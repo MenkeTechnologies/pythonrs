@@ -17,7 +17,7 @@
 use fusevm::{Chunk, NumOp, VMResult, Value, VM};
 use indexmap::IndexMap;
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
 /// Builtin ids emitted by the compiler and registered on every VM. The compiler
@@ -86,6 +86,7 @@ pub mod ops {
     pub const MATCH_KEY: u16 = 60; // [subject, key] -> [value, Bool] | [Bool(false)]
     pub const MATCH_MAP_REST: u16 = 61; // [subject, keylist] -> dict of remaining keys
     pub const MATCH_CLASS: u16 = 62; // [subject, class, npos, kwnames...] -> [vals_list, Bool] | [Bool]
+    pub const MKBYTES: u16 = 63; // [latin1_str] -> bytes (one byte per code point 0..=255)
 }
 
 /// Binary-op tags carried by `ops::BINOP` (the non-native operators).
@@ -232,6 +233,42 @@ pub enum PyObj {
     Generator {
         id: u32,
     },
+    /// A mutable byte string (`bytearray`). Held inline (a plain `Vec<u8>`),
+    /// unlike the immutable [`PyObj::Bytes`].
+    Bytearray(Vec<u8>),
+    /// An open file / standard stream. Holds only an index into
+    /// `PyHost.io_handles`; the underlying `std::fs::File` is neither `Clone`
+    /// nor storable inline, so it lives in the side table (ported from
+    /// rubylang's `IoCell`).
+    File {
+        id: u32,
+    },
+    /// A `collections.deque`: a double-ended queue with an optional bound.
+    Deque {
+        items: VecDeque<Value>,
+        maxlen: Option<usize>,
+    },
+    /// The class object returned by `collections.namedtuple(name, fields)`. A
+    /// callable that constructs `PyObj::Tuple` instances tagged in
+    /// `PyHost.nt_meta` so their fields resolve by name.
+    NamedTupleType {
+        type_name: String,
+        fields: Vec<String>,
+    },
+    /// A `functools.partial`: a callable that pre-binds positional/keyword args
+    /// over an arbitrary callable. Handled directly by [`invoke`].
+    Partial {
+        func: Value,
+        args: Vec<Value>,
+        kwargs: Vec<(String, Value)>,
+    },
+    /// A `functools.lru_cache`-wrapped callable. The memo table lives out of
+    /// line in `PyHost.lru_caches` (indexed by `cache_id`) so cloning the heap
+    /// object never copies — or forks — the cache.
+    LruCache {
+        func: Value,
+        cache_id: u32,
+    },
 }
 
 /// Iterator cursor state.
@@ -240,6 +277,63 @@ pub enum IterState {
     Seq { items: Vec<Value>, idx: usize },
     RangeIter { cur: i64, stop: i64, step: i64 },
     DictKeys { keys: Vec<Value>, idx: usize },
+}
+
+// ── I/O side table ───────────────────────────────────────────────────────────
+
+/// One live file / standard stream, indexed by `PyObj::File.id`. Slots 0/1/2 are
+/// always `Stdout`/`Stderr`/`Stdin`. A `File` holds the owned `std::fs::File`
+/// (`None` once closed), the path (for `repr`), and whether it was opened for
+/// reading and/or writing. `std::fs::File` is not `Clone`, so — like rubylang's
+/// `IoCell` — the handle lives here, never inline in a `PyObj`.
+pub enum IoCell {
+    Stdout,
+    Stderr,
+    Stdin,
+    File {
+        file: Option<std::fs::File>,
+        path: String,
+        readable: bool,
+        writable: bool,
+    },
+}
+
+// ── collections side tables ──────────────────────────────────────────────────
+
+/// Which `dict` subclass a `PyObj::Dict` heap object actually is. A plain dict
+/// has no entry in `PyHost.dict_meta`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DictKind {
+    Counter,
+    DefaultDict,
+    OrderedDict,
+}
+
+/// Metadata tagging a `PyObj::Dict` as a `collections` dict subclass. `factory`
+/// is the `defaultdict` `default_factory` (a callable or `None`).
+#[derive(Clone)]
+pub struct DictMeta {
+    pub kind: DictKind,
+    pub factory: Option<Value>,
+}
+
+/// Metadata tagging a `PyObj::Tuple` as a `namedtuple` instance: its type name
+/// and ordered field names, so `.field` access resolves to a tuple index.
+#[derive(Clone)]
+pub struct NtMeta {
+    pub type_name: String,
+    pub fields: Vec<String>,
+}
+
+/// The memo table behind one `functools.lru_cache`-wrapped callable, indexed by
+/// `PyObj::LruCache.cache_id`. `order` records insertion order for eviction when
+/// `maxsize` is set (`None` == unbounded). Keys are the hashable arg tuple.
+pub struct LruData {
+    pub map: IndexMap<PKey, Value>,
+    pub order: VecDeque<PKey>,
+    pub maxsize: Option<usize>,
+    pub hits: u64,
+    pub misses: u64,
 }
 
 // ── environments ─────────────────────────────────────────────────────────────
@@ -300,6 +394,16 @@ pub struct PyHost {
     pub signal: Option<Signal>,
     /// Suspended generator coroutines, indexed by `PyObj::Generator.id`.
     generators: Vec<GenCell>,
+    /// Live file / standard-stream objects, indexed by `PyObj::File.id`. Slots
+    /// 0/1/2 are stdout/stderr/stdin.
+    io_handles: Vec<IoCell>,
+    /// `dict` subclass tags, keyed by the `PyObj::Dict` heap index. Absent for a
+    /// plain dict.
+    pub dict_meta: HashMap<u32, DictMeta>,
+    /// `namedtuple` instance tags, keyed by the `PyObj::Tuple` heap index.
+    pub nt_meta: HashMap<u32, NtMeta>,
+    /// `lru_cache` memo tables, indexed by `PyObj::LruCache.cache_id`.
+    lru_caches: Vec<LruData>,
 }
 
 /// One suspended generator. `coro` is `None` only while this generator is
@@ -373,6 +477,10 @@ impl PyHost {
             exc: None,
             signal: None,
             generators: Vec::new(),
+            io_handles: vec![IoCell::Stdout, IoCell::Stderr, IoCell::Stdin],
+            dict_meta: HashMap::new(),
+            nt_meta: HashMap::new(),
+            lru_caches: Vec::new(),
         }
     }
 
@@ -667,9 +775,24 @@ impl PyHost {
             Value::Obj(_) => match self.get(v) {
                 Some(PyObj::Str(_)) => "str".into(),
                 Some(PyObj::Bytes(_)) => "bytes".into(),
+                Some(PyObj::Bytearray(_)) => "bytearray".into(),
                 Some(PyObj::List(_)) => "list".into(),
-                Some(PyObj::Tuple(_)) => "tuple".into(),
-                Some(PyObj::Dict(_)) => "dict".into(),
+                Some(PyObj::Tuple(_)) => match v {
+                    Value::Obj(i) => match self.nt_meta.get(i) {
+                        Some(m) => m.type_name.clone(),
+                        None => "tuple".into(),
+                    },
+                    _ => "tuple".into(),
+                },
+                Some(PyObj::Dict(_)) => match v {
+                    Value::Obj(i) => match self.dict_meta.get(i).map(|m| m.kind) {
+                        Some(DictKind::Counter) => "Counter".into(),
+                        Some(DictKind::DefaultDict) => "defaultdict".into(),
+                        Some(DictKind::OrderedDict) => "OrderedDict".into(),
+                        None => "dict".into(),
+                    },
+                    _ => "dict".into(),
+                },
                 Some(PyObj::Set(_)) => "set".into(),
                 Some(PyObj::Range { .. }) => "range".into(),
                 Some(PyObj::Slice { .. }) => "slice".into(),
@@ -684,6 +807,11 @@ impl PyHost {
                 Some(PyObj::BigInt(_)) => "int".into(),
                 Some(PyObj::Complex(..)) => "complex".into(),
                 Some(PyObj::Generator { .. }) => "generator".into(),
+                Some(PyObj::File { .. }) => "TextIOWrapper".into(),
+                Some(PyObj::Deque { .. }) => "deque".into(),
+                Some(PyObj::NamedTupleType { .. }) => "type".into(),
+                Some(PyObj::Partial { .. }) => "partial".into(),
+                Some(PyObj::LruCache { .. }) => "functools._lru_cache_wrapper".into(),
                 None => "object".into(),
             },
             _ => "object".into(),
@@ -701,6 +829,8 @@ impl PyHost {
             Value::Obj(_) => match self.get(v) {
                 Some(PyObj::Str(s)) => !s.is_empty(),
                 Some(PyObj::Bytes(b)) => !b.is_empty(),
+                Some(PyObj::Bytearray(b)) => !b.is_empty(),
+                Some(PyObj::Deque { items, .. }) => !items.is_empty(),
                 Some(PyObj::List(l)) => !l.is_empty(),
                 Some(PyObj::Tuple(l)) => !l.is_empty(),
                 Some(PyObj::Dict(d)) => !d.is_empty(),
@@ -750,6 +880,22 @@ impl PyHost {
                 }
                 Some(PyObj::Iter(_)) => "<iterator>".into(),
                 Some(PyObj::Generator { id }) => format!("<generator object at 0x{id:012x}>"),
+                Some(PyObj::Bytearray(b)) => format!("bytearray(b{})", quote_bytes(b)),
+                Some(PyObj::File { id }) => self.file_repr(*id),
+                Some(PyObj::Deque { items, maxlen }) => {
+                    let inner: Vec<String> = items.iter().map(|x| self.repr_of(x)).collect();
+                    match maxlen {
+                        Some(m) => format!("deque([{}], maxlen={m})", inner.join(", ")),
+                        None => format!("deque([{}])", inner.join(", ")),
+                    }
+                }
+                Some(PyObj::NamedTupleType { type_name, .. }) => format!("<class '{type_name}'>"),
+                Some(PyObj::Partial { func, .. }) => {
+                    format!("functools.partial({})", self.repr_of(func))
+                }
+                Some(PyObj::LruCache { func, .. }) => {
+                    format!("<functools._lru_cache_wrapper {}>", self.str_of(func))
+                }
                 Some(PyObj::Slice { .. })
                 | Some(PyObj::List(_))
                 | Some(PyObj::Tuple(_))
@@ -784,19 +930,57 @@ impl PyHost {
                     format!("[{}]", inner.join(", "))
                 }
                 Some(PyObj::Tuple(l)) => {
-                    let inner: Vec<String> = l.iter().map(|x| self.repr_of(x)).collect();
-                    if l.len() == 1 {
-                        format!("({},)", inner[0])
+                    // A namedtuple instance reprs as `Type(field=value, …)`.
+                    let nt = match v {
+                        Value::Obj(i) => self.nt_meta.get(i),
+                        _ => None,
+                    };
+                    if let Some(m) = nt {
+                        let inner: Vec<String> = m
+                            .fields
+                            .iter()
+                            .zip(l.iter())
+                            .map(|(f, x)| format!("{f}={}", self.repr_of(x)))
+                            .collect();
+                        format!("{}({})", m.type_name, inner.join(", "))
                     } else {
-                        format!("({})", inner.join(", "))
+                        let inner: Vec<String> = l.iter().map(|x| self.repr_of(x)).collect();
+                        if l.len() == 1 {
+                            format!("({},)", inner[0])
+                        } else {
+                            format!("({})", inner.join(", "))
+                        }
                     }
                 }
                 Some(PyObj::Dict(d)) => {
-                    let inner: Vec<String> = d
+                    let body: Vec<String> = d
                         .values()
                         .map(|(k, val)| format!("{}: {}", self.repr_of(k), self.repr_of(val)))
                         .collect();
-                    format!("{{{}}}", inner.join(", "))
+                    let dict_repr = format!("{{{}}}", body.join(", "));
+                    let meta = match v {
+                        Value::Obj(i) => self.dict_meta.get(i),
+                        _ => None,
+                    };
+                    match meta.map(|m| (m.kind, m.factory.clone())) {
+                        Some((DictKind::Counter, _)) => format!("Counter({dict_repr})"),
+                        Some((DictKind::DefaultDict, factory)) => {
+                            let f = factory
+                                .map(|fv| self.repr_of(&fv))
+                                .unwrap_or_else(|| "None".into());
+                            format!("defaultdict({f}, {dict_repr})")
+                        }
+                        Some((DictKind::OrderedDict, _)) => {
+                            let pairs: Vec<String> = d
+                                .values()
+                                .map(|(k, val)| {
+                                    format!("({}, {})", self.repr_of(k), self.repr_of(val))
+                                })
+                                .collect();
+                            format!("OrderedDict([{}])", pairs.join(", "))
+                        }
+                        None => dict_repr,
+                    }
                 }
                 Some(PyObj::Set(s)) => {
                     if s.is_empty() {
@@ -878,6 +1062,14 @@ impl PyHost {
                     (Some(PyObj::Set(x)), Some(PyObj::Set(y))) => {
                         x.len() == y.len() && x.keys().all(|k| y.contains_key(k))
                     }
+                    (Some(PyObj::Deque { items: x, .. }), Some(PyObj::Deque { items: y, .. })) => {
+                        x.len() == y.len() && x.iter().zip(y).all(|(p, q)| self.equal(p, q))
+                    }
+                    // bytes/bytearray compare equal by content (`b'a' == bytearray(b'a')`).
+                    (Some(PyObj::Bytes(x)), Some(PyObj::Bytes(y)))
+                    | (Some(PyObj::Bytes(x)), Some(PyObj::Bytearray(y)))
+                    | (Some(PyObj::Bytearray(x)), Some(PyObj::Bytes(y)))
+                    | (Some(PyObj::Bytearray(x)), Some(PyObj::Bytearray(y))) => x == y,
                     _ => match (a, b) {
                         (Value::Str(x), Value::Str(y)) => x == y,
                         _ => a == b,
@@ -907,6 +1099,31 @@ impl PyHost {
             Value::Bool(b) => Some(*b as i64),
             _ => None,
         }
+    }
+}
+
+// ── integer floor-division / modulo (Python semantics, BigInt path) ──────────
+
+/// `x // y` for BigInts, flooring toward −∞ (remainder takes the divisor's sign).
+fn bigint_floordiv(x: &num_bigint::BigInt, y: &num_bigint::BigInt) -> num_bigint::BigInt {
+    let q = x / y;
+    let r = x % y;
+    let zero = num_bigint::BigInt::from(0);
+    if r != zero && (r < zero) != (*y < zero) {
+        q - num_bigint::BigInt::from(1)
+    } else {
+        q
+    }
+}
+
+/// `x % y` for BigInts, with the result taking the sign of `y` (floored).
+fn bigint_mod(x: &num_bigint::BigInt, y: &num_bigint::BigInt) -> num_bigint::BigInt {
+    let r = x % y;
+    let zero = num_bigint::BigInt::from(0);
+    if r != zero && (r < zero) != (*y < zero) {
+        r + y
+    } else {
+        r
     }
 }
 
@@ -1109,7 +1326,7 @@ impl PyHost {
         }
     }
 
-    fn big_val(&self, v: &Value) -> Option<num_bigint::BigInt> {
+    pub fn big_val(&self, v: &Value) -> Option<num_bigint::BigInt> {
         match v {
             Value::Int(n) => Some(num_bigint::BigInt::from(*n)),
             Value::Bool(b) => Some(num_bigint::BigInt::from(*b as i64)),
@@ -1215,31 +1432,65 @@ impl PyHost {
                 (Some(x), Some(y)) => Ok(Value::Float(x / y)),
                 _ => Err(self.optype_err("/", a, b)),
             },
-            binop::FLOORDIV => match (ai, bi) {
-                (Some(_), Some(0)) => {
-                    Err("ZeroDivisionError: integer division or modulo by zero".into())
+            binop::FLOORDIV => {
+                // Python `//` floors toward −∞ (not Rust truncation).
+                if let (Some(x), Some(y)) = (ai, bi) {
+                    if y == 0 {
+                        return Err("ZeroDivisionError: integer division or modulo by zero".into());
+                    }
+                    let (x, y) = (x as i128, y as i128);
+                    let q = x / y;
+                    let r = x % y;
+                    let q = if r != 0 && (r < 0) != (y < 0) {
+                        q - 1
+                    } else {
+                        q
+                    };
+                    return Ok(self.int_result(q));
                 }
-                (Some(x), Some(y)) => Ok(Value::Int(x.div_euclid(y))),
-                _ => match (af, bf) {
+                if let (Some(x), Some(y)) = (self.big_val(a), self.big_val(b)) {
+                    if y == num_bigint::BigInt::from(0) {
+                        return Err("ZeroDivisionError: integer division or modulo by zero".into());
+                    }
+                    return Ok(self.norm_big(bigint_floordiv(&x, &y)));
+                }
+                match (af, bf) {
+                    (Some(_), Some(0.0)) => {
+                        Err("ZeroDivisionError: float floor division by zero".into())
+                    }
                     (Some(x), Some(y)) => Ok(Value::Float((x / y).floor())),
                     _ => Err(self.optype_err("//", a, b)),
-                },
-            },
+                }
+            }
             binop::MOD => {
                 // str % formatting
                 if let Some(PyObj::Str(fmt)) = self.get(a) {
                     let fmt = fmt.clone();
                     return self.str_format_percent(&fmt, b);
                 }
-                match (ai, bi) {
-                    (Some(_), Some(0)) => {
-                        Err("ZeroDivisionError: integer division or modulo by zero".into())
+                // Python `%` takes the sign of the divisor (floored remainder).
+                if let (Some(x), Some(y)) = (ai, bi) {
+                    if y == 0 {
+                        return Err("ZeroDivisionError: integer division or modulo by zero".into());
                     }
-                    (Some(x), Some(y)) => Ok(Value::Int(x.rem_euclid(y))),
-                    _ => match (af, bf) {
-                        (Some(x), Some(y)) => Ok(Value::Float(x - (x / y).floor() * y)),
-                        _ => Err(self.optype_err("%", a, b)),
-                    },
+                    let r = x % y;
+                    let r = if r != 0 && (r < 0) != (y < 0) {
+                        r + y
+                    } else {
+                        r
+                    };
+                    return Ok(Value::Int(r));
+                }
+                if let (Some(x), Some(y)) = (self.big_val(a), self.big_val(b)) {
+                    if y == num_bigint::BigInt::from(0) {
+                        return Err("ZeroDivisionError: integer division or modulo by zero".into());
+                    }
+                    return Ok(self.norm_big(bigint_mod(&x, &y)));
+                }
+                match (af, bf) {
+                    (Some(_), Some(0.0)) => Err("ZeroDivisionError: float modulo".into()),
+                    (Some(x), Some(y)) => Ok(Value::Float(x - (x / y).floor() * y)),
+                    _ => Err(self.optype_err("%", a, b)),
                 }
             }
             binop::POW => match (ai, bi) {
@@ -1335,64 +1586,422 @@ impl PyHost {
     }
 
     /// Minimal printf-style `%` formatting for `str % args`.
+    /// `str % args` — CPython printf-style formatting. Supports the mapping form
+    /// `'%(k)s' % {…}`, single-arg vs tuple positional args, conversions
+    /// `d i u s r a f F e E g G x X o c %`, the flags `- + space 0 #`, field
+    /// width and `.precision` (both as literals or `*` dynamic from the args).
     fn str_format_percent(&mut self, fmt: &str, args: &Value) -> Result<Value, String> {
-        let arglist: Vec<Value> = match self.get(args) {
-            Some(PyObj::Tuple(t)) => t.clone(),
-            _ => vec![args.clone()],
+        let is_mapping = matches!(self.get(args), Some(PyObj::Dict(_)));
+        let arglist: Vec<Value> = if is_mapping {
+            vec![]
+        } else {
+            match self.get(args) {
+                Some(PyObj::Tuple(t)) => t.clone(),
+                _ => vec![args.clone()],
+            }
         };
-        let mut out = String::new();
-        let mut ai = 0;
         let chars: Vec<char> = fmt.chars().collect();
-        let mut i = 0;
-        while i < chars.len() {
-            if chars[i] == '%' && i + 1 < chars.len() {
-                let spec = chars[i + 1];
-                i += 2;
-                match spec {
-                    '%' => out.push('%'),
-                    's' => {
-                        let a = arglist.get(ai).cloned().unwrap_or(Value::Undef);
-                        out.push_str(&self.str_of(&a));
-                        ai += 1;
-                    }
-                    'r' => {
-                        let a = arglist.get(ai).cloned().unwrap_or(Value::Undef);
-                        out.push_str(&self.repr_of(&a));
-                        ai += 1;
-                    }
-                    'd' | 'i' => {
-                        let a = arglist.get(ai).cloned().unwrap_or(Value::Int(0));
-                        out.push_str(
-                            &self
-                                .as_int(&a)
-                                .map(|n| n.to_string())
-                                .unwrap_or_else(|| self.str_of(&a)),
-                        );
-                        ai += 1;
-                    }
-                    'f' => {
-                        let a = arglist.get(ai).cloned().unwrap_or(Value::Float(0.0));
-                        let f = self.num_val(&a).unwrap_or(0.0);
-                        out.push_str(&format!("{f:.6}"));
-                        ai += 1;
-                    }
-                    'x' => {
-                        let a = arglist.get(ai).cloned().unwrap_or(Value::Int(0));
-                        out.push_str(&format!("{:x}", self.as_int(&a).unwrap_or(0)));
-                        ai += 1;
-                    }
-                    other => {
-                        out.push('%');
-                        out.push(other);
-                    }
-                }
-            } else {
+        let n = chars.len();
+        let mut out = String::new();
+        let mut ai = 0usize;
+        let mut i = 0usize;
+        while i < n {
+            if chars[i] != '%' {
                 out.push(chars[i]);
                 i += 1;
+                continue;
             }
+            i += 1;
+            if i >= n {
+                return Err("ValueError: incomplete format".into());
+            }
+            if chars[i] == '%' {
+                out.push('%');
+                i += 1;
+                continue;
+            }
+            // Mapping key `%(name)s`.
+            let mut mapping_key: Option<String> = None;
+            if chars[i] == '(' {
+                i += 1;
+                let mut key = String::new();
+                let mut depth = 1;
+                while i < n && depth > 0 {
+                    match chars[i] {
+                        '(' => {
+                            depth += 1;
+                            key.push('(');
+                        }
+                        ')' => {
+                            depth -= 1;
+                            if depth > 0 {
+                                key.push(')');
+                            }
+                        }
+                        c => key.push(c),
+                    }
+                    i += 1;
+                }
+                mapping_key = Some(key);
+            }
+            // Flags.
+            let (mut f_minus, mut f_plus, mut f_space, mut f_zero, mut f_hash) =
+                (false, false, false, false, false);
+            while i < n {
+                match chars[i] {
+                    '-' => f_minus = true,
+                    '+' => f_plus = true,
+                    ' ' => f_space = true,
+                    '0' => f_zero = true,
+                    '#' => f_hash = true,
+                    _ => break,
+                }
+                i += 1;
+            }
+            // Width (literal or `*`).
+            let mut width: Option<usize> = None;
+            if i < n && chars[i] == '*' {
+                i += 1;
+                let w = self.next_arg_int(&arglist, &mut ai);
+                if w < 0 {
+                    f_minus = true;
+                    width = Some((-w) as usize);
+                } else {
+                    width = Some(w as usize);
+                }
+            } else {
+                let mut wd = String::new();
+                while i < n && chars[i].is_ascii_digit() {
+                    wd.push(chars[i]);
+                    i += 1;
+                }
+                if !wd.is_empty() {
+                    width = wd.parse().ok();
+                }
+            }
+            // Precision (literal or `*`).
+            let mut prec: Option<usize> = None;
+            if i < n && chars[i] == '.' {
+                i += 1;
+                if i < n && chars[i] == '*' {
+                    i += 1;
+                    prec = Some(self.next_arg_int(&arglist, &mut ai).max(0) as usize);
+                } else {
+                    let mut pd = String::new();
+                    while i < n && chars[i].is_ascii_digit() {
+                        pd.push(chars[i]);
+                        i += 1;
+                    }
+                    prec = Some(pd.parse().unwrap_or(0));
+                }
+            }
+            // Length modifiers are accepted and ignored.
+            while i < n && matches!(chars[i], 'h' | 'l' | 'L') {
+                i += 1;
+            }
+            if i >= n {
+                return Err("ValueError: incomplete format".into());
+            }
+            let conv = chars[i];
+            i += 1;
+            // Resolve the value for this conversion.
+            let val = if let Some(key) = &mapping_key {
+                let kv = self.new_str(key.clone());
+                let k = self.to_key(&kv)?;
+                match self.get(args) {
+                    Some(PyObj::Dict(d)) => d
+                        .get(&k)
+                        .map(|(_, v)| v.clone())
+                        .ok_or_else(|| format!("KeyError: '{key}'"))?,
+                    _ => return Err("TypeError: format requires a mapping".into()),
+                }
+            } else {
+                let v = arglist.get(ai).cloned().ok_or_else(|| {
+                    "TypeError: not enough arguments for format string".to_string()
+                })?;
+                ai += 1;
+                v
+            };
+            let core = self.format_conv(conv, &val, f_plus, f_space, f_hash, prec)?;
+            out.push_str(&pad_conv(
+                &core,
+                width,
+                f_minus,
+                f_zero,
+                is_numeric_conv(conv),
+            ));
+        }
+        if !is_mapping && ai < arglist.len() {
+            return Err("TypeError: not all arguments converted during string formatting".into());
         }
         Ok(self.new_str(out))
     }
+
+    /// Pop the next positional arg as an i64 (for `*` width/precision).
+    fn next_arg_int(&self, arglist: &[Value], ai: &mut usize) -> i64 {
+        let v = arglist.get(*ai).cloned().unwrap_or(Value::Int(0));
+        *ai += 1;
+        self.as_int(&v).unwrap_or(0)
+    }
+
+    /// Render one `%`-conversion's core text (sign included, width padding not).
+    fn format_conv(
+        &mut self,
+        conv: char,
+        val: &Value,
+        plus: bool,
+        space: bool,
+        hash: bool,
+        prec: Option<usize>,
+    ) -> Result<String, String> {
+        let sign_str = |neg: bool| -> &'static str {
+            if neg {
+                "-"
+            } else if plus {
+                "+"
+            } else if space {
+                " "
+            } else {
+                ""
+            }
+        };
+        match conv {
+            's' | 'r' | 'a' => {
+                let mut s = match conv {
+                    's' => self.str_of(val),
+                    'r' => self.repr_of(val),
+                    _ => ascii_of(&self.repr_of(val)),
+                };
+                if let Some(p) = prec {
+                    s = s.chars().take(p).collect();
+                }
+                Ok(s)
+            }
+            'c' => {
+                if let Some(cp) = self.as_int(val) {
+                    let ch = char::from_u32(cp as u32)
+                        .ok_or_else(|| "OverflowError: %c arg not in range".to_string())?;
+                    Ok(ch.to_string())
+                } else if let Some(s) = self.as_str(val) {
+                    if s.chars().count() == 1 {
+                        Ok(s)
+                    } else {
+                        Err("TypeError: %c requires int or char".into())
+                    }
+                } else {
+                    Err("TypeError: %c requires int or char".into())
+                }
+            }
+            'd' | 'i' | 'u' | 'x' | 'X' | 'o' => {
+                use num_traits::Signed;
+                // `%d/%i/%u` accept a float (truncated toward zero); `%x/%X/%o`
+                // require an integer.
+                let b = match self.big_val(val) {
+                    Some(b) => b,
+                    None if matches!(conv, 'd' | 'i' | 'u') => match self.num_val(val) {
+                        Some(f) => num_bigint::BigInt::from(f.trunc() as i64),
+                        None => {
+                            return Err(type_error(&format!(
+                                "%{conv} format: a real number is required, not {}",
+                                self.type_name(val)
+                            )))
+                        }
+                    },
+                    None => {
+                        return Err(type_error(&format!(
+                            "%{conv} format: an integer is required, not {}",
+                            self.type_name(val)
+                        )))
+                    }
+                };
+                let neg = b.is_negative();
+                let abs = b.abs();
+                let (mut digits, prefix) = match conv {
+                    'x' => (abs.to_str_radix(16), if hash { "0x" } else { "" }),
+                    'X' => (
+                        abs.to_str_radix(16).to_uppercase(),
+                        if hash { "0X" } else { "" },
+                    ),
+                    'o' => (abs.to_str_radix(8), if hash { "0o" } else { "" }),
+                    _ => (abs.to_str_radix(10), ""),
+                };
+                if let Some(p) = prec {
+                    while digits.len() < p {
+                        digits.insert(0, '0');
+                    }
+                }
+                let prefix = if abs == num_bigint::BigInt::from(0) {
+                    ""
+                } else {
+                    prefix
+                };
+                Ok(format!("{}{}{}", sign_str(neg), prefix, digits))
+            }
+            'f' | 'F' | 'e' | 'E' | 'g' | 'G' => {
+                let x = self.num_val(val).ok_or_else(|| {
+                    type_error(&format!(
+                        "%{conv} format: a real number is required, not {}",
+                        self.type_name(val)
+                    ))
+                })?;
+                let neg = x.is_sign_negative();
+                if x.is_nan() {
+                    return Ok(format!(
+                        "{}{}",
+                        sign_str(false),
+                        if conv.is_uppercase() { "NAN" } else { "nan" }
+                    ));
+                }
+                if x.is_infinite() {
+                    return Ok(format!(
+                        "{}{}",
+                        sign_str(neg),
+                        if conv.is_uppercase() { "INF" } else { "inf" }
+                    ));
+                }
+                let mag = x.abs();
+                let core = match conv {
+                    'f' | 'F' => format!("{:.*}", prec.unwrap_or(6), mag),
+                    'e' => fmt_sci(mag, prec.unwrap_or(6), false),
+                    'E' => fmt_sci(mag, prec.unwrap_or(6), true),
+                    'g' => fmt_g(mag, prec.unwrap_or(6), false, hash),
+                    _ => fmt_g(mag, prec.unwrap_or(6), true, hash),
+                };
+                Ok(format!("{}{}", sign_str(neg), core))
+            }
+            other => Err(format!(
+                "ValueError: unsupported format character '{other}'"
+            )),
+        }
+    }
+}
+
+/// Whether a `%`-conversion produces a number (eligible for `0`-fill / sign).
+fn is_numeric_conv(c: char) -> bool {
+    matches!(
+        c,
+        'd' | 'i' | 'u' | 'x' | 'X' | 'o' | 'f' | 'F' | 'e' | 'E' | 'g' | 'G'
+    )
+}
+
+/// Pad a rendered conversion to `width`. Left-justify with `-`; else zero-fill
+/// numeric conversions (keeping the sign/base prefix leading) when `zero`; else
+/// right-justify with spaces.
+fn pad_conv(core: &str, width: Option<usize>, minus: bool, zero: bool, numeric: bool) -> String {
+    let w = match width {
+        Some(w) => w,
+        None => return core.to_string(),
+    };
+    let len = core.chars().count();
+    if len >= w {
+        return core.to_string();
+    }
+    let pad = w - len;
+    if minus {
+        format!("{core}{}", " ".repeat(pad))
+    } else if zero && numeric {
+        let (prefix, rest) = split_sign_prefix(core);
+        format!("{prefix}{}{rest}", "0".repeat(pad))
+    } else {
+        format!("{}{core}", " ".repeat(pad))
+    }
+}
+
+/// Split a leading sign (`+ - space`) and numeric base prefix (`0x`/`0X`/`0o`)
+/// off a rendered number, so `0`-fill lands after them.
+fn split_sign_prefix(s: &str) -> (String, &str) {
+    let mut idx = 0;
+    let bytes: Vec<char> = s.chars().collect();
+    let mut prefix = String::new();
+    if let Some(&c) = bytes.first() {
+        if c == '+' || c == '-' || c == ' ' {
+            prefix.push(c);
+            idx = 1;
+        }
+    }
+    if bytes.len() >= idx + 2 && bytes[idx] == '0' && matches!(bytes[idx + 1], 'x' | 'X' | 'o') {
+        prefix.push('0');
+        prefix.push(bytes[idx + 1]);
+        idx += 2;
+    }
+    let byte_off: usize = s.chars().take(idx).map(|c| c.len_utf8()).sum();
+    (prefix, &s[byte_off..])
+}
+
+/// `%e` / `%E` scientific form with Python's exponent shape (`e[+-]NN`, ≥2 digits).
+fn fmt_sci(x: f64, prec: usize, upper: bool) -> String {
+    let s = format!("{:.*e}", prec, x);
+    let (mant, exp) = s.split_once('e').unwrap_or((s.as_str(), "0"));
+    let exp_num: i32 = exp.parse().unwrap_or(0);
+    let e = if upper { 'E' } else { 'e' };
+    format!(
+        "{mant}{e}{}{:02}",
+        if exp_num < 0 { '-' } else { '+' },
+        exp_num.abs()
+    )
+}
+
+/// `%g` / `%G`: choose `f` or `e` style by exponent, `precision` significant
+/// digits (min 1), trailing zeros stripped unless the `#` flag is set.
+fn fmt_g(x: f64, prec: usize, upper: bool, hash: bool) -> String {
+    let p = prec.max(1);
+    if x == 0.0 {
+        return "0".to_string();
+    }
+    let exp: i32 = format!("{:e}", x)
+        .split_once('e')
+        .and_then(|(_, e)| e.parse().ok())
+        .unwrap_or(0);
+    if exp < -4 || exp >= p as i32 {
+        let mut s = fmt_sci(x, p - 1, upper);
+        if !hash {
+            s = strip_g_sci(&s);
+        }
+        s
+    } else {
+        let dec = (p as i32 - 1 - exp).max(0) as usize;
+        let mut s = format!("{:.*}", dec, x);
+        if !hash && s.contains('.') {
+            s = s.trim_end_matches('0').trim_end_matches('.').to_string();
+        }
+        s
+    }
+}
+
+/// Strip trailing zeros from the mantissa of a `%g` scientific result.
+fn strip_g_sci(s: &str) -> String {
+    match s.find(['e', 'E']) {
+        Some(pos) => {
+            let (mant, exp) = s.split_at(pos);
+            let mant = if mant.contains('.') {
+                mant.trim_end_matches('0').trim_end_matches('.')
+            } else {
+                mant
+            };
+            format!("{mant}{exp}")
+        }
+        None => s.to_string(),
+    }
+}
+
+/// `%a` (ascii): non-ASCII code points in a repr escaped as `\xNN`/`\uNNNN`/`\UNNNNNNNN`.
+fn ascii_of(s: &str) -> String {
+    let mut o = String::new();
+    for c in s.chars() {
+        if c.is_ascii() {
+            o.push(c);
+        } else {
+            let u = c as u32;
+            if u <= 0xff {
+                o.push_str(&format!("\\x{u:02x}"));
+            } else if u <= 0xffff {
+                o.push_str(&format!("\\u{u:04x}"));
+            } else {
+                o.push_str(&format!("\\U{u:08x}"));
+            }
+        }
+    }
+    o
 }
 
 // ── indexing / iteration / containment ───────────────────────────────────────
@@ -1451,6 +2060,28 @@ impl PyHost {
                     return Err("IndexError: range object index out of range".into());
                 }
                 Ok(Value::Int(start + k * step))
+            }
+            Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) => {
+                let n = b.len() as i64;
+                let i = self
+                    .as_int(idx)
+                    .ok_or_else(|| type_error("byte indices must be integers"))?;
+                let k = if i < 0 { i + n } else { i };
+                if k < 0 || k >= n {
+                    return Err("IndexError: index out of range".into());
+                }
+                Ok(Value::Int(b[k as usize] as i64))
+            }
+            Some(PyObj::Deque { items, .. }) => {
+                let n = items.len() as i64;
+                let i = self
+                    .as_int(idx)
+                    .ok_or_else(|| type_error("deque indices must be integers"))?;
+                let k = if i < 0 { i + n } else { i };
+                if k < 0 || k >= n {
+                    return Err("IndexError: deque index out of range".into());
+                }
+                Ok(items[k as usize].clone())
             }
             _ => Err(type_error(&format!(
                 "'{}' object is not subscriptable",
@@ -1589,8 +2220,22 @@ impl PyHost {
     /// Materialize an iterable into a Vec of values (for `for`, comprehensions,
     /// `list()`, unpacking, …).
     pub fn iter_items(&mut self, v: &Value) -> Result<Vec<Value>, String> {
+        // Iterating a file yields its remaining lines (each keeping its `\n`).
+        // Read first (drops the immutable borrow) so `new_str` can borrow `&mut`.
+        let file_id = match self.get(v) {
+            Some(PyObj::File { id }) => Some(*id),
+            _ => None,
+        };
+        if let Some(id) = file_id {
+            let lines = self.io_read_lines(id)?;
+            return Ok(lines.into_iter().map(|l| self.new_str(l)).collect());
+        }
         match self.get(v) {
             Some(PyObj::List(l)) | Some(PyObj::Tuple(l)) => Ok(l.clone()),
+            Some(PyObj::Deque { items, .. }) => Ok(items.iter().cloned().collect()),
+            Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) => {
+                Ok(b.iter().map(|&x| Value::Int(x as i64)).collect())
+            }
             Some(PyObj::Str(s)) => {
                 let chars: Vec<Value> = s
                     .chars()
@@ -1829,6 +2474,20 @@ impl PyHost {
 
     /// `recv.name`.
     pub fn get_attr(&mut self, recv: &Value, name: &str) -> Result<Value, String> {
+        // namedtuple field access: a tagged tuple resolves `.field` to its index.
+        if let Value::Obj(i) = recv {
+            let field_idx = self
+                .nt_meta
+                .get(i)
+                .and_then(|m| m.fields.iter().position(|f| f == name));
+            if let Some(idx) = field_idx {
+                if let Some(PyObj::Tuple(items)) = self.get(recv) {
+                    if let Some(v) = items.get(idx) {
+                        return Ok(v.clone());
+                    }
+                }
+            }
+        }
         match self.get(recv) {
             Some(PyObj::Instance(inst)) => {
                 if let Some(v) = inst.attrs.get(name) {
@@ -1994,6 +2653,28 @@ pub fn invoke(
             }
         }
         Some(PyObj::Class(name)) => instantiate(&name, args, kwargs),
+        Some(PyObj::NamedTupleType { type_name, fields }) => {
+            namedtuple_construct(&type_name, &fields, args, kwargs)
+        }
+        Some(PyObj::Partial {
+            func,
+            args: bound,
+            kwargs: bkw,
+        }) => {
+            // Prepend bound positionals; bound kwargs first, call kwargs override.
+            let mut all_args = bound;
+            all_args.extend(args);
+            let mut all_kw = bkw;
+            for (k, v) in kwargs {
+                if let Some(slot) = all_kw.iter_mut().find(|(kk, _)| *kk == k) {
+                    slot.1 = v;
+                } else {
+                    all_kw.push((k, v));
+                }
+            }
+            invoke(&func, all_args, all_kw)
+        }
+        Some(PyObj::LruCache { func, cache_id }) => lru_invoke(&func, cache_id, args, kwargs),
         _ => Err(type_error(&format!(
             "'{}' object is not callable",
             with_host(|h| h.type_name(callable))
@@ -2517,11 +3198,39 @@ pub fn import_module(name: &str) -> Result<Value, String> {
         }),
         "sys" => with_host(|h| {
             let argv = h.new_list(vec![]);
+            // Standard streams are `File` handles over the fixed side-table slots.
+            let stdout = h.alloc(PyObj::File { id: 0 });
+            let stderr = h.alloc(PyObj::File { id: 1 });
+            let stdin = h.alloc(PyObj::File { id: 2 });
             vec![
                 ("argv", argv),
                 ("maxsize", Value::Int(i64::MAX)),
                 ("version", h.new_str("3.12.0 (pythonrs)")),
                 ("platform", h.new_str("pythonrs")),
+                ("stdout", stdout),
+                ("stderr", stderr),
+                ("stdin", stdin),
+            ]
+        }),
+        "collections" => with_host(|h| {
+            vec![
+                ("deque", h.alloc(PyObj::Builtin("collections.deque".into()))),
+                (
+                    "Counter",
+                    h.alloc(PyObj::Builtin("collections.Counter".into())),
+                ),
+                (
+                    "defaultdict",
+                    h.alloc(PyObj::Builtin("collections.defaultdict".into())),
+                ),
+                (
+                    "OrderedDict",
+                    h.alloc(PyObj::Builtin("collections.OrderedDict".into())),
+                ),
+                (
+                    "namedtuple",
+                    h.alloc(PyObj::Builtin("collections.namedtuple".into())),
+                ),
             ]
         }),
         _ => {
@@ -2538,4 +3247,482 @@ pub fn import_module(name: &str) -> Result<Value, String> {
             ns,
         })
     }))
+}
+
+// ── file / I/O side table (ported from rubylang's `IoCell`) ──────────────────
+
+fn io_err(e: std::io::Error) -> String {
+    format!("OSError: {e}")
+}
+fn closed_err() -> String {
+    "ValueError: I/O operation on closed file.".into()
+}
+fn unsupported_read() -> String {
+    "io.UnsupportedOperation: not readable".into()
+}
+fn unsupported_write() -> String {
+    "io.UnsupportedOperation: not writable".into()
+}
+
+impl PyHost {
+    /// Register an owned `std::fs::File` and hand back a fresh `File` handle.
+    pub fn io_alloc_file(
+        &mut self,
+        file: std::fs::File,
+        path: String,
+        readable: bool,
+        writable: bool,
+    ) -> Value {
+        let id = self.io_handles.len() as u32;
+        self.io_handles.push(IoCell::File {
+            file: Some(file),
+            path,
+            readable,
+            writable,
+        });
+        self.alloc(PyObj::File { id })
+    }
+
+    /// Whether the file behind `id` is closed (standard streams never close).
+    pub fn io_closed(&self, id: u32) -> bool {
+        matches!(
+            self.io_handles.get(id as usize),
+            Some(IoCell::File { file: None, .. })
+        )
+    }
+
+    /// The `repr` of a file handle.
+    fn file_repr(&self, id: u32) -> String {
+        match self.io_handles.get(id as usize) {
+            Some(IoCell::Stdout) => {
+                "<_io.TextIOWrapper name='<stdout>' mode='w' encoding='utf-8'>".into()
+            }
+            Some(IoCell::Stderr) => {
+                "<_io.TextIOWrapper name='<stderr>' mode='w' encoding='utf-8'>".into()
+            }
+            Some(IoCell::Stdin) => {
+                "<_io.TextIOWrapper name='<stdin>' mode='r' encoding='utf-8'>".into()
+            }
+            Some(IoCell::File {
+                file,
+                path,
+                readable,
+                writable,
+            }) => {
+                let mode = match (readable, writable) {
+                    (true, true) => "r+",
+                    (false, true) => "w",
+                    _ => "r",
+                };
+                let closed = if file.is_none() { " (closed)" } else { "" };
+                format!("<_io.TextIOWrapper name='{path}' mode='{mode}' encoding='utf-8'{closed}>")
+            }
+            None => "<_io.TextIOWrapper>".into(),
+        }
+    }
+
+    /// `f.write(s)` for text — returns the number of characters written.
+    pub fn io_write(&mut self, id: u32, s: &str) -> Result<Value, String> {
+        self.io_write_bytes(id, s.as_bytes())?;
+        Ok(Value::Int(s.chars().count() as i64))
+    }
+
+    /// `f.write(...)` at the byte layer — returns the number of bytes written.
+    pub fn io_write_bytes(&mut self, id: u32, bytes: &[u8]) -> Result<Value, String> {
+        use std::io::Write;
+        match self.io_handles.get_mut(id as usize) {
+            Some(IoCell::Stdout) => {
+                let mut o = std::io::stdout();
+                o.write_all(bytes).and_then(|_| o.flush()).map_err(io_err)?;
+            }
+            Some(IoCell::Stderr) => {
+                let mut o = std::io::stderr();
+                o.write_all(bytes).and_then(|_| o.flush()).map_err(io_err)?;
+            }
+            Some(IoCell::Stdin) => return Err(unsupported_write()),
+            Some(IoCell::File {
+                file: Some(f),
+                writable: true,
+                ..
+            }) => {
+                // Flush immediately: the handle is buffered, and a `with` block's
+                // `__exit__` does not yet close files, so an unflushed write would
+                // be invisible to a read-after-write in the same process.
+                f.write_all(bytes).and_then(|_| f.flush()).map_err(io_err)?;
+            }
+            Some(IoCell::File { file: Some(_), .. }) => return Err(unsupported_write()),
+            Some(IoCell::File { file: None, .. }) => return Err(closed_err()),
+            None => return Err(closed_err()),
+        }
+        Ok(Value::Int(bytes.len() as i64))
+    }
+
+    /// `f.read()` — the remaining contents as a string.
+    pub fn io_read_all(&mut self, id: u32) -> Result<String, String> {
+        use std::io::Read;
+        let mut s = String::new();
+        match self.io_handles.get_mut(id as usize) {
+            Some(IoCell::File {
+                file: Some(f),
+                readable: true,
+                ..
+            }) => {
+                f.read_to_string(&mut s).map_err(io_err)?;
+                Ok(s)
+            }
+            Some(IoCell::File { file: Some(_), .. }) => Err(unsupported_read()),
+            Some(IoCell::File { file: None, .. }) => Err(closed_err()),
+            Some(IoCell::Stdin) => {
+                std::io::stdin().read_to_string(&mut s).map_err(io_err)?;
+                Ok(s)
+            }
+            _ => Err(unsupported_read()),
+        }
+    }
+
+    /// `f.readline()` — one line up to and including `\n` (or EOF); "" at EOF.
+    pub fn io_readline(&mut self, id: u32) -> Result<String, String> {
+        use std::io::Read;
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            let mut one = [0u8; 1];
+            let n = match self.io_handles.get_mut(id as usize) {
+                Some(IoCell::File {
+                    file: Some(f),
+                    readable: true,
+                    ..
+                }) => f.read(&mut one),
+                Some(IoCell::File { file: Some(_), .. }) => return Err(unsupported_read()),
+                Some(IoCell::File { file: None, .. }) => return Err(closed_err()),
+                Some(IoCell::Stdin) => std::io::stdin().read(&mut one),
+                _ => return Err(unsupported_read()),
+            };
+            match n {
+                Ok(0) => break,
+                Ok(_) => {
+                    buf.push(one[0]);
+                    if one[0] == b'\n' {
+                        break;
+                    }
+                }
+                Err(e) => return Err(io_err(e)),
+            }
+        }
+        Ok(String::from_utf8_lossy(&buf).into_owned())
+    }
+
+    /// `f.readlines()` / iteration — the remaining lines, each keeping its `\n`.
+    pub fn io_read_lines(&mut self, id: u32) -> Result<Vec<String>, String> {
+        let all = self.io_read_all(id)?;
+        Ok(all.split_inclusive('\n').map(|l| l.to_string()).collect())
+    }
+
+    /// `f.close()` — drop the file (idempotent; no-op for standard streams).
+    pub fn io_close(&mut self, id: u32) {
+        if let Some(IoCell::File { file, .. }) = self.io_handles.get_mut(id as usize) {
+            *file = None;
+        }
+    }
+
+    /// `f.flush()`.
+    pub fn io_flush(&mut self, id: u32) -> Result<(), String> {
+        use std::io::Write;
+        match self.io_handles.get_mut(id as usize) {
+            Some(IoCell::Stdout) => std::io::stdout().flush().map_err(io_err),
+            Some(IoCell::Stderr) => std::io::stderr().flush().map_err(io_err),
+            Some(IoCell::File { file: Some(f), .. }) => f.flush().map_err(io_err),
+            _ => Ok(()),
+        }
+    }
+
+    // ── lru_cache memo tables ────────────────────────────────────────────────
+    fn lru_new(&mut self, maxsize: Option<usize>) -> u32 {
+        let id = self.lru_caches.len() as u32;
+        self.lru_caches.push(LruData {
+            map: IndexMap::new(),
+            order: VecDeque::new(),
+            maxsize,
+            hits: 0,
+            misses: 0,
+        });
+        id
+    }
+
+    /// Look up `key`; on a hit, mark it most-recently-used and bump `hits`, else
+    /// bump `misses`.
+    fn lru_lookup(&mut self, cache_id: u32, key: &PKey) -> Option<Value> {
+        let c = self.lru_caches.get_mut(cache_id as usize)?;
+        if let Some(v) = c.map.get(key).cloned() {
+            c.hits += 1;
+            if let Some(pos) = c.order.iter().position(|k| k == key) {
+                if let Some(k) = c.order.remove(pos) {
+                    c.order.push_back(k);
+                }
+            }
+            Some(v)
+        } else {
+            c.misses += 1;
+            None
+        }
+    }
+
+    /// Store `key -> val`, evicting the least-recently-used entry past `maxsize`.
+    fn lru_store(&mut self, cache_id: u32, key: PKey, val: Value) {
+        if let Some(c) = self.lru_caches.get_mut(cache_id as usize) {
+            if c.map.insert(key.clone(), val).is_none() {
+                c.order.push_back(key);
+            }
+            if let Some(max) = c.maxsize {
+                while c.map.len() > max {
+                    match c.order.pop_front() {
+                        Some(old) => {
+                            c.map.shift_remove(&old);
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+    }
+
+    /// `(hits, misses, maxsize, currsize)` for `cache_info()`.
+    fn lru_info(&self, cache_id: u32) -> (u64, u64, Option<usize>, usize) {
+        match self.lru_caches.get(cache_id as usize) {
+            Some(c) => (c.hits, c.misses, c.maxsize, c.map.len()),
+            None => (0, 0, None, 0),
+        }
+    }
+
+    /// `cache_clear()` — empty the memo and reset counters.
+    fn lru_clear(&mut self, cache_id: u32) {
+        if let Some(c) = self.lru_caches.get_mut(cache_id as usize) {
+            c.map.clear();
+            c.order.clear();
+            c.hits = 0;
+            c.misses = 0;
+        }
+    }
+}
+
+/// `open(path, mode)` — open a file and return a `File` handle value. The text
+/// modes `r`/`w`/`a`/`x` and their `+` / `b` / `t` variants are supported; bytes
+/// vs text is handled at the read/write layer, not here.
+pub fn open_file(path: &str, mode: &str) -> Result<Value, String> {
+    use std::fs::OpenOptions;
+    let m: String = mode.chars().filter(|c| *c != 'b' && *c != 't').collect();
+    let base = m.chars().next().unwrap_or('r');
+    let plus = m.contains('+');
+    let mut opts = OpenOptions::new();
+    let (readable, writable) = match base {
+        'r' => {
+            opts.read(true);
+            if plus {
+                opts.write(true);
+            }
+            (true, plus)
+        }
+        'w' => {
+            opts.write(true).create(true).truncate(true);
+            if plus {
+                opts.read(true);
+            }
+            (plus, true)
+        }
+        'a' => {
+            opts.append(true).create(true);
+            if plus {
+                opts.read(true);
+            }
+            (plus, true)
+        }
+        'x' => {
+            opts.write(true).create_new(true);
+            if plus {
+                opts.read(true);
+            }
+            (plus, true)
+        }
+        _ => return Err(format!("ValueError: invalid mode: '{mode}'")),
+    };
+    let f = opts.open(path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => {
+            format!("FileNotFoundError: [Errno 2] No such file or directory: '{path}'")
+        }
+        std::io::ErrorKind::AlreadyExists => {
+            format!("FileExistsError: [Errno 17] File exists: '{path}'")
+        }
+        std::io::ErrorKind::PermissionDenied => {
+            format!("PermissionError: [Errno 13] Permission denied: '{path}'")
+        }
+        _ => format!("OSError: {e}: '{path}'"),
+    })?;
+    Ok(with_host(|h| {
+        h.io_alloc_file(f, path.to_string(), readable, writable)
+    }))
+}
+
+// ── collections constructors ─────────────────────────────────────────────────
+
+/// Allocate a `collections.deque`.
+pub fn alloc_deque(items: VecDeque<Value>, maxlen: Option<usize>) -> Value {
+    with_host(|h| h.alloc(PyObj::Deque { items, maxlen }))
+}
+
+/// Allocate a tagged `dict` subclass (Counter / defaultdict / OrderedDict).
+pub fn alloc_dict_subtype(
+    pairs: IndexMap<PKey, (Value, Value)>,
+    kind: DictKind,
+    factory: Option<Value>,
+) -> Value {
+    with_host(|h| {
+        let d = h.alloc(PyObj::Dict(pairs));
+        if let Value::Obj(i) = d {
+            h.dict_meta.insert(i, DictMeta { kind, factory });
+        }
+        d
+    })
+}
+
+/// The `dict_meta` for a value, if it is a tagged `dict` subclass.
+pub fn dict_meta_of(v: &Value) -> Option<DictMeta> {
+    with_host(|h| match v {
+        Value::Obj(i) => h.dict_meta.get(i).cloned(),
+        _ => None,
+    })
+}
+
+/// Build a `namedtuple` type object (`namedtuple(name, field_names)`).
+pub fn make_namedtuple_type(name: &str, fields: Vec<String>) -> Value {
+    with_host(|h| {
+        h.alloc(PyObj::NamedTupleType {
+            type_name: name.to_string(),
+            fields,
+        })
+    })
+}
+
+/// Construct a `namedtuple` instance: a `PyObj::Tuple` tagged in `nt_meta`.
+fn namedtuple_construct(
+    type_name: &str,
+    fields: &[String],
+    args: Vec<Value>,
+    kwargs: Vec<(String, Value)>,
+) -> Result<Value, String> {
+    if args.len() > fields.len() {
+        return Err(type_error(&format!(
+            "{type_name}() takes {} positional arguments but {} were given",
+            fields.len(),
+            args.len()
+        )));
+    }
+    let mut values: Vec<Option<Value>> = vec![None; fields.len()];
+    for (i, a) in args.into_iter().enumerate() {
+        values[i] = Some(a);
+    }
+    for (k, v) in kwargs {
+        match fields.iter().position(|f| *f == k) {
+            Some(i) => {
+                if values[i].is_some() {
+                    return Err(type_error(&format!(
+                        "{type_name}() got multiple values for argument '{k}'"
+                    )));
+                }
+                values[i] = Some(v);
+            }
+            None => {
+                return Err(type_error(&format!(
+                    "{type_name}() got an unexpected keyword argument '{k}'"
+                )))
+            }
+        }
+    }
+    let mut items = Vec::with_capacity(fields.len());
+    for (i, slot) in values.into_iter().enumerate() {
+        match slot {
+            Some(v) => items.push(v),
+            None => {
+                return Err(type_error(&format!(
+                    "{type_name}() missing required argument: '{}'",
+                    fields[i]
+                )))
+            }
+        }
+    }
+    Ok(with_host(|h| {
+        let tup = h.alloc(PyObj::Tuple(items));
+        if let Value::Obj(idx) = tup {
+            h.nt_meta.insert(
+                idx,
+                NtMeta {
+                    type_name: type_name.to_string(),
+                    fields: fields.to_vec(),
+                },
+            );
+        }
+        tup
+    }))
+}
+
+// ── functools partial / lru_cache ────────────────────────────────────────────
+
+/// Allocate a `functools.partial`.
+pub fn make_partial(func: Value, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Value {
+    with_host(|h| h.alloc(PyObj::Partial { func, args, kwargs }))
+}
+
+/// Allocate a `functools.lru_cache`-wrapped callable over `func`.
+pub fn make_lru_cache(func: Value, maxsize: Option<usize>) -> Value {
+    with_host(|h| {
+        let cache_id = h.lru_new(maxsize);
+        h.alloc(PyObj::LruCache { func, cache_id })
+    })
+}
+
+/// `wrapped.cache_info()` — `(hits, misses, maxsize, currsize)` for the cache
+/// behind an `LruCache` value. Returns `None` if `v` is not one.
+pub fn lru_cache_info(v: &Value) -> Option<(u64, u64, Option<usize>, usize)> {
+    let id = match with_host(|h| h.get(v).cloned()) {
+        Some(PyObj::LruCache { cache_id, .. }) => cache_id,
+        _ => return None,
+    };
+    Some(with_host(|h| h.lru_info(id)))
+}
+
+/// `wrapped.cache_clear()` for an `LruCache` value; `false` if `v` is not one.
+pub fn lru_cache_clear(v: &Value) -> bool {
+    match with_host(|h| h.get(v).cloned()) {
+        Some(PyObj::LruCache { cache_id, .. }) => {
+            with_host(|h| h.lru_clear(cache_id));
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Call an lru-cached function: hash the positional args into a key, consult the
+/// memo, compute + store on a miss. Only positional-arg calls with hashable args
+/// are cached; any keyword arg or an unhashable arg bypasses the cache (matching
+/// that such calls can't form a stable key).
+fn lru_invoke(
+    func: &Value,
+    cache_id: u32,
+    args: Vec<Value>,
+    kwargs: Vec<(String, Value)>,
+) -> Result<Value, String> {
+    let key = with_host(|h| {
+        args.iter()
+            .map(|a| h.to_key(a))
+            .collect::<Result<Vec<PKey>, String>>()
+            .map(PKey::Tuple)
+    });
+    let key = match (key, kwargs.is_empty()) {
+        (Ok(k), true) => k,
+        _ => return invoke(func, args, kwargs),
+    };
+    if let Some(v) = with_host(|h| h.lru_lookup(cache_id, &key)) {
+        return Ok(v);
+    }
+    let result = invoke(func, args, kwargs)?;
+    with_host(|h| h.lru_store(cache_id, key, result.clone()));
+    Ok(result)
 }

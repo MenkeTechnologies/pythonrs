@@ -70,7 +70,10 @@ fn ours_bin() -> PathBuf {
     if let Ok(p) = std::env::var("CARGO_BIN_EXE_python") {
         return PathBuf::from(p);
     }
-    if let Some(d) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+    if let Some(d) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+    {
         let cand = d.join("python");
         if cand.exists() {
             return cand;
@@ -97,7 +100,12 @@ fn resolve_oracle() -> String {
         }
         return p;
     }
-    for p in ["python3", "/usr/bin/python3", "/opt/homebrew/bin/python3", "python"] {
+    for p in [
+        "python3",
+        "/usr/bin/python3",
+        "/opt/homebrew/bin/python3",
+        "python",
+    ] {
         if version_of(p).is_some() {
             return p.to_string();
         }
@@ -167,8 +175,7 @@ fn norm_stderr(s: &[u8]) -> Vec<u8> {
     let last = text
         .lines()
         .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .next_back()
+        .rfind(|l| !l.is_empty())
         .unwrap_or("")
         .to_lowercase();
     last.into_bytes()
@@ -185,7 +192,9 @@ fn differs(oracle: &RunOut, ours: &RunOut) -> bool {
     if oracle.stdout != ours.stdout {
         return true;
     }
-    if CMP_STDERR.load(Ordering::Relaxed) && norm_stderr(&oracle.stderr) != norm_stderr(&ours.stderr) {
+    if CMP_STDERR.load(Ordering::Relaxed)
+        && norm_stderr(&oracle.stderr) != norm_stderr(&ours.stderr)
+    {
         return true;
     }
     false
@@ -208,7 +217,12 @@ fn run_prog(prog: &Path, src: &str, timeout: Duration, oracle_env: bool) -> RunO
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(_) => {
-            return RunOut { stdout: Vec::new(), stderr: Vec::new(), exit: -1, timed_out: false }
+            return RunOut {
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                exit: -1,
+                timed_out: false,
+            }
         }
     };
 
@@ -255,7 +269,12 @@ fn run_prog(prog: &Path, src: &str, timeout: Duration, oracle_env: bool) -> RunO
 
     let stdout = out_h.take().and_then(|h| h.join().ok()).unwrap_or_default();
     let stderr = err_h.take().and_then(|h| h.join().ok()).unwrap_or_default();
-    RunOut { stdout, stderr, exit, timed_out }
+    RunOut {
+        stdout,
+        stderr,
+        exit,
+        timed_out,
+    }
 }
 
 fn build_program(stmts: &[String]) -> String {
@@ -266,11 +285,24 @@ fn build_program(stmts: &[String]) -> String {
 // Generators — each returns a statement list whose stdout is deterministic.
 // ---------------------------------------------------------------------------
 
-const INTS: &[&str] = &["0", "1", "2", "3", "5", "7", "10", "-1", "-3", "-7", "42", "100", "-100", "1000"];
+const INTS: &[&str] = &[
+    "0", "1", "2", "3", "5", "7", "10", "-1", "-3", "-7", "42", "100", "-100", "1000",
+];
 const POSINTS: &[&str] = &["1", "2", "3", "4", "5", "6", "8", "10"];
-const FLOATS: &[&str] =
-    &["0.1", "0.2", "0.5", "1.5", "2.0", "3.14", "10.0", "-1.5", "100.0", "0.0", "2.5", "1e3", "1e-3"];
-const STRS: &[&str] = &["'hello'", "'World'", "'abc'", "'Python'", "''", "'a'", "'foo bar'", "'  pad  '", "'AbC'"];
+const FLOATS: &[&str] = &[
+    "0.1", "0.2", "0.5", "1.5", "2.0", "3.14", "10.0", "-1.5", "100.0", "0.0", "2.5", "1e3", "1e-3",
+];
+const STRS: &[&str] = &[
+    "'hello'",
+    "'World'",
+    "'abc'",
+    "'Python'",
+    "''",
+    "'a'",
+    "'foo bar'",
+    "'  pad  '",
+    "'AbC'",
+];
 const WORDS: &[&str] = &["'a'", "'b'", "'c'", "'x'", "'y'", "'z'", "'ab'", "'cd'"];
 
 fn gen_arith(seed: u64) -> Vec<String> {
@@ -306,7 +338,11 @@ fn gen_bignum(seed: u64) -> Vec<String> {
         }
         _ => {
             let n = 10 + r.below(40);
-            vec!["f = 1".into(), format!("for i in range(1, {n}): f *= i"), "print(f)".into()]
+            vec![
+                "f = 1".into(),
+                format!("for i in range(1, {n}): f *= i"),
+                "print(f)".into(),
+            ]
         }
     }
 }
@@ -323,7 +359,7 @@ fn gen_floatfmt(seed: u64) -> Vec<String> {
         3 => format!("round({a} / {b}, {k})"),
         4 => format!("{} ** 0.5", pick(r, POSINTS)),
         5 => format!("{a} + {b}"),
-        _ => format!("{a}"),
+        _ => a.to_string(),
     };
     vec![format!("print({e})")]
 }
@@ -360,7 +396,15 @@ fn gen_fstring(seed: u64) -> Vec<String> {
 
 fn gen_slice(seed: u64) -> Vec<String> {
     let r = &mut Rng::new(seed);
-    let seq = pick(r, &["'abcdefg'", "[1, 2, 3, 4, 5]", "(10, 20, 30, 40)", "'Python3'"]);
+    let seq = pick(
+        r,
+        &[
+            "'abcdefg'",
+            "[1, 2, 3, 4, 5]",
+            "(10, 20, 30, 40)",
+            "'Python3'",
+        ],
+    );
     let idx = &["", "0", "1", "2", "-1", "-2", "3", "5"];
     let a = pick(r, idx);
     let b = pick(r, idx);
@@ -379,8 +423,8 @@ fn gen_listcomp(seed: u64) -> Vec<String> {
     let e = match r.below(4) {
         0 => format!("[i * i for i in range({n})]"),
         1 => format!("[i for i in range({n}) if i % 2 == 0]"),
-        2 => format!("[(i, j) for i in range(3) for j in range(2)]"),
-        _ => format!("[c.upper() for c in 'abcd' if c != 'b']"),
+        2 => "[(i, j) for i in range(3) for j in range(2)]".to_string(),
+        _ => "[c.upper() for c in 'abcd' if c != 'b']".to_string(),
     };
     vec![format!("print({e})")]
 }
@@ -390,7 +434,7 @@ fn gen_dictcomp(seed: u64) -> Vec<String> {
     let n = 3 + r.below(5);
     let e = match r.below(3) {
         0 => format!("{{i: i * i for i in range({n})}}"),
-        1 => format!("{{c: ord(c) for c in 'abc'}}"),
+        1 => "{c: ord(c) for c in 'abc'}".to_string(),
         _ => format!("{{i: i % 2 == 0 for i in range({n})}}"),
     };
     vec![format!("print({e})")]
@@ -402,7 +446,7 @@ fn gen_setcomp(seed: u64) -> Vec<String> {
     // Sets iterate nondeterministically across runs/impls — always sort.
     let inner = match r.below(3) {
         0 => format!("{{i % 3 for i in range({n})}}"),
-        1 => format!("{{c for c in 'banana'}}"),
+        1 => "{c for c in 'banana'}".to_string(),
         _ => format!("{{i * i % 5 for i in range({n})}}"),
     };
     vec![format!("print(sorted({inner}))")]
@@ -410,7 +454,15 @@ fn gen_setcomp(seed: u64) -> Vec<String> {
 
 fn gen_sorting(seed: u64) -> Vec<String> {
     let r = &mut Rng::new(seed);
-    let lst = pick(r, &["[3, 1, 2, 5, 4]", "[10, -1, 7, 0]", "['banana', 'apple', 'cherry']", "[2.5, 1.1, 3.3]"]);
+    let lst = pick(
+        r,
+        &[
+            "[3, 1, 2, 5, 4]",
+            "[10, -1, 7, 0]",
+            "['banana', 'apple', 'cherry']",
+            "[2.5, 1.1, 3.3]",
+        ],
+    );
     let e = match r.below(6) {
         0 => format!("sorted({lst})"),
         1 => format!("sorted({lst}, reverse=True)"),
@@ -476,7 +528,7 @@ fn gen_strmeth(seed: u64) -> Vec<String> {
         0 => format!("{s}.upper()"),
         1 => format!("{s}.lower()"),
         2 => format!("{s}.split()"),
-        3 => format!("','.join(['a', 'b', 'c'])"),
+        3 => "','.join(['a', 'b', 'c'])".to_string(),
         4 => format!("{s}.replace('a', 'X')"),
         5 => format!("{s}.strip()"),
         6 => format!("{s}.find('o')"),
@@ -519,7 +571,7 @@ fn gen_builtins(seed: u64) -> Vec<String> {
         5 => format!("pow({a}, {b})"),
         6 => format!("pow({a}, {b}, {})", pick(r, POSINTS)),
         7 => format!("round({x}, {})", r.below(4)),
-        8 => format!("ord('A')"),
+        8 => "ord('A')".to_string(),
         9 => format!("chr({})", 65 + r.below(20)),
         10 => format!("int('{}', 2)", pick(r, &["101", "1111", "10"])),
         _ => format!("sum([{a}, {b}, {n}])"),
@@ -708,8 +760,7 @@ fn signature(program: &str) -> String {
     let body = program
         .lines()
         .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .next_back()
+        .rfind(|l| !l.is_empty())
         .unwrap_or("")
         .to_string();
     mask_words(&mask_numbers(&body))
@@ -746,7 +797,11 @@ fn mask_numbers(s: &str) -> String {
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
-        let prev_alnum = out.chars().last().map(|p| p.is_alphanumeric() || p == '_').unwrap_or(false);
+        let prev_alnum = out
+            .chars()
+            .last()
+            .map(|p| p.is_alphanumeric() || p == '_')
+            .unwrap_or(false);
         if c.is_ascii_digit() && !prev_alnum {
             while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
                 i += 1;
@@ -786,7 +841,9 @@ fn parse_args() -> Args {
     let mut mode = Mode::Mixed;
     let mut verify = 1usize;
     let mut baseline: Option<PathBuf> = None;
-    let mut jobs = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let mut jobs = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
     let mut out_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target")
         .join("parity-fuzz")
@@ -802,12 +859,18 @@ fn parse_args() -> Args {
             }
             "--seed" | "-s" => {
                 i += 1;
-                base_seed = argv.get(i).and_then(|s| s.parse().ok()).unwrap_or(base_seed);
+                base_seed = argv
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(base_seed);
             }
             "--once" => once = true,
             "--timeout-ms" => {
                 i += 1;
-                timeout_ms = argv.get(i).and_then(|s| s.parse().ok()).unwrap_or(timeout_ms);
+                timeout_ms = argv
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(timeout_ms);
             }
             "--out" | "-o" => {
                 i += 1;
@@ -817,18 +880,28 @@ fn parse_args() -> Args {
             }
             "--max-report" => {
                 i += 1;
-                max_report = argv.get(i).and_then(|s| s.parse().ok()).unwrap_or(max_report);
+                max_report = argv
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(max_report);
             }
             "--jobs" | "-j" => {
                 i += 1;
-                jobs = argv.get(i).and_then(|s| s.parse().ok()).filter(|&j| j >= 1).unwrap_or(jobs);
+                jobs = argv
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .filter(|&j| j >= 1)
+                    .unwrap_or(jobs);
             }
             "--mode" | "-m" => {
                 i += 1;
                 match argv.get(i).and_then(|s| mode_from_name(s)) {
                     Some(m) => mode = m,
                     None => {
-                        eprintln!("unknown --mode '{}'", argv.get(i).map(|s| s.as_str()).unwrap_or(""));
+                        eprintln!(
+                            "unknown --mode '{}'",
+                            argv.get(i).map(|s| s.as_str()).unwrap_or("")
+                        );
                         std::process::exit(2);
                     }
                 }
@@ -838,7 +911,11 @@ fn parse_args() -> Args {
             }
             "--verify" => {
                 i += 1;
-                verify = argv.get(i).and_then(|s| s.parse().ok()).filter(|&k| k >= 1).unwrap_or(verify);
+                verify = argv
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .filter(|&k| k >= 1)
+                    .unwrap_or(verify);
             }
             "--baseline" => {
                 i += 1;
@@ -855,7 +932,18 @@ fn parse_args() -> Args {
         }
         i += 1;
     }
-    Args { count, base_seed, once, timeout_ms, out_path, max_report, jobs, mode, verify, baseline }
+    Args {
+        count,
+        base_seed,
+        once,
+        timeout_ms,
+        out_path,
+        max_report,
+        jobs,
+        mode,
+        verify,
+        baseline,
+    }
 }
 
 fn print_help() {
@@ -891,7 +979,10 @@ fn main() {
     let timeout = Duration::from_millis(args.timeout_ms);
 
     if !bin.exists() {
-        eprintln!("pythonrs `python` binary not found at {}; run `cargo build` first", bin.display());
+        eprintln!(
+            "pythonrs `python` binary not found at {}; run `cargo build` first",
+            bin.display()
+        );
         std::process::exit(2);
     }
 
@@ -931,7 +1022,12 @@ fn main() {
 
     eprintln!("oracle: {}", oracle_id(&oracle));
     eprintln!("ours  : {}", bin.display());
-    eprintln!("fuzzing {} cases ({}) across {} workers…", args.count, mode_name(args.mode), args.jobs);
+    eprintln!(
+        "fuzzing {} cases ({}) across {} workers…",
+        args.count,
+        mode_name(args.mode),
+        args.jobs
+    );
 
     std::thread::scope(|scope| {
         for _ in 0..args.jobs {
@@ -972,7 +1068,10 @@ fn main() {
                     }
                     let err_of = |o: &RunOut| -> String {
                         if CMP_STDERR.load(Ordering::Relaxed) {
-                            format!("\n  stderr: {}", render(&norm_stderr(&o.stderr)).replace('\n', "\n  "))
+                            format!(
+                                "\n  stderr: {}",
+                                render(&norm_stderr(&o.stderr)).replace('\n', "\n  ")
+                            )
                         } else {
                             String::new()
                         }
@@ -1072,16 +1171,26 @@ fn main() {
             for d in &divergences {
                 let _ = writeln!(f, "{d}");
             }
-            println!("wrote {} divergences to {}", divergences.len(), args.out_path.display());
+            println!(
+                "wrote {} divergences to {}",
+                divergences.len(),
+                args.out_path.display()
+            );
         }
     }
 
     if !new_records.is_empty() {
-        println!("\n--- {} NEW gap signature(s) (add to baseline once triaged) ---", new_sigs.len());
+        println!(
+            "\n--- {} NEW gap signature(s) (add to baseline once triaged) ---",
+            new_sigs.len()
+        );
         for s in &new_sigs {
             println!("{s}");
         }
-        println!("\n--- first {} new divergence record(s) ---", new_records.len().min(5));
+        println!(
+            "\n--- first {} new divergence record(s) ---",
+            new_records.len().min(5)
+        );
         for d in new_records.iter().take(5) {
             println!("{d}");
         }

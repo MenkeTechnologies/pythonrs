@@ -518,3 +518,79 @@ fn comprehension_loop_var_does_not_leak() {
         "'j'"
     );
 }
+
+// ── Python floor division / modulo semantics ─────────────────────────────────
+
+#[test]
+fn floor_division_signs() {
+    // `//` floors toward negative infinity for every sign combination.
+    assert_eq!(g("x = -7 // 2", "x"), "-4");
+    assert_eq!(g("x = 7 // -2", "x"), "-4");
+    assert_eq!(g("x = -7 // -2", "x"), "3");
+    assert_eq!(g("x = 7 // 2", "x"), "3");
+    // A large operand exercises the BigInt floor path.
+    assert_eq!(g("x = (-7 * 10**30) // (3 * 10**20)", "x"), "-23333333334");
+}
+
+#[test]
+fn modulo_takes_divisor_sign() {
+    // `%` result carries the sign of the divisor.
+    assert_eq!(g("x = -7 % 100", "x"), "93");
+    assert_eq!(g("x = -7 % -100", "x"), "-7");
+    assert_eq!(g("x = 7 % -100", "x"), "-93");
+    assert_eq!(g("x = 0 % -5", "x"), "0");
+    // Float modulo also floors.
+    assert_eq!(g("x = -7.0 % 3.0", "x"), "2.0");
+    // BigInt modulo path.
+    assert_eq!(g("x = (-7 * 10**25) % 100", "x"), "0");
+    assert_eq!(g("x = (-(10**25) - 7) % 100", "x"), "93");
+}
+
+#[test]
+fn pow_three_arg_modular() {
+    assert_eq!(g("x = pow(2, 10, 1000)", "x"), "24");
+    assert_eq!(g("x = pow(3, 4, 5)", "x"), "1");
+    // Large exponent must not overflow (modular square-and-multiply).
+    assert_eq!(g("x = pow(2, 1000, 10**9 + 7)", "x"), "688423210");
+    // Negative base normalizes to the modulus sign.
+    assert_eq!(g("x = pow(-3, 3, 7)", "x"), "1");
+    // Negative modulus yields a non-positive result.
+    assert_eq!(g("x = pow(2, 3, -5)", "x"), "-2");
+}
+
+// ── printf-style `str % args` ────────────────────────────────────────────────
+
+#[test]
+fn percent_format_numeric() {
+    assert_eq!(g("x = '%.2f' % 3.14159", "x"), "'3.14'");
+    assert_eq!(g("x = '%5d' % 42", "x"), "'   42'");
+    assert_eq!(g("x = '%-5d|' % 42", "x"), "'42   |'");
+    assert_eq!(g("x = '%05d' % 42", "x"), "'00042'");
+    assert_eq!(g("x = '%+d' % 7", "x"), "'+7'");
+    assert_eq!(g("x = '% d' % 7", "x"), "' 7'");
+    assert_eq!(g("x = '%x' % 255", "x"), "'ff'");
+    assert_eq!(g("x = '%#x' % 255", "x"), "'0xff'");
+    assert_eq!(g("x = '%o' % 8", "x"), "'10'");
+    assert_eq!(g("x = '%e' % 12345.678", "x"), "'1.234568e+04'");
+    assert_eq!(g("x = '%.2e' % 12345.678", "x"), "'1.23e+04'");
+    assert_eq!(g("x = '%g' % 0.0001", "x"), "'0.0001'");
+    assert_eq!(g("x = '%g' % 0.00001", "x"), "'1e-05'");
+    assert_eq!(g("x = '%g' % 1000000", "x"), "'1e+06'");
+}
+
+#[test]
+fn percent_format_strings_and_star() {
+    assert_eq!(g("x = '%s=%s' % ('k', 3)", "x"), "'k=3'");
+    assert_eq!(g("x = '%r' % 'hi'", "x"), "\"'hi'\"");
+    assert_eq!(g("x = '%.3s' % 'abcdef'", "x"), "'abc'");
+    // `*` pulls width / precision from the argument tuple.
+    assert_eq!(g("x = '%*d' % (5, 42)", "x"), "'   42'");
+    assert_eq!(g("x = '%.*f' % (2, 3.14159)", "x"), "'3.14'");
+    // Mapping form.
+    assert_eq!(
+        g("x = '%(name)s is %(age)d' % {'name': 'x', 'age': 5}", "x"),
+        "'x is 5'"
+    );
+    assert_eq!(g("x = '%c%c' % (72, 105)", "x"), "'Hi'");
+    assert_eq!(g("x = '100%%' % ()", "x"), "'100%'");
+}
