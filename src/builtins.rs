@@ -1374,6 +1374,7 @@ const BUILTIN_FUNCS: &[&str] = &[
     "dir",
     "callable",
     "open",
+    "super",
 ];
 
 // ── builtin functions ────────────────────────────────────────────────────────
@@ -1719,6 +1720,24 @@ pub fn call_builtin_function(
             let v = arg0(&args)?;
             let tn = with_host(|h| h.type_name(&v));
             Ok(with_host(|h| h.alloc(PyObj::Builtin(tn))))
+        }
+        "super" => {
+            // Zero-arg `super()` reads the enclosing method's defining class and
+            // `self`; `super(C, obj)` takes them explicitly.
+            let (owner, instance) = if args.is_empty() {
+                let owner = with_host(|h| h.current_owner())
+                    .ok_or_else(|| host::type_error("super(): no arguments"))?;
+                let inst = with_host(|h| h.current_self())
+                    .ok_or_else(|| host::type_error("super(): no arguments"))?;
+                (owner, inst)
+            } else {
+                let cls = arg0(&args)?;
+                let owner = with_host(|h| callable_name(h, &cls))
+                    .ok_or_else(|| host::type_error("super() argument 1 must be a type"))?;
+                let inst = args.get(1).cloned().unwrap_or(Value::Undef);
+                (owner, inst)
+            };
+            Ok(with_host(|h| h.alloc(PyObj::Super { owner, instance })))
         }
         "isinstance" => {
             let v = arg0(&args)?;
