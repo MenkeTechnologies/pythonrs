@@ -2083,8 +2083,11 @@ pub fn call_builtin_function(
             }
         }
         "type" => {
-            // 3-arg `type(name, bases, ns)` (dynamic class creation) is not
-            // supported; the 1-arg form returns the object's type.
+            // 3-arg `type(name, bases, ns)`: dynamic class creation.
+            if args.len() == 3 {
+                return type_new(&args[0], &args[1], &args[2]);
+            }
+            // 1-arg form: the object's type.
             let v = arg0(&args)?;
             let tn = with_host(|h| h.type_name(&v));
             Ok(with_host(|h| {
@@ -3686,6 +3689,37 @@ fn pad_str(s: &str, args: &[Value], mode: char) -> String {
 /// CPython `str.maketrans`: build a translation table (a dict of ordinal→
 /// int/str/None). Either a single mapping arg, or two equal-length strings
 /// (`x`→`y`), with an optional third string whose chars map to `None`.
+/// `type(name, bases, namespace)` — dynamic class creation. `bases` is a tuple
+/// of class objects; `namespace` a dict of the class body. Registers the class
+/// and returns it.
+fn type_new(name: &Value, bases: &Value, ns: &Value) -> Result<Value, String> {
+    let cname = with_host(|h| h.as_str(name))
+        .ok_or_else(|| host::type_error("type() argument 1 must be str"))?;
+    // Base class names from the bases tuple (a bare `object` base is implicit).
+    let base_names: Vec<String> = with_host(|h| match h.get(bases) {
+        Some(PyObj::Tuple(items)) | Some(PyObj::List(items)) => items
+            .iter()
+            .filter_map(|b| match h.get(b) {
+                Some(PyObj::Class(n)) => Some(n.clone()),
+                Some(PyObj::Builtin(n)) if n != "object" => Some(n.clone()),
+                _ => None,
+            })
+            .collect(),
+        _ => vec![],
+    });
+    // The class-body namespace (string keys → values).
+    let namespace: IndexMap<String, Value> = with_host(|h| match h.get(ns) {
+        Some(PyObj::Dict(d)) => d
+            .values()
+            .filter_map(|(k, v)| h.as_str(k).map(|s| (s, v.clone())))
+            .collect(),
+        _ => IndexMap::new(),
+    });
+    Ok(with_host(|h| {
+        h.register_class(&cname, base_names, namespace)
+    }))
+}
+
 fn str_maketrans(args: &[Value]) -> Result<Value, String> {
     let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
     if args.len() == 1 {

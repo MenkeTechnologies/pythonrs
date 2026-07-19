@@ -140,6 +140,10 @@ pub struct FuncDef {
     pub name: String,
     /// Positional-or-keyword parameter names, in order.
     pub params: Vec<String>,
+    /// How many leading `params` are positional-only (before a `/`). These
+    /// cannot be passed by keyword.
+    #[serde(default)]
+    pub posonly: usize,
     /// How many trailing `params` have defaults.
     pub ndefaults: usize,
     pub star: Option<String>,
@@ -4208,9 +4212,33 @@ fn bind_params(
     for (k, v) in kwargs {
         kwmap.insert(k, v);
     }
+    // A keyword naming a positional-only param is an error unless a `**kwargs`
+    // absorbs it — CPython reports all such names in one message.
+    if def.kwargs.is_none() {
+        let bad: Vec<String> = def.params[..def.posonly.min(np)]
+            .iter()
+            .filter(|p| kwmap.contains_key(*p))
+            .cloned()
+            .collect();
+        if !bad.is_empty() {
+            // CPython quotes the whole comma-joined list once: `'a, b'`.
+            return Err(type_error(&format!(
+                "{}() got some positional-only arguments passed as keyword arguments: '{}'",
+                def.name,
+                bad.join(", ")
+            )));
+        }
+    }
     for i in 0..np {
         if !vars.contains_key(&def.params[i]) {
-            if let Some(v) = kwmap.shift_remove(&def.params[i]) {
+            // A positional-only param (index < posonly) is never bound by a
+            // keyword — a same-named keyword falls through to `**kwargs` or errors.
+            let by_kw = if i < def.posonly {
+                None
+            } else {
+                kwmap.shift_remove(&def.params[i])
+            };
+            if let Some(v) = by_kw {
                 vars.insert(def.params[i].clone(), v);
             } else if i >= np - ndef {
                 let d = defaults[i - (np - ndef)].clone();

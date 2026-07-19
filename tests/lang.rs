@@ -1424,3 +1424,42 @@ fn repr_escaping_and_ascii_and_octal() {
     // Printable Unicode is kept verbatim in repr.
     assert_eq!(g("x = repr('\u{00e9}')", "x"), "\"'\u{00e9}'\"");
 }
+
+#[test]
+fn three_arg_type_and_posonly() {
+    // Dynamic class creation via 3-arg type().
+    assert_eq!(
+        g("C = type('C', (), {'x': 5})\nx = (C.x, C.__name__)", "x"),
+        "(5, 'C')"
+    );
+    assert_eq!(
+        g(
+            "C = type('C', (), {'m': lambda self: 42})\nx = C().m()",
+            "x"
+        ),
+        "42"
+    );
+    assert_eq!(
+        g(
+            "class B:\n    def f(self): return 7\nD = type('D', (B,), {})\nx = D().f()",
+            "x"
+        ),
+        "7"
+    );
+    // Positional-only enforcement.
+    assert_eq!(
+        g("def f(a, b, /, c): return a+b+c\nx = f(1, 2, c=3)", "x"),
+        "6"
+    );
+    assert_eq!(
+        g("def f(a, /, **kw): return (a, kw)\nx = f(1, a=2)", "x"),
+        "(1, {'a': 2})"
+    );
+    assert_eq!(
+        g(
+            "def f(a, b, /): return a+b\ntry:\n    f(a=1, b=2)\nexcept TypeError:\n    x = 'rejected'",
+            "x"
+        ),
+        "'rejected'"
+    );
+}

@@ -589,6 +589,7 @@ impl Compiler {
         let def = FuncDef {
             name: name.to_string(),
             params: params.names.clone(),
+            posonly: params.posonly,
             ndefaults: params.defaults.len(),
             star: params.star.clone(),
             kwonly: params.kwonly.clone(),

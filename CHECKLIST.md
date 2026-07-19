@@ -158,7 +158,9 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
       `is` (types are conceptual singletons) work, so `type(5)==int`, `type(5) is int`,
       `type(b)==B`, `type(b) is B` all hold. Builtin type names repr as `<class 'int'>`
       (functions stay `<built-in function len>`); `isinstance(int, type)`→`True`.
-      Still open: 3-arg `type(name,bases,ns)` / metaclasses; unbound-method access.
+      **3-arg `type(name, bases, ns)` now builds a real class** (`type_new` →
+      `register_class`): attrs, methods, and base inheritance work. Still open:
+      metaclasses (`class A(metaclass=M)` / `M.__new__`); unbound-method access.
 - [x] **Class introspection attrs** — FIXED: instance `__class__`/`__dict__`,
       class `__mro__`/`__bases__`/`__dict__`/`__qualname__` (`object` is the implicit
       MRO/bases tail), and `vars(instance)` (== `__dict__`). User-class repr now
@@ -366,9 +368,16 @@ kinds + guards), `for/else`/`while/else`, `try/except/else/finally` ordering all
 - [x] **Keyword-only default values** — FIXED: `MKFUNC` now carries the evaluated
       keyword-only defaults (a count + values below the func id; cache schema v5);
       `bind_params` applies them for any omitted optional kwonly param. Works for
-      `def`, `lambda`, methods. (Positional-only enforcement still open.)
+      `def`, `lambda`, methods.
+- [x] **Positional-only enforcement** — FIXED: `FuncDef` carries a `posonly` count
+      (cache schema v8); `bind_params` never binds a positional-only param by keyword
+      (a same-named keyword falls through to `**kwargs` or raises CPython's
+      `got some positional-only arguments passed as keyword arguments: 'a, b'`).
 - [ ] **Walrus in a comprehension doesn't leak** to the enclosing scope (should);
-      rebinding the loop var via walrus wrongly allowed.
+      rebinding the loop var via walrus wrongly allowed. (The comprehension result is
+      correct; only the enclosing-scope leak of the `:=` target is missing. Faithful fix
+      needs nonlocal/global injection into the hidden comp function keyed on nesting
+      depth — deferred to avoid destabilizing the at-parity comprehension lowering.)
 
 ## Tier 8 — Surfaces confirmed at parity (regression-guard — keep here only what is probed-OK)
 
