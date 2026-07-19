@@ -890,10 +890,27 @@ fn b_noop(_vm: &mut VM, _: u8) -> Value {
     Value::Undef
 }
 
-fn b_raise(vm: &mut VM, _: u8) -> Value {
+fn b_raise(vm: &mut VM, argc: u8) -> Value {
     let exc = vm.pop();
+    // `raise E from C` pushes cause under exc.
+    let cause = if argc >= 2 { vm.pop() } else { Value::Undef };
+    // The exception currently being handled (set by `b_try`) becomes the new
+    // exception's implicit `__context__`. Capture it before `raise_value`
+    // overwrites `h.exc` with the freshly-raised object.
+    let context = with_host(|h| h.exc.clone().unwrap_or(Value::Undef));
     match host::raise_value(&exc) {
-        Ok(msg) => abort(vm, msg),
+        Ok(msg) => {
+            with_host(|h| {
+                if let Some(new_exc) = h.exc.clone() {
+                    let ctx = match &context {
+                        Value::Obj(_) if new_exc != context => context.clone(),
+                        _ => Value::Undef,
+                    };
+                    h.set_exc_link(&new_exc, cause.clone(), ctx);
+                }
+            });
+            abort(vm, msg)
+        }
         Err(e) => abort(vm, e),
     }
 }
