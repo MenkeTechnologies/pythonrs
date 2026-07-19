@@ -831,3 +831,84 @@ fn range_membership_is_constant_time() {
     assert_eq!(g("x = 2.0 in range(5)", "x"), "True");
     assert_eq!(g("x = 2.5 in range(5)", "x"), "False");
 }
+
+#[test]
+fn property_descriptor() {
+    // Read-only property.
+    assert_eq!(
+        g(
+            "class C:\n    @property\n    def x(self): return 42\nx = C().x",
+            "x"
+        ),
+        "42"
+    );
+    // getter + setter round-trip.
+    assert_eq!(
+        g(
+            "class C:\n    @property\n    def v(self): return self._v\n    @v.setter\n    def v(self, n): self._v = n * 2\nc = C()\nc.v = 5\nx = c.v",
+            "x"
+        ),
+        "10"
+    );
+    // property() functional form with fget/fset.
+    assert_eq!(
+        g(
+            "class C:\n    def _g(self): return self._n + 1\n    def _s(self, n): self._n = n\n    n = property(_g, _s)\nc = C()\nc.n = 10\nx = c.n",
+            "x"
+        ),
+        "11"
+    );
+}
+
+#[test]
+fn user_data_descriptor() {
+    // A data descriptor (__get__/__set__) overrides the instance dict.
+    assert_eq!(
+        g(
+            "class D:\n    def __get__(self, o, t=None): return o._raw * 3\n    def __set__(self, o, val): o._raw = val\nclass C:\n    d = D()\nc = C()\nc.d = 4\nx = c.d",
+            "x"
+        ),
+        "12"
+    );
+}
+
+#[test]
+fn set_name_hook() {
+    assert_eq!(
+        g(
+            "seen = []\nclass D:\n    def __set_name__(self, owner, name): seen.append((owner.__name__, name))\nclass C:\n    a = D()\n    b = D()\nx = seen",
+            "x"
+        ),
+        "[('C', 'a'), ('C', 'b')]"
+    );
+}
+
+#[test]
+fn call_dunder() {
+    assert_eq!(
+        g(
+            "class C:\n    def __call__(self, x): return x + 1\nc = C()\nx = c(41)",
+            "x"
+        ),
+        "42"
+    );
+    assert_eq!(
+        g(
+            "class C:\n    def __call__(self): return 0\nx = callable(C())",
+            "x"
+        ),
+        "True"
+    );
+    assert_eq!(g("class C:\n    pass\nx = callable(C())", "x"), "False");
+}
+
+#[test]
+fn getattr_fallback() {
+    assert_eq!(
+        g(
+            "class C:\n    def __getattr__(self, n): return 'dyn:' + n\nx = C().missing",
+            "x"
+        ),
+        "'dyn:missing'"
+    );
+}
