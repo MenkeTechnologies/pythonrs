@@ -268,6 +268,9 @@ pub struct Frame {
     pub nonlocals_decl: HashSet<String>,
     pub self_obj: Option<Value>,
     pub owner: Option<String>,
+    /// Source line currently executing in this frame — updated by the DAP debug
+    /// line hook (`--dap`); 0 outside debug mode.
+    pub line: u32,
 }
 
 /// A non-local control signal.
@@ -364,6 +367,7 @@ impl PyHost {
                 nonlocals_decl: HashSet::new(),
                 self_obj: None,
                 owner: None,
+                line: 0,
             }],
             error: None,
             exc: None,
@@ -436,6 +440,49 @@ impl PyHost {
     }
     fn cur_env(&self) -> Env {
         self.frame().env.clone()
+    }
+
+    // ── DAP debug introspection (used only under `--dap`) ────────────────────
+    /// Number of active call frames (the debugger's step-depth reference).
+    pub fn frame_depth(&self) -> usize {
+        self.frames.len()
+    }
+    /// Record the source line the innermost frame is executing (DAP line hook).
+    pub fn set_cur_line(&mut self, line: u32) {
+        if let Some(f) = self.frames.last_mut() {
+            f.line = line;
+        }
+    }
+    /// The call stack as (frame name, line) pairs, innermost first — for the DAP
+    /// `stackTrace`. `owner` carries the function/class name where known.
+    pub fn dbg_stack(&self) -> Vec<(String, u32)> {
+        self.frames
+            .iter()
+            .rev()
+            .map(|f| {
+                let name = f.owner.clone().unwrap_or_else(|| "<module>".to_string());
+                (name, f.line)
+            })
+            .collect()
+    }
+    /// The innermost frame's locals as (name, repr) pairs — for DAP `variables`.
+    /// Dunder names are hidden, matching a debugger's default locals view.
+    pub fn dbg_locals(&self) -> Vec<(String, String)> {
+        let env = self.cur_env();
+        let names: Vec<String> = env
+            .borrow()
+            .vars
+            .keys()
+            .filter(|k| !k.starts_with("__"))
+            .cloned()
+            .collect();
+        names
+            .into_iter()
+            .map(|n| {
+                let v = self.read_name(&n).unwrap_or(Value::Undef);
+                (n, self.repr_of(&v))
+            })
+            .collect()
     }
 
     /// LEGB read: local + enclosing chain, then globals. Returns None if unbound
@@ -2093,6 +2140,7 @@ pub fn run_user_func(
             nonlocals_decl: HashSet::new(),
             self_obj: self_val,
             owner,
+            line: 0,
         })
     });
     let r = run_chunk_on(def.chunk.clone());
@@ -2223,6 +2271,7 @@ pub fn build_class(name: &str, bases: Vec<String>, body_func: &Value) -> Result<
             nonlocals_decl: HashSet::new(),
             self_obj: None,
             owner: Some(name.to_string()),
+            line: 0,
         })
     });
     let r = run_chunk_on(def.chunk.clone());
@@ -2304,6 +2353,7 @@ fn make_generator(chunk: Chunk, env: Env, self_val: Option<Value>, owner: Option
         nonlocals_decl: HashSet::new(),
         self_obj: self_val,
         owner,
+        line: 0,
     };
     let id = with_host(|h| {
         let id = h.generators.len() as u32;
@@ -2417,6 +2467,31 @@ pub fn iter_step(it: &Value) -> Result<Option<Value>, String> {
 /// Import a module by name. A small built-in set is supported; unknown modules
 /// raise `ModuleNotFoundError`.
 pub fn import_module(name: &str) -> Result<Value, String> {
+    // Native stdlib modules under src/stdlib. Their `entries` return owned-String
+    // keys (vs the `&str` keys of the inline arms below), so build the namespace
+    // here and return before the `&str` match.
+    let stdlib_entries: Option<Vec<(String, Value)>> = match name {
+        "itertools" => Some(with_host(crate::stdlib::itertools::entries)),
+        "functools" => Some(with_host(crate::stdlib::functools::entries)),
+        "json" => Some(with_host(crate::stdlib::json::entries)),
+        "os" => Some(with_host(crate::stdlib::os::entries)),
+        "random" => Some(with_host(crate::stdlib::random::entries)),
+        "string" => Some(with_host(crate::stdlib::string::entries)),
+        _ => None,
+    };
+    if let Some(entries) = stdlib_entries {
+        return Ok(with_host(|h| {
+            let mut ns = IndexMap::new();
+            for (k, v) in entries {
+                ns.insert(k, v);
+            }
+            h.alloc(PyObj::Module {
+                name: name.to_string(),
+                ns,
+            })
+        }));
+    }
+
     let entries: Vec<(&str, Value)> = match name {
         "math" => with_host(|h| {
             vec![
