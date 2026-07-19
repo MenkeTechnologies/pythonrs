@@ -4098,7 +4098,9 @@ pub fn apply_format_spec(s: &str, v: &Value, spec: &str) -> String {
         sign = chars[i];
         i += 1;
     }
+    let mut alt = false;
     if i < chars.len() && chars[i] == '#' {
+        alt = true;
         i += 1;
     }
     if i < chars.len() && chars[i] == '0' {
@@ -4141,12 +4143,22 @@ pub fn apply_format_spec(s: &str, v: &Value, spec: &str) -> String {
         }
         'e' | 'E' => {
             let f = as_f(v).unwrap_or(0.0);
-            format!("{:.*e}", prec.unwrap_or(6), f)
+            crate::host::fmt_sci(f, prec.unwrap_or(6), ty == 'E')
         }
-        'x' => format!("{:x}", as_i(v).unwrap_or(0)),
-        'X' => format!("{:X}", as_i(v).unwrap_or(0)),
-        'o' => format!("{:o}", as_i(v).unwrap_or(0)),
-        'b' => format!("{:b}", as_i(v).unwrap_or(0)),
+        'g' | 'G' => {
+            let f = as_f(v).unwrap_or(0.0);
+            crate::host::fmt_g(f, prec.unwrap_or(6), ty == 'G', alt)
+        }
+        'c' => match as_i(v) {
+            Some(n) => char::from_u32(n as u32)
+                .map(|c| c.to_string())
+                .unwrap_or_default(),
+            None => s.to_string(),
+        },
+        'x' => format!("{}{:x}", if alt { "0x" } else { "" }, as_i(v).unwrap_or(0)),
+        'X' => format!("{}{:X}", if alt { "0X" } else { "" }, as_i(v).unwrap_or(0)),
+        'o' => format!("{}{:o}", if alt { "0o" } else { "" }, as_i(v).unwrap_or(0)),
+        'b' => format!("{}{:b}", if alt { "0b" } else { "" }, as_i(v).unwrap_or(0)),
         '%' => {
             let f = as_f(v).unwrap_or(0.0) * 100.0;
             format!("{:.*}%", prec.unwrap_or(6), f)

@@ -1944,7 +1944,7 @@ fn split_sign_prefix(s: &str) -> (String, &str) {
 }
 
 /// `%e` / `%E` scientific form with Python's exponent shape (`e[+-]NN`, ≥2 digits).
-fn fmt_sci(x: f64, prec: usize, upper: bool) -> String {
+pub fn fmt_sci(x: f64, prec: usize, upper: bool) -> String {
     let s = format!("{:.*e}", prec, x);
     let (mant, exp) = s.split_once('e').unwrap_or((s.as_str(), "0"));
     let exp_num: i32 = exp.parse().unwrap_or(0);
@@ -1958,7 +1958,7 @@ fn fmt_sci(x: f64, prec: usize, upper: bool) -> String {
 
 /// `%g` / `%G`: choose `f` or `e` style by exponent, `precision` significant
 /// digits (min 1), trailing zeros stripped unless the `#` flag is set.
-fn fmt_g(x: f64, prec: usize, upper: bool, hash: bool) -> String {
+pub fn fmt_g(x: f64, prec: usize, upper: bool, hash: bool) -> String {
     let p = prec.max(1);
     if x == 0.0 {
         return "0".to_string();
