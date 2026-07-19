@@ -23,7 +23,9 @@ use std::path::PathBuf;
 /// Bump on any incompatible change to `CProg` / the lowering / the shard layout.
 /// v3: new builtin op ids + generator/comprehension-as-function/match/unpack
 /// lowering — bytecode compiled by any earlier pythonrs must miss cleanly.
-const SCHEMA: u64 = 3;
+/// v4: `yield from` now lowers to the `GENRET` op (delegated return value); older
+/// cached bytecode for a `yield from` would drop the value, so it must miss.
+const SCHEMA: u64 = 4;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]

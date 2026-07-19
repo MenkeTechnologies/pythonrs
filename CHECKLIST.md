@@ -289,10 +289,17 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
 with-args), lambdas, generator basics + genexpr laziness, `match`/`case` (all pattern
 kinds + guards), `for/else`/`while/else`, `try/except/else/finally` ordering all **work**.
 
-- [ ] **Generator `.send()` / `.throw()` / `.close()` missing** (`AttributeError`) —
-      coroutine-style generators, cooperative pipelines, cleanup-on-close all fail.
-- [ ] **`yield from` drops the delegated `return` value** (always `None`); sent
-      values not forwarded; **`StopIteration.value` attribute missing**.
+- [x] **Generator `.send()` / `.throw()` / `.close()`** — FIXED: `send` feeds the
+      value into the `yield` expression (rejects a non-`None` value into a
+      just-started generator); `throw` queues an exception raised at the suspended
+      `yield` point (`gen_yield` checks `pending_throw`), catchable by the body;
+      `close` throws `GeneratorExit`, runs `finally`, and swallows the clean exit.
+- [x] **`yield from` delegated value + `StopIteration.value`** — FIXED: the body's
+      `return X` is captured into the generator's `ret_value`; `StopIteration.value`
+      exposes it, `next()`/`send()`/`__next__` raise `StopIteration(value)` on
+      exhaustion, and `yield from` lowers to the new `GENRET` op so the expression
+      evaluates to the sub-generator's return value. (Sent-value forwarding through
+      `yield from` still not plumbed.)
 - [ ] **Async is non-functional** — `async def` executes eagerly and returns a plain
       value (no coroutine); `asyncio` `ModuleNotFoundError`; **async comprehensions are
       a `SyntaxError`**; `await` is a passthrough. Anything using an event loop fails.

@@ -1048,3 +1048,36 @@ fn instance_and_class_introspection() {
         "\"<class '__main__.Widget'>\""
     );
 }
+
+#[test]
+fn generator_send_throw_close() {
+    // .send() feeds a value into the yield expression.
+    assert_eq!(
+        g("def acc():\n    t = 0\n    while True:\n        x = yield t\n        t += x\na = acc()\nnext(a)\ny1 = a.send(5)\ny2 = a.send(10)\nx = (y1, y2)", "x"),
+        "(5, 15)"
+    );
+    // .throw() raises at the suspended yield; a handler can resume.
+    assert_eq!(
+        g("def g():\n    try:\n        yield 1\n    except ValueError:\n        yield 99\ngen = g()\nnext(gen)\nx = gen.throw(ValueError())", "x"),
+        "99"
+    );
+    // .close() runs finally and stops the generator.
+    assert_eq!(
+        g("log = []\ndef g():\n    try:\n        yield 1\n    finally:\n        log.append('closed')\ngen = g()\nnext(gen)\ngen.close()\nx = log", "x"),
+        "['closed']"
+    );
+}
+
+#[test]
+fn generator_return_value() {
+    // StopIteration carries the generator's return value.
+    assert_eq!(
+        g("def g():\n    yield 1\n    return 42\ngen = g()\nnext(gen)\nval = None\ntry:\n    next(gen)\nexcept StopIteration as e:\n    val = e.value\nx = val", "x"),
+        "42"
+    );
+    // `yield from` evaluates to the delegated generator's return value.
+    assert_eq!(
+        g("def sub():\n    yield 1\n    yield 2\n    return 99\ndef main():\n    r = yield from sub()\n    yield r\nx = list(main())", "x"),
+        "[1, 2, 99]"
+    );
+}

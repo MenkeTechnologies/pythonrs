@@ -42,6 +42,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::BUILD_CLASS, b_build_class);
     vm.register_builtin(ops::GETITER, b_getiter);
     vm.register_builtin(ops::FORITER, b_foriter);
+    vm.register_builtin(ops::GENRET, b_genret);
     vm.register_builtin(ops::CONTAINS, b_contains);
     vm.register_builtin(ops::IS, b_is);
     vm.register_builtin(ops::RAISE, b_raise);
@@ -773,6 +774,16 @@ fn iter_instance(v: &Value) -> Result<Value, String> {
     Ok(with_host(|h| {
         h.alloc(PyObj::Iter(IterState::Seq { items, idx: 0 }))
     }))
+}
+
+/// `yield from` result: pop the delegated iterator and push the value it
+/// `return`ed (a generator's `StopIteration.value`), or `None` otherwise.
+fn b_genret(vm: &mut VM, _: u8) -> Value {
+    let it = vm.pop();
+    with_host(|h| match h.get(&it) {
+        Some(PyObj::Generator { id }) => h.gen_return_value(*id),
+        _ => Value::Undef,
+    })
 }
 
 fn b_foriter(vm: &mut VM, _: u8) -> Value {
@@ -2196,7 +2207,16 @@ pub fn call_builtin_function(
                 Some(v) => Ok(v),
                 None => match args.get(1) {
                     Some(d) => Ok(d.clone()),
-                    None => Err("StopIteration".into()),
+                    // An exhausted generator raises `StopIteration(value)` carrying
+                    // its `return` value; any other iterator raises a bare one.
+                    None => {
+                        if with_host(|h| matches!(h.get(&it), Some(PyObj::Generator { .. }))) {
+                            let e = host::gen_stop_iteration(&it);
+                            Err(exc_error_string(&e))
+                        } else {
+                            Err("StopIteration".into())
+                        }
+                    }
                 },
             }
         }
@@ -2986,12 +3006,14 @@ pub fn type_has_method(typename: &str, name: &str) -> bool {
         "TextIOWrapper" => FILE_METHODS,
         "int" | "float" | "bool" => NUM_METHODS,
         "property" => PROPERTY_METHODS,
+        "generator" => GENERATOR_METHODS,
         _ => &[],
     };
     list.contains(&name)
 }
 
 const PROPERTY_METHODS: &[&str] = &["getter", "setter", "deleter"];
+const GENERATOR_METHODS: &[&str] = &["send", "throw", "close", "__next__", "__iter__"];
 
 const BYTES_METHODS: &[&str] = &[
     "decode",
@@ -3132,8 +3154,100 @@ pub fn call_type_method(
         "functools._lru_cache_wrapper" => lru_wrapper_method(recv, name),
         "int" | "float" | "bool" => num_method(recv, name, &args),
         "property" => property_method(recv, name, &args),
+        "generator" => generator_method(recv, name, &args),
         other => Err(format!(
             "AttributeError: '{other}' object has no attribute '{name}'"
+        )),
+    }
+}
+
+/// The abort/error string for an exception object (`Class` or `Class: message`).
+fn exc_error_string(exc: &Value) -> String {
+    with_host(|h| match h.get(exc) {
+        Some(PyObj::Exception { class, args }) => {
+            let msg = h.exc_message(args);
+            if msg.is_empty() {
+                class.clone()
+            } else {
+                format!("{class}: {msg}")
+            }
+        }
+        _ => "StopIteration".into(),
+    })
+}
+
+/// `gen.send/throw/close/__next__/__iter__` — the generator method protocol.
+fn generator_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    match name {
+        "__iter__" => Ok(recv.clone()),
+        "send" | "__next__" => {
+            let v = if name == "send" {
+                args.first().cloned().unwrap_or(Value::Undef)
+            } else {
+                Value::Undef
+            };
+            // A just-started generator only accepts `send(None)`.
+            if name == "send" && !host::gen_started(recv) && !matches!(v, Value::Undef) {
+                return Err(host::type_error(
+                    "can't send non-None value to a just-started generator",
+                ));
+            }
+            match host::gen_resume(recv, v)? {
+                Some(y) => Ok(y),
+                None => {
+                    let e = host::gen_stop_iteration(recv);
+                    Err(exc_error_string(&e))
+                }
+            }
+        }
+        "throw" => {
+            // `throw(ExcType)` / `throw(exc_instance)`.
+            let a0 = args.first().cloned().unwrap_or(Value::Undef);
+            let exc = with_host(|h| match h.get(&a0) {
+                // A class/builtin name → instantiate with the remaining args.
+                Some(PyObj::Builtin(n)) if is_exception_class(n) => {
+                    let n = n.clone();
+                    let rest = args.get(1..).unwrap_or(&[]).to_vec();
+                    h.alloc(PyObj::Exception {
+                        class: n,
+                        args: rest,
+                    })
+                }
+                _ => a0.clone(),
+            });
+            match host::gen_throw(recv, exc)? {
+                Some(y) => Ok(y),
+                None => {
+                    let e = host::gen_stop_iteration(recv);
+                    Err(exc_error_string(&e))
+                }
+            }
+        }
+        "close" => {
+            let ge = with_host(|h| {
+                h.alloc(PyObj::Exception {
+                    class: "GeneratorExit".into(),
+                    args: vec![],
+                })
+            });
+            match host::gen_throw(recv, ge) {
+                // The generator yielded again instead of finishing → error.
+                Ok(Some(_)) => Err("RuntimeError: generator ignored GeneratorExit".to_string()),
+                Ok(None) => Ok(Value::Undef),
+                // GeneratorExit (or a clean StopIteration) propagating out is the
+                // normal, expected outcome of close(); swallow it.
+                Err(e) if e.contains("GeneratorExit") || e.contains("StopIteration") => {
+                    with_host(|h| {
+                        h.error = None;
+                        h.exc = None;
+                    });
+                    Ok(Value::Undef)
+                }
+                Err(e) => Err(e),
+            }
+        }
+        _ => Err(format!(
+            "AttributeError: 'generator' object has no attribute '{name}'"
         )),
     }
 }
