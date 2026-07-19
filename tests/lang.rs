@@ -651,6 +651,24 @@ fn custom_getitem_slice_and_slice_repr() {
 }
 
 #[test]
+fn type_returns_a_real_class() {
+    // type(x) compares/repr's as a class, not an internal builtin-function object.
+    assert_eq!(g("x = type(5) == int", "x"), "True");
+    assert_eq!(g("x = type('a') == str", "x"), "True");
+    assert_eq!(g("x = type([]) == list", "x"), "True");
+    assert_eq!(g("x = type(5) is int", "x"), "True");
+    assert_eq!(g("x = type(5) is str", "x"), "False");
+    assert_eq!(g("x = isinstance(int, type)", "x"), "True");
+    assert_eq!(g("x = str(int)", "x"), "\"<class 'int'>\"");
+    // A user class: type(instance) equals and is-identical to the class object.
+    let src =
+        "class B:\n    pass\nb = B()\neq = type(b) == B\nis_ = type(b) is B\nnm = type(b).__name__";
+    assert_eq!(g(src, "eq"), "True");
+    assert_eq!(g(src, "is_"), "True");
+    assert_eq!(g(src, "nm"), "'B'");
+}
+
+#[test]
 fn super_cooperative_inheritance() {
     // super().__init__ + method extension through a single chain.
     let src = "

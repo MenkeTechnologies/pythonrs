@@ -879,7 +879,15 @@ impl PyHost {
                         .unwrap_or_default();
                     format!("<function {name}>")
                 }
-                Some(PyObj::Builtin(n)) => format!("<built-in function {n}>"),
+                // A builtin *type* name (`int`, `list`, …) reprs as `<class 'X'>`;
+                // a builtin *function* (`len`, `print`) as `<built-in function X>`.
+                Some(PyObj::Builtin(n)) => {
+                    if crate::builtins::is_builtin_type_name(n) {
+                        format!("<class '{n}'>")
+                    } else {
+                        format!("<built-in function {n}>")
+                    }
+                }
                 Some(PyObj::BoundMethod { .. }) => "<bound method>".into(),
                 Some(PyObj::Exception { class, args }) => self.exc_str(class, args),
                 Some(PyObj::Module { name, .. }) => format!("<module '{name}'>"),
@@ -1097,6 +1105,10 @@ impl PyHost {
                     | (Some(PyObj::Bytes(x)), Some(PyObj::Bytearray(y)))
                     | (Some(PyObj::Bytearray(x)), Some(PyObj::Bytes(y)))
                     | (Some(PyObj::Bytearray(x)), Some(PyObj::Bytearray(y))) => x == y,
+                    // Type/function objects compare by name, so `type(5) == int`
+                    // and `type(b) == B` hold regardless of heap identity.
+                    (Some(PyObj::Builtin(x)), Some(PyObj::Builtin(y))) => x == y,
+                    (Some(PyObj::Class(x)), Some(PyObj::Class(y))) => x == y,
                     _ => match (a, b) {
                         (Value::Str(x), Value::Str(y)) => x == y,
                         _ => a == b,

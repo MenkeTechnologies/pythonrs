@@ -721,7 +721,16 @@ fn b_is(vm: &mut VM, _: u8) -> Value {
     let b = vm.pop();
     let a = vm.pop();
     let same = match (&a, &b) {
-        (Value::Obj(x), Value::Obj(y)) => x == y,
+        (Value::Obj(x), Value::Obj(y)) => {
+            // Type / builtin objects are conceptual singletons: `type(5) is int`
+            // and `type(b) is B` hold even across distinct heap allocations.
+            x == y
+                || with_host(|h| match (h.get(&a), h.get(&b)) {
+                    (Some(PyObj::Class(m)), Some(PyObj::Class(n))) => m == n,
+                    (Some(PyObj::Builtin(m)), Some(PyObj::Builtin(n))) => m == n,
+                    _ => false,
+                })
+        }
         (Value::Undef, Value::Undef) => true,
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Int(x), Value::Int(y)) => x == y,
@@ -1302,6 +1311,12 @@ pub fn is_builtin_function(name: &str) -> bool {
         || name.starts_with("statistics.")
 }
 
+/// Whether `name` is a builtin *type* (`int`, `list`, …) as opposed to a builtin
+/// function — controls `<class 'X'>` vs `<built-in function X>` repr.
+pub fn is_builtin_type_name(name: &str) -> bool {
+    is_builtin_type(name)
+}
+
 fn is_builtin_type(name: &str) -> bool {
     matches!(
         name,
@@ -1717,9 +1732,17 @@ pub fn call_builtin_function(
             }
         }
         "type" => {
+            // 3-arg `type(name, bases, ns)` (dynamic class creation) is not
+            // supported; the 1-arg form returns the object's type.
             let v = arg0(&args)?;
             let tn = with_host(|h| h.type_name(&v));
-            Ok(with_host(|h| h.alloc(PyObj::Builtin(tn))))
+            Ok(with_host(|h| {
+                if h.classes.contains_key(&tn) {
+                    h.alloc(PyObj::Class(tn))
+                } else {
+                    h.alloc(PyObj::Builtin(tn))
+                }
+            }))
         }
         "super" => {
             // Zero-arg `super()` reads the enclosing method's defining class and
@@ -2522,6 +2545,14 @@ fn isinstance(h: &host::PyHost, v: &Value, cls: &Value) -> bool {
         Some(n) => n,
         None => return false,
     };
+    // A class object (a user `Class` or a builtin type) is an instance of `type`.
+    if want == "type" {
+        match h.get(v) {
+            Some(PyObj::Class(_)) => return true,
+            Some(PyObj::Builtin(n)) if is_builtin_type(n) => return true,
+            _ => {}
+        }
+    }
     let vt = h.type_name(v);
     if type_isa(h, &vt, &want) {
         return true;
