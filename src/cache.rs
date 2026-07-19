@@ -91,10 +91,17 @@ fn write_shard(shard: &Shard) -> Result<(), String> {
     // Atomic replace (write temp + rename) so a concurrent reader — up to 16
     // instances run against the shared shard — never sees a torn file. A losing
     // concurrent writer just drops its entry (recompiled next run); it can never
-    // corrupt the shard.
-    let tmp = path.with_extension(format!("rkyv.tmp.{}", std::process::id()));
+    // corrupt the shard. The temp name is unique per WRITE (pid + a monotonic
+    // counter), not just per process, so concurrent writers within one process
+    // (e.g. parallel test threads) never clobber each other's temp file.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("rkyv.tmp.{}.{n}", std::process::id()));
     std::fs::write(&tmp, &bytes).map_err(|e| format!("cache write: {e}"))?;
-    std::fs::rename(&tmp, &path).map_err(|e| format!("cache rename: {e}"))
+    std::fs::rename(&tmp, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("cache rename: {e}")
+    })
 }
 
 /// Look up a compiled program for `src`, if present and current.
