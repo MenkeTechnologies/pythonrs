@@ -57,6 +57,16 @@ path = "src/bin/gen_docs.rs"
 name = "parity"
 path = "src/bin/parity.rs"
 
+# Differential parity FUZZER: generates thousands of deterministic-output Python
+# snippets (biased toward float repr, int //-/%- sign rules, bignum, slices, the
+# format mini-language, string methods) and diffs `python -c` against the
+# reference `python3 -c`, delta-debugging every divergence to a minimal repro.
+# Subprocess-only (never links the lib); std-only (no `rand`). Dev tool — needs
+# `python3` on PATH, so CI never runs it.
+[[bin]]
+name = "parity-fuzz"
+path = "src/bin/parity_fuzz.rs"
+
 [dependencies]
 # Python executes on fusevm. pythonrs is a pure frontend: it lowers Python to
 # fusevm bytecode (src/compiler.rs) and hosts the Python object heap
