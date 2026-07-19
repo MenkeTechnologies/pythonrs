@@ -481,6 +481,10 @@ pub struct PyHost {
     pub nt_meta: HashMap<u32, NtMeta>,
     /// `lru_cache` memo tables, indexed by `PyObj::LruCache.cache_id`.
     lru_caches: Vec<LruData>,
+    /// Exception chaining links, keyed by the exception object's heap index.
+    /// `.0` = `__cause__` (`raise X from Y`), `.1` = `__context__` (the
+    /// exception being handled when this one was raised). `Value::Undef` = unset.
+    pub exc_links: HashMap<u32, (Value, Value)>,
 }
 
 /// One suspended generator. `coro` is `None` only while this generator is
@@ -567,7 +571,36 @@ impl PyHost {
             dict_meta: HashMap::new(),
             nt_meta: HashMap::new(),
             lru_caches: Vec::new(),
+            exc_links: HashMap::new(),
         }
+    }
+
+    /// Record `__cause__`/`__context__` for an exception object. `Undef` leaves
+    /// a slot unset. Merges with any existing links (a later implicit
+    /// `__context__` must not clobber an explicit `__cause__`).
+    pub fn set_exc_link(&mut self, exc: &Value, cause: Value, context: Value) {
+        if let Value::Obj(i) = exc {
+            let slot = self
+                .exc_links
+                .entry(*i)
+                .or_insert((Value::Undef, Value::Undef));
+            if !matches!(cause, Value::Undef) {
+                slot.0 = cause;
+            }
+            if !matches!(context, Value::Undef) {
+                slot.1 = context;
+            }
+        }
+    }
+
+    /// Read `__cause__` (`.0`) / `__context__` (`.1`) for an exception object.
+    pub fn exc_link(&self, exc: &Value) -> (Value, Value) {
+        if let Value::Obj(i) = exc {
+            if let Some(links) = self.exc_links.get(i) {
+                return links.clone();
+            }
+        }
+        (Value::Undef, Value::Undef)
     }
 
     // ── program loading ──────────────────────────────────────────────────
@@ -2887,6 +2920,14 @@ impl PyHost {
     /// `super()` across diamond inheritance visits every base exactly once in the
     /// correct order. (`object` is implicit and omitted, since no methods live on
     /// it in the class registry.)
+    /// Whether `class` (a user class name) derives from a builtin exception type
+    /// — i.e. its MRO reaches a name that `is_exception_class` recognizes.
+    pub fn class_is_exception(&self, class: &str) -> bool {
+        self.mro_of(class)
+            .iter()
+            .any(|c| crate::builtins::is_exception_class(c))
+    }
+
     pub fn mro_of(&self, class: &str) -> Vec<String> {
         let bases: Vec<String> = self
             .classes
@@ -2967,6 +3008,18 @@ impl PyHost {
             Some(PyObj::Instance(inst)) => {
                 if let Some(v) = inst.attrs.get(name) {
                     return Ok(v.clone());
+                }
+                // Exception chaining links live in a side table, not the
+                // instance dict (a user exception is a plain `Instance`). Only
+                // exception instances expose these dunders.
+                if (name == "__cause__" || name == "__context__" || name == "__suppress_context__")
+                    && self.class_is_exception(&inst.class)
+                {
+                    return Ok(match name {
+                        "__cause__" => self.exc_link(recv).0,
+                        "__context__" => self.exc_link(recv).1,
+                        _ => Value::Bool(!matches!(self.exc_link(recv).0, Value::Undef)),
+                    });
                 }
                 let class = inst.class.clone();
                 // Instance introspection: `__class__` and `__dict__`.
@@ -3101,10 +3154,16 @@ impl PyHost {
                 if name == "value" && (class == "StopIteration" || class == "StopAsyncIteration") {
                     return Ok(args.first().cloned().unwrap_or(Value::Undef));
                 }
-                // `<Exc>.__cause__`/`__context__` — chaining isn't tracked yet, so
-                // these are always `None` (matching an unchained exception).
-                if name == "__cause__" || name == "__context__" {
-                    return Ok(Value::Undef);
+                if name == "__cause__" {
+                    return Ok(self.exc_link(recv).0);
+                }
+                if name == "__context__" {
+                    return Ok(self.exc_link(recv).1);
+                }
+                if name == "__suppress_context__" {
+                    // True iff an explicit cause was set (`raise X from Y`).
+                    let has_cause = !matches!(self.exc_link(recv).0, Value::Undef);
+                    return Ok(Value::Bool(has_cause));
                 }
                 let class = class.clone();
                 Err(format!(

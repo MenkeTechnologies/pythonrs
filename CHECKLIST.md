@@ -333,8 +333,13 @@ kinds + guards), `for/else`/`while/else`, `try/except/else/finally` ordering all
       exception as the "currently handled" one (`h.exc`) while its body runs, so a
       bare `raise` re-raises it (caught by an outer handler); it is cleared when the
       handler finishes without raising. (`b_try`.)
-- [ ] **Exception chaining absent** — `raise X from Y` → `__cause__`/`__context__` not
-      stored (`AttributeError`); `ExceptionGroup` undefined (though `except*` parses).
+- [x] **Exception chaining** — FIXED: per-exception `__cause__`/`__context__` live in
+      a heap-index-keyed side table (`PyHost.exc_links`). `raise X from Y` wires
+      `__cause__` (and `__suppress_context__`→True); raising inside a handler sets the
+      implicit `__context__` to the exception being handled (`h.exc` captured before
+      the new raise overwrites it). Both readable on builtin `Exception` objects and on
+      user exception instances (gated by `class_is_exception` so non-exception objects
+      still `AttributeError`). Still open: `ExceptionGroup` (though `except*` parses).
 - [x] **Keyword-only default values** — FIXED: `MKFUNC` now carries the evaluated
       keyword-only defaults (a count + values below the func id; cache schema v5);
       `bind_params` applies them for any omitted optional kwonly param. Works for

@@ -1151,9 +1151,47 @@ fn complex_arithmetic() {
     assert_eq!(g("x = (2+3j) ** 2", "x"), "(-5+12j)");
     assert_eq!(g("x = 2j ** 2", "x"), "(-4+0j)");
     // A negative real base to a fractional power yields a complex root.
-    assert_eq!(g("x = (-8) ** (1/3)", "x"), "(1.0000000000000002+1.7320508075688772j)");
+    assert_eq!(
+        g("x = (-8) ** (1/3)", "x"),
+        "(1.0000000000000002+1.7320508075688772j)"
+    );
     assert_eq!(g("x = (1+2j) == (1+2j)", "x"), "True");
     assert_eq!(g("x = bool(0j)", "x"), "False");
     // A zero-imaginary complex keys the same slot as the equal real number.
     assert_eq!(g("x = complex(1, 0) in {1}", "x"), "True");
+}
+
+#[test]
+fn exception_chaining() {
+    // `raise X from Y` sets __cause__ (and __suppress_context__).
+    assert_eq!(
+        g(
+            "try:\n    try:\n        raise ValueError('inner')\n    except ValueError as e:\n        raise TypeError('outer') from e\nexcept TypeError as t:\n    x = type(t.__cause__).__name__",
+            "x"
+        ),
+        "'ValueError'"
+    );
+    assert_eq!(
+        g(
+            "try:\n    try:\n        raise ValueError('inner')\n    except ValueError as e:\n        raise TypeError('outer') from e\nexcept TypeError as t:\n    x = t.__suppress_context__",
+            "x"
+        ),
+        "True"
+    );
+    // Implicit __context__ during handling; no explicit cause.
+    assert_eq!(
+        g(
+            "try:\n    try:\n        raise ValueError('v')\n    except ValueError:\n        raise TypeError('t')\nexcept TypeError as t:\n    x = (type(t.__context__).__name__, t.__cause__)",
+            "x"
+        ),
+        "('ValueError', None)"
+    );
+    // User exception class carries a chain via the side table.
+    assert_eq!(
+        g(
+            "class E(Exception): pass\ntry:\n    raise E('x') from ValueError('c')\nexcept E as e:\n    x = type(e.__cause__).__name__",
+            "x"
+        ),
+        "'ValueError'"
+    );
 }

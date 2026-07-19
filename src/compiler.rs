@@ -243,11 +243,20 @@ impl Compiler {
             StmtKind::Match { subject, cases } => {
                 self.compile_match(b, subject, cases)?;
             }
-            StmtKind::Raise { exc, .. } => match exc {
-                Some(e) => {
-                    self.compile_expr(b, e)?;
-                    b.emit(Op::CallBuiltin(ops::RAISE, 1), line);
-                }
+            StmtKind::Raise { exc, cause } => match exc {
+                Some(e) => match cause {
+                    Some(c) => {
+                        // `raise E from C`: push cause then exc; b_raise(2) pops
+                        // exc first, then cause, and wires `__cause__`.
+                        self.compile_expr(b, c)?;
+                        self.compile_expr(b, e)?;
+                        b.emit(Op::CallBuiltin(ops::RAISE, 2), line);
+                    }
+                    None => {
+                        self.compile_expr(b, e)?;
+                        b.emit(Op::CallBuiltin(ops::RAISE, 1), line);
+                    }
+                },
                 None => {
                     b.emit(Op::CallBuiltin(ops::RERAISE, 0), line);
                     b.emit(Op::Pop, line);
