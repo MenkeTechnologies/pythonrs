@@ -296,6 +296,53 @@ pub enum StmtKind {
         test: Expr,
         msg: Option<Expr>,
     },
+    /// `match subject: case ...` — structural pattern matching (Python 3.10).
+    Match {
+        subject: Expr,
+        cases: Vec<MatchCase>,
+    },
+}
+
+/// One `case pattern [if guard]: body` of a `match`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchCase {
+    pub pattern: Pattern,
+    pub guard: Option<Expr>,
+    pub body: Vec<Stmt>,
+}
+
+/// A `match` pattern (PEP 634).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Pattern {
+    /// `_` — matches anything, binds nothing.
+    Wildcard,
+    /// A capture name — matches anything, binds it.
+    Capture(String),
+    /// A literal or dotted-value pattern (`1`, `"x"`, `None`, `Color.RED`),
+    /// matched by `==`.
+    Value(Expr),
+    /// `p | q | ...` — matches if any alternative matches.
+    Or(Vec<Pattern>),
+    /// `pattern as name` — matches the sub-pattern and binds `name` to the whole.
+    As(Box<Pattern>, String),
+    /// `[p, *rest, q]` — a sequence pattern. `star` is the index of the `*` slot.
+    Sequence {
+        elems: Vec<Pattern>,
+        star: Option<usize>,
+    },
+    /// `*name` / `*_` inside a sequence pattern.
+    Star(Option<String>),
+    /// `{key: p, ..., **rest}` — a mapping pattern.
+    Mapping {
+        keys: Vec<(Expr, Pattern)>,
+        rest: Option<String>,
+    },
+    /// `ClassName(pos..., kw=pat...)` — a class pattern.
+    Class {
+        cls: Expr,
+        pos: Vec<Pattern>,
+        kw: Vec<(String, Pattern)>,
+    },
 }
 
 /// An `import` alias: `name [as asname]`.

@@ -226,13 +226,22 @@ impl Compiler {
                     self.compile_delete(b, t)?;
                 }
             }
-            StmtKind::Global(names) | StmtKind::Nonlocal(names) => {
-                // `nonlocal` is approximated by `global` in the current scope model.
+            StmtKind::Global(names) => {
                 for n in names {
                     self.name_const(b, n);
                     b.emit(Op::CallBuiltin(ops::DECLARE_GLOBAL, 1), line);
                     b.emit(Op::Pop, line);
                 }
+            }
+            StmtKind::Nonlocal(names) => {
+                for n in names {
+                    self.name_const(b, n);
+                    b.emit(Op::CallBuiltin(ops::DECLARE_NONLOCAL, 1), line);
+                    b.emit(Op::Pop, line);
+                }
+            }
+            StmtKind::Match { subject, cases } => {
+                self.compile_match(b, subject, cases)?;
             }
             StmtKind::Raise { exc, .. } => match exc {
                 Some(e) => {
@@ -748,31 +757,63 @@ impl Compiler {
                 b.emit(Op::CallBuiltin(ops::GETLOCAL, 1), 0);
             }
             Expr::List(items) => {
-                self.compile_seq(b, items)?;
-                b.emit(Op::CallBuiltin(ops::MKLIST, argc(items.len())?), 0);
+                if items.iter().any(|e| matches!(e, Expr::Starred(_))) {
+                    // BUILD_ARGS already yields a flat `list`.
+                    self.compile_arg_spread(b, items)?;
+                } else {
+                    self.compile_seq(b, items)?;
+                    b.emit(Op::CallBuiltin(ops::MKLIST, argc(items.len())?), 0);
+                }
             }
             Expr::Tuple(items) => {
-                self.compile_seq(b, items)?;
-                b.emit(Op::CallBuiltin(ops::MKTUPLE, argc(items.len())?), 0);
+                if items.iter().any(|e| matches!(e, Expr::Starred(_))) {
+                    // Flatten to a list, then convert to a tuple.
+                    self.name_const(b, "tuple");
+                    self.compile_arg_spread(b, items)?;
+                    b.emit(Op::CallBuiltin(ops::CALL, 2), 0);
+                } else {
+                    self.compile_seq(b, items)?;
+                    b.emit(Op::CallBuiltin(ops::MKTUPLE, argc(items.len())?), 0);
+                }
             }
             Expr::Set(items) => {
-                self.compile_seq(b, items)?;
-                b.emit(Op::CallBuiltin(ops::MKSET, argc(items.len())?), 0);
+                if items.iter().any(|e| matches!(e, Expr::Starred(_))) {
+                    self.name_const(b, "set");
+                    self.compile_arg_spread(b, items)?;
+                    b.emit(Op::CallBuiltin(ops::CALL, 2), 0);
+                } else {
+                    self.compile_seq(b, items)?;
+                    b.emit(Op::CallBuiltin(ops::MKSET, argc(items.len())?), 0);
+                }
             }
             Expr::Dict(pairs) => {
-                for (k, v) in pairs {
-                    match k {
-                        Some(k) => {
+                if pairs.iter().any(|(k, _)| k.is_none()) {
+                    // `{**a, "k": v, **b}` — each entry is (tag, a, b): tag 1 =
+                    // `**` spread of `a` (b unused), tag 0 = plain (key a, val b).
+                    for (k, v) in pairs {
+                        match k {
+                            Some(k) => {
+                                b.emit(Op::LoadInt(0), 0);
+                                self.compile_expr(b, k)?;
+                                self.compile_expr(b, v)?;
+                            }
+                            None => {
+                                b.emit(Op::LoadInt(1), 0);
+                                self.compile_expr(b, v)?;
+                                b.emit(Op::LoadUndef, 0);
+                            }
+                        }
+                    }
+                    b.emit(Op::CallBuiltin(ops::MKDICT_EX, argc(pairs.len() * 3)?), 0);
+                } else {
+                    for (k, v) in pairs {
+                        if let Some(k) = k {
                             self.compile_expr(b, k)?;
                             self.compile_expr(b, v)?;
                         }
-                        None => {
-                            // **mapping spread — see BUGS; skipped for now.
-                            return Err("dict ** unpacking not yet supported".into());
-                        }
                     }
+                    b.emit(Op::CallBuiltin(ops::MKDICT, argc(pairs.len() * 2)?), 0);
                 }
-                b.emit(Op::CallBuiltin(ops::MKDICT, argc(pairs.len() * 2)?), 0);
             }
             Expr::Starred(inner) => self.compile_expr(b, inner)?,
             Expr::BoolOp(op, values) => self.compile_boolop(b, *op, values)?,
@@ -829,9 +870,7 @@ impl Compiler {
             Expr::SetComp(elt, comps) => {
                 self.compile_comprehension(b, CompKind::Set, elt, None, comps)?
             }
-            Expr::GenExp(elt, comps) => {
-                self.compile_comprehension(b, CompKind::List, elt, None, comps)?
-            }
+            Expr::GenExp(elt, comps) => self.compile_genexp(b, elt, comps)?,
             Expr::DictComp(k, v, comps) => {
                 self.compile_comprehension(b, CompKind::Dict, k, Some(v), comps)?
             }
@@ -840,13 +879,41 @@ impl Compiler {
                 b.emit(Op::Dup, 0);
                 self.compile_assign(b, target)?;
             }
-            Expr::Yield(_) | Expr::YieldFrom(_) => {
-                return Err(
-                    "yield is only valid inside a generator (unsupported; see BUGS)".into(),
-                );
+            Expr::Yield(val) => {
+                match val {
+                    Some(e) => self.compile_expr(b, e)?,
+                    None => {
+                        b.emit(Op::LoadUndef, 0);
+                    }
+                }
+                // YIELDV suspends and leaves the value sent by `.send()`/`next`
+                // on the stack (None for plain iteration).
+                b.emit(Op::CallBuiltin(ops::YIELDV, 1), 0);
+            }
+            Expr::YieldFrom(inner) => {
+                // `yield from E` — iterate E, yielding each item. The delegating
+                // expression value (the sub-generator's return) is None here.
+                self.compile_yield_from(b, inner)?;
             }
             Expr::Await(inner) => self.compile_expr(b, inner)?,
         }
+        Ok(())
+    }
+
+    /// `yield from iterable` — drive the iterable, yielding each element.
+    fn compile_yield_from(&mut self, b: &mut ChunkBuilder, iter: &Expr) -> Result<(), String> {
+        self.compile_expr(b, iter)?;
+        b.emit(Op::CallBuiltin(ops::GETITER, 1), 0); // [it]
+        let start = b.current_pos();
+        b.emit(Op::CallBuiltin(ops::FORITER, 0), 0); // [it, value, has_next]
+        let jdone = b.emit(Op::JumpIfFalse(0), 0); // pops has_next -> [it, value]
+        b.emit(Op::CallBuiltin(ops::YIELDV, 1), 0); // yield value -> [it, sent]
+        b.emit(Op::Pop, 0); // drop sent -> [it]
+        b.emit(Op::Jump(start), 0);
+        let done = b.current_pos();
+        b.patch_jump(jdone, done);
+        b.emit(Op::Pop, 0); // drop iterator
+        b.emit(Op::LoadUndef, 0); // expression value
         Ok(())
     }
 
@@ -1096,7 +1163,7 @@ impl Compiler {
         let has_star = args.iter().any(|a| matches!(a, Expr::Starred(_)));
         let has_kwsplat = keywords.iter().any(|k| k.name.is_none());
         if has_star || has_kwsplat {
-            return Err("call-site * / ** unpacking not yet supported (see BUGS)".into());
+            return self.compile_call_ex(b, func, args, keywords);
         }
         let named: Vec<&Keyword> = keywords.iter().collect();
         let build_kw = |c: &mut Self, b: &mut ChunkBuilder| -> Result<(), String> {
@@ -1150,7 +1217,82 @@ impl Compiler {
         Ok(())
     }
 
+    /// Emit the positional-args list for a call/literal that contains `*spread`
+    /// elements: each element is `(tag, value)` where tag 1 means spread. The
+    /// `BUILD_ARGS` handler flattens spreads and returns a `list`.
+    fn compile_arg_spread(&mut self, b: &mut ChunkBuilder, items: &[Expr]) -> Result<(), String> {
+        for it in items {
+            match it {
+                Expr::Starred(inner) => {
+                    b.emit(Op::LoadInt(1), 0);
+                    self.compile_expr(b, inner)?;
+                }
+                _ => {
+                    b.emit(Op::LoadInt(0), 0);
+                    self.compile_expr(b, it)?;
+                }
+            }
+        }
+        b.emit(Op::CallBuiltin(ops::BUILD_ARGS, argc(items.len() * 2)?), 0);
+        Ok(())
+    }
+
+    /// Emit the kwargs dict for a call with `name=v` and `**mapping` keywords:
+    /// each entry is `(key, value)` where a `None`-key (Undef) is a `**` spread.
+    fn compile_kw_spread(&mut self, b: &mut ChunkBuilder, kws: &[Keyword]) -> Result<(), String> {
+        for kw in kws {
+            match &kw.name {
+                Some(n) => self.strlit(b, n),
+                None => {
+                    b.emit(Op::LoadUndef, 0);
+                }
+            }
+            self.compile_expr(b, &kw.value)?;
+        }
+        b.emit(Op::CallBuiltin(ops::BUILD_KWARGS, argc(kws.len() * 2)?), 0);
+        Ok(())
+    }
+
+    /// Lower a call with `*args`/`**kwargs` unpacking through the EX ops.
+    fn compile_call_ex(
+        &mut self,
+        b: &mut ChunkBuilder,
+        func: &Expr,
+        args: &[Expr],
+        keywords: &[Keyword],
+    ) -> Result<(), String> {
+        match func {
+            Expr::Attribute(recv, attr) => {
+                self.compile_expr(b, recv)?;
+                self.name_const(b, attr);
+                self.compile_arg_spread(b, args)?;
+                self.compile_kw_spread(b, keywords)?;
+                b.emit(Op::CallBuiltin(ops::CALL_METHOD_EX, 4), 0);
+            }
+            Expr::Name(n) => {
+                self.name_const(b, n);
+                self.compile_arg_spread(b, args)?;
+                self.compile_kw_spread(b, keywords)?;
+                b.emit(Op::CallBuiltin(ops::CALL_EX, 3), 0);
+            }
+            _ => {
+                self.compile_expr(b, func)?;
+                self.compile_arg_spread(b, args)?;
+                self.compile_kw_spread(b, keywords)?;
+                b.emit(Op::CallBuiltin(ops::CALL_VALUE_EX, 3), 0);
+            }
+        }
+        Ok(())
+    }
+
     // ── comprehensions ───────────────────────────────────────────────────
+    //
+    // Python 3 runs a comprehension in its OWN function scope: the loop variable
+    // never leaks to the enclosing scope, and enclosing variables are read via
+    // the closure. So a comprehension lowers to a hidden nullary-ish function
+    // whose single parameter `.0` is the outermost iterable (evaluated in the
+    // enclosing scope, matching CPython), and whose body builds and returns the
+    // container. This gives own-scope and no-leak for free.
     fn compile_comprehension(
         &mut self,
         b: &mut ChunkBuilder,
@@ -1159,86 +1301,325 @@ impl Compiler {
         val: Option<&Expr>,
         comps: &[Comprehension],
     ) -> Result<(), String> {
-        // Accumulate into a hidden local, then leave it on the stack.
-        let acc = format!("__comp{}__", self.tmp);
-        self.tmp += 1;
-        match kind {
-            CompKind::List => b.emit(Op::CallBuiltin(ops::MKLIST, 0), 0),
-            CompKind::Set => b.emit(Op::CallBuiltin(ops::MKSET, 0), 0),
-            CompKind::Dict => b.emit(Op::CallBuiltin(ops::MKDICT, 0), 0),
+        let acc = ".result";
+        // Accumulator init + append/add/insert element.
+        let empty = match kind {
+            CompKind::List => Expr::List(vec![]),
+            CompKind::Set => Expr::Set(vec![]),
+            CompKind::Dict => Expr::Dict(vec![]),
         };
-        self.store_name(b, &acc);
-        self.compile_comp_clauses(b, kind, &acc, elt, val, comps, 0)?;
-        self.name_const(b, &acc);
-        b.emit(Op::CallBuiltin(ops::GETLOCAL, 1), 0);
+        let add_stmt: Stmt = match kind {
+            CompKind::List => StmtKind::Expr(Expr::Call {
+                func: Box::new(Expr::Attribute(
+                    Box::new(Expr::Name(acc.into())),
+                    "append".into(),
+                )),
+                args: vec![elt.clone()],
+                keywords: vec![],
+            })
+            .into(),
+            CompKind::Set => StmtKind::Expr(Expr::Call {
+                func: Box::new(Expr::Attribute(
+                    Box::new(Expr::Name(acc.into())),
+                    "add".into(),
+                )),
+                args: vec![elt.clone()],
+                keywords: vec![],
+            })
+            .into(),
+            CompKind::Dict => StmtKind::Assign {
+                targets: vec![Expr::Subscript(
+                    Box::new(Expr::Name(acc.into())),
+                    Box::new(elt.clone()),
+                )],
+                value: val.unwrap().clone(),
+            }
+            .into(),
+        };
+        let mut inner = vec![add_stmt];
+        inner = wrap_comp_clauses(inner, comps);
+        let mut body = vec![StmtKind::Assign {
+            targets: vec![Expr::Name(acc.into())],
+            value: empty,
+        }
+        .into()];
+        body.extend(inner);
+        body.push(StmtKind::Return(Some(Expr::Name(acc.into()))).into());
+        self.emit_comp_call(b, "<comp>", body, &comps[0].iter)
+    }
+
+    /// A generator expression `(elt for target in iter ...)` — lazy: a hidden
+    /// generator function that yields each element.
+    fn compile_genexp(
+        &mut self,
+        b: &mut ChunkBuilder,
+        elt: &Expr,
+        comps: &[Comprehension],
+    ) -> Result<(), String> {
+        let yield_stmt: Stmt = StmtKind::Expr(Expr::Yield(Some(Box::new(elt.clone())))).into();
+        let body = wrap_comp_clauses(vec![yield_stmt], comps);
+        self.emit_comp_call(b, "<genexpr>", body, &comps[0].iter)
+    }
+
+    /// Build the hidden comprehension/genexpr function `def name(.0): body` and
+    /// emit code to call it with the outermost iterable — the shared tail of
+    /// both comprehension and genexpr lowering.
+    fn emit_comp_call(
+        &mut self,
+        b: &mut ChunkBuilder,
+        name: &str,
+        body: Vec<Stmt>,
+        outer_iter: &Expr,
+    ) -> Result<(), String> {
+        let params = Params {
+            names: vec![".0".into()],
+            ..Params::default()
+        };
+        let def_id = self.build_function(name, &params, &body)?;
+        b.emit(Op::LoadInt(def_id as i64), 0);
+        b.emit(Op::CallBuiltin(ops::MKFUNC, 1), 0); // [func]
+        self.compile_expr(b, outer_iter)?; // [func, iterable]
+        b.emit(Op::CallBuiltin(ops::CALL_VALUE, 2), 0);
         Ok(())
     }
 
-    // A lowering helper that legitimately threads compiler + comprehension state.
-    #[allow(clippy::too_many_arguments)]
-    fn compile_comp_clauses(
+    // ── match / case (PEP 634 structural pattern matching) ────────────────
+    fn compile_match(
         &mut self,
         b: &mut ChunkBuilder,
-        kind: CompKind,
-        acc: &str,
-        elt: &Expr,
-        val: Option<&Expr>,
-        comps: &[Comprehension],
-        depth: usize,
+        subject: &Expr,
+        cases: &[MatchCase],
     ) -> Result<(), String> {
-        if depth == comps.len() {
-            // Innermost: append/add/insert the element.
-            self.name_const(b, acc);
-            b.emit(Op::CallBuiltin(ops::GETLOCAL, 1), 0); // [acc]
-            match kind {
-                CompKind::List => {
-                    self.name_const(b, "append");
-                    self.compile_expr(b, elt)?;
-                    b.emit(Op::CallBuiltin(ops::CALL_METHOD, 3), 0);
-                    b.emit(Op::Pop, 0);
-                }
-                CompKind::Set => {
-                    self.name_const(b, "add");
-                    self.compile_expr(b, elt)?;
-                    b.emit(Op::CallBuiltin(ops::CALL_METHOD, 3), 0);
-                    b.emit(Op::Pop, 0);
-                }
-                CompKind::Dict => {
-                    // acc[key] = value
-                    self.compile_expr(b, elt)?; // key
-                    self.compile_expr(b, val.unwrap())?; // value
-                    b.emit(Op::CallBuiltin(ops::SETITEM, 3), 0);
-                    b.emit(Op::Pop, 0);
-                }
+        let subj = format!(".match{}", self.tmp);
+        self.tmp += 1;
+        self.compile_expr(b, subject)?;
+        self.store_name(b, &subj);
+        let mut end_jumps = Vec::new();
+        for case in cases {
+            let mut fails = Vec::new();
+            // Load the subject fresh for this case's pattern test.
+            self.load_local(b, &subj);
+            self.compile_pattern(b, &case.pattern, &mut fails)?;
+            if let Some(g) = &case.guard {
+                self.compile_condition(b, g)?;
+                let jf = b.emit(Op::JumpIfFalse(0), 0);
+                fails.push(jf);
             }
-            return Ok(());
+            self.compile_stmts(b, &case.body)?;
+            end_jumps.push(b.emit(Op::Jump(0), 0));
+            let next = b.current_pos();
+            for f in fails {
+                b.patch_jump(f, next);
+            }
         }
-        let comp = &comps[depth];
-        self.compile_expr(b, &comp.iter)?;
-        b.emit(Op::CallBuiltin(ops::GETITER, 1), 0);
-        let start = b.current_pos();
-        b.emit(Op::CallBuiltin(ops::FORITER, 0), 0);
-        let jdone = b.emit(Op::JumpIfFalse(0), 0);
-        self.compile_assign(b, &comp.target)?;
-        // Guards.
-        let mut guard_jumps = Vec::new();
-        for cond in &comp.ifs {
-            self.compile_condition(b, cond)?;
-            let jf = b.emit(Op::JumpIfFalse(0), 0);
-            guard_jumps.push(jf);
+        let end = b.current_pos();
+        for j in end_jumps {
+            b.patch_jump(j, end);
         }
-        self.compile_comp_clauses(b, kind, acc, elt, val, comps, depth + 1)?;
-        // Guards jump here (skip element) -> continue loop.
-        let cont = b.current_pos();
-        for j in guard_jumps {
-            b.patch_jump(j, cont);
-        }
-        b.emit(Op::Jump(start), 0);
-        let done = b.current_pos();
-        b.patch_jump(jdone, done);
-        b.emit(Op::Pop, 0); // drop iterator
         Ok(())
     }
+
+    fn load_local(&self, b: &mut ChunkBuilder, name: &str) {
+        self.name_const(b, name);
+        b.emit(Op::CallBuiltin(ops::GETLOCAL, 1), 0);
+    }
+
+    /// Compile one pattern. The value to match is on TOP of the stack and is
+    /// consumed whether the pattern matches (fall through) or fails (a jump is
+    /// pushed onto `fails`). This invariant keeps the operand stack balanced at
+    /// every fail label.
+    fn compile_pattern(
+        &mut self,
+        b: &mut ChunkBuilder,
+        pat: &Pattern,
+        fails: &mut Vec<usize>,
+    ) -> Result<(), String> {
+        match pat {
+            Pattern::Wildcard => {
+                b.emit(Op::Pop, 0);
+            }
+            Pattern::Capture(name) => {
+                self.compile_assign(b, &Expr::Name(name.clone()))?;
+            }
+            Pattern::Value(e) => {
+                self.compile_expr(b, e)?; // [v, e]
+                b.emit(Op::NumEq, 0); // [bool]
+                let jf = b.emit(Op::JumpIfFalse(0), 0);
+                fails.push(jf);
+            }
+            Pattern::As(inner, name) => {
+                // Bind name to the whole value, then re-match inner against it.
+                self.compile_assign(b, &Expr::Name(name.clone()))?;
+                self.load_local(b, name);
+                self.compile_pattern(b, inner, fails)?;
+            }
+            Pattern::Or(alts) => {
+                let orv = format!(".or{}", self.tmp);
+                self.tmp += 1;
+                self.store_name(b, &orv);
+                let mut succ = Vec::new();
+                for alt in alts {
+                    self.load_local(b, &orv);
+                    let mut altfails = Vec::new();
+                    self.compile_pattern(b, alt, &mut altfails)?;
+                    succ.push(b.emit(Op::Jump(0), 0));
+                    let here = b.current_pos();
+                    for f in altfails {
+                        b.patch_jump(f, here);
+                    }
+                }
+                fails.push(b.emit(Op::Jump(0), 0));
+                let after = b.current_pos();
+                for j in succ {
+                    b.patch_jump(j, after);
+                }
+            }
+            Pattern::Star(_) => {
+                // A bare star is only meaningful inside a sequence pattern, which
+                // handles it directly; reaching here means a stray value.
+                b.emit(Op::Pop, 0);
+            }
+            Pattern::Sequence { elems, star } => {
+                self.compile_seq_pattern(b, elems, *star, fails)?;
+            }
+            Pattern::Mapping { keys, rest } => {
+                self.compile_map_pattern(b, keys, rest, fails)?;
+            }
+            Pattern::Class { cls, pos, kw } => {
+                self.compile_class_pattern(b, cls, pos, kw, fails)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn compile_seq_pattern(
+        &mut self,
+        b: &mut ChunkBuilder,
+        elems: &[Pattern],
+        star: Option<usize>,
+        fails: &mut Vec<usize>,
+    ) -> Result<(), String> {
+        // [subject] on top.
+        b.emit(Op::LoadInt(elems.len() as i64), 0);
+        b.emit(Op::LoadInt(star.map(|i| i as i64).unwrap_or(-1)), 0);
+        b.emit(Op::CallBuiltin(ops::MATCH_SEQ, 3), 0); // [list, bool] | [bool(false)]
+        let jf = b.emit(Op::JumpIfFalse(0), 0);
+        fails.push(jf);
+        let seqv = format!(".seq{}", self.tmp);
+        self.tmp += 1;
+        self.store_name(b, &seqv); // consume the destructured list
+        for (k, sub) in elems.iter().enumerate() {
+            self.load_local(b, &seqv);
+            b.emit(Op::LoadInt(k as i64), 0);
+            b.emit(Op::CallBuiltin(ops::GETITEM, 2), 0); // [element]
+            match sub {
+                Pattern::Star(Some(name)) => {
+                    self.compile_assign(b, &Expr::Name(name.clone()))?;
+                }
+                Pattern::Star(None) => {
+                    b.emit(Op::Pop, 0);
+                }
+                _ => self.compile_pattern(b, sub, fails)?,
+            }
+        }
+        Ok(())
+    }
+
+    fn compile_map_pattern(
+        &mut self,
+        b: &mut ChunkBuilder,
+        keys: &[(Expr, Pattern)],
+        rest: &Option<String>,
+        fails: &mut Vec<usize>,
+    ) -> Result<(), String> {
+        // [subject] on top.
+        let mapv = format!(".map{}", self.tmp);
+        self.tmp += 1;
+        self.store_name(b, &mapv);
+        self.load_local(b, &mapv);
+        b.emit(Op::CallBuiltin(ops::MATCH_MAP_CHECK, 1), 0); // [bool]
+        let jf = b.emit(Op::JumpIfFalse(0), 0);
+        fails.push(jf);
+        for (keyexpr, sub) in keys {
+            self.load_local(b, &mapv);
+            self.compile_expr(b, keyexpr)?; // [subject, key]
+            b.emit(Op::CallBuiltin(ops::MATCH_KEY, 2), 0); // [value, bool] | [bool(false)]
+            let jf = b.emit(Op::JumpIfFalse(0), 0);
+            fails.push(jf);
+            self.compile_pattern(b, sub, fails)?;
+        }
+        if let Some(rname) = rest {
+            self.load_local(b, &mapv);
+            for (keyexpr, _) in keys {
+                self.compile_expr(b, keyexpr)?;
+            }
+            b.emit(Op::CallBuiltin(ops::MKLIST, argc(keys.len())?), 0);
+            b.emit(Op::CallBuiltin(ops::MATCH_MAP_REST, 2), 0); // [rest_dict]
+            self.compile_assign(b, &Expr::Name(rname.clone()))?;
+        }
+        Ok(())
+    }
+
+    fn compile_class_pattern(
+        &mut self,
+        b: &mut ChunkBuilder,
+        cls: &Expr,
+        pos: &[Pattern],
+        kw: &[(String, Pattern)],
+        fails: &mut Vec<usize>,
+    ) -> Result<(), String> {
+        // [subject] on top.
+        self.compile_expr(b, cls)?; // [subject, class]
+        b.emit(Op::LoadInt(pos.len() as i64), 0);
+        for (name, _) in kw {
+            self.strlit(b, name);
+        }
+        b.emit(Op::CallBuiltin(ops::MATCH_CLASS, argc(3 + kw.len())?), 0); // [list, bool] | [bool]
+        let jf = b.emit(Op::JumpIfFalse(0), 0);
+        fails.push(jf);
+        let clsv = format!(".cls{}", self.tmp);
+        self.tmp += 1;
+        self.store_name(b, &clsv);
+        let subs: Vec<&Pattern> = pos.iter().chain(kw.iter().map(|(_, p)| p)).collect();
+        for (k, sub) in subs.iter().enumerate() {
+            self.load_local(b, &clsv);
+            b.emit(Op::LoadInt(k as i64), 0);
+            b.emit(Op::CallBuiltin(ops::GETITEM, 2), 0); // [element]
+            self.compile_pattern(b, sub, fails)?;
+        }
+        Ok(())
+    }
+}
+
+/// Wrap `inner` statements in the comprehension's `for`/`if` clauses. The first
+/// clause's iterable is replaced by the injected parameter `.0` (the outermost
+/// iterable is evaluated in the enclosing scope and passed in).
+fn wrap_comp_clauses(mut inner: Vec<Stmt>, comps: &[Comprehension]) -> Vec<Stmt> {
+    for (i, comp) in comps.iter().enumerate().rev() {
+        // Innermost-out: apply guards, then the `for`.
+        for cond in comp.ifs.iter().rev() {
+            inner = vec![StmtKind::If {
+                test: cond.clone(),
+                body: inner,
+                orelse: vec![],
+            }
+            .into()];
+        }
+        let iter = if i == 0 {
+            Expr::Name(".0".into())
+        } else {
+            (*comp.iter).clone()
+        };
+        inner = vec![StmtKind::For {
+            target: (*comp.target).clone(),
+            iter,
+            body: inner,
+            orelse: vec![],
+            is_async: false,
+        }
+        .into()];
+    }
+    inner
 }
 
 #[derive(Clone, Copy)]
@@ -1274,6 +1655,7 @@ fn stmt_has_yield(s: &Stmt) -> bool {
                 || body_has_yield(finalbody)
                 || handlers.iter().any(|h| body_has_yield(&h.body))
         }
+        StmtKind::Match { cases, .. } => cases.iter().any(|c| body_has_yield(&c.body)),
         _ => false,
     }
 }
