@@ -148,8 +148,12 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
 - [ ] **Class introspection attrs missing** — `__mro__`, `__bases__`, `__dict__`
       (class & instance), `__class__`, `__subclasses__`, `__qualname__` → `AttributeError`;
       `vars(instance)` → `[]`. C3 MRO inconsistency not detected (silently accepted).
-- [ ] **Iteration protocol inert** — `__iter__`/`__next__`, `__getitem__`-fallback
-      iteration, `__contains__`, `__reversed__` → `'C' object is not iterable`.
+- [x] **Iteration protocol** — FIXED: `__iter__`/`__next__` (lazy when `__iter__`
+      returns a native iterator, else materialized), `__getitem__(0..)`-fallback
+      iteration, `__contains__` (with iterate-and-compare fallback), and
+      `__reversed__` (plus `__getitem__`+`__len__` reverse) all work — for `for`,
+      comprehensions, `list()/tuple()/set()/sum()/max()/sorted()`, and `in`. The
+      shared `host::iter_instance_items` drives the whole protocol.
 - [x] **`__call__` dispatched** — FIXED: an instance whose class defines `__call__`
       is callable via `invoke`; `callable(obj)` reflects it (and now also reports
       `True` for partial/lru_cache/namedtuple/static+classmethod callables).
@@ -157,13 +161,21 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
       `__set_name__` fire; data-vs-non-data precedence honored.
 - [ ] **Attribute-hook dunders** — `__getattr__` FIXED (fires when normal lookup
       fails). Still inert: `__getattribute__`/`__setattr__`/`__delattr__`/`__dir__`.
-- [ ] **`__new__` never called**; `__init__` non-None return not checked.
-- [ ] **`__bool__` / `__len__` truthiness ignored** — instances are always truthy.
-- [ ] **f-string / `.format` ignore `__format__`/`__str__`/`__repr__`** — emit the
-      default `<C object>` (works for `str()`/`repr()`/`print()`, not interpolation).
-- [ ] **`NotImplemented` undefined**; **`__ne__` not derived from `__eq__`**;
-      in-place (`__iadd__`) and unary (`__neg__`/`__abs__`/`__divmod__`) dunders
-      not dispatched.
+- [x] **`__new__`** — FIXED: `instantiate` calls a user `__new__(cls, *a)` (implicit
+      staticmethod) to build the instance; `object.__new__(cls)` allocates a bare
+      instance; `__init__` runs only when `__new__` returned an instance of the class
+      (or subclass), matching `type.__call__`.
+- [x] **`__bool__` / `__len__` truthiness** — already dispatched (b_truthy).
+- [x] **f-string / `.format` honor `__format__`** — FIXED: `format_field` (shared by
+      f-strings, `str.format`, and the `format()` builtin) dispatches `__format__(spec)`;
+      `!r`/`!s`/`!a` conversions dispatch `__repr__`/`__str__`. `str.format` now parses
+      the `!conv` field syntax too.
+- [x] **`NotImplemented` + `__ne__` from `__eq__` + unary dunders** — FIXED:
+      `PyObj::NotImplemented` singleton resolves as a name and is honored by the
+      comparison/arith dispatch (forward → reflected → identity for `==`/`!=`,
+      `TypeError` for ordering/arith). Default `__ne__` derives from `__eq__`.
+      `__neg__`/`__pos__`/`__invert__`/`__abs__` dispatched. (`__iadd__`/`__divmod__`
+      still open.)
 - [ ] **Context managers** — multiple `with` exit **FIFO not LIFO**; `__exit__`
       returning `True` does **not** suppress; `__exit__` receives `(None,None,None)`
       even on exception. Parenthesized `with (a as x, b as y)` is a `SyntaxError`.
