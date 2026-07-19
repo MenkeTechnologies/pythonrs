@@ -1934,75 +1934,79 @@ pub fn call_builtin_function(
                             vec![],
                         )?);
                     }
-                    return Ok(with_host(|h| h.new_list(items)));
+                    return Ok(with_host(|h| h.new_iter_seq(items)));
                 }
                 return Err(host::type_error(&format!(
                     "'{}' object is not reversible",
                     with_host(|h| h.type_name(&v))
                 )));
             }
+            // `reversed` requires a known-length sequence (never infinite), so a
+            // materialize-then-reverse is still lazy in the observable sense: the
+            // result is a one-shot iterator (`next()` works, exhausts once).
             let mut items = host::iter_vec(&v)?;
             items.reverse();
-            Ok(with_host(|h| h.new_list(items)))
+            Ok(with_host(|h| h.new_iter_seq(items)))
         }
         "enumerate" => {
-            let items = host::iter_vec(&arg0(&args)?)?;
-            let start = args
-                .get(1)
-                .and_then(|v| with_host(|h| h.as_int(v)))
+            // Lazy: pairs `(index, value)` pulled on demand. `start=` kwarg or
+            // positional second arg sets the initial index.
+            let source = with_host(|h| h.make_iter(&arg0(&args)?))?;
+            let start = kw_get(&kwargs, "start")
+                .or_else(|| args.get(1).cloned())
+                .and_then(|v| with_host(|h| h.as_int(&v)))
                 .unwrap_or(0);
-            let out: Vec<Value> = with_host(|h| {
-                items
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, x)| h.new_tuple(vec![Value::Int(start + i as i64), x]))
-                    .collect()
-            });
-            Ok(with_host(|h| h.new_list(out)))
+            Ok(with_host(|h| {
+                h.alloc(PyObj::EnumerateObj {
+                    source,
+                    next: start,
+                    done: false,
+                })
+            }))
         }
         "zip" => {
-            let mut seqs = Vec::new();
+            // Lazy `zip`: one iterator per argument, tuple pulled on demand.
+            let mut sources = Vec::with_capacity(args.len());
             for a in &args {
-                seqs.push(host::iter_vec(a)?);
+                sources.push(with_host(|h| h.make_iter(a))?);
             }
-            let n = seqs.iter().map(|s| s.len()).min().unwrap_or(0);
-            let mut out = Vec::new();
-            for i in 0..n {
-                let tup: Vec<Value> = seqs.iter().map(|s| s[i].clone()).collect();
-                out.push(with_host(|h| h.new_tuple(tup)));
-            }
-            Ok(with_host(|h| h.new_list(out)))
+            let strict = kw_get(&kwargs, "strict")
+                .map(|v| with_host(|h| h.truthy(&v)))
+                .unwrap_or(false);
+            Ok(with_host(|h| {
+                h.alloc(PyObj::Zip {
+                    sources,
+                    strict,
+                    done: false,
+                })
+            }))
         }
         "map" => {
+            // Lazy `map`: `func` applied to items pulled from each iterable.
             let f = arg0(&args)?;
-            let mut seqs = Vec::new();
+            let mut sources = Vec::with_capacity(args.len().saturating_sub(1));
             for a in &args[1..] {
-                seqs.push(host::iter_vec(a)?);
+                sources.push(with_host(|h| h.make_iter(a))?);
             }
-            let n = seqs.iter().map(|s| s.len()).min().unwrap_or(0);
-            let mut out = Vec::new();
-            for i in 0..n {
-                let call_args: Vec<Value> = seqs.iter().map(|s| s[i].clone()).collect();
-                out.push(host::invoke(&f, call_args, vec![])?);
-            }
-            Ok(with_host(|h| h.new_list(out)))
+            Ok(with_host(|h| {
+                h.alloc(PyObj::MapObj {
+                    func: f,
+                    sources,
+                    done: false,
+                })
+            }))
         }
         "filter" => {
+            // Lazy `filter`: items pulled and predicate-tested on demand.
             let f = arg0(&args)?;
-            let items = host::iter_vec(&args[1])?;
-            let mut out = Vec::new();
-            for it in items {
-                let keep = if matches!(f, Value::Undef) {
-                    py_bool(&it)?
-                } else {
-                    let r = host::invoke(&f, vec![it.clone()], vec![])?;
-                    py_bool(&r)?
-                };
-                if keep {
-                    out.push(it);
-                }
-            }
-            Ok(with_host(|h| h.new_list(out)))
+            let source = with_host(|h| h.make_iter(&args[1]))?;
+            Ok(with_host(|h| {
+                h.alloc(PyObj::FilterObj {
+                    func: f,
+                    source,
+                    done: false,
+                })
+            }))
         }
         "any" => {
             let items = host::iter_vec(&arg0(&args)?)?;

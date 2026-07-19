@@ -284,10 +284,14 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
 - [ ] **Slice assignment & `del` slice unimplemented** — `x[1:3]=[…]`, `x[1:1]=[…]`,
       `x[::2]=[…]`, `del x[1:3]`, `del x[::2]` all → `TypeError: list indices must be
       integers`. (Read-slicing works.)
-- [ ] **`zip`/`map`/`filter`/`enumerate`/`reversed` are eager lists, not lazy
-      iterators** — `zip([1],[2])` → `[(1,2)]` not `<zip object>`; can't feed `next()`
-      (`TypeError: not an iterator`); don't exhaust (re-iterable); break on infinite
-      inputs. `enumerate(start=)` and `zip(strict=)` silently ignored. (Genexprs ARE lazy.)
+- [x] **`zip`/`map`/`filter`/`enumerate`/`reversed` are lazy iterators** — FIXED:
+      each is a real lazy iterator object (`PyObj::Zip`/`MapObj`/`FilterObj`/
+      `EnumerateObj`; `reversed` → one-shot `Iter`). Sources are held as iterators and
+      pulled one item per step by the free `iter_step` (host borrow released, so an
+      infinite generator source never materializes — no hang). `next()` works, they
+      exhaust once, `repr` is `<zip object at 0x…>`, `type().__name__` is `zip`/`map`/….
+      `enumerate(start=)` and `zip(strict=True)` (byte-exact CPython shorter/longer
+      `ValueError` messages) honored.
 - [ ] **dict views are eager list snapshots** — `{1:2}.keys()`→`[1]` (type `list`),
       no live update, no view set-ops (`.keys() | {…}` → `TypeError`). Missing
       `dict.fromkeys`, `dict | dict` merge, `d.update(**kwargs)` / `d.update(pairs)`

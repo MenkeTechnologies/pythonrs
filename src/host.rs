@@ -233,6 +233,33 @@ pub enum PyObj {
     },
     /// A live iterator over a heap object, with a cursor.
     Iter(IterState),
+    /// A lazy `zip(*iterables[, strict])` iterator. `sources` are pre-made
+    /// iterators (one per argument); each step pulls one item from each and
+    /// yields a tuple, stopping at the shortest (or, with `strict`, raising on a
+    /// length mismatch). `done` latches exhaustion so it never re-yields.
+    Zip {
+        sources: Vec<Value>,
+        strict: bool,
+        done: bool,
+    },
+    /// A lazy `map(func, *iterables)` iterator.
+    MapObj {
+        func: Value,
+        sources: Vec<Value>,
+        done: bool,
+    },
+    /// A lazy `filter(func, iterable)` iterator (`func` = `Undef` → identity).
+    FilterObj {
+        func: Value,
+        source: Value,
+        done: bool,
+    },
+    /// A lazy `enumerate(iterable, start)` iterator; `next` is the running index.
+    EnumerateObj {
+        source: Value,
+        next: i64,
+        done: bool,
+    },
     Module {
         name: String,
         ns: IndexMap<String, Value>,
@@ -631,6 +658,15 @@ impl PyHost {
         self.heap.push(obj);
         Value::Obj((self.heap.len() - 1) as u32)
     }
+    /// A stable pseudo-address for an object (its heap index), used only for the
+    /// `<… object at 0x…>` reprs where CPython prints an opaque pointer.
+    pub fn addr_of(&self, v: &Value) -> u64 {
+        match v {
+            Value::Obj(i) => *i as u64,
+            _ => 0,
+        }
+    }
+
     pub fn get(&self, v: &Value) -> Option<&PyObj> {
         if let Value::Obj(i) = v {
             self.heap.get(*i as usize)
@@ -665,6 +701,11 @@ impl PyHost {
     }
     pub fn new_tuple(&mut self, items: Vec<Value>) -> Value {
         self.alloc(PyObj::Tuple(items))
+    }
+    /// A one-shot sequence iterator (for `reversed`, etc.): `next()` walks the
+    /// items once, then exhausts.
+    pub fn new_iter_seq(&mut self, items: Vec<Value>) -> Value {
+        self.alloc(PyObj::Iter(IterState::Seq { items, idx: 0 }))
     }
     pub fn new_dict(&mut self, pairs: IndexMap<PKey, (Value, Value)>) -> Value {
         self.alloc(PyObj::Dict(pairs))
@@ -941,6 +982,10 @@ impl PyHost {
                 Some(PyObj::BoundMethod { .. }) => "method".into(),
                 Some(PyObj::Exception { class, .. }) => class.clone(),
                 Some(PyObj::Iter(_)) => "iterator".into(),
+                Some(PyObj::Zip { .. }) => "zip".into(),
+                Some(PyObj::MapObj { .. }) => "map".into(),
+                Some(PyObj::FilterObj { .. }) => "filter".into(),
+                Some(PyObj::EnumerateObj { .. }) => "enumerate".into(),
                 Some(PyObj::Module { .. }) => "module".into(),
                 Some(PyObj::BigInt(_)) => "int".into(),
                 Some(PyObj::Complex(..)) => "complex".into(),
@@ -1037,6 +1082,14 @@ impl PyHost {
                     }
                 }
                 Some(PyObj::Iter(_)) => "<iterator>".into(),
+                Some(PyObj::Zip { .. }) => format!("<zip object at 0x{:012x}>", self.addr_of(v)),
+                Some(PyObj::MapObj { .. }) => format!("<map object at 0x{:012x}>", self.addr_of(v)),
+                Some(PyObj::FilterObj { .. }) => {
+                    format!("<filter object at 0x{:012x}>", self.addr_of(v))
+                }
+                Some(PyObj::EnumerateObj { .. }) => {
+                    format!("<enumerate object at 0x{:012x}>", self.addr_of(v))
+                }
                 Some(PyObj::Generator { id }) => format!("<generator object at 0x{id:012x}>"),
                 Some(PyObj::Bytearray(b)) => format!("bytearray(b{})", quote_bytes(b)),
                 Some(PyObj::File { id }) => self.file_repr(*id),
@@ -2766,7 +2819,12 @@ impl PyHost {
                 stop: *stop,
                 step: *step,
             },
-            Some(PyObj::Iter(_)) | Some(PyObj::Generator { .. }) => return Ok(v.clone()),
+            Some(PyObj::Iter(_))
+            | Some(PyObj::Generator { .. })
+            | Some(PyObj::Zip { .. })
+            | Some(PyObj::MapObj { .. })
+            | Some(PyObj::FilterObj { .. })
+            | Some(PyObj::EnumerateObj { .. }) => return Ok(v.clone()),
             _ => {
                 let items = self.iter_items(v)?;
                 IterState::Seq { items, idx: 0 }
@@ -4149,6 +4207,23 @@ pub fn iter_vec(v: &Value) -> Result<Vec<Value>, String> {
         }
         return Ok(out);
     }
+    // Lazy composite iterators (`zip`/`map`/`filter`/`enumerate`) drain via
+    // `iter_step` so their (possibly generator) sources are pulled lazily.
+    if with_host(|h| {
+        matches!(
+            h.get(v),
+            Some(PyObj::Zip { .. })
+                | Some(PyObj::MapObj { .. })
+                | Some(PyObj::FilterObj { .. })
+                | Some(PyObj::EnumerateObj { .. })
+        )
+    }) {
+        let mut out = Vec::new();
+        while let Some(x) = iter_step(v)? {
+            out.push(x);
+        }
+        return Ok(out);
+    }
     // A user instance iterates via its `__iter__`/`__next__` (or `__getitem__`)
     // protocol — reached by `list()`/`tuple()`/`sum()`/… over custom iterables.
     if with_host(|h| matches!(h.get(v), Some(PyObj::Instance(_)))) {
@@ -4213,12 +4288,179 @@ pub fn iter_instance_items(v: &Value) -> Result<Vec<Value>, String> {
     }
 }
 
-/// Advance any iterator — including a generator — by one step.
+/// Advance any iterator — including a generator or a lazy composite iterator
+/// (`zip`/`map`/`filter`/`enumerate`) — by one step. Composite iterators pull
+/// from their sources with the host borrow released, so an infinite source
+/// (e.g. `itertools.count()`) never materializes.
 pub fn iter_step(it: &Value) -> Result<Option<Value>, String> {
-    if with_host(|h| matches!(h.get(it), Some(PyObj::Generator { .. }))) {
-        return gen_resume(it, Value::Undef);
+    match with_host(|h| h.get(it).cloned()) {
+        Some(PyObj::Generator { .. }) => gen_resume(it, Value::Undef),
+        Some(PyObj::Zip { .. }) => zip_step(it),
+        Some(PyObj::MapObj { .. }) => map_step(it),
+        Some(PyObj::FilterObj { .. }) => filter_step(it),
+        Some(PyObj::EnumerateObj { .. }) => enumerate_step(it),
+        _ => with_host(|h| h.iter_next(it)),
     }
-    with_host(|h| h.iter_next(it))
+}
+
+/// One step of a lazy `zip`: pull one item from each source iterator in order.
+fn zip_step(it: &Value) -> Result<Option<Value>, String> {
+    let (sources, strict, done) = match with_host(|h| h.get(it).cloned()) {
+        Some(PyObj::Zip {
+            sources,
+            strict,
+            done,
+        }) => (sources, strict, done),
+        _ => return Err(type_error("not an iterator")),
+    };
+    if done {
+        return Ok(None);
+    }
+    let mut out: Vec<Value> = Vec::with_capacity(sources.len());
+    for (i, s) in sources.iter().enumerate() {
+        match iter_step(s)? {
+            Some(v) => out.push(v),
+            None => {
+                set_zip_done(it);
+                if strict {
+                    return Err(zip_strict_error(&sources, i));
+                }
+                return Ok(None);
+            }
+        }
+    }
+    Ok(Some(with_host(|h| h.new_tuple(out))))
+}
+
+fn set_zip_done(it: &Value) {
+    with_host(|h| {
+        if let Some(PyObj::Zip { done, .. }) = h.get_mut(it) {
+            *done = true;
+        }
+    });
+}
+
+/// Build CPython's `zip(strict=True)` length-mismatch message. `i` is the index
+/// (0-based) of the source that just exhausted mid-round.
+fn zip_strict_error(sources: &[Value], i: usize) -> String {
+    if i > 0 {
+        // Sources 0..i were longer than source i.
+        let than = if i == 1 {
+            "argument 1".to_string()
+        } else {
+            format!("arguments 1-{i}")
+        };
+        return format!(
+            "ValueError: zip() argument {} is shorter than {than}",
+            i + 1
+        );
+    }
+    // Source 0 exhausted first: find the first later source that still yields.
+    for (j, s) in sources.iter().enumerate().skip(1) {
+        if let Ok(Some(_)) = iter_step(s) {
+            let than = if j == 1 {
+                "argument 1".to_string()
+            } else {
+                format!("arguments 1-{j}")
+            };
+            return format!("ValueError: zip() argument {} is longer than {than}", j + 1);
+        }
+    }
+    // All equal length after all — no error (shouldn't reach here).
+    "ValueError: zip() argument is longer".to_string()
+}
+
+/// One step of a lazy `map`: pull one item from each source, then apply `func`.
+fn map_step(it: &Value) -> Result<Option<Value>, String> {
+    let (func, sources, done) = match with_host(|h| h.get(it).cloned()) {
+        Some(PyObj::MapObj {
+            func,
+            sources,
+            done,
+        }) => (func, sources, done),
+        _ => return Err(type_error("not an iterator")),
+    };
+    if done {
+        return Ok(None);
+    }
+    let mut call_args: Vec<Value> = Vec::with_capacity(sources.len());
+    for s in &sources {
+        match iter_step(s)? {
+            Some(v) => call_args.push(v),
+            None => {
+                with_host(|h| {
+                    if let Some(PyObj::MapObj { done, .. }) = h.get_mut(it) {
+                        *done = true;
+                    }
+                });
+                return Ok(None);
+            }
+        }
+    }
+    Ok(Some(invoke(&func, call_args, vec![])?))
+}
+
+/// One step of a lazy `filter`: pull items until one satisfies the predicate.
+fn filter_step(it: &Value) -> Result<Option<Value>, String> {
+    let (func, source, done) = match with_host(|h| h.get(it).cloned()) {
+        Some(PyObj::FilterObj { func, source, done }) => (func, source, done),
+        _ => return Err(type_error("not an iterator")),
+    };
+    if done {
+        return Ok(None);
+    }
+    loop {
+        match iter_step(&source)? {
+            Some(v) => {
+                let keep = if matches!(func, Value::Undef) {
+                    with_host(|h| h.truthy(&v))
+                } else {
+                    let r = invoke(&func, vec![v.clone()], vec![])?;
+                    with_host(|h| h.truthy(&r))
+                };
+                if keep {
+                    return Ok(Some(v));
+                }
+            }
+            None => {
+                with_host(|h| {
+                    if let Some(PyObj::FilterObj { done, .. }) = h.get_mut(it) {
+                        *done = true;
+                    }
+                });
+                return Ok(None);
+            }
+        }
+    }
+}
+
+/// One step of a lazy `enumerate`: pull one item and pair it with the index.
+fn enumerate_step(it: &Value) -> Result<Option<Value>, String> {
+    let (source, idx, done) = match with_host(|h| h.get(it).cloned()) {
+        Some(PyObj::EnumerateObj { source, next, done }) => (source, next, done),
+        _ => return Err(type_error("not an iterator")),
+    };
+    if done {
+        return Ok(None);
+    }
+    match iter_step(&source)? {
+        Some(v) => {
+            with_host(|h| {
+                if let Some(PyObj::EnumerateObj { next, .. }) = h.get_mut(it) {
+                    *next = idx + 1;
+                }
+            });
+            Ok(Some(with_host(|h| h.new_tuple(vec![Value::Int(idx), v]))))
+        }
+        None => {
+            with_host(|h| {
+                if let Some(PyObj::EnumerateObj { done, .. }) = h.get_mut(it) {
+                    *done = true;
+                }
+            });
+            Ok(None)
+        }
+    }
 }
 
 /// Import a module by name. A small built-in set is supported; unknown modules
