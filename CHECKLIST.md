@@ -127,10 +127,12 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
 - [ ] **Instances are never hashable** — `hash(A())` / instance as dict key / set
       member → `TypeError: unhashable type: 'object'`, even with an explicit
       `__hash__`. No user object can key a dict or join a set.
-- [ ] **`type(x)` returns pythonrs's internal builtin-function object, not a class**
-      — `type(5)` → `<built-in function int>`; `type(5)==int` → `False`;
-      `isinstance(int,type)` → `False`; 3-arg `type(name,bases,ns)` and metaclasses
-      inert. Breaks type introspection and `str.lower`-as-unbound-method.
+- [x] **`type(x)` returns a real class** — FIXED: `type(x)` returns a `Class` for
+      user classes and a builtin-type object for builtins; both `==` (by name) and
+      `is` (types are conceptual singletons) work, so `type(5)==int`, `type(5) is int`,
+      `type(b)==B`, `type(b) is B` all hold. Builtin type names repr as `<class 'int'>`
+      (functions stay `<built-in function len>`); `isinstance(int, type)`→`True`.
+      Still open: 3-arg `type(name,bases,ns)` / metaclasses; unbound-method access.
 - [ ] **Class introspection attrs missing** — `__mro__`, `__bases__`, `__dict__`
       (class & instance), `__class__`, `__subclasses__`, `__qualname__` → `AttributeError`;
       `vars(instance)` → `[]`. C3 MRO inconsistency not detected (silently accepted).
