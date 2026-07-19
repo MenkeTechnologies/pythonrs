@@ -46,17 +46,20 @@ dispatch; `[in-flight]` = being implemented in the current host pass.
 
 ## P0 — Interpreter aborts & hangs (must never crash where CPython returns)
 
-- [ ] **`1 >> -1` panics the process** — Rust panic `attempt to shift right with
-      overflow` at `src/host.rs:1306` (SIGABRT). CPython: `ValueError: negative
-      shift count`. `1 << -1` returns garbage instead of the same ValueError.
-- [ ] **Custom `__getitem__` with a slice → stack-overflow SIGABRT** — `class
-      C: def __getitem__(self,k): return k` then `C()[1:5:2]` aborts the process
-      (infinite recursion). CPython returns `slice(1, 5, 2)`.
+- [x] **`1 >> -1` panics the process** — FIXED: shifts route through the BigInt
+      path; a negative count raises a catchable `ValueError: negative shift count`;
+      `1 << -1` raises the same. No process abort. (`host.rs` SHL/SHR.)
+- [x] **Custom `__getitem__` with a slice → stack-overflow SIGABRT** — FIXED:
+      `repr_of` now formats `PyObj::Slice` directly (`slice(1, 5, 2)`) instead of
+      delegating back to `str_of`, which caused infinite `str_of`↔`repr_of` recursion.
 - [ ] **`itertools.islice` is eager → hangs on infinite generators** — consumes
       the whole iterator before slicing, so `islice(count(), 5)` never returns
       (exit 124). Same root cause makes any lazy-slice of an infinite producer hang.
-- [ ] **`N in range(huge)` hangs** — membership is O(n) iteration, not O(1):
-      `999999999999 in range(1000000000000)` never returns. CPython: `True` instantly.
+      (Note: `count()`/`cycle()` themselves are rejected up front, so only a *user*
+      infinite generator triggers the hang; a full lazy-itertools rework is deferred.)
+- [x] **`N in range(huge)` hangs** — FIXED: O(1) membership — integer in the
+      arithmetic progression and within the half-open bounds (`host.rs contains`).
+      Integral floats compare equal to their int value (`2.0 in range(5)` → True).
 
 ## Tier 0 — Execution / runtime surface (the CLI contract every script assumes)
 
@@ -150,12 +153,12 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
 
 ## Tier 4 — Numeric core (silent-wrong values — highest correctness priority)
 
-- [ ] **`int` is not consistently arbitrary-precision.** `+ - * **` are bignum, but
-      `// % << >> & | ^ ~`, comparison `<`, 3-arg `pow`, and `int(float)` downconvert
-      to i64/f64 → silent wrong / wraparound: `(10**30)//3` loses digits;
-      `2**1000 % 1000000007` → `0.0`; `10**20 < 10**20+1` → `False`; `1<<64` → `1`;
-      `int(1e20)` → `i64::MAX`; `&`/`~`/`hex()`/`abs()` on `>i64` → `TypeError`.
-      **The single largest correctness hole.** `[3-arg pow in-flight]`
+- [x] **`int` arbitrary-precision consistency** — FIXED for `<< >> & | ^ ~`,
+      comparison `<`, `int(float)`, `hex()`/`oct()`/`bin()`, `abs()`, and int-string
+      parsing (base prefixes + underscores): all route through the BigInt path.
+      `1<<64`→`18446744073709551616`; `10**20 < 10**20+1`→`True`; `int(1e20)`→bignum;
+      `~(10**20)`, `(10**30)&7`, `hex(10**20)`, `abs(-(10**20))` all correct.
+      `// % **` and 3-arg `pow` were already bignum. `bool` bit-ops now return `bool`.
 - [ ] **Floor `//` / modulo `%` use C truncation, not Python floor** — wrong sign on
       every mixed-sign operand: `7//-2` → `-3` (want `-4`); `-7%-100` → `93` (want
       `-7`); `divmod(7,-2)` → `(-3,1)` (want `(-4,-1)`). `[in-flight]`

@@ -1584,6 +1584,13 @@ pub fn call_builtin_function(
                 Value::Int(n) => Ok(Value::Int(n.abs())),
                 Value::Float(f) => Ok(Value::Float(f.abs())),
                 Value::Bool(b) => Ok(Value::Int(*b as i64)),
+                Value::Obj(_) if matches!(h.get(&v), Some(PyObj::BigInt(_))) => match h.get(&v) {
+                    Some(PyObj::BigInt(b)) => {
+                        let b = b.clone();
+                        Ok(h.norm_big(b.magnitude().clone().into()))
+                    }
+                    _ => unreachable!(),
+                },
                 _ => Err(host::type_error(&format!(
                     "bad operand type for abs(): '{}'",
                     h.type_name(&v)
@@ -2107,14 +2114,11 @@ fn py_sorted(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, String
 
 fn int_radix(args: &[Value], radix: u32, prefix: &str) -> Result<Value, String> {
     let a0 = arg0(args)?;
-    let n = with_host(|h| h.as_int(&a0)).ok_or_else(|| host::type_error("requires an integer"))?;
-    let body = match radix {
-        16 => format!("{:x}", n.unsigned_abs()),
-        8 => format!("{:o}", n.unsigned_abs()),
-        2 => format!("{:b}", n.unsigned_abs()),
-        _ => unreachable!(),
-    };
-    let sign = if n < 0 { "-" } else { "" };
+    let n = with_host(|h| h.big_val(&a0))
+        .ok_or_else(|| host::type_error("'float' object cannot be interpreted as an integer"))?;
+    use num_bigint::Sign;
+    let sign = if n.sign() == Sign::Minus { "-" } else { "" };
+    let body = n.magnitude().to_str_radix(radix);
     Ok(with_host(|h| h.new_str(format!("{sign}{prefix}{body}"))))
 }
 
@@ -2130,34 +2134,88 @@ fn construct_int(args: &[Value]) -> Result<Value, String> {
     with_host(|h| match &v {
         Value::Int(n) => Ok(Value::Int(*n)),
         Value::Bool(b) => Ok(Value::Int(*b as i64)),
-        Value::Float(f) => Ok(Value::Int(*f as i64)),
+        Value::Float(f) => {
+            if !f.is_finite() {
+                let what = if f.is_nan() {
+                    "float NaN"
+                } else {
+                    "float infinity"
+                };
+                return Err(format!("OverflowError: cannot convert {what} to integer"));
+            }
+            // Truncate toward zero, bignum-safe for values beyond i64.
+            let t = f.trunc();
+            if t >= i64::MIN as f64 && t <= i64::MAX as f64 {
+                Ok(Value::Int(t as i64))
+            } else {
+                use num_traits::FromPrimitive;
+                let b = num_bigint::BigInt::from_f64(t)
+                    .ok_or_else(|| host::type_error("cannot convert float to integer"))?;
+                Ok(h.norm_big(b))
+            }
+        }
+        Value::Obj(_) if matches!(h.get(&v), Some(PyObj::BigInt(_))) => Ok(v.clone()),
         _ => {
             let s = h
                 .as_str(&v)
                 .ok_or_else(|| host::type_error("int() argument must be a string or a number"))?;
+            let orig = s.clone();
             let s = s.trim();
-            let (neg, digits) = if let Some(r) = s.strip_prefix('-') {
+            let (neg, rest) = if let Some(r) = s.strip_prefix('-') {
                 (true, r)
             } else if let Some(r) = s.strip_prefix('+') {
                 (false, r)
             } else {
                 (false, s)
             };
-            let digits = digits.replace('_', "");
-            match i64::from_str_radix(&digits, base as u32) {
-                Ok(n) => Ok(Value::Int(if neg { -n } else { n })),
-                Err(_) => {
-                    // Try bignum.
-                    match digits.parse::<num_bigint::BigInt>() {
-                        Ok(b) => {
-                            let b = if neg { -b } else { b };
-                            Ok(h.alloc(PyObj::BigInt(b)))
-                        }
-                        Err(_) => Err(format!(
-                            "ValueError: invalid literal for int() with base {base}: '{s}'"
-                        )),
-                    }
+            // Detect / strip a base prefix. base 0 → auto-detect from prefix.
+            let mut base = base;
+            let body = if let Some(r) = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X"))
+            {
+                if base == 0 {
+                    base = 16;
                 }
+                if base == 16 {
+                    r
+                } else {
+                    rest
+                }
+            } else if let Some(r) = rest.strip_prefix("0o").or_else(|| rest.strip_prefix("0O")) {
+                if base == 0 {
+                    base = 8;
+                }
+                if base == 8 {
+                    r
+                } else {
+                    rest
+                }
+            } else if let Some(r) = rest.strip_prefix("0b").or_else(|| rest.strip_prefix("0B")) {
+                if base == 0 {
+                    base = 2;
+                }
+                if base == 2 {
+                    r
+                } else {
+                    rest
+                }
+            } else {
+                if base == 0 {
+                    base = 10;
+                }
+                rest
+            };
+            let digits = body.replace('_', "");
+            let err =
+                || format!("ValueError: invalid literal for int() with base {base}: '{orig}'");
+            if digits.is_empty() {
+                return Err(err());
+            }
+            match num_bigint::BigInt::parse_bytes(digits.as_bytes(), base as u32) {
+                Some(b) => {
+                    let b = if neg { -b } else { b };
+                    Ok(h.norm_big(b))
+                }
+                None => Err(err()),
             }
         }
     })
