@@ -150,6 +150,25 @@ pythonrs and the reference `python3`, and the output is diffed byte-for-byte.
 pythonrs runs a large, real subset of Python 3, verified against CPython on that
 corpus.
 
+Beyond the fixed corpus, the `parity-fuzz` binary is a differential fuzzer. It
+generates thousands of grammar-driven, deterministic-output snippets — biased
+toward the historically fragile areas (float `repr`, integer `//`/`%` sign
+rules, bignum, slices, the `format` mini-language, string methods) — runs each
+through `python -c` and the reference `python3 -c`, and reports every case where
+stdout or accept/reject diverges. Each case is seeded, so any divergence is
+delta-debugged to a minimal reproducer and replays exactly:
+
+```sh
+cargo build --bin parity-fuzz
+./target/debug/parity-fuzz --count 5000          # fuzz every mode
+./target/debug/parity-fuzz --formatspec          # one surface only
+./target/debug/parity-fuzz --seed 51 --once      # replay + minimize one case
+```
+
+The generator never emits nondeterministic output, so every reported divergence
+is a real gap. `PYTHONRS_FUZZ_PYTHON` names the reference interpreter; a
+`--baseline` allowlist keeps known gaps from failing while new ones exit non-zero.
+
 ## [0x07] STATUS & ROADMAP
 
 Active, in development. The runtime executes a substantial real subset of Python
