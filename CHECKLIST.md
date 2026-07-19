@@ -293,8 +293,10 @@ kinds + guards), `for/else`/`while/else`, `try/except/else/finally` ordering all
 - [ ] **Async is non-functional** — `async def` executes eagerly and returns a plain
       value (no coroutine); `asyncio` `ModuleNotFoundError`; **async comprehensions are
       a `SyntaxError`**; `await` is a passthrough. Anything using an event loop fails.
-- [ ] **Bare `raise` re-raise broken** — `raise` inside `except` → `RuntimeError: No
-      active exception to re-raise`.
+- [x] **Bare `raise` re-raise** — FIXED: the except handler now keeps the caught
+      exception as the "currently handled" one (`h.exc`) while its body runs, so a
+      bare `raise` re-raises it (caught by an outer handler); it is cleared when the
+      handler finishes without raising. (`b_try`.)
 - [ ] **Exception chaining absent** — `raise X from Y` → `__cause__`/`__context__` not
       stored (`AttributeError`); `ExceptionGroup` undefined (though `except*` parses).
 - [ ] **Keyword-only default values not applied** — `def f(a,*,c,d=4); f(1,c=3)` →
@@ -340,4 +342,11 @@ Re-measure: `cargo build && ./target/debug/parity-fuzz --count 50000`.
 Replay one: `./target/debug/parity-fuzz --once --seed <N>`.
 Per-mode: `--<mode>` (arith, formatspec, builtins, floatfmt, strings, fstring,
 slice, listcomp, dictcomp, setcomp, sorting, boolint, ranges, strmeth, comparison,
-builtins, ternary, augassign).
+builtins, ternary, augassign, **classes, iterproto, exceptions**).
+
+**Object-model modes added 2026-07-19** (`classes`, `iterproto`, `exceptions`) —
+each generates deterministic-stdout programs exercising the OOP surface and is in
+the `mixed` rotation. Trajectory to 0: `classes` 15→0 (fixed `bool()`/`any`/`all`
+not dispatching `__bool__`/`__len__`), `iterproto` 0, `exceptions` 0. Mixed 8,000:
+**1 divergence** (`0 ** -1` should raise `ZeroDivisionError` — pre-existing Tier-4
+numeric gap, not object-model).
