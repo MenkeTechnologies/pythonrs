@@ -24,13 +24,18 @@ the ordered, grounded gap list between here and that goal.
   per-expression fuzzer structurally can't (sort **stability**, `json.dumps(sort_keys=)`).
 - Re-measure, never weaken the comparison to move a number.
 
-**Readiness snapshot — 2026-07-19: `3/30 OK (10%)`** against committed `main`
-(`cargo build && ./scripts/dropin_check.sh`). Two cleanly-separated walls:
-- **19 ERR — the `open()`/module wall** (`re collections pathlib subprocess csv
-  datetime hashlib base64 argparse dataclasses enum`). Much of this is the Tier 1/2
-  wiring a concurrent pass is landing now — this number jumps when it merges.
-- **8 DIFF — behavior gaps**: empty `sys.argv`, floor-div/modulo sign, 3-arg `pow`,
-  `%`-string formatting (all in the tiers below).
+**Readiness snapshot — 2026-07-19: `9/30 OK (30%)`** against committed `main`
+(`cargo build && ./scripts/dropin_check.sh`), up from `3/30` — 12 ERR, 9 DIFF.
+**Landed this pass** (grounded, python3-verified): bytes/bytearray (real type),
+file I/O (`open`/read/write/`with`), `collections` (deque/Counter/defaultdict/
+OrderedDict/namedtuple), `functools.partial`/`lru_cache`, the 3 numeric-core fixes
+(**`%`-format full spec, integer floor `//`/`%` divisor-sign, 3-arg modular `pow`**),
+the `with` single-eval + LIFO fix, and wiring for `re/datetime/heapq/bisect/textwrap/
+statistics`. Remaining walls:
+- **12 ERR** — `io pathlib subprocess hashlib base64 csv argparse`, empty `sys.argv`,
+  `sys.exit`, and `datetime`/`re` composites the flat approximations don't cover.
+- **9 DIFF** — the object-model (Tier 3) + remaining-numeric (Tier 4: bignum ops,
+  float scientific `repr`) + data-structure (Tier 6) gaps below.
 
 Tiers are ordered by blast radius toward drop-in. **P0** = the interpreter
 *crashes or hangs* where CPython returns a value — a drop-in must never do this.
