@@ -480,7 +480,20 @@ pub fn decode_escapes(raw: &str, is_raw: bool) -> Result<String, String> {
                 '\\' => out.push('\\'),
                 '\'' => out.push('\''),
                 '"' => out.push('"'),
-                '0' => out.push('\0'),
+                // Octal escape `\ooo` (1-3 octal digits).
+                '0'..='7' => {
+                    let mut oct = String::new();
+                    oct.push(e);
+                    while oct.len() < 3 && matches!(chars.get(i + 1), Some('0'..='7')) {
+                        i += 1;
+                        oct.push(chars[i]);
+                    }
+                    if let Ok(n) = u32::from_str_radix(&oct, 8) {
+                        if let Some(ch) = char::from_u32(n) {
+                            out.push(ch);
+                        }
+                    }
+                }
                 'a' => out.push('\u{07}'),
                 'b' => out.push('\u{08}'),
                 'f' => out.push('\u{0C}'),

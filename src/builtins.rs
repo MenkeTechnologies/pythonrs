@@ -321,6 +321,18 @@ fn b_setitem(vm: &mut VM, _: u8) -> Value {
         let r = host::call_method(&recv, "__setitem__", vec![idx, val.clone()], vec![]);
         return finish(vm, r);
     }
+    // Slice assignment (`x[i:j] = it`): materialize the RHS iterable here, out
+    // of any host borrow (it may be a generator), then splice.
+    if with_host(|h| matches!(h.get(&idx), Some(PyObj::Slice { .. }))) {
+        let repl = match host::iter_vec(&val) {
+            Ok(v) => v,
+            Err(e) => return abort(vm, e),
+        };
+        return match with_host(|h| h.set_slice_vals(&recv, &idx, repl)) {
+            Ok(()) => val,
+            Err(e) => abort(vm, e),
+        };
+    }
     match with_host(|h| h.set_item(&recv, &idx, val.clone())) {
         Ok(()) => val,
         Err(e) => abort(vm, e),
@@ -1829,6 +1841,10 @@ pub fn call_builtin_function(
     if name == "dict.fromkeys" {
         return dict_method(&Value::Undef, "fromkeys", &args, &[]);
     }
+    // `str.maketrans(...)` reached via the `str` type object.
+    if name == "str.maketrans" {
+        return str_maketrans(&args);
+    }
     // Native stdlib module functions (src/stdlib). These take `&mut PyHost`.
     if let Some(f) = name.strip_prefix("textwrap.") {
         if let Some(r) = with_host(|h| crate::stdlib::textwrap::call(h, f, &args)) {
@@ -2172,10 +2188,29 @@ pub fn call_builtin_function(
         "hex" => int_radix(&args, 16, "0x"),
         "oct" => int_radix(&args, 8, "0o"),
         "bin" => int_radix(&args, 2, "0b"),
-        "repr" | "ascii" => {
+        "repr" => {
             let v = arg0(&args)?;
             let s = py_repr(&v)?;
             Ok(with_host(|h| h.new_str(s)))
+        }
+        "ascii" => {
+            // Like `repr`, but every non-ASCII char is `\x`/`\u`/`\U`-escaped.
+            let v = arg0(&args)?;
+            let s = py_repr(&v)?;
+            let mut out = String::with_capacity(s.len());
+            for c in s.chars() {
+                let n = c as u32;
+                if n < 0x80 {
+                    out.push(c);
+                } else if n <= 0xff {
+                    out.push_str(&format!("\\x{n:02x}"));
+                } else if n <= 0xffff {
+                    out.push_str(&format!("\\u{n:04x}"));
+                } else {
+                    out.push_str(&format!("\\U{n:08x}"));
+                }
+            }
+            Ok(with_host(|h| h.new_str(out)))
         }
         "format" => {
             let v = arg0(&args)?;
@@ -3170,6 +3205,17 @@ const STR_METHODS: &[&str] = &[
     "removesuffix",
     "swapcase",
     "casefold",
+    "rindex",
+    "partition",
+    "rpartition",
+    "isnumeric",
+    "isdecimal",
+    "isidentifier",
+    "istitle",
+    "isprintable",
+    "expandtabs",
+    "translate",
+    "format_map",
 ];
 const LIST_METHODS: &[&str] = &[
     "append", "extend", "insert", "remove", "pop", "clear", "index", "count", "sort", "reverse",
@@ -3530,6 +3576,65 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
                 s.strip_suffix(&p).map(|r| r.to_string()).unwrap_or(s),
             ))
         }
+        "rindex" => match s.rfind(&sarg(0)) {
+            Some(b) => Ok(Value::Int(s[..b].chars().count() as i64)),
+            None => Err("ValueError: substring not found".into()),
+        },
+        "partition" => {
+            let sep = sarg(0);
+            let (a, b, c) = match s.find(&sep) {
+                Some(p) => (
+                    s[..p].to_string(),
+                    sep.clone(),
+                    s[p + sep.len()..].to_string(),
+                ),
+                None => (s.clone(), String::new(), String::new()),
+            };
+            Ok(with_host(|h| {
+                let t = vec![h.new_str(a), h.new_str(b), h.new_str(c)];
+                h.new_tuple(t)
+            }))
+        }
+        "rpartition" => {
+            let sep = sarg(0);
+            let (a, b, c) = match s.rfind(&sep) {
+                Some(p) => (
+                    s[..p].to_string(),
+                    sep.clone(),
+                    s[p + sep.len()..].to_string(),
+                ),
+                None => (String::new(), String::new(), s.clone()),
+            };
+            Ok(with_host(|h| {
+                let t = vec![h.new_str(a), h.new_str(b), h.new_str(c)];
+                h.new_tuple(t)
+            }))
+        }
+        "isnumeric" => Ok(Value::Bool(!s.is_empty() && s.chars().all(is_numeric_char))),
+        "isdecimal" => Ok(Value::Bool(
+            !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()),
+        )),
+        "isidentifier" => Ok(Value::Bool(is_identifier(&s))),
+        "istitle" => Ok(Value::Bool(is_titlecased(&s))),
+        "isprintable" => Ok(Value::Bool(
+            s.chars().all(|c| !c.is_control() && c != '\u{85}'),
+        )),
+        "expandtabs" => {
+            let tabsize = args
+                .first()
+                .and_then(|v| with_host(|h| h.as_int(v)))
+                .unwrap_or(8)
+                .max(0) as usize;
+            Ok(new_str(expand_tabs(&s, tabsize)))
+        }
+        "translate" => {
+            let table = arg0(args)?;
+            Ok(new_str(str_translate(&s, &table)?))
+        }
+        "format_map" => {
+            let mapping = arg0(args)?;
+            str_format_map(&s, &mapping)
+        }
         "encode" => Ok(with_host(|h| h.alloc(PyObj::Bytes(s.into_bytes())))),
         "format" => str_dot_format(&s, args),
         _ => Err(format!(
@@ -3578,6 +3683,229 @@ fn pad_str(s: &str, args: &[Value], mode: char) -> String {
 }
 
 /// `str.format(*args, **kwargs)` — positional `{}` / `{0}` and `{name}` fields.
+/// CPython `str.maketrans`: build a translation table (a dict of ordinal→
+/// int/str/None). Either a single mapping arg, or two equal-length strings
+/// (`x`→`y`), with an optional third string whose chars map to `None`.
+fn str_maketrans(args: &[Value]) -> Result<Value, String> {
+    let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+    if args.len() == 1 {
+        // A mapping: string-of-length-1 keys become ordinals; int keys stay.
+        let pairs = with_host(|h| match h.get(&args[0]) {
+            Some(PyObj::Dict(m)) => m
+                .values()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<Vec<_>>(),
+            _ => vec![],
+        });
+        for (k, v) in pairs {
+            let ord = with_host(|h| {
+                if let Some(n) = h.as_int(&k) {
+                    Some(n)
+                } else {
+                    h.as_str(&k)
+                        .filter(|s| s.chars().count() == 1)
+                        .map(|s| s.chars().next().unwrap() as i64)
+                }
+            });
+            match ord {
+                Some(n) => {
+                    host::dict_put(&mut d, PKey::Int(n), Value::Int(n), v);
+                }
+                None => {
+                    return Err(host::type_error(
+                        "keys in translate table must be strings of length 1",
+                    ))
+                }
+            }
+        }
+        return Ok(with_host(|h| h.new_dict(d)));
+    }
+    // Two (or three) string args.
+    let x = with_host(|h| h.as_str(&args[0])).unwrap_or_default();
+    let y = with_host(|h| h.as_str(args.get(1).unwrap_or(&Value::Undef))).unwrap_or_default();
+    let xs: Vec<char> = x.chars().collect();
+    let ys: Vec<char> = y.chars().collect();
+    if xs.len() != ys.len() {
+        return Err(host::type_error(
+            "the first two maketrans arguments must have equal length",
+        ));
+    }
+    for (a, b) in xs.iter().zip(ys.iter()) {
+        let ord = *a as i64;
+        host::dict_put(
+            &mut d,
+            PKey::Int(ord),
+            Value::Int(ord),
+            Value::Int(*b as i64),
+        );
+    }
+    if let Some(z) = args.get(2) {
+        let zs = with_host(|h| h.as_str(z)).unwrap_or_default();
+        for c in zs.chars() {
+            let ord = c as i64;
+            host::dict_put(&mut d, PKey::Int(ord), Value::Int(ord), Value::Undef);
+        }
+    }
+    Ok(with_host(|h| h.new_dict(d)))
+}
+
+/// CPython `str.isnumeric`: any Unicode numeric character (Nd/Nl/No).
+fn is_numeric_char(c: char) -> bool {
+    c.is_numeric()
+}
+
+/// CPython `str.isidentifier` (approximated with Rust's Unicode categories).
+fn is_identifier(s: &str) -> bool {
+    let mut it = s.chars();
+    match it.next() {
+        Some(c) if c == '_' || c.is_alphabetic() => {}
+        _ => return false,
+    }
+    it.all(|c| c == '_' || c.is_alphanumeric())
+}
+
+/// CPython `str.istitle`: every cased run starts upper/title-cased and continues
+/// lower-cased; at least one cased character must be present.
+fn is_titlecased(s: &str) -> bool {
+    let mut cased = false;
+    let mut prev_cased = false;
+    for c in s.chars() {
+        if c.is_uppercase() {
+            if prev_cased {
+                return false;
+            }
+            prev_cased = true;
+            cased = true;
+        } else if c.is_lowercase() {
+            if !prev_cased {
+                return false;
+            }
+            prev_cased = true;
+            cased = true;
+        } else {
+            prev_cased = false;
+        }
+    }
+    cased
+}
+
+/// CPython `str.expandtabs`: replace tabs with spaces to the next tab stop,
+/// resetting the column at each newline/carriage-return.
+fn expand_tabs(s: &str, tabsize: usize) -> String {
+    let mut out = String::new();
+    let mut col = 0;
+    for c in s.chars() {
+        match c {
+            '\t' => {
+                if tabsize == 0 {
+                    continue;
+                }
+                let n = tabsize - (col % tabsize);
+                for _ in 0..n {
+                    out.push(' ');
+                }
+                col += n;
+            }
+            '\n' | '\r' => {
+                out.push(c);
+                col = 0;
+            }
+            other => {
+                out.push(other);
+                col += 1;
+            }
+        }
+    }
+    out
+}
+
+/// CPython `str.translate(table)`: `table` maps ordinals to a replacement
+/// ordinal (int), string, or `None` (delete). Absent keys pass through.
+fn str_translate(s: &str, table: &Value) -> Result<String, String> {
+    let mut out = String::new();
+    for c in s.chars() {
+        let key = with_host(|h| h.to_key(&Value::Int(c as i64)))?;
+        let mapped = with_host(|h| match h.get(table) {
+            Some(PyObj::Dict(d)) => d.get(&key).map(|(_, v)| v.clone()),
+            _ => None,
+        });
+        match mapped {
+            None => out.push(c),
+            Some(Value::Undef) => {} // None → delete
+            Some(v) => {
+                if let Some(n) = with_host(|h| h.as_int(&v)) {
+                    if let Some(ch) = char::from_u32(n as u32) {
+                        out.push(ch);
+                    }
+                } else if let Some(rep) = with_host(|h| h.as_str(&v)) {
+                    out.push_str(&rep);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// CPython `str.format_map(mapping)`: like `.format` but named fields resolve
+/// from `mapping` and it is not copied.
+fn str_format_map(s: &str, mapping: &Value) -> Result<Value, String> {
+    let mut out = String::new();
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '{' if chars.get(i + 1) == Some(&'{') => {
+                out.push('{');
+                i += 2;
+            }
+            '}' if chars.get(i + 1) == Some(&'}') => {
+                out.push('}');
+                i += 2;
+            }
+            '{' => {
+                let mut field = String::new();
+                i += 1;
+                while i < chars.len() && chars[i] != '}' {
+                    field.push(chars[i]);
+                    i += 1;
+                }
+                i += 1;
+                let (name_conv, spec) = match field.split_once(':') {
+                    Some((a, b)) => (a.to_string(), b.to_string()),
+                    None => (field, String::new()),
+                };
+                let (fname, conv) = match name_conv.split_once('!') {
+                    Some((n, c)) => (
+                        n.to_string(),
+                        match c {
+                            "s" => 1,
+                            "r" => 2,
+                            "a" => 3,
+                            _ => 0,
+                        },
+                    ),
+                    None => (name_conv, 0),
+                };
+                let key = PKey::Str(fname.clone());
+                let val = with_host(|h| match h.get(mapping) {
+                    Some(PyObj::Dict(d)) => d.get(&key).map(|(_, v)| v.clone()),
+                    _ => None,
+                });
+                let val = match val {
+                    Some(v) => v,
+                    None => return Err(format!("KeyError: '{fname}'")),
+                };
+                out.push_str(&format_field(&val, conv, &spec)?);
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    Ok(new_str(out))
+}
+
 fn str_dot_format(s: &str, args: &[Value]) -> Result<Value, String> {
     let mut out = String::new();
     let chars: Vec<char> = s.chars().collect();
