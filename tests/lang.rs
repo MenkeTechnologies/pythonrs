@@ -594,3 +594,70 @@ fn percent_format_strings_and_star() {
     assert_eq!(g("x = '%c%c' % (72, 105)", "x"), "'Hi'");
     assert_eq!(g("x = '100%%' % ()", "x"), "'100%'");
 }
+
+#[test]
+fn bignum_bitwise_shift_and_conversions() {
+    // Shifts route through the BigInt path (no i64 wraparound / no panic).
+    assert_eq!(g("x = 1 << 64", "x"), "18446744073709551616");
+    assert_eq!(g("x = 1 << 100", "x"), "1267650600228229401496703205376");
+    assert_eq!(g("x = -5 >> 1", "x"), "-3");
+    // Bitwise ops on values beyond i64.
+    assert_eq!(g("x = (10 ** 30) & 7", "x"), "0");
+    assert_eq!(g("x = ~(10 ** 20)", "x"), "-100000000000000000001");
+    // Exact integer comparison beyond f64 precision.
+    assert_eq!(g("x = 10 ** 20 < 10 ** 20 + 1", "x"), "True");
+    // int(float) and radix conversions are bignum-safe.
+    assert_eq!(g("x = int(1e20)", "x"), "100000000000000000000");
+    assert_eq!(g("x = hex(10 ** 20)", "x"), "'0x56bc75e2d63100000'");
+    assert_eq!(g("x = abs(-(10 ** 20))", "x"), "100000000000000000000");
+    // Base parsing with a prefix, and underscores.
+    assert_eq!(g("x = int('0x1F', 16)", "x"), "31");
+    assert_eq!(g("x = int('1_000')", "x"), "1000");
+    // `bool` bit-ops stay `bool`.
+    assert_eq!(g("x = True & False", "x"), "False");
+    assert_eq!(g("x = True | False", "x"), "True");
+}
+
+#[test]
+fn negative_shift_is_catchable_valueerror() {
+    // `1 >> -1` must raise a catchable ValueError, never abort the process.
+    assert_eq!(
+        g(
+            "try:\n    1 >> -1\n    x = 'no error'\nexcept ValueError as e:\n    x = str(e)",
+            "x"
+        ),
+        "'negative shift count'"
+    );
+}
+
+#[test]
+fn custom_getitem_slice_and_slice_repr() {
+    // A user `__getitem__` receiving a slice must not stack-overflow, and the
+    // returned slice object reprs like CPython.
+    assert_eq!(
+        g(
+            "class C:\n    def __getitem__(self, k):\n        return k\nx = C()[1:5:2]",
+            "x"
+        ),
+        "slice(1, 5, 2)"
+    );
+    assert_eq!(
+        g(
+            "class C:\n    def __getitem__(self, k):\n        return k\nx = C()[::-1]",
+            "x"
+        ),
+        "slice(None, None, -1)"
+    );
+}
+
+#[test]
+fn range_membership_is_constant_time() {
+    // O(1) membership must not iterate a huge range.
+    assert_eq!(g("x = 999999999999 in range(1000000000000)", "x"), "True");
+    assert_eq!(g("x = 4 in range(0, 10, 2)", "x"), "True");
+    assert_eq!(g("x = 5 in range(0, 10, 2)", "x"), "False");
+    assert_eq!(g("x = 4 in range(10, 0, -2)", "x"), "True");
+    // Integral float equals its int value; a fractional float never matches.
+    assert_eq!(g("x = 2.0 in range(5)", "x"), "True");
+    assert_eq!(g("x = 2.5 in range(5)", "x"), "False");
+}

@@ -994,6 +994,12 @@ impl PyHost {
                     let inner: Vec<String> = args.iter().map(|a| self.repr_of(a)).collect();
                     format!("{class}({})", inner.join(", "))
                 }
+                Some(PyObj::Slice { lo, hi, step }) => format!(
+                    "slice({}, {}, {})",
+                    self.repr_of(lo),
+                    self.repr_of(hi),
+                    self.repr_of(step)
+                ),
                 _ => self.str_of(v),
             },
             _ => self.str_of(v),
@@ -1353,7 +1359,7 @@ impl PyHost {
         }
     }
 
-    fn norm_big(&mut self, b: num_bigint::BigInt) -> Value {
+    pub fn norm_big(&mut self, b: num_bigint::BigInt) -> Value {
         use num_traits::ToPrimitive;
         if let Some(n) = b.to_i64() {
             Value::Int(n)
@@ -1412,6 +1418,15 @@ impl PyHost {
 
     fn order(&self, a: &Value, b: &Value) -> Result<std::cmp::Ordering, String> {
         use std::cmp::Ordering;
+        // Exact integer comparison first: two integers (either may be a bignum
+        // beyond f64 precision) must compare by value, not by lossy f64.
+        let a_is_float = matches!(a, Value::Float(_));
+        let b_is_float = matches!(b, Value::Float(_));
+        if !a_is_float && !b_is_float {
+            if let (Some(x), Some(y)) = (self.big_val(a), self.big_val(b)) {
+                return Ok(x.cmp(&y));
+            }
+        }
         if let (Some(x), Some(y)) = (self.num_val(a), self.num_val(b)) {
             return Ok(x.partial_cmp(&y).unwrap_or(Ordering::Equal));
         }
@@ -1556,23 +1571,37 @@ impl PyHost {
                     }
                     return Ok(self.new_set(out));
                 }
-                match (ai, bi) {
-                    (Some(x), Some(y)) => Ok(Value::Int(match tag {
+                if let (Some(x), Some(y)) = (self.big_val(a), self.big_val(b)) {
+                    let res = match tag {
                         binop::BITAND => x & y,
                         binop::BITOR => x | y,
                         _ => x ^ y,
-                    })),
-                    _ => Err(self.optype_err("bitop", a, b)),
+                    };
+                    // `bool op bool` stays `bool` (True & False → False).
+                    if matches!(a, Value::Bool(_)) && matches!(b, Value::Bool(_)) {
+                        use num_traits::Zero;
+                        return Ok(Value::Bool(!res.is_zero()));
+                    }
+                    return Ok(self.norm_big(res));
                 }
+                Err(self.optype_err("bitop", a, b))
             }
-            binop::SHL | binop::SHR => match (ai, bi) {
-                (Some(x), Some(y)) => Ok(Value::Int(if tag == binop::SHL {
-                    x.wrapping_shl(y as u32)
-                } else {
-                    x >> y
-                })),
-                _ => Err(self.optype_err("shift", a, b)),
-            },
+            binop::SHL | binop::SHR => {
+                if let (Some(x), Some(y)) = (self.big_val(a), self.big_val(b)) {
+                    use num_bigint::Sign;
+                    use num_traits::ToPrimitive;
+                    if y.sign() == Sign::Minus {
+                        return Err("ValueError: negative shift count".into());
+                    }
+                    let sh = match y.to_usize() {
+                        Some(s) => s,
+                        None => return Err("OverflowError: too many digits in integer".into()),
+                    };
+                    let res = if tag == binop::SHL { x << sh } else { x >> sh };
+                    return Ok(self.norm_big(res));
+                }
+                Err(self.optype_err("shift", a, b))
+            }
             binop::MATMUL => Err(self.optype_err("@", a, b)),
             _ => Err(type_error("unknown binop")),
         }
@@ -1581,8 +1610,9 @@ impl PyHost {
     /// `~x` / unary `+x`.
     pub fn unary(&mut self, tag: i64, v: &Value) -> Result<Value, String> {
         match tag {
-            unop::INVERT => match self.as_int(v) {
-                Some(n) => Ok(Value::Int(!n)),
+            unop::INVERT => match self.big_val(v) {
+                // `~x == -x - 1` (two's-complement), bignum-safe.
+                Some(n) => Ok(self.norm_big(-(n + num_bigint::BigInt::from(1)))),
                 None => Err(type_error(&format!(
                     "bad operand type for unary ~: '{}'",
                     self.type_name(v)
@@ -2400,9 +2430,31 @@ impl PyHost {
                 let key = self.to_key(item)?;
                 Ok(s.contains_key(&key))
             }
-            Some(PyObj::Range { .. }) => {
-                let items = self.iter_items(container)?;
-                Ok(items.iter().any(|x| self.equal(x, item)))
+            Some(PyObj::Range { start, stop, step }) => {
+                let (start, stop, step) = (*start, *stop, *step);
+                // O(1) membership: an integer in the arithmetic progression and
+                // within the half-open bounds. Non-integers are never members.
+                let x = match item {
+                    Value::Int(n) => *n,
+                    Value::Bool(b) => *b as i64,
+                    // An integral float equals its integer value (`2.0 in range(5)`);
+                    // a fractional float can never be a member.
+                    Value::Float(f)
+                        if f.fract() == 0.0
+                            && f.is_finite()
+                            && *f >= i64::MIN as f64
+                            && *f <= i64::MAX as f64 =>
+                    {
+                        *f as i64
+                    }
+                    _ => return Ok(false),
+                };
+                let in_bounds = if step > 0 {
+                    x >= start && x < stop
+                } else {
+                    x <= start && x > stop
+                };
+                Ok(in_bounds && (x - start).rem_euclid(step.abs()) == 0)
             }
             _ => {
                 let items = self.iter_items(container)?;
