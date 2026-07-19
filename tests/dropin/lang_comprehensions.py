@@ -1,0 +1,6 @@
+nums = list(range(1, 11))
+print([n * n for n in nums if n % 2 == 0])
+print({n: n * n for n in nums if n <= 4})
+print(sorted({n % 3 for n in nums}))
+print([(i, c) for i, c in enumerate("abc")])
+print(sum(n for n in nums if n > 5))
