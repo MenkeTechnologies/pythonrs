@@ -532,19 +532,7 @@ impl Compiler {
         decorators: &[Expr],
     ) -> Result<(), String> {
         let def_id = self.build_function(name, params, body)?;
-        // Push defaults, then the func id, then MKFUNC.
-        for d in &params.defaults {
-            self.compile_expr(b, d)?;
-        }
-        b.emit(Op::LoadInt(def_id as i64), 0);
-        // MKFUNC reads [func_id, defaults...] with func_id pushed first; we push
-        // defaults first, so reverse by emitting func id after — the handler
-        // pops accordingly. To keep func_id first on the arg vector, we instead
-        // rotate: simplest is to push func id BEFORE defaults. Re-emit clean:
-        // (defaults already emitted above are below func id) -> handler treats
-        // the top as func id.
-        let n = params.defaults.len();
-        b.emit(Op::CallBuiltin(ops::MKFUNC, argc(1 + n)?), 0);
+        self.emit_make_func(b, def_id, params)?;
         // Apply decorators (innermost first).
         for d in decorators.iter().rev() {
             self.compile_expr(b, d)?; // [func, dec]
@@ -552,6 +540,31 @@ impl Compiler {
             b.emit(Op::CallBuiltin(ops::CALL_VALUE, 2), 0);
         }
         self.store_name(b, name);
+        Ok(())
+    }
+
+    /// Emit the `MKFUNC` sequence for `def_id`: push the evaluated positional
+    /// defaults, then the keyword-only defaults, a count of them, and the func id
+    /// (kept immediately below `MKFUNC` so id-rebasing still finds it). Assumes
+    /// nothing this call needs is already on the stack.
+    fn emit_make_func(
+        &mut self,
+        b: &mut ChunkBuilder,
+        def_id: usize,
+        params: &Params,
+    ) -> Result<(), String> {
+        for d in &params.defaults {
+            self.compile_expr(b, d)?;
+        }
+        let mut nkw = 0usize;
+        for e in params.kwonly_defaults.iter().flatten() {
+            self.compile_expr(b, e)?;
+            nkw += 1;
+        }
+        b.emit(Op::LoadInt(nkw as i64), 0); // keyword-only default count
+        b.emit(Op::LoadInt(def_id as i64), 0); // func id (immediately below MKFUNC)
+        let total = params.defaults.len() + nkw + 2; // + count + func id
+        b.emit(Op::CallBuiltin(ops::MKFUNC, argc(total)?), 0);
         Ok(())
     }
 
@@ -597,8 +610,7 @@ impl Compiler {
         }
         b.emit(Op::CallBuiltin(ops::MKLIST, argc(bases.len())?), 0); // [bases]
         self.name_const(b, name); // [bases, name]
-        b.emit(Op::LoadInt(def_id as i64), 0);
-        b.emit(Op::CallBuiltin(ops::MKFUNC, 1), 0); // [bases, name, bodyfunc]
+        self.emit_make_func(b, def_id, &empty)?; // [bases, name, bodyfunc]
         b.emit(Op::CallBuiltin(ops::BUILD_CLASS, 3), 0); // -> class value
         for d in decorators.iter().rev() {
             self.compile_expr(b, d)?;
@@ -874,14 +886,7 @@ impl Compiler {
             Expr::Lambda { params, body } => {
                 let bodystmt = vec![Stmt::from(StmtKind::Return(Some((**body).clone())))];
                 let def_id = self.build_function("<lambda>", params, &bodystmt)?;
-                for d in &params.defaults {
-                    self.compile_expr(b, d)?;
-                }
-                b.emit(Op::LoadInt(def_id as i64), 0);
-                b.emit(
-                    Op::CallBuiltin(ops::MKFUNC, argc(1 + params.defaults.len())?),
-                    0,
-                );
+                self.emit_make_func(b, def_id, params)?;
             }
             Expr::ListComp(elt, comps) => {
                 self.compile_comprehension(b, CompKind::List, elt, None, comps)?
@@ -1396,8 +1401,7 @@ impl Compiler {
             ..Params::default()
         };
         let def_id = self.build_function(name, &params, &body)?;
-        b.emit(Op::LoadInt(def_id as i64), 0);
-        b.emit(Op::CallBuiltin(ops::MKFUNC, 1), 0); // [func]
+        self.emit_make_func(b, def_id, &params)?; // [func]
         self.compile_expr(b, outer_iter)?; // [func, iterable]
         b.emit(Op::CallBuiltin(ops::CALL_VALUE, 2), 0);
         Ok(())

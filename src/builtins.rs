@@ -707,11 +707,18 @@ fn b_format(vm: &mut VM, _: u8) -> Value {
 // ── functions / classes ──────────────────────────────────────────────────────
 
 fn b_mkfunc(vm: &mut VM, argc: u8) -> Value {
+    // Stack layout (bottom→top): pos_defaults…, kw_defaults…, kw_count, func_id.
     let mut args = pop_n(vm, argc as usize);
     let def_id = match args.pop() {
         Some(Value::Int(n)) => n as usize,
         _ => return abort(vm, "internal: MKFUNC without func id".into()),
     };
+    let nkw = match args.pop() {
+        Some(Value::Int(n)) => n as usize,
+        _ => return abort(vm, "internal: MKFUNC without kwonly-default count".into()),
+    };
+    let split = args.len().saturating_sub(nkw);
+    let kwonly_defaults = args.split_off(split);
     let defaults = args; // remaining are positional defaults, in order
     let env = with_host(|h| h.current_env_capture());
     with_host(|h| {
@@ -719,6 +726,7 @@ fn b_mkfunc(vm: &mut VM, argc: u8) -> Value {
             def_id,
             env: Some(env),
             defaults,
+            kwonly_defaults,
             bound: None,
             owner: None,
         }))

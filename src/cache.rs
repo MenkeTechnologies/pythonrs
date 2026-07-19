@@ -25,7 +25,9 @@ use std::path::PathBuf;
 /// lowering — bytecode compiled by any earlier pythonrs must miss cleanly.
 /// v4: `yield from` now lowers to the `GENRET` op (delegated return value); older
 /// cached bytecode for a `yield from` would drop the value, so it must miss.
-const SCHEMA: u64 = 4;
+/// v5: `MKFUNC` carries keyword-only defaults + a count below the func id; older
+/// bytecode uses the 1-arg-only layout and must miss cleanly.
+const SCHEMA: u64 = 5;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]
