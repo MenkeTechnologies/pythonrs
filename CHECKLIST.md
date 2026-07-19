@@ -11,7 +11,22 @@ the ordered, grounded gap list between here and that goal.
   reference `python3`, and reports every stdout/exit divergence, minimized. A
   mode at `divergences : 0` is a surface at parity. Re-run to re-measure; never
   weaken the comparison to move a number.
+- **Whole-script readiness corpus** — `tests/dropin/*.py` + `scripts/dropin_check.sh`.
+  Representative whole scripts of the kind an agent actually writes (file I/O,
+  argv, subprocess, the common stdlib, real composites like read→count→sort).
+  The runner runs each through pythonrs and `python3` with identical argv and an
+  isolated cwd, diffs stdout + exit, and reports per-category readiness. This is
+  what "can pythonrs transparently shadow `python3`" actually means: the fuzzer
+  proves per-expression parity, the corpus proves whole-script parity. Where the
+  fuzzer tests one expression at a time it can miss composite gaps — the corpus
+  caught sort **stability**, `json.dumps(sort_keys=...)`, and f-string `#` alt-form
+  that the fuzzer's mode outputs did not.
 - Import/execution probes — `python -c 'import X'`, script argv, exit codes.
+
+**Readiness snapshot — 2026-07-19: `3/30 OK (10%)`** against committed `main`
+(19 ERR = missing `open()`/module wall, largely the Tier 1/2 items several of
+which are being wired now; 8 DIFF = the behavior gaps below). Re-run:
+`cargo build && ./scripts/dropin_check.sh`.
 
 Tiers are ordered by drop-in impact: Tier 0/1 block *most* real scripts; the
 language-semantics gaps in Tier 3 are narrow and already localized by the fuzzer.
@@ -89,6 +104,14 @@ concentrated gaps:
       (~46/150), the largest single divergence surface in the fuzzer.
 - [ ] **3-argument `pow(a, b, m)`** — modular exponentiation ignores the modulus
       (`pow(2, 5, 5)` → `32` instead of `2`). Drives the `builtins` mode (~12/150).
+- [ ] **`sorted`/`.sort` stability.** `sorted(pairs, key=...)` reorders equal-key
+      elements (`[('alice',30),('carol',25),('bob',25)]` vs CPython's
+      `[...,('bob',25),('carol',25)]`). Python guarantees a stable sort; use a
+      stable algorithm. Found by the corpus, not the fuzzer.
+- [ ] **`json.dumps(sort_keys=True)`** ignored — pythonrs emits insertion order.
+      Common in config/serialization round-trips. Found by the corpus.
+- [ ] **f-string / format `#` alternate form** — `f"{n:#x}"` yields `2a`, not `0x2a`
+      (`#o`/`#b` likewise). The `#` flag of the format mini-language is dropped.
 - [ ] **`str.format` keyword fields** — `'{name}'.format(name=...)` not bound (no
       kwargs plumbing through `.format`).
 - [ ] **`//`, `%`, and bitwise ops on bignums** fall back to i64 range (correct only
