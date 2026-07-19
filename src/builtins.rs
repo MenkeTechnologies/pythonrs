@@ -22,6 +22,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::SETITEM, b_setitem);
     vm.register_builtin(ops::DELITEM, b_delitem);
     vm.register_builtin(ops::MKSTR, b_mkstr);
+    vm.register_builtin(ops::MKBYTES, b_mkbytes);
     vm.register_builtin(ops::MKLIST, b_mklist);
     vm.register_builtin(ops::MKTUPLE, b_mktuple);
     vm.register_builtin(ops::MKSET, b_mkset);
@@ -219,6 +220,32 @@ fn b_getitem(vm: &mut VM, _: u8) -> Value {
         let r = host::call_method(&recv, "__getitem__", vec![idx], vec![]);
         return finish(vm, r);
     }
+    // dict-subclass `__missing__`: Counter → 0, defaultdict → default_factory().
+    if let Some(meta) = host::dict_meta_of(&recv) {
+        let missing = with_host(|h| match h.to_key(&idx) {
+            Ok(k) => match h.get(&recv) {
+                Some(PyObj::Dict(d)) => !d.contains_key(&k),
+                _ => false,
+            },
+            Err(_) => false,
+        });
+        if missing {
+            match meta.kind {
+                host::DictKind::Counter => return finish(vm, Ok(Value::Int(0))),
+                host::DictKind::DefaultDict => {
+                    if let Some(factory) = meta.factory {
+                        let r = (|| {
+                            let default = host::invoke(&factory, vec![], vec![])?;
+                            with_host(|h| h.set_item(&recv, &idx, default.clone()))?;
+                            Ok(default)
+                        })();
+                        return finish(vm, r);
+                    }
+                }
+                host::DictKind::OrderedDict => {}
+            }
+        }
+    }
     let r = with_host(|h| h.get_item(&recv, &idx));
     finish(vm, r)
 }
@@ -257,6 +284,21 @@ fn b_mkstr(vm: &mut VM, argc: u8) -> Value {
         }
     });
     with_host(|h| h.new_str(s))
+}
+
+/// Materialize a `bytes` literal. The compiler packs the literal's bytes into a
+/// latin-1 string constant (one code point per byte); here we unpack it back to
+/// the raw `Vec<u8>`.
+fn b_mkbytes(vm: &mut VM, _argc: u8) -> Value {
+    let v = vm.pop();
+    let bytes: Vec<u8> = with_host(|h| match h.get(&v) {
+        Some(PyObj::Str(s)) => s.chars().map(|c| c as u32 as u8).collect(),
+        _ => match &v {
+            Value::Str(s) => s.chars().map(|c| c as u32 as u8).collect(),
+            _ => vec![],
+        },
+    });
+    with_host(|h| h.alloc(PyObj::Bytes(bytes)))
 }
 
 fn b_mklist(vm: &mut VM, argc: u8) -> Value {
@@ -1222,6 +1264,7 @@ fn callable_name(h: &host::PyHost, v: &Value) -> Option<String> {
     match h.get(v) {
         Some(PyObj::Builtin(n)) => Some(n.clone()),
         Some(PyObj::Class(n)) => Some(n.clone()),
+        Some(PyObj::NamedTupleType { type_name, .. }) => Some(type_name.clone()),
         _ => None,
     }
 }
@@ -1250,6 +1293,7 @@ pub fn is_builtin_function(name: &str) -> bool {
         || name.starts_with("json.")
         || name.starts_with("os.")
         || name.starts_with("random.")
+        || name.starts_with("collections.")
 }
 
 fn is_builtin_type(name: &str) -> bool {
@@ -1265,6 +1309,7 @@ fn is_builtin_type(name: &str) -> bool {
             | "set"
             | "frozenset"
             | "bytes"
+            | "bytearray"
             | "complex"
             | "object"
             | "type"
@@ -1322,6 +1367,7 @@ const BUILTIN_FUNCS: &[&str] = &[
     "vars",
     "dir",
     "callable",
+    "open",
 ];
 
 // ── builtin functions ────────────────────────────────────────────────────────
@@ -1440,7 +1486,7 @@ pub fn call_builtin_function(
         }
     }
     if let Some(f) = name.strip_prefix("functools.") {
-        if let Some(r) = crate::stdlib::functools::call(f, &args) {
+        if let Some(r) = crate::stdlib::functools::call(f, &args, &kwargs) {
             return r;
         }
     }
@@ -1458,6 +1504,10 @@ pub fn call_builtin_function(
         if let Some(r) = with_host(|h| crate::stdlib::random::call(h, f, &args)) {
             return r;
         }
+    }
+    // collections constructors (host-backed types).
+    if let Some(f) = name.strip_prefix("collections.") {
+        return construct_collection(f, args, kwargs);
     }
     // Exception constructors.
     if is_exception_class(name) {
@@ -1616,7 +1666,10 @@ pub fn call_builtin_function(
         "pow" => {
             let a = arg0(&args)?;
             let b = args.get(1).cloned().unwrap_or(Value::Int(1));
-            with_host(|h| h.binop(host::binop::POW, &a, &b))
+            match args.get(2) {
+                None | Some(Value::Undef) => with_host(|h| h.binop(host::binop::POW, &a, &b)),
+                Some(m) => pow_mod(&a, &b, m),
+            }
         }
         "type" => {
             let v = arg0(&args)?;
@@ -1794,7 +1847,26 @@ pub fn call_builtin_function(
             let i = args.get(1).and_then(as_f).unwrap_or(0.0);
             Ok(with_host(|h| h.alloc(PyObj::Complex(r, i))))
         }
-        "bytes" => Ok(with_host(|h| h.alloc(PyObj::Bytes(vec![])))),
+        "bytes" => {
+            let b = build_bytes(&args)?;
+            Ok(with_host(|h| h.alloc(PyObj::Bytes(b))))
+        }
+        "bytearray" => {
+            let b = build_bytes(&args)?;
+            Ok(with_host(|h| h.alloc(PyObj::Bytearray(b))))
+        }
+        "open" => {
+            let file = kw_get(&kwargs, "file")
+                .or_else(|| args.first().cloned())
+                .ok_or_else(|| host::type_error("open() missing required argument: 'file'"))?;
+            let path = with_host(|h| h.as_str(&file))
+                .ok_or_else(|| host::type_error("open() argument 'file' must be str"))?;
+            let mode = kw_get(&kwargs, "mode")
+                .or_else(|| args.get(1).cloned())
+                .and_then(|v| with_host(|h| h.as_str(&v)))
+                .unwrap_or_else(|| "r".into());
+            host::open_file(&path, &mode)
+        }
         "object" => Ok(with_host(|h| {
             h.alloc(PyObj::Instance(Instance {
                 class: "object".into(),
@@ -1814,6 +1886,45 @@ fn as_f(v: &Value) -> Option<f64> {
     }
 }
 
+/// 3-argument `pow(base, exp, mod)` — modular exponentiation. All three must be
+/// integers; `exp` must be non-negative (a negative exponent needs a modular
+/// inverse, which is not yet implemented). The result takes the sign of `mod`
+/// (Python's floored convention).
+fn pow_mod(a: &Value, b: &Value, m: &Value) -> Result<Value, String> {
+    use num_bigint::BigInt;
+    use num_traits::ToPrimitive;
+    let (base, exp, modulus) = match with_host(|h| (h.big_val(a), h.big_val(b), h.big_val(m))) {
+        (Some(x), Some(y), Some(z)) => (x, y, z),
+        _ => {
+            return Err(host::type_error(
+                "pow() 3rd argument not allowed unless all arguments are integers",
+            ))
+        }
+    };
+    let zero = BigInt::from(0);
+    if modulus == zero {
+        return Err("ValueError: pow() 3rd argument cannot be 0".into());
+    }
+    if exp < zero {
+        return Err(
+            "ValueError: pow() 2nd argument cannot be negative when 3rd argument specified".into(),
+        );
+    }
+    // `modpow` reduces modulo `|modulus|`; re-apply a floored mod so the sign
+    // matches Python (result sign == modulus sign).
+    let raw = base.modpow(&exp, &modulus);
+    let r = &raw % &modulus;
+    let r = if r != zero && (r < zero) != (modulus < zero) {
+        r + &modulus
+    } else {
+        r
+    };
+    Ok(with_host(|h| match r.to_i64() {
+        Some(n) => Value::Int(n),
+        None => h.alloc(PyObj::BigInt(r)),
+    }))
+}
+
 fn arg0(args: &[Value]) -> Result<Value, String> {
     args.first()
         .cloned()
@@ -1831,7 +1942,8 @@ fn hash_key(k: &PKey) -> i64 {
 fn py_len(v: &Value) -> Result<usize, String> {
     with_host(|h| match h.get(v) {
         Some(PyObj::Str(s)) => Ok(s.chars().count()),
-        Some(PyObj::Bytes(b)) => Ok(b.len()),
+        Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) => Ok(b.len()),
+        Some(PyObj::Deque { items, .. }) => Ok(items.len()),
         Some(PyObj::List(l)) | Some(PyObj::Tuple(l)) => Ok(l.len()),
         Some(PyObj::Dict(d)) => Ok(d.len()),
         Some(PyObj::Set(s)) => Ok(s.len()),
@@ -2216,7 +2328,17 @@ fn isinstance(h: &host::PyHost, v: &Value, cls: &Value) -> bool {
         None => return false,
     };
     let vt = h.type_name(v);
-    type_isa(h, &vt, &want)
+    if type_isa(h, &vt, &want) {
+        return true;
+    }
+    // Structural subclass checks: a namedtuple instance is-a `tuple`; a
+    // Counter/defaultdict/OrderedDict is-a `dict` (their `type_name` is the
+    // subclass, so the string compare above misses these).
+    match h.get(v) {
+        Some(PyObj::Tuple(_)) if want == "tuple" => true,
+        Some(PyObj::Dict(_)) if want == "dict" => true,
+        _ => false,
+    }
 }
 
 fn type_isa(h: &host::PyHost, a: &str, b: &str) -> bool {
@@ -2225,6 +2347,10 @@ fn type_isa(h: &host::PyHost, a: &str, b: &str) -> bool {
     }
     // Numeric duck: bool is-a int in Python.
     if a == "bool" && b == "int" {
+        return true;
+    }
+    // collections dict subclasses are-a dict; namedtuple instances are-a tuple.
+    if b == "dict" && matches!(a, "Counter" | "defaultdict" | "OrderedDict") {
         return true;
     }
     if exception_isa(a, b, h) {
@@ -2243,15 +2369,70 @@ fn type_isa(h: &host::PyHost, a: &str, b: &str) -> bool {
 pub fn type_has_method(typename: &str, name: &str) -> bool {
     let list: &[&str] = match typename {
         "str" => STR_METHODS,
+        "bytes" => BYTES_METHODS,
+        "bytearray" => BYTEARRAY_METHODS,
         "list" => LIST_METHODS,
         "dict" => DICT_METHODS,
+        "OrderedDict" => return DICT_METHODS.contains(&name) || name == "move_to_end",
+        "defaultdict" => return DICT_METHODS.contains(&name),
+        "Counter" => {
+            return DICT_METHODS.contains(&name)
+                || matches!(
+                    name,
+                    "most_common" | "elements" | "subtract" | "update" | "total"
+                )
+        }
         "set" | "frozenset" => SET_METHODS,
         "tuple" => TUPLE_METHODS,
+        "deque" => DEQUE_METHODS,
+        "TextIOWrapper" => FILE_METHODS,
         "int" | "float" | "bool" => NUM_METHODS,
         _ => &[],
     };
     list.contains(&name)
 }
+
+const BYTES_METHODS: &[&str] = &[
+    "decode",
+    "hex",
+    "index",
+    "find",
+    "count",
+    "startswith",
+    "endswith",
+    "upper",
+    "lower",
+];
+const BYTEARRAY_METHODS: &[&str] = &[
+    "append", "extend", "pop", "clear", "decode", "hex", "index", "find",
+];
+const DEQUE_METHODS: &[&str] = &[
+    "append",
+    "appendleft",
+    "pop",
+    "popleft",
+    "extend",
+    "extendleft",
+    "rotate",
+    "clear",
+    "count",
+    "index",
+    "remove",
+];
+const FILE_METHODS: &[&str] = &[
+    "read",
+    "readline",
+    "readlines",
+    "write",
+    "writelines",
+    "close",
+    "flush",
+    "readable",
+    "writable",
+    "seekable",
+    "__enter__",
+    "__exit__",
+];
 
 const STR_METHODS: &[&str] = &[
     "upper",
@@ -2333,10 +2514,21 @@ pub fn call_type_method(
     let tn = with_host(|h| h.type_name(recv));
     match tn.as_str() {
         "str" => str_method(recv, name, &args),
+        "bytes" => bytes_method(recv, name, &args),
+        "bytearray" => bytearray_method(recv, name, &args),
         "list" => list_method(recv, name, &args, &kwargs),
         "dict" => dict_method(recv, name, &args),
+        "Counter" | "defaultdict" | "OrderedDict" => {
+            if let Some(r) = collections_dict_method(recv, name, &args, &tn) {
+                return r;
+            }
+            dict_method(recv, name, &args)
+        }
         "set" | "frozenset" => set_method(recv, name, &args),
         "tuple" => tuple_method(recv, name, &args),
+        "deque" => deque_method(recv, name, &args),
+        "TextIOWrapper" => file_method(recv, name, &args),
+        "functools._lru_cache_wrapper" => lru_wrapper_method(recv, name),
         "int" | "float" | "bool" => num_method(recv, name, &args),
         other => Err(format!(
             "AttributeError: '{other}' object has no attribute '{name}'"
@@ -3045,6 +3237,798 @@ fn num_method(recv: &Value, name: &str, _args: &[Value]) -> Result<Value, String
         })),
         "conjugate" => Ok(recv.clone()),
         _ => Err(format!("AttributeError: object has no attribute '{name}'")),
+    }
+}
+
+// ── bytes / bytearray ────────────────────────────────────────────────────────
+
+/// The byte content of a `bytes` / `bytearray` receiver.
+fn recv_bytes(recv: &Value) -> Vec<u8> {
+    with_host(|h| match h.get(recv) {
+        Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) => b.clone(),
+        _ => vec![],
+    })
+}
+
+/// A bytes-like argument as raw bytes: a `bytes`/`bytearray`, or a single
+/// `int` in `0..=255`. `None` for anything else (a `str`, out-of-range int, …).
+fn arg_bytes_like(v: &Value) -> Option<Vec<u8>> {
+    let obj = with_host(|h| match h.get(v) {
+        Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) => Some(b.clone()),
+        _ => None,
+    });
+    if obj.is_some() {
+        return obj;
+    }
+    match v {
+        Value::Int(n) if (0..=255).contains(n) => Some(vec![*n as u8]),
+        _ => None,
+    }
+}
+
+/// Only a `bytes`/`bytearray` (not an int) as raw bytes — for `file.write(b'…')`.
+fn as_bytes_object(v: &Value) -> Option<Vec<u8>> {
+    with_host(|h| match h.get(v) {
+        Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) => Some(b.clone()),
+        _ => None,
+    })
+}
+
+fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    if needle.len() > hay.len() {
+        return None;
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+fn count_sub(hay: &[u8], needle: &[u8]) -> usize {
+    if needle.is_empty() {
+        return hay.len() + 1;
+    }
+    let mut c = 0;
+    let mut i = 0;
+    while i + needle.len() <= hay.len() {
+        if &hay[i..i + needle.len()] == needle {
+            c += 1;
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+    c
+}
+
+/// Decode bytes to a `str`. Only `utf-8` (default, strict) and `latin-1` /
+/// `ascii` are recognized; the `errors` argument is not yet honored.
+fn decode_bytes(bytes: &[u8], args: &[Value]) -> Result<Value, String> {
+    let enc = args
+        .first()
+        .and_then(|v| with_host(|h| h.as_str(v)))
+        .unwrap_or_else(|| "utf-8".into());
+    let norm = enc.to_lowercase().replace(['-', '_'], "");
+    let s = match norm.as_str() {
+        "latin1" | "latin" | "iso88591" | "l1" | "cp1252" => {
+            bytes.iter().map(|&b| b as char).collect::<String>()
+        }
+        "ascii" | "usascii" => {
+            if bytes.iter().all(|&b| b < 0x80) {
+                bytes.iter().map(|&b| b as char).collect::<String>()
+            } else {
+                return Err("UnicodeDecodeError: 'ascii' codec can't decode byte".into());
+            }
+        }
+        _ => String::from_utf8(bytes.to_vec())
+            .map_err(|_| "UnicodeDecodeError: 'utf-8' codec can't decode byte".to_string())?,
+    };
+    Ok(new_str(s))
+}
+
+fn bytes_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    let bytes = recv_bytes(recv);
+    match name {
+        "decode" => decode_bytes(&bytes, args),
+        "hex" => Ok(new_str(bytes.iter().map(|b| format!("{b:02x}")).collect())),
+        "index" | "find" => {
+            let sub = args.first().and_then(arg_bytes_like).ok_or_else(|| {
+                host::type_error("argument should be integer or bytes-like object")
+            })?;
+            match (name, find_sub(&bytes, &sub)) {
+                (_, Some(p)) => Ok(Value::Int(p as i64)),
+                ("find", None) => Ok(Value::Int(-1)),
+                (_, None) => Err("ValueError: subsection not found".into()),
+            }
+        }
+        "count" => {
+            let sub = args.first().and_then(arg_bytes_like).ok_or_else(|| {
+                host::type_error("argument should be integer or bytes-like object")
+            })?;
+            Ok(Value::Int(count_sub(&bytes, &sub) as i64))
+        }
+        "startswith" => {
+            let sub = args.first().and_then(as_bytes_object).unwrap_or_default();
+            Ok(Value::Bool(bytes.starts_with(&sub)))
+        }
+        "endswith" => {
+            let sub = args.first().and_then(as_bytes_object).unwrap_or_default();
+            Ok(Value::Bool(bytes.ends_with(&sub)))
+        }
+        "upper" => Ok(with_host(|h| {
+            h.alloc(PyObj::Bytes(bytes.to_ascii_uppercase()))
+        })),
+        "lower" => Ok(with_host(|h| {
+            h.alloc(PyObj::Bytes(bytes.to_ascii_lowercase()))
+        })),
+        _ => Err(format!(
+            "AttributeError: 'bytes' object has no attribute '{name}'"
+        )),
+    }
+}
+
+fn bytearray_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    match name {
+        "append" => {
+            let a0 = arg0(args)?;
+            let n = with_host(|h| h.as_int(&a0))
+                .ok_or_else(|| host::type_error("an integer is required"))?;
+            if !(0..=255).contains(&n) {
+                return Err("ValueError: byte must be in range(0, 256)".into());
+            }
+            with_host(|h| {
+                if let Some(PyObj::Bytearray(b)) = h.get_mut(recv) {
+                    b.push(n as u8);
+                }
+            });
+            Ok(Value::Undef)
+        }
+        "extend" => {
+            let add = arg0(args)?;
+            let extra = collect_bytes(&add)?;
+            with_host(|h| {
+                if let Some(PyObj::Bytearray(b)) = h.get_mut(recv) {
+                    b.extend_from_slice(&extra);
+                }
+            });
+            Ok(Value::Undef)
+        }
+        "pop" => {
+            let got = with_host(|h| match h.get_mut(recv) {
+                Some(PyObj::Bytearray(b)) => b.pop(),
+                _ => None,
+            });
+            got.map(|x| Value::Int(x as i64))
+                .ok_or_else(|| "IndexError: pop from empty bytearray".into())
+        }
+        "clear" => {
+            with_host(|h| {
+                if let Some(PyObj::Bytearray(b)) = h.get_mut(recv) {
+                    b.clear();
+                }
+            });
+            Ok(Value::Undef)
+        }
+        "decode" => decode_bytes(&recv_bytes(recv), args),
+        "hex" => Ok(new_str(
+            recv_bytes(recv)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect(),
+        )),
+        "index" | "find" => {
+            let bytes = recv_bytes(recv);
+            let sub = args.first().and_then(arg_bytes_like).ok_or_else(|| {
+                host::type_error("argument should be integer or bytes-like object")
+            })?;
+            match (name, find_sub(&bytes, &sub)) {
+                (_, Some(p)) => Ok(Value::Int(p as i64)),
+                ("find", None) => Ok(Value::Int(-1)),
+                (_, None) => Err("ValueError: subsection not found".into()),
+            }
+        }
+        _ => Err(format!(
+            "AttributeError: 'bytearray' object has no attribute '{name}'"
+        )),
+    }
+}
+
+/// Build the byte content for a `bytes()` / `bytearray()` constructor call.
+/// Handles `()` → empty, `int` → that many zero bytes, a bytes-like copy, a
+/// `str` (with an optional encoding), and an iterable of ints.
+fn build_bytes(args: &[Value]) -> Result<Vec<u8>, String> {
+    let v = match args.first() {
+        None => return Ok(vec![]),
+        Some(v) => v,
+    };
+    if let Value::Int(n) = v {
+        if *n < 0 {
+            return Err("ValueError: negative count".into());
+        }
+        return Ok(vec![0u8; *n as usize]);
+    }
+    if let Some(b) = as_bytes_object(v) {
+        return Ok(b);
+    }
+    if let Some(s) = with_host(|h| h.as_str(v)) {
+        let enc = args
+            .get(1)
+            .and_then(|e| with_host(|h| h.as_str(e)))
+            .map(|e| e.to_lowercase().replace(['-', '_'], ""));
+        return match enc.as_deref() {
+            Some("latin1") | Some("latin") | Some("iso88591") | Some("l1") => {
+                Ok(s.chars().map(|c| c as u32 as u8).collect())
+            }
+            _ => Ok(s.into_bytes()),
+        };
+    }
+    collect_bytes(v)
+}
+
+/// Collect a bytes-like / iterable-of-ints argument into raw bytes (for
+/// `bytearray.extend`, `bytes(iterable)`, …).
+fn collect_bytes(v: &Value) -> Result<Vec<u8>, String> {
+    if let Some(b) = as_bytes_object(v) {
+        return Ok(b);
+    }
+    let items = host::iter_vec(v)?;
+    let mut out = Vec::with_capacity(items.len());
+    for it in items {
+        let n = with_host(|h| h.as_int(&it))
+            .ok_or_else(|| host::type_error("'int' object is required"))?;
+        if !(0..=255).contains(&n) {
+            return Err("ValueError: bytes must be in range(0, 256)".into());
+        }
+        out.push(n as u8);
+    }
+    Ok(out)
+}
+
+// ── collections.deque ────────────────────────────────────────────────────────
+
+fn deque_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    match name {
+        "append" => {
+            let v = arg0(args)?;
+            with_host(|h| {
+                if let Some(PyObj::Deque { items, maxlen }) = h.get_mut(recv) {
+                    items.push_back(v);
+                    if let Some(m) = *maxlen {
+                        while items.len() > m {
+                            items.pop_front();
+                        }
+                    }
+                }
+            });
+            Ok(Value::Undef)
+        }
+        "appendleft" => {
+            let v = arg0(args)?;
+            with_host(|h| {
+                if let Some(PyObj::Deque { items, maxlen }) = h.get_mut(recv) {
+                    items.push_front(v);
+                    if let Some(m) = *maxlen {
+                        while items.len() > m {
+                            items.pop_back();
+                        }
+                    }
+                }
+            });
+            Ok(Value::Undef)
+        }
+        "pop" => with_host(|h| match h.get_mut(recv) {
+            Some(PyObj::Deque { items, .. }) => items.pop_back(),
+            _ => None,
+        })
+        .ok_or_else(|| "IndexError: pop from an empty deque".into()),
+        "popleft" => with_host(|h| match h.get_mut(recv) {
+            Some(PyObj::Deque { items, .. }) => items.pop_front(),
+            _ => None,
+        })
+        .ok_or_else(|| "IndexError: pop from an empty deque".into()),
+        "extend" => {
+            let add = host::iter_vec(&arg0(args)?)?;
+            with_host(|h| {
+                if let Some(PyObj::Deque { items, maxlen }) = h.get_mut(recv) {
+                    for v in add {
+                        items.push_back(v);
+                        if let Some(m) = *maxlen {
+                            while items.len() > m {
+                                items.pop_front();
+                            }
+                        }
+                    }
+                }
+            });
+            Ok(Value::Undef)
+        }
+        "extendleft" => {
+            let add = host::iter_vec(&arg0(args)?)?;
+            with_host(|h| {
+                if let Some(PyObj::Deque { items, maxlen }) = h.get_mut(recv) {
+                    for v in add {
+                        items.push_front(v);
+                        if let Some(m) = *maxlen {
+                            while items.len() > m {
+                                items.pop_back();
+                            }
+                        }
+                    }
+                }
+            });
+            Ok(Value::Undef)
+        }
+        "rotate" => {
+            let n = args
+                .first()
+                .and_then(|v| with_host(|h| h.as_int(v)))
+                .unwrap_or(1);
+            with_host(|h| {
+                if let Some(PyObj::Deque { items, .. }) = h.get_mut(recv) {
+                    if !items.is_empty() {
+                        let len = items.len() as i64;
+                        let k = ((n % len) + len) % len;
+                        for _ in 0..k {
+                            if let Some(x) = items.pop_back() {
+                                items.push_front(x);
+                            }
+                        }
+                    }
+                }
+            });
+            Ok(Value::Undef)
+        }
+        "clear" => {
+            with_host(|h| {
+                if let Some(PyObj::Deque { items, .. }) = h.get_mut(recv) {
+                    items.clear();
+                }
+            });
+            Ok(Value::Undef)
+        }
+        "count" => {
+            let v = arg0(args)?;
+            Ok(Value::Int(with_host(|h| match h.get(recv) {
+                Some(PyObj::Deque { items, .. }) => {
+                    items.iter().filter(|x| h.equal(x, &v)).count() as i64
+                }
+                _ => 0,
+            })))
+        }
+        "index" => {
+            let v = arg0(args)?;
+            with_host(|h| match h.get(recv) {
+                Some(PyObj::Deque { items, .. }) => {
+                    match items.iter().position(|x| h.equal(x, &v)) {
+                        Some(p) => Ok(Value::Int(p as i64)),
+                        None => Err(format!("ValueError: {} is not in deque", h.repr_of(&v))),
+                    }
+                }
+                _ => Err(host::type_error("not a deque")),
+            })
+        }
+        "remove" => {
+            let v = arg0(args)?;
+            let pos = with_host(|h| match h.get(recv) {
+                Some(PyObj::Deque { items, .. }) => items.iter().position(|x| h.equal(x, &v)),
+                _ => None,
+            });
+            match pos {
+                Some(p) => {
+                    with_host(|h| {
+                        if let Some(PyObj::Deque { items, .. }) = h.get_mut(recv) {
+                            items.remove(p);
+                        }
+                    });
+                    Ok(Value::Undef)
+                }
+                None => Err("ValueError: deque.remove(x): x not in deque".into()),
+            }
+        }
+        _ => Err(format!(
+            "AttributeError: 'collections.deque' object has no attribute '{name}'"
+        )),
+    }
+}
+
+// ── collections dict subclasses (Counter / defaultdict / OrderedDict) ─────────
+
+/// Methods specific to the `dict` subclasses. Returns `None` when `name` is a
+/// plain-dict method (the caller then falls back to `dict_method`).
+fn collections_dict_method(
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+    tn: &str,
+) -> Option<Result<Value, String>> {
+    match (tn, name) {
+        ("Counter", "most_common") => Some(counter_most_common(recv, args)),
+        ("Counter", "elements") => Some(counter_elements(recv)),
+        ("Counter", "total") => Some(Ok(Value::Int(with_host(|h| match h.get(recv) {
+            Some(PyObj::Dict(d)) => d
+                .values()
+                .map(|(_, v)| h.as_int(v).unwrap_or(0))
+                .sum::<i64>(),
+            _ => 0,
+        })))),
+        ("Counter", "subtract") => Some(counter_add(recv, args, -1)),
+        ("Counter", "update") => Some(counter_add(recv, args, 1)),
+        ("OrderedDict", "move_to_end") => Some(ordered_move_to_end(recv, args)),
+        _ => None,
+    }
+}
+
+/// `Counter.most_common([n])` — `(element, count)` pairs, highest count first,
+/// ties keeping insertion order (CPython uses a stable sort).
+fn counter_most_common(recv: &Value, args: &[Value]) -> Result<Value, String> {
+    let mut pairs: Vec<(Value, i64)> = with_host(|h| match h.get(recv) {
+        Some(PyObj::Dict(d)) => d
+            .values()
+            .map(|(k, v)| (k.clone(), h.as_int(v).unwrap_or(0)))
+            .collect(),
+        _ => vec![],
+    });
+    pairs.sort_by_key(|p| std::cmp::Reverse(p.1)); // stable → ties keep insertion order
+    let n = args.first().and_then(|v| with_host(|h| h.as_int(v)));
+    if let Some(n) = n {
+        pairs.truncate(n.max(0) as usize);
+    }
+    let tuples: Vec<Value> = with_host(|h| {
+        pairs
+            .into_iter()
+            .map(|(k, c)| h.new_tuple(vec![k, Value::Int(c)]))
+            .collect()
+    });
+    Ok(with_host(|h| h.new_list(tuples)))
+}
+
+/// `Counter.elements()` — each element repeated `count` times (counts <= 0 skipped).
+fn counter_elements(recv: &Value) -> Result<Value, String> {
+    let pairs: Vec<(Value, i64)> = with_host(|h| match h.get(recv) {
+        Some(PyObj::Dict(d)) => d
+            .values()
+            .map(|(k, v)| (k.clone(), h.as_int(v).unwrap_or(0)))
+            .collect(),
+        _ => vec![],
+    });
+    let mut out = Vec::new();
+    for (k, c) in pairs {
+        for _ in 0..c.max(0) {
+            out.push(k.clone());
+        }
+    }
+    Ok(with_host(|h| h.new_list(out)))
+}
+
+/// `Counter.update(iterable_or_mapping)` / `.subtract(...)` with `sign` +1 / -1.
+fn counter_add(recv: &Value, args: &[Value], sign: i64) -> Result<Value, String> {
+    let other = match args.first() {
+        Some(v) => v.clone(),
+        None => return Ok(Value::Undef),
+    };
+    // A mapping contributes its counts; any other iterable contributes 1 each.
+    let is_dict = with_host(|h| matches!(h.get(&other), Some(PyObj::Dict(_))));
+    let deltas: Vec<(PKey, Value, i64)> = if is_dict {
+        with_host(|h| match h.get(&other) {
+            Some(PyObj::Dict(d)) => d
+                .values()
+                .map(|(k, v)| {
+                    let key = h.to_key(k).unwrap_or(PKey::None);
+                    (key, k.clone(), h.as_int(v).unwrap_or(0) * sign)
+                })
+                .collect(),
+            _ => vec![],
+        })
+    } else {
+        let items = host::iter_vec(&other)?;
+        with_host(|h| {
+            items
+                .into_iter()
+                .map(|it| {
+                    let key = h.to_key(&it).unwrap_or(PKey::None);
+                    (key, it, sign)
+                })
+                .collect()
+        })
+    };
+    with_host(|h| {
+        if let Some(PyObj::Dict(d)) = h.get_mut(recv) {
+            for (key, kv, delta) in deltas {
+                let entry = d.entry(key).or_insert_with(|| (kv.clone(), Value::Int(0)));
+                let cur = match &entry.1 {
+                    Value::Int(n) => *n,
+                    _ => 0,
+                };
+                entry.1 = Value::Int(cur + delta);
+            }
+        }
+    });
+    Ok(Value::Undef)
+}
+
+/// `OrderedDict.move_to_end(key, last=True)`.
+fn ordered_move_to_end(recv: &Value, args: &[Value]) -> Result<Value, String> {
+    let kv = arg0(args)?;
+    let key = with_host(|h| h.to_key(&kv))?;
+    let last = args
+        .get(1)
+        .map(|v| with_host(|h| h.truthy(v)))
+        .unwrap_or(true);
+    let found = with_host(|h| {
+        if let Some(PyObj::Dict(d)) = h.get_mut(recv) {
+            if let Some((k, entry)) = d.shift_remove_entry(&key) {
+                if last {
+                    d.insert(k, entry);
+                } else {
+                    d.shift_insert(0, k, entry);
+                }
+                return true;
+            }
+        }
+        false
+    });
+    if !found {
+        return Err(format!("KeyError: {}", with_host(|h| h.repr_of(&kv))));
+    }
+    Ok(Value::Undef)
+}
+
+// ── collections constructors ─────────────────────────────────────────────────
+
+/// Insert `key: val` (a `str` key) into a dict-backed target in place.
+fn dict_insert_str(target: &Value, key: String, val: Value) -> Result<(), String> {
+    let kv = new_str(key);
+    let k = with_host(|h| h.to_key(&kv))?;
+    with_host(|h| {
+        if let Some(PyObj::Dict(d)) = h.get_mut(target) {
+            d.insert(k, (kv, val));
+        }
+    });
+    Ok(())
+}
+
+/// Fill a dict-backed target from a mapping or an iterable of `(key, value)`
+/// pairs (`dict()`-style initialization).
+fn fill_dict_from(target: &Value, src: &Value) -> Result<(), String> {
+    if matches!(src, Value::Undef) {
+        return Ok(());
+    }
+    let is_dict = with_host(|h| matches!(h.get(src), Some(PyObj::Dict(_))));
+    if is_dict {
+        let pairs = with_host(|h| match h.get(src) {
+            Some(PyObj::Dict(d)) => d
+                .iter()
+                .map(|(k, (kv, v))| (k.clone(), kv.clone(), v.clone()))
+                .collect::<Vec<_>>(),
+            _ => vec![],
+        });
+        with_host(|h| {
+            if let Some(PyObj::Dict(d)) = h.get_mut(target) {
+                for (k, kv, v) in pairs {
+                    d.insert(k, (kv, v));
+                }
+            }
+        });
+    } else {
+        let items = host::iter_vec(src)?;
+        for it in items {
+            let pair = host::iter_vec(&it)?;
+            if pair.len() != 2 {
+                return Err(host::type_error(
+                    "dictionary update sequence element has length != 2",
+                ));
+            }
+            let k = with_host(|h| h.to_key(&pair[0]))?;
+            let (kv, v) = (pair[0].clone(), pair[1].clone());
+            with_host(|h| {
+                if let Some(PyObj::Dict(d)) = h.get_mut(target) {
+                    d.insert(k, (kv, v));
+                }
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Construct a `collections` type: `deque` / `Counter` / `defaultdict` /
+/// `OrderedDict` / `namedtuple`.
+fn construct_collection(
+    kind: &str,
+    args: Vec<Value>,
+    kwargs: Vec<(String, Value)>,
+) -> Result<Value, String> {
+    match kind {
+        "deque" => {
+            let mut items: std::collections::VecDeque<Value> = match args.first() {
+                Some(v) if !matches!(v, Value::Undef) => {
+                    std::collections::VecDeque::from(host::iter_vec(v)?)
+                }
+                _ => std::collections::VecDeque::new(),
+            };
+            let maxlen = match args.get(1) {
+                Some(v) if !matches!(v, Value::Undef) => {
+                    with_host(|h| h.as_int(v)).map(|n| n.max(0) as usize)
+                }
+                _ => None,
+            };
+            if let Some(m) = maxlen {
+                while items.len() > m {
+                    items.pop_front();
+                }
+            }
+            Ok(host::alloc_deque(items, maxlen))
+        }
+        "Counter" => {
+            let c = host::alloc_dict_subtype(IndexMap::new(), host::DictKind::Counter, None);
+            if let Some(v) = args.first() {
+                if !matches!(v, Value::Undef) {
+                    counter_add(&c, std::slice::from_ref(v), 1)?;
+                }
+            }
+            for (k, v) in kwargs {
+                let cnt = with_host(|h| h.as_int(&v)).unwrap_or(0);
+                dict_insert_str(&c, k, Value::Int(cnt))?;
+            }
+            Ok(c)
+        }
+        "defaultdict" => {
+            // A dict first-arg is initial data, not a factory.
+            let factory = match args.first() {
+                None => None,
+                Some(Value::Undef) => None,
+                Some(v) if with_host(|h| matches!(h.get(v), Some(PyObj::Dict(_)))) => None,
+                Some(v) => Some(v.clone()),
+            };
+            let dd =
+                host::alloc_dict_subtype(IndexMap::new(), host::DictKind::DefaultDict, factory);
+            for v in &args {
+                if with_host(|h| matches!(h.get(v), Some(PyObj::Dict(_)))) {
+                    fill_dict_from(&dd, v)?;
+                }
+            }
+            for (k, v) in kwargs {
+                dict_insert_str(&dd, k, v)?;
+            }
+            Ok(dd)
+        }
+        "OrderedDict" => {
+            let od = host::alloc_dict_subtype(IndexMap::new(), host::DictKind::OrderedDict, None);
+            if let Some(v) = args.first() {
+                fill_dict_from(&od, v)?;
+            }
+            for (k, v) in kwargs {
+                dict_insert_str(&od, k, v)?;
+            }
+            Ok(od)
+        }
+        "namedtuple" => {
+            let tname = args
+                .first()
+                .and_then(|v| with_host(|h| h.as_str(v)))
+                .ok_or_else(|| {
+                    host::type_error(
+                        "namedtuple() missing 1 required positional argument: 'typename'",
+                    )
+                })?;
+            let fields: Vec<String> = match args.get(1) {
+                Some(v) => {
+                    if let Some(s) = with_host(|h| h.as_str(v)) {
+                        s.replace(',', " ")
+                            .split_whitespace()
+                            .map(|x| x.to_string())
+                            .collect()
+                    } else {
+                        host::iter_vec(v)?
+                            .iter()
+                            .filter_map(|it| with_host(|h| h.as_str(it)))
+                            .collect()
+                    }
+                }
+                None => vec![],
+            };
+            Ok(host::make_namedtuple_type(&tname, fields))
+        }
+        _ => Err(host::name_error(&format!("collections.{kind}"))),
+    }
+}
+
+// ── functools.lru_cache wrapper ──────────────────────────────────────────────
+
+fn lru_wrapper_method(recv: &Value, name: &str) -> Result<Value, String> {
+    match name {
+        "cache_info" => {
+            let (hits, misses, maxsize, currsize) =
+                host::lru_cache_info(recv).unwrap_or((0, 0, None, 0));
+            let ms = maxsize
+                .map(|n| Value::Int(n as i64))
+                .unwrap_or(Value::Undef);
+            Ok(with_host(|h| {
+                h.new_tuple(vec![
+                    Value::Int(hits as i64),
+                    Value::Int(misses as i64),
+                    ms,
+                    Value::Int(currsize as i64),
+                ])
+            }))
+        }
+        "cache_clear" => {
+            host::lru_cache_clear(recv);
+            Ok(Value::Undef)
+        }
+        _ => Err(format!(
+            "AttributeError: 'functools._lru_cache_wrapper' object has no attribute '{name}'"
+        )),
+    }
+}
+
+// ── file objects ─────────────────────────────────────────────────────────────
+
+fn file_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    let id = match with_host(|h| match h.get(recv) {
+        Some(PyObj::File { id }) => Some(*id),
+        _ => None,
+    }) {
+        Some(id) => id,
+        None => return Err(host::type_error("not a file")),
+    };
+    match name {
+        "read" => {
+            let s = with_host(|h| h.io_read_all(id))?;
+            Ok(new_str(s))
+        }
+        "readline" => {
+            let s = with_host(|h| h.io_readline(id))?;
+            Ok(new_str(s))
+        }
+        "readlines" => {
+            let lines = with_host(|h| h.io_read_lines(id))?;
+            let vals: Vec<Value> = with_host(|h| lines.into_iter().map(|l| h.new_str(l)).collect());
+            Ok(with_host(|h| h.new_list(vals)))
+        }
+        "write" => {
+            let s = arg0(args)?;
+            match as_bytes_object(&s) {
+                Some(bytes) => with_host(|h| h.io_write_bytes(id, &bytes)),
+                None => {
+                    let txt = with_host(|h| h.str_of(&s));
+                    with_host(|h| h.io_write(id, &txt))
+                }
+            }
+        }
+        "writelines" => {
+            let items = host::iter_vec(&arg0(args)?)?;
+            for it in items {
+                match as_bytes_object(&it) {
+                    Some(bytes) => {
+                        with_host(|h| h.io_write_bytes(id, &bytes))?;
+                    }
+                    None => {
+                        let txt = with_host(|h| h.str_of(&it));
+                        with_host(|h| h.io_write(id, &txt))?;
+                    }
+                }
+            }
+            Ok(Value::Undef)
+        }
+        "close" => {
+            with_host(|h| h.io_close(id));
+            Ok(Value::Undef)
+        }
+        "flush" => {
+            with_host(|h| h.io_flush(id))?;
+            Ok(Value::Undef)
+        }
+        "readable" => Ok(Value::Bool(true)),
+        "writable" => Ok(Value::Bool(true)),
+        "seekable" => Ok(Value::Bool(true)),
+        "__enter__" => Ok(recv.clone()),
+        "__exit__" => {
+            with_host(|h| h.io_close(id));
+            Ok(Value::Bool(false))
+        }
+        _ => Err(format!(
+            "AttributeError: '_io.TextIOWrapper' object has no attribute '{name}'"
+        )),
     }
 }
 

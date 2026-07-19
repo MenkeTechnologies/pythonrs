@@ -672,13 +672,28 @@ impl Compiler {
         body: &[Stmt],
     ) -> Result<(), String> {
         // Desugar `with a as x: body` -> enter, then try/finally exit.
-        // Build a synthetic body that binds the context vars and runs the suite.
+        // The context expression is evaluated EXACTLY ONCE into a synthetic temp;
+        // `__enter__`/`__exit__` both dispatch on that temp. (Re-evaluating it —
+        // as `with open(path,'w')` — would re-run the side effect, e.g. re-open and
+        // truncate the file, discarding the writes.)
         let mut inner: Vec<Stmt> = Vec::new();
+        let mut temps: Vec<String> = Vec::new();
         for it in items {
-            // x = ctx.__enter__()
+            let ctx_tmp = format!(".with{}", self.tmp);
+            self.tmp += 1;
+            temps.push(ctx_tmp.clone());
+            // __with_ctx = <context expr>   (evaluated once)
+            inner.push(
+                StmtKind::Assign {
+                    targets: vec![Expr::Name(ctx_tmp.clone())],
+                    value: it.context.clone(),
+                }
+                .into(),
+            );
+            // x = __with_ctx.__enter__()
             let enter = Expr::Call {
                 func: Box::new(Expr::Attribute(
-                    Box::new(it.context.clone()),
+                    Box::new(Expr::Name(ctx_tmp.clone())),
                     "__enter__".into(),
                 )),
                 args: vec![],
@@ -696,12 +711,12 @@ impl Compiler {
             }
         }
         inner.extend_from_slice(body);
-        // finally: ctx.__exit__(None, None, None)
+        // finally: __with_ctx.__exit__(None, None, None), in REVERSE (LIFO) order.
         let mut fin: Vec<Stmt> = Vec::new();
-        for it in items {
+        for ctx_tmp in temps.iter().rev() {
             let exit = Expr::Call {
                 func: Box::new(Expr::Attribute(
-                    Box::new(it.context.clone()),
+                    Box::new(Expr::Name(ctx_tmp.clone())),
                     "__exit__".into(),
                 )),
                 args: vec![Expr::None, Expr::None, Expr::None],
@@ -747,9 +762,13 @@ impl Compiler {
                 b.emit(Op::LoadUndef, 0);
             }
             Expr::Str(s) => self.strlit(b, s),
-            Expr::Bytes(_) => {
-                // Minimal: represent bytes literal as empty for now (see BUGS).
-                self.strlit(b, "");
+            Expr::Bytes(bytes) => {
+                // Pack the bytes into a latin-1 string constant (one code point
+                // per byte); `MKBYTES` unpacks it back to raw bytes at runtime.
+                let packed: String = bytes.iter().map(|&byte| byte as char).collect();
+                let k = b.add_constant(Value::str(&packed));
+                b.emit(Op::LoadConst(k), 0);
+                b.emit(Op::CallBuiltin(ops::MKBYTES, 1), 0);
             }
             Expr::FString(parts) => self.compile_fstring(b, parts)?,
             Expr::Name(n) => {

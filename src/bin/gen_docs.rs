@@ -53,10 +53,13 @@ fn main() {
 /// (pythonrs orders the tiny `int`/`float` sets as `int, float, int`). Grouping
 /// keeps each `id="ch-…"` anchor unique, so the reference PDF never emits a
 /// multiply-defined label.
-fn build_body(corpus: &[(&str, &str, &str, &str)]) -> String {
+/// A reference-corpus entry: (name, chapter, doc, example).
+type CEntry<'a> = (&'a str, &'a str, &'a str, &'a str);
+
+fn build_body(corpus: &[CEntry]) -> String {
     // Ordered list of chapters (first-seen) plus each chapter's entries. A plain
     // Vec of (chapter, Vec<entry>) keeps insertion order without a dependency.
-    let mut chapters: Vec<(&str, Vec<&(&str, &str, &str, &str)>)> = Vec::new();
+    let mut chapters: Vec<(&str, Vec<&CEntry>)> = Vec::new();
     for entry in corpus {
         let chapter = entry.1;
         match chapters.iter_mut().find(|(c, _)| *c == chapter) {

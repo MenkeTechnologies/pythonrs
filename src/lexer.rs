@@ -327,7 +327,10 @@ impl Lexer {
             self.push(Tok::FString(raw, is_raw));
         } else if is_bytes {
             let decoded = decode_escapes(&raw, is_raw)?;
-            self.push(Tok::Bytes(decoded.into_bytes()));
+            // Each decoded code point is one byte (latin-1): `\xff` -> 0xFF, not
+            // its two-byte UTF-8 encoding.
+            let bytes: Vec<u8> = decoded.chars().map(|c| c as u32 as u8).collect();
+            self.push(Tok::Bytes(bytes));
         } else {
             let decoded = decode_escapes(&raw, is_raw)?;
             self.push(Tok::Str(decoded));
