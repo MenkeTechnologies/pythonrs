@@ -1721,6 +1721,19 @@ fn quote_str(s: &str) -> String {
                 out.push('\\');
                 out.push(c);
             }
+            // Non-printable (C0/C1 controls, DEL): CPython repr escapes these as
+            // `\xXX` (≤0xff), `\uXXXX` (≤0xffff), or `\UXXXXXXXX`. Printable
+            // Unicode (e.g. `é`) is kept verbatim.
+            c if c.is_control() => {
+                let n = c as u32;
+                if n <= 0xff {
+                    out.push_str(&format!("\\x{n:02x}"));
+                } else if n <= 0xffff {
+                    out.push_str(&format!("\\u{n:04x}"));
+                } else {
+                    out.push_str(&format!("\\U{n:08x}"));
+                }
+            }
             c => out.push(c),
         }
     }
@@ -2876,6 +2889,11 @@ impl PyHost {
     }
 
     pub fn del_item(&mut self, recv: &Value, idx: &Value) -> Result<(), String> {
+        // Slice deletion: `del x[i:j]`, `del x[::k]`.
+        if let Some(PyObj::Slice { lo, hi, step }) = self.get(idx) {
+            let (lo, hi, step) = (lo.clone(), hi.clone(), step.clone());
+            return self.del_slice(recv, &lo, &hi, &step);
+        }
         match self.get(recv) {
             Some(PyObj::Dict(_)) => {
                 let key = self.to_key(idx)?;
@@ -2902,6 +2920,120 @@ impl PyHost {
             }
             _ => Err(type_error("object doesn't support item deletion")),
         }
+    }
+
+    /// The concrete indices selected by `[lo:hi:step]` over a length-`n`
+    /// sequence, in iteration order (mirrors CPython `PySlice_AdjustIndices`).
+    fn slice_indices(&mut self, lo: &Value, hi: &Value, step: i64, n: i64) -> Vec<i64> {
+        let (mut i, stop) = slice_bounds(lo, hi, step, n, self);
+        let mut out = Vec::new();
+        if step > 0 {
+            while i < stop {
+                if i >= 0 && i < n {
+                    out.push(i);
+                }
+                i += step;
+            }
+        } else {
+            while i > stop {
+                if i >= 0 && i < n {
+                    out.push(i);
+                }
+                i += step;
+            }
+        }
+        out
+    }
+
+    /// `x[lo:hi:step] = repl` (lists only), with `repl` already materialized. A
+    /// contiguous slice (step == 1) splices in any-length replacement; an
+    /// extended slice (step ≠ 1) requires `repl.len()` to equal the selected count.
+    pub fn set_slice_vals(
+        &mut self,
+        recv: &Value,
+        idx: &Value,
+        repl: Vec<Value>,
+    ) -> Result<(), String> {
+        let (lo, hi, step) = match self.get(idx) {
+            Some(PyObj::Slice { lo, hi, step }) => (lo.clone(), hi.clone(), step.clone()),
+            _ => return Err(type_error("expected a slice")),
+        };
+        let (lo, hi) = (&lo, &hi);
+        let step = self.as_int(&step).unwrap_or(1);
+        if step == 0 {
+            return Err("ValueError: slice step cannot be zero".into());
+        }
+        let n = match self.get(recv) {
+            Some(PyObj::List(l)) => l.len() as i64,
+            _ => {
+                return Err(type_error(&format!(
+                    "'{}' object does not support item assignment",
+                    self.type_name(recv)
+                )))
+            }
+        };
+        if step == 1 {
+            // Contiguous splice over [start, stop).
+            let (start, stop) = slice_bounds(lo, hi, 1, n, self);
+            let (start, stop) = (
+                start.clamp(0, n) as usize,
+                stop.clamp(0, n).max(start) as usize,
+            );
+            if let Some(PyObj::List(l)) = self.get_mut(recv) {
+                l.splice(start..stop, repl);
+            }
+            Ok(())
+        } else {
+            let indices = self.slice_indices(lo, hi, step, n);
+            if indices.len() != repl.len() {
+                return Err(format!(
+                    "ValueError: attempt to assign sequence of size {} to extended slice of size {}",
+                    repl.len(),
+                    indices.len()
+                ));
+            }
+            if let Some(PyObj::List(l)) = self.get_mut(recv) {
+                for (idx, v) in indices.into_iter().zip(repl) {
+                    l[idx as usize] = v;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// `del x[lo:hi:step]` (lists only).
+    fn del_slice(
+        &mut self,
+        recv: &Value,
+        lo: &Value,
+        hi: &Value,
+        step: &Value,
+    ) -> Result<(), String> {
+        let step = self.as_int(step).unwrap_or(1);
+        if step == 0 {
+            return Err("ValueError: slice step cannot be zero".into());
+        }
+        let n = match self.get(recv) {
+            Some(PyObj::List(l)) => l.len() as i64,
+            _ => {
+                return Err(type_error(&format!(
+                    "'{}' object doesn't support item deletion",
+                    self.type_name(recv)
+                )))
+            }
+        };
+        let mut indices = self.slice_indices(lo, hi, step, n);
+        indices.sort_unstable();
+        indices.dedup();
+        if let Some(PyObj::List(l)) = self.get_mut(recv) {
+            // Remove from highest index down so earlier removals don't shift.
+            for i in indices.into_iter().rev() {
+                if (i as usize) < l.len() {
+                    l.remove(i as usize);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Materialize an iterable into a Vec of values (for `for`, comprehensions,
@@ -3477,6 +3609,10 @@ impl PyHost {
             // attribute of the `dict` builtin. Returns a callable builtin.
             Some(PyObj::Builtin(n)) if n == "dict" && name == "fromkeys" => {
                 Ok(self.alloc(PyObj::Builtin("dict.fromkeys".into())))
+            }
+            // `str.maketrans` — a static method on the `str` type.
+            Some(PyObj::Builtin(n)) if n == "str" && name == "maketrans" => {
+                Ok(self.alloc(PyObj::Builtin("str.maketrans".into())))
             }
             _ => {
                 // Numeric `.real`/`.imag` (int/float/bool/bigint/complex are all

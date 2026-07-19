@@ -268,8 +268,10 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
       `1.2e+05`) all wrong.
 - [ ] **str method args silently ignored** — `split`/`rsplit` maxsplit, `find`/`index`
       start, `splitlines(keepends)` all ignored → wrong values, no error.
-- [ ] **Missing str methods** — `partition/rpartition/expandtabs/translate/maketrans/
-      format_map/rindex/isnumeric/isdecimal/istitle/isidentifier` (`AttributeError`).
+- [x] **Missing str methods** — FIXED: `partition`/`rpartition`/`rindex`/`isnumeric`/
+      `isdecimal`/`istitle`/`isidentifier`/`isprintable`/`expandtabs`/`translate`/
+      `format_map` (instance methods) + `str.maketrans` (static method on the `str`
+      type object, like `dict.fromkeys`). All byte-verified vs CPython.
 - [ ] **bytes / bytearray non-functional** — `b'hello'` evaluates to an **empty
       string**; `len(b'hello')`→`0`; indexing/iteration/slicing/all methods broken;
       `bytes([65,66])`→`b''`; `bytes.fromhex`/`.hex()`/`.decode()` missing; `bytearray`
@@ -279,15 +281,21 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
 - [ ] **`repr` doesn't escape C0 controls** (`\x00`-`\x1f`, ` `) — data-corrupting
       raw bytes leak; **`ascii()` doesn't `\x`-escape non-ASCII**; `\N{…}` named and
       `\NNN` octal string escapes not decoded.
+      **FIXED (except `\N{…}`):** `repr` `\xXX`/`\uXXXX`/`\UXXXXXXXX`-escapes
+      non-printable chars (printable Unicode kept verbatim); `ascii()` escapes every
+      non-ASCII char; lexer decodes `\NNN` octal escapes. `\N{NAME}` still open — needs
+      a Unicode name→codepoint database (no crate vendored; substrate gap).
 
 ## Tier 6 — Data structures / iterators
 
 - [x] **Slice read bounds with negative step** — FIXED: `slice_bounds` now mirrors
       CPython's `PySlice_AdjustIndices` (negative step clamps into `[-1, n-1]`), so
       `[1,2,3,4,5][5:-2:-2]`→`[5]` and `(10,20,30,40)[5::-2]`→`(40, 20)`.
-- [ ] **Slice assignment & `del` slice unimplemented** — `x[1:3]=[…]`, `x[1:1]=[…]`,
-      `x[::2]=[…]`, `del x[1:3]`, `del x[::2]` all → `TypeError: list indices must be
-      integers`. (Read-slicing works.)
+- [x] **Slice assignment & `del` slice** — FIXED: `x[i:j]=it` (contiguous splice, any
+      length), `x[::k]=it` (extended, size-checked with the CPython `ValueError`
+      message), `x[1:1]=it` (insert), `del x[i:j]`, `del x[::k]` all work on lists. The
+      RHS iterable is materialized in `b_setitem` outside the host borrow (so a
+      generator RHS is fine and never re-borrow-panics).
 - [x] **`zip`/`map`/`filter`/`enumerate`/`reversed` are lazy iterators** — FIXED:
       each is a real lazy iterator object (`PyObj::Zip`/`MapObj`/`FilterObj`/
       `EnumerateObj`; `reversed` → one-shot `Iter`). Sources are held as iterators and

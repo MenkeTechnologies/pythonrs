@@ -29,7 +29,9 @@ use std::path::PathBuf;
 /// bytecode uses the 1-arg-only layout and must miss cleanly.
 /// v6: `raise X from Y` now emits `RAISE` with argc 2 (cause pushed under exc);
 /// older bytecode dropped the cause, so it must miss cleanly.
-const SCHEMA: u64 = 6;
+/// v7: the lexer decodes `\NNN` octal string escapes; older bytecode baked the
+/// undecoded literal into the chunk, so it must miss cleanly.
+const SCHEMA: u64 = 7;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]

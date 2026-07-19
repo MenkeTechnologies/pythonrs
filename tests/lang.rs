@@ -1358,3 +1358,69 @@ fn range_methods_and_equality() {
     assert_eq!(g("x = range(0,10,2) == range(0,11,2)", "x"), "False");
     assert_eq!(g("x = range(0,10,2) == range(0,9,2)", "x"), "True");
 }
+
+#[test]
+fn slice_assignment_and_del() {
+    assert_eq!(g("x = [1,2,3,4,5]\nx[1:3] = [9]\n", "x"), "[1, 9, 4, 5]");
+    assert_eq!(
+        g("x = [1,2,3,4,5]\nx[1:1] = [8,9]\n", "x"),
+        "[1, 8, 9, 2, 3, 4, 5]"
+    );
+    assert_eq!(
+        g("x = [1,2,3,4,5,6]\nx[::2] = [7,8,9]\n", "x"),
+        "[7, 2, 8, 4, 9, 6]"
+    );
+    assert_eq!(g("x = [1,2,3]\nx[:] = [9,9,9,9]\n", "x"), "[9, 9, 9, 9]");
+    assert_eq!(g("x = [1,2,3,4,5]\nx[1:4] = []\n", "x"), "[1, 5]");
+    assert_eq!(g("x = [1,2,3,4,5]\ndel x[1:3]\n", "x"), "[1, 4, 5]");
+    assert_eq!(g("x = [1,2,3,4,5,6]\ndel x[::2]\n", "x"), "[2, 4, 6]");
+    // A generator RHS is materialized without a borrow panic.
+    assert_eq!(
+        g("x = [1,2,3]\nx[1:2] = (i for i in [7,8])\n", "x"),
+        "[1, 7, 8, 3]"
+    );
+}
+
+#[test]
+fn str_methods_tier5() {
+    assert_eq!(g("x = 'a.b.c'.partition('.')", "x"), "('a', '.', 'b.c')");
+    assert_eq!(g("x = 'a.b.c'.rpartition('.')", "x"), "('a.b', '.', 'c')");
+    assert_eq!(g("x = 'x'.partition('.')", "x"), "('x', '', '')");
+    assert_eq!(g("x = 'abcb'.rindex('b')", "x"), "3");
+    assert_eq!(
+        g("x = ('123'.isnumeric(), 'abc'.isnumeric())", "x"),
+        "(True, False)"
+    );
+    assert_eq!(
+        g("x = ('1'.isdecimal(), '\u{00bd}'.isdecimal())", "x"),
+        "(True, False)"
+    );
+    assert_eq!(
+        g("x = ('Hello World'.istitle(), 'hello'.istitle())", "x"),
+        "(True, False)"
+    );
+    assert_eq!(
+        g("x = ('abc'.isidentifier(), '1a'.isidentifier())", "x"),
+        "(True, False)"
+    );
+    assert_eq!(g("x = 'a\\tbc'.expandtabs(4)", "x"), "'a   bc'");
+    assert_eq!(g("x = 'abc'.translate({97:98})", "x"), "'bbc'");
+    assert_eq!(
+        g("x = 'hello'.translate(str.maketrans('lo','LO'))", "x"),
+        "'heLLO'"
+    );
+    assert_eq!(g("x = str.maketrans('ab','xy')", "x"), "{97: 120, 98: 121}");
+    assert_eq!(g("x = '{a:.2f}'.format_map({'a':3.14159})", "x"), "'3.14'");
+}
+
+#[test]
+fn repr_escaping_and_ascii_and_octal() {
+    // repr escapes C0 controls; ascii escapes non-ASCII. `g` reprs the string
+    // global, so these are the double-repr forms python3 also produces.
+    assert_eq!(g(r#"x = repr("a\x00b\x1f")"#, "x"), r#""'a\\x00b\\x1f'""#);
+    assert_eq!(g("x = ascii('caf\u{00e9}')", "x"), r#""'caf\\xe9'""#);
+    // Octal string escape.
+    assert_eq!(g(r#"x = "\101\102\103""#, "x"), "'ABC'");
+    // Printable Unicode is kept verbatim in repr.
+    assert_eq!(g("x = repr('\u{00e9}')", "x"), "\"'\u{00e9}'\"");
+}
