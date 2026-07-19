@@ -760,6 +760,9 @@ fn b_assert_fail(vm: &mut VM, _: u8) -> Value {
 
 fn b_dbg_line(vm: &mut VM, _: u8) -> Value {
     let _line = vm.pop();
+    // Under `--dap` the debugger pauses here at each statement boundary; a normal
+    // run's hook is a no-op (returns immediately).
+    crate::dap::on_debug_line(vm);
     Value::Undef
 }
 
@@ -1240,7 +1243,13 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
 // ── builtin predicates ───────────────────────────────────────────────────────
 
 pub fn is_builtin_function(name: &str) -> bool {
-    BUILTIN_FUNCS.contains(&name) || name.starts_with("math.")
+    BUILTIN_FUNCS.contains(&name)
+        || name.starts_with("math.")
+        || name.starts_with("itertools.")
+        || name.starts_with("functools.")
+        || name.starts_with("json.")
+        || name.starts_with("os.")
+        || name.starts_with("random.")
 }
 
 fn is_builtin_type(name: &str) -> bool {
@@ -1422,6 +1431,33 @@ pub fn call_builtin_function(
     // math.* module functions.
     if let Some(m) = name.strip_prefix("math.") {
         return call_math(m, &args);
+    }
+    // Native stdlib module functions (src/stdlib). itertools/functools are free
+    // functions (they re-enter `with_host`); json/os/random take `&mut PyHost`.
+    if let Some(f) = name.strip_prefix("itertools.") {
+        if let Some(r) = crate::stdlib::itertools::call(f, &args, &kwargs) {
+            return r;
+        }
+    }
+    if let Some(f) = name.strip_prefix("functools.") {
+        if let Some(r) = crate::stdlib::functools::call(f, &args) {
+            return r;
+        }
+    }
+    if let Some(f) = name.strip_prefix("json.") {
+        if let Some(r) = with_host(|h| crate::stdlib::json::call(h, f, &args)) {
+            return r;
+        }
+    }
+    if let Some(f) = name.strip_prefix("os.") {
+        if let Some(r) = with_host(|h| crate::stdlib::os::call(h, f, &args)) {
+            return r;
+        }
+    }
+    if let Some(f) = name.strip_prefix("random.") {
+        if let Some(r) = with_host(|h| crate::stdlib::random::call(h, f, &args)) {
+            return r;
+        }
     }
     // Exception constructors.
     if is_exception_class(name) {

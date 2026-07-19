@@ -22,6 +22,7 @@ pub mod lexer;
 pub mod lsp;
 pub mod parser;
 pub mod repl;
+pub mod stdlib;
 
 pub use fusevm::Value;
 

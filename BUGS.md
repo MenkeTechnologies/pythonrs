@@ -60,15 +60,20 @@ list of what is **not** yet covered, so nobody mistakes a gap for a bug fixed.
   through `.format`), and `:spec`.
 
 ## Tooling
-- **`--dap`** (Debug Adapter Protocol): returns "not implemented". `--dap` compile
-  mode (per-statement line markers) exists; the stepping server does not.
-- **`--lsp`**: minimal — initialize/shutdown handshake, builtin/keyword completion,
-  a stub hover. No diagnostics, go-to-def, or signature help yet.
+- **`--dap`** (Debug Adapter Protocol): implemented — breakpoints, step
+  in/out/over/continue, stack trace, locals, and program-stdout capture (pipe +
+  dup2 → `output` events). Frame names in the stack use the function/class owner
+  or `<module>` (no per-function name field yet). Watch expressions not yet added.
+- **`--lsp`**: full corpus — completion (166 builtins/keywords/methods), position-
+  aware hover, and diagnostics via the real parser. Go-to-def and signature help
+  not yet added.
 - **REPL** does not echo bare-expression values (use `print(...)`); multi-line
   blocks close on a blank line.
-- **`import`**: only `math` and `sys` (minimal) resolve; other modules raise
-  `ModuleNotFoundError`.
 
 ## Standard library
-Effectively none beyond builtins + minimal `math`/`sys`. No `os`, `re`, `json`,
-`collections`, `itertools`, `datetime`, file I/O, etc. yet.
+Implemented natively (values match CPython except `random`, which is pythonrs's
+own deterministic PRNG): `math`, `sys`, `json` (dumps/loads, order-preserving,
+bignum-safe), `os` + `os.path` (POSIX), `random`, `string`, `itertools` (eager —
+finite forms; unbounded `count`/`cycle` rejected), `functools.reduce`.
+Not yet: `re`, `collections` (needs new container types), `datetime`, file I/O,
+`functools.partial`/`lru_cache`, and most of the rest of the stdlib.
