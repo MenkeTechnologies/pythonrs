@@ -87,6 +87,7 @@ pub mod ops {
     pub const MATCH_MAP_REST: u16 = 61; // [subject, keylist] -> dict of remaining keys
     pub const MATCH_CLASS: u16 = 62; // [subject, class, npos, kwnames...] -> [vals_list, Bool] | [Bool]
     pub const MKBYTES: u16 = 63; // [latin1_str] -> bytes (one byte per code point 0..=255)
+    pub const GENRET: u16 = 64; // [iter] -> the exhausted (sub)generator's return value (`yield from`)
 }
 
 /// Binary-op tags carried by `ops::BINOP` (the non-native operators).
@@ -478,6 +479,15 @@ struct GenCell {
     yielder: *const (),
     ctx: GenContext,
     done: bool,
+    /// Whether the body has run past its first resume (a fresh generator only
+    /// accepts `send(None)` / `next()`).
+    started: bool,
+    /// An exception queued by `.throw()`/`.close()` to raise at the current
+    /// `yield` point on the next resume.
+    pending_throw: Option<Value>,
+    /// The value the body `return`ed (carried by `StopIteration.value` and by
+    /// `yield from`). `Undef` for a plain fall-off-the-end return.
+    ret_value: Value,
 }
 
 /// The mutable "execution registers" swapped at every generator resume/suspend
@@ -559,6 +569,14 @@ impl PyHost {
     }
     pub fn try_def(&self, id: usize) -> Option<TryDef> {
         self.tries.get(id).cloned()
+    }
+    /// The value a (sub)generator `return`ed — its `StopIteration.value`, read by
+    /// the `yield from` delegation op.
+    pub fn gen_return_value(&self, id: u32) -> Value {
+        self.generators
+            .get(id as usize)
+            .map(|g| g.ret_value.clone())
+            .unwrap_or(Value::Undef)
     }
 
     // ── heap allocation / accessors ──────────────────────────────────────
@@ -2836,6 +2854,16 @@ impl PyHost {
                     let a = args.clone();
                     return Ok(self.new_tuple(a));
                 }
+                // `StopIteration.value` / `StopAsyncIteration.value` — the first
+                // arg (the generator's `return` value), or `None`.
+                if name == "value" && (class == "StopIteration" || class == "StopAsyncIteration") {
+                    return Ok(args.first().cloned().unwrap_or(Value::Undef));
+                }
+                // `<Exc>.__cause__`/`__context__` — chaining isn't tracked yet, so
+                // these are always `None` (matching an unchained exception).
+                if name == "__cause__" || name == "__context__" {
+                    return Ok(Value::Undef);
+                }
                 let class = class.clone();
                 Err(format!(
                     "AttributeError: '{class}' object has no attribute '{name}'"
@@ -3570,6 +3598,9 @@ fn make_generator(chunk: Chunk, env: Env, self_val: Option<Value>, owner: Option
                 ..GenContext::default()
             },
             done: false,
+            started: false,
+            pending_throw: None,
+            ret_value: Value::Undef,
         });
         id
     });
@@ -3579,10 +3610,13 @@ fn make_generator(chunk: Chunk, env: Env, self_val: Option<Value>, owner: Option
             // body's VM) can reach it. Valid for the whole body lifetime.
             with_host(|h| h.generators[id as usize].yielder = yielder as *const _ as *const ());
             let r = run_chunk_on(chunk);
-            // A `return` inside the body leaves a Return signal; drop it so the
-            // generator's StopIteration is clean.
+            // A `return X` inside the body leaves a `Return(X)` signal; capture X
+            // as the generator's return value (→ `StopIteration.value`) then drop
+            // the signal so the generator's exhaustion is clean.
             with_host(|h| {
-                h.signal.take();
+                if let Some(Signal::Return(v)) = h.signal.take() {
+                    h.generators[id as usize].ret_value = v;
+                }
             });
             r.map(|_| Value::Undef)
         },
@@ -3602,7 +3636,66 @@ pub fn gen_yield(v: Value) -> Result<Value, String> {
     // SAFETY: same-thread coroutine; the yielder lives for the whole body, and
     // we only reach here from inside that body (its stack is live).
     let yielder = unsafe { &*(yp as *const corosensei::Yielder<Value, Value>) };
-    Ok(yielder.suspend(v))
+    let sent = yielder.suspend(v);
+    // A `.throw()`/`.close()` queued an exception to raise at this yield point.
+    if let Some(exc) = with_host(|h| h.generators[id as usize].pending_throw.take()) {
+        // `raise_value` sets `h.exc` and returns the abort string; propagate it as
+        // an error so the body's own `try/except` can catch it.
+        return Err(raise_value(&exc).unwrap_or_else(|e| e));
+    }
+    Ok(sent)
+}
+
+/// Whether a generator has been resumed at least once (a fresh generator only
+/// accepts `send(None)`).
+pub fn gen_started(gen: &Value) -> bool {
+    match with_host(|h| h.get(gen).cloned()) {
+        Some(PyObj::Generator { id }) => with_host(|h| h.generators[id as usize].started),
+        _ => false,
+    }
+}
+
+/// The `StopIteration` object carrying a finished generator's return value (its
+/// `.value`). Built when `send`/`next`/`__next__` exhaust the generator.
+pub fn gen_stop_iteration(gen: &Value) -> Value {
+    let ret = match with_host(|h| h.get(gen).cloned()) {
+        Some(PyObj::Generator { id }) => with_host(|h| h.generators[id as usize].ret_value.clone()),
+        _ => Value::Undef,
+    };
+    let args = if matches!(ret, Value::Undef) {
+        vec![]
+    } else {
+        vec![ret]
+    };
+    with_host(|h| {
+        let e = h.alloc(PyObj::Exception {
+            class: "StopIteration".into(),
+            args,
+        });
+        h.exc = Some(e.clone());
+        e
+    });
+    with_host(|h| h.exc.clone().unwrap())
+}
+
+/// `gen.throw(exc)` — queue `exc` to raise at the current yield point, then
+/// resume. Returns the next yielded value, or `Ok(None)` if the throw propagated
+/// out of the generator (its body did not catch it — the error is on `h`).
+pub fn gen_throw(gen: &Value, exc: Value) -> Result<Option<Value>, String> {
+    let id = match with_host(|h| h.get(gen).cloned()) {
+        Some(PyObj::Generator { id }) => id,
+        _ => return Err(type_error("not a generator")),
+    };
+    // Throwing into a not-yet-started or finished generator raises in the caller.
+    let (started, done) = with_host(|h| {
+        let g = &h.generators[id as usize];
+        (g.started, g.done)
+    });
+    if !started || done {
+        return Err(raise_value(&exc).unwrap_or_else(|e| e));
+    }
+    with_host(|h| h.generators[id as usize].pending_throw = Some(exc));
+    gen_resume(gen, Value::Undef)
 }
 
 /// Resume a generator until its next `yield` or its body returns. Returns
@@ -3625,6 +3718,7 @@ pub fn gen_resume(gen: &Value, send: Value) -> Result<Option<Value>, String> {
     let gen_ctx = with_host(|h| std::mem::take(&mut h.generators[id as usize].ctx));
     let caller_ctx = with_host(|h| h.install_gen_ctx(gen_ctx));
     let prev = CUR_GEN.with(|c| c.replace(Some(id)));
+    with_host(|h| h.generators[id as usize].started = true);
 
     let out = coro.resume(send); // no host borrow held; body drives its own VM
 

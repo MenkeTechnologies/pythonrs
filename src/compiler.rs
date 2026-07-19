@@ -931,8 +931,9 @@ impl Compiler {
         b.emit(Op::Jump(start), 0);
         let done = b.current_pos();
         b.patch_jump(jdone, done);
-        b.emit(Op::Pop, 0); // drop iterator
-        b.emit(Op::LoadUndef, 0); // expression value
+        // The `yield from` expression evaluates to the delegated iterator's
+        // return value (its `StopIteration.value`) — `None` for a non-generator.
+        b.emit(Op::CallBuiltin(ops::GENRET, 1), 0); // [it] -> retval
         Ok(())
     }
 
