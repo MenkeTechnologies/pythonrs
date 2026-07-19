@@ -214,6 +214,13 @@ pub enum PyObj {
     /// An immutable, hashable `frozenset`. Same storage as `Set`, but usable as
     /// a dict key / set member (see `PKey::Frozenset`) and immutable.
     Frozenset(IndexMap<PKey, Value>),
+    /// A live `dict_keys`/`dict_values`/`dict_items` view. Holds a handle to the
+    /// backing dict (not a snapshot), so it reflects later mutations. `kind`:
+    /// 0 = keys, 1 = values, 2 = items.
+    DictView {
+        dict: Value,
+        kind: u8,
+    },
     Range {
         start: i64,
         stop: i64,
@@ -743,6 +750,52 @@ impl PyHost {
         matches!(self.get(v), Some(PyObj::Frozenset(_)))
     }
 
+    /// The live elements of a `dict_keys`/`dict_values`/`dict_items` view,
+    /// materialized (allocating item tuples) from the backing dict at call time
+    /// — so the view reflects mutations. `None` if `v` is not a view.
+    pub fn view_items(&mut self, v: &Value) -> Option<Vec<Value>> {
+        let (dict, kind) = match self.get(v) {
+            Some(PyObj::DictView { dict, kind }) => (dict.clone(), *kind),
+            _ => return None,
+        };
+        let pairs: Vec<(Value, Value)> = match self.get(&dict) {
+            Some(PyObj::Dict(d)) => d.values().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            _ => vec![],
+        };
+        Some(
+            pairs
+                .into_iter()
+                .map(|(k, v)| match kind {
+                    0 => k,
+                    1 => v,
+                    _ => self.new_tuple(vec![k, v]),
+                })
+                .collect(),
+        )
+    }
+
+    /// A set-map of `v` for the set-algebra operators: `set`/`frozenset`, or a
+    /// `dict_keys`/`dict_items` view coerced to a key-set. `None` otherwise
+    /// (a `dict_values` view has no set algebra).
+    pub fn setmap_of(&mut self, v: &Value) -> Option<IndexMap<PKey, Value>> {
+        if let Some(PyObj::Set(s)) | Some(PyObj::Frozenset(s)) = self.get(v) {
+            return Some(s.clone());
+        }
+        let kind = match self.get(v) {
+            Some(PyObj::DictView { kind, .. }) if *kind == 0 || *kind == 2 => *kind,
+            _ => return None,
+        };
+        let items = self.view_items(v)?;
+        let mut out: IndexMap<PKey, Value> = IndexMap::new();
+        for it in items {
+            if let Ok(k) = self.to_key(&it) {
+                out.insert(k, it);
+            }
+        }
+        let _ = kind;
+        Some(out)
+    }
+
     pub fn as_str(&self, v: &Value) -> Option<String> {
         match self.get(v) {
             Some(PyObj::Str(s)) => Some(s.clone()),
@@ -1003,6 +1056,11 @@ impl PyHost {
                 },
                 Some(PyObj::Set(_)) => "set".into(),
                 Some(PyObj::Frozenset(_)) => "frozenset".into(),
+                Some(PyObj::DictView { kind, .. }) => match kind {
+                    0 => "dict_keys".into(),
+                    1 => "dict_values".into(),
+                    _ => "dict_items".into(),
+                },
                 Some(PyObj::Range { .. }) => "range".into(),
                 Some(PyObj::Slice { .. }) => "slice".into(),
                 Some(PyObj::Func(_)) => "function".into(),
@@ -1056,6 +1114,9 @@ impl PyHost {
                 Some(PyObj::Dict(d)) => !d.is_empty(),
                 Some(PyObj::Set(s)) => !s.is_empty(),
                 Some(PyObj::Frozenset(s)) => !s.is_empty(),
+                Some(PyObj::DictView { dict, .. }) => {
+                    matches!(self.get(dict), Some(PyObj::Dict(d)) if !d.is_empty())
+                }
                 Some(PyObj::Range { start, stop, step }) => range_len(*start, *stop, *step) != 0,
                 Some(PyObj::BigInt(b)) => *b != num_bigint::BigInt::from(0),
                 Some(PyObj::Complex(r, i)) => *r != 0.0 || *i != 0.0,
@@ -1160,7 +1221,8 @@ impl PyHost {
                 | Some(PyObj::Tuple(_))
                 | Some(PyObj::Dict(_))
                 | Some(PyObj::Set(_))
-                | Some(PyObj::Frozenset(_)) => self.repr_of(v),
+                | Some(PyObj::Frozenset(_))
+                | Some(PyObj::DictView { .. }) => self.repr_of(v),
                 None => "<object>".into(),
             },
             _ => "<object>".into(),
@@ -1257,6 +1319,26 @@ impl PyHost {
                         let inner: Vec<String> = s.values().map(|x| self.repr_of(x)).collect();
                         format!("frozenset({{{}}})", inner.join(", "))
                     }
+                }
+                Some(PyObj::DictView { dict, kind }) => {
+                    let (kind, dict) = (*kind, dict.clone());
+                    let label = match kind {
+                        0 => "dict_keys",
+                        1 => "dict_values",
+                        _ => "dict_items",
+                    };
+                    let inner: Vec<String> = match self.get(&dict) {
+                        Some(PyObj::Dict(d)) => d
+                            .values()
+                            .map(|(k, v)| match kind {
+                                0 => self.repr_of(k),
+                                1 => self.repr_of(v),
+                                _ => format!("({}, {})", self.repr_of(k), self.repr_of(v)),
+                            })
+                            .collect(),
+                        _ => vec![],
+                    };
+                    format!("{label}([{}])", inner.join(", "))
                 }
                 Some(PyObj::Exception { class, args }) => {
                     let inner: Vec<String> = args.iter().map(|a| self.repr_of(a)).collect();
@@ -1371,6 +1453,23 @@ impl PyHost {
                     }
                     (Some(PyObj::Deque { items: x, .. }), Some(PyObj::Deque { items: y, .. })) => {
                         x.len() == y.len() && x.iter().zip(y).all(|(p, q)| self.equal(p, q))
+                    }
+                    // Two ranges are equal iff they yield the same sequence: same
+                    // length, and (empty, or same start and (len 1 or same step)).
+                    (
+                        Some(PyObj::Range {
+                            start: s1,
+                            stop: e1,
+                            step: t1,
+                        }),
+                        Some(PyObj::Range {
+                            start: s2,
+                            stop: e2,
+                            step: t2,
+                        }),
+                    ) => {
+                        let (l1, l2) = (range_len(*s1, *e1, *t1), range_len(*s2, *e2, *t2));
+                        l1 == l2 && (l1 == 0 || (s1 == s2 && (l1 == 1 || t1 == t2)))
                     }
                     // bytes/bytearray compare equal by content (`b'a' == bytearray(b'a')`).
                     (Some(PyObj::Bytes(x)), Some(PyObj::Bytes(y)))
@@ -1732,9 +1831,9 @@ impl PyHost {
                         return Ok(self.alloc(PyObj::Complex(ar - br, ai - bi)));
                     }
                 }
-                // set difference (result type follows the left operand)
-                if let (Some(x), Some(y)) = (self.setlike(a), self.setlike(b)) {
-                    let mut out = x.clone();
+                // set difference (result type follows the left operand;
+                // dict_keys/dict_items views participate as key-sets)
+                if let (Some(mut out), Some(y)) = (self.setmap_of(a), self.setmap_of(b)) {
                     for k in y.keys() {
                         out.shift_remove(k);
                     }
@@ -2049,9 +2148,20 @@ impl PyHost {
                 },
             },
             binop::BITAND | binop::BITOR | binop::BITXOR => {
-                // set operations (result type follows the left operand)
-                if let (Some(x), Some(y)) = (self.setlike(a), self.setlike(b)) {
-                    let (x, y) = (x.clone(), y.clone());
+                // dict merge: `d1 | d2` → a new dict (right operand wins on key clash).
+                if tag == binop::BITOR {
+                    if let (Some(PyObj::Dict(x)), Some(PyObj::Dict(y))) = (self.get(a), self.get(b))
+                    {
+                        let mut out = x.clone();
+                        for (k, (kv, vv)) in y.clone() {
+                            dict_put(&mut out, k, kv, vv);
+                        }
+                        return Ok(self.new_dict(out));
+                    }
+                }
+                // set operations (result type follows the left operand;
+                // dict_keys/dict_items views participate as key-sets)
+                if let (Some(x), Some(y)) = (self.setmap_of(a), self.setmap_of(b)) {
                     let mut out = IndexMap::new();
                     match tag {
                         binop::BITAND => {
@@ -2662,6 +2772,22 @@ impl PyHost {
         if step == 0 {
             return Err("ValueError: slice step cannot be zero".into());
         }
+        // Slicing a range yields a new range (never materializes).
+        if let Some(PyObj::Range {
+            start: rstart,
+            stop: rstop,
+            step: rstep,
+        }) = self.get(recv)
+        {
+            let (rstart, rstep) = (*rstart, *rstep);
+            let len = range_len(rstart, *rstop, rstep);
+            let (i, j) = slice_bounds(lo, hi, step, len, self);
+            return Ok(self.alloc(PyObj::Range {
+                start: rstart + i * rstep,
+                stop: rstart + j * rstep,
+                step: rstep * step,
+            }));
+        }
         let is_str = matches!(self.get(recv), Some(PyObj::Str(_)));
         let items: Vec<Value> = match self.get(recv) {
             Some(PyObj::List(l)) | Some(PyObj::Tuple(l)) => l.clone(),
@@ -2791,6 +2917,10 @@ impl PyHost {
             let lines = self.io_read_lines(id)?;
             return Ok(lines.into_iter().map(|l| self.new_str(l)).collect());
         }
+        // A dict view materializes its live elements (allocating item tuples).
+        if let Some(items) = self.view_items(v) {
+            return Ok(items);
+        }
         // A CPython iterable (stdlib-ffi) is drained through its own iterator.
         #[cfg(feature = "stdlib-ffi")]
         if let Some(id) = self.foreign_id(v) {
@@ -2860,6 +2990,10 @@ impl PyHost {
         #[cfg(feature = "stdlib-ffi")]
         if let Some(id) = self.foreign_id(v) {
             return crate::ffi::make_iter(self, id);
+        }
+        // A dict view snapshots its live elements at iterator creation.
+        if let Some(items) = self.view_items(v) {
+            return Ok(self.alloc(PyObj::Iter(IterState::Seq { items, idx: 0 })));
         }
         let state = match self.get(v) {
             Some(PyObj::List(l)) | Some(PyObj::Tuple(l)) => IterState::Seq {
@@ -2953,6 +3087,17 @@ impl PyHost {
         #[cfg(feature = "stdlib-ffi")]
         if let Some(id) = self.foreign_id(container) {
             return crate::ffi::contains(self, id, item);
+        }
+        // A dict view: membership over its live elements. A keys view can test
+        // membership by direct key lookup (O(1)); values/items compare linearly.
+        if let Some(PyObj::DictView { dict, kind }) = self.get(container) {
+            let (dict, kind) = (dict.clone(), *kind);
+            if kind == 0 {
+                let key = self.to_key(item)?;
+                return Ok(matches!(self.get(&dict), Some(PyObj::Dict(d)) if d.contains_key(&key)));
+            }
+            let items = self.view_items(container).unwrap_or_default();
+            return Ok(items.iter().any(|x| self.equal(x, item)));
         }
         match self.get(container) {
             Some(PyObj::Str(s)) => {
@@ -3327,6 +3472,11 @@ impl PyHost {
                 // `type(x).__name__` — the builtin/type object's name.
                 let n = n.clone();
                 Ok(self.new_str(n))
+            }
+            // `dict.fromkeys` — a classmethod on the `dict` type, reached as an
+            // attribute of the `dict` builtin. Returns a callable builtin.
+            Some(PyObj::Builtin(n)) if n == "dict" && name == "fromkeys" => {
+                Ok(self.alloc(PyObj::Builtin("dict.fromkeys".into())))
             }
             _ => {
                 // Numeric `.real`/`.imag` (int/float/bool/bigint/complex are all
@@ -3756,6 +3906,12 @@ pub fn call_method(
         // `foreign.method(...)` (stdlib-ffi) — dispatch on the CPython side.
         #[cfg(feature = "stdlib-ffi")]
         Some(PyObj::Foreign(id)) => crate::ffi::call_method(id, name, args, kwargs),
+        // A method fetched from a builtin *type* object (`dict.fromkeys(...)`):
+        // resolve the attribute (a callable builtin) then invoke it.
+        Some(PyObj::Builtin(_)) => match with_host(|h| h.get_attr(recv, name)) {
+            Ok(f) => invoke(&f, args, kwargs),
+            Err(_) => crate::builtins::call_type_method(recv, name, args, kwargs),
+        },
         _ => crate::builtins::call_type_method(recv, name, args, kwargs),
     }
 }

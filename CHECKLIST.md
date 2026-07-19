@@ -296,12 +296,17 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
       exhaust once, `repr` is `<zip object at 0x…>`, `type().__name__` is `zip`/`map`/….
       `enumerate(start=)` and `zip(strict=True)` (byte-exact CPython shorter/longer
       `ValueError` messages) honored.
-- [ ] **dict views are eager list snapshots** — `{1:2}.keys()`→`[1]` (type `list`),
-      no live update, no view set-ops (`.keys() | {…}` → `TypeError`). Missing
-      `dict.fromkeys`, `dict | dict` merge, `d.update(**kwargs)` / `d.update(pairs)`
-      (only `update(dict)` works).
-- [ ] **`range`** — no slicing (`range(10)[2:8:2]`), no `.index`/`.count`,
-      value-inequality (`range(10)==range(0,10)`→`False`); O(n) membership (see P0).
+- [x] **dict views** — FIXED: `PyObj::DictView{dict,kind}` is a live view (holds a
+      handle to the backing dict, reflects mutations). `type().__name__` =
+      `dict_keys`/`dict_values`/`dict_items`; repr `dict_keys([…])`; iteration, `len`,
+      `in`. Keys/items views participate in set algebra (`| & - ^`, via `setmap_of`),
+      returning a `set`. `dict.fromkeys(iterable[, value])` (reached on the `dict` type
+      object), `dict | dict` merge (right wins), `d |= …`, and `d.update(mapping |
+      pairs-iterable, **kwargs)` all work.
+- [x] **`range`** — FIXED: slicing yields a new `range` (`range(10)[2:8:2]`→
+      `range(2, 8, 2)`, never materializes), `.index`/`.count` (O(1) arithmetic), and
+      value equality (`range(10)==range(0,10)`→True; two ranges equal iff same length
+      and same start/step when non-trivial). O(1) membership was already done.
 - [x] **set** — FIXED: subset partial-order comparisons `<= >= < >` (in `compare`,
       before the total-order path, so incomparable sets yield False both ways),
       `isdisjoint`, and `intersection_update`/`difference_update`/
