@@ -130,6 +130,9 @@ fn b_getlocal(vm: &mut VM, _: u8) -> Value {
     if let Some(v) = with_host(|h| h.read_name(&name)) {
         return v;
     }
+    if name == "NotImplemented" {
+        return with_host(|h| h.alloc(PyObj::NotImplemented));
+    }
     if is_known_builtin(&name) {
         return with_host(|h| h.alloc(PyObj::Builtin(name.clone())));
     }
@@ -140,6 +143,9 @@ fn b_getglobal(vm: &mut VM, _: u8) -> Value {
     let name = sval(&vm.pop());
     if let Some(v) = with_host(|h| h.read_global(&name)) {
         return v;
+    }
+    if name == "NotImplemented" {
+        return with_host(|h| h.alloc(PyObj::NotImplemented));
     }
     if is_known_builtin(&name) {
         return with_host(|h| h.alloc(PyObj::Builtin(name.clone())));
@@ -649,6 +655,34 @@ fn stringify(vm: &mut VM, v: &Value, repr: bool) -> Value {
     with_host(|h| h.new_str(s))
 }
 
+/// Format one replacement field: apply the `!r`/`!s`/`!a` conversion (codes
+/// 2/1/3, 0 = none), honor an instance's `__format__(spec)`, then apply the
+/// format spec. Shared by f-strings (`ops::FORMAT`) and `str.format`.
+fn format_field(v: &Value, conv: i64, spec: &str) -> Result<String, String> {
+    // A conversion turns the value into a string first; `__format__` is bypassed.
+    if conv != 0 {
+        let s = match conv {
+            2 => py_repr(v)?,                 // !r
+            3 => with_host(|h| h.repr_of(v)), // !a (ascii — repr for now)
+            _ => py_str(v)?,                  // !s
+        };
+        let sv = with_host(|h| h.new_str(s.clone()));
+        return Ok(apply_format_spec(&s, &sv, spec));
+    }
+    // No conversion: an instance's `__format__(spec)` wins outright.
+    let has_format = with_host(|h| match h.get(v) {
+        Some(PyObj::Instance(i)) => h.class_lookup(&i.class, "__format__").is_some(),
+        _ => false,
+    });
+    if has_format {
+        let specv = with_host(|h| h.new_str(spec.to_string()));
+        let r = host::call_method(v, "__format__", vec![specv], vec![])?;
+        return Ok(with_host(|h| h.str_of(&r)));
+    }
+    let s = py_str(v)?;
+    Ok(apply_format_spec(&s, v, spec))
+}
+
 fn b_format(vm: &mut VM, _: u8) -> Value {
     let spec = sval(&vm.pop());
     let conv = match vm.pop() {
@@ -656,17 +690,10 @@ fn b_format(vm: &mut VM, _: u8) -> Value {
         _ => 0,
     };
     let v = vm.pop();
-    // Apply conversion.
-    let s = match conv {
-        2 => with_host(|h| h.repr_of(&v)), // !r
-        _ => {
-            // !s / !a / none -> str(), with instance dunder dispatch.
-            let sv = stringify(vm, &v, false);
-            with_host(|h| h.str_of(&sv))
-        }
-    };
-    let out = crate::builtins::apply_format_spec(&s, &v, &spec);
-    with_host(|h| h.new_str(out))
+    match format_field(&v, conv, &spec) {
+        Ok(out) => with_host(|h| h.new_str(out)),
+        Err(e) => abort(vm, e),
+    }
 }
 
 // ── functions / classes ──────────────────────────────────────────────────────
@@ -706,7 +733,8 @@ fn b_build_class(vm: &mut VM, _: u8) -> Value {
 
 fn b_getiter(vm: &mut VM, _: u8) -> Value {
     let v = vm.pop();
-    // __iter__ on instances -> materialize via repeated __next__.
+    // On an instance, prefer a *lazy* __iter__ result; else materialize via the
+    // __iter__/__next__ or __getitem__ protocol (host::iter_instance_items).
     if with_host(|h| matches!(h.get(&v), Some(PyObj::Instance(_)))) {
         let r = iter_instance(&v);
         return finish(vm, r);
@@ -715,25 +743,26 @@ fn b_getiter(vm: &mut VM, _: u8) -> Value {
     finish(vm, r)
 }
 
-/// Drive a user iterable's `__iter__`/`__next__` into a concrete seq iterator.
+/// Drive a user iterable into a concrete seq iterator. A `__iter__` that returns
+/// a native iterator is used directly (stays lazy); everything else materializes
+/// through the shared `__iter__`/`__next__`/`__getitem__` protocol.
 fn iter_instance(v: &Value) -> Result<Value, String> {
-    let it = host::call_method(v, "__iter__", vec![], vec![])?;
-    // If __iter__ returned a builtin iterator, use it directly.
-    if with_host(|h| matches!(h.get(&it), Some(PyObj::Iter(_)))) {
-        return Ok(it);
-    }
-    // Otherwise materialize by calling __next__ until StopIteration.
-    let mut items = Vec::new();
-    loop {
-        match host::call_method(&it, "__next__", vec![], vec![]) {
-            Ok(x) => items.push(x),
-            Err(e) if e.contains("StopIteration") => break,
-            Err(e) => return Err(e),
-        }
-        if items.len() > 10_000_000 {
-            break;
+    let has_iter = with_host(|h| match h.get(v) {
+        Some(PyObj::Instance(i)) => h.class_lookup(&i.class, "__iter__").is_some(),
+        _ => false,
+    });
+    if has_iter {
+        let it = host::call_method(v, "__iter__", vec![], vec![])?;
+        if with_host(|h| {
+            matches!(
+                h.get(&it),
+                Some(PyObj::Iter(_)) | Some(PyObj::Generator { .. })
+            )
+        }) {
+            return Ok(it);
         }
     }
+    let items = host::iter_instance_items(v)?;
     Ok(with_host(|h| {
         h.alloc(PyObj::Iter(IterState::Seq { items, idx: 0 }))
     }))
@@ -759,6 +788,25 @@ fn b_foriter(vm: &mut VM, _: u8) -> Value {
 fn b_contains(vm: &mut VM, _: u8) -> Value {
     let container = vm.pop();
     let item = vm.pop();
+    // Instance `__contains__` wins; else fall back to iterating the instance
+    // (via __iter__/__getitem__) and comparing.
+    if with_host(|h| matches!(h.get(&container), Some(PyObj::Instance(_)))) {
+        let has_contains = with_host(|h| match h.get(&container) {
+            Some(PyObj::Instance(i)) => h.class_lookup(&i.class, "__contains__").is_some(),
+            _ => false,
+        });
+        if has_contains {
+            let r = host::call_method(&container, "__contains__", vec![item], vec![]);
+            return match r {
+                Ok(v) => Value::Bool(with_host(|h| h.truthy(&v))),
+                Err(e) => abort(vm, e),
+            };
+        }
+        return match iter_membership(&container, &item) {
+            Ok(b) => Value::Bool(b),
+            Err(e) => abort(vm, e),
+        };
+    }
     // A generator is consumed to test membership (no host borrow held).
     if with_host(|h| matches!(h.get(&container), Some(PyObj::Generator { .. }))) {
         return match host::iter_vec(&container) {
@@ -771,6 +819,13 @@ fn b_contains(vm: &mut VM, _: u8) -> Value {
         Ok(b) => Value::Bool(b),
         Err(e) => abort(vm, e),
     }
+}
+
+/// Materialize an instance iterable and test whether `item` is a member (the
+/// `in` fallback when no `__contains__` is defined).
+fn iter_membership(container: &Value, item: &Value) -> Result<bool, String> {
+    let items = host::iter_instance_items(container)?;
+    Ok(with_host(|h| items.iter().any(|x| h.equal(x, item))))
 }
 
 fn b_is(vm: &mut VM, _: u8) -> Value {
@@ -881,23 +936,108 @@ fn is_instance_with(h: &host::PyHost, v: &Value, name: &str) -> bool {
     matches!(h.get(v), Some(PyObj::Instance(i)) if instance_has(h, i, name))
 }
 
-/// Python operator overloading: if `a` defines the forward dunder `lname`
-/// (`__add__`), call `a.lname(b)`; else if `b` defines the reflected dunder
-/// `rname` (`__radd__`), call `b.rname(a)`. Returns `None` to fall through to the
-/// host's native handling when neither operand is an overloading instance.
+/// Is `v` the `NotImplemented` singleton?
+fn is_not_implemented(v: &Value) -> bool {
+    with_host(|h| matches!(h.get(v), Some(PyObj::NotImplemented)))
+}
+
+/// The outcome of dispatching a binary/comparison dunder pair.
+enum Dunder {
+    /// A concrete result the dunder produced.
+    Value(Value),
+    /// Both operands declined (no dunder, or all returned `NotImplemented`).
+    NotImplemented,
+    Err(String),
+}
+
+/// Dispatch the forward/reflected dunder pair, honoring `NotImplemented`: try
+/// `a.lname(b)` then `b.rname(a)`, skipping any that return the `NotImplemented`
+/// singleton. Only instance operands are consulted; a `NotImplemented` outcome
+/// means the caller should fall back (native op, identity, or `TypeError`).
+fn dispatch_binop(a: &Value, b: &Value, lname: &str, rname: &str) -> Dunder {
+    if with_host(|h| is_instance_with(h, a, lname)) {
+        match host::call_method(a, lname, vec![b.clone()], vec![]) {
+            Ok(v) if is_not_implemented(&v) => {}
+            Ok(v) => return Dunder::Value(v),
+            Err(e) => return Dunder::Err(e),
+        }
+    }
+    if with_host(|h| is_instance_with(h, b, rname)) {
+        match host::call_method(b, rname, vec![a.clone()], vec![]) {
+            Ok(v) if is_not_implemented(&v) => {}
+            Ok(v) => return Dunder::Value(v),
+            Err(e) => return Dunder::Err(e),
+        }
+    }
+    Dunder::NotImplemented
+}
+
+/// Python operator overloading for the non-native `BINOP` tags (`//`, `%`, `&`,
+/// …): dispatch dunders, or `None` to fall through to native handling when
+/// neither operand overloads. On both-declined (`NotImplemented`) with an
+/// instance operand, raise the unsupported-operand `TypeError`.
 fn try_binop_dunder(
     a: &Value,
     b: &Value,
     lname: &str,
     rname: &str,
 ) -> Option<Result<Value, String>> {
-    if with_host(|h| is_instance_with(h, a, lname)) {
-        return Some(host::call_method(a, lname, vec![b.clone()], vec![]));
+    let involved = with_host(|h| {
+        matches!(h.get(a), Some(PyObj::Instance(_))) || matches!(h.get(b), Some(PyObj::Instance(_)))
+    });
+    if !involved {
+        return None;
     }
-    if with_host(|h| is_instance_with(h, b, rname)) {
-        return Some(host::call_method(b, rname, vec![a.clone()], vec![]));
+    match dispatch_binop(a, b, lname, rname) {
+        Dunder::Value(v) => Some(Ok(v)),
+        Dunder::Err(e) => Some(Err(e)),
+        Dunder::NotImplemented => {
+            let sym = binop_symbol(lname);
+            Some(Err(unsupported_operand(sym, a, b)))
+        }
     }
-    None
+}
+
+/// The operator glyph for an unsupported-operand `TypeError` message.
+fn binop_symbol(lname: &str) -> &'static str {
+    match lname {
+        "__add__" => "+",
+        "__sub__" => "-",
+        "__mul__" => "*",
+        "__truediv__" => "/",
+        "__floordiv__" => "//",
+        "__mod__" => "%",
+        "__pow__" => "** or pow()",
+        "__matmul__" => "@",
+        "__and__" => "&",
+        "__or__" => "|",
+        "__xor__" => "^",
+        "__lshift__" => "<<",
+        "__rshift__" => ">>",
+        _ => "?",
+    }
+}
+
+fn unsupported_operand(sym: &str, a: &Value, b: &Value) -> String {
+    with_host(|h| {
+        host::type_error(&format!(
+            "unsupported operand type(s) for {sym}: '{}' and '{}'",
+            h.type_name(a),
+            h.type_name(b)
+        ))
+    })
+}
+
+/// Identity comparison (mirrors the `is` operator) for the `==`/`!=` fallback.
+fn identity_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Obj(x), Value::Obj(y)) => x == y,
+        (Value::Undef, Value::Undef) => true,
+        (Value::Bool(x), Value::Bool(y)) => x == y,
+        (Value::Int(x), Value::Int(y)) => x == y,
+        (Value::Float(x), Value::Float(y)) => x == y,
+        _ => false,
+    }
 }
 
 /// (forward, reflected) dunder names for a non-native binop tag (`host::binop`).
@@ -962,6 +1102,20 @@ fn b_unary(vm: &mut VM, _: u8) -> Value {
         Value::Int(n) => n,
         _ => return abort(vm, "internal: UNARY tag".into()),
     };
+    // Instance overloading: `~x` → __invert__, unary `+x` → __pos__.
+    let dunder = match tag {
+        host::unop::INVERT => "__invert__",
+        host::unop::POS => "__pos__",
+        _ => "",
+    };
+    if !dunder.is_empty()
+        && with_host(
+            |h| matches!(h.get(&v), Some(PyObj::Instance(i)) if instance_has(h, i, dunder)),
+        )
+    {
+        let r = host::call_method(&v, dunder, vec![], vec![]);
+        return finish(vm, r);
+    }
     let r = with_host(|h| h.unary(tag, &v));
     finish(vm, r)
 }
@@ -1340,12 +1494,74 @@ fn callable_name(h: &host::PyHost, v: &Value) -> Option<String> {
 /// instances defining an operator dunder (`__add__`, `__eq__`, `__lt__`, …) are
 /// dispatched first; everything else falls to the host's native numeric logic.
 pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
-    if let Some((l, r)) = numop_dunders(op) {
-        if let Some(res) = try_binop_dunder(a, b, l, r) {
-            return res;
+    use NumOp::*;
+    let a_inst = with_host(|h| matches!(h.get(a), Some(PyObj::Instance(_))));
+    let b_inst = with_host(|h| matches!(h.get(b), Some(PyObj::Instance(_))));
+    // No user instance involved → native handling (preserves `1 == 1.0`, etc.).
+    if !a_inst && !b_inst {
+        return with_host(|h| h.arith(op, a, b));
+    }
+    match op {
+        Eq => match dispatch_binop(a, b, "__eq__", "__eq__") {
+            Dunder::Value(v) => Ok(v),
+            Dunder::Err(e) => Err(e),
+            Dunder::NotImplemented => Ok(Value::Bool(identity_eq(a, b))),
+        },
+        Ne => match dispatch_binop(a, b, "__ne__", "__ne__") {
+            Dunder::Value(v) => Ok(v),
+            Dunder::Err(e) => Err(e),
+            // Default `__ne__` derives from `__eq__` (inverting its truthiness).
+            Dunder::NotImplemented => match dispatch_binop(a, b, "__eq__", "__eq__") {
+                Dunder::Value(v) => Ok(Value::Bool(!with_host(|h| h.truthy(&v)))),
+                Dunder::Err(e) => Err(e),
+                Dunder::NotImplemented => Ok(Value::Bool(!identity_eq(a, b))),
+            },
+        },
+        Lt | Le | Gt | Ge => {
+            let (l, r) = numop_dunders(op).unwrap();
+            match dispatch_binop(a, b, l, r) {
+                Dunder::Value(v) => Ok(v),
+                Dunder::Err(e) => Err(e),
+                Dunder::NotImplemented => {
+                    let sym = match op {
+                        Lt => "<",
+                        Le => "<=",
+                        Gt => ">",
+                        _ => ">=",
+                    };
+                    Err(with_host(|h| {
+                        host::type_error(&format!(
+                            "'{sym}' not supported between instances of '{}' and '{}'",
+                            h.type_name(a),
+                            h.type_name(b)
+                        ))
+                    }))
+                }
+            }
+        }
+        // Unary negation reaches the hook with the operand in `a`; an instance
+        // defining `__neg__` overloads it.
+        Neg => {
+            if a_inst
+                && with_host(
+                    |h| matches!(h.get(a), Some(PyObj::Instance(i)) if instance_has(h, i, "__neg__")),
+                )
+            {
+                host::call_method(a, "__neg__", vec![], vec![])
+            } else {
+                with_host(|h| h.arith(op, a, b))
+            }
+        }
+        // Arithmetic: forward/reflected dunder, else unsupported-operand TypeError.
+        Add | Sub | Mul | Div | Mod | Pow => {
+            let (l, r) = numop_dunders(op).unwrap();
+            match dispatch_binop(a, b, l, r) {
+                Dunder::Value(v) => Ok(v),
+                Dunder::Err(e) => Err(e),
+                Dunder::NotImplemented => Err(unsupported_operand(binop_symbol(l), a, b)),
+            }
         }
     }
-    with_host(|h| h.arith(op, a, b))
 }
 
 // ── builtin predicates ───────────────────────────────────────────────────────
@@ -1655,6 +1871,12 @@ pub fn call_builtin_function(
         "range" => make_range(&args),
         "abs" => {
             let v = arg0(&args)?;
+            // Instance overloading: `abs(x)` → `x.__abs__()`.
+            if with_host(
+                |h| matches!(h.get(&v), Some(PyObj::Instance(i)) if instance_has(h, i, "__abs__")),
+            ) {
+                return host::call_method(&v, "__abs__", vec![], vec![]);
+            }
             with_host(|h| match &v {
                 Value::Int(n) => Ok(Value::Int(n.abs())),
                 Value::Float(f) => Ok(Value::Float(f.abs())),
@@ -1684,7 +1906,39 @@ pub fn call_builtin_function(
         }
         "sorted" => py_sorted(&args, &kwargs),
         "reversed" => {
-            let mut items = host::iter_vec(&arg0(&args)?)?;
+            let v = arg0(&args)?;
+            // Instance `__reversed__` wins; else `__getitem__`+`__len__` reverse.
+            if with_host(|h| matches!(h.get(&v), Some(PyObj::Instance(_)))) {
+                let (has_rev, has_gi) = with_host(|h| match h.get(&v) {
+                    Some(PyObj::Instance(i)) => (
+                        h.class_lookup(&i.class, "__reversed__").is_some(),
+                        h.class_lookup(&i.class, "__getitem__").is_some()
+                            && h.class_lookup(&i.class, "__len__").is_some(),
+                    ),
+                    _ => (false, false),
+                });
+                if has_rev {
+                    return host::call_method(&v, "__reversed__", vec![], vec![]);
+                }
+                if has_gi {
+                    let n = py_len(&v)?;
+                    let mut items = Vec::with_capacity(n);
+                    for i in (0..n as i64).rev() {
+                        items.push(host::call_method(
+                            &v,
+                            "__getitem__",
+                            vec![Value::Int(i)],
+                            vec![],
+                        )?);
+                    }
+                    return Ok(with_host(|h| h.new_list(items)));
+                }
+                return Err(host::type_error(&format!(
+                    "'{}' object is not reversible",
+                    with_host(|h| h.type_name(&v))
+                )));
+            }
+            let mut items = host::iter_vec(&v)?;
             items.reverse();
             Ok(with_host(|h| h.new_list(items)))
         }
@@ -1905,10 +2159,7 @@ pub fn call_builtin_function(
             let v = arg0(&args)?;
             let spec =
                 with_host(|h| h.str_of(&args.get(1).cloned().unwrap_or_else(|| Value::str(""))));
-            let s = py_str(&v)?;
-            // `apply_format_spec` re-enters `with_host` internally, so it must be
-            // called outside any active host borrow.
-            let out = apply_format_spec(&s, &v, &spec);
+            let out = format_field(&v, 0, &spec)?;
             Ok(with_host(|h| h.new_str(out)))
         }
         "iter" => {
@@ -3121,9 +3372,22 @@ fn str_dot_format(s: &str, args: &[Value]) -> Result<Value, String> {
                     i += 1;
                 }
                 i += 1; // skip }
-                let (fname, spec) = match field.split_once(':') {
+                let (name_conv, spec) = match field.split_once(':') {
                     Some((a, b)) => (a.to_string(), b.to_string()),
                     None => (field, String::new()),
+                };
+                // Split off a `!r`/`!s`/`!a` conversion from the field name.
+                let (fname, conv) = match name_conv.split_once('!') {
+                    Some((n, c)) => (
+                        n.to_string(),
+                        match c {
+                            "s" => 1,
+                            "r" => 2,
+                            "a" => 3,
+                            _ => 0,
+                        },
+                    ),
+                    None => (name_conv, 0),
                 };
                 let val = if fname.is_empty() {
                     let v = args.get(auto).cloned().unwrap_or(Value::Undef);
@@ -3134,8 +3398,7 @@ fn str_dot_format(s: &str, args: &[Value]) -> Result<Value, String> {
                 } else {
                     Value::Undef
                 };
-                let sv = py_str(&val)?;
-                out.push_str(&apply_format_spec(&sv, &val, &spec));
+                out.push_str(&format_field(&val, conv, &spec)?);
             }
             c => {
                 out.push(c);

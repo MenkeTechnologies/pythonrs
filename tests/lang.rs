@@ -912,3 +912,91 @@ fn getattr_fallback() {
         "'dyn:missing'"
     );
 }
+
+#[test]
+fn format_dunder() {
+    // f-string honors __format__ with the spec.
+    assert_eq!(
+        g(
+            "class C:\n    def __format__(self, s): return 'F[' + s + ']'\nx = f'{C():>3}'",
+            "x"
+        ),
+        "'F[>3]'"
+    );
+    // str.format honors __format__ and !r conversion.
+    assert_eq!(
+        g("class C:\n    def __format__(self, s): return 'z'\n    def __repr__(self): return 'R'\nx = '{}-{!r}'.format(C(), C())", "x"),
+        "'z-R'"
+    );
+    // format() builtin.
+    assert_eq!(
+        g(
+            "class C:\n    def __format__(self, s): return 'q' + s\nx = format(C(), 'w')",
+            "x"
+        ),
+        "'qw'"
+    );
+}
+
+#[test]
+fn ne_derived_and_not_implemented() {
+    // __ne__ is derived from __eq__ when not defined.
+    assert_eq!(
+        g("class C:\n    def __init__(s, v): s.v = v\n    def __eq__(s, o): return s.v == o.v\nx = (C(1) == C(1), C(1) != C(2), C(1) != C(1))", "x"),
+        "(True, True, False)"
+    );
+    // Returning NotImplemented falls back to identity (== against a foreign type).
+    assert_eq!(
+        g("class A:\n    def __eq__(s, o):\n        if isinstance(o, A): return True\n        return NotImplemented\nx = (A() == A(), A() == 5, 5 == A())", "x"),
+        "(True, False, False)"
+    );
+}
+
+#[test]
+fn unary_dunders() {
+    // Unwrap to scalars so the test doesn't depend on __repr__ dispatch in the
+    // read-back harness (repr_of is &self and can't call a method).
+    assert_eq!(
+        g("class V:\n    def __init__(s, x): s.x = x\n    def __neg__(s): return V(-s.x)\n    def __abs__(s): return V(abs(s.x))\n    def __invert__(s): return V(~s.x)\n    def __pos__(s): return V(+s.x)\nx = ((-V(5)).x, abs(V(-3)).x, (~V(4)).x, (+V(7)).x)", "x"),
+        "(-5, 3, -5, 7)"
+    );
+}
+
+#[test]
+fn iteration_protocol() {
+    // __getitem__ sequence-protocol iteration.
+    assert_eq!(
+        g("class S:\n    def __init__(s): s.d = [10, 20, 30]\n    def __getitem__(s, i):\n        if i >= len(s.d): raise IndexError\n        return s.d[i]\nx = [list(S()), 20 in S(), 99 in S()]", "x"),
+        "[[10, 20, 30], True, False]"
+    );
+    // __contains__ overrides iteration.
+    assert_eq!(
+        g(
+            "class C:\n    def __contains__(s, x): return x == 42\nx = (42 in C(), 1 in C())",
+            "x"
+        ),
+        "(True, False)"
+    );
+    // __reversed__.
+    assert_eq!(
+        g(
+            "class C:\n    def __reversed__(s): return iter([3, 2, 1])\nx = list(reversed(C()))",
+            "x"
+        ),
+        "[3, 2, 1]"
+    );
+}
+
+#[test]
+fn new_dunder() {
+    // __new__ creates the instance and __init__ receives the same args.
+    assert_eq!(
+        g("class C:\n    def __new__(cls, x): return object.__new__(cls)\n    def __init__(self, x): self.x = x * 2\nx = C(7).x", "x"),
+        "14"
+    );
+    // __new__ returning a foreign object skips __init__.
+    assert_eq!(
+        g("class C:\n    def __new__(cls): return 99\n    def __init__(self): self.bad = True\nx = C()", "x"),
+        "99"
+    );
+}

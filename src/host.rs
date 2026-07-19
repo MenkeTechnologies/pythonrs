@@ -293,6 +293,10 @@ pub enum PyObj {
         fset: Value,
         fdel: Value,
     },
+    /// The `NotImplemented` singleton: returned by a binary/comparison dunder to
+    /// signal "this operand pair is not my business", so the interpreter tries the
+    /// reflected operation (and, for `==`/`!=`, falls back to identity).
+    NotImplemented,
 }
 
 /// The plan for reading `recv.name` when a descriptor may be involved. Computed
@@ -874,6 +878,7 @@ impl PyHost {
                 Some(PyObj::StaticMethod(_)) => "staticmethod".into(),
                 Some(PyObj::ClassMethod(_)) => "classmethod".into(),
                 Some(PyObj::Property { .. }) => "property".into(),
+                Some(PyObj::NotImplemented) => "NotImplementedType".into(),
                 None => "object".into(),
             },
             _ => "object".into(),
@@ -980,6 +985,7 @@ impl PyHost {
                     format!("<classmethod({})>", self.str_of(f))
                 }
                 Some(PyObj::Property { .. }) => "<property object>".into(),
+                Some(PyObj::NotImplemented) => "NotImplemented".into(),
                 Some(PyObj::Slice { .. })
                 | Some(PyObj::List(_))
                 | Some(PyObj::Tuple(_))
@@ -3140,6 +3146,20 @@ pub fn call_method(
                 )),
             }
         }
+        // `object.__new__(cls)` — allocate a bare instance of `cls` (the default
+        // `__new__`, reached from a user `__new__` override).
+        Some(PyObj::Builtin(bname)) if bname == "object" && name == "__new__" => {
+            let cls = args.first().cloned().unwrap_or(Value::Undef);
+            match with_host(|h| h.get(&cls).cloned()) {
+                Some(PyObj::Class(cname)) => Ok(with_host(|h| {
+                    h.alloc(PyObj::Instance(Instance {
+                        class: cname,
+                        attrs: IndexMap::new(),
+                    }))
+                })),
+                _ => Err(type_error("object.__new__(X): X is not a type object")),
+            }
+        }
         _ => crate::builtins::call_type_method(recv, name, args, kwargs),
     }
 }
@@ -3185,17 +3205,40 @@ pub fn instantiate(
             })
         }));
     }
-    let inst = with_host(|h| {
-        h.alloc(PyObj::Instance(Instance {
-            class: class.to_string(),
-            attrs: IndexMap::new(),
-        }))
+    // `__new__` (if the class overrides it) creates the instance; it is an
+    // implicit staticmethod, so `cls` is passed as the first argument. Otherwise
+    // a bare instance is allocated (the default `object.__new__`).
+    let inst = if let Some(newf) = with_host(|h| h.class_lookup(class, "__new__")) {
+        let newf = match with_host(|h| h.get(&newf).cloned()) {
+            Some(PyObj::StaticMethod(inner)) => inner,
+            _ => newf,
+        };
+        let clsobj = with_host(|h| h.alloc(PyObj::Class(class.to_string())));
+        let mut a = Vec::with_capacity(args.len() + 1);
+        a.push(clsobj);
+        a.extend(args.clone());
+        invoke(&newf, a, kwargs.clone())?
+    } else {
+        with_host(|h| {
+            h.alloc(PyObj::Instance(Instance {
+                class: class.to_string(),
+                attrs: IndexMap::new(),
+            }))
+        })
+    };
+    // `__init__` runs only when `__new__` returned an instance of `class` (or a
+    // subclass) — matching CPython's `type.__call__`.
+    let init_ok = with_host(|h| match h.get(&inst) {
+        Some(PyObj::Instance(i)) => h.mro_of(&i.class).iter().any(|c| c == class),
+        _ => false,
     });
-    if let Some(f) = with_host(|h| h.class_lookup(class, "__init__")) {
-        let fobj = with_host(|h| h.get(&f).cloned());
-        if let Some(PyObj::Func(fv)) = fobj {
-            let owner = with_host(|h| method_owner(h, class, "__init__"));
-            run_user_func(&fv, Some(inst.clone()), owner, args, kwargs)?;
+    if init_ok {
+        if let Some(f) = with_host(|h| h.class_lookup(class, "__init__")) {
+            let fobj = with_host(|h| h.get(&f).cloned());
+            if let Some(PyObj::Func(fv)) = fobj {
+                let owner = with_host(|h| method_owner(h, class, "__init__"));
+                run_user_func(&fv, Some(inst.clone()), owner, args, kwargs)?;
+            }
         }
     }
     Ok(inst)
@@ -3557,7 +3600,68 @@ pub fn iter_vec(v: &Value) -> Result<Vec<Value>, String> {
         }
         return Ok(out);
     }
+    // A user instance iterates via its `__iter__`/`__next__` (or `__getitem__`)
+    // protocol — reached by `list()`/`tuple()`/`sum()`/… over custom iterables.
+    if with_host(|h| matches!(h.get(v), Some(PyObj::Instance(_)))) {
+        return iter_instance_items(v);
+    }
     with_host(|h| h.iter_items(v))
+}
+
+/// Materialize a user instance's iteration into a concrete vector: `__iter__`
+/// then repeated `__next__` (draining a native iterator/generator if `__iter__`
+/// returned one), else the old-style `__getitem__(0..)` sequence protocol.
+pub fn iter_instance_items(v: &Value) -> Result<Vec<Value>, String> {
+    let (has_iter, has_getitem) = with_host(|h| match h.get(v) {
+        Some(PyObj::Instance(i)) => (
+            h.class_lookup(&i.class, "__iter__").is_some(),
+            h.class_lookup(&i.class, "__getitem__").is_some(),
+        ),
+        _ => (false, false),
+    });
+    if has_iter {
+        let it = call_method(v, "__iter__", vec![], vec![])?;
+        if with_host(|h| {
+            matches!(
+                h.get(&it),
+                Some(PyObj::Iter(_)) | Some(PyObj::Generator { .. })
+            )
+        }) {
+            return iter_vec(&it);
+        }
+        let mut items = Vec::new();
+        loop {
+            match call_method(&it, "__next__", vec![], vec![]) {
+                Ok(x) => items.push(x),
+                Err(e) if e.contains("StopIteration") => break,
+                Err(e) => return Err(e),
+            }
+            if items.len() > 10_000_000 {
+                break;
+            }
+        }
+        Ok(items)
+    } else if has_getitem {
+        let mut items = Vec::new();
+        let mut i: i64 = 0;
+        loop {
+            match call_method(v, "__getitem__", vec![Value::Int(i)], vec![]) {
+                Ok(x) => items.push(x),
+                Err(e) if e.contains("IndexError") || e.contains("StopIteration") => break,
+                Err(e) => return Err(e),
+            }
+            i += 1;
+            if items.len() > 10_000_000 {
+                break;
+            }
+        }
+        Ok(items)
+    } else {
+        Err(type_error(&format!(
+            "'{}' object is not iterable",
+            with_host(|h| h.type_name(v))
+        )))
+    }
 }
 
 /// Advance any iterator — including a generator — by one step.
