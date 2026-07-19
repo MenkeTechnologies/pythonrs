@@ -242,8 +242,12 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
       root (`(-8)**(1/3)`). Complex `==` (real+zero-imag unifies with the real
       number), `bool`, and hashing (`PKey::Complex`; zero-imag normalizes to the
       real key) all work. `complex(1,2)` repr `(1+2j)` (integral parts drop `.0`).
-- [ ] **`frozenset` is not a real type** — unhashable (`TypeError: unhashable type:
-      'set'`), can't be a dict key/set member, no `frozenset(...)` repr, conflated with `set`.
+- [x] **`frozenset` real hashable type** — FIXED: `PyObj::Frozenset` (same storage as
+      `set`, immutable) + `PKey::Frozenset` (element keys sorted/deduped → canonical, so
+      equal frozensets share one hash). Dict key / set member work; `frozenset(...)` /
+      `frozenset()` repr; set algebra (`| & - ^`) returns a `frozenset` when the left
+      operand is one; `isinstance` (frozenset ⊄ set, set ⊄ frozenset); `set == frozenset`
+      by membership; immutable (mutators raise `AttributeError`).
 - [ ] **Misc:** `bool` bit-ops return `int` not `bool` (`True&False`→`0`); int/float
       methods `to_bytes/from_bytes/bit_count/as_integer_ratio/.hex/numerator/denominator/
       __index__` absent; `int("0x1F",16)` rejected; underscores in `float("1_000.5")`
@@ -298,9 +302,11 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
       (only `update(dict)` works).
 - [ ] **`range`** — no slicing (`range(10)[2:8:2]`), no `.index`/`.count`,
       value-inequality (`range(10)==range(0,10)`→`False`); O(n) membership (see P0).
-- [ ] **set** — subset comparisons `<= >= < >` (`TypeError`), `isdisjoint`, and
-      `intersection_update`/`difference_update`/`symmetric_difference_update` missing.
-      (Operator algebra `| & - ^`, `add/discard/remove/update`, in-place all work.)
+- [x] **set** — FIXED: subset partial-order comparisons `<= >= < >` (in `compare`,
+      before the total-order path, so incomparable sets yield False both ways),
+      `isdisjoint`, and `intersection_update`/`difference_update`/
+      `symmetric_difference_update` (all accept any iterable via `iter_keys`).
+      `issubset`/`issuperset` now also accept any iterable.
 - [ ] **`type([])`/`type({})`/… print `<built-in function list>`** not `<class 'list'>`;
       instance dunders `[].__class__`/`[].__len__()` and unbound `str.lower` unavailable.
 - [ ] **set repr ordering** — insertion order vs CPython hash order (impl-defined but
