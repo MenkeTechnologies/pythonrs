@@ -1612,10 +1612,6 @@ pub fn is_builtin_function(name: &str) -> bool {
         || name.starts_with("os.")
         || name.starts_with("random.")
         || name.starts_with("collections.")
-        || name.starts_with("re.")
-        || name.starts_with("datetime.")
-        || name.starts_with("heapq.")
-        || name.starts_with("bisect.")
         || name.starts_with("textwrap.")
         || name.starts_with("statistics.")
 }
@@ -1836,26 +1832,6 @@ pub fn call_builtin_function(
     }
     if let Some(f) = name.strip_prefix("random.") {
         if let Some(r) = with_host(|h| crate::stdlib::random::call(h, f, &args)) {
-            return r;
-        }
-    }
-    if let Some(f) = name.strip_prefix("re.") {
-        if let Some(r) = with_host(|h| crate::stdlib::re::call(h, f, &args)) {
-            return r;
-        }
-    }
-    if let Some(f) = name.strip_prefix("datetime.") {
-        if let Some(r) = with_host(|h| crate::stdlib::datetime::call(h, f, &args)) {
-            return r;
-        }
-    }
-    if let Some(f) = name.strip_prefix("heapq.") {
-        if let Some(r) = with_host(|h| crate::stdlib::heapq::call(h, f, &args)) {
-            return r;
-        }
-    }
-    if let Some(f) = name.strip_prefix("bisect.") {
-        if let Some(r) = with_host(|h| crate::stdlib::bisect::call(h, f, &args)) {
             return r;
         }
     }
