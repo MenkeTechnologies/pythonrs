@@ -145,9 +145,12 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
       `type(b)==B`, `type(b) is B` all hold. Builtin type names repr as `<class 'int'>`
       (functions stay `<built-in function len>`); `isinstance(int, type)`→`True`.
       Still open: 3-arg `type(name,bases,ns)` / metaclasses; unbound-method access.
-- [ ] **Class introspection attrs missing** — `__mro__`, `__bases__`, `__dict__`
-      (class & instance), `__class__`, `__subclasses__`, `__qualname__` → `AttributeError`;
-      `vars(instance)` → `[]`. C3 MRO inconsistency not detected (silently accepted).
+- [x] **Class introspection attrs** — FIXED: instance `__class__`/`__dict__`,
+      class `__mro__`/`__bases__`/`__dict__`/`__qualname__` (`object` is the implicit
+      MRO/bases tail), and `vars(instance)` (== `__dict__`). User-class repr now
+      carries the `__main__.` module qualifier to match CPython (builtins stay bare).
+      Still open: `__subclasses__`; the synthetic `__dict__` dunder entries
+      (`__module__`/`__weakref__`/…); MRO-inconsistency detection.
 - [x] **Iteration protocol** — FIXED: `__iter__`/`__next__` (lazy when `__iter__`
       returns a native iterator, else materialized), `__getitem__(0..)`-fallback
       iteration, `__contains__` (with iterate-and-compare fallback), and

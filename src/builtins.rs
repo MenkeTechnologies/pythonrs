@@ -2252,7 +2252,12 @@ pub fn call_builtin_function(
                 .unwrap_or(Value::Undef);
             Ok(with_host(|h| h.alloc(PyObj::Property { fget, fset, fdel })))
         }
-        "vars" | "dir" => Ok(with_host(|h| h.new_list(vec![]))),
+        "vars" => match args.first() {
+            // `vars(obj)` == `obj.__dict__`.
+            Some(v) => with_host(|h| h.get_attr(v, "__dict__")),
+            None => Ok(with_host(|h| h.new_dict(IndexMap::new()))),
+        },
+        "dir" => Ok(with_host(|h| h.new_list(vec![]))),
         // Type constructors.
         "int" => construct_int(&args),
         "float" => construct_float(&args),

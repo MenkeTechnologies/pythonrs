@@ -1029,3 +1029,22 @@ fn bare_reraise_in_handler() {
         "'boom'"
     );
 }
+
+#[test]
+fn instance_and_class_introspection() {
+    // Instance __class__ / __dict__ and vars().
+    assert_eq!(
+        g("class C:\n    def __init__(s): s.a = 1; s.b = 2\nc = C()\nx = (c.__class__.__name__, c.__dict__, vars(c))", "x"),
+        "('C', {'a': 1, 'b': 2}, {'a': 1, 'b': 2})"
+    );
+    // Class __bases__ / __mro__ names.
+    assert_eq!(
+        g("class A: pass\nclass B(A): pass\nx = ([b.__name__ for b in B.__bases__], [c.__name__ for c in B.__mro__])", "x"),
+        "(['A'], ['B', 'A', 'object'])"
+    );
+    // User class repr carries the __main__ module qualifier (builtins don't).
+    assert_eq!(
+        g("class Widget: pass\nx = repr(Widget)", "x"),
+        "\"<class '__main__.Widget'>\""
+    );
+}
