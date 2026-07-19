@@ -74,6 +74,18 @@ pub mod ops {
     pub const DBG_LINE: u16 = 48; // [line] -> DAP statement marker (debug only)
     pub const TRY: u16 = 49; // [try_id] -> run a try/except/else/finally block
     pub const DECLARE_GLOBAL: u16 = 50; // [name] -> mark name global in this frame
+    pub const DECLARE_NONLOCAL: u16 = 51; // [name] -> mark name nonlocal in this frame
+    pub const CALL_EX: u16 = 52; // [name, args_list, kwargs_dict] -> resolve name & call
+    pub const CALL_VALUE_EX: u16 = 53; // [callable, args_list, kwargs_dict]
+    pub const CALL_METHOD_EX: u16 = 54; // [recv, name, args_list, kwargs_dict]
+    pub const BUILD_ARGS: u16 = 55; // [tag,val,...] -> positional list (tag 1 = *spread)
+    pub const BUILD_KWARGS: u16 = 56; // [key,val,...] -> kwargs dict (key Undef = **spread)
+    pub const MKDICT_EX: u16 = 57; // [tag,a,b,...] -> dict (tag 1 = **spread of a)
+    pub const MATCH_SEQ: u16 = 58; // [subject, count, star] -> [elems_list, Bool] | [Bool(false)]
+    pub const MATCH_MAP_CHECK: u16 = 59; // [subject] -> Bool (is a mapping)
+    pub const MATCH_KEY: u16 = 60; // [subject, key] -> [value, Bool] | [Bool(false)]
+    pub const MATCH_MAP_REST: u16 = 61; // [subject, keylist] -> dict of remaining keys
+    pub const MATCH_CLASS: u16 = 62; // [subject, class, npos, kwnames...] -> [vals_list, Bool] | [Bool]
 }
 
 /// Binary-op tags carried by `ops::BINOP` (the non-native operators).
@@ -215,6 +227,11 @@ pub enum PyObj {
     },
     BigInt(num_bigint::BigInt),
     Complex(f64, f64),
+    /// A live generator (from a `def` with `yield`, or a generator expression),
+    /// backed by a stackful `corosensei` coroutine in `PyHost.generators`.
+    Generator {
+        id: u32,
+    },
 }
 
 /// Iterator cursor state.
@@ -246,6 +263,9 @@ fn new_env(parent: Option<Env>) -> Env {
 pub struct Frame {
     pub env: Env,
     pub globals_decl: HashSet<String>,
+    /// Names declared `nonlocal` in this frame — writes target the nearest
+    /// enclosing function scope that binds the name, not the local env.
+    pub nonlocals_decl: HashSet<String>,
     pub self_obj: Option<Value>,
     pub owner: Option<String>,
 }
@@ -275,6 +295,38 @@ pub struct PyHost {
     /// The in-flight exception object, if any.
     pub exc: Option<Value>,
     pub signal: Option<Signal>,
+    /// Suspended generator coroutines, indexed by `PyObj::Generator.id`.
+    generators: Vec<GenCell>,
+}
+
+/// One suspended generator. `coro` is `None` only while this generator is
+/// actively running (taken out across `Coroutine::resume`); `ctx` holds its
+/// volatile execution context (frames/signal/error/exc) while suspended.
+struct GenCell {
+    coro: Option<corosensei::Coroutine<Value, Value, Result<Value, String>>>,
+    /// Raw pointer to the coroutine body's `Yielder`, published on entry (same
+    /// thread → valid for the body's life). Read by `yield` to suspend.
+    yielder: *const (),
+    ctx: GenContext,
+    done: bool,
+}
+
+/// The mutable "execution registers" swapped at every generator resume/suspend
+/// boundary so a suspended generator's half-finished frame/signal state never
+/// leaks into the resuming caller (and vice-versa). The object heap, function
+/// table, classes, tries and globals are shared and never swapped.
+#[derive(Default)]
+struct GenContext {
+    frames: Vec<Frame>,
+    error: Option<String>,
+    exc: Option<Value>,
+    signal: Option<Signal>,
+}
+
+thread_local! {
+    /// Id of the generator whose body is currently executing on this thread, or
+    /// `None` at the root. `yield` suspends this generator.
+    static CUR_GEN: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
 thread_local! {
@@ -309,12 +361,14 @@ impl PyHost {
             frames: vec![Frame {
                 env: module_env,
                 globals_decl: HashSet::new(),
+                nonlocals_decl: HashSet::new(),
                 self_obj: None,
                 owner: None,
             }],
             error: None,
             exc: None,
             signal: None,
+            generators: Vec::new(),
         }
     }
 
@@ -404,8 +458,32 @@ impl PyHost {
     /// Assign to `name` following Python scope rules: a `global`-declared name
     /// (or module scope) writes to globals; otherwise the current local env.
     pub fn set_name(&mut self, name: &str, val: Value) {
-        let is_global = self.frames.len() == 1 || self.frame().globals_decl.contains(name);
-        if is_global {
+        if self.frame().globals_decl.contains(name) {
+            self.globals.insert(name.to_string(), val);
+            return;
+        }
+        if self.frame().nonlocals_decl.contains(name) {
+            // Rebind the nearest ENCLOSING function scope that binds `name`
+            // (skip the current env — that is what distinguishes it from a plain
+            // local assignment and from `global`).
+            let cur = self.cur_env();
+            let mut env = cur.borrow().parent.clone();
+            while let Some(e) = env {
+                if e.borrow().vars.contains_key(name) {
+                    e.borrow_mut().vars.insert(name.to_string(), val);
+                    return;
+                }
+                let parent = e.borrow().parent.clone();
+                env = parent;
+            }
+            // No binding found up the chain: fall back to the immediate parent.
+            let parent = cur.borrow().parent.clone();
+            if let Some(p) = parent {
+                p.borrow_mut().vars.insert(name.to_string(), val);
+                return;
+            }
+        }
+        if self.frames.len() == 1 {
             self.globals.insert(name.to_string(), val);
         } else {
             self.cur_env()
@@ -440,6 +518,14 @@ impl PyHost {
             .last_mut()
             .unwrap()
             .globals_decl
+            .insert(name.to_string());
+    }
+
+    pub fn declare_nonlocal(&mut self, name: &str) {
+        self.frames
+            .last_mut()
+            .unwrap()
+            .nonlocals_decl
             .insert(name.to_string());
     }
 
@@ -550,6 +636,7 @@ impl PyHost {
                 Some(PyObj::Module { .. }) => "module".into(),
                 Some(PyObj::BigInt(_)) => "int".into(),
                 Some(PyObj::Complex(..)) => "complex".into(),
+                Some(PyObj::Generator { .. }) => "generator".into(),
                 None => "object".into(),
             },
             _ => "object".into(),
@@ -615,6 +702,7 @@ impl PyHost {
                     }
                 }
                 Some(PyObj::Iter(_)) => "<iterator>".into(),
+                Some(PyObj::Generator { id }) => format!("<generator object at 0x{id:012x}>"),
                 Some(PyObj::Slice { .. })
                 | Some(PyObj::List(_))
                 | Some(PyObj::Tuple(_))
@@ -1535,7 +1623,7 @@ impl PyHost {
                 stop: *stop,
                 step: *step,
             },
-            Some(PyObj::Iter(_)) => return Ok(v.clone()),
+            Some(PyObj::Iter(_)) | Some(PyObj::Generator { .. }) => return Ok(v.clone()),
             _ => {
                 let items = self.iter_items(v)?;
                 IterState::Seq { items, idx: 0 }
@@ -1745,6 +1833,11 @@ impl PyHost {
                 Err(format!(
                     "AttributeError: '{class}' object has no attribute '{name}'"
                 ))
+            }
+            Some(PyObj::Builtin(n)) if name == "__name__" => {
+                // `type(x).__name__` — the builtin/type object's name.
+                let n = n.clone();
+                Ok(self.new_str(n))
             }
             _ => {
                 // Builtin type method: hand back a bound builtin method.
@@ -1980,11 +2073,6 @@ pub fn run_user_func(
     kwargs: Vec<(String, Value)>,
 ) -> Result<Value, String> {
     let def = with_host(|h| h.funcs[fv.def_id].clone());
-    if def.is_generator {
-        return Err(type_error(
-            "generator functions are not yet supported (see BUGS.md)",
-        ));
-    }
     let self_val = self_opt.or_else(|| fv.bound.clone());
     let mut pos = args;
     if let Some(s) = &self_val {
@@ -1993,10 +2081,16 @@ pub fn run_user_func(
     let env = new_env(fv.env.clone());
     bind_params(&env, &def, &fv.defaults, pos, kwargs)?;
     let owner = owner_opt.or_else(|| fv.owner.clone());
+    // Generator function: build a suspended coroutine over the already-bound
+    // frame; nothing of the body runs until the first `next`/iteration.
+    if def.is_generator {
+        return Ok(make_generator(def.chunk.clone(), env, self_val, owner));
+    }
     with_host(|h| {
         h.frames.push(Frame {
             env,
             globals_decl: HashSet::new(),
+            nonlocals_decl: HashSet::new(),
             self_obj: self_val,
             owner,
         })
@@ -2126,6 +2220,7 @@ pub fn build_class(name: &str, bases: Vec<String>, body_func: &Value) -> Result<
         h.frames.push(Frame {
             env: env.clone(),
             globals_decl: HashSet::new(),
+            nonlocals_decl: HashSet::new(),
             self_obj: None,
             owner: Some(name.to_string()),
         })
@@ -2183,6 +2278,140 @@ fn join_exc(class: &str, msg: &str) -> String {
     } else {
         format!("{class}: {msg}")
     }
+}
+
+// ── generators (stackful coroutines, same-thread via corosensei) ─────────────
+
+impl PyHost {
+    /// Swap the volatile execution context in one shot, returning the previous
+    /// one — used to install a generator's context on resume and pull it back
+    /// out on suspend/return, keeping caller and generator states isolated.
+    fn install_gen_ctx(&mut self, mut c: GenContext) -> GenContext {
+        std::mem::swap(&mut self.frames, &mut c.frames);
+        std::mem::swap(&mut self.error, &mut c.error);
+        std::mem::swap(&mut self.exc, &mut c.exc);
+        std::mem::swap(&mut self.signal, &mut c.signal);
+        c
+    }
+}
+
+/// Build a suspended generator whose body is `chunk`, run in a frame with the
+/// already-bound `env`. Nothing executes until the first `gen_resume`.
+fn make_generator(chunk: Chunk, env: Env, self_val: Option<Value>, owner: Option<String>) -> Value {
+    let frame = Frame {
+        env,
+        globals_decl: HashSet::new(),
+        nonlocals_decl: HashSet::new(),
+        self_obj: self_val,
+        owner,
+    };
+    let id = with_host(|h| {
+        let id = h.generators.len() as u32;
+        h.generators.push(GenCell {
+            coro: None,
+            yielder: std::ptr::null(),
+            ctx: GenContext {
+                frames: vec![frame],
+                ..GenContext::default()
+            },
+            done: false,
+        });
+        id
+    });
+    let coro = corosensei::Coroutine::new(
+        move |yielder: &corosensei::Yielder<Value, Value>, _first: Value| {
+            // Same thread → publish the yielder so `yield` (deep inside the
+            // body's VM) can reach it. Valid for the whole body lifetime.
+            with_host(|h| h.generators[id as usize].yielder = yielder as *const _ as *const ());
+            let r = run_chunk_on(chunk);
+            // A `return` inside the body leaves a Return signal; drop it so the
+            // generator's StopIteration is clean.
+            with_host(|h| {
+                h.signal.take();
+            });
+            r.map(|_| Value::Undef)
+        },
+    );
+    with_host(|h| h.generators[id as usize].coro = Some(coro));
+    with_host(|h| h.alloc(PyObj::Generator { id }))
+}
+
+/// `yield v` — suspend the running generator, handing `v` to the resumer;
+/// returns the value the next `gen_resume(x)` supplies (a sent value, or None).
+pub fn gen_yield(v: Value) -> Result<Value, String> {
+    let id = match CUR_GEN.with(|c| c.get()) {
+        Some(id) => id,
+        None => return Err(type_error("'yield' outside a generator")),
+    };
+    let yp = with_host(|h| h.generators[id as usize].yielder);
+    // SAFETY: same-thread coroutine; the yielder lives for the whole body, and
+    // we only reach here from inside that body (its stack is live).
+    let yielder = unsafe { &*(yp as *const corosensei::Yielder<Value, Value>) };
+    Ok(yielder.suspend(v))
+}
+
+/// Resume a generator until its next `yield` or its body returns. Returns
+/// `Ok(Some(v))` for a yielded value, `Ok(None)` when exhausted, `Err` if the
+/// body raised. Preserves the shared host: the coroutine is taken out so the
+/// body re-enters `with_host` freely, and the volatile context is swapped so the
+/// caller's frames/signal survive the switch.
+pub fn gen_resume(gen: &Value, send: Value) -> Result<Option<Value>, String> {
+    let id = match with_host(|h| h.get(gen).cloned()) {
+        Some(PyObj::Generator { id }) => id,
+        _ => return Err(type_error("not a generator")),
+    };
+    if with_host(|h| h.generators[id as usize].done) {
+        return Ok(None);
+    }
+    let mut coro = match with_host(|h| h.generators[id as usize].coro.take()) {
+        Some(c) => c,
+        None => return Err("ValueError: generator already executing".into()),
+    };
+    let gen_ctx = with_host(|h| std::mem::take(&mut h.generators[id as usize].ctx));
+    let caller_ctx = with_host(|h| h.install_gen_ctx(gen_ctx));
+    let prev = CUR_GEN.with(|c| c.replace(Some(id)));
+
+    let out = coro.resume(send); // no host borrow held; body drives its own VM
+
+    CUR_GEN.with(|c| c.set(prev));
+    let gen_ctx = with_host(|h| h.install_gen_ctx(caller_ctx));
+    with_host(|h| {
+        h.generators[id as usize].ctx = gen_ctx;
+        h.generators[id as usize].coro = Some(coro);
+    });
+
+    match out {
+        corosensei::CoroutineResult::Yield(y) => Ok(Some(y)),
+        corosensei::CoroutineResult::Return(r) => {
+            with_host(|h| h.generators[id as usize].done = true);
+            match r {
+                Ok(_) => Ok(None),
+                Err(e) => Err(e),
+            }
+        }
+    }
+}
+
+/// Materialize any iterable — including a generator — into a `Vec`. Unlike the
+/// `&mut self` `iter_items`, this holds NO host borrow across a generator
+/// resume, so it is safe for generator-typed operands.
+pub fn iter_vec(v: &Value) -> Result<Vec<Value>, String> {
+    if with_host(|h| matches!(h.get(v), Some(PyObj::Generator { .. }))) {
+        let mut out = Vec::new();
+        while let Some(x) = gen_resume(v, Value::Undef)? {
+            out.push(x);
+        }
+        return Ok(out);
+    }
+    with_host(|h| h.iter_items(v))
+}
+
+/// Advance any iterator — including a generator — by one step.
+pub fn iter_step(it: &Value) -> Result<Option<Value>, String> {
+    if with_host(|h| matches!(h.get(it), Some(PyObj::Generator { .. }))) {
+        return gen_resume(it, Value::Undef);
+    }
+    with_host(|h| h.iter_next(it))
 }
 
 /// Import a module by name. A small built-in set is supported; unknown modules

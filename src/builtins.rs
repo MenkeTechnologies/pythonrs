@@ -58,6 +58,19 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::ASSERT_FAIL, b_assert_fail);
     vm.register_builtin(ops::TRY, b_try);
     vm.register_builtin(ops::DBG_LINE, b_dbg_line);
+    vm.register_builtin(ops::YIELDV, b_yieldv);
+    vm.register_builtin(ops::DECLARE_NONLOCAL, b_declare_nonlocal);
+    vm.register_builtin(ops::CALL_EX, b_call_ex);
+    vm.register_builtin(ops::CALL_VALUE_EX, b_call_value_ex);
+    vm.register_builtin(ops::CALL_METHOD_EX, b_call_method_ex);
+    vm.register_builtin(ops::BUILD_ARGS, b_build_args);
+    vm.register_builtin(ops::BUILD_KWARGS, b_build_kwargs);
+    vm.register_builtin(ops::MKDICT_EX, b_mkdict_ex);
+    vm.register_builtin(ops::MATCH_SEQ, b_match_seq);
+    vm.register_builtin(ops::MATCH_MAP_CHECK, b_match_map_check);
+    vm.register_builtin(ops::MATCH_KEY, b_match_key);
+    vm.register_builtin(ops::MATCH_MAP_REST, b_match_map_rest);
+    vm.register_builtin(ops::MATCH_CLASS, b_match_class);
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -150,6 +163,12 @@ fn b_setglobal(vm: &mut VM, _: u8) -> Value {
 fn b_declare_global(vm: &mut VM, _: u8) -> Value {
     let name = sval(&vm.pop());
     with_host(|h| h.declare_global(&name));
+    Value::Undef
+}
+
+fn b_declare_nonlocal(vm: &mut VM, _: u8) -> Value {
+    let name = sval(&vm.pop());
+    with_host(|h| h.declare_nonlocal(&name));
     Value::Undef
 }
 
@@ -341,6 +360,137 @@ fn b_call_value_kw(vm: &mut VM, argc: u8) -> Value {
     finish(vm, r)
 }
 
+// ── generators ────────────────────────────────────────────────────────────────
+
+fn b_yieldv(vm: &mut VM, _: u8) -> Value {
+    let v = vm.pop();
+    match host::gen_yield(v) {
+        Ok(sent) => sent,
+        Err(e) => abort(vm, e),
+    }
+}
+
+// ── call-site * / ** unpacking (EX ops) ───────────────────────────────────────
+
+/// Positional args from a `list` value.
+fn list_args(v: &Value) -> Vec<Value> {
+    with_host(|h| match h.get(v) {
+        Some(PyObj::List(l)) => l.clone(),
+        _ => Vec::new(),
+    })
+}
+
+fn b_call_ex(vm: &mut VM, _: u8) -> Value {
+    let kwd = vm.pop();
+    let argl = vm.pop();
+    let name = sval(&vm.pop());
+    let r = host::call_named(&name, list_args(&argl), kw_pairs(&kwd));
+    finish(vm, r)
+}
+
+fn b_call_value_ex(vm: &mut VM, _: u8) -> Value {
+    let kwd = vm.pop();
+    let argl = vm.pop();
+    let callable = vm.pop();
+    let r = host::invoke(&callable, list_args(&argl), kw_pairs(&kwd));
+    finish(vm, r)
+}
+
+fn b_call_method_ex(vm: &mut VM, _: u8) -> Value {
+    let kwd = vm.pop();
+    let argl = vm.pop();
+    let name = sval(&vm.pop());
+    let recv = vm.pop();
+    let r = host::call_method(&recv, &name, list_args(&argl), kw_pairs(&kwd));
+    finish(vm, r)
+}
+
+/// Flatten a positional-arg spread: pairs `(tag, value)`, tag 1 = `*` spread.
+fn b_build_args(vm: &mut VM, argc: u8) -> Value {
+    let flat = pop_n(vm, argc as usize);
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 1 < flat.len() {
+        let spread = matches!(flat[i], Value::Int(1));
+        let val = flat[i + 1].clone();
+        if spread {
+            match host::iter_vec(&val) {
+                Ok(items) => out.extend(items),
+                Err(e) => return abort(vm, e),
+            }
+        } else {
+            out.push(val);
+        }
+        i += 2;
+    }
+    with_host(|h| h.new_list(out))
+}
+
+/// Build a kwargs `dict`: pairs `(key, value)`, a `None`(Undef) key = `**` spread.
+fn b_build_kwargs(vm: &mut VM, argc: u8) -> Value {
+    let flat = pop_n(vm, argc as usize);
+    let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+    let mut i = 0;
+    while i + 1 < flat.len() {
+        let key = flat[i].clone();
+        let val = flat[i + 1].clone();
+        if matches!(key, Value::Undef) {
+            // **mapping spread — copy each str key/value.
+            let pairs = with_host(|h| match h.get(&val) {
+                Some(PyObj::Dict(m)) => m
+                    .iter()
+                    .map(|(k, (kv, v))| (k.clone(), kv.clone(), v.clone()))
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            });
+            for (k, kv, v) in pairs {
+                d.insert(k, (kv, v));
+            }
+        } else {
+            let kstr = sval(&key);
+            let kv = with_host(|h| h.new_str(kstr.clone()));
+            d.insert(PKey::Str(kstr), (kv, val));
+        }
+        i += 2;
+    }
+    with_host(|h| h.new_dict(d))
+}
+
+/// Build a dict from `{**a, k: v}` literal entries: triples `(tag, a, b)` where
+/// tag 1 = `**` spread of `a` (b unused), tag 0 = plain `(key a, val b)`.
+fn b_mkdict_ex(vm: &mut VM, argc: u8) -> Value {
+    let flat = pop_n(vm, argc as usize);
+    let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+    let mut i = 0;
+    while i + 2 < flat.len() {
+        let spread = matches!(flat[i], Value::Int(1));
+        if spread {
+            let m = flat[i + 1].clone();
+            let pairs = with_host(|h| match h.get(&m) {
+                Some(PyObj::Dict(map)) => map
+                    .iter()
+                    .map(|(k, (kv, v))| (k.clone(), kv.clone(), v.clone()))
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            });
+            for (k, kv, v) in pairs {
+                d.insert(k, (kv, v));
+            }
+        } else {
+            let k = flat[i + 1].clone();
+            let v = flat[i + 2].clone();
+            match with_host(|h| h.to_key(&k)) {
+                Ok(key) => {
+                    d.insert(key, (k, v));
+                }
+                Err(e) => return abort(vm, e),
+            }
+        }
+        i += 3;
+    }
+    with_host(|h| h.new_dict(d))
+}
+
 // ── truthiness / str / format ────────────────────────────────────────────────
 
 fn b_truthy(vm: &mut VM, _: u8) -> Value {
@@ -496,7 +646,7 @@ fn b_foriter(vm: &mut VM, _: u8) -> Value {
         Some(v) => v.clone(),
         None => return abort(vm, "internal: FORITER with empty stack".into()),
     };
-    match with_host(|h| h.iter_next(&it)) {
+    match host::iter_step(&it) {
         Ok(Some(v)) => {
             vm.push(v);
             Value::Bool(true)
@@ -511,6 +661,13 @@ fn b_foriter(vm: &mut VM, _: u8) -> Value {
 fn b_contains(vm: &mut VM, _: u8) -> Value {
     let container = vm.pop();
     let item = vm.pop();
+    // A generator is consumed to test membership (no host borrow held).
+    if with_host(|h| matches!(h.get(&container), Some(PyObj::Generator { .. }))) {
+        return match host::iter_vec(&container) {
+            Ok(items) => Value::Bool(with_host(|h| items.iter().any(|x| h.equal(x, &item)))),
+            Err(e) => abort(vm, e),
+        };
+    }
     let r = with_host(|h| h.contains(&item, &container));
     match r {
         Ok(b) => Value::Bool(b),
@@ -726,7 +883,7 @@ fn b_unpack(vm: &mut VM, _: u8) -> Value {
         _ => 0,
     };
     let iterable = vm.pop();
-    let items = match with_host(|h| h.iter_items(&iterable)) {
+    let items = match host::iter_vec(&iterable) {
         Ok(v) => v,
         Err(e) => return abort(vm, e),
     };
@@ -863,6 +1020,165 @@ fn b_try(vm: &mut VM, _: u8) -> Value {
         vm.ip = vm.chunk.ops.len();
     }
     Value::Undef
+}
+
+// ── match / case structural helpers ───────────────────────────────────────────
+
+/// `[subject, count, star]` -> on match push the `count` destructured elements
+/// as a `list` then `Bool(true)`; on mismatch just `Bool(false)`. Sequence
+/// patterns match `list`/`tuple` (not str/bytes/dict/set), mirroring PEP 634.
+fn b_match_seq(vm: &mut VM, _: u8) -> Value {
+    let star = match vm.pop() {
+        Value::Int(n) => n,
+        _ => -1,
+    };
+    let count = match vm.pop() {
+        Value::Int(n) => n as usize,
+        _ => 0,
+    };
+    let subject = vm.pop();
+    let items = with_host(|h| match h.get(&subject) {
+        Some(PyObj::List(l)) | Some(PyObj::Tuple(l)) => Some(l.clone()),
+        _ => None,
+    });
+    let items = match items {
+        Some(v) => v,
+        None => return Value::Bool(false),
+    };
+    let ordered: Vec<Value> = if star < 0 {
+        if items.len() != count {
+            return Value::Bool(false);
+        }
+        items
+    } else {
+        let si = star as usize;
+        let after = count - si - 1;
+        if items.len() < si + after {
+            return Value::Bool(false);
+        }
+        let mid = items[si..items.len() - after].to_vec();
+        let mid_list = with_host(|h| h.new_list(mid));
+        let mut out = Vec::with_capacity(count);
+        out.extend_from_slice(&items[..si]);
+        out.push(mid_list);
+        out.extend_from_slice(&items[items.len() - after..]);
+        out
+    };
+    let list = with_host(|h| h.new_list(ordered));
+    vm.push(list);
+    Value::Bool(true)
+}
+
+/// `[subject]` -> `Bool` (is a mapping — a dict).
+fn b_match_map_check(vm: &mut VM, _: u8) -> Value {
+    let subject = vm.pop();
+    Value::Bool(with_host(|h| {
+        matches!(h.get(&subject), Some(PyObj::Dict(_)))
+    }))
+}
+
+/// `[subject, key]` -> on hit push `value` then `Bool(true)`; else `Bool(false)`.
+fn b_match_key(vm: &mut VM, _: u8) -> Value {
+    let key = vm.pop();
+    let subject = vm.pop();
+    let k = match with_host(|h| h.to_key(&key)) {
+        Ok(k) => k,
+        Err(e) => return abort(vm, e),
+    };
+    let got = with_host(|h| match h.get(&subject) {
+        Some(PyObj::Dict(d)) => d.get(&k).map(|(_, v)| v.clone()),
+        _ => None,
+    });
+    match got {
+        Some(v) => {
+            vm.push(v);
+            Value::Bool(true)
+        }
+        None => Value::Bool(false),
+    }
+}
+
+/// `[subject, keylist]` -> a new dict of `subject` minus the matched keys.
+fn b_match_map_rest(vm: &mut VM, _: u8) -> Value {
+    let keylist = vm.pop();
+    let subject = vm.pop();
+    let keys = match host::iter_vec(&keylist) {
+        Ok(ks) => ks,
+        Err(e) => return abort(vm, e),
+    };
+    let mut d = with_host(|h| match h.get(&subject) {
+        Some(PyObj::Dict(d)) => d.clone(),
+        _ => IndexMap::new(),
+    });
+    for kv in &keys {
+        if let Ok(k) = with_host(|h| h.to_key(kv)) {
+            d.shift_remove(&k);
+        }
+    }
+    with_host(|h| h.new_dict(d))
+}
+
+/// `[subject, class, npos, kwnames...]` -> on match push extracted sub-values
+/// (positional via `__match_args__` / builtin self-match, then keyword via
+/// attributes) as a `list`, then `Bool(true)`; else `Bool(false)`.
+fn b_match_class(vm: &mut VM, argc: u8) -> Value {
+    let all = pop_n(vm, argc as usize);
+    if all.len() < 3 {
+        return abort(vm, "internal: MATCH_CLASS arity".into());
+    }
+    let subject = all[0].clone();
+    let class = all[1].clone();
+    let npos = match all[2] {
+        Value::Int(n) => n as usize,
+        _ => 0,
+    };
+    let kwnames: Vec<String> = all[3..].iter().map(sval).collect();
+    if !with_host(|h| isinstance(h, &subject, &class)) {
+        return Value::Bool(false);
+    }
+    let cname = with_host(|h| callable_name(h, &class)).unwrap_or_default();
+    let mut vals: Vec<Value> = Vec::new();
+    if npos > 0 {
+        if is_builtin_type(&cname) {
+            // Builtin types (int, str, …) allow a single positional self-match.
+            vals.push(subject.clone());
+        } else {
+            let margs = with_host(|h| h.class_lookup(&cname, "__match_args__"));
+            let names: Vec<String> = match margs {
+                Some(v) => match host::iter_vec(&v) {
+                    Ok(items) => items.iter().map(sval).collect(),
+                    Err(e) => return abort(vm, e),
+                },
+                None => {
+                    return abort(
+                        vm,
+                        host::type_error(&format!(
+                            "{cname}() accepts 0 positional sub-patterns ({npos} given)"
+                        )),
+                    )
+                }
+            };
+            for i in 0..npos {
+                let attr = match names.get(i) {
+                    Some(a) => a.clone(),
+                    None => return Value::Bool(false),
+                };
+                match with_host(|h| h.get_attr(&subject, &attr)) {
+                    Ok(v) => vals.push(v),
+                    Err(_) => return Value::Bool(false),
+                }
+            }
+        }
+    }
+    for name in &kwnames {
+        match with_host(|h| h.get_attr(&subject, name)) {
+            Ok(v) => vals.push(v),
+            Err(_) => return Value::Bool(false),
+        }
+    }
+    let list = with_host(|h| h.new_list(vals));
+    vm.push(list);
+    Value::Bool(true)
 }
 
 fn synth_exc(h: &mut host::PyHost, err: &str) -> Value {
@@ -1155,7 +1471,7 @@ pub fn call_builtin_function(
         "min" => reduce_minmax(&args, &kwargs, false),
         "max" => reduce_minmax(&args, &kwargs, true),
         "sum" => {
-            let items = with_host(|h| h.iter_items(&arg0(&args)?))?;
+            let items = host::iter_vec(&arg0(&args)?)?;
             let mut acc = args.get(1).cloned().unwrap_or(Value::Int(0));
             for it in items {
                 acc = with_host(|h| h.arith(NumOp::Add, &acc, &it))?;
@@ -1164,12 +1480,12 @@ pub fn call_builtin_function(
         }
         "sorted" => py_sorted(&args, &kwargs),
         "reversed" => {
-            let mut items = with_host(|h| h.iter_items(&arg0(&args)?))?;
+            let mut items = host::iter_vec(&arg0(&args)?)?;
             items.reverse();
             Ok(with_host(|h| h.new_list(items)))
         }
         "enumerate" => {
-            let items = with_host(|h| h.iter_items(&arg0(&args)?))?;
+            let items = host::iter_vec(&arg0(&args)?)?;
             let start = args
                 .get(1)
                 .and_then(|v| with_host(|h| h.as_int(v)))
@@ -1186,7 +1502,7 @@ pub fn call_builtin_function(
         "zip" => {
             let mut seqs = Vec::new();
             for a in &args {
-                seqs.push(with_host(|h| h.iter_items(a))?);
+                seqs.push(host::iter_vec(a)?);
             }
             let n = seqs.iter().map(|s| s.len()).min().unwrap_or(0);
             let mut out = Vec::new();
@@ -1200,7 +1516,7 @@ pub fn call_builtin_function(
             let f = arg0(&args)?;
             let mut seqs = Vec::new();
             for a in &args[1..] {
-                seqs.push(with_host(|h| h.iter_items(a))?);
+                seqs.push(host::iter_vec(a)?);
             }
             let n = seqs.iter().map(|s| s.len()).min().unwrap_or(0);
             let mut out = Vec::new();
@@ -1212,7 +1528,7 @@ pub fn call_builtin_function(
         }
         "filter" => {
             let f = arg0(&args)?;
-            let items = with_host(|h| h.iter_items(&args[1]))?;
+            let items = host::iter_vec(&args[1])?;
             let mut out = Vec::new();
             for it in items {
                 let keep = if matches!(f, Value::Undef) {
@@ -1228,13 +1544,13 @@ pub fn call_builtin_function(
             Ok(with_host(|h| h.new_list(out)))
         }
         "any" => {
-            let items = with_host(|h| h.iter_items(&arg0(&args)?))?;
+            let items = host::iter_vec(&arg0(&args)?)?;
             Ok(Value::Bool(
                 items.iter().any(|x| with_host(|h| h.truthy(x))),
             ))
         }
         "all" => {
-            let items = with_host(|h| h.iter_items(&arg0(&args)?))?;
+            let items = host::iter_vec(&arg0(&args)?)?;
             Ok(Value::Bool(
                 items.iter().all(|x| with_host(|h| h.truthy(x))),
             ))
@@ -1359,7 +1675,7 @@ pub fn call_builtin_function(
         }
         "next" => {
             let it = arg0(&args)?;
-            match with_host(|h| h.iter_next(&it))? {
+            match host::iter_step(&it)? {
                 Some(v) => Ok(v),
                 None => match args.get(1) {
                     Some(d) => Ok(d.clone()),
@@ -1409,21 +1725,21 @@ pub fn call_builtin_function(
         }
         "list" => {
             let items = match args.first() {
-                Some(v) => with_host(|h| h.iter_items(v))?,
+                Some(v) => host::iter_vec(v)?,
                 None => vec![],
             };
             Ok(with_host(|h| h.new_list(items)))
         }
         "tuple" => {
             let items = match args.first() {
-                Some(v) => with_host(|h| h.iter_items(v))?,
+                Some(v) => host::iter_vec(v)?,
                 None => vec![],
             };
             Ok(with_host(|h| h.new_tuple(items)))
         }
         "set" | "frozenset" => {
             let items = match args.first() {
-                Some(v) => with_host(|h| h.iter_items(v))?,
+                Some(v) => host::iter_vec(v)?,
                 None => vec![],
             };
             let mut s: IndexMap<PKey, Value> = IndexMap::new();
@@ -1528,7 +1844,7 @@ fn reduce_minmax(
     want_max: bool,
 ) -> Result<Value, String> {
     let items = if args.len() == 1 {
-        with_host(|h| h.iter_items(&args[0]))?
+        host::iter_vec(&args[0])?
     } else {
         args.to_vec()
     };
@@ -1564,7 +1880,7 @@ fn eval_key(key: &Option<Value>, v: &Value) -> Result<Value, String> {
 }
 
 fn py_sorted(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, String> {
-    let mut items = with_host(|h| h.iter_items(&arg0(args)?))?;
+    let mut items = host::iter_vec(&arg0(args)?)?;
     let key = kw_get(kwargs, "key");
     let reverse = kw_get(kwargs, "reverse")
         .map(|v| with_host(|h| h.truthy(&v)))
@@ -1701,9 +2017,9 @@ fn construct_dict(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, S
                 }
             });
         } else {
-            let pairs = with_host(|h| h.iter_items(v))?;
+            let pairs = host::iter_vec(v)?;
             for p in pairs {
-                let kv = with_host(|h| h.iter_items(&p))?;
+                let kv = host::iter_vec(&p)?;
                 if kv.len() == 2 {
                     let key = with_host(|h| h.to_key(&kv[0]))?;
                     d.insert(key, (kv[0].clone(), kv[1].clone()));
@@ -2066,7 +2382,7 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             Ok(with_host(|h| h.new_list(parts)))
         }
         "join" => {
-            let items = with_host(|h| h.iter_items(&args[0]))?;
+            let items = host::iter_vec(&args[0])?;
             let mut strs = Vec::new();
             for it in items {
                 strs.push(
@@ -2276,7 +2592,7 @@ fn list_method(
             Ok(Value::Undef)
         }
         "extend" => {
-            let items = with_host(|h| h.iter_items(&arg0(args)?))?;
+            let items = host::iter_vec(&arg0(args)?)?;
             with_host(|h| {
                 if let Some(PyObj::List(l)) = h.get_mut(recv) {
                     l.extend(items);
@@ -2610,7 +2926,7 @@ fn set_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             Ok(with_host(|h| h.new_set(s)))
         }
         "update" => {
-            let items = with_host(|h| h.iter_items(&arg0(args)?))?;
+            let items = host::iter_vec(&arg0(args)?)?;
             for it in items {
                 let k = with_host(|h| h.to_key(&it))?;
                 with_host(|h| {

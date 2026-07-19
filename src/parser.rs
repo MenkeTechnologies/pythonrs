@@ -155,6 +155,9 @@ impl Parser {
                 "try" => return self.parse_try(out, line),
                 "with" => return self.parse_with(out, line, false),
                 "async" => return self.parse_async(out, line),
+                // `match` is a soft keyword: only a match statement when the
+                // logical line ends in a `:` NEWLINE INDENT `case` shape.
+                "match" if self.looks_like_match() => return self.parse_match(out, line),
                 _ => {}
             }
         }
@@ -674,6 +677,270 @@ impl Parser {
             line,
         ));
         Ok(())
+    }
+
+    // ── match / case (PEP 634) ────────────────────────────────────────────
+    /// Disambiguate the soft keyword `match`: it starts a match statement only
+    /// when the logical line has a top-level `:` immediately followed by
+    /// `NEWLINE INDENT case`. Otherwise `match` is an ordinary identifier.
+    fn looks_like_match(&self) -> bool {
+        let mut i = self.pos + 1;
+        // Must be followed by something that can begin the subject expression.
+        match self.toks.get(i).map(|t| &t.tok) {
+            Some(Tok::Op(o)) if o == "=" || o == ":" || o == "." || o == ";" || o == "," => {
+                return false
+            }
+            Some(Tok::Newline) | Some(Tok::Eof) | None => return false,
+            _ => {}
+        }
+        let mut depth = 0i32;
+        while let Some(t) = self.toks.get(i) {
+            match &t.tok {
+                Tok::Op(o) if o == "(" || o == "[" || o == "{" => depth += 1,
+                Tok::Op(o) if o == ")" || o == "]" || o == "}" => depth -= 1,
+                Tok::Op(o) if o == ":" && depth == 0 => {
+                    return matches!(self.toks.get(i + 1).map(|t| &t.tok), Some(Tok::Newline))
+                        && matches!(self.toks.get(i + 2).map(|t| &t.tok), Some(Tok::Indent))
+                        && matches!(self.toks.get(i + 3).map(|t| &t.tok), Some(Tok::Name(n)) if n == "case");
+                }
+                Tok::Newline | Tok::Eof => return false,
+                _ => {}
+            }
+            i += 1;
+        }
+        false
+    }
+
+    fn parse_match(&mut self, out: &mut Vec<Stmt>, line: u32) -> Result<(), String> {
+        self.advance(); // match
+        let subject = self.parse_exprlist()?;
+        self.expect_op(":")?;
+        self.skip_newlines();
+        if !matches!(self.cur(), Tok::Indent) {
+            return Err(format!(
+                "IndentationError: expected an indented block after 'match' (line {})",
+                self.line()
+            ));
+        }
+        self.advance(); // Indent
+        let mut cases = Vec::new();
+        while self.at_kw("case") {
+            self.advance(); // case
+            let pattern = self.parse_patterns()?;
+            let guard = if self.eat_kw("if") {
+                Some(self.parse_namedexpr()?)
+            } else {
+                None
+            };
+            let body = self.parse_suite()?;
+            self.skip_newlines();
+            cases.push(MatchCase {
+                pattern,
+                guard,
+                body,
+            });
+        }
+        if matches!(self.cur(), Tok::Dedent) {
+            self.advance();
+        }
+        out.push(Stmt::new(StmtKind::Match { subject, cases }, line));
+        Ok(())
+    }
+
+    /// Top-level pattern for a `case`: an open sequence (`case 1, 2`) or a single
+    /// OR-pattern.
+    fn parse_patterns(&mut self) -> Result<Pattern, String> {
+        let first = self.parse_or_pattern()?;
+        if self.at_op(",") {
+            let mut elems = vec![first];
+            while self.eat_op(",") {
+                if self.at_op(":") || self.at_kw("if") {
+                    break;
+                }
+                elems.push(self.parse_or_pattern()?);
+            }
+            let star = elems.iter().position(|p| matches!(p, Pattern::Star(_)));
+            Ok(Pattern::Sequence { elems, star })
+        } else {
+            Ok(first)
+        }
+    }
+
+    fn parse_or_pattern(&mut self) -> Result<Pattern, String> {
+        let first = self.parse_as_pattern()?;
+        if self.at_op("|") {
+            let mut alts = vec![first];
+            while self.eat_op("|") {
+                alts.push(self.parse_as_pattern()?);
+            }
+            Ok(Pattern::Or(alts))
+        } else {
+            Ok(first)
+        }
+    }
+
+    fn parse_as_pattern(&mut self) -> Result<Pattern, String> {
+        let p = self.parse_closed_pattern()?;
+        if self.eat_kw("as") {
+            let name = self.expect_name()?;
+            Ok(Pattern::As(Box::new(p), name))
+        } else {
+            Ok(p)
+        }
+    }
+
+    fn parse_closed_pattern(&mut self) -> Result<Pattern, String> {
+        // `*name` / `*_` (only valid inside a sequence, checked structurally).
+        if self.eat_op("*") {
+            let name = if self.at_kw("_") {
+                self.advance();
+                None
+            } else {
+                Some(self.expect_name()?)
+            };
+            return Ok(Pattern::Star(name));
+        }
+        // Bracketed / parenthesized sequence pattern.
+        if self.eat_op("[") {
+            return self.parse_sequence_pattern("]");
+        }
+        if self.at_op("(") {
+            self.advance();
+            // A single parenthesized pattern is a group; commas make a sequence.
+            if self.eat_op(")") {
+                return Ok(Pattern::Sequence {
+                    elems: vec![],
+                    star: None,
+                });
+            }
+            let first = self.parse_or_pattern()?;
+            if self.at_op(",") {
+                let mut elems = vec![first];
+                while self.eat_op(",") {
+                    if self.at_op(")") {
+                        break;
+                    }
+                    elems.push(self.parse_or_pattern()?);
+                }
+                self.expect_op(")")?;
+                let star = elems.iter().position(|p| matches!(p, Pattern::Star(_)));
+                return Ok(Pattern::Sequence { elems, star });
+            }
+            self.expect_op(")")?;
+            return Ok(first);
+        }
+        // Mapping pattern.
+        if self.at_op("{") {
+            return self.parse_mapping_pattern();
+        }
+        // Literal patterns.
+        if let Some(p) = self.try_literal_pattern()? {
+            return Ok(p);
+        }
+        // Name-based: capture, wildcard, dotted value, or class pattern.
+        let name = self.expect_name()?;
+        if name == "_" {
+            return Ok(Pattern::Wildcard);
+        }
+        // Build a (possibly dotted) value expression.
+        let mut expr = Expr::Name(name);
+        let mut dotted = false;
+        while self.eat_op(".") {
+            let attr = self.expect_name()?;
+            expr = Expr::Attribute(Box::new(expr), attr);
+            dotted = true;
+        }
+        if self.at_op("(") {
+            return self.parse_class_pattern(expr);
+        }
+        if dotted {
+            Ok(Pattern::Value(expr))
+        } else {
+            match expr {
+                Expr::Name(n) => Ok(Pattern::Capture(n)),
+                _ => Ok(Pattern::Value(expr)),
+            }
+        }
+    }
+
+    fn try_literal_pattern(&mut self) -> Result<Option<Pattern>, String> {
+        // Signed numbers, strings, True/False/None.
+        if self.at_op("-") {
+            self.advance();
+            let e = self.parse_atom()?;
+            return Ok(Some(Pattern::Value(Expr::UnaryOp(UnOp::Neg, Box::new(e)))));
+        }
+        let lit = match self.cur().clone() {
+            Tok::Int(_)
+            | Tok::BigInt(_)
+            | Tok::Float(_)
+            | Tok::Complex(_)
+            | Tok::Str(_)
+            | Tok::FString(_, _)
+            | Tok::Bytes(_) => Some(self.parse_atom()?),
+            Tok::Name(n) if n == "None" || n == "True" || n == "False" => Some(self.parse_atom()?),
+            _ => None,
+        };
+        Ok(lit.map(Pattern::Value))
+    }
+
+    fn parse_sequence_pattern(&mut self, close: &str) -> Result<Pattern, String> {
+        let mut elems = Vec::new();
+        while !self.at_op(close) {
+            elems.push(self.parse_or_pattern()?);
+            if !self.eat_op(",") {
+                break;
+            }
+        }
+        self.expect_op(close)?;
+        let star = elems.iter().position(|p| matches!(p, Pattern::Star(_)));
+        Ok(Pattern::Sequence { elems, star })
+    }
+
+    fn parse_mapping_pattern(&mut self) -> Result<Pattern, String> {
+        self.advance(); // {
+        let mut keys = Vec::new();
+        let mut rest = None;
+        while !self.at_op("}") {
+            if self.eat_op("**") {
+                rest = Some(self.expect_name()?);
+                let _ = self.eat_op(",");
+                break;
+            }
+            // key is a literal or dotted value expression.
+            let key = self.parse_or()?;
+            self.expect_op(":")?;
+            let pat = self.parse_or_pattern()?;
+            keys.push((key, pat));
+            if !self.eat_op(",") {
+                break;
+            }
+        }
+        self.expect_op("}")?;
+        Ok(Pattern::Mapping { keys, rest })
+    }
+
+    fn parse_class_pattern(&mut self, cls: Expr) -> Result<Pattern, String> {
+        self.expect_op("(")?;
+        let mut pos = Vec::new();
+        let mut kw = Vec::new();
+        while !self.at_op(")") {
+            // keyword sub-pattern: name=pattern
+            if matches!(self.cur(), Tok::Name(n) if !is_keyword(n))
+                && matches!(&self.toks[self.pos + 1].tok, Tok::Op(o) if o == "=")
+            {
+                let kn = self.expect_name()?;
+                self.expect_op("=")?;
+                kw.push((kn, self.parse_or_pattern()?));
+            } else {
+                pos.push(self.parse_or_pattern()?);
+            }
+            if !self.eat_op(",") {
+                break;
+            }
+        }
+        self.expect_op(")")?;
+        Ok(Pattern::Class { cls, pos, kw })
     }
 
     fn parse_raise(&mut self, out: &mut Vec<Stmt>, line: u32) -> Result<(), String> {
