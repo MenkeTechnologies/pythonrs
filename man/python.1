@@ -1,0 +1,45 @@
+.TH PYTHON 1 "2026" "pythonrs 0.1.0" "User Commands"
+.SH NAME
+python \- Python on fusevm, a compiled Python runtime (bytecode VM + Cranelift JIT)
+.SH SYNOPSIS
+.B python
+[\fIOPTIONS\fR] [\fIFILE\fR] [\fIARGS\fR...]
+.SH DESCRIPTION
+.B pythonrs
+lexes and parses Python 3 and lowers it to
+.B fusevm
+bytecode executed on a three\-tier Cranelift JIT over a PyHost object heap.
+There is no bespoke VM or JIT; execution and codegen live in fusevm.
+.PP
+Every ordinary run transparently caches compiled bytecode in
+.I ~/.pythonrs/scripts.rkyv
+(rkyv shard); a cache hit skips lex/parse/lower entirely.
+.SH OPTIONS
+.TP
+.B \-c \fISRC\fR
+Execute a one\-liner instead of a file.
+.TP
+.B \-\-build
+Ahead\-of\-time compile the script to a standalone native executable.
+.TP
+.B \-\-dump\-bytecode
+Print the compiled fusevm bytecode for the script and exit.
+.TP
+.B \-\-repl
+Start the interactive REPL.
+.TP
+.B \-\-lsp
+Speak the Language Server Protocol over stdio.
+.TP
+.B \-\-dap
+Speak the Debug Adapter Protocol over stdio.
+.SH ENVIRONMENT
+.TP
+.B PYTHONRS_TRACE
+When set, log bytecode\-cache hit/miss to stderr.
+.SH FILES
+.TP
+.I ~/.pythonrs/scripts.rkyv
+The rkyv bytecode cache shard.
+.SH SEE ALSO
+.BR python3 (1)
