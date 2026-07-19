@@ -10,7 +10,9 @@ use pythonrs::{eval_str, host};
 fn g(src: &str, name: &str) -> String {
     eval_str(src).expect("program should run without error");
     host::with_host(|h| {
-        let v = h.read_global(name).unwrap_or_else(|| panic!("global {name} unbound"));
+        let v = h
+            .read_global(name)
+            .unwrap_or_else(|| panic!("global {name} unbound"));
         h.repr_of(&v)
     })
 }
@@ -50,7 +52,10 @@ fn lists_dicts_sets_tuples() {
     assert_eq!(g("x = [1, 2, 3] + [4]", "x"), "[1, 2, 3, 4]");
     assert_eq!(g("a = [1, 2]\na.append(3)\nx = a", "x"), "[1, 2, 3]");
     assert_eq!(g("x = {'a': 1, 'b': 2}", "x"), "{'a': 1, 'b': 2}");
-    assert_eq!(g("d = {'a': 1}\nd['b'] = 2\nx = d", "x"), "{'a': 1, 'b': 2}");
+    assert_eq!(
+        g("d = {'a': 1}\nd['b'] = 2\nx = d", "x"),
+        "{'a': 1, 'b': 2}"
+    );
     assert_eq!(g("x = sorted({3, 1, 2, 1})", "x"), "[1, 2, 3]");
     assert_eq!(g("x = (1, 2, 3)[1]", "x"), "2");
 }
@@ -70,7 +75,10 @@ fn comprehensions() {
         g("x = [i for i in range(10) if i % 2 == 0]", "x"),
         "[0, 2, 4, 6, 8]"
     );
-    assert_eq!(g("x = {i: i * i for i in range(3)}", "x"), "{0: 0, 1: 1, 2: 4}");
+    assert_eq!(
+        g("x = {i: i * i for i in range(3)}", "x"),
+        "{0: 0, 1: 1, 2: 4}"
+    );
     assert_eq!(
         g("x = [y for row in [[1, 2], [3, 4]] for y in row]", "x"),
         "[1, 2, 3, 4]"
@@ -79,12 +87,12 @@ fn comprehensions() {
 
 #[test]
 fn functions_defaults_varargs() {
+    assert_eq!(g("def f(a, b=10):\n    return a + b\nx = f(5)", "x"), "15");
     assert_eq!(
-        g("def f(a, b=10):\n    return a + b\nx = f(5)", "x"),
-        "15"
-    );
-    assert_eq!(
-        g("def f(*args):\n    return sum(args)\nx = f(1, 2, 3, 4)", "x"),
+        g(
+            "def f(*args):\n    return sum(args)\nx = f(1, 2, 3, 4)",
+            "x"
+        ),
         "10"
     );
     assert_eq!(
@@ -96,7 +104,10 @@ fn functions_defaults_varargs() {
 #[test]
 fn closures() {
     assert_eq!(
-        g("def make(n):\n    def add(x):\n        return x + n\n    return add\nx = make(10)(5)", "x"),
+        g(
+            "def make(n):\n    def add(x):\n        return x + n\n    return add\nx = make(10)(5)",
+            "x"
+        ),
         "15"
     );
 }
@@ -114,10 +125,7 @@ class B(A):
         return self.v * 3
 x = B(7).go()";
     assert_eq!(g(src, "x"), "21");
-    assert_eq!(
-        g("class A:\n    pass\nx = isinstance(A(), A)", "x"),
-        "True"
-    );
+    assert_eq!(g("class A:\n    pass\nx = isinstance(A(), A)", "x"), "True");
 }
 
 #[test]
@@ -133,29 +141,47 @@ finally:
 x = y + '/' + w";
     assert_eq!(g(src, "x"), "'caught/done'");
     assert_eq!(
-        g("try:\n    raise ValueError('boom')\nexcept ValueError as e:\n    x = str(e)", "x"),
+        g(
+            "try:\n    raise ValueError('boom')\nexcept ValueError as e:\n    x = str(e)",
+            "x"
+        ),
         "'boom'"
     );
 }
 
 #[test]
 fn builtins_and_hof() {
-    assert_eq!(g("x = list(map(lambda n: n * 2, [1, 2, 3]))", "x"), "[2, 4, 6]");
-    assert_eq!(g("x = list(filter(lambda n: n > 2, [1, 2, 3, 4]))", "x"), "[3, 4]");
+    assert_eq!(
+        g("x = list(map(lambda n: n * 2, [1, 2, 3]))", "x"),
+        "[2, 4, 6]"
+    );
+    assert_eq!(
+        g("x = list(filter(lambda n: n > 2, [1, 2, 3, 4]))", "x"),
+        "[3, 4]"
+    );
     assert_eq!(g("x = sorted([3, 1, 2], reverse=True)", "x"), "[3, 2, 1]");
     assert_eq!(g("x = max([1, 5, 3], key=lambda n: -n)", "x"), "1");
     assert_eq!(g("x = sum(range(101))", "x"), "5050");
-    assert_eq!(g("x = list(enumerate(['a', 'b']))", "x"), "[(0, 'a'), (1, 'b')]");
+    assert_eq!(
+        g("x = list(enumerate(['a', 'b']))", "x"),
+        "[(0, 'a'), (1, 'b')]"
+    );
 }
 
 #[test]
 fn control_flow() {
     assert_eq!(
-        g("x = 0\nfor i in range(5):\n    if i == 3:\n        break\n    x += i", "x"),
+        g(
+            "x = 0\nfor i in range(5):\n    if i == 3:\n        break\n    x += i",
+            "x"
+        ),
         "3"
     );
     assert_eq!(
-        g("x = []\nfor i in range(5):\n    if i % 2:\n        continue\n    x.append(i)", "x"),
+        g(
+            "x = []\nfor i in range(5):\n    if i % 2:\n        continue\n    x.append(i)",
+            "x"
+        ),
         "[0, 2, 4]"
     );
     assert_eq!(g("x = 'yes' if 5 > 3 else 'no'", "x"), "'yes'");

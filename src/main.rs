@@ -73,7 +73,11 @@ fn dump(file: &str) -> Result<(), String> {
     let prog = pythonrs::compile(&src)?;
     println!("== main ==\n{:#?}", prog.main.ops);
     for (name, m) in &prog.functions {
-        println!("== def {name} ({}) ==\n{:#?}", m.params.join(", "), m.chunk.ops);
+        println!(
+            "== def {name} ({}) ==\n{:#?}",
+            m.params.join(", "),
+            m.chunk.ops
+        );
     }
     for (i, p) in prog.procs.iter().enumerate() {
         println!("== block #{i} ==\n{:#?}", p.chunk.ops);

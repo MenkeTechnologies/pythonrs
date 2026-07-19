@@ -203,12 +203,12 @@ impl Parser {
                 }
                 "return" => {
                     self.advance();
-                    let v = if self.at_newline() || self.at_op(";") || matches!(self.cur(), Tok::Eof)
-                    {
-                        None
-                    } else {
-                        Some(self.parse_exprlist()?)
-                    };
+                    let v =
+                        if self.at_newline() || self.at_op(";") || matches!(self.cur(), Tok::Eof) {
+                            None
+                        } else {
+                            Some(self.parse_exprlist()?)
+                        };
                     out.push(Stmt::new(StmtKind::Return(v), line));
                     return Ok(());
                 }
@@ -370,7 +370,10 @@ impl Parser {
         self.advance();
         let target = self.parse_target_tuple()?;
         if !self.eat_kw("in") {
-            return Err(format!("SyntaxError: expected 'in' in for (line {})", self.line()));
+            return Err(format!(
+                "SyntaxError: expected 'in' in for (line {})",
+                self.line()
+            ));
         }
         let iter = self.parse_exprlist()?;
         let body = self.parse_suite()?;
@@ -478,7 +481,9 @@ impl Parser {
         } else if self.at_kw("class") {
             self.parse_classdef(out, line, decorators)
         } else {
-            Err(format!("SyntaxError: expected def/class after decorator (line {line})"))
+            Err(format!(
+                "SyntaxError: expected def/class after decorator (line {line})"
+            ))
         }
     }
 
@@ -730,7 +735,10 @@ impl Parser {
             Some(m)
         };
         if !self.eat_kw("import") {
-            return Err(format!("SyntaxError: expected 'import' (line {})", self.line()));
+            return Err(format!(
+                "SyntaxError: expected 'import' (line {})",
+                self.line()
+            ));
         }
         let mut names = Vec::new();
         if self.eat_op("*") {
@@ -832,7 +840,10 @@ impl Parser {
             self.advance();
             let test = self.parse_or()?;
             if !self.eat_kw("else") {
-                return Err(format!("SyntaxError: ternary missing else (line {})", self.line()));
+                return Err(format!(
+                    "SyntaxError: ternary missing else (line {})",
+                    self.line()
+                ));
             }
             let orelse = self.parse_ternary()?;
             return Ok(Expr::IfExp {
@@ -920,7 +931,10 @@ impl Parser {
                     ops.push((CmpOp::NotIn, self.parse_bitor()?));
                     continue;
                 } else {
-                    return Err(format!("SyntaxError: expected 'in' after 'not' (line {})", self.line()));
+                    return Err(format!(
+                        "SyntaxError: expected 'in' after 'not' (line {})",
+                        self.line()
+                    ));
                 }
             } else {
                 break;
@@ -1473,7 +1487,10 @@ impl Parser {
             self.advance(); // for
             let target = self.parse_target_tuple()?;
             if !self.eat_kw("in") {
-                return Err(format!("SyntaxError: comprehension missing 'in' (line {})", self.line()));
+                return Err(format!(
+                    "SyntaxError: comprehension missing 'in' (line {})",
+                    self.line()
+                ));
             }
             let iter = self.parse_or()?;
             let mut ifs = Vec::new();

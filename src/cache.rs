@@ -109,7 +109,10 @@ pub fn load(src: &str) -> Option<Program> {
     let key = key_for(src);
     let verify = verify_for(src);
     let shard = load_shard();
-    let entry = shard.entries.iter().find(|e| e.key == key && e.verify == verify)?;
+    let entry = shard
+        .entries
+        .iter()
+        .find(|e| e.key == key && e.verify == verify)?;
     let cp: CProg = bincode::deserialize(&entry.blob).ok()?;
     Some(Program {
         main: cp.main,

@@ -30,17 +30,12 @@ pub fn run() {
                         DefaultPromptSegment::Basic("... ".to_string()),
                         DefaultPromptSegment::Empty,
                     );
-                    loop {
-                        match line_editor.read_line(&cont_prompt) {
-                            Ok(Signal::Success(more)) => {
-                                if more.trim().is_empty() {
-                                    break;
-                                }
-                                buffer.push('\n');
-                                buffer.push_str(&more);
-                            }
-                            _ => break,
+                    while let Ok(Signal::Success(more)) = line_editor.read_line(&cont_prompt) {
+                        if more.trim().is_empty() {
+                            break;
                         }
+                        buffer.push('\n');
+                        buffer.push_str(&more);
                     }
                 }
                 run_line(&buffer);
