@@ -1,0 +1,15 @@
+#compdef python
+# zsh completion for pythonrs `python`.
+_python() {
+  _arguments -s \
+    '(-c)-c[execute a one-liner]:source' \
+    '--build[AOT-compile to a native executable]' \
+    '--dump-bytecode[print lowered fusevm bytecode]' \
+    '--repl[start the interactive REPL]' \
+    '--lsp[speak LSP over stdio]' \
+    '--dap[speak DAP over stdio]' \
+    '(-h --help)'{-h,--help}'[show help]' \
+    '(-V --version)'{-V,--version}'[show version]' \
+    '*:Python file:_files -g "*.py"'
+}
+_python "$@"
