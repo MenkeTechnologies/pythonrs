@@ -12,6 +12,7 @@
 //!   - element `0` is the whole match (CPython's `m.group(0)`),
 //!   - elements `1..` are the capture groups in order,
 //!   - a group that did not participate in the match is `None` (`Value::Undef`).
+//!
 //! On **no match** the functions return `None` (`Value::Undef`), matching the
 //! falsy return of `re.match` etc.
 //! Real Match objects with `.group(n)` / `.start()` / `.span()` / `.groupdict()`
@@ -39,6 +40,8 @@
 //! Wiring (done by the parent): an `import_module` arm for `"re"` that calls
 //! [`entries`], a `call_builtin_function` arm routing `re.*` to [`call`], and the
 //! `re.` prefix added to `is_builtin_function`.
+
+#![allow(clippy::explicit_counter_loop)]
 
 use crate::host::{type_error, PyHost};
 use fusevm::Value;
@@ -100,7 +103,13 @@ fn arg_str(h: &PyHost, v: Option<&Value>) -> Option<String> {
 }
 
 /// Required string argument `pos` (0-based) of function `fname`.
-fn req_str(h: &PyHost, args: &[Value], pos: usize, fname: &str, param: &str) -> Result<String, String> {
+fn req_str(
+    h: &PyHost,
+    args: &[Value],
+    pos: usize,
+    fname: &str,
+    param: &str,
+) -> Result<String, String> {
     match arg_str(h, args.get(pos)) {
         Some(s) => Ok(s),
         None => Err(type_error(&format!(
