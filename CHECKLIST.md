@@ -172,9 +172,12 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
       `int`, ndigits → `float`; negative ndigits round ints/floats to powers of ten,
       bignum-safe; non-finite floats raise without ndigits. `round(2.5)`→`2`,
       `round(12345,-2)`→`12300`, `round(2.675,2)`→`2.67`.
-- [ ] **Numeric key equality broken** — `1`, `1.0`, `True` do NOT unify in dict/set:
-      `1.0 in {1}` → `False`; `{1,1.0,True}` → `{1,1.0,True}` (want `{1}`). Silent
-      wrong-result. **Critical.**
+- [x] **Numeric key equality** — FIXED: `to_key` canonicalizes numeric keys (bool
+      and integral floats normalize to the matching `Int`/`Big` key), so `1`, `1.0`,
+      `True` unify: `1.0 in {1}`→`True`; `{1,1.0,True}`→`{1}`. Dict/set inserts now
+      keep the FIRST key/element object (CPython semantics) via `dict_put`/`set_put`
+      across every build/merge/update/add path. Bignum ints are hashable; `float()`
+      accepts bignums and underscore-grouped literals.
 - [ ] **Complex arithmetic unusable** — `(1+2j)+(3+4j)` → `TypeError`; `complex("1+2j")`
       → `0.0j`; `(-8)**(1/3)` → `nan` (want the complex root); `.real`/`.imag`/`abs`
       all fail.

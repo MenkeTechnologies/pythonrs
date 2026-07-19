@@ -317,7 +317,7 @@ fn b_mkset(vm: &mut VM, argc: u8) -> Value {
     for it in items {
         match with_host(|h| h.to_key(&it)) {
             Ok(k) => {
-                set.insert(k, it);
+                host::set_put(&mut set, k, it);
             }
             Err(e) => return abort(vm, e),
         }
@@ -334,7 +334,7 @@ fn b_mkdict(vm: &mut VM, argc: u8) -> Value {
         let v = flat[i + 1].clone();
         match with_host(|h| h.to_key(&k)) {
             Ok(key) => {
-                d.insert(key, (k, v));
+                host::dict_put(&mut d, key, k, v);
             }
             Err(e) => return abort(vm, e),
         }
@@ -486,7 +486,7 @@ fn b_build_kwargs(vm: &mut VM, argc: u8) -> Value {
                 _ => Vec::new(),
             });
             for (k, kv, v) in pairs {
-                d.insert(k, (kv, v));
+                host::dict_put(&mut d, k, kv, v);
             }
         } else {
             let kstr = sval(&key);
@@ -516,14 +516,14 @@ fn b_mkdict_ex(vm: &mut VM, argc: u8) -> Value {
                 _ => Vec::new(),
             });
             for (k, kv, v) in pairs {
-                d.insert(k, (kv, v));
+                host::dict_put(&mut d, k, kv, v);
             }
         } else {
             let k = flat[i + 1].clone();
             let v = flat[i + 2].clone();
             match with_host(|h| h.to_key(&k)) {
                 Ok(key) => {
-                    d.insert(key, (k, v));
+                    host::dict_put(&mut d, key, k, v);
                 }
                 Err(e) => return abort(vm, e),
             }
@@ -1878,7 +1878,7 @@ pub fn call_builtin_function(
             let mut s: IndexMap<PKey, Value> = IndexMap::new();
             for it in items {
                 let k = with_host(|h| h.to_key(&it))?;
-                s.insert(k, it);
+                host::set_put(&mut s, k, it);
             }
             Ok(with_host(|h| h.new_set(s)))
         }
@@ -2301,14 +2301,25 @@ fn construct_float(args: &[Value]) -> Result<Value, String> {
         Value::Int(n) => Ok(Value::Float(*n as f64)),
         Value::Float(f) => Ok(Value::Float(*f)),
         Value::Bool(b) => Ok(Value::Float(*b as i64 as f64)),
+        Value::Obj(_) if matches!(h.get(&v), Some(PyObj::BigInt(_))) => {
+            use num_traits::ToPrimitive;
+            match h.get(&v) {
+                Some(PyObj::BigInt(b)) => Ok(Value::Float(b.to_f64().unwrap_or(f64::INFINITY))),
+                _ => unreachable!(),
+            }
+        }
         _ => {
             let s = h
                 .as_str(&v)
                 .ok_or_else(|| host::type_error("float() argument must be a string or a number"))?;
-            match s.trim() {
-                "inf" | "infinity" | "Infinity" => Ok(Value::Float(f64::INFINITY)),
-                "-inf" => Ok(Value::Float(f64::NEG_INFINITY)),
-                "nan" => Ok(Value::Float(f64::NAN)),
+            // Underscores may group digits (`float("1_000.5")`).
+            let cleaned = s.trim().replace('_', "");
+            match cleaned.as_str() {
+                "inf" | "infinity" | "Infinity" | "+inf" | "+infinity" => {
+                    Ok(Value::Float(f64::INFINITY))
+                }
+                "-inf" | "-infinity" => Ok(Value::Float(f64::NEG_INFINITY)),
+                "nan" | "+nan" | "-nan" => Ok(Value::Float(f64::NAN)),
                 t => t
                     .parse::<f64>()
                     .map(Value::Float)
@@ -2335,7 +2346,7 @@ fn construct_dict(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, S
                 let kv = host::iter_vec(&p)?;
                 if kv.len() == 2 {
                     let key = with_host(|h| h.to_key(&kv[0]))?;
-                    d.insert(key, (kv[0].clone(), kv[1].clone()));
+                    host::dict_put(&mut d, key, kv[0].clone(), kv[1].clone());
                 }
             }
         }
@@ -3209,7 +3220,7 @@ fn dict_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String
                 with_host(|h| {
                     if let Some(PyObj::Dict(d)) = h.get_mut(recv) {
                         for (k, kv, v) in pairs {
-                            d.insert(k, (kv, v));
+                            host::dict_put(d, k, kv, v);
                         }
                     }
                 });
@@ -3257,7 +3268,7 @@ fn set_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             let k = with_host(|h| h.to_key(&v))?;
             with_host(|h| {
                 if let Some(PyObj::Set(s)) = h.get_mut(recv) {
-                    s.insert(k, v);
+                    host::set_put(s, k, v);
                 }
             });
             Ok(Value::Undef)
@@ -3324,7 +3335,7 @@ fn set_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
                 let k = with_host(|h| h.to_key(&it))?;
                 with_host(|h| {
                     if let Some(PyObj::Set(s)) = h.get_mut(recv) {
-                        s.insert(k, it);
+                        host::set_put(s, k, it);
                     }
                 });
             }
@@ -3970,7 +3981,7 @@ fn fill_dict_from(target: &Value, src: &Value) -> Result<(), String> {
         with_host(|h| {
             if let Some(PyObj::Dict(d)) = h.get_mut(target) {
                 for (k, kv, v) in pairs {
-                    d.insert(k, (kv, v));
+                    host::dict_put(d, k, kv, v);
                 }
             }
         });
@@ -3987,7 +3998,7 @@ fn fill_dict_from(target: &Value, src: &Value) -> Result<(), String> {
             let (kv, v) = (pair[0].clone(), pair[1].clone());
             with_host(|h| {
                 if let Some(PyObj::Dict(d)) = h.get_mut(target) {
-                    d.insert(k, (kv, v));
+                    host::dict_put(d, k, kv, v);
                 }
             });
         }

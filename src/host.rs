@@ -115,8 +115,12 @@ pub mod unop {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PKey {
     None,
-    Bool(bool),
     Int(i64),
+    /// Integer outside the `i64` range (a normalized `BigInt`). Never overlaps
+    /// `Int`, since `norm_big` collapses any in-range bignum back to `Int`.
+    Big(num_bigint::BigInt),
+    /// A non-integral float. Integral floats normalize to `Int`/`Big` so that
+    /// `1`, `1.0`, and `True` share one key (`1.0 in {1}` → True).
     FloatBits(u64),
     Str(String),
     Tuple(Vec<PKey>),
@@ -1010,12 +1014,14 @@ impl PyHost {
     pub fn to_key(&self, v: &Value) -> Result<PKey, String> {
         Ok(match v {
             Value::Undef => PKey::None,
-            Value::Bool(b) => PKey::Bool(*b),
+            // Numbers hash by value: `1`, `1.0`, and `True` share one key.
+            Value::Bool(b) => PKey::Int(*b as i64),
             Value::Int(n) => PKey::Int(*n),
-            Value::Float(f) => PKey::FloatBits(f.to_bits()),
+            Value::Float(f) => float_pkey(*f),
             Value::Str(s) => PKey::Str((**s).clone()),
             Value::Obj(_) => match self.get(v) {
                 Some(PyObj::Str(s)) => PKey::Str(s.clone()),
+                Some(PyObj::BigInt(b)) => PKey::Big(b.clone()),
                 Some(PyObj::Tuple(items)) => {
                     let mut ks = Vec::with_capacity(items.len());
                     for it in items {
@@ -1106,6 +1112,40 @@ impl PyHost {
             _ => None,
         }
     }
+}
+
+/// Insert into a dict with CPython semantics: on a duplicate key, keep the
+/// FIRST-inserted key object but update the value (`{1: 'a', 1.0: 'b'}` → `{1: 'b'}`).
+pub fn dict_put(d: &mut IndexMap<PKey, (Value, Value)>, key: PKey, kv: Value, val: Value) {
+    use indexmap::map::Entry;
+    match d.entry(key) {
+        Entry::Occupied(mut e) => e.get_mut().1 = val,
+        Entry::Vacant(e) => {
+            e.insert((kv, val));
+        }
+    }
+}
+
+/// Insert into a set with CPython semantics: a duplicate keeps the FIRST element
+/// object (`{1, 1.0, True}` → `{1}`).
+pub fn set_put(s: &mut IndexMap<PKey, Value>, key: PKey, item: Value) {
+    s.entry(key).or_insert(item);
+}
+
+/// Canonical dict/set key for a float. An integral, finite float normalizes to
+/// the matching integer key (`Int`/`Big`) so it unifies with `int`/`bool`
+/// (`1.0 in {1}` → True); everything else keys by its raw bits.
+fn float_pkey(f: f64) -> PKey {
+    if f.is_finite() && f.fract() == 0.0 {
+        if f >= i64::MIN as f64 && f <= i64::MAX as f64 {
+            return PKey::Int(f as i64);
+        }
+        use num_traits::FromPrimitive;
+        if let Some(b) = num_bigint::BigInt::from_f64(f) {
+            return PKey::Big(b);
+        }
+    }
+    PKey::FloatBits(f.to_bits())
 }
 
 // ── integer floor-division / modulo (Python semantics, BigInt path) ──────────
@@ -2222,7 +2262,7 @@ impl PyHost {
                 let key = self.to_key(idx)?;
                 let kv = idx.clone();
                 if let Some(PyObj::Dict(d)) = self.get_mut(recv) {
-                    d.insert(key, (kv, val));
+                    dict_put(d, key, kv, val);
                 }
                 Ok(())
             }
