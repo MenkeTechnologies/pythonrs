@@ -1195,3 +1195,42 @@ fn exception_chaining() {
         "'ValueError'"
     );
 }
+
+#[test]
+fn lazy_iterators() {
+    // zip/map/filter/enumerate are lazy iterator objects, not eager lists.
+    assert_eq!(g("x = type(zip([1],[2])).__name__", "x"), "'zip'");
+    assert_eq!(g("x = type(map(str,[1])).__name__", "x"), "'map'");
+    assert_eq!(g("x = type(filter(None,[1])).__name__", "x"), "'filter'");
+    assert_eq!(g("x = type(enumerate([1])).__name__", "x"), "'enumerate'");
+    // next() drives them; they exhaust once.
+    assert_eq!(
+        g(
+            "z = zip([1,2],[3,4])\nx = (next(z), list(z), next(z, 'end'))",
+            "x"
+        ),
+        "((1, 3), [(2, 4)], 'end')"
+    );
+    assert_eq!(g("x = list(map(lambda a: a*2, [1,2,3]))", "x"), "[2, 4, 6]");
+    assert_eq!(
+        g("x = list(filter(lambda a: a % 2, range(10)))", "x"),
+        "[1, 3, 5, 7, 9]"
+    );
+    assert_eq!(
+        g("x = list(enumerate('ab', start=5))", "x"),
+        "[(5, 'a'), (6, 'b')]"
+    );
+    // reversed is a one-shot iterator, not a list.
+    assert_eq!(
+        g("r = reversed([1,2,3])\nx = (next(r), list(r))", "x"),
+        "(3, [2, 1])"
+    );
+    // Infinite source never materializes (would hang if eager).
+    assert_eq!(
+        g(
+            "def c():\n    i=0\n    while True:\n        yield i\n        i+=1\nx = list(zip(c(), ['a','b','c']))",
+            "x"
+        ),
+        "[(0, 'a'), (1, 'b'), (2, 'c')]"
+    );
+}

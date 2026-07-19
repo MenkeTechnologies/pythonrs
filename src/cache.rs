@@ -27,7 +27,9 @@ use std::path::PathBuf;
 /// cached bytecode for a `yield from` would drop the value, so it must miss.
 /// v5: `MKFUNC` carries keyword-only defaults + a count below the func id; older
 /// bytecode uses the 1-arg-only layout and must miss cleanly.
-const SCHEMA: u64 = 5;
+/// v6: `raise X from Y` now emits `RAISE` with argc 2 (cause pushed under exc);
+/// older bytecode dropped the cause, so it must miss cleanly.
+const SCHEMA: u64 = 6;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]
