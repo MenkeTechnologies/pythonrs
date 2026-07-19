@@ -1,0 +1,124 @@
+[package]
+name = "pythonrs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+authors = ["MenkeTechnologies <linux.dev25@gmail.com>"]
+description = "Python as a fusevm frontend: a lexer/parser and compiler to fusevm::Chunk on a PyHost object heap, with no bespoke VM or JIT — the first compiled standalone Python runtime"
+license = "MIT"
+repository = "https://github.com/MenkeTechnologies/pythonrs"
+homepage = "https://menketechnologies.github.io/pythonrs/"
+documentation = "https://docs.rs/pythonrs"
+readme = "README.md"
+keywords = ["python", "interpreter", "compiler", "jit", "fusevm"]
+categories = ["command-line-utilities", "compilers"]
+publish = true
+# Dev-only artifacts kept out of the published crate. Consumers get src + the
+# `python`/gen-docs/parity bins, the man page, and shell completions — not the
+# HUD site, CI config, integration-test corpus, self-test .py examples, or the
+# bug tracker. None are referenced at compile time (no include_str! into them),
+# so the packaged crate still builds and its bins run.
+exclude = [
+    "/docs/",
+    "/.github/",
+    "/tests/",
+    "/examples/",
+    "/scripts/",
+    "/BUGS.md",
+]
+
+# pythonrs is a standalone crate, not a workspace member. An explicit empty
+# `[workspace]` stops cargo walking up to the MenkeTechnologiesMeta parent.
+[workspace]
+
+[lib]
+name = "pythonrs"
+path = "src/lib.rs"
+# staticlib so an AOT object can be linked against the pythonrs runtime (the
+# extension-op dispatch + the fusevm AOT runtime) into a standalone native
+# executable via `python --build`.
+crate-type = ["rlib", "staticlib"]
+
+[[bin]]
+name = "python"
+path = "src/main.rs"
+
+# Offline generator for docs/reference.html — renders the builtin/method
+# reference (src/lsp.rs corpus) as a static page. Run before pushing Pages.
+[[bin]]
+name = "gen-docs"
+path = "src/bin/gen_docs.rs"
+
+# Differential parity harness: runs the corpus through pythonrs and the reference
+# `python3`, diffing stdout. Development tool — needs `python3` on PATH, so CI
+# never runs it; its frozen outputs live in tests/data/parity_expected.txt, which
+# tests/parity.rs replays with no `python3` installed.
+[[bin]]
+name = "parity"
+path = "src/bin/parity.rs"
+
+[dependencies]
+# Python executes on fusevm. pythonrs is a pure frontend: it lowers Python to
+# fusevm bytecode (src/compiler.rs) and hosts the Python object heap
+# (src/host.rs, reached from fusevm's extension handler). Object/str/list/dict
+# cells ride through the VM as `Value::Obj(u32)` handles into that heap.
+#
+# `jit-disk-cache` turns on fusevm's three-tier Cranelift JIT *and* its
+# persistent on-disk cache of compiled native code (keyed by chunk hash), so hot
+# Python loops trace-compile and warm runs skip recompilation. `aot` enables the
+# ahead-of-time object emitter behind `python --build`.
+fusevm = { version = "0.14.10", features = ["jit", "jit-disk-cache", "aot"] }
+
+clap = { version = "4.5", features = ["derive", "cargo"] }
+thiserror = "2.0"
+rustc-hash = "2.1"
+# Python dict preserves insertion order (guaranteed since 3.7, observable in
+# iteration/repr).
+indexmap = "2"
+
+# rkyv-backed bytecode cache at ~/.pythonrs/scripts.rkyv (mirrors zshrs/rubylang):
+# the outer shard is a zero-copy rkyv archive; the inner per-script fusevm::Chunk
+# is bincode (fusevm::Chunk is serde-owned, not rkyv::Archive). Versioned from
+# day one so a cached .py that worked never breaks (compat floor).
+rkyv = { version = "0.7", features = ["validation", "archive_le", "size_32"] }
+bincode = "1.3"
+memmap2 = "0.9"
+dirs = "5"
+once_cell = "1"
+
+# LSP (`python --lsp`) + DAP (`python --dap`) over stdio. libc gives the DAP
+# server a pipe + dup2 to capture the debuggee's stdout (print) so program output
+# streams as `output` events instead of corrupting the JSON-RPC channel.
+lsp-server = "0.7.9"
+lsp-types = "0.97.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+
+# Interactive REPL (`python --repl` / TTY fallthrough): reedline line editor,
+# nu-ansi-term for the banner/status colors, sysinfo for the live stats box.
+reedline = "0.47.0"
+nu-ansi-term = "0.50"
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
+toml = "0.8"
+
+# Regex engine backing the `re` module.
+regex = "1"
+glob = "0.3"
+
+# Stackful same-thread coroutines backing Python generators (yield) and the
+# async event loop. Switches the native stack on the SAME OS thread, so the
+# thread_local! PyHost object heap is shared across a generator suspend/resume.
+corosensei = "0.3"
+
+# Arbitrary-precision integers: Python `int` is unbounded, so values that fit
+# stay `i64` and only the overflow path allocates a `BigInt` heap object.
+num-bigint = "0.4"
+num-integer = "0.1"
+num-traits = "0.2"
+# Exact rationals backing `fractions.Fraction` and complex support.
+num-rational = "0.4"
+num-complex = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
