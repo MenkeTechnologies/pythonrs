@@ -213,6 +213,9 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
       keep the FIRST key/element object (CPython semantics) via `dict_put`/`set_put`
       across every build/merge/update/add path. Bignum ints are hashable; `float()`
       accepts bignums and underscore-grouped literals.
+- [x] **`0 ** <negative>`** — FIXED: raises `ZeroDivisionError` (int base: `zero to
+      a negative power`; float base: `0.0 cannot be raised to a negative power`)
+      instead of returning `inf`. (Was the last mixed-fuzz divergence.)
 - [ ] **Complex arithmetic unusable** — `(1+2j)+(3+4j)` → `TypeError`; `complex("1+2j")`
       → `0.0j`; `(-8)**(1/3)` → `nan` (want the complex root); `.real`/`.imag`/`abs`
       all fail.
@@ -309,8 +312,10 @@ kinds + guards), `for/else`/`while/else`, `try/except/else/finally` ordering all
       handler finishes without raising. (`b_try`.)
 - [ ] **Exception chaining absent** — `raise X from Y` → `__cause__`/`__context__` not
       stored (`AttributeError`); `ExceptionGroup` undefined (though `except*` parses).
-- [ ] **Keyword-only default values not applied** — `def f(a,*,c,d=4); f(1,c=3)` →
-      `NameError: name 'd'`. Positional-only params not enforced against keyword calls.
+- [x] **Keyword-only default values** — FIXED: `MKFUNC` now carries the evaluated
+      keyword-only defaults (a count + values below the func id; cache schema v5);
+      `bind_params` applies them for any omitted optional kwonly param. Works for
+      `def`, `lambda`, methods. (Positional-only enforcement still open.)
 - [ ] **Walrus in a comprehension doesn't leak** to the enclosing scope (should);
       rebinding the loop var via walrus wrongly allowed.
 

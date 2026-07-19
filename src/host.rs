@@ -180,6 +180,9 @@ pub struct FuncVal {
     pub env: Option<Env>,
     /// Default values for the trailing positional params.
     pub defaults: Vec<Value>,
+    /// Default values for the keyword-only params that have one, in `kwonly`
+    /// order (evaluated at def time, like `defaults`).
+    pub kwonly_defaults: Vec<Value>,
     /// Bound receiver for a bound method (`instance.method`).
     pub bound: Option<Value>,
     /// Owning class name (for `super()` and method identity).
@@ -1683,6 +1686,18 @@ impl PyHost {
                     Ok(self.norm_big(acc))
                 }
                 _ => match (af, bf) {
+                    // `0 ** <negative>` is a division by zero in CPython, not `inf`.
+                    // Integer base and float base word the message differently.
+                    (Some(x), Some(y)) if x == 0.0 && y < 0.0 => {
+                        if ai.is_some() && bi.is_some() {
+                            Err("ZeroDivisionError: zero to a negative power".into())
+                        } else {
+                            Err(
+                                "ZeroDivisionError: 0.0 cannot be raised to a negative power"
+                                    .into(),
+                            )
+                        }
+                    }
                     (Some(x), Some(y)) => Ok(Value::Float(x.powf(y))),
                     _ => Err(self.optype_err("**", a, b)),
                 },
@@ -3345,7 +3360,7 @@ pub fn run_user_func(
         pos.insert(0, s.clone());
     }
     let env = new_env(fv.env.clone());
-    bind_params(&env, &def, &fv.defaults, pos, kwargs)?;
+    bind_params(&env, &def, &fv.defaults, &fv.kwonly_defaults, pos, kwargs)?;
     let owner = owner_opt.or_else(|| fv.owner.clone());
     // Generator function: build a suspended coroutine over the already-bound
     // frame; nothing of the body runs until the first `next`/iteration.
@@ -3381,6 +3396,7 @@ fn bind_params(
     env: &Env,
     def: &FuncDef,
     defaults: &[Value],
+    kwonly_defaults: &[Value],
     pos: Vec<Value>,
     kwargs: Vec<(String, Value)>,
 ) -> Result<(), String> {
@@ -3426,14 +3442,29 @@ fn bind_params(
             vars.insert(star.clone(), t);
         }
     }
+    // `kwonly_defaults` holds only the defaulted kwonly params, in kwonly order;
+    // walk it with a separate cursor as we pass each optional param.
+    let mut kwdef_cursor = 0usize;
     for (j, name) in def.kwonly.iter().enumerate() {
+        let required = def.kwonly_required.get(j).copied().unwrap_or(true);
         if let Some(v) = kwmap.shift_remove(name) {
             vars.insert(name.clone(), v);
-        } else if def.kwonly_required.get(j).copied().unwrap_or(true) {
+            if !required {
+                kwdef_cursor += 1;
+            }
+        } else if required {
             return Err(type_error(&format!(
                 "{}() missing required keyword-only argument: '{}'",
                 def.name, name
             )));
+        } else {
+            // Apply the def-time default for this optional keyword-only param.
+            let d = kwonly_defaults
+                .get(kwdef_cursor)
+                .cloned()
+                .unwrap_or(Value::Undef);
+            vars.insert(name.clone(), d);
+            kwdef_cursor += 1;
         }
     }
     if let Some(kw) = &def.kwargs {

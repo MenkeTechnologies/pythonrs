@@ -1081,3 +1081,44 @@ fn generator_return_value() {
         "[1, 2, 99]"
     );
 }
+
+#[test]
+fn keyword_only_defaults() {
+    // A keyword-only param with a default may be omitted.
+    assert_eq!(
+        g(
+            "def f(a, *, c, d=4): return a + c + d\nx = (f(1, c=3), f(1, c=3, d=10))",
+            "x"
+        ),
+        "(8, 14)"
+    );
+    // All-optional keyword-only.
+    assert_eq!(g("def f(a, *, c=10): return a + c\nx = f(1)", "x"), "11");
+    // Lambda keyword-only default.
+    assert_eq!(
+        g("h = lambda a, *, b=2: a * b\nx = (h(5), h(5, b=3))", "x"),
+        "(10, 15)"
+    );
+    // Mixed positional + keyword-only defaults.
+    assert_eq!(
+        g(
+            "def f(a=1, b=2, *, c=3, d=4): return (a, b, c, d)\nx = (f(), f(10, c=30))",
+            "x"
+        ),
+        "((1, 2, 3, 4), (10, 2, 30, 4))"
+    );
+}
+
+#[test]
+fn zero_to_negative_power_raises() {
+    // `0 ** <negative>` is a ZeroDivisionError, not `inf`.
+    assert_eq!(
+        g(
+            "x = 'unset'\ntry:\n    0 ** -1\nexcept ZeroDivisionError:\n    x = 'zde'",
+            "x"
+        ),
+        "'zde'"
+    );
+    // Non-zero base still works.
+    assert_eq!(g("x = 2 ** -1", "x"), "0.5");
+}
