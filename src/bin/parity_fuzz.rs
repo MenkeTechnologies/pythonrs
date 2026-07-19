@@ -733,6 +733,198 @@ fn gen_exceptions(seed: u64) -> Vec<String> {
     }
 }
 
+/// Sequence unpacking: starred targets, nested targets, call-site `*`/`**`
+/// spreads, and literal spreads. Deterministic (ordered scalars/lists/dicts).
+fn gen_unpacking(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let a = pick(r, SMALLINTS);
+    let b = pick(r, SMALLINTS);
+    let c = pick(r, SMALLINTS);
+    let n = 3 + r.below(4);
+    match r.below(6) {
+        0 => vec![format!("a, *b, c = [{a}, {b}, {c}, 7, 8]\nprint(a, b, c)")],
+        1 => vec![format!("first, *rest = range({n})\nprint(first, rest)")],
+        2 => vec![format!("*init, last = [{a}, {b}, {c}]\nprint(init, last)")],
+        3 => vec![format!("(x, y), z = ({a}, {b}), {c}\nprint(x, y, z)")],
+        4 => vec![
+            format!("def f(p, q, r): return p * 100 + q * 10 + r"),
+            format!("args = [{a}, {b}, {c}]"),
+            "print(f(*args))".into(),
+            format!("print(*[{a}, {b}, {c}], sep='-')"),
+        ],
+        _ => vec![
+            format!("d1 = {{'a': {a}, 'b': {b}}}"),
+            format!("d2 = {{'b': {c}, 'c': 9}}"),
+            "print({**d1, **d2})".into(),
+            format!("print([*[{a}, {b}], *[{c}]])"),
+        ],
+    }
+}
+
+/// Comprehensions: list/set/dict/nested + conditions + genexpr laziness. Set
+/// outputs are always sorted (set iteration order is impl-defined).
+fn gen_comprehension(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let n = 3 + r.below(5);
+    let m = 2 + r.below(4);
+    let k = pick(r, POSINTS);
+    match r.below(6) {
+        0 => vec![format!("print([x * x for x in range({n})])")],
+        1 => vec![format!("print([x for x in range({n}) if x % {k} == 0])")],
+        2 => vec![format!("print(sorted({{x % {k} for x in range({n})}}))")],
+        3 => vec![format!("print({{x: x * x for x in range({n})}})")],
+        4 => vec![format!(
+            "print([x * y for x in range({m}) for y in range({m})])"
+        )],
+        _ => vec![format!("print(sum(x * x for x in range({n})))")],
+    }
+}
+
+/// dict views + set algebra + frozenset. All set/frozenset results are printed
+/// via a sorted list, a scalar, or a bool so output never depends on iteration
+/// order (dict/dict-view order IS deterministic and printed directly).
+fn gen_dictset(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let a = pick(r, SMALLINTS);
+    let b = pick(r, SMALLINTS);
+    let c = pick(r, SMALLINTS);
+    let d = pick(r, SMALLINTS);
+    match r.below(8) {
+        0 => vec![format!(
+            "print(sorted({{{a}, {b}, {c}}} | {{{b}, {c}, {d}}}))"
+        )],
+        1 => vec![format!(
+            "print(sorted({{{a}, {b}, {c}}} & {{{b}, {c}, {d}}}))"
+        )],
+        2 => vec![format!(
+            "print({{{a}, {b}}} <= {{{a}, {b}, {c}}}, {{{a}, {b}}} < {{{a}, {b}}})"
+        )],
+        3 => vec![
+            format!("fs = frozenset([{a}, {b}, {c}])"),
+            format!("m = {{fs: 'v'}}"),
+            format!("print(m[frozenset([{c}, {b}, {a}])])"),
+            "print(isinstance(fs, frozenset), isinstance(fs, set))".into(),
+        ],
+        4 => vec![
+            format!("dd = {{{a}: 1, {b}: 2, {c}: 3}}"),
+            "print(sorted(dd.keys()))".into(),
+            "print(sorted(dd.values()))".into(),
+            format!("print(sorted(dd.keys() | {{{d}}}))"),
+        ],
+        5 => vec![
+            format!("dd = {{{a}: 1, {b}: 2}}"),
+            "print(type(dd.keys()).__name__)".into(),
+            "print(len(dd.items()))".into(),
+            format!("print(dict.fromkeys([{a}, {b}, {c}], 0))"),
+        ],
+        6 => vec![
+            format!("d1 = {{'a': {a}}}"),
+            format!("d2 = {{'b': {b}}}"),
+            "print(d1 | d2)".into(),
+            format!("d1.update(c={c})\nprint(d1)"),
+        ],
+        _ => vec![format!(
+            "print(sorted({{{a}, {b}, {c}}}.symmetric_difference([{b}, {c}, {d}])))"
+        )],
+    }
+}
+
+/// Lazy iterators (`zip`/`map`/`filter`/`enumerate`/`reversed`) driven via
+/// `next()`/`list()`, including an infinite generator source (no hang if lazy).
+fn gen_itertools(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let a = pick(r, SMALLINTS);
+    let b = pick(r, SMALLINTS);
+    let c = pick(r, SMALLINTS);
+    let s = pick(r, POSINTS);
+    match r.below(6) {
+        0 => vec![
+            format!("z = zip([{a}, {b}], [{c}, 9])"),
+            "print(next(z))".into(),
+            "print(list(z))".into(),
+            "print(next(z, 'end'))".into(),
+        ],
+        1 => vec![format!(
+            "print(list(map(lambda t: t * 2, [{a}, {b}, {c}])))"
+        )],
+        2 => vec![format!(
+            "print(list(filter(lambda t: t > {b}, [{a}, {b}, {c}, 9])))"
+        )],
+        3 => vec![format!(
+            "print(list(enumerate([{a}, {b}, {c}], start={s})))"
+        )],
+        4 => vec![
+            format!("rv = reversed([{a}, {b}, {c}])"),
+            "print(next(rv))".into(),
+            "print(list(rv))".into(),
+        ],
+        _ => vec![
+            "def cnt():".into(),
+            "    i = 0".into(),
+            "    while True:".into(),
+            "        yield i".into(),
+            "        i += 1".into(),
+            format!("print(list(zip(cnt(), [{a}, {b}, {c}])))"),
+        ],
+    }
+}
+
+/// Complex arithmetic: `+ - * / **`, `complex()` constructor, `.real`/`.imag`/
+/// `.conjugate()`, `abs`. `repr((a+bj))` is deterministic across impls.
+fn gen_complexnum(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let a = 1 + r.below(5);
+    let b = 1 + r.below(5);
+    let c = 1 + r.below(5);
+    let d = 1 + r.below(5);
+    match r.below(6) {
+        0 => vec![format!("print(({a}+{b}j) + ({c}+{d}j))")],
+        1 => vec![format!("print(({a}+{b}j) * ({c}+{d}j))")],
+        2 => vec![format!("print(({a}+{b}j) - ({c}+{d}j))")],
+        3 => vec![format!("print(complex({a}, {b}).conjugate())")],
+        4 => vec![format!(
+            "z = {a}+{b}j\nprint(z.real, z.imag, abs(z) == abs(z))"
+        )],
+        _ => vec![format!("print(({a}+{b}j) ** 2)")],
+    }
+}
+
+/// Exception chaining: `raise X from Y` (`__cause__`) and implicit `__context__`
+/// during handling. Output is deterministic type names / booleans.
+fn gen_exceptions2(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let excs = ["ValueError", "TypeError", "KeyError", "RuntimeError"];
+    let e1 = excs[r.below(excs.len() as u64) as usize];
+    let e2 = excs[r.below(excs.len() as u64) as usize];
+    match r.below(3) {
+        0 => vec![
+            "try:".into(),
+            "    try:".into(),
+            format!("        raise {e1}('inner')"),
+            format!("    except {e1} as e:"),
+            format!("        raise {e2}('outer') from e"),
+            format!("except {e2} as t:"),
+            "    print(type(t.__cause__).__name__, t.__suppress_context__)".into(),
+        ],
+        1 => vec![
+            "try:".into(),
+            "    try:".into(),
+            format!("        raise {e1}('a')"),
+            format!("    except {e1}:"),
+            format!("        raise {e2}('b')"),
+            format!("except {e2} as t:"),
+            "    print(type(t.__context__).__name__, t.__cause__)".into(),
+        ],
+        _ => vec![
+            "class E(Exception): pass".into(),
+            "try:".into(),
+            format!("    raise E('x') from {e1}('c')"),
+            "except E as e:".into(),
+            "    print(type(e.__cause__).__name__)".into(),
+        ],
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Mode dispatch
 // ---------------------------------------------------------------------------
@@ -761,6 +953,12 @@ enum Mode {
     Classes,
     Iterproto,
     Exceptions,
+    Unpacking,
+    Comprehension,
+    Dictset,
+    Itertools,
+    Complexnum,
+    Exceptions2,
 }
 
 const REAL_MODES: &[Mode] = &[
@@ -785,6 +983,12 @@ const REAL_MODES: &[Mode] = &[
     Mode::Classes,
     Mode::Iterproto,
     Mode::Exceptions,
+    Mode::Unpacking,
+    Mode::Comprehension,
+    Mode::Dictset,
+    Mode::Itertools,
+    Mode::Complexnum,
+    Mode::Exceptions2,
 ];
 
 /// Generate the statement list for a seed in the selected mode. `Mixed` rotates
@@ -816,6 +1020,12 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Classes => gen_classes(seed),
         Mode::Iterproto => gen_iterproto(seed),
         Mode::Exceptions => gen_exceptions(seed),
+        Mode::Unpacking => gen_unpacking(seed),
+        Mode::Comprehension => gen_comprehension(seed),
+        Mode::Dictset => gen_dictset(seed),
+        Mode::Itertools => gen_itertools(seed),
+        Mode::Complexnum => gen_complexnum(seed),
+        Mode::Exceptions2 => gen_exceptions2(seed),
     }
 }
 
@@ -843,6 +1053,12 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Classes => "classes",
         Mode::Iterproto => "iterproto",
         Mode::Exceptions => "exceptions",
+        Mode::Unpacking => "unpacking",
+        Mode::Comprehension => "comprehension",
+        Mode::Dictset => "dictset",
+        Mode::Itertools => "itertools",
+        Mode::Complexnum => "complexnum",
+        Mode::Exceptions2 => "exceptions2",
     }
 }
 
@@ -870,6 +1086,12 @@ fn mode_from_name(s: &str) -> Option<Mode> {
         Mode::Classes,
         Mode::Iterproto,
         Mode::Exceptions,
+        Mode::Unpacking,
+        Mode::Comprehension,
+        Mode::Dictset,
+        Mode::Itertools,
+        Mode::Complexnum,
+        Mode::Exceptions2,
     ];
     ALL.iter().copied().find(|&m| mode_name(m) == s)
 }

@@ -408,7 +408,8 @@ Re-measure: `cargo build && ./target/debug/parity-fuzz --count 50000`.
 Replay one: `./target/debug/parity-fuzz --once --seed <N>`.
 Per-mode: `--<mode>` (arith, formatspec, builtins, floatfmt, strings, fstring,
 slice, listcomp, dictcomp, setcomp, sorting, boolint, ranges, strmeth, comparison,
-builtins, ternary, augassign, **classes, iterproto, exceptions**).
+builtins, ternary, augassign, classes, iterproto, exceptions, **unpacking,
+comprehension, dictset, itertools, complexnum, exceptions2**).
 
 **Object-model modes added 2026-07-19** (`classes`, `iterproto`, `exceptions`) —
 each generates deterministic-stdout programs exercising the OOP surface and is in
@@ -416,3 +417,12 @@ the `mixed` rotation. Trajectory to 0: `classes` 15→0 (fixed `bool()`/`any`/`a
 not dispatching `__bool__`/`__len__`), `iterproto` 0, `exceptions` 0. After the
 `0 ** -1` → `ZeroDivisionError` fix, **mixed 8,000 = 0 divergences**; each new mode
 at 3,000 = 0.
+
+**Language-core modes added 2026-07-19** (`unpacking`, `comprehension`, `dictset`,
+`itertools`, `complexnum`, `exceptions2`) — cover starred/nested/spread unpacking,
+list/set/dict/nested comprehensions + genexprs, dict views + set algebra +
+frozenset, the lazy iterators driven via `next()`/`list()` (incl. an infinite
+generator source), complex arithmetic, and `raise from`/implicit-context chaining.
+All outputs are order-deterministic (sets always `sorted`). Each drove to **0**
+(unpacking/comprehension/dictset at 1,500; itertools/complexnum/exceptions2 at 800),
+and a **mixed 4,000 run = 0 divergences** with the new modes in rotation.
