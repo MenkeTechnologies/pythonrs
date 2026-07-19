@@ -1606,11 +1606,6 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
 pub fn is_builtin_function(name: &str) -> bool {
     BUILTIN_FUNCS.contains(&name)
         || name.starts_with("math.")
-        || name.starts_with("itertools.")
-        || name.starts_with("functools.")
-        || name.starts_with("json.")
-        || name.starts_with("os.")
-        || name.starts_with("random.")
         || name.starts_with("collections.")
         || name.starts_with("textwrap.")
         || name.starts_with("statistics.")
@@ -1808,33 +1803,7 @@ pub fn call_builtin_function(
     if let Some(m) = name.strip_prefix("math.") {
         return call_math(m, &args);
     }
-    // Native stdlib module functions (src/stdlib). itertools/functools are free
-    // functions (they re-enter `with_host`); json/os/random take `&mut PyHost`.
-    if let Some(f) = name.strip_prefix("itertools.") {
-        if let Some(r) = crate::stdlib::itertools::call(f, &args, &kwargs) {
-            return r;
-        }
-    }
-    if let Some(f) = name.strip_prefix("functools.") {
-        if let Some(r) = crate::stdlib::functools::call(f, &args, &kwargs) {
-            return r;
-        }
-    }
-    if let Some(f) = name.strip_prefix("json.") {
-        if let Some(r) = with_host(|h| crate::stdlib::json::call(h, f, &args)) {
-            return r;
-        }
-    }
-    if let Some(f) = name.strip_prefix("os.") {
-        if let Some(r) = with_host(|h| crate::stdlib::os::call(h, f, &args)) {
-            return r;
-        }
-    }
-    if let Some(f) = name.strip_prefix("random.") {
-        if let Some(r) = with_host(|h| crate::stdlib::random::call(h, f, &args)) {
-            return r;
-        }
-    }
+    // Native stdlib module functions (src/stdlib). These take `&mut PyHost`.
     if let Some(f) = name.strip_prefix("textwrap.") {
         if let Some(r) = with_host(|h| crate::stdlib::textwrap::call(h, f, &args)) {
             return r;
@@ -2437,6 +2406,8 @@ fn py_len(v: &Value) -> Result<usize, String> {
         Some(PyObj::Range { start, stop, step }) => {
             Ok(host::range_len(*start, *stop, *step).max(0) as usize)
         }
+        #[cfg(feature = "stdlib-ffi")]
+        Some(PyObj::Foreign(id)) => crate::ffi::len(*id),
         _ => Err(host::type_error(&format!(
             "object of type '{}' has no len()",
             h.type_name(v)

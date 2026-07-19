@@ -1,6 +1,14 @@
-//! Headless stdlib tests: import a native stdlib module, bind a global from it,
-//! and read that global's `repr` back from the host. No `python3` required, so
-//! these run in CI. Expected values are what CPython produces for the same call.
+//! Headless stdlib tests: import a stdlib module, bind a global from it, and read
+//! that global's `repr` back from the host. Expected values are what CPython
+//! produces for the same call.
+//!
+//! Modules provided natively by pythonrs (`collections`, `bytes`/`bytearray`,
+//! file I/O) run in every build. Modules that used to have hand-rolled shadows
+//! (`json`/`os`/`random`/`string`/`itertools`/`functools`) now come from the real
+//! CPython stdlib through the `stdlib-ffi` bridge; their tests are gated on that
+//! feature (compiled out of the default, no-libpython build where those modules
+//! intentionally do not exist) and run against CPython under
+//! `PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 cargo test --features stdlib-ffi`.
 
 use pythonrs::{eval_str, host};
 
@@ -15,6 +23,7 @@ fn g(src: &str, name: &str) -> String {
     })
 }
 
+#[cfg(feature = "stdlib-ffi")]
 #[test]
 fn json_dumps_loads_roundtrip() {
     // Insertion order preserved; None/bool lowered to null/true; int stays int.
@@ -34,6 +43,7 @@ fn json_dumps_loads_roundtrip() {
     );
 }
 
+#[cfg(feature = "stdlib-ffi")]
 #[test]
 fn itertools_eager_combinatorics() {
     assert_eq!(
@@ -59,6 +69,7 @@ fn itertools_eager_combinatorics() {
     );
 }
 
+#[cfg(feature = "stdlib-ffi")]
 #[test]
 fn functools_reduce() {
     assert_eq!(
@@ -70,6 +81,7 @@ fn functools_reduce() {
     );
 }
 
+#[cfg(feature = "stdlib-ffi")]
 #[test]
 fn os_path_posix() {
     assert_eq!(
@@ -86,6 +98,7 @@ fn os_path_posix() {
     );
 }
 
+#[cfg(feature = "stdlib-ffi")]
 #[test]
 fn string_constants() {
     assert_eq!(
@@ -95,6 +108,7 @@ fn string_constants() {
     assert_eq!(g("import string\nx = string.digits", "x"), "'0123456789'");
 }
 
+#[cfg(feature = "stdlib-ffi")]
 #[test]
 fn random_is_deterministic_after_seed() {
     // pythonrs's own PRNG (not CPython-bit-identical), but stable across runs for
@@ -219,6 +233,7 @@ fn collections_namedtuple() {
 
 // ── functools.partial / lru_cache ────────────────────────────────────────────
 
+#[cfg(feature = "stdlib-ffi")]
 #[test]
 fn functools_partial() {
     assert_eq!(
@@ -238,6 +253,7 @@ fn functools_partial() {
     );
 }
 
+#[cfg(feature = "stdlib-ffi")]
 #[test]
 fn functools_lru_cache() {
     // Bare form: default maxsize 128; cache_info reports hits/misses/maxsize/currsize.
@@ -246,7 +262,7 @@ fn functools_lru_cache() {
             "import functools\nsq = functools.lru_cache(lambda n: n * n)\nsq(3)\nsq(3)\nsq(4)\nx = sq.cache_info()",
             "x"
         ),
-        "(1, 2, 128, 2)"
+        "CacheInfo(hits=1, misses=2, maxsize=128, currsize=2)"
     );
     // Parameterized decorator form carries the maxsize through the partial.
     assert_eq!(
@@ -254,7 +270,7 @@ fn functools_lru_cache() {
             "import functools\nsq = functools.lru_cache(maxsize=2)(lambda n: n * n)\nsq(1)\nsq(2)\nsq(3)\nx = sq.cache_info()",
             "x"
         ),
-        "(0, 3, 2, 2)"
+        "CacheInfo(hits=0, misses=3, maxsize=2, currsize=2)"
     );
     // Cached values are correct.
     assert_eq!(
@@ -354,4 +370,46 @@ fn file_for_loop_lines() {
     });
     let _ = std::fs::remove_file(&path);
     assert_eq!(got, "['x', 'y']");
+}
+
+// ── CPython stdlib FFI bridge (real re / hashlib / json C accelerators) ───────
+
+/// Exercise the `stdlib-ffi` bridge end to end: import a pure module and two
+/// C-accelerator modules, run a call on each, and marshal the result back. Values
+/// are the exact CPython outputs (verified against `python3`).
+#[cfg(feature = "stdlib-ffi")]
+#[test]
+fn ffi_c_accelerators_marshal_back() {
+    // _sre: findall returns a real list of matched substrings.
+    assert_eq!(
+        g("import re\nx = re.findall(r'\\d+', 'a1b22')", "x"),
+        "['1', '22']"
+    );
+    // _hashlib: sha256 hex digest of b"abc".
+    assert_eq!(
+        g(
+            "import hashlib\nx = hashlib.sha256(b'abc').hexdigest()",
+            "x"
+        ),
+        "'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'"
+    );
+    // _json: dumps a list back to its compact-with-spaces text form.
+    assert_eq!(
+        g("import json\nx = json.dumps([1, 2, 3])", "x"),
+        "'[1, 2, 3]'"
+    );
+}
+
+/// A pythonrs lambda passed as a CPython stdlib callback must call back into
+/// fusevm (`functools.reduce` folding a fusevm closure over CPython data).
+#[cfg(feature = "stdlib-ffi")]
+#[test]
+fn ffi_reverse_callback_into_fusevm() {
+    assert_eq!(
+        g(
+            "import functools\nx = functools.reduce(lambda a, b: a + b, [1, 2, 3, 4], 100)",
+            "x"
+        ),
+        "110"
+    );
 }

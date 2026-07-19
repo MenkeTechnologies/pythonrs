@@ -304,6 +304,14 @@ pub enum PyObj {
     /// signal "this operand pair is not my business", so the interpreter tries the
     /// reflected operation (and, for `==`/`!=`, falls back to identity).
     NotImplemented,
+    /// A live CPython object owned by the `stdlib-ffi` bridge — a handle (index)
+    /// into `crate::ffi`'s side-table. Any object the real CPython stdlib returns
+    /// that pythonrs can't represent by value (compiled regex, `datetime`,
+    /// sockets, iterators, module objects, …) is carried this way; attribute
+    /// access / calls / indexing / iteration / `len` / `str` / membership route
+    /// back through `crate::ffi`.
+    #[cfg(feature = "stdlib-ffi")]
+    Foreign(u32),
 }
 
 /// The plan for reading `recv.name` when a descriptor may be involved. Computed
@@ -605,6 +613,17 @@ impl PyHost {
         }
     }
 
+    /// The `stdlib-ffi` handle id if `v` is a CPython `Foreign` object, else
+    /// `None`. Copying the id out ends the heap borrow before dispatching to the
+    /// bridge (which needs `&mut self` to marshal the result back).
+    #[cfg(feature = "stdlib-ffi")]
+    pub fn foreign_id(&self, v: &Value) -> Option<u32> {
+        match self.get(v) {
+            Some(PyObj::Foreign(id)) => Some(*id),
+            _ => None,
+        }
+    }
+
     pub fn new_str(&mut self, s: impl Into<String>) -> Value {
         self.alloc(PyObj::Str(s.into()))
     }
@@ -903,6 +922,8 @@ impl PyHost {
                 Some(PyObj::ClassMethod(_)) => "classmethod".into(),
                 Some(PyObj::Property { .. }) => "property".into(),
                 Some(PyObj::NotImplemented) => "NotImplementedType".into(),
+                #[cfg(feature = "stdlib-ffi")]
+                Some(PyObj::Foreign(id)) => crate::ffi::type_name(*id),
                 None => "object".into(),
             },
             _ => "object".into(),
@@ -930,6 +951,8 @@ impl PyHost {
                 Some(PyObj::BigInt(b)) => *b != num_bigint::BigInt::from(0),
                 Some(PyObj::Complex(r, i)) => *r != 0.0 || *i != 0.0,
                 Some(PyObj::Instance(_)) => true, // __bool__/__len__ handled by caller
+                #[cfg(feature = "stdlib-ffi")]
+                Some(PyObj::Foreign(id)) => crate::ffi::truthy(*id),
                 _ => true,
             },
             _ => true,
@@ -1013,6 +1036,8 @@ impl PyHost {
                 }
                 Some(PyObj::Property { .. }) => "<property object>".into(),
                 Some(PyObj::NotImplemented) => "NotImplemented".into(),
+                #[cfg(feature = "stdlib-ffi")]
+                Some(PyObj::Foreign(id)) => crate::ffi::str_of(*id),
                 Some(PyObj::Slice { .. })
                 | Some(PyObj::List(_))
                 | Some(PyObj::Tuple(_))
@@ -1117,6 +1142,8 @@ impl PyHost {
                     self.repr_of(hi),
                     self.repr_of(step)
                 ),
+                #[cfg(feature = "stdlib-ffi")]
+                Some(PyObj::Foreign(id)) => crate::ffi::repr_of(*id),
                 _ => self.str_of(v),
             },
             _ => self.str_of(v),
@@ -2382,6 +2409,10 @@ fn ascii_of(s: &str) -> String {
 impl PyHost {
     /// `recv[idx]`.
     pub fn get_item(&mut self, recv: &Value, idx: &Value) -> Result<Value, String> {
+        #[cfg(feature = "stdlib-ffi")]
+        if let Some(id) = self.foreign_id(recv) {
+            return crate::ffi::get_item(self, id, idx);
+        }
         // Slice?
         if let Some(PyObj::Slice { lo, hi, step }) = self.get(idx) {
             let (lo, hi, step) = (lo.clone(), hi.clone(), step.clone());
@@ -2603,6 +2634,16 @@ impl PyHost {
             let lines = self.io_read_lines(id)?;
             return Ok(lines.into_iter().map(|l| self.new_str(l)).collect());
         }
+        // A CPython iterable (stdlib-ffi) is drained through its own iterator.
+        #[cfg(feature = "stdlib-ffi")]
+        if let Some(id) = self.foreign_id(v) {
+            let it = crate::ffi::make_iter(self, id)?;
+            let mut out = Vec::new();
+            while let Some(x) = self.iter_next(&it)? {
+                out.push(x);
+            }
+            return Ok(out);
+        }
         match self.get(v) {
             Some(PyObj::List(l)) | Some(PyObj::Tuple(l)) => Ok(l.clone()),
             Some(PyObj::Deque { items, .. }) => Ok(items.iter().cloned().collect()),
@@ -2659,6 +2700,10 @@ impl PyHost {
 
     /// Build an iterator object over `v`.
     pub fn make_iter(&mut self, v: &Value) -> Result<Value, String> {
+        #[cfg(feature = "stdlib-ffi")]
+        if let Some(id) = self.foreign_id(v) {
+            return crate::ffi::make_iter(self, id);
+        }
         let state = match self.get(v) {
             Some(PyObj::List(l)) | Some(PyObj::Tuple(l)) => IterState::Seq {
                 items: l.clone(),
@@ -2699,6 +2744,10 @@ impl PyHost {
 
     /// Advance an iterator; `None` on exhaustion.
     pub fn iter_next(&mut self, it: &Value) -> Result<Option<Value>, String> {
+        #[cfg(feature = "stdlib-ffi")]
+        if let Some(id) = self.foreign_id(it) {
+            return crate::ffi::iter_next(self, id);
+        }
         let out = match self.get_mut(it) {
             Some(PyObj::Iter(IterState::Seq { items, idx })) => {
                 if *idx < items.len() {
@@ -2739,6 +2788,10 @@ impl PyHost {
 
     /// `item in container`.
     pub fn contains(&mut self, item: &Value, container: &Value) -> Result<bool, String> {
+        #[cfg(feature = "stdlib-ffi")]
+        if let Some(id) = self.foreign_id(container) {
+            return crate::ffi::contains(self, id, item);
+        }
         match self.get(container) {
             Some(PyObj::Str(s)) => {
                 let needle = self
@@ -2891,6 +2944,11 @@ impl PyHost {
 
     /// `recv.name`.
     pub fn get_attr(&mut self, recv: &Value, name: &str) -> Result<Value, String> {
+        // A CPython object (stdlib-ffi) resolves attributes on the CPython side.
+        #[cfg(feature = "stdlib-ffi")]
+        if let Some(id) = self.foreign_id(recv) {
+            return crate::ffi::get_attr(self, id, name);
+        }
         // namedtuple field access: a tagged tuple resolves `.field` to its index.
         if let Value::Obj(i) = recv {
             let field_idx = self
@@ -3378,6 +3436,10 @@ pub fn invoke(
         {
             call_method(callable, "__call__", args, kwargs)
         }
+        // A CPython callable (stdlib-ffi): call it on the CPython side. The bridge
+        // drops the host borrow across the call so pythonrs callbacks can run.
+        #[cfg(feature = "stdlib-ffi")]
+        Some(PyObj::Foreign(id)) => crate::ffi::call(id, args, kwargs),
         _ => Err(type_error(&format!(
             "'{}' object is not callable",
             with_host(|h| h.type_name(callable))
@@ -3503,6 +3565,9 @@ pub fn call_method(
                 _ => Err(type_error("object.__new__(X): X is not a type object")),
             }
         }
+        // `foreign.method(...)` (stdlib-ffi) — dispatch on the CPython side.
+        #[cfg(feature = "stdlib-ffi")]
+        Some(PyObj::Foreign(id)) => crate::ffi::call_method(id, name, args, kwargs),
         _ => crate::builtins::call_type_method(recv, name, args, kwargs),
     }
 }
@@ -4104,12 +4169,6 @@ pub fn import_module(name: &str) -> Result<Value, String> {
     // keys (vs the `&str` keys of the inline arms below), so build the namespace
     // here and return before the `&str` match.
     let stdlib_entries: Option<Vec<(String, Value)>> = match name {
-        "itertools" => Some(with_host(crate::stdlib::itertools::entries)),
-        "functools" => Some(with_host(crate::stdlib::functools::entries)),
-        "json" => Some(with_host(crate::stdlib::json::entries)),
-        "os" => Some(with_host(crate::stdlib::os::entries)),
-        "random" => Some(with_host(crate::stdlib::random::entries)),
-        "string" => Some(with_host(crate::stdlib::string::entries)),
         "textwrap" => Some(with_host(crate::stdlib::textwrap::entries)),
         "statistics" => Some(with_host(crate::stdlib::statistics::entries)),
         _ => None,
@@ -4188,6 +4247,17 @@ pub fn import_module(name: &str) -> Result<Value, String> {
             ]
         }),
         _ => {
+            // With the CPython stdlib bridge on, a module pythonrs doesn't provide
+            // natively is imported from the real CPython stdlib (pure `.py` + C
+            // accelerators) and returned as a `Foreign` module handle. `from x
+            // import y`, submodules (`os.path`), and `sys.modules` all fall out of
+            // CPython's own importer.
+            #[cfg(feature = "stdlib-ffi")]
+            {
+                let id = crate::ffi::import(name)?;
+                return Ok(with_host(|h| h.alloc(PyObj::Foreign(id))));
+            }
+            #[cfg(not(feature = "stdlib-ffi"))]
             return Err(format!("ModuleNotFoundError: No module named '{name}'"));
         }
     };

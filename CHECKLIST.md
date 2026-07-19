@@ -52,11 +52,10 @@ dispatch; `[in-flight]` = being implemented in the current host pass.
 - [x] **Custom `__getitem__` with a slice → stack-overflow SIGABRT** — FIXED:
       `repr_of` now formats `PyObj::Slice` directly (`slice(1, 5, 2)`) instead of
       delegating back to `str_of`, which caused infinite `str_of`↔`repr_of` recursion.
-- [ ] **`itertools.islice` is eager → hangs on infinite generators** — consumes
-      the whole iterator before slicing, so `islice(count(), 5)` never returns
-      (exit 124). Same root cause makes any lazy-slice of an infinite producer hang.
-      (Note: `count()`/`cycle()` themselves are rejected up front, so only a *user*
-      infinite generator triggers the hang; a full lazy-itertools rework is deferred.)
+- [x] **`itertools.islice` is eager → hangs on infinite generators** — RESOLVED via
+      the `stdlib-ffi` bridge: `itertools` is now the real CPython module, so
+      `islice`/`count`/`cycle` are natively lazy and `islice(count(), 5)` returns.
+      (The old hand-rolled eager `itertools` shadow was deleted.)
 - [x] **`N in range(huge)` hangs** — FIXED: O(1) membership — integer in the
       arithmetic progression and within the half-open bounds (`host.rs contains`).
       Integral floats compare equal to their int value (`2.0 in range(5)` → True).
@@ -79,6 +78,10 @@ dispatch; `[in-flight]` = being implemented in the current host pass.
 
 ## Tier 1 — File & process I/O (top blocker for real scripts)
 
+**`subprocess`, `pathlib`, `io` (`StringIO`/`BytesIO`), and the full `os` surface
+are CLOSED via the `stdlib-ffi` bridge** (real CPython modules). `open()` + file
+objects are native (landed). Items below track the native default-build surface.
+
 - [ ] **`open()` missing** — `NameError: name 'open' is not defined`. No read/write/
       append/`with open(...)`/line iteration. Single largest drop-in blocker.
 - [ ] **File objects** `[in-flight]` — `.read/.readline/.readlines/.write/.writelines/
@@ -90,25 +93,36 @@ dispatch; `[in-flight]` = being implemented in the current host pass.
 
 ## Tier 2 — stdlib modules scripts reach for
 
-Importable today (8): `math os sys json random string itertools functools`.
+**CLOSED via the CPython stdlib FFI bridge (feature `stdlib-ffi`).** pythonrs no
+longer reimplements the stdlib. With the feature on, any module pythonrs does not
+serve natively (`math`/`sys`/`collections` stay native; `textwrap`/`statistics`
+kept hand-rolled) is imported from the **real CPython stdlib** — pure `.py` **and**
+the C accelerators (`_sre`/`_hashlib`/`_datetime`/`_json`/…) — over an embedded
+libpython (`src/ffi.rs`). `import <anything>`, `from x import y`, submodules
+(`os.path`), and `sys.modules` all fall out of CPython's own importer. Results
+marshal to pythonrs values by-value (int/float/bool/None/str/bytes/list/tuple/dict/
+set); everything else stays a `PyObj::Foreign` handle whose attr/call/index/iter/
+len/str/repr/membership route back through the bridge. A pythonrs callable passed
+as a stdlib callback (`functools.reduce(f, …)`, `sorted(key=f)`) is wrapped so
+CPython calls back into fusevm. Verified byte-identical to `python3` (3.14.6):
+`re.findall`, `hashlib.sha256`, `argparse`, `json.dumps/loads`, `textwrap`,
+`itertools.chain/combinations/permutations`, `functools.reduce/partial/lru_cache`,
+`os.path.*`, `string.*`.
 
-- [ ] **Wire the already-written modules** `[unwired]` — `src/stdlib/{re,datetime,
-      heapq,bisect,textwrap,statistics}.rs` exist but `import` → `ModuleNotFoundError`.
-      Register them in `import_module` + `call_builtin_function` (this integration is
-      pending on the current host pass; wiring lines captured from each module).
-- [ ] **`collections`** `[in-flight]` — `Counter/defaultdict/OrderedDict/deque/
-      namedtuple`. Needs the new container types.
-- [ ] **`copy`** — `copy.copy`/`deepcopy` (`ModuleNotFoundError`). (`a[:]`/`.copy()` work.)
-- [ ] **`from x import *`** unsupported — `AttributeError: module 'math' has no
-      attribute '*'`. **Submodule import** `import os.path` → `ModuleNotFoundError`.
-      **`sys.modules`** absent.
-- [ ] **`functools` gaps** — `wraps`, `partial` `[in-flight]`, `lru_cache`,
-      `total_ordering` (`AttributeError`; only `reduce` present).
-- [ ] **`math` gaps** — `isclose`, `trunc`, `log2`, `comb` (`AttributeError`).
-- [ ] **`decimal`/`fractions`** — `Decimal`/`Fraction` absent.
-- [ ] **`time`, `argparse`, `typing`, `dataclasses`, `enum`, `contextlib`,
-      `operator`, `abc`, `logging`, `hashlib`, `base64`, `csv`** — all
-      `ModuleNotFoundError`. `typing` accept-and-ignore is enough for most scripts.
+Build/run with the feature: `PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 cargo build
+--features stdlib-ffi` (CI has a dedicated `stdlib-ffi` job). Default builds never
+pull pyo3 or need libpython, so they import only the native set below.
+
+- The former hand-rolled shadows `src/stdlib/{json,os,random,string,itertools,
+  functools}.rs` were **deleted** — the real CPython modules replace them.
+- Native (available in every build): `math`, `sys`, `collections`
+  (`Counter/defaultdict/OrderedDict/deque/namedtuple`), `textwrap`, `statistics`,
+  plus the built-in `bytes`/`bytearray` and file I/O.
+- **Known bridge limits:** the side-table never frees `Foreign` handles (fine for
+  long-lived stdlib objects, leaks for high-churn ones like per-iteration match
+  objects); non-callable objects passed *into* a CPython call still error; module
+  bundling for release artifacts (ship `lib/python3.14` + `libpython`) is future
+  work per FFI_STDLIB.md §6.
 
 ## Tier 3 — Object model / OOP (largest correctness surface after numerics)
 
