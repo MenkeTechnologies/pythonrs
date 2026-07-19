@@ -1390,6 +1390,8 @@ const BUILTIN_FUNCS: &[&str] = &[
     "callable",
     "open",
     "super",
+    "staticmethod",
+    "classmethod",
 ];
 
 // ── builtin functions ────────────────────────────────────────────────────────
@@ -1743,6 +1745,14 @@ pub fn call_builtin_function(
                     h.alloc(PyObj::Builtin(tn))
                 }
             }))
+        }
+        "staticmethod" => {
+            let f = arg0(&args)?;
+            Ok(with_host(|h| h.alloc(PyObj::StaticMethod(f))))
+        }
+        "classmethod" => {
+            let f = arg0(&args)?;
+            Ok(with_host(|h| h.alloc(PyObj::ClassMethod(f))))
         }
         "super" => {
             // Zero-arg `super()` reads the enclosing method's defining class and

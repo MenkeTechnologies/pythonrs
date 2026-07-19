@@ -122,8 +122,12 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
       the original instance. `mro_of` now uses **C3 linearization** (was a naive DFS),
       so cooperative `super()` across diamond inheritance visits each base once in the
       correct order (`D(B,C)`→`[D,B,C,A]`). `super().__init__()` and method extension work.
-- [ ] **`property` / `classmethod` / `staticmethod` are undefined names** —
-      the three most-used class decorators all `NameError`.
+- [x] **`classmethod` / `staticmethod`** — FIXED: both are builtins that wrap the
+      function in a `PyObj::StaticMethod`/`ClassMethod` marker; method dispatch
+      (call_method + get_attr, instance and class receivers) honors them — static gets
+      no implicit arg, classmethod binds the receiver's class as `cls` (derived-class
+      aware, so `D.g` sees `D`). Alternate constructors `cls()` work.
+      Still open: **`property`** (needs the descriptor protocol).
 - [ ] **Instances are never hashable** — `hash(A())` / instance as dict key / set
       member → `TypeError: unhashable type: 'object'`, even with an explicit
       `__hash__`. No user object can key a dict or join a set.
