@@ -925,7 +925,9 @@ impl PyHost {
                 Some(PyObj::Complex(r, i)) => fmt_complex(*r, *i),
                 Some(PyObj::Bytes(b)) => format!("b{}", quote_bytes(b)),
                 Some(PyObj::Instance(inst)) => format!("<{} object>", inst.class),
-                Some(PyObj::Class(n)) => format!("<class '{n}'>"),
+                // User classes are defined in the top-level module, which under
+                // `-c`/a script CPython names `__main__` (builtins stay bare).
+                Some(PyObj::Class(n)) => format!("<class '__main__.{n}'>"),
                 Some(PyObj::Func(f)) => {
                     let name = self
                         .funcs
@@ -2713,6 +2715,22 @@ impl PyHost {
                     return Ok(v.clone());
                 }
                 let class = inst.class.clone();
+                // Instance introspection: `__class__` and `__dict__`.
+                if name == "__class__" {
+                    return Ok(self.alloc(PyObj::Class(class)));
+                }
+                if name == "__dict__" {
+                    let attrs = match self.get(recv) {
+                        Some(PyObj::Instance(i)) => i.attrs.clone(),
+                        _ => IndexMap::new(),
+                    };
+                    let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+                    for (k, val) in attrs {
+                        let kv = self.new_str(k.clone());
+                        d.insert(PKey::Str(k), (kv, val));
+                    }
+                    return Ok(self.new_dict(d));
+                }
                 if let Some(v) = self.class_lookup(&class, name) {
                     match self.get(&v) {
                         // Bind plain functions to the instance.
@@ -2743,8 +2761,48 @@ impl PyHost {
             }
             Some(PyObj::Class(cname)) => {
                 let cname = cname.clone();
-                if name == "__name__" {
+                if name == "__name__" || name == "__qualname__" {
                     return Ok(self.new_str(cname));
+                }
+                // Class introspection: `__mro__`, `__bases__`, `__dict__`.
+                if name == "__mro__" {
+                    let mut mro: Vec<Value> = self
+                        .mro_of(&cname)
+                        .into_iter()
+                        .map(|c| self.alloc(PyObj::Class(c)))
+                        .collect();
+                    // `object` is the implicit tail of every MRO.
+                    mro.push(self.alloc(PyObj::Builtin("object".into())));
+                    return Ok(self.new_tuple(mro));
+                }
+                if name == "__bases__" {
+                    let bases: Vec<String> = self
+                        .classes
+                        .get(&cname)
+                        .map(|cd| cd.bases.clone())
+                        .unwrap_or_default();
+                    let vals: Vec<Value> = if bases.is_empty() {
+                        vec![self.alloc(PyObj::Builtin("object".into()))]
+                    } else {
+                        bases
+                            .into_iter()
+                            .map(|b| self.alloc(PyObj::Class(b)))
+                            .collect()
+                    };
+                    return Ok(self.new_tuple(vals));
+                }
+                if name == "__dict__" {
+                    let ns = self
+                        .classes
+                        .get(&cname)
+                        .map(|cd| cd.ns.clone())
+                        .unwrap_or_default();
+                    let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+                    for (k, val) in ns {
+                        let kv = self.new_str(k.clone());
+                        d.insert(PKey::Str(k), (kv, val));
+                    }
+                    return Ok(self.new_dict(d));
                 }
                 if let Some(v) = self.class_lookup(&cname, name) {
                     match self.get(&v) {
