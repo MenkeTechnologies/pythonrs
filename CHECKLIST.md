@@ -182,8 +182,11 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
 - [ ] **Context managers** — multiple `with` exit **FIFO not LIFO**; `__exit__`
       returning `True` does **not** suppress; `__exit__` receives `(None,None,None)`
       even on exception. Parenthesized `with (a as x, b as y)` is a `SyntaxError`.
-- [ ] **`__slots__` not enforced**; `__init_subclass__` class-kwargs not passed;
-      `a.__class__ = B` reassignment ignored.
+- [x] **`__slots__` enforced** — FIXED: a fully-slotted instance (every user class
+      in its MRO declares `__slots__`) rejects assignment of an undeclared attribute
+      (`… object has no attribute 'z' and no __dict__ …`) and has no `__dict__`; a
+      non-slotted base restores the dict (no restriction). Still open:
+      `__init_subclass__` class-kwargs; `a.__class__ = B` reassignment.
 - [ ] **`dataclasses` / `enum` modules absent** (see Tier 2).
 
 ## Tier 4 — Numeric core (silent-wrong values — highest correctness priority)
@@ -362,6 +365,6 @@ builtins, ternary, augassign, **classes, iterproto, exceptions**).
 **Object-model modes added 2026-07-19** (`classes`, `iterproto`, `exceptions`) —
 each generates deterministic-stdout programs exercising the OOP surface and is in
 the `mixed` rotation. Trajectory to 0: `classes` 15→0 (fixed `bool()`/`any`/`all`
-not dispatching `__bool__`/`__len__`), `iterproto` 0, `exceptions` 0. Mixed 8,000:
-**1 divergence** (`0 ** -1` should raise `ZeroDivisionError` — pre-existing Tier-4
-numeric gap, not object-model).
+not dispatching `__bool__`/`__len__`), `iterproto` 0, `exceptions` 0. After the
+`0 ** -1` → `ZeroDivisionError` fix, **mixed 8,000 = 0 divergences**; each new mode
+at 3,000 = 0.

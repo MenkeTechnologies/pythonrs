@@ -2753,6 +2753,12 @@ impl PyHost {
                     return Ok(self.alloc(PyObj::Class(class)));
                 }
                 if name == "__dict__" {
+                    // A fully-slotted instance has no `__dict__`.
+                    if self.slots_of(&class).is_some() {
+                        return Err(format!(
+                            "AttributeError: '{class}' object has no attribute '__dict__'"
+                        ));
+                    }
                     let attrs = match self.get(recv) {
                         Some(PyObj::Instance(i)) => i.attrs.clone(),
                         _ => IndexMap::new(),
@@ -2935,6 +2941,45 @@ impl PyHost {
         self.class_lookup(class, name).is_some()
     }
 
+    /// The allowed attribute names for a `__slots__`-restricted instance, or
+    /// `None` if the instance has a normal `__dict__` (some user class in its MRO
+    /// omits `__slots__`). The returned set is the union of every class's slots.
+    fn slots_of(&self, class: &str) -> Option<HashSet<String>> {
+        let mut slots = HashSet::new();
+        let mut any = false;
+        for c in self.mro_of(class) {
+            let cd = match self.classes.get(&c) {
+                Some(cd) => cd,
+                None => continue, // builtin base (e.g. `object`) — implicit, skip
+            };
+            match cd.ns.get("__slots__") {
+                Some(v) => {
+                    any = true;
+                    match self.get(v) {
+                        Some(PyObj::List(items)) | Some(PyObj::Tuple(items)) => {
+                            for it in items {
+                                if let Some(s) = self.as_str(it) {
+                                    slots.insert(s);
+                                }
+                            }
+                        }
+                        Some(PyObj::Str(s)) => {
+                            slots.insert(s.clone());
+                        }
+                        _ => {}
+                    }
+                }
+                // A user class without `__slots__` gives the instance a `__dict__`.
+                None => return None,
+            }
+        }
+        if any {
+            Some(slots)
+        } else {
+            None
+        }
+    }
+
     /// Plan reading `recv.name`, honoring the descriptor protocol (`property`
     /// and user `__get__` descriptors). See [`AttrGet`].
     pub fn plan_attr_get(&mut self, recv: &Value, name: &str) -> AttrGet {
@@ -3014,6 +3059,19 @@ impl PyHost {
 
     /// `recv.name = val`.
     pub fn set_attr(&mut self, recv: &Value, name: &str, val: Value) -> Result<(), String> {
+        // `__slots__` enforcement: a slotted instance rejects any attribute name
+        // not declared in its slots.
+        if let Some(PyObj::Instance(inst)) = self.get(recv) {
+            let class = inst.class.clone();
+            if let Some(slots) = self.slots_of(&class) {
+                if !slots.contains(name) {
+                    return Err(format!(
+                        "AttributeError: '{class}' object has no attribute '{name}' and no \
+                         __dict__ for setting new attributes"
+                    ));
+                }
+            }
+        }
         match self.get_mut(recv) {
             Some(PyObj::Instance(inst)) => {
                 inst.attrs.insert(name.to_string(), val);
