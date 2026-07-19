@@ -651,6 +651,33 @@ fn custom_getitem_slice_and_slice_repr() {
 }
 
 #[test]
+fn numeric_keys_unify_in_dict_and_set() {
+    // 1, 1.0, True hash and compare equal, so they collapse to one key.
+    assert_eq!(g("x = 1.0 in {1}", "x"), "True");
+    assert_eq!(g("x = True in {1}", "x"), "True");
+    assert_eq!(g("x = len({1, 1.0, True})", "x"), "1");
+    // The set keeps the FIRST-inserted element object (1, an int).
+    assert_eq!(g("x = sorted({1, 1.0, True})", "x"), "[1]");
+    assert_eq!(g("x = {1, 1.0, True}", "x"), "{1}");
+    // Dict keeps the first key object, updates the value.
+    assert_eq!(g("x = {1: 'a', 1.0: 'b', True: 'c'}", "x"), "{1: 'c'}");
+    assert_eq!(
+        g("d = {}\nd[1] = 'a'\nd[1.0] = 'b'\nx = d", "x"),
+        "{1: 'b'}"
+    );
+    // Bignum-valued float unifies with the bignum int key.
+    assert_eq!(g("x = len({10 ** 20, float(10 ** 20)})", "x"), "1");
+    // Merge / update follow the same rule.
+    assert_eq!(g("x = {**{1: 'a'}, **{1.0: 'b'}}", "x"), "{1: 'b'}");
+    assert_eq!(
+        g("d = {1.0: 'a'}\nd.update({1: 'b'})\nx = d", "x"),
+        "{1.0: 'b'}"
+    );
+    // float() accepts bignums and underscore-grouped literals.
+    assert_eq!(g("x = float('1_000.5')", "x"), "1000.5");
+}
+
+#[test]
 fn round_bankers_and_negative_ndigits() {
     // Round-half-to-even (banker's), returning an int with no ndigits.
     assert_eq!(g("x = round(2.5)", "x"), "2");
