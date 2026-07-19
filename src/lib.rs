@@ -16,6 +16,8 @@ pub mod cache;
 pub mod cli;
 pub mod compiler;
 pub mod dap;
+#[cfg(feature = "stdlib-ffi")]
+pub mod ffi;
 pub mod host;
 pub mod intercepts;
 pub mod lexer;
