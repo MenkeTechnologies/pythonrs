@@ -1234,3 +1234,72 @@ fn lazy_iterators() {
         "[(0, 'a'), (1, 'b'), (2, 'c')]"
     );
 }
+
+#[test]
+fn frozenset_type() {
+    assert_eq!(g("x = frozenset([1,2,2])", "x"), "frozenset({1, 2})");
+    assert_eq!(g("x = frozenset()", "x"), "frozenset()");
+    assert_eq!(g("x = type(frozenset()).__name__", "x"), "'frozenset'");
+    // Hashable: usable as a dict key and a set member.
+    assert_eq!(
+        g("d = {frozenset([1,2]): 'a'}\nx = d[frozenset([2,1])]", "x"),
+        "'a'"
+    );
+    assert_eq!(
+        g(
+            "x = len({frozenset([1,2]), frozenset([2,1]), frozenset([3])})",
+            "x"
+        ),
+        "2"
+    );
+    // Set algebra: result type follows the left operand.
+    assert_eq!(
+        g("x = type(frozenset([1,2]) | {3}).__name__", "x"),
+        "'frozenset'"
+    );
+    assert_eq!(g("x = type({1,2} | frozenset([3])).__name__", "x"), "'set'");
+    assert_eq!(
+        g("x = frozenset([1,2,3]) & frozenset([2,3,4])", "x"),
+        "frozenset({2, 3})"
+    );
+    // isinstance: frozenset is not a set and vice versa.
+    assert_eq!(
+        g("x = (isinstance(frozenset(), frozenset), isinstance(frozenset(), set), isinstance({1}, frozenset))", "x"),
+        "(True, False, False)"
+    );
+    // set == frozenset by membership.
+    assert_eq!(g("x = frozenset([1,2]) == {1,2}", "x"), "True");
+}
+
+#[test]
+fn set_ops_and_comparisons() {
+    // Subset partial-order operators.
+    assert_eq!(
+        g("x = ({1,2} <= {1,2,3}, {1,2} < {1,2})", "x"),
+        "(True, False)"
+    );
+    assert_eq!(
+        g("x = ({1,2} < {3,4}, {1,2} > {3,4})", "x"),
+        "(False, False)"
+    );
+    assert_eq!(g("x = {1,2,3} > {1,2}", "x"), "True");
+    // isdisjoint and the *_update mutators (accept any iterable).
+    assert_eq!(g("x = {1,2}.isdisjoint([3,4])", "x"), "True");
+    assert_eq!(g("x = {1,2}.isdisjoint([2,3])", "x"), "False");
+    assert_eq!(
+        g("s = {1,2,3}\ns.intersection_update([2,3,4])\nx = s", "x"),
+        "{2, 3}"
+    );
+    assert_eq!(
+        g("s = {1,2,3}\ns.difference_update([2])\nx = s", "x"),
+        "{1, 3}"
+    );
+    assert_eq!(
+        g(
+            "s = {1,2,3}\ns.symmetric_difference_update([3,4])\nx = s",
+            "x"
+        ),
+        "{1, 2, 4}"
+    );
+    assert_eq!(g("x = {1,2,3}.issubset([1,2,3,4])", "x"), "True");
+}

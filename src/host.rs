@@ -113,7 +113,7 @@ pub mod unop {
 // ── heap objects ───────────────────────────────────────────────────────────
 
 /// A key usable in a dict/set: Python hashes by value for the immutable types.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum PKey {
     None,
     Int(i64),
@@ -128,6 +128,9 @@ pub enum PKey {
     Complex(u64, u64),
     Str(String),
     Tuple(Vec<PKey>),
+    /// A `frozenset` key: the element keys sorted+deduped into a canonical order,
+    /// so two equal frozensets (any insertion order) share one key.
+    Frozenset(Vec<PKey>),
 }
 
 /// A compiled function template: parameter shape + body chunk. Shared by every
@@ -208,6 +211,9 @@ pub enum PyObj {
     Tuple(Vec<Value>),
     Dict(IndexMap<PKey, (Value, Value)>),
     Set(IndexMap<PKey, Value>),
+    /// An immutable, hashable `frozenset`. Same storage as `Set`, but usable as
+    /// a dict key / set member (see `PKey::Frozenset`) and immutable.
+    Frozenset(IndexMap<PKey, Value>),
     Range {
         start: i64,
         stop: i64,
@@ -713,6 +719,29 @@ impl PyHost {
     pub fn new_set(&mut self, items: IndexMap<PKey, Value>) -> Value {
         self.alloc(PyObj::Set(items))
     }
+    pub fn new_frozenset(&mut self, items: IndexMap<PKey, Value>) -> Value {
+        self.alloc(PyObj::Frozenset(items))
+    }
+    /// A `set` or `frozenset` result, choosing the variant by `frozen` — used by
+    /// the set-algebra operators, whose result type follows the left operand.
+    pub fn new_setlike(&mut self, items: IndexMap<PKey, Value>, frozen: bool) -> Value {
+        if frozen {
+            self.alloc(PyObj::Frozenset(items))
+        } else {
+            self.alloc(PyObj::Set(items))
+        }
+    }
+    /// The backing map of a `set` or `frozenset`, else `None`.
+    pub fn setlike(&self, v: &Value) -> Option<&IndexMap<PKey, Value>> {
+        match self.get(v) {
+            Some(PyObj::Set(s)) | Some(PyObj::Frozenset(s)) => Some(s),
+            _ => None,
+        }
+    }
+    /// Whether `v` is a `frozenset`.
+    pub fn is_frozenset(&self, v: &Value) -> bool {
+        matches!(self.get(v), Some(PyObj::Frozenset(_)))
+    }
 
     pub fn as_str(&self, v: &Value) -> Option<String> {
         match self.get(v) {
@@ -973,6 +1002,7 @@ impl PyHost {
                     _ => "dict".into(),
                 },
                 Some(PyObj::Set(_)) => "set".into(),
+                Some(PyObj::Frozenset(_)) => "frozenset".into(),
                 Some(PyObj::Range { .. }) => "range".into(),
                 Some(PyObj::Slice { .. }) => "slice".into(),
                 Some(PyObj::Func(_)) => "function".into(),
@@ -1025,6 +1055,7 @@ impl PyHost {
                 Some(PyObj::Tuple(l)) => !l.is_empty(),
                 Some(PyObj::Dict(d)) => !d.is_empty(),
                 Some(PyObj::Set(s)) => !s.is_empty(),
+                Some(PyObj::Frozenset(s)) => !s.is_empty(),
                 Some(PyObj::Range { start, stop, step }) => range_len(*start, *stop, *step) != 0,
                 Some(PyObj::BigInt(b)) => *b != num_bigint::BigInt::from(0),
                 Some(PyObj::Complex(r, i)) => *r != 0.0 || *i != 0.0,
@@ -1128,7 +1159,8 @@ impl PyHost {
                 | Some(PyObj::List(_))
                 | Some(PyObj::Tuple(_))
                 | Some(PyObj::Dict(_))
-                | Some(PyObj::Set(_)) => self.repr_of(v),
+                | Some(PyObj::Set(_))
+                | Some(PyObj::Frozenset(_)) => self.repr_of(v),
                 None => "<object>".into(),
             },
             _ => "<object>".into(),
@@ -1218,6 +1250,14 @@ impl PyHost {
                         format!("{{{}}}", inner.join(", "))
                     }
                 }
+                Some(PyObj::Frozenset(s)) => {
+                    if s.is_empty() {
+                        "frozenset()".into()
+                    } else {
+                        let inner: Vec<String> = s.values().map(|x| self.repr_of(x)).collect();
+                        format!("frozenset({{{}}})", inner.join(", "))
+                    }
+                }
                 Some(PyObj::Exception { class, args }) => {
                     let inner: Vec<String> = args.iter().map(|a| self.repr_of(a)).collect();
                     format!("{class}({})", inner.join(", "))
@@ -1262,6 +1302,14 @@ impl PyHost {
                     }
                     PKey::Tuple(ks)
                 }
+                Some(PyObj::Frozenset(s)) => {
+                    // Canonicalize: element keys sorted + deduped, so any two
+                    // equal frozensets hash and compare identically.
+                    let mut ks: Vec<PKey> = s.keys().cloned().collect();
+                    ks.sort();
+                    ks.dedup();
+                    PKey::Frozenset(ks)
+                }
                 Some(other) => {
                     return Err(type_error(&format!(
                         "unhashable type: '{}'",
@@ -1279,6 +1327,7 @@ impl PyHost {
             PyObj::List(_) => "list",
             PyObj::Dict(_) => "dict",
             PyObj::Set(_) => "set",
+            PyObj::Frozenset(_) => "frozenset",
             _ => "object",
         }
     }
@@ -1312,7 +1361,12 @@ impl PyHost {
                                 y.get(k).map(|(_, yv)| self.equal(xv, yv)).unwrap_or(false)
                             })
                     }
-                    (Some(PyObj::Set(x)), Some(PyObj::Set(y))) => {
+                    // `set == frozenset` compares by membership, so
+                    // `{1,2} == frozenset({1,2})` holds.
+                    (Some(PyObj::Set(x)), Some(PyObj::Set(y)))
+                    | (Some(PyObj::Set(x)), Some(PyObj::Frozenset(y)))
+                    | (Some(PyObj::Frozenset(x)), Some(PyObj::Set(y)))
+                    | (Some(PyObj::Frozenset(x)), Some(PyObj::Frozenset(y))) => {
                         x.len() == y.len() && x.keys().all(|k| y.contains_key(k))
                     }
                     (Some(PyObj::Deque { items: x, .. }), Some(PyObj::Deque { items: y, .. })) => {
@@ -1678,13 +1732,14 @@ impl PyHost {
                         return Ok(self.alloc(PyObj::Complex(ar - br, ai - bi)));
                     }
                 }
-                // set difference
-                if let (Some(PyObj::Set(x)), Some(PyObj::Set(y))) = (self.get(a), self.get(b)) {
+                // set difference (result type follows the left operand)
+                if let (Some(x), Some(y)) = (self.setlike(a), self.setlike(b)) {
                     let mut out = x.clone();
                     for k in y.keys() {
                         out.shift_remove(k);
                     }
-                    return Ok(self.new_set(out));
+                    let frozen = self.is_frozenset(a);
+                    return Ok(self.new_setlike(out, frozen));
                 }
                 Err(self.optype_err("-", a, b))
             }
@@ -1804,6 +1859,21 @@ impl PyHost {
     /// Comparison ops for non-native operands (`<`, `>`, `<=`, `>=`).
     pub fn compare(&mut self, op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
         use std::cmp::Ordering;
+        // Sets/frozensets use the subset partial order, not a total order — the
+        // operands can be incomparable (`{1} < {2}` and `{1} > {2}` both False).
+        if let (Some(x), Some(y)) = (self.setlike(a), self.setlike(b)) {
+            let a_sub_b = x.keys().all(|k| y.contains_key(k)); // a ⊆ b
+            let b_sub_a = y.keys().all(|k| x.contains_key(k)); // b ⊆ a
+            let (la, lb) = (x.len(), y.len());
+            let res = match op {
+                NumOp::Le => a_sub_b,
+                NumOp::Lt => a_sub_b && la < lb,
+                NumOp::Ge => b_sub_a,
+                NumOp::Gt => b_sub_a && lb < la,
+                _ => unreachable!(),
+            };
+            return Ok(Value::Bool(res));
+        }
         let ord = self.order(a, b)?;
         let res = match op {
             NumOp::Lt => ord == Ordering::Less,
@@ -1979,8 +2049,8 @@ impl PyHost {
                 },
             },
             binop::BITAND | binop::BITOR | binop::BITXOR => {
-                // set operations
-                if let (Some(PyObj::Set(x)), Some(PyObj::Set(y))) = (self.get(a), self.get(b)) {
+                // set operations (result type follows the left operand)
+                if let (Some(x), Some(y)) = (self.setlike(a), self.setlike(b)) {
                     let (x, y) = (x.clone(), y.clone());
                     let mut out = IndexMap::new();
                     match tag {
@@ -2010,7 +2080,8 @@ impl PyHost {
                             }
                         }
                     }
-                    return Ok(self.new_set(out));
+                    let frozen = self.is_frozenset(a);
+                    return Ok(self.new_setlike(out, frozen));
                 }
                 if let (Some(x), Some(y)) = (self.big_val(a), self.big_val(b)) {
                     let res = match tag {
@@ -2748,7 +2819,7 @@ impl PyHost {
                     .collect();
                 Ok(chars)
             }
-            Some(PyObj::Set(s)) => Ok(s.values().cloned().collect()),
+            Some(PyObj::Set(s)) | Some(PyObj::Frozenset(s)) => Ok(s.values().cloned().collect()),
             Some(PyObj::Dict(d)) => Ok(d.values().map(|(k, _)| k.clone()).collect()),
             Some(PyObj::Range { start, stop, step }) => {
                 let (start, stop, step) = (*start, *stop, *step);
@@ -2806,7 +2877,7 @@ impl PyHost {
                     .collect(),
                 idx: 0,
             },
-            Some(PyObj::Set(s)) => IterState::Seq {
+            Some(PyObj::Set(s)) | Some(PyObj::Frozenset(s)) => IterState::Seq {
                 items: s.values().cloned().collect(),
                 idx: 0,
             },
@@ -2898,7 +2969,7 @@ impl PyHost {
                 let key = self.to_key(item)?;
                 Ok(d.contains_key(&key))
             }
-            Some(PyObj::Set(s)) => {
+            Some(PyObj::Set(s)) | Some(PyObj::Frozenset(s)) => {
                 let key = self.to_key(item)?;
                 Ok(s.contains_key(&key))
             }

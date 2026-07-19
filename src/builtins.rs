@@ -1742,6 +1742,7 @@ fn py_str(v: &Value) -> Result<String, String> {
                 | Some(PyObj::Tuple(_))
                 | Some(PyObj::Dict(_))
                 | Some(PyObj::Set(_))
+                | Some(PyObj::Frozenset(_))
         )
     }) {
         return py_repr(v);
@@ -1767,12 +1768,14 @@ fn py_repr(v: &Value) -> Result<String, String> {
         List(Vec<Value>),
         Tuple(Vec<Value>),
         Set(Vec<Value>),
+        Frozenset(Vec<Value>),
         Dict(Vec<(Value, Value)>),
     }
     let cont = with_host(|h| match h.get(v) {
         Some(PyObj::List(l)) => Some(Cont::List(l.clone())),
         Some(PyObj::Tuple(l)) => Some(Cont::Tuple(l.clone())),
         Some(PyObj::Set(s)) => Some(Cont::Set(s.values().cloned().collect())),
+        Some(PyObj::Frozenset(s)) => Some(Cont::Frozenset(s.values().cloned().collect())),
         Some(PyObj::Dict(d)) => Some(Cont::Dict(d.values().cloned().collect())),
         _ => None,
     });
@@ -1791,6 +1794,8 @@ fn py_repr(v: &Value) -> Result<String, String> {
             }
             Cont::Set(e) if e.is_empty() => "set()".into(),
             Cont::Set(e) => format!("{{{}}}", reprs(&e)?.join(", ")),
+            Cont::Frozenset(e) if e.is_empty() => "frozenset()".into(),
+            Cont::Frozenset(e) => format!("frozenset({{{}}})", reprs(&e)?.join(", ")),
             Cont::Dict(pairs) => {
                 let mut p = Vec::with_capacity(pairs.len());
                 for (k, val) in &pairs {
@@ -2292,7 +2297,11 @@ pub fn call_builtin_function(
                 let k = with_host(|h| h.to_key(&it))?;
                 host::set_put(&mut s, k, it);
             }
-            Ok(with_host(|h| h.new_set(s)))
+            if name == "frozenset" {
+                Ok(with_host(|h| h.new_frozenset(s)))
+            } else {
+                Ok(with_host(|h| h.new_set(s)))
+            }
         }
         "dict" => construct_dict(&args, &kwargs),
         "complex" => {
@@ -2423,7 +2432,7 @@ fn py_len(v: &Value) -> Result<usize, String> {
         Some(PyObj::Deque { items, .. }) => Ok(items.len()),
         Some(PyObj::List(l)) | Some(PyObj::Tuple(l)) => Ok(l.len()),
         Some(PyObj::Dict(d)) => Ok(d.len()),
-        Some(PyObj::Set(s)) => Ok(s.len()),
+        Some(PyObj::Set(s)) | Some(PyObj::Frozenset(s)) => Ok(s.len()),
         Some(PyObj::Range { start, stop, step }) => {
             Ok(host::range_len(*start, *stop, *step).max(0) as usize)
         }
@@ -3180,7 +3189,11 @@ const SET_METHODS: &[&str] = &[
     "difference",
     "issubset",
     "issuperset",
+    "isdisjoint",
     "update",
+    "intersection_update",
+    "difference_update",
+    "symmetric_difference_update",
     "copy",
     "symmetric_difference",
 ];
@@ -3897,6 +3910,25 @@ fn dict_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String
 }
 
 fn set_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    // `frozenset` is immutable: it has no in-place mutators.
+    if with_host(|h| h.is_frozenset(recv))
+        && matches!(
+            name,
+            "add"
+                | "discard"
+                | "remove"
+                | "clear"
+                | "update"
+                | "pop"
+                | "intersection_update"
+                | "difference_update"
+                | "symmetric_difference_update"
+        )
+    {
+        return Err(format!(
+            "AttributeError: 'frozenset' object has no attribute '{name}'"
+        ));
+    }
     match name {
         "add" => {
             let v = arg0(args)?;
@@ -3936,7 +3968,7 @@ fn set_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
         "symmetric_difference" => set_binop(recv, args, host::binop::BITXOR),
         "difference" => {
             let other = arg0(args)?;
-            let other_set = if with_host(|h| matches!(h.get(&other), Some(PyObj::Set(_)))) {
+            let other_set = if with_host(|h| h.setlike(&other).is_some()) {
                 other
             } else {
                 call_builtin_function("set", vec![other], vec![])?
@@ -3944,25 +3976,30 @@ fn set_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             with_host(|h| h.arith(NumOp::Sub, recv, &other_set))
         }
         "issubset" => {
-            let a0 = arg0(args)?;
-            let other = with_host(|h| set_keys(h, &a0));
+            let other = iter_keys(&arg0(args)?)?;
             Ok(Value::Bool(with_host(|h| {
                 set_keys(h, recv).iter().all(|k| other.contains(k))
             })))
         }
         "issuperset" => {
-            let a0 = arg0(args)?;
-            let other = with_host(|h| set_keys(h, &a0));
+            let other = iter_keys(&arg0(args)?)?;
             Ok(Value::Bool(with_host(|h| {
                 other.iter().all(|k| set_keys(h, recv).contains(k))
             })))
         }
+        "isdisjoint" => {
+            let other = iter_keys(&arg0(args)?)?;
+            Ok(Value::Bool(with_host(|h| {
+                set_keys(h, recv).iter().all(|k| !other.contains(k))
+            })))
+        }
         "copy" => {
-            let s = with_host(|h| match h.get(recv) {
-                Some(PyObj::Set(s)) => s.clone(),
-                _ => IndexMap::new(),
+            let (s, frozen) = with_host(|h| match h.get(recv) {
+                Some(PyObj::Set(s)) => (s.clone(), false),
+                Some(PyObj::Frozenset(s)) => (s.clone(), true),
+                _ => (IndexMap::new(), false),
             });
-            Ok(with_host(|h| h.new_set(s)))
+            Ok(with_host(|h| h.new_setlike(s, frozen)))
         }
         "update" => {
             let items = host::iter_vec(&arg0(args)?)?;
@@ -3986,6 +4023,39 @@ fn set_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
                 Err(host::type_error("not a set"))
             }
         }),
+        "intersection_update" => {
+            let other = iter_keys(&arg0(args)?)?;
+            with_host(|h| {
+                if let Some(PyObj::Set(s)) = h.get_mut(recv) {
+                    s.retain(|k, _| other.contains(k));
+                }
+            });
+            Ok(Value::Undef)
+        }
+        "difference_update" => {
+            let other = iter_keys(&arg0(args)?)?;
+            with_host(|h| {
+                if let Some(PyObj::Set(s)) = h.get_mut(recv) {
+                    s.retain(|k, _| !other.contains(k));
+                }
+            });
+            Ok(Value::Undef)
+        }
+        "symmetric_difference_update" => {
+            // Toggle membership of each element of the other iterable.
+            let items = host::iter_vec(&arg0(args)?)?;
+            for it in items {
+                let k = with_host(|h| h.to_key(&it))?;
+                with_host(|h| {
+                    if let Some(PyObj::Set(s)) = h.get_mut(recv) {
+                        if s.shift_remove(&k).is_none() {
+                            host::set_put(s, k, it);
+                        }
+                    }
+                });
+            }
+            Ok(Value::Undef)
+        }
         _ => Err(format!(
             "AttributeError: 'set' object has no attribute '{name}'"
         )),
@@ -3993,16 +4063,31 @@ fn set_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
 }
 
 fn set_keys(h: &host::PyHost, v: &Value) -> Vec<PKey> {
-    match h.get(v) {
-        Some(PyObj::Set(s)) => s.keys().cloned().collect(),
-        _ => vec![],
+    match h.setlike(v) {
+        Some(s) => s.keys().cloned().collect(),
+        None => vec![],
     }
+}
+
+/// The element keys of any iterable (set/frozenset short-circuit; anything else
+/// is materialized and hashed) — for set methods that accept an arbitrary
+/// iterable argument (`issubset([...])`, `isdisjoint((...))`, …).
+fn iter_keys(v: &Value) -> Result<Vec<PKey>, String> {
+    if let Some(ks) = with_host(|h| h.setlike(v).map(|s| s.keys().cloned().collect::<Vec<_>>())) {
+        return Ok(ks);
+    }
+    let items = host::iter_vec(v)?;
+    let mut ks = Vec::with_capacity(items.len());
+    for it in items {
+        ks.push(with_host(|h| h.to_key(&it))?);
+    }
+    Ok(ks)
 }
 
 fn set_binop(recv: &Value, args: &[Value], tag: i64) -> Result<Value, String> {
     let other = arg0(args)?;
     // Coerce a non-set argument to a set first.
-    let other_set = if with_host(|h| matches!(h.get(&other), Some(PyObj::Set(_)))) {
+    let other_set = if with_host(|h| h.setlike(&other).is_some()) {
         other
     } else {
         call_builtin_function("set", vec![other], vec![])?
