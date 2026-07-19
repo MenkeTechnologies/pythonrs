@@ -123,6 +123,9 @@ pub enum PKey {
     /// A non-integral float. Integral floats normalize to `Int`/`Big` so that
     /// `1`, `1.0`, and `True` share one key (`1.0 in {1}` → True).
     FloatBits(u64),
+    /// A `complex` with a non-zero imaginary part (real+zero-imag complex keys
+    /// normalize to the matching real key so `complex(1,0)` unifies with `1`).
+    Complex(u64, u64),
     Str(String),
     Tuple(Vec<PKey>),
 }
@@ -925,6 +928,7 @@ impl PyHost {
                 Some(PyObj::Set(s)) => !s.is_empty(),
                 Some(PyObj::Range { start, stop, step }) => range_len(*start, *stop, *step) != 0,
                 Some(PyObj::BigInt(b)) => *b != num_bigint::BigInt::from(0),
+                Some(PyObj::Complex(r, i)) => *r != 0.0 || *i != 0.0,
                 Some(PyObj::Instance(_)) => true, // __bool__/__len__ handled by caller
                 _ => true,
             },
@@ -1131,6 +1135,13 @@ impl PyHost {
             Value::Obj(_) => match self.get(v) {
                 Some(PyObj::Str(s)) => PKey::Str(s.clone()),
                 Some(PyObj::BigInt(b)) => PKey::Big(b.clone()),
+                Some(PyObj::Complex(r, i)) => {
+                    if *i == 0.0 {
+                        float_pkey(*r)
+                    } else {
+                        PKey::Complex(r.to_bits(), i.to_bits())
+                    }
+                }
                 Some(PyObj::Tuple(items)) => {
                     let mut ks = Vec::with_capacity(items.len());
                     for it in items {
@@ -1168,6 +1179,14 @@ impl PyHost {
                 if let (Some(x), Some(y)) = (self.num_val(a), self.num_val(b)) {
                     return x == y;
                 }
+                // complex == complex / complex == real
+                if self.is_complex(a) || self.is_complex(b) {
+                    if let (Some((ar, ai)), Some((br, bi))) =
+                        (self.complex_val(a), self.complex_val(b))
+                    {
+                        return ar == br && ai == bi;
+                    }
+                }
                 match (self.get(a), self.get(b)) {
                     (Some(PyObj::Str(x)), Some(PyObj::Str(y))) => x == y,
                     (Some(PyObj::List(x)), Some(PyObj::List(y)))
@@ -1202,6 +1221,20 @@ impl PyHost {
                 }
             }
         }
+    }
+
+    /// A value as `(real, imag)` if it participates in complex arithmetic: any
+    /// real number (imag = 0) or a `complex`. `None` for non-numerics.
+    pub fn complex_val(&self, v: &Value) -> Option<(f64, f64)> {
+        if let Some(PyObj::Complex(r, i)) = self.get(v) {
+            return Some((*r, *i));
+        }
+        self.num_val(v).map(|r| (r, 0.0))
+    }
+
+    /// True if `v` is a `complex` heap object.
+    pub fn is_complex(&self, v: &Value) -> bool {
+        matches!(self.get(v), Some(PyObj::Complex(..)))
     }
 
     /// A numeric value as f64 if `v` is a number (int/float/bool/bigint).
@@ -1320,12 +1353,86 @@ pub fn fmt_float(f: f64) -> String {
 }
 
 fn fmt_complex(r: f64, i: f64) -> String {
-    if r == 0.0 {
-        format!("{}j", fmt_float(i))
+    // A complex part reprs like a float but drops a trailing `.0` for integral
+    // values (`complex(1,2)` → `(1+2j)`, not `(1.0+2.0j)`).
+    if r == 0.0 && r.is_sign_positive() {
+        format!("{}j", fmt_complex_part(i))
     } else {
-        let sign = if i >= 0.0 { "+" } else { "-" };
-        format!("({}{}{}j)", fmt_float(r), sign, fmt_float(i.abs()))
+        let sign = if i >= 0.0 || i.is_nan() { "+" } else { "-" };
+        format!(
+            "({}{}{}j)",
+            fmt_complex_part(r),
+            sign,
+            fmt_complex_part(i.abs())
+        )
     }
+}
+
+/// A single `complex` component: the float repr with a trailing `.0` stripped.
+fn fmt_complex_part(f: f64) -> String {
+    let s = fmt_float(f);
+    match s.strip_suffix(".0") {
+        Some(t) => t.to_string(),
+        None => s,
+    }
+}
+
+/// Complex exponentiation (`complex.__pow__`), a faithful port of CPython's
+/// `complex_pow` (`Objects/complexobject.c`): a small integral exponent uses
+/// exact repeated-squaring (`c_powi`); anything else the polar `_Py_c_pow`.
+fn c_pow(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
+    if b.1 == 0.0 && b.0 == b.0.floor() && b.0.abs() <= 100.0 {
+        return c_powi(a, b.0 as i64);
+    }
+    c_pow_polar(a, b)
+}
+
+fn c_pow_polar(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
+    if b.0 == 0.0 && b.1 == 0.0 {
+        return (1.0, 0.0);
+    }
+    if a.0 == 0.0 && a.1 == 0.0 {
+        return (0.0, 0.0);
+    }
+    let vabs = a.0.hypot(a.1);
+    let mut len = vabs.powf(b.0);
+    let at = a.1.atan2(a.0);
+    let mut phase = at * b.0;
+    if b.1 != 0.0 {
+        len /= (at * b.1).exp();
+        phase += b.1 * vabs.ln();
+    }
+    (len * phase.cos(), len * phase.sin())
+}
+
+fn c_prod(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
+    (a.0 * b.0 - a.1 * b.1, a.0 * b.1 + a.1 * b.0)
+}
+
+/// `c_powi`: integer complex power via repeated squaring (CPython's `c_powu`,
+/// with the reciprocal for a negative exponent).
+fn c_powi(x: (f64, f64), n: i64) -> (f64, f64) {
+    if n < 0 {
+        let p = c_powu(x, -n);
+        // reciprocal 1/p
+        let d = p.0 * p.0 + p.1 * p.1;
+        return (p.0 / d, -p.1 / d);
+    }
+    c_powu(x, n)
+}
+
+fn c_powu(x: (f64, f64), n: i64) -> (f64, f64) {
+    let mut r = (1.0, 0.0);
+    let mut p = x;
+    let mut mask = 1i64;
+    while mask > 0 && n >= mask {
+        if n & mask != 0 {
+            r = c_prod(r, p);
+        }
+        mask <<= 1;
+        p = c_prod(p, p);
+    }
+    r
 }
 
 fn quote_str(s: &str) -> String {
@@ -1417,6 +1524,14 @@ impl PyHost {
                 if let (Some(x), Some(y)) = (self.num_val(a), self.num_val(b)) {
                     return Ok(Value::Float(x + y));
                 }
+                // complex + complex / int + complex / …
+                if self.is_complex(a) || self.is_complex(b) {
+                    if let (Some((ar, ai)), Some((br, bi))) =
+                        (self.complex_val(a), self.complex_val(b))
+                    {
+                        return Ok(self.alloc(PyObj::Complex(ar + br, ai + bi)));
+                    }
+                }
                 // str + str, list + list, tuple + tuple
                 match (self.get(a), self.get(b)) {
                     (Some(PyObj::Str(x)), Some(PyObj::Str(y))) => {
@@ -1443,6 +1558,13 @@ impl PyHost {
                 if let (Some(x), Some(y)) = (self.num_val(a), self.num_val(b)) {
                     return Ok(Value::Float(x - y));
                 }
+                if self.is_complex(a) || self.is_complex(b) {
+                    if let (Some((ar, ai)), Some((br, bi))) =
+                        (self.complex_val(a), self.complex_val(b))
+                    {
+                        return Ok(self.alloc(PyObj::Complex(ar - br, ai - bi)));
+                    }
+                }
                 // set difference
                 if let (Some(PyObj::Set(x)), Some(PyObj::Set(y))) = (self.get(a), self.get(b)) {
                     let mut out = x.clone();
@@ -1464,6 +1586,13 @@ impl PyHost {
                 if let (Some(x), Some(y)) = (self.num_val(a), self.num_val(b)) {
                     return Ok(Value::Float(x * y));
                 }
+                if self.is_complex(a) || self.is_complex(b) {
+                    if let (Some((ar, ai)), Some((br, bi))) =
+                        (self.complex_val(a), self.complex_val(b))
+                    {
+                        return Ok(self.alloc(PyObj::Complex(ar * br - ai * bi, ar * bi + ai * br)));
+                    }
+                }
                 Err(self.optype_err("*", a, b))
             }
             Div => self.binop(binop::DIV, a, b),
@@ -1472,6 +1601,10 @@ impl PyHost {
             Neg => {
                 if let Some(x) = self.big_val(a) {
                     return Ok(self.norm_big(-x));
+                }
+                if let Some(PyObj::Complex(r, i)) = self.get(a) {
+                    let (r, i) = (*r, *i);
+                    return Ok(self.alloc(PyObj::Complex(-r, -i)));
                 }
                 Err(type_error(&format!(
                     "bad operand type for unary -: '{}'",
@@ -1613,6 +1746,21 @@ impl PyHost {
             binop::DIV => match (af, bf) {
                 (Some(_), Some(0.0)) => Err("ZeroDivisionError: division by zero".into()),
                 (Some(x), Some(y)) => Ok(Value::Float(x / y)),
+                _ if self.is_complex(a) || self.is_complex(b) => {
+                    match (self.complex_val(a), self.complex_val(b)) {
+                        (Some((ar, ai)), Some((br, bi))) => {
+                            let d = br * br + bi * bi;
+                            if d == 0.0 {
+                                return Err("ZeroDivisionError: complex division by zero".into());
+                            }
+                            Ok(self.alloc(PyObj::Complex(
+                                (ar * br + ai * bi) / d,
+                                (ai * br - ar * bi) / d,
+                            )))
+                        }
+                        _ => Err(self.optype_err("/", a, b)),
+                    }
+                }
                 _ => Err(self.optype_err("/", a, b)),
             },
             binop::FLOORDIV => {
@@ -1685,6 +1833,15 @@ impl PyHost {
                     }
                     Ok(self.norm_big(acc))
                 }
+                _ if self.is_complex(a) || self.is_complex(b) => {
+                    match (self.complex_val(a), self.complex_val(b)) {
+                        (Some(x), Some(y)) => {
+                            let (r, i) = c_pow(x, y);
+                            Ok(self.alloc(PyObj::Complex(r, i)))
+                        }
+                        _ => Err(self.optype_err("**", a, b)),
+                    }
+                }
                 _ => match (af, bf) {
                     // `0 ** <negative>` is a division by zero in CPython, not `inf`.
                     // Integer base and float base word the message differently.
@@ -1697,6 +1854,12 @@ impl PyHost {
                                     .into(),
                             )
                         }
+                    }
+                    // A negative real base raised to a non-integer power yields a
+                    // complex result in CPython (Rust's `powf` returns NaN).
+                    (Some(x), Some(y)) if x < 0.0 && y.fract() != 0.0 => {
+                        let (r, i) = c_pow((x, 0.0), (y, 0.0));
+                        Ok(self.alloc(PyObj::Complex(r, i)))
                     }
                     (Some(x), Some(y)) => Ok(Value::Float(x.powf(y))),
                     _ => Err(self.optype_err("**", a, b)),
@@ -2920,6 +3083,31 @@ impl PyHost {
                 Ok(self.new_str(n))
             }
             _ => {
+                // Numeric `.real`/`.imag` (int/float/bool/bigint/complex are all
+                // read-only descriptors in CPython).
+                if name == "real" || name == "imag" {
+                    if let Some(PyObj::Complex(r, i)) = self.get(recv) {
+                        let (r, i) = (*r, *i);
+                        return Ok(Value::Float(if name == "real" { r } else { i }));
+                    }
+                    if let Value::Int(_) | Value::Bool(_) = recv {
+                        return Ok(if name == "real" {
+                            recv.clone()
+                        } else {
+                            Value::Int(0)
+                        });
+                    }
+                    if let Value::Float(f) = recv {
+                        return Ok(Value::Float(if name == "real" { *f } else { 0.0 }));
+                    }
+                    if matches!(self.get(recv), Some(PyObj::BigInt(_))) {
+                        return Ok(if name == "real" {
+                            recv.clone()
+                        } else {
+                            Value::Int(0)
+                        });
+                    }
+                }
                 // Builtin type method: hand back a bound builtin method.
                 let tn = self.type_name(recv);
                 if crate::builtins::type_has_method(&tn, name) {

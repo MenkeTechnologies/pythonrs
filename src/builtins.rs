@@ -1925,6 +1925,10 @@ pub fn call_builtin_function(
                     }
                     _ => unreachable!(),
                 },
+                Value::Obj(_) if matches!(h.get(&v), Some(PyObj::Complex(..))) => match h.get(&v) {
+                    Some(PyObj::Complex(r, i)) => Ok(Value::Float(r.hypot(*i))),
+                    _ => unreachable!(),
+                },
                 _ => Err(host::type_error(&format!(
                     "bad operand type for abs(): '{}'",
                     h.type_name(&v)
@@ -2326,6 +2330,27 @@ pub fn call_builtin_function(
         }
         "dict" => construct_dict(&args, &kwargs),
         "complex" => {
+            // `complex("1+2j")` — string parsing (single string arg only).
+            if let Some(first) = args.first() {
+                if let Some(s) = with_host(|h| h.as_str(first)) {
+                    if args.len() > 1 {
+                        return Err(host::type_error(
+                            "complex() can't take second arg if first is a string",
+                        ));
+                    }
+                    let (r, i) = parse_complex(&s)?;
+                    return Ok(with_host(|h| h.alloc(PyObj::Complex(r, i))));
+                }
+                // `complex(z)` from another complex.
+                if let Some((r, i)) = with_host(|h| match h.get(first) {
+                    Some(PyObj::Complex(r, i)) => Some((*r, *i)),
+                    _ => None,
+                }) {
+                    if args.len() == 1 {
+                        return Ok(with_host(|h| h.alloc(PyObj::Complex(r, i))));
+                    }
+                }
+            }
             let r = args
                 .first()
                 .and_then(|v| with_host(|h| h.as_int(v)).map(|n| n as f64).or(as_f(v)))
@@ -2734,6 +2759,64 @@ fn construct_int(args: &[Value]) -> Result<Value, String> {
     })
 }
 
+/// Parse a `complex()` string argument (`"1+2j"`, `"2j"`, `"-1-3j"`, `"(1+2j)"`,
+/// `"j"`, `"5"`). Faithful to CPython's split rule: the last unescaped `+`/`-`
+/// that isn't an exponent sign separates the real and imaginary parts.
+fn parse_complex(s: &str) -> Result<(f64, f64), String> {
+    let err = || "ValueError: complex() arg is a malformed string".to_string();
+    let mut t = s.trim();
+    if let Some(inner) = t.strip_prefix('(').and_then(|x| x.strip_suffix(')')) {
+        t = inner.trim();
+    }
+    if t.is_empty() {
+        return Err(err());
+    }
+    let bytes = t.as_bytes();
+    let has_j = matches!(bytes[bytes.len() - 1], b'j' | b'J');
+    if !has_j {
+        return Ok((parse_py_float(t).ok_or_else(err)?, 0.0));
+    }
+    let body = &t[..t.len() - 1]; // strip the trailing `j`
+    let bb = body.as_bytes();
+    let mut split = None;
+    for i in (1..bb.len()).rev() {
+        if (bb[i] == b'+' || bb[i] == b'-') && !matches!(bb[i - 1], b'e' | b'E') {
+            split = Some(i);
+            break;
+        }
+    }
+    match split {
+        Some(k) => {
+            let r = parse_py_float(body[..k].trim()).ok_or_else(err)?;
+            let i = parse_imag(&body[k..])?;
+            Ok((r, i))
+        }
+        None => Ok((0.0, parse_imag(body)?)),
+    }
+}
+
+/// The imaginary magnitude of a complex string part (already `j`-stripped): a
+/// bare/empty/`+`/`-` means ±1, otherwise a float.
+fn parse_imag(s: &str) -> Result<f64, String> {
+    let err = || "ValueError: complex() arg is a malformed string".to_string();
+    match s.trim() {
+        "" | "+" => Ok(1.0),
+        "-" => Ok(-1.0),
+        t => parse_py_float(t).ok_or_else(err),
+    }
+}
+
+/// Parse a Python float literal (with `inf`/`nan`/underscores), or `None`.
+fn parse_py_float(s: &str) -> Option<f64> {
+    let cleaned = s.trim().replace('_', "");
+    match cleaned.as_str() {
+        "inf" | "infinity" | "Infinity" | "+inf" | "+infinity" => Some(f64::INFINITY),
+        "-inf" | "-infinity" => Some(f64::NEG_INFINITY),
+        "nan" | "+nan" | "-nan" => Some(f64::NAN),
+        t => t.parse::<f64>().ok(),
+    }
+}
+
 fn construct_float(args: &[Value]) -> Result<Value, String> {
     let v = match args.first() {
         Some(v) => v.clone(),
@@ -3013,6 +3096,7 @@ pub fn type_has_method(typename: &str, name: &str) -> bool {
         "deque" => DEQUE_METHODS,
         "TextIOWrapper" => FILE_METHODS,
         "int" | "float" | "bool" => NUM_METHODS,
+        "complex" => COMPLEX_METHODS,
         "property" => PROPERTY_METHODS,
         "generator" => GENERATOR_METHODS,
         _ => &[],
@@ -3134,6 +3218,7 @@ const SET_METHODS: &[&str] = &[
 ];
 const TUPLE_METHODS: &[&str] = &["count", "index"];
 const NUM_METHODS: &[&str] = &["bit_length", "is_integer", "conjugate"];
+const COMPLEX_METHODS: &[&str] = &["conjugate"];
 
 /// Dispatch a method call on a builtin-typed receiver.
 pub fn call_type_method(
@@ -3161,6 +3246,7 @@ pub fn call_type_method(
         "TextIOWrapper" => file_method(recv, name, &args),
         "functools._lru_cache_wrapper" => lru_wrapper_method(recv, name),
         "int" | "float" | "bool" => num_method(recv, name, &args),
+        "complex" => complex_method(recv, name),
         "property" => property_method(recv, name, &args),
         "generator" => generator_method(recv, name, &args),
         other => Err(format!(
@@ -3994,6 +4080,24 @@ fn num_method(recv: &Value, name: &str, _args: &[Value]) -> Result<Value, String
         })),
         "conjugate" => Ok(recv.clone()),
         _ => Err(format!("AttributeError: object has no attribute '{name}'")),
+    }
+}
+
+/// `complex` methods (`conjugate`).
+fn complex_method(recv: &Value, name: &str) -> Result<Value, String> {
+    match name {
+        "conjugate" => with_host(|h| match h.get(recv) {
+            Some(PyObj::Complex(r, i)) => {
+                let (r, i) = (*r, *i);
+                Ok(h.alloc(PyObj::Complex(r, -i)))
+            }
+            _ => Err(host::type_error(
+                "descriptor 'conjugate' requires a 'complex' object",
+            )),
+        }),
+        _ => Err(format!(
+            "AttributeError: 'complex' object has no attribute '{name}'"
+        )),
     }
 }
 

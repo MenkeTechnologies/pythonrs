@@ -219,9 +219,15 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
 - [x] **`0 ** <negative>`** — FIXED: raises `ZeroDivisionError` (int base: `zero to
       a negative power`; float base: `0.0 cannot be raised to a negative power`)
       instead of returning `inf`. (Was the last mixed-fuzz divergence.)
-- [ ] **Complex arithmetic unusable** — `(1+2j)+(3+4j)` → `TypeError`; `complex("1+2j")`
-      → `0.0j`; `(-8)**(1/3)` → `nan` (want the complex root); `.real`/`.imag`/`abs`
-      all fail.
+- [x] **Complex arithmetic** — FIXED: `int op complex`/`complex op complex` for
+      `+ - * / **` route through `complex_val`/`c_pow` (CPython `complex_pow`:
+      exact `c_powi` repeated-squaring for small integral exponents, polar
+      `_Py_c_pow` otherwise); `complex("1+2j")`/`"-2j"`/`"(1+2j)"`/`"j"` parsing
+      (CPython last-non-exponent-sign split); `.real`/`.imag`/`.conjugate()`,
+      `abs(complex)`, and a negative real base to a fractional power → complex
+      root (`(-8)**(1/3)`). Complex `==` (real+zero-imag unifies with the real
+      number), `bool`, and hashing (`PKey::Complex`; zero-imag normalizes to the
+      real key) all work. `complex(1,2)` repr `(1+2j)` (integral parts drop `.0`).
 - [ ] **`frozenset` is not a real type** — unhashable (`TypeError: unhashable type:
       'set'`), can't be a dict key/set member, no `frozenset(...)` repr, conflated with `set`.
 - [ ] **Misc:** `bool` bit-ops return `int` not `bool` (`True&False`→`0`); int/float
