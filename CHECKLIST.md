@@ -116,8 +116,12 @@ Binary arithmetic dunders (`__add__`/reflected, all operators), single/multiple
 inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
 `__len__`/`__getitem__`(int)/`__setitem__` all **work**. Grounded gaps:
 
-- [ ] **`super` is an undefined name** — `NameError`. Blocks all cooperative
-      inheritance, `super().__init__()`, method extension. Biggest OOP blocker.
+- [x] **`super`** — FIXED: zero-arg `super()` (reads the enclosing method's
+      defining class + `self`) and explicit `super(C, obj)` both build a `PyObj::Super`
+      proxy; method/attr lookup starts in the MRO strictly after the owner and binds
+      the original instance. `mro_of` now uses **C3 linearization** (was a naive DFS),
+      so cooperative `super()` across diamond inheritance visits each base once in the
+      correct order (`D(B,C)`→`[D,B,C,A]`). `super().__init__()` and method extension work.
 - [ ] **`property` / `classmethod` / `staticmethod` are undefined names** —
       the three most-used class decorators all `NameError`.
 - [ ] **Instances are never hashable** — `hash(A())` / instance as dict key / set

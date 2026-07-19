@@ -651,6 +651,50 @@ fn custom_getitem_slice_and_slice_repr() {
 }
 
 #[test]
+fn super_cooperative_inheritance() {
+    // super().__init__ + method extension through a single chain.
+    let src = "
+class A:
+    def __init__(self, x):
+        self.x = x
+    def greet(self):
+        return 'A' + str(self.x)
+class B(A):
+    def __init__(self, x, y):
+        super().__init__(x)
+        self.y = y
+    def greet(self):
+        return super().greet() + 'B' + str(self.y)
+b = B(1, 2)
+coords = (b.x, b.y)
+msg = b.greet()
+";
+    assert_eq!(g(src, "coords"), "(1, 2)");
+    assert_eq!(g(src, "msg"), "'A1B2'");
+}
+
+#[test]
+fn super_diamond_c3_mro() {
+    // Cooperative super() across a diamond must visit each base once, in C3 order.
+    let src = "
+class A:
+    def m(self):
+        return ['A']
+class B(A):
+    def m(self):
+        return ['B'] + super().m()
+class C(A):
+    def m(self):
+        return ['C'] + super().m()
+class D(B, C):
+    def m(self):
+        return ['D'] + super().m()
+x = D().m()
+";
+    assert_eq!(g(src, "x"), "['D', 'B', 'C', 'A']");
+}
+
+#[test]
 fn numeric_keys_unify_in_dict_and_set() {
     // 1, 1.0, True hash and compare equal, so they collapse to one key.
     assert_eq!(g("x = 1.0 in {1}", "x"), "True");

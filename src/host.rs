@@ -273,6 +273,13 @@ pub enum PyObj {
         func: Value,
         cache_id: u32,
     },
+    /// A bound `super` proxy: attribute/method lookup starts in the MRO of
+    /// `instance`'s class strictly AFTER `owner` (the defining class), binding
+    /// `instance` as `self`. Built by the `super()` builtin.
+    Super {
+        owner: String,
+        instance: Value,
+    },
 }
 
 /// Iterator cursor state.
@@ -816,6 +823,7 @@ impl PyHost {
                 Some(PyObj::NamedTupleType { .. }) => "type".into(),
                 Some(PyObj::Partial { .. }) => "partial".into(),
                 Some(PyObj::LruCache { .. }) => "functools._lru_cache_wrapper".into(),
+                Some(PyObj::Super { .. }) => "super".into(),
                 None => "object".into(),
             },
             _ => "object".into(),
@@ -899,6 +907,13 @@ impl PyHost {
                 }
                 Some(PyObj::LruCache { func, .. }) => {
                     format!("<functools._lru_cache_wrapper {}>", self.str_of(func))
+                }
+                Some(PyObj::Super { owner, instance }) => {
+                    let icls = match self.get(instance) {
+                        Some(PyObj::Instance(i)) => i.class.clone(),
+                        _ => owner.clone(),
+                    };
+                    format!("<super: <class '{owner}'>, <{icls} object>>")
                 }
                 Some(PyObj::Slice { .. })
                 | Some(PyObj::List(_))
@@ -2541,22 +2556,52 @@ fn slice_bounds(lo: &Value, hi: &Value, step: i64, n: i64, h: &PyHost) -> (i64, 
 // ── attributes ───────────────────────────────────────────────────────────────
 
 impl PyHost {
-    /// The method resolution order names for a class (this class first).
+    /// The method resolution order for a class (this class first), computed by
+    /// C3 linearization — the same algorithm CPython uses, so cooperative
+    /// `super()` across diamond inheritance visits every base exactly once in the
+    /// correct order. (`object` is implicit and omitted, since no methods live on
+    /// it in the class registry.)
     pub fn mro_of(&self, class: &str) -> Vec<String> {
-        let mut out = Vec::new();
-        let mut stack = vec![class.to_string()];
-        while let Some(c) = stack.pop() {
-            if out.contains(&c) {
-                continue;
+        let bases: Vec<String> = self
+            .classes
+            .get(class)
+            .map(|cd| cd.bases.clone())
+            .unwrap_or_default();
+        if bases.is_empty() {
+            return vec![class.to_string()];
+        }
+        let mut seqs: Vec<Vec<String>> = bases.iter().map(|b| self.mro_of(b)).collect();
+        seqs.push(bases);
+        let mut result = vec![class.to_string()];
+        loop {
+            seqs.retain(|s| !s.is_empty());
+            if seqs.is_empty() {
+                break;
             }
-            out.push(c.clone());
-            if let Some(cd) = self.classes.get(&c) {
-                for b in &cd.bases {
-                    stack.push(b.clone());
+            // A valid next head appears at the front of some sequence and never
+            // in the tail of any sequence.
+            let head = seqs.iter().find_map(|s| {
+                let h = &s[0];
+                let in_tail = seqs.iter().any(|t| t.len() > 1 && t[1..].contains(h));
+                if in_tail {
+                    None
+                } else {
+                    Some(h.clone())
+                }
+            });
+            let head = match head {
+                Some(h) => h,
+                // Inconsistent hierarchy (CPython raises); degrade gracefully.
+                None => break,
+            };
+            result.push(head.clone());
+            for s in &mut seqs {
+                if s.first() == Some(&head) {
+                    s.remove(0);
                 }
             }
         }
-        out
+        result
     }
 
     /// Look up a name in a class's MRO namespace.
@@ -2638,6 +2683,30 @@ impl PyHost {
                 Err(format!(
                     "AttributeError: '{class}' object has no attribute '{name}'"
                 ))
+            }
+            Some(PyObj::Super { owner, instance }) => {
+                let owner = owner.clone();
+                let instance = instance.clone();
+                let inst_class = match self.get(&instance) {
+                    Some(PyObj::Instance(i)) => i.class.clone(),
+                    _ => owner.clone(),
+                };
+                match super_lookup(self, &owner, &inst_class, name) {
+                    Some((v, _)) => {
+                        // Bind a found method to the original instance.
+                        if matches!(self.get(&v), Some(PyObj::Func(_))) {
+                            Ok(self.alloc(PyObj::BoundMethod {
+                                recv: instance,
+                                func: v,
+                            }))
+                        } else {
+                            Ok(v)
+                        }
+                    }
+                    None => Err(format!(
+                        "AttributeError: 'super' object has no attribute '{name}'"
+                    )),
+                }
             }
             Some(PyObj::Builtin(n)) if name == "__name__" => {
                 // `type(x).__name__` — the builtin/type object's name.
@@ -2845,8 +2914,41 @@ pub fn call_method(
                 "AttributeError: module '{mname}' has no attribute '{name}'"
             )),
         },
+        Some(PyObj::Super { owner, instance }) => {
+            let inst_class = match with_host(|h| h.get(&instance).cloned()) {
+                Some(PyObj::Instance(i)) => i.class,
+                _ => owner.clone(),
+            };
+            match with_host(|h| super_lookup(h, &owner, &inst_class, name)) {
+                Some((f, found)) => {
+                    let fobj = with_host(|h| h.get(&f).cloned());
+                    if let Some(PyObj::Func(fv)) = fobj {
+                        return run_user_func(&fv, Some(instance), Some(found), args, kwargs);
+                    }
+                    invoke(&f, args, kwargs)
+                }
+                None => Err(format!(
+                    "AttributeError: 'super' object has no attribute '{name}'"
+                )),
+            }
+        }
         _ => crate::builtins::call_type_method(recv, name, args, kwargs),
     }
+}
+
+/// Resolve `name` for a `super` proxy: search the MRO of `inst_class` strictly
+/// AFTER `owner`, returning the found `(func_value, defining_class)`.
+fn super_lookup(h: &PyHost, owner: &str, inst_class: &str, name: &str) -> Option<(Value, String)> {
+    let mro = h.mro_of(inst_class);
+    let start = mro.iter().position(|c| c == owner).map(|i| i + 1)?;
+    for c in &mro[start..] {
+        if let Some(cd) = h.classes.get(c) {
+            if let Some(v) = cd.ns.get(name) {
+                return Some((v.clone(), c.clone()));
+            }
+        }
+    }
+    None
 }
 
 fn method_owner(h: &PyHost, class: &str, name: &str) -> Option<String> {
