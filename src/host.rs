@@ -2465,19 +2465,18 @@ impl PyHost {
 }
 
 /// Resolve the (start, stop) integer bounds of a slice given optional endpoints.
+/// Mirrors CPython's `PySlice_AdjustIndices`: negative endpoints are relative to
+/// the end, and the clamping bounds differ by step direction (a negative step
+/// clamps into `[-1, n-1]`, a positive step into `[0, n]`).
 fn slice_bounds(lo: &Value, hi: &Value, step: i64, n: i64, h: &PyHost) -> (i64, i64) {
-    let clamp = |x: i64| -> i64 {
-        let k = if x < 0 { x + n } else { x };
-        k.clamp(0, n)
+    let lower = if step < 0 { -1 } else { 0 };
+    let upper = if step < 0 { n - 1 } else { n };
+    let adjust = |x: i64| -> i64 {
+        let x = if x < 0 { x + n } else { x };
+        x.clamp(lower, upper)
     };
     let start = match h.as_int(lo) {
-        Some(x) => {
-            if x < 0 {
-                (x + n).max(if step < 0 { -1 } else { 0 })
-            } else {
-                x.min(n)
-            }
-        }
+        Some(x) => adjust(x),
         None => {
             if step < 0 {
                 n - 1
@@ -2487,13 +2486,7 @@ fn slice_bounds(lo: &Value, hi: &Value, step: i64, n: i64, h: &PyHost) -> (i64, 
         }
     };
     let stop = match h.as_int(hi) {
-        Some(x) => {
-            if x < 0 {
-                (x + n).max(if step < 0 { -1 } else { 0 })
-            } else {
-                x.min(n)
-            }
-        }
+        Some(x) => adjust(x),
         None => {
             if step < 0 {
                 -1
@@ -2502,7 +2495,6 @@ fn slice_bounds(lo: &Value, hi: &Value, step: i64, n: i64, h: &PyHost) -> (i64, 
             }
         }
     };
-    let _ = clamp;
     (start, stop)
 }
 
