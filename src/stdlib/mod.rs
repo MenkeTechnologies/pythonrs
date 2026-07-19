@@ -7,15 +7,11 @@
 //! functions (they re-enter `with_host` for generator-safe iteration and callback
 //! dispatch, so they must not hold a `&mut PyHost`); `json`/`os`/`random`/`string`
 //! take `&mut PyHost` directly (no re-entrancy).
-pub mod bisect;
-pub mod datetime;
 pub mod functools;
-pub mod heapq;
 pub mod itertools;
 pub mod json;
 pub mod os;
 pub mod random;
-pub mod re;
 pub mod statistics;
 pub mod string;
 pub mod textwrap;
