@@ -1686,18 +1686,19 @@ pub fn call_builtin_function(
         }
         "round" => {
             let v = arg0(&args)?;
+            // `ndigits` is present only when a second arg was passed and it is not None.
+            let has_nd = matches!(args.get(1), Some(x) if !matches!(x, Value::Undef));
             let nd = args.get(1).and_then(|v| with_host(|h| h.as_int(v)));
-            with_host(|_h| match &v {
-                Value::Int(n) => Ok(Value::Int(*n)),
-                Value::Float(f) => match nd {
-                    Some(d) => {
-                        let m = 10f64.powi(d as i32);
-                        Ok(Value::Float((f * m).round() / m))
-                    }
-                    None => Ok(Value::Int(f.round() as i64)),
-                },
+            match &v {
+                Value::Bool(b) => Ok(round_int(&num_bigint::BigInt::from(*b as i64), has_nd, nd)),
+                Value::Int(n) => Ok(round_int(&num_bigint::BigInt::from(*n), has_nd, nd)),
+                Value::Obj(_) if with_host(|h| matches!(h.get(&v), Some(PyObj::BigInt(_)))) => {
+                    let n = with_host(|h| h.big_val(&v)).unwrap();
+                    Ok(round_int(&n, has_nd, nd))
+                }
+                Value::Float(f) => round_float(*f, has_nd, nd),
                 _ => Err(host::type_error("round() argument must be a number")),
-            })
+            }
         }
         "divmod" => {
             let a = arg0(&args)?;
@@ -1796,10 +1797,10 @@ pub fn call_builtin_function(
             let spec =
                 with_host(|h| h.str_of(&args.get(1).cloned().unwrap_or_else(|| Value::str(""))));
             let s = py_str(&v)?;
-            Ok(with_host(|h| {
-                let out = apply_format_spec(&s, &v, &spec);
-                h.new_str(out)
-            }))
+            // `apply_format_spec` re-enters `with_host` internally, so it must be
+            // called outside any active host borrow.
+            let out = apply_format_spec(&s, &v, &spec);
+            Ok(with_host(|h| h.new_str(out)))
         }
         "iter" => {
             let v = arg0(&args)?;
@@ -2110,6 +2111,76 @@ fn py_sorted(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, String
         out.reverse();
     }
     Ok(with_host(|h| h.new_list(out)))
+}
+
+/// `round(int[, ndigits])`. Positive/absent ndigits leave an integer unchanged
+/// (returning `int`); negative ndigits round to the nearest `10**-ndigits` with
+/// round-half-to-even. Always returns an `int` (CPython's `int.__round__`).
+fn round_int(n: &num_bigint::BigInt, has_nd: bool, nd: Option<i64>) -> Value {
+    let d = if has_nd { nd.unwrap_or(0) } else { 0 };
+    if d >= 0 {
+        return with_host(|h| h.norm_big(n.clone()));
+    }
+    use num_integer::Integer;
+    use num_traits::Zero;
+    let k = (-d) as u32;
+    let base = num_bigint::BigInt::from(10).pow(k);
+    let (q, r) = n.div_mod_floor(&base); // r in [0, base)
+    let half = &base / 2u32; // base = 10**k (k>=1) is even -> exact half
+    let rounded = if r < half {
+        q
+    } else if r > half {
+        q + 1
+    } else if (&q % 2u32).is_zero() {
+        q // tie -> round to even
+    } else {
+        q + 1
+    };
+    with_host(|h| h.norm_big(rounded * base))
+}
+
+/// `round(float[, ndigits])`. With no ndigits (or `None`) returns an `int`;
+/// otherwise a `float`. Rounding is round-half-to-even on the true decimal value,
+/// matching CPython — Rust's `{:.N}` formatting already rounds half-to-even, so we
+/// format-then-parse to get the correctly-rounded result (also fixing the
+/// `2.675`-is-really-2.6749… representation issue).
+fn round_float(f: f64, has_nd: bool, nd: Option<i64>) -> Result<Value, String> {
+    let ndigits = if has_nd { nd } else { None };
+    if !f.is_finite() {
+        // With ndigits, a non-finite float rounds to itself; with none, it raises.
+        if ndigits.is_some() {
+            return Ok(Value::Float(f));
+        }
+        return Err(if f.is_nan() {
+            "ValueError: cannot convert float NaN to integer".into()
+        } else {
+            "OverflowError: cannot convert float infinity to integer".into()
+        });
+    }
+    Ok(match ndigits {
+        None => {
+            // No ndigits -> nearest integer, half-to-even, as an int.
+            let s = format!("{f:.0}");
+            match s.parse::<i64>() {
+                Ok(v) => Value::Int(v),
+                Err(_) => match s.parse::<num_bigint::BigInt>() {
+                    Ok(b) => with_host(|h| h.norm_big(b)),
+                    Err(_) => Value::Int(0),
+                },
+            }
+        }
+        Some(d) if d >= 0 => {
+            let s = format!("{f:.*}", d as usize);
+            Value::Float(s.parse::<f64>().unwrap_or(f))
+        }
+        Some(d) => {
+            // Negative ndigits: round-half-even at 10**-d, keep the float type.
+            let p = 10f64.powi((-d) as i32);
+            let scaled = f / p;
+            let rounded: f64 = format!("{scaled:.0}").parse().unwrap_or(scaled);
+            Value::Float(rounded * p)
+        }
+    })
 }
 
 fn int_radix(args: &[Value], radix: u32, prefix: &str) -> Result<Value, String> {
@@ -4190,49 +4261,54 @@ pub fn apply_format_spec(s: &str, v: &Value, spec: &str) -> String {
     let ty = chars.get(i).copied().unwrap_or('\0');
 
     // Render body by type.
-    let mut body = match ty {
-        'd' => match as_i(v) {
-            Some(n) => n.to_string(),
-            None => s.to_string(),
-        },
-        'f' | 'F' => {
-            let f = as_f(v).unwrap_or(0.0);
-            format!("{:.*}", prec.unwrap_or(6), f)
-        }
-        'e' | 'E' => {
-            let f = as_f(v).unwrap_or(0.0);
-            crate::host::fmt_sci(f, prec.unwrap_or(6), ty == 'E')
-        }
-        'g' | 'G' => {
-            let f = as_f(v).unwrap_or(0.0);
-            crate::host::fmt_g(f, prec.unwrap_or(6), ty == 'G', alt)
-        }
-        'c' => match as_i(v) {
-            Some(n) => char::from_u32(n as u32)
-                .map(|c| c.to_string())
-                .unwrap_or_default(),
-            None => s.to_string(),
-        },
-        'x' => format!("{}{:x}", if alt { "0x" } else { "" }, as_i(v).unwrap_or(0)),
-        'X' => format!("{}{:X}", if alt { "0X" } else { "" }, as_i(v).unwrap_or(0)),
-        'o' => format!("{}{:o}", if alt { "0o" } else { "" }, as_i(v).unwrap_or(0)),
-        'b' => format!("{}{:b}", if alt { "0b" } else { "" }, as_i(v).unwrap_or(0)),
-        '%' => {
-            let f = as_f(v).unwrap_or(0.0) * 100.0;
-            format!("{:.*}%", prec.unwrap_or(6), f)
-        }
-        _ => {
-            let mut body = s.to_string();
-            if let Some(p) = prec {
-                if matches!(v, Value::Str(_)) || is_str(v) {
-                    body = body.chars().take(p).collect();
-                } else if as_f(v).is_some() {
-                    body = format!("{:.*}", p, as_f(v).unwrap());
-                }
+    let mut body =
+        match ty {
+            'd' => match with_host(|h| h.big_val(v)) {
+                Some(n) => n.to_string(),
+                None => s.to_string(),
+            },
+            'f' | 'F' => {
+                let f = as_f(v).unwrap_or(0.0);
+                format!("{:.*}", prec.unwrap_or(6), f)
             }
-            body
-        }
-    };
+            'e' | 'E' => {
+                let f = as_f(v).unwrap_or(0.0);
+                crate::host::fmt_sci(f, prec.unwrap_or(6), ty == 'E')
+            }
+            'g' | 'G' => {
+                let f = as_f(v).unwrap_or(0.0);
+                crate::host::fmt_g(f, prec.unwrap_or(6), ty == 'G', alt)
+            }
+            'c' => match as_i(v) {
+                Some(n) => char::from_u32(n as u32)
+                    .map(|c| c.to_string())
+                    .unwrap_or_default(),
+                None => s.to_string(),
+            },
+            'x' => fmt_int_radix(v, 16, if alt { "0x" } else { "" }, false)
+                .unwrap_or_else(|| s.to_string()),
+            'X' => fmt_int_radix(v, 16, if alt { "0X" } else { "" }, true)
+                .unwrap_or_else(|| s.to_string()),
+            'o' => fmt_int_radix(v, 8, if alt { "0o" } else { "" }, false)
+                .unwrap_or_else(|| s.to_string()),
+            'b' => fmt_int_radix(v, 2, if alt { "0b" } else { "" }, false)
+                .unwrap_or_else(|| s.to_string()),
+            '%' => {
+                let f = as_f(v).unwrap_or(0.0) * 100.0;
+                format!("{:.*}%", prec.unwrap_or(6), f)
+            }
+            _ => {
+                let mut body = s.to_string();
+                if let Some(p) = prec {
+                    if matches!(v, Value::Str(_)) || is_str(v) {
+                        body = body.chars().take(p).collect();
+                    } else if as_f(v).is_some() {
+                        body = format!("{:.*}", p, as_f(v).unwrap());
+                    }
+                }
+                body
+            }
+        };
 
     if comma {
         body = add_thousands(&body);
@@ -4275,6 +4351,23 @@ pub fn apply_format_spec(s: &str, v: &Value, spec: &str) -> String {
             }
         }
     }
+}
+
+/// Format an integer (bignum-safe) in `radix` as sign + optional prefix +
+/// magnitude, matching CPython's `format(n, 'x'/'o'/'b')` (e.g. `-ff`, `-0b111`)
+/// rather than Rust's two's-complement `{:x}`/`{:b}`. Returns None for non-ints.
+fn fmt_int_radix(v: &Value, radix: u32, prefix: &str, upper: bool) -> Option<String> {
+    if matches!(v, Value::Float(_)) {
+        return None;
+    }
+    let n = with_host(|h| h.big_val(v))?;
+    use num_bigint::Sign;
+    let sign = if n.sign() == Sign::Minus { "-" } else { "" };
+    let mut body = n.magnitude().to_str_radix(radix);
+    if upper {
+        body = body.to_uppercase();
+    }
+    Some(format!("{sign}{prefix}{body}"))
 }
 
 fn as_i(v: &Value) -> Option<i64> {

@@ -651,6 +651,53 @@ fn custom_getitem_slice_and_slice_repr() {
 }
 
 #[test]
+fn round_bankers_and_negative_ndigits() {
+    // Round-half-to-even (banker's), returning an int with no ndigits.
+    assert_eq!(g("x = round(2.5)", "x"), "2");
+    assert_eq!(g("x = round(0.5)", "x"), "0");
+    assert_eq!(g("x = round(1.5)", "x"), "2");
+    assert_eq!(g("x = round(-2.5)", "x"), "-2");
+    // Representation-correct: 2.675 is really 2.6749…, so it rounds down.
+    assert_eq!(g("x = round(2.675, 2)", "x"), "2.67");
+    assert_eq!(g("x = round(1.5 / 10.0, 1)", "x"), "0.1");
+    // ndigits present -> float, even for a whole result.
+    assert_eq!(g("x = round(2.5, 0)", "x"), "2.0");
+    // Negative ndigits round ints/floats to powers of ten (half-to-even).
+    assert_eq!(g("x = round(12345, -2)", "x"), "12300");
+    assert_eq!(g("x = round(1250, -2)", "x"), "1200");
+    assert_eq!(g("x = round(1350, -2)", "x"), "1400");
+    assert_eq!(g("x = round(123.456, -1)", "x"), "120.0");
+}
+
+#[test]
+fn format_negative_and_bignum_radix() {
+    // Negative ints format as sign + magnitude, not two's complement.
+    assert_eq!(g("x = '{:b}'.format(-7)", "x"), "'-111'");
+    assert_eq!(g("x = '{:x}'.format(-255)", "x"), "'-ff'");
+    assert_eq!(g("x = '{:#x}'.format(-255)", "x"), "'-0xff'");
+    assert_eq!(g("x = '{:08b}'.format(-7)", "x"), "'-0000111'");
+    // Bignum-safe radix + decimal formatting.
+    assert_eq!(g("x = '{:x}'.format(10 ** 20)", "x"), "'56bc75e2d63100000'");
+    assert_eq!(
+        g("x = '{:d}'.format(10 ** 20)", "x"),
+        "'100000000000000000000'"
+    );
+    // The `format()` builtin path (regression: had a double-borrow panic).
+    assert_eq!(g("x = format(255, 'x')", "x"), "'ff'");
+    assert_eq!(g("x = format(-7, 'b')", "x"), "'-111'");
+}
+
+#[test]
+fn slice_negative_step_clamping() {
+    // Start beyond len with a negative step clamps to the last index.
+    assert_eq!(g("x = [1, 2, 3, 4, 5][5:-2:-2]", "x"), "[5]");
+    assert_eq!(g("x = (10, 20, 30, 40)[5::-2]", "x"), "(40, 20)");
+    assert_eq!(g("x = (10, 20, 30, 40)[5:-2:-2]", "x"), "(40,)");
+    assert_eq!(g("x = [0, 1, 2, 3, 4, 5, 6][10:2:-2]", "x"), "[6, 4]");
+    assert_eq!(g("x = [1, 2, 3, 4, 5][-1:-4:-1]", "x"), "[5, 4, 3]");
+}
+
+#[test]
 fn range_membership_is_constant_time() {
     // O(1) membership must not iterate a huge range.
     assert_eq!(g("x = 999999999999 in range(1000000000000)", "x"), "True");

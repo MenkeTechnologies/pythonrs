@@ -167,8 +167,11 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
       (looks like an int); `1.5e300` → a 301-digit integer; `1.234e3` in `.3e`
       format → `1.234e3` (want `1.234e+03`). **Drives most of the `.format`/`%` fuzz
       mass.** Needs the shortest-round-trip + exponent-threshold algorithm.
-- [ ] **`round()` is round-half-up, not banker's** (`round(2.5)`→`3`, `round(0.5)`→`1`)
-      and **ignores negative `ndigits`** (`round(12345,-2)`→`12345`).
+- [x] **`round()`** — FIXED: round-half-to-even (banker's) via format-then-parse
+      (also fixes the `2.675`-is-really-2.6749… representation issue); no ndigits →
+      `int`, ndigits → `float`; negative ndigits round ints/floats to powers of ten,
+      bignum-safe; non-finite floats raise without ndigits. `round(2.5)`→`2`,
+      `round(12345,-2)`→`12300`, `round(2.675,2)`→`2.67`.
 - [ ] **Numeric key equality broken** — `1`, `1.0`, `True` do NOT unify in dict/set:
       `1.0 in {1}` → `False`; `{1,1.0,True}` → `{1,1.0,True}` (want `{1}`). Silent
       wrong-result. **Critical.**
@@ -211,6 +214,9 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
 
 ## Tier 6 — Data structures / iterators
 
+- [x] **Slice read bounds with negative step** — FIXED: `slice_bounds` now mirrors
+      CPython's `PySlice_AdjustIndices` (negative step clamps into `[-1, n-1]`), so
+      `[1,2,3,4,5][5:-2:-2]`→`[5]` and `(10,20,30,40)[5::-2]`→`(40, 20)`.
 - [ ] **Slice assignment & `del` slice unimplemented** — `x[1:3]=[…]`, `x[1:1]=[…]`,
       `x[::2]=[…]`, `del x[1:3]`, `del x[::2]` all → `TypeError: list indices must be
       integers`. (Read-slicing works.)
