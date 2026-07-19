@@ -280,6 +280,11 @@ pub enum PyObj {
         owner: String,
         instance: Value,
     },
+    /// `@staticmethod`-wrapped function: called with no implicit first argument.
+    StaticMethod(Value),
+    /// `@classmethod`-wrapped function: called with the class bound as the first
+    /// argument (`cls`).
+    ClassMethod(Value),
 }
 
 /// Iterator cursor state.
@@ -824,6 +829,8 @@ impl PyHost {
                 Some(PyObj::Partial { .. }) => "partial".into(),
                 Some(PyObj::LruCache { .. }) => "functools._lru_cache_wrapper".into(),
                 Some(PyObj::Super { .. }) => "super".into(),
+                Some(PyObj::StaticMethod(_)) => "staticmethod".into(),
+                Some(PyObj::ClassMethod(_)) => "classmethod".into(),
                 None => "object".into(),
             },
             _ => "object".into(),
@@ -922,6 +929,12 @@ impl PyHost {
                         _ => owner.clone(),
                     };
                     format!("<super: <class '{owner}'>, <{icls} object>>")
+                }
+                Some(PyObj::StaticMethod(f)) => {
+                    format!("<staticmethod({})>", self.str_of(f))
+                }
+                Some(PyObj::ClassMethod(f)) => {
+                    format!("<classmethod({})>", self.str_of(f))
                 }
                 Some(PyObj::Slice { .. })
                 | Some(PyObj::List(_))
@@ -2651,14 +2664,27 @@ impl PyHost {
                 }
                 let class = inst.class.clone();
                 if let Some(v) = self.class_lookup(&class, name) {
-                    // Bind functions to the instance.
-                    if matches!(self.get(&v), Some(PyObj::Func(_))) {
-                        return Ok(self.alloc(PyObj::BoundMethod {
-                            recv: recv.clone(),
-                            func: v,
-                        }));
+                    match self.get(&v) {
+                        // Bind plain functions to the instance.
+                        Some(PyObj::Func(_)) => {
+                            return Ok(self.alloc(PyObj::BoundMethod {
+                                recv: recv.clone(),
+                                func: v,
+                            }));
+                        }
+                        // staticmethod: hand back the raw function.
+                        Some(PyObj::StaticMethod(inner)) => return Ok(inner.clone()),
+                        // classmethod: bind the class as `cls`.
+                        Some(PyObj::ClassMethod(inner)) => {
+                            let inner = inner.clone();
+                            let cls = self.alloc(PyObj::Class(class.clone()));
+                            return Ok(self.alloc(PyObj::BoundMethod {
+                                recv: cls,
+                                func: inner,
+                            }));
+                        }
+                        _ => return Ok(v),
                     }
-                    return Ok(v);
                 }
                 Err(format!(
                     "AttributeError: '{}' object has no attribute '{}'",
@@ -2671,7 +2697,18 @@ impl PyHost {
                     return Ok(self.new_str(cname));
                 }
                 if let Some(v) = self.class_lookup(&cname, name) {
-                    return Ok(v);
+                    match self.get(&v) {
+                        Some(PyObj::StaticMethod(inner)) => return Ok(inner.clone()),
+                        Some(PyObj::ClassMethod(inner)) => {
+                            let inner = inner.clone();
+                            let cls = self.alloc(PyObj::Class(cname.clone()));
+                            return Ok(self.alloc(PyObj::BoundMethod {
+                                recv: cls,
+                                func: inner,
+                            }));
+                        }
+                        _ => return Ok(v),
+                    }
                 }
                 Err(format!(
                     "AttributeError: type object '{cname}' has no attribute '{name}'"
@@ -2822,6 +2859,11 @@ pub fn invoke(
     match obj {
         Some(PyObj::Builtin(name)) => crate::builtins::call_builtin_function(&name, args, kwargs),
         Some(PyObj::Func(fv)) => run_user_func(&fv, None, None, args, kwargs),
+        // A staticmethod is just its wrapped function; a classmethod reached here
+        // (without a bound class) still runs its wrapped function.
+        Some(PyObj::StaticMethod(inner)) | Some(PyObj::ClassMethod(inner)) => {
+            invoke(&inner, args, kwargs)
+        }
         Some(PyObj::BoundMethod { recv, func }) => {
             let f = with_host(|h| h.get(&func).cloned());
             match f {
@@ -2897,11 +2939,23 @@ pub fn call_method(
             let class = inst.class.clone();
             if let Some(f) = with_host(|h| h.class_lookup(&class, name)) {
                 let fobj = with_host(|h| h.get(&f).cloned());
-                if let Some(PyObj::Func(fv)) = fobj {
-                    let owner = with_host(|h| method_owner(h, &class, name));
-                    return run_user_func(&fv, Some(recv.clone()), owner, args, kwargs);
+                match fobj {
+                    Some(PyObj::Func(fv)) => {
+                        let owner = with_host(|h| method_owner(h, &class, name));
+                        return run_user_func(&fv, Some(recv.clone()), owner, args, kwargs);
+                    }
+                    // `@staticmethod`: no implicit first argument.
+                    Some(PyObj::StaticMethod(inner)) => return invoke(&inner, args, kwargs),
+                    // `@classmethod`: bind the instance's class as `cls`.
+                    Some(PyObj::ClassMethod(inner)) => {
+                        let cls = with_host(|h| h.alloc(PyObj::Class(class.clone())));
+                        let mut a = Vec::with_capacity(args.len() + 1);
+                        a.push(cls);
+                        a.extend(args);
+                        return invoke(&inner, a, kwargs);
+                    }
+                    _ => return invoke(&f, args, kwargs),
                 }
-                return invoke(&f, args, kwargs);
             }
             Err(format!(
                 "AttributeError: '{class}' object has no attribute '{name}'"
@@ -2910,11 +2964,21 @@ pub fn call_method(
         Some(PyObj::Class(cname)) => {
             if let Some(f) = with_host(|h| h.class_lookup(&cname, name)) {
                 let fobj = with_host(|h| h.get(&f).cloned());
-                if let Some(PyObj::Func(fv)) = fobj {
-                    // Class.method(...) — no implicit self binding.
-                    return run_user_func(&fv, None, Some(cname.clone()), args, kwargs);
+                match fobj {
+                    Some(PyObj::Func(fv)) => {
+                        // Class.method(...) — no implicit self binding.
+                        return run_user_func(&fv, None, Some(cname.clone()), args, kwargs);
+                    }
+                    Some(PyObj::StaticMethod(inner)) => return invoke(&inner, args, kwargs),
+                    Some(PyObj::ClassMethod(inner)) => {
+                        let cls = with_host(|h| h.alloc(PyObj::Class(cname.clone())));
+                        let mut a = Vec::with_capacity(args.len() + 1);
+                        a.push(cls);
+                        a.extend(args);
+                        return invoke(&inner, a, kwargs);
+                    }
+                    _ => return invoke(&f, args, kwargs),
                 }
-                return invoke(&f, args, kwargs);
             }
             Err(format!(
                 "AttributeError: type object '{cname}' has no attribute '{name}'"

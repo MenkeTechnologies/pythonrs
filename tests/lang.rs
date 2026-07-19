@@ -651,6 +651,40 @@ fn custom_getitem_slice_and_slice_repr() {
 }
 
 #[test]
+fn static_and_class_methods() {
+    let src = "
+class C:
+    tag = 'cls'
+    @staticmethod
+    def f(x):
+        return x * 2
+    @classmethod
+    def g(cls, x):
+        return cls.tag + str(x)
+    @classmethod
+    def make(cls):
+        return cls()
+class D(C):
+    tag = 'D'
+via_cls = C.f(5)
+via_inst = C().f(3)
+cm_cls = C.g(5)
+cm_inst = C().g(7)
+cm_inherit = D.g(9)
+unbound = (lambda h: h(10))(C.f)
+alt_ctor = type(C.make()).__name__
+";
+    assert_eq!(g(src, "via_cls"), "10");
+    assert_eq!(g(src, "via_inst"), "6");
+    assert_eq!(g(src, "cm_cls"), "'cls5'");
+    assert_eq!(g(src, "cm_inst"), "'cls7'");
+    // classmethod binds the *derived* class, so D.g sees D.tag.
+    assert_eq!(g(src, "cm_inherit"), "'D9'");
+    assert_eq!(g(src, "unbound"), "20");
+    assert_eq!(g(src, "alt_ctor"), "'C'");
+}
+
+#[test]
 fn type_returns_a_real_class() {
     // type(x) compares/repr's as a class, not an internal builtin-function object.
     assert_eq!(g("x = type(5) == int", "x"), "True");
