@@ -1825,6 +1825,10 @@ pub fn call_builtin_function(
     if let Some(m) = name.strip_prefix("math.") {
         return call_math(m, &args);
     }
+    // `dict.fromkeys(iterable[, value])` reached via the `dict` type object.
+    if name == "dict.fromkeys" {
+        return dict_method(&Value::Undef, "fromkeys", &args, &[]);
+    }
     // Native stdlib module functions (src/stdlib). These take `&mut PyHost`.
     if let Some(f) = name.strip_prefix("textwrap.") {
         if let Some(r) = with_host(|h| crate::stdlib::textwrap::call(h, f, &args)) {
@@ -2433,6 +2437,10 @@ fn py_len(v: &Value) -> Result<usize, String> {
         Some(PyObj::List(l)) | Some(PyObj::Tuple(l)) => Ok(l.len()),
         Some(PyObj::Dict(d)) => Ok(d.len()),
         Some(PyObj::Set(s)) | Some(PyObj::Frozenset(s)) => Ok(s.len()),
+        Some(PyObj::DictView { dict, .. }) => Ok(match h.get(dict) {
+            Some(PyObj::Dict(d)) => d.len(),
+            _ => 0,
+        }),
         Some(PyObj::Range { start, stop, step }) => {
             Ok(host::range_len(*start, *stop, *step).max(0) as usize)
         }
@@ -3070,6 +3078,7 @@ pub fn type_has_method(typename: &str, name: &str) -> bool {
         }
         "set" | "frozenset" => SET_METHODS,
         "tuple" => TUPLE_METHODS,
+        "range" => &["index", "count"],
         "deque" => DEQUE_METHODS,
         "TextIOWrapper" => FILE_METHODS,
         "int" | "float" | "bool" => NUM_METHODS,
@@ -3177,6 +3186,7 @@ const DICT_METHODS: &[&str] = &[
     "update",
     "clear",
     "copy",
+    "fromkeys",
 ];
 const SET_METHODS: &[&str] = &[
     "add",
@@ -3214,15 +3224,16 @@ pub fn call_type_method(
         "bytes" => bytes_method(recv, name, &args),
         "bytearray" => bytearray_method(recv, name, &args),
         "list" => list_method(recv, name, &args, &kwargs),
-        "dict" => dict_method(recv, name, &args),
+        "dict" => dict_method(recv, name, &args, &kwargs),
         "Counter" | "defaultdict" | "OrderedDict" => {
             if let Some(r) = collections_dict_method(recv, name, &args, &tn) {
                 return r;
             }
-            dict_method(recv, name, &args)
+            dict_method(recv, name, &args, &kwargs)
         }
         "set" | "frozenset" => set_method(recv, name, &args),
         "tuple" => tuple_method(recv, name, &args),
+        "range" => range_method(recv, name, &args),
         "deque" => deque_method(recv, name, &args),
         "TextIOWrapper" => file_method(recv, name, &args),
         "functools._lru_cache_wrapper" => lru_wrapper_method(recv, name),
@@ -3782,37 +3793,42 @@ fn list_method(
     }
 }
 
-fn dict_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+fn dict_method(
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+    kwargs: &[(String, Value)],
+) -> Result<Value, String> {
     match name {
-        "keys" => {
-            let ks = with_host(|h| match h.get(recv) {
-                Some(PyObj::Dict(d)) => d.values().map(|(k, _)| k.clone()).collect(),
-                _ => vec![],
-            });
-            Ok(with_host(|h| h.new_list(ks)))
-        }
-        "values" => {
-            let vs = with_host(|h| match h.get(recv) {
-                Some(PyObj::Dict(d)) => d.values().map(|(_, v)| v.clone()).collect(),
-                _ => vec![],
-            });
-            Ok(with_host(|h| h.new_list(vs)))
-        }
-        "items" => {
-            let items = with_host(|h| match h.get(recv) {
-                Some(PyObj::Dict(d)) => d
-                    .values()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect::<Vec<_>>(),
-                _ => vec![],
-            });
-            let tuples: Vec<Value> = with_host(|h| {
-                items
-                    .into_iter()
-                    .map(|(k, v)| h.new_tuple(vec![k, v]))
-                    .collect()
-            });
-            Ok(with_host(|h| h.new_list(tuples)))
+        "keys" => Ok(with_host(|h| {
+            h.alloc(PyObj::DictView {
+                dict: recv.clone(),
+                kind: 0,
+            })
+        })),
+        "values" => Ok(with_host(|h| {
+            h.alloc(PyObj::DictView {
+                dict: recv.clone(),
+                kind: 1,
+            })
+        })),
+        "items" => Ok(with_host(|h| {
+            h.alloc(PyObj::DictView {
+                dict: recv.clone(),
+                kind: 2,
+            })
+        })),
+        "fromkeys" => {
+            // `dict.fromkeys(iterable[, value])` — unbound classmethod form; here
+            // `recv` is the dict the method was fetched from (unused).
+            let keys = host::iter_vec(&arg0(args)?)?;
+            let value = args.get(1).cloned().unwrap_or(Value::Undef);
+            let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+            for k in keys {
+                let key = with_host(|h| h.to_key(&k))?;
+                host::dict_put(&mut d, key, k, value.clone());
+            }
+            Ok(with_host(|h| h.new_dict(d)))
         }
         "get" => {
             let key = with_host(|h| h.to_key(&arg0(args)?))?;
@@ -3857,22 +3873,7 @@ fn dict_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String
             }))
         }
         "update" => {
-            if let Some(other) = args.first() {
-                let pairs = with_host(|h| match h.get(other) {
-                    Some(PyObj::Dict(d)) => d
-                        .iter()
-                        .map(|(k, (kv, v))| (k.clone(), kv.clone(), v.clone()))
-                        .collect::<Vec<_>>(),
-                    _ => vec![],
-                });
-                with_host(|h| {
-                    if let Some(PyObj::Dict(d)) = h.get_mut(recv) {
-                        for (k, kv, v) in pairs {
-                            host::dict_put(d, k, kv, v);
-                        }
-                    }
-                });
-            }
+            dict_update(recv, args.first(), kwargs)?;
             Ok(Value::Undef)
         }
         "clear" => {
@@ -3907,6 +3908,54 @@ fn dict_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String
             "AttributeError: 'dict' object has no attribute '{name}'"
         )),
     }
+}
+
+/// `dict.update(other?, **kwargs)`: `other` may be a mapping (dict/view) OR an
+/// iterable of key/value pairs; keyword args are applied last (they win).
+fn dict_update(
+    recv: &Value,
+    other: Option<&Value>,
+    kwargs: &[(String, Value)],
+) -> Result<(), String> {
+    // Collect (key, key-value, value) triples to apply, in order.
+    let mut triples: Vec<(PKey, Value, Value)> = Vec::new();
+    if let Some(o) = other {
+        let is_dict = with_host(|h| matches!(h.get(o), Some(PyObj::Dict(_))));
+        if is_dict {
+            let pairs = with_host(|h| match h.get(o) {
+                Some(PyObj::Dict(d)) => d
+                    .iter()
+                    .map(|(k, (kv, v))| (k.clone(), kv.clone(), v.clone()))
+                    .collect::<Vec<_>>(),
+                _ => vec![],
+            });
+            triples.extend(pairs);
+        } else {
+            // An iterable of 2-element pairs.
+            for pair in host::iter_vec(o)? {
+                let elems = host::iter_vec(&pair)?;
+                if elems.len() != 2 {
+                    return Err(host::type_error(
+                        "dictionary update sequence element has length != 2",
+                    ));
+                }
+                let key = with_host(|h| h.to_key(&elems[0]))?;
+                triples.push((key, elems[0].clone(), elems[1].clone()));
+            }
+        }
+    }
+    for (k, v) in kwargs {
+        let kv = with_host(|h| h.new_str(k.clone()));
+        triples.push((PKey::Str(k.clone()), kv, v.clone()));
+    }
+    with_host(|h| {
+        if let Some(PyObj::Dict(d)) = h.get_mut(recv) {
+            for (k, kv, v) in triples {
+                host::dict_put(d, k, kv, v);
+            }
+        }
+    });
+    Ok(())
 }
 
 fn set_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
@@ -4093,6 +4142,40 @@ fn set_binop(recv: &Value, args: &[Value], tag: i64) -> Result<Value, String> {
         call_builtin_function("set", vec![other], vec![])?
     };
     with_host(|h| h.binop(tag, recv, &other_set))
+}
+
+fn range_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    let (start, stop, step) = with_host(|h| match h.get(recv) {
+        Some(PyObj::Range { start, stop, step }) => (*start, *stop, *step),
+        _ => (0, 0, 1),
+    });
+    let len = host::range_len(start, stop, step);
+    let arg = arg0(args)?;
+    // The integer value queried (`range.index`/`range.count` take an int); a
+    // non-int is simply "not in the range".
+    let target = with_host(|h| h.as_int(&arg));
+    // Position of `target` in the arithmetic progression, if any.
+    let pos = target.and_then(|t| {
+        if (t - start) % step == 0 {
+            let k = (t - start) / step;
+            (k >= 0 && k < len).then_some(k)
+        } else {
+            None
+        }
+    });
+    match name {
+        "count" => Ok(Value::Int(if pos.is_some() { 1 } else { 0 })),
+        "index" => match pos {
+            Some(k) => Ok(Value::Int(k)),
+            None => Err(format!(
+                "ValueError: {} is not in range",
+                with_host(|h| h.repr_of(&arg))
+            )),
+        },
+        _ => Err(format!(
+            "AttributeError: 'range' object has no attribute '{name}'"
+        )),
+    }
 }
 
 fn tuple_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {

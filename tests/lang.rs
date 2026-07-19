@@ -1303,3 +1303,58 @@ fn set_ops_and_comparisons() {
     );
     assert_eq!(g("x = {1,2,3}.issubset([1,2,3,4])", "x"), "True");
 }
+
+#[test]
+fn dict_views_and_merge() {
+    // Views are live view objects, not list snapshots.
+    assert_eq!(
+        g("d = {1:2,3:4}\nx = type(d.keys()).__name__", "x"),
+        "'dict_keys'"
+    );
+    assert_eq!(g("d = {1:2,3:4}\nx = d.keys()", "x"), "dict_keys([1, 3])");
+    assert_eq!(
+        g("d = {1:2,3:4}\nx = d.items()", "x"),
+        "dict_items([(1, 2), (3, 4)])"
+    );
+    // Live update: a view reflects later mutation.
+    assert_eq!(
+        g("d = {1:2}\nk = d.keys()\nd[3] = 4\nx = sorted(k)", "x"),
+        "[1, 3]"
+    );
+    // View set-ops return a set.
+    assert_eq!(g("d = {1:2}\nx = d.keys() | {3}", "x"), "{1, 3}");
+    assert_eq!(g("d = {1:2,3:4}\nx = d.items() & {(1,2)}", "x"), "{(1, 2)}");
+    // fromkeys, dict merge, update variants.
+    assert_eq!(
+        g("x = dict.fromkeys([1,2,3])", "x"),
+        "{1: None, 2: None, 3: None}"
+    );
+    assert_eq!(g("x = dict.fromkeys([1,2], 0)", "x"), "{1: 0, 2: 0}");
+    assert_eq!(g("x = {1:2} | {3:4}", "x"), "{1: 2, 3: 4}");
+    assert_eq!(g("d = {1:2}\nd |= {3:4}\nx = d", "x"), "{1: 2, 3: 4}");
+    assert_eq!(
+        g("d = {}\nd.update(a=1, b=2)\nx = d", "x"),
+        "{'a': 1, 'b': 2}"
+    );
+    assert_eq!(
+        g("d = {}\nd.update([(1,2),(3,4)])\nx = d", "x"),
+        "{1: 2, 3: 4}"
+    );
+}
+
+#[test]
+fn range_methods_and_equality() {
+    assert_eq!(g("x = range(10)[2:8:2]", "x"), "range(2, 8, 2)");
+    assert_eq!(g("x = list(range(10)[2:8:2])", "x"), "[2, 4, 6]");
+    assert_eq!(g("x = range(10)[::-1]", "x"), "range(9, -1, -1)");
+    assert_eq!(g("x = range(10).index(4)", "x"), "4");
+    assert_eq!(g("x = range(0,20,2).index(6)", "x"), "3");
+    assert_eq!(
+        g("x = (range(10).count(4), range(10).count(99))", "x"),
+        "(1, 0)"
+    );
+    assert_eq!(g("x = range(10) == range(0, 10)", "x"), "True");
+    assert_eq!(g("x = range(0) == range(5, 5)", "x"), "True");
+    assert_eq!(g("x = range(0,10,2) == range(0,11,2)", "x"), "False");
+    assert_eq!(g("x = range(0,10,2) == range(0,9,2)", "x"), "True");
+}
