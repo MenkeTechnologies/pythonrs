@@ -1122,3 +1122,17 @@ fn zero_to_negative_power_raises() {
     // Non-zero base still works.
     assert_eq!(g("x = 2 ** -1", "x"), "0.5");
 }
+
+#[test]
+fn slots_enforcement() {
+    // A fully-slotted instance rejects undeclared attributes.
+    assert_eq!(
+        g("class P:\n    __slots__ = ('x', 'y')\n    def __init__(s): s.x = 1; s.y = 2\np = P()\nres = 'unset'\ntry:\n    p.z = 3\nexcept AttributeError:\n    res = 'blocked'\nx = (p.x, p.y, res)", "x"),
+        "(1, 2, 'blocked')"
+    );
+    // A non-slotted base restores the instance __dict__ (slots don't restrict).
+    assert_eq!(
+        g("class B: pass\nclass D(B):\n    __slots__ = ('a',)\nd = D()\nd.a = 1\nd.b = 2\nx = (d.a, d.b)", "x"),
+        "(1, 2)"
+    );
+}
