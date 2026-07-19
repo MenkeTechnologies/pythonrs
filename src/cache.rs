@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
-/// Bump on any incompatible change to `CProg` / the lowering.
-const SCHEMA: u64 = 1;
+/// Bump on any incompatible change to `CProg` / the lowering / the shard layout.
+const SCHEMA: u64 = 2;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]
@@ -34,6 +34,11 @@ struct Shard {
 #[archive(check_bytes)]
 struct Entry {
     key: u64,
+    /// A second, independent hash of the source. A cache hit requires BOTH `key`
+    /// and `verify` to match, so an `FxHash` collision on `key` can never return
+    /// a different program's bytecode (which would silently produce wrong
+    /// results — far worse than a cache miss).
+    verify: u64,
     blob: Vec<u8>,
 }
 
@@ -45,10 +50,21 @@ struct CProg {
     tries: Vec<TryDef>,
 }
 
-/// A stable content key for a source string.
+/// A stable content key for a source string (fast `FxHash`, used for lookup).
 pub fn key_for(src: &str) -> u64 {
     let mut h = rustc_hash::FxHasher::default();
     SCHEMA.hash(&mut h);
+    src.hash(&mut h);
+    h.finish()
+}
+
+/// An independent verification hash (std `DefaultHasher`/SipHash), so a hit
+/// requires both hashes to agree — collision-proof for correctness.
+fn verify_for(src: &str) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    let mut h = DefaultHasher::new();
+    SCHEMA.hash(&mut h);
+    src.len().hash(&mut h);
     src.hash(&mut h);
     h.finish()
 }
@@ -72,14 +88,21 @@ fn load_shard() -> Shard {
 fn write_shard(shard: &Shard) -> Result<(), String> {
     let path = shard_path().ok_or("no home dir for cache")?;
     let bytes = rkyv::to_bytes::<_, 4096>(shard).map_err(|e| format!("cache serialize: {e}"))?;
-    std::fs::write(&path, &bytes).map_err(|e| format!("cache write: {e}"))
+    // Atomic replace (write temp + rename) so a concurrent reader — up to 16
+    // instances run against the shared shard — never sees a torn file. A losing
+    // concurrent writer just drops its entry (recompiled next run); it can never
+    // corrupt the shard.
+    let tmp = path.with_extension(format!("rkyv.tmp.{}", std::process::id()));
+    std::fs::write(&tmp, &bytes).map_err(|e| format!("cache write: {e}"))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("cache rename: {e}"))
 }
 
 /// Look up a compiled program for `src`, if present and current.
 pub fn load(src: &str) -> Option<Program> {
     let key = key_for(src);
+    let verify = verify_for(src);
     let shard = load_shard();
-    let entry = shard.entries.iter().find(|e| e.key == key)?;
+    let entry = shard.entries.iter().find(|e| e.key == key && e.verify == verify)?;
     let cp: CProg = bincode::deserialize(&entry.blob).ok()?;
     Some(Program {
         main: cp.main,
@@ -92,6 +115,7 @@ pub fn load(src: &str) -> Option<Program> {
 /// Store `prog` (compiled from `src`) into the shard, replacing any prior entry.
 pub fn store(src: &str, prog: &Program) -> Result<(), String> {
     let key = key_for(src);
+    let verify = verify_for(src);
     let cp = CProg {
         main: prog.main.clone(),
         functions: prog.functions.clone(),
@@ -100,6 +124,6 @@ pub fn store(src: &str, prog: &Program) -> Result<(), String> {
     let blob = bincode::serialize(&cp).map_err(|e| format!("cache encode: {e}"))?;
     let mut shard = load_shard();
     shard.entries.retain(|e| e.key != key);
-    shard.entries.push(Entry { key, blob });
+    shard.entries.push(Entry { key, verify, blob });
     write_shard(&shard)
 }
