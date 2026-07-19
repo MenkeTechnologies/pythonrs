@@ -105,12 +105,15 @@ Set `PYTHONRS_TRACE=1` to log cache hit/miss to stderr (silent otherwise).
 
 ## [0x03] LANGUAGE FEATURES
 
-Arbitrary-precision integers, real closures, classes with inheritance,
-comprehensions (list/dict/set), f-strings, exceptions, and `*args` / `**kwargs`.
-The `PyHost` heap implements the `str` / `list` / `dict` / `tuple` / `set` /
-instance object model with the operator, attribute, item, and iteration
-protocols. See [\[0x07\]](#0x07-status--roadmap) and [BUGS.md](BUGS.md) for the
-honest list of what is not yet implemented.
+Arbitrary-precision integers, real closures, classes with inheritance, operator
+dunders, generators (`yield` / `yield from` / lazy generator expressions, backed
+by stackful `corosensei` coroutines), `match`/`case` structural pattern matching,
+own-scope comprehensions (list/dict/set) and proper `nonlocal`, f-strings,
+exceptions, and full call-site and literal `*` / `**` unpacking. The `PyHost`
+heap implements the `str` / `list` / `dict` / `tuple` / `set` / instance object
+model with the operator, attribute, item, and iteration protocols. See
+[\[0x07\]](#0x07-status--roadmap) and [BUGS.md](BUGS.md) for the honest list of
+what is not yet implemented.
 
 ## [0x04] COMMAND-LINE FLAGS
 
@@ -150,10 +153,10 @@ corpus.
 ## [0x07] STATUS & ROADMAP
 
 Active, in development. The runtime executes a substantial real subset of Python
-3. [BUGS.md](BUGS.md) is the honest ledger of unimplemented features — generators,
-`async`, `match`, operator dunders, and most of the standard library are not yet
-carried. A DAP debug adapter (`--dap`), man pages, and the generated
-`reference.html` land alongside the growing builtin surface.
+3. [BUGS.md](BUGS.md) is the honest ledger of unimplemented features — `async`,
+`bytes` operations, and most of the standard library are not yet carried. A DAP
+debug adapter (`--dap`), man pages, and the generated `reference.html` land
+alongside the growing builtin surface.
 
 ## [0x08] DOCUMENTATION
 
