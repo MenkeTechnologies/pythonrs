@@ -1000,3 +1000,32 @@ fn new_dunder() {
         "99"
     );
 }
+
+#[test]
+fn bool_len_dunder_dispatch() {
+    // bool()/any/all honor __bool__ then __len__ on instances.
+    assert_eq!(
+        g("class C:\n    def __init__(s, n): s.n = n\n    def __len__(s): return s.n\nx = (bool(C(0)), bool(C(3)), any([C(0), C(2)]), all([C(1), C(0)]))", "x"),
+        "(False, True, True, False)"
+    );
+    assert_eq!(
+        g(
+            "class B:\n    def __bool__(s): return False\nx = bool(B())",
+            "x"
+        ),
+        "False"
+    );
+}
+
+#[test]
+fn bare_reraise_in_handler() {
+    // A bare `raise` in an except handler re-raises the active exception, caught
+    // by an outer handler.
+    assert_eq!(
+        g(
+            "def f():\n    try:\n        raise ValueError('boom')\n    except ValueError:\n        raise\nx = 'unset'\ntry:\n    f()\nexcept ValueError as e:\n    x = str(e)",
+            "x"
+        ),
+        "'boom'"
+    );
+}

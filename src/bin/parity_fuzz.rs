@@ -595,6 +595,144 @@ fn gen_augassign(seed: u64) -> Vec<String> {
     vec![format!("x = {a}"), format!("x {op} {b}"), "print(x)".into()]
 }
 
+const SMALLINTS: &[&str] = &[
+    "0", "1", "2", "3", "4", "5", "6", "7", "-1", "-2", "-3", "10",
+];
+
+/// A user class with a rich dunder set: operator overloading, comparison,
+/// `__repr__`, `__neg__`/`__abs__`, `__len__`/`__bool__`, `__format__`. Every
+/// printed form is deterministic (always via `__repr__` or a scalar).
+fn gen_classes(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let a = pick(r, SMALLINTS);
+    let b = pick(r, SMALLINTS);
+    let c = pick(r, SMALLINTS);
+    let vdef: Vec<String> = vec![
+        "class V:".into(),
+        "    def __init__(self, x): self.x = x".into(),
+        "    def __repr__(self): return 'V(' + str(self.x) + ')'".into(),
+        "    def __eq__(self, o): return self.x == o.x".into(),
+        "    def __lt__(self, o): return self.x < o.x".into(),
+        "    def __add__(self, o): return V(self.x + o.x)".into(),
+        "    def __sub__(self, o): return V(self.x - o.x)".into(),
+        "    def __mul__(self, k): return V(self.x * k)".into(),
+        "    def __neg__(self): return V(-self.x)".into(),
+        "    def __abs__(self): return V(abs(self.x))".into(),
+        "    def __len__(self): return abs(self.x)".into(),
+        "    def __bool__(self): return self.x != 0".into(),
+        "    def __format__(self, s): return format(self.x, s)".into(),
+    ];
+    let mut out = vdef;
+    match r.below(8) {
+        0 => out.push(format!("print(V({a}) + V({b}) - V({c}))")),
+        1 => out.push(format!("print(V({a}) == V({b}), V({a}) < V({b}))")),
+        2 => out.push(format!("print(sorted([V({a}), V({b}), V({c})]))")),
+        3 => out.push(format!("print(-V({a}), abs(V({b})), V({a}) * 3)")),
+        4 => out.push(format!("print(bool(V({a})), len(V({b})))")),
+        5 => out.push(format!("print(V({a}) != V({b}), V({a}) != V({a}))")),
+        6 => out.push(format!(
+            "print('{{:+d}}'.format(V({a})), format(V({b}), '03d'))"
+        )),
+        _ => {
+            // property + inheritance/super.
+            out.push("class C(V):".into());
+            out.push("    @property".into());
+            out.push("    def doubled(self): return self.x * 2".into());
+            out.push("    def __add__(self, o): return C(super().__add__(o).x + 1)".into());
+            out.push(format!("c = C({a})"));
+            out.push(format!("print(c.doubled, (c + V({b})).x)"));
+        }
+    }
+    out
+}
+
+/// Custom-iterable protocol: `__getitem__`-sequence and `__iter__`/`__contains__`/
+/// `__reversed__`, exercised through `for`, `list()`, `sum()`, `in`, `reversed()`.
+fn gen_iterproto(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let n = 1 + r.below(5);
+    let probe = r.below(9) as i64;
+    match r.below(2) {
+        0 => vec![
+            "class S:".into(),
+            "    def __init__(self, n): self.n = n".into(),
+            "    def __getitem__(self, i):".into(),
+            "        if i >= self.n: raise IndexError".into(),
+            "        return i * i".into(),
+            format!("s = S({n})"),
+            "print(list(s))".into(),
+            "print(sum(s))".into(),
+            format!("print({probe} in s)"),
+            "print([x for x in s])".into(),
+        ],
+        _ => vec![
+            "class R:".into(),
+            "    def __init__(self, n): self.data = list(range(n))".into(),
+            "    def __iter__(self): return iter(self.data)".into(),
+            "    def __contains__(self, x): return x in self.data".into(),
+            "    def __reversed__(self): return reversed(self.data)".into(),
+            format!("r = R({n})"),
+            "print(list(r))".into(),
+            "print(list(reversed(r)))".into(),
+            format!("print({probe} in r)"),
+            "print(sorted(r, reverse=True))".into(),
+        ],
+    }
+}
+
+/// Exception control flow: try/except/else/finally, multi-type handlers, and
+/// bare-`raise` re-raise. Output is deterministic (type names + fixed messages,
+/// never a raw traceback).
+fn gen_exceptions(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let k = r.below(5) as i64;
+    match r.below(3) {
+        0 => vec![
+            "def risky(k):".into(),
+            "    if k == 0: raise ValueError('bad value')".into(),
+            "    if k == 1: return 1 // 0".into(),
+            "    if k == 2: return [1, 2][5]".into(),
+            "    if k == 3: raise KeyError('missing')".into(),
+            "    return 'ok'".into(),
+            "try:".into(),
+            format!("    print('result', risky({k}))"),
+            "except ValueError as e:".into(),
+            "    print('ValueError', e)".into(),
+            "except (IndexError, ZeroDivisionError) as e:".into(),
+            "    print('arith/index', type(e).__name__)".into(),
+            "except Exception as e:".into(),
+            "    print('other', type(e).__name__)".into(),
+            "finally:".into(),
+            "    print('done')".into(),
+        ],
+        1 => vec![
+            "def g():".into(),
+            "    try:".into(),
+            format!("        if {k} < 3: raise ValueError('x')"),
+            "        return 'clean'".into(),
+            "    except ValueError:".into(),
+            "        print('inner handling')".into(),
+            "        raise".into(),
+            "try:".into(),
+            "    print('got', g())".into(),
+            "except ValueError as e:".into(),
+            "    print('reraised', e)".into(),
+        ],
+        _ => vec![
+            "x = 0".into(),
+            "try:".into(),
+            format!("    x = 10 // {k}"),
+            "except ZeroDivisionError:".into(),
+            "    x = -1".into(),
+            "else:".into(),
+            "    x += 100".into(),
+            "finally:".into(),
+            "    x += 1".into(),
+            "print(x)".into(),
+        ],
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Mode dispatch
 // ---------------------------------------------------------------------------
@@ -620,6 +758,9 @@ enum Mode {
     Builtins,
     Ternary,
     Augassign,
+    Classes,
+    Iterproto,
+    Exceptions,
 }
 
 const REAL_MODES: &[Mode] = &[
@@ -641,6 +782,9 @@ const REAL_MODES: &[Mode] = &[
     Mode::Builtins,
     Mode::Ternary,
     Mode::Augassign,
+    Mode::Classes,
+    Mode::Iterproto,
+    Mode::Exceptions,
 ];
 
 /// Generate the statement list for a seed in the selected mode. `Mixed` rotates
@@ -669,6 +813,9 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Builtins => gen_builtins(seed),
         Mode::Ternary => gen_ternary(seed),
         Mode::Augassign => gen_augassign(seed),
+        Mode::Classes => gen_classes(seed),
+        Mode::Iterproto => gen_iterproto(seed),
+        Mode::Exceptions => gen_exceptions(seed),
     }
 }
 
@@ -693,6 +840,9 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Builtins => "builtins",
         Mode::Ternary => "ternary",
         Mode::Augassign => "augassign",
+        Mode::Classes => "classes",
+        Mode::Iterproto => "iterproto",
+        Mode::Exceptions => "exceptions",
     }
 }
 
@@ -717,6 +867,9 @@ fn mode_from_name(s: &str) -> Option<Mode> {
         Mode::Builtins,
         Mode::Ternary,
         Mode::Augassign,
+        Mode::Classes,
+        Mode::Iterproto,
+        Mode::Exceptions,
     ];
     ALL.iter().copied().find(|&m| mode_name(m) == s)
 }

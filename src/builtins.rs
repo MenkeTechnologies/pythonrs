@@ -597,27 +597,34 @@ fn b_mkdict_ex(vm: &mut VM, argc: u8) -> Value {
 
 // ── truthiness / str / format ────────────────────────────────────────────────
 
+/// Python truthiness with instance dunder dispatch: `__bool__`, else `__len__`,
+/// else the host's structural truthiness. Used by the TRUTHY op, `bool()`,
+/// `any`/`all`/`filter`.
+fn py_bool(v: &Value) -> Result<bool, String> {
+    let (has_bool, has_len) = with_host(|h| match h.get(v) {
+        Some(PyObj::Instance(i)) => (
+            instance_has(h, i, "__bool__"),
+            instance_has(h, i, "__len__"),
+        ),
+        _ => (false, false),
+    });
+    if has_bool {
+        let x = host::call_method(v, "__bool__", vec![], vec![])?;
+        return Ok(with_host(|h| h.truthy(&x)));
+    }
+    if has_len {
+        let x = host::call_method(v, "__len__", vec![], vec![])?;
+        return Ok(with_host(|h| h.truthy(&x)));
+    }
+    Ok(with_host(|h| h.truthy(v)))
+}
+
 fn b_truthy(vm: &mut VM, _: u8) -> Value {
     let v = vm.pop();
-    if with_host(
-        |h| matches!(h.get(&v), Some(PyObj::Instance(i)) if instance_has(h, i, "__bool__") || instance_has(h, i, "__len__")),
-    ) {
-        // __bool__ preferred, else __len__.
-        let has_bool = with_host(|h| match h.get(&v) {
-            Some(PyObj::Instance(i)) => instance_has(h, i, "__bool__"),
-            _ => false,
-        });
-        let r = if has_bool {
-            host::call_method(&v, "__bool__", vec![], vec![])
-        } else {
-            host::call_method(&v, "__len__", vec![], vec![])
-        };
-        return match r {
-            Ok(x) => Value::Bool(with_host(|h| h.truthy(&x))),
-            Err(e) => abort(vm, e),
-        };
+    match py_bool(&v) {
+        Ok(b) => Value::Bool(b),
+        Err(e) => abort(vm, e),
     }
-    Value::Bool(with_host(|h| h.truthy(&v)))
 }
 
 fn instance_has(h: &host::PyHost, i: &Instance, name: &str) -> bool {
@@ -1239,12 +1246,23 @@ fn b_try(vm: &mut VM, _: u8) -> Value {
                     if let Some(name) = bind {
                         with_host(|h| h.set_name(name, exc.clone()));
                     }
+                    // Clear the propagating-error state but keep the caught
+                    // exception as the "currently handled" one, so a bare `raise`
+                    // in the handler body re-raises it (`b_reraise` reads `h.exc`).
                     with_host(|h| {
                         h.error = None;
-                        h.exc = None;
+                        h.exc = Some(exc.clone());
                     });
-                    if let Err(e2) = host::run_chunk_on(hbody.clone()) {
-                        pending = Some(e2);
+                    let hres = host::run_chunk_on(hbody.clone());
+                    match hres {
+                        Ok(_) => with_host(|h| {
+                            // Handler finished without raising — clear the handled
+                            // exception (unless the body set a return/break signal).
+                            if h.signal.is_none() {
+                                h.exc = None;
+                            }
+                        }),
+                        Err(e2) => pending = Some(e2),
                     }
                     if let Some(name) = bind {
                         with_host(|h| {
@@ -1990,10 +2008,10 @@ pub fn call_builtin_function(
             let mut out = Vec::new();
             for it in items {
                 let keep = if matches!(f, Value::Undef) {
-                    with_host(|h| h.truthy(&it))
+                    py_bool(&it)?
                 } else {
                     let r = host::invoke(&f, vec![it.clone()], vec![])?;
-                    with_host(|h| h.truthy(&r))
+                    py_bool(&r)?
                 };
                 if keep {
                     out.push(it);
@@ -2003,15 +2021,21 @@ pub fn call_builtin_function(
         }
         "any" => {
             let items = host::iter_vec(&arg0(&args)?)?;
-            Ok(Value::Bool(
-                items.iter().any(|x| with_host(|h| h.truthy(x))),
-            ))
+            for x in &items {
+                if py_bool(x)? {
+                    return Ok(Value::Bool(true));
+                }
+            }
+            Ok(Value::Bool(false))
         }
         "all" => {
             let items = host::iter_vec(&arg0(&args)?)?;
-            Ok(Value::Bool(
-                items.iter().all(|x| with_host(|h| h.truthy(x))),
-            ))
+            for x in &items {
+                if !py_bool(x)? {
+                    return Ok(Value::Bool(false));
+                }
+            }
+            Ok(Value::Bool(true))
         }
         "round" => {
             let v = arg0(&args)?;
@@ -2239,7 +2263,7 @@ pub fn call_builtin_function(
         }
         "bool" => {
             let v = args.first().cloned().unwrap_or(Value::Bool(false));
-            Ok(Value::Bool(with_host(|h| h.truthy(&v))))
+            Ok(Value::Bool(py_bool(&v)?))
         }
         "list" => {
             let items = match args.first() {
