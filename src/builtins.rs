@@ -189,17 +189,73 @@ fn b_getself(vm: &mut VM, _: u8) -> Value {
 fn b_getattr(vm: &mut VM, _: u8) -> Value {
     let name = sval(&vm.pop());
     let recv = vm.pop();
-    let r = with_host(|h| h.get_attr(&recv, &name));
+    let r = get_attr_desc(&recv, &name);
     finish(vm, r)
+}
+
+/// `recv.name` with the descriptor protocol and the `__getattr__` fallback. The
+/// accessor bodies run user code, so this holds no host borrow across them.
+fn get_attr_desc(recv: &Value, name: &str) -> Result<Value, String> {
+    match with_host(|h| h.plan_attr_get(recv, name)) {
+        host::AttrGet::Property { fget, inst } => {
+            if matches!(fget, Value::Undef) {
+                let cls = with_host(|h| h.type_name(&inst));
+                return Err(format!(
+                    "AttributeError: property '{name}' of '{cls}' object has no getter"
+                ));
+            }
+            host::invoke(&fget, vec![inst], vec![])
+        }
+        host::AttrGet::Descriptor { desc, inst, cls } => {
+            host::call_method(&desc, "__get__", vec![inst, cls], vec![])
+        }
+        host::AttrGet::Plain => match with_host(|h| h.get_attr(recv, name)) {
+            Ok(v) => Ok(v),
+            // `__getattr__` fallback: fires only when normal lookup fails.
+            Err(e) => {
+                let has = with_host(|h| match h.get(recv) {
+                    Some(PyObj::Instance(i)) => h.class_lookup(&i.class, "__getattr__").is_some(),
+                    _ => false,
+                });
+                if has {
+                    let nm = with_host(|h| h.new_str(name.to_string()));
+                    host::call_method(recv, "__getattr__", vec![nm], vec![])
+                } else {
+                    Err(e)
+                }
+            }
+        },
+    }
 }
 
 fn b_setattr(vm: &mut VM, _: u8) -> Value {
     let val = vm.pop();
     let name = sval(&vm.pop());
     let recv = vm.pop();
-    match with_host(|h| h.set_attr(&recv, &name, val)) {
+    let r = set_attr_desc(&recv, &name, val);
+    match r {
         Ok(()) => Value::Undef,
         Err(e) => abort(vm, e),
+    }
+}
+
+/// `recv.name = val` with the data-descriptor protocol (`property.fset`,
+/// user `__set__`).
+fn set_attr_desc(recv: &Value, name: &str, val: Value) -> Result<(), String> {
+    match with_host(|h| h.plan_attr_set(recv, name, &val)) {
+        host::AttrSet::Property { fset, inst, val } => {
+            if matches!(fset, Value::Undef) {
+                let cls = with_host(|h| h.type_name(&inst));
+                return Err(format!(
+                    "AttributeError: property '{name}' of '{cls}' object has no setter"
+                ));
+            }
+            host::invoke(&fset, vec![inst, val], vec![]).map(|_| ())
+        }
+        host::AttrSet::Descriptor { desc, inst, val } => {
+            host::call_method(&desc, "__set__", vec![inst, val], vec![]).map(|_| ())
+        }
+        host::AttrSet::Plain => with_host(|h| h.set_attr(recv, name, val)),
     }
 }
 
@@ -1392,6 +1448,7 @@ const BUILTIN_FUNCS: &[&str] = &[
     "super",
     "staticmethod",
     "classmethod",
+    "property",
 ];
 
 // ── builtin functions ────────────────────────────────────────────────────────
@@ -1787,12 +1844,12 @@ pub fn call_builtin_function(
         "hasattr" => {
             let v = arg0(&args)?;
             let n = with_host(|h| h.str_of(&args.get(1).cloned().unwrap_or(Value::Undef)));
-            Ok(Value::Bool(with_host(|h| h.get_attr(&v, &n)).is_ok()))
+            Ok(Value::Bool(get_attr_desc(&v, &n).is_ok()))
         }
         "getattr" => {
             let v = arg0(&args)?;
             let n = with_host(|h| h.str_of(&args.get(1).cloned().unwrap_or(Value::Undef)));
-            match with_host(|h| h.get_attr(&v, &n)) {
+            match get_attr_desc(&v, &n) {
                 Ok(x) => Ok(x),
                 Err(e) => match args.get(2) {
                     Some(d) => Ok(d.clone()),
@@ -1804,7 +1861,7 @@ pub fn call_builtin_function(
             let v = arg0(&args)?;
             let n = with_host(|h| h.str_of(&args.get(1).cloned().unwrap_or(Value::Undef)));
             let val = args.get(2).cloned().unwrap_or(Value::Undef);
-            with_host(|h| h.set_attr(&v, &n, val))?;
+            set_attr_desc(&v, &n, val)?;
             Ok(Value::Undef)
         }
         "id" => {
@@ -1886,14 +1943,39 @@ pub fn call_builtin_function(
         "callable" => {
             let v = arg0(&args)?;
             Ok(Value::Bool(with_host(|h| {
-                matches!(
-                    h.get(&v),
+                match h.get(&v) {
                     Some(PyObj::Func(_))
-                        | Some(PyObj::Builtin(_))
-                        | Some(PyObj::Class(_))
-                        | Some(PyObj::BoundMethod { .. })
-                )
+                    | Some(PyObj::Builtin(_))
+                    | Some(PyObj::Class(_))
+                    | Some(PyObj::NamedTupleType { .. })
+                    | Some(PyObj::Partial { .. })
+                    | Some(PyObj::LruCache { .. })
+                    | Some(PyObj::StaticMethod(_))
+                    | Some(PyObj::ClassMethod(_))
+                    | Some(PyObj::BoundMethod { .. }) => true,
+                    // An instance is callable iff its class defines `__call__`.
+                    Some(PyObj::Instance(i)) => h.class_lookup(&i.class, "__call__").is_some(),
+                    _ => false,
+                }
             })))
+        }
+        "property" => {
+            let fget = args
+                .first()
+                .cloned()
+                .or_else(|| kw_get(&kwargs, "fget"))
+                .unwrap_or(Value::Undef);
+            let fset = args
+                .get(1)
+                .cloned()
+                .or_else(|| kw_get(&kwargs, "fset"))
+                .unwrap_or(Value::Undef);
+            let fdel = args
+                .get(2)
+                .cloned()
+                .or_else(|| kw_get(&kwargs, "fdel"))
+                .unwrap_or(Value::Undef);
+            Ok(with_host(|h| h.alloc(PyObj::Property { fget, fset, fdel })))
         }
         "vars" | "dir" => Ok(with_host(|h| h.new_list(vec![]))),
         // Type constructors.
@@ -2623,10 +2705,13 @@ pub fn type_has_method(typename: &str, name: &str) -> bool {
         "deque" => DEQUE_METHODS,
         "TextIOWrapper" => FILE_METHODS,
         "int" | "float" | "bool" => NUM_METHODS,
+        "property" => PROPERTY_METHODS,
         _ => &[],
     };
     list.contains(&name)
 }
+
+const PROPERTY_METHODS: &[&str] = &["getter", "setter", "deleter"];
 
 const BYTES_METHODS: &[&str] = &[
     "decode",
@@ -2766,10 +2851,32 @@ pub fn call_type_method(
         "TextIOWrapper" => file_method(recv, name, &args),
         "functools._lru_cache_wrapper" => lru_wrapper_method(recv, name),
         "int" | "float" | "bool" => num_method(recv, name, &args),
+        "property" => property_method(recv, name, &args),
         other => Err(format!(
             "AttributeError: '{other}' object has no attribute '{name}'"
         )),
     }
+}
+
+/// `property.getter/setter/deleter(func)` — return a copy of the property with
+/// the corresponding accessor replaced (the `@x.setter` decorator form).
+fn property_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    let (fget, fset, fdel) = with_host(|h| match h.get(recv) {
+        Some(PyObj::Property { fget, fset, fdel }) => (fget.clone(), fset.clone(), fdel.clone()),
+        _ => (Value::Undef, Value::Undef, Value::Undef),
+    });
+    let f = args.first().cloned().unwrap_or(Value::Undef);
+    let (fget, fset, fdel) = match name {
+        "getter" => (f, fset, fdel),
+        "setter" => (fget, f, fdel),
+        "deleter" => (fget, fset, f),
+        _ => {
+            return Err(format!(
+                "AttributeError: 'property' object has no attribute '{name}'"
+            ))
+        }
+    };
+    Ok(with_host(|h| h.alloc(PyObj::Property { fget, fset, fdel })))
 }
 
 fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {

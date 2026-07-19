@@ -127,7 +127,15 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
       (call_method + get_attr, instance and class receivers) honors them — static gets
       no implicit arg, classmethod binds the receiver's class as `cls` (derived-class
       aware, so `D.g` sees `D`). Alternate constructors `cls()` work.
-      Still open: **`property`** (needs the descriptor protocol).
+- [x] **`property` + descriptor protocol** — FIXED: `PyObj::Property{fget,fset,fdel}`
+      (a data descriptor) + `@property`/`@x.setter`/`@x.deleter` + the functional
+      `property(fget,fset,fdel)` form. `plan_attr_get`/`plan_attr_set` implement the
+      full protocol precedence (data descriptor > instance dict > non-data descriptor
+      > class attr), fired from `b_getattr`/`b_setattr` (out of any host borrow so the
+      accessor runs user code). User `__get__`/`__set__` descriptors and `__set_name__`
+      (fired at class creation, definition order) work. Missing-getter raises the 3.14
+      `property '<n>' of '<C>' object has no getter`. `getattr`/`hasattr`/`setattr`
+      builtins route through the same path.
 - [ ] **Instances are never hashable** — `hash(A())` / instance as dict key / set
       member → `TypeError: unhashable type: 'object'`, even with an explicit
       `__hash__`. No user object can key a dict or join a set.
@@ -142,11 +150,13 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
       `vars(instance)` → `[]`. C3 MRO inconsistency not detected (silently accepted).
 - [ ] **Iteration protocol inert** — `__iter__`/`__next__`, `__getitem__`-fallback
       iteration, `__contains__`, `__reversed__` → `'C' object is not iterable`.
-- [ ] **`__call__` not dispatched** — instances `not callable`; `callable(obj)` `False`.
-- [ ] **Descriptor protocol inert** — `__get__`/`__set__`/`__set_name__` ignored
-      (class-level descriptors returned as-is). Underlies property/classmethod too.
-- [ ] **Attribute-hook dunders inert** — `__getattr__`/`__getattribute__`/
-      `__setattr__`/`__delattr__`/`__dir__` never fire.
+- [x] **`__call__` dispatched** — FIXED: an instance whose class defines `__call__`
+      is callable via `invoke`; `callable(obj)` reflects it (and now also reports
+      `True` for partial/lru_cache/namedtuple/static+classmethod callables).
+- [x] **Descriptor protocol** — FIXED (see `property` row above): `__get__`/`__set__`/
+      `__set_name__` fire; data-vs-non-data precedence honored.
+- [ ] **Attribute-hook dunders** — `__getattr__` FIXED (fires when normal lookup
+      fails). Still inert: `__getattribute__`/`__setattr__`/`__delattr__`/`__dir__`.
 - [ ] **`__new__` never called**; `__init__` non-None return not checked.
 - [ ] **`__bool__` / `__len__` truthiness ignored** — instances are always truthy.
 - [ ] **f-string / `.format` ignore `__format__`/`__str__`/`__repr__`** — emit the

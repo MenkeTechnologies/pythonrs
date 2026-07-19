@@ -285,6 +285,48 @@ pub enum PyObj {
     /// `@classmethod`-wrapped function: called with the class bound as the first
     /// argument (`cls`).
     ClassMethod(Value),
+    /// A `property` descriptor. Each accessor is `Value::Undef` when unset. A
+    /// property is a *data* descriptor (it defines `__set__`/`__delete__`), so it
+    /// takes priority over an instance `__dict__` entry of the same name.
+    Property {
+        fget: Value,
+        fset: Value,
+        fdel: Value,
+    },
+}
+
+/// The plan for reading `recv.name` when a descriptor may be involved. Computed
+/// under a host borrow by [`PyHost::plan_attr_get`], then executed *without* one
+/// (the accessor runs user code, which re-enters the host).
+pub enum AttrGet {
+    /// No descriptor — resolve via [`PyHost::get_attr`].
+    Plain,
+    /// A `property`: invoke `fget(inst)`, or raise if `fget` is unset.
+    Property { fget: Value, inst: Value },
+    /// A user descriptor: call `desc.__get__(inst, cls)`.
+    Descriptor {
+        desc: Value,
+        inst: Value,
+        cls: Value,
+    },
+}
+
+/// The plan for `recv.name = val` when a descriptor may intercept it.
+pub enum AttrSet {
+    /// No descriptor — store via [`PyHost::set_attr`].
+    Plain,
+    /// A `property`: invoke `fset(inst, val)`, or raise if `fset` is unset.
+    Property {
+        fset: Value,
+        inst: Value,
+        val: Value,
+    },
+    /// A user data descriptor: call `desc.__set__(inst, val)`.
+    Descriptor {
+        desc: Value,
+        inst: Value,
+        val: Value,
+    },
 }
 
 /// Iterator cursor state.
@@ -831,6 +873,7 @@ impl PyHost {
                 Some(PyObj::Super { .. }) => "super".into(),
                 Some(PyObj::StaticMethod(_)) => "staticmethod".into(),
                 Some(PyObj::ClassMethod(_)) => "classmethod".into(),
+                Some(PyObj::Property { .. }) => "property".into(),
                 None => "object".into(),
             },
             _ => "object".into(),
@@ -936,6 +979,7 @@ impl PyHost {
                 Some(PyObj::ClassMethod(f)) => {
                     format!("<classmethod({})>", self.str_of(f))
                 }
+                Some(PyObj::Property { .. }) => "<property object>".into(),
                 Some(PyObj::Slice { .. })
                 | Some(PyObj::List(_))
                 | Some(PyObj::Tuple(_))
@@ -2779,6 +2823,88 @@ impl PyHost {
         }
     }
 
+    /// Does `class` (via its MRO) define method `name`?
+    fn class_has(&self, class: &str, name: &str) -> bool {
+        self.class_lookup(class, name).is_some()
+    }
+
+    /// Plan reading `recv.name`, honoring the descriptor protocol (`property`
+    /// and user `__get__` descriptors). See [`AttrGet`].
+    pub fn plan_attr_get(&mut self, recv: &Value, name: &str) -> AttrGet {
+        let (class, in_instdict) = match self.get(recv) {
+            Some(PyObj::Instance(i)) => (i.class.clone(), i.attrs.contains_key(name)),
+            _ => return AttrGet::Plain,
+        };
+        let cls_attr = match self.class_lookup(&class, name) {
+            Some(v) => v,
+            None => return AttrGet::Plain,
+        };
+        // `property` — a data descriptor: overrides the instance dict.
+        if let Some(PyObj::Property { fget, .. }) = self.get(&cls_attr) {
+            return AttrGet::Property {
+                fget: fget.clone(),
+                inst: recv.clone(),
+            };
+        }
+        // A user descriptor is an instance whose class defines `__get__`.
+        let (has_get, is_data) = match self.get(&cls_attr) {
+            Some(PyObj::Instance(i)) => {
+                let c = i.class.clone();
+                (
+                    self.class_has(&c, "__get__"),
+                    self.class_has(&c, "__set__") || self.class_has(&c, "__delete__"),
+                )
+            }
+            _ => (false, false),
+        };
+        // Data descriptors override the instance dict; non-data descriptors only
+        // fire when the name is absent from it.
+        if has_get && (is_data || !in_instdict) {
+            let cls = self.alloc(PyObj::Class(class));
+            return AttrGet::Descriptor {
+                desc: cls_attr,
+                inst: recv.clone(),
+                cls,
+            };
+        }
+        AttrGet::Plain
+    }
+
+    /// Plan `recv.name = val`, honoring `property.fset` and user `__set__`
+    /// data descriptors. See [`AttrSet`].
+    pub fn plan_attr_set(&mut self, recv: &Value, name: &str, val: &Value) -> AttrSet {
+        let class = match self.get(recv) {
+            Some(PyObj::Instance(i)) => i.class.clone(),
+            _ => return AttrSet::Plain,
+        };
+        let cls_attr = match self.class_lookup(&class, name) {
+            Some(v) => v,
+            None => return AttrSet::Plain,
+        };
+        if let Some(PyObj::Property { fset, .. }) = self.get(&cls_attr) {
+            return AttrSet::Property {
+                fset: fset.clone(),
+                inst: recv.clone(),
+                val: val.clone(),
+            };
+        }
+        let has_set = match self.get(&cls_attr) {
+            Some(PyObj::Instance(i)) => {
+                let c = i.class.clone();
+                self.class_has(&c, "__set__")
+            }
+            _ => false,
+        };
+        if has_set {
+            return AttrSet::Descriptor {
+                desc: cls_attr,
+                inst: recv.clone(),
+                val: val.clone(),
+            };
+        }
+        AttrSet::Plain
+    }
+
     /// `recv.name = val`.
     pub fn set_attr(&mut self, recv: &Value, name: &str, val: Value) -> Result<(), String> {
         match self.get_mut(recv) {
@@ -2897,6 +3023,12 @@ pub fn invoke(
             invoke(&func, all_args, all_kw)
         }
         Some(PyObj::LruCache { func, cache_id }) => lru_invoke(&func, cache_id, args, kwargs),
+        // A user instance whose class defines `__call__` is callable.
+        Some(PyObj::Instance(inst))
+            if with_host(|h| h.class_lookup(&inst.class, "__call__").is_some()) =>
+        {
+            call_method(callable, "__call__", args, kwargs)
+        }
         _ => Err(type_error(&format!(
             "'{}' object is not callable",
             with_host(|h| h.type_name(callable))
@@ -3239,7 +3371,21 @@ pub fn build_class(name: &str, bases: Vec<String>, body_func: &Value) -> Result<
     });
     r?;
     let ns: IndexMap<String, Value> = env.borrow().vars.clone();
-    Ok(with_host(|h| h.register_class(name, bases, ns)))
+    let cls = with_host(|h| h.register_class(name, bases, ns.clone()));
+    // Descriptor protocol: fire `__set_name__(owner, name)` on every class-body
+    // value whose type defines it (in definition order).
+    for (attr_name, val) in &ns {
+        let fires = with_host(|h| match h.get(val) {
+            Some(PyObj::Instance(i)) => h.class_lookup(&i.class, "__set_name__").is_some(),
+            _ => false,
+        });
+        if fires {
+            let owner = with_host(|h| h.alloc(PyObj::Class(name.to_string())));
+            let nm = with_host(|h| h.new_str(attr_name.clone()));
+            call_method(val, "__set_name__", vec![owner, nm], vec![])?;
+        }
+    }
+    Ok(cls)
 }
 
 /// Turn a raised value into an exception + the error string to abort with.
