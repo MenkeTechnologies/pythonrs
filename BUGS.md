@@ -5,17 +5,34 @@ object heap. It runs a large, real subset of Python 3 correctly (verified
 byte-for-byte against CPython on the example corpus). This file is the honest
 list of what is **not** yet covered, so nobody mistakes a gap for a bug fixed.
 
+## Implemented (previously listed here as gaps)
+- **Generators / `yield`.** A `def` whose body contains `yield` builds a real
+  lazy generator, backed by a stackful `corosensei` coroutine on the same thread
+  (the thread-local `PyHost` is shared across suspend/resume via a swapped
+  execution context). Supported: `for x in gen()`, `next(g)`, `list(gen())`,
+  `yield`-expression value, and `yield from`. Generator expressions
+  `(x for x in xs)` are now **lazy** (a hidden generator function), not eager.
+- **Call-site unpacking** `f(*args, **kwargs)`, `f(a, *b, c, **d)` — flattened at
+  runtime through `BUILD_ARGS`/`BUILD_KWARGS` and the `CALL*_EX` ops.
+- **Literal spreads** `[*a, *b]`, `(*a, b)`, `{*a, *b}`, and dict `**`-spread
+  `{**a, "k": 1, **b}` (later keys override; `None` stays a valid key).
+- **`match`/`case`** (PEP 634): literal, capture, wildcard `_`, sequence
+  `[a, *rest]`, mapping `{"k": v, **rest}`, class `Point(x=0)` (via
+  `__match_args__` + builtin-type self-match), OR-patterns `a | b`, `as`
+  bindings, and `if` guards.
+- **`nonlocal`** rebinds the nearest enclosing FUNCTION scope that binds the name
+  (distinct from `global`, which targets module scope).
+- **Comprehension scope**: list/set/dict comprehensions run in their own function
+  scope, so the loop variable no longer leaks; enclosing variables are still read
+  through the closure (the outermost iterable is evaluated in the enclosing
+  scope, matching CPython).
+
 ## Not yet implemented (compile/parse-time error, no silent wrong answer)
-- **Generators / `yield`.** `def` bodies containing `yield` are detected and
-  rejected at call time (`generator functions are not yet supported`). Generator
-  expressions `(x for x in xs)` are evaluated **eagerly** as a list, not lazily.
 - **`async`/`await`.** Parsed, but `await` is a no-op passthrough and there is no
   event loop; `async def` runs synchronously.
-- **Call-site unpacking** `f(*args, **kwargs)` — rejected at compile time. Def-site
-  `*args`/`**kwargs` and keyword args `f(a, b=2)` DO work.
-- **`dict` `**spread` inside a literal** `{**a, "k": v}` — rejected at compile time.
-  `dict(**a)` and `d.update(a)` work.
-- **`match`/`case`** structural pattern matching — not parsed yet.
+- **`yield from` delegation value.** Iteration is fully supported, but the value
+  of a `yield from` expression (the sub-generator's `return` value) is always
+  `None`; sent values are not forwarded to the delegate.
 
 ## Partial / simplified semantics
 - **Operator overloading dunders**: now dispatched. Arithmetic/bitwise
@@ -29,10 +46,6 @@ list of what is **not** yet covered, so nobody mistakes a gap for a bug fixed.
   Not yet: `NotImplemented`-driven reflected-op negotiation (the forward dunder is
   used if present; it is not retried reflected when it returns `NotImplemented`);
   `__hash__` for instances as dict keys / set members; in-place `__iadd__` etc.
-- **`nonlocal`** is approximated by `global` (rebinding an enclosing function's
-  local from a nested function writes to module scope instead).
-- **Comprehension scoping**: the loop variable leaks into the surrounding scope
-  (Python 3 gives comprehensions their own scope). The accumulator does not leak.
 - **Chained comparisons** `a < b < c` re-evaluate the interior operand `b`
   (correct for side-effect-free operands; a function call in the middle runs twice).
 - **`with`** desugars to try/finally calling `__enter__`/`__exit__`; the exception

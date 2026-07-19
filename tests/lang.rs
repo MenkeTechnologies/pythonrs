@@ -242,3 +242,279 @@ dct = str({'k': P(4)})
     assert_eq!(g(src, "tup"), "'(P(3),)'");
     assert_eq!(g(src, "dct"), "\"{'k': P(4)}\"");
 }
+
+// ── generators / yield ────────────────────────────────────────────────────────
+
+#[test]
+fn generators_basic() {
+    let src = "
+def count(n):
+    i = 0
+    while i < n:
+        yield i
+        i += 1
+whole = list(count(5))
+first_two = [0, 0]
+g2 = count(2)
+first_two[0] = next(g2)
+first_two[1] = next(g2)
+total = sum(count(10))
+loop = []
+for v in count(3):
+    loop.append(v)
+";
+    assert_eq!(g(src, "whole"), "[0, 1, 2, 3, 4]");
+    assert_eq!(g(src, "first_two"), "[0, 1]");
+    assert_eq!(g(src, "total"), "45");
+    assert_eq!(g(src, "loop"), "[0, 1, 2]");
+}
+
+#[test]
+fn generators_yield_expression_and_from() {
+    // A `yield` expression receives the value passed to the caller's resume; a
+    // plain iteration sends None (falsy), so the echo accumulates the yields.
+    let src = "
+def squares(xs):
+    for x in xs:
+        yield x * x
+def chained():
+    yield from range(3)
+    yield from [7, 8]
+sq = list(squares(range(4)))
+ch = list(chained())
+# lazy generator expression: type is generator, evaluated on demand
+gx = (i * i for i in range(5))
+tname = type(gx).__name__
+vals = list(gx)
+filtered = list(n for n in range(6) if n % 2 == 0)
+";
+    assert_eq!(g(src, "sq"), "[0, 1, 4, 9]");
+    assert_eq!(g(src, "ch"), "[0, 1, 2, 7, 8]");
+    assert_eq!(g(src, "tname"), "'generator'");
+    assert_eq!(g(src, "vals"), "[0, 1, 4, 9, 16]");
+    assert_eq!(g(src, "filtered"), "[0, 2, 4]");
+}
+
+#[test]
+fn generator_is_lazy() {
+    // A generator expression must NOT evaluate its body eagerly: only the two
+    // elements actually consumed by `next` are produced (an eager list would
+    // divide by zero on the 0 element).
+    let src = "
+seen = []
+def tap(x):
+    seen.append(x)
+    return x
+gen = (tap(i) for i in range(100))
+one = next(gen)
+two = next(gen)
+consumed = list(seen)
+";
+    assert_eq!(g(src, "one"), "0");
+    assert_eq!(g(src, "two"), "1");
+    assert_eq!(g(src, "consumed"), "[0, 1]");
+}
+
+// ── call-site * / ** unpacking ────────────────────────────────────────────────
+
+#[test]
+fn call_arg_unpacking() {
+    let src = "
+def f(a, b, c):
+    return (a, b, c)
+lst = [10, 20, 30]
+r1 = f(*lst)
+r2 = f(*[1], *[2, 3])
+r3 = f(1, *[2], 3)
+def h(a, b, c, x=0, y=0):
+    return (a, b, c, x, y)
+r4 = h(*[1, 2], 3, **{'x': 9}, y=8)
+def var(*args, **kwargs):
+    return (args, sorted(kwargs.items()))
+r5 = var(*[1, 2], 3, **{'k': 4}, z=5)
+";
+    assert_eq!(g(src, "r1"), "(10, 20, 30)");
+    assert_eq!(g(src, "r2"), "(1, 2, 3)");
+    assert_eq!(g(src, "r3"), "(1, 2, 3)");
+    assert_eq!(g(src, "r4"), "(1, 2, 3, 9, 8)");
+    assert_eq!(g(src, "r5"), "((1, 2, 3), [('k', 4), ('z', 5)])");
+}
+
+// ── literal spreads ──────────────────────────────────────────────────────────
+
+#[test]
+fn literal_spreads() {
+    assert_eq!(g("x = [*[1, 2], 3, *[4, 5]]", "x"), "[1, 2, 3, 4, 5]");
+    assert_eq!(g("x = (*[1, 2], 3)", "x"), "(1, 2, 3)");
+    assert_eq!(g("x = sorted({*[1, 2], *[2, 3, 4]})", "x"), "[1, 2, 3, 4]");
+    // ** dict spread with later keys overriding earlier ones, insertion order.
+    assert_eq!(
+        g("x = {**{'a': 1}, 'b': 2, **{'c': 3, 'a': 10}}", "x"),
+        "{'a': 10, 'b': 2, 'c': 3}"
+    );
+    // None is a legal dict key and must not be confused with a ** spread slot.
+    assert_eq!(g("x = {**{'a': 1}, None: 2}", "x"), "{'a': 1, None: 2}");
+}
+
+// ── match / case ──────────────────────────────────────────────────────────────
+
+#[test]
+fn match_literal_capture_wildcard_or_guard() {
+    let src = "
+def d(v):
+    match v:
+        case 0:
+            return 'zero'
+        case 1 | 2 | 3:
+            return 'small'
+        case int() if v > 100:
+            return 'big'
+        case str() as s:
+            return 'str:' + s
+        case _:
+            return 'other'
+a = d(0)
+b = d(2)
+c = d(200)
+e = d('hi')
+f = d(3.5)
+";
+    assert_eq!(g(src, "a"), "'zero'");
+    assert_eq!(g(src, "b"), "'small'");
+    assert_eq!(g(src, "c"), "'big'");
+    assert_eq!(g(src, "e"), "'str:hi'");
+    assert_eq!(g(src, "f"), "'other'");
+}
+
+#[test]
+fn match_sequence_and_mapping() {
+    let src = "
+def d(v):
+    match v:
+        case [a, b]:
+            return ('pair', a, b)
+        case [a, *rest]:
+            return ('head', a, rest)
+        case {'name': n, 'age': age}:
+            return ('person', n, age)
+        case _:
+            return ('other',)
+p = d([10, 20])
+h = d([1, 2, 3, 4])
+m = d({'name': 'Al', 'age': 30})
+rest_bind = None
+match {'k': 1, 'a': 2, 'b': 3}:
+    case {'k': v, **others}:
+        rest_bind = (v, sorted(others.items()))
+";
+    assert_eq!(g(src, "p"), "('pair', 10, 20)");
+    assert_eq!(g(src, "h"), "('head', 1, [2, 3, 4])");
+    assert_eq!(g(src, "m"), "('person', 'Al', 30)");
+    assert_eq!(g(src, "rest_bind"), "(1, [('a', 2), ('b', 3)])");
+}
+
+#[test]
+fn match_class_patterns() {
+    let src = "
+class Point:
+    __match_args__ = ('x', 'y')
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+def loc(p):
+    match p:
+        case Point(0, 0):
+            return 'origin'
+        case Point(x=0, y=y):
+            return ('y-axis', y)
+        case Point(x, y):
+            return ('point', x, y)
+        case _:
+            return '?'
+a = loc(Point(0, 0))
+b = loc(Point(0, 5))
+c = loc(Point(3, 4))
+";
+    assert_eq!(g(src, "a"), "'origin'");
+    assert_eq!(g(src, "b"), "('y-axis', 5)");
+    assert_eq!(g(src, "c"), "('point', 3, 4)");
+}
+
+// ── nonlocal ──────────────────────────────────────────────────────────────────
+
+#[test]
+fn nonlocal_rebinds_enclosing_function_scope() {
+    // `nonlocal` writes to the nearest enclosing FUNCTION scope, distinct from
+    // `global` (which would touch module scope).
+    let src = "
+def counter():
+    n = 0
+    def inc():
+        nonlocal n
+        n += 1
+        return n
+    return inc
+c = counter()
+calls = [c(), c(), c()]
+outer_x = 'g'
+def outer():
+    x = 'outer'
+    def inner():
+        nonlocal x
+        x = 'changed'
+    inner()
+    return x
+changed = outer()
+still_global = outer_x
+";
+    assert_eq!(g(src, "calls"), "[1, 2, 3]");
+    assert_eq!(g(src, "changed"), "'changed'");
+    // The module-level name of the same spelling must be untouched.
+    assert_eq!(g(src, "still_global"), "'g'");
+}
+
+#[test]
+fn nonlocal_skips_to_deep_enclosing_scope() {
+    let src = "
+def deep():
+    a = 1
+    def mid():
+        def inner():
+            nonlocal a
+            a = 99
+        inner()
+    mid()
+    return a
+x = deep()
+";
+    assert_eq!(g(src, "x"), "99");
+}
+
+// ── comprehension own-scope ───────────────────────────────────────────────────
+
+#[test]
+fn comprehension_loop_var_does_not_leak() {
+    // Python 3 gives comprehensions their own scope: the loop variable must not
+    // leak, but enclosing variables are still readable.
+    assert_eq!(
+        g("i = 'before'\nsq = [i * i for i in range(4)]\nx = i", "x"),
+        "'before'"
+    );
+    assert_eq!(
+        g("k = 'keep'\nd = {v: v for v in range(2)}\nx = k", "x"),
+        "'keep'"
+    );
+    // Enclosing var is read inside the comprehension.
+    assert_eq!(
+        g("y = 100\nx = [n + y for n in range(3)]", "x"),
+        "[100, 101, 102]"
+    );
+    // Nested comprehension loop vars also stay contained.
+    assert_eq!(
+        g(
+            "j = 'j'\nx = [a * b for a in range(2) for b in range(3)]\nleaked = j",
+            "leaked"
+        ),
+        "'j'"
+    );
+}
