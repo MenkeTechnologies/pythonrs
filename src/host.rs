@@ -1137,11 +1137,26 @@ pub fn fmt_float(f: f64) -> String {
     if f.is_nan() {
         return "nan".into();
     }
-    if f == f.trunc() && f.abs() < 1e16 {
-        format!("{f:.1}")
-    } else {
-        let s = format!("{f}");
+    // Python's `repr(float)`: the shortest round-trip decimal, switching to
+    // scientific notation when the base-10 exponent is < -4 or >= 16, with a
+    // sign and a min-2-digit exponent (`1e+16`, `1e-05`, `1.5e+300`). Rust's `{}`
+    // never uses exponent form (so `1e16` prints as a 17-digit integer) and its
+    // `{:e}` writes `e3`/`e-5` (no sign, no zero-pad) — neither matches CPython.
+    let sci = format!("{f:e}"); // shortest scientific: "1.2345e3", "1e-5", "-1.5e300"
+    let epos = sci
+        .rfind('e')
+        .expect("scientific format carries an exponent");
+    let exp: i32 = sci[epos + 1..].parse().expect("valid exponent");
+    if (-4..16).contains(&exp) {
+        let mut s = format!("{f}");
+        if !s.contains('.') {
+            s.push_str(".0"); // integral value in fixed range -> Python's trailing `.0`
+        }
         s
+    } else {
+        let mantissa = &sci[..epos];
+        let sign = if exp < 0 { '-' } else { '+' };
+        format!("{mantissa}e{sign}{:02}", exp.abs())
     }
 }
 
