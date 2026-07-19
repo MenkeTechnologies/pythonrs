@@ -15,7 +15,7 @@
 //!     bignum, complex — the reference types.
 
 use fusevm::{Chunk, NumOp, VMResult, Value, VM};
-use indexmap::{IndexMap, IndexSet};
+use indexmap::IndexMap;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -184,18 +184,35 @@ pub enum PyObj {
     Tuple(Vec<Value>),
     Dict(IndexMap<PKey, (Value, Value)>),
     Set(IndexMap<PKey, Value>),
-    Range { start: i64, stop: i64, step: i64 },
-    Slice { lo: Value, hi: Value, step: Value },
+    Range {
+        start: i64,
+        stop: i64,
+        step: i64,
+    },
+    Slice {
+        lo: Value,
+        hi: Value,
+        step: Value,
+    },
     Func(FuncVal),
     /// A first-class reference to a builtin function (`len`, `print`, …).
     Builtin(String),
     Class(String),
     Instance(Instance),
-    BoundMethod { recv: Value, func: Value },
-    Exception { class: String, args: Vec<Value> },
+    BoundMethod {
+        recv: Value,
+        func: Value,
+    },
+    Exception {
+        class: String,
+        args: Vec<Value>,
+    },
     /// A live iterator over a heap object, with a cursor.
     Iter(IterState),
-    Module { name: String, ns: IndexMap<String, Value> },
+    Module {
+        name: String,
+        ns: IndexMap<String, Value>,
+    },
     BigInt(num_bigint::BigInt),
     Complex(f64, f64),
 }
@@ -403,7 +420,13 @@ impl PyHost {
     }
 
     pub fn del_name(&mut self, name: &str) -> Result<(), String> {
-        if self.cur_env().borrow_mut().vars.shift_remove(name).is_some() {
+        if self
+            .cur_env()
+            .borrow_mut()
+            .vars
+            .shift_remove(name)
+            .is_some()
+        {
             return Ok(());
         }
         if self.globals.shift_remove(name).is_some() {
@@ -573,7 +596,11 @@ impl PyHost {
                 Some(PyObj::Instance(inst)) => format!("<{} object>", inst.class),
                 Some(PyObj::Class(n)) => format!("<class '{n}'>"),
                 Some(PyObj::Func(f)) => {
-                    let name = self.funcs.get(f.def_id).map(|d| d.name.clone()).unwrap_or_default();
+                    let name = self
+                        .funcs
+                        .get(f.def_id)
+                        .map(|d| d.name.clone())
+                        .unwrap_or_default();
                     format!("<function {name}>")
                 }
                 Some(PyObj::Builtin(n)) => format!("<built-in function {n}>"),
@@ -588,8 +615,11 @@ impl PyHost {
                     }
                 }
                 Some(PyObj::Iter(_)) => "<iterator>".into(),
-                Some(PyObj::Slice { .. }) | Some(PyObj::List(_)) | Some(PyObj::Tuple(_))
-                | Some(PyObj::Dict(_)) | Some(PyObj::Set(_)) => self.repr_of(v),
+                Some(PyObj::Slice { .. })
+                | Some(PyObj::List(_))
+                | Some(PyObj::Tuple(_))
+                | Some(PyObj::Dict(_))
+                | Some(PyObj::Set(_)) => self.repr_of(v),
                 None => "<object>".into(),
             },
             _ => "<object>".into(),
@@ -1051,7 +1081,9 @@ impl PyHost {
                 _ => Err(self.optype_err("/", a, b)),
             },
             binop::FLOORDIV => match (ai, bi) {
-                (Some(_), Some(0)) => Err("ZeroDivisionError: integer division or modulo by zero".into()),
+                (Some(_), Some(0)) => {
+                    Err("ZeroDivisionError: integer division or modulo by zero".into())
+                }
                 (Some(x), Some(y)) => Ok(Value::Int(x.div_euclid(y))),
                 _ => match (af, bf) {
                     (Some(x), Some(y)) => Ok(Value::Float((x / y).floor())),
@@ -1065,7 +1097,9 @@ impl PyHost {
                     return self.str_format_percent(&fmt, b);
                 }
                 match (ai, bi) {
-                    (Some(_), Some(0)) => Err("ZeroDivisionError: integer division or modulo by zero".into()),
+                    (Some(_), Some(0)) => {
+                        Err("ZeroDivisionError: integer division or modulo by zero".into())
+                    }
                     (Some(x), Some(y)) => Ok(Value::Int(x.rem_euclid(y))),
                     _ => match (af, bf) {
                         (Some(x), Some(y)) => Ok(Value::Float(x - (x / y).floor() * y)),
@@ -1193,7 +1227,12 @@ impl PyHost {
                     }
                     'd' | 'i' => {
                         let a = arglist.get(ai).cloned().unwrap_or(Value::Int(0));
-                        out.push_str(&self.as_int(&a).map(|n| n.to_string()).unwrap_or_else(|| self.str_of(&a)));
+                        out.push_str(
+                            &self
+                                .as_int(&a)
+                                .map(|n| n.to_string())
+                                .unwrap_or_else(|| self.str_of(&a)),
+                        );
                         ai += 1;
                     }
                     'f' => {
@@ -1234,7 +1273,9 @@ impl PyHost {
         match self.get(recv) {
             Some(PyObj::List(l)) | Some(PyObj::Tuple(l)) => {
                 let n = l.len() as i64;
-                let i = self.as_int(idx).ok_or_else(|| type_error("indices must be integers"))?;
+                let i = self
+                    .as_int(idx)
+                    .ok_or_else(|| type_error("indices must be integers"))?;
                 let k = if i < 0 { i + n } else { i };
                 if k < 0 || k >= n {
                     return Err("IndexError: index out of range".into());
@@ -1244,7 +1285,9 @@ impl PyHost {
             Some(PyObj::Str(s)) => {
                 let chars: Vec<char> = s.chars().collect();
                 let n = chars.len() as i64;
-                let i = self.as_int(idx).ok_or_else(|| type_error("string indices must be integers"))?;
+                let i = self
+                    .as_int(idx)
+                    .ok_or_else(|| type_error("string indices must be integers"))?;
                 let k = if i < 0 { i + n } else { i };
                 if k < 0 || k >= n {
                     return Err("IndexError: string index out of range".into());
@@ -1265,7 +1308,9 @@ impl PyHost {
                     Some(PyObj::Range { start, stop, step }) => range_len(*start, *stop, *step),
                     _ => 0,
                 };
-                let i = self.as_int(idx).ok_or_else(|| type_error("range indices must be integers"))?;
+                let i = self
+                    .as_int(idx)
+                    .ok_or_else(|| type_error("range indices must be integers"))?;
                 let k = if i < 0 { i + len } else { i };
                 if k < 0 || k >= len {
                     return Err("IndexError: range object index out of range".into());
@@ -1279,7 +1324,13 @@ impl PyHost {
         }
     }
 
-    fn get_slice(&mut self, recv: &Value, lo: &Value, hi: &Value, step: &Value) -> Result<Value, String> {
+    fn get_slice(
+        &mut self,
+        recv: &Value,
+        lo: &Value,
+        hi: &Value,
+        step: &Value,
+    ) -> Result<Value, String> {
         let step = self.as_int(step).unwrap_or(1);
         if step == 0 {
             return Err("ValueError: slice step cannot be zero".into());
@@ -1344,7 +1395,9 @@ impl PyHost {
         match self.get(recv) {
             Some(PyObj::List(l)) => {
                 let n = l.len() as i64;
-                let i = self.as_int(idx).ok_or_else(|| type_error("list indices must be integers"))?;
+                let i = self
+                    .as_int(idx)
+                    .ok_or_else(|| type_error("list indices must be integers"))?;
                 let k = if i < 0 { i + n } else { i };
                 if k < 0 || k >= n {
                     return Err("IndexError: list assignment index out of range".into());
@@ -1382,7 +1435,9 @@ impl PyHost {
             }
             Some(PyObj::List(l)) => {
                 let n = l.len() as i64;
-                let i = self.as_int(idx).ok_or_else(|| type_error("list indices must be integers"))?;
+                let i = self
+                    .as_int(idx)
+                    .ok_or_else(|| type_error("list indices must be integers"))?;
                 let k = if i < 0 { i + n } else { i };
                 if k < 0 || k >= n {
                     return Err("IndexError: list assignment index out of range".into());
@@ -1402,7 +1457,15 @@ impl PyHost {
         match self.get(v) {
             Some(PyObj::List(l)) | Some(PyObj::Tuple(l)) => Ok(l.clone()),
             Some(PyObj::Str(s)) => {
-                let chars: Vec<Value> = s.chars().collect::<Vec<_>>().iter().map(|c| c.to_string()).collect::<Vec<_>>().into_iter().map(|s| self.new_str(s)).collect();
+                let chars: Vec<Value> = s
+                    .chars()
+                    .collect::<Vec<_>>()
+                    .iter()
+                    .map(|c| c.to_string())
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|s| self.new_str(s))
+                    .collect();
                 Ok(chars)
             }
             Some(PyObj::Set(s)) => Ok(s.values().cloned().collect()),
@@ -1449,7 +1512,14 @@ impl PyHost {
                 idx: 0,
             },
             Some(PyObj::Str(s)) => IterState::Seq {
-                items: s.chars().map(|c| c.to_string()).collect::<Vec<_>>().into_iter().map(PyObj::Str).map(|o| self.alloc(o)).collect(),
+                items: s
+                    .chars()
+                    .map(|c| c.to_string())
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(PyObj::Str)
+                    .map(|o| self.alloc(o))
+                    .collect(),
                 idx: 0,
             },
             Some(PyObj::Set(s)) => IterState::Seq {
@@ -1496,7 +1566,11 @@ impl PyHost {
                 }
             }
             Some(PyObj::Iter(IterState::RangeIter { cur, stop, step })) => {
-                let go = if *step > 0 { *cur < *stop } else { *cur > *stop };
+                let go = if *step > 0 {
+                    *cur < *stop
+                } else {
+                    *cur > *stop
+                };
                 if go {
                     let v = *cur;
                     *cur += *step;
@@ -1514,9 +1588,9 @@ impl PyHost {
     pub fn contains(&mut self, item: &Value, container: &Value) -> Result<bool, String> {
         match self.get(container) {
             Some(PyObj::Str(s)) => {
-                let needle = self.as_str(item).ok_or_else(|| {
-                    type_error("'in <string>' requires string as left operand")
-                })?;
+                let needle = self
+                    .as_str(item)
+                    .ok_or_else(|| type_error("'in <string>' requires string as left operand"))?;
                 Ok(s.contains(&needle))
             }
             Some(PyObj::List(l)) | Some(PyObj::Tuple(l)) => {
@@ -1551,8 +1625,11 @@ fn slice_bounds(lo: &Value, hi: &Value, step: i64, n: i64, h: &PyHost) -> (i64, 
     };
     let start = match h.as_int(lo) {
         Some(x) => {
-            let k = if x < 0 { (x + n).max(if step < 0 { -1 } else { 0 }) } else { x.min(n) };
-            k
+            if x < 0 {
+                (x + n).max(if step < 0 { -1 } else { 0 })
+            } else {
+                x.min(n)
+            }
         }
         None => {
             if step < 0 {
@@ -1724,7 +1801,12 @@ impl PyHost {
     }
 
     /// Register a class built from a run class-body namespace.
-    pub fn register_class(&mut self, name: &str, bases: Vec<String>, ns: IndexMap<String, Value>) -> Value {
+    pub fn register_class(
+        &mut self,
+        name: &str,
+        bases: Vec<String>,
+        ns: IndexMap<String, Value>,
+    ) -> Value {
         let mro = {
             let mut out = vec![name.to_string()];
             for b in &bases {
@@ -1752,7 +1834,11 @@ impl PyHost {
 // ── call machinery (free functions: run user chunks, so hold no host borrow) ──
 
 /// Invoke any callable value with positional + keyword arguments.
-pub fn invoke(callable: &Value, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Result<Value, String> {
+pub fn invoke(
+    callable: &Value,
+    args: Vec<Value>,
+    kwargs: Vec<(String, Value)>,
+) -> Result<Value, String> {
     let obj = with_host(|h| h.get(callable).cloned());
     match obj {
         Some(PyObj::Builtin(name)) => crate::builtins::call_builtin_function(&name, args, kwargs),
@@ -1776,7 +1862,11 @@ pub fn invoke(callable: &Value, args: Vec<Value>, kwargs: Vec<(String, Value)>) 
 }
 
 /// Resolve a bare name and call it (`f(args)`, `print(args)`).
-pub fn call_named(name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Result<Value, String> {
+pub fn call_named(
+    name: &str,
+    args: Vec<Value>,
+    kwargs: Vec<(String, Value)>,
+) -> Result<Value, String> {
     if let Some(v) = with_host(|h| h.read_name(name)) {
         return invoke(&v, args, kwargs);
     }
@@ -1790,7 +1880,12 @@ pub fn call_named(name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) ->
 }
 
 /// `recv.name(args)`.
-pub fn call_method(recv: &Value, name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Result<Value, String> {
+pub fn call_method(
+    recv: &Value,
+    name: &str,
+    args: Vec<Value>,
+    kwargs: Vec<(String, Value)>,
+) -> Result<Value, String> {
     let obj = with_host(|h| h.get(recv).cloned());
     match obj {
         Some(PyObj::Instance(inst)) => {
@@ -1846,13 +1941,19 @@ fn method_owner(h: &PyHost, class: &str, name: &str) -> Option<String> {
 }
 
 /// Construct an instance of `class` and run its `__init__`.
-pub fn instantiate(class: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Result<Value, String> {
+pub fn instantiate(
+    class: &str,
+    args: Vec<Value>,
+    kwargs: Vec<(String, Value)>,
+) -> Result<Value, String> {
     // Builtin exception classes construct exception objects.
     if crate::builtins::is_exception_class(class) && !with_host(|h| h.classes.contains_key(class)) {
-        return Ok(with_host(|h| h.alloc(PyObj::Exception {
-            class: class.to_string(),
-            args,
-        })));
+        return Ok(with_host(|h| {
+            h.alloc(PyObj::Exception {
+                class: class.to_string(),
+                args,
+            })
+        }));
     }
     let inst = with_host(|h| {
         h.alloc(PyObj::Instance(Instance {
@@ -2104,7 +2205,10 @@ pub fn import_module(name: &str) -> Result<Value, String> {
                 ("sin", h.alloc(PyObj::Builtin("math.sin".into()))),
                 ("cos", h.alloc(PyObj::Builtin("math.cos".into()))),
                 ("gcd", h.alloc(PyObj::Builtin("math.gcd".into()))),
-                ("factorial", h.alloc(PyObj::Builtin("math.factorial".into()))),
+                (
+                    "factorial",
+                    h.alloc(PyObj::Builtin("math.factorial".into())),
+                ),
             ]
         }),
         "sys" => with_host(|h| {

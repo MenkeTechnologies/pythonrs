@@ -47,6 +47,13 @@ pub fn emit_executable(prog: &Program, out: &Path) -> Result<(), String> {
     cmd.arg(&main_c).arg(&obj).arg(&lib).arg("-o").arg(out);
     if cfg!(target_os = "macos") {
         cmd.args([
+            // NOTE: the linker prints a benign "no platform load command found in
+            // <aot>.o, assuming: macOS" — the cranelift-object `.o` emitted by
+            // fusevm::aot has no LC_BUILD_VERSION. It is cosmetic (the executable
+            // links and runs correctly). The real fix is upstream in fusevm::aot
+            // (stamp the Mach-O platform at object emission); a pythonrs-side
+            // -Wl,-platform_version only introduces conflicting-version warnings,
+            // so we deliberately do NOT pass one here.
             "-framework",
             "CoreFoundation",
             "-framework",
@@ -105,7 +112,7 @@ fn staticlib_path() -> Result<PathBuf, String> {
 pub unsafe extern "C" fn fusevm_aot_register_builtins(vm: *mut VM) {
     let vm = unsafe { &mut *vm };
     crate::builtins::install(vm);
-    vm.set_numeric_hook(Arc::new(|op, a, b| crate::builtins::numeric_hook(op, a, b)));
+    vm.set_numeric_hook(Arc::new(crate::builtins::numeric_hook));
     let images: Vec<ProgImage> = vm
         .chunk
         .names

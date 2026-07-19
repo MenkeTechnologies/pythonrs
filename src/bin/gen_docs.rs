@@ -6,15 +6,27 @@ use std::fmt::Write as _;
 const BUILTINS: &[(&str, &str)] = &[
     ("print(*args, sep=' ', end='\\n')", "Write args to stdout."),
     ("len(x)", "Number of items in a container."),
-    ("range(stop) / range(start, stop[, step])", "An arithmetic progression."),
-    ("int(x=0, base=10)", "Convert to an integer (arbitrary precision)."),
+    (
+        "range(stop) / range(start, stop[, step])",
+        "An arithmetic progression.",
+    ),
+    (
+        "int(x=0, base=10)",
+        "Convert to an integer (arbitrary precision).",
+    ),
     ("float(x=0.0)", "Convert to a floating-point number."),
     ("str(x='')", "String form of an object."),
     ("repr(x)", "The canonical string representation."),
-    ("list / tuple / set / dict / frozenset", "Container constructors."),
+    (
+        "list / tuple / set / dict / frozenset",
+        "Container constructors.",
+    ),
     ("bool(x)", "Truth value of x."),
     ("sum(iterable, start=0)", "Sum of a sequence."),
-    ("min / max(iterable, *, key, default)", "Smallest / largest item."),
+    (
+        "min / max(iterable, *, key, default)",
+        "Smallest / largest item.",
+    ),
     ("sorted(iterable, *, key, reverse)", "A new sorted list."),
     ("enumerate(iterable, start=0)", "Index/value pairs."),
     ("zip(*iterables)", "Tuples of parallel items."),
@@ -24,7 +36,10 @@ const BUILTINS: &[(&str, &str)] = &[
     ("abs / round / divmod / pow", "Numeric helpers."),
     ("type(x) / isinstance(x, cls)", "Runtime type checks."),
     ("hasattr / getattr / setattr", "Attribute access by name."),
-    ("ord / chr / hex / oct / bin", "Character/number conversions."),
+    (
+        "ord / chr / hex / oct / bin",
+        "Character/number conversions.",
+    ),
     ("iter(x) / next(it[, default])", "Iterator protocol."),
     ("input([prompt])", "Read a line from stdin."),
 ];
@@ -32,9 +47,9 @@ const BUILTINS: &[(&str, &str)] = &[
 fn main() {
     let mut body = String::new();
     for (sig, desc) in BUILTINS {
-        let _ = write!(
+        let _ = writeln!(
             body,
-            "<tr><td><code>{}</code></td><td>{}</td></tr>\n",
+            "<tr><td><code>{}</code></td><td>{}</td></tr>",
             html_escape(sig),
             html_escape(desc)
         );
@@ -54,5 +69,7 @@ code{{color:#79c0ff}}</style></head><body>\
 }
 
 fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }

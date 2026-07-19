@@ -79,7 +79,6 @@ fn rebase_chunk(chunk: &mut Chunk, func_off: usize, try_off: usize) {
 
 /// Break/continue jump fixups for a native loop.
 struct LoopCtx {
-    continue_label: usize,
     breaks: Vec<usize>,
     continues: Vec<usize>,
 }
@@ -263,9 +262,10 @@ impl Compiler {
                 for a in aliases {
                     self.strlit(b, &a.name);
                     b.emit(Op::CallBuiltin(ops::IMPORT, 1), line);
-                    let bind = a.asname.clone().unwrap_or_else(|| {
-                        a.name.split('.').next().unwrap_or(&a.name).to_string()
-                    });
+                    let bind = a
+                        .asname
+                        .clone()
+                        .unwrap_or_else(|| a.name.split('.').next().unwrap_or(&a.name).to_string());
                     self.store_name(b, &bind);
                 }
             }
@@ -326,7 +326,11 @@ impl Compiler {
         Ok(())
     }
 
-    fn compile_unpack_assign(&mut self, b: &mut ChunkBuilder, items: &[Expr]) -> Result<(), String> {
+    fn compile_unpack_assign(
+        &mut self,
+        b: &mut ChunkBuilder,
+        items: &[Expr],
+    ) -> Result<(), String> {
         let star_idx = items
             .iter()
             .position(|e| matches!(e, Expr::Starred(_)))
@@ -386,7 +390,7 @@ impl Compiler {
     fn compile_condition(&mut self, b: &mut ChunkBuilder, e: &Expr) -> Result<(), String> {
         self.compile_expr(b, e)?;
         b.emit(Op::CallBuiltin(ops::TRUTHY, 1), 0);
-    Ok(())
+        Ok(())
     }
 
     fn compile_if(
@@ -424,7 +428,6 @@ impl Compiler {
         self.compile_condition(b, test)?;
         let jfalse = b.emit(Op::JumpIfFalse(0), 0);
         self.loops.push(LoopCtx {
-            continue_label: start,
             breaks: Vec::new(),
             continues: Vec::new(),
         });
@@ -459,10 +462,9 @@ impl Compiler {
         let start = b.current_pos();
         b.emit(Op::CallBuiltin(ops::FORITER, 0), 0); // [iterator, value, has_next]
         let jdone = b.emit(Op::JumpIfFalse(0), 0); // pops has_next
-        // [iterator, value] — assign to target.
+                                                   // [iterator, value] — assign to target.
         self.compile_assign(b, target)?; // pops value -> [iterator]
         self.loops.push(LoopCtx {
-            continue_label: start,
             breaks: Vec::new(),
             continues: Vec::new(),
         });
@@ -559,11 +561,7 @@ impl Compiler {
             ndefaults: params.defaults.len(),
             star: params.star.clone(),
             kwonly: params.kwonly.clone(),
-            kwonly_required: params
-                .kwonly_defaults
-                .iter()
-                .map(|d| d.is_none())
-                .collect(),
+            kwonly_required: params.kwonly_defaults.iter().map(|d| d.is_none()).collect(),
             kwargs: params.kwargs.clone(),
             chunk: fb.build(),
             is_generator,
@@ -678,11 +676,13 @@ impl Compiler {
                 keywords: vec![],
             };
             match &it.vars {
-                Some(v) => inner.push(StmtKind::Assign {
-                    targets: vec![v.clone()],
-                    value: enter,
-                }
-                .into()),
+                Some(v) => inner.push(
+                    StmtKind::Assign {
+                        targets: vec![v.clone()],
+                        value: enter,
+                    }
+                    .into(),
+                ),
                 None => inner.push(StmtKind::Expr(enter).into()),
             }
         }
@@ -823,9 +823,15 @@ impl Compiler {
                     0,
                 );
             }
-            Expr::ListComp(elt, comps) => self.compile_comprehension(b, CompKind::List, elt, None, comps)?,
-            Expr::SetComp(elt, comps) => self.compile_comprehension(b, CompKind::Set, elt, None, comps)?,
-            Expr::GenExp(elt, comps) => self.compile_comprehension(b, CompKind::List, elt, None, comps)?,
+            Expr::ListComp(elt, comps) => {
+                self.compile_comprehension(b, CompKind::List, elt, None, comps)?
+            }
+            Expr::SetComp(elt, comps) => {
+                self.compile_comprehension(b, CompKind::Set, elt, None, comps)?
+            }
+            Expr::GenExp(elt, comps) => {
+                self.compile_comprehension(b, CompKind::List, elt, None, comps)?
+            }
             Expr::DictComp(k, v, comps) => {
                 self.compile_comprehension(b, CompKind::Dict, k, Some(v), comps)?
             }
@@ -835,7 +841,9 @@ impl Compiler {
                 self.compile_assign(b, target)?;
             }
             Expr::Yield(_) | Expr::YieldFrom(_) => {
-                return Err("yield is only valid inside a generator (unsupported; see BUGS)".into());
+                return Err(
+                    "yield is only valid inside a generator (unsupported; see BUGS)".into(),
+                );
             }
             Expr::Await(inner) => self.compile_expr(b, inner)?,
         }
@@ -893,7 +901,12 @@ impl Compiler {
         Ok(())
     }
 
-    fn compile_boolop(&mut self, b: &mut ChunkBuilder, op: BoolOp, values: &[Expr]) -> Result<(), String> {
+    fn compile_boolop(
+        &mut self,
+        b: &mut ChunkBuilder,
+        op: BoolOp,
+        values: &[Expr],
+    ) -> Result<(), String> {
         // Left-assoc fold with short-circuit; result is the deciding operand's
         // value (Python semantics), not a coerced bool.
         self.compile_expr(b, &values[0])?;
@@ -940,7 +953,13 @@ impl Compiler {
         Ok(())
     }
 
-    fn compile_binop(&mut self, b: &mut ChunkBuilder, op: BinOp, l: &Expr, r: &Expr) -> Result<(), String> {
+    fn compile_binop(
+        &mut self,
+        b: &mut ChunkBuilder,
+        op: BinOp,
+        l: &Expr,
+        r: &Expr,
+    ) -> Result<(), String> {
         // Native fast path for + - * (JIT-traceable); everything else dispatches.
         let tag = match op {
             BinOp::Add => {
@@ -1098,7 +1117,10 @@ impl Compiler {
                     b.emit(Op::CallBuiltin(ops::CALL_METHOD, argc(2 + args.len())?), 0);
                 } else {
                     build_kw(self, b)?;
-                    b.emit(Op::CallBuiltin(ops::CALL_METHOD_KW, argc(3 + args.len())?), 0);
+                    b.emit(
+                        Op::CallBuiltin(ops::CALL_METHOD_KW, argc(3 + args.len())?),
+                        0,
+                    );
                 }
             }
             Expr::Name(n) => {
@@ -1118,7 +1140,10 @@ impl Compiler {
                     b.emit(Op::CallBuiltin(ops::CALL_VALUE, argc(1 + args.len())?), 0);
                 } else {
                     build_kw(self, b)?;
-                    b.emit(Op::CallBuiltin(ops::CALL_VALUE_KW, argc(2 + args.len())?), 0);
+                    b.emit(
+                        Op::CallBuiltin(ops::CALL_VALUE_KW, argc(2 + args.len())?),
+                        0,
+                    );
                 }
             }
         }
@@ -1149,6 +1174,8 @@ impl Compiler {
         Ok(())
     }
 
+    // A lowering helper that legitimately threads compiler + comprehension state.
+    #[allow(clippy::too_many_arguments)]
     fn compile_comp_clauses(
         &mut self,
         b: &mut ChunkBuilder,

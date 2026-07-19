@@ -218,7 +218,9 @@ impl Lexer {
             }
             return self.scan_name();
         }
-        if c.is_ascii_digit() || (c == '.' && self.peek2().map(|d| d.is_ascii_digit()).unwrap_or(false)) {
+        if c.is_ascii_digit()
+            || (c == '.' && self.peek2().map(|d| d.is_ascii_digit()).unwrap_or(false))
+        {
             return self.scan_number();
         }
         self.scan_op()
@@ -276,7 +278,12 @@ impl Lexer {
         let mut raw = String::new();
         loop {
             match self.peek() {
-                None => return Err(format!("SyntaxError: unterminated string (line {})", self.line)),
+                None => {
+                    return Err(format!(
+                        "SyntaxError: unterminated string (line {})",
+                        self.line
+                    ))
+                }
                 Some(c) if c == quote => {
                     if triple {
                         if self.peek2() == Some(quote)
@@ -305,7 +312,10 @@ impl Lexer {
                     }
                 }
                 Some('\n') if !triple => {
-                    return Err(format!("SyntaxError: EOL while scanning string literal (line {})", self.line));
+                    return Err(format!(
+                        "SyntaxError: EOL while scanning string literal (line {})",
+                        self.line
+                    ));
                 }
                 Some(c) => {
                     raw.push(c);
@@ -351,8 +361,9 @@ impl Lexer {
                             break;
                         }
                     }
-                    let n = i64::from_str_radix(&digits, radix)
-                        .map_err(|_| format!("SyntaxError: bad int literal (line {})", self.line))?;
+                    let n = i64::from_str_radix(&digits, radix).map_err(|_| {
+                        format!("SyntaxError: bad int literal (line {})", self.line)
+                    })?;
                     self.push(Tok::Int(n));
                     return Ok(());
                 }
@@ -390,10 +401,14 @@ impl Lexer {
             }
         }
         if is_complex {
-            let v: f64 = s.parse().map_err(|_| format!("SyntaxError: bad complex (line {})", self.line))?;
+            let v: f64 = s
+                .parse()
+                .map_err(|_| format!("SyntaxError: bad complex (line {})", self.line))?;
             self.push(Tok::Complex(v));
         } else if is_float {
-            let v: f64 = s.parse().map_err(|_| format!("SyntaxError: bad float (line {})", self.line))?;
+            let v: f64 = s
+                .parse()
+                .map_err(|_| format!("SyntaxError: bad float (line {})", self.line))?;
             self.push(Tok::Float(v));
         } else {
             match s.parse::<i64>() {
@@ -435,7 +450,10 @@ impl Lexer {
             self.push(Tok::Op(c.to_string()));
             Ok(())
         } else {
-            Err(format!("SyntaxError: unexpected character {c:?} (line {})", self.line))
+            Err(format!(
+                "SyntaxError: unexpected character {c:?} (line {})",
+                self.line
+            ))
         }
     }
 }

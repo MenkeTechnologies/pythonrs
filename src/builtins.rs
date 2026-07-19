@@ -345,7 +345,9 @@ fn b_call_value_kw(vm: &mut VM, argc: u8) -> Value {
 
 fn b_truthy(vm: &mut VM, _: u8) -> Value {
     let v = vm.pop();
-    if with_host(|h| matches!(h.get(&v), Some(PyObj::Instance(i)) if instance_has(h, i, "__bool__") || instance_has(h, i, "__len__"))) {
+    if with_host(
+        |h| matches!(h.get(&v), Some(PyObj::Instance(i)) if instance_has(h, i, "__bool__") || instance_has(h, i, "__len__")),
+    ) {
         // __bool__ preferred, else __len__.
         let has_bool = with_host(|h| match h.get(&v) {
             Some(PyObj::Instance(i)) => instance_has(h, i, "__bool__"),
@@ -445,10 +447,7 @@ fn b_build_class(vm: &mut VM, _: u8) -> Value {
     let name = sval(&vm.pop());
     let bases_val = vm.pop();
     let bases: Vec<String> = with_host(|h| match h.get(&bases_val) {
-        Some(PyObj::List(l)) => l
-            .iter()
-            .filter_map(|b| callable_name(h, b))
-            .collect(),
+        Some(PyObj::List(l)) => l.iter().filter_map(|b| callable_name(h, b)).collect(),
         _ => Vec::new(),
     });
     let r = host::build_class(&name, bases, &body_func);
@@ -487,7 +486,9 @@ fn iter_instance(v: &Value) -> Result<Value, String> {
             break;
         }
     }
-    Ok(with_host(|h| h.alloc(PyObj::Iter(IterState::Seq { items, idx: 0 }))))
+    Ok(with_host(|h| {
+        h.alloc(PyObj::Iter(IterState::Seq { items, idx: 0 }))
+    }))
 }
 
 fn b_foriter(vm: &mut VM, _: u8) -> Value {
@@ -581,9 +582,20 @@ fn b_assert_fail(vm: &mut VM, _: u8) -> Value {
     });
     // Record the exception object too, for except-binding.
     with_host(|h| {
-        let m = if let Value::Undef = msg { Value::Undef } else { msg.clone() };
-        let args = if matches!(m, Value::Undef) { vec![] } else { vec![m] };
-        let e = h.alloc(PyObj::Exception { class: "AssertionError".into(), args });
+        let m = if let Value::Undef = msg {
+            Value::Undef
+        } else {
+            msg.clone()
+        };
+        let args = if matches!(m, Value::Undef) {
+            vec![]
+        } else {
+            vec![m]
+        };
+        let e = h.alloc(PyObj::Exception {
+            class: "AssertionError".into(),
+            args,
+        });
         h.exc = Some(e);
     });
     abort(vm, s)
@@ -724,7 +736,10 @@ fn b_unpack(vm: &mut VM, _: u8) -> Value {
     let ordered: Vec<Value> = if star_idx < 0 {
         if items.len() != count {
             let msg = if items.len() < count {
-                format!("ValueError: not enough values to unpack (expected {count}, got {})", items.len())
+                format!(
+                    "ValueError: not enough values to unpack (expected {count}, got {})",
+                    items.len()
+                )
             } else {
                 format!("ValueError: too many values to unpack (expected {count})")
             };
@@ -736,7 +751,13 @@ fn b_unpack(vm: &mut VM, _: u8) -> Value {
         let before = si;
         let after = count - si - 1;
         if items.len() < before + after {
-            return abort(vm, format!("ValueError: not enough values to unpack (expected at least {})", before + after));
+            return abort(
+                vm,
+                format!(
+                    "ValueError: not enough values to unpack (expected at least {})",
+                    before + after
+                ),
+            );
         }
         let mid = &items[before..items.len() - after];
         let mid_list = with_host(|h| h.new_list(mid.to_vec()));
@@ -783,9 +804,7 @@ fn b_try(vm: &mut VM, _: u8) -> Value {
             }
         }
         Err(e) => {
-            let exc = with_host(|h| {
-                h.exc.clone().unwrap_or_else(|| synth_exc(h, &e))
-            });
+            let exc = with_host(|h| h.exc.clone().unwrap_or_else(|| synth_exc(h, &e)));
             let mut handled = false;
             for (type_chunk, bind, hbody) in &td.handlers {
                 let matches = match type_chunk {
@@ -911,8 +930,20 @@ pub fn is_builtin_function(name: &str) -> bool {
 fn is_builtin_type(name: &str) -> bool {
     matches!(
         name,
-        "int" | "float" | "str" | "bool" | "list" | "tuple" | "dict" | "set" | "frozenset"
-            | "bytes" | "complex" | "object" | "type" | "range"
+        "int"
+            | "float"
+            | "str"
+            | "bool"
+            | "list"
+            | "tuple"
+            | "dict"
+            | "set"
+            | "frozenset"
+            | "bytes"
+            | "complex"
+            | "object"
+            | "type"
+            | "range"
     )
 }
 
@@ -925,10 +956,47 @@ pub fn is_known_builtin(name: &str) -> bool {
 }
 
 const BUILTIN_FUNCS: &[&str] = &[
-    "print", "len", "range", "abs", "min", "max", "sum", "sorted", "reversed", "enumerate", "zip",
-    "map", "filter", "any", "all", "round", "divmod", "pow", "type", "isinstance", "issubclass",
-    "hasattr", "getattr", "setattr", "delattr", "id", "hash", "ord", "chr", "hex", "oct", "bin",
-    "repr", "ascii", "iter", "next", "input", "format", "vars", "dir", "callable",
+    "print",
+    "len",
+    "range",
+    "abs",
+    "min",
+    "max",
+    "sum",
+    "sorted",
+    "reversed",
+    "enumerate",
+    "zip",
+    "map",
+    "filter",
+    "any",
+    "all",
+    "round",
+    "divmod",
+    "pow",
+    "type",
+    "isinstance",
+    "issubclass",
+    "hasattr",
+    "getattr",
+    "setattr",
+    "delattr",
+    "id",
+    "hash",
+    "ord",
+    "chr",
+    "hex",
+    "oct",
+    "bin",
+    "repr",
+    "ascii",
+    "iter",
+    "next",
+    "input",
+    "format",
+    "vars",
+    "dir",
+    "callable",
 ];
 
 // ── builtin functions ────────────────────────────────────────────────────────
@@ -957,7 +1025,10 @@ fn py_str(v: &Value) -> Result<String, String> {
     if with_host(|h| {
         matches!(
             h.get(v),
-            Some(PyObj::List(_)) | Some(PyObj::Tuple(_)) | Some(PyObj::Dict(_)) | Some(PyObj::Set(_))
+            Some(PyObj::List(_))
+                | Some(PyObj::Tuple(_))
+                | Some(PyObj::Dict(_))
+                | Some(PyObj::Set(_))
         )
     }) {
         return py_repr(v);
@@ -992,9 +1063,8 @@ fn py_repr(v: &Value) -> Result<String, String> {
         Some(PyObj::Dict(d)) => Some(Cont::Dict(d.values().cloned().collect())),
         _ => None,
     });
-    let reprs = |elems: &[Value]| -> Result<Vec<String>, String> {
-        elems.iter().map(py_repr).collect()
-    };
+    let reprs =
+        |elems: &[Value]| -> Result<Vec<String>, String> { elems.iter().map(py_repr).collect() };
     if let Some(cont) = cont {
         return Ok(match cont {
             Cont::List(e) => format!("[{}]", reprs(&e)?.join(", ")),
@@ -1021,7 +1091,10 @@ fn py_repr(v: &Value) -> Result<String, String> {
 }
 
 fn kw_get(kwargs: &[(String, Value)], name: &str) -> Option<Value> {
-    kwargs.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone())
+    kwargs
+        .iter()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| v.clone())
 }
 
 /// Dispatch a Kernel builtin function by name.
@@ -1036,10 +1109,12 @@ pub fn call_builtin_function(
     }
     // Exception constructors.
     if is_exception_class(name) {
-        return Ok(with_host(|h| h.alloc(PyObj::Exception {
-            class: name.to_string(),
-            args,
-        })));
+        return Ok(with_host(|h| {
+            h.alloc(PyObj::Exception {
+                class: name.to_string(),
+                args,
+            })
+        }));
     }
     match name {
         "print" => {
@@ -1095,7 +1170,10 @@ pub fn call_builtin_function(
         }
         "enumerate" => {
             let items = with_host(|h| h.iter_items(&arg0(&args)?))?;
-            let start = args.get(1).and_then(|v| with_host(|h| h.as_int(v))).unwrap_or(0);
+            let start = args
+                .get(1)
+                .and_then(|v| with_host(|h| h.as_int(v)))
+                .unwrap_or(0);
             let out: Vec<Value> = with_host(|h| {
                 items
                     .into_iter()
@@ -1151,16 +1229,20 @@ pub fn call_builtin_function(
         }
         "any" => {
             let items = with_host(|h| h.iter_items(&arg0(&args)?))?;
-            Ok(Value::Bool(items.iter().any(|x| with_host(|h| h.truthy(x)))))
+            Ok(Value::Bool(
+                items.iter().any(|x| with_host(|h| h.truthy(x))),
+            ))
         }
         "all" => {
             let items = with_host(|h| h.iter_items(&arg0(&args)?))?;
-            Ok(Value::Bool(items.iter().all(|x| with_host(|h| h.truthy(x)))))
+            Ok(Value::Bool(
+                items.iter().all(|x| with_host(|h| h.truthy(x))),
+            ))
         }
         "round" => {
             let v = arg0(&args)?;
             let nd = args.get(1).and_then(|v| with_host(|h| h.as_int(v)));
-            with_host(|h| match &v {
+            with_host(|_h| match &v {
                 Value::Int(n) => Ok(Value::Int(*n)),
                 Value::Float(f) => match nd {
                     Some(d) => {
@@ -1250,7 +1332,7 @@ pub fn call_builtin_function(
             let n = with_host(|h| h.as_int(&a0)).unwrap_or(0);
             match char::from_u32(n as u32) {
                 Some(c) => Ok(with_host(|h| h.new_str(c.to_string()))),
-                None => Err(format!("ValueError: chr() arg not in range")),
+                None => Err("ValueError: chr() arg not in range".to_string()),
             }
         }
         "hex" => int_radix(&args, 16, "0x"),
@@ -1263,7 +1345,8 @@ pub fn call_builtin_function(
         }
         "format" => {
             let v = arg0(&args)?;
-            let spec = with_host(|h| h.str_of(&args.get(1).cloned().unwrap_or_else(|| Value::str(""))));
+            let spec =
+                with_host(|h| h.str_of(&args.get(1).cloned().unwrap_or_else(|| Value::str(""))));
             let s = py_str(&v)?;
             Ok(with_host(|h| {
                 let out = apply_format_spec(&s, &v, &spec);
@@ -1293,7 +1376,10 @@ pub fn call_builtin_function(
             }
             let mut line = String::new();
             let _ = std::io::stdin().read_line(&mut line);
-            let line = line.trim_end_matches('\n').trim_end_matches('\r').to_string();
+            let line = line
+                .trim_end_matches('\n')
+                .trim_end_matches('\r')
+                .to_string();
             Ok(with_host(|h| h.new_str(line)))
         }
         "callable" => {
@@ -1301,7 +1387,9 @@ pub fn call_builtin_function(
             Ok(Value::Bool(with_host(|h| {
                 matches!(
                     h.get(&v),
-                    Some(PyObj::Func(_)) | Some(PyObj::Builtin(_)) | Some(PyObj::Class(_))
+                    Some(PyObj::Func(_))
+                        | Some(PyObj::Builtin(_))
+                        | Some(PyObj::Class(_))
                         | Some(PyObj::BoundMethod { .. })
                 )
             })))
@@ -1347,7 +1435,10 @@ pub fn call_builtin_function(
         }
         "dict" => construct_dict(&args, &kwargs),
         "complex" => {
-            let r = args.first().and_then(|v| with_host(|h| h.as_int(v)).map(|n| n as f64).or(as_f(v))).unwrap_or(0.0);
+            let r = args
+                .first()
+                .and_then(|v| with_host(|h| h.as_int(v)).map(|n| n as f64).or(as_f(v)))
+                .unwrap_or(0.0);
             let i = args.get(1).and_then(as_f).unwrap_or(0.0);
             Ok(with_host(|h| h.alloc(PyObj::Complex(r, i))))
         }
@@ -1372,7 +1463,9 @@ fn as_f(v: &Value) -> Option<f64> {
 }
 
 fn arg0(args: &[Value]) -> Result<Value, String> {
-    args.first().cloned().ok_or_else(|| host::type_error("missing required argument"))
+    args.first()
+        .cloned()
+        .ok_or_else(|| host::type_error("missing required argument"))
 }
 
 fn hash_key(k: &PKey) -> i64 {
@@ -1390,8 +1483,13 @@ fn py_len(v: &Value) -> Result<usize, String> {
         Some(PyObj::List(l)) | Some(PyObj::Tuple(l)) => Ok(l.len()),
         Some(PyObj::Dict(d)) => Ok(d.len()),
         Some(PyObj::Set(s)) => Ok(s.len()),
-        Some(PyObj::Range { start, stop, step }) => Ok(host::range_len(*start, *stop, *step).max(0) as usize),
-        _ => Err(host::type_error(&format!("object of type '{}' has no len()", h.type_name(v)))),
+        Some(PyObj::Range { start, stop, step }) => {
+            Ok(host::range_len(*start, *stop, *step).max(0) as usize)
+        }
+        _ => Err(host::type_error(&format!(
+            "object of type '{}' has no len()",
+            h.type_name(v)
+        ))),
     })
     .or_else(|e| {
         // __len__ on instances.
@@ -1407,7 +1505,10 @@ fn py_len(v: &Value) -> Result<usize, String> {
 fn make_range(args: &[Value]) -> Result<Value, String> {
     let ints: Vec<i64> = args
         .iter()
-        .map(|v| with_host(|h| h.as_int(v)).ok_or_else(|| host::type_error("'range' requires integer arguments")))
+        .map(|v| {
+            with_host(|h| h.as_int(v))
+                .ok_or_else(|| host::type_error("'range' requires integer arguments"))
+        })
         .collect::<Result<_, _>>()?;
     let (start, stop, step) = match ints.len() {
         1 => (0, ints[0], 1),
@@ -1421,7 +1522,11 @@ fn make_range(args: &[Value]) -> Result<Value, String> {
     Ok(with_host(|h| h.alloc(PyObj::Range { start, stop, step })))
 }
 
-fn reduce_minmax(args: &[Value], kwargs: &[(String, Value)], want_max: bool) -> Result<Value, String> {
+fn reduce_minmax(
+    args: &[Value],
+    kwargs: &[(String, Value)],
+    want_max: bool,
+) -> Result<Value, String> {
     let items = if args.len() == 1 {
         with_host(|h| h.iter_items(&args[0]))?
     } else {
@@ -1431,7 +1536,10 @@ fn reduce_minmax(args: &[Value], kwargs: &[(String, Value)], want_max: bool) -> 
         if let Some(d) = kw_get(kwargs, "default") {
             return Ok(d);
         }
-        return Err(format!("ValueError: {}() arg is an empty sequence", if want_max { "max" } else { "min" }));
+        return Err(format!(
+            "ValueError: {}() arg is an empty sequence",
+            if want_max { "max" } else { "min" }
+        ));
     }
     let key = kw_get(kwargs, "key");
     let mut best = items[0].clone();
@@ -1458,7 +1566,9 @@ fn eval_key(key: &Option<Value>, v: &Value) -> Result<Value, String> {
 fn py_sorted(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, String> {
     let mut items = with_host(|h| h.iter_items(&arg0(args)?))?;
     let key = kw_get(kwargs, "key");
-    let reverse = kw_get(kwargs, "reverse").map(|v| with_host(|h| h.truthy(&v))).unwrap_or(false);
+    let reverse = kw_get(kwargs, "reverse")
+        .map(|v| with_host(|h| h.truthy(&v)))
+        .unwrap_or(false);
     // Precompute keys.
     let mut keyed: Vec<(Value, Value)> = Vec::with_capacity(items.len());
     for it in items.drain(..) {
@@ -1513,13 +1623,18 @@ fn construct_int(args: &[Value]) -> Result<Value, String> {
         Some(v) => v.clone(),
         None => return Ok(Value::Int(0)),
     };
-    let base = args.get(1).and_then(|b| with_host(|h| h.as_int(b))).unwrap_or(10);
+    let base = args
+        .get(1)
+        .and_then(|b| with_host(|h| h.as_int(b)))
+        .unwrap_or(10);
     with_host(|h| match &v {
         Value::Int(n) => Ok(Value::Int(*n)),
         Value::Bool(b) => Ok(Value::Int(*b as i64)),
         Value::Float(f) => Ok(Value::Int(*f as i64)),
         _ => {
-            let s = h.as_str(&v).ok_or_else(|| host::type_error("int() argument must be a string or a number"))?;
+            let s = h
+                .as_str(&v)
+                .ok_or_else(|| host::type_error("int() argument must be a string or a number"))?;
             let s = s.trim();
             let (neg, digits) = if let Some(r) = s.strip_prefix('-') {
                 (true, r)
@@ -1538,7 +1653,9 @@ fn construct_int(args: &[Value]) -> Result<Value, String> {
                             let b = if neg { -b } else { b };
                             Ok(h.alloc(PyObj::BigInt(b)))
                         }
-                        Err(_) => Err(format!("ValueError: invalid literal for int() with base {base}: '{s}'")),
+                        Err(_) => Err(format!(
+                            "ValueError: invalid literal for int() with base {base}: '{s}'"
+                        )),
                     }
                 }
             }
@@ -1556,14 +1673,17 @@ fn construct_float(args: &[Value]) -> Result<Value, String> {
         Value::Float(f) => Ok(Value::Float(*f)),
         Value::Bool(b) => Ok(Value::Float(*b as i64 as f64)),
         _ => {
-            let s = h.as_str(&v).ok_or_else(|| host::type_error("float() argument must be a string or a number"))?;
+            let s = h
+                .as_str(&v)
+                .ok_or_else(|| host::type_error("float() argument must be a string or a number"))?;
             match s.trim() {
                 "inf" | "infinity" | "Infinity" => Ok(Value::Float(f64::INFINITY)),
                 "-inf" => Ok(Value::Float(f64::NEG_INFINITY)),
                 "nan" => Ok(Value::Float(f64::NAN)),
-                t => t.parse::<f64>().map(Value::Float).map_err(|_| {
-                    format!("ValueError: could not convert string to float: '{s}'")
-                }),
+                t => t
+                    .parse::<f64>()
+                    .map(Value::Float)
+                    .map_err(|_| format!("ValueError: could not convert string to float: '{s}'")),
             }
         }
     })
@@ -1620,7 +1740,11 @@ fn call_math(name: &str, args: &[Value]) -> Result<Value, String> {
         }
         "gcd" => {
             let a = with_host(|h| h.as_int(&args[0])).unwrap_or(0).abs();
-            let b = args.get(1).and_then(|v| with_host(|h| h.as_int(v))).unwrap_or(0).abs();
+            let b = args
+                .get(1)
+                .and_then(|v| with_host(|h| h.as_int(v)))
+                .unwrap_or(0)
+                .abs();
             Ok(Value::Int(gcd(a, b)))
         }
         "factorial" => {
@@ -1695,7 +1819,10 @@ const EXC_PARENTS: &[(&str, &str)] = &[
 ];
 
 fn exc_parent(name: &str) -> Option<&'static str> {
-    EXC_PARENTS.iter().find(|(c, _)| *c == name).map(|(_, p)| *p)
+    EXC_PARENTS
+        .iter()
+        .find(|(c, _)| *c == name)
+        .map(|(_, p)| *p)
 }
 
 /// Whether `exc_class` is-a `want` in the exception hierarchy (builtin chain +
@@ -1775,21 +1902,71 @@ pub fn type_has_method(typename: &str, name: &str) -> bool {
 }
 
 const STR_METHODS: &[&str] = &[
-    "upper", "lower", "strip", "lstrip", "rstrip", "split", "rsplit", "splitlines", "join",
-    "replace", "startswith", "endswith", "find", "rfind", "index", "count", "capitalize", "title",
-    "format", "isdigit", "isalpha", "isalnum", "isspace", "isupper", "islower", "zfill", "center",
-    "ljust", "rjust", "encode", "removeprefix", "removesuffix", "swapcase", "casefold",
+    "upper",
+    "lower",
+    "strip",
+    "lstrip",
+    "rstrip",
+    "split",
+    "rsplit",
+    "splitlines",
+    "join",
+    "replace",
+    "startswith",
+    "endswith",
+    "find",
+    "rfind",
+    "index",
+    "count",
+    "capitalize",
+    "title",
+    "format",
+    "isdigit",
+    "isalpha",
+    "isalnum",
+    "isspace",
+    "isupper",
+    "islower",
+    "zfill",
+    "center",
+    "ljust",
+    "rjust",
+    "encode",
+    "removeprefix",
+    "removesuffix",
+    "swapcase",
+    "casefold",
 ];
 const LIST_METHODS: &[&str] = &[
     "append", "extend", "insert", "remove", "pop", "clear", "index", "count", "sort", "reverse",
     "copy",
 ];
 const DICT_METHODS: &[&str] = &[
-    "keys", "values", "items", "get", "pop", "popitem", "setdefault", "update", "clear", "copy",
+    "keys",
+    "values",
+    "items",
+    "get",
+    "pop",
+    "popitem",
+    "setdefault",
+    "update",
+    "clear",
+    "copy",
 ];
 const SET_METHODS: &[&str] = &[
-    "add", "remove", "discard", "pop", "clear", "union", "intersection", "difference", "issubset",
-    "issuperset", "update", "copy", "symmetric_difference",
+    "add",
+    "remove",
+    "discard",
+    "pop",
+    "clear",
+    "union",
+    "intersection",
+    "difference",
+    "issubset",
+    "issuperset",
+    "update",
+    "copy",
+    "symmetric_difference",
 ];
 const TUPLE_METHODS: &[&str] = &["count", "index"];
 const NUM_METHODS: &[&str] = &["bit_length", "is_integer", "conjugate"];
@@ -1862,8 +2039,11 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             Ok(new_str(out))
         }
         "split" => {
-            let parts: Vec<Value> = if args.is_empty() || matches!(args.first(), Some(Value::Undef)) {
-                s.split_whitespace().map(|w| new_str(w.to_string())).collect()
+            let parts: Vec<Value> = if args.is_empty() || matches!(args.first(), Some(Value::Undef))
+            {
+                s.split_whitespace()
+                    .map(|w| new_str(w.to_string()))
+                    .collect()
             } else {
                 let sep = sarg(0);
                 s.split(&sep).map(|p| new_str(p.to_string())).collect()
@@ -1873,7 +2053,9 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
         "rsplit" => {
             let sep = sarg(0);
             let parts: Vec<Value> = if sep.is_empty() {
-                s.split_whitespace().map(|w| new_str(w.to_string())).collect()
+                s.split_whitespace()
+                    .map(|w| new_str(w.to_string()))
+                    .collect()
             } else {
                 s.split(&sep).map(|p| new_str(p.to_string())).collect()
             };
@@ -1887,9 +2069,10 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             let items = with_host(|h| h.iter_items(&args[0]))?;
             let mut strs = Vec::new();
             for it in items {
-                strs.push(with_host(|h| h.as_str(&it)).ok_or_else(|| {
-                    host::type_error("sequence item: expected str instance")
-                })?);
+                strs.push(
+                    with_host(|h| h.as_str(&it))
+                        .ok_or_else(|| host::type_error("sequence item: expected str instance"))?,
+                );
             }
             Ok(new_str(strs.join(&s)))
         }
@@ -1906,10 +2089,14 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
         "startswith" => Ok(Value::Bool(s.starts_with(&sarg(0)))),
         "endswith" => Ok(Value::Bool(s.ends_with(&sarg(0)))),
         "find" => Ok(Value::Int(
-            s.find(&sarg(0)).map(|b| s[..b].chars().count() as i64).unwrap_or(-1),
+            s.find(&sarg(0))
+                .map(|b| s[..b].chars().count() as i64)
+                .unwrap_or(-1),
         )),
         "rfind" => Ok(Value::Int(
-            s.rfind(&sarg(0)).map(|b| s[..b].chars().count() as i64).unwrap_or(-1),
+            s.rfind(&sarg(0))
+                .map(|b| s[..b].chars().count() as i64)
+                .unwrap_or(-1),
         )),
         "index" => match s.find(&sarg(0)) {
             Some(b) => Ok(Value::Int(s[..b].chars().count() as i64)),
@@ -1923,12 +2110,30 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
                 Ok(Value::Int(s.matches(&sub).count() as i64))
             }
         }
-        "isdigit" => Ok(Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))),
-        "isalpha" => Ok(Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_alphabetic()))),
-        "isalnum" => Ok(Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_alphanumeric()))),
-        "isspace" => Ok(Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_whitespace()))),
-        "isupper" => Ok(Value::Bool(s.chars().any(|c| c.is_alphabetic()) && s.chars().filter(|c| c.is_alphabetic()).all(|c| c.is_uppercase()))),
-        "islower" => Ok(Value::Bool(s.chars().any(|c| c.is_alphabetic()) && s.chars().filter(|c| c.is_alphabetic()).all(|c| c.is_lowercase()))),
+        "isdigit" => Ok(Value::Bool(
+            !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()),
+        )),
+        "isalpha" => Ok(Value::Bool(
+            !s.is_empty() && s.chars().all(|c| c.is_alphabetic()),
+        )),
+        "isalnum" => Ok(Value::Bool(
+            !s.is_empty() && s.chars().all(|c| c.is_alphanumeric()),
+        )),
+        "isspace" => Ok(Value::Bool(
+            !s.is_empty() && s.chars().all(|c| c.is_whitespace()),
+        )),
+        "isupper" => Ok(Value::Bool(
+            s.chars().any(|c| c.is_alphabetic())
+                && s.chars()
+                    .filter(|c| c.is_alphabetic())
+                    .all(|c| c.is_uppercase()),
+        )),
+        "islower" => Ok(Value::Bool(
+            s.chars().any(|c| c.is_alphabetic())
+                && s.chars()
+                    .filter(|c| c.is_alphabetic())
+                    .all(|c| c.is_lowercase()),
+        )),
         "zfill" => {
             let w = with_host(|h| h.as_int(&args[0])).unwrap_or(0) as usize;
             let out = if s.len() < w {
@@ -1948,15 +2153,21 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
         "rjust" => Ok(new_str(pad_str(&s, args, 'r'))),
         "removeprefix" => {
             let p = sarg(0);
-            Ok(new_str(s.strip_prefix(&p).map(|r| r.to_string()).unwrap_or(s)))
+            Ok(new_str(
+                s.strip_prefix(&p).map(|r| r.to_string()).unwrap_or(s),
+            ))
         }
         "removesuffix" => {
             let p = sarg(0);
-            Ok(new_str(s.strip_suffix(&p).map(|r| r.to_string()).unwrap_or(s)))
+            Ok(new_str(
+                s.strip_suffix(&p).map(|r| r.to_string()).unwrap_or(s),
+            ))
         }
         "encode" => Ok(with_host(|h| h.alloc(PyObj::Bytes(s.into_bytes())))),
         "format" => str_dot_format(&s, args),
-        _ => Err(format!("AttributeError: 'str' object has no attribute '{name}'")),
+        _ => Err(format!(
+            "AttributeError: 'str' object has no attribute '{name}'"
+        )),
     }
 }
 
@@ -2048,7 +2259,12 @@ fn str_dot_format(s: &str, args: &[Value]) -> Result<Value, String> {
     Ok(new_str(out))
 }
 
-fn list_method(recv: &Value, name: &str, args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, String> {
+fn list_method(
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+    kwargs: &[(String, Value)],
+) -> Result<Value, String> {
     match name {
         "append" => {
             let v = arg0(args)?;
@@ -2075,7 +2291,11 @@ fn list_method(recv: &Value, name: &str, args: &[Value], kwargs: &[(String, Valu
             with_host(|h| {
                 if let Some(PyObj::List(l)) = h.get_mut(recv) {
                     let n = l.len() as i64;
-                    let k = if idx < 0 { (idx + n).max(0) } else { idx.min(n) } as usize;
+                    let k = if idx < 0 {
+                        (idx + n).max(0)
+                    } else {
+                        idx.min(n)
+                    } as usize;
                     l.insert(k, v);
                 }
             });
@@ -2188,7 +2408,9 @@ fn list_method(recv: &Value, name: &str, args: &[Value], kwargs: &[(String, Valu
             });
             Ok(Value::Undef)
         }
-        _ => Err(format!("AttributeError: 'list' object has no attribute '{name}'")),
+        _ => Err(format!(
+            "AttributeError: 'list' object has no attribute '{name}'"
+        )),
     }
 }
 
@@ -2216,7 +2438,12 @@ fn dict_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String
                     .collect::<Vec<_>>(),
                 _ => vec![],
             });
-            let tuples: Vec<Value> = with_host(|h| items.into_iter().map(|(k, v)| h.new_tuple(vec![k, v])).collect());
+            let tuples: Vec<Value> = with_host(|h| {
+                items
+                    .into_iter()
+                    .map(|(k, v)| h.new_tuple(vec![k, v]))
+                    .collect()
+            });
             Ok(with_host(|h| h.new_list(tuples)))
         }
         "get" => {
@@ -2264,7 +2491,10 @@ fn dict_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String
         "update" => {
             if let Some(other) = args.first() {
                 let pairs = with_host(|h| match h.get(other) {
-                    Some(PyObj::Dict(d)) => d.iter().map(|(k, (kv, v))| (k.clone(), kv.clone(), v.clone())).collect::<Vec<_>>(),
+                    Some(PyObj::Dict(d)) => d
+                        .iter()
+                        .map(|(k, (kv, v))| (k.clone(), kv.clone(), v.clone()))
+                        .collect::<Vec<_>>(),
                     _ => vec![],
                 });
                 with_host(|h| {
@@ -2305,7 +2535,9 @@ fn dict_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String
                 None => Err("KeyError: 'popitem(): dictionary is empty'".into()),
             }
         }
-        _ => Err(format!("AttributeError: 'dict' object has no attribute '{name}'")),
+        _ => Err(format!(
+            "AttributeError: 'dict' object has no attribute '{name}'"
+        )),
     }
 }
 
@@ -2399,7 +2631,9 @@ fn set_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
                 Err(host::type_error("not a set"))
             }
         }),
-        _ => Err(format!("AttributeError: 'set' object has no attribute '{name}'")),
+        _ => Err(format!(
+            "AttributeError: 'set' object has no attribute '{name}'"
+        )),
     }
 }
 
@@ -2440,7 +2674,9 @@ fn tuple_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, Strin
                 _ => Err(host::type_error("not a tuple")),
             })
         }
-        _ => Err(format!("AttributeError: 'tuple' object has no attribute '{name}'")),
+        _ => Err(format!(
+            "AttributeError: 'tuple' object has no attribute '{name}'"
+        )),
     }
 }
 
@@ -2573,7 +2809,11 @@ pub fn apply_format_spec(s: &str, v: &Value, spec: &str) -> String {
         '^' => {
             let l = pad / 2;
             let r = pad - l;
-            format!("{}{body}{}", fill.to_string().repeat(l), fill.to_string().repeat(r))
+            format!(
+                "{}{body}{}",
+                fill.to_string().repeat(l),
+                fill.to_string().repeat(r)
+            )
         }
         '=' => {
             // sign-aware zero pad
