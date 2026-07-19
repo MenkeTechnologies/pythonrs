@@ -596,6 +596,69 @@ fn b_dbg_line(vm: &mut VM, _: u8) -> Value {
 
 // ── binary / unary operators ─────────────────────────────────────────────────
 
+/// Whether `v` is a user instance whose class defines method `name` — the guard
+/// for operator-overloading dunder dispatch.
+fn is_instance_with(h: &host::PyHost, v: &Value, name: &str) -> bool {
+    matches!(h.get(v), Some(PyObj::Instance(i)) if instance_has(h, i, name))
+}
+
+/// Python operator overloading: if `a` defines the forward dunder `lname`
+/// (`__add__`), call `a.lname(b)`; else if `b` defines the reflected dunder
+/// `rname` (`__radd__`), call `b.rname(a)`. Returns `None` to fall through to the
+/// host's native handling when neither operand is an overloading instance.
+fn try_binop_dunder(
+    a: &Value,
+    b: &Value,
+    lname: &str,
+    rname: &str,
+) -> Option<Result<Value, String>> {
+    if with_host(|h| is_instance_with(h, a, lname)) {
+        return Some(host::call_method(a, lname, vec![b.clone()], vec![]));
+    }
+    if with_host(|h| is_instance_with(h, b, rname)) {
+        return Some(host::call_method(b, rname, vec![a.clone()], vec![]));
+    }
+    None
+}
+
+/// (forward, reflected) dunder names for a non-native binop tag (`host::binop`).
+fn binop_tag_dunders(tag: i64) -> Option<(&'static str, &'static str)> {
+    use host::binop::*;
+    Some(match tag {
+        DIV => ("__truediv__", "__rtruediv__"),
+        FLOORDIV => ("__floordiv__", "__rfloordiv__"),
+        MOD => ("__mod__", "__rmod__"),
+        POW => ("__pow__", "__rpow__"),
+        MATMUL => ("__matmul__", "__rmatmul__"),
+        BITAND => ("__and__", "__rand__"),
+        BITOR => ("__or__", "__ror__"),
+        BITXOR => ("__xor__", "__rxor__"),
+        SHL => ("__lshift__", "__rlshift__"),
+        SHR => ("__rshift__", "__rrshift__"),
+        _ => return None,
+    })
+}
+
+/// (forward, reflected) dunder names for a native `NumOp` that fell to the hook.
+fn numop_dunders(op: NumOp) -> Option<(&'static str, &'static str)> {
+    use NumOp::*;
+    Some(match op {
+        Add => ("__add__", "__radd__"),
+        Sub => ("__sub__", "__rsub__"),
+        Mul => ("__mul__", "__rmul__"),
+        Div => ("__truediv__", "__rtruediv__"),
+        Mod => ("__mod__", "__rmod__"),
+        Pow => ("__pow__", "__rpow__"),
+        Eq => ("__eq__", "__eq__"),
+        Ne => ("__ne__", "__ne__"),
+        Lt => ("__lt__", "__gt__"),
+        Le => ("__le__", "__ge__"),
+        Gt => ("__gt__", "__lt__"),
+        Ge => ("__ge__", "__le__"),
+        Neg => return None,
+    })
+}
+
 fn b_binop(vm: &mut VM, _: u8) -> Value {
     let b = vm.pop();
     let a = vm.pop();
@@ -603,8 +666,13 @@ fn b_binop(vm: &mut VM, _: u8) -> Value {
         Value::Int(n) => n,
         _ => return abort(vm, "internal: BINOP tag".into()),
     };
-    // Instance operator overloading (__add__ etc.) is a later wave; core types
-    // handled by the host.
+    // Instance operator overloading (`a / b`, `a % b`, `a & b`, …) via dunders,
+    // then core types handled by the host.
+    if let Some((l, r)) = binop_tag_dunders(tag) {
+        if let Some(res) = try_binop_dunder(&a, &b, l, r) {
+            return finish(vm, res);
+        }
+    }
     let r = with_host(|h| h.binop(tag, &a, &b));
     finish(vm, r)
 }
@@ -822,8 +890,15 @@ fn callable_name(h: &host::PyHost, v: &Value) -> Option<String> {
 
 // ── the strict numeric hook ──────────────────────────────────────────────────
 
-/// Python arithmetic/comparison for operands the VM can't handle natively.
+/// Python arithmetic/comparison for operands the VM can't handle natively. User
+/// instances defining an operator dunder (`__add__`, `__eq__`, `__lt__`, …) are
+/// dispatched first; everything else falls to the host's native numeric logic.
 pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
+    if let Some((l, r)) = numop_dunders(op) {
+        if let Some(res) = try_binop_dunder(a, b, l, r) {
+            return res;
+        }
+    }
     with_host(|h| h.arith(op, a, b))
 }
 
@@ -877,6 +952,16 @@ fn py_str(v: &Value) -> Result<String, String> {
             return Ok(with_host(|h| h.str_of(&r)));
         }
     }
+    // `str(container)` == `repr(container)`; route through py_repr so instance
+    // elements/keys/values dispatch their `__repr__`.
+    if with_host(|h| {
+        matches!(
+            h.get(v),
+            Some(PyObj::List(_)) | Some(PyObj::Tuple(_)) | Some(PyObj::Dict(_)) | Some(PyObj::Set(_))
+        )
+    }) {
+        return py_repr(v);
+    }
     Ok(with_host(|h| h.str_of(v)))
 }
 
@@ -890,6 +975,47 @@ fn py_repr(v: &Value) -> Result<String, String> {
             let r = host::call_method(v, "__repr__", vec![], vec![])?;
             return Ok(with_host(|h| h.str_of(&r)));
         }
+    }
+    // Containers recurse through this layer so instance elements/keys/values
+    // dispatch their own `__repr__` (the host's `repr_of` is `&self` and can't
+    // call back into a method).
+    enum Cont {
+        List(Vec<Value>),
+        Tuple(Vec<Value>),
+        Set(Vec<Value>),
+        Dict(Vec<(Value, Value)>),
+    }
+    let cont = with_host(|h| match h.get(v) {
+        Some(PyObj::List(l)) => Some(Cont::List(l.clone())),
+        Some(PyObj::Tuple(l)) => Some(Cont::Tuple(l.clone())),
+        Some(PyObj::Set(s)) => Some(Cont::Set(s.values().cloned().collect())),
+        Some(PyObj::Dict(d)) => Some(Cont::Dict(d.values().cloned().collect())),
+        _ => None,
+    });
+    let reprs = |elems: &[Value]| -> Result<Vec<String>, String> {
+        elems.iter().map(py_repr).collect()
+    };
+    if let Some(cont) = cont {
+        return Ok(match cont {
+            Cont::List(e) => format!("[{}]", reprs(&e)?.join(", ")),
+            Cont::Tuple(e) => {
+                let p = reprs(&e)?;
+                if p.len() == 1 {
+                    format!("({},)", p[0])
+                } else {
+                    format!("({})", p.join(", "))
+                }
+            }
+            Cont::Set(e) if e.is_empty() => "set()".into(),
+            Cont::Set(e) => format!("{{{}}}", reprs(&e)?.join(", ")),
+            Cont::Dict(pairs) => {
+                let mut p = Vec::with_capacity(pairs.len());
+                for (k, val) in &pairs {
+                    p.push(format!("{}: {}", py_repr(k)?, py_repr(val)?));
+                }
+                format!("{{{}}}", p.join(", "))
+            }
+        });
     }
     Ok(with_host(|h| h.repr_of(v)))
 }
@@ -1312,7 +1438,7 @@ fn reduce_minmax(args: &[Value], kwargs: &[(String, Value)], want_max: bool) -> 
     let mut best_k = eval_key(&key, &best)?;
     for it in &items[1..] {
         let k = eval_key(&key, it)?;
-        let gt = with_host(|h| h.compare(NumOp::Gt, &k, &best_k))?;
+        let gt = numeric_hook(NumOp::Gt, &k, &best_k)?;
         let take = with_host(|h| h.truthy(&gt)) == want_max;
         if take {
             best = it.clone();
@@ -1345,7 +1471,7 @@ fn py_sorted(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, String
         if err.is_some() {
             return std::cmp::Ordering::Equal;
         }
-        match with_host(|h| h.compare(NumOp::Lt, &a.0, &b.0)) {
+        match numeric_hook(NumOp::Lt, &a.0, &b.0) {
             Ok(v) => {
                 if with_host(|h| h.truthy(&v)) {
                     std::cmp::Ordering::Less

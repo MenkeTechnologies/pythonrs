@@ -18,10 +18,17 @@ list of what is **not** yet covered, so nobody mistakes a gap for a bug fixed.
 - **`match`/`case`** structural pattern matching — not parsed yet.
 
 ## Partial / simplified semantics
-- **Operator overloading dunders** (`__add__`, `__eq__`, `__lt__`, `__getitem__`
-  on user classes for arithmetic): `__getitem__`/`__setitem__`/`__len__`/`__bool__`/
-  `__str__`/`__repr__`/`__iter__`/`__next__`/`__init__` are dispatched; arithmetic
-  dunders (`__add__` etc.) are **not** yet — `a + b` on user instances errors.
+- **Operator overloading dunders**: now dispatched. Arithmetic/bitwise
+  (`__add__`/`__sub__`/`__mul__`/`__truediv__`/`__floordiv__`/`__mod__`/`__pow__`/
+  `__matmul__`/`__and__`/`__or__`/`__xor__`/`__lshift__`/`__rshift__`) with their
+  reflected `__r*__` fallbacks, and comparisons (`__eq__`/`__ne__`/`__lt__`/`__le__`/
+  `__gt__`/`__ge__`, reflected for `<`/`>`/`<=`/`>=`), plus the previously-dispatched
+  `__getitem__`/`__setitem__`/`__len__`/`__bool__`/`__str__`/`__repr__`/`__iter__`/
+  `__next__`/`__init__`. Container `repr`/`str` (`list`/`tuple`/`set`/`dict`) now
+  recurses so instance elements/keys/values dispatch their own `__repr__`.
+  Not yet: `NotImplemented`-driven reflected-op negotiation (the forward dunder is
+  used if present; it is not retried reflected when it returns `NotImplemented`);
+  `__hash__` for instances as dict keys / set members; in-place `__iadd__` etc.
 - **`nonlocal`** is approximated by `global` (rebinding an enclosing function's
   local from a nested function writes to module scope instead).
 - **Comprehension scoping**: the loop variable leaks into the surrounding scope

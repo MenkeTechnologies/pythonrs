@@ -169,3 +169,50 @@ fn cache_roundtrip_is_transparent() {
     assert_eq!(g(src, "x"), "285");
     assert_eq!(g(src, "x"), "285");
 }
+
+#[test]
+fn operator_dunders() {
+    // Arithmetic / comparison operator overloading via dunders on a user class.
+    let src = "
+class V:
+    def __init__(self, x): self.x = x
+    def __add__(self, o): return V(self.x + o.x)
+    def __sub__(self, o): return V(self.x - o.x)
+    def __mul__(self, k): return V(self.x * k)
+    def __mod__(self, o): return V(self.x % o.x)
+    def __eq__(self, o): return self.x == o.x
+    def __lt__(self, o): return self.x < o.x
+a = (V(2) + V(3)).x
+b = (V(10) - V(4)).x
+c = (V(5) * 4).x
+d = (V(17) % V(5)).x
+e = V(1) == V(1)
+f = V(1) == V(2)
+g_ = V(1) < V(2)
+xs = [v.x for v in sorted([V(3), V(1), V(2)])]
+";
+    assert_eq!(g(src, "a"), "5");
+    assert_eq!(g(src, "b"), "6");
+    assert_eq!(g(src, "c"), "20");
+    assert_eq!(g(src, "d"), "2");
+    assert_eq!(g(src, "e"), "True");
+    assert_eq!(g(src, "f"), "False");
+    assert_eq!(g(src, "g_"), "True");
+    assert_eq!(g(src, "xs"), "[1, 2, 3]");
+}
+
+#[test]
+fn dunder_repr_in_containers() {
+    // `str`/`repr` of a container must dispatch each element's `__repr__`.
+    let src = "
+class P:
+    def __init__(self, n): self.n = n
+    def __repr__(self): return f'P({self.n})'
+lst = str([P(1), P(2)])
+tup = str((P(3),))
+dct = str({'k': P(4)})
+";
+    assert_eq!(g(src, "lst"), "'[P(1), P(2)]'");
+    assert_eq!(g(src, "tup"), "'(P(3),)'");
+    assert_eq!(g(src, "dct"), "\"{'k': P(4)}\"");
+}
