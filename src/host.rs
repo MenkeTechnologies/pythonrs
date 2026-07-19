@@ -2952,25 +2952,21 @@ impl PyHost {
                 Some(cd) => cd,
                 None => continue, // builtin base (e.g. `object`) — implicit, skip
             };
-            match cd.ns.get("__slots__") {
-                Some(v) => {
-                    any = true;
-                    match self.get(v) {
-                        Some(PyObj::List(items)) | Some(PyObj::Tuple(items)) => {
-                            for it in items {
-                                if let Some(s) = self.as_str(it) {
-                                    slots.insert(s);
-                                }
-                            }
+            // A user class without `__slots__` gives the instance a `__dict__`.
+            let v = cd.ns.get("__slots__")?;
+            any = true;
+            match self.get(v) {
+                Some(PyObj::List(items)) | Some(PyObj::Tuple(items)) => {
+                    for it in items {
+                        if let Some(s) = self.as_str(it) {
+                            slots.insert(s);
                         }
-                        Some(PyObj::Str(s)) => {
-                            slots.insert(s.clone());
-                        }
-                        _ => {}
                     }
                 }
-                // A user class without `__slots__` gives the instance a `__dict__`.
-                None => return None,
+                Some(PyObj::Str(s)) => {
+                    slots.insert(s.clone());
+                }
+                _ => {}
             }
         }
         if any {
