@@ -381,8 +381,14 @@ pub enum PyObj {
 pub enum AttrGet {
     /// No descriptor — resolve via [`PyHost::get_attr`].
     Plain,
-    /// A `property`: invoke `fget(inst)`, or raise if `fget` is unset.
-    Property { fget: Value, inst: Value },
+    /// A `property`: invoke `fget(inst)`, or raise if `fget` is unset. `owner`
+    /// is the class in the MRO that defines the property (for `super()` inside
+    /// the accessor).
+    Property {
+        fget: Value,
+        inst: Value,
+        owner: Option<String>,
+    },
     /// A user descriptor: call `desc.__get__(inst, cls)`.
     Descriptor {
         desc: Value,
@@ -396,10 +402,12 @@ pub enum AttrSet {
     /// No descriptor — store via [`PyHost::set_attr`].
     Plain,
     /// A `property`: invoke `fset(inst, val)`, or raise if `fset` is unset.
+    /// `owner` is the defining class (for `super()` inside the setter).
     Property {
         fset: Value,
         inst: Value,
         val: Value,
+        owner: Option<String>,
     },
     /// A user data descriptor: call `desc.__set__(inst, val)`.
     Descriptor {
@@ -1213,7 +1221,16 @@ impl PyHost {
                 Some(PyObj::BigInt(b)) => b.to_string(),
                 Some(PyObj::Complex(r, i)) => fmt_complex(*r, *i),
                 Some(PyObj::Bytes(b)) => format!("b{}", quote_bytes(b)),
-                Some(PyObj::Instance(inst)) => format!("<{} object>", inst.class),
+                Some(PyObj::Instance(inst)) => {
+                    // A user exception instance stringifies to its message
+                    // (`BaseException.__str__`): ''/str(arg)/repr(tuple).
+                    if self.class_is_exception(&inst.class) {
+                        let a = self.exc_instance_args(&inst.attrs);
+                        self.exc_message(&a)
+                    } else {
+                        format!("<{} object>", inst.class)
+                    }
+                }
                 // User classes are defined in the top-level module, which under
                 // `-c`/a script CPython names `__main__` (builtins stay bare).
                 Some(PyObj::Class(n)) => format!("<class '__main__.{n}'>"),
@@ -1422,6 +1439,13 @@ impl PyHost {
                 Some(PyObj::Exception { class, args }) => {
                     let inner: Vec<String> = args.iter().map(|a| self.repr_of(a)).collect();
                     format!("{class}({})", inner.join(", "))
+                }
+                // A user exception instance reprs as `Class(repr(arg), …)` from
+                // its stored `args`, mirroring `BaseException.__repr__`.
+                Some(PyObj::Instance(inst)) if self.class_is_exception(&inst.class) => {
+                    let a = self.exc_instance_args(&inst.attrs);
+                    let inner: Vec<String> = a.iter().map(|x| self.repr_of(x)).collect();
+                    format!("{}({})", inst.class, inner.join(", "))
                 }
                 Some(PyObj::Slice { lo, hi, step }) => format!(
                     "slice({}, {}, {})",
@@ -3064,7 +3088,7 @@ fn strip_g_sci(s: &str) -> String {
 }
 
 /// `%a` (ascii): non-ASCII code points in a repr escaped as `\xNN`/`\uNNNN`/`\UNNNNNNNN`.
-fn ascii_of(s: &str) -> String {
+pub fn ascii_of(s: &str) -> String {
     let mut o = String::new();
     for c in s.chars() {
         if c.is_ascii() {
@@ -3817,6 +3841,11 @@ impl PyHost {
                 // Exception chaining links live in a side table, not the
                 // instance dict (a user exception is a plain `Instance`). Only
                 // exception instances expose these dunders.
+                // A user exception instance always exposes `.args` (empty tuple
+                // if no construction path stored one).
+                if name == "args" && self.class_is_exception(&inst.class) {
+                    return Ok(self.alloc(PyObj::Tuple(vec![])));
+                }
                 if (name == "__cause__" || name == "__context__" || name == "__suppress_context__")
                     && self.class_is_exception(&inst.class)
                 {
@@ -4115,6 +4144,28 @@ impl PyHost {
     /// Plan reading `recv.name`, honoring the descriptor protocol (`property`
     /// and user `__get__` descriptors). See [`AttrGet`].
     pub fn plan_attr_get(&mut self, recv: &Value, name: &str) -> AttrGet {
+        // `super().<name>` resolves along the MRO strictly after `owner`. If it
+        // lands on a `property`, route through the out-of-borrow getter path so
+        // `super().some_property` invokes its fget (methods/plain attrs fall
+        // back to the in-borrow `get_attr` handling below via `Plain`).
+        if let Some(PyObj::Super { owner, instance }) = self.get(recv) {
+            let owner = owner.clone();
+            let instance = instance.clone();
+            let inst_class = match self.get(&instance) {
+                Some(PyObj::Instance(i)) => i.class.clone(),
+                _ => owner.clone(),
+            };
+            if let Some((v, found)) = super_lookup(self, &owner, &inst_class, name) {
+                if let Some(PyObj::Property { fget, .. }) = self.get(&v) {
+                    return AttrGet::Property {
+                        fget: fget.clone(),
+                        inst: instance,
+                        owner: Some(found),
+                    };
+                }
+            }
+            return AttrGet::Plain;
+        }
         let (class, in_instdict) = match self.get(recv) {
             Some(PyObj::Instance(i)) => (i.class.clone(), i.attrs.contains_key(name)),
             _ => return AttrGet::Plain,
@@ -4128,6 +4179,7 @@ impl PyHost {
             return AttrGet::Property {
                 fget: fget.clone(),
                 inst: recv.clone(),
+                owner: method_owner(self, &class, name),
             };
         }
         // A user descriptor is an instance whose class defines `__get__`.
@@ -4170,6 +4222,7 @@ impl PyHost {
                 fset: fset.clone(),
                 inst: recv.clone(),
                 val: val.clone(),
+                owner: method_owner(self, &class, name),
             };
         }
         let has_set = match self.get(&cls_attr) {
@@ -4547,8 +4600,18 @@ pub fn call_method(
                         _ => Err(type_error("object.__new__(X): X is not a type object")),
                     }
                 }
-                // `super().__init__()` — the `object.__init__` no-op default.
-                None if name == "__init__" => Ok(Value::Undef),
+                // `super().__init__(*args)` — for an exception instance this is
+                // `BaseException.__init__`, which sets `self.args = args`;
+                // otherwise the `object.__init__` no-op default.
+                None if name == "__init__" => {
+                    if with_host(|h| h.class_is_exception(&inst_class)) {
+                        with_host(|h| {
+                            let t = h.alloc(PyObj::Tuple(args.clone()));
+                            let _ = h.set_attr(&instance, "args", t);
+                        });
+                    }
+                    Ok(Value::Undef)
+                }
                 None => Err(format!(
                     "AttributeError: 'super' object has no attribute '{name}'"
                 )),
@@ -4673,9 +4736,16 @@ pub fn instantiate_plain(
         }
     } else {
         with_host(|h| {
+            let mut attrs = IndexMap::new();
+            // `BaseException.__new__(cls, *args)` seeds `self.args` with the
+            // constructor's positional args (overridable by `__init__`/super).
+            if h.class_is_exception(class) {
+                let t = h.alloc(PyObj::Tuple(args.clone()));
+                attrs.insert("args".to_string(), t);
+            }
             h.alloc(PyObj::Instance(Instance {
                 class: class.to_string(),
-                attrs: IndexMap::new(),
+                attrs,
             }))
         })
     };
@@ -4914,6 +4984,18 @@ impl PyHost {
     }
 
     /// Build the `"Class: message"` display string for an exception's args.
+    /// The `args` tuple stored on a user exception instance's dict — set by the
+    /// builtin `BaseException.__new__`/`__init__`. Missing (or non-tuple) → empty.
+    pub fn exc_instance_args(&self, attrs: &IndexMap<String, Value>) -> Vec<Value> {
+        match attrs.get("args") {
+            Some(v) => match self.get(v) {
+                Some(PyObj::Tuple(t)) => t.clone(),
+                _ => vec![v.clone()],
+            },
+            None => Vec::new(),
+        }
+    }
+
     pub fn exc_message(&self, args: &[Value]) -> String {
         if args.is_empty() {
             String::new()
@@ -4927,12 +5009,15 @@ impl PyHost {
 }
 
 /// Run a class body function to populate its namespace, then register the class.
-/// `meta_name` is the explicit `metaclass=` (a user class name) if any.
+/// `meta_name` is the explicit `metaclass=` (a user class name) if any;
+/// `class_kwargs` are the remaining class-header keywords forwarded to
+/// `__init_subclass__`.
 pub fn build_class(
     name: &str,
     bases: Vec<String>,
     body_func: &Value,
     meta_name: Option<String>,
+    class_kwargs: Vec<(String, Value)>,
 ) -> Result<Value, String> {
     let fv = match with_host(|h| h.get(body_func).cloned()) {
         Some(PyObj::Func(fv)) => fv,
@@ -4984,6 +5069,37 @@ pub fn build_class(
             let nm = with_host(|h| h.new_str(attr_name.clone()));
             call_method(val, "__set_name__", vec![owner, nm], vec![])?;
         }
+    }
+    // PEP 487: fire the parent's `__init_subclass__` (an implicit classmethod)
+    // with the new class and the leftover class-header keywords. Resolved along
+    // the MRO strictly after the new class (CPython's `super().__init_subclass__`).
+    let hook = with_host(|h| {
+        h.mro_of(name).into_iter().skip(1).find_map(|c| {
+            h.classes
+                .get(&c)
+                .and_then(|cd| cd.ns.get("__init_subclass__").cloned())
+                .map(|v| (v, c))
+        })
+    });
+    match hook {
+        Some((v, owner)) => {
+            let inner = match with_host(|h| h.get(&v).cloned()) {
+                Some(PyObj::ClassMethod(f)) => f,
+                _ => v,
+            };
+            if let Some(PyObj::Func(fv)) = with_host(|h| h.get(&inner).cloned()) {
+                let clsobj = with_host(|h| h.alloc(PyObj::Class(name.to_string())));
+                run_user_func(&fv, Some(clsobj), Some(owner), vec![], class_kwargs)?;
+            }
+        }
+        // Only `object.__init_subclass__` (the no-arg default) remains: extra
+        // class keywords are an error, matching CPython.
+        None if !class_kwargs.is_empty() => {
+            return Err(type_error(&format!(
+                "{name}.__init_subclass__() takes no keyword arguments"
+            )));
+        }
+        None => {}
     }
     Ok(cls)
 }
@@ -5085,18 +5201,31 @@ pub fn raise_value(exc: &Value) -> Result<String, String> {
                 Ok(name)
             }
             Some(PyObj::Class(name)) => {
-                // Instantiate a user exception class with no args.
+                // Instantiate a user exception class with no args. An exception
+                // class seeds `self.args = ()` (`BaseException.__new__`).
+                let mut attrs = IndexMap::new();
+                if h.class_is_exception(&name) {
+                    let t = h.alloc(PyObj::Tuple(vec![]));
+                    attrs.insert("args".to_string(), t);
+                }
                 let inst = h.alloc(PyObj::Instance(Instance {
                     class: name.clone(),
-                    attrs: IndexMap::new(),
+                    attrs,
                 }));
                 h.exc = Some(inst);
                 Ok(name)
             }
             Some(PyObj::Instance(i)) => {
                 let class = i.class.clone();
+                // A user exception instance's uncaught line shows its message.
+                let line = if h.class_is_exception(&class) {
+                    let a = h.exc_instance_args(&i.attrs);
+                    join_exc(&class, &h.exc_message(&a))
+                } else {
+                    class
+                };
                 h.exc = Some(exc.clone());
-                Ok(class)
+                Ok(line)
             }
             _ => Err(type_error("exceptions must derive from BaseException")),
         }

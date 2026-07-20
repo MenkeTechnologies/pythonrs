@@ -644,7 +644,19 @@ impl Compiler {
         b.emit(Op::CallBuiltin(ops::MKLIST, argc(bases.len())?), 0); // [meta, bases]
         self.name_const(b, name); // [meta, bases, name]
         self.emit_make_func(b, def_id, &empty)?; // [meta, bases, name, bodyfunc]
-        b.emit(Op::CallBuiltin(ops::BUILD_CLASS, 4), 0); // -> class value
+                                                 // The remaining (non-`metaclass`) class keywords become a dict passed to
+                                                 // `__init_subclass__` (`class C(P, tag="x")`). Named keywords only; a
+                                                 // `**`-spread in a class header is uncommon and left unexpanded.
+        let ckw: Vec<&Keyword> = keywords
+            .iter()
+            .filter(|k| k.name.is_some() && k.name.as_deref() != Some("metaclass"))
+            .collect();
+        for kw in &ckw {
+            self.strlit(b, kw.name.as_ref().unwrap());
+            self.compile_expr(b, &kw.value)?;
+        }
+        b.emit(Op::CallBuiltin(ops::MKDICT, argc(ckw.len() * 2)?), 0); // [meta,bases,name,bodyfunc,kwargs]
+        b.emit(Op::CallBuiltin(ops::BUILD_CLASS, 5), 0); // -> class value
         for d in decorators.iter().rev() {
             self.compile_expr(b, d)?;
             b.emit(Op::Swap, 0);

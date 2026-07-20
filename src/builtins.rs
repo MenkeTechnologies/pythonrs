@@ -204,14 +204,22 @@ fn b_getattr(vm: &mut VM, _: u8) -> Value {
 /// accessor bodies run user code, so this holds no host borrow across them.
 fn get_attr_desc(recv: &Value, name: &str) -> Result<Value, String> {
     match with_host(|h| h.plan_attr_get(recv, name)) {
-        host::AttrGet::Property { fget, inst } => {
+        host::AttrGet::Property { fget, inst, owner } => {
             if matches!(fget, Value::Undef) {
                 let cls = with_host(|h| h.type_name(&inst));
                 return Err(format!(
                     "AttributeError: property '{name}' of '{cls}' object has no getter"
                 ));
             }
-            host::invoke(&fget, vec![inst], vec![])
+            // Run the getter as a bound method so `self` and the defining class
+            // land on the frame — a zero-arg `super()` inside the getter reads
+            // them (`invoke` would bind `inst` as a plain arg and leave both unset).
+            match with_host(|h| h.get(&fget).cloned()) {
+                Some(PyObj::Func(fv)) => {
+                    host::run_user_func(&fv, Some(inst), owner, vec![], vec![])
+                }
+                _ => host::invoke(&fget, vec![inst], vec![]),
+            }
         }
         host::AttrGet::Descriptor { desc, inst, cls } => {
             host::call_method(&desc, "__get__", vec![inst, cls], vec![])
@@ -250,14 +258,26 @@ fn b_setattr(vm: &mut VM, _: u8) -> Value {
 /// user `__set__`).
 fn set_attr_desc(recv: &Value, name: &str, val: Value) -> Result<(), String> {
     match with_host(|h| h.plan_attr_set(recv, name, &val)) {
-        host::AttrSet::Property { fset, inst, val } => {
+        host::AttrSet::Property {
+            fset,
+            inst,
+            val,
+            owner,
+        } => {
             if matches!(fset, Value::Undef) {
                 let cls = with_host(|h| h.type_name(&inst));
                 return Err(format!(
                     "AttributeError: property '{name}' of '{cls}' object has no setter"
                 ));
             }
-            host::invoke(&fset, vec![inst, val], vec![]).map(|_| ())
+            // As with the getter, run the setter as a bound method so `self` and
+            // the defining class are on the frame for a zero-arg `super()`.
+            match with_host(|h| h.get(&fset).cloned()) {
+                Some(PyObj::Func(fv)) => {
+                    host::run_user_func(&fv, Some(inst), owner, vec![val], vec![]).map(|_| ())
+                }
+                _ => host::invoke(&fset, vec![inst, val], vec![]).map(|_| ()),
+            }
         }
         host::AttrSet::Descriptor { desc, inst, val } => {
             host::call_method(&desc, "__set__", vec![inst, val], vec![]).map(|_| ())
@@ -689,9 +709,9 @@ fn format_field(v: &Value, conv: i64, spec: &str) -> Result<String, String> {
     // A conversion turns the value into a string first; `__format__` is bypassed.
     if conv != 0 {
         let s = match conv {
-            2 => py_repr(v)?,                 // !r
-            3 => with_host(|h| h.repr_of(v)), // !a (ascii — repr for now)
-            _ => py_str(v)?,                  // !s
+            2 => py_repr(v)?,                  // !r
+            3 => host::ascii_of(&py_repr(v)?), // !a (ascii-escaped repr)
+            _ => py_str(v)?,                   // !s
         };
         let sv = with_host(|h| h.new_str(s.clone()));
         return Ok(apply_format_spec(&s, &sv, spec));
@@ -753,6 +773,7 @@ fn b_mkfunc(vm: &mut VM, argc: u8) -> Value {
 }
 
 fn b_build_class(vm: &mut VM, _: u8) -> Value {
+    let kwargs_val = vm.pop();
     let body_func = vm.pop();
     let name = sval(&vm.pop());
     let bases_val = vm.pop();
@@ -766,7 +787,13 @@ fn b_build_class(vm: &mut VM, _: u8) -> Value {
         Value::Undef => None,
         _ => with_host(|h| callable_name(h, &metaclass)),
     };
-    let r = host::build_class(&name, bases, &body_func, meta_name);
+    // The class-header keywords (minus `metaclass`), forwarded to
+    // `__init_subclass__` as `(name, value)` pairs in definition order.
+    let class_kwargs: Vec<(String, Value)> = with_host(|h| match h.get(&kwargs_val) {
+        Some(PyObj::Dict(d)) => d.values().map(|(k, v)| (h.str_of(k), v.clone())).collect(),
+        _ => Vec::new(),
+    });
+    let r = host::build_class(&name, bases, &body_func, meta_name, class_kwargs);
     finish(vm, r)
 }
 
@@ -1053,6 +1080,14 @@ fn try_binop_dunder(
     lname: &str,
     rname: &str,
 ) -> Option<Result<Value, String>> {
+    // `str % obj` is native string formatting (`str.__mod__`), which is
+    // authoritative — CPython never returns `NotImplemented` from it, so the
+    // right operand's `__rmod__` is never consulted. Route straight to native.
+    if lname == "__mod__"
+        && with_host(|h| matches!(a, Value::Str(_)) || matches!(h.get(a), Some(PyObj::Str(_))))
+    {
+        return None;
+    }
     let involved = with_host(|h| {
         matches!(h.get(a), Some(PyObj::Instance(_))) || matches!(h.get(b), Some(PyObj::Instance(_)))
     });
@@ -1745,16 +1780,22 @@ const BUILTIN_FUNCS: &[&str] = &[
 /// str()/repr() with instance dunder dispatch (free-function form).
 fn py_str(v: &Value) -> Result<String, String> {
     if with_host(|h| matches!(h.get(v), Some(PyObj::Instance(_)))) {
-        let (has_str, has_repr) = with_host(|h| match h.get(v) {
+        let (has_str, has_repr, is_exc) = with_host(|h| match h.get(v) {
             Some(PyObj::Instance(i)) => (
                 h.class_lookup(&i.class, "__str__").is_some(),
                 h.class_lookup(&i.class, "__repr__").is_some(),
+                h.class_is_exception(&i.class),
             ),
-            _ => (false, false),
+            _ => (false, false, false),
         });
         if has_str {
             let r = host::call_method(v, "__str__", vec![], vec![])?;
             return Ok(with_host(|h| h.str_of(&r)));
+        }
+        // `BaseException.__str__` (the message) wins over a user `__repr__` for
+        // exception instances — CPython never falls str→repr for these.
+        if is_exc {
+            return Ok(with_host(|h| h.str_of(v)));
         }
         if has_repr {
             let r = host::call_method(v, "__repr__", vec![], vec![])?;
@@ -2221,20 +2262,7 @@ pub fn call_builtin_function(
         "ascii" => {
             // Like `repr`, but every non-ASCII char is `\x`/`\u`/`\U`-escaped.
             let v = arg0(&args)?;
-            let s = py_repr(&v)?;
-            let mut out = String::with_capacity(s.len());
-            for c in s.chars() {
-                let n = c as u32;
-                if n < 0x80 {
-                    out.push(c);
-                } else if n <= 0xff {
-                    out.push_str(&format!("\\x{n:02x}"));
-                } else if n <= 0xffff {
-                    out.push_str(&format!("\\u{n:04x}"));
-                } else {
-                    out.push_str(&format!("\\U{n:08x}"));
-                }
-            }
+            let out = host::ascii_of(&py_repr(&v)?);
             Ok(with_host(|h| h.new_str(out)))
         }
         "format" => {

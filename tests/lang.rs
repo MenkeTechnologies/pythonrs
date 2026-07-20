@@ -1671,3 +1671,159 @@ fn walrus_in_comprehension_leaks() {
         "([2, 4], 4)"
     );
 }
+
+#[test]
+fn user_exception_str_repr_args() {
+    // A user Exception subclass inherits BaseException's args/str/repr: str is
+    // the message ('' / str(arg) / repr(tuple)), repr is `Class(arg, …)`.
+    assert_eq!(
+        g("class E(Exception): pass\ns = str(E('boom'))", "s"),
+        "'boom'"
+    );
+    assert_eq!(g("class E(Exception): pass\ns = str(E())", "s"), "''");
+    assert_eq!(
+        g("class E(Exception): pass\ns = str(E('a', 'b'))", "s"),
+        "\"('a', 'b')\""
+    );
+    assert_eq!(
+        g("class E(Exception): pass\nr = repr(E('a', 'b'))", "r"),
+        "\"E('a', 'b')\""
+    );
+    assert_eq!(g("class E(Exception): pass\nr = repr(E())", "r"), "'E()'");
+    assert_eq!(
+        g("class E(Exception): pass\na = E('x', 1).args", "a"),
+        "('x', 1)"
+    );
+    assert_eq!(g("class E(Exception): pass\na = E().args", "a"), "()");
+    // isinstance across the builtin hierarchy + user subclass chain.
+    assert_eq!(
+        g(
+            "class A(Exception): pass\nclass B(A): pass\nb = isinstance(B('m'), A) and isinstance(B('m'), Exception)",
+            "b"
+        ),
+        "True"
+    );
+    // A user __init__ that calls super().__init__ overrides args; a custom
+    // __str__ still leaves the default repr = `Class(args…)`.
+    assert_eq!(
+        g(
+            "class E(Exception):\n    def __init__(self, k):\n        super().__init__('missing ' + k)\n        self.k = k\ne = E('id')\nres = (str(e), e.args, e.k)",
+            "res"
+        ),
+        "('missing id', ('missing id',), 'id')"
+    );
+    assert_eq!(
+        g(
+            "class E(Exception):\n    def __str__(self): return 'custom'\nres = (str(E('z')), repr(E('z')))",
+            "res"
+        ),
+        "('custom', \"E('z')\")"
+    );
+    // Caught user exception: `e` and `e.args` are usable in the handler.
+    assert_eq!(
+        g(
+            "out = None\nclass E(Exception): pass\ntry:\n    raise E('bang')\nexcept E as e:\n    out = (str(e), e.args)",
+            "out"
+        ),
+        "('bang', ('bang',))"
+    );
+}
+
+#[test]
+fn super_in_property_accessor() {
+    // A zero-arg super() inside a property getter resolves self + the defining
+    // class, so both super().<method>() and super().<property> work.
+    assert_eq!(
+        g(
+            "class A:\n    def base(self): return 10\nclass B(A):\n    @property\n    def v(self): return super().base() + 1\nx = B().v",
+            "x"
+        ),
+        "11"
+    );
+    assert_eq!(
+        g(
+            "class A:\n    @property\n    def v(self): return 10\nclass B(A):\n    @property\n    def v(self): return super().v + 5\nx = B().v",
+            "x"
+        ),
+        "15"
+    );
+}
+
+#[test]
+fn fstring_ascii_conversion() {
+    // `!a` ascii-escapes non-ASCII in the repr (previously passed repr through).
+    // Built via chr() so the expected value has no backslash-escaping ambiguity:
+    // ascii(chr(233)) == "'" + "\\" + "xe9" + "'".
+    assert_eq!(
+        g("b = f'{chr(233)!a}' == chr(39)+chr(92)+'xe9'+chr(39)", "b"),
+        "True"
+    );
+    assert_eq!(
+        g(
+            "b = f'{chr(1000)!a}' == chr(39)+chr(92)+'u03e8'+chr(39)",
+            "b"
+        ),
+        "True"
+    );
+    // The `ascii()` builtin agrees with `!a`.
+    assert_eq!(
+        g("b = ascii(chr(233)) == chr(39)+chr(92)+'xe9'+chr(39)", "b"),
+        "True"
+    );
+    // `!r` leaves non-ASCII intact: repr(chr(233)) == "'é'".
+    assert_eq!(
+        g("b = f'{chr(233)!r}' == chr(39)+chr(233)+chr(39)", "b"),
+        "True"
+    );
+}
+
+#[test]
+fn str_percent_format_native_authoritative() {
+    // `str % obj` is native formatting (str.__mod__), authoritative over any
+    // right-operand __rmod__: a %s/%r of an exception instance uses its message.
+    assert_eq!(
+        g("class E(Exception): pass\ns = '%s' % E('boom')", "s"),
+        "'boom'"
+    );
+    assert_eq!(
+        g("class E(Exception): pass\ns = '%r' % E('x', 1)", "s"),
+        "\"E('x', 1)\""
+    );
+    // A right operand with `__rmod__` never intercepts `str %` — str formatting
+    // wins, so a mismatched arg count raises rather than calling __rmod__.
+    let e = eval_str("class V:\n    def __rmod__(self, o): return 'nope'\nx = 'lit' % V()")
+        .unwrap_err();
+    assert!(
+        e.contains("not all arguments converted"),
+        "unexpected error: {e}"
+    );
+    // Plain-value %-format (tuples, %r) is unaffected.
+    assert_eq!(g("s = '%s=%r' % ('k', (1, 2))", "s"), "'k=(1, 2)'");
+}
+
+#[test]
+fn init_subclass_hook() {
+    // PEP 487: the parent's __init_subclass__ fires with the new class and the
+    // class-header keywords.
+    assert_eq!(
+        g(
+            "class P:\n    def __init_subclass__(cls, /, tag=None, **kw):\n        cls.tag = tag\nclass C(P, tag='x'): pass\nt = C.tag",
+            "t"
+        ),
+        "'x'"
+    );
+    // An explicit @classmethod form and no-keyword default both work.
+    assert_eq!(
+        g(
+            "seen = []\nclass P:\n    @classmethod\n    def __init_subclass__(cls, **kw):\n        seen.append(cls.__name__)\nclass C(P): pass\nout = seen",
+            "out"
+        ),
+        "['C']"
+    );
+    // Extra keywords with only object's default hook is a TypeError.
+    let e = eval_str("class P: pass\nclass C(P, tag='x'): pass").unwrap_err();
+    assert!(
+        e.contains("__init_subclass__() takes no keyword arguments"),
+        "unexpected error: {e}"
+    );
+}

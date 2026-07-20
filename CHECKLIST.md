@@ -141,6 +141,13 @@ pull pyo3 or need libpython, so they import only the native set below.
   Module bundling for release artifacts (ship `lib/python3.14` + `libpython`) is
   future work per FFI_STDLIB.md §6.
 
+**Known deferrals (intentional, not gaps to fake-close):**
+- **FFI Foreign-handle reclamation** — needs host-side object lifetime (a
+  `Foreign`-drop callback / arena GC in `host.rs`), a major architectural change
+  to the pure-arena heap. Correctly deferred; see the bridge-limits note above.
+- **Linux release bundle** — no Linux runner in this environment to build/verify a
+  Linux artifact; deferred until one is available.
+
 ## Tier 3 — Object model / OOP (largest correctness surface after numerics)
 
 Binary arithmetic dunders (`__add__`/reflected, all operators), single/multiple
@@ -166,7 +173,11 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
       accessor runs user code). User `__get__`/`__set__` descriptors and `__set_name__`
       (fired at class creation, definition order) work. Missing-getter raises the 3.14
       `property '<n>' of '<C>' object has no getter`. `getattr`/`hasattr`/`setattr`
-      builtins route through the same path.
+      builtins route through the same path. A getter/setter now runs as a *bound*
+      method (self + its defining class on the frame, `owner` carried in
+      `AttrGet/AttrSet::Property`), so a zero-arg `super()` inside an accessor
+      resolves — including `super().<some_property>`, which invokes the parent
+      property's getter via the same out-of-borrow path.
 - [x] **Instances are hashable** — FIXED: a new `PKey::Instance{hash,id}` keys a
       user instance by its `__hash__()` result plus a collapsed identity. Because
       `to_key` is `&self` and cannot run user code, the boundary op handlers
@@ -242,7 +253,14 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
       in its MRO declares `__slots__`) rejects assignment of an undeclared attribute
       (`… object has no attribute 'z' and no __dict__ …`) and has no `__dict__`; a
       non-slotted base restores the dict (no restriction). Still open:
-      `__init_subclass__` class-kwargs; `a.__class__ = B` reassignment.
+      `a.__class__ = B` reassignment.
+- [x] **`__init_subclass__` (PEP 487)** — FIXED: after a class is built and its
+      `__set_name__` hooks fire, the parent's `__init_subclass__` (an implicit
+      classmethod, resolved along the new class's MRO strictly after itself) is
+      called with the new class and the leftover class-header keywords
+      (`class C(P, tag="x")`). Only-`object` default + extra keywords raises
+      `C.__init_subclass__() takes no keyword arguments`. Class-header keywords now
+      flow through `BUILD_CLASS` (arity 4→5, cache schema v11) as a dict.
 - [ ] **`dataclasses` / `enum` modules absent** (see Tier 2).
 
 ## Tier 4 — Numeric core (silent-wrong values — highest correctness priority)
@@ -297,14 +315,19 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
 
 ## Tier 5 — Strings / bytes / formatting
 
-- [ ] **`%`-operator specs ignored** — anything past bare `%s`/`%d`/`%r` is emitted as
-      the literal format string: `'%.2f'%x`, `'%5d'`, `'%-8s'`, `'%x/%o/%e/%g/%c/%a'`,
-      flags `+`/space/`0`/`#`, `*` width, `%(name)s`. Plus wrong values: `'%d'%3.9`→
-      `3.9` (no truncation), `'%x'%-255`→ two's-complement.
+- [x] **`%`-operator formatting** — the mini-language (flags/width/precision/`*`/
+      `%(name)s`/all conv chars, incl. `%a` ascii-escaped) works and `str % obj` is
+      native `str.__mod__`, authoritative over a right operand's `__rmod__` (CPython
+      never returns `NotImplemented` from `str.__mod__`). **Deferral:** `%s`/`%r`/`%a`
+      of a *user instance* does NOT dispatch its `__str__`/`__repr__` (the `%`
+      formatter runs inside the host borrow and can't call back into user code) — it
+      prints `<C object>` where CPython uses the dunder. Exception instances format
+      correctly (host-side arms). f-strings and `str.format` DO dispatch these dunders
+      (`format_field` runs out of borrow); prefer them. Fixing `%` faithfully requires
+      moving the formatter out of the borrow like `format_field`.
 - [ ] **`str.format` / f-string advanced spec** — nested fields `'{:{}}'`/`'{:.{}f}'`
       (and f-string `f'{x:{w}.2f}'`) drop the spec; keyword `'{name}'`, index `'{0[0]}'`,
-      attribute `'{0.imag}'` fields → `None`; `!r`/`!s`/`!a` conversions in `.format`
-      (and `!a` in f-strings); the `=` debug specifier `f'{x=}'` is a **`SyntaxError`**;
+      attribute `'{0.imag}'` fields → `None`; the `=` debug specifier `f'{x=}'` is a **`SyntaxError`**;
       `g` type treated as fixed precision (never switches to exponent / strips zeros);
       `#` alt form, `c` type, `=` sign-aware fill, and `e` exponent (`1.2e5` want
       `1.2e+05`) all wrong.
@@ -421,6 +444,15 @@ kinds + guards), `for/else`/`while/else`, `try/except/else/finally` ordering all
       the new raise overwrites it). Both readable on builtin `Exception` objects and on
       user exception instances (gated by `class_is_exception` so non-exception objects
       still `AttributeError`). Still open: `ExceptionGroup` (though `except*` parses).
+- [x] **User exception subclasses inherit `BaseException.__init__`/`__str__`/`.args`**
+      — FIXED: a `class E(Exception)` instance now behaves like a builtin exception.
+      Construction seeds `self.args = tuple(ctor_args)` (`BaseException.__new__`);
+      `super().__init__(*a)` overrides it, and `self.args = …` works too. `str(e)` is
+      the message (`''` / `str(arg)` / `repr(tuple)`), `repr(e)` is `E(arg, …)`, and
+      `.args` reads the tuple (`host::exc_instance_args`). `BaseException.__str__`
+      (the message) wins over a user `__repr__` in `str()`. Uncaught `raise E('x')`
+      prints `E: x`. (host `str_of`/`repr_of` exception-instance arms + `py_str`
+      precedence + `instantiate_plain`/`super().__init__`/`raise_value` seeding.)
 - [x] **Keyword-only default values** — FIXED: `MKFUNC` now carries the evaluated
       keyword-only defaults (a count + values below the func id; cache schema v5);
       `bind_params` applies them for any omitted optional kwonly param. Works for
