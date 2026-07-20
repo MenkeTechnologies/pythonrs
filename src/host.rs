@@ -138,6 +138,8 @@ pub enum PKey {
     /// normalize to the matching real key so `complex(1,0)` unifies with `1`).
     Complex(u64, u64),
     Str(String),
+    /// An immutable `bytes` key (a `bytearray` is mutable and stays unhashable).
+    Bytes(Vec<u8>),
     Tuple(Vec<PKey>),
     /// A `frozenset` key: the element keys sorted+deduped into a canonical order,
     /// so two equal frozensets (any insertion order) share one key.
@@ -1649,6 +1651,8 @@ impl PyHost {
             Value::Str(s) => PKey::Str((**s).clone()),
             Value::Obj(_) => match self.get(v) {
                 Some(PyObj::Str(s)) => PKey::Str(s.clone()),
+                // `bytes` is hashable by its byte content; `bytearray` is not.
+                Some(PyObj::Bytes(b)) => PKey::Bytes(b.clone()),
                 Some(PyObj::BigInt(b)) => PKey::Big(b.clone()),
                 Some(PyObj::Complex(r, i)) => {
                     if *i == 0.0 {
@@ -3152,6 +3156,233 @@ impl PyHost {
         Ok(self.new_str(out))
     }
 
+    /// `bytes % args` / `bytearray % args` — PEP 461 percent formatting. Mirrors
+    /// [`str_format_percent`] but the template and result are raw bytes and the
+    /// conversions follow bytes semantics: `%b`/`%s` take a bytes-like object,
+    /// `%c` an int in `0..=256` or a length-1 bytes-like, `%a`/`%r` produce the
+    /// ASCII repr, and the numeric conversions reuse [`format_conv`]. `is_ba`
+    /// selects a `bytearray` result to match the receiver.
+    pub fn bytes_format_percent(
+        &mut self,
+        fmt: &[u8],
+        args: &Value,
+        is_ba: bool,
+    ) -> Result<Value, String> {
+        let is_mapping = matches!(self.get(args), Some(PyObj::Dict(_)));
+        let arglist: Vec<Value> = if is_mapping {
+            vec![]
+        } else {
+            match self.get(args) {
+                Some(PyObj::Tuple(t)) => t.clone(),
+                _ => vec![args.clone()],
+            }
+        };
+        let n = fmt.len();
+        let mut out: Vec<u8> = Vec::with_capacity(n);
+        let mut ai = 0usize;
+        let mut i = 0usize;
+        while i < n {
+            if fmt[i] != b'%' {
+                out.push(fmt[i]);
+                i += 1;
+                continue;
+            }
+            i += 1;
+            if i >= n {
+                return Err("ValueError: incomplete format".into());
+            }
+            if fmt[i] == b'%' {
+                out.push(b'%');
+                i += 1;
+                continue;
+            }
+            // Mapping key `%(name)s` (the key is a bytes object).
+            let mut mapping_key: Option<Vec<u8>> = None;
+            if fmt[i] == b'(' {
+                i += 1;
+                let mut key = Vec::new();
+                let mut depth = 1;
+                while i < n && depth > 0 {
+                    match fmt[i] {
+                        b'(' => {
+                            depth += 1;
+                            key.push(b'(');
+                        }
+                        b')' => {
+                            depth -= 1;
+                            if depth > 0 {
+                                key.push(b')');
+                            }
+                        }
+                        c => key.push(c),
+                    }
+                    i += 1;
+                }
+                mapping_key = Some(key);
+            }
+            // Flags.
+            let (mut f_minus, mut f_plus, mut f_space, mut f_zero, mut f_hash) =
+                (false, false, false, false, false);
+            while i < n {
+                match fmt[i] {
+                    b'-' => f_minus = true,
+                    b'+' => f_plus = true,
+                    b' ' => f_space = true,
+                    b'0' => f_zero = true,
+                    b'#' => f_hash = true,
+                    _ => break,
+                }
+                i += 1;
+            }
+            // Width (literal or `*`).
+            let mut width: Option<usize> = None;
+            if i < n && fmt[i] == b'*' {
+                i += 1;
+                let w = self.next_arg_int(&arglist, &mut ai);
+                if w < 0 {
+                    f_minus = true;
+                    width = Some((-w) as usize);
+                } else {
+                    width = Some(w as usize);
+                }
+            } else {
+                let mut wd = String::new();
+                while i < n && fmt[i].is_ascii_digit() {
+                    wd.push(fmt[i] as char);
+                    i += 1;
+                }
+                if !wd.is_empty() {
+                    width = wd.parse().ok();
+                }
+            }
+            // Precision (literal or `*`).
+            let mut prec: Option<usize> = None;
+            if i < n && fmt[i] == b'.' {
+                i += 1;
+                if i < n && fmt[i] == b'*' {
+                    i += 1;
+                    prec = Some(self.next_arg_int(&arglist, &mut ai).max(0) as usize);
+                } else {
+                    let mut pd = String::new();
+                    while i < n && fmt[i].is_ascii_digit() {
+                        pd.push(fmt[i] as char);
+                        i += 1;
+                    }
+                    prec = Some(pd.parse().unwrap_or(0));
+                }
+            }
+            // Length modifiers are accepted and ignored.
+            while i < n && matches!(fmt[i], b'h' | b'l' | b'L') {
+                i += 1;
+            }
+            if i >= n {
+                return Err("ValueError: incomplete format".into());
+            }
+            let conv = fmt[i] as char;
+            i += 1;
+            // Resolve the value for this conversion.
+            let val = if let Some(key) = &mapping_key {
+                let kv = self.alloc(PyObj::Bytes(key.clone()));
+                let k = self.to_key(&kv)?;
+                match self.get(args) {
+                    Some(PyObj::Dict(d)) => d
+                        .get(&k)
+                        .map(|(_, v)| v.clone())
+                        .ok_or_else(|| format!("KeyError: {}", self.repr_of(&kv)))?,
+                    _ => return Err("TypeError: format requires a mapping".into()),
+                }
+            } else {
+                let v = arglist.get(ai).cloned().ok_or_else(|| {
+                    "TypeError: not enough arguments for format string".to_string()
+                })?;
+                ai += 1;
+                v
+            };
+            let (core, numeric): (Vec<u8>, bool) = match conv {
+                'b' | 's' => {
+                    let mut raw = match self.get(&val) {
+                        Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) => b.clone(),
+                        _ => {
+                            return Err(type_error(&format!(
+                            "%b requires a bytes-like object, or an object that implements __bytes__, not '{}'",
+                            self.type_name(&val)
+                        )))
+                        }
+                    };
+                    if let Some(p) = prec {
+                        raw.truncate(p);
+                    }
+                    (raw, false)
+                }
+                'a' | 'r' => {
+                    // Both force an ASCII rendering of the repr.
+                    let mut s = ascii_of(&self.repr_of(&val));
+                    if let Some(p) = prec {
+                        s = s.chars().take(p).collect();
+                    }
+                    (s.into_bytes(), false)
+                }
+                'c' => {
+                    if let Some(cp) = self.as_int(&val) {
+                        if !(0..=255).contains(&cp) {
+                            return Err(
+                                "TypeError: %c requires an integer in range(256) or a single byte"
+                                    .into(),
+                            );
+                        }
+                        (vec![cp as u8], false)
+                    } else {
+                        let raw = match self.get(&val) {
+                            Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) => Some(b.clone()),
+                            _ => None,
+                        };
+                        match raw {
+                            Some(b) if b.len() == 1 => (vec![b[0]], false),
+                            Some(b) => return Err(format!(
+                                "TypeError: %c requires an integer in range(256) or a single byte, not a bytes object of length {}",
+                                b.len()
+                            )),
+                            None => return Err(type_error(&format!(
+                                "%c requires an integer in range(256) or a single byte, not {}",
+                                self.type_name(&val)
+                            ))),
+                        }
+                    }
+                }
+                'd' | 'i' | 'u' | 'x' | 'X' | 'o' | 'f' | 'F' | 'e' | 'E' | 'g' | 'G' => {
+                    let s = self.format_conv(
+                        conv,
+                        &val,
+                        ConvFlags {
+                            plus: f_plus,
+                            space: f_space,
+                            hash: f_hash,
+                        },
+                        prec,
+                        &HashMap::new(),
+                    )?;
+                    (s.into_bytes(), true)
+                }
+                other => {
+                    return Err(format!(
+                        "ValueError: unsupported format character '{other}'"
+                    ))
+                }
+            };
+            out.extend_from_slice(&pad_conv_bytes(&core, width, f_minus, f_zero, numeric));
+        }
+        if !is_mapping && ai < arglist.len() {
+            return Err(
+                "TypeError: not all arguments converted during bytes formatting".into(),
+            );
+        }
+        Ok(if is_ba {
+            self.alloc(PyObj::Bytearray(out))
+        } else {
+            self.alloc(PyObj::Bytes(out))
+        })
+    }
+
     /// Pop the next positional arg as an i64 (for `*` width/precision).
     fn next_arg_int(&self, arglist: &[Value], ai: &mut usize) -> i64 {
         let v = arglist.get(*ai).cloned().unwrap_or(Value::Int(0));
@@ -3333,6 +3564,49 @@ fn pad_conv(core: &str, width: Option<usize>, minus: bool, zero: bool, numeric: 
     } else {
         format!("{}{core}", " ".repeat(pad))
     }
+}
+
+/// Byte-level [`pad_conv`] for `bytes`/`bytearray` `%`-formatting. Padding is
+/// measured in bytes; numeric zero-fill lands after any sign/base prefix.
+fn pad_conv_bytes(core: &[u8], width: Option<usize>, minus: bool, zero: bool, numeric: bool) -> Vec<u8> {
+    let w = match width {
+        Some(w) => w,
+        None => return core.to_vec(),
+    };
+    if core.len() >= w {
+        return core.to_vec();
+    }
+    let pad = w - core.len();
+    if minus {
+        let mut v = core.to_vec();
+        v.extend(std::iter::repeat(b' ').take(pad));
+        v
+    } else if zero && numeric {
+        let (prefix, rest) = split_sign_prefix_bytes(core);
+        let mut v = prefix.to_vec();
+        v.extend(std::iter::repeat(b'0').take(pad));
+        v.extend_from_slice(rest);
+        v
+    } else {
+        let mut v: Vec<u8> = std::iter::repeat(b' ').take(pad).collect();
+        v.extend_from_slice(core);
+        v
+    }
+}
+
+/// Byte-level [`split_sign_prefix`]: split a leading sign and `0x`/`0X`/`0o`
+/// base prefix off a rendered number.
+fn split_sign_prefix_bytes(s: &[u8]) -> (&[u8], &[u8]) {
+    let mut idx = 0;
+    if let Some(&c) = s.first() {
+        if c == b'+' || c == b'-' || c == b' ' {
+            idx = 1;
+        }
+    }
+    if s.len() >= idx + 2 && s[idx] == b'0' && matches!(s[idx + 1], b'x' | b'X' | b'o') {
+        idx += 2;
+    }
+    (&s[..idx], &s[idx..])
 }
 
 /// Split a leading sign (`+ - space`) and numeric base prefix (`0x`/`0X`/`0o`)
@@ -3715,6 +3989,20 @@ impl PyHost {
                 }
                 Ok(())
             }
+            Some(PyObj::Bytearray(b)) => {
+                let n = b.len() as i64;
+                let i = self
+                    .as_int(idx)
+                    .ok_or_else(|| type_error("bytearray indices must be integers"))?;
+                let k = if i < 0 { i + n } else { i };
+                if k < 0 || k >= n {
+                    return Err("IndexError: bytearray index out of range".into());
+                }
+                if let Some(PyObj::Bytearray(b)) = self.get_mut(recv) {
+                    b.remove(k as usize);
+                }
+                Ok(())
+            }
             _ => Err(type_error("object doesn't support item deletion")),
         }
     }
@@ -3855,7 +4143,7 @@ impl PyHost {
         }
     }
 
-    /// `del x[lo:hi:step]` (lists only).
+    /// `del x[lo:hi:step]` (lists and bytearrays).
     fn del_slice(
         &mut self,
         recv: &Value,
@@ -3869,6 +4157,7 @@ impl PyHost {
         }
         let n = match self.get(recv) {
             Some(PyObj::List(l)) => l.len() as i64,
+            Some(PyObj::Bytearray(b)) => b.len() as i64,
             _ => {
                 return Err(type_error(&format!(
                     "'{}' object doesn't support item deletion",
@@ -3879,13 +4168,23 @@ impl PyHost {
         let mut indices = self.slice_indices(lo, hi, step, n);
         indices.sort_unstable();
         indices.dedup();
-        if let Some(PyObj::List(l)) = self.get_mut(recv) {
-            // Remove from highest index down so earlier removals don't shift.
-            for i in indices.into_iter().rev() {
-                if (i as usize) < l.len() {
-                    l.remove(i as usize);
+        // Remove from highest index down so earlier removals don't shift.
+        match self.get_mut(recv) {
+            Some(PyObj::List(l)) => {
+                for i in indices.into_iter().rev() {
+                    if (i as usize) < l.len() {
+                        l.remove(i as usize);
+                    }
                 }
             }
+            Some(PyObj::Bytearray(b)) => {
+                for i in indices.into_iter().rev() {
+                    if (i as usize) < b.len() {
+                        b.remove(i as usize);
+                    }
+                }
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -4529,6 +4828,10 @@ impl PyHost {
             // `bytes.fromhex` / `bytearray.fromhex` — classmethods on the type.
             Some(PyObj::Builtin(n)) if (n == "bytes" || n == "bytearray") && name == "fromhex" => {
                 Ok(self.alloc(PyObj::Builtin(format!("{n}.fromhex"))))
+            }
+            // `bytes.maketrans` / `bytearray.maketrans` — static methods on the type.
+            Some(PyObj::Builtin(n)) if (n == "bytes" || n == "bytearray") && name == "maketrans" => {
+                Ok(self.alloc(PyObj::Builtin(format!("{n}.maketrans"))))
             }
             _ => {
                 // Numeric `.real`/`.imag` (int/float/bool/bigint/complex are all

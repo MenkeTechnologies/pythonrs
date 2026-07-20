@@ -64,18 +64,25 @@ fixed. Every line below was re-checked against the **default-build** binary
   `.readlines`/`.write`, line iteration, and `with open(...) as f:` work in the
   default build.
 - **`bytes`/`bytearray` are real heap types** with the full sequence + method
-  surface (byte-verified vs CPython via the `bytesops` fuzz mode, 0 divergences):
-  construction (`b'…'`, `bytes([65,66])`, `bytes(3)`, `bytearray(b'…')`,
-  `bytes.fromhex`/`bytearray.fromhex`), `len`, integer indexing (`b[0]`→int),
-  iteration/`list()`, slicing (`b[1:3]`, `b[::-1]`), concat (`b1+b2`, result type
-  follows the left operand), repeat (`b*3`), membership (`int in b` byte-value,
-  bytes-like substring `b'a' in b'abc'`), ordering (`<`/`==`, incl. bytes vs
-  bytearray). Str-parallel methods returning/taking bytes:
+  surface (byte-verified vs CPython via the `bytesops` and `bytestail` fuzz
+  modes, 0 divergences): construction (`b'…'`, `bytes([65,66])`, `bytes(3)`,
+  `bytearray(b'…')`, `bytes.fromhex`/`bytearray.fromhex`), `len`, integer
+  indexing (`b[0]`→int), iteration/`list()`, slicing (`b[1:3]`, `b[::-1]`),
+  concat (`b1+b2`, result type follows the left operand), repeat (`b*3`),
+  membership (`int in b` byte-value, bytes-like substring `b'a' in b'abc'`),
+  ordering (`<`/`==`, incl. bytes vs bytearray), and `bytes` as a hashable
+  dict/set key. Str-parallel methods returning/taking bytes:
   `split`/`rsplit`/`join`/`replace`/`find`/`rfind`/`index`/`rindex`/`count`/
-  `startswith`/`endswith`/`strip`/`lstrip`/`rstrip`/`upper`/`lower`/`splitlines`/
-  `partition`/`rpartition`/`removeprefix`/`removesuffix`/`decode`/`hex`.
-  `bytearray` item + slice assignment (`ba[0]=65`, `ba[1:2]=b'xy'`, `ba[::2]=…`),
-  plus `append`/`extend`/`pop`/`clear`. `repr` matches CPython quoting (single/
+  `startswith`/`endswith`/`strip`/`lstrip`/`rstrip`/`upper`/`lower`/`swapcase`/
+  `title`/`center`/`ljust`/`rjust`/`splitlines`/`partition`/`rpartition`/
+  `removeprefix`/`removesuffix`/`translate`/`maketrans`/`decode` (with
+  `errors=` `strict`/`ignore`/`replace`)/`hex`, the ASCII `isX` predicates
+  (`isalpha`/`isdigit`/`isalnum`/`isspace`/`isupper`/`islower`/`istitle`/
+  `isascii`), and PEP 461 `%`-formatting (`b'%d-%s' % (1, b'x')`, `%b`/`%c`/
+  `%a`/`%r`, width/precision/flags, `%(name)s` mapping). `bytearray` item +
+  slice assignment (`ba[0]=65`, `ba[1:2]=b'xy'`, `ba[::2]=…`), deletion
+  (`del ba[i]`, `del ba[i:j]`, `del ba[::k]`), plus
+  `append`/`extend`/`pop`/`clear`. `repr` matches CPython quoting (single/
   double-quote selection; the bytearray always-escape-`'` quirk).
 - **Comprehension scope**: list/set/dict comprehensions run in their own function
   scope, so the loop variable no longer leaks; enclosing variables are still read
@@ -143,11 +150,10 @@ fixed. Every line below was re-checked against the **default-build** binary
 - **`int`** is arbitrary precision (bignum) across `+ - * ** // %` and the bitwise
   ops `& | ^ << >>` — verified byte-identical to CPython on `10**30`-scale values
   (the earlier i64-cap on `//`/`%`/bitwise is gone).
-- **`bytes`/`bytearray`** (real types — see Implemented) still lack a few string-
-  parallel methods (`swapcase`/`title`/`capitalize`/`center`/`ljust`/`rjust`/
-  `zfill`/`expandtabs`/`translate`/`maketrans`/the `isX` predicates),
-  `%`-formatting on bytes (`b'%d' % 5`), `del ba[i]`/`del ba[i:j]`, and the
-  `errors=` argument on `.decode()` (only the codec is honored).
+- **`bytes`/`bytearray`** (real types — see Implemented) still lack the
+  `capitalize`/`zfill`/`expandtabs` string-parallel methods. `%`-formatting of a
+  user instance with `__bytes__` via `%b`/`%s` also isn't dispatched (plain
+  bytes-like args and the numeric/`%a`/`%r`/`%c` conversions all work).
 - **f-string / `str.format` format spec** covers the common mini-language
   (fill/align/sign/width/`,`/`.prec`/type `d f e x o b % s c g`) and nested field
   specs (see Implemented). The `=` debug specifier `f'{x=}'` is still a
