@@ -110,6 +110,15 @@ pub mod unop {
     pub const POS: i64 = 1; // unary +
 }
 
+/// The `%`-conversion flags parsed once and threaded into `format_conv`: `+`
+/// (force sign), space (leading space on non-negatives), `#` (alternate form).
+#[derive(Clone, Copy)]
+struct ConvFlags {
+    plus: bool,
+    space: bool,
+    hash: bool,
+}
+
 // ── heap objects ───────────────────────────────────────────────────────────
 
 /// A key usable in a dict/set: Python hashes by value for the immutable types.
@@ -2512,10 +2521,13 @@ impl PyHost {
                 }
             }
             binop::MOD => {
-                // str % formatting
+                // str % formatting. Reached only via internal numeric fallbacks
+                // (the `str % args` opcode path pre-resolves instance dispatch in
+                // `b_binop` and calls `str_format_percent` directly); an empty
+                // premap here keeps the non-dispatching fallback behavior.
                 if let Some(PyObj::Str(fmt)) = self.get(a) {
                     let fmt = fmt.clone();
-                    return self.str_format_percent(&fmt, b);
+                    return self.str_format_percent(&fmt, b, &HashMap::new());
                 }
                 // Python `%` takes the sign of the divisor (floored remainder).
                 if let (Some(x), Some(y)) = (ai, bi) {
@@ -2693,7 +2705,16 @@ impl PyHost {
     /// `'%(k)s' % {…}`, single-arg vs tuple positional args, conversions
     /// `d i u s r a f F e E g G x X o c %`, the flags `- + space 0 #`, field
     /// width and `.precision` (both as literals or `*` dynamic from the args).
-    fn str_format_percent(&mut self, fmt: &str, args: &Value) -> Result<Value, String> {
+    /// `str % args`. `premap` carries the dispatched `str()`/`repr()`/`ascii()`
+    /// of any user instance or instance-bearing container among the format args,
+    /// pre-resolved *outside* the host borrow (this method runs inside it and so
+    /// cannot itself call back into `__str__`/`__repr__`). Keyed by heap id.
+    pub fn str_format_percent(
+        &mut self,
+        fmt: &str,
+        args: &Value,
+        premap: &HashMap<u32, (String, String, String)>,
+    ) -> Result<Value, String> {
         let is_mapping = matches!(self.get(args), Some(PyObj::Dict(_)));
         let arglist: Vec<Value> = if is_mapping {
             vec![]
@@ -2825,7 +2846,17 @@ impl PyHost {
                 ai += 1;
                 v
             };
-            let core = self.format_conv(conv, &val, f_plus, f_space, f_hash, prec)?;
+            let core = self.format_conv(
+                conv,
+                &val,
+                ConvFlags {
+                    plus: f_plus,
+                    space: f_space,
+                    hash: f_hash,
+                },
+                prec,
+                premap,
+            )?;
             out.push_str(&pad_conv(
                 &core,
                 width,
@@ -2852,11 +2883,11 @@ impl PyHost {
         &mut self,
         conv: char,
         val: &Value,
-        plus: bool,
-        space: bool,
-        hash: bool,
+        flags: ConvFlags,
         prec: Option<usize>,
+        premap: &HashMap<u32, (String, String, String)>,
     ) -> Result<String, String> {
+        let ConvFlags { plus, space, hash } = flags;
         let sign_str = |neg: bool| -> &'static str {
             if neg {
                 "-"
@@ -2870,10 +2901,23 @@ impl PyHost {
         };
         match conv {
             's' | 'r' | 'a' => {
-                let mut s = match conv {
-                    's' => self.str_of(val),
-                    'r' => self.repr_of(val),
-                    _ => ascii_of(&self.repr_of(val)),
+                // Prefer the pre-resolved dispatched value for a user instance /
+                // instance-bearing container; fall back to the non-dispatching
+                // host renderers for plain values.
+                let mut s = match val {
+                    Value::Obj(id) if premap.contains_key(id) => {
+                        let (sr, rp, asc) = &premap[id];
+                        match conv {
+                            's' => sr.clone(),
+                            'r' => rp.clone(),
+                            _ => asc.clone(),
+                        }
+                    }
+                    _ => match conv {
+                        's' => self.str_of(val),
+                        'r' => self.repr_of(val),
+                        _ => ascii_of(&self.repr_of(val)),
+                    },
                 };
                 if let Some(p) = prec {
                     s = s.chars().take(p).collect();

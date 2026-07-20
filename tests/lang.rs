@@ -48,6 +48,36 @@ fn strings_and_fstrings() {
 }
 
 #[test]
+fn percent_format_dispatches_instance_str_repr() {
+    // `%s`/`%r`/`%a` must call the user instance's __str__/__repr__ (resolved
+    // outside the host borrow), matching CPython byte-for-byte.
+    let cls = "class C:\n    def __str__(s): return 'S'\n    def __repr__(s): return 'R'\n";
+    assert_eq!(g(&format!("{cls}x = '%s' % C()"), "x"), "'S'");
+    assert_eq!(g(&format!("{cls}x = '%r' % C()"), "x"), "'R'");
+    assert_eq!(g(&format!("{cls}x = '%a' % C()"), "x"), "'R'");
+    // mixed tuple: instance + plain value
+    assert_eq!(g(&format!("{cls}x = '%s=%d' % (C(), 5)"), "x"), "'S=5'");
+    assert_eq!(g(&format!("{cls}x = '%s %r %a' % (C(), C(), C())"), "x"), "'S R R'");
+    // container holding instances (recurses through repr dispatch)
+    assert_eq!(g(&format!("{cls}x = '%s' % ([C(), C()],)"), "x"), "'[R, R]'");
+    assert_eq!(g(&format!("{cls}x = '%r' % ((C(),),)"), "x"), "'(R,)'");
+    // mapping form
+    assert_eq!(g(&format!("{cls}x = '%(k)r' % {{'k': C()}}"), "x"), "'R'");
+    // width/precision still apply after dispatch
+    assert_eq!(g(&format!("{cls}x = '[%5s]' % C()"), "x"), "'[    S]'");
+    assert_eq!(g(&format!("{cls}x = '%.1s' % C()"), "x"), "'S'");
+    // `%=` (desugars to `t = t % v`) goes through the same path
+    assert_eq!(g(&format!("{cls}x = '%s'\nx %= C()"), "x"), "'S'");
+    // `%a` ascii-escapes a non-ASCII dispatched repr
+    assert_eq!(
+        g("class U:\n    def __repr__(s): return 'é'\nx = '%a' % U()", "x"),
+        "'\\\\xe9'"
+    );
+    // plain values unaffected (no regression)
+    assert_eq!(g("x = '%s and %r' % ('a', 'b')", "x"), "\"a and 'b'\"");
+}
+
+#[test]
 fn lists_dicts_sets_tuples() {
     assert_eq!(g("x = [1, 2, 3] + [4]", "x"), "[1, 2, 3, 4]");
     assert_eq!(g("a = [1, 2]\na.append(3)\nx = a", "x"), "[1, 2, 3]");
