@@ -805,6 +805,176 @@ fn gen_classes(seed: u64) -> Vec<String> {
     out
 }
 
+/// Type & metaclass machinery: `type(obj)` (1-arg) / `type(name, bases, ns)`
+/// (3-arg dynamic class), custom metaclasses (`__new__`/`__init__`/`__call__`,
+/// attribute & method lookup through the class, propagation to subclasses),
+/// `__init_subclass__` with class-header keywords, `__set_name__`,
+/// `isinstance`/`issubclass` (tuples + `__instancecheck__`/`__subclasscheck__`
+/// overrides), `__class__`/`__bases__`/`__mro__` (C3 linearization of a
+/// diamond), and `__class_getitem__`. Every branch prints only class names,
+/// name tuples, booleans, or captured scalars — never a raw object repr with an
+/// address — so output is byte-stable across both interpreters.
+fn gen_metatype(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    const STRS: &[&str] = &["a", "b", "hi", "tag", "x", "M", "zz"];
+    let a = pick(r, SMALLINTS);
+    let b = pick(r, SMALLINTS);
+    let s = pick(r, STRS);
+    let mut out: Vec<String> = Vec::new();
+    match r.below(16) {
+        0 => {
+            // `type(obj)` (1-arg) on builtins, a user class, and an instance.
+            out.push("class C: pass".into());
+            out.push(format!(
+                "print(type({a}).__name__, type('{s}').__name__, type([]).__name__, type(C).__name__, type(C()).__name__)"
+            ));
+        }
+        1 => {
+            // 3-arg `type(name, bases, ns)`: dynamic class creation.
+            out.push(format!(
+                "D = type('D', (), {{'x': {a}, 'greet': lambda self: '{s}'}})"
+            ));
+            out.push("d = D()".into());
+            out.push(
+                "print(D.__name__, d.x, d.greet(), type(D).__name__, isinstance(d, D))".into(),
+            );
+        }
+        2 => {
+            // Metaclass `__new__` injecting a namespace entry.
+            out.push("class Meta(type):".into());
+            out.push("    def __new__(mcs, name, bases, ns):".into());
+            out.push(format!("        ns['tag'] = {a}"));
+            out.push("        return super().__new__(mcs, name, bases, ns)".into());
+            out.push("class C(metaclass=Meta): pass".into());
+            out.push("print(C.tag, type(C).__name__)".into());
+        }
+        3 => {
+            // Metaclass `__init__` + propagation to a subclass.
+            out.push("class Meta(type):".into());
+            out.push("    def __init__(cls, name, bases, ns):".into());
+            out.push(format!("        cls.marker = {a}"));
+            out.push("        super().__init__(name, bases, ns)".into());
+            out.push("class C(metaclass=Meta): pass".into());
+            out.push("class D(C): pass".into());
+            out.push("print(C.marker, D.marker, type(D).__name__)".into());
+        }
+        4 => {
+            // Metaclass `__call__` wrapping instantiation.
+            out.push("class Meta(type):".into());
+            out.push("    def __call__(cls, *a, **k):".into());
+            out.push("        obj = super().__call__(*a, **k)".into());
+            out.push(format!("        obj.extra = {b}"));
+            out.push("        return obj".into());
+            out.push("class C(metaclass=Meta):".into());
+            out.push("    def __init__(self, v): self.v = v".into());
+            out.push(format!("c = C({a})"));
+            out.push("print(c.v, c.extra)".into());
+        }
+        5 => {
+            // `__init_subclass__` with class-header keywords + cooperative super.
+            out.push("class Base:".into());
+            out.push("    def __init_subclass__(cls, **kw):".into());
+            out.push("        cls.tags = tuple(sorted(kw.items()))".into());
+            out.push("        super().__init_subclass__()".into());
+            out.push(format!("class C(Base, x={a}, y={b}): pass"));
+            out.push("class D(Base): pass".into());
+            out.push("print(C.tags, D.tags)".into());
+        }
+        6 => {
+            // `__set_name__` descriptor gets its owner + attribute name.
+            out.push("class Named:".into());
+            out.push("    def __set_name__(self, owner, name):".into());
+            out.push("        self.label = owner.__name__ + '.' + name".into());
+            out.push("    def __get__(self, o, ot): return self.label".into());
+            out.push("class Q:".into());
+            out.push("    field = Named()".into());
+            out.push("print(Q().field)".into());
+        }
+        7 => {
+            // C3 linearization of a diamond: `__mro__` name tuple.
+            out.push("class A: pass".into());
+            out.push("class B(A): pass".into());
+            out.push("class C(A): pass".into());
+            out.push("class D(B, C): pass".into());
+            out.push("print([c.__name__ for c in D.__mro__])".into());
+        }
+        8 => {
+            // `__bases__` of a subclass and of a root class (→ object).
+            out.push("class A: pass".into());
+            out.push("class B(A): pass".into());
+            out.push(
+                "print([x.__name__ for x in B.__bases__], [x.__name__ for x in A.__bases__])".into(),
+            );
+        }
+        9 => {
+            // Metaclass `__instancecheck__` override (duck typing).
+            out.push("class Meta(type):".into());
+            out.push("    def __instancecheck__(cls, inst): return hasattr(inst, 'quack')".into());
+            out.push("class Duck(metaclass=Meta): pass".into());
+            out.push("class RealDuck:".into());
+            out.push("    quack = True".into());
+            out.push(format!(
+                "print(isinstance(RealDuck(), Duck), isinstance({a}, Duck))"
+            ));
+        }
+        10 => {
+            // Metaclass `__subclasscheck__` override.
+            out.push("class Meta(type):".into());
+            out.push("    def __subclasscheck__(cls, sub): return hasattr(sub, 'draw')".into());
+            out.push("class Drawable(metaclass=Meta): pass".into());
+            out.push("class Circle:".into());
+            out.push("    def draw(self): pass".into());
+            out.push("print(issubclass(Circle, Drawable), issubclass(int, Drawable))".into());
+        }
+        11 => {
+            // `__class_getitem__` on a class (`Cls[int]`).
+            out.push("class Box:".into());
+            out.push("    def __class_getitem__(cls, item):".into());
+            out.push("        return (cls.__name__, item.__name__)".into());
+            out.push("print(Box[int], Box[str])".into());
+        }
+        12 => {
+            // Metaclass attribute + method visible through the class.
+            out.push("class Meta(type):".into());
+            out.push(format!("    registry = {a}"));
+            out.push("    def describe(cls): return cls.__name__ + '!'".into());
+            out.push("class C(metaclass=Meta): pass".into());
+            out.push("print(C.registry, C.describe())".into());
+        }
+        13 => {
+            // `isinstance`/`issubclass` with a tuple of classes.
+            out.push("class A: pass".into());
+            out.push("class B(A): pass".into());
+            out.push(format!(
+                "print(isinstance(B(), (A, int)), issubclass(B, (int, A)), isinstance({a}, (str, int)))"
+            ));
+        }
+        14 => {
+            // `__class__` chain: class → metaclass; instance → class.
+            out.push("class M(type): pass".into());
+            out.push("class C(metaclass=M): pass".into());
+            out.push(
+                "print(C.__class__.__name__, type(C).__name__, C().__class__.__name__)".into(),
+            );
+        }
+        _ => {
+            // Metaclass `__new__` recording bases; `issubclass` up the chain.
+            out.push("class Meta(type):".into());
+            out.push("    def __new__(mcs, name, bases, ns):".into());
+            out.push("        ns['base_names'] = tuple(b.__name__ for b in bases)".into());
+            out.push("        return super().__new__(mcs, name, bases, ns)".into());
+            out.push("class A(metaclass=Meta): pass".into());
+            out.push("class B(A): pass".into());
+            out.push("class C(B): pass".into());
+            out.push(
+                "print(A.base_names, B.base_names, C.base_names, issubclass(C, A), type(C).__name__)"
+                    .into(),
+            );
+        }
+    }
+    out
+}
+
 /// `match`/`case` structural pattern matching (PEP 634): literal / capture /
 /// wildcard / dotted-value patterns, sequence (with `*rest`), mapping (with
 /// `**rest`), class patterns (positional via `__match_args__` and keyword),
@@ -3286,6 +3456,7 @@ enum Mode {
     Match,
     Conttail,
     Itertail,
+    Metatype,
 }
 
 const REAL_MODES: &[Mode] = &[
@@ -3335,6 +3506,7 @@ const REAL_MODES: &[Mode] = &[
     Mode::Match,
     Mode::Conttail,
     Mode::Itertail,
+    Mode::Metatype,
 ];
 
 /// Generate the statement list for a seed in the selected mode. `Mixed` rotates
@@ -3391,6 +3563,7 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Match => gen_match(seed),
         Mode::Conttail => gen_conttail(seed),
         Mode::Itertail => gen_itertail(seed),
+        Mode::Metatype => gen_metatype(seed),
     }
 }
 
@@ -3443,6 +3616,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Match => "match",
         Mode::Conttail => "conttail",
         Mode::Itertail => "itertail",
+        Mode::Metatype => "metatype",
     }
 }
 
@@ -3495,6 +3669,7 @@ fn mode_from_name(s: &str) -> Option<Mode> {
         Mode::Match,
         Mode::Conttail,
         Mode::Itertail,
+        Mode::Metatype,
     ];
     ALL.iter().copied().find(|&m| mode_name(m) == s)
 }
