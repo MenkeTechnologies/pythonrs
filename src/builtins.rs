@@ -1198,8 +1198,63 @@ fn b_binop(vm: &mut VM, _: u8) -> Value {
             return finish(vm, res);
         }
     }
+    // `str % args`: pre-resolve any instance / instance-bearing container's
+    // dispatched str()/repr()/ascii() OUTSIDE the host borrow (the host `%`
+    // formatter runs inside the borrow and cannot call back into __str__/__repr__),
+    // then format with the pre-resolved table. Covers `%` and `%=` (desugared).
+    if tag == host::binop::MOD && with_host(|h| matches!(h.get(&a), Some(PyObj::Str(_)))) {
+        let r = str_percent_format(&a, &b);
+        return finish(vm, r);
+    }
     let r = with_host(|h| h.binop(tag, &a, &b));
     finish(vm, r)
+}
+
+/// `str % args` with instance-aware `%s`/`%r`/`%a`. Builds a dispatch table of
+/// pre-resolved `(str, repr, ascii)` for every user instance / instance-bearing
+/// container among the top-level format args (computed here, outside any host
+/// borrow, so `__str__`/`__repr__` can fire), then hands it to the host formatter.
+fn str_percent_format(fmt_val: &Value, args: &Value) -> Result<Value, String> {
+    // The top-level format arguments: tuple elements, mapping values, or the
+    // bare single arg.
+    let items: Vec<Value> = with_host(|h| match h.get(args) {
+        Some(PyObj::Tuple(t)) => t.clone(),
+        Some(PyObj::Dict(d)) => d.values().map(|(_, v)| v.clone()).collect(),
+        _ => vec![args.clone()],
+    });
+    let mut premap: std::collections::HashMap<u32, (String, String, String)> =
+        std::collections::HashMap::new();
+    for it in &items {
+        let Value::Obj(id) = it else { continue };
+        if premap.contains_key(id) {
+            continue;
+        }
+        // Only instances and containers that may hold instances need the
+        // dispatching path; everything else the host renders correctly itself.
+        let needs = with_host(|h| {
+            matches!(
+                h.get(it),
+                Some(PyObj::Instance(_))
+                    | Some(PyObj::List(_))
+                    | Some(PyObj::Tuple(_))
+                    | Some(PyObj::Dict(_))
+                    | Some(PyObj::Set(_))
+                    | Some(PyObj::Frozenset(_))
+            )
+        });
+        if !needs {
+            continue;
+        }
+        let s = py_str(it)?;
+        let r = py_repr(it)?;
+        let a = host::ascii_of(&r);
+        premap.insert(*id, (s, r, a));
+    }
+    let fmt = with_host(|h| match h.get(fmt_val) {
+        Some(PyObj::Str(s)) => s.clone(),
+        _ => String::new(),
+    });
+    with_host(|h| h.str_format_percent(&fmt, args, &premap))
 }
 
 fn b_unary(vm: &mut VM, _: u8) -> Value {

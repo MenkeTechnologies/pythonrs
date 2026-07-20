@@ -318,13 +318,13 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
 - [x] **`%`-operator formatting** — the mini-language (flags/width/precision/`*`/
       `%(name)s`/all conv chars, incl. `%a` ascii-escaped) works and `str % obj` is
       native `str.__mod__`, authoritative over a right operand's `__rmod__` (CPython
-      never returns `NotImplemented` from `str.__mod__`). **Deferral:** `%s`/`%r`/`%a`
-      of a *user instance* does NOT dispatch its `__str__`/`__repr__` (the `%`
-      formatter runs inside the host borrow and can't call back into user code) — it
-      prints `<C object>` where CPython uses the dunder. Exception instances format
-      correctly (host-side arms). f-strings and `str.format` DO dispatch these dunders
-      (`format_field` runs out of borrow); prefer them. Fixing `%` faithfully requires
-      moving the formatter out of the borrow like `format_field`.
+      never returns `NotImplemented` from `str.__mod__`). **FIXED:** `%s`/`%r`/`%a` of
+      a *user instance* (and of a container holding instances) now dispatch its
+      `__str__`/`__repr__`/`ascii(repr)` — `b_binop` pre-resolves each format arg's
+      dispatched `(str, repr, ascii)` *outside* the host borrow into a table keyed by
+      heap id and threads it into `str_format_percent`/`format_conv`, so the formatter
+      no longer prints `<C object>`. Covers `%` and `%=`. Byte-verified vs CPython
+      (instance, container, mixed tuple, mapping, width/precision).
 - [ ] **`str.format` / f-string advanced spec** — nested fields `'{:{}}'`/`'{:.{}f}'`
       (and f-string `f'{x:{w}.2f}'`) drop the spec; keyword `'{name}'`, index `'{0[0]}'`,
       attribute `'{0.imag}'` fields → `None`; the `=` debug specifier `f'{x=}'` is a **`SyntaxError`**;
