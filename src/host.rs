@@ -730,6 +730,27 @@ impl PyHost {
     pub fn new_set(&mut self, items: IndexMap<PKey, Value>) -> Value {
         self.alloc(PyObj::Set(items))
     }
+    /// A set/frozenset's elements in CPython iteration/`repr` order. For a set
+    /// whose every key is a plain machine int this is the open-addressing table
+    /// order (`{3, 1, 2}` → `1, 2, 3`); any other element type falls back to
+    /// insertion order (CPython randomizes those hashes, so no fixed order can
+    /// match byte-for-byte).
+    pub fn set_ordered_values(&self, s: &IndexMap<PKey, Value>) -> Vec<Value> {
+        let mut hashes = Vec::with_capacity(s.len());
+        for k in s.keys() {
+            match k {
+                PKey::Int(n) => hashes.push(cpython_int_hash(*n)),
+                // Not the deterministic subset: keep insertion order.
+                _ => return s.values().cloned().collect(),
+            }
+        }
+        let vals: Vec<&Value> = s.values().collect();
+        cpython_set_order(&hashes)
+            .into_iter()
+            .map(|i| vals[i].clone())
+            .collect()
+    }
+
     pub fn new_frozenset(&mut self, items: IndexMap<PKey, Value>) -> Value {
         self.alloc(PyObj::Frozenset(items))
     }
@@ -1312,7 +1333,11 @@ impl PyHost {
                     if s.is_empty() {
                         "set()".into()
                     } else {
-                        let inner: Vec<String> = s.values().map(|x| self.repr_of(x)).collect();
+                        let inner: Vec<String> = self
+                            .set_ordered_values(s)
+                            .iter()
+                            .map(|x| self.repr_of(x))
+                            .collect();
                         format!("{{{}}}", inner.join(", "))
                     }
                 }
@@ -1320,7 +1345,11 @@ impl PyHost {
                     if s.is_empty() {
                         "frozenset()".into()
                     } else {
-                        let inner: Vec<String> = s.values().map(|x| self.repr_of(x)).collect();
+                        let inner: Vec<String> = self
+                            .set_ordered_values(s)
+                            .iter()
+                            .map(|x| self.repr_of(x))
+                            .collect();
                         format!("frozenset({{{}}})", inner.join(", "))
                     }
                 }
@@ -1546,6 +1575,122 @@ pub fn dict_put(d: &mut IndexMap<PKey, (Value, Value)>, key: PKey, kv: Value, va
 /// object (`{1, 1.0, True}` → `{1}`).
 pub fn set_put(s: &mut IndexMap<PKey, Value>, key: PKey, item: Value) {
     s.entry(key).or_insert(item);
+}
+
+// ── CPython set iteration order (`setobject.c`) ──────────────────────────────
+//
+// A set/frozenset iterates (and reprs) in open-addressing table order, not
+// insertion order. For a set of plain machine ints that order is deterministic
+// (`hash(n) == n`, bar `hash(-1) == -2`), so pythonrs reproduces it faithfully.
+// String/other-object hashes are per-process randomized in CPython (SipHash with
+// a random key), so no interpreter can match them byte-for-byte across runs —
+// those sets stay in insertion order (the documented boundary).
+
+const SET_MINSIZE: usize = 8;
+const SET_LINEAR_PROBES: usize = 9;
+const SET_PERTURB_SHIFT: u32 = 5;
+
+/// CPython's `hash()` for a machine int: the value itself, except `-1` maps to
+/// `-2` (`-1` is CPython's error sentinel for `tp_hash`).
+fn cpython_int_hash(n: i64) -> i64 {
+    if n == -1 {
+        -2
+    } else {
+        n
+    }
+}
+
+/// A faithful port of CPython `setobject.c`'s open-addressing table, restricted
+/// to what iteration order needs: it places each element (given by its hash and
+/// its original insertion index) and reports the final slot order. Elements are
+/// already distinct (deduped by `PKey`), so the equality branch never fires.
+struct SetTable {
+    slots: Vec<Option<(i64, usize)>>,
+    mask: usize,
+    fill: usize,
+    used: usize,
+}
+
+impl SetTable {
+    fn new() -> SetTable {
+        SetTable {
+            slots: vec![None; SET_MINSIZE],
+            mask: SET_MINSIZE - 1,
+            fill: 0,
+            used: 0,
+        }
+    }
+
+    /// Probe for the first empty slot for `hash` (CPython perturb + linear-probe
+    /// sequence). All live elements are distinct, so we never match an occupant.
+    fn find_empty(slots: &[Option<(i64, usize)>], mask: usize, hash: i64) -> usize {
+        let mut perturb = hash as u64;
+        let mut i = (hash as u64 as usize) & mask;
+        loop {
+            let probes = if i + SET_LINEAR_PROBES <= mask {
+                SET_LINEAR_PROBES
+            } else {
+                0
+            };
+            for (entry, slot) in slots.iter().enumerate().skip(i).take(probes + 1) {
+                if slot.is_none() {
+                    return entry;
+                }
+            }
+            perturb >>= SET_PERTURB_SHIFT;
+            i = (i
+                .wrapping_mul(5)
+                .wrapping_add(1)
+                .wrapping_add(perturb as usize))
+                & mask;
+        }
+    }
+
+    fn add(&mut self, hash: i64, idx: usize) {
+        let slot = Self::find_empty(&self.slots, self.mask, hash);
+        self.slots[slot] = Some((hash, idx));
+        self.fill += 1;
+        self.used += 1;
+        // Grow when the table is ~3/5 full (CPython `fill*5 >= mask*3`).
+        if self.fill * 5 >= self.mask * 3 {
+            let minused = if self.used > 50000 {
+                self.used * 2
+            } else {
+                self.used * 4
+            };
+            self.resize(minused);
+        }
+    }
+
+    fn resize(&mut self, minused: usize) {
+        let mut newsize = SET_MINSIZE;
+        while newsize <= minused {
+            newsize <<= 1;
+        }
+        let old = std::mem::replace(&mut self.slots, vec![None; newsize]);
+        self.mask = newsize - 1;
+        self.fill = self.used;
+        // Reinsert the live entries in old-table slot order (`set_insert_clean`).
+        for entry in old.into_iter().flatten() {
+            let (hash, idx) = entry;
+            let slot = Self::find_empty(&self.slots, self.mask, hash);
+            self.slots[slot] = Some((hash, idx));
+        }
+    }
+}
+
+/// The original-insertion indices of `hashes`, reordered into CPython set
+/// iteration order. `hashes[k]` is the CPython hash of the `k`-th inserted
+/// element.
+fn cpython_set_order(hashes: &[i64]) -> Vec<usize> {
+    let mut t = SetTable::new();
+    for (idx, &h) in hashes.iter().enumerate() {
+        t.add(h, idx);
+    }
+    t.slots
+        .iter()
+        .filter_map(|s| s.map(|(_, idx)| idx))
+        .collect()
 }
 
 /// Canonical dict/set key for a float. An integral, finite float normalizes to
@@ -3085,7 +3230,7 @@ impl PyHost {
                     .collect();
                 Ok(chars)
             }
-            Some(PyObj::Set(s)) | Some(PyObj::Frozenset(s)) => Ok(s.values().cloned().collect()),
+            Some(PyObj::Set(s)) | Some(PyObj::Frozenset(s)) => Ok(self.set_ordered_values(s)),
             Some(PyObj::Dict(d)) => Ok(d.values().map(|(k, _)| k.clone()).collect()),
             Some(PyObj::Range { start, stop, step }) => {
                 let (start, stop, step) = (*start, *stop, *step);
@@ -3148,7 +3293,7 @@ impl PyHost {
                 idx: 0,
             },
             Some(PyObj::Set(s)) | Some(PyObj::Frozenset(s)) => IterState::Seq {
-                items: s.values().cloned().collect(),
+                items: self.set_ordered_values(s),
                 idx: 0,
             },
             Some(PyObj::Dict(d)) => IterState::DictKeys {

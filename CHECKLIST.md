@@ -345,8 +345,20 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
       `issubset`/`issuperset` now also accept any iterable.
 - [ ] **`type([])`/`type({})`/… print `<built-in function list>`** not `<class 'list'>`;
       instance dunders `[].__class__`/`[].__len__()` and unbound `str.lower` unavailable.
-- [ ] **set repr ordering** — insertion order vs CPython hash order (impl-defined but
-      observable in any set repr). Tuple/frozenset `hash()` values differ.
+- [x] **set repr ordering** — FIXED for the deterministic subset: `set`/`frozenset`
+      of machine ints now repr and iterate in CPython's open-addressing table order
+      (`setobject.c` faithful port — `set_add_entry` perturb+`LINEAR_PROBES`, the
+      `fill*5 >= mask*3` grow trigger, `used*4` resize target, and `set_insert_clean`
+      reinsertion; `hash(n) == n` bar `hash(-1) == -2`). `{3,1,2}` → `{1, 2, 3}`,
+      `set([9,1,17,25,33])` → `{33, 1, 9, 17, 25}`, verified 0-diff vs `python3`
+      across 120+ random int sets and every `set(iterable)` form. Boundary (noted,
+      not faked): (a) string/other-object sets stay in insertion order — CPython
+      SipHash-randomizes those per process, so no fixed order matches byte-for-byte;
+      (b) a *constant* set **literal** with 5+ colliding ints (e.g. `{9,1,17,25,33}`)
+      can differ, because CPython's compiler folds a constant set display to a
+      presized `frozenset` constant, which lays out differently than the incremental
+      build pythonrs (and `set(list)`) performs. Tuple/frozenset `hash()` values still
+      differ (not observable in repr).
 
 **Corpus-caught composite gaps** (found by `dropin_check.sh`, not the per-expression fuzzer):
 - [ ] **`sorted`/`.sort(key=…)` is not stable on ties** — Python guarantees a stable
