@@ -622,6 +622,46 @@ pub fn contains(host: &mut PyHost, id: u32, item: &Value) -> Result<bool, String
     })
 }
 
+/// A binary/comparison operator (`+ - * / // % ** @ & | ^ << >>`,
+/// `== != < <= > >=`) where at least one operand is a `Foreign` CPython object.
+///
+/// `func` is the corresponding `operator`-module attribute (`add`, `truediv`,
+/// `mod`, `and_`, `lshift`, `lt`, `eq`, …). Both operands are marshaled to CPython
+/// (a native operand crosses by value via the in-marshaler; a `Foreign` passes its
+/// underlying object straight through), the real CPython operation runs, and the
+/// result marshals back — by value when representable, else a fresh `Foreign`
+/// (so `date + timedelta` → a CPython `date`, `Decimal + Decimal` → an exact
+/// `Decimal`, `datetime < datetime` → a `bool`). A `TypeError`/`NotImplemented`
+/// from CPython surfaces as a pythonrs error string, never a bridge panic.
+pub fn binary_op(host: &mut PyHost, func: &str, a: &Value, b: &Value) -> Result<Value, String> {
+    Python::with_gil(|py| {
+        let pa = value_to_py(host, py, a)?;
+        let pb = value_to_py(host, py, b)?;
+        let op = py
+            .import("operator")
+            .and_then(|m| m.getattr(func))
+            .map_err(|e| e.to_string())?;
+        let res = op.call1((pa, pb)).map_err(|e| e.to_string())?;
+        py_to_value(host, py, &res)
+    })
+}
+
+/// A unary operator on a `Foreign` CPython object: negation (`-x` → `neg`), unary
+/// plus (`+x` → `pos`), bitwise invert (`~x` → `invert`), or `abs(x)` (`abs`).
+/// `func` is the `operator`-module attribute; the CPython result marshals back the
+/// same way as [`binary_op`].
+pub fn unary_op(host: &mut PyHost, func: &str, v: &Value) -> Result<Value, String> {
+    Python::with_gil(|py| {
+        let pv = value_to_py(host, py, v)?;
+        let op = py
+            .import("operator")
+            .and_then(|m| m.getattr(func))
+            .map_err(|e| e.to_string())?;
+        let res = op.call1((pv,)).map_err(|e| e.to_string())?;
+        py_to_value(host, py, &res)
+    })
+}
+
 /// `len(foreign)`.
 pub fn len(id: u32) -> Result<usize, String> {
     Python::with_gil(|py| {

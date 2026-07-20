@@ -2040,6 +2040,10 @@ pub fn call_builtin_function(
                     Some(PyObj::Complex(r, i)) => Ok(Value::Float(r.hypot(*i))),
                     _ => unreachable!(),
                 },
+                // A CPython `Foreign` object (stdlib-ffi): `abs(Decimal(...))`,
+                // `abs(timedelta(...))`, … dispatch to the real `__abs__`.
+                #[cfg(feature = "stdlib-ffi")]
+                Value::Obj(_) if h.foreign_id(&v).is_some() => crate::ffi::unary_op(h, "abs", &v),
                 _ => Err(host::type_error(&format!(
                     "bad operand type for abs(): '{}'",
                     h.type_name(&v)

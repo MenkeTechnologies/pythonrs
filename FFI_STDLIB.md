@@ -59,7 +59,15 @@ delegates to CPython.
    Route `get_attr`/`call`/`__getitem__`/`__iter__`/`__next__`/`str`/`repr`/`len`/
    `__contains__` on a Foreign through pyo3 (marshal args in, result out). pyo3 owns
    refcounts + the GIL. Add `#[cfg(feature)]` arms to the PyObj matches (type_name,
-   str_of, repr_of, truthy, get_attr, dispatch, invoke).
+   str_of, repr_of, truthy, get_attr, dispatch, invoke). **Binary / comparison /
+   unary operators** on a Foreign operand (`+ - * / // % ** @ & | ^ << >>`,
+   `== != < <= > >=`, unary `- + ~ abs`) route through `ffi::binary_op`/`unary_op`,
+   which marshal both operands (a native operand crosses by value) and call
+   CPython's `operator.<fn>`; the result marshals back by value or as a fresh
+   `Foreign`. Minimal `#[cfg(feature)]` hooks live at the top of `PyHost::arith`
+   (`+ - *`, comparisons, unary `-`), `PyHost::binop` (`/ // % ** @ & | ^ << >>`),
+   `PyHost::unary` (`~`, unary `+`), and the `abs` builtin. A CPython
+   `TypeError`/`NotImplemented` surfaces as a pythonrs error, never a panic.
 
 4. **`host::import_module`** — on the current miss (before `ModuleNotFoundError`), if
    `stdlib-ffi`, try `ffi::import(name)` → wrap as a `Module` whose attrs are Foreign
