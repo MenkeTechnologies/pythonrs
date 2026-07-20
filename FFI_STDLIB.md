@@ -37,9 +37,23 @@ delegates to CPython.
      / `PYTHONHOME` before `Py_Initialize`.
    - `import(name) -> Result<ForeignHandle, String>`: `Python::with_gil(|py| py.import(name))`,
      store the `Py<PyAny>` in a host side-table, return an id.
-   - Marshal helpers: pythonrs `Value` ↔ CPython object. By value for int/float/bool/None/
-     str/bytes/list/tuple/dict/set. By handle (`PyObj::Foreign`) for everything else
-     (compiled regex, datetime, socket, file, …).
+   - Marshal helpers: pythonrs `Value` ↔ CPython object. By value in *both*
+     directions for int/float/bool/None/str/bytes/list/tuple/dict/set, plus (in) a
+     bytearray→CPython `bytearray`, range, complex, `collections.deque`, and
+     frozenset. By handle (`PyObj::Foreign`) for everything else (compiled regex,
+     datetime, socket, file, …). **In-place mutation write-back:** after a call, a
+     by-value mutable-container argument (`list`/`bytearray`/`deque`) is re-read from
+     its CPython object and the pythonrs heap slot is overwritten in place, so
+     in-place stdlib mutators (`heapq.heapify`, `random.shuffle`, `struct.pack_into`)
+     reflect back and aliases observe them. Write-back marshals by value only (never
+     allocates a `Foreign`), so it does not grow the side-table.
+   - **Handle lifetime (known limit):** the side-table is bounded for the
+     value-marshaled path but *not* reclaimed for stdlib calls that return a live
+     CPython object (`re.match` results, datetime, files) — each takes a permanent
+     slot, growing 1:1 with the pythonrs host heap. The host heap is an arena that
+     never frees any object and `PyObj::Foreign` carries only a bare id, so the
+     bridge has no drop signal and cannot safely reclaim. Real reclamation needs a
+     `Foreign`-drop callback / arena GC in `host.rs` (out of the bridge's scope).
 
 3. **`PyObj::Foreign(u32)`** (`#[cfg(feature)]` variant → id into the ffi side-table).
    Route `get_attr`/`call`/`__getitem__`/`__iter__`/`__next__`/`str`/`repr`/`len`/
