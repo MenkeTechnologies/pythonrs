@@ -1744,6 +1744,132 @@ fn gen_complexnum(seed: u64) -> Vec<String> {
     }
 }
 
+/// Numeric edge cases — the corners of `int`/`float`/`complex`/`bool` semantics:
+/// IEEE-754 specials (`inf`/`-inf`/`nan`, signed zero, overflow), banker's
+/// `round`, `pow` (2-arg / 3-arg incl. negative-exponent modular inverse),
+/// `divmod` and `//`/`%` sign rules for int AND float, base conversions
+/// (`bin`/`oct`/`hex`, `int(s, base)`), and the `__index__`/`__int__`/`__float__`/
+/// `__bool__` protocols. Every case prints a value/`repr` (no exceptions), so
+/// output is byte-stable across interpreters.
+fn gen_numedge(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    // Small signed ints and floats with deterministic reprs.
+    const SI: &[&str] = &["7", "-7", "3", "-3", "10", "-10", "42", "-42", "1", "-1", "0"];
+    const SD: &[&str] = &["3", "-3", "2", "-2", "4", "-4", "5", "-5"];
+    const FL: &[&str] = &[
+        "7.5", "-7.5", "2.5", "-2.5", "0.5", "-0.5", "10.25", "-10.25", "3.0", "1.5",
+    ];
+    const PRIMES: &[&str] = &["7", "11", "13", "17"];
+    let a = pick(r, SI);
+    let b = pick(r, SD);
+    let f = pick(r, FL);
+    let g = pick(r, SD);
+    match r.below(20) {
+        // ── IEEE-754 specials & signed zero ──────────────────────────────────
+        0 => vec![format!(
+            "print(float('inf'), float('-inf'), float('nan'))\n\
+             print(float('inf') > 1e308, float('nan') == float('nan'), float('nan') != float('nan'))\n\
+             print(float('inf') + 1, float('inf') - float('inf'), float('nan') + 1)"
+        )],
+        1 => vec![format!(
+            "print(repr(-0.0), repr(0.0), 0.0 == -0.0, repr(-0.0) == repr(0.0))\n\
+             print(1e308 * 10, -1e308 * 10, repr(float('inf')))\n\
+             print(round(-0.0), repr(round(-0.0)))"
+        )],
+        // ── round: banker's rounding, arg count, negative ndigits ────────────
+        2 => vec![format!(
+            "print(round(0.5), round(1.5), round(2.5), round(3.5), round(-0.5), round(-1.5), round(-2.5))"
+        )],
+        3 => vec![format!(
+            "print(round({f}), round({f}, 1), round({f}, 0), round({f}, 2))"
+        )],
+        4 => {
+            let n = pick(r, &["1234567", "-1234567", "15", "25", "-15", "250"]);
+            let d = pick(r, &["-1", "-2", "-3"]);
+            vec![format!("print(round({n}, {d}), round({n}))")]
+        }
+        5 => vec![format!(
+            "print(round(0.125, 2), round(0.375, 2), round(2.675, 2), round(1.005, 2))"
+        )],
+        // ── pow: 2-arg, 3-arg, negative-exponent modular inverse ─────────────
+        6 => {
+            let base = pick(r, &["2", "3", "4", "5"]);
+            let e = pick(r, &["2", "3", "8", "10", "0"]);
+            vec![format!(
+                "print(pow({base}, {e}), {base} ** {e}, pow({base}, {e}, 1000))"
+            )]
+        }
+        7 => {
+            // Negative-exponent modular inverse; base coprime with prime modulus.
+            let base = pick(r, &["2", "3", "4", "5", "6"]);
+            let m = pick(r, PRIMES);
+            vec![format!("print(pow({base}, -1, {m}), pow({base}, -3, {m}))")]
+        }
+        8 => vec![format!(
+            "print(2 ** 0.5, 4 ** 0.5, 2 ** -2, 2 ** -3, (-2) ** 2, -2 ** 2, 2 ** 3 ** 2)"
+        )],
+        // ── divmod / floordiv / mod sign conventions (int) ───────────────────
+        9 => vec![format!(
+            "print(divmod({a}, {b}), {a} // {b}, {a} % {b})"
+        )],
+        10 => vec![format!(
+            "print(7 // 3, -7 // 3, 7 // -3, -7 // -3, 7 % 3, -7 % 3, 7 % -3, -7 % -3)"
+        )],
+        // ── divmod / floordiv / mod (float) ──────────────────────────────────
+        11 => vec![format!(
+            "print(divmod({f}, {g}), {f} // {g}, {f} % {g})"
+        )],
+        12 => vec![format!(
+            "print(7.5 // 2, -7.5 // 2, 7.5 % 2, -7.5 % 2, 10.5 % -3, -10.5 % 3)"
+        )],
+        // ── base conversions ─────────────────────────────────────────────────
+        13 => {
+            let n = pick(r, &["255", "-255", "10", "-10", "4096", "0"]);
+            vec![format!("print(bin({n}), oct({n}), hex({n}))")]
+        }
+        14 => vec![format!(
+            "print(int('ff', 16), int('-1010', 2), int('777', 8), int('0x1f', 16), int('1_000'), 0x1f, 0o17, 0b1010)"
+        )],
+        15 => vec![format!(
+            "print(int({f}), int(-{f}), int(2.0 ** 60), float('1.5e3'), float('  2.5  '), float('1_000'))"
+        )],
+        // ── complex arithmetic & attributes ──────────────────────────────────
+        16 => {
+            let (x, y, z, w) = (1 + r.below(5), 1 + r.below(5), 1 + r.below(5), 1 + r.below(5));
+            vec![format!(
+                "print(({x}+{y}j) + ({z}+{w}j), ({x}+{y}j) * ({z}+{w}j), ({x}+{y}j) / ({z}+{w}j))"
+            )]
+        }
+        17 => {
+            let (x, y) = (1 + r.below(6), 1 + r.below(6));
+            vec![format!(
+                "z = complex({x}, -{y})\nprint(z.real, z.imag, z.conjugate(), abs(z), ({x}+{y}j) ** 2)"
+            )]
+        }
+        // ── __index__ protocol (bin/hex/subscript) ───────────────────────────
+        18 => {
+            let k = 2 + r.below(4);
+            vec![format!(
+                "class Idx:\n    def __index__(self): return {k}\ni = Idx()\n\
+                 print(bin(i), hex(i), oct(i), int(i), float(i))\n\
+                 print([0,10,20,30,40,50,60][i], 'abcdefgh'[i], (5,6,7,8,9,10)[i], range(30)[i])"
+            )]
+        }
+        // ── __int__ / __float__ / __bool__ / abs / unary ─────────────────────
+        _ => {
+            let iv = pick(r, SI);
+            let fv = pick(r, FL);
+            vec![format!(
+                "class N:\n    def __int__(self): return {iv}\nclass F:\n    def __float__(self): return {fv}\nclass B:\n    def __bool__(self): return {}\n\
+                 print(int(N()), float(F()), bool(B()))\n\
+                 print(abs({iv}), abs({fv}), -{iv}, +{fv}, abs(3+4j))\n\
+                 print(int(True), int(False), True + 1, float(True), bool(0), bool(0.0), bool(0j))",
+                if r.below(2) == 0 { "True" } else { "False" }
+            )]
+        }
+    }
+}
+
 /// Exception chaining: `raise X from Y` (`__cause__`) and implicit `__context__`
 /// during handling. Output is deterministic type names / booleans.
 fn gen_exceptions2(seed: u64) -> Vec<String> {
@@ -2730,6 +2856,7 @@ enum Mode {
     Dictset,
     Itertools,
     Complexnum,
+    Numedge,
     Exceptions2,
     Exceptions3,
     Exceptions4,
@@ -2776,6 +2903,7 @@ const REAL_MODES: &[Mode] = &[
     Mode::Dictset,
     Mode::Itertools,
     Mode::Complexnum,
+    Mode::Numedge,
     Mode::Exceptions2,
     Mode::Exceptions3,
     Mode::Exceptions4,
@@ -2829,6 +2957,7 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Dictset => gen_dictset(seed),
         Mode::Itertools => gen_itertools(seed),
         Mode::Complexnum => gen_complexnum(seed),
+        Mode::Numedge => gen_numedge(seed),
         Mode::Exceptions2 => gen_exceptions2(seed),
         Mode::Exceptions3 => gen_exceptions3(seed),
         Mode::Exceptions4 => gen_exceptions4(seed),
@@ -2878,6 +3007,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Dictset => "dictset",
         Mode::Itertools => "itertools",
         Mode::Complexnum => "complexnum",
+        Mode::Numedge => "numedge",
         Mode::Exceptions2 => "exceptions2",
         Mode::Exceptions3 => "exceptions3",
         Mode::Exceptions4 => "exceptions4",
@@ -2927,6 +3057,7 @@ fn mode_from_name(s: &str) -> Option<Mode> {
         Mode::Dictset,
         Mode::Itertools,
         Mode::Complexnum,
+        Mode::Numedge,
         Mode::Exceptions2,
         Mode::Exceptions3,
         Mode::Exceptions4,
