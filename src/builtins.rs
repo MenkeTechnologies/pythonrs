@@ -429,6 +429,17 @@ fn b_getitem(vm: &mut VM, _: u8) -> Value {
             }
         }
     }
+    // A non-dict index that is an instance with `__index__` stands in for an int
+    // (`seq[obj]`). Resolve it before indexing; dict lookups key on the object.
+    let idx = if with_host(|h| !matches!(h.get(&recv), Some(PyObj::Dict(_)))) {
+        match index_dunder(&idx) {
+            Ok(Some(v)) => v,
+            Ok(None) => idx,
+            Err(e) => return abort(vm, e),
+        }
+    } else {
+        idx
+    };
     let cands = host::instance_key_candidates(&recv);
     let r = host::with_instance_key(&idx, &cands, || with_host(|h| h.get_item(&recv, &idx)));
     finish(vm, r)
@@ -846,6 +857,38 @@ fn b_truthy(vm: &mut VM, _: u8) -> Value {
 
 fn instance_has(h: &host::PyHost, i: &Instance, name: &str) -> bool {
     h.class_lookup(&i.class, name).is_some()
+}
+
+/// Whether `r` is an integer value (`int`/`bool`/bignum) — the required return
+/// type of `__index__`/`__int__`.
+fn is_int_value(r: &Value) -> bool {
+    with_host(|h| match r {
+        Value::Int(_) | Value::Bool(_) => true,
+        Value::Obj(_) => matches!(h.get(r), Some(PyObj::BigInt(_))),
+        _ => false,
+    })
+}
+
+/// CPython's `__index__` protocol: if `v` is an instance defining `__index__`,
+/// call it and require an integer result. Returns `Ok(Some(int))` when resolved,
+/// `Ok(None)` when `v` is not an instance with `__index__`, `Err(..)` when the
+/// method raised or returned a non-int. Used by `bin`/`hex`/`oct` and sequence
+/// indexing, where any object may stand in for an integer.
+fn index_dunder(v: &Value) -> Result<Option<Value>, String> {
+    let has = with_host(
+        |h| matches!(h.get(v), Some(PyObj::Instance(i)) if instance_has(h, i, "__index__")),
+    );
+    if !has {
+        return Ok(None);
+    }
+    let r = host::call_method(v, "__index__", vec![], vec![])?;
+    if !is_int_value(&r) {
+        let t = with_host(|h| h.type_name(&r));
+        return Err(host::type_error(&format!(
+            "__index__ returned non-int (type {t})"
+        )));
+    }
+    Ok(Some(r))
 }
 
 fn b_tostr(vm: &mut VM, _: u8) -> Value {
@@ -3135,11 +3178,20 @@ fn pow_mod(a: &Value, b: &Value, m: &Value) -> Result<Value, String> {
     if modulus == zero {
         return Err("ValueError: pow() 3rd argument cannot be 0".into());
     }
-    if exp < zero {
-        return Err(
-            "ValueError: pow() 2nd argument cannot be negative when 3rd argument specified".into(),
-        );
-    }
+    // Negative exponent → modular inverse of `base` (CPython 3.8+):
+    // `pow(base, -k, m) == pow(modinv(base, m), k, m)`.
+    let (base, exp) = if exp < zero {
+        use num_integer::Integer;
+        let m_abs = if modulus < zero { -&modulus } else { modulus.clone() };
+        let base_r = base.mod_floor(&m_abs);
+        let egcd = base_r.extended_gcd(&m_abs);
+        if egcd.gcd != BigInt::from(1) {
+            return Err("ValueError: base is not invertible for the given modulus".into());
+        }
+        (egcd.x.mod_floor(&m_abs), -exp)
+    } else {
+        (base, exp)
+    };
     // `modpow` reduces modulo `|modulus|`; re-apply a floored mod so the sign
     // matches Python (result sign == modulus sign).
     let raw = base.modpow(&exp, &modulus);
@@ -3377,8 +3429,15 @@ fn round_float(f: f64, has_nd: bool, nd: Option<i64>) -> Result<Value, String> {
 
 fn int_radix(args: &[Value], radix: u32, prefix: &str) -> Result<Value, String> {
     let a0 = arg0(args)?;
-    let n = with_host(|h| h.big_val(&a0))
-        .ok_or_else(|| host::type_error("'float' object cannot be interpreted as an integer"))?;
+    // `bin`/`hex`/`oct` accept anything with `__index__`.
+    let a0 = match index_dunder(&a0)? {
+        Some(v) => v,
+        None => a0,
+    };
+    let n = with_host(|h| h.big_val(&a0)).ok_or_else(|| {
+        let t = with_host(|h| h.type_name(&a0));
+        host::type_error(&format!("'{t}' object cannot be interpreted as an integer"))
+    })?;
     use num_bigint::Sign;
     let sign = if n.sign() == Sign::Minus { "-" } else { "" };
     let body = n.magnitude().to_str_radix(radix);
@@ -3390,6 +3449,25 @@ fn construct_int(args: &[Value]) -> Result<Value, String> {
         Some(v) => v.clone(),
         None => return Ok(Value::Int(0)),
     };
+    // `int(x)` with no explicit base honors `__int__`, then `__index__`.
+    if args.len() < 2 {
+        let has_int = with_host(
+            |h| matches!(h.get(&v), Some(PyObj::Instance(i)) if instance_has(h, i, "__int__")),
+        );
+        if has_int {
+            let r = host::call_method(&v, "__int__", vec![], vec![])?;
+            if !is_int_value(&r) {
+                let t = with_host(|h| h.type_name(&r));
+                return Err(host::type_error(&format!(
+                    "__int__ returned non-int (type {t})"
+                )));
+            }
+            return Ok(r);
+        }
+        if let Some(r) = index_dunder(&v)? {
+            return Ok(r);
+        }
+    }
     let base = args
         .get(1)
         .and_then(|b| with_host(|h| h.as_int(b)))
@@ -3419,9 +3497,12 @@ fn construct_int(args: &[Value]) -> Result<Value, String> {
         }
         Value::Obj(_) if matches!(h.get(&v), Some(PyObj::BigInt(_))) => Ok(v.clone()),
         _ => {
-            let s = h
-                .as_str(&v)
-                .ok_or_else(|| host::type_error("int() argument must be a string or a number"))?;
+            let s = h.as_str(&v).ok_or_else(|| {
+                host::type_error(&format!(
+                    "int() argument must be a string, a bytes-like object or a real number, not '{}'",
+                    h.type_name(&v)
+                ))
+            })?;
             let orig = s.clone();
             let s = s.trim();
             let (neg, rest) = if let Some(r) = s.strip_prefix('-') {
@@ -3547,6 +3628,36 @@ fn construct_float(args: &[Value]) -> Result<Value, String> {
         Some(v) => v.clone(),
         None => return Ok(Value::Float(0.0)),
     };
+    // `float(x)` honors `__float__`, then `__index__`.
+    let has_float = with_host(
+        |h| matches!(h.get(&v), Some(PyObj::Instance(i)) if instance_has(h, i, "__float__")),
+    );
+    if has_float {
+        let r = host::call_method(&v, "__float__", vec![], vec![])?;
+        let ok = matches!(r, Value::Float(_));
+        if !ok {
+            let t = with_host(|h| h.type_name(&r));
+            return Err(host::type_error(&format!(
+                "__float__ returned non-float (type {t})"
+            )));
+        }
+        return Ok(r);
+    }
+    if let Some(r) = index_dunder(&v)? {
+        // An `__index__` int converts to float.
+        let f = with_host(|h| {
+            use num_traits::ToPrimitive;
+            match &r {
+                Value::Int(n) => *n as f64,
+                Value::Bool(b) => *b as i64 as f64,
+                _ => match h.big_val(&r) {
+                    Some(b) => b.to_f64().unwrap_or(f64::INFINITY),
+                    None => 0.0,
+                },
+            }
+        });
+        return Ok(Value::Float(f));
+    }
     with_host(|h| match &v {
         Value::Int(n) => Ok(Value::Float(*n as f64)),
         Value::Float(f) => Ok(Value::Float(*f)),
@@ -3559,9 +3670,12 @@ fn construct_float(args: &[Value]) -> Result<Value, String> {
             }
         }
         _ => {
-            let s = h
-                .as_str(&v)
-                .ok_or_else(|| host::type_error("float() argument must be a string or a number"))?;
+            let s = h.as_str(&v).ok_or_else(|| {
+                host::type_error(&format!(
+                    "float() argument must be a string or a real number, not '{}'",
+                    h.type_name(&v)
+                ))
+            })?;
             // Underscores may group digits (`float("1_000.5")`).
             let cleaned = s.trim().replace('_', "");
             match cleaned.as_str() {

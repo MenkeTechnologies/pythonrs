@@ -2367,6 +2367,69 @@ pub fn fmt_float(f: f64) -> String {
     }
 }
 
+/// Float `//` and `%`, ported from CPython's `float_divmod` (floatobject.c).
+/// Uses `fmod` (not `x - floor(x/y)*y`) and carries the correct signed-zero and
+/// the `div - floordiv > 0.5` correction, matching CPython bit-for-bit. Returns
+/// `(floordiv, mod)`. Caller handles the `wx == 0` (ZeroDivisionError) case.
+fn float_divmod(vx: f64, wx: f64) -> (f64, f64) {
+    let mut mod_ = vx % wx; // C fmod
+    let div = (vx - mod_) / wx;
+    let mut div = div;
+    if mod_ != 0.0 {
+        if (wx < 0.0) != (mod_ < 0.0) {
+            mod_ += wx;
+            div -= 1.0;
+        }
+    } else {
+        // A zero remainder takes the sign of the divisor.
+        mod_ = 0.0_f64.copysign(wx);
+    }
+    let floordiv = if div != 0.0 {
+        let fd = div.floor();
+        if div - fd > 0.5 {
+            fd + 1.0
+        } else {
+            fd
+        }
+    } else {
+        0.0_f64.copysign(vx / wx)
+    };
+    (floordiv, mod_)
+}
+
+/// Complex division, ported from CPython 3.14's `_Py_c_quot` (complexobject.c) —
+/// Smith's algorithm with fused multiply-add. Scaling by the larger-magnitude
+/// divisor component avoids intermediate overflow, and the `fma` (Rust's
+/// `mul_add`) reproduces CPython's rounding bit-for-bit.
+fn c_quot(ar: f64, ai: f64, br: f64, bi: f64) -> (f64, f64) {
+    let abs_br = br.abs();
+    let abs_bi = bi.abs();
+    if abs_br >= abs_bi {
+        // Divide top and bottom by br.
+        if abs_br == 0.0 {
+            (0.0, 0.0)
+        } else {
+            let ratio = bi / br;
+            let denom = bi.mul_add(ratio, br); // br + bi*ratio
+            (
+                ai.mul_add(ratio, ar) / denom,   // (ar + ai*ratio)/denom
+                (-ar).mul_add(ratio, ai) / denom, // (ai - ar*ratio)/denom
+            )
+        }
+    } else if abs_bi >= abs_br {
+        // Divide top and bottom by bi.
+        let ratio = br / bi;
+        let denom = br.mul_add(ratio, bi); // br*ratio + bi
+        (
+            ar.mul_add(ratio, ai) / denom,  // (ar*ratio + ai)/denom
+            ai.mul_add(ratio, -ar) / denom, // (ai*ratio - ar)/denom
+        )
+    } else {
+        // At least one of br or bi is NaN.
+        (f64::NAN, f64::NAN)
+    }
+}
+
 fn fmt_complex(r: f64, i: f64) -> String {
     // A complex part reprs like a float but drops a trailing `.0` for integral
     // values (`complex(1,2)` → `(1+2j)`, not `(1.0+2.0j)`).
@@ -2895,14 +2958,11 @@ impl PyHost {
                 _ if self.is_complex(a) || self.is_complex(b) => {
                     match (self.complex_val(a), self.complex_val(b)) {
                         (Some((ar, ai)), Some((br, bi))) => {
-                            let d = br * br + bi * bi;
-                            if d == 0.0 {
+                            if br == 0.0 && bi == 0.0 {
                                 return Err("ZeroDivisionError: complex division by zero".into());
                             }
-                            Ok(self.alloc(PyObj::Complex(
-                                (ar * br + ai * bi) / d,
-                                (ai * br - ar * bi) / d,
-                            )))
+                            let (rr, ri) = c_quot(ar, ai, br, bi);
+                            Ok(self.alloc(PyObj::Complex(rr, ri)))
                         }
                         _ => Err(self.optype_err("/", a, b)),
                     }
@@ -2935,7 +2995,7 @@ impl PyHost {
                     (Some(_), Some(0.0)) => {
                         Err("ZeroDivisionError: float floor division by zero".into())
                     }
-                    (Some(x), Some(y)) => Ok(Value::Float((x / y).floor())),
+                    (Some(x), Some(y)) => Ok(Value::Float(float_divmod(x, y).0)),
                     _ => Err(self.optype_err("//", a, b)),
                 }
             }
@@ -2969,7 +3029,7 @@ impl PyHost {
                 }
                 match (af, bf) {
                     (Some(_), Some(0.0)) => Err("ZeroDivisionError: float modulo".into()),
-                    (Some(x), Some(y)) => Ok(Value::Float(x - (x / y).floor() * y)),
+                    (Some(x), Some(y)) => Ok(Value::Float(float_divmod(x, y).1)),
                     _ => Err(self.optype_err("%", a, b)),
                 }
             }
