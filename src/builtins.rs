@@ -5580,8 +5580,10 @@ pub fn apply_format_spec(s: &str, v: &Value, spec: &str) -> String {
     if comma {
         body = add_thousands(&body);
     }
-    if sign == '+' && as_f(v).map(|f| f >= 0.0).unwrap_or(false) {
-        body = format!("+{body}");
+    // A `+` or space sign flag adds a leading `+`/space to a non-negative value
+    // (a negative already carries its own `-`).
+    if matches!(sign, '+' | ' ') && as_f(v).map(|f| f >= 0.0).unwrap_or(false) {
+        body = format!("{sign}{body}");
     }
 
     let len = body.chars().count();
@@ -5601,12 +5603,23 @@ pub fn apply_format_spec(s: &str, v: &Value, spec: &str) -> String {
             )
         }
         '=' => {
-            // sign-aware zero pad
-            if let Some(rest) = body.strip_prefix('-') {
-                format!("-{}{rest}", fill.to_string().repeat(pad))
-            } else {
-                format!("{}{body}", fill.to_string().repeat(pad))
+            // Sign-aware pad: the fill goes AFTER the sign (`+`/`-`/space) and any
+            // radix prefix (`0x`/`0o`/`0b`), so `+05d` of 5 → `+0005` and `#08x` of
+            // -255 → `-0x000ff`.
+            let cs: Vec<char> = body.chars().collect();
+            let mut k = 0;
+            if cs.first().is_some_and(|c| matches!(c, '+' | '-' | ' ')) {
+                k = 1;
             }
+            if cs.len() >= k + 2
+                && cs[k] == '0'
+                && matches!(cs[k + 1], 'x' | 'X' | 'o' | 'O' | 'b' | 'B')
+            {
+                k += 2;
+            }
+            let head: String = cs[..k].iter().collect();
+            let tail: String = cs[k..].iter().collect();
+            format!("{head}{}{tail}", fill.to_string().repeat(pad))
         }
         '>' => format!("{}{body}", fill.to_string().repeat(pad)),
         _ => {

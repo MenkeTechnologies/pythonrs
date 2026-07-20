@@ -925,6 +925,221 @@ fn gen_exceptions2(seed: u64) -> Vec<String> {
     }
 }
 
+/// User exception subclasses: `.args`/`str`/`repr`/message, inheritance chains,
+/// `isinstance`, `super().__init__`, custom `__str__`. Output is deterministic
+/// (fixed messages, no traceback — everything is caught or printed).
+fn gen_exceptions3(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let a = pick(r, WORDS);
+    let b = pick(r, WORDS);
+    let n = pick(r, POSINTS);
+    match r.below(6) {
+        0 => vec![
+            "class E(Exception): pass".into(),
+            format!("e = E({a})"),
+            "print(str(e), repr(e), e.args)".into(),
+            "print(isinstance(e, Exception), isinstance(e, E))".into(),
+        ],
+        1 => vec![
+            "class E(Exception): pass".into(),
+            format!("e = E({a}, {b})"),
+            "print(str(e))".into(),
+            "print(repr(e))".into(),
+            "print(e.args)".into(),
+            "print(str(E()), repr(E()), E().args)".into(),
+        ],
+        2 => vec![
+            "class E(Exception):".into(),
+            "    def __init__(self, code):".into(),
+            "        super().__init__('err:' + str(code))".into(),
+            "        self.code = code".into(),
+            format!("e = E({n})"),
+            "print(str(e), e.args, e.code)".into(),
+            format!(
+                "try:\n    raise E({n})\nexcept E as x:\n    print('caught', x, x.code, x.args)"
+            ),
+        ],
+        3 => vec![
+            "class E(Exception):".into(),
+            "    def __str__(self): return 'S:' + str(self.args)".into(),
+            format!("e = E({a})"),
+            "print(str(e), repr(e))".into(),
+        ],
+        4 => vec![
+            "class Base(Exception): pass".into(),
+            "class Mid(Base): pass".into(),
+            "class Leaf(Mid): pass".into(),
+            format!("e = Leaf({a})"),
+            "print(isinstance(e, Base), isinstance(e, Mid), isinstance(e, Exception))".into(),
+            "print(str(e), e.args, type(e).__name__)".into(),
+        ],
+        _ => vec![
+            "class MyVal(ValueError): pass".into(),
+            format!(
+                "try:\n    raise MyVal({a})\nexcept ValueError as e:\n    print(str(e), e.args, isinstance(e, ValueError), type(e).__name__)"
+            ),
+        ],
+    }
+}
+
+/// Closures: nested functions, `nonlocal` counters, late-binding loop captures,
+/// default-arg early binding, decorators with arguments, `*args`/`**kw` wrappers,
+/// and multi-level lexical capture. Deterministic scalar output.
+fn gen_closures(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let a = pick(r, POSINTS);
+    let b = pick(r, POSINTS);
+    let n = 2 + r.below(4);
+    match r.below(6) {
+        0 => vec![
+            "def make():".into(),
+            "    count = 0".into(),
+            "    def inc():".into(),
+            "        nonlocal count".into(),
+            "        count += 1".into(),
+            "        return count".into(),
+            "    return inc".into(),
+            "c = make()".into(),
+            "print(c(), c(), c())".into(),
+        ],
+        // Late binding: every lambda sees the final loop value.
+        1 => vec![
+            "fs = []".into(),
+            format!("for i in range({n}):"),
+            "    fs.append(lambda: i)".into(),
+            "print([f() for f in fs])".into(),
+        ],
+        // Default-arg early binding: each lambda captures its own value.
+        2 => vec![
+            "fs = []".into(),
+            format!("for i in range({n}):"),
+            "    fs.append(lambda i=i: i * 2)".into(),
+            "print([f() for f in fs])".into(),
+        ],
+        // Decorator with arguments.
+        3 => vec![
+            "def mul(factor):".into(),
+            "    def deco(fn):".into(),
+            "        def wrap(x): return fn(x) * factor".into(),
+            "        return wrap".into(),
+            "    return deco".into(),
+            format!("@mul({a})"),
+            "def f(x): return x + 1".into(),
+            format!("print(f({b}))"),
+        ],
+        // `*args`/`**kw` forwarding wrapper.
+        4 => vec![
+            "def logged(fn):".into(),
+            "    def w(*args, **kw):".into(),
+            "        return fn(*args, **kw)".into(),
+            "    return w".into(),
+            "@logged".into(),
+            "def add(a, b): return a + b".into(),
+            format!("print(add({a}, b={b}))"),
+        ],
+        // Three-level lexical capture.
+        _ => vec![
+            "def outer(x):".into(),
+            "    def middle(y):".into(),
+            "        def inner(z): return x + y + z".into(),
+            "        return inner".into(),
+            "    return middle".into(),
+            format!("print(outer({a})({b})(1))"),
+        ],
+    }
+}
+
+/// OOP internals: multiple-inheritance MRO + attribute order, `super()` in a
+/// property, `__init_subclass__` with class kwargs, and classmethod alternate
+/// constructors. Deterministic scalar/name output.
+fn gen_oop2(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let a = pick(r, SMALLINTS);
+    match r.below(5) {
+        // MRO order + cooperative dispatch.
+        0 => vec![
+            "class A:".into(),
+            "    def who(self): return 'A'".into(),
+            "class B(A):".into(),
+            "    def who(self): return 'B'".into(),
+            "class C(A):".into(),
+            "    def who(self): return 'C'".into(),
+            "class D(B, C): pass".into(),
+            "print(D().who())".into(),
+            "print([c.__name__ for c in D.__mro__])".into(),
+        ],
+        // super() inside a property getter.
+        1 => vec![
+            "class A:".into(),
+            "    @property".into(),
+            "    def v(self): return 10".into(),
+            "class B(A):".into(),
+            "    @property".into(),
+            "    def v(self): return super().v + 1".into(),
+            "print(B().v)".into(),
+        ],
+        // __init_subclass__ with a class keyword.
+        2 => vec![
+            "class P:".into(),
+            "    def __init_subclass__(cls, /, tag=None, **kw):".into(),
+            "        cls.tag = tag".into(),
+            format!("class C(P, tag={a}): pass"),
+            "print(C.tag)".into(),
+        ],
+        // Classmethod alternate constructors.
+        3 => vec![
+            "class Shape:".into(),
+            "    def __init__(self, n): self.n = n".into(),
+            "    @classmethod".into(),
+            "    def unit(cls): return cls(1)".into(),
+            "    @classmethod".into(),
+            format!("    def scaled(cls, k): return cls({a} + k)"),
+            "print(Shape.unit().n, Shape.scaled(3).n)".into(),
+        ],
+        // MI attribute resolution order.
+        _ => vec![
+            "class A:".into(),
+            "    x = 1".into(),
+            "class B:".into(),
+            "    x = 2".into(),
+            "    y = 3".into(),
+            "class C(A, B): pass".into(),
+            "print(C.x, C.y)".into(),
+            "print([k.__name__ for k in C.__mro__])".into(),
+        ],
+    }
+}
+
+/// String formatting depth: `!r`/`!s`/`!a` on containers, positional `.format`
+/// reuse, `%`-format of tuples, and int format specs. All values are plain
+/// (ints/lists/dicts) so stdout is deterministic and stays clear of the
+/// `%`-on-instance-dunder and nested-field-spec gaps.
+fn gen_strfmt2(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let a = pick(r, SMALLINTS);
+    let b = pick(r, SMALLINTS);
+    match r.below(6) {
+        // !r / !s on a list.
+        0 => vec![format!("xs = [{a}, {b}]\nprint(f'{{xs!r}}|{{xs!s}}')")],
+        // !r on a dict (insertion order is deterministic in both).
+        1 => vec![format!("d = {{'k': {a}, 'j': {b}}}\nprint(f'{{d!r}}')")],
+        // %-format of a tuple (plain values), both %r and %s.
+        2 => vec![format!("t = ({a}, {b})\nprint('%r %s' % (t, t))")],
+        // Positional field reuse in str.format.
+        3 => vec![format!("print('{{0}}-{{1}}-{{0}}'.format({a}, {b}))")],
+        // Int format specs via variables (no nested-field spec).
+        4 => vec![
+            format!("v = {a}"),
+            format!("w = {b}"),
+            "print(f'{v:+05d} {w:>6d}')".into(),
+        ],
+        // % conversion chars on ints.
+        _ => vec![format!(
+            "print('%d/%o/%x/%X' % ({a}, abs({b}), abs({a}), abs({b})))"
+        )],
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Mode dispatch
 // ---------------------------------------------------------------------------
@@ -959,6 +1174,10 @@ enum Mode {
     Itertools,
     Complexnum,
     Exceptions2,
+    Exceptions3,
+    Closures,
+    Oop2,
+    Strfmt2,
 }
 
 const REAL_MODES: &[Mode] = &[
@@ -989,6 +1208,10 @@ const REAL_MODES: &[Mode] = &[
     Mode::Itertools,
     Mode::Complexnum,
     Mode::Exceptions2,
+    Mode::Exceptions3,
+    Mode::Closures,
+    Mode::Oop2,
+    Mode::Strfmt2,
 ];
 
 /// Generate the statement list for a seed in the selected mode. `Mixed` rotates
@@ -1026,6 +1249,10 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Itertools => gen_itertools(seed),
         Mode::Complexnum => gen_complexnum(seed),
         Mode::Exceptions2 => gen_exceptions2(seed),
+        Mode::Exceptions3 => gen_exceptions3(seed),
+        Mode::Closures => gen_closures(seed),
+        Mode::Oop2 => gen_oop2(seed),
+        Mode::Strfmt2 => gen_strfmt2(seed),
     }
 }
 
@@ -1059,6 +1286,10 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Itertools => "itertools",
         Mode::Complexnum => "complexnum",
         Mode::Exceptions2 => "exceptions2",
+        Mode::Exceptions3 => "exceptions3",
+        Mode::Closures => "closures",
+        Mode::Oop2 => "oop2",
+        Mode::Strfmt2 => "strfmt2",
     }
 }
 
@@ -1092,6 +1323,10 @@ fn mode_from_name(s: &str) -> Option<Mode> {
         Mode::Itertools,
         Mode::Complexnum,
         Mode::Exceptions2,
+        Mode::Exceptions3,
+        Mode::Closures,
+        Mode::Oop2,
+        Mode::Strfmt2,
     ];
     ALL.iter().copied().find(|&m| mode_name(m) == s)
 }
