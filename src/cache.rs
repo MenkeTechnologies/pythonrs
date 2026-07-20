@@ -33,7 +33,10 @@ use std::path::PathBuf;
 /// undecoded literal into the chunk, so it must miss cleanly.
 /// v8: `FuncDef` gained a `posonly` count (positional-only enforcement); older
 /// serialized func templates lack it and must miss cleanly.
-const SCHEMA: u64 = 8;
+/// v9: comprehensions now inject a `global`/`nonlocal` declaration for walrus
+/// (`:=`) targets so they leak to the enclosing scope; older bytecode lacks the
+/// declaration and must miss cleanly.
+const SCHEMA: u64 = 9;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]

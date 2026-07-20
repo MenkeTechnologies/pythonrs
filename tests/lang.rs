@@ -1538,3 +1538,28 @@ fn decode_escapes_named_unicode_unit() {
     assert_eq!(decode_escapes("\\N{BULLET}", true).unwrap(), "\\N{BULLET}");
     assert!(decode_escapes("\\N{ SPACE}", false).is_err());
 }
+
+#[test]
+fn walrus_in_comprehension_leaks() {
+    // A `:=` target inside a comprehension binds in the enclosing scope (PEP 572),
+    // not the hidden comprehension function; the result is unaffected.
+    assert_eq!(
+        g("r = range(3)\nres = [y for x in r if (y := x)]", "res"),
+        "[1, 2]"
+    );
+    assert_eq!(g("r = range(3)\n_ = [y for x in r if (y := x)]", "y"), "2");
+    // Walrus in the element, over a list.
+    assert_eq!(g("_ = [(z := i) + z for i in [1, 2, 3]]", "z"), "3");
+    // Set and dict comprehensions leak their walrus target too.
+    assert_eq!(g("_ = {(k := x) for x in range(4)}", "k"), "3");
+    assert_eq!(g("_ = {(m := x): x for x in range(2)}", "m"), "1");
+    // Inside a function the target is nonlocal to that function, not global; the
+    // function exposes it via its return so we can read it back at module scope.
+    assert_eq!(
+        g(
+            "def f():\n    t = -1\n    out = [t for x in range(3) if (t := x * 2)]\n    return out, t\nres = f()",
+            "res"
+        ),
+        "([2, 4], 4)"
+    );
+}
