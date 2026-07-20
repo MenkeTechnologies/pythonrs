@@ -325,8 +325,12 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
       heap id and threads it into `str_format_percent`/`format_conv`, so the formatter
       no longer prints `<C object>`. Covers `%` and `%=`. Byte-verified vs CPython
       (instance, container, mixed tuple, mapping, width/precision).
-- [ ] **`str.format` / f-string advanced spec** — nested fields `'{:{}}'`/`'{:.{}f}'`
-      (and f-string `f'{x:{w}.2f}'`) drop the spec; keyword `'{name}'`, index `'{0[0]}'`,
+- [ ] **`str.format` / f-string advanced spec** — **f-string nested field specs FIXED:**
+      `f'{x:{w}.2f}'`/`f'{3.14159:{5}.{2}f}'`/`f'{42:>{width}}'` now expand the `{…}` inside
+      the spec as their own replacement fields at runtime (spec is compiled as a mini
+      joined-string; cache SCHEMA→12), byte-verified vs CPython. Still open: `str.format`
+      nested fields `'{:{}}'`/`'{:.{}f}'` drop the spec (the `str_dot_format` field scanner
+      stops at the first `}`); keyword `'{name}'`, index `'{0[0]}'`,
       attribute `'{0.imag}'` fields → `None`; the `=` debug specifier `f'{x=}'` is a **`SyntaxError`**;
       `g` type treated as fixed precision (never switches to exponent / strips zeros);
       `c` type and `e` exponent (`1.2e5` want `1.2e+05`) wrong. (Sign-aware `=`/`0`
