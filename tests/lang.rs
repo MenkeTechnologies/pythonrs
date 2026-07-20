@@ -2014,3 +2014,35 @@ async def main():\n    return {x: x * x async for x in R(4) if x % 2 == 0}\n\
 r = asyncio.run(main())";
     assert_eq!(g(src, "r"), "{2: 4, 4: 16}");
 }
+
+#[test]
+fn asyncio_event_wait_set() {
+    let src = "import asyncio\n\
+async def waiter(ev, out):\n    await ev.wait()\n    out.append('woke')\n\
+out = []\n\
+async def main():\n    ev = asyncio.Event()\n    t = asyncio.create_task(waiter(ev, out))\n    await asyncio.sleep(0)\n    out.append('set')\n    ev.set()\n    await t\n\
+asyncio.run(main())";
+    assert_eq!(g(src, "out"), "['set', 'woke']");
+}
+
+#[test]
+fn asyncio_lock_mutual_exclusion() {
+    let src = "import asyncio\n\
+out = []\n\
+async def worker(lock, n):\n    async with lock:\n        out.append('in ' + str(n))\n        await asyncio.sleep(0)\n        out.append('out ' + str(n))\n\
+async def main():\n    lock = asyncio.Lock()\n    await asyncio.gather(worker(lock, 1), worker(lock, 2))\n\
+asyncio.run(main())";
+    // The lock serializes the critical sections: 1 fully then 2 fully.
+    assert_eq!(g(src, "out"), "['in 1', 'out 1', 'in 2', 'out 2']");
+}
+
+#[test]
+fn asyncio_queue_producer_consumer() {
+    let src = "import asyncio\n\
+out = []\n\
+async def producer(q):\n    for i in range(3):\n        await q.put(i)\n\
+async def consumer(q):\n    for _ in range(3):\n        out.append(await q.get())\n\
+async def main():\n    q = asyncio.Queue()\n    await asyncio.gather(producer(q), consumer(q))\n\
+asyncio.run(main())";
+    assert_eq!(g(src, "out"), "[0, 1, 2]");
+}

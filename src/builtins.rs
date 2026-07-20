@@ -3173,6 +3173,25 @@ fn call_asyncio(
         }
         "get_event_loop" | "get_running_loop" | "new_event_loop" => Ok(async_rt::event_loop()),
         "Future" => Ok(async_rt::new_future()),
+        // `wait`/`as_completed` take a single iterable of awaitables (not varargs).
+        "wait" => {
+            let aws = host::iter_vec(&args.into_iter().next().unwrap_or(Value::Undef))?;
+            async_rt::wait(aws)
+        }
+        "as_completed" => {
+            let aws = host::iter_vec(&args.into_iter().next().unwrap_or(Value::Undef))?;
+            async_rt::as_completed(aws)
+        }
+        "Event" => Ok(async_rt::new_event()),
+        "Lock" => Ok(async_rt::new_lock()),
+        "Queue" => {
+            let maxsize = kw_get(&kwargs, "maxsize")
+                .or_else(|| args.into_iter().next())
+                .and_then(num_f)
+                .map(|f| f.max(0.0) as usize)
+                .unwrap_or(0);
+            Ok(async_rt::new_queue(maxsize))
+        }
         _ => Err(format!(
             "AttributeError: module 'asyncio' has no attribute '{name}'"
         )),
@@ -3416,6 +3435,19 @@ pub fn type_has_method(typename: &str, name: &str) -> bool {
         "coroutine" => return GENERATOR_METHODS.contains(&name) || name == "__await__",
         "Future" | "Task" => return FUTURE_METHODS.contains(&name),
         "_UnixSelectorEventLoop" => return LOOP_METHODS.contains(&name),
+        "Event" => return matches!(name, "set" | "clear" | "is_set" | "wait"),
+        "Lock" => {
+            return matches!(
+                name,
+                "acquire" | "release" | "locked" | "__aenter__" | "__aexit__"
+            )
+        }
+        "Queue" => {
+            return matches!(
+                name,
+                "put" | "get" | "put_nowait" | "get_nowait" | "qsize" | "empty" | "full"
+            )
+        }
         _ => &[],
     };
     list.contains(&name)
@@ -3664,6 +3696,7 @@ pub fn call_type_method(
         "coroutine" => coroutine_method(recv, name, &args),
         "Future" | "Task" => crate::async_rt::future_method(recv, name, args),
         "_UnixSelectorEventLoop" => crate::async_rt::loop_method(name, args),
+        "Event" | "Lock" | "Queue" => crate::async_rt::async_obj_method(recv, name, args),
         other => Err(format!(
             "AttributeError: '{other}' object has no attribute '{name}'"
         )),
