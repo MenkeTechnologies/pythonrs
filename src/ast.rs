@@ -59,12 +59,14 @@ pub enum UnOp {
 #[derive(Debug, Clone, PartialEq)]
 pub enum FStrPart {
     Lit(String),
-    /// `{expr!conv:spec}` — `conv` is 's'/'r'/'a' or none; `spec` is the format
-    /// spec (may itself be empty). `expr_src` keeps the source text for `{x=}`.
+    /// `{expr!conv:spec}` — `conv` is 's'/'r'/'a' or none. `spec` is the format
+    /// spec parsed as its own mini joined-string: an empty vec means no spec,
+    /// literal text is a `Lit`, and a nested replacement field (`{w}` in
+    /// `{x:{w}.2f}`) is an `Expr` evaluated at runtime and spliced into the spec.
     Expr {
         expr: Box<Expr>,
         conv: Option<char>,
-        spec: Option<String>,
+        spec: Vec<FStrPart>,
     },
 }
 

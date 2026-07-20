@@ -78,6 +78,24 @@ fn percent_format_dispatches_instance_str_repr() {
 }
 
 #[test]
+fn fstring_nested_format_specs() {
+    // A format spec may itself contain replacement fields, evaluated at runtime
+    // and spliced into the spec before formatting (CPython semantics).
+    assert_eq!(g("x = f'{3.14159:{5}.{2}f}'", "x"), "' 3.14'");
+    assert_eq!(g("w = 8\nn = 2\nx = f'{3.14159:{w}.{n}f}'", "x"), "'    3.14'");
+    assert_eq!(g("w = 8\nx = f'{42:>{w}}'", "x"), "'      42'");
+    assert_eq!(g("w = 8\nx = f'{42:0{w}d}'", "x"), "'00000042'");
+    assert_eq!(g("x = f'{\"x\":{\"*\"}>{6}}'", "x"), "'*****x'");
+    assert_eq!(g("w = 10\nx = f'{\"mid\":{\"=\"}^{w}}'", "x"), "'===mid===='");
+    assert_eq!(g("w = 8\nx = f'{255:#{w}x}'", "x"), "'    0xff'");
+    // nested field with its own conversion
+    assert_eq!(g("w = 5\nx = f'{3.14:>{w}}'", "x"), "' 3.14'");
+    // non-nested spec still works (no regression)
+    assert_eq!(g("x = f'{3.14159:.2f}'", "x"), "'3.14'");
+    assert_eq!(g("x = f'{42:05d}'", "x"), "'00042'");
+}
+
+#[test]
 fn lists_dicts_sets_tuples() {
     assert_eq!(g("x = [1, 2, 3] + [4]", "x"), "[1, 2, 3, 4]");
     assert_eq!(g("a = [1, 2]\na.append(3)\nx = a", "x"), "[1, 2, 3]");

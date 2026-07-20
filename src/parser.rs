@@ -1535,7 +1535,7 @@ impl Parser {
     }
 
     /// Expand an f-string body into literal/expression parts.
-    fn parse_fstring(&mut self, raw: &str, is_raw: bool) -> Result<Vec<FStrPart>, String> {
+    fn parse_fstring(&self, raw: &str, is_raw: bool) -> Result<Vec<FStrPart>, String> {
         let chars: Vec<char> = raw.chars().collect();
         let mut parts = Vec::new();
         let mut lit = String::new();
@@ -1589,7 +1589,7 @@ impl Parser {
                     }
                     i += 1;
                 }
-                parts.push(self.build_fstring_field(&field)?);
+                parts.push(self.build_fstring_field(&field, is_raw)?);
             } else if c == '}' {
                 if chars.get(i + 1) == Some(&'}') {
                     lit.push('}');
@@ -1610,14 +1610,15 @@ impl Parser {
         Ok(parts)
     }
 
-    fn build_fstring_field(&self, field: &str) -> Result<FStrPart, String> {
+    fn build_fstring_field(&self, field: &str, is_raw: bool) -> Result<FStrPart, String> {
         // Split off !conv and :spec (top level only).
         let mut expr_src = field;
-        let mut spec: Option<String> = None;
+        let mut spec: Vec<FStrPart> = Vec::new();
         let mut conv: Option<char> = None;
-        // format spec
+        // format spec — itself a mini joined-string, so a nested replacement field
+        // (`{w}` in `{x:{w}.2f}`) is evaluated at runtime and spliced into the spec.
         if let Some(idx) = find_top_level(field, ':') {
-            spec = Some(field[idx + 1..].to_string());
+            spec = self.parse_fstring(&field[idx + 1..], is_raw)?;
             expr_src = &field[..idx];
         }
         // conversion !s/!r/!a

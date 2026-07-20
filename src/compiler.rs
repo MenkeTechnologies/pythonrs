@@ -1029,15 +1029,36 @@ impl Compiler {
                         _ => 0,
                     };
                     b.emit(Op::LoadInt(conv_i), 0);
-                    let spec = spec.clone().unwrap_or_default();
-                    let k = b.add_constant(Value::str(spec));
-                    b.emit(Op::LoadConst(k), 0);
+                    self.compile_fstring_spec(b, spec)?;
                     b.emit(Op::CallBuiltin(ops::FORMAT, 3), 0);
                     n += 1;
                 }
             }
         }
         b.emit(Op::CallBuiltin(ops::MKSTR, argc(n)?), 0);
+        Ok(())
+    }
+
+    /// Push an f-string field's format spec onto the stack as a string. The
+    /// common case (no spec, or a purely-literal spec) folds to a single
+    /// constant; a spec carrying a nested replacement field (`{w}` in
+    /// `{x:{w}.2f}`) is emitted as its own joined-string, evaluated at runtime.
+    fn compile_fstring_spec(
+        &mut self,
+        b: &mut ChunkBuilder,
+        spec: &[FStrPart],
+    ) -> Result<(), String> {
+        if spec.iter().any(|p| matches!(p, FStrPart::Expr { .. })) {
+            return self.compile_fstring(b, spec);
+        }
+        let mut s = String::new();
+        for p in spec {
+            if let FStrPart::Lit(l) = p {
+                s.push_str(l);
+            }
+        }
+        let k = b.add_constant(Value::str(s));
+        b.emit(Op::LoadConst(k), 0);
         Ok(())
     }
 
