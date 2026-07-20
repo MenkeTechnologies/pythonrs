@@ -2237,6 +2237,34 @@ impl PyHost {
     /// native int/float (bool, bignum, str, list, …), or an int op overflowed.
     pub fn arith(&mut self, op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
         use NumOp::*;
+        // A CPython `Foreign` operand (stdlib-ffi): `date + timedelta`,
+        // `Decimal + Decimal`, `datetime < datetime`, unary `-` on a stdlib
+        // object, … route through the bridge so the real CPython operation runs.
+        #[cfg(feature = "stdlib-ffi")]
+        {
+            if matches!(op, Neg) {
+                if self.foreign_id(a).is_some() {
+                    return crate::ffi::unary_op(self, "neg", a);
+                }
+            } else if self.foreign_id(a).is_some() || self.foreign_id(b).is_some() {
+                let func = match op {
+                    Add => "add",
+                    Sub => "sub",
+                    Mul => "mul",
+                    Div => "truediv",
+                    Mod => "mod",
+                    Pow => "pow",
+                    Eq => "eq",
+                    Ne => "ne",
+                    Lt => "lt",
+                    Le => "le",
+                    Gt => "gt",
+                    Ge => "ge",
+                    Neg => unreachable!(),
+                };
+                return crate::ffi::binary_op(self, func, a, b);
+            }
+        }
         // Bool participates as int.
         let ai = self.as_int(a);
         let bi = self.as_int(b);
@@ -2520,6 +2548,25 @@ impl PyHost {
 
     /// The non-native binary operators (`/ // % ** @ & | ^ << >>`).
     pub fn binop(&mut self, tag: i64, a: &Value, b: &Value) -> Result<Value, String> {
+        // A CPython `Foreign` operand (stdlib-ffi) for `/ // % ** @ & | ^ << >>`
+        // routes through the bridge (`Decimal / Decimal`, an `IntFlag | IntFlag`, …).
+        #[cfg(feature = "stdlib-ffi")]
+        if self.foreign_id(a).is_some() || self.foreign_id(b).is_some() {
+            let func = match tag {
+                binop::DIV => "truediv",
+                binop::FLOORDIV => "floordiv",
+                binop::MOD => "mod",
+                binop::POW => "pow",
+                binop::MATMUL => "matmul",
+                binop::BITAND => "and_",
+                binop::BITOR => "or_",
+                binop::BITXOR => "xor",
+                binop::SHL => "lshift",
+                binop::SHR => "rshift",
+                _ => return Err(type_error("unknown binop")),
+            };
+            return crate::ffi::binary_op(self, func, a, b);
+        }
         let ai = self.as_int(a);
         let bi = self.as_int(b);
         let af = self.num_val(a);
@@ -2734,6 +2781,17 @@ impl PyHost {
 
     /// `~x` / unary `+x`.
     pub fn unary(&mut self, tag: i64, v: &Value) -> Result<Value, String> {
+        // `~x` / unary `+x` on a CPython `Foreign` object (stdlib-ffi) routes
+        // through the bridge (an `IntFlag`'s `~`, a `Decimal`'s unary `+`, …).
+        #[cfg(feature = "stdlib-ffi")]
+        if self.foreign_id(v).is_some() {
+            let func = match tag {
+                unop::INVERT => "invert",
+                unop::POS => "pos",
+                _ => return Err(type_error("unknown unary op")),
+            };
+            return crate::ffi::unary_op(self, func, v);
+        }
         match tag {
             unop::INVERT => match self.big_val(v) {
                 // `~x == -x - 1` (two's-complement), bignum-safe.

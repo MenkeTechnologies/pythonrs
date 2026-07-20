@@ -519,3 +519,74 @@ fn ffi_value_marshaled_churn_is_bounded() {
         "value-marshaled churn grew the side-table by {grew} over 2000 iterations (expected a small constant, not O(iters))"
     );
 }
+
+/// Binary / comparison / unary operators where an operand is a CPython `Foreign`
+/// object route through the bridge to the real CPython operation, so stdlib
+/// arithmetic (`date + timedelta`, `Decimal + Decimal`, `Fraction + Fraction`),
+/// comparisons (`date < date`), the `binop`-opcode ops (`Decimal % Decimal`),
+/// and unary `abs` all match CPython 3.14.6 byte-for-byte.
+#[cfg(feature = "stdlib-ffi")]
+#[test]
+fn ffi_foreign_operator_dispatch() {
+    // `+`: date + timedelta → date (result kept as a fresh Foreign, repr from CPython).
+    assert_eq!(
+        g(
+            "import datetime\nx = datetime.date(2024, 2, 28) + datetime.timedelta(days=2)",
+            "x"
+        ),
+        "datetime.date(2024, 3, 1)"
+    );
+    // `-`: date - date → timedelta; `.days` marshals back by value.
+    assert_eq!(
+        g(
+            "import datetime\nx = (datetime.date(2025, 1, 1) - datetime.date(2024, 1, 1)).days",
+            "x"
+        ),
+        "366"
+    );
+    // comparison → bool.
+    assert_eq!(
+        g(
+            "import datetime\nx = datetime.date(2024, 1, 1) < datetime.date(2024, 1, 2)",
+            "x"
+        ),
+        "True"
+    );
+    // `*` with a native int operand marshaled across the boundary.
+    assert_eq!(
+        g(
+            "import datetime\nx = (datetime.timedelta(days=1) * 3).days",
+            "x"
+        ),
+        "3"
+    );
+    // Decimal exact arithmetic (the whole point of not reimplementing it).
+    assert_eq!(
+        g(
+            "from decimal import Decimal\nx = Decimal('0.1') + Decimal('0.2')",
+            "x"
+        ),
+        "Decimal('0.3')"
+    );
+    // `%` via the binop-opcode path.
+    assert_eq!(
+        g(
+            "from decimal import Decimal\nx = Decimal('7') % Decimal('3')",
+            "x"
+        ),
+        "Decimal('1')"
+    );
+    // Fraction arithmetic.
+    assert_eq!(
+        g(
+            "from fractions import Fraction\nx = Fraction(1, 2) + Fraction(1, 3)",
+            "x"
+        ),
+        "Fraction(5, 6)"
+    );
+    // unary `abs` on a Foreign object.
+    assert_eq!(
+        g("from decimal import Decimal\nx = abs(Decimal('-5'))", "x"),
+        "Decimal('5')"
+    );
+}

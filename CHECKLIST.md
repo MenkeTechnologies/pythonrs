@@ -102,12 +102,15 @@ libpython (`src/ffi.rs`). `import <anything>`, `from x import y`, submodules
 (`os.path`), and `sys.modules` all fall out of CPython's own importer. Results
 marshal to pythonrs values by-value (int/float/bool/None/str/bytes/list/tuple/dict/
 set); everything else stays a `PyObj::Foreign` handle whose attr/call/index/iter/
-len/str/repr/membership route back through the bridge. A pythonrs callable passed
+len/str/repr/membership **and binary / comparison / unary operators** route back
+through the bridge (via CPython's `operator` module). A pythonrs callable passed
 as a stdlib callback (`functools.reduce(f, …)`, `sorted(key=f)`) is wrapped so
 CPython calls back into fusevm. Verified byte-identical to `python3` (3.14.6):
 `re.findall`, `hashlib.sha256`, `argparse`, `json.dumps/loads`, `textwrap`,
 `itertools.chain/combinations/permutations`, `functools.reduce/partial/lru_cache`,
-`os.path.*`, `string.*`.
+`os.path.*`, `string.*`, `datetime.date + timedelta`, `datetime - datetime`,
+`date < date`, `Decimal('0.1') + Decimal('0.2')` (exact), `Fraction + Fraction`,
+`timedelta * 3`, `Decimal % Decimal`, `abs(Decimal('-5'))`.
 
 Build/run with the feature: `PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 cargo build
 --features stdlib-ffi` (CI has a dedicated `stdlib-ffi` job). Default builds never
