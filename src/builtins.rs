@@ -1348,11 +1348,19 @@ fn try_binop_dunder(
     lname: &str,
     rname: &str,
 ) -> Option<Result<Value, String>> {
-    // `str % obj` is native string formatting (`str.__mod__`), which is
-    // authoritative — CPython never returns `NotImplemented` from it, so the
-    // right operand's `__rmod__` is never consulted. Route straight to native.
+    // `str % obj` / `bytes % obj` / `bytearray % obj` are native formatting
+    // (`__mod__`), which is authoritative — CPython never returns
+    // `NotImplemented` from it, so the right operand's `__rmod__` is never
+    // consulted (even when the RHS is an instance with `__bytes__`). Route
+    // straight to native.
     if lname == "__mod__"
-        && with_host(|h| matches!(a, Value::Str(_)) || matches!(h.get(a), Some(PyObj::Str(_))))
+        && with_host(|h| {
+            matches!(a, Value::Str(_))
+                || matches!(
+                    h.get(a),
+                    Some(PyObj::Str(_)) | Some(PyObj::Bytes(_)) | Some(PyObj::Bytearray(_))
+                )
+        })
     {
         return None;
     }
@@ -1483,13 +1491,7 @@ fn b_binop(vm: &mut VM, _: u8) -> Value {
             _ => None,
         });
         if let Some(is_ba) = kind {
-            let r = with_host(|h| {
-                let fmt = match h.get(&a) {
-                    Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) => b.clone(),
-                    _ => vec![],
-                };
-                h.bytes_format_percent(&fmt, &b, is_ba)
-            });
+            let r = bytes_percent_format(&a, &b, is_ba);
             return finish(vm, r);
         }
     }
@@ -1769,6 +1771,53 @@ fn str_percent_format(fmt_val: &Value, args: &Value) -> Result<Value, String> {
         _ => String::new(),
     });
     with_host(|h| h.str_format_percent(&fmt, args, &premap))
+}
+
+/// `bytes % args` / `bytearray % args` (PEP 461): pre-resolve any user
+/// instance's `__bytes__` OUTSIDE the host borrow (the host `%` formatter runs
+/// inside the borrow and cannot call back into `__bytes__`), keyed by heap id,
+/// then hand the pre-resolved table to the host formatter.
+fn bytes_percent_format(fmt_val: &Value, args: &Value, is_ba: bool) -> Result<Value, String> {
+    let items: Vec<Value> = with_host(|h| match h.get(args) {
+        Some(PyObj::Tuple(t)) => t.clone(),
+        Some(PyObj::Dict(d)) => d.values().map(|(_, v)| v.clone()).collect(),
+        _ => vec![args.clone()],
+    });
+    let mut premap: std::collections::HashMap<u32, Vec<u8>> = std::collections::HashMap::new();
+    for it in &items {
+        let Value::Obj(id) = it else { continue };
+        if premap.contains_key(id) {
+            continue;
+        }
+        // Only instances that define `__bytes__` need the dispatching path.
+        let has = with_host(
+            |h| matches!(h.get(it), Some(PyObj::Instance(i)) if instance_has(h, i, "__bytes__")),
+        );
+        if !has {
+            continue;
+        }
+        let res = host::call_method(it, "__bytes__", vec![], vec![])?;
+        let bytes = with_host(|h| match h.get(&res) {
+            Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) => Some(b.clone()),
+            _ => None,
+        });
+        match bytes {
+            Some(b) => {
+                premap.insert(*id, b);
+            }
+            None => {
+                return Err(host::type_error(&format!(
+                    "__bytes__ returned non-bytes (type {})",
+                    with_host(|h| h.type_name(&res))
+                )))
+            }
+        }
+    }
+    let fmt = with_host(|h| match h.get(fmt_val) {
+        Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) => b.clone(),
+        _ => vec![],
+    });
+    with_host(|h| h.bytes_format_percent(&fmt, args, is_ba, &premap))
 }
 
 fn b_unary(vm: &mut VM, _: u8) -> Value {
@@ -4145,6 +4194,9 @@ const BYTES_METHODS: &[&str] = &[
     "removesuffix",
     "swapcase",
     "title",
+    "capitalize",
+    "zfill",
+    "expandtabs",
     "center",
     "ljust",
     "rjust",
@@ -4190,6 +4242,9 @@ const BYTEARRAY_METHODS: &[&str] = &[
     "removesuffix",
     "swapcase",
     "title",
+    "capitalize",
+    "zfill",
+    "expandtabs",
     "center",
     "ljust",
     "rjust",
@@ -4980,6 +5035,34 @@ fn expand_tabs(s: &str, tabsize: usize) -> String {
     out
 }
 
+/// Byte-level `expandtabs`: identical column logic to `expand_tabs` but over raw
+/// bytes (b'\t' → spaces to the next stop; b'\n'/b'\r' reset the column).
+fn expand_tabs_bytes(bytes: &[u8], tabsize: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut col = 0usize;
+    for &b in bytes {
+        match b {
+            b'\t' => {
+                if tabsize == 0 {
+                    continue;
+                }
+                let n = tabsize - (col % tabsize);
+                out.extend(std::iter::repeat(b' ').take(n));
+                col += n;
+            }
+            b'\n' | b'\r' => {
+                out.push(b);
+                col = 0;
+            }
+            other => {
+                out.push(other);
+                col += 1;
+            }
+        }
+    }
+    out
+}
+
 /// CPython `str.translate(table)`: `table` maps ordinals to a replacement
 /// ordinal (int), string, or `None` (delete). Absent keys pass through.
 fn str_translate(s: &str, table: &Value) -> Result<String, String> {
@@ -5494,7 +5577,7 @@ fn dict_method(
                 Some(v) => Ok(v),
                 None => match args.get(1) {
                     Some(d) => Ok(d.clone()),
-                    None => Err(format!("KeyError: {}", with_host(|h| h.repr_of(&kv)))),
+                    None => Err(with_host(|h| h.key_error(&kv))),
                 },
             }
         }
@@ -5645,7 +5728,7 @@ fn set_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
                 }
             });
             if name == "remove" && !removed {
-                return Err(format!("KeyError: {}", with_host(|h| h.repr_of(&v))));
+                return Err(with_host(|h| h.key_error(&v)));
             }
             Ok(Value::Undef)
         }
@@ -5657,17 +5740,25 @@ fn set_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             });
             Ok(Value::Undef)
         }
-        "union" => set_binop(recv, args, host::binop::BITOR),
-        "intersection" => set_binop(recv, args, host::binop::BITAND),
+        // `union`/`intersection`/`difference` are variadic (`s.union(*others)`);
+        // `symmetric_difference` takes exactly one argument.
+        "union" => set_variadic(recv, args, host::binop::BITOR),
+        "intersection" => set_variadic(recv, args, host::binop::BITAND),
         "symmetric_difference" => set_binop(recv, args, host::binop::BITXOR),
         "difference" => {
-            let other = arg0(args)?;
-            let other_set = if with_host(|h| h.setlike(&other).is_some()) {
-                other
-            } else {
-                call_builtin_function("set", vec![other], vec![])?
-            };
-            with_host(|h| h.arith(NumOp::Sub, recv, &other_set))
+            if args.is_empty() {
+                return set_method(recv, "copy", &[]);
+            }
+            let mut acc = recv.clone();
+            for a in args {
+                let other_set = if with_host(|h| h.setlike(a).is_some()) {
+                    a.clone()
+                } else {
+                    call_builtin_function("set", vec![a.clone()], vec![])?
+                };
+                acc = with_host(|h| h.arith(NumOp::Sub, &acc, &other_set))?;
+            }
+            Ok(acc)
         }
         "issubset" => {
             let other = iter_keys(&arg0(args)?)?;
@@ -5695,15 +5786,18 @@ fn set_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             });
             Ok(with_host(|h| h.new_setlike(s, frozen)))
         }
+        // Variadic: `s.update(*others)` folds in every iterable argument.
         "update" => {
-            let items = host::iter_vec(&arg0(args)?)?;
-            for it in items {
-                let k = with_host(|h| h.to_key(&it))?;
-                with_host(|h| {
-                    if let Some(PyObj::Set(s)) = h.get_mut(recv) {
-                        host::set_put(s, k, it);
-                    }
-                });
+            for a in args {
+                let items = host::iter_vec(a)?;
+                for it in items {
+                    let k = with_host(|h| h.to_key(&it))?;
+                    with_host(|h| {
+                        if let Some(PyObj::Set(s)) = h.get_mut(recv) {
+                            host::set_put(s, k, it);
+                        }
+                    });
+                }
             }
             Ok(Value::Undef)
         }
@@ -5717,22 +5811,27 @@ fn set_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
                 Err(host::type_error("not a set"))
             }
         }),
+        // Both variadic: apply each argument's key set in sequence.
         "intersection_update" => {
-            let other = iter_keys(&arg0(args)?)?;
-            with_host(|h| {
-                if let Some(PyObj::Set(s)) = h.get_mut(recv) {
-                    s.retain(|k, _| other.contains(k));
-                }
-            });
+            for a in args {
+                let other = iter_keys(a)?;
+                with_host(|h| {
+                    if let Some(PyObj::Set(s)) = h.get_mut(recv) {
+                        s.retain(|k, _| other.contains(k));
+                    }
+                });
+            }
             Ok(Value::Undef)
         }
         "difference_update" => {
-            let other = iter_keys(&arg0(args)?)?;
-            with_host(|h| {
-                if let Some(PyObj::Set(s)) = h.get_mut(recv) {
-                    s.retain(|k, _| !other.contains(k));
-                }
-            });
+            for a in args {
+                let other = iter_keys(a)?;
+                with_host(|h| {
+                    if let Some(PyObj::Set(s)) = h.get_mut(recv) {
+                        s.retain(|k, _| !other.contains(k));
+                    }
+                });
+            }
             Ok(Value::Undef)
         }
         "symmetric_difference_update" => {
@@ -5787,6 +5886,25 @@ fn set_binop(recv: &Value, args: &[Value], tag: i64) -> Result<Value, String> {
         call_builtin_function("set", vec![other], vec![])?
     };
     with_host(|h| h.binop(tag, recv, &other_set))
+}
+
+/// Variadic set fold (`union`/`intersection`): apply `tag` between the receiver
+/// and every argument in turn, coercing non-set arguments to sets. With no
+/// arguments it returns a copy of the receiver (preserving set/frozenset type).
+fn set_variadic(recv: &Value, args: &[Value], tag: i64) -> Result<Value, String> {
+    if args.is_empty() {
+        return set_method(recv, "copy", &[]);
+    }
+    let mut acc = recv.clone();
+    for a in args {
+        let other_set = if with_host(|h| h.setlike(a).is_some()) {
+            a.clone()
+        } else {
+            call_builtin_function("set", vec![a.clone()], vec![])?
+        };
+        acc = with_host(|h| h.binop(tag, &acc, &other_set))?;
+    }
+    Ok(acc)
 }
 
 fn range_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
@@ -6474,6 +6592,55 @@ fn bytes_common_method(
             }
             Ok(mk_bytes(is_ba, out))
         }
+        // ASCII capitalize: first byte uppercased, remaining bytes lowercased.
+        "capitalize" => {
+            let out: Vec<u8> = bytes
+                .iter()
+                .enumerate()
+                .map(|(i, &b)| {
+                    if i == 0 {
+                        b.to_ascii_uppercase()
+                    } else {
+                        b.to_ascii_lowercase()
+                    }
+                })
+                .collect();
+            Ok(mk_bytes(is_ba, out))
+        }
+        // Left-pad with b'0' to `width`, keeping a leading b'+'/b'-' sign in front.
+        "zfill" => {
+            let w = args
+                .first()
+                .and_then(|v| with_host(|h| h.as_int(v)))
+                .unwrap_or(0)
+                .max(0) as usize;
+            let out = if bytes.len() < w {
+                let padn = w - bytes.len();
+                let mut out = Vec::with_capacity(w);
+                let mut rest = bytes.as_slice();
+                if let Some((&first, tail)) = bytes.split_first() {
+                    if first == b'+' || first == b'-' {
+                        out.push(first);
+                        rest = tail;
+                    }
+                }
+                out.extend(std::iter::repeat(b'0').take(padn));
+                out.extend_from_slice(rest);
+                out
+            } else {
+                bytes.clone()
+            };
+            Ok(mk_bytes(is_ba, out))
+        }
+        // Expand b'\t' to the next `tabsize` stop; b'\n'/b'\r' reset the column.
+        "expandtabs" => {
+            let tabsize = args
+                .first()
+                .and_then(|v| with_host(|h| h.as_int(v)))
+                .unwrap_or(8)
+                .max(0) as usize;
+            Ok(mk_bytes(is_ba, expand_tabs_bytes(&bytes, tabsize)))
+        }
         "center" => Ok(mk_bytes(is_ba, pad_bytes(&bytes, args, 'c')?)),
         "ljust" => Ok(mk_bytes(is_ba, pad_bytes(&bytes, args, 'l')?)),
         "rjust" => Ok(mk_bytes(is_ba, pad_bytes(&bytes, args, 'r')?)),
@@ -7109,7 +7276,7 @@ fn ordered_move_to_end(recv: &Value, args: &[Value]) -> Result<Value, String> {
         false
     });
     if !found {
-        return Err(format!("KeyError: {}", with_host(|h| h.repr_of(&kv))));
+        return Err(with_host(|h| h.key_error(&kv)));
     }
     Ok(Value::Undef)
 }

@@ -344,9 +344,10 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
       (a brace-depth-aware field scanner + shared automatic-field counter, mirroring the
       f-string path); keyword `'{name}'.format(name=…)`, positional-index `'{0[1]}'`,
       subscript `'{d[k]}'`, and attribute `'{0.real}'` field access all resolve. Byte-
-      verified vs CPython (`format2` fuzz mode, 0 divergences). Still open: the `=` debug
-      specifier `f'{x=}'` is a **`SyntaxError`**. (`g`/`c`/`e` type handling and sign-aware
-      `=`/`0` fill are correct.)
+      verified vs CPython (`format2` fuzz mode, 0 divergences). The `=` debug specifier
+      `f'{x=}'`/`f'{x = }'`/`f'{x=:.2f}'`/`f'{y=!r}'` is now supported (`conttail` fuzz
+      mode, 0 divergences). (`g`/`c`/`e` type handling and sign-aware `=`/`0` fill are
+      correct.)
 - [ ] **str method args silently ignored** — `split`/`rsplit` maxsplit, `find`/`index`
       start, `splitlines(keepends)` all ignored → wrong values, no error.
 - [x] **Missing str methods** — FIXED: `partition`/`rpartition`/`rindex`/`isnumeric`/
@@ -366,9 +367,11 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
       `decode`/`hex`. `bytearray` item assignment (`ba[0]=65`) + slice assignment
       (`ba[1:2]=b'xy'`, `ba[::2]=…`) + `append`/`extend`/`pop`/`clear`. `repr` matches
       CPython quoting (single/double-quote selection; the bytearray `\'`-escape quirk).
-      Remaining bytes gaps: `swapcase`/`title`/`capitalize`/`center`/`ljust`/`rjust`/
-      `zfill`/`expandtabs`/`translate`/`maketrans`/`isX` predicates, `%`-formatting on
-      bytes, `del ba[i]`/`del ba[i:j]`, and the `errors=` arg on `decode`.
+      The `bytestail`/`conttail` fuzz modes drove the remaining str-parallel methods to
+      0: `swapcase`/`title`/`capitalize`/`center`/`ljust`/`rjust`/`zfill`/`expandtabs`/
+      `translate`/`maketrans`/`isX` predicates, `%`-formatting on bytes (incl. `%b`/`%s`
+      dispatch of a user `__bytes__`), `del ba[i]`/`del ba[i:j]`, and the `errors=` arg
+      on `decode` are all implemented.
 - [ ] **`str.encode` ignores the codec/errors args** — always UTF-8 (`'x'.encode('utf-16')`
       wrong).
 - [x] **`repr` doesn't escape C0 controls** (`\x00`-`\x1f`, ` `) — data-corrupting

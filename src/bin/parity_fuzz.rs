@@ -2822,6 +2822,170 @@ fn gen_descriptors(seed: u64) -> Vec<String> {
     vec![e]
 }
 
+/// Container "tail": dict methods & views, set/frozenset operations (variadic
+/// forms + operators), dict union, and the f-string `=` debug specifier plus the
+/// bytes `capitalize`/`zfill`/`expandtabs` methods and `%b`/`%s` `__bytes__`
+/// dispatch. Order-sensitive prints use insertion-ordered dict output; set
+/// results are `sorted()` (hash iteration order is not guaranteed to match);
+/// `set.pop()` removes an arbitrary element, so only the length delta is printed.
+fn gen_conttail(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let a = pick(r, SMALLINTS);
+    let b = pick(r, SMALLINTS);
+    let c = pick(r, SMALLINTS);
+    let d = pick(r, SMALLINTS);
+    match r.below(40) {
+        // ---- dict methods ----
+        0 => vec![format!(
+            "d = {{'a': {a}, 'b': {b}, 'c': {c}}}\nprint(d.get('a'), d.get('z'), d.get('z', -9))"
+        )],
+        1 => vec![format!(
+            "d = {{'a': {a}}}\nprint(d.setdefault('a', {b}), d.setdefault('b', {c}), d)"
+        )],
+        2 => vec![format!(
+            "d = {{'a': {a}, 'b': {b}}}\nprint(d.pop('a'), d.pop('z', 'def'), d)"
+        )],
+        // popitem is LIFO — deterministic.
+        3 => vec![format!(
+            "d = {{'a': {a}, 'b': {b}, 'c': {c}}}\nprint(d.popitem(), d.popitem(), d)"
+        )],
+        4 => vec![format!("d = {{'a': {a}}}\nd.update({{'b': {b}}}, c={c})\nprint(d)")],
+        5 => vec![format!(
+            "print(dict.fromkeys(['x', 'y', 'z'], {a}))\nprint(dict.fromkeys(['p', 'q']))"
+        )],
+        6 => vec![format!(
+            "d = {{'a': {a}, 'b': {b}}}\ne = d.copy()\ne['c'] = {c}\nprint(d, e)\nd.clear()\nprint(d)"
+        )],
+        // ---- dict views ----
+        7 => vec![format!(
+            "d = {{'a': {a}, 'b': {b}, 'c': {c}}}\nprint(list(d.keys()), list(d.values()))\nprint(list(d.items()))"
+        )],
+        8 => vec![format!(
+            "d = {{'a': {a}, 'b': {b}}}\nprint(len(d.keys()), 'a' in d.keys(), 'z' in d.keys())\nprint(type(d.keys()).__name__, type(d.values()).__name__, type(d.items()).__name__)"
+        )],
+        9 => vec![format!(
+            "d = {{'a': {a}, 'b': {b}, 'c': {c}}}\nprint(sorted(d.keys() & {{'a', 'c', 'x'}}))\nprint(sorted(d.keys() | {{'z'}}))\nprint(sorted(d.keys() - {{'a'}}))\nprint(sorted(d.keys() ^ {{'a', 'z'}}))"
+        )],
+        10 => vec![format!(
+            "d = {{'a': {a}, 'b': {b}}}\nprint(('a', {a}) in d.items(), ('a', 999) in d.items())\nprint(sorted(d.items() & {{('a', {a})}}))"
+        )],
+        // ---- dict union ----
+        11 => vec![format!(
+            "d1 = {{'a': {a}, 'b': {b}}}\nd2 = {{'b': {c}, 'c': {d}}}\nprint(d1 | d2)\nprint(d2 | d1)"
+        )],
+        12 => vec![format!("d1 = {{'a': {a}}}\nd1 |= {{'b': {b}, 'a': {c}}}\nprint(d1)")],
+        // ---- set methods (variadic union/intersection/difference) ----
+        13 => vec![format!("print(sorted({{{a}, {b}}}.union([{c}], [{d}, {a}])))")],
+        14 => vec![format!(
+            "print(sorted({{{a}, {b}, {c}, {d}}}.intersection([{a}, {b}, {c}], [{b}, {c}])))"
+        )],
+        15 => vec![format!(
+            "print(sorted({{{a}, {b}, {c}}}.difference([{a}], [{b}])))"
+        )],
+        16 => vec![format!(
+            "print(sorted({{{a}, {b}, {c}}}.symmetric_difference([{b}, {c}, {d}])))"
+        )],
+        17 => vec![format!(
+            "s = {{{a}, {b}}}\nprint(s.issubset({{{a}, {b}, {c}}}), s.issuperset({{{a}}}), s.isdisjoint({{{c}, {d}}}))"
+        )],
+        18 => vec![format!(
+            "s = {{{a}, {b}}}\ns.add({c})\ns.discard({d})\ns.discard(999)\nprint(sorted(s))"
+        )],
+        // set.pop() removes an arbitrary element — only the length delta is stable.
+        19 => vec![format!(
+            "s = {{{a}, {b}, {c}}}\nn = len(s)\ns.pop()\nprint(len(s) == n - 1)"
+        )],
+        20 => vec![format!(
+            "s = {{{a}, {b}, {c}}}\ns.update([{d}], {{{a}}})\ns.difference_update([{b}])\nprint(sorted(s))"
+        )],
+        21 => vec![format!(
+            "s = {{{a}, {b}, {c}, {d}}}\ns.intersection_update([{a}, {b}, {c}])\ns.symmetric_difference_update([{a}, 100])\nprint(sorted(s))"
+        )],
+        // ---- set operator forms ----
+        22 => vec![format!(
+            "A = {{{a}, {b}, {c}}}\nB = {{{b}, {c}, {d}}}\nprint(sorted(A | B), sorted(A & B), sorted(A - B), sorted(A ^ B))"
+        )],
+        23 => vec![format!(
+            "A = {{{a}, {b}}}\nB = {{{a}, {b}, {c}}}\nprint(A <= B, A < B, B >= A, A == {{{a}, {b}}})"
+        )],
+        // ---- frozenset ----
+        24 => vec![format!(
+            "fs = frozenset([{a}, {b}, {c}])\nprint(sorted(fs), len(fs), {a} in fs)\nprint(type(fs | {{{d}}}).__name__, type(fs & {{{a}}}).__name__)"
+        )],
+        25 => vec![format!(
+            "fs = frozenset([{a}, {b}])\nm = {{fs: 'v'}}\nprint(m[frozenset([{b}, {a}])], hash(fs) == hash(frozenset([{b}, {a}])))"
+        )],
+        26 => vec![format!(
+            "fs = frozenset([{a}])\ntry:\n    fs.add({b})\nexcept AttributeError as e:\n    print('AE', e)"
+        )],
+        27 => vec![format!(
+            "s = {{{a}, {b}}}\ns.remove({a})\nprint(sorted(s))\ntry:\n    s.remove(999)\nexcept KeyError as e:\n    print('KE', e)"
+        )],
+        // ---- f-string `=` debug ----
+        28 => vec![format!(
+            "x = {a}\nprint(f'{{x=}}')\nprint(f'{{x = }}')\nprint(f'{{ x =}}')"
+        )],
+        29 => vec![format!(
+            "x = {a}\ny = {b}\nprint(f'{{x + y = }}')\nprint(f'{{x * y=}}')"
+        )],
+        30 => vec![format!(
+            "v = {a}\nprint(f'{{v=:+05d}}')\nprint(f'{{v=:>8}}')\nprint(f'{{v = :#x}}')"
+        )],
+        31 => vec![format!(
+            "s = {}\nprint(f'{{s=!r}}')\nprint(f'{{s=!s}}')\nprint(f'{{s = !a}}')",
+            pick(r, WORDS)
+        )],
+        32 => vec![format!(
+            "d = {{'k': {a}}}\nprint(f'{{d=}}')\nprint(f'{{d[\"k\"]=}}')"
+        )],
+        // ---- f-string conversions / nesting / multiline ----
+        33 => vec![format!("xs = [{a}, {b}]\nprint(f'{{xs!r}}|{{xs!s}}|{{xs!a}}')")],
+        34 => vec![format!(
+            "w = {}\nx = {a}\nprint(f'{{x:>{{w}}}}')\nprint(f'{{x:0{{w}}d}}')",
+            pick(r, POSINTS)
+        )],
+        35 => vec![format!(
+            "x = {a}\ny = {b}\nprint(f'''line1 {{x}}\nline2 {{y=}}''')"
+        )],
+        36 => vec![format!(
+            "name = {}\nprint(f'{{name=}} and {{name!r}}')",
+            pick(r, WORDS)
+        )],
+        // ---- bytes tail: capitalize / zfill / expandtabs ----
+        37 => {
+            let bl = pick(
+                r,
+                &[
+                    "b'hello WORLD'",
+                    "b'ABC def'",
+                    "b'123abc'",
+                    "b'  MiXeD  '",
+                    "b''",
+                    "b'a'",
+                ],
+            );
+            vec![format!(
+                "print({bl}.capitalize(), bytearray({bl}).capitalize())"
+            )]
+        }
+        38 => {
+            let zb = pick(r, &["b'42'", "b'-42'", "b'+7'", "b'abc'", "b''", "b'0'"]);
+            let zw = pick(r, &["0", "2", "4", "6", "8"]);
+            vec![format!(
+                "print({zb}.zfill({zw}), bytearray({zb}).zfill({zw}))"
+            )]
+        }
+        // ---- bytes `%b`/`%s` with __bytes__ ----
+        _ => {
+            let ts = pick(r, &["0", "1", "2", "4", "8"]);
+            let rv = pick(r, &["b'X'", "b'yy'", "b'A,B'", "b''"]);
+            vec![format!(
+                "print(b'a\\tbc\\td\\te'.expandtabs({ts}), b'x\\ty\\nz\\tw'.expandtabs({ts}))\nclass C:\n    def __bytes__(self): return {rv}\nprint(b'<%b>' % C(), b'<%s>' % C())"
+            )]
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Mode dispatch
 // ---------------------------------------------------------------------------
@@ -2873,6 +3037,7 @@ enum Mode {
     Attr,
     Calls,
     Match,
+    Conttail,
 }
 
 const REAL_MODES: &[Mode] = &[
@@ -2920,6 +3085,7 @@ const REAL_MODES: &[Mode] = &[
     Mode::Attr,
     Mode::Calls,
     Mode::Match,
+    Mode::Conttail,
 ];
 
 /// Generate the statement list for a seed in the selected mode. `Mixed` rotates
@@ -2974,6 +3140,7 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Attr => gen_attr(seed),
         Mode::Calls => gen_calls(seed),
         Mode::Match => gen_match(seed),
+        Mode::Conttail => gen_conttail(seed),
     }
 }
 
@@ -3024,6 +3191,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Attr => "attr",
         Mode::Calls => "calls",
         Mode::Match => "match",
+        Mode::Conttail => "conttail",
     }
 }
 
@@ -3074,6 +3242,7 @@ fn mode_from_name(s: &str) -> Option<Mode> {
         Mode::Attr,
         Mode::Calls,
         Mode::Match,
+        Mode::Conttail,
     ];
     ALL.iter().copied().find(|&m| mode_name(m) == s)
 }
