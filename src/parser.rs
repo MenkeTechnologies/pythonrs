@@ -1591,7 +1591,7 @@ impl Parser {
                     }
                     i += 1;
                 }
-                parts.push(self.build_fstring_field(&field, is_raw)?);
+                parts.extend(self.build_fstring_field(&field, is_raw)?);
             } else if c == '}' {
                 if chars.get(i + 1) == Some(&'}') {
                     lit.push('}');
@@ -1612,7 +1612,23 @@ impl Parser {
         Ok(parts)
     }
 
-    fn build_fstring_field(&self, field: &str, is_raw: bool) -> Result<FStrPart, String> {
+    fn build_fstring_field(&self, field: &str, is_raw: bool) -> Result<Vec<FStrPart>, String> {
+        // `{expr=}` debug form (PEP 501): the source text up to and including the
+        // top-level `=` (plus following whitespace) is emitted literally, then
+        // the value. A trailing `!conv`/`:spec` still applies; with neither, the
+        // value uses `repr`. Reconstruct "expr[!conv][:spec]" without the `=`
+        // (and leading whitespace) so the shared conv/spec split below applies.
+        let mut debug_prefix: Option<String> = None;
+        let work: String = if let Some(eq) = find_debug_eq(field) {
+            let after = &field[eq + 1..];
+            let ws = after.len() - after.trim_start().len();
+            debug_prefix = Some(field[..eq + 1 + ws].to_string());
+            format!("{}{}", &field[..eq], after.trim_start())
+        } else {
+            field.to_string()
+        };
+        let field: &str = &work;
+
         // Split off !conv and :spec (top level only).
         let mut expr_src = field;
         let mut spec: Vec<FStrPart> = Vec::new();
@@ -1634,7 +1650,10 @@ impl Parser {
                 }
             }
         }
-        // `{x=}` debugging form -> literal "x=" + repr.
+        // A debug field with neither conversion nor format spec defaults to repr.
+        if debug_prefix.is_some() && conv.is_none() && spec.is_empty() {
+            conv = Some('r');
+        }
         let expr_src = expr_src.trim();
         let sub = parse(&format!("({expr_src})")).map_err(|e| format!("f-string: {e}"))?;
         let expr = match sub.into_iter().next() {
@@ -1644,11 +1663,16 @@ impl Parser {
             }) => e,
             _ => return Err(format!("f-string: invalid expression {{{expr_src}}}")),
         };
-        Ok(FStrPart::Expr {
+        let mut out = Vec::with_capacity(2);
+        if let Some(pre) = debug_prefix {
+            out.push(FStrPart::Lit(pre));
+        }
+        out.push(FStrPart::Expr {
             expr: Box::new(expr),
             conv,
             spec,
-        })
+        });
+        Ok(out)
     }
 
     /// `(...)` — parenthesized expr, tuple, or generator expression.
@@ -1813,6 +1837,53 @@ fn find_top_level(s: &str, ch: char) -> Option<usize> {
             _ if c == ch && depth == 0 => return Some(i),
             _ => {}
         }
+    }
+    None
+}
+
+/// Locate the `=` debug marker in an f-string field: the first top-level
+/// standalone `=` that is not part of `==`/`!=`/`<=`/`>=`/`:=` and appears
+/// before any top-level `:` (format spec). Tracks bracket depth and string
+/// literals so a `=`/`:` inside `f(a=1)`, `d[i:j]`, or `"a=b"` is ignored.
+fn find_debug_eq(field: &str) -> Option<usize> {
+    let bytes = field.as_bytes();
+    let mut depth = 0i32;
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(q) = quote {
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\'' | b'"' => quote = Some(c),
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            // A top-level `:` starts the format spec; a debug `=` must precede it.
+            b':' if depth == 0 => return None,
+            b'=' if depth == 0 => {
+                let next = bytes.get(i + 1).copied();
+                let prev = if i > 0 { bytes.get(i - 1).copied() } else { None };
+                let is_eqeq = next == Some(b'=');
+                let is_cmp = matches!(
+                    prev,
+                    Some(b'=') | Some(b'!') | Some(b'<') | Some(b'>') | Some(b':')
+                );
+                if !is_eqeq && !is_cmp {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
     }
     None
 }

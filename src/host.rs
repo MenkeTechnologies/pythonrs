@@ -3373,6 +3373,7 @@ impl PyHost {
         fmt: &[u8],
         args: &Value,
         is_ba: bool,
+        premap: &std::collections::HashMap<u32, Vec<u8>>,
     ) -> Result<Value, String> {
         let is_mapping = matches!(self.get(args), Some(PyObj::Dict(_)));
         let arglist: Vec<Value> = if is_mapping {
@@ -3509,12 +3510,17 @@ impl PyHost {
                 'b' | 's' => {
                     let mut raw = match self.get(&val) {
                         Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) => b.clone(),
-                        _ => {
-                            return Err(type_error(&format!(
+                        // A user instance's `__bytes__` was pre-resolved outside
+                        // the borrow into `premap`, keyed by heap id.
+                        _ => match &val {
+                            Value::Obj(id) if premap.contains_key(id) => premap[id].clone(),
+                            _ => {
+                                return Err(type_error(&format!(
                             "%b requires a bytes-like object, or an object that implements __bytes__, not '{}'",
                             self.type_name(&val)
                         )))
-                        }
+                            }
+                        },
                     };
                     if let Some(p) = prec {
                         raw.truncate(p);

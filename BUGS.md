@@ -82,6 +82,12 @@ fixed. Every line below was re-checked against the **default-build** binary
   `'{:>{width}.{prec}f}'.format(v, width=10, prec=2)`: the `{…}` inside a spec is
   evaluated as its own replacement field (sharing the automatic-field counter) and
   spliced into the final spec before formatting.
+- **f-string `=` debug specifier** `f'{x=}'` / `f'{x = }'` / `f'{x+1=}'`: the
+  source text up to and including the top-level `=` (preserving surrounding
+  whitespace) is emitted literally, then the value — defaulting to `repr` with
+  neither conversion nor format spec, and honoring a trailing `!r`/`!s`/`!a`
+  conversion or `:spec` (`f'{x=:.2f}'`, `f'{y=!r}'`). Byte-verified vs CPython
+  via the `conttail` fuzz mode.
 - **`str.format` keyword / index / attribute fields** `'{name}'.format(name=…)`,
   `'{0[1]}'.format(seq)`, `'{d[k]}'.format(d=…)` (unquoted subscript key → str),
   `'{0.real}'.format(x)` (attribute access) — all resolve against the positional
@@ -101,12 +107,14 @@ fixed. Every line below was re-checked against the **default-build** binary
   dict/set key. Str-parallel methods returning/taking bytes:
   `split`/`rsplit`/`join`/`replace`/`find`/`rfind`/`index`/`rindex`/`count`/
   `startswith`/`endswith`/`strip`/`lstrip`/`rstrip`/`upper`/`lower`/`swapcase`/
-  `title`/`center`/`ljust`/`rjust`/`splitlines`/`partition`/`rpartition`/
+  `title`/`capitalize`/`zfill`/`expandtabs`/`center`/`ljust`/`rjust`/
+  `splitlines`/`partition`/`rpartition`/
   `removeprefix`/`removesuffix`/`translate`/`maketrans`/`decode` (with
   `errors=` `strict`/`ignore`/`replace`)/`hex`, the ASCII `isX` predicates
   (`isalpha`/`isdigit`/`isalnum`/`isspace`/`isupper`/`islower`/`istitle`/
   `isascii`), and PEP 461 `%`-formatting (`b'%d-%s' % (1, b'x')`, `%b`/`%c`/
-  `%a`/`%r`, width/precision/flags, `%(name)s` mapping). `bytearray` item +
+  `%a`/`%r`, width/precision/flags, `%(name)s` mapping; `%b`/`%s` dispatch a
+  user instance's `__bytes__`). `bytearray` item +
   slice assignment (`ba[0]=65`, `ba[1:2]=b'xy'`, `ba[::2]=…`), deletion
   (`del ba[i]`, `del ba[i:j]`, `del ba[::k]`), plus
   `append`/`extend`/`pop`/`clear`. `repr` matches CPython quoting (single/
@@ -164,14 +172,9 @@ fixed. Every line below was re-checked against the **default-build** binary
 - **`int`** is arbitrary precision (bignum) across `+ - * ** // %` and the bitwise
   ops `& | ^ << >>` — verified byte-identical to CPython on `10**30`-scale values
   (the earlier i64-cap on `//`/`%`/bitwise is gone).
-- **`bytes`/`bytearray`** (real types — see Implemented) still lack the
-  `capitalize`/`zfill`/`expandtabs` string-parallel methods. `%`-formatting of a
-  user instance with `__bytes__` via `%b`/`%s` also isn't dispatched (plain
-  bytes-like args and the numeric/`%a`/`%r`/`%c` conversions all work).
 - **f-string / `str.format` format spec** covers the common mini-language
   (fill/align/sign/width/`,`/`.prec`/type `d f e x o b % s c g`) and nested field
-  specs (see Implemented). The `=` debug specifier `f'{x=}'` is still a
-  `SyntaxError`.
+  specs (see Implemented).
 
 ## Tooling
 - **`--dap`** (Debug Adapter Protocol): implemented — breakpoints, step
