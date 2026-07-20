@@ -403,6 +403,10 @@ fn b_getitem(vm: &mut VM, _: u8) -> Value {
         let r = host::call_method(&recv, "__getitem__", vec![idx], vec![]);
         return finish(vm, r);
     }
+    // `Cls[item]` on a class with `__class_getitem__` (e.g. generic aliases).
+    if let Some(r) = host::class_getitem(&recv, idx.clone()) {
+        return finish(vm, r);
+    }
     // dict-subclass `__missing__`: Counter → 0, defaultdict → default_factory().
     if let Some(meta) = host::dict_meta_of(&recv) {
         let missing = with_host(|h| match h.to_key(&idx) {
@@ -2900,14 +2904,12 @@ pub fn call_builtin_function(
         "isinstance" => {
             let v = arg0(&args)?;
             let cls = args.get(1).cloned().unwrap_or(Value::Undef);
-            Ok(Value::Bool(with_host(|h| isinstance(h, &v, &cls))))
+            isinstance_dispatch(&v, &cls).map(Value::Bool)
         }
         "issubclass" => {
             let a0 = arg0(&args)?;
             let a1 = args.get(1).cloned().unwrap_or(Value::Undef);
-            let a = with_host(|h| callable_name(h, &a0)).unwrap_or_default();
-            let b = with_host(|h| callable_name(h, &a1)).unwrap_or_default();
-            Ok(Value::Bool(with_host(|h| type_isa(h, &a, &b))))
+            issubclass_dispatch(&a0, &a1).map(Value::Bool)
         }
         "hasattr" => {
             let v = arg0(&args)?;
@@ -4049,6 +4051,53 @@ fn exception_isa(exc_class: &str, want: &str, h: &host::PyHost) -> bool {
         }
     }
     false
+}
+
+/// `isinstance(v, cls)` honoring a metaclass `__instancecheck__` override and a
+/// tuple of classes (checked left to right, each with its own override). Falls
+/// back to the structural `isinstance` when no override applies.
+fn isinstance_dispatch(v: &Value, cls: &Value) -> Result<bool, String> {
+    if let Some(PyObj::Tuple(ts)) = with_host(|h| h.get(cls).cloned()) {
+        for t in ts {
+            if isinstance_dispatch(v, &t)? {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+    if let Some(r) = host::metaclass_hook(cls, "__instancecheck__", v.clone()) {
+        let res = r?;
+        return Ok(with_host(|h| h.truthy(&res)));
+    }
+    Ok(with_host(|h| isinstance(h, v, cls)))
+}
+
+/// `issubclass(sub, cls)` honoring a metaclass `__subclasscheck__` override and a
+/// tuple of classes. Raises `TypeError` when `sub` is not a class, matching
+/// CPython. Falls back to the structural name-based check.
+fn issubclass_dispatch(sub: &Value, cls: &Value) -> Result<bool, String> {
+    if let Some(PyObj::Tuple(ts)) = with_host(|h| h.get(cls).cloned()) {
+        for t in ts {
+            if issubclass_dispatch(sub, &t)? {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+    if let Some(r) = host::metaclass_hook(cls, "__subclasscheck__", sub.clone()) {
+        let res = r?;
+        return Ok(with_host(|h| h.truthy(&res)));
+    }
+    let a = match with_host(|h| callable_name(h, sub)) {
+        Some(n) => n,
+        None => {
+            return Err(host::type_error(
+                "issubclass() arg 1 must be a class",
+            ))
+        }
+    };
+    let b = with_host(|h| callable_name(h, cls)).unwrap_or_default();
+    Ok(with_host(|h| type_isa(h, &a, &b)))
 }
 
 fn isinstance(h: &host::PyHost, v: &Value, cls: &Value) -> bool {

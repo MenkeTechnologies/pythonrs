@@ -4888,6 +4888,20 @@ impl PyHost {
                 if name == "__name__" || name == "__qualname__" {
                     return Ok(self.new_str(cname));
                 }
+                // `cls.__class__` is the metaclass (`type(cls)`): a user metaclass
+                // becomes a `Class`, otherwise the builtin `type`.
+                if name == "__class__" {
+                    let meta = self
+                        .classes
+                        .get(&cname)
+                        .map(|c| c.metaclass.clone())
+                        .unwrap_or_else(|| "type".into());
+                    return Ok(if self.classes.contains_key(&meta) {
+                        self.alloc(PyObj::Class(meta))
+                    } else {
+                        self.alloc(PyObj::Builtin(meta))
+                    });
+                }
                 // Class introspection: `__mro__`, `__bases__`, `__dict__`.
                 if name == "__mro__" {
                     let mut mro: Vec<Value> = self
@@ -5704,6 +5718,10 @@ pub fn call_method(
                     }
                     Ok(Value::Undef)
                 }
+                // `super().__init_subclass__()` bottoms out at `object`'s no-op
+                // default (PEP 487): a cooperative chain reaching the top returns
+                // `None`. (`object` has no `__set_name__`, so that still errors.)
+                None if name == "__init_subclass__" => Ok(Value::Undef),
                 None => Err(format!(
                     "AttributeError: 'super' object has no attribute '{name}'"
                 )),
@@ -5750,6 +5768,47 @@ pub fn call_method(
         },
         _ => crate::builtins::call_type_method(recv, name, args, kwargs),
     }
+}
+
+/// If `cls` is a user class whose metaclass overrides `name` (used for
+/// `__instancecheck__` / `__subclasscheck__`), invoke the override bound to the
+/// class and return its result. `None` means "no override" — the caller falls
+/// back to the structural check. Ordinary classes (metaclass `type`) and any
+/// non-class value return `None`.
+pub fn metaclass_hook(cls: &Value, name: &str, arg: Value) -> Option<Result<Value, String>> {
+    let cname = match with_host(|h| h.get(cls).cloned()) {
+        Some(PyObj::Class(n)) => n,
+        _ => return None,
+    };
+    let meta = with_host(|h| {
+        h.classes
+            .get(&cname)
+            .map(|c| c.metaclass.clone())
+            .unwrap_or_else(|| "type".into())
+    });
+    if meta == "type" || !with_host(|h| h.class_lookup(&meta, name).is_some()) {
+        return None;
+    }
+    Some(call_method(cls, name, vec![arg], vec![]))
+}
+
+/// If `cls` is a user class defining `__class_getitem__` (an implicit
+/// classmethod), invoke it with the class and `item`, returning the result.
+/// `None` means the class has no such hook — the caller reports the normal
+/// "not subscriptable" error.
+pub fn class_getitem(cls: &Value, item: Value) -> Option<Result<Value, String>> {
+    let cname = match with_host(|h| h.get(cls).cloned()) {
+        Some(PyObj::Class(n)) => n,
+        _ => return None,
+    };
+    let f = with_host(|h| h.class_lookup(&cname, "__class_getitem__"))?;
+    // Implicit classmethod: bind the class as the leading `cls` argument whether
+    // the body was wrapped with `@classmethod` or written bare.
+    let inner = match with_host(|h| h.get(&f).cloned()) {
+        Some(PyObj::ClassMethod(inner)) => inner,
+        _ => f,
+    };
+    Some(invoke(&inner, vec![cls.clone(), item], vec![]))
 }
 
 /// Resolve `name` for a `super` proxy: search the MRO of `inst_class` strictly
