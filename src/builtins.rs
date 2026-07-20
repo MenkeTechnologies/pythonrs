@@ -435,11 +435,19 @@ fn b_getitem(vm: &mut VM, _: u8) -> Value {
     }
     // A non-dict index that is an instance with `__index__` stands in for an int
     // (`seq[obj]`). Resolve it before indexing; dict lookups key on the object.
+    // A `slice` bound with `__index__` is resolved the same way (`a[Idx():Idx()]`).
     let idx = if with_host(|h| !matches!(h.get(&recv), Some(PyObj::Dict(_)))) {
-        match index_dunder(&idx) {
-            Ok(Some(v)) => v,
-            Ok(None) => idx,
-            Err(e) => return abort(vm, e),
+        if with_host(|h| matches!(h.get(&idx), Some(PyObj::Slice { .. }))) {
+            match normalize_slice_bounds(&idx) {
+                Ok(v) => v,
+                Err(e) => return abort(vm, e),
+            }
+        } else {
+            match index_dunder(&idx) {
+                Ok(Some(v)) => v,
+                Ok(None) => idx,
+                Err(e) => return abort(vm, e),
+            }
         }
     } else {
         idx
@@ -458,8 +466,13 @@ fn b_setitem(vm: &mut VM, _: u8) -> Value {
         return finish(vm, r);
     }
     // Slice assignment (`x[i:j] = it`): materialize the RHS iterable here, out
-    // of any host borrow (it may be a generator), then splice.
+    // of any host borrow (it may be a generator), then splice. Slice bounds with
+    // `__index__` are resolved to ints first (`a[Idx():Idx()] = it`).
     if with_host(|h| matches!(h.get(&idx), Some(PyObj::Slice { .. }))) {
+        let idx = match normalize_slice_bounds(&idx) {
+            Ok(v) => v,
+            Err(e) => return abort(vm, e),
+        };
         let repl = match host::iter_vec(&val) {
             Ok(v) => v,
             Err(e) => return abort(vm, e),
@@ -481,6 +494,21 @@ fn b_setitem(vm: &mut VM, _: u8) -> Value {
 fn b_delitem(vm: &mut VM, _: u8) -> Value {
     let idx = vm.pop();
     let recv = vm.pop();
+    // `del obj[i]` on an instance dispatches to `__delitem__` (raw index/slice).
+    if with_host(|h| matches!(h.get(&recv), Some(PyObj::Instance(_)))) {
+        let r = host::call_method(&recv, "__delitem__", vec![idx], vec![]).map(|_| Value::Undef);
+        return finish(vm, r);
+    }
+    // `del seq[Idx():Idx()]` — resolve `__index__` slice bounds (recv is a
+    // builtin sequence here; instances were dispatched to `__delitem__` above).
+    let idx = if with_host(|h| matches!(h.get(&idx), Some(PyObj::Slice { .. }))) {
+        match normalize_slice_bounds(&idx) {
+            Ok(v) => v,
+            Err(e) => return abort(vm, e),
+        }
+    } else {
+        idx
+    };
     let cands = host::instance_key_candidates(&recv);
     match host::with_instance_key(&idx, &cands, || with_host(|h| h.del_item(&recv, &idx))) {
         Ok(()) => Value::Undef,
@@ -2434,6 +2462,7 @@ const BUILTIN_FUNCS: &[&str] = &[
     "property",
     "exit",
     "quit",
+    "slice",
 ];
 
 // ── builtin functions ────────────────────────────────────────────────────────
@@ -2666,6 +2695,27 @@ pub fn call_builtin_function(
             Ok(Value::Int(n as i64))
         }
         "range" => make_range(&args),
+        // `slice(stop)` / `slice(start, stop[, step])`. Bounds are stored RAW —
+        // CPython keeps the objects (`slice(x).start is x`); `__index__` is only
+        // applied when the slice is *used* (indexing) or `.indices()` is called.
+        "slice" => {
+            let (lo, hi, step) = match args.len() {
+                1 => (Value::Undef, args[0].clone(), Value::Undef),
+                2 => (args[0].clone(), args[1].clone(), Value::Undef),
+                3 => (args[0].clone(), args[1].clone(), args[2].clone()),
+                0 => {
+                    return Err(host::type_error(
+                        "slice expected at least 1 argument, got 0",
+                    ))
+                }
+                n => {
+                    return Err(host::type_error(&format!(
+                        "slice expected at most 3 arguments, got {n}"
+                    )))
+                }
+            };
+            Ok(with_host(|h| h.alloc(PyObj::Slice { lo, hi, step })))
+        }
         "abs" => {
             let v = arg0(&args)?;
             // Instance overloading: `abs(x)` → `x.__abs__()`.
@@ -4174,6 +4224,7 @@ pub fn type_has_method(typename: &str, name: &str) -> bool {
         "set" | "frozenset" => SET_METHODS,
         "tuple" => TUPLE_METHODS,
         "range" => &["index", "count"],
+        "slice" => &["indices"],
         "deque" => DEQUE_METHODS,
         "TextIOWrapper" => FILE_METHODS,
         "int" | "float" | "bool" => NUM_METHODS,
@@ -4494,6 +4545,7 @@ pub fn call_type_method(
         "set" | "frozenset" => set_method(recv, name, &args),
         "tuple" => tuple_method(recv, name, &args),
         "range" => range_method(recv, name, &args),
+        "slice" => slice_method(recv, name, &args),
         "deque" => deque_method(recv, name, &args),
         "TextIOWrapper" => file_method(recv, name, &args),
         "functools._lru_cache_wrapper" => lru_wrapper_method(recv, name),
@@ -5549,13 +5601,43 @@ fn list_method(
             Ok(Value::Undef)
         }
         "index" => {
+            // `list.index(x[, start[, stop]])` — search the half-open `[start, stop)`
+            // window; negative bounds normalize against `len` (clamped, like a slice).
             let v = arg0(args)?;
+            let n = with_host(|h| match h.get(recv) {
+                Some(PyObj::List(l)) => l.len() as i64,
+                _ => 0,
+            });
+            let mut start = match args.get(1) {
+                Some(a) => with_host(|h| h.as_int(a)).unwrap_or(0),
+                None => 0,
+            };
+            let mut stop = match args.get(2) {
+                Some(a) => with_host(|h| h.as_int(a)).unwrap_or(n),
+                None => n,
+            };
+            if start < 0 {
+                start += n;
+                if start < 0 {
+                    start = 0;
+                }
+            }
+            if stop < 0 {
+                stop += n;
+            }
+            if stop > n {
+                stop = n;
+            }
             with_host(|h| {
                 if let Some(PyObj::List(l)) = h.get(recv) {
-                    match l.iter().position(|x| h.equal(x, &v)) {
-                        Some(p) => Ok(Value::Int(p as i64)),
-                        None => Err("ValueError: is not in list".into()),
+                    let mut i = start;
+                    while i < stop {
+                        if h.equal(&l[i as usize], &v) {
+                            return Ok(Value::Int(i));
+                        }
+                        i += 1;
                     }
+                    Err("ValueError: list.index(x): x not in list".into())
                 } else {
                     Err(host::type_error("not a list"))
                 }
@@ -6001,6 +6083,96 @@ fn set_variadic(recv: &Value, args: &[Value], tag: i64) -> Result<Value, String>
         acc = with_host(|h| h.binop(tag, &acc, &other_set))?;
     }
     Ok(acc)
+}
+
+/// Resolve a slice bound that is an instance with `__index__` to a plain int,
+/// leaving ints, `None`, and everything else untouched. Used to normalize a
+/// slice before it drives a builtin-sequence read/assign/delete, and by
+/// `slice.indices()`.
+fn resolve_slice_bound(v: &Value) -> Result<Value, String> {
+    match index_dunder(v)? {
+        Some(iv) => Ok(iv),
+        None => Ok(v.clone()),
+    }
+}
+
+/// If `idx` is a `slice` whose start/stop/step include an instance with
+/// `__index__`, return an equivalent slice with those bounds resolved to plain
+/// ints (so `slice_bounds` sees integers). Non-slices and slices with no
+/// instance bound are returned unchanged (identity preserved). This is applied
+/// ONLY on the builtin-sequence path — a user `__getitem__` receives the slice
+/// with its original bound objects, exactly as CPython delivers it.
+fn normalize_slice_bounds(idx: &Value) -> Result<Value, String> {
+    let parts = with_host(|h| match h.get(idx) {
+        Some(PyObj::Slice { lo, hi, step }) => Some((lo.clone(), hi.clone(), step.clone())),
+        _ => None,
+    });
+    let (lo, hi, step) = match parts {
+        Some(t) => t,
+        None => return Ok(idx.clone()),
+    };
+    let needs = with_host(|h| {
+        [&lo, &hi, &step]
+            .iter()
+            .any(|b| matches!(h.get(b), Some(PyObj::Instance(_))))
+    });
+    if !needs {
+        return Ok(idx.clone());
+    }
+    let lo = resolve_slice_bound(&lo)?;
+    let hi = resolve_slice_bound(&hi)?;
+    let step = resolve_slice_bound(&step)?;
+    Ok(with_host(|h| h.alloc(PyObj::Slice { lo, hi, step })))
+}
+
+/// `slice.indices(len)` — the `(start, stop, step)` triple CPython computes via
+/// `PySlice_GetIndicesEx`: step defaults to 1 (0 is a `ValueError`), a negative
+/// length is a `ValueError`, and start/stop/step/len each honor `__index__`.
+fn slice_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    if name != "indices" {
+        return Err(host::type_error(&format!(
+            "'slice' object has no attribute '{name}'"
+        )));
+    }
+    if args.len() != 1 {
+        return Err(host::type_error(&format!(
+            "slice.indices() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
+    let (lo, hi, step) = with_host(|h| match h.get(recv) {
+        Some(PyObj::Slice { lo, hi, step }) => (lo.clone(), hi.clone(), step.clone()),
+        _ => (Value::Undef, Value::Undef, Value::Undef),
+    });
+    // Length must be a non-negative int (via `__index__`).
+    let nv = resolve_slice_bound(&args[0])?;
+    let n = with_host(|h| h.as_int(&nv))
+        .ok_or_else(|| host::type_error("'slice' object cannot be interpreted as an integer"))?;
+    if n < 0 {
+        return Err("ValueError: length should not be negative".into());
+    }
+    // Step defaults to 1; must be non-zero.
+    let step_i = if matches!(step, Value::Undef) {
+        1
+    } else {
+        let sv = resolve_slice_bound(&step)?;
+        let s = with_host(|h| h.as_int(&sv))
+            .ok_or_else(|| host::type_error("slice indices must be integers or None"))?;
+        if s == 0 {
+            return Err("ValueError: slice step cannot be zero".into());
+        }
+        s
+    };
+    let lo = resolve_slice_bound(&lo)?;
+    let hi = resolve_slice_bound(&hi)?;
+    let (start, stop) = with_host(|h| h.slice_adjust(&lo, &hi, step_i, n));
+    Ok(with_host(|h| {
+        h.new_tuple(vec![
+            Value::Int(start),
+            Value::Int(stop),
+            Value::Int(step_i),
+        ])
+    }))
 }
 
 fn range_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {

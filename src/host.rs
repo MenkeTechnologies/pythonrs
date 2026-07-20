@@ -4694,6 +4694,15 @@ impl PyHost {
 /// Mirrors CPython's `PySlice_AdjustIndices`: negative endpoints are relative to
 /// the end, and the clamping bounds differ by step direction (a negative step
 /// clamps into `[-1, n-1]`, a positive step into `[0, n]`).
+impl PyHost {
+    /// `slice.indices(n)` support: the clamped `(start, stop)` for `[lo:hi:step]`
+    /// over a length-`n` sequence (mirrors CPython `PySlice_AdjustIndices`). The
+    /// caller supplies already-int-coerced bounds (`__index__` resolved).
+    pub fn slice_adjust(&self, lo: &Value, hi: &Value, step: i64, n: i64) -> (i64, i64) {
+        slice_bounds(lo, hi, step, n, self)
+    }
+}
+
 fn slice_bounds(lo: &Value, hi: &Value, step: i64, n: i64, h: &PyHost) -> (i64, i64) {
     let lower = if step < 0 { -1 } else { 0 };
     let upper = if step < 0 { n - 1 } else { n };
@@ -5069,6 +5078,16 @@ impl PyHost {
             // `bytes.maketrans` / `bytearray.maketrans` — static methods on the type.
             Some(PyObj::Builtin(n)) if (n == "bytes" || n == "bytearray") && name == "maketrans" => {
                 Ok(self.alloc(PyObj::Builtin(format!("{n}.maketrans"))))
+            }
+            // `slice` read-only attributes: the RAW stored bound objects
+            // (`slice(x).start is x`), `None` for an omitted bound.
+            Some(PyObj::Slice { lo, hi, step }) if matches!(name, "start" | "stop" | "step") => {
+                let v = match name {
+                    "start" => lo,
+                    "stop" => hi,
+                    _ => step,
+                };
+                Ok(v.clone())
             }
             _ => {
                 // Numeric `.real`/`.imag` (int/float/bool/bigint/complex are all

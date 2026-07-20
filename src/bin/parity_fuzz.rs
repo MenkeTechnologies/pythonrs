@@ -417,6 +417,336 @@ fn gen_slice(seed: u64) -> Vec<String> {
     vec![format!("print({e})")]
 }
 
+/// Sequence tail: the list/tuple/str/range slice + `list`-method protocol.
+/// Exercises extended-slice READ (negative step/indices, out-of-range clamping),
+/// slice ASSIGN (grow/shrink contiguous, exact-length extended), slice DELETE,
+/// slice bounds honoring `__index__`, the full `list` method set (with the
+/// `ValueError`/`IndexError` boundaries), custom `__getitem__`/`__setitem__`/
+/// `__delitem__` receiving a `slice` object, `slice(...).indices(n)`, sequence
+/// `*` repetition / `+` concatenation, and negative-index normalization.
+///
+/// Every probe is `print`ed; error paths are caught and reduced to
+/// `type(e).__name__` so exit-code AND stdout parity are both deterministic.
+fn gen_seqtail(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    // Rich bound set: in-range, negative, and far out-of-range (clamping).
+    let bounds = &[
+        "", "0", "1", "2", "3", "-1", "-2", "-3", "5", "7", "-7", "100", "-100",
+    ];
+    let a = pick(r, bounds);
+    let b = pick(r, bounds);
+    let steps = &["", "1", "2", "3", "-1", "-2", "-3"];
+    let step = pick(r, steps);
+    let sl = |a: &str, b: &str, step: &str| -> String {
+        if step.is_empty() {
+            format!("{a}:{b}")
+        } else {
+            format!("{a}:{b}:{step}")
+        }
+    };
+    // A concrete int for method args / repetition counts.
+    let k = pick(r, &["0", "1", "2", "3", "-1", "-2", "5", "-5"]);
+    let n = pick(r, &["0", "1", "2", "3", "4"]);
+    match r.below(20) {
+        // 0: extended slice READ over list/tuple/str/range.
+        0 => {
+            let seq = pick(
+                r,
+                &[
+                    "[10, 20, 30, 40, 50, 60]",
+                    "(0, 1, 2, 3, 4, 5, 6)",
+                    "'abcdefghij'",
+                    "range(10)",
+                    "range(2, 20, 3)",
+                ],
+            );
+            vec![format!("print(({seq})[{}])", sl(a, b, step))]
+        }
+        // 1: contiguous slice ASSIGN (grow / shrink / clear).
+        1 => {
+            let rhs = pick(
+                r,
+                &[
+                    "[]",
+                    "[99]",
+                    "[7, 8, 9]",
+                    "[1, 2, 3, 4, 5]",
+                    "range(3)",
+                    "'xy'",
+                    "(100, 200)",
+                ],
+            );
+            vec![
+                "x = [0, 1, 2, 3, 4]".into(),
+                format!("x[{a}:{b}] = {rhs}"),
+                "print(x)".into(),
+            ]
+        }
+        // 2: extended slice ASSIGN — exact length ok / mismatch => ValueError.
+        2 => {
+            let rhs = pick(
+                r,
+                &["[100, 200, 300]", "[9]", "range(2)", "[1, 2, 3, 4, 5, 6]"],
+            );
+            let st = pick(r, &["2", "3", "-1", "-2"]);
+            vec![
+                "x = list(range(6))".into(),
+                "try:".into(),
+                format!("    x[{}] = {rhs}", sl(a, b, st)),
+                "    print(x)".into(),
+                "except Exception as e:".into(),
+                "    print(type(e).__name__)".into(),
+            ]
+        }
+        // 3: slice DELETE (contiguous + extended).
+        3 => {
+            vec![
+                "x = list(range(8))".into(),
+                format!("del x[{}]", sl(a, b, step)),
+                "print(x)".into(),
+            ]
+        }
+        // 4: slice bounds honoring `__index__` (READ / ASSIGN / DELETE).
+        4 => {
+            let av = pick(r, &["0", "1", "2", "-1", "-2", "3", "5"]);
+            let bv = pick(r, &["6", "4", "3", "-1", "10", "2"]);
+            let sv = pick(r, &["1", "2", "-1"]);
+            let mut prog = vec![
+                "class Idx:".into(),
+                "    def __init__(self, v): self.v = v".into(),
+                "    def __index__(self): return self.v".into(),
+                "s = [0, 1, 2, 3, 4, 5]".into(),
+            ];
+            match r.below(4) {
+                0 => prog.push(format!("print(s[Idx({av}):Idx({bv}):Idx({sv})])")),
+                1 => prog.push(format!("print('abcdef'[Idx({av}):Idx({bv})])")),
+                2 => {
+                    prog.push(format!("s[Idx({av}):Idx({bv})] = [7, 8]"));
+                    prog.push("print(s)".into());
+                }
+                _ => {
+                    prog.push(format!("del s[Idx({av}):Idx({bv})]"));
+                    prog.push("print(s)".into());
+                }
+            }
+            prog
+        }
+        // 5: list.insert / append / extend / copy / clear.
+        5 => {
+            let e = match r.below(5) {
+                0 => format!("x.insert({k}, 99); print(x)"),
+                1 => "x.append(99); print(x)".to_string(),
+                2 => format!("x.extend(range({n})); print(x)"),
+                3 => "y = x.copy(); y.append(0); print(x, y)".to_string(),
+                _ => "x.clear(); print(x)".to_string(),
+            };
+            vec!["x = [1, 2, 3, 4]".into(), e]
+        }
+        // 6: list.remove (ValueError if absent) / list.count.
+        6 => {
+            let v = pick(r, &["1", "2", "3", "9"]);
+            match r.below(2) {
+                0 => vec![
+                    "x = [1, 2, 2, 3, 2]".into(),
+                    "try:".into(),
+                    format!("    x.remove({v}); print(x)"),
+                    "except ValueError as e:".into(),
+                    "    print('ValueError')".into(),
+                ],
+                _ => vec![format!("print([1, 2, 2, 3, 2].count({v}))")],
+            }
+        }
+        // 7: list.index with optional start/stop (ValueError boundary).
+        7 => {
+            let v = pick(r, &["1", "2", "3", "9"]);
+            let start = pick(r, &["0", "1", "2", "-3"]);
+            let stop = pick(r, &["3", "5", "-1", "100"]);
+            let call = match r.below(3) {
+                0 => format!("x.index({v})"),
+                1 => format!("x.index({v}, {start})"),
+                _ => format!("x.index({v}, {start}, {stop})"),
+            };
+            vec![
+                "x = [1, 2, 3, 2, 1, 2]".into(),
+                "try:".into(),
+                format!("    print({call})"),
+                "except ValueError:".into(),
+                "    print('ValueError')".into(),
+            ]
+        }
+        // 8: list.pop (IndexError empty / oob; negative).
+        8 => {
+            let arg = pick(r, &["", "0", "1", "-1", "-2", "5", "-9"]);
+            vec![
+                "x = [10, 20, 30]".into(),
+                "try:".into(),
+                format!("    print(x.pop({arg}), x)"),
+                "except IndexError:".into(),
+                "    print('IndexError')".into(),
+            ]
+        }
+        // 9: list.reverse (in place) + list.sort(key=/reverse=, stable).
+        9 => match r.below(4) {
+            0 => vec!["x = [3, 1, 4, 1, 5, 9, 2]".into(), "x.reverse(); print(x)".into()],
+            1 => vec![
+                "x = [3, 1, 4, 1, 5, 9, 2, 6]".into(),
+                "x.sort(); print(x)".into(),
+            ],
+            2 => vec![
+                "x = [3, 1, 4, 1, 5, 9, 2, 6]".into(),
+                "x.sort(reverse=True); print(x)".into(),
+            ],
+            // Stability: sort by a key with ties preserves input order.
+            _ => vec![
+                "x = [(1, 'a'), (0, 'b'), (1, 'c'), (0, 'd'), (2, 'e')]".into(),
+                "x.sort(key=lambda t: t[0]); print(x)".into(),
+            ],
+        },
+        // 10: custom __getitem__ receiving a slice object.
+        10 => {
+            vec![
+                "class S:".into(),
+                "    def __init__(self): self.d = [0, 1, 2, 3, 4, 5, 6]".into(),
+                "    def __getitem__(self, i):".into(),
+                "        if isinstance(i, slice):".into(),
+                "            return ('slice', i.start, i.stop, i.step)".into(),
+                "        return self.d[i]".into(),
+                format!("print(S()[{}])", sl(a, b, step)),
+            ]
+        }
+        // 11: custom __setitem__ / __delitem__ receiving a slice.
+        11 => {
+            let which = if r.below(2) == 0 { "set" } else { "del" };
+            if which == "set" {
+                vec![
+                    "class S:".into(),
+                    "    def __init__(self): self.d = list(range(6))".into(),
+                    "    def __setitem__(self, i, v): self.d[i] = v".into(),
+                    "    def show(self): return self.d".into(),
+                    "s = S()".into(),
+                    format!("s[{}] = [88, 77]", sl(a, b, "")),
+                    "print(s.show())".into(),
+                ]
+            } else {
+                vec![
+                    "class S:".into(),
+                    "    def __init__(self): self.d = list(range(6))".into(),
+                    "    def __delitem__(self, i): del self.d[i]".into(),
+                    "    def show(self): return self.d".into(),
+                    "s = S()".into(),
+                    format!("del s[{}]", sl(a, b, step)),
+                    "print(s.show())".into(),
+                ]
+            }
+        }
+        // 12: __len__ + __contains__ fallback via iteration.
+        12 => {
+            let v = pick(r, &["0", "2", "5", "9"]);
+            vec![
+                "class C:".into(),
+                "    def __init__(self): self.d = [0, 2, 4, 6, 8]".into(),
+                "    def __len__(self): return len(self.d)".into(),
+                "    def __getitem__(self, i): return self.d[i]".into(),
+                "c = C()".into(),
+                format!("print(len(c), {v} in c)"),
+            ]
+        }
+        // 13: sequence `*` repetition (and __mul__/__rmul__ symmetry).
+        13 => {
+            let seq = pick(r, &["[0]", "[1, 2]", "(3, 4)", "'ab'", "[9, 8, 7]"]);
+            match r.below(3) {
+                0 => vec![format!("print({seq} * {n})")],
+                1 => vec![format!("print({n} * {seq})")],
+                _ => vec![
+                    format!("x = {seq} * {n}"),
+                    format!("y = {n} * {seq}"),
+                    "print(x == y, x)".into(),
+                ],
+            }
+        }
+        // 14: sequence `+` concatenation across list/tuple/str.
+        14 => {
+            let e = match r.below(3) {
+                0 => "[1, 2] + [3, 4, 5]".to_string(),
+                1 => "(1, 2) + (3,)".to_string(),
+                _ => "'ab' + 'cde'".to_string(),
+            };
+            vec![format!("print({e})")]
+        }
+        // 15: slice(...) builtin object: attrs + apply + indices(len).
+        15 => {
+            let av = pick(r, bounds);
+            let bv = pick(r, bounds);
+            let sv = pick(r, steps);
+            let ctor = if sv.is_empty() {
+                let a2 = if av.is_empty() { "None" } else { av };
+                let b2 = if bv.is_empty() { "None" } else { bv };
+                format!("slice({a2}, {b2})")
+            } else {
+                let a2 = if av.is_empty() { "None" } else { av };
+                let b2 = if bv.is_empty() { "None" } else { bv };
+                format!("slice({a2}, {b2}, {sv})")
+            };
+            vec![
+                format!("s = {ctor}"),
+                "print(s.start, s.stop, s.step)".into(),
+                "print('abcdefgh'[s])".into(),
+                "print(s.indices(8))".into(),
+            ]
+        }
+        // 16: negative single-index normalization + IndexError boundary.
+        16 => {
+            let seq = pick(r, &["[10, 20, 30, 40]", "(1, 2, 3, 4, 5)", "'wxyz'"]);
+            let i = pick(r, &["-1", "-2", "-4", "0", "3", "5", "-9"]);
+            vec![
+                "try:".into(),
+                format!("    print(({seq})[{i}])"),
+                "except IndexError:".into(),
+                "    print('IndexError')".into(),
+            ]
+        }
+        // 17: str/range slice edge cases (empty result, full copy, reversal).
+        17 => {
+            let seq = pick(r, &["'Python3'", "range(1, 9)", "[1, 2, 3, 4, 5]"]);
+            let e = match r.below(4) {
+                0 => format!("({seq})[::-1]"),
+                1 => format!("({seq})[:]"),
+                2 => format!("({seq})[::2]"),
+                _ => format!("({seq})[{}]", sl(a, b, step)),
+            };
+            vec![format!("print(list({e}) if not isinstance({e}, str) else {e})")]
+        }
+        // 18: list built by repetition then extended-slice assigned / sorted.
+        18 => match r.below(3) {
+            0 => vec![
+                "x = [0] * 6".into(),
+                "x[::2] = [1, 2, 3]".into(),
+                "print(x)".into(),
+            ],
+            1 => vec![
+                format!("x = list(range(6))"),
+                format!("del x[::{}]", pick(r, &["2", "3", "-2"])),
+                "print(x)".into(),
+            ],
+            _ => vec![
+                "x = ['b', 'a', 'c', 'a', 'b']".into(),
+                "x.sort(); print(x)".into(),
+                "x.sort(reverse=True); print(x)".into(),
+            ],
+        },
+        // 19: __index__ single index + slice.indices with custom object bound.
+        _ => {
+            vec![
+                "class Idx:".into(),
+                "    def __init__(self, v): self.v = v".into(),
+                "    def __index__(self): return self.v".into(),
+                format!("print([10, 20, 30, 40, 50][Idx({k})] if -5 <= {k} < 5 else 'oob')"),
+                format!("print(slice(Idx(1), Idx(4), Idx(2)).indices(10))"),
+            ]
+        }
+    }
+}
+
 fn gen_listcomp(seed: u64) -> Vec<String> {
     let r = &mut Rng::new(seed);
     let n = 3 + r.below(6);
@@ -3554,6 +3884,7 @@ enum Mode {
     Conttail,
     Itertail,
     Metatype,
+    Seqtail,
 }
 
 const REAL_MODES: &[Mode] = &[
@@ -3605,6 +3936,7 @@ const REAL_MODES: &[Mode] = &[
     Mode::Conttail,
     Mode::Itertail,
     Mode::Metatype,
+    Mode::Seqtail,
 ];
 
 /// Generate the statement list for a seed in the selected mode. `Mixed` rotates
@@ -3663,6 +3995,7 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Conttail => gen_conttail(seed),
         Mode::Itertail => gen_itertail(seed),
         Mode::Metatype => gen_metatype(seed),
+        Mode::Seqtail => gen_seqtail(seed),
     }
 }
 
@@ -3717,6 +4050,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Conttail => "conttail",
         Mode::Itertail => "itertail",
         Mode::Metatype => "metatype",
+        Mode::Seqtail => "seqtail",
     }
 }
 
@@ -3771,6 +4105,7 @@ fn mode_from_name(s: &str) -> Option<Mode> {
         Mode::Conttail,
         Mode::Itertail,
         Mode::Metatype,
+        Mode::Seqtail,
     ];
     ALL.iter().copied().find(|&m| mode_name(m) == s)
 }
