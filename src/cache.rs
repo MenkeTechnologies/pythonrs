@@ -46,7 +46,10 @@ use std::path::PathBuf;
 /// `__exit__` desugar; chained comparisons bind interior operands to walrus temps
 /// for single-evaluation. All three change lowering, so older cached bytecode
 /// (which would run the old rebind / re-evaluating forms) must miss cleanly.
-const SCHEMA: u64 = 15;
+/// v16: `yield from` lowers to a single `YIELD_FROM` op (full PEP 380 delegation:
+/// sent values, thrown exceptions, and close forwarded into the sub-iterator)
+/// instead of the old FORITER/YIELDV/GENRET loop that dropped sent values.
+const SCHEMA: u64 = 16;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]

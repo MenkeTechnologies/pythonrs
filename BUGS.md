@@ -12,8 +12,14 @@ fixed. Every line below was re-checked against the **default-build** binary
   lazy generator, backed by a stackful `corosensei` coroutine on the same thread
   (the thread-local `PyHost` is shared across suspend/resume via a swapped
   execution context). Supported: `for x in gen()`, `next(g)`, `list(gen())`,
-  `yield`-expression value, and `yield from` — including the delegate's `return`
-  value (`r = yield from sub()` binds `sub`'s return). Generator expressions
+  the `yield`-expression value, the full method protocol
+  (`.send()`/`.throw()`/`.close()`/`.__next__()`), a generator `return`
+  surfacing as `StopIteration.value`, and **full `yield from` delegation**
+  (PEP 380): a value `.send()`-ed into the delegating generator reaches the
+  sub-generator's `yield` expression, a `.throw()` is forwarded to the
+  sub-generator's `.throw()`, a `.close()` (GeneratorExit) forwards to the
+  sub-iterator and runs its try/finally, and the delegate's `return`
+  (`r = yield from sub()`) binds `sub`'s return value. Generator expressions
   `(x for x in xs)` are **lazy** (a hidden generator function), not eager.
 - **Call-site unpacking** `f(*args, **kwargs)`, `f(a, *b, c, **d)` — flattened at
   runtime through `BUILD_ARGS`/`BUILD_KWARGS` and the `CALL*_EX` ops.
@@ -140,11 +146,6 @@ fixed. Every line below was re-checked against the **default-build** binary
   does not inject `CancelledError` into a suspended coroutine); bounded-`Queue`
   put back-pressure (put is always accepted); `wait`'s `timeout`/`return_when`
   variants; async-generator `asend`/`athrow`/`aclose`.
-
-## Not yet implemented (compile/parse-time error, no silent wrong answer)
-- **`yield from` sent values.** The delegate's `return` value is now forwarded,
-  but a value `send()`-ed into the delegating generator does not reach the
-  sub-generator (`x = yield` inside the delegate sees `None`, not the sent value).
 
 ## Partial / simplified semantics
 - **Operator overloading dunders**: dispatched, with `NotImplemented` reflected
