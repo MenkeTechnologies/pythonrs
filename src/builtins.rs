@@ -220,9 +220,49 @@ fn b_getattr(vm: &mut VM, _: u8) -> Value {
     finish(vm, r)
 }
 
-/// `recv.name` with the descriptor protocol and the `__getattr__` fallback. The
-/// accessor bodies run user code, so this holds no host borrow across them.
+/// Whether `recv` is an instance whose class (user code, not `object`'s
+/// defaults) defines the dunder `name` — used to detect `__getattribute__` /
+/// `__setattr__` / `__delattr__` / `__getattr__` overrides.
+fn instance_dunder(recv: &Value, name: &str) -> bool {
+    with_host(|h| match h.get(recv) {
+        Some(PyObj::Instance(i)) => h.class_has(&i.class, name),
+        _ => false,
+    })
+}
+
+/// Whether an error string is an `AttributeError` (the only error that triggers
+/// the `__getattr__` fallback / that `hasattr` swallows).
+fn is_attr_err(e: &str) -> bool {
+    e.starts_with("AttributeError")
+}
+
+/// `recv.name` — the full attribute read protocol. A user `__getattribute__`
+/// intercepts every access; otherwise the default descriptor-aware lookup runs.
+/// Either way, an `AttributeError` triggers the `__getattr__` fallback if the
+/// class defines one. Accessor bodies run user code, so no host borrow is held.
 fn get_attr_desc(recv: &Value, name: &str) -> Result<Value, String> {
+    let res = if instance_dunder(recv, "__getattribute__") {
+        let nm = with_host(|h| h.new_str(name.to_string()));
+        host::call_method(recv, "__getattribute__", vec![nm], vec![])
+    } else {
+        raw_getattr(recv, name)
+    };
+    match res {
+        Ok(v) => Ok(v),
+        // `__getattr__` fallback: fires only when the lookup raised
+        // AttributeError (a property/descriptor raising it counts, per CPython).
+        Err(e) if is_attr_err(&e) && instance_dunder(recv, "__getattr__") => {
+            let nm = with_host(|h| h.new_str(name.to_string()));
+            host::call_method(recv, "__getattr__", vec![nm], vec![])
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// The default `object.__getattribute__`: descriptor-aware lookup (data
+/// descriptor > instance dict > non-data descriptor / class attr). Does NOT
+/// consult a user `__getattribute__` override or the `__getattr__` fallback.
+pub(crate) fn raw_getattr(recv: &Value, name: &str) -> Result<Value, String> {
     match with_host(|h| h.plan_attr_get(recv, name)) {
         host::AttrGet::Property { fget, inst, owner } => {
             if matches!(fget, Value::Undef) {
@@ -244,22 +284,7 @@ fn get_attr_desc(recv: &Value, name: &str) -> Result<Value, String> {
         host::AttrGet::Descriptor { desc, inst, cls } => {
             host::call_method(&desc, "__get__", vec![inst, cls], vec![])
         }
-        host::AttrGet::Plain => match with_host(|h| h.get_attr(recv, name)) {
-            Ok(v) => Ok(v),
-            // `__getattr__` fallback: fires only when normal lookup fails.
-            Err(e) => {
-                let has = with_host(|h| match h.get(recv) {
-                    Some(PyObj::Instance(i)) => h.class_lookup(&i.class, "__getattr__").is_some(),
-                    _ => false,
-                });
-                if has {
-                    let nm = with_host(|h| h.new_str(name.to_string()));
-                    host::call_method(recv, "__getattr__", vec![nm], vec![])
-                } else {
-                    Err(e)
-                }
-            }
-        },
+        host::AttrGet::Plain => with_host(|h| h.get_attr(recv, name)),
     }
 }
 
@@ -274,9 +299,20 @@ fn b_setattr(vm: &mut VM, _: u8) -> Value {
     }
 }
 
-/// `recv.name = val` with the data-descriptor protocol (`property.fset`,
-/// user `__set__`).
+/// `recv.name = val` — a user `__setattr__` intercepts every store; otherwise
+/// the default descriptor-aware assignment runs.
 fn set_attr_desc(recv: &Value, name: &str, val: Value) -> Result<(), String> {
+    if instance_dunder(recv, "__setattr__") {
+        let nm = with_host(|h| h.new_str(name.to_string()));
+        return host::call_method(recv, "__setattr__", vec![nm, val], vec![]).map(|_| ());
+    }
+    raw_setattr(recv, name, val)
+}
+
+/// The default `object.__setattr__`: the data-descriptor protocol
+/// (`property.fset`, user `__set__`) then a plain instance-dict store
+/// (honoring `__slots__`). Does not consult a user `__setattr__`.
+pub(crate) fn raw_setattr(recv: &Value, name: &str, val: Value) -> Result<(), String> {
     match with_host(|h| h.plan_attr_set(recv, name, &val)) {
         host::AttrSet::Property {
             fset,
@@ -316,10 +352,20 @@ fn b_delattr(vm: &mut VM, _: u8) -> Value {
     }
 }
 
-/// `del recv.name` with the data-descriptor protocol (`property.fdel`,
-/// user `__delete__`). Accessor bodies run user code, so no host borrow is
-/// held across them.
+/// `del recv.name` — a user `__delattr__` intercepts every deletion; otherwise
+/// the default descriptor-aware deletion runs.
 fn del_attr_desc(recv: &Value, name: &str) -> Result<(), String> {
+    if instance_dunder(recv, "__delattr__") {
+        let nm = with_host(|h| h.new_str(name.to_string()));
+        return host::call_method(recv, "__delattr__", vec![nm], vec![]).map(|_| ());
+    }
+    raw_delattr(recv, name)
+}
+
+/// The default `object.__delattr__`: the data-descriptor protocol
+/// (`property.fdel`, user `__delete__`) then a plain instance-dict deletion.
+/// Does not consult a user `__delattr__`.
+pub(crate) fn raw_delattr(recv: &Value, name: &str) -> Result<(), String> {
     match with_host(|h| h.plan_attr_del(recv, name)) {
         host::AttrDel::Property { fdel, inst, owner } => {
             if matches!(fdel, Value::Undef) {
@@ -2774,16 +2820,23 @@ pub fn call_builtin_function(
         "hasattr" => {
             let v = arg0(&args)?;
             let n = with_host(|h| h.str_of(&args.get(1).cloned().unwrap_or(Value::Undef)));
-            Ok(Value::Bool(get_attr_desc(&v, &n).is_ok()))
+            // Only AttributeError becomes `False`; any other exception propagates.
+            match get_attr_desc(&v, &n) {
+                Ok(_) => Ok(Value::Bool(true)),
+                Err(e) if is_attr_err(&e) => Ok(Value::Bool(false)),
+                Err(e) => Err(e),
+            }
         }
         "getattr" => {
             let v = arg0(&args)?;
             let n = with_host(|h| h.str_of(&args.get(1).cloned().unwrap_or(Value::Undef)));
             match get_attr_desc(&v, &n) {
                 Ok(x) => Ok(x),
+                // The default substitutes only for AttributeError; a getter
+                // raising anything else propagates even when a default is given.
                 Err(e) => match args.get(2) {
-                    Some(d) => Ok(d.clone()),
-                    None => Err(e),
+                    Some(d) if is_attr_err(&e) => Ok(d.clone()),
+                    _ => Err(e),
                 },
             }
         }
@@ -2792,6 +2845,12 @@ pub fn call_builtin_function(
             let n = with_host(|h| h.str_of(&args.get(1).cloned().unwrap_or(Value::Undef)));
             let val = args.get(2).cloned().unwrap_or(Value::Undef);
             set_attr_desc(&v, &n, val)?;
+            Ok(Value::Undef)
+        }
+        "delattr" => {
+            let v = arg0(&args)?;
+            let n = with_host(|h| h.str_of(&args.get(1).cloned().unwrap_or(Value::Undef)));
+            del_attr_desc(&v, &n)?;
             Ok(Value::Undef)
         }
         "id" => {
@@ -2941,7 +3000,15 @@ pub fn call_builtin_function(
             Some(v) => with_host(|h| h.get_attr(v, "__dict__")),
             None => Ok(with_host(|h| h.new_dict(IndexMap::new()))),
         },
-        "dir" => Ok(with_host(|h| h.new_list(vec![]))),
+        "dir" => Ok(with_host(|h| {
+            let names = match args.first() {
+                Some(v) => h.dir_names(v),
+                // Bare `dir()` (module scope) is not modeled; return empty.
+                None => Vec::new(),
+            };
+            let items: Vec<Value> = names.into_iter().map(|n| h.new_str(n)).collect();
+            h.new_list(items)
+        })),
         // Type constructors.
         "int" => construct_int(&args),
         "float" => construct_float(&args),
@@ -3035,12 +3102,7 @@ pub fn call_builtin_function(
                 .unwrap_or_else(|| "r".into());
             host::open_file(&path, &mode)
         }
-        "object" => Ok(with_host(|h| {
-            h.alloc(PyObj::Instance(Instance {
-                class: "object".into(),
-                attrs: IndexMap::new(),
-            }))
-        })),
+        "object" => Ok(with_host(|h| h.new_instance("object".into(), IndexMap::new()))),
         _ => Err(host::name_error(name)),
     }
 }

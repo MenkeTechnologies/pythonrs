@@ -18,7 +18,7 @@ use crate::async_rt;
 use fusevm::{Chunk, NumOp, VMResult, Value, VM};
 use indexmap::IndexMap;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
 /// Builtin ids emitted by the compiler and registered on every VM. The compiler
@@ -256,11 +256,16 @@ pub struct FuncVal {
     pub owner: Option<String>,
 }
 
-/// A user-defined class instance.
+/// A user-defined class instance. Its attribute storage (`__dict__`) is a real
+/// heap [`PyObj::Dict`] referenced by `dict`, exactly as CPython backs an
+/// instance with a live dict. So `obj.__dict__` hands back this same handle:
+/// identity is stable (`obj.__dict__ is obj.__dict__`), reads reflect current
+/// attributes, and `obj.__dict__[k] = v` / `del obj.__dict__[k]` write through
+/// to the instance. A fully `__slots__`-restricted instance has no dict.
 #[derive(Clone)]
 pub struct Instance {
     pub class: String,
-    pub attrs: IndexMap<String, Value>,
+    pub dict: Value,
 }
 
 /// A heap object.
@@ -948,6 +953,76 @@ impl PyHost {
     pub fn new_dict(&mut self, pairs: IndexMap<PKey, (Value, Value)>) -> Value {
         self.alloc(PyObj::Dict(pairs))
     }
+
+    /// Allocate a class instance with a fresh live `__dict__` (a real
+    /// [`PyObj::Dict`]) seeded from `attrs`. Every `PyObj::Instance` must be
+    /// built through here so its `dict` field points at heap storage that
+    /// `obj.__dict__` can hand back by handle (see [`Instance`]).
+    pub fn new_instance(&mut self, class: String, attrs: IndexMap<String, Value>) -> Value {
+        let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::with_capacity(attrs.len());
+        for (k, v) in attrs {
+            let kv = self.new_str(k.clone());
+            d.insert(PKey::Str(k), (kv, v));
+        }
+        let dict = self.alloc(PyObj::Dict(d));
+        self.alloc(PyObj::Instance(Instance { class, dict }))
+    }
+
+    /// Read instance attribute `name` from a live instance `__dict__` handle.
+    pub fn inst_attr(&self, dict: &Value, name: &str) -> Option<Value> {
+        match self.get(dict) {
+            Some(PyObj::Dict(m)) => m.get(&PKey::Str(name.to_string())).map(|(_, v)| v.clone()),
+            _ => None,
+        }
+    }
+
+    /// Whether a live instance `__dict__` holds `name`.
+    pub fn inst_has(&self, dict: &Value, name: &str) -> bool {
+        matches!(self.get(dict), Some(PyObj::Dict(m)) if m.contains_key(&PKey::Str(name.to_string())))
+    }
+
+    /// Set `name = val` on a live instance `__dict__`, preserving the existing
+    /// key object on update (no fresh string alloc) so repr/iteration order is
+    /// stable across reassignment, matching CPython dict semantics.
+    pub fn inst_attr_set(&mut self, dict: &Value, name: &str, val: Value) {
+        let key = PKey::Str(name.to_string());
+        if let Some(PyObj::Dict(m)) = self.get(dict) {
+            if m.contains_key(&key) {
+                if let Some(PyObj::Dict(m)) = self.get_mut(dict) {
+                    if let Some(slot) = m.get_mut(&key) {
+                        slot.1 = val;
+                    }
+                }
+                return;
+            }
+        }
+        let kv = self.new_str(name.to_string());
+        if let Some(PyObj::Dict(m)) = self.get_mut(dict) {
+            m.insert(key, (kv, val));
+        }
+    }
+
+    /// Delete `name` from a live instance `__dict__`; returns whether it existed.
+    pub fn inst_attr_del(&mut self, dict: &Value, name: &str) -> bool {
+        match self.get_mut(dict) {
+            Some(PyObj::Dict(m)) => m.shift_remove(&PKey::Str(name.to_string())).is_some(),
+            _ => false,
+        }
+    }
+
+    /// The attribute names of a live instance `__dict__`, in insertion order.
+    pub fn inst_attr_names(&self, dict: &Value) -> Vec<String> {
+        match self.get(dict) {
+            Some(PyObj::Dict(m)) => m
+                .keys()
+                .filter_map(|k| match k {
+                    PKey::Str(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
     pub fn new_set(&mut self, items: IndexMap<PKey, Value>) -> Value {
         self.alloc(PyObj::Set(items))
     }
@@ -1455,7 +1530,7 @@ impl PyHost {
                     // A user exception instance stringifies to its message
                     // (`BaseException.__str__`): ''/str(arg)/repr(tuple).
                     if self.class_is_exception(&inst.class) {
-                        let a = self.exc_instance_args(&inst.attrs);
+                        let a = self.exc_instance_args(&inst.dict);
                         self.exc_message(&inst.class, &a)
                     } else {
                         format!("<{} object>", inst.class)
@@ -1692,7 +1767,7 @@ impl PyHost {
                 // A user exception instance reprs as `Class(repr(arg), …)` from
                 // its stored `args`, mirroring `BaseException.__repr__`.
                 Some(PyObj::Instance(inst)) if self.class_is_exception(&inst.class) => {
-                    let a = self.exc_instance_args(&inst.attrs);
+                    let a = self.exc_instance_args(&inst.dict);
                     let inner: Vec<String> = a.iter().map(|x| self.repr_of(x)).collect();
                     format!("{}({})", inst.class, inner.join(", "))
                 }
@@ -4664,19 +4739,21 @@ impl PyHost {
         }
         match self.get(recv) {
             Some(PyObj::Instance(inst)) => {
-                if let Some(v) = inst.attrs.get(name) {
-                    return Ok(v.clone());
+                let class = inst.class.clone();
+                let inst_dict = inst.dict.clone();
+                if let Some(v) = self.inst_attr(&inst_dict, name) {
+                    return Ok(v);
                 }
                 // Exception chaining links live in a side table, not the
                 // instance dict (a user exception is a plain `Instance`). Only
                 // exception instances expose these dunders.
                 // A user exception instance always exposes `.args` (empty tuple
                 // if no construction path stored one).
-                if name == "args" && self.class_is_exception(&inst.class) {
+                if name == "args" && self.class_is_exception(&class) {
                     return Ok(self.alloc(PyObj::Tuple(vec![])));
                 }
                 if (name == "__cause__" || name == "__context__" || name == "__suppress_context__")
-                    && self.class_is_exception(&inst.class)
+                    && self.class_is_exception(&class)
                 {
                     return Ok(match name {
                         "__cause__" => self.exc_link(recv).0,
@@ -4684,7 +4761,6 @@ impl PyHost {
                         _ => Value::Bool(!matches!(self.exc_link(recv).0, Value::Undef)),
                     });
                 }
-                let class = inst.class.clone();
                 // Instance introspection: `__class__` and `__dict__`.
                 if name == "__class__" {
                     return Ok(self.alloc(PyObj::Class(class)));
@@ -4696,16 +4772,9 @@ impl PyHost {
                             "AttributeError: '{class}' object has no attribute '__dict__'"
                         ));
                     }
-                    let attrs = match self.get(recv) {
-                        Some(PyObj::Instance(i)) => i.attrs.clone(),
-                        _ => IndexMap::new(),
-                    };
-                    let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
-                    for (k, val) in attrs {
-                        let kv = self.new_str(k.clone());
-                        d.insert(PKey::Str(k), (kv, val));
-                    }
-                    return Ok(self.new_dict(d));
+                    // Hand back the instance's live dict by handle: identity is
+                    // stable and mutations through it write through to attrs.
+                    return Ok(inst_dict);
                 }
                 if let Some(v) = self.class_lookup(&class, name) {
                     match self.get(&v) {
@@ -4951,8 +5020,50 @@ impl PyHost {
     }
 
     /// Does `class` (via its MRO) define method `name`?
-    fn class_has(&self, class: &str, name: &str) -> bool {
+    pub fn class_has(&self, class: &str, name: &str) -> bool {
         self.class_lookup(class, name).is_some()
+    }
+
+    /// The sorted, de-duplicated attribute names `dir(v)` reports: for an
+    /// instance, its live `__dict__` keys plus every name defined across its
+    /// class MRO namespaces (`__slots__` members included); for a class, the
+    /// names across its own MRO namespaces. Object-provided default dunders that
+    /// pythonrs does not model are not enumerated.
+    pub fn dir_names(&self, v: &Value) -> Vec<String> {
+        let mut set: BTreeSet<String> = BTreeSet::new();
+        match self.get(v) {
+            Some(PyObj::Instance(i)) => {
+                let dict = i.dict.clone();
+                let class = i.class.clone();
+                for n in self.inst_attr_names(&dict) {
+                    set.insert(n);
+                }
+                self.collect_class_dir(&class, &mut set);
+            }
+            Some(PyObj::Class(c)) => {
+                let c = c.clone();
+                self.collect_class_dir(&c, &mut set);
+            }
+            _ => {}
+        }
+        set.into_iter().collect()
+    }
+
+    /// Add every name defined across `class`'s MRO namespaces (and any
+    /// `__slots__` members) to `set`.
+    fn collect_class_dir(&self, class: &str, set: &mut BTreeSet<String>) {
+        for c in self.mro_of(class) {
+            if let Some(cd) = self.classes.get(&c) {
+                for k in cd.ns.keys() {
+                    set.insert(k.clone());
+                }
+            }
+        }
+        if let Some(slots) = self.slots_of(class) {
+            for s in slots {
+                set.insert(s);
+            }
+        }
     }
 
     /// The allowed attribute names for a `__slots__`-restricted instance, or
@@ -5034,10 +5145,11 @@ impl PyHost {
             }
             return AttrGet::Plain;
         }
-        let (class, in_instdict) = match self.get(recv) {
-            Some(PyObj::Instance(i)) => (i.class.clone(), i.attrs.contains_key(name)),
+        let (class, inst_dict) = match self.get(recv) {
+            Some(PyObj::Instance(i)) => (i.class.clone(), i.dict.clone()),
             _ => return AttrGet::Plain,
         };
+        let in_instdict = self.inst_has(&inst_dict, name);
         let cls_attr = match self.class_lookup(&class, name) {
             Some(v) => v,
             None => return AttrGet::Plain,
@@ -5159,11 +5271,12 @@ impl PyHost {
                 }
             }
         }
+        if let Some(PyObj::Instance(inst)) = self.get(recv) {
+            let dict = inst.dict.clone();
+            self.inst_attr_set(&dict, name, val);
+            return Ok(());
+        }
         match self.get_mut(recv) {
-            Some(PyObj::Instance(inst)) => {
-                inst.attrs.insert(name.to_string(), val);
-                Ok(())
-            }
             Some(PyObj::Module { ns, .. }) => {
                 ns.insert(name.to_string(), val);
                 Ok(())
@@ -5183,8 +5296,9 @@ impl PyHost {
     }
 
     pub fn del_attr(&mut self, recv: &Value, name: &str) -> Result<(), String> {
-        if let Some(PyObj::Instance(inst)) = self.get_mut(recv) {
-            if inst.attrs.shift_remove(name).is_some() {
+        if let Some(PyObj::Instance(inst)) = self.get(recv) {
+            let dict = inst.dict.clone();
+            if self.inst_attr_del(&dict, name) {
                 return Ok(());
             }
         }
@@ -5368,7 +5482,7 @@ pub fn call_method(
     match obj {
         Some(PyObj::Instance(inst)) => {
             // instance attribute that is callable?
-            if let Some(v) = inst.attrs.get(name).cloned() {
+            if let Some(v) = with_host(|h| h.inst_attr(&inst.dict, name)) {
                 return invoke(&v, args, kwargs);
             }
             let class = inst.class.clone();
@@ -5493,12 +5607,9 @@ pub fn call_method(
                 None if name == "__new__" => {
                     let cls = args.first().cloned().unwrap_or(Value::Undef);
                     match with_host(|h| h.get(&cls).cloned()) {
-                        Some(PyObj::Class(cname)) => Ok(with_host(|h| {
-                            h.alloc(PyObj::Instance(Instance {
-                                class: cname,
-                                attrs: IndexMap::new(),
-                            }))
-                        })),
+                        Some(PyObj::Class(cname)) => {
+                            Ok(with_host(|h| h.new_instance(cname, IndexMap::new())))
+                        }
                         _ => Err(type_error("object.__new__(X): X is not a type object")),
                     }
                 }
@@ -5524,13 +5635,29 @@ pub fn call_method(
         Some(PyObj::Builtin(bname)) if bname == "object" && name == "__new__" => {
             let cls = args.first().cloned().unwrap_or(Value::Undef);
             match with_host(|h| h.get(&cls).cloned()) {
-                Some(PyObj::Class(cname)) => Ok(with_host(|h| {
-                    h.alloc(PyObj::Instance(Instance {
-                        class: cname,
-                        attrs: IndexMap::new(),
-                    }))
-                })),
+                Some(PyObj::Class(cname)) => {
+                    Ok(with_host(|h| h.new_instance(cname, IndexMap::new())))
+                }
                 _ => Err(type_error("object.__new__(X): X is not a type object")),
+            }
+        }
+        // `object.__getattribute__/__setattr__/__delattr__(self, ...)` — the
+        // default attribute protocol, reached when a user override cooperates via
+        // `object.__dunder__(self, ...)`. These run the RAW lookup/store so they
+        // never re-enter the user override (which would recurse forever).
+        Some(PyObj::Builtin(bname))
+            if bname == "object"
+                && matches!(name, "__getattribute__" | "__setattr__" | "__delattr__") =>
+        {
+            let selfv = args.first().cloned().unwrap_or(Value::Undef);
+            let attr = with_host(|h| h.str_of(&args.get(1).cloned().unwrap_or(Value::Undef)));
+            match name {
+                "__getattribute__" => crate::builtins::raw_getattr(&selfv, &attr),
+                "__setattr__" => {
+                    let v = args.get(2).cloned().unwrap_or(Value::Undef);
+                    crate::builtins::raw_setattr(&selfv, &attr, v).map(|_| Value::Undef)
+                }
+                _ => crate::builtins::raw_delattr(&selfv, &attr).map(|_| Value::Undef),
             }
         }
         // `foreign.method(...)` (stdlib-ffi) — dispatch on the CPython side.
@@ -5645,10 +5772,7 @@ pub fn instantiate_plain(
                 let t = h.alloc(PyObj::Tuple(args.clone()));
                 attrs.insert("args".to_string(), t);
             }
-            h.alloc(PyObj::Instance(Instance {
-                class: class.to_string(),
-                attrs,
-            }))
+            h.new_instance(class.to_string(), attrs)
         })
     };
     // `__init__` runs only when `__new__` returned an instance of `class` (or a
@@ -6006,9 +6130,9 @@ impl PyHost {
     /// Build the `"Class: message"` display string for an exception's args.
     /// The `args` tuple stored on a user exception instance's dict — set by the
     /// builtin `BaseException.__new__`/`__init__`. Missing (or non-tuple) → empty.
-    pub fn exc_instance_args(&self, attrs: &IndexMap<String, Value>) -> Vec<Value> {
-        match attrs.get("args") {
-            Some(v) => match self.get(v) {
+    pub fn exc_instance_args(&self, dict: &Value) -> Vec<Value> {
+        match self.inst_attr(dict, "args") {
+            Some(v) => match self.get(&v) {
                 Some(PyObj::Tuple(t)) => t.clone(),
                 _ => vec![v.clone()],
             },
@@ -6052,7 +6176,7 @@ impl PyHost {
                 Some(join_exc(class, &self.exc_message(class, args)))
             }
             Some(PyObj::Instance(i)) if self.class_is_exception(&i.class) => {
-                let a = self.exc_instance_args(&i.attrs);
+                let a = self.exc_instance_args(&i.dict);
                 Some(join_exc(&i.class, &self.exc_message(&i.class, &a)))
             }
             _ => None,
@@ -6285,10 +6409,7 @@ pub fn raise_value(exc: &Value) -> Result<String, String> {
                     let t = h.alloc(PyObj::Tuple(vec![]));
                     attrs.insert("args".to_string(), t);
                 }
-                let inst = h.alloc(PyObj::Instance(Instance {
-                    class: name.clone(),
-                    attrs,
-                }));
+                let inst = h.new_instance(name.clone(), attrs);
                 h.exc = Some(inst);
                 Ok(name)
             }
@@ -6296,7 +6417,7 @@ pub fn raise_value(exc: &Value) -> Result<String, String> {
                 let class = i.class.clone();
                 // A user exception instance's uncaught line shows its message.
                 let line = if h.class_is_exception(&class) {
-                    let a = h.exc_instance_args(&i.attrs);
+                    let a = h.exc_instance_args(&i.dict);
                     join_exc(&class, &h.exc_message(&class, &a))
                 } else {
                     class
