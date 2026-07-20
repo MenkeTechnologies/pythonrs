@@ -1976,3 +1976,41 @@ fn asyncio_sleep_timer_ordering() {
         "['fast', 'mid', 'slow']"
     );
 }
+
+#[test]
+fn async_for_custom_aiterator() {
+    let src = "import asyncio\n\
+class R:\n    def __init__(self, n):\n        self.n = n\n        self.i = 0\n    def __aiter__(self):\n        return self\n    async def __anext__(self):\n        if self.i >= self.n:\n            raise StopAsyncIteration\n        self.i += 1\n        await asyncio.sleep(0)\n        return self.i\n\
+out = []\n\
+async def main():\n    async for x in R(3):\n        out.append(x)\n\
+asyncio.run(main())";
+    assert_eq!(g(src, "out"), "[1, 2, 3]");
+}
+
+#[test]
+fn async_with_context_manager() {
+    let src = "import asyncio\n\
+log = []\n\
+class CM:\n    async def __aenter__(self):\n        log.append('enter')\n        return 5\n    async def __aexit__(self, *a):\n        log.append('exit')\n        return False\n\
+async def main():\n    async with CM() as r:\n        log.append(r)\n\
+asyncio.run(main())";
+    assert_eq!(g(src, "log"), "['enter', 5, 'exit']");
+}
+
+#[test]
+fn async_comprehension_list() {
+    let src = "import asyncio\n\
+class R:\n    def __init__(self, n):\n        self.n = n\n        self.i = 0\n    def __aiter__(self):\n        return self\n    async def __anext__(self):\n        if self.i >= self.n:\n            raise StopAsyncIteration\n        self.i += 1\n        await asyncio.sleep(0)\n        return self.i\n\
+async def main():\n    return [x * x async for x in R(4)]\n\
+r = asyncio.run(main())";
+    assert_eq!(g(src, "r"), "[1, 4, 9, 16]");
+}
+
+#[test]
+fn async_comprehension_filter_and_dict() {
+    let src = "import asyncio\n\
+class R:\n    def __init__(self, n):\n        self.n = n\n        self.i = 0\n    def __aiter__(self):\n        return self\n    async def __anext__(self):\n        if self.i >= self.n:\n            raise StopAsyncIteration\n        self.i += 1\n        return self.i\n\
+async def main():\n    return {x: x * x async for x in R(4) if x % 2 == 0}\n\
+r = asyncio.run(main())";
+    assert_eq!(g(src, "r"), "{2: 4, 4: 16}");
+}

@@ -1405,7 +1405,9 @@ impl PyHost {
                     }
                 }
                 Some(PyObj::Future { id }) => async_rt::future_repr(*id),
-                Some(PyObj::EventLoop) => "<_UnixSelectorEventLoop running=False closed=False debug=False>".into(),
+                Some(PyObj::EventLoop) => {
+                    "<_UnixSelectorEventLoop running=False closed=False debug=False>".into()
+                }
                 Some(PyObj::Bytearray(b)) => format!("bytearray(b{})", quote_bytes(b, true)),
                 Some(PyObj::File { id }) => self.file_repr(*id),
                 Some(PyObj::Deque { items, maxlen }) => {

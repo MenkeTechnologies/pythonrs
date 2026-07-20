@@ -1365,7 +1365,7 @@ impl Parser {
             } else {
                 let e = self.parse_namedexpr()?;
                 // Generator expression as sole argument: f(x for x in xs)
-                if self.at_kw("for") && args.is_empty() && keywords.is_empty() {
+                if self.at_comp_for() && args.is_empty() && keywords.is_empty() {
                     let comps = self.parse_comprehension_clauses()?;
                     args.push(Expr::GenExp(Box::new(e), comps));
                 } else {
@@ -1656,7 +1656,7 @@ impl Parser {
             return Ok(Expr::Tuple(Vec::new()));
         }
         let first = self.parse_star_or_expr()?;
-        if self.at_kw("for") {
+        if self.at_comp_for() {
             let comps = self.parse_comprehension_clauses()?;
             self.expect_op(")")?;
             return Ok(Expr::GenExp(Box::new(first), comps));
@@ -1683,7 +1683,7 @@ impl Parser {
             return Ok(Expr::List(Vec::new()));
         }
         let first = self.parse_star_or_expr()?;
-        if self.at_kw("for") {
+        if self.at_comp_for() {
             let comps = self.parse_comprehension_clauses()?;
             self.expect_op("]")?;
             return Ok(Expr::ListComp(Box::new(first), comps));
@@ -1729,7 +1729,7 @@ impl Parser {
             // dict
             self.advance();
             let v = self.parse_expr()?;
-            if self.at_kw("for") {
+            if self.at_comp_for() {
                 let comps = self.parse_comprehension_clauses()?;
                 self.expect_op("}")?;
                 return Ok(Expr::DictComp(Box::new(first), Box::new(v), comps));
@@ -1749,7 +1749,7 @@ impl Parser {
             }
             self.expect_op("}")?;
             Ok(Expr::Dict(pairs))
-        } else if self.at_kw("for") {
+        } else if self.at_comp_for() {
             let comps = self.parse_comprehension_clauses()?;
             self.expect_op("}")?;
             Ok(Expr::SetComp(Box::new(first), comps))
@@ -1766,10 +1766,16 @@ impl Parser {
         }
     }
 
+    /// Whether the cursor is at the start of a comprehension clause: a `for`, or
+    /// an `async for` (an asynchronous comprehension).
+    fn at_comp_for(&self) -> bool {
+        self.at_kw("for") || self.at_kw("async")
+    }
+
     fn parse_comprehension_clauses(&mut self) -> Result<Vec<Comprehension>, String> {
         let mut comps = Vec::new();
         while self.at_kw("for") || self.at_kw("async") {
-            let _ = self.eat_kw("async");
+            let is_async = self.eat_kw("async");
             self.advance(); // for
             let target = self.parse_target_tuple()?;
             if !self.eat_kw("in") {
@@ -1788,6 +1794,7 @@ impl Parser {
                 target: Box::new(target),
                 iter: Box::new(iter),
                 ifs,
+                is_async,
             });
         }
         Ok(comps)
