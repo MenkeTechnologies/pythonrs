@@ -1231,6 +1231,25 @@ fn b_binop(vm: &mut VM, _: u8) -> Value {
         let r = str_percent_format(&a, &b);
         return finish(vm, r);
     }
+    // `bytes % args` / `bytearray % args` (PEP 461). The result keeps the
+    // receiver's type.
+    if tag == host::binop::MOD {
+        let kind = with_host(|h| match h.get(&a) {
+            Some(PyObj::Bytes(_)) => Some(false),
+            Some(PyObj::Bytearray(_)) => Some(true),
+            _ => None,
+        });
+        if let Some(is_ba) = kind {
+            let r = with_host(|h| {
+                let fmt = match h.get(&a) {
+                    Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) => b.clone(),
+                    _ => vec![],
+                };
+                h.bytes_format_percent(&fmt, &b, is_ba)
+            });
+            return finish(vm, r);
+        }
+    }
     let r = with_host(|h| h.binop(tag, &a, &b));
     finish(vm, r)
 }
@@ -2015,6 +2034,10 @@ pub fn call_builtin_function(
     // `str.maketrans(...)` reached via the `str` type object.
     if name == "str.maketrans" {
         return str_maketrans(&args);
+    }
+    // `bytes.maketrans(...)` / `bytearray.maketrans(...)` via the type object.
+    if name == "bytes.maketrans" || name == "bytearray.maketrans" {
+        return bytes_maketrans(&args);
     }
     // `bytes.fromhex(...)` / `bytearray.fromhex(...)` via the type object.
     if name == "bytes.fromhex" || name == "bytearray.fromhex" {
@@ -3530,6 +3553,21 @@ const BYTES_METHODS: &[&str] = &[
     "rpartition",
     "removeprefix",
     "removesuffix",
+    "swapcase",
+    "title",
+    "center",
+    "ljust",
+    "rjust",
+    "translate",
+    "maketrans",
+    "isalpha",
+    "isdigit",
+    "isalnum",
+    "isspace",
+    "isupper",
+    "islower",
+    "istitle",
+    "isascii",
 ];
 const BYTEARRAY_METHODS: &[&str] = &[
     "append",
@@ -3560,6 +3598,21 @@ const BYTEARRAY_METHODS: &[&str] = &[
     "rpartition",
     "removeprefix",
     "removesuffix",
+    "swapcase",
+    "title",
+    "center",
+    "ljust",
+    "rjust",
+    "translate",
+    "maketrans",
+    "isalpha",
+    "isdigit",
+    "isalnum",
+    "isspace",
+    "isupper",
+    "islower",
+    "istitle",
+    "isascii",
 ];
 const DEQUE_METHODS: &[&str] = &[
     "append",
@@ -3692,6 +3745,24 @@ pub fn call_type_method(
             str_dot_format(&s, &args, &kwargs)
         }
         "str" => str_method(recv, name, &args),
+        // `bytes/bytearray.decode(encoding=..., errors=...)` — fold keywords into
+        // the positional (encoding, errors) order the decoder expects.
+        "bytes" | "bytearray" if name == "decode" && !kwargs.is_empty() => {
+            let mut enc = args.first().cloned();
+            let mut err = args.get(1).cloned();
+            for (k, v) in &kwargs {
+                match k.as_str() {
+                    "encoding" => enc = Some(v.clone()),
+                    "errors" => err = Some(v.clone()),
+                    _ => {}
+                }
+            }
+            let mut a2 = vec![enc.unwrap_or_else(|| new_str("utf-8".into()))];
+            if let Some(e) = err {
+                a2.push(e);
+            }
+            decode_bytes(&recv_bytes(recv), &a2)
+        }
         "bytes" => bytes_method(recv, name, &args),
         "bytearray" => bytearray_method(recv, name, &args),
         "list" => list_method(recv, name, &args, &kwargs),
@@ -4126,7 +4197,9 @@ fn pad_str(s: &str, args: &[Value], mode: char) -> String {
         'l' => format!("{s}{}", fill.to_string().repeat(total)),
         'r' => format!("{}{s}", fill.to_string().repeat(total)),
         _ => {
-            let left = total / 2;
+            // CPython `str.center`: `left = marg/2 + (marg & width & 1)`, so the
+            // odd byte favors the left when both margin and width are odd.
+            let left = total / 2 + (total & w & 1);
             let right = total - left;
             format!(
                 "{}{s}{}",
@@ -5476,29 +5549,82 @@ fn bytes_fromhex(args: &[Value]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/// Decode bytes to a `str`. Only `utf-8` (default, strict) and `latin-1` /
-/// `ascii` are recognized; the `errors` argument is not yet honored.
+/// Decode bytes to a `str`. `utf-8` (default) and `latin-1` / `ascii` are
+/// recognized. `errors` is honored for `strict` (default), `ignore`, and
+/// `replace`; any other handler name falls back to strict.
 fn decode_bytes(bytes: &[u8], args: &[Value]) -> Result<Value, String> {
     let enc = args
         .first()
         .and_then(|v| with_host(|h| h.as_str(v)))
         .unwrap_or_else(|| "utf-8".into());
+    let errors = args
+        .get(1)
+        .and_then(|v| with_host(|h| h.as_str(v)))
+        .unwrap_or_else(|| "strict".into());
     let norm = enc.to_lowercase().replace(['-', '_'], "");
     let s = match norm.as_str() {
         "latin1" | "latin" | "iso88591" | "l1" | "cp1252" => {
+            // Every byte maps to U+00..U+FF; no error handler is ever engaged.
             bytes.iter().map(|&b| b as char).collect::<String>()
         }
         "ascii" | "usascii" => {
-            if bytes.iter().all(|&b| b < 0x80) {
-                bytes.iter().map(|&b| b as char).collect::<String>()
-            } else {
-                return Err("UnicodeDecodeError: 'ascii' codec can't decode byte".into());
+            let mut out = String::with_capacity(bytes.len());
+            for &b in bytes {
+                if b < 0x80 {
+                    out.push(b as char);
+                } else {
+                    match errors.as_str() {
+                        "ignore" => {}
+                        "replace" => out.push('\u{fffd}'),
+                        _ => {
+                            return Err("UnicodeDecodeError: 'ascii' codec can't decode byte".into())
+                        }
+                    }
+                }
             }
+            out
         }
-        _ => String::from_utf8(bytes.to_vec())
-            .map_err(|_| "UnicodeDecodeError: 'utf-8' codec can't decode byte".to_string())?,
+        _ => utf8_decode_errors(bytes, &errors)?,
     };
     Ok(new_str(s))
+}
+
+/// UTF-8 decode with a CPython-compatible error handler. Invalid sequences are
+/// handled per the "maximal subpart" rule (matching `std::str::from_utf8`'s
+/// error offsets, which follow the same Unicode standard as CPython's decoder).
+fn utf8_decode_errors(bytes: &[u8], errors: &str) -> Result<String, String> {
+    let mut out = String::with_capacity(bytes.len());
+    let mut rest = bytes;
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(s) => {
+                out.push_str(s);
+                break;
+            }
+            Err(e) => {
+                let valid = e.valid_up_to();
+                // SAFETY of unwrap: `rest[..valid]` is valid UTF-8 by definition.
+                out.push_str(std::str::from_utf8(&rest[..valid]).unwrap());
+                // `error_len() == None` means an incomplete sequence at the end:
+                // CPython replaces/ignores it as a single unit.
+                let skip = e.error_len().unwrap_or(rest.len() - valid);
+                match errors {
+                    "ignore" => {}
+                    "replace" => out.push('\u{fffd}'),
+                    _ => {
+                        return Err(
+                            "UnicodeDecodeError: 'utf-8' codec can't decode byte".to_string()
+                        )
+                    }
+                }
+                rest = &rest[valid + skip..];
+                if rest.is_empty() {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn bytes_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
@@ -5723,10 +5849,216 @@ fn bytes_common_method(
             };
             Ok(mk_bytes(is_ba, out))
         }
+        // ASCII case swap: upper↔lower for a-z/A-Z, other bytes unchanged.
+        "swapcase" => {
+            let out: Vec<u8> = bytes
+                .iter()
+                .map(|&b| {
+                    if b.is_ascii_uppercase() {
+                        b.to_ascii_lowercase()
+                    } else if b.is_ascii_lowercase() {
+                        b.to_ascii_uppercase()
+                    } else {
+                        b
+                    }
+                })
+                .collect();
+            Ok(mk_bytes(is_ba, out))
+        }
+        // ASCII title-case: first ASCII letter of each run uppercased, rest lowered.
+        "title" => {
+            let mut out = Vec::with_capacity(bytes.len());
+            let mut prev_alpha = false;
+            for &b in &bytes {
+                if b.is_ascii_alphabetic() {
+                    out.push(if prev_alpha {
+                        b.to_ascii_lowercase()
+                    } else {
+                        b.to_ascii_uppercase()
+                    });
+                    prev_alpha = true;
+                } else {
+                    out.push(b);
+                    prev_alpha = false;
+                }
+            }
+            Ok(mk_bytes(is_ba, out))
+        }
+        "center" => Ok(mk_bytes(is_ba, pad_bytes(&bytes, args, 'c')?)),
+        "ljust" => Ok(mk_bytes(is_ba, pad_bytes(&bytes, args, 'l')?)),
+        "rjust" => Ok(mk_bytes(is_ba, pad_bytes(&bytes, args, 'r')?)),
+        "translate" => Ok(mk_bytes(is_ba, bytes_translate(&bytes, args)?)),
+        // Reachable via an instance (`b''.maketrans(...)`); always returns bytes.
+        "maketrans" => bytes_maketrans(args),
+        "isalpha" => Ok(Value::Bool(
+            !bytes.is_empty() && bytes.iter().all(|b| b.is_ascii_alphabetic()),
+        )),
+        "isdigit" => Ok(Value::Bool(
+            !bytes.is_empty() && bytes.iter().all(|b| b.is_ascii_digit()),
+        )),
+        "isalnum" => Ok(Value::Bool(
+            !bytes.is_empty() && bytes.iter().all(|b| b.is_ascii_alphanumeric()),
+        )),
+        "isspace" => Ok(Value::Bool(
+            !bytes.is_empty() && bytes.iter().all(|&b| is_ascii_ws(b)),
+        )),
+        "isupper" => Ok(Value::Bool(
+            bytes.iter().any(|b| b.is_ascii_alphabetic())
+                && !bytes.iter().any(|b| b.is_ascii_lowercase()),
+        )),
+        "islower" => Ok(Value::Bool(
+            bytes.iter().any(|b| b.is_ascii_alphabetic())
+                && !bytes.iter().any(|b| b.is_ascii_uppercase()),
+        )),
+        "istitle" => Ok(Value::Bool(is_bytes_titlecased(&bytes))),
+        "isascii" => Ok(Value::Bool(bytes.iter().all(|&b| b < 0x80))),
         _ => Err(format!(
             "AttributeError: '{tname}' object has no attribute '{name}'"
         )),
     }
+}
+
+/// `bytes.center/ljust/rjust(width[, fillbyte])`. `fillbyte` is a length-1
+/// bytes-like (default a space); pads to `width` bytes.
+fn pad_bytes(bytes: &[u8], args: &[Value], mode: char) -> Result<Vec<u8>, String> {
+    let w = args
+        .first()
+        .and_then(|v| with_host(|h| h.as_int(v)))
+        .unwrap_or(0)
+        .max(0) as usize;
+    let fill: u8 = match args.get(1) {
+        None | Some(Value::Undef) => b' ',
+        Some(v) => {
+            let fb = as_bytes_object(v).ok_or_else(|| {
+                host::type_error(&format!(
+                    "{}() argument 2 must be a byte string of length 1, not {}",
+                    match mode {
+                        'l' => "ljust",
+                        'r' => "rjust",
+                        _ => "center",
+                    },
+                    with_host(|h| h.type_name(v))
+                ))
+            })?;
+            if fb.len() != 1 {
+                return Err(host::type_error(&format!(
+                    "{}(): argument 2 must be a byte string of length 1, not a bytes object of length {}",
+                    match mode {
+                        'l' => "ljust",
+                        'r' => "rjust",
+                        _ => "center",
+                    },
+                    fb.len()
+                )));
+            }
+            fb[0]
+        }
+    };
+    if bytes.len() >= w {
+        return Ok(bytes.to_vec());
+    }
+    let total = w - bytes.len();
+    let mut out = Vec::with_capacity(w);
+    match mode {
+        'l' => {
+            out.extend_from_slice(bytes);
+            out.extend(std::iter::repeat(fill).take(total));
+        }
+        'r' => {
+            out.extend(std::iter::repeat(fill).take(total));
+            out.extend_from_slice(bytes);
+        }
+        _ => {
+            // CPython `center`: the extra byte on an odd margin favors the left
+            // when `margin` and `width` are both odd (`marg/2 + (marg & width & 1)`).
+            let left = total / 2 + (total & w & 1);
+            let right = total - left;
+            out.extend(std::iter::repeat(fill).take(left));
+            out.extend_from_slice(bytes);
+            out.extend(std::iter::repeat(fill).take(right));
+        }
+    }
+    Ok(out)
+}
+
+/// `bytes.translate(table[, delete])`. `table` is a 256-byte remap table (or
+/// `None` for identity); `delete` names bytes to drop. Deletion is tested
+/// against the original byte, then the table is applied.
+fn bytes_translate(bytes: &[u8], args: &[Value]) -> Result<Vec<u8>, String> {
+    let table: Option<Vec<u8>> = match args.first() {
+        None | Some(Value::Undef) => None,
+        Some(v) => {
+            let t = as_bytes_object(v)
+                .ok_or_else(|| host::type_error("a bytes-like object is required"))?;
+            if t.len() != 256 {
+                return Err("ValueError: translation table must be 256 characters long".into());
+            }
+            Some(t)
+        }
+    };
+    let delete: Vec<u8> = match args.get(1) {
+        None | Some(Value::Undef) => Vec::new(),
+        Some(v) => {
+            as_bytes_object(v).ok_or_else(|| host::type_error("a bytes-like object is required"))?
+        }
+    };
+    let mut out = Vec::with_capacity(bytes.len());
+    for &b in bytes {
+        if delete.contains(&b) {
+            continue;
+        }
+        out.push(match &table {
+            Some(t) => t[b as usize],
+            None => b,
+        });
+    }
+    Ok(out)
+}
+
+/// `bytes.maketrans(from, to)` — a 256-byte translation table mapping each byte
+/// of `from` to the corresponding byte of `to`; always returns `bytes`.
+fn bytes_maketrans(args: &[Value]) -> Result<Value, String> {
+    let frm = args
+        .first()
+        .and_then(as_bytes_object)
+        .ok_or_else(|| host::type_error("a bytes-like object is required"))?;
+    let to = args
+        .get(1)
+        .and_then(as_bytes_object)
+        .ok_or_else(|| host::type_error("a bytes-like object is required"))?;
+    if frm.len() != to.len() {
+        return Err("ValueError: maketrans arguments must have same length".into());
+    }
+    let mut table: Vec<u8> = (0..=255).collect();
+    for (f, t) in frm.iter().zip(to.iter()) {
+        table[*f as usize] = *t;
+    }
+    Ok(with_host(|h| h.alloc(PyObj::Bytes(table))))
+}
+
+/// ASCII `bytes.istitle()`: at least one cased byte, uppercase only at run
+/// starts, lowercase only after a cased byte.
+fn is_bytes_titlecased(bytes: &[u8]) -> bool {
+    let mut cased = false;
+    let mut prev_cased = false;
+    for &b in bytes {
+        if b.is_ascii_uppercase() {
+            if prev_cased {
+                return false;
+            }
+            prev_cased = true;
+            cased = true;
+        } else if b.is_ascii_lowercase() {
+            if !prev_cased {
+                return false;
+            }
+            prev_cased = true;
+            cased = true;
+        } else {
+            prev_cased = false;
+        }
+    }
+    cased
 }
 
 /// A `startswith`/`endswith` first argument: a bytes-like, or a tuple of them.

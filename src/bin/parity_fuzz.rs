@@ -1483,6 +1483,103 @@ fn gen_bytesops(seed: u64) -> Vec<String> {
     vec![e]
 }
 
+/// The `bytes`/`bytearray` "tail": str-parallel methods (`swapcase`, `title`,
+/// `center`/`ljust`/`rjust`, the `isX` predicates, `translate`/`maketrans`),
+/// `%`-formatting, `del ba[i]` / `del ba[i:j]`, and `decode(errors=...)`. Every
+/// case prints a deterministic value (no error paths) so output stays byte-stable.
+fn gen_bytestail(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    // Case-varied literals for the case/title/predicate methods.
+    const TLIT: &[&str] = &[
+        "b'hello world'",
+        "b'Hello World'",
+        "b'ABC def'",
+        "b\"they're bill's\"",
+        "b'x1x y2y'",
+        "b'MixedCase'",
+        "b'  spaced  '",
+        "b'abc123'",
+        "b'ABC123'",
+        "b'  '",
+        "b''",
+    ];
+    let b = pick(r, TLIT);
+    let fill = pick(r, &["b'*'", "b'.'", "b'-'", "b'0'"]);
+    let w = pick(r, &["6", "8", "10", "3", "0"]);
+    // Deterministic (format, args) pairs — all valid, all byte-stable.
+    const PCT: &[&str] = &[
+        "b'%d-%s' % (42, b'x')",
+        "b'%5d|%-5d|%05d' % (3, 3, 3)",
+        "b'%x/%X/%#o' % (255, 255, 8)",
+        "b'%c%c%c' % (72, 105, 33)",
+        "b'%b and %s' % (b'A', b'B')",
+        "b'%a|%r' % (b'\\xff', b'ok')",
+        "b'%.2f|%+.1f|% d' % (3.14159, 2.5, 7)",
+        "b'%(x)s-%(y)d' % {b'x': b'hi', b'y': 9}",
+        "b'%*d|%-*d|' % (6, 3, 6, 3)",
+        "b'%s' % bytearray(b'ba')",
+        "bytearray(b'%d.%d') % (1, 2)",
+        "b'%%literal%% %d' % (5,)",
+    ];
+    let idx = pick(r, &["0", "1", "2", "-1", "-2", "7"]);
+    let e = match r.below(24) {
+        0 => format!("print({b}.swapcase())"),
+        1 => format!("print({b}.title())"),
+        2 => format!("print({b}.title(), bytearray({b}).title())"),
+        3 => format!("print({b}.center({w}, {fill}), {b}.center({w}))"),
+        4 => format!("print({b}.ljust({w}, {fill}), {b}.rjust({w}, {fill}))"),
+        5 => format!("print({b}.ljust({w}), {b}.rjust({w}))"),
+        6 => format!("print({b}.isalpha(), {b}.isdigit(), {b}.isalnum())"),
+        7 => format!("print({b}.isspace(), {b}.isupper(), {b}.islower())"),
+        8 => format!("print({b}.istitle(), {b}.isascii())"),
+        9 => format!("print(bytearray({b}).swapcase(), bytearray({b}).isupper())"),
+        10 => {
+            "t = bytes.maketrans(b'abcABC', b'xyzXYZ')\n\
+             print(b'aAbBcCd'.translate(t))"
+                .to_string()
+        }
+        11 => {
+            "t = bytes.maketrans(b'abc', b'xyz')\n\
+             print(b'aabbccd'.translate(t, b'a'), b'aabbcc'.translate(None, b'b'))"
+                .to_string()
+        }
+        12 => format!("print(bytearray({b}).translate(bytes.maketrans(b'lo', b'LO')))"),
+        13 => "print(bytes.maketrans(b'', b''))".to_string(),
+        14 => {
+            let p = pick(r, PCT);
+            format!("print({p})")
+        }
+        15 => {
+            let p = pick(r, PCT);
+            format!("print({p})")
+        }
+        16 => {
+            let p = pick(r, PCT);
+            format!("v = {p}\nprint(v, type(v).__name__)")
+        }
+        17 => format!("ba = bytearray(b'abcdefgh')\ndel ba[{idx}]\nprint(ba)"),
+        18 => {
+            let a = pick(r, &["1", "2", "3"]);
+            let c = pick(r, &["4", "5", "6", "8"]);
+            format!("ba = bytearray(b'abcdefgh')\ndel ba[{a}:{c}]\nprint(ba)")
+        }
+        19 => {
+            let k = pick(r, &["2", "3", "-1", "-2"]);
+            format!("ba = bytearray(b'abcdefgh')\ndel ba[::{k}]\nprint(ba)")
+        }
+        20 => "ba = bytearray(b'abcdef')\ndel ba[1:4]\ndel ba[0]\nprint(ba)".to_string(),
+        21 => "print(b'a\\xffb'.decode('utf-8', 'ignore'), b'a\\xffb'.decode('utf-8', 'replace'))"
+            .to_string(),
+        22 => {
+            "print(b'x\\x80y'.decode('ascii', 'ignore'), b'x\\x80y'.decode('ascii', errors='replace'))"
+                .to_string()
+        }
+        _ => "print(b'\\xe2\\x28\\xa1'.decode('utf-8', 'replace'), b'ab\\xc3'.decode('utf-8', 'ignore'))"
+            .to_string(),
+    };
+    vec![e]
+}
+
 /// `str.format` nested field specs plus keyword / positional-index / attribute /
 /// subscript replacement fields.
 fn gen_format2(seed: u64) -> Vec<String> {
@@ -1552,6 +1649,7 @@ enum Mode {
     Oop2,
     Strfmt2,
     Bytesops,
+    Bytestail,
     Format2,
     Async,
     Async2,
@@ -1590,6 +1688,7 @@ const REAL_MODES: &[Mode] = &[
     Mode::Oop2,
     Mode::Strfmt2,
     Mode::Bytesops,
+    Mode::Bytestail,
     Mode::Format2,
     Mode::Async,
     Mode::Async2,
@@ -1635,6 +1734,7 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Oop2 => gen_oop2(seed),
         Mode::Strfmt2 => gen_strfmt2(seed),
         Mode::Bytesops => gen_bytesops(seed),
+        Mode::Bytestail => gen_bytestail(seed),
         Mode::Format2 => gen_format2(seed),
         Mode::Async => gen_async(seed),
         Mode::Async2 => gen_async2(seed),
@@ -1676,6 +1776,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Oop2 => "oop2",
         Mode::Strfmt2 => "strfmt2",
         Mode::Bytesops => "bytesops",
+        Mode::Bytestail => "bytestail",
         Mode::Format2 => "format2",
         Mode::Async => "async",
         Mode::Async2 => "async2",
@@ -1717,6 +1818,7 @@ fn mode_from_name(s: &str) -> Option<Mode> {
         Mode::Oop2,
         Mode::Strfmt2,
         Mode::Bytesops,
+        Mode::Bytestail,
         Mode::Format2,
         Mode::Async,
         Mode::Async2,
