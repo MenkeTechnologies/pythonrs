@@ -90,6 +90,11 @@ pub struct Compiler {
     loops: Vec<LoopCtx>,
     tmp: usize,
     debug: bool,
+    /// Number of enclosing real scopes (`def`/`lambda`/class body) — comprehension
+    /// hidden functions do NOT count. Decides whether a walrus (`:=`) inside a
+    /// comprehension leaks to module scope (`global`, depth 0) or the enclosing
+    /// function (`nonlocal`, depth > 0), per PEP 572.
+    fn_depth: usize,
 }
 
 /// Compile a parsed program. `debug` enables per-statement DAP line markers.
@@ -540,7 +545,10 @@ impl Compiler {
         body: &[Stmt],
         decorators: &[Expr],
     ) -> Result<(), String> {
-        let def_id = self.build_function(name, params, body)?;
+        self.fn_depth += 1;
+        let def_id = self.build_function(name, params, body);
+        self.fn_depth -= 1;
+        let def_id = def_id?;
         self.emit_make_func(b, def_id, params)?;
         // Apply decorators (innermost first).
         for d in decorators.iter().rev() {
@@ -613,7 +621,10 @@ impl Compiler {
         // Class body compiles as a parameterless function that assigns members
         // into its local env; BUILD_CLASS captures that env as the namespace.
         let empty = Params::default();
-        let def_id = self.build_function(&format!("<class {name}>"), &empty, body)?;
+        self.fn_depth += 1;
+        let def_id = self.build_function(&format!("<class {name}>"), &empty, body);
+        self.fn_depth -= 1;
+        let def_id = def_id?;
         // bases list
         for base in bases {
             self.compile_expr(b, base)?;
@@ -895,7 +906,10 @@ impl Compiler {
             }
             Expr::Lambda { params, body } => {
                 let bodystmt = vec![Stmt::from(StmtKind::Return(Some((**body).clone())))];
-                let def_id = self.build_function("<lambda>", params, &bodystmt)?;
+                self.fn_depth += 1;
+                let def_id = self.build_function("<lambda>", params, &bodystmt);
+                self.fn_depth -= 1;
+                let def_id = def_id?;
                 self.emit_make_func(b, def_id, params)?;
             }
             Expr::ListComp(elt, comps) => {
@@ -1378,9 +1392,49 @@ impl Compiler {
             value: empty,
         }
         .into()];
+        // A walrus (`:=`) inside a comprehension binds in the nearest enclosing
+        // non-comprehension scope, not the hidden comp function (PEP 572). Inject
+        // a `global`/`nonlocal` for each such target so the assignment leaks out.
+        for decl in self.comp_walrus_decls(elt, val, comps) {
+            body.insert(0, decl);
+        }
         body.extend(inner);
         body.push(StmtKind::Return(Some(Expr::Name(acc.into()))).into());
         self.emit_comp_call(b, "<comp>", body, &comps[0].iter)
+    }
+
+    /// Build the `global`/`nonlocal` declarations for every walrus (`:=`) target
+    /// appearing in a comprehension's element, value, and `if` clauses (but NOT
+    /// its iterables, which run in the enclosing scope already). At module level
+    /// (`fn_depth == 0`) the target is a `global`; inside a function it is a
+    /// `nonlocal`, so the binding lands in the enclosing scope, not the hidden
+    /// comprehension function.
+    fn comp_walrus_decls(
+        &self,
+        elt: &Expr,
+        val: Option<&Expr>,
+        comps: &[Comprehension],
+    ) -> Vec<Stmt> {
+        let mut names: Vec<String> = Vec::new();
+        collect_walrus_targets(elt, &mut names);
+        if let Some(v) = val {
+            collect_walrus_targets(v, &mut names);
+        }
+        for c in comps {
+            for cond in &c.ifs {
+                collect_walrus_targets(cond, &mut names);
+            }
+        }
+        names.dedup();
+        if names.is_empty() {
+            return vec![];
+        }
+        let kind = if self.fn_depth == 0 {
+            StmtKind::Global(names)
+        } else {
+            StmtKind::Nonlocal(names)
+        };
+        vec![kind.into()]
     }
 
     /// A generator expression `(elt for target in iter ...)` — lazy: a hidden
@@ -1654,6 +1708,84 @@ fn wrap_comp_clauses(mut inner: Vec<Stmt>, comps: &[Comprehension]) -> Vec<Stmt>
         .into()];
     }
     inner
+}
+
+/// Collect the names assigned by a walrus (`:=`) anywhere in `e`, without
+/// descending into a nested scope (lambda / comprehension / genexpr), whose
+/// walrus targets belong to that inner scope.
+fn collect_walrus_targets(e: &Expr, out: &mut Vec<String>) {
+    match e {
+        Expr::NamedExpr(target, value) => {
+            if let Expr::Name(n) = &**target {
+                if !out.contains(n) {
+                    out.push(n.clone());
+                }
+            }
+            collect_walrus_targets(value, out);
+        }
+        Expr::BoolOp(_, items) | Expr::List(items) | Expr::Tuple(items) | Expr::Set(items) => {
+            for it in items {
+                collect_walrus_targets(it, out);
+            }
+        }
+        Expr::Dict(pairs) => {
+            for (k, v) in pairs {
+                if let Some(k) = k {
+                    collect_walrus_targets(k, out);
+                }
+                collect_walrus_targets(v, out);
+            }
+        }
+        Expr::UnaryOp(_, x) | Expr::Starred(x) | Expr::Await(x) | Expr::YieldFrom(x) => {
+            collect_walrus_targets(x, out)
+        }
+        Expr::Yield(Some(x)) => collect_walrus_targets(x, out),
+        Expr::BinOp(_, a, b) => {
+            collect_walrus_targets(a, out);
+            collect_walrus_targets(b, out);
+        }
+        Expr::Compare(a, links) => {
+            collect_walrus_targets(a, out);
+            for (_, rhs) in links {
+                collect_walrus_targets(rhs, out);
+            }
+        }
+        Expr::IfExp { test, body, orelse } => {
+            collect_walrus_targets(test, out);
+            collect_walrus_targets(body, out);
+            collect_walrus_targets(orelse, out);
+        }
+        Expr::Call {
+            func,
+            args,
+            keywords,
+        } => {
+            collect_walrus_targets(func, out);
+            for a in args {
+                collect_walrus_targets(a, out);
+            }
+            for kw in keywords {
+                collect_walrus_targets(&kw.value, out);
+            }
+        }
+        Expr::Attribute(x, _) => collect_walrus_targets(x, out),
+        Expr::Subscript(a, b) => {
+            collect_walrus_targets(a, out);
+            collect_walrus_targets(b, out);
+        }
+        Expr::Slice { lo, hi, step } => {
+            for p in [lo, hi, step].into_iter().flatten() {
+                collect_walrus_targets(p, out);
+            }
+        }
+        // Nested scopes own their own walrus targets — do not descend.
+        Expr::Lambda { .. }
+        | Expr::ListComp(..)
+        | Expr::SetComp(..)
+        | Expr::DictComp(..)
+        | Expr::GenExp(..) => {}
+        _ => {}
+    }
 }
 
 #[derive(Clone, Copy)]

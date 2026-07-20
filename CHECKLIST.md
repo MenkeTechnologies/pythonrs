@@ -118,11 +118,28 @@ pull pyo3 or need libpython, so they import only the native set below.
 - Native (available in every build): `math`, `sys`, `collections`
   (`Counter/defaultdict/OrderedDict/deque/namedtuple`), `textwrap`, `statistics`,
   plus the built-in `bytes`/`bytearray` and file I/O.
-- **Known bridge limits:** the side-table never frees `Foreign` handles (fine for
-  long-lived stdlib objects, leaks for high-churn ones like per-iteration match
-  objects); non-callable objects passed *into* a CPython call still error; module
-  bundling for release artifacts (ship `lib/python3.14` + `libpython`) is future
-  work per FFI_STDLIB.md §6.
+- [x] **Non-callable objects passed *into* a CPython call** — FIXED: `list`/`dict`/
+  `tuple`/`set`/`str`/`bytes`/`int`/`float`/`None` already crossed by value; now
+  `range`/`complex`/`collections.deque`/`frozenset` do too (`json.dumps({…})`,
+  `functools.reduce(f, range(…))`, `"".join(list)`, `sorted(list, key=f)` all
+  byte-identical to `python3`). An in-place stdlib mutator (`heapq.heapify`,
+  `random.shuffle`, `struct.pack_into`) now **writes its mutation back** into the
+  pythonrs object — by-value marshaling copies the argument, so the bridge re-reads
+  the (mutated) CPython object and overwrites the heap slot in place (aliases see it
+  too). Write-back marshals by value only; it never allocates a `Foreign` handle.
+- **Known bridge limits:** the side-table is bounded for the value-marshaled path
+  (`heapq.heapify`/`json.dumps`/`reduce` in a 2000-iteration loop add only the
+  one-time module handle, never one-per-iter). It is **not** reclaimed for stdlib
+  calls that *return* a live CPython object (`re.match` match objects, `datetime`,
+  file handles): each distinct returned object takes a permanent slot, growing 1:1
+  with the pythonrs host heap. That host heap is a pure arena — `host.rs` never
+  frees any object (`heap`/`io_handles`/`lru_caches` are all append-only), `Value`
+  is a `Copy` handle with no `Drop`, and `PyObj::Foreign` carries only a bare id, so
+  the bridge has no signal for when a handle dies and cannot safely reclaim (a live
+  host reference would dangle). Reclaiming those needs host-side object lifetime
+  (a `Foreign`-drop callback / arena GC in `host.rs`), out of the bridge's scope.
+  Module bundling for release artifacts (ship `lib/python3.14` + `libpython`) is
+  future work per FFI_STDLIB.md §6.
 
 ## Tier 3 — Object model / OOP (largest correctness surface after numerics)
 
@@ -377,11 +394,14 @@ kinds + guards), `for/else`/`while/else`, `try/except/else/finally` ordering all
       (cache schema v8); `bind_params` never binds a positional-only param by keyword
       (a same-named keyword falls through to `**kwargs` or raises CPython's
       `got some positional-only arguments passed as keyword arguments: 'a, b'`).
-- [ ] **Walrus in a comprehension doesn't leak** to the enclosing scope (should);
-      rebinding the loop var via walrus wrongly allowed. (The comprehension result is
-      correct; only the enclosing-scope leak of the `:=` target is missing. Faithful fix
-      needs nonlocal/global injection into the hidden comp function keyed on nesting
-      depth — deferred to avoid destabilizing the at-parity comprehension lowering.)
+- [x] **Walrus in a comprehension leaks** to the enclosing scope — FIXED: the
+      compiler collects every `:=` target in a comprehension's element/value/`if`
+      clauses (not its iterables) and injects a `global`/`nonlocal` declaration at
+      the top of the hidden comp function, chosen by the enclosing real-scope depth
+      (`Compiler.fn_depth`: module → `global`, function → `nonlocal`). The
+      comprehension result is unchanged; the `:=` target binds in the enclosing
+      scope (`list`/`set`/`dict` comps), and stays unbound if never assigned
+      (empty iterable). Cache schema bumped to v9 (comp bytecode changed).
 
 ## Tier 8 — Surfaces confirmed at parity (regression-guard — keep here only what is probed-OK)
 
