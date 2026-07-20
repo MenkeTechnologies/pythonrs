@@ -43,6 +43,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::GETITER, b_getiter);
     vm.register_builtin(ops::FORITER, b_foriter);
     vm.register_builtin(ops::GENRET, b_genret);
+    vm.register_builtin(ops::AWAIT, b_await);
     vm.register_builtin(ops::CONTAINS, b_contains);
     vm.register_builtin(ops::IS, b_is);
     vm.register_builtin(ops::RAISE, b_raise);
@@ -526,6 +527,15 @@ fn b_yieldv(vm: &mut VM, _: u8) -> Value {
     let v = vm.pop();
     match host::gen_yield(v) {
         Ok(sent) => sent,
+        Err(e) => abort(vm, e),
+    }
+}
+
+/// `await E` — drive the awaitable, suspending the coroutine until it settles.
+fn b_await(vm: &mut VM, _: u8) -> Value {
+    let awaitable = vm.pop();
+    match crate::async_rt::await_value(awaitable) {
+        Ok(v) => v,
         Err(e) => abort(vm, e),
     }
 }
@@ -1763,6 +1773,7 @@ pub fn is_builtin_function(name: &str) -> bool {
         || name.starts_with("collections.")
         || name.starts_with("textwrap.")
         || name.starts_with("statistics.")
+        || name.starts_with("asyncio.")
 }
 
 /// Whether `name` is a builtin *type* (`int`, `list`, …) as opposed to a builtin
@@ -1993,6 +2004,10 @@ pub fn call_builtin_function(
     // sys.* module functions.
     if let Some(f) = name.strip_prefix("sys.") {
         return call_sys(f, args);
+    }
+    // asyncio.* module functions (native event loop / futures).
+    if let Some(f) = name.strip_prefix("asyncio.") {
+        return call_asyncio(f, args, kwargs);
     }
     // `dict.fromkeys(iterable[, value])` reached via the `dict` type object.
     if name == "dict.fromkeys" {
@@ -3123,6 +3138,57 @@ fn call_sys(name: &str, args: Vec<Value>) -> Result<Value, String> {
     }
 }
 
+/// `asyncio.*` module functions — dispatched to the native async runtime.
+fn call_asyncio(
+    name: &str,
+    args: Vec<Value>,
+    kwargs: Vec<(String, Value)>,
+) -> Result<Value, String> {
+    use crate::async_rt;
+    match name {
+        "run" => async_rt::run(args.into_iter().next().unwrap_or(Value::Undef)),
+        "sleep" => {
+            let mut it = args.into_iter();
+            let delay = it.next().and_then(num_f).unwrap_or(0.0);
+            let result = it.next().unwrap_or(Value::Undef);
+            Ok(async_rt::sleep(delay, result))
+        }
+        "gather" => {
+            let return_exceptions = kw_get(&kwargs, "return_exceptions")
+                .map(|v| with_host(|h| h.truthy(&v)))
+                .unwrap_or(false);
+            async_rt::gather(args, return_exceptions)
+        }
+        "create_task" => {
+            let coro = args.into_iter().next().unwrap_or(Value::Undef);
+            let name = kw_get(&kwargs, "name").map(|v| with_host(|h| h.str_of(&v)));
+            async_rt::create_task(coro, name)
+        }
+        "ensure_future" => async_rt::ensure_future(args.into_iter().next().unwrap_or(Value::Undef)),
+        "wait_for" => {
+            let mut it = args.into_iter();
+            let aw = it.next().unwrap_or(Value::Undef);
+            let timeout = it.next().and_then(num_f);
+            async_rt::wait_for(aw, timeout)
+        }
+        "get_event_loop" | "get_running_loop" | "new_event_loop" => Ok(async_rt::event_loop()),
+        "Future" => Ok(async_rt::new_future()),
+        _ => Err(format!(
+            "AttributeError: module 'asyncio' has no attribute '{name}'"
+        )),
+    }
+}
+
+/// Coerce a value to `f64` for numeric asyncio args (delay/timeout).
+fn num_f(v: Value) -> Option<f64> {
+    match v {
+        Value::Int(n) => Some(n as f64),
+        Value::Float(f) => Some(f),
+        Value::Bool(b) => Some(if b { 1.0 } else { 0.0 }),
+        _ => None,
+    }
+}
+
 fn call_math(name: &str, args: &[Value]) -> Result<Value, String> {
     let f0 = args.first().and_then(as_f).unwrap_or(0.0);
     match name {
@@ -3221,6 +3287,13 @@ const EXC_PARENTS: &[(&str, &str)] = &[
     ("IndentationError", "Exception"),
     ("SyntaxError", "Exception"),
     ("UnicodeDecodeError", "UnicodeError"),
+    ("ConnectionError", "OSError"),
+    ("BrokenPipeError", "ConnectionError"),
+    ("TimeoutError", "OSError"),
+    // asyncio exceptions: CancelledError is a BaseException (never swallowed by
+    // `except Exception`); InvalidStateError guards double set_result.
+    ("CancelledError", "BaseException"),
+    ("InvalidStateError", "Exception"),
 ];
 
 fn exc_parent(name: &str) -> Option<&'static str> {
@@ -3340,10 +3413,43 @@ pub fn type_has_method(typename: &str, name: &str) -> bool {
         "complex" => COMPLEX_METHODS,
         "property" => PROPERTY_METHODS,
         "generator" => GENERATOR_METHODS,
+        "coroutine" => return GENERATOR_METHODS.contains(&name) || name == "__await__",
+        "Future" | "Task" => return FUTURE_METHODS.contains(&name),
+        "_UnixSelectorEventLoop" => return LOOP_METHODS.contains(&name),
         _ => &[],
     };
     list.contains(&name)
 }
+
+const FUTURE_METHODS: &[&str] = &[
+    "set_result",
+    "set_exception",
+    "result",
+    "exception",
+    "done",
+    "cancelled",
+    "cancel",
+    "add_done_callback",
+    "get_name",
+    "__await__",
+    "__iter__",
+];
+
+const LOOP_METHODS: &[&str] = &[
+    "run_until_complete",
+    "create_task",
+    "create_future",
+    "call_soon",
+    "call_later",
+    "time",
+    "is_running",
+    "is_closed",
+    "stop",
+    "close",
+    "run_forever",
+    "get_debug",
+    "set_debug",
+];
 
 const PROPERTY_METHODS: &[&str] = &["getter", "setter", "deleter"];
 const GENERATOR_METHODS: &[&str] = &["send", "throw", "close", "__next__", "__iter__"];
@@ -3555,9 +3661,21 @@ pub fn call_type_method(
         "complex" => complex_method(recv, name),
         "property" => property_method(recv, name, &args),
         "generator" => generator_method(recv, name, &args),
+        "coroutine" => coroutine_method(recv, name, &args),
+        "Future" | "Task" => crate::async_rt::future_method(recv, name, args),
+        "_UnixSelectorEventLoop" => crate::async_rt::loop_method(name, args),
         other => Err(format!(
             "AttributeError: '{other}' object has no attribute '{name}'"
         )),
+    }
+}
+
+/// `coro.send/throw/close/__await__` — a coroutine's method protocol (shares the
+/// generator machinery; `__await__` returns the coroutine itself to be driven).
+fn coroutine_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    match name {
+        "__await__" => Ok(recv.clone()),
+        _ => generator_method(recv, name, args),
     }
 }
 

@@ -89,6 +89,7 @@ pub mod ops {
     pub const MATCH_CLASS: u16 = 62; // [subject, class, npos, kwnames...] -> [vals_list, Bool] | [Bool]
     pub const MKBYTES: u16 = 63; // [latin1_str] -> bytes (one byte per code point 0..=255)
     pub const GENRET: u16 = 64; // [iter] -> the exhausted (sub)generator's return value (`yield from`)
+    pub const AWAIT: u16 = 65; // [awaitable] -> drive it, suspending the coroutine until it settles
 }
 
 /// Binary-op tags carried by `ops::BINOP` (the non-native operators).
@@ -6387,6 +6388,50 @@ pub fn import_module(name: &str) -> Result<Value, String> {
                 (
                     "setrecursionlimit",
                     h.alloc(PyObj::Builtin("sys.setrecursionlimit".into())),
+                ),
+            ]
+        }),
+        "asyncio" => with_host(|h| {
+            vec![
+                ("run", h.alloc(PyObj::Builtin("asyncio.run".into()))),
+                ("sleep", h.alloc(PyObj::Builtin("asyncio.sleep".into()))),
+                ("gather", h.alloc(PyObj::Builtin("asyncio.gather".into()))),
+                (
+                    "create_task",
+                    h.alloc(PyObj::Builtin("asyncio.create_task".into())),
+                ),
+                (
+                    "ensure_future",
+                    h.alloc(PyObj::Builtin("asyncio.ensure_future".into())),
+                ),
+                (
+                    "wait_for",
+                    h.alloc(PyObj::Builtin("asyncio.wait_for".into())),
+                ),
+                (
+                    "get_event_loop",
+                    h.alloc(PyObj::Builtin("asyncio.get_event_loop".into())),
+                ),
+                (
+                    "get_running_loop",
+                    h.alloc(PyObj::Builtin("asyncio.get_running_loop".into())),
+                ),
+                (
+                    "new_event_loop",
+                    h.alloc(PyObj::Builtin("asyncio.new_event_loop".into())),
+                ),
+                ("Future", h.alloc(PyObj::Builtin("asyncio.Future".into()))),
+                (
+                    "TimeoutError",
+                    h.alloc(PyObj::Builtin("TimeoutError".into())),
+                ),
+                (
+                    "CancelledError",
+                    h.alloc(PyObj::Builtin("CancelledError".into())),
+                ),
+                (
+                    "InvalidStateError",
+                    h.alloc(PyObj::Builtin("InvalidStateError".into())),
                 ),
             ]
         }),

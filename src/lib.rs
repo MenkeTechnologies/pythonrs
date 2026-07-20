@@ -10,6 +10,7 @@
 pub mod aot;
 pub mod aot_native;
 pub mod ast;
+pub mod async_rt;
 pub mod banner;
 pub mod builtins;
 pub mod cache;
