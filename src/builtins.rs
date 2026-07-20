@@ -43,6 +43,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::GETITER, b_getiter);
     vm.register_builtin(ops::FORITER, b_foriter);
     vm.register_builtin(ops::GENRET, b_genret);
+    vm.register_builtin(ops::YIELD_FROM, b_yield_from);
     vm.register_builtin(ops::AWAIT, b_await);
     vm.register_builtin(ops::CONTAINS, b_contains);
     vm.register_builtin(ops::IS, b_is);
@@ -562,6 +563,29 @@ fn b_yieldv(vm: &mut VM, _: u8) -> Value {
     let v = vm.pop();
     match host::gen_yield(v) {
         Ok(sent) => sent,
+        Err(e) => abort(vm, e),
+    }
+}
+
+/// `yield from E` (PEP 380). Resolve `E` to an iterator (an instance `__iter__`
+/// may return a lazy generator), then delegate: re-yield each value, forwarding
+/// sent values / thrown exceptions / close into the sub-iterator, and leave the
+/// sub-iterator's return value (its `StopIteration.value`) on the stack.
+fn b_yield_from(vm: &mut VM, _: u8) -> Value {
+    let v = vm.pop();
+    let it = if with_host(|h| matches!(h.get(&v), Some(PyObj::Instance(_)))) {
+        match iter_instance(&v) {
+            Ok(it) => it,
+            Err(e) => return abort(vm, e),
+        }
+    } else {
+        match with_host(|h| h.make_iter(&v)) {
+            Ok(it) => it,
+            Err(e) => return abort(vm, e),
+        }
+    };
+    match host::run_yield_from(it) {
+        Ok(ret) => ret,
         Err(e) => abort(vm, e),
     }
 }

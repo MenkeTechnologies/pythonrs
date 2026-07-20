@@ -1113,6 +1113,180 @@ fn gen_iterproto(seed: u64) -> Vec<String> {
     }
 }
 
+/// Generators & the yield protocol: `yield from` delegation (sent values, thrown
+/// exceptions, and close forwarded into the sub-iterator per PEP 380), the
+/// delegate's `return` surfacing as `StopIteration.value`, direct
+/// `.send()`/`.throw()`/`.close()`/`.__next__()`, generator expressions, nested
+/// `yield from` chains, `yield` as an expression, and try/finally cleanup on
+/// close. Output is deterministic (ints, fixed strings, `type(e).__name__` — never
+/// a generator repr with an address).
+fn gen_generators(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let base = *pick(r, SMALLINTS);
+    let v1 = *pick(r, SMALLINTS);
+    let v2 = *pick(r, SMALLINTS);
+    let v3 = *pick(r, SMALLINTS);
+    let n = 2 + r.below(4); // 2..=5
+    match r.below(10) {
+        0 => vec![
+            // `yield from` sent-value round-trip + delegate return value.
+            "def sub(base):".into(),
+            "    a = yield base".into(),
+            "    b = yield a + 1".into(),
+            "    c = yield b + 1".into(),
+            "    return a + b + c".into(),
+            "def deleg(base):".into(),
+            "    r = yield from sub(base)".into(),
+            "    print('ret', r)".into(),
+            format!("g = deleg({base})"),
+            "print(next(g))".into(),
+            format!("print(g.send({v1}))"),
+            format!("print(g.send({v2}))"),
+            "try:".into(),
+            format!("    g.send({v3})"),
+            "except StopIteration as e:".into(),
+            "    print('stop', e.value)".into(),
+        ],
+        1 => vec![
+            // `yield from` throw forwarded into the sub, caught there, continues.
+            "def sub():".into(),
+            "    try:".into(),
+            "        while True:".into(),
+            "            x = yield".into(),
+            "    except ValueError:".into(),
+            "        yield 'recovered'".into(),
+            format!("        return {v1}"),
+            "def deleg():".into(),
+            "    r = yield from sub()".into(),
+            "    print('dret', r)".into(),
+            "g = deleg()".into(),
+            "next(g)".into(),
+            format!("g.send({v2})"),
+            "print(g.throw(ValueError))".into(),
+            "try:".into(),
+            "    next(g)".into(),
+            "except StopIteration as e:".into(),
+            "    print('stop', e.value)".into(),
+        ],
+        2 => vec![
+            // `yield from` close forwarded → sub's try/finally cleanup runs.
+            "def sub():".into(),
+            "    try:".into(),
+            "        yield 1".into(),
+            "        yield 2".into(),
+            "    finally:".into(),
+            "        print('sub cleanup')".into(),
+            "def deleg():".into(),
+            "    yield from sub()".into(),
+            "g = deleg()".into(),
+            "print(next(g))".into(),
+            "g.close()".into(),
+            "print('closed')".into(),
+        ],
+        3 => vec![
+            // Nested `yield from` chain (3 levels) with send + return threading.
+            "def leaf():".into(),
+            "    a = yield 10".into(),
+            "    b = yield a + 1".into(),
+            "    return b * 2".into(),
+            "def mid():".into(),
+            "    r = yield from leaf()".into(),
+            format!("    return r + {v1}"),
+            "def top():".into(),
+            "    r = yield from mid()".into(),
+            "    print('top', r)".into(),
+            "g = top()".into(),
+            "print(next(g))".into(),
+            format!("print(g.send({v2}))"),
+            "try:".into(),
+            format!("    g.send({v3})"),
+            "except StopIteration as e:".into(),
+            "    print('stop', e.value)".into(),
+        ],
+        4 => vec![
+            // Direct .send()/.throw()/.close() protocol on a plain generator.
+            "def g():".into(),
+            "    total = 0".into(),
+            "    try:".into(),
+            "        while True:".into(),
+            "            x = yield total".into(),
+            "            total += x".into(),
+            "    except ValueError:".into(),
+            "        yield -1".into(),
+            "gen = g()".into(),
+            "print(next(gen))".into(),
+            format!("print(gen.send({v1}))"),
+            format!("print(gen.send({v2}))"),
+            "print(gen.throw(ValueError))".into(),
+            "gen.close()".into(),
+            "print('closed')".into(),
+        ],
+        5 => vec![
+            // `return` inside a generator surfaces as StopIteration.value.
+            "def g(n):".into(),
+            "    for i in range(n):".into(),
+            "        yield i".into(),
+            format!("    return n * {v1}"),
+            format!("gen = g({n})"),
+            "acc = []".into(),
+            "try:".into(),
+            "    while True:".into(),
+            "        acc.append(next(gen))".into(),
+            "except StopIteration as e:".into(),
+            "    print(acc, e.value)".into(),
+        ],
+        6 => vec![
+            // Generator expressions: lazy, drained by list()/sum()/next().
+            format!("gen = (x * x for x in range({n}))"),
+            "print(next(gen))".into(),
+            "print(list(gen))".into(),
+            format!("print(sum(y + {v1} for y in range({n})))"),
+            format!("print(list(z for z in range({n}) if z % 2 == 0))"),
+        ],
+        7 => vec![
+            // `yield from` over plain iterables interleaved with own yields.
+            "def g():".into(),
+            "    yield -1".into(),
+            format!("    yield from [{v1}, {v2}]"),
+            format!("    yield from range({n})"),
+            "    yield from 'ab'".into(),
+            format!("    r = yield from (i for i in range({v3}))"),
+            "    print('genexp done', r)".into(),
+            "print(list(g()))".into(),
+        ],
+        8 => vec![
+            // `yield` as an expression: a send-driven running accumulator.
+            "def acc():".into(),
+            "    total = 0".into(),
+            "    while True:".into(),
+            "        v = yield total".into(),
+            "        if v is None:".into(),
+            "            break".into(),
+            "        total += v".into(),
+            "gen = acc()".into(),
+            "next(gen)".into(),
+            format!("print(gen.send({v1}))"),
+            format!("print(gen.send({v2}))"),
+            format!("print(gen.send({v3}))"),
+        ],
+        _ => vec![
+            // try/finally cleanup on an uncaught throw propagating out.
+            "def g():".into(),
+            "    try:".into(),
+            "        yield 1".into(),
+            "        yield 2".into(),
+            "    finally:".into(),
+            "        print('cleanup')".into(),
+            "gen = g()".into(),
+            "print(next(gen))".into(),
+            "try:".into(),
+            "    gen.throw(RuntimeError('x'))".into(),
+            "except RuntimeError as e:".into(),
+            "    print('propagated', type(e).__name__)".into(),
+        ],
+    }
+}
+
 /// Exception control flow: try/except/else/finally, multi-type handlers, and
 /// bare-`raise` re-raise. Output is deterministic (type names + fixed messages,
 /// never a raw traceback).
@@ -1879,6 +2053,7 @@ enum Mode {
     Augassign,
     Classes,
     Iterproto,
+    Generators,
     Exceptions,
     Unpacking,
     Comprehension,
@@ -1920,6 +2095,7 @@ const REAL_MODES: &[Mode] = &[
     Mode::Augassign,
     Mode::Classes,
     Mode::Iterproto,
+    Mode::Generators,
     Mode::Exceptions,
     Mode::Unpacking,
     Mode::Comprehension,
@@ -1968,6 +2144,7 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Augassign => gen_augassign(seed),
         Mode::Classes => gen_classes(seed),
         Mode::Iterproto => gen_iterproto(seed),
+        Mode::Generators => gen_generators(seed),
         Mode::Exceptions => gen_exceptions(seed),
         Mode::Unpacking => gen_unpacking(seed),
         Mode::Comprehension => gen_comprehension(seed),
@@ -2012,6 +2189,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Augassign => "augassign",
         Mode::Classes => "classes",
         Mode::Iterproto => "iterproto",
+        Mode::Generators => "generators",
         Mode::Exceptions => "exceptions",
         Mode::Unpacking => "unpacking",
         Mode::Comprehension => "comprehension",
@@ -2056,6 +2234,7 @@ fn mode_from_name(s: &str) -> Option<Mode> {
         Mode::Augassign,
         Mode::Classes,
         Mode::Iterproto,
+        Mode::Generators,
         Mode::Exceptions,
         Mode::Unpacking,
         Mode::Comprehension,

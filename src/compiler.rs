@@ -1263,21 +1263,14 @@ impl Compiler {
         Ok(())
     }
 
-    /// `yield from iterable` — drive the iterable, yielding each element.
+    /// `yield from iterable` — full PEP 380 delegation. The single `YIELD_FROM`
+    /// op drives the sub-iterator in the host: it re-yields each value, forwards
+    /// `.send()` values / `.throw()` exceptions / `.close()` into the
+    /// sub-iterator, and leaves the sub-iterator's return value
+    /// (its `StopIteration.value`) on the stack.
     fn compile_yield_from(&mut self, b: &mut ChunkBuilder, iter: &Expr) -> Result<(), String> {
         self.compile_expr(b, iter)?;
-        b.emit(Op::CallBuiltin(ops::GETITER, 1), 0); // [it]
-        let start = b.current_pos();
-        b.emit(Op::CallBuiltin(ops::FORITER, 0), 0); // [it, value, has_next]
-        let jdone = b.emit(Op::JumpIfFalse(0), 0); // pops has_next -> [it, value]
-        b.emit(Op::CallBuiltin(ops::YIELDV, 1), 0); // yield value -> [it, sent]
-        b.emit(Op::Pop, 0); // drop sent -> [it]
-        b.emit(Op::Jump(start), 0);
-        let done = b.current_pos();
-        b.patch_jump(jdone, done);
-        // The `yield from` expression evaluates to the delegated iterator's
-        // return value (its `StopIteration.value`) — `None` for a non-generator.
-        b.emit(Op::CallBuiltin(ops::GENRET, 1), 0); // [it] -> retval
+        b.emit(Op::CallBuiltin(ops::YIELD_FROM, 1), 0); // [iterable] -> retval
         Ok(())
     }
 

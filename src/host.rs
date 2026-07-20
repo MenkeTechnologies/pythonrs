@@ -92,6 +92,7 @@ pub mod ops {
     pub const AWAIT: u16 = 65; // [awaitable] -> drive it, suspending the coroutine until it settles
     pub const INPLACE: u16 = 66; // [iop(int), a, b] -> augmented op (`+=`, `|=`, …): in-place dunder / mutate, else binary fallback
     pub const WITH_EXIT: u16 = 67; // [mgr] -> call `mgr.__exit__` with the active exception triple; -> Bool(suppress)
+    pub const YIELD_FROM: u16 = 68; // [iterable] -> `yield from` delegation (PEP 380); -> sub-iterator's return value
 }
 
 /// In-place (augmented-assignment) op tags carried by `ops::INPLACE`. One per
@@ -6420,6 +6421,28 @@ pub fn gen_yield_awaiting(v: Value) -> Result<Value, String> {
 }
 
 fn gen_suspend(v: Value, awaiting: bool) -> Result<Value, String> {
+    match gen_suspend_raw(v, awaiting)? {
+        Resumed::Send(s) => Ok(s),
+        // A `.throw()`/`.close()` queued an exception to raise at this yield point.
+        // `raise_value` sets `h.exc` and returns the abort string; propagate it as
+        // an error so the body's own `try/except` can catch it.
+        Resumed::Throw(exc) => Err(raise_value(&exc).unwrap_or_else(|e| e)),
+    }
+}
+
+/// How a suspended generator was resumed: a `.send()` value or an exception
+/// injected via `.throw()`/`.close()`. Plain `yield` collapses `Throw` into an
+/// `Err` (see [`gen_suspend`]); `yield from` inspects it to forward the exception
+/// into the sub-iterator (PEP 380).
+enum Resumed {
+    Send(Value),
+    Throw(Value),
+}
+
+/// Suspend the running generator at a `yield`, returning how it was resumed
+/// (a sent value, or an injected exception) WITHOUT collapsing a throw into an
+/// error. This is the shared core of `gen_suspend` and the `yield from` driver.
+fn gen_suspend_raw(v: Value, awaiting: bool) -> Result<Resumed, String> {
     let id = match CUR_GEN.with(|c| c.get()) {
         Some(id) => id,
         None => return Err(type_error("'yield' outside a generator")),
@@ -6430,13 +6453,128 @@ fn gen_suspend(v: Value, awaiting: bool) -> Result<Value, String> {
     // we only reach here from inside that body (its stack is live).
     let yielder = unsafe { &*(yp as *const corosensei::Yielder<Value, Value>) };
     let sent = yielder.suspend(v);
-    // A `.throw()`/`.close()` queued an exception to raise at this yield point.
     if let Some(exc) = with_host(|h| h.generators[id as usize].pending_throw.take()) {
-        // `raise_value` sets `h.exc` and returns the abort string; propagate it as
-        // an error so the body's own `try/except` can catch it.
-        return Err(raise_value(&exc).unwrap_or_else(|e| e));
+        return Ok(Resumed::Throw(exc));
     }
-    Ok(sent)
+    Ok(Resumed::Send(sent))
+}
+
+/// One outcome of advancing the sub-iterator during `yield from` delegation.
+enum SubStep {
+    /// The sub-iterator yielded a value to re-yield from the delegating generator.
+    Yield(Value),
+    /// The sub-iterator is exhausted; carries its return (`StopIteration.value`).
+    Return(Value),
+}
+
+/// The exception's class name (`Exception`/`Instance`/`Builtin` forms), used to
+/// recognize `GeneratorExit` during `yield from` close-forwarding.
+fn exc_class_name(v: &Value) -> Option<String> {
+    with_host(|h| match h.get(v) {
+        Some(PyObj::Exception { class, .. }) => Some(class.clone()),
+        Some(PyObj::Instance(i)) => Some(i.class.clone()),
+        Some(PyObj::Builtin(n)) => Some(n.clone()),
+        _ => None,
+    })
+}
+
+/// A finished sub-generator's return value (its `StopIteration.value`), or `None`
+/// for a non-generator delegate.
+fn gen_ret_of(it: &Value) -> Value {
+    match with_host(|h| h.get(it).cloned()) {
+        Some(PyObj::Generator { id }) => with_host(|h| h.gen_return_value(id)),
+        _ => Value::Undef,
+    }
+}
+
+/// Advance the sub-iterator by sending `s` (`Undef` = `next()`). A generator
+/// delegate takes `.send(s)`; a plain iterator only accepts `next()` and errors
+/// on a non-`None` send (CPython's `AttributeError: … has no attribute 'send'`).
+fn sub_send(it: &Value, is_gen: bool, s: Value) -> Result<SubStep, String> {
+    if is_gen {
+        match gen_resume(it, s)? {
+            Some(v) => Ok(SubStep::Yield(v)),
+            None => Ok(SubStep::Return(gen_ret_of(it))),
+        }
+    } else {
+        if !matches!(s, Value::Undef) {
+            let tn = with_host(|h| h.type_name(it));
+            return Err(format!(
+                "AttributeError: '{tn}' object has no attribute 'send'"
+            ));
+        }
+        match iter_step(it)? {
+            Some(v) => Ok(SubStep::Yield(v)),
+            None => Ok(SubStep::Return(Value::Undef)),
+        }
+    }
+}
+
+/// Forward a `.throw(exc)` into the sub-iterator. A generator delegate takes
+/// `.throw`; a plain iterator has none, so the exception is raised in the
+/// delegating frame (PEP 380's `raise _e`).
+fn sub_throw(it: &Value, is_gen: bool, exc: Value) -> Result<SubStep, String> {
+    if is_gen {
+        match gen_throw(it, exc)? {
+            Some(v) => Ok(SubStep::Yield(v)),
+            None => Ok(SubStep::Return(gen_ret_of(it))),
+        }
+    } else {
+        Err(raise_value(&exc).unwrap_or_else(|e| e))
+    }
+}
+
+/// Forward a `.close()` (GeneratorExit) into a sub-generator, swallowing whatever
+/// it produces (the delegating generator re-raises the GeneratorExit itself).
+fn sub_close(it: &Value, is_gen: bool) {
+    if is_gen {
+        let ge = with_host(|h| {
+            h.alloc(PyObj::Exception {
+                class: "GeneratorExit".into(),
+                args: vec![],
+            })
+        });
+        let _ = gen_throw(it, ge);
+        with_host(|h| {
+            h.error = None;
+            h.exc = None;
+        });
+    }
+}
+
+/// `yield from <it>` delegation (PEP 380): drive the sub-iterator `it`,
+/// re-yielding each of its values from the delegating generator and forwarding
+/// `.send()` values, `.throw()` exceptions, and `.close()` (GeneratorExit) into
+/// the sub-iterator. Returns the sub-iterator's return value (its
+/// `StopIteration.value`) so `r = yield from sub()` binds correctly.
+pub fn run_yield_from(it: Value) -> Result<Value, String> {
+    let is_gen = with_host(|h| matches!(h.get(&it), Some(PyObj::Generator { .. })));
+    // `_y = next(_i)` — the first advance is always a plain `next()`.
+    let mut y = match sub_send(&it, is_gen, Value::Undef)? {
+        SubStep::Yield(v) => v,
+        SubStep::Return(r) => return Ok(r),
+    };
+    loop {
+        match gen_suspend_raw(y, false)? {
+            // `_s = yield _y` → `next(_i)` if None, else `_i.send(_s)`.
+            Resumed::Send(s) => match sub_send(&it, is_gen, s)? {
+                SubStep::Yield(v) => y = v,
+                SubStep::Return(r) => return Ok(r),
+            },
+            Resumed::Throw(exc) => {
+                // GeneratorExit → close the sub-iterator, then re-raise it here.
+                if exc_class_name(&exc).as_deref() == Some("GeneratorExit") {
+                    sub_close(&it, is_gen);
+                    return Err(raise_value(&exc).unwrap_or_else(|e| e));
+                }
+                // Any other thrown exception → forward to `_i.throw`.
+                match sub_throw(&it, is_gen, exc)? {
+                    SubStep::Yield(v) => y = v,
+                    SubStep::Return(r) => return Ok(r),
+                }
+            }
+        }
+    }
 }
 
 /// Whether a generator has been resumed at least once (a fresh generator only
