@@ -102,10 +102,13 @@ fixed. Every line below was re-checked against the **default-build** binary
   __aexit__`; async comprehensions `[x async for x in ag()]` (and set/dict forms,
   with `if` filters) run the hidden comprehension body as an awaited coroutine —
   all byte-verified vs CPython.
-  **Not yet:** async generators (`async def` containing `yield`);
-  `asyncio.wait`/`as_completed`/`Queue`/`Event`/`Lock`; task cancellation
+  `asyncio.wait`/`as_completed`/`Event`/`Lock`/`Queue` are also implemented
+  natively on the same event loop (`Event.wait/set/clear`, `Lock.acquire/release`
+  + `async with lock`, `Queue.put/get/qsize`), byte-verified vs CPython.
+  **Not yet:** async generators (`async def` containing `yield`); task cancellation
   propagation (`Task.cancel` settles the future but does not inject
-  `CancelledError` into a suspended coroutine).
+  `CancelledError` into a suspended coroutine); bounded-`Queue` put back-pressure
+  (put is always accepted); `wait`'s `timeout`/`return_when` variants.
 
 ## Not yet implemented (compile/parse-time error, no silent wrong answer)
 - **`yield from` sent values.** The delegate's `return` value is now forwarded,

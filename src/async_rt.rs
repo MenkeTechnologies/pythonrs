@@ -68,9 +68,33 @@ struct Timer {
     cb: Callback,
 }
 
+/// An `asyncio` synchronization primitive, backed by `PyObj::AsyncObj.id`.
+enum AsyncObj {
+    /// A one-shot flag: `wait()` blocks until `set()`; `clear()` resets it.
+    Event {
+        flag: bool,
+        waiters: Vec<u32>, // future ids to complete on `set()`
+    },
+    /// A mutual-exclusion lock: `acquire()` blocks while held; `release()` hands
+    /// off to the next waiter (staying locked) or unlocks.
+    Lock {
+        locked: bool,
+        waiters: VecDeque<u32>, // future ids waiting to acquire
+    },
+    /// A FIFO queue: `get()` blocks while empty. `maxsize` is recorded for
+    /// `full()`/`repr`; bounded `put()` back-pressure is not yet modeled (put is
+    /// always accepted), matching the common unbounded-queue usage.
+    Queue {
+        items: VecDeque<Value>,
+        maxsize: usize, // 0 = unbounded
+        getters: VecDeque<u32>,
+    },
+}
+
 #[derive(Default)]
 struct EventLoop {
     futures: Vec<FutureCell>,
+    async_objs: Vec<AsyncObj>,
     ready: VecDeque<Callback>,
     timers: Vec<Timer>,
     time: f64,
@@ -619,6 +643,388 @@ pub fn wait_for(aw: Value, timeout: Option<f64>) -> Result<Value, String> {
         );
     }
     Ok(outer)
+}
+
+/// `asyncio.wait(aws)` — wait for all awaitables to complete; the result future
+/// resolves to `(done, pending)` sets. (No timeout/`return_when` variants yet;
+/// this waits for ALL_COMPLETED.)
+pub fn wait(aws: Vec<Value>) -> Result<Value, String> {
+    // ensure_future each, gather-join, then build the (done, empty) tuple.
+    let tasks: Vec<Value> = aws
+        .into_iter()
+        .map(ensure_future)
+        .collect::<Result<_, _>>()?;
+    let joined = gather_join(&tasks);
+    let jid = future_id(&joined).unwrap();
+    let outer = new_future();
+    let oid = future_id(&outer).unwrap();
+    let tasks_c = tasks.clone();
+    add_done_native(
+        jid,
+        Box::new(move || {
+            let done = with_host(|h| h.alloc(PyObj::Set(build_set(&tasks_c))));
+            let pending = with_host(|h| h.alloc(PyObj::Set(indexmap::IndexMap::new())));
+            let tup = with_host(|h| h.new_tuple(vec![done, pending]));
+            settle(oid, tup, None, false);
+        }),
+    );
+    Ok(outer)
+}
+
+/// `asyncio.as_completed(aws)` — returns a list of awaitables (one per input)
+/// that resolve in completion order. Awaiting them in list order yields results
+/// as the underlying tasks finish, matching CPython's iteration semantics.
+pub fn as_completed(aws: Vec<Value>) -> Result<Value, String> {
+    let tasks: Vec<Value> = aws
+        .into_iter()
+        .map(ensure_future)
+        .collect::<Result<_, _>>()?;
+    // One output future per input; the k-th input to complete fulfills the k-th
+    // output future (in completion order).
+    let outs: Vec<Value> = (0..tasks.len()).map(|_| new_future()).collect();
+    let next_slot = Rc::new(std::cell::Cell::new(0usize));
+    let outs_rc = Rc::new(outs.clone());
+    for t in &tasks {
+        let tid = future_id(t).unwrap();
+        let next_slot = next_slot.clone();
+        let outs_rc = outs_rc.clone();
+        add_done_native(
+            tid,
+            Box::new(move || {
+                let k = next_slot.get();
+                next_slot.set(k + 1);
+                let oid = future_id(&outs_rc[k]).unwrap();
+                if let Some(e) = future_exc(tid) {
+                    fail_quietly(oid, e);
+                } else {
+                    settle(oid, future_result(tid), None, false);
+                }
+            }),
+        );
+    }
+    Ok(with_host(|h| h.new_list(outs)))
+}
+
+/// Join a set of already-ensured futures: the returned future completes once all
+/// of them are done (result value unused by callers here).
+fn gather_join(tasks: &[Value]) -> Value {
+    let outer = new_future();
+    let oid = future_id(&outer).unwrap();
+    let n = tasks.len();
+    if n == 0 {
+        settle(oid, Value::Undef, None, false);
+        return outer;
+    }
+    let remaining = Rc::new(std::cell::Cell::new(n));
+    for t in tasks {
+        let tid = future_id(t).unwrap();
+        let remaining_c = remaining.clone();
+        add_done_native(
+            tid,
+            Box::new(move || {
+                let rem = remaining_c.get() - 1;
+                remaining_c.set(rem);
+                if rem == 0 {
+                    settle(oid, Value::Undef, None, false);
+                }
+            }),
+        );
+    }
+    outer
+}
+
+fn build_set(items: &[Value]) -> indexmap::IndexMap<crate::host::PKey, Value> {
+    let mut m = indexmap::IndexMap::new();
+    for (i, v) in items.iter().enumerate() {
+        // Futures aren't hashable by value; key by heap identity via a synthetic
+        // int key so the set holds each distinct task once.
+        m.insert(crate::host::PKey::Int(i as i64), v.clone());
+    }
+    m
+}
+
+// ── synchronization primitives (Event / Lock / Queue) ────────────────────────
+
+fn new_async_obj(obj: AsyncObj) -> Value {
+    let id = with_loop(|l| {
+        let id = l.async_objs.len() as u32;
+        l.async_objs.push(obj);
+        id
+    });
+    with_host(|h| h.alloc(PyObj::AsyncObj { id }))
+}
+
+/// `asyncio.Event()`.
+pub fn new_event() -> Value {
+    new_async_obj(AsyncObj::Event {
+        flag: false,
+        waiters: Vec::new(),
+    })
+}
+
+/// `asyncio.Lock()`.
+pub fn new_lock() -> Value {
+    new_async_obj(AsyncObj::Lock {
+        locked: false,
+        waiters: VecDeque::new(),
+    })
+}
+
+/// `asyncio.Queue(maxsize=0)`.
+pub fn new_queue(maxsize: usize) -> Value {
+    new_async_obj(AsyncObj::Queue {
+        items: VecDeque::new(),
+        maxsize,
+        getters: VecDeque::new(),
+    })
+}
+
+fn async_obj_id(v: &Value) -> Option<u32> {
+    match with_host(|h| h.get(v).cloned()) {
+        Some(PyObj::AsyncObj { id }) => Some(id),
+        _ => None,
+    }
+}
+
+/// Type name for an `AsyncObj` cell.
+pub fn async_obj_type_name(id: u32) -> &'static str {
+    with_loop(|l| match &l.async_objs[id as usize] {
+        AsyncObj::Event { .. } => "Event",
+        AsyncObj::Lock { .. } => "Lock",
+        AsyncObj::Queue { .. } => "Queue",
+    })
+}
+
+/// `repr` for an `AsyncObj` cell.
+pub fn async_obj_repr(id: u32) -> String {
+    with_loop(|l| match &l.async_objs[id as usize] {
+        AsyncObj::Event { flag, .. } => {
+            format!(
+                "<asyncio.locks.Event object [{}]>",
+                if *flag { "set" } else { "unset" }
+            )
+        }
+        AsyncObj::Lock { locked, .. } => format!(
+            "<asyncio.locks.Lock object [{}]>",
+            if *locked { "locked" } else { "unlocked" }
+        ),
+        AsyncObj::Queue { items, maxsize, .. } => {
+            format!("<Queue maxsize={maxsize} _queue={}>", items.len())
+        }
+    })
+}
+
+/// Dispatch a method call on an `Event`/`Lock`/`Queue`.
+pub fn async_obj_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, String> {
+    let id = async_obj_id(recv).ok_or_else(|| host::type_error("not an async primitive"))?;
+    let kind = with_loop(|l| match &l.async_objs[id as usize] {
+        AsyncObj::Event { .. } => 0u8,
+        AsyncObj::Lock { .. } => 1,
+        AsyncObj::Queue { .. } => 2,
+    });
+    match (kind, name) {
+        // ── Event ──
+        (0, "set") => {
+            let waiters = with_loop(|l| {
+                if let AsyncObj::Event { flag, waiters } = &mut l.async_objs[id as usize] {
+                    *flag = true;
+                    std::mem::take(waiters)
+                } else {
+                    Vec::new()
+                }
+            });
+            for w in waiters {
+                settle(w, Value::Bool(true), None, false);
+            }
+            Ok(Value::Undef)
+        }
+        (0, "clear") => {
+            with_loop(|l| {
+                if let AsyncObj::Event { flag, .. } = &mut l.async_objs[id as usize] {
+                    *flag = false;
+                }
+            });
+            Ok(Value::Undef)
+        }
+        (0, "is_set") => Ok(Value::Bool(with_loop(|l| {
+            matches!(
+                &l.async_objs[id as usize],
+                AsyncObj::Event { flag: true, .. }
+            )
+        }))),
+        (0, "wait") => {
+            let flag = with_loop(|l| {
+                matches!(
+                    &l.async_objs[id as usize],
+                    AsyncObj::Event { flag: true, .. }
+                )
+            });
+            let fut = new_future();
+            let fid = future_id(&fut).unwrap();
+            if flag {
+                settle(fid, Value::Bool(true), None, false);
+            } else {
+                with_loop(|l| {
+                    if let AsyncObj::Event { waiters, .. } = &mut l.async_objs[id as usize] {
+                        waiters.push(fid);
+                    }
+                });
+            }
+            Ok(fut)
+        }
+        // ── Lock ──
+        (1, "locked") => Ok(Value::Bool(with_loop(|l| {
+            matches!(
+                &l.async_objs[id as usize],
+                AsyncObj::Lock { locked: true, .. }
+            )
+        }))),
+        (1, "acquire") | (1, "__aenter__") => {
+            let fut = new_future();
+            let fid = future_id(&fut).unwrap();
+            let acquired = with_loop(|l| {
+                if let AsyncObj::Lock { locked, waiters } = &mut l.async_objs[id as usize] {
+                    if *locked {
+                        waiters.push_back(fid);
+                        false
+                    } else {
+                        *locked = true;
+                        true
+                    }
+                } else {
+                    true
+                }
+            });
+            if acquired {
+                settle(fid, Value::Bool(true), None, false);
+            }
+            Ok(fut)
+        }
+        (1, "release") => {
+            release_lock(id);
+            Ok(Value::Undef)
+        }
+        (1, "__aexit__") => {
+            release_lock(id);
+            // __aexit__ must be awaitable and return False (don't suppress).
+            let fut = new_future();
+            settle(future_id(&fut).unwrap(), Value::Bool(false), None, false);
+            Ok(fut)
+        }
+        // ── Queue ──
+        (2, "qsize") => Ok(Value::Int(with_loop(|l| {
+            match &l.async_objs[id as usize] {
+                AsyncObj::Queue { items, .. } => items.len() as i64,
+                _ => 0,
+            }
+        }))),
+        (2, "empty") => Ok(Value::Bool(with_loop(|l| {
+            match &l.async_objs[id as usize] {
+                AsyncObj::Queue { items, .. } => items.is_empty(),
+                _ => true,
+            }
+        }))),
+        (2, "full") => Ok(Value::Bool(with_loop(|l| {
+            match &l.async_objs[id as usize] {
+                AsyncObj::Queue { items, maxsize, .. } => *maxsize > 0 && items.len() >= *maxsize,
+                _ => false,
+            }
+        }))),
+        (2, "put_nowait") => {
+            queue_put(id, args.into_iter().next().unwrap_or(Value::Undef));
+            Ok(Value::Undef)
+        }
+        (2, "put") => {
+            queue_put(id, args.into_iter().next().unwrap_or(Value::Undef));
+            let fut = new_future();
+            settle(future_id(&fut).unwrap(), Value::Undef, None, false);
+            Ok(fut)
+        }
+        (2, "get_nowait") => queue_get_now(id),
+        (2, "get") => {
+            let fut = new_future();
+            let fid = future_id(&fut).unwrap();
+            // If an item is ready, fulfill immediately; else queue the getter.
+            let item = with_loop(|l| {
+                if let AsyncObj::Queue { items, .. } = &mut l.async_objs[id as usize] {
+                    items.pop_front()
+                } else {
+                    None
+                }
+            });
+            match item {
+                Some(v) => settle(fid, v, None, false),
+                None => {
+                    with_loop(|l| {
+                        if let AsyncObj::Queue { getters, .. } = &mut l.async_objs[id as usize] {
+                            getters.push_back(fid);
+                        }
+                    });
+                    false
+                }
+            };
+            // A pending putter (bounded queue) can now proceed — skipped (unbounded
+            // default); bounded put blocking is not yet modeled.
+            Ok(fut)
+        }
+        _ => Err(format!(
+            "AttributeError: '{}' object has no attribute '{name}'",
+            async_obj_type_name(id)
+        )),
+    }
+}
+
+/// Hand a lock to the next waiter (staying locked) or release it.
+fn release_lock(id: u32) {
+    let next = with_loop(|l| {
+        if let AsyncObj::Lock { locked, waiters } = &mut l.async_objs[id as usize] {
+            match waiters.pop_front() {
+                Some(w) => Some(w), // stays locked, handed to `w`
+                None => {
+                    *locked = false;
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    });
+    if let Some(w) = next {
+        settle(w, Value::Bool(true), None, false);
+    }
+}
+
+/// Put an item, waking a pending getter if one is waiting.
+fn queue_put(id: u32, v: Value) {
+    let getter = with_loop(|l| {
+        if let AsyncObj::Queue { items, getters, .. } = &mut l.async_objs[id as usize] {
+            if let Some(g) = getters.pop_front() {
+                Some(g)
+            } else {
+                items.push_back(v.clone());
+                None
+            }
+        } else {
+            None
+        }
+    });
+    if let Some(g) = getter {
+        settle(g, v, None, false);
+    }
+}
+
+fn queue_get_now(id: u32) -> Result<Value, String> {
+    let item = with_loop(|l| {
+        if let AsyncObj::Queue { items, .. } = &mut l.async_objs[id as usize] {
+            items.pop_front()
+        } else {
+            None
+        }
+    });
+    match item {
+        Some(v) => Ok(v),
+        None => Err("QueueEmpty: ".to_string()),
+    }
 }
 
 // ── event-loop object ────────────────────────────────────────────────────────

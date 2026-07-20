@@ -329,6 +329,11 @@ pub enum PyObj {
     /// The singleton asyncio event loop object (`get_event_loop()`), a thin
     /// handle over the native ready-queue + timer-heap runtime.
     EventLoop,
+    /// An `asyncio` synchronization primitive (`Event`/`Lock`/`Queue`), backed by
+    /// a cell in the async runtime side-table (`crate::async_rt`).
+    AsyncObj {
+        id: u32,
+    },
     /// A mutable byte string (`bytearray`). Held inline (a plain `Vec<u8>`),
     /// unlike the immutable [`PyObj::Bytes`].
     Bytearray(Vec<u8>),
@@ -1274,6 +1279,7 @@ impl PyHost {
                 },
                 Some(PyObj::Future { id }) => async_rt::future_type_name(*id).into(),
                 Some(PyObj::EventLoop) => "_UnixSelectorEventLoop".into(),
+                Some(PyObj::AsyncObj { id }) => async_rt::async_obj_type_name(*id).into(),
                 Some(PyObj::File { .. }) => "TextIOWrapper".into(),
                 Some(PyObj::Deque { .. }) => "deque".into(),
                 Some(PyObj::NamedTupleType { .. }) => "type".into(),
@@ -1408,6 +1414,7 @@ impl PyHost {
                 Some(PyObj::EventLoop) => {
                     "<_UnixSelectorEventLoop running=False closed=False debug=False>".into()
                 }
+                Some(PyObj::AsyncObj { id }) => async_rt::async_obj_repr(*id),
                 Some(PyObj::Bytearray(b)) => format!("bytearray(b{})", quote_bytes(b, true)),
                 Some(PyObj::File { id }) => self.file_repr(*id),
                 Some(PyObj::Deque { items, maxlen }) => {
@@ -6410,6 +6417,14 @@ pub fn import_module(name: &str) -> Result<Value, String> {
                     "wait_for",
                     h.alloc(PyObj::Builtin("asyncio.wait_for".into())),
                 ),
+                ("wait", h.alloc(PyObj::Builtin("asyncio.wait".into()))),
+                (
+                    "as_completed",
+                    h.alloc(PyObj::Builtin("asyncio.as_completed".into())),
+                ),
+                ("Event", h.alloc(PyObj::Builtin("asyncio.Event".into()))),
+                ("Lock", h.alloc(PyObj::Builtin("asyncio.Lock".into()))),
+                ("Queue", h.alloc(PyObj::Builtin("asyncio.Queue".into()))),
                 (
                     "get_event_loop",
                     h.alloc(PyObj::Builtin("asyncio.get_event_loop".into())),

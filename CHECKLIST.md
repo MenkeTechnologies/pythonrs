@@ -470,8 +470,10 @@ kinds + guards), `for/else`/`while/else`, `try/except/else/finally` ordering all
       (`__aiter__`/`__anext__`, `StopAsyncIteration`, `for…else`), `async with`
       (`await __aenter__`/`__aexit__`), and async comprehensions
       (`[x async for x in ag()]` + set/dict + `if` filters) all lowered and byte-verified.
-      **Still pending:** async generators (`async def` with `yield`), task cancellation
-      injection, `asyncio.wait`/`as_completed`/`Queue`/`Event`/`Lock`.
+      `asyncio.wait`/`as_completed`/`Event`/`Lock`/`Queue` are implemented natively too
+      (`async with lock`, producer/consumer `Queue`, `Event.wait`/`set`). **Still pending:**
+      async generators (`async def` with `yield`), task cancellation injection,
+      bounded-`Queue` back-pressure, `wait` timeout/`return_when`.
 - [x] **Bare `raise` re-raise** — FIXED: the except handler now keeps the caught
       exception as the "currently handled" one (`h.exc`) while its body runs, so a
       bare `raise` re-raises it (caught by an outer handler); it is cleared when the
