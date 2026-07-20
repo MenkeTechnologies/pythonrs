@@ -1463,3 +1463,78 @@ fn three_arg_type_and_posonly() {
         "'rejected'"
     );
 }
+
+#[test]
+fn named_unicode_escapes() {
+    // \N{NAME} resolves to the codepoint, in normal strings and f-strings.
+    // Expected values match CPython 3.14 byte for byte.
+    assert_eq!(g("x = '\\N{LATIN SMALL LETTER E WITH ACUTE}'", "x"), "'é'");
+    assert_eq!(
+        g("x = '\\N{GREEK SMALL LETTER ALPHA}\\N{BULLET}'", "x"),
+        "'α•'"
+    );
+    assert_eq!(g("x = len('\\N{ROCKET}')", "x"), "1");
+    assert_eq!(g("x = ord('\\N{SNOWMAN}')", "x"), "9731");
+    // Case-insensitive name matching (CPython accepts lowercase).
+    assert_eq!(g("x = '\\N{bullet}'", "x"), "'•'");
+    // f-string: the escape's braces are not a replacement field.
+    assert_eq!(g("x = f'a\\N{BULLET}b {1+1}'", "x"), "'a•b 2'");
+    assert_eq!(g("x = f'\\N{ROCKET}{7}'", "x"), "'🚀7'");
+    // An escaped backslash means \N is literal, not an escape.
+    assert_eq!(g("x = '\\\\N{BULLET}'", "x"), "'\\\\N{BULLET}'");
+}
+
+#[test]
+fn named_unicode_escape_errors() {
+    // Unknown name (CPython's exact unicodeescape error, byte-identical payload).
+    let e = eval_str("x = '\\N{NOT A REAL NAME}'").unwrap_err();
+    assert!(
+        e.contains(
+            "(unicode error) 'unicodeescape' codec can't decode bytes in position 0-18: unknown Unicode character name"
+        ),
+        "got: {e}"
+    );
+    // Position offset accounts for a leading char.
+    let e = eval_str("x = 'x\\N{BOGUS NAME HERE}'").unwrap_err();
+    assert!(
+        e.contains("position 1-19: unknown Unicode character name"),
+        "got: {e}"
+    );
+    // Empty braces -> malformed.
+    let e = eval_str("x = '\\N{}'").unwrap_err();
+    assert!(
+        e.contains("position 0-2: malformed \\N character escape"),
+        "got: {e}"
+    );
+    // Missing brace -> malformed.
+    let e = eval_str("x = '\\Nfoo'").unwrap_err();
+    assert!(
+        e.contains("position 0-1: malformed \\N character escape"),
+        "got: {e}"
+    );
+    // Unterminated brace -> malformed, spans to end of literal.
+    let e = eval_str("x = '\\N{FOO'").unwrap_err();
+    assert!(
+        e.contains("position 0-5: malformed \\N character escape"),
+        "got: {e}"
+    );
+    // CPython matches case-insensitively but NOT loosely: stray whitespace or
+    // underscore-for-space must fail.
+    assert!(eval_str("x = '\\N{ SPACE}'").is_err());
+    assert!(eval_str("x = '\\N{GREEK_SMALL_LETTER_ALPHA}'").is_err());
+    // f-string unknown name also errors.
+    assert!(eval_str("x = f'\\N{NOPE}'").is_err());
+}
+
+#[test]
+fn decode_escapes_named_unicode_unit() {
+    use pythonrs::lexer::decode_escapes;
+    assert_eq!(decode_escapes("\\N{BULLET}", false).unwrap(), "•");
+    assert_eq!(
+        decode_escapes("\\N{LATIN SMALL LETTER E WITH ACUTE}", false).unwrap(),
+        "é"
+    );
+    // Raw strings keep the escape literal.
+    assert_eq!(decode_escapes("\\N{BULLET}", true).unwrap(), "\\N{BULLET}");
+    assert!(decode_escapes("\\N{ SPACE}", false).is_err());
+}

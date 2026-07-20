@@ -526,6 +526,50 @@ pub fn decode_escapes(raw: &str, is_raw: bool) -> Result<String, String> {
                         i += 8;
                     }
                 }
+                // Named Unicode escape `\N{NAME}` (e.g. `\N{LATIN SMALL LETTER E WITH ACUTE}`).
+                'N' => {
+                    // Byte offset of the `\` (positions in CPython's error are byte-based).
+                    let start = byte_offset(&chars, i - 1);
+                    if chars.get(i + 1) != Some(&'{') {
+                        // `\N` not followed by `{` → malformed (covers just `\N`).
+                        return Err(unicode_escape_err(start, start + 1, false));
+                    }
+                    let name_start = i + 2;
+                    let mut j = name_start;
+                    while j < chars.len() && chars[j] != '}' {
+                        j += 1;
+                    }
+                    if j >= chars.len() {
+                        // No closing `}` → malformed (covers to end of the literal).
+                        let end = raw.len().saturating_sub(1);
+                        return Err(unicode_escape_err(start, end, false));
+                    }
+                    if j == name_start {
+                        // Empty `\N{}` → malformed (covers `\N{`).
+                        let end = byte_offset(&chars, i + 1);
+                        return Err(unicode_escape_err(start, end, false));
+                    }
+                    let name: String = chars[name_start..j].iter().collect();
+                    // CPython matches names case-insensitively but NOT loosely — leading/
+                    // trailing whitespace or `_`/`-` swaps must fail. `unicode_names2` does
+                    // UAX#44 loose matching, so round-trip through the canonical name and
+                    // require it to equal the uppercased input exactly.
+                    let upper = name.to_ascii_uppercase();
+                    let resolved = unicode_names2::character(&upper).filter(|&ch| {
+                        unicode_names2::name(ch).is_some_and(|n| n.to_string() == upper)
+                    });
+                    match resolved {
+                        Some(ch) => {
+                            out.push(ch);
+                            i = j; // land on `}`; the `i += 1` below steps past it.
+                        }
+                        None => {
+                            // Unknown name → covers `\N{NAME}` through the closing `}`.
+                            let end = byte_offset(&chars, j);
+                            return Err(unicode_escape_err(start, end, true));
+                        }
+                    }
+                }
                 other => {
                     out.push('\\');
                     out.push(other);
@@ -538,4 +582,45 @@ pub fn decode_escapes(raw: &str, is_raw: bool) -> Result<String, String> {
         }
     }
     Ok(out)
+}
+
+/// True if `lit` ends with an active `\N` escape lead — a trailing `N` preceded by
+/// an odd run of backslashes. Used by the f-string parser so `\N{NAME}`'s braces are
+/// treated as part of the named-Unicode escape rather than a replacement field.
+/// Always false for raw strings (backslashes are literal there).
+pub fn ends_with_named_escape_lead(lit: &str, is_raw: bool) -> bool {
+    if is_raw {
+        return false;
+    }
+    let chars: Vec<char> = lit.chars().collect();
+    if chars.last() != Some(&'N') {
+        return false;
+    }
+    let mut backslashes = 0;
+    let mut idx = chars.len() - 1;
+    while idx > 0 && chars[idx - 1] == '\\' {
+        backslashes += 1;
+        idx -= 1;
+    }
+    backslashes % 2 == 1
+}
+
+/// Byte offset of the char at `idx` within a `char` slice.
+fn byte_offset(chars: &[char], idx: usize) -> usize {
+    chars[..idx].iter().map(|c| c.len_utf8()).sum()
+}
+
+/// Format CPython's `unicodeescape` error for a `\N{...}` escape. `unknown` picks
+/// between the unknown-name and malformed-escape messages; `start`/`end` are the
+/// inclusive byte positions CPython reports.
+fn unicode_escape_err(start: usize, end: usize, unknown: bool) -> String {
+    let reason = if unknown {
+        "unknown Unicode character name"
+    } else {
+        "malformed \\N character escape"
+    };
+    format!(
+        "(unicode error) 'unicodeescape' codec can't decode bytes in position {}-{}: {}",
+        start, end, reason
+    )
 }
