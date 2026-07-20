@@ -653,7 +653,18 @@ fn gen_async(seed: u64) -> Vec<String> {
     let r = &mut Rng::new(seed);
     let n = 2 + r.below(4); // 2..=5 items
     let mut out: Vec<String> = vec!["import asyncio".into()];
-    match r.below(6) {
+    match r.below(7) {
+        6 => {
+            // async generator consumed by an async comprehension.
+            out.push("async def ag(n):".into());
+            out.push("    for i in range(n):".into());
+            out.push("        await asyncio.sleep(0)".into());
+            out.push("        if i % 2 == 0:".into());
+            out.push("            yield i * i".into());
+            out.push("async def main():".into());
+            out.push(format!("    return [x async for x in ag({})]", n + 2));
+            out.push("print(asyncio.run(main()))".into());
+        }
         0 => {
             // gather of N coros returning i*i, in order.
             out.push("async def sq(i):".into());

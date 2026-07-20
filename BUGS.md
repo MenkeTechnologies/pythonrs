@@ -105,10 +105,17 @@ fixed. Every line below was re-checked against the **default-build** binary
   `asyncio.wait`/`as_completed`/`Event`/`Lock`/`Queue` are also implemented
   natively on the same event loop (`Event.wait/set/clear`, `Lock.acquire/release`
   + `async with lock`, `Queue.put/get/qsize`), byte-verified vs CPython.
-  **Not yet:** async generators (`async def` containing `yield`); task cancellation
-  propagation (`Task.cancel` settles the future but does not inject
-  `CancelledError` into a suspended coroutine); bounded-`Queue` put back-pressure
-  (put is always accepted); `wait`'s `timeout`/`return_when` variants.
+- **Async generators.** `async def` containing `yield` builds an async generator
+  (`type().__name__ == 'async_generator'`) with `__aiter__`/`__anext__`; each
+  `__anext__` drives the body to the next `yield` (forwarding intervening `await`
+  suspensions to the loop) and raises `StopAsyncIteration` on exhaustion — so
+  `async for x in ag()` and `[x async for x in ag()]` over a real async generator
+  both work (byte-verified). The `await`-vs-`yield` distinction rides an
+  `awaiting` flag on the generator cell.
+  **Not yet:** task cancellation propagation (`Task.cancel` settles the future but
+  does not inject `CancelledError` into a suspended coroutine); bounded-`Queue`
+  put back-pressure (put is always accepted); `wait`'s `timeout`/`return_when`
+  variants; async-generator `asend`/`athrow`/`aclose`.
 
 ## Not yet implemented (compile/parse-time error, no silent wrong answer)
 - **`yield from` sent values.** The delegate's `return` value is now forwarded,

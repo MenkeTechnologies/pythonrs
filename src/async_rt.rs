@@ -491,9 +491,17 @@ pub fn await_value(x: Value) -> Result<Value, String> {
                 return Ok(future_result(id));
             }
             // Yield the future up to the Task driving this coroutine; the Task
-            // re-steps us (send value ignored) once the future is settled.
-            host::gen_yield(x.clone())?;
+            // re-steps us (send value ignored) once the future is settled. Mark
+            // it as an `await` suspension so an enclosing async generator's
+            // `__anext__` driver tells it apart from a produced `yield` value.
+            host::gen_yield_awaiting(x.clone())?;
         }
+    }
+    // An async generator's `__anext__` returns the generator itself; awaiting it
+    // drives one step: forward each `await` suspension to the loop, and return
+    // the next produced value (or raise `StopAsyncIteration` when exhausted).
+    if host::is_async_generator(&x) {
+        return drive_async_gen(&x);
     }
     // A coroutine: delegate into it (yield-from), forwarding its yields up.
     if host::is_coroutine(&x) {
@@ -514,6 +522,37 @@ pub fn await_value(x: Value) -> Result<Value, String> {
     )))
 }
 
+/// Drive an async generator one `__anext__` step: resume until it produces a
+/// value (a `yield`) or exhausts (`StopAsyncIteration`); an intervening `await`
+/// suspension yields its Future up to the loop and the driver resumes on wake.
+fn drive_async_gen(agen: &Value) -> Result<Value, String> {
+    loop {
+        match host::gen_resume(agen, Value::Undef) {
+            Ok(Some(y)) => {
+                if host::cur_gen_awaiting(agen) {
+                    // `await` inside the async gen: `y` is a Future — forward it
+                    // up to the loop (suspending the outer coroutine), then retry.
+                    host::gen_yield_awaiting(y)?;
+                } else {
+                    // A `yield`ed value: this `__anext__` result.
+                    return Ok(y);
+                }
+            }
+            Ok(None) => {
+                // Exhausted → `StopAsyncIteration`.
+                let e = with_host(|h| {
+                    h.alloc(PyObj::Exception {
+                        class: "StopAsyncIteration".into(),
+                        args: vec![],
+                    })
+                });
+                return Err(host::raise_value(&e).unwrap_or_else(|e| e));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Delegate into a sub-coroutine / `__await__` iterator: pump it, forwarding
 /// each yielded value (ultimately a Future) up to our own resumer.
 fn drive_delegate(sub: &Value) -> Result<Value, String> {
@@ -523,7 +562,7 @@ fn drive_delegate(sub: &Value) -> Result<Value, String> {
             Ok(Some(y)) => {
                 // Forward the yield up to the loop; the sent value is ignored
                 // (Futures publish their result on the object, not via send).
-                send = host::gen_yield(y)?;
+                send = host::gen_yield_awaiting(y)?;
             }
             Ok(None) => return Ok(host::coro_return_value(sub)),
             Err(e) => return Err(e),
