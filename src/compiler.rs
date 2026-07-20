@@ -186,9 +186,13 @@ impl Compiler {
                 iter,
                 body,
                 orelse,
-                ..
+                is_async,
             } => {
-                self.compile_for(b, target, iter, body, orelse)?;
+                if *is_async {
+                    self.compile_async_for(b, target, iter, body, orelse)?;
+                } else {
+                    self.compile_for(b, target, iter, body, orelse)?;
+                }
             }
             StmtKind::FuncDef {
                 name,
@@ -282,8 +286,12 @@ impl Compiler {
             } => {
                 self.compile_try(b, body, handlers, orelse, finalbody)?;
             }
-            StmtKind::With { items, body, .. } => {
-                self.compile_with(b, items, body)?;
+            StmtKind::With {
+                items,
+                body,
+                is_async,
+            } => {
+                self.compile_with(b, items, body, *is_async)?;
             }
             StmtKind::Assert { test, msg } => {
                 self.compile_assert(b, test, msg)?;
@@ -523,6 +531,105 @@ impl Compiler {
         Ok(())
     }
 
+    /// `async for target in aiter: body [else: orelse]` — desugar to the CPython
+    /// protocol: `_it = aiter.__aiter__()` then a loop driving
+    /// `await _it.__anext__()`, breaking on `StopAsyncIteration`. A `.run` flag
+    /// routes normal exhaustion through the `while ... else` so the `else` clause
+    /// fires on exhaustion but not on a body `break`.
+    fn compile_async_for(
+        &mut self,
+        b: &mut ChunkBuilder,
+        target: &Expr,
+        iter: &Expr,
+        body: &[Stmt],
+        orelse: &[Stmt],
+    ) -> Result<(), String> {
+        // `_run` flag routes exhaustion through `while ... else` (so `else` fires
+        // on `StopAsyncIteration` but not on a body `break`). The except handler
+        // only clears `_run` — no `break`/`continue` crosses the try boundary (a
+        // handler body compiles to its own chunk, so a jump out would dangle);
+        // an `if _run:` guard then gates the loop body.
+        let ait = format!(".aiter{}", self.tmp);
+        let run = format!(".arun{}", self.tmp);
+        let val = format!(".aval{}", self.tmp);
+        self.tmp += 1;
+        let mut pre: Vec<Stmt> = Vec::new();
+        // _it = aiter.__aiter__()
+        pre.push(
+            StmtKind::Assign {
+                targets: vec![Expr::Name(ait.clone())],
+                value: Expr::Call {
+                    func: Box::new(Expr::Attribute(Box::new(iter.clone()), "__aiter__".into())),
+                    args: vec![],
+                    keywords: vec![],
+                },
+            }
+            .into(),
+        );
+        // _run = True
+        pre.push(
+            StmtKind::Assign {
+                targets: vec![Expr::Name(run.clone())],
+                value: Expr::True,
+            }
+            .into(),
+        );
+        // try: _val = await _it.__anext__()  except StopAsyncIteration: _run=False
+        let anext = Expr::Await(Box::new(Expr::Call {
+            func: Box::new(Expr::Attribute(
+                Box::new(Expr::Name(ait)),
+                "__anext__".into(),
+            )),
+            args: vec![],
+            keywords: vec![],
+        }));
+        let try_stmt: Stmt = StmtKind::Try {
+            body: vec![StmtKind::Assign {
+                targets: vec![Expr::Name(val.clone())],
+                value: anext,
+            }
+            .into()],
+            handlers: vec![ExceptHandler {
+                typ: Some(Expr::Name("StopAsyncIteration".into())),
+                name: None,
+                body: vec![StmtKind::Assign {
+                    targets: vec![Expr::Name(run.clone())],
+                    value: Expr::False,
+                }
+                .into()],
+                star: false,
+            }],
+            orelse: vec![],
+            finalbody: vec![],
+        }
+        .into();
+        // if _run: <target> = _val; <body>
+        let mut guarded: Vec<Stmt> = vec![StmtKind::Assign {
+            targets: vec![target.clone()],
+            value: Expr::Name(val),
+        }
+        .into()];
+        guarded.extend_from_slice(body);
+        let loop_body: Vec<Stmt> = vec![
+            try_stmt,
+            StmtKind::If {
+                test: Expr::Name(run.clone()),
+                body: guarded,
+                orelse: vec![],
+            }
+            .into(),
+        ];
+        pre.push(
+            StmtKind::While {
+                test: Expr::Name(run),
+                body: loop_body,
+                orelse: orelse.to_vec(),
+            }
+            .into(),
+        );
+        self.compile_stmts(b, &pre)
+    }
+
     fn compile_assert(
         &mut self,
         b: &mut ChunkBuilder,
@@ -746,12 +853,27 @@ impl Compiler {
         b: &mut ChunkBuilder,
         items: &[WithItem],
         body: &[Stmt],
+        is_async: bool,
     ) -> Result<(), String> {
         // Desugar `with a as x: body` -> enter, then try/finally exit.
         // The context expression is evaluated EXACTLY ONCE into a synthetic temp;
         // `__enter__`/`__exit__` both dispatch on that temp. (Re-evaluating it —
         // as `with open(path,'w')` — would re-run the side effect, e.g. re-open and
         // truncate the file, discarding the writes.)
+        // `async with` is identical but drives `__aenter__`/`__aexit__` through
+        // `await` (the enter value / exit call are awaited).
+        let (enter_m, exit_m) = if is_async {
+            ("__aenter__", "__aexit__")
+        } else {
+            ("__enter__", "__exit__")
+        };
+        let awaited = |e: Expr| -> Expr {
+            if is_async {
+                Expr::Await(Box::new(e))
+            } else {
+                e
+            }
+        };
         let mut inner: Vec<Stmt> = Vec::new();
         let mut temps: Vec<String> = Vec::new();
         for it in items {
@@ -766,15 +888,15 @@ impl Compiler {
                 }
                 .into(),
             );
-            // x = __with_ctx.__enter__()
-            let enter = Expr::Call {
+            // x = [await] __with_ctx.__[a]enter__()
+            let enter = awaited(Expr::Call {
                 func: Box::new(Expr::Attribute(
                     Box::new(Expr::Name(ctx_tmp.clone())),
-                    "__enter__".into(),
+                    enter_m.into(),
                 )),
                 args: vec![],
                 keywords: vec![],
-            };
+            });
             match &it.vars {
                 Some(v) => inner.push(
                     StmtKind::Assign {
@@ -787,17 +909,17 @@ impl Compiler {
             }
         }
         inner.extend_from_slice(body);
-        // finally: __with_ctx.__exit__(None, None, None), in REVERSE (LIFO) order.
+        // finally: [await] __with_ctx.__[a]exit__(None, None, None), in LIFO order.
         let mut fin: Vec<Stmt> = Vec::new();
         for ctx_tmp in temps.iter().rev() {
-            let exit = Expr::Call {
+            let exit = awaited(Expr::Call {
                 func: Box::new(Expr::Attribute(
                     Box::new(Expr::Name(ctx_tmp.clone())),
-                    "__exit__".into(),
+                    exit_m.into(),
                 )),
                 args: vec![Expr::None, Expr::None, Expr::None],
                 keywords: vec![],
-            };
+            });
             fin.push(StmtKind::Expr(exit).into());
         }
         self.compile_try(b, &inner, &[], &[], &fin)
@@ -1482,7 +1604,11 @@ impl Compiler {
         }
         body.extend(inner);
         body.push(StmtKind::Return(Some(Expr::Name(acc.into()))).into());
-        self.emit_comp_call(b, "<comp>", body, &comps[0].iter)
+        // An asynchronous comprehension (`[x async for x in ag()]` / an `await` in
+        // any clause) runs the hidden function as a coroutine that the enclosing
+        // (necessarily async) scope awaits.
+        let is_async = comps.iter().any(|c| c.is_async);
+        self.emit_comp_call(b, "<comp>", body, &comps[0].iter, is_async)
     }
 
     /// Build the `global`/`nonlocal` declarations for every walrus (`:=`) target
@@ -1529,7 +1655,7 @@ impl Compiler {
     ) -> Result<(), String> {
         let yield_stmt: Stmt = StmtKind::Expr(Expr::Yield(Some(Box::new(elt.clone())))).into();
         let body = wrap_comp_clauses(vec![yield_stmt], comps);
-        self.emit_comp_call(b, "<genexpr>", body, &comps[0].iter)
+        self.emit_comp_call(b, "<genexpr>", body, &comps[0].iter, false)
     }
 
     /// Build the hidden comprehension/genexpr function `def name(.0): body` and
@@ -1541,15 +1667,20 @@ impl Compiler {
         name: &str,
         body: Vec<Stmt>,
         outer_iter: &Expr,
+        is_async: bool,
     ) -> Result<(), String> {
         let params = Params {
             names: vec![".0".into()],
             ..Params::default()
         };
-        let def_id = self.build_function(name, &params, &body)?;
+        let def_id = self.build_function_ex(name, &params, &body, is_async)?;
         self.emit_make_func(b, def_id, &params)?; // [func]
         self.compile_expr(b, outer_iter)?; // [func, iterable]
-        b.emit(Op::CallBuiltin(ops::CALL_VALUE, 2), 0);
+        b.emit(Op::CallBuiltin(ops::CALL_VALUE, 2), 0); // [result|coroutine]
+        if is_async {
+            // The hidden coroutine is awaited in the enclosing async scope.
+            b.emit(Op::CallBuiltin(ops::AWAIT, 1), 0);
+        }
         Ok(())
     }
 
@@ -1785,7 +1916,7 @@ fn wrap_comp_clauses(mut inner: Vec<Stmt>, comps: &[Comprehension]) -> Vec<Stmt>
             iter,
             body: inner,
             orelse: vec![],
-            is_async: false,
+            is_async: comp.is_async,
         }
         .into()];
     }

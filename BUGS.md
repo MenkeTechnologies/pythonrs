@@ -96,15 +96,18 @@ fixed. Every line below was re-checked against the **default-build** binary
   byte-for-byte vs CPython (coroutine type, ordered `gather` results, `create_task`
   interleaving, `Future.set_result` + await, exception propagation across `await`,
   and `asyncio.sleep` timer ordering).
-  **Not yet:** `async for` / `async with` / async comprehensions (see below);
-  async generators (`async def` containing `yield`); `asyncio.wait`/`as_completed`/
-  `Queue`/`Event`/`Lock`; task cancellation propagation (`Task.cancel` settles the
-  future but does not inject `CancelledError` into a suspended coroutine).
+- **`async for` / `async with` / async comprehensions.** `async for x in ait`
+  drives `__aiter__`/`__anext__` (stopping on `StopAsyncIteration`, with correct
+  `for…else` semantics); `async with cm` drives `await __aenter__` / `await
+  __aexit__`; async comprehensions `[x async for x in ag()]` (and set/dict forms,
+  with `if` filters) run the hidden comprehension body as an awaited coroutine —
+  all byte-verified vs CPython.
+  **Not yet:** async generators (`async def` containing `yield`);
+  `asyncio.wait`/`as_completed`/`Queue`/`Event`/`Lock`; task cancellation
+  propagation (`Task.cancel` settles the future but does not inject
+  `CancelledError` into a suspended coroutine).
 
 ## Not yet implemented (compile/parse-time error, no silent wrong answer)
-- **`async for` / `async with` / async comprehensions.** The async statement
-  forms and `[x async for x in ag()]` are not yet lowered (async comprehension is
-  still a `SyntaxError`).
 - **`yield from` sent values.** The delegate's `return` value is now forwarded,
   but a value `send()`-ed into the delegating generator does not reach the
   sub-generator (`x = yield` inside the delegate sees `None`, not the sent value).

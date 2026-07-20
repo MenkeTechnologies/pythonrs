@@ -320,9 +320,7 @@ pub fn run_until_complete(aw: Value) -> Result<Value, String> {
             break Ok(());
         }
         if !has_work() {
-            break Err(
-                "RuntimeError: Event loop stopped before Future completed.".to_string(),
-            );
+            break Err("RuntimeError: Event loop stopped before Future completed.".to_string());
         }
         if let Err(e) = run_once() {
             with_loop(|l| l.running = false);
@@ -400,10 +398,7 @@ fn task_step(task: Value) {
             match future_id(&awaited) {
                 Some(aid) => {
                     let task2 = task.clone();
-                    add_done_native(
-                        aid,
-                        Box::new(move || schedule_step(task2)),
-                    );
+                    add_done_native(aid, Box::new(move || schedule_step(task2)));
                 }
                 None => {
                     // A coroutine yielded a non-Future to the loop (e.g. a bare
@@ -685,9 +680,7 @@ pub fn future_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value
     let id = future_id(recv).ok_or_else(|| host::type_error("not a future"))?;
     match name {
         "set_result" => set_result(recv, args.into_iter().next().unwrap_or(Value::Undef)),
-        "set_exception" => {
-            set_exception(recv, args.into_iter().next().unwrap_or(Value::Undef))
-        }
+        "set_exception" => set_exception(recv, args.into_iter().next().unwrap_or(Value::Undef)),
         "result" => {
             if !future_done(id) {
                 return Err("InvalidStateError: Result is not set.".to_string());
@@ -763,7 +756,10 @@ pub fn future_repr(id: u32) -> String {
         if let Some(exc) = future_exc(id) {
             format!("finished exception={}", with_host(|h| h.repr_of(&exc)))
         } else {
-            format!("finished result={}", with_host(|h| h.repr_of(&future_result(id))))
+            format!(
+                "finished result={}",
+                with_host(|h| h.repr_of(&future_result(id)))
+            )
         }
     } else {
         "pending".to_string()

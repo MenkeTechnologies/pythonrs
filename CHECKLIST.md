@@ -466,8 +466,11 @@ kinds + guards), `for/else`/`while/else`, `try/except/else/finally` ordering all
       (`src/async_rt.rs`, virtual clock) powers `asyncio.run`/`sleep`/`gather`/
       `create_task`/`ensure_future`/`wait_for`/`get_event_loop`/`Future` — byte-verified
       vs CPython (coroutine type, ordered gather, task interleaving, Future set_result +
-      await, cross-await exception propagation, sleep timer ordering). **Still pending:**
-      `async for`/`async with`/async comprehensions, async generators, task cancellation
+      await, cross-await exception propagation, sleep timer ordering). `async for`
+      (`__aiter__`/`__anext__`, `StopAsyncIteration`, `for…else`), `async with`
+      (`await __aenter__`/`__aexit__`), and async comprehensions
+      (`[x async for x in ag()]` + set/dict + `if` filters) all lowered and byte-verified.
+      **Still pending:** async generators (`async def` with `yield`), task cancellation
       injection, `asyncio.wait`/`as_completed`/`Queue`/`Event`/`Lock`.
 - [x] **Bare `raise` re-raise** — FIXED: the except handler now keeps the caught
       exception as the "currently handled" one (`h.exc`) while its body runs, so a

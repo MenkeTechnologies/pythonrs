@@ -76,6 +76,8 @@ pub struct Comprehension {
     pub target: Box<Expr>,
     pub iter: Box<Expr>,
     pub ifs: Vec<Expr>,
+    /// `async for` clause (an asynchronous comprehension), driven via `__anext__`.
+    pub is_async: bool,
 }
 
 /// A keyword argument at a call site: `name=value`, or `**mapping` when `name`
