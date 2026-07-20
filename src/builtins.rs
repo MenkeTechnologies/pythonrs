@@ -3359,9 +3359,12 @@ fn reduce_minmax(
     let mut best_k = eval_key(&key, &best)?;
     for it in &items[1..] {
         let k = eval_key(&key, it)?;
-        let gt = numeric_hook(NumOp::Gt, &k, &best_k)?;
-        let take = with_host(|h| h.truthy(&gt)) == want_max;
-        if take {
+        // Strict replacement so ties keep the FIRST element (CPython: `max`
+        // returns the first maximal, `min` the first minimal). A non-strict test
+        // (`!(k > best_k)` for min) would overwrite on equal keys.
+        let cmp = if want_max { NumOp::Gt } else { NumOp::Lt };
+        let take = numeric_hook(cmp, &k, &best_k)?;
+        if with_host(|h| h.truthy(&take)) {
             best = it.clone();
             best_k = k;
         }
@@ -3388,18 +3391,30 @@ fn py_sorted(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, String
         let k = eval_key(&key, &it)?;
         keyed.push((k, it));
     }
-    // Insertion sort using host ordering (stable, tolerant of errors).
+    // Stable sort using host ordering. A tie must map to `Ordering::Equal` so the
+    // stable sort keeps the original relative order (CPython's guaranteed
+    // stability). `reverse` flips the compared operands rather than reversing the
+    // output list, so equal elements retain their ORIGINAL order in both
+    // directions — CPython documents `reverse` "as if each comparison were
+    // reversed", which is a stable descending sort, not `sorted(...)[::-1]`.
     let mut err: Option<String> = None;
     keyed.sort_by(|a, b| {
         if err.is_some() {
             return std::cmp::Ordering::Equal;
         }
-        match numeric_hook(NumOp::Lt, &a.0, &b.0) {
-            Ok(v) => {
-                if with_host(|h| h.truthy(&v)) {
-                    std::cmp::Ordering::Less
-                } else {
-                    std::cmp::Ordering::Greater
+        let (lo, hi) = if reverse { (&b.0, &a.0) } else { (&a.0, &b.0) };
+        // lo < hi ?  ->  Less
+        match numeric_hook(NumOp::Lt, lo, hi) {
+            Ok(v) if with_host(|h| h.truthy(&v)) => std::cmp::Ordering::Less,
+            Ok(_) => {
+                // Not less: distinguish Greater (hi < lo) from Equal (tie).
+                match numeric_hook(NumOp::Lt, hi, lo) {
+                    Ok(v2) if with_host(|h| h.truthy(&v2)) => std::cmp::Ordering::Greater,
+                    Ok(_) => std::cmp::Ordering::Equal,
+                    Err(e) => {
+                        err = Some(e);
+                        std::cmp::Ordering::Equal
+                    }
                 }
             }
             Err(e) => {
@@ -3411,10 +3426,7 @@ fn py_sorted(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, String
     if let Some(e) = err {
         return Err(e);
     }
-    let mut out: Vec<Value> = keyed.into_iter().map(|(_, v)| v).collect();
-    if reverse {
-        out.reverse();
-    }
+    let out: Vec<Value> = keyed.into_iter().map(|(_, v)| v).collect();
     Ok(with_host(|h| h.new_list(out)))
 }
 

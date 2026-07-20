@@ -7227,7 +7227,12 @@ fn zip_step(it: &Value) -> Result<Option<Value>, String> {
             None => {
                 set_zip_done(it);
                 if strict {
-                    return Err(zip_strict_error(&sources, i));
+                    // A real length mismatch raises; sources exhausting together
+                    // (source 0 ends and no later source still yields) is a clean
+                    // stop, not an error.
+                    if let Some(e) = zip_strict_error(&sources, i) {
+                        return Err(e);
+                    }
                 }
                 return Ok(None);
             }
@@ -7245,8 +7250,10 @@ fn set_zip_done(it: &Value) {
 }
 
 /// Build CPython's `zip(strict=True)` length-mismatch message. `i` is the index
-/// (0-based) of the source that just exhausted mid-round.
-fn zip_strict_error(sources: &[Value], i: usize) -> String {
+/// (0-based) of the source that just exhausted mid-round. Returns `None` when
+/// there is no mismatch (source 0 ended and every later source is also exhausted)
+/// — that is a normal end-of-iteration, not an error.
+fn zip_strict_error(sources: &[Value], i: usize) -> Option<String> {
     if i > 0 {
         // Sources 0..i were longer than source i.
         let than = if i == 1 {
@@ -7254,10 +7261,10 @@ fn zip_strict_error(sources: &[Value], i: usize) -> String {
         } else {
             format!("arguments 1-{i}")
         };
-        return format!(
+        return Some(format!(
             "ValueError: zip() argument {} is shorter than {than}",
             i + 1
-        );
+        ));
     }
     // Source 0 exhausted first: find the first later source that still yields.
     for (j, s) in sources.iter().enumerate().skip(1) {
@@ -7267,11 +7274,14 @@ fn zip_strict_error(sources: &[Value], i: usize) -> String {
             } else {
                 format!("arguments 1-{j}")
             };
-            return format!("ValueError: zip() argument {} is longer than {than}", j + 1);
+            return Some(format!(
+                "ValueError: zip() argument {} is longer than {than}",
+                j + 1
+            ));
         }
     }
-    // All equal length after all — no error (shouldn't reach here).
-    "ValueError: zip() argument is longer".to_string()
+    // All sources exhausted together: clean stop, no error.
+    None
 }
 
 /// One step of a lazy `map`: pull one item from each source, then apply `func`.
