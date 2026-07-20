@@ -1958,6 +1958,17 @@ pub fn call_builtin_function(
     if name == "str.maketrans" {
         return str_maketrans(&args);
     }
+    // `bytes.fromhex(...)` / `bytearray.fromhex(...)` via the type object.
+    if name == "bytes.fromhex" || name == "bytearray.fromhex" {
+        let b = bytes_fromhex(&args)?;
+        return Ok(with_host(|h| {
+            if name == "bytearray.fromhex" {
+                h.alloc(PyObj::Bytearray(b))
+            } else {
+                h.alloc(PyObj::Bytes(b))
+            }
+        }));
+    }
     // Native stdlib module functions (src/stdlib). These take `&mut PyHost`.
     if let Some(f) = name.strip_prefix("textwrap.") {
         if let Some(r) = with_host(|h| crate::stdlib::textwrap::call(h, f, &args)) {
@@ -3242,17 +3253,59 @@ const GENERATOR_METHODS: &[&str] = &["send", "throw", "close", "__next__", "__it
 
 const BYTES_METHODS: &[&str] = &[
     "decode",
+    "fromhex",
     "hex",
     "index",
+    "rindex",
     "find",
+    "rfind",
     "count",
     "startswith",
     "endswith",
     "upper",
     "lower",
+    "split",
+    "rsplit",
+    "splitlines",
+    "join",
+    "replace",
+    "strip",
+    "lstrip",
+    "rstrip",
+    "partition",
+    "rpartition",
+    "removeprefix",
+    "removesuffix",
 ];
 const BYTEARRAY_METHODS: &[&str] = &[
-    "append", "extend", "pop", "clear", "decode", "hex", "index", "find",
+    "append",
+    "extend",
+    "pop",
+    "clear",
+    "decode",
+    "fromhex",
+    "hex",
+    "index",
+    "rindex",
+    "find",
+    "rfind",
+    "count",
+    "startswith",
+    "endswith",
+    "upper",
+    "lower",
+    "split",
+    "rsplit",
+    "splitlines",
+    "join",
+    "replace",
+    "strip",
+    "lstrip",
+    "rstrip",
+    "partition",
+    "rpartition",
+    "removeprefix",
+    "removesuffix",
 ];
 const DEQUE_METHODS: &[&str] = &[
     "append",
@@ -3378,6 +3431,12 @@ pub fn call_type_method(
 ) -> Result<Value, String> {
     let tn = with_host(|h| h.type_name(recv));
     match tn.as_str() {
+        // `.format` needs the kwargs (keyword replacement fields); other str
+        // methods don't take keywords.
+        "str" if name == "format" => {
+            let s = with_host(|h| h.as_str(recv)).unwrap_or_default();
+            str_dot_format(&s, &args, &kwargs)
+        }
         "str" => str_method(recv, name, &args),
         "bytes" => bytes_method(recv, name, &args),
         "bytearray" => bytearray_method(recv, name, &args),
@@ -3748,7 +3807,9 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             str_format_map(&s, &mapping)
         }
         "encode" => Ok(with_host(|h| h.alloc(PyObj::Bytes(s.into_bytes())))),
-        "format" => str_dot_format(&s, args),
+        // `.format` with keyword fields comes through `call_type_method`, which
+        // has the kwargs; a bare `str_method` call has none.
+        "format" => str_dot_format(&s, args, &[]),
         _ => Err(format!(
             "AttributeError: 'str' object has no attribute '{name}'"
         )),
@@ -4061,11 +4122,171 @@ fn str_format_map(s: &str, mapping: &Value) -> Result<Value, String> {
     Ok(new_str(out))
 }
 
-fn str_dot_format(s: &str, args: &[Value]) -> Result<Value, String> {
+/// A conversion code (`!s`/`!r`/`!a` → 1/2/3, 0 = none) from the trailing part
+/// of a field-name segment (the part before any `:` format spec).
+fn conv_code(c: &str) -> i64 {
+    match c {
+        "s" => 1,
+        "r" => 2,
+        "a" => 3,
+        _ => 0,
+    }
+}
+
+/// Split a replacement field's inner text into `(field_name, conv, spec)`. The
+/// `:` (format-spec separator) and `!` (conversion) are only recognized at
+/// bracket-depth 0, so a subscript key may itself contain them (`{d[a:b]}`).
+fn split_format_field(field: &str) -> (String, i64, String) {
+    let fchars: Vec<char> = field.chars().collect();
+    let mut depth = 0i32;
+    let mut colon = None;
+    let mut bang = None;
+    for (i, &c) in fchars.iter().enumerate() {
+        match c {
+            '[' => depth += 1,
+            ']' => depth -= 1,
+            ':' if depth == 0 => {
+                colon = Some(i);
+                break;
+            }
+            '!' if depth == 0 && bang.is_none() => bang = Some(i),
+            _ => {}
+        }
+    }
+    let (head, spec) = match colon {
+        Some(i) => (
+            fchars[..i].iter().collect::<String>(),
+            fchars[i + 1..].iter().collect::<String>(),
+        ),
+        None => (field.to_string(), String::new()),
+    };
+    // Re-scan the head for a `!conv` (must precede the spec).
+    match bang.filter(|&b| colon.map(|c| b < c).unwrap_or(true)) {
+        Some(b) => {
+            let name: String = fchars[..b].iter().collect();
+            let conv: String = fchars[b + 1..colon.unwrap_or(fchars.len())]
+                .iter()
+                .collect();
+            (name, conv_code(&conv), spec)
+        }
+        None => (head, 0, spec),
+    }
+}
+
+/// Resolve a `str.format` field name (`arg_name` plus `.attr` / `[index]`
+/// accessor chain) against positional `args`, `kwargs`, and the shared
+/// automatic-field counter `auto`.
+fn resolve_format_arg(
+    name: &str,
+    args: &[Value],
+    kwargs: &[(String, Value)],
+    auto: &mut usize,
+) -> Result<Value, String> {
+    let nchars: Vec<char> = name.chars().collect();
+    // Base arg_name ends at the first `.` or `[`.
+    let mut i = 0;
+    while i < nchars.len() && nchars[i] != '.' && nchars[i] != '[' {
+        i += 1;
+    }
+    let base: String = nchars[..i].iter().collect();
+    let mut val = if base.is_empty() {
+        let v = args
+            .get(*auto)
+            .cloned()
+            .ok_or_else(|| format!("IndexError: Replacement index {auto} out of range"))?;
+        *auto += 1;
+        v
+    } else if let Ok(n) = base.parse::<usize>() {
+        args.get(n)
+            .cloned()
+            .ok_or_else(|| format!("IndexError: Replacement index {n} out of range"))?
+    } else {
+        kwargs
+            .iter()
+            .find(|(k, _)| *k == base)
+            .map(|(_, v)| v.clone())
+            .ok_or_else(|| format!("KeyError: '{base}'"))?
+    };
+    // Accessor chain.
+    while i < nchars.len() {
+        match nchars[i] {
+            '.' => {
+                i += 1;
+                let start = i;
+                while i < nchars.len() && nchars[i] != '.' && nchars[i] != '[' {
+                    i += 1;
+                }
+                let attr: String = nchars[start..i].iter().collect();
+                val = with_host(|h| h.get_attr(&val, &attr))?;
+            }
+            '[' => {
+                i += 1;
+                let start = i;
+                while i < nchars.len() && nchars[i] != ']' {
+                    i += 1;
+                }
+                let key: String = nchars[start..i].iter().collect();
+                if i < nchars.len() {
+                    i += 1; // skip ]
+                }
+                let keyv = if let Ok(n) = key.parse::<i64>() {
+                    Value::Int(n)
+                } else {
+                    with_host(|h| h.new_str(key))
+                };
+                val = with_host(|h| h.get_item(&val, &keyv))?;
+            }
+            _ => break,
+        }
+    }
+    Ok(val)
+}
+
+/// Substitute any `{…}` replacement fields inside a format spec (one nesting
+/// level, per CPython), formatting each with its default `str()` and consuming
+/// the shared automatic-field counter.
+fn substitute_nested_spec(
+    spec: &str,
+    args: &[Value],
+    kwargs: &[(String, Value)],
+    auto: &mut usize,
+) -> Result<String, String> {
+    if !spec.contains('{') {
+        return Ok(spec.to_string());
+    }
+    let chars: Vec<char> = spec.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '{' => {
+                i += 1;
+                let mut inner = String::new();
+                while i < chars.len() && chars[i] != '}' {
+                    inner.push(chars[i]);
+                    i += 1;
+                }
+                if i < chars.len() {
+                    i += 1; // skip }
+                }
+                let (fname, conv, _) = split_format_field(&inner);
+                let val = resolve_format_arg(&fname, args, kwargs, auto)?;
+                out.push_str(&format_field(&val, conv, "")?);
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn str_dot_format(s: &str, args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, String> {
     let mut out = String::new();
     let chars: Vec<char> = s.chars().collect();
     let mut i = 0;
-    let mut auto = 0;
+    let mut auto = 0usize;
     while i < chars.len() {
         match chars[i] {
             '{' if chars.get(i + 1) == Some(&'{') => {
@@ -4077,39 +4298,28 @@ fn str_dot_format(s: &str, args: &[Value]) -> Result<Value, String> {
                 i += 2;
             }
             '{' => {
+                // Extract the field, honoring nested `{…}` inside the spec.
                 let mut field = String::new();
+                let mut depth = 1;
                 i += 1;
-                while i < chars.len() && chars[i] != '}' {
+                while i < chars.len() && depth > 0 {
+                    match chars[i] {
+                        '{' => depth += 1,
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
                     field.push(chars[i]);
                     i += 1;
                 }
-                i += 1; // skip }
-                let (name_conv, spec) = match field.split_once(':') {
-                    Some((a, b)) => (a.to_string(), b.to_string()),
-                    None => (field, String::new()),
-                };
-                // Split off a `!r`/`!s`/`!a` conversion from the field name.
-                let (fname, conv) = match name_conv.split_once('!') {
-                    Some((n, c)) => (
-                        n.to_string(),
-                        match c {
-                            "s" => 1,
-                            "r" => 2,
-                            "a" => 3,
-                            _ => 0,
-                        },
-                    ),
-                    None => (name_conv, 0),
-                };
-                let val = if fname.is_empty() {
-                    let v = args.get(auto).cloned().unwrap_or(Value::Undef);
-                    auto += 1;
-                    v
-                } else if let Ok(n) = fname.parse::<usize>() {
-                    args.get(n).cloned().unwrap_or(Value::Undef)
-                } else {
-                    Value::Undef
-                };
+                i += 1; // skip closing }
+                let (fname, conv, spec) = split_format_field(&field);
+                let val = resolve_format_arg(&fname, args, kwargs, &mut auto)?;
+                let spec = substitute_nested_spec(&spec, args, kwargs, &mut auto)?;
                 out.push_str(&format_field(&val, conv, &spec)?);
             }
             c => {
@@ -4761,24 +4971,84 @@ fn as_bytes_object(v: &Value) -> Option<Vec<u8>> {
     })
 }
 
-fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() {
-        return Some(0);
-    }
-    if needle.len() > hay.len() {
-        return None;
-    }
-    hay.windows(needle.len()).position(|w| w == needle)
+/// ASCII whitespace (CPython `Py_ISSPACE`): space, tab, LF, CR, VT, FF.
+fn is_ascii_ws(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
 }
 
-fn count_sub(hay: &[u8], needle: &[u8]) -> usize {
+/// Allocate a `bytes` (when `!is_ba`) or `bytearray` value from raw bytes. Used
+/// so a method returns the same type as its receiver.
+fn mk_bytes(is_ba: bool, v: Vec<u8>) -> Value {
+    with_host(|h| {
+        if is_ba {
+            h.alloc(PyObj::Bytearray(v))
+        } else {
+            h.alloc(PyObj::Bytes(v))
+        }
+    })
+}
+
+/// Normalize an optional `start`/`end` pair (CPython slice-index clamping) over
+/// a length-`len` buffer, reading from `args[from]` and `args[from + 1]`.
+fn resolve_start_end(len: usize, args: &[Value], from: usize) -> (usize, usize) {
+    let n = len as i64;
+    let norm = |v: &Value, default: i64| -> i64 {
+        match with_host(|h| h.as_int(v)) {
+            Some(i) => {
+                let k = if i < 0 { i + n } else { i };
+                k.clamp(0, n)
+            }
+            None => default,
+        }
+    };
+    let start = args.get(from).map(|v| norm(v, 0)).unwrap_or(0);
+    let end = args.get(from + 1).map(|v| norm(v, n)).unwrap_or(n);
+    (start as usize, (end as usize).max(start as usize))
+}
+
+/// Search `hay[start..end]` for `needle`, returning an absolute index (or None).
+/// `reverse` finds the last match. An empty needle matches at `start` (forward)
+/// or `end` (reverse).
+fn bytes_find(hay: &[u8], needle: &[u8], start: usize, end: usize, reverse: bool) -> Option<usize> {
+    let end = end.min(hay.len());
+    if start > end {
+        return None;
+    }
+    let region = &hay[start..end];
     if needle.is_empty() {
-        return hay.len() + 1;
+        return Some(if reverse { end } else { start });
+    }
+    if needle.len() > region.len() {
+        return None;
+    }
+    if reverse {
+        region
+            .windows(needle.len())
+            .rposition(|w| w == needle)
+            .map(|p| p + start)
+    } else {
+        region
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .map(|p| p + start)
+    }
+}
+
+/// Non-overlapping count of `needle` in `hay[start..end]`. An empty needle
+/// counts every gap (`end - start + 1`).
+fn count_range(hay: &[u8], needle: &[u8], start: usize, end: usize) -> usize {
+    let end = end.min(hay.len());
+    if start > end {
+        return 0;
+    }
+    let region = &hay[start..end];
+    if needle.is_empty() {
+        return region.len() + 1;
     }
     let mut c = 0;
     let mut i = 0;
-    while i + needle.len() <= hay.len() {
-        if &hay[i..i + needle.len()] == needle {
+    while i + needle.len() <= region.len() {
+        if &region[i..i + needle.len()] == needle {
             c += 1;
             i += needle.len();
         } else {
@@ -4786,6 +5056,142 @@ fn count_sub(hay: &[u8], needle: &[u8]) -> usize {
         }
     }
     c
+}
+
+/// Split `hay` on `sep`, keeping empty fields (`b'aXXb'.split(b'X')` →
+/// `[b'a', b'', b'b']`). `maxsplit < 0` means unlimited. `reverse` splits from
+/// the right (`rsplit`).
+fn split_on_sep(hay: &[u8], sep: &[u8], maxsplit: i64, reverse: bool) -> Vec<Vec<u8>> {
+    let mut parts: Vec<Vec<u8>> = Vec::new();
+    if reverse {
+        let mut end = hay.len();
+        let mut splits = 0;
+        loop {
+            if maxsplit >= 0 && splits >= maxsplit {
+                break;
+            }
+            match bytes_find(hay, sep, 0, end, true) {
+                Some(p) => {
+                    parts.push(hay[p + sep.len()..end].to_vec());
+                    end = p;
+                    splits += 1;
+                }
+                None => break,
+            }
+        }
+        parts.push(hay[..end].to_vec());
+        parts.reverse();
+    } else {
+        let mut start = 0;
+        let mut splits = 0;
+        loop {
+            if maxsplit >= 0 && splits >= maxsplit {
+                break;
+            }
+            match bytes_find(hay, sep, start, hay.len(), false) {
+                Some(p) => {
+                    parts.push(hay[start..p].to_vec());
+                    start = p + sep.len();
+                    splits += 1;
+                }
+                None => break,
+            }
+        }
+        parts.push(hay[start..].to_vec());
+    }
+    parts
+}
+
+/// Whitespace split (`sep is None`): runs of ASCII whitespace separate fields,
+/// no empty fields, leading/trailing whitespace ignored. On hitting `maxsplit`
+/// the remainder (leading whitespace already skipped) is one field with its
+/// trailing whitespace preserved.
+fn split_ws(hay: &[u8], maxsplit: i64, reverse: bool) -> Vec<Vec<u8>> {
+    let n = hay.len();
+    let mut parts: Vec<Vec<u8>> = Vec::new();
+    if reverse {
+        let mut end = n;
+        let mut splits = 0;
+        loop {
+            while end > 0 && is_ascii_ws(hay[end - 1]) {
+                end -= 1;
+            }
+            if end == 0 {
+                break;
+            }
+            if maxsplit >= 0 && splits >= maxsplit {
+                parts.push(hay[..end].to_vec());
+                break;
+            }
+            let mut start = end;
+            while start > 0 && !is_ascii_ws(hay[start - 1]) {
+                start -= 1;
+            }
+            parts.push(hay[start..end].to_vec());
+            end = start;
+            splits += 1;
+        }
+        parts.reverse();
+    } else {
+        let mut i = 0;
+        let mut splits = 0;
+        loop {
+            while i < n && is_ascii_ws(hay[i]) {
+                i += 1;
+            }
+            if i >= n {
+                break;
+            }
+            if maxsplit >= 0 && splits >= maxsplit {
+                parts.push(hay[i..].to_vec());
+                break;
+            }
+            let start = i;
+            while i < n && !is_ascii_ws(hay[i]) {
+                i += 1;
+            }
+            parts.push(hay[start..i].to_vec());
+            splits += 1;
+        }
+    }
+    parts
+}
+
+/// `bytes.fromhex(s)` / `bytearray.fromhex(s)`: parse hex digit pairs, skipping
+/// runs of ASCII whitespace between bytes.
+fn bytes_fromhex(args: &[Value]) -> Result<Vec<u8>, String> {
+    let s = args
+        .first()
+        .and_then(|v| with_host(|h| h.as_str(v)))
+        .ok_or_else(|| host::type_error("fromhex() argument must be str"))?;
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    let hexval = |c: char| -> Option<u8> { c.to_digit(16).map(|d| d as u8) };
+    while i < chars.len() {
+        if chars[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        let hi = hexval(chars[i]).ok_or_else(|| {
+            format!("ValueError: non-hexadecimal number found in fromhex() arg at position {i}")
+        })?;
+        if i + 1 >= chars.len() || chars[i + 1].is_ascii_whitespace() {
+            return Err(
+                "ValueError: fromhex() arg must contain an even number of hexadecimal digits"
+                    .into(),
+            );
+        }
+        let lo = hexval(chars[i + 1]).ok_or_else(|| {
+            format!(
+                "ValueError: non-hexadecimal number found in fromhex() arg at position {}",
+                i + 1
+            )
+        })?;
+        out.push((hi << 4) | lo);
+        i += 2;
+    }
+    Ok(out)
 }
 
 /// Decode bytes to a `str`. Only `utf-8` (default, strict) and `latin-1` /
@@ -4814,47 +5220,11 @@ fn decode_bytes(bytes: &[u8], args: &[Value]) -> Result<Value, String> {
 }
 
 fn bytes_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
-    let bytes = recv_bytes(recv);
-    match name {
-        "decode" => decode_bytes(&bytes, args),
-        "hex" => Ok(new_str(bytes.iter().map(|b| format!("{b:02x}")).collect())),
-        "index" | "find" => {
-            let sub = args.first().and_then(arg_bytes_like).ok_or_else(|| {
-                host::type_error("argument should be integer or bytes-like object")
-            })?;
-            match (name, find_sub(&bytes, &sub)) {
-                (_, Some(p)) => Ok(Value::Int(p as i64)),
-                ("find", None) => Ok(Value::Int(-1)),
-                (_, None) => Err("ValueError: subsection not found".into()),
-            }
-        }
-        "count" => {
-            let sub = args.first().and_then(arg_bytes_like).ok_or_else(|| {
-                host::type_error("argument should be integer or bytes-like object")
-            })?;
-            Ok(Value::Int(count_sub(&bytes, &sub) as i64))
-        }
-        "startswith" => {
-            let sub = args.first().and_then(as_bytes_object).unwrap_or_default();
-            Ok(Value::Bool(bytes.starts_with(&sub)))
-        }
-        "endswith" => {
-            let sub = args.first().and_then(as_bytes_object).unwrap_or_default();
-            Ok(Value::Bool(bytes.ends_with(&sub)))
-        }
-        "upper" => Ok(with_host(|h| {
-            h.alloc(PyObj::Bytes(bytes.to_ascii_uppercase()))
-        })),
-        "lower" => Ok(with_host(|h| {
-            h.alloc(PyObj::Bytes(bytes.to_ascii_lowercase()))
-        })),
-        _ => Err(format!(
-            "AttributeError: 'bytes' object has no attribute '{name}'"
-        )),
-    }
+    bytes_common_method(recv, false, name, args)
 }
 
 fn bytearray_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    // bytearray-only mutators; everything else shares the bytes methods.
     match name {
         "append" => {
             let a0 = arg0(args)?;
@@ -4896,28 +5266,308 @@ fn bytearray_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, S
             });
             Ok(Value::Undef)
         }
-        "decode" => decode_bytes(&recv_bytes(recv), args),
-        "hex" => Ok(new_str(
-            recv_bytes(recv)
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect(),
-        )),
-        "index" | "find" => {
-            let bytes = recv_bytes(recv);
-            let sub = args.first().and_then(arg_bytes_like).ok_or_else(|| {
-                host::type_error("argument should be integer or bytes-like object")
-            })?;
-            match (name, find_sub(&bytes, &sub)) {
-                (_, Some(p)) => Ok(Value::Int(p as i64)),
-                ("find", None) => Ok(Value::Int(-1)),
-                (_, None) => Err("ValueError: subsection not found".into()),
+        _ => bytes_common_method(recv, true, name, args),
+    }
+}
+
+/// The str-parallel `bytes`/`bytearray` methods. `is_ba` picks the return type
+/// for methods that produce a new buffer (a `bytearray` receiver yields
+/// `bytearray` results, mirroring CPython).
+fn bytes_common_method(
+    recv: &Value,
+    is_ba: bool,
+    name: &str,
+    args: &[Value],
+) -> Result<Value, String> {
+    let bytes = recv_bytes(recv);
+    let tname = if is_ba { "bytearray" } else { "bytes" };
+    // A required bytes-like argument (bytes/bytearray, not an int).
+    let need_sub = |i: usize| -> Result<Vec<u8>, String> {
+        args.get(i)
+            .and_then(as_bytes_object)
+            .ok_or_else(|| host::type_error("a bytes-like object is required"))
+    };
+    // `find`/`rfind`/`index`/`count` accept an int (single byte) or bytes-like.
+    let find_needle = || -> Result<Vec<u8>, String> {
+        args.first()
+            .and_then(arg_bytes_like)
+            .ok_or_else(|| host::type_error("argument should be integer or bytes-like object"))
+    };
+    match name {
+        "decode" => decode_bytes(&bytes, args),
+        "hex" => Ok(new_str(bytes.iter().map(|b| format!("{b:02x}")).collect())),
+        // `fromhex` is a classmethod but is also reachable through an instance.
+        "fromhex" => Ok(mk_bytes(is_ba, bytes_fromhex(args)?)),
+        "upper" => Ok(mk_bytes(is_ba, bytes.to_ascii_uppercase())),
+        "lower" => Ok(mk_bytes(is_ba, bytes.to_ascii_lowercase())),
+        "find" | "rfind" => {
+            let sub = find_needle()?;
+            let (start, end) = resolve_start_end(bytes.len(), args, 1);
+            let p = bytes_find(&bytes, &sub, start, end, name == "rfind");
+            Ok(Value::Int(p.map(|x| x as i64).unwrap_or(-1)))
+        }
+        "index" | "rindex" => {
+            let sub = find_needle()?;
+            let (start, end) = resolve_start_end(bytes.len(), args, 1);
+            match bytes_find(&bytes, &sub, start, end, name == "rindex") {
+                Some(p) => Ok(Value::Int(p as i64)),
+                None => Err("ValueError: subsection not found".into()),
             }
         }
+        "count" => {
+            let sub = find_needle()?;
+            let (start, end) = resolve_start_end(bytes.len(), args, 1);
+            Ok(Value::Int(count_range(&bytes, &sub, start, end) as i64))
+        }
+        "startswith" | "endswith" => {
+            let (start, end) = resolve_start_end(bytes.len(), args, 1);
+            let region = &bytes[start..end.min(bytes.len())];
+            let prefixes = match args.first() {
+                Some(v) => bytes_prefix_tuple(v)?,
+                None => return Err(host::type_error("startswith first arg must be bytes-like")),
+            };
+            let hit = prefixes.iter().any(|p| {
+                if name == "startswith" {
+                    region.starts_with(p)
+                } else {
+                    region.ends_with(p)
+                }
+            });
+            Ok(Value::Bool(hit))
+        }
+        "split" | "rsplit" => {
+            let reverse = name == "rsplit";
+            let maxsplit = args
+                .get(1)
+                .and_then(|v| with_host(|h| h.as_int(v)))
+                .unwrap_or(-1);
+            let sep_arg = args.first().filter(|v| !matches!(v, Value::Undef));
+            let parts = match sep_arg {
+                None => split_ws(&bytes, maxsplit, reverse),
+                Some(v) => {
+                    let sep = as_bytes_object(v)
+                        .ok_or_else(|| host::type_error("must be str or None, not int"))?;
+                    if sep.is_empty() {
+                        return Err("ValueError: empty separator".into());
+                    }
+                    split_on_sep(&bytes, &sep, maxsplit, reverse)
+                }
+            };
+            let items: Vec<Value> = parts.into_iter().map(|p| mk_bytes(is_ba, p)).collect();
+            Ok(with_host(|h| h.new_list(items)))
+        }
+        "splitlines" => {
+            let keepends = args
+                .first()
+                .map(|v| with_host(|h| h.truthy(v)))
+                .unwrap_or(false);
+            let items: Vec<Value> = split_lines(&bytes, keepends)
+                .into_iter()
+                .map(|p| mk_bytes(is_ba, p))
+                .collect();
+            Ok(with_host(|h| h.new_list(items)))
+        }
+        "join" => {
+            let sep = bytes.clone();
+            let items = host::iter_vec(&arg0(args)?)?;
+            let mut out = Vec::new();
+            for (i, it) in items.iter().enumerate() {
+                if i > 0 {
+                    out.extend_from_slice(&sep);
+                }
+                let piece = as_bytes_object(it).ok_or_else(|| {
+                    host::type_error(&format!(
+                        "sequence item {i}: expected a bytes-like object, {} found",
+                        with_host(|h| h.type_name(it))
+                    ))
+                })?;
+                out.extend_from_slice(&piece);
+            }
+            Ok(mk_bytes(is_ba, out))
+        }
+        "replace" => {
+            let old = need_sub(0)?;
+            let new = need_sub(1)?;
+            let count = args
+                .get(2)
+                .and_then(|v| with_host(|h| h.as_int(v)))
+                .unwrap_or(-1);
+            Ok(mk_bytes(is_ba, replace_bytes(&bytes, &old, &new, count)))
+        }
+        "strip" | "lstrip" | "rstrip" => {
+            let chars = args.first().filter(|v| !matches!(v, Value::Undef));
+            let out = strip_bytes(&bytes, chars, name)?;
+            Ok(mk_bytes(is_ba, out))
+        }
+        "partition" | "rpartition" => {
+            let sep = need_sub(0)?;
+            if sep.is_empty() {
+                return Err("ValueError: empty separator".into());
+            }
+            let reverse = name == "rpartition";
+            let (head, mid, tail) = match bytes_find(&bytes, &sep, 0, bytes.len(), reverse) {
+                Some(p) => (
+                    bytes[..p].to_vec(),
+                    sep.clone(),
+                    bytes[p + sep.len()..].to_vec(),
+                ),
+                None if reverse => (Vec::new(), Vec::new(), bytes.clone()),
+                None => (bytes.clone(), Vec::new(), Vec::new()),
+            };
+            let t = vec![
+                mk_bytes(is_ba, head),
+                mk_bytes(is_ba, mid),
+                mk_bytes(is_ba, tail),
+            ];
+            Ok(with_host(|h| h.new_tuple(t)))
+        }
+        "removeprefix" => {
+            let pre = need_sub(0)?;
+            let out = bytes
+                .strip_prefix(pre.as_slice())
+                .map(|s| s.to_vec())
+                .unwrap_or(bytes);
+            Ok(mk_bytes(is_ba, out))
+        }
+        "removesuffix" => {
+            let suf = need_sub(0)?;
+            let out = if suf.is_empty() {
+                bytes
+            } else {
+                bytes
+                    .strip_suffix(suf.as_slice())
+                    .map(|s| s.to_vec())
+                    .unwrap_or(bytes)
+            };
+            Ok(mk_bytes(is_ba, out))
+        }
         _ => Err(format!(
-            "AttributeError: 'bytearray' object has no attribute '{name}'"
+            "AttributeError: '{tname}' object has no attribute '{name}'"
         )),
     }
+}
+
+/// A `startswith`/`endswith` first argument: a bytes-like, or a tuple of them.
+fn bytes_prefix_tuple(v: &Value) -> Result<Vec<Vec<u8>>, String> {
+    if let Some(b) = as_bytes_object(v) {
+        return Ok(vec![b]);
+    }
+    let is_tuple = with_host(|h| matches!(h.get(v), Some(PyObj::Tuple(_))));
+    if is_tuple {
+        let items = host::iter_vec(v)?;
+        let mut out = Vec::with_capacity(items.len());
+        for it in items {
+            let b = as_bytes_object(&it)
+                .ok_or_else(|| host::type_error("a bytes-like object is required"))?;
+            out.push(b);
+        }
+        return Ok(out);
+    }
+    Err(host::type_error(
+        "startswith first arg must be bytes or a tuple of bytes",
+    ))
+}
+
+/// `bytes.replace(old, new[, count])` — non-overlapping, left to right. A
+/// `count < 0` replaces every occurrence.
+fn replace_bytes(hay: &[u8], old: &[u8], new: &[u8], count: i64) -> Vec<u8> {
+    if count == 0 {
+        return hay.to_vec();
+    }
+    // An empty `old` inserts `new` at each of the `len + 1` gaps (before every
+    // byte and after the last), capped by `count`.
+    if old.is_empty() {
+        let slots = hay.len() + 1;
+        let limit = if count < 0 {
+            slots
+        } else {
+            (count as usize).min(slots)
+        };
+        let mut out = Vec::new();
+        for (i, &b) in hay.iter().enumerate() {
+            if i < limit {
+                out.extend_from_slice(new);
+            }
+            out.push(b);
+        }
+        if hay.len() < limit {
+            out.extend_from_slice(new);
+        }
+        return out;
+    }
+    let mut out = Vec::new();
+    let mut i = 0;
+    let mut done = 0i64;
+    while i < hay.len() {
+        if (count < 0 || done < count) && hay[i..].starts_with(old) {
+            out.extend_from_slice(new);
+            i += old.len();
+            done += 1;
+        } else {
+            out.push(hay[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// `strip`/`lstrip`/`rstrip`. `chars` is an optional set of byte values to
+/// remove; `None`/absent strips ASCII whitespace.
+fn strip_bytes(bytes: &[u8], chars: Option<&Value>, which: &str) -> Result<Vec<u8>, String> {
+    let set: Option<Vec<u8>> = match chars {
+        Some(v) => Some(
+            as_bytes_object(v)
+                .ok_or_else(|| host::type_error("a bytes-like object is required"))?,
+        ),
+        None => None,
+    };
+    let strip_c = |b: u8| -> bool {
+        match &set {
+            Some(s) => s.contains(&b),
+            None => is_ascii_ws(b),
+        }
+    };
+    let mut start = 0;
+    let mut end = bytes.len();
+    if which != "rstrip" {
+        while start < end && strip_c(bytes[start]) {
+            start += 1;
+        }
+    }
+    if which != "lstrip" {
+        while end > start && strip_c(bytes[end - 1]) {
+            end -= 1;
+        }
+    }
+    Ok(bytes[start..end].to_vec())
+}
+
+/// `bytes.splitlines(keepends=False)` — split on universal line boundaries
+/// (`\n`, `\r`, `\r\n`). No trailing empty field for a final newline.
+fn split_lines(bytes: &[u8], keepends: bool) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let n = bytes.len();
+    let mut i = 0;
+    let mut start = 0;
+    while i < n {
+        let c = bytes[i];
+        if c == b'\n' || c == b'\r' {
+            let mut brk = i + 1;
+            if c == b'\r' && brk < n && bytes[brk] == b'\n' {
+                brk += 1;
+            }
+            let end = if keepends { brk } else { i };
+            out.push(bytes[start..end].to_vec());
+            i = brk;
+            start = brk;
+        } else {
+            i += 1;
+        }
+    }
+    if start < n {
+        out.push(bytes[start..].to_vec());
+    }
+    out
 }
 
 /// Build the byte content for a `bytes()` / `bytearray()` constructor call.
