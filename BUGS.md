@@ -2,16 +2,19 @@
 
 pythonrs is Python lowered to fusevm (bytecode VM + Cranelift JIT), with a PyHost
 object heap. It runs a large, real subset of Python 3 correctly (verified
-byte-for-byte against CPython on the example corpus). This file is the honest
-list of what is **not** yet covered, so nobody mistakes a gap for a bug fixed.
+byte-for-byte against CPython 3.14.6 on the example corpus). This file is the
+honest list of what is **not** yet covered, so nobody mistakes a gap for a bug
+fixed. Every line below was re-checked against the **default-build** binary
+(`cargo build`, no features) before being written.
 
 ## Implemented (previously listed here as gaps)
 - **Generators / `yield`.** A `def` whose body contains `yield` builds a real
   lazy generator, backed by a stackful `corosensei` coroutine on the same thread
   (the thread-local `PyHost` is shared across suspend/resume via a swapped
   execution context). Supported: `for x in gen()`, `next(g)`, `list(gen())`,
-  `yield`-expression value, and `yield from`. Generator expressions
-  `(x for x in xs)` are now **lazy** (a hidden generator function), not eager.
+  `yield`-expression value, and `yield from` — including the delegate's `return`
+  value (`r = yield from sub()` binds `sub`'s return). Generator expressions
+  `(x for x in xs)` are **lazy** (a hidden generator function), not eager.
 - **Call-site unpacking** `f(*args, **kwargs)`, `f(a, *b, c, **d)` — flattened at
   runtime through `BUILD_ARGS`/`BUILD_KWARGS` and the `CALL*_EX` ops.
 - **Literal spreads** `[*a, *b]`, `(*a, b)`, `{*a, *b}`, and dict `**`-spread
@@ -26,50 +29,81 @@ list of what is **not** yet covered, so nobody mistakes a gap for a bug fixed.
   instances carry `args` (seeded by construction / `super().__init__` / direct
   assignment), stringify to the message (`''`/`str(arg)`/`repr(tuple)`), repr as
   `E(arg, …)`, and expose `.args`; `str()` uses the message even when a user
-  `__repr__` exists; uncaught `raise E('x')` prints `E: x`.
-- **`__init_subclass__` (PEP 487)** fires the parent hook with the new class and
-  class-header keywords (`class C(P, tag="x")`); a zero-arg `super()` inside a
-  `property` getter/setter resolves; f-string/`.format`/`ascii` `!a` ascii-escapes.
+  `__repr__` exists; uncaught `raise E('x')` prints `E: x`. **Exception chaining**
+  `raise X from Y` records `__cause__` (verified: `v.__cause__` is the `from`
+  operand).
+- **Object model**: `complex` (`(1+2j)*(3-1j)`, `.real`/`.imag`, `abs`),
+  `frozenset` (immutable, hashable, set algebra), **metaclasses**
+  (`class A(metaclass=M)`, `M.__new__`/`__init__`; `type(A) is M`), `property`
+  getters/setters, custom **descriptors** (`__get__`/`__set__`), `super()` +
+  **C3 MRO** (`C.__mro__` linearization), and **`__init_subclass__` (PEP 487)**
+  (parent hook fires with the new class and class-header keywords).
+- **Instances are hashable** as dict keys / set members via a user `__hash__`
+  (with `__eq__`), so `{K(1): 'a'}[K(1)]` resolves.
+- **`NotImplemented`-driven reflected-op negotiation**: a forward dunder that
+  returns `NotImplemented` retries the reflected dunder, for both arithmetic
+  (`A().__add__` → `B().__radd__`) and comparison (`A().__lt__` → `B().__gt__`);
+  when neither resolves, a `TypeError` is raised.
+- **`%s`/`%r`/`%a` dispatch a user instance's `__str__`/`__repr__`/`ascii(repr)`**
+  (and recurse into containers holding instances), matching f-strings/`.format`;
+  the format args' dispatched values are pre-resolved outside the host borrow.
+- **Nested f-string format specs** `f'{x:{w}.2f}'` / `f'{3.14159:{5}.{2}f}'` /
+  `f'{42:>{width}}'`: the `{…}` inside a spec is evaluated as its own replacement
+  field at runtime and spliced into the final spec before formatting.
+- **`\N{NAME}`** named-Unicode escapes decode in normal and f-strings.
+- **File I/O**: `open()` (text/binary, read/write/append), `.read`/`.readline`/
+  `.readlines`/`.write`, line iteration, and `with open(...) as f:` work in the
+  default build.
+- **`bytes`/`bytearray` are real heap types** (no longer an empty placeholder):
+  construction (`b'…'`, `bytes([65,66])`, `bytearray(b'…')`), `len`, integer
+  indexing (`b[0]` → int), iteration/`list()`, `.decode()`, `.hex()`, `.upper()`,
+  and `bytearray.append`/`.extend` all work. See Partial below for what is not.
 - **Comprehension scope**: list/set/dict comprehensions run in their own function
   scope, so the loop variable no longer leaks; enclosing variables are still read
   through the closure (the outermost iterable is evaluated in the enclosing
   scope, matching CPython).
 
 ## Not yet implemented (compile/parse-time error, no silent wrong answer)
-- **`async`/`await`.** Parsed, but `await` is a no-op passthrough and there is no
-  event loop; `async def` runs synchronously.
-- **`yield from` delegation value.** Iteration is fully supported, but the value
-  of a `yield from` expression (the sub-generator's `return` value) is always
-  `None`; sent values are not forwarded to the delegate.
+- **`async`/`await`.** Parsed, but there is no event loop: `async def f()` runs
+  **synchronously** and `f()` returns the body's value directly (CPython returns a
+  coroutine object). `await` is a no-op passthrough. `asyncio` is unavailable.
+- **`yield from` sent values.** The delegate's `return` value is now forwarded,
+  but a value `send()`-ed into the delegating generator does not reach the
+  sub-generator (`x = yield` inside the delegate sees `None`, not the sent value).
 
 ## Partial / simplified semantics
-- **Operator overloading dunders**: now dispatched. Arithmetic/bitwise
+- **Operator overloading dunders**: dispatched, with `NotImplemented` reflected
+  fallback (see Implemented). Covered: arithmetic/bitwise
   (`__add__`/`__sub__`/`__mul__`/`__truediv__`/`__floordiv__`/`__mod__`/`__pow__`/
   `__matmul__`/`__and__`/`__or__`/`__xor__`/`__lshift__`/`__rshift__`) with their
-  reflected `__r*__` fallbacks, and comparisons (`__eq__`/`__ne__`/`__lt__`/`__le__`/
-  `__gt__`/`__ge__`, reflected for `<`/`>`/`<=`/`>=`), plus the previously-dispatched
-  `__getitem__`/`__setitem__`/`__len__`/`__bool__`/`__str__`/`__repr__`/`__iter__`/
-  `__next__`/`__init__`. Container `repr`/`str` (`list`/`tuple`/`set`/`dict`) now
+  reflected `__r*__`, comparisons (`__eq__`/`__ne__`/`__lt__`/`__le__`/`__gt__`/
+  `__ge__`), and `__getitem__`/`__setitem__`/`__len__`/`__bool__`/`__str__`/
+  `__repr__`/`__iter__`/`__next__`/`__init__`/`__hash__`. Container `repr`/`str`
   recurses so instance elements/keys/values dispatch their own `__repr__`.
-  Not yet: `NotImplemented`-driven reflected-op negotiation (the forward dunder is
-  used if present; it is not retried reflected when it returns `NotImplemented`) —
-  though `str % obj` is now native-authoritative and never consults the right
-  operand's `__rmod__`; `__hash__` for instances as dict keys / set members;
-  in-place `__iadd__` etc. Also: `%s`/`%r`/`%a` of a *user instance* does not
-  dispatch its `__str__`/`__repr__` (the `%` formatter runs inside the host borrow;
-  f-strings and `str.format` do — prefer them).
+  **Not yet:** in-place augmented dunders — `x += y` does **not** call `__iadd__`
+  (falls through to `__add__`, or `TypeError` if absent).
 - **Chained comparisons** `a < b < c` re-evaluate the interior operand `b`
-  (correct for side-effect-free operands; a function call in the middle runs twice).
-- **`with`** desugars to try/finally calling `__enter__`/`__exit__`; the exception
-  triple passed to `__exit__` is always `(None, None, None)`.
-- **`int`** promotes to arbitrary precision (bignum) for `+ - * **`; `//`, `%`,
-  and bitwise ops on values beyond i64 fall back to i64 range.
-- **`bytes`** literals are accepted but represented as an empty/placeholder object;
-  bytes operations are unimplemented.
+  (correct for side-effect-free operands; a function call in the middle runs
+  twice — verified `1 < f() < 10` calls `f` twice vs CPython's once).
+- **`with`** desugars to try/finally calling `__enter__`/`__exit__`; on the
+  exceptional exit path the triple passed to `__exit__` is always
+  `(None, None, None)`, and a `True` return does **not** suppress the propagating
+  exception (verified: the exception still escapes the `with`).
+- **`int`** is arbitrary precision (bignum) across `+ - * ** // %` and the bitwise
+  ops `& | ^ << >>` — verified byte-identical to CPython on `10**30`-scale values
+  (the earlier i64-cap on `//`/`%`/bitwise is gone).
+- **`bytes`/`bytearray`** (real types — see Implemented) are **incomplete**:
+  slicing (`b[1:3]`), concatenation/repetition (`b + b`, `b * 2`), `in`
+  membership (`b'i' in b'hi'` wrongly returns `False`), most methods
+  (`.split`/`.find`/…), `bytes.fromhex`, `%`-formatting on bytes, and
+  `bytearray` item assignment (`ba[0] = 90` → `TypeError`) are not implemented.
 - **f-string format spec** covers the common mini-language (fill/align/sign/width/
-  `,`/`.prec`/type `d f e x o b % s`); nested-field specs `{:{w}}` are not expanded.
-- **`str.format`** supports `{}`, `{0}`, `{name}` is not bound (no kwargs plumbing
-  through `.format`), and `:spec`.
+  `,`/`.prec`/type `d f e x o b % s`) and now **nested field specs**
+  (`f'{x:{w}.2f}'`, see Implemented).
+- **`str.format`** supports `{}`, `{0}`, and `:spec`; **not** bound: keyword
+  fields `{name}` (no kwargs plumbing — `'{name}'.format(name='x')` yields
+  `None`) and nested-field specs `'{:{}}'` (the `str_dot_format` field scanner
+  stops at the first `}`).
 
 ## Tooling
 - **`--dap`** (Debug Adapter Protocol): implemented — breakpoints, step
@@ -83,9 +117,21 @@ list of what is **not** yet covered, so nobody mistakes a gap for a bug fixed.
   blocks close on a blank line.
 
 ## Standard library
-Implemented natively (values match CPython except `random`, which is pythonrs's
-own deterministic PRNG): `math`, `sys`, `json` (dumps/loads, order-preserving,
-bignum-safe), `os` + `os.path` (POSIX), `random`, `string`, `itertools` (eager —
-finite forms; unbounded `count`/`cycle` rejected), `functools.reduce`.
-Not yet: `re`, `collections` (needs new container types), `datetime`, file I/O,
-`functools.partial`/`lru_cache`, and most of the rest of the stdlib.
+The **default build** (no features) serves only a native subset; every other
+module raises `ModuleNotFoundError`.
+
+- **Native in every build**: `math` (constants + a common function subset), `sys`
+  (skeletal: `argv`/`maxsize`/`version`/`platform`/`stdout`/`stderr`/`stdin`;
+  `version` reports `3.12.0 (pythonrs)`), `collections` (`deque`, `Counter`,
+  `defaultdict`, `OrderedDict`, `namedtuple`), `textwrap`, and `statistics`.
+- **The rest of the stdlib is served by the `--features stdlib-ffi` bridge** — an
+  embedded libpython over pyo3, so `import re`/`json`/`os`/`random`/`string`/
+  `itertools`/`functools`/`datetime`/`hashlib`/… load the **real CPython
+  modules** (pure `.py` + the C accelerators), not hand-rolled shadows.
+  `functools.partial`/`lru_cache`/`reduce`, `re`, `json`, `os` + `os.path`,
+  `random`, `string`, and `itertools` (natively lazy `count`/`cycle`/`islice`)
+  all come from CPython there (`collections`/`math`/`sys` stay the native arms,
+  which resolve before the FFI fallback). Build with
+  `PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 cargo build --features stdlib-ffi`.
+  **Without the feature, none of these import** — e.g. `import functools`,
+  `import re`, `import os` all fail in the default build.
