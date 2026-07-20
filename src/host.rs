@@ -339,6 +339,14 @@ pub enum PyObj {
         next: i64,
         done: bool,
     },
+    /// The two-argument `iter(callable, sentinel)` form: call `func()` with no
+    /// arguments on each step, yielding the result until it equals `sentinel`
+    /// (by `==`), at which point the iterator is exhausted. `done` latches.
+    CallIter {
+        func: Value,
+        sentinel: Value,
+        done: bool,
+    },
     Module {
         name: String,
         ns: IndexMap<String, Value>,
@@ -1451,6 +1459,7 @@ impl PyHost {
                 Some(PyObj::MapObj { .. }) => "map".into(),
                 Some(PyObj::FilterObj { .. }) => "filter".into(),
                 Some(PyObj::EnumerateObj { .. }) => "enumerate".into(),
+                Some(PyObj::CallIter { .. }) => "callable_iterator".into(),
                 Some(PyObj::Module { .. }) => "module".into(),
                 Some(PyObj::BigInt(_)) => "int".into(),
                 Some(PyObj::Complex(..)) => "complex".into(),
@@ -1574,6 +1583,9 @@ impl PyHost {
                 }
                 Some(PyObj::EnumerateObj { .. }) => {
                     format!("<enumerate object at 0x{:012x}>", self.addr_of(v))
+                }
+                Some(PyObj::CallIter { .. }) => {
+                    format!("<callable_iterator object at 0x{:012x}>", self.addr_of(v))
                 }
                 Some(PyObj::Generator { id }) => {
                     let g = &self.generators[*id as usize];
@@ -4530,7 +4542,8 @@ impl PyHost {
             | Some(PyObj::Zip { .. })
             | Some(PyObj::MapObj { .. })
             | Some(PyObj::FilterObj { .. })
-            | Some(PyObj::EnumerateObj { .. }) => return Ok(v.clone()),
+            | Some(PyObj::EnumerateObj { .. })
+            | Some(PyObj::CallIter { .. }) => return Ok(v.clone()),
             _ => {
                 let items = self.iter_items(v)?;
                 IterState::Seq { items, idx: 0 }
@@ -7070,6 +7083,7 @@ pub fn iter_vec(v: &Value) -> Result<Vec<Value>, String> {
                 | Some(PyObj::MapObj { .. })
                 | Some(PyObj::FilterObj { .. })
                 | Some(PyObj::EnumerateObj { .. })
+                | Some(PyObj::CallIter { .. })
         )
     }) {
         let mut out = Vec::new();
@@ -7153,8 +7167,37 @@ pub fn iter_step(it: &Value) -> Result<Option<Value>, String> {
         Some(PyObj::MapObj { .. }) => map_step(it),
         Some(PyObj::FilterObj { .. }) => filter_step(it),
         Some(PyObj::EnumerateObj { .. }) => enumerate_step(it),
+        Some(PyObj::CallIter { .. }) => calliter_step(it),
         _ => with_host(|h| h.iter_next(it)),
     }
+}
+
+/// One step of the two-argument `iter(callable, sentinel)`: call `func()` and
+/// yield the result unless it equals `sentinel` (by `==`), which exhausts the
+/// iterator. A CPython `callable_iterator` latches on the sentinel and stays
+/// exhausted thereafter.
+fn calliter_step(it: &Value) -> Result<Option<Value>, String> {
+    let (func, sentinel, done) = match with_host(|h| h.get(it).cloned()) {
+        Some(PyObj::CallIter {
+            func,
+            sentinel,
+            done,
+        }) => (func, sentinel, done),
+        _ => return Err(type_error("not an iterator")),
+    };
+    if done {
+        return Ok(None);
+    }
+    let v = invoke(&func, vec![], vec![])?;
+    if with_host(|h| h.equal(&v, &sentinel)) {
+        with_host(|h| {
+            if let Some(PyObj::CallIter { done, .. }) = h.get_mut(it) {
+                *done = true;
+            }
+        });
+        return Ok(None);
+    }
+    Ok(Some(v))
 }
 
 /// One step of a lazy `zip`: pull one item from each source iterator in order.
@@ -7168,6 +7211,13 @@ fn zip_step(it: &Value) -> Result<Option<Value>, String> {
         _ => return Err(type_error("not an iterator")),
     };
     if done {
+        return Ok(None);
+    }
+    // `zip()` with no iterables is an immediately-exhausted iterator (CPython
+    // yields nothing); without this guard the empty-tuple round would repeat
+    // forever since no source can signal exhaustion.
+    if sources.is_empty() {
+        set_zip_done(it);
         return Ok(None);
     }
     let mut out: Vec<Value> = Vec::with_capacity(sources.len());

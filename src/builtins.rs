@@ -3002,6 +3002,18 @@ pub fn call_builtin_function(
         }
         "iter" => {
             let v = arg0(&args)?;
+            // Two-argument form: `iter(callable, sentinel)` calls `callable()`
+            // repeatedly, yielding results until one equals `sentinel`.
+            if let Some(sentinel) = args.get(1) {
+                let sentinel = sentinel.clone();
+                return Ok(with_host(|h| {
+                    h.alloc(PyObj::CallIter {
+                        func: v,
+                        sentinel,
+                        done: false,
+                    })
+                }));
+            }
             with_host(|h| h.make_iter(&v))
         }
         "next" => {
