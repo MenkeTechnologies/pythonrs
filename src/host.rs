@@ -469,6 +469,27 @@ pub enum AttrSet {
     },
 }
 
+/// The plan for `del recv.name` when a descriptor may intercept it.
+pub enum AttrDel {
+    /// No descriptor — remove from the instance dict via [`PyHost::del_attr`].
+    Plain,
+    /// A `property`: invoke `fdel(inst)`, or raise if `fdel` is unset. `owner`
+    /// is the defining class (for `super()` inside the deleter).
+    Property {
+        fdel: Value,
+        inst: Value,
+        owner: Option<String>,
+    },
+    /// A user data descriptor: call `desc.__delete__(inst)`. `has_delete` is
+    /// false when the class attribute is a data descriptor (defines `__set__`)
+    /// yet lacks `__delete__` — CPython then raises `AttributeError: __delete__`.
+    Descriptor {
+        desc: Value,
+        inst: Value,
+        has_delete: bool,
+    },
+}
+
 /// Iterator cursor state.
 #[derive(Clone)]
 pub enum IterState {
@@ -4961,6 +4982,25 @@ impl PyHost {
             }
             return AttrGet::Plain;
         }
+        // Class-level access `C.x`: a descriptor in the class MRO is invoked as
+        // `desc.__get__(None, C)` (obj is `None`). `property`/method/staticmethod
+        // fall through to the plain class-attribute read.
+        if let Some(PyObj::Class(cname)) = self.get(recv) {
+            let cname = cname.clone();
+            if let Some(cls_attr) = self.class_lookup(&cname, name) {
+                if let Some(PyObj::Instance(i)) = self.get(&cls_attr) {
+                    let c = i.class.clone();
+                    if self.class_has(&c, "__get__") {
+                        return AttrGet::Descriptor {
+                            desc: cls_attr,
+                            inst: Value::Undef,
+                            cls: recv.clone(),
+                        };
+                    }
+                }
+            }
+            return AttrGet::Plain;
+        }
         let (class, in_instdict) = match self.get(recv) {
             Some(PyObj::Instance(i)) => (i.class.clone(), i.attrs.contains_key(name)),
             _ => return AttrGet::Plain,
@@ -5035,6 +5075,40 @@ impl PyHost {
             };
         }
         AttrSet::Plain
+    }
+
+    /// Plan `del recv.name`, honoring `property.fdel` and user data descriptors
+    /// (`__delete__`). See [`AttrDel`]. Non-data descriptors (only `__get__`) do
+    /// not intercept deletion — the name is removed from the instance dict.
+    pub fn plan_attr_del(&mut self, recv: &Value, name: &str) -> AttrDel {
+        let class = match self.get(recv) {
+            Some(PyObj::Instance(i)) => i.class.clone(),
+            _ => return AttrDel::Plain,
+        };
+        let cls_attr = match self.class_lookup(&class, name) {
+            Some(v) => v,
+            None => return AttrDel::Plain,
+        };
+        if let Some(PyObj::Property { fdel, .. }) = self.get(&cls_attr) {
+            return AttrDel::Property {
+                fdel: fdel.clone(),
+                inst: recv.clone(),
+                owner: method_owner(self, &class, name),
+            };
+        }
+        // A data descriptor (defines `__set__` or `__delete__`) intercepts `del`.
+        if let Some(PyObj::Instance(i)) = self.get(&cls_attr) {
+            let c = i.class.clone();
+            let has_delete = self.class_has(&c, "__delete__");
+            if has_delete || self.class_has(&c, "__set__") {
+                return AttrDel::Descriptor {
+                    desc: cls_attr,
+                    inst: recv.clone(),
+                    has_delete,
+                };
+            }
+        }
+        AttrDel::Plain
     }
 
     /// `recv.name = val`.

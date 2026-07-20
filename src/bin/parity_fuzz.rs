@@ -1769,6 +1769,89 @@ fn gen_format2(seed: u64) -> Vec<String> {
     vec![e]
 }
 
+/// Decorators and the descriptor protocol: `@property` get/set/delete,
+/// `@staticmethod`/`@classmethod` (via class and instance, `cls` binding and
+/// inheritance), function decorators (single, stacked, factories), class
+/// decorators, and custom descriptors (`__get__`/`__set__`/`__delete__`/
+/// `__set_name__`, data-vs-non-data precedence, class-level access).
+/// All programs are byte-stable — they print transformed values, names, and
+/// counts, never a raw object repr. Descriptor state lives on the descriptor
+/// instance (one live object per test), never through `obj.__dict__`.
+fn gen_descriptors(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let n = pick(r, &["1", "2", "3", "5", "7", "10", "-4"]);
+    let m = pick(r, &["2", "3", "4", "6"]);
+    let e: String = match r.below(28) {
+        0 => "class C:\n    def __init__(self): self._x = 10\n    @property\n    def x(self): return self._x * 2\nc = C()\nprint(c.x)"
+            .to_string(),
+        1 => format!(
+            "class C:\n    def __init__(self): self._x = 1\n    @property\n    def x(self): return self._x\n    @x.setter\n    def x(self, v): self._x = v + {n}\nc = C()\nc.x = {m}\nprint(c.x)"
+        ),
+        2 => "class C:\n    def __init__(self): self._x = 5\n    @property\n    def x(self): return self._x\n    @x.setter\n    def x(self, v): self._x = v\n    @x.deleter\n    def x(self): self._x = -99\nc = C()\nprint(c.x)\nc.x = 7\nprint(c.x)\ndel c.x\nprint(c.x)"
+            .to_string(),
+        3 => "class C:\n    @property\n    def x(self): return 42\nc = C()\nprint(c.x)\ntry:\n    c.x = 1\nexcept AttributeError as ex:\n    print('AE', 'no setter' in str(ex) or 'has no setter' in str(ex))"
+            .to_string(),
+        4 => "class C:\n    @property\n    def x(self): return 1\nc = C()\ntry:\n    del c.x\nexcept AttributeError as ex:\n    print('AE', 'deleter' in str(ex))"
+            .to_string(),
+        5 => format!(
+            "class C:\n    @staticmethod\n    def add(a, b): return a + b\nprint(C.add({n}, {m}), C().add({n}, {m}))"
+        ),
+        6 => format!(
+            "class C:\n    @classmethod\n    def make(cls, v): return cls.__name__ + ':' + str(v)\nprint(C.make({n}), C().make({m}))"
+        ),
+        7 => "class A:\n    @classmethod\n    def who(cls): return cls.__name__\nclass B(A): pass\nprint(A.who(), B.who(), B().who())"
+            .to_string(),
+        8 => "class C:\n    kind = 'K'\n    @classmethod\n    def tag(cls): return cls.kind\n    @staticmethod\n    def s(): return 'S'\nprint(C.tag(), C.s(), C().tag(), C().s())"
+            .to_string(),
+        9 => format!(
+            "def twice(f):\n    def w(*a, **k): return f(*a, **k) * 2\n    return w\n@twice\ndef g(x): return x + {n}\nprint(g({m}))"
+        ),
+        10 => "def a(f):\n    def w(): return 'a(' + f() + ')'\n    return w\ndef b(f):\n    def w(): return 'b(' + f() + ')'\n    return w\n@a\n@b\ndef g(): return 'g'\nprint(g())"
+            .to_string(),
+        11 => format!(
+            "def rep(k):\n    def d(f):\n        def w(*a, **kw): return f(*a, **kw) * k\n        return w\n    return d\n@rep({m})\ndef g(x): return x + {n}\nprint(g({n}))"
+        ),
+        12 => "def tag(c):\n    c.marker = 'T'\n    return c\n@tag\nclass C:\n    pass\nprint(C.marker, C().marker)"
+            .to_string(),
+        13 => "def wrap(c):\n    class New(c):\n        extra = 'new'\n    return New\n@wrap\nclass C:\n    base = 'old'\nprint(C.base, C.extra)"
+            .to_string(),
+        14 => format!(
+            "def twice_dec(f):\n    def w(*a, **kw): return f(*a, **kw) * 2\n    return w\ndef add(k):\n    def d(f):\n        def w(*a, **kw): return f(*a, **kw) + k\n        return w\n    return d\n@twice_dec\n@add({m})\ndef g(x): return x\nprint(g({n}))"
+        ),
+        15 => "class Named:\n    def __set_name__(self, owner, name): self.name = name\n    def __get__(self, obj, ot=None): return self.name\nclass C:\n    a = Named()\n    bb = Named()\nprint(C.a, C.bb)"
+            .to_string(),
+        16 => "class D:\n    def __get__(self, obj, ot=None):\n        return 'cls' if obj is None else 'inst'\nclass C:\n    x = D()\nprint(C.x, C().x)"
+            .to_string(),
+        17 => format!(
+            "class Pos:\n    def __init__(self): self.v = 0\n    def __get__(self, obj, ot=None):\n        return self.v if obj is not None else self\n    def __set__(self, obj, val):\n        if val < 0: raise ValueError('neg')\n        self.v = val\nclass C:\n    p = Pos()\nc = C()\nc.p = {m}\nprint(c.p)\ntry:\n    c.p = {n} - 100\nexcept ValueError as ex:\n    print('VE', ex)\nprint(c.p)"
+        ),
+        18 => "class Log:\n    def __get__(self, obj, ot=None): return 5\n    def __delete__(self, obj): print('deleted')\nclass C:\n    x = Log()\nc = C()\nprint(c.x)\ndel c.x"
+            .to_string(),
+        19 => "class Data:\n    def __get__(self, o, t=None): return 'D-get'\n    def __set__(self, o, v): pass\nclass NonData:\n    def __get__(self, o, t=None): return 'ND-get'\nclass C:\n    d = Data()\n    nd = NonData()\nc = C()\nc.d = 'x'\nc.nd = 'y'\nprint(c.d, c.nd)"
+            .to_string(),
+        20 => "class C:\n    def m(self): return 'method'\nc = C()\nprint(C.m(c), c.m())\nc.m = lambda: 'shadow'\nprint(c.m())"
+            .to_string(),
+        21 => format!(
+            "class Temp:\n    def __init__(self, c): self.c = c\n    @property\n    def f(self): return self.c * 9 / 5 + 32\nt = Temp({m})\nprint(t.f)"
+        ),
+        22 => "class C:\n    @classmethod\n    def alt(cls, v):\n        obj = cls()\n        obj.val = v\n        return obj\nclass D(C): pass\nprint(C.alt(3).val, D.alt(4).val, type(D.alt(5)).__name__)"
+            .to_string(),
+        23 => format!(
+            "def deco(f):\n    def w(*a, **k):\n        return (len(a), sorted(k), f(*a, **k))\n    return w\n@deco\ndef g(x, y, z=0): return x + y + z\nprint(g({n}, {m}, z={n}))"
+        ),
+        24 => "class Const:\n    def __init__(self, v): self.v = v\n    def __get__(self, obj, ot=None): return self.v\n    def __set__(self, obj, val): raise AttributeError('read-only')\nclass C:\n    x = Const(7)\nc = C()\nprint(c.x)\ntry:\n    c.x = 1\nexcept AttributeError as ex:\n    print('AE', ex)"
+            .to_string(),
+        25 => "class C:\n    _n = 0\n    @property\n    def n(self): return self._n\n    @n.setter\n    def n(self, v): self._n = v\nclass D(C):\n    @property\n    def n(self): return super().n + 1\nd = D()\nd._n = 4\nprint(d.n)"
+            .to_string(),
+        26 => "class Counter:\n    def __init__(self): self.calls = 0\n    def __get__(self, obj, ot=None):\n        self.calls += 1\n        return self.calls\nclass C:\n    x = Counter()\nc = C()\nprint(c.x, c.x, c.x)"
+            .to_string(),
+        _ => format!(
+            "def memo(f):\n    cache = []\n    def w(x):\n        cache.append(x)\n        return f(x) + len(cache)\n    return w\n@memo\ndef g(x): return x * {m}\nprint(g({n}), g({n}), g({m}))"
+        ),
+    };
+    vec![e]
+}
+
 // ---------------------------------------------------------------------------
 // Mode dispatch
 // ---------------------------------------------------------------------------
@@ -1813,6 +1896,7 @@ enum Mode {
     Async,
     Async2,
     Augwith,
+    Descriptors,
 }
 
 const REAL_MODES: &[Mode] = &[
@@ -1853,6 +1937,7 @@ const REAL_MODES: &[Mode] = &[
     Mode::Async,
     Mode::Async2,
     Mode::Augwith,
+    Mode::Descriptors,
 ];
 
 /// Generate the statement list for a seed in the selected mode. `Mixed` rotates
@@ -1900,6 +1985,7 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Async => gen_async(seed),
         Mode::Async2 => gen_async2(seed),
         Mode::Augwith => gen_augwith(seed),
+        Mode::Descriptors => gen_descriptors(seed),
     }
 }
 
@@ -1943,6 +2029,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Async => "async",
         Mode::Async2 => "async2",
         Mode::Augwith => "augwith",
+        Mode::Descriptors => "descriptors",
     }
 }
 
@@ -1986,6 +2073,7 @@ fn mode_from_name(s: &str) -> Option<Mode> {
         Mode::Async,
         Mode::Async2,
         Mode::Augwith,
+        Mode::Descriptors,
     ];
     ALL.iter().copied().find(|&m| mode_name(m) == s)
 }
