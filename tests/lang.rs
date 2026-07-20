@@ -1552,9 +1552,57 @@ fn set_repr_cpython_hash_order() {
     // Colliding ints beyond the initial table (drives a resize + linear probing).
     assert_eq!(g("x = set([9, 1, 17, 25, 33])", "x"), "{33, 1, 9, 17, 25}");
     // Iteration follows the same order.
-    assert_eq!(g("x = list(set([10, 5, 1, 2, 3]))", "x"), "[1, 2, 3, 5, 10]");
+    assert_eq!(
+        g("x = list(set([10, 5, 1, 2, 3]))", "x"),
+        "[1, 2, 3, 5, 10]"
+    );
     // `1`, `1.0`, `True` unify to one element (int key), repr uses the first.
     assert_eq!(g("x = set([2.0, 1])", "x"), "{1, 2.0}");
+}
+
+#[test]
+fn instance_hash_dict_set_keys() {
+    // A class with `__hash__` + `__eq__` gives value-equal instances one dict/set
+    // slot; lookups with an equal-but-distinct instance find the entry.
+    const C: &str = "class C:\n    def __init__(s, v): s.v = v\n    def __hash__(s): return s.v\n    def __eq__(s, o): return isinstance(o, C) and s.v == o.v\n";
+    assert_eq!(
+        g(
+            &format!("{C}d = {{C(1): 'a', C(2): 'b'}}\nx = d[C(1)]"),
+            "x"
+        ),
+        "'a'"
+    );
+    // Value-equal keys collapse; a re-store updates in place.
+    assert_eq!(
+        g(
+            &format!("{C}d = {{C(1): 'a'}}\nd[C(1)] = 'z'\nx = (len(d), d[C(1)])"),
+            "x"
+        ),
+        "(1, 'z')"
+    );
+    // Set membership + dedup of equal instances.
+    assert_eq!(
+        g(
+            &format!("{C}s = {{C(1), C(2), C(1)}}\nx = (len(s), C(1) in s, C(9) in s)"),
+            "x"
+        ),
+        "(2, True, False)"
+    );
+    // `hash()` returns the `__hash__` result verbatim.
+    assert_eq!(g(&format!("{C}x = hash(C(42))"), "x"), "42");
+    // A bare class (no `__hash__`/`__eq__`) is hashable by identity.
+    assert_eq!(
+        g(
+            "class B: pass\nb = B()\nd = {b: 1}\nx = (d[b], B() in d)",
+            "x"
+        ),
+        "(1, False)"
+    );
+    // `__eq__` without `__hash__` (and `__hash__ = None`) makes it unhashable.
+    for body in ["def __eq__(s, o): return True", "__hash__ = None"] {
+        let src = format!("class U:\n    {body}\ntry:\n    _ = {{U()}}\n    x = 'hashable'\nexcept TypeError:\n    x = 'unhashable'");
+        assert_eq!(g(&src, "x"), "'unhashable'");
+    }
 }
 
 #[test]
