@@ -5163,6 +5163,37 @@ fn str_translate(s: &str, table: &Value) -> Result<String, String> {
     Ok(out)
 }
 
+/// Resolve `mapping[key]` for `str.format_map`, using the full subscript
+/// protocol: a custom mapping's `__getitem__`, a `defaultdict`/`Counter`
+/// `__missing__`, then a plain-dict lookup (KeyError on miss) — exactly what
+/// CPython's `PyObject_GetItem` does for the replacement-field name.
+fn format_map_get(mapping: &Value, key: &str) -> Result<Value, String> {
+    let keyv = with_host(|h| h.new_str(key.to_string()));
+    if with_host(|h| matches!(h.get(mapping), Some(PyObj::Instance(_)))) {
+        return host::call_method(mapping, "__getitem__", vec![keyv], vec![]);
+    }
+    if let Some(meta) = host::dict_meta_of(mapping) {
+        let missing = with_host(|h| match h.to_key(&keyv) {
+            Ok(k) => matches!(h.get(mapping), Some(PyObj::Dict(d)) if !d.contains_key(&k)),
+            Err(_) => false,
+        });
+        if missing {
+            match meta.kind {
+                host::DictKind::Counter => return Ok(Value::Int(0)),
+                host::DictKind::DefaultDict => {
+                    if let Some(factory) = meta.factory {
+                        let default = host::invoke(&factory, vec![], vec![])?;
+                        with_host(|h| h.set_item(mapping, &keyv, default.clone()))?;
+                        return Ok(default);
+                    }
+                }
+                host::DictKind::OrderedDict => {}
+            }
+        }
+    }
+    with_host(|h| h.get_item(mapping, &keyv))
+}
+
 /// CPython `str.format_map(mapping)`: like `.format` but named fields resolve
 /// from `mapping` and it is not copied.
 fn str_format_map(s: &str, mapping: &Value) -> Result<Value, String> {
@@ -5203,15 +5234,7 @@ fn str_format_map(s: &str, mapping: &Value) -> Result<Value, String> {
                     ),
                     None => (name_conv, 0),
                 };
-                let key = PKey::Str(fname.clone());
-                let val = with_host(|h| match h.get(mapping) {
-                    Some(PyObj::Dict(d)) => d.get(&key).map(|(_, v)| v.clone()),
-                    _ => None,
-                });
-                let val = match val {
-                    Some(v) => v,
-                    None => return Err(format!("KeyError: '{fname}'")),
-                };
+                let val = format_map_get(mapping, &fname)?;
                 out.push_str(&format_field(&val, conv, &spec)?);
             }
             c => {
@@ -7660,10 +7683,16 @@ pub fn apply_format_spec(s: &str, v: &Value, spec: &str) -> String {
         width = width * 10 + (chars[i] as usize - '0' as usize);
         i += 1;
     }
-    let comma = i < chars.len() && chars[i] == ',';
-    if comma {
-        i += 1;
-    }
+    // Grouping option: `,` (thousands) or `_` (underscore). CPython places this
+    // between the width and the `.precision`; both are parsed here so `_x` etc.
+    // never collide with the trailing type char.
+    let group: Option<char> = match chars.get(i).copied() {
+        Some(c @ (',' | '_')) => {
+            i += 1;
+            Some(c)
+        }
+        _ => None,
+    };
     let mut prec: Option<usize> = None;
     if i < chars.len() && chars[i] == '.' {
         i += 1;
@@ -7677,7 +7706,7 @@ pub fn apply_format_spec(s: &str, v: &Value, spec: &str) -> String {
     let ty = chars.get(i).copied().unwrap_or('\0');
 
     // Render body by type.
-    let mut body =
+    let body =
         match ty {
             'd' => match with_host(|h| h.big_val(v)) {
                 Some(n) => n.to_string(),
@@ -7726,14 +7755,75 @@ pub fn apply_format_spec(s: &str, v: &Value, spec: &str) -> String {
             }
         };
 
-    if comma {
-        body = add_thousands(&body);
+    let numeric = as_f(v).is_some();
+    // Decompose the numeric body into sign / radix-prefix / integer-digits /
+    // trailing (fraction or exponent), so grouping and sign-aware zero-fill can
+    // operate on just the integer digits — exactly like CPython.
+    let mut sign_str = String::new();
+    let mut rest = body.as_str();
+    if let Some(r) = rest.strip_prefix('-') {
+        sign_str.push('-');
+        rest = r;
+    } else if numeric && matches!(sign, '+' | ' ') {
+        // A `+`/space sign flag adds a leading marker to a non-negative value.
+        sign_str.push(sign);
     }
-    // A `+` or space sign flag adds a leading `+`/space to a non-negative value
-    // (a negative already carries its own `-`).
-    if matches!(sign, '+' | ' ') && as_f(v).map(|f| f >= 0.0).unwrap_or(false) {
-        body = format!("{sign}{body}");
+    let mut prefix = String::new();
+    if rest.len() >= 2 && rest.as_bytes()[0] == b'0' {
+        let c1 = rest.as_bytes()[1] as char;
+        if matches!(c1, 'x' | 'X' | 'o' | 'O' | 'b' | 'B') {
+            prefix = rest[..2].to_string();
+            rest = &rest[2..];
+        }
     }
+    // Split off the fraction / exponent so grouping touches only the integer
+    // digits. `e`/`E` are exponent markers ONLY for the float-exp types — for a
+    // hex value like `3e517` they are ordinary digits.
+    let split: &[char] = if matches!(ty, 'e' | 'E' | 'g' | 'G') {
+        &['.', 'e', 'E']
+    } else {
+        &['.']
+    };
+    let (intpart, tail): (&str, &str) = match rest.find(split) {
+        Some(p) => (&rest[..p], &rest[p..]),
+        None => (rest, ""),
+    };
+
+    // Grouping size: `_` groups hex/oct/bin by 4; `,` and decimal/float `_`
+    // group by 3. Non-numeric bodies never group.
+    let group_size = match (group, ty) {
+        (Some(_), _) if !numeric => 0,
+        (Some('_'), 'x' | 'X' | 'o' | 'b') => 4,
+        (Some(_), _) => 3,
+        (None, _) => 0,
+    };
+    let sep = group.unwrap_or(',');
+
+    // Sign-aware zero-fill only interleaves separators when the fill is '0' and
+    // the alignment is '=' (the `0` flag). Any other fill/align groups the
+    // natural digits first, then pads as an opaque block.
+    let zero_interleave = align == '=' && fill == '0';
+
+    if numeric && group_size > 0 && zero_interleave {
+        // Grow the integer-digit count until sign + prefix + grouped(n) + tail
+        // reaches the width; leading zeros pad the magnitude, then group.
+        let fixed = sign_str.chars().count() + prefix.chars().count() + tail.chars().count();
+        let mut n = intpart.chars().count().max(1);
+        while fixed + grouped_len(n, group_size) < width {
+            n += 1;
+        }
+        let padded = format!("{:0>n$}", intpart, n = n);
+        let grouped = insert_grouping(&padded, sep, group_size);
+        return format!("{sign_str}{prefix}{grouped}{tail}");
+    }
+
+    // Group the natural integer digits (no interleaved padding).
+    let intpart_g = if numeric && group_size > 0 {
+        insert_grouping(intpart, sep, group_size)
+    } else {
+        intpart.to_string()
+    };
+    let body = format!("{sign_str}{prefix}{intpart_g}{tail}");
 
     let len = body.chars().count();
     if len >= width {
@@ -7773,13 +7863,41 @@ pub fn apply_format_spec(s: &str, v: &Value, spec: &str) -> String {
         '>' => format!("{}{body}", fill.to_string().repeat(pad)),
         _ => {
             // default: numbers right-align, strings left-align
-            if as_f(v).is_some() {
+            if numeric {
                 format!("{}{body}", fill.to_string().repeat(pad))
             } else {
                 format!("{body}{}", fill.to_string().repeat(pad))
             }
         }
     }
+}
+
+/// Length of `n` digits after inserting a group separator every `size` digits
+/// from the right: `n + (n-1)/size`.
+fn grouped_len(n: usize, size: usize) -> usize {
+    if n == 0 {
+        0
+    } else {
+        n + (n - 1) / size
+    }
+}
+
+/// Insert `sep` every `size` characters of `digits`, counting from the right
+/// (e.g. `insert_grouping("1234567", ',', 3)` → `"1,234,567"`).
+fn insert_grouping(digits: &str, sep: char, size: usize) -> String {
+    let cs: Vec<char> = digits.chars().collect();
+    let n = cs.len();
+    if n == 0 || size == 0 {
+        return digits.to_string();
+    }
+    let mut out = String::with_capacity(n + n / size);
+    for (idx, c) in cs.iter().enumerate() {
+        if idx > 0 && (n - idx) % size == 0 {
+            out.push(sep);
+        }
+        out.push(*c);
+    }
+    out
 }
 
 /// Format an integer (bignum-safe) in `radix` as sign + optional prefix +
@@ -7812,25 +7930,3 @@ fn is_str(v: &Value) -> bool {
     matches!(v, Value::Str(_)) || with_host(|h| h.as_str(v).is_some())
 }
 
-fn add_thousands(s: &str) -> String {
-    let (sign, digits) = match s.strip_prefix('-') {
-        Some(r) => ("-", r),
-        None => ("", s),
-    };
-    let (int_part, frac) = match digits.split_once('.') {
-        Some((a, b)) => (a, Some(b)),
-        None => (digits, None),
-    };
-    let mut out = String::new();
-    let bytes: Vec<char> = int_part.chars().collect();
-    for (idx, c) in bytes.iter().enumerate() {
-        if idx > 0 && (bytes.len() - idx) % 3 == 0 {
-            out.push(',');
-        }
-        out.push(*c);
-    }
-    match frac {
-        Some(f) => format!("{sign}{out}.{f}"),
-        None => format!("{sign}{out}"),
-    }
-}
