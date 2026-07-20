@@ -90,6 +90,10 @@ pub struct Compiler {
     loops: Vec<LoopCtx>,
     tmp: usize,
     debug: bool,
+    /// The source line of the statement currently being lowered. Call ops carry
+    /// it so an uncaught exception's traceback can name each call-site frame's
+    /// line (expression ops otherwise emit line 0).
+    cur_line: u32,
     /// Number of enclosing real scopes (`def`/`lambda`/class body) — comprehension
     /// hidden functions do NOT count. Decides whether a walrus (`:=`) inside a
     /// comprehension leaks to module scope (`global`, depth 0) or the enclosing
@@ -137,6 +141,9 @@ impl Compiler {
     }
 
     fn compile_stmt(&mut self, b: &mut ChunkBuilder, s: &Stmt) -> Result<(), String> {
+        if s.line != 0 {
+            self.cur_line = s.line;
+        }
         if self.debug && s.line != 0 {
             b.emit(Op::LoadInt(s.line as i64), s.line);
             b.emit(Op::CallBuiltin(ops::DBG_LINE, 1), s.line);
@@ -830,7 +837,7 @@ impl Compiler {
             Expr::FString(parts) => self.compile_fstring(b, parts)?,
             Expr::Name(n) => {
                 self.name_const(b, n);
-                b.emit(Op::CallBuiltin(ops::GETLOCAL, 1), 0);
+                b.emit(Op::CallBuiltin(ops::GETLOCAL, 1), self.cur_line);
             }
             Expr::List(items) => {
                 if items.iter().any(|e| matches!(e, Expr::Starred(_))) {
@@ -915,12 +922,12 @@ impl Compiler {
             Expr::Attribute(recv, attr) => {
                 self.compile_expr(b, recv)?;
                 self.name_const(b, attr);
-                b.emit(Op::CallBuiltin(ops::GETATTR, 2), 0);
+                b.emit(Op::CallBuiltin(ops::GETATTR, 2), self.cur_line);
             }
             Expr::Subscript(recv, idx) => {
                 self.compile_expr(b, recv)?;
                 self.compile_subscript_index(b, idx)?;
-                b.emit(Op::CallBuiltin(ops::GETITEM, 2), 0);
+                b.emit(Op::CallBuiltin(ops::GETITEM, 2), self.cur_line);
             }
             Expr::Slice { lo, hi, step } => {
                 self.compile_opt(b, lo)?;
@@ -1126,19 +1133,19 @@ impl Compiler {
             BinOp::Add => {
                 self.compile_expr(b, l)?;
                 self.compile_expr(b, r)?;
-                b.emit(Op::Add, 0);
+                b.emit(Op::Add, self.cur_line);
                 return Ok(());
             }
             BinOp::Sub => {
                 self.compile_expr(b, l)?;
                 self.compile_expr(b, r)?;
-                b.emit(Op::Sub, 0);
+                b.emit(Op::Sub, self.cur_line);
                 return Ok(());
             }
             BinOp::Mul => {
                 self.compile_expr(b, l)?;
                 self.compile_expr(b, r)?;
-                b.emit(Op::Mul, 0);
+                b.emit(Op::Mul, self.cur_line);
                 return Ok(());
             }
             BinOp::Div => bop::DIV,
@@ -1155,7 +1162,7 @@ impl Compiler {
         b.emit(Op::LoadInt(tag), 0);
         self.compile_expr(b, l)?;
         self.compile_expr(b, r)?;
-        b.emit(Op::CallBuiltin(ops::BINOP, 3), 0);
+        b.emit(Op::CallBuiltin(ops::BINOP, 3), self.cur_line);
         Ok(())
     }
 
@@ -1275,12 +1282,15 @@ impl Compiler {
                 self.name_const(b, attr);
                 self.compile_seq(b, args)?;
                 if named.is_empty() {
-                    b.emit(Op::CallBuiltin(ops::CALL_METHOD, argc(2 + args.len())?), 0);
+                    b.emit(
+                        Op::CallBuiltin(ops::CALL_METHOD, argc(2 + args.len())?),
+                        self.cur_line,
+                    );
                 } else {
                     build_kw(self, b)?;
                     b.emit(
                         Op::CallBuiltin(ops::CALL_METHOD_KW, argc(3 + args.len())?),
-                        0,
+                        self.cur_line,
                     );
                 }
             }
@@ -1288,22 +1298,31 @@ impl Compiler {
                 self.name_const(b, n);
                 self.compile_seq(b, args)?;
                 if named.is_empty() {
-                    b.emit(Op::CallBuiltin(ops::CALL, argc(1 + args.len())?), 0);
+                    b.emit(
+                        Op::CallBuiltin(ops::CALL, argc(1 + args.len())?),
+                        self.cur_line,
+                    );
                 } else {
                     build_kw(self, b)?;
-                    b.emit(Op::CallBuiltin(ops::CALL_KW, argc(2 + args.len())?), 0);
+                    b.emit(
+                        Op::CallBuiltin(ops::CALL_KW, argc(2 + args.len())?),
+                        self.cur_line,
+                    );
                 }
             }
             _ => {
                 self.compile_expr(b, func)?;
                 self.compile_seq(b, args)?;
                 if named.is_empty() {
-                    b.emit(Op::CallBuiltin(ops::CALL_VALUE, argc(1 + args.len())?), 0);
+                    b.emit(
+                        Op::CallBuiltin(ops::CALL_VALUE, argc(1 + args.len())?),
+                        self.cur_line,
+                    );
                 } else {
                     build_kw(self, b)?;
                     b.emit(
                         Op::CallBuiltin(ops::CALL_VALUE_KW, argc(2 + args.len())?),
-                        0,
+                        self.cur_line,
                     );
                 }
             }
@@ -1361,19 +1380,19 @@ impl Compiler {
                 self.name_const(b, attr);
                 self.compile_arg_spread(b, args)?;
                 self.compile_kw_spread(b, keywords)?;
-                b.emit(Op::CallBuiltin(ops::CALL_METHOD_EX, 4), 0);
+                b.emit(Op::CallBuiltin(ops::CALL_METHOD_EX, 4), self.cur_line);
             }
             Expr::Name(n) => {
                 self.name_const(b, n);
                 self.compile_arg_spread(b, args)?;
                 self.compile_kw_spread(b, keywords)?;
-                b.emit(Op::CallBuiltin(ops::CALL_EX, 3), 0);
+                b.emit(Op::CallBuiltin(ops::CALL_EX, 3), self.cur_line);
             }
             _ => {
                 self.compile_expr(b, func)?;
                 self.compile_arg_spread(b, args)?;
                 self.compile_kw_spread(b, keywords)?;
-                b.emit(Op::CallBuiltin(ops::CALL_VALUE_EX, 3), 0);
+                b.emit(Op::CallBuiltin(ops::CALL_VALUE_EX, 3), self.cur_line);
             }
         }
         Ok(())

@@ -517,8 +517,11 @@ pub struct Frame {
     pub nonlocals_decl: HashSet<String>,
     pub self_obj: Option<Value>,
     pub owner: Option<String>,
+    /// The scope name shown in a traceback frame (`<module>`, a function name, or
+    /// a class name for a class body).
+    pub name: String,
     /// Source line currently executing in this frame — updated by the DAP debug
-    /// line hook (`--dap`); 0 outside debug mode.
+    /// line hook (`--dap`) and by the error path when an exception aborts a chunk.
     pub line: u32,
 }
 
@@ -563,6 +566,22 @@ pub struct PyHost {
     /// `.0` = `__cause__` (`raise X from Y`), `.1` = `__context__` (the
     /// exception being handled when this one was raised). `Value::Undef` = unset.
     pub exc_links: HashMap<u32, (Value, Value)>,
+    /// Process arguments exposed to the program as `sys.argv`. Set once per run
+    /// by `init_runtime` (`['']` for the REPL/stdin default, `['script', …]` for
+    /// a file, `['-c', …]` for `-c`).
+    pub argv: Vec<String>,
+    /// Absolute path bound to the top-level `__file__`, `None` for `-c`/stdin.
+    pub main_file: Option<String>,
+    /// The full program source — used to reconstruct traceback source lines.
+    pub prog_source: String,
+    /// The filename shown in traceback frames (`<string>`, `<stdin>`, or a path).
+    pub tb_filename: String,
+    /// Whether traceback frames print their source line (true for a file / `-c`,
+    /// false for stdin — CPython cannot retrieve stdin source).
+    pub tb_show_source: bool,
+    /// Frames captured (innermost first) as an exception unwinds the call stack,
+    /// each `(scope_name, line)`. Cleared when the exception is caught.
+    pub traceback: Vec<(String, u32)>,
 }
 
 /// One suspended generator. `coro` is `None` only while this generator is
@@ -642,6 +661,33 @@ pub fn reset_host() {
     with_host(|h| *h = PyHost::new());
 }
 
+/// Install the per-run CLI/runtime context on a freshly reset host: `sys.argv`,
+/// the top-level `__name__`/`__file__` globals, and the traceback source/filename
+/// metadata. Call after `reset_host`, before running the program.
+pub fn init_runtime(
+    argv: Vec<String>,
+    main_file: Option<String>,
+    source: &str,
+    tb_filename: &str,
+    tb_show_source: bool,
+) {
+    with_host(|h| {
+        h.argv = argv;
+        h.main_file = main_file.clone();
+        h.prog_source = source.to_string();
+        h.tb_filename = tb_filename.to_string();
+        h.tb_show_source = tb_show_source;
+        h.traceback.clear();
+        // The top-level script always runs as `__main__`.
+        let name = h.new_str("__main__");
+        h.set_global("__name__", name);
+        if let Some(path) = main_file {
+            let f = h.new_str(path);
+            h.set_global("__file__", f);
+        }
+    });
+}
+
 impl Default for PyHost {
     fn default() -> Self {
         Self::new()
@@ -663,6 +709,7 @@ impl PyHost {
                 nonlocals_decl: HashSet::new(),
                 self_obj: None,
                 owner: None,
+                name: "<module>".to_string(),
                 line: 0,
             }],
             error: None,
@@ -674,6 +721,12 @@ impl PyHost {
             nt_meta: HashMap::new(),
             lru_caches: Vec::new(),
             exc_links: HashMap::new(),
+            argv: vec![String::new()],
+            main_file: None,
+            prog_source: String::new(),
+            tb_filename: "<string>".to_string(),
+            tb_show_source: true,
+            traceback: Vec::new(),
         }
     }
 
@@ -905,6 +958,13 @@ impl PyHost {
             f.line = line;
         }
     }
+    /// Capture the innermost frame's `(name, line)` into the in-flight traceback
+    /// as an exception unwinds past it. Called just before the frame is popped.
+    pub fn push_tb_frame(&mut self) {
+        if let Some(f) = self.frames.last() {
+            self.traceback.push((f.name.clone(), f.line));
+        }
+    }
     /// The call stack as (frame name, line) pairs, innermost first — for the DAP
     /// `stackTrace`. `owner` carries the function/class name where known.
     pub fn dbg_stack(&self) -> Vec<(String, u32)> {
@@ -1060,6 +1120,22 @@ pub fn name_error(name: &str) -> String {
 }
 pub fn type_error(msg: &str) -> String {
     format!("TypeError: {msg}")
+}
+
+/// The CPython version pythonrs emulates byte-for-byte. `sys.version`/
+/// `sys.version_info` report this rather than pythonrs's own crate version.
+pub const PY_MAJOR: i64 = 3;
+pub const PY_MINOR: i64 = 14;
+pub const PY_MICRO: i64 = 6;
+
+/// CPython's `sys.platform` string for the host OS (`darwin`/`linux`/…), mapped
+/// from Rust's `std::env::consts::OS`.
+pub fn py_platform() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "darwin",
+        "windows" => "win32",
+        other => other,
+    }
 }
 
 // ── the fusevm run plumbing ──────────────────────────────────────────────────
@@ -4292,6 +4368,18 @@ impl PyHost {
                 if name == "value" && (class == "StopIteration" || class == "StopAsyncIteration") {
                     return Ok(args.first().cloned().unwrap_or(Value::Undef));
                 }
+                // `SystemExit.code` — the first arg, the whole tuple for 2+ args,
+                // or `None` when constructed with no arguments.
+                if name == "code" && class == "SystemExit" {
+                    return Ok(match args.len() {
+                        0 => Value::Undef,
+                        1 => args[0].clone(),
+                        _ => {
+                            let a = args.clone();
+                            self.new_tuple(a)
+                        }
+                    });
+                }
                 if name == "__cause__" {
                     return Ok(self.exc_link(recv).0);
                 }
@@ -5131,11 +5219,15 @@ pub fn run_user_func(
             nonlocals_decl: HashSet::new(),
             self_obj: self_val,
             owner,
+            name: def.name.clone(),
             line: 0,
         })
     });
     let r = run_chunk_on(def.chunk.clone());
     let sig = with_host(|h| {
+        if r.is_err() {
+            h.push_tb_frame();
+        }
         h.frames.pop();
         h.signal.take()
     });
@@ -5323,11 +5415,15 @@ pub fn build_class(
             nonlocals_decl: HashSet::new(),
             self_obj: None,
             owner: Some(name.to_string()),
+            name: name.to_string(),
             line: 0,
         })
     });
     let r = run_chunk_on(def.chunk.clone());
     with_host(|h| {
+        if r.is_err() {
+            h.push_tb_frame();
+        }
         h.frames.pop();
         h.signal.take();
     });
@@ -5531,6 +5627,104 @@ fn join_exc(class: &str, msg: &str) -> String {
     }
 }
 
+/// How an uncaught top-level exception ends the process.
+pub enum TopExit {
+    /// An uncaught `SystemExit`: exit with `code`, optionally after writing
+    /// `message` (a non-int/non-None argument) to stderr.
+    SystemExit { code: i32, message: Option<String> },
+    /// Any other uncaught exception: print `traceback` to stderr, exit 1.
+    Uncaught { traceback: String },
+}
+
+/// Classify the top-level error left on the host after a run. `err` is the run's
+/// terse error string (e.g. `"ValueError: boom"`) used as the traceback's final
+/// line. An uncaught `SystemExit` maps to CPython's exit-code rules; anything
+/// else formats a `Traceback (most recent call last):` block.
+pub fn classify_top_error(err: &str) -> TopExit {
+    with_host(|h| {
+        // Uncaught SystemExit (from `sys.exit` or `raise SystemExit`): CPython
+        // prints no traceback and derives the exit status from the code.
+        if let Some(Value::Obj(_)) = &h.exc {
+            let exc = h.exc.clone().unwrap();
+            if let Some(PyObj::Exception { class, args }) = h.get(&exc) {
+                if class == "SystemExit" {
+                    let args = args.clone();
+                    return system_exit_outcome(h, &args);
+                }
+            }
+        }
+        TopExit::Uncaught {
+            traceback: h.render_traceback(err),
+        }
+    })
+}
+
+/// Map a `SystemExit`'s args to an `(exit code, optional stderr message)`:
+/// no args / `None` → 0; an int/bool → that value (masked to 8 bits by the OS);
+/// a str or any other object → 1 with `str(arg)` on stderr.
+fn system_exit_outcome(h: &mut PyHost, args: &[Value]) -> TopExit {
+    let code = match args.len() {
+        0 => Value::Undef,
+        1 => args[0].clone(),
+        _ => h.new_tuple(args.to_vec()),
+    };
+    match &code {
+        Value::Undef => TopExit::SystemExit {
+            code: 0,
+            message: None,
+        },
+        Value::Bool(b) => TopExit::SystemExit {
+            code: *b as i32,
+            message: None,
+        },
+        Value::Int(n) => TopExit::SystemExit {
+            code: *n as i32,
+            message: None,
+        },
+        other => TopExit::SystemExit {
+            code: 1,
+            message: Some(format!("{}\n", h.str_of(other))),
+        },
+    }
+}
+
+impl PyHost {
+    /// Render a CPython `Traceback (most recent call last):` block for an uncaught
+    /// exception, ending with `err`. Frames run outermost (module) first; source
+    /// lines are shown unless the program came from stdin. Caret markers are
+    /// omitted (approximate for a first pass).
+    pub fn render_traceback(&self, err: &str) -> String {
+        let mut out = String::from("Traceback (most recent call last):\n");
+        // Outermost = the module frame still on the stack; then the function
+        // frames captured innermost-first as the exception unwound, reversed.
+        let mut frames: Vec<(String, u32)> = Vec::new();
+        if let Some(f) = self.frames.first() {
+            frames.push((f.name.clone(), f.line));
+        }
+        for f in self.traceback.iter().rev() {
+            frames.push(f.clone());
+        }
+        let src_lines: Vec<&str> = self.prog_source.lines().collect();
+        for (name, line) in &frames {
+            out.push_str(&format!(
+                "  File \"{}\", line {}, in {}\n",
+                self.tb_filename, line, name
+            ));
+            if self.tb_show_source && *line > 0 {
+                if let Some(text) = src_lines.get((*line as usize).saturating_sub(1)) {
+                    let stripped = text.trim();
+                    if !stripped.is_empty() {
+                        out.push_str(&format!("    {stripped}\n"));
+                    }
+                }
+            }
+        }
+        out.push_str(err);
+        out.push('\n');
+        out
+    }
+}
+
 // ── generators (stackful coroutines, same-thread via corosensei) ─────────────
 
 impl PyHost {
@@ -5554,7 +5748,8 @@ fn make_generator(chunk: Chunk, env: Env, self_val: Option<Value>, owner: Option
         globals_decl: HashSet::new(),
         nonlocals_decl: HashSet::new(),
         self_obj: self_val,
-        owner,
+        owner: owner.clone(),
+        name: owner.unwrap_or_else(|| "<genexpr>".to_string()),
         line: 0,
     };
     let id = with_host(|h| {
@@ -6025,19 +6220,76 @@ pub fn import_module(name: &str) -> Result<Value, String> {
             ]
         }),
         "sys" => with_host(|h| {
-            let argv = h.new_list(vec![]);
+            // `sys.argv` mirrors the process arguments installed by `init_runtime`.
+            let argv_strs = h.argv.clone();
+            let argv_items: Vec<Value> = argv_strs.into_iter().map(|s| h.new_str(s)).collect();
+            let argv = h.new_list(argv_items);
             // Standard streams are `File` handles over the fixed side-table slots.
             let stdout = h.alloc(PyObj::File { id: 0 });
             let stderr = h.alloc(PyObj::File { id: 1 });
             let stdin = h.alloc(PyObj::File { id: 2 });
+            // `sys.version_info` — a `(major, minor, micro, releaselevel, serial)`
+            // namedtuple matching the emulated CPython.
+            let vi_vals = vec![
+                Value::Int(PY_MAJOR),
+                Value::Int(PY_MINOR),
+                Value::Int(PY_MICRO),
+                h.new_str("final"),
+                Value::Int(0),
+            ];
+            let version_info = h.new_tuple(vi_vals);
+            if let Value::Obj(i) = version_info {
+                h.nt_meta.insert(
+                    i,
+                    NtMeta {
+                        type_name: "sys.version_info".to_string(),
+                        fields: ["major", "minor", "micro", "releaselevel", "serial"]
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect(),
+                    },
+                );
+            }
+            // `sys.path`: the script directory (or "" for `-c`/stdin) first, as a
+            // list — the shape scripts rely on, not CPython's full search path.
+            let path0 = match &h.main_file {
+                Some(f) => std::path::Path::new(f)
+                    .parent()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                None => String::new(),
+            };
+            let path0 = h.new_str(path0);
+            let path = h.new_list(vec![path0]);
+            let executable = h.new_str(
+                std::env::current_exe()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            );
+            let modules = h.new_dict(IndexMap::new());
+            let version = h.new_str(format!("{PY_MAJOR}.{PY_MINOR}.{PY_MICRO} (pythonrs)"));
+            let platform = h.new_str(py_platform());
             vec![
                 ("argv", argv),
                 ("maxsize", Value::Int(i64::MAX)),
-                ("version", h.new_str("3.12.0 (pythonrs)")),
-                ("platform", h.new_str("pythonrs")),
+                ("version", version),
+                ("version_info", version_info),
+                ("platform", platform),
+                ("path", path),
+                ("modules", modules),
+                ("executable", executable),
                 ("stdout", stdout),
                 ("stderr", stderr),
                 ("stdin", stdin),
+                ("exit", h.alloc(PyObj::Builtin("sys.exit".into()))),
+                (
+                    "getrecursionlimit",
+                    h.alloc(PyObj::Builtin("sys.getrecursionlimit".into())),
+                ),
+                (
+                    "setrecursionlimit",
+                    h.alloc(PyObj::Builtin("sys.setrecursionlimit".into())),
+                ),
             ]
         }),
         "collections" => with_host(|h| {
@@ -6161,6 +6413,14 @@ impl PyHost {
     }
 
     /// `f.write(s)` for text — returns the number of characters written.
+    /// The side-table id of a `File`/stream object, if `v` is one.
+    pub fn file_id(&self, v: &Value) -> Option<u32> {
+        match self.get(v) {
+            Some(PyObj::File { id }) => Some(*id),
+            _ => None,
+        }
+    }
+
     pub fn io_write(&mut self, id: u32, s: &str) -> Result<Value, String> {
         self.io_write_bytes(id, s.as_bytes())?;
         Ok(Value::Int(s.chars().count() as i64))
