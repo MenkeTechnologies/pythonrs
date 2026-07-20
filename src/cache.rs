@@ -54,7 +54,10 @@ use std::path::PathBuf;
 /// runs before the loop exit) instead of an in-chunk jump; `CProg` gained a
 /// `warnings` list (compile-time `SyntaxWarning`s). Older bytecode used the jump
 /// form (which panicked on that shape) and lacks the field, so it must miss.
-const SCHEMA: u64 = 17;
+/// v18: `match` singleton value patterns (None/True/False) lower to an identity
+/// check (`IS`) instead of `NumEq`, matching PEP 634 (`0` no longer matches
+/// `case False`). Older bytecode used `NumEq` and would mismatch, so it must miss.
+const SCHEMA: u64 = 18;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]

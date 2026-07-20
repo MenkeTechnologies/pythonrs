@@ -805,6 +805,254 @@ fn gen_classes(seed: u64) -> Vec<String> {
     out
 }
 
+/// `match`/`case` structural pattern matching (PEP 634): literal / capture /
+/// wildcard / dotted-value patterns, sequence (with `*rest`), mapping (with
+/// `**rest`), class patterns (positional via `__match_args__` and keyword),
+/// OR / AS patterns, guards, nesting, singleton identity (`None`/`True`/`False`
+/// matched by `is`, so `0` does NOT match `case False`), plus the compile-time
+/// rejections (duplicate capture / mapping key / class-keyword, OR alternatives
+/// binding different names) and runtime rejection (positional overflow). Every
+/// branch prints a deterministic scalar or captured value — never an object
+/// repr with an address — so output is byte-stable across both interpreters.
+fn gen_match(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let mut out: Vec<String> = Vec::new();
+    match r.below(18) {
+        0 => {
+            // Literal patterns + OR of literals + irrefutable capture tail.
+            let s = pick(r, &["0", "1", "2", "3", "-1", "7", "99"]);
+            out.push(format!("match {s}:"));
+            out.push("    case 0:".into());
+            out.push("        print('zero')".into());
+            out.push("    case 1 | 2 | 3:".into());
+            out.push("        print('small')".into());
+            out.push("    case -1:".into());
+            out.push("        print('neg')".into());
+            out.push("    case x:".into());
+            out.push("        print('other', x)".into());
+        }
+        1 => {
+            // Singleton identity: None/True/False by `is`, ints by `==`.
+            let s = pick(r, &["0", "1", "None", "True", "False", "2", "3"]);
+            out.push(format!("match {s}:"));
+            out.push("    case None:".into());
+            out.push("        print('none')".into());
+            out.push("    case True:".into());
+            out.push("        print('true')".into());
+            out.push("    case False:".into());
+            out.push("        print('false')".into());
+            out.push("    case 0:".into());
+            out.push("        print('int0')".into());
+            out.push("    case 1:".into());
+            out.push("        print('int1')".into());
+            out.push("    case _:".into());
+            out.push("        print('other')".into());
+        }
+        2 => {
+            // Sequence patterns with a star.
+            let n = r.below(5);
+            let items: Vec<String> = (0..n).map(|i| ((i * 3 + 1) % 10).to_string()).collect();
+            out.push(format!("match [{}]:", items.join(", ")));
+            out.push("    case []:".into());
+            out.push("        print('empty')".into());
+            out.push("    case [a]:".into());
+            out.push("        print('one', a)".into());
+            out.push("    case [a, b]:".into());
+            out.push("        print('two', a, b)".into());
+            out.push("    case [a, *rest]:".into());
+            out.push("        print('many', a, rest)".into());
+        }
+        3 => {
+            // Tuple / parenthesized sequence patterns.
+            let a = pick(r, SMALLINTS);
+            let b = pick(r, SMALLINTS);
+            out.push(format!("match ({a}, {b}):"));
+            out.push("    case (0, 0):".into());
+            out.push("        print('origin')".into());
+            out.push("    case (0, y):".into());
+            out.push("        print('yaxis', y)".into());
+            out.push("    case (x, 0):".into());
+            out.push("        print('xaxis', x)".into());
+            out.push("    case (x, y):".into());
+            out.push("        print('pt', x, y)".into());
+        }
+        4 => {
+            // Mapping pattern with `**rest`.
+            let a = pick(r, SMALLINTS);
+            let b = pick(r, SMALLINTS);
+            out.push(format!("match {{'x': {a}, 'y': {b}}}:"));
+            out.push("    case {'x': 0}:".into());
+            out.push("        print('x0')".into());
+            out.push("    case {'x': xv, **rest}:".into());
+            out.push("        print('x', xv, rest)".into());
+            out.push("    case _:".into());
+            out.push("        print('none')".into());
+        }
+        5 => {
+            // Class pattern, positional via __match_args__.
+            let a = pick(r, SMALLINTS);
+            let b = pick(r, SMALLINTS);
+            out.push("class Point:".into());
+            out.push("    __match_args__ = ('x', 'y')".into());
+            out.push("    def __init__(self, x, y):".into());
+            out.push("        self.x = x".into());
+            out.push("        self.y = y".into());
+            out.push(format!("match Point({a}, {b}):"));
+            out.push("    case Point(0, 0):".into());
+            out.push("        print('origin')".into());
+            out.push("    case Point(x, 0):".into());
+            out.push("        print('xaxis', x)".into());
+            out.push("    case Point(0, y):".into());
+            out.push("        print('yaxis', y)".into());
+            out.push("    case Point(x, y):".into());
+            out.push("        print('pt', x, y)".into());
+        }
+        6 => {
+            // Class pattern, keyword sub-patterns + guard.
+            let a = pick(r, SMALLINTS);
+            let b = pick(r, SMALLINTS);
+            out.push("class P:".into());
+            out.push("    __match_args__ = ('x', 'y')".into());
+            out.push("    def __init__(self, x, y):".into());
+            out.push("        self.x = x".into());
+            out.push("        self.y = y".into());
+            out.push(format!("match P({a}, {b}):"));
+            out.push("    case P(x=0, y=yv):".into());
+            out.push("        print('x0', yv)".into());
+            out.push("    case P(x=xv, y=yv) if xv > yv:".into());
+            out.push("        print('gt', xv, yv)".into());
+            out.push("    case P(x=xv, y=yv):".into());
+            out.push("        print('pt', xv, yv)".into());
+        }
+        7 => {
+            // OR patterns (same-name / no-name alternatives) + AS.
+            let s = pick(r, &["1", "4", "7", "0", "5", "9", "2"]);
+            out.push(format!("match {s}:"));
+            out.push("    case 1 | 2 | 3:".into());
+            out.push("        print('low')".into());
+            out.push("    case 4 | 5 | 6:".into());
+            out.push("        print('mid')".into());
+            out.push("    case (7 | 8 | 9) as n:".into());
+            out.push("        print('high', n)".into());
+            out.push("    case _:".into());
+            out.push("        print('other')".into());
+        }
+        8 => {
+            // AS pattern + guard referencing captures.
+            let a = pick(r, SMALLINTS);
+            let b = pick(r, SMALLINTS);
+            out.push(format!("match [{a}, {b}]:"));
+            out.push("    case [x, y] if x == y:".into());
+            out.push("        print('eq', x)".into());
+            out.push("    case [x, y] as pair:".into());
+            out.push("        print('pair', x, y, len(pair))".into());
+        }
+        9 => {
+            // Nested sequence patterns with captures at depth.
+            let a = pick(r, SMALLINTS);
+            let b = pick(r, SMALLINTS);
+            let c = pick(r, SMALLINTS);
+            out.push(format!("match [{a}, [{b}, {c}]]:"));
+            out.push("    case [0, [y, z]]:".into());
+            out.push("        print('zero', y, z)".into());
+            out.push("    case [x, [0, z]]:".into());
+            out.push("        print('midzero', x, z)".into());
+            out.push("    case [x, [y, z]]:".into());
+            out.push("        print('nested', x, y, z)".into());
+        }
+        10 => {
+            // Dotted value patterns (enum-like class attributes).
+            let v = pick(r, &["0", "1", "2", "3"]);
+            out.push("class Color:".into());
+            out.push("    RED = 0".into());
+            out.push("    GREEN = 1".into());
+            out.push("    BLUE = 2".into());
+            out.push(format!("match {v}:"));
+            out.push("    case Color.RED:".into());
+            out.push("        print('red')".into());
+            out.push("    case Color.GREEN:".into());
+            out.push("        print('green')".into());
+            out.push("    case Color.BLUE:".into());
+            out.push("        print('blue')".into());
+            out.push("    case _:".into());
+            out.push("        print('unknown')".into());
+        }
+        11 => {
+            // Mapping-of-sequence nesting.
+            let a = pick(r, SMALLINTS);
+            let b = pick(r, SMALLINTS);
+            out.push(format!("match {{'items': [{a}, {b}]}}:"));
+            out.push("    case {'items': [0, y]}:".into());
+            out.push("        print('head0', y)".into());
+            out.push("    case {'items': [x, y]}:".into());
+            out.push("        print('two', x, y)".into());
+            out.push("    case _:".into());
+            out.push("        print('no')".into());
+        }
+        12 => {
+            // Builtin class patterns (int/str self-match) across subject types.
+            let subj = if r.below(2) == 0 {
+                pick(r, SMALLINTS).to_string()
+            } else {
+                "'hi'".to_string()
+            };
+            out.push(format!("match {subj}:"));
+            out.push("    case int(v) if v > 0:".into());
+            out.push("        print('pos', v)".into());
+            out.push("    case int(v):".into());
+            out.push("        print('int', v)".into());
+            out.push("    case str(s):".into());
+            out.push("        print('str', s)".into());
+            out.push("    case _:".into());
+            out.push("        print('other')".into());
+        }
+        13 => {
+            // Runtime rejection: positional overflow -> TypeError (both reject).
+            out.push("class P:".into());
+            out.push("    __match_args__ = ('x',)".into());
+            out.push("    def __init__(self):".into());
+            out.push("        self.x = 1".into());
+            out.push("match P():".into());
+            out.push("    case P(a, b):".into());
+            out.push("        print(a, b)".into());
+        }
+        14 => {
+            // Compile-time rejection: duplicate capture -> SyntaxError.
+            let a = pick(r, SMALLINTS);
+            let b = pick(r, SMALLINTS);
+            out.push(format!("match [{a}, {b}]:"));
+            out.push("    case [x, x]:".into());
+            out.push("        print(x)".into());
+        }
+        15 => {
+            // Compile-time rejection: duplicate mapping key -> SyntaxError.
+            let a = pick(r, SMALLINTS);
+            out.push(format!("match {{'a': {a}}}:"));
+            out.push("    case {'a': x, 'a': y}:".into());
+            out.push("        print(x, y)".into());
+        }
+        16 => {
+            // Compile-time rejection: repeated class-keyword -> SyntaxError.
+            out.push("class P:".into());
+            out.push("    def __init__(self):".into());
+            out.push("        self.x = 1".into());
+            out.push("match P():".into());
+            out.push("    case P(x=a, x=b):".into());
+            out.push("        print(a, b)".into());
+        }
+        _ => {
+            // Compile-time rejection: OR alternatives bind different names.
+            let s = pick(r, SMALLINTS);
+            out.push(format!("match {s}:"));
+            out.push("    case [x] | y:".into());
+            out.push("        print('bad')".into());
+            out.push("    case _:".into());
+            out.push("        print('ok')".into());
+        }
+    }
+    out
+}
+
 /// async/await/asyncio: coroutine result, `gather` ordering, `create_task`
 /// interleaving, `Future` set_result, `async for`/`async with`, async
 /// comprehensions — all driven by `asyncio.run` on the native event loop.
@@ -2406,6 +2654,7 @@ enum Mode {
     Augwith,
     Descriptors,
     Calls,
+    Match,
 }
 
 const REAL_MODES: &[Mode] = &[
@@ -2450,6 +2699,7 @@ const REAL_MODES: &[Mode] = &[
     Mode::Augwith,
     Mode::Descriptors,
     Mode::Calls,
+    Mode::Match,
 ];
 
 /// Generate the statement list for a seed in the selected mode. `Mixed` rotates
@@ -2501,6 +2751,7 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Augwith => gen_augwith(seed),
         Mode::Descriptors => gen_descriptors(seed),
         Mode::Calls => gen_calls(seed),
+        Mode::Match => gen_match(seed),
     }
 }
 
@@ -2548,6 +2799,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Augwith => "augwith",
         Mode::Descriptors => "descriptors",
         Mode::Calls => "calls",
+        Mode::Match => "match",
     }
 }
 
@@ -2595,6 +2847,7 @@ fn mode_from_name(s: &str) -> Option<Mode> {
         Mode::Augwith,
         Mode::Descriptors,
         Mode::Calls,
+        Mode::Match,
     ];
     ALL.iter().copied().find(|&m| mode_name(m) == s)
 }
