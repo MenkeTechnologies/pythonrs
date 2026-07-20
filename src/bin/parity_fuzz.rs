@@ -1656,6 +1656,184 @@ fn gen_closures(seed: u64) -> Vec<String> {
     }
 }
 
+/// Function parameters & calling conventions: `*args`/`**kwargs` collection,
+/// positional-only (`/`) and keyword-only (`*`) params, defaults (incl. the
+/// shared-mutable-default gotcha), call-site unpacking (`f(*it)`, `f(**map)`,
+/// multiple `f(*a, *b, **c, **d)`), keywords passed positionally and vice-versa,
+/// lambdas with the same features, and the full family of argument-binding
+/// `TypeError`s (missing / too-many / multiple-values / unexpected keyword /
+/// positional-only-as-keyword / duplicate `**` key). Error cases use only
+/// top-level `def f`/`lambda` so the callable name matches CPython's under
+/// `--stderr`. Every stdout case prints deterministic values (kwargs sorted).
+fn gen_calls(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let a = pick(r, POSINTS);
+    let b = pick(r, POSINTS);
+    let c = pick(r, POSINTS);
+    let d = pick(r, POSINTS);
+    match r.below(24) {
+        // ---- stdout cases: successful binding, deterministic values ----------
+        // Full mixed signature: posonly / pos-or-kw / *args / kwonly / **kwargs.
+        0 => vec![
+            "def f(p, q, /, r, *args, k, m=9, **kw):".into(),
+            "    return (p, q, r, args, k, m, sorted(kw.items()))".into(),
+            format!("print(f({a}, {b}, {c}, 100, 200, k={d}, x=1, y=2))"),
+        ],
+        // `*args`/`**kwargs` collection with a mix of positional & keyword.
+        1 => vec![
+            "def f(*args, **kw): return (args, sorted(kw.items()))".into(),
+            format!("print(f({a}, {b}, {c}, u={d}, v=1, w=2))"),
+        ],
+        // Keyword-only after a named `*args`; defaults on some.
+        2 => vec![
+            "def f(a, b=2, *rest, c, d=4, **kw):".into(),
+            "    return (a, b, rest, c, d, sorted(kw.items()))".into(),
+            format!("print(f({a}, {b}, 7, 8, c={c}, z=9))"),
+        ],
+        // Positional-only params before `/`, then pos-or-kw.
+        3 => vec![
+            "def f(x, y, /, z): return (x, y, z)".into(),
+            format!("print(f({a}, {b}, z={c}))"),
+        ],
+        // Call-site `*iterable` unpacking (list, tuple, range).
+        4 => vec![
+            "def f(a, b, c, d): return (a, b, c, d)".into(),
+            format!("print(f(*[{a}, {b}], *({c},), {d}))"),
+        ],
+        // Call-site `**mapping` unpacking + explicit keyword.
+        5 => vec![
+            "def f(a, b, c): return (a, b, c)".into(),
+            format!("print(f({a}, **{{'b': {b}, 'c': {c}}}))"),
+        ],
+        // Multiple unpackings: f(*a, *b, **c, **d) with disjoint keys.
+        6 => vec![
+            "def f(*args, **kw): return (args, sorted(kw.items()))".into(),
+            format!("print(f(*[{a}], *[{b}, {c}], **{{'p': 1}}, **{{'q': 2}}))"),
+        ],
+        // Shared-mutable-default gotcha: list accumulates across calls.
+        7 => vec![
+            "def f(v, acc=[]):".into(),
+            "    acc.append(v)".into(),
+            "    return list(acc)".into(),
+            format!("print(f({a}))"),
+            format!("print(f({b}))"),
+            format!("print(f({c}))"),
+        ],
+        // Default value referencing a module global (bound at def time).
+        8 => vec![
+            format!("BASE = {a}"),
+            "def f(x, step=10): return x + step".into(),
+            format!("print(f(BASE), f(BASE, {b}))"),
+        ],
+        // Keyword args passed in a different order than declared.
+        9 => vec![
+            "def f(a, b, c): return (a, b, c)".into(),
+            format!("print(f(c={c}, a={a}, b={b}))"),
+        ],
+        // A positional-or-keyword param passed positionally then by keyword mix.
+        10 => vec![
+            "def f(a, b, c, d): return (a, b, c, d)".into(),
+            format!("print(f({a}, {b}, d={d}, c={c}))"),
+        ],
+        // Lambda with the full param feature set.
+        11 => vec![
+            "f = lambda a, b=3, *c, d, **e: (a, b, c, d, sorted(e.items()))".into(),
+            format!("print(f({a}, {b}, 9, d={d}, z=5))"),
+        ],
+        // Nested calls: forward *args/**kwargs through a wrapper.
+        12 => vec![
+            "def inner(a, b, c): return a * 100 + b * 10 + c".into(),
+            "def outer(*args, **kw): return inner(*args, **kw)".into(),
+            format!("print(outer({a}, {b}, c={c}))"),
+        ],
+        // Bare `*` keyword-only marker with defaults.
+        13 => vec![
+            "def f(a, *, b, c=7): return (a, b, c)".into(),
+            format!("print(f({a}, b={b}))"),
+        ],
+        // `**kwargs` absorbing a name that shadows a positional-only param.
+        14 => vec![
+            "def f(a, /, **kw): return (a, sorted(kw.items()))".into(),
+            format!("print(f({a}, a={b}, z={c}))"),
+        ],
+        // *args tuple is empty when no extra positionals are given.
+        15 => vec![
+            "def f(a, *args): return (a, args)".into(),
+            format!("print(f({a}))"),
+        ],
+        // ---- error cases: argument-binding TypeErrors (top-level f / lambda) --
+        // Missing required positional argument(s).
+        16 => {
+            let params = ["a, b", "a, b, c", "a, b, c, d"][r.below(3) as usize];
+            let given = match r.below(2) {
+                0 => String::new(),
+                _ => a.to_string(),
+            };
+            vec![
+                format!("def f({params}): return 0"),
+                format!("print(f({given}))"),
+            ]
+        }
+        // Too many positional arguments (with / without defaults, via unpacking).
+        17 => match r.below(3) {
+            0 => vec![
+                "def f(a, b): return 0".into(),
+                format!("print(f({a}, {b}, {c}))"),
+            ],
+            1 => vec![
+                "def f(a, b=2): return 0".into(),
+                format!("print(f({a}, {b}, {c}, {d}))"),
+            ],
+            _ => vec![
+                "def f(a): return 0".into(),
+                format!("print(f(*[{a}, {b}]))"),
+            ],
+        },
+        // Multiple values for the same argument (positional + keyword).
+        18 => vec![
+            "def f(a, b): return 0".into(),
+            format!("print(f({a}, a={b}))"),
+        ],
+        // Unexpected keyword argument.
+        19 => vec![
+            "def f(a, b): return 0".into(),
+            format!("print(f({a}, {b}, zz={c}))"),
+        ],
+        // Positional-only argument passed as a keyword (no **kwargs to absorb).
+        20 => vec![
+            "def f(a, b, /): return 0".into(),
+            format!("print(f({a}, b={b}))"),
+        ],
+        // Missing required keyword-only argument(s).
+        21 => match r.below(2) {
+            0 => vec![
+                "def f(a, *, k): return 0".into(),
+                format!("print(f({a}))"),
+            ],
+            _ => vec![
+                "def f(*, k, m): return 0".into(),
+                "print(f())".into(),
+            ],
+        },
+        // Duplicate keyword via `**` merge / keyword + `**` (multiple values).
+        22 => match r.below(2) {
+            0 => vec![
+                "def f(a, b): return 0".into(),
+                format!("print(f(**{{'a': {a}}}, **{{'a': {b}, 'b': {c}}}))"),
+            ],
+            _ => vec![
+                "def f(a): return 0".into(),
+                format!("print(f(a={a}, **{{'a': {b}}}))"),
+            ],
+        },
+        // Bare `*` marker must reject extra positionals (regression guard).
+        _ => vec![
+            "def f(a, *, k=1): return 0".into(),
+            format!("print(f({a}, {b}, {c}))"),
+        ],
+    }
+}
+
 /// OOP internals: multiple-inheritance MRO + attribute order, `super()` in a
 /// property, `__init_subclass__` with class kwargs, and classmethod alternate
 /// constructors. Deterministic scalar/name output.
@@ -2072,6 +2250,7 @@ enum Mode {
     Async2,
     Augwith,
     Descriptors,
+    Calls,
 }
 
 const REAL_MODES: &[Mode] = &[
@@ -2114,6 +2293,7 @@ const REAL_MODES: &[Mode] = &[
     Mode::Async2,
     Mode::Augwith,
     Mode::Descriptors,
+    Mode::Calls,
 ];
 
 /// Generate the statement list for a seed in the selected mode. `Mixed` rotates
@@ -2163,6 +2343,7 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Async2 => gen_async2(seed),
         Mode::Augwith => gen_augwith(seed),
         Mode::Descriptors => gen_descriptors(seed),
+        Mode::Calls => gen_calls(seed),
     }
 }
 
@@ -2208,6 +2389,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Async2 => "async2",
         Mode::Augwith => "augwith",
         Mode::Descriptors => "descriptors",
+        Mode::Calls => "calls",
     }
 }
 
@@ -2253,6 +2435,7 @@ fn mode_from_name(s: &str) -> Option<Mode> {
         Mode::Async2,
         Mode::Augwith,
         Mode::Descriptors,
+        Mode::Calls,
     ];
     ALL.iter().copied().find(|&m| mode_name(m) == s)
 }

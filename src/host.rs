@@ -615,6 +615,12 @@ pub struct PyHost {
     /// The in-flight exception object, if any.
     pub exc: Option<Value>,
     pub signal: Option<Signal>,
+    /// A duplicate keyword key detected while merging a call's `**mapping`
+    /// spreads (set by `BUILD_KWARGS`, consumed by the `CALL_*_EX` handlers so
+    /// the raised `TypeError` can name the callable). `f(**a, **b)` with a shared
+    /// key, or `f(k=v, **{'k': ...})`, is an error in CPython even though a plain
+    /// `{**a, **b}` dict display silently keeps the last value.
+    pub pending_kw_dup: Option<String>,
     /// Suspended generator coroutines, indexed by `PyObj::Generator.id`.
     generators: Vec<GenCell>,
     /// Live file / standard-stream objects, indexed by `PyObj::File.id`. Slots
@@ -817,6 +823,7 @@ impl PyHost {
             error: None,
             exc: None,
             signal: None,
+            pending_kw_dup: None,
             generators: Vec::new(),
             io_handles: vec![IoCell::Stdout, IoCell::Stderr, IoCell::Stdin],
             dict_meta: HashMap::new(),
@@ -1117,6 +1124,20 @@ impl PyHost {
         self.globals.get(name).cloned()
     }
 
+    /// CPython's callable display for the `**`-merge duplicate-keyword error:
+    /// a user function/lambda/class is module-qualified (`__main__.f`), while an
+    /// unresolved name (i.e. a builtin like `dict`) stays bare.
+    pub fn call_display_name(&self, name: &str) -> String {
+        match self.read_name(name).and_then(|v| self.get(&v).cloned()) {
+            Some(PyObj::Func(fv)) => {
+                let q = self.funcs.get(fv.def_id).map_or(name, |d| d.name.as_str());
+                format!("__main__.{q}")
+            }
+            Some(PyObj::Class(_)) => format!("__main__.{name}"),
+            _ => name.to_string(),
+        }
+    }
+
     /// Assign to `name` following Python scope rules: a `global`-declared name
     /// (or module scope) writes to globals; otherwise the current local env.
     pub fn set_name(&mut self, name: &str, val: Value) {
@@ -1223,6 +1244,19 @@ pub fn name_error(name: &str) -> String {
 }
 pub fn type_error(msg: &str) -> String {
     format!("TypeError: {msg}")
+}
+
+/// Callable display for the `**`-merge duplicate-keyword error when the callee
+/// is an already-evaluated value (the `CALL_VALUE_EX` path): a user function is
+/// module-qualified like CPython, anything else falls back to `<callable>`.
+pub fn callable_display_name(callable: &Value) -> String {
+    with_host(|h| match h.get(callable) {
+        Some(PyObj::Func(fv)) => {
+            let q = h.funcs.get(fv.def_id).map_or("<callable>", |d| d.name.as_str());
+            format!("__main__.{q}")
+        }
+        _ => "<callable>".to_string(),
+    })
 }
 
 /// The CPython version pythonrs emulates byte-for-byte. `sys.version`/
@@ -5758,7 +5792,27 @@ pub fn run_user_func(
     }
 }
 
+/// Join argument names the way CPython's `format_missing`/`too_many_positional`
+/// helpers do: `'a'`, `'a' and 'b'`, `'a', 'b', and 'c'` (Oxford comma at 3+).
+fn join_names(names: &[String]) -> String {
+    match names.len() {
+        0 => String::new(),
+        1 => format!("'{}'", names[0]),
+        2 => format!("'{}' and '{}'", names[0], names[1]),
+        n => {
+            let head: Vec<String> = names[..n - 1].iter().map(|s| format!("'{s}'")).collect();
+            format!("{}, and '{}'", head.join(", "), names[n - 1])
+        }
+    }
+}
+
 /// Bind positional + keyword arguments into a fresh call environment.
+///
+/// The check order mirrors CPython's argument binder (Python/ceval.c
+/// `initialize_locals`) so error messages surface in the same precedence:
+/// keyword collisions (multiple-values) and invalid keywords fire before a
+/// too-many-positional error, which in turn fires before missing-argument
+/// errors. Deviating from this order changes which `TypeError` a caller sees.
 fn bind_params(
     env: &Env,
     def: &FuncDef,
@@ -5769,87 +5823,120 @@ fn bind_params(
 ) -> Result<(), String> {
     let np = def.params.len();
     let ndef = def.ndefaults;
+    let posonly = def.posonly.min(np);
+    // A named `*args` (`Some(non-empty)`) soaks up extra positionals; a bare `*`
+    // (`Some("")`, keyword-only marker) does not — extras are an error there.
+    let has_vararg = def.star.as_deref().is_some_and(|s| !s.is_empty());
     let mut vars: IndexMap<String, Value> = IndexMap::new();
     let mut star_items = Vec::new();
     let npos = pos.len();
+
+    // 1. Place positional args into their slots; keep the overflow aside.
     for (i, val) in pos.into_iter().enumerate() {
         if i < np {
             vars.insert(def.params[i].clone(), val);
-        } else if def.star.is_some() {
-            star_items.push(val);
         } else {
-            return Err(type_error(&format!(
-                "{}() takes {} positional argument(s) but {} were given",
-                def.name, np, npos
-            )));
+            star_items.push(val);
         }
     }
-    let mut kwmap: IndexMap<String, Value> = IndexMap::new();
+
+    // 2. Bind keyword args in call order. A keyword naming an already-filled
+    //    positional slot is `multiple values`; positional-only names and unknown
+    //    names defer to the leftover bucket (posonly/unexpected/`**kwargs`).
+    let kwonly_given = kwargs.iter().filter(|(k, _)| def.kwonly.contains(k)).count();
+    let mut leftover: Vec<(String, Value)> = Vec::new();
     for (k, v) in kwargs {
-        kwmap.insert(k, v);
+        if let Some(idx) = def.params.iter().position(|p| p == &k) {
+            if idx < posonly {
+                leftover.push((k, v));
+            } else if vars.contains_key(&k) {
+                return Err(type_error(&format!(
+                    "{}() got multiple values for argument '{}'",
+                    def.name, k
+                )));
+            } else {
+                vars.insert(k, v);
+            }
+        } else if def.kwonly.contains(&k) {
+            vars.insert(k, v);
+        } else {
+            leftover.push((k, v));
+        }
     }
-    // A keyword naming a positional-only param is an error unless a `**kwargs`
-    // absorbs it — CPython reports all such names in one message.
-    if def.kwargs.is_none() {
-        let bad: Vec<String> = def.params[..def.posonly.min(np)]
+
+    // 3. Reject invalid leftovers unless a `**kwargs` absorbs them. CPython
+    //    reports positional-only-as-keyword before a plain unexpected keyword.
+    if def.kwargs.is_none() && !leftover.is_empty() {
+        let bad_posonly: Vec<String> = def.params[..posonly]
             .iter()
-            .filter(|p| kwmap.contains_key(*p))
+            .filter(|p| leftover.iter().any(|(k, _)| k == *p))
             .cloned()
             .collect();
-        if !bad.is_empty() {
-            // CPython quotes the whole comma-joined list once: `'a, b'`.
+        if !bad_posonly.is_empty() {
             return Err(type_error(&format!(
                 "{}() got some positional-only arguments passed as keyword arguments: '{}'",
                 def.name,
-                bad.join(", ")
+                bad_posonly.join(", ")
             )));
         }
+        return Err(type_error(&format!(
+            "{}() got an unexpected keyword argument '{}'",
+            def.name, leftover[0].0
+        )));
     }
+
+    // 4. Too many positionals (no `*args` to catch them).
+    if npos > np && !has_vararg {
+        return Err(type_error(&format!(
+            "{}() {}",
+            def.name,
+            too_many_positional(np, ndef, npos, kwonly_given)
+        )));
+    }
+
+    // 5. Fill defaults for unbound positional slots; collect the still-missing.
+    let mut missing: Vec<String> = Vec::new();
     for i in 0..np {
         if !vars.contains_key(&def.params[i]) {
-            // A positional-only param (index < posonly) is never bound by a
-            // keyword — a same-named keyword falls through to `**kwargs` or errors.
-            let by_kw = if i < def.posonly {
-                None
+            if i >= np - ndef {
+                vars.insert(def.params[i].clone(), defaults[i - (np - ndef)].clone());
             } else {
-                kwmap.shift_remove(&def.params[i])
-            };
-            if let Some(v) = by_kw {
-                vars.insert(def.params[i].clone(), v);
-            } else if i >= np - ndef {
-                let d = defaults[i - (np - ndef)].clone();
-                vars.insert(def.params[i].clone(), d);
-            } else {
-                return Err(type_error(&format!(
-                    "{}() missing required positional argument: '{}'",
-                    def.name, def.params[i]
-                )));
+                missing.push(def.params[i].clone());
             }
         }
     }
-    if let Some(star) = &def.star {
-        if !star.is_empty() {
-            let t = with_host(|h| h.new_tuple(star_items));
-            vars.insert(star.clone(), t);
-        }
+    if !missing.is_empty() {
+        let plural = if missing.len() == 1 { "" } else { "s" };
+        return Err(type_error(&format!(
+            "{}() missing {} required positional argument{}: {}",
+            def.name,
+            missing.len(),
+            plural,
+            join_names(&missing)
+        )));
     }
-    // `kwonly_defaults` holds only the defaulted kwonly params, in kwonly order;
-    // walk it with a separate cursor as we pass each optional param.
+
+    // 6. Bind the `*args` tuple (bare `*` has no name to bind).
+    if has_vararg {
+        let name = def.star.clone().unwrap_or_default();
+        let t = with_host(|h| h.new_tuple(star_items));
+        vars.insert(name, t);
+    }
+
+    // 7. Fill keyword-only defaults; collect the still-missing required ones.
+    //    `kwonly_defaults` holds only the defaulted kwonly params, in kwonly
+    //    order; walk it with a separate cursor as we pass each optional param.
     let mut kwdef_cursor = 0usize;
+    let mut missing_kw: Vec<String> = Vec::new();
     for (j, name) in def.kwonly.iter().enumerate() {
         let required = def.kwonly_required.get(j).copied().unwrap_or(true);
-        if let Some(v) = kwmap.shift_remove(name) {
-            vars.insert(name.clone(), v);
+        if vars.contains_key(name) {
             if !required {
                 kwdef_cursor += 1;
             }
         } else if required {
-            return Err(type_error(&format!(
-                "{}() missing required keyword-only argument: '{}'",
-                def.name, name
-            )));
+            missing_kw.push(name.clone());
         } else {
-            // Apply the def-time default for this optional keyword-only param.
             let d = kwonly_defaults
                 .get(kwdef_cursor)
                 .cloned()
@@ -5858,22 +5945,56 @@ fn bind_params(
             kwdef_cursor += 1;
         }
     }
+    if !missing_kw.is_empty() {
+        let plural = if missing_kw.len() == 1 { "" } else { "s" };
+        return Err(type_error(&format!(
+            "{}() missing {} required keyword-only argument{}: {}",
+            def.name,
+            missing_kw.len(),
+            plural,
+            join_names(&missing_kw)
+        )));
+    }
+
+    // 8. Route leftover keywords into `**kwargs` (order preserved).
     if let Some(kw) = &def.kwargs {
         let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
-        for (k, v) in kwmap {
+        for (k, v) in leftover {
             let kv = with_host(|h| h.new_str(k.clone()));
             d.insert(PKey::Str(k), (kv, v));
         }
         let dict = with_host(|h| h.new_dict(d));
         vars.insert(kw.clone(), dict);
-    } else if let Some((k, _)) = kwmap.iter().next() {
-        return Err(type_error(&format!(
-            "{}() got an unexpected keyword argument '{}'",
-            def.name, k
-        )));
     }
+
     env.borrow_mut().vars = vars;
     Ok(())
+}
+
+/// CPython's `too_many_positional` message tail (everything after `name()`):
+/// `takes <n> positional arguments but <m> were given`, with the `from X to Y`
+/// range form when the callable has positional defaults, and the extra
+/// `(and K keyword-only arguments)` clause when keyword-only args were supplied.
+fn too_many_positional(np: usize, ndef: usize, posgiven: usize, kwonly_given: usize) -> String {
+    let takes = if ndef > 0 {
+        format!("from {} to {} positional arguments", np - ndef, np)
+    } else if np == 1 {
+        "1 positional argument".to_string()
+    } else {
+        format!("{np} positional arguments")
+    };
+    let given = if kwonly_given > 0 {
+        let ps = if posgiven == 1 { "" } else { "s" };
+        let ks = if kwonly_given == 1 { "" } else { "s" };
+        format!(
+            "{posgiven} positional argument{ps} (and {kwonly_given} keyword-only argument{ks}) were given"
+        )
+    } else if posgiven == 1 {
+        "1 was given".to_string()
+    } else {
+        format!("{posgiven} were given")
+    };
+    format!("takes {takes} but {given}")
 }
 
 // ── more host operations referenced from builtins ────────────────────────────

@@ -613,6 +613,9 @@ fn b_call_ex(vm: &mut VM, _: u8) -> Value {
     let kwd = vm.pop();
     let argl = vm.pop();
     let name = sval(&vm.pop());
+    if let Some(a) = check_kw_dup(vm, &with_host(|h| h.call_display_name(&name))) {
+        return a;
+    }
     let r = host::call_named(&name, list_args(&argl), kw_pairs(&kwd));
     finish(vm, r)
 }
@@ -621,6 +624,9 @@ fn b_call_value_ex(vm: &mut VM, _: u8) -> Value {
     let kwd = vm.pop();
     let argl = vm.pop();
     let callable = vm.pop();
+    if let Some(a) = check_kw_dup(vm, &host::callable_display_name(&callable)) {
+        return a;
+    }
     let r = host::invoke(&callable, list_args(&argl), kw_pairs(&kwd));
     finish(vm, r)
 }
@@ -630,6 +636,9 @@ fn b_call_method_ex(vm: &mut VM, _: u8) -> Value {
     let argl = vm.pop();
     let name = sval(&vm.pop());
     let recv = vm.pop();
+    if let Some(a) = check_kw_dup(vm, &name) {
+        return a;
+    }
     let r = host::call_method(&recv, &name, list_args(&argl), kw_pairs(&kwd));
     finish(vm, r)
 }
@@ -656,9 +665,23 @@ fn b_build_args(vm: &mut VM, argc: u8) -> Value {
 }
 
 /// Build a kwargs `dict`: pairs `(key, value)`, a `None`(Undef) key = `**` spread.
+///
+/// Unlike a `{**a, **b}` dict display, a call's keyword merge rejects a repeated
+/// key (`f(**a, **b)` / `f(k=v, **{'k': ...})`). We can't name the callable yet,
+/// so the first collision is stashed in `pending_kw_dup` for the following
+/// `CALL_*_EX` handler to raise with the correct `<callable>() got multiple
+/// values for keyword argument '<k>'` message.
 fn b_build_kwargs(vm: &mut VM, argc: u8) -> Value {
     let flat = pop_n(vm, argc as usize);
     let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+    let mut dup: Option<String> = None;
+    let mut note_dup = |k: &PKey, seen: &IndexMap<PKey, (Value, Value)>| {
+        if dup.is_none() && seen.contains_key(k) {
+            if let PKey::Str(s) = k {
+                dup = Some(s.clone());
+            }
+        }
+    };
     let mut i = 0;
     while i + 1 < flat.len() {
         let key = flat[i].clone();
@@ -673,16 +696,38 @@ fn b_build_kwargs(vm: &mut VM, argc: u8) -> Value {
                 _ => Vec::new(),
             });
             for (k, kv, v) in pairs {
+                note_dup(&k, &d);
                 host::dict_put(&mut d, k, kv, v);
             }
         } else {
             let kstr = sval(&key);
             let kv = with_host(|h| h.new_str(kstr.clone()));
-            d.insert(PKey::Str(kstr), (kv, val));
+            let pk = PKey::Str(kstr);
+            note_dup(&pk, &d);
+            d.insert(pk, (kv, val));
         }
         i += 2;
     }
+    if let Some(k) = dup {
+        with_host(|h| h.pending_kw_dup = Some(k));
+    }
     with_host(|h| h.new_dict(d))
+}
+
+/// If the just-built kwargs carried a duplicate key, abort with CPython's
+/// `<callable>() got multiple values for keyword argument '<k>'`. `disp` is the
+/// already-formatted callable name (`__main__.f`, `dict`, …). Returns the abort
+/// sentinel when a duplicate was pending, else `None` to continue the call.
+fn check_kw_dup(vm: &mut VM, disp: &str) -> Option<Value> {
+    let dup = with_host(|h| h.pending_kw_dup.take());
+    dup.map(|k| {
+        abort(
+            vm,
+            host::type_error(&format!(
+                "{disp}() got multiple values for keyword argument '{k}'"
+            )),
+        )
+    })
 }
 
 /// Build a dict from `{**a, k: v}` literal entries: triples `(tag, a, b)` where
