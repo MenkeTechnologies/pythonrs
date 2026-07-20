@@ -307,9 +307,43 @@ fn set_attr_desc(recv: &Value, name: &str, val: Value) -> Result<(), String> {
 fn b_delattr(vm: &mut VM, _: u8) -> Value {
     let name = sval(&vm.pop());
     let recv = vm.pop();
-    match with_host(|h| h.del_attr(&recv, &name)) {
+    let r = del_attr_desc(&recv, &name);
+    match r {
         Ok(()) => Value::Undef,
         Err(e) => abort(vm, e),
+    }
+}
+
+/// `del recv.name` with the data-descriptor protocol (`property.fdel`,
+/// user `__delete__`). Accessor bodies run user code, so no host borrow is
+/// held across them.
+fn del_attr_desc(recv: &Value, name: &str) -> Result<(), String> {
+    match with_host(|h| h.plan_attr_del(recv, name)) {
+        host::AttrDel::Property { fdel, inst, owner } => {
+            if matches!(fdel, Value::Undef) {
+                let cls = with_host(|h| h.type_name(&inst));
+                return Err(format!(
+                    "AttributeError: property '{name}' of '{cls}' object has no deleter"
+                ));
+            }
+            match with_host(|h| h.get(&fdel).cloned()) {
+                Some(PyObj::Func(fv)) => {
+                    host::run_user_func(&fv, Some(inst), owner, vec![], vec![]).map(|_| ())
+                }
+                _ => host::invoke(&fdel, vec![inst], vec![]).map(|_| ()),
+            }
+        }
+        host::AttrDel::Descriptor {
+            desc,
+            inst,
+            has_delete,
+        } => {
+            if !has_delete {
+                return Err("AttributeError: __delete__".to_string());
+            }
+            host::call_method(&desc, "__delete__", vec![inst], vec![]).map(|_| ())
+        }
+        host::AttrDel::Plain => with_host(|h| h.del_attr(recv, name)),
     }
 }
 
