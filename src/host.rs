@@ -604,11 +604,13 @@ pub struct PyHost {
     pub traceback: Vec<(String, u32)>,
 }
 
-/// Whether a [`GenCell`] backs a plain generator or an `async def` coroutine.
+/// Whether a [`GenCell`] backs a plain generator, an `async def` coroutine, or
+/// an async generator (`async def` containing `yield`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum GenKind {
     Generator,
     Coroutine,
+    AsyncGen,
 }
 
 /// One suspended generator. `coro` is `None` only while this generator is
@@ -633,6 +635,10 @@ struct GenCell {
     /// The value the body `return`ed (carried by `StopIteration.value` and by
     /// `yield from`). `Undef` for a plain fall-off-the-end return.
     ret_value: Value,
+    /// For an async generator: whether the most recent suspension was an `await`
+    /// (yielding a Future to the loop) rather than a `yield` (producing a value).
+    /// Read by the async-gen `__anext__` driver to tell the two apart.
+    awaiting: bool,
 }
 
 /// The mutable "execution registers" swapped at every generator resume/suspend
@@ -1276,6 +1282,7 @@ impl PyHost {
                 Some(PyObj::Generator { id }) => match self.generators[*id as usize].kind {
                     GenKind::Coroutine => "coroutine".into(),
                     GenKind::Generator => "generator".into(),
+                    GenKind::AsyncGen => "async_generator".into(),
                 },
                 Some(PyObj::Future { id }) => async_rt::future_type_name(*id).into(),
                 Some(PyObj::EventLoop) => "_UnixSelectorEventLoop".into(),
@@ -1407,6 +1414,12 @@ impl PyHost {
                         }
                         GenKind::Generator => {
                             format!("<generator object {nm} at 0x{:012x}>", self.addr_of(v))
+                        }
+                        GenKind::AsyncGen => {
+                            format!(
+                                "<async_generator object {nm} at 0x{:012x}>",
+                                self.addr_of(v)
+                            )
                         }
                     }
                 }
@@ -5266,11 +5279,18 @@ pub fn run_user_func(
     let env = new_env(fv.env.clone());
     bind_params(&env, &def, &fv.defaults, &fv.kwonly_defaults, pos, kwargs)?;
     let owner = owner_opt.or_else(|| fv.owner.clone());
-    // `async def`: calling it returns a coroutine object; the body runs only
-    // when the event loop drives it (CPython does not execute it eagerly). An
-    // `async def` containing `yield` would be an async generator (not yet
-    // supported); plain async coroutines take this arm.
+    // `async def`: calling it returns a coroutine object (or, if the body
+    // contains `yield`, an async generator); the body runs only when the event
+    // loop drives it (CPython does not execute it eagerly).
     if def.is_async {
+        if def.is_generator {
+            return Ok(make_async_generator(
+                def.chunk.clone(),
+                env,
+                self_val,
+                owner,
+            ));
+        }
         return Ok(make_coroutine(def.chunk.clone(), env, self_val, owner));
     }
     // Generator function: build a suspended coroutine over the already-bound
@@ -5824,6 +5844,37 @@ pub fn make_coroutine(
     make_gen_kind(chunk, env, self_val, owner, GenKind::Coroutine)
 }
 
+/// Build a suspended async generator (`async def` containing `yield`). Its body
+/// suspends both at `yield` (producing a value) and at `await` (yielding a Future
+/// to the loop); the `awaiting` flag distinguishes the two for `__anext__`.
+pub fn make_async_generator(
+    chunk: Chunk,
+    env: Env,
+    self_val: Option<Value>,
+    owner: Option<String>,
+) -> Value {
+    make_gen_kind(chunk, env, self_val, owner, GenKind::AsyncGen)
+}
+
+/// Whether `v` is an async generator object.
+pub fn is_async_generator(v: &Value) -> bool {
+    match with_host(|h| h.get(v).cloned()) {
+        Some(PyObj::Generator { id }) => {
+            with_host(|h| h.generators[id as usize].kind == GenKind::AsyncGen)
+        }
+        _ => false,
+    }
+}
+
+/// Whether the running async generator's last suspension was an `await` (vs a
+/// value-producing `yield`). Read by the `__anext__` driver right after resume.
+pub fn cur_gen_awaiting(gen: &Value) -> bool {
+    match with_host(|h| h.get(gen).cloned()) {
+        Some(PyObj::Generator { id }) => with_host(|h| h.generators[id as usize].awaiting),
+        _ => false,
+    }
+}
+
 fn make_gen_kind(
     chunk: Chunk,
     env: Env,
@@ -5854,6 +5905,7 @@ fn make_gen_kind(
             started: false,
             pending_throw: None,
             ret_value: Value::Undef,
+            awaiting: false,
         });
         id
     });
@@ -5881,10 +5933,22 @@ fn make_gen_kind(
 /// `yield v` — suspend the running generator, handing `v` to the resumer;
 /// returns the value the next `gen_resume(x)` supplies (a sent value, or None).
 pub fn gen_yield(v: Value) -> Result<Value, String> {
+    gen_suspend(v, false)
+}
+
+/// Like [`gen_yield`], but marks the suspension as an `await` (used by the async
+/// runtime so an async generator's `__anext__` driver can tell an awaited Future
+/// from a produced value).
+pub fn gen_yield_awaiting(v: Value) -> Result<Value, String> {
+    gen_suspend(v, true)
+}
+
+fn gen_suspend(v: Value, awaiting: bool) -> Result<Value, String> {
     let id = match CUR_GEN.with(|c| c.get()) {
         Some(id) => id,
         None => return Err(type_error("'yield' outside a generator")),
     };
+    with_host(|h| h.generators[id as usize].awaiting = awaiting);
     let yp = with_host(|h| h.generators[id as usize].yielder);
     // SAFETY: same-thread coroutine; the yielder lives for the whole body, and
     // we only reach here from inside that body (its stack is live).

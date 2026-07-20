@@ -3433,6 +3433,7 @@ pub fn type_has_method(typename: &str, name: &str) -> bool {
         "property" => PROPERTY_METHODS,
         "generator" => GENERATOR_METHODS,
         "coroutine" => return GENERATOR_METHODS.contains(&name) || name == "__await__",
+        "async_generator" => return matches!(name, "__aiter__" | "__anext__"),
         "Future" | "Task" => return FUTURE_METHODS.contains(&name),
         "_UnixSelectorEventLoop" => return LOOP_METHODS.contains(&name),
         "Event" => return matches!(name, "set" | "clear" | "is_set" | "wait"),
@@ -3694,6 +3695,7 @@ pub fn call_type_method(
         "property" => property_method(recv, name, &args),
         "generator" => generator_method(recv, name, &args),
         "coroutine" => coroutine_method(recv, name, &args),
+        "async_generator" => async_generator_method(recv, name),
         "Future" | "Task" => crate::async_rt::future_method(recv, name, args),
         "_UnixSelectorEventLoop" => crate::async_rt::loop_method(name, args),
         "Event" | "Lock" | "Queue" => crate::async_rt::async_obj_method(recv, name, args),
@@ -3709,6 +3711,18 @@ fn coroutine_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, S
     match name {
         "__await__" => Ok(recv.clone()),
         _ => generator_method(recv, name, args),
+    }
+}
+
+/// `agen.__aiter__/__anext__` — an async generator's async-iteration protocol.
+/// Both return the generator itself: `__aiter__` is the async iterator, and
+/// awaiting `__anext__` drives one step (see `async_rt::drive_async_gen`).
+fn async_generator_method(recv: &Value, name: &str) -> Result<Value, String> {
+    match name {
+        "__aiter__" | "__anext__" => Ok(recv.clone()),
+        _ => Err(format!(
+            "AttributeError: 'async_generator' object has no attribute '{name}'"
+        )),
     }
 }
 

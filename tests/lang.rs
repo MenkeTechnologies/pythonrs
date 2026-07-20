@@ -2046,3 +2046,23 @@ async def main():\n    q = asyncio.Queue()\n    await asyncio.gather(producer(q)
 asyncio.run(main())";
     assert_eq!(g(src, "out"), "[0, 1, 2]");
 }
+
+#[test]
+fn async_generator_comprehension() {
+    let src = "import asyncio\n\
+async def ag(n):\n    for i in range(n):\n        await asyncio.sleep(0)\n        yield i * i\n\
+async def main():\n    return [x async for x in ag(4)]\n\
+r = asyncio.run(main())";
+    assert_eq!(g(src, "r"), "[0, 1, 4, 9]");
+}
+
+#[test]
+fn async_generator_type_and_async_for() {
+    let src = "import asyncio\n\
+async def ag(n):\n    for i in range(n):\n        await asyncio.sleep(0)\n        yield i * 10\n\
+out = []\n\
+async def main():\n    async for v in ag(3):\n        out.append(v)\n    return type(ag(1)).__name__\n\
+tn = asyncio.run(main())";
+    assert_eq!(g(src, "out"), "[0, 10, 20]");
+    assert_eq!(g(src, "tn"), "'async_generator'");
+}
