@@ -137,6 +137,7 @@ num-complex = "0.4"
 # (build the FFI config with `PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1` until pyo3
 # ships native 3.14 support). Default builds never pull pyo3 or need libpython.
 pyo3 = { version = "0.24", features = ["abi3-py313", "auto-initialize"], optional = true }
+unicode_names2 = "3.1.0"
 
 [features]
 stdlib-ffi = ["dep:pyo3"]

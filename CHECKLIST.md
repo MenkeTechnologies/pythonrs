@@ -280,13 +280,17 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
       undefined. `[in-flight]` Blocks binary I/O + `hashlib`/`base64`.
 - [ ] **`str.encode` ignores the codec/errors args** — always UTF-8 (`'x'.encode('utf-16')`
       wrong).
-- [ ] **`repr` doesn't escape C0 controls** (`\x00`-`\x1f`, ` `) — data-corrupting
+- [x] **`repr` doesn't escape C0 controls** (`\x00`-`\x1f`, ` `) — data-corrupting
       raw bytes leak; **`ascii()` doesn't `\x`-escape non-ASCII**; `\N{…}` named and
       `\NNN` octal string escapes not decoded.
-      **FIXED (except `\N{…}`):** `repr` `\xXX`/`\uXXXX`/`\UXXXXXXXX`-escapes
+      **FIXED:** `repr` `\xXX`/`\uXXXX`/`\UXXXXXXXX`-escapes
       non-printable chars (printable Unicode kept verbatim); `ascii()` escapes every
-      non-ASCII char; lexer decodes `\NNN` octal escapes. `\N{NAME}` still open — needs
-      a Unicode name→codepoint database (no crate vendored; substrate gap).
+      non-ASCII char; lexer decodes `\NNN` octal escapes. `\N{NAME}` now decoded via the
+      vendored `unicode_names2` crate — the lexer maps the name to its codepoint in normal
+      AND f-strings (round-tripped through the canonical name to reject CPython-invalid loose
+      matches like ` SPACE` / `GREEK_SMALL_LETTER_ALPHA`); unknown names raise CPython's exact
+      `(unicode error) 'unicodeescape' ... unknown Unicode character name` and malformed
+      `\N` / `\N{}` raise the matching `malformed \N character escape`.
 
 ## Tier 6 — Data structures / iterators
 

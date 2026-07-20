@@ -1546,6 +1546,22 @@ impl Parser {
                     i += 2;
                     continue;
                 }
+                // `\N{NAME}` named-Unicode escape: the braces belong to the escape,
+                // not a replacement field. Absorb `{...}` into the literal so
+                // `decode_escapes` resolves the name.
+                if crate::lexer::ends_with_named_escape_lead(&lit, is_raw) {
+                    lit.push('{');
+                    i += 1;
+                    while i < chars.len() && chars[i] != '}' {
+                        lit.push(chars[i]);
+                        i += 1;
+                    }
+                    if i < chars.len() {
+                        lit.push('}');
+                        i += 1;
+                    }
+                    continue;
+                }
                 if !lit.is_empty() {
                     let decoded = crate::lexer::decode_escapes(&lit, is_raw)?;
                     parts.push(FStrPart::Lit(decoded));
