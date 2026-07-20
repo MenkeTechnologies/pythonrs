@@ -646,6 +646,111 @@ fn gen_classes(seed: u64) -> Vec<String> {
     out
 }
 
+/// async/await/asyncio: coroutine result, `gather` ordering, `create_task`
+/// interleaving, `Future` set_result, `async for`/`async with`, async
+/// comprehensions — all driven by `asyncio.run` on the native event loop.
+fn gen_async(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let n = 2 + r.below(4); // 2..=5 items
+    let mut out: Vec<String> = vec!["import asyncio".into()];
+    match r.below(6) {
+        0 => {
+            // gather of N coros returning i*i, in order.
+            out.push("async def sq(i):".into());
+            out.push("    await asyncio.sleep(0)".into());
+            out.push("    return i * i".into());
+            out.push("async def main():".into());
+            let calls: Vec<String> = (0..n).map(|i| format!("sq({i})")).collect();
+            out.push(format!(
+                "    return await asyncio.gather({})",
+                calls.join(", ")
+            ));
+            out.push("print(asyncio.run(main()))".into());
+        }
+        1 => {
+            // create_task fan-out with sleep(0) interleaving; ordered prints.
+            out.push("async def w(i):".into());
+            out.push("    print('s', i)".into());
+            out.push("    await asyncio.sleep(0)".into());
+            out.push("    print('e', i)".into());
+            out.push("async def main():".into());
+            out.push(format!(
+                "    ts = [asyncio.create_task(w(i)) for i in range({n})]"
+            ));
+            out.push("    for t in ts:".into());
+            out.push("        await t".into());
+            out.push("asyncio.run(main())".into());
+        }
+        2 => {
+            // async for over a custom async iterator.
+            out.push("class R:".into());
+            out.push("    def __init__(self, n):".into());
+            out.push("        self.n = n".into());
+            out.push("        self.i = 0".into());
+            out.push("    def __aiter__(self):".into());
+            out.push("        return self".into());
+            out.push("    async def __anext__(self):".into());
+            out.push("        if self.i >= self.n:".into());
+            out.push("            raise StopAsyncIteration".into());
+            out.push("        self.i += 1".into());
+            out.push("        await asyncio.sleep(0)".into());
+            out.push("        return self.i".into());
+            out.push("async def main():".into());
+            out.push("    acc = []".into());
+            out.push(format!("    async for x in R({n}):"));
+            out.push("        acc.append(x)".into());
+            out.push("    return acc".into());
+            out.push("print(asyncio.run(main()))".into());
+        }
+        3 => {
+            // Future set_result awaited across a task.
+            out.push("async def setter(fut, v):".into());
+            out.push("    await asyncio.sleep(0)".into());
+            out.push("    fut.set_result(v)".into());
+            out.push("async def main():".into());
+            out.push("    fut = asyncio.Future()".into());
+            out.push(format!("    asyncio.create_task(setter(fut, {n}))"));
+            out.push("    return await fut".into());
+            out.push("print(asyncio.run(main()))".into());
+        }
+        4 => {
+            // Nested await chain + async comprehension.
+            out.push("async def inner(i):".into());
+            out.push("    await asyncio.sleep(0)".into());
+            out.push("    return i + 1".into());
+            out.push("class R:".into());
+            out.push("    def __init__(self, n):".into());
+            out.push("        self.n = n".into());
+            out.push("        self.i = 0".into());
+            out.push("    def __aiter__(self):".into());
+            out.push("        return self".into());
+            out.push("    async def __anext__(self):".into());
+            out.push("        if self.i >= self.n:".into());
+            out.push("            raise StopAsyncIteration".into());
+            out.push("        self.i += 1".into());
+            out.push("        return self.i".into());
+            out.push("async def main():".into());
+            out.push(format!("    return [await inner(x) async for x in R({n})]"));
+            out.push("print(asyncio.run(main()))".into());
+        }
+        _ => {
+            // async with a custom async context manager.
+            out.push("class CM:".into());
+            out.push("    def __init__(self, v):".into());
+            out.push("        self.v = v".into());
+            out.push("    async def __aenter__(self):".into());
+            out.push("        return self.v".into());
+            out.push("    async def __aexit__(self, *a):".into());
+            out.push("        return False".into());
+            out.push("async def main():".into());
+            out.push(format!("    async with CM({n}) as v:"));
+            out.push("        return v * 2".into());
+            out.push("print(asyncio.run(main()))".into());
+        }
+    }
+    out
+}
+
 /// Custom-iterable protocol: `__getitem__`-sequence and `__iter__`/`__contains__`/
 /// `__reversed__`, exercised through `for`, `list()`, `sum()`, `in`, `reversed()`.
 fn gen_iterproto(seed: u64) -> Vec<String> {
@@ -1279,6 +1384,7 @@ enum Mode {
     Strfmt2,
     Bytesops,
     Format2,
+    Async,
 }
 
 const REAL_MODES: &[Mode] = &[
@@ -1315,6 +1421,7 @@ const REAL_MODES: &[Mode] = &[
     Mode::Strfmt2,
     Mode::Bytesops,
     Mode::Format2,
+    Mode::Async,
 ];
 
 /// Generate the statement list for a seed in the selected mode. `Mixed` rotates
@@ -1358,6 +1465,7 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Strfmt2 => gen_strfmt2(seed),
         Mode::Bytesops => gen_bytesops(seed),
         Mode::Format2 => gen_format2(seed),
+        Mode::Async => gen_async(seed),
     }
 }
 
@@ -1397,6 +1505,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Strfmt2 => "strfmt2",
         Mode::Bytesops => "bytesops",
         Mode::Format2 => "format2",
+        Mode::Async => "async",
     }
 }
 
@@ -1436,6 +1545,7 @@ fn mode_from_name(s: &str) -> Option<Mode> {
         Mode::Strfmt2,
         Mode::Bytesops,
         Mode::Format2,
+        Mode::Async,
     ];
     ALL.iter().copied().find(|&m| mode_name(m) == s)
 }
@@ -1674,7 +1784,7 @@ fn print_help() {
          --mode M         mixed (default; rotates all modes), arith, bignum,\n\
          floatfmt, strings, fstring, slice, listcomp, dictcomp,\n\
          setcomp, sorting, formatspec, boolint, ranges, strmeth,\n\
-         comparison, builtins, ternary, augassign\n\
+         comparison, builtins, ternary, augassign, async, …\n\
          (each also accepted as a `--<mode>` shorthand)\n\
          --stderr         also require the normalized error line to match\n\
          --once           run a single case (seed) and print both outputs\n\
