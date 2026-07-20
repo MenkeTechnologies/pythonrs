@@ -90,6 +90,27 @@ pub mod ops {
     pub const MKBYTES: u16 = 63; // [latin1_str] -> bytes (one byte per code point 0..=255)
     pub const GENRET: u16 = 64; // [iter] -> the exhausted (sub)generator's return value (`yield from`)
     pub const AWAIT: u16 = 65; // [awaitable] -> drive it, suspending the coroutine until it settles
+    pub const INPLACE: u16 = 66; // [iop(int), a, b] -> augmented op (`+=`, `|=`, …): in-place dunder / mutate, else binary fallback
+    pub const WITH_EXIT: u16 = 67; // [mgr] -> call `mgr.__exit__` with the active exception triple; -> Bool(suppress)
+}
+
+/// In-place (augmented-assignment) op tags carried by `ops::INPLACE`. One per
+/// `BinOp`, in `BinOp` declaration order; `b_inplace` maps each to its `__i*__`
+/// dunder and its binary fallback.
+pub mod iop {
+    pub const ADD: i64 = 0; // +=
+    pub const SUB: i64 = 1; // -=
+    pub const MUL: i64 = 2; // *=
+    pub const DIV: i64 = 3; // /=
+    pub const FLOORDIV: i64 = 4; // //=
+    pub const MOD: i64 = 5; // %=
+    pub const POW: i64 = 6; // **=
+    pub const MATMUL: i64 = 7; // @=
+    pub const BITAND: i64 = 8; // &=
+    pub const BITOR: i64 = 9; // |=
+    pub const BITXOR: i64 = 10; // ^=
+    pub const SHL: i64 = 11; // <<=
+    pub const SHR: i64 = 12; // >>=
 }
 
 /// Binary-op tags carried by `ops::BINOP` (the non-native operators).

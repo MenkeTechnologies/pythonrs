@@ -595,6 +595,165 @@ fn gen_augassign(seed: u64) -> Vec<String> {
     vec![format!("x = {a}"), format!("x {op} {b}"), "print(x)".into()]
 }
 
+/// Augmented-assignment in-place semantics, `with`-statement `__exit__`
+/// suppression + real exception triple, and chained-comparison single evaluation
+/// of the interior operand (with short-circuit). Every printed form is
+/// deterministic; identity is probed with `is`, and any set is `sorted` so the
+/// output is order-stable across CPython and pythonrs.
+fn gen_augwith(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    match r.below(6) {
+        // in-place dunder (identity preserved) vs binary fallback (rebinds).
+        0 => {
+            let n = pick(r, POSINTS);
+            if r.below(2) == 0 {
+                vec![
+                    "class C:".into(),
+                    "    def __init__(s): s.v = 0".into(),
+                    "    def __iadd__(s, o): s.v += o; return s".into(),
+                    "c = C()".into(),
+                    "d = c".into(),
+                    format!("c += {n}"),
+                    "print(d is c, c.v)".into(),
+                ]
+            } else {
+                vec![
+                    "class A:".into(),
+                    "    def __init__(s, x): s.x = x".into(),
+                    "    def __add__(s, o): return A(s.x + o)".into(),
+                    format!("a = A({n})"),
+                    "b = a".into(),
+                    "a += 1".into(),
+                    "print(b is a, a.x)".into(),
+                ]
+            }
+        }
+        // list / bytearray in-place mutation (identity preserved).
+        1 => {
+            let a = pick(r, POSINTS);
+            let b = pick(r, POSINTS);
+            let k = pick(r, &["1", "2", "3"]);
+            match r.below(4) {
+                0 => vec![
+                    format!("l = [{a}]"),
+                    "m = l".into(),
+                    format!("l += [{b}]"),
+                    "print(m is l, l)".into(),
+                ],
+                1 => vec![
+                    format!("l = [{a}, {b}]"),
+                    "m = l".into(),
+                    format!("l *= {k}"),
+                    "print(m is l, l)".into(),
+                ],
+                2 => vec![
+                    "l = [1]".into(),
+                    "l += (x for x in range(3))".into(),
+                    "print(l)".into(),
+                ],
+                _ => vec![
+                    "b = bytearray(b'ab')".into(),
+                    "m = b".into(),
+                    "b += b'cd'".into(),
+                    "print(m is b, b)".into(),
+                ],
+            }
+        }
+        // set / dict in-place algebra (identity preserved; sets sorted).
+        2 => {
+            let op = pick(r, &["|=", "&=", "-=", "^="]);
+            if r.below(2) == 0 {
+                vec![
+                    "s = {1, 2, 3}".into(),
+                    "m = s".into(),
+                    format!("s {op} {{2, 3, 4}}"),
+                    "print(m is s, sorted(s))".into(),
+                ]
+            } else {
+                vec![
+                    "d = {'a': 1}".into(),
+                    "m = d".into(),
+                    "d |= {'b': 2}".into(),
+                    "print(m is d, d)".into(),
+                ]
+            }
+        }
+        // immutable rebind: int / str / tuple never mutate in place.
+        3 => {
+            let a = pick(r, INTS);
+            let b = pick(r, POSINTS);
+            match r.below(3) {
+                0 => vec![format!("x = {a}"), format!("x += {b}"), "print(x)".into()],
+                1 => vec![
+                    "s = 'a'".into(),
+                    "s += 'b'".into(),
+                    "print(s)".into(),
+                ],
+                _ => vec![
+                    "t = (1,)".into(),
+                    "u = t".into(),
+                    "t += (2,)".into(),
+                    "print(u is t, t)".into(),
+                ],
+            }
+        }
+        // chained comparison: interior operand evaluated EXACTLY once; a call in
+        // last position exposes short-circuit (n stays 0 when an earlier link fails).
+        4 => {
+            let a = pick(r, SMALLINTS);
+            let b = pick(r, SMALLINTS);
+            let c = pick(r, SMALLINTS);
+            let mut out: Vec<String> = vec![
+                "n = 0".into(),
+                "def f(v):".into(),
+                "    global n".into(),
+                "    n += 1".into(),
+                "    return v".into(),
+            ];
+            if r.below(2) == 0 {
+                // interior call: always evaluated once regardless of outcome.
+                out.push(format!("print({a} < f({b}) < {c}, n)"));
+            } else {
+                // trailing call: reached only if the first link holds.
+                out.push(format!("print({a} < {b} < f({c}), n)"));
+            }
+            out
+        }
+        // with-statement: real triple to __exit__ and truthy-return suppression.
+        _ => {
+            let sup = if r.below(2) == 0 { "True" } else { "False" };
+            if r.below(2) == 0 {
+                vec![
+                    "class CM:".into(),
+                    "    def __enter__(s): return s".into(),
+                    format!("    def __exit__(s, t, v, tb): return {sup}"),
+                    "r = []".into(),
+                    "try:".into(),
+                    "    with CM():".into(),
+                    "        r.append(1)".into(),
+                    "        raise ValueError('x')".into(),
+                    "    r.append(2)".into(),
+                    "except ValueError:".into(),
+                    "    r.append(3)".into(),
+                    "print(r)".into(),
+                ]
+            } else {
+                vec![
+                    "seen = []".into(),
+                    "class CM:".into(),
+                    "    def __enter__(s): return 7".into(),
+                    "    def __exit__(s, t, v, tb):".into(),
+                    "        seen.append((t is ValueError, str(v)))".into(),
+                    "        return True".into(),
+                    "with CM() as x:".into(),
+                    "    raise ValueError('boom')".into(),
+                    "print(x, seen)".into(),
+                ]
+            }
+        }
+    }
+}
+
 const SMALLINTS: &[&str] = &[
     "0", "1", "2", "3", "4", "5", "6", "7", "-1", "-2", "-3", "10",
 ];
@@ -1653,6 +1812,7 @@ enum Mode {
     Format2,
     Async,
     Async2,
+    Augwith,
 }
 
 const REAL_MODES: &[Mode] = &[
@@ -1692,6 +1852,7 @@ const REAL_MODES: &[Mode] = &[
     Mode::Format2,
     Mode::Async,
     Mode::Async2,
+    Mode::Augwith,
 ];
 
 /// Generate the statement list for a seed in the selected mode. `Mixed` rotates
@@ -1738,6 +1899,7 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Format2 => gen_format2(seed),
         Mode::Async => gen_async(seed),
         Mode::Async2 => gen_async2(seed),
+        Mode::Augwith => gen_augwith(seed),
     }
 }
 
@@ -1780,6 +1942,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Format2 => "format2",
         Mode::Async => "async",
         Mode::Async2 => "async2",
+        Mode::Augwith => "augwith",
     }
 }
 
@@ -1822,6 +1985,7 @@ fn mode_from_name(s: &str) -> Option<Mode> {
         Mode::Format2,
         Mode::Async,
         Mode::Async2,
+        Mode::Augwith,
     ];
     ALL.iter().copied().find(|&m| mode_name(m) == s)
 }

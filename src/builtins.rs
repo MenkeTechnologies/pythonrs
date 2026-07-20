@@ -55,6 +55,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::IMPORT_FROM, b_import_from);
     vm.register_builtin(ops::UNPACK, b_unpack);
     vm.register_builtin(ops::BINOP, b_binop);
+    vm.register_builtin(ops::INPLACE, b_inplace);
     vm.register_builtin(ops::UNARY, b_unary);
     vm.register_builtin(ops::GETGLOBAL, b_getglobal);
     vm.register_builtin(ops::GETSELF, b_getself);
@@ -1252,6 +1253,233 @@ fn b_binop(vm: &mut VM, _: u8) -> Value {
     }
     let r = with_host(|h| h.binop(tag, &a, &b));
     finish(vm, r)
+}
+
+/// The in-place dunder name for an `ops::iop` tag (`+=` → `__iadd__`, …).
+fn iop_dunder(tag: i64) -> Option<&'static str> {
+    use host::iop::*;
+    Some(match tag {
+        ADD => "__iadd__",
+        SUB => "__isub__",
+        MUL => "__imul__",
+        DIV => "__itruediv__",
+        FLOORDIV => "__ifloordiv__",
+        MOD => "__imod__",
+        POW => "__ipow__",
+        MATMUL => "__imatmul__",
+        BITAND => "__iand__",
+        BITOR => "__ior__",
+        BITXOR => "__ixor__",
+        SHL => "__ilshift__",
+        SHR => "__irshift__",
+        _ => return None,
+    })
+}
+
+/// The augmented-assignment operator glyph for an in-place `TypeError` message.
+fn iop_symbol(tag: i64) -> &'static str {
+    use host::iop::*;
+    match tag {
+        ADD => "+=",
+        SUB => "-=",
+        MUL => "*=",
+        DIV => "/=",
+        FLOORDIV => "//=",
+        MOD => "%=",
+        POW => "**=",
+        MATMUL => "@=",
+        BITAND => "&=",
+        BITOR => "|=",
+        BITXOR => "^=",
+        SHL => "<<=",
+        SHR => ">>=",
+        _ => "?",
+    }
+}
+
+/// The `x op= y` binary fallback: `x = x op y`. `+`/`-`/`*` route through the
+/// numeric hook (so a user `__add__`/`__radd__` still fires); the rest mirror
+/// `b_binop`'s non-native dispatch (instance dunder, `str %`, then the host op).
+fn inplace_binary_fallback(tag: i64, a: &Value, b: &Value) -> Result<Value, String> {
+    use host::iop;
+    let btag = match tag {
+        iop::ADD => return numeric_hook(NumOp::Add, a, b),
+        iop::SUB => return numeric_hook(NumOp::Sub, a, b),
+        iop::MUL => return numeric_hook(NumOp::Mul, a, b),
+        iop::DIV => host::binop::DIV,
+        iop::FLOORDIV => host::binop::FLOORDIV,
+        iop::MOD => host::binop::MOD,
+        iop::POW => host::binop::POW,
+        iop::MATMUL => host::binop::MATMUL,
+        iop::BITAND => host::binop::BITAND,
+        iop::BITOR => host::binop::BITOR,
+        iop::BITXOR => host::binop::BITXOR,
+        iop::SHL => host::binop::SHL,
+        iop::SHR => host::binop::SHR,
+        _ => return Err(host::type_error("internal: INPLACE tag")),
+    };
+    if let Some((l, r)) = binop_tag_dunders(btag) {
+        if let Some(res) = try_binop_dunder(a, b, l, r) {
+            return res;
+        }
+    }
+    if btag == host::binop::MOD && with_host(|h| matches!(h.get(a), Some(PyObj::Str(_)))) {
+        return str_percent_format(a, b);
+    }
+    with_host(|h| h.binop(btag, a, b))
+}
+
+/// The identity-preserving in-place fast paths for the mutable built-ins
+/// (`list`/`set`/`dict`/`bytearray`). `Some(Ok(a))` after mutating `a` in place;
+/// `Some(Err(..))` for an in-place-specific `TypeError`; `None` when `a` has no
+/// in-place fast path for this op and the caller should use the binary fallback.
+fn inplace_builtin(tag: i64, a: &Value, b: &Value) -> Option<Result<Value, String>> {
+    use host::iop;
+    // list: `+=` extends with any iterable; `*=` repeats in place.
+    if with_host(|h| matches!(h.get(a), Some(PyObj::List(_)))) {
+        match tag {
+            iop::ADD => {
+                let items = match host::iter_vec(b) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return Some(Err(with_host(|h| {
+                            host::type_error(&format!(
+                                "'{}' object is not iterable",
+                                h.type_name(b)
+                            ))
+                        })));
+                    }
+                };
+                with_host(|h| {
+                    if let Some(PyObj::List(l)) = h.get_mut(a) {
+                        l.extend(items);
+                    }
+                });
+                return Some(Ok(a.clone()));
+            }
+            iop::MUL => {
+                let n = with_host(|h| h.as_int(b))?.max(0) as usize; // non-int → binary fallback
+                with_host(|h| {
+                    if let Some(PyObj::List(l)) = h.get_mut(a) {
+                        let base = l.clone();
+                        l.clear();
+                        for _ in 0..n {
+                            l.extend(base.clone());
+                        }
+                    }
+                });
+                return Some(Ok(a.clone()));
+            }
+            _ => return None,
+        }
+    }
+    // bytearray: `+=` extends with a bytes-like; `*=` repeats in place.
+    if with_host(|h| matches!(h.get(a), Some(PyObj::Bytearray(_)))) {
+        match tag {
+            iop::ADD => match as_bytes_object(b) {
+                Some(bytes) => {
+                    with_host(|h| {
+                        if let Some(PyObj::Bytearray(v)) = h.get_mut(a) {
+                            v.extend_from_slice(&bytes);
+                        }
+                    });
+                    return Some(Ok(a.clone()));
+                }
+                None => {
+                    return Some(Err(with_host(|h| {
+                        host::type_error(&format!("can't concat {} to bytearray", h.type_name(b)))
+                    })));
+                }
+            },
+            iop::MUL => {
+                let n = with_host(|h| h.as_int(b))?.max(0) as usize;
+                with_host(|h| {
+                    if let Some(PyObj::Bytearray(v)) = h.get_mut(a) {
+                        let base = v.clone();
+                        v.clear();
+                        for _ in 0..n {
+                            v.extend_from_slice(&base);
+                        }
+                    }
+                });
+                return Some(Ok(a.clone()));
+            }
+            _ => return None,
+        }
+    }
+    // dict: `|=` updates in place with a mapping or an iterable of pairs.
+    if with_host(|h| matches!(h.get(a), Some(PyObj::Dict(_)))) && tag == iop::BITOR {
+        return Some(dict_update(a, Some(b), &[]).map(|()| a.clone()));
+    }
+    // set (mutable only): `|= &= -= ^=` mutate in place; the operand must be a
+    // set-like (mirrors the binary set operators). A frozenset has no in-place
+    // form and falls through to the binary op (rebinding a new frozenset).
+    let is_set = with_host(|h| matches!(h.get(a), Some(PyObj::Set(_))));
+    if is_set && matches!(tag, iop::BITOR | iop::BITAND | iop::SUB | iop::BITXOR) {
+        let y = match with_host(|h| h.setmap_of(b)) {
+            Some(y) => y,
+            None => return Some(Err(unsupported_operand(iop_symbol(tag), a, b))),
+        };
+        with_host(|h| {
+            if let Some(PyObj::Set(x)) = h.get_mut(a) {
+                match tag {
+                    iop::BITOR => {
+                        for (k, v) in y {
+                            x.entry(k).or_insert(v);
+                        }
+                    }
+                    iop::BITAND => {
+                        x.retain(|k, _| y.contains_key(k));
+                    }
+                    iop::SUB => {
+                        x.retain(|k, _| !y.contains_key(k));
+                    }
+                    _ => {
+                        // symmetric difference: drop shared keys, add b-only keys
+                        // (x-only keys stay untouched).
+                        for (k, v) in y {
+                            if x.contains_key(&k) {
+                                x.shift_remove(&k);
+                            } else {
+                                x.insert(k, v);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        return Some(Ok(a.clone()));
+    }
+    None
+}
+
+/// `x op= y` (augmented assignment): try `type(x).__i<op>__(x, y)` — mutating `x`
+/// in place and preserving identity for the mutable built-ins and any user
+/// in-place dunder — then fall back to `x = x op y`.
+fn b_inplace(vm: &mut VM, _: u8) -> Value {
+    let b = vm.pop();
+    let a = vm.pop();
+    let tag = match vm.pop() {
+        Value::Int(n) => n,
+        _ => return abort(vm, "internal: INPLACE tag".into()),
+    };
+    // 1. A user instance's in-place dunder wins; `NotImplemented` falls back.
+    if let Some(iname) = iop_dunder(tag) {
+        if with_host(|h| is_instance_with(h, &a, iname)) {
+            match host::call_method(&a, iname, vec![b.clone()], vec![]) {
+                Ok(v) if is_not_implemented(&v) => {
+                    return finish(vm, inplace_binary_fallback(tag, &a, &b));
+                }
+                r => return finish(vm, r),
+            }
+        }
+    }
+    // 2. Mutable built-in in-place fast path (identity preserved).
+    if let Some(r) = inplace_builtin(tag, &a, &b) {
+        return finish(vm, r);
+    }
+    // 3. Binary fallback (immutables rebind a new value; instance `__add__`/… fire).
+    finish(vm, inplace_binary_fallback(tag, &a, &b))
 }
 
 /// `str % args` with instance-aware `%s`/`%r`/`%a`. Builds a dispatch table of
