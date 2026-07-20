@@ -94,7 +94,20 @@ fn sval(v: &Value) -> String {
     with_host(|h| h.as_str(v)).unwrap_or_default()
 }
 
+/// Record the source line of the op that is aborting the chunk into the current
+/// frame, so an uncaught exception's traceback can name it. The dispatch loop
+/// pre-increments `ip`, so the failing op sits at `ip - 1`.
+fn record_err_line(vm: &VM) {
+    let idx = vm.ip.saturating_sub(1);
+    if let Some(&line) = vm.chunk.lines.get(idx) {
+        if line != 0 {
+            with_host(|h| h.set_cur_line(line));
+        }
+    }
+}
+
 fn abort(vm: &mut VM, e: String) -> Value {
+    record_err_line(vm);
     with_host(|h| h.error = Some(e));
     vm.ip = vm.chunk.ops.len();
     Value::Undef
@@ -105,6 +118,9 @@ fn finish(vm: &mut VM, r: Result<Value, String>) -> Value {
     match r {
         Ok(v) => {
             if with_host(|h| h.error.is_some() || h.signal.is_some()) {
+                if with_host(|h| h.error.is_some()) {
+                    record_err_line(vm);
+                }
                 vm.ip = vm.chunk.ops.len();
             }
             v
@@ -1403,9 +1419,12 @@ fn b_try(vm: &mut VM, _: u8) -> Value {
                     // Clear the propagating-error state but keep the caught
                     // exception as the "currently handled" one, so a bare `raise`
                     // in the handler body re-raises it (`b_reraise` reads `h.exc`).
+                    // The exception is caught: the frames it unwound past are no
+                    // longer part of an uncaught trace, so discard them.
                     with_host(|h| {
                         h.error = None;
                         h.exc = Some(exc.clone());
+                        h.traceback.clear();
                     });
                     let hres = host::run_chunk_on(hbody.clone());
                     match hres {
@@ -1890,14 +1909,24 @@ fn py_repr(v: &Value) -> Result<String, String> {
     // call back into a method).
     enum Cont {
         List(Vec<Value>),
-        Tuple(Vec<Value>),
+        // A tuple, plus `(type_name, field_names)` when it is a namedtuple.
+        Tuple(Vec<Value>, Option<(String, Vec<String>)>),
         Set(Vec<Value>),
         Frozenset(Vec<Value>),
         Dict(Vec<(Value, Value)>),
     }
     let cont = with_host(|h| match h.get(v) {
         Some(PyObj::List(l)) => Some(Cont::List(l.clone())),
-        Some(PyObj::Tuple(l)) => Some(Cont::Tuple(l.clone())),
+        Some(PyObj::Tuple(l)) => {
+            let nt = match v {
+                Value::Obj(i) => h
+                    .nt_meta
+                    .get(i)
+                    .map(|m| (m.type_name.clone(), m.fields.clone())),
+                _ => None,
+            };
+            Some(Cont::Tuple(l.clone(), nt))
+        }
         // Element order follows CPython's set hash-table layout (int subset).
         Some(PyObj::Set(s)) => Some(Cont::Set(h.set_ordered_values(s))),
         Some(PyObj::Frozenset(s)) => Some(Cont::Frozenset(h.set_ordered_values(s))),
@@ -1909,7 +1938,16 @@ fn py_repr(v: &Value) -> Result<String, String> {
     if let Some(cont) = cont {
         return Ok(match cont {
             Cont::List(e) => format!("[{}]", reprs(&e)?.join(", ")),
-            Cont::Tuple(e) => {
+            Cont::Tuple(e, Some((type_name, fields))) => {
+                let p = reprs(&e)?;
+                let inner: Vec<String> = fields
+                    .iter()
+                    .zip(p.iter())
+                    .map(|(f, x)| format!("{f}={x}"))
+                    .collect();
+                format!("{type_name}({})", inner.join(", "))
+            }
+            Cont::Tuple(e, None) => {
                 let p = reprs(&e)?;
                 if p.len() == 1 {
                     format!("({},)", p[0])
@@ -1949,6 +1987,10 @@ pub fn call_builtin_function(
     // math.* module functions.
     if let Some(m) = name.strip_prefix("math.") {
         return call_math(m, &args);
+    }
+    // sys.* module functions.
+    if let Some(f) = name.strip_prefix("sys.") {
+        return call_sys(f, args);
     }
     // `dict.fromkeys(iterable[, value])` reached via the `dict` type object.
     if name == "dict.fromkeys" {
@@ -2005,10 +2047,22 @@ pub fn call_builtin_function(
             for a in &args {
                 parts.push(py_str(a)?);
             }
-            use std::io::Write;
             let out = format!("{}{}", parts.join(&sep), end);
-            let _ = std::io::stdout().write_all(out.as_bytes());
-            let _ = std::io::stdout().flush();
+            // `file=` routes to a file/stream object (e.g. `sys.stderr`); the
+            // default and an explicit `sys.stdout` go to stdout.
+            let file_id = kw_get(&kwargs, "file")
+                .filter(|f| !matches!(f, Value::Undef))
+                .and_then(|f| with_host(|h| h.file_id(&f)));
+            match file_id {
+                Some(id) if id != 0 => {
+                    with_host(|h| h.io_write(id, &out))?;
+                }
+                _ => {
+                    use std::io::Write;
+                    let _ = std::io::stdout().write_all(out.as_bytes());
+                    let _ = std::io::stdout().flush();
+                }
+            }
             Ok(Value::Undef)
         }
         "len" => {
@@ -3028,6 +3082,31 @@ fn construct_dict(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, S
         d.insert(PKey::Str(k.clone()), (kv, v.clone()));
     }
     Ok(with_host(|h| h.new_dict(d)))
+}
+
+/// `sys.*` module functions. `sys.exit` raises a catchable `SystemExit`; the
+/// recursion-limit accessors report/accept a fixed 1000 (pythonrs has no
+/// Python-level recursion counter to enforce).
+fn call_sys(name: &str, args: Vec<Value>) -> Result<Value, String> {
+    match name {
+        "exit" => {
+            // `sys.exit([code])` == `raise SystemExit(code)`. Build the exception
+            // with the given args (0 or 1) and raise it so `except SystemExit`
+            // catches it and an uncaught one drives the process exit code.
+            let exc = with_host(|h| {
+                h.alloc(PyObj::Exception {
+                    class: "SystemExit".into(),
+                    args,
+                })
+            });
+            Err(host::raise_value(&exc)?)
+        }
+        "getrecursionlimit" => Ok(Value::Int(1000)),
+        "setrecursionlimit" => Ok(Value::Undef),
+        _ => Err(format!(
+            "AttributeError: module 'sys' has no attribute '{name}'"
+        )),
+    }
 }
 
 fn call_math(name: &str, args: &[Value]) -> Result<Value, String> {
