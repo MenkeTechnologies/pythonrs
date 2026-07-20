@@ -2819,6 +2819,102 @@ fn gen_format2(seed: u64) -> Vec<String> {
     vec![e]
 }
 
+/// The `str.format` / `format()` / `__format__` protocol and old-style `%`
+/// string formatting, concentrated on the historically weak spots: the `,`/`_`
+/// grouping options across every integer radix and their interaction with
+/// zero-padding, sign and width; `format(value, spec)` builtin dispatch through
+/// `__format__`; `str.format_map`; `str.translate`/`str.maketrans` (dict / 2-arg
+/// / 3-arg); and the full `%` mini-language (conversions, flags, `*` width/prec,
+/// `%(name)s` mapping, tuple-vs-single). Every branch prints a deterministic
+/// value; the few error probes raise on BOTH engines (parity is on success-ness,
+/// not the message text).
+fn gen_strformat(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    // Larger magnitudes so grouping is actually exercised.
+    const GINTS: &[&str] = &[
+        "0", "5", "42", "255", "1234", "1000000", "1234567", "-1234", "-1000000", "1234567890",
+        "-42", "999", "1000", "65535",
+    ];
+    const GFLOATS: &[&str] = &[
+        "1234.5", "1234567.891", "-1234.5", "0.5", "1000000.25", "-9999.99", "12345.678", "0.0",
+    ];
+    let gi = pick(r, GINTS);
+    let gi2 = pick(r, GINTS);
+    let gf = pick(r, GFLOATS);
+    let s = pick(r, WORDS);
+    let grp = pick(r, &[",", "_"]);
+    let ugrp = "_"; // the only grouping legal for x/o/b/X
+    let w = pick(r, &["0", "6", "8", "10", "12", "15"]);
+    let sign = pick(r, &["", "+", "-", " "]);
+    let p = pick(r, &["1", "2", "3", "4"]);
+    let e = match r.below(24) {
+        // --- decimal-int grouping: plain, then combined with width/zero/sign ---
+        0 => format!("print('{{:{grp}}}'.format({gi}))"),
+        1 => format!("print('{{:{grp}d}}'.format({gi}))"),
+        2 => format!("print('{{:0{w}{grp}d}}'.format({gi}))"),
+        3 => format!("print('{{:{sign}0{w}{grp}}}'.format({gi}))"),
+        4 => format!("print('{{:{sign}{grp}}}'.format({gi}))"),
+        // --- hex / oct / bin grouping with `_` (groups of 4 / 3 / 4) ---
+        5 => {
+            let t = pick(r, &["x", "X", "o", "b"]);
+            format!("print('{{:{ugrp}{t}}}'.format(abs({gi})))")
+        }
+        6 => {
+            let t = pick(r, &["x", "X", "o", "b"]);
+            format!("print('{{:#{ugrp}{t}}}'.format(abs({gi})))")
+        }
+        7 => {
+            let t = pick(r, &["x", "X", "o", "b"]);
+            format!("print('{{:0{w}{ugrp}{t}}}'.format(abs({gi})))")
+        }
+        8 => {
+            let t = pick(r, &["x", "X", "o", "b"]);
+            format!("print('{{:#0{w}{ugrp}{t}}}'.format(abs({gi})))")
+        }
+        // --- float grouping ---
+        9 => format!("print('{{:{grp}.{p}f}}'.format({gf}))"),
+        10 => format!("print('{{:0{w}{grp}.{p}f}}'.format({gf}))"),
+        11 => format!("print('{{:{sign}{grp}.{p}f}}'.format({gf}))"),
+        // --- non-zero fill + align with grouping ---
+        12 => format!("print('{{:*>{w}{grp}d}}'.format({gi}))"),
+        // --- format() builtin dispatch (int / float / str) ---
+        13 => {
+            let (v, sp) = pick(
+                r,
+                &[
+                    ("255", "#_x"),
+                    ("1234567", ",d"),
+                    ("1234.5", "012,.2f"),
+                    ("42", "+08_d"),
+                    ("'hi'", ">6"),
+                    ("3.14159", ".3g"),
+                ],
+            );
+            format!("print(format({v}, '{sp}'))")
+        }
+        // --- __format__ dunder: custom + default object.__format__ ---
+        14 => "class C:\n    def __format__(self, spec): return f'F<{spec}>'\nprint(format(C(), 'abc'), '{:xyz}'.format(C()))".to_string(),
+        // --- str.format_map with a plain dict and a custom mapping ---
+        15 => format!(
+            "print('{{a}}/{{b}}/{{a}}'.format_map({{'a': {gi}, 'b': {gi2}}}))"
+        ),
+        16 => "class M:\n    def __getitem__(self, k): return k * 2\nprint('{x}{yy}'.format_map(M()))".to_string(),
+        // --- str.translate / str.maketrans ---
+        17 => "print('hello world'.translate(str.maketrans('lo', 'LO')))".to_string(),
+        18 => "print('hello'.translate(str.maketrans('el', 'ip', 'lo')))".to_string(),
+        19 => "print('abc'.translate({97: 'AA', 98: None, 99: 0x44}))".to_string(),
+        // --- old-style % formatting (conversions, flags, *, mapping) ---
+        20 => format!(
+            "print('%{sign}0{w}d|%-8s|%.{p}f' % ({gi}, {s}, {gf}))"
+        ),
+        21 => format!("print('%*.*f|%*d' % (10, {p}, {gf}, {w}, abs({gi})))"),
+        22 => "print('%(name)s=%(val)08.2f' % {'name': 'x', 'val': 1234.5})".to_string(),
+        // --- conversions !r / !s / !a with a spec ---
+        _ => format!("print('{{0!r:>10}}|{{1!s}}|{{0!a}}'.format({s}, {gi}))"),
+    };
+    vec![e]
+}
+
 /// The attribute-access protocol and instance `__dict__`: the live `__dict__`
 /// mapping (stable identity, write-through subscript/`del`, `vars()` aliasing),
 /// the dunder hooks (`__getattr__` fallback, `__getattribute__`/`__setattr__`/
@@ -3447,6 +3543,7 @@ enum Mode {
     Bytesops,
     Bytestail,
     Format2,
+    Strformat,
     Async,
     Async2,
     Augwith,
@@ -3497,6 +3594,7 @@ const REAL_MODES: &[Mode] = &[
     Mode::Bytesops,
     Mode::Bytestail,
     Mode::Format2,
+    Mode::Strformat,
     Mode::Async,
     Mode::Async2,
     Mode::Augwith,
@@ -3554,6 +3652,7 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Bytesops => gen_bytesops(seed),
         Mode::Bytestail => gen_bytestail(seed),
         Mode::Format2 => gen_format2(seed),
+        Mode::Strformat => gen_strformat(seed),
         Mode::Async => gen_async(seed),
         Mode::Async2 => gen_async2(seed),
         Mode::Augwith => gen_augwith(seed),
@@ -3607,6 +3706,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Bytesops => "bytesops",
         Mode::Bytestail => "bytestail",
         Mode::Format2 => "format2",
+        Mode::Strformat => "strformat",
         Mode::Async => "async",
         Mode::Async2 => "async2",
         Mode::Augwith => "augwith",
@@ -3660,6 +3760,7 @@ fn mode_from_name(s: &str) -> Option<Mode> {
         Mode::Bytesops,
         Mode::Bytestail,
         Mode::Format2,
+        Mode::Strformat,
         Mode::Async,
         Mode::Async2,
         Mode::Augwith,
