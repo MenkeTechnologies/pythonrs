@@ -2066,3 +2066,98 @@ tn = asyncio.run(main())";
     assert_eq!(g(src, "out"), "[0, 10, 20]");
     assert_eq!(g(src, "tn"), "'async_generator'");
 }
+
+#[test]
+fn task_cancel_caught_inside_coroutine() {
+    // Cancelling a suspended Task injects CancelledError at its await point; the
+    // coroutine's try/except runs, and returning normally leaves it un-cancelled.
+    let src = "import asyncio\n\
+out = []\n\
+async def worker():\n    try:\n        await asyncio.sleep(10)\n        return 'no'\n    except asyncio.CancelledError:\n        return 'caught'\n\
+async def main():\n    t = asyncio.create_task(worker())\n    await asyncio.sleep(0)\n    c = t.cancel()\n    r = await t\n    out.append(c)\n    out.append(r)\n    out.append(t.cancelled())\n\
+asyncio.run(main())";
+    assert_eq!(g(src, "out"), "[True, 'caught', False]");
+}
+
+#[test]
+fn task_cancel_propagates_and_marks_cancelled() {
+    // A coroutine that does not catch CancelledError becomes a cancelled Task:
+    // awaiting it raises, and cancelled() is True.
+    let src = "import asyncio\n\
+out = []\n\
+async def worker():\n    await asyncio.sleep(10)\n    return 'no'\n\
+async def main():\n    t = asyncio.create_task(worker())\n    await asyncio.sleep(0)\n    t.cancel()\n    try:\n        await t\n        out.append('no-raise')\n    except asyncio.CancelledError:\n        out.append('raised')\n    out.append(t.cancelled())\n\
+asyncio.run(main())";
+    assert_eq!(g(src, "out"), "['raised', True]");
+}
+
+#[test]
+fn async_generator_asend_roundtrip() {
+    // `asend(v)` resumes the body, `v` becoming the value of the `yield`
+    // expression; exhaustion raises StopAsyncIteration.
+    let src = "import asyncio\n\
+async def ag():\n    a = yield 1\n    b = yield a + 1\n    yield b + 1\n\
+out = []\n\
+async def main():\n    g = ag()\n    out.append(await g.asend(None))\n    out.append(await g.asend(10))\n    out.append(await g.asend(20))\n    try:\n        await g.asend(0)\n    except StopAsyncIteration:\n        out.append('stop')\n\
+asyncio.run(main())";
+    assert_eq!(g(src, "out"), "[1, 11, 21, 'stop']");
+}
+
+#[test]
+fn async_generator_athrow_caught() {
+    // `athrow(exc)` raises at the current `yield`; a body that catches it and
+    // yields again returns that next value.
+    let src = "import asyncio\n\
+out = []\n\
+async def ag():\n    try:\n        while True:\n            yield 1\n    except ValueError:\n        yield 2\n\
+async def main():\n    g = ag()\n    out.append(await g.asend(None))\n    out.append(await g.athrow(ValueError))\n    await g.aclose()\n\
+asyncio.run(main())";
+    assert_eq!(g(src, "out"), "[1, 2]");
+}
+
+#[test]
+fn async_generator_aclose_finishes() {
+    // `aclose()` raises GeneratorExit and drives the body to completion; a later
+    // `asend` on the closed generator raises StopAsyncIteration.
+    let src = "import asyncio\n\
+out = []\n\
+async def ag():\n    try:\n        yield 1\n        yield 2\n    finally:\n        out.append('cleanup')\n\
+async def main():\n    g = ag()\n    out.append(await g.asend(None))\n    await g.aclose()\n    try:\n        await g.asend(None)\n    except StopAsyncIteration:\n        out.append('stop')\n\
+asyncio.run(main())";
+    assert_eq!(g(src, "out"), "[1, 'cleanup', 'stop']");
+}
+
+#[test]
+fn asyncio_wait_for_timeout_and_success() {
+    // `wait_for` raises TimeoutError past the deadline, and returns the result
+    // when the awaitable finishes in time.
+    let src = "import asyncio\n\
+out = []\n\
+async def slow():\n    await asyncio.sleep(10)\n    return 'slow'\n\
+async def fast():\n    await asyncio.sleep(0)\n    return 'fast'\n\
+async def main():\n    try:\n        await asyncio.wait_for(slow(), timeout=1)\n        out.append('no')\n    except asyncio.TimeoutError:\n        out.append('timeout')\n    out.append(await asyncio.wait_for(fast(), timeout=5))\n\
+asyncio.run(main())";
+    assert_eq!(g(src, "out"), "['timeout', 'fast']");
+}
+
+#[test]
+fn asyncio_bounded_queue_backpressure() {
+    // A bounded Queue blocks `put` while full; the consumer drains it in order.
+    let src = "import asyncio\n\
+out = []\n\
+async def main():\n    q = asyncio.Queue(maxsize=2)\n    async def prod():\n        for i in range(5):\n            await q.put(i)\n        await q.put(-1)\n    async def cons():\n        while True:\n            v = await q.get()\n            if v == -1:\n                break\n            out.append(v)\n            await asyncio.sleep(0)\n    await asyncio.gather(prod(), cons())\n\
+asyncio.run(main())";
+    assert_eq!(g(src, "out"), "[0, 1, 2, 3, 4]");
+}
+
+#[test]
+fn asyncio_wait_first_completed() {
+    // `wait(return_when=FIRST_COMPLETED)` settles as soon as one task finishes,
+    // leaving the slower one pending.
+    let src = "import asyncio\n\
+out = []\n\
+async def f(v, d):\n    await asyncio.sleep(d)\n    return v\n\
+async def main():\n    t1 = asyncio.create_task(f(1, 3))\n    t2 = asyncio.create_task(f(2, 1))\n    done, pending = await asyncio.wait([t1, t2], return_when=asyncio.FIRST_COMPLETED)\n    out.append(len(done))\n    out.append(len(pending))\n    await asyncio.wait([t1, t2])\n\
+asyncio.run(main())";
+    assert_eq!(g(src, "out"), "[1, 1]");
+}

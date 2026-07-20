@@ -613,6 +613,20 @@ pub enum GenKind {
     AsyncGen,
 }
 
+/// The pending operation an async generator's next drive should perform. Set by
+/// `agen.asend(v)` / `agen.athrow(exc)` / `agen.aclose()` (and by `__anext__`,
+/// which defaults to `Send(None)`); consumed by `async_rt::drive_async_gen`.
+#[derive(Clone)]
+pub enum AGenOp {
+    /// `asend(v)` / `__anext__`: resume the body sending `v` to the current
+    /// `yield`, returning the next produced value (or `StopAsyncIteration`).
+    Send(Value),
+    /// `athrow(exc)`: raise `exc` at the current `yield` point.
+    Throw(Value),
+    /// `aclose()`: raise `GeneratorExit`, expecting the body to finish.
+    Close,
+}
+
 /// One suspended generator. `coro` is `None` only while this generator is
 /// actively running (taken out across `Coroutine::resume`); `ctx` holds its
 /// volatile execution context (frames/signal/error/exc) while suspended.
@@ -639,6 +653,12 @@ struct GenCell {
     /// (yielding a Future to the loop) rather than a `yield` (producing a value).
     /// Read by the async-gen `__anext__` driver to tell the two apart.
     awaiting: bool,
+    /// For an async generator: the operation `asend`/`athrow`/`aclose` queued on
+    /// the awaitable, consumed by the next `drive_async_gen` (`None` = `__anext__`,
+    /// i.e. `Send(None)`).
+    agen_op: Option<AGenOp>,
+    /// The defining function's name (used by the un-awaited-coroutine warning).
+    func_name: String,
 }
 
 /// The mutable "execution registers" swapped at every generator resume/suspend
@@ -5289,14 +5309,27 @@ pub fn run_user_func(
                 env,
                 self_val,
                 owner,
+                def.name.clone(),
             ));
         }
-        return Ok(make_coroutine(def.chunk.clone(), env, self_val, owner));
+        return Ok(make_coroutine(
+            def.chunk.clone(),
+            env,
+            self_val,
+            owner,
+            def.name.clone(),
+        ));
     }
     // Generator function: build a suspended coroutine over the already-bound
     // frame; nothing of the body runs until the first `next`/iteration.
     if def.is_generator {
-        return Ok(make_generator(def.chunk.clone(), env, self_val, owner));
+        return Ok(make_generator(
+            def.chunk.clone(),
+            env,
+            self_val,
+            owner,
+            def.name.clone(),
+        ));
     }
     with_host(|h| {
         h.frames.push(Frame {
@@ -5828,8 +5861,14 @@ impl PyHost {
 
 /// Build a suspended generator whose body is `chunk`, run in a frame with the
 /// already-bound `env`. Nothing executes until the first `gen_resume`.
-fn make_generator(chunk: Chunk, env: Env, self_val: Option<Value>, owner: Option<String>) -> Value {
-    make_gen_kind(chunk, env, self_val, owner, GenKind::Generator)
+fn make_generator(
+    chunk: Chunk,
+    env: Env,
+    self_val: Option<Value>,
+    owner: Option<String>,
+    func_name: String,
+) -> Value {
+    make_gen_kind(chunk, env, self_val, owner, GenKind::Generator, func_name)
 }
 
 /// Build a suspended `async def` coroutine object. Identical backing to a
@@ -5840,8 +5879,9 @@ pub fn make_coroutine(
     env: Env,
     self_val: Option<Value>,
     owner: Option<String>,
+    func_name: String,
 ) -> Value {
-    make_gen_kind(chunk, env, self_val, owner, GenKind::Coroutine)
+    make_gen_kind(chunk, env, self_val, owner, GenKind::Coroutine, func_name)
 }
 
 /// Build a suspended async generator (`async def` containing `yield`). Its body
@@ -5852,8 +5892,9 @@ pub fn make_async_generator(
     env: Env,
     self_val: Option<Value>,
     owner: Option<String>,
+    func_name: String,
 ) -> Value {
-    make_gen_kind(chunk, env, self_val, owner, GenKind::AsyncGen)
+    make_gen_kind(chunk, env, self_val, owner, GenKind::AsyncGen, func_name)
 }
 
 /// Whether `v` is an async generator object.
@@ -5875,12 +5916,47 @@ pub fn cur_gen_awaiting(gen: &Value) -> bool {
     }
 }
 
+/// Queue the operation an `asend`/`athrow`/`aclose` awaitable will perform on its
+/// next drive (see [`AGenOp`]).
+pub fn set_agen_op(gen: &Value, op: AGenOp) {
+    if let Some(PyObj::Generator { id }) = with_host(|h| h.get(gen).cloned()) {
+        with_host(|h| h.generators[id as usize].agen_op = Some(op));
+    }
+}
+
+/// Take (and clear) the pending async-generator op; `None` means a plain
+/// `__anext__` step (`Send(None)`).
+pub fn take_agen_op(gen: &Value) -> Option<AGenOp> {
+    match with_host(|h| h.get(gen).cloned()) {
+        Some(PyObj::Generator { id }) => with_host(|h| h.generators[id as usize].agen_op.take()),
+        _ => None,
+    }
+}
+
+/// Emit CPython's `RuntimeWarning: coroutine '<name>' was never awaited` (to
+/// stderr) for every coroutine object that was created but never driven — i.e.
+/// never `await`ed, `create_task`'d, or run. Called at program end (best-effort;
+/// CPython emits at GC time, we emit once at teardown).
+pub fn warn_unawaited_coroutines() {
+    let names: Vec<String> = with_host(|h| {
+        h.generators
+            .iter()
+            .filter(|g| g.kind == GenKind::Coroutine && !g.started && !g.done)
+            .map(|g| g.func_name.clone())
+            .collect()
+    });
+    for name in names {
+        eprintln!("RuntimeWarning: coroutine '{name}' was never awaited");
+    }
+}
+
 fn make_gen_kind(
     chunk: Chunk,
     env: Env,
     self_val: Option<Value>,
     owner: Option<String>,
     kind: GenKind,
+    func_name: String,
 ) -> Value {
     let frame = Frame {
         env,
@@ -5906,6 +5982,8 @@ fn make_gen_kind(
             pending_throw: None,
             ret_value: Value::Undef,
             awaiting: false,
+            agen_op: None,
+            func_name,
         });
         id
     });
@@ -6514,6 +6592,11 @@ pub fn import_module(name: &str) -> Result<Value, String> {
                     "InvalidStateError",
                     h.alloc(PyObj::Builtin("InvalidStateError".into())),
                 ),
+                ("QueueEmpty", h.alloc(PyObj::Builtin("QueueEmpty".into()))),
+                ("QueueFull", h.alloc(PyObj::Builtin("QueueFull".into()))),
+                ("FIRST_COMPLETED", h.new_str("FIRST_COMPLETED".to_string())),
+                ("FIRST_EXCEPTION", h.new_str("FIRST_EXCEPTION".to_string())),
+                ("ALL_COMPLETED", h.new_str("ALL_COMPLETED".to_string())),
             ]
         }),
         "collections" => with_host(|h| {

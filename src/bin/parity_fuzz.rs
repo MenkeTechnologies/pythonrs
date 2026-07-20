@@ -762,6 +762,164 @@ fn gen_async(seed: u64) -> Vec<String> {
     out
 }
 
+/// async round 2: `Task.cancel()` → `CancelledError` injection (caught /
+/// propagated), async-generator `asend`/`athrow`/`aclose`, `wait_for` timeout /
+/// success, bounded-`Queue` back-pressure, and `wait(return_when=…)`. Every case
+/// drives all coroutines (no un-awaited leaks) and prints only order-stable
+/// values (counts / result lists), never set `repr` or object identities.
+fn gen_async2(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let n = 1 + r.below(4); // 1..=4
+    let mut out: Vec<String> = vec!["import asyncio".into()];
+    match r.below(9) {
+        0 => {
+            // Task.cancel() caught inside the coroutine → returns normally.
+            out.push("async def worker():".into());
+            out.push("    try:".into());
+            out.push("        await asyncio.sleep(10)".into());
+            out.push("        return 'no'".into());
+            out.push("    except asyncio.CancelledError:".into());
+            out.push("        return 'caught'".into());
+            out.push("async def main():".into());
+            out.push("    t = asyncio.create_task(worker())".into());
+            out.push("    await asyncio.sleep(0)".into());
+            out.push("    c = t.cancel()".into());
+            out.push("    r = await t".into());
+            out.push("    print(c, r, t.cancelled())".into());
+            out.push("asyncio.run(main())".into());
+        }
+        1 => {
+            // Task.cancel() propagates → awaiting the task raises CancelledError.
+            out.push("async def worker():".into());
+            out.push("    await asyncio.sleep(10)".into());
+            out.push("    return 'no'".into());
+            out.push("async def main():".into());
+            out.push("    t = asyncio.create_task(worker())".into());
+            out.push("    await asyncio.sleep(0)".into());
+            out.push("    t.cancel()".into());
+            out.push("    try:".into());
+            out.push("        await t".into());
+            out.push("        print('no-raise')".into());
+            out.push("    except asyncio.CancelledError:".into());
+            out.push("        print('cancelled', t.cancelled())".into());
+            out.push("asyncio.run(main())".into());
+        }
+        2 => {
+            // Async generator `asend` round-trip: each send is echoed back.
+            out.push("async def ag(k):".into());
+            out.push("    for i in range(k):".into());
+            out.push("        await asyncio.sleep(0)".into());
+            out.push("        yield i".into());
+            out.push("async def main():".into());
+            out.push(format!("    g = ag({n})"));
+            out.push("    acc = []".into());
+            out.push("    try:".into());
+            out.push("        v = await g.asend(None)".into());
+            out.push("        while True:".into());
+            out.push("            acc.append(v)".into());
+            out.push("            v = await g.asend(v)".into());
+            out.push("    except StopAsyncIteration:".into());
+            out.push("        pass".into());
+            out.push("    print(acc)".into());
+            out.push("asyncio.run(main())".into());
+        }
+        3 => {
+            // Async generator `athrow`: the body catches and yields once more.
+            out.push("async def ag():".into());
+            out.push("    try:".into());
+            out.push("        while True:".into());
+            out.push("            yield 1".into());
+            out.push("    except ValueError:".into());
+            out.push("        yield 2".into());
+            out.push("async def main():".into());
+            out.push("    g = ag()".into());
+            out.push("    a = await g.asend(None)".into());
+            out.push("    b = await g.athrow(ValueError)".into());
+            out.push("    await g.aclose()".into());
+            out.push("    print(a, b)".into());
+            out.push("asyncio.run(main())".into());
+        }
+        4 => {
+            // Async generator `aclose`: GeneratorExit finishes the body.
+            out.push("async def ag():".into());
+            out.push("    try:".into());
+            out.push("        yield 1".into());
+            out.push("        yield 2".into());
+            out.push("    finally:".into());
+            out.push("        pass".into());
+            out.push("async def main():".into());
+            out.push("    g = ag()".into());
+            out.push("    print(await g.asend(None))".into());
+            out.push("    await g.aclose()".into());
+            out.push("    print('closed')".into());
+            out.push("asyncio.run(main())".into());
+        }
+        5 => {
+            // wait_for timeout → TimeoutError (inner task cancelled).
+            out.push("async def slow():".into());
+            out.push("    await asyncio.sleep(10)".into());
+            out.push("    return 1".into());
+            out.push("async def main():".into());
+            out.push("    try:".into());
+            out.push("        await asyncio.wait_for(slow(), timeout=1)".into());
+            out.push("        print('no')".into());
+            out.push("    except asyncio.TimeoutError:".into());
+            out.push("        print('timeout')".into());
+            out.push("asyncio.run(main())".into());
+        }
+        6 => {
+            // wait_for success within the deadline.
+            out.push("async def fast(v):".into());
+            out.push("    await asyncio.sleep(0)".into());
+            out.push("    return v".into());
+            out.push("async def main():".into());
+            out.push(format!(
+                "    r = await asyncio.wait_for(fast({n}), timeout=5)"
+            ));
+            out.push("    print(r)".into());
+            out.push("asyncio.run(main())".into());
+        }
+        7 => {
+            // Bounded Queue: producer blocks on a full queue until the consumer
+            // drains it; the consumed order is deterministic.
+            out.push("async def main():".into());
+            out.push("    q = asyncio.Queue(2)".into());
+            out.push("    async def prod():".into());
+            out.push(format!("        for i in range({}):", n + 3));
+            out.push("            await q.put(i)".into());
+            out.push("        await q.put(-1)".into());
+            out.push("    async def cons():".into());
+            out.push("        acc = []".into());
+            out.push("        while True:".into());
+            out.push("            v = await q.get()".into());
+            out.push("            if v == -1:".into());
+            out.push("                break".into());
+            out.push("            acc.append(v)".into());
+            out.push("            await asyncio.sleep(0)".into());
+            out.push("        print(acc)".into());
+            out.push("    await asyncio.gather(prod(), cons())".into());
+            out.push("asyncio.run(main())".into());
+        }
+        _ => {
+            // wait(return_when=FIRST_COMPLETED): one done, one pending.
+            out.push("async def f(v, d):".into());
+            out.push("    await asyncio.sleep(d)".into());
+            out.push("    return v".into());
+            out.push("async def main():".into());
+            out.push("    t1 = asyncio.create_task(f(1, 3))".into());
+            out.push("    t2 = asyncio.create_task(f(2, 1))".into());
+            out.push(
+                "    done, pending = await asyncio.wait([t1, t2], return_when=asyncio.FIRST_COMPLETED)"
+                    .into(),
+            );
+            out.push("    print(len(done), len(pending))".into());
+            out.push("    await asyncio.wait([t1, t2])".into());
+            out.push("asyncio.run(main())".into());
+        }
+    }
+    out
+}
+
 /// Custom-iterable protocol: `__getitem__`-sequence and `__iter__`/`__contains__`/
 /// `__reversed__`, exercised through `for`, `list()`, `sum()`, `in`, `reversed()`.
 fn gen_iterproto(seed: u64) -> Vec<String> {
@@ -1396,6 +1554,7 @@ enum Mode {
     Bytesops,
     Format2,
     Async,
+    Async2,
 }
 
 const REAL_MODES: &[Mode] = &[
@@ -1433,6 +1592,7 @@ const REAL_MODES: &[Mode] = &[
     Mode::Bytesops,
     Mode::Format2,
     Mode::Async,
+    Mode::Async2,
 ];
 
 /// Generate the statement list for a seed in the selected mode. `Mixed` rotates
@@ -1477,6 +1637,7 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Bytesops => gen_bytesops(seed),
         Mode::Format2 => gen_format2(seed),
         Mode::Async => gen_async(seed),
+        Mode::Async2 => gen_async2(seed),
     }
 }
 
@@ -1517,6 +1678,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Bytesops => "bytesops",
         Mode::Format2 => "format2",
         Mode::Async => "async",
+        Mode::Async2 => "async2",
     }
 }
 
@@ -1557,6 +1719,7 @@ fn mode_from_name(s: &str) -> Option<Mode> {
         Mode::Bytesops,
         Mode::Format2,
         Mode::Async,
+        Mode::Async2,
     ];
     ALL.iter().copied().find(|&m| mode_name(m) == s)
 }

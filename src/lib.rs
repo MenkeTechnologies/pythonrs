@@ -139,7 +139,11 @@ pub fn run_program(
             }
         }
     };
-    match run_compiled(prog) {
+    let result = run_compiled(prog);
+    // CPython emits `RuntimeWarning: coroutine '…' was never awaited` for any
+    // coroutine that was created but never driven; do the same at teardown.
+    host::warn_unawaited_coroutines();
+    match result {
         Ok(_) => RunReport {
             exit_code: 0,
             stderr: None,
