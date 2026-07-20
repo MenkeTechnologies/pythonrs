@@ -41,7 +41,12 @@ use std::path::PathBuf;
 /// v12: f-string format specs are compiled as their own joined-string so nested
 /// replacement fields (`{w}` in `{x:{w}.2f}`) evaluate at runtime; older bytecode
 /// baked the spec as a literal constant and must miss cleanly.
-const SCHEMA: u64 = 14;
+/// v15: augmented assignment emits the `INPLACE` op (the CPython in-place-dunder
+/// protocol) instead of a plain `x = x <op> y` rebind; `with` uses the hit-flag
+/// `__exit__` desugar; chained comparisons bind interior operands to walrus temps
+/// for single-evaluation. All three change lowering, so older cached bytecode
+/// (which would run the old rebind / re-evaluating forms) must miss cleanly.
+const SCHEMA: u64 = 15;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]
