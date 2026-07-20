@@ -1963,6 +1963,12 @@ impl Compiler {
         subject: &Expr,
         cases: &[MatchCase],
     ) -> Result<(), String> {
+        // Compile-time structural validation (PEP 634): reject before running,
+        // matching CPython which raises SyntaxError for the whole module.
+        for case in cases {
+            let mut names = Vec::new();
+            validate_pattern(&case.pattern, &mut names)?;
+        }
         let subj = format!(".match{}", self.tmp);
         self.tmp += 1;
         self.compile_expr(b, subject)?;
@@ -2016,7 +2022,13 @@ impl Compiler {
             }
             Pattern::Value(e) => {
                 self.compile_expr(b, e)?; // [v, e]
-                b.emit(Op::NumEq, 0); // [bool]
+                // Singleton patterns (None/True/False) match by identity (`is`),
+                // every other literal/value pattern by equality (`==`) — PEP 634.
+                if matches!(e, Expr::None | Expr::True | Expr::False) {
+                    b.emit(Op::CallBuiltin(ops::IS, 2), 0); // [bool]
+                } else {
+                    b.emit(Op::NumEq, 0); // [bool]
+                }
                 let jf = b.emit(Op::JumpIfFalse(0), 0);
                 fails.push(jf);
             }
@@ -2161,6 +2173,114 @@ impl Compiler {
             self.compile_pattern(b, sub, fails)?;
         }
         Ok(())
+    }
+}
+
+/// PEP 634 compile-time pattern checks (CPython raises these as `SyntaxError`
+/// for the whole module, before any case runs). `bound` accumulates the capture
+/// names bound so far in the current case pattern. Rejects: a name bound twice,
+/// a duplicate mapping key, a repeated class-keyword attribute, and OR
+/// alternatives that bind different name sets.
+fn validate_pattern(pat: &Pattern, bound: &mut Vec<String>) -> Result<(), String> {
+    match pat {
+        Pattern::Wildcard | Pattern::Value(_) | Pattern::Star(None) => Ok(()),
+        Pattern::Capture(name) | Pattern::Star(Some(name)) => bind_pattern_name(name, bound),
+        Pattern::As(inner, name) => {
+            validate_pattern(inner, bound)?;
+            bind_pattern_name(name, bound)
+        }
+        Pattern::Sequence { elems, .. } => {
+            for e in elems {
+                validate_pattern(e, bound)?;
+            }
+            Ok(())
+        }
+        Pattern::Mapping { keys, rest } => {
+            for i in 0..keys.len() {
+                for j in 0..i {
+                    if keys[i].0 == keys[j].0 {
+                        return Err(format!(
+                            "SyntaxError: mapping pattern checks duplicate key ({})",
+                            pattern_key_repr(&keys[i].0)
+                        ));
+                    }
+                }
+            }
+            for (_, p) in keys {
+                validate_pattern(p, bound)?;
+            }
+            if let Some(r) = rest {
+                bind_pattern_name(r, bound)?;
+            }
+            Ok(())
+        }
+        Pattern::Class { pos, kw, .. } => {
+            for i in 0..kw.len() {
+                for j in 0..i {
+                    if kw[i].0 == kw[j].0 {
+                        return Err(format!(
+                            "SyntaxError: attribute name repeated in class pattern: {}",
+                            kw[i].0
+                        ));
+                    }
+                }
+            }
+            for p in pos {
+                validate_pattern(p, bound)?;
+            }
+            for (_, p) in kw {
+                validate_pattern(p, bound)?;
+            }
+            Ok(())
+        }
+        Pattern::Or(alts) => {
+            // Each alternative must bind an identical set of names.
+            let base = bound.len();
+            let mut expected: Option<Vec<String>> = None;
+            for alt in alts {
+                let mut alt_bound = bound.clone();
+                validate_pattern(alt, &mut alt_bound)?;
+                let mut added: Vec<String> = alt_bound[base..].to_vec();
+                added.sort();
+                match &expected {
+                    None => expected = Some(added),
+                    Some(exp) if *exp != added => {
+                        return Err(
+                            "SyntaxError: alternative patterns bind different names".into(),
+                        )
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(exp) = expected {
+                bound.extend(exp);
+            }
+            Ok(())
+        }
+    }
+}
+
+fn bind_pattern_name(name: &str, bound: &mut Vec<String>) -> Result<(), String> {
+    if bound.iter().any(|n| n == name) {
+        return Err(format!(
+            "SyntaxError: multiple assignments to name '{name}' in pattern"
+        ));
+    }
+    bound.push(name.to_string());
+    Ok(())
+}
+
+/// CPython-style repr of a mapping-pattern key for the duplicate-key error.
+fn pattern_key_repr(e: &Expr) -> String {
+    match e {
+        Expr::Str(s) => format!("'{s}'"),
+        Expr::Int(n) => n.to_string(),
+        Expr::BigInt(s) => s.clone(),
+        Expr::Float(f) => f.to_string(),
+        Expr::None => "None".into(),
+        Expr::True => "True".into(),
+        Expr::False => "False".into(),
+        _ => "...".into(),
     }
 }
 

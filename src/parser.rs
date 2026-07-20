@@ -752,14 +752,14 @@ impl Parser {
     /// Top-level pattern for a `case`: an open sequence (`case 1, 2`) or a single
     /// OR-pattern.
     fn parse_patterns(&mut self) -> Result<Pattern, String> {
-        let first = self.parse_or_pattern()?;
+        let first = self.parse_pattern()?;
         if self.at_op(",") {
             let mut elems = vec![first];
             while self.eat_op(",") {
                 if self.at_op(":") || self.at_kw("if") {
                     break;
                 }
-                elems.push(self.parse_or_pattern()?);
+                elems.push(self.parse_pattern()?);
             }
             let star = elems.iter().position(|p| matches!(p, Pattern::Star(_)));
             Ok(Pattern::Sequence { elems, star })
@@ -768,26 +768,28 @@ impl Parser {
         }
     }
 
-    fn parse_or_pattern(&mut self) -> Result<Pattern, String> {
-        let first = self.parse_as_pattern()?;
-        if self.at_op("|") {
-            let mut alts = vec![first];
-            while self.eat_op("|") {
-                alts.push(self.parse_as_pattern()?);
-            }
-            Ok(Pattern::Or(alts))
-        } else {
-            Ok(first)
-        }
-    }
-
-    fn parse_as_pattern(&mut self) -> Result<Pattern, String> {
-        let p = self.parse_closed_pattern()?;
+    /// A full pattern (PEP 634 `pattern`): an OR-pattern optionally followed by
+    /// `as name`. `as` binds looser than `|`, so `1 | 2 as x` is `(1 | 2) as x`.
+    fn parse_pattern(&mut self) -> Result<Pattern, String> {
+        let p = self.parse_or_pattern()?;
         if self.eat_kw("as") {
             let name = self.expect_name()?;
             Ok(Pattern::As(Box::new(p), name))
         } else {
             Ok(p)
+        }
+    }
+
+    fn parse_or_pattern(&mut self) -> Result<Pattern, String> {
+        let first = self.parse_closed_pattern()?;
+        if self.at_op("|") {
+            let mut alts = vec![first];
+            while self.eat_op("|") {
+                alts.push(self.parse_closed_pattern()?);
+            }
+            Ok(Pattern::Or(alts))
+        } else {
+            Ok(first)
         }
     }
 
@@ -815,14 +817,14 @@ impl Parser {
                     star: None,
                 });
             }
-            let first = self.parse_or_pattern()?;
+            let first = self.parse_pattern()?;
             if self.at_op(",") {
                 let mut elems = vec![first];
                 while self.eat_op(",") {
                     if self.at_op(")") {
                         break;
                     }
-                    elems.push(self.parse_or_pattern()?);
+                    elems.push(self.parse_pattern()?);
                 }
                 self.expect_op(")")?;
                 let star = elems.iter().position(|p| matches!(p, Pattern::Star(_)));
@@ -889,7 +891,7 @@ impl Parser {
     fn parse_sequence_pattern(&mut self, close: &str) -> Result<Pattern, String> {
         let mut elems = Vec::new();
         while !self.at_op(close) {
-            elems.push(self.parse_or_pattern()?);
+            elems.push(self.parse_pattern()?);
             if !self.eat_op(",") {
                 break;
             }
@@ -912,7 +914,7 @@ impl Parser {
             // key is a literal or dotted value expression.
             let key = self.parse_or()?;
             self.expect_op(":")?;
-            let pat = self.parse_or_pattern()?;
+            let pat = self.parse_pattern()?;
             keys.push((key, pat));
             if !self.eat_op(",") {
                 break;
@@ -933,9 +935,9 @@ impl Parser {
             {
                 let kn = self.expect_name()?;
                 self.expect_op("=")?;
-                kw.push((kn, self.parse_or_pattern()?));
+                kw.push((kn, self.parse_pattern()?));
             } else {
-                pos.push(self.parse_or_pattern()?);
+                pos.push(self.parse_pattern()?);
             }
             if !self.eat_op(",") {
                 break;

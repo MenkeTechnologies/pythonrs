@@ -2012,6 +2012,13 @@ fn b_match_map_rest(vm: &mut VM, _: u8) -> Value {
 /// `[subject, class, npos, kwnames...]` -> on match push extracted sub-values
 /// (positional via `__match_args__` / builtin self-match, then keyword via
 /// attributes) as a `list`, then `Bool(true)`; else `Bool(false)`.
+/// CPython's message for a class pattern with too many positional sub-patterns:
+/// "NAME() accepts N positional sub-pattern(s) (M given)".
+fn match_pos_msg(cname: &str, accepts: usize, given: usize) -> String {
+    let plural = if accepts == 1 { "" } else { "s" };
+    format!("{cname}() accepts {accepts} positional sub-pattern{plural} ({given} given)")
+}
+
 fn b_match_class(vm: &mut VM, argc: u8) -> Value {
     let all = pop_n(vm, argc as usize);
     if all.len() < 3 {
@@ -2031,7 +2038,10 @@ fn b_match_class(vm: &mut VM, argc: u8) -> Value {
     let mut vals: Vec<Value> = Vec::new();
     if npos > 0 {
         if is_builtin_type(&cname) {
-            // Builtin types (int, str, …) allow a single positional self-match.
+            // Builtin types (int, str, …) allow exactly one positional self-match.
+            if npos != 1 {
+                return abort(vm, host::type_error(&match_pos_msg(&cname, 1, npos)));
+            }
             vals.push(subject.clone());
         } else {
             let margs = with_host(|h| h.class_lookup(&cname, "__match_args__"));
@@ -2040,15 +2050,11 @@ fn b_match_class(vm: &mut VM, argc: u8) -> Value {
                     Ok(items) => items.iter().map(sval).collect(),
                     Err(e) => return abort(vm, e),
                 },
-                None => {
-                    return abort(
-                        vm,
-                        host::type_error(&format!(
-                            "{cname}() accepts 0 positional sub-patterns ({npos} given)"
-                        )),
-                    )
-                }
+                None => Vec::new(),
             };
+            if npos > names.len() {
+                return abort(vm, host::type_error(&match_pos_msg(&cname, names.len(), npos)));
+            }
             for i in 0..npos {
                 let attr = match names.get(i) {
                     Some(a) => a.clone(),
