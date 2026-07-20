@@ -7,18 +7,30 @@
 //! only the imported stdlib objects live on the CPython side.
 //!
 //! A stdlib object that pythonrs can represent by value (int/float/bool/None/str/
-//! bytes/list/tuple/dict/set) is marshaled across the boundary. Everything else
-//! (compiled regex, `datetime`, sockets, file objects, iterators, …) stays on the
-//! CPython side behind a [`PyObj::Foreign`](crate::host::PyObj::Foreign) handle:
-//! an index into the side-table below. Attribute access, calls, indexing,
-//! iteration, `len`, `str`/`repr`, and membership on a `Foreign` route back
-//! through here; pyo3 owns the refcounts and the GIL.
+//! bytes/bytearray/list/tuple/dict/set/frozenset/range/complex/`deque`) is
+//! marshaled across the boundary in both directions. Everything else (compiled
+//! regex, `datetime`, sockets, file objects, iterators, …) stays on the CPython
+//! side behind a [`PyObj::Foreign`](crate::host::PyObj::Foreign) handle: an index
+//! into the side-table below. Attribute access, calls, indexing, iteration,
+//! `len`, `str`/`repr`, and membership on a `Foreign` route back through here;
+//! pyo3 owns the refcounts and the GIL.
+//!
+//! A by-value mutable-container argument (`list`/`bytearray`/`deque`) is copied
+//! into a fresh CPython object, so an in-place stdlib mutator (`heapq.heapify`,
+//! `random.shuffle`, `struct.pack_into`) would otherwise lose its effect; after
+//! the call the bridge re-reads that object and overwrites the pythonrs heap slot
+//! in place (see [`writeback_mutated_args`]) so the mutation — and aliases to the
+//! same object — reflect it. Write-back marshals by value only and never
+//! allocates a `Foreign`, so it does not grow the side-table.
 
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyFrozenSet, PyInt, PyList, PySet, PyTuple};
+use pyo3::types::{
+    PyBool, PyByteArray, PyBytes, PyDict, PyFloat, PyFrozenSet, PyInt, PyList, PySet, PyString,
+    PyTuple,
+};
 use pyo3::IntoPyObjectExt;
 
 use crate::host::{with_host, PyHost, PyObj};
@@ -74,6 +86,12 @@ fn store(obj: Py<PyAny>) -> u32 {
     (t.len() - 1) as u32
 }
 
+/// Number of live entries in the side-table. Diagnostic only (used by the
+/// bridge's own tests to assert bounded growth).
+pub fn table_len() -> usize {
+    table().lock().map(|t| t.len()).unwrap_or(0)
+}
+
 /// A fresh owned handle to the side-table object `id`, bound to `py`.
 fn fetch<'py>(py: Python<'py>, id: u32) -> Result<Bound<'py, PyAny>, String> {
     let t = table().lock().expect("ffi table poisoned");
@@ -111,7 +129,12 @@ fn value_to_py<'py>(
         Value::Str(s) => conv(s.as_str().into_bound_py_any(py)),
         Value::Obj(_) => match host.get(v) {
             Some(PyObj::Str(s)) => conv(s.as_str().into_bound_py_any(py)),
-            Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) => Ok(PyBytes::new(py, b).into_any()),
+            Some(PyObj::Bytes(b)) => Ok(PyBytes::new(py, b).into_any()),
+            // A `bytearray` is mutable, so it crosses as a CPython `bytearray`
+            // (not immutable `bytes`) — an in-place stdlib mutator such as
+            // `struct.pack_into` writes into it, and the write-back after the call
+            // reflects that back into the pythonrs object.
+            Some(PyObj::Bytearray(b)) => Ok(PyByteArray::new(py, b).into_any()),
             Some(PyObj::BigInt(b)) => {
                 // pyo3 has no num-bigint bridge enabled; round-trip through the
                 // decimal string, which CPython's `int` parses into an exact int.
@@ -138,6 +161,41 @@ fn value_to_py<'py>(
                 Ok(PySet::new(py, &elems)
                     .map_err(|e| e.to_string())?
                     .into_any())
+            }
+            Some(PyObj::Frozenset(s)) => {
+                let elems = marshal_seq(host, py, &s.values().cloned().collect::<Vec<_>>())?;
+                Ok(PyFrozenSet::new(py, &elems)
+                    .map_err(|e| e.to_string())?
+                    .into_any())
+            }
+            Some(PyObj::Range { start, stop, step }) => {
+                let range = py
+                    .import("builtins")
+                    .and_then(|m| m.getattr("range"))
+                    .map_err(|e| e.to_string())?;
+                range
+                    .call1((*start, *stop, *step))
+                    .map_err(|e| e.to_string())
+            }
+            Some(PyObj::Complex(re, im)) => {
+                let cplx = py
+                    .import("builtins")
+                    .and_then(|m| m.getattr("complex"))
+                    .map_err(|e| e.to_string())?;
+                cplx.call1((*re, *im)).map_err(|e| e.to_string())
+            }
+            Some(PyObj::Deque { items, maxlen }) => {
+                let elems = marshal_seq(host, py, &items.iter().cloned().collect::<Vec<_>>())?;
+                let pylist = PyList::new(py, elems).map_err(|e| e.to_string())?;
+                let deque = py
+                    .import("collections")
+                    .and_then(|m| m.getattr("deque"))
+                    .map_err(|e| e.to_string())?;
+                match maxlen {
+                    Some(n) => deque.call1((pylist, *n)),
+                    None => deque.call1((pylist,)),
+                }
+                .map_err(|e| e.to_string())
             }
             Some(PyObj::Dict(d)) => {
                 let dict = PyDict::new(py);
@@ -311,9 +369,147 @@ fn invoke_bound(
 ) -> Result<Value, String> {
     let (arg_tuple, kw) = with_host(|h| build_call_args(h, py, args, kwargs))?;
     let result = callable
-        .call(arg_tuple, kw.as_ref())
+        .call(&arg_tuple, kw.as_ref())
         .map_err(|e| e.to_string())?;
-    with_host(|h| py_to_value(h, py, &result))
+    with_host(|h| {
+        // Reflect any in-place mutation the stdlib call made to a by-value
+        // mutable-container argument (`heapq.heapify(lst)`, `random.shuffle(lst)`,
+        // `struct.pack_into(fmt, buf, …)`) back into the pythonrs object.
+        writeback_mutated_args(h, py, args, &arg_tuple);
+        py_to_value(h, py, &result)
+    })
+}
+
+/// The pythonrs mutable-container kinds whose in-place mutation by a CPython
+/// stdlib call must be copied back after the call. Immutable arguments
+/// (`str`/`tuple`/`frozenset`/`bytes`/scalars), `Foreign` handles (which are the
+/// *same* CPython object — mutations are already visible), and callables never
+/// need write-back.
+#[derive(Clone, Copy)]
+enum MutKind {
+    List,
+    Bytearray,
+    Deque(Option<usize>),
+}
+
+/// For each positional argument that was marshaled by value as a mutable
+/// container, re-read the (possibly mutated) CPython object and overwrite the
+/// existing pythonrs heap slot *in place*, so aliases to the same object observe
+/// the mutation too. Best-effort: a container whose contents don't round-trip to
+/// representable values (a `Foreign` element) is left untouched rather than
+/// re-wrapped — that would allocate a fresh handle and is never what an in-place
+/// mutator produces in practice.
+fn writeback_mutated_args(
+    host: &mut PyHost,
+    py: Python,
+    args: &[Value],
+    arg_tuple: &Bound<PyTuple>,
+) {
+    for (i, orig) in args.iter().enumerate() {
+        let kind = match host.get(orig) {
+            Some(PyObj::List(_)) => MutKind::List,
+            Some(PyObj::Bytearray(_)) => MutKind::Bytearray,
+            Some(PyObj::Deque { maxlen, .. }) => MutKind::Deque(*maxlen),
+            _ => continue,
+        };
+        let Ok(cpy) = arg_tuple.get_item(i) else {
+            continue;
+        };
+        if let Some(obj) = rebuild_mutable(host, py, &cpy, kind) {
+            if let Some(slot) = host.get_mut(orig) {
+                *slot = obj;
+            }
+        }
+    }
+}
+
+/// Rebuild the pythonrs `PyObj` for a mutable container from its CPython object
+/// after an in-place mutation. Returns `None` (skip write-back) if any element is
+/// not representable by value.
+fn rebuild_mutable(
+    host: &mut PyHost,
+    py: Python,
+    cpy: &Bound<PyAny>,
+    kind: MutKind,
+) -> Option<PyObj> {
+    match kind {
+        MutKind::Bytearray => {
+            let ba = cpy.downcast::<PyByteArray>().ok()?;
+            Some(PyObj::Bytearray(ba.to_vec()))
+        }
+        MutKind::List => {
+            let items = pure_seq(host, py, cpy)?;
+            Some(PyObj::List(items))
+        }
+        MutKind::Deque(maxlen) => {
+            let items = pure_seq(host, py, cpy)?;
+            Some(PyObj::Deque {
+                items: items.into_iter().collect(),
+                maxlen,
+            })
+        }
+    }
+}
+
+/// Iterate a CPython container and marshal every element by value, yielding
+/// `None` if any element is not representable (so the caller skips write-back).
+fn pure_seq(host: &mut PyHost, py: Python, cpy: &Bound<PyAny>) -> Option<Vec<Value>> {
+    let it = cpy.try_iter().ok()?;
+    let mut out = Vec::new();
+    for item in it {
+        out.push(pure_value(host, py, &item.ok()?)?);
+    }
+    Some(out)
+}
+
+/// A CPython object → pythonrs `Value` *without* the `Foreign` fallback: returns
+/// `None` for anything not representable by value. Used only by write-back, whose
+/// contract is "reflect an in-place mutation losslessly, or leave the object
+/// alone" — never allocate a new `Foreign` handle (that would leak on every call
+/// and change identity). [`py_to_value`] is the authoritative marshaler and keeps
+/// unrepresentable results as `Foreign`; the two contracts differ, so they stay
+/// separate functions.
+fn pure_value(host: &mut PyHost, py: Python, obj: &Bound<PyAny>) -> Option<Value> {
+    if obj.is_none() {
+        return Some(Value::Undef);
+    }
+    if obj.is_exact_instance_of::<PyBool>() {
+        return obj.extract::<bool>().ok().map(Value::Bool);
+    }
+    if obj.is_exact_instance_of::<PyInt>() {
+        return match obj.extract::<i64>() {
+            Ok(n) => Some(Value::Int(n)),
+            Err(_) => {
+                let s = obj.str().ok()?.to_string();
+                s.parse::<num_bigint::BigInt>()
+                    .ok()
+                    .map(|b| host.alloc(PyObj::BigInt(b)))
+            }
+        };
+    }
+    if obj.is_exact_instance_of::<PyFloat>() {
+        return obj.extract::<f64>().ok().map(Value::Float);
+    }
+    if obj.is_exact_instance_of::<PyString>() {
+        return obj.extract::<String>().ok().map(|s| host.new_str(s));
+    }
+    if obj.is_exact_instance_of::<PyBytes>() {
+        let b = obj.downcast::<PyBytes>().ok()?;
+        return Some(host.alloc(PyObj::Bytes(b.as_bytes().to_vec())));
+    }
+    if obj.is_exact_instance_of::<PyByteArray>() {
+        let b = obj.downcast::<PyByteArray>().ok()?;
+        return Some(host.alloc(PyObj::Bytearray(b.to_vec())));
+    }
+    if obj.is_exact_instance_of::<PyList>() {
+        let items = pure_seq(host, py, obj)?;
+        return Some(host.new_list(items));
+    }
+    if obj.is_exact_instance_of::<PyTuple>() {
+        let items = pure_seq(host, py, obj)?;
+        return Some(host.new_tuple(items));
+    }
+    None
 }
 
 #[allow(clippy::type_complexity)]

@@ -413,3 +413,109 @@ fn ffi_reverse_callback_into_fusevm() {
         "110"
     );
 }
+
+/// A non-callable pythonrs object passed *into* a CPython stdlib call must
+/// marshal to its CPython equivalent by value. `list`/`dict`/`tuple`/`set`/`str`/
+/// `bytes`/`int`/`float`/`None` already crossed; this adds `range`, `complex`,
+/// `collections.deque`, and `frozenset` — all previously rejected with
+/// `cannot pass '<type>' to a CPython stdlib call`.
+#[cfg(feature = "stdlib-ffi")]
+#[test]
+fn ffi_marshals_value_types_into_cpython_calls() {
+    // range → CPython range.
+    assert_eq!(
+        g(
+            "import functools\nx = functools.reduce(lambda a, b: a + b, range(1, 6))",
+            "x"
+        ),
+        "15"
+    );
+    // complex → CPython complex.
+    assert_eq!(g("import cmath\nx = cmath.sqrt(complex(-1, 0))", "x"), "1j");
+    // collections.deque → CPython deque.
+    assert_eq!(
+        g(
+            "import collections, functools\nx = functools.reduce(lambda a, b: a + b, collections.deque([1, 2, 3]))",
+            "x"
+        ),
+        "6"
+    );
+    // frozenset → CPython frozenset (fold is order-independent).
+    assert_eq!(
+        g(
+            "import functools\nx = functools.reduce(lambda a, b: a + b, frozenset([1, 2, 3]))",
+            "x"
+        ),
+        "6"
+    );
+    // nested dict/list by value through json.
+    assert_eq!(
+        g(
+            "import json\nx = json.dumps({\"a\": [1, 2], \"b\": {\"c\": 3}})",
+            "x"
+        ),
+        "'{\"a\": [1, 2], \"b\": {\"c\": 3}}'"
+    );
+}
+
+/// An in-place stdlib mutator (`heapq.heapify`, `random.shuffle`,
+/// `struct.pack_into`) must reflect its mutation back into the pythonrs object —
+/// by-value marshaling copies the argument, so without write-back the mutation
+/// was silently lost. Aliases to the same object must observe it too (the heap
+/// slot is overwritten in place, never reallocated).
+#[cfg(feature = "stdlib-ffi")]
+#[test]
+fn ffi_inplace_mutation_writes_back() {
+    // heapq.heapify mutates the list in place.
+    assert_eq!(
+        g("import heapq\nh = [5, 3, 8, 1, 2]\nheapq.heapify(h)", "h"),
+        "[1, 2, 8, 3, 5]"
+    );
+    // an alias sees the same mutation.
+    assert_eq!(
+        g(
+            "import heapq\nh = [5, 3, 8, 1, 2]\ng = h\nheapq.heapify(h)",
+            "g"
+        ),
+        "[1, 2, 8, 3, 5]"
+    );
+    // random.shuffle (Mersenne-Twister stable across CPython versions).
+    assert_eq!(
+        g(
+            "import random\nrandom.seed(42)\nx = list(range(10))\nrandom.shuffle(x)",
+            "x"
+        ),
+        "[7, 3, 2, 8, 5, 6, 9, 4, 0, 1]"
+    );
+    // struct.pack_into writes into a bytearray in place.
+    assert_eq!(
+        g(
+            "import struct\nb = bytearray(4)\nstruct.pack_into(\">I\", b, 0, 1000)\nr = list(b)",
+            "r"
+        ),
+        "[0, 0, 3, 232]"
+    );
+}
+
+/// A stdlib call marshaled purely by value (`heapq.heapify`: list in, `None` out,
+/// mutation written back by value) must not allocate a `Foreign` side-table slot
+/// per iteration — only the one-time module handle is stored. This bounds the
+/// side-table for the value-marshaled churn path (the write-back marshaler never
+/// calls `store`). Foreign-*returning* churn (e.g. `re.match` match objects) is a
+/// separate, host-arena-lifetime matter documented in FFI_STDLIB.md.
+#[cfg(feature = "stdlib-ffi")]
+#[test]
+fn ffi_value_marshaled_churn_is_bounded() {
+    let before = pythonrs::ffi::table_len();
+    eval_str(
+        "import heapq\nfor i in range(2000):\n    h = [5, 3, 8, 1, 2, i]\n    heapq.heapify(h)",
+    )
+    .unwrap();
+    let grew = pythonrs::ffi::table_len() - before;
+    // 2000 iterations; a per-iteration leak would add ~2000. A small constant
+    // (module handles, incl. any from other tests sharing the process) is fine.
+    assert!(
+        grew < 100,
+        "value-marshaled churn grew the side-table by {grew} over 2000 iterations (expected a small constant, not O(iters))"
+    );
+}
