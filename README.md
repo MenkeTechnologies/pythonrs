@@ -174,8 +174,9 @@ is a real gap. `PYTHONRS_FUZZ_PYTHON` names the reference interpreter; a
 Active, in development. The runtime executes a substantial real subset of Python
 3. [BUGS.md](BUGS.md) is the honest ledger of unimplemented features — `async`,
 `bytes` operations, and most of the standard library are not yet carried. A DAP
-debug adapter (`--dap`), man pages, and the generated `reference.html` land
-alongside the growing builtin surface.
+debug adapter (`--dap`) — source-line and function breakpoints, stepping, call
+stack, locals, and expression `evaluate` — ships today, alongside man pages and
+the generated `reference.html`.
 
 ## [0x08] DOCUMENTATION
 

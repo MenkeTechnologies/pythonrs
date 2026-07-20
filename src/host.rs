@@ -14,6 +14,7 @@
 //!     function, class, instance, bound-method, exception, iterator, module,
 //!     bignum, complex — the reference types.
 
+use crate::async_rt;
 use fusevm::{Chunk, NumOp, VMResult, Value, VM};
 use indexmap::IndexMap;
 use std::cell::RefCell;
@@ -177,6 +178,10 @@ pub struct FuncDef {
     pub chunk: Chunk,
     /// True if the body contains a `yield` (a generator function).
     pub is_generator: bool,
+    /// True for an `async def`: calling it builds a coroutine object (the body
+    /// does NOT run) which the asyncio event loop drives.
+    #[serde(default)]
+    pub is_async: bool,
 }
 
 /// A compiled lambda/comprehension body (same shape, unnamed).
@@ -314,6 +319,15 @@ pub enum PyObj {
     Generator {
         id: u32,
     },
+    /// An `asyncio` Future or Task, backed by a `FutureCell` in the async
+    /// runtime side-table (`crate::async_rt`). A Task additionally drives a
+    /// coroutine; both settle to a result or exception and fire done-callbacks.
+    Future {
+        id: u32,
+    },
+    /// The singleton asyncio event loop object (`get_event_loop()`), a thin
+    /// handle over the native ready-queue + timer-heap runtime.
+    EventLoop,
     /// A mutable byte string (`bytearray`). Held inline (a plain `Vec<u8>`),
     /// unlike the immutable [`PyObj::Bytes`].
     Bytearray(Vec<u8>),
@@ -584,10 +598,20 @@ pub struct PyHost {
     pub traceback: Vec<(String, u32)>,
 }
 
+/// Whether a [`GenCell`] backs a plain generator or an `async def` coroutine.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum GenKind {
+    Generator,
+    Coroutine,
+}
+
 /// One suspended generator. `coro` is `None` only while this generator is
 /// actively running (taken out across `Coroutine::resume`); `ctx` holds its
 /// volatile execution context (frames/signal/error/exc) while suspended.
 struct GenCell {
+    /// Whether this cell backs a plain generator or an `async def` coroutine
+    /// (drives `type().__name__` and `repr`, and gates `next()`/`for`).
+    kind: GenKind,
     coro: Option<corosensei::Coroutine<Value, Value, Result<Value, String>>>,
     /// Raw pointer to the coroutine body's `Yielder`, published on entry (same
     /// thread → valid for the body's life). Read by `yield` to suspend.
@@ -659,6 +683,7 @@ pub fn with_host<R>(f: impl FnOnce(&mut PyHost) -> R) -> R {
 /// Reset the host to a clean slate (fresh module frame).
 pub fn reset_host() {
     with_host(|h| *h = PyHost::new());
+    async_rt::reset();
 }
 
 /// Install the per-run CLI/runtime context on a freshly reset host: `sys.argv`,
@@ -968,13 +993,14 @@ impl PyHost {
     /// The call stack as (frame name, line) pairs, innermost first — for the DAP
     /// `stackTrace`. `owner` carries the function/class name where known.
     pub fn dbg_stack(&self) -> Vec<(String, u32)> {
+        // `f.name` is the frame's own name (`<module>` for the module frame, the
+        // function/method name for a call). `f.owner` is the *defining class* and
+        // is `None` for top-level functions, so reporting it collapsed every frame
+        // to `<module>` and broke both `stackTrace` names and function breakpoints.
         self.frames
             .iter()
             .rev()
-            .map(|f| {
-                let name = f.owner.clone().unwrap_or_else(|| "<module>".to_string());
-                (name, f.line)
-            })
+            .map(|f| (f.name.clone(), f.line))
             .collect()
     }
     /// The innermost frame's locals as (name, repr) pairs — for DAP `variables`.
@@ -1241,7 +1267,12 @@ impl PyHost {
                 Some(PyObj::Module { .. }) => "module".into(),
                 Some(PyObj::BigInt(_)) => "int".into(),
                 Some(PyObj::Complex(..)) => "complex".into(),
-                Some(PyObj::Generator { .. }) => "generator".into(),
+                Some(PyObj::Generator { id }) => match self.generators[*id as usize].kind {
+                    GenKind::Coroutine => "coroutine".into(),
+                    GenKind::Generator => "generator".into(),
+                },
+                Some(PyObj::Future { id }) => async_rt::future_type_name(*id).into(),
+                Some(PyObj::EventLoop) => "_UnixSelectorEventLoop".into(),
                 Some(PyObj::File { .. }) => "TextIOWrapper".into(),
                 Some(PyObj::Deque { .. }) => "deque".into(),
                 Some(PyObj::NamedTupleType { .. }) => "type".into(),
@@ -1355,7 +1386,25 @@ impl PyHost {
                 Some(PyObj::EnumerateObj { .. }) => {
                     format!("<enumerate object at 0x{:012x}>", self.addr_of(v))
                 }
-                Some(PyObj::Generator { id }) => format!("<generator object at 0x{id:012x}>"),
+                Some(PyObj::Generator { id }) => {
+                    let g = &self.generators[*id as usize];
+                    let nm = g
+                        .ctx
+                        .frames
+                        .first()
+                        .map(|f| f.name.clone())
+                        .unwrap_or_default();
+                    match g.kind {
+                        GenKind::Coroutine => {
+                            format!("<coroutine object {nm} at 0x{:012x}>", self.addr_of(v))
+                        }
+                        GenKind::Generator => {
+                            format!("<generator object {nm} at 0x{:012x}>", self.addr_of(v))
+                        }
+                    }
+                }
+                Some(PyObj::Future { id }) => async_rt::future_repr(*id),
+                Some(PyObj::EventLoop) => "<_UnixSelectorEventLoop running=False closed=False debug=False>".into(),
                 Some(PyObj::Bytearray(b)) => format!("bytearray(b{})", quote_bytes(b, true)),
                 Some(PyObj::File { id }) => self.file_repr(*id),
                 Some(PyObj::Deque { items, maxlen }) => {
@@ -5207,6 +5256,13 @@ pub fn run_user_func(
     let env = new_env(fv.env.clone());
     bind_params(&env, &def, &fv.defaults, &fv.kwonly_defaults, pos, kwargs)?;
     let owner = owner_opt.or_else(|| fv.owner.clone());
+    // `async def`: calling it returns a coroutine object; the body runs only
+    // when the event loop drives it (CPython does not execute it eagerly). An
+    // `async def` containing `yield` would be an async generator (not yet
+    // supported); plain async coroutines take this arm.
+    if def.is_async {
+        return Ok(make_coroutine(def.chunk.clone(), env, self_val, owner));
+    }
     // Generator function: build a suspended coroutine over the already-bound
     // frame; nothing of the body runs until the first `next`/iteration.
     if def.is_generator {
@@ -5743,6 +5799,28 @@ impl PyHost {
 /// Build a suspended generator whose body is `chunk`, run in a frame with the
 /// already-bound `env`. Nothing executes until the first `gen_resume`.
 fn make_generator(chunk: Chunk, env: Env, self_val: Option<Value>, owner: Option<String>) -> Value {
+    make_gen_kind(chunk, env, self_val, owner, GenKind::Generator)
+}
+
+/// Build a suspended `async def` coroutine object. Identical backing to a
+/// generator (a stackful `corosensei` coroutine that suspends at each `await`),
+/// but tagged `Coroutine` so `type().__name__` is `coroutine` and `repr` differs.
+pub fn make_coroutine(
+    chunk: Chunk,
+    env: Env,
+    self_val: Option<Value>,
+    owner: Option<String>,
+) -> Value {
+    make_gen_kind(chunk, env, self_val, owner, GenKind::Coroutine)
+}
+
+fn make_gen_kind(
+    chunk: Chunk,
+    env: Env,
+    self_val: Option<Value>,
+    owner: Option<String>,
+    kind: GenKind,
+) -> Value {
     let frame = Frame {
         env,
         globals_decl: HashSet::new(),
@@ -5755,6 +5833,7 @@ fn make_generator(chunk: Chunk, env: Env, self_val: Option<Value>, owner: Option
     let id = with_host(|h| {
         let id = h.generators.len() as u32;
         h.generators.push(GenCell {
+            kind,
             coro: None,
             yielder: std::ptr::null(),
             ctx: GenContext {
@@ -5815,6 +5894,25 @@ pub fn gen_yield(v: Value) -> Result<Value, String> {
 pub fn gen_started(gen: &Value) -> bool {
     match with_host(|h| h.get(gen).cloned()) {
         Some(PyObj::Generator { id }) => with_host(|h| h.generators[id as usize].started),
+        _ => false,
+    }
+}
+
+/// The value a finished coroutine/generator `return`ed (its `StopIteration`
+/// value). `None` (`Undef`) for a fall-off-the-end return.
+pub fn coro_return_value(gen: &Value) -> Value {
+    match with_host(|h| h.get(gen).cloned()) {
+        Some(PyObj::Generator { id }) => with_host(|h| h.gen_return_value(id)),
+        _ => Value::Undef,
+    }
+}
+
+/// Whether `v` is a coroutine object (from an `async def`).
+pub fn is_coroutine(v: &Value) -> bool {
+    match with_host(|h| h.get(v).cloned()) {
+        Some(PyObj::Generator { id }) => {
+            with_host(|h| h.generators[id as usize].kind == GenKind::Coroutine)
+        }
         _ => false,
     }
 }
