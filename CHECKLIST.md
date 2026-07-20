@@ -325,27 +325,40 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
       heap id and threads it into `str_format_percent`/`format_conv`, so the formatter
       no longer prints `<C object>`. Covers `%` and `%=`. Byte-verified vs CPython
       (instance, container, mixed tuple, mapping, width/precision).
-- [ ] **`str.format` / f-string advanced spec** — **f-string nested field specs FIXED:**
-      `f'{x:{w}.2f}'`/`f'{3.14159:{5}.{2}f}'`/`f'{42:>{width}}'` now expand the `{…}` inside
+- [x] **`str.format` / f-string advanced spec** — **f-string nested field specs FIXED:**
+      `f'{x:{w}.2f}'`/`f'{3.14159:{5}.{2}f}'`/`f'{42:>{width}}'` expand the `{…}` inside
       the spec as their own replacement fields at runtime (spec is compiled as a mini
-      joined-string; cache SCHEMA→12), byte-verified vs CPython. Still open: `str.format`
-      nested fields `'{:{}}'`/`'{:.{}f}'` drop the spec (the `str_dot_format` field scanner
-      stops at the first `}`); keyword `'{name}'`, index `'{0[0]}'`,
-      attribute `'{0.imag}'` fields → `None`; the `=` debug specifier `f'{x=}'` is a **`SyntaxError`**;
-      `g` type treated as fixed precision (never switches to exponent / strips zeros);
-      `c` type and `e` exponent (`1.2e5` want `1.2e+05`) wrong. (Sign-aware `=`/`0`
-      fill — the fill after the sign and any `0x`/`0o`/`0b` prefix, plus the space
-      sign flag — is now correct.)
+      joined-string; cache SCHEMA→12), byte-verified vs CPython. **`str.format` nested
+      field specs + keyword/index/attribute fields FIXED:** `'{:{}}'`/`'{:.{}f}'`/
+      `'{:>{width}.{prec}f}'` now evaluate the `{…}` inside the spec and splice it in
+      (a brace-depth-aware field scanner + shared automatic-field counter, mirroring the
+      f-string path); keyword `'{name}'.format(name=…)`, positional-index `'{0[1]}'`,
+      subscript `'{d[k]}'`, and attribute `'{0.real}'` field access all resolve. Byte-
+      verified vs CPython (`format2` fuzz mode, 0 divergences). Still open: the `=` debug
+      specifier `f'{x=}'` is a **`SyntaxError`**. (`g`/`c`/`e` type handling and sign-aware
+      `=`/`0` fill are correct.)
 - [ ] **str method args silently ignored** — `split`/`rsplit` maxsplit, `find`/`index`
       start, `splitlines(keepends)` all ignored → wrong values, no error.
 - [x] **Missing str methods** — FIXED: `partition`/`rpartition`/`rindex`/`isnumeric`/
       `isdecimal`/`istitle`/`isidentifier`/`isprintable`/`expandtabs`/`translate`/
       `format_map` (instance methods) + `str.maketrans` (static method on the `str`
       type object, like `dict.fromkeys`). All byte-verified vs CPython.
-- [ ] **bytes / bytearray non-functional** — `b'hello'` evaluates to an **empty
-      string**; `len(b'hello')`→`0`; indexing/iteration/slicing/all methods broken;
-      `bytes([65,66])`→`b''`; `bytes.fromhex`/`.hex()`/`.decode()` missing; `bytearray`
-      undefined. `[in-flight]` Blocks binary I/O + `hashlib`/`base64`.
+- [x] **bytes / bytearray** — real heap types, byte-verified vs CPython (`bytesops`
+      fuzz mode, 0 divergences). Construction (`b'…'`, `bytes([65,66])`, `bytes(3)`,
+      `bytearray(b'…')`, `bytes.fromhex`/`bytearray.fromhex`), `len`, integer indexing
+      (`b[0]`→int), iteration/`list()`, slicing (`b[1:3]`/`b[::-1]`), concat (`b1+b2`,
+      result type follows the left operand), repeat (`b*3`), membership (`int in b`,
+      bytes-like substring `b'a' in b'abc'`), ordering (`<`/`==` incl. bytes vs
+      bytearray). Str-parallel methods returning/taking bytes: `split`/`rsplit`
+      (maxsplit + whitespace)/`join`/`replace`/`find`/`rfind`/`index`/`rindex`/`count`
+      (start/end)/`startswith`/`endswith` (tuple + start/end)/`strip`/`lstrip`/`rstrip`/
+      `upper`/`lower`/`splitlines`/`partition`/`rpartition`/`removeprefix`/`removesuffix`/
+      `decode`/`hex`. `bytearray` item assignment (`ba[0]=65`) + slice assignment
+      (`ba[1:2]=b'xy'`, `ba[::2]=…`) + `append`/`extend`/`pop`/`clear`. `repr` matches
+      CPython quoting (single/double-quote selection; the bytearray `\'`-escape quirk).
+      Remaining bytes gaps: `swapcase`/`title`/`capitalize`/`center`/`ljust`/`rjust`/
+      `zfill`/`expandtabs`/`translate`/`maketrans`/`isX` predicates, `%`-formatting on
+      bytes, `del ba[i]`/`del ba[i:j]`, and the `errors=` arg on `decode`.
 - [ ] **`str.encode` ignores the codec/errors args** — always UTF-8 (`'x'.encode('utf-16')`
       wrong).
 - [x] **`repr` doesn't escape C0 controls** (`\x00`-`\x1f`, ` `) — data-corrupting

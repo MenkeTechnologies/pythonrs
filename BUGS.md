@@ -47,17 +47,33 @@ fixed. Every line below was re-checked against the **default-build** binary
 - **`%s`/`%r`/`%a` dispatch a user instance's `__str__`/`__repr__`/`ascii(repr)`**
   (and recurse into containers holding instances), matching f-strings/`.format`;
   the format args' dispatched values are pre-resolved outside the host borrow.
-- **Nested f-string format specs** `f'{x:{w}.2f}'` / `f'{3.14159:{5}.{2}f}'` /
-  `f'{42:>{width}}'`: the `{…}` inside a spec is evaluated as its own replacement
-  field at runtime and spliced into the final spec before formatting.
+- **Nested format specs (f-string AND `str.format`)** `f'{x:{w}.2f}'` /
+  `f'{3.14159:{5}.{2}f}'` / `'{:{}}'.format('hi', 10)` /
+  `'{:>{width}.{prec}f}'.format(v, width=10, prec=2)`: the `{…}` inside a spec is
+  evaluated as its own replacement field (sharing the automatic-field counter) and
+  spliced into the final spec before formatting.
+- **`str.format` keyword / index / attribute fields** `'{name}'.format(name=…)`,
+  `'{0[1]}'.format(seq)`, `'{d[k]}'.format(d=…)` (unquoted subscript key → str),
+  `'{0.real}'.format(x)` (attribute access) — all resolve against the positional
+  args, kwargs, and accessor chain.
 - **`\N{NAME}`** named-Unicode escapes decode in normal and f-strings.
 - **File I/O**: `open()` (text/binary, read/write/append), `.read`/`.readline`/
   `.readlines`/`.write`, line iteration, and `with open(...) as f:` work in the
   default build.
-- **`bytes`/`bytearray` are real heap types** (no longer an empty placeholder):
-  construction (`b'…'`, `bytes([65,66])`, `bytearray(b'…')`), `len`, integer
-  indexing (`b[0]` → int), iteration/`list()`, `.decode()`, `.hex()`, `.upper()`,
-  and `bytearray.append`/`.extend` all work. See Partial below for what is not.
+- **`bytes`/`bytearray` are real heap types** with the full sequence + method
+  surface (byte-verified vs CPython via the `bytesops` fuzz mode, 0 divergences):
+  construction (`b'…'`, `bytes([65,66])`, `bytes(3)`, `bytearray(b'…')`,
+  `bytes.fromhex`/`bytearray.fromhex`), `len`, integer indexing (`b[0]`→int),
+  iteration/`list()`, slicing (`b[1:3]`, `b[::-1]`), concat (`b1+b2`, result type
+  follows the left operand), repeat (`b*3`), membership (`int in b` byte-value,
+  bytes-like substring `b'a' in b'abc'`), ordering (`<`/`==`, incl. bytes vs
+  bytearray). Str-parallel methods returning/taking bytes:
+  `split`/`rsplit`/`join`/`replace`/`find`/`rfind`/`index`/`rindex`/`count`/
+  `startswith`/`endswith`/`strip`/`lstrip`/`rstrip`/`upper`/`lower`/`splitlines`/
+  `partition`/`rpartition`/`removeprefix`/`removesuffix`/`decode`/`hex`.
+  `bytearray` item + slice assignment (`ba[0]=65`, `ba[1:2]=b'xy'`, `ba[::2]=…`),
+  plus `append`/`extend`/`pop`/`clear`. `repr` matches CPython quoting (single/
+  double-quote selection; the bytearray always-escape-`'` quirk).
 - **Comprehension scope**: list/set/dict comprehensions run in their own function
   scope, so the loop variable no longer leaks; enclosing variables are still read
   through the closure (the outermost iterable is evaluated in the enclosing
@@ -92,18 +108,15 @@ fixed. Every line below was re-checked against the **default-build** binary
 - **`int`** is arbitrary precision (bignum) across `+ - * ** // %` and the bitwise
   ops `& | ^ << >>` — verified byte-identical to CPython on `10**30`-scale values
   (the earlier i64-cap on `//`/`%`/bitwise is gone).
-- **`bytes`/`bytearray`** (real types — see Implemented) are **incomplete**:
-  slicing (`b[1:3]`), concatenation/repetition (`b + b`, `b * 2`), `in`
-  membership (`b'i' in b'hi'` wrongly returns `False`), most methods
-  (`.split`/`.find`/…), `bytes.fromhex`, `%`-formatting on bytes, and
-  `bytearray` item assignment (`ba[0] = 90` → `TypeError`) are not implemented.
-- **f-string format spec** covers the common mini-language (fill/align/sign/width/
-  `,`/`.prec`/type `d f e x o b % s`) and now **nested field specs**
-  (`f'{x:{w}.2f}'`, see Implemented).
-- **`str.format`** supports `{}`, `{0}`, and `:spec`; **not** bound: keyword
-  fields `{name}` (no kwargs plumbing — `'{name}'.format(name='x')` yields
-  `None`) and nested-field specs `'{:{}}'` (the `str_dot_format` field scanner
-  stops at the first `}`).
+- **`bytes`/`bytearray`** (real types — see Implemented) still lack a few string-
+  parallel methods (`swapcase`/`title`/`capitalize`/`center`/`ljust`/`rjust`/
+  `zfill`/`expandtabs`/`translate`/`maketrans`/the `isX` predicates),
+  `%`-formatting on bytes (`b'%d' % 5`), `del ba[i]`/`del ba[i:j]`, and the
+  `errors=` argument on `.decode()` (only the codec is honored).
+- **f-string / `str.format` format spec** covers the common mini-language
+  (fill/align/sign/width/`,`/`.prec`/type `d f e x o b % s c g`) and nested field
+  specs (see Implemented). The `=` debug specifier `f'{x=}'` is still a
+  `SyntaxError`.
 
 ## Tooling
 - **`--dap`** (Debug Adapter Protocol): implemented — breakpoints, step

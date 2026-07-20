@@ -1140,6 +1140,105 @@ fn gen_strfmt2(seed: u64) -> Vec<String> {
     }
 }
 
+/// `bytes`/`bytearray` literals with repr edge cases (quotes, control bytes,
+/// non-ASCII). Every generated case has deterministic stdout in both engines.
+const BLIT: &[&str] = &[
+    "b'hello'",
+    "b'World'",
+    "b'abcabc'",
+    "b''",
+    "b'a'",
+    "b'foo bar'",
+    "b'a,b,c'",
+    "b'  pad  '",
+    "b'AbC'",
+    "b'x-y-z'",
+    "b'ab.cd.ef'",
+    "b\"a'b\"",
+    "b'a\"b'",
+    "b'tab\\ther'",
+    "b'\\x00\\xff'",
+];
+/// Non-empty single/short byte separators (never `b''`, which raises).
+const BSEP: &[&str] = &["b','", "b'-'", "b'.'", "b' '", "b'a'", "b'X'", "b'cd'"];
+/// ASCII-only byte literals safe to `.decode('utf-8')`/`'ascii'`.
+const BDEC: &[&str] = &["b'hello'", "b'World'", "b'abc'", "b''", "b'A,B,C'"];
+
+fn gen_bytesops(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let b = pick(r, BLIT);
+    let b2 = pick(r, BLIT);
+    let sep = pick(r, BSEP);
+    let idx = pick(r, &["0", "1", "2", "-1", "-2", "3"]);
+    let jdx = pick(r, &["0", "1", "2", "3", "-1", "5"]);
+    let n = r.below(3);
+    let e = match r.below(26) {
+        0 => format!("print({b})"),
+        1 => format!("print(bytearray({b}))"),
+        2 => format!("print(repr({b}), repr(bytearray({b})))"),
+        3 => format!("print({b}[{idx}:{jdx}], {b}[::-1], {b}[::2])"),
+        4 => format!("print({b} + {b2}, bytearray({b}) + {b2})"),
+        5 => format!("print({b} * {n}, {n} * bytearray({b}))"),
+        6 => format!("print({sep} in {b}, 97 in {b}, 300 not in {b})"),
+        7 => format!("print({b}.split({sep}), {b}.split())"),
+        8 => format!("print({b}.rsplit({sep}, 1), {b}.rsplit())"),
+        9 => format!("print({sep}.join([b'a', b'b', b'c']), bytearray({sep}).join([{b}]))"),
+        10 => format!("print({b}.replace({sep}, b'YY'), {b}.replace({sep}, b'', 1))"),
+        11 => format!("print({b}.find({sep}), {b}.rfind({sep}), {b}.count({sep}))"),
+        12 => format!("print({b}.startswith({sep}), {b}.endswith({sep}))"),
+        13 => format!("print({b}.strip(), {b}.lstrip(), {b}.rstrip())"),
+        14 => "print(b'xxhelloxx'.strip(b'x'), b'--a--'.lstrip(b'-'))".to_string(),
+        15 => format!("print({b}.upper(), {b}.lower())"),
+        16 => "print(b'a\\nb\\r\\nc\\rd'.splitlines(), b'a\\nb\\n'.splitlines(True))".to_string(),
+        17 => format!("print({b}.partition({sep}), {b}.rpartition({sep}))"),
+        18 => format!("print({b}.removeprefix(b'a'), {b}.removesuffix(b'c'))"),
+        19 => format!("print(bytes.fromhex('48656c6c6f20'), {b}.hex())"),
+        20 => "print(bytes([72, 105]), bytes(3), bytearray([65, 66]))".to_string(),
+        21 => format!("print(list({b}), len({b}))"),
+        22 => {
+            let d = pick(r, BDEC);
+            format!("print({d}.decode('utf-8'), {d}.decode('ascii'))")
+        }
+        23 => {
+            let v = 65 + r.below(20);
+            format!("ba = bytearray(b'abcdef')\nba[{idx}] = {v}\nprint(ba)")
+        }
+        24 => format!("ba = bytearray(b'abcdef')\nba[{idx}:{jdx}] = b'XY'\nprint(ba)"),
+        _ => format!("print({b} < {b2}, {b} == bytearray({b}), {b} != {b2})"),
+    };
+    vec![e]
+}
+
+/// `str.format` nested field specs plus keyword / positional-index / attribute /
+/// subscript replacement fields.
+fn gen_format2(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let w = pick(r, &["4", "6", "8", "10", "12"]);
+    let p = pick(r, &["1", "2", "3", "4"]);
+    let f = pick(r, &["3.14159", "2.5", "12345.678", "0.5", "-7.25"]);
+    let s = pick(r, WORDS);
+    let a = pick(r, INTS);
+    let b = pick(r, INTS);
+    let e = match r.below(15) {
+        0 => format!("print('{{:{{}}}}'.format({s}, {w}))"),
+        1 => format!("print('{{:.{{}}f}}'.format({f}, {p}))"),
+        2 => format!("print('{{:{{}}.{{}}f}}'.format({f}, {w}, {p}))"),
+        3 => format!("print('{{:>{{wd}}.{{pr}}f}}'.format({f}, wd={w}, pr={p}))"),
+        4 => format!("print('{{name}}'.format(name={s}))"),
+        5 => format!("print('{{0}}-{{1}}-{{0}}'.format({a}, {b}))"),
+        6 => format!("print('{{0[1]}}'.format([{a}, {b}, 9]))"),
+        7 => format!("print('{{d[k]}}'.format(d={{'k': {a}}}))"),
+        8 => format!("print('{{0.real}}|{{0.imag}}'.format(complex({a}, {b})))"),
+        9 => format!("print('{{:{{fill}}>{{wd}}}}'.format({s}, fill='-', wd={w}))"),
+        10 => format!("print('{{v:{{aa}}.{{bb}}f}}'.format(v={f}, aa={w}, bb={p}))"),
+        11 => format!("print('{{0:{{1}}}}'.format({s}, {w}))"),
+        12 => format!("print('{{:+.{{}}e}}'.format({f}, {p}))"),
+        13 => format!("print('{{o[0]}}/{{o[2]}}'.format(o=({a}, 0, {b})))"),
+        _ => format!("print('{{:^{{}}}}'.format({s}, {w}), '{{:*^{{}}}}'.format({s}, {w}))"),
+    };
+    vec![e]
+}
+
 // ---------------------------------------------------------------------------
 // Mode dispatch
 // ---------------------------------------------------------------------------
@@ -1178,6 +1277,8 @@ enum Mode {
     Closures,
     Oop2,
     Strfmt2,
+    Bytesops,
+    Format2,
 }
 
 const REAL_MODES: &[Mode] = &[
@@ -1212,6 +1313,8 @@ const REAL_MODES: &[Mode] = &[
     Mode::Closures,
     Mode::Oop2,
     Mode::Strfmt2,
+    Mode::Bytesops,
+    Mode::Format2,
 ];
 
 /// Generate the statement list for a seed in the selected mode. `Mixed` rotates
@@ -1253,6 +1356,8 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Closures => gen_closures(seed),
         Mode::Oop2 => gen_oop2(seed),
         Mode::Strfmt2 => gen_strfmt2(seed),
+        Mode::Bytesops => gen_bytesops(seed),
+        Mode::Format2 => gen_format2(seed),
     }
 }
 
@@ -1290,6 +1395,8 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Closures => "closures",
         Mode::Oop2 => "oop2",
         Mode::Strfmt2 => "strfmt2",
+        Mode::Bytesops => "bytesops",
+        Mode::Format2 => "format2",
     }
 }
 
@@ -1327,6 +1434,8 @@ fn mode_from_name(s: &str) -> Option<Mode> {
         Mode::Closures,
         Mode::Oop2,
         Mode::Strfmt2,
+        Mode::Bytesops,
+        Mode::Format2,
     ];
     ALL.iter().copied().find(|&m| mode_name(m) == s)
 }

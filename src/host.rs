@@ -1229,7 +1229,7 @@ impl PyHost {
                 Some(PyObj::Str(s)) => s.clone(),
                 Some(PyObj::BigInt(b)) => b.to_string(),
                 Some(PyObj::Complex(r, i)) => fmt_complex(*r, *i),
-                Some(PyObj::Bytes(b)) => format!("b{}", quote_bytes(b)),
+                Some(PyObj::Bytes(b)) => format!("b{}", quote_bytes(b, false)),
                 Some(PyObj::Instance(inst)) => {
                     // A user exception instance stringifies to its message
                     // (`BaseException.__str__`): ''/str(arg)/repr(tuple).
@@ -1280,7 +1280,7 @@ impl PyHost {
                     format!("<enumerate object at 0x{:012x}>", self.addr_of(v))
                 }
                 Some(PyObj::Generator { id }) => format!("<generator object at 0x{id:012x}>"),
-                Some(PyObj::Bytearray(b)) => format!("bytearray(b{})", quote_bytes(b)),
+                Some(PyObj::Bytearray(b)) => format!("bytearray(b{})", quote_bytes(b, true)),
                 Some(PyObj::File { id }) => self.file_repr(*id),
                 Some(PyObj::Deque { items, maxlen }) => {
                     let inner: Vec<String> = items.iter().map(|x| self.repr_of(x)).collect();
@@ -2173,19 +2173,37 @@ fn quote_str(s: &str) -> String {
     out
 }
 
-fn quote_bytes(b: &[u8]) -> String {
-    let mut out = String::from("'");
+/// Render the `'…'`/`"…"` quoted body of a `bytes`/`bytearray` repr. CPython
+/// defaults to a single quote, switching to a double quote only when the buffer
+/// contains a `'` but no `"`. `bytes` escapes just the chosen quote char; a
+/// `bytearray` always escapes `'` (even under a `"` quote) — a CPython quirk
+/// (`bytearray(b"a'b")` → `bytearray(b"a\'b")`).
+fn quote_bytes(b: &[u8], is_bytearray: bool) -> String {
+    let has_single = b.contains(&b'\'');
+    let has_double = b.contains(&b'"');
+    let quote = if has_single && !has_double {
+        b'"'
+    } else {
+        b'\''
+    };
+    let mut out = String::new();
+    out.push(quote as char);
     for &c in b {
         match c {
             b'\\' => out.push_str("\\\\"),
-            b'\n' => out.push_str("\\n"),
             b'\t' => out.push_str("\\t"),
+            b'\n' => out.push_str("\\n"),
             b'\r' => out.push_str("\\r"),
+            _ if c == quote => {
+                out.push('\\');
+                out.push(quote as char);
+            }
+            b'\'' if is_bytearray => out.push_str("\\'"),
             0x20..=0x7e => out.push(c as char),
             _ => out.push_str(&format!("\\x{c:02x}")),
         }
     }
-    out.push('\'');
+    out.push(quote as char);
     out
 }
 
@@ -2258,6 +2276,21 @@ impl PyHost {
                         let mut v = x.clone();
                         v.extend(y.clone());
                         Ok(self.new_tuple(v))
+                    }
+                    // bytes/bytearray concat — the result type follows the left
+                    // operand (`b'a' + bytearray(b'b')` → bytes;
+                    // `bytearray(b'a') + b'b'` → bytearray).
+                    (Some(PyObj::Bytes(x)), Some(PyObj::Bytes(y)))
+                    | (Some(PyObj::Bytes(x)), Some(PyObj::Bytearray(y))) => {
+                        let mut v = x.clone();
+                        v.extend_from_slice(y);
+                        Ok(self.alloc(PyObj::Bytes(v)))
+                    }
+                    (Some(PyObj::Bytearray(x)), Some(PyObj::Bytes(y)))
+                    | (Some(PyObj::Bytearray(x)), Some(PyObj::Bytearray(y))) => {
+                        let mut v = x.clone();
+                        v.extend_from_slice(y);
+                        Ok(self.alloc(PyObj::Bytearray(v)))
                     }
                     _ => Err(self.optype_err("+", a, b)),
                 }
@@ -2396,6 +2429,22 @@ impl PyHost {
                 }
                 Ok(Some(self.new_tuple(out)))
             }
+            Some(PyObj::Bytes(s)) => {
+                let base = s.clone();
+                let mut out = Vec::with_capacity(base.len() * n);
+                for _ in 0..n {
+                    out.extend_from_slice(&base);
+                }
+                Ok(Some(self.alloc(PyObj::Bytes(out))))
+            }
+            Some(PyObj::Bytearray(s)) => {
+                let base = s.clone();
+                let mut out = Vec::with_capacity(base.len() * n);
+                for _ in 0..n {
+                    out.extend_from_slice(&base);
+                }
+                Ok(Some(self.alloc(PyObj::Bytearray(out))))
+            }
             _ => Ok(None),
         }
     }
@@ -2445,6 +2494,12 @@ impl PyHost {
         }
         match (self.get(a), self.get(b)) {
             (Some(PyObj::Str(x)), Some(PyObj::Str(y))) => Ok(x.cmp(y)),
+            // bytes/bytearray order lexicographically by byte value (a bytes and
+            // a bytearray of equal content compare equal).
+            (Some(PyObj::Bytes(x)), Some(PyObj::Bytes(y)))
+            | (Some(PyObj::Bytes(x)), Some(PyObj::Bytearray(y)))
+            | (Some(PyObj::Bytearray(x)), Some(PyObj::Bytes(y)))
+            | (Some(PyObj::Bytearray(x)), Some(PyObj::Bytearray(y))) => Ok(x.cmp(y)),
             (Some(PyObj::List(x)), Some(PyObj::List(y)))
             | (Some(PyObj::Tuple(x)), Some(PyObj::Tuple(y))) => {
                 for (p, q) in x.iter().zip(y.iter()) {
@@ -3268,6 +3323,34 @@ impl PyHost {
                 step: rstep * step,
             }));
         }
+        // Slicing bytes/bytearray yields a new buffer of the same type.
+        if let Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) = self.get(recv) {
+            let is_ba = matches!(self.get(recv), Some(PyObj::Bytearray(_)));
+            let src = b.clone();
+            let n = src.len() as i64;
+            let (mut i, stop) = slice_bounds(lo, hi, step, n, self);
+            let mut out = Vec::new();
+            if step > 0 {
+                while i < stop {
+                    if i >= 0 && i < n {
+                        out.push(src[i as usize]);
+                    }
+                    i += step;
+                }
+            } else {
+                while i > stop {
+                    if i >= 0 && i < n {
+                        out.push(src[i as usize]);
+                    }
+                    i += step;
+                }
+            }
+            return Ok(if is_ba {
+                self.alloc(PyObj::Bytearray(out))
+            } else {
+                self.alloc(PyObj::Bytes(out))
+            });
+        }
         let is_str = matches!(self.get(recv), Some(PyObj::Str(_)));
         let items: Vec<Value> = match self.get(recv) {
             Some(PyObj::List(l)) | Some(PyObj::Tuple(l)) => l.clone(),
@@ -3345,6 +3428,27 @@ impl PyHost {
                 let kv = idx.clone();
                 if let Some(PyObj::Dict(d)) = self.get_mut(recv) {
                     dict_put(d, key, kv, val);
+                }
+                Ok(())
+            }
+            // `ba[i] = int` — a single byte in `0..=256`.
+            Some(PyObj::Bytearray(b)) => {
+                let n = b.len() as i64;
+                let i = self
+                    .as_int(idx)
+                    .ok_or_else(|| type_error("bytearray indices must be integers"))?;
+                let k = if i < 0 { i + n } else { i };
+                if k < 0 || k >= n {
+                    return Err("IndexError: bytearray index out of range".into());
+                }
+                let v = self
+                    .as_int(&val)
+                    .ok_or_else(|| type_error("an integer is required"))?;
+                if !(0..=255).contains(&v) {
+                    return Err("ValueError: byte must be in range(0, 256)".into());
+                }
+                if let Some(PyObj::Bytearray(b)) = self.get_mut(recv) {
+                    b[k as usize] = v as u8;
                 }
                 Ok(())
             }
@@ -3430,6 +3534,10 @@ impl PyHost {
         if step == 0 {
             return Err("ValueError: slice step cannot be zero".into());
         }
+        // `ba[i:j] = bytes-like` — the replacement's items are ints in `0..=256`.
+        if matches!(self.get(recv), Some(PyObj::Bytearray(_))) {
+            return self.set_bytearray_slice(recv, lo, hi, step, repl);
+        }
         let n = match self.get(recv) {
             Some(PyObj::List(l)) => l.len() as i64,
             _ => {
@@ -3462,6 +3570,59 @@ impl PyHost {
             if let Some(PyObj::List(l)) = self.get_mut(recv) {
                 for (idx, v) in indices.into_iter().zip(repl) {
                     l[idx as usize] = v;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// `bytearray[lo:hi:step] = repl` — `repl` is the RHS iterable already
+    /// materialized to a `Vec<Value>` of ints. A contiguous slice (step == 1)
+    /// splices any-length; an extended slice needs an exact-length replacement.
+    fn set_bytearray_slice(
+        &mut self,
+        recv: &Value,
+        lo: &Value,
+        hi: &Value,
+        step: i64,
+        repl: Vec<Value>,
+    ) -> Result<(), String> {
+        let mut bytes = Vec::with_capacity(repl.len());
+        for v in &repl {
+            let n = self
+                .as_int(v)
+                .ok_or_else(|| type_error("an integer is required"))?;
+            if !(0..=255).contains(&n) {
+                return Err("ValueError: byte must be in range(0, 256)".into());
+            }
+            bytes.push(n as u8);
+        }
+        let n = match self.get(recv) {
+            Some(PyObj::Bytearray(b)) => b.len() as i64,
+            _ => return Err(type_error("expected a bytearray")),
+        };
+        if step == 1 {
+            let (start, stop) = slice_bounds(lo, hi, 1, n, self);
+            let (start, stop) = (
+                start.clamp(0, n) as usize,
+                stop.clamp(0, n).max(start) as usize,
+            );
+            if let Some(PyObj::Bytearray(b)) = self.get_mut(recv) {
+                b.splice(start..stop, bytes);
+            }
+            Ok(())
+        } else {
+            let indices = self.slice_indices(lo, hi, step, n);
+            if indices.len() != bytes.len() {
+                return Err(format!(
+                    "ValueError: attempt to assign bytes of size {} to extended slice of size {}",
+                    bytes.len(),
+                    indices.len()
+                ));
+            }
+            if let Some(PyObj::Bytearray(b)) = self.get_mut(recv) {
+                for (idx, v) in indices.into_iter().zip(bytes) {
+                    b[idx as usize] = v;
                 }
             }
             Ok(())
@@ -3716,6 +3877,30 @@ impl PyHost {
             Some(PyObj::Set(s)) | Some(PyObj::Frozenset(s)) => {
                 let key = self.to_key(item)?;
                 Ok(s.contains_key(&key))
+            }
+            // `int in bytes` tests byte-value membership; a bytes-like `in bytes`
+            // is a substring search (`b'i' in b'hi'` → True).
+            Some(PyObj::Bytes(hay)) | Some(PyObj::Bytearray(hay)) => {
+                let hay = hay.clone();
+                if let Some(n) = self.as_int(item) {
+                    if !(0..=255).contains(&n) {
+                        return Err("ValueError: byte must be in range(0, 256)".into());
+                    }
+                    return Ok(hay.contains(&(n as u8)));
+                }
+                let needle = match self.get(item) {
+                    Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) => b.clone(),
+                    _ => {
+                        return Err(type_error(&format!(
+                            "a bytes-like object is required, or an integer, not '{}'",
+                            self.type_name(item)
+                        )))
+                    }
+                };
+                if needle.is_empty() {
+                    return Ok(true);
+                }
+                Ok(hay.windows(needle.len()).any(|w| w == needle.as_slice()))
             }
             Some(PyObj::Range { start, stop, step }) => {
                 let (start, stop, step) = (*start, *stop, *step);
@@ -4102,6 +4287,10 @@ impl PyHost {
             // `str.maketrans` — a static method on the `str` type.
             Some(PyObj::Builtin(n)) if n == "str" && name == "maketrans" => {
                 Ok(self.alloc(PyObj::Builtin("str.maketrans".into())))
+            }
+            // `bytes.fromhex` / `bytearray.fromhex` — classmethods on the type.
+            Some(PyObj::Builtin(n)) if (n == "bytes" || n == "bytearray") && name == "fromhex" => {
+                Ok(self.alloc(PyObj::Builtin(format!("{n}.fromhex"))))
             }
             _ => {
                 // Numeric `.real`/`.imag` (int/float/bool/bigint/complex are all
