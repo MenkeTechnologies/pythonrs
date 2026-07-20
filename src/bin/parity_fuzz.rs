@@ -2986,6 +2986,253 @@ fn gen_conttail(seed: u64) -> Vec<String> {
     }
 }
 
+/// Iterator protocol & the builtin-function tail. Covers the already-landed
+/// `iter(callable, sentinel)` (2-arg `callable_iterator`) and the `zip()`-no-args
+/// guard, plus the wider surface: `next(it, default)`, `reversed`/`__reversed__`,
+/// `enumerate(start=)`, `zip(*its, strict=True)` length-mismatch, multi-iterable
+/// `map`, `filter(None, ...)`, stable `sorted(key=, reverse=)`, `min`/`max` with
+/// `key=`/`default=`/vararg forms, `sum(start=)`, short-circuit `all`/`any`,
+/// `in` via `__contains__`/`__iter__`/`__getitem__` fallback, `len` via `__len__`,
+/// and `range` object semantics (index/slice/len/`in`/negative-step/equality).
+/// Output is deterministic — printed values, counts, sorted lists, `bool`s, and
+/// `type(e).__name__` for the raising arms; never a repr carrying an address.
+fn gen_itertail(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let a = pick(r, SMALLINTS);
+    let b = pick(r, SMALLINTS);
+    let c = pick(r, SMALLINTS);
+    match r.below(24) {
+        // ---- iter(callable, sentinel): 2-arg callable_iterator ----
+        0 => {
+            let sent = pick(r, &["3", "0", "5", "-1"]);
+            vec![
+                "def mk():".into(),
+                "    state = {'i': 0}".into(),
+                "    def step():".into(),
+                "        state['i'] += 1".into(),
+                "        return state['i']".into(),
+                "    return step".into(),
+                format!("it = iter(mk(), {sent})"),
+                "print(list(it))".into(),
+                "print(type(it).__name__)".into(),
+                "print(iter(it) is it)".into(),
+            ]
+        }
+        // ---- iter(callable, sentinel) with next()/default ----
+        1 => vec![
+            "buf = list('abcXdef')".into(),
+            "pos = {'i': 0}".into(),
+            "def rd():".into(),
+            "    i = pos['i']".into(),
+            "    pos['i'] = i + 1".into(),
+            "    return buf[i]".into(),
+            "it = iter(rd, 'X')".into(),
+            "print(next(it))".into(),
+            "print(next(it))".into(),
+            "print(next(it))".into(),
+            "print(next(it, 'DONE'))".into(),
+            "print(next(it, 'DONE'))".into(),
+        ],
+        // ---- zip() with no args (empty iterator) + zip strict ----
+        2 => vec![
+            "print(list(zip()))".into(),
+            "print(list(zip([])))".into(),
+            format!("print(list(zip([{a}, {b}], [{c}])))"),
+            "try:".into(),
+            format!("    print(list(zip([{a}, {b}, {c}], [1, 2], strict=True)))"),
+            "except ValueError as e:".into(),
+            "    print('ValueError')".into(),
+        ],
+        // ---- zip strict equal-length succeeds ----
+        3 => vec![format!(
+            "print(list(zip([{a}, {b}, {c}], [1, 2, 3], strict=True)))"
+        )],
+        // ---- next(it, default) exhaustion vs bare next raising ----
+        4 => vec![
+            format!("it = iter([{a}, {b}])"),
+            "print(next(it))".into(),
+            "print(next(it))".into(),
+            "print(next(it, 'end'))".into(),
+            "it2 = iter([])".into(),
+            "try:".into(),
+            "    next(it2)".into(),
+            "except StopIteration:".into(),
+            "    print('StopIteration')".into(),
+        ],
+        // ---- reversed on list/tuple/range/str ----
+        5 => {
+            let seq = pick(
+                r,
+                &[
+                    "[3, 1, 2]",
+                    "(5, 4, 6)",
+                    "range(4)",
+                    "range(2, 9, 3)",
+                    "'abcd'",
+                    "[]",
+                ],
+            );
+            vec![format!("print(list(reversed({seq})))")]
+        }
+        // ---- custom __reversed__ ----
+        6 => vec![
+            "class D:".into(),
+            format!("    def __init__(self): self.v = [{a}, {b}, {c}]"),
+            "    def __len__(self): return len(self.v)".into(),
+            "    def __getitem__(self, i): return self.v[i]".into(),
+            "    def __reversed__(self): return iter(['R'] + self.v)".into(),
+            "d = D()".into(),
+            "print(list(reversed(d)))".into(),
+        ],
+        // ---- reversed via __len__/__getitem__ (no __reversed__) ----
+        7 => vec![
+            "class Seq:".into(),
+            format!("    def __init__(self): self.v = [{a}, {b}, {c}]"),
+            "    def __len__(self): return len(self.v)".into(),
+            "    def __getitem__(self, i): return self.v[i]".into(),
+            "print(list(reversed(Seq())))".into(),
+        ],
+        // ---- enumerate with start= ----
+        8 => {
+            let st = pick(r, &["0", "1", "5", "-2", "100"]);
+            vec![format!(
+                "print(list(enumerate(['a', 'b', 'c', 'd'], start={st})))"
+            )]
+        }
+        // ---- map over multiple iterables (stops at shortest) ----
+        9 => vec![format!(
+            "print(list(map(lambda x, y: x + y, [{a}, {b}, {c}], [10, 20])))"
+        )],
+        // ---- map with 3 iterables ----
+        10 => vec![format!(
+            "print(list(map(lambda x, y, z: x * y + z, [{a}, {b}], [2, 3], [1, 1, 1])))"
+        )],
+        // ---- filter(None, ...) = truthiness ----
+        11 => vec![format!(
+            "print(list(filter(None, [{a}, 0, {b}, '', {c}, None, [], 'x'])))"
+        )],
+        // ---- sorted with key + reverse, stability ----
+        12 => vec![
+            "data = [('b', 2), ('a', 2), ('c', 1), ('d', 1), ('e', 2)]".into(),
+            "print(sorted(data, key=lambda t: t[1]))".into(),
+            "print(sorted(data, key=lambda t: t[1], reverse=True))".into(),
+            "print(sorted('dbca'))".into(),
+        ],
+        // ---- sorted key= abs ----
+        13 => vec![format!(
+            "print(sorted([{a}, {b}, {c}, -4, 4, -1], key=abs))"
+        )],
+        // ---- min/max with key= and default= ----
+        14 => vec![
+            "words = ['bb', 'a', 'cccc', 'ddd']".into(),
+            "print(min(words, key=len))".into(),
+            "print(max(words, key=len))".into(),
+            "print(min([], default='none'))".into(),
+            "print(max([], default=-1))".into(),
+        ],
+        // ---- min/max vararg forms ----
+        15 => vec![
+            format!("print(min({a}, {b}, {c}))"),
+            format!("print(max({a}, {b}, {c}))"),
+            format!("print(min({a}, {b}, {c}, key=abs))"),
+            format!("print(max({a}, {b}, {c}, key=lambda x: -x))"),
+        ],
+        // ---- sum with start= ----
+        16 => {
+            let st = pick(r, &["0", "10", "-5", "100"]);
+            vec![
+                format!("print(sum([{a}, {b}, {c}], {st}))"),
+                format!("print(sum([{a}, {b}, {c}]))"),
+                "print(sum([[1], [2], [3]], []))".into(),
+            ]
+        }
+        // ---- all/any short-circuit + empty ----
+        17 => vec![
+            "print(all([]))".into(),
+            "print(any([]))".into(),
+            format!("print(all([{a}, {b}, {c}]))"),
+            format!("print(any([0, 0, {a}]))"),
+            "print(all([1, 1, 0, 1]))".into(),
+            "print(any([0, 0, 0]))".into(),
+        ],
+        // ---- __contains__ custom ----
+        18 => {
+            let probe = pick(r, &["2", "7", "0", "-1"]);
+            vec![
+                "class Even:".into(),
+                "    def __contains__(self, x): return x % 2 == 0".into(),
+                "e = Even()".into(),
+                format!("print({probe} in e)"),
+                format!("print({probe} not in e)"),
+            ]
+        }
+        // ---- in fallback via __iter__ (no __contains__) ----
+        19 => {
+            let probe = pick(r, &["2", "9", "0"]);
+            vec![
+                "class It:".into(),
+                format!("    def __iter__(self): return iter([{a}, {b}, {c}])"),
+                format!("print({probe} in It())"),
+            ]
+        }
+        // ---- in fallback via __getitem__ (no __contains__/__iter__) ----
+        20 => {
+            let probe = pick(r, &["1", "4", "0"]);
+            vec![
+                "class G:".into(),
+                format!("    def __init__(self): self.v = [{a}, {b}, {c}]"),
+                "    def __getitem__(self, i):".into(),
+                "        if i >= len(self.v): raise IndexError".into(),
+                "        return self.v[i]".into(),
+                format!("print({probe} in G())"),
+            ]
+        }
+        // ---- constructors from iterables ----
+        21 => vec![
+            "g = (x * x for x in range(5))".into(),
+            "print(list(g))".into(),
+            format!("print(tuple(x for x in [{a}, {b}, {c}]))"),
+            "print(sorted(set([1, 2, 2, 3, 3, 3])))".into(),
+            "print(sorted(frozenset([3, 1, 2, 1])))".into(),
+            "print(dict([('a', 1), ('b', 2)]))".into(),
+            "print(dict(zip('xy', [1, 2])))".into(),
+        ],
+        // ---- range object semantics ----
+        22 => {
+            let start = pick(r, &["0", "2", "-3", "10"]);
+            let stop = pick(r, &["10", "5", "-5", "20"]);
+            let step = pick(r, &["1", "2", "3", "-1", "-2"]);
+            let idx = pick(r, &["0", "1", "-1", "2"]);
+            let probe = pick(r, &["3", "0", "-2", "7"]);
+            vec![
+                format!("rg = range({start}, {stop}, {step})"),
+                "print(list(rg))".into(),
+                "print(len(rg))".into(),
+                format!("print({probe} in rg)"),
+                "if len(rg):".into(),
+                format!("    print(rg[{idx}])"),
+                "print(list(rg[1:4]))".into(),
+                "print(list(rg[::-1]))".into(),
+                format!("print(range(0, 10, 2) == range(0, 10, 2))"),
+                "print(range(0, 4) == range(0, 4, 1))".into(),
+            ]
+        }
+        // ---- len via __len__, and mixed iter of iterators ----
+        _ => vec![
+            "class L:".into(),
+            format!("    def __len__(self): return {}", 3 + (r.below(5) as i64)),
+            "print(len(L()))".into(),
+            format!("print(len(range({start}, {stop})))",
+                start = pick(r, &["0", "2", "5"]),
+                stop = pick(r, &["8", "10", "3"])),
+            "it = iter(range(5))".into(),
+            "print(next(it))".into(),
+            "print(list(it))".into(),
+            "print(list(map(str, filter(lambda x: x > 1, [0, 1, 2, 3]))))".into(),
+        ],
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Mode dispatch
 // ---------------------------------------------------------------------------
@@ -3038,6 +3285,7 @@ enum Mode {
     Calls,
     Match,
     Conttail,
+    Itertail,
 }
 
 const REAL_MODES: &[Mode] = &[
@@ -3086,6 +3334,7 @@ const REAL_MODES: &[Mode] = &[
     Mode::Calls,
     Mode::Match,
     Mode::Conttail,
+    Mode::Itertail,
 ];
 
 /// Generate the statement list for a seed in the selected mode. `Mixed` rotates
@@ -3141,6 +3390,7 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Calls => gen_calls(seed),
         Mode::Match => gen_match(seed),
         Mode::Conttail => gen_conttail(seed),
+        Mode::Itertail => gen_itertail(seed),
     }
 }
 
@@ -3192,6 +3442,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Calls => "calls",
         Mode::Match => "match",
         Mode::Conttail => "conttail",
+        Mode::Itertail => "itertail",
     }
 }
 
@@ -3243,6 +3494,7 @@ fn mode_from_name(s: &str) -> Option<Mode> {
         Mode::Calls,
         Mode::Match,
         Mode::Conttail,
+        Mode::Itertail,
     ];
     ALL.iter().copied().find(|&m| mode_name(m) == s)
 }
