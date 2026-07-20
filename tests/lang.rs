@@ -57,9 +57,15 @@ fn percent_format_dispatches_instance_str_repr() {
     assert_eq!(g(&format!("{cls}x = '%a' % C()"), "x"), "'R'");
     // mixed tuple: instance + plain value
     assert_eq!(g(&format!("{cls}x = '%s=%d' % (C(), 5)"), "x"), "'S=5'");
-    assert_eq!(g(&format!("{cls}x = '%s %r %a' % (C(), C(), C())"), "x"), "'S R R'");
+    assert_eq!(
+        g(&format!("{cls}x = '%s %r %a' % (C(), C(), C())"), "x"),
+        "'S R R'"
+    );
     // container holding instances (recurses through repr dispatch)
-    assert_eq!(g(&format!("{cls}x = '%s' % ([C(), C()],)"), "x"), "'[R, R]'");
+    assert_eq!(
+        g(&format!("{cls}x = '%s' % ([C(), C()],)"), "x"),
+        "'[R, R]'"
+    );
     assert_eq!(g(&format!("{cls}x = '%r' % ((C(),),)"), "x"), "'(R,)'");
     // mapping form
     assert_eq!(g(&format!("{cls}x = '%(k)r' % {{'k': C()}}"), "x"), "'R'");
@@ -70,7 +76,10 @@ fn percent_format_dispatches_instance_str_repr() {
     assert_eq!(g(&format!("{cls}x = '%s'\nx %= C()"), "x"), "'S'");
     // `%a` ascii-escapes a non-ASCII dispatched repr
     assert_eq!(
-        g("class U:\n    def __repr__(s): return 'é'\nx = '%a' % U()", "x"),
+        g(
+            "class U:\n    def __repr__(s): return 'é'\nx = '%a' % U()",
+            "x"
+        ),
         "'\\\\xe9'"
     );
     // plain values unaffected (no regression)
@@ -82,11 +91,17 @@ fn fstring_nested_format_specs() {
     // A format spec may itself contain replacement fields, evaluated at runtime
     // and spliced into the spec before formatting (CPython semantics).
     assert_eq!(g("x = f'{3.14159:{5}.{2}f}'", "x"), "' 3.14'");
-    assert_eq!(g("w = 8\nn = 2\nx = f'{3.14159:{w}.{n}f}'", "x"), "'    3.14'");
+    assert_eq!(
+        g("w = 8\nn = 2\nx = f'{3.14159:{w}.{n}f}'", "x"),
+        "'    3.14'"
+    );
     assert_eq!(g("w = 8\nx = f'{42:>{w}}'", "x"), "'      42'");
     assert_eq!(g("w = 8\nx = f'{42:0{w}d}'", "x"), "'00000042'");
     assert_eq!(g("x = f'{\"x\":{\"*\"}>{6}}'", "x"), "'*****x'");
-    assert_eq!(g("w = 10\nx = f'{\"mid\":{\"=\"}^{w}}'", "x"), "'===mid===='");
+    assert_eq!(
+        g("w = 10\nx = f'{\"mid\":{\"=\"}^{w}}'", "x"),
+        "'===mid===='"
+    );
     assert_eq!(g("w = 8\nx = f'{255:#{w}x}'", "x"), "'    0xff'");
     // nested field with its own conversion
     assert_eq!(g("w = 5\nx = f'{3.14:>{w}}'", "x"), "' 3.14'");
@@ -1889,4 +1904,75 @@ fn format_spec_sign_aware_zero_pad() {
     // A `+`/space sign flag prefixes a non-negative value.
     assert_eq!(g("s = f'{5: d}'", "s"), "' 5'");
     assert_eq!(g("s = f'{7:>6d}'", "s"), "'     7'");
+}
+
+// ── async / await / asyncio (native fusevm event loop) ───────────────────────
+
+#[test]
+fn async_def_returns_coroutine() {
+    // Calling an `async def` returns a coroutine object; the body does NOT run.
+    assert_eq!(
+        g(
+            "async def f():\n    return 1\nc = f()\nt = type(c).__name__\nimport asyncio\nasyncio.run(c)",
+            "t"
+        ),
+        "'coroutine'"
+    );
+}
+
+#[test]
+fn asyncio_run_awaits_result() {
+    assert_eq!(
+        g(
+            "import asyncio\nasync def main():\n    await asyncio.sleep(0)\n    return 7\nr = asyncio.run(main())",
+            "r"
+        ),
+        "7"
+    );
+}
+
+#[test]
+fn asyncio_gather_ordered_results() {
+    assert_eq!(
+        g(
+            "import asyncio\nasync def sq(n):\n    await asyncio.sleep(0)\n    return n*n\nasync def main():\n    return await asyncio.gather(sq(1), sq(2), sq(3))\nr = asyncio.run(main())",
+            "r"
+        ),
+        "[1, 4, 9]"
+    );
+}
+
+#[test]
+fn asyncio_create_task_and_future() {
+    // A Task sets a Future's result; the main coroutine awaits the Future.
+    assert_eq!(
+        g(
+            "import asyncio\nasync def setter(fut):\n    await asyncio.sleep(0)\n    fut.set_result(99)\nasync def main():\n    fut = asyncio.Future()\n    asyncio.create_task(setter(fut))\n    return await fut\nr = asyncio.run(main())",
+            "r"
+        ),
+        "99"
+    );
+}
+
+#[test]
+fn await_exception_propagates() {
+    assert_eq!(
+        g(
+            "import asyncio\nasync def boom():\n    await asyncio.sleep(0)\n    raise ValueError('nope')\nasync def main():\n    try:\n        await boom()\n    except ValueError as e:\n        return str(e)\nr = asyncio.run(main())",
+            "r"
+        ),
+        "'nope'"
+    );
+}
+
+#[test]
+fn asyncio_sleep_timer_ordering() {
+    // Timers fire in virtual-clock order regardless of scheduling order.
+    assert_eq!(
+        g(
+            "import asyncio\nout = []\nasync def t(name, d):\n    await asyncio.sleep(d)\n    out.append(name)\nasync def main():\n    await asyncio.gather(t('slow', 0.2), t('fast', 0.1), t('mid', 0.15))\nasyncio.run(main())",
+            "out"
+        ),
+        "['fast', 'mid', 'slow']"
+    );
 }

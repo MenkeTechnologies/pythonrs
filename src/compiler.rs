@@ -195,9 +195,9 @@ impl Compiler {
                 params,
                 body,
                 decorators,
-                ..
+                is_async,
             } => {
-                self.compile_funcdef(b, name, params, body, decorators)?;
+                self.compile_funcdef(b, name, params, body, decorators, *is_async)?;
             }
             StmtKind::ClassDef {
                 name,
@@ -551,9 +551,10 @@ impl Compiler {
         params: &Params,
         body: &[Stmt],
         decorators: &[Expr],
+        is_async: bool,
     ) -> Result<(), String> {
         self.fn_depth += 1;
-        let def_id = self.build_function(name, params, body);
+        let def_id = self.build_function_ex(name, params, body, is_async);
         self.fn_depth -= 1;
         let def_id = def_id?;
         self.emit_make_func(b, def_id, params)?;
@@ -598,6 +599,16 @@ impl Compiler {
         params: &Params,
         body: &[Stmt],
     ) -> Result<usize, String> {
+        self.build_function_ex(name, params, body, false)
+    }
+
+    fn build_function_ex(
+        &mut self,
+        name: &str,
+        params: &Params,
+        body: &[Stmt],
+        is_async: bool,
+    ) -> Result<usize, String> {
         let mut fb = ChunkBuilder::new();
         self.compile_stmts(&mut fb, body)?;
         let is_generator = body_has_yield(body);
@@ -612,6 +623,7 @@ impl Compiler {
             kwargs: params.kwargs.clone(),
             chunk: fb.build(),
             is_generator,
+            is_async,
         };
         self.functions.push((name.to_string(), def));
         Ok(self.functions.len() - 1)
@@ -974,7 +986,13 @@ impl Compiler {
                 // expression value (the sub-generator's return) is None here.
                 self.compile_yield_from(b, inner)?;
             }
-            Expr::Await(inner) => self.compile_expr(b, inner)?,
+            Expr::Await(inner) => {
+                // `await E` — evaluate the awaitable, then drive it: the AWAIT op
+                // suspends the running coroutine (yielding up to the event loop)
+                // until the awaitable settles, then leaves its result.
+                self.compile_expr(b, inner)?;
+                b.emit(Op::CallBuiltin(ops::AWAIT, 1), 0);
+            }
         }
         Ok(())
     }

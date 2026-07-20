@@ -82,10 +82,29 @@ fixed. Every line below was re-checked against the **default-build** binary
   through the closure (the outermost iterable is evaluated in the enclosing
   scope, matching CPython).
 
+## Implemented — async/await/asyncio (native fusevm event loop)
+- **`async def` / `await` / `asyncio`.** `async def f()` returns a real coroutine
+  object (`type(f()).__name__ == 'coroutine'`; the body does **not** run on call),
+  backed by the same stackful `corosensei` coroutine as generators — each `await`
+  is a suspension point. `await` drives an awaitable (a coroutine, an
+  `asyncio.Future`/`Task`, or an object with `__await__`), suspending the running
+  coroutine (yielding up to its Task) until it settles, then resuming with the
+  result (or raising its exception). The event loop (`crate::async_rt`) is a native
+  ready-queue + timer-heap with a virtual clock, single-thread and cooperative like
+  CPython's. `asyncio.run`/`sleep`/`gather`/`create_task`/`ensure_future`/
+  `wait_for`/`get_event_loop`/`get_running_loop`/`Future` all run on it, verified
+  byte-for-byte vs CPython (coroutine type, ordered `gather` results, `create_task`
+  interleaving, `Future.set_result` + await, exception propagation across `await`,
+  and `asyncio.sleep` timer ordering).
+  **Not yet:** `async for` / `async with` / async comprehensions (see below);
+  async generators (`async def` containing `yield`); `asyncio.wait`/`as_completed`/
+  `Queue`/`Event`/`Lock`; task cancellation propagation (`Task.cancel` settles the
+  future but does not inject `CancelledError` into a suspended coroutine).
+
 ## Not yet implemented (compile/parse-time error, no silent wrong answer)
-- **`async`/`await`.** Parsed, but there is no event loop: `async def f()` runs
-  **synchronously** and `f()` returns the body's value directly (CPython returns a
-  coroutine object). `await` is a no-op passthrough. `asyncio` is unavailable.
+- **`async for` / `async with` / async comprehensions.** The async statement
+  forms and `[x async for x in ag()]` are not yet lowered (async comprehension is
+  still a `SyntaxError`).
 - **`yield from` sent values.** The delegate's `return` value is now forwarded,
   but a value `send()`-ed into the delegating generator does not reach the
   sub-generator (`x = yield` inside the delegate sees `None`, not the sent value).

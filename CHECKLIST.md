@@ -458,9 +458,17 @@ kinds + guards), `for/else`/`while/else`, `try/except/else/finally` ordering all
       exhaustion, and `yield from` lowers to the new `GENRET` op so the expression
       evaluates to the sub-generator's return value. (Sent-value forwarding through
       `yield from` still not plumbed.)
-- [ ] **Async is non-functional** — `async def` executes eagerly and returns a plain
-      value (no coroutine); `asyncio` `ModuleNotFoundError`; **async comprehensions are
-      a `SyntaxError`**; `await` is a passthrough. Anything using an event loop fails.
+- [x] **`async`/`await`/`asyncio` on a native fusevm event loop** — FIXED: `async def`
+      returns a real coroutine object (body does not run on call), backed by the
+      generator/`corosensei` infra with each `await` a suspension point. `await` drives
+      coroutines / `asyncio.Future`s / `__await__` objects, suspending up to the driving
+      Task until the awaitable settles. Native ready-queue + timer-heap event loop
+      (`src/async_rt.rs`, virtual clock) powers `asyncio.run`/`sleep`/`gather`/
+      `create_task`/`ensure_future`/`wait_for`/`get_event_loop`/`Future` — byte-verified
+      vs CPython (coroutine type, ordered gather, task interleaving, Future set_result +
+      await, cross-await exception propagation, sleep timer ordering). **Still pending:**
+      `async for`/`async with`/async comprehensions, async generators, task cancellation
+      injection, `asyncio.wait`/`as_completed`/`Queue`/`Event`/`Lock`.
 - [x] **Bare `raise` re-raise** — FIXED: the except handler now keeps the caught
       exception as the "currently handled" one (`h.exc`) while its body runs, so a
       bare `raise` re-raises it (caught by an outer handler); it is cleared when the

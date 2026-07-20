@@ -41,7 +41,7 @@ use std::path::PathBuf;
 /// v12: f-string format specs are compiled as their own joined-string so nested
 /// replacement fields (`{w}` in `{x:{w}.2f}`) evaluate at runtime; older bytecode
 /// baked the spec as a literal constant and must miss cleanly.
-const SCHEMA: u64 = 13;
+const SCHEMA: u64 = 14;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]
