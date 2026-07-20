@@ -49,7 +49,12 @@ use std::path::PathBuf;
 /// v16: `yield from` lowers to a single `YIELD_FROM` op (full PEP 380 delegation:
 /// sent values, thrown exceptions, and close forwarded into the sub-iterator)
 /// instead of the old FORITER/YIELDV/GENRET loop that dropped sent values.
-const SCHEMA: u64 = 16;
+/// v17: a loop whose `break`/`continue` crosses a `try`/`with` boundary lowers
+/// its body to a `LOOP_BODY` sub-chunk driven by control signals (so a `finally`
+/// runs before the loop exit) instead of an in-chunk jump; `CProg` gained a
+/// `warnings` list (compile-time `SyntaxWarning`s). Older bytecode used the jump
+/// form (which panicked on that shape) and lacks the field, so it must miss.
+const SCHEMA: u64 = 17;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]
@@ -76,6 +81,7 @@ struct CProg {
     main: Chunk,
     functions: Vec<(String, FuncDef)>,
     tries: Vec<TryDef>,
+    warnings: Vec<(u32, String)>,
 }
 
 /// A stable content key for a source string (fast `FxHash`, used for lookup).
@@ -147,6 +153,7 @@ pub fn load(src: &str) -> Option<Program> {
         functions: cp.functions,
         procs: Vec::new(),
         tries: cp.tries,
+        warnings: cp.warnings,
     })
 }
 
@@ -158,6 +165,7 @@ pub fn store(src: &str, prog: &Program) -> Result<(), String> {
         main: prog.main.clone(),
         functions: prog.functions.clone(),
         tries: prog.tries.clone(),
+        warnings: prog.warnings.clone(),
     };
     let blob = bincode::serialize(&cp).map_err(|e| format!("cache encode: {e}"))?;
     let mut shard = load_shard();

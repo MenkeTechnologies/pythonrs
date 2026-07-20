@@ -26,6 +26,10 @@ pub struct Program {
     pub functions: Vec<(String, FuncDef)>,
     pub procs: Vec<FuncDef>,
     pub tries: Vec<TryDef>,
+    /// Compile-time `SyntaxWarning`s to emit to stderr before running (e.g.
+    /// `'return' in a 'finally' block`). `(line, keyword)`; carried through the
+    /// bytecode cache so a cache hit warns identically to a fresh compile.
+    pub warnings: Vec<(u32, String)>,
 }
 
 /// Rebase every func-id and try-id reference in `prog` so its ids sit above the
@@ -62,7 +66,7 @@ fn rebase_chunk(chunk: &mut Chunk, func_off: usize, try_off: usize) {
     for i in 1..chunk.ops.len() {
         let off = match chunk.ops[i] {
             Op::CallBuiltin(id, _) if id == ops::MKFUNC || id == ops::MKLAMBDA => func_off,
-            Op::CallBuiltin(id, 1) if id == ops::TRY => try_off,
+            Op::CallBuiltin(id, 1) if id == ops::TRY || id == ops::LOOP_BODY => try_off,
             _ => continue,
         };
         if off == 0 {
@@ -77,10 +81,14 @@ fn rebase_chunk(chunk: &mut Chunk, func_off: usize, try_off: usize) {
     }
 }
 
-/// Break/continue jump fixups for a native loop.
+/// Break/continue jump fixups for a native loop. When `signal` is set the loop
+/// body runs as a `LOOP_BODY` sub-chunk, so `break`/`continue` emit control
+/// signals instead of in-chunk jumps (they must cross a `try`/`with` boundary);
+/// the `breaks`/`continues` fixup lists stay empty in that mode.
 struct LoopCtx {
     breaks: Vec<usize>,
     continues: Vec<usize>,
+    signal: bool,
 }
 
 #[derive(Default)]
@@ -99,6 +107,8 @@ pub struct Compiler {
     /// comprehension leaks to module scope (`global`, depth 0) or the enclosing
     /// function (`nonlocal`, depth > 0), per PEP 572.
     fn_depth: usize,
+    /// Compile-time `SyntaxWarning`s collected while lowering (see `Program`).
+    warnings: Vec<(u32, String)>,
 }
 
 /// Compile a parsed program. `debug` enables per-statement DAP line markers.
@@ -114,6 +124,7 @@ pub fn compile(stmts: &[Stmt], debug: bool) -> Result<Program, String> {
         functions: c.functions,
         procs: Vec::new(),
         tries: c.tries,
+        warnings: c.warnings,
     })
 }
 
@@ -222,20 +233,30 @@ impl Compiler {
                 b.emit(Op::CallBuiltin(ops::SIG_RETURN, 1), line);
             }
             StmtKind::Break => {
-                let j = b.emit(Op::Jump(0), line);
-                self.loops
+                let lc = self
+                    .loops
                     .last_mut()
-                    .ok_or("SyntaxError: 'break' outside loop")?
-                    .breaks
-                    .push(j);
+                    .ok_or("SyntaxError: 'break' outside loop")?;
+                if lc.signal {
+                    b.emit(Op::CallBuiltin(ops::SIG_BREAK, 0), line);
+                    b.emit(Op::Pop, line);
+                } else {
+                    let j = b.emit(Op::Jump(0), line);
+                    self.loops.last_mut().unwrap().breaks.push(j);
+                }
             }
             StmtKind::Continue => {
-                let j = b.emit(Op::Jump(0), line);
-                self.loops
+                let lc = self
+                    .loops
                     .last_mut()
-                    .ok_or("SyntaxError: 'continue' outside loop")?
-                    .continues
-                    .push(j);
+                    .ok_or("SyntaxError: 'continue' outside loop")?;
+                if lc.signal {
+                    b.emit(Op::CallBuiltin(ops::SIG_CONTINUE, 0), line);
+                    b.emit(Op::Pop, line);
+                } else {
+                    let j = b.emit(Op::Jump(0), line);
+                    self.loops.last_mut().unwrap().continues.push(j);
+                }
             }
             StmtKind::Delete(targets) => {
                 for t in targets {
@@ -528,12 +549,16 @@ impl Compiler {
         body: &[Stmt],
         orelse: &[Stmt],
     ) -> Result<(), String> {
+        if loop_needs_signal(body) && !body_has_yield(body) {
+            return self.compile_while_signal(b, test, body, orelse);
+        }
         let start = b.current_pos();
         self.compile_condition(b, test)?;
         let jfalse = b.emit(Op::JumpIfFalse(0), 0);
         self.loops.push(LoopCtx {
             breaks: Vec::new(),
             continues: Vec::new(),
+            signal: false,
         });
         self.compile_stmts(b, body)?;
         b.emit(Op::Jump(start), 0);
@@ -561,6 +586,9 @@ impl Compiler {
         body: &[Stmt],
         orelse: &[Stmt],
     ) -> Result<(), String> {
+        if loop_needs_signal(body) && !body_has_yield(body) {
+            return self.compile_for_signal(b, target, iter, body, orelse);
+        }
         self.compile_expr(b, iter)?;
         b.emit(Op::CallBuiltin(ops::GETITER, 1), 0); // [iterator]
         let start = b.current_pos();
@@ -571,6 +599,7 @@ impl Compiler {
         self.loops.push(LoopCtx {
             breaks: Vec::new(),
             continues: Vec::new(),
+            signal: false,
         });
         self.compile_stmts(b, body)?;
         b.emit(Op::Jump(start), 0);
@@ -594,6 +623,91 @@ impl Compiler {
         for br in ctx.breaks {
             b.patch_jump(br, break_target);
         }
+        Ok(())
+    }
+
+    /// Compile `body` (in signal mode) into a sub-chunk and register it in the
+    /// try table, returning its id for a `LOOP_BODY` op. `break`/`continue` in
+    /// `body` emit control signals (they cross a `try`/`with` boundary).
+    fn register_loop_body(&mut self, body: &[Stmt]) -> Result<usize, String> {
+        self.loops.push(LoopCtx {
+            breaks: Vec::new(),
+            continues: Vec::new(),
+            signal: true,
+        });
+        let chunk = self.compile_block_chunk(body);
+        self.loops.pop();
+        let chunk = chunk?;
+        let id = self.tries.len();
+        self.tries.push(TryDef {
+            body: chunk,
+            handlers: Vec::new(),
+            orelse: None,
+            finalbody: None,
+        });
+        Ok(id)
+    }
+
+    /// `while` whose body `break`/`continue` cross a `try`/`with` boundary: the
+    /// body runs as a `LOOP_BODY` sub-chunk that returns `0` (next iteration) or
+    /// `1` (break); a `return` inside is propagated by the op itself.
+    fn compile_while_signal(
+        &mut self,
+        b: &mut ChunkBuilder,
+        test: &Expr,
+        body: &[Stmt],
+        orelse: &[Stmt],
+    ) -> Result<(), String> {
+        let id = self.register_loop_body(body)?;
+        let start = b.current_pos();
+        self.compile_condition(b, test)?;
+        let jfalse = b.emit(Op::JumpIfFalse(0), 0);
+        b.emit(Op::LoadInt(id as i64), 0);
+        b.emit(Op::CallBuiltin(ops::LOOP_BODY, 1), 0); // [code]
+        let jbreak = b.emit(Op::JumpIfTrue(0), 0); // pops code; 1 -> break
+        b.emit(Op::Jump(start), 0); // 0 -> re-test
+        let after_cond = b.current_pos();
+        b.patch_jump(jfalse, after_cond);
+        if !orelse.is_empty() {
+            self.compile_stmts(b, orelse)?;
+        }
+        let end = b.current_pos();
+        b.patch_jump(jbreak, end);
+        Ok(())
+    }
+
+    /// `for` counterpart of `compile_while_signal`.
+    fn compile_for_signal(
+        &mut self,
+        b: &mut ChunkBuilder,
+        target: &Expr,
+        iter: &Expr,
+        body: &[Stmt],
+        orelse: &[Stmt],
+    ) -> Result<(), String> {
+        let id = self.register_loop_body(body)?;
+        self.compile_expr(b, iter)?;
+        b.emit(Op::CallBuiltin(ops::GETITER, 1), 0); // [iterator]
+        let start = b.current_pos();
+        b.emit(Op::CallBuiltin(ops::FORITER, 0), 0); // [iterator, value, has_next] | [iterator, false]
+        let jdone = b.emit(Op::JumpIfFalse(0), 0); // pops has_next
+        self.compile_assign(b, target)?; // pops value -> [iterator]
+        b.emit(Op::LoadInt(id as i64), 0);
+        b.emit(Op::CallBuiltin(ops::LOOP_BODY, 1), 0); // [iterator, code]
+        let jbreak = b.emit(Op::JumpIfTrue(0), 0); // pops code; 1 -> break; [iterator]
+        b.emit(Op::Jump(start), 0); // 0 -> next iteration
+        let done = b.current_pos();
+        b.patch_jump(jdone, done);
+        b.emit(Op::Pop, 0); // drop iterator on exhaustion
+        if !orelse.is_empty() {
+            self.compile_stmts(b, orelse)?;
+        }
+        let jafter = b.emit(Op::Jump(0), 0);
+        let break_target = b.current_pos();
+        b.emit(Op::Pop, 0); // drop iterator on break
+        let end = b.current_pos();
+        b.patch_jump(jafter, end);
+        b.patch_jump(jbreak, break_target);
         Ok(())
     }
 
@@ -867,6 +981,11 @@ impl Compiler {
         orelse: &[Stmt],
         finalbody: &[Stmt],
     ) -> Result<(), String> {
+        // CPython's `SyntaxWarning: '<kw>' in a 'finally' block` for a
+        // `return`/`break`/`continue` that would jump out of THIS `finally`.
+        if !finalbody.is_empty() {
+            collect_finally_escapes(finalbody, &mut self.warnings);
+        }
         let body_chunk = self.compile_block_chunk(body)?;
         let mut hs = Vec::new();
         for h in handlers {
@@ -2194,4 +2313,75 @@ fn stmt_has_yield(s: &Stmt) -> bool {
 
 fn expr_has_yield(e: &Expr) -> bool {
     matches!(e, Expr::Yield(_) | Expr::YieldFrom(_))
+}
+
+/// Collect the `(line, keyword)` of every `return`/`break`/`continue` that would
+/// jump out of a `finally` block (CPython's `SyntaxWarning`). Descends through
+/// `if`/`with`/`match` and a nested `try`'s body/handlers/`else` — but NOT into a
+/// nested `try`'s own `finally` (that `try` reports it) nor into `for`/`while`/
+/// `def`/`class` (which capture their own control flow, so it never escapes).
+fn collect_finally_escapes(stmts: &[Stmt], out: &mut Vec<(u32, String)>) {
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Return(_) => out.push((s.line, "return".to_string())),
+            StmtKind::Break => out.push((s.line, "break".to_string())),
+            StmtKind::Continue => out.push((s.line, "continue".to_string())),
+            StmtKind::If { body, orelse, .. } => {
+                collect_finally_escapes(body, out);
+                collect_finally_escapes(orelse, out);
+            }
+            StmtKind::With { body, .. } => collect_finally_escapes(body, out),
+            StmtKind::Match { cases, .. } => {
+                for c in cases {
+                    collect_finally_escapes(&c.body, out);
+                }
+            }
+            StmtKind::Try {
+                body,
+                handlers,
+                orelse,
+                ..
+            } => {
+                collect_finally_escapes(body, out);
+                collect_finally_escapes(orelse, out);
+                for h in handlers {
+                    collect_finally_escapes(&h.body, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Whether a loop body has a `break`/`continue` (belonging to THIS loop) that
+/// sits inside a `try` or `with` block. Such a jump must cross the sub-chunk
+/// boundary those constructs introduce (a `finally`/`__exit__` has to run first),
+/// so it can't be a plain in-chunk jump — the loop uses the `LOOP_BODY`
+/// signal path instead. The walk descends through `if`/`try`/`with`/`match`
+/// (which share this loop) but NOT into nested `for`/`while`/`def`/`class`
+/// (which own their own `break`/`continue`).
+fn loop_needs_signal(body: &[Stmt]) -> bool {
+    fn scan(stmts: &[Stmt], in_boundary: bool) -> bool {
+        stmts.iter().any(|s| match &s.kind {
+            StmtKind::Break | StmtKind::Continue => in_boundary,
+            StmtKind::If { body, orelse, .. } => {
+                scan(body, in_boundary) || scan(orelse, in_boundary)
+            }
+            StmtKind::Match { cases, .. } => cases.iter().any(|c| scan(&c.body, in_boundary)),
+            StmtKind::With { body, .. } => scan(body, true),
+            StmtKind::Try {
+                body,
+                handlers,
+                orelse,
+                finalbody,
+            } => {
+                scan(body, true)
+                    || scan(orelse, true)
+                    || scan(finalbody, true)
+                    || handlers.iter().any(|h| scan(&h.body, true))
+            }
+            _ => false,
+        })
+    }
+    scan(body, false)
 }

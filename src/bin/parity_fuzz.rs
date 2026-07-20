@@ -1589,6 +1589,160 @@ fn gen_exceptions3(seed: u64) -> Vec<String> {
     }
 }
 
+/// Exception control-flow & chaining: `try`/`except`/`else`/`finally` ordering
+/// with `return`/`break`/`continue` crossing a `finally`; `finally`/`return`
+/// override; tuple / subclass / bare `except` matching and `as e` name deletion;
+/// implicit `__context__` (including a builtin error raised inside a handler),
+/// explicit `raise X from Y` (`__cause__`); `KeyError` quoting; bare re-raise.
+/// Output is deterministic scalars / ordered lists.
+fn gen_exceptions4(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let n = pick(r, POSINTS);
+    let k = r.below(4) as i64;
+    let excs = ["ValueError", "TypeError", "KeyError", "IndexError"];
+    let e1 = excs[r.below(excs.len() as u64) as usize];
+    let e2 = excs[r.below(excs.len() as u64) as usize];
+    match r.below(12) {
+        // `finally` runs on a `return` from inside `try`; a plain return survives.
+        0 => vec![
+            "def f(k):".into(),
+            "    try:".into(),
+            "        if k: return 'from_try'".into(),
+            "        return 'no_k'".into(),
+            "    finally:".into(),
+            "        print('finally ran')".into(),
+            format!("print(f({}))", k),
+        ],
+        // `return` in `finally` overrides a `return` in `try`.
+        1 => vec![
+            "def f():".into(),
+            "    try:".into(),
+            "        return 'try'".into(),
+            "    finally:".into(),
+            "        return 'finally'".into(),
+            "print(f())".into(),
+        ],
+        // `break`/`continue` inside `try` still run `finally`, in order.
+        2 => vec![
+            "log = []".into(),
+            format!("for i in range({n}):"),
+            "    try:".into(),
+            format!("        if i == {k}: break"),
+            "        log.append(i)".into(),
+            "    finally:".into(),
+            "        log.append('f%d' % i)".into(),
+            "print(log)".into(),
+        ],
+        3 => vec![
+            "log = []".into(),
+            format!("for i in range({n}):"),
+            "    try:".into(),
+            format!("        if i == {k}: continue"),
+            "        log.append(i)".into(),
+            "    finally:".into(),
+            "        log.append('f%d' % i)".into(),
+            "    log.append('tail%d' % i)".into(),
+            "print(log)".into(),
+        ],
+        // `else` runs only when the `try` body raised nothing.
+        4 => vec![
+            "def f(k):".into(),
+            "    order = []".into(),
+            "    try:".into(),
+            "        if k: raise ValueError('x')".into(),
+            "        order.append('body')".into(),
+            "    except ValueError:".into(),
+            "        order.append('except')".into(),
+            "    else:".into(),
+            "        order.append('else')".into(),
+            "    finally:".into(),
+            "        order.append('finally')".into(),
+            "    return order".into(),
+            format!("print(f({}))", k),
+        ],
+        // Tuple-of-types `except (A, B)` + subclass matching.
+        5 => vec![
+            "class MyErr(ValueError): pass".into(),
+            "def f(k):".into(),
+            "    try:".into(),
+            format!("        if k == 0: raise {e1}('a')"),
+            "        if k == 1: raise MyErr('b')".into(),
+            "        return 'ok'".into(),
+            format!("    except ({e1}, TypeError) as e:"),
+            "        return ('tuple', type(e).__name__)".into(),
+            "    except ValueError as e:".into(),
+            "        return ('subclass', type(e).__name__)".into(),
+            format!("print(f({}))", k),
+        ],
+        // The `as e` name is deleted once the handler exits.
+        6 => vec![
+            "try:".into(),
+            format!("    raise {e1}('boom')"),
+            format!("    _ = {e2}"),
+            format!("except {e1} as e:"),
+            "    print('inside', type(e).__name__)".into(),
+            "print('e' in dir())".into(),
+        ],
+        // Bare `except:` catches anything.
+        7 => vec![
+            "def f(k):".into(),
+            "    try:".into(),
+            format!("        if k == 0: raise {e1}('a')"),
+            "        if k == 1: return 1 // 0".into(),
+            "        return [1][9]".into(),
+            "    except:".into(),
+            "        return 'caught'".into(),
+            format!("print(f({}))", k),
+        ],
+        // Explicit `raise X from Y` sets `__cause__`; suppresses context.
+        8 => vec![
+            "try:".into(),
+            "    try:".into(),
+            format!("        raise {e1}('inner')"),
+            format!("    except {e1} as e:"),
+            format!("        raise {e2}('outer') from e"),
+            format!("    except {e1}:"),
+            "        print('unreached')".into(),
+            format!("except {e2} as t:"),
+            "    print(type(t.__cause__).__name__, t.__suppress_context__)".into(),
+        ],
+        // Implicit `__context__` when a *builtin* error is raised in a handler.
+        9 => vec![
+            "try:".into(),
+            "    try:".into(),
+            format!("        raise {e1}('first')"),
+            format!("    except {e1}:"),
+            "        d = {}".into(),
+            "        d['missing']".into(),
+            "except KeyError as e:".into(),
+            "    print(type(e).__name__, str(e), type(e.__context__).__name__)".into(),
+        ],
+        // `KeyError` quoting: `str`/`repr`/`.args` for a missing key.
+        10 => vec![
+            format!("d = {{'a': {n}}}"),
+            "try:".into(),
+            "    d['zzz']".into(),
+            "except KeyError as e:".into(),
+            "    print(str(e), repr(e), e.args)".into(),
+            "print(str(KeyError('k')), repr(KeyError('k')), KeyError(1, 2).args)".into(),
+        ],
+        // Bare re-raise from a handler propagates the same exception outward.
+        _ => vec![
+            "def g(k):".into(),
+            "    try:".into(),
+            format!("        if k: raise {e1}('deep')"),
+            "        return 'clean'".into(),
+            format!("    except {e1}:"),
+            "        print('logging')".into(),
+            "        raise".into(),
+            "try:".into(),
+            format!("    print('got', g({}))", k),
+            format!("except {e1} as e:"),
+            "    print('reraised', type(e).__name__, e)".into(),
+        ],
+    }
+}
+
 /// Closures: nested functions, `nonlocal` counters, late-binding loop captures,
 /// default-arg early binding, decorators with arguments, `*args`/`**kw` wrappers,
 /// and multi-level lexical capture. Deterministic scalar output.
@@ -2240,6 +2394,7 @@ enum Mode {
     Complexnum,
     Exceptions2,
     Exceptions3,
+    Exceptions4,
     Closures,
     Oop2,
     Strfmt2,
@@ -2283,6 +2438,7 @@ const REAL_MODES: &[Mode] = &[
     Mode::Complexnum,
     Mode::Exceptions2,
     Mode::Exceptions3,
+    Mode::Exceptions4,
     Mode::Closures,
     Mode::Oop2,
     Mode::Strfmt2,
@@ -2333,6 +2489,7 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Complexnum => gen_complexnum(seed),
         Mode::Exceptions2 => gen_exceptions2(seed),
         Mode::Exceptions3 => gen_exceptions3(seed),
+        Mode::Exceptions4 => gen_exceptions4(seed),
         Mode::Closures => gen_closures(seed),
         Mode::Oop2 => gen_oop2(seed),
         Mode::Strfmt2 => gen_strfmt2(seed),
@@ -2379,6 +2536,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Complexnum => "complexnum",
         Mode::Exceptions2 => "exceptions2",
         Mode::Exceptions3 => "exceptions3",
+        Mode::Exceptions4 => "exceptions4",
         Mode::Closures => "closures",
         Mode::Oop2 => "oop2",
         Mode::Strfmt2 => "strfmt2",
@@ -2425,6 +2583,7 @@ fn mode_from_name(s: &str) -> Option<Mode> {
         Mode::Complexnum,
         Mode::Exceptions2,
         Mode::Exceptions3,
+        Mode::Exceptions4,
         Mode::Closures,
         Mode::Oop2,
         Mode::Strfmt2,
