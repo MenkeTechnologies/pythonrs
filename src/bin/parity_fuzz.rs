@@ -2523,6 +2523,96 @@ fn gen_format2(seed: u64) -> Vec<String> {
     vec![e]
 }
 
+/// The attribute-access protocol and instance `__dict__`: the live `__dict__`
+/// mapping (stable identity, write-through subscript/`del`, `vars()` aliasing),
+/// the dunder hooks (`__getattr__` fallback, `__getattribute__`/`__setattr__`/
+/// `__delattr__` interception cooperating with the `object.__dunder__` default),
+/// the attribute builtins (`getattr`/`setattr`/`delattr`/`hasattr`/`vars`/`dir`),
+/// class-vs-instance-attribute precedence, and `__slots__` enforcement. Every
+/// program is byte-stable: it prints sorted `__dict__`/`dir` items, captured
+/// values, and booleans — never a raw object repr (which carries an address).
+fn gen_attr(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let n = pick(r, SMALLINTS);
+    let m = pick(r, SMALLINTS);
+    let e: String = match r.below(18) {
+        // Live `__dict__`: stable identity + write-through via a captured alias.
+        0 => format!(
+            "class C:\n    def __init__(self): self.x = {n}\nc = C()\nprint(c.__dict__ is c.__dict__)\nd = c.__dict__\nc.y = {m}\nprint(sorted(d.items()))\nd['z'] = {n}\nprint(c.z, sorted(c.__dict__.keys()))"
+        ),
+        // `del` through `__dict__` persists; `hasattr` observes it.
+        1 => format!(
+            "class C:\n    def __init__(self):\n        self.a = {n}\n        self.b = {m}\nc = C()\ndel c.__dict__['a']\nprint(hasattr(c, 'a'), sorted(c.__dict__.items()))"
+        ),
+        // `getattr`/`setattr`/`hasattr` incl. the `getattr` default.
+        2 => format!(
+            "class C: pass\nc = C()\nsetattr(c, 'foo', {n})\nprint(getattr(c, 'foo'), hasattr(c, 'foo'), hasattr(c, 'bar'), getattr(c, 'bar', {m}))"
+        ),
+        // `vars(o)` is `o.__dict__`; mutation through it persists.
+        3 => format!(
+            "class C:\n    def __init__(self): self.a = {n}\nc = C()\nprint(vars(c) is c.__dict__)\nvars(c)['b'] = {m}\nprint(sorted(c.__dict__.items()))"
+        ),
+        // `__getattr__` fallback: fires only on a miss, not for a real attr.
+        4 => format!(
+            "class F:\n    def __getattr__(self, k): return 'missing:' + k\nf = F()\nf.real = {n}\nprint(f.real, f.ghost, getattr(f, 'x'))"
+        ),
+        // `__getattribute__` intercepts everything; cooperates via object default.
+        5 => format!(
+            "class G:\n    def __getattribute__(self, k):\n        if k == 'secret': return {m}\n        return object.__getattribute__(self, k)\ng = G()\ng.x = {n}\nprint(g.secret, g.x, sorted(g.__dict__.items()))"
+        ),
+        // `__setattr__` intercepts every store; object default writes through.
+        6 => format!(
+            "class S:\n    def __setattr__(self, k, v): object.__setattr__(self, k, v * 2)\ns = S()\ns.a = {n}\ns.b = {m}\nprint(sorted(s.__dict__.items()))"
+        ),
+        // `__delattr__` intercepts deletion.
+        7 => format!(
+            "class D:\n    def __delattr__(self, k):\n        print('del', k)\n        object.__delattr__(self, k)\nd = D()\nd.z = {n}\ndel d.z\nprint(hasattr(d, 'z'), sorted(d.__dict__.keys()))"
+        ),
+        // `__slots__`: reject unlisted names, and no `__dict__` when slots-only.
+        8 => format!(
+            "class P:\n    __slots__ = ('a', 'b')\n    def __init__(self): self.a = {n}\np = P()\np.b = {m}\nprint(p.a, p.b)\ntry:\n    p.c = 1\nexcept AttributeError as ex:\n    print('AE', 'c' in str(ex))\ntry:\n    p.__dict__\nexcept AttributeError:\n    print('no-dict')"
+        ),
+        // `dir()` — sorted, includes class + instance names (non-dunder subset).
+        9 => format!(
+            "class Base:\n    bx = {n}\n    def m(self): return 1\nclass C(Base):\n    cy = {m}\n    def __init__(self): self.i = {n}\nc = C()\nprint([x for x in dir(c) if not x.startswith('_')])\nprint([x for x in dir(C) if not x.startswith('_')])"
+        ),
+        // Class-attr vs instance-attr precedence + `__dict__` membership.
+        10 => format!(
+            "class C:\n    shared = {n}\nc = C()\nprint('shared' in c.__dict__, c.shared)\nc.shared = {m}\nprint('shared' in c.__dict__, c.shared, C.shared)\ndel c.shared\nprint('shared' in c.__dict__, c.shared)"
+        ),
+        // `setattr`/`delattr` by dynamic name, sorted keys across the batch.
+        11 => format!(
+            "class C: pass\nc = C()\nfor name in ['p', 'q', 'r']:\n    setattr(c, name, {n})\nprint(sorted(c.__dict__.keys()))\ndelattr(c, 'q')\nprint(sorted(c.__dict__.keys()), hasattr(c, 'q'))"
+        ),
+        // `__dict__` supports normal dict methods (update/pop) with write-through.
+        12 => format!(
+            "class C:\n    def __init__(self):\n        self.a = {n}\n        self.b = {m}\nc = C()\nc.__dict__.update({{'c': {n}}})\nprint(sorted(c.__dict__.items()))\nc.__dict__.pop('a')\nprint(sorted(c.__dict__.keys()), hasattr(c, 'a'))"
+        ),
+        // `__getattr__` does NOT fire when `__getattribute__` returns a value,
+        // but DOES fire when `__getattribute__` raises AttributeError.
+        13 => format!(
+            "class C:\n    def __getattr__(self, k): return 'fallback:' + k\n    def __getattribute__(self, k):\n        if k == 'boom': raise AttributeError(k)\n        return object.__getattribute__(self, k)\nc = C()\nc.real = {n}\nprint(c.real, c.boom, c.other)"
+        ),
+        // Reassignment keeps insertion order (no key churn on update).
+        14 => format!(
+            "class C:\n    def __init__(self):\n        self.a = {n}\n        self.b = {m}\nc = C()\nc.a = {m}\nc.d = {n}\nprint(list(c.__dict__.keys()), sorted(c.__dict__.values()))"
+        ),
+        // len / iteration / membership over a live `__dict__`.
+        15 => format!(
+            "class C:\n    def __init__(self):\n        self.a = {n}\n        self.b = {m}\n        self.c = {n}\nc = C()\nprint(len(c.__dict__), 'a' in c.__dict__, 'z' in c.__dict__)\nprint(sorted(k for k in c.__dict__))"
+        ),
+        // Empty instance: `__dict__` starts empty and grows.
+        16 => format!(
+            "class C: pass\nc = C()\nprint(c.__dict__ == {{}}, len(c.__dict__))\nc.only = {n}\nprint(sorted(c.__dict__.items()))"
+        ),
+        // Inheritance: instance dict holds only its own names, not inherited.
+        _ => format!(
+            "class A:\n    def __init__(self): self.base = {n}\nclass B(A):\n    def __init__(self):\n        super().__init__()\n        self.own = {m}\nb = B()\nprint(sorted(b.__dict__.items()), hasattr(b, 'base'), hasattr(b, 'own'))"
+        ),
+    };
+    vec![e]
+}
+
 /// Decorators and the descriptor protocol: `@property` get/set/delete,
 /// `@staticmethod`/`@classmethod` (via class and instance, `cls` binding and
 /// inheritance), function decorators (single, stacked, factories), class
@@ -2653,6 +2743,7 @@ enum Mode {
     Async2,
     Augwith,
     Descriptors,
+    Attr,
     Calls,
     Match,
 }
@@ -2698,6 +2789,7 @@ const REAL_MODES: &[Mode] = &[
     Mode::Async2,
     Mode::Augwith,
     Mode::Descriptors,
+    Mode::Attr,
     Mode::Calls,
     Mode::Match,
 ];
@@ -2750,6 +2842,7 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Async2 => gen_async2(seed),
         Mode::Augwith => gen_augwith(seed),
         Mode::Descriptors => gen_descriptors(seed),
+        Mode::Attr => gen_attr(seed),
         Mode::Calls => gen_calls(seed),
         Mode::Match => gen_match(seed),
     }
@@ -2798,6 +2891,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Async2 => "async2",
         Mode::Augwith => "augwith",
         Mode::Descriptors => "descriptors",
+        Mode::Attr => "attr",
         Mode::Calls => "calls",
         Mode::Match => "match",
     }
@@ -2846,6 +2940,7 @@ fn mode_from_name(s: &str) -> Option<Mode> {
         Mode::Async2,
         Mode::Augwith,
         Mode::Descriptors,
+        Mode::Attr,
         Mode::Calls,
         Mode::Match,
     ];
