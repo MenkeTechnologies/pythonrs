@@ -3925,12 +3925,37 @@ pub fn invoke(
     }
 }
 
+/// Marshal a Python call argument into a native fusevm `Value` for `rust { }`
+/// FFI. Python strings ride as `Value::Obj(PyObj::Str)` heap handles, which
+/// fusevm's marshaller cannot read (it calls `Value::to_str`, which returns
+/// `"(obj:N)"` for a handle); rewrite them to a native `Value::Str`. Ints and
+/// floats are already native `Value::Int`/`Value::Float`, so they pass through.
+fn marshal_ffi_arg(v: &Value) -> Value {
+    match v {
+        Value::Obj(_) => match with_host(|h| h.as_str(v)) {
+            Some(s) => Value::str(s),
+            None => v.clone(),
+        },
+        _ => v.clone(),
+    }
+}
+
 /// Resolve a bare name and call it (`f(args)`, `print(args)`).
 pub fn call_named(
     name: &str,
     args: Vec<Value>,
     kwargs: Vec<(String, Value)>,
 ) -> Result<Value, String> {
+    // Inline Rust FFI: the `rust { ... }` desugar emits `__rust_compile(b64,
+    // line)`; compile + register the block's exported functions, returning
+    // Python `None` (`Value::Undef`).
+    if name == "__rust_compile" {
+        let b64 = args
+            .first()
+            .map(|v| with_host(|h| h.str_of(v)))
+            .unwrap_or_default();
+        return fusevm::ffi::compile_and_register(&b64).map(|_| Value::Undef);
+    }
     if let Some(v) = with_host(|h| h.read_name(name)) {
         return invoke(&v, args, kwargs);
     }
@@ -3939,6 +3964,15 @@ pub fn call_named(
     }
     if crate::builtins::is_known_builtin(name) {
         return crate::builtins::call_builtin_function(name, args, kwargs);
+    }
+    // A `rust { ... }` block's exported functions are callable by bareword.
+    // Reached only after user names/classes/builtins all miss, so Python code
+    // always wins; the registry membership check keeps this off the hot path.
+    if fusevm::ffi::is_registered(name) {
+        let margs: Vec<Value> = args.iter().map(marshal_ffi_arg).collect();
+        if let Some(r) = fusevm::ffi::try_call(name, &margs) {
+            return r;
+        }
     }
     Err(name_error(name))
 }
