@@ -93,6 +93,7 @@ pub mod ops {
     pub const INPLACE: u16 = 66; // [iop(int), a, b] -> augmented op (`+=`, `|=`, …): in-place dunder / mutate, else binary fallback
     pub const WITH_EXIT: u16 = 67; // [mgr] -> call `mgr.__exit__` with the active exception triple; -> Bool(suppress)
     pub const YIELD_FROM: u16 = 68; // [iterable] -> `yield from` delegation (PEP 380); -> sub-iterator's return value
+    pub const LOOP_BODY: u16 = 69; // [try_id] -> run a loop body chunk (whose break/continue cross a try/with boundary); consume Break/Continue signals -> Int(0=next, 1=break); Return stops the loop chunk
 }
 
 /// In-place (augmented-assignment) op tags carried by `ops::INPLACE`. One per
@@ -1455,7 +1456,7 @@ impl PyHost {
                     // (`BaseException.__str__`): ''/str(arg)/repr(tuple).
                     if self.class_is_exception(&inst.class) {
                         let a = self.exc_instance_args(&inst.attrs);
-                        self.exc_message(&a)
+                        self.exc_message(&inst.class, &a)
                     } else {
                         format!("<{} object>", inst.class)
                     }
@@ -1574,15 +1575,7 @@ impl PyHost {
     }
 
     fn exc_str(&self, class: &str, args: &[Value]) -> String {
-        if args.is_empty() {
-            String::new()
-        } else if args.len() == 1 {
-            self.str_of(&args[0])
-        } else {
-            let inner: Vec<String> = args.iter().map(|a| self.repr_of(a)).collect();
-            let _ = class;
-            format!("({})", inner.join(", "))
-        }
+        self.exc_message(class, args)
     }
 
     /// `repr(v)`.
@@ -3194,12 +3187,13 @@ impl PyHost {
             let val = if let Some(key) = &mapping_key {
                 let kv = self.new_str(key.clone());
                 let k = self.to_key(&kv)?;
-                match self.get(args) {
-                    Some(PyObj::Dict(d)) => d
-                        .get(&k)
-                        .map(|(_, v)| v.clone())
-                        .ok_or_else(|| format!("KeyError: '{key}'"))?,
+                let found = match self.get(args) {
+                    Some(PyObj::Dict(d)) => d.get(&k).map(|(_, v)| v.clone()),
                     _ => return Err("TypeError: format requires a mapping".into()),
+                };
+                match found {
+                    Some(v) => v,
+                    None => return Err(self.key_error(&kv)),
                 }
             } else {
                 let v = arglist.get(ai).cloned().ok_or_else(|| {
@@ -3361,12 +3355,13 @@ impl PyHost {
             let val = if let Some(key) = &mapping_key {
                 let kv = self.alloc(PyObj::Bytes(key.clone()));
                 let k = self.to_key(&kv)?;
-                match self.get(args) {
-                    Some(PyObj::Dict(d)) => d
-                        .get(&k)
-                        .map(|(_, v)| v.clone())
-                        .ok_or_else(|| format!("KeyError: {}", self.repr_of(&kv)))?,
+                let found = match self.get(args) {
+                    Some(PyObj::Dict(d)) => d.get(&k).map(|(_, v)| v.clone()),
                     _ => return Err("TypeError: format requires a mapping".into()),
+                };
+                match found {
+                    Some(v) => v,
+                    None => return Err(self.key_error(&kv)),
                 }
             } else {
                 let v = arglist.get(ai).cloned().ok_or_else(|| {
@@ -3824,9 +3819,10 @@ impl PyHost {
             }
             Some(PyObj::Dict(d)) => {
                 let key = self.to_key(idx)?;
-                match d.get(&key) {
-                    Some((_, v)) => Ok(v.clone()),
-                    None => Err(format!("KeyError: {}", self.repr_of(idx))),
+                let found = d.get(&key).map(|(_, v)| v.clone());
+                match found {
+                    Some(v) => Ok(v),
+                    None => Err(self.key_error(idx)),
                 }
             }
             Some(PyObj::Range { start, step, .. }) => {
@@ -4045,10 +4041,12 @@ impl PyHost {
         match self.get(recv) {
             Some(PyObj::Dict(_)) => {
                 let key = self.to_key(idx)?;
-                if let Some(PyObj::Dict(d)) = self.get_mut(recv) {
-                    if d.shift_remove(&key).is_none() {
-                        return Err(format!("KeyError: {}", self.repr_of(idx)));
-                    }
+                let removed = match self.get_mut(recv) {
+                    Some(PyObj::Dict(d)) => d.shift_remove(&key).is_some(),
+                    _ => false,
+                };
+                if !removed {
+                    return Err(self.key_error(idx));
                 }
                 Ok(())
             }
@@ -6018,15 +6016,68 @@ impl PyHost {
         }
     }
 
-    pub fn exc_message(&self, args: &[Value]) -> String {
+    pub fn exc_message(&self, class: &str, args: &[Value]) -> String {
         if args.is_empty() {
             String::new()
         } else if args.len() == 1 {
-            self.str_of(&args[0])
+            // `KeyError.__str__` returns `repr(args[0])`, so `KeyError('k')`
+            // stringifies to `'k'` (and its uncaught line is `KeyError: 'k'`).
+            if self.is_keyerror_str_class(class) {
+                self.repr_of(&args[0])
+            } else {
+                self.str_of(&args[0])
+            }
         } else {
             let inner: Vec<String> = args.iter().map(|a| self.repr_of(a)).collect();
             format!("({})", inner.join(", "))
         }
+    }
+
+    /// Whether `class` uses `KeyError`'s `__str__` (repr the single arg): the
+    /// builtin `KeyError` or a user subclass that doesn't override `__str__`.
+    fn is_keyerror_str_class(&self, class: &str) -> bool {
+        if class == "KeyError" {
+            return true;
+        }
+        self.classes.contains_key(class) && self.mro_of(class).iter().any(|c| c == "KeyError")
+    }
+
+    /// The terse `Class: message` (or bare `Class`) line an exception value
+    /// would abort with. Used to decide whether the in-flight `h.exc` actually
+    /// corresponds to a just-raised builtin error string, or is a stale
+    /// still-being-handled exception that must not shadow the real one.
+    pub fn exc_line_of(&self, exc: &Value) -> Option<String> {
+        match self.get(exc) {
+            Some(PyObj::Exception { class, args }) => {
+                Some(join_exc(class, &self.exc_message(class, args)))
+            }
+            Some(PyObj::Instance(i)) if self.class_is_exception(&i.class) => {
+                let a = self.exc_instance_args(&i.attrs);
+                Some(join_exc(&i.class, &self.exc_message(&i.class, &a)))
+            }
+            _ => None,
+        }
+    }
+
+    /// Raise a `KeyError` for a missing `key`: build the exception object with
+    /// the bare key as its single arg (so `.args`/`repr`/`__str__` match
+    /// CPython), link its `__context__` to the exception currently being
+    /// handled, install it as the in-flight exception, and return the terse
+    /// `KeyError: <repr>` line to abort with.
+    pub fn key_error(&mut self, key: &Value) -> String {
+        let repr = self.repr_of(key);
+        let context = self.exc.clone().unwrap_or(Value::Undef);
+        let e = self.alloc(PyObj::Exception {
+            class: "KeyError".to_string(),
+            args: vec![key.clone()],
+        });
+        let ctx = match &context {
+            Value::Obj(_) if e != context => context,
+            _ => Value::Undef,
+        };
+        self.set_exc_link(&e, Value::Undef, ctx);
+        self.exc = Some(e);
+        format!("KeyError: {repr}")
     }
 }
 
@@ -6214,7 +6265,7 @@ pub fn raise_value(exc: &Value) -> Result<String, String> {
         let obj = h.get(exc).cloned();
         match obj {
             Some(PyObj::Exception { class, args }) => {
-                let msg = h.exc_message(&args);
+                let msg = h.exc_message(&class, &args);
                 h.exc = Some(exc.clone());
                 Ok(join_exc(&class, &msg))
             }
@@ -6246,7 +6297,7 @@ pub fn raise_value(exc: &Value) -> Result<String, String> {
                 // A user exception instance's uncaught line shows its message.
                 let line = if h.class_is_exception(&class) {
                     let a = h.exc_instance_args(&i.attrs);
-                    join_exc(&class, &h.exc_message(&a))
+                    join_exc(&class, &h.exc_message(&class, &a))
                 } else {
                     class
                 };

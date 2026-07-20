@@ -50,8 +50,9 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::RAISE, b_raise);
     vm.register_builtin(ops::RERAISE, b_reraise);
     vm.register_builtin(ops::SIG_RETURN, b_sig_return);
-    vm.register_builtin(ops::SIG_BREAK, b_noop);
-    vm.register_builtin(ops::SIG_CONTINUE, b_noop);
+    vm.register_builtin(ops::SIG_BREAK, b_sig_break);
+    vm.register_builtin(ops::SIG_CONTINUE, b_sig_continue);
+    vm.register_builtin(ops::LOOP_BODY, b_loop_body);
     vm.register_builtin(ops::IMPORT, b_import);
     vm.register_builtin(ops::IMPORT_FROM, b_import_from);
     vm.register_builtin(ops::UNPACK, b_unpack);
@@ -1071,8 +1072,57 @@ fn b_sig_return(vm: &mut VM, _: u8) -> Value {
     v
 }
 
-fn b_noop(_vm: &mut VM, _: u8) -> Value {
+/// `break` that must cross a `try`/`with` chunk boundary: set the Break signal
+/// and stop the current chunk (so a `finally` on the way out still runs, driven
+/// by `b_try`), letting the signal bubble to the enclosing `LOOP_BODY`.
+fn b_sig_break(vm: &mut VM, _: u8) -> Value {
+    with_host(|h| h.signal = Some(host::Signal::Break));
+    vm.ip = vm.chunk.ops.len();
     Value::Undef
+}
+
+/// `continue` counterpart of `b_sig_break`.
+fn b_sig_continue(vm: &mut VM, _: u8) -> Value {
+    with_host(|h| h.signal = Some(host::Signal::Continue));
+    vm.ip = vm.chunk.ops.len();
+    Value::Undef
+}
+
+/// Run one iteration's body chunk for a loop whose `break`/`continue` cross a
+/// `try`/`with` boundary (so they can't be plain jumps). Returns `Int(0)` to
+/// continue to the next iteration (normal fall-through OR `continue`), `Int(1)`
+/// to break. A `Return` signal is left intact and the enclosing loop chunk is
+/// halted so the return propagates to the function frame.
+fn b_loop_body(vm: &mut VM, _: u8) -> Value {
+    let id = match vm.pop() {
+        Value::Int(n) => n as usize,
+        _ => return abort(vm, "internal: LOOP_BODY id".into()),
+    };
+    let body = match with_host(|h| h.try_def(id)) {
+        Some(t) => t.body,
+        None => return abort(vm, "internal: unknown loop-body id".into()),
+    };
+    if let Err(e) = host::run_chunk_on(body) {
+        return abort(vm, e);
+    }
+    let code = with_host(|h| match &h.signal {
+        Some(host::Signal::Break) => {
+            h.signal = None;
+            1
+        }
+        Some(host::Signal::Continue) => {
+            h.signal = None;
+            0
+        }
+        // Return: keep the signal for the function frame to consume.
+        Some(host::Signal::Return(_)) => 2,
+        None => 0,
+    });
+    if code == 2 {
+        // Propagate the pending return: stop the loop chunk immediately.
+        vm.ip = vm.chunk.ops.len();
+    }
+    Value::Int(code)
 }
 
 fn b_raise(vm: &mut VM, argc: u8) -> Value {
@@ -1761,7 +1811,34 @@ fn b_try(vm: &mut VM, _: u8) -> Value {
             }
         }
         Err(e) => {
-            let exc = with_host(|h| h.exc.clone().unwrap_or_else(|| synth_exc(h, &e)));
+            // Resolve the object for the raised error. `h.exc` is authoritative
+            // only when it matches the error string just produced (an explicit
+            // `raise` or a builtin that installed its own exception, e.g.
+            // `KeyError`). Otherwise `h.exc` is a stale still-being-handled
+            // exception (set when this handler's enclosing `except` fired): a
+            // native error like `[..][5]` never updates it, so matching against
+            // that stale class would pick the wrong handler. Synthesize a fresh
+            // exception from the string and wire the stale one as `__context__`.
+            let exc = with_host(|h| {
+                let consistent = h
+                    .exc
+                    .clone()
+                    .and_then(|x| h.exc_line_of(&x))
+                    .map(|line| line == e)
+                    .unwrap_or(false);
+                if consistent {
+                    return h.exc.clone().unwrap();
+                }
+                let context = h.exc.clone().unwrap_or(Value::Undef);
+                let new = synth_exc(h, &e);
+                let ctx = match &context {
+                    Value::Obj(_) if new != context => context,
+                    _ => Value::Undef,
+                };
+                h.set_exc_link(&new, Value::Undef, ctx);
+                h.exc = Some(new.clone());
+                new
+            });
             let mut handled = false;
             for (type_chunk, bind, hbody) in &td.handlers {
                 let matches = match type_chunk {
@@ -4152,7 +4229,7 @@ fn async_generator_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<
 fn exc_error_string(exc: &Value) -> String {
     with_host(|h| match h.get(exc) {
         Some(PyObj::Exception { class, args }) => {
-            let msg = h.exc_message(args);
+            let msg = h.exc_message(class, args);
             if msg.is_empty() {
                 class.clone()
             } else {

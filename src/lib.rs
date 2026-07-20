@@ -53,6 +53,7 @@ pub fn load_merged(mut prog: compiler::Program) -> fusevm::Chunk {
         functions,
         procs: _,
         tries,
+        warnings: _,
     } = prog;
     let funcs: Vec<host::FuncDef> = functions.into_iter().map(|(_, f)| f).collect();
     host::with_host(|h| h.load_program(funcs, tries));
@@ -139,6 +140,12 @@ pub fn run_program(
             }
         }
     };
+    // Compile-time `SyntaxWarning`s (e.g. `'return' in a 'finally' block`) print
+    // before execution, matching CPython. Carried through the bytecode cache so a
+    // cache hit warns identically to a fresh compile.
+    for (line, kw) in &prog.warnings {
+        eprintln!("{tb_filename}:{line}: SyntaxWarning: '{kw}' in a 'finally' block");
+    }
     let result = run_compiled(prog);
     // CPython emits `RuntimeWarning: coroutine '…' was never awaited` for any
     // coroutine that was created but never driven; do the same at teardown.
