@@ -187,8 +187,20 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
       `type(b)==B`, `type(b) is B` all hold. Builtin type names repr as `<class 'int'>`
       (functions stay `<built-in function len>`); `isinstance(int, type)`→`True`.
       **3-arg `type(name, bases, ns)` now builds a real class** (`type_new` →
-      `register_class`): attrs, methods, and base inheritance work. Still open:
-      metaclasses (`class A(metaclass=M)` / `M.__new__`); unbound-method access.
+      `register_class`): attrs, methods, and base inheritance work.
+- [x] **Metaclasses** — FIXED: `class A(metaclass=M)` (compiler passes the
+      metaclass to `BUILD_CLASS`, cache v10) constructs the class via
+      `M(name, bases, ns)` — `M.__new__`/`M.__init__` fire and `type(A) is M`
+      (`ClassDef.metaclass`, `type_name(Class)` returns it). A cooperative
+      `super().__new__(mcls, name, bases, ns)` / `super().__init__(...)` /
+      `super().__call__(...)` in a metaclass method falls through to `type.__new__`
+      (builds + tags the class) / a no-op / plain instantiation. A metaclass
+      `__call__` controls instantiation (`instantiate` dispatches to it; singleton
+      pattern works). Metaclass attributes/methods are visible through the class
+      (`cls._registry`, `A.meta_method()` bound to the class). A subclass inherits
+      the most-derived metaclass of its bases. Class objects are hashable dict/set
+      keys (`PKey::Class`, by name). `__new__` now runs with `cls` as the frame
+      `self` so zero-arg `super().__new__(cls)` resolves in ordinary classes too.
 - [x] **Class introspection attrs** — FIXED: instance `__class__`/`__dict__`,
       class `__mro__`/`__bases__`/`__dict__`/`__qualname__` (`object` is the implicit
       MRO/bases tail), and `vars(instance)` (== `__dict__`). User-class repr now

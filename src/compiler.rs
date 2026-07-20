@@ -195,11 +195,11 @@ impl Compiler {
             StmtKind::ClassDef {
                 name,
                 bases,
+                keywords,
                 body,
                 decorators,
-                ..
             } => {
-                self.compile_classdef(b, name, bases, body, decorators)?;
+                self.compile_classdef(b, name, bases, keywords, body, decorators)?;
             }
             StmtKind::Return(e) => {
                 match e {
@@ -615,6 +615,7 @@ impl Compiler {
         b: &mut ChunkBuilder,
         name: &str,
         bases: &[Expr],
+        keywords: &[Keyword],
         body: &[Stmt],
         decorators: &[Expr],
     ) -> Result<(), String> {
@@ -625,14 +626,25 @@ impl Compiler {
         let def_id = self.build_function(&format!("<class {name}>"), &empty, body);
         self.fn_depth -= 1;
         let def_id = def_id?;
+        // The explicit metaclass (`class A(metaclass=M)`), or `None` — BUILD_CLASS
+        // pops it below the other args and, if a real type, drives construction.
+        match keywords
+            .iter()
+            .find(|k| k.name.as_deref() == Some("metaclass"))
+        {
+            Some(k) => self.compile_expr(b, &k.value)?,
+            None => {
+                b.emit(Op::LoadUndef, 0);
+            }
+        }
         // bases list
         for base in bases {
             self.compile_expr(b, base)?;
         }
-        b.emit(Op::CallBuiltin(ops::MKLIST, argc(bases.len())?), 0); // [bases]
-        self.name_const(b, name); // [bases, name]
-        self.emit_make_func(b, def_id, &empty)?; // [bases, name, bodyfunc]
-        b.emit(Op::CallBuiltin(ops::BUILD_CLASS, 3), 0); // -> class value
+        b.emit(Op::CallBuiltin(ops::MKLIST, argc(bases.len())?), 0); // [meta, bases]
+        self.name_const(b, name); // [meta, bases, name]
+        self.emit_make_func(b, def_id, &empty)?; // [meta, bases, name, bodyfunc]
+        b.emit(Op::CallBuiltin(ops::BUILD_CLASS, 4), 0); // -> class value
         for d in decorators.iter().rev() {
             self.compile_expr(b, d)?;
             b.emit(Op::Swap, 0);

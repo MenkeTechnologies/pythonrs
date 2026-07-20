@@ -141,6 +141,10 @@ pub enum PKey {
         hash: i64,
         id: u32,
     },
+    /// A type object (`PyObj::Class` or a builtin type/function) used as a key.
+    /// Types are conceptual singletons by name, so they key by name — matching
+    /// `is`/`==` on classes (`{int: 1}[int]`, `{C: 1}` for a user class `C`).
+    Class(String),
 }
 
 /// A compiled function template: parameter shape + body chunk. Shared by every
@@ -190,6 +194,9 @@ pub struct ClassDef {
     pub ns: IndexMap<String, Value>,
     /// The C3-ish MRO (this class first), by name.
     pub mro: Vec<String>,
+    /// The metaclass name (`type(cls)`). `"type"` for an ordinary class; a user
+    /// metaclass name for `class A(metaclass=M)`.
+    pub metaclass: String,
 }
 
 /// A live closure value.
@@ -1124,7 +1131,12 @@ impl PyHost {
                 Some(PyObj::Slice { .. }) => "slice".into(),
                 Some(PyObj::Func(_)) => "function".into(),
                 Some(PyObj::Builtin(_)) => "builtin_function_or_method".into(),
-                Some(PyObj::Class(_)) => "type".into(),
+                // `type(cls)` is the class's metaclass (`type` unless overridden).
+                Some(PyObj::Class(n)) => self
+                    .classes
+                    .get(n)
+                    .map(|c| c.metaclass.clone())
+                    .unwrap_or_else(|| "type".into()),
                 Some(PyObj::Instance(i)) => i.class.clone(),
                 Some(PyObj::BoundMethod { .. }) => "method".into(),
                 Some(PyObj::Exception { class, .. }) => class.clone(),
@@ -1459,6 +1471,9 @@ impl PyHost {
                     ks.dedup();
                     PKey::Frozenset(ks)
                 }
+                // A type object keys by name (types are singletons by name).
+                Some(PyObj::Class(n)) => PKey::Class(n.clone()),
+                Some(PyObj::Builtin(n)) => PKey::Class(n.clone()),
                 Some(PyObj::Instance(inst)) => {
                     let id = match v {
                         Value::Obj(i) => *i,
@@ -3921,6 +3936,23 @@ impl PyHost {
                         _ => return Ok(v),
                     }
                 }
+                // Fall back to the metaclass (`type(cls)`): an attribute defined on
+                // the metaclass is visible through the class (`cls._registry`).
+                let meta = self
+                    .classes
+                    .get(&cname)
+                    .map(|c| c.metaclass.clone())
+                    .unwrap_or_else(|| "type".into());
+                if meta != "type" {
+                    if let Some(v) = self.class_lookup(&meta, name) {
+                        // A metaclass *method* binds the class as its receiver.
+                        if matches!(self.get(&v), Some(PyObj::Func(_))) {
+                            let cls = self.alloc(PyObj::Class(cname.clone()));
+                            return Ok(self.alloc(PyObj::BoundMethod { recv: cls, func: v }));
+                        }
+                        return Ok(v);
+                    }
+                }
                 Err(format!(
                     "AttributeError: type object '{cname}' has no attribute '{name}'"
                 ))
@@ -4214,6 +4246,18 @@ impl PyHost {
         bases: Vec<String>,
         ns: IndexMap<String, Value>,
     ) -> Value {
+        self.register_class_meta(name, bases, ns, "type")
+    }
+
+    /// Register a class whose metaclass (`type(cls)`) is `metaclass` — `"type"`
+    /// for an ordinary class, a user metaclass name for `class A(metaclass=M)`.
+    pub fn register_class_meta(
+        &mut self,
+        name: &str,
+        bases: Vec<String>,
+        ns: IndexMap<String, Value>,
+        metaclass: &str,
+    ) -> Value {
         let mro = {
             let mut out = vec![name.to_string()];
             for b in &bases {
@@ -4232,6 +4276,7 @@ impl PyHost {
                 bases,
                 ns,
                 mro,
+                metaclass: metaclass.to_string(),
             },
         );
         self.alloc(PyObj::Class(name.to_string()))
@@ -4415,6 +4460,23 @@ pub fn call_method(
                     _ => return invoke(&f, args, kwargs),
                 }
             }
+            // A method defined on the metaclass is callable on the class, bound to
+            // the class as its receiver (`cls`): `A.meta_method()`.
+            let meta = with_host(|h| {
+                h.classes
+                    .get(&cname)
+                    .map(|c| c.metaclass.clone())
+                    .unwrap_or_else(|| "type".into())
+            });
+            if meta != "type" {
+                if let Some(f) = with_host(|h| h.class_lookup(&meta, name)) {
+                    if let Some(PyObj::Func(fv)) = with_host(|h| h.get(&f).cloned()) {
+                        let clsobj = with_host(|h| h.alloc(PyObj::Class(cname.clone())));
+                        let owner = with_host(|h| method_owner(h, &meta, name));
+                        return run_user_func(&fv, Some(clsobj), owner, args, kwargs);
+                    }
+                }
+            }
             Err(format!(
                 "AttributeError: type object '{cname}' has no attribute '{name}'"
             ))
@@ -4438,6 +4500,55 @@ pub fn call_method(
                     }
                     invoke(&f, args, kwargs)
                 }
+                // A metaclass's cooperative `super().<m>(...)` falls through to
+                // the builtin `type`'s implementation.
+                None if with_host(|h| class_inherits_type(h, &owner)) => {
+                    match name {
+                        // `type.__new__(mcls, name, bases, ns)` builds the class.
+                        "__new__" if args.len() >= 4 => {
+                            let mcls_name = with_host(|h| match h.get(&args[0]) {
+                                Some(PyObj::Class(n)) => n.clone(),
+                                _ => owner.clone(),
+                            });
+                            crate::builtins::type_new_meta(&args[1], &args[2], &args[3], &mcls_name)
+                        }
+                        // `type.__init__` is a no-op.
+                        "__init__" => Ok(Value::Undef),
+                        // `type.__call__(cls, *args)` — instantiate `cls` normally
+                        // (skipping the metaclass `__call__`, avoiding recursion).
+                        "__call__" => {
+                            let cls_name = with_host(|h| match h.get(&instance) {
+                                Some(PyObj::Class(n)) => Some(n.clone()),
+                                _ => None,
+                            });
+                            match cls_name {
+                                Some(c) => instantiate_plain(&c, args, kwargs),
+                                None => {
+                                    Err(type_error("super().__call__: receiver is not a class"))
+                                }
+                            }
+                        }
+                        _ => Err(format!(
+                            "AttributeError: 'super' object has no attribute '{name}'"
+                        )),
+                    }
+                }
+                // A cooperative `super().__new__(cls)` at the top of a normal MRO
+                // falls through to `object.__new__`: allocate a bare instance.
+                None if name == "__new__" => {
+                    let cls = args.first().cloned().unwrap_or(Value::Undef);
+                    match with_host(|h| h.get(&cls).cloned()) {
+                        Some(PyObj::Class(cname)) => Ok(with_host(|h| {
+                            h.alloc(PyObj::Instance(Instance {
+                                class: cname,
+                                attrs: IndexMap::new(),
+                            }))
+                        })),
+                        _ => Err(type_error("object.__new__(X): X is not a type object")),
+                    }
+                }
+                // `super().__init__()` — the `object.__init__` no-op default.
+                None if name == "__init__" => Ok(Value::Undef),
                 None => Err(format!(
                     "AttributeError: 'super' object has no attribute '{name}'"
                 )),
@@ -4511,19 +4622,55 @@ pub fn instantiate(
             })
         }));
     }
+    // If `class`'s metaclass defines `__call__`, it controls instantiation:
+    // `A(...)` dispatches to `type(A).__call__(A, ...)`.
+    let meta = with_host(|h| h.classes.get(class).map(|c| c.metaclass.clone()));
+    if let Some(m) = &meta {
+        if m != "type" {
+            if let Some(f) = with_host(|h| h.class_lookup(m, "__call__")) {
+                if let Some(PyObj::Func(fv)) = with_host(|h| h.get(&f).cloned()) {
+                    let clsobj = with_host(|h| h.alloc(PyObj::Class(class.to_string())));
+                    let owner = with_host(|h| method_owner(h, m, "__call__"));
+                    return run_user_func(&fv, Some(clsobj), owner, args, kwargs);
+                }
+            }
+        }
+    }
+    instantiate_plain(class, args, kwargs)
+}
+
+/// The default `type.__call__`: build a class instance via `__new__`/`__init__`
+/// (or a metaclass's class object), *without* consulting a metaclass `__call__`.
+/// Reached directly and from a metaclass's `super().__call__(...)`.
+pub fn instantiate_plain(
+    class: &str,
+    args: Vec<Value>,
+    kwargs: Vec<(String, Value)>,
+) -> Result<Value, String> {
+    // Instantiating a metaclass builds a *class* object (not an instance):
+    // `M(name, bases, ns)` runs `M.__new__` / `M.__init__`.
+    if with_host(|h| class_inherits_type(h, class)) {
+        return metaclass_instantiate(class, args, kwargs);
+    }
     // `__new__` (if the class overrides it) creates the instance; it is an
-    // implicit staticmethod, so `cls` is passed as the first argument. Otherwise
-    // a bare instance is allocated (the default `object.__new__`).
+    // implicit staticmethod, so `cls` is passed as the first argument. `cls` is
+    // also installed as the frame `self` so a zero-arg `super().__new__(cls)`
+    // resolves. Otherwise a bare instance is allocated (default `object.__new__`).
     let inst = if let Some(newf) = with_host(|h| h.class_lookup(class, "__new__")) {
         let newf = match with_host(|h| h.get(&newf).cloned()) {
             Some(PyObj::StaticMethod(inner)) => inner,
             _ => newf,
         };
         let clsobj = with_host(|h| h.alloc(PyObj::Class(class.to_string())));
-        let mut a = Vec::with_capacity(args.len() + 1);
-        a.push(clsobj);
-        a.extend(args.clone());
-        invoke(&newf, a, kwargs.clone())?
+        if let Some(PyObj::Func(fv)) = with_host(|h| h.get(&newf).cloned()) {
+            let owner = with_host(|h| method_owner(h, class, "__new__"));
+            run_user_func(&fv, Some(clsobj), owner, args.clone(), kwargs.clone())?
+        } else {
+            let mut a = Vec::with_capacity(args.len() + 1);
+            a.push(clsobj);
+            a.extend(args.clone());
+            invoke(&newf, a, kwargs.clone())?
+        }
     } else {
         with_host(|h| {
             h.alloc(PyObj::Instance(Instance {
@@ -4548,6 +4695,50 @@ pub fn instantiate(
         }
     }
     Ok(inst)
+}
+
+/// Instantiate a metaclass `meta` — i.e. build a new class object from
+/// `(name, bases, namespace)`. Runs `meta.__new__` (or the default `type.__new__`)
+/// then `meta.__init__(cls, name, bases, ns)`, mirroring `type.__call__`.
+fn metaclass_instantiate(
+    meta: &str,
+    args: Vec<Value>,
+    kwargs: Vec<(String, Value)>,
+) -> Result<Value, String> {
+    // __new__ produces the class object.
+    let newcls = if let Some(newf) = with_host(|h| h.class_lookup(meta, "__new__")) {
+        let newf = match with_host(|h| h.get(&newf).cloned()) {
+            Some(PyObj::StaticMethod(inner)) => inner,
+            _ => newf,
+        };
+        let metaobj = with_host(|h| h.alloc(PyObj::Class(meta.to_string())));
+        if let Some(PyObj::Func(fv)) = with_host(|h| h.get(&newf).cloned()) {
+            let owner = with_host(|h| method_owner(h, meta, "__new__"));
+            run_user_func(&fv, Some(metaobj), owner, args.clone(), kwargs.clone())?
+        } else {
+            let mut a = Vec::with_capacity(args.len() + 1);
+            a.push(metaobj);
+            a.extend(args.clone());
+            invoke(&newf, a, kwargs.clone())?
+        }
+    } else if args.len() >= 3 {
+        // Default `type.__new__(meta, name, bases, ns)`.
+        crate::builtins::type_new_meta(&args[0], &args[1], &args[2], meta)?
+    } else {
+        return Err(type_error("type() takes 1 or 3 arguments"));
+    };
+    // __init__(cls, name, bases, ns) — only if `meta` defines one and the class
+    // was actually produced.
+    let is_class = with_host(|h| matches!(h.get(&newcls), Some(PyObj::Class(_))));
+    if is_class {
+        if let Some(f) = with_host(|h| h.class_lookup(meta, "__init__")) {
+            if let Some(PyObj::Func(fv)) = with_host(|h| h.get(&f).cloned()) {
+                let owner = with_host(|h| method_owner(h, meta, "__init__"));
+                run_user_func(&fv, Some(newcls.clone()), owner, args, kwargs)?;
+            }
+        }
+    }
+    Ok(newcls)
 }
 
 /// Execute a user function/closure body on a fresh frame.
@@ -4736,7 +4927,13 @@ impl PyHost {
 }
 
 /// Run a class body function to populate its namespace, then register the class.
-pub fn build_class(name: &str, bases: Vec<String>, body_func: &Value) -> Result<Value, String> {
+/// `meta_name` is the explicit `metaclass=` (a user class name) if any.
+pub fn build_class(
+    name: &str,
+    bases: Vec<String>,
+    body_func: &Value,
+    meta_name: Option<String>,
+) -> Result<Value, String> {
     let fv = match with_host(|h| h.get(body_func).cloned()) {
         Some(PyObj::Func(fv)) => fv,
         _ => return Err(type_error("internal: class body is not a function")),
@@ -4760,7 +4957,21 @@ pub fn build_class(name: &str, bases: Vec<String>, body_func: &Value) -> Result<
     });
     r?;
     let ns: IndexMap<String, Value> = env.borrow().vars.clone();
-    let cls = with_host(|h| h.register_class(name, bases, ns.clone()));
+    // The effective metaclass: the explicit `metaclass=` if given, else the most
+    // derived metaclass inherited from the bases (CPython rule). A user metaclass
+    // constructs the class via `M(name, bases, namespace)` (firing `M.__new__`/
+    // `M.__init__`, tagging `type(cls) is M`); an implicit `type` registers directly.
+    let effective_meta = match meta_name {
+        Some(m) if with_host(|h| h.classes.contains_key(&m)) => Some(m),
+        _ => {
+            let dm = with_host(|h| default_metaclass(h, &bases));
+            (dm != "type").then_some(dm)
+        }
+    };
+    let cls = match &effective_meta {
+        Some(m) => metaclass_create(m, name, &bases, &ns)?,
+        None => with_host(|h| h.register_class(name, bases, ns.clone())),
+    };
     // Descriptor protocol: fire `__set_name__(owner, name)` on every class-body
     // value whose type defines it (in definition order).
     for (attr_name, val) in &ns {
@@ -4775,6 +4986,84 @@ pub fn build_class(name: &str, bases: Vec<String>, body_func: &Value) -> Result<
         }
     }
     Ok(cls)
+}
+
+/// Construct a class through its metaclass: `M(name, (bases...), {ns...})`. This
+/// runs `M`'s `__call__` (or the default `type.__call__` → `__new__`/`__init__`),
+/// exactly like any `M(...)` call, and returns the new class object.
+fn metaclass_create(
+    meta: &str,
+    name: &str,
+    bases: &[String],
+    ns: &IndexMap<String, Value>,
+) -> Result<Value, String> {
+    let name_v = with_host(|h| h.new_str(name.to_string()));
+    let base_vals: Vec<Value> = with_host(|h| {
+        bases
+            .iter()
+            .map(|b| h.alloc(PyObj::Class(b.clone())))
+            .collect()
+    });
+    let bases_v = with_host(|h| h.new_tuple(base_vals));
+    let ns_map: IndexMap<PKey, (Value, Value)> = with_host(|h| {
+        ns.iter()
+            .map(|(k, v)| {
+                let kv = h.new_str(k.clone());
+                (PKey::Str(k.clone()), (kv, v.clone()))
+            })
+            .collect()
+    });
+    let ns_v = with_host(|h| h.new_dict(ns_map));
+    let meta_v = with_host(|h| h.alloc(PyObj::Class(meta.to_string())));
+    invoke(&meta_v, vec![name_v, bases_v, ns_v], vec![])
+}
+
+/// The most-derived metaclass inherited from `bases` (CPython's rule for a class
+/// with no explicit `metaclass=`): the metaclass that is a subclass of every
+/// base's metaclass. `"type"` when no base carries a user metaclass.
+fn default_metaclass(h: &PyHost, bases: &[String]) -> String {
+    let mut winner = "type".to_string();
+    for b in bases {
+        let mb = h
+            .classes
+            .get(b)
+            .map(|c| c.metaclass.clone())
+            .unwrap_or_else(|| "type".into());
+        if mb == winner {
+            continue;
+        }
+        // Keep whichever metaclass derives from the other (more derived wins).
+        if winner == "type" || class_is_subclass(h, &mb, &winner) {
+            winner = mb;
+        }
+    }
+    winner
+}
+
+/// Whether `sub` is `sup` or derives (transitively) from it.
+fn class_is_subclass(h: &PyHost, sub: &str, sup: &str) -> bool {
+    if sub == sup {
+        return true;
+    }
+    match h.classes.get(sub) {
+        Some(cd) => cd.bases.iter().any(|b| class_is_subclass(h, b, sup)),
+        None => false,
+    }
+}
+
+/// Whether `class` is a metaclass — i.e. it derives (transitively) from the
+/// builtin `type`. A user metaclass is written `class M(type): ...`.
+pub fn class_inherits_type(h: &PyHost, class: &str) -> bool {
+    if class == "type" {
+        return true;
+    }
+    match h.classes.get(class) {
+        Some(cd) => cd
+            .bases
+            .iter()
+            .any(|b| b == "type" || class_inherits_type(h, b)),
+        None => false,
+    }
 }
 
 /// Turn a raised value into an exception + the error string to abort with.

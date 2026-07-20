@@ -1561,6 +1561,48 @@ fn set_repr_cpython_hash_order() {
 }
 
 #[test]
+fn metaclasses() {
+    // `class A(metaclass=M)` runs `M.__new__`/`M.__init__`; `type(A) is M`.
+    let base = "class M(type):\n    def __new__(mcls, name, bases, ns):\n        ns['injected'] = 99\n        return super().__new__(mcls, name, bases, ns)\n    def __init__(cls, name, bases, ns):\n        cls.tag = name.lower()\n        super().__init__(name, bases, ns)\nclass A(metaclass=M):\n    pass\n";
+    assert_eq!(
+        g(&format!("{base}x = (A.injected, A.tag, type(A) is M)"), "x"),
+        "(99, 'a', True)"
+    );
+    // A subclass inherits the metaclass (no explicit `metaclass=`).
+    assert_eq!(
+        g(
+            &format!("{base}class B(A): pass\nx = (type(B) is M, B.injected)"),
+            "x"
+        ),
+        "(True, 99)"
+    );
+    // A metaclass method is callable on the class, bound to the class.
+    assert_eq!(
+        g("class M(type):\n    def kind(cls): return cls.__name__ + '!'\nclass A(metaclass=M): pass\nx = A.kind()", "x"),
+        "'A!'"
+    );
+    // Metaclass `__call__` controls instantiation (singleton pattern).
+    let singleton = "class S(type):\n    _i = {}\n    def __call__(cls, *a):\n        if cls not in cls._i:\n            cls._i[cls] = super().__call__(*a)\n        return cls._i[cls]\nclass DB(metaclass=S):\n    def __init__(self): self.v = 7\n";
+    assert_eq!(
+        g(
+            &format!("{singleton}a = DB()\nb = DB()\nx = (a is b, a.v)"),
+            "x"
+        ),
+        "(True, 7)"
+    );
+    // 3-arg `type(name, bases, ns)` builds an ordinary class (`type` metaclass).
+    assert_eq!(
+        g(
+            "D = type('D', (), {'v': 5})\nx = (D.v, type(D) is type)",
+            "x"
+        ),
+        "(5, True)"
+    );
+    // A class object is usable as a dict key (identity by name).
+    assert_eq!(g("x = {int: 'i', str: 's'}[int]", "x"), "'i'");
+}
+
+#[test]
 fn instance_hash_dict_set_keys() {
     // A class with `__hash__` + `__eq__` gives value-equal instances one dict/set
     // slot; lookups with an equal-but-distinct instance find the entry.
