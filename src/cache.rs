@@ -38,7 +38,7 @@ use std::path::PathBuf;
 /// declaration and must miss cleanly.
 /// v10: `BUILD_CLASS` takes a 4th arg (the explicit metaclass, or `None`) pushed
 /// below the bases; older 3-arg bytecode must miss cleanly.
-const SCHEMA: u64 = 10;
+const SCHEMA: u64 = 11;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]

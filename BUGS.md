@@ -22,6 +22,14 @@ list of what is **not** yet covered, so nobody mistakes a gap for a bug fixed.
   bindings, and `if` guards.
 - **`nonlocal`** rebinds the nearest enclosing FUNCTION scope that binds the name
   (distinct from `global`, which targets module scope).
+- **User exception subclasses** inherit `BaseException`: `class E(Exception)`
+  instances carry `args` (seeded by construction / `super().__init__` / direct
+  assignment), stringify to the message (`''`/`str(arg)`/`repr(tuple)`), repr as
+  `E(arg, …)`, and expose `.args`; `str()` uses the message even when a user
+  `__repr__` exists; uncaught `raise E('x')` prints `E: x`.
+- **`__init_subclass__` (PEP 487)** fires the parent hook with the new class and
+  class-header keywords (`class C(P, tag="x")`); a zero-arg `super()` inside a
+  `property` getter/setter resolves; f-string/`.format`/`ascii` `!a` ascii-escapes.
 - **Comprehension scope**: list/set/dict comprehensions run in their own function
   scope, so the loop variable no longer leaks; enclosing variables are still read
   through the closure (the outermost iterable is evaluated in the enclosing
@@ -44,8 +52,12 @@ list of what is **not** yet covered, so nobody mistakes a gap for a bug fixed.
   `__next__`/`__init__`. Container `repr`/`str` (`list`/`tuple`/`set`/`dict`) now
   recurses so instance elements/keys/values dispatch their own `__repr__`.
   Not yet: `NotImplemented`-driven reflected-op negotiation (the forward dunder is
-  used if present; it is not retried reflected when it returns `NotImplemented`);
-  `__hash__` for instances as dict keys / set members; in-place `__iadd__` etc.
+  used if present; it is not retried reflected when it returns `NotImplemented`) —
+  though `str % obj` is now native-authoritative and never consults the right
+  operand's `__rmod__`; `__hash__` for instances as dict keys / set members;
+  in-place `__iadd__` etc. Also: `%s`/`%r`/`%a` of a *user instance* does not
+  dispatch its `__str__`/`__repr__` (the `%` formatter runs inside the host borrow;
+  f-strings and `str.format` do — prefer them).
 - **Chained comparisons** `a < b < c` re-evaluate the interior operand `b`
   (correct for side-effect-free operands; a function call in the middle runs twice).
 - **`with`** desugars to try/finally calling `__enter__`/`__exit__`; the exception
