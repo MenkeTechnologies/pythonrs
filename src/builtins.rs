@@ -1786,8 +1786,9 @@ fn py_repr(v: &Value) -> Result<String, String> {
     let cont = with_host(|h| match h.get(v) {
         Some(PyObj::List(l)) => Some(Cont::List(l.clone())),
         Some(PyObj::Tuple(l)) => Some(Cont::Tuple(l.clone())),
-        Some(PyObj::Set(s)) => Some(Cont::Set(s.values().cloned().collect())),
-        Some(PyObj::Frozenset(s)) => Some(Cont::Frozenset(s.values().cloned().collect())),
+        // Element order follows CPython's set hash-table layout (int subset).
+        Some(PyObj::Set(s)) => Some(Cont::Set(h.set_ordered_values(s))),
+        Some(PyObj::Frozenset(s)) => Some(Cont::Frozenset(h.set_ordered_values(s))),
         Some(PyObj::Dict(d)) => Some(Cont::Dict(d.values().cloned().collect())),
         _ => None,
     });

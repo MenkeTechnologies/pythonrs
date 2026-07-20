@@ -1540,6 +1540,24 @@ fn decode_escapes_named_unicode_unit() {
 }
 
 #[test]
+fn set_repr_cpython_hash_order() {
+    // A set/frozenset of machine ints iterates and reprs in CPython's
+    // open-addressing table order, not insertion order. `set(iterable)` builds
+    // incrementally, exactly as pythonrs does, so these match byte-for-byte.
+    assert_eq!(g("x = set([3, 1, 2])", "x"), "{1, 2, 3}");
+    assert_eq!(g("x = set([10, 5, 1, 2, 3])", "x"), "{1, 2, 3, 5, 10}");
+    assert_eq!(g("x = set([-1, -5, 3])", "x"), "{3, -5, -1}");
+    assert_eq!(g("x = set([100, 1, 50])", "x"), "{1, 50, 100}");
+    assert_eq!(g("x = frozenset([3, 1, 2])", "x"), "frozenset({1, 2, 3})");
+    // Colliding ints beyond the initial table (drives a resize + linear probing).
+    assert_eq!(g("x = set([9, 1, 17, 25, 33])", "x"), "{33, 1, 9, 17, 25}");
+    // Iteration follows the same order.
+    assert_eq!(g("x = list(set([10, 5, 1, 2, 3]))", "x"), "[1, 2, 3, 5, 10]");
+    // `1`, `1.0`, `True` unify to one element (int key), repr uses the first.
+    assert_eq!(g("x = set([2.0, 1])", "x"), "{1, 2.0}");
+}
+
+#[test]
 fn walrus_in_comprehension_leaks() {
     // A `:=` target inside a comprehension binds in the enclosing scope (PEP 572),
     // not the hidden comprehension function; the result is unaffected.
