@@ -36,7 +36,9 @@ use std::path::PathBuf;
 /// v9: comprehensions now inject a `global`/`nonlocal` declaration for walrus
 /// (`:=`) targets so they leak to the enclosing scope; older bytecode lacks the
 /// declaration and must miss cleanly.
-const SCHEMA: u64 = 9;
+/// v10: `BUILD_CLASS` takes a 4th arg (the explicit metaclass, or `None`) pushed
+/// below the bases; older 3-arg bytecode must miss cleanly.
+const SCHEMA: u64 = 10;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]

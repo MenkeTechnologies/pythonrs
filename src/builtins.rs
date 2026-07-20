@@ -756,11 +756,17 @@ fn b_build_class(vm: &mut VM, _: u8) -> Value {
     let body_func = vm.pop();
     let name = sval(&vm.pop());
     let bases_val = vm.pop();
+    let metaclass = vm.pop();
     let bases: Vec<String> = with_host(|h| match h.get(&bases_val) {
         Some(PyObj::List(l)) => l.iter().filter_map(|b| callable_name(h, b)).collect(),
         _ => Vec::new(),
     });
-    let r = host::build_class(&name, bases, &body_func);
+    // An explicit `metaclass=` that names a user class drives construction.
+    let meta_name = match &metaclass {
+        Value::Undef => None,
+        _ => with_host(|h| callable_name(h, &metaclass)),
+    };
+    let r = host::build_class(&name, bases, &body_func, meta_name);
     finish(vm, r)
 }
 
@@ -3713,6 +3719,18 @@ fn pad_str(s: &str, args: &[Value], mode: char) -> String {
 /// of class objects; `namespace` a dict of the class body. Registers the class
 /// and returns it.
 fn type_new(name: &Value, bases: &Value, ns: &Value) -> Result<Value, String> {
+    type_new_meta(name, bases, ns, "type")
+}
+
+/// `type.__new__(mcls, name, bases, namespace)` — like [`type_new`] but tags the
+/// new class's metaclass as `metaclass` (so `type(cls) is mcls`). Used by the
+/// metaclass construction path.
+pub fn type_new_meta(
+    name: &Value,
+    bases: &Value,
+    ns: &Value,
+    metaclass: &str,
+) -> Result<Value, String> {
     let cname = with_host(|h| h.as_str(name))
         .ok_or_else(|| host::type_error("type() argument 1 must be str"))?;
     // Base class names from the bases tuple (a bare `object` base is implicit).
@@ -3736,7 +3754,7 @@ fn type_new(name: &Value, bases: &Value, ns: &Value) -> Result<Value, String> {
         _ => IndexMap::new(),
     });
     Ok(with_host(|h| {
-        h.register_class(&cname, base_names, namespace)
+        h.register_class_meta(&cname, base_names, namespace, metaclass)
     }))
 }
 
