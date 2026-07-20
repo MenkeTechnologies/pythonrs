@@ -329,8 +329,9 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
       (and f-string `f'{x:{w}.2f}'`) drop the spec; keyword `'{name}'`, index `'{0[0]}'`,
       attribute `'{0.imag}'` fields → `None`; the `=` debug specifier `f'{x=}'` is a **`SyntaxError`**;
       `g` type treated as fixed precision (never switches to exponent / strips zeros);
-      `#` alt form, `c` type, `=` sign-aware fill, and `e` exponent (`1.2e5` want
-      `1.2e+05`) all wrong.
+      `c` type and `e` exponent (`1.2e5` want `1.2e+05`) wrong. (Sign-aware `=`/`0`
+      fill — the fill after the sign and any `0x`/`0o`/`0b` prefix, plus the space
+      sign flag — is now correct.)
 - [ ] **str method args silently ignored** — `split`/`rsplit` maxsplit, `find`/`index`
       start, `splitlines(keepends)` all ignored → wrong values, no error.
 - [x] **Missing str methods** — FIXED: `partition`/`rpartition`/`rindex`/`isnumeric`/
@@ -526,3 +527,17 @@ generator source), complex arithmetic, and `raise from`/implicit-context chainin
 All outputs are order-deterministic (sets always `sorted`). Each drove to **0**
 (unpacking/comprehension/dictset at 1,500; itertools/complexnum/exceptions2 at 800),
 and a **mixed 4,000 run = 0 divergences** with the new modes in rotation.
+
+**Object-model / closure / format modes added 2026-07-19** (`exceptions3`,
+`closures`, `oop2`, `strfmt2`) — cover user exception subclasses (args/str/repr/
+message/inheritance/`isinstance`/`super().__init__`/custom `__str__`), nested
+functions + `nonlocal` + late-binding loop captures + decorators-with-args +
+`*args`/`**kw` wrappers + multi-level lexical capture, multiple-inheritance MRO +
+attribute order + `super()` in a property + `__init_subclass__` class-kwargs +
+classmethod alt-constructors, and `!r`/`!s`/`!a` on containers + positional
+`.format` reuse + `%`-format tuples + int format specs. All outputs are
+deterministic (plain values, no instance-`%` dispatch, no nested-field spec).
+Bugs found + fixed while driving to 0: sign-aware zero-pad placed the fill before
+the sign (`+05d` of 5 → `000+5`, now `+0005`) and the space sign flag didn't
+prefix non-negative values. Each mode drove to **0** (exceptions3/closures at
+2,000; oop2/strfmt2 at 1,500).

@@ -1827,3 +1827,18 @@ fn init_subclass_hook() {
         "unexpected error: {e}"
     );
 }
+
+#[test]
+fn format_spec_sign_aware_zero_pad() {
+    // The `0` flag / `=` align inserts fill AFTER the sign and any radix prefix.
+    assert_eq!(g("s = f'{5:+05d}'", "s"), "'+0005'");
+    assert_eq!(g("s = f'{-3:05d}'", "s"), "'-0003'");
+    assert_eq!(g("s = f'{5: 05d}'", "s"), "' 0005'");
+    assert_eq!(g("s = f'{255:#08x}'", "s"), "'0x0000ff'");
+    assert_eq!(g("s = f'{-255:#08x}'", "s"), "'-0x000ff'");
+    assert_eq!(g("s = f'{3.14:+08.2f}'", "s"), "'+0003.14'");
+    assert_eq!(g("s = f'{-42:=8d}'", "s"), "'-     42'");
+    // A `+`/space sign flag prefixes a non-negative value.
+    assert_eq!(g("s = f'{5: d}'", "s"), "' 5'");
+    assert_eq!(g("s = f'{7:>6d}'", "s"), "'     7'");
+}
