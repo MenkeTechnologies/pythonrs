@@ -99,9 +99,93 @@ jobs:
           name: pythonrs-${{ matrix.target }}
           path: pythonrs-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
 
+  # Self-contained bundles (FFI_STDLIB.md §6): build with --features stdlib-ffi and
+  # ship the pythonrs binary next to the CPython runtime it imports — the pure
+  # stdlib, the lib-dynload C accelerators, and libpython itself — laid out so
+  # `ffi::resolve_home()` finds `<exe>/../lib/python3.14` with zero env vars. These
+  # run WITHOUT a system python@3.14 installed. Only native, same-arch runners are
+  # used: bundling a foreign-arch libpython from a cross build is not possible.
+  bundle:
+    name: Bundle ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    continue-on-error: ${{ matrix.allow_failure || false }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS arm64 — the primary target, verified layout.
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          # Linux x86_64 glibc — native on ubuntu-latest. Tolerated-failure so a
+          # CPython/toolchain hiccup here never blocks the macOS bundle.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            allow_failure: true
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # A real CPython 3.14 (shared libpython + stdlib) must be present for pyo3 to
+      # link against and for the bundler to copy from.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Locate CPython prefix
+        id: py
+        shell: bash
+        run: echo "prefix=$(python3 -c 'import sys;print(sys.prefix)')" >> "$GITHUB_OUTPUT"
+
+      - name: Install patchelf (Linux rpath rewrite)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y patchelf
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (stdlib-ffi)
+        env:
+          PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
+        run: cargo build --release --locked --features stdlib-ffi --bin python --target ${{ matrix.target }}
+
+      - name: Bundle self-contained tree
+        shell: bash
+        run: |
+          scripts/bundle-stdlib.sh \
+            --prefix "${{ steps.py.outputs.prefix }}" \
+            --bin "target/${{ matrix.target }}/release/python" \
+            --triple "${{ matrix.target }}"
+
+      - name: Smoke test the bundle (system python hidden)
+        shell: bash
+        run: |
+          cd "dist/${{ matrix.target }}"
+          env -u PYTHONHOME -u PYTHONPATH -u PYTHONRS_STDLIB \
+            ./bin/python -c 'import re,hashlib,_hashlib; \
+              assert re.findall(r"\d+","a1")==["1"]; \
+              assert hashlib.sha256(b"x").hexdigest().startswith("2d711642"); \
+              print("bundle OK:", re.__file__)'
+
+      - name: Package
+        shell: bash
+        run: |
+          # Tar the self-contained tree with bin/ + lib/ at the archive root
+          # (`-C dist/<triple>`), preserving the `<exe>/../lib` layout the binary
+          # depends on. Extracting anywhere reproduces a runnable prefix.
+          tar czf "pythonrs-${{ github.ref_name }}-${{ matrix.target }}-bundled.tar.gz" \
+            -C "dist/${{ matrix.target }}" bin lib
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: pythonrs-${{ matrix.target }}-bundled
+          path: pythonrs-${{ github.ref_name }}-${{ matrix.target }}-bundled.tar.gz
+
   publish:
     name: Publish GitHub Release
-    needs: build
+    needs: [build, bundle]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -152,48 +236,49 @@ jobs:
         shell: bash
         env:
           VERSION: ${{ github.ref_name }}
-          SHA_ARM_MACOS: ${{ steps.sha.outputs.aarch64_apple_darwin }}
-          SHA_X86_MACOS: ${{ steps.sha.outputs.x86_64_apple_darwin }}
-          SHA_X86_LINUX: ${{ steps.sha.outputs.x86_64_unknown_linux_gnu }}
-          SHA_ARM_LINUX: ${{ steps.sha.outputs.aarch64_unknown_linux_gnu }}
-          SHA_X86_LINUX_MUSL: ${{ steps.sha.outputs.x86_64_unknown_linux_musl }}
-          SHA_ARM_LINUX_MUSL: ${{ steps.sha.outputs.aarch64_unknown_linux_musl }}
+          # Self-contained bundles (bin/python + the CPython runtime). Bottling the
+          # bundle over `depends_on "python@3.14"` because the tarball carries its
+          # own libpython + stdlib — the formula never relies on the user's brew
+          # python prefix matching the CI build prefix.
+          SHA_ARM_MACOS: ${{ steps.sha.outputs.aarch64_apple_darwin_bundled }}
+          SHA_X86_LINUX: ${{ steps.sha.outputs.x86_64_unknown_linux_gnu_bundled }}
         run: |
           set -eu
           V="${VERSION#v}"
           BASE="https://github.com/MenkeTechnologies/pythonrs/releases/download/v${V}"
-          # macOS arm is the primary target — a missing binary there is a
+          # macOS arm is the primary target — a missing bundle there is a
           # release failure, not a platform to silently drop.
           if [ -z "${SHA_ARM_MACOS}" ]; then
-            echo "::error::aarch64-apple-darwin binary missing — refusing to ship a broken formula" >&2
+            echo "::error::aarch64-apple-darwin bundle missing — refusing to ship a broken formula" >&2
             exit 1
           fi
-          # Helper: emit an on_arm / on_intel block when its SHA is non-empty.
-          emit() { local guard="$1" arch="$2" sha="$3"; [ -n "$sha" ] || return 0; printf '    %s do\n      url "%s/pythonrs-v%s-%s.tar.gz"\n      sha256 "%s"\n    end\n' "$guard" "$BASE" "$V" "$arch" "$sha"; }
-          mac_blocks=$( { emit on_arm aarch64-apple-darwin "$SHA_ARM_MACOS"; emit on_intel x86_64-apple-darwin "$SHA_X86_MACOS"; } )
-          linux_blocks=$( { emit on_intel x86_64-unknown-linux-gnu "$SHA_X86_LINUX"; emit on_arm aarch64-unknown-linux-gnu "$SHA_ARM_LINUX"; } )
+          # Emit an on_arm / on_intel url+sha block for a bundled tarball, already
+          # wrapped in its on_macos / on_linux guard (empty string if no SHA).
+          emit() { local guard="$1" arch="$2" sha="$3"; [ -n "$sha" ] || return 0; printf '    %s do\n      url "%s/pythonrs-v%s-%s-bundled.tar.gz"\n      sha256 "%s"\n    end\n' "$guard" "$BASE" "$V" "$arch" "$sha"; }
+          mac_inner=$( emit on_arm aarch64-apple-darwin "$SHA_ARM_MACOS" )
+          linux_inner=$( emit on_intel x86_64-unknown-linux-gnu "$SHA_X86_LINUX" )
           {
             printf 'class Pythonrs < Formula\n'
             printf '  desc "Compiled Python runtime on the fusevm bytecode VM + Cranelift JIT"\n'
             printf '  homepage "https://github.com/MenkeTechnologies/pythonrs"\n'
             printf '  license "MIT"\n'
             printf '  version "%s"\n\n' "$V"
-            [ -n "$mac_blocks" ] && printf '  on_macos do\n%s\n  end\n\n' "$mac_blocks"
-            [ -n "$linux_blocks" ] && printf '  on_linux do\n%s\n  end\n\n' "$linux_blocks"
+            [ -n "$mac_inner" ]   && printf '  on_macos do\n%s\n  end\n\n' "$mac_inner"
+            [ -n "$linux_inner" ] && printf '  on_linux do\n%s\n  end\n\n' "$linux_inner"
             printf '  def install\n'
-            printf '    bin.install "python"\n'
+            # Tarball root is the self-contained prefix: bin/python + lib/python3.14
+            # + lib/libpython. Installing both into the cellar prefix keeps the
+            # binary @executable_path/../lib ($ORIGIN/../lib on Linux) pointing at
+            # the bundled runtime; Homebrew symlinks bin/python onto PATH.
+            printf '    prefix.install "bin", "lib"\n'
             printf '  end\n\n'
             printf '  test do\n'
-            printf '    assert_match "42", shell_output("#{bin}/python -c '\''print(6*7)'\''")\n'
+            # VM path, then the real CPython stdlib over the FFI bridge. The stdlib
+            # case goes through a temp file to sidestep nested-quote escaping.
+            printf '    assert_equal "42", shell_output("#{bin}/python -c '\''print(6*7)'\''").strip\n'
+            printf '    (testpath/"t.py").write("import hashlib\\nprint(hashlib.sha256(b'\''x'\'').hexdigest()[:8])\\n")\n'
+            printf '    assert_equal "2d711642", shell_output("#{bin}/python #{testpath}/t.py").strip\n'
             printf '  end\n'
-            # musl tarballs as trailing comment — Homebrew has no on_libc
-            # gate, so static binaries are referenced by URL for users
-            # targeting Alpine / scratch / distroless.
-            if [ -n "$SHA_X86_LINUX_MUSL" ] || [ -n "$SHA_ARM_LINUX_MUSL" ]; then
-              printf '\n  # Static musl tarballs also published at this release:\n'
-              [ -n "$SHA_X86_LINUX_MUSL" ] && printf '  #   pythonrs-v%s-x86_64-unknown-linux-musl.tar.gz  sha256: %s\n' "$V" "$SHA_X86_LINUX_MUSL"
-              [ -n "$SHA_ARM_LINUX_MUSL" ] && printf '  #   pythonrs-v%s-aarch64-unknown-linux-musl.tar.gz  sha256: %s\n' "$V" "$SHA_ARM_LINUX_MUSL"
-            fi
             printf 'end\n'
           } > tap/Formula/pythonrs.rb
 
