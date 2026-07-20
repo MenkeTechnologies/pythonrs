@@ -1847,6 +1847,8 @@ const BUILTIN_FUNCS: &[&str] = &[
     "staticmethod",
     "classmethod",
     "property",
+    "exit",
+    "quit",
 ];
 
 // ── builtin functions ────────────────────────────────────────────────────────
@@ -2433,6 +2435,18 @@ pub fn call_builtin_function(
                 .trim_end_matches('\r')
                 .to_string();
             Ok(with_host(|h| h.new_str(line)))
+        }
+        // `exit([code])` / `quit([code])` — the `site` module's `Quitter`
+        // objects. Equivalent to `sys.exit`: raise a catchable `SystemExit`
+        // (int→that code, None→0, str→message on stderr + exit 1).
+        "exit" | "quit" => {
+            let exc = with_host(|h| {
+                h.alloc(PyObj::Exception {
+                    class: "SystemExit".into(),
+                    args,
+                })
+            });
+            Err(host::raise_value(&exc)?)
         }
         "callable" => {
             let v = arg0(&args)?;

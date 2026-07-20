@@ -123,6 +123,28 @@ fn sys_exit_none_is_zero() {
 }
 
 #[test]
+fn builtin_exit_int_sets_exit_code() {
+    // `exit(2)` (site.Quitter) is equivalent to `sys.exit(2)`.
+    let r = run_program("exit(2)", vec![String::new()], None, "<string>", true);
+    assert_eq!(r.exit_code, 2);
+    assert_eq!(r.stderr, None);
+}
+
+#[test]
+fn builtin_quit_none_is_zero() {
+    let r = run_program("quit()", vec![String::new()], None, "<string>", true);
+    assert_eq!(r.exit_code, 0);
+    assert_eq!(r.stderr, None);
+}
+
+#[test]
+fn builtin_exit_string_writes_message_exit_1() {
+    let r = run_program("exit('bad')", vec![String::new()], None, "<string>", true);
+    assert_eq!(r.exit_code, 1);
+    assert_eq!(r.stderr.as_deref(), Some("bad\n"));
+}
+
+#[test]
 fn raise_system_exit_with_code() {
     let r = run_program(
         "raise SystemExit(5)",
