@@ -5,6 +5,9 @@ _python() {
     '(-c)-c[execute a one-liner]:source' \
     '--build[AOT-compile to a native executable]' \
     '--dump-bytecode[print lowered fusevm bytecode]' \
+    '--dump-tokens[print the lexer token stream]' \
+    '--dump-ast[print the parsed AST]' \
+    '--disasm[print a fusevm bytecode disassembly listing]' \
     '--repl[start the interactive REPL]' \
     '--lsp[speak LSP over stdio]' \
     '--dap[speak DAP over stdio]' \

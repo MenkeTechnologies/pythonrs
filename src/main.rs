@@ -35,6 +35,24 @@ fn main() -> ExitCode {
                 Err(e) => fail(&e),
             };
         }
+        if cli.dump_tokens {
+            return match dump_tokens(&file) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => fail(&e),
+            };
+        }
+        if cli.dump_ast {
+            return match dump_ast(&file) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => fail(&e),
+            };
+        }
+        if cli.disasm {
+            return match disasm(&file) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => fail(&e),
+            };
+        }
         if cli.build {
             return match pythonrs::aot::build(&file) {
                 Ok(msg) => {
@@ -81,6 +99,44 @@ fn dump(file: &str) -> Result<(), String> {
     }
     for (i, p) in prog.procs.iter().enumerate() {
         println!("== block #{i} ==\n{:#?}", p.chunk.ops);
+    }
+    Ok(())
+}
+
+/// `--dump-tokens`: print the lexer token stream, one `line\tTok` per line.
+/// Python is indentation-sensitive, so INDENT/DEDENT/NEWLINE tokens are printed
+/// as emitted.
+fn dump_tokens(file: &str) -> Result<(), String> {
+    let src = std::fs::read_to_string(file).map_err(|e| format!("cannot read {file}: {e}"))?;
+    for t in pythonrs::lexer::lex(&src)? {
+        println!("{}\t{:?}", t.line, t.tok);
+    }
+    Ok(())
+}
+
+/// `--dump-ast`: print the parsed Python AST.
+fn dump_ast(file: &str) -> Result<(), String> {
+    let src = std::fs::read_to_string(file).map_err(|e| format!("cannot read {file}: {e}"))?;
+    let stmts = pythonrs::parser::parse(&src)?;
+    println!("{stmts:#?}");
+    Ok(())
+}
+
+/// `--disasm`: print a fusevm bytecode disassembly of the main chunk and every
+/// compiled function/block, via the shared `fusevm::Chunk::disassemble`.
+fn disasm(file: &str) -> Result<(), String> {
+    let src = std::fs::read_to_string(file).map_err(|e| format!("cannot read {file}: {e}"))?;
+    let prog = pythonrs::compile(&src)?;
+    println!("; python fusevm — main\n{}", prog.main.disassemble());
+    for (name, m) in &prog.functions {
+        println!(
+            "; python fusevm — def {name}({})\n{}",
+            m.params.join(", "),
+            m.chunk.disassemble()
+        );
+    }
+    for (i, p) in prog.procs.iter().enumerate() {
+        println!("; python fusevm — block #{i}\n{}", p.chunk.disassemble());
     }
     Ok(())
 }
