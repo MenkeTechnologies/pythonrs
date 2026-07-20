@@ -15,7 +15,7 @@
 //! `MKSTR`.
 
 use crate::ast::*;
-use crate::host::{binop as bop, ops, unop, FuncDef, TryDef};
+use crate::host::{binop as bop, iop, ops, unop, FuncDef, TryDef};
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 
 /// A compiled program: the top-level chunk plus the def/lambda/class-body
@@ -408,6 +408,32 @@ impl Compiler {
         Ok(())
     }
 
+    /// The `ops::iop` tag for an augmented-assignment operator.
+    fn iop_tag(op: BinOp) -> i64 {
+        use iop::*;
+        match op {
+            BinOp::Add => ADD,
+            BinOp::Sub => SUB,
+            BinOp::Mul => MUL,
+            BinOp::Div => DIV,
+            BinOp::FloorDiv => FLOORDIV,
+            BinOp::Mod => MOD,
+            BinOp::Pow => POW,
+            BinOp::MatMul => MATMUL,
+            BinOp::BitAnd => BITAND,
+            BinOp::BitOr => BITOR,
+            BinOp::BitXor => BITXOR,
+            BinOp::Shl => SHL,
+            BinOp::Shr => SHR,
+        }
+    }
+
+    /// `t op= v`: apply the in-place protocol (`INPLACE`) and rebind. `INPLACE`
+    /// tries `type(t).__i<op>__(t, v)` — mutating `t` in place and preserving its
+    /// identity for the mutable built-ins (`list`, `set`, `dict`, `bytearray`) and
+    /// user `__iadd__`/… — falling back to `t = t <op> v` otherwise. The receiver
+    /// and index of a subscript/attribute target are evaluated EXACTLY ONCE
+    /// (CPython semantics) by binding them to synthetic temps first.
     fn compile_augassign(
         &mut self,
         b: &mut ChunkBuilder,
@@ -415,12 +441,52 @@ impl Compiler {
         op: BinOp,
         value: &Expr,
     ) -> Result<(), String> {
-        // Desugar `t op= v` -> `t = t op v`. Names & simple targets only (the
-        // subscript/attribute path re-evaluates the receiver, matching output
-        // for side-effect-free receivers).
-        let combined = Expr::BinOp(op, Box::new(target.clone()), Box::new(value.clone()));
-        self.compile_expr(b, &combined)?;
-        self.compile_assign(b, target)?;
+        let tag = Self::iop_tag(op);
+        match target {
+            Expr::Name(_) => {
+                // A name target has no receiver side effect: load, apply, store.
+                b.emit(Op::LoadInt(tag), 0);
+                self.compile_expr(b, target)?;
+                self.compile_expr(b, value)?;
+                b.emit(Op::CallBuiltin(ops::INPLACE, 3), self.cur_line);
+                self.compile_assign(b, target)?;
+            }
+            Expr::Attribute(recv, attr) => {
+                // `recv.attr op= v`: evaluate `recv` once into a temp.
+                let rt = format!(".aug{}", self.tmp);
+                self.tmp += 1;
+                self.compile_expr(b, recv)?;
+                self.compile_assign(b, &Expr::Name(rt.clone()))?;
+                let lval = Expr::Attribute(Box::new(Expr::Name(rt.clone())), attr.clone());
+                b.emit(Op::LoadInt(tag), 0);
+                self.compile_expr(b, &lval)?;
+                self.compile_expr(b, value)?;
+                b.emit(Op::CallBuiltin(ops::INPLACE, 3), self.cur_line);
+                self.compile_assign(b, &lval)?;
+            }
+            Expr::Subscript(recv, idx) => {
+                // `recv[idx] op= v`: evaluate `recv` and `idx` once into temps
+                // (a slice index materializes to a slice object, still once).
+                let rt = format!(".aug{}", self.tmp);
+                self.tmp += 1;
+                let it = format!(".aug{}", self.tmp);
+                self.tmp += 1;
+                self.compile_expr(b, recv)?;
+                self.compile_assign(b, &Expr::Name(rt.clone()))?;
+                self.compile_subscript_index(b, idx)?;
+                self.compile_assign(b, &Expr::Name(it.clone()))?;
+                let lval = Expr::Subscript(
+                    Box::new(Expr::Name(rt.clone())),
+                    Box::new(Expr::Name(it.clone())),
+                );
+                b.emit(Op::LoadInt(tag), 0);
+                self.compile_expr(b, &lval)?;
+                self.compile_expr(b, value)?;
+                b.emit(Op::CallBuiltin(ops::INPLACE, 3), self.cur_line);
+                self.compile_assign(b, &lval)?;
+            }
+            _ => return Err("SyntaxError: cannot assign to this expression".into()),
+        }
         Ok(())
     }
 
@@ -855,13 +921,35 @@ impl Compiler {
         body: &[Stmt],
         is_async: bool,
     ) -> Result<(), String> {
-        // Desugar `with a as x: body` -> enter, then try/finally exit.
-        // The context expression is evaluated EXACTLY ONCE into a synthetic temp;
-        // `__enter__`/`__exit__` both dispatch on that temp. (Re-evaluating it —
-        // as `with open(path,'w')` — would re-run the side effect, e.g. re-open and
-        // truncate the file, discarding the writes.)
-        // `async with` is identical but drives `__aenter__`/`__aexit__` through
-        // `await` (the enter value / exit call are awaited).
+        // `with A, B: BODY` nests each manager independently (B inside A), so an
+        // inner manager suppressing an exception hides it from the outer one —
+        // exactly CPython's semantics. Fold from the innermost item outward.
+        let mut cur: Vec<Stmt> = body.to_vec();
+        for it in items.iter().rev() {
+            cur = self.desugar_with_single(it, cur, is_async);
+        }
+        self.compile_stmts(b, &cur)
+    }
+
+    /// Desugar a single `with item as VAR: body` to the CPython protocol:
+    /// ```text
+    /// .ctx = <context expr>            # evaluated EXACTLY once
+    /// VAR  = .ctx.__enter__()
+    /// .hit = False
+    /// try:
+    ///     body
+    /// except BaseException as .exc:
+    ///     .hit = True
+    ///     if not .ctx.__exit__(type(.exc), .exc, None):   # real 3-tuple
+    ///         raise                                        # truthy → suppressed
+    /// finally:
+    ///     if not .hit:
+    ///         .ctx.__exit__(None, None, None)              # normal exit, once
+    /// ```
+    /// `async with` drives `__aenter__`/`__aexit__` through `await`. The traceback
+    /// slot is `None` (pythonrs has no traceback objects); the type and value are
+    /// the real exception's.
+    fn desugar_with_single(&mut self, it: &WithItem, body: Vec<Stmt>, is_async: bool) -> Vec<Stmt> {
         let (enter_m, exit_m) = if is_async {
             ("__aenter__", "__aexit__")
         } else {
@@ -874,55 +962,111 @@ impl Compiler {
                 e
             }
         };
-        let mut inner: Vec<Stmt> = Vec::new();
-        let mut temps: Vec<String> = Vec::new();
-        for it in items {
-            let ctx_tmp = format!(".with{}", self.tmp);
-            self.tmp += 1;
-            temps.push(ctx_tmp.clone());
-            // __with_ctx = <context expr>   (evaluated once)
-            inner.push(
+        let ctx = format!(".with{}", self.tmp);
+        self.tmp += 1;
+        let hit = format!(".withhit{}", self.tmp);
+        self.tmp += 1;
+        let exc = format!(".withexc{}", self.tmp);
+        self.tmp += 1;
+
+        let call = |recv: &str, method: &str, args: Vec<Expr>| -> Expr {
+            Expr::Call {
+                func: Box::new(Expr::Attribute(
+                    Box::new(Expr::Name(recv.into())),
+                    method.into(),
+                )),
+                args,
+                keywords: vec![],
+            }
+        };
+
+        let mut out: Vec<Stmt> = Vec::new();
+        // .ctx = <context expr>   (once)
+        out.push(
+            StmtKind::Assign {
+                targets: vec![Expr::Name(ctx.clone())],
+                value: it.context.clone(),
+            }
+            .into(),
+        );
+        // VAR = [await] .ctx.__enter__()   (or eval for effect if no `as`)
+        let enter = awaited(call(&ctx, enter_m, vec![]));
+        match &it.vars {
+            Some(v) => out.push(
                 StmtKind::Assign {
-                    targets: vec![Expr::Name(ctx_tmp.clone())],
-                    value: it.context.clone(),
+                    targets: vec![v.clone()],
+                    value: enter,
                 }
                 .into(),
-            );
-            // x = [await] __with_ctx.__[a]enter__()
-            let enter = awaited(Expr::Call {
-                func: Box::new(Expr::Attribute(
-                    Box::new(Expr::Name(ctx_tmp.clone())),
-                    enter_m.into(),
-                )),
-                args: vec![],
-                keywords: vec![],
-            });
-            match &it.vars {
-                Some(v) => inner.push(
-                    StmtKind::Assign {
-                        targets: vec![v.clone()],
-                        value: enter,
-                    }
-                    .into(),
-                ),
-                None => inner.push(StmtKind::Expr(enter).into()),
+            ),
+            None => out.push(StmtKind::Expr(enter).into()),
+        }
+        // .hit = False
+        out.push(
+            StmtKind::Assign {
+                targets: vec![Expr::Name(hit.clone())],
+                value: Expr::False,
             }
+            .into(),
+        );
+        // except handler body: .hit = True; if not .ctx.__exit__(type(.exc),.exc,None): raise
+        let exit_exc = awaited(call(
+            &ctx,
+            exit_m,
+            vec![
+                Expr::Call {
+                    func: Box::new(Expr::Name("type".into())),
+                    args: vec![Expr::Name(exc.clone())],
+                    keywords: vec![],
+                },
+                Expr::Name(exc.clone()),
+                Expr::None,
+            ],
+        ));
+        let handler_body: Vec<Stmt> = vec![
+            StmtKind::Assign {
+                targets: vec![Expr::Name(hit.clone())],
+                value: Expr::True,
+            }
+            .into(),
+            StmtKind::If {
+                test: Expr::UnaryOp(UnOp::Not, Box::new(exit_exc)),
+                body: vec![StmtKind::Raise {
+                    exc: None,
+                    cause: None,
+                }
+                .into()],
+                orelse: vec![],
+            }
+            .into(),
+        ];
+        // finally: if not .hit: .ctx.__exit__(None, None, None)
+        let exit_none = awaited(call(
+            &ctx,
+            exit_m,
+            vec![Expr::None, Expr::None, Expr::None],
+        ));
+        let finalbody: Vec<Stmt> = vec![StmtKind::If {
+            test: Expr::UnaryOp(UnOp::Not, Box::new(Expr::Name(hit.clone()))),
+            body: vec![StmtKind::Expr(exit_none).into()],
+            orelse: vec![],
         }
-        inner.extend_from_slice(body);
-        // finally: [await] __with_ctx.__[a]exit__(None, None, None), in LIFO order.
-        let mut fin: Vec<Stmt> = Vec::new();
-        for ctx_tmp in temps.iter().rev() {
-            let exit = awaited(Expr::Call {
-                func: Box::new(Expr::Attribute(
-                    Box::new(Expr::Name(ctx_tmp.clone())),
-                    exit_m.into(),
-                )),
-                args: vec![Expr::None, Expr::None, Expr::None],
-                keywords: vec![],
-            });
-            fin.push(StmtKind::Expr(exit).into());
-        }
-        self.compile_try(b, &inner, &[], &[], &fin)
+        .into()];
+        out.push(
+            StmtKind::Try {
+                body,
+                handlers: vec![ExceptHandler {
+                    typ: Some(Expr::Name("BaseException".into())),
+                    name: Some(exc),
+                    body: handler_body,
+                    star: false,
+                }],
+                orelse: vec![],
+                finalbody,
+            }
+            .into(),
+        );
+        out
     }
 
     // ── expressions ──────────────────────────────────────────────────────
@@ -1316,17 +1460,33 @@ impl Compiler {
             self.emit_single_compare(b, left, ops_list[0].0, &ops_list[0].1)?;
             return Ok(());
         }
-        // Chained: a<b<c -> (a<b) and (b<c). Re-evaluates interior operands
-        // (side-effect-free operands only; see BUGS).
+        // Chained: `a<b<c` -> `(a<b) and (b<c)`, but each INTERIOR operand is
+        // evaluated EXACTLY ONCE (CPython semantics). Bind each interior operand
+        // to a synthetic temp with a walrus (`:=`) inside the link that first
+        // reads it; the next link reads the temp. Because the conjunction folds
+        // through `compile_boolop`'s short-circuit, a later operand's walrus is
+        // never reached once an earlier link is False — so short-circuit
+        // evaluation is preserved (the operand is not evaluated at all).
+        let n = ops_list.len();
         let mut conj: Vec<Expr> = Vec::new();
         let mut prev = left.clone();
-        for (op, rhs) in ops_list {
-            conj.push(Expr::Compare(
-                Box::new(prev.clone()),
-                vec![(*op, rhs.clone())],
-            ));
-            prev = rhs.clone();
+        for (i, (op, rhs)) in ops_list.iter().enumerate() {
+            if i + 1 < n {
+                let t = format!(".cmp{}", self.tmp);
+                self.tmp += 1;
+                // `prev op (t := rhs)`
+                let walrus = Expr::NamedExpr(
+                    Box::new(Expr::Name(t.clone())),
+                    Box::new(rhs.clone()),
+                );
+                conj.push(Expr::Compare(Box::new(prev), vec![(*op, walrus)]));
+                prev = Expr::Name(t);
+            } else {
+                conj.push(Expr::Compare(Box::new(prev), vec![(*op, rhs.clone())]));
+                prev = rhs.clone();
+            }
         }
+        let _ = prev;
         self.compile_boolop(b, BoolOp::And, &conj)
     }
 

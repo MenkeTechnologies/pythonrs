@@ -25,6 +25,23 @@ fixed. Every line below was re-checked against the **default-build** binary
   bindings, and `if` guards.
 - **`nonlocal`** rebinds the nearest enclosing FUNCTION scope that binds the name
   (distinct from `global`, which targets module scope).
+- **Augmented assignment** (`+= -= *= /= //= %= **= @= &= |= ^= <<= >>=`) runs the
+  CPython in-place protocol: `x += y` tries `type(x).__i<op>__(x, y)` first, then
+  falls back to `x = x <op> y`. A user `__iadd__`/… that mutates and returns
+  `self` preserves identity (`id(x)` unchanged), as do the mutable built-ins
+  (`list +=`/`*=`, `set |= &= -= ^=`, `dict |=`, `bytearray +=`/`*=`); immutables
+  (`int`/`str`/`tuple`/`frozenset`) rebind a new object. A subscript/attribute
+  target's receiver and index are evaluated exactly once.
+- **Chained comparisons** `a < b < c` evaluate each interior operand exactly once
+  and short-circuit (`1 < f() < 10` calls `f` once; a failed earlier link skips
+  the later operands entirely).
+- **`with` / `async with`** call a real `__exit__(exc_type, exc_value, tb)` with
+  the active exception's type and value on the error path (`tb` is `None` —
+  pythonrs has no traceback objects); a truthy return **suppresses** the
+  exception, a falsy/`None` return re-raises. On the normal path `__exit__` is
+  called once with `(None, None, None)`. `with A, B:` nests independently, so an
+  inner manager's suppression hides the exception from the outer one. `__enter__`'s
+  return value binds to the `as` target.
 - **User exception subclasses** inherit `BaseException`: `class E(Exception)`
   instances carry `args` (seeded by construction / `super().__init__` / direct
   assignment), stringify to the message (`''`/`str(arg)`/`repr(tuple)`), repr as
@@ -138,15 +155,7 @@ fixed. Every line below was re-checked against the **default-build** binary
   `__ge__`), and `__getitem__`/`__setitem__`/`__len__`/`__bool__`/`__str__`/
   `__repr__`/`__iter__`/`__next__`/`__init__`/`__hash__`. Container `repr`/`str`
   recurses so instance elements/keys/values dispatch their own `__repr__`.
-  **Not yet:** in-place augmented dunders — `x += y` does **not** call `__iadd__`
-  (falls through to `__add__`, or `TypeError` if absent).
-- **Chained comparisons** `a < b < c` re-evaluate the interior operand `b`
-  (correct for side-effect-free operands; a function call in the middle runs
-  twice — verified `1 < f() < 10` calls `f` twice vs CPython's once).
-- **`with`** desugars to try/finally calling `__enter__`/`__exit__`; on the
-  exceptional exit path the triple passed to `__exit__` is always
-  `(None, None, None)`, and a `True` return does **not** suppress the propagating
-  exception (verified: the exception still escapes the `with`).
+  In-place augmented dunders are dispatched too (see Implemented).
 - **`int`** is arbitrary precision (bignum) across `+ - * ** // %` and the bitwise
   ops `& | ^ << >>` — verified byte-identical to CPython on `10**30`-scale values
   (the earlier i64-cap on `//`/`%`/bitwise is gone).
