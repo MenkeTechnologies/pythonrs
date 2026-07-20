@@ -92,9 +92,11 @@ pub fn compile_or_load(src: &str) -> Result<compiler::Program, String> {
     Ok(prog)
 }
 
-/// Parse/load, compile, and run a Python source string on a fresh host.
+/// Parse/load, compile, and run a Python source string on a fresh host. Runs as
+/// the top-level `__main__` with a default `sys.argv` of `['']`.
 pub fn eval_str(src: &str) -> Result<Value, String> {
     host::reset_host();
+    host::init_runtime(vec![String::new()], None, src, "<string>", true);
     run_compiled(compile_or_load(src)?)
 }
 
@@ -102,7 +104,56 @@ pub fn eval_str(src: &str) -> Result<Value, String> {
 pub fn eval_file(path: &str) -> Result<Value, String> {
     let src = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
     host::reset_host();
+    host::init_runtime(vec![path.to_string()], None, &src, path, true);
     run_compiled(compile_or_load(&src)?)
+}
+
+/// How a program run ended: the process exit code plus any text the runtime must
+/// emit to stderr (a traceback block or a `SystemExit` message).
+pub struct RunReport {
+    pub exit_code: i32,
+    pub stderr: Option<String>,
+}
+
+/// Run a top-level program with a fully specified CLI/runtime context and reduce
+/// the outcome to a process exit code + stderr text (uncaught-exception traceback
+/// or `SystemExit` handling). This is the entry the `python` binary uses so that
+/// `sys.argv`, `__name__`/`__file__`, `sys.exit`, and tracebacks all behave like
+/// CPython.
+pub fn run_program(
+    src: &str,
+    argv: Vec<String>,
+    main_file: Option<String>,
+    tb_filename: &str,
+    show_source: bool,
+) -> RunReport {
+    host::reset_host();
+    host::init_runtime(argv, main_file, src, tb_filename, show_source);
+    let prog = match compile_or_load(src) {
+        Ok(p) => p,
+        Err(e) => {
+            return RunReport {
+                exit_code: 1,
+                stderr: Some(format!("{e}\n")),
+            }
+        }
+    };
+    match run_compiled(prog) {
+        Ok(_) => RunReport {
+            exit_code: 0,
+            stderr: None,
+        },
+        Err(e) => match host::classify_top_error(&e) {
+            host::TopExit::SystemExit { code, message } => RunReport {
+                exit_code: code,
+                stderr: message,
+            },
+            host::TopExit::Uncaught { traceback } => RunReport {
+                exit_code: 1,
+                stderr: Some(traceback),
+            },
+        },
+    }
 }
 
 /// Read and run a `.py` file under the DAP debugger.

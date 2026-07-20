@@ -29,7 +29,10 @@ fixed. Every line below was re-checked against the **default-build** binary
   instances carry `args` (seeded by construction / `super().__init__` / direct
   assignment), stringify to the message (`''`/`str(arg)`/`repr(tuple)`), repr as
   `E(arg, …)`, and expose `.args`; `str()` uses the message even when a user
-  `__repr__` exists; uncaught `raise E('x')` prints `E: x`. **Exception chaining**
+  `__repr__` exists. An uncaught exception prints CPython's
+  `Traceback (most recent call last):` block — header, `  File "<path>", line N,
+  in <scope>` + source line per frame (outermost first), then `ErrorType: message`
+  (caret `^^^` markers omitted for now). **Exception chaining**
   `raise X from Y` records `__cause__` (verified: `v.__cause__` is the `from`
   operand).
 - **Object model**: `complex` (`(1+2j)*(3-1j)`, `.real`/`.imag`, `abs`),
@@ -121,8 +124,8 @@ fixed. Every line below was re-checked against the **default-build** binary
 ## Tooling
 - **`--dap`** (Debug Adapter Protocol): implemented — breakpoints, step
   in/out/over/continue, stack trace, locals, and program-stdout capture (pipe +
-  dup2 → `output` events). Frame names in the stack use the function/class owner
-  or `<module>` (no per-function name field yet). Watch expressions not yet added.
+  dup2 → `output` events). Frame names in the stack use the function name (or
+  `<module>`), shared with the traceback path. Watch expressions not yet added.
 - **`--lsp`**: full corpus — completion (166 builtins/keywords/methods), position-
   aware hover, and diagnostics via the real parser. Go-to-def and signature help
   not yet added.
@@ -134,8 +137,10 @@ The **default build** (no features) serves only a native subset; every other
 module raises `ModuleNotFoundError`.
 
 - **Native in every build**: `math` (constants + a common function subset), `sys`
-  (skeletal: `argv`/`maxsize`/`version`/`platform`/`stdout`/`stderr`/`stdin`;
-  `version` reports `3.12.0 (pythonrs)`), `collections` (`deque`, `Counter`,
+  (`argv` from the process args, `exit`/`getrecursionlimit`/`setrecursionlimit`,
+  `maxsize`, `version`/`version_info` reporting the emulated CPython `3.14.6`,
+  `platform` (`darwin`/`linux`), `path`, `modules`, `executable`,
+  `stdout`/`stderr`/`stdin` file objects), `collections` (`deque`, `Counter`,
   `defaultdict`, `OrderedDict`, `namedtuple`), `textwrap`, and `statistics`.
 - **The rest of the stdlib is served by the `--features stdlib-ffi` bridge** — an
   embedded libpython over pyo3, so `import re`/`json`/`os`/`random`/`string`/

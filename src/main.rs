@@ -25,10 +25,23 @@ fn main() -> ExitCode {
     }
 
     if let Some(src) = cli.eval {
-        return run_source(&src, "-c");
+        // `python -c '…' a b` → sys.argv == ['-c', 'a', 'b']. With `-c` present the
+        // first trailing token is a program arg, not a script path, so clap's
+        // `file` slot (if filled) belongs at the front of the passthrough args.
+        let mut argv = vec!["-c".to_string()];
+        argv.extend(cli.file);
+        argv.extend(cli.argv);
+        return emit(pythonrs::run_program(&src, argv, None, "<string>", true));
     }
 
     if let Some(file) = cli.file {
+        // `python - …` reads the script from stdin (argv[0] == '-').
+        if file == "-" {
+            let src = std::io::read_to_string(std::io::stdin()).unwrap_or_default();
+            let mut argv = vec!["-".to_string()];
+            argv.extend(cli.argv);
+            return emit(pythonrs::run_program(&src, argv, None, "<stdin>", false));
+        }
         if cli.dump_bytecode {
             return match dump(&file) {
                 Ok(()) => ExitCode::SUCCESS,
@@ -63,10 +76,22 @@ fn main() -> ExitCode {
                 Err(e) => fail(&e),
             };
         }
-        return match pythonrs::eval_file(&file) {
-            Ok(_) => ExitCode::SUCCESS,
-            Err(e) => fail(&e),
+        let src = match std::fs::read_to_string(&file) {
+            Ok(s) => s,
+            Err(e) => return fail(&format!("cannot read {file}: {e}")),
         };
+        // `__file__`/traceback use the absolute path; `sys.argv[0]` keeps the path
+        // as typed. `python script.py a b` → sys.argv == ['script.py', 'a', 'b'].
+        let abs = abs_path(&file);
+        let mut argv = vec![file.clone()];
+        argv.extend(cli.argv);
+        return emit(pythonrs::run_program(
+            &src,
+            argv,
+            Some(abs.clone()),
+            &abs,
+            true,
+        ));
     }
 
     if cli.repl || atty_stdin() {
@@ -74,15 +99,32 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    // No file and non-interactive stdin: run stdin as a script.
+    // No file and non-interactive stdin: run stdin as a script (argv == ['']).
     let src = std::io::read_to_string(std::io::stdin()).unwrap_or_default();
-    run_source(&src, "stdin")
+    let mut argv = vec![String::new()];
+    argv.extend(cli.argv);
+    emit(pythonrs::run_program(&src, argv, None, "<stdin>", false))
 }
 
-fn run_source(src: &str, _label: &str) -> ExitCode {
-    match pythonrs::eval_str(src) {
-        Ok(_) => ExitCode::SUCCESS,
-        Err(e) => fail(&e),
+/// Emit a run's stderr text (traceback / `SystemExit` message) and reduce its
+/// exit code to a process `ExitCode` (masked to 8 bits like the OS does).
+fn emit(report: pythonrs::RunReport) -> ExitCode {
+    if let Some(s) = &report.stderr {
+        eprint!("{s}");
+    }
+    ExitCode::from((report.exit_code & 0xFF) as u8)
+}
+
+/// CPython's `__file__` rule: an absolute path is kept; a relative one is joined
+/// onto the cwd without normalizing (so `./x.py` stays `<cwd>/./x.py`).
+fn abs_path(file: &str) -> String {
+    let p = std::path::Path::new(file);
+    if p.is_absolute() {
+        return file.to_string();
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(file).to_string_lossy().into_owned(),
+        Err(_) => file.to_string(),
     }
 }
 

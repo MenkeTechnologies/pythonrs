@@ -62,18 +62,25 @@ dispatch; `[in-flight]` = being implemented in the current host pass.
 
 ## Tier 0 — Execution / runtime surface (the CLI contract every script assumes)
 
-- [ ] **`sys.argv` is `[]`** — even for `python script.py a b` / `python -c '…'`.
-      CPython: `['script.py','a','b']` / `['-c']`. Nearly every script reads argv.
-- [ ] **`sys.exit(code)`** — `AttributeError: module 'sys' has no attribute 'exit'`;
-      `sys.exit(3)` exits `1`, not `3`. Exit-code control + the `SystemExit` path.
-- [ ] **`__name__` is undefined** — `if __name__ == "__main__":` is a `NameError`.
-      The most common script entry idiom is broken.
-- [ ] **Tracebacks** — uncaught exceptions print one terse line
-      `python: ValueError: boom` (no `Traceback`, no frames/file/line/caret).
-      Tooling that greps tracebacks and humans expect the CPython block.
-- [ ] **`sys` is skeletal** — missing `stdin`/`stdout`/`stderr` (file objects),
-      `path`, `modules`, `version_info`, `executable`, `getrecursionlimit`.
-      `sys.version` reports `3.12.0` (should track the emulated CPython, 3.14).
+- [x] **`sys.argv`** — populated from the process args: `python script.py a b` →
+      `['script.py','a','b']`; `python -c '…' x y` → `['-c','x','y']`;
+      `python` (repl)/stdin → `['']`/`['-']`. Wired through `host::init_runtime`
+      (`main.rs` builds argv; the `sys` module reads `h.argv`).
+- [x] **`sys.exit(code)`** — raises a catchable `SystemExit`; an uncaught one exits
+      `n` for an int, `0` for `None`/no-arg, `1` + the message on a str. `.code`
+      exposes the arg. Exit-code propagated through `main.rs`.
+- [x] **`__name__`** — the top-level script/`-c`/stdin runs as `__main__`, so
+      `if __name__ == "__main__":` fires; `__file__` set (abs path) for a file run.
+- [x] **Tracebacks** — an uncaught exception prints CPython's
+      `Traceback (most recent call last):` block: the header, one
+      `  File "<path>", line N, in <scope>` + the source line per frame (outermost
+      first), then `ErrorType: message`. Line info comes from the compiler's
+      per-op line metadata (call/binop/subscript/attr/name ops carry the stmt
+      line); caret (`^^^`) markers are omitted for a first pass. Exit stays 1.
+- [x] **`sys` completeness** — `stdin`/`stdout`/`stderr` file objects
+      (`print(file=sys.stderr)` routes correctly), `version` (reports the emulated
+      `3.14.6`), `version_info` (a namedtuple), `platform`, `maxsize`, `path`
+      (list), `executable`, `modules`, `getrecursionlimit()`/`setrecursionlimit()`.
 - [x] `python -c`, `python file.py`, stdin-as-script dispatch run; non-zero exit on error.
 
 ## Tier 1 — File & process I/O (top blocker for real scripts)
