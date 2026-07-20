@@ -167,9 +167,20 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
       (fired at class creation, definition order) work. Missing-getter raises the 3.14
       `property '<n>' of '<C>' object has no getter`. `getattr`/`hasattr`/`setattr`
       builtins route through the same path.
-- [ ] **Instances are never hashable** — `hash(A())` / instance as dict key / set
-      member → `TypeError: unhashable type: 'object'`, even with an explicit
-      `__hash__`. No user object can key a dict or join a set.
+- [x] **Instances are hashable** — FIXED: a new `PKey::Instance{hash,id}` keys a
+      user instance by its `__hash__()` result plus a collapsed identity. Because
+      `to_key` is `&self` and cannot run user code, the boundary op handlers
+      (`b_getitem`/`b_setitem`/`b_delitem`/`b_contains`, set/dict literals,
+      `set.add`/`discard`/`remove`, `set`/`frozenset`/`dict` ctors, `dict.get`/
+      `setdefault`/`pop`/`fromkeys`) call `host::prepare_key` first — it runs
+      `__hash__` (and `__eq__` against the container's existing instance keys to
+      collapse a value-equal entry) outside the borrow and stashes the resolved
+      key in a thread-local pending table that `to_key` reads. Default identity
+      hashing (no user `__hash__`) is resolved inline; `__eq__` without `__hash__`
+      or `__hash__ = None` raises `unhashable type`. `hash(inst)` returns the raw
+      `__hash__` result. Boundary: instance↔builtin cross-type key unification
+      (`{1: 'a'}[C()]` where `C().__eq__(1)`) is not collapsed — instance keys
+      only collapse onto other instance keys.
 - [x] **`type(x)` returns a real class** — FIXED: `type(x)` returns a `Class` for
       user classes and a builtin-type object for builtins; both `==` (by name) and
       `is` (types are conceptual singletons) work, so `type(5)==int`, `type(5) is int`,

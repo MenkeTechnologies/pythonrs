@@ -131,6 +131,16 @@ pub enum PKey {
     /// A `frozenset` key: the element keys sorted+deduped into a canonical order,
     /// so two equal frozensets (any insertion order) share one key.
     Frozenset(Vec<PKey>),
+    /// A user-instance key. `hash` is the value's `__hash__()` result (or the
+    /// heap id for the default identity hash); `id` is the heap id of the object
+    /// this key is *equal to* (its own, or a value-equal existing key it collapsed
+    /// onto — see `prepare_key`). Two keys are the same dict/set slot iff both the
+    /// hash and the collapsed id match, giving identity semantics by default and
+    /// value semantics when the class defines `__hash__` + `__eq__`.
+    Instance {
+        hash: i64,
+        id: u32,
+    },
 }
 
 /// A compiled function template: parameter shape + body chunk. Shared by every
@@ -572,6 +582,30 @@ thread_local! {
 
 thread_local! {
     static HOST: RefCell<PyHost> = RefCell::new(PyHost::new());
+}
+
+thread_local! {
+    /// Resolved dict/set keys for user instances (heap id → `PKey::Instance`),
+    /// computed by [`prepare_key`] *outside* any host borrow (running `__hash__`/
+    /// `__eq__`), then read by the borrowed [`PyHost::to_key`] which cannot itself
+    /// run user code. A single container op prepares its instance key(s) here just
+    /// before the borrowed access and clears them right after.
+    static PENDING_KEY: RefCell<HashMap<u32, PKey>> = RefCell::new(HashMap::new());
+}
+
+/// Insert a resolved instance key for `id` into the pending-key table.
+fn pending_key_set(id: u32, key: PKey) {
+    PENDING_KEY.with(|p| p.borrow_mut().insert(id, key));
+}
+
+/// Read (without removing) the resolved instance key for `id`, if prepared.
+fn pending_key_get(id: u32) -> Option<PKey> {
+    PENDING_KEY.with(|p| p.borrow().get(&id).cloned())
+}
+
+/// Drop all pending instance keys (called at the end of a container op).
+fn pending_key_clear() {
+    PENDING_KEY.with(|p| p.borrow_mut().clear());
 }
 
 /// Run `f` with mutable access to the thread-local host.
@@ -1425,6 +1459,41 @@ impl PyHost {
                     ks.dedup();
                     PKey::Frozenset(ks)
                 }
+                Some(PyObj::Instance(inst)) => {
+                    let id = match v {
+                        Value::Obj(i) => *i,
+                        _ => 0,
+                    };
+                    let class = inst.class.clone();
+                    // A key resolved by `prepare_key` (user `__hash__` ran outside
+                    // the borrow) wins; otherwise fall back to what we can decide
+                    // here without user code.
+                    if let Some(k) = pending_key_get(id) {
+                        k
+                    } else {
+                        match self.class_lookup(&class, "__hash__") {
+                            // `__hash__ = None` (or `__eq__` without `__hash__`)
+                            // makes instances unhashable (CPython rule).
+                            Some(Value::Undef) => {
+                                return Err(type_error(&format!("unhashable type: '{class}'")))
+                            }
+                            None if self.class_lookup(&class, "__eq__").is_some() => {
+                                return Err(type_error(&format!("unhashable type: '{class}'")))
+                            }
+                            // Default identity hash — no user code needed.
+                            None => PKey::Instance {
+                                hash: id as i64,
+                                id,
+                            },
+                            // A user `__hash__` must be resolved via `prepare_key`
+                            // before the borrowed key lookup; reaching here means a
+                            // keying path was not routed. Fail visibly, never guess.
+                            Some(_) => {
+                                return Err(type_error(&format!("unhashable type: '{class}'")))
+                            }
+                        }
+                    }
+                }
                 Some(other) => {
                     return Err(type_error(&format!(
                         "unhashable type: '{}'",
@@ -1691,6 +1760,172 @@ fn cpython_set_order(hashes: &[i64]) -> Vec<usize> {
         .iter()
         .filter_map(|s| s.map(|(_, idx)| idx))
         .collect()
+}
+
+// ── instance hashing (user `__hash__` / `__eq__` as dict/set keys) ───────────
+
+/// The `Py_hash_t` (i64) value of a `__hash__` result. CPython truncates a
+/// returned int to the platform hash width; a non-int result is a `TypeError`.
+fn hash_int_of(v: &Value) -> Result<i64, String> {
+    match v {
+        Value::Bool(b) => Ok(*b as i64),
+        Value::Int(n) => Ok(*n),
+        _ => with_host(|h| match h.get(v) {
+            // A bignum `__hash__` result is reduced the way CPython hashes ints
+            // (mod 2**61-1 on 64-bit), keeping equal values' hashes equal.
+            Some(PyObj::BigInt(b)) => Ok(bigint_pyhash(b)),
+            _ => Err(type_error("__hash__ method should return an integer")),
+        }),
+    }
+}
+
+/// CPython's `long_hash`: `x mod (2**61 - 1)` with sign, `-1` mapped to `-2`.
+fn bigint_pyhash(b: &num_bigint::BigInt) -> i64 {
+    use num_bigint::BigInt;
+    use num_traits::ToPrimitive;
+    let modulus = BigInt::from((1i64 << 61) - 1);
+    let mut r = b % &modulus;
+    if r.sign() == num_bigint::Sign::Minus {
+        r += &modulus;
+    }
+    // `r` is now in [0, 2**61-1); re-apply the original sign.
+    let mut h = r.to_i64().unwrap_or(0);
+    if b.sign() == num_bigint::Sign::Minus {
+        h = -h;
+    }
+    if h == -1 {
+        -2
+    } else {
+        h
+    }
+}
+
+/// Resolve — outside any host borrow — the dict/set key for a user instance whose
+/// class defines `__hash__`, stashing it in the pending-key table so the borrowed
+/// [`PyHost::to_key`] can pick it up. `candidates` are the `(key, key-object)`
+/// pairs already in the target container; if the instance's `__hash__` matches an
+/// existing instance key whose object is `__eq__`-equal, the key collapses onto
+/// that entry (CPython value semantics). A no-op for non-instances and for
+/// identity-hashed instances (`to_key` handles those inline).
+pub fn prepare_key(v: &Value, candidates: &[(PKey, Value)]) -> Result<(), String> {
+    let (id, class) = match with_host(|h| match v {
+        Value::Obj(i) => match h.get(v) {
+            Some(PyObj::Instance(inst)) => Some((*i, inst.class.clone())),
+            _ => None,
+        },
+        _ => None,
+    }) {
+        Some(t) => t,
+        None => return Ok(()),
+    };
+    let hashf = with_host(|h| h.class_lookup(&class, "__hash__"));
+    match &hashf {
+        // `__hash__ = None`, or `__eq__` without `__hash__` → unhashable.
+        Some(Value::Undef) => return Err(type_error(&format!("unhashable type: '{class}'"))),
+        None => {
+            if with_host(|h| h.class_lookup(&class, "__eq__").is_some()) {
+                return Err(type_error(&format!("unhashable type: '{class}'")));
+            }
+            // Default identity hash: `to_key` resolves it inline, no prep needed.
+            return Ok(());
+        }
+        Some(_) => {}
+    }
+    let hres = call_method(v, "__hash__", vec![], vec![])?;
+    let hash = hash_int_of(&hres)?;
+    // Collapse onto a value-equal existing instance key of the same hash.
+    let mut canonical = PKey::Instance { hash, id };
+    for (pk, kobj) in candidates {
+        if let PKey::Instance { hash: ch, .. } = pk {
+            if *ch == hash {
+                let eqr = call_method(v, "__eq__", vec![kobj.clone()], vec![])?;
+                if with_host(|h| h.truthy(&eqr)) {
+                    canonical = pk.clone();
+                    break;
+                }
+            }
+        }
+    }
+    pending_key_set(id, canonical);
+    Ok(())
+}
+
+/// `hash(instance)`: the class's `__hash__()` result verbatim (default identity
+/// hash if undefined), or a `TypeError` if the instance is unhashable.
+pub fn instance_hash_value(v: &Value) -> Result<i64, String> {
+    let (id, class) = match with_host(|h| match v {
+        Value::Obj(i) => match h.get(v) {
+            Some(PyObj::Instance(inst)) => Some((*i, inst.class.clone())),
+            _ => None,
+        },
+        _ => None,
+    }) {
+        Some(t) => t,
+        None => return Err(type_error("unhashable type")),
+    };
+    match with_host(|h| h.class_lookup(&class, "__hash__")) {
+        Some(Value::Undef) => Err(type_error(&format!("unhashable type: '{class}'"))),
+        None => {
+            if with_host(|h| h.class_lookup(&class, "__eq__").is_some()) {
+                Err(type_error(&format!("unhashable type: '{class}'")))
+            } else {
+                Ok(id as i64)
+            }
+        }
+        Some(_) => {
+            let r = call_method(v, "__hash__", vec![], vec![])?;
+            hash_int_of(&r)
+        }
+    }
+}
+
+/// Instance-key collapse candidates from an in-flight set map (a literal/ctor
+/// being built element by element).
+pub fn set_local_candidates(s: &IndexMap<PKey, Value>) -> Vec<(PKey, Value)> {
+    s.iter()
+        .filter(|(k, _)| matches!(k, PKey::Instance { .. }))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+/// Instance-key collapse candidates from an in-flight dict map.
+pub fn dict_local_candidates(d: &IndexMap<PKey, (Value, Value)>) -> Vec<(PKey, Value)> {
+    d.iter()
+        .filter(|(k, _)| matches!(k, PKey::Instance { .. }))
+        .map(|(k, (kv, _))| (k.clone(), kv.clone()))
+        .collect()
+}
+
+/// The `(key, key-object)` pairs of any instance keys already present in a heap
+/// dict or set/frozenset — the collapse candidates for [`prepare_key`].
+pub fn instance_key_candidates(container: &Value) -> Vec<(PKey, Value)> {
+    with_host(|h| match h.get(container) {
+        Some(PyObj::Dict(d)) => d
+            .iter()
+            .filter(|(k, _)| matches!(k, PKey::Instance { .. }))
+            .map(|(k, (kv, _))| (k.clone(), kv.clone()))
+            .collect(),
+        Some(PyObj::Set(s)) | Some(PyObj::Frozenset(s)) => s
+            .iter()
+            .filter(|(k, _)| matches!(k, PKey::Instance { .. }))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        _ => vec![],
+    })
+}
+
+/// Prepare an instance key for a container op, run `f` (the borrowed access that
+/// calls `to_key`), then clear the pending table. `candidates` collapses a
+/// value-equal existing key. Any non-instance `v` makes this a thin passthrough.
+pub fn with_instance_key<R>(
+    v: &Value,
+    candidates: &[(PKey, Value)],
+    f: impl FnOnce() -> Result<R, String>,
+) -> Result<R, String> {
+    let prep = prepare_key(v, candidates);
+    let r = prep.and_then(|()| f());
+    pending_key_clear();
+    r
 }
 
 /// Canonical dict/set key for a float. An integral, finite float normalizes to
