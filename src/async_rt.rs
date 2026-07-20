@@ -48,6 +48,9 @@ struct FutureCell {
     is_task: bool,
     /// Whether a Task's next step has been scheduled (guards double-step).
     step_scheduled: bool,
+    /// A pending `Task.cancel()` request: the next `task_step` throws
+    /// `CancelledError` into the coroutine at its current `await` point.
+    must_cancel: bool,
     name: String,
 }
 
@@ -81,13 +84,15 @@ enum AsyncObj {
         locked: bool,
         waiters: VecDeque<u32>, // future ids waiting to acquire
     },
-    /// A FIFO queue: `get()` blocks while empty. `maxsize` is recorded for
-    /// `full()`/`repr`; bounded `put()` back-pressure is not yet modeled (put is
-    /// always accepted), matching the common unbounded-queue usage.
+    /// A FIFO queue: `get()` blocks while empty; bounded `put()` (a non-zero
+    /// `maxsize`) blocks while the queue is full, resuming when a `get()` frees a
+    /// slot. `maxsize == 0` is unbounded.
     Queue {
         items: VecDeque<Value>,
         maxsize: usize, // 0 = unbounded
         getters: VecDeque<u32>,
+        /// Blocked `put()`s awaiting a free slot: `(future id, item)`.
+        putters: VecDeque<(u32, Value)>,
     },
 }
 
@@ -130,6 +135,7 @@ fn new_cell(is_task: bool, coro: Option<Value>, name: String) -> Value {
             coro,
             is_task,
             step_scheduled: false,
+            must_cancel: false,
             name,
         });
         id
@@ -401,7 +407,48 @@ fn schedule_step(task: Value) {
     call_soon_native(Box::new(move || task_step(task)));
 }
 
-/// Resume a Task's coroutine to its next awaited Future (or to completion).
+/// Request cancellation of a Future/Task (`Future.cancel()` / `Task.cancel()`).
+/// Returns `False` if it was already done. A plain Future is settled as cancelled
+/// immediately; a Task instead injects `CancelledError` into its coroutine at the
+/// next step (so `try/except CancelledError` inside the task runs).
+fn cancel_future(id: u32) -> bool {
+    if future_done(id) {
+        return false;
+    }
+    let is_task = with_loop(|l| l.futures[id as usize].is_task);
+    if is_task {
+        with_loop(|l| l.futures[id as usize].must_cancel = true);
+        // Schedule a step now; whatever inner Future the coroutine is suspended on
+        // is simply abandoned (its later settlement no-ops on the done Task).
+        let task = with_host(|h| h.alloc(PyObj::Future { id }));
+        schedule_step(task);
+    } else {
+        settle(id, Value::Undef, Some(make_cancelled_error()), true);
+    }
+    true
+}
+
+/// A fresh `asyncio.CancelledError` exception object.
+fn make_cancelled_error() -> Value {
+    with_host(|h| {
+        h.alloc(PyObj::Exception {
+            class: "CancelledError".into(),
+            args: vec![],
+        })
+    })
+}
+
+/// Whether an abort string / exception object denotes a `CancelledError`.
+fn is_cancelled_exc(exc: &Value) -> bool {
+    matches!(
+        with_host(|h| h.get(exc).cloned()),
+        Some(PyObj::Exception { class, .. }) if class == "CancelledError"
+    )
+}
+
+/// Resume a Task's coroutine to its next awaited Future (or to completion). A
+/// pending `must_cancel` throws `CancelledError` into the coroutine instead of
+/// resuming it normally, so the body's `try/except CancelledError` can run.
 fn task_step(task: Value) {
     let id = match future_id(&task) {
         Some(id) => id,
@@ -415,7 +462,13 @@ fn task_step(task: Value) {
         Some(c) => c,
         None => return,
     };
-    match host::gen_resume(&coro, Value::Undef) {
+    let must_cancel = with_loop(|l| std::mem::take(&mut l.futures[id as usize].must_cancel));
+    let stepped = if must_cancel {
+        host::gen_throw(&coro, make_cancelled_error())
+    } else {
+        host::gen_resume(&coro, Value::Undef)
+    };
+    match stepped {
         Ok(Some(awaited)) => {
             // The coroutine yielded a Future it is waiting on. Re-step this Task
             // when that Future settles.
@@ -444,7 +497,14 @@ fn task_step(task: Value) {
         }
         Err(e) => {
             let exc = take_pending_exc(&e);
-            fail_quietly(id, exc);
+            // A `CancelledError` propagating out of the coroutine settles the Task
+            // as *cancelled* (so `task.cancelled()` is True and awaiting it raises
+            // `CancelledError`); any other exception is a normal failure.
+            if is_cancelled_exc(&exc) {
+                settle(id, Value::Undef, Some(exc), true);
+            } else {
+                fail_quietly(id, exc);
+            }
         }
     }
 }
@@ -522,23 +582,51 @@ pub fn await_value(x: Value) -> Result<Value, String> {
     )))
 }
 
-/// Drive an async generator one `__anext__` step: resume until it produces a
-/// value (a `yield`) or exhausts (`StopAsyncIteration`); an intervening `await`
-/// suspension yields its Future up to the loop and the driver resumes on wake.
+/// Drive an async generator one step, per the pending op (`__anext__`/`asend` →
+/// resume sending a value; `athrow` → raise at the current `yield`; `aclose` →
+/// raise `GeneratorExit` and expect the body to finish). Resumes until the body
+/// produces a value (a `yield`) or finishes; an intervening `await` suspension
+/// yields its Future up to the loop and the driver resumes on wake.
 fn drive_async_gen(agen: &Value) -> Result<Value, String> {
+    // The first resume performs the queued op; later resumes (after forwarding an
+    // `await`) always send `None`.
+    let mut pending = Some(host::take_agen_op(agen).unwrap_or(host::AGenOp::Send(Value::Undef)));
+    let closing = matches!(pending, Some(host::AGenOp::Close));
     loop {
-        match host::gen_resume(agen, Value::Undef) {
+        let stepped = match pending.take() {
+            Some(host::AGenOp::Send(v)) => host::gen_resume(agen, v),
+            Some(host::AGenOp::Throw(exc)) => host::gen_throw(agen, exc),
+            Some(host::AGenOp::Close) => {
+                let ge = with_host(|h| {
+                    h.alloc(PyObj::Exception {
+                        class: "GeneratorExit".into(),
+                        args: vec![],
+                    })
+                });
+                host::gen_throw(agen, ge)
+            }
+            // Resumes after the first always send `None`.
+            None => host::gen_resume(agen, Value::Undef),
+        };
+        match stepped {
             Ok(Some(y)) => {
                 if host::cur_gen_awaiting(agen) {
                     // `await` inside the async gen: `y` is a Future — forward it
                     // up to the loop (suspending the outer coroutine), then retry.
                     host::gen_yield_awaiting(y)?;
+                } else if closing {
+                    // The body `yield`ed while being closed — that is an error.
+                    return Err("RuntimeError: async generator ignored GeneratorExit".to_string());
                 } else {
-                    // A `yield`ed value: this `__anext__` result.
+                    // A `yield`ed value: this `__anext__`/`asend`/`athrow` result.
                     return Ok(y);
                 }
             }
             Ok(None) => {
+                if closing {
+                    // `aclose()` completes with `None` once the body finishes.
+                    return Ok(Value::Undef);
+                }
                 // Exhausted → `StopAsyncIteration`.
                 let e = with_host(|h| {
                     h.alloc(PyObj::Exception {
@@ -548,8 +636,57 @@ fn drive_async_gen(agen: &Value) -> Result<Value, String> {
                 });
                 return Err(host::raise_value(&e).unwrap_or_else(|e| e));
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                // `aclose()` swallows the expected `GeneratorExit`/`StopAsyncIteration`.
+                if closing && (e.contains("GeneratorExit") || e.contains("StopAsyncIteration")) {
+                    with_host(|h| {
+                        h.error = None;
+                        h.exc = None;
+                    });
+                    return Ok(Value::Undef);
+                }
+                return Err(e);
+            }
         }
+    }
+}
+
+/// The `agen.asend`/`athrow`/`aclose` awaitables. Each records the op on the
+/// generator cell and returns the generator itself as the awaitable; the actual
+/// drive happens when it is `await`ed (see [`drive_async_gen`]).
+pub fn async_gen_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, String> {
+    match name {
+        "asend" => {
+            host::set_agen_op(
+                recv,
+                host::AGenOp::Send(args.into_iter().next().unwrap_or(Value::Undef)),
+            );
+            Ok(recv.clone())
+        }
+        "athrow" => {
+            let a0 = args.first().cloned().unwrap_or(Value::Undef);
+            // `athrow(ExcType, ...)` instantiates; `athrow(exc_instance)` passes through.
+            let exc = with_host(|h| match h.get(&a0) {
+                Some(PyObj::Builtin(n)) if crate::builtins::is_exception_class(n) => {
+                    let n = n.clone();
+                    let rest = args.get(1..).unwrap_or(&[]).to_vec();
+                    h.alloc(PyObj::Exception {
+                        class: n,
+                        args: rest,
+                    })
+                }
+                _ => a0.clone(),
+            });
+            host::set_agen_op(recv, host::AGenOp::Throw(exc));
+            Ok(recv.clone())
+        }
+        "aclose" => {
+            host::set_agen_op(recv, host::AGenOp::Close);
+            Ok(recv.clone())
+        }
+        _ => Err(format!(
+            "AttributeError: 'async_generator' object has no attribute '{name}'"
+        )),
     }
 }
 
@@ -670,6 +807,9 @@ pub fn wait_for(aw: Value, timeout: Option<f64>) -> Result<Value, String> {
             t,
             Callback::Native(Box::new(move || {
                 if !future_done(oid) {
+                    // Cancel the still-running inner task (CPython cancels + awaits
+                    // it), then fail the outer future with `TimeoutError`.
+                    cancel_future(iid);
                     let e = with_host(|h| {
                         h.alloc(PyObj::Exception {
                             class: "TimeoutError".into(),
@@ -684,29 +824,98 @@ pub fn wait_for(aw: Value, timeout: Option<f64>) -> Result<Value, String> {
     Ok(outer)
 }
 
-/// `asyncio.wait(aws)` — wait for all awaitables to complete; the result future
-/// resolves to `(done, pending)` sets. (No timeout/`return_when` variants yet;
-/// this waits for ALL_COMPLETED.)
-pub fn wait(aws: Vec<Value>) -> Result<Value, String> {
-    // ensure_future each, gather-join, then build the (done, empty) tuple.
+/// `return_when` selector for [`wait`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ReturnWhen {
+    FirstCompleted,
+    FirstException,
+    AllCompleted,
+}
+
+impl ReturnWhen {
+    /// Parse the `asyncio.FIRST_COMPLETED`/`FIRST_EXCEPTION`/`ALL_COMPLETED`
+    /// string constants (defaulting to `ALL_COMPLETED`).
+    pub fn parse(s: &str) -> ReturnWhen {
+        match s {
+            "FIRST_COMPLETED" => ReturnWhen::FirstCompleted,
+            "FIRST_EXCEPTION" => ReturnWhen::FirstException,
+            _ => ReturnWhen::AllCompleted,
+        }
+    }
+}
+
+/// `asyncio.wait(aws, timeout=None, return_when=ALL_COMPLETED)` — wait for the
+/// awaitables per `return_when`; the result future resolves to `(done, pending)`
+/// sets partitioned by completion at settle time. A `timeout` settles early with
+/// whatever is done so far (the rest go to `pending`).
+pub fn wait(
+    aws: Vec<Value>,
+    timeout: Option<f64>,
+    return_when: ReturnWhen,
+) -> Result<Value, String> {
     let tasks: Vec<Value> = aws
         .into_iter()
         .map(ensure_future)
         .collect::<Result<_, _>>()?;
-    let joined = gather_join(&tasks);
-    let jid = future_id(&joined).unwrap();
     let outer = new_future();
     let oid = future_id(&outer).unwrap();
-    let tasks_c = tasks.clone();
-    add_done_native(
-        jid,
-        Box::new(move || {
-            let done = with_host(|h| h.alloc(PyObj::Set(build_set(&tasks_c))));
-            let pending = with_host(|h| h.alloc(PyObj::Set(indexmap::IndexMap::new())));
+    if tasks.is_empty() {
+        let done = with_host(|h| h.alloc(PyObj::Set(indexmap::IndexMap::new())));
+        let pending = with_host(|h| h.alloc(PyObj::Set(indexmap::IndexMap::new())));
+        let tup = with_host(|h| h.new_tuple(vec![done, pending]));
+        settle(oid, tup, None, false);
+        return Ok(outer);
+    }
+    // Partition `tasks` into (done, pending) by each task's current done state and
+    // settle `outer` with that snapshot.
+    let build_and_settle = {
+        let tasks = tasks.clone();
+        move || {
+            if future_done(oid) {
+                return;
+            }
+            let (mut done, mut pending) = (Vec::new(), Vec::new());
+            for t in &tasks {
+                let tid = future_id(t).unwrap();
+                if future_done(tid) {
+                    done.push(t.clone());
+                } else {
+                    pending.push(t.clone());
+                }
+            }
+            let done = with_host(|h| h.alloc(PyObj::Set(build_set(&done))));
+            let pending = with_host(|h| h.alloc(PyObj::Set(build_set(&pending))));
             let tup = with_host(|h| h.new_tuple(vec![done, pending]));
             settle(oid, tup, None, false);
-        }),
-    );
+        }
+    };
+    let build_and_settle = Rc::new(build_and_settle);
+    let n = tasks.len();
+    let remaining = Rc::new(std::cell::Cell::new(n));
+    for t in &tasks {
+        let tid = future_id(t).unwrap();
+        let remaining_c = remaining.clone();
+        let settle_c = build_and_settle.clone();
+        add_done_native(
+            tid,
+            Box::new(move || {
+                let rem = remaining_c.get() - 1;
+                remaining_c.set(rem);
+                let trigger = match return_when {
+                    ReturnWhen::FirstCompleted => true,
+                    ReturnWhen::FirstException => future_exc(tid).is_some() || rem == 0,
+                    ReturnWhen::AllCompleted => rem == 0,
+                };
+                if trigger {
+                    settle_c();
+                }
+            }),
+        );
+    }
+    if let Some(t) = timeout {
+        let settle_c = build_and_settle.clone();
+        call_later(t, Callback::Native(Box::new(move || settle_c())));
+    }
     Ok(outer)
 }
 
@@ -742,34 +951,6 @@ pub fn as_completed(aws: Vec<Value>) -> Result<Value, String> {
         );
     }
     Ok(with_host(|h| h.new_list(outs)))
-}
-
-/// Join a set of already-ensured futures: the returned future completes once all
-/// of them are done (result value unused by callers here).
-fn gather_join(tasks: &[Value]) -> Value {
-    let outer = new_future();
-    let oid = future_id(&outer).unwrap();
-    let n = tasks.len();
-    if n == 0 {
-        settle(oid, Value::Undef, None, false);
-        return outer;
-    }
-    let remaining = Rc::new(std::cell::Cell::new(n));
-    for t in tasks {
-        let tid = future_id(t).unwrap();
-        let remaining_c = remaining.clone();
-        add_done_native(
-            tid,
-            Box::new(move || {
-                let rem = remaining_c.get() - 1;
-                remaining_c.set(rem);
-                if rem == 0 {
-                    settle(oid, Value::Undef, None, false);
-                }
-            }),
-        );
-    }
-    outer
 }
 
 fn build_set(items: &[Value]) -> indexmap::IndexMap<crate::host::PKey, Value> {
@@ -815,6 +996,7 @@ pub fn new_queue(maxsize: usize) -> Value {
         items: VecDeque::new(),
         maxsize,
         getters: VecDeque::new(),
+        putters: VecDeque::new(),
     })
 }
 
@@ -970,28 +1152,38 @@ pub fn async_obj_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Va
             }
         }))),
         (2, "put_nowait") => {
-            queue_put(id, args.into_iter().next().unwrap_or(Value::Undef));
+            let v = args.into_iter().next().unwrap_or(Value::Undef);
+            if queue_is_full(id) {
+                return Err("QueueFull: ".to_string());
+            }
+            queue_put(id, v);
             Ok(Value::Undef)
         }
         (2, "put") => {
-            queue_put(id, args.into_iter().next().unwrap_or(Value::Undef));
+            let v = args.into_iter().next().unwrap_or(Value::Undef);
             let fut = new_future();
-            settle(future_id(&fut).unwrap(), Value::Undef, None, false);
+            let fid = future_id(&fut).unwrap();
+            // A full bounded queue blocks the `put`: park `(fid, v)` and complete
+            // it when a `get()` frees a slot. Otherwise the put completes at once.
+            if queue_is_full(id) {
+                with_loop(|l| {
+                    if let AsyncObj::Queue { putters, .. } = &mut l.async_objs[id as usize] {
+                        putters.push_back((fid, v));
+                    }
+                });
+            } else {
+                queue_put(id, v);
+                settle(fid, Value::Undef, None, false);
+            }
             Ok(fut)
         }
         (2, "get_nowait") => queue_get_now(id),
         (2, "get") => {
             let fut = new_future();
             let fid = future_id(&fut).unwrap();
-            // If an item is ready, fulfill immediately; else queue the getter.
-            let item = with_loop(|l| {
-                if let AsyncObj::Queue { items, .. } = &mut l.async_objs[id as usize] {
-                    items.pop_front()
-                } else {
-                    None
-                }
-            });
-            match item {
+            // If an item is ready, fulfill immediately (waking a blocked putter);
+            // else queue the getter.
+            match queue_take(id) {
                 Some(v) => settle(fid, v, None, false),
                 None => {
                     with_loop(|l| {
@@ -1002,8 +1194,6 @@ pub fn async_obj_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Va
                     false
                 }
             };
-            // A pending putter (bounded queue) can now proceed — skipped (unbounded
-            // default); bounded put blocking is not yet modeled.
             Ok(fut)
         }
         _ => Err(format!(
@@ -1033,7 +1223,16 @@ fn release_lock(id: u32) {
     }
 }
 
-/// Put an item, waking a pending getter if one is waiting.
+/// Whether a bounded queue is at capacity (a full `put` blocks).
+fn queue_is_full(id: u32) -> bool {
+    with_loop(|l| match &l.async_objs[id as usize] {
+        AsyncObj::Queue { items, maxsize, .. } => *maxsize > 0 && items.len() >= *maxsize,
+        _ => false,
+    })
+}
+
+/// Put an item, waking a pending getter if one is waiting (item handed over
+/// directly, bypassing the buffer). Only called when the queue has room.
 fn queue_put(id: u32, v: Value) {
     let getter = with_loop(|l| {
         if let AsyncObj::Queue { items, getters, .. } = &mut l.async_objs[id as usize] {
@@ -1052,15 +1251,34 @@ fn queue_put(id: u32, v: Value) {
     }
 }
 
-fn queue_get_now(id: u32) -> Result<Value, String> {
-    let item = with_loop(|l| {
-        if let AsyncObj::Queue { items, .. } = &mut l.async_objs[id as usize] {
-            items.pop_front()
+/// Take one buffered item and, if a blocked putter is waiting, admit its item
+/// into the freed slot (completing that put). Returns `None` if empty.
+fn queue_take(id: u32) -> Option<Value> {
+    let (item, putter) = with_loop(|l| {
+        if let AsyncObj::Queue { items, putters, .. } = &mut l.async_objs[id as usize] {
+            let item = items.pop_front();
+            // A slot just freed → admit the next blocked put into the buffer.
+            let putter = if item.is_some() {
+                putters.pop_front()
+            } else {
+                None
+            };
+            if let Some((_, ref pv)) = putter {
+                items.push_back(pv.clone());
+            }
+            (item, putter)
         } else {
-            None
+            (None, None)
         }
     });
-    match item {
+    if let Some((pfid, _)) = putter {
+        settle(pfid, Value::Undef, None, false);
+    }
+    item
+}
+
+fn queue_get_now(id: u32) -> Result<Value, String> {
+    match queue_take(id) {
         Some(v) => Ok(v),
         None => Err("QueueEmpty: ".to_string()),
     }
@@ -1153,20 +1371,7 @@ pub fn future_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value
             }
             Ok(Value::Undef)
         }
-        "cancel" => {
-            if future_done(id) {
-                Ok(Value::Bool(false))
-            } else {
-                let e = with_host(|h| {
-                    h.alloc(PyObj::Exception {
-                        class: "CancelledError".into(),
-                        args: vec![],
-                    })
-                });
-                settle(id, Value::Undef, Some(e), true);
-                Ok(Value::Bool(true))
-            }
-        }
+        "cancel" => Ok(Value::Bool(cancel_future(id))),
         "get_name" => Ok(with_host(|h| {
             let nm = with_loop(|l| l.futures[id as usize].name.clone());
             h.new_str(nm)

@@ -997,21 +997,20 @@ fn b_raise(vm: &mut VM, argc: u8) -> Value {
 }
 
 fn b_reraise(vm: &mut VM, _: u8) -> Value {
-    let msg = with_host(|h| {
-        let e = h.exc.clone();
-        match e {
-            Some(v) => Some(h.str_of(&v)),
-            None => h.error.clone(),
-        }
-    });
+    // Re-raise the active exception preserving its *class* (not just its
+    // message): use the "Class: msg" / "Class" form so a driver that recovers
+    // the exception from the abort string alone (e.g. an asyncio Task settling a
+    // re-raised `CancelledError`) still sees the right type. `exc_error_string`
+    // itself borrows the host, so pull `h.exc` out before calling it.
+    let active = with_host(|h| h.exc.clone());
+    let msg = match active {
+        Some(ref v) => Some(exc_error_string(v)),
+        None => with_host(|h| h.error.clone()),
+    };
     match msg {
-        Some(m) => abort(vm, exc_to_error(&m)),
+        Some(m) => abort(vm, m),
         None => abort(vm, "RuntimeError: No active exception to re-raise".into()),
     }
-}
-
-fn exc_to_error(m: &str) -> String {
-    m.to_string()
 }
 
 fn b_assert_fail(vm: &mut VM, _: u8) -> Value {
@@ -3168,15 +3167,27 @@ fn call_asyncio(
         "wait_for" => {
             let mut it = args.into_iter();
             let aw = it.next().unwrap_or(Value::Undef);
-            let timeout = it.next().and_then(num_f);
+            // `timeout` is positional-or-keyword; `timeout=None` means "no timeout".
+            let timeout = it
+                .next()
+                .or_else(|| kw_get(&kwargs, "timeout"))
+                .and_then(num_f);
             async_rt::wait_for(aw, timeout)
         }
         "get_event_loop" | "get_running_loop" | "new_event_loop" => Ok(async_rt::event_loop()),
         "Future" => Ok(async_rt::new_future()),
         // `wait`/`as_completed` take a single iterable of awaitables (not varargs).
         "wait" => {
-            let aws = host::iter_vec(&args.into_iter().next().unwrap_or(Value::Undef))?;
-            async_rt::wait(aws)
+            let mut it = args.into_iter();
+            let aws = host::iter_vec(&it.next().unwrap_or(Value::Undef))?;
+            let timeout = it
+                .next()
+                .or_else(|| kw_get(&kwargs, "timeout"))
+                .and_then(num_f);
+            let return_when = kw_get(&kwargs, "return_when")
+                .map(|v| async_rt::ReturnWhen::parse(&with_host(|h| h.str_of(&v))))
+                .unwrap_or(async_rt::ReturnWhen::AllCompleted);
+            async_rt::wait(aws, timeout, return_when)
         }
         "as_completed" => {
             let aws = host::iter_vec(&args.into_iter().next().unwrap_or(Value::Undef))?;
@@ -3313,6 +3324,8 @@ const EXC_PARENTS: &[(&str, &str)] = &[
     // `except Exception`); InvalidStateError guards double set_result.
     ("CancelledError", "BaseException"),
     ("InvalidStateError", "Exception"),
+    ("QueueEmpty", "Exception"),
+    ("QueueFull", "Exception"),
 ];
 
 fn exc_parent(name: &str) -> Option<&'static str> {
@@ -3433,7 +3446,12 @@ pub fn type_has_method(typename: &str, name: &str) -> bool {
         "property" => PROPERTY_METHODS,
         "generator" => GENERATOR_METHODS,
         "coroutine" => return GENERATOR_METHODS.contains(&name) || name == "__await__",
-        "async_generator" => return matches!(name, "__aiter__" | "__anext__"),
+        "async_generator" => {
+            return matches!(
+                name,
+                "__aiter__" | "__anext__" | "asend" | "athrow" | "aclose"
+            )
+        }
         "Future" | "Task" => return FUTURE_METHODS.contains(&name),
         "_UnixSelectorEventLoop" => return LOOP_METHODS.contains(&name),
         "Event" => return matches!(name, "set" | "clear" | "is_set" | "wait"),
@@ -3695,7 +3713,7 @@ pub fn call_type_method(
         "property" => property_method(recv, name, &args),
         "generator" => generator_method(recv, name, &args),
         "coroutine" => coroutine_method(recv, name, &args),
-        "async_generator" => async_generator_method(recv, name),
+        "async_generator" => async_generator_method(recv, name, args),
         "Future" | "Task" => crate::async_rt::future_method(recv, name, args),
         "_UnixSelectorEventLoop" => crate::async_rt::loop_method(name, args),
         "Event" | "Lock" | "Queue" => crate::async_rt::async_obj_method(recv, name, args),
@@ -3717,9 +3735,11 @@ fn coroutine_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, S
 /// `agen.__aiter__/__anext__` — an async generator's async-iteration protocol.
 /// Both return the generator itself: `__aiter__` is the async iterator, and
 /// awaiting `__anext__` drives one step (see `async_rt::drive_async_gen`).
-fn async_generator_method(recv: &Value, name: &str) -> Result<Value, String> {
+fn async_generator_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, String> {
     match name {
         "__aiter__" | "__anext__" => Ok(recv.clone()),
+        // `asend`/`athrow`/`aclose` return awaitables driven by the async runtime.
+        "asend" | "athrow" | "aclose" => crate::async_rt::async_gen_method(recv, name, args),
         _ => Err(format!(
             "AttributeError: 'async_generator' object has no attribute '{name}'"
         )),
