@@ -7195,6 +7195,13 @@ fn bind_params(
     let np = def.params.len();
     let ndef = def.ndefaults;
     let posonly = def.posonly.min(np);
+    // Argument-count errors name the callable by its `__qualname__` (CPython:
+    // `outer.<locals>.f() takes …`), falling back to the bare name.
+    let fname = if def.qualname.is_empty() {
+        def.name.as_str()
+    } else {
+        def.qualname.as_str()
+    };
     // A named `*args` (`Some(non-empty)`) soaks up extra positionals; a bare `*`
     // (`Some("")`, keyword-only marker) does not — extras are an error there.
     let has_vararg = def.star.as_deref().is_some_and(|s| !s.is_empty());
@@ -7226,7 +7233,7 @@ fn bind_params(
             } else if vars.contains_key(&k) {
                 return Err(type_error(&format!(
                     "{}() got multiple values for argument '{}'",
-                    def.name, k
+                    fname, k
                 )));
             } else {
                 vars.insert(k, v);
@@ -7249,13 +7256,13 @@ fn bind_params(
         if !bad_posonly.is_empty() {
             return Err(type_error(&format!(
                 "{}() got some positional-only arguments passed as keyword arguments: '{}'",
-                def.name,
+                fname,
                 bad_posonly.join(", ")
             )));
         }
         return Err(type_error(&format!(
             "{}() got an unexpected keyword argument '{}'",
-            def.name, leftover[0].0
+            fname, leftover[0].0
         )));
     }
 
@@ -7263,7 +7270,7 @@ fn bind_params(
     if npos > np && !has_vararg {
         return Err(type_error(&format!(
             "{}() {}",
-            def.name,
+            fname,
             too_many_positional(np, ndef, npos, kwonly_given)
         )));
     }
@@ -7283,7 +7290,7 @@ fn bind_params(
         let plural = if missing.len() == 1 { "" } else { "s" };
         return Err(type_error(&format!(
             "{}() missing {} required positional argument{}: {}",
-            def.name,
+            fname,
             missing.len(),
             plural,
             join_names(&missing)
@@ -7323,7 +7330,7 @@ fn bind_params(
         let plural = if missing_kw.len() == 1 { "" } else { "s" };
         return Err(type_error(&format!(
             "{}() missing {} required keyword-only argument{}: {}",
-            def.name,
+            fname,
             missing_kw.len(),
             plural,
             join_names(&missing_kw)
