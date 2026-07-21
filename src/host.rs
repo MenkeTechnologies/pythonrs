@@ -5860,6 +5860,21 @@ impl PyHost {
                         });
                     }
                 }
+                // `.numerator`/`.denominator` — an integer is its own numerator
+                // over a denominator of 1 (bool normalizes to `int`).
+                if name == "numerator" || name == "denominator" {
+                    let is_int = matches!(recv, Value::Int(_) | Value::Bool(_))
+                        || matches!(self.get(recv), Some(PyObj::BigInt(_)));
+                    if is_int {
+                        return Ok(if name == "denominator" {
+                            Value::Int(1)
+                        } else if let Value::Bool(b) = recv {
+                            Value::Int(*b as i64)
+                        } else {
+                            recv.clone()
+                        });
+                    }
+                }
                 // Builtin type method: hand back a bound builtin method.
                 let tn = self.type_name(recv);
                 if crate::builtins::type_has_method(&tn, name) {
