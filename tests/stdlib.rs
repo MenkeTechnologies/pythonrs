@@ -148,6 +148,36 @@ fn collections_deque_ops() {
         ),
         "1"
     );
+    // `maxlen` passed as a keyword (not just positional) is honored on construction
+    // and by later appends; `.maxlen` reads it back (`None` when unbounded).
+    assert_eq!(
+        g(
+            "from collections import deque\nd = deque([1,2,3], maxlen=4)\nd.appendleft(0)\nd.append(4)\nx = list(d)",
+            "x"
+        ),
+        "[1, 2, 3, 4]"
+    );
+    assert_eq!(
+        g(
+            "from collections import deque\nx = deque([1,2,3], maxlen=2).maxlen",
+            "x"
+        ),
+        "2"
+    );
+    assert_eq!(
+        g(
+            "from collections import deque\nx = deque([1,2,3]).maxlen",
+            "x"
+        ),
+        "None"
+    );
+    assert_eq!(
+        g(
+            "from collections import deque\nx = list(deque(iterable=[9,8,7], maxlen=2))",
+            "x"
+        ),
+        "[8, 7]"
+    );
 }
 
 #[test]

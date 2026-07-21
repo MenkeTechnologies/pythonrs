@@ -5984,6 +5984,15 @@ impl PyHost {
                         self.alloc(PyObj::Builtin(tn))
                     });
                 }
+                // `deque.maxlen` — the read-only length bound (an int) or `None`.
+                if name == "maxlen" {
+                    if let Some(PyObj::Deque { maxlen, .. }) = self.get(recv) {
+                        return Ok(match maxlen {
+                            Some(m) => Value::Int(*m as i64),
+                            None => Value::Undef,
+                        });
+                    }
+                }
                 // Builtin type method: hand back a bound builtin method.
                 if crate::builtins::type_has_method(&tn, name) {
                     let b = self.alloc(PyObj::Builtin(name.to_string()));
@@ -6250,6 +6259,12 @@ impl PyHost {
 
     /// `recv.name = val`.
     pub fn set_attr(&mut self, recv: &Value, name: &str, val: Value) -> Result<(), String> {
+        // A live CPython object (`decimal.getcontext().prec = 6`) sets through the
+        // bridge.
+        #[cfg(feature = "stdlib-ffi")]
+        if let Some(id) = self.foreign_id(recv) {
+            return crate::ffi::set_attr(self, id, name, &val);
+        }
         // `__slots__` enforcement: a slotted instance rejects any attribute name
         // not declared in its slots.
         if let Some(PyObj::Instance(inst)) = self.get(recv) {
