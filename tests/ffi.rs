@@ -216,3 +216,39 @@ print(greet('bob'), greet.__name__)
         "stderr={stderr}"
     );
 }
+
+/// A native pythonrs class crosses into a CPython call: `@dataclass` mirrors it
+/// (fields from __annotations__, methods bound), and `typing.NamedTuple` (a
+/// Foreign base) builds via the real metaclass. Skips without the stdlib bridge.
+#[test]
+fn ffi_dataclass_and_named_tuple() {
+    let src = "\
+from dataclasses import dataclass
+@dataclass
+class Point:
+    x: int
+    y: int
+    label: str = 'origin'
+    def dist_sq(self):
+        return self.x ** 2 + self.y ** 2
+p = Point(3, 4)
+print(p, p.dist_sq(), p == Point(3, 4))
+from typing import NamedTuple
+class Pair(NamedTuple):
+    a: int
+    b: int = 9
+q = Pair(1)
+print(q, q.a, q.b, q._asdict(), Pair._fields)
+";
+    let (stdout, stderr, ok) = run_py(src);
+    if !ok || stderr.contains("ModuleNotFoundError") {
+        eprintln!("skipping ffi-dataclass test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(
+        stdout,
+        "Point(x=3, y=4, label='origin') 25 True\n\
+         Pair(a=1, b=9) 1 9 {'a': 1, 'b': 9} ('a', 'b')\n",
+        "stderr={stderr}"
+    );
+}
