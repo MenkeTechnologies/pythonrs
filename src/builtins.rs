@@ -3902,14 +3902,24 @@ fn construct_float(args: &[Value]) -> Result<Value, String> {
 fn construct_dict(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, String> {
     let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
     if let Some(v) = args.first() {
-        // dict(pairs) or dict(mapping)
-        let is_dict = with_host(|h| matches!(h.get(v), Some(PyObj::Dict(_))));
-        if is_dict {
-            with_host(|h| {
-                if let Some(PyObj::Dict(m)) = h.get(v) {
-                    d = m.clone();
+        // dict(mapping): a real dict OR a dict-subclass instance (`class D(dict)`),
+        // whose native dict lives in its payload — unwrap it so `dict(d)` copies
+        // the pairs instead of iterating the instance as bare keys.
+        let dict_map = with_host(|h| {
+            let src = match h.get(v) {
+                Some(PyObj::Dict(_)) => Some(v.clone()),
+                Some(PyObj::Instance(inst)) if !matches!(inst.payload, Value::Undef) => {
+                    Some(inst.payload.clone())
                 }
-            });
+                _ => None,
+            };
+            src.and_then(|s| match h.get(&s) {
+                Some(PyObj::Dict(m)) => Some(m.clone()),
+                _ => None,
+            })
+        });
+        if let Some(m) = dict_map {
+            d = m;
         } else {
             let pairs = host::iter_vec(v)?;
             for p in pairs {
