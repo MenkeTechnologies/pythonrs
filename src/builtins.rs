@@ -1676,6 +1676,14 @@ fn b_binop(vm: &mut VM, _: u8) -> Value {
         Some((l, r)) => (host::subclass_operand(&a, l), host::subclass_operand(&b, r)),
         None => (a, b),
     };
+    // Counter `&` (intersection) / `|` (union) — multiset ops keeping positive
+    // counts; only when both operands are Counters.
+    if tag == host::binop::BITAND || tag == host::binop::BITOR {
+        let op = if tag == host::binop::BITAND { '&' } else { '|' };
+        if let Some(res) = counter_binop(&a, &b, op) {
+            return finish(vm, res);
+        }
+    }
     // Instance operator overloading (`a / b`, `a % b`, `a & b`, …) via dunders,
     // then core types handled by the host.
     if let Some((l, r)) = binop_tag_dunders(tag) {
@@ -2538,6 +2546,17 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
     };
     let a = &a_owned;
     let b = &b_owned;
+    // Counter `+` / `-` — multiset ops keeping positive counts, only when both
+    // operands are Counters (else int/float arithmetic falls through).
+    match op {
+        Add | Sub => {
+            let sym = if matches!(op, Add) { '+' } else { '-' };
+            if let Some(res) = counter_binop(a, b, sym) {
+                return res;
+            }
+        }
+        _ => {}
+    }
     // A CPython (Foreign) operand runs the op in CPython with the host borrow
     // released, so an operator that re-enters pythonrs (a `cmp_to_key` wrapper's
     // `__lt__` calling the user cmp function during `sorted`) doesn't double-
@@ -2829,7 +2848,9 @@ fn py_repr(v: &Value) -> Result<String, String> {
         Tuple(Vec<Value>, Option<(String, Vec<String>)>),
         Set(Vec<Value>),
         Frozenset(Vec<Value>),
-        Dict(Vec<(Value, Value)>),
+        // A dict, plus its subtype tag (Counter / defaultdict / OrderedDict) and
+        // the defaultdict factory, so the repr keeps the CPython wrapper.
+        Dict(Vec<(Value, Value)>, Option<(host::DictKind, Option<Value>)>),
     }
     let cont = with_host(|h| match h.get(v) {
         Some(PyObj::List(l)) => Some(Cont::List(l.clone())),
@@ -2846,7 +2867,13 @@ fn py_repr(v: &Value) -> Result<String, String> {
         // Element order follows CPython's set hash-table layout (int subset).
         Some(PyObj::Set(s)) => Some(Cont::Set(h.set_ordered_values(s))),
         Some(PyObj::Frozenset(s)) => Some(Cont::Frozenset(h.set_ordered_values(s))),
-        Some(PyObj::Dict(d)) => Some(Cont::Dict(d.values().cloned().collect())),
+        Some(PyObj::Dict(d)) => {
+            let meta = match v {
+                Value::Obj(i) => h.dict_meta.get(i).map(|m| (m.kind, m.factory.clone())),
+                _ => None,
+            };
+            Some(Cont::Dict(d.values().cloned().collect(), meta))
+        }
         _ => None,
     });
     let reprs =
@@ -2858,7 +2885,7 @@ fn py_repr(v: &Value) -> Result<String, String> {
         let marker = match &cont {
             Cont::List(_) => "[...]",
             Cont::Tuple(..) => "(...)",
-            Cont::Set(_) | Cont::Dict(_) => "{...}",
+            Cont::Set(_) | Cont::Dict(..) => "{...}",
             Cont::Frozenset(_) => "frozenset(...)",
         };
         if host::repr_guard_enter(id) {
@@ -2888,12 +2915,30 @@ fn py_repr(v: &Value) -> Result<String, String> {
                 Cont::Set(e) => format!("{{{}}}", reprs(&e)?.join(", ")),
                 Cont::Frozenset(e) if e.is_empty() => "frozenset()".into(),
                 Cont::Frozenset(e) => format!("frozenset({{{}}})", reprs(&e)?.join(", ")),
-                Cont::Dict(pairs) => {
+                Cont::Dict(pairs, meta) => {
                     let mut p = Vec::with_capacity(pairs.len());
                     for (k, val) in &pairs {
                         p.push(format!("{}: {}", py_repr(k)?, py_repr(val)?));
                     }
-                    format!("{{{}}}", p.join(", "))
+                    let body = format!("{{{}}}", p.join(", "));
+                    // CPython 3.12+ formats: Counter({…}), OrderedDict({…}),
+                    // defaultdict(<factory>, {…}); a plain dict is just {…}.
+                    // Empty Counter/OrderedDict use the bare `Counter()` form.
+                    let empty = pairs.is_empty();
+                    match meta.as_ref().map(|(k, _)| *k) {
+                        Some(host::DictKind::Counter) if empty => "Counter()".into(),
+                        Some(host::DictKind::Counter) => format!("Counter({body})"),
+                        Some(host::DictKind::OrderedDict) if empty => "OrderedDict()".into(),
+                        Some(host::DictKind::OrderedDict) => format!("OrderedDict({body})"),
+                        Some(host::DictKind::DefaultDict) => {
+                            let f = match meta.and_then(|(_, f)| f) {
+                                Some(fv) => py_repr(&fv)?,
+                                None => "None".into(),
+                            };
+                            format!("defaultdict({f}, {body})")
+                        }
+                        None => body,
+                    }
                 }
             })
         };
@@ -4297,8 +4342,22 @@ fn construct_dict(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, S
                 _ => None,
             })
         });
+        // A foreign (CPython) mapping (ChainMap, a custom Mapping, …) exposes
+        // `keys()`; `dict(mapping)` copies via keys()+subscript, matching CPython,
+        // instead of iterating it as bare keys.
+        let foreign_keys = if dict_map.is_none() && with_host(|h| h.foreign_id(v)).is_some() {
+            host::call_method(v, "keys", vec![], vec![]).ok()
+        } else {
+            None
+        };
         if let Some(m) = dict_map {
             d = m;
+        } else if let Some(keys) = foreign_keys {
+            for k in host::iter_vec(&keys)? {
+                let val = with_host(|h| h.get_item(v, &k))?;
+                let key = with_host(|h| h.to_key(&k))?;
+                host::dict_put(&mut d, key, k, val);
+            }
         } else {
             let pairs = host::iter_vec(v)?;
             for p in pairs {
@@ -5194,7 +5253,7 @@ pub fn call_type_method(
         "list" => list_method(recv, name, &args, &kwargs),
         "dict" => dict_method(recv, name, &args, &kwargs),
         "Counter" | "defaultdict" | "OrderedDict" => {
-            if let Some(r) = collections_dict_method(recv, name, &args, &tn) {
+            if let Some(r) = collections_dict_method(recv, name, &args, &kwargs, &tn) {
                 return r;
             }
             dict_method(recv, name, &args, &kwargs)
@@ -9076,6 +9135,7 @@ fn collections_dict_method(
     recv: &Value,
     name: &str,
     args: &[Value],
+    kwargs: &[(String, Value)],
     tn: &str,
 ) -> Option<Result<Value, String>> {
     match (tn, name) {
@@ -9090,7 +9150,7 @@ fn collections_dict_method(
         })))),
         ("Counter", "subtract") => Some(counter_add(recv, args, -1)),
         ("Counter", "update") => Some(counter_add(recv, args, 1)),
-        ("OrderedDict", "move_to_end") => Some(ordered_move_to_end(recv, args)),
+        ("OrderedDict", "move_to_end") => Some(ordered_move_to_end(recv, args, kwargs)),
         _ => None,
     }
 }
@@ -9138,6 +9198,54 @@ fn counter_elements(recv: &Value) -> Result<Value, String> {
 }
 
 /// `Counter.update(iterable_or_mapping)` / `.subtract(...)` with `sign` +1 / -1.
+/// Counter multiset operators — `+`/`-`/`&`/`|`, keeping only positive counts
+/// (CPython semantics; result order is the first operand's keys then the
+/// second's). Returns `None` unless both operands are `Counter`s, so plain
+/// dict/set `|`/`&` and int arithmetic fall through.
+fn counter_binop(a: &Value, b: &Value, op: char) -> Option<Result<Value, String>> {
+    let is_counter =
+        |v: &Value| host::dict_meta_of(v).map(|m| m.kind) == Some(host::DictKind::Counter);
+    if !(is_counter(a) && is_counter(b)) {
+        return None;
+    }
+    let dump = |v: &Value| -> Vec<(PKey, Value, i64)> {
+        with_host(|h| match h.get(v) {
+            Some(PyObj::Dict(m)) => m
+                .iter()
+                .map(|(k, (kv, cnt))| (k.clone(), kv.clone(), h.as_int(cnt).unwrap_or(0)))
+                .collect(),
+            _ => Vec::new(),
+        })
+    };
+    let da = dump(a);
+    let db = dump(b);
+    let get = |d: &[(PKey, Value, i64)], k: &PKey| {
+        d.iter().find(|(kk, _, _)| kk == k).map(|(_, _, c)| *c).unwrap_or(0)
+    };
+    // Union of keys: first operand's order, then second-only keys.
+    let mut keys: Vec<(PKey, Value)> = da.iter().map(|(k, kv, _)| (k.clone(), kv.clone())).collect();
+    for (k, kv, _) in &db {
+        if !da.iter().any(|(kk, _, _)| kk == k) {
+            keys.push((k.clone(), kv.clone()));
+        }
+    }
+    let mut out: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+    for (k, kv) in keys {
+        let (x, y) = (get(&da, &k), get(&db, &k));
+        let val = match op {
+            '+' => x + y,
+            '-' => x - y,
+            '&' => x.min(y),
+            '|' => x.max(y),
+            _ => return None,
+        };
+        if val > 0 {
+            out.insert(k, (kv, Value::Int(val)));
+        }
+    }
+    Some(Ok(host::alloc_dict_subtype(out, host::DictKind::Counter, None)))
+}
+
 fn counter_add(recv: &Value, args: &[Value], sign: i64) -> Result<Value, String> {
     let other = match args.first() {
         Some(v) => v.clone(),
@@ -9183,12 +9291,17 @@ fn counter_add(recv: &Value, args: &[Value], sign: i64) -> Result<Value, String>
     Ok(Value::Undef)
 }
 
-/// `OrderedDict.move_to_end(key, last=True)`.
-fn ordered_move_to_end(recv: &Value, args: &[Value]) -> Result<Value, String> {
+/// `OrderedDict.move_to_end(key, last=True)`. `last` may be positional or keyword.
+fn ordered_move_to_end(
+    recv: &Value,
+    args: &[Value],
+    kwargs: &[(String, Value)],
+) -> Result<Value, String> {
     let kv = arg0(args)?;
     let key = with_host(|h| h.to_key(&kv))?;
     let last = args
         .get(1)
+        .or_else(|| kwargs.iter().find(|(k, _)| k == "last").map(|(_, v)| v))
         .map(|v| with_host(|h| h.truthy(v)))
         .unwrap_or(true);
     let found = with_host(|h| {
