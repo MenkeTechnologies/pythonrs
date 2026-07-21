@@ -966,7 +966,7 @@ fn format_field(v: &Value, conv: i64, spec: &str) -> Result<String, String> {
             _ => py_str(v)?,                   // !s
         };
         let sv = with_host(|h| h.new_str(s.clone()));
-        return Ok(apply_format_spec(&s, &sv, spec));
+        return apply_format_spec(&s, &sv, spec);
     }
     // No conversion: an instance's `__format__(spec)` wins outright.
     let has_format = with_host(|h| match h.get(v) {
@@ -979,7 +979,7 @@ fn format_field(v: &Value, conv: i64, spec: &str) -> Result<String, String> {
         return Ok(with_host(|h| h.str_of(&r)));
     }
     let s = py_str(v)?;
-    Ok(apply_format_spec(&s, v, spec))
+    apply_format_spec(&s, v, spec)
 }
 
 fn b_format(vm: &mut VM, _: u8) -> Value {
@@ -7816,21 +7816,27 @@ fn new_str(s: String) -> Value {
 
 /// Apply a `format()` mini-language spec to a stringified value. Supports
 /// `[[fill]align][sign][#][0][width][,][.prec][type]` for the common cases.
-pub fn apply_format_spec(s: &str, v: &Value, spec: &str) -> String {
+pub fn apply_format_spec(s: &str, v: &Value, spec: &str) -> Result<String, String> {
     if spec.is_empty() {
-        return s.to_string();
+        return Ok(s.to_string());
     }
     let chars: Vec<char> = spec.chars().collect();
     let mut i = 0;
     let mut fill = ' ';
     let mut align = '\0';
+    // Whether alignment was written explicitly (`<`/`>`/`^`/`=`), as opposed to
+    // being implied by the `0` flag — CPython rejects an explicit `=` on strings
+    // but accepts the `0`-implied form.
+    let mut align_explicit = false;
     // [[fill]align]
     if chars.len() >= 2 && matches!(chars[1], '<' | '>' | '^' | '=') {
         fill = chars[0];
         align = chars[1];
+        align_explicit = true;
         i = 2;
     } else if !chars.is_empty() && matches!(chars[0], '<' | '>' | '^' | '=') {
         align = chars[0];
+        align_explicit = true;
         i = 1;
     }
     let mut sign = '\0';
@@ -7876,6 +7882,8 @@ pub fn apply_format_spec(s: &str, v: &Value, spec: &str) -> String {
         prec = Some(p);
     }
     let ty = chars.get(i).copied().unwrap_or('\0');
+
+    validate_format_spec(v, ty, sign, alt, group, prec, align, align_explicit)?;
 
     // Render body by type.
     let body =
@@ -7986,7 +7994,7 @@ pub fn apply_format_spec(s: &str, v: &Value, spec: &str) -> String {
         }
         let padded = format!("{:0>n$}", intpart, n = n);
         let grouped = insert_grouping(&padded, sep, group_size);
-        return format!("{sign_str}{prefix}{grouped}{tail}");
+        return Ok(format!("{sign_str}{prefix}{grouped}{tail}"));
     }
 
     // Group the natural integer digits (no interleaved padding).
@@ -7999,10 +8007,10 @@ pub fn apply_format_spec(s: &str, v: &Value, spec: &str) -> String {
 
     let len = body.chars().count();
     if len >= width {
-        return body;
+        return Ok(body);
     }
     let pad = width - len;
-    match align {
+    Ok(match align {
         '<' => format!("{body}{}", fill.to_string().repeat(pad)),
         '^' => {
             let l = pad / 2;
@@ -8013,6 +8021,10 @@ pub fn apply_format_spec(s: &str, v: &Value, spec: &str) -> String {
                 fill.to_string().repeat(r)
             )
         }
+        // A non-numeric body only reaches `=` via the `0` flag (explicit `=` on a
+        // string is rejected in validation); CPython keeps the string's default
+        // left alignment there, so `{:05s}` of "hi" → "hi000".
+        '=' if !numeric => format!("{body}{}", fill.to_string().repeat(pad)),
         '=' => {
             // Sign-aware pad: the fill goes AFTER the sign (`+`/`-`/space) and any
             // radix prefix (`0x`/`0o`/`0b`), so `+05d` of 5 → `+0005` and `#08x` of
@@ -8041,7 +8053,109 @@ pub fn apply_format_spec(s: &str, v: &Value, spec: &str) -> String {
                 format!("{body}{}", fill.to_string().repeat(pad))
             }
         }
+    })
+}
+
+/// Validate a parsed format spec against the value's type, matching CPython's
+/// `str`/`int`/`float` `__format__` errors. Parity is on success-ness (a raised
+/// `ValueError`/`OverflowError`/`TypeError`), so only the error CONDITION must
+/// match CPython — the exact message text is best-effort.
+#[allow(clippy::too_many_arguments)]
+fn validate_format_spec(
+    v: &Value,
+    ty: char,
+    sign: char,
+    alt: bool,
+    group: Option<char>,
+    prec: Option<usize>,
+    align: char,
+    align_explicit: bool,
+) -> Result<(), String> {
+    let is_float = matches!(v, Value::Float(_));
+    let is_int = !is_float && with_host(|h| h.big_val(v)).is_some();
+    let is_num = is_float || is_int;
+    let is_string = !is_num && is_str(v);
+    let tyname = || with_host(|h| h.type_name(v));
+
+    // Non-numeric, non-string object with a (non-empty) spec has no custom
+    // __format__ here: object.__format__ rejects any format string.
+    if !is_num && !is_string {
+        return Err(format!(
+            "TypeError: unsupported format string passed to {}.__format__",
+            tyname()
+        ));
     }
+
+    // String value: only '' and 's' types; sign / '#' / explicit '=' / grouping
+    // are all rejected.
+    if is_string {
+        if ty != '\0' && ty != 's' {
+            return Err(format!(
+                "ValueError: Unknown format code '{ty}' for object of type 'str'"
+            ));
+        }
+        if sign != '\0' {
+            return Err("ValueError: Sign not allowed in string format specifier".into());
+        }
+        if alt {
+            return Err(
+                "ValueError: Alternate form (#) not allowed in string format specifier".into(),
+            );
+        }
+        if align_explicit && align == '=' {
+            return Err(
+                "ValueError: '=' alignment not allowed in string format specifier".into(),
+            );
+        }
+        if let Some(g) = group {
+            return Err(format!("ValueError: Cannot specify '{g}' with 's'."));
+        }
+        return Ok(());
+    }
+
+    // 's' requires a string value.
+    if ty == 's' {
+        return Err(format!(
+            "ValueError: Unknown format code 's' for object of type '{}'",
+            tyname()
+        ));
+    }
+
+    // Integer-only presentation types reject a float value.
+    if is_float && matches!(ty, 'b' | 'o' | 'x' | 'X' | 'c' | 'd') {
+        return Err(format!(
+            "ValueError: Unknown format code '{ty}' for object of type 'float'"
+        ));
+    }
+
+    // Grouping-vs-type: ',' is illegal with the radix / char / locale types;
+    // '_' is illegal only with 'c'.
+    match group {
+        Some(',') if matches!(ty, 'x' | 'X' | 'o' | 'b' | 'c' | 'n') => {
+            return Err("ValueError: Cannot specify ',' with '?'.".replace('?', &ty.to_string()));
+        }
+        Some('_') if ty == 'c' => {
+            return Err("ValueError: Cannot specify '_' with 'c'.".into());
+        }
+        _ => {}
+    }
+
+    // Precision is not allowed when the effective type is an integer type.
+    if is_int && prec.is_some() && matches!(ty, '\0' | 'b' | 'o' | 'x' | 'X' | 'c' | 'd') {
+        return Err("ValueError: Precision not allowed in integer format specifier".into());
+    }
+
+    // 'c' codepoint must be in range(0x110000).
+    if ty == 'c' && is_int {
+        if let Some(n) = with_host(|h| h.big_val(v)) {
+            use num_bigint::BigInt;
+            if n < BigInt::from(0) || n > BigInt::from(0x10_FFFFu32) {
+                return Err("OverflowError: %c arg not in range(0x110000)".into());
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Length of `n` digits after inserting a group separator every `size` digits

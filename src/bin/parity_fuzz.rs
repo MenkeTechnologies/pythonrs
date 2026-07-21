@@ -3177,7 +3177,7 @@ fn gen_strformat(seed: u64) -> Vec<String> {
     let w = pick(r, &["0", "6", "8", "10", "12", "15"]);
     let sign = pick(r, &["", "+", "-", " "]);
     let p = pick(r, &["1", "2", "3", "4"]);
-    let e = match r.below(24) {
+    let e = match r.below(33) {
         // --- decimal-int grouping: plain, then combined with width/zero/sign ---
         0 => format!("print('{{:{grp}}}'.format({gi}))"),
         1 => format!("print('{{:{grp}d}}'.format({gi}))"),
@@ -3240,7 +3240,57 @@ fn gen_strformat(seed: u64) -> Vec<String> {
         21 => format!("print('%*.*f|%*d' % (10, {p}, {gf}, {w}, abs({gi})))"),
         22 => "print('%(name)s=%(val)08.2f' % {'name': 'x', 'val': 1234.5})".to_string(),
         // --- conversions !r / !s / !a with a spec ---
-        _ => format!("print('{{0!r:>10}}|{{1!s}}|{{0!a}}'.format({s}, {gi}))"),
+        23 => format!("print('{{0!r:>10}}|{{1!s}}|{{0!a}}'.format({s}, {gi}))"),
+        // --- ERROR PARITY: illegal `,` grouping with radix/char/locale types ---
+        24 => {
+            let t = pick(r, &["x", "X", "o", "b", "c", "n"]);
+            format!("print('{{:,{t}}}'.format(abs({gi}) + 1))")
+        }
+        // --- ERROR PARITY: precision on an integer presentation type ---
+        25 => {
+            let t = pick(r, &["d", "x", "o", "b", "c", ""]);
+            format!("print('{{:.{p}{t}}}'.format(abs({gi}) + 1))")
+        }
+        // --- ERROR PARITY: type code incompatible with the value type ---
+        26 => {
+            let t = pick(r, &["d", "x", "o", "b", "c"]);
+            format!("print('{{:{t}}}'.format({gf}))")
+        }
+        27 => {
+            let t = pick(r, &["d", "x", "g", "e", "f", "c", "n"]);
+            format!("print('{{:{t}}}'.format({s}))")
+        }
+        // --- ERROR PARITY: sign / `#` / explicit `=` grouping on a string ---
+        28 => {
+            let bad = pick(r, &["+", " ", "#", "=6", ","]);
+            format!("print('{{:{bad}}}'.format({s}))")
+        }
+        // --- `c` conversion: valid codepoints and out-of-range (OverflowError) ---
+        29 => {
+            let n = pick(r, &["65", "97", "0x41", "8364", "-1", "1114112", "0x110000"]);
+            format!("print('{{:c}}'.format({n}))")
+        }
+        // --- string field: zero-pad (left) + fill/align combinations (all valid) ---
+        30 => format!("print('{{:0{w}}}|{{:*^{w}}}|{{:.>{w}s}}'.format({s}, {s}, {s}))"),
+        // --- format() builtin error dispatch (mismatched type code) ---
+        31 => {
+            let (v, sp) = pick(
+                r,
+                &[
+                    ("3.5", "d"),
+                    ("'hi'", "x"),
+                    ("255", ",x"),
+                    ("5", ".2d"),
+                    ("'hi'", "+"),
+                    ("[1, 2]", ">5"),
+                ],
+            );
+            format!("print(format({v}, '{sp}'))")
+        }
+        // --- old-style % with `#` alt forms and mixed conversions ---
+        _ => format!(
+            "print('%#x|%#o|%+d|% d|%r' % (abs({gi}), abs({gi2}), {gi}, abs({gi2}), {s}))"
+        ),
     };
     vec![e]
 }

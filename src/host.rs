@@ -3714,11 +3714,8 @@ impl PyHost {
                         digits.insert(0, '0');
                     }
                 }
-                let prefix = if abs == num_bigint::BigInt::from(0) {
-                    ""
-                } else {
-                    prefix
-                };
+                // Python (unlike C printf) keeps the `#` radix prefix even for a
+                // zero value: `'%#x' % 0` → `0x0`, `'%#o' % 0` → `0o0`.
                 Ok(format!("{}{}{}", sign_str(neg), prefix, digits))
             }
             'f' | 'F' | 'e' | 'E' | 'g' | 'G' => {
