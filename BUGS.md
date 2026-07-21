@@ -265,11 +265,17 @@ fixed. Every line below was re-checked against the **default-build** binary
   from the true value (e.g. `2113325745016023.2` prints as `…3.3`); the underlying
   `f64` bits are identical either way (`float.hex` agrees). A faithful fix needs a
   dtoa-style shortest formatter rather than the `std` one.
-- **256+ element collection / call literals**: a single `[...]`/`(...)`/`{...}`
-  literal or call with more than 255 items raises `too many arguments (>255) for
-  one call` — the `MKLIST`/`MKTUPLE`/`MKSET`/`MKDICT`/`CALL` ops carry a `u8`
-  operand count. CPython builds arbitrarily large literals. Needs a chunked-build
-  lowering (or a wider operand) across every collection/call site.
+- **256+ argument calls / `**`-spread dict literals**: `CallBuiltin` carries a
+  `u8` operand count, so an op that must name >255 stack slots at once raises
+  `too many arguments (>255) for one call`. Plain collection literals
+  (`[...]`/`(...)`/`{...}` and f-strings) no longer hit this — the compiler now
+  builds them in ≤255-slot chunks via the `EXTEND_LIST`/`EXTEND_TUPLE`/
+  `EXTEND_SET`/`EXTEND_DICT`/`EXTEND_STR` ops (mirrors CPython's
+  LIST_EXTEND/DICT_UPDATE/BUILD_STRING). Still overflowing: a call with >255
+  positional args, a `{**a, …}` dict literal with >127 entries (the tag-packed
+  `MKDICT_EX` site), and the rare >255-slot `MKFUNC`/class-base/`MATCH_CLASS`
+  sites. CPython lowers all of these too; the same chunked treatment would extend
+  to the call/spread paths.
 
 ## Tooling
 - **`--dap`** (Debug Adapter Protocol): implemented — breakpoints, step
@@ -286,8 +292,10 @@ fixed. Every line below was re-checked against the **default-build** binary
   analogue of `python3 -i < file`.
 
 ## Standard library
-The **default build** (no features) serves only a native subset; every other
-module raises `ModuleNotFoundError`.
+The **default build** ships the `stdlib-ffi` bridge, so a native fast-path subset
+plus the entire CPython stdlib are importable out of the box. A
+`--no-default-features` build serves only the native subset below; every other
+module then raises `ModuleNotFoundError`.
 
 - **Native in every build**: `math` (constants + a common function subset), `sys`
   (`argv` from the process args, `exit`/`getrecursionlimit`/`setrecursionlimit`,
@@ -295,14 +303,15 @@ module raises `ModuleNotFoundError`.
   `platform` (`darwin`/`linux`), `path`, `modules`, `executable`,
   `stdout`/`stderr`/`stdin` file objects), `collections` (`deque`, `Counter`,
   `defaultdict`, `OrderedDict`, `namedtuple`), `textwrap`, and `statistics`.
-- **The rest of the stdlib is served by the `--features stdlib-ffi` bridge** — an
-  embedded libpython over pyo3, so `import re`/`json`/`os`/`random`/`string`/
+- **The rest of the stdlib is served by the `stdlib-ffi` bridge (on by default)**
+  — an embedded libpython over pyo3, so `import re`/`json`/`os`/`random`/`string`/
   `itertools`/`functools`/`datetime`/`hashlib`/… load the **real CPython
   modules** (pure `.py` + the C accelerators), not hand-rolled shadows.
   `functools.partial`/`lru_cache`/`reduce`, `re`, `json`, `os` + `os.path`,
   `random`, `string`, and `itertools` (natively lazy `count`/`cycle`/`islice`)
   all come from CPython there (`collections`/`math`/`sys` stay the native arms,
-  which resolve before the FFI fallback). Build with
-  `PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 cargo build --features stdlib-ffi`.
-  **Without the feature, none of these import** — e.g. `import functools`,
-  `import re`, `import os` all fail in the default build.
+  which resolve before the FFI fallback). A bare `cargo build` works as-is
+  (`.cargo/config.toml` pins `PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1` for pyo3's
+  3.14 forward-compat check). **Only a `--no-default-features` build drops the
+  bridge** — there `import functools`/`import re`/`import os` all raise
+  `ModuleNotFoundError`.

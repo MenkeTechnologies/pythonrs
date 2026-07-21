@@ -130,9 +130,10 @@ num-traits = "0.2"
 num-rational = "0.4"
 num-complex = "0.4"
 
-# Optional CPython stdlib FFI bridge (feature `stdlib-ffi`, OFF by default). When
-# enabled, `import <stdlib>` delegates to an embedded libpython over pyo3 instead
-# of a hand-rolled shadow — the real CPython stdlib (pure `.py` + C accelerators).
+# CPython stdlib FFI bridge (feature `stdlib-ffi`, ON by default — see [features]).
+# `import <stdlib>` delegates to an embedded libpython over pyo3 instead of a
+# hand-rolled shadow — the real CPython stdlib (pure `.py` + C accelerators).
+# Disable with `--no-default-features` for a pyo3-free, libpython-free build.
 # `abi3-py313` links one binary against any CPython >= 3.13 via the stable ABI
 # (build the FFI config with `PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1` until pyo3
 # ships native 3.14 support). Default builds never pull pyo3 or need libpython.
@@ -141,6 +142,11 @@ unicode_names2 = "3.1.0"
 unicode-general-category = "1.1.0"
 
 [features]
+# stdlib-ffi is ON by default so `import os` (and the rest of the CPython stdlib)
+# works out of the box. `.cargo/config.toml` pins the pyo3 3.14 forward-compat
+# flag so a bare `cargo build` needs no extra env. `--no-default-features` drops
+# pyo3/libpython for a native-only build (only pythonrs's built-in modules).
+default = ["stdlib-ffi"]
 stdlib-ffi = ["dep:pyo3"]
 
 [dev-dependencies]
