@@ -27,6 +27,11 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::MKTUPLE, b_mktuple);
     vm.register_builtin(ops::MKSET, b_mkset);
     vm.register_builtin(ops::MKDICT, b_mkdict);
+    vm.register_builtin(ops::EXTEND_LIST, b_extend_list);
+    vm.register_builtin(ops::EXTEND_TUPLE, b_extend_tuple);
+    vm.register_builtin(ops::EXTEND_SET, b_extend_set);
+    vm.register_builtin(ops::EXTEND_DICT, b_extend_dict);
+    vm.register_builtin(ops::EXTEND_STR, b_extend_str);
     vm.register_builtin(ops::MKSLICE, b_mkslice);
     vm.register_builtin(ops::CALL, b_call);
     vm.register_builtin(ops::CALL_KW, b_call_kw);
@@ -589,6 +594,96 @@ fn b_mkdict(vm: &mut VM, argc: u8) -> Value {
         i += 2;
     }
     with_host(|h| h.new_dict(d))
+}
+
+// ── chunked-build extends ────────────────────────────────────────────────────
+// A collection literal with more stack slots than a u8 argc can name is built in
+// ≤255-slot chunks: `MK*` makes the accumulator from the first chunk, then each
+// `EXTEND_*` op below folds the next chunk into it. Stack on entry is
+// [acc, items...] (bottom-to-top), so `pop_n` yields the accumulator first.
+
+fn b_extend_list(vm: &mut VM, argc: u8) -> Value {
+    let mut items = pop_n(vm, argc as usize);
+    let acc = items.remove(0);
+    with_host(|h| {
+        if let Some(PyObj::List(l)) = h.get_mut(&acc) {
+            l.extend(items);
+        }
+    });
+    acc
+}
+
+fn b_extend_tuple(vm: &mut VM, argc: u8) -> Value {
+    let mut items = pop_n(vm, argc as usize);
+    let acc = items.remove(0);
+    let mut all: Vec<Value> = with_host(|h| match h.get(&acc) {
+        Some(PyObj::Tuple(t)) => t.clone(),
+        _ => Vec::new(),
+    });
+    all.extend(items);
+    with_host(|h| h.new_tuple(all))
+}
+
+fn b_extend_set(vm: &mut VM, argc: u8) -> Value {
+    let mut items = pop_n(vm, argc as usize);
+    let acc = items.remove(0);
+    let mut set: IndexMap<PKey, Value> = with_host(|h| match h.get(&acc) {
+        Some(PyObj::Set(s)) => s.clone(),
+        _ => IndexMap::new(),
+    });
+    for it in items {
+        let cands = host::set_local_candidates(&set);
+        let key = host::with_instance_key(&it, &cands, || with_host(|h| h.to_key(&it)));
+        match key {
+            Ok(k) => host::set_put(&mut set, k, it),
+            Err(e) => return abort(vm, e),
+        }
+    }
+    with_host(|h| {
+        if let Some(PyObj::Set(s)) = h.get_mut(&acc) {
+            *s = set;
+        }
+    });
+    acc
+}
+
+fn b_extend_dict(vm: &mut VM, argc: u8) -> Value {
+    let flat = pop_n(vm, argc as usize);
+    let acc = flat[0].clone();
+    let mut d: IndexMap<PKey, (Value, Value)> = with_host(|h| match h.get(&acc) {
+        Some(PyObj::Dict(m)) => m.clone(),
+        _ => IndexMap::new(),
+    });
+    let mut i = 1;
+    while i + 1 < flat.len() {
+        let k = flat[i].clone();
+        let v = flat[i + 1].clone();
+        let cands = host::dict_local_candidates(&d);
+        let key = host::with_instance_key(&k, &cands, || with_host(|h| h.to_key(&k)));
+        match key {
+            Ok(key) => host::dict_put(&mut d, key, k, v),
+            Err(e) => return abort(vm, e),
+        }
+        i += 2;
+    }
+    with_host(|h| {
+        if let Some(PyObj::Dict(m)) = h.get_mut(&acc) {
+            *m = d;
+        }
+    });
+    acc
+}
+
+fn b_extend_str(vm: &mut VM, argc: u8) -> Value {
+    let mut parts = pop_n(vm, argc as usize);
+    let acc = parts.remove(0);
+    let mut s = with_host(|h| h.str_of(&acc));
+    with_host(|h| {
+        for p in &parts {
+            s.push_str(&h.str_of(p));
+        }
+    });
+    with_host(|h| h.new_str(s))
 }
 
 fn b_mkslice(vm: &mut VM, _: u8) -> Value {

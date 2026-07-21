@@ -21,15 +21,17 @@ delegates to CPython.
 
 ## Implementation (feature-gated so it never breaks default/peer builds)
 
-1. **Cargo** — optional dep + feature (default OFF):
+1. **Cargo** — optional dep, feature ON by default:
    ```toml
    [dependencies]
    pyo3 = { version = "0.24", features = ["abi3-py313", "auto-initialize"], optional = true }
    [features]
+   default = ["stdlib-ffi"]
    stdlib-ffi = ["dep:pyo3"]
    ```
-   Default `cargo build`/`test`/`clippy` are unaffected (no libpython needed). CI adds one
-   job: `PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 cargo build --features stdlib-ffi`.
+   `.cargo/config.toml` pins `PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1`, so a bare
+   `cargo build`/`test`/`clippy` links libpython and imports the real stdlib with no
+   extra env. A pyo3-free/libpython-free build uses `cargo build --no-default-features`.
 
 2. **`src/ffi.rs`** (`#[cfg(feature = "stdlib-ffi")]`):
    - `init()` once at startup: resolve the stdlib prefix (order: `PYTHONRS_STDLIB` env →

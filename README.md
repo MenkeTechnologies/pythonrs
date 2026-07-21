@@ -172,8 +172,10 @@ is a real gap. `PYTHONRS_FUZZ_PYTHON` names the reference interpreter; a
 ## [0x07] STATUS & ROADMAP
 
 Active, in development. The runtime executes a substantial real subset of Python
-3. [BUGS.md](BUGS.md) is the honest ledger of unimplemented features — `async`,
-`bytes` operations, and most of the standard library are not yet carried. A DAP
+3. The full CPython standard library is importable by default — the `stdlib-ffi`
+bridge (on by default) delegates `import os`/`re`/`json`/… to an embedded
+libpython, so only a `--no-default-features` build is limited to the native
+module subset. [BUGS.md](BUGS.md) is the honest ledger of remaining gaps. A DAP
 debug adapter (`--dap`) — source-line and function breakpoints, stepping, call
 stack, locals, and expression `evaluate` — ships today, alongside man pages and
 the generated `reference.html`.

@@ -2479,3 +2479,53 @@ fn sequence_index_and_concat_error_messages() {
         "got: {e}"
     );
 }
+
+/// Collection literals whose stack-slot count exceeds the `CallBuiltin` u8 argc
+/// cap (a 174-key dict literal in a real script raised "too many arguments
+/// (>255) for one call"). The compiler now builds them in ≤255-slot chunks via
+/// the `EXTEND_*` ops; verify each container type is correct at and around the
+/// chunk boundaries (list/tuple/set/str-parts spill at >255, dict pairs at
+/// >127). Values checked against CPython.
+#[test]
+fn large_collection_literals_exceed_u8_argc() {
+    // 300-element list (spills once past the 255 mk-chunk).
+    let lst = (0..300).map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
+    assert_eq!(g(&format!("a = [{lst}]\nx = (len(a), sum(a), a[0], a[-1])"), "x"), "(300, 44850, 0, 299)");
+
+    // 300-element tuple (EXTEND_TUPLE rebuilds each chunk).
+    assert_eq!(g(&format!("a = ({lst},)\nx = (len(a), sum(a), a[-1])"), "x"), "(300, 44850, 299)");
+
+    // 300-key dict literal — 600 stack slots, dict pairs spill past 127.
+    let pairs = (0..300).map(|i| format!("{i}: {}", i * i)).collect::<Vec<_>>().join(", ");
+    assert_eq!(
+        g(&format!("d = {{{pairs}}}\nx = (len(d), sum(d.values()), d[0], d[299])"), "x"),
+        "(300, 8955050, 0, 89401)"
+    );
+
+    // Set literal with cross-chunk duplicates -> deduped (EXTEND_SET keying).
+    let st = (0..300).map(|i| (i % 250).to_string()).collect::<Vec<_>>().join(", ");
+    assert_eq!(g(&format!("s = {{{st}}}\nx = (len(s), sum(s))"), "x"), "(250, 31125)");
+
+    // f-string with 300 replacement fields spills EXTEND_STR; `{0}{1}...` are
+    // integer-literal fields, so the result is "012...299".
+    let fields = (0..300).map(|i| format!("{{{i}}}")).collect::<Vec<_>>().concat();
+    let expected: String = (0..300).map(|i| i.to_string()).collect();
+    assert_eq!(g(&format!("x = f\"{fields}\""), "x"), format!("'{expected}'"));
+
+    // Boundaries: exactly at, just over, and dict at its 127/128 pair edge.
+    for n in [255usize, 256, 127, 128, 254] {
+        let seq = (0..n).map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
+        let want = (n, n * (n.saturating_sub(1)) / 2);
+        assert_eq!(
+            g(&format!("a = [{seq}]\nx = (len(a), sum(a))"), "x"),
+            format!("({}, {})", want.0, want.1),
+            "list n={n}"
+        );
+        let dp = (0..n).map(|i| format!("{i}: {i}")).collect::<Vec<_>>().join(", ");
+        assert_eq!(
+            g(&format!("d = {{{dp}}}\nx = (len(d), sum(d.values()))"), "x"),
+            format!("({}, {})", want.0, want.1),
+            "dict n={n}"
+        );
+    }
+}

@@ -1363,8 +1363,9 @@ impl Compiler {
                     // BUILD_ARGS already yields a flat `list`.
                     self.compile_arg_spread(b, items)?;
                 } else {
-                    self.compile_seq(b, items)?;
-                    b.emit(Op::CallBuiltin(ops::MKLIST, argc(items.len())?), 0);
+                    self.build_chunked(b, ops::MKLIST, ops::EXTEND_LIST, items.len(), 1, |c, b, i| {
+                        c.compile_expr(b, &items[i])
+                    })?;
                 }
             }
             Expr::Tuple(items) => {
@@ -1374,8 +1375,9 @@ impl Compiler {
                     self.compile_arg_spread(b, items)?;
                     b.emit(Op::CallBuiltin(ops::CALL, 2), 0);
                 } else {
-                    self.compile_seq(b, items)?;
-                    b.emit(Op::CallBuiltin(ops::MKTUPLE, argc(items.len())?), 0);
+                    self.build_chunked(b, ops::MKTUPLE, ops::EXTEND_TUPLE, items.len(), 1, |c, b, i| {
+                        c.compile_expr(b, &items[i])
+                    })?;
                 }
             }
             Expr::Set(items) => {
@@ -1384,8 +1386,9 @@ impl Compiler {
                     self.compile_arg_spread(b, items)?;
                     b.emit(Op::CallBuiltin(ops::CALL, 2), 0);
                 } else {
-                    self.compile_seq(b, items)?;
-                    b.emit(Op::CallBuiltin(ops::MKSET, argc(items.len())?), 0);
+                    self.build_chunked(b, ops::MKSET, ops::EXTEND_SET, items.len(), 1, |c, b, i| {
+                        c.compile_expr(b, &items[i])
+                    })?;
                 }
             }
             Expr::Dict(pairs) => {
@@ -1408,13 +1411,14 @@ impl Compiler {
                     }
                     b.emit(Op::CallBuiltin(ops::MKDICT_EX, argc(pairs.len() * 3)?), 0);
                 } else {
-                    for (k, v) in pairs {
-                        if let Some(k) = k {
-                            self.compile_expr(b, k)?;
-                            self.compile_expr(b, v)?;
-                        }
-                    }
-                    b.emit(Op::CallBuiltin(ops::MKDICT, argc(pairs.len() * 2)?), 0);
+                    // This branch is reached only when every key is `Some`
+                    // (the `**`-spread case took the arm above), so each pair
+                    // contributes exactly two stack slots.
+                    self.build_chunked(b, ops::MKDICT, ops::EXTEND_DICT, pairs.len(), 2, |c, b, i| {
+                        let (k, v) = &pairs[i];
+                        c.compile_expr(b, k.as_ref().expect("plain dict key"))?;
+                        c.compile_expr(b, v)
+                    })?;
                 }
             }
             Expr::Starred(inner) => self.compile_expr(b, inner)?,
@@ -1532,21 +1536,65 @@ impl Compiler {
         Ok(())
     }
 
+    /// Emit a collection literal whose element count may exceed the u8 `argc`
+    /// cap of `CallBuiltin`. `slots` is the stack slots per element (2 for dict
+    /// k,v pairs, else 1). When the whole literal fits one chunk it lowers to a
+    /// single `mk`; otherwise the first chunk builds the accumulator with `mk`
+    /// and each further chunk folds in via `extend` ([acc, items...]) — the same
+    /// shape CPython uses for oversized literals (LIST_EXTEND/DICT_UPDATE/…).
+    /// `emit(self, b, i)` pushes element `i`'s `slots` values.
+    fn build_chunked(
+        &mut self,
+        b: &mut ChunkBuilder,
+        mk: u16,
+        extend: u16,
+        count: usize,
+        slots: usize,
+        mut emit: impl FnMut(&mut Self, &mut ChunkBuilder, usize) -> Result<(), String>,
+    ) -> Result<(), String> {
+        // Whole elements per chunk: the `mk` chunk fills all 255 slots; an
+        // `extend` chunk reserves 1 slot for the accumulator beneath it.
+        let mk_cap = 255 / slots;
+        let ext_cap = (255 - 1) / slots;
+        if count <= mk_cap {
+            for i in 0..count {
+                emit(self, b, i)?;
+            }
+            b.emit(Op::CallBuiltin(mk, (count * slots) as u8), 0);
+            return Ok(());
+        }
+        for i in 0..mk_cap {
+            emit(self, b, i)?;
+        }
+        b.emit(Op::CallBuiltin(mk, (mk_cap * slots) as u8), 0);
+        let mut i = mk_cap;
+        while i < count {
+            let n = ext_cap.min(count - i);
+            for j in 0..n {
+                emit(self, b, i + j)?;
+            }
+            b.emit(Op::CallBuiltin(extend, (1 + n * slots) as u8), 0);
+            i += n;
+        }
+        Ok(())
+    }
+
     fn compile_subscript_index(&mut self, b: &mut ChunkBuilder, idx: &Expr) -> Result<(), String> {
         self.compile_expr(b, idx)
     }
 
     fn compile_fstring(&mut self, b: &mut ChunkBuilder, parts: &[FStrPart]) -> Result<(), String> {
-        let mut n = 0;
-        for p in parts {
-            match p {
+        // Each part pushes exactly one string slot (a literal constant, or a
+        // FORMAT result). `build_chunked` keeps a >255-part f-string within the
+        // u8 argc cap by folding extra parts in with EXTEND_STR.
+        self.build_chunked(b, ops::MKSTR, ops::EXTEND_STR, parts.len(), 1, |c, b, i| {
+            match &parts[i] {
                 FStrPart::Lit(s) => {
                     let k = b.add_constant(Value::str(s));
                     b.emit(Op::LoadConst(k), 0);
-                    n += 1;
                 }
                 FStrPart::Expr { expr, conv, spec } => {
-                    self.compile_expr(b, expr)?;
+                    c.compile_expr(b, expr)?;
                     let conv_i = match conv {
                         Some('s') => 1,
                         Some('r') => 2,
@@ -1554,14 +1602,12 @@ impl Compiler {
                         _ => 0,
                     };
                     b.emit(Op::LoadInt(conv_i), 0);
-                    self.compile_fstring_spec(b, spec)?;
+                    c.compile_fstring_spec(b, spec)?;
                     b.emit(Op::CallBuiltin(ops::FORMAT, 3), 0);
-                    n += 1;
                 }
             }
-        }
-        b.emit(Op::CallBuiltin(ops::MKSTR, argc(n)?), 0);
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Push an f-string field's format spec onto the stack as a string. The

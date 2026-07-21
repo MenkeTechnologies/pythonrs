@@ -95,6 +95,16 @@ pub mod ops {
     pub const YIELD_FROM: u16 = 68; // [iterable] -> `yield from` delegation (PEP 380); -> sub-iterator's return value
     pub const LOOP_BODY: u16 = 69; // [try_id] -> run a loop body chunk (whose break/continue cross a try/with boundary); consume Break/Continue signals -> Int(0=next, 1=break); Return stops the loop chunk
     pub const DISPLAYHOOK: u16 = 70; // [v] -> interactive REPL echo: if v is not None, print repr(v) and bind `_` (CPython sys.displayhook)
+    // Chunked-build extends for collection literals whose element count exceeds
+    // the u8 argc cap of `CallBuiltin`. The first ≤255-slot chunk is built with
+    // the matching `MK*` op; each further chunk folds into the accumulator that
+    // sits beneath it on the stack (mirrors CPython's LIST_EXTEND / SET_UPDATE /
+    // DICT_UPDATE / BUILD_STRING). Each pops [acc, items...] and pushes acc.
+    pub const EXTEND_LIST: u16 = 71; // [list, items...] -> list (append items)
+    pub const EXTEND_TUPLE: u16 = 72; // [tuple, items...] -> tuple (acc ++ items)
+    pub const EXTEND_SET: u16 = 73; // [set, items...] -> set (add items)
+    pub const EXTEND_DICT: u16 = 74; // [dict, k,v,...] -> dict (insert pairs)
+    pub const EXTEND_STR: u16 = 75; // [str, parts...] -> str (concat parts)
 }
 
 /// In-place (augmented-assignment) op tags carried by `ops::INPLACE`. One per
