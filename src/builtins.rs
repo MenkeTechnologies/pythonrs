@@ -6052,12 +6052,17 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
         "lstrip" => Ok(new_str(strip_str(&s, args, 1))),
         "rstrip" => Ok(new_str(strip_str(&s, args, 2))),
         "swapcase" => Ok(new_str(
+            // Unicode-aware: a cased letter maps to the opposite case (case
+            // mapping can be 1→many, e.g. `ß` → `SS`); non-cased chars pass
+            // through. ASCII-only mapping left `ï`/`é` unchanged.
             s.chars()
-                .map(|c| {
+                .flat_map(|c| {
                     if c.is_uppercase() {
-                        c.to_ascii_lowercase()
+                        c.to_lowercase().collect::<Vec<_>>()
+                    } else if c.is_lowercase() {
+                        c.to_uppercase().collect::<Vec<_>>()
                     } else {
-                        c.to_ascii_uppercase()
+                        vec![c]
                     }
                 })
                 .collect::<String>(),
@@ -9939,15 +9944,32 @@ fn construct_collection(
 ) -> Result<Value, String> {
     match kind {
         "deque" => {
-            let mut items: std::collections::VecDeque<Value> = match args.first() {
+            // `deque([iterable[, maxlen]])` — both are also acceptable by keyword
+            // (`deque([1,2,3], maxlen=4)`), so consult kwargs when a positional is
+            // absent.
+            let kw = |name: &str| {
+                kwargs
+                    .iter()
+                    .find(|(k, _)| k == name)
+                    .map(|(_, v)| v.clone())
+            };
+            let iterable = match args.first() {
+                Some(v) if !matches!(v, Value::Undef) => Some(v.clone()),
+                _ => kw("iterable"),
+            };
+            let mut items: std::collections::VecDeque<Value> = match iterable {
                 Some(v) if !matches!(v, Value::Undef) => {
-                    std::collections::VecDeque::from(host::iter_vec(v)?)
+                    std::collections::VecDeque::from(host::iter_vec(&v)?)
                 }
                 _ => std::collections::VecDeque::new(),
             };
-            let maxlen = match args.get(1) {
+            let maxlen_val = match args.get(1) {
+                Some(v) if !matches!(v, Value::Undef) => Some(v.clone()),
+                _ => kw("maxlen"),
+            };
+            let maxlen = match maxlen_val {
                 Some(v) if !matches!(v, Value::Undef) => {
-                    with_host(|h| h.as_int(v)).map(|n| n.max(0) as usize)
+                    with_host(|h| h.as_int(&v)).map(|n| n.max(0) as usize)
                 }
                 _ => None,
             };

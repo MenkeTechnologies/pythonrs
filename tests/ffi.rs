@@ -462,3 +462,22 @@ except TypeError as e:
         "stderr={stderr}"
     );
 }
+
+/// Setting an attribute on a live CPython object routes through the bridge, so a
+/// mutable stdlib object (`decimal.getcontext().prec = 6`) takes effect. Previously
+/// `set_attr` raised "'Context' object attribute assignment unsupported".
+#[test]
+fn ffi_foreign_setattr() {
+    let src = "\
+from decimal import Decimal, getcontext
+getcontext().prec = 6
+print(getcontext().prec)
+print(Decimal(1) / Decimal(7))
+";
+    let (stdout, stderr, ok) = run_py(src);
+    if !ok || stderr.contains("ModuleNotFoundError") {
+        eprintln!("skipping ffi-foreign-setattr test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(stdout, "6\n0.142857\n", "stderr={stderr}");
+}

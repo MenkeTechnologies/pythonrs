@@ -493,6 +493,16 @@ pub fn get_attr(host: &mut PyHost, id: u32, name: &str) -> Result<Value, String>
     })
 }
 
+/// `foreign.name = value` — set an attribute on a foreign (CPython) object, e.g.
+/// `decimal.getcontext().prec = 6`.
+pub fn set_attr(host: &mut PyHost, id: u32, name: &str, value: &Value) -> Result<(), String> {
+    Python::with_gil(|py| {
+        let obj = fetch(py, id)?;
+        let v = value_to_py(host, py, value)?;
+        obj.setattr(name, v).map_err(|e| e.to_string())
+    })
+}
+
 /// `foreign(*args, **kwargs)` — call the foreign object.
 ///
 /// The host borrow is dropped for the duration of the CPython call so a pythonrs

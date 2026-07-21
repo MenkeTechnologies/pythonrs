@@ -2277,6 +2277,22 @@ fn str_casefold_full_folding() {
     assert_eq!(g("x = 'Straße'.lower()", "x"), "'straße'");
 }
 
+/// `str.swapcase` is Unicode-aware: accented letters swap case (`ï`->`Ï`,
+/// `é`->`É`) and a 1->many mapping expands (`ß`->`SS`); an ASCII-only
+/// implementation left the accented letters unchanged.
+#[test]
+fn str_swapcase_unicode() {
+    assert_eq!(g("x = 'naïve'.swapcase()", "x"), "'NAÏVE'");
+    assert_eq!(g("x = 'É'.swapcase()", "x"), "'é'");
+    assert_eq!(g("x = 'café ÑOÑO'.swapcase()", "x"), "'CAFÉ ñoño'");
+    assert_eq!(g("x = 'ß'.swapcase()", "x"), "'SS'");
+    // ASCII and non-cased characters behave as before.
+    assert_eq!(
+        g("x = 'Hello, World! 123'.swapcase()", "x"),
+        "'hELLO, wORLD! 123'"
+    );
+}
+
 /// `int.bit_count` / `int.bit_length` for native and bignum ints (ones and bit
 /// width of the magnitude).
 #[test]
