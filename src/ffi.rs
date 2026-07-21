@@ -324,12 +324,18 @@ fn value_to_py<'py>(
                 let members: Vec<(String, Value)> = host
                     .classes
                     .get(cname)
-                    .map(|c| c.ns.iter().map(|(k, val)| (k.clone(), val.clone())).collect())
+                    .map(|c| {
+                        c.ns.iter()
+                            .map(|(k, val)| (k.clone(), val.clone()))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let ns_dict = PyDict::new(py);
                 for (k, val) in &members {
                     let pv = value_to_py(host, py, val)?;
-                    ns_dict.set_item(k.as_str(), pv).map_err(|e| e.to_string())?;
+                    ns_dict
+                        .set_item(k.as_str(), pv)
+                        .map_err(|e| e.to_string())?;
                 }
                 if !ns_dict.contains("__module__").unwrap_or(false) {
                     let _ = ns_dict.set_item("__module__", "__main__");

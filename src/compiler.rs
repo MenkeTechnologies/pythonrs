@@ -2543,7 +2543,13 @@ fn wrap_comp_clauses(mut inner: Vec<Stmt>, comps: &[Comprehension]) -> Vec<Stmt>
 /// A top-level statement of a class body that is a simple (bare-name)
 /// annotation, so the body needs an `__annotations__` dict.
 fn is_ann_assign(s: &Stmt) -> bool {
-    matches!(&s.kind, StmtKind::AnnAssign { target: Expr::Name(_), .. })
+    matches!(
+        &s.kind,
+        StmtKind::AnnAssign {
+            target: Expr::Name(_),
+            ..
+        }
+    )
 }
 
 fn param_names(params: &Params) -> Vec<String> {

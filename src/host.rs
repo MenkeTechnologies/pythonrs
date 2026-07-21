@@ -5417,7 +5417,8 @@ impl PyHost {
         if let Value::Obj(i) = recv {
             if let Some(fields) = self.nt_meta.get(i).map(|m| m.fields.clone()) {
                 if name == "_fields" {
-                    let items: Vec<Value> = fields.iter().map(|f| self.new_str(f.clone())).collect();
+                    let items: Vec<Value> =
+                        fields.iter().map(|f| self.new_str(f.clone())).collect();
                     return Ok(self.new_tuple(items));
                 }
                 if let Some(idx) = fields.iter().position(|f| f == name) {

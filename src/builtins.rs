@@ -3337,13 +3337,15 @@ pub fn call_builtin_function(
                     // An instance / foreign object (`Decimal`, `Fraction`, a user
                     // class) delegates to `x.__round__([n])`.
                     let has_round = with_host(|h| match h.get(&v) {
-                        Some(PyObj::Instance(i)) => {
-                            h.class_lookup(&i.class, "__round__").is_some()
-                        }
+                        Some(PyObj::Instance(i)) => h.class_lookup(&i.class, "__round__").is_some(),
                         _ => h.foreign_id(&v).is_some(),
                     });
                     if has_round {
-                        let margs = if has_nd { vec![args[1].clone()] } else { vec![] };
+                        let margs = if has_nd {
+                            vec![args[1].clone()]
+                        } else {
+                            vec![]
+                        };
                         host::call_method(&v, "__round__", margs, vec![])
                     } else {
                         Err(host::type_error(&format!(
@@ -3511,12 +3513,12 @@ pub fn call_builtin_function(
                     Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) if b.len() == 1 => {
                         Ok(b[0] as i64)
                     }
-                    Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) => Err(host::type_error(
-                        &format!(
+                    Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) => {
+                        Err(host::type_error(&format!(
                             "ord() expected a character, but string of length {} found",
                             b.len()
-                        ),
-                    )),
+                        )))
+                    }
                     _ => Err(host::type_error(&format!(
                         "ord() expected string of length 1, but {} found",
                         h.type_name(&a0)
@@ -5229,7 +5231,12 @@ fn nt_instance_method(
                     }
                 }
             }
-            Some(host::namedtuple_construct(&type_name, &fields, new_items, vec![]))
+            Some(host::namedtuple_construct(
+                &type_name,
+                &fields,
+                new_items,
+                vec![],
+            ))
         }
         "count" | "index" => Some(tuple_method(recv, name, args)),
         _ => None,
@@ -9320,10 +9327,16 @@ fn counter_binop(a: &Value, b: &Value, op: char) -> Option<Result<Value, String>
     let da = dump(a);
     let db = dump(b);
     let get = |d: &[(PKey, Value, i64)], k: &PKey| {
-        d.iter().find(|(kk, _, _)| kk == k).map(|(_, _, c)| *c).unwrap_or(0)
+        d.iter()
+            .find(|(kk, _, _)| kk == k)
+            .map(|(_, _, c)| *c)
+            .unwrap_or(0)
     };
     // Union of keys: first operand's order, then second-only keys.
-    let mut keys: Vec<(PKey, Value)> = da.iter().map(|(k, kv, _)| (k.clone(), kv.clone())).collect();
+    let mut keys: Vec<(PKey, Value)> = da
+        .iter()
+        .map(|(k, kv, _)| (k.clone(), kv.clone()))
+        .collect();
     for (k, kv, _) in &db {
         if !da.iter().any(|(kk, _, _)| kk == k) {
             keys.push((k.clone(), kv.clone()));
@@ -9343,7 +9356,11 @@ fn counter_binop(a: &Value, b: &Value, op: char) -> Option<Result<Value, String>
             out.insert(k, (kv, Value::Int(val)));
         }
     }
-    Some(Ok(host::alloc_dict_subtype(out, host::DictKind::Counter, None)))
+    Some(Ok(host::alloc_dict_subtype(
+        out,
+        host::DictKind::Counter,
+        None,
+    )))
 }
 
 fn counter_add(recv: &Value, args: &[Value], sign: i64) -> Result<Value, String> {
@@ -9778,7 +9795,11 @@ pub fn apply_format_spec(s: &str, v: &Value, spec: &str) -> Result<String, Strin
     // An int-like value (`int`/`bool`/bignum) with no explicit presentation type
     // formats as a decimal integer, so `format(False, "5")` is `    0` (the int
     // value) rather than the string `"False"`.
-    let ty = if ty == '\0' && is_int_like(v) { 'd' } else { ty };
+    let ty = if ty == '\0' && is_int_like(v) {
+        'd'
+    } else {
+        ty
+    };
 
     validate_format_spec(v, ty, sign, alt, group, prec, align, align_explicit)?;
 

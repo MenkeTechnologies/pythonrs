@@ -2672,7 +2672,13 @@ fn dunder_import_builtin() {
     assert_eq!(g("x = __import__('sys').maxsize > 0", "x"), "True");
     assert_eq!(g("m = __import__('math')\nx = m.floor(3.7)", "x"), "3");
     // Dotted name, empty fromlist -> top package name.
-    assert_eq!(g("x = __import__('sys').__name__ if hasattr(__import__('sys'), '__name__') else 'sys'", "x"), "'sys'");
+    assert_eq!(
+        g(
+            "x = __import__('sys').__name__ if hasattr(__import__('sys'), '__name__') else 'sys'",
+            "x"
+        ),
+        "'sys'"
+    );
 }
 
 /// A class body captures its simple annotations into `__annotations__` (so
@@ -2682,7 +2688,10 @@ fn dunder_import_builtin() {
 #[test]
 fn class_body_annotations() {
     assert_eq!(
-        g("class C:\n    x: int\n    y: str = 'hi'\nz = C.__annotations__", "z"),
+        g(
+            "class C:\n    x: int\n    y: str = 'hi'\nz = C.__annotations__",
+            "z"
+        ),
         "{'x': <class 'int'>, 'y': <class 'str'>}"
     );
     assert_eq!(g("class C:\n    y: str = 'hi'\nv = C.y", "v"), "'hi'");
