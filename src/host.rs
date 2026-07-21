@@ -5409,18 +5409,29 @@ impl PyHost {
         if let Some(id) = self.foreign_id(recv) {
             return crate::ffi::get_attr(self, id, name);
         }
-        // namedtuple field access: a tagged tuple resolves `.field` to its index.
+        // namedtuple field access: a tagged tuple resolves `.field` to its index,
+        // and `._fields` to the field-name tuple.
         if let Value::Obj(i) = recv {
-            let field_idx = self
-                .nt_meta
-                .get(i)
-                .and_then(|m| m.fields.iter().position(|f| f == name));
-            if let Some(idx) = field_idx {
-                if let Some(PyObj::Tuple(items)) = self.get(recv) {
-                    if let Some(v) = items.get(idx) {
-                        return Ok(v.clone());
+            if let Some(fields) = self.nt_meta.get(i).map(|m| m.fields.clone()) {
+                if name == "_fields" {
+                    let items: Vec<Value> = fields.iter().map(|f| self.new_str(f.clone())).collect();
+                    return Ok(self.new_tuple(items));
+                }
+                if let Some(idx) = fields.iter().position(|f| f == name) {
+                    if let Some(PyObj::Tuple(items)) = self.get(recv) {
+                        if let Some(v) = items.get(idx) {
+                            return Ok(v.clone());
+                        }
                     }
                 }
+            }
+        }
+        // namedtuple TYPE object: `Point._fields`.
+        if name == "_fields" {
+            if let Some(PyObj::NamedTupleType { fields, .. }) = self.get(recv) {
+                let fields = fields.clone();
+                let items: Vec<Value> = fields.iter().map(|f| self.new_str(f.clone())).collect();
+                return Ok(self.new_tuple(items));
             }
         }
         // Native-shadowed module: fast-path the native namespace, else defer to
@@ -9228,7 +9239,7 @@ pub fn make_namedtuple_type(name: &str, fields: Vec<String>) -> Value {
 }
 
 /// Construct a `namedtuple` instance: a `PyObj::Tuple` tagged in `nt_meta`.
-fn namedtuple_construct(
+pub fn namedtuple_construct(
     type_name: &str,
     fields: &[String],
     args: Vec<Value>,
