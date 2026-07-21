@@ -3687,6 +3687,8 @@ impl PyHost {
             },
             unop::POS => match v {
                 Value::Int(_) | Value::Float(_) | Value::Bool(_) => Ok(v.clone()),
+                // `+complex`/`+bignum` return the value unchanged.
+                _ if matches!(self.get(v), Some(PyObj::Complex(..))) => Ok(v.clone()),
                 _ if self.num_val(v).is_some() => Ok(v.clone()),
                 _ => Err(type_error(&format!(
                     "bad operand type for unary +: '{}'",
@@ -5876,8 +5878,17 @@ impl PyHost {
                         });
                     }
                 }
-                // Builtin type method: hand back a bound builtin method.
+                // `x.__class__` on a builtin-type value is its type object (same
+                // as `type(x)`).
                 let tn = self.type_name(recv);
+                if name == "__class__" {
+                    return Ok(if self.classes.contains_key(&tn) {
+                        self.alloc(PyObj::Class(tn))
+                    } else {
+                        self.alloc(PyObj::Builtin(tn))
+                    });
+                }
+                // Builtin type method: hand back a bound builtin method.
                 if crate::builtins::type_has_method(&tn, name) {
                     let b = self.alloc(PyObj::Builtin(name.to_string()));
                     return Ok(self.alloc(PyObj::BoundMethod {
@@ -7059,6 +7070,11 @@ fn metaclass_instantiate(
 }
 
 /// Execute a user function/closure body on a fresh frame.
+/// Maximum Python call depth before a `RecursionError` (CPython's default
+/// `sys.getrecursionlimit()`). Sized to stay well within the interpreter
+/// thread's 512 MiB stack (see `main`).
+const RECURSION_LIMIT: usize = 1000;
+
 pub fn run_user_func(
     fv: &FuncVal,
     self_opt: Option<Value>,
@@ -7109,6 +7125,13 @@ pub fn run_user_func(
             def.name.clone(),
             def.locals.clone(),
         ));
+    }
+    // Recursion guard: raise a catchable `RecursionError` before the deep Rust
+    // call chain per Python frame exhausts the (large but finite) native stack.
+    // The limit matches CPython's default (1000); the interpreter runs on a
+    // 512 MiB-stack thread, which comfortably holds that many frames.
+    if with_host(|h| h.frames.len() >= RECURSION_LIMIT) {
+        return Err("RecursionError: maximum recursion depth exceeded".to_string());
     }
     with_host(|h| {
         h.frames.push(Frame {

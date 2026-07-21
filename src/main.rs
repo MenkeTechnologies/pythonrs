@@ -9,6 +9,21 @@
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    // Run on a worker thread with a large stack. Each Python call frame recurses
+    // through a deep chain of Rust functions (dispatch → call → run_user_func →
+    // run_chunk_on → …), so the default 8 MiB main-thread stack overflows at only
+    // ~85 Python frames. A 512 MiB stack reaches well past CPython's default
+    // recursion limit (1000); a `RecursionError` guard (host::enter_call) stops
+    // runaway recursion before even that is exhausted.
+    std::thread::Builder::new()
+        .stack_size(512 * 1024 * 1024)
+        .spawn(run_main)
+        .expect("spawn interpreter thread")
+        .join()
+        .unwrap_or(ExitCode::FAILURE)
+}
+
+fn run_main() -> ExitCode {
     let cli = pythonrs::cli::parse();
 
     if cli.lsp {
