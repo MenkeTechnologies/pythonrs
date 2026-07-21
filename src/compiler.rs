@@ -114,6 +114,11 @@ pub struct Compiler {
     /// compile time (CPython raises `SyntaxError` for an unbound / module-level
     /// `nonlocal`).
     func_scopes: Vec<HashSet<String>>,
+    /// The dotted prefix for the `__qualname__` of an entity defined at the
+    /// current point: `""` at module level, `"outer.<locals>."` inside a
+    /// function `outer`, `"C."` inside class `C`. Appended with the entity name
+    /// to form its qualified name (CPython's `co_qualname`).
+    qual_prefix: String,
     /// Compile-time `SyntaxWarning`s collected while lowering (see `Program`).
     warnings: Vec<(u32, String)>,
 }
@@ -932,6 +937,31 @@ impl Compiler {
         is_async: bool,
         kind: ScopeKind,
     ) -> Result<usize, String> {
+        self.build_function_qn(name, name, params, body, is_async, kind)
+    }
+
+    /// As [`build_function_ex`], but `qual_name` (the entity's user-facing name)
+    /// drives `__qualname__` and the nested prefix independently of `name` (the
+    /// chunk/traceback name). They differ for a class body, whose chunk name is
+    /// `<class C>` while its qualname component is `C`.
+    fn build_function_qn(
+        &mut self,
+        name: &str,
+        qual_name: &str,
+        params: &Params,
+        body: &[Stmt],
+        is_async: bool,
+        kind: ScopeKind,
+    ) -> Result<usize, String> {
+        // `__qualname__`: the dotted path to this entity. Its own name is joined
+        // to the enclosing prefix; its body then defines nested entities under an
+        // extended prefix (`.<locals>.` for a function, `.` for a class body).
+        let qualname = format!("{}{}", self.qual_prefix, qual_name);
+        let saved_prefix = self.qual_prefix.clone();
+        self.qual_prefix = match kind {
+            ScopeKind::ClassBody => format!("{qualname}."),
+            ScopeKind::Function => format!("{qualname}.<locals>."),
+        };
         // The scope's local names: everything assigned in the body, minus names
         // it declares `global`/`nonlocal`. Reading one before it is bound is an
         // `UnboundLocalError` at runtime. A class body resolves names dynamically,
@@ -957,10 +987,12 @@ impl Compiler {
         if pushed {
             self.func_scopes.pop();
         }
+        self.qual_prefix = saved_prefix;
         compiled?;
         let is_generator = body_has_yield(body);
         let def = FuncDef {
             name: name.to_string(),
+            qualname,
             params: params.names.clone(),
             posonly: params.posonly,
             ndefaults: params.defaults.len(),
@@ -990,8 +1022,9 @@ impl Compiler {
         // into its local env; BUILD_CLASS captures that env as the namespace.
         let empty = Params::default();
         self.fn_depth += 1;
-        let def_id = self.build_function_ex(
+        let def_id = self.build_function_qn(
             &format!("<class {name}>"),
+            name,
             &empty,
             body,
             false,
