@@ -61,7 +61,9 @@ use std::path::PathBuf;
 /// function-local name before it is bound raises `UnboundLocalError` instead of
 /// falling through to an enclosing/global binding. Older bytecode lacks the field
 /// and would give the wrong error, so it must miss.
-const SCHEMA: u64 = 19;
+/// v20: `FuncDef` gained a `qualname` (`__qualname__`) so function introspection
+/// dunders resolve. Older bytecode lacks the field, so it must miss.
+const SCHEMA: u64 = 20;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]

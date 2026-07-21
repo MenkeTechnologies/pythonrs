@@ -188,6 +188,11 @@ pub enum PKey {
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct FuncDef {
     pub name: String,
+    /// The qualified name (`__qualname__` / `co_qualname`): the dotted path from
+    /// the module scope, e.g. `f`, `C.m`, `outer.<locals>.inner`. Defaults to
+    /// `name` for bytecode predating this field.
+    #[serde(default)]
+    pub qualname: String,
     /// Positional-or-keyword parameter names, in order.
     pub params: Vec<String>,
     /// How many leading `params` are positional-only (before a `/`). These
@@ -235,6 +240,9 @@ pub struct TryDef {
 #[derive(Clone, Default)]
 pub struct ClassDef {
     pub name: String,
+    /// The qualified name (`__qualname__`): the dotted lexical path, e.g. `C`,
+    /// `A.B`, `f.<locals>.C`. Empty falls back to `name` (a top-level class).
+    pub qualname: String,
     pub bases: Vec<String>,
     /// The class namespace populated by running the class body.
     pub ns: IndexMap<String, Value>,
@@ -5041,8 +5049,19 @@ impl PyHost {
             }
             Some(PyObj::Class(cname)) => {
                 let cname = cname.clone();
-                if name == "__name__" || name == "__qualname__" {
+                if name == "__name__" {
                     return Ok(self.new_str(cname));
+                }
+                if name == "__qualname__" {
+                    // The dotted path for a nested class (`A.B`); a top-level
+                    // class has none recorded, so its qualname is its name.
+                    let q = self
+                        .classes
+                        .get(&cname)
+                        .map(|c| c.qualname.clone())
+                        .filter(|q| !q.is_empty())
+                        .unwrap_or_else(|| cname.clone());
+                    return Ok(self.new_str(q));
                 }
                 // `cls.__class__` is the metaclass (`type(cls)`): a user metaclass
                 // becomes a `Class`, otherwise the builtin `type`.
@@ -5201,6 +5220,34 @@ impl PyHost {
                     }
                     None => Err(format!(
                         "AttributeError: 'super' object has no attribute '{name}'"
+                    )),
+                }
+            }
+            // Function introspection dunders. `C.m` yields the raw `Func`; a
+            // bound `inst.m` delegates to the same underlying function.
+            Some(PyObj::Func(fv))
+                if matches!(
+                    name,
+                    "__name__" | "__qualname__" | "__module__" | "__defaults__"
+                ) =>
+            {
+                let (def_id, defaults) = (fv.def_id, fv.defaults.clone());
+                self.func_dunder(name, def_id, &defaults)
+            }
+            Some(PyObj::BoundMethod { func, .. })
+                if matches!(
+                    name,
+                    "__name__" | "__qualname__" | "__module__" | "__defaults__"
+                ) =>
+            {
+                let func = func.clone();
+                match self.get(&func) {
+                    Some(PyObj::Func(fv)) => {
+                        let (def_id, defaults) = (fv.def_id, fv.defaults.clone());
+                        self.func_dunder(name, def_id, &defaults)
+                    }
+                    _ => Err(format!(
+                        "AttributeError: 'method' object has no attribute '{name}'"
                     )),
                 }
             }
@@ -5601,6 +5648,9 @@ impl PyHost {
             name.to_string(),
             ClassDef {
                 name: name.to_string(),
+                // Set by `build_class` once known; a bare registration (or an
+                // older cache) leaves it empty, falling back to `name`.
+                qualname: String::new(),
                 bases,
                 ns,
                 mro,
@@ -6431,6 +6481,37 @@ fn too_many_positional(np: usize, ndef: usize, posgiven: usize, kwonly_given: us
 // ── more host operations referenced from builtins ────────────────────────────
 
 impl PyHost {
+    /// Resolve a function introspection dunder to its value: `__name__` /
+    /// `__qualname__` from the `FuncDef`, `__module__` is always `__main__` (the
+    /// script module), and `__defaults__` is the positional-default tuple (or
+    /// `None` when there are none), matching CPython.
+    fn func_dunder(&mut self, name: &str, def_id: usize, defaults: &[Value]) -> Result<Value, String> {
+        match name {
+            "__name__" => {
+                let n = self.funcs[def_id].name.clone();
+                Ok(self.new_str(n))
+            }
+            "__qualname__" => {
+                let d = &self.funcs[def_id];
+                let q = if d.qualname.is_empty() {
+                    d.name.clone()
+                } else {
+                    d.qualname.clone()
+                };
+                Ok(self.new_str(q))
+            }
+            "__module__" => Ok(self.new_str("__main__".to_string())),
+            // `__defaults__`: a tuple of the positional defaults, or `None`.
+            _ => {
+                if defaults.is_empty() {
+                    Ok(Value::Undef)
+                } else {
+                    Ok(self.new_tuple(defaults.to_vec()))
+                }
+            }
+        }
+    }
+
     /// The environment a closure defined in the current frame captures. A class
     /// body is not a lexical scope for its methods (CPython): a function defined
     /// there captures the class body's PARENT env, so `class C: x=1; def m(self):
@@ -6581,6 +6662,15 @@ pub fn build_class(
         Some(m) => metaclass_create(m, name, &bases, &ns)?,
         None => with_host(|h| h.register_class(name, bases, ns.clone())),
     };
+    // Record the class's `__qualname__` (carried on the class-body `FuncDef`,
+    // whose qualname was set to the class's dotted path at compile time).
+    if !def.qualname.is_empty() {
+        with_host(|h| {
+            if let Some(cd) = h.classes.get_mut(name) {
+                cd.qualname = def.qualname.clone();
+            }
+        });
+    }
     // Descriptor protocol: fire `__set_name__(owner, name)` on every class-body
     // value whose type defines it (in definition order).
     for (attr_name, val) in &ns {

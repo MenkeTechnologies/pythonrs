@@ -2697,7 +2697,7 @@ fn gen_scoping(seed: u64) -> Vec<String> {
     let a = pick(r, POSINTS);
     let b = pick(r, POSINTS);
     let n = 2 + r.below(3); // 2..=4, so comprehension/walrus targets always bind
-    match r.below(20) {
+    match r.below(25) {
         // ── LEGB reads ────────────────────────────────────────────────────
         // Local assignment shadows a module global; the global is untouched.
         0 => vec![
@@ -2840,6 +2840,8 @@ fn gen_scoping(seed: u64) -> Vec<String> {
             "    g()".into(),
             "f()".into(),
         ],
+        // `nonlocal` at module level.
+        17 => vec!["nonlocal z".into()],
         // ── class scope is not an enclosing scope ─────────────────────────
         // A method reads the module global, NOT the same-named class attribute
         // (class scope is transparent to method bodies).
@@ -2853,12 +2855,45 @@ fn gen_scoping(seed: u64) -> Vec<String> {
         ],
         // A comprehension in a class body likewise skips the class scope for its
         // body, reading the module global (only its first iterable sees class).
-        _ => vec![
+        19 => vec![
             format!("v = {a}"),
             "class C:".into(),
             format!("    v = {b}"),
             format!("    got = [v for _ in range({n})]"),
             "print(C.got)".into(),
+        ],
+        // ── introspection dunders: __name__ / __qualname__ / __module__ ────
+        // A nested function's `__qualname__` carries the `.<locals>.` marker.
+        20 => vec![
+            "def outer():".into(),
+            "    def inner(): pass".into(),
+            "    return inner".into(),
+            "f = outer()".into(),
+            "print(f.__name__, f.__qualname__, f.__module__)".into(),
+        ],
+        // A method's `__qualname__` is `Class.method`; a nested class nests too.
+        21 => vec![
+            "class A:".into(),
+            "    class B:".into(),
+            "        def m(self): pass".into(),
+            "print(A.__qualname__, A.B.__qualname__, A.B.m.__qualname__)".into(),
+        ],
+        // `__defaults__`: a tuple of the positional defaults.
+        22 => vec![
+            format!("def f(p, q={a}, r={b}): return p"),
+            "print(f.__defaults__)".into(),
+        ],
+        // `__defaults__` is `None` when a function has no positional defaults.
+        23 => vec![
+            "def f(p, *, k): return p".into(),
+            "print(f.__defaults__)".into(),
+        ],
+        // A class nested inside a function records the `.<locals>.` qualname.
+        _ => vec![
+            "def make():".into(),
+            "    class Inner: pass".into(),
+            "    return Inner".into(),
+            "print(make().__qualname__, make().__name__)".into(),
         ],
     }
 }
