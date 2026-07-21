@@ -587,7 +587,10 @@ fn gen_seqtail(seed: u64) -> Vec<String> {
         }
         // 9: list.reverse (in place) + list.sort(key=/reverse=, stable).
         9 => match r.below(4) {
-            0 => vec!["x = [3, 1, 4, 1, 5, 9, 2]".into(), "x.reverse(); print(x)".into()],
+            0 => vec![
+                "x = [3, 1, 4, 1, 5, 9, 2]".into(),
+                "x.reverse(); print(x)".into(),
+            ],
             1 => vec![
                 "x = [3, 1, 4, 1, 5, 9, 2, 6]".into(),
                 "x.sort(); print(x)".into(),
@@ -714,7 +717,9 @@ fn gen_seqtail(seed: u64) -> Vec<String> {
                 2 => format!("({seq})[::2]"),
                 _ => format!("({seq})[{}]", sl(a, b, step)),
             };
-            vec![format!("print(list({e}) if not isinstance({e}, str) else {e})")]
+            vec![format!(
+                "print(list({e}) if not isinstance({e}, str) else {e})"
+            )]
         }
         // 18: list built by repetition then extended-slice assigned / sorted.
         18 => match r.below(3) {
@@ -1014,11 +1019,7 @@ fn gen_augwith(seed: u64) -> Vec<String> {
             let b = pick(r, POSINTS);
             match r.below(3) {
                 0 => vec![format!("x = {a}"), format!("x += {b}"), "print(x)".into()],
-                1 => vec![
-                    "s = 'a'".into(),
-                    "s += 'b'".into(),
-                    "print(s)".into(),
-                ],
+                1 => vec!["s = 'a'".into(), "s += 'b'".into(), "print(s)".into()],
                 _ => vec![
                     "t = (1,)".into(),
                     "u = t".into(),
@@ -1198,7 +1199,9 @@ fn gen_subclass(seed: u64) -> Vec<String> {
             out.push("    def total(self): return sum(self.values())".into());
             out.push(format!("m = MyD({{'{s}': {a}, '{t}': {b}}})"));
             out.push("print(m, m.total(), len(m))".into());
-            out.push(format!("m['{s}'] = {c}; print(m['{s}'], sorted(m.items()))"));
+            out.push(format!(
+                "m['{s}'] = {c}; print(m['{s}'], sorted(m.items()))"
+            ));
         }
         // str subclass with a user method.
         4 => {
@@ -1207,7 +1210,9 @@ fn gen_subclass(seed: u64) -> Vec<String> {
             out.push(format!("u = U('{s}')"));
             out.push("print(u, repr(u), u.shout(), len(u))".into());
             out.push(format!("print(u + '{t}', u[0], u.startswith('{s}'[0]))"));
-            out.push(format!("print(u == '{s}', type(u).__name__, isinstance(u, str))"));
+            out.push(format!(
+                "print(u == '{s}', type(u).__name__, isinstance(u, str))"
+            ));
         }
         // str subclass: replace/find/upper chains.
         5 => {
@@ -1233,7 +1238,9 @@ fn gen_subclass(seed: u64) -> Vec<String> {
             out.push("    pass".into());
             out.push(format!("i = I({b})"));
             out.push("print(i // 2, i % 3, i & 6, i | 1, i ^ 3)".to_string());
-            out.push(format!("print(i + I({a}), type(i * 2).__name__, hash(i) == hash({b}))"));
+            out.push(format!(
+                "print(i + I({a}), type(i * 2).__name__, hash(i) == hash({b}))"
+            ));
         }
         // float subclass.
         8 => {
@@ -1260,7 +1267,9 @@ fn gen_subclass(seed: u64) -> Vec<String> {
             out.push("    pass".into());
             out.push(format!("ss = S([{a}, {b}, {c}, {a}])"));
             out.push(format!("print(sorted(ss), len(ss), {a} in ss)"));
-            out.push(format!("print(sorted(ss | {{{b}, 99}}), sorted(ss & {{{a}, {c}}}))"));
+            out.push(format!(
+                "print(sorted(ss | {{{b}, 99}}), sorted(ss & {{{a}, {c}}}))"
+            ));
             out.push("print(type(ss).__name__, isinstance(ss, set))".into());
         }
         // list subclass with instance attributes + iteration.
@@ -1413,7 +1422,8 @@ fn gen_metatype(seed: u64) -> Vec<String> {
             out.push("class A: pass".into());
             out.push("class B(A): pass".into());
             out.push(
-                "print([x.__name__ for x in B.__bases__], [x.__name__ for x in A.__bases__])".into(),
+                "print([x.__name__ for x in B.__bases__], [x.__name__ for x in A.__bases__])"
+                    .into(),
             );
         }
         9 => {
@@ -2434,7 +2444,9 @@ fn gen_complexnum(seed: u64) -> Vec<String> {
 fn gen_numedge(seed: u64) -> Vec<String> {
     let r = &mut Rng::new(seed);
     // Small signed ints and floats with deterministic reprs.
-    const SI: &[&str] = &["7", "-7", "3", "-3", "10", "-10", "42", "-42", "1", "-1", "0"];
+    const SI: &[&str] = &[
+        "7", "-7", "3", "-3", "10", "-10", "42", "-42", "1", "-1", "0",
+    ];
     const SD: &[&str] = &["3", "-3", "2", "-2", "4", "-4", "5", "-5"];
     const FL: &[&str] = &[
         "7.5", "-7.5", "2.5", "-2.5", "0.5", "-0.5", "10.25", "-10.25", "3.0", "1.5",
@@ -2990,11 +3002,7 @@ fn gen_scoping(seed: u64) -> Vec<String> {
             "f()".into(),
         ],
         // Aug-assign of a never-bound local.
-        13 => vec![
-            "def f():".into(),
-            format!("    x += {a}"),
-            "f()".into(),
-        ],
+        13 => vec!["def f():".into(), format!("    x += {a}"), "f()".into()],
         // A name bound only on an untaken branch is still local (→ unbound).
         14 => vec![
             "def f(c):".into(),
@@ -3228,14 +3236,8 @@ fn gen_calls(seed: u64) -> Vec<String> {
         ],
         // Missing required keyword-only argument(s).
         21 => match r.below(2) {
-            0 => vec![
-                "def f(a, *, k): return 0".into(),
-                format!("print(f({a}))"),
-            ],
-            _ => vec![
-                "def f(*, k, m): return 0".into(),
-                "print(f())".into(),
-            ],
+            0 => vec!["def f(a, *, k): return 0".into(), format!("print(f({a}))")],
+            _ => vec!["def f(*, k, m): return 0".into(), "print(f())".into()],
         },
         // Duplicate keyword via `**` merge / keyword + `**` (multiple values).
         22 => match r.below(2) {
@@ -3556,11 +3558,30 @@ fn gen_strformat(seed: u64) -> Vec<String> {
     let r = &mut Rng::new(seed);
     // Larger magnitudes so grouping is actually exercised.
     const GINTS: &[&str] = &[
-        "0", "5", "42", "255", "1234", "1000000", "1234567", "-1234", "-1000000", "1234567890",
-        "-42", "999", "1000", "65535",
+        "0",
+        "5",
+        "42",
+        "255",
+        "1234",
+        "1000000",
+        "1234567",
+        "-1234",
+        "-1000000",
+        "1234567890",
+        "-42",
+        "999",
+        "1000",
+        "65535",
     ];
     const GFLOATS: &[&str] = &[
-        "1234.5", "1234567.891", "-1234.5", "0.5", "1000000.25", "-9999.99", "12345.678", "0.0",
+        "1234.5",
+        "1234567.891",
+        "-1234.5",
+        "0.5",
+        "1000000.25",
+        "-9999.99",
+        "12345.678",
+        "0.0",
     ];
     let gi = pick(r, GINTS);
     let gi2 = pick(r, GINTS);
@@ -4280,9 +4301,11 @@ fn gen_itertail(seed: u64) -> Vec<String> {
             "class L:".into(),
             format!("    def __len__(self): return {}", 3 + (r.below(5) as i64)),
             "print(len(L()))".into(),
-            format!("print(len(range({start}, {stop})))",
+            format!(
+                "print(len(range({start}, {stop})))",
                 start = pick(r, &["0", "2", "5"]),
-                stop = pick(r, &["8", "10", "3"])),
+                stop = pick(r, &["8", "10", "3"])
+            ),
             "it = iter(range(5))".into(),
             "print(next(it))".into(),
             "print(list(it))".into(),
@@ -4313,21 +4336,21 @@ fn gen_display(seed: u64) -> Vec<String> {
         "'plain'",
         "''",
         "'a b c'",
-        "chr(39)",                            // '  -> repr uses "..."
-        "chr(34)",                            // "  -> repr uses '...'
-        "chr(39)+chr(34)",                    // both -> '...' with \' escapes
-        "chr(92)",                            // backslash
-        "chr(10)",                            // newline
-        "chr(9)",                             // tab
-        "chr(13)",                            // CR
-        "chr(7)",                             // bell -> \x07
-        "chr(0)",                             // NUL -> \x00
-        "chr(127)",                           // DEL
-        "chr(233)",                           // é (non-ascii)
-        "'x'+chr(39)+'y'",                    // embedded '
-        "'x'+chr(34)+'y'",                    // embedded "
-        "'q'+chr(39)+chr(34)+'r'",            // both embedded
-        "'日本'",                              // wide non-ascii
+        "chr(39)",                 // '  -> repr uses "..."
+        "chr(34)",                 // "  -> repr uses '...'
+        "chr(39)+chr(34)",         // both -> '...' with \' escapes
+        "chr(92)",                 // backslash
+        "chr(10)",                 // newline
+        "chr(9)",                  // tab
+        "chr(13)",                 // CR
+        "chr(7)",                  // bell -> \x07
+        "chr(0)",                  // NUL -> \x00
+        "chr(127)",                // DEL
+        "chr(233)",                // é (non-ascii)
+        "'x'+chr(39)+'y'",         // embedded '
+        "'x'+chr(34)+'y'",         // embedded "
+        "'q'+chr(39)+chr(34)+'r'", // both embedded
+        "'日本'",                  // wide non-ascii
     ];
     const SCALARS: &[&str] = &[
         "0", "1", "-1", "42", "-100", "1000000", "True", "False", "None", "0.0", "-0.0", "0.1",
@@ -4411,11 +4434,7 @@ fn gen_display(seed: u64) -> Vec<String> {
         // 7: reference-cycle recursion markers.
         7 => match r.below(5) {
             0 => vec!["a = [1, 2]".into(), "a.append(a)".into(), "print(a)".into()],
-            1 => vec![
-                "d = {}".into(),
-                "d['self'] = d".into(),
-                "print(d)".into(),
-            ],
+            1 => vec!["d = {}".into(), "d['self'] = d".into(), "print(d)".into()],
             2 => vec![
                 "a = []".into(),
                 "b = []".into(),

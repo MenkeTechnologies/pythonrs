@@ -198,8 +198,8 @@ fn median(h: &mut PyHost, args: &[Value]) -> Result<Value, String> {
         // Even count: (a + b) / 2 — true division, always a float.
         let a = as_f64(h, &sorted[n / 2 - 1])
             .ok_or_else(|| type_error("median requires numeric data"))?;
-        let b = as_f64(h, &sorted[n / 2])
-            .ok_or_else(|| type_error("median requires numeric data"))?;
+        let b =
+            as_f64(h, &sorted[n / 2]).ok_or_else(|| type_error("median requires numeric data"))?;
         Ok(Value::Float((a + b) / 2.0))
     }
 }
@@ -264,11 +264,7 @@ enum Variance {
     Float(f64),
 }
 
-fn compute_variance(
-    h: &PyHost,
-    items: &[Value],
-    sample: bool,
-) -> Result<Variance, String> {
+fn compute_variance(h: &PyHost, items: &[Value], sample: bool) -> Result<Variance, String> {
     let n = items.len() as i128;
     if all_small_int(h, items) {
         let sx: i128 = items.iter().map(|v| h.as_int(v).unwrap() as i128).sum();

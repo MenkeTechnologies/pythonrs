@@ -2278,7 +2278,10 @@ fn b_match_class(vm: &mut VM, argc: u8) -> Value {
                 None => Vec::new(),
             };
             if npos > names.len() {
-                return abort(vm, host::type_error(&match_pos_msg(&cname, names.len(), npos)));
+                return abort(
+                    vm,
+                    host::type_error(&match_pos_msg(&cname, names.len(), npos)),
+                );
             }
             for i in 0..npos {
                 let attr = match names.get(i) {
@@ -3357,7 +3360,9 @@ pub fn call_builtin_function(
                 .unwrap_or_else(|| "r".into());
             host::open_file(&path, &mode)
         }
-        "object" => Ok(with_host(|h| h.new_instance("object".into(), IndexMap::new()))),
+        "object" => Ok(with_host(|h| {
+            h.new_instance("object".into(), IndexMap::new())
+        })),
         _ => Err(host::name_error(name)),
     }
 }
@@ -3394,7 +3399,11 @@ fn pow_mod(a: &Value, b: &Value, m: &Value) -> Result<Value, String> {
     // `pow(base, -k, m) == pow(modinv(base, m), k, m)`.
     let (base, exp) = if exp < zero {
         use num_integer::Integer;
-        let m_abs = if modulus < zero { -&modulus } else { modulus.clone() };
+        let m_abs = if modulus < zero {
+            -&modulus
+        } else {
+            modulus.clone()
+        };
         let base_r = base.mod_floor(&m_abs);
         let egcd = base_r.extended_gcd(&m_abs);
         if egcd.gcd != BigInt::from(1) {
@@ -4251,11 +4260,7 @@ fn issubclass_dispatch(sub: &Value, cls: &Value) -> Result<bool, String> {
     }
     let a = match with_host(|h| callable_name(h, sub)) {
         Some(n) => n,
-        None => {
-            return Err(host::type_error(
-                "issubclass() arg 1 must be a class",
-            ))
-        }
+        None => return Err(host::type_error("issubclass() arg 1 must be a class")),
     };
     let b = with_host(|h| callable_name(h, cls)).unwrap_or_default();
     Ok(with_host(|h| type_isa(h, &a, &b)))
@@ -4955,9 +4960,7 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
         "isalnum" => Ok(Value::Bool(
             !s.is_empty() && s.chars().all(|c| c.is_alphanumeric()),
         )),
-        "isspace" => Ok(Value::Bool(
-            !s.is_empty() && s.chars().all(is_py_space),
-        )),
+        "isspace" => Ok(Value::Bool(!s.is_empty() && s.chars().all(is_py_space))),
         "isupper" => Ok(Value::Bool(
             s.chars().any(|c| c.is_alphabetic())
                 && s.chars()
@@ -5245,8 +5248,10 @@ fn is_py_space(c: char) -> bool {
 /// `Other_ID_Continue` set (U+00B7, U+0387, U+1369..U+1371, U+19DA) plus the
 /// zero-width joiner / non-joiner (U+200C/U+200D), which PEP 3131 permits.
 fn is_other_id_continue(c: char) -> bool {
-    matches!(c,
-        '\u{00b7}' | '\u{0387}' | '\u{1369}'..='\u{1371}' | '\u{19da}' | '\u{200c}' | '\u{200d}')
+    matches!(
+        c,
+        '\u{00b7}' | '\u{0387}' | '\u{1369}'..='\u{1371}' | '\u{19da}' | '\u{200c}' | '\u{200d}'
+    )
 }
 
 /// CPython `str.isidentifier` (approximated with Rust's Unicode categories plus
@@ -5532,9 +5537,11 @@ fn resolve_format_arg(
     let base: String = nchars[..i].iter().collect();
     let mut val = if base.is_empty() {
         if st.manual == Some(true) {
-            return Err("ValueError: cannot switch from manual field specification to \
+            return Err(
+                "ValueError: cannot switch from manual field specification to \
                         automatic field numbering"
-                .into());
+                    .into(),
+            );
         }
         st.manual = Some(false);
         let v = args
@@ -5545,9 +5552,11 @@ fn resolve_format_arg(
         v
     } else if let Ok(n) = base.parse::<usize>() {
         if st.manual == Some(false) {
-            return Err("ValueError: cannot switch from automatic field numbering to \
+            return Err(
+                "ValueError: cannot switch from automatic field numbering to \
                         manual field specification"
-                .into());
+                    .into(),
+            );
         }
         st.manual = Some(true);
         args.get(n)
@@ -6772,11 +6781,15 @@ fn decode_error(out: &mut String, bad: &[u8], errors: &str, codec: &str) -> Resu
             }
             Ok(())
         }
-        "strict" => Err(format!("UnicodeDecodeError: '{codec}' codec can't decode byte")),
+        "strict" => Err(format!(
+            "UnicodeDecodeError: '{codec}' codec can't decode byte"
+        )),
         "namereplace" | "xmlcharrefreplace" => Err(
             "TypeError: don't know how to handle UnicodeDecodeError in error callback".to_string(),
         ),
-        _ => Err(format!("LookupError: unknown error handler name '{errors}'")),
+        _ => Err(format!(
+            "LookupError: unknown error handler name '{errors}'"
+        )),
     }
 }
 
@@ -6811,7 +6824,11 @@ fn encode_str(s: &str, encoding: &str, errors: &str) -> Result<Vec<u8>, String> 
             }
             Ok(out)
         }
-        "utf16" | "utf16le" | "utf16be" | "u16" | "unicodelittleunmarked"
+        "utf16"
+        | "utf16le"
+        | "utf16be"
+        | "u16"
+        | "unicodelittleunmarked"
         | "unicodebigunmarked" => {
             let be = norm.ends_with("be") || norm == "unicodebigunmarked";
             let bom = matches!(norm.as_str(), "utf16" | "u16");
@@ -8529,9 +8546,7 @@ fn validate_format_spec(
             );
         }
         if align_explicit && align == '=' {
-            return Err(
-                "ValueError: '=' alignment not allowed in string format specifier".into(),
-            );
+            return Err("ValueError: '=' alignment not allowed in string format specifier".into());
         }
         if let Some(g) = group {
             return Err(format!("ValueError: Cannot specify '{g}' with 's'."));
@@ -8641,4 +8656,3 @@ fn as_i(v: &Value) -> Option<i64> {
 fn is_str(v: &Value) -> bool {
     matches!(v, Value::Str(_)) || with_host(|h| h.as_str(v).is_some())
 }
-

@@ -63,7 +63,10 @@ fn augassign_list_iadd_extends_in_place() {
         "True"
     );
     assert_eq!(g("l = [1, 2]\nl += [3, 4]", "l"), "[1, 2, 3, 4]");
-    assert_eq!(g("l = [1]\nl += (x for x in range(3))", "l"), "[1, 0, 1, 2]");
+    assert_eq!(
+        g("l = [1]\nl += (x for x in range(3))", "l"),
+        "[1, 0, 1, 2]"
+    );
     assert_eq!(g("l = [1]\nl += 'ab'", "l"), "[1, 'a', 'b']");
 }
 
@@ -82,7 +85,10 @@ fn augassign_immutable_types_rebind_new_value() {
     assert_eq!(g("s = 'a'\ns += 'b'", "s"), "'ab'");
     assert_eq!(g("t = (1,)\nt += (2,)", "t"), "(1, 2)");
     // A tuple never mutates: the original binding is untouched.
-    assert_eq!(g("t = (1,)\nu = t\nt += (2,)\nsame = u is t", "same"), "False");
+    assert_eq!(
+        g("t = (1,)\nu = t\nt += (2,)\nsame = u is t", "same"),
+        "False"
+    );
 }
 
 #[test]
@@ -112,10 +118,16 @@ fn augassign_dict_ior_updates_in_place() {
 #[test]
 fn augassign_bytearray_iadd_extends_in_place() {
     assert_eq!(
-        g("b = bytearray(b'ab')\nm = b\nb += b'cd'\nsame = m is b", "same"),
+        g(
+            "b = bytearray(b'ab')\nm = b\nb += b'cd'\nsame = m is b",
+            "same"
+        ),
         "True"
     );
-    assert_eq!(g("b = bytearray(b'ab')\nb += b'cd'", "b"), "bytearray(b'abcd')");
+    assert_eq!(
+        g("b = bytearray(b'ab')\nb += b'cd'", "b"),
+        "bytearray(b'abcd')"
+    );
 }
 
 #[test]

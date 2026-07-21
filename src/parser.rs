@@ -1871,7 +1871,11 @@ fn find_debug_eq(field: &str) -> Option<usize> {
             b':' if depth == 0 => return None,
             b'=' if depth == 0 => {
                 let next = bytes.get(i + 1).copied();
-                let prev = if i > 0 { bytes.get(i - 1).copied() } else { None };
+                let prev = if i > 0 {
+                    bytes.get(i - 1).copied()
+                } else {
+                    None
+                };
                 let is_eqeq = next == Some(b'=');
                 let is_cmp = matches!(
                     prev,
