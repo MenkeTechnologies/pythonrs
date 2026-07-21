@@ -220,6 +220,93 @@ fn uncaught_traceback_shape() {
 }
 
 #[test]
+fn uncaught_traceback_explicit_cause_chain() {
+    // `raise X from Y` renders both blocks: the cause first (its own frames), the
+    // CPython connector line, then the raising exception. Caret markers omitted.
+    let src = "try:\n    int(\"bad\")\nexcept ValueError as e:\n    raise RuntimeError(\"wrapped\") from e\n";
+    let r = run_program(
+        src,
+        vec!["t.py".into()],
+        Some("/t.py".into()),
+        "/t.py",
+        true,
+    );
+    assert_eq!(r.exit_code, 1);
+    let tb = r.stderr.expect("expected a traceback on stderr");
+    let expected = concat!(
+        "Traceback (most recent call last):\n",
+        "  File \"/t.py\", line 2, in <module>\n",
+        "    int(\"bad\")\n",
+        "ValueError: invalid literal for int() with base 10: 'bad'\n",
+        "\n",
+        "The above exception was the direct cause of the following exception:\n",
+        "\n",
+        "Traceback (most recent call last):\n",
+        "  File \"/t.py\", line 4, in <module>\n",
+        "    raise RuntimeError(\"wrapped\") from e\n",
+        "RuntimeError: wrapped\n",
+    );
+    assert_eq!(tb, expected);
+}
+
+#[test]
+fn uncaught_traceback_implicit_context_chain() {
+    // An exception raised while handling another (no `from`) chains via
+    // `__context__` with the "During handling …" connector, including the frames
+    // of the function where the original exception was raised.
+    let src = "def parse(s):\n    return int(s)\n\ntry:\n    parse(\"xyz\")\nexcept ValueError:\n    raise RuntimeError(\"handler failed\")\n";
+    let r = run_program(
+        src,
+        vec!["t.py".into()],
+        Some("/t.py".into()),
+        "/t.py",
+        true,
+    );
+    assert_eq!(r.exit_code, 1);
+    let tb = r.stderr.expect("expected a traceback on stderr");
+    let expected = concat!(
+        "Traceback (most recent call last):\n",
+        "  File \"/t.py\", line 5, in <module>\n",
+        "    parse(\"xyz\")\n",
+        "  File \"/t.py\", line 2, in parse\n",
+        "    return int(s)\n",
+        "ValueError: invalid literal for int() with base 10: 'xyz'\n",
+        "\n",
+        "During handling of the above exception, another exception occurred:\n",
+        "\n",
+        "Traceback (most recent call last):\n",
+        "  File \"/t.py\", line 7, in <module>\n",
+        "    raise RuntimeError(\"handler failed\")\n",
+        "RuntimeError: handler failed\n",
+    );
+    assert_eq!(tb, expected);
+}
+
+#[test]
+fn uncaught_traceback_from_none_suppresses_context() {
+    // `raise X from None` sets `__suppress_context__`, so the implicit context is
+    // hidden — only the raising exception's block prints.
+    let src =
+        "try:\n    int(\"bad\")\nexcept ValueError:\n    raise RuntimeError(\"clean\") from None\n";
+    let r = run_program(
+        src,
+        vec!["t.py".into()],
+        Some("/t.py".into()),
+        "/t.py",
+        true,
+    );
+    assert_eq!(r.exit_code, 1);
+    let tb = r.stderr.expect("expected a traceback on stderr");
+    let expected = concat!(
+        "Traceback (most recent call last):\n",
+        "  File \"/t.py\", line 4, in <module>\n",
+        "    raise RuntimeError(\"clean\") from None\n",
+        "RuntimeError: clean\n",
+    );
+    assert_eq!(tb, expected);
+}
+
+#[test]
 fn stdin_traceback_omits_source_lines() {
     // Source text is unavailable for stdin, so only the frame headers show.
     let r = run_program(

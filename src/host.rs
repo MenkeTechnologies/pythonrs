@@ -733,6 +733,15 @@ pub struct PyHost {
     /// `.0` = `__cause__` (`raise X from Y`), `.1` = `__context__` (the
     /// exception being handled when this one was raised). `Value::Undef` = unset.
     pub exc_links: HashMap<u32, (Value, Value)>,
+    /// Per-exception traceback frames (`__traceback__`), keyed by the exception's
+    /// heap index: the outermost-first `(scope, line)` stack captured when the
+    /// exception is caught. Used to render `__cause__`/`__context__` chain blocks
+    /// in an uncaught traceback (the final exception uses the live `traceback`).
+    pub exc_tb: HashMap<u32, Vec<(String, u32)>>,
+    /// Exception heap ids raised with an explicit `from` clause (`raise X from Y`
+    /// or `raise X from None`), which sets `__suppress_context__` — the implicit
+    /// `__context__` is then hidden from the rendered traceback.
+    pub suppress_context: HashSet<u32>,
     /// Process arguments exposed to the program as `sys.argv`. Set once per run
     /// by `init_runtime` (`['']` for the REPL/stdin default, `['script', …]` for
     /// a file, `['-c', …]` for `-c`).
@@ -929,6 +938,8 @@ impl PyHost {
             lru_caches: Vec::new(),
             total_ordering: HashSet::new(),
             exc_links: HashMap::new(),
+            exc_tb: HashMap::new(),
+            suppress_context: HashSet::new(),
             argv: vec![String::new()],
             main_file: None,
             prog_source: String::new(),
@@ -1280,6 +1291,24 @@ impl PyHost {
         if let Some(f) = self.frames.last() {
             self.traceback.push((f.name.clone(), f.line));
         }
+    }
+    /// Snapshot `exc`'s traceback (outermost-first) into `exc_tb`, just before the
+    /// caught exception's live `traceback` is cleared. The exception's own trace
+    /// runs from the frame that *catches* it (the innermost still-active frame,
+    /// where the `try` lives) down to the raise point — frames *above* the catcher
+    /// (its callers) are not part of this exception's trace, since it was caught
+    /// before reaching them. Lets an uncaught traceback later render this
+    /// exception's frames when it appears as a `__cause__`/`__context__`.
+    pub fn capture_exc_tb(&mut self, exc: &Value) {
+        let Value::Obj(id) = exc else { return };
+        let mut tb: Vec<(String, u32)> = Vec::new();
+        if let Some(f) = self.frames.last() {
+            tb.push((f.name.clone(), f.line));
+        }
+        for f in self.traceback.iter().rev() {
+            tb.push(f.clone());
+        }
+        self.exc_tb.insert(*id, tb);
     }
     /// The call stack as (frame name, line) pairs, innermost first — for the DAP
     /// `stackTrace`. `owner` carries the function/class name where known.
@@ -5683,6 +5712,12 @@ impl PyHost {
                 }
             }
             Some(PyObj::Exception { class, args }) => {
+                if name == "__class__" {
+                    // The exception's type object (`e.__class__ is ValueError`,
+                    // `e.__class__.__name__`).
+                    let c = class.clone();
+                    return Ok(self.alloc(PyObj::Builtin(c)));
+                }
                 if name == "args" {
                     let a = args.clone();
                     return Ok(self.new_tuple(a));
@@ -5711,9 +5746,11 @@ impl PyHost {
                     return Ok(self.exc_link(recv).1);
                 }
                 if name == "__suppress_context__" {
-                    // True iff an explicit cause was set (`raise X from Y`).
-                    let has_cause = !matches!(self.exc_link(recv).0, Value::Undef);
-                    return Ok(Value::Bool(has_cause));
+                    // True iff raised with any explicit `from` clause (`raise X
+                    // from Y` or `raise X from None`).
+                    let suppressed =
+                        matches!(recv, Value::Obj(id) if self.suppress_context.contains(id));
+                    return Ok(Value::Bool(suppressed));
                 }
                 let class = class.clone();
                 Err(format!(
@@ -7944,22 +7981,74 @@ fn system_exit_outcome(h: &mut PyHost, args: &[Value]) -> TopExit {
 
 impl PyHost {
     /// Render a CPython `Traceback (most recent call last):` block for an uncaught
-    /// exception, ending with `err`. Frames run outermost (module) first; source
-    /// lines are shown unless the program came from stdin. Caret markers are
-    /// omitted (approximate for a first pass).
+    /// exception, ending with `err`, including any `__cause__`/`__context__` chain
+    /// (oldest exception first, joined by CPython's connector lines). Frames run
+    /// outermost (module) first; source lines are shown unless the program came
+    /// from stdin. Caret markers are omitted (approximate for a first pass).
     pub fn render_traceback(&self, err: &str) -> String {
-        let mut out = String::from("Traceback (most recent call last):\n");
-        // Outermost = the module frame still on the stack; then the function
-        // frames captured innermost-first as the exception unwound, reversed.
-        let mut frames: Vec<(String, u32)> = Vec::new();
+        // The final (uncaught) exception's frames: the module frame still on the
+        // stack, then the function frames it unwound past (innermost-first),
+        // reversed to outermost-first.
+        let mut final_frames: Vec<(String, u32)> = Vec::new();
         if let Some(f) = self.frames.first() {
-            frames.push((f.name.clone(), f.line));
+            final_frames.push((f.name.clone(), f.line));
         }
         for f in self.traceback.iter().rev() {
-            frames.push(f.clone());
+            final_frames.push(f.clone());
         }
+        // Walk the chain backwards from the final exception. Each ancestor carries
+        // the connector line that introduces the *next-newer* exception. Prefer an
+        // explicit `__cause__` (`raise X from Y`, which also suppresses context);
+        // otherwise an implicit `__context__`.
+        const CAUSE: &str =
+            "\nThe above exception was the direct cause of the following exception:\n\n";
+        const CONTEXT: &str =
+            "\nDuring handling of the above exception, another exception occurred:\n\n";
+        let mut ancestors: Vec<(Value, &'static str)> = Vec::new();
+        if let Some(final_exc) = &self.exc {
+            let mut cur = final_exc.clone();
+            let mut seen: HashSet<u32> = HashSet::new();
+            loop {
+                if let Value::Obj(id) = cur {
+                    if !seen.insert(id) {
+                        break;
+                    }
+                }
+                let (cause, context) = self.exc_link(&cur);
+                let suppressed =
+                    matches!(&cur, Value::Obj(id) if self.suppress_context.contains(id));
+                let (pred, connector) = if !matches!(cause, Value::Undef) {
+                    (cause, CAUSE)
+                } else if !suppressed && !matches!(context, Value::Undef) {
+                    (context, CONTEXT)
+                } else {
+                    break;
+                };
+                ancestors.push((pred.clone(), connector));
+                cur = pred;
+            }
+        }
+        // Ancestors are collected newest-first; render oldest-first, each followed
+        // by its connector, then the final exception's own block.
+        let mut out = String::new();
+        for (exc, connector) in ancestors.iter().rev() {
+            let frames = match exc {
+                Value::Obj(id) => self.exc_tb.get(id).cloned().unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            out.push_str(&self.render_one_tb(&frames, &self.exc_final_line(exc)));
+            out.push_str(connector);
+        }
+        out.push_str(&self.render_one_tb(&final_frames, err));
+        out
+    }
+
+    /// Render one `Traceback (most recent call last):` block: the `frames`
+    /// (outermost-first) followed by the terse `final_line`.
+    fn render_one_tb(&self, frames: &[(String, u32)], final_line: &str) -> String {
+        let mut out = String::from("Traceback (most recent call last):\n");
         let src_lines: Vec<&str> = self.prog_source.lines().collect();
-        for (name, line) in &frames {
+        for (name, line) in frames {
             out.push_str(&format!(
                 "  File \"{}\", line {}, in {}\n",
                 self.tb_filename, line, name
@@ -7973,9 +8062,24 @@ impl PyHost {
                 }
             }
         }
-        out.push_str(err);
+        out.push_str(final_line);
         out.push('\n');
         out
+    }
+
+    /// The terse `ExcType: message` line for a chained exception object (a bare
+    /// `ExcType` when it has no message). Empty for a non-exception value.
+    fn exc_final_line(&self, exc: &Value) -> String {
+        match self.get(exc) {
+            Some(PyObj::Exception { class, args }) => {
+                join_exc(class, &self.exc_message(class, args))
+            }
+            Some(PyObj::Instance(i)) if self.class_is_exception(&i.class) => {
+                let a = self.exc_instance_args(&i.dict);
+                join_exc(&i.class, &self.exc_message(&i.class, &a))
+            }
+            _ => String::new(),
+        }
     }
 }
 

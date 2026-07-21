@@ -71,13 +71,17 @@ fixed. Every line below was re-checked against the **default-build** binary
 - **User exception subclasses** inherit `BaseException`: `class E(Exception)`
   instances carry `args` (seeded by construction / `super().__init__` / direct
   assignment), stringify to the message (`''`/`str(arg)`/`repr(tuple)`), repr as
-  `E(arg, …)`, and expose `.args`; `str()` uses the message even when a user
-  `__repr__` exists. An uncaught exception prints CPython's
-  `Traceback (most recent call last):` block — header, `  File "<path>", line N,
-  in <scope>` + source line per frame (outermost first), then `ErrorType: message`
-  (caret `^^^` markers omitted for now). **Exception chaining**
-  `raise X from Y` records `__cause__` (verified: `v.__cause__` is the `from`
-  operand).
+  `E(arg, …)`, and expose `.args` and `.__class__` (the type object); `str()` uses
+  the message even when a user `__repr__` exists. An uncaught exception prints
+  CPython's `Traceback (most recent call last):` block — header, `  File "<path>",
+  line N, in <scope>` + source line per frame (outermost first), then
+  `ErrorType: message` (caret `^^^` markers omitted for now). **Exception
+  chaining** renders in full: `raise X from Y` records `__cause__` and prints the
+  cause's own block followed by "The above exception was the direct cause …"; an
+  exception raised while handling another chains via `__context__` ("During
+  handling of the above exception …"); `raise X from None` sets
+  `__suppress_context__`, hiding the implicit context. Each chained exception's
+  frames are captured (`__traceback__`) at the point it is caught.
 - **Object model**: `complex` (`(1+2j)*(3-1j)`, `.real`/`.imag`, `abs`),
   `frozenset` (immutable, hashable, set algebra), **metaclasses**
   (`class A(metaclass=M)`, `M.__new__`/`__init__`; `type(A) is M`), `property`

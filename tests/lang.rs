@@ -2663,6 +2663,35 @@ fn ellipsis_singleton() {
     assert_eq!(g("x = [..., 1, ...].count(...)", "x"), "2");
 }
 
+/// A builtin exception instance exposes `__class__` as its type object, so
+/// `e.__class__ is ValueError`, `e.__class__.__name__`, and the `__cause__`/
+/// `__context__`/`__suppress_context__` chaining attributes all resolve.
+#[test]
+fn exception_class_and_chain_attrs() {
+    assert_eq!(
+        g("x = ValueError('x').__class__.__name__", "x"),
+        "'ValueError'"
+    );
+    assert_eq!(
+        g("x = (ValueError('x').__class__ is ValueError)", "x"),
+        "True"
+    );
+    assert_eq!(
+        g(
+            "try:\n try: int('x')\n except ValueError: raise RuntimeError('a') from None\nexcept RuntimeError as e:\n x = (e.__suppress_context__, e.__cause__, type(e.__context__).__name__)",
+            "x"
+        ),
+        "(True, None, 'ValueError')"
+    );
+    assert_eq!(
+        g(
+            "try:\n try: int('x')\n except ValueError: raise RuntimeError('b')\nexcept RuntimeError as e:\n x = e.__suppress_context__",
+            "x"
+        ),
+        "False"
+    );
+}
+
 /// Unbound builtin methods reached via a type object: `str.lower`, `list.append`,
 /// `dict.get`. Callable with an explicit receiver (`str.lower("HI")`), usable as
 /// a `key=`/`map` function, and repr as `<method '…' of '…' objects>`. Also the
