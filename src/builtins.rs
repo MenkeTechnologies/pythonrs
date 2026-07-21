@@ -2552,37 +2552,54 @@ fn py_repr(v: &Value) -> Result<String, String> {
     let reprs =
         |elems: &[Value]| -> Result<Vec<String>, String> { elems.iter().map(py_repr).collect() };
     if let Some(cont) = cont {
-        return Ok(match cont {
-            Cont::List(e) => format!("[{}]", reprs(&e)?.join(", ")),
-            Cont::Tuple(e, Some((type_name, fields))) => {
-                let p = reprs(&e)?;
-                let inner: Vec<String> = fields
-                    .iter()
-                    .zip(p.iter())
-                    .map(|(f, x)| format!("{f}={x}"))
-                    .collect();
-                format!("{type_name}({})", inner.join(", "))
-            }
-            Cont::Tuple(e, None) => {
-                let p = reprs(&e)?;
-                if p.len() == 1 {
-                    format!("({},)", p[0])
-                } else {
-                    format!("({})", p.join(", "))
+        // Reference-cycle guard: a container that (transitively) contains itself
+        // must emit CPython's recursion marker instead of recursing forever.
+        let id = if let Value::Obj(i) = v { *i } else { 0 };
+        let marker = match &cont {
+            Cont::List(_) => "[...]",
+            Cont::Tuple(..) => "(...)",
+            Cont::Set(_) | Cont::Dict(_) => "{...}",
+            Cont::Frozenset(_) => "frozenset(...)",
+        };
+        if host::repr_guard_enter(id) {
+            return Ok(marker.to_string());
+        }
+        let build = || -> Result<String, String> {
+            Ok(match cont {
+                Cont::List(e) => format!("[{}]", reprs(&e)?.join(", ")),
+                Cont::Tuple(e, Some((type_name, fields))) => {
+                    let p = reprs(&e)?;
+                    let inner: Vec<String> = fields
+                        .iter()
+                        .zip(p.iter())
+                        .map(|(f, x)| format!("{f}={x}"))
+                        .collect();
+                    format!("{type_name}({})", inner.join(", "))
                 }
-            }
-            Cont::Set(e) if e.is_empty() => "set()".into(),
-            Cont::Set(e) => format!("{{{}}}", reprs(&e)?.join(", ")),
-            Cont::Frozenset(e) if e.is_empty() => "frozenset()".into(),
-            Cont::Frozenset(e) => format!("frozenset({{{}}})", reprs(&e)?.join(", ")),
-            Cont::Dict(pairs) => {
-                let mut p = Vec::with_capacity(pairs.len());
-                for (k, val) in &pairs {
-                    p.push(format!("{}: {}", py_repr(k)?, py_repr(val)?));
+                Cont::Tuple(e, None) => {
+                    let p = reprs(&e)?;
+                    if p.len() == 1 {
+                        format!("({},)", p[0])
+                    } else {
+                        format!("({})", p.join(", "))
+                    }
                 }
-                format!("{{{}}}", p.join(", "))
-            }
-        });
+                Cont::Set(e) if e.is_empty() => "set()".into(),
+                Cont::Set(e) => format!("{{{}}}", reprs(&e)?.join(", ")),
+                Cont::Frozenset(e) if e.is_empty() => "frozenset()".into(),
+                Cont::Frozenset(e) => format!("frozenset({{{}}})", reprs(&e)?.join(", ")),
+                Cont::Dict(pairs) => {
+                    let mut p = Vec::with_capacity(pairs.len());
+                    for (k, val) in &pairs {
+                        p.push(format!("{}: {}", py_repr(k)?, py_repr(val)?));
+                    }
+                    format!("{{{}}}", p.join(", "))
+                }
+            })
+        };
+        let result = build();
+        host::repr_guard_leave(id);
+        return result;
     }
     Ok(with_host(|h| h.repr_of(v)))
 }

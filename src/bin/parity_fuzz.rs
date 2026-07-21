@@ -3897,6 +3897,236 @@ fn gen_itertail(seed: u64) -> Vec<String> {
     }
 }
 
+/// The print / repr / str DISPLAY protocol: `print(*args, sep=, end=, file=)`
+/// (custom separators/terminators, multiple args, `sys.stderr` routing, empty
+/// print), the `repr` vs `str` distinction and str→repr fallback, container
+/// `repr` recursing through ELEMENT `__repr__`, the reference-cycle recursion
+/// markers (`[...]`/`{...}`/`(...)`), `repr` of every builtin type (str quote
+/// choice, shortest-round-trip float, bool, None, 1-tuple trailing comma, bytes,
+/// empty containers), `object.__repr__`'s default `<__main__.Cls object at 0x…>`
+/// form, `ascii()`, and `format(obj)` with an empty spec == `str(obj)`.
+///
+/// Object identity addresses are nondeterministic, so the default-`__repr__`
+/// cases NEVER print the raw address — they assert the `startswith`/`endswith`
+/// shape (booleans) or compare two reprs of the SAME object (address cancels).
+/// Every other probe is exact.
+fn gen_display(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    // Python-source expressions each producing a string whose repr exercises a
+    // quote-choice / escaping branch. Built with `chr()` so the Rust source is
+    // free of quote-escaping hazards.
+    const STREXPRS: &[&str] = &[
+        "'plain'",
+        "''",
+        "'a b c'",
+        "chr(39)",                            // '  -> repr uses "..."
+        "chr(34)",                            // "  -> repr uses '...'
+        "chr(39)+chr(34)",                    // both -> '...' with \' escapes
+        "chr(92)",                            // backslash
+        "chr(10)",                            // newline
+        "chr(9)",                             // tab
+        "chr(13)",                            // CR
+        "chr(7)",                             // bell -> \x07
+        "chr(0)",                             // NUL -> \x00
+        "chr(127)",                           // DEL
+        "chr(233)",                           // é (non-ascii)
+        "'x'+chr(39)+'y'",                    // embedded '
+        "'x'+chr(34)+'y'",                    // embedded "
+        "'q'+chr(39)+chr(34)+'r'",            // both embedded
+        "'日本'",                              // wide non-ascii
+    ];
+    const SCALARS: &[&str] = &[
+        "0", "1", "-1", "42", "-100", "1000000", "True", "False", "None", "0.0", "-0.0", "0.1",
+        "3.14", "-1.5", "1e3", "1e-3", "2.0", "100.0", "0.1+0.2", "1/3", "2**0.5", "1e300",
+    ];
+    match r.below(13) {
+        // 0: print with custom sep / end + multiple args.
+        0 => {
+            let sep = pick(r, &["''", "'-'", "', '", "'::'", "' '", "'\\n'", "'|'"]);
+            let end = pick(r, &["''", "'!'", "'\\n'", "'.\\n'", "'END'", "'\\n\\n'"]);
+            let a = pick(r, SCALARS);
+            let b = pick(r, SCALARS);
+            let c = pick(r, SCALARS);
+            vec![
+                format!("print({a}, {b}, {c}, sep={sep}, end={end})"),
+                "print('|sentinel')".into(),
+            ]
+        }
+        // 1: empty print / end-only continuation.
+        1 => vec![
+            "print()".into(),
+            "print('a', end='')".into(),
+            "print('b', end='')".into(),
+            "print()".into(),
+            "print()".into(),
+        ],
+        // 2: `file=` routing — stderr must NOT reach stdout; stdout must.
+        2 => vec![
+            "import sys".into(),
+            "print('A')".into(),
+            "print('B', file=sys.stdout)".into(),
+            "print('C', file=sys.stderr)".into(),
+            "print('D', 'E', file=sys.stderr, sep='-')".into(),
+            "print('F')".into(),
+        ],
+        // 3: repr of a scalar (int / float shortest-round-trip / bool / None).
+        3 => {
+            let x = pick(r, SCALARS);
+            vec![format!("print(repr({x}))")]
+        }
+        // 4: str-quote choice / ascii escaping of a string.
+        4 => {
+            let s = pick(r, STREXPRS);
+            match r.below(3) {
+                0 => vec![format!("print(repr({s}))")],
+                1 => vec![format!("print(ascii({s}))")],
+                _ => vec![format!("print(repr({s}), ascii({s}))")],
+            }
+        }
+        // 5: repr of containers — 1-tuple comma, empties, bytes, nesting.
+        5 => {
+            let e = pick(
+                r,
+                &[
+                    "(1,)",
+                    "()",
+                    "(1, 2, 3)",
+                    "[]",
+                    "[[1], [2, 3], []]",
+                    "{}",
+                    "b''",
+                    "b'hi'",
+                    "b'a\\x00\\n\\t\\\\'",
+                    "(1, 'a', (2,), [3])",
+                    "{'k': [1, (2, 3)]}",
+                    "[True, False, None, 1.5]",
+                    "frozenset()",
+                ],
+            );
+            vec![format!("print(repr({e}))")]
+        }
+        // 6: container repr recurses ELEMENT `__repr__` (never `__str__`).
+        6 => vec![
+            "class C:".into(),
+            "    def __repr__(self): return 'R'".into(),
+            "    def __str__(self): return 'S'".into(),
+            "print([C(), (C(),), {1: C()}])".into(),
+            "print({C()!r})".into(),
+            "print(str([C()]))".into(),
+        ],
+        // 7: reference-cycle recursion markers.
+        7 => match r.below(5) {
+            0 => vec!["a = [1, 2]".into(), "a.append(a)".into(), "print(a)".into()],
+            1 => vec![
+                "d = {}".into(),
+                "d['self'] = d".into(),
+                "print(d)".into(),
+            ],
+            2 => vec![
+                "a = []".into(),
+                "b = []".into(),
+                "a.append(b)".into(),
+                "b.append(a)".into(),
+                "print(a)".into(),
+            ],
+            3 => vec![
+                "a = [1]".into(),
+                "d = {}".into(),
+                "d['x'] = a".into(),
+                "a.append(d)".into(),
+                "print(a)".into(),
+                "print(d)".into(),
+            ],
+            _ => vec![
+                "a = []".into(),
+                "a.append(a)".into(),
+                "a.append(a)".into(),
+                "print(repr(a))".into(),
+            ],
+        },
+        // 8: str→repr fallback, and `object.__repr__` default shape.
+        8 => match r.below(4) {
+            // only __repr__ present: str() falls through to it.
+            0 => vec![
+                "class C:".into(),
+                "    def __repr__(self): return 'RR'".into(),
+                "print(str(C()), repr(C()))".into(),
+            ],
+            // only __str__: repr() uses the object default.
+            1 => vec![
+                "class C:".into(),
+                "    def __str__(self): return 'SS'".into(),
+                "print(str(C()))".into(),
+                "print(repr(C()).startswith('<__main__.C object at 0x'), repr(C()).endswith('>'))"
+                    .into(),
+            ],
+            // both present: each used for its own protocol.
+            2 => vec![
+                "class C:".into(),
+                "    def __str__(self): return 'S'".into(),
+                "    def __repr__(self): return 'R'".into(),
+                "print(str(C()), repr(C()))".into(),
+            ],
+            // neither: str and repr are the SAME object-default string.
+            _ => vec![
+                "class C: pass".into(),
+                "c = C()".into(),
+                "print(str(c).startswith('<__main__.C object at 0x'), str(c).endswith('>'))".into(),
+                "print(repr(c) == str(c))".into(),
+            ],
+        },
+        // 9: format(obj) with empty spec == str(obj); custom __format__.
+        9 => match r.below(3) {
+            0 => vec![
+                "class C:".into(),
+                "    def __str__(self): return 'STR'".into(),
+                "    def __repr__(self): return 'REP'".into(),
+                "print(format(C()), format(C(), ''))".into(),
+            ],
+            1 => {
+                let a = pick(r, SCALARS);
+                vec![format!("print(format({a}), format({a}, ''))")]
+            }
+            _ => vec![
+                "class C:".into(),
+                "    def __format__(self, spec): return 'FMT[' + spec + ']'".into(),
+                "print(format(C()), format(C(), 'abc'))".into(),
+            ],
+        },
+        // 10: print of scalars directly (str path, multi-arg default sep).
+        10 => {
+            let a = pick(r, SCALARS);
+            let b = pick(r, SCALARS);
+            let c = pick(r, STREXPRS);
+            vec![format!("print({a}, {b}, {c})")]
+        }
+        // 11: str(container) == repr(container) (element reprs inside).
+        11 => {
+            let e = pick(
+                r,
+                &[
+                    "[1, 'a', 2.5]",
+                    "(True, None)",
+                    "{'x': 1, 'y': [2]}",
+                    "['it'+chr(39)+'s']",
+                    "[b'z']",
+                ],
+            );
+            vec![format!("print(str({e}) == repr({e}), str({e}))")]
+        }
+        // 12: sep/end that are themselves reprs; str vs repr in one print.
+        _ => {
+            let s = pick(r, STREXPRS);
+            vec![
+                format!("v = {s}"),
+                "print(str(v) == v)".into(),
+                "print(repr(v) == repr(v))".into(),
+                format!("print('[', repr({s}), ']', sep='')"),
+            ]
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Mode dispatch
 // ---------------------------------------------------------------------------
@@ -3953,6 +4183,7 @@ enum Mode {
     Itertail,
     Metatype,
     Seqtail,
+    Display,
 }
 
 const REAL_MODES: &[Mode] = &[
@@ -4005,6 +4236,7 @@ const REAL_MODES: &[Mode] = &[
     Mode::Itertail,
     Mode::Metatype,
     Mode::Seqtail,
+    Mode::Display,
 ];
 
 /// Generate the statement list for a seed in the selected mode. `Mixed` rotates
@@ -4064,6 +4296,7 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Itertail => gen_itertail(seed),
         Mode::Metatype => gen_metatype(seed),
         Mode::Seqtail => gen_seqtail(seed),
+        Mode::Display => gen_display(seed),
     }
 }
 
@@ -4119,6 +4352,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Itertail => "itertail",
         Mode::Metatype => "metatype",
         Mode::Seqtail => "seqtail",
+        Mode::Display => "display",
     }
 }
 
@@ -4174,6 +4408,7 @@ fn mode_from_name(s: &str) -> Option<Mode> {
         Mode::Itertail,
         Mode::Metatype,
         Mode::Seqtail,
+        Mode::Display,
     ];
     ALL.iter().copied().find(|&m| mode_name(m) == s)
 }
