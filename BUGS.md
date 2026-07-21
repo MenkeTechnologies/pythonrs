@@ -304,7 +304,11 @@ module then raises `ModuleNotFoundError`.
   `maxsize`, `version`/`version_info` reporting the emulated CPython `3.14.6`,
   `platform` (`darwin`/`linux`), `path`, `modules`, `executable`,
   `stdout`/`stderr`/`stdin` file objects), `collections` (`deque`, `Counter`,
-  `defaultdict`, `OrderedDict`, `namedtuple`), `textwrap`, and `statistics`.
+  `defaultdict`, `OrderedDict`, `namedtuple`). `textwrap` and `statistics` have
+  native subsets too, but they cover only positional args, so under the FFI
+  bridge (default) they defer to the real CPython modules (full keyword-option
+  surface — `textwrap.fill(t, width=…)`); the native subsets serve only
+  `--no-default-features`.
 - **The rest of the stdlib is served by the `stdlib-ffi` bridge (on by default)**
   — an embedded libpython over pyo3, so `import re`/`json`/`os`/`random`/`string`/
   `itertools`/`functools`/`datetime`/`hashlib`/… load the **real CPython
@@ -329,3 +333,9 @@ module then raises `ModuleNotFoundError`.
     `@functools.wraps(fn)` fails — CPython does `setattr(wrapper, '__module__', …)`
     on the pythonrs `PyrsCallable` proxy, which is attribute-read-only. Needs a
     settable attribute store on marshalled pythonrs callables.
+  - **Passing a pythonrs generator to a CPython stdlib call**: e.g.
+    `itertools.takewhile(pred, my_gen())` raises `TypeError: cannot pass
+    'generator' to a CPython stdlib call` — the in-marshaler has no CPython
+    iterator wrapper for a pythonrs generator. (Foreign→pythonrs iteration works;
+    only pythonrs→Foreign of a live generator is missing.) Materializing the
+    generator first (`list(my_gen())`) is the workaround.

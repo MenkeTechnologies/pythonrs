@@ -600,7 +600,9 @@ pub fn make_iter(host: &mut PyHost, id: u32) -> Result<Value, String> {
     })
 }
 
-/// `next(foreign)` — `None` on `StopIteration`.
+/// `next(foreign)` — `None` on `StopIteration`. Caller holds the host borrow, so
+/// only safe for iterators that never re-enter pythonrs during `next()` (a plain
+/// CPython container). Callback-driving iterators must use [`iter_next_cb`].
 pub fn iter_next(host: &mut PyHost, id: u32) -> Result<Option<Value>, String> {
     Python::with_gil(|py| {
         let obj = fetch(py, id)?;
@@ -608,6 +610,24 @@ pub fn iter_next(host: &mut PyHost, id: u32) -> Result<Option<Value>, String> {
         match it.next() {
             None => Ok(None),
             Some(Ok(item)) => Ok(Some(py_to_value(host, py, &item)?)),
+            Some(Err(e)) => Err(e.to_string()),
+        }
+    })
+}
+
+/// `next(foreign)` for the borrow-free iteration path (`host::iter_step` /
+/// `host::iter_vec`). The caller must NOT hold the host borrow: advancing a lazy
+/// CPython iterator (`itertools.starmap`/`dropwhile`/`takewhile`/`filterfalse`
+/// over a pythonrs callable) runs that callable, which re-enters the host. The
+/// advance therefore happens with no borrow held; the result is marshaled under
+/// a fresh short borrow, exactly like [`invoke_bound`].
+pub fn iter_next_cb(id: u32) -> Result<Option<Value>, String> {
+    Python::with_gil(|py| {
+        let obj = fetch(py, id)?;
+        let mut it = obj.try_iter().map_err(|e| e.to_string())?;
+        match it.next() {
+            None => Ok(None),
+            Some(Ok(item)) => Ok(Some(with_host(|h| py_to_value(h, py, &item))?)),
             Some(Err(e)) => Err(e.to_string()),
         }
     })
@@ -643,6 +663,40 @@ pub fn binary_op(host: &mut PyHost, func: &str, a: &Value, b: &Value) -> Result<
             .map_err(|e| e.to_string())?;
         let res = op.call1((pa, pb)).map_err(|e| e.to_string())?;
         py_to_value(host, py, &res)
+    })
+}
+
+/// `float(foreign)` — run CPython's own `float()` on the object so `__float__`
+/// (`Fraction`, `Decimal`, `numpy` scalars, …) and `__index__` are honored. A
+/// `TypeError` (no conversion) surfaces as a pythonrs error string.
+pub fn to_float(id: u32) -> Result<f64, String> {
+    Python::with_gil(|py| {
+        let obj = fetch(py, id)?;
+        let f = py
+            .import("builtins")
+            .and_then(|b| b.getattr("float"))
+            .and_then(|f| f.call1((obj,)))
+            .map_err(|e| e.to_string())?;
+        f.extract::<f64>().map_err(|e| e.to_string())
+    })
+}
+
+/// [`binary_op`] for the borrow-free path (`numeric_hook`): the caller must NOT
+/// hold the host borrow. The operator runs in CPython with no borrow held, so an
+/// operand whose comparison/arithmetic calls back into pythonrs (a
+/// `functools.cmp_to_key` wrapper's `__lt__` invoking the user cmp function) can
+/// re-enter the host. Args and result are marshaled under fresh short borrows.
+pub fn binary_op_cb(func: &str, a: &Value, b: &Value) -> Result<Value, String> {
+    Python::with_gil(|py| {
+        let (pa, pb) = with_host(|h| -> Result<_, String> {
+            Ok((value_to_py(h, py, a)?, value_to_py(h, py, b)?))
+        })?;
+        let op = py
+            .import("operator")
+            .and_then(|m| m.getattr(func))
+            .map_err(|e| e.to_string())?;
+        let res = op.call1((pa, pb)).map_err(|e| e.to_string())?;
+        with_host(|h| py_to_value(h, py, &res))
     })
 }
 
