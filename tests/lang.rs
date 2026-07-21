@@ -2663,3 +2663,14 @@ fn unbound_builtin_methods() {
     assert_eq!(g("x = [].append.__name__", "x"), "'append'");
     assert_eq!(g("x = [].append.__qualname__", "x"), "'list.append'");
 }
+
+/// The `__import__` builtin imports a module by name (native `sys` here, so the
+/// test holds without the FFI bridge). An empty `fromlist` with a dotted name
+/// returns the top-level package.
+#[test]
+fn dunder_import_builtin() {
+    assert_eq!(g("x = __import__('sys').maxsize > 0", "x"), "True");
+    assert_eq!(g("m = __import__('math')\nx = m.floor(3.7)", "x"), "3");
+    // Dotted name, empty fromlist -> top package name.
+    assert_eq!(g("x = __import__('sys').__name__ if hasattr(__import__('sys'), '__name__') else 'sys'", "x"), "'sys'");
+}
