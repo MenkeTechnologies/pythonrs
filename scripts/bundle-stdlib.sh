@@ -137,11 +137,23 @@ if [ "$os" = "Darwin" ]; then
   else
     echo "bundle-stdlib: WARNING: no libpython load command found to relink" >&2
   fi
-  # install_name_tool invalidates the (ad-hoc) signature — re-sign so the binary
-  # loads on Apple Silicon. The dylib is unchanged, no re-sign needed there.
-  codesign --remove-signature "$out/bin/python" 2>/dev/null || true
-  codesign -s - -f "$out/bin/python" 2>/dev/null \
-    || echo "bundle-stdlib: WARNING: codesign failed; binary may need manual signing" >&2
+  # install_name_tool invalidates the binary's ad-hoc signature, AND the copied
+  # libpython dylib + lib-dynload/*.so carry signatures bound to their original
+  # on-disk slice; once relocated into the bundle, Apple Silicon's dyld rejects
+  # them ("code signature invalid" -> Abort trap: 6). Ad-hoc re-sign EVERY Mach-O
+  # in the tree so the whole bundle loads on arm64.
+  _resign() {
+    codesign --remove-signature "$1" 2>/dev/null || true
+    codesign -s - -f "$1" 2>/dev/null \
+      || echo "bundle-stdlib: WARNING: codesign failed for $1; may need manual signing" >&2
+  }
+  _resign "$out/bin/python"
+  _resign "$out/lib/$dylib"
+  if [ -d "$out/lib/$libpy/lib-dynload" ]; then
+    for _so in "$out/lib/$libpy/lib-dynload"/*.so; do
+      [ -e "$_so" ] && _resign "$_so"
+    done
+  fi
 else
   # Linux: point the binary at $ORIGIN/../lib for the bundled soname.
   if command -v patchelf >/dev/null 2>&1; then
