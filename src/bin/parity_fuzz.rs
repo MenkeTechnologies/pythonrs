@@ -2697,7 +2697,7 @@ fn gen_scoping(seed: u64) -> Vec<String> {
     let a = pick(r, POSINTS);
     let b = pick(r, POSINTS);
     let n = 2 + r.below(3); // 2..=4, so comprehension/walrus targets always bind
-    match r.below(18) {
+    match r.below(20) {
         // ── LEGB reads ────────────────────────────────────────────────────
         // Local assignment shadows a module global; the global is untouched.
         0 => vec![
@@ -2840,8 +2840,26 @@ fn gen_scoping(seed: u64) -> Vec<String> {
             "    g()".into(),
             "f()".into(),
         ],
-        // `nonlocal` at module level.
-        _ => vec!["nonlocal z".into()],
+        // ── class scope is not an enclosing scope ─────────────────────────
+        // A method reads the module global, NOT the same-named class attribute
+        // (class scope is transparent to method bodies).
+        18 => vec![
+            format!("x = {a}"),
+            "class C:".into(),
+            format!("    x = {b}"),
+            "    def m(self):".into(),
+            "        return x".into(),
+            "print(C().m(), C.x)".into(),
+        ],
+        // A comprehension in a class body likewise skips the class scope for its
+        // body, reading the module global (only its first iterable sees class).
+        _ => vec![
+            format!("v = {a}"),
+            "class C:".into(),
+            format!("    v = {b}"),
+            format!("    got = [v for _ in range({n})]"),
+            "print(C.got)".into(),
+        ],
     }
 }
 
