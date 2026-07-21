@@ -3160,7 +3160,14 @@ pub fn call_builtin_function(
             // enter the float loop below.
             while idx < items.len() && sum_is_long(&acc) {
                 let item = &items[idx];
-                acc = with_host(|h| h.arith(NumOp::Add, &acc, item))?;
+                // A non-int item is added generically (int+float -> float, or
+                // int+instance -> `__radd__`), which may enter the float loop;
+                // two ints stay on the exact `arith` fast path.
+                acc = if sum_is_long(item) {
+                    with_host(|h| h.arith(NumOp::Add, &acc, item))?
+                } else {
+                    numeric_hook(NumOp::Add, &acc, item)?
+                };
                 idx += 1;
                 if !sum_is_long(item) {
                     break;
@@ -3186,9 +3193,10 @@ pub fn call_builtin_function(
                 }
                 acc = Value::Float(cs_to_double(hi, lo));
             }
-            // Generic tail (mixed types, complex, Decimal, …).
+            // Generic tail (mixed types, complex, Decimal, instances via their
+            // `__add__`/`__radd__`, …).
             while idx < items.len() {
-                acc = with_host(|h| h.arith(NumOp::Add, &acc, &items[idx]))?;
+                acc = numeric_hook(NumOp::Add, &acc, &items[idx])?;
                 idx += 1;
             }
             Ok(acc)
@@ -3325,7 +3333,25 @@ pub fn call_builtin_function(
                     Ok(round_int(&n, has_nd, nd))
                 }
                 Value::Float(f) => round_float(*f, has_nd, nd),
-                _ => Err(host::type_error("round() argument must be a number")),
+                _ => {
+                    // An instance / foreign object (`Decimal`, `Fraction`, a user
+                    // class) delegates to `x.__round__([n])`.
+                    let has_round = with_host(|h| match h.get(&v) {
+                        Some(PyObj::Instance(i)) => {
+                            h.class_lookup(&i.class, "__round__").is_some()
+                        }
+                        _ => h.foreign_id(&v).is_some(),
+                    });
+                    if has_round {
+                        let margs = if has_nd { vec![args[1].clone()] } else { vec![] };
+                        host::call_method(&v, "__round__", margs, vec![])
+                    } else {
+                        Err(host::type_error(&format!(
+                            "type {} doesn't define __round__ method",
+                            with_host(|h| h.type_name(&v))
+                        )))
+                    }
+                }
             }
         }
         "divmod" => {
@@ -3468,11 +3494,36 @@ pub fn call_builtin_function(
         }
         "ord" => {
             let a0 = arg0(&args)?;
-            let s = with_host(|h| h.as_str(&a0)).unwrap_or_default();
-            match s.chars().next() {
-                Some(c) => Ok(Value::Int(c as i64)),
-                None => Err(host::type_error("ord() expected a character")),
-            }
+            // A `str` of exactly one character, or a `bytes`/`bytearray` of length
+            // one; any other length is a TypeError naming the actual length.
+            let n = with_host(|h| -> Result<i64, String> {
+                if let Some(s) = h.as_str(&a0) {
+                    let len = s.chars().count();
+                    return if len == 1 {
+                        Ok(s.chars().next().unwrap() as i64)
+                    } else {
+                        Err(host::type_error(&format!(
+                            "ord() expected a character, but string of length {len} found"
+                        )))
+                    };
+                }
+                match h.get(&a0) {
+                    Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) if b.len() == 1 => {
+                        Ok(b[0] as i64)
+                    }
+                    Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) => Err(host::type_error(
+                        &format!(
+                            "ord() expected a character, but string of length {} found",
+                            b.len()
+                        ),
+                    )),
+                    _ => Err(host::type_error(&format!(
+                        "ord() expected string of length 1, but {} found",
+                        h.type_name(&a0)
+                    ))),
+                }
+            })?;
+            Ok(Value::Int(n))
         }
         "chr" => {
             let a0 = arg0(&args)?;
@@ -3901,7 +3952,7 @@ fn reduce_minmax(
             return Ok(d);
         }
         return Err(format!(
-            "ValueError: {}() arg is an empty sequence",
+            "ValueError: {}() iterable argument is empty",
             if want_max { "max" } else { "min" }
         ));
     }
@@ -6741,7 +6792,7 @@ fn dict_method(
             });
             match got {
                 Some((k, v)) => Ok(with_host(|h| h.new_tuple(vec![k, v]))),
-                None => Err("KeyError: 'popitem(): dictionary is empty'".into()),
+                None => Err("KeyError: popitem(): dictionary is empty".into()),
             }
         }
         _ => Err(format!(
