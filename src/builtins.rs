@@ -5078,12 +5078,60 @@ fn is_num_dunder(tn: &str, name: &str) -> bool {
 }
 
 /// Dispatch a method call on a builtin-typed receiver.
+/// namedtuple instance methods (`_asdict`, `_replace`, plus inherited
+/// `count`/`index`). A namedtuple's `type_name` is its own name (not "tuple"),
+/// so these are dispatched before the by-type-name method match below. Returns
+/// `None` when `recv` isn't a namedtuple, so a plain tuple falls through.
+fn nt_instance_method(
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+    kwargs: &[(String, Value)],
+) -> Option<Result<Value, String>> {
+    let (items, fields, type_name) = with_host(|h| match (h.get(recv), recv) {
+        (Some(PyObj::Tuple(items)), Value::Obj(i)) => h
+            .nt_meta
+            .get(i)
+            .map(|m| (items.clone(), m.fields.clone(), m.type_name.clone())),
+        _ => None,
+    })?;
+    match name {
+        "_asdict" => Some(Ok(with_host(|h| {
+            let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+            for (f, v) in fields.iter().zip(items.iter()) {
+                let kv = h.new_str(f.clone());
+                d.insert(PKey::Str(f.clone()), (kv, v.clone()));
+            }
+            h.new_dict(d)
+        }))),
+        "_replace" => {
+            let mut new_items = items.clone();
+            for (k, v) in kwargs {
+                match fields.iter().position(|f| f == k) {
+                    Some(idx) => new_items[idx] = v.clone(),
+                    None => {
+                        return Some(Err(host::type_error(&format!(
+                            "{type_name}() got an unexpected keyword argument '{k}'"
+                        ))))
+                    }
+                }
+            }
+            Some(host::namedtuple_construct(&type_name, &fields, new_items, vec![]))
+        }
+        "count" | "index" => Some(tuple_method(recv, name, args)),
+        _ => None,
+    }
+}
+
 pub fn call_type_method(
     recv: &Value,
     name: &str,
     args: Vec<Value>,
     kwargs: Vec<(String, Value)>,
 ) -> Result<Value, String> {
+    if let Some(r) = nt_instance_method(recv, name, &args, &kwargs) {
+        return r;
+    }
     let tn = with_host(|h| h.type_name(recv));
     match tn.as_str() {
         // `.format` needs the kwargs (keyword replacement fields); other str
