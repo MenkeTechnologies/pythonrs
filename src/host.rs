@@ -2651,6 +2651,29 @@ fn c_powu(x: (f64, f64), n: i64) -> (f64, f64) {
     r
 }
 
+/// CPython `Py_UNICODE_ISPRINTABLE`: a code point is printable unless its
+/// general category is Other (Cc, Cf, Cs, Co, Cn) or Separator (Zl, Zp, Zs) —
+/// with the sole exception that ASCII space (U+0020, a Zs) IS printable. Used by
+/// `repr`, `ascii`, and `str.isprintable` to decide what to escape. Unicode 16.0
+/// data (matches CPython 3.14's `unicodedata`).
+pub fn is_printable_char(c: char) -> bool {
+    if c == ' ' {
+        return true;
+    }
+    use unicode_general_category::{get_general_category, GeneralCategory as G};
+    !matches!(
+        get_general_category(c),
+        G::Control
+            | G::Format
+            | G::Surrogate
+            | G::PrivateUse
+            | G::Unassigned
+            | G::LineSeparator
+            | G::ParagraphSeparator
+            | G::SpaceSeparator
+    )
+}
+
 fn quote_str(s: &str) -> String {
     let has_single = s.contains('\'');
     let has_double = s.contains('"');
@@ -2671,10 +2694,11 @@ fn quote_str(s: &str) -> String {
                 out.push('\\');
                 out.push(c);
             }
-            // Non-printable (C0/C1 controls, DEL): CPython repr escapes these as
+            // Non-printable (controls, format, separators, unassigned, private
+            // use — see `is_printable_char`): CPython repr escapes these as
             // `\xXX` (≤0xff), `\uXXXX` (≤0xffff), or `\UXXXXXXXX`. Printable
             // Unicode (e.g. `é`) is kept verbatim.
-            c if c.is_control() => {
+            c if !is_printable_char(c) => {
                 let n = c as u32;
                 if n <= 0xff {
                     out.push_str(&format!("\\x{n:02x}"));

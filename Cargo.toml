@@ -138,6 +138,7 @@ num-complex = "0.4"
 # ships native 3.14 support). Default builds never pull pyo3 or need libpython.
 pyo3 = { version = "0.24", features = ["abi3-py313", "auto-initialize"], optional = true }
 unicode_names2 = "3.1.0"
+unicode-general-category = "1.1.0"
 
 [features]
 stdlib-ffi = ["dep:pyo3"]

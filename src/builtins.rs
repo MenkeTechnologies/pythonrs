@@ -3047,7 +3047,12 @@ pub fn call_builtin_function(
             let n = with_host(|h| h.as_int(&a0)).unwrap_or(0);
             match char::from_u32(n as u32) {
                 Some(c) => Ok(with_host(|h| h.new_str(c.to_string()))),
-                None => Err("ValueError: chr() arg not in range".to_string()),
+                // Rust `char` can't hold a lone surrogate (U+D800..U+DFFF), so
+                // `chr(surrogate)` errors here where CPython would return a
+                // surrogate-bearing `str`; that gap needs a surrogate-aware
+                // string type. Both the surrogate and out-of-range cases share
+                // CPython's message text.
+                None => Err("ValueError: chr() arg not in range(0x110000)".to_string()),
             }
         }
         "hex" => int_radix(&args, 16, "0x"),
@@ -4074,6 +4079,8 @@ const EXC_PARENTS: &[(&str, &str)] = &[
     ("IndentationError", "Exception"),
     ("SyntaxError", "Exception"),
     ("UnicodeDecodeError", "UnicodeError"),
+    ("UnicodeEncodeError", "UnicodeError"),
+    ("UnicodeTranslateError", "UnicodeError"),
     ("ConnectionError", "OSError"),
     ("BrokenPipeError", "ConnectionError"),
     ("TimeoutError", "OSError"),
@@ -4532,6 +4539,24 @@ pub fn call_type_method(
             let s = with_host(|h| h.as_str(recv)).unwrap_or_default();
             str_dot_format(&s, &args, &kwargs)
         }
+        // `str.encode(encoding=..., errors=...)` — fold keywords into the
+        // positional (encoding, errors) order `str_method`'s `encode` expects.
+        "str" if name == "encode" && !kwargs.is_empty() => {
+            let mut enc = args.first().cloned();
+            let mut err = args.get(1).cloned();
+            for (k, v) in &kwargs {
+                match k.as_str() {
+                    "encoding" => enc = Some(v.clone()),
+                    "errors" => err = Some(v.clone()),
+                    _ => {}
+                }
+            }
+            let mut a2 = vec![enc.unwrap_or_else(|| new_str("utf-8".into()))];
+            if let Some(e) = err {
+                a2.push(e);
+            }
+            str_method(recv, name, &a2)
+        }
         "str" => str_method(recv, name, &args),
         // `bytes/bytearray.decode(encoding=..., errors=...)` — fold keywords into
         // the positional (encoding, errors) order the decoder expects.
@@ -4846,7 +4871,7 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             !s.is_empty() && s.chars().all(|c| c.is_alphanumeric()),
         )),
         "isspace" => Ok(Value::Bool(
-            !s.is_empty() && s.chars().all(|c| c.is_whitespace()),
+            !s.is_empty() && s.chars().all(is_py_space),
         )),
         "isupper" => Ok(Value::Bool(
             s.chars().any(|c| c.is_alphabetic())
@@ -4929,9 +4954,7 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
         )),
         "isidentifier" => Ok(Value::Bool(is_identifier(&s))),
         "istitle" => Ok(Value::Bool(is_titlecased(&s))),
-        "isprintable" => Ok(Value::Bool(
-            s.chars().all(|c| !c.is_control() && c != '\u{85}'),
-        )),
+        "isprintable" => Ok(Value::Bool(s.chars().all(host::is_printable_char))),
         "expandtabs" => {
             let tabsize = args
                 .first()
@@ -4948,7 +4971,19 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             let mapping = arg0(args)?;
             str_format_map(&s, &mapping)
         }
-        "encode" => Ok(with_host(|h| h.alloc(PyObj::Bytes(s.into_bytes())))),
+        "isascii" => Ok(Value::Bool(s.chars().all(|c| (c as u32) < 0x80))),
+        "encode" => {
+            let enc = args
+                .first()
+                .and_then(|v| with_host(|h| h.as_str(v)))
+                .unwrap_or_else(|| "utf-8".into());
+            let errors = args
+                .get(1)
+                .and_then(|v| with_host(|h| h.as_str(v)))
+                .unwrap_or_else(|| "strict".into());
+            let bytes = encode_str(&s, &enc, &errors)?;
+            Ok(with_host(|h| h.alloc(PyObj::Bytes(bytes))))
+        }
         // `.format` with keyword fields comes through `call_type_method`, which
         // has the kwargs; a bare `str_method` call has none.
         "format" => str_dot_format(&s, args, &[]),
@@ -5114,14 +5149,30 @@ fn is_numeric_char(c: char) -> bool {
     c.is_numeric()
 }
 
-/// CPython `str.isidentifier` (approximated with Rust's Unicode categories).
+/// CPython `str.isspace` / `Py_UNICODE_ISSPACE`: Rust's `White_Space` set plus
+/// the four ASCII information separators U+001C..U+001F, which CPython counts as
+/// whitespace (bidirectional category B/S) but Rust does not.
+fn is_py_space(c: char) -> bool {
+    c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
+}
+
+/// CPython identifier "continue" chars beyond `XID_Continue`: the
+/// `Other_ID_Continue` set (U+00B7, U+0387, U+1369..U+1371, U+19DA) plus the
+/// zero-width joiner / non-joiner (U+200C/U+200D), which PEP 3131 permits.
+fn is_other_id_continue(c: char) -> bool {
+    matches!(c,
+        '\u{00b7}' | '\u{0387}' | '\u{1369}'..='\u{1371}' | '\u{19da}' | '\u{200c}' | '\u{200d}')
+}
+
+/// CPython `str.isidentifier` (approximated with Rust's Unicode categories plus
+/// the `Other_ID_Start`/`Other_ID_Continue` chars CPython adds on top).
 fn is_identifier(s: &str) -> bool {
     let mut it = s.chars();
     match it.next() {
         Some(c) if c == '_' || c.is_alphabetic() => {}
         _ => return false,
     }
-    it.all(|c| c == '_' || c.is_alphanumeric())
+    it.all(|c| c == '_' || c.is_alphanumeric() || is_other_id_continue(c))
 }
 
 /// CPython `str.istitle`: every cased run starts upper/title-cased and continues
@@ -6566,6 +6617,155 @@ fn bytes_fromhex(args: &[Value]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// Normalize a codec name the way CPython's alias table does for the encodings
+/// we implement: lowercase, strip `-`/`_`/spaces. `UTF-8` / `utf_8` / `U8` all
+/// collapse to `utf8`.
+fn norm_codec(enc: &str) -> String {
+    enc.to_lowercase().replace(['-', '_', ' '], "")
+}
+
+/// Apply an encode error handler to a single un-encodable code point, appending
+/// its replacement bytes to `out`. Returns `Err` for `strict` (the caller turns
+/// this into the `UnicodeEncodeError`). `codec` names the encoding for the error
+/// text. Handlers: `strict`, `ignore`, `replace` (`?`), `backslashreplace`
+/// (`\xHH`/`\uHHHH`/`\UHHHHHHHH`), `xmlcharrefreplace` (`&#NNN;`), `namereplace`
+/// (`\N{NAME}`, falling back to `backslashreplace` when the char is unnamed).
+fn encode_error(out: &mut Vec<u8>, c: char, errors: &str, codec: &str) -> Result<(), String> {
+    match errors {
+        "ignore" => Ok(()),
+        "replace" => {
+            out.push(b'?');
+            Ok(())
+        }
+        "backslashreplace" => {
+            let n = c as u32;
+            let esc = if n <= 0xff {
+                format!("\\x{n:02x}")
+            } else if n <= 0xffff {
+                format!("\\u{n:04x}")
+            } else {
+                format!("\\U{n:08x}")
+            };
+            out.extend_from_slice(esc.as_bytes());
+            Ok(())
+        }
+        "xmlcharrefreplace" => {
+            out.extend_from_slice(format!("&#{};", c as u32).as_bytes());
+            Ok(())
+        }
+        "namereplace" => {
+            match unicode_names2::name(c) {
+                Some(name) => out.extend_from_slice(format!("\\N{{{name}}}").as_bytes()),
+                None => return encode_error(out, c, "backslashreplace", codec),
+            }
+            Ok(())
+        }
+        _ => Err(format!(
+            "UnicodeEncodeError: '{codec}' codec can't encode character '\\x{:x}'",
+            c as u32
+        )),
+    }
+}
+
+/// Apply a decode error handler to one undecodable byte-run (`bad`), appending
+/// the replacement to `out`. Matches CPython: `ignore` skips, `replace` emits a
+/// single U+FFFD, `backslashreplace` emits `\xHH` per byte; `strict` raises
+/// `UnicodeDecodeError`; the encode-only `namereplace`/`xmlcharrefreplace` raise
+/// `TypeError` (CPython's "can't handle UnicodeDecodeError in error callback");
+/// an unrecognized name raises `LookupError`. The caller invokes this once per
+/// maximal error subpart, so `replace`'s U+FFFD count matches CPython.
+fn decode_error(out: &mut String, bad: &[u8], errors: &str, codec: &str) -> Result<(), String> {
+    match errors {
+        "ignore" => Ok(()),
+        "replace" => {
+            out.push('\u{fffd}');
+            Ok(())
+        }
+        "backslashreplace" => {
+            for &b in bad {
+                out.push_str(&format!("\\x{b:02x}"));
+            }
+            Ok(())
+        }
+        "strict" => Err(format!("UnicodeDecodeError: '{codec}' codec can't decode byte")),
+        "namereplace" | "xmlcharrefreplace" => Err(
+            "TypeError: don't know how to handle UnicodeDecodeError in error callback".to_string(),
+        ),
+        _ => Err(format!("LookupError: unknown error handler name '{errors}'")),
+    }
+}
+
+/// CPython `str.encode(encoding, errors)`. Supports `utf-8` (default), `ascii`,
+/// `latin-1`/`iso-8859-1`, and the `utf-16`/`utf-32` families (bare names emit a
+/// BOM in native little-endian order; the explicit `-le`/`-be` names don't). The
+/// error handler is only ever engaged by `ascii`/`latin-1` (a `str` holds only
+/// valid scalar values, so every char round-trips through the Unicode codecs).
+fn encode_str(s: &str, encoding: &str, errors: &str) -> Result<Vec<u8>, String> {
+    let norm = norm_codec(encoding);
+    match norm.as_str() {
+        "utf8" | "u8" | "utf" | "cp65001" => Ok(s.as_bytes().to_vec()),
+        "ascii" | "usascii" | "646" => {
+            let mut out = Vec::with_capacity(s.len());
+            for c in s.chars() {
+                if (c as u32) < 0x80 {
+                    out.push(c as u8);
+                } else {
+                    encode_error(&mut out, c, errors, "ascii")?;
+                }
+            }
+            Ok(out)
+        }
+        "latin1" | "latin" | "iso88591" | "8859" | "cp819" | "l1" => {
+            let mut out = Vec::with_capacity(s.len());
+            for c in s.chars() {
+                if (c as u32) <= 0xff {
+                    out.push(c as u8);
+                } else {
+                    encode_error(&mut out, c, errors, "latin-1")?;
+                }
+            }
+            Ok(out)
+        }
+        "utf16" | "utf16le" | "utf16be" | "u16" | "unicodelittleunmarked"
+        | "unicodebigunmarked" => {
+            let be = norm.ends_with("be") || norm == "unicodebigunmarked";
+            let bom = matches!(norm.as_str(), "utf16" | "u16");
+            let mut out = Vec::with_capacity(s.len() * 2 + 2);
+            let push = |u: u16, out: &mut Vec<u8>| {
+                let b = if be { u.to_be_bytes() } else { u.to_le_bytes() };
+                out.extend_from_slice(&b);
+            };
+            if bom {
+                push(0xfeff, &mut out);
+            }
+            let mut buf = [0u16; 2];
+            for c in s.chars() {
+                for &u in c.encode_utf16(&mut buf).iter() {
+                    push(u, &mut out);
+                }
+            }
+            Ok(out)
+        }
+        "utf32" | "utf32le" | "utf32be" | "u32" => {
+            let be = norm.ends_with("be");
+            let bom = matches!(norm.as_str(), "utf32" | "u32");
+            let mut out = Vec::with_capacity(s.len() * 4 + 4);
+            let push = |u: u32, out: &mut Vec<u8>| {
+                let b = if be { u.to_be_bytes() } else { u.to_le_bytes() };
+                out.extend_from_slice(&b);
+            };
+            if bom {
+                push(0xfeff, &mut out);
+            }
+            for c in s.chars() {
+                push(c as u32, &mut out);
+            }
+            Ok(out)
+        }
+        _ => Err(format!("LookupError: unknown encoding: {encoding}")),
+    }
+}
+
 /// Decode bytes to a `str`. `utf-8` (default) and `latin-1` / `ascii` are
 /// recognized. `errors` is honored for `strict` (default), `ignore`, and
 /// `replace`; any other handler name falls back to strict.
@@ -6578,25 +6778,21 @@ fn decode_bytes(bytes: &[u8], args: &[Value]) -> Result<Value, String> {
         .get(1)
         .and_then(|v| with_host(|h| h.as_str(v)))
         .unwrap_or_else(|| "strict".into());
-    let norm = enc.to_lowercase().replace(['-', '_'], "");
+    let norm = norm_codec(&enc);
     let s = match norm.as_str() {
-        "latin1" | "latin" | "iso88591" | "l1" | "cp1252" => {
+        "latin1" | "latin" | "iso88591" | "l1" | "cp1252" | "8859" | "cp819" => {
             // Every byte maps to U+00..U+FF; no error handler is ever engaged.
             bytes.iter().map(|&b| b as char).collect::<String>()
         }
-        "ascii" | "usascii" => {
+        "utf16" | "utf16le" | "utf16be" | "u16" => decode_utf16(bytes, &norm, &errors)?,
+        "utf32" | "utf32le" | "utf32be" | "u32" => decode_utf32(bytes, &norm, &errors)?,
+        "ascii" | "usascii" | "646" => {
             let mut out = String::with_capacity(bytes.len());
             for &b in bytes {
                 if b < 0x80 {
                     out.push(b as char);
                 } else {
-                    match errors.as_str() {
-                        "ignore" => {}
-                        "replace" => out.push('\u{fffd}'),
-                        _ => {
-                            return Err("UnicodeDecodeError: 'ascii' codec can't decode byte".into())
-                        }
-                    }
+                    decode_error(&mut out, &[b], &errors, "ascii")?;
                 }
             }
             out
@@ -6604,6 +6800,83 @@ fn decode_bytes(bytes: &[u8], args: &[Value]) -> Result<Value, String> {
         _ => utf8_decode_errors(bytes, &errors)?,
     };
     Ok(new_str(s))
+}
+
+/// Decode UTF-16. Bare `utf-16` consumes a leading BOM to pick endianness
+/// (defaulting to little-endian, CPython's native order on the LE hosts this
+/// targets); `utf-16-le`/`utf-16-be` are fixed-endian and never strip a BOM.
+/// Odd trailing bytes and unpaired surrogates engage the error handler.
+fn decode_utf16(bytes: &[u8], norm: &str, errors: &str) -> Result<String, String> {
+    let mut be = norm.ends_with("be");
+    let mut start = 0;
+    if norm == "utf16" || norm == "u16" {
+        if bytes.starts_with(&[0xff, 0xfe]) {
+            start = 2;
+        } else if bytes.starts_with(&[0xfe, 0xff]) {
+            be = true;
+            start = 2;
+        }
+    }
+    let units: Vec<u16> = bytes[start..]
+        .chunks_exact(2)
+        .map(|c| {
+            if be {
+                u16::from_be_bytes([c[0], c[1]])
+            } else {
+                u16::from_le_bytes([c[0], c[1]])
+            }
+        })
+        .collect();
+    let trailing = (bytes.len() - start) % 2 != 0;
+    let mut out = String::with_capacity(units.len());
+    for r in char::decode_utf16(units) {
+        match r {
+            Ok(c) => out.push(c),
+            Err(e) => {
+                let u = e.unpaired_surrogate();
+                let b = if be { u.to_be_bytes() } else { u.to_le_bytes() };
+                decode_error(&mut out, &b, errors, "utf-16")?;
+            }
+        }
+    }
+    if trailing {
+        decode_error(&mut out, &bytes[bytes.len() - 1..], errors, "utf-16")?;
+    }
+    Ok(out)
+}
+
+/// Decode UTF-32. Bare `utf-32` consumes a leading BOM (default little-endian);
+/// `utf-32-le`/`utf-32-be` are fixed-endian. Out-of-range / surrogate / truncated
+/// words engage the error handler.
+fn decode_utf32(bytes: &[u8], norm: &str, errors: &str) -> Result<String, String> {
+    let mut be = norm.ends_with("be");
+    let mut start = 0;
+    if norm == "utf32" || norm == "u32" {
+        if bytes.starts_with(&[0xff, 0xfe, 0x00, 0x00]) {
+            start = 4;
+        } else if bytes.starts_with(&[0x00, 0x00, 0xfe, 0xff]) {
+            be = true;
+            start = 4;
+        }
+    }
+    let body = &bytes[start..];
+    let mut out = String::with_capacity(body.len() / 4);
+    for c in body.chunks(4) {
+        if c.len() < 4 {
+            decode_error(&mut out, c, errors, "utf-32")?;
+            break;
+        }
+        let n = if be {
+            u32::from_be_bytes([c[0], c[1], c[2], c[3]])
+        } else {
+            u32::from_le_bytes([c[0], c[1], c[2], c[3]])
+        };
+        match char::from_u32(n) {
+            Some(ch) => out.push(ch),
+            None => decode_error(&mut out, c, errors, "utf-32")?,
+        }
+    }
+    Ok(out)
 }
 
 /// UTF-8 decode with a CPython-compatible error handler. Invalid sequences are
@@ -6625,15 +6898,7 @@ fn utf8_decode_errors(bytes: &[u8], errors: &str) -> Result<String, String> {
                 // `error_len() == None` means an incomplete sequence at the end:
                 // CPython replaces/ignores it as a single unit.
                 let skip = e.error_len().unwrap_or(rest.len() - valid);
-                match errors {
-                    "ignore" => {}
-                    "replace" => out.push('\u{fffd}'),
-                    _ => {
-                        return Err(
-                            "UnicodeDecodeError: 'utf-8' codec can't decode byte".to_string()
-                        )
-                    }
-                }
+                decode_error(&mut out, &rest[valid..valid + skip], errors, "utf-8")?;
                 rest = &rest[valid + skip..];
                 if rest.is_empty() {
                     break;
@@ -6720,7 +6985,42 @@ fn bytes_common_method(
     };
     match name {
         "decode" => decode_bytes(&bytes, args),
-        "hex" => Ok(new_str(bytes.iter().map(|b| format!("{b:02x}")).collect())),
+        "hex" => {
+            // `hex(sep=None, bytes_per_sep=1)`: with a separator, insert it every
+            // `|bytes_per_sep|` bytes — grouping from the RIGHT for a positive
+            // count, from the LEFT for a negative one (CPython's rule).
+            match args.first() {
+                None => Ok(new_str(bytes.iter().map(|b| format!("{b:02x}")).collect())),
+                Some(sep_v) => {
+                    let sep = with_host(|h| h.as_str(sep_v))
+                        .ok_or_else(|| host::type_error("sep must be str or bytes"))?;
+                    let group = args
+                        .get(1)
+                        .and_then(|v| with_host(|h| h.as_int(v)))
+                        .unwrap_or(1);
+                    if group == 0 {
+                        return Err("ValueError: bytes_per_sep must not be zero".into());
+                    }
+                    let g = group.unsigned_abs() as usize;
+                    let n = bytes.len();
+                    let mut out = String::with_capacity(n * 2 + n);
+                    for (i, b) in bytes.iter().enumerate() {
+                        if i > 0 {
+                            let boundary = if group > 0 {
+                                (n - i) % g == 0
+                            } else {
+                                i % g == 0
+                            };
+                            if boundary {
+                                out.push_str(&sep);
+                            }
+                        }
+                        out.push_str(&format!("{b:02x}"));
+                    }
+                    Ok(new_str(out))
+                }
+            }
+        }
         // `fromhex` is a classmethod but is also reachable through an instance.
         "fromhex" => Ok(mk_bytes(is_ba, bytes_fromhex(args)?)),
         "upper" => Ok(mk_bytes(is_ba, bytes.to_ascii_uppercase())),
