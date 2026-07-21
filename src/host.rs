@@ -7454,13 +7454,10 @@ impl PyHost {
 /// `meta_name` is the explicit `metaclass=` (a user class name) if any;
 /// `class_kwargs` are the remaining class-header keywords forwarded to
 /// `__init_subclass__`.
-pub fn build_class(
-    name: &str,
-    bases: Vec<String>,
-    body_func: &Value,
-    meta_name: Option<String>,
-    class_kwargs: Vec<(String, Value)>,
-) -> Result<Value, String> {
+/// Run a class-body function on a fresh class frame and return the namespace it
+/// binds (member/method names in definition order). Shared by the native
+/// `build_class` and the foreign-base (CPython metaclass) path.
+fn run_class_body(name: &str, body_func: &Value) -> Result<IndexMap<String, Value>, String> {
     let fv = match with_host(|h| h.get(body_func).cloned()) {
         Some(PyObj::Func(fv)) => fv,
         _ => return Err(type_error("internal: class body is not a function")),
@@ -7491,7 +7488,38 @@ pub fn build_class(
         h.signal.take();
     });
     r?;
-    let ns: IndexMap<String, Value> = env.borrow().vars.clone();
+    let vars = env.borrow().vars.clone();
+    Ok(vars)
+}
+
+/// Create a class that has at least one foreign (CPython) base by delegating to
+/// that base's metaclass over the FFI bridge (`class C(enum.Enum): …` →
+/// `EnumType`). The class body runs on fusevm; its namespace is handed to
+/// CPython's `types.new_class`, which fires `__prepare__` and the real metaclass.
+/// The result is a `Foreign` class handle.
+#[cfg(feature = "stdlib-ffi")]
+pub fn build_class_foreign(
+    name: &str,
+    bases: Vec<Value>,
+    body_func: &Value,
+) -> Result<Value, String> {
+    let ns = run_class_body(name, body_func)?;
+    let members: Vec<(String, Value)> = ns.into_iter().collect();
+    crate::ffi::build_foreign_class(name, &bases, &members)
+}
+
+pub fn build_class(
+    name: &str,
+    bases: Vec<String>,
+    body_func: &Value,
+    meta_name: Option<String>,
+    class_kwargs: Vec<(String, Value)>,
+) -> Result<Value, String> {
+    let def = match with_host(|h| h.get(body_func).cloned()) {
+        Some(PyObj::Func(fv)) => with_host(|h| h.funcs[fv.def_id].clone()),
+        _ => return Err(type_error("internal: class body is not a function")),
+    };
+    let ns: IndexMap<String, Value> = run_class_body(name, body_func)?;
     // The effective metaclass: the explicit `metaclass=` if given, else the most
     // derived metaclass inherited from the bases (CPython rule). A user metaclass
     // constructs the class via `M(name, bases, namespace)` (firing `M.__new__`/

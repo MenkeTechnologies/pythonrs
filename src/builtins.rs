@@ -1160,6 +1160,21 @@ fn b_build_class(vm: &mut VM, _: u8) -> Value {
     let name = sval(&vm.pop());
     let bases_val = vm.pop();
     let metaclass = vm.pop();
+    // A foreign (CPython) base — `class C(enum.Enum)`, `class T(NamedTuple)` —
+    // means the class must be built by that base's metaclass; route creation
+    // through CPython so members/fields are produced the real way.
+    #[cfg(feature = "stdlib-ffi")]
+    if with_host(|h| match h.get(&bases_val) {
+        Some(PyObj::List(l)) => l.iter().any(|b| h.foreign_id(b).is_some()),
+        _ => false,
+    }) {
+        let bases: Vec<Value> = with_host(|h| match h.get(&bases_val) {
+            Some(PyObj::List(l)) => l.clone(),
+            _ => Vec::new(),
+        });
+        let r = host::build_class_foreign(&name, bases, &body_func);
+        return finish(vm, r);
+    }
     let bases: Vec<String> = with_host(|h| match h.get(&bases_val) {
         Some(PyObj::List(l)) => l.iter().filter_map(|b| callable_name(h, b)).collect(),
         _ => Vec::new(),
@@ -1315,6 +1330,13 @@ fn b_is(vm: &mut VM, _: u8) -> Value {
                 || with_host(|h| match (h.get(&a), h.get(&b)) {
                     (Some(PyObj::Class(m)), Some(PyObj::Class(n))) => m == n,
                     (Some(PyObj::Builtin(m)), Some(PyObj::Builtin(n))) => m == n,
+                    // Two `Foreign` handles are the same object when they point at
+                    // the same CPython object — so `Color.RED is Color.RED`
+                    // (a singleton enum member fetched twice) holds.
+                    #[cfg(feature = "stdlib-ffi")]
+                    (Some(PyObj::Foreign(m)), Some(PyObj::Foreign(n))) => {
+                        crate::ffi::same_object(*m, *n)
+                    }
                     _ => false,
                 })
         }
@@ -2712,6 +2734,7 @@ const BUILTIN_FUNCS: &[&str] = &[
     "type",
     "isinstance",
     "issubclass",
+    "__import__",
     "hasattr",
     "getattr",
     "setattr",
@@ -3326,6 +3349,23 @@ pub fn call_builtin_function(
             let a0 = arg0(&args)?;
             let a1 = args.get(1).cloned().unwrap_or(Value::Undef);
             issubclass_dispatch(&a0, &a1).map(Value::Bool)
+        }
+        "__import__" => {
+            // `__import__(name, globals=None, locals=None, fromlist=(), level=0)`.
+            // With an empty `fromlist` and a dotted name CPython returns the
+            // top-level package; otherwise the named (sub)module.
+            let name_v = arg0(&args)?;
+            let name = with_host(|h| h.str_of(&name_v));
+            let fromlist_empty = match args.get(3) {
+                None | Some(Value::Undef) => true,
+                Some(v) => with_host(|h| !h.truthy(v)),
+            };
+            let target = if fromlist_empty {
+                name.split('.').next().unwrap_or(&name).to_string()
+            } else {
+                name
+            };
+            host::import_module(&target)
         }
         "hasattr" => {
             let v = arg0(&args)?;
