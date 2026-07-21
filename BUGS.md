@@ -239,17 +239,37 @@ fixed. Every line below was re-checked against the **default-build** binary
   out-of-range and surrogate paths share CPython's `chr() arg not in
   range(0x110000)` message. `surrogateescape`/`surrogatepass` handlers are
   likewise not reachable for the same reason.
+- **`float` `repr` tie-break**: the shortest-round-trip formatter defers to Rust
+  `std`'s Ryū, which breaks an exact tie between two equally-short 17-digit
+  decimals toward the larger digit, whereas CPython's dtoa rounds half-to-even.
+  This surfaces only on the rare value whose two shortest reprs are equidistant
+  from the true value (e.g. `2113325745016023.2` prints as `…3.3`); the underlying
+  `f64` bits are identical either way (`float.hex` agrees). A faithful fix needs a
+  dtoa-style shortest formatter rather than the `std` one.
+- **256+ element collection / call literals**: a single `[...]`/`(...)`/`{...}`
+  literal or call with more than 255 items raises `too many arguments (>255) for
+  one call` — the `MKLIST`/`MKTUPLE`/`MKSET`/`MKDICT`/`CALL` ops carry a `u8`
+  operand count. CPython builds arbitrarily large literals. Needs a chunked-build
+  lowering (or a wider operand) across every collection/call site.
+- **Numeric dunder methods as attributes**: operator dunders on `int`/`float`
+  (`(5).__index__()`, `(-5).__abs__()`, `(7).__floordiv__(2)`) are not exposed as
+  callable attributes, though the operators themselves dispatch. `AttributeError`
+  where CPython returns the bound method.
+- **`memoryview`**: the type is not implemented (`NameError: name 'memoryview'`).
 
 ## Tooling
 - **`--dap`** (Debug Adapter Protocol): implemented — breakpoints, step
   in/out/over/continue, stack trace, locals, and program-stdout capture (pipe +
   dup2 → `output` events). Frame names in the stack use the function name (or
   `<module>`), shared with the traceback path. Watch expressions not yet added.
-- **`--lsp`**: full corpus — completion (166 builtins/keywords/methods), position-
+- **`--lsp`**: full corpus — completion (builtins/keywords/methods), position-
   aware hover, and diagnostics via the real parser. Go-to-def and signature help
   not yet added.
-- **REPL** does not echo bare-expression values (use `print(...)`); multi-line
-  blocks close on a blank line.
+- **REPL** echoes bare-expression values through `sys.displayhook` (CPython
+  "single" mode: prints `repr(value)` for non-`None` top-level results and binds
+  `_`); multi-line blocks close on a blank line. Passing `--repl` with piped
+  (non-TTY) stdin runs the same interactive loop over the piped source, the
+  analogue of `python3 -i < file`.
 
 ## Standard library
 The **default build** (no features) serves only a native subset; every other

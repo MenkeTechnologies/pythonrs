@@ -14,6 +14,7 @@ pub mod async_rt;
 pub mod banner;
 pub mod builtins;
 pub mod cache;
+pub mod casefold;
 pub mod cli;
 pub mod compiler;
 pub mod dap;
@@ -40,6 +41,14 @@ pub fn compile(src: &str) -> Result<compiler::Program, String> {
 pub fn compile_debug(src: &str) -> Result<compiler::Program, String> {
     let stmts = parser::parse(src)?;
     compiler::compile(&stmts, true)
+}
+
+/// Compile one interactive REPL line in CPython "single" mode: a top-level
+/// expression statement echoes its value through `sys.displayhook` (prints
+/// `repr(value)` for non-`None` results and binds `_`). Not used for scripts.
+pub fn compile_interactive(src: &str) -> Result<compiler::Program, String> {
+    let stmts = parser::parse(src)?;
+    compiler::compile_interactive(&stmts)
 }
 
 /// Rebase a freshly compiled program's func/try ids above those already loaded

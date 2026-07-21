@@ -94,6 +94,7 @@ pub mod ops {
     pub const WITH_EXIT: u16 = 67; // [mgr] -> call `mgr.__exit__` with the active exception triple; -> Bool(suppress)
     pub const YIELD_FROM: u16 = 68; // [iterable] -> `yield from` delegation (PEP 380); -> sub-iterator's return value
     pub const LOOP_BODY: u16 = 69; // [try_id] -> run a loop body chunk (whose break/continue cross a try/with boundary); consume Break/Continue signals -> Int(0=next, 1=break); Return stops the loop chunk
+    pub const DISPLAYHOOK: u16 = 70; // [v] -> interactive REPL echo: if v is not None, print repr(v) and bind `_` (CPython sys.displayhook)
 }
 
 /// In-place (augmented-assignment) op tags carried by `ops::INPLACE`. One per
@@ -5422,6 +5423,14 @@ impl PyHost {
             // `bytes.fromhex` / `bytearray.fromhex` — classmethods on the type.
             Some(PyObj::Builtin(n)) if (n == "bytes" || n == "bytearray") && name == "fromhex" => {
                 Ok(self.alloc(PyObj::Builtin(format!("{n}.fromhex"))))
+            }
+            // `int.from_bytes` — a classmethod on the `int` type object.
+            Some(PyObj::Builtin(n)) if n == "int" && name == "from_bytes" => {
+                Ok(self.alloc(PyObj::Builtin("int.from_bytes".into())))
+            }
+            // `float.fromhex` — a classmethod on the `float` type object.
+            Some(PyObj::Builtin(n)) if n == "float" && name == "fromhex" => {
+                Ok(self.alloc(PyObj::Builtin("float.fromhex".into())))
             }
             // `bytes.maketrans` / `bytearray.maketrans` — static methods on the type.
             Some(PyObj::Builtin(n))

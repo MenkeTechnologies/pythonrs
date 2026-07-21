@@ -94,8 +94,15 @@ fn main() -> ExitCode {
         ));
     }
 
-    if cli.repl || atty_stdin() {
+    if atty_stdin() {
         pythonrs::repl::run();
+        return ExitCode::SUCCESS;
+    }
+    // `--repl` with a piped (non-TTY) stdin: run the interactive loop over the
+    // piped source (CPython's `python3 -i < file`), so REPL echo is observable
+    // and testable without a terminal.
+    if cli.repl {
+        pythonrs::repl::run_piped();
         return ExitCode::SUCCESS;
     }
 
