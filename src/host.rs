@@ -2035,7 +2035,9 @@ impl PyHost {
                         Value::Obj(i) => self.dict_meta.get(i),
                         _ => None,
                     };
+                    let empty = d.is_empty();
                     let out = match meta.map(|m| (m.kind, m.factory.clone())) {
+                        Some((DictKind::Counter, _)) if empty => "Counter()".into(),
                         Some((DictKind::Counter, _)) => format!("Counter({dict_repr})"),
                         Some((DictKind::DefaultDict, factory)) => {
                             let f = factory
@@ -2043,15 +2045,10 @@ impl PyHost {
                                 .unwrap_or_else(|| "None".into());
                             format!("defaultdict({f}, {dict_repr})")
                         }
-                        Some((DictKind::OrderedDict, _)) => {
-                            let pairs: Vec<String> = d
-                                .values()
-                                .map(|(k, val)| {
-                                    format!("({}, {})", self.repr_of(k), self.repr_of(val))
-                                })
-                                .collect();
-                            format!("OrderedDict([{}])", pairs.join(", "))
-                        }
+                        // CPython 3.12+ reprs OrderedDict dict-style, not as a
+                        // list of pairs; an empty one is the bare `OrderedDict()`.
+                        Some((DictKind::OrderedDict, _)) if empty => "OrderedDict()".into(),
+                        Some((DictKind::OrderedDict, _)) => format!("OrderedDict({dict_repr})"),
                         None => dict_repr,
                     };
                     repr_guard_leave(id);
