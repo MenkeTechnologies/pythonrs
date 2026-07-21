@@ -280,6 +280,13 @@ pub struct FuncVal {
 pub struct Instance {
     pub class: String,
     pub dict: Value,
+    /// For a subclass of a builtin type (`class Stack(list)`, `class C(int)`),
+    /// the native heap object / value holding the inherited builtin payload
+    /// (the list storage, the int value, …). `Value::Undef` for a plain
+    /// `object` subclass. Builtin operations (`len`, `[]`, `+`, iteration,
+    /// `repr`, inherited methods) delegate to this when the subclass does not
+    /// override the corresponding dunder. See [`PyHost::builtin_base_of`].
+    pub payload: Value,
 }
 
 /// A heap object.
@@ -998,7 +1005,43 @@ impl PyHost {
             d.insert(PKey::Str(k), (kv, v));
         }
         let dict = self.alloc(PyObj::Dict(d));
-        self.alloc(PyObj::Instance(Instance { class, dict }))
+        self.alloc(PyObj::Instance(Instance {
+            class,
+            dict,
+            payload: Value::Undef,
+        }))
+    }
+
+    /// Allocate a builtin-subclass instance carrying `payload` (the inherited
+    /// native list/dict/str/int/… storage). Attributes start empty.
+    pub fn new_instance_payload(&mut self, class: String, payload: Value) -> Value {
+        let dict = self.alloc(PyObj::Dict(IndexMap::new()));
+        self.alloc(PyObj::Instance(Instance {
+            class,
+            dict,
+            payload,
+        }))
+    }
+
+    /// The builtin base type in `class`'s MRO (`list`/`dict`/`str`/`int`/…),
+    /// making the class a subclass of a builtin type. `None` for a plain
+    /// `object` subclass. Walks the MRO so an indirect subclass
+    /// (`class B(A)` where `A(list)`) is also detected.
+    pub fn builtin_base_of(&self, class: &str) -> Option<&'static str> {
+        for c in self.mro_of(class) {
+            match c.as_str() {
+                "list" => return Some("list"),
+                "dict" => return Some("dict"),
+                "str" => return Some("str"),
+                "int" => return Some("int"),
+                "float" => return Some("float"),
+                "tuple" => return Some("tuple"),
+                "set" => return Some("set"),
+                "frozenset" => return Some("frozenset"),
+                _ => {}
+            }
+        }
+        None
     }
 
     /// Read instance attribute `name` from a live instance `__dict__` handle.
@@ -1153,6 +1196,8 @@ impl PyHost {
     pub fn as_str(&self, v: &Value) -> Option<String> {
         match self.get(v) {
             Some(PyObj::Str(s)) => Some(s.clone()),
+            // A `str` subclass instance coerces through its native payload.
+            Some(PyObj::Instance(_)) => self.base_payload_any(v).and_then(|p| self.as_str(&p)),
             _ => None,
         }
     }
@@ -1641,6 +1686,15 @@ impl PyHost {
                     if self.class_is_exception(&inst.class) {
                         let a = self.exc_instance_args(&inst.dict);
                         self.exc_message(&inst.class, &a)
+                    } else if !matches!(inst.payload, Value::Undef)
+                        && self.builtin_base_of(&inst.class).is_some()
+                        && self.class_lookup(&inst.class, "__str__").is_none()
+                        && self.class_lookup(&inst.class, "__repr__").is_none()
+                    {
+                        // Builtin-type subclass without a `__str__`/`__repr__`
+                        // override: the base type's string form (`str(Stack(...))`
+                        // → the list form, `str(U("hi"))` → `"hi"`).
+                        self.str_of(&inst.payload)
                     } else {
                         // `object.__repr__` default: `<__main__.Cls object at 0x…>`.
                         // Instances defined under `-c`/a script live in `__main__`
@@ -1917,6 +1971,15 @@ impl PyHost {
                     let inner: Vec<String> = a.iter().map(|x| self.repr_of(x)).collect();
                     format!("{}({})", inst.class, inner.join(", "))
                 }
+                // Builtin-type subclass without a `__repr__` override: the base
+                // type's repr (`repr(Stack([1,2]))` → `[1, 2]`).
+                Some(PyObj::Instance(inst))
+                    if !matches!(inst.payload, Value::Undef)
+                        && self.builtin_base_of(&inst.class).is_some()
+                        && self.class_lookup(&inst.class, "__repr__").is_none() =>
+                {
+                    self.repr_of(&inst.payload)
+                }
                 Some(PyObj::Slice { lo, hi, step }) => format!(
                     "slice({}, {}, {})",
                     self.repr_of(lo),
@@ -2029,6 +2092,22 @@ impl PyHost {
 
     /// Structural equality (`==`).
     pub fn equal(&self, a: &Value, b: &Value) -> bool {
+        // A builtin-subclass instance with no `__eq__` override compares by its
+        // native payload value (`'cat' == U('cat')`, `Stack([1]) == [1]`).
+        let ua;
+        let a = if self.class_lookup_eq_free(a) {
+            ua = self.base_payload_any(a).unwrap();
+            &ua
+        } else {
+            a
+        };
+        let ub;
+        let b = if self.class_lookup_eq_free(b) {
+            ub = self.base_payload_any(b).unwrap();
+            &ub
+        } else {
+            b
+        };
         match (a, b) {
             (Value::Undef, Value::Undef) => true,
             (Value::Bool(x), Value::Bool(y)) => x == y,
@@ -2117,13 +2196,15 @@ impl PyHost {
     }
 
     /// A numeric value as f64 if `v` is a number (int/float/bool/bigint).
-    fn num_val(&self, v: &Value) -> Option<f64> {
+    pub fn num_val(&self, v: &Value) -> Option<f64> {
         match v {
             Value::Int(n) => Some(*n as f64),
             Value::Float(f) => Some(*f),
             Value::Bool(b) => Some(*b as i64 as f64),
             Value::Obj(_) => match self.get(v) {
                 Some(PyObj::BigInt(b)) => Some(bigint_to_f64(b)),
+                // An `int`/`float` subclass coerces through its native payload.
+                Some(PyObj::Instance(_)) => self.base_payload_num(v).and_then(|p| self.num_val(&p)),
                 _ => None,
             },
             _ => None,
@@ -2134,6 +2215,49 @@ impl PyHost {
         match v {
             Value::Int(n) => Some(*n),
             Value::Bool(b) => Some(*b as i64),
+            // An `int` subclass instance coerces through its native payload.
+            Value::Obj(_) => self.base_payload_num(v).and_then(|p| self.as_int(&p)),
+            _ => None,
+        }
+    }
+
+    /// The native numeric payload of a builtin-subclass instance whose base is
+    /// `int`/`float` and which does not override the numeric-coercion dunders —
+    /// so value-level coercion (`as_int`/`num_val`) sees through the subclass.
+    fn base_payload_num(&self, v: &Value) -> Option<Value> {
+        match self.get(v) {
+            Some(PyObj::Instance(i)) if !matches!(i.payload, Value::Undef) => {
+                match self.builtin_base_of(&i.class) {
+                    Some("int") | Some("float") => Some(i.payload.clone()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether `v` is a builtin-subclass instance that compares by its base
+    /// value (has a native payload and no user `__eq__` override).
+    fn class_lookup_eq_free(&self, v: &Value) -> bool {
+        match self.get(v) {
+            Some(PyObj::Instance(i)) if !matches!(i.payload, Value::Undef) => {
+                self.builtin_base_of(&i.class).is_some()
+                    && self.class_lookup(&i.class, "__eq__").is_none()
+            }
+            _ => false,
+        }
+    }
+
+    /// The native payload of any builtin-subclass instance (value-level
+    /// unwrapping for `as_str`/`equal`), or `None` for a plain object subclass.
+    fn base_payload_any(&self, v: &Value) -> Option<Value> {
+        match self.get(v) {
+            Some(PyObj::Instance(i))
+                if !matches!(i.payload, Value::Undef)
+                    && self.builtin_base_of(&i.class).is_some() =>
+            {
+                Some(i.payload.clone())
+            }
             _ => None,
         }
     }
@@ -2378,10 +2502,24 @@ pub fn instance_hash_value(v: &Value) -> Result<i64, String> {
         Some(Value::Undef) => Err(type_error(&format!("unhashable type: '{class}'"))),
         None => {
             if with_host(|h| h.class_lookup(&class, "__eq__").is_some()) {
-                Err(type_error(&format!("unhashable type: '{class}'")))
-            } else {
-                Ok(id as i64)
+                return Err(type_error(&format!("unhashable type: '{class}'")));
             }
+            // A builtin-type subclass hashes by its base value
+            // (str/int/float/tuple/frozenset); a list/dict/set subclass is
+            // unhashable, exactly like its base.
+            if let Some((base, payload)) = with_host(|h| match h.get(v) {
+                Some(PyObj::Instance(i)) if !matches!(i.payload, Value::Undef) => {
+                    h.builtin_base_of(&i.class).map(|b| (b, i.payload.clone()))
+                }
+                _ => None,
+            }) {
+                if base_provides(base, "__hash__") {
+                    let k = with_host(|h| h.to_key(&payload))?;
+                    return Ok(crate::builtins::hash_key(&k));
+                }
+                return Err(type_error(&format!("unhashable type: '{class}'")));
+            }
+            Ok(id as i64)
         }
         Some(_) => {
             let r = call_method(v, "__hash__", vec![], vec![])?;
@@ -5780,6 +5918,225 @@ pub fn call_named(
     Err(name_error(name))
 }
 
+// ── builtin-type subclassing (hybrid instances) ─────────────────────────────
+
+/// Whether a builtin base type `base` provides `dunder` natively, so a subclass
+/// instance responds to it without a user override. Covers the container /
+/// value protocol guards (`len`, `[]`, iteration, `repr`, `hash`, numeric
+/// coercion); arithmetic/comparison operators are handled by operand unwrapping
+/// (see [`subclass_operand`]), not here.
+pub fn base_provides(base: &str, dunder: &str) -> bool {
+    match base {
+        "list" => matches!(
+            dunder,
+            "__len__"
+                | "__getitem__"
+                | "__setitem__"
+                | "__delitem__"
+                | "__iter__"
+                | "__contains__"
+                | "__reversed__"
+                | "__repr__"
+                | "__str__"
+        ),
+        "tuple" => matches!(
+            dunder,
+            "__len__"
+                | "__getitem__"
+                | "__iter__"
+                | "__contains__"
+                | "__reversed__"
+                | "__repr__"
+                | "__str__"
+                | "__hash__"
+        ),
+        "str" => matches!(
+            dunder,
+            "__len__"
+                | "__getitem__"
+                | "__iter__"
+                | "__contains__"
+                | "__reversed__"
+                | "__repr__"
+                | "__str__"
+                | "__hash__"
+        ),
+        "dict" => matches!(
+            dunder,
+            "__len__"
+                | "__getitem__"
+                | "__setitem__"
+                | "__delitem__"
+                | "__iter__"
+                | "__contains__"
+                | "__repr__"
+                | "__str__"
+        ),
+        "set" => matches!(
+            dunder,
+            "__len__" | "__iter__" | "__contains__" | "__repr__" | "__str__"
+        ),
+        "frozenset" => matches!(
+            dunder,
+            "__len__" | "__iter__" | "__contains__" | "__repr__" | "__str__" | "__hash__"
+        ),
+        "int" => matches!(
+            dunder,
+            "__repr__" | "__str__" | "__hash__" | "__bool__" | "__index__" | "__int__" | "__float__"
+        ),
+        "float" => matches!(
+            dunder,
+            "__repr__" | "__str__" | "__hash__" | "__bool__" | "__int__" | "__float__"
+        ),
+        _ => false,
+    }
+}
+
+/// If `v` is a builtin-subclass instance whose user class does NOT override
+/// `dunder`, and whose base provides `dunder`, return its native payload so the
+/// caller runs the base operation on it. Otherwise `None`.
+pub fn subclass_payload(v: &Value, dunder: &str) -> Option<Value> {
+    with_host(|h| match h.get(v) {
+        Some(PyObj::Instance(i)) if !matches!(i.payload, Value::Undef) => {
+            let base = h.builtin_base_of(&i.class)?;
+            if base_provides(base, dunder) && h.class_lookup(&i.class, dunder).is_none() {
+                Some(i.payload.clone())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    })
+}
+
+/// For an operand in an arithmetic/comparison operation: if `v` is a
+/// builtin-subclass instance that does not override the operator `dunder`,
+/// return its native payload (so the native operation runs and yields the base
+/// type — `C(5) + 3 == 8`, a plain `int`). Otherwise return `v` unchanged.
+pub fn subclass_operand(v: &Value, dunder: &str) -> Value {
+    with_host(|h| match h.get(v) {
+        Some(PyObj::Instance(i)) if !matches!(i.payload, Value::Undef) => {
+            if h.builtin_base_of(&i.class).is_some() && h.class_lookup(&i.class, dunder).is_none() {
+                i.payload.clone()
+            } else {
+                v.clone()
+            }
+        }
+        _ => v.clone(),
+    })
+}
+
+/// Run method/dunder `name` on a builtin-subclass instance by delegating to its
+/// native payload. Container/value dunders route to the native heap ops; named
+/// methods (`append`, `upper`, `keys`, …) route to [`call_type_method`]. `recv`
+/// is the full instance (needed for a `dict` subclass `__missing__` hook).
+fn base_dispatch(
+    recv: &Value,
+    payload: &Value,
+    base: &str,
+    name: &str,
+    args: Vec<Value>,
+    kwargs: Vec<(String, Value)>,
+) -> Result<Value, String> {
+    match name {
+        "__len__" => {
+            let n = crate::builtins::py_len(payload)?;
+            Ok(Value::Int(n as i64))
+        }
+        "__bool__" => Ok(Value::Bool(with_host(|h| h.truthy(payload)))),
+        "__getitem__" => {
+            let idx = args.into_iter().next().unwrap_or(Value::Undef);
+            // A `dict` subclass with a `__missing__` hook: fire it on a miss.
+            if base == "dict" {
+                let missing = with_host(|h| match h.to_key(&idx) {
+                    Ok(k) => matches!(h.get(payload), Some(PyObj::Dict(d)) if !d.contains_key(&k)),
+                    Err(_) => false,
+                });
+                if missing {
+                    let cls = with_host(|h| match h.get(recv) {
+                        Some(PyObj::Instance(i)) => i.class.clone(),
+                        _ => String::new(),
+                    });
+                    if with_host(|h| h.class_lookup(&cls, "__missing__").is_some()) {
+                        return call_method(recv, "__missing__", vec![idx], vec![]);
+                    }
+                }
+            }
+            with_host(|h| h.get_item(payload, &idx))
+        }
+        "__setitem__" => {
+            let mut it = args.into_iter();
+            let idx = it.next().unwrap_or(Value::Undef);
+            let val = it.next().unwrap_or(Value::Undef);
+            with_host(|h| h.set_item(payload, &idx, val)).map(|_| Value::Undef)
+        }
+        "__delitem__" => {
+            let idx = args.into_iter().next().unwrap_or(Value::Undef);
+            with_host(|h| h.del_item(payload, &idx)).map(|_| Value::Undef)
+        }
+        "__contains__" => {
+            let item = args.into_iter().next().unwrap_or(Value::Undef);
+            Ok(Value::Bool(with_host(|h| h.contains(&item, payload))?))
+        }
+        "__iter__" => with_host(|h| h.make_iter(payload)),
+        "__repr__" => Ok(with_host(|h| {
+            let s = h.repr_of(payload);
+            h.new_str(s)
+        })),
+        "__str__" => Ok(with_host(|h| {
+            let s = h.str_of(payload);
+            h.new_str(s)
+        })),
+        "__hash__" => {
+            // Hash by the payload's value (the base type's `__hash__`).
+            let k = with_host(|h| h.to_key(payload))?;
+            Ok(Value::Int(crate::builtins::hash_key(&k)))
+        }
+        "__int__" | "__index__" => {
+            let n = with_host(|h| h.as_int(payload));
+            match n {
+                Some(n) => Ok(Value::Int(n)),
+                None => crate::builtins::call_type_method(payload, name, args, kwargs),
+            }
+        }
+        "__float__" => {
+            let f = with_host(|h| h.num_val(payload));
+            match f {
+                Some(f) => Ok(Value::Float(f)),
+                None => crate::builtins::call_type_method(payload, name, args, kwargs),
+            }
+        }
+        _ => crate::builtins::call_type_method(payload, name, args, kwargs),
+    }
+}
+
+/// `super().__init__(*args, **kwargs)` inside a builtin-type subclass: populate
+/// the instance's native payload from the constructor arguments. For a mutable
+/// base the payload's storage is replaced with a freshly-built base value; for
+/// an immutable base the value was fixed at `__new__`, so this is a no-op.
+fn base_super_init(
+    base: &str,
+    payload: &Value,
+    args: Vec<Value>,
+    kwargs: Vec<(String, Value)>,
+) -> Result<Value, String> {
+    match base {
+        "list" | "dict" | "set" => {
+            let built = crate::builtins::call_builtin_function(base, args, kwargs)?;
+            with_host(|h| {
+                if let Some(o) = h.get(&built).cloned() {
+                    if let Some(slot) = h.get_mut(payload) {
+                        *slot = o;
+                    }
+                }
+            });
+            Ok(Value::Undef)
+        }
+        // Immutable base: the value is set by `__new__`; `__init__` is a no-op.
+        _ => Ok(Value::Undef),
+    }
+}
+
 /// `recv.name(args)`.
 pub fn call_method(
     recv: &Value,
@@ -5813,6 +6170,14 @@ pub fn call_method(
                         return invoke(&inner, a, kwargs);
                     }
                     _ => return invoke(&f, args, kwargs),
+                }
+            }
+            // Builtin-subclass instance: inherited methods / protocol dunders
+            // delegate to the native payload (`stack.append(x)`, `u.upper()`,
+            // `d.keys()`, and the `__len__`/`__getitem__`/… protocol).
+            if !matches!(inst.payload, Value::Undef) {
+                if let Some(base) = with_host(|h| h.builtin_base_of(&class)) {
+                    return base_dispatch(recv, &inst.payload, base, name, args, kwargs);
                 }
             }
             Err(format!(
@@ -5877,6 +6242,31 @@ pub fn call_method(
                         return run_user_func(&fv, Some(instance), Some(found), args, kwargs);
                     }
                     invoke(&f, args, kwargs)
+                }
+                // A `super().<m>(...)` inside a builtin-type subclass reaches the
+                // builtin base: `super().__init__(it)` fills the native payload,
+                // `super().append(x)` / `super().upper()` run the base method.
+                None if with_host(|h| h.builtin_base_of(&inst_class).is_some())
+                    && !matches!(
+                        with_host(|h| match h.get(&instance) {
+                            Some(PyObj::Instance(i)) => i.payload.clone(),
+                            _ => Value::Undef,
+                        }),
+                        Value::Undef
+                    ) =>
+                {
+                    let base = with_host(|h| h.builtin_base_of(&inst_class)).unwrap();
+                    let payload = with_host(|h| match h.get(&instance) {
+                        Some(PyObj::Instance(i)) => i.payload.clone(),
+                        _ => Value::Undef,
+                    });
+                    if name == "__init__" {
+                        return base_super_init(base, &payload, args, kwargs);
+                    }
+                    if name == "__new__" {
+                        return Ok(instance.clone());
+                    }
+                    base_dispatch(&instance, &payload, base, name, args, kwargs)
                 }
                 // A metaclass's cooperative `super().<m>(...)` falls through to
                 // the builtin `type`'s implementation.
@@ -6117,6 +6507,27 @@ pub fn instantiate_plain(
             a.extend(args.clone());
             invoke(&newf, a, kwargs.clone())?
         }
+    } else if let Some(base) = with_host(|h| h.builtin_base_of(class)) {
+        // Subclass of a builtin type (`class Stack(list)`, `class C(int)`): the
+        // default `__new__`/`__init__` initialize the inherited native payload.
+        // An immutable base (int/float/str/tuple/frozenset) is fixed at
+        // `__new__` from the constructor args. A mutable base (list/dict/set)
+        // is filled from the args unless the subclass defines `__init__` (which
+        // controls filling, typically via `super().__init__(...)`), in which
+        // case it starts empty.
+        let immutable = matches!(base, "int" | "float" | "str" | "tuple" | "frozenset");
+        let has_user_init = with_host(|h| {
+            matches!(
+                h.class_lookup(class, "__init__").and_then(|f| h.get(&f).cloned()),
+                Some(PyObj::Func(_))
+            )
+        });
+        let payload = if immutable || !has_user_init {
+            crate::builtins::call_builtin_function(base, args.clone(), kwargs.clone())?
+        } else {
+            crate::builtins::call_builtin_function(base, vec![], vec![])?
+        };
+        with_host(|h| h.new_instance_payload(class.to_string(), payload))
     } else {
         with_host(|h| {
             let mut attrs = IndexMap::new();
@@ -7468,6 +7879,11 @@ pub fn iter_vec(v: &Value) -> Result<Vec<Value>, String> {
 /// then repeated `__next__` (draining a native iterator/generator if `__iter__`
 /// returned one), else the old-style `__getitem__(0..)` sequence protocol.
 pub fn iter_instance_items(v: &Value) -> Result<Vec<Value>, String> {
+    // A builtin-type subclass without an `__iter__` override materializes its
+    // native payload (`sorted(S([...]))`, `list(Stack(...))`).
+    if let Some(payload) = subclass_payload(v, "__iter__") {
+        return iter_vec(&payload);
+    }
     let (has_iter, has_getitem) = with_host(|h| match h.get(v) {
         Some(PyObj::Instance(i)) => (
             h.class_lookup(&i.class, "__iter__").is_some(),

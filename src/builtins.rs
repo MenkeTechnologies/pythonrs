@@ -890,7 +890,17 @@ fn b_truthy(vm: &mut VM, _: u8) -> Value {
 }
 
 fn instance_has(h: &host::PyHost, i: &Instance, name: &str) -> bool {
-    h.class_lookup(&i.class, name).is_some()
+    if h.class_lookup(&i.class, name).is_some() {
+        return true;
+    }
+    // A builtin-type subclass responds to the protocol dunders its base
+    // provides (`__len__`/`__getitem__`/`__iter__`/`__repr__`/…) via delegation.
+    if !matches!(i.payload, Value::Undef) {
+        if let Some(base) = h.builtin_base_of(&i.class) {
+            return host::base_provides(base, name);
+        }
+    }
+    false
 }
 
 /// Whether `r` is an integer value (`int`/`bool`/bignum) — the required return
@@ -1069,6 +1079,11 @@ fn b_getiter(vm: &mut VM, _: u8) -> Value {
 /// a native iterator is used directly (stays lazy); everything else materializes
 /// through the shared `__iter__`/`__next__`/`__getitem__` protocol.
 fn iter_instance(v: &Value) -> Result<Value, String> {
+    // A builtin-type subclass without an `__iter__` override iterates its native
+    // payload (`for x in Stack([...])`).
+    if let Some(payload) = host::subclass_payload(v, "__iter__") {
+        return with_host(|h| h.make_iter(&payload));
+    }
     let has_iter = with_host(|h| match h.get(v) {
         Some(PyObj::Instance(i)) => h.class_lookup(&i.class, "__iter__").is_some(),
         _ => false,
@@ -1123,6 +1138,14 @@ fn b_contains(vm: &mut VM, _: u8) -> Value {
     // Instance `__contains__` wins; else fall back to iterating the instance
     // (via __iter__/__getitem__) and comparing.
     if with_host(|h| matches!(h.get(&container), Some(PyObj::Instance(_)))) {
+        // A builtin-type subclass without `__contains__` tests membership on its
+        // native payload (`x in Stack([...])`).
+        if let Some(payload) = host::subclass_payload(&container, "__contains__") {
+            return match with_host(|h| h.contains(&item, &payload)) {
+                Ok(b) => Value::Bool(b),
+                Err(e) => abort(vm, e),
+            };
+        }
         let has_contains = with_host(|h| match h.get(&container) {
             Some(PyObj::Instance(i)) => h.class_lookup(&i.class, "__contains__").is_some(),
             _ => false,
@@ -1398,6 +1421,12 @@ fn try_binop_dunder(
     {
         return None;
     }
+    // A builtin-type subclass operand with no override delegates to its native
+    // payload (`S1 | S2` of set subclasses runs native set union, etc.).
+    let a_owned = host::subclass_operand(a, lname);
+    let b_owned = host::subclass_operand(b, rname);
+    let a = &a_owned;
+    let b = &b_owned;
     let involved = with_host(|h| {
         matches!(h.get(a), Some(PyObj::Instance(_))) || matches!(h.get(b), Some(PyObj::Instance(_)))
     });
@@ -1500,6 +1529,12 @@ fn b_binop(vm: &mut VM, _: u8) -> Value {
     let tag = match vm.pop() {
         Value::Int(n) => n,
         _ => return abort(vm, "internal: BINOP tag".into()),
+    };
+    // A builtin-type subclass operand with no override delegates to its native
+    // payload, so the native op runs on the base value (`S1 | S2`, `C(5) // 2`).
+    let (a, b) = match binop_tag_dunders(tag) {
+        Some((l, r)) => (host::subclass_operand(&a, l), host::subclass_operand(&b, r)),
+        None => (a, b),
     };
     // Instance operator overloading (`a / b`, `a % b`, `a & b`, …) via dunders,
     // then core types handled by the host.
@@ -2300,6 +2335,25 @@ fn callable_name(h: &host::PyHost, v: &Value) -> Option<String> {
 /// dispatched first; everything else falls to the host's native numeric logic.
 pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
     use NumOp::*;
+    // A builtin-type subclass operand with no operator override delegates to its
+    // native payload, so `C(5) + 3` runs int arithmetic (yielding a plain `int`)
+    // and `Stack([1]) + [2]` runs list concatenation (a plain `list`).
+    let (fwd, refl) = match op {
+        Neg => ("__neg__", ""),
+        _ => numop_dunders(op).unwrap_or(("", "")),
+    };
+    let a_owned = if fwd.is_empty() {
+        a.clone()
+    } else {
+        host::subclass_operand(a, fwd)
+    };
+    let b_owned = if refl.is_empty() {
+        b.clone()
+    } else {
+        host::subclass_operand(b, refl)
+    };
+    let a = &a_owned;
+    let b = &b_owned;
     let a_inst = with_host(|h| matches!(h.get(a), Some(PyObj::Instance(_))));
     let b_inst = with_host(|h| matches!(h.get(b), Some(PyObj::Instance(_))));
     // No user instance involved → native handling (preserves `1 == 1.0`, etc.).
@@ -2743,6 +2797,9 @@ pub fn call_builtin_function(
             ) {
                 return host::call_method(&v, "__abs__", vec![], vec![]);
             }
+            // An `int`/`float` subclass with no `__abs__` override: `abs` on the
+            // native payload (a plain `int`/`float`).
+            let v = host::subclass_operand(&v, "__abs__");
             with_host(|h| match &v {
                 Value::Int(n) => Ok(Value::Int(n.abs())),
                 Value::Float(f) => Ok(Value::Float(f.abs())),
@@ -3350,7 +3407,7 @@ fn arg0(args: &[Value]) -> Result<Value, String> {
         .ok_or_else(|| host::type_error("missing required argument"))
 }
 
-fn hash_key(k: &PKey) -> i64 {
+pub fn hash_key(k: &PKey) -> i64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
@@ -3358,7 +3415,7 @@ fn hash_key(k: &PKey) -> i64 {
     h.finish() as i64
 }
 
-fn py_len(v: &Value) -> Result<usize, String> {
+pub fn py_len(v: &Value) -> Result<usize, String> {
     with_host(|h| match h.get(v) {
         Some(PyObj::Str(s)) => Ok(s.chars().count()),
         Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) => Ok(b.len()),
