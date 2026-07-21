@@ -653,7 +653,7 @@ fn drive_async_gen(agen: &Value) -> Result<Value, String> {
 
 /// The `agen.asend`/`athrow`/`aclose` awaitables. Each records the op on the
 /// generator cell and returns the generator itself as the awaitable; the actual
-/// drive happens when it is `await`ed (see [`drive_async_gen`]).
+/// drive happens when it is `await`ed (see `drive_async_gen`).
 pub fn async_gen_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<Value, String> {
     match name {
         "asend" => {

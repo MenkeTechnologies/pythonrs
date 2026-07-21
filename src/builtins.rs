@@ -5133,7 +5133,7 @@ fn type_new(name: &Value, bases: &Value, ns: &Value) -> Result<Value, String> {
     type_new_meta(name, bases, ns, "type")
 }
 
-/// `type.__new__(mcls, name, bases, namespace)` — like [`type_new`] but tags the
+/// `type.__new__(mcls, name, bases, namespace)` — like `type_new` but tags the
 /// new class's metaclass as `metaclass` (so `type(cls) is mcls`). Used by the
 /// metaclass construction path.
 pub fn type_new_meta(
