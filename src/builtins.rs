@@ -4816,6 +4816,7 @@ pub fn type_has_method(typename: &str, name: &str) -> bool {
                     "most_common" | "elements" | "subtract" | "update" | "total"
                 )
         }
+        "dict_keys" | "dict_items" => return name == "isdisjoint",
         "set" | "frozenset" => SET_METHODS,
         "tuple" => TUPLE_METHODS,
         "range" => &["index", "count"],
@@ -5267,6 +5268,16 @@ pub fn call_type_method(
         return r;
     }
     let tn = with_host(|h| h.type_name(recv));
+    // Set-like dict views (`dict_keys`/`dict_items`) support `isdisjoint`.
+    if matches!(tn.as_str(), "dict_keys" | "dict_items") && name == "isdisjoint" {
+        let other = arg0(&args)?;
+        let mine = host::iter_vec(recv)?;
+        let theirs = host::iter_vec(&other)?;
+        let disjoint = !mine
+            .iter()
+            .any(|e| theirs.iter().any(|o| with_host(|h| h.equal(e, o))));
+        return Ok(Value::Bool(disjoint));
+    }
     match tn.as_str() {
         // `.format` needs the kwargs (keyword replacement fields); other str
         // methods don't take keywords.
