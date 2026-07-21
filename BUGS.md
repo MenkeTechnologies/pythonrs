@@ -139,6 +139,17 @@ fixed. Every line below was re-checked against the **default-build** binary
   (`del ba[i]`, `del ba[i:j]`, `del ba[::k]`), plus
   `append`/`extend`/`pop`/`clear`. `repr` matches CPython quoting (single/
   double-quote selection; the bytearray always-escape-`'` quirk).
+- **`memoryview`** over a `bytes`/`bytearray` buffer (faithful 1-D unsigned-byte
+  subset, byte-verified vs CPython): `memoryview(b'…')`, `len`, integer indexing
+  (incl. negative), contiguous slicing (a sub-view sharing the buffer) and
+  strided slicing (a fresh view), iteration, byte-value membership, equality
+  against `bytes`/`bytearray`/other views, `bool`, `bytes(mv)`/`list(mv)`
+  conversion, and `tobytes`/`hex`/`tolist`. Read-only descriptors `obj`,
+  `nbytes`, `format` (`'B'`), `itemsize`, `ndim`, `shape`, `strides`,
+  `readonly`, `contiguous`. A view over a `bytearray` reflects later mutations
+  to the backing buffer and is writable-flagged (`readonly` False); a `bytes`
+  backing is read-only. `<memory at 0x…>` repr. Not covered: `cast` (format
+  reinterpretation), multi-dimensional views, item assignment through the view.
 - **Codecs, escapes, and unicode** (byte-verified vs CPython via the `codec`
   fuzz mode, 0 divergences): `str.encode(encoding, errors)` across
   `utf-8`/`ascii`/`latin-1`/`iso-8859-1`/`utf-16`/`utf-32` (bare `utf-16`/`utf-32`
@@ -220,6 +231,14 @@ fixed. Every line below was re-checked against the **default-build** binary
   `__ge__`), and `__getitem__`/`__setitem__`/`__len__`/`__bool__`/`__str__`/
   `__repr__`/`__iter__`/`__next__`/`__init__`/`__hash__`. Container `repr`/`str`
   recurses so instance elements/keys/values dispatch their own `__repr__`.
+  The numeric dunders are also exposed as callable bound methods on
+  `int`/`bool`/`float` (`(5).__index__()`, `(-3).__abs__()`, `(7).__floordiv__(2)`,
+  `(1).__add__(2)`, `(2.0).__round__()`, reflected `__r*__`, comparisons,
+  `__int__`/`__float__`/`__trunc__`/`__floor__`/`__ceil__`/`__invert__`/`__bool__`/
+  `__hash__`); a binary dunder returns the `NotImplemented` singleton for operand
+  types the base type declines (`int` combines only with `int`-likes) — matching
+  CPython, byte-verified. `int`-only bitwise/shift/`__index__`/`__invert__` are
+  absent on `float`, as in CPython.
   In-place augmented dunders are dispatched too (see Implemented). Subclassing
   builtin types (`class L(list)`, `class C(int)`, …) is fully covered: inherited
   methods/operators/iteration, `super().__init__`, `__new__`, use as dict/set
@@ -251,11 +270,6 @@ fixed. Every line below was re-checked against the **default-build** binary
   one call` — the `MKLIST`/`MKTUPLE`/`MKSET`/`MKDICT`/`CALL` ops carry a `u8`
   operand count. CPython builds arbitrarily large literals. Needs a chunked-build
   lowering (or a wider operand) across every collection/call site.
-- **Numeric dunder methods as attributes**: operator dunders on `int`/`float`
-  (`(5).__index__()`, `(-5).__abs__()`, `(7).__floordiv__(2)`) are not exposed as
-  callable attributes, though the operators themselves dispatch. `AttributeError`
-  where CPython returns the bound method.
-- **`memoryview`**: the type is not implemented (`NameError: name 'memoryview'`).
 
 ## Tooling
 - **`--dap`** (Debug Adapter Protocol): implemented — breakpoints, step

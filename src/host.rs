@@ -397,6 +397,17 @@ pub enum PyObj {
     /// A mutable byte string (`bytearray`). Held inline (a plain `Vec<u8>`),
     /// unlike the immutable [`PyObj::Bytes`].
     Bytearray(Vec<u8>),
+    /// A `memoryview` over a `bytes`/`bytearray` buffer. Holds a handle to the
+    /// backing object (not a snapshot), so a view over a `bytearray` reflects
+    /// later mutations. `start`/`len` bound the (possibly sliced) window;
+    /// `readonly` is true for a `bytes` backing. A faithful 1-D unsigned-byte
+    /// (`format 'B'`, `itemsize 1`) subset.
+    Memoryview {
+        obj: Value,
+        start: usize,
+        len: usize,
+        readonly: bool,
+    },
     /// An open file / standard stream. Holds only an index into
     /// `PyHost.io_handles`; the underlying `std::fs::File` is neither `Clone`
     /// nor storable inline, so it lives in the side table (ported from
@@ -1566,6 +1577,7 @@ impl PyHost {
                 Some(PyObj::Str(_)) => "str".into(),
                 Some(PyObj::Bytes(_)) => "bytes".into(),
                 Some(PyObj::Bytearray(_)) => "bytearray".into(),
+                Some(PyObj::Memoryview { .. }) => "memoryview".into(),
                 Some(PyObj::List(_)) => "list".into(),
                 Some(PyObj::Tuple(_)) => match v {
                     Value::Obj(i) => match self.nt_meta.get(i) {
@@ -1650,6 +1662,7 @@ impl PyHost {
                 Some(PyObj::Str(s)) => !s.is_empty(),
                 Some(PyObj::Bytes(b)) => !b.is_empty(),
                 Some(PyObj::Bytearray(b)) => !b.is_empty(),
+                Some(PyObj::Memoryview { len, .. }) => *len != 0,
                 Some(PyObj::Deque { items, .. }) => !items.is_empty(),
                 Some(PyObj::List(l)) => !l.is_empty(),
                 Some(PyObj::Tuple(l)) => !l.is_empty(),
@@ -1781,6 +1794,9 @@ impl PyHost {
                 }
                 Some(PyObj::AsyncObj { id }) => async_rt::async_obj_repr(*id),
                 Some(PyObj::Bytearray(b)) => format!("bytearray(b{})", quote_bytes(b, true)),
+                Some(PyObj::Memoryview { .. }) => {
+                    format!("<memory at 0x{:012x}>", self.addr_of(v))
+                }
                 Some(PyObj::File { id }) => self.file_repr(*id),
                 Some(PyObj::Deque { items, maxlen }) => {
                     let inner: Vec<String> = items.iter().map(|x| self.repr_of(x)).collect();
@@ -2181,6 +2197,34 @@ impl PyHost {
                     | (Some(PyObj::Bytes(x)), Some(PyObj::Bytearray(y)))
                     | (Some(PyObj::Bytearray(x)), Some(PyObj::Bytes(y)))
                     | (Some(PyObj::Bytearray(x)), Some(PyObj::Bytearray(y))) => x == y,
+                    // A memoryview compares by its bytes against another view or a
+                    // bytes/bytearray (`memoryview(b'ab') == b'ab'`).
+                    (Some(PyObj::Memoryview { .. }), _)
+                        if matches!(
+                            self.get(b),
+                            Some(PyObj::Memoryview { .. })
+                                | Some(PyObj::Bytes(_))
+                                | Some(PyObj::Bytearray(_))
+                        ) =>
+                    {
+                        let yb = match self.get(b) {
+                            Some(PyObj::Bytes(y)) | Some(PyObj::Bytearray(y)) => y.clone(),
+                            _ => self.mv_bytes(b),
+                        };
+                        self.mv_bytes(a) == yb
+                    }
+                    (_, Some(PyObj::Memoryview { .. }))
+                        if matches!(
+                            self.get(a),
+                            Some(PyObj::Bytes(_)) | Some(PyObj::Bytearray(_))
+                        ) =>
+                    {
+                        let xb = match self.get(a) {
+                            Some(PyObj::Bytes(x)) | Some(PyObj::Bytearray(x)) => x.clone(),
+                            _ => Vec::new(),
+                        };
+                        xb == self.mv_bytes(b)
+                    }
                     // Type/function objects compare by name, so `type(5) == int`
                     // and `type(b) == B` hold regardless of heap identity.
                     (Some(PyObj::Builtin(x)), Some(PyObj::Builtin(y))) => x == y,
@@ -3021,7 +3065,30 @@ impl PyHost {
                         v.extend_from_slice(y);
                         Ok(self.alloc(PyObj::Bytearray(v)))
                     }
-                    _ => Err(self.optype_err("+", a, b)),
+                    // A sequence left operand with an incompatible right operand
+                    // gives the type-specific concat error, not the generic
+                    // "unsupported operand type(s)" one.
+                    _ => {
+                        let rt = self.type_name(b);
+                        Err(match self.get(a) {
+                            Some(PyObj::Str(_)) => type_error(&format!(
+                                "can only concatenate str (not \"{rt}\") to str"
+                            )),
+                            Some(PyObj::List(_)) => type_error(&format!(
+                                "can only concatenate list (not \"{rt}\") to list"
+                            )),
+                            Some(PyObj::Tuple(_)) => type_error(&format!(
+                                "can only concatenate tuple (not \"{rt}\") to tuple"
+                            )),
+                            Some(PyObj::Bytes(_)) => {
+                                type_error(&format!("can't concat {rt} to bytes"))
+                            }
+                            Some(PyObj::Bytearray(_)) => {
+                                type_error(&format!("can't concat {rt} to bytearray"))
+                            }
+                            _ => self.optype_err("+", a, b),
+                        })
+                    }
                 }
             }
             Sub => {
@@ -3280,7 +3347,7 @@ impl PyHost {
                     match (self.complex_val(a), self.complex_val(b)) {
                         (Some((ar, ai)), Some((br, bi))) => {
                             if br == 0.0 && bi == 0.0 {
-                                return Err("ZeroDivisionError: complex division by zero".into());
+                                return Err("ZeroDivisionError: division by zero".into());
                             }
                             let (rr, ri) = c_quot(ar, ai, br, bi);
                             Ok(self.alloc(PyObj::Complex(rr, ri)))
@@ -3294,7 +3361,7 @@ impl PyHost {
                 // Python `//` floors toward −∞ (not Rust truncation).
                 if let (Some(x), Some(y)) = (ai, bi) {
                     if y == 0 {
-                        return Err("ZeroDivisionError: integer division or modulo by zero".into());
+                        return Err("ZeroDivisionError: division by zero".into());
                     }
                     let (x, y) = (x as i128, y as i128);
                     let q = x / y;
@@ -3308,14 +3375,12 @@ impl PyHost {
                 }
                 if let (Some(x), Some(y)) = (self.big_val(a), self.big_val(b)) {
                     if y == num_bigint::BigInt::from(0) {
-                        return Err("ZeroDivisionError: integer division or modulo by zero".into());
+                        return Err("ZeroDivisionError: division by zero".into());
                     }
                     return Ok(self.norm_big(bigint_floordiv(&x, &y)));
                 }
                 match (af, bf) {
-                    (Some(_), Some(0.0)) => {
-                        Err("ZeroDivisionError: float floor division by zero".into())
-                    }
+                    (Some(_), Some(0.0)) => Err("ZeroDivisionError: division by zero".into()),
                     (Some(x), Some(y)) => Ok(Value::Float(float_divmod(x, y).0)),
                     _ => Err(self.optype_err("//", a, b)),
                 }
@@ -3332,7 +3397,7 @@ impl PyHost {
                 // Python `%` takes the sign of the divisor (floored remainder).
                 if let (Some(x), Some(y)) = (ai, bi) {
                     if y == 0 {
-                        return Err("ZeroDivisionError: integer division or modulo by zero".into());
+                        return Err("ZeroDivisionError: division by zero".into());
                     }
                     let r = x % y;
                     let r = if r != 0 && (r < 0) != (y < 0) {
@@ -3344,12 +3409,12 @@ impl PyHost {
                 }
                 if let (Some(x), Some(y)) = (self.big_val(a), self.big_val(b)) {
                     if y == num_bigint::BigInt::from(0) {
-                        return Err("ZeroDivisionError: integer division or modulo by zero".into());
+                        return Err("ZeroDivisionError: division by zero".into());
                     }
                     return Ok(self.norm_big(bigint_mod(&x, &y)));
                 }
                 match (af, bf) {
-                    (Some(_), Some(0.0)) => Err("ZeroDivisionError: float modulo".into()),
+                    (Some(_), Some(0.0)) => Err("ZeroDivisionError: division by zero".into()),
                     (Some(x), Some(y)) => Ok(Value::Float(float_divmod(x, y).1)),
                     _ => Err(self.optype_err("%", a, b)),
                 }
@@ -3374,16 +3439,9 @@ impl PyHost {
                 }
                 _ => match (af, bf) {
                     // `0 ** <negative>` is a division by zero in CPython, not `inf`.
-                    // Integer base and float base word the message differently.
+                    // As of 3.14 both int and float bases word it the same way.
                     (Some(x), Some(y)) if x == 0.0 && y < 0.0 => {
-                        if ai.is_some() && bi.is_some() {
-                            Err("ZeroDivisionError: zero to a negative power".into())
-                        } else {
-                            Err(
-                                "ZeroDivisionError: 0.0 cannot be raised to a negative power"
-                                    .into(),
-                            )
-                        }
+                        Err("ZeroDivisionError: zero to a negative power".into())
                     }
                     // A negative real base raised to a non-integer power yields a
                     // complex result in CPython (Rust's `powf` returns NaN).
@@ -4244,6 +4302,25 @@ pub fn ascii_of(s: &str) -> String {
 // ── indexing / iteration / containment ───────────────────────────────────────
 
 impl PyHost {
+    /// The current bytes a `memoryview` exposes, read from its live backing
+    /// `bytes`/`bytearray` object (so a view over a `bytearray` reflects
+    /// mutations). Empty for a non-memoryview or a stale/out-of-bounds window.
+    pub fn mv_bytes(&self, recv: &Value) -> Vec<u8> {
+        if let Some(PyObj::Memoryview {
+            obj, start, len, ..
+        }) = self.get(recv)
+        {
+            let (start, len) = (*start, *len);
+            if let Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) = self.get(obj) {
+                return b
+                    .get(start..start + len)
+                    .map(|s| s.to_vec())
+                    .unwrap_or_default();
+            }
+        }
+        Vec::new()
+    }
+
     /// `recv[idx]`.
     pub fn get_item(&mut self, recv: &Value, idx: &Value) -> Result<Value, String> {
         #[cfg(feature = "stdlib-ffi")]
@@ -4257,13 +4334,15 @@ impl PyHost {
         }
         match self.get(recv) {
             Some(PyObj::List(l)) | Some(PyObj::Tuple(l)) => {
+                let is_tuple = matches!(self.get(recv), Some(PyObj::Tuple(_)));
                 let n = l.len() as i64;
                 let i = self
                     .as_int(idx)
                     .ok_or_else(|| type_error("indices must be integers"))?;
                 let k = if i < 0 { i + n } else { i };
                 if k < 0 || k >= n {
-                    return Err("IndexError: index out of range".into());
+                    let ty = if is_tuple { "tuple" } else { "list" };
+                    return Err(format!("IndexError: {ty} index out of range"));
                 }
                 Ok(l[k as usize].clone())
             }
@@ -4304,13 +4383,19 @@ impl PyHost {
                 Ok(Value::Int(start + k * step))
             }
             Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) => {
+                // `bytes` reports the bare message; `bytearray` names the type.
+                let is_ba = matches!(self.get(recv), Some(PyObj::Bytearray(_)));
                 let n = b.len() as i64;
                 let i = self
                     .as_int(idx)
                     .ok_or_else(|| type_error("byte indices must be integers"))?;
                 let k = if i < 0 { i + n } else { i };
                 if k < 0 || k >= n {
-                    return Err("IndexError: index out of range".into());
+                    return Err(if is_ba {
+                        "IndexError: bytearray index out of range".into()
+                    } else {
+                        "IndexError: index out of range".into()
+                    });
                 }
                 Ok(Value::Int(b[k as usize] as i64))
             }
@@ -4324,6 +4409,18 @@ impl PyHost {
                     return Err("IndexError: deque index out of range".into());
                 }
                 Ok(items[k as usize].clone())
+            }
+            Some(PyObj::Memoryview { .. }) => {
+                let bytes = self.mv_bytes(recv);
+                let n = bytes.len() as i64;
+                let i = self
+                    .as_int(idx)
+                    .ok_or_else(|| type_error("memoryview: invalid slice key"))?;
+                let k = if i < 0 { i + n } else { i };
+                if k < 0 || k >= n {
+                    return Err("IndexError: index out of bounds on dimension 1".into());
+                }
+                Ok(Value::Int(bytes[k as usize] as i64))
             }
             _ => Err(type_error(&format!(
                 "'{}' object is not subscriptable",
@@ -4357,6 +4454,55 @@ impl PyHost {
                 start: rstart + i * rstep,
                 stop: rstart + j * rstep,
                 step: rstep * step,
+            }));
+        }
+        // Slicing a memoryview yields another memoryview. A contiguous
+        // (`step == 1`) slice is a sub-view sharing the backing buffer; a
+        // strided slice materializes a fresh read-only byte buffer to view.
+        if let Some(PyObj::Memoryview {
+            obj,
+            start,
+            len,
+            readonly,
+        }) = self.get(recv)
+        {
+            let (obj, start, readonly) = (obj.clone(), *start, *readonly);
+            let n = *len as i64;
+            let (mut i, stop) = slice_bounds(lo, hi, step, n, self);
+            if step == 1 {
+                let lo_i = i.clamp(0, n);
+                let hi_i = stop.clamp(lo_i, n);
+                return Ok(self.alloc(PyObj::Memoryview {
+                    obj,
+                    start: start + lo_i as usize,
+                    len: (hi_i - lo_i) as usize,
+                    readonly,
+                }));
+            }
+            let src = self.mv_bytes(recv);
+            let mut out = Vec::new();
+            if step > 0 {
+                while i < stop {
+                    if i >= 0 && i < n {
+                        out.push(src[i as usize]);
+                    }
+                    i += step;
+                }
+            } else {
+                while i > stop {
+                    if i >= 0 && i < n {
+                        out.push(src[i as usize]);
+                    }
+                    i += step;
+                }
+            }
+            let len = out.len();
+            let buf = self.alloc(PyObj::Bytes(out));
+            return Ok(self.alloc(PyObj::Memoryview {
+                obj: buf,
+                start: 0,
+                len,
+                readonly: true,
             }));
         }
         // Slicing bytes/bytearray yields a new buffer of the same type.
@@ -4760,6 +4906,11 @@ impl PyHost {
             Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) => {
                 Ok(b.iter().map(|&x| Value::Int(x as i64)).collect())
             }
+            Some(PyObj::Memoryview { .. }) => Ok(self
+                .mv_bytes(v)
+                .iter()
+                .map(|&x| Value::Int(x as i64))
+                .collect()),
             Some(PyObj::Str(s)) => {
                 let chars: Vec<Value> = s
                     .chars()
@@ -4965,6 +5116,14 @@ impl PyHost {
                     return Ok(true);
                 }
                 Ok(hay.windows(needle.len()).any(|w| w == needle.as_slice()))
+            }
+            // `int in memoryview` tests byte-value membership over the view.
+            Some(PyObj::Memoryview { .. }) => {
+                let hay = self.mv_bytes(container);
+                match self.as_int(item) {
+                    Some(n) if (0..=255).contains(&n) => Ok(hay.contains(&(n as u8))),
+                    _ => Ok(false),
+                }
             }
             Some(PyObj::Range { start, stop, step }) => {
                 let (start, stop, step) = (*start, *stop, *step);
@@ -5437,6 +5596,47 @@ impl PyHost {
                 if (n == "bytes" || n == "bytearray") && name == "maketrans" =>
             {
                 Ok(self.alloc(PyObj::Builtin(format!("{n}.maketrans"))))
+            }
+            // `memoryview` read-only descriptor attributes. A faithful 1-D
+            // unsigned-byte view: `format 'B'`, `itemsize 1`, `ndim 1`,
+            // contiguous. `obj` is the backing object; `nbytes`/`shape` derive
+            // from the window length.
+            Some(PyObj::Memoryview {
+                obj, len, readonly, ..
+            }) if matches!(
+                name,
+                "obj"
+                    | "nbytes"
+                    | "format"
+                    | "itemsize"
+                    | "ndim"
+                    | "readonly"
+                    | "shape"
+                    | "strides"
+                    | "contiguous"
+                    | "c_contiguous"
+                    | "f_contiguous"
+            ) =>
+            {
+                let (obj, len, readonly) = (obj.clone(), *len, *readonly);
+                Ok(match name {
+                    "obj" => obj,
+                    "nbytes" => Value::Int(len as i64),
+                    "format" => self.new_str("B"),
+                    "itemsize" => Value::Int(1),
+                    "ndim" => Value::Int(1),
+                    "readonly" => Value::Bool(readonly),
+                    "shape" => {
+                        let n = Value::Int(len as i64);
+                        self.new_tuple(vec![n])
+                    }
+                    "strides" => {
+                        let one = Value::Int(1);
+                        self.new_tuple(vec![one])
+                    }
+                    // Single-segment 1-D views are contiguous in every layout.
+                    _ => Value::Bool(true),
+                })
             }
             // `slice` read-only attributes: the RAW stored bound objects
             // (`slice(x).start is x`), `None` for an omitted bound.
