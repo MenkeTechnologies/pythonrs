@@ -4464,9 +4464,13 @@ impl PyHost {
             Some(PyObj::List(l)) | Some(PyObj::Tuple(l)) => {
                 let is_tuple = matches!(self.get(recv), Some(PyObj::Tuple(_)));
                 let n = l.len() as i64;
-                let i = self
-                    .as_int(idx)
-                    .ok_or_else(|| type_error("indices must be integers"))?;
+                let i = self.as_int(idx).ok_or_else(|| {
+                    let ty = if is_tuple { "tuple" } else { "list" };
+                    type_error(&format!(
+                        "{ty} indices must be integers or slices, not {}",
+                        self.type_name(idx)
+                    ))
+                })?;
                 let k = if i < 0 { i + n } else { i };
                 if k < 0 || k >= n {
                     let ty = if is_tuple { "tuple" } else { "list" };
