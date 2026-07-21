@@ -1474,6 +1474,13 @@ fn b_raise(vm: &mut VM, argc: u8) -> Value {
                         _ => Value::Undef,
                     };
                     h.set_exc_link(&new_exc, cause.clone(), ctx);
+                    // Any explicit `from` clause (including `from None`) sets
+                    // `__suppress_context__`, hiding the implicit context.
+                    if argc >= 2 {
+                        if let Value::Obj(id) = new_exc {
+                            h.suppress_context.insert(id);
+                        }
+                    }
                 }
             });
             abort(vm, msg)
@@ -2274,11 +2281,12 @@ fn b_try(vm: &mut VM, _: u8) -> Value {
                     // Clear the propagating-error state but keep the caught
                     // exception as the "currently handled" one, so a bare `raise`
                     // in the handler body re-raises it (`b_reraise` reads `h.exc`).
-                    // The exception is caught: the frames it unwound past are no
-                    // longer part of an uncaught trace, so discard them.
+                    // The exception is caught: snapshot its frames as `__traceback__`
+                    // (for a later chained render), then discard the live trace.
                     with_host(|h| {
                         h.error = None;
                         h.exc = Some(exc.clone());
+                        h.capture_exc_tb(&exc);
                         h.traceback.clear();
                     });
                     let hres = host::run_chunk_on(hbody.clone());
