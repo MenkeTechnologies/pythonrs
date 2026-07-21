@@ -1595,6 +1595,10 @@ fn type_object_class_name(n: &str) -> Option<String> {
     if let Some(q) = qualified {
         return Some(q.to_string());
     }
+    // Builtin exception classes (`ValueError`, `KeyError`, …) are type objects.
+    if crate::builtins::is_exception_class(n) {
+        return Some(n.to_string());
+    }
     // Unqualified builtin type names: constructors plus the names `type()`
     // yields for functions, methods, iterators, views, sentinels, descriptors.
     let unqualified = matches!(
@@ -1818,14 +1822,21 @@ impl PyHost {
                         .unwrap_or_default();
                     format!("<function {name}>")
                 }
-                // A `PyObj::Builtin` is either a callable builtin (`len`,
-                // `math.sqrt`) or a *type object* returned by `type(x)`. Type
-                // objects repr as `<class 'X'>` (module-qualified for stdlib
-                // container types); callables as `<built-in function X>`.
-                Some(PyObj::Builtin(n)) => match type_object_class_name(n) {
-                    Some(cls) => format!("<class '{cls}'>"),
-                    None => format!("<built-in function {n}>"),
-                },
+                // A `PyObj::Builtin` is an unbound builtin method
+                // (`str.upper`), a *type object* returned by `type(x)` (repr
+                // `<class 'X'>`), or a plain callable builtin (`len`,
+                // `math.sqrt` -> `<built-in function X>`).
+                Some(PyObj::Builtin(n)) => {
+                    if let Some((tp, meth)) = n.split_once('.') {
+                        if crate::builtins::type_has_method(tp, meth) {
+                            return format!("<method '{meth}' of '{tp}' objects>");
+                        }
+                    }
+                    match type_object_class_name(n) {
+                        Some(cls) => format!("<class '{cls}'>"),
+                        None => format!("<built-in function {n}>"),
+                    }
+                }
                 Some(PyObj::BoundMethod { .. }) => "<bound method>".into(),
                 Some(PyObj::Exception { class, args }) => self.exc_str(class, args),
                 Some(PyObj::Module { name, .. }) => format!("<module '{name}'>"),
@@ -5651,17 +5662,32 @@ impl PyHost {
                 let (def_id, defaults) = (fv.def_id, fv.defaults.clone());
                 self.func_dunder(name, def_id, &defaults)
             }
-            Some(PyObj::BoundMethod { func, .. })
+            Some(PyObj::BoundMethod { func, recv })
                 if matches!(
                     name,
                     "__name__" | "__qualname__" | "__module__" | "__defaults__"
                 ) =>
             {
                 let func = func.clone();
+                let recv = recv.clone();
                 match self.get(&func) {
                     Some(PyObj::Func(fv)) => {
                         let (def_id, defaults) = (fv.def_id, fv.defaults.clone());
                         self.func_dunder(name, def_id, &defaults)
+                    }
+                    // A bound builtin method (`[].append`): `func` is the method
+                    // name. `__name__` is the bare name, `__qualname__` is
+                    // `<type>.<name>`; `__module__`/`__defaults__` are `None`.
+                    Some(PyObj::Builtin(bn)) => {
+                        let bare = bn.rsplit('.').next().unwrap_or(bn).to_string();
+                        match name {
+                            "__name__" => Ok(self.new_str(bare)),
+                            "__qualname__" => {
+                                let tn = self.type_name(&recv);
+                                Ok(self.new_str(format!("{tn}.{bare}")))
+                            }
+                            _ => Ok(Value::Undef),
+                        }
                     }
                     _ => Err(format!(
                         "AttributeError: 'method' object has no attribute '{name}'"
@@ -5699,6 +5725,14 @@ impl PyHost {
                 if (n == "bytes" || n == "bytearray") && name == "maketrans" =>
             {
                 Ok(self.alloc(PyObj::Builtin(format!("{n}.maketrans"))))
+            }
+            // Unbound instance method reached via a builtin type object
+            // (`str.lower`, `list.append`, `dict.get`): a callable that takes the
+            // receiver as its first argument (CPython's unbound method). Gated by
+            // `type_has_method`, so a non-method name falls through to
+            // AttributeError below.
+            Some(PyObj::Builtin(n)) if crate::builtins::type_has_method(n, name) => {
+                Ok(self.alloc(PyObj::Builtin(format!("{n}.{name}"))))
             }
             // `memoryview` read-only descriptor attributes. A faithful 1-D
             // unsigned-byte view: `format 'B'`, `itemsize 1`, `ndim 1`,
@@ -8232,6 +8266,19 @@ pub fn iter_vec(v: &Value) -> Result<Vec<Value>, String> {
         }
         return Ok(out);
     }
+    // A foreign (CPython) iterable drains via `iter_step` so its advance runs
+    // with the host borrow released — a lazy stdlib iterator built over a
+    // pythonrs callback (`list(itertools.starmap(pow, …))`) would otherwise
+    // re-enter the host mid-borrow and panic.
+    #[cfg(feature = "stdlib-ffi")]
+    if with_host(|h| h.foreign_id(v)).is_some() {
+        let it = with_host(|h| h.make_iter(v))?;
+        let mut out = Vec::new();
+        while let Some(x) = iter_step(&it)? {
+            out.push(x);
+        }
+        return Ok(out);
+    }
     // A user instance iterates via its `__iter__`/`__next__` (or `__getitem__`)
     // protocol — reached by `list()`/`tuple()`/`sum()`/… over custom iterables.
     if with_host(|h| matches!(h.get(v), Some(PyObj::Instance(_)))) {
@@ -8313,6 +8360,10 @@ pub fn iter_step(it: &Value) -> Result<Option<Value>, String> {
         Some(PyObj::FilterObj { .. }) => filter_step(it),
         Some(PyObj::EnumerateObj { .. }) => enumerate_step(it),
         Some(PyObj::CallIter { .. }) => calliter_step(it),
+        // A foreign (CPython) iterator advances with the host borrow released so
+        // a lazy stdlib iterator running a pythonrs callback can re-enter.
+        #[cfg(feature = "stdlib-ffi")]
+        Some(PyObj::Foreign(id)) => crate::ffi::iter_next_cb(id),
         _ => with_host(|h| h.iter_next(it)),
     }
 }
@@ -8527,12 +8578,18 @@ fn enumerate_step(it: &Value) -> Result<Option<Value>, String> {
 pub fn import_module(name: &str) -> Result<Value, String> {
     // Native stdlib modules under src/stdlib. Their `entries` return owned-String
     // keys (vs the `&str` keys of the inline arms below), so build the namespace
-    // here and return before the `&str` match.
+    // here and return before the `&str` match. These are pure-Python subsets
+    // (e.g. the native `textwrap` covers only `width`, not the full keyword-
+    // option surface), so with the FFI bridge on they are skipped in favor of
+    // the real CPython modules; they serve only the `--no-default-features` build.
+    #[cfg(not(feature = "stdlib-ffi"))]
     let stdlib_entries: Option<Vec<(String, Value)>> = match name {
         "textwrap" => Some(with_host(crate::stdlib::textwrap::entries)),
         "statistics" => Some(with_host(crate::stdlib::statistics::entries)),
         _ => None,
     };
+    #[cfg(feature = "stdlib-ffi")]
+    let stdlib_entries: Option<Vec<(String, Value)>> = None;
     if let Some(entries) = stdlib_entries {
         return Ok(with_host(|h| {
             let mut ns = IndexMap::new();

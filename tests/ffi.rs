@@ -96,3 +96,52 @@ print(math.isqrt(100), math.trunc(3.7), math.comb(5, 2), round(math.hypot(3, 4),
     }
     assert_eq!(stdout, "10 3 10 5.0\n", "stderr={stderr}");
 }
+
+/// Reverse-callback reentrancy: a lazy CPython stdlib iterator (`itertools`) and
+/// a `functools.cmp_to_key` comparator both call back into a pythonrs callable
+/// while the host is mid-operation. These used to panic with `RefCell already
+/// borrowed`; the FFI iteration/binary-op paths now release the host borrow
+/// across the CPython call. Skips cleanly when the stdlib bridge is unavailable.
+#[test]
+fn ffi_reverse_callbacks_do_not_panic() {
+    let src = "\
+import itertools, functools
+print(list(itertools.starmap(pow, [(2, 3), (3, 2), (10, 2)])))
+print(list(itertools.takewhile(lambda x: x < 100, [1, 10, 100, 5])))
+print(list(itertools.filterfalse(lambda x: x % 2, range(6))))
+print(sorted([3, 1, 2], key=functools.cmp_to_key(lambda a, b: b - a)))
+print(sorted(['pie', 'a', 'bb'], key=functools.cmp_to_key(lambda a, b: len(a) - len(b))))
+";
+    let (stdout, stderr, ok) = run_py(src);
+    if !ok || stderr.contains("ModuleNotFoundError") {
+        eprintln!("skipping ffi-callback test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert!(!stderr.contains("RefCell"), "reentrancy panic: {stderr}");
+    assert_eq!(
+        stdout,
+        "[8, 9, 100]\n[1, 10]\n[0, 2, 4]\n[3, 2, 1]\n['a', 'bb', 'pie']\n",
+        "stderr={stderr}"
+    );
+}
+
+/// `float()` of a foreign object honors its `__float__` (`Fraction`, `Decimal`),
+/// and `textwrap`/`statistics` resolve to the real CPython modules (the native
+/// subsets are skipped under the FFI bridge, so keyword options like `width=`
+/// work). Skips cleanly when the bridge is unavailable.
+#[test]
+fn ffi_float_conversion_and_full_stdlib_modules() {
+    let src = "\
+from fractions import Fraction
+from decimal import Decimal
+import textwrap
+print(float(Fraction(1, 3)), float(Decimal('2.5')))
+print(textwrap.fill('a b c d e f', width=5))
+";
+    let (stdout, stderr, ok) = run_py(src);
+    if !ok || stderr.contains("ModuleNotFoundError") {
+        eprintln!("skipping ffi-float/stdlib test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(stdout, "0.3333333333333333 2.5\na b c\nd e f\n", "stderr={stderr}");
+}

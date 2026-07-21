@@ -2472,6 +2472,29 @@ fn callable_name(h: &host::PyHost, v: &Value) -> Option<String> {
 /// Python arithmetic/comparison for operands the VM can't handle natively. User
 /// instances defining an operator dunder (`__add__`, `__eq__`, `__lt__`, …) are
 /// dispatched first; everything else falls to the host's native numeric logic.
+/// The `operator`-module attribute name for a `NumOp` binary op (`Add` → `add`,
+/// `Lt` → `lt`, …), or `None` for the unary `Neg`. Used to run an op on a
+/// `Foreign` operand in CPython over the FFI bridge.
+#[cfg(feature = "stdlib-ffi")]
+fn foreign_binop_func(op: NumOp) -> Option<&'static str> {
+    use NumOp::*;
+    Some(match op {
+        Add => "add",
+        Sub => "sub",
+        Mul => "mul",
+        Div => "truediv",
+        Mod => "mod",
+        Pow => "pow",
+        Eq => "eq",
+        Ne => "ne",
+        Lt => "lt",
+        Le => "le",
+        Gt => "gt",
+        Ge => "ge",
+        Neg => return None,
+    })
+}
+
 pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
     use NumOp::*;
     // A builtin-type subclass operand with no operator override delegates to its
@@ -2493,6 +2516,16 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
     };
     let a = &a_owned;
     let b = &b_owned;
+    // A CPython (Foreign) operand runs the op in CPython with the host borrow
+    // released, so an operator that re-enters pythonrs (a `cmp_to_key` wrapper's
+    // `__lt__` calling the user cmp function during `sorted`) doesn't double-
+    // borrow the host. `h.arith`'s foreign branch would hold the borrow.
+    #[cfg(feature = "stdlib-ffi")]
+    if let Some(func) = foreign_binop_func(op) {
+        if with_host(|h| h.foreign_id(a).is_some() || h.foreign_id(b).is_some()) {
+            return crate::ffi::binary_op_cb(func, a, b);
+        }
+    }
     let a_inst = with_host(|h| matches!(h.get(a), Some(PyObj::Instance(_))));
     let b_inst = with_host(|h| matches!(h.get(b), Some(PyObj::Instance(_))));
     // No user instance involved → native handling (preserves `1 == 1.0`, etc.).
@@ -2905,6 +2938,21 @@ pub fn call_builtin_function(
                 h.alloc(PyObj::Bytes(b))
             }
         }));
+    }
+    // Unbound builtin instance method reached via the type object
+    // (`str.lower(s)`, `list.append(lst, x)`, `dict.get(d, k)`): the first
+    // argument is the receiver. Gated by `is_builtin_type` + `type_has_method`
+    // so only genuine `type.method` names route here (getattr already rejected a
+    // bad name), never a module function like `math.sqrt`.
+    if let Some((tp, meth)) = name.split_once('.') {
+        if is_builtin_type(tp) && type_has_method(tp, meth) {
+            let Some(recv) = args.first().cloned() else {
+                return Err(host::type_error(&format!(
+                    "descriptor '{meth}' of '{tp}' object needs an argument"
+                )));
+            };
+            return call_type_method(&recv, meth, args[1..].to_vec(), kwargs);
+        }
     }
     // Native stdlib module functions (src/stdlib). These take `&mut PyHost`.
     if let Some(f) = name.strip_prefix("textwrap.") {
@@ -4119,6 +4167,12 @@ fn construct_float(args: &[Value]) -> Result<Value, String> {
         Some(v) => v.clone(),
         None => return Ok(Value::Float(0.0)),
     };
+    // A foreign (CPython) object runs through CPython's own `float()` so its
+    // `__float__`/`__index__` (`Fraction`, `Decimal`, …) are honored.
+    #[cfg(feature = "stdlib-ffi")]
+    if let Some(id) = with_host(|h| h.foreign_id(&v)) {
+        return crate::ffi::to_float(id).map(Value::Float);
+    }
     // `float(x)` honors `__float__`, then `__index__`.
     let has_float = with_host(
         |h| matches!(h.get(&v), Some(PyObj::Instance(i)) if instance_has(h, i, "__float__")),
@@ -9323,6 +9377,21 @@ fn new_str(s: String) -> Value {
 
 /// Apply a `format()` mini-language spec to a stringified value. Supports
 /// `[[fill]align][sign][#][0][width][,][.prec][type]` for the common cases.
+/// CPython's spelling of a non-finite float inside a numeric format type:
+/// lowercase `nan`/`inf`/`-inf` for `f`/`e`/`g`/`%`, uppercase for `F`/`E`/`G`.
+/// `None` for a finite value. The returned body still flows through the shared
+/// sign/width/zero-fill logic (so `{inf:08.2f}` → `00000inf`, like CPython).
+fn fmt_nonfinite(f: f64, upper: bool) -> Option<String> {
+    if f.is_nan() {
+        Some(if upper { "NAN" } else { "nan" }.to_string())
+    } else if f.is_infinite() {
+        let s = if upper { "INF" } else { "inf" };
+        Some(if f < 0.0 { format!("-{s}") } else { s.to_string() })
+    } else {
+        None
+    }
+}
+
 pub fn apply_format_spec(s: &str, v: &Value, spec: &str) -> Result<String, String> {
     if spec.is_empty() {
         return Ok(s.to_string());
@@ -9401,15 +9470,18 @@ pub fn apply_format_spec(s: &str, v: &Value, spec: &str) -> Result<String, Strin
             },
             'f' | 'F' => {
                 let f = as_f(v).unwrap_or(0.0);
-                format!("{:.*}", prec.unwrap_or(6), f)
+                fmt_nonfinite(f, ty == 'F')
+                    .unwrap_or_else(|| format!("{:.*}", prec.unwrap_or(6), f))
             }
             'e' | 'E' => {
                 let f = as_f(v).unwrap_or(0.0);
-                crate::host::fmt_sci(f, prec.unwrap_or(6), ty == 'E')
+                fmt_nonfinite(f, ty == 'E')
+                    .unwrap_or_else(|| crate::host::fmt_sci(f, prec.unwrap_or(6), ty == 'E'))
             }
             'g' | 'G' => {
                 let f = as_f(v).unwrap_or(0.0);
-                crate::host::fmt_g(f, prec.unwrap_or(6), ty == 'G', alt)
+                fmt_nonfinite(f, ty == 'G')
+                    .unwrap_or_else(|| crate::host::fmt_g(f, prec.unwrap_or(6), ty == 'G', alt))
             }
             'c' => match as_i(v) {
                 Some(n) => char::from_u32(n as u32)
@@ -9426,8 +9498,11 @@ pub fn apply_format_spec(s: &str, v: &Value, spec: &str) -> Result<String, Strin
             'b' => fmt_int_radix(v, 2, if alt { "0b" } else { "" }, false)
                 .unwrap_or_else(|| s.to_string()),
             '%' => {
-                let f = as_f(v).unwrap_or(0.0) * 100.0;
-                format!("{:.*}%", prec.unwrap_or(6), f)
+                let f = as_f(v).unwrap_or(0.0);
+                match fmt_nonfinite(f, false) {
+                    Some(s) => format!("{s}%"),
+                    None => format!("{:.*}%", prec.unwrap_or(6), f * 100.0),
+                }
             }
             _ => {
                 let mut body = s.to_string();

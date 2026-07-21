@@ -2578,3 +2578,49 @@ fn sum_neumaier_and_paths() {
         "got: {e}"
     );
 }
+
+/// Non-finite floats format lowercase (`nan`/`inf`) for `f`/`e`/`g`/`%` and
+/// uppercase (`NAN`/`INF`) for `F`/`E`/`G`, and still flow through width/sign/
+/// zero-fill. Regression: `{nan:.2f}` rendered Rust's `NaN`.
+#[test]
+fn nonfinite_float_format() {
+    assert_eq!(g("x = f'{float(\"nan\"):.2f}'", "x"), "'nan'");
+    assert_eq!(g("x = f'{float(\"inf\"):f}'", "x"), "'inf'");
+    assert_eq!(g("x = f'{float(\"-inf\"):.1f}'", "x"), "'-inf'");
+    assert_eq!(g("x = f'{float(\"nan\"):.2F}'", "x"), "'NAN'");
+    assert_eq!(g("x = f'{float(\"inf\"):E}'", "x"), "'INF'");
+    assert_eq!(g("x = f'{float(\"nan\"):+g}'", "x"), "'+nan'");
+    assert_eq!(g("x = f'{float(\"inf\"):%}'", "x"), "'inf%'");
+    // Non-finite still honors width and zero-fill (CPython `00000inf`).
+    assert_eq!(g("x = f'{float(\"inf\"):08.2f}'", "x"), "'00000inf'");
+    assert_eq!(g("x = f'{float(\"nan\"):>8}'", "x"), "'     nan'");
+}
+
+/// A builtin exception class is a type object, so `repr(ValueError)` is
+/// `<class 'ValueError'>`, not `<built-in function ValueError>`.
+#[test]
+fn exception_class_repr() {
+    assert_eq!(g("x = ValueError", "x"), "<class 'ValueError'>");
+    assert_eq!(g("x = KeyError", "x"), "<class 'KeyError'>");
+    assert_eq!(g("x = Exception", "x"), "<class 'Exception'>");
+    assert_eq!(g("x = type(ValueError)", "x"), "<class 'type'>");
+}
+
+/// Unbound builtin methods reached via a type object: `str.lower`, `list.append`,
+/// `dict.get`. Callable with an explicit receiver (`str.lower("HI")`), usable as
+/// a `key=`/`map` function, and repr as `<method '…' of '…' objects>`. Also the
+/// bound-method `__name__`.
+#[test]
+fn unbound_builtin_methods() {
+    assert_eq!(g("x = str.lower('HELLO')", "x"), "'hello'");
+    assert_eq!(g("x = sorted(['B', 'a', 'C'], key=str.lower)", "x"), "['a', 'B', 'C']");
+    assert_eq!(g("x = list(map(str.upper, ['a', 'b']))", "x"), "['A', 'B']");
+    assert_eq!(g("x = list.count([1, 1, 2], 1)", "x"), "2");
+    assert_eq!(g("x = dict.get({'a': 1}, 'a')", "x"), "1");
+    assert_eq!(g("x = str.upper", "x"), "<method 'upper' of 'str' objects>");
+    // A bad attribute on a type object is still an AttributeError.
+    assert!(eval_str("x = str.nonesuch").is_err());
+    // Bound builtin method dunders.
+    assert_eq!(g("x = [].append.__name__", "x"), "'append'");
+    assert_eq!(g("x = [].append.__qualname__", "x"), "'list.append'");
+}
