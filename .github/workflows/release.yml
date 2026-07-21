@@ -267,10 +267,11 @@ jobs:
             [ -n "$linux_inner" ] && printf '  on_linux do\n%s\n  end\n\n' "$linux_inner"
             printf '  def install\n'
             # Tarball root is the self-contained prefix: bin/python + lib/python3.14
-            # + lib/libpython. Installing both into the cellar prefix keeps the
-            # binary @executable_path/../lib ($ORIGIN/../lib on Linux) pointing at
-            # the bundled runtime; Homebrew symlinks bin/python onto PATH.
-            printf '    prefix.install "bin", "lib"\n'
+            # + lib/libpython. Install the whole tree into libexec (keeping bin/../lib
+            # intact so the binary's @executable_path/../lib / $ORIGIN/../lib rpath
+            # still resolves the bundled runtime), then symlink bin/python onto PATH.
+            printf '    libexec.install "bin", "lib"\n'
+            printf '    bin.install_symlink libexec/"bin/python"\n'
             printf '  end\n\n'
             printf '  test do\n'
             # VM path, then the real CPython stdlib over the FFI bridge. The stdlib
