@@ -1648,6 +1648,24 @@ fn inplace_binary_fallback(tag: i64, a: &Value, b: &Value) -> Result<Value, Stri
 /// in-place fast path for this op and the caller should use the binary fallback.
 fn inplace_builtin(tag: i64, a: &Value, b: &Value) -> Option<Result<Value, String>> {
     use host::iop;
+    // A mutable builtin-subclass instance (`class L(list)`, `class S(set)`) keeps
+    // its native storage in its payload. Mutate the payload in place, then return
+    // the *instance* so `x += ...` preserves x's subclass type (CPython: inherited
+    // `__iadd__` mutates and returns self). An immutable payload (int/str/tuple
+    // subclass) yields `None` here, so the binary fallback rebinds to the base
+    // type — which is what CPython does for immutables too.
+    let payload = with_host(|h| match h.get(a) {
+        Some(PyObj::Instance(inst)) if !matches!(inst.payload, Value::Undef) => {
+            Some(inst.payload.clone())
+        }
+        _ => None,
+    });
+    if let Some(p) = payload {
+        return match inplace_builtin(tag, &p, b) {
+            Some(Ok(_)) => Some(Ok(a.clone())),
+            other => other,
+        };
+    }
     // list: `+=` extends with any iterable; `*=` repeats in place.
     if with_host(|h| matches!(h.get(a), Some(PyObj::List(_)))) {
         match tag {
