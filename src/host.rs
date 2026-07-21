@@ -1647,21 +1647,23 @@ fn type_object_class_name(n: &str) -> Option<String> {
     unqualified.then(|| n.to_string())
 }
 
-/// A native-shadowed pure stdlib module whose native namespace is only a
-/// fast-path subset. On a miss, defer to the real CPython module over the FFI
-/// bridge so every symbol CPython's module exposes still resolves (e.g.
-/// `math.isqrt`/`math.trunc`/`math.comb`, absent from the native `math` arm).
-/// `Some(Ok/Err)` = the module is shadowed and the FFI lookup ran; `None` = no
-/// fallback (not a shadowed module, or the bridge is compiled out). Scoped to
-/// `math` — a set of pure numeric functions that marshal cleanly; `sys` and
-/// `collections` keep their native objects and are intentionally not deferred.
+/// A native-shadowed stdlib module whose native namespace is only a fast-path
+/// subset. On a miss, defer to the real CPython module over the FFI bridge so
+/// every symbol CPython's module exposes still resolves — `math.isqrt`/`trunc`/
+/// `comb` (absent from the native `math` arm), `collections.ChainMap`/`UserDict`/
+/// `abc` (absent from the native `collections` arm). The native members (`math`
+/// constants/functions, `collections.deque`/`Counter`/`defaultdict`/`OrderedDict`/
+/// `namedtuple`) are hit first, so only genuine misses defer. `Some(Ok/Err)` =
+/// the module is shadowed and the FFI lookup ran; `None` = no fallback (not a
+/// shadowed module, or the bridge is compiled out). `sys` keeps its native
+/// objects (`stdout`/`argv`/…) and is intentionally not deferred.
 #[cfg(feature = "stdlib-ffi")]
 fn module_ffi_fallback(
     host: &mut PyHost,
     mname: &str,
     name: &str,
 ) -> Option<Result<Value, String>> {
-    if mname != "math" {
+    if !matches!(mname, "math" | "collections") {
         return None;
     }
     match crate::ffi::import(mname) {

@@ -5140,6 +5140,17 @@ pub fn call_type_method(
             let s = with_host(|h| h.as_str(recv)).unwrap_or_default();
             str_dot_format(&s, &args, &kwargs)
         }
+        // `str.splitlines(keepends=...)` — fold the keyword into the positional
+        // arg `str_method` reads.
+        "str" if name == "splitlines" && !kwargs.is_empty() => {
+            let a: Vec<Value> = kwargs
+                .iter()
+                .find(|(k, _)| k == "keepends")
+                .map(|(_, v)| v.clone())
+                .into_iter()
+                .collect();
+            str_method(recv, name, &a)
+        }
         // `str.encode(encoding=..., errors=...)` — fold keywords into the
         // positional (encoding, errors) order `str_method`'s `encode` expects.
         "str" if name == "encode" && !kwargs.is_empty() => {
@@ -5658,12 +5669,13 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
         )),
         "zfill" => {
             let w = with_host(|h| h.as_int(&args[0])).unwrap_or(0) as usize;
-            let out = if s.len() < w {
-                let pad = "0".repeat(w - s.chars().count());
-                if let Some(rest) = s.strip_prefix('-') {
-                    format!("-{pad}{rest}")
-                } else {
-                    format!("{pad}{s}")
+            let n = s.chars().count();
+            let out = if n < w {
+                let pad = "0".repeat(w - n);
+                // A leading sign (`+`/`-`) stays in front of the zero padding.
+                match s.strip_prefix(['+', '-']) {
+                    Some(rest) => format!("{}{pad}{rest}", &s[..1]),
+                    None => format!("{pad}{s}"),
                 }
             } else {
                 s.clone()
