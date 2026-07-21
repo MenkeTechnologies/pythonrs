@@ -709,6 +709,10 @@ pub struct PyHost {
     pub nt_meta: HashMap<u32, NtMeta>,
     /// `lru_cache` memo tables, indexed by `PyObj::LruCache.cache_id`.
     lru_caches: Vec<LruData>,
+    /// Names of classes decorated with `functools.total_ordering`. The decorator
+    /// runs natively (keeping the class a native pythonrs class), and comparison
+    /// dispatch derives the missing rich-comparison ops for a marked class.
+    total_ordering: HashSet<String>,
     /// Exception chaining links, keyed by the exception object's heap index.
     /// `.0` = `__cause__` (`raise X from Y`), `.1` = `__context__` (the
     /// exception being handled when this one was raised). `Value::Undef` = unset.
@@ -907,6 +911,7 @@ impl PyHost {
             dict_meta: HashMap::new(),
             nt_meta: HashMap::new(),
             lru_caches: Vec::new(),
+            total_ordering: HashSet::new(),
             exc_links: HashMap::new(),
             argv: vec![String::new()],
             main_file: None,
@@ -1673,7 +1678,7 @@ fn module_ffi_fallback(
     mname: &str,
     name: &str,
 ) -> Option<Result<Value, String>> {
-    if !matches!(mname, "math" | "collections") {
+    if !matches!(mname, "math" | "collections" | "functools") {
         return None;
     }
     match crate::ffi::import(mname) {
@@ -8782,6 +8787,19 @@ pub fn import_module(name: &str) -> Result<Value, String> {
                 ("deepcopy", h.alloc(PyObj::Builtin("copy.deepcopy".into()))),
             ]
         }),
+        // `functools` is native-shadowed only for `total_ordering` (which must run
+        // natively so the class stays a native pythonrs class — a CPython round
+        // trip would return a Foreign class whose native `__init__` can't set
+        // attributes). Every other member (`reduce`, `partial`, `lru_cache`,
+        // `wraps`, `cmp_to_key`, …) misses this namespace and defers to the real
+        // CPython `functools` via `module_ffi_fallback`.
+        #[cfg(feature = "stdlib-ffi")]
+        "functools" => with_host(|h| {
+            vec![(
+                "total_ordering",
+                h.alloc(PyObj::Builtin("functools.total_ordering".into())),
+            )]
+        }),
         "math" => with_host(|h| {
             vec![
                 ("pi", Value::Float(std::f64::consts::PI)),
@@ -9405,6 +9423,19 @@ pub fn namedtuple_construct(
 }
 
 // ── functools partial / lru_cache ────────────────────────────────────────────
+
+impl PyHost {
+    /// Mark `class` as `@functools.total_ordering` (comparison dispatch will
+    /// derive its missing rich-comparison ops).
+    pub fn mark_total_ordering(&mut self, class: &str) {
+        self.total_ordering.insert(class.to_string());
+    }
+
+    /// Whether `class` was decorated with `functools.total_ordering`.
+    pub fn is_total_ordering(&self, class: &str) -> bool {
+        self.total_ordering.contains(class)
+    }
+}
 
 /// Allocate a `functools.partial`.
 pub fn make_partial(func: Value, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Value {

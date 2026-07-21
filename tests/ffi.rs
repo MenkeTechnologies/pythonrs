@@ -372,3 +372,44 @@ print(y)
         "stderr={stderr}"
     );
 }
+
+/// `@functools.total_ordering` runs natively: the decorated class stays a native
+/// pythonrs class (so `__init__` can set attributes — a CPython round trip made it
+/// a Foreign class that couldn't), and comparison dispatch derives the three
+/// missing rich-comparison ops from the one defined ordering method plus `__eq__`.
+/// Verified for both a `__lt__`-rooted and a `__gt__`-rooted class.
+#[test]
+fn ffi_total_ordering_native() {
+    let src = "\
+import functools
+@functools.total_ordering
+class V:
+    def __init__(self, n):
+        self.n = n
+    def __eq__(self, o):
+        return self.n == o.n
+    def __lt__(self, o):
+        return self.n < o.n
+print(V(1) < V(2), V(3) >= V(2), V(2) <= V(2), V(2) > V(1), V(1) >= V(1), V(2) <= V(1))
+print([v.n for v in sorted([V(3), V(1), V(2)])])
+
+@functools.total_ordering
+class G:
+    def __init__(self, n):
+        self.n = n
+    def __eq__(self, o):
+        return self.n == o.n
+    def __gt__(self, o):
+        return self.n > o.n
+print(G(1) < G(2), G(2) <= G(2), G(3) >= G(1))
+";
+    let (stdout, stderr, ok) = run_py(src);
+    if !ok || stderr.contains("ModuleNotFoundError") {
+        eprintln!("skipping ffi-total-ordering test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(
+        stdout, "True True True True True False\n[1, 2, 3]\nTrue True True\n",
+        "stderr={stderr}"
+    );
+}

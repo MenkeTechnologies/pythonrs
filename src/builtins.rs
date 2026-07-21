@@ -2621,6 +2621,25 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
                 Dunder::Value(v) => Ok(v),
                 Dunder::Err(e) => Err(e),
                 Dunder::NotImplemented => {
+                    // `@functools.total_ordering`: derive the missing op from the
+                    // class's defined ordering dunder — forward (`a op b`) first,
+                    // then reflected (`b <reflected-op> a`).
+                    if let Some(res) = total_ordering_derive(op, a, b) {
+                        if !matches!(&res, Ok(v) if is_not_implemented(v)) {
+                            return res;
+                        }
+                    }
+                    let refl = match op {
+                        Lt => Gt,
+                        Le => Ge,
+                        Gt => Lt,
+                        _ => Le,
+                    };
+                    if let Some(res) = total_ordering_derive(refl, b, a) {
+                        if !matches!(&res, Ok(v) if is_not_implemented(v)) {
+                            return res;
+                        }
+                    }
                     let sym = match op {
                         Lt => "<",
                         Le => "<=",
@@ -2995,6 +3014,11 @@ pub fn call_builtin_function(
     // copy.copy / copy.deepcopy (native — see call_copy).
     if let Some(f) = name.strip_prefix("copy.") {
         return call_copy(f, &args);
+    }
+    // functools.total_ordering (native — keeps the decorated class a native
+    // pythonrs class; see call_total_ordering).
+    if name == "functools.total_ordering" {
+        return call_total_ordering(&args);
     }
     // sys.* module functions.
     if let Some(f) = name.strip_prefix("sys.") {
@@ -4581,6 +4605,102 @@ fn num_f(v: Value) -> Option<f64> {
         Value::Bool(b) => Some(if b { 1.0 } else { 0.0 }),
         _ => None,
     }
+}
+
+/// `functools.total_ordering(cls)` — native so `cls` stays a native pythonrs
+/// class (a CPython round trip returns a Foreign class whose native `__init__`
+/// can't set attributes). Marks the class; comparison dispatch derives the
+/// missing rich-comparison ops (see `total_ordering_derive`). Requires `__eq__`
+/// and at least one of `__lt__`/`__le__`/`__gt__`/`__ge__`, matching CPython.
+fn call_total_ordering(args: &[Value]) -> Result<Value, String> {
+    let cls = arg0(args)?;
+    let name = match with_host(|h| h.get(&cls).cloned()) {
+        Some(PyObj::Class(n)) => n,
+        _ => return Err(host::type_error("total_ordering: argument must be a class")),
+    };
+    let roots = ["__lt__", "__le__", "__gt__", "__ge__"];
+    let has_root = with_host(|h| roots.iter().any(|m| h.class_lookup(&name, m).is_some()));
+    if !has_root {
+        return Err(host::type_error(
+            "must define at least one ordering operation: < > <= >=",
+        ));
+    }
+    with_host(|h| h.mark_total_ordering(&name));
+    Ok(cls)
+}
+
+/// Derive `self <op> other` for a `@total_ordering` class that lacks the direct
+/// `op` dunder, from the single ordering dunder it does define plus `__eq__`
+/// (CPython's `functools._convert` formulas). `None` if `self` is not an instance
+/// of a marked class or `op` is the defined root; `Some(NotImplemented)` if the
+/// root dunder declines.
+fn total_ordering_derive(op: NumOp, selfv: &Value, other: &Value) -> Option<Result<Value, String>> {
+    use NumOp::*;
+    let class = with_host(|h| match h.get(selfv) {
+        Some(PyObj::Instance(i)) if h.is_total_ordering(&i.class) => Some(i.class.clone()),
+        _ => None,
+    })?;
+    let target = match op {
+        Lt => "__lt__",
+        Le => "__le__",
+        Gt => "__gt__",
+        Ge => "__ge__",
+        _ => return None,
+    };
+    // The single root ordering dunder the user defined (first found wins; a class
+    // with several defined has each resolved directly, so this path is unused).
+    let root = ["__lt__", "__le__", "__gt__", "__ge__"]
+        .into_iter()
+        .find(|m| with_host(|h| h.class_lookup(&class, m).is_some()))?;
+    if target == root {
+        return None; // resolved directly upstream — nothing to derive
+    }
+    // r = truthiness of `self.<root>(other)`; a declined root propagates.
+    let rv = match host::call_method(selfv, root, vec![other.clone()], vec![]) {
+        Ok(v) => v,
+        Err(e) => return Some(Err(e)),
+    };
+    if is_not_implemented(&rv) {
+        return Some(Ok(rv));
+    }
+    let r = with_host(|h| h.truthy(&rv));
+    // Only some formulas reference `self == other`; compute it lazily.
+    let needs_eq = matches!(
+        (root, target),
+        ("__lt__", "__gt__")
+            | ("__lt__", "__le__")
+            | ("__le__", "__ge__")
+            | ("__le__", "__lt__")
+            | ("__gt__", "__lt__")
+            | ("__gt__", "__ge__")
+            | ("__ge__", "__le__")
+            | ("__ge__", "__gt__")
+    );
+    let eq = if needs_eq {
+        match dispatch_binop(selfv, other, "__eq__", "__eq__") {
+            Dunder::Value(v) => with_host(|h| h.truthy(&v)),
+            Dunder::Err(e) => return Some(Err(e)),
+            Dunder::NotImplemented => identity_eq(selfv, other),
+        }
+    } else {
+        false
+    };
+    let result = match (root, target) {
+        ("__lt__", "__gt__") => !r && !eq,
+        ("__lt__", "__le__") => r || eq,
+        ("__lt__", "__ge__") => !r,
+        ("__le__", "__ge__") => !r || eq,
+        ("__le__", "__lt__") => r && !eq,
+        ("__le__", "__gt__") => !r,
+        ("__gt__", "__lt__") => !r && !eq,
+        ("__gt__", "__ge__") => r || eq,
+        ("__gt__", "__le__") => !r,
+        ("__ge__", "__le__") => !r || eq,
+        ("__ge__", "__gt__") => r && !eq,
+        ("__ge__", "__lt__") => !r,
+        _ => return None,
+    };
+    Some(Ok(Value::Bool(result)))
 }
 
 /// `copy.copy` / `copy.deepcopy` — implemented natively because routing them
