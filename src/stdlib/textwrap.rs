@@ -45,8 +45,12 @@ fn text_arg(h: &PyHost, args: &[Value], fname: &str) -> Result<String, String> {
     let v = args
         .first()
         .ok_or_else(|| type_error(&format!("{fname}() missing required argument: 'text'")))?;
-    h.as_str(v)
-        .ok_or_else(|| type_error(&format!("{fname}() requires a str, not '{}'", h.type_name(v))))
+    h.as_str(v).ok_or_else(|| {
+        type_error(&format!(
+            "{fname}() requires a str, not '{}'",
+            h.type_name(v)
+        ))
+    })
 }
 
 /// Optional positional `width` (`args[idx]`), defaulting to 70.

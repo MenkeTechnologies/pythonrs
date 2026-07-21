@@ -924,7 +924,9 @@ impl Compiler {
         }
         let bound = self.func_scopes[..n - 1].iter().any(|s| s.contains(name));
         if !bound {
-            return Err(format!("SyntaxError: no binding for nonlocal '{name}' found"));
+            return Err(format!(
+                "SyntaxError: no binding for nonlocal '{name}' found"
+            ));
         }
         Ok(())
     }
@@ -1260,11 +1262,7 @@ impl Compiler {
             .into(),
         ];
         // finally: if not .hit: .ctx.__exit__(None, None, None)
-        let exit_none = awaited(call(
-            &ctx,
-            exit_m,
-            vec![Expr::None, Expr::None, Expr::None],
-        ));
+        let exit_none = awaited(call(&ctx, exit_m, vec![Expr::None, Expr::None, Expr::None]));
         let finalbody: Vec<Stmt> = vec![StmtKind::If {
             test: Expr::UnaryOp(UnOp::Not, Box::new(Expr::Name(hit.clone()))),
             body: vec![StmtKind::Expr(exit_none).into()],
@@ -1687,10 +1685,8 @@ impl Compiler {
                 let t = format!(".cmp{}", self.tmp);
                 self.tmp += 1;
                 // `prev op (t := rhs)`
-                let walrus = Expr::NamedExpr(
-                    Box::new(Expr::Name(t.clone())),
-                    Box::new(rhs.clone()),
-                );
+                let walrus =
+                    Expr::NamedExpr(Box::new(Expr::Name(t.clone())), Box::new(rhs.clone()));
                 conj.push(Expr::Compare(Box::new(prev), vec![(*op, walrus)]));
                 prev = Expr::Name(t);
             } else {
@@ -2122,8 +2118,8 @@ impl Compiler {
             }
             Pattern::Value(e) => {
                 self.compile_expr(b, e)?; // [v, e]
-                // Singleton patterns (None/True/False) match by identity (`is`),
-                // every other literal/value pattern by equality (`==`) — PEP 634.
+                                          // Singleton patterns (None/True/False) match by identity (`is`),
+                                          // every other literal/value pattern by equality (`==`) — PEP 634.
                 if matches!(e, Expr::None | Expr::True | Expr::False) {
                     b.emit(Op::CallBuiltin(ops::IS, 2), 0); // [bool]
                 } else {
@@ -2345,9 +2341,7 @@ fn validate_pattern(pat: &Pattern, bound: &mut Vec<String>) -> Result<(), String
                 match &expected {
                     None => expected = Some(added),
                     Some(exp) if *exp != added => {
-                        return Err(
-                            "SyntaxError: alternative patterns bind different names".into(),
-                        )
+                        return Err("SyntaxError: alternative patterns bind different names".into())
                     }
                     _ => {}
                 }
@@ -2554,9 +2548,10 @@ fn collect_bound_stmt(s: &Stmt, out: &mut HashSet<String>) {
         StmtKind::Import(aliases) => {
             for a in aliases {
                 // `import a.b.c` binds `a`; `import a.b as x` binds `x`.
-                let n = a.asname.clone().unwrap_or_else(|| {
-                    a.name.split('.').next().unwrap_or(&a.name).to_string()
-                });
+                let n = a
+                    .asname
+                    .clone()
+                    .unwrap_or_else(|| a.name.split('.').next().unwrap_or(&a.name).to_string());
                 out.insert(n);
             }
         }

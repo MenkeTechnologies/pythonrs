@@ -1448,7 +1448,10 @@ pub fn type_error(msg: &str) -> String {
 pub fn callable_display_name(callable: &Value) -> String {
     with_host(|h| match h.get(callable) {
         Some(PyObj::Func(fv)) => {
-            let q = h.funcs.get(fv.def_id).map_or("<callable>", |d| d.name.as_str());
+            let q = h
+                .funcs
+                .get(fv.def_id)
+                .map_or("<callable>", |d| d.name.as_str());
             format!("__main__.{q}")
         }
         _ => "<callable>".to_string(),
@@ -2705,7 +2708,7 @@ fn c_quot(ar: f64, ai: f64, br: f64, bi: f64) -> (f64, f64) {
             let ratio = bi / br;
             let denom = bi.mul_add(ratio, br); // br + bi*ratio
             (
-                ai.mul_add(ratio, ar) / denom,   // (ar + ai*ratio)/denom
+                ai.mul_add(ratio, ar) / denom,    // (ar + ai*ratio)/denom
                 (-ar).mul_add(ratio, ai) / denom, // (ai - ar*ratio)/denom
             )
         }
@@ -3902,9 +3905,7 @@ impl PyHost {
             out.extend_from_slice(&pad_conv_bytes(&core, width, f_minus, f_zero, numeric));
         }
         if !is_mapping && ai < arglist.len() {
-            return Err(
-                "TypeError: not all arguments converted during bytes formatting".into(),
-            );
+            return Err("TypeError: not all arguments converted during bytes formatting".into());
         }
         Ok(if is_ba {
             self.alloc(PyObj::Bytearray(out))
@@ -4095,7 +4096,13 @@ fn pad_conv(core: &str, width: Option<usize>, minus: bool, zero: bool, numeric: 
 
 /// Byte-level [`pad_conv`] for `bytes`/`bytearray` `%`-formatting. Padding is
 /// measured in bytes; numeric zero-fill lands after any sign/base prefix.
-fn pad_conv_bytes(core: &[u8], width: Option<usize>, minus: bool, zero: bool, numeric: bool) -> Vec<u8> {
+fn pad_conv_bytes(
+    core: &[u8],
+    width: Option<usize>,
+    minus: bool,
+    zero: bool,
+    numeric: bool,
+) -> Vec<u8> {
     let w = match width {
         Some(w) => w,
         None => return core.to_vec(),
@@ -5417,7 +5424,9 @@ impl PyHost {
                 Ok(self.alloc(PyObj::Builtin(format!("{n}.fromhex"))))
             }
             // `bytes.maketrans` / `bytearray.maketrans` — static methods on the type.
-            Some(PyObj::Builtin(n)) if (n == "bytes" || n == "bytearray") && name == "maketrans" => {
+            Some(PyObj::Builtin(n))
+                if (n == "bytes" || n == "bytearray") && name == "maketrans" =>
+            {
                 Ok(self.alloc(PyObj::Builtin(format!("{n}.maketrans"))))
             }
             // `slice` read-only attributes: the RAW stored bound objects
@@ -5991,7 +6000,13 @@ pub fn base_provides(base: &str, dunder: &str) -> bool {
         ),
         "int" => matches!(
             dunder,
-            "__repr__" | "__str__" | "__hash__" | "__bool__" | "__index__" | "__int__" | "__float__"
+            "__repr__"
+                | "__str__"
+                | "__hash__"
+                | "__bool__"
+                | "__index__"
+                | "__int__"
+                | "__float__"
         ),
         "float" => matches!(
             dunder,
@@ -6126,9 +6141,13 @@ fn base_dispatch(
 fn new_subclass_or_bare(cname: &str, extra: &[Value]) -> Result<Value, String> {
     if let Some(base) = with_host(|h| h.builtin_base_of(cname)) {
         let payload = crate::builtins::call_builtin_function(base, extra.to_vec(), vec![])?;
-        return Ok(with_host(|h| h.new_instance_payload(cname.to_string(), payload)));
+        return Ok(with_host(|h| {
+            h.new_instance_payload(cname.to_string(), payload)
+        }));
     }
-    Ok(with_host(|h| h.new_instance(cname.to_string(), IndexMap::new())))
+    Ok(with_host(|h| {
+        h.new_instance(cname.to_string(), IndexMap::new())
+    }))
 }
 
 /// `super().__init__(*args, **kwargs)` inside a builtin-type subclass: populate
@@ -6537,7 +6556,8 @@ pub fn instantiate_plain(
         let immutable = matches!(base, "int" | "float" | "str" | "tuple" | "frozenset");
         let has_user_init = with_host(|h| {
             matches!(
-                h.class_lookup(class, "__init__").and_then(|f| h.get(&f).cloned()),
+                h.class_lookup(class, "__init__")
+                    .and_then(|f| h.get(&f).cloned()),
                 Some(PyObj::Func(_))
             )
         });
@@ -6754,7 +6774,10 @@ fn bind_params(
     // 2. Bind keyword args in call order. A keyword naming an already-filled
     //    positional slot is `multiple values`; positional-only names and unknown
     //    names defer to the leftover bucket (posonly/unexpected/`**kwargs`).
-    let kwonly_given = kwargs.iter().filter(|(k, _)| def.kwonly.contains(k)).count();
+    let kwonly_given = kwargs
+        .iter()
+        .filter(|(k, _)| def.kwonly.contains(k))
+        .count();
     let mut leftover: Vec<(String, Value)> = Vec::new();
     for (k, v) in kwargs {
         if let Some(idx) = def.params.iter().position(|p| p == &k) {
@@ -6915,7 +6938,12 @@ impl PyHost {
     /// `__qualname__` from the `FuncDef`, `__module__` is always `__main__` (the
     /// script module), and `__defaults__` is the positional-default tuple (or
     /// `None` when there are none), matching CPython.
-    fn func_dunder(&mut self, name: &str, def_id: usize, defaults: &[Value]) -> Result<Value, String> {
+    fn func_dunder(
+        &mut self,
+        name: &str,
+        def_id: usize,
+        defaults: &[Value],
+    ) -> Result<Value, String> {
         match name {
             "__name__" => {
                 let n = self.funcs[def_id].name.clone();
