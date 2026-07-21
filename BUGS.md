@@ -33,8 +33,24 @@ fixed. Every line below was re-checked against the **default-build** binary
   (`is`), every other literal by `==`. Compile-time `SyntaxError`s (duplicate
   capture, duplicate mapping key, repeated class-keyword, OR alternatives binding
   different names) and the positional-overflow `TypeError` mirror CPython.
+- **Name resolution (LEGB)** follows CPython's compile-time scope analysis. A
+  name assigned anywhere in a function body is a **local**; reading it before it
+  is bound raises **`UnboundLocalError`** (a `NameError` subclass) rather than
+  falling through to an enclosing/global binding — covering read-before-assign,
+  `+=` on an unbound name, a conditionally-assigned name, and `del`-then-read. A
+  read at module scope stays dynamic (`NameError`). A **class body is not an
+  enclosing scope** for its methods/comprehensions: free names there resolve
+  against the enclosing/module scope, never the class namespace (reachable only
+  via `self`/`ClassName`).
 - **`nonlocal`** rebinds the nearest enclosing FUNCTION scope that binds the name
-  (distinct from `global`, which targets module scope).
+  (distinct from `global`, which targets module scope). Validated at compile
+  time: a `nonlocal` with no enclosing binding is `SyntaxError: no binding for
+  nonlocal '<x>' found`, and one at module level is `SyntaxError: nonlocal
+  declaration not allowed at module level`.
+- **Function/class introspection**: `__name__`, `__qualname__` (the dotted
+  `co_qualname` path — `outer.<locals>.inner`, `C.m`, `A.B`), `__module__`
+  (`__main__`), and `__defaults__` (positional-default tuple, or `None`) on
+  functions, bound methods, and classes.
 - **Augmented assignment** (`+= -= *= /= //= %= **= @= &= |= ^= <<= >>=`) runs the
   CPython in-place protocol: `x += y` tries `type(x).__i<op>__(x, y)` first, then
   falls back to `x = x <op> y`. A user `__iadd__`/… that mutates and returns
