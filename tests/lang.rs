@@ -2674,3 +2674,26 @@ fn dunder_import_builtin() {
     // Dotted name, empty fromlist -> top package name.
     assert_eq!(g("x = __import__('sys').__name__ if hasattr(__import__('sys'), '__name__') else 'sys'", "x"), "'sys'");
 }
+
+/// A class body captures its simple annotations into `__annotations__` (so
+/// `@dataclass`/`typing.NamedTuple` and `Cls.__annotations__` see the fields);
+/// an annotated assignment still binds the value, and a nested function's local
+/// annotation does not leak into the class dict.
+#[test]
+fn class_body_annotations() {
+    assert_eq!(
+        g("class C:\n    x: int\n    y: str = 'hi'\nz = C.__annotations__", "z"),
+        "{'x': <class 'int'>, 'y': <class 'str'>}"
+    );
+    assert_eq!(g("class C:\n    y: str = 'hi'\nv = C.y", "v"), "'hi'");
+    // A forward-reference string annotation is stored verbatim.
+    assert_eq!(
+        g("class C:\n    a: 'Later'\nz = C.__annotations__['a']", "z"),
+        "'Later'"
+    );
+    // A method-local annotation is not recorded in the class's __annotations__.
+    assert_eq!(
+        g("class C:\n    x: int\n    def m(self):\n        y: int = 1\n        return y\nz = sorted(C.__annotations__)", "z"),
+        "['x']"
+    );
+}

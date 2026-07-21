@@ -329,15 +329,19 @@ module then raises `ModuleNotFoundError`.
   (`itertools.takewhile(pred, gen())` over an infinite generator); pythonrs
   callables carry a `__dict__` and expose the wrapped function's dunders, so
   `@functools.wraps` succeeds; pythonrs methods stored in a CPython-built class
-  bind `self` (the `PyrsCallable` descriptor).
+  bind `self` (the `PyrsCallable` descriptor). A native pythonrs class also
+  crosses into a CPython call — `@dataclass` mirrors it over `object` via
+  `types.new_class` (methods as `PyrsCallable` descriptors, `__annotations__`/
+  class-vars by value), so dataclass installs `__init__`/`__repr__`/`__eq__`/
+  ordering and the result rebinds the name. Class bodies capture their simple
+  annotations into `__annotations__`, so `Cls.__annotations__`, `@dataclass`, and
+  `typing.NamedTuple` all see the fields.
   Remaining gaps:
-  - **Passing a *native* pythonrs class into a CPython call** — `@dataclass`
-    (`dataclasses.dataclass(MyClass)`) raises `TypeError: cannot pass 'type' to a
-    CPython stdlib call`. The in-marshaler has no CPython mirror for a native
-    `PyObj::Class`, and pythonrs doesn't yet capture class-body `__annotations__`
-    (which `dataclass` needs to find fields). Needs annotation capture plus a
-    class-mirroring marshaler. (A class that *inherits* a Foreign base already
-    crosses via the Enum path above; this is only the pass-as-argument direction.)
-  - **Native `collections.namedtuple` method surface**: instances support field
-    access and indexing but not `_asdict`/`_replace`/`_fields`. (`typing.NamedTuple`
-    subclasses would instead route through the Foreign-base path.)
+  - **Function annotations**: `def f(a: int) -> str` doesn't populate
+    `f.__annotations__` (the parser discards param/return annotations; only
+    class-body annotations are captured). Needs the parser/AST to keep them and
+    the compiler to build the function's annotation dict at def time.
+  - **`collections.namedtuple` field *types*** cross as `PyrsCallable` wrappers,
+    not the CPython type objects, so `dataclasses.fields(x)[i].type` on a mirrored
+    class is a proxy — the generated `__init__`/`__repr__`/`__eq__` (which use only
+    field names) are unaffected.
