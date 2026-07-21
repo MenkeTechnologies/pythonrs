@@ -1027,10 +1027,46 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
         "255 .bit_length()   # => 8",
     ),
     (
+        "bit_count",
+        "int",
+        "number of ones in the binary representation of abs(self)",
+        "255 .bit_count()   # => 8",
+    ),
+    (
+        "to_bytes",
+        "int",
+        "to_bytes(length=1, byteorder='big', *, signed=False) — the int as bytes",
+        "(258).to_bytes(2, 'big')   # => b'\\x01\\x02'",
+    ),
+    (
+        "from_bytes",
+        "int",
+        "from_bytes(bytes, byteorder='big', *, signed=False) — an int from bytes",
+        "int.from_bytes(b'\\x01\\x02', 'big')   # => 258",
+    ),
+    (
+        "as_integer_ratio",
+        "int",
+        "a pair (numerator, denominator) whose exact ratio equals self",
+        "(0.5).as_integer_ratio()   # => (1, 2)",
+    ),
+    (
         "is_integer",
         "float",
         "True if the float has no fractional part",
         "(3.0).is_integer()   # => True",
+    ),
+    (
+        "hex",
+        "float",
+        "the exact value as a hexadecimal string",
+        "(3.14).hex()   # => '0x1.91eb851eb851fp+1'",
+    ),
+    (
+        "fromhex",
+        "float",
+        "fromhex(s) — parse a hexadecimal float string (inverse of float.hex)",
+        "float.fromhex('0x1.8p+1')   # => 3.0",
     ),
     (
         "conjugate",

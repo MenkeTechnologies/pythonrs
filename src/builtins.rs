@@ -77,6 +77,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::MATCH_KEY, b_match_key);
     vm.register_builtin(ops::MATCH_MAP_REST, b_match_map_rest);
     vm.register_builtin(ops::MATCH_CLASS, b_match_class);
+    vm.register_builtin(ops::DISPLAYHOOK, b_displayhook);
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -938,6 +939,28 @@ fn index_dunder(v: &Value) -> Result<Option<Value>, String> {
 fn b_tostr(vm: &mut VM, _: u8) -> Value {
     let v = vm.pop();
     stringify(vm, &v, false)
+}
+
+/// CPython `sys.displayhook`: the interactive REPL feeds each top-level
+/// expression-statement value here. `None` is neither printed nor bound; any
+/// other value is `repr`-printed to stdout and bound to the module global `_`.
+/// Only emitted for interactive compiles (`compile_interactive`), never scripts.
+fn b_displayhook(vm: &mut VM, _: u8) -> Value {
+    let v = vm.pop();
+    if matches!(v, Value::Undef) {
+        return Value::Undef;
+    }
+    let s = match py_repr(&v) {
+        Ok(s) => s,
+        Err(e) => return abort(vm, e),
+    };
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let _ = out.write_all(s.as_bytes());
+    let _ = out.write_all(b"\n");
+    let _ = out.flush();
+    with_host(|h| h.set_global("_", v));
+    Value::Undef
 }
 
 /// str()/repr() with dunder dispatch for instances.
@@ -2718,6 +2741,16 @@ pub fn call_builtin_function(
     if name == "bytes.maketrans" || name == "bytearray.maketrans" {
         return bytes_maketrans(&args);
     }
+    // `int.from_bytes(bytes, byteorder='big', *, signed=False)` via the type.
+    if name == "int.from_bytes" {
+        return int_from_bytes(&args, &kwargs);
+    }
+    // `float.fromhex(str)` via the type object.
+    if name == "float.fromhex" {
+        let s = with_host(|h| args.first().and_then(|v| h.as_str(v)))
+            .ok_or_else(|| host::type_error("float.fromhex() argument must be str"))?;
+        return Ok(Value::Float(float_fromhex(&s)?));
+    }
     // `bytes.fromhex(...)` / `bytearray.fromhex(...)` via the type object.
     if name == "bytes.fromhex" || name == "bytearray.fromhex" {
         let b = bytes_fromhex(&args)?;
@@ -4343,7 +4376,8 @@ pub fn type_has_method(typename: &str, name: &str) -> bool {
         "slice" => &["indices"],
         "deque" => DEQUE_METHODS,
         "TextIOWrapper" => FILE_METHODS,
-        "int" | "float" | "bool" => NUM_METHODS,
+        "int" | "bool" => INT_METHODS,
+        "float" => FLOAT_METHODS,
         "complex" => COMPLEX_METHODS,
         "property" => PROPERTY_METHODS,
         "generator" => GENERATOR_METHODS,
@@ -4611,7 +4645,15 @@ const SET_METHODS: &[&str] = &[
     "symmetric_difference",
 ];
 const TUPLE_METHODS: &[&str] = &["count", "index"];
-const NUM_METHODS: &[&str] = &["bit_length", "is_integer", "conjugate"];
+const INT_METHODS: &[&str] = &[
+    "bit_length",
+    "bit_count",
+    "to_bytes",
+    "as_integer_ratio",
+    "is_integer",
+    "conjugate",
+];
+const FLOAT_METHODS: &[&str] = &["is_integer", "as_integer_ratio", "hex", "conjugate"];
 const COMPLEX_METHODS: &[&str] = &["conjugate"];
 
 /// Dispatch a method call on a builtin-typed receiver.
@@ -4683,7 +4725,7 @@ pub fn call_type_method(
         "deque" => deque_method(recv, name, &args),
         "TextIOWrapper" => file_method(recv, name, &args),
         "functools._lru_cache_wrapper" => lru_wrapper_method(recv, name),
-        "int" | "float" | "bool" => num_method(recv, name, &args),
+        "int" | "float" | "bool" => num_method(recv, name, &args, &kwargs),
         "complex" => complex_method(recv, name),
         "property" => property_method(recv, name, &args),
         "generator" => generator_method(recv, name, &args),
@@ -4911,12 +4953,72 @@ fn split_ws_str(s: &str, maxsplit: i64, reverse: bool) -> Vec<String> {
     parts
 }
 
+/// A Unicode line boundary per CPython `str.splitlines`: `\n`, `\r`, `\v`
+/// (\x0b), `\f` (\x0c), `\x1c`, `\x1d`, `\x1e`, `\x85` (NEL), ` ` (LINE
+/// SEPARATOR), ` ` (PARAGRAPH SEPARATOR). `\r\n` is treated as one boundary
+/// by the caller.
+fn is_line_boundary(c: char) -> bool {
+    matches!(
+        c,
+        '\n' | '\r'
+            | '\u{0b}'
+            | '\u{0c}'
+            | '\u{1c}'
+            | '\u{1d}'
+            | '\u{1e}'
+            | '\u{85}'
+            | '\u{2028}'
+            | '\u{2029}'
+    )
+}
+
+/// CPython `str.splitlines(keepends)`: split at Unicode line boundaries, joining
+/// `\r\n` into a single break. A trailing boundary does not yield a final empty
+/// line. With `keepends`, the boundary character(s) stay attached to their line.
+fn str_splitlines(s: &str, keepends: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    let chars: Vec<char> = s.chars().collect();
+    let mut start = 0;
+    let mut i = 0;
+    while i < chars.len() {
+        if is_line_boundary(chars[i]) {
+            // `\r\n` is one break; the newline extends the boundary run.
+            let mut end = i + 1;
+            if chars[i] == '\r' && end < chars.len() && chars[end] == '\n' {
+                end += 1;
+            }
+            let slice_end = if keepends { end } else { i };
+            out.push(chars[start..slice_end].iter().collect());
+            start = end;
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+    if start < chars.len() {
+        out.push(chars[start..].iter().collect());
+    }
+    out
+}
+
 fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
     let s = with_host(|h| h.as_str(recv)).unwrap_or_default();
     let sarg = |i: usize| with_host(|h| args.get(i).and_then(|v| h.as_str(v))).unwrap_or_default();
     match name {
         "upper" => Ok(new_str(s.to_uppercase())),
-        "lower" | "casefold" => Ok(new_str(s.to_lowercase())),
+        "lower" => Ok(new_str(s.to_lowercase())),
+        // Full Unicode case folding: identical to lowercasing except for the
+        // codepoints in the override table (multi-char folds like `ß`->`ss`).
+        "casefold" => {
+            let mut out = String::with_capacity(s.len());
+            for c in s.chars() {
+                match crate::casefold::casefold_override(c) {
+                    Some(f) => out.push_str(f),
+                    None => out.extend(c.to_lowercase()),
+                }
+            }
+            Ok(new_str(out))
+        }
         "strip" => Ok(new_str(strip_str(&s, args, 3))),
         "lstrip" => Ok(new_str(strip_str(&s, args, 1))),
         "rstrip" => Ok(new_str(strip_str(&s, args, 2))),
@@ -4991,7 +5093,14 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             Ok(with_host(|h| h.new_list(parts)))
         }
         "splitlines" => {
-            let parts: Vec<Value> = s.lines().map(|l| new_str(l.to_string())).collect();
+            let keepends = args
+                .first()
+                .map(|v| py_bool(v).unwrap_or(false))
+                .unwrap_or(false);
+            let parts: Vec<Value> = str_splitlines(&s, keepends)
+                .into_iter()
+                .map(new_str)
+                .collect();
             Ok(with_host(|h| h.new_list(parts)))
         }
         "join" => {
@@ -6519,20 +6628,332 @@ fn tuple_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, Strin
     }
 }
 
-fn num_method(recv: &Value, name: &str, _args: &[Value]) -> Result<Value, String> {
+fn num_method(
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+    kwargs: &[(String, Value)],
+) -> Result<Value, String> {
     match name {
         "bit_length" => {
-            let n = with_host(|h| h.as_int(recv)).unwrap_or(0);
-            Ok(Value::Int(64 - n.unsigned_abs().leading_zeros() as i64))
+            // Magnitude bit count; faithful for both native `i64` and bignum ints.
+            let bits = with_host(|h| h.big_val(recv))
+                .map(|b| b.bits())
+                .unwrap_or(0);
+            Ok(Value::Int(bits as i64))
         }
+        "bit_count" => {
+            // Number of ones in the binary representation of abs(self).
+            let ones: u32 = with_host(|h| h.big_val(recv))
+                .map(|b| b.to_bytes_le().1.iter().map(|byte| byte.count_ones()).sum())
+                .unwrap_or(0);
+            Ok(Value::Int(ones as i64))
+        }
+        "to_bytes" => int_to_bytes(recv, args, kwargs),
         "is_integer" => Ok(Value::Bool(match recv {
             Value::Float(f) => f.fract() == 0.0,
             Value::Int(_) | Value::Bool(_) => true,
             _ => false,
         })),
+        "as_integer_ratio" => {
+            let (num, den) = match recv {
+                Value::Float(f) => float_as_integer_ratio(*f)?,
+                // int/bool: ratio is (self, 1).
+                _ => (
+                    with_host(|h| h.big_val(recv)).unwrap_or_default(),
+                    num_bigint::BigInt::from(1),
+                ),
+            };
+            let n = with_host(|h| h.norm_big(num));
+            let d = with_host(|h| h.norm_big(den));
+            Ok(with_host(|h| h.new_tuple(vec![n, d])))
+        }
+        "hex" => match recv {
+            Value::Float(f) => Ok(new_str(float_hex(*f))),
+            _ => Err(format!("AttributeError: object has no attribute '{name}'")),
+        },
         "conjugate" => Ok(recv.clone()),
         _ => Err(format!("AttributeError: object has no attribute '{name}'")),
     }
+}
+
+/// `float.hex()` — the exact hexadecimal string of a float, e.g. `3.14` ->
+/// `0x1.91eb851eb851fp+1`. Faithful to CPython's `float.__hex__`: 13 fraction
+/// digits for finite values, a bare `0x0.0p+0` for zero, and `inf`/`nan` words.
+fn float_hex(f: f64) -> String {
+    if f.is_nan() {
+        return "nan".into();
+    }
+    if f.is_infinite() {
+        return if f < 0.0 { "-inf".into() } else { "inf".into() };
+    }
+    let bits = f.to_bits();
+    let sign = if bits >> 63 == 1 { "-" } else { "" };
+    let raw_exp = ((bits >> 52) & 0x7ff) as i64;
+    let frac = bits & 0x000f_ffff_ffff_ffff;
+    if raw_exp == 0 && frac == 0 {
+        return format!("{sign}0x0.0p+0");
+    }
+    let (lead, exp) = if raw_exp == 0 {
+        (0, -1022) // subnormal
+    } else {
+        (1, raw_exp - 1023)
+    };
+    // 52-bit fraction as exactly 13 lowercase hex digits.
+    let digits = format!("{frac:013x}");
+    let sign_char = if exp >= 0 { '+' } else { '-' };
+    format!("{sign}0x{lead}.{digits}p{sign_char}{}", exp.abs())
+}
+
+/// `int.to_bytes(length=1, byteorder='big', *, signed=False)`. Faithful to
+/// CPython: unsigned negatives and values too large for `length` raise
+/// `OverflowError`; signed values use two's complement sign extension.
+fn int_to_bytes(recv: &Value, args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, String> {
+    let length = match args.first().cloned().or_else(|| kw_get(kwargs, "length")) {
+        Some(v) => {
+            let n = with_host(|h| h.as_int(&v))
+                .ok_or_else(|| host::type_error("'length' must be an integer"))?;
+            if n < 0 {
+                return Err("ValueError: length argument must be non-negative".into());
+            }
+            n as usize
+        }
+        None => 1,
+    };
+    let byteorder = match args.get(1).cloned().or_else(|| kw_get(kwargs, "byteorder")) {
+        Some(v) => with_host(|h| h.as_str(&v)).unwrap_or_default(),
+        None => "big".into(),
+    };
+    let little = match byteorder.as_str() {
+        "big" => false,
+        "little" => true,
+        _ => return Err("ValueError: byteorder must be either 'little' or 'big'".into()),
+    };
+    let signed = kw_get(kwargs, "signed")
+        .map(|v| py_bool(&v).unwrap_or(false))
+        .unwrap_or(false);
+    let val = with_host(|h| h.big_val(recv)).unwrap_or_default();
+    let mut be: Vec<u8> = if signed {
+        let minimal = val.to_signed_bytes_be();
+        if minimal.len() > length {
+            return Err("OverflowError: int too big to convert".into());
+        }
+        // Sign-extend: 0xFF for negatives, 0x00 otherwise.
+        let pad = if val.sign() == num_bigint::Sign::Minus {
+            0xFF
+        } else {
+            0x00
+        };
+        let mut v = vec![pad; length - minimal.len()];
+        v.extend_from_slice(&minimal);
+        v
+    } else {
+        if val.sign() == num_bigint::Sign::Minus {
+            return Err("OverflowError: can't convert negative int to unsigned".into());
+        }
+        // Magnitude, big-endian, leading zeros stripped (empty for 0).
+        let minimal = val.to_bytes_be().1;
+        let minimal: &[u8] = if minimal == [0] { &[] } else { &minimal };
+        if minimal.len() > length {
+            return Err("OverflowError: int too big to convert".into());
+        }
+        let mut v = vec![0u8; length - minimal.len()];
+        v.extend_from_slice(minimal);
+        v
+    };
+    if little {
+        be.reverse();
+    }
+    Ok(with_host(|h| h.alloc(PyObj::Bytes(be))))
+}
+
+/// `float.fromhex(s)` — parse a hexadecimal float string (the inverse of
+/// `float.hex`). Accepts an optional sign, an optional `0x`, a hex mantissa with
+/// optional fraction, an optional `p<exp>` binary exponent, and the `inf`/`nan`
+/// words. The value `mantissa * 2^exp` is formed exactly as a big rational and
+/// rounded once to the nearest `f64`, matching CPython's correct rounding.
+fn float_fromhex(s: &str) -> Result<f64, String> {
+    let err = || format!("ValueError: invalid hexadecimal floating-point string: {s}");
+    let t = s.trim();
+    let low = t.to_ascii_lowercase();
+    let (neg, rest) = match low.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, low.strip_prefix('+').unwrap_or(low.as_str())),
+    };
+    match rest {
+        "inf" | "infinity" => {
+            return Ok(if neg {
+                f64::NEG_INFINITY
+            } else {
+                f64::INFINITY
+            })
+        }
+        "nan" => return Ok(f64::NAN),
+        _ => {}
+    }
+    let body = rest.strip_prefix("0x").unwrap_or(rest);
+    let (mant, exp_str) = match body.split_once('p') {
+        Some((m, e)) => (m, Some(e)),
+        None => (body, None),
+    };
+    let (int_part, frac_part) = match mant.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (mant, ""),
+    };
+    if int_part.is_empty() && frac_part.is_empty() {
+        return Err(err());
+    }
+    // Accumulate all hex digits into one big integer, tracking fraction width.
+    let mut m = num_bigint::BigInt::from(0);
+    for c in int_part.chars().chain(frac_part.chars()) {
+        let d = c.to_digit(16).ok_or_else(err)?;
+        m = m * 16 + d;
+    }
+    let p: i64 = match exp_str {
+        Some(e) => e.parse().map_err(|_| err())?,
+        None => 0,
+    };
+    // value = m * 2^(p - 4*frac_digits).
+    let e = p - 4 * frac_part.len() as i64;
+    let val = big_scaled_to_f64(&m, e);
+    Ok(if neg { -val } else { val })
+}
+
+/// Round `m * 2^e` to the nearest `f64` (ties to even). Scaling an exactly-
+/// rounded mantissa by a power of two is itself exact in the normal range, so
+/// the single rounding happens when the big mantissa is narrowed to 53 bits.
+fn big_scaled_to_f64(m: &num_bigint::BigInt, e: i64) -> f64 {
+    use num_traits::ToPrimitive;
+    if m.sign() == num_bigint::Sign::NoSign {
+        return 0.0;
+    }
+    // Narrow the mantissa to at most 54 significant bits (53 + a round bit),
+    // folding the discarded low bits into a sticky bit so the final `to_f64`
+    // rounds to nearest-even correctly rather than double-rounding.
+    let bits = m.bits() as i64;
+    let mut m = m.clone();
+    let mut e = e;
+    let keep = 54;
+    if bits > keep {
+        let drop = bits - keep;
+        let mask = (num_bigint::BigInt::from(1) << (drop as usize)) - 1;
+        let low: num_bigint::BigInt = &m & &mask;
+        m >>= drop as usize;
+        // Sticky: OR a 1 into the lowest kept bit if any dropped bit was set,
+        // preserving round-to-nearest-even semantics through the final scale.
+        if low.sign() != num_bigint::Sign::NoSign
+            && (&m & num_bigint::BigInt::from(1)).sign() == num_bigint::Sign::NoSign
+        {
+            m += 1;
+        }
+        e += drop;
+    }
+    let base = m.to_f64().unwrap_or(f64::INFINITY);
+    // Scale by 2^e via ldexp-style exact power-of-two multiplication.
+    ldexp(base, e)
+}
+
+/// `base * 2^exp` with `f64` semantics (over/underflow saturate as in CPython).
+fn ldexp(base: f64, exp: i64) -> f64 {
+    if base == 0.0 || !base.is_finite() {
+        return base;
+    }
+    let mut b = base;
+    let mut e = exp;
+    // Step in chunks the exponent range can represent exactly (2^±1000).
+    while e > 1000 {
+        b *= 2f64.powi(1000);
+        e -= 1000;
+    }
+    while e < -1000 {
+        b *= 2f64.powi(-1000);
+        e += 1000;
+    }
+    b * 2f64.powi(e as i32)
+}
+
+/// `int.from_bytes(bytes, byteorder='big', *, signed=False)` — build an int from
+/// a bytes-like object or an iterable of ints. Faithful to CPython.
+fn int_from_bytes(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, String> {
+    let src = args
+        .first()
+        .ok_or_else(|| host::type_error("from_bytes() missing required argument 'bytes'"))?;
+    let mut bytes: Vec<u8> = match with_host(|h| match h.get(src) {
+        Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) => Some(b.clone()),
+        _ => None,
+    }) {
+        Some(b) => b,
+        None => {
+            // Any iterable of ints in range(0, 256).
+            let items = host::iter_vec(src)?;
+            let mut v = Vec::with_capacity(items.len());
+            for it in items {
+                let n = with_host(|h| h.as_int(&it))
+                    .ok_or_else(|| host::type_error("'bytes' must be an iterable of integers"))?;
+                if !(0..=255).contains(&n) {
+                    return Err("ValueError: bytes must be in range(0, 256)".into());
+                }
+                v.push(n as u8);
+            }
+            v
+        }
+    };
+    let byteorder = match args.get(1).cloned().or_else(|| kw_get(kwargs, "byteorder")) {
+        Some(v) => with_host(|h| h.as_str(&v)).unwrap_or_default(),
+        None => "big".into(),
+    };
+    let little = match byteorder.as_str() {
+        "big" => false,
+        "little" => true,
+        _ => return Err("ValueError: byteorder must be either 'little' or 'big'".into()),
+    };
+    let signed = kw_get(kwargs, "signed")
+        .map(|v| py_bool(&v).unwrap_or(false))
+        .unwrap_or(false);
+    if little {
+        bytes.reverse(); // normalize to big-endian for BigInt construction
+    }
+    let big = if signed {
+        num_bigint::BigInt::from_signed_bytes_be(&bytes)
+    } else {
+        num_bigint::BigInt::from_bytes_be(num_bigint::Sign::Plus, &bytes)
+    };
+    Ok(with_host(|h| h.norm_big(big)))
+}
+
+/// `float.as_integer_ratio()` — the exact numerator/denominator whose quotient is
+/// `f`. Raises on non-finite values, matching CPython.
+fn float_as_integer_ratio(f: f64) -> Result<(num_bigint::BigInt, num_bigint::BigInt), String> {
+    use num_bigint::BigInt;
+    use num_integer::Integer;
+    if f.is_nan() {
+        return Err("ValueError: cannot convert NaN to integer ratio".into());
+    }
+    if f.is_infinite() {
+        return Err("OverflowError: cannot convert Infinity to integer ratio".into());
+    }
+    if f == 0.0 {
+        return Ok((BigInt::from(0), BigInt::from(1)));
+    }
+    let bits = f.to_bits();
+    let sign: i8 = if bits >> 63 == 1 { -1 } else { 1 };
+    let raw_exp = ((bits >> 52) & 0x7ff) as i64;
+    let raw_mant = bits & 0x000f_ffff_ffff_ffff;
+    // Reconstruct value == mant * 2^exp with mant an integer.
+    let (mant, exp) = if raw_exp == 0 {
+        (raw_mant, -1074) // subnormal
+    } else {
+        (raw_mant | 0x0010_0000_0000_0000, raw_exp - 1075)
+    };
+    let mut num = BigInt::from(mant) * sign;
+    let mut den = BigInt::from(1);
+    if exp >= 0 {
+        num <<= exp as usize;
+    } else {
+        den <<= (-exp) as usize;
+    }
+    let g = num.gcd(&den);
+    Ok((num / &g, den / &g))
 }
 
 /// `complex` methods (`conjugate`).

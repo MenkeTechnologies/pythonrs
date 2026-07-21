@@ -2236,3 +2236,124 @@ async def main():\n    t1 = asyncio.create_task(f(1, 3))\n    t2 = asyncio.creat
 asyncio.run(main())";
     assert_eq!(g(src, "out"), "[1, 1]");
 }
+
+/// `str.splitlines`: the full CPython line-boundary set (`\n \r \r\n \v \f \x1c
+/// \x1d \x1e \x85    `), `\r\n` as one break, no trailing empty line,
+/// and `keepends` retaining the boundary characters.
+#[test]
+fn str_splitlines_boundaries_and_keepends() {
+    assert_eq!(g("x = 'a\\nb\\r\\nc'.splitlines()", "x"), "['a', 'b', 'c']");
+    assert_eq!(
+        g("x = 'a\\nb\\n'.splitlines(True)", "x"),
+        "['a\\n', 'b\\n']"
+    );
+    assert_eq!(
+        g("x = 'a\\rb\\r\\nc\\n'.splitlines(True)", "x"),
+        "['a\\r', 'b\\r\\n', 'c\\n']"
+    );
+    // Vertical tab, form feed, and the C1/Unicode separators are all breaks.
+    assert_eq!(
+        g(
+            "x = 'a\\x0bb\\x0cc\\x1cd\\x1ee\\x85f\\u2028g'.splitlines()",
+            "x"
+        ),
+        "['a', 'b', 'c', 'd', 'e', 'f', 'g']"
+    );
+    // No trailing empty element for a terminal boundary; interior blank stays.
+    assert_eq!(g("x = 'a\\n\\nb'.splitlines()", "x"), "['a', '', 'b']");
+    assert_eq!(g("x = ''.splitlines()", "x"), "[]");
+}
+
+/// `str.casefold`: full Unicode folding, not just simple lowercasing — the
+/// multi-character folds (`ß`->`ss`, titlecase digraphs) that `str.lower` misses.
+#[test]
+fn str_casefold_full_folding() {
+    assert_eq!(g("x = 'Straße'.casefold()", "x"), "'strasse'");
+    assert_eq!(g("x = 'ǅ'.casefold()", "x"), "'ǆ'"); // U+01C5 -> U+01C6
+    assert_eq!(g("x = 'ﬀ'.casefold()", "x"), "'ff'"); // U+FB00 LATIN SMALL LIGATURE FF
+                                                      // Ordinary text folds identically to lowercasing.
+    assert_eq!(g("x = 'HELLO World'.casefold()", "x"), "'hello world'");
+    // `lower` must NOT gain the full folds (ß stays ß).
+    assert_eq!(g("x = 'Straße'.lower()", "x"), "'straße'");
+}
+
+/// `int.bit_count` / `int.bit_length` for native and bignum ints (ones and bit
+/// width of the magnitude).
+#[test]
+fn int_bit_count_and_length() {
+    assert_eq!(g("x = (255).bit_count()", "x"), "8");
+    assert_eq!(g("x = (0).bit_count()", "x"), "0");
+    assert_eq!(g("x = (-7).bit_count()", "x"), "3"); // magnitude of -7 is 0b111
+    assert_eq!(g("x = (2**64 - 1).bit_count()", "x"), "64");
+    assert_eq!(g("x = (2**100).bit_count()", "x"), "1");
+    assert_eq!(g("x = (2**100).bit_length()", "x"), "101");
+    assert_eq!(g("x = (0).bit_length()", "x"), "0");
+}
+
+/// `int.to_bytes` / `int.from_bytes`: byteorder, `signed` two's complement, the
+/// default length/byteorder, and a bignum round-trip.
+#[test]
+fn int_to_from_bytes() {
+    assert_eq!(g("x = (10).to_bytes(2, 'big')", "x"), "b'\\x00\\n'");
+    assert_eq!(g("x = (258).to_bytes(2, 'little')", "x"), "b'\\x02\\x01'");
+    assert_eq!(g("x = (5).to_bytes()", "x"), "b'\\x05'"); // defaults: length 1, big
+    assert_eq!(g("x = (0).to_bytes(0, 'big')", "x"), "b''");
+    assert_eq!(
+        g("x = (-1).to_bytes(2, 'big', signed=True)", "x"),
+        "b'\\xff\\xff'"
+    );
+    assert_eq!(g("x = int.from_bytes(b'\\x01\\x02', 'big')", "x"), "258");
+    assert_eq!(
+        g("x = int.from_bytes(b'\\xff\\xff', 'big', signed=True)", "x"),
+        "-1"
+    );
+    assert_eq!(g("x = int.from_bytes([1, 0], 'big')", "x"), "256");
+    // Bignum round-trips through its own byte width.
+    assert_eq!(
+        g(
+            "n = 2**100\nx = int.from_bytes(n.to_bytes(13, 'big'), 'big') == n",
+            "x"
+        ),
+        "True"
+    );
+}
+
+/// `int.to_bytes` overflow / bad-argument errors match CPython's messages.
+#[test]
+fn int_to_bytes_errors() {
+    let e = |src: &str| eval_str(src).unwrap_err();
+    assert!(e("(-1).to_bytes(2, 'big')").contains("can't convert negative int to unsigned"));
+    assert!(e("(256).to_bytes(1, 'big')").contains("int too big to convert"));
+    assert!(e("(128).to_bytes(1, 'big', signed=True)").contains("int too big to convert"));
+    assert!(e("(5).to_bytes(2, 'middle')").contains("byteorder must be either 'little' or 'big'"));
+}
+
+/// `float.as_integer_ratio` (exact rational) and `int.as_integer_ratio`.
+#[test]
+fn as_integer_ratio_exact() {
+    assert_eq!(g("x = (0.5).as_integer_ratio()", "x"), "(1, 2)");
+    assert_eq!(g("x = (0.0).as_integer_ratio()", "x"), "(0, 1)");
+    assert_eq!(g("x = (-2.5).as_integer_ratio()", "x"), "(-5, 2)");
+    assert_eq!(g("x = (10).as_integer_ratio()", "x"), "(10, 1)");
+    // 0.1 is not exactly a tenth — its true binary ratio surfaces here.
+    assert_eq!(
+        g("x = (0.1).as_integer_ratio()", "x"),
+        "(3602879701896397, 36028797018963968)"
+    );
+}
+
+/// `float.hex` / `float.fromhex`: exact hex formatting and a bit-exact round trip.
+#[test]
+fn float_hex_and_fromhex() {
+    assert_eq!(g("x = (3.14).hex()", "x"), "'0x1.91eb851eb851fp+1'");
+    assert_eq!(g("x = (1.0).hex()", "x"), "'0x1.0000000000000p+0'");
+    assert_eq!(g("x = (0.0).hex()", "x"), "'0x0.0p+0'");
+    assert_eq!(g("x = (-0.0).hex()", "x"), "'-0x0.0p+0'");
+    // Smallest positive subnormal.
+    assert_eq!(g("x = (5e-324).hex()", "x"), "'0x0.0000000000001p-1022'");
+    assert_eq!(g("x = float.fromhex('0x1.8p+1')", "x"), "3.0");
+    assert_eq!(g("x = float.fromhex('  0X1P4  ')", "x"), "16.0"); // no dot, uppercase, ws
+    assert_eq!(g("x = float.fromhex('-inf')", "x"), "-inf");
+    // Round-trip preserves the exact bits.
+    assert_eq!(g("x = float.fromhex((0.1).hex()) == 0.1", "x"), "True");
+}

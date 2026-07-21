@@ -121,6 +121,11 @@ pub struct Compiler {
     qual_prefix: String,
     /// Compile-time `SyntaxWarning`s collected while lowering (see `Program`).
     warnings: Vec<(u32, String)>,
+    /// Interactive ("single") compile mode: a top-level (`fn_depth == 0`)
+    /// expression statement is routed through `sys.displayhook` (`ops::DISPLAYHOOK`)
+    /// instead of being discarded, so the REPL echoes `repr(value)` for non-`None`
+    /// results. Off for ordinary script compiles.
+    interactive: bool,
 }
 
 /// The kind of scope a hidden function represents, controlling whether it is a
@@ -135,8 +140,19 @@ enum ScopeKind {
 
 /// Compile a parsed program. `debug` enables per-statement DAP line markers.
 pub fn compile(stmts: &[Stmt], debug: bool) -> Result<Program, String> {
+    compile_ex(stmts, debug, false)
+}
+
+/// Compile with the interactive ("single") flag set: top-level expression
+/// statements echo their value via `sys.displayhook`. Used only by the REPL.
+pub fn compile_interactive(stmts: &[Stmt]) -> Result<Program, String> {
+    compile_ex(stmts, false, true)
+}
+
+fn compile_ex(stmts: &[Stmt], debug: bool, interactive: bool) -> Result<Program, String> {
     let mut c = Compiler {
         debug,
+        interactive,
         ..Default::default()
     };
     let mut b = ChunkBuilder::new();
@@ -186,7 +202,15 @@ impl Compiler {
         match &s.kind {
             StmtKind::Expr(e) => {
                 self.compile_expr(b, e)?;
-                b.emit(Op::Pop, line);
+                // Interactive REPL: echo a top-level expression's value through
+                // `sys.displayhook` (CPython "single" mode). Nested scopes
+                // (`def`/`lambda`/class body, `fn_depth > 0`) discard as normal.
+                if self.interactive && self.fn_depth == 0 {
+                    b.emit(Op::CallBuiltin(ops::DISPLAYHOOK, 1), line);
+                    b.emit(Op::Pop, line);
+                } else {
+                    b.emit(Op::Pop, line);
+                }
             }
             StmtKind::Pass => {}
             StmtKind::Assign { targets, value } => {

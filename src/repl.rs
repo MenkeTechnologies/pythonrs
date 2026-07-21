@@ -48,6 +48,35 @@ pub fn run() {
     }
 }
 
+/// Non-TTY REPL: read source lines from stdin and evaluate them with the same
+/// interactive semantics as the TTY loop (persistent host, block accumulation on
+/// an open header, `sys.displayhook` echo of non-`None` top-level expressions).
+/// This is the pipe-driven analogue of CPython's `python3 -i < file` — reached
+/// only when `--repl` is passed with a non-interactive stdin. No banner and no
+/// prompts are emitted (nothing to prompt to), keeping stdout to program output
+/// and displayhook echoes only.
+pub fn run_piped() {
+    use std::io::BufRead;
+    crate::host::reset_host();
+    let stdin = std::io::stdin();
+    let mut lines = stdin.lock().lines().map_while(Result::ok);
+    while let Some(mut buffer) = lines.next() {
+        if buffer.trim().is_empty() {
+            continue;
+        }
+        if opens_block(&buffer) {
+            for more in lines.by_ref() {
+                if more.trim().is_empty() {
+                    break;
+                }
+                buffer.push('\n');
+                buffer.push_str(&more);
+            }
+        }
+        run_line(&buffer);
+    }
+}
+
 fn opens_block(s: &str) -> bool {
     let t = s.trim_end();
     t.ends_with(':')
@@ -58,7 +87,7 @@ fn opens_block(s: &str) -> bool {
 }
 
 fn run_line(src: &str) {
-    match crate::compile(src) {
+    match crate::compile_interactive(src) {
         Ok(prog) => match crate::run_compiled(prog) {
             Ok(_) => {}
             Err(e) => eprintln!("{}", Color::Red.paint(e)),
