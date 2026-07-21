@@ -304,6 +304,26 @@ pub(crate) fn raw_getattr(recv: &Value, name: &str) -> Result<Value, String> {
         host::AttrGet::Descriptor { desc, inst, cls } => {
             host::call_method(&desc, "__get__", vec![inst, cls], vec![])
         }
+        host::AttrGet::CachedProperty { func, inst, name } => {
+            // Compute `func(inst)` (as a bound method so `self`/`super()` work),
+            // cache it in the instance dict, and return it. Runs outside the host
+            // borrow so the getter body can re-enter freely.
+            let value = match with_host(|h| h.get(&func).cloned()) {
+                Some(PyObj::Func(fv)) => {
+                    host::run_user_func(&fv, Some(inst.clone()), None, vec![], vec![])?
+                }
+                _ => host::invoke(&func, vec![inst.clone()], vec![])?,
+            };
+            // Cache into the instance dict. A `__slots__` instance with no dict
+            // can't cache — CPython raises this exact `TypeError`.
+            if with_host(|h| h.set_attr(&inst, &name, value.clone())).is_err() {
+                let cls = with_host(|h| h.type_name(&inst));
+                return Err(host::type_error(&format!(
+                    "No '__dict__' attribute on '{cls}' instance to cache '{name}' property."
+                )));
+            }
+            Ok(value)
+        }
         host::AttrGet::Plain => with_host(|h| h.get_attr(recv, name)),
     }
 }
@@ -3019,6 +3039,17 @@ pub fn call_builtin_function(
     // pythonrs class; see call_total_ordering).
     if name == "functools.total_ordering" {
         return call_total_ordering(&args);
+    }
+    // functools.cached_property(func) — a native non-data descriptor. Its `name`
+    // is filled from the class-namespace key at class-build time.
+    if name == "functools.cached_property" {
+        let func = arg0(&args)?;
+        return Ok(with_host(|h| {
+            h.alloc(PyObj::CachedProperty {
+                func,
+                name: String::new(),
+            })
+        }));
     }
     // sys.* module functions.
     if let Some(f) = name.strip_prefix("sys.") {

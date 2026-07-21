@@ -478,6 +478,15 @@ pub enum PyObj {
         fset: Value,
         fdel: Value,
     },
+    /// A `functools.cached_property` descriptor: a *non-data* descriptor whose
+    /// first access computes `func(instance)` and stores it in the instance
+    /// `__dict__` under `name`, so every later access hits the dict directly.
+    /// `name` is filled from the class-namespace key at class-build time (CPython
+    /// learns it via `__set_name__`).
+    CachedProperty {
+        func: Value,
+        name: String,
+    },
     /// The `NotImplemented` singleton: returned by a binary/comparison dunder to
     /// signal "this operand pair is not my business", so the interpreter tries the
     /// reflected operation (and, for `==`/`!=`, falls back to identity).
@@ -514,6 +523,13 @@ pub enum AttrGet {
         desc: Value,
         inst: Value,
         cls: Value,
+    },
+    /// A `functools.cached_property` on first access: invoke `func(inst)`, cache
+    /// the result in `inst`'s `__dict__` under `name`, and return it.
+    CachedProperty {
+        func: Value,
+        inst: Value,
+        name: String,
     },
 }
 
@@ -1781,6 +1797,7 @@ impl PyHost {
                 Some(PyObj::StaticMethod(_)) => "staticmethod".into(),
                 Some(PyObj::ClassMethod(_)) => "classmethod".into(),
                 Some(PyObj::Property { .. }) => "property".into(),
+                Some(PyObj::CachedProperty { .. }) => "cached_property".into(),
                 Some(PyObj::NotImplemented) => "NotImplementedType".into(),
                 Some(PyObj::Ellipsis) => "ellipsis".into(),
                 #[cfg(feature = "stdlib-ffi")]
@@ -1973,6 +1990,7 @@ impl PyHost {
                     format!("<classmethod({})>", self.str_of(f))
                 }
                 Some(PyObj::Property { .. }) => "<property object>".into(),
+                Some(PyObj::CachedProperty { .. }) => "<functools.cached_property object>".into(),
                 Some(PyObj::NotImplemented) => "NotImplemented".into(),
                 Some(PyObj::Ellipsis) => "Ellipsis".into(),
                 #[cfg(feature = "stdlib-ffi")]
@@ -6087,6 +6105,18 @@ impl PyHost {
                 owner: method_owner(self, &class, name),
             };
         }
+        // `functools.cached_property` — a non-data descriptor: it fires only when
+        // the name is absent from the instance dict; once computed and cached
+        // there, a later access reads the dict (via the `Plain` path below).
+        if let Some(PyObj::CachedProperty { func, .. }) = self.get(&cls_attr) {
+            if !in_instdict {
+                return AttrGet::CachedProperty {
+                    func: func.clone(),
+                    inst: recv.clone(),
+                    name: name.to_string(),
+                };
+            }
+        }
         // A user descriptor is an instance whose class defines `__get__`.
         let (has_get, is_data) = match self.get(&cls_attr) {
             Some(PyObj::Instance(i)) => {
@@ -6263,6 +6293,21 @@ impl PyHost {
             }
             out
         };
+        // Emulate `__set_name__` for `functools.cached_property`: it learns the
+        // attribute name from its class-namespace key so it can cache into the
+        // instance dict on first access.
+        let cp_names: Vec<(Value, String)> = ns
+            .iter()
+            .filter(|(_, v)| {
+                matches!(self.get(v), Some(PyObj::CachedProperty { name, .. }) if name.is_empty())
+            })
+            .map(|(k, v)| (v.clone(), k.clone()))
+            .collect();
+        for (val, key) in cp_names {
+            if let Some(PyObj::CachedProperty { name, .. }) = self.get_mut(&val) {
+                *name = key;
+            }
+        }
         self.classes.insert(
             name.to_string(),
             ClassDef {
@@ -8795,10 +8840,16 @@ pub fn import_module(name: &str) -> Result<Value, String> {
         // CPython `functools` via `module_ffi_fallback`.
         #[cfg(feature = "stdlib-ffi")]
         "functools" => with_host(|h| {
-            vec![(
-                "total_ordering",
-                h.alloc(PyObj::Builtin("functools.total_ordering".into())),
-            )]
+            vec![
+                (
+                    "total_ordering",
+                    h.alloc(PyObj::Builtin("functools.total_ordering".into())),
+                ),
+                (
+                    "cached_property",
+                    h.alloc(PyObj::Builtin("functools.cached_property".into())),
+                ),
+            ]
         }),
         "math" => with_host(|h| {
             vec![
