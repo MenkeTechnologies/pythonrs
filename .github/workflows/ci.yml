@@ -12,10 +12,19 @@ env:
 jobs:
   build-test:
     runs-on: ubuntu-latest
+    # `stdlib-ffi` is on by default (Cargo.toml [features]), so the default
+    # build pulls pyo3 and links libpython — it needs a CPython >= 3.13 and the
+    # abi3 forward-compat flag, same as the stdlib-ffi job below.
+    env:
+      PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
         run: rustup update stable && rustup default stable && rustup component add rustfmt clippy
+      - name: Install CPython
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
       - name: Format
         run: cargo fmt --check
       - name: Clippy
@@ -29,10 +38,10 @@ jobs:
       - name: Test
         run: cargo test --verbose
 
-  # Separate job for the optional CPython stdlib FFI bridge (feature
-  # `stdlib-ffi`): it links an embedded libpython via pyo3, so it needs a
-  # CPython >= 3.13 present and the abi3 forward-compat flag. The default
-  # build-test job above never pulls pyo3.
+  # Explicit `--features stdlib-ffi` job for the CPython stdlib FFI bridge. It is
+  # on by default now, so build-test above already exercises it; this job pins
+  # the feature explicitly (and its CPython >= 3.13 + abi3 forward-compat env) so
+  # the FFI path stays covered even if the default feature set changes.
   stdlib-ffi:
     runs-on: ubuntu-latest
     env:
