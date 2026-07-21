@@ -137,7 +137,7 @@ num-complex = "0.4"
 # `abi3-py313` links one binary against any CPython >= 3.13 via the stable ABI
 # (build the FFI config with `PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1` until pyo3
 # ships native 3.14 support). Default builds never pull pyo3 or need libpython.
-pyo3 = { version = "0.24", features = ["abi3-py313", "auto-initialize"], optional = true }
+pyo3 = { version = "0.29", features = ["abi3-py313", "auto-initialize"], optional = true }
 unicode_names2 = "3.1.0"
 unicode-general-category = "1.1.0"
 
