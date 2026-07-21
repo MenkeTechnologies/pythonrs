@@ -3675,7 +3675,21 @@ pub fn call_builtin_function(
             h.new_list(items)
         })),
         // Type constructors.
-        "int" => construct_int(&args),
+        "int" => {
+            // Fold an `int(x, base=B)` keyword into the positional base slot.
+            let mut a = args.clone();
+            if let Some(base) = kw_get(&kwargs, "base") {
+                if a.len() >= 2 {
+                    a[1] = base;
+                } else {
+                    if a.is_empty() {
+                        a.push(Value::str(""));
+                    }
+                    a.push(base);
+                }
+            }
+            construct_int(&a)
+        }
         "float" => construct_float(&args),
         "str" => {
             let v = args.first().cloned().unwrap_or_else(|| Value::str(""));
@@ -5090,7 +5104,7 @@ const INT_METHODS: &[&str] = &[
     "conjugate",
 ];
 const FLOAT_METHODS: &[&str] = &["is_integer", "as_integer_ratio", "hex", "conjugate"];
-const COMPLEX_METHODS: &[&str] = &["conjugate"];
+const COMPLEX_METHODS: &[&str] = &["conjugate", "__abs__"];
 
 /// The numeric dunder methods `int`/`bool` expose as bound methods
 /// (`(5).__add__(2)`, `(-3).__abs__()`, `(7).__floordiv__(2)`). Includes the
@@ -7755,6 +7769,12 @@ fn complex_method(recv: &Value, name: &str) -> Result<Value, String> {
             }
             _ => Err(host::type_error(
                 "descriptor 'conjugate' requires a 'complex' object",
+            )),
+        }),
+        "__abs__" => with_host(|h| match h.get(recv) {
+            Some(PyObj::Complex(r, i)) => Ok(Value::Float((r * r + i * i).sqrt())),
+            _ => Err(host::type_error(
+                "descriptor '__abs__' requires a 'complex'",
             )),
         }),
         _ => Err(format!(
