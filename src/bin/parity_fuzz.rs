@@ -4306,6 +4306,169 @@ fn gen_display(seed: u64) -> Vec<String> {
     }
 }
 
+/// Codecs, escape sequences, and unicode: `str.encode` / `bytes.decode` across
+/// `utf-8`/`ascii`/`latin-1`/`utf-16`/`utf-32` and the `strict`/`ignore`/
+/// `replace`/`backslashreplace`/`xmlcharrefreplace`/`namereplace` error
+/// handlers; `repr`/`ascii` escaping of non-printable and astral code points;
+/// `chr`/`ord` round-trips across the full range (surrogates excluded — a Rust
+/// `str` can't hold them); `isprintable`/`isidentifier`/`isascii`; `len`/index
+/// by code point; and string/bytes escape literals (`\n \xHH \uHHHH \U... \N{}`,
+/// octal, raw strings). The generated SOURCE is ASCII (non-ASCII is built via
+/// `chr()` / escapes) so the harness input stays clean; every probe prints a
+/// deterministic value (`repr`, encoded bytes, decoded repr, an int, or a bool),
+/// and encode/decode probes that may raise are wrapped so exit-code AND stdout
+/// parity both hold.
+fn gen_codec(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    // Code points spanning every relevant general category (NO surrogates):
+    // controls, space/line/paragraph separators, format chars, printable BMP,
+    // private use, unassigned/noncharacter, and astral-plane.
+    const CPS: &[&str] = &[
+        "0", "7", "9", "10", "13", "27", "31", "32", "65", "0x7e", "0x7f", "0x80", "0x85", "0xa0",
+        "0xad", "0xa9", "0xe9", "0x3b1", "0x2022", "0x2028", "0x2029", "0x200b", "0x200d",
+        "0x2060", "0xfeff", "0x2603", "0xe000", "0xf8ff", "0xfdd0", "0xfffe", "0xffff", "0x10000",
+        "0x1f600", "0x1f4a9", "0x100000", "0x10fffd", "0x10ffff",
+    ];
+    let cp = pick(r, CPS);
+    let cp2 = pick(r, CPS);
+    // Encodings the DEFAULT build implements (mixed case / alias forms included).
+    const ENCS: &[&str] = &[
+        "'utf-8'",
+        "'ascii'",
+        "'latin-1'",
+        "'iso-8859-1'",
+        "'utf-16'",
+        "'utf-16-le'",
+        "'utf-16-be'",
+        "'utf-32'",
+        "'utf-32-le'",
+        "'utf-32-be'",
+        "'UTF-8'",
+        "'utf_16_le'",
+        "'US-ASCII'",
+    ];
+    let enc = pick(r, ENCS);
+    // Encodings that round-trip ANY scalar value (for encode->decode probes).
+    const UTFENCS: &[&str] = &[
+        "'utf-8'",
+        "'utf-16'",
+        "'utf-16-le'",
+        "'utf-16-be'",
+        "'utf-32'",
+        "'utf-32-le'",
+        "'utf-32-be'",
+    ];
+    let uenc = pick(r, UTFENCS);
+    const ERRS: &[&str] = &[
+        "'strict'",
+        "'ignore'",
+        "'replace'",
+        "'backslashreplace'",
+        "'xmlcharrefreplace'",
+        "'namereplace'",
+    ];
+    let err = pick(r, ERRS);
+    // ASCII-source string literals exercising every escape form.
+    const ESCS: &[&str] = &[
+        r#""\n\t\r\\\0\a\b\f\v""#,
+        r#""\x41\x7f\x80\xff\xa0""#,
+        r#""\u03b1\u2022 \ufeff""#,
+        r#""\U0001F600\U0001F4A9\U00010000""#,
+        r#""\101\102\103\0\7\77\377""#,
+        r#""\N{BULLET}\N{DEGREE SIGN}\N{GREEK SMALL LETTER ALPHA}""#,
+        r#""mix \x41\u03b1\N{BULLET} end""#,
+        r#""'quotes' and \"double\"""#,
+    ];
+    let esc = pick(r, ESCS);
+    // ASCII-source bytes literals with byte escapes.
+    const BESCS: &[&str] = &[
+        r#"b"\x00\x7f\x80\xff\n\t\r\\""#,
+        r#"b"\101\102\0\7\377""#,
+        r#"b"hello\x00world""#,
+        r#"b"\xe6\x97\xa5\xe6\x9c\xac""#,
+        r#"b"\xc3\xa9\xc3\xa8""#,
+        r#"b"\xff\xfe\x41\x00""#,
+        r#"b"caf\xc3\xa9""#,
+    ];
+    let besc = pick(r, BESCS);
+    // Raw-string literals (no escape processing).
+    const RAWS: &[&str] = &[
+        r#"r"\n\t\x41""#,
+        r#"r"\u03b1\N{X}""#,
+        r#"r"C:\path\to""#,
+        r#"rb"\x41\n""#,
+    ];
+    let raw = pick(r, RAWS);
+    // Wrap a possibly-raising expression so exit-code AND stdout stay in parity.
+    let guard = |expr: String| -> Vec<String> {
+        vec![
+            "try:".into(),
+            format!("    print({expr})"),
+            "except Exception as e:".into(),
+            "    print(type(e).__name__)".into(),
+        ]
+    };
+    match r.below(20) {
+        // 0: repr of a single built code point (escape-vs-verbatim decision).
+        0 => vec![format!("print(repr(chr({cp}) + chr({cp2})))")],
+        // 1: ascii() of a built string (non-ASCII + non-printable escaping).
+        1 => vec![format!("print(ascii('x' + chr({cp}) + 'y' + chr({cp2})))")],
+        // 2: chr/ord round-trip across the full range.
+        2 => vec![format!("print(ord(chr({cp})), chr({cp}) == chr({cp}))")],
+        // 3: the unicode predicates.
+        3 => vec![format!(
+            "c = chr({cp})\nprint(c.isprintable(), c.isascii(), c.isspace())"
+        )],
+        // 4: len / index by code point (astral counts as one).
+        4 => vec![format!(
+            "s = 'a' + chr({cp}) + 'bc' + chr({cp2})\nprint(len(s), ord(s[1]), ord(s[-1]), s[0])"
+        )],
+        // 5: encode across encoding x error-handler (may raise).
+        5 => guard(format!("('A' + chr({cp}) + 'z').encode({enc}, {err})")),
+        // 6: encode with keyword errors=.
+        6 => guard(format!("('q' + chr({cp})).encode({enc}, errors={err})")),
+        // 8: encode -> decode round-trip through a UTF codec (always succeeds).
+        8 => vec![format!(
+            "print(('A' + chr({cp}) + chr({cp2})).encode({uenc}).decode({uenc}) == 'A' + chr({cp}) + chr({cp2}))"
+        )],
+        // 7: repr of an escape-sequence string literal.
+        7 => vec![format!("print(repr({esc}))")],
+        // 9: ascii() of an escape-sequence literal.
+        9 => vec![format!("print(ascii({esc}))")],
+        // 10: encode an escape literal (may raise on ascii/latin-1).
+        10 => guard(format!("{esc}.encode({enc}, {err})")),
+        // 11: repr / length of a bytes escape literal.
+        11 => vec![format!("print(repr({besc}), len({besc}))")],
+        // 12: decode a bytes escape literal (may raise on strict).
+        12 => guard(format!("repr({besc}.decode({enc}, {err}))")),
+        // 13: decode with keyword errors=.
+        13 => guard(format!("repr({besc}.decode({enc}, errors={err}))")),
+        // 14: raw-string literal (no escape processing) repr + length.
+        14 => vec![format!("print(repr({raw}), len({raw}))")],
+        // 15: named escape resolution.
+        15 => vec![
+            "print(ord('\\N{BULLET}'), ord('\\N{DEGREE SIGN}'))".into(),
+            "print(repr('\\N{GREEK SMALL LETTER ALPHA}\\N{SNOWMAN}'))".into(),
+        ],
+        // 16: isidentifier across ASCII + built non-ASCII first/other chars.
+        16 => vec![format!(
+            "print(('a' + chr({cp})).isidentifier(), chr({cp}).isidentifier(), ('x1_' + chr({cp})).isidentifier())"
+        )],
+        // 17: bytes.hex / fromhex round-trip + hex with separator.
+        17 => vec![format!(
+            "print({besc}.hex(), {besc}.hex('-'), bytes.fromhex('48656c6c6f') == b'Hello')"
+        )],
+        // 18: chr encode to fixed-width UTF and back-compare byte length.
+        18 => guard(format!(
+            "len(('A' + chr({cp})).encode({enc}))"
+        )),
+        // 19: repr of a big built string mixing many categories.
+        _ => vec![format!(
+            "print(repr(chr({cp}) + 'mid' + chr({cp2}) + '\\t\\x00'))"
+        )],
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Mode dispatch
 // ---------------------------------------------------------------------------
@@ -4364,6 +4527,7 @@ enum Mode {
     Seqtail,
     Display,
     Scoping,
+    Codec,
 }
 
 const REAL_MODES: &[Mode] = &[
@@ -4418,6 +4582,7 @@ const REAL_MODES: &[Mode] = &[
     Mode::Seqtail,
     Mode::Display,
     Mode::Scoping,
+    Mode::Codec,
 ];
 
 /// Generate the statement list for a seed in the selected mode. `Mixed` rotates
@@ -4479,6 +4644,7 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Seqtail => gen_seqtail(seed),
         Mode::Display => gen_display(seed),
         Mode::Scoping => gen_scoping(seed),
+        Mode::Codec => gen_codec(seed),
     }
 }
 
@@ -4536,6 +4702,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Seqtail => "seqtail",
         Mode::Display => "display",
         Mode::Scoping => "scoping",
+        Mode::Codec => "codec",
     }
 }
 
@@ -4593,6 +4760,7 @@ fn mode_from_name(s: &str) -> Option<Mode> {
         Mode::Seqtail,
         Mode::Display,
         Mode::Scoping,
+        Mode::Codec,
     ];
     ALL.iter().copied().find(|&m| mode_name(m) == s)
 }

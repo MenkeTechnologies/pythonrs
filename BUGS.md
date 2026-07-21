@@ -109,8 +109,12 @@ fixed. Every line below was re-checked against the **default-build** binary
   `startswith`/`endswith`/`strip`/`lstrip`/`rstrip`/`upper`/`lower`/`swapcase`/
   `title`/`capitalize`/`zfill`/`expandtabs`/`center`/`ljust`/`rjust`/
   `splitlines`/`partition`/`rpartition`/
-  `removeprefix`/`removesuffix`/`translate`/`maketrans`/`decode` (with
-  `errors=` `strict`/`ignore`/`replace`)/`hex`, the ASCII `isX` predicates
+  `removeprefix`/`removesuffix`/`translate`/`maketrans`/`decode` (across
+  `utf-8`/`ascii`/`latin-1`/`utf-16`/`utf-32` with `errors=`
+  `strict`/`ignore`/`replace`/`backslashreplace`; the encode-only
+  `namereplace`/`xmlcharrefreplace` raise `TypeError` on decode, matching
+  CPython)/`hex` (incl. the `sep`/`bytes_per_sep` grouping form), the ASCII `isX`
+  predicates
   (`isalpha`/`isdigit`/`isalnum`/`isspace`/`isupper`/`islower`/`istitle`/
   `isascii`), and PEP 461 `%`-formatting (`b'%d-%s' % (1, b'x')`, `%b`/`%c`/
   `%a`/`%r`, width/precision/flags, `%(name)s` mapping; `%b`/`%s` dispatch a
@@ -119,6 +123,21 @@ fixed. Every line below was re-checked against the **default-build** binary
   (`del ba[i]`, `del ba[i:j]`, `del ba[::k]`), plus
   `append`/`extend`/`pop`/`clear`. `repr` matches CPython quoting (single/
   double-quote selection; the bytearray always-escape-`'` quirk).
+- **Codecs, escapes, and unicode** (byte-verified vs CPython via the `codec`
+  fuzz mode, 0 divergences): `str.encode(encoding, errors)` across
+  `utf-8`/`ascii`/`latin-1`/`iso-8859-1`/`utf-16`/`utf-32` (bare `utf-16`/`utf-32`
+  emit a little-endian BOM; the `-le`/`-be` names don't) with the
+  `strict`/`ignore`/`replace`/`backslashreplace`/`xmlcharrefreplace`/`namereplace`
+  error handlers; `bytes.decode` for the same codecs with BOM auto-detection and
+  the decode-side handler set. `repr`/`ascii` escape exactly the non-printable
+  code points CPython does (Unicode 16.0 general categories Cc/Cf/Cs/Co/Cn and
+  Zl/Zp/Zs, space excepted), choosing the shortest `\xHH`/`\uHHHH`/`\UHHHHHHHH`
+  form. `chr`/`ord` round-trip the full range (lone surrogates rejected — a Rust
+  `str` can't hold them; see gaps). `str.isprintable`/`isascii`/`isidentifier`
+  (incl. the PEP 3131 `Other_ID_Continue` + ZWNJ/ZWJ chars)/`isspace` (incl.
+  U+001C..U+001F) match CPython; `len`/indexing count code points, not bytes.
+  Escape literals — `\n \t \r \0`, octal `\NNN`, `\xHH`, `\uHHHH`, `\UHHHHHHHH`,
+  `\N{NAME}`, raw `r"…"`, and byte-string escapes — decode in the lexer.
 - **Comprehension scope**: list/set/dict comprehensions run in their own function
   scope, so the loop variable no longer leaks; enclosing variables are still read
   through the closure (the outermost iterable is evaluated in the enclosing
@@ -175,6 +194,13 @@ fixed. Every line below was re-checked against the **default-build** binary
 - **f-string / `str.format` format spec** covers the common mini-language
   (fill/align/sign/width/`,`/`.prec`/type `d f e x o b % s c g`) and nested field
   specs (see Implemented).
+- **Lone surrogates in `str`**: `chr(0xD800..0xDFFF)` raises `ValueError` where
+  CPython returns a surrogate-bearing `str` (which then fails only on UTF-8
+  encode). pythonrs strings are Rust `String` (valid scalar values only), so a
+  lone surrogate is unrepresentable without a surrogate-aware string type; the
+  out-of-range and surrogate paths share CPython's `chr() arg not in
+  range(0x110000)` message. `surrogateescape`/`surrogatepass` handlers are
+  likewise not reachable for the same reason.
 
 ## Tooling
 - **`--dap`** (Debug Adapter Protocol): implemented — breakpoints, step
