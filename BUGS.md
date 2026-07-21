@@ -220,18 +220,12 @@ fixed. Every line below was re-checked against the **default-build** binary
   `__ge__`), and `__getitem__`/`__setitem__`/`__len__`/`__bool__`/`__str__`/
   `__repr__`/`__iter__`/`__next__`/`__init__`/`__hash__`. Container `repr`/`str`
   recurses so instance elements/keys/values dispatch their own `__repr__`.
-  In-place augmented dunders are dispatched too (see Implemented).
-- **Builtin-type subclass instances as dict/set keys** hash by identity, not by
-  their base value: `{U('a'): 1}['a']` (where `class U(str)`) raises `KeyError`
-  where CPython returns `1`, because `to_key` keys a subclass instance as
-  `PKey::Instance` (identity) rather than unwrapping to the payload's value key.
-  The subclass value still hashes correctly via `hash(U('a')) == hash('a')`; only
-  the dict/set *keying* path does not yet unwrap. (Subclassing itself — methods,
-  operators, iteration, `super()` — is fully covered; see Implemented.)
-- **Augmented assignment on a mutable builtin subclass** loses the subclass type:
-  `s += [2]` where `class L(list)` yields a plain `list`, not an `L` (the value
-  is correct, the type is downgraded). Direct mutation (`s.append(2)`) preserves
-  the subclass identity.
+  In-place augmented dunders are dispatched too (see Implemented). Subclassing
+  builtin types (`class L(list)`, `class C(int)`, …) is fully covered: inherited
+  methods/operators/iteration, `super().__init__`, `__new__`, use as dict/set
+  keys (a payload-hashing subclass keys identically to its base value),
+  `dict(subclass)` conversion, and augmented assignment preserving the subclass
+  type for mutable bases.
 - **`int`** is arbitrary precision (bignum) across `+ - * ** // %` and the bitwise
   ops `& | ^ << >>` — verified byte-identical to CPython on `10**30`-scale values
   (the earlier i64-cap on `//`/`%`/bitwise is gone).
