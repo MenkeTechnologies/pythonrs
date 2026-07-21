@@ -47,6 +47,81 @@ fn strings_and_fstrings() {
     assert_eq!(g("x = 'a,b,c'.split(',')", "x"), "['a', 'b', 'c']");
 }
 
+/// str positional-arg cluster: split/rsplit maxsplit, find/rfind/index/rindex
+/// and count honoring start/end, startswith/endswith honoring start/end and
+/// tuple prefixes. Char-index space, faithful to CPython 3.14.
+#[test]
+fn str_split_maxsplit() {
+    // sep + maxsplit
+    assert_eq!(g("x = 'a,b,c'.split(',', 1)", "x"), "['a', 'b,c']");
+    assert_eq!(g("x = 'a,b,c'.split(',', 0)", "x"), "['a,b,c']");
+    assert_eq!(g("x = 'a,b,c'.split(',', 5)", "x"), "['a', 'b', 'c']");
+    assert_eq!(g("x = 'a,b,,c'.split(',')", "x"), "['a', 'b', '', 'c']");
+    // whitespace split (sep is None) honors maxsplit; tail keeps inner/trailing ws
+    assert_eq!(g("x = '  a  b  c  '.split()", "x"), "['a', 'b', 'c']");
+    assert_eq!(g("x = 'a b c d'.split(None, 2)", "x"), "['a', 'b', 'c d']");
+}
+
+#[test]
+fn str_rsplit_maxsplit() {
+    // splits from the right and honors maxsplit
+    assert_eq!(g("x = 'a b c'.rsplit(' ', 1)", "x"), "['a b', 'c']");
+    assert_eq!(g("x = 'a,b,c,d'.rsplit(',', 2)", "x"), "['a,b', 'c', 'd']");
+    assert_eq!(g("x = 'a,b,c'.rsplit(',')", "x"), "['a', 'b', 'c']");
+    // whitespace rsplit with maxsplit
+    assert_eq!(g("x = 'a b c d'.rsplit(None, 1)", "x"), "['a b c', 'd']");
+    // prog-name idiom from the argv drop-in
+    assert_eq!(g("x = '/a/b/prog.py'.rsplit('/', 1)[-1]", "x"), "'prog.py'");
+}
+
+#[test]
+fn str_find_rfind_start_end() {
+    assert_eq!(g("x = 'abcabc'.find('a', 1)", "x"), "3");
+    assert_eq!(g("x = 'abcabc'.rfind('a')", "x"), "3");
+    assert_eq!(g("x = 'abcabc'.find('a', 1, 2)", "x"), "-1");
+    assert_eq!(g("x = 'abcabc'.find('c', -2)", "x"), "5");
+    assert_eq!(g("x = 'abcabc'.rfind('a', 0, 2)", "x"), "0");
+    // unicode: char index (2), not byte index (3, since é is 2 bytes)
+    assert_eq!(g("x = 'héllo'.find('l')", "x"), "2");
+}
+
+#[test]
+fn str_index_rindex_start_end() {
+    assert_eq!(g("x = 'abcabc'.index('b', 2)", "x"), "4");
+    assert_eq!(g("x = 'abcabc'.rindex('b')", "x"), "4");
+    // ValueError when not present in the given range
+    assert_eq!(
+        g(
+            "try:\n    'abcabc'.index('b', 5)\n    x = 'no error'\nexcept ValueError as e:\n    x = type(e).__name__",
+            "x"
+        ),
+        "'ValueError'"
+    );
+}
+
+#[test]
+fn str_count_start_end() {
+    assert_eq!(g("x = 'abcabc'.count('a', 1)", "x"), "1");
+    assert_eq!(g("x = 'abcabc'.count('a')", "x"), "2");
+    assert_eq!(g("x = 'aaa'.count('a', 1, 2)", "x"), "1");
+    // empty needle counts gaps within the range
+    assert_eq!(g("x = 'abc'.count('')", "x"), "4");
+    assert_eq!(g("x = 'abc'.count('', 1)", "x"), "3");
+}
+
+#[test]
+fn str_startswith_endswith_start_end() {
+    assert_eq!(g("x = 'hello'.startswith('l', 2)", "x"), "True");
+    assert_eq!(g("x = 'hello'.endswith('ll', 0, 4)", "x"), "True");
+    assert_eq!(g("x = 'hello'.startswith('l', 2, 3)", "x"), "True");
+    assert_eq!(g("x = 'hello'.startswith('he')", "x"), "True");
+    assert_eq!(g("x = 'hello'.endswith('lo')", "x"), "True");
+    // tuple of prefixes still works
+    assert_eq!(g("x = 'hello'.startswith(('x', 'he'))", "x"), "True");
+    assert_eq!(g("x = 'hello'.endswith(('x', 'lo'))", "x"), "True");
+    assert_eq!(g("x = 'hello'.startswith(('x', 'y'))", "x"), "False");
+}
+
 #[test]
 fn percent_format_dispatches_instance_str_repr() {
     // `%s`/`%r`/`%a` must call the user instance's __str__/__repr__ (resolved
