@@ -308,3 +308,40 @@ print(list(map(op.attrgetter('x'), pts)))
         "stderr={stderr}"
     );
 }
+
+/// Compile-time `SyntaxWarning`s (CPython): `is`/`is not` with an immutable
+/// literal, and a literal sequence subscripted by a float constant. Both print
+/// to stderr before the program runs, with the offending source line echoed
+/// (the subprocess harness runs from a real temp file, so the echo fires).
+#[test]
+fn syntax_warnings_is_literal_and_float_subscript() {
+    // The float subscript raises a runtime TypeError, so it's caught to let the
+    // program complete; the compile-time warnings still print regardless.
+    let src = "\
+x = 5
+print(x is 1)
+try:
+    [1, 2, 3][1.5]
+except TypeError:
+    print('caught')
+";
+    let (stdout, stderr, ok) = run_py(src);
+    assert!(ok, "program should still run: {stderr}");
+    assert_eq!(stdout, "False\ncaught\n", "stderr={stderr}");
+    assert!(
+        stderr.contains("SyntaxWarning: \"is\" with 'int' literal. Did you mean \"==\"?"),
+        "missing is-literal warning: {stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "SyntaxWarning: list indices must be integers or slices, not float; \
+             perhaps you missed a comma?"
+        ),
+        "missing float-subscript warning: {stderr}"
+    );
+    // The offending source line is echoed under each warning.
+    assert!(
+        stderr.contains("  print(x is 1)"),
+        "no source echo: {stderr}"
+    );
+}

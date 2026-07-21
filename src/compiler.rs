@@ -1507,6 +1507,18 @@ impl Compiler {
                 b.emit(Op::CallBuiltin(ops::GETATTR, 2), self.cur_line);
             }
             Expr::Subscript(recv, idx) => {
+                // CPython `SyntaxWarning` for a literal sequence subscripted by a
+                // float/complex constant (a likely missing comma).
+                if let (Some(ct), Some(it)) = (literal_container_type(recv), float_index_type(idx))
+                {
+                    self.warnings.push((
+                        self.cur_line,
+                        format!(
+                            "{ct} indices must be integers or slices, not {it}; \
+                             perhaps you missed a comma?"
+                        ),
+                    ));
+                }
                 self.compile_expr(b, recv)?;
                 self.compile_subscript_index(b, idx)?;
                 b.emit(Op::CallBuiltin(ops::GETITEM, 2), self.cur_line);
@@ -1866,11 +1878,23 @@ impl Compiler {
                 b.emit(Op::NumGe, 0);
             }
             CmpOp::Is => {
+                if let Some(t) = const_literal_type(left).or_else(|| const_literal_type(rhs)) {
+                    self.warnings.push((
+                        self.cur_line,
+                        format!("\"is\" with '{t}' literal. Did you mean \"==\"?"),
+                    ));
+                }
                 self.compile_expr(b, left)?;
                 self.compile_expr(b, rhs)?;
                 b.emit(Op::CallBuiltin(ops::IS, 2), 0);
             }
             CmpOp::IsNot => {
+                if let Some(t) = const_literal_type(left).or_else(|| const_literal_type(rhs)) {
+                    self.warnings.push((
+                        self.cur_line,
+                        format!("\"is not\" with '{t}' literal. Did you mean \"!=\"?"),
+                    ));
+                }
                 self.compile_expr(b, left)?;
                 self.compile_expr(b, rhs)?;
                 b.emit(Op::CallBuiltin(ops::IS, 2), 0);
@@ -2540,6 +2564,47 @@ fn wrap_comp_clauses(mut inner: Vec<Stmt>, comps: &[Comprehension]) -> Vec<Stmt>
 
 /// The parameter names a `def`/`lambda` binds (positional, `*args`, keyword-only,
 /// `**kwargs`), skipping the bare-`*` keyword-only marker (`Some("")`).
+/// The CPython type name of an immutable *constant* literal (`int`/`float`/
+/// `complex`/`str`/`bytes`, or a `tuple` of such), used for the `SyntaxWarning`
+/// on `x is <literal>`. `None` for names, containers CPython doesn't fold
+/// (`list`/`dict`/`set`), and the singletons (`None`/`True`/`False`).
+fn const_literal_type(e: &Expr) -> Option<&'static str> {
+    match e {
+        Expr::Int(_) | Expr::BigInt(_) => Some("int"),
+        Expr::Float(_) => Some("float"),
+        Expr::Complex(_) => Some("complex"),
+        Expr::Str(_) => Some("str"),
+        Expr::Bytes(_) => Some("bytes"),
+        Expr::Tuple(items) if items.iter().all(|x| const_literal_type(x).is_some()) => {
+            Some("tuple")
+        }
+        _ => None,
+    }
+}
+
+/// The type name of a literal *sequence* container (`list`/`tuple`/`str`/
+/// `bytes`) whose subscription CPython can type-check at compile time; `None`
+/// otherwise (a `dict` allows float keys, a `name`/call has unknown type).
+fn literal_container_type(e: &Expr) -> Option<&'static str> {
+    match e {
+        Expr::List(_) => Some("list"),
+        Expr::Tuple(_) => Some("tuple"),
+        Expr::Str(_) => Some("str"),
+        Expr::Bytes(_) => Some("bytes"),
+        _ => None,
+    }
+}
+
+/// The type name of a `float`/`complex` literal index (which can't index a
+/// sequence), else `None`.
+fn float_index_type(e: &Expr) -> Option<&'static str> {
+    match e {
+        Expr::Float(_) => Some("float"),
+        Expr::Complex(_) => Some("complex"),
+        _ => None,
+    }
+}
+
 /// A top-level statement of a class body that is a simple (bare-name)
 /// annotation, so the body needs an `__annotations__` dict.
 fn is_ann_assign(s: &Stmt) -> bool {
@@ -3001,9 +3066,9 @@ fn expr_has_yield(e: &Expr) -> bool {
 fn collect_finally_escapes(stmts: &[Stmt], out: &mut Vec<(u32, String)>) {
     for s in stmts {
         match &s.kind {
-            StmtKind::Return(_) => out.push((s.line, "return".to_string())),
-            StmtKind::Break => out.push((s.line, "break".to_string())),
-            StmtKind::Continue => out.push((s.line, "continue".to_string())),
+            StmtKind::Return(_) => out.push((s.line, "'return' in a 'finally' block".to_string())),
+            StmtKind::Break => out.push((s.line, "'break' in a 'finally' block".to_string())),
+            StmtKind::Continue => out.push((s.line, "'continue' in a 'finally' block".to_string())),
             StmtKind::If { body, orelse, .. } => {
                 collect_finally_escapes(body, out);
                 collect_finally_escapes(orelse, out);
