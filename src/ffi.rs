@@ -315,6 +315,36 @@ fn value_to_py<'py>(
                     .map(|p| p.into_any().into_bound(py))
                     .map_err(|e| e.to_string())
             }
+            // A native pythonrs class passed into a CPython call (`@dataclass`,
+            // `dataclasses.fields(Cls)`): build a CPython mirror over `object`
+            // with the class namespace — methods cross as `PyrsCallable`
+            // descriptors (they bind `self`), `__annotations__`/class-vars by
+            // value — so the decorator can read the fields and add methods.
+            Some(PyObj::Class(cname)) => {
+                let members: Vec<(String, Value)> = host
+                    .classes
+                    .get(cname)
+                    .map(|c| c.ns.iter().map(|(k, val)| (k.clone(), val.clone())).collect())
+                    .unwrap_or_default();
+                let ns_dict = PyDict::new(py);
+                for (k, val) in &members {
+                    let pv = value_to_py(host, py, val)?;
+                    ns_dict.set_item(k.as_str(), pv).map_err(|e| e.to_string())?;
+                }
+                if !ns_dict.contains("__module__").unwrap_or(false) {
+                    let _ = ns_dict.set_item("__module__", "__main__");
+                }
+                let _ = ns_dict.set_item("__qualname__", cname.as_str());
+                let obj_base = py
+                    .import("builtins")
+                    .and_then(|m| m.getattr("object"))
+                    .map_err(|e| e.to_string())?;
+                let bases = PyTuple::new(py, &[obj_base]).map_err(|e| e.to_string())?;
+                let helper = make_class_helper(py)?;
+                helper
+                    .call1((cname.as_str(), bases, ns_dict))
+                    .map_err(|e| e.to_string())
+            }
             _ => Err(crate::host::type_error(&format!(
                 "cannot pass '{}' to a CPython stdlib call",
                 host.type_name(v)

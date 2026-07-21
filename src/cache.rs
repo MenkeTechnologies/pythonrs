@@ -63,7 +63,12 @@ use std::path::PathBuf;
 /// and would give the wrong error, so it must miss.
 /// v20: `FuncDef` gained a `qualname` (`__qualname__`) so function introspection
 /// dunders resolve. Older bytecode lacks the field, so it must miss.
-const SCHEMA: u64 = 20;
+/// v21: a class body now lowers its simple annotations (`x: int`) into an
+/// `__annotations__` dict (SETUP + per-field SETITEM), so `dataclass`/
+/// `typing.NamedTuple` and `Cls.__annotations__` see the fields; also large
+/// collection literals (over 255 elements) lower via the `EXTEND_*` ops. Older
+/// cached bytecode lacks the annotation/extend lowering and must miss cleanly.
+const SCHEMA: u64 = 21;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]
