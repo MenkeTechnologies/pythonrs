@@ -2575,8 +2575,56 @@ pub fn is_builtin_function(name: &str) -> bool {
 
 /// Whether `name` is a builtin *type* (`int`, `list`, …) as opposed to a builtin
 /// function — controls `<class 'X'>` vs `<built-in function X>` repr.
-pub fn is_builtin_type_name(name: &str) -> bool {
-    is_builtin_type(name)
+/// `True` if `v` is an `int` (or `bool`/bigint) — CPython `PyLong_Check` — used
+/// by `sum`'s exact integer prefix and its float-loop int handling.
+fn sum_is_long(v: &Value) -> bool {
+    matches!(v, Value::Int(_) | Value::Bool(_))
+        || with_host(|h| matches!(h.get(v), Some(PyObj::BigInt(_))))
+}
+
+/// The trailing half of CPython's "sum() can't sum X" message if `start` is a
+/// forbidden start value (str/bytes/bytearray), else `None`.
+fn sum_bad_start(start: &Value) -> Option<&'static str> {
+    if matches!(start, Value::Str(_)) {
+        return Some("strings [use ''.join(seq) instead]");
+    }
+    with_host(|h| match h.get(start) {
+        Some(PyObj::Str(_)) => Some("strings [use ''.join(seq) instead]"),
+        Some(PyObj::Bytes(_)) => Some("bytes [use b''.join(seq) instead]"),
+        Some(PyObj::Bytearray(_)) => Some("bytearray [use b''.join(seq) instead]"),
+        _ => None,
+    })
+}
+
+/// Neumaier "improved Kahan–Babuška" step: fold `x` into the compensated sum
+/// `(hi, lo)`. Verbatim port of CPython `cs_add` (`Python/bltinmodule.c`).
+#[inline]
+fn cs_add(hi: f64, lo: f64, x: f64) -> (f64, f64) {
+    let t = hi + x;
+    let lo = if hi.abs() >= x.abs() {
+        lo + ((hi - t) + x)
+    } else {
+        lo + ((x - t) + hi)
+    };
+    (t, lo)
+}
+
+/// Collapse a compensated sum to a `double` (CPython `cs_to_double`): add the
+/// low-order compensation back unless it is non-finite.
+#[inline]
+fn cs_to_double(hi: f64, lo: f64) -> f64 {
+    if lo != 0.0 && lo.is_finite() {
+        hi + lo
+    } else {
+        hi
+    }
+}
+
+/// `True` if `name` names a builtin *type* (constructor) or exception class —
+/// i.e. `type(<that>)` is `type`. Used by `PyHost::type_name` to distinguish a
+/// builtin type object (`int`, `ValueError`) from a builtin function (`len`).
+pub fn is_type_like_builtin(name: &str) -> bool {
+    is_builtin_type(name) || is_exception_class(name)
 }
 
 fn is_builtin_type(name: &str) -> bool {
@@ -2978,10 +3026,54 @@ pub fn call_builtin_function(
         "min" => reduce_minmax(&args, &kwargs, false),
         "max" => reduce_minmax(&args, &kwargs, true),
         "sum" => {
-            let items = host::iter_vec(&arg0(&args)?)?;
-            let mut acc = args.get(1).cloned().unwrap_or(Value::Int(0));
-            for it in items {
-                acc = with_host(|h| h.arith(NumOp::Add, &acc, &it))?;
+            // Faithful port of CPython 3.14 `builtin_sum_impl`: an exact integer
+            // prefix, then Neumaier compensated summation once the accumulator is
+            // a float (so `sum([0.1]*10) == 1.0`), then generic `+` for the tail.
+            let seq = arg0(&args)?;
+            let start = args.get(1).cloned().unwrap_or(Value::Int(0));
+            // CPython rejects str/bytes/bytearray start values up front.
+            if let Some(msg) = sum_bad_start(&start) {
+                return Err(host::type_error(&format!("sum() can't sum {msg}")));
+            }
+            let items = host::iter_vec(&seq)?;
+            let mut acc = start;
+            let mut idx = 0;
+            // Exact integer prefix. pythonrs int add auto-promotes to bigint, so
+            // this stays exact like CPython's `i_result` fast path; the first
+            // non-int item is added generically (int+float -> float), which may
+            // enter the float loop below.
+            while idx < items.len() && sum_is_long(&acc) {
+                let item = &items[idx];
+                acc = with_host(|h| h.arith(NumOp::Add, &acc, item))?;
+                idx += 1;
+                if !sum_is_long(item) {
+                    break;
+                }
+            }
+            // Neumaier compensated float summation.
+            if let Value::Float(mut hi) = acc {
+                let mut lo = 0.0f64;
+                while idx < items.len() {
+                    let item = &items[idx];
+                    let x = if let Value::Float(x) = *item {
+                        x
+                    } else if sum_is_long(item) {
+                        with_host(|h| h.num_val(item)).unwrap()
+                    } else {
+                        // Non-float non-int: finalize and fall to the generic tail.
+                        break;
+                    };
+                    let (nh, nl) = cs_add(hi, lo, x);
+                    hi = nh;
+                    lo = nl;
+                    idx += 1;
+                }
+                acc = Value::Float(cs_to_double(hi, lo));
+            }
+            // Generic tail (mixed types, complex, Decimal, …).
+            while idx < items.len() {
+                acc = with_host(|h| h.arith(NumOp::Add, &acc, &items[idx]))?;
+                idx += 1;
             }
             Ok(acc)
         }

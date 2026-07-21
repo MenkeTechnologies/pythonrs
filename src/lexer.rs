@@ -382,6 +382,13 @@ impl Lexer {
                     self.pos += 1;
                 }
                 '.' => {
+                    // A second `.` after the number is already a float (a
+                    // decimal point or an exponent was seen) is attribute
+                    // access, not part of the literal: `0.1.is_integer()` lexes
+                    // as `0.1` then `.is_integer`, matching CPython.
+                    if is_float {
+                        break;
+                    }
                     is_float = true;
                     s.push(c);
                     self.pos += 1;

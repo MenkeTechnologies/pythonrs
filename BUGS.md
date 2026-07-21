@@ -297,7 +297,9 @@ plus the entire CPython stdlib are importable out of the box. A
 `--no-default-features` build serves only the native subset below; every other
 module then raises `ModuleNotFoundError`.
 
-- **Native in every build**: `math` (constants + a common function subset), `sys`
+- **Native in every build**: `math` (constants + a common function fast path;
+  in a default build any symbol the native arm lacks — `isqrt`, `trunc`, `comb`,
+  `hypot`, … — defers to the real CPython `math` over the FFI bridge), `sys`
   (`argv` from the process args, `exit`/`getrecursionlimit`/`setrecursionlimit`,
   `maxsize`, `version`/`version_info` reporting the emulated CPython `3.14.6`,
   `platform` (`darwin`/`linux`), `path`, `modules`, `executable`,
@@ -315,3 +317,15 @@ module then raises `ModuleNotFoundError`.
   3.14 forward-compat check). **Only a `--no-default-features` build drops the
   bridge** — there `import functools`/`import re`/`import os` all raise
   `ModuleNotFoundError`.
+- **FFI-boundary integration gaps** (imported module works, but crossing the
+  boundary with a pythonrs object does not):
+  - **`enum` / metaclasses on a Foreign base**: `class C(Enum): A = 1` builds a
+    native class with metaclass `type` instead of routing creation through the
+    Foreign base's `EnumType`, so `C.A` reads back the raw value `1` (not a
+    member) and `C.A.name`/`.value` raise `AttributeError`. Needs metaclass-aware
+    class creation across the FFI boundary (call CPython `type(name, bases, ns)`
+    when a base is Foreign, wrap the result).
+  - **`functools.wraps` on a pythonrs wrapper**: plain decorators work, but
+    `@functools.wraps(fn)` fails — CPython does `setattr(wrapper, '__module__', …)`
+    on the pythonrs `PyrsCallable` proxy, which is attribute-read-only. Needs a
+    settable attribute store on marshalled pythonrs callables.
