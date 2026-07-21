@@ -335,12 +335,21 @@ module then raises `ModuleNotFoundError`.
   class-vars by value), so dataclass installs `__init__`/`__repr__`/`__eq__`/
   ordering and the result rebinds the name. Class bodies capture their simple
   annotations into `__annotations__`, so `Cls.__annotations__`, `@dataclass`, and
-  `typing.NamedTuple` all see the fields.
+  `typing.NamedTuple` all see the fields. A pythonrs *instance* also crosses into
+  a CPython call as a `PyrsInstance` proxy (attribute/item access, comparison,
+  hashing, repr route back to the fusevm object), so `operator.attrgetter("x")
+  (obj)` / `sorted(objs, key=itemgetter(0))` work.
   Remaining gaps:
   - **Function annotations**: `def f(a: int) -> str` doesn't populate
     `f.__annotations__` (the parser discards param/return annotations; only
     class-body annotations are captured). Needs the parser/AST to keep them and
     the compiler to build the function's annotation dict at def time.
+  - **A CPython descriptor on a pythonrs class** (`functools.cached_property`)
+    isn't invoked via `__get__` on instance access — it returns the descriptor
+    object. The fix needs the getattr path to detect a Foreign class attribute
+    and call its `__get__` *outside* the already-borrowed `get_attr` (the host is
+    mutably borrowed there, so the FFI call can't run inline). Native `@property`
+    is unaffected.
   - **`collections.namedtuple` field *types*** cross as `PyrsCallable` wrappers,
     not the CPython type objects, so `dataclasses.fields(x)[i].type` on a mirrored
     class is a proxy — the generated `__init__`/`__repr__`/`__eq__` (which use only
