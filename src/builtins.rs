@@ -9386,7 +9386,11 @@ fn fmt_nonfinite(f: f64, upper: bool) -> Option<String> {
         Some(if upper { "NAN" } else { "nan" }.to_string())
     } else if f.is_infinite() {
         let s = if upper { "INF" } else { "inf" };
-        Some(if f < 0.0 { format!("-{s}") } else { s.to_string() })
+        Some(if f < 0.0 {
+            format!("-{s}")
+        } else {
+            s.to_string()
+        })
     } else {
         None
     }

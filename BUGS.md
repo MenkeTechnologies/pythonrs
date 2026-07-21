@@ -321,21 +321,23 @@ module then raises `ModuleNotFoundError`.
   3.14 forward-compat check). **Only a `--no-default-features` build drops the
   bridge** — there `import functools`/`import re`/`import os` all raise
   `ModuleNotFoundError`.
-- **FFI-boundary integration gaps** (imported module works, but crossing the
-  boundary with a pythonrs object does not):
-  - **`enum` / metaclasses on a Foreign base**: `class C(Enum): A = 1` builds a
-    native class with metaclass `type` instead of routing creation through the
-    Foreign base's `EnumType`, so `C.A` reads back the raw value `1` (not a
-    member) and `C.A.name`/`.value` raise `AttributeError`. Needs metaclass-aware
-    class creation across the FFI boundary (call CPython `type(name, bases, ns)`
-    when a base is Foreign, wrap the result).
-  - **`functools.wraps` on a pythonrs wrapper**: plain decorators work, but
-    `@functools.wraps(fn)` fails — CPython does `setattr(wrapper, '__module__', …)`
-    on the pythonrs `PyrsCallable` proxy, which is attribute-read-only. Needs a
-    settable attribute store on marshalled pythonrs callables.
-  - **Passing a pythonrs generator to a CPython stdlib call**: e.g.
-    `itertools.takewhile(pred, my_gen())` raises `TypeError: cannot pass
-    'generator' to a CPython stdlib call` — the in-marshaler has no CPython
-    iterator wrapper for a pythonrs generator. (Foreign→pythonrs iteration works;
-    only pythonrs→Foreign of a live generator is missing.) Materializing the
-    generator first (`list(my_gen())`) is the workaround.
+- **FFI-boundary integration** — crossing the bridge with a pythonrs object.
+  Working: `class C(enum.Enum)` (and other Foreign-base classes) are built by the
+  real metaclass via CPython `types.new_class`, so members/`.name`/`.value`,
+  singleton `is` identity, IntEnum/Flag, and body-defined methods all behave like
+  CPython; a pythonrs generator marshals into a CPython call as a lazy iterator
+  (`itertools.takewhile(pred, gen())` over an infinite generator); pythonrs
+  callables carry a `__dict__` and expose the wrapped function's dunders, so
+  `@functools.wraps` succeeds; pythonrs methods stored in a CPython-built class
+  bind `self` (the `PyrsCallable` descriptor).
+  Remaining gaps:
+  - **Passing a *native* pythonrs class into a CPython call** — `@dataclass`
+    (`dataclasses.dataclass(MyClass)`) raises `TypeError: cannot pass 'type' to a
+    CPython stdlib call`. The in-marshaler has no CPython mirror for a native
+    `PyObj::Class`, and pythonrs doesn't yet capture class-body `__annotations__`
+    (which `dataclass` needs to find fields). Needs annotation capture plus a
+    class-mirroring marshaler. (A class that *inherits* a Foreign base already
+    crosses via the Enum path above; this is only the pass-as-argument direction.)
+  - **Native `collections.namedtuple` method surface**: instances support field
+    access and indexing but not `_asdict`/`_replace`/`_fields`. (`typing.NamedTuple`
+    subclasses would instead route through the Foreign-base path.)

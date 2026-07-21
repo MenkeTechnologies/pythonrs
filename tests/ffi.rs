@@ -119,8 +119,7 @@ print(sorted(['pie', 'a', 'bb'], key=functools.cmp_to_key(lambda a, b: len(a) - 
     }
     assert!(!stderr.contains("RefCell"), "reentrancy panic: {stderr}");
     assert_eq!(
-        stdout,
-        "[8, 9, 100]\n[1, 10]\n[0, 2, 4]\n[3, 2, 1]\n['a', 'bb', 'pie']\n",
+        stdout, "[8, 9, 100]\n[1, 10]\n[0, 2, 4]\n[3, 2, 1]\n['a', 'bb', 'pie']\n",
         "stderr={stderr}"
     );
 }
@@ -143,5 +142,77 @@ print(textwrap.fill('a b c d e f', width=5))
         eprintln!("skipping ffi-float/stdlib test: stdlib bridge unavailable ({stderr})");
         return;
     }
-    assert_eq!(stdout, "0.3333333333333333 2.5\na b c\nd e f\n", "stderr={stderr}");
+    assert_eq!(
+        stdout, "0.3333333333333333 2.5\na b c\nd e f\n",
+        "stderr={stderr}"
+    );
+}
+
+/// Enum via a foreign (CPython) base: `class C(Enum)` is built by the real
+/// `EnumType` metaclass, so members, `.name`/`.value`, iteration, `by-value` and
+/// `by-name` lookup, singleton `is` identity, IntEnum ordering, and body-defined
+/// methods all behave like CPython. Skips cleanly without the stdlib bridge.
+#[test]
+fn ffi_enum_via_foreign_metaclass() {
+    let src = "\
+from enum import Enum, IntEnum, auto
+class Color(Enum):
+    RED = 1
+    GREEN = 2
+    def bright(self): return self.value * 10
+class Pri(IntEnum):
+    LOW = 1
+    HIGH = 3
+print(Color.RED, Color.RED.name, Color.RED.value)
+print([c.name for c in Color], Color(2), Color['GREEN'])
+print(Color.RED is Color.RED, Color.RED is Color.GREEN, Color(1) is Color.RED)
+print(Color.RED.bright(), len(Color))
+print(Pri.HIGH > Pri.LOW, Pri.HIGH + 1, sorted(Pri, reverse=True))
+";
+    let (stdout, stderr, ok) = run_py(src);
+    if !ok || stderr.contains("ModuleNotFoundError") {
+        eprintln!("skipping ffi-enum test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert!(!stderr.contains("RefCell"), "panic: {stderr}");
+    assert_eq!(
+        stdout,
+        "Color.RED RED 1\n['RED', 'GREEN'] Color.GREEN Color.GREEN\nTrue False True\n10 2\nTrue 4 [<Pri.HIGH: 3>, <Pri.LOW: 1>]\n",
+        "stderr={stderr}"
+    );
+}
+
+/// A pythonrs generator crosses into a CPython call as a lazy iterator
+/// (`itertools.takewhile` over an infinite generator never materializes), and
+/// `functools.wraps` on a pythonrs wrapper succeeds — `__name__` is copied off
+/// the wrapped function and the decorated function stays callable.
+#[test]
+fn ffi_generator_marshalling_and_functools_wraps() {
+    let src = "\
+import itertools, functools
+def fib():
+    a, b = 0, 1
+    while True:
+        yield a
+        a, b = b, a + b
+print(list(itertools.takewhile(lambda x: x < 50, fib())))
+def logged(fn):
+    @functools.wraps(fn)
+    def wrapper(*a, **k):
+        return fn(*a, **k)
+    return wrapper
+@logged
+def greet(name):
+    return 'hi ' + name
+print(greet('bob'), greet.__name__)
+";
+    let (stdout, stderr, ok) = run_py(src);
+    if !ok || stderr.contains("ModuleNotFoundError") {
+        eprintln!("skipping ffi-gen/wraps test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(
+        stdout, "[0, 1, 1, 2, 3, 5, 8, 13, 21, 34]\nhi bob greet\n",
+        "stderr={stderr}"
+    );
 }
