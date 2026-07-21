@@ -111,6 +111,78 @@ pub fn import(name: &str) -> Result<u32, String> {
     })
 }
 
+/// Whether two `Foreign` handles point at the *same* CPython object (`is`
+/// identity). Enum members and other CPython singletons compare equal under `is`
+/// even when fetched into distinct handles.
+pub fn same_object(a: u32, b: u32) -> bool {
+    Python::with_gil(|py| match (fetch(py, a), fetch(py, b)) {
+        (Ok(x), Ok(y)) => x.is(&y),
+        _ => false,
+    })
+}
+
+/// Create a class with foreign (CPython) bases via CPython's own class machinery
+/// (`class C(enum.Enum): A = 1` → `EnumType`). `types.new_class` computes the
+/// metaclass, fires `__prepare__`, and the body populates the prepared namespace
+/// one key at a time — so a metaclass namespace like Enum's `_EnumDict` records
+/// each member through `__setitem__`. Returns a `Foreign` handle to the class.
+pub fn build_foreign_class(
+    name: &str,
+    bases: &[Value],
+    members: &[(String, Value)],
+) -> Result<Value, String> {
+    init();
+    Python::with_gil(|py| {
+        // Marshal bases + members under a short host borrow; the metaclass call
+        // runs with none held (a method body may re-enter fusevm).
+        let (bases_tuple, members_dict): (Bound<PyAny>, Bound<PyAny>) =
+            with_host(|h| -> Result<_, String> {
+                let base_objs: Vec<Bound<PyAny>> = bases
+                    .iter()
+                    .map(|b| value_to_py(h, py, b))
+                    .collect::<Result<_, _>>()?;
+                let bases_tuple = PyTuple::new(py, &base_objs).map_err(|e| e.to_string())?;
+                let members_dict = PyDict::new(py);
+                for (k, v) in members {
+                    let pv = value_to_py(h, py, v)?;
+                    members_dict
+                        .set_item(k.as_str(), pv)
+                        .map_err(|e| e.to_string())?;
+                }
+                Ok((bases_tuple.into_any(), members_dict.into_any()))
+            })?;
+        let helper = make_class_helper(py)?;
+        let cls = helper
+            .call1((name, bases_tuple, members_dict))
+            .map_err(|e| e.to_string())?;
+        let id = store(cls.unbind());
+        Ok(with_host(|h| h.alloc(PyObj::Foreign(id))))
+    })
+}
+
+/// The cached `_make(name, bases, members)` helper (built via `types.new_class`),
+/// which populates the metaclass-prepared namespace one key at a time so
+/// `_EnumDict.__setitem__` — and any other metaclass namespace — sees each key.
+fn make_class_helper(py: Python) -> Result<Bound<PyAny>, String> {
+    static MAKE_CLASS: OnceLock<Py<PyAny>> = OnceLock::new();
+    if let Some(f) = MAKE_CLASS.get() {
+        return Ok(f.bind(py).clone());
+    }
+    let code = cr#"
+import types
+def _make(name, bases, members):
+    def body(ns):
+        for k in members:
+            ns[k] = members[k]
+    return types.new_class(name, tuple(bases), {}, body)
+"#;
+    let module = PyModule::from_code(py, code, c"_pyrs_class.py", c"_pyrs_class")
+        .map_err(|e| e.to_string())?;
+    let f = module.getattr("_make").map_err(|e| e.to_string())?;
+    let _ = MAKE_CLASS.set(f.clone().unbind());
+    Ok(f)
+}
+
 // ── marshaling: pythonrs Value ↔ CPython object ──────────────────────────────
 
 /// pythonrs `Value` → CPython object. By value for the representable types;
@@ -207,6 +279,25 @@ fn value_to_py<'py>(
                 Ok(dict.into_any())
             }
             Some(PyObj::Foreign(id)) => fetch(py, *id),
+            // A pythonrs lazy iterator (generator / zip / map / filter /
+            // enumerate / composite iterator) passed into a CPython call
+            // (`itertools.takewhile(pred, gen())`, `"".join(gen())`, …) is wrapped
+            // as a CPython iterator whose `__next__` drives fusevm one step at a
+            // time — so an infinite generator is never materialized.
+            Some(
+                PyObj::Generator { .. }
+                | PyObj::Iter(_)
+                | PyObj::Zip { .. }
+                | PyObj::MapObj { .. }
+                | PyObj::FilterObj { .. }
+                | PyObj::EnumerateObj { .. }
+                | PyObj::CallIter { .. },
+            ) => {
+                let it = PyrsIterator { target: v.clone() };
+                Py::new(py, it)
+                    .map(|p| p.into_any().into_bound(py))
+                    .map_err(|e| e.to_string())
+            }
             // A pythonrs callable (lambda / def / builtin / bound method / partial
             // / lru_cache) passed as a callback (`functools.reduce(f, …)`,
             // `sorted(key=f)`, …) is wrapped so CPython can call back into fusevm.
@@ -534,17 +625,57 @@ fn build_call_args<'py>(
     Ok((arg_tuple, kw))
 }
 
-/// A fusevm-side callable (lambda / def / builtin / …) exposed to CPython so it
-/// can be used as a stdlib callback. `__call__` marshals the CPython arguments to
-/// pythonrs values, runs the callable on fusevm (no host borrow held here), and
-/// marshals the result back.
-#[pyclass]
+// A fusevm-side callable (lambda / def / builtin / …) exposed to CPython so it
+// can be used as a stdlib callback. `__call__` marshals the CPython arguments to
+// pythonrs values, runs the callable on fusevm (no host borrow held here), and
+// marshals the result back. (Plain `//`, not `///`: a doc comment would become
+// the pyclass `__doc__` and leak as every wrapped callable's `__doc__`.)
+// `dict` gives each proxy a `__dict__`, so CPython code can set attributes on it
+// (`functools.update_wrapper` does `setattr(wrapper, '__module__', …)` and
+// `wrapper.__dict__.update(...)`). Attributes it doesn't set fall through to
+// `__getattr__`, which delegates the wrapped callable's dunders.
+#[pyclass(dict)]
 struct PyrsCallable {
     target: Value,
 }
 
 #[pymethods]
 impl PyrsCallable {
+    /// Delegate a missing attribute (function dunder like `__name__` /
+    /// `__qualname__` / `__module__`) to the wrapped fusevm callable, so
+    /// `functools.update_wrapper` can copy them off it. `__getattr__` runs only
+    /// after normal lookup (including the instance `__dict__`) misses, so a
+    /// wraps-assigned attribute wins over the delegate. A dunder the target
+    /// lacks becomes `AttributeError` (which `update_wrapper` silently skips).
+    fn __getattr__(&self, py: Python, name: String) -> PyResult<Py<PyAny>> {
+        match with_host(|h| h.get_attr(&self.target, &name)) {
+            Ok(v) => with_host(|h| value_to_py(h, py, &v))
+                .map(|b| b.unbind())
+                .map_err(pyo3::exceptions::PyRuntimeError::new_err),
+            Err(e) => Err(pyo3::exceptions::PyAttributeError::new_err(e)),
+        }
+    }
+
+    /// Descriptor protocol: a pythonrs function stored in a CPython-built class
+    /// (an `enum`/`dataclass`/`NamedTuple` method) binds `self` on instance
+    /// access, and — because it now has `__get__` — CPython recognizes it as a
+    /// method rather than a plain attribute (Enum's `_EnumDict` would otherwise
+    /// make it a member). Class access (`obj is None`) yields the unbound proxy.
+    fn __get__<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+        obj: Option<Bound<'py, PyAny>>,
+        _owner: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        match obj {
+            Some(instance) if !instance.is_none() => py
+                .import("types")?
+                .getattr("MethodType")?
+                .call1((slf, instance)),
+            _ => Ok(slf.into_any()),
+        }
+    }
+
     #[pyo3(signature = (*args, **kwargs))]
     fn __call__(
         &self,
@@ -578,6 +709,35 @@ impl PyrsCallable {
         with_host(|h| value_to_py(h, py, &result))
             .map(|b| b.unbind())
             .map_err(to_pyerr)
+    }
+}
+
+// A CPython iterator backed by a pythonrs lazy iterator (generator / zip / map /
+// filter / enumerate / composite). `__next__` advances fusevm one step with NO
+// host borrow held (`iter_step` manages its own borrows and may re-enter
+// pythonrs), so CPython can consume `itertools.takewhile(pred, gen())` and the
+// like without materializing an (possibly infinite) source. Plain `//` (not
+// `///`) so the doc text doesn't become a leaking `__doc__`.
+#[pyclass]
+struct PyrsIterator {
+    target: Value,
+}
+
+#[pymethods]
+impl PyrsIterator {
+    fn __iter__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
+    }
+
+    fn __next__(&self, py: Python) -> PyResult<Option<Py<PyAny>>> {
+        let to_pyerr = |e: String| pyo3::exceptions::PyRuntimeError::new_err(e);
+        match crate::host::iter_step(&self.target).map_err(to_pyerr)? {
+            // `None` from `__next__` raises `StopIteration` in pyo3.
+            None => Ok(None),
+            Some(v) => with_host(|h| value_to_py(h, py, &v))
+                .map(|b| Some(b.unbind()))
+                .map_err(to_pyerr),
+        }
     }
 }
 
