@@ -2787,7 +2787,7 @@ const BUILTIN_FUNCS: &[&str] = &[
 // ── builtin functions ────────────────────────────────────────────────────────
 
 /// str()/repr() with instance dunder dispatch (free-function form).
-fn py_str(v: &Value) -> Result<String, String> {
+pub fn py_str(v: &Value) -> Result<String, String> {
     if with_host(|h| matches!(h.get(v), Some(PyObj::Instance(_)))) {
         let (has_str, has_repr, is_exc) = with_host(|h| match h.get(v) {
             Some(PyObj::Instance(i)) => (
@@ -2828,7 +2828,7 @@ fn py_str(v: &Value) -> Result<String, String> {
     Ok(with_host(|h| h.str_of(v)))
 }
 
-fn py_repr(v: &Value) -> Result<String, String> {
+pub fn py_repr(v: &Value) -> Result<String, String> {
     if with_host(|h| matches!(h.get(v), Some(PyObj::Instance(_)))) {
         let has_repr = with_host(|h| match h.get(v) {
             Some(PyObj::Instance(i)) => h.class_lookup(&i.class, "__repr__").is_some(),

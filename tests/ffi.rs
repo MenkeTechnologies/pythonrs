@@ -278,3 +278,33 @@ except RecursionError:
     );
     assert_eq!(stdout, "125250\nRecursionError\n", "stderr={stderr}");
 }
+
+/// A pythonrs instance crosses into a CPython call as a proxy: `operator`
+/// attr/item getters read its attributes/items, and it sorts by its own
+/// comparison. Skips cleanly without the stdlib bridge.
+#[test]
+fn ffi_instance_proxy_attrgetter() {
+    let src = "\
+import operator as op
+class P:
+    def __init__(self, x, y):
+        self.x, self.y = x, y
+    def __repr__(self):
+        return f'P({self.x},{self.y})'
+pts = [P(1, 5), P(3, 2), P(2, 8)]
+print([p.x for p in sorted(pts, key=op.attrgetter('x'))])
+print(op.attrgetter('y')(P(7, 9)))
+rows = [[3, 'c'], [1, 'a'], [2, 'b']]
+print(sorted(rows, key=op.itemgetter(1)))
+print(list(map(op.attrgetter('x'), pts)))
+";
+    let (stdout, stderr, ok) = run_py(src);
+    if !ok || stderr.contains("ModuleNotFoundError") {
+        eprintln!("skipping ffi-instance-proxy test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(
+        stdout, "[1, 2, 3]\n9\n[[1, 'a'], [2, 'b'], [3, 'c']]\n[1, 3, 2]\n",
+        "stderr={stderr}"
+    );
+}

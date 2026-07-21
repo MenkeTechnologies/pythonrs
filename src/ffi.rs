@@ -351,6 +351,16 @@ fn value_to_py<'py>(
                     .call1((cname.as_str(), bases, ns_dict))
                     .map_err(|e| e.to_string())
             }
+            // A pythonrs instance passed into a CPython call (`operator.attrgetter
+            // ("x")(pt)`, `sorted(objs, key=itemgetter(0))`, `json.dumps(obj,
+            // default=...)`) is wrapped so CPython's attribute/item access,
+            // comparison, hashing, and repr route back to the fusevm object.
+            Some(PyObj::Instance(_)) => {
+                let proxy = PyrsInstance { target: v.clone() };
+                Py::new(py, proxy)
+                    .map(|p| p.into_any().into_bound(py))
+                    .map_err(|e| e.to_string())
+            }
             _ => Err(crate::host::type_error(&format!(
                 "cannot pass '{}' to a CPython stdlib call",
                 host.type_name(v)
@@ -774,6 +784,75 @@ impl PyrsIterator {
                 .map(|b| Some(b.unbind()))
                 .map_err(to_pyerr),
         }
+    }
+}
+
+// A CPython view of a pythonrs instance: attribute/item access, comparison,
+// hashing, and repr/str route back to the fusevm object, so an instance can be
+// passed into a CPython call (`operator.attrgetter("x")(obj)`, `sorted(objs,
+// key=itemgetter(0))`, a custom `json.dumps` default). Each host call runs with
+// no host borrow held (CPython invokes these outside the marshalling window).
+#[pyclass]
+struct PyrsInstance {
+    target: Value,
+}
+
+#[pymethods]
+impl PyrsInstance {
+    fn __getattr__(&self, py: Python, name: String) -> PyResult<Py<PyAny>> {
+        match with_host(|h| h.get_attr(&self.target, &name)) {
+            Ok(v) => with_host(|h| value_to_py(h, py, &v))
+                .map(|b| b.unbind())
+                .map_err(pyo3::exceptions::PyRuntimeError::new_err),
+            Err(e) => Err(pyo3::exceptions::PyAttributeError::new_err(e)),
+        }
+    }
+
+    fn __getitem__(&self, py: Python, key: Bound<PyAny>) -> PyResult<Py<PyAny>> {
+        let to_pyerr = |e: String| pyo3::exceptions::PyRuntimeError::new_err(e);
+        let key_v = with_host(|h| py_to_value(h, py, &key)).map_err(to_pyerr)?;
+        let r = crate::host::call_method(&self.target, "__getitem__", vec![key_v], vec![])
+            .map_err(to_pyerr)?;
+        with_host(|h| value_to_py(h, py, &r))
+            .map(|b| b.unbind())
+            .map_err(to_pyerr)
+    }
+
+    fn __richcmp__(
+        &self,
+        py: Python,
+        other: Bound<PyAny>,
+        op: pyo3::pyclass::CompareOp,
+    ) -> PyResult<Py<PyAny>> {
+        use fusevm::NumOp;
+        let to_pyerr = |e: String| pyo3::exceptions::PyRuntimeError::new_err(e);
+        let other_v = with_host(|h| py_to_value(h, py, &other)).map_err(to_pyerr)?;
+        let numop = match op {
+            pyo3::pyclass::CompareOp::Lt => NumOp::Lt,
+            pyo3::pyclass::CompareOp::Le => NumOp::Le,
+            pyo3::pyclass::CompareOp::Eq => NumOp::Eq,
+            pyo3::pyclass::CompareOp::Ne => NumOp::Ne,
+            pyo3::pyclass::CompareOp::Gt => NumOp::Gt,
+            pyo3::pyclass::CompareOp::Ge => NumOp::Ge,
+        };
+        let r = crate::builtins::numeric_hook(numop, &self.target, &other_v).map_err(to_pyerr)?;
+        with_host(|h| value_to_py(h, py, &r))
+            .map(|b| b.unbind())
+            .map_err(to_pyerr)
+    }
+
+    fn __hash__(&self) -> PyResult<isize> {
+        with_host(|h| h.to_key(&self.target))
+            .map(|k| crate::builtins::hash_key(&k) as isize)
+            .map_err(pyo3::exceptions::PyTypeError::new_err)
+    }
+
+    fn __repr__(&self) -> PyResult<String> {
+        crate::builtins::py_repr(&self.target).map_err(pyo3::exceptions::PyRuntimeError::new_err)
+    }
+
+    fn __str__(&self) -> PyResult<String> {
+        crate::builtins::py_str(&self.target).map_err(pyo3::exceptions::PyRuntimeError::new_err)
     }
 }
 
