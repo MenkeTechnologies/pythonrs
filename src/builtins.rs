@@ -4918,6 +4918,9 @@ const BYTES_METHODS: &[&str] = &[
 const BYTEARRAY_METHODS: &[&str] = &[
     "append",
     "extend",
+    "insert",
+    "reverse",
+    "remove",
     "pop",
     "clear",
     "decode",
@@ -8370,6 +8373,26 @@ fn bytearray_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, S
             });
             Ok(Value::Undef)
         }
+        "insert" => {
+            let idx_v = arg0(args)?;
+            let val_v = args.get(1).cloned().unwrap_or(Value::Undef);
+            let idx = with_host(|h| h.as_int(&idx_v)).unwrap_or(0);
+            let n = with_host(|h| h.as_int(&val_v))
+                .ok_or_else(|| host::type_error("an integer is required"))?;
+            if !(0..=255).contains(&n) {
+                return Err("ValueError: byte must be in range(0, 256)".into());
+            }
+            with_host(|h| {
+                if let Some(PyObj::Bytearray(b)) = h.get_mut(recv) {
+                    // CPython clamps the index like list.insert (negative from
+                    // the end, out-of-range to [0, len]).
+                    let len = b.len() as i64;
+                    let i = (if idx < 0 { idx + len } else { idx }).clamp(0, len) as usize;
+                    b.insert(i, n as u8);
+                }
+            });
+            Ok(Value::Undef)
+        }
         "pop" => {
             let got = with_host(|h| match h.get_mut(recv) {
                 Some(PyObj::Bytearray(b)) => b.pop(),
@@ -8377,6 +8400,32 @@ fn bytearray_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, S
             });
             got.map(|x| Value::Int(x as i64))
                 .ok_or_else(|| "IndexError: pop from empty bytearray".into())
+        }
+        "reverse" => {
+            with_host(|h| {
+                if let Some(PyObj::Bytearray(b)) = h.get_mut(recv) {
+                    b.reverse();
+                }
+            });
+            Ok(Value::Undef)
+        }
+        "remove" => {
+            let a0 = arg0(args)?;
+            let n = with_host(|h| h.as_int(&a0)).unwrap_or(-1);
+            let removed = with_host(|h| {
+                if let Some(PyObj::Bytearray(b)) = h.get_mut(recv) {
+                    if let Some(pos) = b.iter().position(|&x| x as i64 == n) {
+                        b.remove(pos);
+                        return true;
+                    }
+                }
+                false
+            });
+            if removed {
+                Ok(Value::Undef)
+            } else {
+                Err("ValueError: value not found in bytearray".into())
+            }
         }
         "clear" => {
             with_host(|h| {
@@ -9726,6 +9775,10 @@ pub fn apply_format_spec(s: &str, v: &Value, spec: &str) -> Result<String, Strin
         prec = Some(p);
     }
     let ty = chars.get(i).copied().unwrap_or('\0');
+    // An int-like value (`int`/`bool`/bignum) with no explicit presentation type
+    // formats as a decimal integer, so `format(False, "5")` is `    0` (the int
+    // value) rather than the string `"False"`.
+    let ty = if ty == '\0' && is_int_like(v) { 'd' } else { ty };
 
     validate_format_spec(v, ty, sign, alt, group, prec, align, align_explicit)?;
 
