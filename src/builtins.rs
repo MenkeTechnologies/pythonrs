@@ -32,6 +32,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::EXTEND_SET, b_extend_set);
     vm.register_builtin(ops::EXTEND_DICT, b_extend_dict);
     vm.register_builtin(ops::EXTEND_STR, b_extend_str);
+    vm.register_builtin(ops::ELLIPSIS, b_ellipsis);
     vm.register_builtin(ops::MKSLICE, b_mkslice);
     vm.register_builtin(ops::CALL, b_call);
     vm.register_builtin(ops::CALL_KW, b_call_kw);
@@ -152,6 +153,11 @@ fn kw_pairs(d: &Value) -> Vec<(String, Value)> {
 
 // ── name / attribute / item handlers ─────────────────────────────────────────
 
+fn b_ellipsis(_vm: &mut VM, _: u8) -> Value {
+    // `...` — the `Ellipsis` singleton (distinct from `None`).
+    with_host(|h| h.alloc(PyObj::Ellipsis))
+}
+
 fn b_getlocal(vm: &mut VM, _: u8) -> Value {
     let name = sval(&vm.pop());
     match with_host(|h| h.read_name_checked(&name)) {
@@ -161,6 +167,9 @@ fn b_getlocal(vm: &mut VM, _: u8) -> Value {
     }
     if name == "NotImplemented" {
         return with_host(|h| h.alloc(PyObj::NotImplemented));
+    }
+    if name == "Ellipsis" {
+        return with_host(|h| h.alloc(PyObj::Ellipsis));
     }
     if is_known_builtin(&name) {
         return with_host(|h| h.alloc(PyObj::Builtin(name.clone())));
@@ -175,6 +184,9 @@ fn b_getglobal(vm: &mut VM, _: u8) -> Value {
     }
     if name == "NotImplemented" {
         return with_host(|h| h.alloc(PyObj::NotImplemented));
+    }
+    if name == "Ellipsis" {
+        return with_host(|h| h.alloc(PyObj::Ellipsis));
     }
     if is_known_builtin(&name) {
         return with_host(|h| h.alloc(PyObj::Builtin(name.clone())));
@@ -1128,7 +1140,8 @@ fn b_format(vm: &mut VM, _: u8) -> Value {
 // ── functions / classes ──────────────────────────────────────────────────────
 
 fn b_mkfunc(vm: &mut VM, argc: u8) -> Value {
-    // Stack layout (bottom→top): pos_defaults…, kw_defaults…, kw_count, func_id.
+    // Stack layout (bottom→top): annotations_dict, pos_defaults…, kw_defaults…,
+    // kw_count, func_id.
     let mut args = pop_n(vm, argc as usize);
     let def_id = match args.pop() {
         Some(Value::Int(n)) => n as usize,
@@ -1140,7 +1153,15 @@ fn b_mkfunc(vm: &mut VM, argc: u8) -> Value {
     };
     let split = args.len().saturating_sub(nkw);
     let kwonly_defaults = args.split_off(split);
-    let defaults = args; // remaining are positional defaults, in order
+    // The `__annotations__` dict is the deepest arg (always present — the compiler
+    // emits an empty dict for an unannotated func); the rest are positional
+    // defaults, in order.
+    let annotations = if args.is_empty() {
+        Value::Undef
+    } else {
+        args.remove(0)
+    };
+    let defaults = args;
     let env = with_host(|h| h.current_env_capture());
     with_host(|h| {
         h.alloc(PyObj::Func(host::FuncVal {
@@ -1150,6 +1171,7 @@ fn b_mkfunc(vm: &mut VM, argc: u8) -> Value {
             kwonly_defaults,
             bound: None,
             owner: None,
+            annotations,
         }))
     })
 }
@@ -1330,6 +1352,10 @@ fn b_is(vm: &mut VM, _: u8) -> Value {
                 || with_host(|h| match (h.get(&a), h.get(&b)) {
                     (Some(PyObj::Class(m)), Some(PyObj::Class(n))) => m == n,
                     (Some(PyObj::Builtin(m)), Some(PyObj::Builtin(n))) => m == n,
+                    // `Ellipsis`/`NotImplemented` are singletons: any two
+                    // allocations of `...` satisfy `... is ...`.
+                    (Some(PyObj::Ellipsis), Some(PyObj::Ellipsis))
+                    | (Some(PyObj::NotImplemented), Some(PyObj::NotImplemented)) => true,
                     // Two `Foreign` handles are the same object when they point at
                     // the same CPython object — so `Color.RED is Color.RED`
                     // (a singleton enum member fetched twice) holds.

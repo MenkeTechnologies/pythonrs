@@ -502,10 +502,11 @@ impl Parser {
         self.advance(); // def
         let name = self.expect_name()?;
         self.expect_op("(")?;
-        let params = self.parse_params(")")?;
+        let mut params = self.parse_params(")")?;
         self.expect_op(")")?;
         if self.eat_op("->") {
-            let _ret = self.parse_expr()?; // return annotation (discarded)
+            let ret = self.parse_expr()?; // return annotation, recorded as `"return"`
+            params.annotations.push(("return".to_string(), ret));
         }
         let body = self.parse_suite()?;
         out.push(Stmt::new(
@@ -539,29 +540,35 @@ impl Parser {
                 if self.at_op(",") || self.at_op(close) {
                     p.star = Some(String::new()); // bare `*`
                 } else {
-                    p.star = Some(self.expect_name()?);
+                    let star_name = self.expect_name()?;
                     if close == ")" && self.at_op(":") {
                         self.advance();
-                        let _ = self.parse_expr()?;
+                        let ann = self.parse_expr()?;
+                        p.annotations.push((star_name.clone(), ann));
                     }
+                    p.star = Some(star_name);
                 }
                 seen_star = true;
                 let _ = self.eat_op(",");
                 continue;
             }
             if self.eat_op("**") {
-                p.kwargs = Some(self.expect_name()?);
+                let kw_name = self.expect_name()?;
                 if close == ")" && self.at_op(":") {
                     self.advance();
-                    let _ = self.parse_expr()?;
+                    let ann = self.parse_expr()?;
+                    p.annotations.push((kw_name.clone(), ann));
                 }
+                p.kwargs = Some(kw_name);
                 let _ = self.eat_op(",");
                 continue;
             }
             let name = self.expect_name()?;
-            // Type annotation (discarded).
+            // `name: annotation` — recorded for `__annotations__` (only in a
+            // `def`, `close == ")"`; a `lambda` has no annotations).
             if close == ")" && self.eat_op(":") {
-                let _ = self.parse_expr()?;
+                let ann = self.parse_expr()?;
+                p.annotations.push((name.clone(), ann));
             }
             let default = if self.eat_op("=") {
                 Some(self.parse_expr()?)

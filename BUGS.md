@@ -335,15 +335,16 @@ module then raises `ModuleNotFoundError`.
   class-vars by value), so dataclass installs `__init__`/`__repr__`/`__eq__`/
   ordering and the result rebinds the name. Class bodies capture their simple
   annotations into `__annotations__`, so `Cls.__annotations__`, `@dataclass`, and
-  `typing.NamedTuple` all see the fields. A pythonrs *instance* also crosses into
-  a CPython call as a `PyrsInstance` proxy (attribute/item access, comparison,
-  hashing, repr route back to the fusevm object), so `operator.attrgetter("x")
-  (obj)` / `sorted(objs, key=itemgetter(0))` work.
+  `typing.NamedTuple` all see the fields. Function parameter/return annotations
+  are also kept: `def f(a: int) -> str` builds `f.__annotations__` at def time
+  (evaluated eagerly, keys in source order with `"return"` last), reachable on a
+  bound method too; a bare builtin type in an annotation (`Optional[int]`) crosses
+  into CPython as the real `int` type, so `typing` generics build correctly. A
+  pythonrs *instance* also crosses into a CPython call as a `PyrsInstance` proxy
+  (attribute/item access, comparison, hashing, repr route back to the fusevm
+  object), so `operator.attrgetter("x")(obj)` / `sorted(objs, key=itemgetter(0))`
+  work.
   Remaining gaps:
-  - **Function annotations**: `def f(a: int) -> str` doesn't populate
-    `f.__annotations__` (the parser discards param/return annotations; only
-    class-body annotations are captured). Needs the parser/AST to keep them and
-    the compiler to build the function's annotation dict at def time.
   - **A CPython descriptor on a pythonrs class** (`functools.cached_property`)
     isn't invoked via `__get__` on instance access — it returns the descriptor
     object. The fix needs the getattr path to detect a Foreign class attribute

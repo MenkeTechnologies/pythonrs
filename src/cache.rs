@@ -71,7 +71,12 @@ use std::path::PathBuf;
 /// v22: `CProg.warnings` entries now carry the full `SyntaxWarning` text (not
 /// just a keyword), and the compiler adds the `"is" with a literal` warning.
 /// Older cached warnings held bare keywords and would print malformed.
-const SCHEMA: u64 = 22;
+/// v23: `MKFUNC` carries an `__annotations__` dict as its deepest arg (built from
+/// param/return annotations at def time) and `FuncVal` gained an `annotations`
+/// field; also `...` lowers to the new `ELLIPSIS` op (a distinct `Ellipsis`
+/// singleton) instead of `LoadUndef` (`None`). Older bytecode used the
+/// annotation-free layout / conflated `...` with `None` and must miss cleanly.
+const SCHEMA: u64 = 23;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]
