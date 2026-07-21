@@ -1135,6 +1135,167 @@ fn gen_classes(seed: u64) -> Vec<String> {
     out
 }
 
+/// Subclassing builtin types (`class Stack(list)`, `class C(int)`, …): the
+/// hybrid instance inherits ALL builtin behavior (methods, operators, indexing,
+/// iteration, `len`, `repr`) while supporting user methods, instance attributes,
+/// `super().__init__(...)`, and (for `dict`) the `__missing__` hook. Arithmetic
+/// on an `int`/`float` subclass returns the plain base type, and `isinstance` /
+/// `type(x).__name__` reflect the subclass. Every branch prints scalars,
+/// booleans, list/dict/tuple reprs (deterministic), or `sorted(...)` of a set —
+/// never a raw address — so output is byte-stable across both interpreters.
+fn gen_subclass(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    const STRS: &[&str] = &["a", "hi", "xy", "abc", "z", "cat", "Q"];
+    let a = pick(r, SMALLINTS);
+    let b = pick(r, SMALLINTS);
+    let c = pick(r, SMALLINTS);
+    let s = pick(r, STRS);
+    // A second, DISTINCT string (used as a separate dict key / kwarg), so
+    // branches never emit a duplicate key (`D(z=1, z=2)` is a compile error).
+    let t = {
+        let mut cand = pick(r, STRS);
+        while cand == s {
+            cand = pick(r, STRS);
+        }
+        cand
+    };
+    let mut out: Vec<String> = Vec::new();
+    match r.below(14) {
+        // list subclass with a user method + inherited behavior.
+        0 => {
+            out.push("class Stack(list):".into());
+            out.push("    def push(self, x): self.append(x)".into());
+            out.push("    def top(self): return self[-1]".into());
+            out.push(format!("s = Stack([{a}, {b}])"));
+            out.push(format!("s.push({c})"));
+            out.push("print(s, len(s), s.top(), s[0])".into());
+            out.push(format!("print({a} in s, s + [99], s.count({a}))"));
+            out.push("print(type(s).__name__, isinstance(s, list))".into());
+        }
+        // list subclass, custom __init__ with super().
+        1 => {
+            out.push("class DList(list):".into());
+            out.push("    def __init__(self, data):".into());
+            out.push("        super().__init__(data)".into());
+            out.push("        self.tag = 'd'".into());
+            out.push(format!("d = DList([{a}, {b}, {c}])"));
+            out.push("print(d, d.tag, sum(d), sorted(d, reverse=True))".into());
+            out.push("d.append(7); print(d, len(d))".into());
+        }
+        // dict subclass with __missing__.
+        2 => {
+            out.push("class D(dict):".into());
+            out.push("    def __missing__(self, k): return len(k)".into());
+            out.push(format!("d = D({s}={a}, {t}={b})"));
+            out.push(format!("d['{s}'] = {c}"));
+            out.push(format!("print(d['{s}'], d['zzzz'], d.get('no'))"));
+            out.push("print(sorted(d.keys()), sorted(d.values()), len(d))".into());
+            out.push(format!("print('{s}' in d, type(d).__name__)"));
+        }
+        // dict subclass plain (inherited repr, items).
+        3 => {
+            out.push("class MyD(dict):".into());
+            out.push("    def total(self): return sum(self.values())".into());
+            out.push(format!("m = MyD({{'{s}': {a}, '{t}': {b}}})"));
+            out.push("print(m, m.total(), len(m))".into());
+            out.push(format!("m['{s}'] = {c}; print(m['{s}'], sorted(m.items()))"));
+        }
+        // str subclass with a user method.
+        4 => {
+            out.push("class U(str):".into());
+            out.push("    def shout(self): return self.upper() + '!'".into());
+            out.push(format!("u = U('{s}')"));
+            out.push("print(u, repr(u), u.shout(), len(u))".into());
+            out.push(format!("print(u + '{t}', u[0], u.startswith('{s}'[0]))"));
+            out.push(format!("print(u == '{s}', type(u).__name__, isinstance(u, str))"));
+        }
+        // str subclass: replace/find/upper chains.
+        5 => {
+            out.push("class Name(str):".into());
+            out.push("    def rev(self): return self[::-1]".into());
+            out.push(format!("n = Name('{s}{t}')"));
+            out.push("print(n.rev(), n.replace('a', 'Z'), n.count('a'))".into());
+            out.push("print(sorted(n), list(n), n * 2)".into());
+        }
+        // int subclass: arithmetic returns plain int.
+        6 => {
+            out.push("class C(int):".into());
+            out.push("    def half(self): return self // 2".into());
+            out.push(format!("c = C({a})"));
+            out.push(format!("print(c + {b}, c - {b}, c * {b})"));
+            out.push(format!("print(type(c + {b}).__name__, c.half())"));
+            out.push(format!("print(c < {b}, c == {a}, abs(C({b})), -c)"));
+            out.push("print(type(c).__name__, isinstance(c, int), bool(C(0)))".into());
+        }
+        // int subclass: bit ops + floordiv/mod.
+        7 => {
+            out.push("class I(int):".into());
+            out.push("    pass".into());
+            out.push(format!("i = I({b})"));
+            out.push("print(i // 2, i % 3, i & 6, i | 1, i ^ 3)".to_string());
+            out.push(format!("print(i + I({a}), type(i * 2).__name__, hash(i) == hash({b}))"));
+        }
+        // float subclass.
+        8 => {
+            out.push("class F(float):".into());
+            out.push("    def sq(self): return self * self".into());
+            let fa = pick(r, &["1.5", "2.0", "3.25", "0.5", "4.0"]);
+            let fb = pick(r, &["2", "0.5", "1.5", "3"]);
+            out.push(format!("f = F({fa})"));
+            out.push(format!("print(f + {fb}, f * 2, type(f + {fb}).__name__)"));
+            out.push("print(f.sq(), type(f).__name__, isinstance(f, float))".into());
+        }
+        // tuple subclass.
+        9 => {
+            out.push("class T(tuple):".into());
+            out.push("    def first(self): return self[0]".into());
+            out.push(format!("tp = T([{a}, {b}, {c}])"));
+            out.push("print(tp, tp[1], len(tp), tp.first())".into());
+            out.push(format!("print({a} in tp, tp + ({b},), tp.count({a}))"));
+            out.push("print(type(tp).__name__, isinstance(tp, tuple), sorted(tp))".into());
+        }
+        // set subclass (always sorted for determinism).
+        10 => {
+            out.push("class S(set):".into());
+            out.push("    pass".into());
+            out.push(format!("ss = S([{a}, {b}, {c}, {a}])"));
+            out.push(format!("print(sorted(ss), len(ss), {a} in ss)"));
+            out.push(format!("print(sorted(ss | {{{b}, 99}}), sorted(ss & {{{a}, {c}}}))"));
+            out.push("print(type(ss).__name__, isinstance(ss, set))".into());
+        }
+        // list subclass with instance attributes + iteration.
+        11 => {
+            out.push("class Log(list):".into());
+            out.push("    def __init__(self, *xs):".into());
+            out.push("        super().__init__(xs)".into());
+            out.push("        self.n = 0".into());
+            out.push("    def add(self, x):".into());
+            out.push("        self.append(x); self.n += 1".into());
+            out.push(format!("g = Log({a}, {b})"));
+            out.push(format!("g.add({c}); g.add({a})"));
+            out.push("print(g, g.n, [x * 2 for x in g])".into());
+        }
+        // str subclass used with format + comparison.
+        12 => {
+            out.push("class W(str):".into());
+            out.push("    pass".into());
+            out.push(format!("w = W('{s}')"));
+            out.push(format!("print('{{}}!'.format(w), w in ('{s}', '{t}'))"));
+            out.push("print(w.upper(), w.ljust(5, '.'), len(w))".into());
+        }
+        // empty-construction defaults.
+        _ => {
+            out.push("class EL(list): pass".into());
+            out.push("class ED(dict): pass".into());
+            out.push("class ES(str): pass".into());
+            out.push("print(EL(), ED(), repr(ES()), len(EL()), len(ED()))".into());
+            out.push(format!("el = EL(); el.append({a}); el.append({b})"));
+            out.push("print(el, sum(el), bool(EL()), bool(el))".into());
+        }
+    }
+    out
+}
+
 /// Type & metaclass machinery: `type(obj)` (1-arg) / `type(name, bases, ns)`
 /// (3-arg dynamic class), custom metaclasses (`__new__`/`__init__`/`__call__`,
 /// attribute & method lookup through the class, propagation to subclasses),
@@ -4563,6 +4724,7 @@ enum Mode {
     Display,
     Scoping,
     Codec,
+    Subclass,
 }
 
 const REAL_MODES: &[Mode] = &[
@@ -4618,6 +4780,7 @@ const REAL_MODES: &[Mode] = &[
     Mode::Display,
     Mode::Scoping,
     Mode::Codec,
+    Mode::Subclass,
 ];
 
 /// Generate the statement list for a seed in the selected mode. `Mixed` rotates
@@ -4680,6 +4843,7 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Display => gen_display(seed),
         Mode::Scoping => gen_scoping(seed),
         Mode::Codec => gen_codec(seed),
+        Mode::Subclass => gen_subclass(seed),
     }
 }
 
@@ -4738,6 +4902,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Display => "display",
         Mode::Scoping => "scoping",
         Mode::Codec => "codec",
+        Mode::Subclass => "subclass",
     }
 }
 
@@ -4796,6 +4961,7 @@ fn mode_from_name(s: &str) -> Option<Mode> {
         Mode::Display,
         Mode::Scoping,
         Mode::Codec,
+        Mode::Subclass,
     ];
     ALL.iter().copied().find(|&m| mode_name(m) == s)
 }
