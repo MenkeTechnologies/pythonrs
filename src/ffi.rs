@@ -10,7 +10,7 @@
 //! bytes/bytearray/list/tuple/dict/set/frozenset/range/complex/`deque`) is
 //! marshaled across the boundary in both directions. Everything else (compiled
 //! regex, `datetime`, sockets, file objects, iterators, …) stays on the CPython
-//! side behind a [`PyObj::Foreign`](crate::host::PyObj::Foreign) handle: an index
+//! side behind a [`PyObj::Foreign`] handle: an index
 //! into the side-table below. Attribute access, calls, indexing, iteration,
 //! `len`, `str`/`repr`, and membership on a `Foreign` route back through here;
 //! pyo3 owns the refcounts and the GIL.

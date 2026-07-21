@@ -1363,9 +1363,14 @@ impl Compiler {
                     // BUILD_ARGS already yields a flat `list`.
                     self.compile_arg_spread(b, items)?;
                 } else {
-                    self.build_chunked(b, ops::MKLIST, ops::EXTEND_LIST, items.len(), 1, |c, b, i| {
-                        c.compile_expr(b, &items[i])
-                    })?;
+                    self.build_chunked(
+                        b,
+                        ops::MKLIST,
+                        ops::EXTEND_LIST,
+                        items.len(),
+                        1,
+                        |c, b, i| c.compile_expr(b, &items[i]),
+                    )?;
                 }
             }
             Expr::Tuple(items) => {
@@ -1375,9 +1380,14 @@ impl Compiler {
                     self.compile_arg_spread(b, items)?;
                     b.emit(Op::CallBuiltin(ops::CALL, 2), 0);
                 } else {
-                    self.build_chunked(b, ops::MKTUPLE, ops::EXTEND_TUPLE, items.len(), 1, |c, b, i| {
-                        c.compile_expr(b, &items[i])
-                    })?;
+                    self.build_chunked(
+                        b,
+                        ops::MKTUPLE,
+                        ops::EXTEND_TUPLE,
+                        items.len(),
+                        1,
+                        |c, b, i| c.compile_expr(b, &items[i]),
+                    )?;
                 }
             }
             Expr::Set(items) => {
@@ -1386,9 +1396,14 @@ impl Compiler {
                     self.compile_arg_spread(b, items)?;
                     b.emit(Op::CallBuiltin(ops::CALL, 2), 0);
                 } else {
-                    self.build_chunked(b, ops::MKSET, ops::EXTEND_SET, items.len(), 1, |c, b, i| {
-                        c.compile_expr(b, &items[i])
-                    })?;
+                    self.build_chunked(
+                        b,
+                        ops::MKSET,
+                        ops::EXTEND_SET,
+                        items.len(),
+                        1,
+                        |c, b, i| c.compile_expr(b, &items[i]),
+                    )?;
                 }
             }
             Expr::Dict(pairs) => {
@@ -1414,11 +1429,18 @@ impl Compiler {
                     // This branch is reached only when every key is `Some`
                     // (the `**`-spread case took the arm above), so each pair
                     // contributes exactly two stack slots.
-                    self.build_chunked(b, ops::MKDICT, ops::EXTEND_DICT, pairs.len(), 2, |c, b, i| {
-                        let (k, v) = &pairs[i];
-                        c.compile_expr(b, k.as_ref().expect("plain dict key"))?;
-                        c.compile_expr(b, v)
-                    })?;
+                    self.build_chunked(
+                        b,
+                        ops::MKDICT,
+                        ops::EXTEND_DICT,
+                        pairs.len(),
+                        2,
+                        |c, b, i| {
+                            let (k, v) = &pairs[i];
+                            c.compile_expr(b, k.as_ref().expect("plain dict key"))?;
+                            c.compile_expr(b, v)
+                        },
+                    )?;
                 }
             }
             Expr::Starred(inner) => self.compile_expr(b, inner)?,

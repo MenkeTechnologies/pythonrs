@@ -2489,28 +2489,58 @@ fn sequence_index_and_concat_error_messages() {
 #[test]
 fn large_collection_literals_exceed_u8_argc() {
     // 300-element list (spills once past the 255 mk-chunk).
-    let lst = (0..300).map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
-    assert_eq!(g(&format!("a = [{lst}]\nx = (len(a), sum(a), a[0], a[-1])"), "x"), "(300, 44850, 0, 299)");
+    let lst = (0..300)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    assert_eq!(
+        g(
+            &format!("a = [{lst}]\nx = (len(a), sum(a), a[0], a[-1])"),
+            "x"
+        ),
+        "(300, 44850, 0, 299)"
+    );
 
     // 300-element tuple (EXTEND_TUPLE rebuilds each chunk).
-    assert_eq!(g(&format!("a = ({lst},)\nx = (len(a), sum(a), a[-1])"), "x"), "(300, 44850, 299)");
+    assert_eq!(
+        g(&format!("a = ({lst},)\nx = (len(a), sum(a), a[-1])"), "x"),
+        "(300, 44850, 299)"
+    );
 
     // 300-key dict literal — 600 stack slots, dict pairs spill past 127.
-    let pairs = (0..300).map(|i| format!("{i}: {}", i * i)).collect::<Vec<_>>().join(", ");
+    let pairs = (0..300)
+        .map(|i| format!("{i}: {}", i * i))
+        .collect::<Vec<_>>()
+        .join(", ");
     assert_eq!(
-        g(&format!("d = {{{pairs}}}\nx = (len(d), sum(d.values()), d[0], d[299])"), "x"),
+        g(
+            &format!("d = {{{pairs}}}\nx = (len(d), sum(d.values()), d[0], d[299])"),
+            "x"
+        ),
         "(300, 8955050, 0, 89401)"
     );
 
     // Set literal with cross-chunk duplicates -> deduped (EXTEND_SET keying).
-    let st = (0..300).map(|i| (i % 250).to_string()).collect::<Vec<_>>().join(", ");
-    assert_eq!(g(&format!("s = {{{st}}}\nx = (len(s), sum(s))"), "x"), "(250, 31125)");
+    let st = (0..300)
+        .map(|i| (i % 250).to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    assert_eq!(
+        g(&format!("s = {{{st}}}\nx = (len(s), sum(s))"), "x"),
+        "(250, 31125)"
+    );
 
     // f-string with 300 replacement fields spills EXTEND_STR; `{0}{1}...` are
     // integer-literal fields, so the result is "012...299".
-    let fields = (0..300).map(|i| format!("{{{i}}}")).collect::<Vec<_>>().concat();
+    let fields = (0..300)
+        .map(|i| format!("{{{i}}}"))
+        .collect::<Vec<_>>()
+        .concat();
     let expected: String = (0..300).map(|i| i.to_string()).collect();
-    assert_eq!(g(&format!("x = f\"{fields}\""), "x"), format!("'{expected}'"));
+    assert_eq!(
+        g(&format!("x = f\"{fields}\""), "x"),
+        format!("'{expected}'")
+    );
 
     // Boundaries: exactly at, just over, and dict at its 127/128 pair edge.
     for n in [255usize, 256, 127, 128, 254] {
@@ -2521,7 +2551,10 @@ fn large_collection_literals_exceed_u8_argc() {
             format!("({}, {})", want.0, want.1),
             "list n={n}"
         );
-        let dp = (0..n).map(|i| format!("{i}: {i}")).collect::<Vec<_>>().join(", ");
+        let dp = (0..n)
+            .map(|i| format!("{i}: {i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
         assert_eq!(
             g(&format!("d = {{{dp}}}\nx = (len(d), sum(d.values()))"), "x"),
             format!("({}, {})", want.0, want.1),
@@ -2556,7 +2589,10 @@ fn type_object_repr() {
     assert_eq!(g("x = type(lambda: 0)", "x"), "<class 'function'>");
     assert_eq!(g("x = type(3)", "x"), "<class 'int'>");
     assert_eq!(g("x = type(int)", "x"), "<class 'type'>");
-    assert_eq!(g("x = type(NotImplemented)", "x"), "<class 'NotImplementedType'>");
+    assert_eq!(
+        g("x = type(NotImplemented)", "x"),
+        "<class 'NotImplementedType'>"
+    );
     // A callable builtin still reprs as a function, not a class.
     assert_eq!(g("x = len", "x"), "<built-in function len>");
 }
@@ -2613,7 +2649,10 @@ fn exception_class_repr() {
 #[test]
 fn unbound_builtin_methods() {
     assert_eq!(g("x = str.lower('HELLO')", "x"), "'hello'");
-    assert_eq!(g("x = sorted(['B', 'a', 'C'], key=str.lower)", "x"), "['a', 'B', 'C']");
+    assert_eq!(
+        g("x = sorted(['B', 'a', 'C'], key=str.lower)", "x"),
+        "['a', 'B', 'C']"
+    );
     assert_eq!(g("x = list(map(str.upper, ['a', 'b']))", "x"), "['A', 'B']");
     assert_eq!(g("x = list.count([1, 1, 2], 1)", "x"), "2");
     assert_eq!(g("x = dict.get({'a': 1}, 'a')", "x"), "1");
