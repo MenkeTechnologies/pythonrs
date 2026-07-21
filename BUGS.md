@@ -343,14 +343,15 @@ module then raises `ModuleNotFoundError`.
   pythonrs *instance* also crosses into a CPython call as a `PyrsInstance` proxy
   (attribute/item access, comparison, hashing, repr route back to the fusevm
   object), so `operator.attrgetter("x")(obj)` / `sorted(objs, key=itemgetter(0))`
-  work.
+  work. `functools.total_ordering` and `functools.cached_property` run natively
+  (the class stays a native pythonrs class): `total_ordering` derives the missing
+  rich-comparison ops from the one defined ordering method plus `__eq__`, and
+  `cached_property` is a non-data descriptor that computes on first access and
+  caches into the instance dict (later reads hit the dict; a `__slots__` instance
+  with no dict raises CPython's `TypeError`). Every other `functools` member
+  (`reduce`, `partial`, `lru_cache`, `wraps`, `cmp_to_key`) defers to the real
+  CPython module.
   Remaining gaps:
-  - **A CPython descriptor on a pythonrs class** (`functools.cached_property`)
-    isn't invoked via `__get__` on instance access — it returns the descriptor
-    object. The fix needs the getattr path to detect a Foreign class attribute
-    and call its `__get__` *outside* the already-borrowed `get_attr` (the host is
-    mutably borrowed there, so the FFI call can't run inline). Native `@property`
-    is unaffected.
   - **`collections.namedtuple` field *types*** cross as `PyrsCallable` wrappers,
     not the CPython type objects, so `dataclasses.fields(x)[i].type` on a mirrored
     class is a proxy — the generated `__init__`/`__repr__`/`__eq__` (which use only

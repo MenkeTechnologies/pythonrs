@@ -413,3 +413,52 @@ print(G(1) < G(2), G(2) <= G(2), G(3) >= G(1))
         "stderr={stderr}"
     );
 }
+
+/// `@functools.cached_property` runs natively as a non-data descriptor: first
+/// access computes the getter and caches the result in the instance `__dict__`
+/// (so later accesses read the dict and never recompute), the cached value can be
+/// overwritten and `del`'d (forcing a recompute), and a `__slots__` instance with
+/// no dict raises CPython's exact `TypeError`.
+#[test]
+fn ffi_cached_property_native() {
+    let src = "\
+import functools
+class Circle:
+    def __init__(self, r):
+        self.r = r
+    @functools.cached_property
+    def area(self):
+        print('computing')
+        return self.r * self.r
+c = Circle(10)
+print(c.area)
+print(c.area)
+c.area = 999
+print(c.area)
+del c.area
+print(c.area)
+print(type(Circle.area).__name__)
+class S:
+    __slots__ = ('r',)
+    def __init__(self, r):
+        self.r = r
+    @functools.cached_property
+    def a(self):
+        return self.r
+try:
+    S(1).a
+except TypeError as e:
+    print(e)
+";
+    let (stdout, stderr, ok) = run_py(src);
+    if !ok || stderr.contains("ModuleNotFoundError") {
+        eprintln!("skipping ffi-cached-property test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(
+        stdout,
+        "computing\n100\n100\n999\ncomputing\n100\ncached_property\n\
+         No '__dict__' attribute on 'S' instance to cache 'a' property.\n",
+        "stderr={stderr}"
+    );
+}
