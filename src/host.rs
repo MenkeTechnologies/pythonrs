@@ -105,6 +105,7 @@ pub mod ops {
     pub const EXTEND_SET: u16 = 73; // [set, items...] -> set (add items)
     pub const EXTEND_DICT: u16 = 74; // [dict, k,v,...] -> dict (insert pairs)
     pub const EXTEND_STR: u16 = 75; // [str, parts...] -> str (concat parts)
+    pub const ELLIPSIS: u16 = 76; // [] -> the `Ellipsis` (`...`) singleton
 }
 
 /// In-place (augmented-assignment) op tags carried by `ops::INPLACE`. One per
@@ -192,6 +193,9 @@ pub enum PKey {
     /// Types are conceptual singletons by name, so they key by name — matching
     /// `is`/`==` on classes (`{int: 1}[int]`, `{C: 1}` for a user class `C`).
     Class(String),
+    /// The `Ellipsis` (`...`) / `NotImplemented` singletons used as dict/set keys.
+    /// Hashable by identity; the tag distinguishes the two (`Ellipsis` = 0).
+    Singleton(u8),
 }
 
 /// A compiled function template: parameter shape + body chunk. Shared by every
@@ -279,6 +283,9 @@ pub struct FuncVal {
     pub bound: Option<Value>,
     /// Owning class name (for `super()` and method identity).
     pub owner: Option<String>,
+    /// The `__annotations__` dict `{param|"return": annotation}`, built at def
+    /// time. A heap [`PyObj::Dict`] handle (empty dict for an unannotated func).
+    pub annotations: Value,
 }
 
 /// A user-defined class instance. Its attribute storage (`__dict__`) is a real
@@ -475,6 +482,9 @@ pub enum PyObj {
     /// signal "this operand pair is not my business", so the interpreter tries the
     /// reflected operation (and, for `==`/`!=`, falls back to identity).
     NotImplemented,
+    /// The `Ellipsis` (`...`) singleton — a distinct truthy object of type
+    /// `ellipsis`, not `None` (used in slices and as a type-annotation placeholder).
+    Ellipsis,
     /// A live CPython object owned by the `stdlib-ffi` bridge — a handle (index)
     /// into `crate::ffi`'s side-table. Any object the real CPython stdlib returns
     /// that pythonrs can't represent by value (compiled regex, `datetime`,
@@ -1767,6 +1777,7 @@ impl PyHost {
                 Some(PyObj::ClassMethod(_)) => "classmethod".into(),
                 Some(PyObj::Property { .. }) => "property".into(),
                 Some(PyObj::NotImplemented) => "NotImplementedType".into(),
+                Some(PyObj::Ellipsis) => "ellipsis".into(),
                 #[cfg(feature = "stdlib-ffi")]
                 Some(PyObj::Foreign(id)) => crate::ffi::type_name(*id),
                 None => "object".into(),
@@ -1958,6 +1969,7 @@ impl PyHost {
                 }
                 Some(PyObj::Property { .. }) => "<property object>".into(),
                 Some(PyObj::NotImplemented) => "NotImplemented".into(),
+                Some(PyObj::Ellipsis) => "Ellipsis".into(),
                 #[cfg(feature = "stdlib-ffi")]
                 Some(PyObj::Foreign(id)) => crate::ffi::str_of(*id),
                 Some(PyObj::Slice { .. })
@@ -2181,6 +2193,8 @@ impl PyHost {
                 // A type object keys by name (types are singletons by name).
                 Some(PyObj::Class(n)) => PKey::Class(n.clone()),
                 Some(PyObj::Builtin(n)) => PKey::Class(n.clone()),
+                Some(PyObj::Ellipsis) => PKey::Singleton(0),
+                Some(PyObj::NotImplemented) => PKey::Singleton(1),
                 Some(PyObj::Instance(inst)) => {
                     let id = match v {
                         Value::Obj(i) => *i,
@@ -2357,6 +2371,10 @@ impl PyHost {
                     // and `type(b) == B` hold regardless of heap identity.
                     (Some(PyObj::Builtin(x)), Some(PyObj::Builtin(y))) => x == y,
                     (Some(PyObj::Class(x)), Some(PyObj::Class(y))) => x == y,
+                    // Singletons compare equal to themselves regardless of heap
+                    // identity (`... == ...`, and `lst.count(...)`).
+                    (Some(PyObj::Ellipsis), Some(PyObj::Ellipsis))
+                    | (Some(PyObj::NotImplemented), Some(PyObj::NotImplemented)) => true,
                     _ => match (a, b) {
                         (Value::Str(x), Value::Str(y)) => x == y,
                         _ => a == b,
@@ -5705,6 +5723,24 @@ impl PyHost {
             }
             // Function introspection dunders. `C.m` yields the raw `Func`; a
             // bound `inst.m` delegates to the same underlying function.
+            // `f.__annotations__` — the def-time dict `{param|"return": type}`.
+            Some(PyObj::Func(fv)) if name == "__annotations__" => {
+                let ann = fv.annotations.clone();
+                if matches!(ann, Value::Undef) {
+                    Ok(self.new_dict(IndexMap::new()))
+                } else {
+                    Ok(ann)
+                }
+            }
+            Some(PyObj::BoundMethod { func, .. }) if name == "__annotations__" => {
+                let func = func.clone();
+                match self.get(&func) {
+                    Some(PyObj::Func(fv)) if !matches!(fv.annotations, Value::Undef) => {
+                        Ok(fv.annotations.clone())
+                    }
+                    _ => Ok(self.new_dict(IndexMap::new())),
+                }
+            }
             Some(PyObj::Func(fv))
                 if matches!(
                     name,

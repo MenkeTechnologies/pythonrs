@@ -187,6 +187,11 @@ pub struct Params {
     pub kwonly_defaults: Vec<Option<Expr>>,
     /// `**kwargs` collector name, if any.
     pub kwargs: Option<String>,
+    /// Parameter/return annotations in source order, as `(name, expr)` pairs
+    /// (the return annotation uses the name `"return"`). Evaluated at def time to
+    /// build the function's `__annotations__` dict. Empty for a `lambda` or an
+    /// unannotated `def`.
+    pub annotations: Vec<(String, Expr)>,
 }
 
 /// One `except` clause of a `try`.

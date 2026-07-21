@@ -278,6 +278,7 @@ fn value_to_py<'py>(
                 }
                 Ok(dict.into_any())
             }
+            Some(PyObj::Ellipsis) => Ok(py.Ellipsis().into_bound(py)),
             Some(PyObj::Foreign(id)) => fetch(py, *id),
             // A pythonrs lazy iterator (generator / zip / map / filter /
             // enumerate / composite iterator) passed into a CPython call
@@ -296,6 +297,23 @@ fn value_to_py<'py>(
                 let it = PyrsIterator { target: v.clone() };
                 Py::new(py, it)
                     .map(|p| p.into_any().into_bound(py))
+                    .map_err(|e| e.to_string())
+            }
+            // A bare builtin type/function (`int`, `str`, `len`, `sorted`, …)
+            // crosses as the REAL CPython object when one exists: so `Optional
+            // [int]` holds CPython's `int` (its repr needs no callback into a
+            // borrowed host), and `reduce(min, …)` calls the real function. Only a
+            // pythonrs-only or method-qualified builtin (`dict.fromkeys`) falls
+            // through to the callback proxy below.
+            Some(PyObj::Builtin(name))
+                if !name.contains('.')
+                    && py
+                        .import("builtins")
+                        .and_then(|m| m.getattr(name.as_str()))
+                        .is_ok() =>
+            {
+                py.import("builtins")
+                    .and_then(|m| m.getattr(name.as_str()))
                     .map_err(|e| e.to_string())
             }
             // A pythonrs callable (lambda / def / builtin / bound method / partial
@@ -387,6 +405,11 @@ fn marshal_seq<'py>(
 fn py_to_value(host: &mut PyHost, py: Python, obj: &Bound<PyAny>) -> Result<Value, String> {
     if obj.is_none() {
         return Ok(Value::Undef);
+    }
+    // CPython `Ellipsis` (`...`) crosses back as the native singleton (distinct
+    // from `None`) so identity and repr match.
+    if obj.is(&py.Ellipsis()) {
+        return Ok(host.alloc(PyObj::Ellipsis));
     }
     if obj.is_exact_instance_of::<PyBool>() {
         return Ok(Value::Bool(

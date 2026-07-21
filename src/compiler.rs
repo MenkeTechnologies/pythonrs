@@ -925,16 +925,27 @@ impl Compiler {
         Ok(())
     }
 
-    /// Emit the `MKFUNC` sequence for `def_id`: push the evaluated positional
-    /// defaults, then the keyword-only defaults, a count of them, and the func id
-    /// (kept immediately below `MKFUNC` so id-rebasing still finds it). Assumes
-    /// nothing this call needs is already on the stack.
+    /// Emit the `MKFUNC` sequence for `def_id`: push the `__annotations__` dict
+    /// (bottom, evaluated at def time), the evaluated positional defaults, then the
+    /// keyword-only defaults, a count of them, and the func id (kept immediately
+    /// below `MKFUNC` so id-rebasing still finds it). Assumes nothing this call
+    /// needs is already on the stack.
     fn emit_make_func(
         &mut self,
         b: &mut ChunkBuilder,
         def_id: usize,
         params: &Params,
     ) -> Result<(), String> {
+        // `__annotations__` dict `{name: value, ...}` — deepest arg, so it does not
+        // disturb the func-id `LoadInt` that must stay right below `MKFUNC`.
+        for (name, ann) in &params.annotations {
+            self.compile_expr(b, &Expr::Str(name.clone()))?;
+            self.compile_expr(b, ann)?;
+        }
+        b.emit(
+            Op::CallBuiltin(ops::MKDICT, argc(params.annotations.len() * 2)?),
+            0,
+        );
         for d in &params.defaults {
             self.compile_expr(b, d)?;
         }
@@ -945,7 +956,7 @@ impl Compiler {
         }
         b.emit(Op::LoadInt(nkw as i64), 0); // keyword-only default count
         b.emit(Op::LoadInt(def_id as i64), 0); // func id (immediately below MKFUNC)
-        let total = params.defaults.len() + nkw + 2; // + count + func id
+        let total = 1 + params.defaults.len() + nkw + 2; // annotations + defaults + count + func id
         b.emit(Op::CallBuiltin(ops::MKFUNC, argc(total)?), 0);
         Ok(())
     }
@@ -1379,7 +1390,7 @@ impl Compiler {
                 b.emit(Op::CallBuiltin(ops::CALL, 3), 0);
             }
             Expr::Ellipsis => {
-                b.emit(Op::LoadUndef, 0);
+                b.emit(Op::CallBuiltin(ops::ELLIPSIS, 0), 0);
             }
             Expr::Str(s) => self.strlit(b, s),
             Expr::Bytes(bytes) => {

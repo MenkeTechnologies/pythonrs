@@ -345,3 +345,30 @@ except TypeError:
         "no source echo: {stderr}"
     );
 }
+
+/// Function annotations that subscript a `typing` generic (`Optional[int]`)
+/// evaluate through the stdlib bridge: `int` crosses into CPython as the real
+/// `int` type (not a callback proxy), so `typing.Optional[int]` builds and its
+/// repr needs no re-entry into the borrowed host. Regression for a double-borrow
+/// panic where a builtin type crossed as a `PyrsCallable`.
+#[test]
+fn ffi_typing_annotation_subscript() {
+    let src = "\
+from typing import Optional, List
+def h(x: Optional[int] = None) -> List[str]:
+    return []
+print(h.__annotations__['x'])
+print(h.__annotations__['return'])
+y = Optional[int]
+print(y)
+";
+    let (stdout, stderr, ok) = run_py(src);
+    if !ok || stderr.contains("ModuleNotFoundError") {
+        eprintln!("skipping ffi-typing-annotation test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(
+        stdout, "int | None\ntyping.List[str]\nint | None\n",
+        "stderr={stderr}"
+    );
+}

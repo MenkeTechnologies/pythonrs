@@ -2642,6 +2642,27 @@ fn exception_class_repr() {
     assert_eq!(g("x = type(ValueError)", "x"), "<class 'type'>");
 }
 
+/// The `...` (`Ellipsis`) singleton is a distinct truthy object of type
+/// `ellipsis`, never `None`: `... is ...`, `... == ...`, `... is not None`,
+/// hashable (usable as a dict/set key), and repr/str `Ellipsis`. The bare name
+/// `Ellipsis` resolves to the same singleton.
+#[test]
+fn ellipsis_singleton() {
+    assert_eq!(g("x = ...", "x"), "Ellipsis");
+    assert_eq!(g("x = type(...).__name__", "x"), "'ellipsis'");
+    assert_eq!(g("x = (... is ...)", "x"), "True");
+    assert_eq!(g("x = (... == ...)", "x"), "True");
+    assert_eq!(g("x = (... is None)", "x"), "False");
+    assert_eq!(g("x = (... == None)", "x"), "False");
+    assert_eq!(g("x = bool(...)", "x"), "True");
+    assert_eq!(g("x = (... is Ellipsis)", "x"), "True");
+    // Hashable: works as a dict key and dedupes in a set.
+    assert_eq!(g("x = {...: 'e'}[...]", "x"), "'e'");
+    assert_eq!(g("x = len({..., ..., None})", "x"), "2");
+    // Equality drives `count`.
+    assert_eq!(g("x = [..., 1, ...].count(...)", "x"), "2");
+}
+
 /// Unbound builtin methods reached via a type object: `str.lower`, `list.append`,
 /// `dict.get`. Callable with an explicit receiver (`str.lower("HI")`), usable as
 /// a `key=`/`map` function, and repr as `<method '…' of '…' objects>`. Also the
@@ -2704,6 +2725,39 @@ fn class_body_annotations() {
     assert_eq!(
         g("class C:\n    x: int\n    def m(self):\n        y: int = 1\n        return y\nz = sorted(C.__annotations__)", "z"),
         "['x']"
+    );
+}
+
+/// `def` parameter/return annotations build the function's `__annotations__`
+/// dict at def time (keys in source order, `"return"` last), matching CPython.
+#[test]
+fn function_annotations() {
+    // Positional, keyword-only, `*args`/`**kwargs`, and return, in source order.
+    assert_eq!(
+        g(
+            "def f(a: int, b: 'str', *args: float, c: bool = True, **kw: bytes) -> list:\n    return a\nz = f.__annotations__",
+            "z",
+        ),
+        "{'a': <class 'int'>, 'b': 'str', 'args': <class 'float'>, 'c': <class 'bool'>, 'kw': <class 'bytes'>, 'return': <class 'list'>}",
+    );
+    // An unannotated function has an empty (but real, mutable) dict.
+    assert_eq!(
+        g("def g(x, y):\n    return x\nz = g.__annotations__", "z"),
+        "{}"
+    );
+    // A method's annotations are reachable both unbound (`C.m`) and bound (`c.m`).
+    assert_eq!(
+        g("class C:\n    def m(self, n: int) -> 'C':\n        return self\nz = C.m.__annotations__", "z"),
+        "{'n': <class 'int'>, 'return': 'C'}",
+    );
+    assert_eq!(
+        g("class C:\n    def m(self, n: int) -> 'C':\n        return self\nz = C().m.__annotations__", "z"),
+        "{'n': <class 'int'>, 'return': 'C'}",
+    );
+    // The dict is live: annotations can be introspected and mutated.
+    assert_eq!(
+        g("def f(x: int) -> str:\n    return ''\nf.__annotations__['x'] = 99\nz = f.__annotations__['x']", "z"),
+        "99",
     );
 }
 
