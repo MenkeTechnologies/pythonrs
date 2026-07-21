@@ -19,7 +19,7 @@
 //! into a fresh CPython object, so an in-place stdlib mutator (`heapq.heapify`,
 //! `random.shuffle`, `struct.pack_into`) would otherwise lose its effect; after
 //! the call the bridge re-reads that object and overwrites the pythonrs heap slot
-//! in place (see [`writeback_mutated_args`]) so the mutation — and aliases to the
+//! in place (see `writeback_mutated_args`) so the mutation — and aliases to the
 //! same object — reflect it. Write-back marshals by value only and never
 //! allocates a `Foreign`, so it does not grow the side-table.
 
@@ -466,7 +466,7 @@ fn pure_seq(host: &mut PyHost, py: Python, cpy: &Bound<PyAny>) -> Option<Vec<Val
 /// `None` for anything not representable by value. Used only by write-back, whose
 /// contract is "reflect an in-place mutation losslessly, or leave the object
 /// alone" — never allocate a new `Foreign` handle (that would leak on every call
-/// and change identity). [`py_to_value`] is the authoritative marshaler and keeps
+/// and change identity). `py_to_value` is the authoritative marshaler and keeps
 /// unrepresentable results as `Foreign`; the two contracts differ, so they stay
 /// separate functions.
 fn pure_value(host: &mut PyHost, py: Python, obj: &Bound<PyAny>) -> Option<Value> {
@@ -620,7 +620,7 @@ pub fn iter_next(host: &mut PyHost, id: u32) -> Result<Option<Value>, String> {
 /// CPython iterator (`itertools.starmap`/`dropwhile`/`takewhile`/`filterfalse`
 /// over a pythonrs callable) runs that callable, which re-enters the host. The
 /// advance therefore happens with no borrow held; the result is marshaled under
-/// a fresh short borrow, exactly like [`invoke_bound`].
+/// a fresh short borrow, exactly like `invoke_bound`.
 pub fn iter_next_cb(id: u32) -> Result<Option<Value>, String> {
     Python::with_gil(|py| {
         let obj = fetch(py, id)?;
