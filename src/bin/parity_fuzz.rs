@@ -3177,7 +3177,7 @@ fn gen_strformat(seed: u64) -> Vec<String> {
     let w = pick(r, &["0", "6", "8", "10", "12", "15"]);
     let sign = pick(r, &["", "+", "-", " "]);
     let p = pick(r, &["1", "2", "3", "4"]);
-    let e = match r.below(33) {
+    let e = match r.below(34) {
         // --- decimal-int grouping: plain, then combined with width/zero/sign ---
         0 => format!("print('{{:{grp}}}'.format({gi}))"),
         1 => format!("print('{{:{grp}d}}'.format({gi}))"),
@@ -3288,9 +3288,27 @@ fn gen_strformat(seed: u64) -> Vec<String> {
             format!("print(format({v}, '{sp}'))")
         }
         // --- old-style % with `#` alt forms and mixed conversions ---
-        _ => format!(
+        32 => format!(
             "print('%#x|%#o|%+d|% d|%r' % (abs({gi}), abs({gi2}), {gi}, abs({gi2}), {s}))"
         ),
+        // --- auto vs manual field numbering (valid runs + illegal mixing) ---
+        _ => {
+            let tmpl = pick(
+                r,
+                &[
+                    "{}{}",        // both automatic (ok)
+                    "{0}{1}{0}",   // all manual (ok)
+                    "{n}{}{}",     // named + automatic (ok)
+                    "{}{0}",       // auto -> manual (error)
+                    "{0}{}",       // manual -> auto (error)
+                    "{1}{}",       // manual -> auto (error)
+                    "{:{}}",       // nested automatic (ok)
+                    "{0:{1}}",     // nested manual (ok)
+                    "{0:{}}",      // manual -> auto in nested spec (error)
+                ],
+            );
+            format!("print('{tmpl}'.format({gi}, {gi2}, n={gf}))")
+        }
     };
     vec![e]
 }

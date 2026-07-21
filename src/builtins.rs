@@ -5349,14 +5349,24 @@ fn split_format_field(field: &str) -> (String, i64, String) {
     }
 }
 
+/// Shared automatic/manual field-numbering state for one `str.format` call.
+/// `mode` is `None` until the first `{}`/`{0}` fixes the numbering discipline;
+/// mixing the two afterwards is a `ValueError`, exactly as in CPython.
+#[derive(Default)]
+struct FieldNum {
+    counter: usize,
+    /// `Some(false)` = automatic (`{}`), `Some(true)` = manual (`{0}`).
+    manual: Option<bool>,
+}
+
 /// Resolve a `str.format` field name (`arg_name` plus `.attr` / `[index]`
 /// accessor chain) against positional `args`, `kwargs`, and the shared
-/// automatic-field counter `auto`.
+/// automatic/manual field-numbering state `st`.
 fn resolve_format_arg(
     name: &str,
     args: &[Value],
     kwargs: &[(String, Value)],
-    auto: &mut usize,
+    st: &mut FieldNum,
 ) -> Result<Value, String> {
     let nchars: Vec<char> = name.chars().collect();
     // Base arg_name ends at the first `.` or `[`.
@@ -5366,13 +5376,25 @@ fn resolve_format_arg(
     }
     let base: String = nchars[..i].iter().collect();
     let mut val = if base.is_empty() {
+        if st.manual == Some(true) {
+            return Err("ValueError: cannot switch from manual field specification to \
+                        automatic field numbering"
+                .into());
+        }
+        st.manual = Some(false);
         let v = args
-            .get(*auto)
+            .get(st.counter)
             .cloned()
-            .ok_or_else(|| format!("IndexError: Replacement index {auto} out of range"))?;
-        *auto += 1;
+            .ok_or_else(|| format!("IndexError: Replacement index {} out of range", st.counter))?;
+        st.counter += 1;
         v
     } else if let Ok(n) = base.parse::<usize>() {
+        if st.manual == Some(false) {
+            return Err("ValueError: cannot switch from automatic field numbering to \
+                        manual field specification"
+                .into());
+        }
+        st.manual = Some(true);
         args.get(n)
             .cloned()
             .ok_or_else(|| format!("IndexError: Replacement index {n} out of range"))?
@@ -5419,13 +5441,13 @@ fn resolve_format_arg(
 }
 
 /// Substitute any `{…}` replacement fields inside a format spec (one nesting
-/// level, per CPython), formatting each with its default `str()` and consuming
-/// the shared automatic-field counter.
+/// level, per CPython), formatting each with its default `str()` and threading
+/// the shared automatic/manual field-numbering state.
 fn substitute_nested_spec(
     spec: &str,
     args: &[Value],
     kwargs: &[(String, Value)],
-    auto: &mut usize,
+    st: &mut FieldNum,
 ) -> Result<String, String> {
     if !spec.contains('{') {
         return Ok(spec.to_string());
@@ -5446,7 +5468,7 @@ fn substitute_nested_spec(
                     i += 1; // skip }
                 }
                 let (fname, conv, _) = split_format_field(&inner);
-                let val = resolve_format_arg(&fname, args, kwargs, auto)?;
+                let val = resolve_format_arg(&fname, args, kwargs, st)?;
                 out.push_str(&format_field(&val, conv, "")?);
             }
             c => {
@@ -5462,7 +5484,7 @@ fn str_dot_format(s: &str, args: &[Value], kwargs: &[(String, Value)]) -> Result
     let mut out = String::new();
     let chars: Vec<char> = s.chars().collect();
     let mut i = 0;
-    let mut auto = 0usize;
+    let mut auto = FieldNum::default();
     while i < chars.len() {
         match chars[i] {
             '{' if chars.get(i + 1) == Some(&'{') => {
