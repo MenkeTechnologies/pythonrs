@@ -126,6 +126,11 @@ pub struct Compiler {
     /// instead of being discarded, so the REPL echoes `repr(value)` for non-`None`
     /// results. Off for ordinary script compiles.
     interactive: bool,
+    /// True while lowering a class body's own statements (not a nested def/class):
+    /// a simple annotation (`x: int`) there records `x` into the class's
+    /// `__annotations__` dict, so `dataclass`/`typing.NamedTuple` and
+    /// `Cls.__annotations__` see the fields.
+    in_class_body: bool,
 }
 
 /// The kind of scope a hidden function represents, controlling whether it is a
@@ -223,7 +228,25 @@ impl Compiler {
                     self.compile_assign(b, t)?;
                 }
             }
-            StmtKind::AnnAssign { target, value, .. } => {
+            StmtKind::AnnAssign {
+                target,
+                annotation,
+                value,
+            } => {
+                // In a class body, a *simple* (bare-name) annotation records
+                // `__annotations__[name] = <annotation>` so dataclass /
+                // typing.NamedTuple and `Cls.__annotations__` see the field.
+                if self.in_class_body {
+                    if let Expr::Name(n) = target {
+                        self.compile_expr(b, annotation)?; // [ann]
+                        self.name_const(b, "__annotations__");
+                        b.emit(Op::CallBuiltin(ops::GETLOCAL, 1), self.cur_line); // [ann, dict]
+                        self.strlit(b, n); // [ann, dict, key]
+                        b.emit(Op::Rot, 0); // [dict, key, ann]
+                        b.emit(Op::CallBuiltin(ops::SETITEM, 3), 0);
+                        b.emit(Op::Pop, 0);
+                    }
+                }
                 if let Some(v) = value {
                     self.compile_expr(b, v)?;
                     self.compile_assign(b, target)?;
@@ -1009,7 +1032,21 @@ impl Compiler {
             pushed = true;
         }
         let mut fb = ChunkBuilder::new();
+        // A class body captures its simple annotations into `__annotations__`; a
+        // nested def/class resets the flag so its own annotations don't leak into
+        // the enclosing class's dict.
+        let saved_icb = self.in_class_body;
+        self.in_class_body = kind == ScopeKind::ClassBody;
+        if self.in_class_body && body.iter().any(is_ann_assign) {
+            // `__annotations__ = {}` at the top of the class body.
+            fb.emit(Op::CallBuiltin(ops::MKDICT, 0), 0);
+            self.name_const(&mut fb, "__annotations__");
+            fb.emit(Op::Swap, 0);
+            fb.emit(Op::CallBuiltin(ops::SETLOCAL, 2), 0);
+            fb.emit(Op::Pop, 0);
+        }
         let compiled = self.compile_stmts(&mut fb, body);
+        self.in_class_body = saved_icb;
         if pushed {
             self.func_scopes.pop();
         }
@@ -2503,6 +2540,12 @@ fn wrap_comp_clauses(mut inner: Vec<Stmt>, comps: &[Comprehension]) -> Vec<Stmt>
 
 /// The parameter names a `def`/`lambda` binds (positional, `*args`, keyword-only,
 /// `**kwargs`), skipping the bare-`*` keyword-only marker (`Some("")`).
+/// A top-level statement of a class body that is a simple (bare-name)
+/// annotation, so the body needs an `__annotations__` dict.
+fn is_ann_assign(s: &Stmt) -> bool {
+    matches!(&s.kind, StmtKind::AnnAssign { target: Expr::Name(_), .. })
+}
+
 fn param_names(params: &Params) -> Vec<String> {
     let mut v = params.names.clone();
     if let Some(s) = &params.star {

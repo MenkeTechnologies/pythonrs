@@ -7518,7 +7518,18 @@ pub fn build_class_foreign(
     body_func: &Value,
 ) -> Result<Value, String> {
     let ns = run_class_body(name, body_func)?;
-    let members: Vec<(String, Value)> = ns.into_iter().collect();
+    let mut members: Vec<(String, Value)> = ns.into_iter().collect();
+    // CPython class creation always provides `__module__`/`__qualname__` in the
+    // namespace; some metaclasses (typing.NamedTuple) index them directly and
+    // KeyError without. Supply them if the body didn't.
+    if !members.iter().any(|(k, _)| k == "__module__") {
+        let m = with_host(|h| h.new_str("__main__".to_string()));
+        members.push(("__module__".to_string(), m));
+    }
+    if !members.iter().any(|(k, _)| k == "__qualname__") {
+        let q = with_host(|h| h.new_str(name.to_string()));
+        members.push(("__qualname__".to_string(), q));
+    }
     crate::ffi::build_foreign_class(name, &bases, &members)
 }
 
