@@ -68,7 +68,10 @@ use std::path::PathBuf;
 /// `typing.NamedTuple` and `Cls.__annotations__` see the fields; also large
 /// collection literals (over 255 elements) lower via the `EXTEND_*` ops. Older
 /// cached bytecode lacks the annotation/extend lowering and must miss cleanly.
-const SCHEMA: u64 = 21;
+/// v22: `CProg.warnings` entries now carry the full `SyntaxWarning` text (not
+/// just a keyword), and the compiler adds the `"is" with a literal` warning.
+/// Older cached warnings held bare keywords and would print malformed.
+const SCHEMA: u64 = 22;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]

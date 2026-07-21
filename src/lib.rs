@@ -152,8 +152,15 @@ pub fn run_program(
     // Compile-time `SyntaxWarning`s (e.g. `'return' in a 'finally' block`) print
     // before execution, matching CPython. Carried through the bytecode cache so a
     // cache hit warns identically to a fresh compile.
-    for (line, kw) in &prog.warnings {
-        eprintln!("{tb_filename}:{line}: SyntaxWarning: '{kw}' in a 'finally' block");
+    for (line, msg) in &prog.warnings {
+        eprintln!("{tb_filename}:{line}: SyntaxWarning: {msg}");
+        // For a real file, CPython echoes the offending source line (via
+        // linecache) indented two spaces; `-c`/`<stdin>` have no file to read.
+        if !tb_filename.starts_with('<') {
+            if let Some(text) = src.lines().nth((*line as usize).saturating_sub(1)) {
+                eprintln!("  {}", text.trim_start());
+            }
+        }
     }
     let result = run_compiled(prog);
     // CPython emits `RuntimeWarning: coroutine '…' was never awaited` for any
