@@ -1160,7 +1160,7 @@ fn gen_subclass(seed: u64) -> Vec<String> {
         cand
     };
     let mut out: Vec<String> = Vec::new();
-    match r.below(14) {
+    match r.below(16) {
         // list subclass with a user method + inherited behavior.
         0 => {
             out.push("class Stack(list):".into());
@@ -1282,6 +1282,25 @@ fn gen_subclass(seed: u64) -> Vec<String> {
             out.push(format!("w = W('{s}')"));
             out.push(format!("print('{{}}!'.format(w), w in ('{s}', '{t}'))"));
             out.push("print(w.upper(), w.ljust(5, '.'), len(w))".into());
+        }
+        // int subclass overriding __new__ (immutable value fixed at __new__) + __init__.
+        13 => {
+            out.push("class C(int):".into());
+            out.push("    def __new__(cls, v):".into());
+            out.push("        return super().__new__(cls, v * 2)".into());
+            out.push("    def __init__(self, v):".into());
+            out.push("        self.orig = v".into());
+            out.push(format!("c = C({b})"));
+            out.push("print(c, c.orig, c + 1, type(c).__name__)".into());
+            out.push("print(isinstance(c, int), c * 2, c.orig + c)".into());
+        }
+        // str subclass overriding __new__.
+        14 => {
+            out.push("class U(str):".into());
+            out.push("    def __new__(cls, v):".into());
+            out.push("        return super().__new__(cls, v.upper())".into());
+            out.push(format!("u = U('{s}')"));
+            out.push("print(u, len(u), type(u).__name__, u.lower())".into());
         }
         // empty-construction defaults.
         _ => {

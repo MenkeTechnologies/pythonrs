@@ -159,6 +159,23 @@ fixed. Every line below was re-checked against the **default-build** binary
   through the closure (the outermost iterable is evaluated in the enclosing
   scope, matching CPython).
 
+- **Subclassing builtin types** (`class Stack(list)`, `class D(dict)`,
+  `class U(str)`, `class C(int)`, `class F(float)`, `class T(tuple)`,
+  `class S(set)`). The instance is a hybrid: it carries the native builtin
+  payload (list storage / int value / …) alongside the class + `__dict__`, so it
+  inherits ALL builtin behavior — methods (`.append`/`.upper`/`.keys`),
+  operators (`+`/`[]`/`len`), iteration, membership, `repr`/`str`, hashing,
+  equality — while supporting user methods, instance attributes, and
+  `super().__init__(...)` / `super().__new__(cls, …)`. One mechanism routes every
+  type (`builtin_base_of` detects the base from the MRO; the payload is unwrapped
+  for operators/coercion and delegated to for methods/protocol dunders).
+  Construction builds the payload from the constructor args (immutable bases at
+  `__new__`, mutable bases via `__init__`/`super().__init__`). A `dict` subclass
+  fires `__missing__` on a key miss; `int`/`float` subclass arithmetic returns
+  the plain base type (`C(5) + 3` → `int` `8`); `isinstance` and
+  `type(x).__name__` reflect the subclass. Fuzzed to zero divergences
+  (`parity-fuzz --mode subclass`).
+
 ## Implemented — async/await/asyncio (native fusevm event loop)
 - **`async def` / `await` / `asyncio`.** `async def f()` returns a real coroutine
   object (`type(f()).__name__ == 'coroutine'`; the body does **not** run on call),
@@ -204,6 +221,17 @@ fixed. Every line below was re-checked against the **default-build** binary
   `__repr__`/`__iter__`/`__next__`/`__init__`/`__hash__`. Container `repr`/`str`
   recurses so instance elements/keys/values dispatch their own `__repr__`.
   In-place augmented dunders are dispatched too (see Implemented).
+- **Builtin-type subclass instances as dict/set keys** hash by identity, not by
+  their base value: `{U('a'): 1}['a']` (where `class U(str)`) raises `KeyError`
+  where CPython returns `1`, because `to_key` keys a subclass instance as
+  `PKey::Instance` (identity) rather than unwrapping to the payload's value key.
+  The subclass value still hashes correctly via `hash(U('a')) == hash('a')`; only
+  the dict/set *keying* path does not yet unwrap. (Subclassing itself — methods,
+  operators, iteration, `super()` — is fully covered; see Implemented.)
+- **Augmented assignment on a mutable builtin subclass** loses the subclass type:
+  `s += [2]` where `class L(list)` yields a plain `list`, not an `L` (the value
+  is correct, the type is downgraded). Direct mutation (`s.append(2)`) preserves
+  the subclass identity.
 - **`int`** is arbitrary precision (bignum) across `+ - * ** // %` and the bitwise
   ops `& | ^ << >>` — verified byte-identical to CPython on `10**30`-scale values
   (the earlier i64-cap on `//`/`%`/bitwise is gone).
