@@ -2529,3 +2529,52 @@ fn large_collection_literals_exceed_u8_argc() {
         );
     }
 }
+
+/// Attribute access directly on a float literal: `0.1.is_integer()` must lex as
+/// `0.1` then `.is_integer` (a second `.` after the decimal point ends the
+/// literal), not consume the dot into a malformed float. Regression for a
+/// `SyntaxError: bad float` the lexer raised on this CPython-valid form.
+#[test]
+fn float_literal_attribute_access() {
+    assert_eq!(g("x = 0.1.is_integer()", "x"), "False");
+    assert_eq!(g("x = 2.0.is_integer()", "x"), "True");
+    assert_eq!(g("x = 3.14.hex()", "x"), g("y = (3.14).hex()", "y"));
+    // A float from an exponent also ends before a following dot.
+    assert_eq!(g("x = 1e3.is_integer()", "x"), "True");
+}
+
+/// `type(x)` for values whose type is not a constructor builtin still reprs as
+/// `<class '…'>`, not `<built-in function …>`. Regression: `type(None)` and
+/// `type(len)` reported as built-in functions.
+#[test]
+fn type_object_repr() {
+    assert_eq!(g("x = type(None)", "x"), "<class 'NoneType'>");
+    assert_eq!(
+        g("x = type(len)", "x"),
+        "<class 'builtin_function_or_method'>"
+    );
+    assert_eq!(g("x = type(lambda: 0)", "x"), "<class 'function'>");
+    assert_eq!(g("x = type(3)", "x"), "<class 'int'>");
+    assert_eq!(g("x = type(int)", "x"), "<class 'type'>");
+    assert_eq!(g("x = type(NotImplemented)", "x"), "<class 'NotImplementedType'>");
+    // A callable builtin still reprs as a function, not a class.
+    assert_eq!(g("x = len", "x"), "<built-in function len>");
+}
+
+/// `sum()` uses Neumaier compensated summation for floats (CPython 3.12+), so
+/// `sum([0.1]*10)` is exactly `1.0`, not `0.9999999999999999`. Also verifies the
+/// exact integer prefix, mixed int/float, complex tail, and the str-start guard.
+#[test]
+fn sum_neumaier_and_paths() {
+    assert_eq!(g("x = sum([0.1]*10)", "x"), "1.0");
+    assert_eq!(g("x = sum([1e18, 1, -1e18])", "x"), "1.0");
+    assert_eq!(g("x = sum([1, 2, 3])", "x"), "6");
+    assert_eq!(g("x = sum([1, 2, 3.5])", "x"), "6.5");
+    assert_eq!(g("x = sum([2**70, 1])", "x"), "1180591620717411303425");
+    assert_eq!(g("x = sum([1, 2, complex(1, 1)])", "x"), "(4+1j)");
+    let e = eval_str("x = sum(['a', 'b'], '')").unwrap_err();
+    assert!(
+        e.contains("sum() can't sum strings [use ''.join(seq) instead]"),
+        "got: {e}"
+    );
+}

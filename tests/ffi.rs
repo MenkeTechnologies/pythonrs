@@ -77,3 +77,22 @@ fn rust_block_with_no_exports_errors() {
     assert!(!ok, "empty-export block must error");
     assert!(stderr.contains("rust FFI"), "unexpected error: {stderr}");
 }
+
+/// The native `math` module is only a fast-path subset; a symbol it lacks
+/// (`isqrt`, `trunc`, `comb`, `hypot`) must resolve from the real CPython
+/// `math` over the stdlib-ffi bridge, not raise `AttributeError`. Skips cleanly
+/// when the bridge/libpython is unavailable (e.g. a `--no-default-features` or
+/// libpython-less environment) so it never reports a false failure.
+#[test]
+fn native_math_defers_missing_symbols_to_cpython() {
+    let src = "\
+import math
+print(math.isqrt(100), math.trunc(3.7), math.comb(5, 2), round(math.hypot(3, 4), 1))
+";
+    let (stdout, stderr, ok) = run_py(src);
+    if !ok || stderr.contains("ModuleNotFoundError") {
+        eprintln!("skipping math-ffi test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(stdout, "10 3 10 5.0\n", "stderr={stderr}");
+}

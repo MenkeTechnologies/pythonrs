@@ -1574,6 +1574,71 @@ pub fn run_main(chunk: Chunk) -> Result<Value, String> {
 
 // ── value operations (pure over builtin types) ───────────────────────────────
 
+/// If `n` (a `PyObj::Builtin` name) is a *type object* — the kind `type(x)`
+/// returns — its CPython class name for `repr` (`<class '…'>`), module-qualified
+/// where CPython qualifies it. Returns `None` for callable builtins (`len`,
+/// `print`, `math.sqrt`), which repr as `<built-in function …>`. The set mirrors
+/// every name `PyHost::type_name` can emit.
+fn type_object_class_name(n: &str) -> Option<String> {
+    // Module-qualified stdlib types.
+    let qualified = match n {
+        "Counter" => Some("collections.Counter"),
+        "defaultdict" => Some("collections.defaultdict"),
+        "OrderedDict" => Some("collections.OrderedDict"),
+        "deque" => Some("collections.deque"),
+        "partial" => Some("functools.partial"),
+        "TextIOWrapper" => Some("_io.TextIOWrapper"),
+        // `type_name` already returns these fully qualified.
+        "functools._lru_cache_wrapper" => Some("functools._lru_cache_wrapper"),
+        _ => None,
+    };
+    if let Some(q) = qualified {
+        return Some(q.to_string());
+    }
+    // Unqualified builtin type names: constructors plus the names `type()`
+    // yields for functions, methods, iterators, views, sentinels, descriptors.
+    let unqualified = matches!(
+        n,
+        "int" | "float" | "str" | "bool" | "list" | "tuple" | "dict" | "set"
+            | "frozenset" | "bytes" | "bytearray" | "memoryview" | "complex"
+            | "object" | "type" | "range" | "slice"
+            | "NoneType" | "NotImplementedType" | "ellipsis"
+            | "function" | "builtin_function_or_method" | "method" | "module"
+            | "property" | "staticmethod" | "classmethod" | "super"
+            | "iterator" | "callable_iterator" | "zip" | "map" | "filter"
+            | "enumerate" | "generator" | "coroutine" | "async_generator"
+            | "dict_keys" | "dict_values" | "dict_items"
+    );
+    unqualified.then(|| n.to_string())
+}
+
+/// A native-shadowed pure stdlib module whose native namespace is only a
+/// fast-path subset. On a miss, defer to the real CPython module over the FFI
+/// bridge so every symbol CPython's module exposes still resolves (e.g.
+/// `math.isqrt`/`math.trunc`/`math.comb`, absent from the native `math` arm).
+/// `Some(Ok/Err)` = the module is shadowed and the FFI lookup ran; `None` = no
+/// fallback (not a shadowed module, or the bridge is compiled out). Scoped to
+/// `math` — a set of pure numeric functions that marshal cleanly; `sys` and
+/// `collections` keep their native objects and are intentionally not deferred.
+#[cfg(feature = "stdlib-ffi")]
+fn module_ffi_fallback(host: &mut PyHost, mname: &str, name: &str) -> Option<Result<Value, String>> {
+    if mname != "math" {
+        return None;
+    }
+    match crate::ffi::import(mname) {
+        Ok(id) => Some(crate::ffi::get_attr(host, id, name)),
+        Err(e) => Some(Err(e)),
+    }
+}
+#[cfg(not(feature = "stdlib-ffi"))]
+fn module_ffi_fallback(
+    _host: &mut PyHost,
+    _mname: &str,
+    _name: &str,
+) -> Option<Result<Value, String>> {
+    None
+}
+
 impl PyHost {
     /// The Python type name of `v`.
     pub fn type_name(&self, v: &Value) -> String {
@@ -1615,7 +1680,16 @@ impl PyHost {
                 Some(PyObj::Range { .. }) => "range".into(),
                 Some(PyObj::Slice { .. }) => "slice".into(),
                 Some(PyObj::Func(_)) => "function".into(),
-                Some(PyObj::Builtin(_)) => "builtin_function_or_method".into(),
+                // A builtin type/exception constructor (`int`, `ValueError`) is a
+                // type object, so its type is `type`; a builtin function (`len`)
+                // is a `builtin_function_or_method`.
+                Some(PyObj::Builtin(n)) => {
+                    if crate::builtins::is_type_like_builtin(n) {
+                        "type".into()
+                    } else {
+                        "builtin_function_or_method".into()
+                    }
+                }
                 // `type(cls)` is the class's metaclass (`type` unless overridden).
                 Some(PyObj::Class(n)) => self
                     .classes
@@ -1744,15 +1818,14 @@ impl PyHost {
                         .unwrap_or_default();
                     format!("<function {name}>")
                 }
-                // A builtin *type* name (`int`, `list`, …) reprs as `<class 'X'>`;
-                // a builtin *function* (`len`, `print`) as `<built-in function X>`.
-                Some(PyObj::Builtin(n)) => {
-                    if crate::builtins::is_builtin_type_name(n) {
-                        format!("<class '{n}'>")
-                    } else {
-                        format!("<built-in function {n}>")
-                    }
-                }
+                // A `PyObj::Builtin` is either a callable builtin (`len`,
+                // `math.sqrt`) or a *type object* returned by `type(x)`. Type
+                // objects repr as `<class 'X'>` (module-qualified for stdlib
+                // container types); callables as `<built-in function X>`.
+                Some(PyObj::Builtin(n)) => match type_object_class_name(n) {
+                    Some(cls) => format!("<class '{cls}'>"),
+                    None => format!("<built-in function {n}>"),
+                },
                 Some(PyObj::BoundMethod { .. }) => "<bound method>".into(),
                 Some(PyObj::Exception { class, args }) => self.exc_str(class, args),
                 Some(PyObj::Module { name, .. }) => format!("<module '{name}'>"),
@@ -5304,6 +5377,24 @@ impl PyHost {
                 }
             }
         }
+        // Native-shadowed module: fast-path the native namespace, else defer to
+        // the real CPython module over the FFI bridge. Resolved before the
+        // borrowing match below because the fallback needs `&mut self`.
+        let module_lookup = match self.get(recv) {
+            Some(PyObj::Module { ns, name: mname }) => Some((ns.get(name).cloned(), mname.clone())),
+            _ => None,
+        };
+        if let Some((hit, mname)) = module_lookup {
+            return match hit {
+                Some(v) => Ok(v),
+                None => match module_ffi_fallback(self, &mname, name) {
+                    Some(r) => r,
+                    None => Err(format!(
+                        "AttributeError: module '{mname}' has no attribute '{name}'"
+                    )),
+                },
+            };
+        }
         match self.get(recv) {
             Some(PyObj::Instance(inst)) => {
                 let class = inst.class.clone();
@@ -5476,6 +5567,8 @@ impl PyHost {
                     "AttributeError: type object '{cname}' has no attribute '{name}'"
                 ))
             }
+            // Modules are fully resolved up-front (see the block before this
+            // match) so the FFI fallback can take `&mut self`; unreachable here.
             Some(PyObj::Module { ns, name: mname }) => {
                 let mname = mname.clone();
                 match ns.get(name) {
@@ -6485,9 +6578,15 @@ pub fn call_method(
         }
         Some(PyObj::Module { ns, name: mname }) => match ns.get(name).cloned() {
             Some(v) => invoke(&v, args, kwargs),
-            None => Err(format!(
-                "AttributeError: module '{mname}' has no attribute '{name}'"
-            )),
+            // Native-shadowed module miss (`math.isqrt(…)`): resolve the symbol
+            // from the real CPython module over the FFI bridge, then call it.
+            None => match with_host(|h| module_ffi_fallback(h, &mname, name)) {
+                Some(Ok(f)) => invoke(&f, args, kwargs),
+                Some(Err(e)) => Err(e),
+                None => Err(format!(
+                    "AttributeError: module '{mname}' has no attribute '{name}'"
+                )),
+            },
         },
         Some(PyObj::Super { owner, instance }) => {
             let inst_class = match with_host(|h| h.get(&instance).cloned()) {
