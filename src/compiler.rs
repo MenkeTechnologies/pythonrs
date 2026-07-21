@@ -17,6 +17,7 @@
 use crate::ast::*;
 use crate::host::{binop as bop, iop, ops, unop, FuncDef, TryDef};
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
+use std::collections::HashSet;
 
 /// A compiled program: the top-level chunk plus the def/lambda/class-body
 /// template table (indexed by def id) and the try-block table.
@@ -107,8 +108,24 @@ pub struct Compiler {
     /// comprehension leaks to module scope (`global`, depth 0) or the enclosing
     /// function (`nonlocal`, depth > 0), per PEP 572.
     fn_depth: usize,
+    /// Bound-name set of each enclosing *function* scope (`def`/`lambda`/
+    /// comprehension), innermost last. A class body is NOT pushed — `nonlocal`
+    /// resolution skips class scope. Used to validate `nonlocal` targets at
+    /// compile time (CPython raises `SyntaxError` for an unbound / module-level
+    /// `nonlocal`).
+    func_scopes: Vec<HashSet<String>>,
     /// Compile-time `SyntaxWarning`s collected while lowering (see `Program`).
     warnings: Vec<(u32, String)>,
+}
+
+/// The kind of scope a hidden function represents, controlling whether it is a
+/// `nonlocal` resolution target (class bodies are transparent to `nonlocal`).
+#[derive(Clone, Copy, PartialEq)]
+enum ScopeKind {
+    /// A `def`/`lambda`/comprehension: a real function scope for `nonlocal`.
+    Function,
+    /// A class body: names resolve dynamically and it is skipped by `nonlocal`.
+    ClassBody,
 }
 
 /// Compile a parsed program. `debug` enables per-statement DAP line markers.
@@ -272,6 +289,7 @@ impl Compiler {
             }
             StmtKind::Nonlocal(names) => {
                 for n in names {
+                    self.check_nonlocal_binding(n)?;
                     self.name_const(b, n);
                     b.emit(Op::CallBuiltin(ops::DECLARE_NONLOCAL, 1), line);
                     b.emit(Op::Pop, line);
@@ -841,7 +859,7 @@ impl Compiler {
         is_async: bool,
     ) -> Result<(), String> {
         self.fn_depth += 1;
-        let def_id = self.build_function_ex(name, params, body, is_async);
+        let def_id = self.build_function_ex(name, params, body, is_async, ScopeKind::Function);
         self.fn_depth -= 1;
         let def_id = def_id?;
         self.emit_make_func(b, def_id, params)?;
@@ -886,7 +904,24 @@ impl Compiler {
         params: &Params,
         body: &[Stmt],
     ) -> Result<usize, String> {
-        self.build_function_ex(name, params, body, false)
+        self.build_function_ex(name, params, body, false, ScopeKind::Function)
+    }
+
+    /// Validate a `nonlocal name` declaration at compile time, mirroring CPython:
+    /// at module level (no enclosing function) it is a `SyntaxError`, and if no
+    /// enclosing function scope binds `name` it is `no binding for nonlocal`.
+    fn check_nonlocal_binding(&self, name: &str) -> Result<(), String> {
+        let n = self.func_scopes.len();
+        // `func_scopes.last()` is the current function; a `nonlocal` targets an
+        // ENCLOSING one, so the current scope is excluded from the search.
+        if n == 0 {
+            return Err("SyntaxError: nonlocal declaration not allowed at module level".into());
+        }
+        let bound = self.func_scopes[..n - 1].iter().any(|s| s.contains(name));
+        if !bound {
+            return Err(format!("SyntaxError: no binding for nonlocal '{name}' found"));
+        }
+        Ok(())
     }
 
     fn build_function_ex(
@@ -895,9 +930,34 @@ impl Compiler {
         params: &Params,
         body: &[Stmt],
         is_async: bool,
+        kind: ScopeKind,
     ) -> Result<usize, String> {
+        // The scope's local names: everything assigned in the body, minus names
+        // it declares `global`/`nonlocal`. Reading one before it is bound is an
+        // `UnboundLocalError` at runtime. A class body resolves names dynamically,
+        // so it carries no local set (unbound reads there are `NameError`).
+        let locals = if kind == ScopeKind::ClassBody {
+            Vec::new()
+        } else {
+            scope_locals(body)
+        };
+        // Push this scope's bound names (locals + params) so a nested `nonlocal`
+        // can resolve against it. Class bodies are transparent to `nonlocal`.
+        let mut pushed = false;
+        if kind == ScopeKind::Function {
+            let mut bound: HashSet<String> = locals.iter().cloned().collect();
+            for p in param_names(params) {
+                bound.insert(p);
+            }
+            self.func_scopes.push(bound);
+            pushed = true;
+        }
         let mut fb = ChunkBuilder::new();
-        self.compile_stmts(&mut fb, body)?;
+        let compiled = self.compile_stmts(&mut fb, body);
+        if pushed {
+            self.func_scopes.pop();
+        }
+        compiled?;
         let is_generator = body_has_yield(body);
         let def = FuncDef {
             name: name.to_string(),
@@ -909,6 +969,7 @@ impl Compiler {
             kwonly_required: params.kwonly_defaults.iter().map(|d| d.is_none()).collect(),
             kwargs: params.kwargs.clone(),
             chunk: fb.build(),
+            locals,
             is_generator,
             is_async,
         };
@@ -929,7 +990,13 @@ impl Compiler {
         // into its local env; BUILD_CLASS captures that env as the namespace.
         let empty = Params::default();
         self.fn_depth += 1;
-        let def_id = self.build_function(&format!("<class {name}>"), &empty, body);
+        let def_id = self.build_function_ex(
+            &format!("<class {name}>"),
+            &empty,
+            body,
+            false,
+            ScopeKind::ClassBody,
+        );
         self.fn_depth -= 1;
         let def_id = def_id?;
         // The explicit metaclass (`class A(metaclass=M)`), or `None` — BUILD_CLASS
@@ -1945,7 +2012,7 @@ impl Compiler {
             names: vec![".0".into()],
             ..Params::default()
         };
-        let def_id = self.build_function_ex(name, &params, &body, is_async)?;
+        let def_id = self.build_function_ex(name, &params, &body, is_async, ScopeKind::Function)?;
         self.emit_make_func(b, def_id, &params)?; // [func]
         self.compile_expr(b, outer_iter)?; // [func, iterable]
         b.emit(Op::CallBuiltin(ops::CALL_VALUE, 2), 0); // [result|coroutine]
@@ -2313,6 +2380,328 @@ fn wrap_comp_clauses(mut inner: Vec<Stmt>, comps: &[Comprehension]) -> Vec<Stmt>
         .into()];
     }
     inner
+}
+
+/// The parameter names a `def`/`lambda` binds (positional, `*args`, keyword-only,
+/// `**kwargs`), skipping the bare-`*` keyword-only marker (`Some("")`).
+fn param_names(params: &Params) -> Vec<String> {
+    let mut v = params.names.clone();
+    if let Some(s) = &params.star {
+        if !s.is_empty() {
+            v.push(s.clone());
+        }
+    }
+    v.extend(params.kwonly.iter().cloned());
+    if let Some(k) = &params.kwargs {
+        v.push(k.clone());
+    }
+    v
+}
+
+/// The local-name set of a function/comprehension scope: every name *bound* in
+/// the body (assignments, `for`/`with`/`except`/`match` targets, nested
+/// `def`/`class` names, imports, and walrus `:=` targets that leak out of a
+/// comprehension per PEP 572) MINUS the names the scope declares `global`/
+/// `nonlocal`. Reading one before it is bound is an `UnboundLocalError`. The walk
+/// stays at this scope level — it does not descend into a nested `def`/`class`/
+/// lambda body, each of which owns its own locals. Sorted for a stable bytecode
+/// cache key.
+fn scope_locals(body: &[Stmt]) -> Vec<String> {
+    let mut bound = HashSet::new();
+    let mut gdecl = HashSet::new();
+    let mut ndecl = HashSet::new();
+    for s in body {
+        collect_bound_stmt(s, &mut bound);
+        collect_scope_decls_stmt(s, &mut gdecl, &mut ndecl);
+    }
+    let mut out: Vec<String> = bound
+        .into_iter()
+        .filter(|n| !gdecl.contains(n) && !ndecl.contains(n))
+        .collect();
+    out.sort();
+    out
+}
+
+/// Add every simple-name binding target in `e` (a `Name`, or the names nested in
+/// tuple/list/starred unpacking). Attribute/subscript targets bind no local name.
+fn bind_target(e: &Expr, out: &mut HashSet<String>) {
+    match e {
+        Expr::Name(n) => {
+            out.insert(n.clone());
+        }
+        Expr::Tuple(items) | Expr::List(items) => {
+            for it in items {
+                bind_target(it, out);
+            }
+        }
+        Expr::Starred(x) => bind_target(x, out),
+        _ => {}
+    }
+}
+
+/// Add every name bound by one statement to `out`, recursing through
+/// control-flow suites at this scope level but NOT into nested `def`/`class`
+/// bodies. See [`scope_locals`].
+fn collect_bound_stmt(s: &Stmt, out: &mut HashSet<String>) {
+    match &s.kind {
+        StmtKind::Assign { targets, value } => {
+            for t in targets {
+                bind_target(t, out);
+            }
+            collect_leaked_walrus(value, out);
+        }
+        StmtKind::AugAssign { target, value, .. } => {
+            bind_target(target, out);
+            collect_leaked_walrus(value, out);
+        }
+        StmtKind::AnnAssign { target, value, .. } => {
+            // A bare-name annotation (`x: int`) makes `x` local even with no value.
+            bind_target(target, out);
+            if let Some(v) = value {
+                collect_leaked_walrus(v, out);
+            }
+        }
+        StmtKind::For {
+            target,
+            iter,
+            body,
+            orelse,
+            ..
+        } => {
+            bind_target(target, out);
+            collect_leaked_walrus(iter, out);
+            for s in body.iter().chain(orelse) {
+                collect_bound_stmt(s, out);
+            }
+        }
+        StmtKind::While { test, body, orelse } => {
+            collect_leaked_walrus(test, out);
+            for s in body.iter().chain(orelse) {
+                collect_bound_stmt(s, out);
+            }
+        }
+        StmtKind::If { test, body, orelse } => {
+            collect_leaked_walrus(test, out);
+            for s in body.iter().chain(orelse) {
+                collect_bound_stmt(s, out);
+            }
+        }
+        StmtKind::With { items, body, .. } => {
+            for it in items {
+                collect_leaked_walrus(&it.context, out);
+                if let Some(v) = &it.vars {
+                    bind_target(v, out);
+                }
+            }
+            for s in body {
+                collect_bound_stmt(s, out);
+            }
+        }
+        StmtKind::Try {
+            body,
+            handlers,
+            orelse,
+            finalbody,
+        } => {
+            for s in body.iter().chain(orelse).chain(finalbody) {
+                collect_bound_stmt(s, out);
+            }
+            for h in handlers {
+                if let Some(n) = &h.name {
+                    out.insert(n.clone());
+                }
+                for s in &h.body {
+                    collect_bound_stmt(s, out);
+                }
+            }
+        }
+        StmtKind::FuncDef { name, .. } | StmtKind::ClassDef { name, .. } => {
+            out.insert(name.clone());
+        }
+        StmtKind::Import(aliases) => {
+            for a in aliases {
+                // `import a.b.c` binds `a`; `import a.b as x` binds `x`.
+                let n = a.asname.clone().unwrap_or_else(|| {
+                    a.name.split('.').next().unwrap_or(&a.name).to_string()
+                });
+                out.insert(n);
+            }
+        }
+        StmtKind::ImportFrom { names, .. } => {
+            for a in names {
+                out.insert(a.asname.clone().unwrap_or_else(|| a.name.clone()));
+            }
+        }
+        StmtKind::Match { subject, cases } => {
+            collect_leaked_walrus(subject, out);
+            for c in cases {
+                let mut names = Vec::new();
+                let _ = validate_pattern(&c.pattern, &mut names);
+                for n in names {
+                    out.insert(n);
+                }
+                if let Some(g) = &c.guard {
+                    collect_leaked_walrus(g, out);
+                }
+                for s in &c.body {
+                    collect_bound_stmt(s, out);
+                }
+            }
+        }
+        StmtKind::Expr(e) | StmtKind::Return(Some(e)) => collect_leaked_walrus(e, out),
+        StmtKind::Delete(targets) => {
+            // `del x` references a name that must already be local (CPython treats
+            // it as a binding for scope purposes).
+            for t in targets {
+                bind_target(t, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Collect the names a suite declares `global` / `nonlocal` at this scope level
+/// (recursing control flow, not nested `def`/`class` bodies).
+fn collect_scope_decls_stmt(s: &Stmt, g: &mut HashSet<String>, nl: &mut HashSet<String>) {
+    match &s.kind {
+        StmtKind::Global(names) => {
+            for n in names {
+                g.insert(n.clone());
+            }
+        }
+        StmtKind::Nonlocal(names) => {
+            for n in names {
+                nl.insert(n.clone());
+            }
+        }
+        StmtKind::If { body, orelse, .. }
+        | StmtKind::While { body, orelse, .. }
+        | StmtKind::For { body, orelse, .. } => {
+            for s in body.iter().chain(orelse) {
+                collect_scope_decls_stmt(s, g, nl);
+            }
+        }
+        StmtKind::With { body, .. } => {
+            for s in body {
+                collect_scope_decls_stmt(s, g, nl);
+            }
+        }
+        StmtKind::Try {
+            body,
+            handlers,
+            orelse,
+            finalbody,
+        } => {
+            for s in body.iter().chain(orelse).chain(finalbody) {
+                collect_scope_decls_stmt(s, g, nl);
+            }
+            for h in handlers {
+                for s in &h.body {
+                    collect_scope_decls_stmt(s, g, nl);
+                }
+            }
+        }
+        StmtKind::Match { cases, .. } => {
+            for c in cases {
+                for s in &c.body {
+                    collect_scope_decls_stmt(s, g, nl);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Like [`collect_walrus_targets`] but descends INTO nested comprehensions —
+/// whose walrus (`:=`) targets leak to the enclosing function scope (PEP 572) —
+/// while still stopping at a nested `def`/lambda, which owns its walrus targets.
+fn collect_leaked_walrus(e: &Expr, out: &mut HashSet<String>) {
+    match e {
+        Expr::NamedExpr(target, value) => {
+            if let Expr::Name(n) = &**target {
+                out.insert(n.clone());
+            }
+            collect_leaked_walrus(value, out);
+        }
+        Expr::BoolOp(_, items) | Expr::List(items) | Expr::Tuple(items) | Expr::Set(items) => {
+            for it in items {
+                collect_leaked_walrus(it, out);
+            }
+        }
+        Expr::Dict(pairs) => {
+            for (k, v) in pairs {
+                if let Some(k) = k {
+                    collect_leaked_walrus(k, out);
+                }
+                collect_leaked_walrus(v, out);
+            }
+        }
+        Expr::UnaryOp(_, x)
+        | Expr::Starred(x)
+        | Expr::Await(x)
+        | Expr::YieldFrom(x)
+        | Expr::Yield(Some(x)) => collect_leaked_walrus(x, out),
+        Expr::BinOp(_, a, b) => {
+            collect_leaked_walrus(a, out);
+            collect_leaked_walrus(b, out);
+        }
+        Expr::Compare(a, links) => {
+            collect_leaked_walrus(a, out);
+            for (_, rhs) in links {
+                collect_leaked_walrus(rhs, out);
+            }
+        }
+        Expr::IfExp { test, body, orelse } => {
+            collect_leaked_walrus(test, out);
+            collect_leaked_walrus(body, out);
+            collect_leaked_walrus(orelse, out);
+        }
+        Expr::Call {
+            func,
+            args,
+            keywords,
+        } => {
+            collect_leaked_walrus(func, out);
+            for a in args {
+                collect_leaked_walrus(a, out);
+            }
+            for kw in keywords {
+                collect_leaked_walrus(&kw.value, out);
+            }
+        }
+        Expr::Attribute(x, _) => collect_leaked_walrus(x, out),
+        Expr::Subscript(a, b) => {
+            collect_leaked_walrus(a, out);
+            collect_leaked_walrus(b, out);
+        }
+        Expr::Slice { lo, hi, step } => {
+            for p in [lo, hi, step].into_iter().flatten() {
+                collect_leaked_walrus(p, out);
+            }
+        }
+        Expr::ListComp(elt, comps) | Expr::SetComp(elt, comps) | Expr::GenExp(elt, comps) => {
+            collect_leaked_walrus(elt, out);
+            for c in comps {
+                collect_leaked_walrus(&c.iter, out);
+                for cond in &c.ifs {
+                    collect_leaked_walrus(cond, out);
+                }
+            }
+        }
+        Expr::DictComp(k, v, comps) => {
+            collect_leaked_walrus(k, out);
+            collect_leaked_walrus(v, out);
+            for c in comps {
+                collect_leaked_walrus(&c.iter, out);
+                for cond in &c.ifs {
+                    collect_leaked_walrus(cond, out);
+                }
+            }
+        }
+        // A lambda owns its own walrus targets — do not descend.
+        Expr::Lambda { .. } => {}
+        _ => {}
+    }
 }
 
 /// Collect the names assigned by a walrus (`:=`) anywhere in `e`, without
