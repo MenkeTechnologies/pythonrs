@@ -252,3 +252,29 @@ print(q, q.a, q.b, q._asdict(), Pair._fields)
         "stderr={stderr}"
     );
 }
+
+/// Deep recursion runs on the interpreter's large-stack thread and hits a
+/// catchable `RecursionError` (CPython's default limit) rather than aborting the
+/// process on a native stack overflow. Runs the real binary via the subprocess
+/// harness (recursion needs no stdlib bridge).
+#[test]
+fn deep_recursion_and_recursion_error() {
+    let src = "\
+def s(n):
+    return 0 if n == 0 else n + s(n - 1)
+print(s(500))
+def loop():
+    return loop()
+try:
+    loop()
+except RecursionError:
+    print('RecursionError')
+";
+    let (stdout, stderr, ok) = run_py(src);
+    assert!(ok, "recursion program failed: {stderr}");
+    assert!(
+        !stderr.contains("stack overflow") && !stderr.contains("panicked"),
+        "native crash instead of RecursionError: {stderr}"
+    );
+    assert_eq!(stdout, "125250\nRecursionError\n", "stderr={stderr}");
+}
