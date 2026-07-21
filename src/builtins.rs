@@ -4833,6 +4833,84 @@ fn property_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
     Ok(with_host(|h| h.alloc(PyObj::Property { fget, fset, fdel })))
 }
 
+/// Prefixes for `str.startswith`/`endswith`: a single str, or every str in a
+/// tuple. Mirrors CPython accepting `str | tuple[str, ...]`.
+fn str_prefixes(v: &Value) -> Result<Vec<String>, String> {
+    if let Some(s) = with_host(|h| h.as_str(v)) {
+        return Ok(vec![s]);
+    }
+    let items = host::iter_vec(v)?;
+    let mut out = Vec::with_capacity(items.len());
+    for it in items {
+        out.push(
+            with_host(|h| h.as_str(&it))
+                .ok_or_else(|| host::type_error("tuple for startswith must only contain str"))?,
+        );
+    }
+    Ok(out)
+}
+
+/// Whitespace split for `str.split(None, maxsplit)` / `rsplit`. Runs of Unicode
+/// whitespace (`char::is_whitespace`, matching the `split_whitespace` used
+/// elsewhere) separate fields; no empty fields; leading/trailing whitespace is
+/// dropped. On hitting `maxsplit` the remainder becomes one field (leading
+/// whitespace skipped for forward, trailing preserved; the mirror for reverse).
+fn split_ws_str(s: &str, maxsplit: i64, reverse: bool) -> Vec<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if reverse {
+        let mut rest = s;
+        let mut splits = 0;
+        loop {
+            let trimmed = rest.trim_end_matches(char::is_whitespace);
+            if trimmed.is_empty() {
+                break;
+            }
+            if maxsplit >= 0 && splits >= maxsplit {
+                parts.push(trimmed.to_string());
+                break;
+            }
+            match trimmed.rfind(char::is_whitespace) {
+                Some(idx) => {
+                    let after = idx + trimmed[idx..].chars().next().unwrap().len_utf8();
+                    parts.push(trimmed[after..].to_string());
+                    rest = &trimmed[..idx];
+                    splits += 1;
+                }
+                None => {
+                    parts.push(trimmed.to_string());
+                    break;
+                }
+            }
+        }
+        parts.reverse();
+    } else {
+        let mut rest = s;
+        let mut splits = 0;
+        loop {
+            let trimmed = rest.trim_start_matches(char::is_whitespace);
+            if trimmed.is_empty() {
+                break;
+            }
+            if maxsplit >= 0 && splits >= maxsplit {
+                parts.push(trimmed.to_string());
+                break;
+            }
+            match trimmed.find(char::is_whitespace) {
+                Some(idx) => {
+                    parts.push(trimmed[..idx].to_string());
+                    rest = &trimmed[idx..];
+                    splits += 1;
+                }
+                None => {
+                    parts.push(trimmed.to_string());
+                    break;
+                }
+            }
+        }
+    }
+    parts
+}
+
 fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
     let s = with_host(|h| h.as_str(recv)).unwrap_or_default();
     let sarg = |i: usize| with_host(|h| args.get(i).and_then(|v| h.as_str(v))).unwrap_or_default();
@@ -4879,27 +4957,37 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             }
             Ok(new_str(out))
         }
-        "split" => {
-            let parts: Vec<Value> = if args.is_empty() || matches!(args.first(), Some(Value::Undef))
-            {
-                s.split_whitespace()
-                    .map(|w| new_str(w.to_string()))
-                    .collect()
+        "split" | "rsplit" => {
+            let reverse = name == "rsplit";
+            let maxsplit = args
+                .get(1)
+                .and_then(|v| with_host(|h| h.as_int(v)))
+                .unwrap_or(-1);
+            let none_sep = args.is_empty() || matches!(args.first(), Some(Value::Undef));
+            let strs: Vec<String> = if none_sep {
+                split_ws_str(&s, maxsplit, reverse)
             } else {
                 let sep = sarg(0);
-                s.split(&sep).map(|p| new_str(p.to_string())).collect()
+                if sep.is_empty() {
+                    return Err("ValueError: empty separator".into());
+                }
+                let cap = if maxsplit >= 0 {
+                    (maxsplit as usize).saturating_add(1)
+                } else {
+                    usize::MAX
+                };
+                if reverse {
+                    let mut v: Vec<String> = s
+                        .rsplitn(cap, sep.as_str())
+                        .map(|p| p.to_string())
+                        .collect();
+                    v.reverse();
+                    v
+                } else {
+                    s.splitn(cap, sep.as_str()).map(|p| p.to_string()).collect()
+                }
             };
-            Ok(with_host(|h| h.new_list(parts)))
-        }
-        "rsplit" => {
-            let sep = sarg(0);
-            let parts: Vec<Value> = if sep.is_empty() {
-                s.split_whitespace()
-                    .map(|w| new_str(w.to_string()))
-                    .collect()
-            } else {
-                s.split(&sep).map(|p| new_str(p.to_string())).collect()
-            };
+            let parts: Vec<Value> = strs.into_iter().map(new_str).collect();
             Ok(with_host(|h| h.new_list(parts)))
         }
         "splitlines" => {
@@ -4927,29 +5015,44 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             };
             Ok(new_str(out))
         }
-        "startswith" => Ok(Value::Bool(s.starts_with(&sarg(0)))),
-        "endswith" => Ok(Value::Bool(s.ends_with(&sarg(0)))),
-        "find" => Ok(Value::Int(
-            s.find(&sarg(0))
-                .map(|b| s[..b].chars().count() as i64)
-                .unwrap_or(-1),
-        )),
-        "rfind" => Ok(Value::Int(
-            s.rfind(&sarg(0))
-                .map(|b| s[..b].chars().count() as i64)
-                .unwrap_or(-1),
-        )),
-        "index" => match s.find(&sarg(0)) {
-            Some(b) => Ok(Value::Int(s[..b].chars().count() as i64)),
-            None => Err("ValueError: substring not found".into()),
-        },
-        "count" => {
-            let sub = sarg(0);
-            if sub.is_empty() {
-                Ok(Value::Int(s.chars().count() as i64 + 1))
-            } else {
-                Ok(Value::Int(s.matches(&sub).count() as i64))
+        "startswith" | "endswith" => {
+            let chars: Vec<char> = s.chars().collect();
+            let (start, end) = resolve_start_end(chars.len(), args, 1);
+            let region: String = chars[start..end.min(chars.len())].iter().collect();
+            let prefixes = match args.first() {
+                Some(v) if !matches!(v, Value::Undef) => str_prefixes(v)?,
+                _ => return Err(host::type_error("startswith first arg must be str")),
+            };
+            let hit = prefixes.iter().any(|p| {
+                if name == "startswith" {
+                    region.starts_with(p.as_str())
+                } else {
+                    region.ends_with(p.as_str())
+                }
+            });
+            Ok(Value::Bool(hit))
+        }
+        "find" | "rfind" => {
+            let needle: Vec<char> = sarg(0).chars().collect();
+            let chars: Vec<char> = s.chars().collect();
+            let (start, end) = resolve_start_end(chars.len(), args, 1);
+            let p = slice_find(&chars, &needle, start, end, name == "rfind");
+            Ok(Value::Int(p.map(|x| x as i64).unwrap_or(-1)))
+        }
+        "index" | "rindex" => {
+            let needle: Vec<char> = sarg(0).chars().collect();
+            let chars: Vec<char> = s.chars().collect();
+            let (start, end) = resolve_start_end(chars.len(), args, 1);
+            match slice_find(&chars, &needle, start, end, name == "rindex") {
+                Some(p) => Ok(Value::Int(p as i64)),
+                None => Err("ValueError: substring not found".into()),
             }
+        }
+        "count" => {
+            let sub: Vec<char> = sarg(0).chars().collect();
+            let chars: Vec<char> = s.chars().collect();
+            let (start, end) = resolve_start_end(chars.len(), args, 1);
+            Ok(Value::Int(count_range(&chars, &sub, start, end) as i64))
         }
         "isdigit" => Ok(Value::Bool(
             !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()),
@@ -5002,10 +5105,6 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
                 s.strip_suffix(&p).map(|r| r.to_string()).unwrap_or(s),
             ))
         }
-        "rindex" => match s.rfind(&sarg(0)) {
-            Some(b) => Ok(Value::Int(s[..b].chars().count() as i64)),
-            None => Err("ValueError: substring not found".into()),
-        },
         "partition" => {
             let sep = sarg(0);
             let (a, b, c) = match s.find(&sep) {
@@ -6526,7 +6625,13 @@ fn resolve_start_end(len: usize, args: &[Value], from: usize) -> (usize, usize) 
 /// Search `hay[start..end]` for `needle`, returning an absolute index (or None).
 /// `reverse` finds the last match. An empty needle matches at `start` (forward)
 /// or `end` (reverse).
-fn bytes_find(hay: &[u8], needle: &[u8], start: usize, end: usize, reverse: bool) -> Option<usize> {
+fn slice_find<T: PartialEq>(
+    hay: &[T],
+    needle: &[T],
+    start: usize,
+    end: usize,
+    reverse: bool,
+) -> Option<usize> {
     let end = end.min(hay.len());
     if start > end {
         return None;
@@ -6553,7 +6658,7 @@ fn bytes_find(hay: &[u8], needle: &[u8], start: usize, end: usize, reverse: bool
 
 /// Non-overlapping count of `needle` in `hay[start..end]`. An empty needle
 /// counts every gap (`end - start + 1`).
-fn count_range(hay: &[u8], needle: &[u8], start: usize, end: usize) -> usize {
+fn count_range<T: PartialEq>(hay: &[T], needle: &[T], start: usize, end: usize) -> usize {
     let end = end.min(hay.len());
     if start > end {
         return 0;
@@ -6587,7 +6692,7 @@ fn split_on_sep(hay: &[u8], sep: &[u8], maxsplit: i64, reverse: bool) -> Vec<Vec
             if maxsplit >= 0 && splits >= maxsplit {
                 break;
             }
-            match bytes_find(hay, sep, 0, end, true) {
+            match slice_find(hay, sep, 0, end, true) {
                 Some(p) => {
                     parts.push(hay[p + sep.len()..end].to_vec());
                     end = p;
@@ -6605,7 +6710,7 @@ fn split_on_sep(hay: &[u8], sep: &[u8], maxsplit: i64, reverse: bool) -> Vec<Vec
             if maxsplit >= 0 && splits >= maxsplit {
                 break;
             }
-            match bytes_find(hay, sep, start, hay.len(), false) {
+            match slice_find(hay, sep, start, hay.len(), false) {
                 Some(p) => {
                     parts.push(hay[start..p].to_vec());
                     start = p + sep.len();
@@ -7130,13 +7235,13 @@ fn bytes_common_method(
         "find" | "rfind" => {
             let sub = find_needle()?;
             let (start, end) = resolve_start_end(bytes.len(), args, 1);
-            let p = bytes_find(&bytes, &sub, start, end, name == "rfind");
+            let p = slice_find(&bytes, &sub, start, end, name == "rfind");
             Ok(Value::Int(p.map(|x| x as i64).unwrap_or(-1)))
         }
         "index" | "rindex" => {
             let sub = find_needle()?;
             let (start, end) = resolve_start_end(bytes.len(), args, 1);
-            match bytes_find(&bytes, &sub, start, end, name == "rindex") {
+            match slice_find(&bytes, &sub, start, end, name == "rindex") {
                 Some(p) => Ok(Value::Int(p as i64)),
                 None => Err("ValueError: subsection not found".into()),
             }
@@ -7232,7 +7337,7 @@ fn bytes_common_method(
                 return Err("ValueError: empty separator".into());
             }
             let reverse = name == "rpartition";
-            let (head, mid, tail) = match bytes_find(&bytes, &sep, 0, bytes.len(), reverse) {
+            let (head, mid, tail) = match slice_find(&bytes, &sep, 0, bytes.len(), reverse) {
                 Some(p) => (
                     bytes[..p].to_vec(),
                     sep.clone(),
