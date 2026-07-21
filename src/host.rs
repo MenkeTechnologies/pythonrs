@@ -2054,6 +2054,15 @@ impl PyHost {
                             None if self.class_lookup(&class, "__eq__").is_some() => {
                                 return Err(type_error(&format!("unhashable type: '{class}'")))
                             }
+                            // A builtin-subclass instance that overrides neither
+                            // `__hash__` nor `__eq__` inherits the base type's
+                            // hash, so it keys by its payload — `U("a")` (with
+                            // `class U(str)`) keys and compares identically to
+                            // `"a"`. Only a payload-bearing subclass; a plain
+                            // `object` subclass keeps the identity hash below.
+                            None if !matches!(inst.payload, Value::Undef) => {
+                                return self.to_key(&inst.payload);
+                            }
                             // Default identity hash — no user code needed.
                             None => PKey::Instance {
                                 hash: id as i64,
