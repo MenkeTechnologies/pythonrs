@@ -699,7 +699,7 @@ pub struct PyHost {
     pub traceback: Vec<(String, u32)>,
 }
 
-/// Whether a [`GenCell`] backs a plain generator, an `async def` coroutine, or
+/// Whether a `GenCell` backs a plain generator, an `async def` coroutine, or
 /// an async generator (`async def` containing `yield`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum GenKind {
@@ -3683,10 +3683,10 @@ impl PyHost {
     }
 
     /// `bytes % args` / `bytearray % args` — PEP 461 percent formatting. Mirrors
-    /// [`str_format_percent`] but the template and result are raw bytes and the
+    /// `str_format_percent` but the template and result are raw bytes and the
     /// conversions follow bytes semantics: `%b`/`%s` take a bytes-like object,
     /// `%c` an int in `0..=256` or a length-1 bytes-like, `%a`/`%r` produce the
-    /// ASCII repr, and the numeric conversions reuse [`format_conv`]. `is_ba`
+    /// ASCII repr, and the numeric conversions reuse `format_conv`. `is_ba`
     /// selects a `bytearray` result to match the receiver.
     pub fn bytes_format_percent(
         &mut self,
