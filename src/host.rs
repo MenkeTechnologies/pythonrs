@@ -605,6 +605,10 @@ pub struct Frame {
     /// `UnboundLocalError`, not an LEGB fall-through. Empty for the module frame
     /// and class-body frames (whose reads stay dynamic, giving `NameError`).
     pub locals_set: HashSet<String>,
+    /// True for a class-body frame. A class scope is NOT an enclosing scope for
+    /// nested functions (methods, comprehensions), so a closure defined here
+    /// captures the class body's PARENT env, skipping the class namespace.
+    pub is_class_body: bool,
     pub self_obj: Option<Value>,
     pub owner: Option<String>,
     /// The scope name shown in a traceback frame (`<module>`, a function name, or
@@ -841,6 +845,7 @@ impl PyHost {
                 globals_decl: HashSet::new(),
                 nonlocals_decl: HashSet::new(),
                 locals_set: HashSet::new(),
+                is_class_body: false,
                 self_obj: None,
                 owner: None,
                 name: "<module>".to_string(),
@@ -6170,6 +6175,7 @@ pub fn run_user_func(
             globals_decl: HashSet::new(),
             nonlocals_decl: HashSet::new(),
             locals_set: def.locals.iter().cloned().collect(),
+            is_class_body: false,
             self_obj: self_val,
             owner,
             name: def.name.clone(),
@@ -6401,9 +6407,19 @@ fn too_many_positional(np: usize, ndef: usize, posgiven: usize, kwonly_given: us
 // ── more host operations referenced from builtins ────────────────────────────
 
 impl PyHost {
-    /// The current frame's environment, for a closure to capture.
+    /// The environment a closure defined in the current frame captures. A class
+    /// body is not a lexical scope for its methods (CPython): a function defined
+    /// there captures the class body's PARENT env, so `class C: x=1; def m(self):
+    /// return x` resolves `x` in the enclosing/module scope, not the class body.
+    /// The class namespace stays reachable only via `self`/`C`, never by name.
     pub fn current_env_capture(&self) -> Env {
-        self.frame().env.clone()
+        let f = self.frame();
+        if f.is_class_body {
+            if let Some(parent) = f.env.borrow().parent.clone() {
+                return parent;
+            }
+        }
+        f.env.clone()
     }
 
     /// Build the `"Class: message"` display string for an exception's args.
@@ -6509,6 +6525,7 @@ pub fn build_class(
             // A class body resolves names dynamically (LOAD_NAME), so an unbound
             // read is a `NameError`, not `UnboundLocalError` — leave this empty.
             locals_set: HashSet::new(),
+            is_class_body: true,
             self_obj: None,
             owner: Some(name.to_string()),
             name: name.to_string(),
@@ -6965,6 +6982,7 @@ fn make_gen_kind(
         globals_decl: HashSet::new(),
         nonlocals_decl: HashSet::new(),
         locals_set: locals.into_iter().collect(),
+        is_class_body: false,
         self_obj: self_val,
         owner: owner.clone(),
         name: owner.unwrap_or_else(|| "<genexpr>".to_string()),
