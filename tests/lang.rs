@@ -2706,3 +2706,39 @@ fn class_body_annotations() {
         "['x']"
     );
 }
+
+/// Native `copy.copy`/`copy.deepcopy` (routing through CPython would deep-copy by
+/// value, losing shallow sharing and instance identity). Shallow shares nested
+/// refs; deep is independent and preserves shared/cyclic references.
+#[test]
+fn copy_module_native() {
+    // Shallow copy shares the nested list.
+    assert_eq!(
+        g(
+            "import copy\na=[1,[2]]\nb=copy.copy(a)\na[1].append(3)\nx=(b[1], a[1] is b[1])",
+            "x"
+        ),
+        "([2, 3], True)"
+    );
+    // Deep copy is independent.
+    assert_eq!(
+        g(
+            "import copy\na=[1,[2]]\nb=copy.deepcopy(a)\na[1].append(3)\nx=b[1]",
+            "x"
+        ),
+        "[2]"
+    );
+    // Deepcopy preserves shared references (one copied object, referenced twice).
+    assert_eq!(
+        g(
+            "import copy\ns=[0]\ny=copy.deepcopy([s, s])\nx=y[0] is y[1]",
+            "x"
+        ),
+        "True"
+    );
+    // Deepcopy of an instance copies its attributes independently.
+    assert_eq!(
+        g("import copy\nclass N:\n    def __init__(s,v):\n        s.v=v\nn=N([1])\nm=copy.deepcopy(n)\nn.v.append(2)\nx=m.v", "x"),
+        "[1]"
+    );
+}

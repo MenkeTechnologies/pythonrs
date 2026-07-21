@@ -8738,6 +8738,14 @@ pub fn import_module(name: &str) -> Result<Value, String> {
     }
 
     let entries: Vec<(&str, Value)> = match name {
+        // `copy` is native (a CPython round-trip would deep-copy by value, losing
+        // shallow-copy sharing and instance identity).
+        "copy" => with_host(|h| {
+            vec![
+                ("copy", h.alloc(PyObj::Builtin("copy.copy".into()))),
+                ("deepcopy", h.alloc(PyObj::Builtin("copy.deepcopy".into()))),
+            ]
+        }),
         "math" => with_host(|h| {
             vec![
                 ("pi", Value::Float(std::f64::consts::PI)),
