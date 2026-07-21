@@ -148,8 +148,10 @@ fn kw_pairs(d: &Value) -> Vec<(String, Value)> {
 
 fn b_getlocal(vm: &mut VM, _: u8) -> Value {
     let name = sval(&vm.pop());
-    if let Some(v) = with_host(|h| h.read_name(&name)) {
-        return v;
+    match with_host(|h| h.read_name_checked(&name)) {
+        host::NameRead::Value(v) => return v,
+        host::NameRead::Unbound => return abort(vm, host::unbound_local_error(&name)),
+        host::NameRead::Missing => {}
     }
     if name == "NotImplemented" {
         return with_host(|h| h.alloc(PyObj::NotImplemented));

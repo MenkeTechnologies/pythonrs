@@ -202,6 +202,12 @@ pub struct FuncDef {
     pub kwonly_required: Vec<bool>,
     pub kwargs: Option<String>,
     pub chunk: Chunk,
+    /// Names that are *local* to this function scope: assigned somewhere in the
+    /// body (not declared `global`/`nonlocal`). Reading one before it is bound is
+    /// an `UnboundLocalError`, never an LEGB fall-through to an enclosing/global
+    /// binding — CPython decides this at compile time, so we carry the set here.
+    #[serde(default)]
+    pub locals: Vec<String>,
     /// True if the body contains a `yield` (a generator function).
     pub is_generator: bool,
     /// True for an `async def`: calling it builds a coroutine object (the body
@@ -594,6 +600,11 @@ pub struct Frame {
     /// Names declared `nonlocal` in this frame — writes target the nearest
     /// enclosing function scope that binds the name, not the local env.
     pub nonlocals_decl: HashSet<String>,
+    /// Names local to this function scope (see `FuncDef::locals`). A read of a
+    /// name in this set resolves ONLY in `env`; if absent it is an
+    /// `UnboundLocalError`, not an LEGB fall-through. Empty for the module frame
+    /// and class-body frames (whose reads stay dynamic, giving `NameError`).
+    pub locals_set: HashSet<String>,
     pub self_obj: Option<Value>,
     pub owner: Option<String>,
     /// The scope name shown in a traceback frame (`<module>`, a function name, or
@@ -829,6 +840,7 @@ impl PyHost {
                 env: module_env,
                 globals_decl: HashSet::new(),
                 nonlocals_decl: HashSet::new(),
+                locals_set: HashSet::new(),
                 self_obj: None,
                 owner: None,
                 name: "<module>".to_string(),
@@ -1208,6 +1220,28 @@ impl PyHost {
         self.globals.get(name).cloned()
     }
 
+    /// `UnboundLocalError`-aware read for a bare-name load. If `name` is a genuine
+    /// local of the current frame (in `locals_set`, not declared `global`/
+    /// `nonlocal`) it resolves ONLY in the current env: present → its value,
+    /// absent → [`NameRead::Unbound`] (an `UnboundLocalError`, never a fall-through
+    /// to an enclosing or global binding). Otherwise it is a normal LEGB read.
+    pub fn read_name_checked(&self, name: &str) -> NameRead {
+        let f = self.frame();
+        if f.locals_set.contains(name)
+            && !f.globals_decl.contains(name)
+            && !f.nonlocals_decl.contains(name)
+        {
+            return match self.cur_env().borrow().vars.get(name) {
+                Some(v) => NameRead::Value(v.clone()),
+                None => NameRead::Unbound,
+            };
+        }
+        match self.read_name(name) {
+            Some(v) => NameRead::Value(v),
+            None => NameRead::Missing,
+        }
+    }
+
     /// CPython's callable display for the `**`-merge duplicate-keyword error:
     /// a user function/lambda/class is module-qualified (`__main__.f`), while an
     /// unresolved name (i.e. a builtin like `dict`) stays bare.
@@ -1250,13 +1284,15 @@ impl PyHost {
                 return;
             }
         }
-        if self.frames.len() == 1 {
+        // Module scope is the only env with no parent. Test that, not
+        // `frames.len() == 1`: a generator/coroutine runs on an isolated
+        // single-frame stack, so the length test would wrongly route its locals
+        // to globals (invisible to an `UnboundLocalError`-aware local read).
+        let cur = self.cur_env();
+        if cur.borrow().parent.is_none() {
             self.globals.insert(name.to_string(), val);
         } else {
-            self.cur_env()
-                .borrow_mut()
-                .vars
-                .insert(name.to_string(), val);
+            cur.borrow_mut().vars.insert(name.to_string(), val);
         }
     }
 
@@ -1325,6 +1361,24 @@ impl PyHost {
 
 pub fn name_error(name: &str) -> String {
     format!("NameError: name '{name}' is not defined")
+}
+/// CPython's `UnboundLocalError` message (a `NameError` subclass), raised when a
+/// function reads a local name before it has been bound.
+pub fn unbound_local_error(name: &str) -> String {
+    format!(
+        "UnboundLocalError: cannot access local variable '{name}' where it is not associated with a value"
+    )
+}
+
+/// Outcome of an `UnboundLocalError`-aware bare-name read (see
+/// [`PyHost::read_name_checked`]).
+pub enum NameRead {
+    /// The name resolved to this value.
+    Value(Value),
+    /// A genuine local read before binding → `UnboundLocalError`.
+    Unbound,
+    /// Not found in any scope → the caller falls back to builtins / `NameError`.
+    Missing,
 }
 pub fn type_error(msg: &str) -> String {
     format!("TypeError: {msg}")
@@ -6086,6 +6140,7 @@ pub fn run_user_func(
                 self_val,
                 owner,
                 def.name.clone(),
+                def.locals.clone(),
             ));
         }
         return Ok(make_coroutine(
@@ -6094,6 +6149,7 @@ pub fn run_user_func(
             self_val,
             owner,
             def.name.clone(),
+            def.locals.clone(),
         ));
     }
     // Generator function: build a suspended coroutine over the already-bound
@@ -6105,6 +6161,7 @@ pub fn run_user_func(
             self_val,
             owner,
             def.name.clone(),
+            def.locals.clone(),
         ));
     }
     with_host(|h| {
@@ -6112,6 +6169,7 @@ pub fn run_user_func(
             env,
             globals_decl: HashSet::new(),
             nonlocals_decl: HashSet::new(),
+            locals_set: def.locals.iter().cloned().collect(),
             self_obj: self_val,
             owner,
             name: def.name.clone(),
@@ -6448,6 +6506,9 @@ pub fn build_class(
             env: env.clone(),
             globals_decl: HashSet::new(),
             nonlocals_decl: HashSet::new(),
+            // A class body resolves names dynamically (LOAD_NAME), so an unbound
+            // read is a `NameError`, not `UnboundLocalError` — leave this empty.
+            locals_set: HashSet::new(),
             self_obj: None,
             owner: Some(name.to_string()),
             name: name.to_string(),
@@ -6780,8 +6841,17 @@ fn make_generator(
     self_val: Option<Value>,
     owner: Option<String>,
     func_name: String,
+    locals: Vec<String>,
 ) -> Value {
-    make_gen_kind(chunk, env, self_val, owner, GenKind::Generator, func_name)
+    make_gen_kind(
+        chunk,
+        env,
+        self_val,
+        owner,
+        GenKind::Generator,
+        func_name,
+        locals,
+    )
 }
 
 /// Build a suspended `async def` coroutine object. Identical backing to a
@@ -6793,8 +6863,17 @@ pub fn make_coroutine(
     self_val: Option<Value>,
     owner: Option<String>,
     func_name: String,
+    locals: Vec<String>,
 ) -> Value {
-    make_gen_kind(chunk, env, self_val, owner, GenKind::Coroutine, func_name)
+    make_gen_kind(
+        chunk,
+        env,
+        self_val,
+        owner,
+        GenKind::Coroutine,
+        func_name,
+        locals,
+    )
 }
 
 /// Build a suspended async generator (`async def` containing `yield`). Its body
@@ -6806,8 +6885,17 @@ pub fn make_async_generator(
     self_val: Option<Value>,
     owner: Option<String>,
     func_name: String,
+    locals: Vec<String>,
 ) -> Value {
-    make_gen_kind(chunk, env, self_val, owner, GenKind::AsyncGen, func_name)
+    make_gen_kind(
+        chunk,
+        env,
+        self_val,
+        owner,
+        GenKind::AsyncGen,
+        func_name,
+        locals,
+    )
 }
 
 /// Whether `v` is an async generator object.
@@ -6870,11 +6958,13 @@ fn make_gen_kind(
     owner: Option<String>,
     kind: GenKind,
     func_name: String,
+    locals: Vec<String>,
 ) -> Value {
     let frame = Frame {
         env,
         globals_decl: HashSet::new(),
         nonlocals_decl: HashSet::new(),
+        locals_set: locals.into_iter().collect(),
         self_obj: self_val,
         owner: owner.clone(),
         name: owner.unwrap_or_else(|| "<genexpr>".to_string()),

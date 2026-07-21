@@ -57,7 +57,11 @@ use std::path::PathBuf;
 /// v18: `match` singleton value patterns (None/True/False) lower to an identity
 /// check (`IS`) instead of `NumEq`, matching PEP 634 (`0` no longer matches
 /// `case False`). Older bytecode used `NumEq` and would mismatch, so it must miss.
-const SCHEMA: u64 = 18;
+/// v19: `FuncDef` gained a `locals` set (names local to the scope) so a read of a
+/// function-local name before it is bound raises `UnboundLocalError` instead of
+/// falling through to an enclosing/global binding. Older bytecode lacks the field
+/// and would give the wrong error, so it must miss.
+const SCHEMA: u64 = 19;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]

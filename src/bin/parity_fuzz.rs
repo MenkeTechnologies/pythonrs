@@ -2684,6 +2684,167 @@ fn gen_closures(seed: u64) -> Vec<String> {
     }
 }
 
+/// Name resolution (LEGB), `global`/`nonlocal`, and closures — the scoping
+/// surface. Covers: local shadowing a global, reading a global / enclosing /
+/// builtin, `global` create+mutate, `nonlocal` counters and multi-level rebinds,
+/// late-binding vs default-arg closure capture, comprehension iteration vars not
+/// leaking while a walrus (`:=`) does, and the error cases surfaced under
+/// `--stderr`: `UnboundLocalError` (read-before-assign, aug-assign, conditional,
+/// `del`) and the `nonlocal` `SyntaxError`s (no binding / at module level). Every
+/// program prints resolved values or raises the matching error deterministically.
+fn gen_scoping(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let a = pick(r, POSINTS);
+    let b = pick(r, POSINTS);
+    let n = 2 + r.below(3); // 2..=4, so comprehension/walrus targets always bind
+    match r.below(18) {
+        // ── LEGB reads ────────────────────────────────────────────────────
+        // Local assignment shadows a module global; the global is untouched.
+        0 => vec![
+            format!("x = {a}"),
+            "def f():".into(),
+            format!("    x = {b}"),
+            "    return x".into(),
+            "print(f(), x)".into(),
+        ],
+        // A function reads a module global it never assigns (L miss → G hit).
+        1 => vec![
+            format!("x = {a}"),
+            "def f():".into(),
+            "    return x + 1".into(),
+            "print(f())".into(),
+        ],
+        // Enclosing (E) capture across one nesting level.
+        2 => vec![
+            "def outer():".into(),
+            format!("    z = {a}"),
+            "    def inner():".into(),
+            format!("        return z + {b}"),
+            "    return inner()".into(),
+            "print(outer())".into(),
+        ],
+        // Builtin (B) read from inside a function.
+        3 => vec![
+            "def f(v):".into(),
+            "    return len(v) + abs(-1)".into(),
+            format!("print(f([0] * {a}))"),
+        ],
+        // ── global ────────────────────────────────────────────────────────
+        // `global` mutate of an existing module name.
+        4 => vec![
+            format!("c = {a}"),
+            "def f():".into(),
+            "    global c".into(),
+            format!("    c += {b}"),
+            "f()".into(),
+            "print(c)".into(),
+        ],
+        // `global` for a name that does not exist yet (created in globals).
+        5 => vec![
+            "def f():".into(),
+            "    global made".into(),
+            format!("    made = {a}"),
+            "f()".into(),
+            "print(made)".into(),
+        ],
+        // ── nonlocal ──────────────────────────────────────────────────────
+        // A closure counter sharing one cell via `nonlocal`.
+        6 => vec![
+            "def make():".into(),
+            format!("    n = {a}"),
+            "    def inc():".into(),
+            "        nonlocal n".into(),
+            "        n += 1".into(),
+            "        return n".into(),
+            "    return inc".into(),
+            "c = make()".into(),
+            "print(c(), c(), c())".into(),
+        ],
+        // `nonlocal` rebinding two levels up.
+        7 => vec![
+            "def a():".into(),
+            format!("    x = {a}"),
+            "    def b():".into(),
+            "        def c():".into(),
+            "            nonlocal x".into(),
+            format!("            x = {b}"),
+            "        c()".into(),
+            "    b()".into(),
+            "    return x".into(),
+            "print(a())".into(),
+        ],
+        // ── closures: capture timing ──────────────────────────────────────
+        // Late binding: every lambda sees the final loop value.
+        8 => vec![
+            format!("fs = [lambda: i for i in range({n})]"),
+            "print([f() for f in fs])".into(),
+        ],
+        // Default-arg early binding: each lambda keeps its own value.
+        9 => vec![
+            format!("fs = [lambda i=i: i for i in range({n})]"),
+            "print([f() for f in fs])".into(),
+        ],
+        // ── comprehension scope ───────────────────────────────────────────
+        // The iteration variable does not leak to the enclosing scope.
+        10 => vec![
+            format!("[i for i in range({n})]"),
+            "try:".into(),
+            "    print(i)".into(),
+            "except NameError:".into(),
+            "    print('unbound')".into(),
+        ],
+        // A walrus (`:=`) in a comprehension leaks to the enclosing function.
+        11 => vec![
+            "def f():".into(),
+            format!("    r = [(y := v) for v in range({n})]"),
+            "    return (r, y)".into(),
+            "print(f())".into(),
+        ],
+        // ── UnboundLocalError (compare under --stderr) ────────────────────
+        // Read a name before the assignment that makes it local.
+        12 => vec![
+            format!("x = {a}"),
+            "def f():".into(),
+            "    print(x)".into(),
+            format!("    x = {b}"),
+            "f()".into(),
+        ],
+        // Aug-assign of a never-bound local.
+        13 => vec![
+            "def f():".into(),
+            format!("    x += {a}"),
+            "f()".into(),
+        ],
+        // A name bound only on an untaken branch is still local (→ unbound).
+        14 => vec![
+            "def f(c):".into(),
+            format!("    if c: y = {a}"),
+            "    return y".into(),
+            "print(f(0))".into(),
+        ],
+        // `del` of a local then a read of it.
+        15 => vec![
+            "def f():".into(),
+            format!("    x = {a}"),
+            "    del x".into(),
+            "    return x".into(),
+            "f()".into(),
+        ],
+        // ── nonlocal SyntaxError (compare under --stderr) ─────────────────
+        // No enclosing binding for the `nonlocal` name.
+        16 => vec![
+            "def f():".into(),
+            "    def g():".into(),
+            "        nonlocal q".into(),
+            format!("        q = {a}"),
+            "    g()".into(),
+            "f()".into(),
+        ],
+        // `nonlocal` at module level.
+        _ => vec!["nonlocal z".into()],
+    }
+}
+
 /// Function parameters & calling conventions: `*args`/`**kwargs` collection,
 /// positional-only (`/`) and keyword-only (`*`) params, defaults (incl. the
 /// shared-mutable-default gotcha), call-site unpacking (`f(*it)`, `f(**map)`,
@@ -4184,6 +4345,7 @@ enum Mode {
     Metatype,
     Seqtail,
     Display,
+    Scoping,
 }
 
 const REAL_MODES: &[Mode] = &[
@@ -4237,6 +4399,7 @@ const REAL_MODES: &[Mode] = &[
     Mode::Metatype,
     Mode::Seqtail,
     Mode::Display,
+    Mode::Scoping,
 ];
 
 /// Generate the statement list for a seed in the selected mode. `Mixed` rotates
@@ -4297,6 +4460,7 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Metatype => gen_metatype(seed),
         Mode::Seqtail => gen_seqtail(seed),
         Mode::Display => gen_display(seed),
+        Mode::Scoping => gen_scoping(seed),
     }
 }
 
@@ -4353,6 +4517,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Metatype => "metatype",
         Mode::Seqtail => "seqtail",
         Mode::Display => "display",
+        Mode::Scoping => "scoping",
     }
 }
 
@@ -4409,6 +4574,7 @@ fn mode_from_name(s: &str) -> Option<Mode> {
         Mode::Metatype,
         Mode::Seqtail,
         Mode::Display,
+        Mode::Scoping,
     ];
     ALL.iter().copied().find(|&m| mode_name(m) == s)
 }
