@@ -2966,6 +2966,10 @@ pub fn call_builtin_function(
     if let Some(m) = name.strip_prefix("math.") {
         return call_math(m, &args);
     }
+    // copy.copy / copy.deepcopy (native — see call_copy).
+    if let Some(f) = name.strip_prefix("copy.") {
+        return call_copy(f, &args);
+    }
     // sys.* module functions.
     if let Some(f) = name.strip_prefix("sys.") {
         return call_sys(f, args);
@@ -4550,6 +4554,219 @@ fn num_f(v: Value) -> Option<f64> {
         Value::Float(f) => Some(f),
         Value::Bool(b) => Some(if b { 1.0 } else { 0.0 }),
         _ => None,
+    }
+}
+
+/// `copy.copy` / `copy.deepcopy` — implemented natively because routing them
+/// through the CPython `copy` module marshals the object by value (a deep copy),
+/// which loses `copy.copy`'s shared references and can't reconstruct a pythonrs
+/// instance from its CPython proxy.
+pub fn call_copy(name: &str, args: &[Value]) -> Result<Value, String> {
+    let v = arg0(args)?;
+    match name {
+        "copy" => copy_shallow(&v),
+        "deepcopy" => {
+            let mut memo = std::collections::HashMap::new();
+            copy_deep(&v, &mut memo)
+        }
+        _ => Err(host::type_error(&format!(
+            "module 'copy' has no attribute '{name}'"
+        ))),
+    }
+}
+
+/// A shallow copy: a fresh mutable container/instance sharing the element or
+/// attribute references; an immutable value is returned unchanged.
+fn copy_shallow(v: &Value) -> Result<Value, String> {
+    enum K {
+        List(Vec<Value>),
+        Dict(IndexMap<PKey, (Value, Value)>, Option<host::DictMeta>),
+        Set(IndexMap<PKey, Value>),
+        Bytearray(Vec<u8>),
+        Instance(Instance),
+        Same,
+    }
+    let k = with_host(|h| match h.get(v) {
+        Some(PyObj::List(l)) => K::List(l.clone()),
+        Some(PyObj::Dict(d)) => {
+            let meta = match v {
+                Value::Obj(i) => h.dict_meta.get(i).cloned(),
+                _ => None,
+            };
+            K::Dict(d.clone(), meta)
+        }
+        Some(PyObj::Set(s)) => K::Set(s.clone()),
+        Some(PyObj::Bytearray(b)) => K::Bytearray(b.clone()),
+        Some(PyObj::Instance(inst)) => K::Instance(inst.clone()),
+        _ => K::Same,
+    });
+    Ok(with_host(|h| match k {
+        K::List(l) => h.new_list(l),
+        K::Dict(d, meta) => {
+            let nd = h.new_dict(d);
+            if let (Some(meta), Value::Obj(i)) = (meta, &nd) {
+                h.dict_meta.insert(*i, meta);
+            }
+            nd
+        }
+        K::Set(s) => h.new_set(s),
+        K::Bytearray(b) => h.alloc(PyObj::Bytearray(b)),
+        K::Instance(inst) => {
+            let pairs = match h.get(&inst.dict) {
+                Some(PyObj::Dict(d)) => d.clone(),
+                _ => IndexMap::new(),
+            };
+            let dict = h.alloc(PyObj::Dict(pairs));
+            h.alloc(PyObj::Instance(Instance {
+                class: inst.class,
+                dict,
+                payload: inst.payload,
+            }))
+        }
+        K::Same => v.clone(),
+    }))
+}
+
+/// A deep, recursive copy. New containers are registered in `memo` (keyed by heap
+/// id) before their children are copied, so shared and cyclic references are
+/// preserved exactly as CPython's `deepcopy` does.
+fn copy_deep(v: &Value, memo: &mut std::collections::HashMap<u32, Value>) -> Result<Value, String> {
+    if let Value::Obj(i) = v {
+        if let Some(c) = memo.get(i) {
+            return Ok(c.clone());
+        }
+    }
+    enum K {
+        List(Vec<Value>),
+        Tuple(Vec<Value>),
+        Dict(Vec<(Value, Value)>, Option<host::DictMeta>),
+        Set(Vec<Value>),
+        Bytearray(Vec<u8>),
+        Instance(String, Vec<(Value, Value)>, Value),
+        Same,
+    }
+    let k = with_host(|h| match h.get(v) {
+        Some(PyObj::List(l)) => K::List(l.clone()),
+        Some(PyObj::Tuple(l)) => K::Tuple(l.clone()),
+        Some(PyObj::Dict(d)) => {
+            let meta = match v {
+                Value::Obj(i) => h.dict_meta.get(i).cloned(),
+                _ => None,
+            };
+            K::Dict(d.values().cloned().collect(), meta)
+        }
+        Some(PyObj::Set(s)) => K::Set(s.values().cloned().collect()),
+        Some(PyObj::Bytearray(b)) => K::Bytearray(b.clone()),
+        Some(PyObj::Instance(inst)) => {
+            let pairs = match h.get(&inst.dict) {
+                Some(PyObj::Dict(d)) => d.values().cloned().collect(),
+                _ => Vec::new(),
+            };
+            K::Instance(inst.class.clone(), pairs, inst.payload.clone())
+        }
+        _ => K::Same,
+    });
+    let id = if let Value::Obj(i) = v {
+        Some(*i)
+    } else {
+        None
+    };
+    match k {
+        K::List(items) => {
+            let out = with_host(|h| h.new_list(Vec::new()));
+            if let Some(i) = id {
+                memo.insert(i, out.clone());
+            }
+            let mut copied = Vec::with_capacity(items.len());
+            for it in &items {
+                copied.push(copy_deep(it, memo)?);
+            }
+            with_host(|h| {
+                if let Some(PyObj::List(l)) = h.get_mut(&out) {
+                    *l = copied;
+                }
+            });
+            Ok(out)
+        }
+        K::Tuple(items) => {
+            let mut copied = Vec::with_capacity(items.len());
+            for it in &items {
+                copied.push(copy_deep(it, memo)?);
+            }
+            let out = with_host(|h| h.new_tuple(copied));
+            if let Some(i) = id {
+                memo.insert(i, out.clone());
+            }
+            Ok(out)
+        }
+        K::Dict(pairs, meta) => {
+            let out = with_host(|h| h.new_dict(IndexMap::new()));
+            if let Some(i) = id {
+                memo.insert(i, out.clone());
+            }
+            let mut nd: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+            for (k, val) in &pairs {
+                let ck = copy_deep(k, memo)?;
+                let cv = copy_deep(val, memo)?;
+                let key = with_host(|h| h.to_key(&ck))?;
+                nd.insert(key, (ck, cv));
+            }
+            with_host(|h| {
+                if let Some(PyObj::Dict(d)) = h.get_mut(&out) {
+                    *d = nd;
+                }
+                if let (Some(meta), Value::Obj(i)) = (meta, &out) {
+                    h.dict_meta.insert(*i, meta);
+                }
+            });
+            Ok(out)
+        }
+        K::Set(items) => {
+            let mut copied: IndexMap<PKey, Value> = IndexMap::new();
+            for it in &items {
+                let ci = copy_deep(it, memo)?;
+                let key = with_host(|h| h.to_key(&ci))?;
+                copied.insert(key, ci);
+            }
+            let out = with_host(|h| h.new_set(copied));
+            if let Some(i) = id {
+                memo.insert(i, out.clone());
+            }
+            Ok(out)
+        }
+        K::Bytearray(b) => {
+            let out = with_host(|h| h.alloc(PyObj::Bytearray(b)));
+            if let Some(i) = id {
+                memo.insert(i, out.clone());
+            }
+            Ok(out)
+        }
+        K::Instance(class, pairs, payload) => {
+            let dict = with_host(|h| h.alloc(PyObj::Dict(IndexMap::new())));
+            let out = with_host(|h| {
+                h.alloc(PyObj::Instance(Instance {
+                    class,
+                    dict: dict.clone(),
+                    payload,
+                }))
+            });
+            if let Some(i) = id {
+                memo.insert(i, out.clone());
+            }
+            let mut nd: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+            for (k, val) in &pairs {
+                let cv = copy_deep(val, memo)?;
+                let key = with_host(|h| h.to_key(k))?;
+                nd.insert(key, (k.clone(), cv));
+            }
+            with_host(|h| {
+                if let Some(PyObj::Dict(d)) = h.get_mut(&dict) {
+                    *d = nd;
+                }
+            });
+            Ok(out)
+        }
+        K::Same => Ok(v.clone()),
     }
 }
 
