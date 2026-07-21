@@ -2498,6 +2498,7 @@ fn is_builtin_type(name: &str) -> bool {
             | "frozenset"
             | "bytes"
             | "bytearray"
+            | "memoryview"
             | "complex"
             | "object"
             | "type"
@@ -3381,6 +3382,42 @@ pub fn call_builtin_function(
             let b = build_bytes(&args)?;
             Ok(with_host(|h| h.alloc(PyObj::Bytearray(b))))
         }
+        "memoryview" => {
+            let v = arg0(&args)?;
+            with_host(|h| {
+                let (len, readonly) = match h.get(&v) {
+                    Some(PyObj::Bytes(b)) => (b.len(), true),
+                    Some(PyObj::Bytearray(b)) => (b.len(), false),
+                    // A memoryview of a memoryview shares the same window.
+                    Some(PyObj::Memoryview {
+                        obj,
+                        start,
+                        len,
+                        readonly,
+                    }) => {
+                        let (obj, start, len, readonly) = (obj.clone(), *start, *len, *readonly);
+                        return Ok(h.alloc(PyObj::Memoryview {
+                            obj,
+                            start,
+                            len,
+                            readonly,
+                        }));
+                    }
+                    _ => {
+                        return Err(host::type_error(&format!(
+                            "memoryview: a bytes-like object is required, not '{}'",
+                            h.type_name(&v)
+                        )))
+                    }
+                };
+                Ok(h.alloc(PyObj::Memoryview {
+                    obj: v.clone(),
+                    start: 0,
+                    len,
+                    readonly,
+                }))
+            })
+        }
         "open" => {
             let file = kw_get(&kwargs, "file")
                 .or_else(|| args.first().cloned())
@@ -3479,6 +3516,7 @@ pub fn py_len(v: &Value) -> Result<usize, String> {
     with_host(|h| match h.get(v) {
         Some(PyObj::Str(s)) => Ok(s.chars().count()),
         Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) => Ok(b.len()),
+        Some(PyObj::Memoryview { len, .. }) => Ok(*len),
         Some(PyObj::Deque { items, .. }) => Ok(items.len()),
         Some(PyObj::List(l)) | Some(PyObj::Tuple(l)) => Ok(l.len()),
         Some(PyObj::Dict(d)) => Ok(d.len()),
@@ -4359,6 +4397,7 @@ pub fn type_has_method(typename: &str, name: &str) -> bool {
         "str" => STR_METHODS,
         "bytes" => BYTES_METHODS,
         "bytearray" => BYTEARRAY_METHODS,
+        "memoryview" => MEMORYVIEW_METHODS,
         "list" => LIST_METHODS,
         "dict" => DICT_METHODS,
         "OrderedDict" => return DICT_METHODS.contains(&name) || name == "move_to_end",
@@ -4376,8 +4415,8 @@ pub fn type_has_method(typename: &str, name: &str) -> bool {
         "slice" => &["indices"],
         "deque" => DEQUE_METHODS,
         "TextIOWrapper" => FILE_METHODS,
-        "int" | "bool" => INT_METHODS,
-        "float" => FLOAT_METHODS,
+        "int" | "bool" => return INT_METHODS.contains(&name) || INT_DUNDERS.contains(&name),
+        "float" => return FLOAT_METHODS.contains(&name) || FLOAT_DUNDERS.contains(&name),
         "complex" => COMPLEX_METHODS,
         "property" => PROPERTY_METHODS,
         "generator" => GENERATOR_METHODS,
@@ -4533,6 +4572,7 @@ const BYTEARRAY_METHODS: &[&str] = &[
     "istitle",
     "isascii",
 ];
+const MEMORYVIEW_METHODS: &[&str] = &["tobytes", "hex", "tolist", "release"];
 const DEQUE_METHODS: &[&str] = &[
     "append",
     "appendleft",
@@ -4656,6 +4696,106 @@ const INT_METHODS: &[&str] = &[
 const FLOAT_METHODS: &[&str] = &["is_integer", "as_integer_ratio", "hex", "conjugate"];
 const COMPLEX_METHODS: &[&str] = &["conjugate"];
 
+/// The numeric dunder methods `int`/`bool` expose as bound methods
+/// (`(5).__add__(2)`, `(-3).__abs__()`, `(7).__floordiv__(2)`). Includes the
+/// integer-only bitwise / shift / `__index__` / `__invert__` surface.
+const INT_DUNDERS: &[&str] = &[
+    "__add__",
+    "__radd__",
+    "__sub__",
+    "__rsub__",
+    "__mul__",
+    "__rmul__",
+    "__truediv__",
+    "__rtruediv__",
+    "__floordiv__",
+    "__rfloordiv__",
+    "__mod__",
+    "__rmod__",
+    "__pow__",
+    "__rpow__",
+    "__divmod__",
+    "__rdivmod__",
+    "__and__",
+    "__rand__",
+    "__or__",
+    "__ror__",
+    "__xor__",
+    "__rxor__",
+    "__lshift__",
+    "__rlshift__",
+    "__rshift__",
+    "__rrshift__",
+    "__neg__",
+    "__pos__",
+    "__abs__",
+    "__invert__",
+    "__eq__",
+    "__ne__",
+    "__lt__",
+    "__le__",
+    "__gt__",
+    "__ge__",
+    "__index__",
+    "__int__",
+    "__float__",
+    "__trunc__",
+    "__floor__",
+    "__ceil__",
+    "__round__",
+    "__bool__",
+    "__repr__",
+    "__str__",
+    "__hash__",
+];
+/// The numeric dunder methods `float` exposes (no bitwise / shift / `__index__`
+/// / `__invert__` — `float` has none of those in CPython).
+const FLOAT_DUNDERS: &[&str] = &[
+    "__add__",
+    "__radd__",
+    "__sub__",
+    "__rsub__",
+    "__mul__",
+    "__rmul__",
+    "__truediv__",
+    "__rtruediv__",
+    "__floordiv__",
+    "__rfloordiv__",
+    "__mod__",
+    "__rmod__",
+    "__pow__",
+    "__rpow__",
+    "__divmod__",
+    "__rdivmod__",
+    "__neg__",
+    "__pos__",
+    "__abs__",
+    "__eq__",
+    "__ne__",
+    "__lt__",
+    "__le__",
+    "__gt__",
+    "__ge__",
+    "__int__",
+    "__float__",
+    "__trunc__",
+    "__floor__",
+    "__ceil__",
+    "__round__",
+    "__bool__",
+    "__repr__",
+    "__str__",
+    "__hash__",
+];
+
+/// Is `name` a numeric dunder pythonrs exposes for base type `tn`?
+fn is_num_dunder(tn: &str, name: &str) -> bool {
+    match tn {
+        "float" => FLOAT_DUNDERS.contains(&name),
+        _ => INT_DUNDERS.contains(&name), // int, bool
+    }
+}
+
 /// Dispatch a method call on a builtin-typed receiver.
 pub fn call_type_method(
     recv: &Value,
@@ -4710,6 +4850,7 @@ pub fn call_type_method(
         }
         "bytes" => bytes_method(recv, name, &args),
         "bytearray" => bytearray_method(recv, name, &args),
+        "memoryview" => memoryview_method(recv, name, &args),
         "list" => list_method(recv, name, &args, &kwargs),
         "dict" => dict_method(recv, name, &args, &kwargs),
         "Counter" | "defaultdict" | "OrderedDict" => {
@@ -4725,6 +4866,7 @@ pub fn call_type_method(
         "deque" => deque_method(recv, name, &args),
         "TextIOWrapper" => file_method(recv, name, &args),
         "functools._lru_cache_wrapper" => lru_wrapper_method(recv, name),
+        "int" | "float" | "bool" if is_num_dunder(&tn, name) => num_dunder(recv, name, &args),
         "int" | "float" | "bool" => num_method(recv, name, &args, &kwargs),
         "complex" => complex_method(recv, name),
         "property" => property_method(recv, name, &args),
@@ -6628,6 +6770,192 @@ fn tuple_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, Strin
     }
 }
 
+/// Is `v` an `int`-like value (`int`, `bool`, or a bignum `int`)?
+fn is_int_like(v: &Value) -> bool {
+    matches!(v, Value::Int(_) | Value::Bool(_))
+        || with_host(|h| matches!(h.get(v), Some(PyObj::BigInt(_))))
+}
+/// Is `v` a numeric value `float` arithmetic accepts (`int`-like or `float`)?
+fn is_num_like(v: &Value) -> bool {
+    is_int_like(v) || matches!(v, Value::Float(_))
+}
+/// The `int` value of a numeric receiver: a `bool` normalizes to `0`/`1`
+/// (`True.__index__()` is `1`, not `True`); everything else is unchanged.
+fn to_int_value(recv: &Value) -> Value {
+    match recv {
+        Value::Bool(b) => Value::Int(*b as i64),
+        other => other.clone(),
+    }
+}
+
+/// Dispatch a numeric dunder method exposed as a bound method on `int`/`float`/
+/// `bool` (`(5).__add__(2)`, `(-3).__abs__()`, `(2.0).__round__()`). Binary
+/// dunders return the `NotImplemented` singleton for operand types the base
+/// type declines — `int` combines only with `int`-likes, `float` with any
+/// number — mirroring CPython, and delegate the actual computation to the same
+/// host arithmetic the operators use. The caller guarantees `name` is a dunder
+/// valid for the receiver's type (via [`is_num_dunder`]).
+fn num_dunder(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    use host::binop as bo;
+    let recv_float = matches!(recv, Value::Float(_));
+    let ni = || Ok(with_host(|h| h.alloc(PyObj::NotImplemented)));
+    let b = args.first().cloned().unwrap_or(Value::Undef);
+    // Operand acceptable for a binary dunder on this receiver type?
+    let accepts = |v: &Value| {
+        if recv_float {
+            is_num_like(v)
+        } else {
+            is_int_like(v)
+        }
+    };
+
+    match name {
+        // --- unary / conversion (operand ignored) ---
+        "__abs__" => call_builtin_function("abs", vec![recv.clone()], vec![]),
+        // Unary minus as `0 - self` keeps the receiver's type (int→int, float→float).
+        "__neg__" => with_host(|h| h.arith(NumOp::Sub, &Value::Int(0), recv)),
+        "__pos__" => Ok(to_int_value(recv)),
+        // `~x == -(x + 1)`; integers only (float has no `__invert__`).
+        "__invert__" => {
+            let x = with_host(|h| h.big_val(recv)).unwrap_or_default();
+            Ok(with_host(|h| {
+                h.norm_big(-(x + num_bigint::BigInt::from(1)))
+            }))
+        }
+        "__index__" => Ok(to_int_value(recv)),
+        // `int(...)` truncates a float toward zero and normalizes bool→int.
+        "__int__" | "__trunc__" => call_builtin_function("int", vec![recv.clone()], vec![]),
+        "__float__" => call_builtin_function("float", vec![recv.clone()], vec![]),
+        "__floor__" => match recv {
+            Value::Float(f) => call_builtin_function("math.floor", vec![Value::Float(*f)], vec![]),
+            _ => Ok(to_int_value(recv)),
+        },
+        "__ceil__" => match recv {
+            Value::Float(f) => call_builtin_function("math.ceil", vec![Value::Float(*f)], vec![]),
+            _ => Ok(to_int_value(recv)),
+        },
+        "__round__" => {
+            let mut a = vec![recv.clone()];
+            if let Some(nd) = args.first() {
+                if !matches!(nd, Value::Undef) {
+                    a.push(nd.clone());
+                }
+            }
+            call_builtin_function("round", a, vec![])
+        }
+        "__bool__" => Ok(Value::Bool(with_host(|h| h.truthy(recv)))),
+        "__repr__" => Ok(with_host(|h| {
+            let s = h.repr_of(recv);
+            h.new_str(s)
+        })),
+        "__str__" => Ok(with_host(|h| {
+            let s = h.str_of(recv);
+            h.new_str(s)
+        })),
+        "__hash__" => {
+            let k = with_host(|h| h.to_key(recv))?;
+            Ok(Value::Int(hash_key(&k)))
+        }
+
+        // --- comparison (declined operand → NotImplemented) ---
+        "__eq__" | "__ne__" => {
+            if !accepts(&b) {
+                return ni();
+            }
+            let eq = with_host(|h| h.equal(recv, &b));
+            Ok(Value::Bool(if name == "__eq__" { eq } else { !eq }))
+        }
+        "__lt__" | "__le__" | "__gt__" | "__ge__" => {
+            if !accepts(&b) {
+                return ni();
+            }
+            let op = match name {
+                "__lt__" => NumOp::Lt,
+                "__le__" => NumOp::Le,
+                "__gt__" => NumOp::Gt,
+                _ => NumOp::Ge,
+            };
+            with_host(|h| h.compare(op, recv, &b))
+        }
+
+        // --- forward binary arithmetic (self OP other) ---
+        "__add__" | "__sub__" | "__mul__" => {
+            if !accepts(&b) {
+                return ni();
+            }
+            let op = match name {
+                "__add__" => NumOp::Add,
+                "__sub__" => NumOp::Sub,
+                _ => NumOp::Mul,
+            };
+            with_host(|h| h.arith(op, recv, &b))
+        }
+        "__truediv__" | "__floordiv__" | "__mod__" | "__pow__" | "__and__" | "__or__"
+        | "__xor__" | "__lshift__" | "__rshift__" => {
+            if !accepts(&b) {
+                return ni();
+            }
+            with_host(|h| h.binop(binop_dunder_tag(name), recv, &b))
+        }
+        "__divmod__" => {
+            if !accepts(&b) {
+                return ni();
+            }
+            let q = with_host(|h| h.binop(bo::FLOORDIV, recv, &b))?;
+            let r = with_host(|h| h.binop(bo::MOD, recv, &b))?;
+            Ok(with_host(|h| h.new_tuple(vec![q, r])))
+        }
+
+        // --- reflected binary arithmetic (other OP self) ---
+        "__radd__" | "__rsub__" | "__rmul__" => {
+            if !accepts(&b) {
+                return ni();
+            }
+            let op = match name {
+                "__radd__" => NumOp::Add,
+                "__rsub__" => NumOp::Sub,
+                _ => NumOp::Mul,
+            };
+            with_host(|h| h.arith(op, &b, recv))
+        }
+        "__rtruediv__" | "__rfloordiv__" | "__rmod__" | "__rpow__" | "__rand__" | "__ror__"
+        | "__rxor__" | "__rlshift__" | "__rrshift__" => {
+            if !accepts(&b) {
+                return ni();
+            }
+            // Reflected name `__rNAME__` → forward `__NAME__` (drop the `r`).
+            let fwd = format!("__{}", &name[3..]);
+            with_host(|h| h.binop(binop_dunder_tag(&fwd), &b, recv))
+        }
+        "__rdivmod__" => {
+            if !accepts(&b) {
+                return ni();
+            }
+            let q = with_host(|h| h.binop(bo::FLOORDIV, &b, recv))?;
+            let r = with_host(|h| h.binop(bo::MOD, &b, recv))?;
+            Ok(with_host(|h| h.new_tuple(vec![q, r])))
+        }
+        _ => Err(format!("AttributeError: object has no attribute '{name}'")),
+    }
+}
+
+/// The `host::binop` tag for a forward binary numeric dunder name.
+fn binop_dunder_tag(name: &str) -> i64 {
+    use host::binop as bo;
+    match name {
+        "__truediv__" => bo::DIV,
+        "__floordiv__" => bo::FLOORDIV,
+        "__mod__" => bo::MOD,
+        "__pow__" => bo::POW,
+        "__and__" => bo::BITAND,
+        "__or__" => bo::BITOR,
+        "__xor__" => bo::BITXOR,
+        "__lshift__" => bo::SHL,
+        "__rshift__" => bo::SHR,
+        _ => bo::DIV,
+    }
+}
+
 fn num_method(
     recv: &Value,
     name: &str,
@@ -7004,6 +7332,7 @@ fn arg_bytes_like(v: &Value) -> Option<Vec<u8>> {
 fn as_bytes_object(v: &Value) -> Option<Vec<u8>> {
     with_host(|h| match h.get(v) {
         Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) => Some(b.clone()),
+        Some(PyObj::Memoryview { .. }) => Some(h.mv_bytes(v)),
         _ => None,
     })
 }
@@ -7539,6 +7868,28 @@ fn utf8_decode_errors(bytes: &[u8], errors: &str) -> Result<String, String> {
 
 fn bytes_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
     bytes_common_method(recv, false, name, args)
+}
+
+/// `memoryview` methods over the view's live bytes (`m.tobytes()`, `m.hex()`,
+/// `m.tolist()`). `hex` reuses the `bytes` implementation (so `sep` /
+/// `bytes_per_sep` work); `release` is a no-op in this owned-heap model.
+fn memoryview_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    let bytes = with_host(|h| h.mv_bytes(recv));
+    match name {
+        "tobytes" => Ok(with_host(|h| h.alloc(PyObj::Bytes(bytes)))),
+        "tolist" => Ok(with_host(|h| {
+            let items = bytes.iter().map(|&b| Value::Int(b as i64)).collect();
+            h.new_list(items)
+        })),
+        "hex" => {
+            let tmp = with_host(|h| h.alloc(PyObj::Bytes(bytes)));
+            bytes_method(&tmp, "hex", args)
+        }
+        "release" => Ok(Value::Undef),
+        _ => Err(format!(
+            "AttributeError: 'memoryview' object has no attribute '{name}'"
+        )),
+    }
 }
 
 fn bytearray_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {

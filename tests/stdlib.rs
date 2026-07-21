@@ -590,3 +590,92 @@ fn ffi_foreign_operator_dispatch() {
         "Decimal('5')"
     );
 }
+
+#[test]
+fn memoryview_over_bytes() {
+    // Construction, len, indexing (incl. negative), and the read-only flag.
+    assert_eq!(g("m = memoryview(b'abcde')\nx = len(m)", "x"), "5");
+    assert_eq!(g("x = memoryview(b'abcde')[0]", "x"), "97");
+    assert_eq!(g("x = memoryview(b'abcde')[-1]", "x"), "101");
+    assert_eq!(g("x = memoryview(b'abcde').readonly", "x"), "True");
+    // tobytes / hex / tolist over the whole view.
+    assert_eq!(g("x = memoryview(b'abcde').tobytes()", "x"), "b'abcde'");
+    assert_eq!(g("x = memoryview(b'abcde').hex()", "x"), "'6162636465'");
+    assert_eq!(
+        g("x = memoryview(b'abcde').tolist()", "x"),
+        "[97, 98, 99, 100, 101]"
+    );
+    // hex with a separator reuses the bytes machinery.
+    assert_eq!(
+        g("x = memoryview(b'abcde').hex(' ')", "x"),
+        "'61 62 63 64 65'"
+    );
+    // bytes()/list() conversions and iteration.
+    assert_eq!(g("x = bytes(memoryview(b'abc'))", "x"), "b'abc'");
+    assert_eq!(g("x = list(memoryview(b'abc'))", "x"), "[97, 98, 99]");
+    // The descriptor attributes of a 1-D unsigned-byte view.
+    assert_eq!(g("x = memoryview(b'abc').obj", "x"), "b'abc'");
+    assert_eq!(g("x = memoryview(b'abc').nbytes", "x"), "3");
+    assert_eq!(g("x = memoryview(b'abc').format", "x"), "'B'");
+    assert_eq!(g("x = memoryview(b'abc').itemsize", "x"), "1");
+    assert_eq!(g("x = memoryview(b'abc').ndim", "x"), "1");
+    assert_eq!(g("x = memoryview(b'abc').shape", "x"), "(3,)");
+    assert_eq!(g("x = memoryview(b'abc').strides", "x"), "(1,)");
+    assert_eq!(g("x = memoryview(b'abc').contiguous", "x"), "True");
+}
+
+#[test]
+fn memoryview_slicing_and_membership() {
+    // A contiguous slice is a sub-view sharing the buffer.
+    assert_eq!(g("x = memoryview(b'abcde')[1:3].tobytes()", "x"), "b'bc'");
+    // A strided slice materializes a fresh view.
+    assert_eq!(g("x = memoryview(b'abcde')[::2].tobytes()", "x"), "b'ace'");
+    assert_eq!(
+        g("x = memoryview(b'abcde')[::-1].tobytes()", "x"),
+        "b'edcba'"
+    );
+    // Byte-value membership and equality against bytes.
+    assert_eq!(g("x = 97 in memoryview(b'abc')", "x"), "True");
+    assert_eq!(g("x = 200 in memoryview(b'abc')", "x"), "False");
+    assert_eq!(g("x = memoryview(b'abc') == b'abc'", "x"), "True");
+    assert_eq!(g("x = memoryview(b'abc') == b'abd'", "x"), "False");
+    // bool() of an empty vs non-empty view.
+    assert_eq!(g("x = bool(memoryview(b''))", "x"), "False");
+    assert_eq!(g("x = bool(memoryview(b'a'))", "x"), "True");
+}
+
+#[test]
+fn memoryview_reflects_bytearray_mutation() {
+    // A view over a bytearray sees later mutations to the backing buffer.
+    assert_eq!(
+        g(
+            "ba = bytearray(b'xyz')\nm = memoryview(ba)\nba[0] = 65\nx = m.tobytes()",
+            "x"
+        ),
+        "b'Ayz'"
+    );
+    assert_eq!(
+        g(
+            "ba = bytearray(b'xyz')\nm = memoryview(ba)\nx = m.readonly",
+            "x"
+        ),
+        "False"
+    );
+    assert_eq!(
+        g("x = isinstance(memoryview(b'a'), memoryview)", "x"),
+        "True"
+    );
+}
+
+#[test]
+fn memoryview_index_and_type_errors() {
+    // Out-of-bounds index (CPython's exact dimension-aware message).
+    let e = eval_str("x = memoryview(b'abc')[5]").unwrap_err();
+    assert!(e.contains("index out of bounds on dimension 1"), "got: {e}");
+    // A non-bytes-like constructor argument.
+    let e = eval_str("x = memoryview(42)").unwrap_err();
+    assert!(
+        e.contains("a bytes-like object is required, not 'int'"),
+        "got: {e}"
+    );
+}

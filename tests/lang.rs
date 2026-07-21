@@ -2357,3 +2357,125 @@ fn float_hex_and_fromhex() {
     // Round-trip preserves the exact bits.
     assert_eq!(g("x = float.fromhex((0.1).hex()) == 0.1", "x"), "True");
 }
+
+#[test]
+fn numeric_dunder_methods_int() {
+    // The round-2 gap: numeric dunders are now callable bound methods on int.
+    assert_eq!(g("x = (5).__index__()", "x"), "5");
+    assert_eq!(g("x = (-3).__abs__()", "x"), "3");
+    assert_eq!(g("x = (7).__floordiv__(2)", "x"), "3");
+    assert_eq!(g("x = (1).__add__(2)", "x"), "3");
+    assert_eq!(g("x = (5).__mul__(3)", "x"), "15");
+    assert_eq!(g("x = (5).__mod__(3)", "x"), "2");
+    assert_eq!(g("x = (5).__pow__(3)", "x"), "125");
+    assert_eq!(g("x = (5).__neg__()", "x"), "-5");
+    assert_eq!(g("x = (5).__invert__()", "x"), "-6");
+    assert_eq!(g("x = (5).__divmod__(3)", "x"), "(1, 2)");
+    assert_eq!(g("x = (5).__and__(3)", "x"), "1");
+    assert_eq!(g("x = (5).__lshift__(2)", "x"), "20");
+    assert_eq!(g("x = (10).__truediv__(4)", "x"), "2.5");
+    assert_eq!(g("x = (5).__int__()", "x"), "5");
+    assert_eq!(g("x = (3).__float__()", "x"), "3.0");
+    assert_eq!(g("x = (5).__round__(1)", "x"), "5");
+    assert_eq!(g("x = (123).__round__(-1)", "x"), "120");
+    assert_eq!(g("x = (5).__bool__()", "x"), "True");
+    assert_eq!(g("x = (0).__bool__()", "x"), "False");
+    // Reflected dunders compute `other OP self`.
+    assert_eq!(g("x = (5).__radd__(2)", "x"), "7");
+    assert_eq!(g("x = (5).__rsub__(2)", "x"), "-3");
+    assert_eq!(g("x = (5).__rfloordiv__(2)", "x"), "0");
+    // bool inherits int's dunders and normalizes to int.
+    assert_eq!(g("x = True.__index__()", "x"), "1");
+    assert_eq!(g("x = True.__add__(1)", "x"), "2");
+}
+
+#[test]
+fn numeric_dunder_methods_float_and_notimplemented() {
+    assert_eq!(g("x = (2.0).__round__()", "x"), "2");
+    assert_eq!(g("x = (3.14159).__round__(2)", "x"), "3.14");
+    assert_eq!(g("x = (5.0).__floordiv__(2)", "x"), "2.0");
+    assert_eq!(g("x = (3.7).__floor__()", "x"), "3");
+    assert_eq!(g("x = (3.7).__ceil__()", "x"), "4");
+    assert_eq!(g("x = (3.5).__int__()", "x"), "3");
+    // int declines a float operand (returns NotImplemented, not TypeError);
+    // float accepts an int operand.
+    assert_eq!(g("x = (5).__add__(2.0)", "x"), "NotImplemented");
+    assert_eq!(g("x = (1).__eq__('x')", "x"), "NotImplemented");
+    assert_eq!(g("x = (5).__eq__(5.0)", "x"), "NotImplemented");
+    assert_eq!(g("x = (2.0).__lt__(3)", "x"), "True");
+    assert_eq!(g("x = (2.0).__lt__('x')", "x"), "NotImplemented");
+    assert_eq!(g("x = (1).__eq__(1)", "x"), "True");
+    // A dunder that hits a zero divisor raises, mirroring the operator.
+    let e = eval_str("x = (5).__mod__(0)").unwrap_err();
+    assert!(
+        e.contains("ZeroDivisionError: division by zero"),
+        "got: {e}"
+    );
+}
+
+#[test]
+fn zero_division_messages_match_314() {
+    // CPython 3.14 unified all these to the bare "division by zero".
+    for expr in [
+        "5 // 0",
+        "5 % 0",
+        "5.0 // 0.0",
+        "5.0 % 0.0",
+        "1 / 0",
+        "divmod(5, 0)",
+    ] {
+        let e = eval_str(&format!("x = {expr}")).unwrap_err();
+        assert!(
+            e.contains("ZeroDivisionError: division by zero"),
+            "{expr} -> {e}"
+        );
+    }
+    // Zero to a negative power (int and float base word it identically in 3.14).
+    let e = eval_str("x = 0 ** -1").unwrap_err();
+    assert!(e.contains("zero to a negative power"), "got: {e}");
+    let e = eval_str("x = 0.0 ** -1").unwrap_err();
+    assert!(e.contains("zero to a negative power"), "got: {e}");
+}
+
+#[test]
+fn sequence_index_and_concat_error_messages() {
+    // Index-out-of-range names the sequence type (except bytes, which is bare).
+    let e = eval_str("x = [][5]").unwrap_err();
+    assert!(e.contains("list index out of range"), "got: {e}");
+    let e = eval_str("x = (1, 2)[5]").unwrap_err();
+    assert!(e.contains("tuple index out of range"), "got: {e}");
+    let e = eval_str("x = bytearray(b'ab')[9]").unwrap_err();
+    assert!(e.contains("bytearray index out of range"), "got: {e}");
+    let e = eval_str("x = b'ab'[9]").unwrap_err();
+    assert!(
+        e.contains("IndexError: index out of range") && !e.contains("bytes index"),
+        "got: {e}"
+    );
+    // Concatenating a sequence with a wrong-typed operand uses the type-specific
+    // concat message, not the generic "unsupported operand type(s)" one.
+    let e = eval_str("x = 'a' + 1").unwrap_err();
+    assert!(
+        e.contains("can only concatenate str (not \"int\") to str"),
+        "got: {e}"
+    );
+    let e = eval_str("x = [1] + (2,)").unwrap_err();
+    assert!(
+        e.contains("can only concatenate list (not \"tuple\") to list"),
+        "got: {e}"
+    );
+    let e = eval_str("x = (1,) + [2]").unwrap_err();
+    assert!(
+        e.contains("can only concatenate tuple (not \"list\") to tuple"),
+        "got: {e}"
+    );
+    let e = eval_str("x = b'a' + 1").unwrap_err();
+    assert!(e.contains("can't concat int to bytes"), "got: {e}");
+    let e = eval_str("x = bytearray(b'a') + 1").unwrap_err();
+    assert!(e.contains("can't concat int to bytearray"), "got: {e}");
+    // A non-sequence left operand keeps the generic operand message.
+    let e = eval_str("x = 5 + 'x'").unwrap_err();
+    assert!(
+        e.contains("unsupported operand type(s) for +: 'int' and 'str'"),
+        "got: {e}"
+    );
+}
