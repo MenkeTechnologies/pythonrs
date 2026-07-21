@@ -1370,6 +1370,39 @@ pub fn set_debug_mode(on: bool) {
     DEBUG_MODE.with(|d| d.set(on));
 }
 
+thread_local! {
+    /// Object ids currently mid-`repr` — CPython's `Py_ReprEnter`/`Py_ReprLeave`
+    /// stack. A container that (directly or transitively) contains itself would
+    /// otherwise recurse forever; instead the inner re-entry emits `[...]`/`{...}`.
+    static REPR_GUARD: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Begin repr-ing container `id`. Returns `true` if `id` is ALREADY on the repr
+/// stack (a reference cycle) — the caller must then emit the recursion marker and
+/// NOT recurse. Returns `false` after recording `id`; pair every `false` with a
+/// matching `repr_guard_leave(id)`.
+pub fn repr_guard_enter(id: u32) -> bool {
+    REPR_GUARD.with(|g| {
+        let mut g = g.borrow_mut();
+        if g.contains(&id) {
+            true
+        } else {
+            g.push(id);
+            false
+        }
+    })
+}
+
+/// End repr-ing container `id` (pops the most recent matching entry).
+pub fn repr_guard_leave(id: u32) {
+    REPR_GUARD.with(|g| {
+        let mut g = g.borrow_mut();
+        if let Some(pos) = g.iter().rposition(|&x| x == id) {
+            g.remove(pos);
+        }
+    });
+}
+
 /// Register every pythonrs builtin + the numeric hook on a VM, then run it.
 pub fn run_chunk_on(chunk: Chunk) -> Result<Value, String> {
     let mut vm = VM::new(chunk);
@@ -1542,7 +1575,14 @@ impl PyHost {
                         let a = self.exc_instance_args(&inst.dict);
                         self.exc_message(&inst.class, &a)
                     } else {
-                        format!("<{} object>", inst.class)
+                        // `object.__repr__` default: `<__main__.Cls object at 0x…>`.
+                        // Instances defined under `-c`/a script live in `__main__`
+                        // (matching the `Class` repr above).
+                        format!(
+                            "<__main__.{} object at 0x{:012x}>",
+                            inst.class,
+                            self.addr_of(v)
+                        )
                     }
                 }
                 // User classes are defined in the top-level module, which under
@@ -1672,16 +1712,25 @@ impl PyHost {
             Value::Obj(_) => match self.get(v) {
                 Some(PyObj::Str(s)) => quote_str(s),
                 Some(PyObj::List(l)) => {
+                    let id = if let Value::Obj(i) = v { *i } else { 0 };
+                    if repr_guard_enter(id) {
+                        return "[...]".into();
+                    }
                     let inner: Vec<String> = l.iter().map(|x| self.repr_of(x)).collect();
+                    repr_guard_leave(id);
                     format!("[{}]", inner.join(", "))
                 }
                 Some(PyObj::Tuple(l)) => {
+                    let id = if let Value::Obj(i) = v { *i } else { 0 };
+                    if repr_guard_enter(id) {
+                        return "(...)".into();
+                    }
                     // A namedtuple instance reprs as `Type(field=value, …)`.
                     let nt = match v {
                         Value::Obj(i) => self.nt_meta.get(i),
                         _ => None,
                     };
-                    if let Some(m) = nt {
+                    let out = if let Some(m) = nt {
                         let inner: Vec<String> = m
                             .fields
                             .iter()
@@ -1696,9 +1745,15 @@ impl PyHost {
                         } else {
                             format!("({})", inner.join(", "))
                         }
-                    }
+                    };
+                    repr_guard_leave(id);
+                    out
                 }
                 Some(PyObj::Dict(d)) => {
+                    let id = if let Value::Obj(i) = v { *i } else { 0 };
+                    if repr_guard_enter(id) {
+                        return "{...}".into();
+                    }
                     let body: Vec<String> = d
                         .values()
                         .map(|(k, val)| format!("{}: {}", self.repr_of(k), self.repr_of(val)))
@@ -1708,7 +1763,7 @@ impl PyHost {
                         Value::Obj(i) => self.dict_meta.get(i),
                         _ => None,
                     };
-                    match meta.map(|m| (m.kind, m.factory.clone())) {
+                    let out = match meta.map(|m| (m.kind, m.factory.clone())) {
                         Some((DictKind::Counter, _)) => format!("Counter({dict_repr})"),
                         Some((DictKind::DefaultDict, factory)) => {
                             let f = factory
@@ -1726,17 +1781,24 @@ impl PyHost {
                             format!("OrderedDict([{}])", pairs.join(", "))
                         }
                         None => dict_repr,
-                    }
+                    };
+                    repr_guard_leave(id);
+                    out
                 }
                 Some(PyObj::Set(s)) => {
                     if s.is_empty() {
                         "set()".into()
                     } else {
+                        let id = if let Value::Obj(i) = v { *i } else { 0 };
+                        if repr_guard_enter(id) {
+                            return "{...}".into();
+                        }
                         let inner: Vec<String> = self
                             .set_ordered_values(s)
                             .iter()
                             .map(|x| self.repr_of(x))
                             .collect();
+                        repr_guard_leave(id);
                         format!("{{{}}}", inner.join(", "))
                     }
                 }
@@ -1744,11 +1806,16 @@ impl PyHost {
                     if s.is_empty() {
                         "frozenset()".into()
                     } else {
+                        let id = if let Value::Obj(i) = v { *i } else { 0 };
+                        if repr_guard_enter(id) {
+                            return "frozenset(...)".into();
+                        }
                         let inner: Vec<String> = self
                             .set_ordered_values(s)
                             .iter()
                             .map(|x| self.repr_of(x))
                             .collect();
+                        repr_guard_leave(id);
                         format!("frozenset({{{}}})", inner.join(", "))
                     }
                 }
