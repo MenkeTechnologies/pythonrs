@@ -6110,6 +6110,18 @@ fn base_dispatch(
     }
 }
 
+/// Allocate an instance of `cname` for a cooperative `super().__new__(cls, …)`.
+/// When `cname` subclasses a builtin type, the extra arguments build the native
+/// payload (`class C(int): __new__ -> super().__new__(cls, v*2)`); otherwise a
+/// bare instance (the `object.__new__` default).
+fn new_subclass_or_bare(cname: &str, extra: &[Value]) -> Result<Value, String> {
+    if let Some(base) = with_host(|h| h.builtin_base_of(cname)) {
+        let payload = crate::builtins::call_builtin_function(base, extra.to_vec(), vec![])?;
+        return Ok(with_host(|h| h.new_instance_payload(cname.to_string(), payload)));
+    }
+    Ok(with_host(|h| h.new_instance(cname.to_string(), IndexMap::new())))
+}
+
 /// `super().__init__(*args, **kwargs)` inside a builtin-type subclass: populate
 /// the instance's native payload from the constructor arguments. For a mutable
 /// base the payload's storage is replaced with a freshly-built base value; for
@@ -6306,9 +6318,7 @@ pub fn call_method(
                 None if name == "__new__" => {
                     let cls = args.first().cloned().unwrap_or(Value::Undef);
                     match with_host(|h| h.get(&cls).cloned()) {
-                        Some(PyObj::Class(cname)) => {
-                            Ok(with_host(|h| h.new_instance(cname, IndexMap::new())))
-                        }
+                        Some(PyObj::Class(cname)) => Ok(new_subclass_or_bare(&cname, &args[1..])?),
                         _ => Err(type_error("object.__new__(X): X is not a type object")),
                     }
                 }
