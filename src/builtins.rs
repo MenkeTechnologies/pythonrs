@@ -4241,6 +4241,12 @@ fn construct_int(args: &[Value]) -> Result<Value, String> {
     };
     // `int(x)` with no explicit base honors `__int__`, then `__index__`.
     if args.len() < 2 {
+        // A live CPython object (an `IntEnum` member, `Fraction`, `numpy` scalar)
+        // converts via CPython's own `int()`.
+        #[cfg(feature = "stdlib-ffi")]
+        if let Some(id) = with_host(|h| h.foreign_id(&v)) {
+            return with_host(|h| crate::ffi::to_int(h, id));
+        }
         let has_int = with_host(
             |h| matches!(h.get(&v), Some(PyObj::Instance(i)) if instance_has(h, i, "__int__")),
         );
@@ -5106,6 +5112,16 @@ fn exception_isa(exc_class: &str, want: &str, h: &host::PyHost) -> bool {
             }
         }
     }
+    // A CPython stdlib exception raised over the bridge (e.g.
+    // `dataclasses.FrozenInstanceError`) is unknown to pythonrs's builtin table
+    // and isn't a user class; treat it as an `Exception` subclass so the common
+    // catch-all `except Exception` matches. Nearly all exceptions derive from
+    // `Exception`, and the non-`Exception` `BaseException` subclasses
+    // (`KeyboardInterrupt`, `SystemExit`, `GeneratorExit`) are all builtins in the
+    // table, so this never misclassifies one of those.
+    if want == "Exception" && !is_exception_class(exc_class) && !h.classes.contains_key(exc_class) {
+        return true;
+    }
     false
 }
 
@@ -5124,6 +5140,13 @@ fn isinstance_dispatch(v: &Value, cls: &Value) -> Result<bool, String> {
     if let Some(r) = host::metaclass_hook(cls, "__instancecheck__", v.clone()) {
         let res = r?;
         return Ok(with_host(|h| h.truthy(&res)));
+    }
+    // A CPython class/ABC (`collections.abc.Sequence`, an `enum`/`typing` type):
+    // let CPython's `isinstance` decide (a native list crosses as a real `list`,
+    // so structural ABC checks succeed).
+    #[cfg(feature = "stdlib-ffi")]
+    if let Some(cls_id) = with_host(|h| h.foreign_id(cls)) {
+        return with_host(|h| crate::ffi::isinstance_foreign(h, v, cls_id));
     }
     Ok(with_host(|h| isinstance(h, v, cls)))
 }
@@ -10312,8 +10335,11 @@ pub fn apply_format_spec(s: &str, v: &Value, spec: &str) -> Result<String, Strin
                 if let Some(p) = prec {
                     if matches!(v, Value::Str(_)) || is_str(v) {
                         body = body.chars().take(p).collect();
-                    } else if as_f(v).is_some() {
-                        body = format!("{:.*}", p, as_f(v).unwrap());
+                    } else if let Some(f) = as_f(v) {
+                        // A float with a precision but no presentation type uses
+                        // CPython's "general" float format, NOT fixed-point.
+                        body = fmt_nonfinite(f, false)
+                            .unwrap_or_else(|| crate::host::fmt_none_float(f, p));
                     }
                 }
                 body

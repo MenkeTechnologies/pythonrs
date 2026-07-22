@@ -2277,6 +2277,25 @@ fn str_casefold_full_folding() {
     assert_eq!(g("x = 'Straße'.lower()", "x"), "'straße'");
 }
 
+/// A float formatted with a precision but NO presentation type (`f"{x:.3}"`,
+/// `format(x, '.3')`) uses CPython's "general" format — significant digits with a
+/// `g`-style switch to scientific (one exponent sooner than `g`), keeping a
+/// trailing `.0` for a whole result — NOT fixed-point (`.3f`).
+#[test]
+fn float_no_type_precision_format() {
+    assert_eq!(g("x = format(3.14159, '.3')", "x"), "'3.14'");
+    assert_eq!(g("x = format(2.0, '.3')", "x"), "'2.0'");
+    assert_eq!(g("x = format(100.0, '.3')", "x"), "'1e+02'");
+    assert_eq!(g("x = format(100.0, '.5')", "x"), "'100.0'");
+    assert_eq!(g("x = format(12345.678, '.5')", "x"), "'1.2346e+04'");
+    // Rounding carry bumps the exponent across the scientific threshold.
+    assert_eq!(g("x = format(9.99, '.2')", "x"), "'1e+01'");
+    // Width padding still applies around the general body.
+    assert_eq!(g("x = f'{3.14159:{5}.{3}}'", "x"), "' 3.14'");
+    // A fixed `.Nf` type is unaffected.
+    assert_eq!(g("x = format(3.14159, '.3f')", "x"), "'3.142'");
+}
+
 /// `str.swapcase` is Unicode-aware: accented letters swap case (`ï`->`Ï`,
 /// `é`->`É`) and a 1->many mapping expands (`ß`->`SS`); an ASCII-only
 /// implementation left the accented letters unchanged.
