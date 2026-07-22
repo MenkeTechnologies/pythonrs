@@ -5030,12 +5030,26 @@ fn copy_deep(v: &Value, memo: &mut std::collections::HashMap<u32, Value>) -> Res
     }
 }
 
+/// Convert an integral `f64` to a pythonrs int: a plain `Value::Int` when it fits
+/// `i64`, else an exact `BigInt` (so `math.floor(1e20)` is `10**20`, not the
+/// i64-saturated `as i64` cast). Non-finite maps to `0` (callers guard finiteness).
+fn f64_to_int(h: &mut host::PyHost, x: f64) -> Value {
+    if x >= i64::MIN as f64 && x <= i64::MAX as f64 {
+        return Value::Int(x as i64);
+    }
+    use num_traits::FromPrimitive;
+    match num_bigint::BigInt::from_f64(x) {
+        Some(b) => h.norm_big(b),
+        None => Value::Int(0),
+    }
+}
+
 fn call_math(name: &str, args: &[Value]) -> Result<Value, String> {
     let f0 = args.first().and_then(as_f).unwrap_or(0.0);
     match name {
         "sqrt" => Ok(Value::Float(f0.sqrt())),
-        "floor" => Ok(Value::Int(f0.floor() as i64)),
-        "ceil" => Ok(Value::Int(f0.ceil() as i64)),
+        "floor" => Ok(with_host(|h| f64_to_int(h, f0.floor()))),
+        "ceil" => Ok(with_host(|h| f64_to_int(h, f0.ceil()))),
         "fabs" => Ok(Value::Float(f0.abs())),
         "sin" => Ok(Value::Float(f0.sin())),
         "cos" => Ok(Value::Float(f0.cos())),
@@ -5051,13 +5065,18 @@ fn call_math(name: &str, args: &[Value]) -> Result<Value, String> {
             Ok(Value::Float(f0.powf(e)))
         }
         "gcd" => {
-            let a = with_host(|h| h.as_int(&args[0])).unwrap_or(0).abs();
-            let b = args
-                .get(1)
-                .and_then(|v| with_host(|h| h.as_int(v)))
-                .unwrap_or(0)
-                .abs();
-            Ok(Value::Int(gcd(a, b)))
+            // `math.gcd(*integers)` — arbitrary count (CPython 3.9+) and
+            // bignum-safe (`as_int` would silently truncate a value beyond i64 to
+            // 0, giving the wrong gcd).
+            use num_integer::Integer;
+            let mut acc = num_bigint::BigInt::from(0);
+            for a in args {
+                let n = with_host(|h| h.big_val(a)).ok_or_else(|| {
+                    host::type_error("'float' object cannot be interpreted as an integer")
+                })?;
+                acc = acc.gcd(&n);
+            }
+            Ok(with_host(|h| h.norm_big(acc)))
         }
         "factorial" => {
             let n = with_host(|h| h.as_int(&args[0])).unwrap_or(0);
@@ -5078,15 +5097,6 @@ fn call_math(name: &str, args: &[Value]) -> Result<Value, String> {
         }
         _ => Err(host::name_error(&format!("math.{name}"))),
     }
-}
-
-fn gcd(mut a: i64, mut b: i64) -> i64 {
-    while b != 0 {
-        let t = b;
-        b = a % b;
-        a = t;
-    }
-    a
 }
 
 // ── exception hierarchy ──────────────────────────────────────────────────────
@@ -6232,27 +6242,31 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
                 .collect::<String>(),
         )),
         "capitalize" => {
+            // CPython titlecases the first character (`ǳ` → `ǲ`, not `Ǳ`) and
+            // lowercases the rest.
             let mut c = s.chars();
             let out = match c.next() {
-                Some(f) => f.to_uppercase().collect::<String>() + &c.as_str().to_lowercase(),
+                Some(f) => to_titlecase(f) + &c.as_str().to_lowercase(),
                 None => String::new(),
             };
             Ok(new_str(out))
         }
         "title" => {
             let mut out = String::new();
-            let mut prev_alpha = false;
+            let mut prev_cased = false;
             for ch in s.chars() {
+                // CPython's `str.title` cases word boundaries by the *cased*
+                // property (letters + titlecase-mapped digraphs), not `isalpha`.
                 if ch.is_alphabetic() {
-                    if prev_alpha {
+                    if prev_cased {
                         out.extend(ch.to_lowercase());
                     } else {
-                        out.extend(ch.to_uppercase());
+                        out.push_str(&to_titlecase(ch));
                     }
-                    prev_alpha = true;
+                    prev_cased = true;
                 } else {
                     out.push(ch);
-                    prev_alpha = false;
+                    prev_cased = false;
                 }
             }
             Ok(new_str(out))
@@ -6361,9 +6375,7 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             let (start, end) = resolve_start_end(chars.len(), args, 1);
             Ok(Value::Int(count_range(&chars, &sub, start, end) as i64))
         }
-        "isdigit" => Ok(Value::Bool(
-            !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()),
-        )),
+        "isdigit" => Ok(Value::Bool(!s.is_empty() && s.chars().all(is_digit_char))),
         "isalpha" => Ok(Value::Bool(
             !s.is_empty() && s.chars().all(|c| c.is_alphabetic()),
         )),
@@ -6444,9 +6456,7 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             }))
         }
         "isnumeric" => Ok(Value::Bool(!s.is_empty() && s.chars().all(is_numeric_char))),
-        "isdecimal" => Ok(Value::Bool(
-            !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()),
-        )),
+        "isdecimal" => Ok(Value::Bool(!s.is_empty() && s.chars().all(is_decimal_char))),
         "isidentifier" => Ok(Value::Bool(is_identifier(&s))),
         "istitle" => Ok(Value::Bool(is_titlecased(&s))),
         "isprintable" => Ok(Value::Bool(s.chars().all(host::is_printable_char))),
@@ -6642,6 +6652,45 @@ fn str_maketrans(args: &[Value]) -> Result<Value, String> {
 /// CPython `str.isnumeric`: any Unicode numeric character (Nd/Nl/No).
 fn is_numeric_char(c: char) -> bool {
     c.is_numeric()
+}
+
+/// CPython `str.isdecimal` / `Py_UNICODE_ISDECIMAL`: the Unicode `Nd` category
+/// (Decimal_Number) — ASCII `0-9` plus other scripts' decimal digits (Devanagari
+/// `०`, Thai `๓`, fullwidth), but NOT superscripts or fractions. Rust's
+/// `is_ascii_digit` covered only ASCII.
+fn is_decimal_char(c: char) -> bool {
+    use unicode_general_category::{get_general_category, GeneralCategory};
+    get_general_category(c) == GeneralCategory::DecimalNumber
+}
+
+/// CPython `str.isdigit` / `Py_UNICODE_ISDIGIT`: every decimal digit
+/// ([`is_decimal_char`]) plus the `Numeric_Type=Digit` characters that are not
+/// themselves decimal — superscripts/subscripts (`²`, `₃`), circled/parenthesized
+/// digits (`①`, `⑽`), etc. This second set is finite and stable (Unicode's
+/// Numeric_Type property, which Rust's std does not expose).
+fn is_digit_char(c: char) -> bool {
+    is_decimal_char(c)
+        || matches!(c,
+            '\u{00B2}'..='\u{00B3}' | '\u{00B9}' | '\u{1369}'..='\u{1371}' | '\u{19DA}'
+            | '\u{2070}' | '\u{2074}'..='\u{2079}' | '\u{2080}'..='\u{2089}'
+            | '\u{2460}'..='\u{2468}' | '\u{2474}'..='\u{247C}' | '\u{2488}'..='\u{2490}'
+            | '\u{24EA}' | '\u{24F5}'..='\u{24FD}' | '\u{24FF}' | '\u{2776}'..='\u{277E}'
+            | '\u{2780}'..='\u{2788}' | '\u{278A}'..='\u{2792}' | '\u{10A40}'..='\u{10A43}'
+            | '\u{10E60}'..='\u{10E68}' | '\u{11052}'..='\u{1105A}' | '\u{1F100}'..='\u{1F10A}')
+}
+
+/// The titlecase form of `ch` (CPython's `str.title`/`capitalize` first-letter
+/// mapping). Rust's std only exposes uppercase; the Latin digraph ligatures whose
+/// titlecase differs from their uppercase (`ǳ` → `ǲ`, not `Ǳ`) are handled
+/// explicitly, everything else uppercases.
+fn to_titlecase(ch: char) -> String {
+    match ch {
+        '\u{01C4}' | '\u{01C5}' | '\u{01C6}' => "\u{01C5}".to_string(),
+        '\u{01C7}' | '\u{01C8}' | '\u{01C9}' => "\u{01C8}".to_string(),
+        '\u{01CA}' | '\u{01CB}' | '\u{01CC}' => "\u{01CB}".to_string(),
+        '\u{01F1}' | '\u{01F2}' | '\u{01F3}' => "\u{01F2}".to_string(),
+        _ => ch.to_uppercase().collect(),
+    }
 }
 
 /// CPython `str.isspace` / `Py_UNICODE_ISSPACE`: Rust's `White_Space` set plus
