@@ -2512,8 +2512,12 @@ fn b_match_class(vm: &mut VM, argc: u8) -> Value {
         _ => 0,
     };
     let kwnames: Vec<String> = all[3..].iter().map(sval).collect();
-    if !with_host(|h| isinstance(h, &subject, &class)) {
-        return Value::Bool(false);
+    // `isinstance_dispatch` (not the raw helper) so a foreign class — a
+    // `@dataclass`/`enum` mirror — matches via CPython's `isinstance`.
+    match isinstance_dispatch(&subject, &class) {
+        Ok(true) => {}
+        Ok(false) => return Value::Bool(false),
+        Err(e) => return abort(vm, e),
     }
     let cname = with_host(|h| callable_name(h, &class)).unwrap_or_default();
     let mut vals: Vec<Value> = Vec::new();
@@ -2525,7 +2529,9 @@ fn b_match_class(vm: &mut VM, argc: u8) -> Value {
             }
             vals.push(subject.clone());
         } else {
-            let margs = with_host(|h| h.class_lookup(&cname, "__match_args__"));
+            // `__match_args__` via `get_attr` so a foreign class (dataclass mirror,
+            // whose name isn't in `h.classes`) is read over the bridge.
+            let margs = with_host(|h| h.get_attr(&class, "__match_args__")).ok();
             let names: Vec<String> = match margs {
                 Some(v) => match host::iter_vec(&v) {
                     Ok(items) => items.iter().map(sval).collect(),

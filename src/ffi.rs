@@ -101,30 +101,45 @@ fn fetch<'py>(py: Python<'py>, id: u32) -> Result<Bound<'py, PyAny>, String> {
     }
 }
 
-/// Convert a CPython exception to pythonrs's terse `"Class: message"` error
-/// string (the same text `PyErr::to_string` yields), and register the exception
-/// type's base-class chain (its `__mro__` names) on the host so pythonrs's
+/// The exception type's `(class name, __mro__ base names)`, so pythonrs's
 /// `except` matching can resolve a specific base — `except ValueError` catching a
-/// foreign `json.JSONDecodeError` — which it otherwise has no knowledge of.
-fn pyerr_to_error(py: Python, err: &PyErr) -> String {
+/// foreign `json.JSONDecodeError`. `None` when the chain can't be read.
+fn pyerr_class_bases(py: Python, err: &PyErr) -> Option<(String, Vec<String>)> {
     let ty = err.get_type(py);
-    if let Ok(name) = ty.name() {
-        let class = name.to_string();
-        let mut bases: Vec<String> = Vec::new();
-        if let Ok(mro) = ty.getattr("__mro__") {
-            if let Ok(seq) = mro.try_iter() {
-                for c in seq.flatten() {
-                    if let Ok(n) = c.getattr("__name__").and_then(|n| n.extract::<String>()) {
-                        bases.push(n);
-                    }
+    let class = ty.name().ok()?.to_string();
+    let mut bases: Vec<String> = Vec::new();
+    if let Ok(mro) = ty.getattr("__mro__") {
+        if let Ok(seq) = mro.try_iter() {
+            for c in seq.flatten() {
+                if let Ok(n) = c.getattr("__name__").and_then(|n| n.extract::<String>()) {
+                    bases.push(n);
                 }
             }
         }
-        if !bases.is_empty() {
-            with_host(|h| {
-                h.foreign_exc_bases.insert(class, bases);
-            });
-        }
+    }
+    (!bases.is_empty()).then_some((class, bases))
+}
+
+/// Convert a CPython exception to pythonrs's terse `"Class: message"` string,
+/// registering its base chain via a fresh host borrow. For the **borrow-free**
+/// call path only (`invoke_bound`, which drops the host borrow across the call);
+/// a caller that already holds `&mut PyHost` must use [`pyerr_to_error_h`] to
+/// avoid a double borrow.
+fn pyerr_to_error(py: Python, err: &PyErr) -> String {
+    if let Some((class, bases)) = pyerr_class_bases(py, err) {
+        with_host(|h| {
+            h.foreign_exc_bases.insert(class, bases);
+        });
+    }
+    err.to_string()
+}
+
+/// Like [`pyerr_to_error`] but registers through an already-held `&mut PyHost`
+/// (the `get_item`/`set_attr` paths run inside `PyHost::get_item`/`set_attr`,
+/// which hold the borrow — calling `with_host` there would double-borrow).
+fn pyerr_to_error_h(host: &mut PyHost, py: Python, err: &PyErr) -> String {
+    if let Some((class, bases)) = pyerr_class_bases(py, err) {
+        host.foreign_exc_bases.insert(class, bases);
     }
     err.to_string()
 }
@@ -540,7 +555,8 @@ pub fn set_attr(host: &mut PyHost, id: u32, name: &str, value: &Value) -> Result
     Python::with_gil(|py| {
         let obj = fetch(py, id)?;
         let v = value_to_py(host, py, value)?;
-        obj.setattr(name, v).map_err(|e| pyerr_to_error(py, &e))
+        obj.setattr(name, v)
+            .map_err(|e| pyerr_to_error_h(host, py, &e))
     })
 }
 
@@ -935,7 +951,9 @@ pub fn get_item(host: &mut PyHost, id: u32, idx: &Value) -> Result<Value, String
     Python::with_gil(|py| {
         let obj = fetch(py, id)?;
         let key = value_to_py(host, py, idx)?;
-        let item = obj.get_item(key).map_err(|e| pyerr_to_error(py, &e))?;
+        let item = obj
+            .get_item(key)
+            .map_err(|e| pyerr_to_error_h(host, py, &e))?;
         py_to_value(host, py, &item)
     })
 }
