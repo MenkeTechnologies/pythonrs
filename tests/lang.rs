@@ -2296,6 +2296,60 @@ fn float_no_type_precision_format() {
     assert_eq!(g("x = format(3.14159, '.3f')", "x"), "'3.142'");
 }
 
+/// The argument-clinic `str` methods accept their arguments by keyword
+/// (`"a b c".split(maxsplit=1)`); every other `str` method rejects keywords with
+/// CPython's `TypeError`, and an unexpected keyword on an accepting method also
+/// raises.
+#[test]
+fn str_method_keyword_arguments() {
+    assert_eq!(g("x = 'a b c d'.split(maxsplit=1)", "x"), "['a', 'b c d']");
+    assert_eq!(
+        g("x = 'a-b-c'.split(sep='-', maxsplit=1)", "x"),
+        "['a', 'b-c']"
+    );
+    assert_eq!(g("x = 'aaa'.replace('a', 'b', count=2)", "x"), "'bba'");
+    assert_eq!(g("x = 'a\\tb'.expandtabs(tabsize=4)", "x"), "'a   b'");
+    // A non-accepting method raises "takes no keyword arguments".
+    assert_eq!(
+        g(
+            "try:\n    'x'.center(5, fillchar='*')\nexcept TypeError as e:\n    x = str(e)",
+            "x"
+        ),
+        "'str.center() takes no keyword arguments'"
+    );
+    // An unexpected keyword on an accepting method raises.
+    assert_eq!(
+        g(
+            "try:\n    'a b'.split(bad=1)\nexcept TypeError as e:\n    x = str(e)",
+            "x"
+        ),
+        "\"split() got an unexpected keyword argument 'bad'\""
+    );
+}
+
+/// List/tuple membership (`in`), `.index`, `.count`, and `.remove` honor a user
+/// `__eq__` (CPython's `PyObject_RichCompareBool` — identity first, then `==`),
+/// not native identity. Previously an instance was found only by identity.
+#[test]
+fn sequence_membership_uses_eq() {
+    let cls = "class M:\n    def __init__(s, v): s.v = v\n    def __eq__(s, o): return isinstance(o, M) and s.v == o.v\n    def __hash__(s): return hash(s.v)\n";
+    assert_eq!(g(&format!("{cls}x = M(1) in [M(1), M(2)]"), "x"), "True");
+    assert_eq!(g(&format!("{cls}x = M(3) in [M(1), M(2)]"), "x"), "False");
+    assert_eq!(g(&format!("{cls}x = M(1) in (M(1), M(2))"), "x"), "True");
+    assert_eq!(g(&format!("{cls}x = [M(1), M(2)].index(M(2))"), "x"), "1");
+    assert_eq!(
+        g(&format!("{cls}x = [M(1), M(2), M(1)].count(M(1))"), "x"),
+        "2"
+    );
+    assert_eq!(
+        g(
+            &format!("{cls}l = [M(1), M(2), M(3)]\nl.remove(M(2))\nx = [m.v for m in l]"),
+            "x"
+        ),
+        "[1, 3]"
+    );
+}
+
 /// `str.swapcase` is Unicode-aware: accented letters swap case (`ï`->`Ï`,
 /// `é`->`É`) and a 1->many mapping expands (`ß`->`SS`); an ASCII-only
 /// implementation left the accented letters unchanged.

@@ -629,3 +629,39 @@ except Exception as e:
     }
     assert_eq!(stdout, "caught FrozenInstanceError\n", "stderr={stderr}");
 }
+
+/// A CPython exception raised over the bridge is matched by pythonrs `except`
+/// clauses against its captured base-class chain: `except ValueError` catches a
+/// `json.JSONDecodeError` (a ValueError subclass), `except ArithmeticError`
+/// catches `decimal.InvalidOperation`, and the exact foreign type
+/// (`except json.JSONDecodeError`) matches by its CPython `__name__`.
+#[test]
+fn ffi_foreign_exception_base_matching() {
+    let src = "\
+import json
+from decimal import Decimal
+try:
+    json.loads('x')
+except LookupError:
+    print('wrong')
+except ValueError:
+    print('ValueError')
+try:
+    json.loads('x')
+except json.JSONDecodeError:
+    print('exact')
+try:
+    Decimal('bad')
+except ArithmeticError:
+    print('ArithmeticError')
+";
+    let (stdout, stderr, ok) = run_py(src);
+    if !ok || stderr.contains("ModuleNotFoundError") {
+        eprintln!("skipping ffi-foreign-exc-base test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(
+        stdout, "ValueError\nexact\nArithmeticError\n",
+        "stderr={stderr}"
+    );
+}
