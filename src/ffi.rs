@@ -1002,6 +1002,33 @@ pub fn to_float(id: u32) -> Result<f64, String> {
     })
 }
 
+/// `isinstance(v, foreign_cls)` — the class is a CPython class/ABC
+/// (`collections.abc.Sequence`, a `typing`/`enum` type). `v` is marshaled to its
+/// CPython form (a native list crosses as a `list`, etc.) and CPython's
+/// `isinstance` decides, so an ABC's structural `__instancecheck__` runs.
+pub fn isinstance_foreign(host: &mut PyHost, v: &Value, cls_id: u32) -> Result<bool, String> {
+    Python::with_gil(|py| {
+        let obj = value_to_py(host, py, v)?;
+        let cls = fetch(py, cls_id)?;
+        obj.is_instance(&cls).map_err(|e| e.to_string())
+    })
+}
+
+/// `int(foreign)` — run CPython's own `int()` on the object so `__int__` /
+/// `__index__` and an `IntEnum` member (an `int` subclass) convert. The result
+/// crosses back by value (bignum-safe via `py_to_value`).
+pub fn to_int(host: &mut PyHost, id: u32) -> Result<Value, String> {
+    Python::with_gil(|py| {
+        let obj = fetch(py, id)?;
+        let i = py
+            .import("builtins")
+            .and_then(|b| b.getattr("int"))
+            .and_then(|f| f.call1((obj,)))
+            .map_err(|e| e.to_string())?;
+        py_to_value(host, py, &i)
+    })
+}
+
 /// [`binary_op`] for the borrow-free path (`numeric_hook`): the caller must NOT
 /// hold the host borrow. The operator runs in CPython with no borrow held, so an
 /// operand whose comparison/arithmetic calls back into pythonrs (a

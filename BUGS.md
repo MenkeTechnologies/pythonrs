@@ -361,8 +361,17 @@ module then raises `ModuleNotFoundError`.
   caches into the instance dict (later reads hit the dict; a `__slots__` instance
   with no dict raises CPython's `TypeError`). Every other `functools` member
   (`reduce`, `partial`, `lru_cache`, `wraps`, `cmp_to_key`) defers to the real
-  CPython module.
+  CPython module. `int(x)` of a foreign value converts via CPython's `int()` (an
+  `IntEnum` member, `Fraction`, …); `isinstance(v, foreign_cls)` against a CPython
+  ABC (`collections.abc.Sequence`, …) marshals `v` and lets CPython's structural
+  `__instancecheck__` decide; and a CPython exception raised over the bridge (e.g.
+  `dataclasses.FrozenInstanceError`) is caught by `except Exception` (an exception
+  class unknown to the builtin table is treated as an `Exception` subclass).
   Remaining gaps:
+  - **A foreign exception matches only `except Exception`/`BaseException`**, not a
+    specific base (`except ValueError` won't catch a CPython `ValueError` subclass
+    like `json.JSONDecodeError` raised over the bridge) — that needs CPython
+    `issubclass` on the retained exception type, not just the class name.
   - **`collections.namedtuple` field *types*** cross as `PyrsCallable` wrappers,
     not the CPython type objects, so `dataclasses.fields(x)[i].type` on a mirrored
     class is a proxy — the generated `__init__`/`__repr__`/`__eq__` (which use only

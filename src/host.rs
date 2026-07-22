@@ -4497,6 +4497,42 @@ pub fn fmt_g(x: f64, prec: usize, upper: bool, hash: bool) -> String {
     }
 }
 
+/// Format a float with a precision but NO presentation type (`format(x, '.3')`,
+/// `f"{x:.3}"`). This is CPython's "general" float format: like `'g'` with two
+/// differences — it switches to scientific one exponent sooner (`exp >= p-1`
+/// instead of `exp >= p`), and a result that renders as a bare integer keeps a
+/// trailing `.0` (`Py_DTSF_ADD_DOT_0`), so `format(2.0, '.3')` is `'2.0'`, not
+/// `'2'`. Trailing zeros are otherwise stripped as in `'g'`.
+pub fn fmt_none_float(x: f64, prec: usize) -> String {
+    let p = prec.max(1);
+    // Exponent of `x` *after* rounding to `p` significant figures, so a carry
+    // (`9.99` → `10.` at `p=2`) bumps the exponent and the scientific-vs-fixed
+    // decision sees the rounded magnitude, matching CPython.
+    let exp: i32 = if x == 0.0 {
+        0
+    } else {
+        fmt_sci(x, p - 1, false)
+            .split_once(['e', 'E'])
+            .and_then(|(_, e)| e.parse().ok())
+            .unwrap_or(0)
+    };
+    let mut s = if exp < -4 || exp >= p as i32 - 1 {
+        strip_g_sci(&fmt_sci(x, p - 1, false))
+    } else {
+        let dec = (p as i32 - 1 - exp).max(0) as usize;
+        let s = format!("{:.*}", dec, x);
+        if s.contains('.') {
+            s.trim_end_matches('0').trim_end_matches('.').to_string()
+        } else {
+            s
+        }
+    };
+    if !s.contains('.') && !s.contains(['e', 'E']) {
+        s.push_str(".0");
+    }
+    s
+}
+
 /// Strip trailing zeros from the mantissa of a `%g` scientific result.
 fn strip_g_sci(s: &str) -> String {
     match s.find(['e', 'E']) {

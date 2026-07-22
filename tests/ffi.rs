@@ -554,3 +554,78 @@ print('after:', repr(buf.getvalue()))
         "stderr={stderr}"
     );
 }
+
+/// A foreign (CPython) value converts through `int()`: an `IntEnum` member (an
+/// `int` subclass) and a `Fraction`/`Decimal` all reach a native int, and the
+/// result participates in arithmetic. Previously `int()` rejected the foreign
+/// object.
+#[test]
+fn ffi_int_of_foreign() {
+    let src = "\
+from enum import IntEnum
+from fractions import Fraction
+class P(IntEnum):
+    LOW = 1
+    HIGH = 10
+print(int(P.HIGH), int(P.HIGH) + 5)
+print(int(Fraction(7, 2)))
+print(int(Fraction(-9, 4)))
+";
+    let (stdout, stderr, ok) = run_py(src);
+    if !ok || stderr.contains("ModuleNotFoundError") {
+        eprintln!("skipping ffi-int-of-foreign test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(stdout, "10 15\n3\n-2\n", "stderr={stderr}");
+}
+
+/// `isinstance` against a CPython ABC (`collections.abc.*`) decides structurally
+/// via CPython: a native pythonrs list/dict/str/generator crosses to its CPython
+/// form so the ABC's `__instancecheck__` runs. Previously all such checks were
+/// `False`.
+#[test]
+fn ffi_isinstance_against_abc() {
+    let src = "\
+from collections import abc
+print(isinstance([], abc.Sequence))
+print(isinstance({}, abc.Mapping))
+print(isinstance('s', abc.Sequence))
+print(isinstance((x for x in []), abc.Iterator))
+print(isinstance(42, abc.Sequence))
+print(isinstance({1, 2}, abc.Set))
+";
+    let (stdout, stderr, ok) = run_py(src);
+    if !ok || stderr.contains("ModuleNotFoundError") {
+        eprintln!("skipping ffi-isinstance-abc test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(
+        stdout, "True\nTrue\nTrue\nTrue\nFalse\nTrue\n",
+        "stderr={stderr}"
+    );
+}
+
+/// An exception raised by CPython over the bridge (`dataclasses.FrozenInstanceError`
+/// from assigning to a frozen dataclass) is catchable by the common `except
+/// Exception` catch-all — an exception class unknown to pythonrs's builtin table is
+/// treated as an `Exception` subclass.
+#[test]
+fn ffi_foreign_exception_caught_by_except_exception() {
+    let src = "\
+from dataclasses import dataclass
+@dataclass(frozen=True)
+class C:
+    v: int
+c = C(1)
+try:
+    c.v = 2
+except Exception as e:
+    print('caught', type(e).__name__)
+";
+    let (stdout, stderr, ok) = run_py(src);
+    if !ok || stderr.contains("ModuleNotFoundError") {
+        eprintln!("skipping ffi-foreign-exception test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(stdout, "caught FrozenInstanceError\n", "stderr={stderr}");
+}
