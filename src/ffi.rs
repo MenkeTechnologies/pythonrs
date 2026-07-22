@@ -101,6 +101,34 @@ fn fetch<'py>(py: Python<'py>, id: u32) -> Result<Bound<'py, PyAny>, String> {
     }
 }
 
+/// Convert a CPython exception to pythonrs's terse `"Class: message"` error
+/// string (the same text `PyErr::to_string` yields), and register the exception
+/// type's base-class chain (its `__mro__` names) on the host so pythonrs's
+/// `except` matching can resolve a specific base — `except ValueError` catching a
+/// foreign `json.JSONDecodeError` — which it otherwise has no knowledge of.
+fn pyerr_to_error(py: Python, err: &PyErr) -> String {
+    let ty = err.get_type(py);
+    if let Ok(name) = ty.name() {
+        let class = name.to_string();
+        let mut bases: Vec<String> = Vec::new();
+        if let Ok(mro) = ty.getattr("__mro__") {
+            if let Ok(seq) = mro.try_iter() {
+                for c in seq.flatten() {
+                    if let Ok(n) = c.getattr("__name__").and_then(|n| n.extract::<String>()) {
+                        bases.push(n);
+                    }
+                }
+            }
+        }
+        if !bases.is_empty() {
+            with_host(|h| {
+                h.foreign_exc_bases.insert(class, bases);
+            });
+        }
+    }
+    err.to_string()
+}
+
 /// Import `name` (possibly dotted, e.g. `os.path`) via CPython's own importer and
 /// return a `Foreign` handle to the module object.
 pub fn import(name: &str) -> Result<u32, String> {
@@ -512,7 +540,7 @@ pub fn set_attr(host: &mut PyHost, id: u32, name: &str, value: &Value) -> Result
     Python::with_gil(|py| {
         let obj = fetch(py, id)?;
         let v = value_to_py(host, py, value)?;
-        obj.setattr(name, v).map_err(|e| e.to_string())
+        obj.setattr(name, v).map_err(|e| pyerr_to_error(py, &e))
     })
 }
 
@@ -553,7 +581,7 @@ fn invoke_bound(
     let (arg_tuple, kw) = with_host(|h| build_call_args(h, py, args, kwargs))?;
     let result = callable
         .call(&arg_tuple, kw.as_ref())
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| pyerr_to_error(py, &e))?;
     with_host(|h| {
         // Reflect any in-place mutation the stdlib call made to a by-value
         // mutable-container argument (`heapq.heapify(lst)`, `random.shuffle(lst)`,
@@ -907,7 +935,7 @@ pub fn get_item(host: &mut PyHost, id: u32, idx: &Value) -> Result<Value, String
     Python::with_gil(|py| {
         let obj = fetch(py, id)?;
         let key = value_to_py(host, py, idx)?;
-        let item = obj.get_item(key).map_err(|e| e.to_string())?;
+        let item = obj.get_item(key).map_err(|e| pyerr_to_error(py, &e))?;
         py_to_value(host, py, &item)
     })
 }
@@ -1103,6 +1131,17 @@ pub fn truthy(id: u32) -> bool {
 }
 
 /// The CPython type name of a foreign object (`module`, `re.Pattern`, …).
+/// The `__name__` of a foreign *class* object (`except json.JSONDecodeError` →
+/// `"JSONDecodeError"`). `None` if the handle isn't a class / has no `__name__`.
+pub fn class_name(id: u32) -> Option<String> {
+    Python::with_gil(|py| {
+        let obj = fetch(py, id).ok()?;
+        obj.getattr("__name__")
+            .ok()
+            .and_then(|n| n.extract::<String>().ok())
+    })
+}
+
 pub fn type_name(id: u32) -> String {
     Python::with_gil(|py| match fetch(py, id) {
         Ok(obj) => obj

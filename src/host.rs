@@ -751,6 +751,11 @@ pub struct PyHost {
     /// or `raise X from None`), which sets `__suppress_context__` — the implicit
     /// `__context__` is then hidden from the rendered traceback.
     pub suppress_context: HashSet<u32>,
+    /// Base-class names (its CPython `__mro__`) of each exception type raised over
+    /// the stdlib-ffi bridge, keyed by the exception's class name — so
+    /// `except ValueError` matches a foreign `json.JSONDecodeError`, which pythonrs
+    /// has no builtin knowledge of. Populated at raise time by the ffi error path.
+    pub foreign_exc_bases: HashMap<String, Vec<String>>,
     /// Process arguments exposed to the program as `sys.argv`. Set once per run
     /// by `init_runtime` (`['']` for the REPL/stdin default, `['script', …]` for
     /// a file, `['-c', …]` for `-c`).
@@ -957,6 +962,7 @@ impl PyHost {
             exc_links: HashMap::new(),
             exc_tb: HashMap::new(),
             suppress_context: HashSet::new(),
+            foreign_exc_bases: HashMap::new(),
             argv: vec![String::new()],
             main_file: None,
             prog_source: String::new(),

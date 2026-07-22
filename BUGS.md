@@ -365,13 +365,12 @@ module then raises `ModuleNotFoundError`.
   `IntEnum` member, `Fraction`, …); `isinstance(v, foreign_cls)` against a CPython
   ABC (`collections.abc.Sequence`, …) marshals `v` and lets CPython's structural
   `__instancecheck__` decide; and a CPython exception raised over the bridge (e.g.
-  `dataclasses.FrozenInstanceError`) is caught by `except Exception` (an exception
-  class unknown to the builtin table is treated as an `Exception` subclass).
+  `dataclasses.FrozenInstanceError`) is caught by `except Exception`. A foreign
+  exception also matches a **specific base**: its `__mro__` base names are captured
+  at raise time, so `except ValueError` catches a `json.JSONDecodeError` and
+  `except ArithmeticError` catches `decimal.InvalidOperation`; the exact foreign
+  type (`except json.JSONDecodeError`) matches by its CPython `__name__`.
   Remaining gaps:
-  - **A foreign exception matches only `except Exception`/`BaseException`**, not a
-    specific base (`except ValueError` won't catch a CPython `ValueError` subclass
-    like `json.JSONDecodeError` raised over the bridge) — that needs CPython
-    `issubclass` on the retained exception type, not just the class name.
   - **`collections.namedtuple` field *types*** cross as `PyrsCallable` wrappers,
     not the CPython type objects, so `dataclasses.fields(x)[i].type` on a mirrored
     class is a proxy — the generated `__init__`/`__repr__`/`__eq__` (which use only

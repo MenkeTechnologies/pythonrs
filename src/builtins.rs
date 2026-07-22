@@ -1344,6 +1344,36 @@ fn b_contains(vm: &mut VM, _: u8) -> Value {
             Err(e) => abort(vm, e),
         };
     }
+    // A list/tuple whose membership may hit a user `__eq__` (the searched item or
+    // any element is an instance) compares element-by-element via the rich `==`
+    // dunder outside the host borrow. Scalar-only sequences use the fast path.
+    if with_host(|h| {
+        matches!(
+            h.get(&container),
+            Some(PyObj::List(_)) | Some(PyObj::Tuple(_))
+        )
+    }) {
+        let elems = with_host(|h| match h.get(&container) {
+            Some(PyObj::List(l)) | Some(PyObj::Tuple(l)) => l.clone(),
+            _ => Vec::new(),
+        });
+        let any_instance = with_host(|h| {
+            matches!(h.get(&item), Some(PyObj::Instance(_)))
+                || elems
+                    .iter()
+                    .any(|e| matches!(h.get(e), Some(PyObj::Instance(_))))
+        });
+        if any_instance {
+            for e in &elems {
+                match elem_equal(e, &item) {
+                    Ok(true) => return Value::Bool(true),
+                    Ok(false) => {}
+                    Err(err) => return abort(vm, err),
+                }
+            }
+            return Value::Bool(false);
+        }
+    }
     let cands = host::instance_key_candidates(&container);
     let r = host::with_instance_key(&item, &cands, || {
         with_host(|h| h.contains(&item, &container))
@@ -1592,6 +1622,30 @@ fn dispatch_binop(a: &Value, b: &Value, lname: &str, rname: &str) -> Dunder {
 /// …): dispatch dunders, or `None` to fall through to native handling when
 /// neither operand overloads. On both-declined (`NotImplemented`) with an
 /// instance operand, raise the unsupported-operand `TypeError`.
+/// Element equality for `in` / `list.index` / `list.count` / `list.remove` on a
+/// list or tuple — CPython's `PyObject_RichCompareBool`: identity first (so
+/// `nan in [nan]` with the same object is `True`), then the `==` dunder when a
+/// user instance is involved, else native value equality. `elem` is the sequence
+/// element (forward operand), `target` the searched value, matching CPython's
+/// `RichCompareBool(item, value, Py_EQ)`.
+fn elem_equal(elem: &Value, target: &Value) -> Result<bool, String> {
+    if identity_eq(elem, target) {
+        return Ok(true);
+    }
+    let needs_dunder = with_host(|h| {
+        matches!(h.get(elem), Some(PyObj::Instance(_)))
+            || matches!(h.get(target), Some(PyObj::Instance(_)))
+    });
+    if needs_dunder {
+        return match dispatch_binop(elem, target, "__eq__", "__eq__") {
+            Dunder::Value(v) => Ok(with_host(|h| h.truthy(&v))),
+            Dunder::Err(e) => Err(e),
+            Dunder::NotImplemented => Ok(with_host(|h| h.equal(elem, target))),
+        };
+    }
+    Ok(with_host(|h| h.equal(elem, target)))
+}
+
 fn try_binop_dunder(
     a: &Value,
     b: &Value,
@@ -2536,6 +2590,15 @@ fn exc_matches(h: &host::PyHost, exc: &Value, typ: &Value) -> bool {
     }
     let want = match callable_name(h, typ) {
         Some(n) => n,
+        // A foreign exception class (`except json.JSONDecodeError`) resolves by
+        // its CPython `__name__`, matched against the raised exception's recorded
+        // base chain by `exception_isa`.
+        #[cfg(feature = "stdlib-ffi")]
+        None => match h.foreign_id(typ).and_then(crate::ffi::class_name) {
+            Some(n) => n,
+            None => return false,
+        },
+        #[cfg(not(feature = "stdlib-ffi"))]
         None => return false,
     };
     exception_isa(&exc_class, &want, h)
@@ -5112,13 +5175,20 @@ fn exception_isa(exc_class: &str, want: &str, h: &host::PyHost) -> bool {
             }
         }
     }
-    // A CPython stdlib exception raised over the bridge (e.g.
-    // `dataclasses.FrozenInstanceError`) is unknown to pythonrs's builtin table
-    // and isn't a user class; treat it as an `Exception` subclass so the common
-    // catch-all `except Exception` matches. Nearly all exceptions derive from
-    // `Exception`, and the non-`Exception` `BaseException` subclasses
-    // (`KeyboardInterrupt`, `SystemExit`, `GeneratorExit`) are all builtins in the
-    // table, so this never misclassifies one of those.
+    // A CPython exception raised over the bridge (e.g. `json.JSONDecodeError`, a
+    // `ValueError` subclass): its base-class chain was captured at raise time, so
+    // `except ValueError` matches by consulting the recorded `__mro__` names.
+    if let Some(bases) = h.foreign_exc_bases.get(exc_class) {
+        if bases.iter().any(|b| b == want) {
+            return true;
+        }
+    }
+    // A CPython stdlib exception unknown to pythonrs's builtin table (and not a
+    // user class) with no recorded base chain: treat it as an `Exception`
+    // subclass so the common catch-all `except Exception` still matches. Nearly
+    // all exceptions derive from `Exception`, and the non-`Exception`
+    // `BaseException` subclasses (`KeyboardInterrupt`, `SystemExit`,
+    // `GeneratorExit`) are all builtins in the table.
     if want == "Exception" && !is_exception_class(exc_class) && !h.classes.contains_key(exc_class) {
         return true;
     }
@@ -5745,7 +5815,7 @@ pub fn call_type_method(
             }
             str_method(recv, name, &a2)
         }
-        "str" => str_method(recv, name, &args),
+        "str" => str_method(recv, name, &fold_str_kwargs(name, &args, &kwargs)?),
         // `bytes/bytearray.decode(encoding=..., errors=...)` — fold keywords into
         // the positional (encoding, errors) order the decoder expects.
         "bytes" | "bytearray" if name == "decode" && !kwargs.is_empty() => {
@@ -6057,6 +6127,71 @@ fn str_splitlines(s: &str, keepends: bool) -> Vec<String> {
         out.push(chars[start..].iter().collect());
     }
     out
+}
+
+/// The positional index a keyword argument occupies for a `str` method that
+/// accepts keywords (`"a b".split(maxsplit=1)` → `maxsplit` is arg 1). Only the
+/// argument-clinic methods below take keywords; every other `str` method is
+/// `METH_VARARGS`-only and rejects them (see `str_accepts_kwargs`). `None` = an
+/// unexpected keyword for that method.
+fn str_kwarg_pos(method: &str, kw: &str) -> Option<usize> {
+    Some(match (method, kw) {
+        ("split" | "rsplit", "sep") => 0,
+        ("split" | "rsplit", "maxsplit") => 1,
+        ("replace", "old") => 0,
+        ("replace", "new") => 1,
+        ("replace", "count") => 2,
+        ("expandtabs", "tabsize") | ("splitlines", "keepends") => 0,
+        _ => return None,
+    })
+}
+
+/// Whether CPython accepts keyword arguments for this `str` method. Most reject
+/// them (`str.center() takes no keyword arguments`); only these argument-clinic
+/// methods accept keywords. (`encode`/`splitlines`-with-kwargs are folded by
+/// dedicated arms before reaching here; both are listed for completeness.)
+fn str_accepts_kwargs(method: &str) -> bool {
+    matches!(
+        method,
+        "split" | "rsplit" | "replace" | "expandtabs" | "splitlines" | "encode"
+    )
+}
+
+/// Fold keyword arguments into the positional slots `str_method` reads, so a
+/// keyword call (`"a b c".split(maxsplit=1)`) behaves like the positional form.
+/// A method that does not accept keywords, or an unexpected keyword name, raises
+/// the same `TypeError` CPython does. Unfilled interior slots become
+/// `Value::Undef` (treated as "not given").
+fn fold_str_kwargs(
+    method: &str,
+    args: &[Value],
+    kwargs: &[(String, Value)],
+) -> Result<Vec<Value>, String> {
+    if kwargs.is_empty() {
+        return Ok(args.to_vec());
+    }
+    if !str_accepts_kwargs(method) {
+        return Err(format!(
+            "TypeError: str.{method}() takes no keyword arguments"
+        ));
+    }
+    let mut out: Vec<Option<Value>> = args.iter().cloned().map(Some).collect();
+    for (k, v) in kwargs {
+        match str_kwarg_pos(method, k) {
+            Some(pos) => {
+                if pos >= out.len() {
+                    out.resize(pos + 1, None);
+                }
+                out[pos] = Some(v.clone());
+            }
+            None => {
+                return Err(format!(
+                    "TypeError: {method}() got an unexpected keyword argument '{k}'"
+                ))
+            }
+        }
+    }
+    Ok(out.into_iter().map(|o| o.unwrap_or(Value::Undef)).collect())
 }
 
 fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
@@ -7033,22 +7168,30 @@ fn list_method(
         }
         "remove" => {
             let v = arg0(args)?;
-            with_host(|h| {
-                let pos = if let Some(PyObj::List(l)) = h.get(recv) {
-                    l.iter().position(|x| h.equal(x, &v))
-                } else {
-                    None
-                };
-                match pos {
-                    Some(p) => {
+            // Locate via the rich `==` dunder (outside the borrow) so a user
+            // `__eq__` is honored, then remove the first match.
+            let elems = with_host(|h| match h.get(recv) {
+                Some(PyObj::List(l)) => l.clone(),
+                _ => Vec::new(),
+            });
+            let mut pos = None;
+            for (i, e) in elems.iter().enumerate() {
+                if elem_equal(e, &v)? {
+                    pos = Some(i);
+                    break;
+                }
+            }
+            match pos {
+                Some(p) => {
+                    with_host(|h| {
                         if let Some(PyObj::List(l)) = h.get_mut(recv) {
                             l.remove(p);
                         }
-                        Ok(Value::Undef)
-                    }
-                    None => Err("ValueError: list.remove(x): x not in list".into()),
+                    });
+                    Ok(Value::Undef)
                 }
-            })
+                None => Err("ValueError: list.remove(x): x not in list".into()),
+            }
         }
         "clear" => {
             with_host(|h| {
@@ -7086,30 +7229,34 @@ fn list_method(
             if stop > n {
                 stop = n;
             }
-            with_host(|h| {
-                if let Some(PyObj::List(l)) = h.get(recv) {
-                    let mut i = start;
-                    while i < stop {
-                        if h.equal(&l[i as usize], &v) {
-                            return Ok(Value::Int(i));
-                        }
-                        i += 1;
-                    }
-                    Err("ValueError: list.index(x): x not in list".into())
-                } else {
-                    Err(host::type_error("not a list"))
+            // Compare via the rich `==` dunder (outside the borrow) so a user
+            // `__eq__` is honored; the element is the forward operand.
+            let elems = with_host(|h| match h.get(recv) {
+                Some(PyObj::List(l)) => l.clone(),
+                _ => Vec::new(),
+            });
+            let mut i = start;
+            while i < stop {
+                if elem_equal(&elems[i as usize], &v)? {
+                    return Ok(Value::Int(i));
                 }
-            })
+                i += 1;
+            }
+            Err("ValueError: list.index(x): x not in list".into())
         }
         "count" => {
             let v = arg0(args)?;
-            Ok(Value::Int(with_host(|h| {
-                if let Some(PyObj::List(l)) = h.get(recv) {
-                    l.iter().filter(|x| h.equal(x, &v)).count() as i64
-                } else {
-                    0
+            let elems = with_host(|h| match h.get(recv) {
+                Some(PyObj::List(l)) => l.clone(),
+                _ => Vec::new(),
+            });
+            let mut n = 0i64;
+            for e in &elems {
+                if elem_equal(e, &v)? {
+                    n += 1;
                 }
-            })))
+            }
+            Ok(Value::Int(n))
         }
         "reverse" => {
             with_host(|h| {
