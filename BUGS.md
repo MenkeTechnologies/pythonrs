@@ -67,7 +67,14 @@ fixed. Every line below was re-checked against the **default-build** binary
   exception, a falsy/`None` return re-raises. On the normal path `__exit__` is
   called once with `(None, None, None)`. `with A, B:` nests independently, so an
   inner manager's suppression hides the exception from the outer one. `__enter__`'s
-  return value binds to the `as` target.
+  return value binds to the `as` target. A **foreign** context manager
+  (`contextlib.suppress`, …) works on the error path too: the pythonrs exception is
+  reconstructed as a real CPython exception for its `__exit__`, so `suppress`
+  matches it (including by base class). `contextlib.redirect_stdout`/
+  `redirect_stderr` and `sys.stdout = io.StringIO()` retarget pythonrs's own
+  `print` (a native redirect; a CPython one only touches CPython's stream, which
+  print doesn't consult); nesting restores correctly and `sys.__stdout__`/
+  `__stderr__`/`__stdin__` keep the native streams.
 - **User exception subclasses** inherit `BaseException`: `class E(Exception)`
   instances carry `args` (seeded by construction / `super().__init__` / direct
   assignment), stringify to the message (`''`/`str(arg)`/`repr(tuple)`), repr as
