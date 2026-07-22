@@ -369,9 +369,19 @@ module then raises `ModuleNotFoundError`.
   exception also matches a **specific base**: its `__mro__` base names are captured
   at raise time, so `except ValueError` catches a `json.JSONDecodeError` and
   `except ArithmeticError` catches `decimal.InvalidOperation`; the exact foreign
-  type (`except json.JSONDecodeError`) matches by its CPython `__name__`.
+  type (`except json.JSONDecodeError`) matches by its CPython `__name__`. A
+  `@dataclass` instance also matches a `match` class pattern (positional via
+  `__match_args__`/keyword), routed through CPython `isinstance` + bridge attribute
+  reads.
   Remaining gaps:
   - **`collections.namedtuple` field *types*** cross as `PyrsCallable` wrappers,
     not the CPython type objects, so `dataclasses.fields(x)[i].type` on a mirrored
     class is a proxy — the generated `__init__`/`__repr__`/`__eq__` (which use only
     field names) are unaffected.
+  - **A class with a foreign base cascades to a foreign class**, so a zero-arg
+    `super()` in one of its methods raises `super(): no arguments` — the pythonrs
+    method runs on the CPython mirror without a native `__class__`/`self` frame.
+    This bites `class C(abc.ABC)` hierarchies (`abc.ABC` is foreign): native
+    `abc.ABC`/`@abstractmethod` are not yet recognized, so use a plain base class
+    (a method raising `NotImplementedError`) for now. A native-base hierarchy's
+    `super()`/MRO is unaffected.

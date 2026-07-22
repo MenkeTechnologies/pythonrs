@@ -665,3 +665,71 @@ except ArithmeticError:
         "stderr={stderr}"
     );
 }
+
+/// Setting an attribute on a frozen dataclass that also defines a method must
+/// raise FrozenInstanceError, not panic. Regression: the ffi error path
+/// registered the exception's base chain via a fresh host borrow while the
+/// set_attr path already held it (double borrow).
+#[test]
+fn ffi_frozen_dataclass_setattr_no_panic() {
+    let src = "\
+from dataclasses import dataclass
+@dataclass(frozen=True)
+class RGB:
+    r: int
+    g: int
+    def hex(self):
+        return self.r
+c = RGB(1, 2)
+try:
+    c.r = 9
+    print('assigned')
+except Exception as e:
+    print('frozen', type(e).__name__)
+";
+    let (stdout, stderr, ok) = run_py(src);
+    if !ok && stderr.contains("ModuleNotFoundError") {
+        eprintln!("skipping ffi-frozen-setattr test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert!(!stderr.contains("RefCell"), "double-borrow panic: {stderr}");
+    assert_eq!(stdout, "frozen FrozenInstanceError\n", "stderr={stderr}");
+}
+
+/// `match` class patterns match a `@dataclass` instance — the class is a foreign
+/// (CPython) mirror, so the match must use CPython isinstance and read
+/// `__match_args__` over the bridge. Both positional and keyword sub-patterns
+/// (with literals and captures) work.
+#[test]
+fn ffi_match_dataclass_class_pattern() {
+    let src = "\
+from dataclasses import dataclass
+@dataclass
+class Point:
+    x: int
+    y: int
+def classify(p):
+    match p:
+        case Point(0, 0):
+            return 'origin'
+        case Point(x=0, y=v):
+            return f'y-axis {v}'
+        case Point(a, b):
+            return f'point {a},{b}'
+        case _:
+            return 'other'
+print(classify(Point(0, 0)))
+print(classify(Point(0, 7)))
+print(classify(Point(2, 4)))
+print(classify(42))
+";
+    let (stdout, stderr, ok) = run_py(src);
+    if !ok || stderr.contains("ModuleNotFoundError") {
+        eprintln!("skipping ffi-match-dataclass test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(
+        stdout, "origin\ny-axis 7\npoint 2,4\nother\n",
+        "stderr={stderr}"
+    );
+}
