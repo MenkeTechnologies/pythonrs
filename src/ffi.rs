@@ -49,21 +49,47 @@ fn table() -> &'static Mutex<Vec<Py<PyAny>>> {
 /// Resolve the CPython prefix to hand to `PYTHONHOME`, or `None` to let the
 /// linked libpython locate its own stdlib (the system-CPython path).
 ///
-/// Order: `PYTHONRS_STDLIB` env → bundled `<exe_dir>/../lib/python3.14` → system.
+/// Order: `PYTHONRS_STDLIB` env → bundled `<exe_dir>/../lib/python3.*` →
+/// per-user `~/.pythonrs/lib/python3.*` (the `install.sh` target) → system.
 fn resolve_home() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("PYTHONRS_STDLIB") {
         return Some(PathBuf::from(p));
     }
+    // A bundled tree next to the binary (`<prefix>/bin/python`,
+    // `<prefix>/lib/python3.*`); `PYTHONHOME` wants the prefix (`<exe>/..`).
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            // The stdlib is `<prefix>/lib/python3.14`; `PYTHONHOME` wants the
-            // prefix, so a bundled tree next to the binary makes home `<exe>/..`.
-            if dir.join("../lib/python3.14").is_dir() {
-                return dir.parent().map(PathBuf::from);
+            if let Some(prefix) = dir.parent() {
+                if has_stdlib(prefix) {
+                    return Some(prefix.to_path_buf());
+                }
             }
         }
     }
+    // The `~/.pythonrs` install (co-located with the bytecode cache), so a binary
+    // placed anywhere on `PATH` still finds the vendored stdlib.
+    if let Some(home) = dirs::home_dir() {
+        let prefix = home.join(".pythonrs");
+        if has_stdlib(&prefix) {
+            return Some(prefix);
+        }
+    }
     None
+}
+
+/// Whether `prefix/lib/python3.*` (the stdlib tree) exists under `prefix`.
+fn has_stdlib(prefix: &std::path::Path) -> bool {
+    let libdir = prefix.join("lib");
+    std::fs::read_dir(&libdir)
+        .map(|entries| {
+            entries.flatten().any(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("python3."))
+                    && e.path().is_dir()
+            })
+        })
+        .unwrap_or(false)
 }
 
 /// Initialize the embedded interpreter once, after pinning `PYTHONHOME` so the
