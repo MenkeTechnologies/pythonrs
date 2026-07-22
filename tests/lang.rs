@@ -2327,6 +2327,58 @@ fn str_method_keyword_arguments() {
     );
 }
 
+/// The native `math.gcd`/`floor`/`ceil` are bignum-safe: `gcd` is variadic
+/// (CPython 3.9+) and does not truncate an operand beyond `i64` to `0`, and
+/// `floor`/`ceil` of a large float produce an exact `int`, not the i64-saturated
+/// cast.
+#[test]
+fn math_bignum_safe() {
+    assert_eq!(
+        g(
+            "import math\nx = math.gcd(123456789012345678901234567890, 987654321)",
+            "x"
+        ),
+        "9"
+    );
+    assert_eq!(g("import math\nx = math.gcd(2**70, 12)", "x"), "4");
+    assert_eq!(g("import math\nx = math.gcd(24, 36, 48)", "x"), "12");
+    assert_eq!(g("import math\nx = math.gcd()", "x"), "0");
+    assert_eq!(
+        g("import math\nx = math.floor(1e20)", "x"),
+        "100000000000000000000"
+    );
+    assert_eq!(
+        g("import math\nx = math.ceil(-1e20)", "x"),
+        "-100000000000000000000"
+    );
+    assert_eq!(g("import math\nx = math.floor(3.7)", "x"), "3");
+}
+
+/// `str.title`/`capitalize` use the Unicode *titlecase* mapping for the leading
+/// letter, not uppercase — the Latin digraph ligatures (`ǳ` → `ǲ`, not `Ǳ`)
+/// differ. `str.isdecimal`/`isdigit`/`isnumeric` follow the Unicode
+/// Decimal/Digit/Numeric properties (other scripts' decimals, superscripts,
+/// circled digits, fractions), not just ASCII.
+#[test]
+fn unicode_titlecase_and_numeric_predicates() {
+    assert_eq!(g("x = '\u{01F3}'.title()", "x"), "'\u{01F2}'");
+    assert_eq!(g("x = '\u{01F3}'.upper()", "x"), "'\u{01F1}'");
+    assert_eq!(g("x = '\u{01C6}xyz'.capitalize()", "x"), "'\u{01C5}xyz'");
+    assert_eq!(g("x = 'hello world'.title()", "x"), "'Hello World'");
+    // Decimal: other scripts' Nd digits, not superscripts/fractions.
+    assert_eq!(g("x = '\u{0969}'.isdecimal()", "x"), "True"); // Devanagari 3
+    assert_eq!(g("x = '\u{FF15}'.isdecimal()", "x"), "True"); // fullwidth 5
+    assert_eq!(g("x = '\u{00B2}'.isdecimal()", "x"), "False"); // superscript 2
+                                                               // Digit: decimals plus Numeric_Type=Digit (superscripts, circled).
+    assert_eq!(g("x = '\u{00B2}'.isdigit()", "x"), "True"); // superscript 2
+    assert_eq!(g("x = '\u{2465}'.isdigit()", "x"), "True"); // circled 6
+    assert_eq!(g("x = '\u{00BD}'.isdigit()", "x"), "False"); // 1/2 fraction
+                                                             // Numeric: also fractions and letter-numbers.
+    assert_eq!(g("x = '\u{00BD}'.isnumeric()", "x"), "True"); // 1/2
+    assert_eq!(g("x = '\u{2167}'.isnumeric()", "x"), "True"); // Roman VIII
+    assert_eq!(g("x = '\u{2167}'.isdigit()", "x"), "False");
+}
+
 /// List/tuple membership (`in`), `.index`, `.count`, and `.remove` honor a user
 /// `__eq__` (CPython's `PyObject_RichCompareBool` — identity first, then `==`),
 /// not native identity. Previously an instance was found only by identity.
