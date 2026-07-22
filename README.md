@@ -29,7 +29,7 @@ execution and codegen live in `fusevm` — the same engine behind
 [`elisprs`](https://github.com/MenkeTechnologies/elisprs), and
 [`rubylang`](https://github.com/MenkeTechnologies/rubylang).
 
-It is, to our knowledge, the first compiled standalone Python runtime that both
+It is the first compiled standalone Python runtime that both
 **transparently caches bytecode via rkyv on every run** and **AOT-compiles a
 script to a native executable**.
 
