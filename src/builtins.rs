@@ -3048,6 +3048,19 @@ pub fn call_builtin_function(
     if name == "functools.total_ordering" {
         return call_total_ordering(&args);
     }
+    // contextlib.redirect_stdout(target) / redirect_stderr(target) — native
+    // context managers that retarget pythonrs's own print stream.
+    if name == "contextlib.redirect_stdout" || name == "contextlib.redirect_stderr" {
+        let target = arg0(&args)?;
+        let stderr = name.ends_with("stderr");
+        return Ok(with_host(|h| {
+            h.alloc(PyObj::Redirect {
+                stderr,
+                target,
+                saved: None,
+            })
+        }));
+    }
     // functools.cached_property(func) — a native non-data descriptor. Its `name`
     // is filled from the class-namespace key at class-build time.
     if name == "functools.cached_property" {
@@ -3152,20 +3165,13 @@ pub fn call_builtin_function(
                 parts.push(py_str(a)?);
             }
             let out = format!("{}{}", parts.join(&sep), end);
-            // `file=` routes to a file/stream object (e.g. `sys.stderr`); the
-            // default and an explicit `sys.stdout` go to stdout.
-            let file_id = kw_get(&kwargs, "file")
-                .filter(|f| !matches!(f, Value::Undef))
-                .and_then(|f| with_host(|h| h.file_id(&f)));
-            match file_id {
-                Some(id) if id != 0 => {
-                    with_host(|h| h.io_write(id, &out))?;
-                }
-                _ => {
-                    use std::io::Write;
-                    let _ = std::io::stdout().write_all(out.as_bytes());
-                    let _ = std::io::stdout().flush();
-                }
+            // An explicit `file=` writes to that stream (a native `File` such as
+            // `sys.stderr`, or any object with `write` — a `StringIO`); with no
+            // `file=`, write to the current `sys.stdout` (honoring a redirect).
+            let file = kw_get(&kwargs, "file").filter(|f| !matches!(f, Value::Undef));
+            match file {
+                Some(f) => host::write_to_stream(&f, &out)?,
+                None => host::write_stdout(&out)?,
             }
             Ok(Value::Undef)
         }

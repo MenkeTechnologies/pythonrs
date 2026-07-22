@@ -369,6 +369,19 @@ fn value_to_py<'py>(
                     .call1((cname.as_str(), bases, ns_dict))
                     .map_err(|e| e.to_string())
             }
+            // A builtin exception passed into a CPython call — e.g. the exception
+            // value handed to a foreign context manager's `__exit__` (`with
+            // contextlib.suppress(ZeroDivisionError): …`). Reconstruct the real
+            // CPython exception instance from its class name + args.
+            Some(PyObj::Exception { class, args }) => {
+                let ctor = py
+                    .import("builtins")
+                    .and_then(|m| m.getattr(class.as_str()))
+                    .map_err(|e| e.to_string())?;
+                let pargs = marshal_seq(host, py, args)?;
+                let tup = PyTuple::new(py, pargs).map_err(|e| e.to_string())?;
+                ctor.call1(tup).map_err(|e| e.to_string())
+            }
             // A pythonrs instance passed into a CPython call (`operator.attrgetter
             // ("x")(pt)`, `sorted(objs, key=itemgetter(0))`, `json.dumps(obj,
             // default=...)`) is wrapped so CPython's attribute/item access,

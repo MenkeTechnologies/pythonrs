@@ -487,6 +487,15 @@ pub enum PyObj {
         func: Value,
         name: String,
     },
+    /// A `contextlib.redirect_stdout` / `redirect_stderr` context manager. On
+    /// `__enter__` it saves the current stream target into `saved` and points the
+    /// stream at `target`; `__exit__` restores `saved`. `stderr` selects which
+    /// stream; nesting works because each instance holds its own `saved`.
+    Redirect {
+        stderr: bool,
+        target: Value,
+        saved: Option<Value>,
+    },
     /// The `NotImplemented` singleton: returned by a binary/comparison dunder to
     /// signal "this operand pair is not my business", so the interpreter tries the
     /// reflected operation (and, for `==`/`!=`, falls back to identity).
@@ -758,6 +767,14 @@ pub struct PyHost {
     /// Frames captured (innermost first) as an exception unwinds the call stack,
     /// each `(scope_name, line)`. Cleared when the exception is caught.
     pub traceback: Vec<(String, u32)>,
+    /// The current `sys.stdout` / `sys.stderr` targets when reassigned away from
+    /// the native streams (`sys.stdout = io.StringIO()`,
+    /// `contextlib.redirect_stdout`). `None` = the native stream. Tracked on the
+    /// host (not a module ns) because `import` is not cached, so different `sys`
+    /// module instances must share one redirect. `print` and the REPL displayhook
+    /// consult these.
+    pub stdout_target: Option<Value>,
+    pub stderr_target: Option<Value>,
 }
 
 /// Whether a `GenCell` backs a plain generator, an `async def` coroutine, or
@@ -946,6 +963,8 @@ impl PyHost {
             tb_filename: "<string>".to_string(),
             tb_show_source: true,
             traceback: Vec::new(),
+            stdout_target: None,
+            stderr_target: None,
         }
     }
 
@@ -1723,7 +1742,7 @@ fn module_ffi_fallback(
     mname: &str,
     name: &str,
 ) -> Option<Result<Value, String>> {
-    if !matches!(mname, "math" | "collections" | "functools") {
+    if !matches!(mname, "math" | "collections" | "functools" | "contextlib") {
         return None;
     }
     match crate::ffi::import(mname) {
@@ -1827,6 +1846,13 @@ impl PyHost {
                 Some(PyObj::ClassMethod(_)) => "classmethod".into(),
                 Some(PyObj::Property { .. }) => "property".into(),
                 Some(PyObj::CachedProperty { .. }) => "cached_property".into(),
+                Some(PyObj::Redirect { stderr, .. }) => {
+                    if *stderr {
+                        "redirect_stderr".into()
+                    } else {
+                        "redirect_stdout".into()
+                    }
+                }
                 Some(PyObj::NotImplemented) => "NotImplementedType".into(),
                 Some(PyObj::Ellipsis) => "ellipsis".into(),
                 #[cfg(feature = "stdlib-ffi")]
@@ -2020,6 +2046,14 @@ impl PyHost {
                 }
                 Some(PyObj::Property { .. }) => "<property object>".into(),
                 Some(PyObj::CachedProperty { .. }) => "<functools.cached_property object>".into(),
+                Some(PyObj::Redirect { stderr, .. }) => {
+                    let nm = if *stderr {
+                        "redirect_stderr"
+                    } else {
+                        "redirect_stdout"
+                    };
+                    format!("<contextlib.{nm} object at 0x{:012x}>", self.addr_of(v))
+                }
                 Some(PyObj::NotImplemented) => "NotImplemented".into(),
                 Some(PyObj::Ellipsis) => "Ellipsis".into(),
                 #[cfg(feature = "stdlib-ffi")]
@@ -5510,6 +5544,23 @@ impl PyHost {
                 return Ok(self.new_tuple(items));
             }
         }
+        // `sys.stdout` / `sys.stderr` resolve to the current redirect target when
+        // one is active (`redirect_stdout`, or `sys.stdout = …`), so the attribute
+        // reflects the live stream regardless of which `sys` instance is read
+        // (`import` is not cached). `sys.__stdout__` keeps the native stream.
+        if let Some(PyObj::Module { name: mname, .. }) = self.get(recv) {
+            if mname == "sys" {
+                if name == "stdout" {
+                    if let Some(t) = self.stdout_target.clone() {
+                        return Ok(t);
+                    }
+                } else if name == "stderr" {
+                    if let Some(t) = self.stderr_target.clone() {
+                        return Ok(t);
+                    }
+                }
+            }
+        }
         // Native-shadowed module: fast-path the native namespace, else defer to
         // the real CPython module over the FFI bridge. Resolved before the
         // borrowing match below because the fallback needs `&mut self`.
@@ -6283,6 +6334,27 @@ impl PyHost {
             self.inst_attr_set(&dict, name, val);
             return Ok(());
         }
+        // `sys.stdout` / `sys.stderr` reassignment records a host-level redirect
+        // (see the `stdout_target`/`stderr_target` fields), so `print` writes to
+        // the new stream even though `import` is not cached. A reset back to the
+        // native stream (`File { id: 0/1 }`) clears the redirect.
+        if let Some(PyObj::Module { name: mname, .. }) = self.get(recv) {
+            if mname == "sys" && (name == "stdout" || name == "stderr") {
+                let is_stdout = name == "stdout";
+                let native_id = if is_stdout { 0 } else { 1 };
+                let target = match &val {
+                    v if matches!(self.get(v), Some(PyObj::File { id }) if *id == native_id) => {
+                        None
+                    }
+                    _ => Some(val.clone()),
+                };
+                if is_stdout {
+                    self.stdout_target = target;
+                } else {
+                    self.stderr_target = target;
+                }
+            }
+        }
         match self.get_mut(recv) {
             Some(PyObj::Module { ns, .. }) => {
                 ns.insert(name.to_string(), val);
@@ -6746,6 +6818,47 @@ pub fn call_method(
 ) -> Result<Value, String> {
     let obj = with_host(|h| h.get(recv).cloned());
     match obj {
+        // `contextlib.redirect_stdout`/`redirect_stderr` context manager: retarget
+        // the stream on `__enter__` (saving the prior target on the instance so
+        // nesting restores correctly) and restore it on `__exit__`.
+        Some(PyObj::Redirect { stderr, target, .. }) => match name {
+            "__enter__" => {
+                with_host(|h| {
+                    let cur = if stderr {
+                        h.stderr_target.clone()
+                    } else {
+                        h.stdout_target.clone()
+                    };
+                    if let Some(PyObj::Redirect { saved, .. }) = h.get_mut(recv) {
+                        *saved = cur;
+                    }
+                    let new = Some(target.clone());
+                    if stderr {
+                        h.stderr_target = new;
+                    } else {
+                        h.stdout_target = new;
+                    }
+                });
+                Ok(target)
+            }
+            "__exit__" => {
+                with_host(|h| {
+                    let saved = match h.get(recv) {
+                        Some(PyObj::Redirect { saved, .. }) => saved.clone(),
+                        _ => None,
+                    };
+                    if stderr {
+                        h.stderr_target = saved;
+                    } else {
+                        h.stdout_target = saved;
+                    }
+                });
+                Ok(Value::Bool(false))
+            }
+            _ => Err(format!(
+                "AttributeError: 'redirect' object has no attribute '{name}'"
+            )),
+        },
         Some(PyObj::Instance(inst)) => {
             // instance attribute that is callable?
             if let Some(v) = with_host(|h| h.inst_attr(&inst.dict, name)) {
@@ -8970,6 +9083,23 @@ pub fn import_module(name: &str) -> Result<Value, String> {
                 ),
             ]
         }),
+        // `contextlib` is native-shadowed for `redirect_stdout`/`redirect_stderr`,
+        // which must retarget pythonrs's own `print` stream (a CPython
+        // redirect_stdout retargets CPython's `sys.stdout`, which pythonrs's print
+        // doesn't consult). Every other member defers to the real CPython module.
+        #[cfg(feature = "stdlib-ffi")]
+        "contextlib" => with_host(|h| {
+            vec![
+                (
+                    "redirect_stdout",
+                    h.alloc(PyObj::Builtin("contextlib.redirect_stdout".into())),
+                ),
+                (
+                    "redirect_stderr",
+                    h.alloc(PyObj::Builtin("contextlib.redirect_stderr".into())),
+                ),
+            ]
+        }),
         "math" => with_host(|h| {
             vec![
                 ("pi", Value::Float(std::f64::consts::PI)),
@@ -9001,6 +9131,11 @@ pub fn import_module(name: &str) -> Result<Value, String> {
             let stdout = h.alloc(PyObj::File { id: 0 });
             let stderr = h.alloc(PyObj::File { id: 1 });
             let stdin = h.alloc(PyObj::File { id: 2 });
+            // `sys.__stdout__` / `__stderr__` / `__stdin__` — the original streams,
+            // unaffected by a `sys.stdout` reassignment or `redirect_stdout`.
+            let orig_stdout = h.alloc(PyObj::File { id: 0 });
+            let orig_stderr = h.alloc(PyObj::File { id: 1 });
+            let orig_stdin = h.alloc(PyObj::File { id: 2 });
             // `sys.version_info` — a `(major, minor, micro, releaselevel, serial)`
             // namedtuple matching the emulated CPython.
             let vi_vals = vec![
@@ -9054,6 +9189,9 @@ pub fn import_module(name: &str) -> Result<Value, String> {
                 ("stdout", stdout),
                 ("stderr", stderr),
                 ("stdin", stdin),
+                ("__stdout__", orig_stdout),
+                ("__stderr__", orig_stderr),
+                ("__stdin__", orig_stdin),
                 ("exit", h.alloc(PyObj::Builtin("sys.exit".into()))),
                 (
                     "getrecursionlimit",
@@ -9488,6 +9626,53 @@ pub fn open_file(path: &str, mode: &str) -> Result<Value, String> {
     Ok(with_host(|h| {
         h.io_alloc_file(f, path.to_string(), readable, writable)
     }))
+}
+
+// ── stdout/stderr stream routing ─────────────────────────────────────────────
+
+/// Write `s` to a print target: a native `File` handle uses `io_write` (so
+/// `sys.__stdout__` and explicit file handles always reach the real stream); any
+/// other object (a CPython `StringIO`, a user object with `write`) has its `write`
+/// method called (no host borrow held, so the callee can re-enter).
+pub fn write_to_stream(target: &Value, s: &str) -> Result<(), String> {
+    if let Some(id) = with_host(|h| h.file_id(target)) {
+        with_host(|h| h.io_write(id, s))?;
+        return Ok(());
+    }
+    let sv = with_host(|h| h.new_str(s.to_string()));
+    call_method(target, "write", vec![sv], vec![])?;
+    Ok(())
+}
+
+/// Write `s` to the current `sys.stdout` — its redirect target if reassigned
+/// (`sys.stdout = io.StringIO()`, `contextlib.redirect_stdout`), else the native
+/// stdout stream.
+pub fn write_stdout(s: &str) -> Result<(), String> {
+    match with_host(|h| h.stdout_target.clone()) {
+        Some(t) => write_to_stream(&t, s),
+        None => {
+            use std::io::Write;
+            let mut o = std::io::stdout();
+            let _ = o.write_all(s.as_bytes());
+            let _ = o.flush();
+            Ok(())
+        }
+    }
+}
+
+/// Write `s` to the current `sys.stderr` — its redirect target if reassigned,
+/// else the native stderr stream.
+pub fn write_stderr(s: &str) -> Result<(), String> {
+    match with_host(|h| h.stderr_target.clone()) {
+        Some(t) => write_to_stream(&t, s),
+        None => {
+            use std::io::Write;
+            let mut o = std::io::stderr();
+            let _ = o.write_all(s.as_bytes());
+            let _ = o.flush();
+            Ok(())
+        }
+    }
 }
 
 // ── collections constructors ─────────────────────────────────────────────────

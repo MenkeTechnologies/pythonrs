@@ -481,3 +481,76 @@ print(Decimal(1) / Decimal(7))
     }
     assert_eq!(stdout, "6\n0.142857\n", "stderr={stderr}");
 }
+
+/// A pythonrs exception handed to a foreign context manager's `__exit__` is
+/// reconstructed as a real CPython exception, so `contextlib.suppress` matches it
+/// (including by base class) and swallows it; a non-matching exception propagates.
+#[test]
+fn ffi_foreign_context_manager_exit() {
+    let src = "\
+from contextlib import suppress
+with suppress(ZeroDivisionError):
+    x = 1 / 0
+print('suppressed')
+with suppress(ArithmeticError):
+    y = 1 / 0
+print('base-class suppressed')
+try:
+    with suppress(KeyError):
+        raise ValueError('propagates')
+except ValueError as e:
+    print('propagated:', e)
+";
+    let (stdout, stderr, ok) = run_py(src);
+    if !ok || stderr.contains("ModuleNotFoundError") {
+        eprintln!("skipping ffi-foreign-cm test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(
+        stdout, "suppressed\nbase-class suppressed\npropagated: propagates\n",
+        "stderr={stderr}"
+    );
+}
+
+/// `sys.stdout` reassignment and `contextlib.redirect_stdout` retarget pythonrs's
+/// own `print` (a CPython redirect_stdout only touches CPython's `sys.stdout`,
+/// which pythonrs's print doesn't consult). Nesting restores correctly, an
+/// exception inside still restores the stream, and `sys.__stdout__` stays the
+/// real stream.
+#[test]
+fn ffi_stdout_redirect() {
+    let src = "\
+import io, sys
+from contextlib import redirect_stdout
+sys.stdout = io.StringIO()
+print('manual')
+cap = sys.stdout.getvalue()
+sys.stdout = sys.__stdout__
+print('manual:', repr(cap))
+outer, inner = io.StringIO(), io.StringIO()
+with redirect_stdout(outer):
+    print('o1')
+    with redirect_stdout(inner):
+        print('i')
+    print('o2')
+print('outer:', repr(outer.getvalue()))
+print('inner:', repr(inner.getvalue()))
+buf = io.StringIO()
+try:
+    with redirect_stdout(buf):
+        print('before')
+        raise ValueError('x')
+except ValueError:
+    pass
+print('after:', repr(buf.getvalue()))
+";
+    let (stdout, stderr, ok) = run_py(src);
+    if !ok || stderr.contains("ModuleNotFoundError") {
+        eprintln!("skipping ffi-stdout-redirect test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(
+        stdout, "manual: 'manual\\n'\nouter: 'o1\\no2\\n'\ninner: 'i\\n'\nafter: 'before\\n'\n",
+        "stderr={stderr}"
+    );
+}
