@@ -83,10 +83,32 @@ delegates to CPython.
    runtime `sys.argv`/`sys.exit`, `math` if kept native). (`re/datetime/heapq/bisect`
    already deleted.)
 
-6. **Bundle packaging** (the "install stdlib with it" path): release artifact ships
-   `lib/python3.14/` (or zipped `python314.zip`) + `lib/python3.14/lib-dynload/*.so` +
-   `libpython3.14.dylib`; AOT standalone binaries bundle all three. Homebrew: either
-   `depends_on "python@3.14"` (system) or bottle the bundle.
+6. **Bundle packaging** (the "install stdlib with it" path) — DONE via
+   `scripts/install.sh`, which installs a fully self-contained runtime into
+   `~/.pythonrs` (co-located with the bytecode cache):
+
+       ~/.pythonrs/bin/python                 the pythonrs binary
+       ~/.pythonrs/lib/libpython3.14.dylib    the CPython runtime
+       ~/.pythonrs/lib/lib{crypto,ssl,sqlite3,lzma,zstd,mpdec}…   C-ext deps
+       ~/.pythonrs/lib/python3.14/            pure stdlib + lib-dynload/*.so
+
+   `ffi::resolve_home()` finds it (via `<exe>/../lib` or a `~/.pythonrs` fallback)
+   and pins `PYTHONHOME` before `Py_Initialize`. Crucially the installer does a
+   **recursive** relink: it copies EVERY non-system dylib the runtime touches —
+   libpython AND the C-extensions' transitive Homebrew deps (openssl, sqlite, xz,
+   zstd, mpdecimal) — into `lib/`, rewrites every load command to `@rpath`, adds the
+   matching rpath, and ad-hoc re-signs (arm64 dyld rejects an invalid signature).
+   The result has **zero** `/opt/homebrew` references, so `brew uninstall python`
+   (and those five formulae) leaves pythonrs running. Verified: the vendored binary
+   loads `~/.pythonrs/lib/libpython3.14.dylib` and imports `hashlib`/`ssl`/`sqlite3`/
+   `lzma`/`decimal`/`json`/… with nothing under `/opt/homebrew` referenced. Put
+   `~/.pythonrs/bin` on `PATH` (or **symlink** `bin/python` — a bare `cp` breaks the
+   `@executable_path` rpath). `scripts/bundle-stdlib.sh` still stages the older
+   `dist/<triple>` release-tarball layout but only relinks the binary (its
+   C-extension transitive deps are NOT yet vendored — use `install.sh` for a
+   truly Homebrew-free tree).
+   Caveat: this vendors the RUNTIME. Rebuilding pythonrs from source still needs
+   `python@3.14` present (pyo3 links it at build time); runtime is independent.
 
 ## Remaining language gaps (loop, gated on session-limit reset)
 Exception chaining (`__cause__`/`__context__`, `raise X from Y`); lazy `zip`/`map`/
