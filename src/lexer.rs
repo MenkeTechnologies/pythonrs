@@ -383,10 +383,19 @@ impl Lexer {
                             break;
                         }
                     }
-                    let n = i64::from_str_radix(&digits, radix).map_err(|_| {
-                        format!("SyntaxError: bad int literal (line {})", self.line)
-                    })?;
-                    self.push(Tok::Int(n));
+                    match i64::from_str_radix(&digits, radix) {
+                        Ok(n) => self.push(Tok::Int(n)),
+                        // Overflows i64 (`0xFFFFFFFFFFFFFFFF`, a wide `0o…`/`0b…`):
+                        // promote to a bignum, storing its decimal form so it takes
+                        // the same `Tok::BigInt` path as an oversized decimal.
+                        Err(_) => {
+                            let big = num_bigint::BigInt::parse_bytes(digits.as_bytes(), radix)
+                                .ok_or_else(|| {
+                                    format!("SyntaxError: bad int literal (line {})", self.line)
+                                })?;
+                            self.push(Tok::BigInt(big.to_string()));
+                        }
+                    }
                     return Ok(());
                 }
             }
