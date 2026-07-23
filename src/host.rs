@@ -189,6 +189,16 @@ pub enum PKey {
         hash: i64,
         id: u32,
     },
+    /// A CPython `Foreign` object (stdlib-ffi) used as a dict/set key — an enum
+    /// member, `Decimal`, `Fraction`, `datetime`, … `hash` is CPython's own
+    /// `hash(obj)` (so value-equal objects share a bucket); `id` is the heap id of
+    /// the object this key is *equal to* (its own, or a value-equal existing key it
+    /// collapsed onto via `prepare_key` + `ffi::foreign_eq`), giving CPython value
+    /// semantics rather than raw handle identity.
+    Foreign {
+        hash: i64,
+        id: u32,
+    },
     /// A type object (`PyObj::Class` or a builtin type/function) used as a key.
     /// Types are conceptual singletons by name, so they key by name — matching
     /// `is`/`==` on classes (`{int: 1}[int]`, `{C: 1}` for a user class `C`).
@@ -2403,6 +2413,25 @@ impl PyHost {
                         }
                     }
                 }
+                // A CPython Foreign object as a key: a value-equal collapse
+                // resolved by `prepare_key` (which ran `ffi::foreign_eq` outside
+                // the borrow) wins; otherwise key by CPython's own hash with this
+                // object's own heap id. Same-handle lookups match directly; a
+                // fresh value-equal handle is collapsed by `prepare_key` at the
+                // container op, exactly like the `Instance` path.
+                #[cfg(feature = "stdlib-ffi")]
+                Some(PyObj::Foreign(fid)) => {
+                    let id = match v {
+                        Value::Obj(i) => *i,
+                        _ => 0,
+                    };
+                    if let Some(k) = pending_key_get(id) {
+                        k
+                    } else {
+                        let hash = crate::ffi::foreign_hash(*fid)?;
+                        PKey::Foreign { hash, id }
+                    }
+                }
                 Some(other) => {
                     return Err(type_error(&format!(
                         "unhashable type: '{}'",
@@ -2550,12 +2579,37 @@ impl PyHost {
                     (Some(PyObj::Foreign(x)), Some(PyObj::Foreign(y))) => {
                         crate::ffi::foreign_eq(*x, *y)
                     }
+                    // A CPython Foreign object vs a native scalar: CPython's own
+                    // `__eq__`, so `IntEnum.HIGH == 3` / `Decimal('1.5') == 1.5`
+                    // hold inside `in` / `.index` / `.count` / list `==`.
+                    #[cfg(feature = "stdlib-ffi")]
+                    (Some(PyObj::Foreign(f)), _) => self.foreign_eq_native(*f, b),
+                    #[cfg(feature = "stdlib-ffi")]
+                    (_, Some(PyObj::Foreign(f))) => self.foreign_eq_native(*f, a),
                     _ => match (a, b) {
                         (Value::Str(x), Value::Str(y)) => x == y,
                         _ => a == b,
                     },
                 }
             }
+        }
+    }
+
+    /// `foreign == native-scalar` via CPython's `__eq__` (borrow-free bridge).
+    /// `other` is the non-Foreign operand; an `int`/`bool` compares as an int, any
+    /// other number as a float, a `str` as a str. A non-scalar native (list, dict,
+    /// user instance) has no scalar form here and defaults unequal — CPython would
+    /// consult the object's `__eq__`, but that path is not reachable borrow-free.
+    #[cfg(feature = "stdlib-ffi")]
+    fn foreign_eq_native(&self, fid: u32, other: &Value) -> bool {
+        if let Some(n) = self.as_int(other) {
+            crate::ffi::foreign_eq_prim(fid, crate::ffi::Prim::Int(n))
+        } else if let Some(f) = self.num_val(other) {
+            crate::ffi::foreign_eq_prim(fid, crate::ffi::Prim::Float(f))
+        } else if let Some(s) = self.as_str(other) {
+            crate::ffi::foreign_eq_prim(fid, crate::ffi::Prim::Str(&s))
+        } else {
+            false
         }
     }
 
@@ -2821,6 +2875,32 @@ fn bigint_pyhash(b: &num_bigint::BigInt) -> i64 {
 /// that entry (CPython value semantics). A no-op for non-instances and for
 /// identity-hashed instances (`to_key` handles those inline).
 pub fn prepare_key(v: &Value, candidates: &[(PKey, Value)]) -> Result<(), String> {
+    // A CPython Foreign key (enum member, Decimal, datetime, …): hash via the
+    // bridge outside the borrow, then collapse onto a value-equal existing key of
+    // the same hash (CPython `PyObject_RichCompareBool`), so a fresh handle keys
+    // to the same slot as an equal one already present. Mirrors the instance path.
+    #[cfg(feature = "stdlib-ffi")]
+    if let Some((id, fid)) = with_host(|h| match (v, h.get(v)) {
+        (Value::Obj(i), Some(PyObj::Foreign(f))) => Some((*i, *f)),
+        _ => None,
+    }) {
+        let hash = crate::ffi::foreign_hash(fid)?;
+        let mut canonical = PKey::Foreign { hash, id };
+        for (pk, kobj) in candidates {
+            if let PKey::Foreign { hash: ch, .. } = pk {
+                if *ch == hash {
+                    if let Some(cf) = with_host(|h| h.foreign_id(kobj)) {
+                        if crate::ffi::foreign_eq(fid, cf) {
+                            canonical = pk.clone();
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        pending_key_set(id, canonical);
+        return Ok(());
+    }
     let (id, class) = match with_host(|h| match v {
         Value::Obj(i) => match h.get(v) {
             Some(PyObj::Instance(inst)) => Some((*i, inst.class.clone())),
@@ -2910,7 +2990,7 @@ pub fn instance_hash_value(v: &Value) -> Result<i64, String> {
 /// being built element by element).
 pub fn set_local_candidates(s: &IndexMap<PKey, Value>) -> Vec<(PKey, Value)> {
     s.iter()
-        .filter(|(k, _)| matches!(k, PKey::Instance { .. }))
+        .filter(|(k, _)| matches!(k, PKey::Instance { .. } | PKey::Foreign { .. }))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect()
 }
@@ -2918,7 +2998,7 @@ pub fn set_local_candidates(s: &IndexMap<PKey, Value>) -> Vec<(PKey, Value)> {
 /// Instance-key collapse candidates from an in-flight dict map.
 pub fn dict_local_candidates(d: &IndexMap<PKey, (Value, Value)>) -> Vec<(PKey, Value)> {
     d.iter()
-        .filter(|(k, _)| matches!(k, PKey::Instance { .. }))
+        .filter(|(k, _)| matches!(k, PKey::Instance { .. } | PKey::Foreign { .. }))
         .map(|(k, (kv, _))| (k.clone(), kv.clone()))
         .collect()
 }
@@ -2929,12 +3009,12 @@ pub fn instance_key_candidates(container: &Value) -> Vec<(PKey, Value)> {
     with_host(|h| match h.get(container) {
         Some(PyObj::Dict(d)) => d
             .iter()
-            .filter(|(k, _)| matches!(k, PKey::Instance { .. }))
+            .filter(|(k, _)| matches!(k, PKey::Instance { .. } | PKey::Foreign { .. }))
             .map(|(k, (kv, _))| (k.clone(), kv.clone()))
             .collect(),
         Some(PyObj::Set(s)) | Some(PyObj::Frozenset(s)) => s
             .iter()
-            .filter(|(k, _)| matches!(k, PKey::Instance { .. }))
+            .filter(|(k, _)| matches!(k, PKey::Instance { .. } | PKey::Foreign { .. }))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
         _ => vec![],
@@ -3627,6 +3707,11 @@ impl PyHost {
                 }
                 Ok(x.len().cmp(&y.len()))
             }
+            // Two CPython Foreign objects order by CPython's own rich comparison,
+            // so foreign elements inside a list/tuple sort or `<` compare correctly
+            // (`sorted([(IntEnum, …)])`, `[date] < [date]`, `[Decimal] < [Decimal]`).
+            #[cfg(feature = "stdlib-ffi")]
+            (Some(PyObj::Foreign(x)), Some(PyObj::Foreign(y))) => crate::ffi::foreign_cmp(*x, *y),
             _ => Err(type_error(&format!(
                 "'<' not supported between instances of '{}' and '{}'",
                 self.type_name(a),

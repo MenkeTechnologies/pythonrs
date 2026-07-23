@@ -4062,6 +4062,13 @@ fn arg0(args: &[Value]) -> Result<Value, String> {
 pub fn hash_key(k: &PKey) -> i64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
+    // A Foreign key's user-visible `hash()` is CPython's own `hash(obj)` (the
+    // `hash` field), independent of the handle's heap id — so value-equal objects
+    // (`Decimal('1.5')` fetched twice) report equal hashes. The `id` only
+    // discriminates map slots after `prepare_key`'s value collapse.
+    if let PKey::Foreign { hash, .. } = k {
+        return *hash;
+    }
     let mut h = DefaultHasher::new();
     k.hash(&mut h);
     h.finish() as i64

@@ -71,6 +71,64 @@ r = [
 
 #[cfg(feature = "stdlib-ffi")]
 #[test]
+fn foreign_objects_as_set_and_dict_keys() {
+    // Regression: a CPython Foreign object (enum member, Decimal, datetime, …) had
+    // no `to_key` arm, so ANY set/dict keyed by one raised `unhashable type`. It
+    // now keys by CPython's hash with value-equal collapse (`prepare_key` +
+    // `ffi::foreign_eq`), matching CPython dict/set semantics.
+    let src = "\
+from enum import Enum, auto
+from decimal import Decimal
+class C(Enum):
+    A = auto()
+    B = auto()
+A = C.A
+d1 = Decimal('1.5')
+s = {C.A, C.B}
+r = [
+    A in {C.A, C.B},          # set membership
+    len({C.A, C.B, C.A}),     # dedup within one construction
+    {C.A: 1, C.B: 2}[C.B],    # dict lookup
+    d1 in {Decimal('1.5')},   # fresh value-equal handle collapses on lookup
+    len({d1, Decimal('1.5')}),# dedup of equal fresh handles
+    C.B in s,                 # membership against a bound set
+    hash(C.A) == hash(C.A),
+    hash(d1) == hash(Decimal('1.5')),
+]";
+    assert_eq!(
+        g(src, "r"),
+        "[True, 2, 2, True, 1, True, True, True]"
+    );
+}
+
+#[cfg(feature = "stdlib-ffi")]
+#[test]
+fn foreign_vs_native_equality_and_ordering_in_containers() {
+    // Regression (cat. 2 + 3): IntEnum-vs-int equality inside `in`/`.index`, and
+    // ordering of Foreign elements inside a list/tuple sort or `<`, both failed
+    // (False / TypeError). Now route through CPython `__eq__` / rich comparison.
+    let src = "\
+from enum import IntEnum
+class Pri(IntEnum):
+    LOW = 1
+    MID = 2
+    HIGH = 3
+r = [
+    Pri.HIGH in [1, 2, 3],                              # IntEnum member == int
+    3 in (Pri.LOW, Pri.HIGH),                           # int == IntEnum member
+    [1, 2, 3].index(Pri.MID),
+    sorted([Pri.HIGH, Pri.LOW, Pri.MID]),               # foreign elements order
+    [Pri.LOW] < [Pri.HIGH],                             # sequence compare
+    (Pri.LOW, Pri.HIGH) < (Pri.MID, Pri.LOW),
+]";
+    assert_eq!(
+        g(src, "r"),
+        "[True, True, 1, [<Pri.LOW: 1>, <Pri.MID: 2>, <Pri.HIGH: 3>], True, True]"
+    );
+}
+
+#[cfg(feature = "stdlib-ffi")]
+#[test]
 fn itertools_eager_combinatorics() {
     assert_eq!(
         g(

@@ -286,6 +286,62 @@ pub fn foreign_eq(a: u32, b: u32) -> bool {
     })
 }
 
+/// A native scalar to compare against a `Foreign` object without a host borrow —
+/// the operand of `enum_member in [ints]`, `Decimal in [floats]`, etc.
+pub enum Prim<'a> {
+    Int(i64),
+    Float(f64),
+    Str(&'a str),
+}
+
+/// `a == b` where `a` is a `Foreign` handle and `b` is a native scalar — CPython's
+/// `__eq__` (so `IntEnum.HIGH == 3`, `Decimal('1.5') == 1.5`). Borrow-free: the
+/// scalar is built directly, no host marshaling, so it is safe to call from
+/// `PyHost::equal` (which holds the host borrow) for `in`/`.index`/`.count`.
+pub fn foreign_eq_prim(fid: u32, prim: Prim) -> bool {
+    Python::with_gil(|py| {
+        let Ok(x) = fetch(py, fid) else { return false };
+        let other: Bound<PyAny> = match prim {
+            Prim::Int(n) => match n.into_pyobject(py) {
+                Ok(o) => o.into_any(),
+                Err(_) => return false,
+            },
+            Prim::Float(f) => match f.into_pyobject(py) {
+                Ok(o) => o.into_any(),
+                Err(_) => return false,
+            },
+            Prim::Str(s) => match s.into_pyobject(py) {
+                Ok(o) => o.into_any(),
+                Err(_) => return false,
+            },
+        };
+        x.eq(&other).unwrap_or(false)
+    })
+}
+
+/// Rich-compare two `Foreign` handles for ordering (`<`), so foreign elements
+/// order correctly inside a pythonrs list/tuple sort or comparison
+/// (`sorted([(IntEnum, …)])`, `[date] < [date]`). Borrow-free. An error (two
+/// unorderable foreign types) surfaces CPython's `TypeError`.
+pub fn foreign_cmp(a: u32, b: u32) -> Result<std::cmp::Ordering, String> {
+    Python::with_gil(|py| match (fetch(py, a), fetch(py, b)) {
+        (Ok(x), Ok(y)) => x.compare(&y).map_err(|e| e.to_string()),
+        _ => Err("ffi: invalid foreign handle".into()),
+    })
+}
+
+/// `hash(obj)` for a `Foreign` handle — CPython's own `__hash__`, so equal
+/// objects hash equal (`hash(Decimal('1.5')) == hash(Decimal('1.50'))`) and enum
+/// members / dates / fractions can key a pythonrs set or dict. Borrow-free (reads
+/// only the FFI table). An unhashable CPython object (a marshaled `list`/`dict`
+/// never reaches here) surfaces its `TypeError`.
+pub fn foreign_hash(id: u32) -> Result<i64, String> {
+    Python::with_gil(|py| match fetch(py, id) {
+        Ok(x) => x.hash().map(|h| h as i64).map_err(|e| e.to_string()),
+        Err(e) => Err(e),
+    })
+}
+
 /// Create a class with foreign (CPython) bases via CPython's own class machinery
 /// (`class C(enum.Enum): A = 1` → `EnumType`). `types.new_class` computes the
 /// metaclass, fires `__prepare__`, and the body populates the prepared namespace

@@ -234,6 +234,23 @@ fixed. Every line below was re-checked against the **default-build** binary
   variants; async-generator `asend`/`athrow`/`aclose`.
 
 ## Partial / simplified semantics
+- **Cross-set algebra (`& | - ^`) with hash+`__eq__`-keyed elements** — a set
+  *operation between two independently built sets* whose elements key by value
+  (a user instance with `__hash__`/`__eq__`, or a CPython `Foreign` object — enum
+  member, `Decimal`, `datetime`, …) does not merge value-equal elements across the
+  two operands: `{P(1), P(2)} & {P(2)}` yields `set()` rather than `{P(2)}`, and
+  `|`/`-`/`^` likewise. The dict/set *key* itself carries the heap id of the
+  object it collapsed onto within its own construction (see `PKey::Instance`/
+  `PKey::Foreign`), and the algebra ops compare those keys structurally, so equal
+  elements built from different handles occupy distinct slots. Construction,
+  membership (`in`), lookup, `.index`/`.count`, dedup within one literal, dict
+  keying, and `==` between two whole sets all resolve value equality correctly
+  (via `prepare_key` collapse); only the binary/`update` algebra ops between
+  separate sets miss it. This is one pre-existing bug shared by instance and
+  Foreign keys; a faithful fix re-keys each operand element against the other set
+  (the `prepare_key` collapse) instead of comparing keys structurally. **Foreign
+  set/dict keys otherwise fully work**: `{enum_member}`, `{Decimal(...): v}`,
+  `hash(member)`, `Counter([...])`, and value-equal fresh-handle lookups.
 - **Operator overloading dunders**: dispatched, with `NotImplemented` reflected
   fallback (see Implemented). Covered: arithmetic/bitwise
   (`__add__`/`__sub__`/`__mul__`/`__truediv__`/`__floordiv__`/`__mod__`/`__pow__`/
