@@ -55,6 +55,17 @@ fn builtins_module_exposes_functions_types_exceptions() {
 }
 
 #[test]
+fn exception_traceback_and_frame() {
+    // A caught exception exposes __traceback__ over the captured frames; each node
+    // has a tb_frame. (Faithful types.py derives TracebackType/FrameType here.)
+    let src = "try:\n    raise TypeError('boom')\nexcept TypeError as exc:\n    \
+               tb = exc.__traceback__\n    x = (type(tb).__name__, type(tb.tb_frame).__name__)";
+    assert_eq!(g(src, "x"), "('traceback', 'frame')");
+    // A never-propagated exception has no traceback.
+    assert_eq!(g("x = TypeError('z').__traceback__", "x"), "None");
+}
+
+#[test]
 fn introspection_descriptor_types() {
     // The C-level descriptor / mappingproxy types the faithful types.py derives.
     assert_eq!(g("x = type(type.__dict__).__name__", "x"), "'mappingproxy'");

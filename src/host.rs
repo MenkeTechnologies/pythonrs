@@ -441,6 +441,19 @@ pub enum PyObj {
         kind: DescKind,
         qual: String,
     },
+    /// An exception's `__traceback__` — a node in the traceback chain over the
+    /// captured `(scope, line)` frames. `idx` is this node's position; `tb_next`
+    /// advances toward the innermost frame.
+    Traceback {
+        frames: Vec<(String, u32)>,
+        idx: usize,
+    },
+    /// A stack frame object (`tb.tb_frame`). Minimal: the scope name and current
+    /// line, with `f_globals` the running module's globals.
+    PyFrame {
+        name: String,
+        lineno: u32,
+    },
     /// A first-class reference to a builtin function (`len`, `print`, …).
     Builtin(String),
     Class(String),
@@ -2407,6 +2420,8 @@ impl PyHost {
                 Some(PyObj::Namespace { .. }) => "SimpleNamespace".into(),
                 Some(PyObj::MappingProxy { .. }) => "mappingproxy".into(),
                 Some(PyObj::Descriptor { kind, .. }) => kind.type_name().into(),
+                Some(PyObj::Traceback { .. }) => "traceback".into(),
+                Some(PyObj::PyFrame { .. }) => "frame".into(),
                 Some(PyObj::LruCache { .. }) => "functools._lru_cache_wrapper".into(),
                 Some(PyObj::Super { .. }) => "super".into(),
                 Some(PyObj::StaticMethod(_)) => "staticmethod".into(),
@@ -2555,6 +2570,15 @@ impl PyHost {
                         }
                         _ => format!("<{} '{name}' of '{owner}' objects>", kind.type_name()),
                     }
+                }
+                Some(PyObj::Traceback { .. }) => {
+                    format!("<traceback object at 0x{:012x}>", self.addr_of(v))
+                }
+                Some(PyObj::PyFrame { name, lineno }) => {
+                    format!(
+                        "<frame at 0x{:012x}, file '<string>', line {lineno}, code {name}>",
+                        self.addr_of(v)
+                    )
                 }
                 // A `PyObj::Builtin` is an unbound builtin method
                 // (`str.upper`), a *type object* returned by `type(x)` (repr
@@ -6571,6 +6595,22 @@ impl PyHost {
                 if name == "__context__" {
                     return Ok(self.exc_link(recv).1);
                 }
+                if name == "__traceback__" {
+                    // The captured `(scope, line)` frames as a traceback chain, or
+                    // None if the exception was never propagated through a frame.
+                    let frames = match recv {
+                        Value::Obj(id) => self
+                            .exc_tb
+                            .get(id)
+                            .map(|fs| fs.iter().map(|(s, l, _)| (s.clone(), *l)).collect::<Vec<_>>())
+                            .unwrap_or_default(),
+                        _ => Vec::new(),
+                    };
+                    if frames.is_empty() {
+                        return Ok(Value::Undef);
+                    }
+                    return Ok(self.alloc(PyObj::Traceback { frames, idx: 0 }));
+                }
                 if name == "__suppress_context__" {
                     // True iff raised with any explicit `from` clause (`raise X
                     // from Y` or `raise X from None`).
@@ -6627,6 +6667,55 @@ impl PyHost {
                     "AttributeError: 'types.SimpleNamespace' object has no attribute '{name}'"
                 )),
             },
+            // Traceback chain navigation.
+            Some(PyObj::Traceback { frames, idx }) => {
+                let (frames, idx) = (frames.clone(), *idx);
+                match name {
+                    "tb_frame" => {
+                        let (n, l) = frames[idx].clone();
+                        Ok(self.alloc(PyObj::PyFrame {
+                            name: n,
+                            lineno: l,
+                        }))
+                    }
+                    "tb_lineno" => Ok(Value::Int(frames[idx].1 as i64)),
+                    "tb_lasti" => Ok(Value::Int(-1)),
+                    "tb_next" => {
+                        if idx + 1 < frames.len() {
+                            Ok(self.alloc(PyObj::Traceback {
+                                frames,
+                                idx: idx + 1,
+                            }))
+                        } else {
+                            Ok(Value::Undef)
+                        }
+                    }
+                    _ => Err(format!(
+                        "AttributeError: 'traceback' object has no attribute '{name}'"
+                    )),
+                }
+            }
+            // Frame object: the module globals are live; locals are not captured.
+            Some(PyObj::PyFrame { lineno, .. }) => {
+                let lineno = *lineno;
+                match name {
+                    "f_lineno" => Ok(Value::Int(lineno as i64)),
+                    "f_locals" => Ok(self.new_dict(IndexMap::new())),
+                    "f_globals" | "f_builtins" => {
+                        let pairs = self.globals_pairs();
+                        let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+                        for (k, v) in pairs {
+                            let kv = self.new_str(k.clone());
+                            d.insert(PKey::Str(k), (kv, v));
+                        }
+                        Ok(self.new_dict(d))
+                    }
+                    "f_back" => Ok(Value::Undef),
+                    _ => Err(format!(
+                        "AttributeError: 'frame' object has no attribute '{name}'"
+                    )),
+                }
+            }
             // Function introspection dunders. `C.m` yields the raw `Func`; a
             // bound `inst.m` delegates to the same underlying function.
             // `f.__annotations__` — the def-time dict `{param|"return": type}`.
