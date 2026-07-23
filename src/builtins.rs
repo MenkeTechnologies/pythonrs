@@ -3656,6 +3656,23 @@ pub fn call_builtin_function(
                 }
             }))
         }
+        // `types.SimpleNamespace(**kwargs)` — a mutable attribute bag. CPython
+        // takes keyword arguments only (a single positional mapping is also
+        // accepted in 3.13+, but the keyword form is what the stdlib uses).
+        "SimpleNamespace" => {
+            if !args.is_empty() {
+                return Err(host::type_error(
+                    "no positional arguments expected",
+                ));
+            }
+            Ok(with_host(|h| {
+                let mut attrs = indexmap::IndexMap::new();
+                for (k, v) in kwargs {
+                    attrs.insert(k, v);
+                }
+                h.alloc(PyObj::Namespace { attrs })
+            }))
+        }
         "staticmethod" => {
             let f = arg0(&args)?;
             Ok(with_host(|h| h.alloc(PyObj::StaticMethod(f))))

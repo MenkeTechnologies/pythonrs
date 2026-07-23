@@ -372,6 +372,12 @@ pub enum PyObj {
     Union {
         args: Vec<Value>,
     },
+    /// A `types.SimpleNamespace` — a mutable attribute bag (`sys.implementation`,
+    /// argparse results). Attribute reads/writes go through `attrs`; `repr` is
+    /// `namespace(k=v, …)`. Native VM object.
+    Namespace {
+        attrs: IndexMap<String, Value>,
+    },
     /// A first-class reference to a builtin function (`len`, `print`, …).
     Builtin(String),
     Class(String),
@@ -2335,6 +2341,7 @@ impl PyHost {
                 Some(PyObj::Partial { .. }) => "partial".into(),
                 Some(PyObj::Code { .. }) => "code".into(),
                 Some(PyObj::Union { .. }) => "UnionType".into(),
+                Some(PyObj::Namespace { .. }) => "SimpleNamespace".into(),
                 Some(PyObj::LruCache { .. }) => "functools._lru_cache_wrapper".into(),
                 Some(PyObj::Super { .. }) => "super".into(),
                 Some(PyObj::StaticMethod(_)) => "staticmethod".into(),
@@ -2456,6 +2463,16 @@ impl PyHost {
                         .map(|a| self.union_member_name(a))
                         .collect::<Vec<_>>()
                         .join(" | ")
+                }
+                Some(PyObj::Namespace { attrs }) => {
+                    let attrs: Vec<(String, Value)> =
+                        attrs.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                    let inner = attrs
+                        .iter()
+                        .map(|(k, v)| format!("{k}={}", self.repr_of(v)))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("namespace({inner})")
                 }
                 // A `PyObj::Builtin` is an unbound builtin method
                 // (`str.upper`), a *type object* returned by `type(x)` (repr
@@ -6508,6 +6525,13 @@ impl PyHost {
                 Ok(self.new_tuple(args))
             }
             Some(PyObj::Union { .. }) if name == "__parameters__" => Ok(self.new_tuple(vec![])),
+            // SimpleNamespace attribute reads resolve from its bag.
+            Some(PyObj::Namespace { attrs }) => match attrs.get(name) {
+                Some(v) => Ok(v.clone()),
+                None => Err(format!(
+                    "AttributeError: 'types.SimpleNamespace' object has no attribute '{name}'"
+                )),
+            },
             // Function introspection dunders. `C.m` yields the raw `Func`; a
             // bound `inst.m` delegates to the same underlying function.
             // `f.__annotations__` — the def-time dict `{param|"return": type}`.
@@ -6991,6 +7015,11 @@ impl PyHost {
         #[cfg(feature = "stdlib-ffi")]
         if let Some(id) = self.foreign_id(recv) {
             return crate::ffi::set_attr(self, id, name, &val);
+        }
+        // SimpleNamespace: attribute writes go into its bag.
+        if let Some(PyObj::Namespace { attrs }) = self.get_mut(recv) {
+            attrs.insert(name.to_string(), val);
+            return Ok(());
         }
         // `__slots__` enforcement: a slotted instance rejects any attribute name
         // not declared in its slots.
@@ -10117,11 +10146,25 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
             let modules = h.new_dict(IndexMap::new());
             let version = h.new_str(format!("{PY_MAJOR}.{PY_MINOR}.{PY_MICRO} (pythonrs)"));
             let platform = h.new_str(py_platform());
+            // `sys.implementation` — a SimpleNamespace describing the interpreter
+            // (its type is what the faithful `types.py` binds as SimpleNamespace).
+            let implementation = {
+                let mut a: IndexMap<String, Value> = IndexMap::new();
+                let name = h.new_str("pythonrs");
+                let cache_tag = h.new_str(format!("pythonrs-{PY_MAJOR}{PY_MINOR}"));
+                let hexversion = ((PY_MAJOR) << 24) | ((PY_MINOR) << 16) | ((PY_MICRO) << 8) | 0xf0;
+                a.insert("name".to_string(), name);
+                a.insert("cache_tag".to_string(), cache_tag);
+                a.insert("version".to_string(), version_info.clone());
+                a.insert("hexversion".to_string(), Value::Int(hexversion));
+                h.alloc(PyObj::Namespace { attrs: a })
+            };
             vec![
                 ("argv", argv),
                 ("maxsize", Value::Int(i64::MAX)),
                 ("version", version),
                 ("version_info", version_info),
+                ("implementation", implementation),
                 ("platform", platform),
                 ("path", path),
                 ("modules", modules),

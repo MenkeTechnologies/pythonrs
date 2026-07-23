@@ -55,6 +55,26 @@ fn builtins_module_exposes_functions_types_exceptions() {
 }
 
 #[test]
+fn simplenamespace_and_sys_implementation() {
+    // sys.implementation is a native SimpleNamespace; its type is what the
+    // faithful types.py binds as SimpleNamespace.
+    assert_eq!(
+        g("import sys\nx = type(sys.implementation).__name__", "x"),
+        "'SimpleNamespace'",
+    );
+    assert_eq!(g("import sys\nx = sys.implementation.name", "x"), "'pythonrs'");
+    // Constructible from the type, repr as namespace(...), attributes mutable.
+    assert_eq!(
+        g("import sys\nSN = type(sys.implementation)\nn = SN(a=1, b=2)\nx = repr(n)", "x"),
+        "'namespace(a=1, b=2)'",
+    );
+    assert_eq!(
+        g("import sys\nSN = type(sys.implementation)\nn = SN(a=1)\nn.b = 5\nx = n.a + n.b", "x"),
+        "6",
+    );
+}
+
+#[test]
 fn pep604_union_type() {
     // `X | Y` on types builds a native types.UnionType (used in annotations and
     // isinstance across the faithful stdlib).
