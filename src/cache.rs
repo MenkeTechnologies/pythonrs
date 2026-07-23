@@ -80,7 +80,10 @@ use std::path::PathBuf;
 /// v24: `CProg` gained a `positions` list (traceback-caret op-index → span tables)
 /// and the loader recomputes each chunk's `op_hash` (skipped by serde) so caret
 /// lookups match. Older entries lack the field and must miss cleanly.
-const SCHEMA: u64 = 24;
+/// v25: `Entry` gained a `source` name (script path / `<string>` / `<stdin>`) for
+/// `--cacheview` provenance; the added rkyv field changes the shard layout, so
+/// older shards fail to decode and rebuild.
+const SCHEMA: u64 = 25;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]
@@ -98,6 +101,10 @@ struct Entry {
     /// a different program's bytecode (which would silently produce wrong
     /// results — far worse than a cache miss).
     verify: u64,
+    /// The source name that last produced this entry — a script path, `<string>`
+    /// (`-c`), or `<stdin>`. The cache keys by source CONTENT, so this is
+    /// best-effort provenance for `--cacheview`, not part of the lookup.
+    source: String,
     blob: Vec<u8>,
 }
 
@@ -279,6 +286,9 @@ pub fn clear() -> std::io::Result<()> {
 pub struct EntryInfo {
     /// The `FxHash` lookup key (source + schema).
     pub key: u64,
+    /// The source name that produced the entry (script path / `<string>` /
+    /// `<stdin>`), for provenance in the listing.
+    pub source: String,
     /// The independent SipHash verification hash.
     pub verify: u64,
     /// On-disk size of the compiled blob in bytes.
@@ -312,6 +322,7 @@ pub fn entries() -> Vec<EntryInfo> {
                 .unwrap_or((0, 0, 0, 0));
             EntryInfo {
                 key: e.key,
+                source: e.source.clone(),
                 verify: e.verify,
                 blob_len: e.blob.len(),
                 main_ops,
@@ -327,6 +338,9 @@ pub fn entries() -> Vec<EntryInfo> {
 pub fn store(src: &str, prog: &Program) -> Result<(), String> {
     let key = key_for(src);
     let verify = verify_for(src);
+    // The source name for `--cacheview` provenance: the traceback filename the
+    // runtime is initialized with (a script path, `<string>`, or `<stdin>`).
+    let source = crate::host::with_host(|h| h.tb_filename.clone());
     let cp = CProg {
         main: prog.main.clone(),
         functions: prog.functions.clone(),
@@ -337,6 +351,11 @@ pub fn store(src: &str, prog: &Program) -> Result<(), String> {
     let blob = bincode::serialize(&cp).map_err(|e| format!("cache encode: {e}"))?;
     let mut shard = load_shard();
     shard.entries.retain(|e| e.key != key);
-    shard.entries.push(Entry { key, verify, blob });
+    shard.entries.push(Entry {
+        key,
+        verify,
+        source,
+        blob,
+    });
     write_shard(&shard)
 }
