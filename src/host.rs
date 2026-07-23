@@ -6685,6 +6685,12 @@ impl PyHost {
                     };
                     return Ok(self.new_tuple(vals));
                 }
+                // `cls.__subclasses__()` — bound zero-arg method (computed on call).
+                if name == "__subclasses__" {
+                    let cls = self.alloc(PyObj::Class(cname.clone()));
+                    let func = self.alloc(PyObj::Builtin("__subclasses__".into()));
+                    return Ok(self.alloc(PyObj::BoundMethod { recv: cls, func }));
+                }
                 if name == "__dict__" {
                     let ns = self
                         .classes
@@ -8150,6 +8156,12 @@ pub fn call_method(
             ))
         }
         Some(PyObj::Class(cname)) => {
+            // Native type-object methods (`cls.__subclasses__()`) don't live in the
+            // class namespace; dispatch them to the type-method handler.
+            if name == "__subclasses__" {
+                let cls = with_host(|h| h.alloc(PyObj::Class(cname.clone())));
+                return crate::builtins::call_type_method(&cls, name, args, kwargs);
+            }
             if let Some(f) = with_host(|h| h.class_lookup(&cname, name)) {
                 let fobj = with_host(|h| h.get(&f).cloned());
                 match fobj {
@@ -9770,6 +9782,16 @@ pub fn take_agen_op(gen: &Value) -> Option<AGenOp> {
 /// never `await`ed, `create_task`'d, or run. Called at program end (best-effort;
 /// CPython emits at GC time, we emit once at teardown).
 impl PyHost {
+    /// The immediate subclasses of `cname` — user classes that list it as a base
+    /// (`cls.__subclasses__()`).
+    pub fn subclasses_of(&self, cname: &str) -> Vec<String> {
+        self.classes
+            .values()
+            .filter(|cd| cd.bases.iter().any(|b| b == cname))
+            .map(|cd| cd.name.clone())
+            .collect()
+    }
+
     /// A frame object for `sys._getframe(depth)` — `depth` levels up from the
     /// caller. Minimal (scope name + current line); `f_globals` is live.
     pub fn current_frame_object(&mut self, depth: usize) -> Value {

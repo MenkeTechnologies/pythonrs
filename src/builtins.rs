@@ -6341,6 +6341,21 @@ pub fn call_type_method(
     if let Some(r) = nt_instance_method(recv, name, &args, &kwargs) {
         return r;
     }
+    // `cls.__subclasses__()` — the class's immediate user subclasses.
+    if name == "__subclasses__" {
+        return Ok(with_host(|h| {
+            let cn = match h.get(recv) {
+                Some(PyObj::Class(n)) => n.clone(),
+                _ => String::new(),
+            };
+            let subs: Vec<Value> = h
+                .subclasses_of(&cn)
+                .into_iter()
+                .map(|n| h.alloc(PyObj::Class(n)))
+                .collect();
+            h.new_list(subs)
+        }));
+    }
     let tn = with_host(|h| h.type_name(recv));
     // Universal container dunder: `c.__contains__(x)` == `x in c`. Routed through
     // the host membership check so a method bound off any builtin container
