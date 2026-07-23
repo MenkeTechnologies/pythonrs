@@ -17,6 +17,29 @@ fn g(src: &str, name: &str) -> String {
     })
 }
 
+// Subscripting a type object (`list[int]`, `dict[str, int]`, a user class) is
+// generic parameterization -> a `types.GenericAlias`, not indexing. Gated to the
+// self-contained build, which routes through the vendored `types`; the ffi build
+// routes through CPython's `types` and is not exercised here.
+#[cfg(not(feature = "stdlib-ffi"))]
+#[test]
+fn generic_subscription_builds_a_genericalias() {
+    // `list[int]` is a `types.GenericAlias` carrying origin `list` and args `(int,)`.
+    assert_eq!(g("x = type(list[int]).__name__ == 'GenericAlias'", "x"), "True");
+    assert_eq!(g("x = list[int].__origin__ is list", "x"), "True");
+    assert_eq!(g("x = list[int].__args__ == (int,)", "x"), "True");
+    // Multiple args form a tuple, and every type builds the SAME alias type.
+    assert_eq!(g("x = dict[str, int].__args__ == (str, int)", "x"), "True");
+    assert_eq!(
+        g("import types\nx = type(dict[str, int]) is types.GenericAlias", "x"),
+        "True",
+    );
+    // A user class parameterizes too, and its `__origin__` is the class itself.
+    assert_eq!(g("class Box: pass\nx = Box[int].__origin__ is Box", "x"), "True");
+    // A builtin FUNCTION is not a type: subscripting it stays a TypeError.
+    assert!(pythonrs::eval_str("x = len[0]").is_err());
+}
+
 #[test]
 fn arithmetic_and_precedence() {
     assert_eq!(g("x = 2 + 3 * 4 - 1", "x"), "13");

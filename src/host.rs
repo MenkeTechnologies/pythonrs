@@ -7115,6 +7115,50 @@ fn marshal_ffi_arg(v: &Value) -> Value {
 }
 
 /// Resolve a bare name and call it (`f(args)`, `print(args)`).
+/// True if `recv` is a type object that parameterizes to a generic alias when
+/// subscripted (`list[int]`, `dict[str, int]`, or any user class). Builtin
+/// FUNCTIONS (`len`, `print`) are excluded — only type builtins qualify.
+pub fn is_generic_subscriptable(recv: &Value) -> bool {
+    with_host(|h| match h.get(recv) {
+        // Every user-defined class is a type: `Cls[T]` is a generic alias
+        // (dispatching `__class_getitem__` when the class defines one).
+        Some(PyObj::Class(_)) => true,
+        // The builtin container/type objects that carry `__class_getitem__` in
+        // CPython. `str`/`bytes`/`int`/`float`/`bool` do NOT (subscripting them
+        // stays a TypeError), matching CPython.
+        Some(PyObj::Builtin(n)) => matches!(
+            n.as_str(),
+            "list" | "dict" | "tuple" | "set" | "frozenset" | "type"
+        ),
+        _ => false,
+    })
+}
+
+/// Build the generic alias for `recv[idx]` where `recv` is a type object. A user
+/// class with `__class_getitem__` uses its own hook; every other type builds a
+/// `types.GenericAlias(recv, idx)` so the alias is the SAME type the stdlib gets
+/// from `from types import GenericAlias`. Runs with NO host borrow held (it calls
+/// back into the VM), so the caller must invoke it outside `with_host`.
+pub fn generic_alias(recv: &Value, idx: &Value) -> Result<Value, String> {
+    // A class that defines `__class_getitem__` (a classmethod) drives its own
+    // parameterization — the ABCs bind `classmethod(GenericAlias)` this way.
+    let hook = with_host(|h| match h.get(recv) {
+        Some(PyObj::Class(cn)) => {
+            let cn = cn.clone();
+            h.class_lookup(&cn, "__class_getitem__").map(|_| ())
+        }
+        _ => None,
+    });
+    if hook.is_some() {
+        // `get_attr` binds the classmethod to `recv` as `cls`; invoke with `idx`.
+        let bound = with_host(|h| h.get_attr(recv, "__class_getitem__"))?;
+        return invoke(&bound, vec![idx.clone()], vec![]);
+    }
+    let types_mod = import_module("types")?;
+    let ga = with_host(|h| h.get_attr(&types_mod, "GenericAlias"))?;
+    invoke(&ga, vec![recv.clone(), idx.clone()], vec![])
+}
+
 pub fn call_named(
     name: &str,
     args: Vec<Value>,

@@ -502,6 +502,12 @@ fn b_getitem(vm: &mut VM, _: u8) -> Value {
     if let Some(id) = with_host(|h| h.foreign_id(&recv)) {
         return finish(vm, crate::ffi::get_item_cb(id, &idx));
     }
+    // Subscripting a TYPE object is generic parameterization, not indexing:
+    // `list[int]`, `dict[str, int]`, `Cls[T]` -> a `types.GenericAlias`. Handle it
+    // here (outside the `get_item` borrow) because it can re-enter the VM.
+    if host::is_generic_subscriptable(&recv) {
+        return finish(vm, host::generic_alias(&recv, &idx));
+    }
     let cands = host::instance_key_candidates(&recv);
     let r = host::with_instance_key(&idx, &cands, || with_host(|h| h.get_item(&recv, &idx)));
     finish(vm, r)
