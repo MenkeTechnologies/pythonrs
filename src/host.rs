@@ -3786,7 +3786,17 @@ impl PyHost {
             };
             return Ok(Value::Bool(res));
         }
-        let ord = self.order(a, b)?;
+        // The operator symbol drives the `'<' not supported …` message; CPython
+        // uses the OUTER operator even for a failing list/tuple element compare
+        // (`[1] >= ["a"]` reports `>=`), so it threads through `order`'s recursion.
+        let sym = match op {
+            NumOp::Lt => "<",
+            NumOp::Le => "<=",
+            NumOp::Gt => ">",
+            NumOp::Ge => ">=",
+            _ => "<",
+        };
+        let ord = self.order(a, b, sym)?;
         let res = match op {
             NumOp::Lt => ord == Ordering::Less,
             NumOp::Le => ord != Ordering::Greater,
@@ -3797,7 +3807,7 @@ impl PyHost {
         Ok(Value::Bool(res))
     }
 
-    fn order(&self, a: &Value, b: &Value) -> Result<std::cmp::Ordering, String> {
+    fn order(&self, a: &Value, b: &Value, sym: &str) -> Result<std::cmp::Ordering, String> {
         use std::cmp::Ordering;
         // Exact integer comparison first: two integers (either may be a bignum
         // beyond f64 precision) must compare by value, not by lossy f64.
@@ -3822,7 +3832,7 @@ impl PyHost {
             (Some(PyObj::List(x)), Some(PyObj::List(y)))
             | (Some(PyObj::Tuple(x)), Some(PyObj::Tuple(y))) => {
                 for (p, q) in x.iter().zip(y.iter()) {
-                    let o = self.order(p, q)?;
+                    let o = self.order(p, q, sym)?;
                     if o != Ordering::Equal {
                         return Ok(o);
                     }
@@ -3835,7 +3845,7 @@ impl PyHost {
             #[cfg(feature = "stdlib-ffi")]
             (Some(PyObj::Foreign(x)), Some(PyObj::Foreign(y))) => crate::ffi::foreign_cmp(*x, *y),
             _ => Err(type_error(&format!(
-                "'<' not supported between instances of '{}' and '{}'",
+                "'{sym}' not supported between instances of '{}' and '{}'",
                 self.type_name(a),
                 self.type_name(b)
             ))),

@@ -23,6 +23,76 @@ fn g(src: &str, name: &str) -> String {
     })
 }
 
+/// The `TypeError` message for running `src` (which must fail).
+fn err(src: &str) -> String {
+    eval_str(src).expect_err("program should raise")
+}
+
+#[test]
+fn comparison_typeerror_names_the_operator() {
+    // The `'<' not supported …` message must reflect the actual operator, and the
+    // OUTER operator even for a failing list-element compare (CPython behavior).
+    assert_eq!(
+        err("x = 1 < 'a'"),
+        "TypeError: '<' not supported between instances of 'int' and 'str'"
+    );
+    assert_eq!(
+        err("x = 1 <= 'a'"),
+        "TypeError: '<=' not supported between instances of 'int' and 'str'"
+    );
+    assert_eq!(
+        err("x = 1 >= 'a'"),
+        "TypeError: '>=' not supported between instances of 'int' and 'str'"
+    );
+    assert_eq!(
+        err("x = [1] >= ['a']"),
+        "TypeError: '>=' not supported between instances of 'int' and 'str'"
+    );
+}
+
+#[test]
+fn builtin_method_arity_is_enforced() {
+    // Fixed-arity builtin methods/functions reject wrong positional counts with
+    // CPython's exact wording (METH_O / METH_NOARGS / METH_VARARGS forms).
+    assert_eq!(
+        err("[].append(1, 2)"),
+        "TypeError: list.append() takes exactly one argument (2 given)"
+    );
+    assert_eq!(
+        err("[].clear(1)"),
+        "TypeError: list.clear() takes no arguments (1 given)"
+    );
+    assert_eq!(
+        err("[].pop(1, 2)"),
+        "TypeError: pop expected at most 1 argument, got 2"
+    );
+    assert_eq!(
+        err("[].insert(1, 2, 3)"),
+        "TypeError: insert expected 2 arguments, got 3"
+    );
+    assert_eq!(
+        err("import math\nx = math.sqrt(1, 2)"),
+        "TypeError: math.sqrt() takes exactly one argument (2 given)"
+    );
+    assert_eq!(
+        err("{}.get(1, 2, 3)"),
+        "TypeError: get expected at most 2 arguments, got 3"
+    );
+    assert_eq!(
+        err("set().add(1, 2)"),
+        "TypeError: set.add() takes exactly one argument (2 given)"
+    );
+    assert_eq!(
+        err("(1,).count(1, 2)"),
+        "TypeError: tuple.count() takes exactly one argument (2 given)"
+    );
+    // A frozenset mutator is still an AttributeError, not an arity error.
+    assert_eq!(
+        err("frozenset().add(1, 2)"),
+        "AttributeError: 'frozenset' object has no attribute 'add'"
+    );
+}
+
 #[cfg(feature = "stdlib-ffi")]
 #[test]
 fn json_dumps_loads_roundtrip() {

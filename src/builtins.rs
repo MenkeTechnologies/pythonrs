@@ -5233,7 +5233,71 @@ fn f64_to_int(h: &mut host::PyHost, x: f64) -> Value {
     }
 }
 
+/// A builtin method/function's argument-count contract, mirroring the distinct
+/// CPython error messages each C calling convention produces.
+enum Arity {
+    /// `METH_O` — exactly one positional. `qual` is the qualified name shown as
+    /// `Type.method()`: "…() takes exactly one argument (N given)".
+    ExactlyOne,
+    /// `METH_NOARGS`: "Type.method() takes no arguments (N given)".
+    NoArgs,
+    /// `METH_VARARGS` with a fixed count: "method expected K arguments, got N"
+    /// (unqualified; "argument" when K == 1).
+    VarExact(usize),
+    /// `METH_VARARGS` with optional trailing args: "method expected at most MAX
+    /// argument(s), got N", or "…at least MIN…" when too few.
+    VarRange(usize, usize),
+    /// Keyword-only (e.g. `list.sort`): "method() takes no positional arguments".
+    NoPositional,
+}
+
+/// Validate `argc` positional args against a method's [`Arity`], returning
+/// CPython's exact `TypeError` string on mismatch. `qual` is the `Type.method`
+/// qualified name; `name` is the bare method name (used by the VARARGS forms).
+fn check_arity(name: &str, qual: &str, spec: Arity, argc: usize) -> Result<(), String> {
+    let plural = |k: usize| if k == 1 { "argument" } else { "arguments" };
+    match spec {
+        Arity::ExactlyOne if argc != 1 => Err(host::type_error(&format!(
+            "{qual}() takes exactly one argument ({argc} given)"
+        ))),
+        Arity::NoArgs if argc != 0 => Err(host::type_error(&format!(
+            "{qual}() takes no arguments ({argc} given)"
+        ))),
+        Arity::VarExact(k) if argc != k => Err(host::type_error(&format!(
+            "{name} expected {k} {}, got {argc}",
+            plural(k)
+        ))),
+        Arity::VarRange(_, max) if argc > max => Err(host::type_error(&format!(
+            "{name} expected at most {max} {}, got {argc}",
+            plural(max)
+        ))),
+        Arity::VarRange(min, _) if argc < min => Err(host::type_error(&format!(
+            "{name} expected at least {min} {}, got {argc}",
+            plural(min)
+        ))),
+        Arity::NoPositional if argc != 0 => {
+            Err(host::type_error(&format!("{name}() takes no positional arguments")))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The argument-count contract for a `math` module function, or `None` for the
+/// variadic ones (`gcd`, `lcm`) that accept any count.
+fn math_arity(name: &str) -> Option<Arity> {
+    Some(match name {
+        "log" => Arity::VarRange(1, 2),
+        "pow" | "atan2" | "copysign" | "fmod" | "remainder" | "ldexp" => Arity::VarExact(2),
+        "gcd" | "lcm" | "hypot" => return None,
+        // Every other implemented math function is single-argument (METH_O).
+        _ => Arity::ExactlyOne,
+    })
+}
+
 fn call_math(name: &str, args: &[Value]) -> Result<Value, String> {
+    if let Some(spec) = math_arity(name) {
+        check_arity(name, &format!("math.{name}"), spec, args.len())?;
+    }
     let f0 = args.first().and_then(as_f).unwrap_or(0.0);
     match name {
         "sqrt" => Ok(Value::Float(f0.sqrt())),
@@ -7338,12 +7402,30 @@ fn str_dot_format(s: &str, args: &[Value], kwargs: &[(String, Value)]) -> Result
     Ok(new_str(out))
 }
 
+/// The argument-count contract for a `list` method (positional args only; `sort`
+/// takes keyword-only `key`/`reverse`). `None` for names this dispatcher does not
+/// treat as fixed-arity.
+fn list_arity(name: &str) -> Option<Arity> {
+    Some(match name {
+        "append" | "extend" | "remove" | "count" => Arity::ExactlyOne,
+        "clear" | "reverse" | "copy" => Arity::NoArgs,
+        "insert" => Arity::VarExact(2),
+        "pop" => Arity::VarRange(0, 1),
+        "index" => Arity::VarRange(1, 3),
+        "sort" => Arity::NoPositional,
+        _ => return None,
+    })
+}
+
 fn list_method(
     recv: &Value,
     name: &str,
     args: &[Value],
     kwargs: &[(String, Value)],
 ) -> Result<Value, String> {
+    if let Some(spec) = list_arity(name) {
+        check_arity(name, &format!("list.{name}"), spec, args.len())?;
+    }
     match name {
         "append" => {
             let v = arg0(args)?;
@@ -7535,12 +7617,27 @@ fn list_method(
     }
 }
 
+/// Argument-count contract for a `dict` method (positional args; `get`/`pop`/
+/// `setdefault`/`update` also accept keywords in some CPython paths, but the
+/// positional cap still applies).
+fn dict_arity(name: &str) -> Option<Arity> {
+    Some(match name {
+        "keys" | "values" | "items" | "clear" | "copy" | "popitem" => Arity::NoArgs,
+        "get" | "pop" | "setdefault" => Arity::VarRange(1, 2),
+        "update" => Arity::VarRange(0, 1),
+        _ => return None,
+    })
+}
+
 fn dict_method(
     recv: &Value,
     name: &str,
     args: &[Value],
     kwargs: &[(String, Value)],
 ) -> Result<Value, String> {
+    if let Some(spec) = dict_arity(name) {
+        check_arity(name, &format!("dict.{name}"), spec, args.len())?;
+    }
     match name {
         "keys" => Ok(with_host(|h| {
             h.alloc(PyObj::DictView {
@@ -7705,7 +7802,24 @@ fn dict_update(
     Ok(())
 }
 
+/// Argument-count contract for a `set`/`frozenset` method. The variadic algebra
+/// methods (`union`, `intersection`, …) accept any count and are omitted.
+fn set_arity(name: &str) -> Option<Arity> {
+    Some(match name {
+        "add" | "discard" | "remove" => Arity::ExactlyOne,
+        "clear" | "copy" | "pop" => Arity::NoArgs,
+        _ => return None,
+    })
+}
+
 fn set_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    // Real `set` only: a `frozenset` mutator (`add`/`discard`/…) must raise the
+    // AttributeError below first, so arity is not checked for it here.
+    if !with_host(|h| h.is_frozenset(recv)) {
+        if let Some(spec) = set_arity(name) {
+            check_arity(name, &format!("set.{name}"), spec, args.len())?;
+        }
+    }
     // `frozenset` is immutable: it has no in-place mutators.
     if with_host(|h| h.is_frozenset(recv))
         && matches!(
@@ -8054,6 +8168,17 @@ fn range_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, Strin
 
 fn tuple_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
     match name {
+        "count" if args.len() != 1 => Err(host::type_error(&format!(
+            "tuple.count() takes exactly one argument ({} given)",
+            args.len()
+        ))),
+        "index" if args.len() > 3 => Err(host::type_error(&format!(
+            "index expected at most 3 arguments, got {}",
+            args.len()
+        ))),
+        "index" if args.is_empty() => Err(host::type_error(
+            "index expected at least 1 argument, got 0",
+        )),
         "count" => {
             let v = arg0(args)?;
             Ok(Value::Int(with_host(|h| match h.get(recv) {
