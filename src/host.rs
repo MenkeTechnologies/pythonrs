@@ -9640,26 +9640,28 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
             ]
         }),
         "math" => with_host(|h| {
-            vec![
+            // Every function implemented by `builtins::call_math`; each resolves to
+            // a `math.<name>` builtin. Kept as a flat list so adding a function is a
+            // one-line change here plus its arm in `call_math`.
+            const MATH_FNS: &[&str] = &[
+                "sqrt", "floor", "ceil", "fabs", "pow", "log", "log2", "log10", "log1p",
+                "exp", "exp2", "expm1", "cbrt", "sin", "cos", "tan", "asin", "acos", "atan",
+                "atan2", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh", "degrees",
+                "radians", "hypot", "trunc", "copysign", "fmod", "ldexp", "isqrt", "isnan",
+                "isinf", "isfinite", "gcd", "factorial",
+                "lgamma", "gamma", "erf", "erfc",
+            ];
+            let mut out: Vec<(&str, Value)> = vec![
                 ("pi", Value::Float(std::f64::consts::PI)),
                 ("e", Value::Float(std::f64::consts::E)),
                 ("tau", Value::Float(std::f64::consts::TAU)),
                 ("inf", Value::Float(f64::INFINITY)),
                 ("nan", Value::Float(f64::NAN)),
-                ("sqrt", h.alloc(PyObj::Builtin("math.sqrt".into()))),
-                ("floor", h.alloc(PyObj::Builtin("math.floor".into()))),
-                ("ceil", h.alloc(PyObj::Builtin("math.ceil".into()))),
-                ("fabs", h.alloc(PyObj::Builtin("math.fabs".into()))),
-                ("pow", h.alloc(PyObj::Builtin("math.pow".into()))),
-                ("log", h.alloc(PyObj::Builtin("math.log".into()))),
-                ("sin", h.alloc(PyObj::Builtin("math.sin".into()))),
-                ("cos", h.alloc(PyObj::Builtin("math.cos".into()))),
-                ("gcd", h.alloc(PyObj::Builtin("math.gcd".into()))),
-                (
-                    "factorial",
-                    h.alloc(PyObj::Builtin("math.factorial".into())),
-                ),
-            ]
+            ];
+            for &f in MATH_FNS {
+                out.push((f, h.alloc(PyObj::Builtin(format!("math.{f}")))));
+            }
+            out
         }),
         "sys" => with_host(|h| {
             // `sys.argv` mirrors the process arguments installed by `init_runtime`.

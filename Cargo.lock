@@ -1305,6 +1305,7 @@ dependencies = [
  "glob",
  "indexmap",
  "libc",
+ "libm",
  "lsp-server",
  "lsp-types",
  "memmap2",

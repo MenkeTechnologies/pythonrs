@@ -5368,6 +5368,68 @@ fn call_math(name: &str, args: &[Value]) -> Result<Value, String> {
         "fabs" => Ok(Value::Float(f0.abs())),
         "sin" => Ok(Value::Float(f0.sin())),
         "cos" => Ok(Value::Float(f0.cos())),
+        "tan" => Ok(Value::Float(f0.tan())),
+        "asin" => Ok(Value::Float(f0.asin())),
+        "acos" => Ok(Value::Float(f0.acos())),
+        "atan" => Ok(Value::Float(f0.atan())),
+        "sinh" => Ok(Value::Float(f0.sinh())),
+        "cosh" => Ok(Value::Float(f0.cosh())),
+        "tanh" => Ok(Value::Float(f0.tanh())),
+        "asinh" => Ok(Value::Float(f0.asinh())),
+        "acosh" => Ok(Value::Float(f0.acosh())),
+        "atanh" => Ok(Value::Float(f0.atanh())),
+        "exp" => Ok(Value::Float(f0.exp())),
+        "exp2" => Ok(Value::Float(f0.exp2())),
+        "expm1" => Ok(Value::Float(f0.exp_m1())),
+        "log2" => Ok(Value::Float(f0.log2())),
+        "log10" => Ok(Value::Float(f0.log10())),
+        "log1p" => Ok(Value::Float(f0.ln_1p())),
+        // Special functions Rust std lacks — pure-Rust libm keeps `math`
+        // self-contained (no C libm) on the no-libpython build.
+        "lgamma" => Ok(Value::Float(libm::lgamma(f0))),
+        "gamma" => Ok(Value::Float(libm::tgamma(f0))),
+        "erf" => Ok(Value::Float(libm::erf(f0))),
+        "erfc" => Ok(Value::Float(libm::erfc(f0))),
+        "cbrt" => Ok(Value::Float(f0.cbrt())),
+        "degrees" => Ok(Value::Float(f0.to_degrees())),
+        "radians" => Ok(Value::Float(f0.to_radians())),
+        "trunc" => Ok(with_host(|h| f64_to_int(h, f0.trunc()))),
+        "isnan" => Ok(Value::Bool(f0.is_nan())),
+        "isinf" => Ok(Value::Bool(f0.is_infinite())),
+        "isfinite" => Ok(Value::Bool(f0.is_finite())),
+        "atan2" => {
+            let f1 = args.get(1).and_then(as_f).unwrap_or(0.0);
+            Ok(Value::Float(f0.atan2(f1)))
+        }
+        "hypot" => {
+            // CPython 3.8+ `hypot(*coords)` — Euclidean norm of any number of args.
+            let sumsq: f64 = args.iter().filter_map(as_f).map(|c| c * c).sum();
+            Ok(Value::Float(sumsq.sqrt()))
+        }
+        "copysign" => {
+            let f1 = args.get(1).and_then(as_f).unwrap_or(0.0);
+            Ok(Value::Float(f0.copysign(f1)))
+        }
+        "fmod" => {
+            let f1 = args.get(1).and_then(as_f).unwrap_or(0.0);
+            // C `fmod`: result has the sign of the dividend (unlike Python `%`).
+            Ok(Value::Float(f0 % f1))
+        }
+        "ldexp" => {
+            let f1 = args.get(1).and_then(as_f).unwrap_or(0.0);
+            Ok(Value::Float(f0 * 2f64.powi(f1 as i32)))
+        }
+        "isqrt" => {
+            // Integer square root: floor(sqrt(n)) for a non-negative int, bignum-safe.
+            use num_integer::Roots;
+            let n = with_host(|h| h.big_val(&args[0])).ok_or_else(|| {
+                host::type_error("'float' object cannot be interpreted as an integer")
+            })?;
+            if n.sign() == num_bigint::Sign::Minus {
+                return Err("ValueError: isqrt() argument must be nonnegative".into());
+            }
+            Ok(with_host(|h| h.norm_big(n.sqrt())))
+        }
         "log" => {
             let base = args.get(1).and_then(as_f);
             Ok(Value::Float(match base {

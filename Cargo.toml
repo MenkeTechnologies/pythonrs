@@ -126,6 +126,9 @@ corosensei = "0.3"
 num-bigint = "0.4"
 num-integer = "0.1"
 num-traits = "0.2"
+# Pure-Rust libm for the special functions Rust std lacks (`lgamma`/`gamma`/`erf`/
+# `erfc`) — part of the self-contained `math` surface, no C libm dependency.
+libm = "0.2"
 # Exact rationals backing `fractions.Fraction` and complex support.
 num-rational = "0.4"
 num-complex = "0.4"
