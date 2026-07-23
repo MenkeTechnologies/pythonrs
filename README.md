@@ -101,6 +101,11 @@ python --repl               # interactive REPL
 python --lsp                # Language Server Protocol over stdio
 ```
 
+The REPL is a `reedline` line editor: **Tab** pops a columnar completion menu
+(Shift+Tab / BackTab cycles backward) sourced from the language keywords,
+builtins, `math.*`, per-type method names, and the live module globals / class
+names of the persistent session; history persists to `~/.pythonrs/history`.
+
 Set `PYTHONRS_TRACE=1` to log cache hit/miss to stderr (silent otherwise).
 
 ## [0x03] LANGUAGE FEATURES

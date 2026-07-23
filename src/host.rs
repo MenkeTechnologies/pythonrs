@@ -1465,6 +1465,18 @@ impl PyHost {
         self.globals.insert(name.to_string(), val);
     }
 
+    /// Module-level binding names plus defined class names — the dynamic half of
+    /// REPL tab completion (user variables, defs, imports, classes). Top-level
+    /// `def`/`class` bind into `globals`; class names are also unioned in so a
+    /// class defined and immediately referenced still completes.
+    pub fn global_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.globals.keys().cloned().collect();
+        names.extend(self.classes.keys().cloned());
+        names.sort();
+        names.dedup();
+        names
+    }
+
     pub fn del_name(&mut self, name: &str) -> Result<(), String> {
         if self
             .cur_env()
