@@ -273,6 +273,20 @@ jobs:
             printf '    libexec.install "bin", "lib"\n'
             printf '    bin.install_symlink libexec/"bin/python"\n'
             printf '  end\n\n'
+            # Mirror the self-contained tree into ~/.pythonrs (co-located with the
+            # scripts.rkyv bytecode cache), matching the source install.sh layout.
+            # The binary loads libpython via @executable_path/../lib, so bin/ and
+            # lib/ must stay siblings; ~/.pythonrs/bin/python then runs against
+            # ~/.pythonrs/lib with no dependency on the Cellar. scripts.rkyv (if
+            # present) is left untouched — only bin/ and lib/ are refreshed.
+            printf '  def post_install\n'
+            printf '    home = File.expand_path("~/.pythonrs")\n'
+            printf '    mkdir_p home\n'
+            printf '    ["bin", "lib"].each do |d|\n'
+            printf '      rm_rf "#{home}/#{d}"\n'
+            printf '      cp_r "#{libexec}/#{d}", home\n'
+            printf '    end\n'
+            printf '  end\n\n'
             printf '  test do\n'
             # VM path, then the real CPython stdlib over the FFI bridge. The stdlib
             # case goes through a temp file to sidestep nested-quote escaping.
