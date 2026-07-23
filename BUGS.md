@@ -312,6 +312,19 @@ fixed. Every line below was re-checked against the **default-build** binary
   to the call/spread paths.
 
 ## Tooling
+- **`--build`** (AOT to a standalone native executable): implemented for the
+  **libpython-free** build (`cargo build --no-default-features`). An uncaught
+  exception in the AOT binary renders the same traceback the interpreter does —
+  `File`/source line + CPython carets — and exits non-zero (the embedded image
+  carries the source, filename, and caret position tables, and the binary
+  recomputes each chunk's serde-skipped `op_hash` so caret lookups hit).
+  `sys.exit(n)` returns `n`. Two limits: (1) a `stdlib-ffi` build cannot AOT (its
+  CPython/pyo3 symbols can't be statically linked into a standalone binary — the
+  build fails up front with that instruction); (2) an error from a **native
+  fast-path op** (`int + str`, unary `-` on a bad type) is held in fusevm's
+  private AOT result rather than on the host, so it exits silently instead of
+  printing a traceback — every builtin-dispatched error (index/key/type-via-
+  method/name/division/attribute) renders correctly.
 - **`--dap`** (Debug Adapter Protocol): implemented — breakpoints, step
   in/out/over/continue, stack trace, locals, and program-stdout capture (pipe +
   dup2 → `output` events). Frame names in the stack use the function name (or

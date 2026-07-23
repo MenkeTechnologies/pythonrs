@@ -14,11 +14,28 @@
 //! only host state a chunk depends on is the function/try tables, which the
 //! image below restores before the main chunk runs.
 
+use crate::ast::Span;
 use crate::compiler::Program;
 use crate::host::{self, FuncDef, TryDef};
-use fusevm::VM;
+use fusevm::{Chunk, VM};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// Recompute a chunk's `op_hash` the way `fusevm::ChunkBuilder::build` does (a
+/// `DefaultHasher` over ops then constants). `op_hash` is `#[serde(skip)]`, so a
+/// bincode-deserialized AOT chunk carries `0`; restoring it (the pre-rebase ops
+/// match the compile-time hash) lets caret lookups by `op_hash` hit.
+fn restore_op_hash(chunk: &mut Chunk) {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    chunk.ops.hash(&mut h);
+    chunk.constants.hash(&mut h);
+    chunk.op_hash = h.finish();
+    for sub in &mut chunk.sub_chunks {
+        restore_op_hash(sub);
+    }
+}
 
 /// Marker prefix for the embedded program image in `chunk.names`.
 const PROG_IMAGE_TAG: &str = "\u{1}pythonrs-prog-image:";
@@ -27,18 +44,33 @@ const PROG_IMAGE_TAG: &str = "\u{1}pythonrs-prog-image:";
 struct ProgImage {
     functions: Vec<FuncDef>,
     tries: Vec<TryDef>,
+    /// The program's full source text and its display filename, so the AOT binary
+    /// renders an uncaught exception's traceback (source lines + carets) exactly
+    /// like the interpreter.
+    #[serde(default)]
+    source: String,
+    #[serde(default)]
+    filename: String,
+    /// Traceback-caret op-index → span tables, keyed by chunk `op_hash` — the same
+    /// set the interpreter registers at run time (see `compiler::Program`).
+    #[serde(default)]
+    positions: Vec<(u64, Vec<Span>)>,
 }
 
-/// Compile a program to a standalone native executable at `out`.
-pub fn emit_executable(prog: &Program, out: &Path) -> Result<(), String> {
+/// Compile a program to a standalone native executable at `out`. `src`/`filename`
+/// are embedded so the binary can render tracebacks.
+pub fn emit_executable(prog: &Program, src: &str, filename: &str, out: &Path) -> Result<(), String> {
     let obj = std::env::temp_dir().join("pythonrs_aot.o");
-    emit_object(prog, &obj)?;
+    emit_object(prog, src, filename, &obj)?;
 
     let main_c = std::env::temp_dir().join("pythonrs_aot_main.c");
     std::fs::write(
         &main_c,
-        "extern long fusevm_aot_run_embedded(void);\n\
-         int main(void) { return (int)fusevm_aot_run_embedded(); }\n",
+        // `pythonrs_aot_run_embedded` (below) wraps fusevm's runner so an uncaught
+        // pythonrs exception (set on the host, not returned as a native VM error)
+        // renders a proper traceback and exits non-zero.
+        "extern long pythonrs_aot_run_embedded(void);\n\
+         int main(void) { return (int)pythonrs_aot_run_embedded(); }\n",
     )
     .map_err(|e| e.to_string())?;
 
@@ -72,11 +104,14 @@ pub fn emit_executable(prog: &Program, out: &Path) -> Result<(), String> {
 }
 
 /// Emit just the relocatable AOT object (embedding the program image).
-fn emit_object(prog: &Program, obj: &Path) -> Result<(), String> {
+fn emit_object(prog: &Program, src: &str, filename: &str, obj: &Path) -> Result<(), String> {
     let mut chunk = prog.main.clone();
     let image = ProgImage {
         functions: prog.functions.iter().map(|(_, f)| f.clone()).collect(),
         tries: prog.tries.clone(),
+        source: src.to_string(),
+        filename: filename.to_string(),
+        positions: prog.positions.clone(),
     };
     let json = serde_json::to_string(&image).map_err(|e| e.to_string())?;
     chunk.names.push(format!("{PROG_IMAGE_TAG}{json}"));
@@ -120,9 +155,103 @@ pub unsafe extern "C" fn fusevm_aot_register_builtins(vm: *mut VM) {
         .filter_map(|n| n.strip_prefix(PROG_IMAGE_TAG))
         .filter_map(|j| serde_json::from_str(j).ok())
         .collect();
-    host::with_host(|h| {
-        for img in images {
-            h.load_program(img.functions, img.tries);
+    for mut img in images {
+        // Restore the source/filename so a traceback shows its `File`/source
+        // lines, register the caret position tables, then install the
+        // function/try tables the main chunk calls into.
+        let has_file = !img.filename.is_empty();
+        host::init_runtime(
+            vec![if has_file {
+                img.filename.clone()
+            } else {
+                String::new()
+            }],
+            has_file.then(|| img.filename.clone()),
+            &img.source,
+            if has_file { &img.filename } else { "<string>" },
+            has_file && !img.filename.starts_with('<'),
+        );
+        for (op_hash, table) in img.positions {
+            host::register_positions(op_hash, table);
         }
-    });
+        // Function/try bodies deserialize with `op_hash == 0` (serde-skipped); the
+        // caret registry is keyed by the real hash, so restore it on each.
+        for f in &mut img.functions {
+            restore_op_hash(&mut f.chunk);
+        }
+        for t in &mut img.tries {
+            restore_op_hash(&mut t.body);
+            for (typ, _, handler) in &mut t.handlers {
+                if let Some(typ) = typ {
+                    restore_op_hash(typ);
+                }
+                restore_op_hash(handler);
+            }
+            if let Some(e) = &mut t.orelse {
+                restore_op_hash(e);
+            }
+            if let Some(fb) = &mut t.finalbody {
+                restore_op_hash(fb);
+            }
+        }
+        host::with_host(|h| h.load_program(img.functions, img.tries));
+    }
+}
+
+/// The AOT entry the emitted `main` calls: run the embedded chunk, then surface
+/// an uncaught pythonrs exception the way the interpreter does — a rendered
+/// traceback (with carets) to stderr and a non-zero exit — rather than fusevm's
+/// generic runner, which only reports NATIVE VM errors and silently drops a
+/// pythonrs error left on the host.
+///
+/// # Safety
+/// Relies on the fusevm-emitted `fusevm_aot_chunk_blob`/`_len`/`fusevm_aot_entry`
+/// link symbols, exactly as `fusevm::aot::fusevm_aot_run_embedded` does.
+#[no_mangle]
+pub extern "C" fn pythonrs_aot_run_embedded() -> i64 {
+    #[allow(improper_ctypes)]
+    extern "C" {
+        static fusevm_aot_chunk_blob: u8;
+        static fusevm_aot_chunk_len: u64;
+        fn fusevm_aot_entry(vm: *mut VM) -> i64;
+    }
+    let mut chunk: Chunk = unsafe {
+        let len = fusevm_aot_chunk_len as usize;
+        let bytes = std::slice::from_raw_parts(&fusevm_aot_chunk_blob as *const u8, len);
+        match bincode::deserialize(bytes) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("pythonrs aot: corrupt embedded chunk: {e}");
+                return 1;
+            }
+        }
+    };
+    // The deserialized main chunk lost its `op_hash` (serde-skipped); restore it so
+    // an error's caret span is found in the registered position table.
+    restore_op_hash(&mut chunk);
+    let mut vm = VM::new(chunk);
+    // SAFETY: pointer is valid for the call; the hook borrows it exclusively.
+    unsafe { fusevm_aot_register_builtins(&mut vm as *mut VM) };
+    // SAFETY: the compiled entry has the declared C ABI and reads `vm`.
+    unsafe { fusevm_aot_entry(&mut vm as *mut VM) };
+
+    // A pythonrs error (`IndexError`, `TypeError`, `NameError`, `sys.exit`, …) is
+    // left on the host by `builtins::abort`; render it like the interpreter (a
+    // traceback with carets, or a `SystemExit` code/message). fusevm's own runner
+    // reports only NATIVE VM errors and drops this, exiting 0 silently.
+    match host::with_host(|h| h.take_error()) {
+        None => 0,
+        Some(e) => match host::classify_top_error(&e) {
+            host::TopExit::SystemExit { code, message } => {
+                if let Some(msg) = message {
+                    eprint!("{msg}");
+                }
+                code as i64
+            }
+            host::TopExit::Uncaught { traceback } => {
+                eprint!("{traceback}");
+                1
+            }
+        },
+    }
 }
