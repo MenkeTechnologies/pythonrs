@@ -11019,6 +11019,9 @@ fn validate_format_spec(
                 "ValueError: Unknown format code '{ty}' for object of type 'str'"
             ));
         }
+        if sign == ' ' {
+            return Err("ValueError: Space not allowed in string format specifier".into());
+        }
         if sign != '\0' {
             return Err("ValueError: Sign not allowed in string format specifier".into());
         }

@@ -87,6 +87,7 @@ fn run_main() -> ExitCode {
         Prog::Command(src) => {
             let mut argv = vec!["-c".to_string()];
             argv.extend(args);
+            let src = dedent_command(&src);
             emit(pythonrs::run_program(&src, argv, None, "<string>", true))
         }
         // `python - …` reads the script from stdin (argv[0] == '-').
@@ -165,6 +166,29 @@ fn run_script(cli: &pythonrs::cli::Cli, file: String, args: Vec<String>) -> Exit
     let mut argv = vec![file];
     argv.extend(args);
     emit(pythonrs::run_program(&src, argv, Some(abs.clone()), &abs, true))
+}
+
+/// CPython tolerates a uniformly-indented `-c` program (`python -c '  print(1)'`
+/// prints `1`): the first line's indentation sets the baseline. Strip that exact
+/// leading-whitespace prefix from every line so the lexer sees a column-0
+/// baseline; a line indented MORE than the first keeps its relative indent and
+/// still raises. A script FILE gets no such treatment — a leading indent there is
+/// an `IndentationError`, matching CPython.
+fn dedent_command(src: &str) -> String {
+    let Some(first) = src.lines().find(|l| !l.trim().is_empty()) else {
+        return src.to_string();
+    };
+    let prefix: String = first
+        .chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .collect();
+    if prefix.is_empty() {
+        return src.to_string();
+    }
+    src.lines()
+        .map(|l| l.strip_prefix(&prefix).unwrap_or(l))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// What the command line asks python to run, after CPython's interpreter-option
