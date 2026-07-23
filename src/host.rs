@@ -7026,8 +7026,7 @@ impl PyHost {
             // `<type>.__mro__` / `__bases__` on a type object.
             Some(PyObj::Builtin(n))
                 if (name == "__mro__" || name == "__bases__")
-                    && (crate::builtins::is_type_like_builtin(n)
-                        || (!n.contains('.') && !crate::builtins::is_builtin_function(n))) =>
+                    && (crate::builtins::is_type_object_name(n)) =>
             {
                 let mut mro = crate::builtins::builtin_mro(n);
                 if name == "__bases__" {
@@ -7044,8 +7043,7 @@ impl PyHost {
             // full C method table to enumerate).
             Some(PyObj::Builtin(n))
                 if name == "__dict__"
-                    && (crate::builtins::is_type_like_builtin(n)
-                        || (!n.contains('.') && !crate::builtins::is_builtin_function(n))) =>
+                    && (crate::builtins::is_type_object_name(n)) =>
             {
                 let n = n.clone();
                 let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();

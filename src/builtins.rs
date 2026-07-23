@@ -2918,6 +2918,28 @@ pub fn is_type_like_builtin(name: &str) -> bool {
     is_builtin_type(name) || is_exception_class(name)
 }
 
+/// True if `n` names a builtin TYPE object (for `isinstance(x, type)`, `__mro__`,
+/// `__dict__`). Covers the builtin types/exceptions, the type-constructor
+/// builtins that are also callable (`zip`/`map`/`filter`/`enumerate`/…), and any
+/// dotless type-name builtin produced by `type(x)` (coroutine/generator/…). A
+/// dotted name is an unbound method; a plain BUILTIN_FUNCS name is a function.
+pub fn is_type_object_name(n: &str) -> bool {
+    is_type_like_builtin(n)
+        || matches!(
+            n,
+            "zip" | "map"
+                | "filter"
+                | "enumerate"
+                | "reversed"
+                | "slice"
+                | "super"
+                | "property"
+                | "classmethod"
+                | "staticmethod"
+        )
+        || (!n.contains('.') && !is_builtin_function(n))
+}
+
 /// The method-resolution order of a builtin type object, as type names from the
 /// type up to `object`. Exceptions follow their class chain; `bool` subclasses
 /// `int`; everything else is `[name, object]`.
@@ -5801,12 +5823,7 @@ fn isinstance(h: &host::PyHost, v: &Value, cls: &Value) -> bool {
             // builtin produced by `type(x)` (coroutine/generator/iterator/…). A
             // dotted name is an unbound method (`str.upper`) and a BUILTIN_FUNCS
             // name is a function (`len`) -- neither is a type.
-            Some(PyObj::Builtin(n))
-                if is_type_like_builtin(n)
-                    || (!n.contains('.') && !is_builtin_function(n)) =>
-            {
-                return true
-            }
+            Some(PyObj::Builtin(n)) if is_type_object_name(n) => return true,
             _ => {}
         }
     }
