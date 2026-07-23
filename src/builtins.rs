@@ -5634,6 +5634,20 @@ fn isinstance_dispatch(v: &Value, cls: &Value) -> Result<bool, String> {
         }
         return Ok(false);
     }
+    // A PEP 604 union (`isinstance(x, int | str)`) tests each member; a bare
+    // `None` member matches only `None` itself (as `NoneType`).
+    if let Some(PyObj::Union { args }) = with_host(|h| h.get(cls).cloned()) {
+        for m in args {
+            if matches!(m, Value::Undef) {
+                if matches!(v, Value::Undef) {
+                    return Ok(true);
+                }
+            } else if isinstance_dispatch(v, &m)? {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
     if let Some(r) = host::metaclass_hook(cls, "__instancecheck__", v.clone()) {
         let res = r?;
         return Ok(with_host(|h| h.truthy(&res)));

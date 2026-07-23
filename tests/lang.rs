@@ -55,6 +55,24 @@ fn builtins_module_exposes_functions_types_exceptions() {
 }
 
 #[test]
+fn pep604_union_type() {
+    // `X | Y` on types builds a native types.UnionType (used in annotations and
+    // isinstance across the faithful stdlib).
+    assert_eq!(g("x = int | str", "x"), "int | str");
+    assert_eq!(g("x = type(int | str).__name__", "x"), "'UnionType'");
+    assert_eq!(g("x = int | None", "x"), "int | None");
+    assert_eq!(
+        g("x = (int | str | float).__args__", "x"),
+        "(<class 'int'>, <class 'str'>, <class 'float'>)",
+    );
+    assert_eq!(g("x = isinstance(5, int | str)", "x"), "True");
+    assert_eq!(g("x = isinstance(1.5, int | str)", "x"), "False");
+    assert_eq!(g("x = isinstance(None, int | None)", "x"), "True");
+    // Duplicate members dedupe; a lone member collapses to the type itself.
+    assert_eq!(g("x = int | int is int", "x"), "True");
+}
+
+#[test]
 fn function_code_object_co_attributes() {
     // Native code object: argcounts, varnames, flags derived from the FuncDef,
     // matching CPython exactly (needed by inspect/functools/dataclasses/types).

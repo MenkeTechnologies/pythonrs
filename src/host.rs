@@ -366,6 +366,12 @@ pub enum PyObj {
     Code {
         def_id: usize,
     },
+    /// A PEP 604 union type (`int | str`, `X | None`). `args` are the member
+    /// type objects (flattened, deduped). `type()` is `types.UnionType`; used in
+    /// annotations and `isinstance(x, int | str)`. Native VM object.
+    Union {
+        args: Vec<Value>,
+    },
     /// A first-class reference to a builtin function (`len`, `print`, …).
     Builtin(String),
     Class(String),
@@ -1443,6 +1449,33 @@ impl PyHost {
         matches!(self.get(v), Some(PyObj::Frozenset(_)))
     }
 
+    /// If `v` is a valid PEP 604 union member — a type object, an existing union
+    /// (flattened), or `None` (as `NoneType`) — return its member list. `None`
+    /// otherwise, so `|` falls through to its numeric/set meanings.
+    fn union_members(&self, v: &Value) -> Option<Vec<Value>> {
+        match self.get(v) {
+            Some(PyObj::Union { args }) => Some(args.clone()),
+            Some(PyObj::Class(_)) => Some(vec![v.clone()]),
+            Some(PyObj::Builtin(n)) if crate::builtins::is_type_like_builtin(n) => {
+                Some(vec![v.clone()])
+            }
+            // Bare `None` in a union stands for `NoneType` (`int | None`).
+            None if matches!(v, Value::Undef) => Some(vec![v.clone()]),
+            _ => None,
+        }
+    }
+
+    /// The display name of a union member for `repr` (`int | str`): a type's
+    /// name, or `None` for the bare-`None` (`NoneType`) member.
+    fn union_member_name(&self, v: &Value) -> String {
+        match self.get(v) {
+            Some(PyObj::Builtin(n)) => n.clone(),
+            Some(PyObj::Class(n)) => n.clone(),
+            None if matches!(v, Value::Undef) => "None".to_string(),
+            _ => self.repr_of(v),
+        }
+    }
+
     /// The live elements of a `dict_keys`/`dict_values`/`dict_items` view,
     /// materialized (allocating item tuples) from the backing dict at call time
     /// — so the view reflects mutations. `None` if `v` is not a view.
@@ -2301,6 +2334,7 @@ impl PyHost {
                 Some(PyObj::NamedTupleType { .. }) => "type".into(),
                 Some(PyObj::Partial { .. }) => "partial".into(),
                 Some(PyObj::Code { .. }) => "code".into(),
+                Some(PyObj::Union { .. }) => "UnionType".into(),
                 Some(PyObj::LruCache { .. }) => "functools._lru_cache_wrapper".into(),
                 Some(PyObj::Super { .. }) => "super".into(),
                 Some(PyObj::StaticMethod(_)) => "staticmethod".into(),
@@ -2415,6 +2449,13 @@ impl PyHost {
                         .map(|d| d.name.clone())
                         .unwrap_or_default();
                     format!("<code object {name} at 0x0000000000000000, file \"<string>\", line 1>")
+                }
+                Some(PyObj::Union { args }) => {
+                    let args = args.clone();
+                    args.iter()
+                        .map(|a| self.union_member_name(a))
+                        .collect::<Vec<_>>()
+                        .join(" | ")
                 }
                 // A `PyObj::Builtin` is an unbound builtin method
                 // (`str.upper`), a *type object* returned by `type(x)` (repr
@@ -4312,6 +4353,23 @@ impl PyHost {
                         return Ok(Value::Bool(!res.is_zero()));
                     }
                     return Ok(self.norm_big(res));
+                }
+                // PEP 604: `X | Y` on type objects builds a `types.UnionType`.
+                if tag == binop::BITOR {
+                    if let (Some(mut xs), Some(ys)) =
+                        (self.union_members(a), self.union_members(b))
+                    {
+                        for y in ys {
+                            if !xs.iter().any(|x| self.equal(x, &y)) {
+                                xs.push(y);
+                            }
+                        }
+                        // `int | int` collapses to the single type, as in CPython.
+                        if xs.len() == 1 {
+                            return Ok(xs.into_iter().next().unwrap());
+                        }
+                        return Ok(self.alloc(PyObj::Union { args: xs }));
+                    }
                 }
                 Err(self.optype_err("bitop", a, b))
             }
@@ -6443,6 +6501,13 @@ impl PyHost {
                 let def_id = *def_id;
                 self.code_attr(def_id, name)
             }
+            // `(int | str).__args__` -> the member tuple; `__parameters__` is empty
+            // (no typevars in a plain union).
+            Some(PyObj::Union { args }) if name == "__args__" => {
+                let args = args.clone();
+                Ok(self.new_tuple(args))
+            }
+            Some(PyObj::Union { .. }) if name == "__parameters__" => Ok(self.new_tuple(vec![])),
             // Function introspection dunders. `C.m` yields the raw `Func`; a
             // bound `inst.m` delegates to the same underlying function.
             // `f.__annotations__` — the def-time dict `{param|"return": type}`.
