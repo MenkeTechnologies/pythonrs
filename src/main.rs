@@ -24,24 +24,19 @@ fn main() -> ExitCode {
 }
 
 fn run_main() -> ExitCode {
-    // CPython semantics: `-m module` terminates interpreter-option parsing. The
-    // module name follows and EVERYTHING after it is the module's own `sys.argv`,
-    // passed through verbatim (`pip install --upgrade`, `pytest --verbose`,
-    // `json.tool --sort-keys` — those flags belong to the module, not to python).
-    // clap can't model that, so intercept `-m` from the raw args before clap sees
-    // the tail. Leading interpreter flags (before `-m`) are still honored.
+    // CPython (`Modules/main.c::pymain_parse_cmdline`) stops interpreter-option
+    // parsing at the FIRST of `-c` / `-m` / a script file / `--`; everything from
+    // there is the program plus its own `sys.argv`, passed through verbatim (so
+    // `script.py -u`, `-c '…' --flag`, `pip install --upgrade` all reach the
+    // program, never python). clap parses options anywhere and can't model that,
+    // so we split the raw args at the program boundary first, hand ONLY the
+    // leading interpreter-flag region to clap, and own the program + its argv.
     let raw: Vec<String> = std::env::args().collect();
-    if let Some(m) = find_dash_m(&raw) {
-        apply_leading_flags(&raw[1..m.flag_idx]);
-        let code = pythonrs::run_module(&m.module, &m.args);
-        return ExitCode::from((code & 0xFF) as u8);
-    }
+    let boundary = program_boundary(&raw);
+    let cli = pythonrs::cli::parse_from(&raw[..boundary]);
 
-    let cli = pythonrs::cli::parse();
-
-    // CPython interpreter flags that affect the embedded runtime. Set as env vars
-    // before the interpreter starts (`ffi::init` reads them at Py_Initialize); the
-    // embedded CPython that hosts the stdlib bridge then honors them.
+    // Interpreter flags that affect the embedded runtime, set as env vars before
+    // it starts (`ffi::init` reads them at `Py_Initialize`).
     if cli.unbuffered {
         std::env::set_var("PYTHONUNBUFFERED", "1");
     }
@@ -62,166 +57,179 @@ fn run_main() -> ExitCode {
         };
     }
 
-    if let Some(src) = cli.eval {
-        // `python -c '…' a b` → sys.argv == ['-c', 'a', 'b']. With `-c` present the
-        // first trailing token is a program arg, not a script path, so clap's
-        // `file` slot (if filled) belongs at the front of the passthrough args.
-        let mut argv = vec!["-c".to_string()];
-        argv.extend(cli.file);
-        argv.extend(cli.argv);
-        return emit(pythonrs::run_program(&src, argv, None, "<string>", true));
-    }
-
-    if let Some(file) = cli.file {
+    let (prog, args) = parse_program(&raw[boundary..]);
+    match prog {
+        // `python -m module …` → run the library module on the embedded CPython.
+        Prog::Module(module) => {
+            let code = pythonrs::run_module(&module, &args);
+            ExitCode::from((code & 0xFF) as u8)
+        }
+        // `python -c '…' a b` → sys.argv == ['-c', 'a', 'b'].
+        Prog::Command(src) => {
+            let mut argv = vec!["-c".to_string()];
+            argv.extend(args);
+            emit(pythonrs::run_program(&src, argv, None, "<string>", true))
+        }
         // `python - …` reads the script from stdin (argv[0] == '-').
-        if file == "-" {
+        Prog::Stdin => {
             let src = std::io::read_to_string(std::io::stdin()).unwrap_or_default();
             let mut argv = vec!["-".to_string()];
-            argv.extend(cli.argv);
-            return emit(pythonrs::run_program(&src, argv, None, "<stdin>", false));
+            argv.extend(args);
+            emit(pythonrs::run_program(&src, argv, None, "<stdin>", false))
         }
-        if cli.dump_bytecode {
-            return match dump(&file) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => fail(&e),
-            };
+        Prog::Script(file) => run_script(&cli, file, args),
+        Prog::MissingArg(opt) => fail_usage(&format!("Argument expected for the {opt} option")),
+        // No program: LSP/DAP handled above; a TTY starts the REPL, `--repl` over a
+        // pipe runs the interactive loop on the piped source, else stdin is a script.
+        Prog::None => {
+            if atty_stdin() {
+                pythonrs::repl::run();
+                return ExitCode::SUCCESS;
+            }
+            if cli.repl {
+                pythonrs::repl::run_piped();
+                return ExitCode::SUCCESS;
+            }
+            // stdin-as-script: argv == [''].
+            let src = std::io::read_to_string(std::io::stdin()).unwrap_or_default();
+            let mut argv = vec![String::new()];
+            argv.extend(args);
+            emit(pythonrs::run_program(&src, argv, None, "<stdin>", false))
         }
-        if cli.dump_tokens {
-            return match dump_tokens(&file) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => fail(&e),
-            };
-        }
-        if cli.dump_ast {
-            return match dump_ast(&file) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => fail(&e),
-            };
-        }
-        if cli.disasm {
-            return match disasm(&file) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => fail(&e),
-            };
-        }
-        if cli.build {
-            return match pythonrs::aot::build(&file) {
-                Ok(msg) => {
-                    // A build report is explicit user-requested output.
-                    println!("{msg}");
-                    ExitCode::SUCCESS
-                }
-                Err(e) => fail(&e),
-            };
-        }
-        let src = match std::fs::read_to_string(&file) {
-            Ok(s) => s,
-            Err(e) => return fail(&format!("cannot read {file}: {e}")),
+    }
+}
+
+/// Run a script file: honor `--dump-*`/`--disasm`/`--build` if requested, else
+/// execute it with `sys.argv == [file, *args]`.
+fn run_script(cli: &pythonrs::cli::Cli, file: String, args: Vec<String>) -> ExitCode {
+    if cli.dump_bytecode {
+        return match dump(&file) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e),
         };
-        // `__file__`/traceback use the absolute path; `sys.argv[0]` keeps the path
-        // as typed. `python script.py a b` → sys.argv == ['script.py', 'a', 'b'].
-        let abs = abs_path(&file);
-        let mut argv = vec![file.clone()];
-        argv.extend(cli.argv);
-        return emit(pythonrs::run_program(
-            &src,
-            argv,
-            Some(abs.clone()),
-            &abs,
-            true,
-        ));
     }
-
-    if atty_stdin() {
-        pythonrs::repl::run();
-        return ExitCode::SUCCESS;
+    if cli.dump_tokens {
+        return match dump_tokens(&file) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e),
+        };
     }
-    // `--repl` with a piped (non-TTY) stdin: run the interactive loop over the
-    // piped source (CPython's `python3 -i < file`), so REPL echo is observable
-    // and testable without a terminal.
-    if cli.repl {
-        pythonrs::repl::run_piped();
-        return ExitCode::SUCCESS;
+    if cli.dump_ast {
+        return match dump_ast(&file) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e),
+        };
     }
-
-    // No file and non-interactive stdin: run stdin as a script (argv == ['']).
-    let src = std::io::read_to_string(std::io::stdin()).unwrap_or_default();
-    let mut argv = vec![String::new()];
-    argv.extend(cli.argv);
-    emit(pythonrs::run_program(&src, argv, None, "<stdin>", false))
+    if cli.disasm {
+        return match disasm(&file) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e),
+        };
+    }
+    if cli.build {
+        return match pythonrs::aot::build(&file) {
+            Ok(msg) => {
+                // A build report is explicit user-requested output.
+                println!("{msg}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e),
+        };
+    }
+    let src = match std::fs::read_to_string(&file) {
+        Ok(s) => s,
+        Err(e) => return fail(&format!("cannot read {file}: {e}")),
+    };
+    // `__file__`/traceback use the absolute path; `sys.argv[0]` keeps the path as
+    // typed. `python script.py a b` → sys.argv == ['script.py', 'a', 'b'].
+    let abs = abs_path(&file);
+    let mut argv = vec![file];
+    argv.extend(args);
+    emit(pythonrs::run_program(&src, argv, Some(abs.clone()), &abs, true))
 }
 
-/// A parsed `-m` invocation: where `-m` sat, the module name, and the module's
-/// verbatim argv (everything after the module name).
-struct DashM {
-    flag_idx: usize,
-    module: String,
-    args: Vec<String>,
+/// What the command line asks python to run, after CPython's interpreter-option
+/// parsing terminates at the program boundary.
+enum Prog {
+    /// `-c SRC` — a one-liner.
+    Command(String),
+    /// `-m MODULE` — a library module (runs on the embedded CPython).
+    Module(String),
+    /// A script file path.
+    Script(String),
+    /// `-` — read the script from stdin (`sys.argv[0] == '-'`).
+    Stdin,
+    /// `-c`/`-m` given with no following argument (`opt` is `-c`/`-m`).
+    MissingArg(&'static str),
+    /// No program token: REPL / LSP / DAP / stdin-as-script.
+    None,
 }
 
-/// Scan raw process args for CPython's `-m` (or glued `-mMODULE`), stopping if
-/// `-c` appears first (its code string, not `-m`, then terminates parsing). Only
-/// interpreter-option tokens may precede `-m`; the first bare token that is not
-/// such an option is a script path, so `-m` after it doesn't apply.
-fn find_dash_m(raw: &[String]) -> Option<DashM> {
+/// The index into `raw` where the program begins — the first of `-c` / `-m` / a
+/// script file / `-` / `--`. Everything before is the interpreter-flag region;
+/// everything from here is the program and its verbatim `sys.argv`. Mirrors
+/// CPython's `pymain_parse_cmdline`: only interpreter options precede the program,
+/// and the first bare token (or `-c`/`-m`/`-`/`--`) ends option parsing.
+fn program_boundary(raw: &[String]) -> usize {
     let mut i = 1;
     while i < raw.len() {
         let a = &raw[i];
-        if a == "-c" {
-            return None; // `-c` wins; clap handles it.
-        }
-        if a == "-m" {
-            let module = raw.get(i + 1)?.clone();
-            return Some(DashM {
-                flag_idx: i,
-                module,
-                args: raw[i + 2..].to_vec(),
-            });
-        }
-        if let Some(module) = a.strip_prefix("-m").filter(|s| !s.is_empty()) {
-            // Glued `-mpip` form (CPython accepts it).
-            return Some(DashM {
-                flag_idx: i,
-                module: module.to_string(),
-                args: raw[i + 1..].to_vec(),
-            });
+        // Program starters (separate or glued `-cSRC`/`-mMOD`), stdin `-`, and the
+        // `--` end-of-options marker all begin the program region.
+        if a == "-c"
+            || a == "-m"
+            || a == "-"
+            || a == "--"
+            || ((a.starts_with("-c") || a.starts_with("-m")) && a.len() > 2)
+        {
+            return i;
         }
         if a == "-W" {
             i += 2; // `-W <action>` consumes its value.
             continue;
         }
         if a.starts_with('-') && a.len() > 1 {
-            i += 1; // another interpreter flag (-u/-E/-I/-O/-S/-B/…).
+            i += 1; // an interpreter flag (short `-u/-E/-I/-O/-S/-B`, long `--repl`…).
             continue;
         }
-        return None; // a bare token (script path) — not `-m` mode.
+        return i; // a bare token — the script path.
     }
-    None
+    raw.len()
 }
 
-/// Apply the runtime-affecting interpreter flags that appeared before `-m`
-/// (`-u` → unbuffered, `-W <action>` → warning filter) as env vars the embedded
-/// CPython reads at startup. Other flags (`-E/-I/-O/-S/-B`) are accepted no-ops.
-fn apply_leading_flags(leading: &[String]) {
-    let mut warns: Vec<String> = Vec::new();
-    let mut i = 0;
-    while i < leading.len() {
-        match leading[i].as_str() {
-            "-u" => std::env::set_var("PYTHONUNBUFFERED", "1"),
-            "-W" => {
-                if let Some(v) = leading.get(i + 1) {
-                    warns.push(v.clone());
-                    i += 2;
-                    continue;
-                }
-            }
-            _ => {}
-        }
-        i += 1;
+/// Classify the program region (`raw[boundary..]`) into a [`Prog`] plus its
+/// verbatim argv (everything after the program token). CPython's `--` consumes
+/// itself, then the next token is the script.
+fn parse_program(region: &[String]) -> (Prog, Vec<String>) {
+    let Some(first) = region.first() else {
+        return (Prog::None, Vec::new());
+    };
+    let rest = |n: usize| region.get(n..).map(<[String]>::to_vec).unwrap_or_default();
+    match first.as_str() {
+        "-c" => match region.get(1) {
+            Some(src) => (Prog::Command(src.clone()), rest(2)),
+            None => (Prog::MissingArg("-c"), Vec::new()),
+        },
+        "-m" => match region.get(1) {
+            Some(m) => (Prog::Module(m.clone()), rest(2)),
+            None => (Prog::MissingArg("-m"), Vec::new()),
+        },
+        "-" => (Prog::Stdin, rest(1)),
+        "--" => match region.get(1) {
+            Some(f) => (Prog::Script(f.clone()), rest(2)),
+            None => (Prog::None, Vec::new()),
+        },
+        s if s.starts_with("-c") => (Prog::Command(s[2..].to_string()), rest(1)),
+        s if s.starts_with("-m") => (Prog::Module(s[2..].to_string()), rest(1)),
+        s => (Prog::Script(s.to_string()), rest(1)),
     }
-    if !warns.is_empty() {
-        std::env::set_var("PYTHONWARNINGS", warns.join(","));
-    }
+}
+
+/// A command-line usage error: terse message on stderr, exit 2 (CPython's
+/// usage-error code, e.g. `-c`/`-m` with no argument).
+fn fail_usage(msg: &str) -> ExitCode {
+    eprintln!("python: {msg}");
+    ExitCode::from(2)
 }
 
 /// Emit a run's stderr text (traceback / `SystemExit` message) and reduce its

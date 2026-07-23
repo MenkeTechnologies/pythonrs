@@ -14,11 +14,12 @@ pub struct Cli {
     #[arg(short = 'c', long = "command", value_name = "SRC")]
     pub eval: Option<String>,
 
-    /// Run a library module as a script (`python -m pip …`); delegates to the
-    /// embedded CPython (`runpy`), so `-m pip`/`-m venv`/`-m http.server` behave
-    /// exactly like `python3 -m`. Trailing tokens become the module's `sys.argv`.
-    #[arg(short = 'm', value_name = "MODULE")]
-    pub module: Option<String>,
+    // NOTE: `-m` is intentionally NOT a clap field. It's intercepted from the raw
+    // args in `main.rs::find_dash_m` before clap runs, because CPython's `-m`
+    // terminates interpreter-option parsing (every token after the module is the
+    // module's verbatim `sys.argv`) — a contract clap can't model. A clap `-m`
+    // field would also wrongly capture a `-m` that is a *program* argument
+    // (`python foo.py -m bar`, `python -c '…' -m x`), dropping it from `sys.argv`.
 
     /// Force stdout/stderr unbuffered (CPython `-u` / `PYTHONUNBUFFERED`).
     #[arg(short = 'u')]
@@ -96,4 +97,12 @@ pub struct Cli {
 /// Parse the process arguments.
 pub fn parse() -> Cli {
     Cli::parse()
+}
+
+/// Parse a specific argument slice (the leading interpreter-flag region, with
+/// `args[0]` the program name). Used after the raw args are split at the program
+/// boundary so clap only ever sees interpreter options — never the program's own
+/// args. `--help`/`--version`/a bad flag are handled by clap here (print + exit).
+pub fn parse_from(args: &[String]) -> Cli {
+    Cli::parse_from(args)
 }

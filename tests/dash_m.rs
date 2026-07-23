@@ -90,3 +90,67 @@ fn passthrough_flags_do_not_break_c_eval() {
     assert_eq!(code, 0, "stderr: {err}");
     assert_eq!(out.trim(), "42");
 }
+
+// ── Program-boundary / argv-termination parity with CPython ──────────────────
+// CPython stops interpreter-option parsing at the first of `-c`/`-m`/script/`--`;
+// every token after belongs to the program's sys.argv, even tokens that look like
+// python's own flags. These guard against the regression where clap kept parsing
+// `-u`/`-m`/etc. past the program boundary and dropped them from sys.argv.
+
+/// Write a `print(sys.argv)` script to a temp file and return its path (kept
+/// alive by the returned handle).
+fn argv_script() -> tempfile::NamedTempFile {
+    let mut f = tempfile::Builder::new()
+        .suffix(".py")
+        .tempfile()
+        .expect("temp file");
+    f.write_all(b"import sys\nprint(sys.argv)\n").expect("write");
+    f
+}
+
+#[test]
+fn script_args_that_look_like_python_flags_reach_sys_argv() {
+    let f = argv_script();
+    let path = f.path().to_str().unwrap().to_string();
+    // `-u -E extra` are the SCRIPT's argv, not python's — python stopped parsing
+    // options at the script path.
+    let (out, err, code) = run(&[&path, "-u", "-E", "extra"], None);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert_eq!(out.trim(), format!("['{path}', '-u', '-E', 'extra']"));
+}
+
+#[test]
+fn dash_m_as_a_program_arg_is_not_module_mode() {
+    let f = argv_script();
+    let path = f.path().to_str().unwrap().to_string();
+    // `-m bar` AFTER a script path is the script's argv, not `python -m`.
+    let (out, err, code) = run(&[&path, "-m", "bar"], None);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert_eq!(out.trim(), format!("['{path}', '-m', 'bar']"));
+}
+
+#[test]
+fn c_eval_argv_keeps_flaglike_tokens() {
+    // `python -c CODE -m x` → sys.argv == ['-c', '-m', 'x'].
+    let (out, err, code) = run(&["-c", "import sys; print(sys.argv)", "-m", "x"], None);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert_eq!(out.trim(), "['-c', '-m', 'x']");
+}
+
+#[test]
+fn double_dash_ends_option_parsing() {
+    let f = argv_script();
+    let path = f.path().to_str().unwrap().to_string();
+    // `python -- script.py -u` → script with argv [script, '-u'].
+    let (out, err, code) = run(&["--", &path, "-u"], None);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert_eq!(out.trim(), format!("['{path}', '-u']"));
+}
+
+#[test]
+fn missing_c_and_m_args_exit_2() {
+    let (_o, _e, c1) = run(&["-c"], None);
+    assert_eq!(c1, 2, "`-c` with no argument should exit 2");
+    let (_o2, _e2, c2) = run(&["-m"], None);
+    assert_eq!(c2, 2, "`-m` with no argument should exit 2");
+}
