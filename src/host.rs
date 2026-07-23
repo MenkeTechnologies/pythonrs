@@ -8220,7 +8220,11 @@ pub fn call_method(
                 Some((f, found)) => {
                     let fobj = with_host(|h| h.get(&f).cloned());
                     if let Some(PyObj::Func(fv)) = fobj {
-                        return run_user_func(&fv, Some(instance), Some(found), args, kwargs);
+                        // `__new__` is an implicit staticmethod — the class is passed
+                        // explicitly in `args`, so `super().__new__(cls, …)` must NOT
+                        // also bind the instance as a receiver.
+                        let recv = if name == "__new__" { None } else { Some(instance) };
+                        return run_user_func(&fv, recv, Some(found), args, kwargs);
                     }
                     invoke(&f, args, kwargs)
                 }
@@ -8601,6 +8605,16 @@ pub fn run_user_func(
     if let Some(s) = &self_val {
         pos.insert(0, s.clone());
     }
+    // `__new__` is an implicit staticmethod (no bound receiver), but zero-arg
+    // `super()` inside it resolves against the class passed as the first argument.
+    // Expose that as the frame's `self` without prepending it to the parameters.
+    let frame_self = self_val.clone().or_else(|| {
+        if def.name == "__new__" {
+            pos.first().cloned()
+        } else {
+            None
+        }
+    });
     let env = new_env(fv.env.clone());
     bind_params(&env, &def, &fv.defaults, &fv.kwonly_defaults, pos, kwargs)?;
     let owner = owner_opt.or_else(|| fv.owner.clone());
@@ -8660,7 +8674,7 @@ pub fn run_user_func(
             nonlocals_decl: HashSet::new(),
             locals_set: def.locals.iter().cloned().collect(),
             is_class_body: false,
-            self_obj: self_val,
+            self_obj: frame_self,
             owner,
             name: def.name.clone(),
             line: 0,
@@ -10717,12 +10731,24 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                 a.insert("hexversion".to_string(), Value::Int(hexversion));
                 h.alloc(PyObj::Namespace { attrs: a })
             };
+            // `sys.builtin_module_names` — modules compiled into the interpreter.
+            // `os` reads this to pick the platform (`'posix' in ...`), so on a Unix
+            // host it must contain `posix`.
+            let builtin_module_names = {
+                let names = [
+                    "_abc", "_io", "_imp", "_thread", "_warnings", "builtins", "errno",
+                    "itertools", "marshal", "posix", "sys", "time",
+                ];
+                let vals: Vec<Value> = names.iter().map(|n| h.new_str(*n)).collect();
+                h.new_tuple(vals)
+            };
             vec![
                 ("argv", argv),
                 ("maxsize", Value::Int(i64::MAX)),
                 ("version", version),
                 ("version_info", version_info),
                 ("implementation", implementation),
+                ("builtin_module_names", builtin_module_names),
                 ("platform", platform),
                 ("path", path),
                 ("modules", modules),

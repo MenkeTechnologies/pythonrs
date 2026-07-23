@@ -207,6 +207,17 @@ fn function_docstring_is_dunder_doc() {
 }
 
 #[test]
+fn metaclass_super_new_is_static() {
+    // super().__new__ inside a metaclass __new__ passes the class explicitly (no
+    // extra bound receiver -> right arg count), and zero-arg super() there resolves
+    // against that first argument. This is what let _collections_abc's ABCMeta run.
+    let src = "class Meta(type):\n    def __new__(mcls, name, bases, ns):\n        \
+               cls = super().__new__(mcls, name, bases, ns)\n        cls.tag = 'made'\n        \
+               return cls\nclass C(metaclass=Meta): pass\nx = C.tag";
+    assert_eq!(g(src, "x"), "'made'");
+}
+
+#[test]
 fn isinstance_of_type_for_type_objects() {
     // Every type object is an instance of `type` -- incl. the coroutine/generator/
     // iterator types the stdlib registers with ABCs; functions and unbound
