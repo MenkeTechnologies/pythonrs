@@ -698,7 +698,7 @@ impl Compiler {
         body: &[Stmt],
         orelse: &[Stmt],
     ) -> Result<(), String> {
-        if loop_needs_signal(body) && !body_has_yield(body) {
+        if loop_needs_signal(body) {
             return self.compile_while_signal(b, test, body, orelse);
         }
         let start = b.current_pos();
@@ -735,7 +735,7 @@ impl Compiler {
         body: &[Stmt],
         orelse: &[Stmt],
     ) -> Result<(), String> {
-        if loop_needs_signal(body) && !body_has_yield(body) {
+        if loop_needs_signal(body) {
             return self.compile_for_signal(b, target, iter, body, orelse);
         }
         self.compile_expr(b, iter)?;
@@ -778,6 +778,14 @@ impl Compiler {
     /// Compile `body` (in signal mode) into a sub-chunk and register it in the
     /// try table, returning its id for a `LOOP_BODY` op. `break`/`continue` in
     /// `body` emit control signals (they cross a `try`/`with` boundary).
+    ///
+    /// A `yield` inside `body` suspends correctly through the `LOOP_BODY` sub-chunk
+    /// (the coroutine yielder is thread-published, not chunk-scoped), so this path
+    /// serves generators too — the signal lowering is chosen purely on whether a
+    /// `break`/`continue` crosses a `try`/`with`, independent of `yield`. (A loop
+    /// with `yield` AND such a crossing must use this path: the native jump-patch
+    /// path would try to patch a `continue` compiled into a try-handler's own
+    /// chunk, panicking `patch_jump on non-jump op`.)
     fn register_loop_body(&mut self, body: &[Stmt]) -> Result<usize, String> {
         self.loops.push(LoopCtx {
             breaks: Vec::new(),

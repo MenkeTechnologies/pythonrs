@@ -408,6 +408,45 @@ for v in count(3):
 }
 
 #[test]
+fn generator_loop_break_continue_across_try() {
+    // A generator whose loop `continue`/`break` crosses a `try`/`finally`
+    // boundary. Both the signal-driven loop lowering (needed so a `finally` runs
+    // before the loop exit) and `yield` inside that lowered body must work at
+    // once. Regression: the compiler took the native jump-patch path for any
+    // loop containing `yield`, but a `continue` inside an `except` compiles into
+    // the try handler's own chunk, so patching its jump into the main chunk
+    // panicked (`patch_jump on non-jump op`) — this is exactly the shape in the
+    // vendored stdlib `os._walk`.
+    let src = "
+def gen(items):
+    i = 0
+    while i < len(items):
+        x = items[i]
+        i += 1
+        try:
+            if x < 0:
+                raise ValueError
+            yield 100 // x
+        except (ValueError, ZeroDivisionError):
+            continue
+out = list(gen([2, 0, 5, -1, 4]))
+
+def stop_at(n):
+    i = 0
+    while True:
+        try:
+            if i >= n:
+                break
+            yield i * i
+        finally:
+            i += 1
+squares = list(stop_at(4))
+";
+    assert_eq!(g(src, "out"), "[50, 20, 25]");
+    assert_eq!(g(src, "squares"), "[0, 1, 4, 9]");
+}
+
+#[test]
 fn generators_yield_expression_and_from() {
     // A `yield` expression receives the value passed to the caller's resume; a
     // plain iteration sends None (falsy), so the echo accumulates the yields.
