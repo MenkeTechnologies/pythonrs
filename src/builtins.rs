@@ -495,6 +495,12 @@ fn b_getitem(vm: &mut VM, _: u8) -> Value {
     } else {
         idx
     };
+    // A CPython `Foreign` object (stdlib-ffi): run `recv[idx]` (its `__getitem__`)
+    // OUTSIDE the borrow so a `@dataclass` with a user `__getitem__` re-enters.
+    #[cfg(feature = "stdlib-ffi")]
+    if let Some(id) = with_host(|h| h.foreign_id(&recv)) {
+        return finish(vm, crate::ffi::get_item_cb(id, &idx));
+    }
     let cands = host::instance_key_candidates(&recv);
     let r = host::with_instance_key(&idx, &cands, || with_host(|h| h.get_item(&recv, &idx)));
     finish(vm, r)
@@ -564,11 +570,11 @@ fn b_delitem(vm: &mut VM, _: u8) -> Value {
 fn b_mkstr(vm: &mut VM, argc: u8) -> Value {
     let parts = pop_n(vm, argc as usize);
     let mut s = String::new();
-    with_host(|h| {
-        for p in &parts {
-            s.push_str(&h.str_of(p));
-        }
-    });
+    // `host::str_of` (free fn) prefetches any foreign `__str__` outside the borrow,
+    // so a `Foreign` with a user-defined dunder can't re-enter mid-format.
+    for p in &parts {
+        s.push_str(&host::str_of(p));
+    }
     with_host(|h| h.new_str(s))
 }
 
@@ -1009,6 +1015,12 @@ fn py_bool(v: &Value) -> Result<bool, String> {
         let x = host::call_method(v, "__len__", vec![], vec![])?;
         return Ok(with_host(|h| h.truthy(&x)));
     }
+    // A CPython `Foreign` object (stdlib-ffi): run its `__bool__`/`__len__` in
+    // CPython OUTSIDE the borrow so a `@dataclass` with a user dunder can re-enter.
+    #[cfg(feature = "stdlib-ffi")]
+    if let Some(fid) = with_host(|h| h.foreign_id(v)) {
+        return Ok(crate::ffi::truthy(fid));
+    }
     Ok(with_host(|h| h.truthy(v)))
 }
 
@@ -1115,7 +1127,7 @@ fn stringify(vm: &mut VM, v: &Value, repr: bool) -> Value {
             return finish(vm, r);
         }
     }
-    let s = with_host(|h| if repr { h.repr_of(v) } else { h.str_of(v) });
+    let s = if repr { host::repr_of(v) } else { host::str_of(v) };
     with_host(|h| h.new_str(s))
 }
 
@@ -1376,6 +1388,15 @@ fn b_contains(vm: &mut VM, _: u8) -> Value {
             }
             return Value::Bool(false);
         }
+    }
+    // A CPython `Foreign` container (stdlib-ffi): run `in` (its `__contains__`)
+    // OUTSIDE the borrow so a `@dataclass` with a user `__contains__` re-enters.
+    #[cfg(feature = "stdlib-ffi")]
+    if let Some(id) = with_host(|h| h.foreign_id(&container)) {
+        return match crate::ffi::contains_cb(id, &item) {
+            Ok(b) => Value::Bool(b),
+            Err(e) => abort(vm, e),
+        };
     }
     let cands = host::instance_key_candidates(&container);
     let r = host::with_instance_key(&item, &cands, || {
@@ -2185,6 +2206,19 @@ fn b_unary(vm: &mut VM, _: u8) -> Value {
         let r = host::call_method(&v, dunder, vec![], vec![]);
         return finish(vm, r);
     }
+    // A CPython `Foreign` operand (stdlib-ffi): dispatch `~`/unary `+` OUTSIDE the
+    // borrow so a `@dataclass` with a user `__invert__`/`__pos__` can re-enter.
+    #[cfg(feature = "stdlib-ffi")]
+    {
+        let func = match tag {
+            host::unop::INVERT => "invert",
+            host::unop::POS => "pos",
+            _ => "",
+        };
+        if !func.is_empty() && with_host(|h| h.foreign_id(&v).is_some()) {
+            return finish(vm, crate::ffi::unary_op_cb(func, &v));
+        }
+    }
     let r = with_host(|h| h.unary(tag, &v));
     finish(vm, r)
 }
@@ -2693,6 +2727,13 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
             return crate::ffi::binary_op_cb(func, a, b);
         }
     }
+    // Unary negation on a `Foreign` operand: `foreign_binop_func(Neg)` is `None`
+    // (it is not a binary op), so dispatch it borrow-free here before the native
+    // fallthrough would hand it to `h.arith` (which holds the borrow across ffi).
+    #[cfg(feature = "stdlib-ffi")]
+    if matches!(op, Neg) && with_host(|h| h.foreign_id(a).is_some()) {
+        return crate::ffi::unary_op_cb("neg", a);
+    }
     let a_inst = with_host(|h| matches!(h.get(a), Some(PyObj::Instance(_))));
     let b_inst = with_host(|h| matches!(h.get(b), Some(PyObj::Instance(_))));
     // No user instance involved → native handling (preserves `1 == 1.0`, etc.).
@@ -2766,6 +2807,12 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
             {
                 host::call_method(a, "__neg__", vec![], vec![])
             } else {
+                // A CPython `Foreign` operand: dispatch `-x` OUTSIDE the borrow so
+                // a `@dataclass` with a user `__neg__` can re-enter the host.
+                #[cfg(feature = "stdlib-ffi")]
+                if with_host(|h| h.foreign_id(a).is_some()) {
+                    return crate::ffi::unary_op_cb("neg", a);
+                }
                 with_host(|h| h.arith(op, a, b))
             }
         }
@@ -2974,7 +3021,9 @@ pub fn py_str(v: &Value) -> Result<String, String> {
     }) {
         return py_repr(v);
     }
-    Ok(with_host(|h| h.str_of(v)))
+    // `host::str_of` prefetches a `Foreign` object's CPython `str` outside the
+    // borrow, so a foreign value with a user `__str__`/`__repr__` cannot re-enter.
+    Ok(host::str_of(v))
 }
 
 pub fn py_repr(v: &Value) -> Result<String, String> {
@@ -3095,7 +3144,8 @@ pub fn py_repr(v: &Value) -> Result<String, String> {
         host::repr_guard_leave(id);
         return result;
     }
-    Ok(with_host(|h| h.repr_of(v)))
+    // See `py_str`: prefetch a `Foreign` object's CPython `repr` outside the borrow.
+    Ok(host::repr_of(v))
 }
 
 fn kw_get(kwargs: &[(String, Value)], name: &str) -> Option<Value> {
@@ -3289,6 +3339,14 @@ pub fn call_builtin_function(
             // An `int`/`float` subclass with no `__abs__` override: `abs` on the
             // native payload (a plain `int`/`float`).
             let v = host::subclass_operand(&v, "__abs__");
+            // A CPython `Foreign` object (stdlib-ffi): `abs(Decimal(...))`,
+            // `abs(timedelta(...))`, or a `@dataclass` with a user `__abs__`.
+            // Dispatch OUTSIDE the borrow — the real `__abs__` may be a pythonrs
+            // method that re-enters the host.
+            #[cfg(feature = "stdlib-ffi")]
+            if with_host(|h| h.foreign_id(&v).is_some()) {
+                return crate::ffi::unary_op_cb("abs", &v);
+            }
             with_host(|h| match &v {
                 Value::Int(n) => Ok(Value::Int(n.abs())),
                 Value::Float(f) => Ok(Value::Float(f.abs())),
@@ -3304,10 +3362,6 @@ pub fn call_builtin_function(
                     Some(PyObj::Complex(r, i)) => Ok(Value::Float(r.hypot(*i))),
                     _ => unreachable!(),
                 },
-                // A CPython `Foreign` object (stdlib-ffi): `abs(Decimal(...))`,
-                // `abs(timedelta(...))`, … dispatch to the real `__abs__`.
-                #[cfg(feature = "stdlib-ffi")]
-                Value::Obj(_) if h.foreign_id(&v).is_some() => crate::ffi::unary_op(h, "abs", &v),
                 _ => Err(host::type_error(&format!(
                     "bad operand type for abs(): '{}'",
                     h.type_name(&v)
@@ -4251,6 +4305,13 @@ pub fn hash_key(k: &PKey) -> i64 {
 }
 
 pub fn py_len(v: &Value) -> Result<usize, String> {
+    // A CPython `Foreign` object (stdlib-ffi): `len()` runs its `__len__` in
+    // CPython OUTSIDE the borrow, so a `@dataclass` with a user `__len__` can
+    // re-enter the host without a double borrow.
+    #[cfg(feature = "stdlib-ffi")]
+    if let Some(fid) = with_host(|h| h.foreign_id(v)) {
+        return crate::ffi::len(fid);
+    }
     with_host(|h| match h.get(v) {
         Some(PyObj::Str(s)) => Ok(s.chars().count()),
         Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) => Ok(b.len()),
@@ -4497,7 +4558,8 @@ fn construct_int(args: &[Value]) -> Result<Value, String> {
         // converts via CPython's own `int()`.
         #[cfg(feature = "stdlib-ffi")]
         if let Some(id) = with_host(|h| h.foreign_id(&v)) {
-            return with_host(|h| crate::ffi::to_int(h, id));
+            // Borrow-free: a `@dataclass` with a user `__int__` re-enters the host.
+            return crate::ffi::to_int_cb(id);
         }
         let has_int = with_host(
             |h| matches!(h.get(&v), Some(PyObj::Instance(i)) if instance_has(h, i, "__int__")),

@@ -1136,12 +1136,37 @@ pub fn get_item(host: &mut PyHost, id: u32, idx: &Value) -> Result<Value, String
     })
 }
 
+/// [`get_item`] for the borrow-free path: the caller must NOT hold the host
+/// borrow, so a `Foreign` object whose `__getitem__` is a pythonrs method can
+/// re-enter. Key and result marshal under fresh short borrows.
+pub fn get_item_cb(id: u32, idx: &Value) -> Result<Value, String> {
+    Python::with_gil(|py| {
+        let key = with_host(|h| value_to_py(h, py, idx))?;
+        let obj = fetch(py, id)?;
+        let item = obj.get_item(key).map_err(|e| e.to_string())?;
+        with_host(|h| py_to_value(h, py, &item))
+    })
+}
+
 /// `iter(foreign)` — returns a `Foreign` iterator handle.
 pub fn make_iter(host: &mut PyHost, id: u32) -> Result<Value, String> {
     Python::with_gil(|py| {
         let obj = fetch(py, id)?;
         let it = obj.try_iter().map_err(|e| e.to_string())?;
         Ok(host.alloc(PyObj::Foreign(store(it.into_any().unbind()))))
+    })
+}
+
+/// [`make_iter`] for the borrow-free path: the caller must NOT hold the host
+/// borrow, so a `Foreign` object whose `__iter__` is a pythonrs method can
+/// re-enter. `try_iter` (which runs `__iter__`) is called with no borrow held;
+/// only the resulting handle is allocated under a fresh short borrow.
+pub fn make_iter_cb(id: u32) -> Result<Value, String> {
+    Python::with_gil(|py| {
+        let obj = fetch(py, id)?;
+        let it = obj.try_iter().map_err(|e| e.to_string())?;
+        let handle = it.into_any().unbind();
+        Ok(with_host(|h| h.alloc(PyObj::Foreign(store(handle)))))
     })
 }
 
@@ -1183,6 +1208,17 @@ pub fn contains(host: &mut PyHost, id: u32, item: &Value) -> Result<bool, String
     Python::with_gil(|py| {
         let obj = fetch(py, id)?;
         let needle = value_to_py(host, py, item)?;
+        obj.contains(needle).map_err(|e| e.to_string())
+    })
+}
+
+/// [`contains`] for the borrow-free path: the caller must NOT hold the host
+/// borrow, so a `Foreign` object whose `__contains__` is a pythonrs method can
+/// re-enter. The needle marshals under a fresh short borrow.
+pub fn contains_cb(id: u32, item: &Value) -> Result<bool, String> {
+    Python::with_gil(|py| {
+        let needle = with_host(|h| value_to_py(h, py, item))?;
+        let obj = fetch(py, id)?;
         obj.contains(needle).map_err(|e| e.to_string())
     })
 }
@@ -1253,6 +1289,21 @@ pub fn to_int(host: &mut PyHost, id: u32) -> Result<Value, String> {
     })
 }
 
+/// [`to_int`] for the borrow-free path: the caller must NOT hold the host borrow,
+/// so a `Foreign` object whose `__int__`/`__index__` is a pythonrs method can
+/// re-enter. Only the result marshals back, under a fresh short borrow.
+pub fn to_int_cb(id: u32) -> Result<Value, String> {
+    Python::with_gil(|py| {
+        let obj = fetch(py, id)?;
+        let i = py
+            .import("builtins")
+            .and_then(|b| b.getattr("int"))
+            .and_then(|f| f.call1((obj,)))
+            .map_err(|e| e.to_string())?;
+        with_host(|h| py_to_value(h, py, &i))
+    })
+}
+
 /// [`binary_op`] for the borrow-free path (`numeric_hook`): the caller must NOT
 /// hold the host borrow. The operator runs in CPython with no borrow held, so an
 /// operand whose comparison/arithmetic calls back into pythonrs (a
@@ -1285,6 +1336,22 @@ pub fn unary_op(host: &mut PyHost, func: &str, v: &Value) -> Result<Value, Strin
             .map_err(|e| e.to_string())?;
         let res = op.call1((pv,)).map_err(|e| e.to_string())?;
         py_to_value(host, py, &res)
+    })
+}
+
+/// [`unary_op`] for the borrow-free path: the caller must NOT hold the host
+/// borrow. The CPython operator runs with no borrow held, so an operand whose
+/// `__neg__`/`__abs__`/… is a pythonrs method (a `@dataclass` with user dunders)
+/// can re-enter the host. Arg and result marshal under fresh short borrows.
+pub fn unary_op_cb(func: &str, v: &Value) -> Result<Value, String> {
+    Python::with_gil(|py| {
+        let pv = with_host(|h| value_to_py(h, py, v))?;
+        let op = py
+            .import("operator")
+            .and_then(|m| m.getattr(func))
+            .map_err(|e| e.to_string())?;
+        let res = op.call1((pv,)).map_err(|e| e.to_string())?;
+        with_host(|h| py_to_value(h, py, &res))
     })
 }
 

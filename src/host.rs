@@ -947,6 +947,98 @@ fn pending_key_clear() {
     PENDING_KEY.with(|p| p.borrow_mut().clear());
 }
 
+#[cfg(feature = "stdlib-ffi")]
+thread_local! {
+    /// Pre-computed CPython `str`/`repr` for reachable `Foreign` objects, keyed by
+    /// heap id. A `Foreign` with a user-defined `__str__`/`__repr__` runs pythonrs
+    /// code when CPython formats it, which re-enters `with_host`; computing it here
+    /// *outside* any borrow (via [`prefetch_foreign_display`]) and reading it from
+    /// the borrowed [`PyHost::str_of`]/[`PyHost::repr_of`] avoids the double borrow.
+    static PENDING_DISPLAY: RefCell<HashMap<u32, (String, String)>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Read the prefetched `(str, repr)` for a foreign id, if prepared.
+#[cfg(feature = "stdlib-ffi")]
+fn pending_display_get(id: u32) -> Option<(String, String)> {
+    PENDING_DISPLAY.with(|p| p.borrow().get(&id).cloned())
+}
+
+/// Walk `v` and, for every reachable `Foreign`, compute its CPython `str`/`repr`
+/// with NO host borrow held and cache it in `PENDING_DISPLAY`. Short scoped
+/// borrows only read the object graph; the ffi calls (which may re-enter pythonrs
+/// for a user `__str__`/`__repr__`) run between them. Mirrors `prepare_key`.
+#[cfg(feature = "stdlib-ffi")]
+fn prefetch_foreign_display(v: &Value) {
+    fn walk(v: &Value, seen: &mut HashSet<u32>) {
+        let Value::Obj(id) = v else { return };
+        if !seen.insert(*id) {
+            return;
+        }
+        // Copy out just what we need under a short borrow, then release it.
+        enum Kind {
+            Foreign(u32),
+            Children(Vec<Value>),
+            None,
+        }
+        let kind = with_host(|h| match h.get(v) {
+            Some(PyObj::Foreign(f)) => Kind::Foreign(*f),
+            Some(PyObj::List(l)) | Some(PyObj::Tuple(l)) => Kind::Children(l.clone()),
+            Some(PyObj::Set(s)) | Some(PyObj::Frozenset(s)) => {
+                Kind::Children(s.values().cloned().collect())
+            }
+            Some(PyObj::Deque { items, .. }) => Kind::Children(items.iter().cloned().collect()),
+            Some(PyObj::Dict(d)) => Kind::Children(
+                d.values()
+                    .flat_map(|(k, val)| [k.clone(), val.clone()])
+                    .collect(),
+            ),
+            _ => Kind::None,
+        });
+        match kind {
+            Kind::Foreign(fid) => {
+                // ffi runs with no borrow held (may re-enter pythonrs). Cache under
+                // the FOREIGN id — that is the key `PyObj::Foreign(id)` presents to
+                // the borrowed `str_of`/`repr_of`, not the outer heap id.
+                let s = crate::ffi::str_of(fid);
+                let r = crate::ffi::repr_of(fid);
+                PENDING_DISPLAY.with(|p| p.borrow_mut().insert(fid, (s, r)));
+            }
+            Kind::Children(children) => {
+                for c in &children {
+                    walk(c, seen);
+                }
+            }
+            Kind::None => {}
+        }
+    }
+    let mut seen = HashSet::new();
+    walk(v, &mut seen);
+}
+
+/// `str(v)` from outside any host borrow: prefetch reachable foreign displays,
+/// then format. Callers that already hold a borrow use `PyHost::str_of` directly
+/// (safe as long as the borrowing op prefetched, or the value has no foreign
+/// with user `__str__`/`__repr__`).
+pub fn str_of(v: &Value) -> String {
+    #[cfg(feature = "stdlib-ffi")]
+    prefetch_foreign_display(v);
+    let s = with_host(|h| h.str_of(v));
+    #[cfg(feature = "stdlib-ffi")]
+    PENDING_DISPLAY.with(|p| p.borrow_mut().clear());
+    s
+}
+
+/// `repr(v)` from outside any host borrow — see [`str_of`].
+pub fn repr_of(v: &Value) -> String {
+    #[cfg(feature = "stdlib-ffi")]
+    prefetch_foreign_display(v);
+    let s = with_host(|h| h.repr_of(v));
+    #[cfg(feature = "stdlib-ffi")]
+    PENDING_DISPLAY.with(|p| p.borrow_mut().clear());
+    s
+}
+
 /// Run `f` with mutable access to the thread-local host.
 pub fn with_host<R>(f: impl FnOnce(&mut PyHost) -> R) -> R {
     HOST.with(|h| f(&mut h.borrow_mut()))
@@ -2293,7 +2385,9 @@ impl PyHost {
                 Some(PyObj::NotImplemented) => "NotImplemented".into(),
                 Some(PyObj::Ellipsis) => "Ellipsis".into(),
                 #[cfg(feature = "stdlib-ffi")]
-                Some(PyObj::Foreign(id)) => crate::ffi::str_of(*id),
+                Some(PyObj::Foreign(id)) => pending_display_get(*id)
+                    .map(|(s, _)| s)
+                    .unwrap_or_else(|| crate::ffi::str_of(*id)),
                 Some(PyObj::Slice { .. })
                 | Some(PyObj::List(_))
                 | Some(PyObj::Tuple(_))
@@ -2469,7 +2563,9 @@ impl PyHost {
                     self.repr_of(step)
                 ),
                 #[cfg(feature = "stdlib-ffi")]
-                Some(PyObj::Foreign(id)) => crate::ffi::repr_of(*id),
+                Some(PyObj::Foreign(id)) => pending_display_get(*id)
+                    .map(|(_, r)| r)
+                    .unwrap_or_else(|| crate::ffi::repr_of(*id)),
                 _ => self.str_of(v),
             },
             _ => self.str_of(v),
@@ -9149,8 +9245,11 @@ pub fn iter_vec(v: &Value) -> Result<Vec<Value>, String> {
     // pythonrs callback (`list(itertools.starmap(pow, …))`) would otherwise
     // re-enter the host mid-borrow and panic.
     #[cfg(feature = "stdlib-ffi")]
-    if with_host(|h| h.foreign_id(v)).is_some() {
-        let it = with_host(|h| h.make_iter(v))?;
+    if let Some(id) = with_host(|h| h.foreign_id(v)) {
+        // `make_iter_cb` runs the object's `__iter__` OUTSIDE the borrow, so a
+        // `@dataclass` with a user `__iter__` can re-enter; `iter_step` then
+        // advances borrow-free too.
+        let it = crate::ffi::make_iter_cb(id)?;
         let mut out = Vec::new();
         while let Some(x) = iter_step(&it)? {
             out.push(x);

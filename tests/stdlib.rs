@@ -95,6 +95,29 @@ fn builtin_method_arity_is_enforced() {
 
 #[cfg(feature = "stdlib-ffi")]
 #[test]
+fn dataclass_user_dunders_do_not_reenter_host() {
+    // Regression: a `@dataclass` (a CPython-bridge class) with user-defined
+    // dunders panicked with `RefCell already borrowed` on `print`/`repr`/
+    // arithmetic/`len`/`bool`/`in`, because the operation ran CPython (which calls
+    // the pythonrs dunder back) while the host was borrowed. Each now dispatches
+    // outside the borrow.
+    let src = "\
+from dataclasses import dataclass
+@dataclass
+class V:
+    x: int
+    def __repr__(self): return f'V{self.x}'
+    def __neg__(self): return V(-self.x)
+    def __add__(self, o): return V(self.x + o.x)
+    def __len__(self): return self.x
+    def __bool__(self): return self.x > 0
+    def __contains__(self, i): return i == self.x
+r = [repr([V(1), V(2)]), repr(-V(5)), repr(V(1) + V(2)), len(V(4)), bool(V(0)), 3 in V(3)]";
+    assert_eq!(g(src, "r"), "['[V1, V2]', 'V-5', 'V3', 4, False, True]");
+}
+
+#[cfg(feature = "stdlib-ffi")]
+#[test]
 fn json_dumps_loads_roundtrip() {
     // Insertion order preserved; None/bool lowered to null/true; int stays int.
     assert_eq!(
