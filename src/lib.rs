@@ -18,6 +18,7 @@ pub mod casefold;
 pub mod cli;
 pub mod compiler;
 pub mod dap;
+pub mod extensions;
 #[cfg(feature = "stdlib-ffi")]
 pub mod ffi;
 pub mod host;
@@ -89,6 +90,12 @@ pub fn run_compiled(prog: compiler::Program) -> Result<Value, String> {
 /// automatically — not only under `--build`. Set `PYTHONRS_TRACE=1` to log
 /// hit/miss to stderr (silent otherwise; normal runs print nothing).
 pub fn compile_or_load(src: &str) -> Result<compiler::Program, String> {
+    // `PYTHONRS_CACHE=0|false|no` (see `cache::cache_enabled`) turns the shard off
+    // entirely — every run recompiles and nothing is stored. `--doctor` reports
+    // this state, so the gate must be honored here or that report would lie.
+    if !cache::cache_enabled() {
+        return compile(src);
+    }
     if let Some(prog) = cache::load(src) {
         if std::env::var_os("PYTHONRS_TRACE").is_some() {
             eprintln!(

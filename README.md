@@ -99,6 +99,9 @@ python --build foo.py       # AOT-compile to a native ./foo executable
 python --dump-bytecode f.py # print the lowered fusevm bytecode
 python --repl               # interactive REPL
 python --lsp                # Language Server Protocol over stdio
+python --doctor             # runtime / CPython / cache / env diagnostic report
+python --cacheview          # list the compiled programs in the bytecode cache
+python --cache-clear        # delete the bytecode cache shard
 ```
 
 The REPL is a `reedline` line editor: **Tab** pops a columnar completion menu
@@ -111,7 +114,9 @@ methods for a builtin value, an imported module's own namespace, or an instance'
 attributes plus every method reachable along its class MRO. History persists to
 `~/.pythonrs/history`.
 
-Set `PYTHONRS_TRACE=1` to log cache hit/miss to stderr (silent otherwise).
+Set `PYTHONRS_TRACE=1` to log cache hit/miss to stderr (silent otherwise). Set
+`PYTHONRS_CACHE=0` (or `false`/`no`) to disable the transparent bytecode cache
+entirely — every run recompiles and nothing is stored.
 
 ## [0x03] LANGUAGE FEATURES
 
@@ -138,6 +143,9 @@ what is not yet implemented.
 | `--dump-bytecode` | Print the lowered `fusevm` bytecode and exit. |
 | `--repl` | Start the interactive REPL. |
 | `--lsp` | Run the Language Server Protocol server over stdio. |
+| `--doctor` | Print a diagnostic report — runtime, embedded CPython, fusevm engine, bytecode cache, `PYTHON*` env, and every `python*` interpreter on `PATH` — and exit. |
+| `--cacheview` | List the compiled programs held in the rkyv bytecode cache (`~/.pythonrs/scripts.rkyv`): per-entry hashes, blob size, and op/function/try/warning counts. |
+| `--cache-clear` | Delete the rkyv bytecode cache shard and exit. |
 
 ## [0x05] ARCHITECTURE
 

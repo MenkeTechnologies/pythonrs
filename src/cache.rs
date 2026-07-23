@@ -225,6 +225,104 @@ pub fn load(src: &str) -> Option<Program> {
     })
 }
 
+// ── Introspection (`--doctor` / `--cacheview` / `--cache-clear`) ─────────────
+// Read-only accessors mirroring the fleet's cache-introspection surface
+// (elisprs `src/cache.rs`): the CLI extensions render these; the hot path
+// (`load`/`store`) never touches them.
+
+/// The schema version stamped into every cache key. Bumping it (see `SCHEMA`)
+/// invalidates every prior entry cleanly.
+pub const fn schema_version() -> u64 {
+    SCHEMA
+}
+
+/// Path to the on-disk bytecode shard (`~/.pythonrs/scripts.rkyv`). Falls back to
+/// a `/tmp` path only when there is no home directory.
+pub fn default_cache_path() -> PathBuf {
+    shard_path().unwrap_or_else(|| PathBuf::from("/tmp/.pythonrs/scripts.rkyv"))
+}
+
+/// `PYTHONRS_CACHE=0|false|no` disables the transparent bytecode cache (every run
+/// recompiles). Any other value — or unset — leaves it on.
+pub fn cache_enabled() -> bool {
+    !matches!(
+        std::env::var("PYTHONRS_CACHE").as_deref(),
+        Ok("0") | Ok("false") | Ok("no")
+    )
+}
+
+/// Entry count and on-disk byte size of the shard (`0`/`0` when absent).
+pub fn stats() -> (usize, u64) {
+    let count = load_shard().entries.len();
+    let bytes = default_cache_path()
+        .metadata()
+        .map(|m| m.len())
+        .unwrap_or(0);
+    (count, bytes)
+}
+
+/// Delete the on-disk shard. A missing shard is success (nothing to clear).
+pub fn clear() -> std::io::Result<()> {
+    let Some(path) = shard_path() else {
+        return Ok(());
+    };
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// A read-only summary of one cached program, for `--cacheview`. The counts are
+/// decoded from the inner bincode blob; a blob that fails to decode (stale
+/// format) reports zeros rather than aborting the listing.
+pub struct EntryInfo {
+    /// The `FxHash` lookup key (source + schema).
+    pub key: u64,
+    /// The independent SipHash verification hash.
+    pub verify: u64,
+    /// On-disk size of the compiled blob in bytes.
+    pub blob_len: usize,
+    /// Ops in the `__main__` chunk.
+    pub main_ops: usize,
+    /// Compiled top-level functions.
+    pub functions: usize,
+    /// `try` bodies (own chunks, not in `main.sub_chunks`).
+    pub tries: usize,
+    /// Compile-time `SyntaxWarning`s stored with the program.
+    pub warnings: usize,
+}
+
+/// Summarize every entry in the shard (decoding each blob's counts), in shard
+/// order. Used only by `--cacheview`.
+pub fn entries() -> Vec<EntryInfo> {
+    load_shard()
+        .entries
+        .iter()
+        .map(|e| {
+            let (main_ops, functions, tries, warnings) = bincode::deserialize::<CProg>(&e.blob)
+                .map(|cp| {
+                    (
+                        cp.main.ops.len(),
+                        cp.functions.len(),
+                        cp.tries.len(),
+                        cp.warnings.len(),
+                    )
+                })
+                .unwrap_or((0, 0, 0, 0));
+            EntryInfo {
+                key: e.key,
+                verify: e.verify,
+                blob_len: e.blob.len(),
+                main_ops,
+                functions,
+                tries,
+                warnings,
+            }
+        })
+        .collect()
+}
+
 /// Store `prog` (compiled from `src`) into the shard, replacing any prior entry.
 pub fn store(src: &str, prog: &Program) -> Result<(), String> {
     let key = key_for(src);

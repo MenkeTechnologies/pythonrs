@@ -85,6 +85,18 @@ pub struct Cli {
     #[arg(long = "disasm")]
     pub disasm: bool,
 
+    /// Print a diagnostic report (runtime, embedded CPython, cache, env) and exit.
+    #[arg(long = "doctor")]
+    pub doctor: bool,
+
+    /// List the compiled programs in the rkyv bytecode cache and exit.
+    #[arg(long = "cacheview")]
+    pub cacheview: bool,
+
+    /// Delete the rkyv bytecode cache shard and exit.
+    #[arg(long = "cache-clear")]
+    pub cache_clear: bool,
+
     /// The `.py` script to run (omit with --repl / --lsp / --dap / -c).
     #[arg(value_name = "FILE")]
     pub file: Option<String>,

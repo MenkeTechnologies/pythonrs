@@ -57,6 +57,25 @@ fn run_main() -> ExitCode {
         };
     }
 
+    // Diagnostic/cache extensions (no program): report and exit before any script
+    // parsing. Each returns a process exit code.
+    if cli.doctor {
+        return ExitCode::from((pythonrs::extensions::doctor::run() & 0xFF) as u8);
+    }
+    if cli.cacheview {
+        return ExitCode::from((pythonrs::extensions::cacheview::run() & 0xFF) as u8);
+    }
+    if cli.cache_clear {
+        return match pythonrs::cache::clear() {
+            Ok(()) => {
+                // Explicit, user-requested confirmation on stdout.
+                println!("python: bytecode cache cleared ({})", pythonrs::cache::default_cache_path().display());
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&format!("--cache-clear: {e}")),
+        };
+    }
+
     let (prog, args) = parse_program(&raw[boundary..]);
     match prog {
         // `python -m module …` → run the library module on the embedded CPython.
