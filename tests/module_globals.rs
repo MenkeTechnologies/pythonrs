@@ -83,6 +83,31 @@ fn imported_generator_sees_module_global_on_each_resume() {
 }
 
 #[test]
+fn star_import_binds_public_names_only() {
+    // `from m import *` binds every non-underscore name and skips `_private`.
+    let out = run_with_module(
+        "star",
+        "modg_star",
+        "PUBLIC = 1\n_private = 2\ndef helper():\n    return 3\n",
+        "from modg_star import *\nprint(PUBLIC, helper())\nprint('_private' in dir())",
+    );
+    assert_eq!(out, "1 3\nFalse");
+}
+
+#[test]
+fn star_import_respects_dunder_all() {
+    // With `__all__` defined, only its names bind — even a public name absent from
+    // `__all__` stays unbound, and a private name listed in `__all__` binds.
+    let out = run_with_module(
+        "starall",
+        "modg_starall",
+        "__all__ = ['a', '_c']\na = 1\nb = 2\n_c = 3\n",
+        "from modg_starall import *\nprint(a, _c)\nprint('b' in dir())",
+    );
+    assert_eq!(out, "1 3\nFalse");
+}
+
+#[test]
 fn imported_module_global_does_not_leak_into_importer() {
     // The fixture's module global `SECRET` must NOT become visible at the
     // importer's scope — a single shared namespace would have leaked it.

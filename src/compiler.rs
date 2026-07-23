@@ -475,6 +475,15 @@ impl Compiler {
             StmtKind::ImportFrom { module, names, .. } => {
                 let m = module.clone().unwrap_or_default();
                 for a in names {
+                    // `from m import *`: import the module, then bind all of its
+                    // public names in one op (which leaves an `Undef` to pop).
+                    if a.name == "*" {
+                        self.strlit(b, &m);
+                        b.emit(Op::CallBuiltin(ops::IMPORT, 1), line);
+                        b.emit(Op::CallBuiltin(ops::IMPORT_STAR, 1), line);
+                        b.emit(Op::Pop, 0);
+                        continue;
+                    }
                     self.strlit(b, &m);
                     b.emit(Op::CallBuiltin(ops::IMPORT, 1), line);
                     self.strlit(b, &a.name);

@@ -61,6 +61,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::LOOP_BODY, b_loop_body);
     vm.register_builtin(ops::IMPORT, b_import);
     vm.register_builtin(ops::IMPORT_FROM, b_import_from);
+    vm.register_builtin(ops::IMPORT_STAR, b_import_star);
     vm.register_builtin(ops::UNPACK, b_unpack);
     vm.register_builtin(ops::BINOP, b_binop);
     vm.register_builtin(ops::INPLACE, b_inplace);
@@ -2237,6 +2238,23 @@ fn b_import_from(vm: &mut VM, _: u8) -> Value {
     let module = vm.pop();
     let r = with_host(|h| h.get_attr(&module, &name));
     finish(vm, r)
+}
+
+/// `from <module> import *` — bind the module's public names (its `__all__`, or
+/// every non-underscore name) into the current namespace. Leaves an `Undef`
+/// sentinel the compiler pops.
+fn b_import_star(vm: &mut VM, _: u8) -> Value {
+    let module = vm.pop();
+    let bindings = match with_host(|h| h.import_star_bindings(&module)) {
+        Ok(b) => b,
+        Err(e) => return abort(vm, e),
+    };
+    with_host(|h| {
+        for (name, val) in bindings {
+            h.set_name(&name, val);
+        }
+    });
+    Value::Undef
 }
 
 // ── unpack ───────────────────────────────────────────────────────────────────

@@ -107,6 +107,7 @@ pub mod ops {
     pub const EXTEND_DICT: u16 = 74; // [dict, k,v,...] -> dict (insert pairs)
     pub const EXTEND_STR: u16 = 75; // [str, parts...] -> str (concat parts)
     pub const ELLIPSIS: u16 = 76; // [] -> the `Ellipsis` (`...`) singleton
+    pub const IMPORT_STAR: u16 = 77; // [module] -> bind all public names (`from m import *`)
 }
 
 /// In-place (augmented-assignment) op tags carried by `ops::INPLACE`. One per
@@ -1753,6 +1754,62 @@ impl PyHost {
 
     pub fn set_global(&mut self, name: &str, val: Value) {
         self.globals_mut().insert(name.to_string(), val);
+    }
+
+    /// A `list`/`tuple` of `str` flattened to owned `String`s — reads a module's
+    /// `__all__`. Errors if it is not a sequence of strings.
+    fn str_sequence(&self, v: &Value) -> Result<Vec<String>, String> {
+        match self.get(v) {
+            Some(PyObj::List(items)) | Some(PyObj::Tuple(items)) => items
+                .iter()
+                .map(|it| {
+                    self.as_str(it)
+                        .ok_or_else(|| type_error("__all__ must contain only strings"))
+                })
+                .collect(),
+            _ => Err(type_error("__all__ must be a list or tuple of str")),
+        }
+    }
+
+    /// The names `from <module> import *` binds: the module's `__all__` if it
+    /// defines one, otherwise every namespace entry whose name does not begin with
+    /// `_`. Returns `(name, value)` pairs for the caller to bind.
+    pub fn import_star_bindings(&mut self, module: &Value) -> Result<Vec<(String, Value)>, String> {
+        match self.get(module).cloned() {
+            Some(PyObj::Module { ns, .. }) => {
+                if let Some(all) = ns.get("__all__").cloned() {
+                    let mut out = Vec::new();
+                    for n in self.str_sequence(&all)? {
+                        if let Some(v) = ns.get(&n) {
+                            out.push((n, v.clone()));
+                        }
+                    }
+                    Ok(out)
+                } else {
+                    Ok(ns
+                        .iter()
+                        .filter(|(k, _)| !k.starts_with('_'))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect())
+                }
+            }
+            // A CPython module over the ffi bridge: honor its `__all__` (the
+            // stdlib modules reached by star-import all define one).
+            #[cfg(feature = "stdlib-ffi")]
+            Some(PyObj::Foreign(id)) => {
+                let all = crate::ffi::get_attr(self, id, "__all__").map_err(|_| {
+                    type_error("'import *' from this module needs an __all__ it does not define")
+                })?;
+                let mut out = Vec::new();
+                for n in self.str_sequence(&all)? {
+                    if let Ok(v) = crate::ffi::get_attr(self, id, &n) {
+                        out.push((n, v));
+                    }
+                }
+                Ok(out)
+            }
+            _ => Err(type_error("'import *' requires a module object")),
+        }
     }
 
     /// Remove a module global, returning its value if bound. Used by `eval()` to

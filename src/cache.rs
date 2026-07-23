@@ -83,7 +83,10 @@ use std::path::PathBuf;
 /// v25: `Entry` gained a `source` name (script path / `<string>` / `<stdin>`) for
 /// `--cacheview` provenance; the added rkyv field changes the shard layout, so
 /// older shards fail to decode and rebuild.
-const SCHEMA: u64 = 25;
+/// v26: new `IMPORT_STAR` opcode for `from m import *` — the compiler now emits
+/// different bytecode for a star-import, so any entry cached under v25 (which
+/// mis-emitted it as an `IMPORT_FROM "*"` attribute fetch) must miss and recompile.
+const SCHEMA: u64 = 26;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]
