@@ -252,6 +252,10 @@ pub struct FuncDef {
     /// content fills in on recompile).
     #[serde(default)]
     pub doc: Option<String>,
+    /// Names this function closes over — referenced here and bound in an enclosing
+    /// function scope (`co_freevars`; drives `func.__closure__`). Sorted.
+    #[serde(default)]
+    pub freevars: Vec<String>,
 }
 
 /// A compiled lambda/comprehension body (same shape, unnamed).
@@ -453,6 +457,11 @@ pub enum PyObj {
     PyFrame {
         name: String,
         lineno: u32,
+    },
+    /// A closure cell (`func.__closure__[i]`). Holds the current value of a free
+    /// variable, read via `cell_contents`. `type()` is `cell`.
+    Cell {
+        value: Value,
     },
     /// A first-class reference to a builtin function (`len`, `print`, …).
     Builtin(String),
@@ -1804,6 +1813,19 @@ impl PyHost {
         self.globals().get(name).cloned()
     }
 
+    /// Look `name` up along a specific captured env chain (for `__closure__`
+    /// free-variable reads), independent of the current frame.
+    fn env_lookup(&self, env: &Env, name: &str) -> Option<Value> {
+        let mut cur = Some(env.clone());
+        while let Some(e) = cur {
+            if let Some(v) = e.borrow().vars.get(name) {
+                return Some(v.clone());
+            }
+            cur = e.borrow().parent.clone();
+        }
+        None
+    }
+
     /// `UnboundLocalError`-aware read for a bare-name load. If `name` is a genuine
     /// local of the current frame (in `locals_set`, not declared `global`/
     /// `nonlocal`) it resolves ONLY in the current env: present → its value,
@@ -2422,6 +2444,7 @@ impl PyHost {
                 Some(PyObj::Descriptor { kind, .. }) => kind.type_name().into(),
                 Some(PyObj::Traceback { .. }) => "traceback".into(),
                 Some(PyObj::PyFrame { .. }) => "frame".into(),
+                Some(PyObj::Cell { .. }) => "cell".into(),
                 Some(PyObj::LruCache { .. }) => "functools._lru_cache_wrapper".into(),
                 Some(PyObj::Super { .. }) => "super".into(),
                 Some(PyObj::StaticMethod(_)) => "staticmethod".into(),
@@ -2579,6 +2602,19 @@ impl PyHost {
                         "<frame at 0x{:012x}, file '<string>', line {lineno}, code {name}>",
                         self.addr_of(v)
                     )
+                }
+                Some(PyObj::Cell { value }) => {
+                    let value = value.clone();
+                    if matches!(value, Value::Undef) {
+                        format!("<cell at 0x{:012x}: empty>", self.addr_of(v))
+                    } else {
+                        format!(
+                            "<cell at 0x{:012x}: {} object at 0x{:012x}>",
+                            self.addr_of(v),
+                            self.type_name(&value),
+                            self.addr_of(&value)
+                        )
+                    }
                 }
                 // A `PyObj::Builtin` is an unbound builtin method
                 // (`str.upper`), a *type object* returned by `type(x)` (repr
@@ -6647,6 +6683,26 @@ impl PyHost {
                     )),
                 }
             }
+            // `func.__closure__` — a tuple of cells over the function's free
+            // variables (their current values from the captured env), or None.
+            Some(PyObj::Func(fv)) if name == "__closure__" => {
+                let fv = fv.clone();
+                let freevars = self.funcs[fv.def_id].freevars.clone();
+                if freevars.is_empty() {
+                    return Ok(Value::Undef);
+                }
+                let mut cells = Vec::with_capacity(freevars.len());
+                for fname in &freevars {
+                    let val = fv
+                        .env
+                        .as_ref()
+                        .and_then(|e| self.env_lookup(e, fname))
+                        .unwrap_or(Value::Undef);
+                    cells.push(self.alloc(PyObj::Cell { value: val }));
+                }
+                Ok(self.new_tuple(cells))
+            }
+            Some(PyObj::Cell { value }) if name == "cell_contents" => Ok(value.clone()),
             // Code-object introspection (`func.__code__.co_*`), derived from the
             // backing `FuncDef`. Native VM object, not a Python reimplementation.
             Some(PyObj::Code { def_id }) => {
@@ -8636,10 +8692,8 @@ impl PyHost {
         const CO_NEWLOCALS: i64 = 0x0002;
         const CO_VARARGS: i64 = 0x0004;
         const CO_VARKEYWORDS: i64 = 0x0008;
-        // CO_NOFREE: the function has no free-variable cells. pythonrs closures
-        // capture the enclosing env by reference (no cell/free slots in the code
-        // object), so this always holds — and it matches CPython's flags for
-        // every non-closure function.
+        // CO_NOFREE: the function closes over no free variables (set below only
+        // when `freevars` is empty), matching CPython's flag for non-closures.
         const CO_NOFREE: i64 = 0x0040;
         const CO_GENERATOR: i64 = 0x0020;
         const CO_COROUTINE: i64 = 0x0080;
@@ -8653,7 +8707,11 @@ impl PyHost {
             } else {
                 d.qualname.clone()
             };
-            let mut f = CO_OPTIMIZED | CO_NEWLOCALS | CO_NOFREE;
+            let mut f = CO_OPTIMIZED | CO_NEWLOCALS;
+            // CO_NOFREE unless the function actually closes over a variable.
+            if d.freevars.is_empty() {
+                f |= CO_NOFREE;
+            }
             if d.star.is_some() {
                 f |= CO_VARARGS;
             }
@@ -8720,9 +8778,14 @@ impl PyHost {
                 }))
             }
             "co_firstlineno" => Ok(Value::Int(1)),
-            // pythonrs does not expose the constant/name/free/cell tables yet;
+            "co_freevars" => {
+                let fv = self.funcs[def_id].freevars.clone();
+                let vals: Vec<Value> = fv.into_iter().map(|n| self.new_str(n)).collect();
+                Ok(self.new_tuple(vals))
+            }
+            // pythonrs does not expose the constant/name/cell tables yet;
             // report them empty rather than fabricate contents.
-            "co_names" | "co_consts" | "co_freevars" | "co_cellvars" => Ok(self.new_tuple(vec![])),
+            "co_names" | "co_consts" | "co_cellvars" => Ok(self.new_tuple(vec![])),
             "co_stacksize" => Ok(Value::Int(0)),
             _ => Err(format!(
                 "AttributeError: 'code' object has no attribute '{name}'"

@@ -55,6 +55,25 @@ fn builtins_module_exposes_functions_types_exceptions() {
 }
 
 #[test]
+fn closure_cells_and_freevars() {
+    // A closure exposes its free variables as cells (co_freevars + __closure__).
+    let src = "def outer():\n    x = 10\n    y = 20\n    def inner():\n        return x + y\n    \
+               return inner\nf = outer()";
+    assert_eq!(g(&format!("{src}\nz = f.__code__.co_freevars"), "z"), "('x', 'y')");
+    assert_eq!(g(&format!("{src}\nz = len(f.__closure__)"), "z"), "2");
+    assert_eq!(
+        g(&format!("{src}\nz = sorted(c.cell_contents for c in f.__closure__)"), "z"),
+        "[10, 20]",
+    );
+    assert_eq!(g(&format!("{src}\nz = type(f.__closure__[0]).__name__"), "z"), "'cell'");
+    // A `nonlocal` declaration alone makes a name free (even unreferenced).
+    let cf = "def factory():\n    a = 1\n    def f():\n        nonlocal a\n    return f.__closure__[0]";
+    assert_eq!(g(&format!("{cf}\nz = type(factory()).__name__"), "z"), "'cell'");
+    // A non-closure function has __closure__ None.
+    assert_eq!(g("def g(): return 1\nz = g.__closure__", "z"), "None");
+}
+
+#[test]
 fn exception_traceback_and_frame() {
     // A caught exception exposes __traceback__ over the captured frames; each node
     // has a tb_frame. (Faithful types.py derives TracebackType/FrameType here.)

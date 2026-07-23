@@ -1127,6 +1127,13 @@ impl Compiler {
         } else {
             scope_locals(body)
         };
+        // Free variables (`co_freevars`) — computed against the ENCLOSING function
+        // scopes, before this scope is pushed. Class bodies form no closure.
+        let freevars = if kind == ScopeKind::Function {
+            scope_freevars(params, body, &self.func_scopes)
+        } else {
+            Vec::new()
+        };
         // Push this scope's bound names (locals + params) so a nested `nonlocal`
         // can resolve against it. Class bodies are transparent to `nonlocal`.
         let mut pushed = false;
@@ -1176,6 +1183,7 @@ impl Compiler {
             is_generator,
             is_async,
             doc: docstring(body),
+            freevars,
         };
         self.functions.push((name.to_string(), def));
         Ok(self.functions.len() - 1)
@@ -2806,6 +2814,269 @@ fn scope_locals(body: &[Stmt]) -> Vec<String> {
         .collect();
     out.sort();
     out
+}
+
+/// The names a function closes over: referenced anywhere in its body (including
+/// nested functions) AND bound in an enclosing function scope, minus its own
+/// params/locals and any it declares `global`. This is `co_freevars` /
+/// `func.__closure__`. The `∩ enclosing` filter means the collector need not
+/// track nested-scope bindings — a nested local is never in an enclosing scope.
+fn scope_freevars(
+    params: &Params,
+    body: &[Stmt],
+    enclosing: &[HashSet<String>],
+) -> Vec<String> {
+    let mut bound_here: HashSet<String> = scope_locals(body).into_iter().collect();
+    for p in param_names(params) {
+        bound_here.insert(p);
+    }
+    let mut gdecl = HashSet::new();
+    let mut ndecl = HashSet::new();
+    for s in body {
+        collect_scope_decls_stmt(s, &mut gdecl, &mut ndecl);
+    }
+    let enclosing_all: HashSet<String> = enclosing.iter().flatten().cloned().collect();
+    let mut refs: HashSet<String> = HashSet::new();
+    for s in body {
+        collect_names_stmt(s, &mut refs);
+    }
+    // A `nonlocal` declaration makes a name free even if the body never uses it.
+    for n in &ndecl {
+        refs.insert(n.clone());
+    }
+    let mut fv: Vec<String> = refs
+        .into_iter()
+        .filter(|n| enclosing_all.contains(n) && !bound_here.contains(n) && !gdecl.contains(n))
+        .collect();
+    fv.sort();
+    fv
+}
+
+/// Collect every `Name` referenced in `e`, descending into all sub-expressions
+/// and nested scopes. Over-collection (nested-scope locals) is harmless: callers
+/// filter by an enclosing-scope set those names can't be in.
+fn collect_names_expr(e: &Expr, out: &mut HashSet<String>) {
+    match e.unspanned() {
+        Expr::Name(n) => {
+            out.insert(n.clone());
+        }
+        Expr::List(xs) | Expr::Tuple(xs) | Expr::Set(xs) | Expr::BoolOp(_, xs) => {
+            for x in xs {
+                collect_names_expr(x, out);
+            }
+        }
+        Expr::Dict(pairs) => {
+            for (k, v) in pairs {
+                if let Some(k) = k {
+                    collect_names_expr(k, out);
+                }
+                collect_names_expr(v, out);
+            }
+        }
+        Expr::Starred(x)
+        | Expr::UnaryOp(_, x)
+        | Expr::YieldFrom(x)
+        | Expr::Await(x)
+        | Expr::Attribute(x, _) => collect_names_expr(x, out),
+        Expr::Yield(o) => {
+            if let Some(x) = o {
+                collect_names_expr(x, out);
+            }
+        }
+        Expr::BinOp(_, a, b) | Expr::Subscript(a, b) | Expr::NamedExpr(a, b) => {
+            collect_names_expr(a, out);
+            collect_names_expr(b, out);
+        }
+        Expr::Compare(a, rest) => {
+            collect_names_expr(a, out);
+            for (_, x) in rest {
+                collect_names_expr(x, out);
+            }
+        }
+        Expr::IfExp { test, body, orelse } => {
+            collect_names_expr(test, out);
+            collect_names_expr(body, out);
+            collect_names_expr(orelse, out);
+        }
+        Expr::Call { func, args, keywords } => {
+            collect_names_expr(func, out);
+            for a in args {
+                collect_names_expr(a, out);
+            }
+            for kw in keywords {
+                collect_names_expr(&kw.value, out);
+            }
+        }
+        Expr::Slice { lo, hi, step } => {
+            for o in [lo, hi, step].into_iter().flatten() {
+                collect_names_expr(o, out);
+            }
+        }
+        Expr::Lambda { params, body } => {
+            for d in &params.defaults {
+                collect_names_expr(d, out);
+            }
+            for d in params.kwonly_defaults.iter().flatten() {
+                collect_names_expr(d, out);
+            }
+            collect_names_expr(body, out);
+        }
+        Expr::ListComp(elt, comps) | Expr::SetComp(elt, comps) | Expr::GenExp(elt, comps) => {
+            collect_names_expr(elt, out);
+            collect_names_comps(comps, out);
+        }
+        Expr::DictComp(k, v, comps) => {
+            collect_names_expr(k, out);
+            collect_names_expr(v, out);
+            collect_names_comps(comps, out);
+        }
+        Expr::FString(parts) => collect_names_fstr(parts, out),
+        _ => {} // literals carry no names
+    }
+}
+
+fn collect_names_comps(comps: &[Comprehension], out: &mut HashSet<String>) {
+    for c in comps {
+        collect_names_expr(&c.target, out);
+        collect_names_expr(&c.iter, out);
+        for cond in &c.ifs {
+            collect_names_expr(cond, out);
+        }
+    }
+}
+
+fn collect_names_fstr(parts: &[FStrPart], out: &mut HashSet<String>) {
+    for p in parts {
+        if let FStrPart::Expr { expr, spec, .. } = p {
+            collect_names_expr(expr, out);
+            collect_names_fstr(spec, out);
+        }
+    }
+}
+
+/// Collect every `Name` referenced in one statement, recursing through suites AND
+/// into nested `def`/`class` bodies (their free references may resolve outward).
+fn collect_names_stmt(s: &Stmt, out: &mut HashSet<String>) {
+    match &s.kind {
+        StmtKind::Expr(e) => collect_names_expr(e, out),
+        StmtKind::Assign { targets, value } => {
+            for t in targets {
+                collect_names_expr(t, out);
+            }
+            collect_names_expr(value, out);
+        }
+        StmtKind::AugAssign { target, value, .. } => {
+            collect_names_expr(target, out);
+            collect_names_expr(value, out);
+        }
+        StmtKind::AnnAssign { target, value, .. } => {
+            collect_names_expr(target, out);
+            if let Some(v) = value {
+                collect_names_expr(v, out);
+            }
+        }
+        StmtKind::If { test, body, orelse }
+        | StmtKind::While { test, body, orelse } => {
+            collect_names_expr(test, out);
+            for st in body.iter().chain(orelse) {
+                collect_names_stmt(st, out);
+            }
+        }
+        StmtKind::For { target, iter, body, orelse, .. } => {
+            collect_names_expr(target, out);
+            collect_names_expr(iter, out);
+            for st in body.iter().chain(orelse) {
+                collect_names_stmt(st, out);
+            }
+        }
+        StmtKind::With { items, body, .. } => {
+            for it in items {
+                collect_names_expr(&it.context, out);
+                if let Some(a) = &it.vars {
+                    collect_names_expr(a, out);
+                }
+            }
+            for st in body {
+                collect_names_stmt(st, out);
+            }
+        }
+        StmtKind::FuncDef { params, body, decorators, .. } => {
+            for d in &params.defaults {
+                collect_names_expr(d, out);
+            }
+            for d in params.kwonly_defaults.iter().flatten() {
+                collect_names_expr(d, out);
+            }
+            for dec in decorators {
+                collect_names_expr(dec, out);
+            }
+            for st in body {
+                collect_names_stmt(st, out);
+            }
+        }
+        StmtKind::ClassDef { bases, keywords, body, decorators, .. } => {
+            for b in bases {
+                collect_names_expr(b, out);
+            }
+            for kw in keywords {
+                collect_names_expr(&kw.value, out);
+            }
+            for dec in decorators {
+                collect_names_expr(dec, out);
+            }
+            for st in body {
+                collect_names_stmt(st, out);
+            }
+        }
+        StmtKind::Return(Some(e)) => collect_names_expr(e, out),
+        StmtKind::Delete(es) => {
+            for e in es {
+                collect_names_expr(e, out);
+            }
+        }
+        StmtKind::Raise { exc, cause } => {
+            if let Some(e) = exc {
+                collect_names_expr(e, out);
+            }
+            if let Some(c) = cause {
+                collect_names_expr(c, out);
+            }
+        }
+        StmtKind::Try { body, handlers, orelse, finalbody } => {
+            for st in body {
+                collect_names_stmt(st, out);
+            }
+            for h in handlers {
+                if let Some(t) = &h.typ {
+                    collect_names_expr(t, out);
+                }
+                for st in &h.body {
+                    collect_names_stmt(st, out);
+                }
+            }
+            for st in orelse.iter().chain(finalbody) {
+                collect_names_stmt(st, out);
+            }
+        }
+        StmtKind::Assert { test, msg } => {
+            collect_names_expr(test, out);
+            if let Some(m) = msg {
+                collect_names_expr(m, out);
+            }
+        }
+        StmtKind::Match { subject, cases } => {
+            collect_names_expr(subject, out);
+            for case in cases {
+                if let Some(g) = &case.guard {
+                    collect_names_expr(g, out);
+                }
+                for st in &case.body {
+                    collect_names_stmt(st, out);
+                }
+            }
+        }
+        _ => {} // Pass/Break/Continue/Import/Global/Nonlocal/Return(None) bind no free refs
+    }
 }
 
 /// Add every simple-name binding target in `e` (a `Name`, or the names nested in

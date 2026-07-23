@@ -86,7 +86,9 @@ use std::path::PathBuf;
 /// v26: new `IMPORT_STAR` opcode for `from m import *` — the compiler now emits
 /// different bytecode for a star-import, so any entry cached under v25 (which
 /// mis-emitted it as an `IMPORT_FROM "*"` attribute fetch) must miss and recompile.
-const SCHEMA: u64 = 26;
+/// v27: `FuncDef` gained `freevars` (drives `func.__closure__`/`co_freevars` and
+/// the `CO_NOFREE` flag); recompile so closures carry their free-variable list.
+const SCHEMA: u64 = 27;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]
