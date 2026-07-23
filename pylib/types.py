@@ -7,73 +7,70 @@ Define names for built-in types that aren't directly accessible as a builtin.
 # iterator.  Don't check the type!  Use hasattr to check for both
 # "__iter__" and "__next__" attributes instead.
 
+import sys
+
+def _f(): pass
+FunctionType = type(_f)
+LambdaType = type(lambda: None)  # Same as FunctionType
+CodeType = type(_f.__code__)
+MappingProxyType = type(type.__dict__)
+SimpleNamespace = type(sys.implementation)
+
+def _cell_factory():
+    a = 1
+    def f():
+        nonlocal a
+    return f.__closure__[0]
+CellType = type(_cell_factory())
+
+def _g():
+    yield 1
+GeneratorType = type(_g())
+
+async def _c(): pass
+_c = _c()
+CoroutineType = type(_c)
+_c.close()  # Prevent ResourceWarning
+
+async def _ag():
+    yield
+_ag = _ag()
+AsyncGeneratorType = type(_ag)
+
+class _C:
+    def _m(self): pass
+MethodType = type(_C()._m)
+
+BuiltinFunctionType = type(len)
+BuiltinMethodType = type([].append)  # Same as BuiltinFunctionType
+
+WrapperDescriptorType = type(object.__init__)
+MethodWrapperType = type(object().__str__)
+MethodDescriptorType = type(str.join)
+ClassMethodDescriptorType = type(dict.__dict__['fromkeys'])
+
+ModuleType = type(sys)
+
 try:
-    from _types import *
-except ImportError:
-    import sys
+    raise TypeError
+except TypeError as exc:
+    TracebackType = type(exc.__traceback__)
+    FrameType = type(exc.__traceback__.tb_frame)
 
-    def _f(): pass
-    FunctionType = type(_f)
-    LambdaType = type(lambda: None)  # Same as FunctionType
-    CodeType = type(_f.__code__)
-    MappingProxyType = type(type.__dict__)
-    SimpleNamespace = type(sys.implementation)
+GetSetDescriptorType = type(FunctionType.__code__)
+MemberDescriptorType = type(FunctionType.__globals__)
 
-    def _cell_factory():
-        a = 1
-        def f():
-            nonlocal a
-        return f.__closure__[0]
-    CellType = type(_cell_factory())
+GenericAlias = type(list[int])
+UnionType = type(int | str)
 
-    def _g():
-        yield 1
-    GeneratorType = type(_g())
+EllipsisType = type(Ellipsis)
+NoneType = type(None)
+NotImplementedType = type(NotImplemented)
 
-    async def _c(): pass
-    _c = _c()
-    CoroutineType = type(_c)
-    _c.close()  # Prevent ResourceWarning
+# CapsuleType cannot be accessed from pure Python,
+# so there is no fallback definition.
 
-    async def _ag():
-        yield
-    _ag = _ag()
-    AsyncGeneratorType = type(_ag)
-
-    class _C:
-        def _m(self): pass
-    MethodType = type(_C()._m)
-
-    BuiltinFunctionType = type(len)
-    BuiltinMethodType = type([].append)  # Same as BuiltinFunctionType
-
-    WrapperDescriptorType = type(object.__init__)
-    MethodWrapperType = type(object().__str__)
-    MethodDescriptorType = type(str.join)
-    ClassMethodDescriptorType = type(dict.__dict__['fromkeys'])
-
-    ModuleType = type(sys)
-
-    try:
-        raise TypeError
-    except TypeError as exc:
-        TracebackType = type(exc.__traceback__)
-        FrameType = type(exc.__traceback__.tb_frame)
-
-    GetSetDescriptorType = type(FunctionType.__code__)
-    MemberDescriptorType = type(FunctionType.__globals__)
-
-    GenericAlias = type(list[int])
-    UnionType = type(int | str)
-
-    EllipsisType = type(Ellipsis)
-    NoneType = type(None)
-    NotImplementedType = type(NotImplemented)
-
-    # CapsuleType cannot be accessed from pure Python,
-    # so there is no fallback definition.
-
-    del sys, _f, _g, _C, _c, _ag, _cell_factory  # Not for export
+del sys, _f, _g, _C, _c, _ag, _cell_factory  # Not for export
 
 
 # Provide a PEP 3115 compliant mechanism for class creation

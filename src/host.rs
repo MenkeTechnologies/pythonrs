@@ -426,6 +426,15 @@ pub enum PyObj {
     Union {
         args: Vec<Value>,
     },
+    /// A parameterized generic alias (`list[int]`, `WeakSet[T]`). `type()` is
+    /// `types.GenericAlias`. Callable (constructs `origin`), forwards attribute
+    /// access to `origin`, and substitutes `origin` as a base (`__mro_entries__`).
+    /// Native so `list[int]` needs no import (types.py derives GenericAlias from
+    /// `type(list[int])`, which would otherwise recurse into the loading module).
+    GenericAlias {
+        origin: Value,
+        args: Vec<Value>,
+    },
     /// A `types.SimpleNamespace` — a mutable attribute bag (`sys.implementation`,
     /// argparse results). Attribute reads/writes go through `attrs`; `repr` is
     /// `namespace(k=v, …)`. Native VM object.
@@ -1567,6 +1576,18 @@ impl PyHost {
         }
     }
 
+    /// The display name of a generic-alias argument for `repr` (`list[int]`): a
+    /// type object's name, a nested alias's own repr, else the value's repr.
+    fn generic_arg_name(&self, v: &Value) -> String {
+        match self.get(v) {
+            Some(PyObj::Builtin(n)) => n.clone(),
+            Some(PyObj::Class(n)) => n.clone(),
+            Some(PyObj::GenericAlias { .. }) | Some(PyObj::Union { .. }) => self.repr_of(v),
+            None if matches!(v, Value::Undef) => "None".to_string(),
+            _ => self.repr_of(v),
+        }
+    }
+
     /// The live elements of a `dict_keys`/`dict_values`/`dict_items` view,
     /// materialized (allocating item tuples) from the backing dict at call time
     /// — so the view reflects mutations. `None` if `v` is not a view.
@@ -2439,6 +2460,7 @@ impl PyHost {
                 Some(PyObj::Partial { .. }) => "partial".into(),
                 Some(PyObj::Code { .. }) => "code".into(),
                 Some(PyObj::Union { .. }) => "UnionType".into(),
+                Some(PyObj::GenericAlias { .. }) => "GenericAlias".into(),
                 Some(PyObj::Namespace { .. }) => "SimpleNamespace".into(),
                 Some(PyObj::MappingProxy { .. }) => "mappingproxy".into(),
                 Some(PyObj::Descriptor { kind, .. }) => kind.type_name().into(),
@@ -2566,6 +2588,15 @@ impl PyHost {
                         .map(|a| self.union_member_name(a))
                         .collect::<Vec<_>>()
                         .join(" | ")
+                }
+                Some(PyObj::GenericAlias { origin, args }) => {
+                    let (origin, args) = (origin.clone(), args.clone());
+                    let inner = args
+                        .iter()
+                        .map(|a| self.generic_arg_name(a))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("{}[{inner}]", self.generic_arg_name(&origin))
                 }
                 Some(PyObj::Namespace { attrs }) => {
                     let attrs: Vec<(String, Value)> =
@@ -6716,6 +6747,16 @@ impl PyHost {
                 Ok(self.new_tuple(args))
             }
             Some(PyObj::Union { .. }) if name == "__parameters__" => Ok(self.new_tuple(vec![])),
+            // Generic alias: expose origin/args; forward anything else to origin.
+            Some(PyObj::GenericAlias { origin, args }) => {
+                let (origin, args) = (origin.clone(), args.clone());
+                match name {
+                    "__origin__" => Ok(origin),
+                    "__args__" => Ok(self.new_tuple(args)),
+                    "__parameters__" => Ok(self.new_tuple(vec![])),
+                    _ => self.get_attr(&origin, name),
+                }
+            }
             // SimpleNamespace attribute reads resolve from its bag.
             Some(PyObj::Namespace { attrs }) => match attrs.get(name) {
                 Some(v) => Ok(v.clone()),
@@ -7469,6 +7510,8 @@ pub fn invoke(
             }
         }
         Some(PyObj::Class(name)) => instantiate(&name, args, kwargs),
+        // Calling a generic alias constructs its origin (`list[int]()` -> list()).
+        Some(PyObj::GenericAlias { origin, .. }) => invoke(&origin, args, kwargs),
         Some(PyObj::NamedTupleType { type_name, fields }) => {
             namedtuple_construct(&type_name, &fields, args, kwargs)
         }
@@ -7563,9 +7606,18 @@ pub fn generic_alias(recv: &Value, idx: &Value) -> Result<Value, String> {
         let bound = with_host(|h| h.get_attr(recv, "__class_getitem__"))?;
         return invoke(&bound, vec![idx.clone()], vec![]);
     }
-    let types_mod = import_module("types")?;
-    let ga = with_host(|h| h.get_attr(&types_mod, "GenericAlias"))?;
-    invoke(&ga, vec![recv.clone(), idx.clone()], vec![])
+    // Build a native GenericAlias directly — no module import, so types.py's own
+    // `type(list[int])` cannot recurse into the still-loading `types` module.
+    Ok(with_host(|h| {
+        let args = match h.get(idx) {
+            Some(PyObj::Tuple(items)) => items.clone(),
+            _ => vec![idx.clone()],
+        };
+        h.alloc(PyObj::GenericAlias {
+            origin: recv.clone(),
+            args,
+        })
+    }))
 }
 
 pub fn call_named(
@@ -9553,6 +9605,22 @@ pub fn take_agen_op(gen: &Value) -> Option<AGenOp> {
 /// stderr) for every coroutine object that was created but never driven — i.e.
 /// never `await`ed, `create_task`'d, or run. Called at program end (best-effort;
 /// CPython emits at GC time, we emit once at teardown).
+impl PyHost {
+    /// If `gen` is an un-started generator/coroutine, mark it closed without
+    /// running its body and return true (CPython's `close()` on an un-started
+    /// coroutine; also clears the "never awaited" warning). False otherwise.
+    pub fn close_unstarted_gen(&mut self, gen: &Value) -> bool {
+        if let Some(PyObj::Generator { id }) = self.get(gen) {
+            let id = *id as usize;
+            if !self.generators[id].started {
+                self.generators[id].done = true;
+                return true;
+            }
+        }
+        false
+    }
+}
+
 pub fn warn_unawaited_coroutines() {
     let names: Vec<String> = with_host(|h| {
         h.generators

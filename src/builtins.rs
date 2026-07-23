@@ -3686,6 +3686,23 @@ pub fn call_builtin_function(
                 h.alloc(PyObj::Namespace { attrs })
             }))
         }
+        // `types.GenericAlias(origin, args)` — the type object (from
+        // `type(list[int])`) is callable to build an alias, which is how the
+        // stdlib's `__class_getitem__ = classmethod(GenericAlias)` works.
+        "GenericAlias" => {
+            let origin = arg0(&args)?;
+            let idx = args.get(1).cloned().unwrap_or(Value::Undef);
+            Ok(with_host(|h| {
+                let alias_args = match h.get(&idx) {
+                    Some(PyObj::Tuple(items)) => items.clone(),
+                    _ => vec![idx.clone()],
+                };
+                h.alloc(PyObj::GenericAlias {
+                    origin,
+                    args: alias_args,
+                })
+            }))
+        }
         "staticmethod" => {
             let f = arg0(&args)?;
             Ok(with_host(|h| h.alloc(PyObj::StaticMethod(f))))
@@ -6456,6 +6473,12 @@ fn generator_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, S
             }
         }
         "close" => {
+            // Closing an un-started generator/coroutine just marks it closed —
+            // CPython does not run the body — and clears the "never awaited"
+            // warning for a coroutine created only to read its type.
+            if with_host(|h| h.close_unstarted_gen(recv)) {
+                return Ok(Value::Undef);
+            }
             let ge = with_host(|h| {
                 h.alloc(PyObj::Exception {
                     class: "GeneratorExit".into(),

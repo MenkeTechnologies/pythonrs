@@ -54,6 +54,34 @@ fn builtins_module_exposes_functions_types_exceptions() {
     );
 }
 
+// The unmodified CPython types.py runs on pythonrs's native introspection floor
+// (no _types shim): its whole `type(_f.__code__)`-onward derivation block
+// succeeds. Gated to the self-contained build (the ffi build uses CPython's).
+#[cfg(not(feature = "stdlib-ffi"))]
+#[test]
+fn faithful_types_module_runs_on_native_primitives() {
+    assert_eq!(g("import types\nx = types.GenericAlias.__name__", "x"), "'GenericAlias'");
+    assert_eq!(g("import types\nx = types.UnionType.__name__", "x"), "'UnionType'");
+    for ty in [
+        "CodeType",
+        "CellType",
+        "MappingProxyType",
+        "SimpleNamespace",
+        "TracebackType",
+        "FrameType",
+        "WrapperDescriptorType",
+        "GetSetDescriptorType",
+    ] {
+        assert_eq!(
+            g(&format!("import types\nx = hasattr(types, {ty:?})"), "x"),
+            "True",
+            "types.{ty} should be derivable",
+        );
+    }
+    // The rest of the module (PEP 3115 helpers) is intact too.
+    assert_eq!(g("import types\nx = hasattr(types, 'new_class')", "x"), "True");
+}
+
 #[test]
 fn closure_cells_and_freevars() {
     // A closure exposes its free variables as cells (co_freevars + __closure__).
