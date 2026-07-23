@@ -12,6 +12,7 @@
 //! is a 64-bit hash of the source plus a schema version, so a source or format
 //! change misses cleanly instead of loading stale bytecode.
 
+use crate::ast::Span;
 use crate::compiler::Program;
 use crate::host::{FuncDef, TryDef};
 use fusevm::Chunk;
@@ -76,7 +77,10 @@ use std::path::PathBuf;
 /// field; also `...` lowers to the new `ELLIPSIS` op (a distinct `Ellipsis`
 /// singleton) instead of `LoadUndef` (`None`). Older bytecode used the
 /// annotation-free layout / conflated `...` with `None` and must miss cleanly.
-const SCHEMA: u64 = 23;
+/// v24: `CProg` gained a `positions` list (traceback-caret op-index → span tables)
+/// and the loader recomputes each chunk's `op_hash` (skipped by serde) so caret
+/// lookups match. Older entries lack the field and must miss cleanly.
+const SCHEMA: u64 = 24;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]
@@ -104,6 +108,23 @@ struct CProg {
     functions: Vec<(String, FuncDef)>,
     tries: Vec<TryDef>,
     warnings: Vec<(u32, String)>,
+    /// Traceback-caret position tables, `(chunk op_hash, op-index → span)`.
+    positions: Vec<(u64, Vec<Span>)>,
+}
+
+/// Recompute a chunk's `op_hash` exactly as `fusevm::ChunkBuilder::build` does
+/// (a `DefaultHasher` over ops then constants). `op_hash` is `#[serde(skip)]`, so
+/// a deserialized chunk carries `0`; restoring it (from the pre-rebase cached
+/// ops, which match the compile-time hash) lets caret lookups by `op_hash` hit.
+fn restore_op_hash(chunk: &mut Chunk) {
+    use std::collections::hash_map::DefaultHasher;
+    let mut h = DefaultHasher::new();
+    chunk.ops.hash(&mut h);
+    chunk.constants.hash(&mut h);
+    chunk.op_hash = h.finish();
+    for sub in &mut chunk.sub_chunks {
+        restore_op_hash(sub);
+    }
 }
 
 /// A stable content key for a source string (fast `FxHash`, used for lookup).
@@ -169,13 +190,38 @@ pub fn load(src: &str) -> Option<Program> {
         .entries
         .iter()
         .find(|e| e.key == key && e.verify == verify)?;
-    let cp: CProg = bincode::deserialize(&entry.blob).ok()?;
+    let mut cp: CProg = bincode::deserialize(&entry.blob).ok()?;
+    // Restore each chunk's serde-skipped `op_hash` so runtime caret lookups match
+    // the cached position tables' keys.
+    restore_op_hash(&mut cp.main);
+    for (_, f) in &mut cp.functions {
+        restore_op_hash(&mut f.chunk);
+    }
+    // `try` bodies/handlers/else/finally run as their own chunks (in `tries`, not
+    // `main.sub_chunks`), so their `op_hash` must be restored too or a caret for
+    // an error inside a `try` block would be lost on a cache hit.
+    for t in &mut cp.tries {
+        restore_op_hash(&mut t.body);
+        for (typ, _, handler) in &mut t.handlers {
+            if let Some(typ) = typ {
+                restore_op_hash(typ);
+            }
+            restore_op_hash(handler);
+        }
+        if let Some(e) = &mut t.orelse {
+            restore_op_hash(e);
+        }
+        if let Some(f) = &mut t.finalbody {
+            restore_op_hash(f);
+        }
+    }
     Some(Program {
         main: cp.main,
         functions: cp.functions,
         procs: Vec::new(),
         tries: cp.tries,
         warnings: cp.warnings,
+        positions: cp.positions,
     })
 }
 
@@ -188,6 +234,7 @@ pub fn store(src: &str, prog: &Program) -> Result<(), String> {
         functions: prog.functions.clone(),
         tries: prog.tries.clone(),
         warnings: prog.warnings.clone(),
+        positions: prog.positions.clone(),
     };
     let blob = bincode::serialize(&cp).map_err(|e| format!("cache encode: {e}"))?;
     let mut shard = load_shard();

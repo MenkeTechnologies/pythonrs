@@ -88,6 +88,43 @@ pub struct Keyword {
     pub value: Expr,
 }
 
+/// A source span for traceback carets: character columns within a 1-based
+/// `line`. `line == 0` marks "no span" (synthetic/desugared nodes). When
+/// `anchor_end > anchor_start`, the `[anchor_start, anchor_end)` sub-range
+/// renders the secondary caret `^` and the rest of `[start, end)` renders the
+/// primary caret `~` — CPython's `~^~` binary-op and `~~~^^^` subscript/call
+/// anchoring. With no anchor the whole `[start, end)` renders `^`.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize,
+)]
+pub struct Span {
+    pub line: u32,
+    pub start: u32,
+    pub end: u32,
+    pub anchor_start: u32,
+    pub anchor_end: u32,
+    /// This op is the direct call value of an `x = f(...)` / `return f(...)`
+    /// statement, whose caret CPython suppresses when the call raises.
+    pub suppress: bool,
+}
+
+impl Span {
+    pub const NONE: Span = Span {
+        line: 0,
+        start: 0,
+        end: 0,
+        anchor_start: 0,
+        anchor_end: 0,
+        suppress: false,
+    };
+    pub fn is_some(&self) -> bool {
+        self.line != 0
+    }
+    pub fn has_anchor(&self) -> bool {
+        self.anchor_end > self.anchor_start
+    }
+}
+
 /// A Python expression.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
@@ -167,6 +204,32 @@ pub enum Expr {
 
     /// `:=` walrus in an expression context.
     NamedExpr(Box<Expr>, Box<Expr>),
+
+    /// An expression carrying its source span, attached by the parser to the
+    /// caret-bearing forms (name load, binary op, subscript, call, attribute,
+    /// unary op). The compiler peels it and records the span for the raising op;
+    /// every other consumer treats `Spanned(e, _)` as `e` via `Expr::unspanned`.
+    Spanned(Box<Expr>, Span),
+}
+
+impl Expr {
+    /// Peel any `Spanned` wrapper(s), returning the underlying expression. Used
+    /// wherever code matches on expression structure (assignment targets, walrus
+    /// targets, constant folding) so a wrapped node is treated as its inner form.
+    pub fn unspanned(&self) -> &Expr {
+        let mut e = self;
+        while let Expr::Spanned(inner, _) = e {
+            e = inner;
+        }
+        e
+    }
+    /// The span wrapping this expression, or `Span::NONE`.
+    pub fn span(&self) -> Span {
+        match self {
+            Expr::Spanned(_, s) => *s,
+            _ => Span::NONE,
+        }
+    }
 }
 
 /// A formal-parameter list for a `def`/`lambda`.

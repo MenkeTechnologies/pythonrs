@@ -81,8 +81,14 @@ fixed. Every line below was re-checked against the **default-build** binary
   `E(arg, …)`, and expose `.args` and `.__class__` (the type object); `str()` uses
   the message even when a user `__repr__` exists. An uncaught exception prints
   CPython's `Traceback (most recent call last):` block — header, `  File "<path>",
-  line N, in <scope>` + source line per frame (outermost first), then
-  `ErrorType: message` (caret `^^^` markers omitted for now). **Exception
+  line N, in <scope>` + source line + CPython 3.11+ fine-grained caret per frame
+  (outermost first), then `ErrorType: message`. Carets follow CPython's anchor
+  rules: `~^~` under a binary operator, `~~~^^^` under a subscript/call's
+  brackets, a plain `^^^` under a name/attribute, and no caret when the span
+  covers the whole line or when an `x = f(...)` / `return f(...)` call raises. A
+  fused name/method call whose *callee lookup* fails (`foo()` on an undefined
+  name, `obj.missing()`) anchors the call brackets rather than the name — the one
+  spot the fused CALL op diverges from CPython's separate LOAD+CALL. **Exception
   chaining** renders in full: `raise X from Y` records `__cause__` and prints the
   cause's own block followed by "The above exception was the direct cause …"; an
   exception raised while handling another chains via `__context__` ("During

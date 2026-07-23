@@ -30,11 +30,16 @@ pub enum Tok {
     Eof,
 }
 
-/// A token plus its 1-based source line.
+/// A token plus its 1-based source line and 0-based character columns (start
+/// inclusive, end exclusive) within that line. Columns feed traceback carets;
+/// they are only meaningful for on-line tokens (structural Newline/Indent/Dedent/
+/// Eof carry stale columns that no consumer reads).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Token {
     pub tok: Tok,
     pub line: u32,
+    pub col: u32,
+    pub end_col: u32,
 }
 
 struct Lexer {
@@ -44,6 +49,11 @@ struct Lexer {
     depth: i32,
     indents: Vec<usize>,
     out: Vec<Token>,
+    /// Char index where the current line begins — subtracted from a token's
+    /// start/end char index to get its 0-based character column (for carets).
+    line_start: usize,
+    /// Char index where the token currently being scanned begins.
+    tok_start: usize,
 }
 
 /// Multi-char operators, longest first so the scanner is greedy.
@@ -62,6 +72,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
         depth: 0,
         indents: vec![0],
         out: Vec::new(),
+        line_start: 0,
+        tok_start: 0,
     };
     lx.run()?;
     Ok(lx.out)
@@ -80,6 +92,7 @@ impl Lexer {
             self.pos += 1;
             if ch == '\n' {
                 self.line += 1;
+                self.line_start = self.pos;
             }
         }
         c
@@ -88,6 +101,8 @@ impl Lexer {
         self.out.push(Token {
             tok,
             line: self.line,
+            col: (self.tok_start.saturating_sub(self.line_start)) as u32,
+            end_col: (self.pos.saturating_sub(self.line_start)) as u32,
         });
     }
 
@@ -206,6 +221,10 @@ impl Lexer {
     }
 
     fn scan_token(&mut self) -> Result<(), String> {
+        // Record where this token begins so `push` can derive its column. The
+        // scan_* helpers each emit exactly one token, so this start holds until
+        // the corresponding `push`.
+        self.tok_start = self.pos;
         let c = self.peek().unwrap();
         // String / prefixed string / f-string / bytes.
         if c == '"' || c == '\'' {

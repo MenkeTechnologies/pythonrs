@@ -15,6 +15,7 @@
 //!     bignum, complex — the reference types.
 
 use crate::async_rt;
+use crate::ast::Span;
 use fusevm::{Chunk, NumOp, VMResult, Value, VM};
 use indexmap::IndexMap;
 use std::cell::RefCell;
@@ -699,6 +700,9 @@ pub struct Frame {
     /// Source line currently executing in this frame — updated by the DAP debug
     /// line hook (`--dap`) and by the error path when an exception aborts a chunk.
     pub line: u32,
+    /// Source span of the op that aborted this frame — set alongside `line` by
+    /// the error path, used to draw the traceback caret. `Span::NONE` otherwise.
+    pub span: Span,
 }
 
 /// A non-local control signal.
@@ -770,7 +774,7 @@ pub struct PyHost {
     /// heap index: the outermost-first `(scope, line)` stack captured when the
     /// exception is caught. Used to render `__cause__`/`__context__` chain blocks
     /// in an uncaught traceback (the final exception uses the live `traceback`).
-    pub exc_tb: HashMap<u32, Vec<(String, u32)>>,
+    pub exc_tb: HashMap<u32, Vec<(String, u32, Span)>>,
     /// Exception heap ids raised with an explicit `from` clause (`raise X from Y`
     /// or `raise X from None`), which sets `__suppress_context__` — the implicit
     /// `__context__` is then hidden from the rendered traceback.
@@ -794,8 +798,8 @@ pub struct PyHost {
     /// false for stdin — CPython cannot retrieve stdin source).
     pub tb_show_source: bool,
     /// Frames captured (innermost first) as an exception unwinds the call stack,
-    /// each `(scope_name, line)`. Cleared when the exception is caught.
-    pub traceback: Vec<(String, u32)>,
+    /// each `(scope_name, line, span)`. Cleared when the exception is caught.
+    pub traceback: Vec<(String, u32, Span)>,
     /// The current `sys.stdout` / `sys.stderr` targets when reassigned away from
     /// the native streams (`sys.stdout = io.StringIO()`,
     /// `contextlib.redirect_stdout`). `None` = the native stream. Tracked on the
@@ -886,6 +890,35 @@ thread_local! {
 }
 
 thread_local! {
+    /// Op-index → source span, keyed by the owning chunk's `op_hash` (stable
+    /// across the clones made per call). The compiler registers one table per
+    /// chunk it builds; `record_err_line` looks the failing op's span up here to
+    /// draw a CPython-style traceback caret. Grows for the process lifetime, like
+    /// the object heap.
+    static POSITIONS: RefCell<HashMap<u64, Vec<Span>>> = RefCell::new(HashMap::new());
+}
+
+/// Register a chunk's op-index → span table under its `op_hash`. Called by the
+/// compiler as each chunk is finalized.
+pub fn register_positions(op_hash: u64, table: Vec<Span>) {
+    POSITIONS.with(|p| {
+        p.borrow_mut().insert(op_hash, table);
+    });
+}
+
+/// The span recorded for op `idx` of the chunk with hash `op_hash`, or
+/// `Span::NONE` if none (unregistered chunk, or a non-caret op).
+pub fn lookup_position(op_hash: u64, idx: usize) -> Span {
+    POSITIONS.with(|p| {
+        p.borrow()
+            .get(&op_hash)
+            .and_then(|t| t.get(idx))
+            .copied()
+            .unwrap_or(Span::NONE)
+    })
+}
+
+thread_local! {
     /// Resolved dict/set keys for user instances (heap id → `PKey::Instance`),
     /// computed by [`prepare_key`] *outside* any host borrow (running `__hash__`/
     /// `__eq__`), then read by the borrowed [`PyHost::to_key`] which cannot itself
@@ -972,6 +1005,7 @@ impl PyHost {
                 owner: None,
                 name: "<module>".to_string(),
                 line: 0,
+                span: Span::NONE,
             }],
             error: None,
             exc: None,
@@ -1376,11 +1410,21 @@ impl PyHost {
             f.line = line;
         }
     }
-    /// Capture the innermost frame's `(name, line)` into the in-flight traceback
-    /// as an exception unwinds past it. Called just before the frame is popped.
+    /// Record the failing op's line AND caret span into the innermost frame — the
+    /// error path (`record_err_line`) calls this so an uncaught traceback can both
+    /// name the line and underline the exact sub-expression.
+    pub fn set_cur_line_span(&mut self, line: u32, span: Span) {
+        if let Some(f) = self.frames.last_mut() {
+            f.line = line;
+            f.span = span;
+        }
+    }
+    /// Capture the innermost frame's `(name, line, span)` into the in-flight
+    /// traceback as an exception unwinds past it. Called just before the frame is
+    /// popped.
     pub fn push_tb_frame(&mut self) {
         if let Some(f) = self.frames.last() {
-            self.traceback.push((f.name.clone(), f.line));
+            self.traceback.push((f.name.clone(), f.line, f.span));
         }
     }
     /// Snapshot `exc`'s traceback (outermost-first) into `exc_tb`, just before the
@@ -1392,9 +1436,9 @@ impl PyHost {
     /// exception's frames when it appears as a `__cause__`/`__context__`.
     pub fn capture_exc_tb(&mut self, exc: &Value) {
         let Value::Obj(id) = exc else { return };
-        let mut tb: Vec<(String, u32)> = Vec::new();
+        let mut tb: Vec<(String, u32, Span)> = Vec::new();
         if let Some(f) = self.frames.last() {
-            tb.push((f.name.clone(), f.line));
+            tb.push((f.name.clone(), f.line, f.span));
         }
         for f in self.traceback.iter().rev() {
             tb.push(f.clone());
@@ -1799,7 +1843,14 @@ pub fn run_chunk_on(chunk: Chunk) -> Result<Value, String> {
     match outcome {
         VMResult::Ok(v) => Ok(v),
         VMResult::Halted => Ok(vm.stack.last().cloned().unwrap_or(Value::Undef)),
-        VMResult::Error(e) => Err(e),
+        VMResult::Error(e) => {
+            // A native fast-path op (Add/Sub/Mul/Negate/comparisons) raised via the
+            // VM directly, not through a pythonrs builtin's `abort`, so the failing
+            // op's line/caret span was never recorded. Capture it here from the
+            // still-valid `ip` before unwinding.
+            crate::builtins::record_err_line(&vm);
+            Err(e)
+        }
     }
 }
 
@@ -7676,6 +7727,7 @@ pub fn run_user_func(
             owner,
             name: def.name.clone(),
             line: 0,
+            span: Span::NONE,
         })
     });
     let r = run_chunk_on(def.chunk.clone());
@@ -8069,6 +8121,7 @@ fn run_class_body(name: &str, body_func: &Value) -> Result<IndexMap<String, Valu
             owner: Some(name.to_string()),
             name: name.to_string(),
             line: 0,
+            span: Span::NONE,
         })
     });
     let r = run_chunk_on(def.chunk.clone());
@@ -8398,9 +8451,9 @@ impl PyHost {
         // The final (uncaught) exception's frames: the module frame still on the
         // stack, then the function frames it unwound past (innermost-first),
         // reversed to outermost-first.
-        let mut final_frames: Vec<(String, u32)> = Vec::new();
+        let mut final_frames: Vec<(String, u32, Span)> = Vec::new();
         if let Some(f) = self.frames.first() {
-            final_frames.push((f.name.clone(), f.line));
+            final_frames.push((f.name.clone(), f.line, f.span));
         }
         for f in self.traceback.iter().rev() {
             final_frames.push(f.clone());
@@ -8454,10 +8507,10 @@ impl PyHost {
 
     /// Render one `Traceback (most recent call last):` block: the `frames`
     /// (outermost-first) followed by the terse `final_line`.
-    fn render_one_tb(&self, frames: &[(String, u32)], final_line: &str) -> String {
+    fn render_one_tb(&self, frames: &[(String, u32, Span)], final_line: &str) -> String {
         let mut out = String::from("Traceback (most recent call last):\n");
         let src_lines: Vec<&str> = self.prog_source.lines().collect();
-        for (name, line) in frames {
+        for (name, line, span) in frames {
             out.push_str(&format!(
                 "  File \"{}\", line {}, in {}\n",
                 self.tb_filename, line, name
@@ -8467,6 +8520,12 @@ impl PyHost {
                     let stripped = text.trim();
                     if !stripped.is_empty() {
                         out.push_str(&format!("    {stripped}\n"));
+                        if span.line == *line {
+                            if let Some(carets) = caret_line(text, *span) {
+                                out.push_str(&carets);
+                                out.push('\n');
+                            }
+                        }
                     }
                 }
             }
@@ -8505,6 +8564,55 @@ impl PyHost {
         std::mem::swap(&mut self.signal, &mut c.signal);
         c
     }
+}
+
+/// Build the CPython-style caret line underlining `span` beneath the displayed
+/// (stripped, 4-space-indented) source `text`, or `None` when CPython omits it.
+///
+/// Columns in `span` are character offsets into the ORIGINAL `text`; the display
+/// strips leading whitespace, so offsets shift left by the indent. Rules ported
+/// from CPython `traceback.py`:
+/// - a `suppress` span (an `x = f(...)` / `return f(...)` call that raised) is
+///   hidden;
+/// - a span with a sub-anchor (`~^~` binop, `~~~^^^` subscript/call) is shown;
+/// - a plain span is shown only if something precedes or follows it on the line
+///   (so a span covering the whole statement — e.g. `None.foo` — is hidden);
+/// - the anchor sub-range renders `^`, the rest of the span `~`; a plain span
+///   renders entirely `^`.
+fn caret_line(text: &str, span: Span) -> Option<String> {
+    if !span.is_some() || span.suppress {
+        return None;
+    }
+    let lead = text.chars().take_while(|c| c.is_whitespace()).count() as u32;
+    let stripped_len = text.trim().chars().count() as u32;
+    // Offsets relative to the stripped (displayed) line.
+    let start = span.start.saturating_sub(lead);
+    let end = span.end.saturating_sub(lead).min(stripped_len);
+    if end <= start {
+        return None;
+    }
+    let has_anchor = span.has_anchor();
+    let a0 = span.anchor_start.saturating_sub(lead);
+    let a1 = span.anchor_end.saturating_sub(lead);
+    // Show/hide: anchored spans always show; a plain span shows only when it does
+    // not cover the whole stripped line.
+    let show = has_anchor || start > 0 || end < stripped_len;
+    if !show {
+        return None;
+    }
+    let primary = if has_anchor { '~' } else { '^' };
+    let mut carets = String::from("    ");
+    for col in 0..end {
+        let c = if col < start {
+            ' '
+        } else if has_anchor && col >= a0 && col < a1 {
+            '^'
+        } else {
+            primary
+        };
+        carets.push(c);
+    }
+    Some(carets)
 }
 
 /// Build a suspended generator whose body is `chunk`, run in a frame with the
@@ -8644,6 +8752,7 @@ fn make_gen_kind(
         owner: owner.clone(),
         name: owner.unwrap_or_else(|| "<genexpr>".to_string()),
         line: 0,
+        span: Span::NONE,
     };
     let id = with_host(|h| {
         let id = h.generators.len() as u32;

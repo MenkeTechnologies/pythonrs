@@ -191,11 +191,88 @@ fn sys_scalars_present() {
     assert_eq!(g("import sys\nx = sys.version[:6]", "x"), "'3.14.6'");
 }
 
+/// One helper: run `src` as `/t.py`, expect exit 1, return the traceback.
+fn traceback_of(src: &str) -> String {
+    let r = run_program(
+        src,
+        vec!["t.py".into()],
+        Some("/t.py".into()),
+        "/t.py",
+        true,
+    );
+    assert_eq!(r.exit_code, 1);
+    r.stderr.expect("expected a traceback on stderr")
+}
+
+#[test]
+fn caret_anchor_shapes() {
+    // CPython 3.11+ fine-grained caret anchors, byte-for-byte:
+    // a subscript underlines its brackets (`~^^^`), a binary op its operator
+    // (`~~^~~`), and an attribute error whose span covers the whole displayed
+    // line draws no caret at all.
+    assert_eq!(
+        traceback_of("x = [1, 2]\nprint(x[9])\n"),
+        concat!(
+            "Traceback (most recent call last):\n",
+            "  File \"/t.py\", line 2, in <module>\n",
+            "    print(x[9])\n",
+            "          ~^^^\n",
+            "IndexError: list index out of range\n",
+        )
+    );
+    assert_eq!(
+        traceback_of("a = 1\nb = \"z\"\nc = a + b\n"),
+        concat!(
+            "Traceback (most recent call last):\n",
+            "  File \"/t.py\", line 3, in <module>\n",
+            "    c = a + b\n",
+            "        ~~^~~\n",
+            "TypeError: unsupported operand type(s) for +: 'int' and 'str'\n",
+        )
+    );
+    // Whole-line attribute span → caret omitted (matches CPython).
+    assert_eq!(
+        traceback_of("v = None\nv.attr\n"),
+        concat!(
+            "Traceback (most recent call last):\n",
+            "  File \"/t.py\", line 2, in <module>\n",
+            "    v.attr\n",
+            "AttributeError: 'NoneType' object has no attribute 'attr'\n",
+        )
+    );
+}
+
+#[test]
+fn caret_call_value_suppressed() {
+    // CPython omits the caret when an `x = f(...)` / `return f(...)` call raises;
+    // the same `int("z")` inside a bare expression IS anchored.
+    assert_eq!(
+        traceback_of("y = int(\"z\")\n"),
+        concat!(
+            "Traceback (most recent call last):\n",
+            "  File \"/t.py\", line 1, in <module>\n",
+            "    y = int(\"z\")\n",
+            "ValueError: invalid literal for int() with base 10: 'z'\n",
+        )
+    );
+    assert_eq!(
+        traceback_of("int(\"z\")\n"),
+        concat!(
+            "Traceback (most recent call last):\n",
+            "  File \"/t.py\", line 1, in <module>\n",
+            "    int(\"z\")\n",
+            "    ~~~^^^^^\n",
+            "ValueError: invalid literal for int() with base 10: 'z'\n",
+        )
+    );
+}
+
 #[test]
 fn uncaught_traceback_shape() {
     // A nested-call uncaught exception prints the CPython traceback block: header,
-    // one `File "…", line N, in <scope>` + source line per frame (outermost first),
-    // then `ErrorType: message`. Caret markers are intentionally omitted.
+    // one `File "…", line N, in <scope>` + source line + caret per frame
+    // (outermost first), then `ErrorType: message`. The `a()`/`b()` call sites get
+    // the `~^^` call anchor; the bare `raise` line has no caret.
     let src = "def a():\n    b()\n\ndef b():\n    raise ValueError(\"boom\")\n\na()\n";
     let r = run_program(
         src,
@@ -210,8 +287,10 @@ fn uncaught_traceback_shape() {
         "Traceback (most recent call last):\n",
         "  File \"/t.py\", line 7, in <module>\n",
         "    a()\n",
+        "    ~^^\n",
         "  File \"/t.py\", line 2, in a\n",
         "    b()\n",
+        "    ~^^\n",
         "  File \"/t.py\", line 5, in b\n",
         "    raise ValueError(\"boom\")\n",
         "ValueError: boom\n",
@@ -222,7 +301,8 @@ fn uncaught_traceback_shape() {
 #[test]
 fn uncaught_traceback_explicit_cause_chain() {
     // `raise X from Y` renders both blocks: the cause first (its own frames), the
-    // CPython connector line, then the raising exception. Caret markers omitted.
+    // CPython connector line, then the raising exception. The `int("bad")` call
+    // carries the `~~~^^^^^^^` caret; the `raise … from e` line has none.
     let src = "try:\n    int(\"bad\")\nexcept ValueError as e:\n    raise RuntimeError(\"wrapped\") from e\n";
     let r = run_program(
         src,
@@ -237,6 +317,7 @@ fn uncaught_traceback_explicit_cause_chain() {
         "Traceback (most recent call last):\n",
         "  File \"/t.py\", line 2, in <module>\n",
         "    int(\"bad\")\n",
+        "    ~~~^^^^^^^\n",
         "ValueError: invalid literal for int() with base 10: 'bad'\n",
         "\n",
         "The above exception was the direct cause of the following exception:\n",
@@ -253,7 +334,9 @@ fn uncaught_traceback_explicit_cause_chain() {
 fn uncaught_traceback_implicit_context_chain() {
     // An exception raised while handling another (no `from`) chains via
     // `__context__` with the "During handling …" connector, including the frames
-    // of the function where the original exception was raised.
+    // of the function where the original exception was raised. The `parse("xyz")`
+    // call gets the `~~~~~^^^^^^^` caret; `return int(s)` is caret-suppressed (a
+    // `return call()` value), matching CPython.
     let src = "def parse(s):\n    return int(s)\n\ntry:\n    parse(\"xyz\")\nexcept ValueError:\n    raise RuntimeError(\"handler failed\")\n";
     let r = run_program(
         src,
@@ -268,6 +351,7 @@ fn uncaught_traceback_implicit_context_chain() {
         "Traceback (most recent call last):\n",
         "  File \"/t.py\", line 5, in <module>\n",
         "    parse(\"xyz\")\n",
+        "    ~~~~~^^^^^^^\n",
         "  File \"/t.py\", line 2, in parse\n",
         "    return int(s)\n",
         "ValueError: invalid literal for int() with base 10: 'xyz'\n",

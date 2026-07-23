@@ -31,6 +31,11 @@ pub struct Program {
     /// `'return' in a 'finally' block`). `(line, keyword)`; carried through the
     /// bytecode cache so a cache hit warns identically to a fresh compile.
     pub warnings: Vec<(u32, String)>,
+    /// Traceback-caret position tables: `(chunk op_hash, op-index → span)` for the
+    /// main chunk and every function/block chunk. Registered into the host's
+    /// position registry at run time (`load_merged`) and carried through the
+    /// bytecode cache so a cache hit draws identical carets.
+    pub positions: Vec<(u64, Vec<Span>)>,
 }
 
 /// Rebase every func-id and try-id reference in `prog` so its ids sit above the
@@ -131,6 +136,23 @@ pub struct Compiler {
     /// `__annotations__` dict, so `dataclass`/`typing.NamedTuple` and
     /// `Cls.__annotations__` see the fields.
     in_class_body: bool,
+    /// The source span of the caret-bearing expression currently being lowered,
+    /// peeled from its `Expr::Spanned` wrapper. Recorded against the raising op's
+    /// index so an uncaught exception can underline the exact sub-expression
+    /// (CPython 3.11+ traceback carets). `Span::NONE` for synthetic nodes.
+    node_span: Span,
+    /// Set before lowering the direct call value of an `x = f(...)` / `return
+    /// f(...)` statement; consumed by the outermost `Spanned` peel to mark that
+    /// call's span `suppress` (CPython omits the caret when such a call raises).
+    suppress_hint: bool,
+    /// Per-chunk table of op-index → span, mirroring the currently-building
+    /// `ChunkBuilder`. A stack because function/loop bodies build nested chunks;
+    /// each frame is registered under its chunk's `op_hash` when the chunk is
+    /// finished (see `begin_chunk`/`finish_chunk`).
+    positions: Vec<Vec<Span>>,
+    /// Finished per-chunk position tables paired with their chunk `op_hash`,
+    /// accumulated as each chunk is built and handed to `Program.positions`.
+    collected_positions: Vec<(u64, Vec<Span>)>,
 }
 
 /// The kind of scope a hidden function represents, controlling whether it is a
@@ -161,13 +183,16 @@ fn compile_ex(stmts: &[Stmt], debug: bool, interactive: bool) -> Result<Program,
         ..Default::default()
     };
     let mut b = ChunkBuilder::new();
+    c.begin_chunk();
     c.compile_stmts(&mut b, stmts)?;
+    let main = c.finish_chunk(b);
     Ok(Program {
-        main: b.build(),
+        main,
         functions: c.functions,
         procs: Vec::new(),
         tries: c.tries,
         warnings: c.warnings,
+        positions: c.collected_positions,
     })
 }
 
@@ -176,6 +201,40 @@ fn argc(n: usize) -> Result<u8, String> {
 }
 
 impl Compiler {
+    // ── traceback-caret position tables ──────────────────────────────────
+    /// Open a fresh position frame for a chunk about to be built. Pair with
+    /// `finish_chunk` so the frame is registered and popped in balance.
+    fn begin_chunk(&mut self) {
+        self.positions.push(Vec::new());
+    }
+    /// Finalize `b` into a `Chunk` and register the open position frame under the
+    /// chunk's `op_hash` (stable across the clones made per call), padded to the
+    /// op count. `record_err_line` looks the table up at raise time.
+    fn finish_chunk(&mut self, b: ChunkBuilder) -> Chunk {
+        let c = b.build();
+        let mut frame = self.positions.pop().unwrap_or_default();
+        frame.resize(c.ops.len(), Span::NONE);
+        // Collect rather than register: `load_merged` registers the whole set at
+        // run time, so a cache-loaded program (which skips compilation) registers
+        // identically from `Program.positions`.
+        self.collected_positions.push((c.op_hash, frame));
+        c
+    }
+    /// Record `self.node_span` (the caret-bearing expr being lowered) against the
+    /// raising op at `idx` in the current chunk's position frame.
+    fn record_span(&mut self, idx: usize) {
+        let sp = self.node_span;
+        if !sp.is_some() {
+            return;
+        }
+        if let Some(frame) = self.positions.last_mut() {
+            if frame.len() <= idx {
+                frame.resize(idx + 1, Span::NONE);
+            }
+            frame[idx] = sp;
+        }
+    }
+
     // ── emit helpers ─────────────────────────────────────────────────────
     fn name_const(&self, b: &mut ChunkBuilder, s: &str) {
         let k = b.add_constant(Value::str(s));
@@ -219,7 +278,13 @@ impl Compiler {
             }
             StmtKind::Pass => {}
             StmtKind::Assign { targets, value } => {
+                // CPython omits the caret when a single `name = call(...)`'s call
+                // raises; flag the value's call span so the renderer hides it.
+                self.suppress_hint = targets.len() == 1
+                    && matches!(targets[0].unspanned(), Expr::Name(_))
+                    && matches!(value.unspanned(), Expr::Call { .. });
                 self.compile_expr(b, value)?;
+                self.suppress_hint = false;
                 // Store to every target (dup for all but the last).
                 for (i, t) in targets.iter().enumerate() {
                     if i + 1 < targets.len() {
@@ -237,7 +302,7 @@ impl Compiler {
                 // `__annotations__[name] = <annotation>` so dataclass /
                 // typing.NamedTuple and `Cls.__annotations__` see the field.
                 if self.in_class_body {
-                    if let Expr::Name(n) = target {
+                    if let Expr::Name(n) = target.unspanned() {
                         self.compile_expr(b, annotation)?; // [ann]
                         self.name_const(b, "__annotations__");
                         b.emit(Op::CallBuiltin(ops::GETLOCAL, 1), self.cur_line); // [ann, dict]
@@ -294,7 +359,16 @@ impl Compiler {
             }
             StmtKind::Return(e) => {
                 match e {
-                    Some(e) => self.compile_expr(b, e)?,
+                    Some(e) => {
+                        // CPython omits the caret when `return name(...)`'s call
+                        // raises (value is a `Call` on a bare `Name` func).
+                        self.suppress_hint = matches!(
+                            e.unspanned(),
+                            Expr::Call { func, .. } if matches!(func.unspanned(), Expr::Name(_))
+                        );
+                        self.compile_expr(b, e)?;
+                        self.suppress_hint = false;
+                    }
                     None => {
                         b.emit(Op::LoadUndef, line);
                     }
@@ -423,7 +497,9 @@ impl Compiler {
     }
 
     fn compile_assign(&mut self, b: &mut ChunkBuilder, target: &Expr) -> Result<(), String> {
-        // Value is on top of stack.
+        // Value is on top of stack. Peel the parser's span wrapper so a target
+        // like `x`, `a.b`, or `a[i]` (all `Spanned`) matches structurally.
+        let target = target.unspanned();
         match target {
             Expr::Name(n) => {
                 self.name_const(b, n);
@@ -476,6 +552,7 @@ impl Compiler {
     }
 
     fn compile_delete(&mut self, b: &mut ChunkBuilder, target: &Expr) -> Result<(), String> {
+        let target = target.unspanned();
         match target {
             Expr::Name(n) => {
                 self.name_const(b, n);
@@ -533,7 +610,9 @@ impl Compiler {
         value: &Expr,
     ) -> Result<(), String> {
         let tag = Self::iop_tag(op);
-        match target {
+        // Peel for structural matching; the `Name` arm still lowers the original
+        // (wrapped) `target` so its load records a caret span.
+        match target.unspanned() {
             Expr::Name(_) => {
                 // A name target has no receiver side effect: load, apply, store.
                 b.emit(Op::LoadInt(tag), 0);
@@ -1043,6 +1122,7 @@ impl Compiler {
             pushed = true;
         }
         let mut fb = ChunkBuilder::new();
+        self.begin_chunk();
         // A class body captures its simple annotations into `__annotations__`; a
         // nested def/class resets the flag so its own annotations don't leak into
         // the enclosing class's dict.
@@ -1074,7 +1154,7 @@ impl Compiler {
             kwonly: params.kwonly.clone(),
             kwonly_required: params.kwonly_defaults.iter().map(|d| d.is_none()).collect(),
             kwargs: params.kwargs.clone(),
-            chunk: fb.build(),
+            chunk: self.finish_chunk(fb),
             locals,
             is_generator,
             is_async,
@@ -1196,15 +1276,17 @@ impl Compiler {
     /// Compile a suite into a standalone chunk that runs in the current scope.
     fn compile_block_chunk(&mut self, stmts: &[Stmt]) -> Result<Chunk, String> {
         let mut cb = ChunkBuilder::new();
+        self.begin_chunk();
         self.compile_stmts(&mut cb, stmts)?;
-        Ok(cb.build())
+        Ok(self.finish_chunk(cb))
     }
 
     /// Compile a single expression into a chunk leaving its value on the stack.
     fn compile_expr_chunk(&mut self, e: &Expr) -> Result<Chunk, String> {
         let mut cb = ChunkBuilder::new();
+        self.begin_chunk();
         self.compile_expr(&mut cb, e)?;
-        Ok(cb.build())
+        Ok(self.finish_chunk(cb))
     }
 
     fn compile_with(
@@ -1360,7 +1442,26 @@ impl Compiler {
 
     // ── expressions ──────────────────────────────────────────────────────
     fn compile_expr(&mut self, b: &mut ChunkBuilder, e: &Expr) -> Result<(), String> {
+        // Peel the parser's span wrapper: set it as the active `node_span` while
+        // lowering the inner node, so the raising op (name load / binop / subscript
+        // / call / attribute / unary) records it. Children save/restore around
+        // themselves, so when this node emits its op, `node_span` still holds this
+        // node's span. The suppress hint (assign/return direct call value) is
+        // consumed by the outermost peel only.
+        if let Expr::Spanned(inner, sp) = e {
+            let mut sp = *sp;
+            if std::mem::take(&mut self.suppress_hint)
+                && matches!(inner.unspanned(), Expr::Call { .. })
+            {
+                sp.suppress = true;
+            }
+            let prev = std::mem::replace(&mut self.node_span, sp);
+            let r = self.compile_expr(b, inner);
+            self.node_span = prev;
+            return r;
+        }
         match e {
+            Expr::Spanned(_, _) => unreachable!("peeled above"),
             Expr::None => {
                 b.emit(Op::LoadUndef, 0);
             }
@@ -1404,7 +1505,8 @@ impl Compiler {
             Expr::FString(parts) => self.compile_fstring(b, parts)?,
             Expr::Name(n) => {
                 self.name_const(b, n);
-                b.emit(Op::CallBuiltin(ops::GETLOCAL, 1), self.cur_line);
+                let idx = b.emit(Op::CallBuiltin(ops::GETLOCAL, 1), self.cur_line);
+                self.record_span(idx);
             }
             Expr::List(items) => {
                 if items.iter().any(|e| matches!(e, Expr::Starred(_))) {
@@ -1515,7 +1617,8 @@ impl Compiler {
             Expr::Attribute(recv, attr) => {
                 self.compile_expr(b, recv)?;
                 self.name_const(b, attr);
-                b.emit(Op::CallBuiltin(ops::GETATTR, 2), self.cur_line);
+                let idx = b.emit(Op::CallBuiltin(ops::GETATTR, 2), self.cur_line);
+                self.record_span(idx);
             }
             Expr::Subscript(recv, idx) => {
                 // CPython `SyntaxWarning` for a literal sequence subscripted by a
@@ -1532,7 +1635,8 @@ impl Compiler {
                 }
                 self.compile_expr(b, recv)?;
                 self.compile_subscript_index(b, idx)?;
-                b.emit(Op::CallBuiltin(ops::GETITEM, 2), self.cur_line);
+                let op_idx = b.emit(Op::CallBuiltin(ops::GETITEM, 2), self.cur_line);
+                self.record_span(op_idx);
             }
             Expr::Slice { lo, hi, step } => {
                 self.compile_opt(b, lo)?;
@@ -1747,7 +1851,8 @@ impl Compiler {
         match op {
             UnOp::Neg => {
                 self.compile_expr(b, e)?;
-                b.emit(Op::Negate, 0);
+                let idx = b.emit(Op::Negate, 0);
+                self.record_span(idx);
             }
             UnOp::Not => {
                 self.compile_condition(b, e)?;
@@ -1756,12 +1861,14 @@ impl Compiler {
             UnOp::Invert => {
                 b.emit(Op::LoadInt(unop::INVERT), 0);
                 self.compile_expr(b, e)?;
-                b.emit(Op::CallBuiltin(ops::UNARY, 2), 0);
+                let idx = b.emit(Op::CallBuiltin(ops::UNARY, 2), 0);
+                self.record_span(idx);
             }
             UnOp::Pos => {
                 b.emit(Op::LoadInt(unop::POS), 0);
                 self.compile_expr(b, e)?;
-                b.emit(Op::CallBuiltin(ops::UNARY, 2), 0);
+                let idx = b.emit(Op::CallBuiltin(ops::UNARY, 2), 0);
+                self.record_span(idx);
             }
         }
         Ok(())
@@ -1779,19 +1886,22 @@ impl Compiler {
             BinOp::Add => {
                 self.compile_expr(b, l)?;
                 self.compile_expr(b, r)?;
-                b.emit(Op::Add, self.cur_line);
+                let idx = b.emit(Op::Add, self.cur_line);
+                self.record_span(idx);
                 return Ok(());
             }
             BinOp::Sub => {
                 self.compile_expr(b, l)?;
                 self.compile_expr(b, r)?;
-                b.emit(Op::Sub, self.cur_line);
+                let idx = b.emit(Op::Sub, self.cur_line);
+                self.record_span(idx);
                 return Ok(());
             }
             BinOp::Mul => {
                 self.compile_expr(b, l)?;
                 self.compile_expr(b, r)?;
-                b.emit(Op::Mul, self.cur_line);
+                let idx = b.emit(Op::Mul, self.cur_line);
+                self.record_span(idx);
                 return Ok(());
             }
             BinOp::Div => bop::DIV,
@@ -1808,7 +1918,8 @@ impl Compiler {
         b.emit(Op::LoadInt(tag), 0);
         self.compile_expr(b, l)?;
         self.compile_expr(b, r)?;
-        b.emit(Op::CallBuiltin(ops::BINOP, 3), self.cur_line);
+        let idx = b.emit(Op::CallBuiltin(ops::BINOP, 3), self.cur_line);
+        self.record_span(idx);
         Ok(())
     }
 
@@ -1861,32 +1972,38 @@ impl Compiler {
             CmpOp::Eq => {
                 self.compile_expr(b, left)?;
                 self.compile_expr(b, rhs)?;
-                b.emit(Op::NumEq, 0);
+                let idx = b.emit(Op::NumEq, self.cur_line);
+                self.record_span(idx);
             }
             CmpOp::Ne => {
                 self.compile_expr(b, left)?;
                 self.compile_expr(b, rhs)?;
-                b.emit(Op::NumNe, 0);
+                let idx = b.emit(Op::NumNe, self.cur_line);
+                self.record_span(idx);
             }
             CmpOp::Lt => {
                 self.compile_expr(b, left)?;
                 self.compile_expr(b, rhs)?;
-                b.emit(Op::NumLt, 0);
+                let idx = b.emit(Op::NumLt, self.cur_line);
+                self.record_span(idx);
             }
             CmpOp::Le => {
                 self.compile_expr(b, left)?;
                 self.compile_expr(b, rhs)?;
-                b.emit(Op::NumLe, 0);
+                let idx = b.emit(Op::NumLe, self.cur_line);
+                self.record_span(idx);
             }
             CmpOp::Gt => {
                 self.compile_expr(b, left)?;
                 self.compile_expr(b, rhs)?;
-                b.emit(Op::NumGt, 0);
+                let idx = b.emit(Op::NumGt, self.cur_line);
+                self.record_span(idx);
             }
             CmpOp::Ge => {
                 self.compile_expr(b, left)?;
                 self.compile_expr(b, rhs)?;
-                b.emit(Op::NumGe, 0);
+                let idx = b.emit(Op::NumGe, self.cur_line);
+                self.record_span(idx);
             }
             CmpOp::Is => {
                 if let Some(t) = const_literal_type(left).or_else(|| const_literal_type(rhs)) {
@@ -1948,19 +2065,24 @@ impl Compiler {
             b.emit(Op::CallBuiltin(ops::MKDICT, argc(named.len() * 2)?), 0);
             Ok(())
         };
-        match func {
+        // The call's own span (set by the enclosing `Spanned` peel) is recorded
+        // against whichever CALL op is emitted, so a call that raises underlines
+        // `func(...)` with the CPython `~~~^^^` bracket anchor. `func` is peeled
+        // so the parser's span wrapper does not defeat the method-call fast path.
+        let span_idx;
+        match func.unspanned() {
             Expr::Attribute(recv, attr) => {
                 self.compile_expr(b, recv)?;
                 self.name_const(b, attr);
                 self.compile_seq(b, args)?;
                 if named.is_empty() {
-                    b.emit(
+                    span_idx = b.emit(
                         Op::CallBuiltin(ops::CALL_METHOD, argc(2 + args.len())?),
                         self.cur_line,
                     );
                 } else {
                     build_kw(self, b)?;
-                    b.emit(
+                    span_idx = b.emit(
                         Op::CallBuiltin(ops::CALL_METHOD_KW, argc(3 + args.len())?),
                         self.cur_line,
                     );
@@ -1970,13 +2092,13 @@ impl Compiler {
                 self.name_const(b, n);
                 self.compile_seq(b, args)?;
                 if named.is_empty() {
-                    b.emit(
+                    span_idx = b.emit(
                         Op::CallBuiltin(ops::CALL, argc(1 + args.len())?),
                         self.cur_line,
                     );
                 } else {
                     build_kw(self, b)?;
-                    b.emit(
+                    span_idx = b.emit(
                         Op::CallBuiltin(ops::CALL_KW, argc(2 + args.len())?),
                         self.cur_line,
                     );
@@ -1986,19 +2108,20 @@ impl Compiler {
                 self.compile_expr(b, func)?;
                 self.compile_seq(b, args)?;
                 if named.is_empty() {
-                    b.emit(
+                    span_idx = b.emit(
                         Op::CallBuiltin(ops::CALL_VALUE, argc(1 + args.len())?),
                         self.cur_line,
                     );
                 } else {
                     build_kw(self, b)?;
-                    b.emit(
+                    span_idx = b.emit(
                         Op::CallBuiltin(ops::CALL_VALUE_KW, argc(2 + args.len())?),
                         self.cur_line,
                     );
                 }
             }
         }
+        self.record_span(span_idx);
         Ok(())
     }
 
@@ -2046,7 +2169,7 @@ impl Compiler {
         args: &[Expr],
         keywords: &[Keyword],
     ) -> Result<(), String> {
-        match func {
+        match func.unspanned() {
             Expr::Attribute(recv, attr) => {
                 self.compile_expr(b, recv)?;
                 self.name_const(b, attr);
@@ -2530,6 +2653,7 @@ fn bind_pattern_name(name: &str, bound: &mut Vec<String>) -> Result<(), String> 
 
 /// CPython-style repr of a mapping-pattern key for the duplicate-key error.
 fn pattern_key_repr(e: &Expr) -> String {
+    let e = e.unspanned();
     match e {
         Expr::Str(s) => format!("'{s}'"),
         Expr::Int(n) => n.to_string(),
@@ -2580,6 +2704,7 @@ fn wrap_comp_clauses(mut inner: Vec<Stmt>, comps: &[Comprehension]) -> Vec<Stmt>
 /// on `x is <literal>`. `None` for names, containers CPython doesn't fold
 /// (`list`/`dict`/`set`), and the singletons (`None`/`True`/`False`).
 fn const_literal_type(e: &Expr) -> Option<&'static str> {
+    let e = e.unspanned();
     match e {
         Expr::Int(_) | Expr::BigInt(_) => Some("int"),
         Expr::Float(_) => Some("float"),
@@ -2597,6 +2722,7 @@ fn const_literal_type(e: &Expr) -> Option<&'static str> {
 /// `bytes`) whose subscription CPython can type-check at compile time; `None`
 /// otherwise (a `dict` allows float keys, a `name`/call has unknown type).
 fn literal_container_type(e: &Expr) -> Option<&'static str> {
+    let e = e.unspanned();
     match e {
         Expr::List(_) => Some("list"),
         Expr::Tuple(_) => Some("tuple"),
@@ -2609,6 +2735,7 @@ fn literal_container_type(e: &Expr) -> Option<&'static str> {
 /// The type name of a `float`/`complex` literal index (which can't index a
 /// sequence), else `None`.
 fn float_index_type(e: &Expr) -> Option<&'static str> {
+    let e = e.unspanned();
     match e {
         Expr::Float(_) => Some("float"),
         Expr::Complex(_) => Some("complex"),
@@ -2621,10 +2748,7 @@ fn float_index_type(e: &Expr) -> Option<&'static str> {
 fn is_ann_assign(s: &Stmt) -> bool {
     matches!(
         &s.kind,
-        StmtKind::AnnAssign {
-            target: Expr::Name(_),
-            ..
-        }
+        StmtKind::AnnAssign { target, .. } if matches!(target.unspanned(), Expr::Name(_))
     )
 }
 
@@ -2669,6 +2793,7 @@ fn scope_locals(body: &[Stmt]) -> Vec<String> {
 /// Add every simple-name binding target in `e` (a `Name`, or the names nested in
 /// tuple/list/starred unpacking). Attribute/subscript targets bind no local name.
 fn bind_target(e: &Expr, out: &mut HashSet<String>) {
+    let e = e.unspanned();
     match e {
         Expr::Name(n) => {
             out.insert(n.clone());
@@ -2861,9 +2986,10 @@ fn collect_scope_decls_stmt(s: &Stmt, g: &mut HashSet<String>, nl: &mut HashSet<
 /// whose walrus (`:=`) targets leak to the enclosing function scope (PEP 572) —
 /// while still stopping at a nested `def`/lambda, which owns its walrus targets.
 fn collect_leaked_walrus(e: &Expr, out: &mut HashSet<String>) {
+    let e = e.unspanned();
     match e {
         Expr::NamedExpr(target, value) => {
-            if let Expr::Name(n) = &**target {
+            if let Expr::Name(n) = target.unspanned() {
                 out.insert(n.clone());
             }
             collect_leaked_walrus(value, out);
@@ -2953,9 +3079,10 @@ fn collect_leaked_walrus(e: &Expr, out: &mut HashSet<String>) {
 /// descending into a nested scope (lambda / comprehension / genexpr), whose
 /// walrus targets belong to that inner scope.
 fn collect_walrus_targets(e: &Expr, out: &mut Vec<String>) {
+    let e = e.unspanned();
     match e {
         Expr::NamedExpr(target, value) => {
-            if let Expr::Name(n) = &**target {
+            if let Expr::Name(n) = target.unspanned() {
                 if !out.contains(n) {
                     out.push(n.clone());
                 }
@@ -3066,7 +3193,7 @@ fn stmt_has_yield(s: &Stmt) -> bool {
 }
 
 fn expr_has_yield(e: &Expr) -> bool {
-    matches!(e, Expr::Yield(_) | Expr::YieldFrom(_))
+    matches!(e.unspanned(), Expr::Yield(_) | Expr::YieldFrom(_))
 }
 
 /// Collect the `(line, keyword)` of every `return`/`break`/`continue` that would

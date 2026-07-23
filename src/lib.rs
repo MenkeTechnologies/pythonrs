@@ -56,6 +56,13 @@ pub fn compile_interactive(src: &str) -> Result<compiler::Program, String> {
 /// chunk to run. Shared by the initial script run, each REPL line, and imports.
 pub fn load_merged(mut prog: compiler::Program) -> fusevm::Chunk {
     let (func_off, try_off) = host::with_host(|h| h.program_offsets());
+    // Register traceback-caret position tables before rebasing. Keys are the
+    // pre-rebase `op_hash`, which `rebase_program` leaves untouched (it mutates
+    // ops but not the stored hash), so runtime lookups by `vm.chunk.op_hash`
+    // still match. Covers both fresh compiles and cache hits.
+    for (op_hash, table) in &prog.positions {
+        host::register_positions(*op_hash, table.clone());
+    }
     compiler::rebase_program(&mut prog, func_off, try_off);
     let compiler::Program {
         main,
@@ -63,6 +70,7 @@ pub fn load_merged(mut prog: compiler::Program) -> fusevm::Chunk {
         procs: _,
         tries,
         warnings: _,
+        positions: _,
     } = prog;
     let funcs: Vec<host::FuncDef> = functions.into_iter().map(|(_, f)| f).collect();
     host::with_host(|h| h.load_program(funcs, tries));

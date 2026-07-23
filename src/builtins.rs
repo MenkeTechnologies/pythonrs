@@ -108,11 +108,14 @@ fn sval(v: &Value) -> String {
 /// Record the source line of the op that is aborting the chunk into the current
 /// frame, so an uncaught exception's traceback can name it. The dispatch loop
 /// pre-increments `ip`, so the failing op sits at `ip - 1`.
-fn record_err_line(vm: &VM) {
+pub(crate) fn record_err_line(vm: &VM) {
     let idx = vm.ip.saturating_sub(1);
     if let Some(&line) = vm.chunk.lines.get(idx) {
         if line != 0 {
-            with_host(|h| h.set_cur_line(line));
+            // Look the failing op's caret span up in the position table registered
+            // for this chunk (keyed by its `op_hash`); `Span::NONE` if none.
+            let span = crate::host::lookup_position(vm.chunk.op_hash, idx);
+            with_host(|h| h.set_cur_line_span(line, span));
         }
     }
 }

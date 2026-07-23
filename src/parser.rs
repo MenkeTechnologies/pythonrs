@@ -34,6 +34,24 @@ struct Parser {
     pos: usize,
 }
 
+/// Wrap a caret-bearing expression with its source span. `anchor_start ==
+/// anchor_end` means no sub-anchor (the whole span renders `^`); otherwise
+/// `[anchor_start, anchor_end)` is the operator/bracket region (`^`) and the
+/// rest of the span renders `~` — CPython's `~^~` / `~~~^^^` traceback carets.
+fn spanned(e: Expr, line: u32, start: u32, end: u32, anchor_start: u32, anchor_end: u32) -> Expr {
+    Expr::Spanned(
+        Box::new(e),
+        Span {
+            line,
+            start,
+            end,
+            anchor_start,
+            anchor_end,
+            suppress: false,
+        },
+    )
+}
+
 impl Parser {
     // ── cursor ────────────────────────────────────────────────────────────
     fn cur(&self) -> &Tok {
@@ -41,6 +59,19 @@ impl Parser {
     }
     fn line(&self) -> u32 {
         self.toks[self.pos].line
+    }
+    /// 0-based character column where the current token starts (for carets).
+    fn col(&self) -> u32 {
+        self.toks[self.pos].col
+    }
+    /// End column (exclusive) of the current token.
+    fn cur_end_col(&self) -> u32 {
+        self.toks[self.pos].end_col
+    }
+    /// End column (exclusive) of the just-consumed token — the end of the
+    /// expression whose last token sits at `pos - 1`.
+    fn prev_end_col(&self) -> u32 {
+        self.toks[self.pos.saturating_sub(1)].end_col
     }
     fn advance(&mut self) -> Tok {
         let t = self.toks[self.pos].tok.clone();
@@ -1177,6 +1208,7 @@ impl Parser {
     }
 
     fn parse_comparison(&mut self) -> Result<Expr, String> {
+        let (sl, sc) = (self.line(), self.col());
         let left = self.parse_bitor()?;
         let mut ops = Vec::new();
         loop {
@@ -1223,35 +1255,49 @@ impl Parser {
         if ops.is_empty() {
             Ok(left)
         } else {
-            Ok(Expr::Compare(Box::new(left), ops))
+            // CPython underlines a comparison with a plain `^` span (no `~^~`
+            // operator anchor), so a bare `a < b` that spans the whole line is
+            // hidden and `x = a < b` shows `^^^^^`.
+            let end = self.prev_end_col();
+            Ok(spanned(Expr::Compare(Box::new(left), ops), sl, sc, end, 0, 0))
         }
     }
 
     fn parse_bitor(&mut self) -> Result<Expr, String> {
+        let (sl, sc) = (self.line(), self.col());
         let mut e = self.parse_bitxor()?;
         while self.at_op("|") {
+            let (opc, ope) = (self.col(), self.cur_end_col());
             self.advance();
-            e = Expr::BinOp(BinOp::BitOr, Box::new(e), Box::new(self.parse_bitxor()?));
+            let e2 = Expr::BinOp(BinOp::BitOr, Box::new(e), Box::new(self.parse_bitxor()?));
+            e = spanned(e2, sl, sc, self.prev_end_col(), opc, ope);
         }
         Ok(e)
     }
     fn parse_bitxor(&mut self) -> Result<Expr, String> {
+        let (sl, sc) = (self.line(), self.col());
         let mut e = self.parse_bitand()?;
         while self.at_op("^") {
+            let (opc, ope) = (self.col(), self.cur_end_col());
             self.advance();
-            e = Expr::BinOp(BinOp::BitXor, Box::new(e), Box::new(self.parse_bitand()?));
+            let e2 = Expr::BinOp(BinOp::BitXor, Box::new(e), Box::new(self.parse_bitand()?));
+            e = spanned(e2, sl, sc, self.prev_end_col(), opc, ope);
         }
         Ok(e)
     }
     fn parse_bitand(&mut self) -> Result<Expr, String> {
+        let (sl, sc) = (self.line(), self.col());
         let mut e = self.parse_shift()?;
         while self.at_op("&") {
+            let (opc, ope) = (self.col(), self.cur_end_col());
             self.advance();
-            e = Expr::BinOp(BinOp::BitAnd, Box::new(e), Box::new(self.parse_shift()?));
+            let e2 = Expr::BinOp(BinOp::BitAnd, Box::new(e), Box::new(self.parse_shift()?));
+            e = spanned(e2, sl, sc, self.prev_end_col(), opc, ope);
         }
         Ok(e)
     }
     fn parse_shift(&mut self) -> Result<Expr, String> {
+        let (sl, sc) = (self.line(), self.col());
         let mut e = self.parse_arith()?;
         loop {
             let op = if self.at_op("<<") {
@@ -1261,12 +1307,15 @@ impl Parser {
             } else {
                 break;
             };
+            let (opc, ope) = (self.col(), self.cur_end_col());
             self.advance();
-            e = Expr::BinOp(op, Box::new(e), Box::new(self.parse_arith()?));
+            let e2 = Expr::BinOp(op, Box::new(e), Box::new(self.parse_arith()?));
+            e = spanned(e2, sl, sc, self.prev_end_col(), opc, ope);
         }
         Ok(e)
     }
     fn parse_arith(&mut self) -> Result<Expr, String> {
+        let (sl, sc) = (self.line(), self.col());
         let mut e = self.parse_term()?;
         loop {
             let op = if self.at_op("+") {
@@ -1276,12 +1325,16 @@ impl Parser {
             } else {
                 break;
             };
+            let ( opc, ope) = (self.col(), self.cur_end_col());
             self.advance();
-            e = Expr::BinOp(op, Box::new(e), Box::new(self.parse_term()?));
+            let e2 = Expr::BinOp(op, Box::new(e), Box::new(self.parse_term()?));
+            let end = self.prev_end_col();
+            e = spanned(e2, sl, sc, end, opc, ope);
         }
         Ok(e)
     }
     fn parse_term(&mut self) -> Result<Expr, String> {
+        let (sl, sc) = (self.line(), self.col());
         let mut e = self.parse_unary()?;
         loop {
             let op = if self.at_op("*") {
@@ -1297,32 +1350,56 @@ impl Parser {
             } else {
                 break;
             };
+            let (opc, ope) = (self.col(), self.cur_end_col());
             self.advance();
-            e = Expr::BinOp(op, Box::new(e), Box::new(self.parse_unary()?));
+            let e2 = Expr::BinOp(op, Box::new(e), Box::new(self.parse_unary()?));
+            let end = self.prev_end_col();
+            e = spanned(e2, sl, sc, end, opc, ope);
         }
         Ok(e)
     }
     fn parse_unary(&mut self) -> Result<Expr, String> {
+        let (sl, sc) = (self.line(), self.col());
+        let unary = |p: &mut Self, op: UnOp| -> Result<Expr, String> {
+            p.advance();
+            let operand = p.parse_unary()?;
+            let end = p.prev_end_col();
+            Ok(spanned(
+                Expr::UnaryOp(op, Box::new(operand)),
+                sl,
+                sc,
+                end,
+                0,
+                0,
+            ))
+        };
         if self.at_op("-") {
-            self.advance();
-            return Ok(Expr::UnaryOp(UnOp::Neg, Box::new(self.parse_unary()?)));
+            return unary(self, UnOp::Neg);
         }
         if self.at_op("+") {
-            self.advance();
-            return Ok(Expr::UnaryOp(UnOp::Pos, Box::new(self.parse_unary()?)));
+            return unary(self, UnOp::Pos);
         }
         if self.at_op("~") {
-            self.advance();
-            return Ok(Expr::UnaryOp(UnOp::Invert, Box::new(self.parse_unary()?)));
+            return unary(self, UnOp::Invert);
         }
         self.parse_power()
     }
     fn parse_power(&mut self) -> Result<Expr, String> {
+        let (sl, sc) = (self.line(), self.col());
         let base = self.parse_await_postfix()?;
         if self.at_op("**") {
+            let (opc, ope) = (self.col(), self.cur_end_col());
             self.advance();
             let exp = self.parse_unary()?; // right-assoc, binds unary on the right
-            return Ok(Expr::BinOp(BinOp::Pow, Box::new(base), Box::new(exp)));
+            let end = self.prev_end_col();
+            return Ok(spanned(
+                Expr::BinOp(BinOp::Pow, Box::new(base), Box::new(exp)),
+                sl,
+                sc,
+                end,
+                opc,
+                ope,
+            ));
         }
         Ok(base)
     }
@@ -1332,17 +1409,43 @@ impl Parser {
             let e = self.parse_await_postfix()?;
             return Ok(Expr::Await(Box::new(e)));
         }
+        // Span of the whole postfix chain starts at the value's first token; each
+        // trailer wraps its result so a call/subscript/attribute that raises
+        // underlines from here to its closing bracket / attribute name.
+        let (start_line, start_col) = (self.line(), self.col());
         let mut e = self.parse_atom()?;
         loop {
             if self.at_op("(") {
+                // Anchor the call's `(...)` bracket region for the `~~~^^^` caret.
+                let paren_col = self.col();
                 e = self.parse_call(e)?;
-            } else if self.eat_op("[") {
+                let end = self.prev_end_col();
+                e = spanned(e, start_line, start_col, end, paren_col, end);
+            } else if self.at_op("[") {
+                let bracket_col = self.col();
+                self.advance();
                 let sub = self.parse_subscript()?;
                 self.expect_op("]")?;
-                e = Expr::Subscript(Box::new(e), Box::new(sub));
+                let end = self.prev_end_col();
+                e = spanned(
+                    Expr::Subscript(Box::new(e), Box::new(sub)),
+                    start_line,
+                    start_col,
+                    end,
+                    bracket_col,
+                    end,
+                );
             } else if self.eat_op(".") {
                 let attr = self.expect_name()?;
-                e = Expr::Attribute(Box::new(e), attr);
+                let end = self.prev_end_col();
+                e = spanned(
+                    Expr::Attribute(Box::new(e), attr),
+                    start_line,
+                    start_col,
+                    end,
+                    0,
+                    0,
+                );
             } else {
                 break;
             }
@@ -1459,6 +1562,7 @@ impl Parser {
             }
             Tok::Str(_) | Tok::FString(_, _) | Tok::Bytes(_) => self.parse_string_group(),
             Tok::Name(n) => {
+                let (nl, nc, ne) = (self.line(), self.col(), self.cur_end_col());
                 self.advance();
                 match n.as_str() {
                     "None" => Ok(Expr::None),
@@ -1483,7 +1587,9 @@ impl Parser {
                     _ if is_keyword(&n) => Err(format!(
                         "SyntaxError: unexpected keyword '{n}' (line {line})"
                     )),
-                    _ => Ok(Expr::Name(n)),
+                    // A bare name load carries its span so an undefined-name
+                    // traceback underlines exactly the name.
+                    _ => Ok(spanned(Expr::Name(n), nl, nc, ne, 0, 0)),
                 }
             }
             Tok::Op(o) => match o.as_str() {
