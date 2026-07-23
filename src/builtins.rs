@@ -4414,6 +4414,12 @@ pub fn py_len(v: &Value) -> Result<usize, String> {
         Some(PyObj::Range { start, stop, step }) => {
             Ok(host::range_len(*start, *stop, *step).max(0) as usize)
         }
+        Some(PyObj::BigRange { start, stop, step }) => {
+            use num_traits::ToPrimitive;
+            host::big_range_len(start, stop, step).to_usize().ok_or_else(|| {
+                "OverflowError: cannot fit 'int' into an index-sized integer".to_string()
+            })
+        }
         #[cfg(feature = "stdlib-ffi")]
         Some(PyObj::Foreign(id)) => crate::ffi::len(*id),
         _ => Err(host::type_error(&format!(
@@ -4433,23 +4439,40 @@ pub fn py_len(v: &Value) -> Result<usize, String> {
 }
 
 fn make_range(args: &[Value]) -> Result<Value, String> {
-    let ints: Vec<i64> = args
+    if !matches!(args.len(), 1..=3) {
+        return Err(host::type_error("range expected 1 to 3 arguments"));
+    }
+    // Fast path: every argument fits `i64`.
+    let small: Option<Vec<i64>> = args.iter().map(|v| with_host(|h| h.as_int(v))).collect();
+    if let Some(ints) = small {
+        let (start, stop, step) = match ints.len() {
+            1 => (0, ints[0], 1),
+            2 => (ints[0], ints[1], 1),
+            _ => (ints[0], ints[1], ints[2]),
+        };
+        if step == 0 {
+            return Err("ValueError: range() arg 3 must not be zero".into());
+        }
+        return Ok(with_host(|h| h.alloc(PyObj::Range { start, stop, step })));
+    }
+    // A bound overflows `i64`: promote to a bignum range (`range(1 << 1000)`).
+    let bigs: Vec<num_bigint::BigInt> = args
         .iter()
         .map(|v| {
-            with_host(|h| h.as_int(v))
+            with_host(|h| h.big_val(v))
                 .ok_or_else(|| host::type_error("'range' requires integer arguments"))
         })
         .collect::<Result<_, _>>()?;
-    let (start, stop, step) = match ints.len() {
-        1 => (0, ints[0], 1),
-        2 => (ints[0], ints[1], 1),
-        3 => (ints[0], ints[1], ints[2]),
-        _ => return Err(host::type_error("range expected 1 to 3 arguments")),
+    use num_traits::{One, Zero};
+    let (start, stop, step) = match bigs.len() {
+        1 => (num_bigint::BigInt::zero(), bigs[0].clone(), num_bigint::BigInt::one()),
+        2 => (bigs[0].clone(), bigs[1].clone(), num_bigint::BigInt::one()),
+        _ => (bigs[0].clone(), bigs[1].clone(), bigs[2].clone()),
     };
-    if step == 0 {
+    if step.is_zero() {
         return Err("ValueError: range() arg 3 must not be zero".into());
     }
-    Ok(with_host(|h| h.alloc(PyObj::Range { start, stop, step })))
+    Ok(with_host(|h| h.alloc(PyObj::BigRange { start, stop, step })))
 }
 
 fn reduce_minmax(
@@ -4971,6 +4994,15 @@ fn call_sys(name: &str, args: Vec<Value>) -> Result<Value, String> {
         }
         "getrecursionlimit" => Ok(Value::Int(1000)),
         "setrecursionlimit" => Ok(Value::Undef),
+        // `sys._getframe([depth])` — the frame `depth` levels up from the caller.
+        "_getframe" => {
+            let depth = args
+                .first()
+                .and_then(|v| with_host(|h| h.as_int(v)))
+                .unwrap_or(0)
+                .max(0) as usize;
+            Ok(with_host(|h| h.current_frame_object(depth)))
+        }
         _ => Err(format!(
             "AttributeError: module 'sys' has no attribute '{name}'"
         )),

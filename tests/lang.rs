@@ -207,6 +207,25 @@ fn function_docstring_is_dunder_doc() {
 }
 
 #[test]
+fn bignum_range() {
+    // A range whose bounds exceed i64 works fully (list/index/contains/len/bool/
+    // repr/iter), matching CPython.
+    assert_eq!(
+        g("x = list(range(10**20, 10**20 + 4))", "x"),
+        "[100000000000000000000, 100000000000000000001, \
+          100000000000000000002, 100000000000000000003]",
+    );
+    assert_eq!(g("x = range(10**20, 10**20 + 5)[2]", "x"), "100000000000000000002");
+    assert_eq!(g("x = range(10**20, 10**20 + 5)[-1]", "x"), "100000000000000000004");
+    assert_eq!(g("x = 10**20 + 3 in range(10**20, 10**20 + 5)", "x"), "True");
+    assert_eq!(g("x = len(range(10**20, 10**20 + 7))", "x"), "7");
+    assert_eq!(g("x = bool(range(5, 5))", "x"), "False");
+    assert_eq!(g("x = range(10**30)", "x"), "range(0, 1000000000000000000000000000000)");
+    // The type-extraction case from _collections_abc: range(1<<1000) is iterable.
+    assert_eq!(g("x = type(iter(range(1 << 1000))).__name__", "x"), "'iterator'");
+}
+
+#[test]
 fn arithmetic_and_precedence() {
     assert_eq!(g("x = 2 + 3 * 4 - 1", "x"), "13");
     assert_eq!(g("x = 7 // 2", "x"), "3");

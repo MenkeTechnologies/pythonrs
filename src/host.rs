@@ -407,6 +407,13 @@ pub enum PyObj {
         stop: i64,
         step: i64,
     },
+    /// A `range` whose bounds do not fit `i64` (`range(1 << 1000)`). Kept separate
+    /// so the common i64 `Range` stays a cheap scalar; all operations use bignum.
+    BigRange {
+        start: num_bigint::BigInt,
+        stop: num_bigint::BigInt,
+        step: num_bigint::BigInt,
+    },
     Slice {
         lo: Value,
         hi: Value,
@@ -723,6 +730,11 @@ pub enum AttrDel {
 pub enum IterState {
     Seq { items: Vec<Value>, idx: usize },
     RangeIter { cur: i64, stop: i64, step: i64 },
+    BigRangeIter {
+        cur: num_bigint::BigInt,
+        stop: num_bigint::BigInt,
+        step: num_bigint::BigInt,
+    },
     DictKeys { keys: Vec<Value>, idx: usize },
 }
 
@@ -2415,7 +2427,7 @@ impl PyHost {
                     1 => "dict_values".into(),
                     _ => "dict_items".into(),
                 },
-                Some(PyObj::Range { .. }) => "range".into(),
+                Some(PyObj::Range { .. }) | Some(PyObj::BigRange { .. }) => "range".into(),
                 Some(PyObj::Slice { .. }) => "slice".into(),
                 Some(PyObj::Func(_)) => "function".into(),
                 // A builtin type/exception constructor (`int`, `ValueError`) is a
@@ -2513,6 +2525,10 @@ impl PyHost {
                     matches!(self.get(dict), Some(PyObj::Dict(d)) if !d.is_empty())
                 }
                 Some(PyObj::Range { start, stop, step }) => range_len(*start, *stop, *step) != 0,
+                Some(PyObj::BigRange { start, stop, step }) => {
+                    use num_traits::Zero;
+                    !big_range_len(start, stop, step).is_zero()
+                }
                 Some(PyObj::BigInt(b)) => *b != num_bigint::BigInt::from(0),
                 Some(PyObj::Complex(r, i)) => *r != 0.0 || *i != 0.0,
                 Some(PyObj::Instance(_)) => true, // __bool__/__len__ handled by caller
@@ -2667,6 +2683,14 @@ impl PyHost {
                 Some(PyObj::Module { name, .. }) => format!("<module '{name}'>"),
                 Some(PyObj::Range { start, stop, step }) => {
                     if *step == 1 {
+                        format!("range({start}, {stop})")
+                    } else {
+                        format!("range({start}, {stop}, {step})")
+                    }
+                }
+                Some(PyObj::BigRange { start, stop, step }) => {
+                    use num_traits::One;
+                    if step.is_one() {
                         format!("range({start}, {stop})")
                     } else {
                         format!("range({start}, {stop}, {step})")
@@ -3984,6 +4008,28 @@ pub fn range_len(start: i64, stop: i64, step: i64) -> i64 {
         (start - stop - step - 1) / (-step)
     } else {
         0
+    }
+}
+
+/// Number of elements in a bignum `range(start, stop, step)`.
+pub fn big_range_len(
+    start: &num_bigint::BigInt,
+    stop: &num_bigint::BigInt,
+    step: &num_bigint::BigInt,
+) -> num_bigint::BigInt {
+    use num_bigint::BigInt;
+    use num_traits::{One, Zero};
+    let zero = BigInt::zero();
+    if *step > zero {
+        if stop > start {
+            (stop - start + step - BigInt::one()) / step
+        } else {
+            zero
+        }
+    } else if start > stop {
+        (start - stop - step - BigInt::one()) / (-step)
+    } else {
+        zero
     }
 }
 
@@ -5478,6 +5524,18 @@ impl PyHost {
                 }
                 Ok(Value::Int(start + k * step))
             }
+            Some(PyObj::BigRange { start, stop, step }) => {
+                let (start, stop, step) = (start.clone(), stop.clone(), step.clone());
+                let len = big_range_len(&start, &stop, &step);
+                let i = self
+                    .big_val(idx)
+                    .ok_or_else(|| type_error("range indices must be integers"))?;
+                let k = if i < num_bigint::BigInt::from(0) { &i + &len } else { i };
+                if k < num_bigint::BigInt::from(0) || k >= len {
+                    return Err("IndexError: range object index out of range".into());
+                }
+                Ok(self.norm_big(start + k * step))
+            }
             Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) => {
                 // `bytes` reports the bare message; `bytearray` names the type.
                 let is_ba = matches!(self.get(recv), Some(PyObj::Bytearray(_)));
@@ -6038,6 +6096,22 @@ impl PyHost {
                 }
                 Ok(out)
             }
+            Some(PyObj::BigRange { start, stop, step }) => {
+                use num_traits::Zero;
+                let (stop, step) = (stop.clone(), step.clone());
+                let pos = step > num_bigint::BigInt::zero();
+                let mut out = Vec::new();
+                let mut c = start.clone();
+                loop {
+                    let go = if pos { c < stop } else { c > stop };
+                    if !go {
+                        break;
+                    }
+                    out.push(self.norm_big(c.clone()));
+                    c += &step;
+                }
+                Ok(out)
+            }
             Some(PyObj::Iter(_)) => {
                 let mut out = Vec::new();
                 while let Some(x) = self.iter_next(v)? {
@@ -6094,6 +6168,11 @@ impl PyHost {
                 stop: *stop,
                 step: *step,
             },
+            Some(PyObj::BigRange { start, stop, step }) => IterState::BigRangeIter {
+                cur: start.clone(),
+                stop: stop.clone(),
+                step: step.clone(),
+            },
             Some(PyObj::Iter(_))
             | Some(PyObj::Generator { .. })
             | Some(PyObj::Zip { .. })
@@ -6114,6 +6193,25 @@ impl PyHost {
         #[cfg(feature = "stdlib-ffi")]
         if let Some(id) = self.foreign_id(it) {
             return crate::ffi::iter_next(self, id);
+        }
+        // Bignum range iterator: clone the state out (releasing the borrow),
+        // advance, write back, then normalize the yielded value — `norm_big`
+        // needs `&mut self`, so it cannot run inside the `get_mut` match below.
+        if let Some(PyObj::Iter(IterState::BigRangeIter { cur, stop, step })) = self.get(it) {
+            use num_traits::Zero;
+            let (cur, stop, step) = (cur.clone(), stop.clone(), step.clone());
+            let go = if step > num_bigint::BigInt::zero() {
+                cur < stop
+            } else {
+                cur > stop
+            };
+            if !go {
+                return Ok(None);
+            }
+            if let Some(PyObj::Iter(IterState::BigRangeIter { cur: c, .. })) = self.get_mut(it) {
+                *c = &cur + &step;
+            }
+            return Ok(Some(self.norm_big(cur)));
         }
         let out = match self.get_mut(it) {
             Some(PyObj::Iter(IterState::Seq { items, idx })) => {
@@ -9606,6 +9704,18 @@ pub fn take_agen_op(gen: &Value) -> Option<AGenOp> {
 /// never `await`ed, `create_task`'d, or run. Called at program end (best-effort;
 /// CPython emits at GC time, we emit once at teardown).
 impl PyHost {
+    /// A frame object for `sys._getframe(depth)` — `depth` levels up from the
+    /// caller. Minimal (scope name + current line); `f_globals` is live.
+    pub fn current_frame_object(&mut self, depth: usize) -> Value {
+        let idx = self.frames.len().saturating_sub(1 + depth);
+        let (name, lineno) = self
+            .frames
+            .get(idx)
+            .map(|f| (f.name.clone(), f.line))
+            .unwrap_or_else(|| ("<module>".to_string(), 0));
+        self.alloc(PyObj::PyFrame { name, lineno })
+    }
+
     /// If `gen` is an un-started generator/coroutine, mark it closed without
     /// running its body and return true (CPython's `close()` on an un-started
     /// coroutine; also clears the "never awaited" warning). False otherwise.
@@ -10546,6 +10656,7 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                     "setrecursionlimit",
                     h.alloc(PyObj::Builtin("sys.setrecursionlimit".into())),
                 ),
+                ("_getframe", h.alloc(PyObj::Builtin("sys._getframe".into()))),
             ]
         }),
         "asyncio" => with_host(|h| {
