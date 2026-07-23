@@ -2924,6 +2924,10 @@ const BUILTIN_FUNCS: &[&str] = &[
     "exit",
     "quit",
     "slice",
+    "eval",
+    "exec",
+    "globals",
+    "locals",
 ];
 
 // ── builtin functions ────────────────────────────────────────────────────────
@@ -3842,6 +3846,23 @@ pub fn call_builtin_function(
             let items: Vec<Value> = names.into_iter().map(|n| h.new_str(n)).collect();
             h.new_list(items)
         })),
+        // `globals()` / `locals()` as a dict. A snapshot (not a live view): reads
+        // and passing to `eval`/`exec` work; in-place mutation is not reflected
+        // back into the namespace. `locals()` at module scope is `globals()`.
+        "globals" => Ok(str_keyed_dict(with_host(|h| h.globals_pairs()))),
+        "locals" => Ok(str_keyed_dict(with_host(|h| {
+            if h.frame_depth() > 1 {
+                h.caller_locals().into_iter().collect()
+            } else {
+                h.globals_pairs()
+            }
+        }))),
+        // `eval(expr[, globals[, locals]])` evaluates a single expression string
+        // and returns its value; `exec(code[, globals[, locals]])` runs statements
+        // and returns None. Both compile the source on the fly and re-enter the VM
+        // on the current host (so names resolve against — and assignments land in —
+        // the live module globals), exactly as the REPL runs a line.
+        "eval" | "exec" => run_pysource(name == "eval", &args),
         // Type constructors.
         "int" => {
             // Fold an `int(x, base=B)` keyword into the positional base slot.
@@ -4051,6 +4072,158 @@ fn pow_mod(a: &Value, b: &Value, m: &Value) -> Result<Value, String> {
         Some(n) => Value::Int(n),
         None => h.alloc(PyObj::BigInt(r)),
     }))
+}
+
+/// Shared implementation of `eval`/`exec`. `want_value` is true for `eval` (the
+/// source is a single expression whose value is returned); false for `exec`
+/// (statements, returning `None`). `args` is `[source, globals?, locals?]`.
+///
+/// The source is compiled on the fly and run by re-entering the VM on the current
+/// host — a fresh VM instance sharing the live module globals and heap (the same
+/// mechanism the REPL uses per line). With no namespace argument, names resolve
+/// against and assignments land in the real module globals. A `globals` dict
+/// replaces the module globals for the run (saved and restored afterward, with
+/// post-run bindings copied back into the dict); a `locals` dict is overlaid on
+/// top. Builtins resolve through a separate registry, so they stay available.
+fn run_pysource(want_value: bool, args: &[Value]) -> Result<Value, String> {
+    let fname = if want_value { "eval" } else { "exec" };
+    let src = match args.first() {
+        // A pre-compiled code object is unsupported (pythonrs has no code
+        // objects); a string source is required.
+        Some(v) => with_host(|h| h.as_str(v)).ok_or_else(|| {
+            host::type_error(&format!(
+                "{fname}() arg 1 must be a string, bytes or code object"
+            ))
+        })?,
+        None => {
+            return Err(host::type_error(&format!(
+                "{fname}() missing required argument: 'source' (pos 1)"
+            )))
+        }
+    };
+
+    let ns_arg = |i: usize| match args.get(i) {
+        Some(v) if !matches!(v, Value::Undef) => Some(v.clone()),
+        _ => None,
+    };
+    let globals_arg = ns_arg(1);
+    let locals_arg = ns_arg(2);
+    let explicit_ns = globals_arg.is_some() || locals_arg.is_some();
+    // With no explicit namespace, a call from inside a function runs against the
+    // module globals with the caller's locals overlaid, and its writes are
+    // DISCARDED afterward — CPython's rule that exec/eval in a function reads
+    // locals but cannot persist to them or to globals. At module scope, writes go
+    // straight to the real module globals and persist.
+    let in_function = with_host(|h| h.frame_depth() > 1);
+    let sandboxed = explicit_ns || in_function;
+
+    // `eval` requires exactly one expression. Validate the RAW (leading-whitespace
+    // stripped, as CPython does) source first, so a statement, a semicolon/newline
+    // series, or a bare newline after an operator is a SyntaxError — the wrapper's
+    // parens below would otherwise make some of those parse.
+    if want_value {
+        let stmts = crate::parser::parse(src.trim())?;
+        if stmts.len() != 1 || !matches!(stmts[0].kind, crate::ast::StmtKind::Expr(_)) {
+            return Err("SyntaxError: invalid syntax".to_string());
+        }
+    }
+    // Bind the (validated) expression to a temporary so its value can be read back.
+    // The surrounding newlines let a multi-line expression (one whose newlines sit
+    // inside its own brackets) parse and stop a trailing `# comment` from swallowing
+    // the closing paren.
+    const TMP: &str = "__pyrs_eval_result__";
+    let to_compile = if want_value {
+        format!("{TMP} = (\n{src}\n)")
+    } else {
+        src
+    };
+
+    let saved = if sandboxed {
+        let snap = with_host(|h| h.snapshot_globals());
+        let mut ns: IndexMap<String, Value> = if explicit_ns {
+            // The provided globals/locals dicts ARE the namespace.
+            IndexMap::new()
+        } else {
+            // In-function, no explicit namespace: module globals + caller locals.
+            let mut base = snap.clone();
+            for (k, v) in with_host(|h| h.caller_locals()) {
+                base.insert(k, v);
+            }
+            base
+        };
+        for d in [globals_arg.as_ref(), locals_arg.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            for (k, v) in dict_str_pairs(d)? {
+                ns.insert(k, v);
+            }
+        }
+        with_host(|h| h.replace_globals(ns));
+        Some(snap)
+    } else {
+        None
+    };
+
+    // Park any active function frames so the nested chunk runs at module scope
+    // (its globals reach the real module namespace, not the caller's locals).
+    let parked = with_host(|h| h.enter_module_scope());
+    let result = (|| -> Result<Value, String> {
+        let prog = crate::compile(&to_compile)?;
+        let chunk = crate::load_merged(prog);
+        crate::host::run_chunk_on(chunk)?;
+        Ok(if want_value {
+            with_host(|h| h.del_global(TMP)).unwrap_or(Value::Undef)
+        } else {
+            Value::Undef
+        })
+    })();
+    with_host(|h| h.restore_scope(parked));
+
+    if let Some(saved) = saved {
+        // With an explicit `globals` dict, copy the post-run namespace back into it
+        // (so `exec("x=1", d)` leaves `d["x"] == 1`). The in-function overlay case
+        // writes nothing back — its assignments are discarded. Either way, restore
+        // the interpreter's real module globals.
+        if explicit_ns {
+            if let Some(g) = &globals_arg {
+                for (k, v) in with_host(|h| h.globals_pairs()) {
+                    if k == TMP {
+                        continue;
+                    }
+                    let key = with_host(|h| h.new_str(k));
+                    with_host(|h| h.set_item(g, &key, v))?;
+                }
+            }
+        }
+        with_host(|h| h.replace_globals(saved));
+    }
+    result
+}
+
+/// Build a `dict` from string-keyed `(name, value)` pairs — the shape returned by
+/// `globals()`/`locals()`, insertion order preserved.
+fn str_keyed_dict(pairs: Vec<(String, Value)>) -> Value {
+    with_host(|h| {
+        let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::with_capacity(pairs.len());
+        for (k, v) in pairs {
+            let key = h.new_str(k.clone());
+            d.insert(PKey::Str(k), (key, v));
+        }
+        h.new_dict(d)
+    })
+}
+
+/// A dict's string-keyed `(name, value)` entries, for an `eval`/`exec` namespace
+/// argument. Non-string keys are skipped (a namespace is keyed by identifier).
+fn dict_str_pairs(d: &Value) -> Result<Vec<(String, Value)>, String> {
+    with_host(|h| match h.get(d) {
+        Some(PyObj::Dict(m)) => Ok(m
+            .iter()
+            .filter_map(|(_, (kv, v))| h.as_str(kv).map(|s| (s, v.clone())))
+            .collect()),
+        _ => Err(host::type_error("globals must be a real dictionary")),
+    })
 }
 
 fn arg0(args: &[Value]) -> Result<Value, String> {

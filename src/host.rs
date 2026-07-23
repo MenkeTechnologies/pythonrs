@@ -1323,6 +1323,48 @@ impl PyHost {
         self.frame().env.clone()
     }
 
+    /// Park any active function frames so a nested `eval`/`exec` run executes at
+    /// MODULE scope — its name binding and lookup then reach the real module
+    /// globals rather than the calling function's locals (`exec("g = 1")` inside a
+    /// function sets a module global, matching CPython's default-namespace rule).
+    /// Returns the parked frames to hand back to [`restore_scope`]. A run already
+    /// at module scope parks nothing.
+    pub fn enter_module_scope(&mut self) -> Vec<Frame> {
+        self.frames.split_off(1)
+    }
+
+    /// Restore the frames parked by [`enter_module_scope`] once the nested run
+    /// finishes, so the interrupted caller resumes with its frame intact.
+    pub fn restore_scope(&mut self, parked: Vec<Frame>) {
+        self.frames.truncate(1);
+        self.frames.extend(parked);
+    }
+
+    /// The visible local bindings of the innermost (calling) frame — its env chain
+    /// flattened, inner scopes shadowing enclosing ones. This is the `locals()` a
+    /// nested `eval`/`exec` reads from when called inside a function. Empty at
+    /// module scope (its bindings are the globals, included separately).
+    pub fn caller_locals(&self) -> IndexMap<String, Value> {
+        let mut out: IndexMap<String, Value> = IndexMap::new();
+        if self.frames.len() <= 1 {
+            return out;
+        }
+        // Collect the env chain, then apply outermost→innermost so the nearest
+        // scope wins on a name shadowed along the chain.
+        let mut chain: Vec<Env> = Vec::new();
+        let mut cur = Some(self.frame().env.clone());
+        while let Some(e) = cur {
+            cur = e.borrow().parent.clone();
+            chain.push(e);
+        }
+        for e in chain.into_iter().rev() {
+            for (k, v) in e.borrow().vars.iter() {
+                out.insert(k.clone(), v.clone());
+            }
+        }
+        out
+    }
+
     // ── DAP debug introspection (used only under `--dap`) ────────────────────
     /// Number of active call frames (the debugger's step-depth reference).
     pub fn frame_depth(&self) -> usize {
@@ -1487,6 +1529,35 @@ impl PyHost {
 
     pub fn set_global(&mut self, name: &str, val: Value) {
         self.globals.insert(name.to_string(), val);
+    }
+
+    /// Remove a module global, returning its value if bound. Used by `eval()` to
+    /// reclaim the temporary that captured the evaluated expression's value.
+    pub fn del_global(&mut self, name: &str) -> Option<Value> {
+        self.globals.shift_remove(name)
+    }
+
+    /// A clone of the whole module-global namespace — the save half of the
+    /// save/replace/run/restore used by `eval`/`exec` with an explicit `globals`
+    /// dict, so the caller's real globals are untouched by the evaluated code.
+    pub fn snapshot_globals(&self) -> IndexMap<String, Value> {
+        self.globals.clone()
+    }
+
+    /// Replace the module-global namespace wholesale (the restore/replace half of
+    /// the `eval`/`exec` explicit-namespace flow). Builtins resolve through a
+    /// separate registry, so they remain available regardless of this map.
+    pub fn replace_globals(&mut self, g: IndexMap<String, Value>) {
+        self.globals = g;
+    }
+
+    /// The module globals as `(name, value)` pairs — lets `eval`/`exec` copy the
+    /// post-run namespace back into a caller-supplied `globals` dict.
+    pub fn globals_pairs(&self) -> Vec<(String, Value)> {
+        self.globals
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 
     /// Module-level binding names plus defined class names — the dynamic half of
