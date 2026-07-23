@@ -283,6 +283,10 @@ pub struct ClassDef {
 #[derive(Clone)]
 pub struct FuncVal {
     pub def_id: usize,
+    /// The module (index into `PyHost::module_globals`) this function was defined
+    /// in. Global-name resolution while the function runs targets this slot, so a
+    /// vendored stdlib function sees its own module's names, not the importer's.
+    pub module: usize,
     /// Captured lexical environment (enclosing scope chain), for free vars.
     pub env: Option<Env>,
     /// Default values for the trailing positional params.
@@ -736,8 +740,16 @@ pub struct PyHost {
     pub classes: IndexMap<String, ClassDef>,
     /// try/except/finally block templates, indexed by try id.
     pub tries: Vec<TryDef>,
-    /// Module-level (global) names.
-    globals: IndexMap<String, Value>,
+    /// Per-module global namespaces (each imported module's `__dict__`), index 0
+    /// being `__main__`. A function/class-body/generator captures the id of the
+    /// module it was defined in and resolves its globals through that slot, so a
+    /// vendored stdlib function sees ITS module's names — not the importer's —
+    /// exactly as CPython's `func.__globals__ is module.__dict__`. The slot for an
+    /// imported module is kept alive after import for this reason.
+    module_globals: Vec<IndexMap<String, Value>>,
+    /// The module whose globals the currently-running code resolves against —
+    /// swapped around every function call, class body, and generator resume.
+    cur_module: usize,
     /// The frame stack (bottom = module).
     frames: Vec<Frame>,
     pub error: Option<String>,
@@ -882,6 +894,10 @@ struct GenContext {
     error: Option<String>,
     exc: Option<Value>,
     signal: Option<Signal>,
+    /// The module the generator body resolves globals against — restored on every
+    /// resume so a generator function defined in a vendored module sees its own
+    /// module's names (see [`FuncVal::module`]).
+    module: usize,
 }
 
 thread_local! {
@@ -1091,7 +1107,8 @@ impl PyHost {
             funcs: Vec::new(),
             classes: IndexMap::new(),
             tries: Vec::new(),
-            globals: IndexMap::new(),
+            module_globals: vec![IndexMap::new()],
+            cur_module: 0,
             frames: vec![Frame {
                 env: module_env,
                 globals_decl: HashSet::new(),
@@ -1606,11 +1623,56 @@ impl PyHost {
             }
             env = e.borrow().parent.clone();
         }
-        self.globals.get(name).cloned()
+        self.globals().get(name).cloned()
+    }
+
+    /// The globals of the currently-running module (the `cur_module` slot).
+    #[inline]
+    fn globals(&self) -> &IndexMap<String, Value> {
+        &self.module_globals[self.cur_module]
+    }
+
+    /// Mutable globals of the currently-running module.
+    #[inline]
+    fn globals_mut(&mut self) -> &mut IndexMap<String, Value> {
+        &mut self.module_globals[self.cur_module]
+    }
+
+    /// The module a freshly-created function/class-body captures (the module now
+    /// executing).
+    #[inline]
+    pub fn cur_module(&self) -> usize {
+        self.cur_module
+    }
+
+    /// Set the module code resolves globals against, returning the previous one.
+    /// Callers save the return value and restore it once the run completes, so
+    /// nested calls across modules stay isolated.
+    #[inline]
+    pub fn swap_module(&mut self, m: usize) -> usize {
+        std::mem::replace(&mut self.cur_module, m)
+    }
+
+    /// Allocate a fresh module-globals slot (its `__dict__`) and return its id.
+    /// The slot is never freed — functions defined in the module keep resolving
+    /// their globals through it for the life of the process.
+    pub fn new_module_slot(&mut self, ns: IndexMap<String, Value>) -> usize {
+        let id = self.module_globals.len();
+        self.module_globals.push(ns);
+        id
+    }
+
+    /// Read-only view of a specific module's globals (for building its
+    /// `PyObj::Module` namespace snapshot after import).
+    pub fn module_globals_pairs(&self, id: usize) -> Vec<(String, Value)> {
+        self.module_globals[id]
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 
     pub fn read_global(&self, name: &str) -> Option<Value> {
-        self.globals.get(name).cloned()
+        self.globals().get(name).cloned()
     }
 
     /// `UnboundLocalError`-aware read for a bare-name load. If `name` is a genuine
@@ -1653,7 +1715,7 @@ impl PyHost {
     /// (or module scope) writes to globals; otherwise the current local env.
     pub fn set_name(&mut self, name: &str, val: Value) {
         if self.frame().globals_decl.contains(name) {
-            self.globals.insert(name.to_string(), val);
+            self.globals_mut().insert(name.to_string(), val);
             return;
         }
         if self.frame().nonlocals_decl.contains(name) {
@@ -1683,40 +1745,40 @@ impl PyHost {
         // to globals (invisible to an `UnboundLocalError`-aware local read).
         let cur = self.cur_env();
         if cur.borrow().parent.is_none() {
-            self.globals.insert(name.to_string(), val);
+            self.globals_mut().insert(name.to_string(), val);
         } else {
             cur.borrow_mut().vars.insert(name.to_string(), val);
         }
     }
 
     pub fn set_global(&mut self, name: &str, val: Value) {
-        self.globals.insert(name.to_string(), val);
+        self.globals_mut().insert(name.to_string(), val);
     }
 
     /// Remove a module global, returning its value if bound. Used by `eval()` to
     /// reclaim the temporary that captured the evaluated expression's value.
     pub fn del_global(&mut self, name: &str) -> Option<Value> {
-        self.globals.shift_remove(name)
+        self.globals_mut().shift_remove(name)
     }
 
     /// A clone of the whole module-global namespace — the save half of the
     /// save/replace/run/restore used by `eval`/`exec` with an explicit `globals`
     /// dict, so the caller's real globals are untouched by the evaluated code.
     pub fn snapshot_globals(&self) -> IndexMap<String, Value> {
-        self.globals.clone()
+        self.globals().clone()
     }
 
     /// Replace the module-global namespace wholesale (the restore/replace half of
     /// the `eval`/`exec` explicit-namespace flow). Builtins resolve through a
     /// separate registry, so they remain available regardless of this map.
     pub fn replace_globals(&mut self, g: IndexMap<String, Value>) {
-        self.globals = g;
+        *self.globals_mut() = g;
     }
 
     /// The module globals as `(name, value)` pairs — lets `eval`/`exec` copy the
     /// post-run namespace back into a caller-supplied `globals` dict.
     pub fn globals_pairs(&self) -> Vec<(String, Value)> {
-        self.globals
+        self.globals()
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
@@ -1727,7 +1789,7 @@ impl PyHost {
     /// `def`/`class` bind into `globals`; class names are also unioned in so a
     /// class defined and immediately referenced still completes.
     pub fn global_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.globals.keys().cloned().collect();
+        let mut names: Vec<String> = self.globals().keys().cloned().collect();
         names.extend(self.classes.keys().cloned());
         names.sort();
         names.dedup();
@@ -1790,7 +1852,7 @@ impl PyHost {
         {
             return Ok(());
         }
-        if self.globals.shift_remove(name).is_some() {
+        if self.globals_mut().shift_remove(name).is_some() {
             return Ok(());
         }
         Err(name_error(name))
@@ -7808,38 +7870,44 @@ pub fn run_user_func(
     let owner = owner_opt.or_else(|| fv.owner.clone());
     // `async def`: calling it returns a coroutine object (or, if the body
     // contains `yield`, an async generator); the body runs only when the event
-    // loop drives it (CPython does not execute it eagerly).
-    if def.is_async {
-        if def.is_generator {
-            return Ok(make_async_generator(
+    // loop drives it (CPython does not execute it eagerly). The generator/
+    // coroutine object captures the module to restore on each resume, so swap to
+    // the callee's module while it is built (`make_gen_kind` reads `cur_module`),
+    // then restore the caller's before handing the object back.
+    if def.is_async || def.is_generator {
+        let saved_mod = with_host(|h| h.swap_module(fv.module));
+        let obj = if def.is_async {
+            if def.is_generator {
+                make_async_generator(
+                    def.chunk.clone(),
+                    env,
+                    self_val,
+                    owner,
+                    def.name.clone(),
+                    def.locals.clone(),
+                )
+            } else {
+                make_coroutine(
+                    def.chunk.clone(),
+                    env,
+                    self_val,
+                    owner,
+                    def.name.clone(),
+                    def.locals.clone(),
+                )
+            }
+        } else {
+            make_generator(
                 def.chunk.clone(),
                 env,
                 self_val,
                 owner,
                 def.name.clone(),
                 def.locals.clone(),
-            ));
-        }
-        return Ok(make_coroutine(
-            def.chunk.clone(),
-            env,
-            self_val,
-            owner,
-            def.name.clone(),
-            def.locals.clone(),
-        ));
-    }
-    // Generator function: build a suspended coroutine over the already-bound
-    // frame; nothing of the body runs until the first `next`/iteration.
-    if def.is_generator {
-        return Ok(make_generator(
-            def.chunk.clone(),
-            env,
-            self_val,
-            owner,
-            def.name.clone(),
-            def.locals.clone(),
-        ));
+            )
+        };
+        with_host(|h| h.swap_module(saved_mod));
+        return Ok(obj);
     }
     // Recursion guard: raise a catchable `RecursionError` before the deep Rust
     // call chain per Python frame exhausts the (large but finite) native stack.
@@ -7848,7 +7916,8 @@ pub fn run_user_func(
     if with_host(|h| h.frames.len() >= RECURSION_LIMIT) {
         return Err("RecursionError: maximum recursion depth exceeded".to_string());
     }
-    with_host(|h| {
+    let saved_mod = with_host(|h| {
+        let saved = h.swap_module(fv.module);
         h.frames.push(Frame {
             env,
             globals_decl: HashSet::new(),
@@ -7860,7 +7929,8 @@ pub fn run_user_func(
             name: def.name.clone(),
             line: 0,
             span: Span::NONE,
-        })
+        });
+        saved
     });
     let r = run_chunk_on(def.chunk.clone());
     let sig = with_host(|h| {
@@ -7868,6 +7938,7 @@ pub fn run_user_func(
             h.push_tb_frame();
         }
         h.frames.pop();
+        h.swap_module(saved_mod);
         h.signal.take()
     });
     match r {
@@ -8240,7 +8311,8 @@ fn run_class_body(name: &str, body_func: &Value) -> Result<IndexMap<String, Valu
     };
     let def = with_host(|h| h.funcs[fv.def_id].clone());
     let env = new_env(fv.env.clone());
-    with_host(|h| {
+    let saved_mod = with_host(|h| {
+        let saved = h.swap_module(fv.module);
         h.frames.push(Frame {
             env: env.clone(),
             globals_decl: HashSet::new(),
@@ -8254,7 +8326,8 @@ fn run_class_body(name: &str, body_func: &Value) -> Result<IndexMap<String, Valu
             name: name.to_string(),
             line: 0,
             span: Span::NONE,
-        })
+        });
+        saved
     });
     let r = run_chunk_on(def.chunk.clone());
     with_host(|h| {
@@ -8262,6 +8335,7 @@ fn run_class_body(name: &str, body_func: &Value) -> Result<IndexMap<String, Valu
             h.push_tb_frame();
         }
         h.frames.pop();
+        h.swap_module(saved_mod);
         h.signal.take();
     });
     r?;
@@ -8694,6 +8768,7 @@ impl PyHost {
         std::mem::swap(&mut self.error, &mut c.error);
         std::mem::swap(&mut self.exc, &mut c.exc);
         std::mem::swap(&mut self.signal, &mut c.signal);
+        std::mem::swap(&mut self.cur_module, &mut c.module);
         c
     }
 }
@@ -8894,6 +8969,8 @@ fn make_gen_kind(
             yielder: std::ptr::null(),
             ctx: GenContext {
                 frames: vec![frame],
+                // Capture the defining module so every resume restores it.
+                module: h.cur_module,
                 ..GenContext::default()
             },
             done: false,
@@ -9926,20 +10003,22 @@ fn try_import_vendored(name: &str) -> Option<Result<Value, String>> {
 /// The caller's globals and frame stack are saved and restored around the run.
 #[cfg(not(feature = "stdlib-ffi"))]
 fn run_vendored_module(name: &str, src: &str, path: &std::path::Path) -> Result<Value, String> {
-    // Save the importer's namespace + park its frames so the module body runs at a
-    // clean module scope (its `def`/`class`/assignments become the module globals).
-    let saved_globals = with_host(|h| h.snapshot_globals());
+    // Park the importer's frames so the module body runs at a clean module scope
+    // (its `def`/`class`/assignments become module globals), and allocate a fresh,
+    // PERSISTENT globals slot for it — functions defined here capture this slot's
+    // id and keep resolving their globals through it after import completes.
     let parked = with_host(|h| h.enter_module_scope());
-
-    // Seed the module dunders CPython sets before executing the body.
-    with_host(|h| {
+    let (mid, saved_mod) = with_host(|h| {
         let name_v = h.new_str(name);
         let file_v = h.new_str(path.to_string_lossy());
+        // Seed the module dunders CPython sets before executing the body.
         let mut ns: IndexMap<String, Value> = IndexMap::new();
         ns.insert("__name__".to_string(), name_v);
         ns.insert("__file__".to_string(), file_v);
         ns.insert("__doc__".to_string(), Value::Undef);
-        h.replace_globals(ns);
+        let mid = h.new_module_slot(ns);
+        let saved = h.swap_module(mid);
+        (mid, saved)
     });
 
     let run = (|| -> Result<(), String> {
@@ -9949,17 +10028,19 @@ fn run_vendored_module(name: &str, src: &str, path: &std::path::Path) -> Result<
         Ok(())
     })();
 
-    // Snapshot the module namespace BEFORE restoring the importer's globals.
-    let ns_pairs = with_host(|h| h.globals_pairs());
     with_host(|h| {
-        h.replace_globals(saved_globals);
+        h.swap_module(saved_mod);
         h.restore_scope(parked);
     });
     run?;
 
+    // The `Module` namespace is a snapshot of the (still-live) module slot: name
+    // lookups on the module object read it, while functions read the slot itself.
+    // They share heap handles for mutable globals, so in-place mutation stays
+    // visible through both; only a top-level rebind would diverge.
     Ok(with_host(|h| {
         let mut ns: IndexMap<String, Value> = IndexMap::new();
-        for (k, v) in ns_pairs {
+        for (k, v) in h.module_globals_pairs(mid) {
             ns.insert(k, v);
         }
         h.alloc(PyObj::Module {

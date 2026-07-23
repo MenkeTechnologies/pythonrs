@@ -1201,6 +1201,7 @@ fn b_mkfunc(vm: &mut VM, argc: u8) -> Value {
     with_host(|h| {
         h.alloc(PyObj::Func(host::FuncVal {
             def_id,
+            module: h.cur_module(),
             env: Some(env),
             defaults,
             kwonly_defaults,
