@@ -359,6 +359,13 @@ pub enum PyObj {
         step: Value,
     },
     Func(FuncVal),
+    /// A function's compiled code object (`func.__code__`), keyed to its
+    /// `FuncDef`. Exposes the `co_*` introspection attributes the faithful stdlib
+    /// reads (`types` derives `CodeType`, `inspect.signature`, `functools`,
+    /// `dataclasses`). A native VM object — not a Python reimplementation.
+    Code {
+        def_id: usize,
+    },
     /// A first-class reference to a builtin function (`len`, `print`, …).
     Builtin(String),
     Class(String),
@@ -2293,6 +2300,7 @@ impl PyHost {
                 Some(PyObj::Deque { .. }) => "deque".into(),
                 Some(PyObj::NamedTupleType { .. }) => "type".into(),
                 Some(PyObj::Partial { .. }) => "partial".into(),
+                Some(PyObj::Code { .. }) => "code".into(),
                 Some(PyObj::LruCache { .. }) => "functools._lru_cache_wrapper".into(),
                 Some(PyObj::Super { .. }) => "super".into(),
                 Some(PyObj::StaticMethod(_)) => "staticmethod".into(),
@@ -2399,6 +2407,14 @@ impl PyHost {
                         .map(|d| d.name.clone())
                         .unwrap_or_default();
                     format!("<function {name}>")
+                }
+                Some(PyObj::Code { def_id }) => {
+                    let name = self
+                        .funcs
+                        .get(*def_id)
+                        .map(|d| d.name.clone())
+                        .unwrap_or_default();
+                    format!("<code object {name} at 0x0000000000000000, file \"<string>\", line 1>")
                 }
                 // A `PyObj::Builtin` is an unbound builtin method
                 // (`str.upper`), a *type object* returned by `type(x)` (repr
@@ -6421,6 +6437,12 @@ impl PyHost {
                     )),
                 }
             }
+            // Code-object introspection (`func.__code__.co_*`), derived from the
+            // backing `FuncDef`. Native VM object, not a Python reimplementation.
+            Some(PyObj::Code { def_id }) => {
+                let def_id = *def_id;
+                self.code_attr(def_id, name)
+            }
             // Function introspection dunders. `C.m` yields the raw `Func`; a
             // bound `inst.m` delegates to the same underlying function.
             // `f.__annotations__` — the def-time dict `{param|"return": type}`.
@@ -6444,7 +6466,7 @@ impl PyHost {
             Some(PyObj::Func(fv))
                 if matches!(
                     name,
-                    "__name__" | "__qualname__" | "__module__" | "__defaults__" | "__doc__"
+                    "__name__" | "__qualname__" | "__module__" | "__defaults__" | "__doc__" | "__code__"
                 ) =>
             {
                 let (def_id, defaults) = (fv.def_id, fv.defaults.clone());
@@ -6453,7 +6475,7 @@ impl PyHost {
             Some(PyObj::BoundMethod { func, recv })
                 if matches!(
                     name,
-                    "__name__" | "__qualname__" | "__module__" | "__defaults__" | "__doc__"
+                    "__name__" | "__qualname__" | "__module__" | "__defaults__" | "__doc__" | "__code__"
                 ) =>
             {
                 let func = func.clone();
@@ -8279,6 +8301,110 @@ impl PyHost {
     /// `__qualname__` from the `FuncDef`, `__module__` is always `__main__` (the
     /// script module), and `__defaults__` is the positional-default tuple (or
     /// `None` when there are none), matching CPython.
+    /// A `co_*` attribute of a function's code object, derived from its
+    /// `FuncDef`. Covers the surface the faithful stdlib reads: `types` (only
+    /// needs the type + `co_flags`), `inspect.signature`
+    /// (argcounts/varnames/flags), `functools`, `dataclasses`.
+    fn code_attr(&mut self, def_id: usize, name: &str) -> Result<Value, String> {
+        // CPython co_flags bits (`Include/cpython/code.h`).
+        const CO_OPTIMIZED: i64 = 0x0001;
+        const CO_NEWLOCALS: i64 = 0x0002;
+        const CO_VARARGS: i64 = 0x0004;
+        const CO_VARKEYWORDS: i64 = 0x0008;
+        // CO_NOFREE: the function has no free-variable cells. pythonrs closures
+        // capture the enclosing env by reference (no cell/free slots in the code
+        // object), so this always holds — and it matches CPython's flags for
+        // every non-closure function.
+        const CO_NOFREE: i64 = 0x0040;
+        const CO_GENERATOR: i64 = 0x0020;
+        const CO_COROUTINE: i64 = 0x0080;
+        const CO_ASYNC_GENERATOR: i64 = 0x0200;
+        // Pull every field under one short immutable borrow so the alloc/new_str
+        // below (which need `&mut self`) don't conflict with it.
+        let (co_name, co_qualname, params, posonly, kwonly, star, kwargs, locals, flags) = {
+            let d = &self.funcs[def_id];
+            let q = if d.qualname.is_empty() {
+                d.name.clone()
+            } else {
+                d.qualname.clone()
+            };
+            let mut f = CO_OPTIMIZED | CO_NEWLOCALS | CO_NOFREE;
+            if d.star.is_some() {
+                f |= CO_VARARGS;
+            }
+            if d.kwargs.is_some() {
+                f |= CO_VARKEYWORDS;
+            }
+            if d.is_generator && !d.is_async {
+                f |= CO_GENERATOR;
+            }
+            if d.is_async && !d.is_generator {
+                f |= CO_COROUTINE;
+            }
+            if d.is_async && d.is_generator {
+                f |= CO_ASYNC_GENERATOR;
+            }
+            (
+                d.name.clone(),
+                q,
+                d.params.clone(),
+                d.posonly,
+                d.kwonly.clone(),
+                d.star.clone(),
+                d.kwargs.clone(),
+                d.locals.clone(),
+                f,
+            )
+        };
+        // co_varnames: parameters (positional then keyword-only), then
+        // `*args`/`**kwargs`, then any remaining body locals.
+        let varnames = || -> Vec<String> {
+            let mut names = params.clone();
+            names.extend(kwonly.iter().cloned());
+            if let Some(s) = &star {
+                names.push(s.clone());
+            }
+            if let Some(k) = &kwargs {
+                names.push(k.clone());
+            }
+            for l in &locals {
+                if !names.contains(l) {
+                    names.push(l.clone());
+                }
+            }
+            names
+        };
+        match name {
+            "co_name" => Ok(self.new_str(co_name)),
+            "co_qualname" => Ok(self.new_str(co_qualname)),
+            "co_argcount" => Ok(Value::Int(params.len() as i64)),
+            "co_posonlyargcount" => Ok(Value::Int(posonly as i64)),
+            "co_kwonlyargcount" => Ok(Value::Int(kwonly.len() as i64)),
+            "co_flags" => Ok(Value::Int(flags)),
+            "co_varnames" => {
+                let vals: Vec<Value> = varnames().into_iter().map(|n| self.new_str(n)).collect();
+                Ok(self.new_tuple(vals))
+            }
+            "co_nlocals" => Ok(Value::Int(varnames().len() as i64)),
+            "co_filename" => {
+                let f = self.tb_filename.clone();
+                Ok(self.new_str(if f.is_empty() {
+                    "<string>".to_string()
+                } else {
+                    f
+                }))
+            }
+            "co_firstlineno" => Ok(Value::Int(1)),
+            // pythonrs does not expose the constant/name/free/cell tables yet;
+            // report them empty rather than fabricate contents.
+            "co_names" | "co_consts" | "co_freevars" | "co_cellvars" => Ok(self.new_tuple(vec![])),
+            "co_stacksize" => Ok(Value::Int(0)),
+            _ => Err(format!(
+                "AttributeError: 'code' object has no attribute '{name}'"
+            )),
+        }
+    }
+
     fn func_dunder(
         &mut self,
         name: &str,
@@ -8304,6 +8430,7 @@ impl PyHost {
                 Some(d) => Ok(self.new_str(d)),
                 None => Ok(Value::Undef),
             },
+            "__code__" => Ok(self.alloc(PyObj::Code { def_id })),
             // `__defaults__`: a tuple of the positional defaults, or `None`.
             _ => {
                 if defaults.is_empty() {

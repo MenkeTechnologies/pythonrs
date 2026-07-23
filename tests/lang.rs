@@ -55,6 +55,27 @@ fn builtins_module_exposes_functions_types_exceptions() {
 }
 
 #[test]
+fn function_code_object_co_attributes() {
+    // Native code object: argcounts, varnames, flags derived from the FuncDef,
+    // matching CPython exactly (needed by inspect/functools/dataclasses/types).
+    let sig = "def f(a, b, /, c, *args, d, **kw):\n    x = 1\n    return x\n";
+    assert_eq!(g(&format!("{sig}y = f.__code__.co_name"), "y"), "'f'");
+    assert_eq!(g(&format!("{sig}y = f.__code__.co_argcount"), "y"), "3");
+    assert_eq!(g(&format!("{sig}y = f.__code__.co_posonlyargcount"), "y"), "2");
+    assert_eq!(g(&format!("{sig}y = f.__code__.co_kwonlyargcount"), "y"), "1");
+    assert_eq!(
+        g(&format!("{sig}y = f.__code__.co_varnames"), "y"),
+        "('a', 'b', 'c', 'd', 'args', 'kw', 'x')",
+    );
+    assert_eq!(g("def f(): pass\ny = type(f.__code__).__name__", "y"), "'code'");
+    // co_flags: OPTIMIZED|NEWLOCALS|NOFREE = 0x43 plain; generator adds 0x20,
+    // coroutine adds 0x80.
+    assert_eq!(g("def f(): pass\ny = f.__code__.co_flags", "y"), "67");
+    assert_eq!(g("def g():\n    yield 1\ny = g.__code__.co_flags & 0x20 != 0", "y"), "True");
+    assert_eq!(g("async def c(): pass\ny = c.__code__.co_flags & 0x80 != 0", "y"), "True");
+}
+
+#[test]
 fn function_docstring_is_dunder_doc() {
     // The body's first bare string literal is `__doc__`; absent one, `__doc__` is
     // None (present as an attribute, never an AttributeError).
