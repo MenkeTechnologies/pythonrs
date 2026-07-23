@@ -10639,6 +10639,20 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                 ),
             ]
         }),
+        // `_string` — the C helpers behind `string.Formatter`: the format-string
+        // field parser and the field-name splitter.
+        "_string" => with_host(|h| {
+            vec![
+                (
+                    "formatter_parser",
+                    h.alloc(PyObj::Builtin("_string.formatter_parser".into())),
+                ),
+                (
+                    "formatter_field_name_split",
+                    h.alloc(PyObj::Builtin("_string.formatter_field_name_split".into())),
+                ),
+            ]
+        }),
         // `errno` — the platform error numbers (from libc) plus the `errorcode`
         // {number: name} map. A pure constants C-ext, correct natively on any
         // build.

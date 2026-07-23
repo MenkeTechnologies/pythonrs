@@ -245,6 +245,25 @@ fn function_attributes() {
 }
 
 #[test]
+fn string_module_and_string_formatter() {
+    // Native _string (formatter_parser/formatter_field_name_split) lets the
+    // string package + string.Formatter run.
+    assert_eq!(g("import string\nx = string.digits", "x"), "'0123456789'");
+    assert_eq!(
+        g("import string\nx = string.Formatter().format('{0} {name}', 'hi', name='world')", "x"),
+        "'hi world'",
+    );
+    assert_eq!(
+        g("import _string\nx = list(_string.formatter_parser('a{0}b'))", "x"),
+        "[('a', '0', '', None), ('b', None, None, None)]",
+    );
+    assert_eq!(
+        g("import _string\nx = _string.formatter_field_name_split('0.name[1]')[0]", "x"),
+        "0",
+    );
+}
+
+#[test]
 fn errno_module() {
     // Native errno constants (from libc). Low POSIX numbers are stable across
     // Linux/macOS, so assert those.

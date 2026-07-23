@@ -3301,6 +3301,13 @@ pub fn call_builtin_function(
     if let Some(f) = name.strip_prefix("asyncio.") {
         return call_asyncio(f, args, kwargs);
     }
+    // `_string` — the C helpers behind `string.Formatter`.
+    if name == "_string.formatter_parser" {
+        return string_formatter_parser(&args);
+    }
+    if name == "_string.formatter_field_name_split" {
+        return string_formatter_field_name_split(&args);
+    }
     // `dict.fromkeys(iterable[, value])` reached via the `dict` type object.
     if name == "dict.fromkeys" {
         return dict_method(&Value::Undef, "fromkeys", &args, &[]);
@@ -5020,6 +5027,162 @@ fn construct_dict(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, S
 /// `sys.*` module functions. `sys.exit` raises a catchable `SystemExit`; the
 /// recursion-limit accessors report/accept a fixed 1000 (pythonrs has no
 /// Python-level recursion counter to enforce).
+/// `_string.formatter_parser(fmt)` — the `str.format` field parser. Yields
+/// `(literal_text, field_name, format_spec, conversion)` per replacement field;
+/// a trailing literal is `(text, None, None, None)`.
+fn string_formatter_parser(args: &[Value]) -> Result<Value, String> {
+    let s = with_host(|h| args.first().and_then(|v| h.as_str(v)))
+        .ok_or_else(|| host::type_error("formatter_parser() argument must be str"))?;
+    let cs: Vec<char> = s.chars().collect();
+    let n = cs.len();
+    let mut i = 0;
+    type Field = (String, Option<String>, Option<String>, Option<char>);
+    let mut out: Vec<Field> = Vec::new();
+    while i < n {
+        let mut lit = String::new();
+        let mut has_field = false;
+        while i < n {
+            let c = cs[i];
+            if c == '{' || c == '}' {
+                if i + 1 < n && cs[i + 1] == c {
+                    lit.push(c);
+                    i += 2;
+                    continue;
+                }
+                if c == '}' {
+                    return Err("ValueError: Single '}' encountered in format string".into());
+                }
+                has_field = true;
+                i += 1; // skip '{'
+                break;
+            }
+            lit.push(c);
+            i += 1;
+        }
+        if !has_field {
+            if !lit.is_empty() {
+                out.push((lit, None, None, None));
+            }
+            break;
+        }
+        let mut field_name = String::new();
+        let mut conversion: Option<char> = None;
+        let mut format_spec = String::new();
+        while i < n && cs[i] != '!' && cs[i] != ':' && cs[i] != '}' {
+            field_name.push(cs[i]);
+            i += 1;
+        }
+        if i < n && cs[i] == '!' {
+            i += 1;
+            if i >= n || cs[i] == '}' || cs[i] == ':' {
+                return Err(
+                    "ValueError: end of string while looking for conversion specifier".into(),
+                );
+            }
+            conversion = Some(cs[i]);
+            i += 1;
+        }
+        if i < n && cs[i] == ':' {
+            i += 1;
+            let mut depth = 1;
+            while i < n {
+                let c = cs[i];
+                if c == '{' {
+                    depth += 1;
+                } else if c == '}' {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                format_spec.push(c);
+                i += 1;
+            }
+        }
+        if i >= n || cs[i] != '}' {
+            return Err("ValueError: expected '}' before end of string".into());
+        }
+        i += 1; // skip closing '}'
+        out.push((lit, Some(field_name), Some(format_spec), conversion));
+    }
+    Ok(with_host(|h| {
+        let mut tuples: Vec<Value> = Vec::with_capacity(out.len());
+        for (lit, fname, fspec, conv) in out {
+            let lit_v = h.new_str(lit);
+            let fname_v = fname.map(|s| h.new_str(s)).unwrap_or(Value::Undef);
+            let fspec_v = fspec.map(|s| h.new_str(s)).unwrap_or(Value::Undef);
+            let conv_v = conv.map(|c| h.new_str(c.to_string())).unwrap_or(Value::Undef);
+            tuples.push(h.new_tuple(vec![lit_v, fname_v, fspec_v, conv_v]));
+        }
+        h.new_list(tuples)
+    }))
+}
+
+/// `_string.formatter_field_name_split(name)` — `(first, rest)` where `first` is
+/// the leading arg name (str) or index (int), and `rest` iterates
+/// `(is_attr, key)` for each `.attr` / `[item]` access.
+fn string_formatter_field_name_split(args: &[Value]) -> Result<Value, String> {
+    let s = with_host(|h| args.first().and_then(|v| h.as_str(v)))
+        .ok_or_else(|| host::type_error("formatter_field_name_split() argument must be str"))?;
+    let cs: Vec<char> = s.chars().collect();
+    let n = cs.len();
+    let mut i = 0;
+    let mut first = String::new();
+    while i < n && cs[i] != '.' && cs[i] != '[' {
+        first.push(cs[i]);
+        i += 1;
+    }
+    // (is_attr, key, key_is_int)
+    let mut rest: Vec<(bool, String, bool)> = Vec::new();
+    while i < n {
+        if cs[i] == '.' {
+            i += 1;
+            let mut nm = String::new();
+            while i < n && cs[i] != '.' && cs[i] != '[' {
+                nm.push(cs[i]);
+                i += 1;
+            }
+            rest.push((true, nm, false));
+        } else if cs[i] == '[' {
+            i += 1;
+            let mut key = String::new();
+            while i < n && cs[i] != ']' {
+                key.push(cs[i]);
+                i += 1;
+            }
+            if i >= n {
+                return Err("ValueError: Missing ']' in format string".into());
+            }
+            i += 1; // skip ']'
+            let is_int = !key.is_empty() && key.chars().all(|c| c.is_ascii_digit());
+            rest.push((false, key, is_int));
+        } else {
+            return Err(
+                "ValueError: Only '.' or '[' may follow ']' in format field specifier".into(),
+            );
+        }
+    }
+    let first_is_int = !first.is_empty() && first.chars().all(|c| c.is_ascii_digit());
+    Ok(with_host(|h| {
+        let first_v = if first_is_int {
+            Value::Int(first.parse().unwrap_or(0))
+        } else {
+            h.new_str(first)
+        };
+        let mut items: Vec<Value> = Vec::with_capacity(rest.len());
+        for (is_attr, key, key_is_int) in rest {
+            let key_v = if !is_attr && key_is_int {
+                Value::Int(key.parse().unwrap_or(0))
+            } else {
+                h.new_str(key)
+            };
+            items.push(h.new_tuple(vec![Value::Bool(is_attr), key_v]));
+        }
+        let rest_list = h.new_list(items);
+        h.new_tuple(vec![first_v, rest_list])
+    }))
+}
+
 fn call_sys(name: &str, args: Vec<Value>) -> Result<Value, String> {
     match name {
         "exit" => {
