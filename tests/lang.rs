@@ -264,6 +264,28 @@ fn string_module_and_string_formatter() {
 }
 
 #[test]
+fn itertools_module() {
+    // Lazy iterators (incl. over infinite sources via islice) and combinatorics.
+    assert_eq!(g("import itertools as it\nx = list(it.islice(it.count(10, 2), 4))", "x"), "[10, 12, 14, 16]");
+    assert_eq!(g("import itertools as it\nx = list(it.islice(it.cycle('AB'), 5))", "x"), "['A', 'B', 'A', 'B', 'A']");
+    assert_eq!(g("import itertools as it\nx = list(it.accumulate([1, 2, 3, 4]))", "x"), "[1, 3, 6, 10]");
+    assert_eq!(g("import itertools as it\nx = list(it.chain([1, 2], [3]))", "x"), "[1, 2, 3]");
+    assert_eq!(g("import itertools as it\nx = list(it.pairwise([1, 2, 3]))", "x"), "[(1, 2), (2, 3)]");
+    assert_eq!(
+        g("import itertools as it\nx = list(it.combinations([1, 2, 3], 2))", "x"),
+        "[(1, 2), (1, 3), (2, 3)]",
+    );
+    assert_eq!(
+        g("import itertools as it\nx = list(it.product([1, 2], [3, 4]))", "x"),
+        "[(1, 3), (1, 4), (2, 3), (2, 4)]",
+    );
+    assert_eq!(
+        g("import itertools as it\nx = [(k, list(gp)) for k, gp in it.groupby([1, 1, 2, 3, 3])]", "x"),
+        "[(1, [1, 1]), (2, [2]), (3, [3, 3])]",
+    );
+}
+
+#[test]
 fn errno_module() {
     // Native errno constants (from libc). Low POSIX numbers are stable across
     // Linux/macOS, so assert those.

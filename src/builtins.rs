@@ -3301,6 +3301,10 @@ pub fn call_builtin_function(
     if let Some(f) = name.strip_prefix("asyncio.") {
         return call_asyncio(f, args, kwargs);
     }
+    // `itertools.*` iterators.
+    if let Some(f) = name.strip_prefix("itertools.") {
+        return call_itertools(f, args, kwargs);
+    }
     // `_string` — the C helpers behind `string.Formatter`.
     if name == "_string.formatter_parser" {
         return string_formatter_parser(&args);
@@ -5181,6 +5185,322 @@ fn string_formatter_field_name_split(args: &[Value]) -> Result<Value, String> {
         let rest_list = h.new_list(items);
         h.new_tuple(vec![first_v, rest_list])
     }))
+}
+
+/// Construct an `itertools` iterator. Lazy ones build an `ItertoolsIter`; the
+/// combinatorics build the full tuple list and return its iterator.
+fn call_itertools(name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Result<Value, String> {
+    use host::{ItKind, PyObj};
+    let mk = |kind: ItKind, sources: Vec<Value>, func: Value, nums: Vec<i64>, buf: Vec<Value>, flag: bool| {
+        with_host(|h| {
+            h.alloc(PyObj::ItertoolsIter {
+                kind,
+                sources,
+                func,
+                nums,
+                buf,
+                flag,
+                done: false,
+            })
+        })
+    };
+    let iter_of = |v: &Value| -> Result<Value, String> { with_host(|h| h.make_iter(v)) };
+    let as_i = |v: &Value| with_host(|h| h.as_int(v));
+    let kw = |k: &str| kwargs.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+    match name {
+        "count" => {
+            let start = args.first().and_then(|v| as_i(v)).unwrap_or(0);
+            let step = args.get(1).and_then(|v| as_i(v)).unwrap_or(1);
+            Ok(mk(ItKind::Count, vec![], Value::Undef, vec![start, step], vec![], false))
+        }
+        "repeat" => {
+            let obj = args.first().cloned().unwrap_or(Value::Undef);
+            let times = args
+                .get(1)
+                .cloned()
+                .or_else(|| kw("times"))
+                .and_then(|v| as_i(&v))
+                .unwrap_or(-1);
+            Ok(mk(ItKind::Repeat, vec![], Value::Undef, vec![times], vec![obj], false))
+        }
+        "cycle" => {
+            let src = iter_of(&arg0(&args)?)?;
+            Ok(mk(ItKind::Cycle, vec![src], Value::Undef, vec![0], vec![], false))
+        }
+        "chain" => {
+            let mut sources = Vec::with_capacity(args.len());
+            for a in &args {
+                sources.push(iter_of(a)?);
+            }
+            Ok(mk(ItKind::Chain, sources, Value::Undef, vec![0], vec![], false))
+        }
+        "chain.from_iterable" => {
+            let outer = host::iter_vec(&arg0(&args)?)?;
+            let mut sources = Vec::with_capacity(outer.len());
+            for a in &outer {
+                sources.push(iter_of(a)?);
+            }
+            Ok(mk(ItKind::Chain, sources, Value::Undef, vec![0], vec![], false))
+        }
+        "accumulate" => {
+            let src = iter_of(&arg0(&args)?)?;
+            let func = args.get(1).cloned().or_else(|| kw("func")).unwrap_or(Value::Undef);
+            Ok(mk(ItKind::Accumulate, vec![src], func, vec![], vec![], false))
+        }
+        "starmap" => {
+            let func = arg0(&args)?;
+            let src = iter_of(args.get(1).ok_or_else(|| host::type_error("starmap expected 2 arguments"))?)?;
+            Ok(mk(ItKind::StarMap, vec![src], func, vec![], vec![], false))
+        }
+        "compress" => {
+            let data = iter_of(&arg0(&args)?)?;
+            let sel = iter_of(args.get(1).ok_or_else(|| host::type_error("compress expected 2 arguments"))?)?;
+            Ok(mk(ItKind::Compress, vec![data, sel], Value::Undef, vec![], vec![], false))
+        }
+        "dropwhile" => {
+            let func = arg0(&args)?;
+            let src = iter_of(args.get(1).ok_or_else(|| host::type_error("dropwhile expected 2 arguments"))?)?;
+            Ok(mk(ItKind::DropWhile, vec![src], func, vec![], vec![], true))
+        }
+        "takewhile" => {
+            let func = arg0(&args)?;
+            let src = iter_of(args.get(1).ok_or_else(|| host::type_error("takewhile expected 2 arguments"))?)?;
+            Ok(mk(ItKind::TakeWhile, vec![src], func, vec![], vec![], false))
+        }
+        "filterfalse" => {
+            let func = args.first().cloned().unwrap_or(Value::Undef);
+            // filterfalse(None, it): None is already Value::Undef (the identity sentinel).
+            let func = func;
+            let src = iter_of(args.get(1).ok_or_else(|| host::type_error("filterfalse expected 2 arguments"))?)?;
+            Ok(mk(ItKind::FilterFalse, vec![src], func, vec![], vec![], false))
+        }
+        "islice" => {
+            let src = iter_of(&arg0(&args)?)?;
+            // islice(it, stop) | islice(it, start, stop[, step])
+            let (start, stop, step) = if args.len() <= 2 {
+                (0, args.get(1).and_then(|v| as_i(v)).unwrap_or(-1), 1)
+            } else {
+                (
+                    args.get(1).and_then(|v| as_i(v)).unwrap_or(0),
+                    args.get(2).and_then(|v| as_i(v)).unwrap_or(-1),
+                    args.get(3).and_then(|v| as_i(v)).unwrap_or(1),
+                )
+            };
+            // nums = [next_yield_index=start, stop, step, cursor=0]
+            Ok(mk(ItKind::ISlice, vec![src], Value::Undef, vec![start, stop, step, 0], vec![], false))
+        }
+        "zip_longest" => {
+            let fill = kw("fillvalue").unwrap_or(Value::Undef);
+            let mut sources = Vec::with_capacity(args.len());
+            for a in &args {
+                sources.push(iter_of(a)?);
+            }
+            Ok(mk(ItKind::ZipLongest, sources, fill, vec![], vec![], false))
+        }
+        "pairwise" => {
+            let src = iter_of(&arg0(&args)?)?;
+            Ok(mk(ItKind::Pairwise, vec![src], Value::Undef, vec![], vec![], false))
+        }
+        "product" => itertools_product(&args, &kwargs),
+        "permutations" => itertools_permutations(&args),
+        "combinations" => itertools_combinations(&args, false),
+        "combinations_with_replacement" => itertools_combinations(&args, true),
+        "tee" => itertools_tee(&args),
+        "groupby" => itertools_groupby(&args, &kwargs),
+        _ => Err(format!("AttributeError: module 'itertools' has no attribute '{name}'")),
+    }
+}
+
+/// A list-iterator over `items` (for the eager combinatoric itertools functions).
+fn list_iter(items: Vec<Value>) -> Value {
+    with_host(|h| {
+        let l = h.new_list(items);
+        h.make_iter(&l).unwrap_or(l)
+    })
+}
+
+fn itertools_product(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, String> {
+    let repeat = kwargs
+        .iter()
+        .find(|(n, _)| n == "repeat")
+        .and_then(|(_, v)| with_host(|h| h.as_int(v)))
+        .unwrap_or(1)
+        .max(0) as usize;
+    let mut pools: Vec<Vec<Value>> = Vec::new();
+    for a in args {
+        pools.push(host::iter_vec(a)?);
+    }
+    let base = pools.clone();
+    for _ in 1..repeat {
+        pools.extend(base.iter().cloned());
+    }
+    if repeat == 0 {
+        pools.clear();
+    }
+    // Cartesian product.
+    let mut result: Vec<Vec<Value>> = vec![vec![]];
+    for pool in &pools {
+        let mut next = Vec::new();
+        for prefix in &result {
+            for item in pool {
+                let mut row = prefix.clone();
+                row.push(item.clone());
+                next.push(row);
+            }
+        }
+        result = next;
+    }
+    let tuples: Vec<Value> = result.into_iter().map(|r| with_host(|h| h.new_tuple(r))).collect();
+    Ok(list_iter(tuples))
+}
+
+fn itertools_permutations(args: &[Value]) -> Result<Value, String> {
+    let pool = host::iter_vec(&arg0(args)?)?;
+    let n = pool.len();
+    let r = args
+        .get(1)
+        .filter(|v| !matches!(v, Value::Undef))
+        .and_then(|v| with_host(|h| h.as_int(v)))
+        .map(|x| x as usize)
+        .unwrap_or(n);
+    let mut out: Vec<Value> = Vec::new();
+    if r <= n {
+        let mut indices: Vec<usize> = (0..n).collect();
+        // Standard CPython permutations via a cycles array.
+        let mut cycles: Vec<usize> = (n - r + 1..=n).rev().collect();
+        let emit = |indices: &[usize]| {
+            let row: Vec<Value> = indices[..r].iter().map(|&i| pool[i].clone()).collect();
+            with_host(|h| h.new_tuple(row))
+        };
+        out.push(emit(&indices));
+        'outer: loop {
+            let mut i = r;
+            loop {
+                if i == 0 {
+                    break 'outer;
+                }
+                i -= 1;
+                cycles[i] -= 1;
+                if cycles[i] == 0 {
+                    let first = indices[i];
+                    for j in i..n - 1 {
+                        indices[j] = indices[j + 1];
+                    }
+                    indices[n - 1] = first;
+                    cycles[i] = n - i;
+                } else {
+                    let j = n - cycles[i];
+                    indices.swap(i, j);
+                    out.push(emit(&indices));
+                    break;
+                }
+            }
+        }
+    }
+    Ok(list_iter(out))
+}
+
+fn itertools_combinations(args: &[Value], with_repl: bool) -> Result<Value, String> {
+    let pool = host::iter_vec(&arg0(args)?)?;
+    let n = pool.len();
+    let r = args
+        .get(1)
+        .and_then(|v| with_host(|h| h.as_int(v)))
+        .ok_or_else(|| host::type_error("combinations() missing r"))?
+        .max(0) as usize;
+    let mut out: Vec<Value> = Vec::new();
+    let emit = |indices: &[usize]| {
+        let row: Vec<Value> = indices.iter().map(|&i| pool[i].clone()).collect();
+        with_host(|h| h.new_tuple(row))
+    };
+    if with_repl {
+        if n == 0 && r > 0 {
+            return Ok(list_iter(out));
+        }
+        let mut indices = vec![0usize; r];
+        out.push(emit(&indices));
+        loop {
+            let mut i = r;
+            loop {
+                if i == 0 {
+                    return Ok(list_iter(out));
+                }
+                i -= 1;
+                if indices[i] != n - 1 {
+                    break;
+                }
+            }
+            let v = indices[i] + 1;
+            for j in i..r {
+                indices[j] = v;
+            }
+            out.push(emit(&indices));
+        }
+    } else {
+        if r > n {
+            return Ok(list_iter(out));
+        }
+        let mut indices: Vec<usize> = (0..r).collect();
+        out.push(emit(&indices));
+        loop {
+            let mut i = r;
+            loop {
+                if i == 0 {
+                    return Ok(list_iter(out));
+                }
+                i -= 1;
+                if indices[i] != i + n - r {
+                    break;
+                }
+            }
+            indices[i] += 1;
+            for j in i + 1..r {
+                indices[j] = indices[j - 1] + 1;
+            }
+            out.push(emit(&indices));
+        }
+    }
+}
+
+fn itertools_tee(args: &[Value]) -> Result<Value, String> {
+    let items = host::iter_vec(&arg0(args)?)?;
+    let n = args.get(1).and_then(|v| with_host(|h| h.as_int(v))).unwrap_or(2).max(0) as usize;
+    let iters: Vec<Value> = (0..n).map(|_| list_iter(items.clone())).collect();
+    Ok(with_host(|h| h.new_tuple(iters)))
+}
+
+fn itertools_groupby(args: &[Value], _kwargs: &[(String, Value)]) -> Result<Value, String> {
+    let items = host::iter_vec(&arg0(args)?)?;
+    let key = args.get(1).filter(|v| !matches!(v, Value::Undef)).cloned();
+    // Materialize consecutive groups as (key, list) tuples (the group is a list,
+    // which is iterable like CPython's grouper — eager, not lazily invalidated).
+    let mut out: Vec<Value> = Vec::new();
+    let mut i = 0;
+    while i < items.len() {
+        let k = match &key {
+            Some(f) => host::invoke(f, vec![items[i].clone()], vec![])?,
+            None => items[i].clone(),
+        };
+        let mut group = vec![items[i].clone()];
+        let mut j = i + 1;
+        while j < items.len() {
+            let kj = match &key {
+                Some(f) => host::invoke(f, vec![items[j].clone()], vec![])?,
+                None => items[j].clone(),
+            };
+            if with_host(|h| h.equal(&kj, &k)) {
+                group.push(items[j].clone());
+                j += 1;
+            } else {
+                break;
+            }
+        }
+        let glist = with_host(|h| h.new_list(group));
+        let tup = with_host(|h| h.new_tuple(vec![k, glist]));
+        out.push(tup);
+        i = j;
+    }
+    Ok(list_iter(out))
 }
 
 fn call_sys(name: &str, args: Vec<Value>) -> Result<Value, String> {

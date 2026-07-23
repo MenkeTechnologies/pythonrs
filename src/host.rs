@@ -354,6 +354,46 @@ const OBJECT_SLOT_WRAPPERS: &[&str] = &[
     "__sizeof__",
 ];
 
+/// The lazy `itertools` iterators. Each drives [`PyObj::ItertoolsIter`] through
+/// its step function; the combinatoric ones (product/permutations/…) are built
+/// eagerly instead.
+#[derive(Clone, Copy, PartialEq)]
+pub enum ItKind {
+    Count,
+    Repeat,
+    Cycle,
+    Chain,
+    Accumulate,
+    StarMap,
+    Compress,
+    DropWhile,
+    TakeWhile,
+    FilterFalse,
+    ISlice,
+    ZipLongest,
+    Pairwise,
+}
+
+impl ItKind {
+    fn type_name(self) -> &'static str {
+        match self {
+            ItKind::Count => "itertools.count",
+            ItKind::Repeat => "itertools.repeat",
+            ItKind::Cycle => "itertools.cycle",
+            ItKind::Chain => "itertools.chain",
+            ItKind::Accumulate => "itertools.accumulate",
+            ItKind::StarMap => "itertools.starmap",
+            ItKind::Compress => "itertools.compress",
+            ItKind::DropWhile => "itertools.dropwhile",
+            ItKind::TakeWhile => "itertools.takewhile",
+            ItKind::FilterFalse => "itertools.filterfalse",
+            ItKind::ISlice => "itertools.islice",
+            ItKind::ZipLongest => "itertools.zip_longest",
+            ItKind::Pairwise => "itertools.pairwise",
+        }
+    }
+}
+
 /// The kind of a C-level attribute [`PyObj::Descriptor`], which fixes its
 /// `type().__name__`. These are the descriptor types CPython's `types` module
 /// derives so the stdlib can classify class members.
@@ -478,6 +518,19 @@ pub enum PyObj {
     /// variable, read via `cell_contents`. `type()` is `cell`.
     Cell {
         value: Value,
+    },
+    /// A lazy `itertools` iterator. `sources` are pre-made input iterators, `func`
+    /// an optional predicate/binop, `nums` integer state (count start/step,
+    /// islice bounds, cursor), `buf` a value buffer (cycle's seen items,
+    /// accumulate's running total), `flag`/`done` latches.
+    ItertoolsIter {
+        kind: ItKind,
+        sources: Vec<Value>,
+        func: Value,
+        nums: Vec<i64>,
+        buf: Vec<Value>,
+        flag: bool,
+        done: bool,
     },
     /// A first-class reference to a builtin function (`len`, `print`, …).
     Builtin(String),
@@ -2484,6 +2537,7 @@ impl PyHost {
                 Some(PyObj::Traceback { .. }) => "traceback".into(),
                 Some(PyObj::PyFrame { .. }) => "frame".into(),
                 Some(PyObj::Cell { .. }) => "cell".into(),
+                Some(PyObj::ItertoolsIter { kind, .. }) => kind.type_name().into(),
                 Some(PyObj::LruCache { .. }) => "functools._lru_cache_wrapper".into(),
                 Some(PyObj::Super { .. }) => "super".into(),
                 Some(PyObj::StaticMethod(_)) => "staticmethod".into(),
@@ -2703,6 +2757,9 @@ impl PyHost {
                 }
                 Some(PyObj::Iter(_)) => "<iterator>".into(),
                 Some(PyObj::Zip { .. }) => format!("<zip object at 0x{:012x}>", self.addr_of(v)),
+                Some(PyObj::ItertoolsIter { kind, .. }) => {
+                    format!("<{} object at 0x{:012x}>", kind.type_name(), self.addr_of(v))
+                }
                 Some(PyObj::MapObj { .. }) => format!("<map object at 0x{:012x}>", self.addr_of(v)),
                 Some(PyObj::FilterObj { .. }) => {
                     format!("<filter object at 0x{:012x}>", self.addr_of(v))
@@ -6192,6 +6249,7 @@ impl PyHost {
             | Some(PyObj::MapObj { .. })
             | Some(PyObj::FilterObj { .. })
             | Some(PyObj::EnumerateObj { .. })
+            | Some(PyObj::ItertoolsIter { .. })
             | Some(PyObj::CallIter { .. }) => return Ok(v.clone()),
             _ => {
                 let items = self.iter_items(v)?;
@@ -10212,6 +10270,7 @@ pub fn iter_vec(v: &Value) -> Result<Vec<Value>, String> {
                 | Some(PyObj::MapObj { .. })
                 | Some(PyObj::FilterObj { .. })
                 | Some(PyObj::EnumerateObj { .. })
+                | Some(PyObj::ItertoolsIter { .. })
                 | Some(PyObj::CallIter { .. })
         )
     }) {
@@ -10306,6 +10365,297 @@ pub fn iter_instance_items(v: &Value) -> Result<Vec<Value>, String> {
     }
 }
 
+/// One step of a lazy `itertools` iterator. State is cloned out so the source
+/// pulls / predicate calls run with no host borrow held, then the mutated state
+/// (and any exhaustion latch) is written back.
+fn itertools_step(it: &Value) -> Result<Option<Value>, String> {
+    let (kind, sources, func, mut nums, mut buf, mut flag, done) =
+        match with_host(|h| h.get(it).cloned()) {
+            Some(PyObj::ItertoolsIter {
+                kind,
+                sources,
+                func,
+                nums,
+                buf,
+                flag,
+                done,
+            }) => (kind, sources, func, nums, buf, flag, done),
+            _ => return Err(type_error("not an iterator")),
+        };
+    if done {
+        return Ok(None);
+    }
+    let mut finished = false;
+    let result: Option<Value> = match kind {
+        ItKind::Count => {
+            let cur = nums[0];
+            nums[0] = cur.wrapping_add(nums[1]);
+            Some(Value::Int(cur))
+        }
+        ItKind::Repeat => {
+            // nums[0] = remaining (-1 = infinite).
+            if nums[0] == 0 {
+                finished = true;
+                None
+            } else {
+                if nums[0] > 0 {
+                    nums[0] -= 1;
+                }
+                Some(buf[0].clone())
+            }
+        }
+        ItKind::Cycle => {
+            if !flag {
+                // First pass: pull from the source, remembering each item.
+                match iter_step(&sources[0])? {
+                    Some(v) => {
+                        buf.push(v.clone());
+                        Some(v)
+                    }
+                    None => {
+                        flag = true; // source exhausted; replay the buffer
+                        if buf.is_empty() {
+                            finished = true;
+                            None
+                        } else {
+                            let v = buf[0].clone();
+                            nums = vec![1 % buf.len() as i64];
+                            Some(v)
+                        }
+                    }
+                }
+            } else if buf.is_empty() {
+                finished = true;
+                None
+            } else {
+                let idx = nums[0] as usize;
+                let v = buf[idx].clone();
+                nums[0] = ((idx + 1) % buf.len()) as i64;
+                Some(v)
+            }
+        }
+        ItKind::Chain => {
+            let mut out = None;
+            while (nums[0] as usize) < sources.len() {
+                match iter_step(&sources[nums[0] as usize])? {
+                    Some(v) => {
+                        out = Some(v);
+                        break;
+                    }
+                    None => nums[0] += 1,
+                }
+            }
+            if out.is_none() {
+                finished = true;
+            }
+            out
+        }
+        ItKind::Accumulate => match iter_step(&sources[0])? {
+            None => {
+                finished = true;
+                None
+            }
+            Some(v) => {
+                let acc = if buf.is_empty() {
+                    v
+                } else {
+                    let prev = buf[0].clone();
+                    if matches!(func, Value::Undef) {
+                        with_host(|h| h.arith(NumOp::Add, &prev, &v))?
+                    } else {
+                        invoke(&func, vec![prev, v], vec![])?
+                    }
+                };
+                buf = vec![acc.clone()];
+                Some(acc)
+            }
+        },
+        ItKind::StarMap => match iter_step(&sources[0])? {
+            None => {
+                finished = true;
+                None
+            }
+            Some(tup) => {
+                let call_args = iter_vec(&tup)?;
+                Some(invoke(&func, call_args, vec![])?)
+            }
+        },
+        ItKind::Compress => {
+            // sources = [data, selectors]; yield data where selector is truthy.
+            let mut out = None;
+            loop {
+                let d = iter_step(&sources[0])?;
+                let s = iter_step(&sources[1])?;
+                match (d, s) {
+                    (Some(dv), Some(sv)) => {
+                        if with_host(|h| h.truthy(&sv)) {
+                            out = Some(dv);
+                            break;
+                        }
+                    }
+                    _ => {
+                        finished = true;
+                        break;
+                    }
+                }
+            }
+            out
+        }
+        ItKind::DropWhile => {
+            // flag = still dropping.
+            let mut out = None;
+            loop {
+                match iter_step(&sources[0])? {
+                    None => {
+                        finished = true;
+                        break;
+                    }
+                    Some(v) => {
+                        if flag {
+                            let keep = invoke(&func, vec![v.clone()], vec![])?;
+                            if with_host(|h| h.truthy(&keep)) {
+                                continue; // still dropping
+                            }
+                            flag = false;
+                        }
+                        out = Some(v);
+                        break;
+                    }
+                }
+            }
+            out
+        }
+        ItKind::TakeWhile => match iter_step(&sources[0])? {
+            None => {
+                finished = true;
+                None
+            }
+            Some(v) => {
+                let keep = invoke(&func, vec![v.clone()], vec![])?;
+                if with_host(|h| h.truthy(&keep)) {
+                    Some(v)
+                } else {
+                    finished = true;
+                    None
+                }
+            }
+        },
+        ItKind::FilterFalse => {
+            let mut out = None;
+            loop {
+                match iter_step(&sources[0])? {
+                    None => {
+                        finished = true;
+                        break;
+                    }
+                    Some(v) => {
+                        let truthy = if matches!(func, Value::Undef) {
+                            with_host(|h| h.truthy(&v))
+                        } else {
+                            let r = invoke(&func, vec![v.clone()], vec![])?;
+                            with_host(|h| h.truthy(&r))
+                        };
+                        if !truthy {
+                            out = Some(v);
+                            break;
+                        }
+                    }
+                }
+            }
+            out
+        }
+        ItKind::ISlice => {
+            // nums = [next_yield_index, stop(-1=inf), step, cursor].
+            let mut out = None;
+            loop {
+                if nums[1] >= 0 && nums[3] >= nums[1] {
+                    finished = true;
+                    break;
+                }
+                match iter_step(&sources[0])? {
+                    None => {
+                        finished = true;
+                        break;
+                    }
+                    Some(v) => {
+                        let cur = nums[3];
+                        nums[3] += 1;
+                        if cur == nums[0] {
+                            nums[0] += nums[2];
+                            out = Some(v);
+                            break;
+                        }
+                    }
+                }
+            }
+            out
+        }
+        ItKind::ZipLongest => {
+            // func = fillvalue. Yield a tuple until every source is exhausted.
+            let mut row = Vec::with_capacity(sources.len());
+            let mut any = false;
+            for s in &sources {
+                match iter_step(s)? {
+                    Some(v) => {
+                        any = true;
+                        row.push(v);
+                    }
+                    None => row.push(func.clone()),
+                }
+            }
+            if any {
+                Some(with_host(|h| h.new_tuple(row)))
+            } else {
+                finished = true;
+                None
+            }
+        }
+        ItKind::Pairwise => {
+            if buf.is_empty() {
+                match iter_step(&sources[0])? {
+                    Some(v) => buf.push(v),
+                    None => {
+                        finished = true;
+                    }
+                }
+            }
+            if finished {
+                None
+            } else {
+                match iter_step(&sources[0])? {
+                    Some(v) => {
+                        let prev = buf[0].clone();
+                        buf = vec![v.clone()];
+                        Some(with_host(|h| h.new_tuple(vec![prev, v])))
+                    }
+                    None => {
+                        finished = true;
+                        None
+                    }
+                }
+            }
+        }
+    };
+    with_host(|h| {
+        if let Some(PyObj::ItertoolsIter {
+            nums: n,
+            buf: b,
+            flag: f,
+            done: d,
+            ..
+        }) = h.get_mut(it)
+        {
+            *n = nums;
+            *b = buf;
+            *f = flag;
+            if finished {
+                *d = true;
+            }
+        }
+    });
+    Ok(result)
+}
+
 /// Advance any iterator — including a generator or a lazy composite iterator
 /// (`zip`/`map`/`filter`/`enumerate`) — by one step. Composite iterators pull
 /// from their sources with the host borrow released, so an infinite source
@@ -10318,6 +10668,7 @@ pub fn iter_step(it: &Value) -> Result<Option<Value>, String> {
         Some(PyObj::FilterObj { .. }) => filter_step(it),
         Some(PyObj::EnumerateObj { .. }) => enumerate_step(it),
         Some(PyObj::CallIter { .. }) => calliter_step(it),
+        Some(PyObj::ItertoolsIter { .. }) => itertools_step(it),
         // A foreign (CPython) iterator advances with the host borrow released so
         // a lazy stdlib iterator running a pythonrs callback can re-enter.
         #[cfg(feature = "stdlib-ffi")]
@@ -10638,6 +10989,34 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                     h.alloc(PyObj::Builtin("contextlib.redirect_stderr".into())),
                 ),
             ]
+        }),
+        // `itertools` — the iterator toolkit. Lazy iterators build an
+        // `ItertoolsIter`; the combinatorics build eagerly.
+        "itertools" => with_host(|h| {
+            const FNS: &[&str] = &[
+                "count",
+                "repeat",
+                "cycle",
+                "chain",
+                "accumulate",
+                "starmap",
+                "compress",
+                "dropwhile",
+                "takewhile",
+                "filterfalse",
+                "islice",
+                "zip_longest",
+                "pairwise",
+                "product",
+                "permutations",
+                "combinations",
+                "combinations_with_replacement",
+                "tee",
+                "groupby",
+            ];
+            FNS.iter()
+                .map(|f| (*f, h.alloc(PyObj::Builtin(format!("itertools.{f}")))))
+                .collect()
         }),
         // `_string` — the C helpers behind `string.Formatter`: the format-string
         // field parser and the field-name splitter.
