@@ -207,6 +207,20 @@ fn function_docstring_is_dunder_doc() {
 }
 
 #[test]
+fn isinstance_of_type_for_type_objects() {
+    // Every type object is an instance of `type` -- incl. the coroutine/generator/
+    // iterator types the stdlib registers with ABCs; functions and unbound
+    // methods are not.
+    assert_eq!(g("def _c(): pass\nx = isinstance(type(_c), type)", "x"), "True");
+    assert_eq!(g("x = isinstance(type(iter([])), type)", "x"), "True");
+    assert_eq!(g("x = isinstance(int, type)", "x"), "True");
+    assert_eq!(g("class C: pass\nx = isinstance(C, type)", "x"), "True");
+    assert_eq!(g("x = isinstance(len, type)", "x"), "False");
+    assert_eq!(g("x = isinstance(str.upper, type)", "x"), "False");
+    assert_eq!(g("x = isinstance(5, type)", "x"), "False");
+}
+
+#[test]
 fn function_attributes() {
     // Functions carry a writable attribute dict (abc's __isabstractmethod__,
     // functools.wraps, decorators).

@@ -5776,8 +5776,17 @@ fn isinstance(h: &host::PyHost, v: &Value, cls: &Value) -> bool {
     // A class object (a user `Class` or a builtin type) is an instance of `type`.
     if want == "type" {
         match h.get(v) {
-            Some(PyObj::Class(_)) => return true,
-            Some(PyObj::Builtin(n)) if is_builtin_type(n) => return true,
+            Some(PyObj::Class(_)) | Some(PyObj::NamedTupleType { .. }) => return true,
+            // Any type object: a known builtin type/exception, or a type-name
+            // builtin produced by `type(x)` (coroutine/generator/iterator/…). A
+            // dotted name is an unbound method (`str.upper`) and a BUILTIN_FUNCS
+            // name is a function (`len`) -- neither is a type.
+            Some(PyObj::Builtin(n))
+                if is_type_like_builtin(n)
+                    || (!n.contains('.') && !is_builtin_function(n)) =>
+            {
+                return true
+            }
             _ => {}
         }
     }
