@@ -3,6 +3,14 @@
 _python() {
   _arguments -s \
     '(-c)-c[execute a one-liner]:source' \
+    '(-m)-m[run a library module as a script (delegates to embedded CPython runpy)]:module' \
+    '-u[force unbuffered stdout/stderr]' \
+    '-E[ignore PYTHON* env vars (drop-in compat)]' \
+    '-I[isolated mode (drop-in compat)]' \
+    '-O[optimization level (drop-in compat)]' \
+    '-S[no site import (drop-in compat)]' \
+    '-B[do not write bytecode caches (drop-in compat)]' \
+    '-W[warning filter]:action' \
     '--build[AOT-compile to a native executable]' \
     '--dump-bytecode[print lowered fusevm bytecode]' \
     '--dump-tokens[print the lexer token stream]' \

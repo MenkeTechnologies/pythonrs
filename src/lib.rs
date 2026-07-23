@@ -119,6 +119,23 @@ pub fn eval_file(path: &str) -> Result<Value, String> {
     run_compiled(compile_or_load(&src)?)
 }
 
+/// Run `python -m <module> [args…]`. Delegates to the embedded CPython's
+/// `runpy` (the same code path as CPython's `-m`), so `-m pip`/`-m venv`/… run on
+/// the real interpreter. Returns the process exit code. Only available with the
+/// `stdlib-ffi` bridge; a native-only build has no interpreter to host `runpy`.
+#[cfg(feature = "stdlib-ffi")]
+pub fn run_module(module: &str, args: &[String]) -> i32 {
+    ffi::run_module(module, args)
+}
+
+/// `-m` with no embedded interpreter (native-only `--no-default-features` build):
+/// there is no `runpy` to run the module through, so report and exit non-zero.
+#[cfg(not(feature = "stdlib-ffi"))]
+pub fn run_module(module: &str, _args: &[String]) -> i32 {
+    eprintln!("python: -m requires the stdlib-ffi bridge (not in this build): {module}");
+    1
+}
+
 /// How a program run ended: the process exit code plus any text the runtime must
 /// emit to stderr (a traceback block or a `SystemExit` message).
 pub struct RunReport {

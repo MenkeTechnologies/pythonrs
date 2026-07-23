@@ -105,6 +105,89 @@ pub fn init() {
     });
 }
 
+/// Run `python -m <modname> [args…]` on the embedded CPython by calling
+/// `runpy._run_module_as_main` — the exact private entry CPython's own `-m` uses
+/// (`Modules/main.c` → `pymain_run_module` → `runpy._run_module_as_main`). The
+/// module runs on the real interpreter, not on fusevm, so `-m pip`, `-m venv`,
+/// `-m http.server`, `-m json.tool`, … behave identically to `python3 -m`.
+///
+/// `sys.argv` is set to `[modname, *args]`; `_run_module_as_main(alter_argv=True)`
+/// then overwrites `argv[0]` with the module's resolved file, matching CPython.
+/// Returns the process exit code: a `SystemExit` maps to its `.code` (an int as
+/// itself, `None` → 0, a str printed to stderr → 1); any other uncaught exception
+/// prints the CPython traceback and returns 1.
+pub fn run_module(modname: &str, args: &[String]) -> i32 {
+    init();
+    Python::with_gil(|py| {
+        let sys = match py.import("sys") {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("python: {e}");
+                return 1;
+            }
+        };
+        let argv = PyList::empty(py);
+        let _ = argv.append(modname);
+        for a in args {
+            let _ = argv.append(a);
+        }
+        if let Err(e) = sys.setattr("argv", argv) {
+            eprintln!("python: {e}");
+            return 1;
+        }
+        let runpy = match py.import("runpy") {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("python: {e}");
+                return 1;
+            }
+        };
+        // alter_argv=True → runpy replaces argv[0] with the module's origin path,
+        // exactly as CPython's `-m` does.
+        let code = match runpy.call_method1("_run_module_as_main", (modname, true)) {
+            Ok(_) => 0,
+            Err(e) => {
+                if e.is_instance_of::<pyo3::exceptions::PySystemExit>(py) {
+                    system_exit_code(py, &e)
+                } else {
+                    e.print(py);
+                    1
+                }
+            }
+        };
+        // The embedded interpreter is never `Py_Finalize`d (the process just
+        // exits), so its block-buffered `sys.stdout`/`stderr` would drop pending
+        // output on a pipe. Flush both before returning so piped `-m` output
+        // (e.g. `python -m pip --version | cat`) is not lost.
+        for stream in ["stdout", "stderr"] {
+            if let Ok(s) = sys.getattr(stream) {
+                let _ = s.call_method0("flush");
+            }
+        }
+        code
+    })
+}
+
+/// The process exit code carried by a `SystemExit`: an int as itself, `None`
+/// (or a missing `.code`) → 0, anything else → print `str(code)` to stderr, 1.
+fn system_exit_code(py: Python, e: &PyErr) -> i32 {
+    match e.value(py).getattr("code") {
+        Ok(code) if code.is_none() => 0,
+        Ok(code) => {
+            if let Ok(n) = code.extract::<i32>() {
+                n
+            } else {
+                eprintln!(
+                    "{}",
+                    code.str().map(|s| s.to_string()).unwrap_or_default()
+                );
+                1
+            }
+        }
+        Err(_) => 0,
+    }
+}
+
 /// Store a CPython object in the side-table and hand back its `Foreign` id.
 fn store(obj: Py<PyAny>) -> u32 {
     let mut t = table().lock().expect("ffi table poisoned");

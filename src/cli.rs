@@ -14,6 +14,44 @@ pub struct Cli {
     #[arg(short = 'c', long = "command", value_name = "SRC")]
     pub eval: Option<String>,
 
+    /// Run a library module as a script (`python -m pip …`); delegates to the
+    /// embedded CPython (`runpy`), so `-m pip`/`-m venv`/`-m http.server` behave
+    /// exactly like `python3 -m`. Trailing tokens become the module's `sys.argv`.
+    #[arg(short = 'm', value_name = "MODULE")]
+    pub module: Option<String>,
+
+    /// Force stdout/stderr unbuffered (CPython `-u` / `PYTHONUNBUFFERED`).
+    #[arg(short = 'u')]
+    pub unbuffered: bool,
+
+    /// Ignore `PYTHON*` environment variables (CPython `-E`). Accepted for
+    /// drop-in compatibility.
+    #[arg(short = 'E')]
+    pub ignore_env: bool,
+
+    /// Run in isolated mode (CPython `-I`). Accepted for drop-in compatibility.
+    #[arg(short = 'I')]
+    pub isolated: bool,
+
+    /// No `site` import (CPython `-S`). Accepted for drop-in compatibility.
+    #[arg(short = 'S')]
+    pub no_site: bool,
+
+    /// Don't write bytecode caches (CPython `-B`). Accepted for drop-in
+    /// compatibility.
+    #[arg(short = 'B')]
+    pub no_bytecode: bool,
+
+    /// Optimization level (CPython `-O` / `-OO`). Accepted for drop-in
+    /// compatibility.
+    #[arg(short = 'O', action = clap::ArgAction::Count)]
+    pub optimize: u8,
+
+    /// Warning filter(s) (CPython `-W <action>`). Passed to the embedded
+    /// interpreter via `PYTHONWARNINGS`.
+    #[arg(short = 'W', value_name = "ARG")]
+    pub warnings: Vec<String>,
+
     /// Start the interactive REPL.
     #[arg(long = "repl")]
     pub repl: bool,

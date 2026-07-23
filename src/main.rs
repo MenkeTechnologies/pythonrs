@@ -24,7 +24,30 @@ fn main() -> ExitCode {
 }
 
 fn run_main() -> ExitCode {
+    // CPython semantics: `-m module` terminates interpreter-option parsing. The
+    // module name follows and EVERYTHING after it is the module's own `sys.argv`,
+    // passed through verbatim (`pip install --upgrade`, `pytest --verbose`,
+    // `json.tool --sort-keys` — those flags belong to the module, not to python).
+    // clap can't model that, so intercept `-m` from the raw args before clap sees
+    // the tail. Leading interpreter flags (before `-m`) are still honored.
+    let raw: Vec<String> = std::env::args().collect();
+    if let Some(m) = find_dash_m(&raw) {
+        apply_leading_flags(&raw[1..m.flag_idx]);
+        let code = pythonrs::run_module(&m.module, &m.args);
+        return ExitCode::from((code & 0xFF) as u8);
+    }
+
     let cli = pythonrs::cli::parse();
+
+    // CPython interpreter flags that affect the embedded runtime. Set as env vars
+    // before the interpreter starts (`ffi::init` reads them at Py_Initialize); the
+    // embedded CPython that hosts the stdlib bridge then honors them.
+    if cli.unbuffered {
+        std::env::set_var("PYTHONUNBUFFERED", "1");
+    }
+    if !cli.warnings.is_empty() {
+        std::env::set_var("PYTHONWARNINGS", cli.warnings.join(","));
+    }
 
     if cli.lsp {
         return match pythonrs::lsp::run() {
@@ -126,6 +149,79 @@ fn run_main() -> ExitCode {
     let mut argv = vec![String::new()];
     argv.extend(cli.argv);
     emit(pythonrs::run_program(&src, argv, None, "<stdin>", false))
+}
+
+/// A parsed `-m` invocation: where `-m` sat, the module name, and the module's
+/// verbatim argv (everything after the module name).
+struct DashM {
+    flag_idx: usize,
+    module: String,
+    args: Vec<String>,
+}
+
+/// Scan raw process args for CPython's `-m` (or glued `-mMODULE`), stopping if
+/// `-c` appears first (its code string, not `-m`, then terminates parsing). Only
+/// interpreter-option tokens may precede `-m`; the first bare token that is not
+/// such an option is a script path, so `-m` after it doesn't apply.
+fn find_dash_m(raw: &[String]) -> Option<DashM> {
+    let mut i = 1;
+    while i < raw.len() {
+        let a = &raw[i];
+        if a == "-c" {
+            return None; // `-c` wins; clap handles it.
+        }
+        if a == "-m" {
+            let module = raw.get(i + 1)?.clone();
+            return Some(DashM {
+                flag_idx: i,
+                module,
+                args: raw[i + 2..].to_vec(),
+            });
+        }
+        if let Some(module) = a.strip_prefix("-m").filter(|s| !s.is_empty()) {
+            // Glued `-mpip` form (CPython accepts it).
+            return Some(DashM {
+                flag_idx: i,
+                module: module.to_string(),
+                args: raw[i + 1..].to_vec(),
+            });
+        }
+        if a == "-W" {
+            i += 2; // `-W <action>` consumes its value.
+            continue;
+        }
+        if a.starts_with('-') && a.len() > 1 {
+            i += 1; // another interpreter flag (-u/-E/-I/-O/-S/-B/…).
+            continue;
+        }
+        return None; // a bare token (script path) — not `-m` mode.
+    }
+    None
+}
+
+/// Apply the runtime-affecting interpreter flags that appeared before `-m`
+/// (`-u` → unbuffered, `-W <action>` → warning filter) as env vars the embedded
+/// CPython reads at startup. Other flags (`-E/-I/-O/-S/-B`) are accepted no-ops.
+fn apply_leading_flags(leading: &[String]) {
+    let mut warns: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < leading.len() {
+        match leading[i].as_str() {
+            "-u" => std::env::set_var("PYTHONUNBUFFERED", "1"),
+            "-W" => {
+                if let Some(v) = leading.get(i + 1) {
+                    warns.push(v.clone());
+                    i += 2;
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if !warns.is_empty() {
+        std::env::set_var("PYTHONWARNINGS", warns.join(","));
+    }
 }
 
 /// Emit a run's stderr text (traceback / `SystemExit` message) and reduce its

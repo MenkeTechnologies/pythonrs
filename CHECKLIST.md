@@ -82,6 +82,20 @@ dispatch; `[in-flight]` = being implemented in the current host pass.
       `3.14.6`), `version_info` (a namedtuple), `platform`, `maxsize`, `path`
       (list), `executable`, `modules`, `getrecursionlimit()`/`setrecursionlimit()`.
 - [x] `python -c`, `python file.py`, stdin-as-script dispatch run; non-zero exit on error.
+- [x] **`python -m MODULE [args…]`** — delegates to the embedded CPython
+      (`runpy._run_module_as_main`, the same entry CPython's own `-m` uses), so
+      `-m pip`/`-m venv`/`-m http.server`/`-m json.tool`/`-m calendar` run on the
+      real interpreter. `-m` terminates interpreter-option parsing (raw-arg
+      interception in `main.rs`), so every token after the module is the module's
+      verbatim `sys.argv` (`pip install --upgrade`, `json.tool --sort-keys`);
+      exit code propagates (`SystemExit.code` / uncaught → 1); piped `stdout` is
+      flushed before exit (the interpreter is never `Py_Finalize`d). Requires the
+      `stdlib-ffi` bridge; a `--no-default-features` build reports and exits 1.
+- [x] **CPython interpreter flags** `-u -E -I -O/-OO -S -B -W <action>` — accepted
+      for drop-in compatibility (previously hard-errored via clap). `-u` →
+      `PYTHONUNBUFFERED`, `-W` → `PYTHONWARNINGS` (real effect on the embedded
+      interpreter); `-E/-I/-O/-S/-B` are tolerated no-ops. (`src/cli.rs`,
+      `src/main.rs`.)
 
 ## Tier 1 — File & process I/O (top blocker for real scripts)
 

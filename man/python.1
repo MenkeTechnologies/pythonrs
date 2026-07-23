@@ -19,6 +19,32 @@ Every ordinary run transparently caches compiled bytecode in
 .B \-c \fISRC\fR
 Execute a one\-liner instead of a file.
 .TP
+.B \-m \fIMODULE\fR [\fIargs\fR...]
+Run a library module as a script. Delegates to the embedded CPython
+.RB ( runpy ),
+so
+.BR "\-m pip" ,
+.BR "\-m venv" ,
+.BR "\-m http.server" ,
+and
+.B \-m json.tool
+behave exactly like
+.BR "python3 \-m" .
+Every token after the module name is the module's own
+.BR sys.argv .
+Requires the stdlib\-ffi bridge (the default build).
+.TP
+.B \-u
+Force stdout/stderr unbuffered (CPython
+.BR \-u / PYTHONUNBUFFERED ).
+.TP
+.B \-E \-I \-O \-S \-B \-W \fIACTION\fR
+CPython interpreter flags, accepted for drop\-in compatibility.
+.B \-u
+and
+.B \-W
+take real effect via the embedded interpreter; the rest are tolerated no\-ops.
+.TP
 .B \-\-build
 Ahead\-of\-time compile the script to a standalone native executable.
 .TP

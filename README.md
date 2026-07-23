@@ -125,6 +125,10 @@ what is not yet implemented.
 | Flag | Effect |
 |---|---|
 | *(none)* | Run the script/one-liner, transparently rkyv-cached. |
+| `-c SRC` | Execute a one-liner (`python -c 'print(1+1)'`). |
+| `-m MODULE …` | Run a library module as a script. Delegates to the embedded CPython (`runpy`), so `-m pip` / `-m venv` / `-m http.server` / `-m json.tool` behave exactly like `python3 -m`; every token after the module is the module's own `sys.argv`. Needs the `stdlib-ffi` bridge (default build). |
+| `-u` | Force unbuffered `stdout`/`stderr` (`PYTHONUNBUFFERED`). |
+| `-E -I -O -S -B -W` | CPython interpreter flags, accepted for drop-in compatibility (`-u`/`-W` take real effect via the embedded interpreter; the rest are tolerated no-ops). |
 | `--build` | AOT-compile the script to a standalone native executable. |
 | `--dump-bytecode` | Print the lowered `fusevm` bytecode and exit. |
 | `--repl` | Start the interactive REPL. |
