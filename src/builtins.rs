@@ -10548,7 +10548,11 @@ pub fn apply_format_spec(s: &str, v: &Value, spec: &str) -> Result<String, Strin
             }
         };
 
-    let numeric = as_f(v).is_some();
+    // `as_f` narrows to f64 and returns `None` for a bignum, so it can't be the
+    // sole numeric test: an int above `i64::MAX` is still numeric and must keep
+    // grouping, the `+`/space sign flag, and `0`-fill interleave. `is_int_like`
+    // covers the `PyObj::BigInt` case that `as_f` drops.
+    let numeric = as_f(v).is_some() || is_int_like(v);
     // Decompose the numeric body into sign / radix-prefix / integer-digits /
     // trailing (fraction or exponent), so grouping and sign-aware zero-fill can
     // operate on just the integer digits — exactly like CPython.

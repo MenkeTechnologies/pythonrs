@@ -204,3 +204,45 @@ fn format_keyword_index_attr_fields() {
         "'   3.1416'"
     );
 }
+
+/// Numeric format specs (`,`/`_` grouping, `+`/space sign, `0`-fill interleave)
+/// must keep working for integers above `i64::MAX`. The `numeric` gate used to
+/// derive from `as_f`, which narrows to f64 and returns `None` for a bignum, so
+/// every one of these silently no-op'd — grouping dropped, sign dropped, and the
+/// `0`-fill path appended zeros on the wrong side, corrupting the magnitude.
+/// Expected strings are what CPython 3.14 produces for the same specs.
+#[test]
+fn format_grouping_bignum() {
+    // `,` grouping straddling the i64 boundary (2**62 fits i64; 2**63 does not).
+    assert_eq!(g("x = f'{2**62:,}'", "x"), "'4,611,686,018,427,387,904'");
+    assert_eq!(g("x = f'{2**63:,}'", "x"), "'9,223,372,036,854,775,808'");
+    assert_eq!(g("x = f'{2**64:,}'", "x"), "'18,446,744,073,709,551,616'");
+    assert_eq!(
+        g("x = f'{10**30:,}'", "x"),
+        "'1,000,000,000,000,000,000,000,000,000,000'"
+    );
+    assert_eq!(g("x = f'{-(2**64):,}'", "x"), "'-18,446,744,073,709,551,616'");
+    // `_` grouping, decimal and radix (hex groups by 4, honoring `#`).
+    assert_eq!(g("x = f'{10**20:_}'", "x"), "'100_000_000_000_000_000_000'");
+    assert_eq!(g("x = f'{2**64:_x}'", "x"), "'1_0000_0000_0000_0000'");
+    assert_eq!(
+        g("x = f'{2**80:#_x}'", "x"),
+        "'0x1_0000_0000_0000_0000_0000'"
+    );
+    // `+`/space sign flag on a non-negative bignum.
+    assert_eq!(g("x = f'{2**64:+}'", "x"), "'+18446744073709551616'");
+    assert_eq!(g("x = f'{2**64:+,}'", "x"), "'+18,446,744,073,709,551,616'");
+    // `0`-fill (`=` align) must interleave separators into the zero padding, not
+    // pad the block as opaque text.
+    assert_eq!(g("x = f'{2**64:020,}'", "x"), "'18,446,744,073,709,551,616'");
+    assert_eq!(
+        g("x = f'{2**64:030_}'", "x"),
+        "'00_018_446_744_073_709_551_616'"
+    );
+    assert_eq!(
+        g("x = f'{2**64:+030,}'", "x"),
+        "'+0,018,446,744,073,709,551,616'"
+    );
+    // Regression guard: the i64 fast path stays correct.
+    assert_eq!(g("x = f'{-12345:,}'", "x"), "'-12,345'");
+}
