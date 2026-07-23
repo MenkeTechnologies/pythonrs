@@ -2918,6 +2918,19 @@ pub fn is_type_like_builtin(name: &str) -> bool {
     is_builtin_type(name) || is_exception_class(name)
 }
 
+/// The classmethod names of a builtin type — the members reached as
+/// `<type>.__dict__[name]` that are C classmethod descriptors (`dict.fromkeys`,
+/// `int.from_bytes`, …). Used to populate a type object's `__dict__` proxy.
+pub fn type_classmethods(name: &str) -> &'static [&'static str] {
+    match name {
+        "dict" => &["fromkeys"],
+        "int" => &["from_bytes"],
+        "bytes" | "bytearray" => &["fromhex"],
+        "float" => &["fromhex"],
+        _ => &[],
+    }
+}
+
 /// The builtin *type* names (constructors), as a slice so the `builtins` module
 /// namespace can enumerate them without duplicating the list.
 pub const BUILTIN_TYPES: &[&str] = &[

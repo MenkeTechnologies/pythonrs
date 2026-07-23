@@ -55,6 +55,31 @@ fn builtins_module_exposes_functions_types_exceptions() {
 }
 
 #[test]
+fn introspection_descriptor_types() {
+    // The C-level descriptor / mappingproxy types the faithful types.py derives.
+    assert_eq!(g("x = type(type.__dict__).__name__", "x"), "'mappingproxy'");
+    assert_eq!(g("x = type(object.__init__).__name__", "x"), "'wrapper_descriptor'");
+    assert_eq!(g("x = type(object().__str__).__name__", "x"), "'method-wrapper'");
+    assert_eq!(
+        g("x = type(dict.__dict__['fromkeys']).__name__", "x"),
+        "'classmethod_descriptor'",
+    );
+    assert_eq!(
+        g("def _f(): pass\nx = type(type(_f).__code__).__name__", "x"),
+        "'getset_descriptor'",
+    );
+    assert_eq!(
+        g("def _f(): pass\nx = type(type(_f).__globals__).__name__", "x"),
+        "'member_descriptor'",
+    );
+    // A mappingproxy indexes through to its wrapped dict.
+    assert_eq!(
+        g("x = type(dict.__dict__['fromkeys']).__name__", "x"),
+        "'classmethod_descriptor'",
+    );
+}
+
+#[test]
 fn simplenamespace_and_sys_implementation() {
     // sys.implementation is a native SimpleNamespace; its type is what the
     // faithful types.py binds as SimpleNamespace.

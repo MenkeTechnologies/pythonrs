@@ -329,6 +329,56 @@ pub struct Instance {
     pub payload: Value,
 }
 
+/// The `object`-level dunder slots that a type object exposes as
+/// `wrapper_descriptor`s (`type(object.__init__)`). The comparison/hash/attr/
+/// format slots CPython wraps; enough for introspection to classify them.
+const OBJECT_SLOT_WRAPPERS: &[&str] = &[
+    "__init__",
+    "__str__",
+    "__repr__",
+    "__eq__",
+    "__ne__",
+    "__lt__",
+    "__le__",
+    "__gt__",
+    "__ge__",
+    "__hash__",
+    "__delattr__",
+    "__setattr__",
+    "__getattribute__",
+    "__format__",
+    "__sizeof__",
+];
+
+/// The kind of a C-level attribute [`PyObj::Descriptor`], which fixes its
+/// `type().__name__`. These are the descriptor types CPython's `types` module
+/// derives so the stdlib can classify class members.
+#[derive(Clone, Copy, PartialEq)]
+pub enum DescKind {
+    /// `type(object.__init__)` — an unbound slot wrapper on a type.
+    WrapperDescriptor,
+    /// `type(object().__str__)` — a slot wrapper bound to an instance.
+    MethodWrapper,
+    /// `type(dict.__dict__['fromkeys'])` — a C classmethod.
+    ClassMethodDescriptor,
+    /// `type(FunctionType.__code__)` — a computed (get/set) attribute.
+    GetSetDescriptor,
+    /// `type(FunctionType.__globals__)` — a C struct-member attribute.
+    MemberDescriptor,
+}
+
+impl DescKind {
+    fn type_name(self) -> &'static str {
+        match self {
+            DescKind::WrapperDescriptor => "wrapper_descriptor",
+            DescKind::MethodWrapper => "method-wrapper",
+            DescKind::ClassMethodDescriptor => "classmethod_descriptor",
+            DescKind::GetSetDescriptor => "getset_descriptor",
+            DescKind::MemberDescriptor => "member_descriptor",
+        }
+    }
+}
+
 /// A heap object.
 #[derive(Clone)]
 pub enum PyObj {
@@ -377,6 +427,19 @@ pub enum PyObj {
     /// `namespace(k=v, …)`. Native VM object.
     Namespace {
         attrs: IndexMap<String, Value>,
+    },
+    /// A read-only view of a mapping (`types.MappingProxyType`) — what a type's
+    /// `__dict__` returns. Reads pass through to `dict`; there is no mutating API.
+    MappingProxy {
+        dict: Value,
+    },
+    /// One of CPython's C-level attribute descriptors, distinguished by `kind`.
+    /// These exist so faithful introspection (`type(object.__init__)`,
+    /// `type(dict.__dict__['fromkeys'])`, `type(FunctionType.__code__)`) yields
+    /// the right distinct type object; `qual` is the `owner.name` display.
+    Descriptor {
+        kind: DescKind,
+        qual: String,
     },
     /// A first-class reference to a builtin function (`len`, `print`, …).
     Builtin(String),
@@ -2342,6 +2405,8 @@ impl PyHost {
                 Some(PyObj::Code { .. }) => "code".into(),
                 Some(PyObj::Union { .. }) => "UnionType".into(),
                 Some(PyObj::Namespace { .. }) => "SimpleNamespace".into(),
+                Some(PyObj::MappingProxy { .. }) => "mappingproxy".into(),
+                Some(PyObj::Descriptor { kind, .. }) => kind.type_name().into(),
                 Some(PyObj::LruCache { .. }) => "functools._lru_cache_wrapper".into(),
                 Some(PyObj::Super { .. }) => "super".into(),
                 Some(PyObj::StaticMethod(_)) => "staticmethod".into(),
@@ -2473,6 +2538,23 @@ impl PyHost {
                         .collect::<Vec<_>>()
                         .join(", ");
                     format!("namespace({inner})")
+                }
+                Some(PyObj::MappingProxy { dict }) => {
+                    let dict = dict.clone();
+                    format!("mappingproxy({})", self.repr_of(&dict))
+                }
+                Some(PyObj::Descriptor { kind, qual }) => {
+                    let (kind, qual) = (*kind, qual.clone());
+                    let (owner, name) = qual.split_once('.').unwrap_or(("", qual.as_str()));
+                    match kind {
+                        DescKind::MethodWrapper => {
+                            format!("<method-wrapper '{name}' of object>")
+                        }
+                        DescKind::GetSetDescriptor | DescKind::MemberDescriptor => {
+                            format!("<attribute '{name}' of '{owner}' objects>")
+                        }
+                        _ => format!("<{} '{name}' of '{owner}' objects>", kind.type_name()),
+                    }
                 }
                 // A `PyObj::Builtin` is an unbound builtin method
                 // (`str.upper`), a *type object* returned by `type(x)` (repr
@@ -5285,6 +5367,11 @@ impl PyHost {
                     None => Err(self.key_error(idx)),
                 }
             }
+            // A mappingproxy indexes through to its backing dict (read-only).
+            Some(PyObj::MappingProxy { dict }) => {
+                let dict = dict.clone();
+                self.get_item(&dict, idx)
+            }
             Some(PyObj::Range { start, step, .. }) => {
                 let (start, step) = (*start, *step);
                 let len = match self.get(recv) {
@@ -6321,6 +6408,14 @@ impl PyHost {
                         _ => return Ok(v),
                     }
                 }
+                // An inherited `object` slot reached on an instance (`obj.__str__`)
+                // with no user override is a bound method-wrapper, as in CPython.
+                if OBJECT_SLOT_WRAPPERS.contains(&name) {
+                    return Ok(self.alloc(PyObj::Descriptor {
+                        kind: DescKind::MethodWrapper,
+                        qual: format!("{class}.{name}"),
+                    }));
+                }
                 Err(format!(
                     "AttributeError: '{}' object has no attribute '{}'",
                     class, name
@@ -6597,6 +6692,53 @@ impl PyHost {
                 // `type(x).__name__` — the builtin/type object's name.
                 let n = n.clone();
                 Ok(self.new_str(n))
+            }
+            // `<type>.__dict__` — a mappingproxy over the type's namespace. Sparse
+            // for builtin types: only the classmethod descriptors the stdlib
+            // reaches via `<type>.__dict__[name]` are populated (pythonrs has no
+            // full C method table to enumerate).
+            Some(PyObj::Builtin(n))
+                if name == "__dict__" && crate::builtins::is_type_like_builtin(n) =>
+            {
+                let n = n.clone();
+                let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+                for cm in crate::builtins::type_classmethods(&n) {
+                    let key = self.new_str((*cm).to_string());
+                    let desc = self.alloc(PyObj::Descriptor {
+                        kind: DescKind::ClassMethodDescriptor,
+                        qual: format!("{n}.{cm}"),
+                    });
+                    d.insert(PKey::Str((*cm).to_string()), (key, desc));
+                }
+                let dict = self.alloc(PyObj::Dict(d));
+                Ok(self.alloc(PyObj::MappingProxy { dict }))
+            }
+            // `FunctionType.__code__` / `.__globals__` reached on the TYPE object
+            // are the get/set and member descriptors CPython's `types` derives.
+            Some(PyObj::Builtin(n)) if n == "function" && name == "__code__" => {
+                Ok(self.alloc(PyObj::Descriptor {
+                    kind: DescKind::GetSetDescriptor,
+                    qual: "function.__code__".into(),
+                }))
+            }
+            Some(PyObj::Builtin(n)) if n == "function" && name == "__globals__" => {
+                Ok(self.alloc(PyObj::Descriptor {
+                    kind: DescKind::MemberDescriptor,
+                    qual: "function.__globals__".into(),
+                }))
+            }
+            // A dunder slot reached on a builtin type object (`object.__init__`)
+            // is an unbound slot wrapper (`wrapper_descriptor`).
+            Some(PyObj::Builtin(n))
+                if crate::builtins::is_type_like_builtin(n)
+                    && name.starts_with("__")
+                    && name.ends_with("__")
+                    && OBJECT_SLOT_WRAPPERS.contains(&name) =>
+            {
+                Ok(self.alloc(PyObj::Descriptor {
+                    kind: DescKind::WrapperDescriptor,
+                    qual: format!("{n}.{name}"),
+                }))
             }
             // `dict.fromkeys` — a classmethod on the `dict` type, reached as an
             // attribute of the `dict` builtin. Returns a callable builtin.
