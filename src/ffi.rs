@@ -273,6 +273,19 @@ pub fn same_object(a: u32, b: u32) -> bool {
     })
 }
 
+/// `PyObject_RichCompareBool(a, b, Py_EQ)` on two `Foreign` handles — CPython's
+/// own identity-then-`__eq__`, the exact primitive `in` / `.index` / `.count` /
+/// list-`==` use. Borrow-free: it reads only the FFI side-table (never the host),
+/// so it is safe to call from `PyHost::equal` while the host is already borrowed
+/// (unlike [`binary_op_cb`], which re-borrows the host to marshal a native
+/// operand). Enum members — and any two equal CPython objects — compare True.
+pub fn foreign_eq(a: u32, b: u32) -> bool {
+    Python::with_gil(|py| match (fetch(py, a), fetch(py, b)) {
+        (Ok(x), Ok(y)) => x.eq(&y).unwrap_or(false),
+        _ => false,
+    })
+}
+
 /// Create a class with foreign (CPython) bases via CPython's own class machinery
 /// (`class C(enum.Enum): A = 1` → `EnumType`). `types.new_class` computes the
 /// metaclass, fires `__prepare__`, and the body populates the prepared namespace

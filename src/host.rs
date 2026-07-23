@@ -2539,6 +2539,17 @@ impl PyHost {
                     // identity (`... == ...`, and `lst.count(...)`).
                     (Some(PyObj::Ellipsis), Some(PyObj::Ellipsis))
                     | (Some(PyObj::NotImplemented), Some(PyObj::NotImplemented)) => true,
+                    // Two CPython `Foreign` objects (stdlib-ffi): defer to CPython's
+                    // own identity-then-`__eq__`, so an enum member `in (A, B)`,
+                    // `(A, B).index(member)`, `list.count(member)`, and a list/tuple
+                    // `==` holding foreign elements all match CPython. Two distinct
+                    // handles onto the same singleton (`S.A` fetched twice) are `is`
+                    // and `==` equal there; the raw `a == b` handle-id fallback below
+                    // would wrongly call them unequal.
+                    #[cfg(feature = "stdlib-ffi")]
+                    (Some(PyObj::Foreign(x)), Some(PyObj::Foreign(y))) => {
+                        crate::ffi::foreign_eq(*x, *y)
+                    }
                     _ => match (a, b) {
                         (Value::Str(x), Value::Str(y)) => x == y,
                         _ => a == b,

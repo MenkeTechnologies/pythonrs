@@ -45,6 +45,32 @@ fn json_dumps_loads_roundtrip() {
 
 #[cfg(feature = "stdlib-ffi")]
 #[test]
+fn enum_member_container_membership_uses_python_equality() {
+    // Regression: `PyHost::equal` compared two `Foreign` handles by raw handle id,
+    // so an enum member fetched twice read as unequal — `member in (A, B)`,
+    // `.index`, `.count`, and list/tuple `==` over foreign elements all failed
+    // while `==`/`is` on the same members succeeded (a different code path). They
+    // now route through CPython's identity-then-`__eq__` (`ffi::foreign_eq`).
+    let src = "\
+from enum import Enum, auto
+class S(Enum):
+    A = auto()
+    B = auto()
+    C = auto()
+x = S.A
+r = [
+    x in (S.A, S.B),
+    x in [S.A, S.B],
+    S.C in (S.A, S.B),
+    (S.A, S.B).index(S.A),
+    [S.A, S.A, S.B].count(S.A),
+    [S.A, S.B] == [S.A, S.B],
+]";
+    assert_eq!(g(src, "r"), "[True, True, False, 0, 2, True]");
+}
+
+#[cfg(feature = "stdlib-ffi")]
+#[test]
 fn itertools_eager_combinatorics() {
     assert_eq!(
         g(
