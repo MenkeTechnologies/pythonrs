@@ -891,3 +891,30 @@ fn vendored_import_is_memoized() {
         "True"
     );
 }
+
+#[test]
+fn dunder_contains_is_callable_on_builtin_containers() {
+    // `c.__contains__(x)` == `x in c` for every builtin container — the stdlib
+    // `keyword.py` binds `frozenset(kwlist).__contains__` to build `iskeyword`.
+    assert_eq!(g("x = frozenset([1, 2, 3]).__contains__(2)", "x"), "True");
+    assert_eq!(g("x = {1, 2}.__contains__(5)", "x"), "False");
+    assert_eq!(g("x = [1, 2].__contains__(2)", "x"), "True");
+    assert_eq!(g("x = {'a': 1}.__contains__('a')", "x"), "True");
+    assert_eq!(g("x = 'abc'.__contains__('b')", "x"), "True");
+}
+
+#[cfg(not(feature = "stdlib-ffi"))]
+#[test]
+fn vendored_keyword_runs_on_pythonrs() {
+    // `keyword.py` executes end-to-end on pythonrs (native build, no libpython):
+    // its `iskeyword`/`issoftkeyword` are `frozenset(...).__contains__` bindings.
+    assert_eq!(g("import keyword\nx = keyword.iskeyword('for')", "x"), "True");
+    assert_eq!(
+        g("import keyword\nx = keyword.iskeyword('banana')", "x"),
+        "False"
+    );
+    assert_eq!(
+        g("import keyword\nx = keyword.issoftkeyword('match')", "x"),
+        "True"
+    );
+}

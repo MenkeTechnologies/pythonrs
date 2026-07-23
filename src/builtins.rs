@@ -5564,6 +5564,30 @@ fn type_isa(h: &host::PyHost, a: &str, b: &str) -> bool {
 /// Whether `typename` responds to method `name` (used by `getattr`/bound
 /// methods to distinguish a method from an `AttributeError`).
 pub fn type_has_method(typename: &str, name: &str) -> bool {
+    // `__contains__` is a real bound method on every builtin container in CPython
+    // (`frozenset(kwlist).__contains__` is exactly how the stdlib `keyword.py`
+    // builds `iskeyword`). Recognize it explicitly — it is kept OUT of the
+    // per-type method lists below (which feed `dir()`), and `call_type_method`
+    // routes the call through the membership check.
+    if name == "__contains__"
+        && matches!(
+            typename,
+            "str" | "bytes"
+                | "bytearray"
+                | "list"
+                | "tuple"
+                | "dict"
+                | "set"
+                | "frozenset"
+                | "range"
+                | "deque"
+                | "dict_keys"
+                | "dict_items"
+                | "dict_values"
+        )
+    {
+        return true;
+    }
     let list: &[&str] = match typename {
         "str" => STR_METHODS,
         "bytes" => BYTES_METHODS,
@@ -6032,6 +6056,13 @@ pub fn call_type_method(
         return r;
     }
     let tn = with_host(|h| h.type_name(recv));
+    // Universal container dunder: `c.__contains__(x)` == `x in c`. Routed through
+    // the host membership check so a method bound off any builtin container
+    // (`frozenset(...).__contains__`, `"abc".__contains__`, …) is callable.
+    if name == "__contains__" {
+        let item = arg0(&args)?;
+        return Ok(Value::Bool(with_host(|h| h.contains(&item, recv))?));
+    }
     // Set-like dict views (`dict_keys`/`dict_items`) support `isdisjoint`.
     if matches!(tn.as_str(), "dict_keys" | "dict_items") && name == "isdisjoint" {
         let other = arg0(&args)?;
