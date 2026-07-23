@@ -808,6 +808,11 @@ pub struct PyHost {
     /// consult these.
     pub stdout_target: Option<Value>,
     pub stderr_target: Option<Value>,
+    /// Imported modules keyed by dotted name — pythonrs's `sys.modules`. A second
+    /// `import x` returns the cached module object (CPython identity + run-once
+    /// side effects) instead of re-executing the vendored `.py`. Populated by
+    /// `import_module` on every successful import (native, vendored, or bridged).
+    modules: IndexMap<String, Value>,
 }
 
 /// Whether a `GenCell` backs a plain generator, an `async def` coroutine, or
@@ -1029,7 +1034,18 @@ impl PyHost {
             traceback: Vec::new(),
             stdout_target: None,
             stderr_target: None,
+            modules: IndexMap::new(),
         }
+    }
+
+    /// A previously-imported module by dotted name (pythonrs's `sys.modules`).
+    pub fn cached_module(&self, name: &str) -> Option<Value> {
+        self.modules.get(name).cloned()
+    }
+
+    /// Record `module` under `name` so a re-import returns the same object.
+    pub fn cache_module(&mut self, name: &str, module: Value) {
+        self.modules.insert(name.to_string(), module);
     }
 
     /// Record `__cause__`/`__context__` for an exception object. `Undef` leaves
@@ -9435,9 +9451,23 @@ fn enumerate_step(it: &Value) -> Result<Option<Value>, String> {
     }
 }
 
-/// Import a module by name. A small built-in set is supported; unknown modules
-/// raise `ModuleNotFoundError`.
+/// Import a module by name, memoized through the host's `sys.modules` cache: the
+/// first import runs (native arm, vendored `.py`, or bridge), later imports of the
+/// same name return the identical cached object — CPython's run-once semantics.
 pub fn import_module(name: &str) -> Result<Value, String> {
+    if let Some(m) = with_host(|h| h.cached_module(name)) {
+        return Ok(m);
+    }
+    let module = import_module_inner(name)?;
+    with_host(|h| h.cache_module(name, module.clone()));
+    Ok(module)
+}
+
+/// The uncached import resolution: native inline arms, then the vendored CPython
+/// stdlib `.py` shipped in `pylib/` (run on pythonrs itself), then — only in the
+/// default build and only until the native C-accelerator floor is complete — the
+/// `stdlib-ffi` bridge.
+fn import_module_inner(name: &str) -> Result<Value, String> {
     // Native stdlib modules under src/stdlib. Their `entries` return owned-String
     // keys (vs the `&str` keys of the inline arms below), so build the namespace
     // here and return before the `&str` match. These are pure-Python subsets
@@ -9692,24 +9722,144 @@ pub fn import_module(name: &str) -> Result<Value, String> {
             ]
         }),
         _ => {
-            // With the CPython stdlib bridge on, a module pythonrs doesn't provide
-            // natively is imported from the real CPython stdlib (pure `.py` + C
-            // accelerators) and returned as a `Foreign` module handle. `from x
-            // import y`, submodules (`os.path`), and `sys.modules` all fall out of
-            // CPython's own importer.
+            // Native build (`--no-default-features`): the vendored CPython stdlib
+            // `.py` shipped in `pylib/` is the ONLY source — compiled and executed
+            // on pythonrs's OWN interpreter, no libpython. This is the endgame
+            // path; `brew install pythonrs` lays `pylib/` down beside the binary
+            // and CPython is never in the dependency graph.
+            #[cfg(not(feature = "stdlib-ffi"))]
+            {
+                return match try_import_vendored(name) {
+                    Some(res) => res,
+                    None => Err(format!("ModuleNotFoundError: No module named '{name}'")),
+                };
+            }
+            // Default build: the `stdlib-ffi` bridge (libpython) stays primary so
+            // behavior is drop-in while the native C-accelerator floor
+            // (`posix`/`_io`/`_sre`/…) that the vendored `.py` needs is still being
+            // built out. The vendored path is exercised by the native build.
             #[cfg(feature = "stdlib-ffi")]
             {
                 let id = crate::ffi::import(name)?;
                 return Ok(with_host(|h| h.alloc(PyObj::Foreign(id))));
             }
-            #[cfg(not(feature = "stdlib-ffi"))]
-            return Err(format!("ModuleNotFoundError: No module named '{name}'"));
         }
     };
     Ok(with_host(|h| {
         let mut ns = IndexMap::new();
         for (k, v) in entries {
             ns.insert(k.to_string(), v);
+        }
+        h.alloc(PyObj::Module {
+            name: name.to_string(),
+            ns,
+        })
+    }))
+}
+
+// ── vendored stdlib importer (`pylib/`) ──────────────────────────────────────
+// pythonrs ships CPython's pure-Python stdlib `.py` files under `pylib/` and runs
+// them on its OWN lexer/parser/compiler/fusevm — no libpython. This is what makes
+// pythonrs a real Python implementation rather than a pyo3 wrapper.
+
+/// Locate the vendored stdlib root (`pylib/`). Search order:
+///   1. `$PYTHONRS_LIB` (an explicit override / install-time path).
+///   2. `<exe_dir>/../lib/pythonrs/pylib` and `<exe_dir>/pylib` (install layout,
+///      e.g. what a Homebrew formula lays down beside the binary).
+///   3. `<CARGO_MANIFEST_DIR>/pylib` (the in-repo tree, for `cargo run`/tests).
+#[cfg(not(feature = "stdlib-ffi"))]
+fn pylib_dir() -> Option<std::path::PathBuf> {
+    if let Some(p) = std::env::var_os("PYTHONRS_LIB") {
+        let p = std::path::PathBuf::from(p);
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            for cand in [
+                dir.join("../lib/pythonrs/pylib"),
+                dir.join("../pylib"),
+                dir.join("pylib"),
+            ] {
+                if cand.is_dir() {
+                    return Some(cand);
+                }
+            }
+        }
+    }
+    let dev = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("pylib");
+    dev.is_dir().then_some(dev)
+}
+
+/// Resolve a dotted module name to its vendored source file, if present:
+/// `json` → `pylib/json.py` or `pylib/json/__init__.py`; `os.path` →
+/// `pylib/os/path.py` or `pylib/os/path/__init__.py`.
+#[cfg(not(feature = "stdlib-ffi"))]
+fn resolve_vendored_path(name: &str) -> Option<std::path::PathBuf> {
+    let root = pylib_dir()?;
+    let rel = name.replace('.', "/");
+    let module_file = root.join(format!("{rel}.py"));
+    if module_file.is_file() {
+        return Some(module_file);
+    }
+    let package_init = root.join(&rel).join("__init__.py");
+    package_init.is_file().then_some(package_init)
+}
+
+/// Try to import `name` from the vendored stdlib. `None` = no such `.py` file
+/// (caller tries the next resolver); `Some(Ok)` = ran on pythonrs and produced a
+/// native module; `Some(Err)` = the file exists but failed to execute.
+#[cfg(not(feature = "stdlib-ffi"))]
+fn try_import_vendored(name: &str) -> Option<Result<Value, String>> {
+    let path = resolve_vendored_path(name)?;
+    let src = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) => return Some(Err(format!("ImportError: cannot read {}: {e}", path.display()))),
+    };
+    Some(run_vendored_module(name, &src, &path))
+}
+
+/// Execute a vendored module's source in a fresh namespace (its `__dict__`) at
+/// module scope, then package the resulting globals as a native `PyObj::Module`.
+/// The caller's globals and frame stack are saved and restored around the run.
+#[cfg(not(feature = "stdlib-ffi"))]
+fn run_vendored_module(name: &str, src: &str, path: &std::path::Path) -> Result<Value, String> {
+    // Save the importer's namespace + park its frames so the module body runs at a
+    // clean module scope (its `def`/`class`/assignments become the module globals).
+    let saved_globals = with_host(|h| h.snapshot_globals());
+    let parked = with_host(|h| h.enter_module_scope());
+
+    // Seed the module dunders CPython sets before executing the body.
+    with_host(|h| {
+        let name_v = h.new_str(name);
+        let file_v = h.new_str(path.to_string_lossy());
+        let mut ns: IndexMap<String, Value> = IndexMap::new();
+        ns.insert("__name__".to_string(), name_v);
+        ns.insert("__file__".to_string(), file_v);
+        ns.insert("__doc__".to_string(), Value::Undef);
+        h.replace_globals(ns);
+    });
+
+    let run = (|| -> Result<(), String> {
+        let prog = crate::compile_or_load(src)?;
+        let chunk = crate::load_merged(prog);
+        run_chunk_on(chunk)?;
+        Ok(())
+    })();
+
+    // Snapshot the module namespace BEFORE restoring the importer's globals.
+    let ns_pairs = with_host(|h| h.globals_pairs());
+    with_host(|h| {
+        h.replace_globals(saved_globals);
+        h.restore_scope(parked);
+    });
+    run?;
+
+    Ok(with_host(|h| {
+        let mut ns: IndexMap<String, Value> = IndexMap::new();
+        for (k, v) in ns_pairs {
+            ns.insert(k, v);
         }
         h.alloc(PyObj::Module {
             name: name.to_string(),

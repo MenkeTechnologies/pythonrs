@@ -863,3 +863,31 @@ fn memoryview_index_and_type_errors() {
         "got: {e}"
     );
 }
+
+// ── vendored stdlib importer (native, CPython-free build) ─────────────────────
+// These run only in the `--no-default-features` build, where `import <mod>` is
+// served by compiling the vendored `pylib/*.py` on pythonrs itself (no libpython).
+// They prove a real CPython stdlib source file executes end-to-end on the Rust
+// interpreter and produces native pythonrs objects.
+
+#[cfg(not(feature = "stdlib-ffi"))]
+#[test]
+fn vendored_future_runs_on_pythonrs() {
+    // `__future__.py` is pure Python with no imports — the cleanest proof that a
+    // vendored stdlib file is compiled and executed by pythonrs, not CPython.
+    assert_eq!(
+        g("import __future__\nx = __future__.division.optional", "x"),
+        "(2, 2, 0, 'alpha', 2)"
+    );
+}
+
+#[cfg(not(feature = "stdlib-ffi"))]
+#[test]
+fn vendored_import_is_memoized() {
+    // Second import of the same module returns the identical cached object
+    // (pythonrs's `sys.modules`), so the vendored `.py` executes at most once.
+    assert_eq!(
+        g("import __future__ as a\nimport __future__ as b\nx = a is b", "x"),
+        "True"
+    );
+}

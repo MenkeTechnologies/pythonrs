@@ -164,6 +164,22 @@ lexer  →  parser  →  AST  →  compiler  →  fusevm::Chunk  →  fusevm VM 
   builtin functions (`print` / `len` / `range` / …), and per-type methods.
 - `cache.rs` — the rkyv-shard bytecode cache.
 - `aot_native.rs` — native-executable emission via `fusevm::aot`.
+- `pylib/` — the vendored CPython pure-Python standard library (`.py` sources)
+  shipped **with** pythonrs. In the native build these are imported by compiling
+  and executing them on pythonrs's own interpreter — no libpython.
+
+### Standard library: two build modes
+
+The `import` path resolves a module from native inline arms first, then:
+
+| Build | Command | `import <stdlib>` source |
+|---|---|---|
+| **Native (CPython-free)** | `cargo build --no-default-features` | The vendored `pylib/*.py`, compiled on pythonrs and run on fusevm. No pyo3, no libpython — CPython is not in the dependency graph. This is the shipping target (`brew install pythonrs` lays `pylib/` beside the binary). |
+| **Bridged (drop-in)** | `cargo build` | The real CPython stdlib over an embedded libpython (pyo3, the `stdlib-ffi` feature). Kept primary while the native build's C-accelerator floor (`posix`/`_io`/`_sre`/…) is completed. |
+
+Imports are memoized through the host's `sys.modules` cache, so a module's
+vendored `.py` executes at most once (CPython run-once identity semantics).
+`$PYTHONRS_LIB` overrides the `pylib/` search path.
 
 ## [0x06] PARITY HARNESS
 
