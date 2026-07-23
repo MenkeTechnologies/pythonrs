@@ -1,0 +1,112 @@
+.\" pythonall(1) — comprehensive all-in-one man page for pythonrs.
+.\" Modeled after zshall(1): every section of the reference in one document.
+.\" Render with:  man -l man/pythonall.1
+.\" Install:      cp man/pythonall.1 /usr/local/share/man/man1/
+.TH PYTHONALL 1 "2026-07-23" "pythonrs 0.1.0" "User Commands"
+.SH NAME
+pythonall \- the pythonrs comprehensive reference (invocation, language,
+architecture, bytecode VM + Cranelift JIT, LSP, DAP, inline-Rust FFI)
+.SH OVERVIEW
+This is the all\-in\-one
+.B pythonrs
+manual, modeled on
+.BR zshall (1).
+It concatenates the major sections of the pythonrs reference into a single page so
+you can grep with `/`:
+.RS 2
+.PP
+.B 1.  INVOCATION
+.RB "\(em " "flags, files, exit status"
+.br
+.B 2.  LANGUAGE
+.RB "\(em " "the Python the runtime parses and runs"
+.br
+.B 3.  ARCHITECTURE
+.RB "\(em " "lex \[->] parse \[->] lower \[->] fusevm VM + JIT + rkyv cache"
+.br
+.B 4.  TOOLING
+.RB "\(em " "\-\-lsp, \-\-dap, inline-Rust FFI, AOT, dumps"
+.br
+.B 5.  DIAGNOSTICS
+.RB "\(em " "error format and common messages"
+.RE
+.SH 1. INVOCATION
+.B python
+[\fIOPTIONS\fR] \fIFILE\fR [\fIARGS\fR...] runs a Python script.
+.B \-c \fISRC\fR
+executes a one\-liner, and
+.B \-m \fIMODULE\fR
+runs a library module as a script.
+.B \-\-lsp
+and
+.B \-\-dap
+speak their protocols over stdio and take no file. See
+.BR python (1)
+for the per\-flag table.
+.SH 2. LANGUAGE
+pythonrs runs Python 3 as ordinary compiled bytecode. It lexes and parses the
+source, lowers it to
+.B fusevm
+instructions, and lets the shared engine execute and JIT\-compile them. Arithmetic
+and comparisons lower to native fusevm ops; Python\-specific behaviour \(em
+truthiness, attribute and method dispatch,
+.BR str / list
+concatenation, bignum promotion, and object construction \(em is served by the
+.B PyHost
+object heap, whose
+.BR str / list / dict / tuple / set
+and instance cells ride through the VM as handles. It is the first compiled
+standalone Python runtime.
+.SH 3. ARCHITECTURE
+.EX
+Python source \[->] lexer \[->] parser (AST) \[->] lower to fusevm bytecode \[->] fusevm VM + Cranelift JIT
+.EE
+.PP
+There is no bespoke VM or JIT; execution and codegen live in fusevm, the shared
+engine behind zshrs, stryke, awkrs, elisp, and ruby. Every ordinary run
+transparently caches compiled bytecode in
+.I ~/.pythonrs/scripts.rkyv
+(an rkyv shard); a cache hit skips lex/parse/lower entirely.
+.SH 4. TOOLING
+.SS Language server (\-\-lsp)
+.B python \-\-lsp
+speaks LSP over stdio: completion and hover from the symbol corpus (the same table
+that generates
+.IR docs/reference.html ),
+and diagnostics from the runtime's own parser. It is read\-only; no output reaches
+the terminal.
+.SS Debugger (\-\-dap)
+.B python \-\-dap
+speaks the Debug Adapter Protocol over stdio: line breakpoints, single\-stepping,
+a stack trace, and inspection of a frame's locals. Program output is captured and
+forwarded as
+.B output
+events so it never corrupts the protocol channel.
+.SS Inline-Rust FFI
+A
+.B rust { pub extern "C" fn \[u2026] }
+block desugars to an internal
+.BR __rust_compile ,
+compiles to a cached
+.B cdylib
+on first run (via the shared
+.B fusevm
+FFI runtime), and its exports become callable by name from Python
+.RB ( src/rust_ffi.rs ).
+.SS Deployment and dumps
+An AOT native compiler links a standalone executable.
+.B \-\-dump\-tokens
+prints the token stream,
+.B \-\-dump\-ast
+the parsed AST, and
+.B \-\-disasm
+a fusevm bytecode disassembly \(em each then exits.
+.SH 5. DIAGNOSTICS
+Errors are written to standard error in Python's own exception form. The process
+exits non\-zero on an unhandled exception and 0 on success.
+.SH SEE ALSO
+.BR python (1)
+The focused invocation page. Source and issue tracker:
+https://github.com/MenkeTechnologies/pythonrs
+.SH AUTHOR
+Part of the fusevm language family.
