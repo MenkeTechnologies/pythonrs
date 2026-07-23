@@ -42,6 +42,7 @@ cargo build --bin python --bin parity
 | `operators.py` | operator overloading (an immutable `Vector`) |
 | `dataclasses_demo.py` | `@dataclass`: defaults, ordering, frozen |
 | `enums_demo.py` | `Enum`, `IntEnum`, `Flag`, `auto()` |
+| `state_machine.py` | an event-driven FSM with `Enum` states and dispatch |
 
 ## Algorithms
 
@@ -53,6 +54,8 @@ cargo build --bin python --bin parity
 | `matrix.py` | transpose, multiply, identity |
 | `calculator.py` | a shunting-yard expression evaluator |
 | `fibonacci.py` | four implementations, including memoized |
+| `graphs.py` | BFS, DFS, topological sort, Dijkstra (`heapq`) |
+| `binary_tree.py` | a BST: insert, search, traversals, height |
 
 ## Data & text
 
@@ -73,4 +76,7 @@ cargo build --bin python --bin parity
 | `regex_demo.py` | `re`: match, findall, groups, substitution |
 | `hashing.py` | `hashlib`, `base64`, `binascii` |
 | `datetime_demo.py` | dates, times, and `timedelta` arithmetic |
+| `argparse_demo.py` | `argparse`: types, choices, `nargs`, subcommands |
+| `csv_demo.py` | `csv` read/write over `io.StringIO`, quoting |
+| `statistics_demo.py` | `statistics` + group-by aggregation |
 | `bank_account.py` | a stateful simulation with a transaction ledger |
