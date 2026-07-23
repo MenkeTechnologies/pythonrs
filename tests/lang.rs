@@ -245,6 +245,14 @@ fn function_attributes() {
 }
 
 #[test]
+fn errno_module() {
+    // Native errno constants (from libc). Low POSIX numbers are stable across
+    // Linux/macOS, so assert those.
+    assert_eq!(g("import errno\nx = (errno.ENOENT, errno.EEXIST, errno.EINVAL)", "x"), "(2, 17, 22)");
+    assert_eq!(g("import errno\nx = errno.errorcode[errno.ENOENT]", "x"), "'ENOENT'");
+}
+
+#[test]
 fn bignum_range() {
     // A range whose bounds exceed i64 works fully (list/index/contains/len/bool/
     // repr/iter), matching CPython.

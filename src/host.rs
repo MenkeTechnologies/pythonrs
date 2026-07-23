@@ -10639,6 +10639,94 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                 ),
             ]
         }),
+        // `errno` — the platform error numbers (from libc) plus the `errorcode`
+        // {number: name} map. A pure constants C-ext, correct natively on any
+        // build.
+        "errno" => with_host(|h| {
+            let names: &[(&str, i32)] = &[
+                ("EPERM", libc::EPERM),
+                ("ENOENT", libc::ENOENT),
+                ("ESRCH", libc::ESRCH),
+                ("EINTR", libc::EINTR),
+                ("EIO", libc::EIO),
+                ("ENXIO", libc::ENXIO),
+                ("E2BIG", libc::E2BIG),
+                ("ENOEXEC", libc::ENOEXEC),
+                ("EBADF", libc::EBADF),
+                ("ECHILD", libc::ECHILD),
+                ("EAGAIN", libc::EAGAIN),
+                ("ENOMEM", libc::ENOMEM),
+                ("EACCES", libc::EACCES),
+                ("EFAULT", libc::EFAULT),
+                ("EBUSY", libc::EBUSY),
+                ("EEXIST", libc::EEXIST),
+                ("EXDEV", libc::EXDEV),
+                ("ENODEV", libc::ENODEV),
+                ("ENOTDIR", libc::ENOTDIR),
+                ("EISDIR", libc::EISDIR),
+                ("EINVAL", libc::EINVAL),
+                ("ENFILE", libc::ENFILE),
+                ("EMFILE", libc::EMFILE),
+                ("ENOTTY", libc::ENOTTY),
+                ("EFBIG", libc::EFBIG),
+                ("ENOSPC", libc::ENOSPC),
+                ("ESPIPE", libc::ESPIPE),
+                ("EROFS", libc::EROFS),
+                ("EMLINK", libc::EMLINK),
+                ("EPIPE", libc::EPIPE),
+                ("EDOM", libc::EDOM),
+                ("ERANGE", libc::ERANGE),
+                ("EDEADLK", libc::EDEADLK),
+                ("ENAMETOOLONG", libc::ENAMETOOLONG),
+                ("ENOLCK", libc::ENOLCK),
+                ("ENOSYS", libc::ENOSYS),
+                ("ENOTEMPTY", libc::ENOTEMPTY),
+                ("ELOOP", libc::ELOOP),
+                ("EWOULDBLOCK", libc::EWOULDBLOCK),
+                ("ENOMSG", libc::ENOMSG),
+                ("EIDRM", libc::EIDRM),
+                ("EOVERFLOW", libc::EOVERFLOW),
+                ("EBADMSG", libc::EBADMSG),
+                ("EILSEQ", libc::EILSEQ),
+                ("ENOTSOCK", libc::ENOTSOCK),
+                ("EDESTADDRREQ", libc::EDESTADDRREQ),
+                ("EMSGSIZE", libc::EMSGSIZE),
+                ("EPROTOTYPE", libc::EPROTOTYPE),
+                ("ENOPROTOOPT", libc::ENOPROTOOPT),
+                ("EPROTONOSUPPORT", libc::EPROTONOSUPPORT),
+                ("EOPNOTSUPP", libc::EOPNOTSUPP),
+                ("EAFNOSUPPORT", libc::EAFNOSUPPORT),
+                ("EADDRINUSE", libc::EADDRINUSE),
+                ("EADDRNOTAVAIL", libc::EADDRNOTAVAIL),
+                ("ENETDOWN", libc::ENETDOWN),
+                ("ENETUNREACH", libc::ENETUNREACH),
+                ("ECONNABORTED", libc::ECONNABORTED),
+                ("ECONNRESET", libc::ECONNRESET),
+                ("ENOBUFS", libc::ENOBUFS),
+                ("EISCONN", libc::EISCONN),
+                ("ENOTCONN", libc::ENOTCONN),
+                ("ETIMEDOUT", libc::ETIMEDOUT),
+                ("ECONNREFUSED", libc::ECONNREFUSED),
+                ("EHOSTUNREACH", libc::EHOSTUNREACH),
+                ("EALREADY", libc::EALREADY),
+                ("EINPROGRESS", libc::EINPROGRESS),
+                ("ECANCELED", libc::ECANCELED),
+                ("ENOTSUP", libc::ENOTSUP),
+            ];
+            let mut v: Vec<(&str, Value)> = Vec::with_capacity(names.len() + 1);
+            let mut ec: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+            for (n, val) in names {
+                v.push((n, Value::Int(*val as i64)));
+                let key = PKey::Int(*val as i64);
+                if !ec.contains_key(&key) {
+                    let nv = h.new_str((*n).to_string());
+                    ec.insert(key, (Value::Int(*val as i64), nv));
+                }
+            }
+            let errorcode = h.alloc(PyObj::Dict(ec));
+            v.push(("errorcode", errorcode));
+            v
+        }),
         "math" => with_host(|h| {
             // Every function implemented by `builtins::call_math`; each resolves to
             // a `math.<name>` builtin. Kept as a flat list so adding a function is a
