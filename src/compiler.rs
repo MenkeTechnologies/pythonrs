@@ -1175,6 +1175,7 @@ impl Compiler {
             locals,
             is_generator,
             is_async,
+            doc: docstring(body),
         };
         self.functions.push((name.to_string(), def));
         Ok(self.functions.len() - 1)
@@ -3182,6 +3183,18 @@ enum CompKind {
 /// descend into nested defs/lambdas).
 fn body_has_yield(body: &[Stmt]) -> bool {
     body.iter().any(stmt_has_yield)
+}
+
+/// The docstring of a function/class/module body: its first statement when that
+/// is a bare string-literal expression, else `None` (CPython's `__doc__` rule).
+fn docstring(body: &[Stmt]) -> Option<String> {
+    match body.first().map(|s| &s.kind) {
+        Some(StmtKind::Expr(e)) => match e.unspanned() {
+            Expr::Str(s) => Some(s.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn stmt_has_yield(s: &Stmt) -> bool {

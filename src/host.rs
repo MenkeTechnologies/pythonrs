@@ -246,6 +246,12 @@ pub struct FuncDef {
     /// does NOT run) which the asyncio event loop drives.
     #[serde(default)]
     pub is_async: bool,
+    /// The docstring — the body's first statement when it is a bare string
+    /// literal, else `None`. Surfaces as `func.__doc__`. `serde(default)` so
+    /// bytecode cached before this field decodes to `None` (attribute present,
+    /// content fills in on recompile).
+    #[serde(default)]
+    pub doc: Option<String>,
 }
 
 /// A compiled lambda/comprehension body (same shape, unnamed).
@@ -6438,7 +6444,7 @@ impl PyHost {
             Some(PyObj::Func(fv))
                 if matches!(
                     name,
-                    "__name__" | "__qualname__" | "__module__" | "__defaults__"
+                    "__name__" | "__qualname__" | "__module__" | "__defaults__" | "__doc__"
                 ) =>
             {
                 let (def_id, defaults) = (fv.def_id, fv.defaults.clone());
@@ -6447,7 +6453,7 @@ impl PyHost {
             Some(PyObj::BoundMethod { func, recv })
                 if matches!(
                     name,
-                    "__name__" | "__qualname__" | "__module__" | "__defaults__"
+                    "__name__" | "__qualname__" | "__module__" | "__defaults__" | "__doc__"
                 ) =>
             {
                 let func = func.clone();
@@ -8294,6 +8300,10 @@ impl PyHost {
                 Ok(self.new_str(q))
             }
             "__module__" => Ok(self.new_str("__main__".to_string())),
+            "__doc__" => match self.funcs[def_id].doc.clone() {
+                Some(d) => Ok(self.new_str(d)),
+                None => Ok(Value::Undef),
+            },
             // `__defaults__`: a tuple of the positional defaults, or `None`.
             _ => {
                 if defaults.is_empty() {

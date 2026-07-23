@@ -55,6 +55,16 @@ fn builtins_module_exposes_functions_types_exceptions() {
 }
 
 #[test]
+fn function_docstring_is_dunder_doc() {
+    // The body's first bare string literal is `__doc__`; absent one, `__doc__` is
+    // None (present as an attribute, never an AttributeError).
+    assert_eq!(g("def f():\n    'the doc'\n    return 1\nx = f.__doc__", "x"), "'the doc'");
+    assert_eq!(g("def g():\n    return 2\nx = g.__doc__", "x"), "None");
+    // A non-string first statement is not a docstring.
+    assert_eq!(g("def h():\n    42\nx = h.__doc__", "x"), "None");
+}
+
+#[test]
 fn arithmetic_and_precedence() {
     assert_eq!(g("x = 2 + 3 * 4 - 1", "x"), "13");
     assert_eq!(g("x = 7 // 2", "x"), "3");
