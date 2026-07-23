@@ -1123,6 +1123,16 @@ impl PyHost {
         }
     }
 
+    /// Native-only build (`--no-default-features`): there is no `stdlib-ffi`
+    /// bridge, so no value is ever a CPython `Foreign` object. Kept as an
+    /// always-`None` companion so the unconditional call sites in `builtins.rs`
+    /// and the foreign-object fast paths here compile without a `cfg` at every
+    /// caller.
+    #[cfg(not(feature = "stdlib-ffi"))]
+    pub fn foreign_id(&self, _v: &Value) -> Option<u32> {
+        None
+    }
+
     pub fn new_str(&mut self, s: impl Into<String>) -> Value {
         self.alloc(PyObj::Str(s.into()))
     }
