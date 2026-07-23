@@ -479,10 +479,12 @@ impl Lexer {
             self.push(Tok::Op(c.to_string()));
             Ok(())
         } else {
-            Err(format!(
-                "SyntaxError: unexpected character {c:?} (line {})",
-                self.line
-            ))
+            // A stray character (`!` outside `!=`, `$`, `?`, backtick, …) is
+            // rejected the way CPython reports it: a bare `SyntaxError: invalid
+            // syntax` (the line/caret live in the traceback's `File` header, not
+            // the message), so the final error line matches `python3` exactly.
+            let _ = c;
+            Err("SyntaxError: invalid syntax".to_string())
         }
     }
 }

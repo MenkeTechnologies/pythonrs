@@ -147,14 +147,17 @@ impl Parser {
 
     /// A suite after a `:` — either a one-line simple statement or an indented
     /// block.
-    fn parse_suite(&mut self) -> Result<Vec<Stmt>, String> {
+    /// `desc` names the construct for the missing-block error (CPython's
+    /// `expected an indented block after <desc> on line <kw_line>`), e.g. `'if'
+    /// statement`, `function definition`, `class definition`. `kw_line` is the
+    /// line of the compound-statement keyword, not the (later) blank/dedent line.
+    fn parse_suite(&mut self, desc: &str, kw_line: u32) -> Result<Vec<Stmt>, String> {
         self.expect_op(":")?;
         if self.at_newline() {
             self.skip_newlines();
             if !matches!(self.cur(), Tok::Indent) {
                 return Err(format!(
-                    "IndentationError: expected an indented block (line {})",
-                    self.line()
+                    "IndentationError: expected an indented block after {desc} on line {kw_line}"
                 ));
             }
             self.advance(); // Indent
@@ -178,6 +181,12 @@ impl Parser {
     /// Dispatch one statement (simple or compound) into `out`.
     fn parse_statement(&mut self, out: &mut Vec<Stmt>) -> Result<(), String> {
         let line = self.line();
+        // A block consumes its own `Indent` in `parse_suite`, so an `Indent` at a
+        // statement boundary is always stray — CPython's `IndentationError:
+        // unexpected indent` (the line lives in the traceback's `File` header).
+        if matches!(self.cur(), Tok::Indent) {
+            return Err("IndentationError: unexpected indent".to_string());
+        }
         if let Tok::Name(n) = self.cur().clone() {
             match n.as_str() {
                 "if" => return self.parse_if(out, line),
@@ -197,7 +206,32 @@ impl Parser {
         if self.at_op("@") {
             return self.parse_decorated(out, line);
         }
+        // `case NAME … :` at statement start (outside a `match`) is the classic
+        // Python 3.10+ mistake; CPython reports `invalid syntax. Did you mean
+        // 'class'?`. `case` immediately followed by a bare name is never a valid
+        // expression (two adjacent names), and the trailing `:` is the block-header
+        // shape CPython keys the `class` suggestion on — so this is unambiguous. A
+        // real `case = …` / `case.attr` / `case(…)` (non-name next) is untouched.
+        if self.looks_like_stray_case() {
+            return Err("SyntaxError: invalid syntax. Did you mean 'class'?".to_string());
+        }
         self.parse_simple_line(out)
+    }
+
+    /// `case NAME:` at statement start — the misused `case` soft keyword (a bare
+    /// capture pattern with the block-header `:`). Kept narrow (a single name then
+    /// `:`) so only the unambiguous misuse trips it, matching CPython's `class`
+    /// suggestion for `case _:` / `case x:`.
+    fn looks_like_stray_case(&self) -> bool {
+        matches!(self.cur(), Tok::Name(n) if n == "case")
+            && matches!(
+                self.toks.get(self.pos + 1).map(|t| &t.tok),
+                Some(Tok::Name(_))
+            )
+            && matches!(
+                self.toks.get(self.pos + 2).map(|t| &t.tok),
+                Some(Tok::Op(o)) if o == ":"
+            )
     }
 
     /// A logical line of one or more `;`-separated simple statements.
@@ -368,15 +402,22 @@ impl Parser {
 
     // ── compound statements ───────────────────────────────────────────────
     fn parse_if(&mut self, out: &mut Vec<Stmt>, line: u32) -> Result<(), String> {
+        let kw = if matches!(self.cur(), Tok::Name(n) if n == "elif") {
+            "'elif' statement"
+        } else {
+            "'if' statement"
+        };
         self.advance(); // if / elif
         let test = self.parse_namedexpr()?;
-        let body = self.parse_suite()?;
+        let body = self.parse_suite(kw, line)?;
         let mut orelse = Vec::new();
         self.skip_newlines_shallow();
         if self.at_kw("elif") {
             self.parse_if(&mut orelse, self.line())?;
-        } else if self.eat_kw("else") {
-            orelse = self.parse_suite()?;
+        } else if self.at_kw("else") {
+            let else_line = self.line();
+            self.advance();
+            orelse = self.parse_suite("'else' statement", else_line)?;
         }
         out.push(Stmt::new(StmtKind::If { test, body, orelse }, line));
         Ok(())
@@ -392,9 +433,11 @@ impl Parser {
     fn parse_while(&mut self, out: &mut Vec<Stmt>, line: u32) -> Result<(), String> {
         self.advance();
         let test = self.parse_namedexpr()?;
-        let body = self.parse_suite()?;
-        let orelse = if self.eat_kw("else") {
-            self.parse_suite()?
+        let body = self.parse_suite("'while' statement", line)?;
+        let orelse = if self.at_kw("else") {
+            let el = self.line();
+            self.advance();
+            self.parse_suite("'else' statement", el)?
         } else {
             Vec::new()
         };
@@ -412,9 +455,11 @@ impl Parser {
             ));
         }
         let iter = self.parse_exprlist()?;
-        let body = self.parse_suite()?;
-        let orelse = if self.eat_kw("else") {
-            self.parse_suite()?
+        let body = self.parse_suite("'for' statement", line)?;
+        let orelse = if self.at_kw("else") {
+            let el = self.line();
+            self.advance();
+            self.parse_suite("'else' statement", el)?
         } else {
             Vec::new()
         };
@@ -474,7 +519,7 @@ impl Parser {
                 break;
             }
         }
-        let body = self.parse_suite()?;
+        let body = self.parse_suite("'with' statement", line)?;
         out.push(Stmt::new(
             StmtKind::With {
                 items,
@@ -539,7 +584,7 @@ impl Parser {
             let ret = self.parse_expr()?; // return annotation, recorded as `"return"`
             params.annotations.push(("return".to_string(), ret));
         }
-        let body = self.parse_suite()?;
+        let body = self.parse_suite("function definition", line)?;
         out.push(Stmt::new(
             StmtKind::FuncDef {
                 name,
@@ -657,7 +702,7 @@ impl Parser {
             }
             self.expect_op(")")?;
         }
-        let body = self.parse_suite()?;
+        let body = self.parse_suite("class definition", line)?;
         out.push(Stmt::new(
             StmtKind::ClassDef {
                 name,
@@ -673,9 +718,10 @@ impl Parser {
 
     fn parse_try(&mut self, out: &mut Vec<Stmt>, line: u32) -> Result<(), String> {
         self.advance();
-        let body = self.parse_suite()?;
+        let body = self.parse_suite("'try' statement", line)?;
         let mut handlers = Vec::new();
         while self.at_kw("except") {
+            let except_line = self.line();
             self.advance();
             let star = self.eat_op("*");
             let (typ, name) = if self.at_op(":") {
@@ -689,7 +735,7 @@ impl Parser {
                 };
                 (Some(t), n)
             };
-            let hbody = self.parse_suite()?;
+            let hbody = self.parse_suite("'except' statement", except_line)?;
             handlers.push(ExceptHandler {
                 typ,
                 name,
@@ -697,13 +743,17 @@ impl Parser {
                 star,
             });
         }
-        let orelse = if self.eat_kw("else") {
-            self.parse_suite()?
+        let orelse = if self.at_kw("else") {
+            let el = self.line();
+            self.advance();
+            self.parse_suite("'else' statement", el)?
         } else {
             Vec::new()
         };
-        let finalbody = if self.eat_kw("finally") {
-            self.parse_suite()?
+        let finalbody = if self.at_kw("finally") {
+            let fl = self.line();
+            self.advance();
+            self.parse_suite("'finally' statement", fl)?
         } else {
             Vec::new()
         };
@@ -739,9 +789,18 @@ impl Parser {
                 Tok::Op(o) if o == "(" || o == "[" || o == "{" => depth += 1,
                 Tok::Op(o) if o == ")" || o == "]" || o == "}" => depth -= 1,
                 Tok::Op(o) if o == ":" && depth == 0 => {
-                    return matches!(self.toks.get(i + 1).map(|t| &t.tok), Some(Tok::Newline))
-                        && matches!(self.toks.get(i + 2).map(|t| &t.tok), Some(Tok::Indent))
+                    let a1 = self.toks.get(i + 1).map(|t| &t.tok);
+                    let a2 = self.toks.get(i + 2).map(|t| &t.tok);
+                    // A real match block is `: NEWLINE INDENT case`. A bare
+                    // `match SUBJECT:` with no block (end of input, or a NEWLINE
+                    // not followed by INDENT) is still a match header — CPython
+                    // reports the missing block, so `parse_match` must own it.
+                    let real_block = matches!(a1, Some(Tok::Newline))
+                        && matches!(a2, Some(Tok::Indent))
                         && matches!(self.toks.get(i + 3).map(|t| &t.tok), Some(Tok::Name(n)) if n == "case");
+                    let bare_header = matches!(a1, Some(Tok::Eof))
+                        || (matches!(a1, Some(Tok::Newline)) && !matches!(a2, Some(Tok::Indent)));
+                    return real_block || bare_header;
                 }
                 Tok::Newline | Tok::Eof => return false,
                 _ => {}
@@ -758,13 +817,13 @@ impl Parser {
         self.skip_newlines();
         if !matches!(self.cur(), Tok::Indent) {
             return Err(format!(
-                "IndentationError: expected an indented block after 'match' (line {})",
-                self.line()
+                "IndentationError: expected an indented block after 'match' statement on line {line}"
             ));
         }
         self.advance(); // Indent
         let mut cases = Vec::new();
         while self.at_kw("case") {
+            let case_line = self.line();
             self.advance(); // case
             let pattern = self.parse_patterns()?;
             let guard = if self.eat_kw("if") {
@@ -772,7 +831,7 @@ impl Parser {
             } else {
                 None
             };
-            let body = self.parse_suite()?;
+            let body = self.parse_suite("'case' statement", case_line)?;
             self.skip_newlines();
             cases.push(MatchCase {
                 pattern,
@@ -1600,12 +1659,15 @@ impl Parser {
                     self.advance();
                     Ok(Expr::Ellipsis)
                 }
-                _ => Err(format!(
-                    "SyntaxError: unexpected {:?} (line {line})",
-                    self.cur()
-                )),
+                // An operator where an atom was expected — CPython's catch-all
+                // `invalid syntax` (the token/line live in the traceback header).
+                _ => Err("SyntaxError: invalid syntax".to_string()),
             },
-            other => Err(format!("SyntaxError: unexpected {other:?} (line {line})")),
+            // Any other token (Newline, Op, keyword) where an atom was expected.
+            _ => {
+                let _ = line;
+                Err("SyntaxError: invalid syntax".to_string())
+            }
         }
     }
 
