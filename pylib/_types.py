@@ -72,6 +72,56 @@ class SimpleNamespace:
         return NotImplemented
 
 
+# ── MappingProxyType: a read-only view of a mapping (no C type) ──────────────
+
+
+class MappingProxyType:
+    """A read-only view onto a live mapping, per `types.MappingProxyType`.
+
+    Reads pass through to the wrapped mapping (so later mutations of it show up);
+    there is no mutating API. `enum` and `re` use it to expose a class member map
+    that callers must not edit.
+    """
+
+    def __init__(self, mapping):
+        self._mapping = mapping
+
+    def __getitem__(self, key):
+        return self._mapping[key]
+
+    def __iter__(self):
+        return iter(self._mapping)
+
+    def __len__(self):
+        return len(self._mapping)
+
+    def __contains__(self, key):
+        return key in self._mapping
+
+    def keys(self):
+        return self._mapping.keys()
+
+    def values(self):
+        return self._mapping.values()
+
+    def items(self):
+        return self._mapping.items()
+
+    def get(self, key, default=None):
+        return self._mapping.get(key, default)
+
+    def copy(self):
+        return self._mapping.copy()
+
+    def __eq__(self, other):
+        if isinstance(other, MappingProxyType):
+            return self._mapping == other._mapping
+        return self._mapping == other
+
+    def __repr__(self):
+        return "mappingproxy(%r)" % (self._mapping,)
+
+
 # ── GenericAlias: `list[int]` / `WeakSet[T]` parameterized generics ──────────
 
 

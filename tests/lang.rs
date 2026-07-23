@@ -40,6 +40,20 @@ fn generic_subscription_builds_a_genericalias() {
     assert!(pythonrs::eval_str("x = len[0]").is_err());
 }
 
+// `builtins` importable as a module (self-contained build). functools/operator/
+// enum/re all `import builtins`; the ffi build uses CPython's own module.
+#[cfg(not(feature = "stdlib-ffi"))]
+#[test]
+fn builtins_module_exposes_functions_types_exceptions() {
+    assert_eq!(g("import builtins\nx = builtins.abs(-5)", "x"), "5");
+    assert_eq!(g("from builtins import len as L\nx = L([1, 2, 3])", "x"), "3");
+    assert_eq!(g("import builtins\nx = builtins.int('42') == 42", "x"), "True");
+    assert_eq!(
+        g("import builtins\nx = builtins.ValueError.__name__ == 'ValueError'", "x"),
+        "True",
+    );
+}
+
 #[test]
 fn arithmetic_and_precedence() {
     assert_eq!(g("x = 2 + 3 * 4 - 1", "x"), "13");

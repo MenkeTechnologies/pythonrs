@@ -9773,6 +9773,25 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
     }
 
     let entries: Vec<(&str, Value)> = match name {
+        // `builtins` as an importable module: every builtin function/type/exception
+        // resolves to the same `PyObj::Builtin` a bare-name lookup would, plus the
+        // singletons. The self-contained build needs this — `functools`, `operator`,
+        // `enum`, `re` all `import builtins`. On the ffi build CPython's richer
+        // builtins module (with `open`/`compile`/`vars`/… pythonrs lacks) is used.
+        #[cfg(not(feature = "stdlib-ffi"))]
+        "builtins" => with_host(|h| {
+            let mut v: Vec<(&str, Value)> = Vec::new();
+            for n in crate::builtins::builtin_names() {
+                v.push((n, h.alloc(PyObj::Builtin(n.to_string()))));
+            }
+            v.push(("None", Value::Undef));
+            v.push(("True", Value::Bool(true)));
+            v.push(("False", Value::Bool(false)));
+            v.push(("NotImplemented", h.alloc(PyObj::NotImplemented)));
+            v.push(("Ellipsis", h.alloc(PyObj::Ellipsis)));
+            v.push(("__debug__", Value::Bool(true)));
+            v
+        }),
         // `copy` is native (a CPython round-trip would deep-copy by value, losing
         // shallow-copy sharing and instance identity).
         "copy" => with_host(|h| {

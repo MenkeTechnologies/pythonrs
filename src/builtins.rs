@@ -2918,26 +2918,41 @@ pub fn is_type_like_builtin(name: &str) -> bool {
     is_builtin_type(name) || is_exception_class(name)
 }
 
+/// The builtin *type* names (constructors), as a slice so the `builtins` module
+/// namespace can enumerate them without duplicating the list.
+pub const BUILTIN_TYPES: &[&str] = &[
+    "int",
+    "float",
+    "str",
+    "bool",
+    "list",
+    "tuple",
+    "dict",
+    "set",
+    "frozenset",
+    "bytes",
+    "bytearray",
+    "memoryview",
+    "complex",
+    "object",
+    "type",
+    "range",
+];
+
 fn is_builtin_type(name: &str) -> bool {
-    matches!(
-        name,
-        "int"
-            | "float"
-            | "str"
-            | "bool"
-            | "list"
-            | "tuple"
-            | "dict"
-            | "set"
-            | "frozenset"
-            | "bytes"
-            | "bytearray"
-            | "memoryview"
-            | "complex"
-            | "object"
-            | "type"
-            | "range"
-    )
+    BUILTIN_TYPES.contains(&name)
+}
+
+/// Every builtin name exposed by the `builtins` module: functions, type
+/// constructors, and exception classes (each resolves to a `PyObj::Builtin`).
+/// Singletons (`None`/`True`/`False`/`NotImplemented`/`Ellipsis`) are added by
+/// the module builder, not here.
+pub fn builtin_names() -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = BUILTIN_FUNCS.to_vec();
+    names.extend_from_slice(BUILTIN_TYPES);
+    names.push("BaseException");
+    names.extend(EXC_PARENTS.iter().map(|(c, _)| *c));
+    names
 }
 
 pub fn is_exception_class(name: &str) -> bool {
