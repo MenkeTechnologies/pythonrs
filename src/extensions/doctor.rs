@@ -19,6 +19,7 @@ pub fn run() -> i32 {
 
     environment();
     embedded_cpython();
+    vendored_stdlib();
     runtime();
     bytecode_cache();
     env_vars();
@@ -82,15 +83,94 @@ fn embedded_cpython() {
     println!();
 }
 
-/// Native-only build: no embedded interpreter, so `import os` / `-m` are absent.
+/// Native-only build: no embedded interpreter. `import <stdlib>` is served from
+/// the vendored `pylib/` (see `vendored_stdlib`), not libpython; `-m` is absent.
 #[cfg(not(feature = "stdlib-ffi"))]
 fn embedded_cpython() {
     println!("{}", bold("Embedded CPython (stdlib-ffi)"));
     println!(
         "  {}",
-        yellow("disabled — built --no-default-features (no stdlib import / -m)")
+        green("none — CPython-free build; stdlib served from pylib/ (below)")
     );
     println!();
+}
+
+/// The vendored CPython pure-Python stdlib (`pylib/`) that pythonrs runs on its
+/// own interpreter. Present and used in the native build; shipped-but-inactive in
+/// the bridged build (which prefers libpython until the C-accelerator floor lands).
+fn vendored_stdlib() {
+    println!("{}", bold("Vendored stdlib (pylib/)"));
+    let active = cfg!(not(feature = "stdlib-ffi"));
+    match locate_pylib() {
+        Some(dir) => {
+            let count = count_py(&dir);
+            println!("  root:        {}", dir.display());
+            println!("  modules:     ~{count} .py files");
+            println!(
+                "  status:      {}",
+                if active {
+                    green("active — imports run on pythonrs (no libpython)")
+                } else {
+                    dim("present, inactive — bridged build prefers libpython")
+                },
+            );
+        }
+        None => println!(
+            "  {}",
+            if active {
+                red("not found — set $PYTHONRS_LIB or ship pylib/ beside the binary")
+            } else {
+                yellow("not found (bridged build does not require it)")
+            },
+        ),
+    }
+    println!();
+}
+
+/// Resolve the `pylib/` root the same way the importer does (`$PYTHONRS_LIB`,
+/// install layout beside the binary, then the in-repo tree).
+fn locate_pylib() -> Option<std::path::PathBuf> {
+    if let Some(p) = std::env::var_os("PYTHONRS_LIB") {
+        let p = std::path::PathBuf::from(p);
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            for cand in [
+                dir.join("../lib/pythonrs/pylib"),
+                dir.join("../pylib"),
+                dir.join("pylib"),
+            ] {
+                if cand.is_dir() {
+                    return Some(cand);
+                }
+            }
+        }
+    }
+    let dev = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("pylib");
+    dev.is_dir().then_some(dev)
+}
+
+/// Count `.py` files under a directory tree (best-effort, for the report).
+fn count_py(dir: &std::path::Path) -> usize {
+    let mut n = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().and_then(|e| e.to_str()) == Some("py") {
+                n += 1;
+            }
+        }
+    }
+    n
 }
 
 /// The execution engine: fusevm bytecode VM + Cranelift JIT, shared with the
