@@ -207,6 +207,19 @@ fn function_docstring_is_dunder_doc() {
 }
 
 #[test]
+fn function_attributes() {
+    // Functions carry a writable attribute dict (abc's __isabstractmethod__,
+    // functools.wraps, decorators).
+    assert_eq!(
+        g("def f(): pass\nf.__isabstractmethod__ = True\nx = f.__isabstractmethod__", "x"),
+        "True",
+    );
+    assert_eq!(g("def g(): pass\nx = g.__isabstractmethod__", "x"), "False");
+    assert_eq!(g("def f(): pass\nf.tag = 42\nx = f.tag", "x"), "42");
+    assert_eq!(g("def f(): pass\nf.a = 1\nf.b = 2\nx = f.__dict__", "x"), "{'a': 1, 'b': 2}");
+}
+
+#[test]
 fn bignum_range() {
     // A range whose bounds exceed i64 works fully (list/index/contains/len/bool/
     // repr/iter), matching CPython.

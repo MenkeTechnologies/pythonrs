@@ -919,6 +919,10 @@ pub struct PyHost {
     /// exception is caught. Used to render `__cause__`/`__context__` chain blocks
     /// in an uncaught traceback (the final exception uses the live `traceback`).
     pub exc_tb: HashMap<u32, Vec<(String, u32, Span)>>,
+    /// Arbitrary attributes assigned to a function object (`func.__dict__`), keyed
+    /// by the function's heap id. CPython functions carry a writable dict; the
+    /// stdlib uses it for `__isabstractmethod__`, `functools.wraps`, decorators.
+    pub func_attrs: HashMap<u32, IndexMap<String, Value>>,
     /// Exception heap ids raised with an explicit `from` clause (`raise X from Y`
     /// or `raise X from None`), which sets `__suppress_context__` — the implicit
     /// `__context__` is then hidden from the rendered traceback.
@@ -1265,6 +1269,7 @@ impl PyHost {
             total_ordering: HashSet::new(),
             exc_links: HashMap::new(),
             exc_tb: HashMap::new(),
+            func_attrs: HashMap::new(),
             suppress_context: HashSet::new(),
             foreign_exc_bases: HashMap::new(),
             argv: vec![String::new()],
@@ -6832,6 +6837,28 @@ impl PyHost {
                 Ok(self.new_tuple(cells))
             }
             Some(PyObj::Cell { value }) if name == "cell_contents" => Ok(value.clone()),
+            // A function's writable attribute dict.
+            Some(PyObj::Func(_)) if name == "__dict__" => {
+                let id = if let Value::Obj(i) = recv { *i } else { 0 };
+                let attrs = self.func_attrs.get(&id).cloned().unwrap_or_default();
+                let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+                for (k, v) in attrs {
+                    let kv = self.new_str(k.clone());
+                    d.insert(PKey::Str(k), (kv, v));
+                }
+                Ok(self.new_dict(d))
+            }
+            // `__isabstractmethod__` defaults to False; any user-assigned function
+            // attribute (or an explicit `__isabstractmethod__`) reads from the dict.
+            Some(PyObj::Func(_))
+                if name == "__isabstractmethod__"
+                    || matches!(recv, Value::Obj(id)
+                        if self.func_attrs.get(id).is_some_and(|m| m.contains_key(name))) =>
+            {
+                let id = if let Value::Obj(i) = recv { *i } else { 0 };
+                let v = self.func_attrs.get(&id).and_then(|m| m.get(name)).cloned();
+                Ok(v.unwrap_or(Value::Bool(false)))
+            }
             // Code-object introspection (`func.__code__.co_*`), derived from the
             // backing `FuncDef`. Native VM object, not a Python reimplementation.
             Some(PyObj::Code { def_id }) => {
@@ -7484,6 +7511,15 @@ impl PyHost {
                 } else {
                     self.stderr_target = target;
                 }
+            }
+        }
+        // A function object carries a writable attribute dict (`func.attr = v`,
+        // `func.__isabstractmethod__ = True`).
+        if matches!(self.get(recv), Some(PyObj::Func(_))) {
+            if let Value::Obj(id) = recv {
+                let id = *id;
+                self.func_attrs.entry(id).or_default().insert(name.to_string(), val);
+                return Ok(());
             }
         }
         match self.get_mut(recv) {
