@@ -102,9 +102,14 @@ python --lsp                # Language Server Protocol over stdio
 ```
 
 The REPL is a `reedline` line editor: **Tab** pops a columnar completion menu
-(Shift+Tab / BackTab cycles backward) sourced from the language keywords,
-builtins, `math.*`, per-type method names, and the live module globals / class
-names of the persistent session; history persists to `~/.pythonrs/history`.
+(Shift+Tab / BackTab cycles backward). On a bare word it offers the language
+keywords, builtins, `math.*`, per-type method names, and the live module
+globals / class names of the persistent session. After a `name.` it switches to
+**type-aware attribute completion** — it reads the receiver's live runtime type
+and offers exactly that surface: `str`/`list`/`dict`/`set`/`tuple`/`int`/`float`
+methods for a builtin value, an imported module's own namespace, or an instance's
+attributes plus every method reachable along its class MRO. History persists to
+`~/.pythonrs/history`.
 
 Set `PYTHONRS_TRACE=1` to log cache hit/miss to stderr (silent otherwise).
 

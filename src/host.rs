@@ -700,6 +700,20 @@ pub enum Signal {
 }
 
 /// The Python runtime.
+/// Attribute-completion surface for a `base.<partial>` receiver, produced by
+/// [`PyHost::attr_completions`]. Instances and modules carry concrete names;
+/// builtin scalars/containers defer to the LSP corpus chapter for their method
+/// list (the REPL completer holds the corpus, the host does not).
+pub enum AttrCompletion {
+    /// A builtin type — expand to its method names via the named LSP corpus
+    /// chapter (`"str"`, `"list"`, `"dict"`, `"set"`, `"tuple"`, `"int"`,
+    /// `"float"`, `"bytes"`, `"frozenset"`).
+    BuiltinType(&'static str),
+    /// Concrete attribute / member names (instance attrs + MRO methods, or a
+    /// module's namespace).
+    Names(Vec<String>),
+}
+
 pub struct PyHost {
     heap: Vec<PyObj>,
     /// Function/lambda templates, indexed by def id.
@@ -1475,6 +1489,52 @@ impl PyHost {
         names.sort();
         names.dedup();
         names
+    }
+
+    /// Attribute / method completion candidates for `base.<partial>`, where
+    /// `base` is a module-global name. Returns `None` when `base` is unbound or
+    /// its runtime type carries no completable attribute surface — the caller
+    /// then falls back to plain word completion.
+    pub fn attr_completions(&self, base: &str) -> Option<AttrCompletion> {
+        let v = self.read_global(base)?;
+        // Scalars carried inline in the `Value` (not on the object heap).
+        match &v {
+            Value::Bool(_) | Value::Int(_) => return Some(AttrCompletion::BuiltinType("int")),
+            Value::Float(_) => return Some(AttrCompletion::BuiltinType("float")),
+            Value::Str(_) => return Some(AttrCompletion::BuiltinType("str")),
+            Value::Obj(_) => {}
+            _ => return None,
+        }
+        match self.get(&v)? {
+            PyObj::Str(_) => Some(AttrCompletion::BuiltinType("str")),
+            PyObj::Bytes(_) | PyObj::Bytearray(_) => Some(AttrCompletion::BuiltinType("bytes")),
+            PyObj::List(_) => Some(AttrCompletion::BuiltinType("list")),
+            PyObj::Tuple(_) => Some(AttrCompletion::BuiltinType("tuple")),
+            PyObj::Dict(_) => Some(AttrCompletion::BuiltinType("dict")),
+            PyObj::Set(_) => Some(AttrCompletion::BuiltinType("set")),
+            PyObj::Frozenset(_) => Some(AttrCompletion::BuiltinType("frozenset")),
+            PyObj::BigInt(_) => Some(AttrCompletion::BuiltinType("int")),
+            // A module (`import math`) → its own namespace members.
+            PyObj::Module { ns, .. } => Some(AttrCompletion::Names(ns.keys().cloned().collect())),
+            // A user instance → its instance attributes plus every method /
+            // class attribute reachable along the MRO.
+            PyObj::Instance(i) => {
+                let class = i.class.clone();
+                let dict = i.dict.clone();
+                let mut names = self.inst_attr_names(&dict);
+                if let Some(c) = self.classes.get(&class) {
+                    for cls in &c.mro {
+                        if let Some(cd) = self.classes.get(cls) {
+                            names.extend(cd.ns.keys().cloned());
+                        }
+                    }
+                }
+                names.sort();
+                names.dedup();
+                Some(AttrCompletion::Names(names))
+            }
+            _ => None,
+        }
     }
 
     pub fn del_name(&mut self, name: &str) -> Result<(), String> {

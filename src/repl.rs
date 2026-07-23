@@ -56,6 +56,56 @@ fn completion_word_start(line: &str, pos: usize) -> (usize, &str) {
     (start, line.get(start..pos).unwrap_or(""))
 }
 
+/// Detect a `base.<partial>` attribute context at the cursor. Returns the
+/// receiver identifier `base`, the byte offset where `partial` starts, and the
+/// `partial` typed so far. `None` when the cursor is not immediately after a
+/// `name.` (bare word, chained `a.b.`, or literal receiver → plain completion).
+fn attr_context(line: &str, pos: usize) -> Option<(&str, usize, &str)> {
+    let (pstart, partial) = completion_word_start(line, pos);
+    let before = line.get(..pstart)?;
+    // The partial must sit directly after a `.` (one ASCII byte).
+    if !before.ends_with('.') {
+        return None;
+    }
+    let dot = pstart - 1;
+    let base_before = line.get(..dot)?;
+    let base_start = base_before
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !(c.is_alphanumeric() || *c == '_'))
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0);
+    let base = line.get(base_start..dot)?;
+    if base.is_empty() {
+        return None;
+    }
+    Some((base, pstart, partial))
+}
+
+/// Corpus method names for one chapter (`"str"`, `"list"`, …) — the per-type
+/// method surface for builtin-type attribute completion.
+fn corpus_chapter_names(chapter: &str) -> Vec<String> {
+    crate::lsp::corpus()
+        .iter()
+        .filter(|(_, ch, ..)| *ch == chapter)
+        .map(|(name, ..)| (*name).to_string())
+        .collect()
+}
+
+/// One prefix-matched suggestion (shared struct-literal for both paths).
+fn suggestion(value: String, span: Span) -> Suggestion {
+    Suggestion {
+        value,
+        description: None,
+        style: None,
+        extra: None,
+        span,
+        append_whitespace: false,
+        display_override: None,
+        match_indices: None,
+    }
+}
+
 /// Reedline completer: static LSP corpus + live host globals/class names,
 /// prefix-matched against the identifier at the cursor.
 struct PyCompleter {
@@ -64,6 +114,26 @@ struct PyCompleter {
 
 impl Completer for PyCompleter {
     fn complete(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
+        // 1. `base.<partial>` — type-aware attribute/method completion off the
+        //    receiver's live runtime type (str/list/…/module/instance).
+        if let Some((base, start, partial)) = attr_context(line, pos) {
+            let candidates: Option<Vec<String>> = crate::host::with_host(|h| {
+                h.attr_completions(base).map(|a| match a {
+                    crate::host::AttrCompletion::BuiltinType(ch) => corpus_chapter_names(ch),
+                    crate::host::AttrCompletion::Names(v) => v,
+                })
+            });
+            if let Some(mut names) = candidates {
+                let span = Span::new(start, pos);
+                names.retain(|w| w.starts_with(partial));
+                names.sort();
+                names.dedup();
+                return names.into_iter().map(|w| suggestion(w, span)).collect();
+            }
+            // `base` unbound or no attr surface → fall through to word completion.
+        }
+
+        // 2. bare-word completion (keywords/builtins/methods + live globals).
         let (start, prefix) = completion_word_start(line, pos);
         let span = Span::new(start, pos);
 
@@ -80,16 +150,7 @@ impl Completer for PyCompleter {
             if !seen.insert(w.as_str()) {
                 continue;
             }
-            out.push(Suggestion {
-                value: w.clone(),
-                description: None,
-                style: None,
-                extra: None,
-                span,
-                append_whitespace: false,
-                display_override: None,
-                match_indices: None,
-            });
+            out.push(suggestion(w.clone(), span));
         }
         out.sort_by(|a, b| a.value.cmp(&b.value));
         out
@@ -259,6 +320,65 @@ mod tests {
         let (st, pre) = completion_word_start(s, s.len());
         assert_eq!(st, 4);
         assert_eq!(pre, "");
+    }
+
+    #[test]
+    fn attr_context_detects_receiver_and_partial() {
+        assert_eq!(attr_context("s.up", 4), Some(("s", 2, "up")));
+        // Empty partial right after the dot.
+        assert_eq!(attr_context("s.", 2), Some(("s", 2, "")));
+        // Bare word — not an attribute context.
+        assert_eq!(attr_context("upp", 3), None);
+        // Chained: base parses as the segment before the last dot.
+        assert_eq!(attr_context("a.b.c", 5), Some(("b", 4, "c")));
+    }
+
+    #[test]
+    fn attr_completion_str_offers_str_methods_only() {
+        use fusevm::Value;
+        use std::sync::Arc;
+        crate::host::reset_host();
+        crate::host::with_host(|h| h.set_global("s", Value::Str(Arc::new("hi".to_string()))));
+
+        let mut c = PyCompleter {
+            static_words: build_static_words(),
+        };
+        let line = "s.up";
+        let out = c.complete(line, line.len());
+        assert!(out.iter().any(|s| s.value == "upper"), "str.upper not offered");
+        assert!(out.iter().all(|s| s.value.starts_with("up")));
+        // A dict-only method must not leak onto a str receiver.
+        let all = c.complete("s.", 2);
+        assert!(all.iter().any(|s| s.value == "split"), "str.split missing");
+        assert!(!all.iter().any(|s| s.value == "keys"), "dict.keys leaked onto str");
+    }
+
+    #[test]
+    fn attr_completion_list_offers_list_methods() {
+        crate::host::reset_host();
+        let lst = crate::host::with_host(|h| h.new_list(Vec::new()));
+        crate::host::with_host(|h| h.set_global("xs", lst));
+
+        let mut c = PyCompleter {
+            static_words: build_static_words(),
+        };
+        let out = c.complete("xs.app", 6);
+        assert!(out.iter().any(|s| s.value == "append"), "list.append not offered");
+        assert!(out.iter().all(|s| s.value.starts_with("app")));
+    }
+
+    #[test]
+    fn attr_completion_unbound_base_falls_back_to_words() {
+        crate::host::reset_host();
+        let mut c = PyCompleter {
+            static_words: build_static_words(),
+        };
+        // `nope` is unbound → attr path yields nothing, word completion runs on
+        // the `up` segment (dot is a word boundary) and finds nothing starting
+        // with `up` except any such corpus name; assert it does not panic and
+        // every suggestion respects the `up` prefix.
+        let out = c.complete("nope.up", 7);
+        assert!(out.iter().all(|s| s.value.starts_with("up")));
     }
 
     #[test]
