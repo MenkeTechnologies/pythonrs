@@ -2918,6 +2918,26 @@ pub fn is_type_like_builtin(name: &str) -> bool {
     is_builtin_type(name) || is_exception_class(name)
 }
 
+/// The method-resolution order of a builtin type object, as type names from the
+/// type up to `object`. Exceptions follow their class chain; `bool` subclasses
+/// `int`; everything else is `[name, object]`.
+pub fn builtin_mro(name: &str) -> Vec<String> {
+    let mut chain = vec![name.to_string()];
+    if name == "bool" {
+        chain.push("int".to_string());
+    } else if is_exception_class(name) {
+        let mut cur = name;
+        while let Some((_, parent)) = EXC_PARENTS.iter().find(|(c, _)| *c == cur) {
+            chain.push((*parent).to_string());
+            cur = parent;
+        }
+    }
+    if name != "object" {
+        chain.push("object".to_string());
+    }
+    chain
+}
+
 /// The classmethod names of a builtin type — the members reached as
 /// `<type>.__dict__[name]` that are C classmethod descriptors (`dict.fromkeys`,
 /// `int.from_bytes`, …). Used to populate a type object's `__dict__` proxy.

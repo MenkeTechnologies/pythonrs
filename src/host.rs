@@ -6117,6 +6117,14 @@ impl PyHost {
                 }
                 Ok(out)
             }
+            // Iterating a mappingproxy yields its backing dict's keys.
+            Some(PyObj::MappingProxy { dict }) => {
+                let dict = dict.clone();
+                Ok(match self.get(&dict) {
+                    Some(PyObj::Dict(d)) => d.values().map(|(k, _)| k.clone()).collect(),
+                    _ => Vec::new(),
+                })
+            }
             Some(PyObj::Iter(_)) => {
                 let mut out = Vec::new();
                 while let Some(x) = self.iter_next(v)? {
@@ -6287,6 +6295,11 @@ impl PyHost {
             Some(PyObj::Dict(d)) => {
                 let key = self.to_key(item)?;
                 Ok(d.contains_key(&key))
+            }
+            // A mappingproxy tests membership over its backing dict's keys.
+            Some(PyObj::MappingProxy { dict }) => {
+                let dict = dict.clone();
+                self.contains(item, &dict)
             }
             Some(PyObj::Set(s)) | Some(PyObj::Frozenset(s)) => {
                 let key = self.to_key(item)?;
@@ -7004,12 +7017,29 @@ impl PyHost {
                 let n = n.clone();
                 Ok(self.new_str(n))
             }
+            // `<type>.__mro__` / `__bases__` on a type object.
+            Some(PyObj::Builtin(n))
+                if (name == "__mro__" || name == "__bases__")
+                    && (crate::builtins::is_type_like_builtin(n)
+                        || (!n.contains('.') && !crate::builtins::is_builtin_function(n))) =>
+            {
+                let mut mro = crate::builtins::builtin_mro(n);
+                if name == "__bases__" {
+                    // Immediate bases: everything after self (usually just object).
+                    mro.remove(0);
+                }
+                let vals: Vec<Value> =
+                    mro.into_iter().map(|c| self.alloc(PyObj::Builtin(c))).collect();
+                Ok(self.new_tuple(vals))
+            }
             // `<type>.__dict__` — a mappingproxy over the type's namespace. Sparse
             // for builtin types: only the classmethod descriptors the stdlib
             // reaches via `<type>.__dict__[name]` are populated (pythonrs has no
             // full C method table to enumerate).
             Some(PyObj::Builtin(n))
-                if name == "__dict__" && crate::builtins::is_type_like_builtin(n) =>
+                if name == "__dict__"
+                    && (crate::builtins::is_type_like_builtin(n)
+                        || (!n.contains('.') && !crate::builtins::is_builtin_function(n))) =>
             {
                 let n = n.clone();
                 let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
