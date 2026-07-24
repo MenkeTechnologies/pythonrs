@@ -96,7 +96,10 @@ use std::path::PathBuf;
 /// stale negative-cache/relative bytecode must rebuild.
 /// v30: `import a.b.c` now binds the TOP package `a` (re-importing it) instead of
 /// the leaf submodule, so the emitted bytecode differs for any dotted `import`.
-const SCHEMA: u64 = 30;
+/// v31: a `def`/`lambda` with annotations compiles them as a `<annotate>` thunk
+/// (MKFUNC evaluates it with forward-reference NameErrors caught) instead of an
+/// inline dict, so annotated-function bytecode differs.
+const SCHEMA: u64 = 31;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]

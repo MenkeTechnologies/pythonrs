@@ -63,6 +63,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::IMPORT_FROM, b_import_from);
     vm.register_builtin(ops::IMPORT_STAR, b_import_star);
     vm.register_builtin(ops::IMPORT_RELATIVE, b_import_relative);
+    vm.register_builtin(ops::TRY_ANNOTATION, b_try_annotation);
     vm.register_builtin(ops::UNPACK, b_unpack);
     vm.register_builtin(ops::BINOP, b_binop);
     vm.register_builtin(ops::INPLACE, b_inplace);
@@ -1196,13 +1197,29 @@ fn b_mkfunc(vm: &mut VM, argc: u8) -> Value {
     };
     let split = args.len().saturating_sub(nkw);
     let kwonly_defaults = args.split_off(split);
-    // The `__annotations__` dict is the deepest arg (always present — the compiler
-    // emits an empty dict for an unannotated func); the rest are positional
-    // defaults, in order.
+    // The `__annotations__` are the deepest arg (always present). An unannotated
+    // func gets a plain empty dict; an annotated one gets a THUNK — evaluate it
+    // now, catching a forward-reference NameError (a self-referential annotation
+    // like typing IO's `-> IO[AnyStr]`, or a package's forward-ref type alias),
+    // leaving the annotations empty in that case rather than aborting the def.
     let annotations = if args.is_empty() {
         Value::Undef
     } else {
-        args.remove(0)
+        let raw = args.remove(0);
+        if with_host(|h| matches!(h.get(&raw), Some(PyObj::Func(_)))) {
+            match host::invoke(&raw, vec![], vec![]) {
+                Ok(d) => d,
+                Err(e) if e.contains("NameError") => {
+                    with_host(|h| {
+                        h.take_error();
+                    });
+                    with_host(|h| h.new_dict(indexmap::IndexMap::new()))
+                }
+                Err(e) => return abort(vm, e),
+            }
+        } else {
+            raw
+        }
     };
     let defaults = args;
     let env = with_host(|h| h.current_env_capture());
@@ -2298,6 +2315,28 @@ fn b_import_from(vm: &mut VM, _: u8) -> Value {
 /// `from <dots><modpart> import <name>` — a relative import. Stack (top-first):
 /// `name`, `modpart`, `level`. Resolves against the current module's
 /// `__package__` and leaves the value to bind under `name`.
+/// `TRY_ANNOTATION [dict, key, thunk]` — record a class-body annotation:
+/// `dict[key] = thunk()`, but a forward-reference `NameError` from the thunk is
+/// swallowed (the entry is skipped), so `x: SomeLaterName` in a class body does
+/// not abort the class definition. Leaves nothing on the stack.
+fn b_try_annotation(vm: &mut VM, _: u8) -> Value {
+    let thunk = vm.pop();
+    let key = vm.pop();
+    let dict = vm.pop();
+    match host::invoke(&thunk, vec![], vec![]) {
+        Ok(v) => {
+            let _ = with_host(|h| h.set_item(&dict, &key, v));
+        }
+        Err(e) if e.contains("NameError") => {
+            with_host(|h| {
+                h.take_error();
+            });
+        }
+        Err(e) => return abort(vm, e),
+    }
+    Value::Undef
+}
+
 fn b_import_relative(vm: &mut VM, _: u8) -> Value {
     let name = sval(&vm.pop());
     let modpart = sval(&vm.pop());
@@ -3501,6 +3540,21 @@ pub fn call_builtin_function(
             // `str.__new__(str, 'x')` on the base type itself → the plain value.
             None => call_builtin_function(base, rest, kwargs),
         };
+    }
+    // `mappingproxy(mapping)` — `types.MappingProxyType(d)` (which is
+    // `type(type.__dict__)`) wraps a dict in a read-only view.
+    if name == "mappingproxy" {
+        let src = arg0(&args)?;
+        let dict = with_host(|h| match h.get(&src) {
+            Some(PyObj::Dict(_)) => Some(src.clone()),
+            Some(PyObj::MappingProxy { dict }) => Some(dict.clone()),
+            Some(PyObj::Instance(i)) if matches!(h.get(&i.payload), Some(PyObj::Dict(_))) => {
+                Some(i.payload.clone())
+            }
+            _ => None,
+        })
+        .ok_or_else(|| host::type_error("mappingproxy() argument must be a mapping, not ..."))?;
+        return Ok(with_host(|h| h.alloc(PyObj::MappingProxy { dict })));
     }
     // `object.__new__(cls, *args)` — build a bare instance of the class argument
     // (the args beyond `cls` are consumed by `__init__`, per CPython).

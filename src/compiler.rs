@@ -303,13 +303,21 @@ impl Compiler {
                 // typing.NamedTuple and `Cls.__annotations__` see the field.
                 if self.in_class_body {
                     if let Expr::Name(n) = target.unspanned() {
-                        self.compile_expr(b, annotation)?; // [ann]
+                        // The annotation is compiled as a thunk so a forward
+                        // reference (`x: SomeLaterName`) does not abort the class
+                        // body — `TRY_ANNOTATION` records `__annotations__[key] =
+                        // thunk()` and skips the entry on a NameError.
                         self.name_const(b, "__annotations__");
-                        b.emit(Op::CallBuiltin(ops::GETLOCAL, 1), self.cur_line); // [ann, dict]
-                        self.strlit(b, n); // [ann, dict, key]
-                        b.emit(Op::Rot, 0); // [dict, key, ann]
-                        b.emit(Op::CallBuiltin(ops::SETITEM, 3), 0);
-                        b.emit(Op::Pop, 0);
+                        b.emit(Op::CallBuiltin(ops::GETLOCAL, 1), self.cur_line); // [dict]
+                        self.strlit(b, n); // [dict, key]
+                        let ann_body =
+                            vec![Stmt::from(StmtKind::Return(Some(annotation.clone())))];
+                        let empty = Params::default();
+                        self.fn_depth += 1;
+                        let thunk_id = self.build_function("<annotate>", &empty, &ann_body);
+                        self.fn_depth -= 1;
+                        self.emit_make_func(b, thunk_id?, &empty)?; // [dict, key, thunk]
+                        b.emit(Op::CallBuiltin(ops::TRY_ANNOTATION, 3), 0);
                     }
                 }
                 if let Some(v) = value {
@@ -1074,16 +1082,30 @@ impl Compiler {
         def_id: usize,
         params: &Params,
     ) -> Result<(), String> {
-        // `__annotations__` dict `{name: value, ...}` — deepest arg, so it does not
-        // disturb the func-id `LoadInt` that must stay right below `MKFUNC`.
-        for (name, ann) in &params.annotations {
-            self.compile_expr(b, &Expr::Str(name.clone()))?;
-            self.compile_expr(b, ann)?;
+        // `__annotations__` — the deepest arg, so it does not disturb the func-id
+        // `LoadInt` that must stay right below `MKFUNC`. With annotations present,
+        // emit a THUNK that builds the `{name: value, …}` dict instead of building
+        // it inline: `MKFUNC` evaluates the thunk with any forward-reference
+        // `NameError` caught, so a self-referential annotation (`def m(self) ->
+        // IO[AnyStr]`, or a package's forward-ref type alias) no longer aborts the
+        // definition. An unannotated function keeps its plain empty dict.
+        if params.annotations.is_empty() {
+            b.emit(Op::CallBuiltin(ops::MKDICT, 0), 0);
+        } else {
+            let dict_expr = Expr::Dict(
+                params
+                    .annotations
+                    .iter()
+                    .map(|(name, ann)| (Some(Expr::Str(name.clone())), ann.clone()))
+                    .collect(),
+            );
+            let bodystmt = vec![Stmt::from(StmtKind::Return(Some(dict_expr)))];
+            let empty = Params::default();
+            self.fn_depth += 1;
+            let thunk_id = self.build_function("<annotate>", &empty, &bodystmt);
+            self.fn_depth -= 1;
+            self.emit_make_func(b, thunk_id?, &empty)?; // pushes the thunk value
         }
-        b.emit(
-            Op::CallBuiltin(ops::MKDICT, argc(params.annotations.len() * 2)?),
-            0,
-        );
         for d in &params.defaults {
             self.compile_expr(b, d)?;
         }

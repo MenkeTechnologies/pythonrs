@@ -109,6 +109,7 @@ pub mod ops {
     pub const ELLIPSIS: u16 = 76; // [] -> the `Ellipsis` (`...`) singleton
     pub const IMPORT_STAR: u16 = 77; // [module] -> bind all public names (`from m import *`)
     pub const IMPORT_RELATIVE: u16 = 78; // [level, modpart, name] -> value bound by a relative `from . import`
+    pub const TRY_ANNOTATION: u16 = 79; // [dict, key, thunk] -> set dict[key]=thunk(), forward-ref NameError skipped
 }
 
 /// In-place (augmented-assignment) op tags carried by `ops::INPLACE`. One per

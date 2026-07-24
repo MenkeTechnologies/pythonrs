@@ -505,6 +505,46 @@ fn typing_type_var_core() {
     );
 }
 
+// Forward references in annotations no longer abort a definition: a function or
+// class-body annotation that names something not yet bound is compiled as a
+// thunk whose forward-reference NameError is caught (the entry is dropped),
+// while a resolvable annotation still records the real object. Common in
+// third-party packages (tomli, dataclass-heavy code).
+#[test]
+fn forward_reference_annotations_tolerated() {
+    // Resolvable function annotations stay real objects.
+    assert_eq!(
+        g("def f(a: int) -> str:\n    return ''\nx = f.__annotations__", "x"),
+        "{'a': <class 'int'>, 'return': <class 'str'>}",
+    );
+    // A forward-ref function annotation leaves annotations empty, not a crash.
+    assert_eq!(g("def g(x) -> NotYet:\n    return x\ny = g.__annotations__\nx = y", "x"), "{}");
+    // Class body: resolvable kept, forward-ref dropped.
+    let cls = "class C:\n    a: int\n    b: Later\n    c: str = 'z'\nx = sorted(C.__annotations__)";
+    assert_eq!(g(cls, "x"), "['a', 'c']");
+}
+
+// `types.MappingProxyType(d)` (i.e. `type(type.__dict__)`, the `mappingproxy`
+// type) wraps a dict in a read-only view.
+#[cfg(not(feature = "stdlib-ffi"))]
+#[test]
+fn mappingproxy_constructor() {
+    let src = "from types import MappingProxyType\nm = MappingProxyType({'a': 1, 'b': 2})\nx = (m['a'], m.get('b'), sorted(m.keys()))";
+    assert_eq!(g(src, "x"), "(1, 2, ['a', 'b'])");
+}
+
+// Native `re` (regex-crate backed) matches CPython for the common surface.
+#[cfg(not(feature = "stdlib-ffi"))]
+#[test]
+fn re_module_core() {
+    assert_eq!(g("import re\nx = re.match(r'(\\d+)-(\\d+)', '12-34').groups()", "x"), "('12', '34')");
+    assert_eq!(g("import re\nx = re.findall(r'\\d+', 'a1b22c333')", "x"), "['1', '22', '333']");
+    assert_eq!(g("import re\nx = re.sub(r'\\d', '#', 'a1b2')", "x"), "'a#b#'");
+    assert_eq!(g("import re\nx = re.sub(r'(\\w)(\\d)', r'\\2\\1', 'a1')", "x"), "'1a'");
+    assert_eq!(g("import re\nm = re.search(r'(?P<y>\\d+)', 'x=42')\nx = m.group('y')", "x"), "'42'");
+    assert_eq!(g("import re\nx = re.split(r'\\s+', 'a b  c')", "x"), "['a', 'b', 'c']");
+}
+
 // PEP 695 type parameters (`class C[T]`, `def f[T]`) parse and run: the params
 // bind to `object` so eagerly-evaluated annotations (`-> T`) resolve, and the
 // runtime is unaffected. CPython 3.14's typing.py uses this syntax throughout.
@@ -525,14 +565,10 @@ fn pep695_type_params() {
 #[cfg(not(feature = "stdlib-ffi"))]
 #[test]
 fn relative_import_resolves_package() {
-    let src = "\
-try:
-    import re
-    x = 'imported'
-except ModuleNotFoundError as e:
-    x = str(e)";
-    // The dotted import resolved to `re._compiler` → `_sre` (not `''`).
-    assert_eq!(g(src, "x"), "\"No module named '_sre'\"");
+    // `email/__init__.py` uses relative imports (`from . import ...`); importing
+    // it exercises relative-import resolution against `__package__`. The program
+    // running to completion (`g` would panic on an import error) is the check.
+    assert_eq!(g("import email\nx = 'ok'", "x"), "'ok'");
 }
 
 // `collections.abc` is the pure-Python `_collections_abc` module (CPython aliases
