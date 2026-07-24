@@ -2918,6 +2918,28 @@ pub fn is_type_like_builtin(name: &str) -> bool {
     is_builtin_type(name) || is_exception_class(name)
 }
 
+/// The universal object dunders that any builtin value exposes as a bound method
+/// (`d.__len__`, `d.__getitem__`, `x.__eq__`), dispatched by `call_type_method`.
+/// The stdlib reaches these directly (e.g. functools.lru_cache uses
+/// `cache.__len__`).
+pub fn is_object_dunder_method(name: &str) -> bool {
+    matches!(
+        name,
+        "__len__"
+            | "__getitem__"
+            | "__setitem__"
+            | "__delitem__"
+            | "__iter__"
+            | "__contains__"
+            | "__eq__"
+            | "__ne__"
+            | "__hash__"
+            | "__str__"
+            | "__repr__"
+            | "__bool__"
+    )
+}
+
 /// True if `n` names a builtin TYPE object (for `isinstance(x, type)`, `__mro__`,
 /// `__dict__`). Covers the builtin types/exceptions, the type-constructor
 /// builtins that are also callable (`zip`/`map`/`filter`/`enumerate`/…), and any
@@ -6891,6 +6913,46 @@ pub fn call_type_method(
     if name == "__contains__" {
         let item = arg0(&args)?;
         return Ok(Value::Bool(with_host(|h| h.contains(&item, recv))?));
+    }
+    // Other universal object dunders reached as bound methods (`cache.__len__`,
+    // `cache.__getitem__(k)`, `x.__eq__(y)`) — dispatch to the native op.
+    match name {
+        "__len__" => return Ok(Value::Int(py_len(recv)? as i64)),
+        "__getitem__" => {
+            let k = arg0(&args)?;
+            return with_host(|h| h.get_item(recv, &k));
+        }
+        "__setitem__" => {
+            let k = arg0(&args)?;
+            let v = args.get(1).cloned().unwrap_or(Value::Undef);
+            with_host(|h| h.set_item(recv, &k, v))?;
+            return Ok(Value::Undef);
+        }
+        "__delitem__" => {
+            let k = arg0(&args)?;
+            with_host(|h| h.del_item(recv, &k))?;
+            return Ok(Value::Undef);
+        }
+        "__iter__" => return with_host(|h| h.make_iter(recv)),
+        "__eq__" | "__ne__" => {
+            let o = arg0(&args)?;
+            let eq = with_host(|h| h.equal(recv, &o));
+            return Ok(Value::Bool(if name == "__eq__" { eq } else { !eq }));
+        }
+        "__hash__" => {
+            let k = with_host(|h| h.to_key(recv))?;
+            return Ok(Value::Int(hash_key(&k)));
+        }
+        "__str__" => return Ok(with_host(|h| {
+            let s = h.str_of(recv);
+            h.new_str(s)
+        })),
+        "__repr__" => return Ok(with_host(|h| {
+            let s = h.repr_of(recv);
+            h.new_str(s)
+        })),
+        "__bool__" => return Ok(Value::Bool(with_host(|h| h.truthy(recv)))),
+        _ => {}
     }
     // Set-like dict views (`dict_keys`/`dict_items`) support `isdisjoint`.
     if matches!(tn.as_str(), "dict_keys" | "dict_items") && name == "isdisjoint" {

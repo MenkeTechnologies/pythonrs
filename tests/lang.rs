@@ -264,6 +264,21 @@ fn string_module_and_string_formatter() {
 }
 
 #[test]
+fn object_dunder_methods() {
+    // Universal object dunders are reachable as bound methods (the stdlib uses
+    // e.g. cache.__len__ directly).
+    assert_eq!(g("x = {'a': 1}.__len__()", "x"), "1");
+    assert_eq!(g("x = [1, 2, 3].__getitem__(1)", "x"), "2");
+    assert_eq!(g("x = 'hi'.__eq__('hi')", "x"), "True");
+    assert_eq!(g("x = (1, 2, 3).__contains__(2)", "x"), "True");
+    // functools.lru_cache uses cache.__len__ internally.
+    assert_eq!(
+        g("import functools\n@functools.cache\ndef f(n): return n * n\nx = f(6) + f(6)", "x"),
+        "72",
+    );
+}
+
+#[test]
 fn thread_locks() {
     // Native _thread locks: RLock is reentrant, plain lock tracks state. (Single
     // user thread, so acquire always succeeds.)
