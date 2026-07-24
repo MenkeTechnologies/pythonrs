@@ -175,6 +175,32 @@ fn shard_path() -> Option<PathBuf> {
     Some(dir.join("scripts.rkyv"))
 }
 
+/// An exclusive advisory lock (`flock`) over the shard, held for the duration of
+/// a read-modify-write. Up to 16 instances share one shard; without this, two
+/// writers both load the same base, both rewrite it, and the losing rename drops
+/// the other's entry. Serializing the whole load→append→write under the lock
+/// makes every writer re-read the latest shard, so no entry is ever lost — while
+/// keeping the single authoritative store (readers still mmap the renamed file;
+/// the lock is a sibling `.lock`, never in the read path).
+struct ShardLock(std::fs::File);
+
+impl ShardLock {
+    fn acquire() -> Option<Self> {
+        use std::os::unix::io::AsRawFd;
+        let path = shard_path()?.with_extension("lock");
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&path)
+            .ok()?;
+        // Blocking exclusive lock; released when `f` is dropped (fd closed).
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return None;
+        }
+        Some(ShardLock(f))
+    }
+}
+
 fn load_shard() -> Shard {
     let Some(path) = shard_path() else {
         return Shard::default();
@@ -365,6 +391,11 @@ pub fn store(src: &str, prog: &Program) -> Result<(), String> {
         positions: prog.positions.clone(),
     };
     let blob = bincode::serialize(&cp).map_err(|e| format!("cache encode: {e}"))?;
+    // Serialize the whole read-modify-write against the other instances sharing
+    // the shard, so concurrent writers merge instead of clobbering. The lock is
+    // held until this function returns (the guard drops). If the lock cannot be
+    // taken, fall through unlocked — a dropped entry only costs a recompile.
+    let _guard = ShardLock::acquire();
     let mut shard = load_shard();
     shard.entries.retain(|e| e.key != key);
     shard.entries.push(Entry {
