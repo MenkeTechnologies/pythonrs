@@ -6787,12 +6787,30 @@ pub fn re_pattern_method(
     match method {
         "match" | "search" | "fullmatch" => {
             let text = text.ok_or_else(|| host::type_error("expected string"))?;
+            // Optional `pos`/`endpos` (`p.match(s, pos)`): match within
+            // `text[pos:endpos]` but report absolute positions. tomli scans a TOML
+            // document with `RE_NUMBER.match(src, pos)`.
+            let pos = args
+                .get(1)
+                .and_then(|v| with_host(|h| h.as_int(v)))
+                .unwrap_or(0)
+                .clamp(0, text.len() as i64) as usize;
+            let endpos = args
+                .get(2)
+                .and_then(|v| with_host(|h| h.as_int(v)))
+                .map(|e| (e.clamp(0, text.len() as i64)) as usize)
+                .unwrap_or(text.len());
+            let sub = text.get(pos..endpos).unwrap_or("");
             let anchored = method == "match" || method == "fullmatch";
-            match re_first_match(pat_id, &text, anchored) {
-                Some(spans) => {
-                    // `fullmatch` also requires the match to reach the end.
+            match re_first_match(pat_id, sub, anchored) {
+                Some(rel) => {
+                    // Shift the sub-slice spans back to absolute positions.
+                    let spans: Vec<Option<(usize, usize)>> = rel
+                        .iter()
+                        .map(|s| s.map(|(a, b)| (a + pos, b + pos)))
+                        .collect();
                     if method == "fullmatch"
-                        && spans.first().copied().flatten().map(|(_, e)| e) != Some(text.len())
+                        && spans.first().copied().flatten().map(|(_, e)| e) != Some(endpos)
                     {
                         return Ok(Value::Undef);
                     }

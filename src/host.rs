@@ -9274,6 +9274,22 @@ pub fn call_method(
         // `foreign.method(...)` (stdlib-ffi) — dispatch on the CPython side.
         #[cfg(feature = "stdlib-ffi")]
         Some(PyObj::Foreign(id)) => crate::ffi::call_method(id, name, args, kwargs),
+        // `<ExcClass>.__init__(self, *args)` — `BaseException.__init__` sets
+        // `self.args`. tomli's `TOMLDecodeError` calls `ValueError.__init__(self,
+        // msg)` explicitly (rather than via `super()`).
+        Some(PyObj::Builtin(bname))
+            if name == "__init__" && crate::builtins::is_exception_class(&bname) =>
+        {
+            let mut it = args.into_iter();
+            if let Some(inst) = it.next() {
+                let rest: Vec<Value> = it.collect();
+                with_host(|h| {
+                    let t = h.alloc(PyObj::Tuple(rest));
+                    let _ = h.set_attr(&inst, "args", t);
+                });
+            }
+            Ok(Value::Undef)
+        }
         // A method fetched from a builtin *type* object (`dict.fromkeys(...)`):
         // resolve the attribute (a callable builtin) then invoke it.
         Some(PyObj::Builtin(_)) => match with_host(|h| h.get_attr(recv, name)) {
