@@ -531,6 +531,14 @@ pub enum DescKind {
     MemberDescriptor,
 }
 
+/// The attribute names of a `time.struct_time`, in order: the 9 sequence fields
+/// (`tm_year … tm_isdst`) then the two attribute-only extras (`tm_gmtoff`,
+/// `tm_zone`). Index/iteration cover only the first 9.
+pub const STRUCT_TIME_FIELDS: &[&str] = &[
+    "tm_year", "tm_mon", "tm_mday", "tm_hour", "tm_min", "tm_sec", "tm_wday", "tm_yday",
+    "tm_isdst", "tm_gmtoff", "tm_zone",
+];
+
 /// Which `typing` type-parameter flavor a [`PyObj::TypeVarLike`] is.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TypeVarKind {
@@ -623,6 +631,13 @@ pub enum PyObj {
     GenericAlias {
         origin: Value,
         args: Vec<Value>,
+    },
+    /// A `time.struct_time` — the 9-field broken-down time sequence
+    /// (`tm_year … tm_isdst`) plus the named-only `tm_gmtoff`/`tm_zone`. Indexes
+    /// and iterates as a 9-tuple; the extra two are attribute-only. `fields` holds
+    /// all 11 values in order.
+    StructTime {
+        fields: Vec<Value>,
     },
     /// A `typing` type parameter — `TypeVar`, `ParamSpec`, or `TypeVarTuple` — the
     /// C `_typing` primitives that `typing.py` builds on. `kind` selects which;
@@ -2765,6 +2780,7 @@ impl PyHost {
                 Some(PyObj::Union { .. }) => "UnionType".into(),
                 Some(PyObj::GenericAlias { .. }) => "GenericAlias".into(),
                 Some(PyObj::TypeVarLike { kind, .. }) => kind.type_name().into(),
+                Some(PyObj::StructTime { .. }) => "struct_time".into(),
                 Some(PyObj::Namespace { .. }) => "SimpleNamespace".into(),
                 Some(PyObj::MappingProxy { .. }) => "mappingproxy".into(),
                 Some(PyObj::Descriptor { kind, .. }) => kind.type_name().into(),
@@ -2895,6 +2911,16 @@ impl PyHost {
                     format!("<code object {name} at 0x0000000000000000, file \"<string>\", line 1>")
                 }
                 Some(PyObj::TypeVarLike { name, .. }) => name.clone(),
+                Some(PyObj::StructTime { fields }) => {
+                    let fields = fields.clone();
+                    let parts: Vec<String> = STRUCT_TIME_FIELDS
+                        .iter()
+                        .zip(fields.iter())
+                        .filter(|(_, v)| !matches!(v, Value::Undef))
+                        .map(|(name, v)| format!("{name}={}", self.repr_of(v)))
+                        .collect();
+                    format!("time.struct_time({})", parts.join(", "))
+                }
                 Some(PyObj::Union { args }) => {
                     let args = args.clone();
                     args.iter()
@@ -5790,6 +5816,12 @@ impl PyHost {
             let (lo, hi, step) = (lo.clone(), hi.clone(), step.clone());
             return self.get_slice(recv, &lo, &hi, &step);
         }
+        // A `struct_time` indexes as its 9-element sequence (`t[0]` == `tm_year`).
+        if let Some(PyObj::StructTime { fields }) = self.get(recv) {
+            let seq: Vec<Value> = fields.iter().take(9).cloned().collect();
+            let t = self.new_tuple(seq);
+            return self.get_item(&t, idx);
+        }
         match self.get(recv) {
             Some(PyObj::List(l)) | Some(PyObj::Tuple(l)) => {
                 let is_tuple = matches!(self.get(recv), Some(PyObj::Tuple(_)));
@@ -6381,6 +6413,7 @@ impl PyHost {
         }
         match self.get(v) {
             Some(PyObj::List(l)) | Some(PyObj::Tuple(l)) => Ok(l.clone()),
+            Some(PyObj::StructTime { fields }) => Ok(fields.iter().take(9).cloned().collect()),
             Some(PyObj::Deque { items, .. }) => Ok(items.iter().cloned().collect()),
             Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) => {
                 Ok(b.iter().map(|&x| Value::Int(x as i64)).collect())
@@ -6492,6 +6525,10 @@ impl PyHost {
         let state = match self.get(v) {
             Some(PyObj::List(l)) | Some(PyObj::Tuple(l)) => IterState::Seq {
                 items: l.clone(),
+                idx: 0,
+            },
+            Some(PyObj::StructTime { fields }) => IterState::Seq {
+                items: fields.iter().take(9).cloned().collect(),
                 idx: 0,
             },
             Some(PyObj::Str(s)) => IterState::Seq {
@@ -7414,6 +7451,18 @@ impl PyHost {
                 Err(format!(
                     "AttributeError: '{}' object has no attribute '{name}'",
                     self.type_name(recv)
+                ))
+            }
+            // `struct_time.tm_year` etc. — read the named field (including the
+            // attribute-only `tm_gmtoff`/`tm_zone`).
+            Some(PyObj::StructTime { fields }) => {
+                if let Some(i) = STRUCT_TIME_FIELDS.iter().position(|f| *f == name) {
+                    if let Some(v) = fields.get(i) {
+                        return Ok(v.clone());
+                    }
+                }
+                Err(format!(
+                    "AttributeError: 'time.struct_time' object has no attribute '{name}'"
                 ))
             }
             // Generic alias: expose origin/args; forward anything else to origin.
@@ -8922,6 +8971,12 @@ pub fn call_method(
                     }
                     _ => return invoke(&f, args, kwargs),
                 }
+            }
+            // `Cls.__new__(subcls, *args)` with no class-defined `__new__` falls
+            // back to `object.__new__` — a bare instance of the class argument.
+            // `_pydatetime`'s `tzinfo.__new__(cls)` relies on this.
+            if name == "__new__" {
+                return crate::builtins::call_builtin_function("object.__new__", args, kwargs);
             }
             // A method defined on the metaclass is callable on the class, bound to
             // the class as its receiver (`cls`): `A.meta_method()`.
@@ -12078,6 +12133,29 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                     h.alloc(PyObj::Builtin("atexit._ncallbacks".into())),
                 ),
             ]
+        }),
+        // `time` — wall-clock, monotonic, and broken-down-time functions. The
+        // calendar conversions (`gmtime`/`localtime`/`strftime`/`mktime`) delegate
+        // to libc (the real C accelerator); `time()`/`monotonic()`/`sleep()` use
+        // Rust's `std::time`. Native because CPython's `time` is a C module.
+        "time" => with_host(|h| {
+            const FNS: &[&str] = &[
+                "time", "time_ns", "monotonic", "monotonic_ns", "perf_counter",
+                "perf_counter_ns", "process_time", "process_time_ns", "sleep",
+                "gmtime", "localtime", "mktime", "strftime", "struct_time", "asctime",
+                "ctime",
+            ];
+            let mut out: Vec<(&str, Value)> =
+                FNS.iter().map(|f| (*f, h.alloc(PyObj::Builtin(format!("time.{f}"))))).collect();
+            let (tz, alt, daylight, name_std, name_dst) = crate::builtins::tz_info();
+            out.push(("timezone", Value::Int(tz)));
+            out.push(("altzone", Value::Int(alt)));
+            out.push(("daylight", Value::Int(daylight)));
+            let n0 = h.new_str(name_std);
+            let n1 = h.new_str(name_dst);
+            let tzname = h.new_tuple(vec![n0, n1]);
+            out.push(("tzname", tzname));
+            out
         }),
         // `errno` — the platform error numbers (from libc) plus the `errorcode`
         // {number: name} map. A pure constants C-ext, correct natively on any

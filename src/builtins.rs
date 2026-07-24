@@ -3401,6 +3401,10 @@ pub fn call_builtin_function(
     if let Some(f) = name.strip_prefix("_typing.") {
         return call_typing(f, args, kwargs);
     }
+    // `time.*` — clocks and broken-down time.
+    if let Some(f) = name.strip_prefix("time.") {
+        return call_time(f, args);
+    }
     // `atexit.*` — shutdown-callback registry.
     if let Some(f) = name.strip_prefix("atexit.") {
         return match f {
@@ -4694,6 +4698,7 @@ pub fn py_len(v: &Value) -> Result<usize, String> {
         Some(PyObj::Memoryview { len, .. }) => Ok(*len),
         Some(PyObj::Deque { items, .. }) => Ok(items.len()),
         Some(PyObj::List(l)) | Some(PyObj::Tuple(l)) => Ok(l.len()),
+        Some(PyObj::StructTime { .. }) => Ok(9),
         Some(PyObj::Dict(d)) => Ok(d.len()),
         Some(PyObj::Set(s)) | Some(PyObj::Frozenset(s)) => Ok(s.len()),
         Some(PyObj::DictView { dict, .. }) => Ok(match h.get(dict) {
@@ -6574,6 +6579,194 @@ fn call_typing(f: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Resul
         return Ok(with_host(|h| h.make_type_var(kind, name, constraints, kwargs)));
     }
     Err(host::name_error(&format!("_typing.{f}")))
+}
+
+/// Timezone constants (`timezone`, `altzone`, `daylight`, `tzname`) for the `time`
+/// module, derived from libc's `localtime_r` of "now" (the `timezone`/`tzname`
+/// globals are not exposed by the `libc` crate). `timezone` is seconds WEST of
+/// UTC; `altzone` is the DST variant.
+pub fn tz_info() -> (i64, i64, i64, String, String) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0) as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&t, &mut tm) };
+    let gmtoff = tm.tm_gmtoff as i64;
+    let zone = unsafe {
+        std::ffi::CStr::from_ptr(tm.tm_zone)
+            .to_string_lossy()
+            .into_owned()
+    };
+    let is_dst = tm.tm_isdst > 0;
+    let timezone = if is_dst { -gmtoff + 3600 } else { -gmtoff };
+    (timezone, timezone - 3600, is_dst as i64, zone.clone(), zone)
+}
+
+/// The process-start reference for the monotonic clock (fixed on first read).
+fn monotonic_origin() -> std::time::Instant {
+    use std::sync::OnceLock;
+    static ORIGIN: OnceLock<std::time::Instant> = OnceLock::new();
+    *ORIGIN.get_or_init(std::time::Instant::now)
+}
+
+/// Build a `struct_time` from a libc `tm` plus the gmt-offset and zone name.
+fn struct_time_from_tm(h: &mut host::PyHost, tm: &libc::tm, gmtoff: i64, zone: &str) -> Value {
+    let z = h.new_str(zone.to_string());
+    let fields = vec![
+        Value::Int(tm.tm_year as i64 + 1900),
+        Value::Int(tm.tm_mon as i64 + 1),
+        Value::Int(tm.tm_mday as i64),
+        Value::Int(tm.tm_hour as i64),
+        Value::Int(tm.tm_min as i64),
+        Value::Int(tm.tm_sec as i64),
+        Value::Int((tm.tm_wday as i64 + 6) % 7), // libc: Sun=0; Python: Mon=0
+        Value::Int(tm.tm_yday as i64 + 1),
+        Value::Int(tm.tm_isdst as i64),
+        Value::Int(gmtoff),
+        z,
+    ];
+    h.alloc(PyObj::StructTime { fields })
+}
+
+/// Convert a `struct_time` (or a plain 9-tuple) argument into a libc `tm`.
+fn struct_time_to_tm(args: &[Value]) -> Result<libc::tm, String> {
+    let seq = host::iter_vec(&arg0(args)?)?;
+    if seq.len() < 9 {
+        return Err(host::type_error(
+            "argument must be a struct_time or sequence of length 9",
+        ));
+    }
+    let g = |i: usize| with_host(|h| h.as_int(&seq[i])).unwrap_or(0) as libc::c_int;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    tm.tm_year = g(0) - 1900;
+    tm.tm_mon = g(1) - 1;
+    tm.tm_mday = g(2);
+    tm.tm_hour = g(3);
+    tm.tm_min = g(4);
+    tm.tm_sec = g(5);
+    tm.tm_wday = (g(6) + 1) % 7;
+    tm.tm_yday = g(7) - 1;
+    tm.tm_isdst = g(8);
+    Ok(tm)
+}
+
+/// Format a libc `tm` with `strftime` into an owned String.
+fn strftime_libc(fmt: &str, tm: &mut libc::tm) -> String {
+    let cfmt = match std::ffi::CString::new(fmt) {
+        Ok(c) => c,
+        Err(_) => return String::new(),
+    };
+    let mut buf = vec![0u8; 256];
+    let n = unsafe {
+        libc::strftime(
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+            cfmt.as_ptr(),
+            tm,
+        )
+    };
+    String::from_utf8_lossy(&buf[..n]).into_owned()
+}
+
+/// `time.*` — clocks, `sleep`, and libc-backed broken-down time.
+fn call_time(f: &str, args: Vec<Value>) -> Result<Value, String> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now_secs = || {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0)
+    };
+    let secs_arg = |args: &[Value]| -> i64 {
+        args.first()
+            .and_then(|v| with_host(|h| h.num_val(v)))
+            .map(|f| f as i64)
+            .unwrap_or_else(|| now_secs() as i64)
+    };
+    match f {
+        "time" => Ok(Value::Float(now_secs())),
+        "time_ns" => Ok(Value::Int(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos() as i64)
+                .unwrap_or(0),
+        )),
+        "monotonic" | "perf_counter" | "process_time" => {
+            Ok(Value::Float(monotonic_origin().elapsed().as_secs_f64()))
+        }
+        "monotonic_ns" | "perf_counter_ns" | "process_time_ns" => {
+            Ok(Value::Int(monotonic_origin().elapsed().as_nanos() as i64))
+        }
+        "sleep" => {
+            let secs = args.first().and_then(|v| with_host(|h| h.num_val(v))).unwrap_or(0.0);
+            if secs > 0.0 {
+                std::thread::sleep(std::time::Duration::from_secs_f64(secs));
+            }
+            Ok(Value::Undef)
+        }
+        "gmtime" | "localtime" => {
+            let t = secs_arg(&args) as libc::time_t;
+            let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+            let (gmtoff, zone) = unsafe {
+                if f == "gmtime" {
+                    libc::gmtime_r(&t, &mut tm);
+                    (0i64, "UTC".to_string())
+                } else {
+                    libc::localtime_r(&t, &mut tm);
+                    let z = std::ffi::CStr::from_ptr(tm.tm_zone)
+                        .to_string_lossy()
+                        .into_owned();
+                    (tm.tm_gmtoff as i64, z)
+                }
+            };
+            Ok(with_host(|h| struct_time_from_tm(h, &tm, gmtoff, &zone)))
+        }
+        "mktime" => {
+            let mut tm = struct_time_to_tm(&args)?;
+            let t = unsafe { libc::mktime(&mut tm) };
+            Ok(Value::Float(t as f64))
+        }
+        "strftime" => {
+            let fmt = with_host(|h| h.as_str(&args[0]))
+                .ok_or_else(|| host::type_error("strftime() argument 1 must be str"))?;
+            let mut tm = if args.len() > 1 {
+                struct_time_to_tm(&args[1..])?
+            } else {
+                let t = now_secs() as libc::time_t;
+                let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+                unsafe { libc::localtime_r(&t, &mut tm) };
+                tm
+            };
+            Ok(Value::str(&strftime_libc(&fmt, &mut tm)))
+        }
+        "struct_time" => {
+            let seq = host::iter_vec(&arg0(&args)?)?;
+            if seq.len() < 9 {
+                return Err(host::type_error(
+                    "time.struct_time() takes a sequence of length 9 to 11",
+                ));
+            }
+            let mut fields: Vec<Value> = seq.into_iter().take(11).collect();
+            while fields.len() < 11 {
+                fields.push(Value::Undef);
+            }
+            Ok(with_host(|h| h.alloc(PyObj::StructTime { fields })))
+        }
+        "asctime" | "ctime" => {
+            let mut tm = if f == "asctime" && !args.is_empty() {
+                struct_time_to_tm(&args)?
+            } else {
+                let t = now_secs() as libc::time_t;
+                let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+                unsafe { libc::localtime_r(&t, &mut tm) };
+                tm
+            };
+            Ok(Value::str(strftime_libc("%a %b %e %H:%M:%S %Y", &mut tm).trim()))
+        }
+        _ => Err(host::name_error(&format!("time.{f}"))),
+    }
 }
 
 fn call_math(name: &str, args: &[Value]) -> Result<Value, String> {
