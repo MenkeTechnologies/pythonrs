@@ -94,7 +94,9 @@ use std::path::PathBuf;
 /// v29: PEP 695 type parameters (`class C[T]`, `def f[T]`) now parse and emit
 /// `T = object` bindings; files that previously failed to compile now do, so any
 /// stale negative-cache/relative bytecode must rebuild.
-const SCHEMA: u64 = 29;
+/// v30: `import a.b.c` now binds the TOP package `a` (re-importing it) instead of
+/// the leaf submodule, so the emitted bytecode differs for any dotted `import`.
+const SCHEMA: u64 = 30;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]

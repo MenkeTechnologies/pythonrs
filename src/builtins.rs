@@ -3390,6 +3390,10 @@ pub fn call_builtin_function(
     if let Some(f) = name.strip_prefix("posix.") {
         return call_posix(f, args, kwargs);
     }
+    // `_typing.*` — the C accelerator constructors `typing.py` imports.
+    if let Some(f) = name.strip_prefix("_typing.") {
+        return call_typing(f, args, kwargs);
+    }
     // `atexit.*` — shutdown-callback registry.
     if let Some(f) = name.strip_prefix("atexit.") {
         return match f {
@@ -6508,6 +6512,32 @@ fn math_arity(name: &str) -> Option<Arity> {
         // Every other implemented math function is single-argument (METH_O).
         _ => Arity::ExactlyOne,
     })
+}
+
+/// The `_typing` C-accelerator constructors that `typing.py` imports. The rich
+/// type-system logic stays in `typing.py`; these build the primitive objects.
+fn call_typing(f: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Result<Value, String> {
+    use host::TypeVarKind;
+    // `_idfunc(x)` — identity (typing uses it as `TypeAliasType.__call__`).
+    if f == "_idfunc" {
+        return Ok(args.into_iter().next().unwrap_or(Value::Undef));
+    }
+    // The three type-parameter flavors share a constructor shape: a name, then
+    // keyword-supplied dunder attributes (`bound`, `covariant`, `default`, …).
+    let kind = match f {
+        "TypeVar" => Some(TypeVarKind::TypeVar),
+        "ParamSpec" => Some(TypeVarKind::ParamSpec),
+        "TypeVarTuple" => Some(TypeVarKind::TypeVarTuple),
+        _ => None,
+    };
+    if let Some(kind) = kind {
+        let name = with_host(|h| h.as_str(&args[0]))
+            .ok_or_else(|| host::type_error(&format!("{f}() argument 1 must be str")))?;
+        // Positional args after the name are `TypeVar` constraints.
+        let constraints: Vec<Value> = args.iter().skip(1).cloned().collect();
+        return Ok(with_host(|h| h.make_type_var(kind, name, constraints, kwargs)));
+    }
+    Err(host::name_error(&format!("_typing.{f}")))
 }
 
 fn call_math(name: &str, args: &[Value]) -> Result<Value, String> {

@@ -463,13 +463,30 @@ impl Compiler {
             }
             StmtKind::Import(aliases) => {
                 for a in aliases {
-                    self.strlit(b, &a.name);
-                    b.emit(Op::CallBuiltin(ops::IMPORT, 1), line);
-                    let bind = a
-                        .asname
-                        .clone()
-                        .unwrap_or_else(|| a.name.split('.').next().unwrap_or(&a.name).to_string());
-                    self.store_name(b, &bind);
+                    match &a.asname {
+                        // `import a.b.c as x` binds the LEAF submodule to `x`.
+                        Some(asname) => {
+                            self.strlit(b, &a.name);
+                            b.emit(Op::CallBuiltin(ops::IMPORT, 1), line);
+                            self.store_name(b, asname);
+                        }
+                        // `import a.b.c` imports the whole chain (each level bound
+                        // on its parent) but binds only the TOP package `a` — so
+                        // `a.b.c` is then reached by attribute access. CPython's
+                        // IMPORT_NAME returns the top module when fromlist is empty.
+                        None => {
+                            let top = a.name.split('.').next().unwrap_or(&a.name).to_string();
+                            self.strlit(b, &a.name);
+                            b.emit(Op::CallBuiltin(ops::IMPORT, 1), line);
+                            if top != a.name {
+                                // Discard the leaf, import the top package for the binding.
+                                b.emit(Op::Pop, 0);
+                                self.strlit(b, &top);
+                                b.emit(Op::CallBuiltin(ops::IMPORT, 1), line);
+                            }
+                            self.store_name(b, &top);
+                        }
+                    }
                 }
             }
             StmtKind::ImportFrom {

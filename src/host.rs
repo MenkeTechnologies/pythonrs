@@ -528,6 +528,28 @@ pub enum DescKind {
     MemberDescriptor,
 }
 
+/// Which `typing` type-parameter flavor a [`PyObj::TypeVarLike`] is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TypeVarKind {
+    /// `TypeVar('T')` — a single type variable.
+    TypeVar,
+    /// `ParamSpec('P')` — a parameter specification.
+    ParamSpec,
+    /// `TypeVarTuple('Ts')` — a variadic type variable.
+    TypeVarTuple,
+}
+
+impl TypeVarKind {
+    /// The `type(...).__name__` CPython reports for this flavor.
+    fn type_name(self) -> &'static str {
+        match self {
+            TypeVarKind::TypeVar => "TypeVar",
+            TypeVarKind::ParamSpec => "ParamSpec",
+            TypeVarKind::TypeVarTuple => "TypeVarTuple",
+        }
+    }
+}
+
 impl DescKind {
     fn type_name(self) -> &'static str {
         match self {
@@ -598,6 +620,16 @@ pub enum PyObj {
     GenericAlias {
         origin: Value,
         args: Vec<Value>,
+    },
+    /// A `typing` type parameter — `TypeVar`, `ParamSpec`, or `TypeVarTuple` — the
+    /// C `_typing` primitives that `typing.py` builds on. `kind` selects which;
+    /// `attrs` holds the dunder attributes (`__bound__`, `__constraints__`,
+    /// `__covariant__`, `__default__`, …) that `typing.py` reads. Hashable by
+    /// identity, usable as a generic argument, and `|`-combinable into a `Union`.
+    TypeVarLike {
+        kind: TypeVarKind,
+        name: String,
+        attrs: Value,
     },
     /// A `types.SimpleNamespace` — a mutable attribute bag (`sys.implementation`,
     /// argparse results). Attribute reads/writes go through `attrs`; `repr` is
@@ -2729,6 +2761,7 @@ impl PyHost {
                 Some(PyObj::Code { .. }) => "code".into(),
                 Some(PyObj::Union { .. }) => "UnionType".into(),
                 Some(PyObj::GenericAlias { .. }) => "GenericAlias".into(),
+                Some(PyObj::TypeVarLike { kind, .. }) => kind.type_name().into(),
                 Some(PyObj::Namespace { .. }) => "SimpleNamespace".into(),
                 Some(PyObj::MappingProxy { .. }) => "mappingproxy".into(),
                 Some(PyObj::Descriptor { kind, .. }) => kind.type_name().into(),
@@ -2858,6 +2891,7 @@ impl PyHost {
                         .unwrap_or_default();
                     format!("<code object {name} at 0x0000000000000000, file \"<string>\", line 1>")
                 }
+                Some(PyObj::TypeVarLike { name, .. }) => name.clone(),
                 Some(PyObj::Union { args }) => {
                     let args = args.clone();
                     args.iter()
@@ -3283,7 +3317,8 @@ impl PyHost {
                     | PyObj::ClassMethod(_)
                     | PyObj::Module { .. }
                     | PyObj::Code { .. }
-                    | PyObj::Lock { .. },
+                    | PyObj::Lock { .. }
+                    | PyObj::TypeVarLike { .. },
                 ) => {
                     let id = match v {
                         Value::Obj(i) => *i,
@@ -6725,6 +6760,50 @@ impl PyHost {
         }
     }
 
+    /// Build a `TypeVar`/`ParamSpec`/`TypeVarTuple` object (a `_typing`
+    /// primitive). The dunder attributes `typing.py` reads (`__name__`,
+    /// `__bound__`, `__constraints__`, `__covariant__`, `__contravariant__`,
+    /// `__infer_variance__`, `__default__`) are stored in a backing dict; unset
+    /// keyword arguments take their CPython defaults.
+    pub fn make_type_var(
+        &mut self,
+        kind: TypeVarKind,
+        name: String,
+        constraints: Vec<Value>,
+        kwargs: Vec<(String, Value)>,
+    ) -> Value {
+        let get = |kwargs: &[(String, Value)], k: &str| {
+            kwargs.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.clone())
+        };
+        let name_v = self.new_str(name.clone());
+        let bound = get(&kwargs, "bound").unwrap_or(Value::Undef);
+        let covariant = get(&kwargs, "covariant").unwrap_or(Value::Bool(false));
+        let contravariant = get(&kwargs, "contravariant").unwrap_or(Value::Bool(false));
+        let infer_variance = get(&kwargs, "infer_variance").unwrap_or(Value::Bool(false));
+        // `default` unset → the `NoDefault` sentinel (same object `_typing` exports).
+        let default = get(&kwargs, "default").unwrap_or_else(|| {
+            self.cached_module("_typing")
+                .and_then(|m| self.get_attr(&m, "NoDefault").ok())
+                .unwrap_or(Value::Undef)
+        });
+        let constraints_tuple = self.new_tuple(constraints);
+        let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+        for (k, v) in [
+            ("__name__", name_v),
+            ("__bound__", bound),
+            ("__constraints__", constraints_tuple),
+            ("__covariant__", covariant),
+            ("__contravariant__", contravariant),
+            ("__infer_variance__", infer_variance),
+            ("__default__", default),
+        ] {
+            let kv = self.new_str(k.to_string());
+            d.insert(PKey::Str(k.to_string()), (kv, v));
+        }
+        let attrs = self.new_dict(d);
+        self.alloc(PyObj::TypeVarLike { kind, name, attrs })
+    }
+
     /// If `v` is a class whose metaclass (other than plain `type`) defines the
     /// method `name`, return that method value (unbound). Used to dispatch a
     /// metaclass dunder against the class object itself — e.g. iterating an Enum
@@ -7259,6 +7338,21 @@ impl PyHost {
                 Ok(self.new_tuple(args))
             }
             Some(PyObj::Union { .. }) if name == "__parameters__" => Ok(self.new_tuple(vec![])),
+            // A TypeVar/ParamSpec/TypeVarTuple exposes its dunder attributes from
+            // the backing dict; `has_default()` reflects whether `__default__` was
+            // set (not the `NoDefault` sentinel).
+            Some(PyObj::TypeVarLike { attrs, .. }) => {
+                let attrs = attrs.clone();
+                if let Some(PyObj::Dict(d)) = self.get(&attrs) {
+                    if let Some((_, v)) = d.get(&PKey::Str(name.to_string())) {
+                        return Ok(v.clone());
+                    }
+                }
+                Err(format!(
+                    "AttributeError: '{}' object has no attribute '{name}'",
+                    self.type_name(recv)
+                ))
+            }
             // Generic alias: expose origin/args; forward anything else to origin.
             Some(PyObj::GenericAlias { origin, args }) => {
                 let (origin, args) = (origin.clone(), args.clone());
@@ -7386,10 +7480,15 @@ impl PyHost {
                     )),
                 }
             }
-            Some(PyObj::Builtin(n)) if name == "__name__" => {
-                // `type(x).__name__` — the builtin/type object's name.
+            Some(PyObj::Builtin(n)) if name == "__name__" || name == "__qualname__" => {
+                // `type(x).__name__` / `.__qualname__` — the builtin type's name.
                 let n = n.clone();
                 Ok(self.new_str(n))
+            }
+            // A builtin type object / function reports `builtins` as its module
+            // (typing's deprecated-alias machinery reads `origin.__module__`).
+            Some(PyObj::Builtin(_)) if name == "__module__" => {
+                Ok(self.new_str("builtins".to_string()))
             }
             // `<type>.__mro__` / `__bases__` on a type object.
             Some(PyObj::Builtin(n))
@@ -8888,6 +8987,26 @@ pub fn call_method(
                 // default (PEP 487): a cooperative chain reaching the top returns
                 // `None`. (`object` has no `__set_name__`, so that still errors.)
                 None if name == "__init_subclass__" => Ok(Value::Undef),
+                // `super().__setattr__/__delattr__/__getattribute__(...)` bottom out
+                // at `object`'s implementations — the plain instance-dict ops
+                // (typing's `_GenericAlias.__setattr__` calls `super().__setattr__`).
+                None if name == "__setattr__" => {
+                    let mut it = args.into_iter();
+                    let attr = it.next().unwrap_or(Value::Undef);
+                    let val = it.next().unwrap_or(Value::Undef);
+                    let attr_s = with_host(|h| h.as_str(&attr)).unwrap_or_default();
+                    with_host(|h| h.set_attr(&instance, &attr_s, val)).map(|_| Value::Undef)
+                }
+                None if name == "__delattr__" => {
+                    let attr = args.into_iter().next().unwrap_or(Value::Undef);
+                    let attr_s = with_host(|h| h.as_str(&attr)).unwrap_or_default();
+                    with_host(|h| h.del_attr(&instance, &attr_s)).map(|_| Value::Undef)
+                }
+                None if name == "__getattribute__" => {
+                    let attr = args.into_iter().next().unwrap_or(Value::Undef);
+                    let attr_s = with_host(|h| h.as_str(&attr)).unwrap_or_default();
+                    with_host(|h| h.get_attr(&instance, &attr_s))
+                }
                 None => Err(format!(
                     "AttributeError: 'super' object has no attribute '{name}'"
                 )),
@@ -9931,9 +10050,12 @@ fn metaclass_create(
 ) -> Result<Value, String> {
     let name_v = with_host(|h| h.new_str(name.to_string()));
     let base_vals: Vec<Value> = with_host(|h| {
+        // A builtin base (`Generic`, `int`, `Exception`) must reach the metaclass
+        // as its Builtin object, not a synthetic Class, so identity checks in the
+        // metaclass (`bases == (Generic,)` in typing's `_ProtocolMeta`) hold.
         bases
             .iter()
-            .map(|b| h.alloc(PyObj::Class(b.clone())))
+            .map(|b| h.class_or_builtin_type(b.clone()))
             .collect()
     });
     let bases_v = with_host(|h| h.new_tuple(base_vals));
@@ -11473,6 +11595,20 @@ pub fn import_module(name: &str) -> Result<Value, String> {
     if let Some(m) = with_host(|h| h.cached_module(name)) {
         return Ok(m);
     }
+    // Import parent packages first, as CPython does (`import a.b.c` imports `a`,
+    // then `a.b`, then `a.b.c`). A package `__init__` may register the child as a
+    // submodule alias — os/__init__ runs `sys.modules['os.path'] = posixpath`,
+    // collections/__init__ aliases `collections.abc` — so once the parent runs,
+    // the child resolves from the cache. A parent that fails is non-fatal here;
+    // the direct resolution below reports the real error.
+    if let Some((parent, _)) = name.rsplit_once('.') {
+        if with_host(|h| h.cached_module(parent)).is_none() {
+            let _ = import_module(parent);
+            if let Some(m) = with_host(|h| h.cached_module(name)) {
+                return Ok(m);
+            }
+        }
+    }
     let module = import_module_inner(name)?;
     with_host(|h| h.cache_module(name, module.clone()));
     // Bind a submodule as an attribute of its parent package, as CPython's import
@@ -11808,6 +11944,38 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                     "formatter_field_name_split",
                     h.alloc(PyObj::Builtin("_string.formatter_field_name_split".into())),
                 ),
+            ]
+        }),
+        // `_typing` — the C accelerator `typing.py` builds on: the type-parameter
+        // constructors (`TypeVar`/`ParamSpec`/`TypeVarTuple`), the `Generic` base,
+        // the `Union` special form, `_idfunc`, and the `NoDefault` sentinel. The
+        // rich type-system logic (`_GenericAlias`, `_SpecialForm`, `_type_check`)
+        // stays in the vendored `typing.py`.
+        "_typing" => with_host(|h| {
+            let no_default = h.alloc(PyObj::Builtin("_typing.NoDefault".into()));
+            vec![
+                ("_idfunc", h.alloc(PyObj::Builtin("_typing._idfunc".into()))),
+                ("TypeVar", h.alloc(PyObj::Builtin("_typing.TypeVar".into()))),
+                ("ParamSpec", h.alloc(PyObj::Builtin("_typing.ParamSpec".into()))),
+                (
+                    "TypeVarTuple",
+                    h.alloc(PyObj::Builtin("_typing.TypeVarTuple".into())),
+                ),
+                (
+                    "ParamSpecArgs",
+                    h.alloc(PyObj::Builtin("_typing.ParamSpecArgs".into())),
+                ),
+                (
+                    "ParamSpecKwargs",
+                    h.alloc(PyObj::Builtin("_typing.ParamSpecKwargs".into())),
+                ),
+                (
+                    "TypeAliasType",
+                    h.alloc(PyObj::Builtin("_typing.TypeAliasType".into())),
+                ),
+                ("Generic", h.alloc(PyObj::Builtin("Generic".into()))),
+                ("Union", h.alloc(PyObj::Builtin("_typing.Union".into()))),
+                ("NoDefault", no_default),
             ]
         }),
         // `atexit` — cleanup callbacks run (LIFO) at interpreter shutdown. Native

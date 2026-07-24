@@ -396,6 +396,59 @@ x = (n, log, atexit._ncallbacks())";
     assert_eq!(g(src, "x"), "(2, ['c', 'a'], 0)");
 }
 
+// `import a.b` binds the TOP package `a` (not the leaf), and importing a dotted
+// name pulls its parent packages first — so `import os.path` gives the `os`
+// module with `os.path` reachable, and `import collections.abc` works via the
+// alias its parent registers.
+#[cfg(not(feature = "stdlib-ffi"))]
+#[test]
+fn dotted_import_binds_top_package() {
+    assert_eq!(g("import os.path\nx = os.path.join('a', 'b')", "x"), "'a/b'");
+    assert_eq!(g("import os.path\nx = type(os).__name__", "x"), "'module'");
+    assert_eq!(
+        g("import collections.abc\nx = collections.abc.Mapping.__name__", "x"),
+        "'Mapping'",
+    );
+}
+
+// `super().__setattr__(name, value)` (and `__delattr__`) bottom out at object's
+// implementations — the plain instance-dict ops. typing's `_GenericAlias`
+// relies on this.
+#[test]
+fn super_setattr_reaches_object() {
+    let src = "\
+class Guard:
+    def __setattr__(self, k, v):
+        super().__setattr__(k, v.upper() if isinstance(v, str) else v)
+g = Guard()
+g.name = 'abc'
+g.n = 5
+x = (g.name, g.n)";
+    assert_eq!(g(src, "x"), "('ABC', 5)");
+}
+
+// A builtin type object reports `builtins` as its `__module__` and its name as
+// `__qualname__` (typing's deprecated-alias machinery reads both).
+#[test]
+fn builtin_type_module_qualname() {
+    assert_eq!(g("x = list.__module__", "x"), "'builtins'");
+    assert_eq!(g("x = dict.__qualname__", "x"), "'dict'");
+}
+
+// A `TypeVar`/`ParamSpec`/`TypeVarTuple` from the native `_typing` core exposes
+// the dunder attributes typing.py reads, and is hashable (usable in sets/dicts).
+#[cfg(not(feature = "stdlib-ffi"))]
+#[test]
+fn typing_type_var_core() {
+    let src = "import _typing\nT = _typing.TypeVar('T', bound=int)\n\
+               x = (T.__name__, T.__bound__.__name__, T.__covariant__, type(T).__name__)";
+    assert_eq!(g(src, "x"), "('T', 'int', False, 'TypeVar')");
+    assert_eq!(
+        g("import _typing\nT = _typing.TypeVar('T')\nx = len({T, T, _typing.TypeVar('T')})", "x"),
+        "2",
+    );
+}
+
 // PEP 695 type parameters (`class C[T]`, `def f[T]`) parse and run: the params
 // bind to `object` so eagerly-evaluated annotations (`-> T`) resolve, and the
 // runtime is unaffected. CPython 3.14's typing.py uses this syntax throughout.
