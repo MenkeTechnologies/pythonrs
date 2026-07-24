@@ -195,6 +195,9 @@ pub fn run_program(
         }
     }
     let result = run_compiled(prog);
+    // `atexit` callbacks run at interpreter shutdown, after the top-level program
+    // finishes (whether it returned or raised), before teardown warnings.
+    host::run_atexit_callbacks();
     // CPython emits `RuntimeWarning: coroutine '…' was never awaited` for any
     // coroutine that was created but never driven; do the same at teardown.
     host::warn_unawaited_coroutines();

@@ -361,6 +361,54 @@ fn class_attr_call_constructs() {
     assert_eq!(g(src, "x"), "8");
 }
 
+// Native `math` combinatorics/accumulation functions, bignum-exact and matching
+// CPython 3.14. Common in third-party packages (more-itertools, packaging).
+#[test]
+fn math_comb_perm_fsum_prod() {
+    assert_eq!(g("import math\nx = math.comb(5, 2)", "x"), "10");
+    assert_eq!(g("import math\nx = math.comb(3, 5)", "x"), "0"); // k > n
+    assert_eq!(g("import math\nx = math.comb(50, 25)", "x"), "126410606437752");
+    assert_eq!(g("import math\nx = math.perm(5, 2)", "x"), "20");
+    assert_eq!(g("import math\nx = math.perm(4)", "x"), "24"); // perm(n) == n!
+    assert_eq!(g("import math\nx = math.prod([1, 2, 3, 4])", "x"), "24");
+    assert_eq!(g("import math\nx = math.prod([])", "x"), "1");
+    assert_eq!(g("import math\nx = round(math.fsum([0.1] * 10), 10)", "x"), "1.0");
+}
+
+// `atexit` registers cleanup callbacks that run LIFO at shutdown. `register`
+// returns the callback (usable as a decorator); `_run_exitfuncs` runs and drains
+// them; `unregister` removes by identity. (At-shutdown firing is exercised by the
+// `-c`/file entry point, not the `eval_str` test path.)
+#[cfg(not(feature = "stdlib-ffi"))]
+#[test]
+fn atexit_callbacks() {
+    let src = "\
+import atexit
+log = []
+atexit.register(lambda: log.append('a'))
+b = atexit.register(lambda: log.append('b'))
+atexit.unregister(b)
+atexit.register(lambda: log.append('c'))
+n = atexit._ncallbacks()
+atexit._run_exitfuncs()
+x = (n, log, atexit._ncallbacks())";
+    // 2 registered (b removed), run LIFO (c before a), drained to 0.
+    assert_eq!(g(src, "x"), "(2, ['c', 'a'], 0)");
+}
+
+// PEP 695 type parameters (`class C[T]`, `def f[T]`) parse and run: the params
+// bind to `object` so eagerly-evaluated annotations (`-> T`) resolve, and the
+// runtime is unaffected. CPython 3.14's typing.py uses this syntax throughout.
+#[test]
+fn pep695_type_params() {
+    assert_eq!(g("def ident[T](x: T) -> T:\n    return x\nx = ident(5)", "x"), "5");
+    let m = "class Stack[T]:\n    def push[U](self, v: U) -> U:\n        return v\nx = Stack().push(99)";
+    assert_eq!(g(m, "x"), "99");
+    // Multiple params, bound/default syntax parse and are discarded.
+    assert_eq!(g("class Pair[A, B]:\n    pass\nx = Pair.__name__", "x"), "'Pair'");
+    assert_eq!(g("def f[T: int, U = str](x):\n    return x\nx = f(7)", "x"), "7");
+}
+
 // A relative import (`from . import _compiler` in re's `__init__`) resolves
 // against the module's `__package__`: it reaches the real submodule `re._compiler`
 // (which then needs the native `_sre` C-accelerator). Before relative-import

@@ -91,7 +91,10 @@ use std::path::PathBuf;
 /// v28: new `IMPORT_RELATIVE` opcode — a relative `from . import x` now compiles
 /// to a runtime-resolved import (previously the leading dots were dropped and the
 /// module name collapsed to `""`), so cached star/relative-import bytecode misses.
-const SCHEMA: u64 = 28;
+/// v29: PEP 695 type parameters (`class C[T]`, `def f[T]`) now parse and emit
+/// `T = object` bindings; files that previously failed to compile now do, so any
+/// stale negative-cache/relative bytecode must rebuild.
+const SCHEMA: u64 = 29;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]

@@ -1145,6 +1145,9 @@ pub struct PyHost {
     /// Per-`_random.Random`-instance Mersenne Twister state, keyed by the
     /// instance's heap id (the RNG backing `random`).
     pub mt_states: HashMap<u32, MtState>,
+    /// `atexit`-registered callbacks: `(func, args, kwargs)` in registration
+    /// order. Run LIFO at interpreter shutdown ([`run_atexit_callbacks`]).
+    pub atexit_callbacks: Vec<(Value, Vec<Value>, Vec<(String, Value)>)>,
 }
 
 /// Whether a `GenCell` backs a plain generator, an `async def` coroutine, or
@@ -1467,6 +1470,7 @@ impl PyHost {
             modules: IndexMap::new(),
             sys_modules: None,
             mt_states: HashMap::new(),
+            atexit_callbacks: Vec::new(),
         }
     }
 
@@ -10459,6 +10463,23 @@ pub fn warn_unawaited_coroutines() {
     }
 }
 
+/// Run every `atexit`-registered callback in reverse registration order (LIFO),
+/// at interpreter shutdown. An exception from one callback is reported to stderr
+/// and the rest still run, matching CPython's `atexit` teardown. The list is
+/// drained so a re-entrant `_run_exitfuncs` does not run a callback twice.
+pub fn run_atexit_callbacks() {
+    let callbacks: Vec<(Value, Vec<Value>, Vec<(String, Value)>)> =
+        with_host(|h| std::mem::take(&mut h.atexit_callbacks));
+    for (func, args, kwargs) in callbacks.into_iter().rev() {
+        if let Err(e) = invoke(&func, args, kwargs) {
+            // Clear the pending error so a later callback (and the caller) is not
+            // aborted by this one's failure.
+            with_host(|h| h.exc = None);
+            eprintln!("Error in atexit._run_exitfuncs:\n{e}");
+        }
+    }
+}
+
 fn make_gen_kind(
     chunk: Chunk,
     env: Env,
@@ -11789,6 +11810,27 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                 ),
             ]
         }),
+        // `atexit` — cleanup callbacks run (LIFO) at interpreter shutdown. Native
+        // because CPython's is a C module; the callbacks fire from `run_program`
+        // after the top-level program finishes (see `run_atexit_callbacks`).
+        "atexit" => with_host(|h| {
+            vec![
+                ("register", h.alloc(PyObj::Builtin("atexit.register".into()))),
+                (
+                    "unregister",
+                    h.alloc(PyObj::Builtin("atexit.unregister".into())),
+                ),
+                (
+                    "_run_exitfuncs",
+                    h.alloc(PyObj::Builtin("atexit._run_exitfuncs".into())),
+                ),
+                ("_clear", h.alloc(PyObj::Builtin("atexit._clear".into()))),
+                (
+                    "_ncallbacks",
+                    h.alloc(PyObj::Builtin("atexit._ncallbacks".into())),
+                ),
+            ]
+        }),
         // `errno` — the platform error numbers (from libc) plus the `errorcode`
         // {number: name} map. A pure constants C-ext, correct natively on any
         // build.
@@ -11886,7 +11928,7 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                 "exp", "exp2", "expm1", "cbrt", "sin", "cos", "tan", "asin", "acos", "atan",
                 "atan2", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh", "degrees",
                 "radians", "hypot", "trunc", "copysign", "fmod", "ldexp", "isqrt", "isnan",
-                "isinf", "isfinite", "gcd", "factorial",
+                "isinf", "isfinite", "gcd", "factorial", "comb", "perm", "fsum", "prod",
                 "lgamma", "gamma", "erf", "erfc",
             ];
             let mut out: Vec<(&str, Value)> = vec![
@@ -12185,19 +12227,33 @@ fn pylib_dir() -> Option<std::path::PathBuf> {
     dev.is_dir().then_some(dev)
 }
 
-/// Resolve a dotted module name to its vendored source file, if present:
-/// `json` → `pylib/json.py` or `pylib/json/__init__.py`; `os.path` →
-/// `pylib/os/path.py` or `pylib/os/path/__init__.py`.
+/// Third-party package root: `~/.pythonrs/pip` (where pip-installed pure-Python
+/// packages live). Searched AFTER the vendored stdlib so a package can never
+/// shadow a stdlib module, mirroring CPython's stdlib-before-site-packages order.
+#[cfg(not(feature = "stdlib-ffi"))]
+fn pip_dir() -> Option<std::path::PathBuf> {
+    let d = dirs::home_dir()?.join(".pythonrs").join("pip");
+    d.is_dir().then_some(d)
+}
+
+/// Resolve a dotted module name to a source file on the search path, if present:
+/// `json` → `<root>/json.py` or `<root>/json/__init__.py`; `os.path` →
+/// `<root>/os/path.py` or `<root>/os/path/__init__.py`. Roots are searched in
+/// order: the vendored stdlib (`pylib/`) first, then `~/.pythonrs/pip`.
 #[cfg(not(feature = "stdlib-ffi"))]
 fn resolve_vendored_path(name: &str) -> Option<std::path::PathBuf> {
-    let root = pylib_dir()?;
     let rel = name.replace('.', "/");
-    let module_file = root.join(format!("{rel}.py"));
-    if module_file.is_file() {
-        return Some(module_file);
+    for root in [pylib_dir(), pip_dir()].into_iter().flatten() {
+        let module_file = root.join(format!("{rel}.py"));
+        if module_file.is_file() {
+            return Some(module_file);
+        }
+        let package_init = root.join(&rel).join("__init__.py");
+        if package_init.is_file() {
+            return Some(package_init);
+        }
     }
-    let package_init = root.join(&rel).join("__init__.py");
-    package_init.is_file().then_some(package_init)
+    None
 }
 
 /// Try to import `name` from the vendored stdlib. `None` = no such `.py` file

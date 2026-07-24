@@ -568,6 +568,68 @@ impl Parser {
         }
     }
 
+    /// PEP 695: parse an optional type-parameter list after a class/def name
+    /// (`class C[T]`, `def f[T, *Ts, **P]`) and return the parameter names.
+    /// Bounds/constraints/defaults (`[T: int]`, `[T = str]`) are consumed and
+    /// discarded. Type parameters are a static-typing construct — pythonrs
+    /// evaluates annotations eagerly, so [`bind_type_params`] binds each name to
+    /// `object` in the enclosing scope so an annotation like `-> T` resolves
+    /// (the runtime does not depend on which concrete type parameters exist).
+    fn parse_type_params(&mut self) -> Result<Vec<String>, String> {
+        let mut names = Vec::new();
+        if !self.at_op("[") {
+            return Ok(names);
+        }
+        self.advance(); // [
+        let mut depth = 1usize;
+        // A parameter name is the first identifier of each comma-separated item,
+        // after any `*`/`**` prefix; identifiers inside a bound/default (depth > 1,
+        // or after a `:`/`=` in the item) are not parameters.
+        let mut expect_name = true;
+        loop {
+            match self.cur().clone() {
+                Tok::Op(o) if o == "[" => {
+                    depth += 1;
+                    expect_name = false;
+                }
+                Tok::Op(o) if o == "]" => {
+                    depth -= 1;
+                    if depth == 0 {
+                        self.advance();
+                        return Ok(names);
+                    }
+                }
+                Tok::Op(o) if depth == 1 && o == "," => expect_name = true,
+                Tok::Op(o) if depth == 1 && (o == "*" || o == "**") => {}
+                Tok::Op(_) if depth == 1 => expect_name = false, // `:` / `=`
+                Tok::Name(n) if depth == 1 && expect_name => {
+                    names.push(n);
+                    expect_name = false;
+                }
+                Tok::Eof => {
+                    return Err("SyntaxError: unterminated type-parameter list".to_string())
+                }
+                _ => {}
+            }
+            self.advance();
+        }
+    }
+
+    /// Emit `T = object` bindings for PEP 695 type parameters into `out`, ahead of
+    /// the class/def they precede, so eagerly-evaluated annotations that reference
+    /// them resolve. See [`parse_type_params`].
+    fn bind_type_params(&self, out: &mut Vec<Stmt>, params: &[String], line: u32) {
+        for name in params {
+            out.push(Stmt::new(
+                StmtKind::Assign {
+                    targets: vec![Expr::Name(name.clone())],
+                    value: Expr::Name("object".to_string()),
+                },
+                line,
+            ));
+        }
+    }
+
     fn parse_funcdef(
         &mut self,
         out: &mut Vec<Stmt>,
@@ -577,6 +639,8 @@ impl Parser {
     ) -> Result<(), String> {
         self.advance(); // def
         let name = self.expect_name()?;
+        let type_params = self.parse_type_params()?; // PEP 695 `def f[T](...)`
+        self.bind_type_params(out, &type_params, line);
         self.expect_op("(")?;
         let mut params = self.parse_params(")")?;
         self.expect_op(")")?;
@@ -675,6 +739,8 @@ impl Parser {
     ) -> Result<(), String> {
         self.advance(); // class
         let name = self.expect_name()?;
+        let type_params = self.parse_type_params()?; // PEP 695 `class C[T](...)`
+        self.bind_type_params(out, &type_params, line);
         let mut bases = Vec::new();
         let mut keywords = Vec::new();
         if self.eat_op("(") {

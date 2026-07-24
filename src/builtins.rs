@@ -2259,21 +2259,40 @@ fn b_import(vm: &mut VM, _: u8) -> Value {
 fn b_import_from(vm: &mut VM, _: u8) -> Value {
     let name = sval(&vm.pop());
     let module = vm.pop();
-    let is_module = with_host(|h| matches!(h.get(&module), Some(PyObj::Module { .. })));
-    let r = with_host(|h| h.get_attr(&module, &name)).map_err(|e| {
-        // `from mod import missing` raises ImportError (not AttributeError) so the
-        // stdlib's `try: from posix import X / except ImportError:` fallbacks fire.
-        if is_module && e.starts_with("AttributeError") {
-            let mname = with_host(|h| match h.get(&module) {
-                Some(PyObj::Module { name, .. }) => name.clone(),
-                _ => String::new(),
-            });
-            format!("ImportError: cannot import name '{name}' from '{mname}'")
-        } else {
-            e
-        }
+    let mname = with_host(|h| match h.get(&module) {
+        Some(PyObj::Module { name, .. }) => Some(name.clone()),
+        _ => None,
     });
-    finish(vm, r)
+    let orig = match with_host(|h| h.get_attr(&module, &name)) {
+        Ok(v) => return finish(vm, Ok(v)),
+        Err(e) => e,
+    };
+    if let Some(pkg) = &mname {
+        // `from pkg import name` where `name` is a SUBMODULE not yet bound as an
+        // attribute: import `pkg.name` and use it (CPython's `_handle_fromlist`).
+        // toml/__init__ does `from toml import encoder` for its own submodules.
+        let sub = format!("{pkg}.{name}");
+        match host::import_module(&sub) {
+            Ok(m) => return finish(vm, Ok(m)),
+            Err(e) => {
+                // A submodule that EXISTS but failed to import propagates its real
+                // error; only a genuinely-absent submodule falls through to the
+                // `ImportError: cannot import name` that stdlib `try/except`
+                // fallbacks key on.
+                let sub_absent = e.contains("No module named")
+                    && (e.contains(&format!("'{sub}'")) || e.contains(&format!("'{name}'")));
+                if !sub_absent {
+                    return finish(vm, Err(e));
+                }
+            }
+        }
+        return finish(
+            vm,
+            Err(format!("ImportError: cannot import name '{name}' from '{pkg}'")),
+        );
+    }
+    // A non-module `from` target: surface the original attribute error.
+    finish(vm, Err(orig))
 }
 
 /// `from <dots><modpart> import <name>` — a relative import. Stack (top-first):
@@ -3370,6 +3389,35 @@ pub fn call_builtin_function(
     // `posix.*` — the Unix syscall surface.
     if let Some(f) = name.strip_prefix("posix.") {
         return call_posix(f, args, kwargs);
+    }
+    // `atexit.*` — shutdown-callback registry.
+    if let Some(f) = name.strip_prefix("atexit.") {
+        return match f {
+            // `register(func, *args, **kwargs)` records the callback and returns
+            // it (so it works as a decorator).
+            "register" => {
+                let func = arg0(&args)?;
+                let rest: Vec<Value> = args.iter().skip(1).cloned().collect();
+                with_host(|h| h.atexit_callbacks.push((func.clone(), rest, kwargs)));
+                Ok(func)
+            }
+            // `unregister(func)` removes every registration of `func` (by identity).
+            "unregister" => {
+                let func = arg0(&args)?;
+                with_host(|h| h.atexit_callbacks.retain(|(f, _, _)| !identity_eq(f, &func)));
+                Ok(Value::Undef)
+            }
+            "_run_exitfuncs" => {
+                host::run_atexit_callbacks();
+                Ok(Value::Undef)
+            }
+            "_clear" => {
+                with_host(|h| h.atexit_callbacks.clear());
+                Ok(Value::Undef)
+            }
+            "_ncallbacks" => Ok(Value::Int(with_host(|h| h.atexit_callbacks.len()) as i64)),
+            _ => Err(host::type_error(&format!("atexit has no function '{f}'"))),
+        };
     }
     // `_thread.*` — lock/thread primitives.
     if let Some(f) = name.strip_prefix("_thread.") {
@@ -6452,8 +6500,10 @@ fn check_arity(name: &str, qual: &str, spec: Arity, argc: usize) -> Result<(), S
 /// variadic ones (`gcd`, `lcm`) that accept any count.
 fn math_arity(name: &str) -> Option<Arity> {
     Some(match name {
-        "log" => Arity::VarRange(1, 2),
-        "pow" | "atan2" | "copysign" | "fmod" | "remainder" | "ldexp" => Arity::VarExact(2),
+        "log" | "perm" => Arity::VarRange(1, 2),
+        "pow" | "atan2" | "copysign" | "fmod" | "remainder" | "ldexp" | "comb" => {
+            Arity::VarExact(2)
+        }
         "gcd" | "lcm" | "hypot" => return None,
         // Every other implemented math function is single-argument (METH_O).
         _ => Arity::ExactlyOne,
@@ -6574,6 +6624,112 @@ fn call_math(name: &str, args: &[Value]) -> Result<Value, String> {
                     Some(v) => Value::Int(v),
                     None => h.alloc(PyObj::BigInt(acc)),
                 }
+            }))
+        }
+        // `math.prod(iterable, *, start=1)` — the product of the elements. Stays
+        // bignum-exact for ints (a `start` keyword is handled by the caller's
+        // kwargs, but the positional-only stdlib form passes just the iterable).
+        "prod" => {
+            let items = with_host(|h| h.iter_items(&args[0]))?;
+            // Int fast path stays exact; fall to float as soon as any element is a
+            // float (matching CPython's type promotion).
+            let all_int = items.iter().all(|v| with_host(|h| h.big_val(v)).is_some());
+            if all_int {
+                use num_traits::ToPrimitive;
+                let mut acc = num_bigint::BigInt::from(1);
+                for v in &items {
+                    acc *= with_host(|h| h.big_val(v)).unwrap();
+                }
+                return Ok(with_host(|h| match acc.to_i64() {
+                    Some(n) => Value::Int(n),
+                    None => h.alloc(PyObj::BigInt(acc)),
+                }));
+            }
+            let mut acc = 1.0f64;
+            for v in &items {
+                acc *= as_f(v).ok_or_else(|| host::type_error("must be a number"))?;
+            }
+            Ok(Value::Float(acc))
+        }
+        // `math.fsum(iterable)` — a full-precision float sum (Shewchuk's exact
+        // running partial sums), so `fsum([0.1]*10) == 1.0` where a naive sum
+        // drifts. Matches CPython's `mathmodule.c` fsum.
+        "fsum" => {
+            let items = with_host(|h| h.iter_items(&args[0]))?;
+            let mut partials: Vec<f64> = Vec::new();
+            for it in &items {
+                let mut x = as_f(it)
+                    .ok_or_else(|| host::type_error("must be real number"))?;
+                let mut i = 0;
+                for j in 0..partials.len() {
+                    let mut y = partials[j];
+                    if x.abs() < y.abs() {
+                        std::mem::swap(&mut x, &mut y);
+                    }
+                    let hi = x + y;
+                    let lo = y - (hi - x);
+                    if lo != 0.0 {
+                        partials[i] = lo;
+                        i += 1;
+                    }
+                    x = hi;
+                }
+                partials.truncate(i);
+                partials.push(x);
+            }
+            Ok(Value::Float(partials.iter().sum()))
+        }
+        // `math.comb(n, k)` — binomial coefficient n! / (k!(n-k)!), computed as
+        // the running product (n-k+1..=n) / k! to stay bignum-exact. `math.perm(
+        // n, k=None)` — the k-permutations n! / (n-k)! (k defaults to n → n!).
+        "comb" | "perm" => {
+            use num_bigint::BigInt;
+            use num_traits::{ToPrimitive, Zero};
+            let n = with_host(|h| h.big_val(&args[0]))
+                .ok_or_else(|| host::type_error("'float' object cannot be interpreted as an integer"))?;
+            let is_comb = name == "comb";
+            let k = match args.get(1) {
+                Some(v) => with_host(|h| h.big_val(v)).ok_or_else(|| {
+                    host::type_error("'float' object cannot be interpreted as an integer")
+                })?,
+                None if is_comb => {
+                    return Err(host::type_error("comb() takes exactly two arguments"))
+                }
+                None => n.clone(), // perm(n) == perm(n, n) == n!
+            };
+            if n.sign() == num_bigint::Sign::Minus || k.sign() == num_bigint::Sign::Minus {
+                return Err(format!(
+                    "ValueError: {name}() not defined for negative values"
+                ));
+            }
+            if k > n {
+                return Ok(Value::Int(0));
+            }
+            // numerator = product(n-k+1 ..= n)
+            let mut num = BigInt::from(1);
+            let mut i = &n - &k + 1;
+            while i <= n {
+                num *= &i;
+                i += 1;
+            }
+            let result = if is_comb {
+                let mut den = BigInt::from(1);
+                let mut j = BigInt::from(2);
+                while j <= k {
+                    den *= &j;
+                    j += 1;
+                }
+                if den.is_zero() {
+                    num
+                } else {
+                    num / den
+                }
+            } else {
+                num
+            };
+            Ok(with_host(|h| match result.to_i64() {
+                Some(v) => Value::Int(v),
+                None => h.alloc(PyObj::BigInt(result)),
             }))
         }
         _ => Err(host::name_error(&format!("math.{name}"))),
