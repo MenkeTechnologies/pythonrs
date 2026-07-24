@@ -207,6 +207,17 @@ fn function_docstring_is_dunder_doc() {
 }
 
 #[test]
+fn delattr_on_class_and_namespace() {
+    // delattr removes a class attribute (only instances worked before) and a
+    // SimpleNamespace attribute.
+    assert_eq!(g("class C: pass\nC.x = 5\ndelattr(C, 'x')\nx = hasattr(C, 'x')", "x"), "False");
+    assert_eq!(
+        g("import sys\nSN = type(sys.implementation)\nn = SN(a=1)\ndel n.a\nx = hasattr(n, 'a')", "x"),
+        "False",
+    );
+}
+
+#[test]
 fn metaclass_super_new_is_static() {
     // super().__new__ inside a metaclass __new__ passes the class explicitly (no
     // extra bound receiver -> right arg count), and zero-arg super() there resolves

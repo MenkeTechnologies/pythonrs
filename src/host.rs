@@ -7671,6 +7671,24 @@ impl PyHost {
                 return Ok(());
             }
         }
+        // `delattr(SomeClass, name)` removes a class attribute from its namespace.
+        if let Some(PyObj::Class(cname)) = self.get(recv) {
+            let cname = cname.clone();
+            if let Some(cd) = self.classes.get_mut(&cname) {
+                if cd.ns.shift_remove(name).is_some() {
+                    return Ok(());
+                }
+            }
+            return Err(format!(
+                "AttributeError: type object '{cname}' has no attribute '{name}'"
+            ));
+        }
+        // A SimpleNamespace attribute deletion.
+        if let Some(PyObj::Namespace { attrs }) = self.get_mut(recv) {
+            if attrs.shift_remove(name).is_some() {
+                return Ok(());
+            }
+        }
         Err(format!(
             "AttributeError: '{}' object has no attribute '{name}'",
             self.type_name(recv)
