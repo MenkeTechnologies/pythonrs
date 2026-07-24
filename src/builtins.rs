@@ -7755,12 +7755,23 @@ pub fn type_new_meta(
         _ => vec![],
     });
     // The class-body namespace (string keys → values).
-    let namespace: IndexMap<String, Value> = with_host(|h| match h.get(ns) {
-        Some(PyObj::Dict(d)) => d
-            .values()
-            .filter_map(|(k, v)| h.as_str(k).map(|s| (s, v.clone())))
-            .collect(),
-        _ => IndexMap::new(),
+    // The namespace may be a plain dict OR a dict SUBCLASS instance (enum's
+    // `_EnumDict`), whose entries live in its builtin-base payload dict.
+    let dict_handle = with_host(|h| match h.get(ns) {
+        Some(PyObj::Dict(_)) => Some(ns.clone()),
+        Some(PyObj::Instance(inst)) if !matches!(inst.payload, Value::Undef) => {
+            Some(inst.payload.clone())
+        }
+        _ => None,
+    });
+    let namespace: IndexMap<String, Value> = with_host(|h| {
+        match dict_handle.as_ref().and_then(|d| h.get(d)) {
+            Some(PyObj::Dict(d)) => d
+                .values()
+                .filter_map(|(k, v)| h.as_str(k).map(|s| (s, v.clone())))
+                .collect(),
+            _ => IndexMap::new(),
+        }
     });
     Ok(with_host(|h| {
         h.register_class_meta(&cname, base_names, namespace, metaclass)
