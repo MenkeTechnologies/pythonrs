@@ -17,7 +17,7 @@
 use crate::ast::*;
 use crate::host::{binop as bop, iop, ops, unop, FuncDef, TryDef};
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// A compiled program: the top-level chunk plus the def/lambda/class-body
 /// template table (indexed by def id) and the try-block table.
@@ -102,6 +102,13 @@ pub struct Compiler {
     functions: Vec<(String, FuncDef)>,
     tries: Vec<TryDef>,
     loops: Vec<LoopCtx>,
+    /// Active only while lowering the body of a *native* integer for-range loop
+    /// (see `try_compile_native_range_for`): maps each loop-local Python name to a
+    /// fusevm frame slot so `Name` loads/stores become `GetSlot`/`SetSlot` (direct
+    /// Vec indexing) instead of `CallBuiltin(GETLOCAL/SETLOCAL)` (builtin dispatch
+    /// + string-keyed env dict). The hot loop then contains only native ops, which
+    /// the interpreter runs far faster and the AOT/JIT native tier can lower.
+    native_slots: Option<HashMap<String, u16>>,
     tmp: usize,
     debug: bool,
     /// The source line of the statement currently being lowered. Call ops carry
@@ -549,6 +556,10 @@ impl Compiler {
     fn store_name(&self, b: &mut ChunkBuilder, name: &str) {
         // stack: [value] -> SETLOCAL([name, value]) -> value ; pop
         // Push name UNDER value: emit name then swap.
+        if let Some(slot) = self.native_slots.as_ref().and_then(|m| m.get(name)) {
+            b.emit(Op::SetSlot(*slot), 0); // consumes the value on top of stack
+            return;
+        }
         self.name_const(b, name);
         b.emit(Op::Swap, 0);
         b.emit(Op::CallBuiltin(ops::SETLOCAL, 2), 0);
@@ -561,10 +572,14 @@ impl Compiler {
         let target = target.unspanned();
         match target {
             Expr::Name(n) => {
-                self.name_const(b, n);
-                b.emit(Op::Swap, 0);
-                b.emit(Op::CallBuiltin(ops::SETLOCAL, 2), 0);
-                b.emit(Op::Pop, 0);
+                if let Some(slot) = self.native_slots.as_ref().and_then(|m| m.get(n)) {
+                    b.emit(Op::SetSlot(*slot), 0); // consumes the value on top
+                } else {
+                    self.name_const(b, n);
+                    b.emit(Op::Swap, 0);
+                    b.emit(Op::CallBuiltin(ops::SETLOCAL, 2), 0);
+                    b.emit(Op::Pop, 0);
+                }
             }
             Expr::Attribute(recv, attr) => {
                 // stack: [value]; need [recv, name, value]
@@ -672,7 +687,21 @@ impl Compiler {
         // Peel for structural matching; the `Name` arm still lowers the original
         // (wrapped) `target` so its load records a caret span.
         match target.unspanned() {
-            Expr::Name(_) => {
+            Expr::Name(n) => {
+                // Native for-range loop body: a slot-local int target with `+`/`-`/`*`
+                // lowers to GetSlot; <value>; Add/Sub/Mul; SetSlot — all native, no
+                // INPLACE dispatch. (The interpreter still routes the arithmetic op
+                // through pythonrs's numeric hook, so bignum promotion is preserved.)
+                if let (Some(slot), Some(nop)) = (
+                    self.native_slots.as_ref().and_then(|m| m.get(n).copied()),
+                    native_arith_op(op),
+                ) {
+                    self.compile_expr(b, target)?; // GetSlot(slot)
+                    self.compile_expr(b, value)?;
+                    b.emit(nop, self.cur_line);
+                    b.emit(Op::SetSlot(slot), 0);
+                    return Ok(());
+                }
                 // A name target has no receiver side effect: load, apply, store.
                 b.emit(Op::LoadInt(tag), 0);
                 self.compile_expr(b, target)?;
@@ -786,6 +815,150 @@ impl Compiler {
         Ok(())
     }
 
+    /// Try to lower `for <name> in range(...): <body>` as a native counted loop
+    /// over fusevm frame slots (no iterator protocol, no per-name env-dict
+    /// dispatch, native `Add`/`Sub`/`Mul`). Returns `Ok(true)` if it emitted the
+    /// native form, `Ok(false)` if the pattern didn't qualify (caller falls back
+    /// to the general iterator loop). Applies only when: the target is a plain
+    /// name; the iterable is `range(a)`/`range(a,b)`/`range(a,b,1)` with `range`
+    /// unshadowed in an enclosing function scope; and every body statement is a
+    /// slot-safe integer assign/aug-assign (`analyze_native_body`) that does not
+    /// rebind the loop variable. Semantics preserved: the loop var is left bound
+    /// to its last value (and unbound on an empty range — all write-backs sit
+    /// behind the entry guard), and arithmetic stays bignum-correct because the
+    /// interpreter runs `Add`/`Sub`/`Mul` through pythonrs's numeric hook (and the
+    /// chunk is marked `int_overflow_deopt` so native compilation deopts on i64
+    /// overflow rather than wrapping).
+    fn try_compile_native_range_for(
+        &mut self,
+        b: &mut ChunkBuilder,
+        target: &Expr,
+        iter: &Expr,
+        body: &[Stmt],
+    ) -> Result<bool, String> {
+        let target_name = match target.unspanned() {
+            Expr::Name(n) => n.clone(),
+            _ => return Ok(false),
+        };
+        let (func, args) = match iter.unspanned() {
+            Expr::Call {
+                func,
+                args,
+                keywords,
+            } if keywords.is_empty() => (func, args),
+            _ => return Ok(false),
+        };
+        match func.unspanned() {
+            Expr::Name(n) if n == "range" => {}
+            _ => return Ok(false),
+        }
+        // A locally-rebound `range` is not the builtin — bail (rare).
+        if self.func_scopes.iter().any(|s| s.contains("range")) {
+            return Ok(false);
+        }
+        let (start_expr, stop_expr): (Option<&Expr>, &Expr) = match args.len() {
+            1 => (None, &args[0]),
+            2 => (Some(&args[0]), &args[1]),
+            3 => {
+                match args[2].unspanned() {
+                    Expr::Int(1) => {}
+                    _ => return Ok(false), // only step == 1 handled natively
+                }
+                (Some(&args[0]), &args[1])
+            }
+            _ => return Ok(false),
+        };
+        let (reads, writes) = match analyze_native_body(body, &target_name) {
+            Some(rw) => rw,
+            None => return Ok(false),
+        };
+
+        // Slot assignment: 0 = loop var, then each distinct other local, then the
+        // loop bound.
+        let mut slots: HashMap<String, u16> = HashMap::new();
+        slots.insert(target_name.clone(), 0);
+        let target_slot = 0u16;
+        let mut next: u16 = 1;
+        let mut ordered: Vec<String> = Vec::new();
+        for name in reads.iter().chain(writes.iter()) {
+            if name == &target_name || slots.contains_key(name) {
+                continue;
+            }
+            slots.insert(name.clone(), next);
+            ordered.push(name.clone());
+            next += 1;
+        }
+        let stop_slot = next;
+
+        // Native Add/Sub/Mul in this chunk must promote to bignum on i64 overflow
+        // if it is ever compiled natively (the interpreter already does via hook).
+        b.set_int_overflow_deopt(true);
+
+        // Prologue: evaluate the range bounds (normal namespace path) into slots.
+        match start_expr {
+            Some(e) => self.compile_expr(b, e)?,
+            None => {
+                b.emit(Op::LoadInt(0), 0);
+            }
+        }
+        b.emit(Op::SetSlot(target_slot), 0);
+        self.compile_expr(b, stop_expr)?;
+        b.emit(Op::SetSlot(stop_slot), 0);
+
+        // Entry guard: empty range skips the body AND every write-back, so the
+        // loop var stays unbound and locals keep their prior values (CPython).
+        b.emit(Op::GetSlot(target_slot), 0);
+        b.emit(Op::GetSlot(stop_slot), 0);
+        b.emit(Op::NumLt, 0);
+        let jskip = b.emit(Op::JumpIfFalse(0), 0);
+
+        // Load body-read locals from the namespace AFTER the guard (an empty range
+        // must not raise NameError for a name the body would have read).
+        for name in &ordered {
+            if reads.iter().any(|r| r == name) {
+                self.name_const(b, name);
+                b.emit(Op::CallBuiltin(ops::GETLOCAL, 1), 0);
+                b.emit(Op::SetSlot(slots[name]), 0);
+            }
+        }
+
+        // Loop body with slot redirection active.
+        let top = b.current_pos();
+        let saved = self.native_slots.take();
+        self.native_slots = Some(slots.clone());
+        let body_res = self.compile_stmts(b, body);
+        self.native_slots = saved;
+        body_res?;
+
+        // i += 1; continue while i < stop.
+        b.emit(Op::GetSlot(target_slot), 0);
+        b.emit(Op::LoadInt(1), 0);
+        b.emit(Op::Add, 0);
+        b.emit(Op::SetSlot(target_slot), 0);
+        b.emit(Op::GetSlot(target_slot), 0);
+        b.emit(Op::GetSlot(stop_slot), 0);
+        b.emit(Op::NumLt, 0);
+        b.emit(Op::JumpIfTrue(top), 0);
+        // Fell out one step past the last value; restore i to its last body value.
+        b.emit(Op::GetSlot(target_slot), 0);
+        b.emit(Op::LoadInt(1), 0);
+        b.emit(Op::Sub, 0);
+        b.emit(Op::SetSlot(target_slot), 0);
+
+        // Write-backs (reached only when the loop ran): loop var + every modified
+        // local, back into the Python namespace via the normal store path.
+        b.emit(Op::GetSlot(target_slot), 0);
+        self.store_name(b, &target_name);
+        for name in &writes {
+            b.emit(Op::GetSlot(slots[name]), 0);
+            self.store_name(b, name);
+        }
+
+        let after = b.current_pos();
+        b.patch_jump(jskip, after);
+        Ok(true)
+    }
+
     fn compile_for(
         &mut self,
         b: &mut ChunkBuilder,
@@ -794,6 +967,13 @@ impl Compiler {
         body: &[Stmt],
         orelse: &[Stmt],
     ) -> Result<(), String> {
+        // Fast path: a `for i in range(...)` whose body is slot-safe integer
+        // arithmetic lowers to a native counted loop (fusevm slots + Add/Sub/Mul),
+        // no iterator protocol and no per-name env-dict dispatch. Only when there
+        // is no `else` clause and no signal-crossing body.
+        if orelse.is_empty() && !loop_needs_signal(body) && self.try_compile_native_range_for(b, target, iter, body)? {
+            return Ok(());
+        }
         if loop_needs_signal(body) {
             return self.compile_for_signal(b, target, iter, body, orelse);
         }
@@ -1594,9 +1774,13 @@ impl Compiler {
             }
             Expr::FString(parts) => self.compile_fstring(b, parts)?,
             Expr::Name(n) => {
-                self.name_const(b, n);
-                let idx = b.emit(Op::CallBuiltin(ops::GETLOCAL, 1), self.cur_line);
-                self.record_span(idx);
+                if let Some(slot) = self.native_slots.as_ref().and_then(|m| m.get(n)) {
+                    b.emit(Op::GetSlot(*slot), self.cur_line);
+                } else {
+                    self.name_const(b, n);
+                    let idx = b.emit(Op::CallBuiltin(ops::GETLOCAL, 1), self.cur_line);
+                    self.record_span(idx);
+                }
             }
             Expr::List(items) => {
                 if items.iter().any(|e| matches!(e, Expr::Starred(_))) {
@@ -3602,6 +3786,95 @@ fn collect_finally_escapes(stmts: &[Stmt], out: &mut Vec<(u32, String)>) {
 /// Whether a loop body has a `break`/`continue` (belonging to THIS loop) that
 /// sits inside a `try` or `with` block. Such a jump must cross the sub-chunk
 /// boundary those constructs introduce (a `finally`/`__exit__` has to run first),
+/// The fusevm native ops for the Python binary operators whose native codegen is
+/// overflow-safe under `int_overflow_deopt` — `+`, `-`, `*` only. Division,
+/// modulo, power, bitwise, etc. are not lowered to native slot arithmetic.
+fn native_arith_op(op: BinOp) -> Option<Op> {
+    match op {
+        BinOp::Add => Some(Op::Add),
+        BinOp::Sub => Some(Op::Sub),
+        BinOp::Mul => Some(Op::Mul),
+        _ => None,
+    }
+}
+
+/// A native-loop body value expression: only int literals, names, unary `+`/`-`,
+/// and `+`/`-`/`*` binops are allowed (each name read is appended to `reads`).
+/// Anything else — a call, comparison, subscript, attribute, float, `/`, `//`,
+/// `%`, `**`, etc. — returns `false`, disqualifying the whole loop.
+fn native_safe_value(e: &Expr, reads: &mut Vec<String>) -> bool {
+    match e.unspanned() {
+        Expr::Int(_) => true,
+        Expr::Name(n) => {
+            if !reads.iter().any(|r| r == n) {
+                reads.push(n.clone());
+            }
+            true
+        }
+        Expr::UnaryOp(UnOp::Neg | UnOp::Pos, inner) => native_safe_value(inner, reads),
+        Expr::BinOp(op, l, r) => {
+            native_arith_op(*op).is_some()
+                && native_safe_value(l, reads)
+                && native_safe_value(r, reads)
+        }
+        _ => false,
+    }
+}
+
+/// Analyze a candidate native for-range body. Returns `Some((reads, writes))` of
+/// the local names it reads / assigns when every statement is a slot-safe integer
+/// assign or `+=`/`-=`/`*=` (see `native_safe_value`) that does NOT rebind the
+/// loop variable `target`; otherwise `None` (the loop falls back to the general
+/// iterator form).
+fn analyze_native_body(body: &[Stmt], target: &str) -> Option<(Vec<String>, Vec<String>)> {
+    let mut reads: Vec<String> = Vec::new();
+    let mut writes: Vec<String> = Vec::new();
+    for s in body {
+        match &s.kind {
+            StmtKind::Pass => {}
+            StmtKind::Assign { targets, value } => {
+                if targets.len() != 1 {
+                    return None;
+                }
+                let name = match targets[0].unspanned() {
+                    Expr::Name(n) => n,
+                    _ => return None,
+                };
+                if name == target {
+                    return None;
+                }
+                if !native_safe_value(value, &mut reads) {
+                    return None;
+                }
+                if !writes.iter().any(|w| w == name) {
+                    writes.push(name.clone());
+                }
+            }
+            StmtKind::AugAssign { target: t, op, value } => {
+                let name = match t.unspanned() {
+                    Expr::Name(n) => n,
+                    _ => return None,
+                };
+                if name == target || native_arith_op(*op).is_none() {
+                    return None;
+                }
+                // `x op= v` reads x too.
+                if !reads.iter().any(|r| r == name) {
+                    reads.push(name.clone());
+                }
+                if !native_safe_value(value, &mut reads) {
+                    return None;
+                }
+                if !writes.iter().any(|w| w == name) {
+                    writes.push(name.clone());
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some((reads, writes))
+}
+
 /// so it can't be a plain in-chunk jump — the loop uses the `LOOP_BODY`
 /// signal path instead. The walk descends through `if`/`try`/`with`/`match`
 /// (which share this loop) but NOT into nested `for`/`while`/`def`/`class`
