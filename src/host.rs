@@ -8527,6 +8527,8 @@ pub fn is_generic_subscriptable(recv: &Value) -> bool {
             // typing's `Generic[T]` builds a generic alias; used as a base
             // (`class C(Generic[T])`), its `__mro_entries__` substitutes `Generic`.
                 | "Generic"
+            // `re.Pattern[str]` / `re.Match[str]` in annotations.
+                | "re.Pattern" | "re.Match"
         ),
         _ => false,
     })
@@ -12275,6 +12277,9 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
             }
             // `re.error` is a subclass of Exception; expose the class object.
             out.push(("error", h.alloc(PyObj::Builtin("re.error".into()))));
+            // The `Pattern`/`Match` type objects (`isinstance(m, re.Match)`).
+            out.push(("Pattern", h.alloc(PyObj::Builtin("re.Pattern".into()))));
+            out.push(("Match", h.alloc(PyObj::Builtin("re.Match".into()))));
             out
         }),
         // `errno` — the platform error numbers (from libc) plus the `errorcode`
