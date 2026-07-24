@@ -6704,6 +6704,19 @@ impl PyHost {
         if let Some(id) = self.foreign_id(recv) {
             return crate::ffi::get_attr(self, id, name);
         }
+        // Type dunders on a scalar value (None/bool/int/float): `__new__` (the
+        // inherited object.__new__) and `__class__`. The stdlib inspects these
+        // (enum's `_find_new_` reads `None.__new__`).
+        if !matches!(recv, Value::Obj(_)) {
+            match name {
+                "__new__" => return Ok(self.alloc(PyObj::Builtin("object.__new__".into()))),
+                "__class__" => {
+                    let tn = self.type_name(recv);
+                    return Ok(self.alloc(PyObj::Builtin(tn)));
+                }
+                _ => {}
+            }
+        }
         // namedtuple field access: a tagged tuple resolves `.field` to its index,
         // and `._fields` to the field-name tuple.
         if let Value::Obj(i) = recv {
