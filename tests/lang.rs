@@ -737,6 +737,50 @@ fn native_modulo_in_loops_matches_floored_semantics() {
     );
 }
 
+// `(a * b) % k` and `(a * b + c) % k` fuse into fusevm's `MulModFloor` /
+// `MulAddModFloor`, which take the product in i128. Python reduces the EXACT
+// product, so a product that leaves i64 must give the same answer as the bignum
+// path it replaces — that is what these pin, along with the floored sign for
+// every combination of operand and divisor sign.
+#[test]
+fn fused_modular_arithmetic_matches_exact_python() {
+    // Products well past 2**63 every iteration; the unfused form would wrap.
+    assert_eq!(
+        g(
+            "s = 0\nfor i in range(2000000, 2000200): s += (i * i * i) % 1000000007\nx = s",
+            "x"
+        ),
+        "98924377940"
+    );
+    // The linear-congruential shape, `(a*b + c) % k`.
+    assert_eq!(
+        g(
+            "s = 0\nfor i in range(1000): s += (i * 6364136223846793005 + 1442695040888963407) % 1000000007\nx = s",
+            "x"
+        ),
+        "501053277580"
+    );
+    // Written the other way round: `(c + a*b) % k`.
+    assert_eq!(
+        g("s = 0\nfor i in range(500): s += (99 + i * 31) % 1000\nx = s", "x"),
+        "247750"
+    );
+    // Negative dividend and negative divisor: the result is floored, so it takes
+    // the divisor's sign — the fused ops must not leave a C-truncated remainder.
+    assert_eq!(
+        g("s = 0\nfor i in range(-500, 0): s += (i * 7) % 97\nx = s", "x"),
+        "24089"
+    );
+    assert_eq!(
+        g("s = 0\nfor i in range(-500, 500): s += (i * i * 7 + i) % -97\nx = s", "x"),
+        "-48056"
+    );
+    // A float dividend takes the unfused fallback inside the op and must still
+    // floor (CPython: `-4.0 % 2 == 0.0`, not `-0.0`).
+    assert_eq!(g("y = -4.0\nx = (y * 1) % 2", "x"), "0.0");
+    assert_eq!(g("y = 3.5\nx = (y * -3) % 7", "x"), "3.5");
+}
+
 #[test]
 fn bignum_promotion() {
     assert_eq!(g("x = 2 ** 64", "x"), "18446744073709551616");
