@@ -148,6 +148,16 @@ pub unsafe extern "C" fn fusevm_aot_register_builtins(vm: *mut VM) {
     let vm = unsafe { &mut *vm };
     crate::builtins::install(vm);
     vm.set_numeric_hook(Arc::new(crate::builtins::numeric_hook));
+    // The AOT entry lowers the chunk natively only as far as its first
+    // non-lowerable op: a `CallBuiltin` is a deopt point, and fusevm does not
+    // resume native execution past one ("the resumed interpreter owns everything
+    // after this point"). Every pythonrs program reaches a builtin call almost
+    // immediately (a namespace store is `SETLOCAL`), so the bulk of the program —
+    // including its hot loops — runs on the VM the entry deopts into. Give that
+    // VM the same JIT tiers `run_chunk_on` gives the interpreter, or the binary
+    // runs the whole program on the plain bytecode loop (50M-iteration `%` loop:
+    // 6.80s without, 0.03s with).
+    vm.enable_tracing_jit();
     let images: Vec<ProgImage> = vm
         .chunk
         .names
