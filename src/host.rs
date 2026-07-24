@@ -6666,6 +6666,34 @@ impl PyHost {
             .any(|c| crate::builtins::is_exception_class(c))
     }
 
+    /// Reconstruct a base/MRO entry from its name: a user-defined class (present
+    /// in `self.classes`) becomes a `Class`; any other name is a builtin type
+    /// (`int`, `str`, `Exception`, …) and must become its `Builtin` type object,
+    /// so `base.__dict__`, identity, and `isinstance` match the real builtin.
+    fn class_or_builtin_type(&mut self, name: String) -> Value {
+        if self.classes.contains_key(&name) {
+            self.alloc(PyObj::Class(name))
+        } else {
+            self.alloc(PyObj::Builtin(name))
+        }
+    }
+
+    /// If `v` is a class whose metaclass (other than plain `type`) defines the
+    /// method `name`, return that method value (unbound). Used to dispatch a
+    /// metaclass dunder against the class object itself — e.g. iterating an Enum
+    /// subclass runs `type(cls).__iter__(cls)`.
+    pub fn metaclass_method(&self, v: &Value, name: &str) -> Option<Value> {
+        let cname = match self.get(v) {
+            Some(PyObj::Class(c)) => c.clone(),
+            _ => return None,
+        };
+        let meta = self.classes.get(&cname).map(|cd| cd.metaclass.clone())?;
+        if meta.is_empty() || meta == "type" {
+            return None;
+        }
+        self.class_lookup(&meta, name)
+    }
+
     pub fn mro_of(&self, class: &str) -> Vec<String> {
         let bases: Vec<String> = self
             .classes
@@ -6921,7 +6949,10 @@ impl PyHost {
                     let mut mro: Vec<Value> = self
                         .mro_of(&cname)
                         .into_iter()
-                        .map(|c| self.alloc(PyObj::Class(c)))
+                        // A user-defined class stays a Class; a builtin ancestor
+                        // (`int`, `Exception`, …) must be its Builtin type object
+                        // so `.__dict__`/identity match the real builtin type.
+                        .map(|c| self.class_or_builtin_type(c))
                         .collect();
                     // `object` is the implicit tail of every MRO.
                     mro.push(self.alloc(PyObj::Builtin("object".into())));
@@ -6938,7 +6969,7 @@ impl PyHost {
                     } else {
                         bases
                             .into_iter()
-                            .map(|b| self.alloc(PyObj::Class(b)))
+                            .map(|b| self.class_or_builtin_type(b))
                             .collect()
                     };
                     return Ok(self.new_tuple(vals));
@@ -7105,6 +7136,17 @@ impl PyHost {
             }
             // `func.__closure__` — a tuple of cells over the function's free
             // variables (their current values from the captured env), or None.
+            // A function is a (non-data) descriptor: `f.__get__(obj, cls)` binds
+            // it as a method. Only `__get__` exists — no `__set__`/`__delete__` —
+            // so `_is_descriptor(func)` in enum's `_EnumDict` is True (methods are
+            // not recorded as members) while functions stay non-data descriptors.
+            Some(PyObj::Func(_)) if name == "__get__" => {
+                let func = self.alloc(PyObj::Builtin("function.__get__".into()));
+                Ok(self.alloc(PyObj::BoundMethod {
+                    recv: recv.clone(),
+                    func,
+                }))
+            }
             Some(PyObj::Func(fv)) if name == "__closure__" => {
                 let fv = fv.clone();
                 let freevars = self.funcs[fv.def_id].freevars.clone();
@@ -7326,6 +7368,14 @@ impl PyHost {
             {
                 let n = n.clone();
                 let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+                // Every builtin type carries `__new__` in its own `__dict__` in
+                // CPython; enum's `_find_data_type_` keys off this membership to
+                // recognise a mixin data type (`'__new__' in base.__dict__`).
+                {
+                    let key = self.new_str("__new__".to_string());
+                    let ctor = self.alloc(PyObj::Builtin("object.__new__".into()));
+                    d.insert(PKey::Str("__new__".to_string()), (key, ctor));
+                }
                 for cm in crate::builtins::type_classmethods(&n) {
                     let key = self.new_str((*cm).to_string());
                     let desc = self.alloc(PyObj::Descriptor {
@@ -7338,10 +7388,19 @@ impl PyHost {
                 Ok(self.alloc(PyObj::MappingProxy { dict }))
             }
             // `<type>.__new__` on a builtin type object — a callable constructor.
+            // A data type builds a payload-carrying instance when its `__new__`
+            // is invoked on a subclass (enum's `_new_member_ = str.__new__`,
+            // `int.__new__`, …); other builtin types fall back to the generic
+            // bare-instance `object.__new__`.
             Some(PyObj::Builtin(n))
                 if name == "__new__" && crate::builtins::is_type_object_name(n) =>
             {
-                Ok(self.alloc(PyObj::Builtin("object.__new__".into())))
+                let ctor = match n.as_str() {
+                    "int" | "str" | "float" | "tuple" | "frozenset" | "list" | "dict"
+                    | "set" => format!("{n}.__new__"),
+                    _ => "object.__new__".to_string(),
+                };
+                Ok(self.alloc(PyObj::Builtin(ctor)))
             }
             // `FunctionType.__code__` / `.__globals__` reached on the TYPE object
             // are the get/set and member descriptors CPython's `types` derives.
@@ -7995,6 +8054,17 @@ pub fn invoke(
                             return crate::builtins::random_method(*id, m, &args);
                         }
                     }
+                    // `func.__get__(obj, cls)` — the descriptor bind: `recv` is the
+                    // function, arg0 is the instance (`None` → unbound function).
+                    if name == "function.__get__" {
+                        let obj = args.into_iter().next().unwrap_or(Value::Undef);
+                        return Ok(match obj {
+                            Value::Undef => recv,
+                            inst => with_host(|h| {
+                                h.alloc(PyObj::BoundMethod { recv: inst, func: recv.clone() })
+                            }),
+                        });
+                    }
                     crate::builtins::call_type_method(&recv, &name, args, kwargs)
                 }
                 Some(PyObj::Func(fv)) => run_user_func(&fv, Some(recv), None, args, kwargs),
@@ -8002,6 +8072,29 @@ pub fn invoke(
             }
         }
         Some(PyObj::Class(name)) => instantiate(&name, args, kwargs),
+        // An unbound slot wrapper (`int.__str__`, `object.__repr__`) is callable:
+        // `wrapper(self, *rest)` runs the slot on its first argument. Dispatch to
+        // the base type directly — re-looking-up the method on `self` could hit
+        // this same wrapper (enum stores `member_type.__str__` as the class's
+        // `__str__`) and recurse.
+        Some(PyObj::Descriptor {
+            kind: DescKind::WrapperDescriptor,
+            qual,
+        }) => {
+            let (base, method) = qual.split_once('.').unwrap_or(("", qual.as_str()));
+            let (base, method) = (base.to_string(), method.to_string());
+            let mut it = args.into_iter();
+            let recv = it.next().ok_or_else(|| {
+                type_error(&format!("unbound method {qual}() needs an argument"))
+            })?;
+            let rest: Vec<Value> = it.collect();
+            if crate::builtins::is_type_like_builtin(&base) {
+                let payload =
+                    with_host(|h| h.base_payload_any(&recv)).unwrap_or_else(|| recv.clone());
+                return base_dispatch(&recv, &payload, &base, &method, rest, kwargs);
+            }
+            call_method(&recv, &method, rest, kwargs)
+        }
         // Calling a generic alias constructs its origin (`list[int]()` -> list()).
         Some(PyObj::GenericAlias { origin, .. }) => invoke(&origin, args, kwargs),
         Some(PyObj::NamedTupleType { type_name, fields }) => {
@@ -8412,6 +8505,33 @@ pub fn call_method(
     }
     let obj = with_host(|h| h.get(recv).cloned());
     match obj {
+        // `func.__get__(obj, cls)` invoked directly (not via attribute read):
+        // the descriptor bind — `obj` is None → the plain function, else a bound
+        // method. Mirrors the `__get__` attribute a function exposes.
+        Some(PyObj::Func(_)) if name == "__get__" => {
+            let inst = args.into_iter().next().unwrap_or(Value::Undef);
+            Ok(match inst {
+                Value::Undef => recv.clone(),
+                inst => with_host(|h| {
+                    h.alloc(PyObj::BoundMethod {
+                        recv: inst,
+                        func: recv.clone(),
+                    })
+                }),
+            })
+        }
+        // `types.MappingProxyType` (a type's `__dict__`) is a read-only view:
+        // read methods delegate to the backing dict; mutators are rejected.
+        Some(PyObj::MappingProxy { dict }) => {
+            match name {
+                "get" | "keys" | "values" | "items" | "copy" | "__getitem__"
+                | "__contains__" | "__len__" | "__iter__" | "__or__" | "__ror__"
+                | "__eq__" | "__ne__" | "__reversed__" => call_method(&dict, name, args, kwargs),
+                _ => Err(type_error(&format!(
+                    "'mappingproxy' object has no attribute '{name}'"
+                ))),
+            }
+        }
         // `contextlib.redirect_stdout`/`redirect_stderr` context manager: retarget
         // the stream on `__enter__` (saving the prior target on the instance so
         // nesting restores correctly) and restore it on `__exit__`.
@@ -8494,6 +8614,13 @@ pub fn call_method(
                 return invoke(&v, args, kwargs);
             }
             let class = inst.class.clone();
+            // `obj.__class__(...)` compiles as a method call, but `__class__` is a
+            // data attribute (the class); resolve it and construct (enum's
+            // `self.__class__(value)` in `Flag.__or__`, etc.).
+            if name == "__class__" {
+                let cls = with_host(|h| h.alloc(PyObj::Class(class.clone())));
+                return invoke(&cls, args, kwargs);
+            }
             if let Some(f) = with_host(|h| h.class_lookup(&class, name)) {
                 let fobj = with_host(|h| h.get(&f).cloned());
                 match fobj {
@@ -8511,8 +8638,27 @@ pub fn call_method(
                         a.extend(args);
                         return invoke(&inner, a, kwargs);
                     }
+                    // An unbound slot wrapper stored as a class method (enum sets
+                    // `__str__ = member_type.__str__`) binds to the instance: the
+                    // wrapper takes `self` as its first argument.
+                    Some(PyObj::Descriptor {
+                        kind: DescKind::WrapperDescriptor,
+                        ..
+                    }) => {
+                        let mut a = Vec::with_capacity(args.len() + 1);
+                        a.push(recv.clone());
+                        a.extend(args);
+                        return invoke(&f, a, kwargs);
+                    }
                     _ => return invoke(&f, args, kwargs),
                 }
+            }
+            // `__init__` inherited with no user override is `object.__init__` —
+            // a no-op returning None. A builtin base (str/int/…) provides no
+            // `__init__`, so the hybrid dispatch below would wrongly report a
+            // missing attribute (enum member creation calls `member.__init__(*args)`).
+            if name == "__init__" {
+                return Ok(Value::Undef);
             }
             // Builtin-subclass instance: inherited methods / protocol dunders
             // delegate to the native payload (`stack.append(x)`, `u.upper()`,
@@ -8637,13 +8783,17 @@ pub fn call_method(
                 // the builtin `type`'s implementation.
                 None if with_host(|h| class_inherits_type(h, &owner)) => {
                     match name {
-                        // `type.__new__(mcls, name, bases, ns)` builds the class.
+                        // `type.__new__(mcls, name, bases, ns, **kwds)` builds the
+                        // class. The `kwds` the metaclass `__new__` forwarded here
+                        // (past its own consumed keywords) go to `__init_subclass__`.
                         "__new__" if args.len() >= 4 => {
                             let mcls_name = with_host(|h| match h.get(&args[0]) {
                                 Some(PyObj::Class(n)) => n.clone(),
                                 _ => owner.clone(),
                             });
-                            crate::builtins::type_new_meta(&args[1], &args[2], &args[3], &mcls_name)
+                            crate::builtins::type_new_meta(
+                                &args[1], &args[2], &args[3], &mcls_name, kwargs,
+                            )
                         }
                         // `type.__init__` is a no-op.
                         "__init__" => Ok(Value::Undef),
@@ -8947,8 +9097,9 @@ fn metaclass_instantiate(
             invoke(&newf, a, kwargs.clone())?
         }
     } else if args.len() >= 3 {
-        // Default `type.__new__(meta, name, bases, ns)`.
-        crate::builtins::type_new_meta(&args[0], &args[1], &args[2], meta)?
+        // Default `type.__new__(meta, name, bases, ns)`; the class keywords reach
+        // `__init_subclass__` (the metaclass has no `__new__` to consume any).
+        crate::builtins::type_new_meta(&args[0], &args[1], &args[2], meta, kwargs.clone())?
     } else {
         return Err(type_error("type() takes 1 or 3 arguments"));
     };
@@ -9616,6 +9767,25 @@ pub fn build_class_foreign(
     crate::ffi::build_foreign_class(name, &bases, &members)
 }
 
+/// Fire `__set_name__(owner, attr)` on each namespace value whose type defines
+/// it, in definition order — the descriptor-naming step CPython runs inside
+/// `type.__new__`. Enum members are created here (each `_proto_member`'s
+/// `__set_name__` builds the real member and records it in `_member_map_`).
+pub fn fire_set_name(class_name: &str, ns: &IndexMap<String, Value>) -> Result<(), String> {
+    for (attr_name, val) in ns {
+        let fires = with_host(|h| match h.get(val) {
+            Some(PyObj::Instance(i)) => h.class_lookup(&i.class, "__set_name__").is_some(),
+            _ => false,
+        });
+        if fires {
+            let owner = with_host(|h| h.alloc(PyObj::Class(class_name.to_string())));
+            let nm = with_host(|h| h.new_str(attr_name.clone()));
+            call_method(val, "__set_name__", vec![owner, nm], vec![])?;
+        }
+    }
+    Ok(())
+}
+
 pub fn build_class(
     name: &str,
     bases: Vec<String>,
@@ -9652,24 +9822,29 @@ pub fn build_class(
             }
         });
     }
-    // Descriptor protocol: fire `__set_name__(owner, name)` on every class-body
-    // value whose type defines it (in definition order).
-    for (attr_name, val) in &ns {
-        let fires = with_host(|h| match h.get(val) {
-            Some(PyObj::Instance(i)) => h.class_lookup(&i.class, "__set_name__").is_some(),
-            _ => false,
-        });
-        if fires {
-            let owner = with_host(|h| h.alloc(PyObj::Class(name.to_string())));
-            let nm = with_host(|h| h.new_str(attr_name.clone()));
-            call_method(val, "__set_name__", vec![owner, nm], vec![])?;
-        }
+    // Descriptor naming (`__set_name__`) and PEP 487 (`__init_subclass__`) run
+    // inside `type.__new__`. For the metaclass path that is `type_new_meta`,
+    // reached via the metaclass's `super().__new__(...)` — which sees the
+    // possibly-rewritten classdict (enum's members) and the leftover keywords
+    // after the metaclass `__new__` consumed its own (e.g. enum's `boundary=`).
+    // Firing here again would misname descriptors and pass consumed keywords.
+    if effective_meta.is_none() {
+        fire_set_name(name, &ns)?;
+        fire_init_subclass(name, class_kwargs)?;
     }
-    // PEP 487: fire the parent's `__init_subclass__` (an implicit classmethod)
-    // with the new class and the leftover class-header keywords. Resolved along
-    // the MRO strictly after the new class (CPython's `super().__init_subclass__`).
+    Ok(cls)
+}
+
+/// PEP 487: fire the nearest ancestor's `__init_subclass__` (an implicit
+/// classmethod) with the leftover class-header keywords, resolved along the MRO
+/// strictly after the new class. Extra keywords when only the default
+/// `object.__init_subclass__` remains are an error, matching CPython.
+pub fn fire_init_subclass(
+    class_name: &str,
+    class_kwargs: Vec<(String, Value)>,
+) -> Result<(), String> {
     let hook = with_host(|h| {
-        h.mro_of(name).into_iter().skip(1).find_map(|c| {
+        h.mro_of(class_name).into_iter().skip(1).find_map(|c| {
             h.classes
                 .get(&c)
                 .and_then(|cd| cd.ns.get("__init_subclass__").cloned())
@@ -9683,20 +9858,18 @@ pub fn build_class(
                 _ => v,
             };
             if let Some(PyObj::Func(fv)) = with_host(|h| h.get(&inner).cloned()) {
-                let clsobj = with_host(|h| h.alloc(PyObj::Class(name.to_string())));
+                let clsobj = with_host(|h| h.alloc(PyObj::Class(class_name.to_string())));
                 run_user_func(&fv, Some(clsobj), Some(owner), vec![], class_kwargs)?;
             }
         }
-        // Only `object.__init_subclass__` (the no-arg default) remains: extra
-        // class keywords are an error, matching CPython.
         None if !class_kwargs.is_empty() => {
             return Err(type_error(&format!(
-                "{name}.__init_subclass__() takes no keyword arguments"
+                "{class_name}.__init_subclass__() takes no keyword arguments"
             )));
         }
         None => {}
     }
-    Ok(cls)
+    Ok(())
 }
 
 /// Construct a class through its metaclass: `M(name, (bases...), {ns...})`. This
@@ -9751,7 +9924,7 @@ fn metaclass_create(
 /// The most-derived metaclass inherited from `bases` (CPython's rule for a class
 /// with no explicit `metaclass=`): the metaclass that is a subclass of every
 /// base's metaclass. `"type"` when no base carries a user metaclass.
-fn default_metaclass(h: &PyHost, bases: &[String]) -> String {
+pub fn default_metaclass(h: &PyHost, bases: &[String]) -> String {
     let mut winner = "type".to_string();
     for b in bases {
         let mb = h
@@ -10641,6 +10814,12 @@ pub fn iter_vec(v: &Value) -> Result<Vec<Value>, String> {
     // protocol — reached by `list()`/`tuple()`/`sum()`/… over custom iterables.
     if with_host(|h| matches!(h.get(v), Some(PyObj::Instance(_)))) {
         return iter_instance_items(v);
+    }
+    // A class whose metaclass defines `__iter__` (Enum subclasses) materializes
+    // via `type(cls).__iter__(cls)` — reached by `list(Color)`, `[*Color]`, etc.
+    if let Some(m) = with_host(|h| h.metaclass_method(v, "__iter__")) {
+        let it = invoke(&m, vec![v.clone()], vec![])?;
+        return iter_vec(&it);
     }
     with_host(|h| h.iter_items(v))
 }

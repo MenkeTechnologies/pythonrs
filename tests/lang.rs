@@ -314,6 +314,53 @@ fn os_module_self_contained() {
     assert_eq!(g("import contextlib\nx = 1", "x"), "1");
 }
 
+// The faithful CPython `enum` stdlib runs self-contained on pythonrs's own VM:
+// the metaclass machinery (`__prepare__`, `__set_name__`/`_proto_member`,
+// `__init_subclass__`, metaclass `__iter__`, `_simple_enum`) all resolve
+// natively. Output is bit-faithful to CPython 3.14.
+#[cfg(not(feature = "stdlib-ffi"))]
+#[test]
+fn enum_module_self_contained() {
+    // Plain Enum: repr, member iteration, value lookup.
+    let e = "import enum\nclass C(enum.Enum):\n    RED = 1\n    GREEN = 2\n";
+    assert_eq!(g(&format!("{e}x = repr(C.RED)"), "x"), "'<C.RED: 1>'");
+    assert_eq!(g(&format!("{e}x = [m.name for m in C]"), "x"), "['RED', 'GREEN']");
+    assert_eq!(g(&format!("{e}x = C(2).name"), "x"), "'GREEN'");
+    // IntEnum: `str` is the int value (3.11+ ReprEnum behavior), arithmetic works.
+    let n = "import enum\nclass N(enum.IntEnum):\n    ONE = 1\n    TWO = 2\n";
+    assert_eq!(g(&format!("{n}x = str(N.ONE)"), "x"), "'1'");
+    assert_eq!(g(&format!("{n}x = N.TWO + 1"), "x"), "3");
+    // IntFlag: bitwise combine, composite repr, membership.
+    let p = "import enum\nclass P(enum.IntFlag):\n    R = 4\n    W = 2\n    X = 1\n";
+    assert_eq!(g(&format!("{p}x = (P.R | P.W).value"), "x"), "6");
+    assert_eq!(g(&format!("{p}x = repr(P.R | P.W)"), "x"), "'<P.R|W: 6>'");
+    assert_eq!(g(&format!("{p}x = P.R in (P.R | P.W)"), "x"), "True");
+    // StrEnum: members are strings.
+    let s = "import enum\nclass S(enum.StrEnum):\n    A = 'aa'\n";
+    assert_eq!(g(&format!("{s}x = S.A == 'aa'"), "x"), "True");
+}
+
+// A function is a non-data descriptor: `f.__get__(obj, cls)` binds it as a
+// method (`hasattr(f, '__get__')` is True, `__set__`/`__delete__` are not) — enum
+// relies on this to tell members from methods.
+#[cfg(not(feature = "stdlib-ffi"))]
+#[test]
+fn function_is_descriptor() {
+    assert_eq!(g("def f(self): return 1\nx = hasattr(f, '__get__')", "x"), "True");
+    assert_eq!(g("def f(self): return 1\nx = hasattr(f, '__set__')", "x"), "False");
+    let bind = "def f(self): return self + 1\nclass C: pass\nc = C()\nx = f.__get__(5, int)()";
+    assert_eq!(g(bind, "x"), "6");
+}
+
+// `obj.__class__(args)` — a data attribute invoked as a call — constructs an
+// instance of the object's class (compiled as a method call; `__class__`
+// resolves to the class, then constructs). Used by enum's `Flag.__or__`.
+#[test]
+fn class_attr_call_constructs() {
+    let src = "class I(int):\n    def dup(self):\n        return self.__class__(int(self) * 2)\nx = int(I(4).dup())";
+    assert_eq!(g(src, "x"), "8");
+}
+
 // A bound method called through a stored reference (`f = obj.m; f()`) — not just
 // `obj.m()` — resolves zero-arg super() (owner comes from FuncVal, tagged at
 // class registration).

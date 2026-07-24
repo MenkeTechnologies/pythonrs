@@ -1269,8 +1269,24 @@ fn b_getiter(vm: &mut VM, _: u8) -> Value {
         let r = iter_instance(&v);
         return finish(vm, r);
     }
+    // A class whose metaclass defines `__iter__` (Enum subclasses) iterates via
+    // `type(cls).__iter__(cls)`; drive whatever iterable that returns.
+    if let Some(m) = with_host(|h| h.metaclass_method(&v, "__iter__")) {
+        let r = host::invoke(&m, vec![v.clone()], vec![]).and_then(|it| iter_drive(&it));
+        return finish(vm, r);
+    }
     let r = with_host(|h| h.make_iter(&v));
     finish(vm, r)
+}
+
+/// Turn an already-obtained iterable (e.g. the result of a metaclass `__iter__`)
+/// into an iterator: a user instance goes through its own iteration protocol; a
+/// native iterator/generator/sequence is driven by `make_iter`.
+fn iter_drive(it: &Value) -> Result<Value, String> {
+    if with_host(|h| matches!(h.get(it), Some(PyObj::Instance(_)))) {
+        return iter_instance(it);
+    }
+    with_host(|h| h.make_iter(it))
 }
 
 /// Drive a user iterable into a concrete seq iterator. A `__iter__` that returns
@@ -3379,6 +3395,31 @@ pub fn call_builtin_function(
     if name == "_string.formatter_field_name_split" {
         return string_formatter_field_name_split(&args);
     }
+    // `<base>.__new__(cls, *args)` — a data type's constructor invoked on a
+    // subclass (enum's `_new_member_`, an explicit `int.__new__(MyInt, 5)`).
+    // Build a payload-carrying hybrid instance for the subclass; on the base
+    // type itself it yields the plain builtin value.
+    if let Some(base) = name.strip_suffix(".__new__").filter(|b| {
+        matches!(
+            *b,
+            "int" | "str" | "float" | "tuple" | "frozenset" | "list" | "dict" | "set"
+        )
+    }) {
+        let cls = arg0(&args)?;
+        let rest: Vec<Value> = args.iter().skip(1).cloned().collect();
+        let cname = with_host(|h| match h.get(&cls) {
+            Some(PyObj::Class(n)) => Some(n.clone()),
+            _ => None,
+        });
+        return match cname {
+            Some(c) => {
+                let payload = call_builtin_function(base, rest, kwargs)?;
+                Ok(with_host(|h| h.new_instance_payload(c, payload)))
+            }
+            // `str.__new__(str, 'x')` on the base type itself → the plain value.
+            None => call_builtin_function(base, rest, kwargs),
+        };
+    }
     // `object.__new__(cls, *args)` — build a bare instance of the class argument
     // (the args beyond `cls` are consumed by `__init__`, per CPython).
     if name == "object.__new__" {
@@ -3787,8 +3828,32 @@ pub fn call_builtin_function(
             }
         }
         "type" => {
-            // 3-arg `type(name, bases, ns)`: dynamic class creation.
+            // 3-arg `type(name, bases, ns, **kw)`: dynamic class creation. The
+            // most-derived metaclass inherited from the bases wins (CPython's
+            // rule) — so `type(name, (StrEnum,), body, boundary=…, _simple=True)`
+            // from enum's `_simple_enum` actually invokes `EnumType`, carrying its
+            // keywords, rather than registering a plain `type`-metaclass class.
             if args.len() == 3 {
+                let base_names: Vec<String> = with_host(|h| match h.get(&args[1]) {
+                    Some(PyObj::Tuple(items)) | Some(PyObj::List(items)) => items
+                        .iter()
+                        .filter_map(|b| match h.get(b) {
+                            Some(PyObj::Class(n)) => Some(n.clone()),
+                            Some(PyObj::Builtin(n)) if n != "object" => Some(n.clone()),
+                            _ => None,
+                        })
+                        .collect(),
+                    _ => vec![],
+                });
+                let meta = with_host(|h| host::default_metaclass(h, &base_names));
+                if meta != "type" {
+                    let metaobj = with_host(|h| h.alloc(PyObj::Class(meta)));
+                    return host::invoke(
+                        &metaobj,
+                        vec![args[0].clone(), args[1].clone(), args[2].clone()],
+                        kwargs,
+                    );
+                }
                 return type_new(&args[0], &args[1], &args[2]);
             }
             // 1-arg form: the object's type.
@@ -8049,17 +8114,21 @@ fn pad_str(s: &str, args: &[Value], mode: char) -> String {
 /// of class objects; `namespace` a dict of the class body. Registers the class
 /// and returns it.
 fn type_new(name: &Value, bases: &Value, ns: &Value) -> Result<Value, String> {
-    type_new_meta(name, bases, ns, "type")
+    type_new_meta(name, bases, ns, "type", vec![])
 }
 
-/// `type.__new__(mcls, name, bases, namespace)` — like `type_new` but tags the
-/// new class's metaclass as `metaclass` (so `type(cls) is mcls`). Used by the
-/// metaclass construction path.
+/// `type.__new__(mcls, name, bases, namespace, **kwds)` — like `type_new` but
+/// tags the new class's metaclass as `metaclass` (so `type(cls) is mcls`) and
+/// fires the class-creation hooks (`__set_name__`, `__init_subclass__`) that
+/// live in `type.__new__`. `class_kwargs` are the keywords the metaclass's
+/// `__new__` forwarded here (its own were already consumed), so they reach
+/// `__init_subclass__` exactly as CPython delivers them.
 pub fn type_new_meta(
     name: &Value,
     bases: &Value,
     ns: &Value,
     metaclass: &str,
+    class_kwargs: Vec<(String, Value)>,
 ) -> Result<Value, String> {
     let cname = with_host(|h| h.as_str(name))
         .ok_or_else(|| host::type_error("type() argument 1 must be str"))?;
@@ -8094,9 +8163,17 @@ pub fn type_new_meta(
             _ => IndexMap::new(),
         }
     });
-    Ok(with_host(|h| {
-        h.register_class_meta(&cname, base_names, namespace, metaclass)
-    }))
+    let cls = with_host(|h| {
+        h.register_class_meta(&cname, base_names, namespace.clone(), metaclass)
+    });
+    // Descriptor naming and PEP 487 both run inside `type.__new__` in CPython —
+    // fire them here so a metaclass's `super().__new__(mcls, name, bases,
+    // classdict, **kwds)` builds enum members (`_proto_member.__set_name__`),
+    // names any other descriptors, and delivers only the still-unconsumed
+    // keywords to `__init_subclass__`.
+    host::fire_set_name(&cname, &namespace)?;
+    host::fire_init_subclass(&cname, class_kwargs)?;
+    Ok(cls)
 }
 
 fn str_maketrans(args: &[Value]) -> Result<Value, String> {
