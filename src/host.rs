@@ -1021,6 +1021,10 @@ pub struct PyHost {
     /// side effects) instead of re-executing the vendored `.py`. Populated by
     /// `import_module` on every successful import (native, vendored, or bridged).
     modules: IndexMap<String, Value>,
+    /// The live `sys.modules` dict handle (set when `sys` is built). Kept in sync
+    /// with the internal cache so Python-level `sys.modules[k] = v` (e.g. os.py's
+    /// `sys.modules['os.path'] = path`) is honored by subsequent imports.
+    sys_modules: Option<Value>,
 }
 
 /// Whether a `GenCell` backs a plain generator, an `async def` coroutine, or
@@ -1341,17 +1345,37 @@ impl PyHost {
             stdout_target: None,
             stderr_target: None,
             modules: IndexMap::new(),
+            sys_modules: None,
         }
     }
 
     /// A previously-imported module by dotted name (pythonrs's `sys.modules`).
     pub fn cached_module(&self, name: &str) -> Option<Value> {
-        self.modules.get(name).cloned()
+        if let Some(m) = self.modules.get(name) {
+            return Some(m.clone());
+        }
+        // A module registered only in the Python-level sys.modules (e.g. os.py's
+        // `sys.modules['os.path'] = path`).
+        if let Some(sm) = &self.sys_modules {
+            if let Some(PyObj::Dict(d)) = self.get(sm) {
+                if let Some((_, v)) = d.get(&PKey::Str(name.to_string())) {
+                    return Some(v.clone());
+                }
+            }
+        }
+        None
     }
 
-    /// Record `module` under `name` so a re-import returns the same object.
+    /// Record `module` under `name` so a re-import returns the same object. Also
+    /// mirrored into the live `sys.modules` dict.
     pub fn cache_module(&mut self, name: &str, module: Value) {
-        self.modules.insert(name.to_string(), module);
+        self.modules.insert(name.to_string(), module.clone());
+        if let Some(sm) = self.sys_modules.clone() {
+            let kv = self.new_str(name.to_string());
+            if let Some(PyObj::Dict(d)) = self.get_mut(&sm) {
+                d.insert(PKey::Str(name.to_string()), (kv, module));
+            }
+        }
     }
 
     /// Record `__cause__`/`__context__` for an exception object. `Undef` leaves
@@ -6764,6 +6788,15 @@ impl PyHost {
                     let func = self.alloc(PyObj::Builtin("__subclasses__".into()));
                     return Ok(self.alloc(PyObj::BoundMethod { recv: cls, func }));
                 }
+                // `cls.__new__` — the class's own __new__ if defined, else the
+                // inherited `object.__new__` (a callable that builds a bare
+                // instance). An implicit staticmethod, so it is returned unbound.
+                if name == "__new__" {
+                    if let Some(f) = self.class_lookup(&cname, "__new__") {
+                        return Ok(f);
+                    }
+                    return Ok(self.alloc(PyObj::Builtin("object.__new__".into())));
+                }
                 if name == "__dict__" {
                     let ns = self
                         .classes
@@ -7142,6 +7175,12 @@ impl PyHost {
                 }
                 let dict = self.alloc(PyObj::Dict(d));
                 Ok(self.alloc(PyObj::MappingProxy { dict }))
+            }
+            // `<type>.__new__` on a builtin type object — a callable constructor.
+            Some(PyObj::Builtin(n))
+                if name == "__new__" && crate::builtins::is_type_object_name(n) =>
+            {
+                Ok(self.alloc(PyObj::Builtin("object.__new__".into())))
             }
             // `FunctionType.__code__` / `.__globals__` reached on the TYPE object
             // are the get/set and member descriptors CPython's `types` derives.
@@ -11093,6 +11132,65 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                 ),
             ]
         }),
+        // `posix` — the Unix syscall surface `os` sits on. Backed by std::fs/
+        // std::env/libc.
+        "posix" => with_host(|h| {
+            const FNS: &[&str] = &[
+                "getcwd", "getcwdb", "chdir", "listdir", "scandir", "stat", "lstat", "fstat",
+                "mkdir", "makedirs", "rmdir", "remove", "unlink", "rename", "replace", "getpid",
+                "getppid", "getuid", "geteuid", "getgid", "getegid", "urandom", "umask", "system",
+                "strerror", "getenv", "putenv", "unsetenv", "access", "fspath", "_exit", "abort",
+                "getpgrp", "cpu_count", "device_encoding", "get_terminal_size", "isatty", "pipe",
+                "dup", "close", "read", "write", "open", "lseek", "fsync", "kill", "waitpid",
+                "_create_environ", "readlink", "symlink", "link", "chmod", "utime", "truncate",
+                "sync", "get_inheritable", "set_inheritable", "ftruncate", "sched_yield",
+            ];
+            let mut v: Vec<(&str, Value)> = FNS
+                .iter()
+                .map(|f| (*f, h.alloc(PyObj::Builtin(format!("posix.{f}")))))
+                .collect();
+            // Constants (from libc where platform-specific).
+            let consts: &[(&str, i64)] = &[
+                ("F_OK", libc::F_OK as i64),
+                ("R_OK", libc::R_OK as i64),
+                ("W_OK", libc::W_OK as i64),
+                ("X_OK", libc::X_OK as i64),
+                ("SEEK_SET", libc::SEEK_SET as i64),
+                ("SEEK_CUR", libc::SEEK_CUR as i64),
+                ("SEEK_END", libc::SEEK_END as i64),
+                ("O_RDONLY", libc::O_RDONLY as i64),
+                ("O_WRONLY", libc::O_WRONLY as i64),
+                ("O_RDWR", libc::O_RDWR as i64),
+                ("O_APPEND", libc::O_APPEND as i64),
+                ("O_CREAT", libc::O_CREAT as i64),
+                ("O_EXCL", libc::O_EXCL as i64),
+                ("O_TRUNC", libc::O_TRUNC as i64),
+                ("O_NONBLOCK", libc::O_NONBLOCK as i64),
+                ("O_CLOEXEC", libc::O_CLOEXEC as i64),
+                ("WNOHANG", libc::WNOHANG as i64),
+                ("EX_OK", 0),
+            ];
+            for (k, val) in consts {
+                v.push((k, Value::Int(*val)));
+            }
+            // `environ` as a {bytes: bytes} dict — CPython's posix.environ is
+            // bytes-keyed on Unix, and os wraps it in a str-decoding mapping.
+            let environ = {
+                let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+                for (k, val) in std::env::vars() {
+                    let kb = k.clone().into_bytes();
+                    let kv = h.alloc(PyObj::Bytes(kb.clone()));
+                    let vv = h.alloc(PyObj::Bytes(val.into_bytes()));
+                    d.insert(PKey::Bytes(kb), (kv, vv));
+                }
+                h.alloc(PyObj::Dict(d))
+            };
+            v.push(("environ", environ));
+            // Capability list `os` reads (empty = no optional dir-fd/etc. features).
+            let have = h.new_list(vec![]);
+            v.push(("_have_functions", have));
+            v
+        }),
         // `_thread` — low-level threading primitives. pythonrs runs user code on
         // one thread, so the locks are functional but uncontended.
         "_thread" => with_host(|h| {
@@ -11325,6 +11423,18 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                     .unwrap_or_default(),
             );
             let modules = h.new_dict(IndexMap::new());
+            // Publish the live sys.modules handle + seed it with already-imported
+            // modules, so Python-level assignment/reads stay consistent with the
+            // internal import cache.
+            h.sys_modules = Some(modules.clone());
+            let cached: Vec<(String, Value)> =
+                h.modules.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            for (k, v) in cached {
+                let kv = h.new_str(k.clone());
+                if let Some(PyObj::Dict(d)) = h.get_mut(&modules) {
+                    d.insert(PKey::Str(k), (kv, v));
+                }
+            }
             let version = h.new_str(format!("{PY_MAJOR}.{PY_MINOR}.{PY_MICRO} (pythonrs)"));
             let platform = h.new_str(py_platform());
             // `sys.implementation` — a SimpleNamespace describing the interpreter
@@ -11378,6 +11488,21 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                     h.alloc(PyObj::Builtin("sys.setrecursionlimit".into())),
                 ),
                 ("_getframe", h.alloc(PyObj::Builtin("sys._getframe".into()))),
+                (
+                    "getfilesystemencoding",
+                    h.alloc(PyObj::Builtin("sys.getfilesystemencoding".into())),
+                ),
+                (
+                    "getfilesystemencodeerrors",
+                    h.alloc(PyObj::Builtin("sys.getfilesystemencodeerrors".into())),
+                ),
+                (
+                    "getdefaultencoding",
+                    h.alloc(PyObj::Builtin("sys.getdefaultencoding".into())),
+                ),
+                ("intern", h.alloc(PyObj::Builtin("sys.intern".into()))),
+                ("audit", h.alloc(PyObj::Builtin("sys.audit".into()))),
+                ("is_finalizing", h.alloc(PyObj::Builtin("sys.is_finalizing".into()))),
             ]
         }),
         "asyncio" => with_host(|h| {
@@ -11580,6 +11705,18 @@ fn run_vendored_module(name: &str, src: &str, path: &std::path::Path) -> Result<
         (mid, saved)
     });
 
+    // Create the module object and cache it NOW — before running the body — so a
+    // circular import during the body (os <-> posixpath) resolves to this same,
+    // partially-populated object instead of re-running the body forever.
+    let module = with_host(|h| {
+        let m = h.alloc(PyObj::Module {
+            name: name.to_string(),
+            ns: IndexMap::new(),
+        });
+        h.cache_module(name, m.clone());
+        m
+    });
+
     let run = (|| -> Result<(), String> {
         let prog = crate::compile_or_load(src)?;
         let chunk = crate::load_merged(prog);
@@ -11590,23 +11727,18 @@ fn run_vendored_module(name: &str, src: &str, path: &std::path::Path) -> Result<
     with_host(|h| {
         h.swap_module(saved_mod);
         h.restore_scope(parked);
+        // Populate the already-cached module object IN PLACE from the final slot
+        // globals, so every holder (including a mid-import circular reference) sees
+        // the complete namespace. Functions read the live slot directly.
+        let pairs = h.module_globals_pairs(mid);
+        if let Some(PyObj::Module { ns, .. }) = h.get_mut(&module) {
+            for (k, v) in pairs {
+                ns.insert(k, v);
+            }
+        }
     });
     run?;
-
-    // The `Module` namespace is a snapshot of the (still-live) module slot: name
-    // lookups on the module object read it, while functions read the slot itself.
-    // They share heap handles for mutable globals, so in-place mutation stays
-    // visible through both; only a top-level rebind would diverge.
-    Ok(with_host(|h| {
-        let mut ns: IndexMap<String, Value> = IndexMap::new();
-        for (k, v) in h.module_globals_pairs(mid) {
-            ns.insert(k, v);
-        }
-        h.alloc(PyObj::Module {
-            name: name.to_string(),
-            ns,
-        })
-    }))
+    Ok(module)
 }
 
 // ── file / I/O side table (ported from rubylang's `IoCell`) ──────────────────

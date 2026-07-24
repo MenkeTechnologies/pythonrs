@@ -2242,7 +2242,20 @@ fn b_import(vm: &mut VM, _: u8) -> Value {
 fn b_import_from(vm: &mut VM, _: u8) -> Value {
     let name = sval(&vm.pop());
     let module = vm.pop();
-    let r = with_host(|h| h.get_attr(&module, &name));
+    let is_module = with_host(|h| matches!(h.get(&module), Some(PyObj::Module { .. })));
+    let r = with_host(|h| h.get_attr(&module, &name)).map_err(|e| {
+        // `from mod import missing` raises ImportError (not AttributeError) so the
+        // stdlib's `try: from posix import X / except ImportError:` fallbacks fire.
+        if is_module && e.starts_with("AttributeError") {
+            let mname = with_host(|h| match h.get(&module) {
+                Some(PyObj::Module { name, .. }) => name.clone(),
+                _ => String::new(),
+            });
+            format!("ImportError: cannot import name '{name}' from '{mname}'")
+        } else {
+            e
+        }
+    });
     finish(vm, r)
 }
 
@@ -3323,6 +3336,10 @@ pub fn call_builtin_function(
     if let Some(f) = name.strip_prefix("asyncio.") {
         return call_asyncio(f, args, kwargs);
     }
+    // `posix.*` — the Unix syscall surface.
+    if let Some(f) = name.strip_prefix("posix.") {
+        return call_posix(f, args, kwargs);
+    }
     // `_thread.*` — lock/thread primitives.
     if let Some(f) = name.strip_prefix("_thread.") {
         return match f {
@@ -3361,6 +3378,19 @@ pub fn call_builtin_function(
     }
     if name == "_string.formatter_field_name_split" {
         return string_formatter_field_name_split(&args);
+    }
+    // `object.__new__(cls, *args)` — build a bare instance of the class argument
+    // (the args beyond `cls` are consumed by `__init__`, per CPython).
+    if name == "object.__new__" {
+        let cls = arg0(&args)?;
+        let cname = with_host(|h| match h.get(&cls) {
+            Some(PyObj::Class(n)) => Some(n.clone()),
+            _ => None,
+        });
+        return match cname {
+            Some(c) => Ok(with_host(|h| h.new_instance(c, IndexMap::new()))),
+            None => Err(host::type_error("object.__new__(X): X is not a type object")),
+        };
     }
     // `dict.fromkeys(iterable[, value])` reached via the `dict` type object.
     if name == "dict.fromkeys" {
@@ -5553,6 +5583,223 @@ fn itertools_groupby(args: &[Value], _kwargs: &[(String, Value)]) -> Result<Valu
     Ok(list_iter(out))
 }
 
+/// The `posix` syscall surface, backed by std::fs/std::env/libc.
+fn call_posix(name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Result<Value, String> {
+    let path_arg = |i: usize| -> Option<String> {
+        args.get(i).and_then(|v| with_host(|h| h.as_str(v)))
+    };
+    let str_v = |s: String| with_host(|h| h.new_str(s));
+    let io_err = |e: std::io::Error| -> String {
+        let code = e.raw_os_error().unwrap_or(0);
+        format!("OSError: [Errno {code}] {e}")
+    };
+    match name {
+        "getcwd" => std::env::current_dir()
+            .map(|p| str_v(p.to_string_lossy().into_owned()))
+            .map_err(io_err),
+        "getcwdb" => std::env::current_dir()
+            .map(|p| {
+                with_host(|h| h.alloc(PyObj::Bytes(p.to_string_lossy().as_bytes().to_vec())))
+            })
+            .map_err(io_err),
+        "chdir" => {
+            let p = path_arg(0).ok_or_else(|| host::type_error("chdir: path required"))?;
+            std::env::set_current_dir(&p).map_err(io_err)?;
+            Ok(Value::Undef)
+        }
+        "listdir" => {
+            let p = path_arg(0).unwrap_or_else(|| ".".to_string());
+            let mut names = Vec::new();
+            for entry in std::fs::read_dir(&p).map_err(io_err)? {
+                let e = entry.map_err(io_err)?;
+                names.push(str_v(e.file_name().to_string_lossy().into_owned()));
+            }
+            Ok(with_host(|h| h.new_list(names)))
+        }
+        "stat" | "lstat" => {
+            let p = path_arg(0).ok_or_else(|| host::type_error("stat: path required"))?;
+            let md = if name == "lstat" {
+                std::fs::symlink_metadata(&p)
+            } else {
+                std::fs::metadata(&p)
+            }
+            .map_err(io_err)?;
+            Ok(build_stat_result(&md))
+        }
+        "mkdir" => {
+            let p = path_arg(0).ok_or_else(|| host::type_error("mkdir: path required"))?;
+            std::fs::create_dir(&p).map_err(io_err)?;
+            Ok(Value::Undef)
+        }
+        "makedirs" => {
+            let p = path_arg(0).ok_or_else(|| host::type_error("makedirs: path required"))?;
+            std::fs::create_dir_all(&p).map_err(io_err)?;
+            Ok(Value::Undef)
+        }
+        "rmdir" => {
+            let p = path_arg(0).ok_or_else(|| host::type_error("rmdir: path required"))?;
+            std::fs::remove_dir(&p).map_err(io_err)?;
+            Ok(Value::Undef)
+        }
+        "remove" | "unlink" => {
+            let p = path_arg(0).ok_or_else(|| host::type_error("remove: path required"))?;
+            std::fs::remove_file(&p).map_err(io_err)?;
+            Ok(Value::Undef)
+        }
+        "rename" | "replace" => {
+            let src = path_arg(0).ok_or_else(|| host::type_error("rename: src required"))?;
+            let dst = path_arg(1).ok_or_else(|| host::type_error("rename: dst required"))?;
+            std::fs::rename(&src, &dst).map_err(io_err)?;
+            Ok(Value::Undef)
+        }
+        "getpid" => Ok(Value::Int(std::process::id() as i64)),
+        "getppid" => Ok(Value::Int(unsafe { libc::getppid() } as i64)),
+        "getuid" | "geteuid" => Ok(Value::Int(unsafe { libc::getuid() } as i64)),
+        "getgid" | "getegid" => Ok(Value::Int(unsafe { libc::getgid() } as i64)),
+        "getpgrp" => Ok(Value::Int(unsafe { libc::getpgrp() } as i64)),
+        "umask" => {
+            let m = args.first().and_then(|v| with_host(|h| h.as_int(v))).unwrap_or(0);
+            let prev = unsafe { libc::umask(m as libc::mode_t) };
+            Ok(Value::Int(prev as i64))
+        }
+        "urandom" => {
+            let n = args.first().and_then(|v| with_host(|h| h.as_int(v))).unwrap_or(0).max(0) as usize;
+            let mut buf = vec![0u8; n];
+            use std::io::Read;
+            std::fs::File::open("/dev/urandom")
+                .and_then(|mut f| f.read_exact(&mut buf))
+                .map_err(io_err)?;
+            Ok(with_host(|h| h.alloc(PyObj::Bytes(buf))))
+        }
+        "getenv" => {
+            let key = path_arg(0).ok_or_else(|| host::type_error("getenv: key required"))?;
+            match std::env::var(&key) {
+                Ok(val) => Ok(str_v(val)),
+                Err(_) => Ok(args.get(1).cloned().unwrap_or(Value::Undef)),
+            }
+        }
+        "putenv" => {
+            let key = path_arg(0).ok_or_else(|| host::type_error("putenv: key required"))?;
+            let val = path_arg(1).unwrap_or_default();
+            std::env::set_var(&key, &val);
+            Ok(Value::Undef)
+        }
+        "unsetenv" => {
+            let key = path_arg(0).ok_or_else(|| host::type_error("unsetenv: key required"))?;
+            std::env::remove_var(&key);
+            Ok(Value::Undef)
+        }
+        "access" => {
+            let p = path_arg(0).ok_or_else(|| host::type_error("access: path required"))?;
+            let mode = args.get(1).and_then(|v| with_host(|h| h.as_int(v))).unwrap_or(0);
+            let cp = std::ffi::CString::new(p).map_err(|_| "ValueError: embedded null".to_string())?;
+            Ok(Value::Bool(unsafe { libc::access(cp.as_ptr(), mode as i32) } == 0))
+        }
+        "fspath" => {
+            // Return str/bytes unchanged; call __fspath__ on a path-like object.
+            let a = arg0(&args)?;
+            if with_host(|h| matches!(h.get(&a), Some(PyObj::Str(_)) | Some(PyObj::Bytes(_))))
+                || matches!(a, Value::Str(_))
+            {
+                Ok(a)
+            } else {
+                host::call_method(&a, "__fspath__", vec![], vec![])
+            }
+        }
+        "strerror" => {
+            let code = args.first().and_then(|v| with_host(|h| h.as_int(v))).unwrap_or(0);
+            let msg = std::io::Error::from_raw_os_error(code as i32).to_string();
+            Ok(str_v(msg))
+        }
+        "system" => {
+            let cmd = path_arg(0).ok_or_else(|| host::type_error("system: command required"))?;
+            let status = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(&cmd)
+                .status()
+                .map_err(io_err)?;
+            Ok(Value::Int((status.code().unwrap_or(0) as i64) << 8))
+        }
+        "cpu_count" => Ok(std::thread::available_parallelism()
+            .map(|n| Value::Int(n.get() as i64))
+            .unwrap_or(Value::Undef)),
+        "isatty" => {
+            let fd = args.first().and_then(|v| with_host(|h| h.as_int(v))).unwrap_or(-1);
+            Ok(Value::Bool(unsafe { libc::isatty(fd as i32) } == 1))
+        }
+        "_exit" => {
+            let code = args.first().and_then(|v| with_host(|h| h.as_int(v))).unwrap_or(0);
+            std::process::exit(code as i32);
+        }
+        "abort" => std::process::exit(134),
+        "sync" | "sched_yield" => Ok(Value::Undef),
+        "_create_environ" => Ok(with_host(|h| {
+            let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+            for (k, val) in std::env::vars() {
+                let kb = k.into_bytes();
+                let kv = h.alloc(PyObj::Bytes(kb.clone()));
+                let vv = h.alloc(PyObj::Bytes(val.into_bytes()));
+                d.insert(PKey::Bytes(kb), (kv, vv));
+            }
+            h.alloc(PyObj::Dict(d))
+        })),
+        // File-descriptor level ops.
+        "close" => {
+            let fd = args.first().and_then(|v| with_host(|h| h.as_int(v))).unwrap_or(-1);
+            unsafe { libc::close(fd as i32) };
+            Ok(Value::Undef)
+        }
+        "get_inheritable" => Ok(Value::Bool(false)),
+        "set_inheritable" | "fsync" | "utime" | "chmod" | "truncate" | "ftruncate" => {
+            Ok(Value::Undef)
+        }
+        "readlink" => {
+            let p = path_arg(0).ok_or_else(|| host::type_error("readlink: path required"))?;
+            std::fs::read_link(&p)
+                .map(|t| str_v(t.to_string_lossy().into_owned()))
+                .map_err(io_err)
+        }
+        _ => Err(format!("AttributeError: module 'posix' has no attribute '{name}'")),
+    }
+    .map_err(|e| {
+        let _ = &kwargs;
+        e
+    })
+}
+
+/// A `posix.stat` result — the 10-field `stat_result` sequence (st_mode, st_ino,
+/// st_dev, st_nlink, st_uid, st_gid, st_size, st_atime, st_mtime, st_ctime),
+/// tagged so `.st_mode` etc. resolve.
+fn build_stat_result(md: &std::fs::Metadata) -> Value {
+    use std::os::unix::fs::MetadataExt;
+    let fields = [
+        ("st_mode", md.mode() as i64),
+        ("st_ino", md.ino() as i64),
+        ("st_dev", md.dev() as i64),
+        ("st_nlink", md.nlink() as i64),
+        ("st_uid", md.uid() as i64),
+        ("st_gid", md.gid() as i64),
+        ("st_size", md.size() as i64),
+        ("st_atime", md.atime()),
+        ("st_mtime", md.mtime()),
+        ("st_ctime", md.ctime()),
+    ];
+    with_host(|h| {
+        let vals: Vec<Value> = fields.iter().map(|(_, v)| Value::Int(*v)).collect();
+        let tup = h.new_tuple(vals);
+        if let Value::Obj(i) = tup {
+            h.nt_meta.insert(
+                i,
+                host::NtMeta {
+                    type_name: "os.stat_result".to_string(),
+                    fields: fields.iter().map(|(k, _)| (*k).to_string()).collect(),
+                },
+            );
+        }
+        tup
+    })
+}
+
 fn call_sys(name: &str, args: Vec<Value>) -> Result<Value, String> {
     match name {
         "exit" => {
@@ -5569,6 +5816,14 @@ fn call_sys(name: &str, args: Vec<Value>) -> Result<Value, String> {
         }
         "getrecursionlimit" => Ok(Value::Int(1000)),
         "setrecursionlimit" => Ok(Value::Undef),
+        "getfilesystemencoding" | "getdefaultencoding" => {
+            Ok(with_host(|h| h.new_str("utf-8".to_string())))
+        }
+        "getfilesystemencodeerrors" => Ok(with_host(|h| h.new_str("surrogateescape".to_string()))),
+        // `sys.intern(s)` returns the string (no interning table needed here).
+        "intern" => Ok(args.into_iter().next().unwrap_or(Value::Undef)),
+        "audit" => Ok(Value::Undef),
+        "is_finalizing" => Ok(Value::Bool(false)),
         // `sys._getframe([depth])` — the frame `depth` levels up from the caller.
         "_getframe" => {
             let depth = args

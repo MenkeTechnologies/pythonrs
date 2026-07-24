@@ -299,6 +299,21 @@ fn object_dunder_methods() {
     );
 }
 
+// The os module imports and works on the self-contained build (native posix +
+// the circular-import / sys.modules / __new__ fixes it needs). Gated to no-ffi.
+#[cfg(not(feature = "stdlib-ffi"))]
+#[test]
+fn os_module_self_contained() {
+    assert_eq!(g("import os\nx = type(os.getcwd()).__name__", "x"), "'str'");
+    assert_eq!(g("import os\nx = os.sep", "x"), "'/'");
+    assert_eq!(g("import os\nx = os.path.join('a', 'b', 'c')", "x"), "'a/b/c'");
+    assert_eq!(g("import os\nx = os.path.basename('/x/y.txt')", "x"), "'y.txt'");
+    assert_eq!(g("import os\nx = os.getpid() > 0", "x"), "True");
+    assert_eq!(g("import os\nx = 'PATH' in os.environ", "x"), "True");
+    assert_eq!(g("import os\nx = os.stat('.').st_size >= 0", "x"), "True");
+    assert_eq!(g("import contextlib\nx = 1", "x"), "1");
+}
+
 #[test]
 fn thread_locks() {
     // Native _thread locks: RLock is reentrant, plain lock tracks state. (Single
