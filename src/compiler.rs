@@ -1049,12 +1049,60 @@ impl Compiler {
                     self.emit_native_while(b, test, wbody)?;
                 }
                 StmtKind::If { test, body: tb, orelse } => {
-                    self.emit_native_if(b, test, tb, orelse)?;
+                    // Branchless fast path for conditional accumulation:
+                    //   `if cond: acc += v`  ->  `acc += (cond & 1) * v`
+                    //   `if cond: acc -= v`  ->  `acc -= (cond & 1) * v`
+                    // (no else, single aug-add/sub to a slot). This keeps the hot
+                    // path branch-free so the tracing JIT compiles it, instead of
+                    // an `if` whose forward branch would break the trace. `& 1`
+                    // turns the comparison's bool into an Int (arithmetic on a bool
+                    // deopts; BitAnd accepts it). cond and v are side-effect-free,
+                    // so evaluating them unconditionally is safe.
+                    if let Some((target_slot, nop, value)) =
+                        self.branchless_accum(tb, orelse)
+                    {
+                        b.emit(Op::GetSlot(target_slot), 0);
+                        self.emit_native_cond(b, test)?;
+                        b.emit(Op::LoadInt(1), 0);
+                        b.emit(Op::BitAnd, 0);
+                        self.compile_expr(b, value)?;
+                        b.emit(Op::Mul, 0);
+                        b.emit(nop, 0);
+                        b.emit(Op::SetSlot(target_slot), 0);
+                    } else {
+                        self.emit_native_if(b, test, tb, orelse)?;
+                    }
                 }
                 _ => self.compile_stmts(b, std::slice::from_ref(stmt))?,
             }
         }
         Ok(())
+    }
+
+    /// Recognize `if cond: acc += v` / `if cond: acc -= v` (single aug-add/sub to
+    /// a slot-local, no `else`), returning `(slot, Add|Sub, value)` so the caller
+    /// can emit it branchlessly. The returned value expression borrows `then_body`,
+    /// not `self`, so the caller may still take `&mut self` to emit.
+    fn branchless_accum<'a>(
+        &self,
+        then_body: &'a [Stmt],
+        else_body: &[Stmt],
+    ) -> Option<(u16, Op, &'a Expr)> {
+        if !else_body.is_empty() || then_body.len() != 1 {
+            return None;
+        }
+        if let StmtKind::AugAssign { target, op, value } = &then_body[0].kind {
+            if let Expr::Name(n) = target.unspanned() {
+                let nop = match op {
+                    BinOp::Add => Op::Add,
+                    BinOp::Sub => Op::Sub,
+                    _ => return None,
+                };
+                let slot = self.native_slots.as_ref()?.get(n).copied()?;
+                return Some((slot, nop, value));
+            }
+        }
+        None
     }
 
     /// Push a native boolean for a validated native condition (see
