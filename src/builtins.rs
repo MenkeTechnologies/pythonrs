@@ -3301,6 +3301,34 @@ pub fn call_builtin_function(
     if let Some(f) = name.strip_prefix("asyncio.") {
         return call_asyncio(f, args, kwargs);
     }
+    // `_thread.*` — lock/thread primitives.
+    if let Some(f) = name.strip_prefix("_thread.") {
+        return match f {
+            "allocate_lock" => Ok(with_host(|h| {
+                h.alloc(PyObj::Lock {
+                    count: 0,
+                    reentrant: false,
+                })
+            })),
+            "RLock" => Ok(with_host(|h| {
+                h.alloc(PyObj::Lock {
+                    count: 0,
+                    reentrant: true,
+                })
+            })),
+            // A single, stable identity for the one user thread.
+            "get_ident" | "get_native_id" => Ok(Value::Int(1)),
+            "start_new_thread" => {
+                // Run the target synchronously (no real threads for user code).
+                let func = arg0(&args)?;
+                let a = args.get(1).cloned().unwrap_or(Value::Undef);
+                let call_args = host::iter_vec(&a).unwrap_or_default();
+                host::invoke(&func, call_args, vec![])?;
+                Ok(Value::Int(1))
+            }
+            _ => Err(format!("AttributeError: module '_thread' has no attribute '{f}'")),
+        };
+    }
     // `itertools.*` iterators.
     if let Some(f) = name.strip_prefix("itertools.") {
         return call_itertools(f, args, kwargs);

@@ -519,6 +519,13 @@ pub enum PyObj {
     Cell {
         value: Value,
     },
+    /// A `_thread` lock (`allocate_lock()`/`RLock()`). `count` tracks nesting for
+    /// a reentrant lock; a plain lock is 0/1. Functional under pythonrs's
+    /// single-threaded user execution (the stdlib uses these for cache/IO guards).
+    Lock {
+        count: u32,
+        reentrant: bool,
+    },
     /// A lazy `itertools` iterator. `sources` are pre-made input iterators, `func`
     /// an optional predicate/binop, `nums` integer state (count start/step,
     /// islice bounds, cursor), `buf` a value buffer (cycle's seen items,
@@ -2537,6 +2544,9 @@ impl PyHost {
                 Some(PyObj::Traceback { .. }) => "traceback".into(),
                 Some(PyObj::PyFrame { .. }) => "frame".into(),
                 Some(PyObj::Cell { .. }) => "cell".into(),
+                Some(PyObj::Lock { reentrant, .. }) => {
+                    if *reentrant { "RLock" } else { "lock" }.into()
+                }
                 Some(PyObj::ItertoolsIter { kind, .. }) => kind.type_name().into(),
                 Some(PyObj::LruCache { .. }) => "functools._lru_cache_wrapper".into(),
                 Some(PyObj::Super { .. }) => "super".into(),
@@ -2759,6 +2769,11 @@ impl PyHost {
                 Some(PyObj::Zip { .. }) => format!("<zip object at 0x{:012x}>", self.addr_of(v)),
                 Some(PyObj::ItertoolsIter { kind, .. }) => {
                     format!("<{} object at 0x{:012x}>", kind.type_name(), self.addr_of(v))
+                }
+                Some(PyObj::Lock { count, reentrant }) => {
+                    let state = if *count > 0 { "locked" } else { "unlocked" };
+                    let kind = if *reentrant { "_thread.RLock" } else { "_thread.lock" };
+                    format!("<{state} {kind} object at 0x{:012x}>", self.addr_of(v))
                 }
                 Some(PyObj::MapObj { .. }) => format!("<map object at 0x{:012x}>", self.addr_of(v)),
                 Some(PyObj::FilterObj { .. }) => {
@@ -8135,6 +8150,41 @@ pub fn call_method(
         // `contextlib.redirect_stdout`/`redirect_stderr` context manager: retarget
         // the stream on `__enter__` (saving the prior target on the instance so
         // nesting restores correctly) and restore it on `__exit__`.
+        // `_thread` lock methods. Single-threaded, so acquire always succeeds;
+        // a reentrant lock counts nesting.
+        Some(PyObj::Lock { reentrant, .. }) => match name {
+            "acquire" | "__enter__" => {
+                with_host(|h| {
+                    if let Some(PyObj::Lock { count, .. }) = h.get_mut(recv) {
+                        *count += 1;
+                    }
+                });
+                // `__enter__` returns the lock semantics (`acquire` -> True).
+                if name == "__enter__" {
+                    Ok(Value::Bool(true))
+                } else {
+                    Ok(Value::Bool(true))
+                }
+            }
+            "release" | "__exit__" => {
+                with_host(|h| {
+                    if let Some(PyObj::Lock { count, .. }) = h.get_mut(recv) {
+                        if *count > 0 {
+                            *count -= 1;
+                        }
+                    }
+                });
+                Ok(Value::Undef)
+            }
+            "locked" => Ok(Value::Bool(with_host(|h| {
+                matches!(h.get(recv), Some(PyObj::Lock { count, .. }) if *count > 0)
+            }))),
+            "_is_owned" => Ok(Value::Bool(reentrant
+                && with_host(|h| {
+                    matches!(h.get(recv), Some(PyObj::Lock { count, .. }) if *count > 0)
+                }))),
+            _ => Err(type_error(&format!("'lock' object has no method '{name}'"))),
+        },
         Some(PyObj::Redirect { stderr, target, .. }) => match name {
             "__enter__" => {
                 with_host(|h| {
@@ -10988,6 +11038,31 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                     "redirect_stderr",
                     h.alloc(PyObj::Builtin("contextlib.redirect_stderr".into())),
                 ),
+            ]
+        }),
+        // `_thread` — low-level threading primitives. pythonrs runs user code on
+        // one thread, so the locks are functional but uncontended.
+        "_thread" => with_host(|h| {
+            vec![
+                (
+                    "allocate_lock",
+                    h.alloc(PyObj::Builtin("_thread.allocate_lock".into())),
+                ),
+                ("RLock", h.alloc(PyObj::Builtin("_thread.RLock".into()))),
+                (
+                    "get_ident",
+                    h.alloc(PyObj::Builtin("_thread.get_ident".into())),
+                ),
+                (
+                    "get_native_id",
+                    h.alloc(PyObj::Builtin("_thread.get_native_id".into())),
+                ),
+                (
+                    "start_new_thread",
+                    h.alloc(PyObj::Builtin("_thread.start_new_thread".into())),
+                ),
+                ("error", h.alloc(PyObj::Builtin("RuntimeError".into()))),
+                ("TIMEOUT_MAX", Value::Float(f64::MAX)),
             ]
         }),
         // `itertools` — the iterator toolkit. Lazy iterators build an

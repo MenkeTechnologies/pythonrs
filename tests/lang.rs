@@ -264,6 +264,20 @@ fn string_module_and_string_formatter() {
 }
 
 #[test]
+fn thread_locks() {
+    // Native _thread locks: RLock is reentrant, plain lock tracks state. (Single
+    // user thread, so acquire always succeeds.)
+    assert_eq!(g("import _thread\nlk = _thread.RLock()\nwith lk:\n    x = 42", "x"), "42");
+    assert_eq!(
+        g("import _thread\nl = _thread.allocate_lock()\nl.acquire()\nx = l.locked()", "x"),
+        "True",
+    );
+    assert_eq!(g("import _thread\nx = _thread.get_ident()", "x"), "1");
+    // functools imports on top of _thread.
+    assert_eq!(g("import functools\nx = functools.reduce(lambda a, b: a + b, [1, 2, 3, 4])", "x"), "10");
+}
+
+#[test]
 fn itertools_module() {
     // Lazy iterators (incl. over infinite sources via islice) and combinatorics.
     assert_eq!(g("import itertools as it\nx = list(it.islice(it.count(10, 2), 4))", "x"), "[10, 12, 14, 16]");
