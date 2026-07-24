@@ -352,6 +352,11 @@ const OBJECT_SLOT_WRAPPERS: &[&str] = &[
     "__getattribute__",
     "__format__",
     "__sizeof__",
+    "__reduce__",
+    "__reduce_ex__",
+    "__dir__",
+    "__init_subclass__",
+    "__subclasshook__",
 ];
 
 /// MT19937 — the Mersenne Twister behind CPython's `random`. Seeded via CPython's
@@ -3223,6 +3228,25 @@ impl PyHost {
                 // A type object keys by name (types are singletons by name).
                 Some(PyObj::Class(n)) => PKey::Class(n.clone()),
                 Some(PyObj::Builtin(n)) => PKey::Class(n.clone()),
+                // Functions/methods/other callables hash by identity (heap id).
+                Some(
+                    PyObj::Func(_)
+                    | PyObj::BoundMethod { .. }
+                    | PyObj::StaticMethod(_)
+                    | PyObj::ClassMethod(_)
+                    | PyObj::Module { .. }
+                    | PyObj::Code { .. }
+                    | PyObj::Lock { .. },
+                ) => {
+                    let id = match v {
+                        Value::Obj(i) => *i,
+                        _ => 0,
+                    };
+                    PKey::Instance {
+                        hash: id as i64,
+                        id,
+                    }
+                }
                 Some(PyObj::Ellipsis) => PKey::Singleton(0),
                 Some(PyObj::NotImplemented) => PKey::Singleton(1),
                 Some(PyObj::Instance(inst)) => {
