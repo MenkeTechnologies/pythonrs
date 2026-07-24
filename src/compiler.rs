@@ -791,9 +791,21 @@ impl Compiler {
         orelse: &[Stmt],
     ) -> Result<(), String> {
         // Native fast path: a slot-safe integer `while` (no else) lowers to a
-        // native loop over fusevm slots (native comparison + Add/Sub/Mul).
-        if orelse.is_empty() && self.try_compile_native_while(b, test, body)? {
-            return Ok(());
+        // native loop over fusevm slots (native comparison + Add/Sub/Mul). Like
+        // the counted loop it type-guards the values it seeds slots with, and the
+        // code below doubles as the generic version those guards fall back to.
+        let mut versioned: Option<NativeForPlan> = None;
+        if orelse.is_empty() {
+            if let Some(plan) = self.try_compile_native_while(b, test, body)? {
+                if plan.skip_generic.is_none() {
+                    return Ok(());
+                }
+                let generic_start = b.current_pos();
+                for j in &plan.guard_jumps {
+                    b.patch_jump(*j, generic_start);
+                }
+                versioned = Some(plan);
+            }
         }
         if loop_needs_signal(body) {
             return self.compile_while_signal(b, test, body, orelse);
@@ -821,6 +833,12 @@ impl Compiler {
         for br in ctx.breaks {
             b.patch_jump(br, end);
         }
+        if let Some(plan) = versioned {
+            if let Some(j) = plan.skip_generic {
+                let after_generic = b.current_pos();
+                b.patch_jump(j, after_generic);
+            }
+        }
         Ok(())
     }
 
@@ -844,24 +862,24 @@ impl Compiler {
         target: &Expr,
         iter: &Expr,
         body: &[Stmt],
-    ) -> Result<bool, String> {
+    ) -> Result<Option<NativeForPlan>, String> {
         // Only the OUTERMOST loop of a nest reaches here (nested loops are emitted
         // directly by `emit_native_range_loop`), so `native_slots` must be inactive.
         if self.native_slots.is_some() {
-            return Ok(false);
+            return Ok(None);
         }
         let target_name = match target.unspanned() {
             Expr::Name(n) => n.clone(),
-            _ => return Ok(false),
+            _ => return Ok(None),
         };
         let (start_expr, stop_expr, step) = match native_range_call(iter) {
             Some(b) => b,
-            None => return Ok(false),
+            None => return Ok(None),
         };
         // A locally-rebound `range` is not the builtin — bail (rare). The check is
         // scope-wide, so it covers every `range(...)` in the nest.
         if self.func_scopes.iter().any(|s| s.contains("range")) {
-            return Ok(false);
+            return Ok(None);
         }
 
         // Validate + collect the whole nest. `loop_vars` are bound by loops (get
@@ -873,15 +891,18 @@ impl Compiler {
         // The outer bounds are evaluated before any loop variable is bound, so no
         // name is provably an integer there (`int_names` is empty).
         if let Some(e) = start_expr {
-            if !native_safe_value(e, &mut reads, &[]) {
-                return Ok(false);
+            if !native_safe_value(e, &mut reads, IntNames::Only(&[])) {
+                return Ok(None);
             }
         }
-        if !native_safe_value(stop_expr, &mut reads, &[]) {
-            return Ok(false);
+        if !native_safe_value(stop_expr, &mut reads, IntNames::Only(&[])) {
+            return Ok(None);
         }
-        if !analyze_native_tree(body, &mut loop_vars, &mut reads, &mut writes) {
-            return Ok(false);
+        // The body runs behind the preamble's `IS_INT` guards, so every name it
+        // reads is an integer there (`IntNames::All`) — the bounds above, which
+        // are evaluated before those guards, get no such assumption.
+        if !analyze_native_tree(body, &mut loop_vars, &mut reads, &mut writes, IntNames::All) {
+            return Ok(None);
         }
         // Namespace loads = names read before being written (definite-assignment).
         let mut defined = vec![target_name.clone()];
@@ -890,7 +911,7 @@ impl Compiler {
         // For-range write-backs sit behind the empty-range guard, so an
         // unconditionally-`defined` name is valid too.
         if !native_writebacks_valid(&writes, &load_names, &defined, &loop_vars, true) {
-            return Ok(false);
+            return Ok(None);
         }
 
         // Slot assignment: every distinct local name gets a slot; loop `stop`
@@ -934,10 +955,30 @@ impl Compiler {
 
         self.native_slots = Some(slots);
         self.native_next_slot = next;
-        let res = self.emit_loop_core(b, target_slot, outer_stop_slot, step, body, &ns_loads, &wb);
+        let mut guard_jumps = Vec::new();
+        let res = self.emit_loop_core(
+            b,
+            target_slot,
+            outer_stop_slot,
+            step,
+            body,
+            &ns_loads,
+            &wb,
+            &mut guard_jumps,
+        );
         self.native_slots = None;
         res?;
-        Ok(true)
+        // Guards were emitted: the caller must follow this with a generic copy of
+        // the loop for them to land in, and patch `skip_generic` past it.
+        let skip_generic = if guard_jumps.is_empty() {
+            None
+        } else {
+            Some(b.emit(Op::Jump(0), 0))
+        };
+        Ok(Some(NativeForPlan {
+            guard_jumps,
+            skip_generic,
+        }))
     }
 
     /// Emit a nested native range loop (called only while `native_slots` is
@@ -965,7 +1006,7 @@ impl Compiler {
         b.emit(Op::SetSlot(target_slot), 0);
         self.compile_expr(b, stop_expr)?;
         b.emit(Op::SetSlot(stop_slot), 0);
-        self.emit_loop_core(b, target_slot, stop_slot, step, body, &[], &[])
+        self.emit_loop_core(b, target_slot, stop_slot, step, body, &[], &[], &mut Vec::new())
     }
 
     /// The shared counted-loop body: entry guard (empty range skips everything),
@@ -982,6 +1023,7 @@ impl Compiler {
         body: &[Stmt],
         ns_loads: &[(String, u16)],
         ns_writebacks: &[(String, u16)],
+        guard_jumps: &mut Vec<usize>,
     ) -> Result<(), String> {
         // Ascending ranges test `i < stop`, descending `i > stop`.
         let cmp = if step > 0 { Op::NumLt } else { Op::NumGt };
@@ -994,6 +1036,17 @@ impl Compiler {
             self.name_const(b, name);
             b.emit(Op::CallBuiltin(ops::GETLOCAL, 1), 0);
             b.emit(Op::SetSlot(*slot), 0);
+        }
+        // Type guards on the seeded slots, once, in the preamble. Everything the
+        // body does assumes those values are integers — that is what lets the
+        // arithmetic lower to native ops at all — and nothing about a namespace
+        // read proves it. A failing guard jumps to the generic copy of the loop
+        // the caller emits (`compile_for`), so the fast path can assume ints
+        // instead of the compiler having to prove them (see `IntNames::All`).
+        for (_, slot) in ns_loads {
+            b.emit(Op::GetSlot(*slot), 0);
+            b.emit(Op::CallBuiltin(ops::IS_INT, 1), 0);
+            guard_jumps.push(b.emit(Op::JumpIfFalse(0), 0));
         }
 
         let top = b.current_pos();
@@ -1271,21 +1324,25 @@ impl Compiler {
         b: &mut ChunkBuilder,
         test: &Expr,
         body: &[Stmt],
-    ) -> Result<bool, String> {
+    ) -> Result<Option<NativeForPlan>, String> {
         if self.native_slots.is_some() || loop_needs_signal(body) {
-            return Ok(false);
+            return Ok(None);
         }
         if self.func_scopes.iter().any(|s| s.contains("range")) {
-            return Ok(false);
+            return Ok(None);
         }
         let mut loop_vars: Vec<String> = Vec::new();
         let mut reads: Vec<String> = Vec::new();
         let mut writes: Vec<String> = Vec::new();
-        if !native_safe_cond(test, &mut reads, &[]) {
-            return Ok(false);
+        // The condition is re-tested INSIDE the guarded region, so it may assume
+        // integers too — the guards run before the first test.
+        if !native_safe_cond(test, &mut reads, IntNames::All) {
+            return Ok(None);
         }
-        if !analyze_native_tree(body, &mut loop_vars, &mut reads, &mut writes) {
-            return Ok(false);
+        // Behind the same `IS_INT` preamble guards the counted loop uses, so the
+        // body may assume every name it reads is an integer.
+        if !analyze_native_tree(body, &mut loop_vars, &mut reads, &mut writes, IntNames::All) {
+            return Ok(None);
         }
         // A `while` has no guard-gated write-back (it can run zero times), so every
         // written name must be read-before-write — loaded before the loop — for its
@@ -1295,7 +1352,7 @@ impl Compiler {
         reads_needing_load(test, &defined, &mut load_names);
         collect_ns_loads(body, &mut defined, &mut load_names);
         if !native_writebacks_valid(&writes, &load_names, &defined, &loop_vars, false) {
-            return Ok(false);
+            return Ok(None);
         }
 
         let mut slots: HashMap<String, u16> = HashMap::new();
@@ -1326,6 +1383,14 @@ impl Compiler {
             b.emit(Op::CallBuiltin(ops::GETLOCAL, 1), 0);
             b.emit(Op::SetSlot(*slot), 0);
         }
+        // Type-guard the seeded slots, exactly as the counted loop does; a
+        // failure jumps to the generic copy `compile_while` emits after this.
+        let mut guard_jumps = Vec::new();
+        for (_, slot) in &ns_loads {
+            b.emit(Op::GetSlot(*slot), 0);
+            b.emit(Op::CallBuiltin(ops::IS_INT, 1), 0);
+            guard_jumps.push(b.emit(Op::JumpIfFalse(0), 0));
+        }
         let res = self.emit_native_while(b, test, body);
         if res.is_ok() {
             for (name, slot) in &wb {
@@ -1338,7 +1403,15 @@ impl Compiler {
         }
         self.native_slots = None;
         res?;
-        Ok(true)
+        let skip_generic = if guard_jumps.is_empty() {
+            None
+        } else {
+            Some(b.emit(Op::Jump(0), 0))
+        };
+        Ok(Some(NativeForPlan {
+            guard_jumps,
+            skip_generic,
+        }))
     }
 
     fn compile_for(
@@ -1353,8 +1426,23 @@ impl Compiler {
         // arithmetic lowers to a native counted loop (fusevm slots + Add/Sub/Mul),
         // no iterator protocol and no per-name env-dict dispatch. Only when there
         // is no `else` clause and no signal-crossing body.
-        if orelse.is_empty() && !loop_needs_signal(body) && self.try_compile_native_range_for(b, target, iter, body)? {
-            return Ok(());
+        //
+        // When that loop seeds slots from the namespace it guards their types,
+        // and the code below doubles as the generic version those guards fall
+        // back to (loop versioning) — so this returns early only when the native
+        // form needed no guards at all.
+        let mut versioned: Option<NativeForPlan> = None;
+        if orelse.is_empty() && !loop_needs_signal(body) {
+            if let Some(plan) = self.try_compile_native_range_for(b, target, iter, body)? {
+                if plan.skip_generic.is_none() {
+                    return Ok(());
+                }
+                let generic_start = b.current_pos();
+                for j in &plan.guard_jumps {
+                    b.patch_jump(*j, generic_start);
+                }
+                versioned = Some(plan);
+            }
         }
         if loop_needs_signal(body) {
             return self.compile_for_signal(b, target, iter, body, orelse);
@@ -1392,6 +1480,13 @@ impl Compiler {
         b.patch_jump(jafter, end);
         for br in ctx.breaks {
             b.patch_jump(br, break_target);
+        }
+        // Land the native version's skip-jump past this generic copy.
+        if let Some(plan) = versioned {
+            if let Some(j) = plan.skip_generic {
+                let after_generic = b.current_pos();
+                b.patch_jump(j, after_generic);
+            }
         }
         Ok(())
     }
@@ -4189,16 +4284,39 @@ fn native_arith_op(op: BinOp) -> Option<Op> {
     }
 }
 
+/// Which names a native-loop analysis may assume hold integers.
+///
+/// Inside a loop body the answer is `All`: `emit_loop_core` guards every value it
+/// seeds a slot with (`ops::IS_INT`) and jumps to the generic copy of the loop if
+/// one is not an integer, so the body is only ever reached with integer slots.
+/// Expressions evaluated before those guards run — the range bounds — get `Only`,
+/// listing the loop variables already bound (none, for the outermost bounds).
+#[derive(Clone, Copy)]
+enum IntNames<'a> {
+    All,
+    Only(&'a [String]),
+}
+
+impl IntNames<'_> {
+    fn contains(&self, name: &str) -> bool {
+        match self {
+            IntNames::All => true,
+            IntNames::Only(names) => names.iter().any(|n| n == name),
+        }
+    }
+}
+
 /// A native-loop body value expression: only int literals, names, unary `+`/`-`,
 /// `+`/`-`/`*` binops, and `%` by an integer literal over a provably-integer
 /// dividend (`provably_int`) are allowed (each name read is appended to `reads`).
 /// Anything else — a call, comparison, subscript, attribute, float, `/`, `//`,
 /// `**`, etc. — returns `false`, disqualifying the whole loop.
 ///
-/// `int_names` are the names known to hold an integer at this point (the loop
-/// variables bound by the enclosing native counted loops); a name read from the
-/// namespace could hold anything, so it does not qualify as a `%` dividend.
-fn native_safe_value(e: &Expr, reads: &mut Vec<String>, int_names: &[String]) -> bool {
+/// `int_names` says which names are known to hold an integer here: `All` inside a
+/// loop body, where `emit_loop_core` type-guards every namespace value it seeds a
+/// slot with, and `Only` for expressions evaluated BEFORE those guards run (the
+/// range bounds), where a namespace read could still hold anything.
+fn native_safe_value(e: &Expr, reads: &mut Vec<String>, int_names: IntNames) -> bool {
     match e.unspanned() {
         Expr::Int(_) => true,
         Expr::Name(n) => {
@@ -4234,10 +4352,10 @@ fn native_safe_value(e: &Expr, reads: &mut Vec<String>, int_names: &[String]) ->
 /// an int (it could be a `str`, whose `%` is formatting, or a float, or an
 /// instance with `__mod__`) — `emit_native_mod`'s remainder correction compares
 /// the result against `0`, which only types the numeric hook orders can survive.
-fn provably_int(e: &Expr, int_names: &[String]) -> bool {
+fn provably_int(e: &Expr, int_names: IntNames) -> bool {
     match e.unspanned() {
         Expr::Int(_) => true,
-        Expr::Name(n) => int_names.iter().any(|v| v == n),
+        Expr::Name(n) => int_names.contains(n),
         Expr::UnaryOp(UnOp::Neg | UnOp::Pos, inner) => provably_int(inner, int_names),
         Expr::BinOp(BinOp::Mod, l, r) => {
             native_mod_divisor(r).is_some() && provably_int(l, int_names)
@@ -4249,6 +4367,20 @@ fn provably_int(e: &Expr, int_names: &[String]) -> bool {
         }
         _ => false,
     }
+}
+
+/// What `try_compile_native_range_for` emitted, when it emitted anything.
+///
+/// A native loop that seeds slots from the namespace guards their types once, in
+/// its preamble (`emit_loop_core`). Because a guard can fail, the caller emits a
+/// GENERIC copy of the same loop right after the native one — loop versioning —
+/// and patches the jumps here: `guard_jumps` land at the start of that copy, and
+/// `skip_generic` jumps over it when the native version ran. A loop that seeds
+/// nothing from the namespace (every name is a loop variable) needs no guards,
+/// no copy, and leaves `skip_generic` `None`.
+struct NativeForPlan {
+    guard_jumps: Vec<usize>,
+    skip_generic: Option<usize>,
 }
 
 /// The two operands of `e` when it is a product, for the `(a*b + c) % k` fusion.
@@ -4347,7 +4479,7 @@ fn native_cmp_op(op: CmpOp) -> Option<Op> {
 /// A native-safe loop/branch condition: a single (non-chained) arithmetic
 /// comparison of native-safe integer operands, or a native-safe integer
 /// expression used for truthiness. Collects the names it reads.
-fn native_safe_cond(test: &Expr, reads: &mut Vec<String>, int_names: &[String]) -> bool {
+fn native_safe_cond(test: &Expr, reads: &mut Vec<String>, int_names: IntNames) -> bool {
     match test.unspanned() {
         Expr::Compare(lhs, rest) if rest.len() == 1 && native_cmp_op(rest[0].0).is_some() => {
             native_safe_value(lhs, reads, int_names)
@@ -4369,8 +4501,9 @@ fn analyze_native_tree(
     loop_vars: &mut Vec<String>,
     reads: &mut Vec<String>,
     writes: &mut Vec<String>,
+    int_names: IntNames,
 ) -> bool {
-    analyze_native_tree_at(body, false, loop_vars, reads, writes)
+    analyze_native_tree_at(body, false, loop_vars, reads, writes, int_names)
 }
 
 /// `conditional` is true inside an `if`/`while` body: a `for` there is rejected
@@ -4383,6 +4516,7 @@ fn analyze_native_tree_at(
     loop_vars: &mut Vec<String>,
     reads: &mut Vec<String>,
     writes: &mut Vec<String>,
+    int_names: IntNames,
 ) -> bool {
     for s in body {
         match &s.kind {
@@ -4398,7 +4532,7 @@ fn analyze_native_tree_at(
                 if loop_vars.iter().any(|v| v == name) {
                     return false; // must not rebind a loop variable
                 }
-                if !native_safe_value(value, reads, loop_vars) {
+                if !native_safe_value(value, reads, int_names) {
                     return false;
                 }
                 push_unique(writes, name);
@@ -4412,17 +4546,17 @@ fn analyze_native_tree_at(
                     return false;
                 }
                 push_unique(reads, name); // `x op= v` reads x
-                if !native_safe_value(value, reads, loop_vars) {
+                if !native_safe_value(value, reads, int_names) {
                     return false;
                 }
                 push_unique(writes, name);
             }
             StmtKind::If { test, body: tb, orelse } => {
-                if !native_safe_cond(test, reads, loop_vars) {
+                if !native_safe_cond(test, reads, int_names) {
                     return false;
                 }
-                if !analyze_native_tree_at(tb, true, loop_vars, reads, writes)
-                    || !analyze_native_tree_at(orelse, true, loop_vars, reads, writes)
+                if !analyze_native_tree_at(tb, true, loop_vars, reads, writes, int_names)
+                    || !analyze_native_tree_at(orelse, true, loop_vars, reads, writes, int_names)
                 {
                     return false;
                 }
@@ -4431,11 +4565,11 @@ fn analyze_native_tree_at(
                 if !orelse.is_empty() || loop_needs_signal(wb) {
                     return false;
                 }
-                if !native_safe_cond(test, reads, loop_vars) {
+                if !native_safe_cond(test, reads, int_names) {
                     return false;
                 }
                 // A `while` re-tests its condition, so its body is conditional.
-                if !analyze_native_tree_at(wb, true, loop_vars, reads, writes) {
+                if !analyze_native_tree_at(wb, true, loop_vars, reads, writes, int_names) {
                     return false;
                 }
             }
@@ -4458,16 +4592,16 @@ fn analyze_native_tree_at(
                     None => return false,
                 };
                 if let Some(e) = start {
-                    if !native_safe_value(e, reads, loop_vars) {
+                    if !native_safe_value(e, reads, int_names) {
                         return false;
                     }
                 }
-                if !native_safe_value(stop, reads, loop_vars) {
+                if !native_safe_value(stop, reads, int_names) {
                     return false;
                 }
                 push_unique(loop_vars, &tname);
                 push_unique(writes, &tname);
-                if !analyze_native_tree_at(inner, false, loop_vars, reads, writes) {
+                if !analyze_native_tree_at(inner, false, loop_vars, reads, writes, int_names) {
                     return false;
                 }
             }

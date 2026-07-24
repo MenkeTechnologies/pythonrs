@@ -64,6 +64,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::IMPORT_STAR, b_import_star);
     vm.register_builtin(ops::IMPORT_RELATIVE, b_import_relative);
     vm.register_builtin(ops::TRY_ANNOTATION, b_try_annotation);
+    vm.register_builtin(ops::IS_INT, b_is_int);
     vm.register_builtin(ops::UNPACK, b_unpack);
     vm.register_builtin(ops::BINOP, b_binop);
     vm.register_builtin(ops::INPLACE, b_inplace);
@@ -1031,6 +1032,23 @@ fn py_bool(v: &Value) -> Result<bool, String> {
         return Ok(crate::ffi::truthy(fid));
     }
     Ok(with_host(|h| h.truthy(v)))
+}
+
+/// `IS_INT` — the type guard a native counted loop emits over the values it
+/// seeds its slots with (see `compiler::emit_int_guards`). True only for values
+/// the loop's integer lowering is exact on: a fixnum or a host bignum.
+///
+/// `bool` is deliberately excluded. It is an `int` to Python, but a slot holding
+/// one would be written back as an `int`, changing `repr(x)` from `True` to `1`
+/// for a name the loop never actually modified.
+fn b_is_int(vm: &mut VM, _: u8) -> Value {
+    let v = vm.pop();
+    let is_int = match v {
+        Value::Int(_) => true,
+        Value::Obj(_) => with_host(|h| matches!(h.get(&v), Some(PyObj::BigInt(_)))),
+        _ => false,
+    };
+    Value::Bool(is_int)
 }
 
 fn b_truthy(vm: &mut VM, _: u8) -> Value {

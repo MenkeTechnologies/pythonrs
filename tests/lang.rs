@@ -781,6 +781,56 @@ fn fused_modular_arithmetic_matches_exact_python() {
     assert_eq!(g("y = 3.5\nx = (y * -3) % 7", "x"), "3.5");
 }
 
+// A native loop assumes the values it seeds its slots with are integers, and
+// guards that assumption once in its preamble (`ops::IS_INT`). When a guard
+// fails, a generic copy of the same loop runs instead — loop versioning. These
+// pin the fallback: every case below seeds a native-shaped loop with something
+// that is NOT an int, so the generic copy has to produce Python's answer for it.
+#[test]
+fn native_loop_type_guard_falls_back_to_the_generic_copy() {
+    // `str * int` is repetition, not arithmetic.
+    assert_eq!(
+        g("s = 'a'\nfor i in range(3): s = s * 2\nx = s", "x"),
+        "'aaaaaaaa'"
+    );
+    // `str % int` is formatting — the case the guard exists for, since the
+    // native path's remainder handling would compare the result against 0.
+    assert_eq!(
+        g("t = 'x=%d'\nfor i in range(1): t = t % 7\nx = t", "x"),
+        "'x=7'"
+    );
+    assert_eq!(g("f = 1.5\nfor i in range(4): f = f * 2\nx = f", "x"), "24.0");
+    assert_eq!(
+        g("l = [1]\nfor i in range(3): l = l * 2\nx = len(l)", "x"),
+        "8"
+    );
+    // A `bool` seed is excluded deliberately: it is an int to Python, but the
+    // loop would write an `int` back, changing `repr` for an untouched name.
+    assert_eq!(
+        g("b = True\nfor i in range(3): b = b + i\nx = b", "x"),
+        "4"
+    );
+    // The loop variable's last-value binding survives the fallback.
+    assert_eq!(
+        g("u = 'q'\nfor i in range(5): u = u + 'z'\nx = (i, u)", "x"),
+        "(4, 'qzzzzz')"
+    );
+    // An integer-seeded loop after a guard-failing one still takes the fast path.
+    assert_eq!(
+        g("s = 'a'\nfor i in range(2): s = s * 2\nn = 0\nfor i in range(100): n += i % 7\nx = n", "x"),
+        "295"
+    );
+    // `while` loops are versioned the same way.
+    assert_eq!(
+        g("s = 'ab'\nc = 0\nwhile c < 3:\n    s = s * 2\n    c += 1\nx = (s, c)", "x"),
+        "('abababababababab', 3)"
+    );
+    assert_eq!(
+        g("f = 1.0\nd = 0\nwhile d < 4:\n    f = f * 3\n    d += 1\nx = f", "x"),
+        "81.0"
+    );
+}
+
 #[test]
 fn bignum_promotion() {
     assert_eq!(g("x = 2 ** 64", "x"), "18446744073709551616");

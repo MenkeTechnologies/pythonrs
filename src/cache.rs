@@ -99,10 +99,15 @@ use std::path::PathBuf;
 /// v31: a `def`/`lambda` with annotations compiles them as a `<annotate>` thunk
 /// (MKFUNC evaluates it with forward-reference NameErrors caught) instead of an
 /// inline dict, so annotated-function bytecode differs.
+/// v39: a native counted loop type-guards the values it seeds slots with and is
+/// emitted alongside a generic copy to fall back to (loop versioning), so any
+/// loop that reads a namespace name compiles to different bytecode.
+/// v38: `(a*b) % k` / `(a*b + c) % k` fuse into fusevm `MulModFloor` /
+/// `MulAddModFloor`, changing the emitted ops for those expressions.
 /// v37: `%` by an integer literal inside a native slot loop lowers to native
 /// `Mod` + a branchless floor correction instead of the `BINOP` host call, so
 /// loops containing `%` emit different bytecode (and now qualify as native).
-const SCHEMA: u64 = 38;
+const SCHEMA: u64 = 39;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]
