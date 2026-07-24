@@ -335,7 +335,7 @@ fn random_matches_cpython() {
     assert_eq!(g("import random\nrandom.seed(42)\nx = random.getrandbits(64)", "x"), "2053695854357871005");
     assert_eq!(
         g("import random\nrandom.seed(42)\nx = random.sample(range(100), 3)", "x"),
-        "[3, 94, 35]",
+        "[81, 14, 3]",
     );
 }
 
