@@ -698,6 +698,45 @@ fn arithmetic_and_precedence() {
     assert_eq!(g("x = -3 + 2 * 4", "x"), "5");
 }
 
+// `%` by an integer literal inside a counted loop lowers to native `Mod` plus a
+// branchless floor correction (compiler::emit_native_mod) instead of the host
+// `BINOP` call. Native `Mod` truncates like C, so every case where Python's
+// floored `%` disagrees with truncation has to be pinned — a negative dividend,
+// a negative divisor, and both at once. The loops are long enough to be JIT
+// -compiled, so these run as native code, not through the interpreter.
+#[test]
+fn native_modulo_in_loops_matches_floored_semantics() {
+    // Positive operands: truncation and flooring agree.
+    assert_eq!(g("s = 0\nfor i in range(200): s += i % 7\nx = s", "x"), "594");
+    // Negative dividend, positive divisor: result must be in [0, k).
+    assert_eq!(
+        g("s = 0\nfor i in range(-200, 0): s += i % 7\nx = s", "x"),
+        "606"
+    );
+    // Negative divisor: result must be in (k, 0].
+    assert_eq!(
+        g("s = 0\nfor i in range(-200, 200): s += i % -7\nx = s", "x"),
+        "-1201"
+    );
+    // `%` feeding a condition stays exact (the branchless-accumulation path).
+    assert_eq!(
+        g(
+            "c = 0\nfor i in range(-300, 300):\n    if i % 3 == 0:\n        c += 1\nx = c",
+            "x"
+        ),
+        "200"
+    );
+    // A dividend that leaves i64 mid-loop: the native path must hand off to the
+    // bignum hook rather than wrap. 3000000000**3 is well past 2**63.
+    assert_eq!(
+        g(
+            "s = 0\nfor i in range(3000000000, 3000000200): s += (i * i * i) % 1000000007\nx = s",
+            "x"
+        ),
+        "21253743547"
+    );
+}
+
 #[test]
 fn bignum_promotion() {
     assert_eq!(g("x = 2 ** 64", "x"), "18446744073709551616");

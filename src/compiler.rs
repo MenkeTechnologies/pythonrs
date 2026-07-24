@@ -870,12 +870,14 @@ impl Compiler {
         let mut loop_vars = vec![target_name.clone()];
         let mut reads: Vec<String> = Vec::new();
         let mut writes = vec![target_name.clone()];
+        // The outer bounds are evaluated before any loop variable is bound, so no
+        // name is provably an integer there (`int_names` is empty).
         if let Some(e) = start_expr {
-            if !native_safe_value(e, &mut reads) {
+            if !native_safe_value(e, &mut reads, &[]) {
                 return Ok(false);
             }
         }
-        if !native_safe_value(stop_expr, &mut reads) {
+        if !native_safe_value(stop_expr, &mut reads, &[]) {
             return Ok(false);
         }
         if !analyze_native_tree(body, &mut loop_vars, &mut reads, &mut writes) {
@@ -1105,6 +1107,42 @@ impl Compiler {
         None
     }
 
+    /// Emit `<dividend> % <k>` as native ops instead of the `BINOP`/`MOD` host
+    /// call, for a compile-time integer literal `k` (`|k| >= 2`, see
+    /// `native_mod_divisor`). `Op::Mod` is C-style truncating (`-7 % 3 == -1`)
+    /// where Python floors (`-7 % 3 == 2`), so the remainder is corrected
+    /// BRANCHLESSLY — `r + (r sign-disagrees-with k) * k` — keeping the loop body
+    /// free of forward branches so the tracing JIT still records it.
+    ///
+    /// Correct on all three paths `Op::Mod` can take:
+    /// - two native ints: `checked_rem` (truncating) + the correction == Python;
+    /// - an operand outside `i64` (a bignum from an overflowed accumulator): the
+    ///   op delegates to pythonrs's numeric hook, which already returns the
+    ///   floored result — in `[0,k)` for `k > 0` — so the correction adds `0`;
+    /// - a float dividend: Rust's `%` truncates like C, and the same correction
+    ///   floors it. The correction's `+ 0` also normalizes `-0.0` to `0.0`,
+    ///   matching CPython's `-4.0 % 2 == 0.0`.
+    ///
+    /// `|k| >= 2` excludes `k == 0` (`Op::Mod` yields `0` natively but Python
+    /// raises `ZeroDivisionError`) and `|k| == 1` (whose result is always `0`,
+    /// and whose native `srem(i64::MIN, -1)` would trap in the JIT).
+    fn emit_native_mod(&mut self, b: &mut ChunkBuilder, dividend: &Expr, k: i64) -> Result<(), String> {
+        self.compile_expr(b, dividend)?;
+        b.emit(Op::LoadInt(k), 0);
+        let idx = b.emit(Op::Mod, self.cur_line);
+        self.record_span(idx);
+        // [r] -> [r, r] -> [r, r <sign-disagrees> 0] -> [r, 0|1] -> [r, 0|k] -> [r']
+        b.emit(Op::Dup, 0);
+        b.emit(Op::LoadInt(0), 0);
+        b.emit(if k > 0 { Op::NumLt } else { Op::NumGt }, 0);
+        b.emit(Op::LoadInt(1), 0); // bool -> Int (arithmetic on a Kind::Bool deopts)
+        b.emit(Op::BitAnd, 0);
+        b.emit(Op::LoadInt(k), 0);
+        b.emit(Op::Mul, 0);
+        b.emit(Op::Add, 0);
+        Ok(())
+    }
+
     /// Push a native boolean for a validated native condition (see
     /// `native_safe_cond`): a single arithmetic comparison (`NumLt`/`NumEq`/…), or
     /// the truthiness of an integer expression (`x != 0`). No `TRUTHY` builtin, so
@@ -1198,7 +1236,7 @@ impl Compiler {
         let mut loop_vars: Vec<String> = Vec::new();
         let mut reads: Vec<String> = Vec::new();
         let mut writes: Vec<String> = Vec::new();
-        if !native_safe_cond(test, &mut reads) {
+        if !native_safe_cond(test, &mut reads, &[]) {
             return Ok(false);
         }
         if !analyze_native_tree(body, &mut loop_vars, &mut reads, &mut writes) {
@@ -2454,6 +2492,15 @@ impl Compiler {
         l: &Expr,
         r: &Expr,
     ) -> Result<(), String> {
+        // Native `%` by an integer literal, inside a native slot loop only — the
+        // loop's analysis (`native_safe_value`) has proved the dividend is an
+        // integer there, which the branchless floor correction below requires.
+        if matches!(op, BinOp::Mod) && self.native_slots.is_some() {
+            if let Some(k) = native_mod_divisor(r) {
+                self.emit_native_mod(b, l, k)?;
+                return Ok(());
+            }
+        }
         // Native fast path for + - * (JIT-traceable); everything else dispatches.
         let tag = match op {
             BinOp::Add => {
@@ -4098,10 +4145,15 @@ fn native_arith_op(op: BinOp) -> Option<Op> {
 }
 
 /// A native-loop body value expression: only int literals, names, unary `+`/`-`,
-/// and `+`/`-`/`*` binops are allowed (each name read is appended to `reads`).
+/// `+`/`-`/`*` binops, and `%` by an integer literal over a provably-integer
+/// dividend (`provably_int`) are allowed (each name read is appended to `reads`).
 /// Anything else — a call, comparison, subscript, attribute, float, `/`, `//`,
-/// `%`, `**`, etc. — returns `false`, disqualifying the whole loop.
-fn native_safe_value(e: &Expr, reads: &mut Vec<String>) -> bool {
+/// `**`, etc. — returns `false`, disqualifying the whole loop.
+///
+/// `int_names` are the names known to hold an integer at this point (the loop
+/// variables bound by the enclosing native counted loops); a name read from the
+/// namespace could hold anything, so it does not qualify as a `%` dividend.
+fn native_safe_value(e: &Expr, reads: &mut Vec<String>, int_names: &[String]) -> bool {
     match e.unspanned() {
         Expr::Int(_) => true,
         Expr::Name(n) => {
@@ -4110,13 +4162,52 @@ fn native_safe_value(e: &Expr, reads: &mut Vec<String>) -> bool {
             }
             true
         }
-        Expr::UnaryOp(UnOp::Neg | UnOp::Pos, inner) => native_safe_value(inner, reads),
+        Expr::UnaryOp(UnOp::Neg | UnOp::Pos, inner) => native_safe_value(inner, reads, int_names),
+        Expr::BinOp(BinOp::Mod, l, r) => {
+            native_mod_divisor(r).is_some()
+                && provably_int(l, int_names)
+                && native_safe_value(l, reads, int_names)
+        }
         Expr::BinOp(op, l, r) => {
             native_arith_op(*op).is_some()
-                && native_safe_value(l, reads)
-                && native_safe_value(r, reads)
+                && native_safe_value(l, reads, int_names)
+                && native_safe_value(r, reads, int_names)
         }
         _ => false,
+    }
+}
+
+/// Whether `e` is guaranteed to evaluate to a Python `int` (fixnum or bignum):
+/// an integer literal, a name bound by an enclosing native counted loop, or
+/// `+`/`-`/`*`/`%`/unary-sign over those. A bare namespace name is NOT provably
+/// an int (it could be a `str`, whose `%` is formatting, or a float, or an
+/// instance with `__mod__`) — `emit_native_mod`'s remainder correction compares
+/// the result against `0`, which only types the numeric hook orders can survive.
+fn provably_int(e: &Expr, int_names: &[String]) -> bool {
+    match e.unspanned() {
+        Expr::Int(_) => true,
+        Expr::Name(n) => int_names.iter().any(|v| v == n),
+        Expr::UnaryOp(UnOp::Neg | UnOp::Pos, inner) => provably_int(inner, int_names),
+        Expr::BinOp(BinOp::Mod, l, r) => {
+            native_mod_divisor(r).is_some() && provably_int(l, int_names)
+        }
+        Expr::BinOp(op, l, r) => {
+            native_arith_op(*op).is_some()
+                && provably_int(l, int_names)
+                && provably_int(r, int_names)
+        }
+        _ => false,
+    }
+}
+
+/// The divisor of a natively-lowerable `%`: a literal integer with `|k| >= 2`.
+/// `0` is excluded because `Op::Mod` yields `0` where Python raises
+/// `ZeroDivisionError`, and `±1` because the result is always `0` anyway and
+/// `srem(i64::MIN, -1)` traps in the JIT. See `emit_native_mod`.
+fn native_mod_divisor(e: &Expr) -> Option<i64> {
+    match literal_int(e) {
+        Some(k) if k.abs() >= 2 => Some(k),
+        _ => None,
     }
 }
 
@@ -4185,12 +4276,13 @@ fn native_cmp_op(op: CmpOp) -> Option<Op> {
 /// A native-safe loop/branch condition: a single (non-chained) arithmetic
 /// comparison of native-safe integer operands, or a native-safe integer
 /// expression used for truthiness. Collects the names it reads.
-fn native_safe_cond(test: &Expr, reads: &mut Vec<String>) -> bool {
+fn native_safe_cond(test: &Expr, reads: &mut Vec<String>, int_names: &[String]) -> bool {
     match test.unspanned() {
         Expr::Compare(lhs, rest) if rest.len() == 1 && native_cmp_op(rest[0].0).is_some() => {
-            native_safe_value(lhs, reads) && native_safe_value(&rest[0].1, reads)
+            native_safe_value(lhs, reads, int_names)
+                && native_safe_value(&rest[0].1, reads, int_names)
         }
-        other => native_safe_value(other, reads),
+        other => native_safe_value(other, reads, int_names),
     }
 }
 
@@ -4235,7 +4327,7 @@ fn analyze_native_tree_at(
                 if loop_vars.iter().any(|v| v == name) {
                     return false; // must not rebind a loop variable
                 }
-                if !native_safe_value(value, reads) {
+                if !native_safe_value(value, reads, loop_vars) {
                     return false;
                 }
                 push_unique(writes, name);
@@ -4249,13 +4341,13 @@ fn analyze_native_tree_at(
                     return false;
                 }
                 push_unique(reads, name); // `x op= v` reads x
-                if !native_safe_value(value, reads) {
+                if !native_safe_value(value, reads, loop_vars) {
                     return false;
                 }
                 push_unique(writes, name);
             }
             StmtKind::If { test, body: tb, orelse } => {
-                if !native_safe_cond(test, reads) {
+                if !native_safe_cond(test, reads, loop_vars) {
                     return false;
                 }
                 if !analyze_native_tree_at(tb, true, loop_vars, reads, writes)
@@ -4268,7 +4360,7 @@ fn analyze_native_tree_at(
                 if !orelse.is_empty() || loop_needs_signal(wb) {
                     return false;
                 }
-                if !native_safe_cond(test, reads) {
+                if !native_safe_cond(test, reads, loop_vars) {
                     return false;
                 }
                 // A `while` re-tests its condition, so its body is conditional.
@@ -4295,11 +4387,11 @@ fn analyze_native_tree_at(
                     None => return false,
                 };
                 if let Some(e) = start {
-                    if !native_safe_value(e, reads) {
+                    if !native_safe_value(e, reads, loop_vars) {
                         return false;
                     }
                 }
-                if !native_safe_value(stop, reads) {
+                if !native_safe_value(stop, reads, loop_vars) {
                     return false;
                 }
                 push_unique(loop_vars, &tname);
