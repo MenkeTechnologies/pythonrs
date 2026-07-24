@@ -6929,6 +6929,18 @@ impl PyHost {
                 Ok(self.new_tuple(cells))
             }
             Some(PyObj::Cell { value }) if name == "cell_contents" => Ok(value.clone()),
+            // `staticmethod.__func__` / `classmethod.__func__` — the wrapped
+            // function (enum's _EnumDict inspects these).
+            Some(PyObj::StaticMethod(inner)) | Some(PyObj::ClassMethod(inner))
+                if name == "__func__" || name == "__wrapped__" =>
+            {
+                Ok(inner.clone())
+            }
+            Some(PyObj::StaticMethod(_)) | Some(PyObj::ClassMethod(_))
+                if name == "__isabstractmethod__" =>
+            {
+                Ok(Value::Bool(false))
+            }
             // A function's writable attribute dict.
             Some(PyObj::Func(_)) if name == "__dict__" => {
                 let id = if let Value::Obj(i) = recv { *i } else { 0 };
@@ -9372,7 +9384,7 @@ pub fn build_class(
         }
     };
     let cls = match &effective_meta {
-        Some(m) => metaclass_create(m, name, &bases, &ns)?,
+        Some(m) => metaclass_create(m, name, &bases, &ns, &class_kwargs)?,
         None => with_host(|h| h.register_class(name, bases, ns.clone())),
     };
     // Record the class's `__qualname__` (carried on the class-body `FuncDef`,
@@ -9439,6 +9451,7 @@ fn metaclass_create(
     name: &str,
     bases: &[String],
     ns: &IndexMap<String, Value>,
+    class_kwargs: &[(String, Value)],
 ) -> Result<Value, String> {
     let name_v = with_host(|h| h.new_str(name.to_string()));
     let base_vals: Vec<Value> = with_host(|h| {
@@ -9448,17 +9461,35 @@ fn metaclass_create(
             .collect()
     });
     let bases_v = with_host(|h| h.new_tuple(base_vals));
-    let ns_map: IndexMap<PKey, (Value, Value)> = with_host(|h| {
-        ns.iter()
-            .map(|(k, v)| {
-                let kv = h.new_str(k.clone());
-                (PKey::Str(k.clone()), (kv, v.clone()))
-            })
-            .collect()
-    });
-    let ns_v = with_host(|h| h.new_dict(ns_map));
     let meta_v = with_host(|h| h.alloc(PyObj::Class(meta.to_string())));
-    invoke(&meta_v, vec![name_v, bases_v, ns_v], vec![])
+    // PEP 3115 `__prepare__`: if the metaclass provides a custom namespace (e.g.
+    // enum's `_EnumDict`), build the class dict THROUGH it — replaying each body
+    // assignment via its `__setitem__` so its bookkeeping (member tracking) runs.
+    let has_prepare = with_host(|h| h.class_lookup(meta, "__prepare__").is_some());
+    let ns_v = if has_prepare {
+        let prepared = call_method(
+            &meta_v,
+            "__prepare__",
+            vec![name_v.clone(), bases_v.clone()],
+            class_kwargs.to_vec(),
+        )?;
+        for (k, v) in ns {
+            let kv = with_host(|h| h.new_str(k.clone()));
+            call_method(&prepared, "__setitem__", vec![kv, v.clone()], vec![])?;
+        }
+        prepared
+    } else {
+        let ns_map: IndexMap<PKey, (Value, Value)> = with_host(|h| {
+            ns.iter()
+                .map(|(k, v)| {
+                    let kv = h.new_str(k.clone());
+                    (PKey::Str(k.clone()), (kv, v.clone()))
+                })
+                .collect()
+        });
+        with_host(|h| h.new_dict(ns_map))
+    };
+    invoke(&meta_v, vec![name_v, bases_v, ns_v], class_kwargs.to_vec())
 }
 
 /// The most-derived metaclass inherited from `bases` (CPython's rule for a class
