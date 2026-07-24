@@ -2923,6 +2923,9 @@ pub fn is_type_like_builtin(name: &str) -> bool {
 /// The stdlib reaches these directly (e.g. functools.lru_cache uses
 /// `cache.__len__`).
 pub fn is_object_dunder_method(name: &str) -> bool {
+    // Note: __eq__/__ne__/__hash__ are NOT here — those have type-specific
+    // NotImplemented semantics (e.g. int.__eq__(str) is NotImplemented) handled
+    // elsewhere; a generic override would break them.
     matches!(
         name,
         "__len__"
@@ -2931,9 +2934,6 @@ pub fn is_object_dunder_method(name: &str) -> bool {
             | "__delitem__"
             | "__iter__"
             | "__contains__"
-            | "__eq__"
-            | "__ne__"
-            | "__hash__"
             | "__str__"
             | "__repr__"
             | "__bool__"
@@ -6934,15 +6934,6 @@ pub fn call_type_method(
             return Ok(Value::Undef);
         }
         "__iter__" => return with_host(|h| h.make_iter(recv)),
-        "__eq__" | "__ne__" => {
-            let o = arg0(&args)?;
-            let eq = with_host(|h| h.equal(recv, &o));
-            return Ok(Value::Bool(if name == "__eq__" { eq } else { !eq }));
-        }
-        "__hash__" => {
-            let k = with_host(|h| h.to_key(recv))?;
-            return Ok(Value::Int(hash_key(&k)));
-        }
         "__str__" => return Ok(with_host(|h| {
             let s = h.str_of(recv);
             h.new_str(s)
