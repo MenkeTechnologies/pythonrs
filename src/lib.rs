@@ -93,6 +93,22 @@ pub fn compile_or_load(src: &str) -> Result<compiler::Program, String> {
     compile_or_load_cacheable(src, true)
 }
 
+/// [`compile_or_load`] that labels a stored entry with `source` (its module
+/// path) instead of the runtime's traceback filename. Imported modules use this
+/// so `--cacheview` attributes each cached blob to the module that produced it,
+/// not the `<string>`/script name of whatever run triggered the import.
+pub fn compile_or_load_labeled(src: &str, source: &str) -> Result<compiler::Program, String> {
+    if !cache::cache_enabled() {
+        return compile(src);
+    }
+    if let Some(prog) = cache::load(src) {
+        return Ok(prog);
+    }
+    let prog = compile(src)?;
+    let _ = cache::store_labeled(src, &prog, source);
+    Ok(prog)
+}
+
 /// [`compile_or_load`] with an explicit cacheability gate. A `-c`/stdin program
 /// (`cacheable == false`) is compiled fresh and NEVER touches the shard: such
 /// one-off snippets are never re-run byte-for-byte, so caching them only bloats

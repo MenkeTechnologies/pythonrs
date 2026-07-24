@@ -12786,7 +12786,9 @@ fn run_vendored_module(name: &str, src: &str, path: &std::path::Path) -> Result<
     });
 
     let run = (|| -> Result<(), String> {
-        let prog = crate::compile_or_load(src)?;
+        // Label the cached entry with the module's own path so `--cacheview`
+        // attributes it to the module, not the `<string>`/script that imported it.
+        let prog = crate::compile_or_load_labeled(src, &path.to_string_lossy())?;
         let chunk = crate::load_merged(prog);
         run_chunk_on(chunk)?;
         Ok(())

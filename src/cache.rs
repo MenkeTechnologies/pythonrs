@@ -377,12 +377,21 @@ pub fn entries() -> Vec<EntryInfo> {
 }
 
 /// Store `prog` (compiled from `src`) into the shard, replacing any prior entry.
+/// The `--cacheview` provenance label defaults to the runtime's traceback
+/// filename (a script path, `<string>`, or `<stdin>`).
 pub fn store(src: &str, prog: &Program) -> Result<(), String> {
+    let source = crate::host::with_host(|h| h.tb_filename.clone());
+    store_labeled(src, prog, &source)
+}
+
+/// [`store`] with an explicit provenance `source` label. Imported modules pass
+/// their own file path here so `--cacheview` shows the module — otherwise every
+/// module compiled during a `python -c` run would inherit the `<string>` label
+/// of that run and the listing would read as `-c` churn instead of real modules.
+pub fn store_labeled(src: &str, prog: &Program, source: &str) -> Result<(), String> {
     let key = key_for(src);
     let verify = verify_for(src);
-    // The source name for `--cacheview` provenance: the traceback filename the
-    // runtime is initialized with (a script path, `<string>`, or `<stdin>`).
-    let source = crate::host::with_host(|h| h.tb_filename.clone());
+    let source = source.to_string();
     let cp = CProg {
         main: prog.main.clone(),
         functions: prog.functions.clone(),
