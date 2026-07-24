@@ -11548,6 +11548,13 @@ fn resolve_relative_anchor(pkg: &str, level: usize) -> Result<String, String> {
 /// default build and only until the native C-accelerator floor is complete — the
 /// `stdlib-ffi` bridge.
 fn import_module_inner(name: &str) -> Result<Value, String> {
+    // `collections.abc` is an alias for the pure-Python `_collections_abc`
+    // module; CPython wires it with `sys.modules['collections.abc'] =
+    // _collections_abc` in collections/__init__. pythonrs serves `collections`
+    // from a native arm (which never runs that line), so alias it here.
+    if name == "collections.abc" {
+        return import_module("_collections_abc");
+    }
     // Native stdlib modules under src/stdlib. Their `entries` return owned-String
     // keys (vs the `&str` keys of the inline arms below), so build the namespace
     // here and return before the `&str` match. These are pure-Python subsets

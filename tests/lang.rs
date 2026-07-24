@@ -378,6 +378,17 @@ except ModuleNotFoundError as e:
     assert_eq!(g(src, "x"), "\"No module named '_sre'\"");
 }
 
+// `collections.abc` is the pure-Python `_collections_abc` module (CPython aliases
+// it via `sys.modules['collections.abc'] = _collections_abc`); pythonrs serves
+// `collections` from a native arm, so the alias is wired in the importer.
+#[cfg(not(feature = "stdlib-ffi"))]
+#[test]
+fn collections_abc_alias() {
+    let src = "from collections.abc import Mapping, Sequence, Iterable\n\
+               x = (issubclass(dict, Mapping), issubclass(list, Sequence), isinstance((), Iterable))";
+    assert_eq!(g(src, "x"), "(True, True, True)");
+}
+
 // A module whose body fails mid-import is NOT left cached as a broken shell: a
 // retry re-runs the body and re-raises (CPython removes it from sys.modules),
 // rather than silently resolving to a half-built module that masks the failure.
