@@ -90,10 +90,23 @@ pub fn run_compiled(prog: compiler::Program) -> Result<Value, String> {
 /// automatically — not only under `--build`. Set `PYTHONRS_TRACE=1` to log
 /// hit/miss to stderr (silent otherwise; normal runs print nothing).
 pub fn compile_or_load(src: &str) -> Result<compiler::Program, String> {
+    compile_or_load_cacheable(src, true)
+}
+
+/// [`compile_or_load`] with an explicit cacheability gate. A `-c`/stdin program
+/// (`cacheable == false`) is compiled fresh and NEVER touches the shard: such
+/// one-off snippets are never re-run byte-for-byte, so caching them only bloats
+/// the append-only shard (and forces an O(shard) rewrite per miss) for no hit —
+/// CPython likewise never writes a `.pyc` for `-c`/stdin. Real script files and
+/// imported modules stay cacheable.
+pub fn compile_or_load_cacheable(
+    src: &str,
+    cacheable: bool,
+) -> Result<compiler::Program, String> {
     // `PYTHONRS_CACHE=0|false|no` (see `cache::cache_enabled`) turns the shard off
     // entirely — every run recompiles and nothing is stored. `--doctor` reports
     // this state, so the gate must be honored here or that report would lie.
-    if !cache::cache_enabled() {
+    if !cacheable || !cache::cache_enabled() {
         return compile(src);
     }
     if let Some(prog) = cache::load(src) {
@@ -123,7 +136,8 @@ pub fn compile_or_load(src: &str) -> Result<compiler::Program, String> {
 pub fn eval_str(src: &str) -> Result<Value, String> {
     host::reset_host();
     host::init_runtime(vec![String::new()], None, src, "<string>", true);
-    run_compiled(compile_or_load(src)?)
+    // A bare source string (`<string>`) is a throwaway program — don't cache it.
+    run_compiled(compile_or_load_cacheable(src, false)?)
 }
 
 /// Read and run a `.py` file (transparently rkyv-cached — see `compile_or_load`).
@@ -171,8 +185,11 @@ pub fn run_program(
     show_source: bool,
 ) -> RunReport {
     host::reset_host();
+    // A real script file (`main_file` set) is cacheable; a `-c`/stdin program is
+    // not — it never re-runs byte-for-byte, so caching it only bloats the shard.
+    let cacheable = main_file.is_some();
     host::init_runtime(argv, main_file, src, tb_filename, show_source);
-    let prog = match compile_or_load(src) {
+    let prog = match compile_or_load_cacheable(src, cacheable) {
         Ok(p) => p,
         Err(e) => {
             return RunReport {
