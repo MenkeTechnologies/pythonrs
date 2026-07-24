@@ -293,6 +293,12 @@ body.no-neon-glow .doc-card {
   max-width: 42rem;
 }
 
+.docs-note {
+  font-size: 12px;
+  color: var(--text-dim);
+  line-height: 1.55;
+}
+
 .docs-build-line:empty {
   display: none;
 }
