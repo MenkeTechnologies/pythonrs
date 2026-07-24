@@ -472,9 +472,34 @@ impl Compiler {
                     self.store_name(b, &bind);
                 }
             }
-            StmtKind::ImportFrom { module, names, .. } => {
+            StmtKind::ImportFrom {
+                module,
+                names,
+                level,
+            } => {
                 let m = module.clone().unwrap_or_default();
                 for a in names {
+                    // A relative import (`from . import x`, `from ..pkg import y`)
+                    // resolves at runtime against the module's `__package__`, since
+                    // the leading dots' meaning depends on where the module lives.
+                    if *level > 0 {
+                        if a.name == "*" {
+                            b.emit(Op::LoadInt(*level as i64), line);
+                            self.strlit(b, &m);
+                            self.strlit(b, "*");
+                            b.emit(Op::CallBuiltin(ops::IMPORT_RELATIVE, 3), line);
+                            b.emit(Op::CallBuiltin(ops::IMPORT_STAR, 1), line);
+                            b.emit(Op::Pop, 0);
+                            continue;
+                        }
+                        b.emit(Op::LoadInt(*level as i64), line);
+                        self.strlit(b, &m);
+                        self.strlit(b, &a.name);
+                        b.emit(Op::CallBuiltin(ops::IMPORT_RELATIVE, 3), line);
+                        let bind = a.asname.clone().unwrap_or_else(|| a.name.clone());
+                        self.store_name(b, &bind);
+                        continue;
+                    }
                     // `from m import *`: import the module, then bind all of its
                     // public names in one op (which leaves an `Undef` to pop).
                     if a.name == "*" {

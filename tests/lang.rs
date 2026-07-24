@@ -361,6 +361,41 @@ fn class_attr_call_constructs() {
     assert_eq!(g(src, "x"), "8");
 }
 
+// A relative import (`from . import _compiler` in re's `__init__`) resolves
+// against the module's `__package__`: it reaches the real submodule `re._compiler`
+// (which then needs the native `_sre` C-accelerator). Before relative-import
+// support the leading dot was dropped and the name collapsed to `''`.
+#[cfg(not(feature = "stdlib-ffi"))]
+#[test]
+fn relative_import_resolves_package() {
+    let src = "\
+try:
+    import re
+    x = 'imported'
+except ModuleNotFoundError as e:
+    x = str(e)";
+    // The dotted import resolved to `re._compiler` → `_sre` (not `''`).
+    assert_eq!(g(src, "x"), "\"No module named '_sre'\"");
+}
+
+// A module whose body fails mid-import is NOT left cached as a broken shell: a
+// retry re-runs the body and re-raises (CPython removes it from sys.modules),
+// rather than silently resolving to a half-built module that masks the failure.
+#[cfg(not(feature = "stdlib-ffi"))]
+#[test]
+fn failed_import_is_not_cached() {
+    let src = "\
+res = []
+for _ in range(2):
+    try:
+        import contextvars
+        res.append('cached')
+    except ModuleNotFoundError:
+        res.append('raised')
+x = res";
+    assert_eq!(g(src, "x"), "['raised', 'raised']");
+}
+
 // A bound method called through a stored reference (`f = obj.m; f()`) — not just
 // `obj.m()` — resolves zero-arg super() (owner comes from FuncVal, tagged at
 // class registration).

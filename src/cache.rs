@@ -88,7 +88,10 @@ use std::path::PathBuf;
 /// mis-emitted it as an `IMPORT_FROM "*"` attribute fetch) must miss and recompile.
 /// v27: `FuncDef` gained `freevars` (drives `func.__closure__`/`co_freevars` and
 /// the `CO_NOFREE` flag); recompile so closures carry their free-variable list.
-const SCHEMA: u64 = 27;
+/// v28: new `IMPORT_RELATIVE` opcode — a relative `from . import x` now compiles
+/// to a runtime-resolved import (previously the leading dots were dropped and the
+/// module name collapsed to `""`), so cached star/relative-import bytecode misses.
+const SCHEMA: u64 = 28;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]

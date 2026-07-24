@@ -62,6 +62,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::IMPORT, b_import);
     vm.register_builtin(ops::IMPORT_FROM, b_import_from);
     vm.register_builtin(ops::IMPORT_STAR, b_import_star);
+    vm.register_builtin(ops::IMPORT_RELATIVE, b_import_relative);
     vm.register_builtin(ops::UNPACK, b_unpack);
     vm.register_builtin(ops::BINOP, b_binop);
     vm.register_builtin(ops::INPLACE, b_inplace);
@@ -2272,6 +2273,20 @@ fn b_import_from(vm: &mut VM, _: u8) -> Value {
             e
         }
     });
+    finish(vm, r)
+}
+
+/// `from <dots><modpart> import <name>` — a relative import. Stack (top-first):
+/// `name`, `modpart`, `level`. Resolves against the current module's
+/// `__package__` and leaves the value to bind under `name`.
+fn b_import_relative(vm: &mut VM, _: u8) -> Value {
+    let name = sval(&vm.pop());
+    let modpart = sval(&vm.pop());
+    let level = match vm.pop() {
+        Value::Int(n) if n > 0 => n as usize,
+        _ => 1,
+    };
+    let r = host::import_relative(level, &modpart, &name);
     finish(vm, r)
 }
 

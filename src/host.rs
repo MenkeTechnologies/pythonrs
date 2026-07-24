@@ -108,6 +108,7 @@ pub mod ops {
     pub const EXTEND_STR: u16 = 75; // [str, parts...] -> str (concat parts)
     pub const ELLIPSIS: u16 = 76; // [] -> the `Ellipsis` (`...`) singleton
     pub const IMPORT_STAR: u16 = 77; // [module] -> bind all public names (`from m import *`)
+    pub const IMPORT_RELATIVE: u16 = 78; // [level, modpart, name] -> value bound by a relative `from . import`
 }
 
 /// In-place (augmented-assignment) op tags carried by `ops::INPLACE`. One per
@@ -1498,6 +1499,19 @@ impl PyHost {
         }
     }
 
+    /// Drop `name` from the module cache (and live `sys.modules`). Used when a
+    /// module body fails mid-import: CPython removes the half-built module so a
+    /// retry re-runs the body and re-raises, rather than resolving to a broken
+    /// cached shell (which would silently mask a dependency's import failure).
+    pub fn uncache_module(&mut self, name: &str) {
+        self.modules.remove(name);
+        if let Some(sm) = self.sys_modules.clone() {
+            if let Some(PyObj::Dict(d)) = self.get_mut(&sm) {
+                d.shift_remove(&PKey::Str(name.to_string()));
+            }
+        }
+    }
+
     /// Record `__cause__`/`__context__` for an exception object. `Undef` leaves
     /// a slot unset. Merges with any existing links (a later implicit
     /// `__context__` must not clobber an explicit `__cause__`).
@@ -2016,6 +2030,35 @@ impl PyHost {
     #[inline]
     fn globals_mut(&mut self) -> &mut IndexMap<String, Value> {
         &mut self.module_globals[self.cur_module]
+    }
+
+    /// The current module's `__package__` (the anchor for a relative import).
+    /// Falls back to `__name__`'s parent when unset, as CPython's importlib does.
+    pub fn current_package(&self) -> String {
+        let g = self.globals();
+        if let Some(v) = g.get("__package__") {
+            if let Some(s) = self.as_str(v) {
+                return s;
+            }
+        }
+        // No `__package__`: derive from `__name__` (a package keeps its own name,
+        // a module drops its final component).
+        if let Some(v) = g.get("__name__") {
+            if let Some(n) = self.as_str(v) {
+                return match n.rsplit_once('.') {
+                    Some((parent, _)) => parent.to_string(),
+                    None => String::new(),
+                };
+            }
+        }
+        String::new()
+    }
+
+    /// Set attribute `name = val` on a module object (its `ns` map).
+    pub fn set_module_attr(&mut self, module: &Value, name: &str, val: Value) {
+        if let Some(PyObj::Module { ns, .. }) = self.get_mut(module) {
+            ns.insert(name.to_string(), val);
+        }
     }
 
     /// The module a freshly-created function/class-body captures (the module now
@@ -11411,7 +11454,93 @@ pub fn import_module(name: &str) -> Result<Value, String> {
     }
     let module = import_module_inner(name)?;
     with_host(|h| h.cache_module(name, module.clone()));
+    // Bind a submodule as an attribute of its parent package, as CPython's import
+    // system does: after `import a.b` (or a relative `from .b import *`), `a.b`
+    // stays reachable and `from a import b` finds it.
+    if let Some((parent, leaf)) = name.rsplit_once('.') {
+        if let Some(pmod) = with_host(|h| h.cached_module(parent)) {
+            with_host(|h| h.set_module_attr(&pmod, leaf, module.clone()));
+        }
+    }
     Ok(module)
+}
+
+/// Resolve a relative import (`from <dots><modpart> import <name>`) against the
+/// currently-running module's `__package__`. `level` is the number of leading
+/// dots; `modpart` is the (possibly empty) dotted path after them. Returns the
+/// value to bind under `name`. Mirrors CPython's `importlib._bootstrap`:
+///   - `from . import sub`   → import (and return) the submodule `pkg.sub`,
+///     else the attribute `sub` defined in the package `__init__`.
+///   - `from .mod import x`  → import `pkg.mod`, return its attribute `x`.
+///   - `from . import *`     → return the anchor package for `IMPORT_STAR`.
+pub fn import_relative(level: usize, modpart: &str, name: &str) -> Result<Value, String> {
+    let pkg = with_host(|h| h.current_package());
+    let anchor = resolve_relative_anchor(&pkg, level)?;
+    let base = match (anchor.is_empty(), modpart.is_empty()) {
+        (_, true) => anchor.clone(),
+        (true, false) => modpart.to_string(),
+        (false, false) => format!("{anchor}.{modpart}"),
+    };
+    // `from .pkg import *` (or `from . import *`) — hand the source package back
+    // for the `IMPORT_STAR` op that follows.
+    if name == "*" {
+        return import_module(&base);
+    }
+    if modpart.is_empty() {
+        // `from . import name`: prefer the submodule `base.name`; if there is no
+        // such module, `name` is an attribute defined in the package body.
+        let sub = if base.is_empty() {
+            name.to_string()
+        } else {
+            format!("{base}.{name}")
+        };
+        match import_module(&sub) {
+            Ok(m) => {
+                // Bind the submodule as an attribute of its package, as CPython does.
+                if let Ok(base_mod) = import_module(&base) {
+                    with_host(|h| h.set_module_attr(&base_mod, name, m.clone()));
+                }
+                return Ok(m);
+            }
+            Err(e) => {
+                // Only fall back to a package attribute when the SUBMODULE itself
+                // is absent. A submodule that exists but failed to execute (e.g.
+                // a missing C-accelerator dependency) propagates its real error.
+                let missing_sub = e.contains("No module named")
+                    && (e.contains(&format!("'{sub}'")) || e.contains(&format!("'{name}'")));
+                if !missing_sub {
+                    return Err(e);
+                }
+                let base_mod = import_module(&base)?;
+                return with_host(|h| h.get_attr(&base_mod, name));
+            }
+        }
+    }
+    // `from .mod import name`: import the source module, read its attribute.
+    let base_mod = import_module(&base)?;
+    with_host(|h| h.get_attr(&base_mod, name))
+}
+
+/// Strip `level - 1` trailing components from the anchor package `pkg` (CPython's
+/// relative-import base: one dot = the current package, each extra dot climbs
+/// one parent). Errors past the top-level package.
+fn resolve_relative_anchor(pkg: &str, level: usize) -> Result<String, String> {
+    if level == 0 {
+        return Ok(pkg.to_string());
+    }
+    let mut bits: Vec<&str> = if pkg.is_empty() {
+        Vec::new()
+    } else {
+        pkg.split('.').collect()
+    };
+    let strip = level - 1;
+    if strip > bits.len() {
+        return Err(
+            "ImportError: attempted relative import beyond top-level package".to_string(),
+        );
+    }
+    bits.truncate(bits.len() - strip);
+    Ok(bits.join("."))
 }
 
 /// The uncached import resolution: native inline arms, then the vendored CPython
@@ -12090,10 +12219,24 @@ fn run_vendored_module(name: &str, src: &str, path: &std::path::Path) -> Result<
     let (mid, saved_mod) = with_host(|h| {
         let name_v = h.new_str(name);
         let file_v = h.new_str(path.to_string_lossy());
+        // `__package__` anchors relative imports (`from . import ...`). A package
+        // (`__init__.py`) is its own anchor; a plain module `a.b` anchors on its
+        // parent `a`.
+        let is_package = path.file_name().is_some_and(|f| f == "__init__.py");
+        let package = if is_package {
+            name.to_string()
+        } else {
+            match name.rsplit_once('.') {
+                Some((parent, _)) => parent.to_string(),
+                None => String::new(),
+            }
+        };
+        let package_v = h.new_str(&package);
         // Seed the module dunders CPython sets before executing the body.
         let mut ns: IndexMap<String, Value> = IndexMap::new();
         ns.insert("__name__".to_string(), name_v);
         ns.insert("__file__".to_string(), file_v);
+        ns.insert("__package__".to_string(), package_v);
         ns.insert("__doc__".to_string(), Value::Undef);
         let mid = h.new_module_slot(ns);
         let saved = h.swap_module(mid);
@@ -12122,14 +12265,21 @@ fn run_vendored_module(name: &str, src: &str, path: &std::path::Path) -> Result<
     with_host(|h| {
         h.swap_module(saved_mod);
         h.restore_scope(parked);
-        // Populate the already-cached module object IN PLACE from the final slot
-        // globals, so every holder (including a mid-import circular reference) sees
-        // the complete namespace. Functions read the live slot directly.
-        let pairs = h.module_globals_pairs(mid);
-        if let Some(PyObj::Module { ns, .. }) = h.get_mut(&module) {
-            for (k, v) in pairs {
-                ns.insert(k, v);
+        if run.is_ok() {
+            // Populate the already-cached module object IN PLACE from the final
+            // slot globals, so every holder (including a mid-import circular
+            // reference) sees the complete namespace. Functions read the live slot.
+            let pairs = h.module_globals_pairs(mid);
+            if let Some(PyObj::Module { ns, .. }) = h.get_mut(&module) {
+                for (k, v) in pairs {
+                    ns.insert(k, v);
+                }
             }
+        } else {
+            // The body failed: drop the half-built module so a retry re-runs it
+            // (and re-raises) instead of resolving to a broken cached shell that
+            // silently masks the failure of whatever this module imported.
+            h.uncache_module(name);
         }
     });
     run?;
