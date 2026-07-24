@@ -109,6 +109,10 @@ pub struct Compiler {
     /// + string-keyed env dict). The hot loop then contains only native ops, which
     /// the interpreter runs far faster and the AOT/JIT native tier can lower.
     native_slots: Option<HashMap<String, u16>>,
+    /// Next free fusevm slot index to hand out for a loop bound while emitting a
+    /// native for-range nest (names take slots `0..k`; each loop's `stop` bound
+    /// takes the next slot). Meaningful only while `native_slots` is `Some`.
+    native_next_slot: u16,
     tmp: usize,
     debug: bool,
     /// The source line of the statement currently being lowered. Call ops carry
@@ -836,65 +840,108 @@ impl Compiler {
         iter: &Expr,
         body: &[Stmt],
     ) -> Result<bool, String> {
+        // Only the OUTERMOST loop of a nest reaches here (nested loops are emitted
+        // directly by `emit_native_range_loop`), so `native_slots` must be inactive.
+        if self.native_slots.is_some() {
+            return Ok(false);
+        }
         let target_name = match target.unspanned() {
             Expr::Name(n) => n.clone(),
             _ => return Ok(false),
         };
-        let (func, args) = match iter.unspanned() {
-            Expr::Call {
-                func,
-                args,
-                keywords,
-            } if keywords.is_empty() => (func, args),
-            _ => return Ok(false),
+        let (start_expr, stop_expr) = match native_range_call(iter) {
+            Some(b) => b,
+            None => return Ok(false),
         };
-        match func.unspanned() {
-            Expr::Name(n) if n == "range" => {}
-            _ => return Ok(false),
-        }
-        // A locally-rebound `range` is not the builtin — bail (rare).
+        // A locally-rebound `range` is not the builtin — bail (rare). The check is
+        // scope-wide, so it covers every `range(...)` in the nest.
         if self.func_scopes.iter().any(|s| s.contains("range")) {
             return Ok(false);
         }
-        let (start_expr, stop_expr): (Option<&Expr>, &Expr) = match args.len() {
-            1 => (None, &args[0]),
-            2 => (Some(&args[0]), &args[1]),
-            3 => {
-                match args[2].unspanned() {
-                    Expr::Int(1) => {}
-                    _ => return Ok(false), // only step == 1 handled natively
-                }
-                (Some(&args[0]), &args[1])
-            }
-            _ => return Ok(false),
-        };
-        let (reads, writes) = match analyze_native_body(body, &target_name) {
-            Some(rw) => rw,
-            None => return Ok(false),
-        };
 
-        // Slot assignment: 0 = loop var, then each distinct other local, then the
-        // loop bound.
-        let mut slots: HashMap<String, u16> = HashMap::new();
-        slots.insert(target_name.clone(), 0);
-        let target_slot = 0u16;
-        let mut next: u16 = 1;
-        let mut ordered: Vec<String> = Vec::new();
-        for name in reads.iter().chain(writes.iter()) {
-            if name == &target_name || slots.contains_key(name) {
-                continue;
+        // Validate + collect the whole nest. `loop_vars` are bound by loops (get
+        // their value from the loop, not the namespace); `reads` need a pre-loop
+        // load; `writes` (accumulators + loop vars) are stored back afterward.
+        let mut loop_vars = vec![target_name.clone()];
+        let mut reads: Vec<String> = Vec::new();
+        let mut writes = vec![target_name.clone()];
+        if let Some(e) = start_expr {
+            if !native_safe_value(e, &mut reads) {
+                return Ok(false);
             }
-            slots.insert(name.clone(), next);
-            ordered.push(name.clone());
-            next += 1;
         }
-        let stop_slot = next;
+        if !native_safe_value(stop_expr, &mut reads) {
+            return Ok(false);
+        }
+        if !analyze_native_tree(body, &mut loop_vars, &mut reads, &mut writes) {
+            return Ok(false);
+        }
 
-        // Native Add/Sub/Mul in this chunk must promote to bignum on i64 overflow
-        // if it is ever compiled natively (the interpreter already does via hook).
+        // Slot assignment: every distinct local name gets a slot; loop `stop`
+        // bounds take slots above them (`native_next_slot`, per loop).
+        let mut slots: HashMap<String, u16> = HashMap::new();
+        let mut next: u16 = 0;
+        for name in loop_vars.iter().chain(reads.iter()).chain(writes.iter()) {
+            if !slots.contains_key(name) {
+                slots.insert(name.clone(), next);
+                next += 1;
+            }
+        }
+        let target_slot = slots[&target_name];
+        let outer_stop_slot = next;
+        next += 1;
+
+        // Namespace boundary: load reads that aren't loop-bound; write back every
+        // modified name (accumulators + all loop vars, deduped) once, at the end.
+        let ns_loads: Vec<(String, u16)> = reads
+            .iter()
+            .filter(|n| !loop_vars.iter().any(|v| &v == n))
+            .map(|n| (n.clone(), slots[n]))
+            .collect();
+        let mut wb: Vec<(String, u16)> = Vec::new();
+        for name in &writes {
+            if !wb.iter().any(|(w, _)| w == name) {
+                wb.push((name.clone(), slots[name]));
+            }
+        }
+
         b.set_int_overflow_deopt(true);
 
-        // Prologue: evaluate the range bounds (normal namespace path) into slots.
+        // Outer bounds are evaluated on the normal namespace path (before slot
+        // redirection is active), then the nest runs with `native_slots` on.
+        match start_expr {
+            Some(e) => self.compile_expr(b, e)?,
+            None => {
+                b.emit(Op::LoadInt(0), 0);
+            }
+        }
+        b.emit(Op::SetSlot(target_slot), 0);
+        self.compile_expr(b, stop_expr)?;
+        b.emit(Op::SetSlot(outer_stop_slot), 0);
+
+        self.native_slots = Some(slots);
+        self.native_next_slot = next;
+        let res = self.emit_loop_core(b, target_slot, outer_stop_slot, body, &ns_loads, &wb);
+        self.native_slots = None;
+        res?;
+        Ok(true)
+    }
+
+    /// Emit a nested native range loop (called only while `native_slots` is
+    /// active). Its bounds are evaluated through slot redirection (so they may
+    /// reference enclosing loop variables), then the shared loop core runs with no
+    /// namespace load/write-back — the outermost loop owns that boundary.
+    fn emit_native_range_loop(
+        &mut self,
+        b: &mut ChunkBuilder,
+        target_name: &str,
+        start_expr: Option<&Expr>,
+        stop_expr: &Expr,
+        body: &[Stmt],
+    ) -> Result<(), String> {
+        let target_slot = self.native_slots.as_ref().unwrap()[target_name];
+        let stop_slot = self.native_next_slot;
+        self.native_next_slot += 1;
         match start_expr {
             Some(e) => self.compile_expr(b, e)?,
             None => {
@@ -904,33 +951,53 @@ impl Compiler {
         b.emit(Op::SetSlot(target_slot), 0);
         self.compile_expr(b, stop_expr)?;
         b.emit(Op::SetSlot(stop_slot), 0);
+        self.emit_loop_core(b, target_slot, stop_slot, body, &[], &[])
+    }
 
-        // Entry guard: empty range skips the body AND every write-back, so the
-        // loop var stays unbound and locals keep their prior values (CPython).
+    /// The shared counted-loop body: entry guard (empty range skips everything),
+    /// optional post-guard namespace loads, the loop body (nested range loops
+    /// recurse; other statements lower through slot redirection), induction +
+    /// continue test, last-value restore, and optional namespace write-backs. The
+    /// target/stop slots must already hold the evaluated bounds.
+    fn emit_loop_core(
+        &mut self,
+        b: &mut ChunkBuilder,
+        target_slot: u16,
+        stop_slot: u16,
+        body: &[Stmt],
+        ns_loads: &[(String, u16)],
+        ns_writebacks: &[(String, u16)],
+    ) -> Result<(), String> {
         b.emit(Op::GetSlot(target_slot), 0);
         b.emit(Op::GetSlot(stop_slot), 0);
         b.emit(Op::NumLt, 0);
         let jskip = b.emit(Op::JumpIfFalse(0), 0);
 
-        // Load body-read locals from the namespace AFTER the guard (an empty range
-        // must not raise NameError for a name the body would have read).
-        for name in &ordered {
-            if reads.iter().any(|r| r == name) {
-                self.name_const(b, name);
-                b.emit(Op::CallBuiltin(ops::GETLOCAL, 1), 0);
-                b.emit(Op::SetSlot(slots[name]), 0);
+        for (name, slot) in ns_loads {
+            self.name_const(b, name);
+            b.emit(Op::CallBuiltin(ops::GETLOCAL, 1), 0);
+            b.emit(Op::SetSlot(*slot), 0);
+        }
+
+        let top = b.current_pos();
+        for stmt in body {
+            if let StmtKind::For {
+                target, iter, body: inner, ..
+            } = &stmt.kind
+            {
+                // Validated by `analyze_native_tree`; re-extract for emission.
+                let tname = match target.unspanned() {
+                    Expr::Name(n) => n.clone(),
+                    _ => unreachable!("native nest validated"),
+                };
+                let (istart, istop) =
+                    native_range_call(iter).expect("native nest validated");
+                self.emit_native_range_loop(b, &tname, istart, istop, inner)?;
+            } else {
+                self.compile_stmts(b, std::slice::from_ref(stmt))?;
             }
         }
 
-        // Loop body with slot redirection active.
-        let top = b.current_pos();
-        let saved = self.native_slots.take();
-        self.native_slots = Some(slots.clone());
-        let body_res = self.compile_stmts(b, body);
-        self.native_slots = saved;
-        body_res?;
-
-        // i += 1; continue while i < stop.
         b.emit(Op::GetSlot(target_slot), 0);
         b.emit(Op::LoadInt(1), 0);
         b.emit(Op::Add, 0);
@@ -939,24 +1006,26 @@ impl Compiler {
         b.emit(Op::GetSlot(stop_slot), 0);
         b.emit(Op::NumLt, 0);
         b.emit(Op::JumpIfTrue(top), 0);
-        // Fell out one step past the last value; restore i to its last body value.
+        // Fell out one step past the last value; restore to last body value.
         b.emit(Op::GetSlot(target_slot), 0);
         b.emit(Op::LoadInt(1), 0);
         b.emit(Op::Sub, 0);
         b.emit(Op::SetSlot(target_slot), 0);
 
-        // Write-backs (reached only when the loop ran): loop var + every modified
-        // local, back into the Python namespace via the normal store path.
-        b.emit(Op::GetSlot(target_slot), 0);
-        self.store_name(b, &target_name);
-        for name in &writes {
-            b.emit(Op::GetSlot(slots[name]), 0);
-            self.store_name(b, name);
+        // Write slots back to the Python namespace. Emit the store RAW (not via
+        // `store_name`) because `native_slots` is still active here and would
+        // otherwise redirect the store right back into the slot.
+        for (name, slot) in ns_writebacks {
+            b.emit(Op::GetSlot(*slot), 0); // [value]
+            self.name_const(b, name); // [value, name]
+            b.emit(Op::Swap, 0); // [name, value]
+            b.emit(Op::CallBuiltin(ops::SETLOCAL, 2), 0);
+            b.emit(Op::Pop, 0);
         }
 
         let after = b.current_pos();
         b.patch_jump(jskip, after);
-        Ok(true)
+        Ok(())
     }
 
     fn compile_for(
@@ -3821,58 +3890,121 @@ fn native_safe_value(e: &Expr, reads: &mut Vec<String>) -> bool {
     }
 }
 
-/// Analyze a candidate native for-range body. Returns `Some((reads, writes))` of
-/// the local names it reads / assigns when every statement is a slot-safe integer
-/// assign or `+=`/`-=`/`*=` (see `native_safe_value`) that does NOT rebind the
-/// loop variable `target`; otherwise `None` (the loop falls back to the general
-/// iterator form).
-fn analyze_native_body(body: &[Stmt], target: &str) -> Option<(Vec<String>, Vec<String>)> {
-    let mut reads: Vec<String> = Vec::new();
-    let mut writes: Vec<String> = Vec::new();
+/// If `iter` is `range(a)` / `range(a, b)` / `range(a, b, 1)` with `range` named
+/// directly, return `(start?, stop)`. Only step `1` is handled natively; any
+/// other step (or a non-`range` call) yields `None`, so the loop falls back.
+fn native_range_call(iter: &Expr) -> Option<(Option<&Expr>, &Expr)> {
+    let (func, args) = match iter.unspanned() {
+        Expr::Call {
+            func,
+            args,
+            keywords,
+        } if keywords.is_empty() => (func, args),
+        _ => return None,
+    };
+    match func.unspanned() {
+        Expr::Name(n) if n == "range" => {}
+        _ => return None,
+    }
+    match args.len() {
+        1 => Some((None, &args[0])),
+        2 => Some((Some(&args[0]), &args[1])),
+        3 => match args[2].unspanned() {
+            Expr::Int(1) => Some((Some(&args[0]), &args[1])),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn push_unique(v: &mut Vec<String>, name: &str) {
+    if !v.iter().any(|x| x == name) {
+        v.push(name.to_string());
+    }
+}
+
+/// Recursively validate a native for-range nest and collect its `loop_vars`
+/// (names bound by a loop), `reads` (names read in bounds/values), and `writes`
+/// (names assigned, incl. loop vars). Every statement must be `pass`, a single
+/// slot-safe integer `Name = value`, a `+=`/`-=`/`*=` on a `Name`, or a nested
+/// `for <name> in range(...)` whose body is itself native-safe — none of which
+/// may rebind an enclosing loop variable, and no `break`/`continue`/`else`.
+/// Returns `false` on anything else (the whole loop then falls back).
+fn analyze_native_tree(
+    body: &[Stmt],
+    loop_vars: &mut Vec<String>,
+    reads: &mut Vec<String>,
+    writes: &mut Vec<String>,
+) -> bool {
     for s in body {
         match &s.kind {
             StmtKind::Pass => {}
             StmtKind::Assign { targets, value } => {
                 if targets.len() != 1 {
-                    return None;
+                    return false;
                 }
                 let name = match targets[0].unspanned() {
                     Expr::Name(n) => n,
-                    _ => return None,
+                    _ => return false,
                 };
-                if name == target {
-                    return None;
+                if loop_vars.iter().any(|v| v == name) {
+                    return false; // must not rebind a loop variable
                 }
-                if !native_safe_value(value, &mut reads) {
-                    return None;
+                if !native_safe_value(value, reads) {
+                    return false;
                 }
-                if !writes.iter().any(|w| w == name) {
-                    writes.push(name.clone());
-                }
+                push_unique(writes, name);
             }
-            StmtKind::AugAssign { target: t, op, value } => {
-                let name = match t.unspanned() {
+            StmtKind::AugAssign { target, op, value } => {
+                let name = match target.unspanned() {
                     Expr::Name(n) => n,
-                    _ => return None,
+                    _ => return false,
                 };
-                if name == target || native_arith_op(*op).is_none() {
-                    return None;
+                if loop_vars.iter().any(|v| v == name) || native_arith_op(*op).is_none() {
+                    return false;
                 }
-                // `x op= v` reads x too.
-                if !reads.iter().any(|r| r == name) {
-                    reads.push(name.clone());
+                push_unique(reads, name); // `x op= v` reads x
+                if !native_safe_value(value, reads) {
+                    return false;
                 }
-                if !native_safe_value(value, &mut reads) {
-                    return None;
+                push_unique(writes, name);
+            }
+            StmtKind::For {
+                target,
+                iter,
+                body: inner,
+                orelse,
+                is_async,
+            } => {
+                if *is_async || !orelse.is_empty() || loop_needs_signal(inner) {
+                    return false; // no async-for, no for-else, no break/continue
                 }
-                if !writes.iter().any(|w| w == name) {
-                    writes.push(name.clone());
+                let tname = match target.unspanned() {
+                    Expr::Name(n) => n.clone(),
+                    _ => return false,
+                };
+                let (start, stop) = match native_range_call(iter) {
+                    Some(b) => b,
+                    None => return false,
+                };
+                if let Some(e) = start {
+                    if !native_safe_value(e, reads) {
+                        return false;
+                    }
+                }
+                if !native_safe_value(stop, reads) {
+                    return false;
+                }
+                push_unique(loop_vars, &tname);
+                push_unique(writes, &tname);
+                if !analyze_native_tree(inner, loop_vars, reads, writes) {
+                    return false;
                 }
             }
-            _ => return None,
+            _ => return false,
         }
     }
-    Some((reads, writes))
+    true
 }
 
 /// so it can't be a plain in-chunk jump — the loop uses the `LOOP_BODY`
