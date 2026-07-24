@@ -854,7 +854,7 @@ impl Compiler {
             Expr::Name(n) => n.clone(),
             _ => return Ok(false),
         };
-        let (start_expr, stop_expr) = match native_range_call(iter) {
+        let (start_expr, stop_expr, step) = match native_range_call(iter) {
             Some(b) => b,
             None => return Ok(false),
         };
@@ -932,7 +932,7 @@ impl Compiler {
 
         self.native_slots = Some(slots);
         self.native_next_slot = next;
-        let res = self.emit_loop_core(b, target_slot, outer_stop_slot, body, &ns_loads, &wb);
+        let res = self.emit_loop_core(b, target_slot, outer_stop_slot, step, body, &ns_loads, &wb);
         self.native_slots = None;
         res?;
         Ok(true)
@@ -948,6 +948,7 @@ impl Compiler {
         target_name: &str,
         start_expr: Option<&Expr>,
         stop_expr: &Expr,
+        step: i64,
         body: &[Stmt],
     ) -> Result<(), String> {
         let target_slot = self.native_slots.as_ref().unwrap()[target_name];
@@ -962,7 +963,7 @@ impl Compiler {
         b.emit(Op::SetSlot(target_slot), 0);
         self.compile_expr(b, stop_expr)?;
         b.emit(Op::SetSlot(stop_slot), 0);
-        self.emit_loop_core(b, target_slot, stop_slot, body, &[], &[])
+        self.emit_loop_core(b, target_slot, stop_slot, step, body, &[], &[])
     }
 
     /// The shared counted-loop body: entry guard (empty range skips everything),
@@ -975,13 +976,16 @@ impl Compiler {
         b: &mut ChunkBuilder,
         target_slot: u16,
         stop_slot: u16,
+        step: i64,
         body: &[Stmt],
         ns_loads: &[(String, u16)],
         ns_writebacks: &[(String, u16)],
     ) -> Result<(), String> {
+        // Ascending ranges test `i < stop`, descending `i > stop`.
+        let cmp = if step > 0 { Op::NumLt } else { Op::NumGt };
         b.emit(Op::GetSlot(target_slot), 0);
         b.emit(Op::GetSlot(stop_slot), 0);
-        b.emit(Op::NumLt, 0);
+        b.emit(cmp.clone(), 0);
         let jskip = b.emit(Op::JumpIfFalse(0), 0);
 
         for (name, slot) in ns_loads {
@@ -994,16 +998,16 @@ impl Compiler {
         self.emit_native_body(b, body)?;
 
         b.emit(Op::GetSlot(target_slot), 0);
-        b.emit(Op::LoadInt(1), 0);
+        b.emit(Op::LoadInt(step), 0);
         b.emit(Op::Add, 0);
         b.emit(Op::SetSlot(target_slot), 0);
         b.emit(Op::GetSlot(target_slot), 0);
         b.emit(Op::GetSlot(stop_slot), 0);
-        b.emit(Op::NumLt, 0);
+        b.emit(cmp, 0);
         b.emit(Op::JumpIfTrue(top), 0);
         // Fell out one step past the last value; restore to last body value.
         b.emit(Op::GetSlot(target_slot), 0);
-        b.emit(Op::LoadInt(1), 0);
+        b.emit(Op::LoadInt(step), 0);
         b.emit(Op::Sub, 0);
         b.emit(Op::SetSlot(target_slot), 0);
 
@@ -1037,9 +1041,9 @@ impl Compiler {
                         Expr::Name(n) => n.clone(),
                         _ => unreachable!("native nest validated"),
                     };
-                    let (istart, istop) =
+                    let (istart, istop, istep) =
                         native_range_call(iter).expect("native nest validated");
-                    self.emit_native_range_loop(b, &tname, istart, istop, inner)?;
+                    self.emit_native_range_loop(b, &tname, istart, istop, istep, inner)?;
                 }
                 StmtKind::While { test, body: wbody, .. } => {
                     self.emit_native_while(b, test, wbody)?;
@@ -4068,10 +4072,24 @@ fn native_safe_value(e: &Expr, reads: &mut Vec<String>) -> bool {
     }
 }
 
-/// If `iter` is `range(a)` / `range(a, b)` / `range(a, b, 1)` with `range` named
-/// directly, return `(start?, stop)`. Only step `1` is handled natively; any
-/// other step (or a non-`range` call) yields `None`, so the loop falls back.
-fn native_range_call(iter: &Expr) -> Option<(Option<&Expr>, &Expr)> {
+/// A literal integer expression (`5` or `-5`), if `e` is one.
+fn literal_int(e: &Expr) -> Option<i64> {
+    match e.unspanned() {
+        Expr::Int(n) => Some(*n),
+        Expr::UnaryOp(UnOp::Neg, inner) => match inner.unspanned() {
+            Expr::Int(n) => Some(-*n),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// If `iter` is `range(a)` / `range(a, b)` / `range(a, b, step)` with `range`
+/// named directly, return `(start?, stop, step)`. The step must be a nonzero
+/// integer literal (any sign) so the loop's direction is known at compile time;
+/// a non-literal step (or a non-`range` call) yields `None` and the loop falls
+/// back to the general iterator form.
+fn native_range_call(iter: &Expr) -> Option<(Option<&Expr>, &Expr, i64)> {
     let (func, args) = match iter.unspanned() {
         Expr::Call {
             func,
@@ -4085,10 +4103,10 @@ fn native_range_call(iter: &Expr) -> Option<(Option<&Expr>, &Expr)> {
         _ => return None,
     }
     match args.len() {
-        1 => Some((None, &args[0])),
-        2 => Some((Some(&args[0]), &args[1])),
-        3 => match args[2].unspanned() {
-            Expr::Int(1) => Some((Some(&args[0]), &args[1])),
+        1 => Some((None, &args[0], 1)),
+        2 => Some((Some(&args[0]), &args[1], 1)),
+        3 => match literal_int(&args[2]) {
+            Some(step) if step != 0 => Some((Some(&args[0]), &args[1], step)),
             _ => None,
         },
         _ => None,
@@ -4224,7 +4242,7 @@ fn analyze_native_tree_at(
                     Expr::Name(n) => n.clone(),
                     _ => return false,
                 };
-                let (start, stop) = match native_range_call(iter) {
+                let (start, stop, _step) = match native_range_call(iter) {
                     Some(b) => b,
                     None => return false,
                 };
@@ -4312,7 +4330,7 @@ fn collect_ns_loads(body: &[Stmt], defined: &mut Vec<String>, loads: &mut Vec<St
             StmtKind::For {
                 target, iter, body: inner, ..
             } => {
-                if let Some((start, stop)) = native_range_call(iter) {
+                if let Some((start, stop, _step)) = native_range_call(iter) {
                     if let Some(e) = start {
                         reads_needing_load(e, defined, loads);
                     }

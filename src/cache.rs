@@ -99,7 +99,7 @@ use std::path::PathBuf;
 /// v31: a `def`/`lambda` with annotations compiles them as a `<annotate>` thunk
 /// (MKFUNC evaluates it with forward-reference NameErrors caught) instead of an
 /// inline dict, so annotated-function bytecode differs.
-const SCHEMA: u64 = 34;
+const SCHEMA: u64 = 35;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]
