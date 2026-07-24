@@ -295,7 +295,76 @@ impl Lexer {
             self.bump();
         }
         let mut raw = String::new();
+        // For an f-string, a quote inside a `{…}` replacement field does not end
+        // the literal (PEP 701 nested strings), so track replacement-field depth.
+        let mut brace_depth: i32 = 0;
         loop {
+            // Inside an f-string replacement field, a quote opens a NESTED string
+            // literal (same or different quotes); scan it whole so its content —
+            // including the outer quote char — never terminates the outer f-string.
+            if is_f && brace_depth > 0 {
+                if let Some(q) = self.peek() {
+                    if q == '\'' || q == '"' {
+                        raw.push(q);
+                        self.bump();
+                        let nested_triple =
+                            self.peek() == Some(q) && self.peek2() == Some(q);
+                        if nested_triple {
+                            raw.push(q);
+                            raw.push(q);
+                            self.bump();
+                            self.bump();
+                        }
+                        loop {
+                            match self.peek() {
+                                None => {
+                                    return Err(format!(
+                                        "SyntaxError: unterminated string (line {})",
+                                        self.line
+                                    ))
+                                }
+                                Some('\\') => {
+                                    raw.push('\\');
+                                    self.bump();
+                                    if let Some(n) = self.peek() {
+                                        raw.push(n);
+                                        self.bump();
+                                    }
+                                }
+                                Some(c) if c == q => {
+                                    if nested_triple {
+                                        if self.peek2() == Some(q)
+                                            && self.src.get(self.pos + 2).copied() == Some(q)
+                                        {
+                                            raw.push(q);
+                                            raw.push(q);
+                                            raw.push(q);
+                                            self.bump();
+                                            self.bump();
+                                            self.bump();
+                                            break;
+                                        }
+                                        raw.push(c);
+                                        self.bump();
+                                    } else {
+                                        raw.push(q);
+                                        self.bump();
+                                        break;
+                                    }
+                                }
+                                Some(c) => {
+                                    if c == '\n' {
+                                        self.line += 1;
+                                    }
+                                    raw.push(c);
+                                    self.bump();
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
             match self.peek() {
                 None => {
                     return Err(format!(
@@ -328,6 +397,27 @@ impl Lexer {
                     if let Some(n) = self.peek() {
                         raw.push(n);
                         self.bump();
+                    }
+                }
+                // f-string replacement-field braces (`{{`/`}}` are literal).
+                Some('{') if is_f => {
+                    raw.push('{');
+                    self.bump();
+                    if self.peek() == Some('{') {
+                        raw.push('{');
+                        self.bump();
+                    } else {
+                        brace_depth += 1;
+                    }
+                }
+                Some('}') if is_f => {
+                    raw.push('}');
+                    self.bump();
+                    if self.peek() == Some('}') {
+                        raw.push('}');
+                        self.bump();
+                    } else if brace_depth > 0 {
+                        brace_depth -= 1;
                     }
                 }
                 Some('\n') if !triple => {

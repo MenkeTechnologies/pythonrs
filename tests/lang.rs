@@ -264,6 +264,16 @@ fn string_module_and_string_formatter() {
 }
 
 #[test]
+fn nested_fstrings_pep701() {
+    // PEP 701: an f-string may nest same-quote f-strings inside its fields.
+    assert_eq!(g("d = 'dec'\nx = f'{f' {d}' if d else ''} tail'", "x"), "' dec tail'");
+    assert_eq!(g("x = f'{f'{f'{1 + 1}'}'}'", "x"), "'2'");
+    assert_eq!(g("w = 5\nx = f'{f'{w}'.rjust(3)}|'", "x"), "'  5|'");
+    // Regular f-strings (conversions, format specs) are unaffected.
+    assert_eq!(g("n = 'x'\nx = f'{n} = {1 + 2:03d} {n!r}'", "x"), "\"x = 003 'x'\"");
+}
+
+#[test]
 fn object_dunder_methods() {
     // Universal object dunders are reachable as bound methods (the stdlib uses
     // e.g. cache.__len__ directly).
