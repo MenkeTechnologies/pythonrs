@@ -289,6 +289,9 @@ pub struct ClassDef {
     /// The metaclass name (`type(cls)`). `"type"` for an ordinary class; a user
     /// metaclass name for `class A(metaclass=M)`.
     pub metaclass: String,
+    /// The `__module__` — the `__name__` of the module whose body defined the
+    /// class. Empty defaults to `__main__` (a class built at the top level).
+    pub module: String,
 }
 
 /// A live closure value.
@@ -6469,6 +6472,23 @@ impl PyHost {
         if let Some(items) = self.view_items(v) {
             return Ok(self.alloc(PyObj::Iter(IterState::Seq { items, idx: 0 })));
         }
+        // A builtin-subclass instance with no user `__iter__` (a namedtuple, a
+        // `list`/`tuple`/`dict`/`str` subclass) iterates its native payload. Reached
+        // when the instance is passed to `zip`/`map`/`enumerate` — their lazy
+        // iterators call `make_iter` directly, unlike `list()`, which routes through
+        // `iter_vec`/`iter_instance_items`.
+        if let Some((payload, class)) = match self.get(v) {
+            Some(PyObj::Instance(i)) if !matches!(i.payload, Value::Undef) => {
+                Some((i.payload.clone(), i.class.clone()))
+            }
+            _ => None,
+        } {
+            if self.builtin_base_of(&class).is_some()
+                && self.class_lookup(&class, "__iter__").is_none()
+            {
+                return self.make_iter(&payload);
+            }
+        }
         let state = match self.get(v) {
             Some(PyObj::List(l)) | Some(PyObj::Tuple(l)) => IterState::Seq {
                 items: l.clone(),
@@ -6960,6 +6980,7 @@ impl PyHost {
             Some(PyObj::Instance(inst)) => {
                 let class = inst.class.clone();
                 let inst_dict = inst.dict.clone();
+                let inst_payload = inst.payload.clone();
                 if let Some(v) = self.inst_attr(&inst_dict, name) {
                     return Ok(v);
                 }
@@ -7027,6 +7048,23 @@ impl PyHost {
                         _ => return Ok(v),
                     }
                 }
+                // A named method inherited from the builtin base (`d.get`,
+                // `stack.append`, `s.upper`) reached as an ATTRIBUTE (`g = d.get`)
+                // binds to the instance; invoking it routes through the payload.
+                // The method-CALL form `d.get(k)` is handled by `call_method`, but
+                // binding it to a name (`_count_elements`'s `mapping.get`) lands here.
+                if !matches!(inst_payload, Value::Undef) {
+                    if let Some(base) = self.builtin_base_of(&class) {
+                        if crate::builtins::type_has_method(base, name) {
+                            let func =
+                                self.alloc(PyObj::Builtin(format!("__base_method__.{name}")));
+                            return Ok(self.alloc(PyObj::BoundMethod {
+                                recv: recv.clone(),
+                                func,
+                            }));
+                        }
+                    }
+                }
                 // An inherited `object` slot reached on an instance (`obj.__str__`)
                 // with no user override is a bound method-wrapper, as in CPython.
                 if OBJECT_SLOT_WRAPPERS.contains(&name) {
@@ -7055,6 +7093,15 @@ impl PyHost {
                         .filter(|q| !q.is_empty())
                         .unwrap_or_else(|| cname.clone());
                     return Ok(self.new_str(q));
+                }
+                if name == "__module__" {
+                    let m = self
+                        .classes
+                        .get(&cname)
+                        .map(|c| c.module.clone())
+                        .filter(|m| !m.is_empty())
+                        .unwrap_or_else(|| "__main__".to_string());
+                    return Ok(self.new_str(m));
                 }
                 // `cls.__class__` is the metaclass (`type(cls)`): a user metaclass
                 // becomes a `Class`, otherwise the builtin `type`.
@@ -7158,6 +7205,16 @@ impl PyHost {
                         }
                         return Ok(v);
                     }
+                }
+                // An inherited object-slot dunder reached on the class object with
+                // no override (`C.__ne__`, `C.__repr__`) is the unbound slot
+                // wrapper from `object`, as in CPython. (collections' OrderedDict
+                // does `__ne__ = _collections_abc.MutableMapping.__ne__`.)
+                if OBJECT_SLOT_WRAPPERS.contains(&name) {
+                    return Ok(self.alloc(PyObj::Descriptor {
+                        kind: DescKind::WrapperDescriptor,
+                        qual: format!("object.{name}"),
+                    }));
                 }
                 Err(format!(
                     "AttributeError: type object '{cname}' has no attribute '{name}'"
@@ -8156,6 +8213,13 @@ impl PyHost {
                 *name = key;
             }
         }
+        // `__module__` is the `__name__` of the module whose body is defining the
+        // class (the currently-running module scope).
+        let module = self
+            .globals()
+            .get("__name__")
+            .and_then(|v| self.as_str(v))
+            .unwrap_or_else(|| "__main__".to_string());
         self.classes.insert(
             name.to_string(),
             ClassDef {
@@ -8167,6 +8231,7 @@ impl PyHost {
                 ns,
                 mro,
                 metaclass: metaclass.to_string(),
+                module,
             },
         );
         self.alloc(PyObj::Class(name.to_string()))
@@ -8194,6 +8259,12 @@ pub fn invoke(
             let f = with_host(|h| h.get(&func).cloned());
             match f {
                 Some(PyObj::Builtin(name)) => {
+                    // A named base method bound as an attribute (`g = d.get`):
+                    // route back through `call_method` so it reaches the payload
+                    // via `base_dispatch`.
+                    if let Some(m) = name.strip_prefix("__base_method__.") {
+                        return call_method(&recv, m, args, kwargs);
+                    }
                     // A native `_random.Random` method bound to an instance.
                     if let Some(m) = name.strip_prefix("_random.Random.") {
                         if let Value::Obj(id) = &recv {
@@ -12303,13 +12374,16 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                 ("ALL_COMPLETED", h.new_str("ALL_COMPLETED".to_string())),
             ]
         }),
-        "collections" => with_host(|h| {
+        // `_collections` — the C container accelerators. Exposing the native
+        // `deque`/`defaultdict`/`OrderedDict` here lets the FULL vendored
+        // `collections/__init__.py` run (rather than a native subset), so
+        // `ChainMap`, `Counter`, `UserDict`/`UserList`/`UserString`, and
+        // `namedtuple` all come from the faithful pure-Python source. The other
+        // `_collections` helpers (`_tuplegetter`, `_count_elements`,
+        // `_deque_iterator`) have pure-Python fallbacks in `collections`.
+        "_collections" => with_host(|h| {
             vec![
                 ("deque", h.alloc(PyObj::Builtin("collections.deque".into()))),
-                (
-                    "Counter",
-                    h.alloc(PyObj::Builtin("collections.Counter".into())),
-                ),
                 (
                     "defaultdict",
                     h.alloc(PyObj::Builtin("collections.defaultdict".into())),
@@ -12317,10 +12391,6 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                 (
                     "OrderedDict",
                     h.alloc(PyObj::Builtin("collections.OrderedDict".into())),
-                ),
-                (
-                    "namedtuple",
-                    h.alloc(PyObj::Builtin("collections.namedtuple".into())),
                 ),
             ]
         }),

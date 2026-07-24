@@ -396,6 +396,48 @@ x = (n, log, atexit._ncallbacks())";
     assert_eq!(g(src, "x"), "(2, ['c', 'a'], 0)");
 }
 
+// The FULL vendored `collections` runs (via a native `_collections` arm exposing
+// the container accelerators as type objects), so ChainMap/Counter/OrderedDict/
+// namedtuple/UserList/UserDict all come from the faithful pure-Python source and
+// match CPython 3.14.
+#[cfg(not(feature = "stdlib-ffi"))]
+#[test]
+fn collections_full_vendored() {
+    assert_eq!(g("import collections\nx = collections.Counter('aabbbc').most_common(2)", "x"), "[('b', 3), ('a', 2)]");
+    assert_eq!(
+        g("import collections\nx = dict(collections.ChainMap({'a': 1}, {'a': 2, 'b': 3}))", "x"),
+        "{'a': 1, 'b': 3}",
+    );
+    let nt = "import collections\nP = collections.namedtuple('P', ['x', 'y'])\nx = P(1, 2)._asdict()";
+    assert_eq!(g(nt, "x"), "{'x': 1, 'y': 2}");
+    assert_eq!(g("import collections\nx = list(collections.UserList([1, 2]) + [3])", "x"), "[1, 2, 3]");
+}
+
+// `eval`/`exec` with an explicit globals namespace runs in a scope where a
+// function/lambda it defines captures that namespace (namedtuple's eval'd
+// `__new__` reads `_tuple_new` from the namespace when later called).
+#[test]
+fn eval_globals_captured_by_defined_fn() {
+    let src = "ns = {'_mul': lambda a: a * 3}\nf = eval('lambda n: _mul(n)', ns)\nx = f(7)";
+    assert_eq!(g(src, "x"), "21");
+}
+
+// A builtin-subclass instance delegates to its native payload when a base method
+// is BOUND to a name (`g = d.get`) and when the instance is passed to
+// `zip`/`map`/`dict` (payload iteration / the keys() mapping protocol).
+#[test]
+fn builtin_subclass_delegation() {
+    // Bound base method resolves through the payload.
+    let bind = "class D(dict):\n    pass\nd = D(); d['a'] = 1\ng = d.get\nx = (g('a'), g('z', 9))";
+    assert_eq!(g(bind, "x"), "(1, 9)");
+    // A tuple subclass passed to zip iterates its payload.
+    let z = "class T(tuple):\n    pass\nt = tuple.__new__(T, (1, 2))\nx = dict(zip(['a', 'b'], t))";
+    assert_eq!(g(z, "x"), "{'a': 1, 'b': 2}");
+    // dict() over a user mapping uses keys()+__getitem__.
+    let m = "class M:\n    def keys(self):\n        return ['x']\n    def __getitem__(self, k):\n        return k.upper()\nx = dict(M())";
+    assert_eq!(g(m, "x"), "{'x': 'X'}");
+}
+
 // `import a.b` binds the TOP package `a` (not the leaf), and importing a dotted
 // name pulls its parent packages first — so `import os.path` gives the `os`
 // module with `os.path` reachable, and `import collections.abc` works via the

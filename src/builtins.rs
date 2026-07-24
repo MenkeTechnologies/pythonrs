@@ -3021,6 +3021,13 @@ pub fn is_type_object_name(n: &str) -> bool {
                 | "property"
                 | "classmethod"
                 | "staticmethod"
+                // The native `collections` container constructors ARE types
+                // (`isinstance(deque, type)`, ABC `register(deque)`), even though
+                // they carry a dotted dispatch name.
+                | "collections.deque"
+                | "collections.defaultdict"
+                | "collections.OrderedDict"
+                | "collections.Counter"
         )
         || (!n.contains('.') && !is_builtin_function(n))
 }
@@ -4524,7 +4531,6 @@ fn run_pysource(want_value: bool, args: &[Value]) -> Result<Value, String> {
     // locals but cannot persist to them or to globals. At module scope, writes go
     // straight to the real module globals and persist.
     let in_function = with_host(|h| h.frame_depth() > 1);
-    let sandboxed = explicit_ns || in_function;
 
     // `eval` requires exactly one expression. Validate the RAW (leading-whitespace
     // stripped, as CPython does) source first, so a statement, a semicolon/newline
@@ -4547,19 +4553,31 @@ fn run_pysource(want_value: bool, args: &[Value]) -> Result<Value, String> {
         src
     };
 
-    let saved = if sandboxed {
-        let snap = with_host(|h| h.snapshot_globals());
-        let mut ns: IndexMap<String, Value> = if explicit_ns {
-            // The provided globals/locals dicts ARE the namespace.
-            IndexMap::new()
-        } else {
-            // In-function, no explicit namespace: module globals + caller locals.
-            let mut base = snap.clone();
-            for (k, v) in with_host(|h| h.caller_locals()) {
-                base.insert(k, v);
-            }
-            base
-        };
+    // Capture the overlay namespace (module globals + caller locals) BEFORE
+    // parking frames, since `caller_locals` reads the innermost (calling) frame.
+    let overlay_base: Option<IndexMap<String, Value>> = if !explicit_ns && in_function {
+        let mut base = with_host(|h| h.snapshot_globals());
+        for (k, v) in with_host(|h| h.caller_locals()) {
+            base.insert(k, v);
+        }
+        Some(base)
+    } else {
+        None
+    };
+
+    // Park any active function frames so the nested chunk runs at module scope
+    // (its globals reach the module namespace, not the caller's locals).
+    let parked = with_host(|h| h.enter_module_scope());
+
+    // With an explicit `globals`/`locals` namespace, run the code in a FRESH,
+    // PERSISTENT module slot backed by that namespace — so any function/lambda the
+    // code defines captures THAT namespace as its `__globals__` and still resolves
+    // its free names after `eval` returns (namedtuple's `eval('lambda …: _tuple_new(
+    // …)', ns)` reads `_tuple_new` from `ns` when the member type is later called).
+    // An in-function eval with NO explicit namespace overlays caller locals on the
+    // real module globals and discards the writes.
+    let fresh_mod: Option<usize> = if explicit_ns {
+        let mut ns: IndexMap<String, Value> = IndexMap::new();
         for d in [globals_arg.as_ref(), locals_arg.as_ref()]
             .into_iter()
             .flatten()
@@ -4568,15 +4586,21 @@ fn run_pysource(want_value: bool, args: &[Value]) -> Result<Value, String> {
                 ns.insert(k, v);
             }
         }
-        with_host(|h| h.replace_globals(ns));
+        Some(with_host(|h| {
+            let mid = h.new_module_slot(ns);
+            h.swap_module(mid)
+        }))
+    } else {
+        None
+    };
+    let overlay_saved: Option<IndexMap<String, Value>> = if let Some(base) = overlay_base {
+        let snap = with_host(|h| h.snapshot_globals());
+        with_host(|h| h.replace_globals(base));
         Some(snap)
     } else {
         None
     };
 
-    // Park any active function frames so the nested chunk runs at module scope
-    // (its globals reach the real module namespace, not the caller's locals).
-    let parked = with_host(|h| h.enter_module_scope());
     let result = (|| -> Result<Value, String> {
         let prog = crate::compile(&to_compile)?;
         let chunk = crate::load_merged(prog);
@@ -4587,24 +4611,24 @@ fn run_pysource(want_value: bool, args: &[Value]) -> Result<Value, String> {
             Value::Undef
         })
     })();
-    with_host(|h| h.restore_scope(parked));
 
-    if let Some(saved) = saved {
-        // With an explicit `globals` dict, copy the post-run namespace back into it
-        // (so `exec("x=1", d)` leaves `d["x"] == 1`). The in-function overlay case
-        // writes nothing back — its assignments are discarded. Either way, restore
-        // the interpreter's real module globals.
-        if explicit_ns {
-            if let Some(g) = &globals_arg {
-                for (k, v) in with_host(|h| h.globals_pairs()) {
-                    if k == TMP {
-                        continue;
-                    }
-                    let key = with_host(|h| h.new_str(k));
-                    with_host(|h| h.set_item(g, &key, v))?;
+    if let Some(saved_mod) = fresh_mod {
+        // Copy the post-run namespace back into the caller's `globals` dict (so
+        // `exec("x=1", d)` leaves `d["x"] == 1`), then restore the module — the
+        // fresh slot lives on for any function that captured it.
+        if let Some(g) = &globals_arg {
+            for (k, v) in with_host(|h| h.globals_pairs()) {
+                if k == TMP {
+                    continue;
                 }
+                let key = with_host(|h| h.new_str(k));
+                with_host(|h| h.set_item(g, &key, v))?;
             }
         }
+        with_host(|h| h.swap_module(saved_mod));
+    }
+    with_host(|h| h.restore_scope(parked));
+    if let Some(saved) = overlay_saved {
         with_host(|h| h.replace_globals(saved));
     }
     result
@@ -5203,10 +5227,14 @@ fn construct_dict(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, S
                 _ => None,
             })
         });
-        // A foreign (CPython) mapping (ChainMap, a custom Mapping, …) exposes
-        // `keys()`; `dict(mapping)` copies via keys()+subscript, matching CPython,
-        // instead of iterating it as bare keys.
-        let foreign_keys = if dict_map.is_none() && with_host(|h| h.foreign_id(v)).is_some() {
+        // A mapping that exposes `keys()` — a native user `Mapping` (ChainMap,
+        // UserDict) or a foreign (CPython) object — is copied via keys()+subscript,
+        // matching CPython, instead of being iterated as bare keys / pairs.
+        let has_keys = with_host(|h| match h.get(v) {
+            Some(PyObj::Instance(i)) => h.class_lookup(&i.class, "keys").is_some(),
+            _ => false,
+        }) || with_host(|h| h.foreign_id(v)).is_some();
+        let foreign_keys = if dict_map.is_none() && has_keys {
             host::call_method(v, "keys", vec![], vec![]).ok()
         } else {
             None
@@ -5214,8 +5242,16 @@ fn construct_dict(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, S
         if let Some(m) = dict_map {
             d = m;
         } else if let Some(keys) = foreign_keys {
+            // `d[k] = mapping[k]` via the subscript protocol (`__getitem__`), so a
+            // native user `Mapping` (ChainMap) resolves through its own method,
+            // not the host's builtin-container `get_item`.
+            let is_native = with_host(|h| matches!(h.get(v), Some(PyObj::Instance(_))));
             for k in host::iter_vec(&keys)? {
-                let val = with_host(|h| h.get_item(v, &k))?;
+                let val = if is_native {
+                    host::call_method(v, "__getitem__", vec![k.clone()], vec![])?
+                } else {
+                    with_host(|h| h.get_item(v, &k))?
+                };
                 let key = with_host(|h| h.to_key(&k))?;
                 host::dict_put(&mut d, key, k, val);
             }
