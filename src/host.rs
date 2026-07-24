@@ -632,6 +632,24 @@ pub enum PyObj {
         origin: Value,
         args: Vec<Value>,
     },
+    /// A compiled `re` pattern (`re.compile(...)`). `id` indexes
+    /// [`PyHost::regexes`]; `pattern` is the original source string (for
+    /// `.pattern`), `flags` the `re` flag bits, `groups` the capture-group count.
+    Pattern {
+        id: usize,
+        pattern: String,
+        flags: i64,
+        groups: usize,
+    },
+    /// A `re` match object. `text` is the searched string; `spans` holds the
+    /// `(start, end)` byte range of each group (group 0 is the whole match), with
+    /// `None` for a group that did not participate. `named` maps group names to
+    /// their index.
+    Match {
+        text: String,
+        spans: Vec<Option<(usize, usize)>>,
+        named: Vec<(String, usize)>,
+    },
     /// A `time.struct_time` — the 9-field broken-down time sequence
     /// (`tm_year … tm_isdst`) plus the named-only `tm_gmtoff`/`tm_zone`. Indexes
     /// and iterates as a 9-tuple; the extra two are attribute-only. `fields` holds
@@ -1198,6 +1216,10 @@ pub struct PyHost {
     /// `atexit`-registered callbacks: `(func, args, kwargs)` in registration
     /// order. Run LIFO at interpreter shutdown ([`run_atexit_callbacks`]).
     pub atexit_callbacks: Vec<(Value, Vec<Value>, Vec<(String, Value)>)>,
+    /// Compiled `re` patterns, indexed by [`PyObj::Pattern`]'s `id`. The native
+    /// `re` module (backed by the `regex` crate) stores each compiled `Regex`
+    /// here so a `PyObj::Pattern` stays cheap to clone.
+    pub regexes: Vec<regex::Regex>,
 }
 
 /// Whether a `GenCell` backs a plain generator, an `async def` coroutine, or
@@ -1521,6 +1543,7 @@ impl PyHost {
             sys_modules: None,
             mt_states: HashMap::new(),
             atexit_callbacks: Vec::new(),
+            regexes: Vec::new(),
         }
     }
 
@@ -2781,6 +2804,8 @@ impl PyHost {
                 Some(PyObj::GenericAlias { .. }) => "GenericAlias".into(),
                 Some(PyObj::TypeVarLike { kind, .. }) => kind.type_name().into(),
                 Some(PyObj::StructTime { .. }) => "struct_time".into(),
+                Some(PyObj::Pattern { .. }) => "re.Pattern".into(),
+                Some(PyObj::Match { .. }) => "re.Match".into(),
                 Some(PyObj::Namespace { .. }) => "SimpleNamespace".into(),
                 Some(PyObj::MappingProxy { .. }) => "mappingproxy".into(),
                 Some(PyObj::Descriptor { kind, .. }) => kind.type_name().into(),
@@ -2920,6 +2945,18 @@ impl PyHost {
                         .map(|(name, v)| format!("{name}={}", self.repr_of(v)))
                         .collect();
                     format!("time.struct_time({})", parts.join(", "))
+                }
+                Some(PyObj::Pattern { pattern, .. }) => {
+                    // CPython truncates a long pattern in the repr.
+                    let shown: String = pattern.chars().take(200).collect();
+                    let q = shown.replace('\\', "\\\\").replace('\'', "\\'");
+                    format!("re.compile('{q}')")
+                }
+                Some(PyObj::Match { text, spans, .. }) => {
+                    let (s, e) = spans.first().copied().flatten().unwrap_or((0, 0));
+                    let matched = text.get(s..e).unwrap_or("");
+                    let q = matched.replace('\\', "\\\\").replace('\'', "\\'");
+                    format!("<re.Match object; span=({s}, {e}), match='{q}'>")
                 }
                 Some(PyObj::Union { args }) => {
                     let args = args.clone();
@@ -7465,6 +7502,55 @@ impl PyHost {
                     "AttributeError: 'time.struct_time' object has no attribute '{name}'"
                 ))
             }
+            // `re.Pattern` attributes; method names bind as callable methods.
+            Some(PyObj::Pattern {
+                pattern,
+                flags,
+                groups,
+                ..
+            }) => {
+                let (pattern, flags, groups) = (pattern.clone(), *flags, *groups);
+                match name {
+                    "pattern" => Ok(self.new_str(pattern)),
+                    "flags" => Ok(Value::Int(flags)),
+                    "groups" => Ok(Value::Int(groups as i64)),
+                    "match" | "search" | "fullmatch" | "findall" | "finditer" | "sub"
+                    | "subn" | "split" => {
+                        let func = self.alloc(PyObj::Builtin(format!("__base_method__.{name}")));
+                        Ok(self.alloc(PyObj::BoundMethod {
+                            recv: recv.clone(),
+                            func,
+                        }))
+                    }
+                    _ => Err(format!(
+                        "AttributeError: 're.Pattern' object has no attribute '{name}'"
+                    )),
+                }
+            }
+            // `re.Match` attributes; method names bind as callable methods.
+            Some(PyObj::Match { text, spans, .. }) => {
+                match name {
+                    "string" => Ok(self.new_str(text.clone())),
+                    "lastindex" => Ok(spans
+                        .iter()
+                        .rposition(|s| s.is_some())
+                        .filter(|&i| i > 0)
+                        .map(|i| Value::Int(i as i64))
+                        .unwrap_or(Value::Undef)),
+                    "pos" => Ok(Value::Int(0)),
+                    "endpos" => Ok(Value::Int(text.len() as i64)),
+                    "group" | "groups" | "groupdict" | "start" | "end" | "span" => {
+                        let func = self.alloc(PyObj::Builtin(format!("__base_method__.{name}")));
+                        Ok(self.alloc(PyObj::BoundMethod {
+                            recv: recv.clone(),
+                            func,
+                        }))
+                    }
+                    _ => Err(format!(
+                        "AttributeError: 're.Match' object has no attribute '{name}'"
+                    )),
+                }
+            }
             // Generic alias: expose origin/args; forward anything else to origin.
             Some(PyObj::GenericAlias { origin, args }) => {
                 let (origin, args) = (origin.clone(), args.clone());
@@ -8780,6 +8866,11 @@ pub fn call_method(
     }
     let obj = with_host(|h| h.get(recv).cloned());
     match obj {
+        // `re.Pattern` / `re.Match` methods (`p.search(s)`, `m.group(1)`, …).
+        Some(PyObj::Pattern { .. }) => {
+            crate::builtins::re_pattern_method(recv, name, &args, &kwargs)
+        }
+        Some(PyObj::Match { .. }) => crate::builtins::re_match_method(recv, name, &args),
         // `func.__get__(obj, cls)` invoked directly (not via attribute read):
         // the descriptor bind — `obj` is None → the plain function, else a bound
         // method. Mirrors the `__get__` attribute a function exposes.
@@ -12155,6 +12246,35 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
             let n1 = h.new_str(name_dst);
             let tzname = h.new_tuple(vec![n0, n1]);
             out.push(("tzname", tzname));
+            out
+        }),
+        // `re` — regular expressions, backed natively by the Rust `regex` crate
+        // (a linear-time NFA engine). Faithful for the common syntax
+        // (`\d \w \s`, groups, named groups, alternation, anchors, quantifiers,
+        // inline flags); features the engine lacks (backreferences, lookaround)
+        // raise `re.error` at compile, as documented.
+        "re" => with_host(|h| {
+            const FNS: &[&str] = &[
+                "compile", "match", "search", "fullmatch", "findall", "finditer",
+                "sub", "subn", "split", "escape", "purge",
+            ];
+            let mut out: Vec<(&str, Value)> =
+                FNS.iter().map(|f| (*f, h.alloc(PyObj::Builtin(format!("re.{f}"))))).collect();
+            // Flag constants (both long and short names).
+            for (name, bit) in [
+                ("IGNORECASE", 2i64), ("I", 2),
+                ("LOCALE", 4), ("L", 4),
+                ("MULTILINE", 8), ("M", 8),
+                ("DOTALL", 16), ("S", 16),
+                ("UNICODE", 32), ("U", 32),
+                ("VERBOSE", 64), ("X", 64),
+                ("ASCII", 256), ("A", 256),
+                ("NOFLAG", 0),
+            ] {
+                out.push((name, Value::Int(bit)));
+            }
+            // `re.error` is a subclass of Exception; expose the class object.
+            out.push(("error", h.alloc(PyObj::Builtin("re.error".into()))));
             out
         }),
         // `errno` — the platform error numbers (from libc) plus the `errorcode`

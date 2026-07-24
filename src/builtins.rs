@@ -3405,6 +3405,10 @@ pub fn call_builtin_function(
     if let Some(f) = name.strip_prefix("time.") {
         return call_time(f, args);
     }
+    // `re.*` — regular expressions (module-level functions).
+    if let Some(f) = name.strip_prefix("re.") {
+        return call_re(f, args, kwargs);
+    }
     // `atexit.*` — shutdown-callback registry.
     if let Some(f) = name.strip_prefix("atexit.") {
         return match f {
@@ -6579,6 +6583,448 @@ fn call_typing(f: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Resul
         return Ok(with_host(|h| h.make_type_var(kind, name, constraints, kwargs)));
     }
     Err(host::name_error(&format!("_typing.{f}")))
+}
+
+/// Translate a Python `re` pattern + flag bits into a `regex`-crate pattern by
+/// prepending the inline-flag group `(?imsx)`, then compile it. `re` flag bits:
+/// I=2, M=8, S=16, X=64 (others are no-ops for the byte/NFA engine here).
+fn re_compile_raw(pattern: &str, flags: i64) -> Result<regex::Regex, String> {
+    let mut inline = String::new();
+    if flags & 2 != 0 {
+        inline.push('i');
+    }
+    if flags & 8 != 0 {
+        inline.push('m');
+    }
+    if flags & 16 != 0 {
+        inline.push('s');
+    }
+    if flags & 64 != 0 {
+        inline.push('x');
+    }
+    let full = if inline.is_empty() {
+        pattern.to_string()
+    } else {
+        format!("(?{inline}){pattern}")
+    };
+    regex::Regex::new(&full).map_err(|e| {
+        // The `re.error` message; the engine's own text is close enough.
+        format!("re.error: {}", e.to_string().lines().last().unwrap_or("bad pattern"))
+    })
+}
+
+/// Compile `pattern` (a str or an already-compiled `Pattern`) with `flags` into a
+/// `PyObj::Pattern`, storing the `Regex` in the host.
+fn re_compile(pattern: &Value, flags: i64) -> Result<Value, String> {
+    // An already-compiled pattern passes through (`re.match(compiled, s)`).
+    if with_host(|h| matches!(h.get(pattern), Some(PyObj::Pattern { .. }))) {
+        return Ok(pattern.clone());
+    }
+    let src = with_host(|h| h.as_str(pattern))
+        .ok_or_else(|| host::type_error("first argument must be string or compiled pattern"))?;
+    let re = re_compile_raw(&src, flags)?;
+    let groups = re.captures_len().saturating_sub(1);
+    Ok(with_host(|h| {
+        let id = h.regexes.len();
+        h.regexes.push(re);
+        h.alloc(PyObj::Pattern {
+            id,
+            pattern: src,
+            flags,
+            groups,
+        })
+    }))
+}
+
+/// Build a `PyObj::Match` from a regex match over `text` (byte spans), recording
+/// the named-group index map from the pattern.
+fn re_build_match(pat_id: usize, text: &str, m_spans: Vec<Option<(usize, usize)>>) -> Value {
+    let named: Vec<(String, usize)> = with_host(|h| {
+        h.regexes[pat_id]
+            .capture_names()
+            .enumerate()
+            .filter_map(|(i, n)| n.map(|n| (n.to_string(), i)))
+            .collect()
+    });
+    with_host(|h| {
+        h.alloc(PyObj::Match {
+            text: text.to_string(),
+            spans: m_spans,
+            named,
+        })
+    })
+}
+
+/// Run a compiled pattern's search/match against `text`, returning the group
+/// spans of the first match at/after `anchored` position, or None.
+fn re_first_match(pat_id: usize, text: &str, anchored: bool) -> Option<Vec<Option<(usize, usize)>>> {
+    with_host(|h| {
+        let re = &h.regexes[pat_id];
+        let caps = re.captures(text)?;
+        // `match` requires the match to start at position 0.
+        if anchored && caps.get(0).map(|m| m.start()) != Some(0) {
+            return None;
+        }
+        Some(
+            (0..re.captures_len())
+                .map(|i| caps.get(i).map(|m| (m.start(), m.end())))
+                .collect(),
+        )
+    })
+}
+
+/// `re.*` module functions: compile a pattern (when given a raw one) and apply
+/// the operation. Pattern/Match method calls are dispatched separately.
+fn call_re(f: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Result<Value, String> {
+    let flag_arg = |args: &[Value], idx: usize| -> i64 {
+        args.get(idx)
+            .and_then(|v| with_host(|h| h.as_int(v)))
+            .or_else(|| {
+                kwargs
+                    .iter()
+                    .find(|(k, _)| k == "flags")
+                    .and_then(|(_, v)| with_host(|h| h.as_int(v)))
+            })
+            .unwrap_or(0)
+    };
+    match f {
+        "escape" => {
+            let a = arg0(&args)?;
+            let s = with_host(|h| h.as_str(&a))
+                .ok_or_else(|| host::type_error("re.escape() requires a string"))?;
+            Ok(Value::str(&regex::escape(&s)))
+        }
+        "purge" => Ok(Value::Undef),
+        "compile" => re_compile(&arg0(&args)?, flag_arg(&args, 1)),
+        // `re.match/search/fullmatch(pattern, string, flags=0)` — compile then run.
+        "match" | "search" | "fullmatch" => {
+            let pat = re_compile(&arg0(&args)?, flag_arg(&args, 2))?;
+            let text = args.get(1).cloned().unwrap_or(Value::Undef);
+            re_pattern_method(&pat, f, &[text], &[])
+        }
+        "findall" | "finditer" | "split" => {
+            let pat = re_compile(&arg0(&args)?, flag_arg(&args, 2))?;
+            let text = args.get(1).cloned().unwrap_or(Value::Undef);
+            re_pattern_method(&pat, f, &[text], &[])
+        }
+        "sub" | "subn" => {
+            // `sub(pattern, repl, string, count=0, flags=0)`.
+            let pat = re_compile(&arg0(&args)?, flag_arg(&args, 4))?;
+            let rest: Vec<Value> = args.iter().skip(1).cloned().collect();
+            re_pattern_method(&pat, f, &rest, &[])
+        }
+        _ => Err(host::name_error(&format!("re.{f}"))),
+    }
+}
+
+/// A compiled `Pattern`'s methods (`p.match(s)`, `p.findall(s)`, `p.sub(r, s)`,
+/// …), also the target of the module-level `re.match`/`re.sub`/… helpers.
+pub fn re_pattern_method(
+    pat: &Value,
+    method: &str,
+    args: &[Value],
+    _kwargs: &[(String, Value)],
+) -> Result<Value, String> {
+    let (pat_id, groups) = match with_host(|h| h.get(pat).cloned()) {
+        Some(PyObj::Pattern { id, groups, .. }) => (id, groups),
+        _ => return Err(host::type_error("not a compiled pattern")),
+    };
+    let text = with_host(|h| h.as_str(args.first().unwrap_or(&Value::Undef)));
+    match method {
+        "match" | "search" | "fullmatch" => {
+            let text = text.ok_or_else(|| host::type_error("expected string"))?;
+            let anchored = method == "match" || method == "fullmatch";
+            match re_first_match(pat_id, &text, anchored) {
+                Some(spans) => {
+                    // `fullmatch` also requires the match to reach the end.
+                    if method == "fullmatch"
+                        && spans.first().copied().flatten().map(|(_, e)| e) != Some(text.len())
+                    {
+                        return Ok(Value::Undef);
+                    }
+                    Ok(re_build_match(pat_id, &text, spans))
+                }
+                None => Ok(Value::Undef),
+            }
+        }
+        "findall" => {
+            let text = text.ok_or_else(|| host::type_error("expected string"))?;
+            // Each match's group strings (group 0 when no groups, else groups 1..).
+            let rows: Vec<Vec<String>> = with_host(|h| {
+                let re = &h.regexes[pat_id];
+                re.captures_iter(&text)
+                    .map(|caps| {
+                        let grp = |i: usize| caps.get(i).map(|m| m.as_str().to_string()).unwrap_or_default();
+                        match groups {
+                            0 => vec![grp(0)],
+                            _ => (1..=groups).map(grp).collect(),
+                        }
+                    })
+                    .collect()
+            });
+            // 0 or 1 group → list of strings; multiple → list of tuples.
+            let vals: Vec<Value> = rows
+                .into_iter()
+                .map(|row| {
+                    if groups > 1 {
+                        let t: Vec<Value> = row.iter().map(|s| Value::str(s)).collect();
+                        with_host(|h| h.new_tuple(t))
+                    } else {
+                        Value::str(&row[0])
+                    }
+                })
+                .collect();
+            Ok(with_host(|h| h.new_list(vals)))
+        }
+        "finditer" => {
+            let text = text.ok_or_else(|| host::type_error("expected string"))?;
+            let all: Vec<Vec<Option<(usize, usize)>>> = with_host(|h| {
+                let re = &h.regexes[pat_id];
+                re.captures_iter(&text)
+                    .map(|caps| {
+                        (0..re.captures_len())
+                            .map(|i| caps.get(i).map(|m| (m.start(), m.end())))
+                            .collect()
+                    })
+                    .collect()
+            });
+            let matches: Vec<Value> =
+                all.into_iter().map(|s| re_build_match(pat_id, &text, s)).collect();
+            // Return a list iterator (finditer yields lazily in CPython; a list is
+            // an acceptable eager stand-in for typical use).
+            let list = with_host(|h| h.new_list(matches));
+            with_host(|h| h.make_iter(&list))
+        }
+        "sub" | "subn" => {
+            let repl = args.first().cloned().unwrap_or(Value::Undef);
+            let text = with_host(|h| h.as_str(args.get(1).unwrap_or(&Value::Undef)))
+                .ok_or_else(|| host::type_error("expected string"))?;
+            let count = args.get(2).and_then(|v| with_host(|h| h.as_int(v))).unwrap_or(0);
+            re_sub(pat_id, &repl, &text, count, method == "subn")
+        }
+        "split" => {
+            let text = text.ok_or_else(|| host::type_error("expected string"))?;
+            let maxsplit = args.get(1).and_then(|v| with_host(|h| h.as_int(v))).unwrap_or(0);
+            let parts: Vec<String> = with_host(|h| {
+                let re = &h.regexes[pat_id];
+                if maxsplit > 0 {
+                    re.splitn(&text, (maxsplit as usize) + 1).map(|s| s.to_string()).collect()
+                } else {
+                    re.split(&text).map(|s| s.to_string()).collect()
+                }
+            });
+            let vals: Vec<Value> = parts.iter().map(|s| Value::str(s)).collect();
+            Ok(with_host(|h| h.new_list(vals)))
+        }
+        _ => Err(host::type_error(&format!("Pattern has no method '{method}'"))),
+    }
+}
+
+/// `re.sub`/`Pattern.sub` — replace matches. A string replacement translates
+/// Python's `\1`/`\g<name>` backrefs to the `regex` crate's `$1`/`${name}`; a
+/// callable replacement is called with each match object.
+fn re_sub(
+    pat_id: usize,
+    repl: &Value,
+    text: &str,
+    count: i64,
+    want_count: bool,
+) -> Result<Value, String> {
+    let is_callable = with_host(|h| {
+        matches!(
+            h.get(repl),
+            Some(PyObj::Func(_)) | Some(PyObj::BoundMethod { .. }) | Some(PyObj::Builtin(_))
+        )
+    });
+    if is_callable {
+        // Collect match spans, call repl(match) for each, splice the results.
+        let spans: Vec<Vec<Option<(usize, usize)>>> = with_host(|h| {
+            let re = &h.regexes[pat_id];
+            re.captures_iter(text)
+                .map(|c| {
+                    (0..re.captures_len())
+                        .map(|i| c.get(i).map(|m| (m.start(), m.end())))
+                        .collect()
+                })
+                .collect()
+        });
+        let mut out = String::new();
+        let mut last = 0usize;
+        let mut n = 0i64;
+        for s in spans {
+            if count > 0 && n >= count {
+                break;
+            }
+            let (ms, me) = s.first().copied().flatten().unwrap_or((0, 0));
+            out.push_str(&text[last..ms]);
+            let m = re_build_match(pat_id, text, s);
+            let r = host::invoke(repl, vec![m], vec![])?;
+            out.push_str(&with_host(|h| h.as_str(&r)).unwrap_or_default());
+            last = me;
+            n += 1;
+        }
+        out.push_str(&text[last..]);
+        return finish_sub(Value::str(&out), n, want_count);
+    }
+    // String replacement: translate backrefs and apply.
+    let rsrc = with_host(|h| h.as_str(repl)).unwrap_or_default();
+    let rrepl = re_translate_repl(&rsrc);
+    let (result, n) = with_host(|h| {
+        let re = &h.regexes[pat_id];
+        if count > 0 {
+            let mut cnt = 0i64;
+            let s = re
+                .replacen(text, count as usize, rrepl.as_str())
+                .into_owned();
+            cnt = re.find_iter(text).take(count as usize).count() as i64;
+            let _ = &mut cnt;
+            (s, cnt)
+        } else {
+            let n = re.find_iter(text).count() as i64;
+            (re.replace_all(text, rrepl.as_str()).into_owned(), n)
+        }
+    });
+    finish_sub(Value::str(&result), n, want_count)
+}
+
+fn finish_sub(result: Value, n: i64, want_count: bool) -> Result<Value, String> {
+    if want_count {
+        Ok(with_host(|h| h.new_tuple(vec![result, Value::Int(n)])))
+    } else {
+        Ok(result)
+    }
+}
+
+/// Translate a Python `sub` replacement string (`\1`, `\g<n>`, `\g<name>`) into
+/// the `regex` crate's syntax (`${1}`, `${name}`). A literal `$` is escaped.
+fn re_translate_repl(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '$' => out.push_str("$$"),
+            '\\' => match chars.peek() {
+                Some(d) if d.is_ascii_digit() => {
+                    out.push_str("${");
+                    while let Some(d) = chars.peek() {
+                        if d.is_ascii_digit() {
+                            out.push(*d);
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    out.push('}');
+                }
+                Some('g') => {
+                    chars.next(); // g
+                    if chars.peek() == Some(&'<') {
+                        chars.next(); // <
+                        out.push_str("${");
+                        while let Some(d) = chars.peek() {
+                            if *d == '>' {
+                                chars.next();
+                                break;
+                            }
+                            out.push(*d);
+                            chars.next();
+                        }
+                        out.push('}');
+                    }
+                }
+                Some(other) => {
+                    // `\n`, `\t`, `\\` — keep as the literal char.
+                    let o = *other;
+                    chars.next();
+                    match o {
+                        'n' => out.push('\n'),
+                        't' => out.push('\t'),
+                        'r' => out.push('\r'),
+                        _ => out.push(o),
+                    }
+                }
+                None => out.push('\\'),
+            },
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// A `re.Match` object's methods (`m.group(n)`, `m.groups()`, `m.span()`, …).
+pub fn re_match_method(m: &Value, method: &str, args: &[Value]) -> Result<Value, String> {
+    let (text, spans, named) = match with_host(|h| h.get(m).cloned()) {
+        Some(PyObj::Match { text, spans, named }) => (text, spans, named),
+        _ => return Err(host::type_error("not a match object")),
+    };
+    // Resolve a group specifier (int index or str name) to a group number.
+    let group_idx = |g: &Value| -> Option<usize> {
+        if let Some(i) = with_host(|h| h.as_int(g)) {
+            return Some(i as usize);
+        }
+        with_host(|h| h.as_str(g))
+            .and_then(|name| named.iter().find(|(n, _)| *n == name).map(|(_, i)| *i))
+    };
+    let group_str = |idx: usize| -> Value {
+        match spans.get(idx).copied().flatten() {
+            Some((s, e)) => Value::str(text.get(s..e).unwrap_or("")),
+            None => Value::Undef, // an unmatched optional group is None
+        }
+    };
+    match method {
+        "group" => {
+            if args.is_empty() {
+                return Ok(group_str(0));
+            }
+            if args.len() == 1 {
+                let idx = group_idx(&args[0])
+                    .ok_or_else(|| "IndexError: no such group".to_string())?;
+                return Ok(group_str(idx));
+            }
+            let vals: Vec<Value> = args
+                .iter()
+                .map(|g| group_idx(g).map(group_str).unwrap_or(Value::Undef))
+                .collect();
+            Ok(with_host(|h| h.new_tuple(vals)))
+        }
+        "groups" => {
+            let default = args.first().cloned().unwrap_or(Value::Undef);
+            let vals: Vec<Value> = (1..spans.len())
+                .map(|i| match group_str(i) {
+                    Value::Undef => default.clone(),
+                    v => v,
+                })
+                .collect();
+            Ok(with_host(|h| h.new_tuple(vals)))
+        }
+        "groupdict" => {
+            let named = named.clone();
+            let mut d: indexmap::IndexMap<host::PKey, (Value, Value)> = indexmap::IndexMap::new();
+            for (name, idx) in named {
+                let k = with_host(|h| h.new_str(name.clone()));
+                d.insert(host::PKey::Str(name), (k, group_str(idx)));
+            }
+            Ok(with_host(|h| h.new_dict(d)))
+        }
+        "start" | "end" | "span" => {
+            let idx = args
+                .first()
+                .and_then(|g| group_idx(g))
+                .unwrap_or(0);
+            match spans.get(idx).copied().flatten() {
+                Some((s, e)) => Ok(match method {
+                    "start" => Value::Int(s as i64),
+                    "end" => Value::Int(e as i64),
+                    _ => with_host(|h| h.new_tuple(vec![Value::Int(s as i64), Value::Int(e as i64)])),
+                }),
+                None => Ok(match method {
+                    "span" => with_host(|h| h.new_tuple(vec![Value::Int(-1), Value::Int(-1)])),
+                    _ => Value::Int(-1),
+                }),
+            }
+        }
+        _ => Err(host::type_error(&format!("Match has no method '{method}'"))),
+    }
 }
 
 /// Timezone constants (`timezone`, `altzone`, `daylight`, `tzname`) for the `time`
