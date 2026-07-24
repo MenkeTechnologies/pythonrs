@@ -7103,6 +7103,12 @@ impl PyHost {
                         .unwrap_or_else(|| "__main__".to_string());
                     return Ok(self.new_str(m));
                 }
+                // A class with no annotations still has `__annotations__ == {}`
+                // (not an AttributeError), as in CPython — else typing's
+                // `_get_protocol_attrs` falls back to `annotationlib` (t-strings).
+                if name == "__annotations__" && self.class_lookup(&cname, name).is_none() {
+                    return Ok(self.new_dict(IndexMap::new()));
+                }
                 // `cls.__class__` is the metaclass (`type(cls)`): a user metaclass
                 // becomes a `Class`, otherwise the builtin `type`.
                 if name == "__class__" {
@@ -8383,6 +8389,9 @@ pub fn is_generic_subscriptable(recv: &Value) -> bool {
         Some(PyObj::Builtin(n)) => matches!(
             n.as_str(),
             "list" | "dict" | "tuple" | "set" | "frozenset" | "type"
+            // typing's `Generic[T]` builds a generic alias; used as a base
+            // (`class C(Generic[T])`), its `__mro_entries__` substitutes `Generic`.
+                | "Generic"
         ),
         _ => false,
     })

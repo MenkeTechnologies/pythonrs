@@ -396,6 +396,20 @@ x = (n, log, atexit._ncallbacks())";
     assert_eq!(g(src, "x"), "(2, ['c', 'a'], 0)");
 }
 
+// A user class exposes `__module__` (its defining module) and, with no
+// annotations, `__annotations__ == {}` (not an AttributeError) — CPython
+// semantics that typing.py's `_get_protocol_attrs` depends on. `Generic[T]`
+// builds a generic alias.
+#[cfg(not(feature = "stdlib-ffi"))]
+#[test]
+fn class_dunders_and_generic_subscript() {
+    assert_eq!(g("class C: pass\nx = C.__annotations__", "x"), "{}");
+    assert_eq!(g("class C: pass\nx = C.__module__", "x"), "'__main__'");
+    assert_eq!(g("import collections\nx = collections.Counter.__module__", "x"), "'collections'");
+    let gen = "from _typing import Generic, TypeVar\nT = TypeVar('T')\nx = type(Generic[T]).__name__";
+    assert_eq!(g(gen, "x"), "'GenericAlias'");
+}
+
 // The FULL vendored `collections` runs (via a native `_collections` arm exposing
 // the container accelerators as type objects), so ChainMap/Counter/OrderedDict/
 // namedtuple/UserList/UserDict all come from the faithful pure-Python source and
