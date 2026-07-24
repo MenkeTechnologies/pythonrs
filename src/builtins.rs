@@ -5583,6 +5583,81 @@ fn itertools_groupby(args: &[Value], _kwargs: &[(String, Value)]) -> Result<Valu
     Ok(list_iter(out))
 }
 
+/// A `_random.Random` instance method, dispatched against the instance's MT
+/// state (keyed by heap id `id`).
+pub fn random_method(id: u32, name: &str, args: &[Value]) -> Result<Value, String> {
+    match name {
+        "seed" => {
+            let key: Vec<u32> = match args.first() {
+                None | Some(Value::Undef) => {
+                    let mut buf = [0u8; 32];
+                    use std::io::Read;
+                    let _ = std::fs::File::open("/dev/urandom")
+                        .and_then(|mut f| f.read_exact(&mut buf));
+                    buf.chunks(4)
+                        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect()
+                }
+                Some(a) => {
+                    let big = with_host(|h| h.big_val(a))
+                        .ok_or_else(|| host::type_error("seed must be an integer"))?;
+                    let (_, digits) = big.to_u32_digits();
+                    if digits.is_empty() {
+                        vec![0]
+                    } else {
+                        digits
+                    }
+                }
+            };
+            with_host(|h| h.mt_states.entry(id).or_default().init_by_array(&key));
+            Ok(Value::Undef)
+        }
+        "random" => Ok(Value::Float(with_host(|h| {
+            h.mt_states.entry(id).or_default().random()
+        }))),
+        "getrandbits" => {
+            let k = args.first().and_then(|v| with_host(|h| h.as_int(v))).unwrap_or(0);
+            if k <= 0 {
+                return Err("ValueError: number of bits must be greater than zero".into());
+            }
+            Ok(with_host(|h| {
+                let st = h.mt_states.entry(id).or_default();
+                if k <= 32 {
+                    return Value::Int((st.next_u32() >> (32 - k)) as i64);
+                }
+                let words = ((k - 1) / 32 + 1) as usize;
+                let mut result = num_bigint::BigInt::from(0);
+                let mut kk = k;
+                for i in 0..words {
+                    let mut r = st.next_u32();
+                    if kk < 32 {
+                        r >>= 32 - kk;
+                    }
+                    result |= num_bigint::BigInt::from(r) << (32 * i as u32);
+                    kk -= 32;
+                }
+                h.norm_big(result)
+            }))
+        }
+        "getstate" => Ok(with_host(|h| {
+            let s = h.mt_states.entry(id).or_default().state();
+            let vals: Vec<Value> = s.into_iter().map(|w| Value::Int(w as i64)).collect();
+            h.new_tuple(vals)
+        })),
+        "setstate" => {
+            let tup = arg0(args)?;
+            let items = host::iter_vec(&tup)?;
+            let s: Vec<u32> = items
+                .iter()
+                .map(|v| with_host(|h| h.as_int(v)).unwrap_or(0) as u32)
+                .collect();
+            with_host(|h| h.mt_states.entry(id).or_default().set_state(&s));
+            Ok(Value::Undef)
+        }
+        _ => Err(format!("AttributeError: '_random.Random' object has no method '{name}'")),
+    }
+}
+
 /// The `posix` syscall surface, backed by std::fs/std::env/libc.
 fn call_posix(name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Result<Value, String> {
     let path_arg = |i: usize| -> Option<String> {

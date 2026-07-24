@@ -354,6 +354,117 @@ const OBJECT_SLOT_WRAPPERS: &[&str] = &[
     "__sizeof__",
 ];
 
+/// MT19937 — the Mersenne Twister behind CPython's `random`. Seeded via CPython's
+/// `init_by_array`, so `random.seed(n); random.random()` matches CPython.
+#[derive(Clone)]
+pub struct MtState {
+    mt: [u32; 624],
+    index: usize,
+}
+
+impl Default for MtState {
+    fn default() -> Self {
+        let mut s = MtState {
+            mt: [0; 624],
+            index: 624,
+        };
+        s.init_by_array(&[19650218u32.wrapping_add(0)]); // placeholder; reseeded on use
+        s
+    }
+}
+
+impl MtState {
+    fn init_genrand(&mut self, seed: u32) {
+        self.mt[0] = seed;
+        for i in 1..624 {
+            self.mt[i] = 1812433253u32
+                .wrapping_mul(self.mt[i - 1] ^ (self.mt[i - 1] >> 30))
+                .wrapping_add(i as u32);
+        }
+        self.index = 624;
+    }
+
+    /// CPython's `init_by_array` (seeds from an array of 32-bit words).
+    pub fn init_by_array(&mut self, key: &[u32]) {
+        self.init_genrand(19650218);
+        let (mut i, mut j) = (1usize, 0usize);
+        let mut k = 624.max(key.len());
+        while k > 0 {
+            self.mt[i] = (self.mt[i]
+                ^ ((self.mt[i - 1] ^ (self.mt[i - 1] >> 30)).wrapping_mul(1664525)))
+            .wrapping_add(key[j])
+            .wrapping_add(j as u32);
+            i += 1;
+            j += 1;
+            if i >= 624 {
+                self.mt[0] = self.mt[623];
+                i = 1;
+            }
+            if j >= key.len() {
+                j = 0;
+            }
+            k -= 1;
+        }
+        k = 623;
+        while k > 0 {
+            self.mt[i] = (self.mt[i]
+                ^ ((self.mt[i - 1] ^ (self.mt[i - 1] >> 30)).wrapping_mul(1566083941)))
+            .wrapping_sub(i as u32);
+            i += 1;
+            if i >= 624 {
+                self.mt[0] = self.mt[623];
+                i = 1;
+            }
+            k -= 1;
+        }
+        self.mt[0] = 0x80000000;
+        self.index = 624;
+    }
+
+    pub fn next_u32(&mut self) -> u32 {
+        if self.index >= 624 {
+            for i in 0..624 {
+                let y = (self.mt[i] & 0x80000000) | (self.mt[(i + 1) % 624] & 0x7fffffff);
+                let mut next = self.mt[(i + 397) % 624] ^ (y >> 1);
+                if y & 1 != 0 {
+                    next ^= 0x9908b0df;
+                }
+                self.mt[i] = next;
+            }
+            self.index = 0;
+        }
+        let mut y = self.mt[self.index];
+        self.index += 1;
+        y ^= y >> 11;
+        y ^= (y << 7) & 0x9d2c5680;
+        y ^= (y << 15) & 0xefc60000;
+        y ^= y >> 18;
+        y
+    }
+
+    /// A random double in [0, 1) — CPython's `random_random` (53-bit).
+    pub fn random(&mut self) -> f64 {
+        let a = (self.next_u32() >> 5) as f64;
+        let b = (self.next_u32() >> 6) as f64;
+        (a * 67108864.0 + b) * (1.0 / 9007199254740992.0)
+    }
+
+    /// The 625-element state (624 MT words + index), as CPython's `getstate`.
+    pub fn state(&self) -> Vec<u32> {
+        let mut v = self.mt.to_vec();
+        v.push(self.index as u32);
+        v
+    }
+
+    /// Restore from a 625-element state (`setstate`).
+    pub fn set_state(&mut self, s: &[u32]) {
+        if s.len() >= 625 {
+            self.mt.copy_from_slice(&s[..624]);
+            self.index = s[624] as usize;
+        }
+    }
+}
+
 /// The lazy `itertools` iterators. Each drives [`PyObj::ItertoolsIter`] through
 /// its step function; the combinatoric ones (product/permutations/…) are built
 /// eagerly instead.
@@ -1025,6 +1136,9 @@ pub struct PyHost {
     /// with the internal cache so Python-level `sys.modules[k] = v` (e.g. os.py's
     /// `sys.modules['os.path'] = path`) is honored by subsequent imports.
     sys_modules: Option<Value>,
+    /// Per-`_random.Random`-instance Mersenne Twister state, keyed by the
+    /// instance's heap id (the RNG backing `random`).
+    pub mt_states: HashMap<u32, MtState>,
 }
 
 /// Whether a `GenCell` backs a plain generator, an `async def` coroutine, or
@@ -1346,6 +1460,7 @@ impl PyHost {
             stderr_target: None,
             modules: IndexMap::new(),
             sys_modules: None,
+            mt_states: HashMap::new(),
         }
     }
 
@@ -1656,8 +1771,8 @@ impl PyHost {
     fn union_members(&self, v: &Value) -> Option<Vec<Value>> {
         match self.get(v) {
             Some(PyObj::Union { args }) => Some(args.clone()),
-            Some(PyObj::Class(_)) => Some(vec![v.clone()]),
-            Some(PyObj::Builtin(n)) if crate::builtins::is_type_like_builtin(n) => {
+            Some(PyObj::Class(_)) | Some(PyObj::GenericAlias { .. }) => Some(vec![v.clone()]),
+            Some(PyObj::Builtin(n)) if crate::builtins::is_type_object_name(n) => {
                 Some(vec![v.clone()])
             }
             // Bare `None` in a union stands for `NoneType` (`int | None`).
@@ -6709,6 +6824,15 @@ impl PyHost {
                                 func: inner,
                             }));
                         }
+                        // A native class method (a Builtin in the class ns, e.g.
+                        // `_random.Random.random`) binds to the instance too, so a
+                        // stored reference (`r = inst.random; r()`) still receives it.
+                        Some(PyObj::Builtin(_)) => {
+                            return Ok(self.alloc(PyObj::BoundMethod {
+                                recv: recv.clone(),
+                                func: v,
+                            }));
+                        }
                         _ => return Ok(v),
                     }
                 }
@@ -7764,6 +7888,17 @@ impl PyHost {
             }
             out
         };
+        // Tag each method defined here with its owning class, so zero-arg
+        // `super()` resolves even when the bound method is called through a stored
+        // reference (`f = obj.m; f()`), not just `obj.m()` — the latter passes the
+        // owner explicitly, the former relies on `FuncVal::owner`.
+        for v in ns.values() {
+            if let Some(PyObj::Func(fv)) = self.get_mut(v) {
+                if fv.owner.is_none() {
+                    fv.owner = Some(name.to_string());
+                }
+            }
+        }
         // Emulate `__set_name__` for `functools.cached_property`: it learns the
         // attribute name from its class-namespace key so it can cache into the
         // instance dict on first access.
@@ -7817,6 +7952,12 @@ pub fn invoke(
             let f = with_host(|h| h.get(&func).cloned());
             match f {
                 Some(PyObj::Builtin(name)) => {
+                    // A native `_random.Random` method bound to an instance.
+                    if let Some(m) = name.strip_prefix("_random.Random.") {
+                        if let Value::Obj(id) = &recv {
+                            return crate::builtins::random_method(*id, m, &args);
+                        }
+                    }
                     crate::builtins::call_type_method(&recv, &name, args, kwargs)
                 }
                 Some(PyObj::Func(fv)) => run_user_func(&fv, Some(recv), None, args, kwargs),
@@ -8218,6 +8359,20 @@ pub fn call_method(
     args: Vec<Value>,
     kwargs: Vec<(String, Value)>,
 ) -> Result<Value, String> {
+    // `_random.Random` (and subclasses) — the RNG methods dispatch against the
+    // instance's Mersenne Twister state, not the class namespace.
+    if matches!(name, "random" | "seed" | "getrandbits" | "getstate" | "setstate") {
+        if let Some(id) = with_host(|h| match (recv, h.get(recv)) {
+            (Value::Obj(oid), Some(PyObj::Instance(i)))
+                if h.mro_of(&i.class).iter().any(|c| c == "_random.Random") =>
+            {
+                Some(*oid)
+            }
+            _ => None,
+        }) {
+            return crate::builtins::random_method(id, name, &args);
+        }
+    }
     let obj = with_host(|h| h.get(recv).cloned());
     match obj {
         // `contextlib.redirect_stdout`/`redirect_stderr` context manager: retarget
@@ -8406,6 +8561,13 @@ pub fn call_method(
                         // also bind the instance as a receiver.
                         let recv = if name == "__new__" { None } else { Some(instance) };
                         return run_user_func(&fv, recv, Some(found), args, kwargs);
+                    }
+                    // A native class method resolved through super (e.g.
+                    // `_random.Random.seed`) still needs the instance.
+                    if found == "_random.Random" {
+                        if let Value::Obj(id) = &instance {
+                            return crate::builtins::random_method(*id, &name, &args);
+                        }
                     }
                     invoke(&f, args, kwargs)
                 }
@@ -11131,6 +11293,23 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                     h.alloc(PyObj::Builtin("contextlib.redirect_stderr".into())),
                 ),
             ]
+        }),
+        // `_random` — the Mersenne Twister RNG. `Random` is a subclassable class
+        // (random.py does `class Random(_random.Random)`); its methods dispatch
+        // natively against per-instance MT state.
+        "_random" => with_host(|h| {
+            if !h.classes.contains_key("_random.Random") {
+                let mut ns: IndexMap<String, Value> = IndexMap::new();
+                for m in ["random", "seed", "getrandbits", "getstate", "setstate"] {
+                    ns.insert(
+                        m.to_string(),
+                        h.alloc(PyObj::Builtin(format!("_random.Random.{m}"))),
+                    );
+                }
+                h.register_class_meta("_random.Random", vec![], ns, "type");
+            }
+            let cls = h.alloc(PyObj::Class("_random.Random".to_string()));
+            vec![("Random", cls)]
         }),
         // `posix` — the Unix syscall surface `os` sits on. Backed by std::fs/
         // std::env/libc.

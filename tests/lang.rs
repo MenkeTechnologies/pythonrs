@@ -314,6 +314,31 @@ fn os_module_self_contained() {
     assert_eq!(g("import contextlib\nx = 1", "x"), "1");
 }
 
+// A bound method called through a stored reference (`f = obj.m; f()`) — not just
+// `obj.m()` — resolves zero-arg super() (owner comes from FuncVal, tagged at
+// class registration).
+#[test]
+fn stored_bound_method_resolves_super() {
+    let src = "class B:\n    def g(self):\n        return 'b'\nclass C(B):\n    def g(self):\n        \
+               return super().g() + 'c'\nf = C().g\nx = f()";
+    assert_eq!(g(src, "x"), "'bc'");
+}
+
+// Native MT19937 random -> bit-identical to CPython (same seeding). no-ffi only.
+#[cfg(not(feature = "stdlib-ffi"))]
+#[test]
+fn random_matches_cpython() {
+    assert_eq!(
+        g("import random\nrandom.seed(42)\nx = [random.randint(1, 100) for _ in range(5)]", "x"),
+        "[82, 15, 4, 95, 36]",
+    );
+    assert_eq!(g("import random\nrandom.seed(42)\nx = random.getrandbits(64)", "x"), "2053695854357871005");
+    assert_eq!(
+        g("import random\nrandom.seed(42)\nx = random.sample(range(100), 3)", "x"),
+        "[3, 94, 35]",
+    );
+}
+
 #[test]
 fn thread_locks() {
     // Native _thread locks: RLock is reentrant, plain lock tracks state. (Single
