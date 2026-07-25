@@ -399,11 +399,16 @@ impl Lexer {
                         self.bump();
                     }
                 }
-                // f-string replacement-field braces (`{{`/`}}` are literal).
+                // f-string replacement-field braces. `{{`/`}}` are literal braces
+                // ONLY in the literal text between fields (depth 0). Inside a
+                // field they are two structural braces: `f"{x:{w}}"` closes the
+                // nested width field and then the outer one, and reading that
+                // `}}` as an escape left the outer field open — the scan ran past
+                // the closing quote and reported an unterminated string.
                 Some('{') if is_f => {
                     raw.push('{');
                     self.bump();
-                    if self.peek() == Some('{') {
+                    if brace_depth == 0 && self.peek() == Some('{') {
                         raw.push('{');
                         self.bump();
                     } else {
@@ -413,7 +418,7 @@ impl Lexer {
                 Some('}') if is_f => {
                     raw.push('}');
                     self.bump();
-                    if self.peek() == Some('}') {
+                    if brace_depth == 0 && self.peek() == Some('}') {
                         raw.push('}');
                         self.bump();
                     } else if brace_depth > 0 {
