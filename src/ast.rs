@@ -65,6 +65,11 @@ pub enum FStrPart {
     /// `{x:{w}.2f}`) is an `Expr` evaluated at runtime and spliced into the spec.
     Expr {
         expr: Box<Expr>,
+        /// The field's source text, verbatim. f-strings ignore it; a t-string
+        /// exposes it as `Interpolation.expression` (PEP 750), which is the whole
+        /// point of a template — the consumer sees what was written, not just the
+        /// value it evaluated to.
+        src: String,
         conv: Option<char>,
         spec: Vec<FStrPart>,
     },
@@ -140,6 +145,8 @@ pub enum Expr {
     Str(String),
     Bytes(Vec<u8>),
     FString(Vec<FStrPart>),
+    /// PEP 750 `t"..."` — evaluates to a `string.templatelib.Template`, not a str.
+    TString(Vec<FStrPart>),
 
     /// A bare name (`x`); the compiler resolves scope (LEGB) at runtime.
     Name(String),

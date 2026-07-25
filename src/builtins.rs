@@ -65,6 +65,8 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::IMPORT_RELATIVE, b_import_relative);
     vm.register_builtin(ops::TRY_ANNOTATION, b_try_annotation);
     vm.register_builtin(ops::IS_INT, b_is_int);
+    vm.register_builtin(ops::INTERPOLATION, b_interpolation);
+    vm.register_builtin(ops::TEMPLATE, b_template);
     vm.register_builtin(ops::UNPACK, b_unpack);
     vm.register_builtin(ops::BINOP, b_binop);
     vm.register_builtin(ops::INPLACE, b_inplace);
@@ -1049,6 +1051,63 @@ fn b_is_int(vm: &mut VM, _: u8) -> Value {
         _ => false,
     };
     Value::Bool(is_int)
+}
+
+/// `INTERPOLATION` — one `{...}` field of a t-string, built from the evaluated
+/// value plus the metadata PEP 750 exposes: the field's source text, its
+/// `!r`/`!s`/`!a` conversion, and its format spec.
+fn b_interpolation(vm: &mut VM, _: u8) -> Value {
+    let format_spec = sval(&vm.pop());
+    let conv = match vm.pop() {
+        Value::Int(1) => Some('s'),
+        Value::Int(2) => Some('r'),
+        Value::Int(3) => Some('a'),
+        _ => None,
+    };
+    let expression = sval(&vm.pop());
+    let value = vm.pop();
+    with_host(|h| {
+        h.alloc(PyObj::Interpolation {
+            value,
+            expression,
+            conversion: conv,
+            format_spec,
+        })
+    })
+}
+
+/// `TEMPLATE` — assemble a `Template` from the interleaved segment list the
+/// compiler built. CPython normalizes to `len(strings) == len(interpolations) + 1`
+/// with empty strings filling any gap, so the two always zip back together.
+fn b_template(vm: &mut VM, _: u8) -> Value {
+    let segments = vm.pop();
+    let items = match with_host(|h| h.get(&segments).cloned()) {
+        Some(PyObj::List(items)) => items,
+        _ => Vec::new(),
+    };
+    with_host(|h| {
+        let mut strings: Vec<String> = vec![String::new()];
+        let mut interpolations: Vec<Value> = Vec::new();
+        for seg in items {
+            if matches!(h.get(&seg), Some(PyObj::Interpolation { .. })) {
+                interpolations.push(seg);
+                strings.push(String::new());
+            } else {
+                // Adjacent literals merge; `t"a" "b"` is one static piece. The
+                // compiler emits them as inline `Value::Str` constants, which never
+                // reach the object heap.
+                let lit = match &seg {
+                    Value::Str(s) => (**s).clone(),
+                    _ => h.as_str(&seg).unwrap_or_default(),
+                };
+                strings.last_mut().unwrap().push_str(&lit);
+            }
+        }
+        h.alloc(PyObj::Template {
+            strings,
+            interpolations,
+        })
+    })
 }
 
 fn b_truthy(vm: &mut VM, _: u8) -> Value {

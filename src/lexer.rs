@@ -22,6 +22,8 @@ pub enum Tok {
     Bytes(Vec<u8>),
     /// `(raw_inner_text, is_raw)` for an f-string; fields parsed by the parser.
     FString(String, bool),
+    /// PEP 750 template string (`t"..."`); same body syntax as an f-string.
+    TString(String, bool),
     /// An operator or delimiter, e.g. `+`, `==`, `**`, `(`, `:`, `,`, `->`.
     Op(String),
     Newline,
@@ -260,7 +262,7 @@ impl Lexer {
         }
         let is_prefix = matches!(
             pre.as_str(),
-            "r" | "b" | "f" | "u" | "rb" | "br" | "rf" | "fr" | "bf" | "fb"
+            "r" | "b" | "f" | "u" | "t" | "rb" | "br" | "rf" | "fr" | "bf" | "fb" | "rt" | "tr"
         );
         if is_prefix && matches!(self.peek(), Some('"') | Some('\'')) {
             Ok(Some(pre))
@@ -287,7 +289,11 @@ impl Lexer {
     fn scan_string(&mut self, prefix: String) -> Result<(), String> {
         let is_raw = prefix.contains('r');
         let is_bytes = prefix.contains('b');
-        let is_f = prefix.contains('f');
+        let is_t = prefix.contains('t');
+        // A t-string body scans exactly like an f-string body: same replacement
+        // fields, same PEP 701 nesting, same `{{`/`}}` escapes. Only what the
+        // parser BUILDS from it differs.
+        let is_f = prefix.contains('f') || is_t;
         let quote = self.bump().unwrap();
         let triple = self.peek() == Some(quote) && self.peek2() == Some(quote);
         if triple {
@@ -437,7 +443,9 @@ impl Lexer {
                 }
             }
         }
-        if is_f {
+        if is_t {
+            self.push(Tok::TString(raw, is_raw));
+        } else if is_f {
             self.push(Tok::FString(raw, is_raw));
         } else if is_bytes {
             let decoded = decode_escapes(&raw, is_raw)?;

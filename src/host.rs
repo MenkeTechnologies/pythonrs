@@ -111,6 +111,8 @@ pub mod ops {
     pub const IMPORT_RELATIVE: u16 = 78; // [level, modpart, name] -> value bound by a relative `from . import`
     pub const TRY_ANNOTATION: u16 = 79; // [dict, key, thunk] -> set dict[key]=thunk(), forward-ref NameError skipped
     pub const IS_INT: u16 = 80; // [v] -> Bool: v is an `int` a native slot loop can hold (fixnum or bignum, not bool)
+    pub const INTERPOLATION: u16 = 81; // [value, expression(str), conv(int), spec(str)] -> Interpolation
+    pub const TEMPLATE: u16 = 82; // [segments(list of str|Interpolation)] -> Template
 }
 
 /// In-place (augmented-assignment) op tags carried by `ops::INPLACE`. One per
@@ -828,6 +830,22 @@ pub enum PyObj {
     Module {
         name: String,
         slot: usize,
+    },
+    /// PEP 750 `string.templatelib.Template` — the value a `t"..."` literal
+    /// evaluates to. `strings` always has exactly one more element than
+    /// `interpolations`, so the two interleave back into the original literal.
+    Template {
+        strings: Vec<String>,
+        interpolations: Vec<Value>,
+    },
+    /// One `{...}` field of a template: the evaluated value plus everything the
+    /// consumer needs to decide what to do with it — the SOURCE text of the
+    /// expression, the `!r`/`!s`/`!a` conversion, and the format spec.
+    Interpolation {
+        value: Value,
+        expression: String,
+        conversion: Option<char>,
+        format_spec: String,
     },
     /// A module's `__dict__`: a live view of its globals slot, not a copy. CPython
     /// hands back the real namespace dict, and code relies on writing through it —
@@ -2864,6 +2882,10 @@ fn type_object_class_name(n: &str) -> Option<String> {
         "TextIOWrapper" => Some("_io.TextIOWrapper"),
         // `type_name` already returns these fully qualified.
         "functools._lru_cache_wrapper" => Some("functools._lru_cache_wrapper"),
+        "re.Pattern" => Some("re.Pattern"),
+        "re.Match" => Some("re.Match"),
+        "string.templatelib.Template" => Some("string.templatelib.Template"),
+        "string.templatelib.Interpolation" => Some("string.templatelib.Interpolation"),
         _ => None,
     };
     if let Some(q) = qualified {
@@ -3026,6 +3048,8 @@ impl PyHost {
                 Some(PyObj::Module { .. }) => "module".into(),
                 // A `__dict__` view IS a dict as far as Python can tell.
                 Some(PyObj::ModuleDict { .. }) => "dict".into(),
+                Some(PyObj::Template { .. }) => "string.templatelib.Template".into(),
+                Some(PyObj::Interpolation { .. }) => "string.templatelib.Interpolation".into(),
                 Some(PyObj::BigInt(_)) => "int".into(),
                 Some(PyObj::Complex(..)) => "complex".into(),
                 Some(PyObj::Generator { id }) => match self.generators[*id as usize].kind {
@@ -3285,6 +3309,33 @@ impl PyHost {
                 Some(PyObj::BoundMethod { .. }) => "<bound method>".into(),
                 Some(PyObj::Exception { class, args }) => self.exc_str(class, args),
                 Some(PyObj::Module { name, .. }) => format!("<module '{name}'>"),
+                Some(PyObj::Template {
+                    strings,
+                    interpolations,
+                }) => {
+                    let ss: Vec<String> = strings.iter().map(|s| quote_str(s)).collect();
+                    let is: Vec<String> = interpolations.iter().map(|v| self.repr_of(v)).collect();
+                    format!(
+                        "Template(strings=({}), interpolations=({}))",
+                        tuple_body(&ss),
+                        tuple_body(&is)
+                    )
+                }
+                Some(PyObj::Interpolation {
+                    value,
+                    expression,
+                    conversion,
+                    format_spec,
+                }) => format!(
+                    "Interpolation({}, {}, {}, {})",
+                    self.repr_of(value),
+                    quote_str(expression),
+                    match conversion {
+                        Some(c) => quote_str(&c.to_string()),
+                        None => "None".to_string(),
+                    },
+                    quote_str(format_spec)
+                ),
                 Some(PyObj::ModuleDict { slot }) => {
                     let items: Vec<String> = self.module_globals[*slot]
                         .iter()
@@ -4736,6 +4787,14 @@ fn exact_big_eq_float(b: &num_bigint::BigInt, f: f64) -> bool {
     num_bigint::BigInt::from_f64(f).is_some_and(|x| &x == b)
 }
 
+/// Render tuple elements with Python's trailing comma for a 1-tuple.
+fn tuple_body(items: &[String]) -> String {
+    match items {
+        [one] => format!("{one},"),
+        _ => items.join(", "),
+    }
+}
+
 fn bigint_to_f64(b: &num_bigint::BigInt) -> f64 {
     use num_traits::ToPrimitive;
     b.to_f64().unwrap_or(f64::INFINITY)
@@ -4799,6 +4858,33 @@ impl PyHost {
                     {
                         return Ok(self.alloc(PyObj::Complex(ar + br, ai + bi)));
                     }
+                }
+                // Two templates concatenate: the seam joins the left's trailing
+                // literal to the right's leading one, keeping
+                // `len(strings) == len(interpolations) + 1`.
+                if let (
+                    Some(PyObj::Template {
+                        strings: ls,
+                        interpolations: li,
+                    }),
+                    Some(PyObj::Template {
+                        strings: rs,
+                        interpolations: ri,
+                    }),
+                ) = (self.get(a), self.get(b))
+                {
+                    let mut strings = ls.clone();
+                    let mut interpolations = li.clone();
+                    let (rs, ri) = (rs.clone(), ri.clone());
+                    let seam = strings.pop().unwrap_or_default();
+                    let mut rs = rs.into_iter();
+                    strings.push(seam + &rs.next().unwrap_or_default());
+                    strings.extend(rs);
+                    interpolations.extend(ri);
+                    return Ok(self.alloc(PyObj::Template {
+                        strings,
+                        interpolations,
+                    }));
                 }
                 // str + str, list + list, tuple + tuple
                 match (self.get(a), self.get(b)) {
@@ -6809,6 +6895,27 @@ impl PyHost {
         if let Some(d) = self.module_dict_snapshot(v) {
             return self.iter_items(&d);
         }
+        // A `Template` iterates as its literal pieces and interpolations, in
+        // source order, with EMPTY literals skipped — so a consumer can walk a
+        // template without special-casing the gaps between adjacent fields.
+        if let Some(PyObj::Template {
+            strings,
+            interpolations,
+        }) = self.get(v)
+        {
+            let (strings, interps) = (strings.clone(), interpolations.clone());
+            let mut out = Vec::with_capacity(strings.len() + interps.len());
+            for (i, s) in strings.iter().enumerate() {
+                if !s.is_empty() {
+                    let sv = self.new_str(s.clone());
+                    out.push(sv);
+                }
+                if let Some(interp) = interps.get(i) {
+                    out.push(interp.clone());
+                }
+            }
+            return Ok(out);
+        }
         // Iterating a file yields its remaining lines (each keeping its `\n`).
         // Read first (drops the immutable borrow) so `new_str` can borrow `&mut`.
         let file_id = match self.get(v) {
@@ -7885,6 +7992,56 @@ impl PyHost {
             }
             // `(int | str).__args__` -> the member tuple; `__parameters__` is empty
             // (no typevars in a plain union).
+            // PEP 750 `Template` / `Interpolation` attributes.
+            Some(PyObj::Template {
+                strings,
+                interpolations,
+            }) => {
+                let (strings, interps) = (strings.clone(), interpolations.clone());
+                match name {
+                    "strings" => {
+                        let vals: Vec<Value> =
+                            strings.into_iter().map(|s| self.new_str(s)).collect();
+                        Ok(self.new_tuple(vals))
+                    }
+                    "interpolations" => Ok(self.new_tuple(interps)),
+                    // `values` is the interpolations' evaluated values, in order.
+                    "values" => {
+                        let vals: Vec<Value> = interps
+                            .iter()
+                            .map(|i| match self.get(i) {
+                                Some(PyObj::Interpolation { value, .. }) => value.clone(),
+                                _ => Value::Undef,
+                            })
+                            .collect();
+                        Ok(self.new_tuple(vals))
+                    }
+                    _ => Err(format!(
+                        "AttributeError: 'Template' object has no attribute '{name}'"
+                    )),
+                }
+            }
+            Some(PyObj::Interpolation {
+                value,
+                expression,
+                conversion,
+                format_spec,
+            }) => {
+                let (value, expression) = (value.clone(), expression.clone());
+                let (conversion, format_spec) = (*conversion, format_spec.clone());
+                match name {
+                    "value" => Ok(value),
+                    "expression" => Ok(self.new_str(expression)),
+                    "conversion" => Ok(match conversion {
+                        Some(c) => self.new_str(c.to_string()),
+                        None => Value::Undef,
+                    }),
+                    "format_spec" => Ok(self.new_str(format_spec)),
+                    _ => Err(format!(
+                        "AttributeError: 'Interpolation' object has no attribute '{name}'"
+                    )),
+                }
+            }
             Some(PyObj::Union { args }) if name == "__args__" => {
                 let args = args.clone();
                 Ok(self.new_tuple(args))
@@ -8103,14 +8260,30 @@ impl PyHost {
                 }
             }
             Some(PyObj::Builtin(n)) if name == "__name__" || name == "__qualname__" => {
-                // `type(x).__name__` / `.__qualname__` — the builtin type's name.
+                // `type(x).__name__` / `.__qualname__` — the builtin type's BARE
+                // name. A module-qualified type object (`re.Pattern`,
+                // `string.templatelib.Template`) reports just the trailing
+                // component, as CPython does; the module lives in `__module__`.
                 let n = n.clone();
-                Ok(self.new_str(n))
+                let bare = match type_object_class_name(&n) {
+                    Some(_) => n.rsplit('.').next().unwrap_or(&n).to_string(),
+                    None => n,
+                };
+                Ok(self.new_str(bare))
             }
             // A builtin type object / function reports `builtins` as its module
             // (typing's deprecated-alias machinery reads `origin.__module__`).
-            Some(PyObj::Builtin(_)) if name == "__module__" => {
-                Ok(self.new_str("builtins".to_string()))
+            Some(PyObj::Builtin(n)) if name == "__module__" => {
+                // A module-qualified type object reports its own module.
+                let n = n.clone();
+                let m = match type_object_class_name(&n) {
+                    Some(q) => match q.rsplit_once('.') {
+                        Some((module, _)) => module.to_string(),
+                        None => "builtins".to_string(),
+                    },
+                    None => "builtins".to_string(),
+                };
+                Ok(self.new_str(m))
             }
             // `<type>.__mro__` / `__bases__` on a type object.
             Some(PyObj::Builtin(n))

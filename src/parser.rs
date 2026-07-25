@@ -1044,6 +1044,7 @@ impl Parser {
             | Tok::Complex(_)
             | Tok::Str(_)
             | Tok::FString(_, _)
+            | Tok::TString(_, _)
             | Tok::Bytes(_) => Some(self.parse_atom()?),
             Tok::Name(n) if n == "None" || n == "True" || n == "False" => Some(self.parse_atom()?),
             _ => None,
@@ -1685,7 +1686,9 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Complex(f))
             }
-            Tok::Str(_) | Tok::FString(_, _) | Tok::Bytes(_) => self.parse_string_group(),
+            Tok::Str(_) | Tok::FString(_, _) | Tok::TString(_, _) | Tok::Bytes(_) => {
+                self.parse_string_group()
+            }
             Tok::Name(n) => {
                 let (nl, nc, ne) = (self.line(), self.col(), self.cur_end_col());
                 self.advance();
@@ -1741,6 +1744,7 @@ impl Parser {
     fn parse_string_group(&mut self) -> Result<Expr, String> {
         let mut parts: Vec<FStrPart> = Vec::new();
         let mut any_f = false;
+        let mut any_t = false;
         let mut byte_acc: Option<Vec<u8>> = None;
         loop {
             match self.cur().clone() {
@@ -1758,13 +1762,26 @@ impl Parser {
                     let mut sub = self.parse_fstring(&raw, is_raw)?;
                     parts.append(&mut sub);
                 }
+                Tok::TString(raw, is_raw) => {
+                    self.advance();
+                    any_t = true;
+                    let mut sub = self.parse_fstring(&raw, is_raw)?;
+                    parts.append(&mut sub);
+                }
                 _ => break,
             }
         }
         if let Some(b) = byte_acc {
             return Ok(Expr::Bytes(b));
         }
-        if any_f {
+        // Concatenating a t-string with an f-string is a SyntaxError in CPython:
+        // the two produce different types, so there is nothing to join.
+        if any_t && any_f {
+            return Err("SyntaxError: cannot mix t-string and f-string literals".to_string());
+        }
+        if any_t {
+            Ok(Expr::TString(parts))
+        } else if any_f {
             Ok(Expr::FString(parts))
         } else {
             let mut s = String::new();
@@ -1910,6 +1927,7 @@ impl Parser {
         }
         out.push(FStrPart::Expr {
             expr: Box::new(expr),
+            src: expr_src.to_string(),
             conv,
             spec,
         });

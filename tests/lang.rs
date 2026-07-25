@@ -3912,3 +3912,51 @@ fn copy_module_native() {
         "[1]"
     );
 }
+
+#[test]
+fn t_strings_build_templates_not_strings() {
+    // PEP 750: a `t"..."` literal evaluates to a `string.templatelib.Template`,
+    // and its fields are NOT formatted — the consumer decides. `annotationlib`
+    // does `_Template = type(t"")`, so `inspect` and `dataclasses` transitively
+    // depend on the literal existing at all.
+    assert_eq!(
+        g("name = 'world'\nt = t'Hello {name}!'\nx = t.strings", "x"),
+        "('Hello ', '!')"
+    );
+    assert_eq!(
+        g("name = 'world'\nt = t'Hello {name}!'\nx = t.values", "x"),
+        "('world',)"
+    );
+    // An interpolation keeps the SOURCE text of its expression, its conversion,
+    // and its format spec — none of which survive f-string formatting.
+    assert_eq!(
+        g("n = 3\ni = t'{n + 1!r:>5}'.interpolations[0]\nx = (i.value, i.expression, i.conversion, i.format_spec)", "x"),
+        "(4, 'n + 1', 'r', '>5')"
+    );
+    // Iteration interleaves literals and interpolations, skipping empty pieces.
+    assert_eq!(
+        g("x = [type(p).__name__ for p in t'{1}{2}']", "x"),
+        "['Interpolation', 'Interpolation']"
+    );
+    assert_eq!(g("x = t'{1}{2}'.strings", "x"), "('', '', '')");
+    // Concatenation joins at the seam and keeps strings == interpolations + 1.
+    assert_eq!(
+        g("t = t'a{1}' + t'b{2}'\nx = (t.strings, t.values)", "x"),
+        "(('a', 'b', ''), (1, 2))"
+    );
+    // An empty template still has one static piece.
+    assert_eq!(g("x = (t''.strings, t''.values)", "x"), "(('',), ())");
+    // A t-string is a distinct type from a str.
+    assert_eq!(
+        g("x = type(t'').__module__ + '.' + type(t'').__name__", "x"),
+        "'string.templatelib.Template'"
+    );
+}
+
+#[test]
+fn t_string_and_f_string_literals_cannot_be_concatenated() {
+    // They produce different types, so there is nothing to join — CPython makes
+    // this a SyntaxError rather than silently picking one.
+    let e = eval_str("x = t'a' f'b'").expect_err("mixing t- and f-strings must fail");
+    assert!(e.contains("SyntaxError"), "expected a SyntaxError, got: {e}");
+}

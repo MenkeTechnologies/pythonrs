@@ -2250,6 +2250,7 @@ impl Compiler {
                 b.emit(Op::CallBuiltin(ops::MKBYTES, 1), 0);
             }
             Expr::FString(parts) => self.compile_fstring(b, parts)?,
+            Expr::TString(parts) => self.compile_tstring(b, parts)?,
             Expr::Name(n) => {
                 if let Some(slot) = self.native_slots.as_ref().and_then(|m| m.get(n)) {
                     b.emit(Op::GetSlot(*slot), self.cur_line);
@@ -2530,7 +2531,7 @@ impl Compiler {
                     let k = b.add_constant(Value::str(s));
                     b.emit(Op::LoadConst(k), 0);
                 }
-                FStrPart::Expr { expr, conv, spec } => {
+                FStrPart::Expr { expr, conv, spec, .. } => {
                     c.compile_expr(b, expr)?;
                     let conv_i = match conv {
                         Some('s') => 1,
@@ -2545,6 +2546,44 @@ impl Compiler {
             }
             Ok(())
         })
+    }
+
+    /// PEP 750 `t"..."` — builds a `string.templatelib.Template` rather than
+    /// concatenating to a str. Each segment is pushed as either a literal string
+    /// or an `Interpolation` (value, source text, conversion, format spec), and
+    /// `TEMPLATE` assembles them; the interpolations are NOT formatted here, which
+    /// is the whole point — the consumer decides what to do with each value.
+    fn compile_tstring(&mut self, b: &mut ChunkBuilder, parts: &[FStrPart]) -> Result<(), String> {
+        self.build_chunked(b, ops::MKLIST, ops::EXTEND_LIST, parts.len(), 1, |c, b, i| {
+            match &parts[i] {
+                FStrPart::Lit(s) => {
+                    let k = b.add_constant(Value::str(s));
+                    b.emit(Op::LoadConst(k), 0);
+                }
+                FStrPart::Expr {
+                    expr,
+                    src,
+                    conv,
+                    spec,
+                } => {
+                    c.compile_expr(b, expr)?;
+                    let k = b.add_constant(Value::str(src));
+                    b.emit(Op::LoadConst(k), 0);
+                    let conv_i = match conv {
+                        Some('s') => 1,
+                        Some('r') => 2,
+                        Some('a') => 3,
+                        _ => 0,
+                    };
+                    b.emit(Op::LoadInt(conv_i), 0);
+                    c.compile_fstring_spec(b, spec)?;
+                    b.emit(Op::CallBuiltin(ops::INTERPOLATION, 4), 0);
+                }
+            }
+            Ok(())
+        })?;
+        b.emit(Op::CallBuiltin(ops::TEMPLATE, 1), 0);
+        Ok(())
     }
 
     /// Push an f-string field's format spec onto the stack as a string. The
@@ -3664,7 +3703,7 @@ fn collect_names_expr(e: &Expr, out: &mut HashSet<String>) {
             collect_names_expr(v, out);
             collect_names_comps(comps, out);
         }
-        Expr::FString(parts) => collect_names_fstr(parts, out),
+        Expr::FString(parts) | Expr::TString(parts) => collect_names_fstr(parts, out),
         _ => {} // literals carry no names
     }
 }
