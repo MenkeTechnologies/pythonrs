@@ -1496,3 +1496,165 @@ fn a_getset_descriptor_is_callable_through_the_descriptor_protocol() {
         "'ok'"
     );
 }
+
+#[test]
+fn exec_binds_into_locals_when_given_both_namespaces() {
+    // With separate `globals` and `locals`, the code's top-level namespace IS
+    // `locals`: a `def` there lands in `locals`, not in `globals`. `dataclasses`
+    // generates every `__init__`/`__repr__` with `exec(txt, self.globals, ns)`
+    // and then reads `ns['__create_fn__']`.
+    assert_eq!(
+        g(
+            "g = {}\n\
+             ns = {}\n\
+             exec('def f():\\n return 42', g, ns)\n\
+             x = ('f' in ns, 'f' in g, ns['f']())",
+            "x"
+        ),
+        "(True, False, 42)"
+    );
+    // A name merely READ from `globals` is not copied into `locals`.
+    assert_eq!(
+        g(
+            "g = {'seen': 1}\n\
+             ns = {}\n\
+             exec('y = seen + 1', g, ns)\n\
+             x = ('seen' in ns, ns['y'])",
+            "x"
+        ),
+        "(False, 2)"
+    );
+    // A single namespace still receives the bindings.
+    assert_eq!(g("d = {}\nexec('v = 5', d)\nx = d['v']", "x"), "5");
+}
+
+#[cfg(not(feature = "stdlib-ffi"))]
+#[test]
+fn vendored_dataclasses_run_on_pythonrs() {
+    // dataclasses generates its methods as SOURCE and execs them, so this covers
+    // the whole path: `annotationlib` for the field types, `inspect` for the
+    // signature, and `exec` with split namespaces for the generated code.
+    assert_eq!(
+        g(
+            "from dataclasses import dataclass\n\
+             @dataclass\n\
+             class P:\n\
+             \x20   a: int\n\
+             \x20   b: int = 0\n\
+             x = repr(P(1))",
+            "x"
+        ),
+        "'P(a=1, b=0)'"
+    );
+    assert_eq!(
+        g(
+            "from dataclasses import dataclass\n\
+             @dataclass\n\
+             class P:\n\
+             \x20   a: int\n\
+             x = (P(1) == P(1), P(1) == P(2))",
+            "x"
+        ),
+        "(True, False)"
+    );
+    assert_eq!(
+        g(
+            "import dataclasses\n\
+             @dataclasses.dataclass\n\
+             class P:\n\
+             \x20   a: int\n\
+             \x20   b: int\n\
+             x = dataclasses.asdict(P(1, 2))",
+            "x"
+        ),
+        "{'a': 1, 'b': 2}"
+    );
+}
+
+#[cfg(not(feature = "stdlib-ffi"))]
+#[test]
+fn vendored_inspect_and_traceback_run_on_pythonrs() {
+    assert_eq!(
+        g(
+            "import inspect\n\
+             def f(a, b=2, *args, **kw):\n\
+             \x20   pass\n\
+             x = str(inspect.signature(f))",
+            "x"
+        ),
+        "'(a, b=2, *args, **kw)'"
+    );
+    assert_eq!(
+        g("import inspect\nx = inspect.isfunction(inspect.signature)", "x"),
+        "True"
+    );
+    assert_eq!(
+        g(
+            "import traceback\n\
+             try:\n\
+             \x20   raise ValueError('boom')\n\
+             except ValueError as e:\n\
+             \x20   x = traceback.format_exception_only(type(e), e)[0].strip()",
+            "x"
+        ),
+        "'ValueError: boom'"
+    );
+}
+
+#[test]
+fn globals_is_the_live_module_namespace() {
+    // `globals()` IS the running module's namespace, so writing through it binds
+    // a module global. `inspect` builds its entire `CO_*` constant set that way
+    // (`mod_dict = globals()`, then `mod_dict["CO_" + name] = flag`), and a
+    // snapshot silently dropped every one of them.
+    assert_eq!(g("g = globals()\ng['ZZ'] = 5\nx = ZZ", "x"), "5");
+    assert_eq!(g("x = type(globals()).__name__", "x"), "'dict'");
+    // `locals()` inside a function stays a snapshot, as CPython's is for an
+    // optimized frame.
+    assert_eq!(
+        g("def f():\n\x20   a = 1\n\x20   return locals()\nx = f()", "x"),
+        "{'a': 1}"
+    );
+}
+
+#[test]
+fn a_function_reports_its_keyword_only_defaults() {
+    // `inspect.signature` reads `__kwdefaults__` for every function it describes.
+    assert_eq!(
+        g("def f(a, b=2, *args, c=3, d, **kw):\n\x20   pass\nx = f.__kwdefaults__", "x"),
+        "{'c': 3}"
+    );
+    assert_eq!(g("def f(a, b=2):\n\x20   pass\nx = f.__defaults__", "x"), "(2,)");
+    // No keyword-only defaults at all is `None`, not an empty dict.
+    assert_eq!(g("def g(x):\n\x20   pass\nx = g.__kwdefaults__", "x"), "None");
+}
+
+#[cfg(not(feature = "stdlib-ffi"))]
+#[test]
+fn a_generator_body_can_call_a_deep_chain() {
+    // A generator runs on its OWN stack, and everything it calls runs there too,
+    // so the size that matters is the whole Python call chain the body can reach
+    // — not one frame. `traceback.format_exception_only` is a generator that
+    // calls through `_format_final_exc_line` into `_colorize`, and it overflowed
+    // corosensei's 1 MiB default outright.
+    assert_eq!(
+        g(
+            "import traceback\n\
+             x = traceback.format_exception_only(ValueError, ValueError('boom'))[0].strip()",
+            "x"
+        ),
+        "'ValueError: boom'"
+    );
+    // Recursion inside a generator body has to be able to go deep too.
+    assert_eq!(
+        g(
+            "def rec(n):\n\
+             \x20   return 1 if n <= 0 else 1 + rec(n - 1)\n\
+             def gen():\n\
+             \x20   yield rec(200)\n\
+             x = list(gen())",
+            "x"
+        ),
+        "[201]"
+    );
+}

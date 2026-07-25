@@ -8304,16 +8304,29 @@ impl PyHost {
             Some(PyObj::Func(fv))
                 if matches!(
                     name,
-                    "__name__" | "__qualname__" | "__module__" | "__defaults__" | "__doc__" | "__code__"
+                    "__name__"
+                        | "__qualname__"
+                        | "__module__"
+                        | "__defaults__"
+                        | "__kwdefaults__"
+                        | "__doc__"
+                        | "__code__"
                 ) =>
             {
                 let (def_id, defaults) = (fv.def_id, fv.defaults.clone());
-                self.func_dunder(name, def_id, &defaults)
+                let kwd = fv.kwonly_defaults.clone();
+                self.func_dunder(name, def_id, &defaults, &kwd)
             }
             Some(PyObj::BoundMethod { func, recv })
                 if matches!(
                     name,
-                    "__name__" | "__qualname__" | "__module__" | "__defaults__" | "__doc__" | "__code__"
+                    "__name__"
+                        | "__qualname__"
+                        | "__module__"
+                        | "__defaults__"
+                        | "__kwdefaults__"
+                        | "__doc__"
+                        | "__code__"
                 ) =>
             {
                 let func = func.clone();
@@ -8321,7 +8334,8 @@ impl PyHost {
                 match self.get(&func) {
                     Some(PyObj::Func(fv)) => {
                         let (def_id, defaults) = (fv.def_id, fv.defaults.clone());
-                        self.func_dunder(name, def_id, &defaults)
+                let kwd = fv.kwonly_defaults.clone();
+                        self.func_dunder(name, def_id, &defaults, &kwd)
                     }
                     // A bound builtin method (`[].append`): `func` is the method
                     // name. `__name__` is the bare name, `__qualname__` is
@@ -8400,18 +8414,32 @@ impl PyHost {
                     let ctor = self.alloc(PyObj::Builtin("object.__new__".into()));
                     d.insert(PKey::Str("__new__".to_string()), (key, ctor));
                 }
-                // `type.__dict__['__annotations__']` is a getset descriptor, and
-                // `annotationlib` binds it at import time as its canonical way to
-                // read a class's own annotations without triggering `__getattr__`.
-                // Everything that imports `annotationlib` — `dataclasses`,
-                // `inspect`, `traceback`, `logging`, `unittest` — starts here.
+                // The type-level getset descriptors. Code binds these directly to
+                // read an attribute off a class WITHOUT going through
+                // `__getattr__` or a metaclass: `annotationlib` does
+                // `type.__dict__['__annotations__'].__get__`, and `inspect`'s
+                // static introspection is built on `type.__dict__['__mro__']` and
+                // `type.__dict__['__dict__']`. Everything downstream of those two
+                // modules — `dataclasses`, `traceback`, `logging`, `unittest`,
+                // `hashlib` — reaches the interpreter through this table.
                 if n == "type" {
-                    let key = self.new_str("__annotations__".to_string());
-                    let desc = self.alloc(PyObj::Descriptor {
-                        kind: DescKind::GetSetDescriptor,
-                        qual: "type.__annotations__".to_string(),
-                    });
-                    d.insert(PKey::Str("__annotations__".to_string()), (key, desc));
+                    for attr in [
+                        "__annotations__",
+                        "__mro__",
+                        "__dict__",
+                        "__bases__",
+                        "__name__",
+                        "__qualname__",
+                        "__module__",
+                        "__doc__",
+                    ] {
+                        let key = self.new_str(attr.to_string());
+                        let desc = self.alloc(PyObj::Descriptor {
+                            kind: DescKind::GetSetDescriptor,
+                            qual: format!("type.{attr}"),
+                        });
+                        d.insert(PKey::Str(attr.to_string()), (key, desc));
+                    }
                 }
                 for cm in crate::builtins::type_classmethods(&n) {
                     let key = self.new_str((*cm).to_string());
@@ -10948,6 +10976,7 @@ impl PyHost {
         name: &str,
         def_id: usize,
         defaults: &[Value],
+        kwonly_defaults: &[Value],
     ) -> Result<Value, String> {
         match name {
             "__name__" => {
@@ -10969,6 +10998,34 @@ impl PyHost {
                 None => Ok(Value::Undef),
             },
             "__code__" => Ok(self.alloc(PyObj::Code { def_id })),
+            // `__kwdefaults__`: the defaults of KEYWORD-ONLY parameters, as a
+            // dict, or `None` when there are none. `inspect.signature` reads it
+            // for every function it describes.
+            "__kwdefaults__" => {
+                // `kwonly_defaults` holds one value per keyword-only parameter
+                // that HAS a default, in `kwonly` order, so the two are zipped
+                // through `kwonly_required` rather than positionally.
+                let d = &self.funcs[def_id];
+                let names: Vec<String> = d.kwonly.clone();
+                let required: Vec<bool> = d.kwonly_required.clone();
+                let mut map: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+                let mut next = 0usize;
+                for (i, n) in names.iter().enumerate() {
+                    if required.get(i).copied().unwrap_or(true) {
+                        continue;
+                    }
+                    let Some(v) = kwonly_defaults.get(next).cloned() else {
+                        break;
+                    };
+                    next += 1;
+                    let kv = self.new_str(n.clone());
+                    map.insert(PKey::Str(n.clone()), (kv, v));
+                }
+                if map.is_empty() {
+                    return Ok(Value::Undef);
+                }
+                Ok(self.new_dict(map))
+            }
             // `__defaults__`: a tuple of the positional defaults, or `None`.
             _ => {
                 if defaults.is_empty() {
@@ -11882,7 +11939,19 @@ fn make_gen_kind(
         });
         id
     });
-    let coro = corosensei::Coroutine::new(
+    // A generator body runs on its OWN stack, and everything it calls runs there
+    // too — so the size that matters is not "one generator frame" but the whole
+    // Python call chain the body can reach. corosensei's 1 MiB default is far too
+    // small for that: `traceback.format_exception_only` is a generator that calls
+    // through `_format_final_exc_line` into `_colorize`, and it overflowed. The
+    // interpreter thread itself runs on 512 MiB (see `main`) for the same reason;
+    // 64 MiB per generator is the same trade at a size that stays affordable when
+    // many generators are live at once.
+    const GENERATOR_STACK: usize = 64 * 1024 * 1024;
+    let stack = corosensei::stack::DefaultStack::new(GENERATOR_STACK)
+        .expect("allocate generator stack");
+    let coro = corosensei::Coroutine::with_stack(
+        stack,
         move |yielder: &corosensei::Yielder<Value, Value>, _first: Value| {
             // Same thread → publish the yielder so `yield` (deep inside the
             // body's VM) can reach it. Valid for the whole body lifetime.
@@ -13094,6 +13163,9 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
         // `hasarg`/`hasjump`/… lists, `dis` reads those, and `inspect` imports
         // `dis`; that chain is why the module has to exist.
         "_opcode" => Some(with_host(crate::stdlib::pyopcode::entries)),
+        // `_imp` — the import primitives `importlib` is handed at startup.
+        "_imp" => Some(with_host(crate::stdlib::pyimp::entries)),
+        "marshal" => Some(with_host(crate::stdlib::pyimp::marshal_entries)),
         _ => None,
     };
     #[cfg(feature = "stdlib-ffi")]
@@ -13725,10 +13797,9 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
             // `os` reads this to pick the platform (`'posix' in ...`), so on a Unix
             // host it must contain `posix`.
             let builtin_module_names = {
-                let names = [
-                    "_abc", "_io", "_imp", "_thread", "_warnings", "builtins", "errno",
-                    "itertools", "marshal", "posix", "sys", "time",
-                ];
+                // One authoritative list, shared with `_imp.is_builtin`: a name
+                // here MUST have a native arm behind it (see `pyimp`).
+                let names = crate::stdlib::pyimp::BUILTIN_MODULES;
                 let vals: Vec<Value> = names.iter().map(|n| h.new_str(*n)).collect();
                 h.new_tuple(vals)
             };

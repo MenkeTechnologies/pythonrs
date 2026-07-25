@@ -3747,6 +3747,29 @@ pub fn call_builtin_function(
         let sv = with_host(|h| h.new_str(src));
         return with_host(|h| crate::stdlib::pytokenize::tokenizer_iter(h, &[sv], &kwargs));
     }
+    // `_imp.create_builtin(spec)` — hand back the module pythonrs's own importer
+    // produces, whether that is a native arm or a vendored `.py`. The import
+    // machinery then has a real module to initialize rather than the `None` that
+    // made `_bootstrap._setup` die on `_warnings`. Resolved here, outside the host
+    // borrow, because importing re-enters the host.
+    if name == "_imp.create_builtin" {
+        let spec = arg0(&args)?;
+        let n = with_host(|h| h.get_attr(&spec, "name").ok().and_then(|v| h.as_str(&v)));
+        return match n {
+            Some(n) => host::import_module(crate::stdlib::pyimp::builtin_source(&n)),
+            None => Ok(Value::Undef),
+        };
+    }
+    if let Some(f) = name.strip_prefix("marshal.") {
+        if let Some(r) = with_host(|h| crate::stdlib::pyimp::call(h, f, &args)) {
+            return r;
+        }
+    }
+    if let Some(f) = name.strip_prefix("_imp.") {
+        if let Some(r) = with_host(|h| crate::stdlib::pyimp::call(h, f, &args)) {
+            return r;
+        }
+    }
     if let Some(f) = name.strip_prefix("_opcode.") {
         if let Some(r) = with_host(|h| crate::stdlib::pyopcode::call(h, f, &args)) {
             return r;
@@ -4518,17 +4541,30 @@ pub fn call_builtin_function(
             let items: Vec<Value> = names.into_iter().map(|n| h.new_str(n)).collect();
             h.new_list(items)
         })),
-        // `globals()` / `locals()` as a dict. A snapshot (not a live view): reads
-        // and passing to `eval`/`exec` work; in-place mutation is not reflected
-        // back into the namespace. `locals()` at module scope is `globals()`.
-        "globals" => Ok(str_keyed_dict(with_host(|h| h.globals_pairs()))),
-        "locals" => Ok(str_keyed_dict(with_host(|h| {
-            if h.frame_depth() > 1 {
-                h.caller_locals().into_iter().collect()
+        // `globals()` is the running module's namespace itself — a LIVE view, so
+        // `globals()['X'] = v` binds a module global. `inspect` builds its whole
+        // `CO_*` constant set that way (`mod_dict = globals()` then
+        // `mod_dict["CO_" + name] = flag`), and a snapshot silently dropped every
+        // one of them.
+        "globals" => Ok(with_host(|h| {
+            let slot = h.cur_module();
+            h.module_dict(slot)
+        })),
+        // `locals()` inside a function is a SNAPSHOT, as CPython's is for an
+        // optimized frame: writing to it does not rebind a local. At module scope
+        // it is `globals()`, and there it is live.
+        "locals" => {
+            if with_host(|h| h.frame_depth() > 1) {
+                Ok(str_keyed_dict(with_host(|h| {
+                    h.caller_locals().into_iter().collect()
+                })))
             } else {
-                h.globals_pairs()
+                Ok(with_host(|h| {
+                    let slot = h.cur_module();
+                    h.module_dict(slot)
+                }))
             }
-        }))),
+        }
         // `eval(expr[, globals[, locals]])` evaluates a single expression string
         // and returns its value; `exec(code[, globals[, locals]])` runs statements
         // and returns None. Both compile the source on the fly and re-enter the VM
@@ -4832,6 +4868,9 @@ fn run_pysource(want_value: bool, args: &[Value]) -> Result<Value, String> {
     // …)', ns)` reads `_tuple_new` from `ns` when the member type is later called).
     // An in-function eval with NO explicit namespace overlays caller locals on the
     // real module globals and discards the writes.
+    // Names the namespace already held, so the writeback below can tell a binding
+    // the code MADE from one it merely read.
+    let mut pre_existing: IndexMap<String, Value> = IndexMap::new();
     let fresh_mod: Option<usize> = if explicit_ns {
         let mut ns: IndexMap<String, Value> = IndexMap::new();
         for d in [globals_arg.as_ref(), locals_arg.as_ref()]
@@ -4842,6 +4881,7 @@ fn run_pysource(want_value: bool, args: &[Value]) -> Result<Value, String> {
                 ns.insert(k, v);
             }
         }
+        pre_existing = ns.clone();
         Some(with_host(|h| {
             let mid = h.new_module_slot(ns);
             h.swap_module(mid)
@@ -4869,16 +4909,32 @@ fn run_pysource(want_value: bool, args: &[Value]) -> Result<Value, String> {
     })();
 
     if let Some(saved_mod) = fresh_mod {
-        // Copy the post-run namespace back into the caller's `globals` dict (so
-        // `exec("x=1", d)` leaves `d["x"] == 1`), then restore the module — the
-        // fresh slot lives on for any function that captured it.
-        if let Some(g) = &globals_arg {
+        // Bindings the code made go back to the caller's namespace. When separate
+        // `globals` and `locals` are given, the code's top-level namespace IS
+        // `locals` — a `def` there lands in `locals`, not in `globals`. Copying
+        // everything into `globals` instead is what made `dataclasses` fail:
+        // it does `exec(txt, self.globals, ns)` and then reads
+        // `ns['__create_fn__']`, which was never there.
+        let target = locals_arg.as_ref().or(globals_arg.as_ref());
+        if let Some(t) = target {
             for (k, v) in with_host(|h| h.globals_pairs()) {
                 if k == TMP {
                     continue;
                 }
+                // Only what the code actually bound or rebound: a name merely
+                // READ from `globals` must not be copied into `locals`.
+                if pre_existing
+                    .get(&k)
+                    .is_some_and(|old| std::mem::discriminant(old) == std::mem::discriminant(&v)
+                        && match (old, &v) {
+                            (Value::Obj(a), Value::Obj(b)) => a == b,
+                            _ => with_host(|h| h.equal(old, &v)),
+                        })
+                {
+                    continue;
+                }
                 let key = with_host(|h| h.new_str(k));
-                with_host(|h| h.set_item(g, &key, v))?;
+                with_host(|h| h.set_item(t, &key, v))?;
             }
         }
         with_host(|h| h.swap_module(saved_mod));
@@ -4906,12 +4962,25 @@ fn str_keyed_dict(pairs: Vec<(String, Value)>) -> Value {
 /// A dict's string-keyed `(name, value)` entries, for an `eval`/`exec` namespace
 /// argument. Non-string keys are skipped (a namespace is keyed by identifier).
 fn dict_str_pairs(d: &Value) -> Result<Vec<(String, Value)>, String> {
-    with_host(|h| match h.get(d) {
-        Some(PyObj::Dict(m)) => Ok(m
-            .iter()
-            .filter_map(|(_, (kv, v))| h.as_str(kv).map(|s| (s, v.clone())))
-            .collect()),
-        _ => Err(host::type_error("globals must be a real dictionary")),
+    // A module's `__dict__` is a live view of its globals slot, not a `dict`
+    // object, and it is a perfectly ordinary namespace argument: `traceback`
+    // evaluates with `exec(code, module.__dict__)`. Read through the view.
+    if let Some(slot) = with_host(|h| h.module_dict_slot(d)) {
+        return Ok(with_host(|h| h.module_globals_pairs(slot)));
+    }
+    with_host(|h| {
+        let target = match h.get(d) {
+            // A `mappingproxy` (a type's `__dict__`) reads through to its dict.
+            Some(PyObj::MappingProxy { dict }) => dict.clone(),
+            _ => d.clone(),
+        };
+        match h.get(&target) {
+            Some(PyObj::Dict(m)) => Ok(m
+                .iter()
+                .filter_map(|(_, (kv, v))| h.as_str(kv).map(|s| (s, v.clone())))
+                .collect()),
+            _ => Err(host::type_error("globals must be a real dictionary")),
+        }
     })
 }
 
@@ -4953,10 +5022,12 @@ pub fn py_len(v: &Value) -> Result<usize, String> {
         Some(PyObj::StructTime { .. }) => Ok(9),
         Some(PyObj::Dict(d)) => Ok(d.len()),
         Some(PyObj::Set(s)) | Some(PyObj::Frozenset(s)) => Ok(s.len()),
-        Some(PyObj::DictView { dict, .. }) => Ok(match h.get(dict) {
-            Some(PyObj::Dict(d)) => d.len(),
-            _ => 0,
-        }),
+        Some(PyObj::DictView { dict, .. }) | Some(PyObj::MappingProxy { dict }) => {
+            Ok(match h.get(dict) {
+                Some(PyObj::Dict(d)) => d.len(),
+                _ => 0,
+            })
+        }
         Some(PyObj::Range { start, stop, step }) => {
             Ok(host::range_len(*start, *stop, *step).max(0) as usize)
         }
