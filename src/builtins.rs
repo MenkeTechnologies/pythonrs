@@ -4159,9 +4159,18 @@ pub fn call_builtin_function(
             // top-level package; otherwise the named (sub)module.
             let name_v = arg0(&args)?;
             let name = with_host(|h| h.str_of(&name_v));
-            let fromlist_empty = match args.get(3) {
+            // `fromlist` is routinely passed BY KEYWORD — `encodings/__init__` does
+            // `__import__('encodings.' + modname, fromlist=_import_tail, level=0)`
+            // — so reading only the positional slot made every such call return
+            // the top package instead of the submodule, and the codec search
+            // function never found its `getregentry`.
+            let fromlist = args
+                .get(3)
+                .cloned()
+                .or_else(|| kwargs.iter().find(|(k, _)| k == "fromlist").map(|(_, v)| v.clone()));
+            let fromlist_empty = match fromlist {
                 None | Some(Value::Undef) => true,
-                Some(v) => with_host(|h| !h.truthy(v)),
+                Some(v) => with_host(|h| !h.truthy(&v)),
             };
             let target = if fromlist_empty {
                 name.split('.').next().unwrap_or(&name).to_string()

@@ -8525,7 +8525,12 @@ impl PyHost {
         // `class Codec(codecs.Codec)`, and `class StreamWriter(codecs.
         // StreamWriter)` right after. Give the shadowing class its own key
         // (display name unchanged) so the base it inherits from stays reachable.
-        let key = if bases.iter().any(|b| b == name) {
+        // Check the whole ancestry, not just the direct bases: `class
+        // IncrementalDecoder(codecs.BufferedIncrementalDecoder)` shadows a
+        // GRANDparent, and overwriting that entry makes the direct base's own
+        // base list point at this new class — the same cycle, one level up.
+        let ancestors: Vec<String> = bases.iter().flat_map(|b| self.mro_of(b)).collect();
+        let key = if ancestors.iter().any(|b| b == name) {
             let mut n = 1usize;
             loop {
                 let cand = format!("{name}#{n}");
@@ -12173,9 +12178,6 @@ fn import_in_progress(name: &str) -> bool {
 }
 
 pub fn import_module(name: &str) -> Result<Value, String> {
-    if std::env::var_os("PYTHONRS_IMPORT_TRACE").is_some() {
-        eprintln!("IMPORT {name}");
-    }
     if let Some(m) = with_host(|h| h.cached_module(name)) {
         return Ok(m);
     }
