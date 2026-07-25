@@ -831,6 +831,23 @@ pub enum PyObj {
         name: String,
         slot: usize,
     },
+    /// `_io.BytesIO` — an in-memory binary stream. `pos` is a byte offset.
+    BytesIO {
+        buf: Vec<u8>,
+        pos: usize,
+        closed: bool,
+    },
+    /// `_io.StringIO` — an in-memory text stream. `pos` and `len` are CODE POINT
+    /// counts (CPython's text positions are), and `len` is carried alongside the
+    /// buffer so appending stays O(1) instead of re-counting the whole string.
+    StringIO {
+        buf: String,
+        len: usize,
+        pos: usize,
+        closed: bool,
+        /// `newline=None`: translate every line ending to '\n' on write.
+        translate: bool,
+    },
     /// PEP 750 `string.templatelib.Template` — the value a `t"..."` literal
     /// evaluates to. `strings` always has exactly one more element than
     /// `interpolations`, so the two interleave back into the original literal.
@@ -2883,6 +2900,12 @@ fn type_object_class_name(n: &str) -> Option<String> {
         // `type_name` already returns these fully qualified.
         "functools._lru_cache_wrapper" => Some("functools._lru_cache_wrapper"),
         "re.Pattern" => Some("re.Pattern"),
+        "os.stat_result" => Some("os.stat_result"),
+        _ if n.strip_prefix("_io.")
+            .is_some_and(|t| crate::stdlib::pyio::STREAM_TYPES.contains(&t)) =>
+        {
+            Some(n)
+        }
         "re.Match" => Some("re.Match"),
         "string.templatelib.Template" => Some("string.templatelib.Template"),
         "string.templatelib.Interpolation" => Some("string.templatelib.Interpolation"),
@@ -3048,6 +3071,8 @@ impl PyHost {
                 Some(PyObj::Module { .. }) => "module".into(),
                 // A `__dict__` view IS a dict as far as Python can tell.
                 Some(PyObj::ModuleDict { .. }) => "dict".into(),
+                Some(PyObj::BytesIO { .. }) => "_io.BytesIO".into(),
+                Some(PyObj::StringIO { .. }) => "_io.StringIO".into(),
                 Some(PyObj::Template { .. }) => "string.templatelib.Template".into(),
                 Some(PyObj::Interpolation { .. }) => "string.templatelib.Interpolation".into(),
                 Some(PyObj::BigInt(_)) => "int".into(),
@@ -3152,6 +3177,8 @@ impl PyHost {
             Value::Str(s) => (**s).clone(),
             Value::Obj(_) => match self.get(v) {
                 Some(PyObj::StructFmt(f)) => format!("<_struct.Struct object, format '{f}'>"),
+                Some(PyObj::BytesIO { .. }) => "<_io.BytesIO object>".to_string(),
+                Some(PyObj::StringIO { .. }) => "<_io.StringIO object>".to_string(),
                 Some(PyObj::ContextVar { name, .. }) => format!("<ContextVar name='{name}'>"),
                 Some(PyObj::ContextToken { .. }) => "<Token>".to_string(),
                 Some(PyObj::Str(s)) => s.clone(),
@@ -6895,6 +6922,15 @@ impl PyHost {
         if let Some(d) = self.module_dict_snapshot(v) {
             return self.iter_items(&d);
         }
+        // Iterating an in-memory stream yields its remaining lines.
+        if matches!(
+            self.get(v),
+            Some(PyObj::BytesIO { .. }) | Some(PyObj::StringIO { .. })
+        ) {
+            if let Some(r) = crate::stdlib::pyio::stream_lines(self, v) {
+                return r;
+            }
+        }
         // A `Template` iterates as its literal pieces and interpolations, in
         // source order, with EMPTY literals skipped — so a consumer can walk a
         // template without special-casing the gaps between adjacent fields.
@@ -7527,6 +7563,16 @@ impl PyHost {
                 }
             }
         }
+        // `f.closed` on an in-memory stream. Resolved before the borrowing match
+        // below because the lookup needs `&mut self`.
+        if matches!(
+            self.get(recv),
+            Some(PyObj::BytesIO { .. }) | Some(PyObj::StringIO { .. })
+        ) {
+            if let Some(r) = crate::stdlib::pyio::stream_attr(self, recv, name) {
+                return r;
+            }
+        }
         // Native-shadowed module: fast-path the native namespace, else defer to
         // the real CPython module over the FFI bridge. Resolved before the
         // borrowing match below because the fallback needs `&mut self`.
@@ -7689,6 +7735,12 @@ impl PyHost {
                         .filter(|q| !q.is_empty())
                         .unwrap_or_else(|| cname.clone());
                     return Ok(self.new_str(q));
+                }
+                // Every class has `__doc__`, `None` when undocumented. A body
+                // run by `run_class_body` gets one from its docstring; a class
+                // registered natively (the `_io` bases) has no body to read.
+                if name == "__doc__" && !self.class_has(&cname, "__doc__") {
+                    return Ok(Value::Undef);
                 }
                 if name == "__module__" {
                     let m = self
@@ -12127,6 +12179,39 @@ pub fn iter_vec(v: &Value) -> Result<Vec<Value>, String> {
     with_host(|h| h.iter_items(v))
 }
 
+/// Turn `v` into something [`iter_step`] can drive, running any user-level
+/// `__iter__` OUTSIDE the host borrow.
+///
+/// `PyHost::make_iter` cannot do this itself: it holds `&mut self`, so it can
+/// never call back into Python, and it therefore has no way to honor a user
+/// class's iteration protocol. Every lazy iterator (`zip`, `map`, `filter`,
+/// `enumerate`, all of `itertools`) stores its sources through here, so a custom
+/// iterable works as a source for any of them — `pathlib.relative_to` chains
+/// over a `_PathParents`, whose only protocol is `__len__`/`__getitem__`.
+pub fn make_iterator(v: &Value) -> Result<Value, String> {
+    let protocol = with_host(|h| match h.get(v) {
+        Some(PyObj::Instance(i)) => Some((
+            h.class_lookup(&i.class, "__iter__").is_some(),
+            h.class_lookup(&i.class, "__getitem__").is_some(),
+        )),
+        _ => None,
+    });
+    match protocol {
+        // `__iter__` hands back a real iterator, so iteration stays lazy.
+        Some((true, _)) => {
+            let it = call_method(v, "__iter__", vec![], vec![])?;
+            with_host(|h| h.make_iter(&it))
+        }
+        // The old-style `__getitem__(0..)` sequence protocol has no iterator
+        // object to hand back, so it is materialized once here.
+        Some((false, true)) => {
+            let items = iter_instance_items(v)?;
+            Ok(with_host(|h| h.alloc(PyObj::Iter(IterState::Seq { items, idx: 0 }))))
+        }
+        _ => with_host(|h| h.make_iter(v)),
+    }
+}
+
 /// Materialize a user instance's iteration into a concrete vector: `__iter__`
 /// then repeated `__next__` (draining a native iterator/generator if `__iter__`
 /// returned one), else the old-style `__getitem__(0..)` sequence protocol.
@@ -12922,6 +13007,9 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
         // `from _codecs import *`, and the interpreter cannot start text I/O
         // without it.
         "_codecs" => Some(with_host(crate::stdlib::codecs::entries)),
+        // `_io` — the concrete streams `io.py` declares its ABCs over. Six
+        // modules (io, pathlib, logging, unittest, hashlib, pprint) start here.
+        "_io" => Some(with_host(crate::stdlib::pyio::entries)),
         _ => None,
     };
     #[cfg(feature = "stdlib-ffi")]
@@ -13074,6 +13162,12 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                 }
                 h.alloc(PyObj::Dict(d))
             };
+            // `stat_result` as a type object. `os.stat()` already returns values
+            // tagged with this type name; `pathlib` reaches the TYPE itself to
+            // feature-test for platform-specific fields
+            // (`hasattr(os.stat_result, 'st_flags')`).
+            let stat_result = h.alloc(PyObj::Builtin("os.stat_result".into()));
+            v.push(("stat_result", stat_result));
             v.push(("environ", environ));
             // Capability list `os` reads (empty = no optional dir-fd/etc. features).
             let have = h.new_list(vec![]);

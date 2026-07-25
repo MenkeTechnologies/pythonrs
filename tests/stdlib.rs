@@ -1184,3 +1184,122 @@ fn math_sumprod_is_exact_for_ints_and_correctly_rounded_for_floats() {
         "0.0"
     );
 }
+
+#[cfg(not(feature = "stdlib-ffi"))]
+#[test]
+fn vendored_io_runs_on_pythonrs() {
+    // `io.py` declares its ABCs over the concrete streams `_io` supplies, so this
+    // exercises both halves: the native `StringIO`/`BytesIO` and the vendored
+    // module that registers them with `TextIOBase`/`BufferedIOBase`.
+    assert_eq!(
+        g("import io\ns = io.StringIO()\ns.write('a')\ns.write('bc')\nx = s.getvalue()", "x"),
+        "'abc'"
+    );
+    assert_eq!(
+        g("import io\ns = io.StringIO('a\\nb\\n')\nx = [l for l in s]", "x"),
+        "['a\\n', 'b\\n']"
+    );
+    assert_eq!(
+        g("import io\nb = io.BytesIO(b'abcdef')\nb.read(2)\nb.seek(-2, 2)\nx = b.read()", "x"),
+        "b'ef'"
+    );
+    // An overwrite in the middle of a BytesIO leaves the tail intact.
+    assert_eq!(
+        g("import io\nb = io.BytesIO(b'xyz')\nb.seek(1)\nb.write(b'Q')\nx = b.getvalue()", "x"),
+        "b'xQz'"
+    );
+    // Text positions are CODE POINTS, not bytes: two 2-byte characters is 2.
+    assert_eq!(
+        g("import io\ns = io.StringIO()\ns.write('\\u00e9\\u00e9')\nx = s.tell()", "x"),
+        "2"
+    );
+    assert_eq!(
+        g("import io\nx = isinstance(io.StringIO(), io.TextIOBase)", "x"),
+        "True"
+    );
+    assert_eq!(
+        g("import io\nx = isinstance(io.BytesIO(), io.BufferedIOBase)", "x"),
+        "True"
+    );
+    // A closed stream refuses every operation but `close`.
+    assert_eq!(
+        g(
+            "import io\n\
+             s = io.StringIO('x')\n\
+             s.close()\n\
+             try:\n\
+             \x20   s.read()\n\
+             \x20   x = 'no error'\n\
+             except ValueError:\n\
+             \x20   x = 'closed'",
+            "x"
+        ),
+        "'closed'"
+    );
+}
+
+#[cfg(not(feature = "stdlib-ffi"))]
+#[test]
+fn vendored_pathlib_runs_on_pythonrs() {
+    assert_eq!(
+        g("import pathlib\np = pathlib.PurePosixPath('/a/b/f.tar.gz')\nx = (p.name, p.stem, p.suffix)", "x"),
+        "('f.tar.gz', 'f.tar', '.gz')"
+    );
+    assert_eq!(
+        g("import pathlib\nx = str(pathlib.PurePosixPath('a') / 'b' / 'c')", "x"),
+        "'a/b/c'"
+    );
+    // `relative_to` chains over `_PathParents`, whose only iteration protocol is
+    // `__len__`/`__getitem__` — it has no `__iter__` at all.
+    assert_eq!(
+        g("import pathlib\nx = str(pathlib.PurePosixPath('/a/b').relative_to('/a'))", "x"),
+        "'b'"
+    );
+}
+
+#[test]
+fn a_getitem_only_sequence_iterates_in_lazy_iterators() {
+    // The old-style sequence protocol (`__getitem__` from 0 until IndexError, no
+    // `__iter__`) has to work as a SOURCE for the lazy iterators too, not just
+    // for `list()`. `pathlib.relative_to` chains over exactly such an object.
+    let seq = "class S:\n\
+               \x20   def __getitem__(self, i):\n\
+               \x20       if i >= 3: raise IndexError\n\
+               \x20       return i * 10\n\
+               s = S()\n";
+    assert_eq!(
+        g(&format!("{seq}from itertools import chain\nx = list(chain([1], s))"), "x"),
+        "[1, 0, 10, 20]"
+    );
+    assert_eq!(g(&format!("{seq}x = list(zip(s, 'abc'))"), "x"), "[(0, 'a'), (10, 'b'), (20, 'c')]");
+    assert_eq!(g(&format!("{seq}x = list(map(str, s))"), "x"), "['0', '10', '20']");
+    assert_eq!(g(&format!("{seq}x = list(enumerate(s))"), "x"), "[(0, 0), (1, 10), (2, 20)]");
+    assert_eq!(g(&format!("{seq}x = list(filter(None, s))"), "x"), "[10, 20]");
+}
+
+#[test]
+fn python_character_class_syntax_survives_translation() {
+    // Inside `[...]` Python treats almost everything as a literal, while the
+    // regex crate reserves several constructs there. `glob` compiles `([*?[])`
+    // — three literal metacharacters — and a bare `[` inside a class opened a
+    // NESTED class instead, failing with "unclosed character class" and taking
+    // `pathlib` down with it.
+    assert_eq!(
+        g(r"import re
+x = re.findall('([*?[])', 'a[b*c')", "x"),
+        "['[', '*']"
+    );
+    // `\b` is a backspace inside a class and a word boundary outside one.
+    assert_eq!(g(r"import re
+x = re.findall(r'[\b]', 'a\x08b')", "x"), "['\\x08']");
+    assert_eq!(g(r"import re
+x = re.findall(r'\bw\w*', 'a word')", "x"), "['word']");
+    // `]` in first position is a literal member, not the close.
+    assert_eq!(g(r"import re
+x = re.findall(r'[]]', 'a]b')", "x"), "[']']");
+    assert_eq!(g(r"import re
+x = re.findall(r'[^]]+', 'ab]cd')", "x"), "['ab', 'cd']");
+    // Ranges must keep working.
+    assert_eq!(g(r"import re
+x = re.findall(r'[a-z]+', 'abc123')", "x"), "['abc']");
+}

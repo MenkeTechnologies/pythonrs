@@ -3150,7 +3150,14 @@ pub fn is_type_object_name(n: &str) -> bool {
                 | "_contextvars.Token"
                 | "_contextvars.Context"
                 | "_struct.Struct"
+                // `os.stat()` results are tagged with this type; `pathlib`
+                // feature-tests the type object itself.
+                | "os.stat_result"
         )
+        // Every `_io` stream type: `io.py` hands each one to `ABCMeta.register`,
+        // which rejects anything that is not a class.
+        || n.strip_prefix("_io.")
+            .is_some_and(|t| crate::stdlib::pyio::STREAM_TYPES.contains(&t))
         || (!n.contains('.') && !is_builtin_function(n))
 }
 
@@ -3701,6 +3708,11 @@ pub fn call_builtin_function(
         }
     }
     // Native stdlib module functions (src/stdlib). These take `&mut PyHost`.
+    if let Some(f) = name.strip_prefix("_io.") {
+        if let Some(r) = with_host(|h| crate::stdlib::pyio::call(h, f, &args, &kwargs)) {
+            return r;
+        }
+    }
     if let Some(f) = name.strip_prefix("_struct.") {
         if let Some(r) = with_host(|h| crate::stdlib::pystruct::call(h, f, &args)) {
             return r;
@@ -3966,7 +3978,7 @@ pub fn call_builtin_function(
         "enumerate" => {
             // Lazy: pairs `(index, value)` pulled on demand. `start=` kwarg or
             // positional second arg sets the initial index.
-            let source = with_host(|h| h.make_iter(&arg0(&args)?))?;
+            let source = host::make_iterator(&arg0(&args)?)?;
             let start = kw_get(&kwargs, "start")
                 .or_else(|| args.get(1).cloned())
                 .and_then(|v| with_host(|h| h.as_int(&v)))
@@ -3983,7 +3995,7 @@ pub fn call_builtin_function(
             // Lazy `zip`: one iterator per argument, tuple pulled on demand.
             let mut sources = Vec::with_capacity(args.len());
             for a in &args {
-                sources.push(with_host(|h| h.make_iter(a))?);
+                sources.push(host::make_iterator(a)?);
             }
             let strict = kw_get(&kwargs, "strict")
                 .map(|v| with_host(|h| h.truthy(&v)))
@@ -4001,7 +4013,7 @@ pub fn call_builtin_function(
             let f = arg0(&args)?;
             let mut sources = Vec::with_capacity(args.len().saturating_sub(1));
             for a in &args[1..] {
-                sources.push(with_host(|h| h.make_iter(a))?);
+                sources.push(host::make_iterator(a)?);
             }
             Ok(with_host(|h| {
                 h.alloc(PyObj::MapObj {
@@ -4014,7 +4026,7 @@ pub fn call_builtin_function(
         "filter" => {
             // Lazy `filter`: items pulled and predicate-tested on demand.
             let f = arg0(&args)?;
-            let source = with_host(|h| h.make_iter(&args[1]))?;
+            let source = host::make_iterator(&args[1])?;
             Ok(with_host(|h| {
                 h.alloc(PyObj::FilterObj {
                     func: f,
@@ -5653,7 +5665,7 @@ fn call_itertools(name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) ->
             })
         })
     };
-    let iter_of = |v: &Value| -> Result<Value, String> { with_host(|h| h.make_iter(v)) };
+    let iter_of = |v: &Value| -> Result<Value, String> { host::make_iterator(v) };
     let as_i = |v: &Value| with_host(|h| h.as_int(v));
     let kw = |k: &str| kwargs.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
     match name {
@@ -6781,18 +6793,28 @@ fn call_typing(f: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Resul
     Err(host::name_error(&format!("_typing.{f}")))
 }
 
-/// Rewrite `\b` INSIDE a character class to `\x08`.
+/// Translate the character-class syntax Python and the `regex` crate disagree on.
 ///
-/// Python gives `\b` two meanings: a word-boundary assertion outside a class,
-/// and the backspace character inside one (`[\b]` matches `"\x08"`). The
-/// `regex` crate only has the assertion, and rejects it in a class — so
-/// `re.compile(r'[\x00-\x1f\\"\b\f\n\r\t]')` failed, and with it `import json`,
-/// whose encoder compiles exactly that pattern at import time.
+/// Inside `[...]` Python treats almost everything as a literal, while the crate
+/// reserves several constructs there:
 ///
-/// Tracks class depth and escapes so a `\b` outside a class, a `\\` before it,
-/// or a `[` inside a class is not misread.
+/// * `\b` is a backspace to Python (`[\b]` matches `"\x08"`) and a word-boundary
+///   assertion to the crate, which then rejects it in a class. `json`'s encoder
+///   compiles `[\x00-\x1f\\"\b\f\n\r\t]` at import time, so `import json` died on
+///   this.
+/// * `[` is a literal to Python and opens a NESTED class in the crate. `glob`
+///   compiles `([*?[])` — three literal metacharacters — and got "unclosed
+///   character class", taking `pathlib` with it.
+/// * `&&`, `~~` and `||` are the crate's set operators (intersection, symmetric
+///   difference, union) and plain repeated literals to Python. `--` is NOT in
+///   that list: Python reads it as a character RANGE and rejects it, so leaving
+///   it alone keeps both engines failing on the same input.
+///
+/// Class depth and backslash escapes are tracked so a construct outside a class,
+/// or one that is already escaped, is left alone.
 fn rewrite_class_backspace(pattern: &str) -> std::borrow::Cow<'_, str> {
-    if !pattern.contains("\\b") {
+    // Every rewrite happens inside a class, so a pattern with none is unchanged.
+    if !pattern.contains('[') {
         return std::borrow::Cow::Borrowed(pattern);
     }
     let chars: Vec<char> = pattern.chars().collect();
@@ -6811,7 +6833,8 @@ fn rewrite_class_backspace(pattern: &str) -> std::borrow::Cow<'_, str> {
                 i += 2;
                 continue;
             }
-            // `]` as the first member of a class is a literal, not the close.
+            // `^` right after the open negates; `]` in first position is a literal
+            // member rather than the close.
             '[' if !in_class => {
                 in_class = true;
                 out.push('[');
@@ -6821,9 +6844,25 @@ fn rewrite_class_backspace(pattern: &str) -> std::borrow::Cow<'_, str> {
                     i += 1;
                 }
                 if chars.get(i) == Some(&']') {
-                    out.push(']');
+                    out.push_str("\\]");
                     i += 1;
                 }
+                continue;
+            }
+            // A literal `[` to Python; the start of a nested class to the crate.
+            '[' if in_class => {
+                out.push_str("\\[");
+                i += 1;
+                continue;
+            }
+            // The crate's set operators are repeated literals to Python. Escaping
+            // the first character of the pair keeps both as members.
+            c if in_class && matches!(c, '&' | '~' | '|') && chars.get(i + 1) == Some(&c) =>
+            {
+                out.push('\\');
+                out.push(c);
+                out.push(c);
+                i += 2;
                 continue;
             }
             ']' if in_class => in_class = false,
@@ -7824,6 +7863,10 @@ const EXC_PARENTS: &[(&str, &str)] = &[
     ("IndexError", "LookupError"),
     ("KeyError", "LookupError"),
     ("ValueError", "Exception"),
+    // `io.UnsupportedOperation` is `(OSError, ValueError)` in CPython; the single
+    // parent chain here keeps `except ValueError` working, which is what the
+    // stdlib actually catches it with.
+    ("UnsupportedOperation", "ValueError"),
     ("UnicodeError", "ValueError"),
     ("TypeError", "Exception"),
     ("NameError", "Exception"),
@@ -8631,6 +8674,9 @@ pub fn call_type_method(
         return r;
     }
     if let Some(r) = with_host(|h| crate::stdlib::pystruct::struct_method(h, recv, name, &args)) {
+        return r;
+    }
+    if let Some(r) = with_host(|h| crate::stdlib::pyio::stream_method(h, recv, name, &args)) {
         return r;
     }
     if let Some(r) = nt_instance_method(recv, name, &args, &kwargs) {
