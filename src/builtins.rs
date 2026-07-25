@@ -3085,6 +3085,11 @@ pub fn is_type_object_name(n: &str) -> bool {
                 | "collections.defaultdict"
                 | "collections.OrderedDict"
                 | "collections.Counter"
+                // Same for the `_contextvars` types: `contextvars.py` registers
+                // `Context` with `collections.abc.Mapping`, which requires a class.
+                | "_contextvars.ContextVar"
+                | "_contextvars.Token"
+                | "_contextvars.Context"
         )
         || (!n.contains('.') && !is_builtin_function(n))
 }
@@ -3649,6 +3654,36 @@ pub fn call_builtin_function(
     // collections constructors (host-backed types).
     if let Some(f) = name.strip_prefix("collections.") {
         return construct_collection(f, args, kwargs);
+    }
+    // `_contextvars` (PEP 567). One interpreter thread, so a variable's "current
+    // value in the running context" is a slot on the variable itself.
+    if let Some(f) = name.strip_prefix("_contextvars.") {
+        return match f {
+            "ContextVar" => {
+                let a0 = arg0(&args)?;
+                let name = with_host(|h| h.as_str(&a0))
+                    .ok_or_else(|| host::type_error("ContextVar() argument 1 must be str"))?;
+                let default = args
+                    .get(1)
+                    .cloned()
+                    .or_else(|| kw_get(&kwargs, "default"))
+                    .map(Box::new);
+                Ok(with_host(|h| {
+                    h.alloc(PyObj::ContextVar {
+                        name,
+                        default,
+                        value: None,
+                    })
+                }))
+            }
+            // A bare `Context()` / `copy_context()`: the variables carry their own
+            // state, so an empty marker object is a faithful stand-in for running
+            // code in "the current context".
+            "Context" | "copy_context" => Ok(with_host(|h| {
+                h.alloc(PyObj::Builtin("_contextvars.Context".into()))
+            })),
+            _ => Err(host::name_error(&format!("_contextvars.{f}"))),
+        };
     }
     // Exception constructors.
     if is_exception_class(name) {
@@ -8389,12 +8424,78 @@ fn nt_instance_method(
     }
 }
 
+/// `ContextVar` / `Token` methods (PEP 567). `None` means `recv` is neither, so
+/// the caller carries on with its normal type dispatch.
+fn context_var_method(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    let is_var = with_host(|h| matches!(h.get(recv), Some(PyObj::ContextVar { .. })));
+    if !is_var {
+        // `Token.old_value` / `.var` are attributes, not methods; nothing here.
+        return None;
+    }
+    Some(match name {
+        // `get()` → the set value, else the explicit fallback, else the
+        // variable's default, else LookupError (CPython raises exactly that).
+        "get" => with_host(|h| match h.get(recv) {
+            Some(PyObj::ContextVar { name, default, value }) => {
+                if let Some(v) = value {
+                    return Ok((**v).clone());
+                }
+                if let Some(v) = args.first() {
+                    return Ok(v.clone());
+                }
+                match default {
+                    Some(d) => Ok((**d).clone()),
+                    None => Err(format!("LookupError: <ContextVar name='{name}'>")),
+                }
+            }
+            _ => unreachable!("checked above"),
+        }),
+        "set" => {
+            let new = args.first().cloned().unwrap_or(Value::Undef);
+            Ok(with_host(|h| {
+                let old = match h.get_mut(recv) {
+                    Some(PyObj::ContextVar { value, .. }) => value.replace(Box::new(new)),
+                    _ => None,
+                };
+                h.alloc(PyObj::ContextToken {
+                    var: Box::new(recv.clone()),
+                    old,
+                })
+            }))
+        }
+        "reset" => {
+            let tok = args.first().cloned().unwrap_or(Value::Undef);
+            let old = with_host(|h| match h.get(&tok) {
+                Some(PyObj::ContextToken { old, .. }) => Some(old.clone()),
+                _ => None,
+            });
+            match old {
+                Some(old) => {
+                    with_host(|h| {
+                        if let Some(PyObj::ContextVar { value, .. }) = h.get_mut(recv) {
+                            *value = old;
+                        }
+                    });
+                    Ok(Value::Undef)
+                }
+                None => Err(host::type_error("ContextVar.reset() expects a Token")),
+            }
+        }
+        _ => Err(host::type_error(&format!(
+            "'ContextVar' object has no attribute '{name}'"
+        ))),
+    })
+}
+
 pub fn call_type_method(
     recv: &Value,
     name: &str,
     args: Vec<Value>,
     kwargs: Vec<(String, Value)>,
 ) -> Result<Value, String> {
+    if let Some(r) = context_var_method(recv, name, &args) {
+        return r;
+    }
     if let Some(r) = nt_instance_method(recv, name, &args, &kwargs) {
         return r;
     }

@@ -741,6 +741,20 @@ pub enum PyObj {
         count: u32,
         reentrant: bool,
     },
+    /// A `contextvars.ContextVar`. One interpreter thread here, so the "current
+    /// context" is just the variable's own slot: `set` swaps it and hands back a
+    /// `ContextToken` carrying the previous state for `reset`.
+    ContextVar {
+        name: String,
+        default: Option<Box<Value>>,
+        value: Option<Box<Value>>,
+    },
+    /// The token `ContextVar.set` returns — the variable it came from plus the
+    /// value that was there (`None` = the variable was unset).
+    ContextToken {
+        var: Box<Value>,
+        old: Option<Box<Value>>,
+    },
     /// A lazy `itertools` iterator. `sources` are pre-made input iterators, `func`
     /// an optional predicate/binop, `nums` integer state (count start/step,
     /// islice bounds, cursor), `buf` a value buffer (cycle's seen items,
@@ -2852,6 +2866,8 @@ impl PyHost {
             Value::Float(_) => "float".into(),
             Value::Str(_) => "str".into(),
             Value::Obj(_) => match self.get(v) {
+                Some(PyObj::ContextVar { .. }) => "ContextVar".into(),
+                Some(PyObj::ContextToken { .. }) => "Token".into(),
                 Some(PyObj::Str(_)) => "str".into(),
                 Some(PyObj::Bytes(_)) => "bytes".into(),
                 Some(PyObj::Bytearray(_)) => "bytearray".into(),
@@ -3010,6 +3026,8 @@ impl PyHost {
             Value::Float(f) => fmt_float(*f),
             Value::Str(s) => (**s).clone(),
             Value::Obj(_) => match self.get(v) {
+                Some(PyObj::ContextVar { name, .. }) => format!("<ContextVar name='{name}'>"),
+                Some(PyObj::ContextToken { .. }) => "<Token>".to_string(),
                 Some(PyObj::Str(s)) => s.clone(),
                 Some(PyObj::BigInt(b)) => b.to_string(),
                 Some(PyObj::Complex(r, i)) => fmt_complex(*r, *i),
@@ -12710,11 +12728,49 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
             };
             let path0 = h.new_str(path0);
             let path = h.new_list(vec![path0]);
-            let executable = h.new_str(
-                std::env::current_exe()
+            let exe_path = std::env::current_exe()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let executable = h.new_str(exe_path.clone());
+            let exec_path = h.new_str(exe_path.clone());
+            // The install root: the binary's parent directory's parent, mirroring
+            // CPython's `<prefix>/bin/python` layout.
+            let prefix = h.new_str(
+                std::path::Path::new(&exe_path)
+                    .parent()
+                    .and_then(|p| p.parent())
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_default(),
             );
+            let flags = {
+                let mut a: IndexMap<String, Value> = IndexMap::new();
+                for (k, v) in [
+                    ("debug", 0),
+                    ("inspect", 0),
+                    ("interactive", 0),
+                    ("optimize", 0),
+                    ("dont_write_bytecode", 0),
+                    ("no_user_site", 0),
+                    ("no_site", 0),
+                    ("ignore_environment", 0),
+                    ("verbose", 0),
+                    ("bytes_warning", 0),
+                    ("quiet", 0),
+                    ("hash_randomization", 0),
+                    ("isolated", 0),
+                    ("dev_mode", 0),
+                    ("utf8_mode", 0),
+                    ("safe_path", 0),
+                    ("int_max_str_digits", -1),
+                    ("warn_default_encoding", 0),
+                    ("gil", 1),
+                    ("thread_inherit_context", 1),
+                    ("context_aware_warnings", 1),
+                ] {
+                    a.insert(k.to_string(), Value::Int(v));
+                }
+                h.alloc(PyObj::Namespace { attrs: a })
+            };
             let modules = h.new_dict(IndexMap::new());
             // Publish the live sys.modules handle + seed it with already-imported
             // modules, so Python-level assignment/reads stay consistent with the
@@ -12796,6 +12852,25 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                 ("intern", h.alloc(PyObj::Builtin("sys.intern".into()))),
                 ("audit", h.alloc(PyObj::Builtin("sys.audit".into()))),
                 ("is_finalizing", h.alloc(PyObj::Builtin("sys.is_finalizing".into()))),
+                // Installation layout. `argparse` reads `base_prefix` (to detect a
+                // venv) at import time, so its absence made the module
+                // unimportable. There is no separate base install here — pythonrs
+                // is one binary — so all four point at the runtime's own root.
+                ("prefix", prefix.clone()),
+                ("base_prefix", prefix.clone()),
+                ("exec_prefix", prefix.clone()),
+                ("base_exec_prefix", prefix),
+                ("dont_write_bytecode", Value::Bool(false)),
+                // `sys.flags` — the command-line/environment switches. Read at
+                // import time by `_py_warnings` (`flags.context_aware_warnings`),
+                // so `warnings` and everything importing it needs the whole bag,
+                // not just the flag it happens to read. Values reflect how this
+                // runtime actually behaves: no -O, no -B, no isolation.
+                ("flags", flags),
+                ("warnoptions", h.new_list(Vec::new())),
+                ("hexversion", Value::Int(0x030E_00F0)),
+                ("api_version", Value::Int(1013)),
+                ("_base_executable", exec_path),
             ]
         }),
         "asyncio" => with_host(|h| {
@@ -12862,6 +12937,20 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
         // `namedtuple` all come from the faithful pure-Python source. The other
         // `_collections` helpers (`_tuplegetter`, `_count_elements`,
         // `_deque_iterator`) have pure-Python fallbacks in `collections`.
+        // `_contextvars` — the C accelerator behind `contextvars.py` (PEP 567).
+        // `_py_warnings` builds a `ContextVar` at import time, so `warnings` and
+        // everything that imports it (`traceback`, …) needs this to exist.
+        "_contextvars" => with_host(|h| {
+            vec![
+                ("ContextVar", h.alloc(PyObj::Builtin("_contextvars.ContextVar".into()))),
+                ("Token", h.alloc(PyObj::Builtin("_contextvars.Token".into()))),
+                ("Context", h.alloc(PyObj::Builtin("_contextvars.Context".into()))),
+                (
+                    "copy_context",
+                    h.alloc(PyObj::Builtin("_contextvars.copy_context".into())),
+                ),
+            ]
+        }),
         "_collections" => with_host(|h| {
             vec![
                 ("deque", h.alloc(PyObj::Builtin("collections.deque".into()))),

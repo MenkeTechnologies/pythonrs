@@ -4726,6 +4726,17 @@ fn loop_needs_signal(body: &[Stmt]) -> bool {
             }
             StmtKind::Match { cases, .. } => cases.iter().any(|c| scan(&c.body, in_boundary)),
             StmtKind::With { body, .. } => scan(body, true),
+            // A nested loop owns the `break`/`continue` in its BODY — but not the
+            // ones in its `else`, which runs after that loop is finished and so
+            // belong to THIS loop. Missing them left such a jump recorded against
+            // this loop while it was emitted inside the nested construct's
+            // sub-chunk, and patching that index into the outer chunk panicked
+            // the compiler ("index out of bounds" / "patch_jump on non-jump op").
+            // `inspect._getmembers` — hence `import inspect`, `dataclasses`, and
+            // everything downstream — is exactly this shape.
+            StmtKind::For { orelse, .. } | StmtKind::While { orelse, .. } => {
+                scan(orelse, in_boundary)
+            }
             StmtKind::Try {
                 body,
                 handlers,

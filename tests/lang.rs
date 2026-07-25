@@ -585,6 +585,7 @@ fn collections_abc_alias() {
 // A module whose body fails mid-import is NOT left cached as a broken shell: a
 // retry re-runs the body and re-raises (CPython removes it from sys.modules),
 // rather than silently resolving to a half-built module that masks the failure.
+// Uses `sqlite3`, whose `_sqlite3` accelerator this runtime does not provide.
 #[cfg(not(feature = "stdlib-ffi"))]
 #[test]
 fn failed_import_is_not_cached() {
@@ -592,7 +593,7 @@ fn failed_import_is_not_cached() {
 res = []
 for _ in range(2):
     try:
-        import contextvars
+        import sqlite3
         res.append('cached')
     except ModuleNotFoundError:
         res.append('raised')
