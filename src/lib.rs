@@ -269,3 +269,4 @@ pub fn eval_to_string(src: &str) -> Result<String, String> {
     let v = eval_str(src)?;
     Ok(host::with_host(|h| h.repr_of(&v)))
 }
+

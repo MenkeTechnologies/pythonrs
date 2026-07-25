@@ -643,7 +643,11 @@ pub enum PyObj {
         hi: Value,
         step: Value,
     },
-    Func(FuncVal),
+    /// A user function. Behind an `Rc` because dispatching a call reads the
+    /// callable out of the heap by CLONING it — and a bare `FuncVal` clone copies
+    /// both its default-value vectors, two heap allocations and two frees on
+    /// every single Python call. The refcount bump costs nothing.
+    Func(Rc<FuncVal>),
     /// A function's compiled code object (`func.__code__`), keyed to its
     /// `FuncDef`. Exposes the `co_*` introspection attributes the faithful stdlib
     /// reads (`types` derives `CodeType`, `inspect.signature`, `functools`,
@@ -1221,8 +1225,9 @@ pub struct Frame {
     pub self_obj: Option<Value>,
     pub owner: Option<String>,
     /// The scope name shown in a traceback frame (`<module>`, a function name, or
-    /// a class name for a class body).
-    pub name: String,
+    /// a class name for a class body). `Rc` for the same reason as `owner` — this
+    /// used to be two `String` allocations on every single Python call.
+    pub name: Rc<str>,
     /// Source line currently executing in this frame — updated by the DAP debug
     /// line hook (`--dap`) and by the error path when an exception aborts a chunk.
     pub line: u32,
@@ -1265,6 +1270,9 @@ pub struct PyHost {
     /// with it. A call clones the `Rc` into its frame instead of collecting the
     /// set again (see `Frame::locals_set`).
     pub func_locals: Vec<Rc<HashSet<String>>>,
+    /// Each function's traceback name, pre-shared. `Frame::name` used to be a
+    /// `String` copied out of the `FuncDef` on every call.
+    pub func_names: Vec<Rc<str>>,
     /// Class templates by name.
     pub classes: IndexMap<String, ClassDef>,
     /// Memoized C3 linearizations, keyed by class name.
@@ -1675,6 +1683,7 @@ impl PyHost {
             heap: Vec::new(),
             funcs: Vec::new(),
             func_locals: Vec::new(),
+            func_names: Vec::new(),
             classes: IndexMap::new(),
             mro_cache: std::cell::RefCell::new(HashMap::new()),
             tries: Vec::new(),
@@ -1689,7 +1698,7 @@ impl PyHost {
                 is_class_body: false,
                 self_obj: None,
                 owner: None,
-                name: "<module>".to_string(),
+                name: Rc::from("<module>"),
                 line: 0,
                 span: Span::NONE,
             }],
@@ -1818,6 +1827,7 @@ impl PyHost {
         for f in funcs {
             self.func_locals
                 .push(Rc::new(f.locals.iter().cloned().collect()));
+            self.func_names.push(Rc::from(f.name.as_str()));
             self.funcs.push(Rc::new(f));
         }
         self.tries.extend(tries);
@@ -2250,7 +2260,7 @@ impl PyHost {
     /// popped.
     pub fn push_tb_frame(&mut self) {
         if let Some(f) = self.frames.last() {
-            self.traceback.push((f.name.clone(), f.line, f.span));
+            self.traceback.push((f.name.to_string(), f.line, f.span));
         }
     }
     /// Snapshot `exc`'s traceback (outermost-first) into `exc_tb`, just before the
@@ -2264,7 +2274,7 @@ impl PyHost {
         let Value::Obj(id) = exc else { return };
         let mut tb: Vec<(String, u32, Span)> = Vec::new();
         if let Some(f) = self.frames.last() {
-            tb.push((f.name.clone(), f.line, f.span));
+            tb.push((f.name.to_string(), f.line, f.span));
         }
         for f in self.traceback.iter().rev() {
             tb.push(f.clone());
@@ -2281,7 +2291,7 @@ impl PyHost {
         self.frames
             .iter()
             .rev()
-            .map(|f| (f.name.clone(), f.line))
+            .map(|f| (f.name.to_string(), f.line))
             .collect()
     }
     /// The innermost frame's locals as (name, repr) pairs — for DAP `variables`.
@@ -2867,7 +2877,11 @@ thread_local! {
     /// cloned once per function instead of once per call. Each key holds a stack
     /// of VMs, so recursion — which needs the same chunk live at several depths
     /// at once — just pops another one.
-    static VM_POOL: RefCell<HashMap<u64, Vec<VM>>> = RefCell::new(HashMap::new());
+    /// Boxed: a `VM` is ~1.7 KB, and pooling it BY VALUE memcpy'd the whole
+    /// struct out of the pool on the way in and back on the way out — nearly
+    /// 4 KB of copying per Python call, which profiled as the single largest
+    /// cost in call-heavy code. A `Box` makes both moves pointer-sized.
+    static VM_POOL: RefCell<HashMap<u64, Vec<Box<VM>>>> = RefCell::new(HashMap::new());
 }
 
 /// Register every pythonrs builtin + the numeric hook on a VM, then run it.
@@ -2878,8 +2892,7 @@ thread_local! {
 /// measurably slowed container-heavy top-level code. Repeated calls to the same
 /// function go through `run_chunk_cached` instead.
 pub fn run_chunk_on(chunk: Chunk) -> Result<Value, String> {
-    let mut vm = new_configured_vm(chunk);
-    finish_run(&mut vm, None)
+    finish_run(Box::new(new_configured_vm(chunk)), None)
 }
 
 /// Build a VM with pythonrs's builtins, numeric hook, and JIT/debug wiring.
@@ -2901,7 +2914,7 @@ fn new_configured_vm(chunk: Chunk) -> VM {
 
 /// Run `vm` to completion and translate the outcome, recycling it into the pool
 /// under `pool_key` when one is given.
-fn finish_run(vm: &mut VM, pool_key: Option<u64>) -> Result<Value, String> {
+fn finish_run(mut vm: Box<VM>, pool_key: Option<u64>) -> Result<Value, String> {
     let outcome = vm.run();
     let halted_top = matches!(outcome, VMResult::Halted)
         .then(|| vm.stack.last().cloned().unwrap_or(Value::Undef));
@@ -2910,14 +2923,19 @@ fn finish_run(vm: &mut VM, pool_key: Option<u64>) -> Result<Value, String> {
         // VM directly, not through a pythonrs builtin's `abort`, so the failing
         // op's line/caret span was never recorded. Capture it here from the
         // still-valid `ip` before unwinding.
-        crate::builtins::record_err_line(vm);
+        crate::builtins::record_err_line(&vm);
     }
     if let Some(key) = pool_key {
         // A suspended generator parks its VM on the coroutine stack instead — it
         // only reaches here once `run` has returned, so a recycled VM is never
         // one some frame is still executing on.
-        let spent = std::mem::replace(vm, VM::new(Chunk::default()));
-        VM_POOL.with(|p| p.borrow_mut().entry(key).or_default().push(spent));
+        //
+        // The VM moves straight into the pool. Taking it by `&mut` meant building
+        // a fresh `VM` — which installs every builtin and allocates its stack,
+        // frames and globals — purely as a placeholder to swap out and drop, on
+        // EVERY call that returned one. That construct-and-discard was the single
+        // largest cost in a call-heavy program.
+        VM_POOL.with(|p| p.borrow_mut().entry(key).or_default().push(vm));
     }
     if let Some(e) = with_host(|h| h.take_error()) {
         return Err(e);
@@ -2944,7 +2962,7 @@ fn finish_run(vm: &mut VM, pool_key: Option<u64>) -> Result<Value, String> {
 /// function body, run it, drop the copy" into "reset a VM and run".
 pub fn run_chunk_cached(key: u64, make: impl FnOnce() -> Chunk) -> Result<Value, String> {
     let pooled = VM_POOL.with(|p| p.borrow_mut().get_mut(&key).and_then(|v| v.pop()));
-    let mut vm = match pooled {
+    let vm = match pooled {
         Some(mut vm) => {
             // Hand the VM its own chunk straight back — `reset` moves it, so this
             // is a pointer swap rather than a copy of the bytecode.
@@ -2952,9 +2970,9 @@ pub fn run_chunk_cached(key: u64, make: impl FnOnce() -> Chunk) -> Result<Value,
             vm.reset(own);
             vm
         }
-        None => new_configured_vm(make()),
+        None => Box::new(new_configured_vm(make())),
     };
-    finish_run(&mut vm, Some(key))
+    finish_run(vm, Some(key))
 }
 
 /// Run the top-level program chunk.
@@ -9389,7 +9407,7 @@ impl PyHost {
         for v in ns.values() {
             if let Some(PyObj::Func(fv)) = self.get_mut(v) {
                 if fv.owner.is_none() {
-                    fv.owner = Some(name_for_key.clone());
+                    Rc::make_mut(fv).owner = Some(name_for_key.clone());
                 }
             }
         }
@@ -10816,10 +10834,11 @@ pub fn run_user_func(
     // read through. The chunk is fetched by hand below, on the two paths that
     // genuinely need to own one.
     // Two `Rc` bumps: no copy of the signature, the local set, or the body.
-    let (def, locals_rc) = with_host(|h| {
+    let (def, locals_rc, frame_name) = with_host(|h| {
         (
             h.funcs[fv.def_id].clone(),
             h.func_locals[fv.def_id].clone(),
+            h.func_names[fv.def_id].clone(),
         )
     });
     let def_id = fv.def_id;
@@ -10901,7 +10920,7 @@ pub fn run_user_func(
             is_class_body: false,
             self_obj: frame_self,
             owner,
-            name: def.name.clone(),
+            name: frame_name,
             line: 0,
             span: Span::NONE,
         });
@@ -11443,7 +11462,7 @@ fn run_class_body(name: &str, body_func: &Value) -> Result<IndexMap<String, Valu
             is_class_body: true,
             self_obj: None,
             owner: Some(name.to_string()),
-            name: name.to_string(),
+            name: Rc::from(name),
             line: 0,
             span: Span::NONE,
         });
@@ -11847,7 +11866,7 @@ impl PyHost {
         // reversed to outermost-first.
         let mut final_frames: Vec<(String, u32, Span)> = Vec::new();
         if let Some(f) = self.frames.first() {
-            final_frames.push((f.name.clone(), f.line, f.span));
+            final_frames.push((f.name.to_string(), f.line, f.span));
         }
         for f in self.traceback.iter().rev() {
             final_frames.push(f.clone());
@@ -12133,7 +12152,7 @@ impl PyHost {
         let (name, lineno) = self
             .frames
             .get(idx)
-            .map(|f| (f.name.clone(), f.line))
+            .map(|f| (f.name.to_string(), f.line))
             .unwrap_or_else(|| ("<module>".to_string(), 0));
         self.alloc(PyObj::PyFrame { name, lineno })
     }
@@ -12200,7 +12219,7 @@ fn make_gen_kind(
         is_class_body: false,
         self_obj: self_val,
         owner: owner.clone(),
-        name: owner.unwrap_or_else(|| "<genexpr>".to_string()),
+        name: owner.map_or_else(|| Rc::from("<genexpr>"), |o| Rc::from(o.as_str())),
         line: 0,
         span: Span::NONE,
     };

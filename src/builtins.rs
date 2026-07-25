@@ -1316,7 +1316,7 @@ fn b_mkfunc(vm: &mut VM, argc: u8) -> Value {
     let defaults = args;
     let env = with_host(|h| h.current_env_capture());
     with_host(|h| {
-        h.alloc(PyObj::Func(host::FuncVal {
+        h.alloc(PyObj::Func(std::rc::Rc::new(host::FuncVal {
             def_id,
             module: h.cur_module(),
             env: Some(env),
@@ -1325,7 +1325,7 @@ fn b_mkfunc(vm: &mut VM, argc: u8) -> Value {
             bound: None,
             owner: None,
             annotations,
-        }))
+        })))
     })
 }
 
