@@ -594,7 +594,7 @@ impl TypeVarKind {
 }
 
 impl DescKind {
-    fn type_name(self) -> &'static str {
+    pub fn type_name(self) -> &'static str {
         match self {
             DescKind::WrapperDescriptor => "wrapper_descriptor",
             DescKind::MethodWrapper => "method-wrapper",
@@ -3293,6 +3293,11 @@ impl PyHost {
                         DescKind::GetSetDescriptor | DescKind::MemberDescriptor => {
                             format!("<attribute '{name}' of '{owner}' objects>")
                         }
+                        // CPython calls a wrapper descriptor a "slot wrapper" in
+                        // its repr, even though its type is `wrapper_descriptor`.
+                        DescKind::WrapperDescriptor => {
+                            format!("<slot wrapper '{name}' of '{owner}' objects>")
+                        }
                         _ => format!("<{} '{name}' of '{owner}' objects>", kind.type_name()),
                     }
                 }
@@ -3704,6 +3709,16 @@ impl PyHost {
                 // A type object keys by name (types are singletons by name).
                 Some(PyObj::Class(n)) => PKey::Class(n.clone()),
                 Some(PyObj::Builtin(n)) => PKey::Class(n.clone()),
+                // A C-level descriptor (`dict.__repr__`) keys by what it names,
+                // not by heap id: CPython caches one object per type/slot, so
+                // `dict.__repr__` is the same object every time it is read, while
+                // this runtime builds a fresh one per access. `pprint` fills its
+                // dispatch table with `_dispatch[dict.__repr__] = ...` and then
+                // looks up `type(obj).__repr__`, which is a DIFFERENT read of the
+                // same slot — hashing by id would never find the entry.
+                Some(PyObj::Descriptor { kind, qual }) => {
+                    PKey::Class(format!("{}:{qual}", kind.type_name()))
+                }
                 // Functions/methods/other callables hash by identity (heap id).
                 Some(
                     PyObj::Func(_)
@@ -13010,6 +13025,9 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
         // `_io` — the concrete streams `io.py` declares its ABCs over. Six
         // modules (io, pathlib, logging, unittest, hashlib, pprint) start here.
         "_io" => Some(with_host(crate::stdlib::pyio::entries)),
+        // `_tokenize` — the tokenizer `tokenize.py` drives, and through
+        // `traceback`, what `logging`/`unittest`/`hashlib` reach first.
+        "_tokenize" => Some(with_host(crate::stdlib::pytokenize::entries)),
         _ => None,
     };
     #[cfg(feature = "stdlib-ffi")]

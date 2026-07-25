@@ -3708,6 +3708,17 @@ pub fn call_builtin_function(
         }
     }
     // Native stdlib module functions (src/stdlib). These take `&mut PyHost`.
+    if name == "_tokenize.TokenizerIter" {
+        // The argument is a `readline` callable; drain it OUTSIDE the host borrow
+        // (it is user code) before handing the source to the tokenizer.
+        let source = arg0(&args)?;
+        let src = match with_host(|h| h.as_str(&source)) {
+            Some(s) => s,
+            None => crate::stdlib::pytokenize::drain_readline(&source)?,
+        };
+        let sv = with_host(|h| h.new_str(src));
+        return with_host(|h| crate::stdlib::pytokenize::tokenizer_iter(h, &[sv], &kwargs));
+    }
     if let Some(f) = name.strip_prefix("_io.") {
         if let Some(r) = with_host(|h| crate::stdlib::pyio::call(h, f, &args, &kwargs)) {
             return r;
@@ -8166,6 +8177,10 @@ pub fn type_has_method(typename: &str, name: &str) -> bool {
         "slice" => &["indices"],
         "deque" => DEQUE_METHODS,
         "TextIOWrapper" => FILE_METHODS,
+        // The in-memory streams answer the file protocol plus their own
+        // `getvalue`. `tokenize` reaches for `StringIO(...).readline` as a bound
+        // method, so these have to be attribute-visible, not just callable.
+        "_io.StringIO" | "_io.BytesIO" => return STREAM_METHODS.contains(&name),
         "int" | "bool" => return INT_METHODS.contains(&name) || INT_DUNDERS.contains(&name),
         "float" => return FLOAT_METHODS.contains(&name) || FLOAT_DUNDERS.contains(&name),
         "complex" => COMPLEX_METHODS,
@@ -8197,6 +8212,31 @@ pub fn type_has_method(typename: &str, name: &str) -> bool {
     };
     list.contains(&name)
 }
+
+/// The methods `_io.StringIO` / `_io.BytesIO` expose. `read1` is binary-only in
+/// CPython but harmless on a text stream, and listing it here costs nothing.
+const STREAM_METHODS: &[&str] = &[
+    "read",
+    "read1",
+    "readline",
+    "readlines",
+    "write",
+    "writelines",
+    "seek",
+    "tell",
+    "truncate",
+    "getvalue",
+    "close",
+    "flush",
+    "readable",
+    "writable",
+    "seekable",
+    "isatty",
+    "__enter__",
+    "__exit__",
+    "__iter__",
+    "__next__",
+];
 
 const FUTURE_METHODS: &[&str] = &[
     "set_result",

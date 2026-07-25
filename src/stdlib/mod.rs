@@ -15,3 +15,4 @@ pub mod binascii;
 pub mod codecs;
 pub mod pyio;
 pub mod pystruct;
+pub mod pytokenize;

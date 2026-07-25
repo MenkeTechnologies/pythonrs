@@ -1303,3 +1303,67 @@ x = re.findall(r'[^]]+', 'ab]cd')", "x"), "['ab', 'cd']");
     assert_eq!(g(r"import re
 x = re.findall(r'[a-z]+', 'abc123')", "x"), "['abc']");
 }
+
+#[cfg(not(feature = "stdlib-ffi"))]
+#[test]
+fn vendored_tokenize_runs_on_pythonrs() {
+    // `tokenize` is a source-fidelity tool: every character of the input has to
+    // be attributable to some token. `traceback` imports it, so `logging`,
+    // `unittest` and `hashlib` reach the interpreter through here.
+    assert_eq!(
+        g(
+            "import tokenize, io, token\n\
+             src = 'x = 1  # hi\\n'\n\
+             x = [(token.tok_name[t.type], t.string) for t in tokenize.generate_tokens(io.StringIO(src).readline)]",
+            "x"
+        ),
+        "[('NAME', 'x'), ('OP', '='), ('NUMBER', '1'), ('COMMENT', '# hi'), ('NEWLINE', '\\n'), ('ENDMARKER', '')]"
+    );
+    // Indentation is reported as INDENT/DEDENT tokens, and a DEDENT closes every
+    // open level at end of input.
+    assert_eq!(
+        g(
+            "import tokenize, io, token\n\
+             src = 'if a:\\n    b\\n'\n\
+             x = [token.tok_name[t.type] for t in tokenize.generate_tokens(io.StringIO(src).readline)]",
+            "x"
+        ),
+        "['NAME', 'NAME', 'OP', 'NEWLINE', 'INDENT', 'NAME', 'NEWLINE', 'DEDENT', 'ENDMARKER']"
+    );
+    // PEP 701: an f-string comes APART into its literal and expression pieces,
+    // rather than arriving as one STRING token.
+    assert_eq!(
+        g(
+            "import tokenize, io, token\n\
+             src = 'f\\\"a{b}c\\\"\\n'\n\
+             x = [(token.tok_name[t.type], t.string) for t in tokenize.generate_tokens(io.StringIO(src).readline)][:6]",
+            "x"
+        ),
+        "[('FSTRING_START', 'f\"'), ('FSTRING_MIDDLE', 'a'), ('OP', '{'), ('NAME', 'b'), ('OP', '}'), ('FSTRING_MIDDLE', 'c')]"
+    );
+    // A nested format spec is its own literal run, and the field's closing brace
+    // flushes it even when empty.
+    assert_eq!(
+        g(
+            "import tokenize, io, token\n\
+             src = 'f\\\"{a:{w}}\\\"\\n'\n\
+             x = [(token.tok_name[t.type], t.string) for t in tokenize.generate_tokens(io.StringIO(src).readline)][6:9]",
+            "x"
+        ),
+        "[('OP', '}'), ('FSTRING_MIDDLE', ''), ('OP', '}')]"
+    );
+}
+
+#[test]
+fn a_slot_wrapper_is_hashable_by_what_it_names() {
+    // CPython caches one descriptor object per type/slot, so `dict.__repr__` is
+    // the same object every read; this runtime builds a fresh one each time.
+    // Hashing by heap id would make `pprint`'s dispatch table — filled with
+    // `_dispatch[dict.__repr__]` and read back via `type(obj).__repr__` — never
+    // find its own entries.
+    assert_eq!(
+        g("d = {dict.__repr__: 'D', list.__repr__: 'L'}\nx = d[type({}).__repr__]", "x"),
+        "'D'"
+    );
+    assert_eq!(g("x = repr(dict.__repr__)", "x"), "\"<slot wrapper '__repr__' of 'dict' objects>\"");
+}
