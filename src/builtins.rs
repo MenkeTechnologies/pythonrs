@@ -6667,6 +6667,60 @@ fn call_typing(f: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Resul
     Err(host::name_error(&format!("_typing.{f}")))
 }
 
+/// Rewrite `\b` INSIDE a character class to `\x08`.
+///
+/// Python gives `\b` two meanings: a word-boundary assertion outside a class,
+/// and the backspace character inside one (`[\b]` matches `"\x08"`). The
+/// `regex` crate only has the assertion, and rejects it in a class — so
+/// `re.compile(r'[\x00-\x1f\\"\b\f\n\r\t]')` failed, and with it `import json`,
+/// whose encoder compiles exactly that pattern at import time.
+///
+/// Tracks class depth and escapes so a `\b` outside a class, a `\\` before it,
+/// or a `[` inside a class is not misread.
+fn rewrite_class_backspace(pattern: &str) -> std::borrow::Cow<'_, str> {
+    if !pattern.contains("\\b") {
+        return std::borrow::Cow::Borrowed(pattern);
+    }
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut out = String::with_capacity(pattern.len());
+    let mut in_class = false;
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' if i + 1 < chars.len() => {
+                if in_class && chars[i + 1] == 'b' {
+                    out.push_str("\\x08");
+                } else {
+                    out.push('\\');
+                    out.push(chars[i + 1]);
+                }
+                i += 2;
+                continue;
+            }
+            // `]` as the first member of a class is a literal, not the close.
+            '[' if !in_class => {
+                in_class = true;
+                out.push('[');
+                i += 1;
+                if chars.get(i) == Some(&'^') {
+                    out.push('^');
+                    i += 1;
+                }
+                if chars.get(i) == Some(&']') {
+                    out.push(']');
+                    i += 1;
+                }
+                continue;
+            }
+            ']' if in_class => in_class = false,
+            _ => {}
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// Translate a Python `re` pattern + flag bits into a `regex`-crate pattern by
 /// prepending the inline-flag group `(?imsx)`, then compile it. `re` flag bits:
 /// I=2, M=8, S=16, X=64 (others are no-ops for the byte/NFA engine here).
@@ -6684,6 +6738,7 @@ fn re_compile_raw(pattern: &str, flags: i64) -> Result<regex::Regex, String> {
     if flags & 64 != 0 {
         inline.push('x');
     }
+    let pattern = rewrite_class_backspace(pattern);
     let full = if inline.is_empty() {
         pattern.to_string()
     } else {
@@ -6702,8 +6757,19 @@ fn re_compile(pattern: &Value, flags: i64) -> Result<Value, String> {
     if with_host(|h| matches!(h.get(pattern), Some(PyObj::Pattern { .. }))) {
         return Ok(pattern.clone());
     }
-    let src = with_host(|h| h.as_str(pattern))
-        .ok_or_else(|| host::type_error("first argument must be string or compiled pattern"))?;
+    // A BYTES pattern (`re.compile(b'[\x80-\xff]')`) compiles too. Each byte is
+    // decoded as latin-1, which maps 0x00..=0xFF to U+0000..=U+00FF one to one,
+    // so the pattern's byte semantics survive into the str engine unchanged.
+    // Rejecting these outright made `import json` fail — its encoder compiles
+    // `b'[\x80-\xff]'` at import time, so the whole module was unreachable.
+    let src = match with_host(|h| h.as_str(pattern)) {
+        Some(s) => s,
+        None => with_host(|h| match h.get(pattern) {
+            Some(PyObj::Bytes(b)) => Some(b.iter().map(|&c| c as char).collect::<String>()),
+            _ => None,
+        })
+        .ok_or_else(|| host::type_error("first argument must be string or compiled pattern"))?,
+    };
     let re = re_compile_raw(&src, flags)?;
     let groups = re.captures_len().saturating_sub(1);
     Ok(with_host(|h| {
@@ -7613,7 +7679,8 @@ const EXC_PARENTS: &[(&str, &str)] = &[
     ("EOFError", "Exception"),
     ("NotADirectoryError", "OSError"),
     ("IsADirectoryError", "OSError"),
-    ("IndentationError", "Exception"),
+    ("IndentationError", "SyntaxError"),
+    ("TabError", "IndentationError"),
     ("SyntaxError", "Exception"),
     ("UnicodeDecodeError", "UnicodeError"),
     ("UnicodeEncodeError", "UnicodeError"),
@@ -7627,6 +7694,39 @@ const EXC_PARENTS: &[(&str, &str)] = &[
     ("InvalidStateError", "Exception"),
     ("QueueEmpty", "Exception"),
     ("QueueFull", "Exception"),
+    // The rest of CPython's builtin hierarchy. Absent names were not merely
+    // unraisable — `except SystemError:` in vendored stdlib code raised NameError
+    // instead, which is what kept `json` unimportable.
+    ("Warning", "Exception"),
+    ("UserWarning", "Warning"),
+    ("DeprecationWarning", "Warning"),
+    ("PendingDeprecationWarning", "Warning"),
+    ("SyntaxWarning", "Warning"),
+    ("RuntimeWarning", "Warning"),
+    ("FutureWarning", "Warning"),
+    ("ImportWarning", "Warning"),
+    ("UnicodeWarning", "Warning"),
+    ("BytesWarning", "Warning"),
+    ("ResourceWarning", "Warning"),
+    ("EncodingWarning", "Warning"),
+    ("SystemError", "Exception"),
+    ("ReferenceError", "Exception"),
+    ("BufferError", "Exception"),
+    ("EnvironmentError", "Exception"),
+    ("PythonFinalizationError", "RuntimeError"),
+    ("BlockingIOError", "OSError"),
+    ("ChildProcessError", "OSError"),
+    ("FileExistsError", "OSError"),
+    ("InterruptedError", "OSError"),
+    ("ProcessLookupError", "OSError"),
+    ("ConnectionAbortedError", "ConnectionError"),
+    ("ConnectionRefusedError", "ConnectionError"),
+    ("ConnectionResetError", "ConnectionError"),
+    // PEP 654. `ExceptionGroup` derives from BaseExceptionGroup in CPython; the
+    // single-parent chain here keeps `except Exception:` catching it, which is
+    // the behaviour that matters.
+    ("BaseExceptionGroup", "BaseException"),
+    ("ExceptionGroup", "Exception"),
 ];
 
 fn exc_parent(name: &str) -> Option<&'static str> {
