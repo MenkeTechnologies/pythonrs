@@ -7339,7 +7339,15 @@ impl PyHost {
             Some(PyObj::Class(cname)) => {
                 let cname = cname.clone();
                 if name == "__name__" {
-                    return Ok(self.new_str(cname));
+                    // The registry KEY may be disambiguated (`Codec#1`) when a
+                    // class shadows one of its bases; the display name is the
+                    // one the class was written with.
+                    let disp = self
+                        .classes
+                        .get(&cname)
+                        .map(|c| c.name.clone())
+                        .unwrap_or_else(|| cname.clone());
+                    return Ok(self.new_str(disp));
                 }
                 if name == "__qualname__" {
                     // The dotted path for a nested class (`A.B`); a top-level
@@ -8510,8 +8518,28 @@ impl PyHost {
         ns: IndexMap<String, Value>,
         metaclass: &str,
     ) -> Value {
+        // Classes live in ONE table keyed by bare name, so a class that shadows
+        // one of its own bases would overwrite it and then list itself as its
+        // base — `mro_of` recurses on that forever and kills the process. The
+        // stdlib does this constantly: every `encodings/*.py` opens with
+        // `class Codec(codecs.Codec)`, and `class StreamWriter(codecs.
+        // StreamWriter)` right after. Give the shadowing class its own key
+        // (display name unchanged) so the base it inherits from stays reachable.
+        let key = if bases.iter().any(|b| b == name) {
+            let mut n = 1usize;
+            loop {
+                let cand = format!("{name}#{n}");
+                if !self.classes.contains_key(&cand) {
+                    break cand;
+                }
+                n += 1;
+            }
+        } else {
+            name.to_string()
+        };
+        let name_for_key = key.clone();
         let mro = {
-            let mut out = vec![name.to_string()];
+            let mut out = vec![name_for_key.clone()];
             for b in &bases {
                 for m in self.mro_of(b) {
                     if !out.contains(&m) {
@@ -8528,7 +8556,7 @@ impl PyHost {
         for v in ns.values() {
             if let Some(PyObj::Func(fv)) = self.get_mut(v) {
                 if fv.owner.is_none() {
-                    fv.owner = Some(name.to_string());
+                    fv.owner = Some(name_for_key.clone());
                 }
             }
         }
@@ -8555,7 +8583,7 @@ impl PyHost {
             .and_then(|v| self.as_str(v))
             .unwrap_or_else(|| "__main__".to_string());
         self.classes.insert(
-            name.to_string(),
+            key.clone(),
             ClassDef {
                 name: name.to_string(),
                 // Set by `build_class` once known; a bare registration (or an
@@ -8568,7 +8596,7 @@ impl PyHost {
                 module,
             },
         );
-        self.alloc(PyObj::Class(name.to_string()))
+        self.alloc(PyObj::Class(key))
     }
 }
 
