@@ -3651,6 +3651,11 @@ pub fn call_builtin_function(
             return r;
         }
     }
+    if let Some(f) = name.strip_prefix("_struct.") {
+        if let Some(r) = with_host(|h| crate::stdlib::pystruct::call(h, f, &args)) {
+            return r;
+        }
+    }
     // collections constructors (host-backed types).
     if let Some(f) = name.strip_prefix("collections.") {
         return construct_collection(f, args, kwargs);

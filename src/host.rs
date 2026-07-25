@@ -12237,6 +12237,9 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
     let stdlib_entries: Option<Vec<(String, Value)>> = match name {
         "textwrap" => Some(with_host(crate::stdlib::textwrap::entries)),
         "statistics" => Some(with_host(crate::stdlib::statistics::entries)),
+        // `_struct` — ported from RustPython (MIT); `struct.py` is `from _struct
+        // import *`, so this is the whole module.
+        "_struct" => Some(with_host(crate::stdlib::pystruct::entries)),
         _ => None,
     };
     #[cfg(feature = "stdlib-ffi")]
