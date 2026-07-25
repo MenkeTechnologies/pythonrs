@@ -3794,6 +3794,44 @@ pub fn call_builtin_function(
             return with_host(|h| crate::stdlib::pyhash::construct(h, algo, &args, &kwargs));
         }
     }
+    // `_csv.reader(iterable, ...)` — draining the source iterator runs user code,
+    // so it happens outside the host borrow. CPython's reader is lazy over that
+    // iterator; `csv.py` only ever iterates the result, so materializing keeps
+    // the parser a pure function of the text.
+    if name == "_csv.reader" {
+        let src = arg0(&args)?;
+        let dialect = with_host(|h| {
+            crate::stdlib::pycsv::Dialect::resolve_public(h, args.get(1), &kwargs)
+        })?;
+        let lines = host::iter_vec(&src)?;
+        let mut text = String::new();
+        for l in &lines {
+            let s = with_host(|h| h.as_str(l)).unwrap_or_default();
+            text.push_str(&s);
+            if !s.ends_with('\n') && !s.ends_with('\r') {
+                text.push('\n');
+            }
+        }
+        return Ok(with_host(|h| {
+            let rows: Vec<Value> = crate::stdlib::pycsv::parse_rows(&text, &dialect)
+                .into_iter()
+                .map(|r| {
+                    let fields: Vec<Value> = r.into_iter().map(|f| h.new_str(f)).collect();
+                    h.new_list(fields)
+                })
+                .collect();
+            h.alloc(host::PyObj::CsvReader {
+                rows,
+                idx: 0,
+                dialect: Box::new(dialect),
+            })
+        }));
+    }
+    if let Some(f) = name.strip_prefix("_csv.") {
+        if let Some(r) = with_host(|h| crate::stdlib::pycsv::call(h, f, &args, &kwargs)) {
+            return r;
+        }
+    }
     if let Some(f) = name.strip_prefix("_signal.") {
         if let Some(r) = with_host(|h| crate::stdlib::pysignal::call(h, f, &args)) {
             return r;
@@ -8035,6 +8073,7 @@ const EXC_PARENTS: &[(&str, &str)] = &[
     // parent chain here keeps `except ValueError` working, which is what the
     // stdlib actually catches it with.
     ("UnsupportedOperation", "ValueError"),
+    ("_csv.Error", "Exception"),
     ("UnicodeError", "ValueError"),
     ("TypeError", "Exception"),
     ("NameError", "Exception"),
@@ -8944,6 +8983,13 @@ pub fn call_type_method(
     }
     if let Some(r) = with_host(|h| crate::stdlib::pyhash::method(h, recv, name, &args)) {
         return r;
+    }
+    // A `_csv` writer's row methods run OUTSIDE the host borrow: they iterate the
+    // row and call the stream's `write`, both of which re-enter.
+    if matches!(name, "writerow" | "writerows") {
+        if let Some(r) = crate::stdlib::pycsv::write_rows(recv, name, &args) {
+            return r;
+        }
     }
     // `desc.__get__(obj[, cls])` on a C-level attribute descriptor. A getset (or
     // member) descriptor names one attribute of its owner type, so invoking it is

@@ -1864,3 +1864,101 @@ fn vendored_logging_runs_on_pythonrs() {
         "'INFO:demo:hello world\\n'"
     );
 }
+
+#[cfg(not(feature = "stdlib-ffi"))]
+#[test]
+fn vendored_csv_runs_on_pythonrs() {
+    // Writing: a field is quoted only when it would otherwise be ambiguous, an
+    // embedded quote is doubled, and `None` writes as an empty field.
+    assert_eq!(
+        g(
+            "import csv, io\n\
+             s = io.StringIO()\n\
+             w = csv.writer(s, lineterminator='\\n')\n\
+             w.writerow(['a', 'b,c', 'd\"e', None])\n\
+             x = s.getvalue()",
+            "x"
+        ),
+        "'a,\"b,c\",\"d\"\"e\",\\n'"
+    );
+    // Reading: a doubled quote inside a quoted field is one literal quote.
+    assert_eq!(
+        g(
+            "import csv, io\n\
+             x = list(csv.reader(io.StringIO('\"he said \"\"hi\"\"\",,z\\r\\n')))",
+            "x"
+        ),
+        "[['he said \"hi\"', '', 'z']]"
+    );
+    // A blank line is an EMPTY ROW, not a skipped one.
+    assert_eq!(
+        g("import csv, io\nx = list(csv.reader(io.StringIO('\\n')))", "x"),
+        "[[]]"
+    );
+    assert_eq!(
+        g(
+            "import csv, io\n\
+             x = list(csv.reader(io.StringIO('  a, b\\n'), skipinitialspace=True))",
+            "x"
+        ),
+        "[['a', 'b']]"
+    );
+    // The dialect registry, and reading through a registered dialect by name.
+    assert_eq!(
+        g(
+            "import csv, io\n\
+             csv.register_dialect('pipe', delimiter='|')\n\
+             rows = list(csv.reader(io.StringIO('a|b\\n'), 'pipe'))\n\
+             csv.unregister_dialect('pipe')\n\
+             x = rows",
+            "x"
+        ),
+        "[['a', 'b']]"
+    );
+    // `DictReader`/`DictWriter` are pure `csv.py` over this module.
+    assert_eq!(
+        g(
+            "import csv, io\n\
+             x = [dict(r) for r in csv.DictReader(io.StringIO('x,y\\n1,2\\n3,4\\n'))]",
+            "x"
+        ),
+        "[{'x': '1', 'y': '2'}, {'x': '3', 'y': '4'}]"
+    );
+    assert_eq!(
+        g(
+            "import csv, io\n\
+             o = io.StringIO()\n\
+             w = csv.DictWriter(o, fieldnames=['x', 'y'], lineterminator='\\n')\n\
+             w.writeheader()\n\
+             w.writerow({'x': 1, 'y': 2})\n\
+             x = o.getvalue()",
+            "x"
+        ),
+        "'x,y\\n1,2\\n'"
+    );
+}
+
+#[test]
+fn a_dict_view_takes_set_operations_against_any_iterable() {
+    // A dict view's set operators accept any iterable, unlike a plain list's.
+    // `csv.DictWriter` finds extra keys with `rowdict.keys() - self.fieldnames`,
+    // where the right side is a LIST.
+    assert_eq!(g("d = {'a': 1, 'b': 2}\nx = sorted(d.keys() - ['a'])", "x"), "['b']");
+    assert_eq!(g("d = {'a': 1, 'b': 2}\nx = sorted(d.keys() & ['a'])", "x"), "['a']");
+    assert_eq!(
+        g("d = {'a': 1}\nx = sorted(d.keys() | {'z'})", "x"),
+        "['a', 'z']"
+    );
+    // A list minus a list is still a TypeError.
+    assert_eq!(
+        g(
+            "try:\n\
+             \x20   [1] - [2]\n\
+             \x20   x = 'no error'\n\
+             except TypeError:\n\
+             \x20   x = 'TypeError'",
+            "x"
+        ),
+        "'TypeError'"
+    );
+}

@@ -14,6 +14,7 @@
 pub mod binascii;
 pub mod codecs;
 pub mod pyast;
+pub mod pycsv;
 pub mod pyhash;
 pub mod pyimp;
 pub mod pyio;

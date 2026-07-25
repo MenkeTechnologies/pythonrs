@@ -776,6 +776,21 @@ pub enum PyObj {
         data: Vec<u8>,
         out_len: usize,
     },
+    /// A `_csv` writer: the stream it emits to plus the dialect it emits under.
+    CsvWriter {
+        stream: Value,
+        dialect: Box<crate::stdlib::pycsv::Dialect>,
+    },
+    /// A resolved `_csv` dialect, as `csv.get_dialect` returns.
+    CsvDialect(Box<crate::stdlib::pycsv::Dialect>),
+    /// A `_csv` reader. The rows are parsed up front; `line_num` still advances
+    /// as they are consumed, because `csv.DictReader` reads it to report which
+    /// input line a malformed row came from.
+    CsvReader {
+        rows: Vec<Value>,
+        idx: usize,
+        dialect: Box<crate::stdlib::pycsv::Dialect>,
+    },
     /// A `contextvars.Context`. Each variable carries its own state here, so a
     /// context is a marker for "the current context" rather than a snapshot — but
     /// it has to be an OBJECT rather than a type marker, because `threading` runs
@@ -2091,8 +2106,30 @@ impl PyHost {
     /// `dict_keys`/`dict_items` view coerced to a key-set. `None` otherwise
     /// (a `dict_values` view has no set algebra).
     pub fn setmap_of(&mut self, v: &Value) -> Option<IndexMap<PKey, Value>> {
+        self.setmap_operand(v, false)
+    }
+
+    /// The key-set of `v` for a set operation. A `set`/`frozenset` and the
+    /// key/item dict views are always set-like; a list or tuple is coerced only
+    /// when the OTHER operand already is one, which is CPython's rule — a dict
+    /// view's set operators accept any iterable (`d.keys() - ['a']`, which
+    /// `csv.DictWriter` uses to find extra keys), while `[1] - [2]` stays a
+    /// TypeError.
+    pub fn setmap_operand(&mut self, v: &Value, other_is_set: bool) -> Option<IndexMap<PKey, Value>> {
         if let Some(PyObj::Set(s)) | Some(PyObj::Frozenset(s)) = self.get(v) {
             return Some(s.clone());
+        }
+        if other_is_set {
+            if let Some(PyObj::List(items)) | Some(PyObj::Tuple(items)) = self.get(v) {
+                let items = items.clone();
+                let mut out: IndexMap<PKey, Value> = IndexMap::new();
+                for it in items {
+                    if let Ok(k) = self.to_key(&it) {
+                        out.insert(k, it);
+                    }
+                }
+                return Some(out);
+            }
         }
         let kind = match self.get(v) {
             Some(PyObj::DictView { kind, .. }) if *kind == 0 || *kind == 2 => *kind,
@@ -3039,6 +3076,9 @@ impl PyHost {
                 Some(PyObj::ContextVar { .. }) => "ContextVar".into(),
                 Some(PyObj::ContextToken { .. }) => "Token".into(),
                 Some(PyObj::ContextObj) => "Context".into(),
+                Some(PyObj::CsvWriter { .. }) => "_csv.writer".into(),
+                Some(PyObj::CsvDialect(_)) => "Dialect".into(),
+                Some(PyObj::CsvReader { .. }) => "_csv.reader".into(),
                 Some(PyObj::Hasher { algo, .. }) => (*algo).name().into(),
                 Some(PyObj::Str(_)) => "str".into(),
                 Some(PyObj::Bytes(_)) => "bytes".into(),
@@ -3211,6 +3251,9 @@ impl PyHost {
                 Some(PyObj::ContextVar { name, .. }) => format!("<ContextVar name='{name}'>"),
                 Some(PyObj::ContextToken { .. }) => "<Token>".to_string(),
                 Some(PyObj::ContextObj) => "<Context>".to_string(),
+                Some(PyObj::CsvWriter { .. }) => "<_csv.writer object>".to_string(),
+                Some(PyObj::CsvDialect(_)) => "<_csv.Dialect object>".to_string(),
+                Some(PyObj::CsvReader { .. }) => "<_csv.reader object>".to_string(),
                 Some(PyObj::Hasher { algo, .. }) => {
                     format!("<{} _hashlib.HASH object>", algo.name())
                 }
@@ -5035,7 +5078,10 @@ impl PyHost {
                 }
                 // set difference (result type follows the left operand;
                 // dict_keys/dict_items views participate as key-sets)
-                if let (Some(mut out), Some(y)) = (self.setmap_of(a), self.setmap_of(b)) {
+                let a_set = self.setmap_of(a).is_some();
+                if let (Some(mut out), Some(y)) =
+                    (self.setmap_of(a), self.setmap_operand(b, a_set))
+                {
                     for k in y.keys() {
                         out.shift_remove(k);
                     }
@@ -5425,7 +5471,12 @@ impl PyHost {
                 }
                 // set operations (result type follows the left operand;
                 // dict_keys/dict_items views participate as key-sets)
-                if let (Some(x), Some(y)) = (self.setmap_of(a), self.setmap_of(b)) {
+                let a_set = self.setmap_of(a).is_some();
+                let b_set = self.setmap_of(b).is_some();
+                if let (Some(x), Some(y)) = (
+                    self.setmap_operand(a, b_set),
+                    self.setmap_operand(b, a_set),
+                ) {
                     let mut out = IndexMap::new();
                     match tag {
                         binop::BITAND => {
@@ -6968,6 +7019,14 @@ impl PyHost {
     /// Materialize an iterable into a Vec of values (for `for`, comprehensions,
     /// `list()`, unpacking, …).
     pub fn iter_items(&mut self, v: &Value) -> Result<Vec<Value>, String> {
+        // A `_csv` reader drains to its remaining rows.
+        if let Some(PyObj::CsvReader { rows, idx, .. }) = self.get(v) {
+            let out = rows[(*idx).min(rows.len())..].to_vec();
+            if let Some(PyObj::CsvReader { rows, idx, .. }) = self.get_mut(v) {
+                *idx = rows.len();
+            }
+            return Ok(out);
+        }
         if let Some(d) = self.module_dict_snapshot(v) {
             return self.iter_items(&d);
         }
@@ -7175,6 +7234,7 @@ impl PyHost {
                 step: step.clone(),
             },
             Some(PyObj::Iter(_))
+            | Some(PyObj::CsvReader { .. })
             | Some(PyObj::Generator { .. })
             | Some(PyObj::Zip { .. })
             | Some(PyObj::MapObj { .. })
@@ -7192,6 +7252,15 @@ impl PyHost {
 
     /// Advance an iterator; `None` on exhaustion.
     pub fn iter_next(&mut self, it: &Value) -> Result<Option<Value>, String> {
+        // A `_csv` reader yields its parsed rows, advancing `line_num` as it goes.
+        if let Some(PyObj::CsvReader { rows, idx, .. }) = self.get_mut(it) {
+            if *idx >= rows.len() {
+                return Ok(None);
+            }
+            let row = rows[*idx].clone();
+            *idx += 1;
+            return Ok(Some(row));
+        }
         #[cfg(feature = "stdlib-ffi")]
         if let Some(id) = self.foreign_id(it) {
             return crate::ffi::iter_next(self, id);
@@ -7612,6 +7681,16 @@ impl PyHost {
                 }
             }
         }
+        // A `_csv` reader is its own iterator.
+        if matches!(name, "__iter__" | "__next__")
+            && matches!(self.get(recv), Some(PyObj::CsvReader { .. }))
+        {
+            let b = self.alloc(PyObj::Builtin(name.to_string()));
+            return Ok(self.alloc(PyObj::BoundMethod {
+                recv: recv.clone(),
+                func: b,
+            }));
+        }
         // Every lazy iterator answers the iteration protocol as BOUND METHODS,
         // not only through `next(it)`: `threading` takes
         // `itertools.count().__next__` as its thread-name counter.
@@ -7632,6 +7711,15 @@ impl PyHost {
                 recv: recv.clone(),
                 func: b,
             }));
+        }
+        // A `_csv` writer's `.dialect`, or a dialect's parameters.
+        if matches!(
+            self.get(recv),
+            Some(PyObj::CsvWriter { .. }) | Some(PyObj::CsvDialect(_)) | Some(PyObj::CsvReader { .. })
+        ) {
+            if let Some(r) = crate::stdlib::pycsv::attr(self, recv, name) {
+                return r;
+            }
         }
         // `h.name` / `.digest_size` / `.block_size` on a hash object.
         if matches!(self.get(recv), Some(PyObj::Hasher { .. })) {
@@ -12883,6 +12971,7 @@ pub fn iter_step(it: &Value) -> Result<Option<Value>, String> {
         Some(PyObj::FilterObj { .. }) => Step::Filter,
         Some(PyObj::EnumerateObj { .. }) => Step::Enumerate,
         Some(PyObj::CallIter { .. }) => Step::CallIter,
+        Some(PyObj::CsvReader { .. }) => Step::Plain,
         Some(PyObj::ItertoolsIter { .. }) => Step::Itertools,
         #[cfg(feature = "stdlib-ffi")]
         Some(PyObj::Foreign(id)) => Step::Foreign(*id),
@@ -13329,6 +13418,9 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
         "_imp" => Some(with_host(crate::stdlib::pyimp::entries)),
         // `_signal` — the POSIX signal numbers `signal.py` re-exports as enums.
         "_signal" => Some(with_host(crate::stdlib::pysignal::entries)),
+        // `_csv` — the CSV parser and formatter `csv.py` builds its readers,
+        // writers and Sniffer on.
+        "_csv" => Some(with_host(crate::stdlib::pycsv::entries)),
         // The hash accelerators `hashlib` dispatches to, one per algorithm family.
         "_md5" | "_sha1" | "_sha2" | "_sha3" | "_blake2" => {
             with_host(|h| crate::stdlib::pyhash::entries(h, name))
