@@ -26,6 +26,7 @@ pub mod intercepts;
 pub mod lexer;
 pub mod lsp;
 pub mod parser;
+pub mod regexpr;
 pub mod repl;
 pub mod rust_ffi;
 pub mod stdlib;

@@ -1066,3 +1066,121 @@ fn typing_union_subscript_matches_the_pep604_spelling() {
     assert_eq!(g("from _typing import Union\nx = Union[int, None]", "x"), "int | None");
     assert_eq!(g("from _typing import Union\nx = Union[int, str] == (int | str)", "x"), "True");
 }
+
+#[test]
+fn regex_supports_lookaround_and_backreferences() {
+    // Python's `re` has look-around and backreferences; a finite-automaton engine
+    // structurally cannot. The compiler falls back to a backtracking engine for
+    // exactly the patterns that need it — `_pydecimal` and `fractions` write their
+    // number grammars with `(?=\d|\.\d)`, so `import decimal` depended on this.
+    assert_eq!(
+        g(r#"import re
+x = re.findall(r'\d+(?= dollars)', '5 dollars 7 euros 9 dollars')"#, "x"),
+        "['5', '9']"
+    );
+    assert_eq!(
+        g(r#"import re
+x = re.sub(r'(?<=a)b', 'X', 'ab cb ab')"#, "x"),
+        "'aX cb aX'"
+    );
+    assert_eq!(
+        g(r#"import re
+x = re.search(r'(\w+) \1', 'hey hey there').group(0)"#, "x"),
+        "'hey hey'"
+    );
+    // The fast engine must still handle everything it always did.
+    assert_eq!(
+        g(r#"import re
+x = re.findall(r'\b\w+\b', 'one two three')"#, "x"),
+        "['one', 'two', 'three']"
+    );
+}
+
+#[test]
+fn re_split_keeps_capture_groups() {
+    // `re.split` is not the engine's `split`: a pattern with capture groups
+    // interleaves each group's text between the pieces, and yields `None` for a
+    // group that did not participate. `textwrap` splits on a pattern that is ALL
+    // groups, so dropping them made every `fill`/`wrap` return blank.
+    assert_eq!(
+        g(r#"import re
+x = re.split(r'(\s)', 'a b c')"#, "x"),
+        "['a', ' ', 'b', ' ', 'c']"
+    );
+    assert_eq!(
+        g(r#"import re
+x = re.split(r'(a)|(b)', 'zazbz')"#, "x"),
+        "['z', 'a', None, 'z', None, 'b', 'z']"
+    );
+    // `maxsplit` is the THIRD positional of `re.split` (where the others keep
+    // `flags`) and is also accepted by keyword.
+    assert_eq!(
+        g("import re\nx = re.split(r',', 'a,b,c', maxsplit=1)", "x"),
+        "['a', 'b,c']"
+    );
+    assert_eq!(
+        g("import re\nx = re.sub(r'a', 'X', 'aaa', count=2)", "x"),
+        "'XXa'"
+    );
+}
+
+#[test]
+fn large_integers_compare_exactly() {
+    // Equality on integers must be exact at any size. Comparing through `f64` made
+    // any two integers within one ULP equal — at 29 digits that is a gap of
+    // billions, and `_pydecimal.sqrt` (which ends in `exact = n*n == c`) took the
+    // "exact" branch on a wrong root and returned 1 for sqrt(2).
+    assert_eq!(
+        g("n = 14142135623730950488016887242\nc = 2 * 100**28\nx = (n*n == c)", "x"),
+        "False"
+    );
+    assert_eq!(g("x = (10**30 + 1 == 10**30)", "x"), "False");
+    // A bignum equals a float only when the float IS that integer exactly.
+    assert_eq!(g("x = (10**30 == 1e30)", "x"), "False");
+    assert_eq!(g("x = (2**53 == 2.0**53)", "x"), "True");
+    assert_eq!(g("x = (10**30 == float(10**30))", "x"), "False");
+}
+
+#[cfg(not(feature = "stdlib-ffi"))]
+#[test]
+fn vendored_decimal_and_fractions_run_on_pythonrs() {
+    // The real `_pydecimal`/`fractions`, not a native subset: correctly-rounded
+    // arbitrary-precision arithmetic all the way through.
+    assert_eq!(
+        g("import decimal\nx = str(decimal.Decimal('1.1') + decimal.Decimal('2.2'))", "x"),
+        "'3.3'"
+    );
+    assert_eq!(
+        g("import decimal\nx = str(decimal.Decimal(1) / decimal.Decimal(7))", "x"),
+        "'0.1428571428571428571428571429'"
+    );
+    assert_eq!(
+        g("import decimal\nx = str(decimal.Decimal('2').sqrt())", "x"),
+        "'1.414213562373095048801688724'"
+    );
+    assert_eq!(
+        g("from fractions import Fraction\nx = str(Fraction('3/7') + Fraction(1, 14))", "x"),
+        "'1/2'"
+    );
+    assert_eq!(
+        g("from fractions import Fraction\nx = str(sum(Fraction(1, n) for n in range(1, 10)))", "x"),
+        "'7129/2520'"
+    );
+}
+
+#[test]
+fn math_sumprod_is_exact_for_ints_and_correctly_rounded_for_floats() {
+    // Two int sequences dot-product EXACTLY (bignum); floats go through the same
+    // compensated accumulator `fsum` uses, with `fma` recovering each product's
+    // rounding error. `statistics.correlation` is built on it.
+    assert_eq!(g("import math\nx = math.sumprod([1,2,3], [4,5,6])", "x"), "32");
+    assert_eq!(
+        g("import math\nx = math.sumprod([10**20, 1], [10**20, 1])", "x"),
+        "10000000000000000000000000000000000000001"
+    );
+    // Catastrophic cancellation: the exact answer is 0, not 1e308-scale noise.
+    assert_eq!(
+        g("import math\nx = math.sumprod([1e308, 1], [1, -1e308])", "x"),
+        "0.0"
+    );
+}

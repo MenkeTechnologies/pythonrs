@@ -3642,16 +3642,6 @@ pub fn call_builtin_function(
         }
     }
     // Native stdlib module functions (src/stdlib). These take `&mut PyHost`.
-    if let Some(f) = name.strip_prefix("textwrap.") {
-        if let Some(r) = with_host(|h| crate::stdlib::textwrap::call(h, f, &args)) {
-            return r;
-        }
-    }
-    if let Some(f) = name.strip_prefix("statistics.") {
-        if let Some(r) = with_host(|h| crate::stdlib::statistics::call(h, f, &args)) {
-            return r;
-        }
-    }
     if let Some(f) = name.strip_prefix("_struct.") {
         if let Some(r) = with_host(|h| crate::stdlib::pystruct::call(h, f, &args)) {
             return r;
@@ -6693,7 +6683,7 @@ fn check_arity(name: &str, qual: &str, spec: Arity, argc: usize) -> Result<(), S
 fn math_arity(name: &str) -> Option<Arity> {
     Some(match name {
         "log" | "perm" => Arity::VarRange(1, 2),
-        "pow" | "atan2" | "copysign" | "fmod" | "remainder" | "ldexp" | "comb" => {
+        "pow" | "atan2" | "copysign" | "fmod" | "remainder" | "ldexp" | "comb" | "sumprod" => {
             Arity::VarExact(2)
         }
         "gcd" | "lcm" | "hypot" => return None,
@@ -6789,7 +6779,28 @@ fn rewrite_class_backspace(pattern: &str) -> std::borrow::Cow<'_, str> {
 /// Translate a Python `re` pattern + flag bits into a `regex`-crate pattern by
 /// prepending the inline-flag group `(?imsx)`, then compile it. `re` flag bits:
 /// I=2, M=8, S=16, X=64 (others are no-ops for the byte/NFA engine here).
-fn re_compile_raw(pattern: &str, flags: i64) -> Result<regex::Regex, String> {
+/// Add `x` to a Shewchuk exact-sum accumulator: `partials` holds non-overlapping
+/// values whose plain sum is the exact total, so the final add rounds once.
+fn exact_sum_push(partials: &mut Vec<f64>, mut x: f64) {
+    let mut i = 0;
+    for j in 0..partials.len() {
+        let mut y = partials[j];
+        if x.abs() < y.abs() {
+            std::mem::swap(&mut x, &mut y);
+        }
+        let hi = x + y;
+        let lo = y - (hi - x);
+        if lo != 0.0 {
+            partials[i] = lo;
+            i += 1;
+        }
+        x = hi;
+    }
+    partials.truncate(i);
+    partials.push(x);
+}
+
+fn re_compile_raw(pattern: &str, flags: i64) -> Result<crate::regexpr::PyRegex, String> {
     let mut inline = String::new();
     if flags & 2 != 0 {
         inline.push('i');
@@ -6809,10 +6820,9 @@ fn re_compile_raw(pattern: &str, flags: i64) -> Result<regex::Regex, String> {
     } else {
         format!("(?{inline}){pattern}")
     };
-    regex::Regex::new(&full).map_err(|e| {
-        // The `re.error` message; the engine's own text is close enough.
-        format!("re.error: {}", e.to_string().lines().last().unwrap_or("bad pattern"))
-    })
+    // `PyRegex` picks the engine: the linear-time one when it can take the
+    // pattern, the backtracking one when the pattern needs look-around.
+    crate::regexpr::PyRegex::new(&full).map_err(|e| format!("re.error: {e}"))
 }
 
 /// Compile `pattern` (a str or an already-compiled `Pattern`) with `flags` into a
@@ -6852,13 +6862,7 @@ fn re_compile(pattern: &Value, flags: i64) -> Result<Value, String> {
 /// Build a `PyObj::Match` from a regex match over `text` (byte spans), recording
 /// the named-group index map from the pattern.
 fn re_build_match(pat_id: usize, text: &str, m_spans: Vec<Option<(usize, usize)>>) -> Value {
-    let named: Vec<(String, usize)> = with_host(|h| {
-        h.regexes[pat_id]
-            .capture_names()
-            .enumerate()
-            .filter_map(|(i, n)| n.map(|n| (n.to_string(), i)))
-            .collect()
-    });
+    let named: Vec<(String, usize)> = with_host(|h| h.regexes[pat_id].named_groups());
     with_host(|h| {
         h.alloc(PyObj::Match {
             text: text.to_string(),
@@ -6872,17 +6876,12 @@ fn re_build_match(pat_id: usize, text: &str, m_spans: Vec<Option<(usize, usize)>
 /// spans of the first match at/after `anchored` position, or None.
 fn re_first_match(pat_id: usize, text: &str, anchored: bool) -> Option<Vec<Option<(usize, usize)>>> {
     with_host(|h| {
-        let re = &h.regexes[pat_id];
-        let caps = re.captures(text)?;
+        let spans = h.regexes[pat_id].first_captures(text)?;
         // `match` requires the match to start at position 0.
-        if anchored && caps.get(0).map(|m| m.start()) != Some(0) {
+        if anchored && spans.first().copied().flatten().map(|(s, _)| s) != Some(0) {
             return None;
         }
-        Some(
-            (0..re.captures_len())
-                .map(|i| caps.get(i).map(|m| (m.start(), m.end())))
-                .collect(),
-        )
+        Some(spans)
     })
 }
 
@@ -6915,16 +6914,23 @@ fn call_re(f: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Result<Va
             let text = args.get(1).cloned().unwrap_or(Value::Undef);
             re_pattern_method(&pat, f, &[text], &[])
         }
-        "findall" | "finditer" | "split" => {
+        "findall" | "finditer" => {
             let pat = re_compile(&arg0(&args)?, flag_arg(&args, 2))?;
             let text = args.get(1).cloned().unwrap_or(Value::Undef);
-            re_pattern_method(&pat, f, &[text], &[])
+            re_pattern_method(&pat, f, &[text], &kwargs)
+        }
+        // `re.split(pattern, string, maxsplit=0, flags=0)` — note `maxsplit` sits
+        // where the other functions keep `flags`.
+        "split" => {
+            let pat = re_compile(&arg0(&args)?, flag_arg(&args, 3))?;
+            let rest: Vec<Value> = args.iter().skip(1).take(2).cloned().collect();
+            re_pattern_method(&pat, f, &rest, &kwargs)
         }
         "sub" | "subn" => {
             // `sub(pattern, repl, string, count=0, flags=0)`.
             let pat = re_compile(&arg0(&args)?, flag_arg(&args, 4))?;
-            let rest: Vec<Value> = args.iter().skip(1).cloned().collect();
-            re_pattern_method(&pat, f, &rest, &[])
+            let rest: Vec<Value> = args.iter().skip(1).take(3).cloned().collect();
+            re_pattern_method(&pat, f, &rest, &kwargs)
         }
         _ => Err(host::name_error(&format!("re.{f}"))),
     }
@@ -6936,8 +6942,16 @@ pub fn re_pattern_method(
     pat: &Value,
     method: &str,
     args: &[Value],
-    _kwargs: &[(String, Value)],
+    kwargs: &[(String, Value)],
 ) -> Result<Value, String> {
+    // `maxsplit`/`count` are ordinary keyword arguments in Python, and callers use
+    // them that way (`re.split(pat, s, maxsplit=1)`).
+    let kw_int = |name: &str| -> Option<i64> {
+        kwargs
+            .iter()
+            .find(|(k, _)| k == name)
+            .and_then(|(_, v)| with_host(|h| h.as_int(v)))
+    };
     let (pat_id, groups) = match with_host(|h| h.get(pat).cloned()) {
         Some(PyObj::Pattern { id, groups, .. }) => (id, groups),
         _ => return Err(host::type_error("not a compiled pattern")),
@@ -6982,10 +6996,18 @@ pub fn re_pattern_method(
             let text = text.ok_or_else(|| host::type_error("expected string"))?;
             // Each match's group strings (group 0 when no groups, else groups 1..).
             let rows: Vec<Vec<String>> = with_host(|h| {
-                let re = &h.regexes[pat_id];
-                re.captures_iter(&text)
-                    .map(|caps| {
-                        let grp = |i: usize| caps.get(i).map(|m| m.as_str().to_string()).unwrap_or_default();
+                h.regexes[pat_id]
+                    .all_captures(&text)
+                    .into_iter()
+                    .map(|spans| {
+                        let grp = |i: usize| {
+                            spans
+                                .get(i)
+                                .copied()
+                                .flatten()
+                                .map(|(a, b)| text[a..b].to_string())
+                                .unwrap_or_default()
+                        };
                         match groups {
                             0 => vec![grp(0)],
                             _ => (1..=groups).map(grp).collect(),
@@ -7009,16 +7031,8 @@ pub fn re_pattern_method(
         }
         "finditer" => {
             let text = text.ok_or_else(|| host::type_error("expected string"))?;
-            let all: Vec<Vec<Option<(usize, usize)>>> = with_host(|h| {
-                let re = &h.regexes[pat_id];
-                re.captures_iter(&text)
-                    .map(|caps| {
-                        (0..re.captures_len())
-                            .map(|i| caps.get(i).map(|m| (m.start(), m.end())))
-                            .collect()
-                    })
-                    .collect()
-            });
+            let all: Vec<Vec<Option<(usize, usize)>>> =
+                with_host(|h| h.regexes[pat_id].all_captures(&text));
             let matches: Vec<Value> =
                 all.into_iter().map(|s| re_build_match(pat_id, &text, s)).collect();
             // Return a list iterator (finditer yields lazily in CPython; a list is
@@ -7030,21 +7044,49 @@ pub fn re_pattern_method(
             let repl = args.first().cloned().unwrap_or(Value::Undef);
             let text = with_host(|h| h.as_str(args.get(1).unwrap_or(&Value::Undef)))
                 .ok_or_else(|| host::type_error("expected string"))?;
-            let count = args.get(2).and_then(|v| with_host(|h| h.as_int(v))).unwrap_or(0);
+            let count = args
+                .get(2)
+                .and_then(|v| with_host(|h| h.as_int(v)))
+                .or_else(|| kw_int("count"))
+                .unwrap_or(0);
             re_sub(pat_id, &repl, &text, count, method == "subn")
         }
         "split" => {
             let text = text.ok_or_else(|| host::type_error("expected string"))?;
-            let maxsplit = args.get(1).and_then(|v| with_host(|h| h.as_int(v))).unwrap_or(0);
-            let parts: Vec<String> = with_host(|h| {
+            let maxsplit = args
+                .get(1)
+                .and_then(|v| with_host(|h| h.as_int(v)))
+                .or_else(|| kw_int("maxsplit"))
+                .unwrap_or(0);
+            // `re.split` is NOT the engines' `split`: when the pattern has capture
+            // groups, Python interleaves each group's text between the pieces
+            // (`re.split(r'(\s)', 'a b')` == `['a', ' ', 'b']`), and yields `None`
+            // for a group that did not participate. `textwrap` splits on a pattern
+            // that is ALL groups, so dropping them returned a list of empty strings
+            // and every `fill`/`wrap` came back blank.
+            let (spans, groups) = with_host(|h| {
                 let re = &h.regexes[pat_id];
-                if maxsplit > 0 {
-                    re.splitn(&text, (maxsplit as usize) + 1).map(|s| s.to_string()).collect()
-                } else {
-                    re.split(&text).map(|s| s.to_string()).collect()
-                }
+                (re.all_captures(&text), re.captures_len())
             });
-            let vals: Vec<Value> = parts.iter().map(|s| with_host(|h| h.new_str(s.clone()))).collect();
+            let mut vals: Vec<Value> = Vec::new();
+            let mut last = 0usize;
+            for (n, m) in spans.iter().enumerate() {
+                if maxsplit > 0 && n as i64 >= maxsplit {
+                    break;
+                }
+                let Some((s, e)) = m.first().copied().flatten() else {
+                    continue;
+                };
+                vals.push(with_host(|h| h.new_str(text[last..s].to_string())));
+                for g in 1..groups {
+                    vals.push(match m.get(g).copied().flatten() {
+                        Some((a, b)) => with_host(|h| h.new_str(text[a..b].to_string())),
+                        None => Value::Undef,
+                    });
+                }
+                last = e;
+            }
+            vals.push(with_host(|h| h.new_str(text[last..].to_string())));
             Ok(with_host(|h| h.new_list(vals)))
         }
         _ => Err(host::type_error(&format!("Pattern has no method '{method}'"))),
@@ -7069,16 +7111,8 @@ fn re_sub(
     });
     if is_callable {
         // Collect match spans, call repl(match) for each, splice the results.
-        let spans: Vec<Vec<Option<(usize, usize)>>> = with_host(|h| {
-            let re = &h.regexes[pat_id];
-            re.captures_iter(text)
-                .map(|c| {
-                    (0..re.captures_len())
-                        .map(|i| c.get(i).map(|m| (m.start(), m.end())))
-                        .collect()
-                })
-                .collect()
-        });
+        let spans: Vec<Vec<Option<(usize, usize)>>> =
+            with_host(|h| h.regexes[pat_id].all_captures(text));
         let mut out = String::new();
         let mut last = 0usize;
         let mut n = 0i64;
@@ -7102,18 +7136,9 @@ fn re_sub(
     let rrepl = re_translate_repl(&rsrc);
     let (result, n) = with_host(|h| {
         let re = &h.regexes[pat_id];
-        if count > 0 {
-            let mut cnt = 0i64;
-            let s = re
-                .replacen(text, count as usize, rrepl.as_str())
-                .into_owned();
-            cnt = re.find_iter(text).take(count as usize).count() as i64;
-            let _ = &mut cnt;
-            (s, cnt)
-        } else {
-            let n = re.find_iter(text).count() as i64;
-            (re.replace_all(text, rrepl.as_str()).into_owned(), n)
-        }
+        let limit = (count > 0).then(|| count as usize);
+        let s = re.replace_n(text, limit, rrepl.as_str());
+        (s, re.count_matches(text, limit) as i64)
     });
     finish_sub(with_host(|h| h.new_str(result)), n, want_count)
 }
@@ -7630,24 +7655,44 @@ fn call_math(name: &str, args: &[Value], kwargs: &[(String, Value)]) -> Result<V
             let items = with_host(|h| h.iter_items(&args[0]))?;
             let mut partials: Vec<f64> = Vec::new();
             for it in &items {
-                let mut x = as_f(it)
-                    .ok_or_else(|| host::type_error("must be real number"))?;
-                let mut i = 0;
-                for j in 0..partials.len() {
-                    let mut y = partials[j];
-                    if x.abs() < y.abs() {
-                        std::mem::swap(&mut x, &mut y);
-                    }
-                    let hi = x + y;
-                    let lo = y - (hi - x);
-                    if lo != 0.0 {
-                        partials[i] = lo;
-                        i += 1;
-                    }
-                    x = hi;
+                let x = as_f(it).ok_or_else(|| host::type_error("must be real number"))?;
+                exact_sum_push(&mut partials, x);
+            }
+            Ok(Value::Float(partials.iter().sum()))
+        }
+        // `math.sumprod(p, q)` — the dot product, correctly rounded. Two int
+        // sequences sum EXACTLY (bignum), so it is usable as an integer kernel;
+        // otherwise each product is split by `fma` into its rounded value plus the
+        // exact rounding error, and both go into the same compensated accumulator
+        // `fsum` uses. `statistics.correlation` and `linear_regression` are built
+        // on this, and both are meaningless if the dot product drifts.
+        "sumprod" => {
+            let (p, q) = with_host(|h| Ok::<_, String>((h.iter_items(&args[0])?, h.iter_items(&args[1])?)))?;
+            if p.len() != q.len() {
+                return Err("ValueError: Inputs are not the same length".into());
+            }
+            let all_int = with_host(|h| {
+                p.iter().chain(q.iter()).all(|v| h.big_val(v).is_some())
+            });
+            if all_int {
+                let mut acc = num_bigint::BigInt::from(0);
+                for (a, b) in p.iter().zip(&q) {
+                    let (x, y) = with_host(|h| (h.big_val(a).unwrap(), h.big_val(b).unwrap()));
+                    acc += x * y;
                 }
-                partials.truncate(i);
-                partials.push(x);
+                return Ok(with_host(|h| h.norm_big(acc)));
+            }
+            let mut partials: Vec<f64> = Vec::new();
+            for (a, b) in p.iter().zip(&q) {
+                let x = as_f(a).ok_or_else(|| host::type_error("must be real number"))?;
+                let y = as_f(b).ok_or_else(|| host::type_error("must be real number"))?;
+                let prod = x * y;
+                // `fma(x, y, -prod)` is the part of `x * y` that `prod` lost.
+                let err = x.mul_add(y, -prod);
+                exact_sum_push(&mut partials, prod);
+                if err != 0.0 {
+                    exact_sum_push(&mut partials, err);
+                }
             }
             Ok(Value::Float(partials.iter().sum()))
         }

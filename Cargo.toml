@@ -112,8 +112,11 @@ nu-ansi-term = "0.50"
 sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 toml = "0.8"
 
-# Regex engine backing the `re` module.
+# Regex engines backing the `re` module: `regex` for the linear-time majority,
+# `fancy-regex` for the patterns it cannot express (look-around, backreferences)
+# — `_pydecimal` and `fractions` both need lookahead. See `src/regexpr.rs`.
 regex = "1"
+fancy-regex = "0.18"
 glob = "0.3"
 
 # Stackful same-thread coroutines backing Python generators (yield) and the

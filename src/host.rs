@@ -1297,7 +1297,7 @@ pub struct PyHost {
     /// Compiled `re` patterns, indexed by [`PyObj::Pattern`]'s `id`. The native
     /// `re` module (backed by the `regex` crate) stores each compiled `Regex`
     /// here so a `PyObj::Pattern` stays cheap to clone.
-    pub regexes: Vec<regex::Regex>,
+    pub regexes: Vec<crate::regexpr::PyRegex>,
 }
 
 /// Whether a `GenCell` backs a plain generator, an `async def` coroutine, or
@@ -1661,6 +1661,16 @@ impl PyHost {
             if let Some(PyObj::Dict(d)) = self.get_mut(&sm) {
                 d.insert(PKey::Str(name.to_string()), (kv, module));
             }
+        }
+    }
+
+    /// What `sys.modules[name]` currently holds, if anything. Python code can
+    /// rebind it during an import (`sys.modules[__name__] = other`).
+    pub fn sys_module_entry(&self, name: &str) -> Option<Value> {
+        let sm = self.sys_modules.as_ref()?;
+        match self.get(sm) {
+            Some(PyObj::Dict(d)) => d.get(&PKey::Str(name.to_string())).map(|(_, v)| v.clone()),
+            _ => None,
         }
     }
 
@@ -3744,7 +3754,26 @@ impl PyHost {
         match (a, b) {
             (Value::Undef, Value::Undef) => true,
             (Value::Bool(x), Value::Bool(y)) => x == y,
+            (Value::Int(x), Value::Int(y)) => x == y,
             _ => {
+                // Integers compare EXACTLY, at any size. Routing them through f64
+                // made any two integers within one ULP of each other equal — for
+                // 29-digit values that is a gap of billions. `_pydecimal.sqrt` ends
+                // with `exact = n*n == c`, so `Decimal(2).sqrt()` took the "exact"
+                // branch on a wrong `n` and returned 1.
+                if self.is_bignum(a) || self.is_bignum(b) {
+                    if let (Some(x), Some(y)) = (self.big_val(a), self.big_val(b)) {
+                        return x == y;
+                    }
+                    // A bignum equals a float only when the float is exactly that
+                    // integer — never by rounding both to the same double.
+                    if let (Some(x), Some(f)) = (self.big_val(a), self.float_val(b)) {
+                        return exact_big_eq_float(&x, f);
+                    }
+                    if let (Some(f), Some(y)) = (self.float_val(a), self.big_val(b)) {
+                        return exact_big_eq_float(&y, f);
+                    }
+                }
                 if let (Some(x), Some(y)) = (self.num_val(a), self.num_val(b)) {
                     return x == y;
                 }
@@ -4696,6 +4725,17 @@ pub fn big_range_len(
     }
 }
 
+/// Whether a bignum is EXACTLY the value a float holds. Both sides are converted
+/// to the same exact integer domain rather than to a common `f64`, so no rounding
+/// can make two different numbers agree.
+fn exact_big_eq_float(b: &num_bigint::BigInt, f: f64) -> bool {
+    use num_traits::FromPrimitive;
+    if !f.is_finite() || f.fract() != 0.0 {
+        return false;
+    }
+    num_bigint::BigInt::from_f64(f).is_some_and(|x| &x == b)
+}
+
 fn bigint_to_f64(b: &num_bigint::BigInt) -> f64 {
     use num_traits::ToPrimitive;
     b.to_f64().unwrap_or(f64::INFINITY)
@@ -4897,6 +4937,21 @@ impl PyHost {
             Value::Int(v)
         } else {
             self.alloc(PyObj::BigInt(num_bigint::BigInt::from(n)))
+        }
+    }
+
+    /// Whether `v` is an integer too large for `i64` (a heap bignum).
+    #[inline]
+    pub fn is_bignum(&self, v: &Value) -> bool {
+        matches!(v, Value::Obj(_)) && matches!(self.get(v), Some(PyObj::BigInt(_)))
+    }
+
+    /// `v` as an `f64` only when it genuinely IS a float (no int coercion).
+    #[inline]
+    pub fn float_val(&self, v: &Value) -> Option<f64> {
+        match v {
+            Value::Float(f) => Some(*f),
+            _ => None,
         }
     }
 
@@ -8332,6 +8387,12 @@ impl PyHost {
                 let c = c.clone();
                 self.collect_class_dir(&c, &mut set);
             }
+            // `dir(module)` is its namespace, sorted.
+            Some(PyObj::Module { slot, .. }) => {
+                for k in self.module_globals[*slot].keys() {
+                    set.insert(k.clone());
+                }
+            }
             _ => {}
         }
         set.into_iter().collect()
@@ -9669,6 +9730,17 @@ pub fn call_method(
                         return run_user_func(&fv, Some(clsobj), owner, args, kwargs);
                     }
                 }
+            }
+            // `object`'s own class-level defaults, reached when nothing in the MRO
+            // overrides them. `__subclasshook__` returning NotImplemented is what
+            // tells `ABCMeta.__subclasscheck__` to fall through to the ordinary
+            // MRO/registry check — `numbers.Complex.register(complex)` is the first
+            // thing `decimal` does, and it goes straight through this hook.
+            if name == "__subclasshook__" {
+                return Ok(with_host(|h| h.alloc(PyObj::NotImplemented)));
+            }
+            if name == "__init_subclass__" {
+                return Ok(Value::Undef);
             }
             Err(format!(
                 "AttributeError: type object '{cname}' has no attribute '{name}'"
@@ -12633,6 +12705,25 @@ fn resolve_relative_anchor(pkg: &str, level: usize) -> Result<String, String> {
 /// stdlib `.py` shipped in `pylib/` (run on pythonrs itself), then — only in the
 /// default build and only until the native C-accelerator floor is complete — the
 /// `stdlib-ffi` bridge.
+/// Build a CPython "struct sequence" — a tuple that also answers by field name
+/// and reprs as `name(field=value, …)`. `sys.version_info`, `sys.float_info` and
+/// friends are all this shape, and code both indexes and attribute-reads them.
+fn struct_seq(h: &mut PyHost, type_name: &str, fields: Vec<(&str, Value)>) -> Value {
+    let names: Vec<String> = fields.iter().map(|(k, _)| k.to_string()).collect();
+    let vals: Vec<Value> = fields.into_iter().map(|(_, v)| v).collect();
+    let t = h.new_tuple(vals);
+    if let Value::Obj(i) = t {
+        h.nt_meta.insert(
+            i,
+            NtMeta {
+                type_name: type_name.to_string(),
+                fields: names,
+            },
+        );
+    }
+    t
+}
+
 fn import_module_inner(name: &str) -> Result<Value, String> {
     // `collections.abc` is an alias for the pure-Python `_collections_abc`
     // module; CPython wires it with `sys.modules['collections.abc'] =
@@ -12649,8 +12740,6 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
     // the real CPython modules; they serve only the `--no-default-features` build.
     #[cfg(not(feature = "stdlib-ffi"))]
     let stdlib_entries: Option<Vec<(String, Value)>> = match name {
-        "textwrap" => Some(with_host(crate::stdlib::textwrap::entries)),
-        "statistics" => Some(with_host(crate::stdlib::statistics::entries)),
         // `_struct` — ported from RustPython (MIT); `struct.py` is `from _struct
         // import *`, so this is the whole module.
         "_struct" => Some(with_host(crate::stdlib::pystruct::entries)),
@@ -13090,7 +13179,7 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                 "exp", "exp2", "expm1", "cbrt", "sin", "cos", "tan", "asin", "acos", "atan",
                 "atan2", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh", "degrees",
                 "radians", "hypot", "trunc", "copysign", "fmod", "ldexp", "isqrt", "isnan",
-                "isinf", "isfinite", "gcd", "factorial", "comb", "perm", "fsum", "prod",
+                "isinf", "isfinite", "gcd", "factorial", "comb", "perm", "fsum", "sumprod", "prod",
                 "lgamma", "gamma", "erf", "erfc", "isclose", "remainder",
             ];
             let mut out: Vec<(&str, Value)> = vec![
@@ -13223,6 +13312,64 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                 a.insert("hexversion".to_string(), Value::Int(hexversion));
                 h.alloc(PyObj::Namespace { attrs: a })
             };
+            // `sys.hash_info` — the numeric-hash parameters. `fractions` and
+            // `_pydecimal` hash a rational by reducing it modulo `modulus`, so these
+            // are the actual constants CPython's `hash()` is defined against, not
+            // decoration.
+            let hash_info = {
+                let algorithm = h.new_str("siphash13".to_string());
+                struct_seq(
+                    h,
+                    "sys.hash_info",
+                    vec![
+                        ("width", Value::Int(64)),
+                        // 2**61 - 1, the Mersenne prime CPython reduces against.
+                        ("modulus", Value::Int(2_305_843_009_213_693_951)),
+                        ("inf", Value::Int(314_159)),
+                        ("nan", Value::Int(0)),
+                        ("imag", Value::Int(1_000_003)),
+                        ("algorithm", algorithm),
+                        ("hash_bits", Value::Int(64)),
+                        ("seed_bits", Value::Int(128)),
+                        ("cutoff", Value::Int(0)),
+                    ],
+                )
+            };
+            // `sys.float_info` — IEEE-754 double limits, straight off Rust's `f64`
+            // so they cannot drift from what arithmetic actually does. `statistics`
+            // reads `mant_dig` and `max` to pick its summation strategy.
+            let float_info = struct_seq(
+                h,
+                "sys.float_info",
+                vec![
+                    ("max", Value::Float(f64::MAX)),
+                    ("max_exp", Value::Int(f64::MAX_EXP as i64)),
+                    ("max_10_exp", Value::Int(f64::MAX_10_EXP as i64)),
+                    ("min", Value::Float(f64::MIN_POSITIVE)),
+                    ("min_exp", Value::Int(f64::MIN_EXP as i64)),
+                    ("min_10_exp", Value::Int(f64::MIN_10_EXP as i64)),
+                    ("dig", Value::Int(f64::DIGITS as i64)),
+                    ("mant_dig", Value::Int(f64::MANTISSA_DIGITS as i64)),
+                    ("epsilon", Value::Float(f64::EPSILON)),
+                    ("radix", Value::Int(f64::RADIX as i64)),
+                    // FLT_ROUNDS == 1: round to nearest.
+                    ("rounds", Value::Int(1)),
+                ],
+            );
+            // `sys.int_info` — CPython's bignum layout. pythonrs stores bignums as
+            // `num-bigint` limbs rather than 30-bit digits, so these describe the
+            // LIMITS code reads them for (`default_max_str_digits`), matching
+            // CPython's values so `int(...)`/`str(...)` guards behave the same.
+            let int_info = struct_seq(
+                h,
+                "sys.int_info",
+                vec![
+                    ("bits_per_digit", Value::Int(30)),
+                    ("sizeof_digit", Value::Int(4)),
+                    ("default_max_str_digits", Value::Int(4300)),
+                    ("str_digits_check_threshold", Value::Int(640)),
+                ],
+            );
             // `sys.builtin_module_names` — modules compiled into the interpreter.
             // `os` reads this to pick the platform (`'posix' in ...`), so on a Unix
             // host it must contain `posix`.
@@ -13299,6 +13446,9 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                 ("flags", flags),
                 ("warnoptions", h.new_list(Vec::new())),
                 ("hexversion", Value::Int(0x030E_00F0)),
+                ("hash_info", hash_info),
+                ("float_info", float_info),
+                ("int_info", int_info),
                 ("api_version", Value::Int(1013)),
                 ("_base_executable", exec_path),
             ]
@@ -13573,6 +13723,11 @@ fn run_vendored_module(name: &str, src: &str, path: &std::path::Path) -> Result<
             // Nothing to copy: the module object points AT slot `mid`, so every
             // holder — including a mid-import circular reference — already sees
             // the namespace the body built, and keeps seeing later writes to it.
+            //
+            // A body IS allowed to replace itself, though: `decimal.py` ends with
+            // `sys.modules[__name__] = _pydecimal`, handing its own name to the
+            // pure-Python implementation. Honour that rebinding, or `import
+            // decimal` resolves to the shell whose body just disowned it.
         } else {
             // The body failed: drop the half-built module so a retry re-runs it
             // (and re-raises) instead of resolving to a broken cached shell that
@@ -13581,7 +13736,12 @@ fn run_vendored_module(name: &str, src: &str, path: &std::path::Path) -> Result<
         }
     });
     run?;
-    Ok(module)
+    // A body is allowed to replace itself: `decimal.py` ends with
+    // `sys.modules[__name__] = _pydecimal`, handing its own name to the
+    // pure-Python implementation. Return whatever `sys.modules` names now, or the
+    // caller re-caches the shell whose body just disowned it and `from decimal
+    // import Decimal` finds an empty module.
+    Ok(with_host(|h| h.sys_module_entry(name)).unwrap_or(module))
 }
 
 // ── file / I/O side table (ported from rubylang's `IoCell`) ──────────────────
