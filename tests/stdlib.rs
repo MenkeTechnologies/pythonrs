@@ -1367,3 +1367,132 @@ fn a_slot_wrapper_is_hashable_by_what_it_names() {
     );
     assert_eq!(g("x = repr(dict.__repr__)", "x"), "\"<slot wrapper '__repr__' of 'dict' objects>\"");
 }
+
+#[test]
+fn a_class_named_after_a_builtin_type_does_not_replace_it() {
+    // Classes live in one table keyed by bare name, so a user class named after a
+    // builtin TYPE silently replaced it for the whole process. `enum.py` opens
+    // with `class property(DynamicClassAttribute)`, and that one line broke every
+    // namedtuple in the program: `collections` builds its field accessors with
+    // `property(...)`, so they became enum's descriptor and `NT.field` raised
+    // through ITS `__get__`.
+    assert_eq!(
+        g(
+            "import enum, collections\n\
+             NT = collections.namedtuple('NT', ['a'])\n\
+             x = NT(7).a",
+            "x"
+        ),
+        "7"
+    );
+    // The shadowing class is still reachable under its own module, and the enum
+    // machinery that depends on it keeps working.
+    assert_eq!(
+        g(
+            "import enum\n\
+             class Color(enum.Enum):\n\
+             \x20   RED = 1\n\
+             x = (Color.RED.name, Color.RED.value)",
+            "x"
+        ),
+        "('RED', 1)"
+    );
+    // A user class shadowing a builtin type leaves the builtin itself intact.
+    assert_eq!(
+        g("class dict: pass\nx = {'a': 1}.keys()", "x"), "dict_keys(['a'])"
+    );
+}
+
+#[cfg(not(feature = "stdlib-ffi"))]
+#[test]
+fn vendored_ast_node_types_run_on_pythonrs() {
+    // `_ast` is pure data: ~130 classes in a shallow hierarchy, each with a
+    // `_fields` tuple. `ast.py` supplies every traversal helper on top.
+    assert_eq!(g("import ast\nx = ast.Name._fields", "x"), "('id', 'ctx')");
+    assert_eq!(
+        g("import ast\nn = ast.Name(id='x', ctx=ast.Load())\nx = (n.id, type(n.ctx).__name__)", "x"),
+        "('x', 'Load')"
+    );
+    // The hierarchy has to be real: `isinstance` against the abstract bases is
+    // how every AST consumer dispatches.
+    assert_eq!(
+        g("import ast\nn = ast.Name(id='x')\nx = (isinstance(n, ast.expr), isinstance(n, ast.AST))", "x"),
+        "(True, True)"
+    );
+    assert_eq!(
+        g("import ast\nx = repr(ast.BinOp(ast.Constant(1), ast.Add(), ast.Constant(2)))", "x"),
+        "'BinOp(left=Constant(value=1), op=Add(), right=Constant(value=2))'"
+    );
+}
+
+#[test]
+fn a_class_annotation_below_top_level_still_records_annotations() {
+    // `__annotations__` is seeded when a class body annotates a bare name at ANY
+    // depth. Scanning only top-level statements made this shape — which is all
+    // over the stdlib — a NameError at class-definition time.
+    assert_eq!(
+        g(
+            "class C:\n\
+             \x20   if True:\n\
+             \x20       x: int\n\
+             x = C.__annotations__",
+            "x"
+        ),
+        "{'x': <class 'int'>}"
+    );
+    assert_eq!(
+        g(
+            "class C:\n\
+             \x20   try:\n\
+             \x20       y: str\n\
+             \x20   except Exception:\n\
+             \x20       pass\n\
+             x = C.__annotations__",
+            "x"
+        ),
+        "{'y': <class 'str'>}"
+    );
+    // A nested `def` opens its own scope; its annotations are not the class's.
+    assert_eq!(
+        g(
+            "class C:\n\
+             \x20   a: int\n\
+             \x20   def m(self):\n\
+             \x20       b: str = 'x'\n\
+             \x20       return b\n\
+             x = C.__annotations__",
+            "x"
+        ),
+        "{'a': <class 'int'>}"
+    );
+}
+
+#[test]
+fn a_getset_descriptor_is_callable_through_the_descriptor_protocol() {
+    // `annotationlib` binds `type.__dict__['__annotations__'].__get__` at import
+    // time as its way to read a class's OWN annotations without tripping
+    // `__getattr__`. Everything that imports it — `dataclasses`, `inspect`,
+    // `traceback`, `logging`, `unittest` — depends on that line.
+    assert_eq!(
+        g(
+            "g = type.__dict__['__annotations__'].__get__\n\
+             class C:\n\
+             \x20   v: int\n\
+             x = g(C)",
+            "x"
+        ),
+        "{'v': <class 'int'>}"
+    );
+    // A `property`/descriptor carries a writable `__doc__`; `dis.py` documents
+    // every field of its `_Instruction` namedtuple that way.
+    assert_eq!(
+        g(
+            "import collections\n\
+             NT = collections.namedtuple('NT', ['f'])\n\
+             NT.f.__doc__ = 'the field'\n\
+             x = 'ok'",
+            "x"
+        ),
+        "'ok'"
+    );
+}

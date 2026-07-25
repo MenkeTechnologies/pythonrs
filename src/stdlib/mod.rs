@@ -13,6 +13,8 @@
 //! vendored file is CPython's own source and cannot drift from it.
 pub mod binascii;
 pub mod codecs;
+pub mod pyast;
 pub mod pyio;
+pub mod pyopcode;
 pub mod pystruct;
 pub mod pytokenize;

@@ -3544,11 +3544,49 @@ fn float_index_type(e: &Expr) -> Option<&'static str> {
 
 /// A top-level statement of a class body that is a simple (bare-name)
 /// annotation, so the body needs an `__annotations__` dict.
+/// Whether a class body annotates any bare name, at ANY depth within the body's
+/// own scope.
+///
+/// The seeding of `__annotations__` is driven by this, so a miss is a NameError
+/// at class-definition time, not a subtle wrong answer. Only top-level statements
+/// used to be scanned, which meant a perfectly ordinary
+///
+/// ```python
+/// class C:
+///     if sys.version_info >= (3, 12):
+///         x: int
+/// ```
+///
+/// blew up — and that shape is all over the stdlib (`annotationlib`, `_colorize`,
+/// `dataclasses`), so `traceback`, `logging`, `unittest` and `inspect` were all
+/// unreachable because of it.
+///
+/// Recursion stops at a nested `def`/`class`: those open their own scope and
+/// their annotations belong to it, not to this class.
 fn is_ann_assign(s: &Stmt) -> bool {
-    matches!(
-        &s.kind,
-        StmtKind::AnnAssign { target, .. } if matches!(target.unspanned(), Expr::Name(_))
-    )
+    match &s.kind {
+        StmtKind::AnnAssign { target, .. } => matches!(target.unspanned(), Expr::Name(_)),
+        StmtKind::If { body, orelse, .. } => {
+            body.iter().any(is_ann_assign) || orelse.iter().any(is_ann_assign)
+        }
+        StmtKind::For { body, orelse, .. } | StmtKind::While { body, orelse, .. } => {
+            body.iter().any(is_ann_assign) || orelse.iter().any(is_ann_assign)
+        }
+        StmtKind::With { body, .. } => body.iter().any(is_ann_assign),
+        StmtKind::Match { cases, .. } => cases.iter().any(|c| c.body.iter().any(is_ann_assign)),
+        StmtKind::Try {
+            body,
+            handlers,
+            orelse,
+            finalbody,
+        } => {
+            body.iter().any(is_ann_assign)
+                || orelse.iter().any(is_ann_assign)
+                || finalbody.iter().any(is_ann_assign)
+                || handlers.iter().any(|h| h.body.iter().any(is_ann_assign))
+        }
+        _ => false,
+    }
 }
 
 fn param_names(params: &Params) -> Vec<String> {

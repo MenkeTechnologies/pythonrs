@@ -8040,6 +8040,22 @@ impl PyHost {
                 }
                 Ok(self.new_dict(d))
             }
+            // An attribute previously assigned onto a `property` or descriptor
+            // (`_Instruction.opname.__doc__ = "…"`) reads back from the same side
+            // table; `__doc__` defaults to None when never set.
+            Some(PyObj::Property { .. }) | Some(PyObj::Descriptor { .. })
+                if name == "__doc__"
+                    || matches!(recv, Value::Obj(id)
+                        if self.func_attrs.get(id).is_some_and(|m| m.contains_key(name))) =>
+            {
+                let id = if let Value::Obj(i) = recv { *i } else { 0 };
+                Ok(self
+                    .func_attrs
+                    .get(&id)
+                    .and_then(|m| m.get(name))
+                    .cloned()
+                    .unwrap_or(Value::Undef))
+            }
             // `__isabstractmethod__` defaults to False; any user-assigned function
             // attribute (or an explicit `__isabstractmethod__`) reads from the dict.
             Some(PyObj::Func(_))
@@ -8383,6 +8399,19 @@ impl PyHost {
                     let key = self.new_str("__new__".to_string());
                     let ctor = self.alloc(PyObj::Builtin("object.__new__".into()));
                     d.insert(PKey::Str("__new__".to_string()), (key, ctor));
+                }
+                // `type.__dict__['__annotations__']` is a getset descriptor, and
+                // `annotationlib` binds it at import time as its canonical way to
+                // read a class's own annotations without triggering `__getattr__`.
+                // Everything that imports `annotationlib` — `dataclasses`,
+                // `inspect`, `traceback`, `logging`, `unittest` — starts here.
+                if n == "type" {
+                    let key = self.new_str("__annotations__".to_string());
+                    let desc = self.alloc(PyObj::Descriptor {
+                        kind: DescKind::GetSetDescriptor,
+                        qual: "type.__annotations__".to_string(),
+                    });
+                    d.insert(PKey::Str("__annotations__".to_string()), (key, desc));
                 }
                 for cm in crate::builtins::type_classmethods(&n) {
                     let key = self.new_str((*cm).to_string());
@@ -8930,6 +8959,22 @@ impl PyHost {
                 }
             }
         }
+        // A `property` or C-level descriptor carries a writable `__doc__`, and
+        // the stdlib uses it: `dis.py` documents each field of its `_Instruction`
+        // namedtuple with `_Instruction.opname.__doc__ = "…"`, which is the line
+        // `inspect` — and so `traceback`, `logging`, `unittest`, `dataclasses` —
+        // fails on if the assignment is refused. The side table functions carry
+        // their attributes in serves for these too.
+        if matches!(
+            self.get(recv),
+            Some(PyObj::Property { .. }) | Some(PyObj::Descriptor { .. })
+        ) {
+            if let Value::Obj(id) = recv {
+                let id = *id;
+                self.func_attrs.entry(id).or_default().insert(name.to_string(), val);
+                return Ok(());
+            }
+        }
         // A function object carries a writable attribute dict (`func.attr = v`,
         // `func.__isabstractmethod__ = True`).
         if matches!(self.get(recv), Some(PyObj::Func(_))) {
@@ -9019,8 +9064,16 @@ impl PyHost {
         // IncrementalDecoder(codecs.BufferedIncrementalDecoder)` shadows a
         // GRANDparent, and overwriting that entry makes the direct base's own
         // base list point at this new class — the same cycle, one level up.
+        // The same collision happens against a BUILTIN type name, and it is worse:
+        // `enum.py` opens with `class property(DynamicClassAttribute)`, which
+        // replaced the builtin `property` for the whole process. `collections`
+        // then built its namedtuple field accessors out of enum's class, and
+        // `NT.field` raised through ITS `__get__` — so every namedtuple in the
+        // program broke the moment anything imported `enum`.
         let ancestors: Vec<String> = bases.iter().flat_map(|b| self.mro_of(b)).collect();
-        let key = if ancestors.iter().any(|b| b == name) {
+        let key = if ancestors.iter().any(|b| b == name)
+            || crate::builtins::shadows_builtin_type(name)
+        {
             let mut n = 1usize;
             loop {
                 let cand = format!("{name}#{n}");
@@ -13005,6 +13058,15 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
     if name == "collections.abc" {
         return import_module("_collections_abc");
     }
+    // `_ast` — the node types `ast.py` is built on. They are pure data (a name, a
+    // base, a `_fields` tuple), so the module is DECLARED by a table in Rust and
+    // DEFINED by running the Python that table expands to — the same relationship
+    // CPython's generated C file has to `Parser/Python.asdl`.
+    #[cfg(not(feature = "stdlib-ffi"))]
+    if name == "_ast" {
+        let src = crate::stdlib::pyast::module_source();
+        return run_vendored_module("_ast", &src, std::path::Path::new("<_ast>"));
+    }
     // Native stdlib modules under src/stdlib. Their `entries` return owned-String
     // keys (vs the `&str` keys of the inline arms below), so build the namespace
     // here and return before the `&str` match. These are pure-Python subsets
@@ -13028,6 +13090,10 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
         // `_tokenize` — the tokenizer `tokenize.py` drives, and through
         // `traceback`, what `logging`/`unittest`/`hashlib` reach first.
         "_tokenize" => Some(with_host(crate::stdlib::pytokenize::entries)),
+        // `_opcode` — CPython instruction metadata. `opcode.py` turns it into the
+        // `hasarg`/`hasjump`/… lists, `dis` reads those, and `inspect` imports
+        // `dis`; that chain is why the module has to exist.
+        "_opcode" => Some(with_host(crate::stdlib::pyopcode::entries)),
         _ => None,
     };
     #[cfg(feature = "stdlib-ffi")]

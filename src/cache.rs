@@ -99,6 +99,9 @@ use std::path::PathBuf;
 /// v31: a `def`/`lambda` with annotations compiles them as a `<annotate>` thunk
 /// (MKFUNC evaluates it with forward-reference NameErrors caught) instead of an
 /// inline dict, so annotated-function bytecode differs.
+/// v41: a class body seeds `__annotations__` when it annotates a bare name at ANY
+/// depth, not only at top level, so a class holding an annotation inside an
+/// `if`/`try`/`with` compiles to different bytecode.
 /// v40: PEP 750 t-strings — `t"..."` lowers to `INTERPOLATION`/`TEMPLATE` calls
 /// (new opcodes), and every f-string field now carries its source text, so any
 /// chunk holding a string literal with replacement fields differs.
@@ -110,7 +113,7 @@ use std::path::PathBuf;
 /// v37: `%` by an integer literal inside a native slot loop lowers to native
 /// `Mod` + a branchless floor correction instead of the `BINOP` host call, so
 /// loops containing `%` emit different bytecode (and now qualify as native).
-const SCHEMA: u64 = 40;
+const SCHEMA: u64 = 41;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]

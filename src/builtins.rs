@@ -3097,6 +3097,34 @@ pub fn is_type_like_builtin(name: &str) -> bool {
     is_builtin_type(name) || is_exception_class(name)
 }
 
+/// Whether a user class of this name would shadow a builtin TYPE.
+///
+/// Classes live in one table keyed by bare name, so such a class silently
+/// replaces the builtin for the entire process. `enum.py` opens with
+/// `class property(DynamicClassAttribute)`, and that one line used to break every
+/// namedtuple in the program — `collections` builds its field accessors with
+/// `property(...)`, so they became enum's descriptor and `NT.field` raised.
+///
+/// Deliberately narrower than `is_type_object_name`, which answers true for any
+/// non-dotted name that is not a builtin FUNCTION: disambiguating every class
+/// would defeat the point of the shared table.
+pub fn shadows_builtin_type(name: &str) -> bool {
+    is_type_like_builtin(name)
+        || matches!(
+            name,
+            "property"
+                | "staticmethod"
+                | "classmethod"
+                | "super"
+                | "slice"
+                | "zip"
+                | "map"
+                | "filter"
+                | "enumerate"
+                | "reversed"
+        )
+}
+
 /// The universal object dunders that any builtin value exposes as a bound method
 /// (`d.__len__`, `d.__getitem__`, `x.__eq__`), dispatched by `call_type_method`.
 /// The stdlib reaches these directly (e.g. functools.lru_cache uses
@@ -3718,6 +3746,11 @@ pub fn call_builtin_function(
         };
         let sv = with_host(|h| h.new_str(src));
         return with_host(|h| crate::stdlib::pytokenize::tokenizer_iter(h, &[sv], &kwargs));
+    }
+    if let Some(f) = name.strip_prefix("_opcode.") {
+        if let Some(r) = with_host(|h| crate::stdlib::pyopcode::call(h, f, &args)) {
+            return r;
+        }
     }
     if let Some(f) = name.strip_prefix("_io.") {
         if let Some(r) = with_host(|h| crate::stdlib::pyio::call(h, f, &args, &kwargs)) {
@@ -8181,6 +8214,12 @@ pub fn type_has_method(typename: &str, name: &str) -> bool {
         // `getvalue`. `tokenize` reaches for `StringIO(...).readline` as a bound
         // method, so these have to be attribute-visible, not just callable.
         "_io.StringIO" | "_io.BytesIO" => return STREAM_METHODS.contains(&name),
+        // A C-level attribute descriptor is callable through the descriptor
+        // protocol: `type.__dict__['__annotations__'].__get__(cls)`.
+        "getset_descriptor" | "member_descriptor" | "wrapper_descriptor"
+        | "classmethod_descriptor" | "method-wrapper" => {
+            return matches!(name, "__get__" | "__set__" | "__delete__")
+        }
         "int" | "bool" => return INT_METHODS.contains(&name) || INT_DUNDERS.contains(&name),
         "float" => return FLOAT_METHODS.contains(&name) || FLOAT_DUNDERS.contains(&name),
         "complex" => COMPLEX_METHODS,
@@ -8718,6 +8757,30 @@ pub fn call_type_method(
     }
     if let Some(r) = with_host(|h| crate::stdlib::pyio::stream_method(h, recv, name, &args)) {
         return r;
+    }
+    // `desc.__get__(obj[, cls])` on a C-level attribute descriptor. A getset (or
+    // member) descriptor names one attribute of its owner type, so invoking it is
+    // simply reading that attribute off the instance — which is how
+    // `annotationlib` reads a class's OWN annotations, via
+    // `type.__dict__['__annotations__'].__get__`, without tripping `__getattr__`.
+    // Everything that imports it — `dataclasses`, `inspect`, `traceback`,
+    // `logging`, `unittest` — depends on that line at import time.
+    if name == "__get__" {
+        if let Some(qual) = with_host(|h| match h.get(recv) {
+            Some(host::PyObj::Descriptor { kind, qual })
+                if matches!(
+                    kind,
+                    host::DescKind::GetSetDescriptor | host::DescKind::MemberDescriptor
+                ) =>
+            {
+                Some(qual.clone())
+            }
+            _ => None,
+        }) {
+            let attr = qual.rsplit('.').next().unwrap_or(&qual).to_string();
+            let obj = args.first().cloned().unwrap_or(Value::Undef);
+            return with_host(|h| h.get_attr(&obj, &attr));
+        }
     }
     if let Some(r) = nt_instance_method(recv, name, &args, &kwargs) {
         return r;
