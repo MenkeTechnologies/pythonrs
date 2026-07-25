@@ -741,6 +741,9 @@ pub enum PyObj {
         count: u32,
         reentrant: bool,
     },
+    /// A compiled `struct.Struct`. Holds the format string; the spec is re-parsed
+    /// per call, which is what `_struct`'s own cache amounts to at this scale.
+    StructFmt(String),
     /// A `contextvars.ContextVar`. One interpreter thread here, so the "current
     /// context" is just the variable's own slot: `set` swaps it and hands back a
     /// `ContextToken` carrying the previous state for `reset`.
@@ -2866,6 +2869,7 @@ impl PyHost {
             Value::Float(_) => "float".into(),
             Value::Str(_) => "str".into(),
             Value::Obj(_) => match self.get(v) {
+                Some(PyObj::StructFmt(_)) => "Struct".into(),
                 Some(PyObj::ContextVar { .. }) => "ContextVar".into(),
                 Some(PyObj::ContextToken { .. }) => "Token".into(),
                 Some(PyObj::Str(_)) => "str".into(),
@@ -3026,6 +3030,7 @@ impl PyHost {
             Value::Float(f) => fmt_float(*f),
             Value::Str(s) => (**s).clone(),
             Value::Obj(_) => match self.get(v) {
+                Some(PyObj::StructFmt(f)) => format!("<_struct.Struct object, format '{f}'>"),
                 Some(PyObj::ContextVar { name, .. }) => format!("<ContextVar name='{name}'>"),
                 Some(PyObj::ContextToken { .. }) => "<Token>".to_string(),
                 Some(PyObj::Str(s)) => s.clone(),
@@ -7732,6 +7737,15 @@ impl PyHost {
                 }
             }
             // SimpleNamespace attribute reads resolve from its bag.
+            // `Struct.size` / `.format` — attributes on a compiled struct.
+            Some(PyObj::StructFmt(_)) => {
+                match crate::stdlib::pystruct::struct_attr_of(self, recv, name) {
+                    Some(r) => r,
+                    None => Err(type_error(&format!(
+                        "'Struct' object has no attribute '{name}'"
+                    ))),
+                }
+            }
             Some(PyObj::Namespace { attrs }) => match attrs.get(name) {
                 Some(v) => Ok(v.clone()),
                 None => Err(format!(
@@ -12240,6 +12254,8 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
         // `_struct` — ported from RustPython (MIT); `struct.py` is `from _struct
         // import *`, so this is the whole module.
         "_struct" => Some(with_host(crate::stdlib::pystruct::entries)),
+        // `binascii` — ported from RustPython (MIT); `base64` is built on it.
+        "binascii" => Some(with_host(crate::stdlib::binascii::entries)),
         _ => None,
     };
     #[cfg(feature = "stdlib-ffi")]

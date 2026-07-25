@@ -9,6 +9,7 @@
 //! removed once the `stdlib-ffi` bridge (`crate::ffi`) began importing the real
 //! CPython stdlib for those modules. Only modules with no C-accelerator parity
 //! concern remain hand-rolled here.
+pub mod binascii;
 pub mod pystruct;
 pub mod statistics;
 pub mod textwrap;

@@ -541,6 +541,7 @@ pub fn entries(h: &mut PyHost) -> Vec<(String, Value)> {
         "calcsize",
         "iter_unpack",
         "_clearcache",
+        "Struct",
     ];
     let mut out: Vec<(String, Value)> = Vec::new();
     for n in NAMES {
@@ -572,9 +573,67 @@ fn buffer_bytes(h: &PyHost, v: &Value) -> Result<Vec<u8>, String> {
     }
 }
 
+/// Methods on a compiled `struct.Struct`. `None` means `recv` is not one, so the
+/// caller carries on with its normal dispatch.
+///
+/// The format is re-parsed per call rather than cached in the object; `Struct`
+/// exists for the API (`base64.b85encode` builds one at import time), and the
+/// parse is linear in a format string that is always tiny.
+pub fn struct_method(
+    h: &mut PyHost,
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, String>> {
+    let fmt = match h.get(recv) {
+        Some(PyObj::StructFmt(f)) => f.clone(),
+        _ => return None,
+    };
+    let mut all: Vec<Value> = vec![h.new_str(fmt)];
+    all.extend_from_slice(args);
+    Some(match name {
+        "pack" | "unpack" | "unpack_from" | "iter_unpack" => {
+            match call(h, name, &all) {
+                Some(r) => r,
+                None => Err(host::type_error(&format!("Struct.{name}"))),
+            }
+        }
+        // `pack_into(buffer, offset, *values)` — the module function takes the
+        // format first, so the already-prepended format lines the arguments up.
+        "pack_into" => match call(h, "pack_into", &all) {
+            Some(r) => r,
+            None => Err(host::type_error("Struct.pack_into")),
+        },
+        _ => Err(host::type_error(&format!(
+            "'Struct' object has no attribute '{name}'"
+        ))),
+    })
+}
+
+/// `Struct.size` / `.format` — attributes, not methods.
+pub fn struct_attr_of(h: &mut PyHost, recv: &Value, name: &str) -> Option<Result<Value, String>> {
+    let fmt = match h.get(recv) {
+        Some(PyObj::StructFmt(f)) => f.clone(),
+        _ => return None,
+    };
+    Some(match name {
+        "size" => FormatSpec::parse(fmt.as_bytes()).map(|s| Value::Int(s.size as i64)),
+        "format" => Ok(h.new_str(fmt)),
+        _ => return None,
+    })
+}
+
 /// Dispatch `_struct.<fname>`.
 pub fn call(h: &mut PyHost, fname: &str, args: &[Value]) -> Option<Result<Value, String>> {
     Some(match fname {
+        // `Struct(fmt)` — validate the format now, as CPython does, so a bad
+        // format raises at construction rather than at first use.
+        "Struct" => (|| {
+            let fmt = fmt_bytes(h, args.first().ok_or_else(|| err("missing format"))?)?;
+            FormatSpec::parse(&fmt)?;
+            let s = String::from_utf8_lossy(&fmt).into_owned();
+            Ok(h.alloc(PyObj::StructFmt(s)))
+        })(),
         "calcsize" => (|| {
             let fmt = fmt_bytes(h, args.first().ok_or_else(|| err("missing format"))?)?;
             Ok(Value::Int(FormatSpec::parse(&fmt)?.size as i64))

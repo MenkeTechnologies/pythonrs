@@ -3090,6 +3090,7 @@ pub fn is_type_object_name(n: &str) -> bool {
                 | "_contextvars.ContextVar"
                 | "_contextvars.Token"
                 | "_contextvars.Context"
+                | "_struct.Struct"
         )
         || (!n.contains('.') && !is_builtin_function(n))
 }
@@ -3653,6 +3654,11 @@ pub fn call_builtin_function(
     }
     if let Some(f) = name.strip_prefix("_struct.") {
         if let Some(r) = with_host(|h| crate::stdlib::pystruct::call(h, f, &args)) {
+            return r;
+        }
+    }
+    if let Some(f) = name.strip_prefix("binascii.") {
+        if let Some(r) = with_host(|h| crate::stdlib::binascii::call(h, f, &args, &kwargs)) {
             return r;
         }
     }
@@ -8499,6 +8505,9 @@ pub fn call_type_method(
     kwargs: Vec<(String, Value)>,
 ) -> Result<Value, String> {
     if let Some(r) = context_var_method(recv, name, &args) {
+        return r;
+    }
+    if let Some(r) = with_host(|h| crate::stdlib::pystruct::struct_method(h, recv, name, &args)) {
         return r;
     }
     if let Some(r) = nt_instance_method(recv, name, &args, &kwargs) {
