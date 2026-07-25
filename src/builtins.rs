@@ -511,7 +511,7 @@ fn b_getitem(vm: &mut VM, _: u8) -> Value {
     if host::is_generic_subscriptable(&recv) {
         return finish(vm, host::generic_alias(&recv, &idx));
     }
-    let cands = host::instance_key_candidates(&recv);
+    let cands = host::instance_key_candidates_for(&recv, Some(&idx));
     let r = host::with_instance_key(&idx, &cands, || with_host(|h| h.get_item(&recv, &idx)));
     finish(vm, r)
 }
@@ -541,7 +541,7 @@ fn b_setitem(vm: &mut VM, _: u8) -> Value {
             Err(e) => abort(vm, e),
         };
     }
-    let cands = host::instance_key_candidates(&recv);
+    let cands = host::instance_key_candidates_for(&recv, Some(&idx));
     match host::with_instance_key(&idx, &cands, || {
         with_host(|h| h.set_item(&recv, &idx, val.clone()))
     }) {
@@ -568,7 +568,7 @@ fn b_delitem(vm: &mut VM, _: u8) -> Value {
     } else {
         idx
     };
-    let cands = host::instance_key_candidates(&recv);
+    let cands = host::instance_key_candidates_for(&recv, Some(&idx));
     match host::with_instance_key(&idx, &cands, || with_host(|h| h.del_item(&recv, &idx))) {
         Ok(()) => Value::Undef,
         Err(e) => abort(vm, e),
@@ -1458,7 +1458,7 @@ fn b_contains(vm: &mut VM, _: u8) -> Value {
             Err(e) => abort(vm, e),
         };
     }
-    let cands = host::instance_key_candidates(&container);
+    let cands = host::instance_key_candidates_for(&container, Some(&item));
     let r = host::with_instance_key(&item, &cands, || {
         with_host(|h| h.contains(&item, &container))
     });
@@ -9975,7 +9975,7 @@ fn dict_method(
         }
         "get" => {
             let kv = arg0(args)?;
-            let cands = host::instance_key_candidates(recv);
+            let cands = host::instance_key_candidates_for(recv, Some(&kv));
             let key = host::with_instance_key(&kv, &cands, || with_host(|h| h.to_key(&kv)))?;
             Ok(with_host(|h| match h.get(recv) {
                 Some(PyObj::Dict(d)) => d.get(&key).map(|(_, v)| v.clone()),
@@ -9985,7 +9985,7 @@ fn dict_method(
         }
         "pop" => {
             let kv = arg0(args)?;
-            let cands = host::instance_key_candidates(recv);
+            let cands = host::instance_key_candidates_for(recv, Some(&kv));
             let key = host::with_instance_key(&kv, &cands, || with_host(|h| h.to_key(&kv)))?;
             let got = with_host(|h| {
                 if let Some(PyObj::Dict(d)) = h.get_mut(recv) {
@@ -10005,7 +10005,7 @@ fn dict_method(
         "setdefault" => {
             let kv = arg0(args)?;
             let default = args.get(1).cloned().unwrap_or(Value::Undef);
-            let cands = host::instance_key_candidates(recv);
+            let cands = host::instance_key_candidates_for(recv, Some(&kv));
             let key = host::with_instance_key(&kv, &cands, || with_host(|h| h.to_key(&kv)))?;
             Ok(with_host(|h| {
                 if let Some(PyObj::Dict(d)) = h.get(recv) {
@@ -10145,7 +10145,7 @@ fn set_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
     match name {
         "add" => {
             let v = arg0(args)?;
-            let cands = host::instance_key_candidates(recv);
+            let cands = host::instance_key_candidates_for(recv, Some(&v));
             let k = host::with_instance_key(&v, &cands, || with_host(|h| h.to_key(&v)))?;
             with_host(|h| {
                 if let Some(PyObj::Set(s)) = h.get_mut(recv) {
@@ -10156,7 +10156,7 @@ fn set_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
         }
         "discard" | "remove" => {
             let v = arg0(args)?;
-            let cands = host::instance_key_candidates(recv);
+            let cands = host::instance_key_candidates_for(recv, Some(&v));
             let k = host::with_instance_key(&v, &cands, || with_host(|h| h.to_key(&v)))?;
             let removed = with_host(|h| {
                 if let Some(PyObj::Set(s)) = h.get_mut(recv) {

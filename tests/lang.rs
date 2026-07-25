@@ -831,6 +831,44 @@ fn native_loop_type_guard_falls_back_to_the_generic_copy() {
     );
 }
 
+// Container operations must be O(1), not O(n). Four separate paths used to clone
+// the whole receiver on every operation — a subscript read, a method call, a
+// dict/set key lookup, and an iterator step — which made appending to, indexing,
+// iterating, or keying a container quadratic. These sizes are chosen so the old
+// behavior does not finish: 60k appends took minutes, 60k dict writes likewise,
+// and the suite as a whole runs in well under a second when they are O(1).
+#[test]
+fn container_operations_are_not_quadratic() {
+    // append + index-read
+    assert_eq!(
+        g("a = []\nfor i in range(60000): a.append(i)\nt = 0\nfor i in range(60000): t += a[i]\nx = t", "x"),
+        "1799970000"
+    );
+    // dict insert + lookup, and set add + membership
+    assert_eq!(
+        g("d = {}\nfor i in range(60000): d[i] = i\nt = 0\nfor i in range(60000): t += d[i]\nx = t", "x"),
+        "1799970000"
+    );
+    assert_eq!(
+        g("s = set()\nfor i in range(60000): s.add(i)\nx = (len(s), 59999 in s)", "x"),
+        "(60000, True)"
+    );
+    // iteration over a large list (every step used to copy the list)
+    assert_eq!(
+        g("a = list(range(60000))\nt = 0\nfor v in a: t += v\nx = t", "x"),
+        "1799970000"
+    );
+    // comprehension over a large list, and str building through join
+    assert_eq!(
+        g("a = [i * 2 for i in range(60000)]\nx = len(a) + a[-1]", "x"),
+        "179998"
+    );
+    assert_eq!(
+        g("p = []\nfor i in range(20000): p.append('ab')\nx = len(''.join(p))", "x"),
+        "40000"
+    );
+}
+
 #[test]
 fn bignum_promotion() {
     assert_eq!(g("x = 2 ** 64", "x"), "18446744073709551616");

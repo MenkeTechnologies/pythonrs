@@ -4036,6 +4036,34 @@ pub fn dict_local_candidates(d: &IndexMap<PKey, (Value, Value)>) -> Vec<(PKey, V
 /// The `(key, key-object)` pairs of any instance keys already present in a heap
 /// dict or set/frozenset — the collapse candidates for [`prepare_key`].
 pub fn instance_key_candidates(container: &Value) -> Vec<(PKey, Value)> {
+    instance_key_candidates_for(container, None)
+}
+
+/// The same, but skipping the scan when `key` cannot collapse against an
+/// instance key. The candidate list exists so a value-equal user instance finds
+/// an existing entry; a plain `int`/`str` key can never do that, and
+/// `with_instance_key` is a passthrough for it. Scanning anyway walked (and
+/// cloned out of) the WHOLE container on every subscript — `d[i]` over a 200k
+/// dict was quadratic.
+pub fn instance_key_candidates_for(container: &Value, key: Option<&Value>) -> Vec<(PKey, Value)> {
+    if let Some(k) = key {
+        let key_can_collapse = with_host(|h| {
+            matches!(k, Value::Obj(_))
+                && !matches!(
+                    h.get(k),
+                    Some(
+                        PyObj::Str(_)
+                            | PyObj::Bytes(_)
+                            | PyObj::Tuple(_)
+                            | PyObj::BigInt(_)
+                            | PyObj::Frozenset(_)
+                    )
+                )
+        });
+        if !key_can_collapse {
+            return Vec::new();
+        }
+    }
     with_host(|h| match h.get(container) {
         Some(PyObj::Dict(d)) => d
             .iter()
@@ -8868,6 +8896,33 @@ pub fn call_method(
             return crate::builtins::random_method(id, name, &args);
         }
     }
+    // Only the variants the match below destructures need an owned copy. Cloning
+    // unconditionally deep-copied the receiver on EVERY method call, so
+    // `a.append(x)` copied the whole list before appending to it — an append loop
+    // was quadratic (400k appends: >90s, against CPython's 0.06s). A builtin
+    // container goes straight to `call_type_method`, which re-reads through the
+    // handle; that is also exactly what the `_` arm below does with it.
+    let needs_owned = with_host(|h| {
+        matches!(
+            h.get(recv),
+            Some(
+                PyObj::Pattern { .. }
+                    | PyObj::Match { .. }
+                    | PyObj::Func(_)
+                    | PyObj::MappingProxy { .. }
+                    | PyObj::Lock { .. }
+                    | PyObj::Redirect { .. }
+                    | PyObj::Instance(_)
+                    | PyObj::Class(_)
+                    | PyObj::Module { .. }
+                    | PyObj::Super { .. }
+                    | PyObj::Builtin(_)
+            )
+        )
+    });
+    if !needs_owned {
+        return crate::builtins::call_type_method(recv, name, args, kwargs);
+    }
     let obj = with_host(|h| h.get(recv).cloned());
     match obj {
         // `re.Pattern` / `re.Match` methods (`p.search(s)`, `m.group(1)`, …).
@@ -9328,9 +9383,15 @@ pub fn metaclass_hook(cls: &Value, name: &str, arg: Value) -> Option<Result<Valu
 /// `None` means the class has no such hook — the caller reports the normal
 /// "not subscriptable" error.
 pub fn class_getitem(cls: &Value, item: Value) -> Option<Result<Value, String>> {
-    let cname = match with_host(|h| h.get(cls).cloned()) {
-        Some(PyObj::Class(n)) => n,
-        _ => return None,
+    // Clone the class NAME, never the object: `get(..).cloned()` here deep-copied
+    // whatever the receiver was, so every `a[i]` on a list copied the entire list
+    // before discarding it — O(n) per subscript, quadratic over a loop.
+    let cname = match with_host(|h| match h.get(cls) {
+        Some(PyObj::Class(n)) => Some(n.clone()),
+        _ => None,
+    }) {
+        Some(n) => n,
+        None => return None,
     };
     let f = with_host(|h| h.class_lookup(&cname, "__class_getitem__"))?;
     // Implicit classmethod: bind the class as the leading `cls` argument whether
@@ -11613,19 +11674,47 @@ fn itertools_step(it: &Value) -> Result<Option<Value>, String> {
 /// from their sources with the host borrow released, so an infinite source
 /// (e.g. `itertools.count()`) never materializes.
 pub fn iter_step(it: &Value) -> Result<Option<Value>, String> {
-    match with_host(|h| h.get(it).cloned()) {
-        Some(PyObj::Generator { .. }) => gen_resume(it, Value::Undef),
-        Some(PyObj::Zip { .. }) => zip_step(it),
-        Some(PyObj::MapObj { .. }) => map_step(it),
-        Some(PyObj::FilterObj { .. }) => filter_step(it),
-        Some(PyObj::EnumerateObj { .. }) => enumerate_step(it),
-        Some(PyObj::CallIter { .. }) => calliter_step(it),
-        Some(PyObj::ItertoolsIter { .. }) => itertools_step(it),
+    // Dispatch on the variant WITHOUT cloning it. Every arm below re-reads
+    // through `it` anyway, and the clone copied the iterator's whole state — for
+    // a list iterator, the entire list — on each step, which made iterating a
+    // list (and so every comprehension over one) quadratic.
+    enum Step {
+        Generator,
+        Zip,
+        Map,
+        Filter,
+        Enumerate,
+        CallIter,
+        Itertools,
+        #[cfg(feature = "stdlib-ffi")]
+        Foreign(u32),
+        Plain,
+    }
+    let step = with_host(|h| match h.get(it) {
+        Some(PyObj::Generator { .. }) => Step::Generator,
+        Some(PyObj::Zip { .. }) => Step::Zip,
+        Some(PyObj::MapObj { .. }) => Step::Map,
+        Some(PyObj::FilterObj { .. }) => Step::Filter,
+        Some(PyObj::EnumerateObj { .. }) => Step::Enumerate,
+        Some(PyObj::CallIter { .. }) => Step::CallIter,
+        Some(PyObj::ItertoolsIter { .. }) => Step::Itertools,
+        #[cfg(feature = "stdlib-ffi")]
+        Some(PyObj::Foreign(id)) => Step::Foreign(*id),
+        _ => Step::Plain,
+    });
+    match step {
+        Step::Generator => gen_resume(it, Value::Undef),
+        Step::Zip => zip_step(it),
+        Step::Map => map_step(it),
+        Step::Filter => filter_step(it),
+        Step::Enumerate => enumerate_step(it),
+        Step::CallIter => calliter_step(it),
+        Step::Itertools => itertools_step(it),
         // A foreign (CPython) iterator advances with the host borrow released so
         // a lazy stdlib iterator running a pythonrs callback can re-enter.
         #[cfg(feature = "stdlib-ffi")]
-        Some(PyObj::Foreign(id)) => crate::ffi::iter_next_cb(id),
-        _ => with_host(|h| h.iter_next(it)),
+        Step::Foreign(id) => crate::ffi::iter_next_cb(id),
+        Step::Plain => with_host(|h| h.iter_next(it)),
     }
 }
 
