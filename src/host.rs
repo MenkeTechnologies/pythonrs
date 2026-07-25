@@ -1257,6 +1257,15 @@ pub struct PyHost {
     pub func_locals: Vec<Rc<HashSet<String>>>,
     /// Class templates by name.
     pub classes: IndexMap<String, ClassDef>,
+    /// Memoized C3 linearizations, keyed by class name.
+    ///
+    /// `mro_of` is on the path of every attribute read, every method dispatch and
+    /// every `isinstance`, and it used to re-run the full C3 algorithm — recursing
+    /// into each base and allocating a fresh `Vec<String>` at every level — on
+    /// each call. One `obj.attr` through a 21-deep class chain cost 45us. The
+    /// cache is dropped whenever a class is registered, since a new class can
+    /// change what an existing name resolves to.
+    mro_cache: std::cell::RefCell<HashMap<String, std::rc::Rc<Vec<String>>>>,
     /// try/except/finally block templates, indexed by try id.
     pub tries: Vec<TryDef>,
     /// Per-module global namespaces (each imported module's `__dict__`), index 0
@@ -1657,6 +1666,7 @@ impl PyHost {
             funcs: Vec::new(),
             func_locals: Vec::new(),
             classes: IndexMap::new(),
+            mro_cache: std::cell::RefCell::new(HashMap::new()),
             tries: Vec::new(),
             module_globals: vec![IndexMap::new()],
             module_dicts: HashMap::new(),
@@ -7563,7 +7573,24 @@ impl PyHost {
         self.class_lookup(&meta, name)
     }
 
+    /// The MRO of `class`, memoized. Callers that only read it should prefer this
+    /// over [`mro_of`], which hands back an owned copy.
+    pub fn mro_rc(&self, class: &str) -> std::rc::Rc<Vec<String>> {
+        if let Some(hit) = self.mro_cache.borrow().get(class) {
+            return hit.clone();
+        }
+        let computed = std::rc::Rc::new(self.compute_mro(class));
+        self.mro_cache
+            .borrow_mut()
+            .insert(class.to_string(), computed.clone());
+        computed
+    }
+
     pub fn mro_of(&self, class: &str) -> Vec<String> {
+        (*self.mro_rc(class)).clone()
+    }
+
+    fn compute_mro(&self, class: &str) -> Vec<String> {
         let bases: Vec<String> = self
             .classes
             .get(class)
@@ -7572,7 +7599,7 @@ impl PyHost {
         if bases.is_empty() {
             return vec![class.to_string()];
         }
-        let mut seqs: Vec<Vec<String>> = bases.iter().map(|b| self.mro_of(b)).collect();
+        let mut seqs: Vec<Vec<String>> = bases.iter().map(|b| (*self.mro_rc(b)).clone()).collect();
         seqs.push(bases);
         let mut result = vec![class.to_string()];
         loop {
@@ -7608,8 +7635,10 @@ impl PyHost {
 
     /// Look up a name in a class's MRO namespace.
     pub fn class_lookup(&self, class: &str, name: &str) -> Option<Value> {
-        for c in self.mro_of(class) {
-            if let Some(cd) = self.classes.get(&c) {
+        // `mro_rc` rather than `mro_of`: this runs on every attribute read, and
+        // copying the name vector per lookup was most of its cost.
+        for c in self.mro_rc(class).iter() {
+            if let Some(cd) = self.classes.get(c) {
                 if let Some(v) = cd.ns.get(name) {
                     return Some(v.clone());
                 }
@@ -9326,6 +9355,10 @@ impl PyHost {
             name.to_string()
         };
         let name_for_key = key.clone();
+        // A new class can change what an existing name resolves to (the
+        // shadowing disambiguation above rekeys classes), so every memoized
+        // linearization is dropped here.
+        self.mro_cache.borrow_mut().clear();
         let mro = {
             let mut out = vec![name_for_key.clone()];
             for b in &bases {
