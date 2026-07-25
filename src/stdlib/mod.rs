@@ -14,8 +14,11 @@
 pub mod binascii;
 pub mod codecs;
 pub mod pyast;
+pub mod pyhash;
 pub mod pyimp;
 pub mod pyio;
 pub mod pyopcode;
+pub mod pysignal;
 pub mod pystruct;
+pub mod pythread;
 pub mod pytokenize;

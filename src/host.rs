@@ -731,6 +731,14 @@ pub enum PyObj {
         name: String,
         lineno: u32,
     },
+    /// A frame's `f_code`. pythonrs has no CPython code objects, but the fields
+    /// callers actually read off one — the defining file and the function name —
+    /// are known: `logging.findCaller` walks frames comparing `co_filename`
+    /// against its own, and `warnings` uses the same field to skip stdlib frames.
+    FrameCode {
+        name: String,
+        lineno: u32,
+    },
     /// A closure cell (`func.__closure__[i]`). Holds the current value of a free
     /// variable, read via `cell_contents`. `type()` is `cell`.
     Cell {
@@ -760,6 +768,20 @@ pub enum PyObj {
         var: Box<Value>,
         old: Option<Box<Value>>,
     },
+    /// A `hashlib` hash object. The fed bytes are kept and hashed on demand,
+    /// which is what makes `digest()` non-destructive and `copy()` a plain clone
+    /// — CPython's objects can be read repeatedly and updated afterwards.
+    Hasher {
+        algo: crate::stdlib::pyhash::Algo,
+        data: Vec<u8>,
+        out_len: usize,
+    },
+    /// A `contextvars.Context`. Each variable carries its own state here, so a
+    /// context is a marker for "the current context" rather than a snapshot — but
+    /// it has to be an OBJECT rather than a type marker, because `threading` runs
+    /// every thread body through `self._context.run(self.run)` and that is a
+    /// bound-method call on a value.
+    ContextObj,
     /// A lazy `itertools` iterator. `sources` are pre-made input iterators, `func`
     /// an optional predicate/binop, `nums` integer state (count start/step,
     /// islice bounds, cursor), `buf` a value buffer (cycle's seen items,
@@ -2018,6 +2040,10 @@ impl PyHost {
     /// name, or `None` for the bare-`None` (`NoneType`) member.
     fn union_member_name(&self, v: &Value) -> String {
         match self.get(v) {
+            // `NoneType` prints as `None` inside a union — `int | None`, never
+            // `int | NoneType`. `typing.Optional[X]` reaches this with the real
+            // type object rather than the bare `None` literal.
+            Some(PyObj::Builtin(n)) if n == "NoneType" => "None".to_string(),
             Some(PyObj::Builtin(n)) => n.clone(),
             Some(PyObj::Class(n)) => n.clone(),
             None if matches!(v, Value::Undef) => "None".to_string(),
@@ -3012,6 +3038,8 @@ impl PyHost {
                 Some(PyObj::StructFmt(_)) => "Struct".into(),
                 Some(PyObj::ContextVar { .. }) => "ContextVar".into(),
                 Some(PyObj::ContextToken { .. }) => "Token".into(),
+                Some(PyObj::ContextObj) => "Context".into(),
+                Some(PyObj::Hasher { algo, .. }) => (*algo).name().into(),
                 Some(PyObj::Str(_)) => "str".into(),
                 Some(PyObj::Bytes(_)) => "bytes".into(),
                 Some(PyObj::Bytearray(_)) => "bytearray".into(),
@@ -3101,6 +3129,7 @@ impl PyHost {
                 Some(PyObj::Descriptor { kind, .. }) => kind.type_name().into(),
                 Some(PyObj::Traceback { .. }) => "traceback".into(),
                 Some(PyObj::PyFrame { .. }) => "frame".into(),
+                Some(PyObj::FrameCode { .. }) => "code".into(),
                 Some(PyObj::Cell { .. }) => "cell".into(),
                 Some(PyObj::Lock { reentrant, .. }) => {
                     if *reentrant { "RLock" } else { "lock" }.into()
@@ -3181,6 +3210,10 @@ impl PyHost {
                 Some(PyObj::StringIO { .. }) => "<_io.StringIO object>".to_string(),
                 Some(PyObj::ContextVar { name, .. }) => format!("<ContextVar name='{name}'>"),
                 Some(PyObj::ContextToken { .. }) => "<Token>".to_string(),
+                Some(PyObj::ContextObj) => "<Context>".to_string(),
+                Some(PyObj::Hasher { algo, .. }) => {
+                    format!("<{} _hashlib.HASH object>", algo.name())
+                }
                 Some(PyObj::Str(s)) => s.clone(),
                 Some(PyObj::BigInt(b)) => b.to_string(),
                 Some(PyObj::Complex(r, i)) => fmt_complex(*r, *i),
@@ -3304,6 +3337,7 @@ impl PyHost {
                 Some(PyObj::Traceback { .. }) => {
                     format!("<traceback object at 0x{:012x}>", self.addr_of(v))
                 }
+                Some(PyObj::FrameCode { name, .. }) => format!("<code object {name}>"),
                 Some(PyObj::PyFrame { name, lineno }) => {
                     format!(
                         "<frame at 0x{:012x}, file '<string>', line {lineno}, code {name}>",
@@ -7578,6 +7612,33 @@ impl PyHost {
                 }
             }
         }
+        // Every lazy iterator answers the iteration protocol as BOUND METHODS,
+        // not only through `next(it)`: `threading` takes
+        // `itertools.count().__next__` as its thread-name counter.
+        if matches!(name, "__next__" | "__iter__")
+            && matches!(
+                self.get(recv),
+                Some(PyObj::ItertoolsIter { .. })
+                    | Some(PyObj::Zip { .. })
+                    | Some(PyObj::MapObj { .. })
+                    | Some(PyObj::FilterObj { .. })
+                    | Some(PyObj::EnumerateObj { .. })
+                    | Some(PyObj::Iter(_))
+                    | Some(PyObj::CallIter { .. })
+            )
+        {
+            let b = self.alloc(PyObj::Builtin(name.to_string()));
+            return Ok(self.alloc(PyObj::BoundMethod {
+                recv: recv.clone(),
+                func: b,
+            }));
+        }
+        // `h.name` / `.digest_size` / `.block_size` on a hash object.
+        if matches!(self.get(recv), Some(PyObj::Hasher { .. })) {
+            if let Some(r) = crate::stdlib::pyhash::attr(self, recv, name) {
+                return r;
+            }
+        }
         // `f.closed` on an in-memory stream. Resolved before the borrowing match
         // below because the lookup needs `&mut self`.
         if matches!(
@@ -7687,8 +7748,16 @@ impl PyHost {
                         }
                         // A native class method (a Builtin in the class ns, e.g.
                         // `_random.Random.random`) binds to the instance too, so a
-                        // stored reference (`r = inst.random; r()`) still receives it.
-                        Some(PyObj::Builtin(_)) => {
+                        // stored reference (`r = inst.random; r()`) still receives
+                        // it. A TYPE object stored as a class attribute is not a
+                        // method and must come back untouched:
+                        // `TestCase.failureException = AssertionError` is exactly
+                        // that, and binding it made `issubclass(exc_type,
+                        // self.failureException)` compare against a bound method —
+                        // so `unittest` filed every assertion failure as an ERROR.
+                        Some(PyObj::Builtin(n))
+                            if !crate::builtins::is_type_object_name(n) =>
+                        {
                             return Ok(self.alloc(PyObj::BoundMethod {
                                 recv: recv.clone(),
                                 func: v,
@@ -7901,6 +7970,14 @@ impl PyHost {
                 }
             }
             Some(PyObj::Exception { class, args }) => {
+                // An attribute assigned onto this instance wins: exceptions carry
+                // arbitrary attributes in CPython, and `unittest` stamps its own
+                // bookkeeping onto the exceptions it catches.
+                if let Value::Obj(id) = recv {
+                    if let Some(v) = self.func_attrs.get(id).and_then(|m| m.get(name)) {
+                        return Ok(v.clone());
+                    }
+                }
                 if name == "__class__" {
                     // The exception's type object (`e.__class__ is ValueError`,
                     // `e.__class__.__name__`).
@@ -8069,6 +8146,28 @@ impl PyHost {
             }
             // Code-object introspection (`func.__code__.co_*`), derived from the
             // backing `FuncDef`. Native VM object, not a Python reimplementation.
+            // A frame's code object: only the identifying fields, which is all
+            // any caller reads off one.
+            Some(PyObj::FrameCode { name: fname, lineno }) => {
+                let (fname, lineno) = (fname.clone(), *lineno);
+                match name {
+                    "co_name" | "co_qualname" => Ok(self.new_str(fname)),
+                    "co_filename" => {
+                        let f = self.tb_filename.clone();
+                        Ok(self.new_str(f))
+                    }
+                    "co_firstlineno" => Ok(Value::Int(lineno as i64)),
+                    "co_flags" => Ok(Value::Int(0)),
+                    "co_argcount" | "co_kwonlyargcount" | "co_posonlyargcount" | "co_nlocals"
+                    | "co_stacksize" => Ok(Value::Int(0)),
+                    "co_varnames" | "co_names" | "co_freevars" | "co_cellvars" | "co_consts" => {
+                        Ok(self.new_tuple(vec![]))
+                    }
+                    _ => Err(format!(
+                        "AttributeError: 'code' object has no attribute '{name}'"
+                    )),
+                }
+            }
             Some(PyObj::Code { def_id }) => {
                 let def_id = *def_id;
                 self.code_attr(def_id, name)
@@ -8261,10 +8360,21 @@ impl PyHost {
                 }
             }
             // Frame object: the module globals are live; locals are not captured.
-            Some(PyObj::PyFrame { lineno, .. }) => {
+            Some(PyObj::PyFrame { lineno, name: fname }) => {
                 let lineno = *lineno;
+                let fname = fname.clone();
                 match name {
                     "f_lineno" => Ok(Value::Int(lineno as i64)),
+                    // `f_code` — the frame's code object. `logging.findCaller`
+                    // walks frames reading `f_code.co_filename` to locate the
+                    // caller, and `warnings` does the same to decide whether a
+                    // frame is stdlib-internal; both are unreachable without it.
+                    "f_code" => Ok(self.alloc(PyObj::FrameCode {
+                        name: fname,
+                        lineno,
+                    })),
+                    "f_trace" | "f_trace_lines" | "f_trace_opcodes" => Ok(Value::Undef),
+                    "f_lasti" => Ok(Value::Int(-1)),
                     "f_locals" => Ok(self.new_dict(IndexMap::new())),
                     "f_globals" | "f_builtins" => {
                         let pairs = self.globals_pairs();
@@ -8370,6 +8480,10 @@ impl PyHost {
             }
             // A builtin type object / function reports `builtins` as its module
             // (typing's deprecated-alias machinery reads `origin.__module__`).
+            // Every builtin function has a `__doc__`; CPython's carry the C
+            // docstring, and `None` is what one without a docstring reports.
+            // `signal.py` copies it off the accelerator onto each wrapper.
+            Some(PyObj::Builtin(_)) if name == "__doc__" => Ok(Value::Undef),
             Some(PyObj::Builtin(n)) if name == "__module__" => {
                 // A module-qualified type object reports its own module.
                 let n = n.clone();
@@ -8985,6 +9099,16 @@ impl PyHost {
                 } else {
                     self.stderr_target = target;
                 }
+            }
+        }
+        // An exception instance carries arbitrary attributes, as CPython's do:
+        // `unittest`'s runner stamps bookkeeping onto the exceptions it catches,
+        // and `raise X from Y` style helpers attach their own state.
+        if matches!(self.get(recv), Some(PyObj::Exception { .. })) {
+            if let Value::Obj(id) = recv {
+                let id = *id;
+                self.func_attrs.entry(id).or_default().insert(name.to_string(), val);
+                return Ok(());
             }
         }
         // A `property` or C-level descriptor carries a writable `__doc__`, and
@@ -9871,17 +9995,35 @@ pub fn call_method(
         // a reentrant lock counts nesting.
         Some(PyObj::Lock { reentrant, .. }) => match name {
             "acquire" | "__enter__" => {
+                let held = with_host(|h| {
+                    matches!(h.get(recv), Some(PyObj::Lock { count, .. }) if *count > 0)
+                });
+                // `acquire(blocking=False)` on a held non-reentrant lock fails,
+                // and saying so is what makes `threading.Condition._is_owned`
+                // work: its default implementation probes with a non-blocking
+                // acquire and reads a refusal as "someone holds this".
+                let blocking = match args.first() {
+                    Some(v) => with_host(|h| h.truthy(v)),
+                    None => true,
+                };
+                if held && !reentrant {
+                    if !blocking {
+                        return Ok(Value::Bool(false));
+                    }
+                    // One thread, so a blocking acquire of a lock this same
+                    // thread holds can never be satisfied. CPython would hang;
+                    // reporting the deadlock is strictly more useful.
+                    return Err(
+                        "RuntimeError: deadlock: acquiring a lock already held by this thread"
+                            .to_string(),
+                    );
+                }
                 with_host(|h| {
                     if let Some(PyObj::Lock { count, .. }) = h.get_mut(recv) {
                         *count += 1;
                     }
                 });
-                // `__enter__` returns the lock semantics (`acquire` -> True).
-                if name == "__enter__" {
-                    Ok(Value::Bool(true))
-                } else {
-                    Ok(Value::Bool(true))
-                }
+                Ok(Value::Bool(true))
             }
             "release" | "__exit__" => {
                 with_host(|h| {
@@ -9896,6 +10038,8 @@ pub fn call_method(
             "locked" => Ok(Value::Bool(with_host(|h| {
                 matches!(h.get(recv), Some(PyObj::Lock { count, .. }) if *count > 0)
             }))),
+            // A no-op: there is no fork to re-initialize after.
+            "_at_fork_reinit" => Ok(Value::Undef),
             "_is_owned" => Ok(Value::Bool(reentrant
                 && with_host(|h| {
                     matches!(h.get(recv), Some(PyObj::Lock { count, .. }) if *count > 0)
@@ -9999,6 +10143,16 @@ pub fn call_method(
                 if let Some(base) = with_host(|h| h.builtin_base_of(&class)) {
                     return base_dispatch(recv, &inst.payload, base, name, args, kwargs);
                 }
+            }
+            // Last resort, as in CPython: `__getattr__` supplies attributes the
+            // class does not define, and a METHOD CALL has to consult it too —
+            // not just a plain attribute read. `unittest`'s `_WritelnDecorator`
+            // is nothing but a `__getattr__` that forwards to a wrapped stream,
+            // so `self.write(...)` inside it went straight to AttributeError.
+            if with_host(|h| h.class_has(&class, "__getattr__")) {
+                let key = with_host(|h| h.new_str(name.to_string()));
+                let attr = call_method(recv, "__getattr__", vec![key], vec![])?;
+                return invoke(&attr, args, kwargs);
             }
             Err(format!(
                 "AttributeError: '{class}' object has no attribute '{name}'"
@@ -13131,6 +13285,14 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
     // base, a `_fields` tuple), so the module is DECLARED by a table in Rust and
     // DEFINED by running the Python that table expands to — the same relationship
     // CPython's generated C file has to `Parser/Python.asdl`.
+    // `_thread` — the Python-shaped half of the threading primitives (the handle
+    // object, the shutdown bookkeeping). The host-backed pieces stay in the
+    // native `_thread_core` arm this module imports from.
+    #[cfg(not(feature = "stdlib-ffi"))]
+    if name == "_thread" {
+        let src = crate::stdlib::pythread::module_source();
+        return run_vendored_module("_thread", src, std::path::Path::new("<_thread>"));
+    }
     #[cfg(not(feature = "stdlib-ffi"))]
     if name == "_ast" {
         let src = crate::stdlib::pyast::module_source();
@@ -13165,6 +13327,12 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
         "_opcode" => Some(with_host(crate::stdlib::pyopcode::entries)),
         // `_imp` — the import primitives `importlib` is handed at startup.
         "_imp" => Some(with_host(crate::stdlib::pyimp::entries)),
+        // `_signal` — the POSIX signal numbers `signal.py` re-exports as enums.
+        "_signal" => Some(with_host(crate::stdlib::pysignal::entries)),
+        // The hash accelerators `hashlib` dispatches to, one per algorithm family.
+        "_md5" | "_sha1" | "_sha2" | "_sha3" | "_blake2" => {
+            with_host(|h| crate::stdlib::pyhash::entries(h, name))
+        }
         "marshal" => Some(with_host(crate::stdlib::pyimp::marshal_entries)),
         _ => None,
     };
@@ -13332,24 +13500,24 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
         }),
         // `_thread` — low-level threading primitives. pythonrs runs user code on
         // one thread, so the locks are functional but uncontended.
-        "_thread" => with_host(|h| {
+        "_thread_core" => with_host(|h| {
             vec![
                 (
                     "allocate_lock",
-                    h.alloc(PyObj::Builtin("_thread.allocate_lock".into())),
+                    h.alloc(PyObj::Builtin("_thread_core.allocate_lock".into())),
                 ),
-                ("RLock", h.alloc(PyObj::Builtin("_thread.RLock".into()))),
+                ("RLock", h.alloc(PyObj::Builtin("_thread_core.RLock".into()))),
                 (
                     "get_ident",
-                    h.alloc(PyObj::Builtin("_thread.get_ident".into())),
+                    h.alloc(PyObj::Builtin("_thread_core.get_ident".into())),
                 ),
                 (
                     "get_native_id",
-                    h.alloc(PyObj::Builtin("_thread.get_native_id".into())),
+                    h.alloc(PyObj::Builtin("_thread_core.get_native_id".into())),
                 ),
                 (
                     "start_new_thread",
-                    h.alloc(PyObj::Builtin("_thread.start_new_thread".into())),
+                    h.alloc(PyObj::Builtin("_thread_core.start_new_thread".into())),
                 ),
                 ("error", h.alloc(PyObj::Builtin("RuntimeError".into()))),
                 ("TIMEOUT_MAX", Value::Float(f64::MAX)),
@@ -13843,6 +14011,20 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                     h.alloc(PyObj::Builtin("sys.getdefaultencoding".into())),
                 ),
                 ("intern", h.alloc(PyObj::Builtin("sys.intern".into()))),
+                // Exception reporting. `threading` captures `sys.excepthook` and
+                // `sys.exc_info` when a `Thread` is constructed, so every
+                // `Thread(...)` reaches these.
+                ("excepthook", h.alloc(PyObj::Builtin("sys.excepthook".into()))),
+                (
+                    "__excepthook__",
+                    h.alloc(PyObj::Builtin("sys.excepthook".into())),
+                ),
+                (
+                    "unraisablehook",
+                    h.alloc(PyObj::Builtin("sys.unraisablehook".into())),
+                ),
+                ("exc_info", h.alloc(PyObj::Builtin("sys.exc_info".into()))),
+                ("exception", h.alloc(PyObj::Builtin("sys.exception".into()))),
                 ("audit", h.alloc(PyObj::Builtin("sys.audit".into()))),
                 ("is_finalizing", h.alloc(PyObj::Builtin("sys.is_finalizing".into()))),
                 // Installation layout. `argparse` reads `base_prefix` (to detect a

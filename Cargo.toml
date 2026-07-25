@@ -112,6 +112,16 @@ nu-ansi-term = "0.50"
 sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 toml = "0.8"
 
+# Hash algorithms behind `hashlib`'s `_md5`/`_sha1`/`_sha2`/`_sha3`/`_blake2`.
+# A hash is defined by its test vectors; these are audited implementations of the
+# same FIPS/RFC specifications CPython links OpenSSL for. See `src/stdlib/pyhash.rs`.
+digest = "0.10"
+md-5 = "0.10"
+sha1 = "0.10"
+sha2 = "0.10"
+sha3 = "0.10"
+blake2 = "0.10"
+
 # Regex engines backing the `re` module: `regex` for the linear-time majority,
 # `fancy-regex` for the patterns it cannot express (look-around, backreferences)
 # — `_pydecimal` and `fractions` both need lookahead. See `src/regexpr.rs`.

@@ -1658,3 +1658,209 @@ fn a_generator_body_can_call_a_deep_chain() {
         "[201]"
     );
 }
+
+#[cfg(not(feature = "stdlib-ffi"))]
+#[test]
+fn vendored_threading_runs_on_pythonrs() {
+    // pythonrs runs user code on ONE thread, so a started thread runs its target
+    // immediately and has finished by the time `start()` returns. Every thread
+    // still needs its own identity while it runs, or a finished thread's
+    // `_delete()` evicts the main thread from the registry.
+    assert_eq!(
+        g(
+            "import threading\n\
+             seen = []\n\
+             t = threading.Thread(target=lambda: seen.append(threading.current_thread().name))\n\
+             t.start()\n\
+             t.join()\n\
+             x = (seen[0], threading.current_thread().name, t.is_alive())",
+            "x"
+        ),
+        "('Thread-1 (<lambda>)', 'MainThread', False)"
+    );
+    // A non-blocking acquire of a held lock FAILS, which is what
+    // `threading.Condition._is_owned` probes with.
+    assert_eq!(
+        g(
+            "import threading\n\
+             lk = threading.Lock()\n\
+             lk.acquire()\n\
+             x = lk.acquire(False)",
+            "x"
+        ),
+        "False"
+    );
+    assert_eq!(
+        g("import threading\ne = threading.Event()\ne.set()\nx = e.is_set()", "x"),
+        "True"
+    );
+}
+
+#[cfg(not(feature = "stdlib-ffi"))]
+#[test]
+fn hashlib_matches_the_reference_digests() {
+    // The published test vectors for "abc". A hash is DEFINED by these, so a
+    // wrong implementation is worse than a missing one.
+    assert_eq!(
+        g("import hashlib\nx = hashlib.sha256(b'abc').hexdigest()", "x"),
+        "'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'"
+    );
+    assert_eq!(
+        g("import hashlib\nx = hashlib.md5(b'abc').hexdigest()", "x"),
+        "'900150983cd24fb0d6963f7d28e17f72'"
+    );
+    assert_eq!(
+        g("import hashlib\nx = hashlib.sha1(b'abc').hexdigest()", "x"),
+        "'a9993e364706816aba3e25717850c26c9cd0d89d'"
+    );
+    assert_eq!(
+        g("import hashlib\nx = hashlib.sha3_256(b'abc').hexdigest()", "x"),
+        "'3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532'"
+    );
+    assert_eq!(
+        g("import hashlib\nx = hashlib.shake_128(b'abc').hexdigest(8)", "x"),
+        "'5881092dd818bf5c'"
+    );
+    // Feeding in pieces equals feeding at once, and reading a digest does not
+    // finalize the object.
+    assert_eq!(
+        g(
+            "import hashlib\n\
+             h = hashlib.sha256()\n\
+             h.update(b'a')\n\
+             h.update(b'bc')\n\
+             first = h.hexdigest()\n\
+             x = (first == hashlib.sha256(b'abc').hexdigest(), first == h.hexdigest())",
+            "x"
+        ),
+        "(True, True)"
+    );
+    // `copy()` forks the state rather than aliasing it.
+    assert_eq!(
+        g(
+            "import hashlib\n\
+             h = hashlib.sha256(b'abc')\n\
+             c = h.copy()\n\
+             c.update(b'd')\n\
+             x = c.hexdigest() != h.hexdigest()",
+            "x"
+        ),
+        "True"
+    );
+}
+
+#[test]
+fn base_exception_is_the_root_of_exceptions_only() {
+    // `BaseException` is the root of the EXCEPTION hierarchy, not of everything.
+    // Answering it unconditionally made `isinstance(True, BaseException)` true,
+    // and `logging._log` reads exactly that to tell an exception object from the
+    // flag `True` — so every `logger.exception(...)` took the wrong branch.
+    assert_eq!(g("x = isinstance(True, BaseException)", "x"), "False");
+    assert_eq!(g("x = isinstance('s', BaseException)", "x"), "False");
+    assert_eq!(g("x = isinstance(1, Exception)", "x"), "False");
+    assert_eq!(g("x = isinstance(ValueError('v'), BaseException)", "x"), "True");
+    assert_eq!(
+        g("class E(Exception): pass\nx = (isinstance(E(), BaseException), issubclass(E, BaseException))", "x"),
+        "(True, True)"
+    );
+}
+
+#[test]
+fn a_type_stored_as_a_class_attribute_is_not_bound_as_a_method() {
+    // Reading a class attribute off an instance binds FUNCTIONS, not types.
+    // `unittest.TestCase.failureException = AssertionError` is a type, and
+    // binding it made `issubclass(exc_type, self.failureException)` compare
+    // against a bound method — so every assertion failure was filed as an ERROR.
+    assert_eq!(
+        g(
+            "class C:\n\
+             \x20   err = AssertionError\n\
+             x = (C().err is AssertionError, issubclass(AssertionError, C().err))",
+            "x"
+        ),
+        "(True, True)"
+    );
+}
+
+#[test]
+fn getattr_fallback_applies_to_method_calls() {
+    // `__getattr__` supplies attributes the class does not define, and a METHOD
+    // CALL has to consult it too. `unittest`'s `_WritelnDecorator` is nothing but
+    // a `__getattr__` forwarding to a wrapped stream.
+    assert_eq!(
+        g(
+            "import io\n\
+             class D:\n\
+             \x20   def __init__(self, s):\n\
+             \x20       self.stream = s\n\
+             \x20   def __getattr__(self, a):\n\
+             \x20       if a == 'stream':\n\
+             \x20           raise AttributeError(a)\n\
+             \x20       return getattr(self.stream, a)\n\
+             d = D(io.StringIO())\n\
+             d.write('hi')\n\
+             x = d.stream.getvalue()",
+            "x"
+        ),
+        "'hi'"
+    );
+}
+
+#[test]
+fn an_exception_instance_carries_attributes() {
+    // CPython exceptions take arbitrary attributes; `unittest` stamps its own
+    // bookkeeping onto the exceptions it catches.
+    assert_eq!(g("e = StopIteration()\ne.value = 5\nx = e.value", "x"), "5");
+    assert_eq!(
+        g("v = ValueError('x')\nv.custom = 'y'\nx = (v.custom, v.args)", "x"),
+        "('y', ('x',))"
+    );
+    // `BaseException`'s own methods.
+    assert_eq!(g("e = ValueError('x')\nx = e.with_traceback(None) is e", "x"), "True");
+    assert_eq!(g("e = ValueError('x')\ne.add_note('n')\nx = e.__notes__", "x"), "['n']");
+}
+
+#[cfg(not(feature = "stdlib-ffi"))]
+#[test]
+fn vendored_unittest_runs_on_pythonrs() {
+    // An assertion failure must be filed as a FAILURE and an unexpected
+    // exception as an ERROR — the distinction `unittest` exists to draw.
+    assert_eq!(
+        g(
+            "import unittest, io\n\
+             class T(unittest.TestCase):\n\
+             \x20   def test_ok(self):\n\
+             \x20       self.assertEqual(1 + 1, 2)\n\
+             \x20   def test_fail(self):\n\
+             \x20       self.assertIn(3, [1, 2])\n\
+             \x20   def test_raises(self):\n\
+             \x20       with self.assertRaises(ValueError):\n\
+             \x20           raise ValueError('x')\n\
+             r = unittest.TextTestRunner(verbosity=0, stream=io.StringIO())\n\
+             res = r.run(unittest.TestLoader().loadTestsFromTestCase(T))\n\
+             x = (res.testsRun, len(res.failures), len(res.errors), res.wasSuccessful())",
+            "x"
+        ),
+        "(3, 1, 0, False)"
+    );
+}
+
+#[cfg(not(feature = "stdlib-ffi"))]
+#[test]
+fn vendored_logging_runs_on_pythonrs() {
+    assert_eq!(
+        g(
+            "import logging, io\n\
+             s = io.StringIO()\n\
+             h = logging.StreamHandler(s)\n\
+             h.setFormatter(logging.Formatter('%(levelname)s:%(name)s:%(message)s'))\n\
+             log = logging.getLogger('demo')\n\
+             log.addHandler(h)\n\
+             log.setLevel(logging.DEBUG)\n\
+             log.info('hello %s', 'world')\n\
+             x = s.getvalue()",
+            "x"
+        ),
+        "'INFO:demo:hello world\\n'"
+    );
+}

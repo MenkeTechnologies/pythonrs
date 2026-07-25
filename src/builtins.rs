@@ -2518,6 +2518,11 @@ fn b_try(vm: &mut VM, _: u8) -> Value {
         None => return abort(vm, "internal: unknown try id".into()),
     };
     let mut pending: Option<String> = None;
+    // The exception being handled when this `try` was entered. `h.exc` is
+    // overwritten by every RAISE, so by the time a handler runs it no longer
+    // names the enclosing handler's exception — this snapshot does, and it is
+    // what gets restored when the handler finishes.
+    let entry_exc = with_host(|h| h.exc.clone());
 
     let body_res = host::run_chunk_on(td.body.clone());
     let signal_after_body = with_host(|h| h.signal.is_some());
@@ -2578,6 +2583,15 @@ fn b_try(vm: &mut VM, _: u8) -> Value {
                     // in the handler body re-raises it (`b_reraise` reads `h.exc`).
                     // The exception is caught: snapshot its frames as `__traceback__`
                     // (for a later chained render), then discard the live trace.
+                    // The exception being handled is SAVED and restored around
+                    // the handler body, as CPython's exception state is. Clearing
+                    // it to `None` afterwards was not enough: anything the body
+                    // called that raised and caught internally — a generator
+                    // reaching StopIteration is the common one — left ITS
+                    // exception behind as "currently handled", and a later
+                    // `sys.exc_info()` in the same handler read that instead.
+                    // `unittest` classifies a failure by exactly that call, so an
+                    // assertion failure was reported as an ERROR.
                     with_host(|h| {
                         h.error = None;
                         h.exc = Some(exc.clone());
@@ -2587,10 +2601,8 @@ fn b_try(vm: &mut VM, _: u8) -> Value {
                     let hres = host::run_chunk_on(hbody.clone());
                     match hres {
                         Ok(_) => with_host(|h| {
-                            // Handler finished without raising — clear the handled
-                            // exception (unless the body set a return/break signal).
                             if h.signal.is_none() {
-                                h.exc = None;
+                                h.exc = entry_exc.clone();
                             }
                         }),
                         Err(e2) => pending = Some(e2),
@@ -3595,8 +3607,8 @@ pub fn call_builtin_function(
             _ => Err(host::type_error(&format!("atexit has no function '{f}'"))),
         };
     }
-    // `_thread.*` — lock/thread primitives.
-    if let Some(f) = name.strip_prefix("_thread.") {
+    // `_thread_core.*` — the host-backed threading primitives.
+    if let Some(f) = name.strip_prefix("_thread_core.") {
         return match f {
             "allocate_lock" => Ok(with_host(|h| {
                 h.alloc(PyObj::Lock {
@@ -3620,7 +3632,7 @@ pub fn call_builtin_function(
                 host::invoke(&func, call_args, vec![])?;
                 Ok(Value::Int(1))
             }
-            _ => Err(format!("AttributeError: module '_thread' has no attribute '{f}'")),
+            _ => Err(format!("AttributeError: module '_thread_core' has no attribute '{f}'")),
         };
     }
     // `itertools.*` iterators.
@@ -3775,6 +3787,18 @@ pub fn call_builtin_function(
             return r;
         }
     }
+    // `_hash.<algo>(...)` — a hash constructor from any of the accelerator
+    // modules (`_md5`, `_sha1`, `_sha2`, `_sha3`, `_blake2`).
+    if let Some(f) = name.strip_prefix("_hash.") {
+        if let Some(algo) = crate::stdlib::pyhash::Algo::from_name(f) {
+            return with_host(|h| crate::stdlib::pyhash::construct(h, algo, &args, &kwargs));
+        }
+    }
+    if let Some(f) = name.strip_prefix("_signal.") {
+        if let Some(r) = with_host(|h| crate::stdlib::pysignal::call(h, f, &args)) {
+            return r;
+        }
+    }
     if let Some(f) = name.strip_prefix("_io.") {
         if let Some(r) = with_host(|h| crate::stdlib::pyio::call(h, f, &args, &kwargs)) {
             return r;
@@ -3828,9 +3852,7 @@ pub fn call_builtin_function(
             // A bare `Context()` / `copy_context()`: the variables carry their own
             // state, so an empty marker object is a faithful stand-in for running
             // code in "the current context".
-            "Context" | "copy_context" => Ok(with_host(|h| {
-                h.alloc(PyObj::Builtin("_contextvars.Context".into()))
-            })),
+            "Context" | "copy_context" => Ok(with_host(|h| h.alloc(PyObj::ContextObj))),
             _ => Err(host::name_error(&format!("_contextvars.{f}"))),
         };
     }
@@ -6394,6 +6416,37 @@ fn call_sys(name: &str, args: Vec<Value>) -> Result<Value, String> {
         // `sys.intern(s)` returns the string (no interning table needed here).
         "intern" => Ok(args.into_iter().next().unwrap_or(Value::Undef)),
         "audit" => Ok(Value::Undef),
+        // `sys.exc_info()` — the exception being handled, as
+        // `(type, value, traceback)`, or a triple of `None` outside a handler.
+        // `sys.exception()` is the same value alone (3.12+).
+        "exc_info" | "exception" => {
+            let cur = with_host(|h| h.exc.clone());
+            let want_triple = name == "exc_info";
+            Ok(with_host(|h| match cur {
+                Some(exc) if !want_triple => exc,
+                Some(exc) => {
+                    let cls = h.get_attr(&exc, "__class__").unwrap_or(Value::Undef);
+                    // No traceback object: pythonrs records traceback frames in a
+                    // side table rather than as a reachable `__traceback__` chain.
+                    h.new_tuple(vec![cls, exc, Value::Undef])
+                }
+                None if !want_triple => Value::Undef,
+                None => h.new_tuple(vec![Value::Undef, Value::Undef, Value::Undef]),
+            }))
+        }
+        // `sys.excepthook(type, value, tb)` — print an uncaught exception, which
+        // is what the default hook does. `sys.unraisablehook` takes the single
+        // argument the C API passes and reports the same way.
+        "excepthook" | "unraisablehook" => {
+            let value = if name == "excepthook" {
+                args.get(1).cloned().unwrap_or(Value::Undef)
+            } else {
+                args.first().cloned().unwrap_or(Value::Undef)
+            };
+            let text = with_host(|h| h.str_of(&value));
+            eprintln!("{text}");
+            Ok(Value::Undef)
+        }
         "is_finalizing" => Ok(Value::Bool(false)),
         // `sys._getframe([depth])` — the frame `depth` levels up from the caller.
         "_getframe" => {
@@ -8066,8 +8119,18 @@ fn exc_parent(name: &str) -> Option<&'static str> {
 /// Whether `exc_class` is-a `want` in the exception hierarchy (builtin chain +
 /// user class MRO).
 fn exception_isa(exc_class: &str, want: &str, h: &host::PyHost) -> bool {
-    if exc_class == want || want == "BaseException" {
+    if exc_class == want {
         return true;
+    }
+    // `BaseException` is the root of the EXCEPTION hierarchy, not of everything:
+    // answering it unconditionally made `isinstance(True, BaseException)` true,
+    // and `logging._log` reads exactly that to decide whether its `exc_info`
+    // argument is an exception object or the flag `True` — so every
+    // `logger.exception(...)` went down the wrong branch and died reaching
+    // `True.__traceback__`.
+    if want == "BaseException" {
+        return is_exception_class(exc_class)
+            || h.classes.contains_key(exc_class) && h.class_is_exception(exc_class);
     }
     // Builtin chain.
     let mut cur = exc_class;
@@ -8104,7 +8167,18 @@ fn exception_isa(exc_class: &str, want: &str, h: &host::PyHost) -> bool {
     // all exceptions derive from `Exception`, and the non-`Exception`
     // `BaseException` subclasses (`KeyboardInterrupt`, `SystemExit`,
     // `GeneratorExit`) are all builtins in the table.
-    if want == "Exception" && !is_exception_class(exc_class) && !h.classes.contains_key(exc_class) {
+    // A BUILTIN type is never one of these: `int`, `str` and friends are known
+    // not to be exceptions, and answering `isinstance(1, Exception)` with True
+    // is simply wrong.
+    if want == "Exception"
+        && !is_exception_class(exc_class)
+        && !h.classes.contains_key(exc_class)
+        && !is_type_like_builtin(exc_class)
+        && !matches!(
+            exc_class,
+            "NoneType" | "function" | "module" | "method" | "builtin_function_or_method"
+        )
+    {
         return true;
     }
     false
@@ -8287,6 +8361,7 @@ pub fn type_has_method(typename: &str, name: &str) -> bool {
         "_io.StringIO" | "_io.BytesIO" => return STREAM_METHODS.contains(&name),
         // A C-level attribute descriptor is callable through the descriptor
         // protocol: `type.__dict__['__annotations__'].__get__(cls)`.
+        "Context" => return matches!(name, "run" | "copy" | "get" | "keys" | "values" | "items"),
         "getset_descriptor" | "member_descriptor" | "wrapper_descriptor"
         | "classmethod_descriptor" | "method-wrapper" => {
             return matches!(name, "__get__" | "__set__" | "__delete__")
@@ -8296,6 +8371,17 @@ pub fn type_has_method(typename: &str, name: &str) -> bool {
         "complex" => COMPLEX_METHODS,
         "property" => PROPERTY_METHODS,
         "generator" => GENERATOR_METHODS,
+        // Every lazy iterator answers the iterator protocol as bound methods.
+        // `threading` takes `itertools.count().__next__` as its name counter, and
+        // reaching `__next__` only through `next(it)` was not enough.
+        _ if typename.starts_with("itertools.")
+            || matches!(
+                typename,
+                "zip" | "map" | "filter" | "enumerate" | "iterator" | "callable_iterator"
+            ) =>
+        {
+            return matches!(name, "__next__" | "__iter__")
+        }
         "coroutine" => return GENERATOR_METHODS.contains(&name) || name == "__await__",
         "async_generator" => {
             return matches!(
@@ -8310,6 +8396,33 @@ pub fn type_has_method(typename: &str, name: &str) -> bool {
             return matches!(
                 name,
                 "acquire" | "release" | "locked" | "__aenter__" | "__aexit__"
+            )
+        }
+        // `_thread.lock` / `_thread.RLock` — the primitives `threading` builds
+        // every synchronization class on. `Condition.__init__` reaches straight
+        // for `lock.acquire`/`lock.release` and binds them as methods.
+        // A plain `_thread.lock` has no ownership notion — `_is_owned` is
+        // REENTRANT-only, and advertising it on a plain lock makes
+        // `threading.Condition` bind a method that cannot answer.
+        _ if is_exception_class(typename) && matches!(name, "with_traceback" | "add_note") => {
+            return true
+        }
+        "lock" => {
+            return matches!(
+                name,
+                "acquire" | "release" | "locked" | "_at_fork_reinit" | "__enter__" | "__exit__"
+            )
+        }
+        "RLock" => {
+            return matches!(
+                name,
+                "acquire"
+                    | "release"
+                    | "locked"
+                    | "_is_owned"
+                    | "_at_fork_reinit"
+                    | "__enter__"
+                    | "__exit__"
             )
         }
         "Queue" => {
@@ -8829,6 +8942,9 @@ pub fn call_type_method(
     if let Some(r) = with_host(|h| crate::stdlib::pyio::stream_method(h, recv, name, &args)) {
         return r;
     }
+    if let Some(r) = with_host(|h| crate::stdlib::pyhash::method(h, recv, name, &args)) {
+        return r;
+    }
     // `desc.__get__(obj[, cls])` on a C-level attribute descriptor. A getset (or
     // member) descriptor names one attribute of its owner type, so invoking it is
     // simply reading that attribute off the instance — which is how
@@ -8899,6 +9015,14 @@ pub fn call_type_method(
             return Ok(Value::Undef);
         }
         "__iter__" => return with_host(|h| h.make_iter(recv)),
+        // `it.__next__()` on a native iterator is `next(it)`: advance, or raise
+        // StopIteration at exhaustion.
+        "__next__" => {
+            return match host::iter_step(recv)? {
+                Some(v) => Ok(v),
+                None => Err("StopIteration".to_string()),
+            }
+        }
         "__str__" => return Ok(with_host(|h| {
             let s = h.str_of(recv);
             h.new_str(s)
@@ -9003,6 +9127,44 @@ pub fn call_type_method(
         "Future" | "Task" => crate::async_rt::future_method(recv, name, args),
         "_UnixSelectorEventLoop" => crate::async_rt::loop_method(name, args),
         "Event" | "Lock" | "Queue" => crate::async_rt::async_obj_method(recv, name, args),
+        // `BaseException`'s own methods. `with_traceback` returns the exception
+        // (there is no traceback object to attach), and `add_note` appends to
+        // `__notes__`, which `traceback` renders. `unittest.assertRaises` stores
+        // its captured exception with `exc.with_traceback(None)`.
+        _ if is_exception_class(&tn) && matches!(name, "with_traceback" | "add_note") => {
+            if name == "with_traceback" {
+                return Ok(recv.clone());
+            }
+            let note = arg0(&args)?;
+            with_host(|h| {
+                let notes = h.get_attr(recv, "__notes__").unwrap_or(Value::Undef);
+                let mut items = match h.get(&notes) {
+                    Some(host::PyObj::List(l)) => l.clone(),
+                    _ => Vec::new(),
+                };
+                items.push(note);
+                let lst = h.new_list(items);
+                h.set_attr(recv, "__notes__", lst)
+            })?;
+            Ok(Value::Undef)
+        }
+        // A `_thread` lock: the operations live on the host object, so route
+        // there rather than reimplementing them.
+        "lock" | "RLock" => host::call_method(recv, name, args, kwargs),
+        // `Context.run(fn, *args, **kw)` — call `fn` in this context. The
+        // variables carry their own state, so "this context" is the current one
+        // and running is a plain call. `threading` dispatches every thread body
+        // through `self._context.run(self.run)`.
+        // `Context.run(fn, *args, **kw)` — call `fn` in this context. Each
+        // variable carries its own state, so "this context" is the current one
+        // and running is a plain call. `threading` dispatches every thread body
+        // through `self._context.run(self.run)`.
+        "Context" if name == "run" => {
+            let f = arg0(&args)?;
+            host::invoke(&f, args[1..].to_vec(), kwargs)
+        }
+        "Context" if name == "copy" => Ok(recv.clone()),
+        "Context" => Ok(with_host(|h| h.new_list(vec![]))),
         other => Err(format!(
             "AttributeError: '{other}' object has no attribute '{name}'"
         )),
