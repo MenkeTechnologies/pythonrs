@@ -67,6 +67,8 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::IS_INT, b_is_int);
     vm.register_builtin(ops::INTERPOLATION, b_interpolation);
     vm.register_builtin(ops::TEMPLATE, b_template);
+    vm.register_builtin(ops::CHECK_BOUND, b_check_bound);
+    vm.register_builtin(ops::UNBOUND, |_, _| with_host(|h| h.alloc(PyObj::Unbound)));
     vm.register_builtin(ops::UNPACK, b_unpack);
     vm.register_builtin(ops::BINOP, b_binop);
     vm.register_builtin(ops::INPLACE, b_inplace);
@@ -1108,6 +1110,19 @@ fn b_template(vm: &mut VM, _: u8) -> Value {
             interpolations,
         })
     })
+}
+
+/// `CHECK_BOUND` — raise `UnboundLocalError` if a frame slot still holds the
+/// never-assigned marker. Emitted only for reads the compiler cannot prove are
+/// dominated by an assignment; a parameter, or a local assigned by a top-level
+/// statement before its first use, reads with a bare `GetSlot`.
+fn b_check_bound(vm: &mut VM, _: u8) -> Value {
+    let v = vm.pop();
+    let name = sval(&vm.pop());
+    if with_host(|h| matches!(h.get(&v), Some(PyObj::Unbound))) {
+        return abort(vm, host::unbound_local_error(&name));
+    }
+    v
 }
 
 fn b_truthy(vm: &mut VM, _: u8) -> Value {

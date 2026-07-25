@@ -113,6 +113,8 @@ pub mod ops {
     pub const IS_INT: u16 = 80; // [v] -> Bool: v is an `int` a native slot loop can hold (fixnum or bignum, not bool)
     pub const INTERPOLATION: u16 = 81; // [value, expression(str), conv(int), spec(str)] -> Interpolation
     pub const TEMPLATE: u16 = 82; // [segments(list of str|Interpolation)] -> Template
+    pub const CHECK_BOUND: u16 = 83; // [name, value] -> value, or UnboundLocalError if unbound
+    pub const UNBOUND: u16 = 84; // [] -> the never-assigned frame-slot marker
 }
 
 /// In-place (augmented-assignment) op tags carried by `ops::INPLACE`. One per
@@ -791,6 +793,14 @@ pub enum PyObj {
         idx: usize,
         dialect: Box<crate::stdlib::pycsv::Dialect>,
     },
+    /// The marker a frame slot holds before its local is first assigned.
+    ///
+    /// Slots are a plain `Vec<Value>`, and `Value::Undef` already means Python
+    /// `None` — so a never-assigned slot had to be distinguishable from one
+    /// holding `None`, or `def f(): print(x); x = 1` would print `None` instead
+    /// of raising `UnboundLocalError`. The compiler emits a `CHECK_BOUND` only
+    /// where it cannot prove the local is already bound.
+    Unbound,
     /// A `contextvars.Context`. Each variable carries its own state here, so a
     /// context is a marker for "the current context" rather than a snapshot — but
     /// it has to be an OBJECT rather than a type marker, because `threading` runs
@@ -3086,6 +3096,7 @@ impl PyHost {
                 Some(PyObj::ContextVar { .. }) => "ContextVar".into(),
                 Some(PyObj::ContextToken { .. }) => "Token".into(),
                 Some(PyObj::ContextObj) => "Context".into(),
+                Some(PyObj::Unbound) => "unbound".into(),
                 Some(PyObj::CsvWriter { .. }) => "_csv.writer".into(),
                 Some(PyObj::CsvDialect(_)) => "Dialect".into(),
                 Some(PyObj::CsvReader { .. }) => "_csv.reader".into(),
@@ -3261,6 +3272,7 @@ impl PyHost {
                 Some(PyObj::ContextVar { name, .. }) => format!("<ContextVar name='{name}'>"),
                 Some(PyObj::ContextToken { .. }) => "<Token>".to_string(),
                 Some(PyObj::ContextObj) => "<Context>".to_string(),
+                Some(PyObj::Unbound) => "<unbound local>".to_string(),
                 Some(PyObj::CsvWriter { .. }) => "<_csv.writer object>".to_string(),
                 Some(PyObj::CsvDialect(_)) => "<_csv.Dialect object>".to_string(),
                 Some(PyObj::CsvReader { .. }) => "<_csv.reader object>".to_string(),

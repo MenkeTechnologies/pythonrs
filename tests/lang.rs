@@ -4009,3 +4009,117 @@ fn attribute_lookup_through_a_deep_class_chain_is_not_quadratic_work() {
         "['D', 'B', 'C', 'A', 'object']"
     );
 }
+
+#[test]
+fn function_locals_live_in_frame_slots_without_changing_semantics() {
+    // An eligible function keeps its locals in `Vec<Value>` slots instead of
+    // hashing each name against the environment chain. The observable behavior
+    // must be identical — including the parts that make slotting hard.
+    //
+    // A read before any assignment is still `UnboundLocalError`, not `None`:
+    // an unassigned slot holds a marker distinct from Python's `None`.
+    assert_eq!(
+        g(
+            "def f():\n\
+             \x20   try:\n\
+             \x20       print(x)\n\
+             \x20   except UnboundLocalError:\n\
+             \x20       return 'unbound'\n\
+             \x20   x = 1\n\
+             x = f()",
+            "x"
+        ),
+        "'unbound'"
+    );
+    // A local bound only on one branch is still unbound on the other.
+    assert_eq!(
+        g(
+            "def f(c):\n\
+             \x20   if c:\n\
+             \x20       y = 1\n\
+             \x20   try:\n\
+             \x20       return y\n\
+             \x20   except UnboundLocalError:\n\
+             \x20       return 'unbound'\n\
+             x = (f(True), f(False))",
+            "x"
+        ),
+        "(1, 'unbound')"
+    );
+    // A loop target is bound inside the body but not after an empty loop.
+    assert_eq!(
+        g(
+            "def f(items):\n\
+             \x20   for i in items:\n\
+             \x20       pass\n\
+             \x20   try:\n\
+             \x20       return i\n\
+             \x20   except UnboundLocalError:\n\
+             \x20       return 'unbound'\n\
+             x = (f([1, 2]), f([]))",
+            "x"
+        ),
+        "(2, 'unbound')"
+    );
+    // A local that shadows a global does not leak into it.
+    assert_eq!(
+        g("v = 'global'\ndef f():\n\x20   v = 'local'\n\x20   return v\nx = (f(), v)", "x"),
+        "('local', 'global')"
+    );
+    // A closure still sees the enclosing local, so names a nested scope reads
+    // must stay name-resolved rather than moving into a slot.
+    assert_eq!(
+        g(
+            "def outer():\n\
+             \x20   a = 10\n\
+             \x20   def inner():\n\
+             \x20       return a + 1\n\
+             \x20   a = 20\n\
+             \x20   return inner()\n\
+             x = outer()",
+            "x"
+        ),
+        "21"
+    );
+    // Recursion gives each activation its own slots.
+    assert_eq!(
+        g(
+            "def fact(n):\n\
+             \x20   if n <= 1:\n\
+             \x20       return 1\n\
+             \x20   acc = n * fact(n - 1)\n\
+             \x20   return acc\n\
+             x = fact(10)",
+            "x"
+        ),
+        "3628800"
+    );
+    // Parameters reach the slots, including defaults, `*args` and `**kwargs`.
+    assert_eq!(
+        g(
+            "def f(a, b=2, *rest, c=3, **kw):\n\
+             \x20   total = a + b + c + len(rest) + len(kw)\n\
+             \x20   return total\n\
+             x = (f(1), f(1, 5, 9, 9, c=0, z=1))",
+            "x"
+        ),
+        "(6, 9)"
+    );
+    // The same loop with a VARIABLE bound must produce the same answer as a
+    // literal one — this is the shape that used to fall off the fast path.
+    assert_eq!(
+        g(
+            "def lit():\n\
+             \x20   s = 0\n\
+             \x20   for i in range(1000): s += i * 3 - 1\n\
+             \x20   return s\n\
+             def var(n):\n\
+             \x20   s = 0\n\
+             \x20   for i in range(n): s += i * 3 - 1\n\
+             \x20   return s\n\
+             x = (lit(), var(1000), lit() == var(1000))",
+            "x"
+        ),
+        "(1497500, 1497500, True)"
+    );
+}

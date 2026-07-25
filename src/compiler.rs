@@ -113,6 +113,19 @@ pub struct Compiler {
     /// native for-range nest (names take slots `0..k`; each loop's `stop` bound
     /// takes the next slot). Meaningful only while `native_slots` is `Some`.
     native_next_slot: u16,
+    /// Frame slots for the FUNCTION currently being compiled: every local that
+    /// can live in a `Vec<Value>` index instead of being hashed by name against
+    /// the host's environment chain on every access.
+    ///
+    /// This is the ordinary path for an eligible function, unlike `native_slots`
+    /// which covers one loop. A read of a name in here is `GetSlot`; a name that
+    /// is NOT in here (a closure variable, a `global`, anything a nested scope can
+    /// see) keeps the name-resolved path unchanged, so eligibility is decided per
+    /// NAME and a partially-slotted function is normal.
+    fn_slots: HashMap<String, u16>,
+    /// Names in `fn_slots` whose every read is dominated by an assignment, so the
+    /// read needs no `CHECK_BOUND`.
+    fn_slots_bound: HashSet<String>,
     tmp: usize,
     debug: bool,
     /// The source line of the statement currently being lowered. Call ops carry
@@ -557,11 +570,21 @@ impl Compiler {
         Ok(())
     }
 
+    /// The frame slot holding `name`, if it has one. A loop-local promotion
+    /// (`native_slots`) wins over the function-wide table so the native loop
+    /// lowering keeps its own numbering.
+    fn slot_of(&self, name: &str) -> Option<u16> {
+        if let Some(s) = self.native_slots.as_ref().and_then(|m| m.get(name)) {
+            return Some(*s);
+        }
+        self.fn_slots.get(name).copied()
+    }
+
     fn store_name(&self, b: &mut ChunkBuilder, name: &str) {
         // stack: [value] -> SETLOCAL([name, value]) -> value ; pop
         // Push name UNDER value: emit name then swap.
-        if let Some(slot) = self.native_slots.as_ref().and_then(|m| m.get(name)) {
-            b.emit(Op::SetSlot(*slot), 0); // consumes the value on top of stack
+        if let Some(slot) = self.slot_of(name) {
+            b.emit(Op::SetSlot(slot), 0); // consumes the value on top of stack
             return;
         }
         self.name_const(b, name);
@@ -576,8 +599,8 @@ impl Compiler {
         let target = target.unspanned();
         match target {
             Expr::Name(n) => {
-                if let Some(slot) = self.native_slots.as_ref().and_then(|m| m.get(n)) {
-                    b.emit(Op::SetSlot(*slot), 0); // consumes the value on top
+                if let Some(slot) = self.slot_of(n) {
+                    b.emit(Op::SetSlot(slot), 0); // consumes the value on top
                 } else {
                     self.name_const(b, n);
                     b.emit(Op::Swap, 0);
@@ -916,12 +939,23 @@ impl Compiler {
 
         // Slot assignment: every distinct local name gets a slot; loop `stop`
         // bounds take slots above them (`native_next_slot`, per loop).
+        // A name the FUNCTION already holds in a slot keeps that slot: the two
+        // tables address the same `Vec<Value>`, so giving the loop its own
+        // numbering would alias one name onto another's storage. Fresh loop
+        // temporaries are allocated above the function's range.
         let mut slots: HashMap<String, u16> = HashMap::new();
-        let mut next: u16 = 0;
+        let mut next: u16 = self.fn_slots.values().copied().max().map_or(0, |m| m + 1);
         for name in loop_vars.iter().chain(reads.iter()).chain(writes.iter()) {
             if !slots.contains_key(name) {
-                slots.insert(name.clone(), next);
-                next += 1;
+                match self.fn_slots.get(name) {
+                    Some(s) => {
+                        slots.insert(name.clone(), *s);
+                    }
+                    None => {
+                        slots.insert(name.clone(), next);
+                        next += 1;
+                    }
+                }
             }
         }
         let target_slot = slots[&target_name];
@@ -930,10 +964,18 @@ impl Compiler {
 
         // Namespace boundary: seed read-before-write locals; write back every
         // modified name (accumulators + all loop vars, deduped) once, at the end.
-        let ns_loads: Vec<(String, u16)> =
-            load_names.iter().map(|n| (n.clone(), slots[n])).collect();
+        // A name already living in a function slot needs neither: its slot IS the
+        // variable, so seeding it from the (now stale) environment would clobber
+        // it, and writing it back is redundant.
+        let ns_loads: Vec<(String, u16)> = load_names
+            .iter()
+            .filter(|n| !self.fn_slots.contains_key(*n))
+            .map(|n| (n.clone(), slots[n]))
+            .collect();
+        // Every value entering the loop from outside is guarded, seeded or not.
+        let guard_slots: Vec<u16> = load_names.iter().map(|n| slots[n]).collect();
         let mut wb: Vec<(String, u16)> = Vec::new();
-        for name in &writes {
+        for name in writes.iter().filter(|n| !self.fn_slots.contains_key(*n)) {
             if !wb.iter().any(|(w, _)| w == name) {
                 wb.push((name.clone(), slots[name]));
             }
@@ -964,6 +1006,7 @@ impl Compiler {
             body,
             &ns_loads,
             &wb,
+            &guard_slots,
             &mut guard_jumps,
         );
         self.native_slots = None;
@@ -1006,7 +1049,7 @@ impl Compiler {
         b.emit(Op::SetSlot(target_slot), 0);
         self.compile_expr(b, stop_expr)?;
         b.emit(Op::SetSlot(stop_slot), 0);
-        self.emit_loop_core(b, target_slot, stop_slot, step, body, &[], &[], &mut Vec::new())
+        self.emit_loop_core(b, target_slot, stop_slot, step, body, &[], &[], &[], &mut Vec::new())
     }
 
     /// The shared counted-loop body: entry guard (empty range skips everything),
@@ -1023,6 +1066,7 @@ impl Compiler {
         body: &[Stmt],
         ns_loads: &[(String, u16)],
         ns_writebacks: &[(String, u16)],
+        guard_slots: &[u16],
         guard_jumps: &mut Vec<usize>,
     ) -> Result<(), String> {
         // Ascending ranges test `i < stop`, descending `i > stop`.
@@ -1043,7 +1087,10 @@ impl Compiler {
         // read proves it. A failing guard jumps to the generic copy of the loop
         // the caller emits (`compile_for`), so the fast path can assume ints
         // instead of the compiler having to prove them (see `IntNames::All`).
-        for (_, slot) in ns_loads {
+        // Guarded independently of the seed: a name the FUNCTION already keeps in
+        // a slot needs no load, but the body still assumes it is an integer, so
+        // it still has to be checked.
+        for slot in guard_slots {
             b.emit(Op::GetSlot(*slot), 0);
             b.emit(Op::CallBuiltin(ops::IS_INT, 1), 0);
             guard_jumps.push(b.emit(Op::JumpIfFalse(0), 0));
@@ -1355,18 +1402,35 @@ impl Compiler {
             return Ok(None);
         }
 
+        // Same rule as the counted loop: a function-slotted name keeps its slot,
+        // and loop temporaries are allocated above the function's range.
         let mut slots: HashMap<String, u16> = HashMap::new();
-        let mut next: u16 = 0;
+        let mut next: u16 = self.fn_slots.values().copied().max().map_or(0, |m| m + 1);
         for name in reads.iter().chain(writes.iter()) {
             if !slots.contains_key(name) {
-                slots.insert(name.clone(), next);
-                next += 1;
+                match self.fn_slots.get(name) {
+                    Some(s) => {
+                        slots.insert(name.clone(), *s);
+                    }
+                    None => {
+                        slots.insert(name.clone(), next);
+                        next += 1;
+                    }
+                }
             }
         }
-        let ns_loads: Vec<(String, u16)> =
-            load_names.iter().map(|n| (n.clone(), slots[n])).collect();
+        // A name already living in a function slot needs neither: its slot IS the
+        // variable, so seeding it from the (now stale) environment would clobber
+        // it, and writing it back is redundant.
+        let ns_loads: Vec<(String, u16)> = load_names
+            .iter()
+            .filter(|n| !self.fn_slots.contains_key(*n))
+            .map(|n| (n.clone(), slots[n]))
+            .collect();
+        // Every value entering the loop from outside is guarded, seeded or not.
+        let guard_slots: Vec<u16> = load_names.iter().map(|n| slots[n]).collect();
         let mut wb: Vec<(String, u16)> = Vec::new();
-        for name in &writes {
+        for name in writes.iter().filter(|n| !self.fn_slots.contains_key(*n)) {
             if !wb.iter().any(|(w, _)| w == name) {
                 wb.push((name.clone(), slots[name]));
             }
@@ -1414,7 +1478,55 @@ impl Compiler {
         }))
     }
 
+    /// Mark a loop target as bound for the duration of its body, returning the
+    /// names to un-mark afterwards.
+    ///
+    /// The loop assigns the target before every execution of the body, so a read
+    /// there needs no `CHECK_BOUND` — but a read AFTER the loop still does, since
+    /// an empty iterable leaves the name unbound. Scoping the promise to the body
+    /// is what makes `for i in ...: s += i` cost a bare `GetSlot` per access.
+    fn bind_loop_target(&mut self, target: &Expr) -> Vec<String> {
+        let mut added = Vec::new();
+        let mut mark = |c: &mut Self, n: &str| {
+            if c.fn_slots.contains_key(n) && c.fn_slots_bound.insert(n.to_string()) {
+                added.push(n.to_string());
+            }
+        };
+        match target.unspanned() {
+            Expr::Name(n) => mark(self, n),
+            Expr::Tuple(xs) | Expr::List(xs) => {
+                for x in xs {
+                    if let Expr::Name(n) = x.unspanned() {
+                        mark(self, n);
+                    }
+                }
+            }
+            _ => {}
+        }
+        added
+    }
+
+    fn unbind_loop_target(&mut self, added: Vec<String>) {
+        for n in added {
+            self.fn_slots_bound.remove(&n);
+        }
+    }
+
     fn compile_for(
+        &mut self,
+        b: &mut ChunkBuilder,
+        target: &Expr,
+        iter: &Expr,
+        body: &[Stmt],
+        orelse: &[Stmt],
+    ) -> Result<(), String> {
+        let bound_target = self.bind_loop_target(target);
+        let r = self.compile_for_inner(b, target, iter, body, orelse);
+        self.unbind_loop_target(bound_target);
+        return r;
+    }
+
+    fn compile_for_inner(
         &mut self,
         b: &mut ChunkBuilder,
         target: &Expr,
@@ -1866,8 +1978,70 @@ impl Compiler {
             self.func_scopes.push(bound);
             pushed = true;
         }
+        // Frame slots for this function's locals. Every access to a slotted name
+        // becomes a `Vec<Value>` index instead of a string hashed against the
+        // host environment chain; a name that does not qualify keeps the old
+        // path, so this is decided per NAME and a partly-slotted function is
+        // normal. Saved and restored so a nested function gets its own table.
+        let saved_slots = std::mem::take(&mut self.fn_slots);
+        let saved_bound = std::mem::take(&mut self.fn_slots_bound);
+        let is_gen_or_async = is_async || body_has_yield(body);
+        if kind == ScopeKind::Function && !is_gen_or_async && fn_slots_allowed(body) {
+            let mut next: u16 = 0;
+            let mut table: HashMap<String, u16> = HashMap::new();
+            // Parameters first: `bind_params` has already bound them, and the
+            // prologue below copies each into its slot.
+            for p in param_names(params) {
+                table.entry(p).or_insert_with(|| {
+                    let s = next;
+                    next += 1;
+                    s
+                });
+            }
+            for l in &locals {
+                // A free variable is resolved through the environment chain by
+                // whatever closes over it, so it cannot move into a slot.
+                if freevars.contains(l) {
+                    continue;
+                }
+                table.entry(l.clone()).or_insert_with(|| {
+                    let s = next;
+                    next += 1;
+                    s
+                });
+            }
+            let mut proven = provably_bound_locals(body);
+            for p in param_names(params) {
+                proven.insert(p);
+            }
+            self.fn_slots = table;
+            self.fn_slots_bound = proven;
+        }
         let mut fb = ChunkBuilder::new();
         self.begin_chunk();
+        // Prologue: seed each slot. Parameters come from the environment (bound
+        // by `bind_params` before this chunk runs); every other local starts as
+        // the never-assigned marker so a premature read still raises.
+        if !self.fn_slots.is_empty() {
+            let params_set: HashSet<String> = param_names(params).into_iter().collect();
+            let mut entries: Vec<(&String, &u16)> = self.fn_slots.iter().collect();
+            entries.sort_by_key(|(_, s)| **s);
+            let proven = self.fn_slots_bound.clone();
+            for (name, slot) in entries {
+                if params_set.contains(name) {
+                    self.name_const(&mut fb, name);
+                    fb.emit(Op::CallBuiltin(ops::GETLOCAL, 1), 0);
+                } else if proven.contains(name) {
+                    // Assigned before any read, so the marker would never be
+                    // observed — and leaving the prologue empty keeps the chunk
+                    // free of opaque builtin calls the JIT would have to bail on.
+                    continue;
+                } else {
+                    fb.emit(Op::CallBuiltin(ops::UNBOUND, 0), 0);
+                }
+                fb.emit(Op::SetSlot(*slot), 0);
+            }
+        }
         // A class body captures its simple annotations into `__annotations__`; a
         // nested def/class resets the flag so its own annotations don't leak into
         // the enclosing class's dict.
@@ -1882,6 +2056,8 @@ impl Compiler {
             fb.emit(Op::Pop, 0);
         }
         let compiled = self.compile_stmts(&mut fb, body);
+        self.fn_slots = saved_slots;
+        self.fn_slots_bound = saved_bound;
         self.in_class_body = saved_icb;
         if pushed {
             self.func_scopes.pop();
@@ -2252,8 +2428,16 @@ impl Compiler {
             Expr::FString(parts) => self.compile_fstring(b, parts)?,
             Expr::TString(parts) => self.compile_tstring(b, parts)?,
             Expr::Name(n) => {
-                if let Some(slot) = self.native_slots.as_ref().and_then(|m| m.get(n)) {
-                    b.emit(Op::GetSlot(*slot), self.cur_line);
+                if let Some(slot) = self.slot_of(n) {
+                    b.emit(Op::GetSlot(slot), self.cur_line);
+                    // A read the compiler could not prove is dominated by an
+                    // assignment still has to raise `UnboundLocalError` rather
+                    // than hand back the never-assigned marker.
+                    if self.fn_slots.contains_key(n) && !self.fn_slots_bound.contains(n) {
+                        self.name_const(b, n);
+                        b.emit(Op::Swap, 0);
+                        b.emit(Op::CallBuiltin(ops::CHECK_BOUND, 2), self.cur_line);
+                    }
                 } else {
                     self.name_const(b, n);
                     let idx = b.emit(Op::CallBuiltin(ops::GETLOCAL, 1), self.cur_line);
@@ -2887,6 +3071,26 @@ impl Compiler {
                     );
                 }
             }
+            // A callee that lives in a frame slot has to be pushed as a VALUE:
+            // the by-name `CALL` below resolves through the environment, which a
+            // slot is invisible to. A comprehension's target is exactly this —
+            // `[f() for f in fs]` calls its own loop variable.
+            Expr::Name(n) if self.slot_of(n).is_some() => {
+                self.compile_expr(b, func)?;
+                self.compile_seq(b, args)?;
+                if named.is_empty() {
+                    span_idx = b.emit(
+                        Op::CallBuiltin(ops::CALL_VALUE, argc(1 + args.len())?),
+                        self.cur_line,
+                    );
+                } else {
+                    build_kw(self, b)?;
+                    span_idx = b.emit(
+                        Op::CallBuiltin(ops::CALL_VALUE_KW, argc(2 + args.len())?),
+                        self.cur_line,
+                    );
+                }
+            }
             Expr::Name(n) => {
                 self.name_const(b, n);
                 self.compile_seq(b, args)?;
@@ -2975,6 +3179,13 @@ impl Compiler {
                 self.compile_arg_spread(b, args)?;
                 self.compile_kw_spread(b, keywords)?;
                 b.emit(Op::CallBuiltin(ops::CALL_METHOD_EX, 4), self.cur_line);
+            }
+            // Same as the plain call: a slotted callee is pushed as a value.
+            Expr::Name(n) if self.slot_of(n).is_some() => {
+                self.compile_expr(b, func)?;
+                self.compile_arg_spread(b, args)?;
+                self.compile_kw_spread(b, keywords)?;
+                b.emit(Op::CallBuiltin(ops::CALL_VALUE_EX, 3), self.cur_line);
             }
             Expr::Name(n) => {
                 self.name_const(b, n);
@@ -3611,6 +3822,194 @@ fn param_names(params: &Params) -> Vec<String> {
 /// stays at this scope level — it does not descend into a nested `def`/`class`/
 /// lambda body, each of which owns its own locals. Sorted for a stable bytecode
 /// cache key.
+/// Whether this function body can hold ANY of its locals in frame slots.
+///
+/// A slot is a `Vec<Value>` index in the VM running this chunk, so a name may
+/// only be slotted when every access to it happens in THAT chunk, in THIS
+/// activation. These constructs break one or the other and disqualify the whole
+/// function:
+///
+/// * a nested `def`/`lambda`/class body, or a comprehension (which lowers to a
+///   hidden function) — a closure resolves names through the environment chain,
+///   which cannot see a slot;
+/// * `try`/`with`, and a loop whose `break`/`continue` needs the signal form —
+///   all of these compile their body to a SEPARATE chunk that runs on its own VM,
+///   with its own slots;
+/// * `global`/`nonlocal`, `del name`, `import *`, and `locals()`/`vars()`/
+///   `eval()`/`exec()` — each reaches a local by name at runtime;
+/// * a generator or `async def`, whose body is parked on a coroutine stack.
+///
+/// Anything not disqualified keeps exactly the behavior it had; this only ever
+/// removes a hash lookup.
+/// Whether this function body can hold any of its locals in frame slots.
+///
+/// A slot is a `Vec<Value>` index in the VM running this chunk, so a name may
+/// only be slotted when every access to it happens in THAT chunk, in THIS
+/// activation. Three families of construct break one or the other:
+///
+/// * a nested `def`/`lambda`/class body or a comprehension (which lowers to a
+///   hidden function) — a closure resolves names through the environment chain,
+///   which cannot see a slot;
+/// * `try`/`with`, and a loop whose `break`/`continue` needs the signal form —
+///   each compiles its body to a SEPARATE chunk that runs on its own VM with its
+///   own slots;
+/// * `global`/`nonlocal`, `del`, and any mention of `locals`/`vars`/`eval`/
+///   `exec` — each reaches a local by name at runtime.
+///
+/// Generators and `async def` are excluded by the caller (their bodies park on a
+/// coroutine stack). A disqualified function compiles exactly as it did before,
+/// so this analysis can only ever remove work.
+fn fn_slots_allowed(body: &[Stmt]) -> bool {
+    if body_has_yield(body) {
+        return false;
+    }
+    let mut refs: HashSet<String> = HashSet::new();
+    for s in body {
+        collect_names_stmt(s, &mut refs);
+    }
+    if refs
+        .iter()
+        .any(|n| matches!(n.as_str(), "locals" | "vars" | "eval" | "exec"))
+    {
+        return false;
+    }
+    body.iter().all(stmt_slot_safe)
+}
+
+fn stmt_slot_safe(s: &Stmt) -> bool {
+    let exprs_ok = |es: &[&Expr]| es.iter().all(|e| expr_slot_safe(e));
+    match &s.kind {
+        StmtKind::FuncDef { .. }
+        | StmtKind::ClassDef { .. }
+        | StmtKind::Try { .. }
+        | StmtKind::With { .. }
+        | StmtKind::Global(_)
+        | StmtKind::Nonlocal(_)
+        | StmtKind::Delete(_) => false,
+        // The signal form of a loop compiles its body to a sub-chunk.
+        StmtKind::For { target, iter, body, orelse, is_async } => {
+            !*is_async
+                && !loop_needs_signal(body)
+                && exprs_ok(&[target, iter])
+                && body.iter().all(stmt_slot_safe)
+                && orelse.iter().all(stmt_slot_safe)
+        }
+        StmtKind::While { test, body, orelse } => {
+            !loop_needs_signal(body)
+                && expr_slot_safe(test)
+                && body.iter().all(stmt_slot_safe)
+                && orelse.iter().all(stmt_slot_safe)
+        }
+        StmtKind::If { test, body, orelse } => {
+            expr_slot_safe(test)
+                && body.iter().all(stmt_slot_safe)
+                && orelse.iter().all(stmt_slot_safe)
+        }
+        StmtKind::Expr(e) | StmtKind::Return(Some(e)) => expr_slot_safe(e),
+        StmtKind::Assign { targets, value } => {
+            targets.iter().all(expr_slot_safe) && expr_slot_safe(value)
+        }
+        StmtKind::AugAssign { target, value, .. } => {
+            expr_slot_safe(target) && expr_slot_safe(value)
+        }
+        StmtKind::AnnAssign { target, value, .. } => {
+            expr_slot_safe(target) && value.as_ref().is_none_or(expr_slot_safe)
+        }
+        StmtKind::Assert { test, msg } => {
+            expr_slot_safe(test) && msg.as_ref().is_none_or(expr_slot_safe)
+        }
+        StmtKind::Raise { exc, cause } => {
+            exc.as_ref().is_none_or(expr_slot_safe) && cause.as_ref().is_none_or(expr_slot_safe)
+        }
+        StmtKind::Return(None) | StmtKind::Pass | StmtKind::Break | StmtKind::Continue => true,
+        // Anything not enumerated (imports, `match`, …) keeps the old path.
+        _ => false,
+    }
+}
+
+/// Whether an expression opens a nested scope (a lambda or a comprehension) or
+/// suspends the frame.
+fn expr_slot_safe(e: &Expr) -> bool {
+    let all = |es: &[Expr]| es.iter().all(expr_slot_safe);
+    match e.unspanned() {
+        Expr::Lambda { .. }
+        | Expr::ListComp(..)
+        | Expr::SetComp(..)
+        | Expr::DictComp(..)
+        | Expr::GenExp(..)
+        | Expr::Yield(_)
+        | Expr::YieldFrom(_)
+        | Expr::Await(_) => false,
+        Expr::List(xs) | Expr::Tuple(xs) | Expr::Set(xs) | Expr::BoolOp(_, xs) => all(xs),
+        Expr::Dict(pairs) => pairs
+            .iter()
+            .all(|(k, v)| k.as_ref().is_none_or(expr_slot_safe) && expr_slot_safe(v)),
+        Expr::Starred(x) | Expr::UnaryOp(_, x) | Expr::Attribute(x, _) => expr_slot_safe(x),
+        Expr::BinOp(_, a, b) | Expr::Subscript(a, b) | Expr::NamedExpr(a, b) => {
+            expr_slot_safe(a) && expr_slot_safe(b)
+        }
+        Expr::Compare(a, rest) => expr_slot_safe(a) && rest.iter().all(|(_, x)| expr_slot_safe(x)),
+        Expr::IfExp { test, body, orelse } => {
+            expr_slot_safe(test) && expr_slot_safe(body) && expr_slot_safe(orelse)
+        }
+        Expr::Call { func, args, keywords } => {
+            expr_slot_safe(func)
+                && all(args)
+                && keywords.iter().all(|k| expr_slot_safe(&k.value))
+        }
+        Expr::Slice { lo, hi, step } => {
+            lo.as_ref().is_none_or(|x| expr_slot_safe(x))
+                && hi.as_ref().is_none_or(|x| expr_slot_safe(x))
+                && step.as_ref().is_none_or(|x| expr_slot_safe(x))
+        }
+        Expr::FString(parts) | Expr::TString(parts) => parts.iter().all(|p| match p {
+            FStrPart::Lit(_) => true,
+            FStrPart::Expr { expr, spec, .. } => {
+                expr_slot_safe(expr)
+                    && spec.iter().all(|s| match s {
+                        FStrPart::Lit(_) => true,
+                        FStrPart::Expr { expr, .. } => expr_slot_safe(expr),
+                    })
+            }
+        }),
+        _ => true,
+    }
+}
+
+/// The locals whose every read is dominated by an assignment, so a bare
+/// `GetSlot` needs no `CHECK_BOUND`.
+///
+/// Deliberately narrow: getting this wrong turns an `UnboundLocalError` into a
+/// silent `None`. A name qualifies only when a TOP-LEVEL `x = ...` — not one
+/// nested in an `if` or a loop, which may never run — precedes every mention of
+/// it in source order.
+fn provably_bound_locals(body: &[Stmt]) -> HashSet<String> {
+    let mut bound: HashSet<String> = HashSet::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for s in body {
+        if let StmtKind::Assign { targets, value } = &s.kind {
+            let mut vrefs = HashSet::new();
+            collect_names_expr(value, &mut vrefs);
+            for n in vrefs {
+                seen.insert(n);
+            }
+            for t in targets {
+                if let Expr::Name(n) = t.unspanned() {
+                    if !seen.contains(n) {
+                        bound.insert(n.clone());
+                    }
+                }
+            }
+        }
+        let mut refs = HashSet::new();
+        collect_names_stmt(s, &mut refs);
+        for n in refs {
+            seen.insert(n);
+        }
+    }
+    bound
+}
+
 fn scope_locals(body: &[Stmt]) -> Vec<String> {
     let mut bound = HashSet::new();
     let mut gdecl = HashSet::new();
