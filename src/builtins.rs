@@ -7018,7 +7018,7 @@ fn call_typing(f: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Resul
 ///
 /// Class depth and backslash escapes are tracked so a construct outside a class,
 /// or one that is already escaped, is left alone.
-fn rewrite_class_backspace(pattern: &str) -> std::borrow::Cow<'_, str> {
+fn rewrite_class_backspace(pattern: &str, verbose: bool) -> std::borrow::Cow<'_, str> {
     // Every rewrite happens inside a class, so a pattern with none is unchanged.
     if !pattern.contains('[') {
         return std::borrow::Cow::Borrowed(pattern);
@@ -7058,6 +7058,17 @@ fn rewrite_class_backspace(pattern: &str) -> std::borrow::Cow<'_, str> {
             // A literal `[` to Python; the start of a nested class to the crate.
             '[' if in_class => {
                 out.push_str("\\[");
+                i += 1;
+                continue;
+            }
+            // Under `re.VERBOSE` Python ignores whitespace in the pattern but NOT
+            // inside a character class, while the crate's `x` flag ignores it in
+            // both. `json`'s whitespace scanner is `[ \t\n\r]*` compiled with
+            // VERBOSE, so the space was silently dropped from the class and
+            // `json.loads` could not skip the space after a comma — every object
+            // with more than one key failed to parse.
+            c if verbose && in_class && (c == ' ' || c == '\t') => {
+                out.push_str(if c == ' ' { "\\x20" } else { "\\t" });
                 i += 1;
                 continue;
             }
@@ -7118,7 +7129,7 @@ fn re_compile_raw(pattern: &str, flags: i64) -> Result<crate::regexpr::PyRegex, 
     if flags & 64 != 0 {
         inline.push('x');
     }
-    let pattern = rewrite_class_backspace(pattern);
+    let pattern = rewrite_class_backspace(pattern, flags & 64 != 0);
     let full = if inline.is_empty() {
         pattern.to_string()
     } else {

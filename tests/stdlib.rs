@@ -1962,3 +1962,48 @@ fn a_dict_view_takes_set_operations_against_any_iterable() {
         "'TypeError'"
     );
 }
+
+#[test]
+fn verbose_mode_keeps_whitespace_inside_a_character_class() {
+    // Under `re.VERBOSE` Python ignores whitespace in the PATTERN but not inside
+    // a character class; the regex crate's `x` flag ignores it in both. `json`'s
+    // whitespace scanner is `[ \t\n\r]*` compiled with VERBOSE, so the space was
+    // silently dropped from the class and `json.loads` could not skip the space
+    // after a comma — every object with more than one key failed to parse.
+    assert_eq!(
+        g(r"import re
+x = re.compile(r'[ \t\n\r]*', re.VERBOSE).match('a  b', 1).end()", "x"),
+        "3"
+    );
+    assert_eq!(
+        g(r"import re
+x = re.findall(r'[ x]+', 'a x b', re.VERBOSE)", "x"),
+        "[' x ']"
+    );
+    // Whitespace OUTSIDE a class is still ignored.
+    assert_eq!(
+        g(r"import re
+x = re.findall(r'\d+  ', 'a12b', re.VERBOSE)", "x"),
+        "['12']"
+    );
+}
+
+#[cfg(not(feature = "stdlib-ffi"))]
+#[test]
+fn json_round_trips_objects_with_several_keys() {
+    // The whole point of the VERBOSE fix above: a second key in an object needs
+    // the whitespace scanner to skip the space after the comma.
+    assert_eq!(
+        g("import json\nx = json.loads('{\"a\": 1, \"bb\": 2}')", "x"),
+        "{'a': 1, 'bb': 2}"
+    );
+    assert_eq!(
+        g(
+            "import json\n\
+             o = {'users': [{'id': i, 'name': 'n%d' % i} for i in range(3)]}\n\
+             x = json.loads(json.dumps(o)) == o",
+            "x"
+        ),
+        "True"
+    );
+}
