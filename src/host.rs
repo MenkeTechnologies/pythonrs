@@ -1098,7 +1098,10 @@ pub struct Frame {
     /// name in this set resolves ONLY in `env`; if absent it is an
     /// `UnboundLocalError`, not an LEGB fall-through. Empty for the module frame
     /// and class-body frames (whose reads stay dynamic, giving `NameError`).
-    pub locals_set: HashSet<String>,
+    /// Shared by `Rc`: this is the callee's `FuncDef::locals` and never changes,
+    /// so a call borrows it instead of rebuilding the set (a per-call HashSet
+    /// allocation plus a String clone per local).
+    pub locals_set: Rc<HashSet<String>>,
     /// True for a class-body frame. A class scope is NOT an enclosing scope for
     /// nested functions (methods, comprehensions), so a closure defined here
     /// captures the class body's PARENT env, skipping the class namespace.
@@ -1142,7 +1145,14 @@ pub enum AttrCompletion {
 pub struct PyHost {
     heap: Vec<PyObj>,
     /// Function/lambda templates, indexed by def id.
-    pub funcs: Vec<FuncDef>,
+    /// Function definitions, shared by `Rc` so a call can take one without
+    /// copying its signature vectors (or its bytecode) — `run_user_func` does
+    /// this on every single Python call.
+    pub funcs: Vec<Rc<FuncDef>>,
+    /// `FuncDef::locals` as a ready-made set, one per entry of `funcs` and built
+    /// with it. A call clones the `Rc` into its frame instead of collecting the
+    /// set again (see `Frame::locals_set`).
+    pub func_locals: Vec<Rc<HashSet<String>>>,
     /// Class templates by name.
     pub classes: IndexMap<String, ClassDef>,
     /// try/except/finally block templates, indexed by try id.
@@ -1535,6 +1545,7 @@ impl PyHost {
         PyHost {
             heap: Vec::new(),
             funcs: Vec::new(),
+            func_locals: Vec::new(),
             classes: IndexMap::new(),
             tries: Vec::new(),
             module_globals: vec![IndexMap::new()],
@@ -1543,7 +1554,7 @@ impl PyHost {
                 env: module_env,
                 globals_decl: HashSet::new(),
                 nonlocals_decl: HashSet::new(),
-                locals_set: HashSet::new(),
+                locals_set: Rc::new(HashSet::new()),
                 is_class_body: false,
                 self_obj: None,
                 owner: None,
@@ -1660,7 +1671,11 @@ impl PyHost {
         (self.funcs.len(), self.tries.len())
     }
     pub fn load_program(&mut self, funcs: Vec<FuncDef>, tries: Vec<TryDef>) {
-        self.funcs.extend(funcs);
+        for f in funcs {
+            self.func_locals
+                .push(Rc::new(f.locals.iter().cloned().collect()));
+            self.funcs.push(Rc::new(f));
+        }
         self.tries.extend(tries);
     }
     pub fn try_def(&self, id: usize) -> Option<TryDef> {
@@ -9715,7 +9730,13 @@ pub fn run_user_func(
     // Python call — `fib(27)` cloned 400k copies of a 30-op chunk it then only
     // read through. The chunk is fetched by hand below, on the two paths that
     // genuinely need to own one.
-    let def = with_host(|h| h.funcs[fv.def_id].clone_meta());
+    // Two `Rc` bumps: no copy of the signature, the local set, or the body.
+    let (def, locals_rc) = with_host(|h| {
+        (
+            h.funcs[fv.def_id].clone(),
+            h.func_locals[fv.def_id].clone(),
+        )
+    });
     let def_id = fv.def_id;
     let self_val = self_opt.or_else(|| fv.bound.clone());
     let mut pos = args;
@@ -9744,7 +9765,7 @@ pub fn run_user_func(
     if def.is_async || def.is_generator {
         let saved_mod = with_host(|h| h.swap_module(fv.module));
         // These park the body on a coroutine stack, so they need an owned chunk.
-        let body = with_host(|h| h.funcs[def_id].chunk.clone());
+        let body = def.chunk.clone();
         let obj = if def.is_async {
             if def.is_generator {
                 make_async_generator(
@@ -9791,7 +9812,7 @@ pub fn run_user_func(
             env,
             globals_decl: HashSet::new(),
             nonlocals_decl: HashSet::new(),
-            locals_set: def.locals.iter().cloned().collect(),
+            locals_set: locals_rc,
             is_class_body: false,
             self_obj: frame_self,
             owner,
@@ -9801,7 +9822,7 @@ pub fn run_user_func(
         });
         saved
     });
-    let r = run_chunk_cached(def_id as u64, || with_host(|h| h.funcs[def_id].chunk.clone()));
+    let r = run_chunk_cached(def_id as u64, || def.chunk.clone());
     let sig = with_host(|h| {
         if r.is_err() {
             h.push_tb_frame();
@@ -10304,7 +10325,7 @@ fn run_class_body(name: &str, body_func: &Value) -> Result<IndexMap<String, Valu
             nonlocals_decl: HashSet::new(),
             // A class body resolves names dynamically (LOAD_NAME), so an unbound
             // read is a `NameError`, not `UnboundLocalError` — leave this empty.
-            locals_set: HashSet::new(),
+            locals_set: Rc::new(HashSet::new()),
             is_class_body: true,
             self_obj: None,
             owner: Some(name.to_string()),
@@ -11037,7 +11058,7 @@ fn make_gen_kind(
         env,
         globals_decl: HashSet::new(),
         nonlocals_decl: HashSet::new(),
-        locals_set: locals.into_iter().collect(),
+        locals_set: Rc::new(locals.into_iter().collect()),
         is_class_body: false,
         self_obj: self_val,
         owner: owner.clone(),
