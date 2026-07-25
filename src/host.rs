@@ -261,6 +261,34 @@ pub struct FuncDef {
     pub freevars: Vec<String>,
 }
 
+impl FuncDef {
+    /// Clone everything EXCEPT the bytecode, leaving `chunk` empty.
+    ///
+    /// A call needs the signature, the name and the local/free-variable sets; it
+    /// reads the body through the VM, which gets its own copy (usually a pooled
+    /// one — see `run_chunk_cached`). `clone()` here would copy the whole `Chunk`
+    /// per call, which on a recursive function is most of the runtime.
+    pub fn clone_meta(&self) -> FuncDef {
+        FuncDef {
+            name: self.name.clone(),
+            qualname: self.qualname.clone(),
+            params: self.params.clone(),
+            posonly: self.posonly,
+            ndefaults: self.ndefaults,
+            star: self.star.clone(),
+            kwonly: self.kwonly.clone(),
+            kwonly_required: self.kwonly_required.clone(),
+            kwargs: self.kwargs.clone(),
+            chunk: Chunk::default(),
+            locals: self.locals.clone(),
+            is_generator: self.is_generator,
+            is_async: self.is_async,
+            doc: self.doc.clone(),
+            freevars: self.freevars.clone(),
+        }
+    }
+}
+
 /// A compiled lambda/comprehension body (same shape, unnamed).
 pub type ProcDef = FuncDef;
 
@@ -1460,6 +1488,11 @@ pub fn with_host<R>(f: impl FnOnce(&mut PyHost) -> R) -> R {
 /// Reset the host to a clean slate (fresh module frame).
 pub fn reset_host() {
     with_host(|h| *h = PyHost::new());
+    // The VM pool is keyed by `def_id`, which indexes the host's function table —
+    // a table this call restarts at zero. A VM left over from the previous
+    // program would be handed to whatever function takes that id next, running
+    // the OLD body. Drop them with the table they belong to.
+    VM_POOL.with(|p| p.borrow_mut().clear());
     async_rt::reset();
 }
 
@@ -2573,8 +2606,39 @@ pub fn repr_guard_leave(id: u32) {
     });
 }
 
+thread_local! {
+    /// Recycled VMs, keyed by the chunk they already hold.
+    ///
+    /// EVERY Python function call runs its body on a VM, and building one is far
+    /// from free: `VM::new` allocates the stack/frame/globals vectors and
+    /// `builtins::install` registers ~80 builtin handlers — per call. `fib(27)`
+    /// paid that 400k times. `VM::reset` clears only execution state and keeps
+    /// the builtin table, the numeric hook, the JIT flag, and every vector's
+    /// capacity.
+    ///
+    /// Keyed by `op_hash` rather than one flat pool so a repeat call to the same
+    /// function gets a VM that ALREADY holds its chunk: `run_chunk_on` hands that
+    /// chunk straight back to `reset` (a move, not a copy), so the bytecode is
+    /// cloned once per function instead of once per call. Each key holds a stack
+    /// of VMs, so recursion — which needs the same chunk live at several depths
+    /// at once — just pops another one.
+    static VM_POOL: RefCell<HashMap<u64, Vec<VM>>> = RefCell::new(HashMap::new());
+}
+
 /// Register every pythonrs builtin + the numeric hook on a VM, then run it.
+///
+/// This is the ONE-SHOT path — the module body, a generator resume, an `exec`.
+/// It builds a VM and drops it, which is the right trade when the chunk runs
+/// once: pooling a chunk that is never re-entered only adds bookkeeping, and it
+/// measurably slowed container-heavy top-level code. Repeated calls to the same
+/// function go through `run_chunk_cached` instead.
 pub fn run_chunk_on(chunk: Chunk) -> Result<Value, String> {
+    let mut vm = new_configured_vm(chunk);
+    finish_run(&mut vm, None)
+}
+
+/// Build a VM with pythonrs's builtins, numeric hook, and JIT/debug wiring.
+fn new_configured_vm(chunk: Chunk) -> VM {
     let mut vm = VM::new(chunk);
     crate::builtins::install(&mut vm);
     vm.set_numeric_hook(std::sync::Arc::new(|op, a, b| {
@@ -2587,22 +2651,65 @@ pub fn run_chunk_on(chunk: Chunk) -> Result<Value, String> {
     } else {
         vm.enable_tracing_jit();
     }
+    vm
+}
+
+/// Run `vm` to completion and translate the outcome, recycling it into the pool
+/// under `pool_key` when one is given.
+fn finish_run(vm: &mut VM, pool_key: Option<u64>) -> Result<Value, String> {
     let outcome = vm.run();
+    let halted_top = matches!(outcome, VMResult::Halted)
+        .then(|| vm.stack.last().cloned().unwrap_or(Value::Undef));
+    if let VMResult::Error(_) = &outcome {
+        // A native fast-path op (Add/Sub/Mul/Negate/comparisons) raised via the
+        // VM directly, not through a pythonrs builtin's `abort`, so the failing
+        // op's line/caret span was never recorded. Capture it here from the
+        // still-valid `ip` before unwinding.
+        crate::builtins::record_err_line(vm);
+    }
+    if let Some(key) = pool_key {
+        // A suspended generator parks its VM on the coroutine stack instead — it
+        // only reaches here once `run` has returned, so a recycled VM is never
+        // one some frame is still executing on.
+        let spent = std::mem::replace(vm, VM::new(Chunk::default()));
+        VM_POOL.with(|p| p.borrow_mut().entry(key).or_default().push(spent));
+    }
     if let Some(e) = with_host(|h| h.take_error()) {
         return Err(e);
     }
     match outcome {
         VMResult::Ok(v) => Ok(v),
-        VMResult::Halted => Ok(vm.stack.last().cloned().unwrap_or(Value::Undef)),
-        VMResult::Error(e) => {
-            // A native fast-path op (Add/Sub/Mul/Negate/comparisons) raised via the
-            // VM directly, not through a pythonrs builtin's `abort`, so the failing
-            // op's line/caret span was never recorded. Capture it here from the
-            // still-valid `ip` before unwinding.
-            crate::builtins::record_err_line(&vm);
-            Err(e)
-        }
+        VMResult::Halted => Ok(halted_top.unwrap_or(Value::Undef)),
+        VMResult::Error(e) => Err(e),
     }
+}
+
+/// The same, but the chunk is produced only if the pool has no VM holding it.
+///
+/// `key` is the callee's `def_id` — an index into the host's function table,
+/// which `load_program` only ever EXTENDS, so ids are stable and unique for the
+/// life of a host. `reset_host` clears the pool along with that table.
+///
+/// Keying by `Chunk::op_hash` instead does not work: it is `serde(skip)` (0 for
+/// any deserialized chunk) and covers only ops and constants, not the name pool,
+/// so two same-shaped functions from different modules would share a bucket and
+/// one would run with the other's globals.
+/// so on a hit there is nothing to build: the caller's `make` is never called and
+/// no bytecode is copied. That is what turns a Python call from "clone the
+/// function body, run it, drop the copy" into "reset a VM and run".
+pub fn run_chunk_cached(key: u64, make: impl FnOnce() -> Chunk) -> Result<Value, String> {
+    let pooled = VM_POOL.with(|p| p.borrow_mut().get_mut(&key).and_then(|v| v.pop()));
+    let mut vm = match pooled {
+        Some(mut vm) => {
+            // Hand the VM its own chunk straight back — `reset` moves it, so this
+            // is a pointer swap rather than a copy of the bytecode.
+            let own = std::mem::take(&mut vm.chunk);
+            vm.reset(own);
+            vm
+        }
+        None => new_configured_vm(make()),
+    };
+    finish_run(&mut vm, Some(key))
 }
 
 /// Run the top-level program chunk.
@@ -9603,7 +9710,13 @@ pub fn run_user_func(
     args: Vec<Value>,
     kwargs: Vec<(String, Value)>,
 ) -> Result<Value, String> {
-    let def = with_host(|h| h.funcs[fv.def_id].clone());
+    // Clone the function's METADATA, never its bytecode. `FuncDef::clone` copies
+    // the whole `Chunk` (ops, constants, names), and this runs on every single
+    // Python call — `fib(27)` cloned 400k copies of a 30-op chunk it then only
+    // read through. The chunk is fetched by hand below, on the two paths that
+    // genuinely need to own one.
+    let def = with_host(|h| h.funcs[fv.def_id].clone_meta());
+    let def_id = fv.def_id;
     let self_val = self_opt.or_else(|| fv.bound.clone());
     let mut pos = args;
     if let Some(s) = &self_val {
@@ -9630,10 +9743,12 @@ pub fn run_user_func(
     // then restore the caller's before handing the object back.
     if def.is_async || def.is_generator {
         let saved_mod = with_host(|h| h.swap_module(fv.module));
+        // These park the body on a coroutine stack, so they need an owned chunk.
+        let body = with_host(|h| h.funcs[def_id].chunk.clone());
         let obj = if def.is_async {
             if def.is_generator {
                 make_async_generator(
-                    def.chunk.clone(),
+                    body,
                     env,
                     self_val,
                     owner,
@@ -9642,7 +9757,7 @@ pub fn run_user_func(
                 )
             } else {
                 make_coroutine(
-                    def.chunk.clone(),
+                    body,
                     env,
                     self_val,
                     owner,
@@ -9652,7 +9767,7 @@ pub fn run_user_func(
             }
         } else {
             make_generator(
-                def.chunk.clone(),
+                body,
                 env,
                 self_val,
                 owner,
@@ -9686,7 +9801,7 @@ pub fn run_user_func(
         });
         saved
     });
-    let r = run_chunk_on(def.chunk.clone());
+    let r = run_chunk_cached(def_id as u64, || with_host(|h| h.funcs[def_id].chunk.clone()));
     let sig = with_host(|h| {
         if r.is_err() {
             h.push_tb_frame();
