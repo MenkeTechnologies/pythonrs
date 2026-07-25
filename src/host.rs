@@ -820,9 +820,22 @@ pub enum PyObj {
         sentinel: Value,
         done: bool,
     },
+    /// An imported module. The namespace is NOT stored here — it is the module's
+    /// globals slot (`PyHost::module_globals[slot]`), the very map the module's own
+    /// functions resolve globals against. Holding a snapshot instead let the two
+    /// drift: `base64.binascii = None` rebound the attribute while `b64encode` kept
+    /// reading the original, so monkeypatching a module silently did nothing.
     Module {
         name: String,
-        ns: IndexMap<String, Value>,
+        slot: usize,
+    },
+    /// A module's `__dict__`: a live view of its globals slot, not a copy. CPython
+    /// hands back the real namespace dict, and code relies on writing through it —
+    /// `enum.global_enum` publishes an enum's members into its defining module with
+    /// `sys.modules[mod].__dict__.update(...)`, which is how `calendar.JANUARY` and
+    /// `calendar.MONDAY` come to exist. A snapshot would drop those on the floor.
+    ModuleDict {
+        slot: usize,
     },
     BigInt(num_bigint::BigInt),
     Complex(f64, f64),
@@ -1181,6 +1194,8 @@ pub struct PyHost {
     /// exactly as CPython's `func.__globals__ is module.__dict__`. The slot for an
     /// imported module is kept alive after import for this reason.
     module_globals: Vec<IndexMap<String, Value>>,
+    /// One `__dict__` view per module slot, so `mod.__dict__ is mod.__dict__`.
+    module_dicts: HashMap<usize, Value>,
     /// The module whose globals the currently-running code resolves against —
     /// swapped around every function call, class body, and generator resume.
     cur_module: usize,
@@ -1572,6 +1587,7 @@ impl PyHost {
             classes: IndexMap::new(),
             tries: Vec::new(),
             module_globals: vec![IndexMap::new()],
+            module_dicts: HashMap::new(),
             cur_module: 0,
             frames: vec![Frame {
                 env: module_env,
@@ -2207,10 +2223,31 @@ impl PyHost {
         String::new()
     }
 
-    /// Set attribute `name = val` on a module object (its `ns` map).
+    /// The globals slot backing a module object, if `v` is one.
+    #[inline]
+    pub fn module_slot(&self, v: &Value) -> Option<usize> {
+        match self.get(v) {
+            Some(PyObj::Module { slot, .. }) => Some(*slot),
+            _ => None,
+        }
+    }
+
+    /// A specific module's namespace — the same map its functions read globals
+    /// from, so a write here is visible to the module's own code.
+    #[inline]
+    pub fn module_ns(&self, slot: usize) -> &IndexMap<String, Value> {
+        &self.module_globals[slot]
+    }
+
+    #[inline]
+    pub fn module_ns_mut(&mut self, slot: usize) -> &mut IndexMap<String, Value> {
+        &mut self.module_globals[slot]
+    }
+
+    /// Set attribute `name = val` on a module object.
     pub fn set_module_attr(&mut self, module: &Value, name: &str, val: Value) {
-        if let Some(PyObj::Module { ns, .. }) = self.get_mut(module) {
-            ns.insert(name.to_string(), val);
+        if let Some(slot) = self.module_slot(module) {
+            self.module_globals[slot].insert(name.to_string(), val);
         }
     }
 
@@ -2249,6 +2286,43 @@ impl PyHost {
 
     pub fn read_global(&self, name: &str) -> Option<Value> {
         self.globals().get(name).cloned()
+    }
+
+    /// The `__dict__` view of module slot `slot`, allocated once and reused so the
+    /// identity is stable (`mod.__dict__ is mod.__dict__`, as in CPython).
+    pub fn module_dict(&mut self, slot: usize) -> Value {
+        if let Some(v) = self.module_dicts.get(&slot) {
+            return v.clone();
+        }
+        let v = self.alloc(PyObj::ModuleDict { slot });
+        self.module_dicts.insert(slot, v.clone());
+        v
+    }
+
+    /// If `v` is a module `__dict__` view, a plain dict holding the same entries.
+    /// Read-only operations answer from this copy rather than duplicating every
+    /// dict code path; the mutators write through to the slot instead.
+    pub fn module_dict_snapshot(&mut self, v: &Value) -> Option<Value> {
+        let slot = match self.get(v) {
+            Some(PyObj::ModuleDict { slot }) => *slot,
+            _ => return None,
+        };
+        let pairs = self.module_globals_pairs(slot);
+        let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::with_capacity(pairs.len());
+        for (k, val) in pairs {
+            let kv = self.new_str(k.clone());
+            d.insert(PKey::Str(k), (kv, val));
+        }
+        Some(self.new_dict(d))
+    }
+
+    /// The module slot a `__dict__` view writes through to.
+    #[inline]
+    pub fn module_dict_slot(&self, v: &Value) -> Option<usize> {
+        match self.get(v) {
+            Some(PyObj::ModuleDict { slot }) => Some(*slot),
+            _ => None,
+        }
     }
 
     /// Look `name` up along a specific captured env chain (for `__closure__`
@@ -2363,8 +2437,8 @@ impl PyHost {
     /// defines one, otherwise every namespace entry whose name does not begin with
     /// `_`. Returns `(name, value)` pairs for the caller to bind.
     pub fn import_star_bindings(&mut self, module: &Value) -> Result<Vec<(String, Value)>, String> {
-        match self.get(module).cloned() {
-            Some(PyObj::Module { ns, .. }) => {
+        match self.module_slot(module).map(|s| self.module_globals[s].clone()) {
+            Some(ns) => {
                 if let Some(all) = ns.get("__all__").cloned() {
                     let mut out = Vec::new();
                     for n in self.str_sequence(&all)? {
@@ -2465,7 +2539,9 @@ impl PyHost {
             PyObj::Frozenset(_) => Some(AttrCompletion::BuiltinType("frozenset")),
             PyObj::BigInt(_) => Some(AttrCompletion::BuiltinType("int")),
             // A module (`import math`) → its own namespace members.
-            PyObj::Module { ns, .. } => Some(AttrCompletion::Names(ns.keys().cloned().collect())),
+            PyObj::Module { slot, .. } => Some(AttrCompletion::Names(
+                self.module_globals[*slot].keys().cloned().collect(),
+            )),
             // A user instance → its instance attributes plus every method /
             // class attribute reachable along the MRO.
             PyObj::Instance(i) => {
@@ -2938,6 +3014,8 @@ impl PyHost {
                 Some(PyObj::EnumerateObj { .. }) => "enumerate".into(),
                 Some(PyObj::CallIter { .. }) => "callable_iterator".into(),
                 Some(PyObj::Module { .. }) => "module".into(),
+                // A `__dict__` view IS a dict as far as Python can tell.
+                Some(PyObj::ModuleDict { .. }) => "dict".into(),
                 Some(PyObj::BigInt(_)) => "int".into(),
                 Some(PyObj::Complex(..)) => "complex".into(),
                 Some(PyObj::Generator { id }) => match self.generators[*id as usize].kind {
@@ -3197,6 +3275,13 @@ impl PyHost {
                 Some(PyObj::BoundMethod { .. }) => "<bound method>".into(),
                 Some(PyObj::Exception { class, args }) => self.exc_str(class, args),
                 Some(PyObj::Module { name, .. }) => format!("<module '{name}'>"),
+                Some(PyObj::ModuleDict { slot }) => {
+                    let items: Vec<String> = self.module_globals[*slot]
+                        .iter()
+                        .map(|(k, v)| format!("{}: {}", quote_str(k), self.repr_of(v)))
+                        .collect();
+                    format!("{{{}}}", items.join(", "))
+                }
                 Some(PyObj::Range { start, stop, step }) => {
                     if *step == 1 {
                         format!("range({start}, {stop})")
@@ -3693,6 +3778,12 @@ impl PyHost {
                     }
                     (Some(PyObj::Deque { items: x, .. }), Some(PyObj::Deque { items: y, .. })) => {
                         x.len() == y.len() && x.iter().zip(y).all(|(p, q)| self.equal(p, q))
+                    }
+                    // Two unions are equal iff they hold the same members, order
+                    // irrelevant: `int | str == str | int`, as in CPython.
+                    (Some(PyObj::Union { args: x }), Some(PyObj::Union { args: y })) => {
+                        x.len() == y.len()
+                            && x.iter().all(|p| y.iter().any(|q| self.equal(p, q)))
                     }
                     // Two ranges are equal iff they yield the same sequence: same
                     // length, and (empty, or same start and (len 1 or same step)).
@@ -5167,16 +5258,9 @@ impl PyHost {
                     if let (Some(mut xs), Some(ys)) =
                         (self.union_members(a), self.union_members(b))
                     {
-                        for y in ys {
-                            if !xs.iter().any(|x| self.equal(x, &y)) {
-                                xs.push(y);
-                            }
-                        }
-                        // `int | int` collapses to the single type, as in CPython.
-                        if xs.len() == 1 {
-                            return Ok(xs.into_iter().next().unwrap());
-                        }
-                        return Ok(self.alloc(PyObj::Union { args: xs }));
+                        xs.extend(ys);
+                        // Dedupes, and collapses `int | int` to the single type.
+                        return Ok(self.build_union(xs));
                     }
                 }
                 Err(self.optype_err("bitop", a, b))
@@ -6028,6 +6112,10 @@ impl PyHost {
 
     /// `recv[idx]`.
     pub fn get_item(&mut self, recv: &Value, idx: &Value) -> Result<Value, String> {
+        // A module `__dict__` view answers reads from a snapshot of the slot.
+        if let Some(d) = self.module_dict_snapshot(recv) {
+            return self.get_item(&d, idx);
+        }
         #[cfg(feature = "stdlib-ffi")]
         if let Some(id) = self.foreign_id(recv) {
             return crate::ffi::get_item(self, id, idx);
@@ -6154,11 +6242,48 @@ impl PyHost {
                 }
                 Ok(Value::Int(bytes[k as usize] as i64))
             }
+            // `typing.Union[X, Y]`. Since 3.14 `typing.Union` IS `types.UnionType`,
+            // so subscripting it builds exactly what `X | Y` builds — same flatten,
+            // same dedupe, same collapse-to-one. `Union[int]` is `int`, and a Union
+            // of nothing is an error rather than an empty union.
+            Some(PyObj::Builtin(n)) if n == "_typing.Union" => {
+                let items = match self.get(idx) {
+                    Some(PyObj::Tuple(xs)) => xs.clone(),
+                    _ => vec![idx.clone()],
+                };
+                if items.is_empty() {
+                    return Err(type_error("Cannot take a Union of no types."));
+                }
+                Ok(self.build_union(items))
+            }
             _ => Err(type_error(&format!(
                 "'{}' object is not subscriptable",
                 self.type_name(recv)
             ))),
         }
+    }
+
+    /// Flatten nested unions, drop duplicates, and collapse a one-member result to
+    /// that member. Shared by PEP 604 `X | Y` and `typing.Union[X, Y]` so the two
+    /// spellings can never disagree.
+    fn build_union(&mut self, items: Vec<Value>) -> Value {
+        let mut args: Vec<Value> = Vec::with_capacity(items.len());
+        for item in items {
+            // A nested union contributes its members, not itself.
+            let members = match self.get(&item) {
+                Some(PyObj::Union { args }) => args.clone(),
+                _ => vec![item],
+            };
+            for m in members {
+                if !args.iter().any(|x| self.equal(x, &m)) {
+                    args.push(m);
+                }
+            }
+        }
+        if args.len() == 1 {
+            return args.into_iter().next().unwrap();
+        }
+        self.alloc(PyObj::Union { args })
     }
 
     fn get_slice(
@@ -6322,6 +6447,15 @@ impl PyHost {
 
     /// `recv[idx] = val`.
     pub fn set_item(&mut self, recv: &Value, idx: &Value, val: Value) -> Result<(), String> {
+        // A module `__dict__` view writes THROUGH to the module's globals, so the
+        // module's own functions see the new binding.
+        if let Some(slot) = self.module_dict_slot(recv) {
+            let k = self
+                .as_str(idx)
+                .ok_or_else(|| type_error("module namespace keys must be strings"))?;
+            self.module_globals[slot].insert(k, val);
+            return Ok(());
+        }
         match self.get(recv) {
             Some(PyObj::List(l)) => {
                 let n = l.len() as i64;
@@ -6374,6 +6508,15 @@ impl PyHost {
     }
 
     pub fn del_item(&mut self, recv: &Value, idx: &Value) -> Result<(), String> {
+        if let Some(slot) = self.module_dict_slot(recv) {
+            let k = self
+                .as_str(idx)
+                .ok_or_else(|| type_error("module namespace keys must be strings"))?;
+            return match self.module_globals[slot].shift_remove(&k) {
+                Some(_) => Ok(()),
+                None => Err(format!("KeyError: '{k}'")),
+            };
+        }
         // Slice deletion: `del x[i:j]`, `del x[::k]`.
         if let Some(PyObj::Slice { lo, hi, step }) = self.get(idx) {
             let (lo, hi, step) = (lo.clone(), hi.clone(), step.clone());
@@ -6608,6 +6751,9 @@ impl PyHost {
     /// Materialize an iterable into a Vec of values (for `for`, comprehensions,
     /// `list()`, unpacking, …).
     pub fn iter_items(&mut self, v: &Value) -> Result<Vec<Value>, String> {
+        if let Some(d) = self.module_dict_snapshot(v) {
+            return self.iter_items(&d);
+        }
         // Iterating a file yields its remaining lines (each keeping its `\n`).
         // Read first (drops the immutable borrow) so `new_str` can borrow `&mut`.
         let file_id = match self.get(v) {
@@ -6862,6 +7008,9 @@ impl PyHost {
 
     /// `item in container`.
     pub fn contains(&mut self, item: &Value, container: &Value) -> Result<bool, String> {
+        if let Some(d) = self.module_dict_snapshot(container) {
+            return self.contains(item, &d);
+        }
         #[cfg(feature = "stdlib-ffi")]
         if let Some(id) = self.foreign_id(container) {
             return crate::ffi::contains(self, id, item);
@@ -7220,9 +7369,28 @@ impl PyHost {
         // the real CPython module over the FFI bridge. Resolved before the
         // borrowing match below because the fallback needs `&mut self`.
         let module_lookup = match self.get(recv) {
-            Some(PyObj::Module { ns, name: mname }) => Some((ns.get(name).cloned(), mname.clone())),
+            Some(PyObj::Module { slot, name: mname }) => Some((
+                self.module_globals[*slot].get(name).cloned(),
+                mname.clone(),
+                *slot,
+            )),
             _ => None,
         };
+        if let Some((hit, _, slot)) = &module_lookup {
+            // `mod.__dict__` is the live namespace, and it wins over any binding
+            // the module happens to have made under that name.
+            if name == "__dict__" {
+                let slot = *slot;
+                return Ok(self.module_dict(slot));
+            }
+            // Every module answers `__name__` even when its body never set one
+            // (native modules do not run a body at all).
+            if name == "__name__" && hit.is_none() {
+                let n = module_lookup.as_ref().unwrap().1.clone();
+                return Ok(self.new_str(n));
+            }
+        }
+        let module_lookup = module_lookup.map(|(hit, mname, _)| (hit, mname));
         if let Some((hit, mname)) = module_lookup {
             return match hit {
                 Some(v) => Ok(v),
@@ -7494,9 +7662,9 @@ impl PyHost {
             }
             // Modules are fully resolved up-front (see the block before this
             // match) so the FFI fallback can take `&mut self`; unreachable here.
-            Some(PyObj::Module { ns, name: mname }) => {
-                let mname = mname.clone();
-                match ns.get(name) {
+            Some(PyObj::Module { slot, name: mname }) => {
+                let (mname, slot) = (mname.clone(), *slot);
+                match self.module_globals[slot].get(name) {
                     Some(v) => Ok(v.clone()),
                     None => Err(format!(
                         "AttributeError: module '{mname}' has no attribute '{name}'"
@@ -8262,6 +8430,27 @@ impl PyHost {
                         };
                     }
                 }
+            } else {
+                // Not on the class itself: a `property` on the METACLASS is a data
+                // descriptor for the class object, invoked with the class as its
+                // instance. `EnumType.__members__` is one — `Month.__members__`
+                // has to run the getter, not hand back the property object.
+                let meta = self
+                    .classes
+                    .get(&cname)
+                    .map(|c| c.metaclass.clone())
+                    .unwrap_or_else(|| "type".into());
+                if meta != "type" {
+                    if let Some(v) = self.class_lookup(&meta, name) {
+                        if let Some(PyObj::Property { fget, .. }) = self.get(&v) {
+                            return AttrGet::Property {
+                                fget: fget.clone(),
+                                inst: recv.clone(),
+                                owner: method_owner(self, &meta, name),
+                            };
+                        }
+                    }
+                }
             }
             return AttrGet::Plain;
         }
@@ -8449,11 +8638,11 @@ impl PyHost {
                 return Ok(());
             }
         }
+        if let Some(slot) = self.module_slot(recv) {
+            self.module_globals[slot].insert(name.to_string(), val);
+            return Ok(());
+        }
         match self.get_mut(recv) {
-            Some(PyObj::Module { ns, .. }) => {
-                ns.insert(name.to_string(), val);
-                Ok(())
-            }
             Some(PyObj::Class(cname)) => {
                 let cname = cname.clone();
                 if let Some(cd) = self.classes.get_mut(&cname) {
@@ -8580,12 +8769,13 @@ impl PyHost {
                 *name = key;
             }
         }
-        // `__module__` is the `__name__` of the module whose body is defining the
-        // class (the currently-running module scope).
-        let module = self
-            .globals()
-            .get("__name__")
+        // `__module__` comes from the class BODY namespace (`run_class_body` puts
+        // it there from the defining module), falling back to the running module
+        // for a bare registration that never ran a body.
+        let module = ns
+            .get("__module__")
             .and_then(|v| self.as_str(v))
+            .or_else(|| self.globals().get("__name__").cloned().and_then(|v| self.as_str(&v)))
             .unwrap_or_else(|| "__main__".to_string());
         self.classes.insert(
             key.clone(),
@@ -9072,12 +9262,135 @@ fn base_super_init(
 }
 
 /// `recv.name(args)`.
+/// Methods on a module's `__dict__`. Writes land in the module's globals slot so
+/// the module's own code sees them — `enum.global_enum` publishing an enum's
+/// members into `calendar` depends on exactly that. Reads are delegated to the
+/// ordinary dict methods over a snapshot.
+fn module_dict_method(
+    slot: usize,
+    recv: &Value,
+    name: &str,
+    args: Vec<Value>,
+    kwargs: Vec<(String, Value)>,
+) -> Result<Value, String> {
+    match name {
+        "update" => {
+            // `update(other, **kw)`: a mapping contributes its items, any other
+            // iterable its key/value pairs.
+            let mut pairs: Vec<(String, Value)> = Vec::new();
+            if let Some(src) = args.first() {
+                let items = match with_host(|h| h.get(src).cloned()) {
+                    Some(PyObj::Dict(d)) => {
+                        d.values().map(|(k, v)| (k.clone(), v.clone())).collect()
+                    }
+                    _ if with_host(|h| h.module_dict_slot(src)).is_some() => {
+                        let s = with_host(|h| h.module_dict_slot(src)).unwrap();
+                        with_host(|h| {
+                            h.module_globals_pairs(s)
+                                .into_iter()
+                                .map(|(k, v)| (h.new_str(k), v))
+                                .collect::<Vec<_>>()
+                        })
+                    }
+                    // Fall back to the mapping protocol, then to pair-iteration.
+                    _ => match call_method(src, "items", vec![], vec![]) {
+                        Ok(items) => {
+                            let mut out = Vec::new();
+                            for it in iter_vec(&items)? {
+                                let kv = iter_vec(&it)?;
+                                if kv.len() != 2 {
+                                    return Err(type_error(
+                                        "dictionary update sequence element has length != 2",
+                                    ));
+                                }
+                                out.push((kv[0].clone(), kv[1].clone()));
+                            }
+                            out
+                        }
+                        Err(_) => {
+                            let mut out = Vec::new();
+                            for it in iter_vec(src)? {
+                                let kv = iter_vec(&it)?;
+                                if kv.len() != 2 {
+                                    return Err(type_error(
+                                        "dictionary update sequence element has length != 2",
+                                    ));
+                                }
+                                out.push((kv[0].clone(), kv[1].clone()));
+                            }
+                            out
+                        }
+                    },
+                };
+                for (k, v) in items {
+                    let ks = with_host(|h| h.as_str(&k))
+                        .ok_or_else(|| type_error("module namespace keys must be strings"))?;
+                    pairs.push((ks, v));
+                }
+            }
+            for (k, v) in kwargs {
+                pairs.push((k, v));
+            }
+            with_host(|h| {
+                for (k, v) in pairs {
+                    h.module_globals[slot].insert(k, v);
+                }
+            });
+            Ok(Value::Undef)
+        }
+        "setdefault" => {
+            let k = with_host(|h| args.first().and_then(|a| h.as_str(a)))
+                .ok_or_else(|| type_error("module namespace keys must be strings"))?;
+            let default = args.get(1).cloned().unwrap_or(Value::Undef);
+            Ok(with_host(|h| {
+                h.module_globals[slot].entry(k).or_insert(default).clone()
+            }))
+        }
+        "pop" => {
+            let k = with_host(|h| args.first().and_then(|a| h.as_str(a)))
+                .ok_or_else(|| type_error("module namespace keys must be strings"))?;
+            match with_host(|h| h.module_globals[slot].shift_remove(&k)) {
+                Some(v) => Ok(v),
+                None => match args.get(1) {
+                    Some(d) => Ok(d.clone()),
+                    None => Err(format!("KeyError: '{k}'")),
+                },
+            }
+        }
+        "popitem" => {
+            match with_host(|h| h.module_globals[slot].pop()) {
+                Some((k, v)) => Ok(with_host(|h| {
+                    let kv = h.new_str(k);
+                    h.new_tuple(vec![kv, v])
+                })),
+                None => Err("KeyError: 'popitem(): dictionary is empty'".into()),
+            }
+        }
+        "clear" => {
+            with_host(|h| h.module_globals[slot].clear());
+            Ok(Value::Undef)
+        }
+        // Pure reads: the snapshot answers exactly as a real dict would.
+        _ => {
+            let snap = with_host(|h| h.module_dict_snapshot(recv))
+                .ok_or_else(|| type_error("not a module namespace"))?;
+            call_method(&snap, name, args, kwargs)
+        }
+    }
+}
+
 pub fn call_method(
     recv: &Value,
     name: &str,
     args: Vec<Value>,
     kwargs: Vec<(String, Value)>,
 ) -> Result<Value, String> {
+    // A module `__dict__` view: the mutators write through to the module's globals
+    // slot; everything else is a pure read and is answered from a snapshot by the
+    // ordinary dict methods, so the two can never disagree about semantics.
+    if let Some(slot) = with_host(|h| h.module_dict_slot(recv)) {
+        return module_dict_method(slot, recv, name, args, kwargs);
+    }
     // `_random.Random` (and subclasses) — the RNG methods dispatch against the
     // instance's Mersenne Twister state, not the class namespace.
     if matches!(name, "random" | "seed" | "getrandbits" | "getstate" | "setstate") {
@@ -9361,7 +9674,9 @@ pub fn call_method(
                 "AttributeError: type object '{cname}' has no attribute '{name}'"
             ))
         }
-        Some(PyObj::Module { ns, name: mname }) => match ns.get(name).cloned() {
+        Some(PyObj::Module { slot, name: mname }) => match with_host(|h| {
+            h.module_globals[slot].get(name).cloned()
+        }) {
             Some(v) => invoke(&v, args, kwargs),
             // Native-shadowed module miss (`math.isqrt(…)`): resolve the symbol
             // from the real CPython module over the FFI bridge, then call it.
@@ -10444,6 +10759,20 @@ fn run_class_body(name: &str, body_func: &Value) -> Result<IndexMap<String, Valu
         with_host(|h| match &def.doc {
             Some(d) => h.new_str(d.clone()),
             None => Value::Undef,
+        })
+    });
+    // `__module__` is the `__name__` of the module the body was DEFINED in, which
+    // is `fv.module` — not whatever module happens to be running when a metaclass
+    // finally registers the class. `class Month(IntEnum)` in calendar.py is
+    // registered from inside `EnumType.__new__`, so reading the live scope
+    // labelled every enum `enum`, and `global_enum` then published `JANUARY` into
+    // the `enum` module instead of `calendar`.
+    vars.entry("__module__".to_string()).or_insert_with(|| {
+        with_host(|h| {
+            h.module_globals[fv.module]
+                .get("__name__")
+                .cloned()
+                .unwrap_or_else(|| h.new_str("__main__".to_string()))
         })
     });
     Ok(vars)
@@ -12159,9 +12488,6 @@ fn enumerate_step(it: &Value) -> Result<Option<Value>, String> {
     }
 }
 
-/// Import a module by name, memoized through the host's `sys.modules` cache: the
-/// first import runs (native arm, vendored `.py`, or bridge), later imports of the
-/// same name return the identical cached object — CPython's run-once semantics.
 thread_local! {
     /// Modules whose body is currently executing. CPython publishes a module in
     /// `sys.modules` BEFORE running it, so a circular import sees the partial
@@ -12177,6 +12503,9 @@ fn import_in_progress(name: &str) -> bool {
     IMPORTING.with(|s| s.borrow().iter().any(|n| n == name))
 }
 
+/// Import a module by name, memoized through the host's `sys.modules` cache: the
+/// first import runs (native arm, vendored `.py`, or bridge), later imports of the
+/// same name return the identical cached object — CPython's run-once semantics.
 pub fn import_module(name: &str) -> Result<Value, String> {
     if let Some(m) = with_host(|h| h.cached_module(name)) {
         return Ok(m);
@@ -12341,9 +12670,10 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
             for (k, v) in entries {
                 ns.insert(k, v);
             }
+            let slot = h.new_module_slot(ns);
             h.alloc(PyObj::Module {
                 name: name.to_string(),
-                ns,
+                slot,
             })
         }));
     }
@@ -13093,9 +13423,10 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
         for (k, v) in entries {
             ns.insert(k.to_string(), v);
         }
+        let slot = h.new_module_slot(ns);
         h.alloc(PyObj::Module {
             name: name.to_string(),
-            ns,
+            slot,
         })
     }))
 }
@@ -13220,7 +13551,7 @@ fn run_vendored_module(name: &str, src: &str, path: &std::path::Path) -> Result<
     let module = with_host(|h| {
         let m = h.alloc(PyObj::Module {
             name: name.to_string(),
-            ns: IndexMap::new(),
+            slot: mid,
         });
         h.cache_module(name, m.clone());
         m
@@ -13239,15 +13570,9 @@ fn run_vendored_module(name: &str, src: &str, path: &std::path::Path) -> Result<
         h.swap_module(saved_mod);
         h.restore_scope(parked);
         if run.is_ok() {
-            // Populate the already-cached module object IN PLACE from the final
-            // slot globals, so every holder (including a mid-import circular
-            // reference) sees the complete namespace. Functions read the live slot.
-            let pairs = h.module_globals_pairs(mid);
-            if let Some(PyObj::Module { ns, .. }) = h.get_mut(&module) {
-                for (k, v) in pairs {
-                    ns.insert(k, v);
-                }
-            }
+            // Nothing to copy: the module object points AT slot `mid`, so every
+            // holder — including a mid-import circular reference — already sees
+            // the namespace the body built, and keeps seeing later writes to it.
         } else {
             // The body failed: drop the half-built module so a retry re-runs it
             // (and re-raises) instead of resolving to a broken cached shell that

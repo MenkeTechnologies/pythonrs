@@ -945,3 +945,124 @@ fn vendored_keyword_runs_on_pythonrs() {
         "True"
     );
 }
+
+#[cfg(not(feature = "stdlib-ffi"))]
+#[test]
+fn a_module_namespace_is_live_not_a_snapshot() {
+    // `mod.attr = v` must be visible to the module's OWN functions: CPython has
+    // one namespace per module and its functions resolve globals through it.
+    // Holding a separate snapshot on the module object let the two drift, so
+    // monkeypatching a module silently did nothing — `base64.binascii = None`
+    // rebound the attribute while `b64encode` kept calling the real one.
+    assert_eq!(
+        g(
+            "import base64\n\
+             base64.binascii = None\n\
+             try:\n\
+             \x20   base64.b64encode(b'a')\n\
+             \x20   x = 'stale'\n\
+             except AttributeError:\n\
+             \x20   x = 'live'",
+            "x"
+        ),
+        "'live'"
+    );
+    // The same namespace reached through `__dict__` writes through as well.
+    assert_eq!(
+        g(
+            "import string, sys\n\
+             sys.modules['string'].__dict__['capwords'] = lambda s: 'PATCHED'\n\
+             x = string.capwords('a b')",
+            "x"
+        ),
+        "'PATCHED'"
+    );
+    // And `__dict__` is one stable object, not a fresh copy per access.
+    assert_eq!(
+        g("import string\nx = string.__dict__ is string.__dict__", "x"),
+        "True"
+    );
+}
+
+#[cfg(not(feature = "stdlib-ffi"))]
+#[test]
+fn a_class_is_labelled_with_the_module_that_defined_it() {
+    // `__module__` is the defining module, NOT whichever module is running when
+    // a metaclass gets around to registering the class. Enum classes are built
+    // inside `EnumType.__new__`, so reading the live scope labelled every enum
+    // `enum` — and `global_enum` then published its members into `enum` instead
+    // of into the module that declared them.
+    assert_eq!(
+        g("import calendar\nx = calendar.Month.__module__", "x"),
+        "'calendar'"
+    );
+}
+
+#[cfg(not(feature = "stdlib-ffi"))]
+#[test]
+fn vendored_calendar_runs_on_pythonrs() {
+    // calendar.py end-to-end: it needs `enum.global_enum`, which reaches through
+    // `sys.modules[...].__dict__.update(...)` to inject `JANUARY`/`MONDAY` as
+    // module globals — names calendar's own functions then read.
+    // `repr()` runs inside the program: the enum's own `__repr__` (which
+    // `global_enum` rebinds to name the module) only fires through the builtin.
+    assert_eq!(
+        g("import calendar\nx = repr(calendar.JANUARY)", "x"),
+        "'calendar.JANUARY'"
+    );
+    assert_eq!(g("import calendar\nx = int(calendar.JANUARY)", "x"), "1");
+    assert_eq!(g("import calendar\nx = int(calendar.SUNDAY)", "x"), "6");
+    assert_eq!(
+        g("import calendar\nx = repr(calendar.monthrange(2026, 2))", "x"),
+        "'(calendar.SUNDAY, 28)'"
+    );
+    assert_eq!(
+        g("import calendar\nx = calendar.isleap(2024)", "x"),
+        "True"
+    );
+    assert_eq!(
+        g("import calendar\nx = calendar.month_name[1]", "x"),
+        "'January'"
+    );
+}
+
+#[cfg(not(feature = "stdlib-ffi"))]
+#[test]
+fn a_property_on_a_metaclass_fires_for_the_class() {
+    // A `property` defined on the metaclass is a data descriptor for the class
+    // OBJECT, so `Cls.prop` runs the getter with the class as `self`. Returning
+    // the property object instead broke `EnumType.__members__`.
+    assert_eq!(
+        g(
+            "class Meta(type):\n\
+             \x20   @property\n\
+             \x20   def label(cls):\n\
+             \x20       return 'meta:' + cls.__name__\n\
+             class C(metaclass=Meta):\n\
+             \x20   pass\n\
+             x = C.label",
+            "x"
+        ),
+        "'meta:C'"
+    );
+    assert_eq!(
+        g("import calendar\nx = list(calendar.Month.__members__)[0]", "x"),
+        "'JANUARY'"
+    );
+}
+
+#[test]
+fn typing_union_subscript_matches_the_pep604_spelling() {
+    // Since 3.14 `typing.Union` IS `types.UnionType`, so `Union[X, Y]` and
+    // `X | Y` must build the identical object — same flatten, same dedupe, same
+    // collapse of a one-member union to that member.
+    assert_eq!(g("from _typing import Union\nx = Union[int, str]", "x"), "int | str");
+    assert_eq!(g("from _typing import Union\nx = Union[int]", "x"), "<class 'int'>");
+    assert_eq!(g("from _typing import Union\nx = Union[int, int]", "x"), "<class 'int'>");
+    assert_eq!(
+        g("from _typing import Union\nx = Union[Union[int, str], bytes]", "x"),
+        "int | str | bytes"
+    );
+    assert_eq!(g("from _typing import Union\nx = Union[int, None]", "x"), "int | None");
+    assert_eq!(g("from _typing import Union\nx = Union[int, str] == (int | str)", "x"), "True");
+}
