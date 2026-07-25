@@ -3657,6 +3657,16 @@ pub fn call_builtin_function(
             return r;
         }
     }
+    if let Some(f) = name.strip_prefix("_codecs.") {
+        // The registry entries call back into Python, so they must not run
+        // under the host borrow.
+        if let Some(r) = crate::stdlib::codecs::call_unborrowed(f, &args, &kwargs) {
+            return r;
+        }
+        if let Some(r) = with_host(|h| crate::stdlib::codecs::call(h, f, &args, &kwargs)) {
+            return r;
+        }
+    }
     if let Some(f) = name.strip_prefix("binascii.") {
         if let Some(r) = with_host(|h| crate::stdlib::binascii::call(h, f, &args, &kwargs)) {
             return r;
@@ -6886,7 +6896,7 @@ fn call_re(f: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Result<Va
             let a = arg0(&args)?;
             let s = with_host(|h| h.as_str(&a))
                 .ok_or_else(|| host::type_error("re.escape() requires a string"))?;
-            Ok(Value::str(&regex::escape(&s)))
+            Ok(with_host(|h| h.new_str(regex::escape(&s))))
         }
         "purge" => Ok(Value::Undef),
         "compile" => re_compile(&arg0(&args)?, flag_arg(&args, 1)),
@@ -6979,10 +6989,10 @@ pub fn re_pattern_method(
                 .into_iter()
                 .map(|row| {
                     if groups > 1 {
-                        let t: Vec<Value> = row.iter().map(|s| Value::str(s)).collect();
+                        let t: Vec<Value> = row.iter().map(|s| with_host(|h| h.new_str(s.clone()))).collect();
                         with_host(|h| h.new_tuple(t))
                     } else {
-                        Value::str(&row[0])
+                        with_host(|h| h.new_str(row[0].clone()))
                     }
                 })
                 .collect();
@@ -7025,7 +7035,7 @@ pub fn re_pattern_method(
                     re.split(&text).map(|s| s.to_string()).collect()
                 }
             });
-            let vals: Vec<Value> = parts.iter().map(|s| Value::str(s)).collect();
+            let vals: Vec<Value> = parts.iter().map(|s| with_host(|h| h.new_str(s.clone()))).collect();
             Ok(with_host(|h| h.new_list(vals)))
         }
         _ => Err(host::type_error(&format!("Pattern has no method '{method}'"))),
@@ -7076,7 +7086,7 @@ fn re_sub(
             n += 1;
         }
         out.push_str(&text[last..]);
-        return finish_sub(Value::str(&out), n, want_count);
+        return finish_sub(with_host(|h| h.new_str(out)), n, want_count);
     }
     // String replacement: translate backrefs and apply.
     let rsrc = with_host(|h| h.as_str(repl)).unwrap_or_default();
@@ -7096,7 +7106,7 @@ fn re_sub(
             (re.replace_all(text, rrepl.as_str()).into_owned(), n)
         }
     });
-    finish_sub(Value::str(&result), n, want_count)
+    finish_sub(with_host(|h| h.new_str(result)), n, want_count)
 }
 
 fn finish_sub(result: Value, n: i64, want_count: bool) -> Result<Value, String> {
@@ -7179,7 +7189,7 @@ pub fn re_match_method(m: &Value, method: &str, args: &[Value]) -> Result<Value,
     };
     let group_str = |idx: usize| -> Value {
         match spans.get(idx).copied().flatten() {
-            Some((s, e)) => Value::str(text.get(s..e).unwrap_or("")),
+            Some((s, e)) => with_host(|h| h.new_str(text.get(s..e).unwrap_or("").to_string())),
             None => Value::Undef, // an unmatched optional group is None
         }
     };
@@ -7397,7 +7407,7 @@ fn call_time(f: &str, args: Vec<Value>) -> Result<Value, String> {
                 unsafe { libc::localtime_r(&t, &mut tm) };
                 tm
             };
-            Ok(Value::str(&strftime_libc(&fmt, &mut tm)))
+            Ok(with_host(|h| h.new_str(strftime_libc(&fmt, &mut tm))))
         }
         "struct_time" => {
             let seq = host::iter_vec(&arg0(&args)?)?;
@@ -7421,7 +7431,7 @@ fn call_time(f: &str, args: Vec<Value>) -> Result<Value, String> {
                 unsafe { libc::localtime_r(&t, &mut tm) };
                 tm
             };
-            Ok(Value::str(strftime_libc("%a %b %e %H:%M:%S %Y", &mut tm).trim()))
+            Ok(with_host(|h| h.new_str(strftime_libc("%a %b %e %H:%M:%S %Y", &mut tm).trim().to_string())))
         }
         _ => Err(host::name_error(&format!("time.{f}"))),
     }

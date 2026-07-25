@@ -10,6 +10,7 @@
 //! CPython stdlib for those modules. Only modules with no C-accelerator parity
 //! concern remain hand-rolled here.
 pub mod binascii;
+pub mod codecs;
 pub mod pystruct;
 pub mod statistics;
 pub mod textwrap;

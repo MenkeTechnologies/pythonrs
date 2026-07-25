@@ -414,12 +414,16 @@ fn collections_ordereddict_move_to_end() {
 
 #[test]
 fn collections_namedtuple() {
+    // `repr` is computed INSIDE the program: a namedtuple is now a real Python
+    // class (the vendored `collections` builds it), so its `__repr__` is Python
+    // code — and `PyHost::repr_of`, which the helper above uses, is a Rust-side
+    // formatter that cannot call back into the interpreter.
     assert_eq!(
         g(
-            "from collections import namedtuple\nPt = namedtuple('Point', ['x','y'])\nx = Pt(1, 2)",
+            "from collections import namedtuple\nPt = namedtuple('Point', ['x','y'])\nx = repr(Pt(1, 2))",
             "x"
         ),
-        "Point(x=1, y=2)"
+        "'Point(x=1, y=2)'"
     );
     // Field access, indexing, and tuple-ness.
     assert_eq!(

@@ -1225,6 +1225,12 @@ pub struct PyHost {
     /// by the function's heap id. CPython functions carry a writable dict; the
     /// stdlib uses it for `__isabstractmethod__`, `functools.wraps`, decorators.
     pub func_attrs: HashMap<u32, IndexMap<String, Value>>,
+    /// Codec search functions registered by `_codecs.register` (the `encodings`
+    /// package installs one at import), the resolved-codec cache keyed by
+    /// normalized name, and user error handlers from `register_error`.
+    pub codec_search: Vec<Value>,
+    pub codec_cache: HashMap<String, Value>,
+    pub codec_errors: HashMap<String, Value>,
     /// Exception heap ids raised with an explicit `from` clause (`raise X from Y`
     /// or `raise X from None`), which sets `__suppress_context__` — the implicit
     /// `__context__` is then hidden from the rendered traceback.
@@ -1592,6 +1598,9 @@ impl PyHost {
             exc_links: HashMap::new(),
             exc_tb: HashMap::new(),
             func_attrs: HashMap::new(),
+            codec_search: Vec::new(),
+            codec_cache: HashMap::new(),
+            codec_errors: HashMap::new(),
             suppress_context: HashSet::new(),
             foreign_exc_bases: HashMap::new(),
             argv: vec![String::new()],
@@ -12120,7 +12129,25 @@ fn enumerate_step(it: &Value) -> Result<Option<Value>, String> {
 /// Import a module by name, memoized through the host's `sys.modules` cache: the
 /// first import runs (native arm, vendored `.py`, or bridge), later imports of the
 /// same name return the identical cached object — CPython's run-once semantics.
+thread_local! {
+    /// Modules whose body is currently executing. CPython publishes a module in
+    /// `sys.modules` BEFORE running it, so a circular import sees the partial
+    /// module; this runtime caches only on completion, so the same cycle would
+    /// re-enter the body forever. `encodings/__init__` does `from . import
+    /// aliases`, whose parent is the very module still running — that overflowed
+    /// the stack.
+    static IMPORTING: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Whether `name`'s body is on the current import stack.
+fn import_in_progress(name: &str) -> bool {
+    IMPORTING.with(|s| s.borrow().iter().any(|n| n == name))
+}
+
 pub fn import_module(name: &str) -> Result<Value, String> {
+    if std::env::var_os("PYTHONRS_IMPORT_TRACE").is_some() {
+        eprintln!("IMPORT {name}");
+    }
     if let Some(m) = with_host(|h| h.cached_module(name)) {
         return Ok(m);
     }
@@ -12131,14 +12158,24 @@ pub fn import_module(name: &str) -> Result<Value, String> {
     // the child resolves from the cache. A parent that fails is non-fatal here;
     // the direct resolution below reports the real error.
     if let Some((parent, _)) = name.rsplit_once('.') {
-        if with_host(|h| h.cached_module(parent)).is_none() {
+        // A parent already on the import stack is mid-body: importing it again
+        // would re-run it. Resolve the child directly instead.
+        if with_host(|h| h.cached_module(parent)).is_none() && !import_in_progress(parent) {
             let _ = import_module(parent);
             if let Some(m) = with_host(|h| h.cached_module(name)) {
                 return Ok(m);
             }
         }
     }
-    let module = import_module_inner(name)?;
+    IMPORTING.with(|s| s.borrow_mut().push(name.to_string()));
+    let module = import_module_inner(name);
+    IMPORTING.with(|s| {
+        let mut b = s.borrow_mut();
+        if let Some(p) = b.iter().rposition(|n| n == name) {
+            b.remove(p);
+        }
+    });
+    let module = module?;
     with_host(|h| h.cache_module(name, module.clone()));
     // Bind a submodule as an attribute of its parent package, as CPython's import
     // system does: after `import a.b` (or a relative `from .b import *`), `a.b`
@@ -12183,7 +12220,11 @@ pub fn import_relative(level: usize, modpart: &str, name: &str) -> Result<Value,
         match import_module(&sub) {
             Ok(m) => {
                 // Bind the submodule as an attribute of its package, as CPython does.
-                if let Ok(base_mod) = import_module(&base) {
+                // Only if the package is already in the cache: `from . import x`
+                // runs INSIDE the package body, so importing it here to get a
+                // handle would re-execute the very module that is running
+                // (`encodings/__init__` does exactly this) and recurse forever.
+                if let Some(base_mod) = with_host(|h| h.cached_module(&base)) {
                     with_host(|h| h.set_module_attr(&base_mod, name, m.clone()));
                 }
                 return Ok(m);
@@ -12256,6 +12297,10 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
         "_struct" => Some(with_host(crate::stdlib::pystruct::entries)),
         // `binascii` — ported from RustPython (MIT); `base64` is built on it.
         "binascii" => Some(with_host(crate::stdlib::binascii::entries)),
+        // `_codecs` — ported from RustPython (MIT). `codecs.py` is
+        // `from _codecs import *`, and the interpreter cannot start text I/O
+        // without it.
+        "_codecs" => Some(with_host(crate::stdlib::codecs::entries)),
         _ => None,
     };
     #[cfg(feature = "stdlib-ffi")]
@@ -12880,6 +12925,12 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                 ("exec_prefix", prefix.clone()),
                 ("base_exec_prefix", prefix),
                 ("dont_write_bytecode", Value::Bool(false)),
+                (
+                    "byteorder",
+                    h.new_str(
+                        if cfg!(target_endian = "big") { "big" } else { "little" }.to_string(),
+                    ),
+                ),
                 // `sys.flags` — the command-line/environment switches. Read at
                 // import time by `_py_warnings` (`flags.context_aware_warnings`),
                 // so `warnings` and everything importing it needs the whole bag,
