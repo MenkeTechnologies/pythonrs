@@ -698,6 +698,70 @@ fn arithmetic_and_precedence() {
     assert_eq!(g("x = -3 + 2 * 4", "x"), "5");
 }
 
+// Gaps found by differential probing against CPython 3.14 — each of these
+// produced a wrong answer or an AttributeError before the fix.
+#[test]
+fn parity_gaps_found_by_differential_probing() {
+    // `abs(-2**63)`: `i64::MIN.abs()` overflows, and the wrapped result is the
+    // NEGATIVE input — a silent wrong answer. Python's ints are unbounded.
+    assert_eq!(g("x = abs(-2**63)", "x"), "9223372036854775808");
+    assert_eq!(g("x = (-2**63).__abs__()", "x"), "9223372036854775808");
+    assert_eq!(g("x = abs(-2**62)", "x"), "4611686018427387904");
+
+    // Every class has `__doc__` — the body's docstring, or None. Missing it broke
+    // `contextlib.contextmanager`, which reads it off its own helper class.
+    assert_eq!(g("class K: pass\nx = K.__doc__", "x"), "None");
+    assert_eq!(g("class K:\n    'd'\nx = K.__doc__", "x"), "'d'");
+    assert_eq!(
+        g(
+            "import contextlib\n@contextlib.contextmanager\ndef cm():\n    yield 42\nwith cm() as v:\n    x = v",
+            "x"
+        ),
+        "42"
+    );
+
+    // `f.attr(...)` on an attribute stored on a FUNCTION object is
+    // getattr-then-call; it used to reach the type-method table instead and
+    // raise, while `(f.attr)(...)` worked.
+    assert_eq!(
+        g(
+            "import functools\ndef d(fn):\n    @functools.wraps(fn)\n    def w(*a): return fn(*a)\n    return w\n@d\ndef g0(n): return n * 10\nx = g0.__wrapped__(4)",
+            "x"
+        ),
+        "40"
+    );
+
+    // `math.isclose` (PEP 485) and `math.remainder` were absent.
+    assert_eq!(g("import math\nx = math.isclose(0.1 + 0.2, 0.3)", "x"), "True");
+    assert_eq!(g("import math\nx = math.isclose(1.0, 1.1)", "x"), "False");
+    assert_eq!(
+        g("import math\nx = math.isclose(1.0, 1.1, rel_tol=0.2)", "x"),
+        "True"
+    );
+    assert_eq!(
+        g("import math\nx = math.isclose(float('nan'), float('nan'))", "x"),
+        "False"
+    );
+    assert_eq!(g("import math\nx = math.remainder(7, 3)", "x"), "1.0");
+}
+
+// A nested replacement field that ENDS a format spec — `f"{x:{w}}"` — closes two
+// braces in a row. The lexer read that `}}` as an escaped brace at any depth, so
+// the outer field never closed and the scan ran off the end of the string.
+#[test]
+fn fstring_nested_field_at_end_of_spec() {
+    assert_eq!(g("w = 4\nx = f'{1:{w}}'", "x"), "'   1'");
+    assert_eq!(g("w = 4\nx = f'{-1:>{w}}'", "x"), "'  -1'");
+    assert_eq!(g("w = 4\nx = f'{1:<{w}}'", "x"), "'1   '");
+    assert_eq!(g("w = 4\nx = f'{1:^{w}}'", "x"), "' 1  '");
+    // Still-nested but not final, and the escape forms that must not change.
+    assert_eq!(g("w = 4\nx = f'{1:0{w}d}'", "x"), "'0001'");
+    assert_eq!(g("w = 2\nx = f'{1.5:.{w}f}'", "x"), "'1.50'");
+    assert_eq!(g("x = f'{{literal}}'", "x"), "'{literal}'");
+    assert_eq!(g("v = 1\nx = f'{{{v}}}'", "x"), "'{1}'");
+    assert_eq!(g("v = 1\nx = f'{v}{{}}'", "x"), "'1{}'");
+}
+
 // `%` by an integer literal inside a counted loop lowers to native `Mod` plus a
 // branchless floor correction (compiler::emit_native_mod) instead of the host
 // `BINOP` call. Native `Mod` truncates like C, so every case where Python's

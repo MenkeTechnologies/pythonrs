@@ -3407,7 +3407,7 @@ pub fn call_builtin_function(
 ) -> Result<Value, String> {
     // math.* module functions.
     if let Some(m) = name.strip_prefix("math.") {
-        return call_math(m, &args);
+        return call_math(m, &args, &kwargs);
     }
     // copy.copy / copy.deepcopy (native — see call_copy).
     if let Some(f) = name.strip_prefix("copy.") {
@@ -3729,7 +3729,13 @@ pub fn call_builtin_function(
                 return crate::ffi::unary_op_cb("abs", &v);
             }
             with_host(|h| match &v {
-                Value::Int(n) => Ok(Value::Int(n.abs())),
+                // `abs(-2**63)` leaves i64 — `i64::MIN.abs()` overflows and would
+                // hand back the negative input. Python's ints are unbounded, so
+                // that one value promotes to a bignum.
+                Value::Int(n) => Ok(match n.checked_abs() {
+                    Some(a) => Value::Int(a),
+                    None => h.norm_big(-num_bigint::BigInt::from(*n)),
+                }),
                 Value::Float(f) => Ok(Value::Float(f.abs())),
                 Value::Bool(b) => Ok(Value::Int(*b as i64)),
                 Value::Obj(_) if matches!(h.get(&v), Some(PyObj::BigInt(_))) => match h.get(&v) {
@@ -6626,6 +6632,10 @@ fn math_arity(name: &str) -> Option<Arity> {
             Arity::VarExact(2)
         }
         "gcd" | "lcm" | "hypot" => return None,
+        // `isclose(a, b, *, rel_tol=…, abs_tol=…)` — two positionals, keyword-only
+        // tolerances.
+        "isclose" => Arity::VarExact(2),
+
         // Every other implemented math function is single-argument (METH_O).
         _ => Arity::ExactlyOne,
     })
@@ -7305,7 +7315,7 @@ fn call_time(f: &str, args: Vec<Value>) -> Result<Value, String> {
     }
 }
 
-fn call_math(name: &str, args: &[Value]) -> Result<Value, String> {
+fn call_math(name: &str, args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, String> {
     if let Some(spec) = math_arity(name) {
         check_arity(name, &format!("math.{name}"), spec, args.len())?;
     }
@@ -7315,6 +7325,42 @@ fn call_math(name: &str, args: &[Value]) -> Result<Value, String> {
         "floor" => Ok(with_host(|h| f64_to_int(h, f0.floor()))),
         "ceil" => Ok(with_host(|h| f64_to_int(h, f0.ceil()))),
         "fabs" => Ok(Value::Float(f0.abs())),
+        // PEP 485: symmetric relative tolerance, defaulting to 1e-09, with an
+        // absolute floor of 0.0. Infinities are close only to themselves; NaN is
+        // close to nothing.
+        "isclose" => {
+            let a = f0;
+            let b = args.get(1).and_then(as_f).unwrap_or(0.0);
+            let kw = |n: &str, d: f64| {
+                kwargs
+                    .iter()
+                    .find(|(k, _)| k == n)
+                    .and_then(|(_, v)| as_f(v))
+                    .unwrap_or(d)
+            };
+            let rel = kw("rel_tol", 1e-9);
+            let abs_tol = kw("abs_tol", 0.0);
+            if rel < 0.0 || abs_tol < 0.0 {
+                return Err("ValueError: tolerances must be non-negative".to_string());
+            }
+            let close = if a == b {
+                true
+            } else if a.is_infinite() || b.is_infinite() || a.is_nan() || b.is_nan() {
+                false
+            } else {
+                let diff = (b - a).abs();
+                diff <= (rel * b).abs() || diff <= (rel * a).abs() || diff <= abs_tol
+            };
+            Ok(Value::Bool(close))
+        }
+        "remainder" => {
+            let b = args.get(1).and_then(as_f).unwrap_or(0.0);
+            // IEEE 754 remainder: r = a - n*b with n the NEAREST integer quotient
+            // (ties to even), unlike `fmod`'s truncated one.
+            let n = (f0 / b).round_ties_even();
+            Ok(Value::Float(f0 - n * b))
+        }
+
         "sin" => Ok(Value::Float(f0.sin())),
         "cos" => Ok(Value::Float(f0.cos())),
         "tan" => Ok(Value::Float(f0.tan())),

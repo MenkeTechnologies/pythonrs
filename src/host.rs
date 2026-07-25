@@ -9042,6 +9042,22 @@ pub fn call_method(
             )
         )
     });
+    // `f.attr(...)` where `attr` is an attribute stored ON a function object
+    // (`functools.wraps` sets `__wrapped__`, and any code may set its own) is
+    // just getattr-then-call. The type-method fallback below only knows the
+    // methods of the receiver's TYPE, so it reported "'function' object has no
+    // attribute '__wrapped__'" for a call that plain attribute access resolved
+    // fine — `(f.__wrapped__)(x)` worked while `f.__wrapped__(x)` did not.
+    if let Value::Obj(id) = recv {
+        let stored = with_host(|h| {
+            matches!(h.get(recv), Some(PyObj::Func(_)))
+                .then(|| h.func_attrs.get(id).and_then(|m| m.get(name)).cloned())
+                .flatten()
+        });
+        if let Some(f) = stored {
+            return invoke(&f, args, kwargs);
+        }
+    }
     if !needs_owned {
         return crate::builtins::call_type_method(recv, name, args, kwargs);
     }
@@ -10345,7 +10361,17 @@ fn run_class_body(name: &str, body_func: &Value) -> Result<IndexMap<String, Valu
         h.signal.take();
     });
     r?;
-    let vars = env.borrow().vars.clone();
+    let mut vars = env.borrow().vars.clone();
+    // CPython puts the class body's docstring in the namespace as `__doc__`, and
+    // `None` there when the body has none — so `Cls.__doc__` always resolves.
+    // Without it `contextlib.contextmanager` dies on its own
+    // `_GeneratorContextManager.__doc__`, taking every `@contextmanager` with it.
+    vars.entry("__doc__".to_string()).or_insert_with(|| {
+        with_host(|h| match &def.doc {
+            Some(d) => h.new_str(d.clone()),
+            None => Value::Undef,
+        })
+    });
     Ok(vars)
 }
 
@@ -12623,7 +12649,7 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                 "atan2", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh", "degrees",
                 "radians", "hypot", "trunc", "copysign", "fmod", "ldexp", "isqrt", "isnan",
                 "isinf", "isfinite", "gcd", "factorial", "comb", "perm", "fsum", "prod",
-                "lgamma", "gamma", "erf", "erfc",
+                "lgamma", "gamma", "erf", "erfc", "isclose", "remainder",
             ];
             let mut out: Vec<(&str, Value)> = vec![
                 ("pi", Value::Float(std::f64::consts::PI)),
