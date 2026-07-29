@@ -40,7 +40,14 @@ impl Endianness {
             }
             Some(b'=') => {
                 *i += 1;
-                (if cfg!(target_endian = "big") { Self::Big } else { Self::Little }, false)
+                (
+                    if cfg!(target_endian = "big") {
+                        Self::Big
+                    } else {
+                        Self::Little
+                    },
+                    false,
+                )
             }
             Some(b'<') => {
                 *i += 1;
@@ -116,7 +123,12 @@ impl FormatType {
     /// otherwise), which the parser enforces.
     fn info(self, native: bool) -> (usize, usize) {
         let (std_size, native_size, native_align) = match self {
-            Self::Pad | Self::SByte | Self::UByte | Self::Char | Self::Str | Self::Pascal
+            Self::Pad
+            | Self::SByte
+            | Self::UByte
+            | Self::Char
+            | Self::Str
+            | Self::Pascal
             | Self::Bool => (1usize, 1usize, 1usize),
             Self::Short | Self::UShort => (2, 2, 2),
             Self::Int | Self::UInt => (4, 4, 4),
@@ -207,8 +219,10 @@ impl FormatSpec {
             let code = FormatType::from_byte(c)
                 .filter(|t| {
                     // `n`/`N`/`P` are native-mode only, exactly as CPython.
-                    !matches!(t, FormatType::SSizeT | FormatType::SizeT | FormatType::VoidP)
-                        || native
+                    !matches!(
+                        t,
+                        FormatType::SSizeT | FormatType::SizeT | FormatType::VoidP
+                    ) || native
                 })
                 .ok_or_else(|| err("bad char in struct format"))?;
             let (size, align) = code.info(native);
@@ -369,7 +383,14 @@ impl FormatSpec {
                 let (lo, hi) = if signed {
                     (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
                 } else {
-                    (0, if bits >= 128 { i128::MAX } else { (1i128 << bits) - 1 })
+                    (
+                        0,
+                        if bits >= 128 {
+                            i128::MAX
+                        } else {
+                            (1i128 << bits) - 1
+                        },
+                    )
                 };
                 if n < lo || n > hi {
                     return Err(err(&format!(
@@ -590,12 +611,10 @@ pub fn struct_method(
     let mut all: Vec<Value> = vec![h.new_str(fmt)];
     all.extend_from_slice(args);
     Some(match name {
-        "pack" | "unpack" | "unpack_from" | "iter_unpack" => {
-            match call(h, name, &all) {
-                Some(r) => r,
-                None => Err(host::type_error(&format!("Struct.{name}"))),
-            }
-        }
+        "pack" | "unpack" | "unpack_from" | "iter_unpack" => match call(h, name, &all) {
+            Some(r) => r,
+            None => Err(host::type_error(&format!("Struct.{name}"))),
+        },
         // `pack_into(buffer, offset, *values)` — the module function takes the
         // format first, so the already-prepended format lines the arguments up.
         "pack_into" => match call(h, "pack_into", &all) {
@@ -685,7 +704,9 @@ pub fn call(h: &mut PyHost, fname: &str, args: &[Value]) -> Option<Result<Value,
                     b[off..off + packed.len()].copy_from_slice(&packed);
                     Ok(Value::Undef)
                 }
-                _ => Err(host::type_error("argument must be read-write bytes-like object")),
+                _ => Err(host::type_error(
+                    "argument must be read-write bytes-like object",
+                )),
             }
         })(),
         "iter_unpack" => (|| {
@@ -696,7 +717,9 @@ pub fn call(h: &mut PyHost, fname: &str, args: &[Value]) -> Option<Result<Value,
             }
             let data = buffer_bytes(h, args.get(1).ok_or_else(|| err("missing buffer"))?)?;
             if data.len() % spec.size != 0 {
-                return Err(err("iterative unpacking requires a buffer of a multiple of the struct size"));
+                return Err(err(
+                    "iterative unpacking requires a buffer of a multiple of the struct size",
+                ));
             }
             // Eager: the chunks are materialised as a list of tuples, which
             // iterates identically for every documented use.

@@ -313,8 +313,7 @@ impl Lexer {
                     if q == '\'' || q == '"' {
                         raw.push(q);
                         self.bump();
-                        let nested_triple =
-                            self.peek() == Some(q) && self.peek2() == Some(q);
+                        let nested_triple = self.peek() == Some(q) && self.peek2() == Some(q);
                         if nested_triple {
                             raw.push(q);
                             raw.push(q);

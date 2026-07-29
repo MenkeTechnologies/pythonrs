@@ -83,8 +83,7 @@ const BASE64_TABLE: [i8; 256] = [
     -1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,-1,
 ];
 
-const B64_ALPHABET: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const B64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 fn b2a_base64(data: &[u8], newline: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len().div_ceil(3) * 4 + 1);
@@ -186,7 +185,11 @@ fn crc32(data: &[u8], init: u32) -> u32 {
         for (i, e) in t.iter_mut().enumerate() {
             let mut c = i as u32;
             for _ in 0..8 {
-                c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+                c = if c & 1 != 0 {
+                    0xEDB8_8320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
             }
             *e = c;
         }
@@ -224,7 +227,12 @@ pub fn entries(h: &mut PyHost) -> Vec<(String, Value)> {
 }
 
 /// Dispatch `binascii.<fname>`.
-pub fn call(h: &mut PyHost, fname: &str, args: &[Value], kwargs: &[(String, Value)]) -> Option<Result<Value, String>> {
+pub fn call(
+    h: &mut PyHost,
+    fname: &str,
+    args: &[Value],
+    kwargs: &[(String, Value)],
+) -> Option<Result<Value, String>> {
     let kw = |n: &str| kwargs.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
     Some(match fname {
         "hexlify" | "b2a_hex" => (|| {
@@ -289,10 +297,7 @@ pub fn call(h: &mut PyHost, fname: &str, args: &[Value], kwargs: &[(String, Valu
         })(),
         "crc32" => (|| {
             let data = buf(h, args.first().ok_or_else(|| err("missing argument"))?)?;
-            let init = args
-                .get(1)
-                .and_then(|v| h.as_int(v))
-                .unwrap_or(0) as u32;
+            let init = args.get(1).and_then(|v| h.as_int(v)).unwrap_or(0) as u32;
             Ok(Value::Int(crc32(&data, init) as i64))
         })(),
         _ => return None,

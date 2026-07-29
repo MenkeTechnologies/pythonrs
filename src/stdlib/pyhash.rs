@@ -151,7 +151,8 @@ pub fn digest_bytes(algo: Algo, data: &[u8], out_len: usize) -> Vec<u8> {
         // hash — not by slicing the full one.
         Algo::Blake2b => {
             use blake2::digest::{Update as _, VariableOutput};
-            let mut h = blake2::Blake2bVar::new(out_len.clamp(1, 64)).expect("valid blake2b length");
+            let mut h =
+                blake2::Blake2bVar::new(out_len.clamp(1, 64)).expect("valid blake2b length");
             h.update(data);
             let mut out = vec![0u8; out_len.clamp(1, 64)];
             h.finalize_variable(&mut out).expect("blake2b finalize");
@@ -159,7 +160,8 @@ pub fn digest_bytes(algo: Algo, data: &[u8], out_len: usize) -> Vec<u8> {
         }
         Algo::Blake2s => {
             use blake2::digest::{Update as _, VariableOutput};
-            let mut h = blake2::Blake2sVar::new(out_len.clamp(1, 32)).expect("valid blake2s length");
+            let mut h =
+                blake2::Blake2sVar::new(out_len.clamp(1, 32)).expect("valid blake2s length");
             h.update(data);
             let mut out = vec![0u8; out_len.clamp(1, 32)];
             h.finalize_variable(&mut out).expect("blake2s finalize");
@@ -186,9 +188,8 @@ pub fn construct(
     let mut data = Vec::new();
     if let Some(v) = args.first() {
         if !matches!(v, Value::Undef) {
-            data = as_bytes(h, v).ok_or_else(|| {
-                host::type_error("object supporting the buffer API required")
-            })?;
+            data = as_bytes(h, v)
+                .ok_or_else(|| host::type_error("object supporting the buffer API required"))?;
         }
     }
     // BLAKE2 takes its output length at construction; everything else uses its
@@ -303,7 +304,12 @@ pub fn entries(h: &mut PyHost, module: &str) -> Option<Vec<(String, Value)>> {
     };
     let mut out: Vec<(String, Value)> = names
         .iter()
-        .map(|n| ((*n).to_string(), h.alloc(PyObj::Builtin(format!("_hash.{n}")))))
+        .map(|n| {
+            (
+                (*n).to_string(),
+                h.alloc(PyObj::Builtin(format!("_hash.{n}"))),
+            )
+        })
         .collect();
     if module == "_blake2" {
         // `hashlib` reads these off `_blake2` for its keyed/parameterized forms.

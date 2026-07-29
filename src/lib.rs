@@ -117,10 +117,7 @@ pub fn compile_or_load_labeled(src: &str, source: &str) -> Result<compiler::Prog
 /// the append-only shard (and forces an O(shard) rewrite per miss) for no hit —
 /// CPython likewise never writes a `.pyc` for `-c`/stdin. Real script files and
 /// imported modules stay cacheable.
-pub fn compile_or_load_cacheable(
-    src: &str,
-    cacheable: bool,
-) -> Result<compiler::Program, String> {
+pub fn compile_or_load_cacheable(src: &str, cacheable: bool) -> Result<compiler::Program, String> {
     // `PYTHONRS_CACHE=0|false|no` (see `cache::cache_enabled`) turns the shard off
     // entirely — every run recompiles and nothing is stored. `--doctor` reports
     // this state, so the gate must be honored here or that report would lie.
@@ -270,4 +267,3 @@ pub fn eval_to_string(src: &str) -> Result<String, String> {
     let v = eval_str(src)?;
     Ok(host::with_host(|h| h.repr_of(&v)))
 }
-

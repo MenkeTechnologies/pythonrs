@@ -144,15 +144,18 @@ fn utf8_decode(b: &[u8], errors: Errors) -> Result<(String, usize), String> {
                             Err(e2) => {
                                 let good = e2.valid_up_to();
                                 if good > 0 {
-                                    out.push_str(std::str::from_utf8(&b[i..i + good]).unwrap_or(""));
+                                    out.push_str(
+                                        std::str::from_utf8(&b[i..i + good]).unwrap_or(""),
+                                    );
                                     i += good;
                                     continue;
                                 }
                                 match errors {
                                     Errors::Ignore => {}
                                     Errors::Replace => out.push('\u{fffd}'),
-                                    Errors::SurrogateEscape => out
-                                        .push(char::from_u32(0xdc00 + b[i] as u32).unwrap_or('\u{fffd}')),
+                                    Errors::SurrogateEscape => out.push(
+                                        char::from_u32(0xdc00 + b[i] as u32).unwrap_or('\u{fffd}'),
+                                    ),
                                     _ => return Err(dec_err("utf-8", i, "invalid start byte")),
                                 }
                                 i += 1;
@@ -203,10 +206,9 @@ fn utf_x_decode(
     big: bool,
     errors: Errors,
 ) -> Result<String, String> {
-    if b.len() % width != 0
-        && errors == Errors::Strict {
-            return Err(dec_err(enc, b.len() - (b.len() % width), "truncated data"));
-        }
+    if b.len() % width != 0 && errors == Errors::Strict {
+        return Err(dec_err(enc, b.len() - (b.len() % width), "truncated data"));
+    }
     let mut units: Vec<u32> = Vec::with_capacity(b.len() / width);
     for chunk in b.chunks_exact(width) {
         let mut v: u32 = 0;
@@ -323,7 +325,6 @@ fn pair(h: &mut PyHost, v: Value, n: usize) -> Value {
     h.new_tuple(vec![v, Value::Int(n as i64)])
 }
 
-
 /// Entry points that must run OUTSIDE the host borrow: the registry calls back
 /// into Python (a search function, a codec's own `encode`/`decode`), and doing
 /// that while `with_host` holds the `RefCell` panics.
@@ -346,8 +347,9 @@ pub fn call_unborrowed(
             if let Some(f) = args.first() {
                 let target = f.clone();
                 host::with_host(|h| {
-                    h.codec_search
-                        .retain(|g| !matches!((g, &target), (Value::Obj(a), Value::Obj(b)) if a == b))
+                    h.codec_search.retain(
+                        |g| !matches!((g, &target), (Value::Obj(a), Value::Obj(b)) if a == b),
+                    )
                 });
             }
             Ok(Value::Undef)
@@ -423,7 +425,9 @@ pub fn call_unborrowed(
                         | "namereplace"
                 ) =>
                 {
-                    Ok(host::with_host(|h| h.alloc(PyObj::Builtin(format!("_codecs.{n}_errors")))))
+                    Ok(host::with_host(|h| {
+                        h.alloc(PyObj::Builtin(format!("_codecs.{n}_errors")))
+                    }))
                 }
                 None => Err(format!("LookupError: unknown error handler name '{n}'")),
             }
@@ -528,22 +532,34 @@ pub fn call(
     Some(match fname {
         // ── native codecs ───────────────────────────────────────────────────
         "utf_8_encode" => (|| {
-            let s = as_text(h, args.first().ok_or_else(|| host::type_error("utf_8_encode"))?)
-                .ok_or_else(|| host::type_error("utf_8_encode() argument 1 must be str"))?;
+            let s = as_text(
+                h,
+                args.first()
+                    .ok_or_else(|| host::type_error("utf_8_encode"))?,
+            )
+            .ok_or_else(|| host::type_error("utf_8_encode() argument 1 must be str"))?;
             let n = s.chars().count();
             // Fast path, as in RustPython: a str is already utf-8.
             let b = h.alloc(PyObj::Bytes(s.into_bytes()));
             Ok(pair(h, b, n))
         })(),
         "utf_8_decode" => (|| {
-            let b = as_bytes(h, args.first().ok_or_else(|| host::type_error("utf_8_decode"))?)
-                .ok_or_else(|| host::type_error("utf_8_decode() argument 1 must be bytes"))?;
+            let b = as_bytes(
+                h,
+                args.first()
+                    .ok_or_else(|| host::type_error("utf_8_decode"))?,
+            )
+            .ok_or_else(|| host::type_error("utf_8_decode() argument 1 must be bytes"))?;
             let (s, n) = utf8_decode(&b, errors_of(h, 1))?;
             let sv = h.new_str(s);
             Ok(pair(h, sv, n))
         })(),
         "latin_1_encode" | "ascii_encode" => (|| {
-            let limit = if fname.starts_with("ascii") { 0x7f } else { 0xff };
+            let limit = if fname.starts_with("ascii") {
+                0x7f
+            } else {
+                0xff
+            };
             let name = if limit == 0x7f { "ascii" } else { "latin-1" };
             let s = as_text(h, args.first().ok_or_else(|| host::type_error(fname))?)
                 .ok_or_else(|| host::type_error("argument 1 must be str"))?;
@@ -553,7 +569,11 @@ pub fn call(
             Ok(pair(h, b, n))
         })(),
         "latin_1_decode" | "ascii_decode" => (|| {
-            let limit = if fname.starts_with("ascii") { 0x7f } else { 0xff };
+            let limit = if fname.starts_with("ascii") {
+                0x7f
+            } else {
+                0xff
+            };
             let name = if limit == 0x7f { "ascii" } else { "latin-1" };
             let b = as_bytes(h, args.first().ok_or_else(|| host::type_error(fname))?)
                 .ok_or_else(|| host::type_error("argument 1 must be bytes"))?;

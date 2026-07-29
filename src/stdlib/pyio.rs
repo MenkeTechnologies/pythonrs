@@ -59,7 +59,11 @@ fn new_bytesio(h: &mut PyHost, args: &[Value]) -> Result<Value, String> {
 /// disable translation on write; the default `'\n'` argument means "translate
 /// nothing on write, but split on any newline when reading", which is what the
 /// `translate` flag below records.
-fn new_stringio(h: &mut PyHost, args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, String> {
+fn new_stringio(
+    h: &mut PyHost,
+    args: &[Value],
+    kwargs: &[(String, Value)],
+) -> Result<Value, String> {
     let initial = match args.first() {
         Some(v) if !matches!(v, Value::Undef) => h
             .as_str(v)
@@ -178,7 +182,8 @@ fn bytesio_method(
                 Err(e) => return Some(Err(e)),
             };
             for it in items {
-                if let Err(e) = bytesio_method(h, recv, "write", &[it]).unwrap_or(Ok(Value::Undef)) {
+                if let Err(e) = bytesio_method(h, recv, "write", &[it]).unwrap_or(Ok(Value::Undef))
+                {
                     return Some(Err(e));
                 }
             }
@@ -267,10 +272,7 @@ fn stringio_method(
         "readline" => {
             let start = byte_at(&buf, pos);
             let rest = &buf[start..];
-            let end = rest
-                .find('\n')
-                .map(|i| start + i + 1)
-                .unwrap_or(buf.len());
+            let end = rest.find('\n').map(|i| start + i + 1).unwrap_or(buf.len());
             let taken = buf[start..end].chars().count();
             set_text_pos(h, recv, pos + taken);
             Ok(h.new_str(buf[start..end].to_string()))
@@ -350,8 +352,9 @@ fn stringio_method(
             // CPython only allows seeking to 0 relative to the end or current
             // position on a text stream; anything else needs an opaque cookie.
             if whence != 0 && off != 0 {
-                return Some(Err("OSError: Can't do nonzero cur-relative seeks".to_string()
-                .replace("cur", if whence == 2 { "end" } else { "cur" })));
+                return Some(Err("OSError: Can't do nonzero cur-relative seeks"
+                    .to_string()
+                    .replace("cur", if whence == 2 { "end" } else { "cur" })));
             }
             let new = match whence {
                 1 => pos,
@@ -373,7 +376,10 @@ fn stringio_method(
             let mut b = buf;
             b.truncate(cut);
             let newlen = b.chars().count();
-            if let Some(PyObj::StringIO { buf: bb, len: l, .. }) = h.get_mut(recv) {
+            if let Some(PyObj::StringIO {
+                buf: bb, len: l, ..
+            }) = h.get_mut(recv)
+            {
                 *bb = b;
                 *l = newlen;
             }
@@ -495,7 +501,12 @@ pub fn entries(h: &mut PyHost) -> Vec<(String, Value)> {
     for n in BASES {
         // Registered as real classes so `class IOBase(_io._IOBase, metaclass=
         // ABCMeta)` has something to inherit from and `abc` can walk the MRO.
-        let v = h.register_class_meta((*n).to_string().as_str(), vec![], Default::default(), "type");
+        let v = h.register_class_meta(
+            (*n).to_string().as_str(),
+            vec![],
+            Default::default(),
+            "type",
+        );
         out.push(((*n).to_string(), v));
     }
     out.push((

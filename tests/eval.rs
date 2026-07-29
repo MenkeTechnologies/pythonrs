@@ -34,7 +34,10 @@ fn stdout(src: &str) -> String {
 #[test]
 fn eval_expression_returns_value() {
     assert_eq!(stdout("print(eval('1 + 2 * 3'))"), "7\n");
-    assert_eq!(stdout("print(eval('[i*i for i in range(4)]'))"), "[0, 1, 4, 9]\n");
+    assert_eq!(
+        stdout("print(eval('[i*i for i in range(4)]'))"),
+        "[0, 1, 4, 9]\n"
+    );
     assert_eq!(stdout("print(eval('len(\"hello\")'))"), "5\n"); // builtins available
     assert_eq!(stdout("print(repr(eval('None')))"), "None\n");
 }
@@ -63,7 +66,11 @@ fn eval_rejects_statements_and_multiple_expressions() {
         let src = format!(
             "try:\n    eval('{bad}')\n    print('NO ERROR')\nexcept SyntaxError:\n    print('SyntaxError')"
         );
-        assert_eq!(stdout(&src), "SyntaxError\n", "eval({bad:?}) should be a SyntaxError");
+        assert_eq!(
+            stdout(&src),
+            "SyntaxError\n",
+            "eval({bad:?}) should be a SyntaxError"
+        );
     }
 }
 
@@ -71,7 +78,10 @@ fn eval_rejects_statements_and_multiple_expressions() {
 fn eval_with_explicit_namespace_dicts() {
     assert_eq!(stdout("print(eval('a + b', {'a': 5, 'b': 3}))"), "8\n");
     // exec writes bindings back into the provided globals dict.
-    assert_eq!(stdout("g = {'n': 4}\nexec('m = n * n', g)\nprint(g['m'])"), "16\n");
+    assert_eq!(
+        stdout("g = {'n': 4}\nexec('m = n * n', g)\nprint(g['m'])"),
+        "16\n"
+    );
     assert_eq!(stdout("print(eval('2 ** 10', {}, {'z': 99}))"), "1024\n");
 }
 
@@ -85,9 +95,7 @@ fn eval_in_function_reads_locals_and_discards_writes() {
     // ... but their assignments do not leak to globals (CPython semantics): the
     // module-level name stays unbound.
     assert_eq!(
-        stdout(
-            "def s():\n    exec('leaked = 99')\ns()\nprint('leaked' in globals())"
-        ),
+        stdout("def s():\n    exec('leaked = 99')\ns()\nprint('leaked' in globals())"),
         "False\n"
     );
 }
@@ -97,9 +105,7 @@ fn nested_and_recursive_eval() {
     assert_eq!(stdout("print(eval(\"eval('3+4')\"))"), "7\n");
     // Recursion driven through eval resolves the function global and the local n.
     assert_eq!(
-        stdout(
-            "def fac(n):\n    return 1 if n < 2 else n * eval('fac(n-1)')\nprint(fac(5))"
-        ),
+        stdout("def fac(n):\n    return 1 if n < 2 else n * eval('fac(n-1)')\nprint(fac(5))"),
         "120\n"
     );
 }

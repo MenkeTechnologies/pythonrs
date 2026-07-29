@@ -311,10 +311,7 @@ fn scan_code(s: &mut Scanner) -> Result<(), String> {
                         // structural, not an operator: it closes the field or
                         // opens the format spec.
                         if s.depth() == 0
-                            && matches!(
-                                s.modes.last(),
-                                Some(Mode::Code { in_field: true, .. })
-                            )
+                            && matches!(s.modes.last(), Some(Mode::Code { in_field: true, .. }))
                         {
                             if *op == "}" {
                                 s.push(OP, "}".into(), (row, col), (row, col + 1));
@@ -638,13 +635,7 @@ fn scan_plain_string(
 }
 
 /// The source between two (row, col) positions, lines joined as written.
-fn slice_span(
-    chars: &[Vec<char>],
-    srow: usize,
-    scol: usize,
-    erow: usize,
-    ecol: usize,
-) -> String {
+fn slice_span(chars: &[Vec<char>], srow: usize, scol: usize, erow: usize, ecol: usize) -> String {
     if srow == erow {
         return chars[srow][scol..ecol].iter().collect();
     }

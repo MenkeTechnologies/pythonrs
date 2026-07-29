@@ -18,7 +18,8 @@ use std::process::Command;
 
 /// A process-unique scratch directory for one test's fixture module.
 fn fixtures_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("pythonrs-modglobals-{}-{tag}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("pythonrs-modglobals-{}-{tag}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create fixtures dir");
     dir
 }

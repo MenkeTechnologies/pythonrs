@@ -59,7 +59,12 @@ struct ProgImage {
 
 /// Compile a program to a standalone native executable at `out`. `src`/`filename`
 /// are embedded so the binary can render tracebacks.
-pub fn emit_executable(prog: &Program, src: &str, filename: &str, out: &Path) -> Result<(), String> {
+pub fn emit_executable(
+    prog: &Program,
+    src: &str,
+    filename: &str,
+    out: &Path,
+) -> Result<(), String> {
     let obj = std::env::temp_dir().join("pythonrs_aot.o");
     emit_object(prog, src, filename, &obj)?;
 

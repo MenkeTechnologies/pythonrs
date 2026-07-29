@@ -104,7 +104,8 @@ fn argv_script() -> tempfile::NamedTempFile {
         .suffix(".py")
         .tempfile()
         .expect("temp file");
-    f.write_all(b"import sys\nprint(sys.argv)\n").expect("write");
+    f.write_all(b"import sys\nprint(sys.argv)\n")
+        .expect("write");
     f
 }
 

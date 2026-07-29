@@ -72,7 +72,10 @@ impl PyRegex {
     pub fn all_captures(&self, text: &str) -> Vec<Spans> {
         let n = self.captures_len();
         match self {
-            PyRegex::Fast(re) => re.captures_iter(text).map(|c| collect_spans(&c, n)).collect(),
+            PyRegex::Fast(re) => re
+                .captures_iter(text)
+                .map(|c| collect_spans(&c, n))
+                .collect(),
             PyRegex::Fancy(re) => re
                 .captures_iter(text)
                 .filter_map(|c| c.ok())
@@ -137,14 +140,22 @@ fn named_from<'a>(names: impl Iterator<Item = Option<&'a str>>) -> Vec<(String, 
 }
 
 fn collect_spans(caps: &regex::Captures<'_>, n: usize) -> Spans {
-    (0..n).map(|i| caps.get(i).map(|m| (m.start(), m.end()))).collect()
+    (0..n)
+        .map(|i| caps.get(i).map(|m| (m.start(), m.end())))
+        .collect()
 }
 
 fn collect_fancy_spans(caps: &fancy_regex::Captures<'_>, n: usize) -> Spans {
-    (0..n).map(|i| caps.get(i).map(|m| (m.start(), m.end()))).collect()
+    (0..n)
+        .map(|i| caps.get(i).map(|m| (m.start(), m.end())))
+        .collect()
 }
 
 /// The `regex` crate's errors are multi-line diagrams; `re.error` is one line.
 fn last_line(msg: &str) -> String {
-    msg.lines().last().unwrap_or("bad pattern").trim().to_string()
+    msg.lines()
+        .last()
+        .unwrap_or("bad pattern")
+        .trim()
+        .to_string()
 }

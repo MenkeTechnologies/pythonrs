@@ -154,7 +154,12 @@ pub fn entries(h: &mut PyHost) -> Vec<(String, Value)> {
     ];
     let mut out: Vec<(String, Value)> = FNS
         .iter()
-        .map(|f| ((*f).to_string(), h.alloc(PyObj::Builtin(format!("_imp.{f}")))))
+        .map(|f| {
+            (
+                (*f).to_string(),
+                h.alloc(PyObj::Builtin(format!("_imp.{f}"))),
+            )
+        })
         .collect();
     // `check_hash_based_pycs` is a string setting, not a function. pythonrs never
     // reads a `.pyc`, so the default CPython value is what it reports.
@@ -163,7 +168,10 @@ pub fn entries(h: &mut PyHost) -> Vec<(String, Value)> {
     // An INT, not a function: `_bootstrap_external` does
     // `MAGIC_NUMBER = _imp.pyc_magic_number_token.to_bytes(4, 'little')` at module
     // level. pythonrs never writes a `.pyc`, so the value only has to be stable.
-    out.push(("pyc_magic_number_token".to_string(), Value::Int(168_627_755)));
+    out.push((
+        "pyc_magic_number_token".to_string(),
+        Value::Int(168_627_755),
+    ));
     let _ = host::type_error;
     out
 }

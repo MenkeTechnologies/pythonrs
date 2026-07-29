@@ -1228,7 +1228,11 @@ fn stringify(vm: &mut VM, v: &Value, repr: bool) -> Value {
             return finish(vm, r);
         }
     }
-    let s = if repr { host::repr_of(v) } else { host::str_of(v) };
+    let s = if repr {
+        host::repr_of(v)
+    } else {
+        host::str_of(v)
+    };
     with_host(|h| h.new_str(s))
 }
 
@@ -2397,7 +2401,9 @@ fn b_import_from(vm: &mut VM, _: u8) -> Value {
         }
         return finish(
             vm,
-            Err(format!("ImportError: cannot import name '{name}' from '{pkg}'")),
+            Err(format!(
+                "ImportError: cannot import name '{name}' from '{pkg}'"
+            )),
         );
     }
     // A non-module `from` target: surface the original attribute error.
@@ -3607,7 +3613,10 @@ pub fn call_builtin_function(
             // `unregister(func)` removes every registration of `func` (by identity).
             "unregister" => {
                 let func = arg0(&args)?;
-                with_host(|h| h.atexit_callbacks.retain(|(f, _, _)| !identity_eq(f, &func)));
+                with_host(|h| {
+                    h.atexit_callbacks
+                        .retain(|(f, _, _)| !identity_eq(f, &func))
+                });
                 Ok(Value::Undef)
             }
             "_run_exitfuncs" => {
@@ -3647,7 +3656,9 @@ pub fn call_builtin_function(
                 host::invoke(&func, call_args, vec![])?;
                 Ok(Value::Int(1))
             }
-            _ => Err(format!("AttributeError: module '_thread_core' has no attribute '{f}'")),
+            _ => Err(format!(
+                "AttributeError: module '_thread_core' has no attribute '{f}'"
+            )),
         };
     }
     // `itertools.*` iterators.
@@ -3711,7 +3722,9 @@ pub fn call_builtin_function(
         });
         return match cname {
             Some(c) => Ok(with_host(|h| h.new_instance(c, IndexMap::new()))),
-            None => Err(host::type_error("object.__new__(X): X is not a type object")),
+            None => Err(host::type_error(
+                "object.__new__(X): X is not a type object",
+            )),
         };
     }
     // `dict.fromkeys(iterable[, value])` reached via the `dict` type object.
@@ -3815,9 +3828,8 @@ pub fn call_builtin_function(
     // the parser a pure function of the text.
     if name == "_csv.reader" {
         let src = arg0(&args)?;
-        let dialect = with_host(|h| {
-            crate::stdlib::pycsv::Dialect::resolve_public(h, args.get(1), &kwargs)
-        })?;
+        let dialect =
+            with_host(|h| crate::stdlib::pycsv::Dialect::resolve_public(h, args.get(1), &kwargs))?;
         let lines = host::iter_vec(&src)?;
         let mut text = String::new();
         for l in &lines {
@@ -4291,9 +4303,7 @@ pub fn call_builtin_function(
         // accepted in 3.13+, but the keyword form is what the stdlib uses).
         "SimpleNamespace" => {
             if !args.is_empty() {
-                return Err(host::type_error(
-                    "no positional arguments expected",
-                ));
+                return Err(host::type_error("no positional arguments expected"));
             }
             Ok(with_host(|h| {
                 let mut attrs = indexmap::IndexMap::new();
@@ -4367,10 +4377,12 @@ pub fn call_builtin_function(
             // — so reading only the positional slot made every such call return
             // the top package instead of the submodule, and the codec search
             // function never found its `getregentry`.
-            let fromlist = args
-                .get(3)
-                .cloned()
-                .or_else(|| kwargs.iter().find(|(k, _)| k == "fromlist").map(|(_, v)| v.clone()));
+            let fromlist = args.get(3).cloned().or_else(|| {
+                kwargs
+                    .iter()
+                    .find(|(k, _)| k == "fromlist")
+                    .map(|(_, v)| v.clone())
+            });
             let fromlist_empty = match fromlist {
                 None | Some(Value::Undef) => true,
                 Some(v) => with_host(|h| !h.truthy(&v)),
@@ -4998,14 +5010,13 @@ fn run_pysource(want_value: bool, args: &[Value]) -> Result<Value, String> {
                 }
                 // Only what the code actually bound or rebound: a name merely
                 // READ from `globals` must not be copied into `locals`.
-                if pre_existing
-                    .get(&k)
-                    .is_some_and(|old| std::mem::discriminant(old) == std::mem::discriminant(&v)
+                if pre_existing.get(&k).is_some_and(|old| {
+                    std::mem::discriminant(old) == std::mem::discriminant(&v)
                         && match (old, &v) {
                             (Value::Obj(a), Value::Obj(b)) => a == b,
                             _ => with_host(|h| h.equal(old, &v)),
-                        })
-                {
+                        }
+                }) {
                     continue;
                 }
                 let key = with_host(|h| h.new_str(k));
@@ -5108,9 +5119,11 @@ pub fn py_len(v: &Value) -> Result<usize, String> {
         }
         Some(PyObj::BigRange { start, stop, step }) => {
             use num_traits::ToPrimitive;
-            host::big_range_len(start, stop, step).to_usize().ok_or_else(|| {
-                "OverflowError: cannot fit 'int' into an index-sized integer".to_string()
-            })
+            host::big_range_len(start, stop, step)
+                .to_usize()
+                .ok_or_else(|| {
+                    "OverflowError: cannot fit 'int' into an index-sized integer".to_string()
+                })
         }
         #[cfg(feature = "stdlib-ffi")]
         Some(PyObj::Foreign(id)) => crate::ffi::len(*id),
@@ -5157,14 +5170,20 @@ fn make_range(args: &[Value]) -> Result<Value, String> {
         .collect::<Result<_, _>>()?;
     use num_traits::{One, Zero};
     let (start, stop, step) = match bigs.len() {
-        1 => (num_bigint::BigInt::zero(), bigs[0].clone(), num_bigint::BigInt::one()),
+        1 => (
+            num_bigint::BigInt::zero(),
+            bigs[0].clone(),
+            num_bigint::BigInt::one(),
+        ),
         2 => (bigs[0].clone(), bigs[1].clone(), num_bigint::BigInt::one()),
         _ => (bigs[0].clone(), bigs[1].clone(), bigs[2].clone()),
     };
     if step.is_zero() {
         return Err("ValueError: range() arg 3 must not be zero".into());
     }
-    Ok(with_host(|h| h.alloc(PyObj::BigRange { start, stop, step })))
+    Ok(with_host(|h| {
+        h.alloc(PyObj::BigRange { start, stop, step })
+    }))
 }
 
 fn reduce_minmax(
@@ -5766,7 +5785,9 @@ fn string_formatter_parser(args: &[Value]) -> Result<Value, String> {
             let lit_v = h.new_str(lit);
             let fname_v = fname.map(|s| h.new_str(s)).unwrap_or(Value::Undef);
             let fspec_v = fspec.map(|s| h.new_str(s)).unwrap_or(Value::Undef);
-            let conv_v = conv.map(|c| h.new_str(c.to_string())).unwrap_or(Value::Undef);
+            let conv_v = conv
+                .map(|c| h.new_str(c.to_string()))
+                .unwrap_or(Value::Undef);
             tuples.push(h.new_tuple(vec![lit_v, fname_v, fspec_v, conv_v]));
         }
         h.new_list(tuples)
@@ -5840,9 +5861,18 @@ fn string_formatter_field_name_split(args: &[Value]) -> Result<Value, String> {
 
 /// Construct an `itertools` iterator. Lazy ones build an `ItertoolsIter`; the
 /// combinatorics build the full tuple list and return its iterator.
-fn call_itertools(name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Result<Value, String> {
+fn call_itertools(
+    name: &str,
+    args: Vec<Value>,
+    kwargs: Vec<(String, Value)>,
+) -> Result<Value, String> {
     use host::{ItKind, PyObj};
-    let mk = |kind: ItKind, sources: Vec<Value>, func: Value, nums: Vec<i64>, buf: Vec<Value>, flag: bool| {
+    let mk = |kind: ItKind,
+              sources: Vec<Value>,
+              func: Value,
+              nums: Vec<i64>,
+              buf: Vec<Value>,
+              flag: bool| {
         with_host(|h| {
             h.alloc(PyObj::ItertoolsIter {
                 kind,
@@ -5862,7 +5892,14 @@ fn call_itertools(name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) ->
         "count" => {
             let start = args.first().and_then(&as_i).unwrap_or(0);
             let step = args.get(1).and_then(&as_i).unwrap_or(1);
-            Ok(mk(ItKind::Count, vec![], Value::Undef, vec![start, step], vec![], false))
+            Ok(mk(
+                ItKind::Count,
+                vec![],
+                Value::Undef,
+                vec![start, step],
+                vec![],
+                false,
+            ))
         }
         "repeat" => {
             let obj = args.first().cloned().unwrap_or(Value::Undef);
@@ -5872,18 +5909,39 @@ fn call_itertools(name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) ->
                 .or_else(|| kw("times"))
                 .and_then(|v| as_i(&v))
                 .unwrap_or(-1);
-            Ok(mk(ItKind::Repeat, vec![], Value::Undef, vec![times], vec![obj], false))
+            Ok(mk(
+                ItKind::Repeat,
+                vec![],
+                Value::Undef,
+                vec![times],
+                vec![obj],
+                false,
+            ))
         }
         "cycle" => {
             let src = iter_of(&arg0(&args)?)?;
-            Ok(mk(ItKind::Cycle, vec![src], Value::Undef, vec![0], vec![], false))
+            Ok(mk(
+                ItKind::Cycle,
+                vec![src],
+                Value::Undef,
+                vec![0],
+                vec![],
+                false,
+            ))
         }
         "chain" => {
             let mut sources = Vec::with_capacity(args.len());
             for a in &args {
                 sources.push(iter_of(a)?);
             }
-            Ok(mk(ItKind::Chain, sources, Value::Undef, vec![0], vec![], false))
+            Ok(mk(
+                ItKind::Chain,
+                sources,
+                Value::Undef,
+                vec![0],
+                vec![],
+                false,
+            ))
         }
         "chain.from_iterable" => {
             let outer = host::iter_vec(&arg0(&args)?)?;
@@ -5891,38 +5949,92 @@ fn call_itertools(name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) ->
             for a in &outer {
                 sources.push(iter_of(a)?);
             }
-            Ok(mk(ItKind::Chain, sources, Value::Undef, vec![0], vec![], false))
+            Ok(mk(
+                ItKind::Chain,
+                sources,
+                Value::Undef,
+                vec![0],
+                vec![],
+                false,
+            ))
         }
         "accumulate" => {
             let src = iter_of(&arg0(&args)?)?;
-            let func = args.get(1).cloned().or_else(|| kw("func")).unwrap_or(Value::Undef);
-            Ok(mk(ItKind::Accumulate, vec![src], func, vec![], vec![], false))
+            let func = args
+                .get(1)
+                .cloned()
+                .or_else(|| kw("func"))
+                .unwrap_or(Value::Undef);
+            Ok(mk(
+                ItKind::Accumulate,
+                vec![src],
+                func,
+                vec![],
+                vec![],
+                false,
+            ))
         }
         "starmap" => {
             let func = arg0(&args)?;
-            let src = iter_of(args.get(1).ok_or_else(|| host::type_error("starmap expected 2 arguments"))?)?;
+            let src = iter_of(
+                args.get(1)
+                    .ok_or_else(|| host::type_error("starmap expected 2 arguments"))?,
+            )?;
             Ok(mk(ItKind::StarMap, vec![src], func, vec![], vec![], false))
         }
         "compress" => {
             let data = iter_of(&arg0(&args)?)?;
-            let sel = iter_of(args.get(1).ok_or_else(|| host::type_error("compress expected 2 arguments"))?)?;
-            Ok(mk(ItKind::Compress, vec![data, sel], Value::Undef, vec![], vec![], false))
+            let sel = iter_of(
+                args.get(1)
+                    .ok_or_else(|| host::type_error("compress expected 2 arguments"))?,
+            )?;
+            Ok(mk(
+                ItKind::Compress,
+                vec![data, sel],
+                Value::Undef,
+                vec![],
+                vec![],
+                false,
+            ))
         }
         "dropwhile" => {
             let func = arg0(&args)?;
-            let src = iter_of(args.get(1).ok_or_else(|| host::type_error("dropwhile expected 2 arguments"))?)?;
+            let src = iter_of(
+                args.get(1)
+                    .ok_or_else(|| host::type_error("dropwhile expected 2 arguments"))?,
+            )?;
             Ok(mk(ItKind::DropWhile, vec![src], func, vec![], vec![], true))
         }
         "takewhile" => {
             let func = arg0(&args)?;
-            let src = iter_of(args.get(1).ok_or_else(|| host::type_error("takewhile expected 2 arguments"))?)?;
-            Ok(mk(ItKind::TakeWhile, vec![src], func, vec![], vec![], false))
+            let src = iter_of(
+                args.get(1)
+                    .ok_or_else(|| host::type_error("takewhile expected 2 arguments"))?,
+            )?;
+            Ok(mk(
+                ItKind::TakeWhile,
+                vec![src],
+                func,
+                vec![],
+                vec![],
+                false,
+            ))
         }
         "filterfalse" => {
             let func = args.first().cloned().unwrap_or(Value::Undef);
             // filterfalse(None, it): None is already Value::Undef (the identity sentinel).
-            let src = iter_of(args.get(1).ok_or_else(|| host::type_error("filterfalse expected 2 arguments"))?)?;
-            Ok(mk(ItKind::FilterFalse, vec![src], func, vec![], vec![], false))
+            let src = iter_of(
+                args.get(1)
+                    .ok_or_else(|| host::type_error("filterfalse expected 2 arguments"))?,
+            )?;
+            Ok(mk(
+                ItKind::FilterFalse,
+                vec![src],
+                func,
+                vec![],
+                vec![],
+                false,
+            ))
         }
         "islice" => {
             let src = iter_of(&arg0(&args)?)?;
@@ -5937,7 +6049,14 @@ fn call_itertools(name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) ->
                 )
             };
             // nums = [next_yield_index=start, stop, step, cursor=0]
-            Ok(mk(ItKind::ISlice, vec![src], Value::Undef, vec![start, stop, step, 0], vec![], false))
+            Ok(mk(
+                ItKind::ISlice,
+                vec![src],
+                Value::Undef,
+                vec![start, stop, step, 0],
+                vec![],
+                false,
+            ))
         }
         "zip_longest" => {
             let fill = kw("fillvalue").unwrap_or(Value::Undef);
@@ -5949,7 +6068,14 @@ fn call_itertools(name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) ->
         }
         "pairwise" => {
             let src = iter_of(&arg0(&args)?)?;
-            Ok(mk(ItKind::Pairwise, vec![src], Value::Undef, vec![], vec![], false))
+            Ok(mk(
+                ItKind::Pairwise,
+                vec![src],
+                Value::Undef,
+                vec![],
+                vec![],
+                false,
+            ))
         }
         "product" => itertools_product(&args, &kwargs),
         "permutations" => itertools_permutations(&args),
@@ -5957,7 +6083,9 @@ fn call_itertools(name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) ->
         "combinations_with_replacement" => itertools_combinations(&args, true),
         "tee" => itertools_tee(&args),
         "groupby" => itertools_groupby(&args, &kwargs),
-        _ => Err(format!("AttributeError: module 'itertools' has no attribute '{name}'")),
+        _ => Err(format!(
+            "AttributeError: module 'itertools' has no attribute '{name}'"
+        )),
     }
 }
 
@@ -6000,7 +6128,10 @@ fn itertools_product(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value
         }
         result = next;
     }
-    let tuples: Vec<Value> = result.into_iter().map(|r| with_host(|h| h.new_tuple(r))).collect();
+    let tuples: Vec<Value> = result
+        .into_iter()
+        .map(|r| with_host(|h| h.new_tuple(r)))
+        .collect();
     Ok(list_iter(tuples))
 }
 
@@ -6112,7 +6243,11 @@ fn itertools_combinations(args: &[Value], with_repl: bool) -> Result<Value, Stri
 
 fn itertools_tee(args: &[Value]) -> Result<Value, String> {
     let items = host::iter_vec(&arg0(args)?)?;
-    let n = args.get(1).and_then(|v| with_host(|h| h.as_int(v))).unwrap_or(2).max(0) as usize;
+    let n = args
+        .get(1)
+        .and_then(|v| with_host(|h| h.as_int(v)))
+        .unwrap_or(2)
+        .max(0) as usize;
     let iters: Vec<Value> = (0..n).map(|_| list_iter(items.clone())).collect();
     Ok(with_host(|h| h.new_tuple(iters)))
 }
@@ -6184,7 +6319,10 @@ pub fn random_method(id: u32, name: &str, args: &[Value]) -> Result<Value, Strin
             h.mt_states.entry(id).or_default().random()
         }))),
         "getrandbits" => {
-            let k = args.first().and_then(|v| with_host(|h| h.as_int(v))).unwrap_or(0);
+            let k = args
+                .first()
+                .and_then(|v| with_host(|h| h.as_int(v)))
+                .unwrap_or(0);
             if k <= 0 {
                 return Err("ValueError: number of bits must be greater than zero".into());
             }
@@ -6222,15 +6360,16 @@ pub fn random_method(id: u32, name: &str, args: &[Value]) -> Result<Value, Strin
             with_host(|h| h.mt_states.entry(id).or_default().set_state(&s));
             Ok(Value::Undef)
         }
-        _ => Err(format!("AttributeError: '_random.Random' object has no method '{name}'")),
+        _ => Err(format!(
+            "AttributeError: '_random.Random' object has no method '{name}'"
+        )),
     }
 }
 
 /// The `posix` syscall surface, backed by std::fs/std::env/libc.
 fn call_posix(name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Result<Value, String> {
-    let path_arg = |i: usize| -> Option<String> {
-        args.get(i).and_then(|v| with_host(|h| h.as_str(v)))
-    };
+    let path_arg =
+        |i: usize| -> Option<String> { args.get(i).and_then(|v| with_host(|h| h.as_str(v))) };
     let str_v = |s: String| with_host(|h| h.new_str(s));
     let io_err = |e: std::io::Error| -> String {
         let code = e.raw_os_error().unwrap_or(0);
@@ -6241,9 +6380,7 @@ fn call_posix(name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Res
             .map(|p| str_v(p.to_string_lossy().into_owned()))
             .map_err(io_err),
         "getcwdb" => std::env::current_dir()
-            .map(|p| {
-                with_host(|h| h.alloc(PyObj::Bytes(p.to_string_lossy().as_bytes().to_vec())))
-            })
+            .map(|p| with_host(|h| h.alloc(PyObj::Bytes(p.to_string_lossy().as_bytes().to_vec()))))
             .map_err(io_err),
         "chdir" => {
             let p = path_arg(0).ok_or_else(|| host::type_error("chdir: path required"))?;
@@ -6301,12 +6438,19 @@ fn call_posix(name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Res
         "getgid" | "getegid" => Ok(Value::Int(unsafe { libc::getgid() } as i64)),
         "getpgrp" => Ok(Value::Int(unsafe { libc::getpgrp() } as i64)),
         "umask" => {
-            let m = args.first().and_then(|v| with_host(|h| h.as_int(v))).unwrap_or(0);
+            let m = args
+                .first()
+                .and_then(|v| with_host(|h| h.as_int(v)))
+                .unwrap_or(0);
             let prev = unsafe { libc::umask(m as libc::mode_t) };
             Ok(Value::Int(prev as i64))
         }
         "urandom" => {
-            let n = args.first().and_then(|v| with_host(|h| h.as_int(v))).unwrap_or(0).max(0) as usize;
+            let n = args
+                .first()
+                .and_then(|v| with_host(|h| h.as_int(v)))
+                .unwrap_or(0)
+                .max(0) as usize;
             let mut buf = vec![0u8; n];
             use std::io::Read;
             std::fs::File::open("/dev/urandom")
@@ -6334,9 +6478,15 @@ fn call_posix(name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Res
         }
         "access" => {
             let p = path_arg(0).ok_or_else(|| host::type_error("access: path required"))?;
-            let mode = args.get(1).and_then(|v| with_host(|h| h.as_int(v))).unwrap_or(0);
-            let cp = std::ffi::CString::new(p).map_err(|_| "ValueError: embedded null".to_string())?;
-            Ok(Value::Bool(unsafe { libc::access(cp.as_ptr(), mode as i32) } == 0))
+            let mode = args
+                .get(1)
+                .and_then(|v| with_host(|h| h.as_int(v)))
+                .unwrap_or(0);
+            let cp =
+                std::ffi::CString::new(p).map_err(|_| "ValueError: embedded null".to_string())?;
+            Ok(Value::Bool(
+                unsafe { libc::access(cp.as_ptr(), mode as i32) } == 0,
+            ))
         }
         "fspath" => {
             // Return str/bytes unchanged; call __fspath__ on a path-like object.
@@ -6350,7 +6500,10 @@ fn call_posix(name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Res
             }
         }
         "strerror" => {
-            let code = args.first().and_then(|v| with_host(|h| h.as_int(v))).unwrap_or(0);
+            let code = args
+                .first()
+                .and_then(|v| with_host(|h| h.as_int(v)))
+                .unwrap_or(0);
             let msg = std::io::Error::from_raw_os_error(code as i32).to_string();
             Ok(str_v(msg))
         }
@@ -6367,11 +6520,17 @@ fn call_posix(name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Res
             .map(|n| Value::Int(n.get() as i64))
             .unwrap_or(Value::Undef)),
         "isatty" => {
-            let fd = args.first().and_then(|v| with_host(|h| h.as_int(v))).unwrap_or(-1);
+            let fd = args
+                .first()
+                .and_then(|v| with_host(|h| h.as_int(v)))
+                .unwrap_or(-1);
             Ok(Value::Bool(unsafe { libc::isatty(fd as i32) } == 1))
         }
         "_exit" => {
-            let code = args.first().and_then(|v| with_host(|h| h.as_int(v))).unwrap_or(0);
+            let code = args
+                .first()
+                .and_then(|v| with_host(|h| h.as_int(v)))
+                .unwrap_or(0);
             std::process::exit(code as i32);
         }
         "abort" => std::process::exit(134),
@@ -6388,7 +6547,10 @@ fn call_posix(name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Res
         })),
         // File-descriptor level ops.
         "close" => {
-            let fd = args.first().and_then(|v| with_host(|h| h.as_int(v))).unwrap_or(-1);
+            let fd = args
+                .first()
+                .and_then(|v| with_host(|h| h.as_int(v)))
+                .unwrap_or(-1);
             unsafe { libc::close(fd as i32) };
             Ok(Value::Undef)
         }
@@ -6402,7 +6564,9 @@ fn call_posix(name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Res
                 .map(|t| str_v(t.to_string_lossy().into_owned()))
                 .map_err(io_err)
         }
-        _ => Err(format!("AttributeError: module 'posix' has no attribute '{name}'")),
+        _ => Err(format!(
+            "AttributeError: module 'posix' has no attribute '{name}'"
+        )),
     }
     .inspect_err(|_e| {
         let _ = &kwargs;
@@ -6959,9 +7123,9 @@ fn check_arity(name: &str, qual: &str, spec: Arity, argc: usize) -> Result<(), S
             "{name} expected at least {min} {}, got {argc}",
             plural(min)
         ))),
-        Arity::NoPositional if argc != 0 => {
-            Err(host::type_error(&format!("{name}() takes no positional arguments")))
-        }
+        Arity::NoPositional if argc != 0 => Err(host::type_error(&format!(
+            "{name}() takes no positional arguments"
+        ))),
         _ => Ok(()),
     }
 }
@@ -7005,7 +7169,9 @@ fn call_typing(f: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Resul
             .ok_or_else(|| host::type_error(&format!("{f}() argument 1 must be str")))?;
         // Positional args after the name are `TypeVar` constraints.
         let constraints: Vec<Value> = args.iter().skip(1).cloned().collect();
-        return Ok(with_host(|h| h.make_type_var(kind, name, constraints, kwargs)));
+        return Ok(with_host(|h| {
+            h.make_type_var(kind, name, constraints, kwargs)
+        }));
     }
     Err(host::name_error(&format!("_typing.{f}")))
 }
@@ -7085,8 +7251,7 @@ fn rewrite_class_backspace(pattern: &str, verbose: bool) -> std::borrow::Cow<'_,
             }
             // The crate's set operators are repeated literals to Python. Escaping
             // the first character of the pair keeps both as members.
-            c if in_class && matches!(c, '&' | '~' | '|') && chars.get(i + 1) == Some(&c) =>
-            {
+            c if in_class && matches!(c, '&' | '~' | '|') && chars.get(i + 1) == Some(&c) => {
                 out.push('\\');
                 out.push(c);
                 out.push(c);
@@ -7200,7 +7365,11 @@ fn re_build_match(pat_id: usize, text: &str, m_spans: Vec<Option<(usize, usize)>
 
 /// Run a compiled pattern's search/match against `text`, returning the group
 /// spans of the first match at/after `anchored` position, or None.
-fn re_first_match(pat_id: usize, text: &str, anchored: bool) -> Option<Vec<Option<(usize, usize)>>> {
+fn re_first_match(
+    pat_id: usize,
+    text: &str,
+    anchored: bool,
+) -> Option<Vec<Option<(usize, usize)>>> {
     with_host(|h| {
         let spans = h.regexes[pat_id].first_captures(text)?;
         // `match` requires the match to start at position 0.
@@ -7346,7 +7515,10 @@ pub fn re_pattern_method(
                 .into_iter()
                 .map(|row| {
                     if groups > 1 {
-                        let t: Vec<Value> = row.iter().map(|s| with_host(|h| h.new_str(s.clone()))).collect();
+                        let t: Vec<Value> = row
+                            .iter()
+                            .map(|s| with_host(|h| h.new_str(s.clone())))
+                            .collect();
                         with_host(|h| h.new_tuple(t))
                     } else {
                         with_host(|h| h.new_str(row[0].clone()))
@@ -7359,8 +7531,10 @@ pub fn re_pattern_method(
             let text = text.ok_or_else(|| host::type_error("expected string"))?;
             let all: Vec<Vec<Option<(usize, usize)>>> =
                 with_host(|h| h.regexes[pat_id].all_captures(&text));
-            let matches: Vec<Value> =
-                all.into_iter().map(|s| re_build_match(pat_id, &text, s)).collect();
+            let matches: Vec<Value> = all
+                .into_iter()
+                .map(|s| re_build_match(pat_id, &text, s))
+                .collect();
             // Return a list iterator (finditer yields lazily in CPython; a list is
             // an acceptable eager stand-in for typical use).
             let list = with_host(|h| h.new_list(matches));
@@ -7415,7 +7589,9 @@ pub fn re_pattern_method(
             vals.push(with_host(|h| h.new_str(text[last..].to_string())));
             Ok(with_host(|h| h.new_list(vals)))
         }
-        _ => Err(host::type_error(&format!("Pattern has no method '{method}'"))),
+        _ => Err(host::type_error(&format!(
+            "Pattern has no method '{method}'"
+        ))),
     }
 }
 
@@ -7559,8 +7735,8 @@ pub fn re_match_method(m: &Value, method: &str, args: &[Value]) -> Result<Value,
                 return Ok(group_str(0));
             }
             if args.len() == 1 {
-                let idx = group_idx(&args[0])
-                    .ok_or_else(|| "IndexError: no such group".to_string())?;
+                let idx =
+                    group_idx(&args[0]).ok_or_else(|| "IndexError: no such group".to_string())?;
                 return Ok(group_str(idx));
             }
             let vals: Vec<Value> = args
@@ -7589,15 +7765,14 @@ pub fn re_match_method(m: &Value, method: &str, args: &[Value]) -> Result<Value,
             Ok(with_host(|h| h.new_dict(d)))
         }
         "start" | "end" | "span" => {
-            let idx = args
-                .first()
-                .and_then(group_idx)
-                .unwrap_or(0);
+            let idx = args.first().and_then(group_idx).unwrap_or(0);
             match spans.get(idx).copied().flatten() {
                 Some((s, e)) => Ok(match method {
                     "start" => Value::Int(s as i64),
                     "end" => Value::Int(e as i64),
-                    _ => with_host(|h| h.new_tuple(vec![Value::Int(s as i64), Value::Int(e as i64)])),
+                    _ => {
+                        with_host(|h| h.new_tuple(vec![Value::Int(s as i64), Value::Int(e as i64)]))
+                    }
                 }),
                 None => Ok(match method {
                     "span" => with_host(|h| h.new_tuple(vec![Value::Int(-1), Value::Int(-1)])),
@@ -7728,7 +7903,10 @@ fn call_time(f: &str, args: Vec<Value>) -> Result<Value, String> {
             Ok(Value::Int(monotonic_origin().elapsed().as_nanos() as i64))
         }
         "sleep" => {
-            let secs = args.first().and_then(|v| with_host(|h| h.num_val(v))).unwrap_or(0.0);
+            let secs = args
+                .first()
+                .and_then(|v| with_host(|h| h.num_val(v)))
+                .unwrap_or(0.0);
             if secs > 0.0 {
                 std::thread::sleep(std::time::Duration::from_secs_f64(secs));
             }
@@ -7791,7 +7969,13 @@ fn call_time(f: &str, args: Vec<Value>) -> Result<Value, String> {
                 unsafe { libc::localtime_r(&t, &mut tm) };
                 tm
             };
-            Ok(with_host(|h| h.new_str(strftime_libc("%a %b %e %H:%M:%S %Y", &mut tm).trim().to_string())))
+            Ok(with_host(|h| {
+                h.new_str(
+                    strftime_libc("%a %b %e %H:%M:%S %Y", &mut tm)
+                        .trim()
+                        .to_string(),
+                )
+            }))
         }
         _ => Err(host::name_error(&format!("time.{f}"))),
     }
@@ -7992,13 +8176,12 @@ fn call_math(name: &str, args: &[Value], kwargs: &[(String, Value)]) -> Result<V
         // `fsum` uses. `statistics.correlation` and `linear_regression` are built
         // on this, and both are meaningless if the dot product drifts.
         "sumprod" => {
-            let (p, q) = with_host(|h| Ok::<_, String>((h.iter_items(&args[0])?, h.iter_items(&args[1])?)))?;
+            let (p, q) =
+                with_host(|h| Ok::<_, String>((h.iter_items(&args[0])?, h.iter_items(&args[1])?)))?;
             if p.len() != q.len() {
                 return Err("ValueError: Inputs are not the same length".into());
             }
-            let all_int = with_host(|h| {
-                p.iter().chain(q.iter()).all(|v| h.big_val(v).is_some())
-            });
+            let all_int = with_host(|h| p.iter().chain(q.iter()).all(|v| h.big_val(v).is_some()));
             if all_int {
                 let mut acc = num_bigint::BigInt::from(0);
                 for (a, b) in p.iter().zip(&q) {
@@ -8027,8 +8210,9 @@ fn call_math(name: &str, args: &[Value], kwargs: &[(String, Value)]) -> Result<V
         "comb" | "perm" => {
             use num_bigint::BigInt;
             use num_traits::{ToPrimitive, Zero};
-            let n = with_host(|h| h.big_val(&args[0]))
-                .ok_or_else(|| host::type_error("'float' object cannot be interpreted as an integer"))?;
+            let n = with_host(|h| h.big_val(&args[0])).ok_or_else(|| {
+                host::type_error("'float' object cannot be interpreted as an integer")
+            })?;
             let is_comb = name == "comb";
             let k = match args.get(1) {
                 Some(v) => with_host(|h| h.big_val(v)).ok_or_else(|| {
@@ -8376,7 +8560,8 @@ pub fn type_has_method(typename: &str, name: &str) -> bool {
     if name == "__contains__"
         && matches!(
             typename,
-            "str" | "bytes"
+            "str"
+                | "bytes"
                 | "bytearray"
                 | "list"
                 | "tuple"
@@ -8422,10 +8607,11 @@ pub fn type_has_method(typename: &str, name: &str) -> bool {
         // A C-level attribute descriptor is callable through the descriptor
         // protocol: `type.__dict__['__annotations__'].__get__(cls)`.
         "Context" => return matches!(name, "run" | "copy" | "get" | "keys" | "values" | "items"),
-        "getset_descriptor" | "member_descriptor" | "wrapper_descriptor"
-        | "classmethod_descriptor" | "method-wrapper" => {
-            return matches!(name, "__get__" | "__set__" | "__delete__")
-        }
+        "getset_descriptor"
+        | "member_descriptor"
+        | "wrapper_descriptor"
+        | "classmethod_descriptor"
+        | "method-wrapper" => return matches!(name, "__get__" | "__set__" | "__delete__"),
         "int" | "bool" => return INT_METHODS.contains(&name) || INT_DUNDERS.contains(&name),
         "float" => return FLOAT_METHODS.contains(&name) || FLOAT_DUNDERS.contains(&name),
         "complex" => COMPLEX_METHODS,
@@ -8936,7 +9122,11 @@ fn context_var_method(recv: &Value, name: &str, args: &[Value]) -> Option<Result
         // `get()` → the set value, else the explicit fallback, else the
         // variable's default, else LookupError (CPython raises exactly that).
         "get" => with_host(|h| match h.get(recv) {
-            Some(PyObj::ContextVar { name, default, value }) => {
+            Some(PyObj::ContextVar {
+                name,
+                default,
+                value,
+            }) => {
                 if let Some(v) = value {
                     return Ok((**v).clone());
                 }
@@ -9086,14 +9276,18 @@ pub fn call_type_method(
                 None => Err("StopIteration".to_string()),
             }
         }
-        "__str__" => return Ok(with_host(|h| {
-            let s = h.str_of(recv);
-            h.new_str(s)
-        })),
-        "__repr__" => return Ok(with_host(|h| {
-            let s = h.repr_of(recv);
-            h.new_str(s)
-        })),
+        "__str__" => {
+            return Ok(with_host(|h| {
+                let s = h.str_of(recv);
+                h.new_str(s)
+            }))
+        }
+        "__repr__" => {
+            return Ok(with_host(|h| {
+                let s = h.repr_of(recv);
+                h.new_str(s)
+            }))
+        }
         "__bool__" => return Ok(Value::Bool(with_host(|h| h.truthy(recv)))),
         _ => {}
     }
@@ -9949,18 +10143,16 @@ pub fn type_new_meta(
         }
         _ => None,
     });
-    let namespace: IndexMap<String, Value> = with_host(|h| {
-        match dict_handle.as_ref().and_then(|d| h.get(d)) {
+    let namespace: IndexMap<String, Value> =
+        with_host(|h| match dict_handle.as_ref().and_then(|d| h.get(d)) {
             Some(PyObj::Dict(d)) => d
                 .values()
                 .filter_map(|(k, v)| h.as_str(k).map(|s| (s, v.clone())))
                 .collect(),
             _ => IndexMap::new(),
-        }
-    });
-    let cls = with_host(|h| {
-        h.register_class_meta(&cname, base_names, namespace.clone(), metaclass)
-    });
+        });
+    let cls =
+        with_host(|h| h.register_class_meta(&cname, base_names, namespace.clone(), metaclass));
     // Descriptor naming and PEP 487 both run inside `type.__new__` in CPython —
     // fire them here so a metaclass's `super().__new__(mcls, name, bases,
     // classdict, **kwds)` builds enum members (`_proto_member.__set_name__`),

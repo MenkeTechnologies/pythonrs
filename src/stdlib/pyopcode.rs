@@ -16,18 +16,80 @@
 use crate::host::{PyHost, PyObj};
 use fusevm::Value;
 
-const HAS_ARG: &[i64] = &[44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,128,143,144,145,146,147,148,149,150,151,152,153,155,156,157,158,159,160,161,162,163,164,165,166,167,168,169,170,171,172,173,174,175,176,177,178,179,180,181,182,183,184,185,186,187,188,189,190,191,192,193,194,195,197,200,209,210,211,237,239,241,242,243,244,245,247,248,249,250,251,253,255,257,258,259,260,261,263,264,265,266];
-const HAS_CONST: &[i64] = &[82,190,191];
-const HAS_NAME: &[i64] = &[61,64,65,72,73,80,91,92,93,96,110,115,116,179,189,194,195,200,249];
-const HAS_JUMP: &[i64] = &[68,70,75,76,77,100,101,102,103,106,172,173,174,175,176,237,248,257,258,259,260];
-const HAS_FREE: &[i64] = &[62,90,97,111];
-const HAS_LOCAL: &[i64] = &[3,63,83,84,85,86,87,88,89,112,113,114,261,266];
-const HAS_EXC: &[i64] = &[263,264,265];
+const HAS_ARG: &[i64] = &[
+    44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67,
+    68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91,
+    92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111,
+    112, 113, 114, 115, 116, 117, 118, 119, 120, 128, 143, 144, 145, 146, 147, 148, 149, 150, 151,
+    152, 153, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171,
+    172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189, 190,
+    191, 192, 193, 194, 195, 197, 200, 209, 210, 211, 237, 239, 241, 242, 243, 244, 245, 247, 248,
+    249, 250, 251, 253, 255, 257, 258, 259, 260, 261, 263, 264, 265, 266,
+];
+const HAS_CONST: &[i64] = &[82, 190, 191];
+const HAS_NAME: &[i64] = &[
+    61, 64, 65, 72, 73, 80, 91, 92, 93, 96, 110, 115, 116, 179, 189, 194, 195, 200, 249,
+];
+const HAS_JUMP: &[i64] = &[
+    68, 70, 75, 76, 77, 100, 101, 102, 103, 106, 172, 173, 174, 175, 176, 237, 248, 257, 258, 259,
+    260,
+];
+const HAS_FREE: &[i64] = &[62, 90, 97, 111];
+const HAS_LOCAL: &[i64] = &[3, 63, 83, 84, 85, 86, 87, 88, 89, 112, 113, 114, 261, 266];
+const HAS_EXC: &[i64] = &[263, 264, 265];
 
-const INTRINSIC1: &[&str] = &["INTRINSIC_1_INVALID", "INTRINSIC_PRINT", "INTRINSIC_IMPORT_STAR", "INTRINSIC_STOPITERATION_ERROR", "INTRINSIC_ASYNC_GEN_WRAP", "INTRINSIC_UNARY_POSITIVE", "INTRINSIC_LIST_TO_TUPLE", "INTRINSIC_TYPEVAR", "INTRINSIC_PARAMSPEC", "INTRINSIC_TYPEVARTUPLE", "INTRINSIC_SUBSCRIPT_GENERIC", "INTRINSIC_TYPEALIAS"];
-const INTRINSIC2: &[&str] = &["INTRINSIC_2_INVALID", "INTRINSIC_PREP_RERAISE_STAR", "INTRINSIC_TYPEVAR_WITH_BOUND", "INTRINSIC_TYPEVAR_WITH_CONSTRAINTS", "INTRINSIC_SET_FUNCTION_TYPE_PARAMS", "INTRINSIC_SET_TYPEPARAM_DEFAULT"];
+const INTRINSIC1: &[&str] = &[
+    "INTRINSIC_1_INVALID",
+    "INTRINSIC_PRINT",
+    "INTRINSIC_IMPORT_STAR",
+    "INTRINSIC_STOPITERATION_ERROR",
+    "INTRINSIC_ASYNC_GEN_WRAP",
+    "INTRINSIC_UNARY_POSITIVE",
+    "INTRINSIC_LIST_TO_TUPLE",
+    "INTRINSIC_TYPEVAR",
+    "INTRINSIC_PARAMSPEC",
+    "INTRINSIC_TYPEVARTUPLE",
+    "INTRINSIC_SUBSCRIPT_GENERIC",
+    "INTRINSIC_TYPEALIAS",
+];
+const INTRINSIC2: &[&str] = &[
+    "INTRINSIC_2_INVALID",
+    "INTRINSIC_PREP_RERAISE_STAR",
+    "INTRINSIC_TYPEVAR_WITH_BOUND",
+    "INTRINSIC_TYPEVAR_WITH_CONSTRAINTS",
+    "INTRINSIC_SET_FUNCTION_TYPE_PARAMS",
+    "INTRINSIC_SET_TYPEPARAM_DEFAULT",
+];
 const SPECIAL_METHODS: &[&str] = &["__enter__", "__exit__", "__aenter__", "__aexit__"];
-const NB_OPS: &[(&str, &str)] = &[("NB_ADD", "+"), ("NB_AND", "&"), ("NB_FLOOR_DIVIDE", "//"), ("NB_LSHIFT", "<<"), ("NB_MATRIX_MULTIPLY", "@"), ("NB_MULTIPLY", "*"), ("NB_REMAINDER", "%"), ("NB_OR", "|"), ("NB_POWER", "**"), ("NB_RSHIFT", ">>"), ("NB_SUBTRACT", "-"), ("NB_TRUE_DIVIDE", "/"), ("NB_XOR", "^"), ("NB_INPLACE_ADD", "+="), ("NB_INPLACE_AND", "&="), ("NB_INPLACE_FLOOR_DIVIDE", "//="), ("NB_INPLACE_LSHIFT", "<<="), ("NB_INPLACE_MATRIX_MULTIPLY", "@="), ("NB_INPLACE_MULTIPLY", "*="), ("NB_INPLACE_REMAINDER", "%="), ("NB_INPLACE_OR", "|="), ("NB_INPLACE_POWER", "**="), ("NB_INPLACE_RSHIFT", ">>="), ("NB_INPLACE_SUBTRACT", "-="), ("NB_INPLACE_TRUE_DIVIDE", "/="), ("NB_INPLACE_XOR", "^="), ("NB_SUBSCR", "[]")];
+const NB_OPS: &[(&str, &str)] = &[
+    ("NB_ADD", "+"),
+    ("NB_AND", "&"),
+    ("NB_FLOOR_DIVIDE", "//"),
+    ("NB_LSHIFT", "<<"),
+    ("NB_MATRIX_MULTIPLY", "@"),
+    ("NB_MULTIPLY", "*"),
+    ("NB_REMAINDER", "%"),
+    ("NB_OR", "|"),
+    ("NB_POWER", "**"),
+    ("NB_RSHIFT", ">>"),
+    ("NB_SUBTRACT", "-"),
+    ("NB_TRUE_DIVIDE", "/"),
+    ("NB_XOR", "^"),
+    ("NB_INPLACE_ADD", "+="),
+    ("NB_INPLACE_AND", "&="),
+    ("NB_INPLACE_FLOOR_DIVIDE", "//="),
+    ("NB_INPLACE_LSHIFT", "<<="),
+    ("NB_INPLACE_MATRIX_MULTIPLY", "@="),
+    ("NB_INPLACE_MULTIPLY", "*="),
+    ("NB_INPLACE_REMAINDER", "%="),
+    ("NB_INPLACE_OR", "|="),
+    ("NB_INPLACE_POWER", "**="),
+    ("NB_INPLACE_RSHIFT", ">>="),
+    ("NB_INPLACE_SUBTRACT", "-="),
+    ("NB_INPLACE_TRUE_DIVIDE", "/="),
+    ("NB_INPLACE_XOR", "^="),
+    ("NB_SUBSCR", "[]"),
+];
 
 /// `_opcode.<fn>(...)`.
 pub fn call(h: &mut PyHost, name: &str, args: &[Value]) -> Option<Result<Value, String>> {
@@ -101,7 +163,12 @@ pub fn entries(h: &mut PyHost) -> Vec<(String, Value)> {
     ];
     let mut out: Vec<(String, Value)> = FNS
         .iter()
-        .map(|f| ((*f).to_string(), h.alloc(PyObj::Builtin(format!("_opcode.{f}")))))
+        .map(|f| {
+            (
+                (*f).to_string(),
+                h.alloc(PyObj::Builtin(format!("_opcode.{f}"))),
+            )
+        })
         .collect();
     // Specialization is a CPython interpreter feature; pythonrs has its own JIT
     // and never runs these instructions, so the flags are off.

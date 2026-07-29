@@ -153,16 +153,18 @@ impl Dialect {
             }
             // An unknown keyword is an error, as it is in CPython — a typo in a
             // dialect parameter would otherwise be silently ignored.
-            _ => return Err(host::type_error(&format!("'{name}' is an invalid keyword argument"))),
+            _ => {
+                return Err(host::type_error(&format!(
+                    "'{name}' is an invalid keyword argument"
+                )))
+            }
         }
         Ok(())
     }
 
     fn validate(&self) -> Result<(), String> {
         if self.quoting != QUOTE_NONE && self.quotechar.is_none() {
-            return Err(host::type_error(
-                "quotechar must be set if quoting enabled",
-            ));
+            return Err(host::type_error("quotechar must be set if quoting enabled"));
         }
         if !(QUOTE_MINIMAL..=QUOTE_NOTNULL).contains(&self.quoting) {
             return Err(host::type_error("bad \"quoting\" value"));
@@ -187,8 +189,7 @@ impl Dialect {
                     || field.contains('\r')
                     || field.contains('\n')
                     || self.lineterminator.chars().any(|c| field.contains(c))
-                    || (self.doublequote
-                        && self.quotechar.is_some_and(|q| field.contains(q)))
+                    || (self.doublequote && self.quotechar.is_some_and(|q| field.contains(q)))
             }
         }
     }
@@ -233,7 +234,13 @@ fn registry_get(name: &str) -> Option<Dialect> {
 
 /// Render one field. `was_string`/`was_none` drive the type-sensitive quoting
 /// modes, which is why the caller passes them rather than just the text.
-fn write_field(out: &mut String, d: &Dialect, field: &str, was_string: bool, was_none: bool) -> Result<(), String> {
+fn write_field(
+    out: &mut String,
+    d: &Dialect,
+    field: &str,
+    was_string: bool,
+    was_none: bool,
+) -> Result<(), String> {
     let quote = d.needs_quotes(field, was_string, was_none);
     let q = d.quotechar.unwrap_or('"');
     if quote {
@@ -419,7 +426,9 @@ pub fn call(
             Ok(Value::Undef)
         })(),
         "unregister_dialect" => {
-            let name = h.as_str(args.first().unwrap_or(&Value::Undef)).unwrap_or_default();
+            let name = h
+                .as_str(args.first().unwrap_or(&Value::Undef))
+                .unwrap_or_default();
             let known = DIALECTS.with(|reg| {
                 let mut reg = reg.borrow_mut();
                 let before = reg.len();
@@ -433,14 +442,19 @@ pub fn call(
             }
         }
         "get_dialect" => (|| -> Result<Value, String> {
-            let name = h.as_str(args.first().unwrap_or(&Value::Undef)).unwrap_or_default();
+            let name = h
+                .as_str(args.first().unwrap_or(&Value::Undef))
+                .unwrap_or_default();
             let d = registry_get(&name)
                 .ok_or_else(|| format!("_csv.Error: unknown dialect '{name}'"))?;
             Ok(h.alloc(PyObj::CsvDialect(Box::new(d))))
         })(),
         "list_dialects" => {
             let names = DIALECTS.with(|reg| {
-                reg.borrow().iter().map(|(n, _)| n.clone()).collect::<Vec<_>>()
+                reg.borrow()
+                    .iter()
+                    .map(|(n, _)| n.clone())
+                    .collect::<Vec<_>>()
             });
             let vals: Vec<Value> = names.into_iter().map(|n| h.new_str(n)).collect();
             Ok(h.new_list(vals))
@@ -543,7 +557,12 @@ pub fn entries(h: &mut PyHost) -> Vec<(String, Value)> {
     ];
     let mut out: Vec<(String, Value)> = FNS
         .iter()
-        .map(|f| ((*f).to_string(), h.alloc(PyObj::Builtin(format!("_csv.{f}")))))
+        .map(|f| {
+            (
+                (*f).to_string(),
+                h.alloc(PyObj::Builtin(format!("_csv.{f}"))),
+            )
+        })
         .collect();
     for (k, v) in [
         ("QUOTE_MINIMAL", QUOTE_MINIMAL),

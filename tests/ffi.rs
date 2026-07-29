@@ -701,7 +701,9 @@ except Exception as e:
             || stderr.contains("SyntaxError")
             || stderr.contains("ImportError"));
     if stdlib_unavailable {
-        eprintln!("skipping ffi-frozen-setattr test: dataclasses unavailable on this build ({stderr})");
+        eprintln!(
+            "skipping ffi-frozen-setattr test: dataclasses unavailable on this build ({stderr})"
+        );
         return;
     }
     assert!(!stderr.contains("RefCell"), "double-borrow panic: {stderr}");

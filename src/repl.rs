@@ -183,7 +183,11 @@ fn build_editor() -> Reedline {
         KeyCode::BackTab,
         ReedlineEvent::MenuPrevious,
     );
-    keybindings.add_binding(KeyModifiers::NONE, KeyCode::BackTab, ReedlineEvent::MenuPrevious);
+    keybindings.add_binding(
+        KeyModifiers::NONE,
+        KeyCode::BackTab,
+        ReedlineEvent::MenuPrevious,
+    );
 
     let editor = Reedline::create()
         .with_completer(Box::new(completer))
@@ -295,7 +299,10 @@ mod tests {
         assert!(v.iter().any(|w| w == "def"), "keyword `def` missing");
         assert!(v.iter().any(|w| w == "lambda"), "keyword `lambda` missing");
         assert!(v.iter().any(|w| w == "sqrt"), "math `sqrt` missing");
-        assert!(v.iter().any(|w| w == "append"), "list method `append` missing");
+        assert!(
+            v.iter().any(|w| w == "append"),
+            "list method `append` missing"
+        );
     }
 
     #[test]
@@ -345,12 +352,18 @@ mod tests {
         };
         let line = "s.up";
         let out = c.complete(line, line.len());
-        assert!(out.iter().any(|s| s.value == "upper"), "str.upper not offered");
+        assert!(
+            out.iter().any(|s| s.value == "upper"),
+            "str.upper not offered"
+        );
         assert!(out.iter().all(|s| s.value.starts_with("up")));
         // A dict-only method must not leak onto a str receiver.
         let all = c.complete("s.", 2);
         assert!(all.iter().any(|s| s.value == "split"), "str.split missing");
-        assert!(!all.iter().any(|s| s.value == "keys"), "dict.keys leaked onto str");
+        assert!(
+            !all.iter().any(|s| s.value == "keys"),
+            "dict.keys leaked onto str"
+        );
     }
 
     #[test]
@@ -363,7 +376,10 @@ mod tests {
             static_words: build_static_words(),
         };
         let out = c.complete("xs.app", 6);
-        assert!(out.iter().any(|s| s.value == "append"), "list.append not offered");
+        assert!(
+            out.iter().any(|s| s.value == "append"),
+            "list.append not offered"
+        );
         assert!(out.iter().all(|s| s.value.starts_with("app")));
     }
 
@@ -388,7 +404,10 @@ mod tests {
         };
         let line = "le";
         let out = c.complete(line, line.len());
-        assert!(out.iter().any(|s| s.value == "len"), "`len` not suggested for `le`");
+        assert!(
+            out.iter().any(|s| s.value == "len"),
+            "`len` not suggested for `le`"
+        );
         // Every suggestion must actually start with the prefix.
         assert!(out.iter().all(|s| s.value.starts_with("le")));
         // No duplicate values.

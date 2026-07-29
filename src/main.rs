@@ -69,7 +69,10 @@ fn run_main() -> ExitCode {
         return match pythonrs::cache::clear() {
             Ok(()) => {
                 // Explicit, user-requested confirmation on stdout.
-                println!("python: bytecode cache cleared ({})", pythonrs::cache::default_cache_path().display());
+                println!(
+                    "python: bytecode cache cleared ({})",
+                    pythonrs::cache::default_cache_path().display()
+                );
                 ExitCode::SUCCESS
             }
             Err(e) => fail(&format!("--cache-clear: {e}")),
@@ -177,7 +180,13 @@ fn run_script(cli: &pythonrs::cli::Cli, file: String, args: Vec<String>) -> Exit
     let abs = abs_path(&file);
     let mut argv = vec![file];
     argv.extend(args);
-    emit(pythonrs::run_program(&src, argv, Some(abs.clone()), &abs, true))
+    emit(pythonrs::run_program(
+        &src,
+        argv,
+        Some(abs.clone()),
+        &abs,
+        true,
+    ))
 }
 
 /// CPython tolerates a uniformly-indented `-c` program (`python -c '  print(1)'`

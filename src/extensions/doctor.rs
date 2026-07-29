@@ -274,11 +274,7 @@ fn path_pythons() {
             }
             seen.push(disp.clone());
             let exec = full.metadata().map(is_executable).unwrap_or(false);
-            println!(
-                "  {} {}",
-                if exec { green("✓") } else { red("✗") },
-                disp,
-            );
+            println!("  {} {}", if exec { green("✓") } else { red("✗") }, disp,);
             found += 1;
         }
     }

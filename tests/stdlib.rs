@@ -188,10 +188,7 @@ r = [
     hash(C.A) == hash(C.A),
     hash(d1) == hash(Decimal('1.5')),
 ]";
-    assert_eq!(
-        g(src, "r"),
-        "[True, 2, 2, True, 1, True, True, True]"
-    );
+    assert_eq!(g(src, "r"), "[True, 2, 2, True, 1, True, True, True]");
 }
 
 #[cfg(feature = "stdlib-ffi")]
@@ -914,7 +911,10 @@ fn vendored_import_is_memoized() {
     // Second import of the same module returns the identical cached object
     // (pythonrs's `sys.modules`), so the vendored `.py` executes at most once.
     assert_eq!(
-        g("import __future__ as a\nimport __future__ as b\nx = a is b", "x"),
+        g(
+            "import __future__ as a\nimport __future__ as b\nx = a is b",
+            "x"
+        ),
         "True"
     );
 }
@@ -935,7 +935,10 @@ fn dunder_contains_is_callable_on_builtin_containers() {
 fn vendored_keyword_runs_on_pythonrs() {
     // `keyword.py` executes end-to-end on pythonrs (native build, no libpython):
     // its `iskeyword`/`issoftkeyword` are `frozenset(...).__contains__` bindings.
-    assert_eq!(g("import keyword\nx = keyword.iskeyword('for')", "x"), "True");
+    assert_eq!(
+        g("import keyword\nx = keyword.iskeyword('for')", "x"),
+        "True"
+    );
     assert_eq!(
         g("import keyword\nx = keyword.iskeyword('banana')", "x"),
         "False"
@@ -1013,13 +1016,13 @@ fn vendored_calendar_runs_on_pythonrs() {
     assert_eq!(g("import calendar\nx = int(calendar.JANUARY)", "x"), "1");
     assert_eq!(g("import calendar\nx = int(calendar.SUNDAY)", "x"), "6");
     assert_eq!(
-        g("import calendar\nx = repr(calendar.monthrange(2026, 2))", "x"),
+        g(
+            "import calendar\nx = repr(calendar.monthrange(2026, 2))",
+            "x"
+        ),
         "'(calendar.SUNDAY, 28)'"
     );
-    assert_eq!(
-        g("import calendar\nx = calendar.isleap(2024)", "x"),
-        "True"
-    );
+    assert_eq!(g("import calendar\nx = calendar.isleap(2024)", "x"), "True");
     assert_eq!(
         g("import calendar\nx = calendar.month_name[1]", "x"),
         "'January'"
@@ -1046,7 +1049,10 @@ fn a_property_on_a_metaclass_fires_for_the_class() {
         "'meta:C'"
     );
     assert_eq!(
-        g("import calendar\nx = list(calendar.Month.__members__)[0]", "x"),
+        g(
+            "import calendar\nx = list(calendar.Month.__members__)[0]",
+            "x"
+        ),
         "'JANUARY'"
     );
 }
@@ -1056,15 +1062,36 @@ fn typing_union_subscript_matches_the_pep604_spelling() {
     // Since 3.14 `typing.Union` IS `types.UnionType`, so `Union[X, Y]` and
     // `X | Y` must build the identical object — same flatten, same dedupe, same
     // collapse of a one-member union to that member.
-    assert_eq!(g("from _typing import Union\nx = Union[int, str]", "x"), "int | str");
-    assert_eq!(g("from _typing import Union\nx = Union[int]", "x"), "<class 'int'>");
-    assert_eq!(g("from _typing import Union\nx = Union[int, int]", "x"), "<class 'int'>");
     assert_eq!(
-        g("from _typing import Union\nx = Union[Union[int, str], bytes]", "x"),
+        g("from _typing import Union\nx = Union[int, str]", "x"),
+        "int | str"
+    );
+    assert_eq!(
+        g("from _typing import Union\nx = Union[int]", "x"),
+        "<class 'int'>"
+    );
+    assert_eq!(
+        g("from _typing import Union\nx = Union[int, int]", "x"),
+        "<class 'int'>"
+    );
+    assert_eq!(
+        g(
+            "from _typing import Union\nx = Union[Union[int, str], bytes]",
+            "x"
+        ),
         "int | str | bytes"
     );
-    assert_eq!(g("from _typing import Union\nx = Union[int, None]", "x"), "int | None");
-    assert_eq!(g("from _typing import Union\nx = Union[int, str] == (int | str)", "x"), "True");
+    assert_eq!(
+        g("from _typing import Union\nx = Union[int, None]", "x"),
+        "int | None"
+    );
+    assert_eq!(
+        g(
+            "from _typing import Union\nx = Union[int, str] == (int | str)",
+            "x"
+        ),
+        "True"
+    );
 }
 
 #[test]
@@ -1074,24 +1101,36 @@ fn regex_supports_lookaround_and_backreferences() {
     // exactly the patterns that need it — `_pydecimal` and `fractions` write their
     // number grammars with `(?=\d|\.\d)`, so `import decimal` depended on this.
     assert_eq!(
-        g(r#"import re
-x = re.findall(r'\d+(?= dollars)', '5 dollars 7 euros 9 dollars')"#, "x"),
+        g(
+            r#"import re
+x = re.findall(r'\d+(?= dollars)', '5 dollars 7 euros 9 dollars')"#,
+            "x"
+        ),
         "['5', '9']"
     );
     assert_eq!(
-        g(r#"import re
-x = re.sub(r'(?<=a)b', 'X', 'ab cb ab')"#, "x"),
+        g(
+            r#"import re
+x = re.sub(r'(?<=a)b', 'X', 'ab cb ab')"#,
+            "x"
+        ),
         "'aX cb aX'"
     );
     assert_eq!(
-        g(r#"import re
-x = re.search(r'(\w+) \1', 'hey hey there').group(0)"#, "x"),
+        g(
+            r#"import re
+x = re.search(r'(\w+) \1', 'hey hey there').group(0)"#,
+            "x"
+        ),
         "'hey hey'"
     );
     // The fast engine must still handle everything it always did.
     assert_eq!(
-        g(r#"import re
-x = re.findall(r'\b\w+\b', 'one two three')"#, "x"),
+        g(
+            r#"import re
+x = re.findall(r'\b\w+\b', 'one two three')"#,
+            "x"
+        ),
         "['one', 'two', 'three']"
     );
 }
@@ -1103,13 +1142,19 @@ fn re_split_keeps_capture_groups() {
     // group that did not participate. `textwrap` splits on a pattern that is ALL
     // groups, so dropping them made every `fill`/`wrap` return blank.
     assert_eq!(
-        g(r#"import re
-x = re.split(r'(\s)', 'a b c')"#, "x"),
+        g(
+            r#"import re
+x = re.split(r'(\s)', 'a b c')"#,
+            "x"
+        ),
         "['a', ' ', 'b', ' ', 'c']"
     );
     assert_eq!(
-        g(r#"import re
-x = re.split(r'(a)|(b)', 'zazbz')"#, "x"),
+        g(
+            r#"import re
+x = re.split(r'(a)|(b)', 'zazbz')"#,
+            "x"
+        ),
         "['z', 'a', None, 'z', None, 'b', 'z']"
     );
     // `maxsplit` is the THIRD positional of `re.split` (where the others keep
@@ -1131,7 +1176,10 @@ fn large_integers_compare_exactly() {
     // billions, and `_pydecimal.sqrt` (which ends in `exact = n*n == c`) took the
     // "exact" branch on a wrong root and returned 1 for sqrt(2).
     assert_eq!(
-        g("n = 14142135623730950488016887242\nc = 2 * 100**28\nx = (n*n == c)", "x"),
+        g(
+            "n = 14142135623730950488016887242\nc = 2 * 100**28\nx = (n*n == c)",
+            "x"
+        ),
         "False"
     );
     assert_eq!(g("x = (10**30 + 1 == 10**30)", "x"), "False");
@@ -1147,11 +1195,17 @@ fn vendored_decimal_and_fractions_run_on_pythonrs() {
     // The real `_pydecimal`/`fractions`, not a native subset: correctly-rounded
     // arbitrary-precision arithmetic all the way through.
     assert_eq!(
-        g("import decimal\nx = str(decimal.Decimal('1.1') + decimal.Decimal('2.2'))", "x"),
+        g(
+            "import decimal\nx = str(decimal.Decimal('1.1') + decimal.Decimal('2.2'))",
+            "x"
+        ),
         "'3.3'"
     );
     assert_eq!(
-        g("import decimal\nx = str(decimal.Decimal(1) / decimal.Decimal(7))", "x"),
+        g(
+            "import decimal\nx = str(decimal.Decimal(1) / decimal.Decimal(7))",
+            "x"
+        ),
         "'0.1428571428571428571428571429'"
     );
     assert_eq!(
@@ -1159,11 +1213,17 @@ fn vendored_decimal_and_fractions_run_on_pythonrs() {
         "'1.414213562373095048801688724'"
     );
     assert_eq!(
-        g("from fractions import Fraction\nx = str(Fraction('3/7') + Fraction(1, 14))", "x"),
+        g(
+            "from fractions import Fraction\nx = str(Fraction('3/7') + Fraction(1, 14))",
+            "x"
+        ),
         "'1/2'"
     );
     assert_eq!(
-        g("from fractions import Fraction\nx = str(sum(Fraction(1, n) for n in range(1, 10)))", "x"),
+        g(
+            "from fractions import Fraction\nx = str(sum(Fraction(1, n) for n in range(1, 10)))",
+            "x"
+        ),
         "'7129/2520'"
     );
 }
@@ -1173,14 +1233,23 @@ fn math_sumprod_is_exact_for_ints_and_correctly_rounded_for_floats() {
     // Two int sequences dot-product EXACTLY (bignum); floats go through the same
     // compensated accumulator `fsum` uses, with `fma` recovering each product's
     // rounding error. `statistics.correlation` is built on it.
-    assert_eq!(g("import math\nx = math.sumprod([1,2,3], [4,5,6])", "x"), "32");
     assert_eq!(
-        g("import math\nx = math.sumprod([10**20, 1], [10**20, 1])", "x"),
+        g("import math\nx = math.sumprod([1,2,3], [4,5,6])", "x"),
+        "32"
+    );
+    assert_eq!(
+        g(
+            "import math\nx = math.sumprod([10**20, 1], [10**20, 1])",
+            "x"
+        ),
         "10000000000000000000000000000000000000001"
     );
     // Catastrophic cancellation: the exact answer is 0, not 1e308-scale noise.
     assert_eq!(
-        g("import math\nx = math.sumprod([1e308, 1], [1, -1e308])", "x"),
+        g(
+            "import math\nx = math.sumprod([1e308, 1], [1, -1e308])",
+            "x"
+        ),
         "0.0"
     );
 }
@@ -1192,33 +1261,54 @@ fn vendored_io_runs_on_pythonrs() {
     // exercises both halves: the native `StringIO`/`BytesIO` and the vendored
     // module that registers them with `TextIOBase`/`BufferedIOBase`.
     assert_eq!(
-        g("import io\ns = io.StringIO()\ns.write('a')\ns.write('bc')\nx = s.getvalue()", "x"),
+        g(
+            "import io\ns = io.StringIO()\ns.write('a')\ns.write('bc')\nx = s.getvalue()",
+            "x"
+        ),
         "'abc'"
     );
     assert_eq!(
-        g("import io\ns = io.StringIO('a\\nb\\n')\nx = [l for l in s]", "x"),
+        g(
+            "import io\ns = io.StringIO('a\\nb\\n')\nx = [l for l in s]",
+            "x"
+        ),
         "['a\\n', 'b\\n']"
     );
     assert_eq!(
-        g("import io\nb = io.BytesIO(b'abcdef')\nb.read(2)\nb.seek(-2, 2)\nx = b.read()", "x"),
+        g(
+            "import io\nb = io.BytesIO(b'abcdef')\nb.read(2)\nb.seek(-2, 2)\nx = b.read()",
+            "x"
+        ),
         "b'ef'"
     );
     // An overwrite in the middle of a BytesIO leaves the tail intact.
     assert_eq!(
-        g("import io\nb = io.BytesIO(b'xyz')\nb.seek(1)\nb.write(b'Q')\nx = b.getvalue()", "x"),
+        g(
+            "import io\nb = io.BytesIO(b'xyz')\nb.seek(1)\nb.write(b'Q')\nx = b.getvalue()",
+            "x"
+        ),
         "b'xQz'"
     );
     // Text positions are CODE POINTS, not bytes: two 2-byte characters is 2.
     assert_eq!(
-        g("import io\ns = io.StringIO()\ns.write('\\u00e9\\u00e9')\nx = s.tell()", "x"),
+        g(
+            "import io\ns = io.StringIO()\ns.write('\\u00e9\\u00e9')\nx = s.tell()",
+            "x"
+        ),
         "2"
     );
     assert_eq!(
-        g("import io\nx = isinstance(io.StringIO(), io.TextIOBase)", "x"),
+        g(
+            "import io\nx = isinstance(io.StringIO(), io.TextIOBase)",
+            "x"
+        ),
         "True"
     );
     assert_eq!(
-        g("import io\nx = isinstance(io.BytesIO(), io.BufferedIOBase)", "x"),
+        g(
+            "import io\nx = isinstance(io.BytesIO(), io.BufferedIOBase)",
+            "x"
+        ),
         "True"
     );
     // A closed stream refuses every operation but `close`.
@@ -1246,13 +1336,19 @@ fn vendored_pathlib_runs_on_pythonrs() {
         "('f.tar.gz', 'f.tar', '.gz')"
     );
     assert_eq!(
-        g("import pathlib\nx = str(pathlib.PurePosixPath('a') / 'b' / 'c')", "x"),
+        g(
+            "import pathlib\nx = str(pathlib.PurePosixPath('a') / 'b' / 'c')",
+            "x"
+        ),
         "'a/b/c'"
     );
     // `relative_to` chains over `_PathParents`, whose only iteration protocol is
     // `__len__`/`__getitem__` — it has no `__iter__` at all.
     assert_eq!(
-        g("import pathlib\nx = str(pathlib.PurePosixPath('/a/b').relative_to('/a'))", "x"),
+        g(
+            "import pathlib\nx = str(pathlib.PurePosixPath('/a/b').relative_to('/a'))",
+            "x"
+        ),
         "'b'"
     );
 }
@@ -1268,13 +1364,28 @@ fn a_getitem_only_sequence_iterates_in_lazy_iterators() {
                \x20       return i * 10\n\
                s = S()\n";
     assert_eq!(
-        g(&format!("{seq}from itertools import chain\nx = list(chain([1], s))"), "x"),
+        g(
+            &format!("{seq}from itertools import chain\nx = list(chain([1], s))"),
+            "x"
+        ),
         "[1, 0, 10, 20]"
     );
-    assert_eq!(g(&format!("{seq}x = list(zip(s, 'abc'))"), "x"), "[(0, 'a'), (10, 'b'), (20, 'c')]");
-    assert_eq!(g(&format!("{seq}x = list(map(str, s))"), "x"), "['0', '10', '20']");
-    assert_eq!(g(&format!("{seq}x = list(enumerate(s))"), "x"), "[(0, 0), (1, 10), (2, 20)]");
-    assert_eq!(g(&format!("{seq}x = list(filter(None, s))"), "x"), "[10, 20]");
+    assert_eq!(
+        g(&format!("{seq}x = list(zip(s, 'abc'))"), "x"),
+        "[(0, 'a'), (10, 'b'), (20, 'c')]"
+    );
+    assert_eq!(
+        g(&format!("{seq}x = list(map(str, s))"), "x"),
+        "['0', '10', '20']"
+    );
+    assert_eq!(
+        g(&format!("{seq}x = list(enumerate(s))"), "x"),
+        "[(0, 0), (1, 10), (2, 20)]"
+    );
+    assert_eq!(
+        g(&format!("{seq}x = list(filter(None, s))"), "x"),
+        "[10, 20]"
+    );
 }
 
 #[test]
@@ -1285,23 +1396,56 @@ fn python_character_class_syntax_survives_translation() {
     // NESTED class instead, failing with "unclosed character class" and taking
     // `pathlib` down with it.
     assert_eq!(
-        g(r"import re
-x = re.findall('([*?[])', 'a[b*c')", "x"),
+        g(
+            r"import re
+x = re.findall('([*?[])', 'a[b*c')",
+            "x"
+        ),
         "['[', '*']"
     );
     // `\b` is a backspace inside a class and a word boundary outside one.
-    assert_eq!(g(r"import re
-x = re.findall(r'[\b]', 'a\x08b')", "x"), "['\\x08']");
-    assert_eq!(g(r"import re
-x = re.findall(r'\bw\w*', 'a word')", "x"), "['word']");
+    assert_eq!(
+        g(
+            r"import re
+x = re.findall(r'[\b]', 'a\x08b')",
+            "x"
+        ),
+        "['\\x08']"
+    );
+    assert_eq!(
+        g(
+            r"import re
+x = re.findall(r'\bw\w*', 'a word')",
+            "x"
+        ),
+        "['word']"
+    );
     // `]` in first position is a literal member, not the close.
-    assert_eq!(g(r"import re
-x = re.findall(r'[]]', 'a]b')", "x"), "[']']");
-    assert_eq!(g(r"import re
-x = re.findall(r'[^]]+', 'ab]cd')", "x"), "['ab', 'cd']");
+    assert_eq!(
+        g(
+            r"import re
+x = re.findall(r'[]]', 'a]b')",
+            "x"
+        ),
+        "[']']"
+    );
+    assert_eq!(
+        g(
+            r"import re
+x = re.findall(r'[^]]+', 'ab]cd')",
+            "x"
+        ),
+        "['ab', 'cd']"
+    );
     // Ranges must keep working.
-    assert_eq!(g(r"import re
-x = re.findall(r'[a-z]+', 'abc123')", "x"), "['abc']");
+    assert_eq!(
+        g(
+            r"import re
+x = re.findall(r'[a-z]+', 'abc123')",
+            "x"
+        ),
+        "['abc']"
+    );
 }
 
 #[cfg(not(feature = "stdlib-ffi"))]
@@ -1362,10 +1506,16 @@ fn a_slot_wrapper_is_hashable_by_what_it_names() {
     // `_dispatch[dict.__repr__]` and read back via `type(obj).__repr__` — never
     // find its own entries.
     assert_eq!(
-        g("d = {dict.__repr__: 'D', list.__repr__: 'L'}\nx = d[type({}).__repr__]", "x"),
+        g(
+            "d = {dict.__repr__: 'D', list.__repr__: 'L'}\nx = d[type({}).__repr__]",
+            "x"
+        ),
         "'D'"
     );
-    assert_eq!(g("x = repr(dict.__repr__)", "x"), "\"<slot wrapper '__repr__' of 'dict' objects>\"");
+    assert_eq!(
+        g("x = repr(dict.__repr__)", "x"),
+        "\"<slot wrapper '__repr__' of 'dict' objects>\""
+    );
 }
 
 #[test]
@@ -1399,7 +1549,8 @@ fn a_class_named_after_a_builtin_type_does_not_replace_it() {
     );
     // A user class shadowing a builtin type leaves the builtin itself intact.
     assert_eq!(
-        g("class dict: pass\nx = {'a': 1}.keys()", "x"), "dict_keys(['a'])"
+        g("class dict: pass\nx = {'a': 1}.keys()", "x"),
+        "dict_keys(['a'])"
     );
 }
 
@@ -1410,7 +1561,10 @@ fn vendored_ast_node_types_run_on_pythonrs() {
     // `_fields` tuple. `ast.py` supplies every traversal helper on top.
     assert_eq!(g("import ast\nx = ast.Name._fields", "x"), "('id', 'ctx')");
     assert_eq!(
-        g("import ast\nn = ast.Name(id='x', ctx=ast.Load())\nx = (n.id, type(n.ctx).__name__)", "x"),
+        g(
+            "import ast\nn = ast.Name(id='x', ctx=ast.Load())\nx = (n.id, type(n.ctx).__name__)",
+            "x"
+        ),
         "('x', 'Load')"
     );
     // The hierarchy has to be real: `isinstance` against the abstract bases is
@@ -1420,7 +1574,10 @@ fn vendored_ast_node_types_run_on_pythonrs() {
         "(True, True)"
     );
     assert_eq!(
-        g("import ast\nx = repr(ast.BinOp(ast.Constant(1), ast.Add(), ast.Constant(2)))", "x"),
+        g(
+            "import ast\nx = repr(ast.BinOp(ast.Constant(1), ast.Add(), ast.Constant(2)))",
+            "x"
+        ),
         "'BinOp(left=Constant(value=1), op=Add(), right=Constant(value=2))'"
     );
 }
@@ -1585,7 +1742,10 @@ fn vendored_inspect_and_traceback_run_on_pythonrs() {
         "'(a, b=2, *args, **kw)'"
     );
     assert_eq!(
-        g("import inspect\nx = inspect.isfunction(inspect.signature)", "x"),
+        g(
+            "import inspect\nx = inspect.isfunction(inspect.signature)",
+            "x"
+        ),
         "True"
     );
     assert_eq!(
@@ -1612,7 +1772,10 @@ fn globals_is_the_live_module_namespace() {
     // `locals()` inside a function stays a snapshot, as CPython's is for an
     // optimized frame.
     assert_eq!(
-        g("def f():\n\x20   a = 1\n\x20   return locals()\nx = f()", "x"),
+        g(
+            "def f():\n\x20   a = 1\n\x20   return locals()\nx = f()",
+            "x"
+        ),
         "{'a': 1}"
     );
 }
@@ -1621,12 +1784,21 @@ fn globals_is_the_live_module_namespace() {
 fn a_function_reports_its_keyword_only_defaults() {
     // `inspect.signature` reads `__kwdefaults__` for every function it describes.
     assert_eq!(
-        g("def f(a, b=2, *args, c=3, d, **kw):\n\x20   pass\nx = f.__kwdefaults__", "x"),
+        g(
+            "def f(a, b=2, *args, c=3, d, **kw):\n\x20   pass\nx = f.__kwdefaults__",
+            "x"
+        ),
         "{'c': 3}"
     );
-    assert_eq!(g("def f(a, b=2):\n\x20   pass\nx = f.__defaults__", "x"), "(2,)");
+    assert_eq!(
+        g("def f(a, b=2):\n\x20   pass\nx = f.__defaults__", "x"),
+        "(2,)"
+    );
     // No keyword-only defaults at all is `None`, not an empty dict.
-    assert_eq!(g("def g(x):\n\x20   pass\nx = g.__kwdefaults__", "x"), "None");
+    assert_eq!(
+        g("def g(x):\n\x20   pass\nx = g.__kwdefaults__", "x"),
+        "None"
+    );
 }
 
 #[cfg(not(feature = "stdlib-ffi"))]
@@ -1691,7 +1863,10 @@ fn vendored_threading_runs_on_pythonrs() {
         "False"
     );
     assert_eq!(
-        g("import threading\ne = threading.Event()\ne.set()\nx = e.is_set()", "x"),
+        g(
+            "import threading\ne = threading.Event()\ne.set()\nx = e.is_set()",
+            "x"
+        ),
         "True"
     );
 }
@@ -1702,7 +1877,10 @@ fn hashlib_matches_the_reference_digests() {
     // The published test vectors for "abc". A hash is DEFINED by these, so a
     // wrong implementation is worse than a missing one.
     assert_eq!(
-        g("import hashlib\nx = hashlib.sha256(b'abc').hexdigest()", "x"),
+        g(
+            "import hashlib\nx = hashlib.sha256(b'abc').hexdigest()",
+            "x"
+        ),
         "'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'"
     );
     assert_eq!(
@@ -1714,11 +1892,17 @@ fn hashlib_matches_the_reference_digests() {
         "'a9993e364706816aba3e25717850c26c9cd0d89d'"
     );
     assert_eq!(
-        g("import hashlib\nx = hashlib.sha3_256(b'abc').hexdigest()", "x"),
+        g(
+            "import hashlib\nx = hashlib.sha3_256(b'abc').hexdigest()",
+            "x"
+        ),
         "'3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532'"
     );
     assert_eq!(
-        g("import hashlib\nx = hashlib.shake_128(b'abc').hexdigest(8)", "x"),
+        g(
+            "import hashlib\nx = hashlib.shake_128(b'abc').hexdigest(8)",
+            "x"
+        ),
         "'5881092dd818bf5c'"
     );
     // Feeding in pieces equals feeding at once, and reading a digest does not
@@ -1758,7 +1942,10 @@ fn base_exception_is_the_root_of_exceptions_only() {
     assert_eq!(g("x = isinstance(True, BaseException)", "x"), "False");
     assert_eq!(g("x = isinstance('s', BaseException)", "x"), "False");
     assert_eq!(g("x = isinstance(1, Exception)", "x"), "False");
-    assert_eq!(g("x = isinstance(ValueError('v'), BaseException)", "x"), "True");
+    assert_eq!(
+        g("x = isinstance(ValueError('v'), BaseException)", "x"),
+        "True"
+    );
     assert_eq!(
         g("class E(Exception): pass\nx = (isinstance(E(), BaseException), issubclass(E, BaseException))", "x"),
         "(True, True)"
@@ -1812,12 +1999,21 @@ fn an_exception_instance_carries_attributes() {
     // bookkeeping onto the exceptions it catches.
     assert_eq!(g("e = StopIteration()\ne.value = 5\nx = e.value", "x"), "5");
     assert_eq!(
-        g("v = ValueError('x')\nv.custom = 'y'\nx = (v.custom, v.args)", "x"),
+        g(
+            "v = ValueError('x')\nv.custom = 'y'\nx = (v.custom, v.args)",
+            "x"
+        ),
         "('y', ('x',))"
     );
     // `BaseException`'s own methods.
-    assert_eq!(g("e = ValueError('x')\nx = e.with_traceback(None) is e", "x"), "True");
-    assert_eq!(g("e = ValueError('x')\ne.add_note('n')\nx = e.__notes__", "x"), "['n']");
+    assert_eq!(
+        g("e = ValueError('x')\nx = e.with_traceback(None) is e", "x"),
+        "True"
+    );
+    assert_eq!(
+        g("e = ValueError('x')\ne.add_note('n')\nx = e.__notes__", "x"),
+        "['n']"
+    );
 }
 
 #[cfg(not(feature = "stdlib-ffi"))]
@@ -1892,7 +2088,10 @@ fn vendored_csv_runs_on_pythonrs() {
     );
     // A blank line is an EMPTY ROW, not a skipped one.
     assert_eq!(
-        g("import csv, io\nx = list(csv.reader(io.StringIO('\\n')))", "x"),
+        g(
+            "import csv, io\nx = list(csv.reader(io.StringIO('\\n')))",
+            "x"
+        ),
         "[[]]"
     );
     assert_eq!(
@@ -1943,8 +2142,14 @@ fn a_dict_view_takes_set_operations_against_any_iterable() {
     // A dict view's set operators accept any iterable, unlike a plain list's.
     // `csv.DictWriter` finds extra keys with `rowdict.keys() - self.fieldnames`,
     // where the right side is a LIST.
-    assert_eq!(g("d = {'a': 1, 'b': 2}\nx = sorted(d.keys() - ['a'])", "x"), "['b']");
-    assert_eq!(g("d = {'a': 1, 'b': 2}\nx = sorted(d.keys() & ['a'])", "x"), "['a']");
+    assert_eq!(
+        g("d = {'a': 1, 'b': 2}\nx = sorted(d.keys() - ['a'])", "x"),
+        "['b']"
+    );
+    assert_eq!(
+        g("d = {'a': 1, 'b': 2}\nx = sorted(d.keys() & ['a'])", "x"),
+        "['a']"
+    );
     assert_eq!(
         g("d = {'a': 1}\nx = sorted(d.keys() | {'z'})", "x"),
         "['a', 'z']"
@@ -1971,19 +2176,28 @@ fn verbose_mode_keeps_whitespace_inside_a_character_class() {
     // silently dropped from the class and `json.loads` could not skip the space
     // after a comma — every object with more than one key failed to parse.
     assert_eq!(
-        g(r"import re
-x = re.compile(r'[ \t\n\r]*', re.VERBOSE).match('a  b', 1).end()", "x"),
+        g(
+            r"import re
+x = re.compile(r'[ \t\n\r]*', re.VERBOSE).match('a  b', 1).end()",
+            "x"
+        ),
         "3"
     );
     assert_eq!(
-        g(r"import re
-x = re.findall(r'[ x]+', 'a x b', re.VERBOSE)", "x"),
+        g(
+            r"import re
+x = re.findall(r'[ x]+', 'a x b', re.VERBOSE)",
+            "x"
+        ),
         "[' x ']"
     );
     // Whitespace OUTSIDE a class is still ignored.
     assert_eq!(
-        g(r"import re
-x = re.findall(r'\d+  ', 'a12b', re.VERBOSE)", "x"),
+        g(
+            r"import re
+x = re.findall(r'\d+  ', 'a12b', re.VERBOSE)",
+            "x"
+        ),
         "['12']"
     );
 }

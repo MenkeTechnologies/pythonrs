@@ -63,8 +63,7 @@ pub fn call(h: &mut PyHost, name: &str, args: &[Value]) -> Option<Result<Value, 
             Ok(h.new_str(format!("Signal {num}")))
         }
         "valid_signals" => {
-            let mut items: indexmap::IndexMap<crate::host::PKey, Value> =
-                indexmap::IndexMap::new();
+            let mut items: indexmap::IndexMap<crate::host::PKey, Value> = indexmap::IndexMap::new();
             for (_, n) in SIGNALS {
                 items.insert(crate::host::PKey::Int(*n as i64), Value::Int(*n as i64));
             }
@@ -130,7 +129,12 @@ pub fn entries(h: &mut PyHost) -> Vec<(String, Value)> {
     ];
     let mut out: Vec<(String, Value)> = FNS
         .iter()
-        .map(|f| ((*f).to_string(), h.alloc(PyObj::Builtin(format!("_signal.{f}")))))
+        .map(|f| {
+            (
+                (*f).to_string(),
+                h.alloc(PyObj::Builtin(format!("_signal.{f}"))),
+            )
+        })
         .collect();
     for (name, num) in SIGNALS {
         out.push(((*name).to_string(), Value::Int(*num as i64)));

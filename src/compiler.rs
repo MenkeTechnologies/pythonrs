@@ -366,8 +366,7 @@ impl Compiler {
                         self.name_const(b, "__annotations__");
                         b.emit(Op::CallBuiltin(ops::GETLOCAL, 1), self.cur_line); // [dict]
                         self.strlit(b, n); // [dict, key]
-                        let ann_body =
-                            vec![Stmt::from(StmtKind::Return(Some(annotation.clone())))];
+                        let ann_body = vec![Stmt::from(StmtKind::Return(Some(annotation.clone())))];
                         let empty = Params::default();
                         self.fn_depth += 1;
                         let thunk_id = self.build_function("<annotate>", &empty, &ann_body);
@@ -1189,7 +1188,10 @@ impl Compiler {
         for stmt in body {
             match &stmt.kind {
                 StmtKind::For {
-                    target, iter, body: inner, ..
+                    target,
+                    iter,
+                    body: inner,
+                    ..
                 } => {
                     let tname = match target.unspanned() {
                         Expr::Name(n) => n.clone(),
@@ -1199,10 +1201,16 @@ impl Compiler {
                         native_range_call(iter).expect("native nest validated");
                     self.emit_native_range_loop(b, &tname, istart, istop, istep, inner)?;
                 }
-                StmtKind::While { test, body: wbody, .. } => {
+                StmtKind::While {
+                    test, body: wbody, ..
+                } => {
                     self.emit_native_while(b, test, wbody)?;
                 }
-                StmtKind::If { test, body: tb, orelse } => {
+                StmtKind::If {
+                    test,
+                    body: tb,
+                    orelse,
+                } => {
                     // Branchless fast path for conditional accumulation:
                     //   `if cond: acc += v`  ->  `acc += (cond & 1) * v`
                     //   `if cond: acc -= v`  ->  `acc -= (cond & 1) * v`
@@ -1212,9 +1220,7 @@ impl Compiler {
                     // turns the comparison's bool into an Int (arithmetic on a bool
                     // deopts; BitAnd accepts it). cond and v are side-effect-free,
                     // so evaluating them unconditionally is safe.
-                    if let Some((target_slot, nop, value)) =
-                        self.branchless_accum(tb, orelse)
-                    {
+                    if let Some((target_slot, nop, value)) = self.branchless_accum(tb, orelse) {
                         b.emit(Op::GetSlot(target_slot), 0);
                         self.emit_native_cond(b, test)?;
                         b.emit(Op::LoadInt(1), 0);
@@ -1286,7 +1292,12 @@ impl Compiler {
     /// native: `(i * i * i) % 1000000007` over 1.2M iterations goes from 386ms to
     /// 12ms. The floor correction below is unchanged — `MulMod` truncates exactly
     /// like `Mod`.
-    fn emit_native_mod(&mut self, b: &mut ChunkBuilder, dividend: &Expr, k: i64) -> Result<(), String> {
+    fn emit_native_mod(
+        &mut self,
+        b: &mut ChunkBuilder,
+        dividend: &Expr,
+        k: i64,
+    ) -> Result<(), String> {
         // The fused ops floor by themselves, so they need none of the correction
         // below and are emitted with a bare `return`.
         match dividend.unspanned() {
@@ -1346,9 +1357,7 @@ impl Compiler {
     /// the branch stays lowerable.
     fn emit_native_cond(&mut self, b: &mut ChunkBuilder, test: &Expr) -> Result<(), String> {
         match test.unspanned() {
-            Expr::Compare(lhs, rest)
-                if rest.len() == 1 && native_cmp_op(rest[0].0).is_some() =>
-            {
+            Expr::Compare(lhs, rest) if rest.len() == 1 && native_cmp_op(rest[0].0).is_some() => {
                 self.compile_expr(b, lhs)?;
                 self.compile_expr(b, &rest[0].1)?;
                 b.emit(native_cmp_op(rest[0].0).unwrap(), 0);
@@ -2767,7 +2776,9 @@ impl Compiler {
                     let k = b.add_constant(Value::str(s));
                     b.emit(Op::LoadConst(k), 0);
                 }
-                FStrPart::Expr { expr, conv, spec, .. } => {
+                FStrPart::Expr {
+                    expr, conv, spec, ..
+                } => {
                     c.compile_expr(b, expr)?;
                     let conv_i = match conv {
                         Some('s') => 1,
@@ -2790,34 +2801,41 @@ impl Compiler {
     /// `TEMPLATE` assembles them; the interpolations are NOT formatted here, which
     /// is the whole point — the consumer decides what to do with each value.
     fn compile_tstring(&mut self, b: &mut ChunkBuilder, parts: &[FStrPart]) -> Result<(), String> {
-        self.build_chunked(b, ops::MKLIST, ops::EXTEND_LIST, parts.len(), 1, |c, b, i| {
-            match &parts[i] {
-                FStrPart::Lit(s) => {
-                    let k = b.add_constant(Value::str(s));
-                    b.emit(Op::LoadConst(k), 0);
+        self.build_chunked(
+            b,
+            ops::MKLIST,
+            ops::EXTEND_LIST,
+            parts.len(),
+            1,
+            |c, b, i| {
+                match &parts[i] {
+                    FStrPart::Lit(s) => {
+                        let k = b.add_constant(Value::str(s));
+                        b.emit(Op::LoadConst(k), 0);
+                    }
+                    FStrPart::Expr {
+                        expr,
+                        src,
+                        conv,
+                        spec,
+                    } => {
+                        c.compile_expr(b, expr)?;
+                        let k = b.add_constant(Value::str(src));
+                        b.emit(Op::LoadConst(k), 0);
+                        let conv_i = match conv {
+                            Some('s') => 1,
+                            Some('r') => 2,
+                            Some('a') => 3,
+                            _ => 0,
+                        };
+                        b.emit(Op::LoadInt(conv_i), 0);
+                        c.compile_fstring_spec(b, spec)?;
+                        b.emit(Op::CallBuiltin(ops::INTERPOLATION, 4), 0);
+                    }
                 }
-                FStrPart::Expr {
-                    expr,
-                    src,
-                    conv,
-                    spec,
-                } => {
-                    c.compile_expr(b, expr)?;
-                    let k = b.add_constant(Value::str(src));
-                    b.emit(Op::LoadConst(k), 0);
-                    let conv_i = match conv {
-                        Some('s') => 1,
-                        Some('r') => 2,
-                        Some('a') => 3,
-                        _ => 0,
-                    };
-                    b.emit(Op::LoadInt(conv_i), 0);
-                    c.compile_fstring_spec(b, spec)?;
-                    b.emit(Op::CallBuiltin(ops::INTERPOLATION, 4), 0);
-                }
-            }
-            Ok(())
-        })?;
+                Ok(())
+            },
+        )?;
         b.emit(Op::CallBuiltin(ops::TEMPLATE, 1), 0);
         Ok(())
     }
@@ -3939,7 +3957,13 @@ fn stmt_slot_safe(s: &Stmt) -> bool {
         | StmtKind::Nonlocal(_)
         | StmtKind::Delete(_) => false,
         // The signal form of a loop compiles its body to a sub-chunk.
-        StmtKind::For { target, iter, body, orelse, is_async } => {
+        StmtKind::For {
+            target,
+            iter,
+            body,
+            orelse,
+            is_async,
+        } => {
             !*is_async
                 && !loop_needs_signal(body)
                 && exprs_ok(&[target, iter])
@@ -4004,11 +4028,11 @@ fn expr_slot_safe(e: &Expr) -> bool {
         Expr::IfExp { test, body, orelse } => {
             expr_slot_safe(test) && expr_slot_safe(body) && expr_slot_safe(orelse)
         }
-        Expr::Call { func, args, keywords } => {
-            expr_slot_safe(func)
-                && all(args)
-                && keywords.iter().all(|k| expr_slot_safe(&k.value))
-        }
+        Expr::Call {
+            func,
+            args,
+            keywords,
+        } => expr_slot_safe(func) && all(args) && keywords.iter().all(|k| expr_slot_safe(&k.value)),
         Expr::Slice { lo, hi, step } => {
             lo.as_ref().map_or(true, |x| expr_slot_safe(x))
                 && hi.as_ref().map_or(true, |x| expr_slot_safe(x))
@@ -4083,11 +4107,7 @@ fn scope_locals(body: &[Stmt]) -> Vec<String> {
 /// params/locals and any it declares `global`. This is `co_freevars` /
 /// `func.__closure__`. The `∩ enclosing` filter means the collector need not
 /// track nested-scope bindings — a nested local is never in an enclosing scope.
-fn scope_freevars(
-    params: &Params,
-    body: &[Stmt],
-    enclosing: &[HashSet<String>],
-) -> Vec<String> {
+fn scope_freevars(params: &Params, body: &[Stmt], enclosing: &[HashSet<String>]) -> Vec<String> {
     let mut bound_here: HashSet<String> = scope_locals(body).into_iter().collect();
     for p in param_names(params) {
         bound_here.insert(p);
@@ -4157,7 +4177,11 @@ fn collect_names_expr(e: &Expr, out: &mut HashSet<String>) {
             collect_names_expr(body, out);
             collect_names_expr(orelse, out);
         }
-        Expr::Call { func, args, keywords } => {
+        Expr::Call {
+            func,
+            args,
+            keywords,
+        } => {
             collect_names_expr(func, out);
             for a in args {
                 collect_names_expr(a, out);
@@ -4234,14 +4258,19 @@ fn collect_names_stmt(s: &Stmt, out: &mut HashSet<String>) {
                 collect_names_expr(v, out);
             }
         }
-        StmtKind::If { test, body, orelse }
-        | StmtKind::While { test, body, orelse } => {
+        StmtKind::If { test, body, orelse } | StmtKind::While { test, body, orelse } => {
             collect_names_expr(test, out);
             for st in body.iter().chain(orelse) {
                 collect_names_stmt(st, out);
             }
         }
-        StmtKind::For { target, iter, body, orelse, .. } => {
+        StmtKind::For {
+            target,
+            iter,
+            body,
+            orelse,
+            ..
+        } => {
             collect_names_expr(target, out);
             collect_names_expr(iter, out);
             for st in body.iter().chain(orelse) {
@@ -4259,7 +4288,12 @@ fn collect_names_stmt(s: &Stmt, out: &mut HashSet<String>) {
                 collect_names_stmt(st, out);
             }
         }
-        StmtKind::FuncDef { params, body, decorators, .. } => {
+        StmtKind::FuncDef {
+            params,
+            body,
+            decorators,
+            ..
+        } => {
             for d in &params.defaults {
                 collect_names_expr(d, out);
             }
@@ -4273,7 +4307,13 @@ fn collect_names_stmt(s: &Stmt, out: &mut HashSet<String>) {
                 collect_names_stmt(st, out);
             }
         }
-        StmtKind::ClassDef { bases, keywords, body, decorators, .. } => {
+        StmtKind::ClassDef {
+            bases,
+            keywords,
+            body,
+            decorators,
+            ..
+        } => {
             for b in bases {
                 collect_names_expr(b, out);
             }
@@ -4301,7 +4341,12 @@ fn collect_names_stmt(s: &Stmt, out: &mut HashSet<String>) {
                 collect_names_expr(c, out);
             }
         }
-        StmtKind::Try { body, handlers, orelse, finalbody } => {
+        StmtKind::Try {
+            body,
+            handlers,
+            orelse,
+            finalbody,
+        } => {
             for st in body {
                 collect_names_stmt(st, out);
             }
@@ -5076,7 +5121,11 @@ fn analyze_native_tree_at(
                 }
                 push_unique(writes, name);
             }
-            StmtKind::If { test, body: tb, orelse } => {
+            StmtKind::If {
+                test,
+                body: tb,
+                orelse,
+            } => {
                 if !native_safe_cond(test, reads, int_names) {
                     return false;
                 }
@@ -5086,7 +5135,11 @@ fn analyze_native_tree_at(
                     return false;
                 }
             }
-            StmtKind::While { test, body: wb, orelse } => {
+            StmtKind::While {
+                test,
+                body: wb,
+                orelse,
+            } => {
                 if !orelse.is_empty() || loop_needs_signal(wb) {
                     return false;
                 }
@@ -5185,7 +5238,11 @@ fn collect_ns_loads(body: &[Stmt], defined: &mut Vec<String>, loads: &mut Vec<St
                     push_unique(defined, n);
                 }
             }
-            StmtKind::If { test, body: tb, orelse } => {
+            StmtKind::If {
+                test,
+                body: tb,
+                orelse,
+            } => {
                 reads_needing_load(test, defined, loads);
                 let mut d1 = defined.clone();
                 collect_ns_loads(tb, &mut d1, loads);
@@ -5198,7 +5255,10 @@ fn collect_ns_loads(body: &[Stmt], defined: &mut Vec<String>, loads: &mut Vec<St
                 collect_ns_loads(wb, &mut d, loads);
             }
             StmtKind::For {
-                target, iter, body: inner, ..
+                target,
+                iter,
+                body: inner,
+                ..
             } => {
                 if let Some((start, stop, _step)) = native_range_call(iter) {
                     if let Some(e) = start {

@@ -14,8 +14,8 @@
 //!     function, class, instance, bound-method, exception, iterator, module,
 //!     bignum, complex — the reference types.
 
-use crate::async_rt;
 use crate::ast::Span;
+use crate::async_rt;
 use fusevm::{Chunk, NumOp, VMResult, Value, VM};
 use indexmap::IndexMap;
 use std::cell::RefCell;
@@ -569,8 +569,17 @@ pub enum DescKind {
 /// (`tm_year … tm_isdst`) then the two attribute-only extras (`tm_gmtoff`,
 /// `tm_zone`). Index/iteration cover only the first 9.
 pub const STRUCT_TIME_FIELDS: &[&str] = &[
-    "tm_year", "tm_mon", "tm_mday", "tm_hour", "tm_min", "tm_sec", "tm_wday", "tm_yday",
-    "tm_isdst", "tm_gmtoff", "tm_zone",
+    "tm_year",
+    "tm_mon",
+    "tm_mday",
+    "tm_hour",
+    "tm_min",
+    "tm_sec",
+    "tm_wday",
+    "tm_yday",
+    "tm_isdst",
+    "tm_gmtoff",
+    "tm_zone",
 ];
 
 /// Which `typing` type-parameter flavor a [`PyObj::TypeVarLike`] is.
@@ -1119,14 +1128,24 @@ pub enum AttrDel {
 /// Iterator cursor state.
 #[derive(Clone)]
 pub enum IterState {
-    Seq { items: Vec<Value>, idx: usize },
-    RangeIter { cur: i64, stop: i64, step: i64 },
+    Seq {
+        items: Vec<Value>,
+        idx: usize,
+    },
+    RangeIter {
+        cur: i64,
+        stop: i64,
+        step: i64,
+    },
     BigRangeIter {
         cur: num_bigint::BigInt,
         stop: num_bigint::BigInt,
         step: num_bigint::BigInt,
     },
-    DictKeys { keys: Vec<Value>, idx: usize },
+    DictKeys {
+        keys: Vec<Value>,
+        idx: usize,
+    },
 }
 
 // ── I/O side table ───────────────────────────────────────────────────────────
@@ -2148,7 +2167,11 @@ impl PyHost {
     /// view's set operators accept any iterable (`d.keys() - ['a']`, which
     /// `csv.DictWriter` uses to find extra keys), while `[1] - [2]` stays a
     /// TypeError.
-    pub fn setmap_operand(&mut self, v: &Value, other_is_set: bool) -> Option<IndexMap<PKey, Value>> {
+    pub fn setmap_operand(
+        &mut self,
+        v: &Value,
+        other_is_set: bool,
+    ) -> Option<IndexMap<PKey, Value>> {
         if let Some(PyObj::Set(s)) | Some(PyObj::Frozenset(s)) = self.get(v) {
             return Some(s.clone());
         }
@@ -2581,7 +2604,10 @@ impl PyHost {
         // Copy the bridge handle out before the namespace clone below borrows
         // the heap; `foreign_id` is always `None` on a native-only build.
         let foreign = self.foreign_id(module);
-        match self.module_slot(module).map(|s| self.module_globals[s].clone()) {
+        match self
+            .module_slot(module)
+            .map(|s| self.module_globals[s].clone())
+        {
             Some(ns) => {
                 if let Some(all) = ns.get("__all__").cloned() {
                     let mut out = Vec::new();
@@ -2605,7 +2631,9 @@ impl PyHost {
             _ => match foreign {
                 Some(id) => {
                     let all = crate::ffi::get_attr(self, id, "__all__").map_err(|_| {
-                        type_error("'import *' from this module needs an __all__ it does not define")
+                        type_error(
+                            "'import *' from this module needs an __all__ it does not define",
+                        )
                     })?;
                     let mut out = Vec::new();
                     for n in self.str_sequence(&all)? {
@@ -3017,7 +3045,8 @@ fn type_object_class_name(n: &str) -> Option<String> {
         "functools._lru_cache_wrapper" => Some("functools._lru_cache_wrapper"),
         "re.Pattern" => Some("re.Pattern"),
         "os.stat_result" => Some("os.stat_result"),
-        _ if n.strip_prefix("_io.")
+        _ if n
+            .strip_prefix("_io.")
             .is_some_and(|t| crate::stdlib::pyio::STREAM_TYPES.contains(&t)) =>
         {
             Some(n)
@@ -3525,11 +3554,19 @@ impl PyHost {
                 Some(PyObj::Iter(_)) => "<iterator>".into(),
                 Some(PyObj::Zip { .. }) => format!("<zip object at 0x{:012x}>", self.addr_of(v)),
                 Some(PyObj::ItertoolsIter { kind, .. }) => {
-                    format!("<{} object at 0x{:012x}>", kind.type_name(), self.addr_of(v))
+                    format!(
+                        "<{} object at 0x{:012x}>",
+                        kind.type_name(),
+                        self.addr_of(v)
+                    )
                 }
                 Some(PyObj::Lock { count, reentrant }) => {
                     let state = if *count > 0 { "locked" } else { "unlocked" };
-                    let kind = if *reentrant { "_thread.RLock" } else { "_thread.lock" };
+                    let kind = if *reentrant {
+                        "_thread.RLock"
+                    } else {
+                        "_thread.lock"
+                    };
                     format!("<{state} {kind} object at 0x{:012x}>", self.addr_of(v))
                 }
                 Some(PyObj::MapObj { .. }) => format!("<map object at 0x{:012x}>", self.addr_of(v)),
@@ -4036,8 +4073,7 @@ impl PyHost {
                     // Two unions are equal iff they hold the same members, order
                     // irrelevant: `int | str == str | int`, as in CPython.
                     (Some(PyObj::Union { args: x }), Some(PyObj::Union { args: y })) => {
-                        x.len() == y.len()
-                            && x.iter().all(|p| y.iter().any(|q| self.equal(p, q)))
+                        x.len() == y.len() && x.iter().all(|p| y.iter().any(|q| self.equal(p, q)))
                     }
                     // Two ranges are equal iff they yield the same sequence: same
                     // length, and (empty, or same start and (len 1 or same step)).
@@ -5134,8 +5170,7 @@ impl PyHost {
                 // set difference (result type follows the left operand;
                 // dict_keys/dict_items views participate as key-sets)
                 let a_set = self.setmap_of(a).is_some();
-                if let (Some(mut out), Some(y)) =
-                    (self.setmap_of(a), self.setmap_operand(b, a_set))
+                if let (Some(mut out), Some(y)) = (self.setmap_of(a), self.setmap_operand(b, a_set))
                 {
                     for k in y.keys() {
                         out.shift_remove(k);
@@ -5528,10 +5563,9 @@ impl PyHost {
                 // dict_keys/dict_items views participate as key-sets)
                 let a_set = self.setmap_of(a).is_some();
                 let b_set = self.setmap_of(b).is_some();
-                if let (Some(x), Some(y)) = (
-                    self.setmap_operand(a, b_set),
-                    self.setmap_operand(b, a_set),
-                ) {
+                if let (Some(x), Some(y)) =
+                    (self.setmap_operand(a, b_set), self.setmap_operand(b, a_set))
+                {
                     let mut out = IndexMap::new();
                     match tag {
                         binop::BITAND => {
@@ -5578,8 +5612,7 @@ impl PyHost {
                 }
                 // PEP 604: `X | Y` on type objects builds a `types.UnionType`.
                 if tag == binop::BITOR {
-                    if let (Some(mut xs), Some(ys)) =
-                        (self.union_members(a), self.union_members(b))
+                    if let (Some(mut xs), Some(ys)) = (self.union_members(a), self.union_members(b))
                     {
                         xs.extend(ys);
                         // Dedupes, and collapses `int | int` to the single type.
@@ -6519,7 +6552,11 @@ impl PyHost {
                 let i = self
                     .big_val(idx)
                     .ok_or_else(|| type_error("range indices must be integers"))?;
-                let k = if i < num_bigint::BigInt::from(0) { &i + &len } else { i };
+                let k = if i < num_bigint::BigInt::from(0) {
+                    &i + &len
+                } else {
+                    i
+                };
                 if k < num_bigint::BigInt::from(0) || k >= len {
                     return Err("IndexError: range object index out of range".into());
                 }
@@ -7571,7 +7608,10 @@ impl PyHost {
         kwargs: Vec<(String, Value)>,
     ) -> Value {
         let get = |kwargs: &[(String, Value)], k: &str| {
-            kwargs.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.clone())
+            kwargs
+                .iter()
+                .find(|(kk, _)| kk == k)
+                .map(|(_, v)| v.clone())
         };
         let name_v = self.new_str(name.clone());
         let bound = get(&kwargs, "bound").unwrap_or(Value::Undef);
@@ -7789,7 +7829,9 @@ impl PyHost {
         // A `_csv` writer's `.dialect`, or a dialect's parameters.
         if matches!(
             self.get(recv),
-            Some(PyObj::CsvWriter { .. }) | Some(PyObj::CsvDialect(_)) | Some(PyObj::CsvReader { .. })
+            Some(PyObj::CsvWriter { .. })
+                | Some(PyObj::CsvDialect(_))
+                | Some(PyObj::CsvReader { .. })
         ) {
             if let Some(r) = crate::stdlib::pycsv::attr(self, recv, name) {
                 return r;
@@ -7917,9 +7959,7 @@ impl PyHost {
                         // that, and binding it made `issubclass(exc_type,
                         // self.failureException)` compare against a bound method —
                         // so `unittest` filed every assertion failure as an ERROR.
-                        Some(PyObj::Builtin(n))
-                            if !crate::builtins::is_type_object_name(n) =>
-                        {
+                        Some(PyObj::Builtin(n)) if !crate::builtins::is_type_object_name(n) => {
                             return Ok(self.alloc(PyObj::BoundMethod {
                                 recv: recv.clone(),
                                 func: v,
@@ -8180,7 +8220,11 @@ impl PyHost {
                         Value::Obj(id) => self
                             .exc_tb
                             .get(id)
-                            .map(|fs| fs.iter().map(|(s, l, _)| (s.clone(), *l)).collect::<Vec<_>>())
+                            .map(|fs| {
+                                fs.iter()
+                                    .map(|(s, l, _)| (s.clone(), *l))
+                                    .collect::<Vec<_>>()
+                            })
                             .unwrap_or_default(),
                         _ => Vec::new(),
                     };
@@ -8310,7 +8354,10 @@ impl PyHost {
             // backing `FuncDef`. Native VM object, not a Python reimplementation.
             // A frame's code object: only the identifying fields, which is all
             // any caller reads off one.
-            Some(PyObj::FrameCode { name: fname, lineno }) => {
+            Some(PyObj::FrameCode {
+                name: fname,
+                lineno,
+            }) => {
                 let (fname, lineno) = (fname.clone(), *lineno);
                 match name {
                     "co_name" | "co_qualname" => Ok(self.new_str(fname)),
@@ -8430,8 +8477,8 @@ impl PyHost {
                     "pattern" => Ok(self.new_str(pattern)),
                     "flags" => Ok(Value::Int(flags)),
                     "groups" => Ok(Value::Int(groups as i64)),
-                    "match" | "search" | "fullmatch" | "findall" | "finditer" | "sub"
-                    | "subn" | "split" => {
+                    "match" | "search" | "fullmatch" | "findall" | "finditer" | "sub" | "subn"
+                    | "split" => {
                         let func = self.alloc(PyObj::Builtin(format!("__base_method__.{name}")));
                         Ok(self.alloc(PyObj::BoundMethod {
                             recv: recv.clone(),
@@ -8444,29 +8491,27 @@ impl PyHost {
                 }
             }
             // `re.Match` attributes; method names bind as callable methods.
-            Some(PyObj::Match { text, spans, .. }) => {
-                match name {
-                    "string" => Ok(self.new_str(text.clone())),
-                    "lastindex" => Ok(spans
-                        .iter()
-                        .rposition(|s| s.is_some())
-                        .filter(|&i| i > 0)
-                        .map(|i| Value::Int(i as i64))
-                        .unwrap_or(Value::Undef)),
-                    "pos" => Ok(Value::Int(0)),
-                    "endpos" => Ok(Value::Int(text.len() as i64)),
-                    "group" | "groups" | "groupdict" | "start" | "end" | "span" => {
-                        let func = self.alloc(PyObj::Builtin(format!("__base_method__.{name}")));
-                        Ok(self.alloc(PyObj::BoundMethod {
-                            recv: recv.clone(),
-                            func,
-                        }))
-                    }
-                    _ => Err(format!(
-                        "AttributeError: 're.Match' object has no attribute '{name}'"
-                    )),
+            Some(PyObj::Match { text, spans, .. }) => match name {
+                "string" => Ok(self.new_str(text.clone())),
+                "lastindex" => Ok(spans
+                    .iter()
+                    .rposition(|s| s.is_some())
+                    .filter(|&i| i > 0)
+                    .map(|i| Value::Int(i as i64))
+                    .unwrap_or(Value::Undef)),
+                "pos" => Ok(Value::Int(0)),
+                "endpos" => Ok(Value::Int(text.len() as i64)),
+                "group" | "groups" | "groupdict" | "start" | "end" | "span" => {
+                    let func = self.alloc(PyObj::Builtin(format!("__base_method__.{name}")));
+                    Ok(self.alloc(PyObj::BoundMethod {
+                        recv: recv.clone(),
+                        func,
+                    }))
                 }
-            }
+                _ => Err(format!(
+                    "AttributeError: 're.Match' object has no attribute '{name}'"
+                )),
+            },
             // Generic alias: expose origin/args; forward anything else to origin.
             Some(PyObj::GenericAlias { origin, args }) => {
                 let (origin, args) = (origin.clone(), args.clone());
@@ -8499,10 +8544,7 @@ impl PyHost {
                 match name {
                     "tb_frame" => {
                         let (n, l) = frames[idx].clone();
-                        Ok(self.alloc(PyObj::PyFrame {
-                            name: n,
-                            lineno: l,
-                        }))
+                        Ok(self.alloc(PyObj::PyFrame { name: n, lineno: l }))
                     }
                     "tb_lineno" => Ok(Value::Int(frames[idx].1 as i64)),
                     "tb_lasti" => Ok(Value::Int(-1)),
@@ -8522,7 +8564,10 @@ impl PyHost {
                 }
             }
             // Frame object: the module globals are live; locals are not captured.
-            Some(PyObj::PyFrame { lineno, name: fname }) => {
+            Some(PyObj::PyFrame {
+                lineno,
+                name: fname,
+            }) => {
                 let lineno = *lineno;
                 let fname = fname.clone();
                 match name {
@@ -8606,7 +8651,7 @@ impl PyHost {
                 match self.get(&func) {
                     Some(PyObj::Func(fv)) => {
                         let (def_id, defaults) = (fv.def_id, fv.defaults.clone());
-                let kwd = fv.kwonly_defaults.clone();
+                        let kwd = fv.kwonly_defaults.clone();
                         self.func_dunder(name, def_id, &defaults, &kwd)
                     }
                     // A bound builtin method (`[].append`): `func` is the method
@@ -8668,8 +8713,10 @@ impl PyHost {
                     // Immediate bases: everything after self (usually just object).
                     mro.remove(0);
                 }
-                let vals: Vec<Value> =
-                    mro.into_iter().map(|c| self.alloc(PyObj::Builtin(c))).collect();
+                let vals: Vec<Value> = mro
+                    .into_iter()
+                    .map(|c| self.alloc(PyObj::Builtin(c)))
+                    .collect();
                 Ok(self.new_tuple(vals))
             }
             // `<type>.__dict__` — a mappingproxy over the type's namespace. Sparse
@@ -8677,8 +8724,7 @@ impl PyHost {
             // reaches via `<type>.__dict__[name]` are populated (pythonrs has no
             // full C method table to enumerate).
             Some(PyObj::Builtin(n))
-                if name == "__dict__"
-                    && (crate::builtins::is_type_object_name(n)) =>
+                if name == "__dict__" && (crate::builtins::is_type_object_name(n)) =>
             {
                 let n = n.clone();
                 let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
@@ -8737,8 +8783,9 @@ impl PyHost {
                 if name == "__new__" && crate::builtins::is_type_object_name(n) =>
             {
                 let ctor = match n.as_str() {
-                    "int" | "str" | "float" | "tuple" | "frozenset" | "list" | "dict"
-                    | "set" => format!("{n}.__new__"),
+                    "int" | "str" | "float" | "tuple" | "frozenset" | "list" | "dict" | "set" => {
+                        format!("{n}.__new__")
+                    }
                     _ => "object.__new__".to_string(),
                 };
                 Ok(self.alloc(PyObj::Builtin(ctor)))
@@ -9269,7 +9316,10 @@ impl PyHost {
         if matches!(self.get(recv), Some(PyObj::Exception { .. })) {
             if let Value::Obj(id) = recv {
                 let id = *id;
-                self.func_attrs.entry(id).or_default().insert(name.to_string(), val);
+                self.func_attrs
+                    .entry(id)
+                    .or_default()
+                    .insert(name.to_string(), val);
                 return Ok(());
             }
         }
@@ -9285,7 +9335,10 @@ impl PyHost {
         ) {
             if let Value::Obj(id) = recv {
                 let id = *id;
-                self.func_attrs.entry(id).or_default().insert(name.to_string(), val);
+                self.func_attrs
+                    .entry(id)
+                    .or_default()
+                    .insert(name.to_string(), val);
                 return Ok(());
             }
         }
@@ -9294,7 +9347,10 @@ impl PyHost {
         if matches!(self.get(recv), Some(PyObj::Func(_))) {
             if let Value::Obj(id) = recv {
                 let id = *id;
-                self.func_attrs.entry(id).or_default().insert(name.to_string(), val);
+                self.func_attrs
+                    .entry(id)
+                    .or_default()
+                    .insert(name.to_string(), val);
                 return Ok(());
             }
         }
@@ -9385,20 +9441,19 @@ impl PyHost {
         // `NT.field` raised through ITS `__get__` — so every namedtuple in the
         // program broke the moment anything imported `enum`.
         let ancestors: Vec<String> = bases.iter().flat_map(|b| self.mro_of(b)).collect();
-        let key = if ancestors.iter().any(|b| b == name)
-            || crate::builtins::shadows_builtin_type(name)
-        {
-            let mut n = 1usize;
-            loop {
-                let cand = format!("{name}#{n}");
-                if !self.classes.contains_key(&cand) {
-                    break cand;
+        let key =
+            if ancestors.iter().any(|b| b == name) || crate::builtins::shadows_builtin_type(name) {
+                let mut n = 1usize;
+                loop {
+                    let cand = format!("{name}#{n}");
+                    if !self.classes.contains_key(&cand) {
+                        break cand;
+                    }
+                    n += 1;
                 }
-                n += 1;
-            }
-        } else {
-            name.to_string()
-        };
+            } else {
+                name.to_string()
+            };
         let name_for_key = key.clone();
         // A new class can change what an existing name resolves to (the
         // shadowing disambiguation above rekeys classes), so every memoized
@@ -9447,7 +9502,12 @@ impl PyHost {
         let module = ns
             .get("__module__")
             .and_then(|v| self.as_str(v))
-            .or_else(|| self.globals().get("__name__").cloned().and_then(|v| self.as_str(&v)))
+            .or_else(|| {
+                self.globals()
+                    .get("__name__")
+                    .cloned()
+                    .and_then(|v| self.as_str(&v))
+            })
             .unwrap_or_else(|| "__main__".to_string());
         self.classes.insert(
             key.clone(),
@@ -9507,7 +9567,10 @@ pub fn invoke(
                         return Ok(match obj {
                             Value::Undef => recv,
                             inst => with_host(|h| {
-                                h.alloc(PyObj::BoundMethod { recv: inst, func: recv.clone() })
+                                h.alloc(PyObj::BoundMethod {
+                                    recv: inst,
+                                    func: recv.clone(),
+                                })
                             }),
                         });
                     }
@@ -9530,9 +9593,9 @@ pub fn invoke(
             let (base, method) = qual.split_once('.').unwrap_or(("", qual.as_str()));
             let (base, method) = (base.to_string(), method.to_string());
             let mut it = args.into_iter();
-            let recv = it.next().ok_or_else(|| {
-                type_error(&format!("unbound method {qual}() needs an argument"))
-            })?;
+            let recv = it
+                .next()
+                .ok_or_else(|| type_error(&format!("unbound method {qual}() needs an argument")))?;
             let rest: Vec<Value> = it.collect();
             if crate::builtins::is_type_like_builtin(&base) {
                 let payload =
@@ -10029,15 +10092,13 @@ fn module_dict_method(
                 },
             }
         }
-        "popitem" => {
-            match with_host(|h| h.module_globals[slot].pop()) {
-                Some((k, v)) => Ok(with_host(|h| {
-                    let kv = h.new_str(k);
-                    h.new_tuple(vec![kv, v])
-                })),
-                None => Err("KeyError: 'popitem(): dictionary is empty'".into()),
-            }
-        }
+        "popitem" => match with_host(|h| h.module_globals[slot].pop()) {
+            Some((k, v)) => Ok(with_host(|h| {
+                let kv = h.new_str(k);
+                h.new_tuple(vec![kv, v])
+            })),
+            None => Err("KeyError: 'popitem(): dictionary is empty'".into()),
+        },
         "clear" => {
             with_host(|h| h.module_globals[slot].clear());
             Ok(Value::Undef)
@@ -10065,7 +10126,10 @@ pub fn call_method(
     }
     // `_random.Random` (and subclasses) — the RNG methods dispatch against the
     // instance's Mersenne Twister state, not the class namespace.
-    if matches!(name, "random" | "seed" | "getrandbits" | "getstate" | "setstate") {
+    if matches!(
+        name,
+        "random" | "seed" | "getrandbits" | "getstate" | "setstate"
+    ) {
         if let Some(id) = with_host(|h| match (recv, h.get(recv)) {
             (Value::Obj(oid), Some(PyObj::Instance(i)))
                 if h.mro_of(&i.class).iter().any(|c| c == "_random.Random") =>
@@ -10144,16 +10208,14 @@ pub fn call_method(
         }
         // `types.MappingProxyType` (a type's `__dict__`) is a read-only view:
         // read methods delegate to the backing dict; mutators are rejected.
-        Some(PyObj::MappingProxy { dict }) => {
-            match name {
-                "get" | "keys" | "values" | "items" | "copy" | "__getitem__"
-                | "__contains__" | "__len__" | "__iter__" | "__or__" | "__ror__"
-                | "__eq__" | "__ne__" | "__reversed__" => call_method(&dict, name, args, kwargs),
-                _ => Err(type_error(&format!(
-                    "'mappingproxy' object has no attribute '{name}'"
-                ))),
-            }
-        }
+        Some(PyObj::MappingProxy { dict }) => match name {
+            "get" | "keys" | "values" | "items" | "copy" | "__getitem__" | "__contains__"
+            | "__len__" | "__iter__" | "__or__" | "__ror__" | "__eq__" | "__ne__"
+            | "__reversed__" => call_method(&dict, name, args, kwargs),
+            _ => Err(type_error(&format!(
+                "'mappingproxy' object has no attribute '{name}'"
+            ))),
+        },
         // `contextlib.redirect_stdout`/`redirect_stderr` context manager: retarget
         // the stream on `__enter__` (saving the prior target on the instance so
         // nesting restores correctly) and restore it on `__exit__`.
@@ -10161,9 +10223,9 @@ pub fn call_method(
         // a reentrant lock counts nesting.
         Some(PyObj::Lock { reentrant, .. }) => match name {
             "acquire" | "__enter__" => {
-                let held = with_host(|h| {
-                    matches!(h.get(recv), Some(PyObj::Lock { count, .. }) if *count > 0)
-                });
+                let held = with_host(
+                    |h| matches!(h.get(recv), Some(PyObj::Lock { count, .. }) if *count > 0),
+                );
                 // `acquire(blocking=False)` on a held non-reentrant lock fails,
                 // and saying so is what makes `threading.Condition._is_owned`
                 // work: its default implementation probes with a non-blocking
@@ -10201,15 +10263,17 @@ pub fn call_method(
                 });
                 Ok(Value::Undef)
             }
-            "locked" => Ok(Value::Bool(with_host(|h| {
-                matches!(h.get(recv), Some(PyObj::Lock { count, .. }) if *count > 0)
-            }))),
+            "locked" => Ok(Value::Bool(with_host(
+                |h| matches!(h.get(recv), Some(PyObj::Lock { count, .. }) if *count > 0),
+            ))),
             // A no-op: there is no fork to re-initialize after.
             "_at_fork_reinit" => Ok(Value::Undef),
-            "_is_owned" => Ok(Value::Bool(reentrant
-                && with_host(|h| {
-                    matches!(h.get(recv), Some(PyObj::Lock { count, .. }) if *count > 0)
-                }))),
+            "_is_owned" => Ok(Value::Bool(
+                reentrant
+                    && with_host(
+                        |h| matches!(h.get(recv), Some(PyObj::Lock { count, .. }) if *count > 0),
+                    ),
+            )),
             _ => Err(type_error(&format!("'lock' object has no method '{name}'"))),
         },
         Some(PyObj::Redirect { stderr, target, .. }) => match name {
@@ -10387,20 +10451,20 @@ pub fn call_method(
                 "AttributeError: type object '{cname}' has no attribute '{name}'"
             ))
         }
-        Some(PyObj::Module { slot, name: mname }) => match with_host(|h| {
-            h.module_globals[slot].get(name).cloned()
-        }) {
-            Some(v) => invoke(&v, args, kwargs),
-            // Native-shadowed module miss (`math.isqrt(…)`): resolve the symbol
-            // from the real CPython module over the FFI bridge, then call it.
-            None => match with_host(|h| module_ffi_fallback(h, &mname, name)) {
-                Some(Ok(f)) => invoke(&f, args, kwargs),
-                Some(Err(e)) => Err(e),
-                None => Err(format!(
-                    "AttributeError: module '{mname}' has no attribute '{name}'"
-                )),
-            },
-        },
+        Some(PyObj::Module { slot, name: mname }) => {
+            match with_host(|h| h.module_globals[slot].get(name).cloned()) {
+                Some(v) => invoke(&v, args, kwargs),
+                // Native-shadowed module miss (`math.isqrt(…)`): resolve the symbol
+                // from the real CPython module over the FFI bridge, then call it.
+                None => match with_host(|h| module_ffi_fallback(h, &mname, name)) {
+                    Some(Ok(f)) => invoke(&f, args, kwargs),
+                    Some(Err(e)) => Err(e),
+                    None => Err(format!(
+                        "AttributeError: module '{mname}' has no attribute '{name}'"
+                    )),
+                },
+            }
+        }
         Some(PyObj::Super { owner, instance }) => {
             let inst_class = match with_host(|h| h.get(&instance).cloned()) {
                 Some(PyObj::Instance(i)) => i.class,
@@ -10413,7 +10477,11 @@ pub fn call_method(
                         // `__new__` is an implicit staticmethod — the class is passed
                         // explicitly in `args`, so `super().__new__(cls, …)` must NOT
                         // also bind the instance as a receiver.
-                        let recv = if name == "__new__" { None } else { Some(instance) };
+                        let recv = if name == "__new__" {
+                            None
+                        } else {
+                            Some(instance)
+                        };
                         return run_user_func(&fv, recv, Some(found), args, kwargs);
                     }
                     // A native class method resolved through super (e.g.
@@ -12202,8 +12270,7 @@ pub fn warn_unawaited_coroutines() {
 /// and the rest still run, matching CPython's `atexit` teardown. The list is
 /// drained so a re-entrant `_run_exitfuncs` does not run a callback twice.
 pub fn run_atexit_callbacks() {
-    let callbacks: Vec<AtexitCallback> =
-        with_host(|h| std::mem::take(&mut h.atexit_callbacks));
+    let callbacks: Vec<AtexitCallback> = with_host(|h| std::mem::take(&mut h.atexit_callbacks));
     for (func, args, kwargs) in callbacks.into_iter().rev() {
         if let Err(e) = invoke(&func, args, kwargs) {
             // Clear the pending error so a later callback (and the caller) is not
@@ -12266,8 +12333,8 @@ fn make_gen_kind(
     // 64 MiB per generator is the same trade at a size that stays affordable when
     // many generators are live at once.
     const GENERATOR_STACK: usize = 64 * 1024 * 1024;
-    let stack = corosensei::stack::DefaultStack::new(GENERATOR_STACK)
-        .expect("allocate generator stack");
+    let stack =
+        corosensei::stack::DefaultStack::new(GENERATOR_STACK).expect("allocate generator stack");
     let coro = corosensei::Coroutine::with_stack(
         stack,
         move |yielder: &corosensei::Yielder<Value, Value>, _first: Value| {
@@ -12661,7 +12728,9 @@ pub fn make_iterator(v: &Value) -> Result<Value, String> {
         // object to hand back, so it is materialized once here.
         Some((false, true)) => {
             let items = iter_instance_items(v)?;
-            Ok(with_host(|h| h.alloc(PyObj::Iter(IterState::Seq { items, idx: 0 }))))
+            Ok(with_host(|h| {
+                h.alloc(PyObj::Iter(IterState::Seq { items, idx: 0 }))
+            }))
         }
         _ => with_host(|h| h.make_iter(v)),
     }
@@ -13407,9 +13476,7 @@ fn resolve_relative_anchor(pkg: &str, level: usize) -> Result<String, String> {
     };
     let strip = level - 1;
     if strip > bits.len() {
-        return Err(
-            "ImportError: attempted relative import beyond top-level package".to_string(),
-        );
+        return Err("ImportError: attempted relative import beyond top-level package".to_string());
     }
     bits.truncate(bits.len() - strip);
     Ok(bits.join("."))
@@ -13605,14 +13672,65 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
         // std::env/libc.
         "posix" => with_host(|h| {
             const FNS: &[&str] = &[
-                "getcwd", "getcwdb", "chdir", "listdir", "scandir", "stat", "lstat", "fstat",
-                "mkdir", "makedirs", "rmdir", "remove", "unlink", "rename", "replace", "getpid",
-                "getppid", "getuid", "geteuid", "getgid", "getegid", "urandom", "umask", "system",
-                "strerror", "getenv", "putenv", "unsetenv", "access", "fspath", "_exit", "abort",
-                "getpgrp", "cpu_count", "device_encoding", "get_terminal_size", "isatty", "pipe",
-                "dup", "close", "read", "write", "open", "lseek", "fsync", "kill", "waitpid",
-                "_create_environ", "readlink", "symlink", "link", "chmod", "utime", "truncate",
-                "sync", "get_inheritable", "set_inheritable", "ftruncate", "sched_yield",
+                "getcwd",
+                "getcwdb",
+                "chdir",
+                "listdir",
+                "scandir",
+                "stat",
+                "lstat",
+                "fstat",
+                "mkdir",
+                "makedirs",
+                "rmdir",
+                "remove",
+                "unlink",
+                "rename",
+                "replace",
+                "getpid",
+                "getppid",
+                "getuid",
+                "geteuid",
+                "getgid",
+                "getegid",
+                "urandom",
+                "umask",
+                "system",
+                "strerror",
+                "getenv",
+                "putenv",
+                "unsetenv",
+                "access",
+                "fspath",
+                "_exit",
+                "abort",
+                "getpgrp",
+                "cpu_count",
+                "device_encoding",
+                "get_terminal_size",
+                "isatty",
+                "pipe",
+                "dup",
+                "close",
+                "read",
+                "write",
+                "open",
+                "lseek",
+                "fsync",
+                "kill",
+                "waitpid",
+                "_create_environ",
+                "readlink",
+                "symlink",
+                "link",
+                "chmod",
+                "utime",
+                "truncate",
+                "sync",
+                "get_inheritable",
+                "set_inheritable",
+                "ftruncate",
+                "sched_yield",
             ];
             let mut v: Vec<(&str, Value)> = FNS
                 .iter()
@@ -13674,7 +13792,10 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                     "allocate_lock",
                     h.alloc(PyObj::Builtin("_thread_core.allocate_lock".into())),
                 ),
-                ("RLock", h.alloc(PyObj::Builtin("_thread_core.RLock".into()))),
+                (
+                    "RLock",
+                    h.alloc(PyObj::Builtin("_thread_core.RLock".into())),
+                ),
                 (
                     "get_ident",
                     h.alloc(PyObj::Builtin("_thread_core.get_ident".into())),
@@ -13743,7 +13864,10 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
             vec![
                 ("_idfunc", h.alloc(PyObj::Builtin("_typing._idfunc".into()))),
                 ("TypeVar", h.alloc(PyObj::Builtin("_typing.TypeVar".into()))),
-                ("ParamSpec", h.alloc(PyObj::Builtin("_typing.ParamSpec".into()))),
+                (
+                    "ParamSpec",
+                    h.alloc(PyObj::Builtin("_typing.ParamSpec".into())),
+                ),
                 (
                     "TypeVarTuple",
                     h.alloc(PyObj::Builtin("_typing.TypeVarTuple".into())),
@@ -13770,7 +13894,10 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
         // after the top-level program finishes (see `run_atexit_callbacks`).
         "atexit" => with_host(|h| {
             vec![
-                ("register", h.alloc(PyObj::Builtin("atexit.register".into()))),
+                (
+                    "register",
+                    h.alloc(PyObj::Builtin("atexit.register".into())),
+                ),
                 (
                     "unregister",
                     h.alloc(PyObj::Builtin("atexit.unregister".into())),
@@ -13792,13 +13919,27 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
         // Rust's `std::time`. Native because CPython's `time` is a C module.
         "time" => with_host(|h| {
             const FNS: &[&str] = &[
-                "time", "time_ns", "monotonic", "monotonic_ns", "perf_counter",
-                "perf_counter_ns", "process_time", "process_time_ns", "sleep",
-                "gmtime", "localtime", "mktime", "strftime", "struct_time", "asctime",
+                "time",
+                "time_ns",
+                "monotonic",
+                "monotonic_ns",
+                "perf_counter",
+                "perf_counter_ns",
+                "process_time",
+                "process_time_ns",
+                "sleep",
+                "gmtime",
+                "localtime",
+                "mktime",
+                "strftime",
+                "struct_time",
+                "asctime",
                 "ctime",
             ];
-            let mut out: Vec<(&str, Value)> =
-                FNS.iter().map(|f| (*f, h.alloc(PyObj::Builtin(format!("time.{f}"))))).collect();
+            let mut out: Vec<(&str, Value)> = FNS
+                .iter()
+                .map(|f| (*f, h.alloc(PyObj::Builtin(format!("time.{f}")))))
+                .collect();
             let (tz, alt, daylight, name_std, name_dst) = crate::builtins::tz_info();
             out.push(("timezone", Value::Int(tz)));
             out.push(("altzone", Value::Int(alt)));
@@ -13816,20 +13957,38 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
         // raise `re.error` at compile, as documented.
         "re" => with_host(|h| {
             const FNS: &[&str] = &[
-                "compile", "match", "search", "fullmatch", "findall", "finditer",
-                "sub", "subn", "split", "escape", "purge",
+                "compile",
+                "match",
+                "search",
+                "fullmatch",
+                "findall",
+                "finditer",
+                "sub",
+                "subn",
+                "split",
+                "escape",
+                "purge",
             ];
-            let mut out: Vec<(&str, Value)> =
-                FNS.iter().map(|f| (*f, h.alloc(PyObj::Builtin(format!("re.{f}"))))).collect();
+            let mut out: Vec<(&str, Value)> = FNS
+                .iter()
+                .map(|f| (*f, h.alloc(PyObj::Builtin(format!("re.{f}")))))
+                .collect();
             // Flag constants (both long and short names).
             for (name, bit) in [
-                ("IGNORECASE", 2i64), ("I", 2),
-                ("LOCALE", 4), ("L", 4),
-                ("MULTILINE", 8), ("M", 8),
-                ("DOTALL", 16), ("S", 16),
-                ("UNICODE", 32), ("U", 32),
-                ("VERBOSE", 64), ("X", 64),
-                ("ASCII", 256), ("A", 256),
+                ("IGNORECASE", 2i64),
+                ("I", 2),
+                ("LOCALE", 4),
+                ("L", 4),
+                ("MULTILINE", 8),
+                ("M", 8),
+                ("DOTALL", 16),
+                ("S", 16),
+                ("UNICODE", 32),
+                ("U", 32),
+                ("VERBOSE", 64),
+                ("X", 64),
+                ("ASCII", 256),
+                ("A", 256),
                 ("NOFLAG", 0),
             ] {
                 out.push((name, Value::Int(bit)));
@@ -13934,12 +14093,56 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
             // a `math.<name>` builtin. Kept as a flat list so adding a function is a
             // one-line change here plus its arm in `call_math`.
             const MATH_FNS: &[&str] = &[
-                "sqrt", "floor", "ceil", "fabs", "pow", "log", "log2", "log10", "log1p",
-                "exp", "exp2", "expm1", "cbrt", "sin", "cos", "tan", "asin", "acos", "atan",
-                "atan2", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh", "degrees",
-                "radians", "hypot", "trunc", "copysign", "fmod", "ldexp", "isqrt", "isnan",
-                "isinf", "isfinite", "gcd", "factorial", "comb", "perm", "fsum", "sumprod", "prod",
-                "lgamma", "gamma", "erf", "erfc", "isclose", "remainder",
+                "sqrt",
+                "floor",
+                "ceil",
+                "fabs",
+                "pow",
+                "log",
+                "log2",
+                "log10",
+                "log1p",
+                "exp",
+                "exp2",
+                "expm1",
+                "cbrt",
+                "sin",
+                "cos",
+                "tan",
+                "asin",
+                "acos",
+                "atan",
+                "atan2",
+                "sinh",
+                "cosh",
+                "tanh",
+                "asinh",
+                "acosh",
+                "atanh",
+                "degrees",
+                "radians",
+                "hypot",
+                "trunc",
+                "copysign",
+                "fmod",
+                "ldexp",
+                "isqrt",
+                "isnan",
+                "isinf",
+                "isfinite",
+                "gcd",
+                "factorial",
+                "comb",
+                "perm",
+                "fsum",
+                "sumprod",
+                "prod",
+                "lgamma",
+                "gamma",
+                "erf",
+                "erfc",
+                "isclose",
+                "remainder",
             ];
             let mut out: Vec<(&str, Value)> = vec![
                 ("pi", Value::Float(std::f64::consts::PI)),
@@ -14048,8 +14251,11 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
             // modules, so Python-level assignment/reads stay consistent with the
             // internal import cache.
             h.sys_modules = Some(modules.clone());
-            let cached: Vec<(String, Value)> =
-                h.modules.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            let cached: Vec<(String, Value)> = h
+                .modules
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
             for (k, v) in cached {
                 let kv = h.new_str(k.clone());
                 if let Some(PyObj::Dict(d)) = h.get_mut(&modules) {
@@ -14182,7 +14388,10 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                 // Exception reporting. `threading` captures `sys.excepthook` and
                 // `sys.exc_info` when a `Thread` is constructed, so every
                 // `Thread(...)` reaches these.
-                ("excepthook", h.alloc(PyObj::Builtin("sys.excepthook".into()))),
+                (
+                    "excepthook",
+                    h.alloc(PyObj::Builtin("sys.excepthook".into())),
+                ),
                 (
                     "__excepthook__",
                     h.alloc(PyObj::Builtin("sys.excepthook".into())),
@@ -14194,7 +14403,10 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                 ("exc_info", h.alloc(PyObj::Builtin("sys.exc_info".into()))),
                 ("exception", h.alloc(PyObj::Builtin("sys.exception".into()))),
                 ("audit", h.alloc(PyObj::Builtin("sys.audit".into()))),
-                ("is_finalizing", h.alloc(PyObj::Builtin("sys.is_finalizing".into()))),
+                (
+                    "is_finalizing",
+                    h.alloc(PyObj::Builtin("sys.is_finalizing".into())),
+                ),
                 // Installation layout. `argparse` reads `base_prefix` (to detect a
                 // venv) at import time, so its absence made the module
                 // unimportable. There is no separate base install here — pythonrs
@@ -14207,7 +14419,12 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                 (
                     "byteorder",
                     h.new_str(
-                        if cfg!(target_endian = "big") { "big" } else { "little" }.to_string(),
+                        if cfg!(target_endian = "big") {
+                            "big"
+                        } else {
+                            "little"
+                        }
+                        .to_string(),
                     ),
                 ),
                 // `sys.flags` — the command-line/environment switches. Read at
@@ -14294,9 +14511,18 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
         // everything that imports it (`traceback`, …) needs this to exist.
         "_contextvars" => with_host(|h| {
             vec![
-                ("ContextVar", h.alloc(PyObj::Builtin("_contextvars.ContextVar".into()))),
-                ("Token", h.alloc(PyObj::Builtin("_contextvars.Token".into()))),
-                ("Context", h.alloc(PyObj::Builtin("_contextvars.Context".into()))),
+                (
+                    "ContextVar",
+                    h.alloc(PyObj::Builtin("_contextvars.ContextVar".into())),
+                ),
+                (
+                    "Token",
+                    h.alloc(PyObj::Builtin("_contextvars.Token".into())),
+                ),
+                (
+                    "Context",
+                    h.alloc(PyObj::Builtin("_contextvars.Context".into())),
+                ),
                 (
                     "copy_context",
                     h.alloc(PyObj::Builtin("_contextvars.copy_context".into())),
@@ -14425,7 +14651,12 @@ fn try_import_vendored(name: &str) -> Option<Result<Value, String>> {
     let path = resolve_vendored_path(name)?;
     let src = match std::fs::read_to_string(&path) {
         Ok(s) => s,
-        Err(e) => return Some(Err(format!("ImportError: cannot read {}: {e}", path.display()))),
+        Err(e) => {
+            return Some(Err(format!(
+                "ImportError: cannot read {}: {e}",
+                path.display()
+            )))
+        }
     };
     Some(run_vendored_module(name, &src, &path))
 }

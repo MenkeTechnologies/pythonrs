@@ -177,10 +177,7 @@ fn system_exit_code(py: Python, e: &PyErr) -> i32 {
             if let Ok(n) = code.extract::<i32>() {
                 n
             } else {
-                eprintln!(
-                    "{}",
-                    code.str().map(|s| s.to_string()).unwrap_or_default()
-                );
+                eprintln!("{}", code.str().map(|s| s.to_string()).unwrap_or_default());
                 1
             }
         }

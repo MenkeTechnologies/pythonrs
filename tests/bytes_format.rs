@@ -221,7 +221,10 @@ fn format_grouping_bignum() {
         g("x = f'{10**30:,}'", "x"),
         "'1,000,000,000,000,000,000,000,000,000,000'"
     );
-    assert_eq!(g("x = f'{-(2**64):,}'", "x"), "'-18,446,744,073,709,551,616'");
+    assert_eq!(
+        g("x = f'{-(2**64):,}'", "x"),
+        "'-18,446,744,073,709,551,616'"
+    );
     // `_` grouping, decimal and radix (hex groups by 4, honoring `#`).
     assert_eq!(g("x = f'{10**20:_}'", "x"), "'100_000_000_000_000_000_000'");
     assert_eq!(g("x = f'{2**64:_x}'", "x"), "'1_0000_0000_0000_0000'");
@@ -234,7 +237,10 @@ fn format_grouping_bignum() {
     assert_eq!(g("x = f'{2**64:+,}'", "x"), "'+18,446,744,073,709,551,616'");
     // `0`-fill (`=` align) must interleave separators into the zero padding, not
     // pad the block as opaque text.
-    assert_eq!(g("x = f'{2**64:020,}'", "x"), "'18,446,744,073,709,551,616'");
+    assert_eq!(
+        g("x = f'{2**64:020,}'", "x"),
+        "'18,446,744,073,709,551,616'"
+    );
     assert_eq!(
         g("x = f'{2**64:030_}'", "x"),
         "'00_018_446_744_073_709_551_616'"

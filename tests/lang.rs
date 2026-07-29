@@ -25,17 +25,26 @@ fn g(src: &str, name: &str) -> String {
 #[test]
 fn generic_subscription_builds_a_genericalias() {
     // `list[int]` is a `types.GenericAlias` carrying origin `list` and args `(int,)`.
-    assert_eq!(g("x = type(list[int]).__name__ == 'GenericAlias'", "x"), "True");
+    assert_eq!(
+        g("x = type(list[int]).__name__ == 'GenericAlias'", "x"),
+        "True"
+    );
     assert_eq!(g("x = list[int].__origin__ is list", "x"), "True");
     assert_eq!(g("x = list[int].__args__ == (int,)", "x"), "True");
     // Multiple args form a tuple, and every type builds the SAME alias type.
     assert_eq!(g("x = dict[str, int].__args__ == (str, int)", "x"), "True");
     assert_eq!(
-        g("import types\nx = type(dict[str, int]) is types.GenericAlias", "x"),
+        g(
+            "import types\nx = type(dict[str, int]) is types.GenericAlias",
+            "x"
+        ),
         "True",
     );
     // A user class parameterizes too, and its `__origin__` is the class itself.
-    assert_eq!(g("class Box: pass\nx = Box[int].__origin__ is Box", "x"), "True");
+    assert_eq!(
+        g("class Box: pass\nx = Box[int].__origin__ is Box", "x"),
+        "True"
+    );
     // A builtin FUNCTION is not a type: subscripting it stays a TypeError.
     assert!(pythonrs::eval_str("x = len[0]").is_err());
 }
@@ -46,10 +55,19 @@ fn generic_subscription_builds_a_genericalias() {
 #[test]
 fn builtins_module_exposes_functions_types_exceptions() {
     assert_eq!(g("import builtins\nx = builtins.abs(-5)", "x"), "5");
-    assert_eq!(g("from builtins import len as L\nx = L([1, 2, 3])", "x"), "3");
-    assert_eq!(g("import builtins\nx = builtins.int('42') == 42", "x"), "True");
     assert_eq!(
-        g("import builtins\nx = builtins.ValueError.__name__ == 'ValueError'", "x"),
+        g("from builtins import len as L\nx = L([1, 2, 3])", "x"),
+        "3"
+    );
+    assert_eq!(
+        g("import builtins\nx = builtins.int('42') == 42", "x"),
+        "True"
+    );
+    assert_eq!(
+        g(
+            "import builtins\nx = builtins.ValueError.__name__ == 'ValueError'",
+            "x"
+        ),
         "True",
     );
 }
@@ -60,8 +78,14 @@ fn builtins_module_exposes_functions_types_exceptions() {
 #[cfg(not(feature = "stdlib-ffi"))]
 #[test]
 fn faithful_types_module_runs_on_native_primitives() {
-    assert_eq!(g("import types\nx = types.GenericAlias.__name__", "x"), "'GenericAlias'");
-    assert_eq!(g("import types\nx = types.UnionType.__name__", "x"), "'UnionType'");
+    assert_eq!(
+        g("import types\nx = types.GenericAlias.__name__", "x"),
+        "'GenericAlias'"
+    );
+    assert_eq!(
+        g("import types\nx = types.UnionType.__name__", "x"),
+        "'UnionType'"
+    );
     for ty in [
         "CodeType",
         "CellType",
@@ -79,7 +103,10 @@ fn faithful_types_module_runs_on_native_primitives() {
         );
     }
     // The rest of the module (PEP 3115 helpers) is intact too.
-    assert_eq!(g("import types\nx = hasattr(types, 'new_class')", "x"), "True");
+    assert_eq!(
+        g("import types\nx = hasattr(types, 'new_class')", "x"),
+        "True"
+    );
 }
 
 #[test]
@@ -87,16 +114,29 @@ fn closure_cells_and_freevars() {
     // A closure exposes its free variables as cells (co_freevars + __closure__).
     let src = "def outer():\n    x = 10\n    y = 20\n    def inner():\n        return x + y\n    \
                return inner\nf = outer()";
-    assert_eq!(g(&format!("{src}\nz = f.__code__.co_freevars"), "z"), "('x', 'y')");
+    assert_eq!(
+        g(&format!("{src}\nz = f.__code__.co_freevars"), "z"),
+        "('x', 'y')"
+    );
     assert_eq!(g(&format!("{src}\nz = len(f.__closure__)"), "z"), "2");
     assert_eq!(
-        g(&format!("{src}\nz = sorted(c.cell_contents for c in f.__closure__)"), "z"),
+        g(
+            &format!("{src}\nz = sorted(c.cell_contents for c in f.__closure__)"),
+            "z"
+        ),
         "[10, 20]",
     );
-    assert_eq!(g(&format!("{src}\nz = type(f.__closure__[0]).__name__"), "z"), "'cell'");
+    assert_eq!(
+        g(&format!("{src}\nz = type(f.__closure__[0]).__name__"), "z"),
+        "'cell'"
+    );
     // A `nonlocal` declaration alone makes a name free (even unreferenced).
-    let cf = "def factory():\n    a = 1\n    def f():\n        nonlocal a\n    return f.__closure__[0]";
-    assert_eq!(g(&format!("{cf}\nz = type(factory()).__name__"), "z"), "'cell'");
+    let cf =
+        "def factory():\n    a = 1\n    def f():\n        nonlocal a\n    return f.__closure__[0]";
+    assert_eq!(
+        g(&format!("{cf}\nz = type(factory()).__name__"), "z"),
+        "'cell'"
+    );
     // A non-closure function has __closure__ None.
     assert_eq!(g("def g(): return 1\nz = g.__closure__", "z"), "None");
 }
@@ -116,8 +156,14 @@ fn exception_traceback_and_frame() {
 fn introspection_descriptor_types() {
     // The C-level descriptor / mappingproxy types the faithful types.py derives.
     assert_eq!(g("x = type(type.__dict__).__name__", "x"), "'mappingproxy'");
-    assert_eq!(g("x = type(object.__init__).__name__", "x"), "'wrapper_descriptor'");
-    assert_eq!(g("x = type(object().__str__).__name__", "x"), "'method-wrapper'");
+    assert_eq!(
+        g("x = type(object.__init__).__name__", "x"),
+        "'wrapper_descriptor'"
+    );
+    assert_eq!(
+        g("x = type(object().__str__).__name__", "x"),
+        "'method-wrapper'"
+    );
     assert_eq!(
         g("x = type(dict.__dict__['fromkeys']).__name__", "x"),
         "'classmethod_descriptor'",
@@ -127,7 +173,10 @@ fn introspection_descriptor_types() {
         "'getset_descriptor'",
     );
     assert_eq!(
-        g("def _f(): pass\nx = type(type(_f).__globals__).__name__", "x"),
+        g(
+            "def _f(): pass\nx = type(type(_f).__globals__).__name__",
+            "x"
+        ),
         "'member_descriptor'",
     );
     // A mappingproxy indexes through to its wrapped dict.
@@ -145,14 +194,23 @@ fn simplenamespace_and_sys_implementation() {
         g("import sys\nx = type(sys.implementation).__name__", "x"),
         "'SimpleNamespace'",
     );
-    assert_eq!(g("import sys\nx = sys.implementation.name", "x"), "'pythonrs'");
+    assert_eq!(
+        g("import sys\nx = sys.implementation.name", "x"),
+        "'pythonrs'"
+    );
     // Constructible from the type, repr as namespace(...), attributes mutable.
     assert_eq!(
-        g("import sys\nSN = type(sys.implementation)\nn = SN(a=1, b=2)\nx = repr(n)", "x"),
+        g(
+            "import sys\nSN = type(sys.implementation)\nn = SN(a=1, b=2)\nx = repr(n)",
+            "x"
+        ),
         "'namespace(a=1, b=2)'",
     );
     assert_eq!(
-        g("import sys\nSN = type(sys.implementation)\nn = SN(a=1)\nn.b = 5\nx = n.a + n.b", "x"),
+        g(
+            "import sys\nSN = type(sys.implementation)\nn = SN(a=1)\nn.b = 5\nx = n.a + n.b",
+            "x"
+        ),
         "6",
     );
 }
@@ -182,25 +240,49 @@ fn function_code_object_co_attributes() {
     let sig = "def f(a, b, /, c, *args, d, **kw):\n    x = 1\n    return x\n";
     assert_eq!(g(&format!("{sig}y = f.__code__.co_name"), "y"), "'f'");
     assert_eq!(g(&format!("{sig}y = f.__code__.co_argcount"), "y"), "3");
-    assert_eq!(g(&format!("{sig}y = f.__code__.co_posonlyargcount"), "y"), "2");
-    assert_eq!(g(&format!("{sig}y = f.__code__.co_kwonlyargcount"), "y"), "1");
+    assert_eq!(
+        g(&format!("{sig}y = f.__code__.co_posonlyargcount"), "y"),
+        "2"
+    );
+    assert_eq!(
+        g(&format!("{sig}y = f.__code__.co_kwonlyargcount"), "y"),
+        "1"
+    );
     assert_eq!(
         g(&format!("{sig}y = f.__code__.co_varnames"), "y"),
         "('a', 'b', 'c', 'd', 'args', 'kw', 'x')",
     );
-    assert_eq!(g("def f(): pass\ny = type(f.__code__).__name__", "y"), "'code'");
+    assert_eq!(
+        g("def f(): pass\ny = type(f.__code__).__name__", "y"),
+        "'code'"
+    );
     // co_flags: OPTIMIZED|NEWLOCALS|NOFREE = 0x43 plain; generator adds 0x20,
     // coroutine adds 0x80.
     assert_eq!(g("def f(): pass\ny = f.__code__.co_flags", "y"), "67");
-    assert_eq!(g("def g():\n    yield 1\ny = g.__code__.co_flags & 0x20 != 0", "y"), "True");
-    assert_eq!(g("async def c(): pass\ny = c.__code__.co_flags & 0x80 != 0", "y"), "True");
+    assert_eq!(
+        g(
+            "def g():\n    yield 1\ny = g.__code__.co_flags & 0x20 != 0",
+            "y"
+        ),
+        "True"
+    );
+    assert_eq!(
+        g(
+            "async def c(): pass\ny = c.__code__.co_flags & 0x80 != 0",
+            "y"
+        ),
+        "True"
+    );
 }
 
 #[test]
 fn function_docstring_is_dunder_doc() {
     // The body's first bare string literal is `__doc__`; absent one, `__doc__` is
     // None (present as an attribute, never an AttributeError).
-    assert_eq!(g("def f():\n    'the doc'\n    return 1\nx = f.__doc__", "x"), "'the doc'");
+    assert_eq!(
+        g("def f():\n    'the doc'\n    return 1\nx = f.__doc__", "x"),
+        "'the doc'"
+    );
     assert_eq!(g("def g():\n    return 2\nx = g.__doc__", "x"), "None");
     // A non-string first statement is not a docstring.
     assert_eq!(g("def h():\n    42\nx = h.__doc__", "x"), "None");
@@ -210,9 +292,18 @@ fn function_docstring_is_dunder_doc() {
 fn delattr_on_class_and_namespace() {
     // delattr removes a class attribute (only instances worked before) and a
     // SimpleNamespace attribute.
-    assert_eq!(g("class C: pass\nC.x = 5\ndelattr(C, 'x')\nx = hasattr(C, 'x')", "x"), "False");
     assert_eq!(
-        g("import sys\nSN = type(sys.implementation)\nn = SN(a=1)\ndel n.a\nx = hasattr(n, 'a')", "x"),
+        g(
+            "class C: pass\nC.x = 5\ndelattr(C, 'x')\nx = hasattr(C, 'x')",
+            "x"
+        ),
+        "False"
+    );
+    assert_eq!(
+        g(
+            "import sys\nSN = type(sys.implementation)\nn = SN(a=1)\ndel n.a\nx = hasattr(n, 'a')",
+            "x"
+        ),
         "False",
     );
 }
@@ -233,7 +324,10 @@ fn isinstance_of_type_for_type_objects() {
     // Every type object is an instance of `type` -- incl. the coroutine/generator/
     // iterator types the stdlib registers with ABCs; functions and unbound
     // methods are not.
-    assert_eq!(g("def _c(): pass\nx = isinstance(type(_c), type)", "x"), "True");
+    assert_eq!(
+        g("def _c(): pass\nx = isinstance(type(_c), type)", "x"),
+        "True"
+    );
     assert_eq!(g("x = isinstance(type(iter([])), type)", "x"), "True");
     assert_eq!(g("x = isinstance(int, type)", "x"), "True");
     assert_eq!(g("class C: pass\nx = isinstance(C, type)", "x"), "True");
@@ -247,12 +341,18 @@ fn function_attributes() {
     // Functions carry a writable attribute dict (abc's __isabstractmethod__,
     // functools.wraps, decorators).
     assert_eq!(
-        g("def f(): pass\nf.__isabstractmethod__ = True\nx = f.__isabstractmethod__", "x"),
+        g(
+            "def f(): pass\nf.__isabstractmethod__ = True\nx = f.__isabstractmethod__",
+            "x"
+        ),
         "True",
     );
     assert_eq!(g("def g(): pass\nx = g.__isabstractmethod__", "x"), "False");
     assert_eq!(g("def f(): pass\nf.tag = 42\nx = f.tag", "x"), "42");
-    assert_eq!(g("def f(): pass\nf.a = 1\nf.b = 2\nx = f.__dict__", "x"), "{'a': 1, 'b': 2}");
+    assert_eq!(
+        g("def f(): pass\nf.a = 1\nf.b = 2\nx = f.__dict__", "x"),
+        "{'a': 1, 'b': 2}"
+    );
 }
 
 #[test]
@@ -261,15 +361,24 @@ fn string_module_and_string_formatter() {
     // string package + string.Formatter run.
     assert_eq!(g("import string\nx = string.digits", "x"), "'0123456789'");
     assert_eq!(
-        g("import string\nx = string.Formatter().format('{0} {name}', 'hi', name='world')", "x"),
+        g(
+            "import string\nx = string.Formatter().format('{0} {name}', 'hi', name='world')",
+            "x"
+        ),
         "'hi world'",
     );
     assert_eq!(
-        g("import _string\nx = list(_string.formatter_parser('a{0}b'))", "x"),
+        g(
+            "import _string\nx = list(_string.formatter_parser('a{0}b'))",
+            "x"
+        ),
         "[('a', '0', '', None), ('b', None, None, None)]",
     );
     assert_eq!(
-        g("import _string\nx = _string.formatter_field_name_split('0.name[1]')[0]", "x"),
+        g(
+            "import _string\nx = _string.formatter_field_name_split('0.name[1]')[0]",
+            "x"
+        ),
         "0",
     );
 }
@@ -277,11 +386,17 @@ fn string_module_and_string_formatter() {
 #[test]
 fn nested_fstrings_pep701() {
     // PEP 701: an f-string may nest same-quote f-strings inside its fields.
-    assert_eq!(g("d = 'dec'\nx = f'{f' {d}' if d else ''} tail'", "x"), "' dec tail'");
+    assert_eq!(
+        g("d = 'dec'\nx = f'{f' {d}' if d else ''} tail'", "x"),
+        "' dec tail'"
+    );
     assert_eq!(g("x = f'{f'{f'{1 + 1}'}'}'", "x"), "'2'");
     assert_eq!(g("w = 5\nx = f'{f'{w}'.rjust(3)}|'", "x"), "'  5|'");
     // Regular f-strings (conversions, format specs) are unaffected.
-    assert_eq!(g("n = 'x'\nx = f'{n} = {1 + 2:03d} {n!r}'", "x"), "\"x = 003 'x'\"");
+    assert_eq!(
+        g("n = 'x'\nx = f'{n} = {1 + 2:03d} {n!r}'", "x"),
+        "\"x = 003 'x'\""
+    );
 }
 
 #[test]
@@ -294,7 +409,10 @@ fn object_dunder_methods() {
     assert_eq!(g("x = (1, 2, 3).__contains__(2)", "x"), "True");
     // functools.lru_cache uses cache.__len__ internally.
     assert_eq!(
-        g("import functools\n@functools.cache\ndef f(n): return n * n\nx = f(6) + f(6)", "x"),
+        g(
+            "import functools\n@functools.cache\ndef f(n): return n * n\nx = f(6) + f(6)",
+            "x"
+        ),
         "72",
     );
 }
@@ -306,8 +424,14 @@ fn object_dunder_methods() {
 fn os_module_self_contained() {
     assert_eq!(g("import os\nx = type(os.getcwd()).__name__", "x"), "'str'");
     assert_eq!(g("import os\nx = os.sep", "x"), "'/'");
-    assert_eq!(g("import os\nx = os.path.join('a', 'b', 'c')", "x"), "'a/b/c'");
-    assert_eq!(g("import os\nx = os.path.basename('/x/y.txt')", "x"), "'y.txt'");
+    assert_eq!(
+        g("import os\nx = os.path.join('a', 'b', 'c')", "x"),
+        "'a/b/c'"
+    );
+    assert_eq!(
+        g("import os\nx = os.path.basename('/x/y.txt')", "x"),
+        "'y.txt'"
+    );
     assert_eq!(g("import os\nx = os.getpid() > 0", "x"), "True");
     assert_eq!(g("import os\nx = 'PATH' in os.environ", "x"), "True");
     assert_eq!(g("import os\nx = os.stat('.').st_size >= 0", "x"), "True");
@@ -324,7 +448,10 @@ fn enum_module_self_contained() {
     // Plain Enum: repr, member iteration, value lookup.
     let e = "import enum\nclass C(enum.Enum):\n    RED = 1\n    GREEN = 2\n";
     assert_eq!(g(&format!("{e}x = repr(C.RED)"), "x"), "'<C.RED: 1>'");
-    assert_eq!(g(&format!("{e}x = [m.name for m in C]"), "x"), "['RED', 'GREEN']");
+    assert_eq!(
+        g(&format!("{e}x = [m.name for m in C]"), "x"),
+        "['RED', 'GREEN']"
+    );
     assert_eq!(g(&format!("{e}x = C(2).name"), "x"), "'GREEN'");
     // IntEnum: `str` is the int value (3.11+ ReprEnum behavior), arithmetic works.
     let n = "import enum\nclass N(enum.IntEnum):\n    ONE = 1\n    TWO = 2\n";
@@ -346,8 +473,14 @@ fn enum_module_self_contained() {
 #[cfg(not(feature = "stdlib-ffi"))]
 #[test]
 fn function_is_descriptor() {
-    assert_eq!(g("def f(self): return 1\nx = hasattr(f, '__get__')", "x"), "True");
-    assert_eq!(g("def f(self): return 1\nx = hasattr(f, '__set__')", "x"), "False");
+    assert_eq!(
+        g("def f(self): return 1\nx = hasattr(f, '__get__')", "x"),
+        "True"
+    );
+    assert_eq!(
+        g("def f(self): return 1\nx = hasattr(f, '__set__')", "x"),
+        "False"
+    );
     let bind = "def f(self): return self + 1\nclass C: pass\nc = C()\nx = f.__get__(5, int)()";
     assert_eq!(g(bind, "x"), "6");
 }
@@ -367,12 +500,18 @@ fn class_attr_call_constructs() {
 fn math_comb_perm_fsum_prod() {
     assert_eq!(g("import math\nx = math.comb(5, 2)", "x"), "10");
     assert_eq!(g("import math\nx = math.comb(3, 5)", "x"), "0"); // k > n
-    assert_eq!(g("import math\nx = math.comb(50, 25)", "x"), "126410606437752");
+    assert_eq!(
+        g("import math\nx = math.comb(50, 25)", "x"),
+        "126410606437752"
+    );
     assert_eq!(g("import math\nx = math.perm(5, 2)", "x"), "20");
     assert_eq!(g("import math\nx = math.perm(4)", "x"), "24"); // perm(n) == n!
     assert_eq!(g("import math\nx = math.prod([1, 2, 3, 4])", "x"), "24");
     assert_eq!(g("import math\nx = math.prod([])", "x"), "1");
-    assert_eq!(g("import math\nx = round(math.fsum([0.1] * 10), 10)", "x"), "1.0");
+    assert_eq!(
+        g("import math\nx = round(math.fsum([0.1] * 10), 10)", "x"),
+        "1.0"
+    );
 }
 
 // `atexit` registers cleanup callbacks that run LIFO at shutdown. `register`
@@ -405,8 +544,15 @@ x = (n, log, atexit._ncallbacks())";
 fn class_dunders_and_generic_subscript() {
     assert_eq!(g("class C: pass\nx = C.__annotations__", "x"), "{}");
     assert_eq!(g("class C: pass\nx = C.__module__", "x"), "'__main__'");
-    assert_eq!(g("import collections\nx = collections.Counter.__module__", "x"), "'collections'");
-    let gen = "from _typing import Generic, TypeVar\nT = TypeVar('T')\nx = type(Generic[T]).__name__";
+    assert_eq!(
+        g(
+            "import collections\nx = collections.Counter.__module__",
+            "x"
+        ),
+        "'collections'"
+    );
+    let gen =
+        "from _typing import Generic, TypeVar\nT = TypeVar('T')\nx = type(Generic[T]).__name__";
     assert_eq!(g(gen, "x"), "'GenericAlias'");
 }
 
@@ -417,14 +563,30 @@ fn class_dunders_and_generic_subscript() {
 #[cfg(not(feature = "stdlib-ffi"))]
 #[test]
 fn collections_full_vendored() {
-    assert_eq!(g("import collections\nx = collections.Counter('aabbbc').most_common(2)", "x"), "[('b', 3), ('a', 2)]");
     assert_eq!(
-        g("import collections\nx = dict(collections.ChainMap({'a': 1}, {'a': 2, 'b': 3}))", "x"),
+        g(
+            "import collections\nx = collections.Counter('aabbbc').most_common(2)",
+            "x"
+        ),
+        "[('b', 3), ('a', 2)]"
+    );
+    assert_eq!(
+        g(
+            "import collections\nx = dict(collections.ChainMap({'a': 1}, {'a': 2, 'b': 3}))",
+            "x"
+        ),
         "{'a': 1, 'b': 3}",
     );
-    let nt = "import collections\nP = collections.namedtuple('P', ['x', 'y'])\nx = P(1, 2)._asdict()";
+    let nt =
+        "import collections\nP = collections.namedtuple('P', ['x', 'y'])\nx = P(1, 2)._asdict()";
     assert_eq!(g(nt, "x"), "{'x': 1, 'y': 2}");
-    assert_eq!(g("import collections\nx = list(collections.UserList([1, 2]) + [3])", "x"), "[1, 2, 3]");
+    assert_eq!(
+        g(
+            "import collections\nx = list(collections.UserList([1, 2]) + [3])",
+            "x"
+        ),
+        "[1, 2, 3]"
+    );
 }
 
 // `eval`/`exec` with an explicit globals namespace runs in a scope where a
@@ -459,10 +621,16 @@ fn builtin_subclass_delegation() {
 #[cfg(not(feature = "stdlib-ffi"))]
 #[test]
 fn dotted_import_binds_top_package() {
-    assert_eq!(g("import os.path\nx = os.path.join('a', 'b')", "x"), "'a/b'");
+    assert_eq!(
+        g("import os.path\nx = os.path.join('a', 'b')", "x"),
+        "'a/b'"
+    );
     assert_eq!(g("import os.path\nx = type(os).__name__", "x"), "'module'");
     assert_eq!(
-        g("import collections.abc\nx = collections.abc.Mapping.__name__", "x"),
+        g(
+            "import collections.abc\nx = collections.abc.Mapping.__name__",
+            "x"
+        ),
         "'Mapping'",
     );
 }
@@ -500,7 +668,10 @@ fn typing_type_var_core() {
                x = (T.__name__, T.__bound__.__name__, T.__covariant__, type(T).__name__)";
     assert_eq!(g(src, "x"), "('T', 'int', False, 'TypeVar')");
     assert_eq!(
-        g("import _typing\nT = _typing.TypeVar('T')\nx = len({T, T, _typing.TypeVar('T')})", "x"),
+        g(
+            "import _typing\nT = _typing.TypeVar('T')\nx = len({T, T, _typing.TypeVar('T')})",
+            "x"
+        ),
         "2",
     );
 }
@@ -514,11 +685,20 @@ fn typing_type_var_core() {
 fn forward_reference_annotations_tolerated() {
     // Resolvable function annotations stay real objects.
     assert_eq!(
-        g("def f(a: int) -> str:\n    return ''\nx = f.__annotations__", "x"),
+        g(
+            "def f(a: int) -> str:\n    return ''\nx = f.__annotations__",
+            "x"
+        ),
         "{'a': <class 'int'>, 'return': <class 'str'>}",
     );
     // A forward-ref function annotation leaves annotations empty, not a crash.
-    assert_eq!(g("def g(x) -> NotYet:\n    return x\ny = g.__annotations__\nx = y", "x"), "{}");
+    assert_eq!(
+        g(
+            "def g(x) -> NotYet:\n    return x\ny = g.__annotations__\nx = y",
+            "x"
+        ),
+        "{}"
+    );
     // Class body: resolvable kept, forward-ref dropped.
     let cls = "class C:\n    a: int\n    b: Later\n    c: str = 'z'\nx = sorted(C.__annotations__)";
     assert_eq!(g(cls, "x"), "['a', 'c']");
@@ -537,12 +717,36 @@ fn mappingproxy_constructor() {
 #[cfg(not(feature = "stdlib-ffi"))]
 #[test]
 fn re_module_core() {
-    assert_eq!(g("import re\nx = re.match(r'(\\d+)-(\\d+)', '12-34').groups()", "x"), "('12', '34')");
-    assert_eq!(g("import re\nx = re.findall(r'\\d+', 'a1b22c333')", "x"), "['1', '22', '333']");
-    assert_eq!(g("import re\nx = re.sub(r'\\d', '#', 'a1b2')", "x"), "'a#b#'");
-    assert_eq!(g("import re\nx = re.sub(r'(\\w)(\\d)', r'\\2\\1', 'a1')", "x"), "'1a'");
-    assert_eq!(g("import re\nm = re.search(r'(?P<y>\\d+)', 'x=42')\nx = m.group('y')", "x"), "'42'");
-    assert_eq!(g("import re\nx = re.split(r'\\s+', 'a b  c')", "x"), "['a', 'b', 'c']");
+    assert_eq!(
+        g(
+            "import re\nx = re.match(r'(\\d+)-(\\d+)', '12-34').groups()",
+            "x"
+        ),
+        "('12', '34')"
+    );
+    assert_eq!(
+        g("import re\nx = re.findall(r'\\d+', 'a1b22c333')", "x"),
+        "['1', '22', '333']"
+    );
+    assert_eq!(
+        g("import re\nx = re.sub(r'\\d', '#', 'a1b2')", "x"),
+        "'a#b#'"
+    );
+    assert_eq!(
+        g("import re\nx = re.sub(r'(\\w)(\\d)', r'\\2\\1', 'a1')", "x"),
+        "'1a'"
+    );
+    assert_eq!(
+        g(
+            "import re\nm = re.search(r'(?P<y>\\d+)', 'x=42')\nx = m.group('y')",
+            "x"
+        ),
+        "'42'"
+    );
+    assert_eq!(
+        g("import re\nx = re.split(r'\\s+', 'a b  c')", "x"),
+        "['a', 'b', 'c']"
+    );
 }
 
 // PEP 695 type parameters (`class C[T]`, `def f[T]`) parse and run: the params
@@ -550,12 +754,21 @@ fn re_module_core() {
 // runtime is unaffected. CPython 3.14's typing.py uses this syntax throughout.
 #[test]
 fn pep695_type_params() {
-    assert_eq!(g("def ident[T](x: T) -> T:\n    return x\nx = ident(5)", "x"), "5");
+    assert_eq!(
+        g("def ident[T](x: T) -> T:\n    return x\nx = ident(5)", "x"),
+        "5"
+    );
     let m = "class Stack[T]:\n    def push[U](self, v: U) -> U:\n        return v\nx = Stack().push(99)";
     assert_eq!(g(m, "x"), "99");
     // Multiple params, bound/default syntax parse and are discarded.
-    assert_eq!(g("class Pair[A, B]:\n    pass\nx = Pair.__name__", "x"), "'Pair'");
-    assert_eq!(g("def f[T: int, U = str](x):\n    return x\nx = f(7)", "x"), "7");
+    assert_eq!(
+        g("class Pair[A, B]:\n    pass\nx = Pair.__name__", "x"),
+        "'Pair'"
+    );
+    assert_eq!(
+        g("def f[T: int, U = str](x):\n    return x\nx = f(7)", "x"),
+        "7"
+    );
 }
 
 // A relative import (`from . import _compiler` in re's `__init__`) resolves
@@ -606,7 +819,8 @@ x = res";
 // class registration).
 #[test]
 fn stored_bound_method_resolves_super() {
-    let src = "class B:\n    def g(self):\n        return 'b'\nclass C(B):\n    def g(self):\n        \
+    let src =
+        "class B:\n    def g(self):\n        return 'b'\nclass C(B):\n    def g(self):\n        \
                return super().g() + 'c'\nf = C().g\nx = f()";
     assert_eq!(g(src, "x"), "'bc'");
 }
@@ -616,12 +830,24 @@ fn stored_bound_method_resolves_super() {
 #[test]
 fn random_matches_cpython() {
     assert_eq!(
-        g("import random\nrandom.seed(42)\nx = [random.randint(1, 100) for _ in range(5)]", "x"),
+        g(
+            "import random\nrandom.seed(42)\nx = [random.randint(1, 100) for _ in range(5)]",
+            "x"
+        ),
         "[82, 15, 4, 95, 36]",
     );
-    assert_eq!(g("import random\nrandom.seed(42)\nx = random.getrandbits(64)", "x"), "2053695854357871005");
     assert_eq!(
-        g("import random\nrandom.seed(42)\nx = random.sample(range(100), 3)", "x"),
+        g(
+            "import random\nrandom.seed(42)\nx = random.getrandbits(64)",
+            "x"
+        ),
+        "2053695854357871005"
+    );
+    assert_eq!(
+        g(
+            "import random\nrandom.seed(42)\nx = random.sample(range(100), 3)",
+            "x"
+        ),
         "[81, 14, 3]",
     );
 }
@@ -630,34 +856,88 @@ fn random_matches_cpython() {
 fn thread_locks() {
     // Native _thread locks: RLock is reentrant, plain lock tracks state. (Single
     // user thread, so acquire always succeeds.)
-    assert_eq!(g("import _thread\nlk = _thread.RLock()\nwith lk:\n    x = 42", "x"), "42");
     assert_eq!(
-        g("import _thread\nl = _thread.allocate_lock()\nl.acquire()\nx = l.locked()", "x"),
+        g(
+            "import _thread\nlk = _thread.RLock()\nwith lk:\n    x = 42",
+            "x"
+        ),
+        "42"
+    );
+    assert_eq!(
+        g(
+            "import _thread\nl = _thread.allocate_lock()\nl.acquire()\nx = l.locked()",
+            "x"
+        ),
         "True",
     );
     assert_eq!(g("import _thread\nx = _thread.get_ident()", "x"), "1");
     // functools imports on top of _thread.
-    assert_eq!(g("import functools\nx = functools.reduce(lambda a, b: a + b, [1, 2, 3, 4])", "x"), "10");
+    assert_eq!(
+        g(
+            "import functools\nx = functools.reduce(lambda a, b: a + b, [1, 2, 3, 4])",
+            "x"
+        ),
+        "10"
+    );
 }
 
 #[test]
 fn itertools_module() {
     // Lazy iterators (incl. over infinite sources via islice) and combinatorics.
-    assert_eq!(g("import itertools as it\nx = list(it.islice(it.count(10, 2), 4))", "x"), "[10, 12, 14, 16]");
-    assert_eq!(g("import itertools as it\nx = list(it.islice(it.cycle('AB'), 5))", "x"), "['A', 'B', 'A', 'B', 'A']");
-    assert_eq!(g("import itertools as it\nx = list(it.accumulate([1, 2, 3, 4]))", "x"), "[1, 3, 6, 10]");
-    assert_eq!(g("import itertools as it\nx = list(it.chain([1, 2], [3]))", "x"), "[1, 2, 3]");
-    assert_eq!(g("import itertools as it\nx = list(it.pairwise([1, 2, 3]))", "x"), "[(1, 2), (2, 3)]");
     assert_eq!(
-        g("import itertools as it\nx = list(it.combinations([1, 2, 3], 2))", "x"),
+        g(
+            "import itertools as it\nx = list(it.islice(it.count(10, 2), 4))",
+            "x"
+        ),
+        "[10, 12, 14, 16]"
+    );
+    assert_eq!(
+        g(
+            "import itertools as it\nx = list(it.islice(it.cycle('AB'), 5))",
+            "x"
+        ),
+        "['A', 'B', 'A', 'B', 'A']"
+    );
+    assert_eq!(
+        g(
+            "import itertools as it\nx = list(it.accumulate([1, 2, 3, 4]))",
+            "x"
+        ),
+        "[1, 3, 6, 10]"
+    );
+    assert_eq!(
+        g(
+            "import itertools as it\nx = list(it.chain([1, 2], [3]))",
+            "x"
+        ),
+        "[1, 2, 3]"
+    );
+    assert_eq!(
+        g(
+            "import itertools as it\nx = list(it.pairwise([1, 2, 3]))",
+            "x"
+        ),
+        "[(1, 2), (2, 3)]"
+    );
+    assert_eq!(
+        g(
+            "import itertools as it\nx = list(it.combinations([1, 2, 3], 2))",
+            "x"
+        ),
         "[(1, 2), (1, 3), (2, 3)]",
     );
     assert_eq!(
-        g("import itertools as it\nx = list(it.product([1, 2], [3, 4]))", "x"),
+        g(
+            "import itertools as it\nx = list(it.product([1, 2], [3, 4]))",
+            "x"
+        ),
         "[(1, 3), (1, 4), (2, 3), (2, 4)]",
     );
     assert_eq!(
-        g("import itertools as it\nx = [(k, list(gp)) for k, gp in it.groupby([1, 1, 2, 3, 3])]", "x"),
+        g(
+            "import itertools as it\nx = [(k, list(gp)) for k, gp in it.groupby([1, 1, 2, 3, 3])]",
+            "x"
+        ),
         "[(1, [1, 1]), (2, [2]), (3, [3, 3])]",
     );
 }
@@ -666,8 +946,17 @@ fn itertools_module() {
 fn errno_module() {
     // Native errno constants (from libc). Low POSIX numbers are stable across
     // Linux/macOS, so assert those.
-    assert_eq!(g("import errno\nx = (errno.ENOENT, errno.EEXIST, errno.EINVAL)", "x"), "(2, 17, 22)");
-    assert_eq!(g("import errno\nx = errno.errorcode[errno.ENOENT]", "x"), "'ENOENT'");
+    assert_eq!(
+        g(
+            "import errno\nx = (errno.ENOENT, errno.EEXIST, errno.EINVAL)",
+            "x"
+        ),
+        "(2, 17, 22)"
+    );
+    assert_eq!(
+        g("import errno\nx = errno.errorcode[errno.ENOENT]", "x"),
+        "'ENOENT'"
+    );
 }
 
 #[test]
@@ -679,14 +968,29 @@ fn bignum_range() {
         "[100000000000000000000, 100000000000000000001, \
           100000000000000000002, 100000000000000000003]",
     );
-    assert_eq!(g("x = range(10**20, 10**20 + 5)[2]", "x"), "100000000000000000002");
-    assert_eq!(g("x = range(10**20, 10**20 + 5)[-1]", "x"), "100000000000000000004");
-    assert_eq!(g("x = 10**20 + 3 in range(10**20, 10**20 + 5)", "x"), "True");
+    assert_eq!(
+        g("x = range(10**20, 10**20 + 5)[2]", "x"),
+        "100000000000000000002"
+    );
+    assert_eq!(
+        g("x = range(10**20, 10**20 + 5)[-1]", "x"),
+        "100000000000000000004"
+    );
+    assert_eq!(
+        g("x = 10**20 + 3 in range(10**20, 10**20 + 5)", "x"),
+        "True"
+    );
     assert_eq!(g("x = len(range(10**20, 10**20 + 7))", "x"), "7");
     assert_eq!(g("x = bool(range(5, 5))", "x"), "False");
-    assert_eq!(g("x = range(10**30)", "x"), "range(0, 1000000000000000000000000000000)");
+    assert_eq!(
+        g("x = range(10**30)", "x"),
+        "range(0, 1000000000000000000000000000000)"
+    );
     // The type-extraction case from _collections_abc: range(1<<1000) is iterable.
-    assert_eq!(g("x = type(iter(range(1 << 1000))).__name__", "x"), "'iterator'");
+    assert_eq!(
+        g("x = type(iter(range(1 << 1000))).__name__", "x"),
+        "'iterator'"
+    );
 }
 
 #[test]
@@ -733,14 +1037,20 @@ fn parity_gaps_found_by_differential_probing() {
     );
 
     // `math.isclose` (PEP 485) and `math.remainder` were absent.
-    assert_eq!(g("import math\nx = math.isclose(0.1 + 0.2, 0.3)", "x"), "True");
+    assert_eq!(
+        g("import math\nx = math.isclose(0.1 + 0.2, 0.3)", "x"),
+        "True"
+    );
     assert_eq!(g("import math\nx = math.isclose(1.0, 1.1)", "x"), "False");
     assert_eq!(
         g("import math\nx = math.isclose(1.0, 1.1, rel_tol=0.2)", "x"),
         "True"
     );
     assert_eq!(
-        g("import math\nx = math.isclose(float('nan'), float('nan'))", "x"),
+        g(
+            "import math\nx = math.isclose(float('nan'), float('nan'))",
+            "x"
+        ),
         "False"
     );
     assert_eq!(g("import math\nx = math.remainder(7, 3)", "x"), "1.0");
@@ -772,7 +1082,10 @@ fn fstring_nested_field_at_end_of_spec() {
 #[test]
 fn native_modulo_in_loops_matches_floored_semantics() {
     // Positive operands: truncation and flooring agree.
-    assert_eq!(g("s = 0\nfor i in range(200): s += i % 7\nx = s", "x"), "594");
+    assert_eq!(
+        g("s = 0\nfor i in range(200): s += i % 7\nx = s", "x"),
+        "594"
+    );
     // Negative dividend, positive divisor: result must be in [0, k).
     assert_eq!(
         g("s = 0\nfor i in range(-200, 0): s += i % 7\nx = s", "x"),
@@ -827,17 +1140,26 @@ fn fused_modular_arithmetic_matches_exact_python() {
     );
     // Written the other way round: `(c + a*b) % k`.
     assert_eq!(
-        g("s = 0\nfor i in range(500): s += (99 + i * 31) % 1000\nx = s", "x"),
+        g(
+            "s = 0\nfor i in range(500): s += (99 + i * 31) % 1000\nx = s",
+            "x"
+        ),
         "247750"
     );
     // Negative dividend and negative divisor: the result is floored, so it takes
     // the divisor's sign — the fused ops must not leave a C-truncated remainder.
     assert_eq!(
-        g("s = 0\nfor i in range(-500, 0): s += (i * 7) % 97\nx = s", "x"),
+        g(
+            "s = 0\nfor i in range(-500, 0): s += (i * 7) % 97\nx = s",
+            "x"
+        ),
         "24089"
     );
     assert_eq!(
-        g("s = 0\nfor i in range(-500, 500): s += (i * i * 7 + i) % -97\nx = s", "x"),
+        g(
+            "s = 0\nfor i in range(-500, 500): s += (i * i * 7 + i) % -97\nx = s",
+            "x"
+        ),
         "-48056"
     );
     // A float dividend takes the unfused fallback inside the op and must still
@@ -864,17 +1186,17 @@ fn native_loop_type_guard_falls_back_to_the_generic_copy() {
         g("t = 'x=%d'\nfor i in range(1): t = t % 7\nx = t", "x"),
         "'x=7'"
     );
-    assert_eq!(g("f = 1.5\nfor i in range(4): f = f * 2\nx = f", "x"), "24.0");
+    assert_eq!(
+        g("f = 1.5\nfor i in range(4): f = f * 2\nx = f", "x"),
+        "24.0"
+    );
     assert_eq!(
         g("l = [1]\nfor i in range(3): l = l * 2\nx = len(l)", "x"),
         "8"
     );
     // A `bool` seed is excluded deliberately: it is an int to Python, but the
     // loop would write an `int` back, changing `repr` for an untouched name.
-    assert_eq!(
-        g("b = True\nfor i in range(3): b = b + i\nx = b", "x"),
-        "4"
-    );
+    assert_eq!(g("b = True\nfor i in range(3): b = b + i\nx = b", "x"), "4");
     // The loop variable's last-value binding survives the fallback.
     assert_eq!(
         g("u = 'q'\nfor i in range(5): u = u + 'z'\nx = (i, u)", "x"),
@@ -882,16 +1204,25 @@ fn native_loop_type_guard_falls_back_to_the_generic_copy() {
     );
     // An integer-seeded loop after a guard-failing one still takes the fast path.
     assert_eq!(
-        g("s = 'a'\nfor i in range(2): s = s * 2\nn = 0\nfor i in range(100): n += i % 7\nx = n", "x"),
+        g(
+            "s = 'a'\nfor i in range(2): s = s * 2\nn = 0\nfor i in range(100): n += i % 7\nx = n",
+            "x"
+        ),
         "295"
     );
     // `while` loops are versioned the same way.
     assert_eq!(
-        g("s = 'ab'\nc = 0\nwhile c < 3:\n    s = s * 2\n    c += 1\nx = (s, c)", "x"),
+        g(
+            "s = 'ab'\nc = 0\nwhile c < 3:\n    s = s * 2\n    c += 1\nx = (s, c)",
+            "x"
+        ),
         "('abababababababab', 3)"
     );
     assert_eq!(
-        g("f = 1.0\nd = 0\nwhile d < 4:\n    f = f * 3\n    d += 1\nx = f", "x"),
+        g(
+            "f = 1.0\nd = 0\nwhile d < 4:\n    f = f * 3\n    d += 1\nx = f",
+            "x"
+        ),
         "81.0"
     );
 }
@@ -915,12 +1246,18 @@ fn container_operations_are_not_quadratic() {
         "1799970000"
     );
     assert_eq!(
-        g("s = set()\nfor i in range(60000): s.add(i)\nx = (len(s), 59999 in s)", "x"),
+        g(
+            "s = set()\nfor i in range(60000): s.add(i)\nx = (len(s), 59999 in s)",
+            "x"
+        ),
         "(60000, True)"
     );
     // iteration over a large list (every step used to copy the list)
     assert_eq!(
-        g("a = list(range(60000))\nt = 0\nfor v in a: t += v\nx = t", "x"),
+        g(
+            "a = list(range(60000))\nt = 0\nfor v in a: t += v\nx = t",
+            "x"
+        ),
         "1799970000"
     );
     // comprehension over a large list, and str building through join
@@ -929,7 +1266,10 @@ fn container_operations_are_not_quadratic() {
         "179998"
     );
     assert_eq!(
-        g("p = []\nfor i in range(20000): p.append('ab')\nx = len(''.join(p))", "x"),
+        g(
+            "p = []\nfor i in range(20000): p.append('ab')\nx = len(''.join(p))",
+            "x"
+        ),
         "40000"
     );
 }
@@ -3958,7 +4298,10 @@ fn t_string_and_f_string_literals_cannot_be_concatenated() {
     // They produce different types, so there is nothing to join — CPython makes
     // this a SyntaxError rather than silently picking one.
     let e = eval_str("x = t'a' f'b'").expect_err("mixing t- and f-strings must fail");
-    assert!(e.contains("SyntaxError"), "expected a SyntaxError, got: {e}");
+    assert!(
+        e.contains("SyntaxError"),
+        "expected a SyntaxError, got: {e}"
+    );
 }
 
 #[test]
@@ -4063,7 +4406,10 @@ fn function_locals_live_in_frame_slots_without_changing_semantics() {
     );
     // A local that shadows a global does not leak into it.
     assert_eq!(
-        g("v = 'global'\ndef f():\n\x20   v = 'local'\n\x20   return v\nx = (f(), v)", "x"),
+        g(
+            "v = 'global'\ndef f():\n\x20   v = 'local'\n\x20   return v\nx = (f(), v)",
+            "x"
+        ),
         "('local', 'global')"
     );
     // A closure still sees the enclosing local, so names a nested scope reads

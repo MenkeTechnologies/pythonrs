@@ -99,9 +99,7 @@ pub struct Keyword {
 /// renders the secondary caret `^` and the rest of `[start, end)` renders the
 /// primary caret `~` — CPython's `~^~` binary-op and `~~~^^^` subscript/call
 /// anchoring. With no anchor the whole `[start, end)` renders `^`.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Span {
     pub line: u32,
     pub start: u32,

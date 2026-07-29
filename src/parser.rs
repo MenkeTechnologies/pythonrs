@@ -606,9 +606,7 @@ impl Parser {
                     names.push(n);
                     expect_name = false;
                 }
-                Tok::Eof => {
-                    return Err("SyntaxError: unterminated type-parameter list".to_string())
-                }
+                Tok::Eof => return Err("SyntaxError: unterminated type-parameter list".to_string()),
                 _ => {}
             }
             self.advance();
@@ -1385,7 +1383,14 @@ impl Parser {
             // operator anchor), so a bare `a < b` that spans the whole line is
             // hidden and `x = a < b` shows `^^^^^`.
             let end = self.prev_end_col();
-            Ok(spanned(Expr::Compare(Box::new(left), ops), sl, sc, end, 0, 0))
+            Ok(spanned(
+                Expr::Compare(Box::new(left), ops),
+                sl,
+                sc,
+                end,
+                0,
+                0,
+            ))
         }
     }
 
@@ -1451,7 +1456,7 @@ impl Parser {
             } else {
                 break;
             };
-            let ( opc, ope) = (self.col(), self.cur_end_col());
+            let (opc, ope) = (self.col(), self.cur_end_col());
             self.advance();
             let e2 = Expr::BinOp(op, Box::new(e), Box::new(self.parse_term()?));
             let end = self.prev_end_col();

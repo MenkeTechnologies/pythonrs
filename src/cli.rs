@@ -20,7 +20,6 @@ pub struct Cli {
     // module's verbatim `sys.argv`) — a contract clap can't model. A clap `-m`
     // field would also wrongly capture a `-m` that is a *program* argument
     // (`python foo.py -m bar`, `python -c '…' -m x`), dropping it from `sys.argv`.
-
     /// Force stdout/stderr unbuffered (CPython `-u` / `PYTHONUNBUFFERED`).
     #[arg(short = 'u')]
     pub unbuffered: bool,
