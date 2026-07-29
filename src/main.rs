@@ -146,6 +146,18 @@ fn run_script(cli: &pythonrs::cli::Cli, file: String, args: Vec<String>) -> Exit
             Err(e) => fail(&e),
         };
     }
+    if cli.tiers {
+        return match std::fs::read_to_string(&file)
+            .map_err(|e| format!("cannot read {file}: {e}"))
+            .and_then(|src| pythonrs::tiers::report(&src))
+        {
+            Ok(r) => {
+                println!("{r}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e),
+        };
+    }
     if cli.build {
         return match pythonrs::aot::build(&file) {
             Ok(msg) => {

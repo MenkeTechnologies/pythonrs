@@ -97,6 +97,7 @@ python foo.py               # run a script (transparently rkyv-cached)
 python -c 'print(1 + 1)'    # run a one-liner
 python --build foo.py       # AOT-compile to a native ./foo executable
 python --dump-bytecode f.py # print the lowered fusevm bytecode
+python --tiers f.py         # run it, then report which fusevm tiers took it
 python --repl               # interactive REPL
 python --lsp                # Language Server Protocol over stdio
 python --doctor             # runtime / CPython / cache / env diagnostic report
@@ -141,6 +142,7 @@ what is not yet implemented.
 | `-E -I -O -S -B -W` | CPython interpreter flags, accepted for drop-in compatibility (`-u`/`-W` take real effect via the embedded interpreter; the rest are tolerated no-ops). |
 | `--build` | AOT-compile the script to a standalone native executable. |
 | `--dump-bytecode` | Print the lowered `fusevm` bytecode and exit. |
+| `--tiers` | Run the script, then report which fusevm execution tier took each of its chunks. |
 | `--repl` | Start the interactive REPL. |
 | `--lsp` | Run the Language Server Protocol server over stdio. |
 | `--doctor` | Print a diagnostic report — runtime, embedded CPython, fusevm engine, bytecode cache, `PYTHON*` env, and every `python*` interpreter on `PATH` — and exit. |

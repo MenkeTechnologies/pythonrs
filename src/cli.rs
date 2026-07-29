@@ -85,6 +85,10 @@ pub struct Cli {
     #[arg(long = "disasm")]
     pub disasm: bool,
 
+    /// Run the script, then report which fusevm tiers took each of its chunks.
+    #[arg(long = "tiers")]
+    pub tiers: bool,
+
     /// Print a diagnostic report (runtime, embedded CPython, cache, env) and exit.
     #[arg(long = "doctor")]
     pub doctor: bool,
