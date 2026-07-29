@@ -2575,6 +2575,9 @@ impl PyHost {
     /// defines one, otherwise every namespace entry whose name does not begin with
     /// `_`. Returns `(name, value)` pairs for the caller to bind.
     pub fn import_star_bindings(&mut self, module: &Value) -> Result<Vec<(String, Value)>, String> {
+        // Copy the bridge handle out before the namespace clone below borrows
+        // the heap; `foreign_id` is always `None` on a native-only build.
+        let foreign = self.foreign_id(module);
         match self.module_slot(module).map(|s| self.module_globals[s].clone()) {
             Some(ns) => {
                 if let Some(all) = ns.get("__all__").cloned() {
@@ -2593,22 +2596,24 @@ impl PyHost {
                         .collect())
                 }
             }
-            // A CPython module over the ffi bridge: honor its `__all__` (the
-            // stdlib modules reached by star-import all define one).
-            #[cfg(feature = "stdlib-ffi")]
-            Some(PyObj::Foreign(id)) => {
-                let all = crate::ffi::get_attr(self, id, "__all__").map_err(|_| {
-                    type_error("'import *' from this module needs an __all__ it does not define")
-                })?;
-                let mut out = Vec::new();
-                for n in self.str_sequence(&all)? {
-                    if let Ok(v) = crate::ffi::get_attr(self, id, &n) {
-                        out.push((n, v));
+            // Not a native module. A CPython module over the ffi bridge is
+            // still a valid target: honor its `__all__` (the stdlib modules
+            // reached by star-import all define one).
+            _ => match foreign {
+                Some(id) => {
+                    let all = crate::ffi::get_attr(self, id, "__all__").map_err(|_| {
+                        type_error("'import *' from this module needs an __all__ it does not define")
+                    })?;
+                    let mut out = Vec::new();
+                    for n in self.str_sequence(&all)? {
+                        if let Ok(v) = crate::ffi::get_attr(self, id, &n) {
+                            out.push((n, v));
+                        }
                     }
+                    Ok(out)
                 }
-                Ok(out)
-            }
-            _ => Err(type_error("'import *' requires a module object")),
+                None => Err(type_error("'import *' requires a module object")),
+            },
         }
     }
 
