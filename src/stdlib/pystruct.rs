@@ -154,7 +154,6 @@ struct FormatCode {
 
 struct FormatSpec {
     endian: Endianness,
-    native: bool,
     codes: Vec<FormatCode>,
     size: usize,
     arg_count: usize,
@@ -235,7 +234,6 @@ impl FormatSpec {
         }
         Ok(Self {
             endian,
-            native,
             codes,
             size: offset,
             arg_count,
@@ -280,9 +278,9 @@ impl FormatSpec {
         let mut out: Vec<u8> = Vec::with_capacity(self.size);
         let mut arg = 0usize;
         for code in &self.codes {
-            out.extend(std::iter::repeat_n(0u8, code.pre_padding));
+            out.extend(std::iter::repeat(0u8).take(code.pre_padding));
             match code.code {
-                FormatType::Pad => out.extend(std::iter::repeat_n(0u8, code.repeat)),
+                FormatType::Pad => out.extend(std::iter::repeat(0u8).take(code.repeat)),
                 FormatType::Str | FormatType::Pascal => {
                     let v = &args[arg];
                     arg += 1;
@@ -297,12 +295,12 @@ impl FormatSpec {
                         b.truncate(cap);
                         out.push(b.len() as u8);
                         out.extend_from_slice(&b);
-                        out.extend(std::iter::repeat_n(0u8, cap - b.len()));
+                        out.extend(std::iter::repeat(0u8).take(cap - b.len()));
                     } else {
                         b.truncate(code.repeat);
                         let pad = code.repeat - b.len();
                         out.extend_from_slice(&b);
-                        out.extend(std::iter::repeat_n(0u8, pad));
+                        out.extend(std::iter::repeat(0u8).take(pad));
                     }
                 }
                 _ => {

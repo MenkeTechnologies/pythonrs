@@ -170,7 +170,7 @@ fn utf8_decode(b: &[u8], errors: Errors) -> Result<(String, usize), String> {
 /// utf-16/utf-32 in either byte order. `width` is 2 or 4.
 fn utf_x_encode(s: &str, width: usize, big: bool, bom: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(s.len() * width + width);
-    let mut push = |v: u32, out: &mut Vec<u8>| {
+    let push = |v: u32, out: &mut Vec<u8>| {
         let bytes: [u8; 4] = v.to_le_bytes();
         let take = &bytes[..width];
         if big {
@@ -203,11 +203,10 @@ fn utf_x_decode(
     big: bool,
     errors: Errors,
 ) -> Result<String, String> {
-    if b.len() % width != 0 {
-        if errors == Errors::Strict {
+    if b.len() % width != 0
+        && errors == Errors::Strict {
             return Err(dec_err(enc, b.len() - (b.len() % width), "truncated data"));
         }
-    }
     let mut units: Vec<u32> = Vec::with_capacity(b.len() / width);
     for chunk in b.chunks_exact(width) {
         let mut v: u32 = 0;

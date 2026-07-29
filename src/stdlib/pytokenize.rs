@@ -77,23 +77,6 @@ struct StrCtx {
     template: bool,
 }
 
-impl StrCtx {
-    fn middle(&self) -> i64 {
-        if self.template {
-            TSTRING_MIDDLE
-        } else {
-            FSTRING_MIDDLE
-        }
-    }
-    fn end(&self) -> i64 {
-        if self.template {
-            TSTRING_END
-        } else {
-            FSTRING_END
-        }
-    }
-}
-
 fn ident_start(c: char) -> bool {
     c.is_alphabetic() || c == '_' || !c.is_ascii()
 }
@@ -193,7 +176,7 @@ impl Scanner {
 
     /// Advance one character, wrapping to the next line.
     fn bump(&mut self) {
-        if self.col + 1 <= self.line_len() {
+        if self.col < self.line_len() {
             self.col += 1;
         }
         if self.col >= self.line_len() {
@@ -285,7 +268,7 @@ fn scan_code(s: &mut Scanner) -> Result<(), String> {
                 }
                 s.col = stop;
             }
-            '\\' if s.peek(1).is_none_or(|n| n == '\n' || n == '\r') => {
+            '\\' if s.peek(1).map_or(true, |n| n == '\n' || n == '\r') => {
                 s.continued = true;
                 s.row += 1;
                 s.col = 0;
@@ -529,7 +512,7 @@ fn scan_literal(s: &mut Scanner, spec: bool) -> Result<(), String> {
                         s.push(middle_kind, text, (srow, scol), (r, c0));
                     }
                     let n = if triple { 3 } else { 1 };
-                    let close: String = std::iter::repeat_n(quote, n).collect();
+                    let close: String = std::iter::repeat(quote).take(n).collect();
                     s.push(end_kind, close, (r, c0), (r, c0 + n));
                     s.col += n;
                     if s.col >= s.line_len() {

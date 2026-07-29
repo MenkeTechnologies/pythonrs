@@ -350,9 +350,7 @@ fn stringio_method(
             // CPython only allows seeking to 0 relative to the end or current
             // position on a text stream; anything else needs an opaque cookie.
             if whence != 0 && off != 0 {
-                return Some(Err(format!(
-                    "OSError: Can't do nonzero cur-relative seeks"
-                )
+                return Some(Err("OSError: Can't do nonzero cur-relative seeks".to_string()
                 .replace("cur", if whence == 2 { "end" } else { "cur" })));
             }
             let new = match whence {

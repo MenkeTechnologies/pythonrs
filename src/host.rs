@@ -1259,6 +1259,9 @@ pub enum AttrCompletion {
     Names(Vec<String>),
 }
 
+/// One `atexit`-registered callback: `(func, args, kwargs)`.
+pub type AtexitCallback = (Value, Vec<Value>, Vec<(String, Value)>);
+
 pub struct PyHost {
     heap: Vec<PyObj>,
     /// Function/lambda templates, indexed by def id.
@@ -1392,7 +1395,7 @@ pub struct PyHost {
     pub mt_states: HashMap<u32, MtState>,
     /// `atexit`-registered callbacks: `(func, args, kwargs)` in registration
     /// order. Run LIFO at interpreter shutdown ([`run_atexit_callbacks`]).
-    pub atexit_callbacks: Vec<(Value, Vec<Value>, Vec<(String, Value)>)>,
+    pub atexit_callbacks: Vec<AtexitCallback>,
     /// Compiled `re` patterns, indexed by [`PyObj::Pattern`]'s `id`. The native
     /// `re` module (backed by the `regex` crate) stores each compiled `Regex`
     /// here so a `PyObj::Pattern` stays cheap to clone.
@@ -1780,7 +1783,7 @@ impl PyHost {
     /// retry re-runs the body and re-raises, rather than resolving to a broken
     /// cached shell (which would silently mask a dependency's import failure).
     pub fn uncache_module(&mut self, name: &str) {
-        self.modules.remove(name);
+        self.modules.shift_remove(name);
         if let Some(sm) = self.sys_modules.clone() {
             if let Some(PyObj::Dict(d)) = self.get_mut(&sm) {
                 d.shift_remove(&PKey::Str(name.to_string()));
@@ -2197,13 +2200,13 @@ impl PyHost {
     /// MODULE scope — its name binding and lookup then reach the real module
     /// globals rather than the calling function's locals (`exec("g = 1")` inside a
     /// function sets a module global, matching CPython's default-namespace rule).
-    /// Returns the parked frames to hand back to [`restore_scope`]. A run already
+    /// Returns the parked frames to hand back to [`Self::restore_scope`]. A run already
     /// at module scope parks nothing.
     pub fn enter_module_scope(&mut self) -> Vec<Frame> {
         self.frames.split_off(1)
     }
 
-    /// Restore the frames parked by [`enter_module_scope`] once the nested run
+    /// Restore the frames parked by [`Self::enter_module_scope`] once the nested run
     /// finishes, so the interrupted caller resumes with its frame intact.
     pub fn restore_scope(&mut self, parked: Vec<Frame>) {
         self.frames.truncate(1);
@@ -2886,6 +2889,13 @@ thread_local! {
     /// struct out of the pool on the way in and back on the way out — nearly
     /// 4 KB of copying per Python call, which profiled as the single largest
     /// cost in call-heavy code. A `Box` makes both moves pointer-sized.
+    ///
+    /// `clippy::vec_box` argues the `Vec` already heap-allocates so the `Box` is
+    /// redundant. That is true of the *storage* and false of the *moves*, which
+    /// are what cost here: pushing and popping a bare `VM` memcpys the struct,
+    /// and this pool is on the hot call path. Kept deliberately, per the
+    /// measurement above.
+    #[allow(clippy::vec_box)]
     static VM_POOL: RefCell<HashMap<u64, Vec<Box<VM>>>> = RefCell::new(HashMap::new());
 }
 
@@ -7609,7 +7619,7 @@ impl PyHost {
     }
 
     /// The MRO of `class`, memoized. Callers that only read it should prefer this
-    /// over [`mro_of`], which hands back an owned copy.
+    /// over [`Self::mro_of`], which hands back an owned copy.
     pub fn mro_rc(&self, class: &str) -> std::rc::Rc<Vec<String>> {
         if let Some(hit) = self.mro_cache.borrow().get(class) {
             return hit.clone();
@@ -10410,7 +10420,7 @@ pub fn call_method(
                     // `_random.Random.seed`) still needs the instance.
                     if found == "_random.Random" {
                         if let Value::Obj(id) = &instance {
-                            return crate::builtins::random_method(*id, &name, &args);
+                            return crate::builtins::random_method(*id, name, &args);
                         }
                     }
                     invoke(&f, args, kwargs)
@@ -10616,13 +10626,10 @@ pub fn class_getitem(cls: &Value, item: Value) -> Option<Result<Value, String>> 
     // Clone the class NAME, never the object: `get(..).cloned()` here deep-copied
     // whatever the receiver was, so every `a[i]` on a list copied the entire list
     // before discarding it — O(n) per subscript, quadratic over a loop.
-    let cname = match with_host(|h| match h.get(cls) {
+    let cname = with_host(|h| match h.get(cls) {
         Some(PyObj::Class(n)) => Some(n.clone()),
         _ => None,
-    }) {
-        Some(n) => n,
-        None => return None,
-    };
+    })?;
     let f = with_host(|h| h.class_lookup(&cname, "__class_getitem__"))?;
     // Implicit classmethod: bind the class as the leading `cls` argument whether
     // the body was wrapped with `@classmethod` or written bare.
@@ -12195,7 +12202,7 @@ pub fn warn_unawaited_coroutines() {
 /// and the rest still run, matching CPython's `atexit` teardown. The list is
 /// drained so a re-entrant `_run_exitfuncs` does not run a callback twice.
 pub fn run_atexit_callbacks() {
-    let callbacks: Vec<(Value, Vec<Value>, Vec<(String, Value)>)> =
+    let callbacks: Vec<AtexitCallback> =
         with_host(|h| std::mem::take(&mut h.atexit_callbacks));
     for (func, args, kwargs) in callbacks.into_iter().rev() {
         if let Err(e) = invoke(&func, args, kwargs) {

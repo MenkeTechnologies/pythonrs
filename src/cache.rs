@@ -203,6 +203,18 @@ fn shard_path() -> Option<PathBuf> {
 /// the lock is a sibling `.lock`, never in the read path).
 struct ShardLock(std::fs::File);
 
+impl Drop for ShardLock {
+    /// Release the advisory lock explicitly. Dropping the `File` would release
+    /// it anyway (closing the fd drops the `flock`), but unlocking by name keeps
+    /// the guard's whole purpose visible at the point it happens — and reads the
+    /// field, which is otherwise held purely for that side effect.
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: `self.0` is an open fd for the lifetime of this guard.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 impl ShardLock {
     fn acquire() -> Option<Self> {
         use std::os::unix::io::AsRawFd;
@@ -210,6 +222,8 @@ impl ShardLock {
         let f = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
+            // A lock file carries no data; never truncate a peer holder's file.
+            .truncate(false)
             .open(&path)
             .ok()?;
         // Blocking exclusive lock; released when `f` is dropped (fd closed).

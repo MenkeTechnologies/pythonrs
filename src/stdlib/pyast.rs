@@ -18,7 +18,10 @@
 /// from CPython's ASDL-generated module. `_fields` drives construction and
 /// `ast.iter_fields`; `_attributes` are the source-position slots every
 /// statement and expression carries.
-pub const AST_NODES: &[(&str, &str, &[&str], &[&str])] = &[
+/// One AST node's table entry: `(name, base, fields, attributes)`.
+pub type NodeSpec = (&'static str, &'static str, &'static [&'static str], &'static [&'static str]);
+
+pub const AST_NODES: &[NodeSpec] = &[
     ("AST", "object", &[], &[]),
     ("Add", "operator", &[], &[]),
     ("And", "boolop", &[], &[]),
@@ -206,13 +209,13 @@ PyCF_OPTIMIZED_AST = 33792
     // defined yet, and the table is alphabetical (`Add(operator)` sorts long
     // before `operator(AST)`).
     let mut defined: Vec<&str> = vec!["AST", "object"];
-    let mut pending: Vec<&(&str, &str, &[&str], &[&str])> =
+    let mut pending: Vec<&NodeSpec> =
         AST_NODES.iter().filter(|(n, ..)| *n != "AST").collect();
-    let mut ordered: Vec<&(&str, &str, &[&str], &[&str])> = Vec::with_capacity(pending.len());
+    let mut ordered: Vec<&NodeSpec> = Vec::with_capacity(pending.len());
     while !pending.is_empty() {
         let (ready, rest): (
-            Vec<&(&str, &str, &[&str], &[&str])>,
-            Vec<&(&str, &str, &[&str], &[&str])>,
+            Vec<&NodeSpec>,
+            Vec<&NodeSpec>,
         ) = pending
             .into_iter()
             .partition(|(_, base, ..)| defined.contains(base));

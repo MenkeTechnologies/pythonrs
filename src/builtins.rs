@@ -5860,8 +5860,8 @@ fn call_itertools(name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) ->
     let kw = |k: &str| kwargs.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
     match name {
         "count" => {
-            let start = args.first().and_then(|v| as_i(v)).unwrap_or(0);
-            let step = args.get(1).and_then(|v| as_i(v)).unwrap_or(1);
+            let start = args.first().and_then(&as_i).unwrap_or(0);
+            let step = args.get(1).and_then(&as_i).unwrap_or(1);
             Ok(mk(ItKind::Count, vec![], Value::Undef, vec![start, step], vec![], false))
         }
         "repeat" => {
@@ -5921,7 +5921,6 @@ fn call_itertools(name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) ->
         "filterfalse" => {
             let func = args.first().cloned().unwrap_or(Value::Undef);
             // filterfalse(None, it): None is already Value::Undef (the identity sentinel).
-            let func = func;
             let src = iter_of(args.get(1).ok_or_else(|| host::type_error("filterfalse expected 2 arguments"))?)?;
             Ok(mk(ItKind::FilterFalse, vec![src], func, vec![], vec![], false))
         }
@@ -5929,12 +5928,12 @@ fn call_itertools(name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) ->
             let src = iter_of(&arg0(&args)?)?;
             // islice(it, stop) | islice(it, start, stop[, step])
             let (start, stop, step) = if args.len() <= 2 {
-                (0, args.get(1).and_then(|v| as_i(v)).unwrap_or(-1), 1)
+                (0, args.get(1).and_then(&as_i).unwrap_or(-1), 1)
             } else {
                 (
-                    args.get(1).and_then(|v| as_i(v)).unwrap_or(0),
-                    args.get(2).and_then(|v| as_i(v)).unwrap_or(-1),
-                    args.get(3).and_then(|v| as_i(v)).unwrap_or(1),
+                    args.get(1).and_then(&as_i).unwrap_or(0),
+                    args.get(2).and_then(&as_i).unwrap_or(-1),
+                    args.get(3).and_then(as_i).unwrap_or(1),
                 )
             };
             // nums = [next_yield_index=start, stop, step, cursor=0]
@@ -6082,9 +6081,7 @@ fn itertools_combinations(args: &[Value], with_repl: bool) -> Result<Value, Stri
                 }
             }
             let v = indices[i] + 1;
-            for j in i..r {
-                indices[j] = v;
-            }
+            indices[i..r].fill(v);
             out.push(emit(&indices));
         }
     } else {
@@ -6407,9 +6404,8 @@ fn call_posix(name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Res
         }
         _ => Err(format!("AttributeError: module 'posix' has no attribute '{name}'")),
     }
-    .map_err(|e| {
+    .inspect_err(|_e| {
         let _ = &kwargs;
-        e
     })
 }
 
@@ -7466,7 +7462,7 @@ fn re_sub(
     let rrepl = re_translate_repl(&rsrc);
     let (result, n) = with_host(|h| {
         let re = &h.regexes[pat_id];
-        let limit = (count > 0).then(|| count as usize);
+        let limit = (count > 0).then_some(count as usize);
         let s = re.replace_n(text, limit, rrepl.as_str());
         (s, re.count_matches(text, limit) as i64)
     });
@@ -7595,7 +7591,7 @@ pub fn re_match_method(m: &Value, method: &str, args: &[Value]) -> Result<Value,
         "start" | "end" | "span" => {
             let idx = args
                 .first()
-                .and_then(|g| group_idx(g))
+                .and_then(group_idx)
                 .unwrap_or(0);
             match spans.get(idx).copied().flatten() {
                 Some((s, e)) => Ok(match method {
@@ -7902,7 +7898,6 @@ fn call_math(name: &str, args: &[Value], kwargs: &[(String, Value)]) -> Result<V
         }
         "isqrt" => {
             // Integer square root: floor(sqrt(n)) for a non-negative int, bignum-safe.
-            use num_integer::Roots;
             let n = with_host(|h| h.big_val(&args[0])).ok_or_else(|| {
                 host::type_error("'float' object cannot be interpreted as an integer")
             })?;
@@ -9026,14 +9021,10 @@ pub fn call_type_method(
     // `logging`, `unittest` — depends on that line at import time.
     if name == "__get__" {
         if let Some(qual) = with_host(|h| match h.get(recv) {
-            Some(host::PyObj::Descriptor { kind, qual })
-                if matches!(
-                    kind,
-                    host::DescKind::GetSetDescriptor | host::DescKind::MemberDescriptor
-                ) =>
-            {
-                Some(qual.clone())
-            }
+            Some(host::PyObj::Descriptor {
+                kind: host::DescKind::GetSetDescriptor | host::DescKind::MemberDescriptor,
+                qual,
+            }) => Some(qual.clone()),
             _ => None,
         }) {
             let attr = qual.rsplit('.').next().unwrap_or(&qual).to_string();

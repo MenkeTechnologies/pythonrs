@@ -106,8 +106,9 @@ pub struct Compiler {
     /// (see `try_compile_native_range_for`): maps each loop-local Python name to a
     /// fusevm frame slot so `Name` loads/stores become `GetSlot`/`SetSlot` (direct
     /// Vec indexing) instead of `CallBuiltin(GETLOCAL/SETLOCAL)` (builtin dispatch
-    /// + string-keyed env dict). The hot loop then contains only native ops, which
-    /// the interpreter runs far faster and the AOT/JIT native tier can lower.
+    /// and a string-keyed env dict). The hot loop then contains only native ops,
+    /// which the interpreter runs far faster and the AOT/JIT native tier can
+    /// lower.
     native_slots: Option<HashMap<String, u16>>,
     /// Next free fusevm slot index to hand out for a loop bound while emitting a
     /// native for-range nest (names take slots `0..k`; each loop's `stop` bound
@@ -222,6 +223,37 @@ fn compile_ex(stmts: &[Stmt], debug: bool, interactive: bool) -> Result<Program,
 
 fn argc(n: usize) -> Result<u8, String> {
     u8::try_from(n).map_err(|_| "too many arguments (>255) for one call".to_string())
+}
+
+/// The namespace plumbing a native for-range loop needs around its body: which
+/// Python names to seed into frame slots on entry (`loads`), which to write back
+/// to the namespace on exit (`writebacks`), and which slots need a type guard
+/// because a namespace value could be a non-int. Grouped so `emit_loop_core`
+/// takes one parameter for the whole concern rather than three parallel slices.
+/// The counted range a native for-range loop walks: the slot holding the
+/// induction variable, the slot holding the (already-evaluated) stop bound, and
+/// the step. Grouped so the three always travel together.
+#[derive(Clone, Copy)]
+struct NativeLoopRange {
+    target_slot: u16,
+    stop_slot: u16,
+    step: i64,
+}
+
+#[derive(Clone, Copy)]
+struct NativeLoopNs<'a> {
+    loads: &'a [(String, u16)],
+    writebacks: &'a [(String, u16)],
+    guard_slots: &'a [u16],
+}
+
+impl NativeLoopNs<'static> {
+    /// A loop that seeds nothing, writes back nothing, and guards nothing.
+    const EMPTY: Self = Self {
+        loads: &[],
+        writebacks: &[],
+        guard_slots: &[],
+    };
 }
 
 impl Compiler {
@@ -1000,13 +1032,17 @@ impl Compiler {
         let mut guard_jumps = Vec::new();
         let res = self.emit_loop_core(
             b,
-            target_slot,
-            outer_stop_slot,
-            step,
+            NativeLoopRange {
+                target_slot,
+                stop_slot: outer_stop_slot,
+                step,
+            },
             body,
-            &ns_loads,
-            &wb,
-            &guard_slots,
+            NativeLoopNs {
+                loads: &ns_loads,
+                writebacks: &wb,
+                guard_slots: &guard_slots,
+            },
             &mut guard_jumps,
         );
         self.native_slots = None;
@@ -1049,7 +1085,17 @@ impl Compiler {
         b.emit(Op::SetSlot(target_slot), 0);
         self.compile_expr(b, stop_expr)?;
         b.emit(Op::SetSlot(stop_slot), 0);
-        self.emit_loop_core(b, target_slot, stop_slot, step, body, &[], &[], &[], &mut Vec::new())
+        self.emit_loop_core(
+            b,
+            NativeLoopRange {
+                target_slot,
+                stop_slot,
+                step,
+            },
+            body,
+            NativeLoopNs::EMPTY,
+            &mut Vec::new(),
+        )
     }
 
     /// The shared counted-loop body: entry guard (empty range skips everything),
@@ -1060,15 +1106,21 @@ impl Compiler {
     fn emit_loop_core(
         &mut self,
         b: &mut ChunkBuilder,
-        target_slot: u16,
-        stop_slot: u16,
-        step: i64,
+        range: NativeLoopRange,
         body: &[Stmt],
-        ns_loads: &[(String, u16)],
-        ns_writebacks: &[(String, u16)],
-        guard_slots: &[u16],
+        ns: NativeLoopNs<'_>,
         guard_jumps: &mut Vec<usize>,
     ) -> Result<(), String> {
+        let NativeLoopRange {
+            target_slot,
+            stop_slot,
+            step,
+        } = range;
+        let NativeLoopNs {
+            loads: ns_loads,
+            writebacks: ns_writebacks,
+            guard_slots,
+        } = ns;
         // Ascending ranges test `i < stop`, descending `i > stop`.
         let cmp = if step > 0 { Op::NumLt } else { Op::NumGt };
         b.emit(Op::GetSlot(target_slot), 0);
@@ -1428,7 +1480,7 @@ impl Compiler {
             .map(|n| (n.clone(), slots[n]))
             .collect();
         // Every value entering the loop from outside is guarded, seeded or not.
-        let guard_slots: Vec<u16> = load_names.iter().map(|n| slots[n]).collect();
+        let _guard_slots: Vec<u16> = load_names.iter().map(|n| slots[n]).collect();
         let mut wb: Vec<(String, u16)> = Vec::new();
         for name in writes.iter().filter(|n| !self.fn_slots.contains_key(*n)) {
             if !wb.iter().any(|(w, _)| w == name) {
@@ -1523,7 +1575,7 @@ impl Compiler {
         let bound_target = self.bind_loop_target(target);
         let r = self.compile_for_inner(b, target, iter, body, orelse);
         self.unbind_loop_target(bound_target);
-        return r;
+        r
     }
 
     fn compile_for_inner(
@@ -3913,13 +3965,13 @@ fn stmt_slot_safe(s: &Stmt) -> bool {
             expr_slot_safe(target) && expr_slot_safe(value)
         }
         StmtKind::AnnAssign { target, value, .. } => {
-            expr_slot_safe(target) && value.as_ref().is_none_or(expr_slot_safe)
+            expr_slot_safe(target) && value.as_ref().map_or(true, expr_slot_safe)
         }
         StmtKind::Assert { test, msg } => {
-            expr_slot_safe(test) && msg.as_ref().is_none_or(expr_slot_safe)
+            expr_slot_safe(test) && msg.as_ref().map_or(true, expr_slot_safe)
         }
         StmtKind::Raise { exc, cause } => {
-            exc.as_ref().is_none_or(expr_slot_safe) && cause.as_ref().is_none_or(expr_slot_safe)
+            exc.as_ref().map_or(true, expr_slot_safe) && cause.as_ref().map_or(true, expr_slot_safe)
         }
         StmtKind::Return(None) | StmtKind::Pass | StmtKind::Break | StmtKind::Continue => true,
         // Anything not enumerated (imports, `match`, …) keeps the old path.
@@ -3943,7 +3995,7 @@ fn expr_slot_safe(e: &Expr) -> bool {
         Expr::List(xs) | Expr::Tuple(xs) | Expr::Set(xs) | Expr::BoolOp(_, xs) => all(xs),
         Expr::Dict(pairs) => pairs
             .iter()
-            .all(|(k, v)| k.as_ref().is_none_or(expr_slot_safe) && expr_slot_safe(v)),
+            .all(|(k, v)| k.as_ref().map_or(true, expr_slot_safe) && expr_slot_safe(v)),
         Expr::Starred(x) | Expr::UnaryOp(_, x) | Expr::Attribute(x, _) => expr_slot_safe(x),
         Expr::BinOp(_, a, b) | Expr::Subscript(a, b) | Expr::NamedExpr(a, b) => {
             expr_slot_safe(a) && expr_slot_safe(b)
@@ -3958,9 +4010,9 @@ fn expr_slot_safe(e: &Expr) -> bool {
                 && keywords.iter().all(|k| expr_slot_safe(&k.value))
         }
         Expr::Slice { lo, hi, step } => {
-            lo.as_ref().is_none_or(|x| expr_slot_safe(x))
-                && hi.as_ref().is_none_or(|x| expr_slot_safe(x))
-                && step.as_ref().is_none_or(|x| expr_slot_safe(x))
+            lo.as_ref().map_or(true, |x| expr_slot_safe(x))
+                && hi.as_ref().map_or(true, |x| expr_slot_safe(x))
+                && step.as_ref().map_or(true, |x| expr_slot_safe(x))
         }
         Expr::FString(parts) | Expr::TString(parts) => parts.iter().all(|p| match p {
             FStrPart::Lit(_) => true,
@@ -4088,11 +4140,8 @@ fn collect_names_expr(e: &Expr, out: &mut HashSet<String>) {
         | Expr::YieldFrom(x)
         | Expr::Await(x)
         | Expr::Attribute(x, _) => collect_names_expr(x, out),
-        Expr::Yield(o) => {
-            if let Some(x) = o {
-                collect_names_expr(x, out);
-            }
-        }
+        Expr::Yield(Some(x)) => collect_names_expr(x, out),
+        Expr::Yield(None) => {}
         Expr::BinOp(_, a, b) | Expr::Subscript(a, b) | Expr::NamedExpr(a, b) => {
             collect_names_expr(a, out);
             collect_names_expr(b, out);
