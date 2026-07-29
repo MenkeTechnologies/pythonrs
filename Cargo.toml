@@ -18,13 +18,23 @@ publish = true
 # HUD site, CI config, integration-test corpus, self-test .py examples, or the
 # bug tracker. None are referenced at compile time (no include_str! into them),
 # so the packaged crate still builds and its bins run.
+# `pylib/` is NOT excluded — it is the vendored pure-Python stdlib the `python`
+# bin loads at runtime.
 exclude = [
-    "/docs/",
     "/.github/",
     "/tests/",
     "/examples/",
+    "/docs/",
+    "/bench/",
+    "/benches/",
+    "/parity/",
     "/scripts/",
+    "/vendor/",
+    "/tools/",
+    "/fuzz/",
     "/BUGS.md",
+    "/CHECKLIST.md",
+    "/FFI_STDLIB.md",
 ]
 
 # pythonrs is a standalone crate, not a workspace member. An explicit empty
