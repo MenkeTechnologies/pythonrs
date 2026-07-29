@@ -367,8 +367,18 @@ print(y)
         eprintln!("skipping ffi-typing-annotation test: stdlib bridge unavailable ({stderr})");
         return;
     }
+    // How `Optional[int]` reprs is a CPython detail, not something pythonrs
+    // decides: 3.14 renders it `int | None`, 3.13 and earlier
+    // `typing.Optional[int]`. The bridge passes whichever through verbatim, so
+    // accept both spellings — what this test pins is that the annotation
+    // survives the round trip at all, and that `List[str]` keeps its own repr.
+    let optional = ["int | None", "typing.Optional[int]"]
+        .into_iter()
+        .find(|s| stdout.starts_with(s))
+        .unwrap_or_else(|| panic!("unexpected Optional repr in {stdout:?} (stderr={stderr})"));
     assert_eq!(
-        stdout, "int | None\ntyping.List[str]\nint | None\n",
+        stdout,
+        format!("{optional}\ntyping.List[str]\n{optional}\n"),
         "stderr={stderr}"
     );
 }
