@@ -2629,6 +2629,7 @@ impl PyHost {
             // still a valid target: honor its `__all__` (the stdlib modules
             // reached by star-import all define one).
             _ => match foreign {
+                #[cfg(feature = "stdlib-ffi")]
                 Some(id) => {
                     let all = crate::ffi::get_attr(self, id, "__all__").map_err(|_| {
                         type_error(
@@ -2643,6 +2644,11 @@ impl PyHost {
                     }
                     Ok(out)
                 }
+                // Native-only build: `crate::ffi` is not compiled, and the
+                // always-`None` `foreign_id` above means nothing reaches here.
+                // The arm exists only to keep the match exhaustive.
+                #[cfg(not(feature = "stdlib-ffi"))]
+                Some(_) => Err(type_error("'import *' requires a module object")),
                 None => Err(type_error("'import *' requires a module object")),
             },
         }
