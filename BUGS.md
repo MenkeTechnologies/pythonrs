@@ -396,8 +396,19 @@ module then raises `ModuleNotFoundError`.
   (`argv` from the process args, `exit`/`getrecursionlimit`/`setrecursionlimit`,
   `maxsize`, `version`/`version_info` reporting the emulated CPython `3.14.6`,
   `platform` (`darwin`/`linux`), `path`, `modules`, `executable`,
-  `stdout`/`stderr`/`stdin` file objects), `collections` (`deque`, `Counter`,
-  `defaultdict`, `OrderedDict`, `namedtuple`). `textwrap` and `statistics` have
+  `stdout`/`stderr`/`stdin` file objects), and `_thread` (the single-threaded
+  primitives `threading` is built on — native under the bridge too, since a
+  target handed to CPython's `_thread` would run on an OS thread whose pythonrs
+  heap, a `thread_local`, is empty). `collections`'s four MUTABLE containers
+  (`deque`, `Counter`, `defaultdict`, `OrderedDict`) are native in a default
+  build as well: a CPython one would hand its values back through the by-value
+  marshaler, so `dd['k'].append(1)` would mutate a throwaway copy. `namedtuple`
+  is not shadowed — its instances are immutable, and CPython's builds the real
+  `_tuplegetter` field descriptors (writable `__doc__`). `ChainMap`, `UserDict`,
+  `UserList`, `UserString` and `collections.abc` defer to CPython. The
+  `--no-default-features` build instead runs the full vendored
+  `collections/__init__.py` over the native `_collections` accelerators.
+  `textwrap` and `statistics` have
   native subsets too, but they cover only positional args, so under the FFI
   bridge (default) they defer to the real CPython modules (full keyword-option
   surface — `textwrap.fill(t, width=…)`); the native subsets serve only
@@ -446,7 +457,12 @@ module then raises `ModuleNotFoundError`.
   CPython module. `int(x)` of a foreign value converts via CPython's `int()` (an
   `IntEnum` member, `Fraction`, …); `isinstance(v, foreign_cls)` against a CPython
   ABC (`collections.abc.Sequence`, …) marshals `v` and lets CPython's structural
-  `__instancecheck__` decide; and a CPython exception raised over the bridge (e.g.
+  `__instancecheck__` decide, and the mirror direction works too — a CPython
+  object behind a handle tested against a NATIVE builtin type (`isinstance(
+  namedtuple_instance, tuple)`) resolves the type name out of CPython's
+  `builtins` and asks CPython, since the handle reports only its own class name
+  and the native structural check has no base chain to walk; and a CPython
+  exception raised over the bridge (e.g.
   `dataclasses.FrozenInstanceError`) is caught by `except Exception`. A foreign
   exception also matches a **specific base**: its `__mro__` base names are captured
   at raise time, so `except ValueError` catches a `json.JSONDecodeError` and

@@ -46,6 +46,17 @@ fn table() -> &'static Mutex<Vec<Py<PyAny>>> {
     TABLE.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+/// Module name → the side-table id its handle already occupies. `sys.modules`
+/// makes every `py.import(name)` after the first hand back the SAME object, so
+/// storing it again only grows the table. Without this, `module_ffi_fallback`
+/// (which re-imports on every attribute miss — `math.isqrt`, `collections.ChainMap`)
+/// allocated a slot per lookup, and per-thread host caches re-imported besides.
+static MODULE_HANDLES: OnceLock<Mutex<rustc_hash::FxHashMap<String, u32>>> = OnceLock::new();
+
+fn module_handles() -> &'static Mutex<rustc_hash::FxHashMap<String, u32>> {
+    MODULE_HANDLES.get_or_init(|| Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
 /// Resolve the CPython prefix to hand to `PYTHONHOME`, or `None` to let the
 /// linked libpython locate its own stdlib (the system-CPython path).
 ///
@@ -253,9 +264,22 @@ fn pyerr_to_error_h(host: &mut PyHost, py: Python, err: &PyErr) -> String {
 /// Import `name` (possibly dotted, e.g. `os.path`) via CPython's own importer and
 /// return a `Foreign` handle to the module object.
 pub fn import(name: &str) -> Result<u32, String> {
+    if let Some(id) = module_handles()
+        .lock()
+        .ok()
+        .and_then(|m| m.get(name).copied())
+    {
+        return Ok(id);
+    }
     init();
     Python::with_gil(|py| match py.import(name) {
-        Ok(module) => Ok(store(module.into_any().unbind())),
+        Ok(module) => {
+            let id = store(module.into_any().unbind());
+            if let Ok(mut m) = module_handles().lock() {
+                m.insert(name.to_string(), id);
+            }
+            Ok(id)
+        }
         Err(e) => Err(e.to_string()),
     })
 }
@@ -1268,6 +1292,26 @@ pub fn isinstance_foreign(host: &mut PyHost, v: &Value, cls_id: u32) -> Result<b
         let obj = value_to_py(host, py, v)?;
         let cls = fetch(py, cls_id)?;
         obj.is_instance(&cls).map_err(|e| e.to_string())
+    })
+}
+
+/// `isinstance(foreign_v, <builtin type>)` — the mirror case: the VALUE is a
+/// CPython object behind a handle and the class is one of pythonrs's own builtin
+/// type objects, named by `type_name` (`tuple`, `dict`, `int`, …). The handle's
+/// type name is the CPython class (`collections.namedtuple('P', …)` instances
+/// report `P`), so the native structural check cannot see the base chain —
+/// resolve the same name out of CPython's `builtins` and let CPython answer.
+/// `false` when the name is not a builtin (a dotted native dispatch name, a user
+/// class), which leaves the native check to decide.
+pub fn foreign_isinstance_of_builtin(fid: u32, type_name: &str) -> bool {
+    Python::with_gil(|py| {
+        let (Ok(obj), Ok(builtins)) = (fetch(py, fid), py.import("builtins")) else {
+            return false;
+        };
+        match builtins.getattr(type_name) {
+            Ok(ty) => obj.is_instance(&ty).unwrap_or(false),
+            Err(_) => false,
+        }
     })
 }
 

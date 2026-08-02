@@ -8465,6 +8465,19 @@ fn isinstance_dispatch(v: &Value, cls: &Value) -> Result<bool, String> {
     if let Some(cls_id) = with_host(|h| h.foreign_id(cls)) {
         return with_host(|h| crate::ffi::isinstance_foreign(h, v, cls_id));
     }
+    // The mirror case: a CPython object behind a handle tested against a NATIVE
+    // builtin type. `isinstance(collections.namedtuple('P', 'a b')(1, 2), tuple)`
+    // is `True` in CPython, but the handle reports type name `P`, so the
+    // structural check below has no base chain to walk. A miss falls through so
+    // the native check still decides.
+    #[cfg(feature = "stdlib-ffi")]
+    if let Some(v_id) = with_host(|h| h.foreign_id(v)) {
+        if let Some(want) = with_host(|h| callable_name(h, cls)) {
+            if crate::ffi::foreign_isinstance_of_builtin(v_id, &want) {
+                return Ok(true);
+            }
+        }
+    }
     Ok(with_host(|h| isinstance(h, v, cls)))
 }
 

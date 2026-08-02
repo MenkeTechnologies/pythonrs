@@ -38,7 +38,11 @@ delegates to CPython.
      bundled `<exe_dir>/../lib/python3.14` → system CPython → error), set `PyConfig.home`
      / `PYTHONHOME` before `Py_Initialize`.
    - `import(name) -> Result<ForeignHandle, String>`: `Python::with_gil(|py| py.import(name))`,
-     store the `Py<PyAny>` in a host side-table, return an id.
+     store the `Py<PyAny>` in a host side-table, return an id. Handles are
+     memoized by module name: `sys.modules` hands back the SAME object on every
+     import, so storing it again would only grow the table — and the
+     native-shadow fallback re-imports on every attribute miss (`math.isqrt`,
+     `collections.ChainMap`), as does each thread's own host module cache.
    - Marshal helpers: pythonrs `Value` ↔ CPython object. By value in *both*
      directions for int/float/bool/None/str/bytes/list/tuple/dict/set, plus (in) a
      bytearray→CPython `bytearray`, range, complex, `collections.deque`, and

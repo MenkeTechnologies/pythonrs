@@ -10154,6 +10154,18 @@ pub fn call_method(
     // container goes straight to `call_type_method`, which re-reads through the
     // handle; that is also exactly what the `_` arm below does with it.
     let needs_owned = with_host(|h| {
+        // `Foreign` is destructured by the `foreign.method(...)` arm below, so it
+        // belongs here too. Its variant is feature-gated, hence the separate test.
+        // Leaving it out sent EVERY method call on a CPython object to
+        // `call_type_method`, which knows only pythonrs's native types and so
+        // reported the method as a missing attribute — `string.Formatter()`,
+        // `_thread.RLock()` and `with contextlib.contextmanager(...)` (whose
+        // `__enter__` is a method call on the foreign context manager) all failed
+        // while the plain attribute READ of the same name resolved fine.
+        #[cfg(feature = "stdlib-ffi")]
+        if matches!(h.get(recv), Some(PyObj::Foreign(_))) {
+            return true;
+        }
         matches!(
             h.get(recv),
             Some(
@@ -13526,7 +13538,14 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
     // `_thread` — the Python-shaped half of the threading primitives (the handle
     // object, the shutdown bookkeeping). The host-backed pieces stay in the
     // native `_thread_core` arm this module imports from.
-    #[cfg(not(feature = "stdlib-ffi"))]
+    //
+    // Native in BOTH builds, unlike the other shadows: this is not a subset of
+    // CPython's `_thread` but a semantic OVERRIDE. pythonrs's object heap is a
+    // `thread_local` and generators suspend by switching stacks on the same OS
+    // thread, so a target handed to CPython's `_thread.start_new_thread` would
+    // run on a foreign thread whose heap is empty. Serving the native module
+    // keeps `get_ident`/`start_joinable_thread` describing the single thread
+    // user code actually runs on.
     if name == "_thread" {
         let src = crate::stdlib::pythread::module_source();
         return run_vendored_module("_thread", src, std::path::Path::new("<_thread>"));
@@ -13654,6 +13673,37 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                 (
                     "redirect_stderr",
                     h.alloc(PyObj::Builtin("contextlib.redirect_stderr".into())),
+                ),
+            ]
+        }),
+        // `collections` is native-shadowed for the four MUTABLE container types.
+        // They have to stay native under the bridge: a CPython `defaultdict`/
+        // `Counter`/`deque` hands its values back through `py_to_value`, which
+        // marshals an exact `list`/`dict` BY VALUE — so `dd['k'].append(1)` would
+        // mutate a throwaway copy and the write would be lost. `namedtuple` is
+        // deliberately NOT shadowed: its instances are immutable (nothing to write
+        // back) and CPython's builds real `_tuplegetter` field descriptors, which
+        // carry the writable `__doc__` that `dis.py` sets on every field.
+        // `ChainMap`, `UserDict`, `UserList`, `UserString` and `abc` miss this
+        // namespace and defer to the real CPython module via `module_ffi_fallback`.
+        // The self-contained build instead runs the full vendored
+        // `collections/__init__.py` over the native `_collections` accelerators,
+        // so it needs no shadow.
+        #[cfg(feature = "stdlib-ffi")]
+        "collections" => with_host(|h| {
+            vec![
+                ("deque", h.alloc(PyObj::Builtin("collections.deque".into()))),
+                (
+                    "Counter",
+                    h.alloc(PyObj::Builtin("collections.Counter".into())),
+                ),
+                (
+                    "defaultdict",
+                    h.alloc(PyObj::Builtin("collections.defaultdict".into())),
+                ),
+                (
+                    "OrderedDict",
+                    h.alloc(PyObj::Builtin("collections.OrderedDict".into())),
                 ),
             ]
         }),
@@ -14670,7 +14720,9 @@ fn try_import_vendored(name: &str) -> Option<Result<Value, String>> {
 /// Execute a vendored module's source in a fresh namespace (its `__dict__`) at
 /// module scope, then package the resulting globals as a native `PyObj::Module`.
 /// The caller's globals and frame stack are saved and restored around the run.
-#[cfg(not(feature = "stdlib-ffi"))]
+///
+/// Compiled into both builds: the `pylib/` tree is native-only, but `_thread` is
+/// served from `stdlib::pythread`'s source in the ffi build too.
 fn run_vendored_module(name: &str, src: &str, path: &std::path::Path) -> Result<Value, String> {
     // Park the importer's frames so the module body runs at a clean module scope
     // (its `def`/`class`/assignments become module globals), and allocate a fresh,
