@@ -1,4 +1,4 @@
-.TH PYTHON 1 "2026" "pythonrs 0.1.2" "User Commands"
+.TH PYTHON 1 "2026-08-02" "pythonrs 0.1.2" "User Commands"
 .SH NAME
 python \- Python on fusevm, a compiled Python runtime (bytecode VM + Cranelift JIT)
 .SH SYNOPSIS
@@ -71,10 +71,45 @@ Speak the Language Server Protocol over stdio.
 .TP
 .B \-\-dap
 Speak the Debug Adapter Protocol over stdio.
+.TP
+.B \-\-doctor
+Print a diagnostic report \(em runtime, embedded CPython, vendored
+.IR pylib/ ,
+fusevm engine, bytecode cache,
+.B PYTHON*
+environment, and every
+.B python*
+interpreter on
+.B PATH
+\(em then exit.
+.TP
+.B \-\-cacheview
+List the compiled programs held in the rkyv bytecode cache: per\-entry hashes,
+blob size, and op/function/try/warning counts. Then exit.
+.TP
+.B \-\-cache\-clear
+Delete the rkyv bytecode cache shard and exit.
 .SH ENVIRONMENT
 .TP
 .B PYTHONRS_TRACE
 When set, log bytecode\-cache hit/miss to stderr.
+.TP
+.B PYTHONRS_CACHE
+Set to
+.BR 0 / false / no
+to disable the transparent bytecode cache entirely \(em every run recompiles and
+nothing is stored.
+.TP
+.B PYTHONRS_LIB
+Override the search path for the vendored pure\-Python stdlib
+.RI ( pylib/ ),
+consulted only by a
+.B \-\-no\-default\-features
+(libpython\-free) build.
+.TP
+.B PYTHONRS_STDLIB
+Override the embedded\-CPython stdlib prefix consulted before the bundled and
+system locations (stdlib\-ffi builds).
 .SH FILES
 .TP
 .I ~/.pythonrs/scripts.rkyv

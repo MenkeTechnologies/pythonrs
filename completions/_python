@@ -16,9 +16,13 @@ _python() {
     '--dump-tokens[print the lexer token stream]' \
     '--dump-ast[print the parsed AST]' \
     '--disasm[print a fusevm bytecode disassembly listing]' \
+    '--tiers[run it, then report which fusevm execution tier took each chunk]' \
     '--repl[start the interactive REPL]' \
     '--lsp[speak LSP over stdio]' \
     '--dap[speak DAP over stdio]' \
+    '--doctor[print a runtime/CPython/cache/env diagnostic report]' \
+    '--cacheview[list the compiled programs in the rkyv bytecode cache]' \
+    '--cache-clear[delete the rkyv bytecode cache shard]' \
     '(-h --help)'{-h,--help}'[show help]' \
     '(-V --version)'{-V,--version}'[show version]' \
     '*:Python file:_files -g "*.py"'

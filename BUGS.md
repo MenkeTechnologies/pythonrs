@@ -5,7 +5,14 @@ object heap. It runs a large, real subset of Python 3 correctly (verified
 byte-for-byte against CPython 3.14.6 on the example corpus). This file is the
 honest list of what is **not** yet covered, so nobody mistakes a gap for a bug
 fixed. Every line below was re-checked against the **default-build** binary
-(`cargo build`, no features) before being written.
+(`cargo build` — default features, so the `stdlib-ffi` bridge is ON) before being
+written.
+
+**Read the open regression under [Standard library](#standard-library) first**:
+a method call on a bridged CPython value (`os.getcwd()`, `json.dumps(...)`)
+currently raises `AttributeError` because `host::call_method` lost its
+`PyObj::Foreign` arm. It invalidates most of the stdlib behavior described below
+until it is fixed.
 
 ## Implemented (previously listed here as gaps)
 - **Generators / `yield`.** A `def` whose body contains `yield` builds a real
@@ -339,6 +346,45 @@ fixed. Every line below was re-checked against the **default-build** binary
   analogue of `python3 -i < file`.
 
 ## Standard library
+
+> **OPEN REGRESSION (2026-08-02) — `foreign.method(...)` in one expression raises
+> `AttributeError`.** Everything in this section describes the intended and
+> previously verified behavior, but on the current `main` build a *method call* on
+> a bridged (CPython-side) value fails, while the identical call split into an
+> attribute read plus an invocation succeeds:
+>
+> ```
+> $ python -c 'import os; os.getcwd()'
+> AttributeError: 'module' object has no attribute 'getcwd'
+> $ python -c 'import os; f = os.getcwd; print(f()[:1])'
+> /
+> $ python -c 'import json; json.dumps({"a":1})'
+> AttributeError: 'module' object has no attribute 'dumps'
+> $ python -c 'import json; d = json.dumps; print(d({"a":1}))'
+> {"a": 1}
+> $ python -c 'from datetime import date; date(2020,1,2).isoformat()'
+> AttributeError: 'date' object has no attribute 'isoformat'
+> $ python -c 'from datetime import date; f = date(2020,1,2).isoformat; print(f())'
+> 2020-01-02
+> ```
+>
+> **Root cause:** `host::call_method` (`src/host.rs:10121`) has no `PyObj::Foreign`
+> arm — the variant appears nowhere in its body, so a bridged receiver falls
+> through to the generic "object has no attribute" error. `PyHost::get_attr`
+> (`src/host.rs:7742`) *does* route a `foreign_id` hit to `ffi::get_attr`, which is
+> why the two-step form works. `set_attr` has the arm (`src/host.rs:9272`);
+> `call_method` is the one that lost it.
+>
+> Import, binding, plain attribute reads, operators, and iteration over bridged
+> values are all unaffected: `from os import getcwd`, `os.sep`, `os.path`,
+> `re.match`, `math.comb(5,2)`, `contextlib.suppress` and `asyncio.run` all work.
+> Modules with a native arm (`sys`, `math`, `functools`, `contextlib`) are
+> unaffected for their native symbols. A related symptom: `dir(json)` returns `[]`.
+>
+> This one defect accounts for every `ERR` row in `scripts/dropin_check.sh` — see
+> the readiness snapshot in `CHECKLIST.md`. `parity-fuzz` does not catch it: its
+> generated programs never cross the bridge (50,000 mixed cases, 0 divergences).
+
 The **default build** ships the `stdlib-ffi` bridge, so a native fast-path subset
 plus the entire CPython stdlib are importable out of the box. A
 `--no-default-features` build serves only the native subset below; every other

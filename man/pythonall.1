@@ -2,7 +2,7 @@
 .\" Modeled after zshall(1): every section of the reference in one document.
 .\" Render with:  man -l man/pythonall.1
 .\" Install:      cp man/pythonall.1 /usr/local/share/man/man1/
-.TH PYTHONALL 1 "2026-07-23" "pythonrs 0.1.0" "User Commands"
+.TH PYTHONALL 1 "2026-08-02" "pythonrs 0.1.2" "User Commands"
 .SH NAME
 pythonall \- the pythonrs comprehensive reference (invocation, language,
 architecture, bytecode VM + Cranelift JIT, LSP, DAP, inline-Rust FFI)
@@ -94,13 +94,37 @@ on first run (via the shared
 FFI runtime), and its exports become callable by name from Python
 .RB ( src/rust_ffi.rs ).
 .SS Deployment and dumps
-An AOT native compiler links a standalone executable.
+.B \-\-build
+AOT\-compiles the script to a standalone native executable.
 .B \-\-dump\-tokens
 prints the token stream,
 .B \-\-dump\-ast
-the parsed AST, and
+the parsed AST,
+.B \-\-dump\-bytecode
+the lowered fusevm chunk, and
 .B \-\-disasm
 a fusevm bytecode disassembly \(em each then exits.
+.B \-\-tiers
+runs the script first, then reports which fusevm execution tier took each of its
+chunks.
+.SS REPL and diagnostics
+.B \-\-repl
+starts the interactive
+.B reedline
+REPL (also entered when no file is given on a TTY).
+.B \-\-doctor
+prints a diagnostic report \(em runtime, embedded CPython, vendored
+.IR pylib/ ,
+fusevm engine, bytecode cache,
+.B PYTHON*
+environment, and every
+.B python*
+interpreter on
+.B PATH.
+.B \-\-cacheview
+lists the compiled programs held in the rkyv cache, and
+.B \-\-cache\-clear
+deletes the shard \(em each then exits.
 .SH 5. DIAGNOSTICS
 Errors are written to standard error in Python's own exception form. The process
 exits non\-zero on an unhandled exception and 0 on success.

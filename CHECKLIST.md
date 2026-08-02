@@ -12,8 +12,9 @@ the ordered, grounded gap list between here and that goal.
   async/exceptions, and builtins/stdlib/import/I-O. Every table row below is an
   exact observed diff.
 - **`parity-fuzz`** (`src/bin/parity_fuzz.rs`) — differential fuzzer; **50,000
-  mixed cases → 1,164 divergences** (snapshot at the bottom). Confirms the numeric/
-  format classes and localizes them. Per-expression: proves per-op parity.
+  mixed cases → 0 divergences** as of 2026-08-02 (snapshot at the bottom). It drove
+  the numeric/format classes to zero; per-expression it proves per-op parity, and it
+  is now a regression net rather than a discovery tool.
 - **Whole-script gauge** — `scripts/dropin_check.sh` + `tests/dropin/*.py`. Runs each
   representative script (file I/O, argv, subprocess, common stdlib, real composites
   like read→count→sort) through pythonrs and `python3` with identical argv and an
@@ -24,18 +25,49 @@ the ordered, grounded gap list between here and that goal.
   per-expression fuzzer structurally can't (sort **stability**, `json.dumps(sort_keys=)`).
 - Re-measure, never weaken the comparison to move a number.
 
-**Readiness snapshot — 2026-07-19: `9/30 OK (30%)`** against committed `main`
-(`cargo build && ./scripts/dropin_check.sh`), up from `3/30` — 12 ERR, 9 DIFF.
-**Landed this pass** (grounded, python3-verified): bytes/bytearray (real type),
+**Readiness snapshot — 2026-08-02: `13/30 OK (43%)`** against committed `main`
+(`cargo build && ./scripts/dropin_check.sh`) — 12 ERR, 5 DIFF, up from `9/30 (30%)`
+on 2026-07-19 and `3/30` before that. Per category: `lang 7/7`, `io 2/2`,
+`argv 1/1`, `re 1/1`, `sys 1/1`, `data 1/2`; `os 0/3`, `real 0/3`,
+`collections 0/2`, and `argparse base64 csv datetime hashlib json pathlib
+subprocess` at `0/1` each.
+
+> **Measured against a live regression — `foreign.method(...)` raises
+> `AttributeError`.** On this build a *method call* on a bridged CPython value
+> fails, while the same call split into a read plus an invocation succeeds:
+>
+> ```
+> $ python -c 'import os; os.getcwd()'
+> AttributeError: 'module' object has no attribute 'getcwd'
+> $ python -c 'import os; f = os.getcwd; print(f()[:1])'
+> /
+> ```
+>
+> **Root cause:** `host::call_method` (`src/host.rs:10121`) has no
+> `PyObj::Foreign` arm — the variant appears nowhere in its body, so a bridged
+> receiver falls through to the generic "object has no attribute" error.
+> `PyHost::get_attr` (`src/host.rs:7742`) and `set_attr` (`src/host.rs:9272`) both
+> still route a `foreign_id` hit to the bridge, which is why the two-step form
+> works. Import, binding, plain attribute reads, operators, and iteration are all
+> unaffected (`os.sep`, `os.path`, `re.match`, `math.comb(5,2)` all fine).
+>
+> **All 12 ERR rows and the `collections`/`data_dataclass`/`pathlib`/
+> `real_wordfreq` DIFFs are this one defect**, verified individually. Fix it
+> before reading anything else into this number.
+
+**Landed previously** (grounded, python3-verified): bytes/bytearray (real type),
 file I/O (`open`/read/write/`with`), `collections` (deque/Counter/defaultdict/
 OrderedDict/namedtuple), `functools.partial`/`lru_cache`, the 3 numeric-core fixes
 (**`%`-format full spec, integer floor `//`/`%` divisor-sign, 3-arg modular `pow`**),
 the `with` single-eval + LIFO fix, and wiring for `re/datetime/heapq/bisect/textwrap/
 statistics`. Remaining walls:
-- **12 ERR** — `io pathlib subprocess hashlib base64 csv argparse`, empty `sys.argv`,
-  `sys.exit`, and `datetime`/`re` composites the flat approximations don't cover.
-- **9 DIFF** — the object-model (Tier 3) + remaining-numeric (Tier 4: bignum ops,
-  float scientific `repr`) + data-structure (Tier 6) gaps below.
+- **12 ERR** — `argparse base64 csv datetime hashlib json os_glob os_listdir
+  os_path_ops subprocess real_json_config real_parse_log`. Every one is the
+  `Foreign` method-call regression above, verified individually.
+- **5 DIFF** — `collections_counter`, `collections_deque`, `data_dataclass`,
+  `pathlib_paths`, `real_wordfreq` — the same regression on the bridged method
+  calls these scripts make, over the object-model (Tier 3) + data-structure
+  (Tier 6) gaps below.
 
 Tiers are ordered by blast radius toward drop-in. **P0** = the interpreter
 *crashes or hangs* where CPython returns a value — a drop-in must never do this.
@@ -103,14 +135,22 @@ dispatch; `[in-flight]` = being implemented in the current host pass.
 are CLOSED via the `stdlib-ffi` bridge** (real CPython modules). `open()` + file
 objects are native (landed). Items below track the native default-build surface.
 
-- [ ] **`open()` missing** — `NameError: name 'open' is not defined`. No read/write/
-      append/`with open(...)`/line iteration. Single largest drop-in blocker.
-- [ ] **File objects** `[in-flight]` — `.read/.readline/.readlines/.write/.writelines/
-      .close/.seek/.tell`, iteration, text vs binary, encodings, `__enter__/__exit__`.
-- [ ] **`subprocess`** — `ModuleNotFoundError`. `run/Popen/check_output/PIPE`, rc.
-- [ ] **`os` expansion** — beyond the current POSIX subset: `environ` mutation,
-      `listdir/scandir/walk/makedirs/remove/rename/chdir`, more `os.path`.
-- [ ] **`pathlib`**, **`io`** (`StringIO`/`BytesIO`) — `ModuleNotFoundError`.
+- [x] **`open()`** — FIXED: `open(path, mode)` returns a real file object;
+      `with open(...)`, read/write/append, and line iteration all work.
+- [x] **File objects** — FIXED: `.read/.readline/.readlines/.write/.writelines/
+      .close/.seek/.tell`, iteration, text vs binary, encodings, `__enter__/__exit__`
+      (`src/stdlib/pyio.rs`).
+- [x] **`subprocess`** — resolves through the `stdlib-ffi` bridge (no more
+      `ModuleNotFoundError`); `from subprocess import run` binds. `subprocess.run(...)`
+      is blocked only by the `Foreign` method-call regression noted at the top.
+- [x] **`os` expansion** — the real CPython `os` arrives over the bridge:
+      `listdir/scandir/walk/makedirs/remove/rename/chdir` and the full `os.path` all
+      bind via `from os import …`. Still open: `environ` item assignment
+      (`environ["X"]="1"` → `TypeError: '_Environ' object does not support item
+      assignment` — the marshalled mapping is read-only).
+- [x] **`pathlib`**, **`io`** (`StringIO`/`BytesIO`) — both import and bind
+      (`from pathlib import Path; Path("/a/b").name` → `b`). Method calls on the
+      returned objects hit the `Foreign` method-call regression noted at the top.
 
 ## Tier 2 — stdlib modules scripts reach for
 
@@ -253,8 +293,10 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
       `True` for partial/lru_cache/namedtuple/static+classmethod callables).
 - [x] **Descriptor protocol** — FIXED (see `property` row above): `__get__`/`__set__`/
       `__set_name__` fire; data-vs-non-data precedence honored.
-- [ ] **Attribute-hook dunders** — `__getattr__` FIXED (fires when normal lookup
-      fails). Still inert: `__getattribute__`/`__setattr__`/`__delattr__`/`__dir__`.
+- [ ] **Attribute-hook dunders** — `__getattr__` (fires when normal lookup fails),
+      `__getattribute__`, `__setattr__`, and `__delattr__` all FIXED and dispatched.
+      Still inert: `__dir__` — `dir(obj)` returns the class/instance dict rather than
+      the user hook's list.
 - [x] **`__new__`** — FIXED: `instantiate` calls a user `__new__(cls, *a)` (implicit
       staticmethod) to build the instance; `object.__new__(cls)` allocates a bare
       instance; `__init__` runs only when `__new__` returned an instance of the class
@@ -270,9 +312,11 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
       `TypeError` for ordering/arith). Default `__ne__` derives from `__eq__`.
       `__neg__`/`__pos__`/`__invert__`/`__abs__` dispatched. (`__iadd__`/`__divmod__`
       still open.)
-- [ ] **Context managers** — multiple `with` exit **FIFO not LIFO**; `__exit__`
-      returning `True` does **not** suppress; `__exit__` receives `(None,None,None)`
-      even on exception. Parenthesized `with (a as x, b as y)` is a `SyntaxError`.
+- [ ] **Context managers** — multiple `with` now exit **LIFO**, `__exit__` returning
+      `True` **suppresses**, and `__exit__` receives the live `(type, value, None)` on
+      the error path: all FIXED. Still open: parenthesized `with (a as x, b as y)` is a
+      `SyntaxError: expected ')' but found Name("as")` — the parser does not accept the
+      parenthesized with-items form (CPython 3.10+, via its PEG parser).
 - [x] **`__slots__` enforced** — FIXED: a fully-slotted instance (every user class
       in its MRO declares `__slots__`) rejects assignment of an undeclared attribute
       (`… object has no attribute 'z' and no __dict__ …`) and has no `__dict__`; a
@@ -285,7 +329,10 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
       (`class C(P, tag="x")`). Only-`object` default + extra keywords raises
       `C.__init_subclass__() takes no keyword arguments`. Class-header keywords now
       flow through `BUILD_CLASS` (arity 4→5, cache schema v11) as a dict.
-- [ ] **`dataclasses` / `enum` modules absent** (see Tier 2).
+- [x] **`dataclasses` / `enum`** — FIXED: both arrive over the `stdlib-ffi` bridge and
+      build native-backed classes. `@dataclass` on a pythonrs class mirrors it via
+      `types.new_class` (`P(1,2)` reprs as `P(x=1, y=2)`); `class C(Enum)` is built by
+      the real metaclass (`C.R.name`/`C.R.value` correct).
 
 ## Tier 4 — Numeric core (silent-wrong values — highest correctness priority)
 
@@ -295,14 +342,12 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
       `1<<64`→`18446744073709551616`; `10**20 < 10**20+1`→`True`; `int(1e20)`→bignum;
       `~(10**20)`, `(10**30)&7`, `hex(10**20)`, `abs(-(10**20))` all correct.
       `// % **` and 3-arg `pow` were already bignum. `bool` bit-ops now return `bool`.
-- [ ] **Floor `//` / modulo `%` use C truncation, not Python floor** — wrong sign on
-      every mixed-sign operand: `7//-2` → `-3` (want `-4`); `-7%-100` → `93` (want
-      `-7`); `divmod(7,-2)` → `(-3,1)` (want `(-4,-1)`). `[in-flight]`
-- [ ] **Float `repr` has no scientific notation and drops `.0`** — every float
-      ≥1e16, <1e-4, or whole-valued prints wrong: `1e16` → `10000000000000000`
-      (looks like an int); `1.5e300` → a 301-digit integer; `1.234e3` in `.3e`
-      format → `1.234e3` (want `1.234e+03`). **Drives most of the `.format`/`%` fuzz
-      mass.** Needs the shortest-round-trip + exponent-threshold algorithm.
+- [x] **Floor `//` / modulo `%` follow Python floor, not C truncation** — FIXED and
+      byte-verified: `7//-2` → `-4`, `-7%-100` → `-7`, `divmod(7,-2)` → `(-4, -1)`.
+- [x] **Float `repr` uses scientific notation and keeps `.0`** — FIXED via the
+      shortest-round-trip + exponent-threshold formatter: `1e16` → `1e+16`, `1e-05` →
+      `1e-05`, `3.0` → `3.0`, `1.5e300` → `1.5e+300`, and `format(1.234e3, ".3e")` →
+      `1.234e+03`. The one residual is the dtoa tie-break noted in BUGS.md.
 - [x] **`round()`** — FIXED: round-half-to-even (banker's) via format-then-parse
       (also fixes the `2.675`-is-really-2.6749… representation issue); no ndigits →
       `int`, ndigits → `float`; negative ndigits round ints/floats to powers of ten,
@@ -332,10 +377,11 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
       `frozenset()` repr; set algebra (`| & - ^`) returns a `frozenset` when the left
       operand is one; `isinstance` (frozenset ⊄ set, set ⊄ frozenset); `set == frozenset`
       by membership; immutable (mutators raise `AttributeError`).
-- [ ] **Misc:** `bool` bit-ops return `int` not `bool` (`True&False`→`0`); int/float
-      methods `to_bytes/from_bytes/bit_count/as_integer_ratio/.hex/numerator/denominator/
-      __index__` absent; `int("0x1F",16)` rejected; underscores in `float("1_000.5")`
-      rejected; `10//0` message wording.
+- [x] **Misc:** all FIXED — `True&False` → `False` (a real `bool`); `to_bytes`/
+      `from_bytes`/`bit_count`/`as_integer_ratio`/`.hex`/`fromhex`/`numerator`/
+      `denominator`/`__index__` all present; `int("0x1F",16)` → `31`;
+      `float("1_000.5")` → `1000.5`; `10//0` raises
+      `ZeroDivisionError: division by zero`, matching python3 verbatim.
 
 ## Tier 5 — Strings / bytes / formatting
 
@@ -362,8 +408,9 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
       `f'{x=}'`/`f'{x = }'`/`f'{x=:.2f}'`/`f'{y=!r}'` is now supported (`conttail` fuzz
       mode, 0 divergences). (`g`/`c`/`e` type handling and sign-aware `=`/`0` fill are
       correct.)
-- [ ] **str method args silently ignored** — `split`/`rsplit` maxsplit, `find`/`index`
-      start, `splitlines(keepends)` all ignored → wrong values, no error.
+- [x] **str method args honored** — FIXED: `"a,b,c".split(",",1)` → `["a","b,c"]`,
+      `"abcabc".find("b",2)` → `4`, and `splitlines(True)`/`splitlines(keepends=True)`
+      keep the line endings.
 - [x] **Missing str methods** — FIXED: `partition`/`rpartition`/`rindex`/`isnumeric`/
       `isdecimal`/`istitle`/`isidentifier`/`isprintable`/`expandtabs`/`translate`/
       `format_map` (instance methods) + `str.maketrans` (static method on the `str`
@@ -386,8 +433,8 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
       `translate`/`maketrans`/`isX` predicates, `%`-formatting on bytes (incl. `%b`/`%s`
       dispatch of a user `__bytes__`), `del ba[i]`/`del ba[i:j]`, and the `errors=` arg
       on `decode` are all implemented.
-- [ ] **`str.encode` ignores the codec/errors args** — always UTF-8 (`'x'.encode('utf-16')`
-      wrong).
+- [x] **`str.encode` honors the codec/errors args** — FIXED:
+      `"x".encode("utf-16")` → `b"\xff\xfex\x00"` (BOM + LE), matching CPython.
 - [x] **`repr` doesn't escape C0 controls** (`\x00`-`\x1f`, ` `) — data-corrupting
       raw bytes leak; **`ascii()` doesn't `\x`-escape non-ASCII**; `\N{…}` named and
       `\NNN` octal string escapes not decoded.
@@ -434,8 +481,9 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
       `isdisjoint`, and `intersection_update`/`difference_update`/
       `symmetric_difference_update` (all accept any iterable via `iter_keys`).
       `issubset`/`issuperset` now also accept any iterable.
-- [ ] **`type([])`/`type({})`/… print `<built-in function list>`** not `<class 'list'>`;
-      instance dunders `[].__class__`/`[].__len__()` and unbound `str.lower` unavailable.
+- [x] **`type([])`/`type({})`/… print `<class 'list'>`** — FIXED, and the instance
+      dunders resolve too: `[].__class__` → `<class 'list'>`, `[].__len__()` → `0`,
+      unbound `str.lower("AB")` → `"ab"`.
 - [x] **set repr ordering** — FIXED for the deterministic subset: `set`/`frozenset`
       of machine ints now repr and iterate in CPython's open-addressing table order
       (`setobject.c` faithful port — `set_add_entry` perturb+`LINEAR_PROBES`, the
@@ -452,11 +500,11 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
       differ (not observable in repr).
 
 **Corpus-caught composite gaps** (found by `dropin_check.sh`, not the per-expression fuzzer):
-- [ ] **`sorted`/`.sort(key=…)` is not stable on ties** — Python guarantees a stable
-      sort; pythonrs reorders equal-key elements (`[('alice',30),('carol',25),('bob',25)]`
-      → order of the two `25`s not preserved). Use a stable algorithm.
-- [ ] **`json.dumps(sort_keys=True)` ignored** — emits insertion order instead of
-      sorted keys. Common in config/serialization round-trips.
+- [x] **`sorted`/`.sort(key=…)` is stable on ties** — FIXED:
+      `sorted([('alice',30),('carol',25),('bob',25)], key=…)` →
+      `[('carol', 25), ('bob', 25), ('alice', 30)]`, byte-identical to python3.
+- [x] **`json.dumps(sort_keys=True)`** — FIXED: the real CPython `json` arrives over
+      the bridge, so `dumps({"b":1,"a":2}, sort_keys=True)` → `{"a": 2, "b": 1}`.
 
 ## Tier 7 — Functions / generators / async / exceptions / control flow
 
@@ -552,24 +600,36 @@ greps message text.
 
 ---
 
-## parity-fuzz snapshot — 2026-07-19 (50,000 cases)
+## parity-fuzz snapshot — 2026-08-02 (50,000 cases)
 
-Oracle: reference `python3` (3.14.6). Mixed mode, 18 workers.
-**50,000 checked → 1,164 divergences (2.3%).** Deduped classes:
+Oracle: reference `python3` (3.14.6). Mixed mode, 10 workers.
+**50,000 checked → 0 divergences (0 known / 0 new), 21 timeouts, 417.6s at 120/s.**
 
-| class | ~share | root cause | tier |
+The four classes that dominated the 2026-07-19 snapshot (1,164 divergences, 2.3%)
+are all closed, and each root cause is checked off in the tiers above:
+
+| class | then (~share) | root cause | now |
 |---|---|---|---|
-| `str.format('{}', float)` / scientific | ~442 | float `repr` has no scientific notation, drops `.0` | 4 |
-| `'%…' % x` format specs | ~338 | `%`-operator specs unimplemented | 5 |
-| `pow(a,b,m)` | 188 | 3-arg modular pow ignores modulus | 4 |
-| `//` / `%` sign | ~140 | C-truncation vs Python floor | 4 |
+| `str.format('{}', float)` / scientific | ~442 | float `repr` had no scientific notation, dropped `.0` | fixed — Tier 4 |
+| `'%…' % x` format specs | ~338 | `%`-operator specs unimplemented | fixed — Tier 5 |
+| `pow(a,b,m)` | 188 | 3-arg modular pow ignored the modulus | fixed — Tier 4 |
+| `//` / `%` sign | ~140 | C-truncation instead of Python floor | fixed — Tier 4 |
 
 Re-measure: `cargo build && ./target/debug/parity-fuzz --count 50000`.
 Replay one: `./target/debug/parity-fuzz --once --seed <N>`.
-Per-mode: `--<mode>` (arith, formatspec, builtins, floatfmt, strings, fstring,
-slice, listcomp, dictcomp, setcomp, sorting, boolint, ranges, strmeth, comparison,
-builtins, ternary, augassign, classes, iterproto, exceptions, **unpacking,
-comprehension, dictset, itertools, complexnum, exceptions2**).
+Per-mode: `--<mode>`, one of the 53 real modes (`mixed` rotates all of them) —
+arith, bignum, floatfmt, strings, fstring, slice, listcomp, dictcomp, setcomp,
+sorting, formatspec, boolint, ranges, strmeth, comparison, builtins, ternary,
+augassign, classes, iterproto, generators, exceptions, unpacking, comprehension,
+dictset, itertools, complexnum, numedge, exceptions2, exceptions3, exceptions4,
+closures, oop2, strfmt2, bytesops, bytestail, format2, strformat, async, async2,
+augwith, descriptors, attr, calls, match, conttail, itertail, metatype, seqtail,
+display, scoping, codec, subclass.
+
+The generated programs import only `sys` and `asyncio` (both native arms), so no
+case ever calls a method on a bridged CPython value — the open `Foreign`
+method-call regression noted at the top of this file therefore does not show up
+here. `scripts/dropin_check.sh` catches it; `parity-fuzz` structurally cannot.
 
 **Object-model modes added 2026-07-19** (`classes`, `iterproto`, `exceptions`) —
 each generates deterministic-stdout programs exercising the OOP surface and is in

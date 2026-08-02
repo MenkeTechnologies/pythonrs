@@ -69,7 +69,8 @@ Two things set it apart from every other standalone Python:
   build step, no `__pycache__` ritual.
 - **AOT to a native executable.** `python --build foo.py` emits a standalone
   native binary (via `fusevm::aot`, linked against the pythonrs runtime
-  staticlib) that runs the script with no interpreter present.
+  staticlib) that runs the script with no interpreter present. This path needs
+  the libpython-free build (`cargo build --no-default-features`).
 
 ## [0x01] INSTALL
 
@@ -82,6 +83,22 @@ git clone https://github.com/MenkeTechnologies/pythonrs
 cd pythonrs && cargo build --release
 # binary: target/release/python  (+ libpythonrs.a for AOT linking)
 ```
+
+The default build links an embedded libpython (the `stdlib-ffi` bridge), so it
+needs CPython present at build time. `cargo build --no-default-features` drops
+pyo3/libpython entirely and serves `import` from the vendored `pylib/` tree.
+
+#### Self-contained install (macOS)
+
+```sh
+scripts/install.sh --release
+```
+
+Installs into `~/.pythonrs` — the binary, the CPython runtime, and every
+transitive dylib the C extensions touch — with all load commands rewritten to
+`@rpath` and re-signed, so nothing under `/opt/homebrew` is referenced and
+`brew uninstall python` leaves pythonrs working. Put `~/.pythonrs/bin` on `PATH`
+(or **symlink** `bin/python`; a bare `cp` breaks the `@executable_path` rpath).
 
 #### Zsh tab completion
 
@@ -117,7 +134,10 @@ attributes plus every method reachable along its class MRO. History persists to
 
 Set `PYTHONRS_TRACE=1` to log cache hit/miss to stderr (silent otherwise). Set
 `PYTHONRS_CACHE=0` (or `false`/`no`) to disable the transparent bytecode cache
-entirely — every run recompiles and nothing is stored.
+entirely — every run recompiles and nothing is stored. `PYTHONRS_STDLIB` overrides
+the embedded-CPython stdlib prefix (checked before the bundled and system
+locations); `PYTHONRS_LIB` overrides the vendored `pylib/` search path used by a
+`--no-default-features` build.
 
 ## [0x03] LANGUAGE FEATURES
 
@@ -140,11 +160,15 @@ what is not yet implemented.
 | `-m MODULE …` | Run a library module as a script. Delegates to the embedded CPython (`runpy`), so `-m pip` / `-m venv` / `-m http.server` / `-m json.tool` behave exactly like `python3 -m`; every token after the module is the module's own `sys.argv`. Needs the `stdlib-ffi` bridge (default build). |
 | `-u` | Force unbuffered `stdout`/`stderr` (`PYTHONUNBUFFERED`). |
 | `-E -I -O -S -B -W` | CPython interpreter flags, accepted for drop-in compatibility (`-u`/`-W` take real effect via the embedded interpreter; the rest are tolerated no-ops). |
-| `--build` | AOT-compile the script to a standalone native executable. |
+| `--build` | AOT-compile the script to a standalone native executable. Needs a libpython-free runtime — build with `--no-default-features`; a `stdlib-ffi` build refuses up front (its CPython symbols can't be statically linked). |
 | `--dump-bytecode` | Print the lowered `fusevm` bytecode and exit. |
+| `--dump-tokens` | Print the lexer token stream and exit. |
+| `--dump-ast` | Print the parsed AST and exit. |
+| `--disasm` | Print a `fusevm` bytecode disassembly listing and exit. |
 | `--tiers` | Run the script, then report which fusevm execution tier took each of its chunks. |
 | `--repl` | Start the interactive REPL. |
 | `--lsp` | Run the Language Server Protocol server over stdio. |
+| `--dap` | Run the Debug Adapter Protocol server over stdio — breakpoints, stepping, stack trace, locals, expression `evaluate`. |
 | `--doctor` | Print a diagnostic report — runtime, embedded CPython, fusevm engine, bytecode cache, `PYTHON*` env, and every `python*` interpreter on `PATH` — and exit. |
 | `--cacheview` | List the compiled programs held in the rkyv bytecode cache (`~/.pythonrs/scripts.rkyv`): per-entry hashes, blob size, and op/function/try/warning counts. |
 | `--cache-clear` | Delete the rkyv bytecode cache shard and exit. |

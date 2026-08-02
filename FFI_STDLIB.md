@@ -76,12 +76,15 @@ delegates to CPython.
    proxies (or a Foreign module handle). `from x import y`, submodules (`os.path`),
    `sys.modules` all fall out of CPython's own importer.
 
-5. **Delete the remaining hand-rolled shadows** in the SAME commit that turns the bridge
-   on (so no regression window): `src/stdlib/{json,os,random,string,itertools,functools,
-   statistics,textwrap}.rs` + their `import_module`/`call_builtin_function`/
-   `is_builtin_function` wiring + `mod.rs`. Keep only genuinely-native pieces (fusevm
-   runtime `sys.argv`/`sys.exit`, `math` if kept native). (`re/datetime/heapq/bisect`
-   already deleted.)
+5. **Delete the remaining hand-rolled shadows** — DONE. `src/stdlib/{json,os,random,
+   string,itertools,functools,statistics,textwrap}.rs` are gone (as are the earlier
+   `re/datetime/heapq/bisect`), along with their `import_module`/`call_builtin_function`/
+   `is_builtin_function` wiring. What remains under `src/stdlib/` is the genuinely-native
+   set the bridge does not serve: `binascii codecs pyast pycsv pyhash pyimp pyio pyopcode
+   pysignal pystruct pythread pytokenize`. `sys` stays wholly native (its `argv`/`exit`/
+   `stdout` are fusevm-runtime objects, deliberately never deferred), while `math`,
+   `collections`, `functools`, and `contextlib` resolve their native arms first and
+   defer to CPython only on a miss (`module_ffi_fallback`, `src/host.rs`).
 
 6. **Bundle packaging** (the "install stdlib with it" path) — DONE via
    `scripts/install.sh`, which installs a fully self-contained runtime into
@@ -110,10 +113,17 @@ delegates to CPython.
    Caveat: this vendors the RUNTIME. Rebuilding pythonrs from source still needs
    `python@3.14` present (pyo3 links it at build time); runtime is independent.
 
-## Remaining language gaps (loop, gated on session-limit reset)
-Exception chaining (`__cause__`/`__context__`, `raise X from Y`); lazy `zip`/`map`/
-`filter`/`enumerate` (+ infinite-`islice`); `frozenset` real type; dict-view set-ops +
-`range`/`set` methods; slice assignment/`del`; remaining str methods; `repr` control-char
-escaping; positional-only enforcement; metaclasses. (Complex arithmetic, `super`/C3,
-property/descriptors, iteration protocol, generators send/throw/close, banker's round,
-bignum, numeric-key unification — DONE; parity-fuzz at 0 across all modes.)
+## Language gaps once tracked here — all landed
+Exception chaining (`__cause__`/`__context__`, `raise X from Y` — `set_exc_link`
+in `src/host.rs`); lazy `zip`/`map`/`filter`/`enumerate` (real lazy iterator
+objects) plus infinite-`islice` via the bridge; `frozenset` as a real type
+(`PyObj::Frozenset`); dict-view set-ops and the `range`/`set` method surface;
+slice assignment and `del` (`set_slice_vals`/`del_slice`); the remaining `str`
+methods (`casefold`/`swapcase`/`title`/`expandtabs`/`rpartition`/`removeprefix`/
+`removesuffix`/`isprintable`/…); `repr` control-char escaping (`'a\tb\nc\x00d'`);
+positional-only enforcement (`FnDef::posonly`); metaclasses (`__prepare__` +
+`types.new_class` over the bridge). Earlier: complex arithmetic, `super`/C3,
+property/descriptors, the iteration protocol, generator `send`/`throw`/`close`,
+banker's rounding, bignum, numeric-key unification.
+
+`BUGS.md` — not this file — is the live ledger of what is still missing.
