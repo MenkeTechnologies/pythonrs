@@ -155,6 +155,47 @@ pub fn eval_str(src: &str) -> Result<Value, String> {
     run_compiled(compile_or_load_cacheable(src, false)?)
 }
 
+/// Run a Python source string on a fresh host with `globals` bound and the
+/// program's output captured in-process, returning the program's outcome
+/// alongside everything it wrote.
+///
+/// This is the entry point for an embedder rather than for the `python` binary,
+/// and it exists because [`eval_str`] cannot serve one: it resets the host
+/// first, which wipes any global installed beforehand, and it lets `print`
+/// reach the real stdout, which corrupts a host that owns the terminal. Both
+/// are fixed here — the globals are seeded *after* the reset, and every write
+/// the program makes lands in the returned string.
+///
+/// The outcome and the output are returned separately (rather than the output
+/// only on success) because a program that prints and *then* raises produced
+/// both, and an embedder generally wants to show both.
+///
+/// Globals are given as text and interned as real Python `str` objects here.
+/// They are deliberately *not* `Value`: a `Value::Str` built by a caller is not
+/// a Python string — strings live on this host's heap as `PyObj::Str`, so a
+/// bare `Value::Str` reprs correctly but has no methods (`stdin.upper()` finds
+/// nothing). Handing the host text and letting it intern removes that trap.
+///
+/// ```no_run
+/// let (result, out) = pythonrs::eval_str_captured("print(stdin.upper())", &[("stdin", "hi")]);
+/// assert!(result.is_ok());
+/// assert_eq!(out, "HI\n");
+/// ```
+pub fn eval_str_captured(src: &str, globals: &[(&str, &str)]) -> (Result<Value, String>, String) {
+    host::reset_host();
+    host::init_runtime(vec![String::new()], None, src, "<string>", true);
+    host::with_host(|h| {
+        for (name, text) in globals {
+            let value = h.new_str(*text);
+            h.set_global(name, value);
+        }
+        h.begin_capture();
+    });
+    let result = compile_or_load_cacheable(src, false).and_then(run_compiled);
+    let output = host::with_host(|h| h.end_capture());
+    (result, output)
+}
+
 /// Read and run a `.py` file (transparently rkyv-cached — see `compile_or_load`).
 pub fn eval_file(path: &str) -> Result<Value, String> {
     let src = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;

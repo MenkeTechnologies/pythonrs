@@ -1400,6 +1400,15 @@ pub struct PyHost {
     /// consult these.
     pub stdout_target: Option<Value>,
     pub stderr_target: Option<Value>,
+    /// In-process output sink. When `Some`, everything the program writes to the
+    /// native stdout/stderr streams is appended here instead of reaching the
+    /// process — what an embedder that owns the terminal (a TUI) needs so a
+    /// `print` cannot corrupt its display. `None` (the default) is the ordinary
+    /// standalone `python` behaviour. Distinct from `stdout_target`, which is
+    /// Python-level (`sys.stdout = …`) and redirects to a Python object; this is
+    /// host-level and catches every native write, including one through a
+    /// reassigned `sys.stdout` that still ends at the real stream.
+    capture: Option<String>,
     /// Imported modules keyed by dotted name — pythonrs's `sys.modules`. A second
     /// `import x` returns the cached module object (CPython identity + run-once
     /// side effects) instead of re-executing the vendored `.py`. Populated by
@@ -1750,6 +1759,7 @@ impl PyHost {
             traceback: Vec::new(),
             stdout_target: None,
             stderr_target: None,
+            capture: None,
             modules: IndexMap::new(),
             sys_modules: None,
             mt_states: HashMap::new(),
@@ -14891,18 +14901,69 @@ impl PyHost {
         Ok(Value::Int(s.chars().count() as i64))
     }
 
+    // ── output capture ───────────────────────────────────────────────────
+    //
+    // Every write a *program* makes to a native stream funnels through
+    // `write_out`: `print`, `sys.stdout.write`, the interactive displayhook, and
+    // the `input()` prompt. Diagnostics the runtime itself emits (the banner, a
+    // crash traceback from `main`) deliberately do not — they belong to the
+    // process, not to the program.
+
+    /// Start capturing program output in-process. Any text already captured is
+    /// discarded, so each run starts clean.
+    pub fn begin_capture(&mut self) {
+        self.capture = Some(String::new());
+    }
+
+    /// Stop capturing and take everything written since [`begin_capture`],
+    /// returning the empty string when capture was not on.
+    ///
+    /// [`begin_capture`]: PyHost::begin_capture
+    pub fn end_capture(&mut self) -> String {
+        self.capture.take().unwrap_or_default()
+    }
+
+    /// Whether output is being captured.
+    pub fn capturing(&self) -> bool {
+        self.capture.is_some()
+    }
+
+    /// Write program output: into the capture buffer when capturing, else to the
+    /// native stream `stderr` selects. `s` is written verbatim — `print` has
+    /// already applied `sep`/`end`.
+    pub fn write_out(&mut self, s: &str, stderr: bool) {
+        if let Some(buf) = &mut self.capture {
+            buf.push_str(s);
+            return;
+        }
+        use std::io::Write;
+        if stderr {
+            let mut o = std::io::stderr();
+            let _ = o.write_all(s.as_bytes());
+            let _ = o.flush();
+        } else {
+            let mut o = std::io::stdout();
+            let _ = o.write_all(s.as_bytes());
+            let _ = o.flush();
+        }
+    }
+
     /// `f.write(...)` at the byte layer — returns the number of bytes written.
     pub fn io_write_bytes(&mut self, id: u32, bytes: &[u8]) -> Result<Value, String> {
         use std::io::Write;
+        // The standard streams route through `write_out` (so an embedder's
+        // capture catches them), which needs `&mut self` of its own — hence the
+        // early return rather than an arm inside the `io_handles` borrow below.
+        match self.io_handles.get(id as usize) {
+            Some(IoCell::Stdout) | Some(IoCell::Stderr) => {
+                let stderr = matches!(self.io_handles.get(id as usize), Some(IoCell::Stderr));
+                self.write_out(&String::from_utf8_lossy(bytes), stderr);
+                return Ok(Value::Int(bytes.len() as i64));
+            }
+            _ => {}
+        }
         match self.io_handles.get_mut(id as usize) {
-            Some(IoCell::Stdout) => {
-                let mut o = std::io::stdout();
-                o.write_all(bytes).and_then(|_| o.flush()).map_err(io_err)?;
-            }
-            Some(IoCell::Stderr) => {
-                let mut o = std::io::stderr();
-                o.write_all(bytes).and_then(|_| o.flush()).map_err(io_err)?;
-            }
+            Some(IoCell::Stdout) | Some(IoCell::Stderr) => unreachable!("handled above"),
             Some(IoCell::Stdin) => return Err(unsupported_write()),
             Some(IoCell::File {
                 file: Some(f),
@@ -15148,10 +15209,7 @@ pub fn write_stdout(s: &str) -> Result<(), String> {
     match with_host(|h| h.stdout_target.clone()) {
         Some(t) => write_to_stream(&t, s),
         None => {
-            use std::io::Write;
-            let mut o = std::io::stdout();
-            let _ = o.write_all(s.as_bytes());
-            let _ = o.flush();
+            with_host(|h| h.write_out(s, false));
             Ok(())
         }
     }
@@ -15163,10 +15221,7 @@ pub fn write_stderr(s: &str) -> Result<(), String> {
     match with_host(|h| h.stderr_target.clone()) {
         Some(t) => write_to_stream(&t, s),
         None => {
-            use std::io::Write;
-            let mut o = std::io::stderr();
-            let _ = o.write_all(s.as_bytes());
-            let _ = o.flush();
+            with_host(|h| h.write_out(s, true));
             Ok(())
         }
     }

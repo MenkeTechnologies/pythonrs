@@ -1197,11 +1197,7 @@ fn b_displayhook(vm: &mut VM, _: u8) -> Value {
         Ok(s) => s,
         Err(e) => return abort(vm, e),
     };
-    use std::io::Write;
-    let mut out = std::io::stdout();
-    let _ = out.write_all(s.as_bytes());
-    let _ = out.write_all(b"\n");
-    let _ = out.flush();
+    with_host(|h| h.write_out(&format!("{s}\n"), false));
     with_host(|h| h.set_global("_", v));
     Value::Undef
 }
@@ -4552,10 +4548,8 @@ pub fn call_builtin_function(
         }
         "input" => {
             if let Some(p) = args.first() {
-                use std::io::Write;
                 let s = py_str(p)?;
-                let _ = std::io::stdout().write_all(s.as_bytes());
-                let _ = std::io::stdout().flush();
+                with_host(|h| h.write_out(&s, false));
             }
             let mut line = String::new();
             let _ = std::io::stdin().read_line(&mut line);
