@@ -4469,3 +4469,152 @@ fn function_locals_live_in_frame_slots_without_changing_semantics() {
         "(1497500, 1497500, True)"
     );
 }
+
+#[test]
+fn dir_lists_builtin_type_methods_and_scope_names() {
+    // `dir(type)` and `dir(value)` both list the methods the type responds to,
+    // so a `"append" in dir(list)` capability check works.
+    assert_eq!(
+        g("x = ('append' in dir(list), 'upper' in dir(str), 'upper' in dir('a'))", "x"),
+        "(True, True, True)"
+    );
+    // Bare `dir()` is the names bound in the current scope: module globals at
+    // module level, the frame's locals inside a function. The function case is
+    // what forced `dir` into the slot-optimization opt-out — with locals in
+    // fusevm slots there is no namespace left to enumerate.
+    assert_eq!(g("q = 1\nx = 'q' in dir()", "x"), "True");
+    assert_eq!(
+        g(
+            "def f():\n\
+             \x20   inner = 1\n\
+             \x20   return sorted(dir())\n\
+             x = f()",
+            "x"
+        ),
+        "['inner']"
+    );
+}
+
+#[test]
+fn vars_with_no_argument_is_locals() {
+    // CPython's `vars()` == `locals()`; it used to return an empty dict.
+    assert_eq!(g("q = 1\nx = 'q' in vars()", "x"), "True");
+    assert_eq!(
+        g(
+            "def f():\n\
+             \x20   inner = 2\n\
+             \x20   return sorted(vars())\n\
+             x = f()",
+            "x"
+        ),
+        "['inner']"
+    );
+}
+
+#[test]
+fn str_maketrans_is_reachable_off_an_instance() {
+    // `str.maketrans` is a staticmethod, so an instance reaches it too and gets
+    // the same table (the receiver string is ignored).
+    assert_eq!(
+        g("x = 'abc'.maketrans('ab', 'xy') == str.maketrans('ab', 'xy')", "x"),
+        "True"
+    );
+    assert_eq!(g("x = 'abc'.translate('zzz'.maketrans('ab', 'xy'))", "x"), "'xyc'");
+}
+
+#[test]
+fn break_continue_return_cross_a_try_boundary() {
+    // A try body compiles to its own chunk, so `break`/`continue`/`return`
+    // inside it have to propagate out to the ENCLOSING loop/frame rather than
+    // just ending the chunk. Sibling fusevm frontends have shipped a compiler
+    // panic (break to an outer loop) and an infinite loop (return from inside a
+    // try inside a loop) on exactly these shapes; each assertion below is the
+    // value CPython 3.14 produces.
+    assert_eq!(
+        g(
+            "def f():\n\
+             \x20   for i in range(5):\n\
+             \x20       try:\n\
+             \x20           if i == 2: break\n\
+             \x20       finally:\n\
+             \x20           pass\n\
+             \x20   return i\n\
+             x = f()",
+            "x"
+        ),
+        "2"
+    );
+    // `continue` from inside a try, with a `finally` that must still run.
+    assert_eq!(
+        g(
+            "def f():\n\
+             \x20   out = []\n\
+             \x20   for i in range(4):\n\
+             \x20       try:\n\
+             \x20           if i % 2 == 0: continue\n\
+             \x20           out.append(i)\n\
+             \x20       finally:\n\
+             \x20           out.append(-i)\n\
+             \x20   return out\n\
+             x = f()",
+            "x"
+        ),
+        "[0, 1, -1, -2, 3, -3]"
+    );
+    // `return` from inside a try inside a loop must end the FRAME, not spin.
+    assert_eq!(
+        g(
+            "def f():\n\
+             \x20   i = 0\n\
+             \x20   while True:\n\
+             \x20       try:\n\
+             \x20           i += 1\n\
+             \x20           if i > 2: return i\n\
+             \x20       except ValueError:\n\
+             \x20           pass\n\
+             x = f()",
+            "x"
+        ),
+        "3"
+    );
+    // `break` from an inner try targets the INNER loop only; the outer keeps going.
+    assert_eq!(
+        g(
+            "def f():\n\
+             \x20   out = []\n\
+             \x20   for i in range(3):\n\
+             \x20       for j in range(3):\n\
+             \x20           try:\n\
+             \x20               if j == 1: break\n\
+             \x20               out.append((i, j))\n\
+             \x20           except Exception:\n\
+             \x20               pass\n\
+             \x20   return out\n\
+             x = f()",
+            "x"
+        ),
+        "[(0, 0), (1, 0), (2, 0)]"
+    );
+    // `break` inside an `except` handler, and a generator that breaks out of a try.
+    assert_eq!(
+        g(
+            "def f():\n\
+             \x20   for i in range(4):\n\
+             \x20       try:\n\
+             \x20           raise ValueError(i)\n\
+             \x20       except ValueError:\n\
+             \x20           if i == 2: break\n\
+             \x20   return i\n\
+             def gen():\n\
+             \x20   for i in range(4):\n\
+             \x20       try:\n\
+             \x20           if i == 2: break\n\
+             \x20           yield i\n\
+             \x20       finally:\n\
+             \x20           pass\n\
+             x = (f(), list(gen()))",
+            "x"
+        ),
+        "(2, [0, 1])"
+    );
+}

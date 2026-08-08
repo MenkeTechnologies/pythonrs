@@ -25,49 +25,27 @@ the ordered, grounded gap list between here and that goal.
   per-expression fuzzer structurally can't (sort **stability**, `json.dumps(sort_keys=)`).
 - Re-measure, never weaken the comparison to move a number.
 
-**Readiness snapshot — 2026-08-02: `13/30 OK (43%)`** against committed `main`
-(`cargo build && ./scripts/dropin_check.sh`) — 12 ERR, 5 DIFF, up from `9/30 (30%)`
-on 2026-07-19 and `3/30` before that. Per category: `lang 7/7`, `io 2/2`,
-`argv 1/1`, `re 1/1`, `sys 1/1`, `data 1/2`; `os 0/3`, `real 0/3`,
-`collections 0/2`, and `argparse base64 csv datetime hashlib json pathlib
-subprocess` at `0/1` each.
+**Readiness snapshot — 2026-08-08: `30/30 OK (100%)`** against committed `main`
+(`cargo build && ./scripts/dropin_check.sh`, reference CPython 3.14.6) — 0 DIFF,
+0 ERR, 0 SKIP. Up from `13/30 (43%)` on 2026-08-02, `9/30 (30%)` on 2026-07-19,
+and `3/30` before that. Every category is complete: `lang 7/7`, `os 3/3`,
+`real 3/3`, `collections 2/2`, `data 2/2`, `io 2/2`, and `argparse argv base64
+csv datetime hashlib json pathlib re subprocess sys` at `1/1` each.
 
-> **Measured against a live regression — `foreign.method(...)` raises
-> `AttributeError`.** On this build a *method call* on a bridged CPython value
-> fails, while the same call split into a read plus an invocation succeeds:
->
-> ```
-> $ python -c 'import os; os.getcwd()'
-> AttributeError: 'module' object has no attribute 'getcwd'
-> $ python -c 'import os; f = os.getcwd; print(f()[:1])'
-> /
-> ```
->
-> **Root cause:** `host::call_method` (`src/host.rs:10121`) has no
-> `PyObj::Foreign` arm — the variant appears nowhere in its body, so a bridged
-> receiver falls through to the generic "object has no attribute" error.
-> `PyHost::get_attr` (`src/host.rs:7742`) and `set_attr` (`src/host.rs:9272`) both
-> still route a `foreign_id` hit to the bridge, which is why the two-step form
-> works. Import, binding, plain attribute reads, operators, and iteration are all
-> unaffected (`os.sep`, `os.path`, `re.match`, `math.comb(5,2)` all fine).
->
-> **All 12 ERR rows and the `collections`/`data_dataclass`/`pathlib`/
-> `real_wordfreq` DIFFs are this one defect**, verified individually. Fix it
-> before reading anything else into this number.
+The last two ERR rows (`csv_parse.py`, `real_json_config.py`) were one defect: a
+native `open()` handle could not cross into a CPython stdlib call, so
+`json.dump(cfg, f)` and `csv.writer(f)` raised `TypeError: cannot pass
+'TextIOWrapper' to a CPython stdlib call`. A native file now marshals as a
+`PyrsFile` proxy (`src/ffi.rs`) whose read/write/iteration route back to the
+same `file_method` the interpreter uses.
 
 **Landed previously** (grounded, python3-verified): bytes/bytearray (real type),
 file I/O (`open`/read/write/`with`), `collections` (deque/Counter/defaultdict/
 OrderedDict/namedtuple), `functools.partial`/`lru_cache`, the 3 numeric-core fixes
 (**`%`-format full spec, integer floor `//`/`%` divisor-sign, 3-arg modular `pow`**),
 the `with` single-eval + LIFO fix, and wiring for `re/datetime/heapq/bisect/textwrap/
-statistics`. Remaining walls:
-- **12 ERR** — `argparse base64 csv datetime hashlib json os_glob os_listdir
-  os_path_ops subprocess real_json_config real_parse_log`. Every one is the
-  `Foreign` method-call regression above, verified individually.
-- **5 DIFF** — `collections_counter`, `collections_deque`, `data_dataclass`,
-  `pathlib_paths`, `real_wordfreq` — the same regression on the bridged method
-  calls these scripts make, over the object-model (Tier 3) + data-structure
-  (Tier 6) gaps below.
+statistics`. The corpus has no remaining ERR or DIFF rows; grow it before
+reading the 100% as "done" — it is 30 scripts, not a conformance suite.
 
 Tiers are ordered by blast radius toward drop-in. **P0** = the interpreter
 *crashes or hangs* where CPython returns a value — a drop-in must never do this.
@@ -142,7 +120,8 @@ objects are native (landed). Items below track the native default-build surface.
       (`src/stdlib/pyio.rs`).
 - [x] **`subprocess`** — resolves through the `stdlib-ffi` bridge (no more
       `ModuleNotFoundError`); `from subprocess import run` binds. `subprocess.run(...)`
-      is blocked only by the `Foreign` method-call regression noted at the top.
+      runs, returning a real `CompletedProcess` (`stdout` is `bytes` under
+      `capture_output=True`).
 - [x] **`os` expansion** — the real CPython `os` arrives over the bridge:
       `listdir/scandir/walk/makedirs/remove/rename/chdir` and the full `os.path` all
       bind via `from os import …`. Still open: `environ` item assignment
@@ -150,7 +129,7 @@ objects are native (landed). Items below track the native default-build surface.
       assignment` — the marshalled mapping is read-only).
 - [x] **`pathlib`**, **`io`** (`StringIO`/`BytesIO`) — both import and bind
       (`from pathlib import Path; Path("/a/b").name` → `b`). Method calls on the
-      returned objects hit the `Foreign` method-call regression noted at the top.
+      returned objects work too (`Path("/a/b.txt").with_suffix(".md")` → `/a/b.md`).
 
 ## Tier 2 — stdlib modules scripts reach for
 
@@ -505,6 +484,18 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
       `[('carol', 25), ('bob', 25), ('alice', 30)]`, byte-identical to python3.
 - [x] **`json.dumps(sort_keys=True)`** — FIXED: the real CPython `json` arrives over
       the bridge, so `dumps({"b":1,"a":2}, sort_keys=True)` → `{"a": 2, "b": 1}`.
+- [x] **A native `open()` handle passed INTO a CPython stdlib call** — FIXED:
+      `json.dump(cfg, f)`, `json.load(f)`, `csv.writer(f)` and `csv.DictReader(f)`
+      used to raise `TypeError: cannot pass 'TextIOWrapper' to a CPython stdlib
+      call`. The marshaler now wraps a `PyObj::File` as a `PyrsFile` proxy whose
+      `read`/`write`/`__next__`/`seek`/`tell`/`name`/`mode`/`closed` route back to
+      the native handle, so the stdlib reads and writes the real file.
+- [x] **File-object surface**: `f.read(n)` (n *characters*, never splitting a
+      multi-byte one), `f.seek`/`f.tell`/`f.truncate`/`f.fileno`/`f.isatty`, and
+      the data attributes `f.name`/`f.mode`/`f.closed`/`f.encoding`. `readable()`
+      /`writable()` now report the mode the handle was opened with instead of
+      always `True`, a binary handle types as `_io.BufferedReader`/`BufferedWriter`
+      /`BufferedRandom`, and the `repr` carries the real mode string.
 
 ## Tier 7 — Functions / generators / async / exceptions / control flow
 
@@ -627,9 +618,9 @@ augwith, descriptors, attr, calls, match, conttail, itertail, metatype, seqtail,
 display, scoping, codec, subclass.
 
 The generated programs import only `sys` and `asyncio` (both native arms), so no
-case ever calls a method on a bridged CPython value — the open `Foreign`
-method-call regression noted at the top of this file therefore does not show up
-here. `scripts/dropin_check.sh` catches it; `parity-fuzz` structurally cannot.
+case ever crosses the CPython bridge — every bridge defect is structurally
+invisible to `parity-fuzz` and has to be caught by `scripts/dropin_check.sh`
+(which is exactly how the `TextIOWrapper`-into-a-stdlib-call gap surfaced).
 
 **Object-model modes added 2026-07-19** (`classes`, `iterproto`, `exceptions`) —
 each generates deterministic-stdout programs exercising the OOP surface and is in

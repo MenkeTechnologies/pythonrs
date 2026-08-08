@@ -624,6 +624,16 @@ fn value_to_py<'py>(
                 let tup = PyTuple::new(py, pargs).map_err(|e| e.to_string())?;
                 ctor.call1(tup).map_err(|e| e.to_string())
             }
+            // A pythonrs `open()` handle passed into a CPython call
+            // (`json.dump(cfg, f)`, `csv.writer(f)`, `csv.DictReader(f)`) is
+            // wrapped as a file-like object whose read/write/iteration route
+            // back to the native handle — so the stdlib writes the real file.
+            Some(PyObj::File { .. }) => {
+                let proxy = PyrsFile { target: v.clone() };
+                Py::new(py, proxy)
+                    .map(|p| p.into_any().into_bound(py))
+                    .map_err(|e| e.to_string())
+            }
             // A pythonrs instance passed into a CPython call (`operator.attrgetter
             // ("x")(pt)`, `sorted(objs, key=itemgetter(0))`, `json.dumps(obj,
             // default=...)`) is wrapped so CPython's attribute/item access,
@@ -745,6 +755,26 @@ pub fn get_attr(host: &mut PyHost, id: u32, name: &str) -> Result<Value, String>
         let obj = fetch(py, id)?;
         let attr = obj.getattr(name).map_err(|e| e.to_string())?;
         py_to_value(host, py, &attr)
+    })
+}
+
+/// `dir(foreign)` — CPython's own `dir()` for a bridged object, so a module's
+/// or an instance's real attribute list is what a caller sees. Returns an empty
+/// list rather than an error if CPython declines: `dir()` never raises.
+pub fn dir_names(id: u32) -> Vec<String> {
+    Python::with_gil(|py| {
+        let Ok(obj) = fetch(py, id) else {
+            return Vec::new();
+        };
+        obj.dir()
+            .ok()
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(|n| n.extract::<String>().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
     })
 }
 
@@ -1143,6 +1173,162 @@ impl PyrsInstance {
     fn __str__(&self) -> PyResult<String> {
         crate::builtins::py_str(&self.target).map_err(pyo3::exceptions::PyRuntimeError::new_err)
     }
+}
+
+// A CPython file-like view of a pythonrs `open()` handle, so a native file can
+// be handed to a stdlib call that reads or writes it (`json.dump(cfg, f)`,
+// `csv.writer(f)`, `csv.DictReader(f)`, `shutil.copyfileobj`). Every method
+// routes back to the same `file_method` the interpreter uses, with no host
+// borrow held (CPython calls these outside the marshalling window). Plain `//`
+// so the doc text doesn't become a leaking `__doc__`.
+#[pyclass]
+struct PyrsFile {
+    target: Value,
+}
+
+impl PyrsFile {
+    /// Call one file method on the wrapped handle and marshal the result back.
+    fn call(&self, py: Python, name: &str, args: Vec<Value>) -> PyResult<Py<PyAny>> {
+        let r = crate::host::call_method(&self.target, name, args, vec![]).map_err(rs_err)?;
+        with_host(|h| value_to_py(h, py, &r))
+            .map(|b| b.unbind())
+            .map_err(rs_err)
+    }
+}
+
+#[pymethods]
+impl PyrsFile {
+    #[pyo3(signature = (size=None))]
+    fn read(&self, py: Python, size: Option<i64>) -> PyResult<Py<PyAny>> {
+        self.call(py, "read", vec![size.map_or(Value::Undef, Value::Int)])
+    }
+
+    fn readline(&self, py: Python) -> PyResult<Py<PyAny>> {
+        self.call(py, "readline", vec![])
+    }
+
+    fn readlines(&self, py: Python) -> PyResult<Py<PyAny>> {
+        self.call(py, "readlines", vec![])
+    }
+
+    fn write(&self, py: Python, data: Bound<PyAny>) -> PyResult<Py<PyAny>> {
+        let v = with_host(|h| py_to_value(h, py, &data)).map_err(rs_err)?;
+        self.call(py, "write", vec![v])
+    }
+
+    fn writelines(&self, py: Python, lines: Bound<PyAny>) -> PyResult<Py<PyAny>> {
+        let v = with_host(|h| py_to_value(h, py, &lines)).map_err(rs_err)?;
+        self.call(py, "writelines", vec![v])
+    }
+
+    fn flush(&self, py: Python) -> PyResult<Py<PyAny>> {
+        self.call(py, "flush", vec![])
+    }
+
+    fn close(&self, py: Python) -> PyResult<Py<PyAny>> {
+        self.call(py, "close", vec![])
+    }
+
+    fn tell(&self, py: Python) -> PyResult<Py<PyAny>> {
+        self.call(py, "tell", vec![])
+    }
+
+    #[pyo3(signature = (offset, whence=0))]
+    fn seek(&self, py: Python, offset: i64, whence: i64) -> PyResult<Py<PyAny>> {
+        self.call(py, "seek", vec![Value::Int(offset), Value::Int(whence)])
+    }
+
+    fn fileno(&self, py: Python) -> PyResult<Py<PyAny>> {
+        self.call(py, "fileno", vec![])
+    }
+
+    fn readable(&self, py: Python) -> PyResult<Py<PyAny>> {
+        self.call(py, "readable", vec![])
+    }
+
+    fn writable(&self, py: Python) -> PyResult<Py<PyAny>> {
+        self.call(py, "writable", vec![])
+    }
+
+    fn seekable(&self, py: Python) -> PyResult<Py<PyAny>> {
+        self.call(py, "seekable", vec![])
+    }
+
+    fn isatty(&self, py: Python) -> PyResult<Py<PyAny>> {
+        self.call(py, "isatty", vec![])
+    }
+
+    #[getter]
+    fn name(&self, py: Python) -> PyResult<Py<PyAny>> {
+        self.attr(py, "name")
+    }
+
+    #[getter]
+    fn mode(&self, py: Python) -> PyResult<Py<PyAny>> {
+        self.attr(py, "mode")
+    }
+
+    #[getter]
+    fn closed(&self, py: Python) -> PyResult<Py<PyAny>> {
+        self.attr(py, "closed")
+    }
+
+    #[getter]
+    fn encoding(&self, py: Python) -> PyResult<Py<PyAny>> {
+        self.attr(py, "encoding")
+    }
+
+    #[getter]
+    fn newlines(&self, py: Python) -> PyResult<Py<PyAny>> {
+        self.attr(py, "newlines")
+    }
+
+    fn __iter__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
+    }
+
+    // Line iteration for `csv.reader(f)` / `csv.DictReader(f)`: an empty line
+    // from `readline` is EOF, which pyo3 turns into `StopIteration`.
+    fn __next__(&self, py: Python) -> PyResult<Option<Py<PyAny>>> {
+        let line = crate::host::call_method(&self.target, "readline", vec![], vec![])
+            .map_err(rs_err)?;
+        let text = with_host(|h| h.str_of(&line));
+        if text.is_empty() {
+            return Ok(None);
+        }
+        with_host(|h| value_to_py(h, py, &line))
+            .map(|b| Some(b.unbind()))
+            .map_err(rs_err)
+    }
+
+    fn __enter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    #[pyo3(signature = (*_args))]
+    fn __exit__(&self, py: Python, _args: &Bound<PyTuple>) -> PyResult<bool> {
+        self.call(py, "close", vec![])?;
+        Ok(false)
+    }
+
+    fn __repr__(&self) -> PyResult<String> {
+        crate::builtins::py_repr(&self.target).map_err(rs_err)
+    }
+}
+
+impl PyrsFile {
+    /// Read one data attribute (`name`/`mode`/`closed`/…) off the handle.
+    fn attr(&self, py: Python, name: &str) -> PyResult<Py<PyAny>> {
+        let v = with_host(|h| h.get_attr(&self.target, name)).map_err(rs_err)?;
+        with_host(|h| value_to_py(h, py, &v))
+            .map(|b| b.unbind())
+            .map_err(rs_err)
+    }
+}
+
+/// A pythonrs-side error string as the CPython exception a stdlib caller sees.
+fn rs_err(e: String) -> pyo3::PyErr {
+    pyo3::exceptions::PyRuntimeError::new_err(e)
 }
 
 /// `foreign[idx]`.

@@ -580,7 +580,133 @@ fn file_for_loop_lines() {
     assert_eq!(got, "['x', 'y']");
 }
 
+#[test]
+fn file_read_size_seek_tell() {
+    let path = tmp_path("seek");
+    let p = path.to_str().unwrap();
+    // `read(n)` takes exactly n CHARACTERS (not the whole file), `tell` reports
+    // the byte offset, and `seek` moves it. A multi-byte character must not be
+    // split, so reading 2 chars of "héllo" lands on byte 3.
+    let src = format!(
+        "f = open('{p}', 'w')\nf.write('héllo world')\nf.close()\n\
+         f = open('{p}')\na = f.read(2)\nb = f.tell()\nc = f.read(3)\n\
+         d = f.seek(0)\ne = f.read(1)\nf.close()\nx = (a, b, c, d, e)\n"
+    );
+    eval_str(&src).expect("file program should run");
+    let got = host::with_host(|h| {
+        let v = h.read_global("x").expect("x unbound");
+        h.repr_of(&v)
+    });
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(got, "('hé', 3, 'llo', 0, 'h')");
+}
+
+#[test]
+fn file_data_attributes_and_directions() {
+    let path = tmp_path("attrs");
+    let p = path.to_str().unwrap();
+    // `mode` is the string passed to `open`; `readable`/`writable` reflect it
+    // (a "w" handle is NOT readable); `closed` flips after `close()`.
+    let src = format!(
+        "f = open('{p}', 'w')\na = (f.mode, f.closed, f.readable(), f.writable())\n\
+         f.close()\nb = f.closed\n\
+         g_ = open('{p}', 'r')\nc = (g_.mode, g_.readable(), g_.writable(), g_.encoding)\n\
+         g_.close()\nx = (a, b, c)\n"
+    );
+    eval_str(&src).expect("file program should run");
+    let got = host::with_host(|h| {
+        let v = h.read_global("x").expect("x unbound");
+        h.repr_of(&v)
+    });
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(
+        got,
+        "(('w', False, False, True), True, ('r', True, False, 'UTF-8'))"
+    );
+}
+
+#[test]
+fn file_name_and_binary_mode_type() {
+    let path = tmp_path("btype");
+    let p = path.to_str().unwrap();
+    // A binary handle is a `_io.BufferedReader`/`BufferedWriter` in CPython, and
+    // `f.name` is the path it was opened with.
+    let src = format!(
+        "f = open('{p}', 'wb')\na = type(f).__name__\nf.write(b'z')\nf.close()\n\
+         g_ = open('{p}', 'rb')\nb = (type(g_).__name__, g_.name == '{p}')\ng_.close()\nx = (a, b)\n"
+    );
+    eval_str(&src).expect("file program should run");
+    let got = host::with_host(|h| {
+        let v = h.read_global("x").expect("x unbound");
+        h.repr_of(&v)
+    });
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(got, "('BufferedWriter', ('BufferedReader', True))");
+}
+
+#[test]
+fn file_truncate_cuts_at_position() {
+    let path = tmp_path("trunc");
+    let p = path.to_str().unwrap();
+    let src = format!(
+        "f = open('{p}', 'w')\nf.write('abcdef')\nf.truncate(3)\nf.close()\n\
+         f = open('{p}')\nx = f.read()\nf.close()\n"
+    );
+    eval_str(&src).expect("file program should run");
+    let got = host::with_host(|h| {
+        let v = h.read_global("x").expect("x unbound");
+        h.repr_of(&v)
+    });
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(got, "'abc'");
+}
+
 // ── CPython stdlib FFI bridge (real re / hashlib / json C accelerators) ───────
+
+/// A native `open()` handle handed to a CPython stdlib call has to behave like a
+/// file object on the CPython side: `json.dump` writes through it and `json.load`
+/// reads back through it, so the round trip must land on the real file.
+#[cfg(feature = "stdlib-ffi")]
+#[test]
+fn ffi_native_file_crosses_into_stdlib_calls() {
+    let path = tmp_path("ffifile");
+    let p = path.to_str().unwrap();
+    let src = format!(
+        "import json\nwith open('{p}', 'w') as f:\n    json.dump({{'b': 1, 'a': [1, 2]}}, f, sort_keys=True)\n\
+         with open('{p}') as f:\n    raw = f.read()\n\
+         with open('{p}') as f:\n    back = json.load(f)\n\
+         x = (raw, sorted(back.items()))\n"
+    );
+    eval_str(&src).expect("json round trip through a native file should run");
+    let got = host::with_host(|h| {
+        let v = h.read_global("x").expect("x unbound");
+        h.repr_of(&v)
+    });
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(got, "('{\"a\": [1, 2], \"b\": 1}', [('a', [1, 2]), ('b', 1)])");
+}
+
+/// `csv` drives a file object by ITERATION on the read side (and `.write` on the
+/// write side), so the bridge must answer `__next__` a line at a time.
+#[cfg(feature = "stdlib-ffi")]
+#[test]
+fn ffi_native_file_iterates_for_csv() {
+    let path = tmp_path("fficsv");
+    let p = path.to_str().unwrap();
+    let src = format!(
+        "import csv\nwith open('{p}', 'w', newline='') as f:\n    w = csv.writer(f)\n    w.writerow(['name', 'age'])\n    w.writerow(['ada', '36'])\n\
+         with open('{p}', newline='') as f:\n    rows = list(csv.DictReader(f))\n\
+         x = [(r['name'], r['age']) for r in rows]\n"
+    );
+    eval_str(&src).expect("csv round trip through a native file should run");
+    let got = host::with_host(|h| {
+        let v = h.read_global("x").expect("x unbound");
+        h.repr_of(&v)
+    });
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(got, "[('ada', '36')]");
+}
+
 
 /// Exercise the `stdlib-ffi` bridge end to end: import a pure module and two
 /// C-accelerator modules, run a call on each, and marshal the result back. Values
@@ -2216,6 +2342,24 @@ fn json_round_trips_objects_with_several_keys() {
             "import json\n\
              o = {'users': [{'id': i, 'name': 'n%d' % i} for i in range(3)]}\n\
              x = json.loads(json.dumps(o)) == o",
+            "x"
+        ),
+        "True"
+    );
+}
+
+/// `dir()` on a bridged CPython object is CPython's own `dir()` — the real
+/// attribute list of the module/instance, which no native table could mirror.
+#[cfg(feature = "stdlib-ffi")]
+#[test]
+fn ffi_dir_lists_the_real_cpython_attributes() {
+    assert_eq!(
+        g("import json\nx = ('dumps' in dir(json), 'JSONDecodeError' in dir(json))", "x"),
+        "(True, True)"
+    );
+    assert_eq!(
+        g(
+            "import datetime\nx = 'isoformat' in dir(datetime.date(2020, 1, 1))",
             "x"
         ),
         "True"

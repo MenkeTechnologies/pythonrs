@@ -4611,13 +4611,31 @@ pub fn call_builtin_function(
         "vars" => match args.first() {
             // `vars(obj)` == `obj.__dict__`.
             Some(v) => with_host(|h| h.get_attr(v, "__dict__")),
-            None => Ok(with_host(|h| h.new_dict(IndexMap::new()))),
+            // Bare `vars()` is `locals()` — the module namespace at module
+            // scope, a snapshot of the caller's locals inside a function.
+            None => call_builtin_function("locals", vec![], vec![]),
         },
         "dir" => Ok(with_host(|h| {
             let names = match args.first() {
                 Some(v) => h.dir_names(v),
-                // Bare `dir()` (module scope) is not modeled; return empty.
-                None => Vec::new(),
+                // Bare `dir()` is the sorted names bound in the current scope.
+                None => {
+                    if h.frame_depth() > 1 {
+                        let mut ns: Vec<String> =
+                            h.caller_locals().into_iter().map(|(k, _)| k).collect();
+                        ns.sort();
+                        ns
+                    } else {
+                        let slot = h.cur_module();
+                        let mut ns: Vec<String> = h
+                            .module_globals_pairs(slot)
+                            .into_iter()
+                            .map(|(k, _)| k)
+                            .collect();
+                        ns.sort();
+                        ns
+                    }
+                }
             };
             let items: Vec<Value> = names.into_iter().map(|n| h.new_str(n)).collect();
             h.new_list(items)
@@ -8556,6 +8574,35 @@ fn type_isa(h: &host::PyHost, a: &str, b: &str) -> bool {
 
 // ── type method dispatch ─────────────────────────────────────────────────────
 
+/// The method-name table of a builtin type, for the types that have a plain
+/// one. `type_has_method` answers from it and `dir()` enumerates it, so the two
+/// can never disagree about what a type responds to. `None` means the type's
+/// methods are decided by a rule rather than a table (an exception class, a
+/// lazy iterator, a lock, …) — `type_has_method` handles those itself.
+pub fn type_method_names(typename: &str) -> Option<&'static [&'static str]> {
+    Some(match typename {
+        "str" => STR_METHODS,
+        "bytes" => BYTES_METHODS,
+        "bytearray" => BYTEARRAY_METHODS,
+        "memoryview" => MEMORYVIEW_METHODS,
+        "list" => LIST_METHODS,
+        "dict" => DICT_METHODS,
+        "set" | "frozenset" => SET_METHODS,
+        "tuple" => TUPLE_METHODS,
+        "range" => &["index", "count"],
+        "slice" => &["indices"],
+        "deque" => DEQUE_METHODS,
+        "complex" => COMPLEX_METHODS,
+        "property" => PROPERTY_METHODS,
+        "generator" => GENERATOR_METHODS,
+        "TextIOWrapper" | "BufferedReader" | "BufferedWriter" | "BufferedRandom" => FILE_METHODS,
+        "_io.StringIO" | "_io.BytesIO" => STREAM_METHODS,
+        "Future" | "Task" => FUTURE_METHODS,
+        "_UnixSelectorEventLoop" => LOOP_METHODS,
+        _ => return None,
+    })
+}
+
 /// Whether `typename` responds to method `name` (used by `getattr`/bound
 /// methods to distinguish a method from an `AttributeError`).
 pub fn type_has_method(typename: &str, name: &str) -> bool {
@@ -8584,13 +8631,12 @@ pub fn type_has_method(typename: &str, name: &str) -> bool {
     {
         return true;
     }
+    if let Some(list) = type_method_names(typename) {
+        return list.contains(&name);
+    }
+    // Everything below is a type whose method set is a RULE, not a table; the
+    // table-backed types already answered above via `type_method_names`.
     let list: &[&str] = match typename {
-        "str" => STR_METHODS,
-        "bytes" => BYTES_METHODS,
-        "bytearray" => BYTEARRAY_METHODS,
-        "memoryview" => MEMORYVIEW_METHODS,
-        "list" => LIST_METHODS,
-        "dict" => DICT_METHODS,
         "OrderedDict" => return DICT_METHODS.contains(&name) || name == "move_to_end",
         "defaultdict" => return DICT_METHODS.contains(&name),
         "Counter" => {
@@ -8601,16 +8647,6 @@ pub fn type_has_method(typename: &str, name: &str) -> bool {
                 )
         }
         "dict_keys" | "dict_items" => return name == "isdisjoint",
-        "set" | "frozenset" => SET_METHODS,
-        "tuple" => TUPLE_METHODS,
-        "range" => &["index", "count"],
-        "slice" => &["indices"],
-        "deque" => DEQUE_METHODS,
-        "TextIOWrapper" => FILE_METHODS,
-        // The in-memory streams answer the file protocol plus their own
-        // `getvalue`. `tokenize` reaches for `StringIO(...).readline` as a bound
-        // method, so these have to be attribute-visible, not just callable.
-        "_io.StringIO" | "_io.BytesIO" => return STREAM_METHODS.contains(&name),
         // A C-level attribute descriptor is callable through the descriptor
         // protocol: `type.__dict__['__annotations__'].__get__(cls)`.
         "Context" => return matches!(name, "run" | "copy" | "get" | "keys" | "values" | "items"),
@@ -8621,9 +8657,6 @@ pub fn type_has_method(typename: &str, name: &str) -> bool {
         | "method-wrapper" => return matches!(name, "__get__" | "__set__" | "__delete__"),
         "int" | "bool" => return INT_METHODS.contains(&name) || INT_DUNDERS.contains(&name),
         "float" => return FLOAT_METHODS.contains(&name) || FLOAT_DUNDERS.contains(&name),
-        "complex" => COMPLEX_METHODS,
-        "property" => PROPERTY_METHODS,
-        "generator" => GENERATOR_METHODS,
         // Every lazy iterator answers the iterator protocol as bound methods.
         // `threading` takes `itertools.count().__next__` as its name counter, and
         // reaching `__next__` only through `next(it)` was not enough.
@@ -8642,8 +8675,6 @@ pub fn type_has_method(typename: &str, name: &str) -> bool {
                 "__aiter__" | "__anext__" | "asend" | "athrow" | "aclose"
             )
         }
-        "Future" | "Task" => return FUTURE_METHODS.contains(&name),
-        "_UnixSelectorEventLoop" => return LOOP_METHODS.contains(&name),
         "Event" => return matches!(name, "set" | "clear" | "is_set" | "wait"),
         "Lock" => {
             return matches!(
@@ -8867,8 +8898,15 @@ const FILE_METHODS: &[&str] = &[
     "readable",
     "writable",
     "seekable",
+    "seek",
+    "tell",
+    "truncate",
+    "fileno",
+    "isatty",
     "__enter__",
     "__exit__",
+    "__iter__",
+    "__next__",
 ];
 
 const STR_METHODS: &[&str] = &[
@@ -8917,6 +8955,8 @@ const STR_METHODS: &[&str] = &[
     "expandtabs",
     "translate",
     "format_map",
+    // A `staticmethod`, so it is reachable off an instance too ("abc".maketrans).
+    "maketrans",
 ];
 const LIST_METHODS: &[&str] = &[
     "append", "extend", "insert", "remove", "pop", "clear", "index", "count", "sort", "reverse",
@@ -9379,7 +9419,9 @@ pub fn call_type_method(
         "range" => range_method(recv, name, &args),
         "slice" => slice_method(recv, name, &args),
         "deque" => deque_method(recv, name, &args),
-        "TextIOWrapper" => file_method(recv, name, &args),
+        "TextIOWrapper" | "BufferedReader" | "BufferedWriter" | "BufferedRandom" => {
+            file_method(recv, name, &args)
+        }
         "functools._lru_cache_wrapper" => lru_wrapper_method(recv, name),
         "int" | "float" | "bool" if is_num_dunder(&tn, name) => num_dunder(recv, name, &args),
         "int" | "float" | "bool" => num_method(recv, name, &args, &kwargs),
@@ -10035,6 +10077,9 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             let table = arg0(args)?;
             Ok(new_str(str_translate(&s, &table)?))
         }
+        // `str.maketrans` is a static method: the receiver string is ignored, so
+        // `"abc".maketrans(...)` builds the same table as `str.maketrans(...)`.
+        "maketrans" => str_maketrans(args),
         "format_map" => {
             let mapping = arg0(args)?;
             str_format_map(&s, &mapping)
@@ -13964,8 +14009,17 @@ fn file_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String
         None => return Err(host::type_error("not a file")),
     };
     match name {
+        // `read()` / `read(-1)` / `read(None)` drain the stream; `read(n)` takes
+        // exactly n characters, as CPython's text-mode read does.
         "read" => {
-            let s = with_host(|h| h.io_read_all(id))?;
+            let n = match args.first() {
+                None | Some(Value::Undef) => None,
+                Some(v) => Some(
+                    with_host(|h| h.as_int(v))
+                        .ok_or_else(|| host::type_error("an integer is required"))?,
+                ),
+            };
+            let s = with_host(|h| h.io_read_n(id, n))?;
             Ok(new_str(s))
         }
         "readline" => {
@@ -14010,16 +14064,61 @@ fn file_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String
             with_host(|h| h.io_flush(id))?;
             Ok(Value::Undef)
         }
-        "readable" => Ok(Value::Bool(true)),
-        "writable" => Ok(Value::Bool(true)),
-        "seekable" => Ok(Value::Bool(true)),
+        "readable" => Ok(Value::Bool(with_host(|h| h.io_dirs(id).0))),
+        "writable" => Ok(Value::Bool(with_host(|h| h.io_dirs(id).1))),
+        // A real file seeks; a standard stream reports its actual capability.
+        "seekable" => Ok(Value::Bool(with_host(|h| h.io_tell(id).is_ok()))),
+        "tell" => Ok(Value::Int(with_host(|h| h.io_tell(id))?)),
+        "seek" => {
+            let off = {
+                let a0 = arg0(args)?;
+                with_host(|h| h.as_int(&a0))
+                    .ok_or_else(|| host::type_error("an integer is required"))?
+            };
+            let whence = match args.get(1) {
+                None | Some(Value::Undef) => 0,
+                Some(v) => with_host(|h| h.as_int(v))
+                    .ok_or_else(|| host::type_error("an integer is required"))?,
+            };
+            Ok(Value::Int(with_host(|h| h.io_seek(id, off, whence))?))
+        }
+        "truncate" => {
+            let size = match args.first() {
+                None | Some(Value::Undef) => None,
+                Some(v) => Some(
+                    with_host(|h| h.as_int(v))
+                        .ok_or_else(|| host::type_error("an integer is required"))?,
+                ),
+            };
+            Ok(Value::Int(with_host(|h| h.io_truncate(id, size))?))
+        }
+        "fileno" => Ok(Value::Int(with_host(|h| h.io_fileno(id))?)),
+        // No TTY detection layer yet: a real file is never a terminal, and the
+        // standard streams answer from the OS.
+        "isatty" => Ok(Value::Bool(match id {
+            0 => std::io::IsTerminal::is_terminal(&std::io::stdout()),
+            1 => std::io::IsTerminal::is_terminal(&std::io::stderr()),
+            2 => std::io::IsTerminal::is_terminal(&std::io::stdin()),
+            _ => false,
+        })),
         "__enter__" => Ok(recv.clone()),
         "__exit__" => {
             with_host(|h| h.io_close(id));
             Ok(Value::Bool(false))
         }
+        "__iter__" => Ok(recv.clone()),
+        // Line iteration: `""` from `readline` is EOF, which is exhaustion.
+        "__next__" => {
+            let s = with_host(|h| h.io_readline(id))?;
+            if s.is_empty() {
+                Err("StopIteration".to_string())
+            } else {
+                Ok(new_str(s))
+            }
+        }
         _ => Err(format!(
-            "AttributeError: '_io.TextIOWrapper' object has no attribute '{name}'"
+            "AttributeError: '_io.{}' object has no attribute '{name}'",
+            with_host(|h| h.file_class_name(id))
         )),
     }
 }

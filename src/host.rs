@@ -1152,9 +1152,10 @@ pub enum IterState {
 
 /// One live file / standard stream, indexed by `PyObj::File.id`. Slots 0/1/2 are
 /// always `Stdout`/`Stderr`/`Stdin`. A `File` holds the owned `std::fs::File`
-/// (`None` once closed), the path (for `repr`), and whether it was opened for
-/// reading and/or writing. `std::fs::File` is not `Clone`, so — like rubylang's
-/// `IoCell` — the handle lives here, never inline in a `PyObj`.
+/// (`None` once closed), the path (for `repr`/`f.name`), the mode string exactly
+/// as passed to `open` (what CPython's `f.mode` returns), and whether it was
+/// opened for reading and/or writing. `std::fs::File` is not `Clone`, so — like
+/// rubylang's `IoCell` — the handle lives here, never inline in a `PyObj`.
 pub enum IoCell {
     Stdout,
     Stderr,
@@ -1162,6 +1163,7 @@ pub enum IoCell {
     File {
         file: Option<std::fs::File>,
         path: String,
+        mode: String,
         readable: bool,
         writable: bool,
     },
@@ -1694,6 +1696,18 @@ pub fn init_runtime(
         // The top-level script always runs as `__main__`.
         let name = h.new_str("__main__");
         h.set_global("__name__", name);
+        // The module dunders CPython binds in `__main__` before the body runs.
+        // `__doc__` is overwritten by the compiled `__doc__ = <docstring>` store
+        // when the script opens with a string literal. `__loader__` and
+        // `__builtins__` are not bound: they need real importer/module objects.
+        for dunder in ["__doc__", "__package__", "__spec__"] {
+            h.set_global(dunder, Value::Undef);
+        }
+        // `__cached__` names the bytecode file of the script, so it exists only
+        // when there IS a script — `python -c` has neither it nor `__file__`.
+        if main_file.is_some() {
+            h.set_global("__cached__", Value::Undef);
+        }
         if let Some(path) = main_file {
             let f = h.new_str(path);
             h.set_global("__file__", f);
@@ -3057,6 +3071,9 @@ fn type_object_class_name(n: &str) -> Option<String> {
         "deque" => Some("collections.deque"),
         "partial" => Some("functools.partial"),
         "TextIOWrapper" => Some("_io.TextIOWrapper"),
+        "BufferedReader" => Some("_io.BufferedReader"),
+        "BufferedWriter" => Some("_io.BufferedWriter"),
+        "BufferedRandom" => Some("_io.BufferedRandom"),
         // `type_name` already returns these fully qualified.
         "functools._lru_cache_wrapper" => Some("functools._lru_cache_wrapper"),
         "re.Pattern" => Some("re.Pattern"),
@@ -3252,7 +3269,7 @@ impl PyHost {
                 Some(PyObj::Future { id }) => async_rt::future_type_name(*id).into(),
                 Some(PyObj::EventLoop) => "_UnixSelectorEventLoop".into(),
                 Some(PyObj::AsyncObj { id }) => async_rt::async_obj_type_name(*id).into(),
-                Some(PyObj::File { .. }) => "TextIOWrapper".into(),
+                Some(PyObj::File { id }) => self.file_class_name(*id).into(),
                 Some(PyObj::Deque { .. }) => "deque".into(),
                 Some(PyObj::NamedTupleType { .. }) => "type".into(),
                 Some(PyObj::Partial { .. }) => "partial".into(),
@@ -8469,6 +8486,41 @@ impl PyHost {
                     self.type_name(recv)
                 ))
             }
+            // `f.name` / `f.mode` / `f.closed` / `f.encoding` — the data
+            // attributes of a file object (its methods keep going through the
+            // builtin method table below).
+            Some(PyObj::File { id }) => {
+                let id = *id;
+                let cls = self.file_class_name(id);
+                match name {
+                    "name" => {
+                        let n = self.io_name(id);
+                        return Ok(self.new_str(n));
+                    }
+                    "mode" => {
+                        let m = self.io_mode(id);
+                        return Ok(self.new_str(m));
+                    }
+                    "closed" => return Ok(Value::Bool(self.io_closed(id))),
+                    // Only a text stream carries a codec, as in CPython.
+                    "encoding" if cls == "TextIOWrapper" => return Ok(self.new_str("UTF-8".to_string())),
+                    "errors" if cls == "TextIOWrapper" => {
+                        return Ok(self.new_str("strict".to_string()))
+                    }
+                    "newlines" if cls == "TextIOWrapper" => return Ok(Value::Undef),
+                    _ => {}
+                }
+                if crate::builtins::type_has_method("TextIOWrapper", name)
+                    || crate::builtins::is_object_dunder_method(name)
+                {
+                    let b = self.alloc(PyObj::Builtin(name.to_string()));
+                    let recv = recv.clone();
+                    return Ok(self.alloc(PyObj::BoundMethod { recv, func: b }));
+                }
+                Err(format!(
+                    "AttributeError: '_io.{cls}' object has no attribute '{name}'"
+                ))
+            }
             // `struct_time.tm_year` etc. — read the named field (including the
             // attribute-only `tm_gmtoff`/`tm_zone`).
             Some(PyObj::StructTime { fields }) => {
@@ -9010,6 +9062,12 @@ impl PyHost {
     /// pythonrs does not model are not enumerated.
     pub fn dir_names(&self, v: &Value) -> Vec<String> {
         let mut set: BTreeSet<String> = BTreeSet::new();
+        // A bridged CPython object answers with its own `dir()` — its real
+        // attribute list, which no native table could reproduce.
+        #[cfg(feature = "stdlib-ffi")]
+        if let Some(id) = self.foreign_id(v) {
+            return crate::ffi::dir_names(id);
+        }
         match self.get(v) {
             Some(PyObj::Instance(i)) => {
                 let dict = i.dict.clone();
@@ -9029,9 +9087,36 @@ impl PyHost {
                     set.insert(k.clone());
                 }
             }
-            _ => {}
+            // `dir(list)` / `dir(str)` — a builtin TYPE object lists the methods
+            // of the type it names; anything else falls through to the value
+            // branch below, which lists the methods of its own type.
+            Some(PyObj::Builtin(n)) if crate::builtins::type_method_names(n).is_some() => {
+                let n = n.clone();
+                self.collect_builtin_dir(&n, &mut set);
+            }
+            _ => {
+                // `dir(x)` on a builtin VALUE ("abc", [1], 2.5) — the methods its
+                // type responds to. Not CPython's full slot-wrapper listing, but
+                // every name here is one the value really answers to.
+                let tn = self.type_name(v);
+                self.collect_builtin_dir(&tn, &mut set);
+            }
         }
         set.into_iter().collect()
+    }
+
+    /// Add the method names of builtin type `tn` (plus the object dunders every
+    /// value carries) to `set`. Empty for a type with no method table.
+    fn collect_builtin_dir(&self, tn: &str, set: &mut BTreeSet<String>) {
+        let Some(names) = crate::builtins::type_method_names(tn) else {
+            return;
+        };
+        for n in names {
+            set.insert((*n).to_string());
+        }
+        for n in ["__class__", "__doc__", "__init__", "__new__", "__sizeof__"] {
+            set.insert(n.to_string());
+        }
     }
 
     /// Add every name defined across `class`'s MRO namespaces (and any
@@ -14836,6 +14921,7 @@ impl PyHost {
         &mut self,
         file: std::fs::File,
         path: String,
+        mode: String,
         readable: bool,
         writable: bool,
     ) -> Value {
@@ -14843,6 +14929,7 @@ impl PyHost {
         self.io_handles.push(IoCell::File {
             file: Some(file),
             path,
+            mode,
             readable,
             writable,
         });
@@ -14855,6 +14942,186 @@ impl PyHost {
             self.io_handles.get(id as usize),
             Some(IoCell::File { file: None, .. })
         )
+    }
+
+    /// The CPython class name of a file handle: a text-mode handle (and every
+    /// standard stream) is a `TextIOWrapper`; a binary-mode one is a
+    /// `BufferedReader` / `BufferedWriter` / `BufferedRandom` depending on which
+    /// directions it was opened for.
+    pub fn file_class_name(&self, id: u32) -> &'static str {
+        match self.io_handles.get(id as usize) {
+            Some(IoCell::File {
+                mode,
+                readable,
+                writable,
+                ..
+            }) if mode.contains('b') => match (readable, writable) {
+                (true, true) => "BufferedRandom",
+                (true, false) => "BufferedReader",
+                _ => "BufferedWriter",
+            },
+            _ => "TextIOWrapper",
+        }
+    }
+
+    /// `f.name` — the path for a real file, the bracketed stream name otherwise.
+    pub fn io_name(&self, id: u32) -> String {
+        match self.io_handles.get(id as usize) {
+            Some(IoCell::Stdout) => "<stdout>".into(),
+            Some(IoCell::Stderr) => "<stderr>".into(),
+            Some(IoCell::Stdin) => "<stdin>".into(),
+            Some(IoCell::File { path, .. }) => path.clone(),
+            None => String::new(),
+        }
+    }
+
+    /// `f.mode` — the mode string exactly as it was passed to `open`.
+    pub fn io_mode(&self, id: u32) -> String {
+        match self.io_handles.get(id as usize) {
+            Some(IoCell::Stdout) | Some(IoCell::Stderr) => "w".into(),
+            Some(IoCell::Stdin) => "r".into(),
+            Some(IoCell::File { mode, .. }) => mode.clone(),
+            None => String::new(),
+        }
+    }
+
+    /// `f.readable()` / `f.writable()` — the directions the handle was opened
+    /// for. A standard stream reports the direction it actually carries.
+    pub fn io_dirs(&self, id: u32) -> (bool, bool) {
+        match self.io_handles.get(id as usize) {
+            Some(IoCell::Stdout) | Some(IoCell::Stderr) => (false, true),
+            Some(IoCell::Stdin) => (true, false),
+            Some(IoCell::File {
+                readable, writable, ..
+            }) => (*readable, *writable),
+            None => (false, false),
+        }
+    }
+
+    /// `f.read(n)` — the next `n` *characters* (text mode), decoded from UTF-8.
+    /// Reads one whole character at a time (a lead byte plus its continuation
+    /// bytes), so a multi-byte character is never split and the stream position
+    /// lands exactly after the nth character — matching CPython's text-mode
+    /// `read`, whose `tell` after `read(2)` of `"héllo"` is byte 3.
+    /// `None`/negative `n` reads to EOF.
+    pub fn io_read_n(&mut self, id: u32, n: Option<i64>) -> Result<String, String> {
+        let want = match n {
+            None => return self.io_read_all(id),
+            Some(k) if k < 0 => return self.io_read_all(id),
+            Some(k) => k as usize,
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        for _ in 0..want {
+            let Some(lead) = self.io_read_byte(id)? else {
+                break;
+            };
+            buf.push(lead);
+            // UTF-8: the lead byte's high bits give the character's total length.
+            let extra = match lead {
+                0x00..=0x7F => 0,
+                0xC0..=0xDF => 1,
+                0xE0..=0xEF => 2,
+                0xF0..=0xF7 => 3,
+                // A stray continuation byte is not a lead byte; take it alone
+                // and let the lossy decode below replace it.
+                _ => 0,
+            };
+            for _ in 0..extra {
+                match self.io_read_byte(id)? {
+                    Some(b) => buf.push(b),
+                    None => break,
+                }
+            }
+        }
+        Ok(String::from_utf8_lossy(&buf).into_owned())
+    }
+
+    /// One byte from a readable handle; `None` at EOF. The shared step behind
+    /// `io_readline` and `io_read_n`.
+    fn io_read_byte(&mut self, id: u32) -> Result<Option<u8>, String> {
+        use std::io::Read;
+        let mut one = [0u8; 1];
+        let read = match self.io_handles.get_mut(id as usize) {
+            Some(IoCell::File {
+                file: Some(f),
+                readable: true,
+                ..
+            }) => f.read(&mut one),
+            Some(IoCell::File { file: Some(_), .. }) => return Err(unsupported_read()),
+            Some(IoCell::File { file: None, .. }) => return Err(closed_err()),
+            Some(IoCell::Stdin) => std::io::stdin().read(&mut one),
+            _ => return Err(unsupported_read()),
+        };
+        match read {
+            Ok(0) => Ok(None),
+            Ok(_) => Ok(Some(one[0])),
+            Err(e) => Err(io_err(e)),
+        }
+    }
+
+    /// `f.tell()` — the current byte offset (CPython's text-mode cookie is the
+    /// byte position for an unbuffered, non-translating stream like ours).
+    pub fn io_tell(&mut self, id: u32) -> Result<i64, String> {
+        use std::io::Seek;
+        match self.io_handles.get_mut(id as usize) {
+            Some(IoCell::File { file: Some(f), .. }) => {
+                f.stream_position().map(|p| p as i64).map_err(io_err)
+            }
+            Some(IoCell::File { file: None, .. }) => Err(closed_err()),
+            _ => Err("OSError: [Errno 29] Illegal seek".into()),
+        }
+    }
+
+    /// `f.seek(offset, whence)` — returns the new absolute position.
+    pub fn io_seek(&mut self, id: u32, offset: i64, whence: i64) -> Result<i64, String> {
+        use std::io::{Seek, SeekFrom};
+        let from = match whence {
+            0 => SeekFrom::Start(offset.max(0) as u64),
+            1 => SeekFrom::Current(offset),
+            2 => SeekFrom::End(offset),
+            _ => return Err(format!("ValueError: invalid whence ({whence}, should be 0, 1 or 2)")),
+        };
+        match self.io_handles.get_mut(id as usize) {
+            Some(IoCell::File { file: Some(f), .. }) => {
+                f.seek(from).map(|p| p as i64).map_err(io_err)
+            }
+            Some(IoCell::File { file: None, .. }) => Err(closed_err()),
+            _ => Err("OSError: [Errno 29] Illegal seek".into()),
+        }
+    }
+
+    /// `f.fileno()` — the underlying OS descriptor.
+    pub fn io_fileno(&self, id: u32) -> Result<i64, String> {
+        #[cfg(unix)]
+        use std::os::unix::io::AsRawFd;
+        match self.io_handles.get(id as usize) {
+            Some(IoCell::Stdout) => Ok(1),
+            Some(IoCell::Stderr) => Ok(2),
+            Some(IoCell::Stdin) => Ok(0),
+            #[cfg(unix)]
+            Some(IoCell::File { file: Some(f), .. }) => Ok(f.as_raw_fd() as i64),
+            Some(IoCell::File { file: None, .. }) => Err(closed_err()),
+            #[allow(unreachable_patterns)]
+            _ => Err("io.UnsupportedOperation: fileno".into()),
+        }
+    }
+
+    /// `f.truncate(size)` — cut the file to `size` (default: current position).
+    pub fn io_truncate(&mut self, id: u32, size: Option<i64>) -> Result<i64, String> {
+        let at = match size {
+            Some(n) => n,
+            None => self.io_tell(id)?,
+        };
+        match self.io_handles.get_mut(id as usize) {
+            Some(IoCell::File {
+                file: Some(f),
+                writable: true,
+                ..
+            }) => f.set_len(at.max(0) as u64).map(|_| at).map_err(io_err),
+            Some(IoCell::File { file: Some(_), .. }) => Err(unsupported_write()),
+            Some(IoCell::File { file: None, .. }) => Err(closed_err()),
+            _ => Err("io.UnsupportedOperation: truncate".into()),
+        }
     }
 
     /// The `repr` of a file handle.
@@ -14870,18 +15137,20 @@ impl PyHost {
                 "<_io.TextIOWrapper name='<stdin>' mode='r' encoding='utf-8'>".into()
             }
             Some(IoCell::File {
-                file,
-                path,
-                readable,
-                writable,
+                file, path, mode, ..
             }) => {
-                let mode = match (readable, writable) {
-                    (true, true) => "r+",
-                    (false, true) => "w",
-                    _ => "r",
-                };
                 let closed = if file.is_none() { " (closed)" } else { "" };
-                format!("<_io.TextIOWrapper name='{path}' mode='{mode}' encoding='utf-8'{closed}>")
+                // A binary-mode handle is a `Buffered*` object in CPython: no
+                // `mode=`/`encoding=` in its repr, and the class name reflects
+                // whether it reads, writes, or both.
+                if mode.contains('b') {
+                    let cls = self.file_class_name(id);
+                    format!("<_io.{cls} name='{path}'{closed}>")
+                } else {
+                    format!(
+                        "<_io.TextIOWrapper name='{path}' mode='{mode}' encoding='UTF-8'{closed}>"
+                    )
+                }
             }
             None => "<_io.TextIOWrapper>".into(),
         }
@@ -15007,30 +15276,11 @@ impl PyHost {
 
     /// `f.readline()` — one line up to and including `\n` (or EOF); "" at EOF.
     pub fn io_readline(&mut self, id: u32) -> Result<String, String> {
-        use std::io::Read;
         let mut buf: Vec<u8> = Vec::new();
-        loop {
-            let mut one = [0u8; 1];
-            let n = match self.io_handles.get_mut(id as usize) {
-                Some(IoCell::File {
-                    file: Some(f),
-                    readable: true,
-                    ..
-                }) => f.read(&mut one),
-                Some(IoCell::File { file: Some(_), .. }) => return Err(unsupported_read()),
-                Some(IoCell::File { file: None, .. }) => return Err(closed_err()),
-                Some(IoCell::Stdin) => std::io::stdin().read(&mut one),
-                _ => return Err(unsupported_read()),
-            };
-            match n {
-                Ok(0) => break,
-                Ok(_) => {
-                    buf.push(one[0]);
-                    if one[0] == b'\n' {
-                        break;
-                    }
-                }
-                Err(e) => return Err(io_err(e)),
+        while let Some(b) = self.io_read_byte(id)? {
+            buf.push(b);
+            if b == b'\n' {
+                break;
             }
         }
         Ok(String::from_utf8_lossy(&buf).into_owned())
@@ -15182,7 +15432,7 @@ pub fn open_file(path: &str, mode: &str) -> Result<Value, String> {
         _ => format!("OSError: {e}: '{path}'"),
     })?;
     Ok(with_host(|h| {
-        h.io_alloc_file(f, path.to_string(), readable, writable)
+        h.io_alloc_file(f, path.to_string(), mode.to_string(), readable, writable)
     }))
 }
 

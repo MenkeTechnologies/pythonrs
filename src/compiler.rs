@@ -209,6 +209,16 @@ fn compile_ex(stmts: &[Stmt], debug: bool, interactive: bool) -> Result<Program,
     };
     let mut b = ChunkBuilder::new();
     c.begin_chunk();
+    // CPython stores a module's docstring as `__doc__` before running the body,
+    // and emits that store ONLY when the body actually opens with a string
+    // literal (`exec("x=1", g)` leaves `g` without a `__doc__`).
+    if let Some(doc) = docstring(stmts) {
+        let store = Stmt::from(StmtKind::Assign {
+            targets: vec![Expr::Name("__doc__".to_string())],
+            value: Expr::Str(doc),
+        });
+        c.compile_stmts(&mut b, std::slice::from_ref(&store))?;
+    }
     c.compile_stmts(&mut b, stmts)?;
     let main = c.finish_chunk(b);
     Ok(Program {
@@ -3924,7 +3934,7 @@ fn param_names(params: &Params) -> Vec<String> {
 ///   each compiles its body to a SEPARATE chunk that runs on its own VM with its
 ///   own slots;
 /// * `global`/`nonlocal`, `del`, and any mention of `locals`/`vars`/`eval`/
-///   `exec` — each reaches a local by name at runtime.
+///   `exec`/`dir` — each reaches a local by name at runtime.
 ///
 /// Generators and `async def` are excluded by the caller (their bodies park on a
 /// coroutine stack). A disqualified function compiles exactly as it did before,
@@ -3939,7 +3949,7 @@ fn fn_slots_allowed(body: &[Stmt]) -> bool {
     }
     if refs
         .iter()
-        .any(|n| matches!(n.as_str(), "locals" | "vars" | "eval" | "exec"))
+        .any(|n| matches!(n.as_str(), "locals" | "vars" | "eval" | "exec" | "dir"))
     {
         return false;
     }

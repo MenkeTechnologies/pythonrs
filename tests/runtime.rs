@@ -421,3 +421,43 @@ fn print_to_stderr_does_not_error() {
     assert_eq!(r.exit_code, 0);
     assert_eq!(r.stderr, None);
 }
+
+#[test]
+fn main_module_dunders_are_bound() {
+    // CPython binds `__doc__`/`__package__`/`__spec__` in `__main__` before the
+    // body runs; reading one must not raise `NameError`. `__cached__` names the
+    // bytecode file, so it exists only when there IS a script file.
+    assert_eq!(
+        g("x = (__name__, __doc__, __package__, __spec__)", "x"),
+        "('__main__', None, None, None)"
+    );
+    assert_eq!(
+        g("x = '__cached__' in globals()", "x"),
+        "False",
+        "`python -c` has no script file, so no __cached__"
+    );
+    let r = run_program(
+        "x = ('__cached__' in globals(), __cached__)",
+        vec!["prog.py".to_string()],
+        Some("prog.py".to_string()),
+        "prog.py",
+        true,
+    );
+    assert_eq!(r.exit_code, 0, "stderr {:?}", r.stderr);
+    assert_eq!(
+        host::with_host(|h| {
+            let v = h.read_global("x").expect("x unbound");
+            h.repr_of(&v)
+        }),
+        "(True, None)"
+    );
+}
+
+#[test]
+fn module_docstring_binds_dunder_doc() {
+    // A body opening with a string literal stores it as `__doc__` — and a body
+    // that does NOT open with one leaves `__doc__` alone (CPython emits the
+    // store only when a docstring is present).
+    assert_eq!(g("'''Mod doc.'''\nx = __doc__", "x"), "'Mod doc.'");
+    assert_eq!(g("y = 1\nx = __doc__", "x"), "None");
+}

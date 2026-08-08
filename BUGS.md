@@ -8,12 +8,6 @@ fixed. Every line below was re-checked against the **default-build** binary
 (`cargo build` — default features, so the `stdlib-ffi` bridge is ON) before being
 written.
 
-**Read the open regression under [Standard library](#standard-library) first**:
-a method call on a bridged CPython value (`os.getcwd()`, `json.dumps(...)`)
-currently raises `AttributeError` because `host::call_method` lost its
-`PyObj::Foreign` arm. It invalidates most of the stdlib behavior described below
-until it is fixed.
-
 ## Implemented (previously listed here as gaps)
 - **Generators / `yield`.** A `def` whose body contains `yield` builds a real
   lazy generator, backed by a stackful `corosensei` coroutine on the same thread
@@ -306,6 +300,23 @@ until it is fixed.
   from the true value (e.g. `2113325745016023.2` prints as `…3.3`); the underlying
   `f64` bits are identical either way (`float.hex` agrees). A faithful fix needs a
   dtoa-style shortest formatter rather than the `std` one.
+- **`dir()` on a native builtin type/value is the method table, not CPython's
+  full slot listing.** `dir(list)`/`dir("a")` enumerate the names the type really
+  responds to (so `'append' in dir(list)` and `'upper' in dir(str)` are right),
+  plus `__class__`/`__doc__`/`__init__`/`__new__`/`__sizeof__`. CPython's
+  `dir(list)` is ~46 entries because every slot wrapper (`__add__`, `__iadd__`,
+  `__class_getitem__`, …) is a real descriptor on the type; pythonrs dispatches
+  those natively rather than through per-type descriptor objects, so they are not
+  enumerable. `dir()` of a bridged CPython object (`dir(json)`,
+  `dir(datetime.date(...))`) IS exact — it delegates to CPython's own `dir()`.
+- **`__loader__` / `__builtins__` are not bound in module globals.** `__name__`,
+  `__file__`, `__doc__`, `__package__`, `__spec__` and (for a script)
+  `__cached__` all match CPython, but the remaining two need real importer and
+  module objects: `__loader__` is a `_frozen_importlib` class and `__builtins__`
+  is the `builtins` module itself. `sorted(globals())` therefore differs from
+  CPython by exactly those two names. Relatedly, `import builtins;
+  builtins.len is len` is `False` — the bridged `builtins` module is a distinct
+  CPython object from the native builtin dispatch.
 - **256+ argument calls / `**`-spread dict literals**: `CallBuiltin` carries a
   `u8` operand count, so an op that must name >255 stack slots at once raises
   `too many arguments (>255) for one call`. Plain collection literals
@@ -346,44 +357,6 @@ until it is fixed.
   analogue of `python3 -i < file`.
 
 ## Standard library
-
-> **OPEN REGRESSION (2026-08-02) — `foreign.method(...)` in one expression raises
-> `AttributeError`.** Everything in this section describes the intended and
-> previously verified behavior, but on the current `main` build a *method call* on
-> a bridged (CPython-side) value fails, while the identical call split into an
-> attribute read plus an invocation succeeds:
->
-> ```
-> $ python -c 'import os; os.getcwd()'
-> AttributeError: 'module' object has no attribute 'getcwd'
-> $ python -c 'import os; f = os.getcwd; print(f()[:1])'
-> /
-> $ python -c 'import json; json.dumps({"a":1})'
-> AttributeError: 'module' object has no attribute 'dumps'
-> $ python -c 'import json; d = json.dumps; print(d({"a":1}))'
-> {"a": 1}
-> $ python -c 'from datetime import date; date(2020,1,2).isoformat()'
-> AttributeError: 'date' object has no attribute 'isoformat'
-> $ python -c 'from datetime import date; f = date(2020,1,2).isoformat; print(f())'
-> 2020-01-02
-> ```
->
-> **Root cause:** `host::call_method` (`src/host.rs:10121`) has no `PyObj::Foreign`
-> arm — the variant appears nowhere in its body, so a bridged receiver falls
-> through to the generic "object has no attribute" error. `PyHost::get_attr`
-> (`src/host.rs:7742`) *does* route a `foreign_id` hit to `ffi::get_attr`, which is
-> why the two-step form works. `set_attr` has the arm (`src/host.rs:9272`);
-> `call_method` is the one that lost it.
->
-> Import, binding, plain attribute reads, operators, and iteration over bridged
-> values are all unaffected: `from os import getcwd`, `os.sep`, `os.path`,
-> `re.match`, `math.comb(5,2)`, `contextlib.suppress` and `asyncio.run` all work.
-> Modules with a native arm (`sys`, `math`, `functools`, `contextlib`) are
-> unaffected for their native symbols. A related symptom: `dir(json)` returns `[]`.
->
-> This one defect accounts for every `ERR` row in `scripts/dropin_check.sh` — see
-> the readiness snapshot in `CHECKLIST.md`. `parity-fuzz` does not catch it: its
-> generated programs never cross the bridge (50,000 mixed cases, 0 divergences).
 
 The **default build** ships the `stdlib-ffi` bridge, so a native fast-path subset
 plus the entire CPython stdlib are importable out of the box. A
