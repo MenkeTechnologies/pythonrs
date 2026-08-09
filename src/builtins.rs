@@ -3186,9 +3186,6 @@ fn callable_name(h: &host::PyHost, v: &Value) -> Option<String> {
 
 // ── the strict numeric hook ──────────────────────────────────────────────────
 
-/// Python arithmetic/comparison for operands the VM can't handle natively. User
-/// instances defining an operator dunder (`__add__`, `__eq__`, `__lt__`, …) are
-/// dispatched first; everything else falls to the host's native numeric logic.
 /// The `operator`-module attribute name for a `NumOp` binary op (`Add` → `add`,
 /// `Lt` → `lt`, …), or `None` for the unary `Neg`. Used to run an op on a
 /// `Foreign` operand in CPython over the FFI bridge.
@@ -3212,6 +3209,21 @@ fn foreign_binop_func(op: NumOp) -> Option<&'static str> {
     })
 }
 
+/// Python arithmetic/comparison reached from fusevm. User instances defining an
+/// operator dunder (`__add__`, `__eq__`, `__lt__`, …) are dispatched first;
+/// everything else falls to the host's native numeric logic.
+///
+/// Two plain `int`/`float` operands DO reach here, so this is not a "non-native
+/// operands only" path:
+///
+/// - `x += y` always lowers to `INPLACE` outside a native for-range slot loop
+///   (`compiler.rs::compile_augassign`), and `inplace_binary_fallback` routes
+///   `+`/`-`/`*` straight back here even for two `Value::Int`s.
+/// - fusevm hands over a mixed `int`/`float` pair whose integer is past 2^53.
+///   It can read that pair natively and deliberately does not: `f64` no longer
+///   holds every integer there, and Python compares `int` against `float`
+///   EXACTLY — `3**34 == float(3**34)` is False — so only a host that keeps the
+///   integer exact can answer it. See `PyHost::rounding_int_float_pair`.
 pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
     use NumOp::*;
     // A builtin-type subclass operand with no operator override delegates to its

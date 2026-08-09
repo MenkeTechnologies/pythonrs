@@ -58,8 +58,9 @@ pythonrs keeps Python the language and throws away CPython's execution model. It
 lexes and parses Python to an AST, lowers the AST to `fusevm` bytecode, and runs
 the bytecode on a stack VM with a Cranelift JIT. Arithmetic and comparisons lower
 to native ops; Python-specific behavior — truthiness, `str`/`list` concat, bignum
-promotion, attribute and method dispatch — runs through a strict numeric hook and
-a numbered builtin-call protocol into the `PyHost` object heap.
+promotion, exact `int`-against-`float` comparison, attribute and method dispatch —
+runs through a strict numeric hook and a numbered builtin-call protocol into the
+`PyHost` object heap.
 
 Two things set it apart from every other standalone Python:
 

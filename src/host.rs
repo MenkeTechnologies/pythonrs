@@ -4293,14 +4293,14 @@ impl PyHost {
                     if let (Some(x), Some(y)) = (self.big_val(a), self.big_val(b)) {
                         return x == y;
                     }
-                    // A bignum equals a float only when the float is exactly that
-                    // integer — never by rounding both to the same double.
-                    if let (Some(x), Some(f)) = (self.big_val(a), self.float_val(b)) {
-                        return exact_big_eq_float(&x, f);
-                    }
-                    if let (Some(f), Some(y)) = (self.float_val(a), self.big_val(b)) {
-                        return exact_big_eq_float(&y, f);
-                    }
+                }
+                // An integer equals a float only when the float is EXACTLY that
+                // integer — never by rounding both to the same double. Not a
+                // bignum-only concern: `3**34` fits an `i64` and still has no
+                // `f64`, so `16677181699666569 == 16677181699666568.0` answered
+                // True until the pair was compared in the integer domain.
+                if let Some((x, f, _)) = self.rounding_int_float_pair(a, b) {
+                    return exact_int_cmp_float(&x, f) == Some(std::cmp::Ordering::Equal);
                 }
                 if let (Some(x), Some(y)) = (self.num_val(a), self.num_val(b)) {
                     return x == y;
@@ -4490,6 +4490,42 @@ impl PyHost {
             Value::Obj(_) => self.base_payload_num(v).and_then(|p| self.as_int(&p)),
             _ => None,
         }
+    }
+
+    /// `v` as an exact integer, but ONLY when its magnitude is past the point
+    /// where `f64` stops holding every integer — a heap bignum always, an `i64`
+    /// (or an `int`-subclass payload) only past 2^53. `None` means the plain
+    /// `f64` reading of `v` is already exact.
+    fn lossy_int_val(&self, v: &Value) -> Option<num_bigint::BigInt> {
+        if matches!(v, Value::Obj(_)) {
+            if let Some(PyObj::BigInt(b)) = self.get(v) {
+                return Some(b.clone());
+            }
+        }
+        self.as_int(v)
+            .filter(|n| f64_would_round(*n))
+            .map(num_bigint::BigInt::from)
+    }
+
+    /// A mixed integer/float pair, in either operand order, whose integer is too
+    /// large to survive the trip through `f64` — the only pair shape that cannot
+    /// be resolved by reading both operands as doubles. Yields the exact integer,
+    /// the float, and whether the integer was the LEFT operand.
+    ///
+    /// `None` for every pair the `f64` route already answers exactly: two
+    /// integers, two floats, a small integer against a float, a non-numeric.
+    fn rounding_int_float_pair(
+        &self,
+        a: &Value,
+        b: &Value,
+    ) -> Option<(num_bigint::BigInt, f64, bool)> {
+        if let Some(f) = self.float_val(b) {
+            return self.lossy_int_val(a).map(|x| (x, f, true));
+        }
+        if let Some(f) = self.float_val(a) {
+            return self.lossy_int_val(b).map(|x| (x, f, false));
+        }
+        None
     }
 
     /// The native numeric payload of a builtin-subclass instance whose base is
@@ -5444,15 +5480,42 @@ pub fn big_range_len(
     }
 }
 
-/// Whether a bignum is EXACTLY the value a float holds. Both sides are converted
-/// to the same exact integer domain rather than to a common `f64`, so no rounding
-/// can make two different numbers agree.
-fn exact_big_eq_float(b: &num_bigint::BigInt, f: f64) -> bool {
+/// Whether reading `n` as an `f64` would land on a DIFFERENT number. Past 2^53
+/// the doubles are spaced more than 1 apart, so consecutive integers collapse
+/// onto a shared neighbour and two distinct values compare equal. Mirrors the
+/// gate fusevm applies before handing a mixed int/float pair to this host.
+#[inline]
+fn f64_would_round(n: i64) -> bool {
+    n.unsigned_abs() > (1u64 << 53)
+}
+
+/// The EXACT ordering of an integer against a float. Both sides are resolved in
+/// the integer domain rather than as a common `f64`, so no rounding can make two
+/// different numbers agree — Python compares `int` against `float` exactly at any
+/// magnitude, unlike the JVM languages that promote the integer to a double.
+/// `None` for a NaN, which is unordered against everything.
+fn exact_int_cmp_float(i: &num_bigint::BigInt, f: f64) -> Option<std::cmp::Ordering> {
     use num_traits::FromPrimitive;
-    if !f.is_finite() || f.fract() != 0.0 {
-        return false;
+    use std::cmp::Ordering;
+    if f.is_nan() {
+        return None;
     }
-    num_bigint::BigInt::from_f64(f).is_some_and(|x| &x == b)
+    if f.is_infinite() {
+        return Some(if f > 0.0 {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        });
+    }
+    // `floor(f)` is integral, so its `BigInt` is exact. With `n = floor(f)` and
+    // `n <= f < n+1`, an integer `i != n` is settled by `i.cmp(&n)` alone; only
+    // `i == n` needs the fraction, where any leftover makes `f` the larger.
+    let n = num_bigint::BigInt::from_f64(f.floor())?;
+    Some(i.cmp(&n).then(if f.fract() == 0.0 {
+        Ordering::Equal
+    } else {
+        Ordering::Less
+    }))
 }
 
 /// Render tuple elements with Python's trailing comma for a 1-tuple.
@@ -5471,8 +5534,12 @@ fn bigint_to_f64(b: &num_bigint::BigInt) -> f64 {
 // ── arithmetic / comparison delegated from the numeric hook ──────────────────
 
 impl PyHost {
-    /// The strict numeric-hook path: `op` on operands where at least one is not a
-    /// native int/float (bool, bignum, str, list, …), or an int op overflowed.
+    /// The strict numeric-hook path. Usually `op` on operands where at least one
+    /// is not a native int/float (bool, bignum, str, list, …), but two plain
+    /// numbers reach it too: an int op that overflowed, an `x op= y` rebind, and
+    /// a mixed int/float pair whose integer is past 2^53 — which fusevm hands
+    /// over precisely BECAUSE reading it as an `f64` would answer the wrong
+    /// number. See `numeric_hook` and `rounding_int_float_pair`.
     pub fn arith(&mut self, op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
         use NumOp::*;
         // A CPython `Foreign` operand (stdlib-ffi): `date + timedelta`,
@@ -5851,6 +5918,16 @@ impl PyHost {
         if !a_is_float && !b_is_float {
             if let (Some(x), Some(y)) = (self.big_val(a), self.big_val(b)) {
                 return Ok(x.cmp(&y));
+            }
+        }
+        // A mixed integer/float pair orders in the integer domain too. The guard
+        // above deliberately skips a float operand, so until this arm existed
+        // EVERY mixed pair — bignum included, where `equal` was already exact —
+        // fell to the `f64` route below and called two different numbers Equal:
+        // `3**40 > float(3**40)` and `3**34 > float(3**34)` both answered False.
+        if let Some((x, f, int_on_left)) = self.rounding_int_float_pair(a, b) {
+            if let Some(ord) = exact_int_cmp_float(&x, f) {
+                return Ok(if int_on_left { ord } else { ord.reverse() });
             }
         }
         if let (Some(x), Some(y)) = (self.num_val(a), self.num_val(b)) {
