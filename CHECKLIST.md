@@ -90,8 +90,10 @@ dispatch; `[in-flight]` = being implemented in the current host pass.
       `Traceback (most recent call last):` block: the header, one
       `  File "<path>", line N, in <scope>` + the source line per frame (outermost
       first), then `ErrorType: message`. Line info comes from the compiler's
-      per-op line metadata (call/binop/subscript/attr/name ops carry the stmt
-      line); caret (`^^^`) markers are omitted for a first pass. Exit stays 1.
+      per-op line metadata: the call/binop/subscript/attribute/name ops, the
+      container displays (`{…}`, `[…]`, `(…)`) and the subscript STORE all carry
+      the stmt line. CPython 3.11+ fine-grained caret anchors (`~^^^`, `~~^~~`)
+      are drawn from the matching span table. Exit stays 1.
 - [x] **`sys` completeness** — `stdin`/`stdout`/`stderr` file objects
       (`print(file=sys.stderr)` routes correctly), `version` (reports the emulated
       `3.14.6`), `version_info` (a namedtuple), `platform`, `maxsize`, `path`
@@ -237,9 +239,11 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
       key in a thread-local pending table that `to_key` reads. Default identity
       hashing (no user `__hash__`) is resolved inline; `__eq__` without `__hash__`
       or `__hash__ = None` raises `unhashable type`. `hash(inst)` returns the raw
-      `__hash__` result. Boundary: instance↔builtin cross-type key unification
-      (`{1: 'a'}[C()]` where `C().__eq__(1)`) is not collapsed — instance keys
-      only collapse onto other instance keys.
+      `__hash__` result. `prepare_key` walks INTO a `tuple`/`frozenset` key, so a
+      value-keyed object nested inside one (`{(P(1),): 5}`) is prepared too, and
+      collapse candidates are gathered at every depth. Boundary: instance↔builtin
+      cross-type key unification (`{1: 'a'}[C()]` where `C().__eq__(1)`) is not
+      collapsed — instance keys only collapse onto other instance keys.
 - [x] **`type(x)` returns a real class** — FIXED: `type(x)` returns a `Class` for
       user classes and a builtin-type object for builtins; both `==` (by name) and
       `is` (types are conceptual singletons) work, so `type(5)==int`, `type(5) is int`,
@@ -467,7 +471,10 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
       `issubset`/`issuperset` now also accept any iterable.
 - [x] **`type([])`/`type({})`/… print `<class 'list'>`** — FIXED, and the instance
       dunders resolve too: `[].__class__` → `<class 'list'>`, `[].__len__()` → `0`,
-      unbound `str.lower("AB")` → `"ab"`.
+      unbound `str.lower("AB")` → `"ab"`. The BINARY OPERATOR slots are bound
+      methods as well (`{'a':1}.__ior__({'b':2})`, `[1].__add__([2])`,
+      `{1,2}.__and__({2})`, `'a'.__mul__(3)`) — each type exposes exactly
+      CPython's instance set, and the same table feeds `dir()`.
 - [x] **set repr ordering** — FIXED for the deterministic subset: `set`/`frozenset`
       of machine ints now repr and iterate in CPython's open-addressing table order
       (`setobject.c` faithful port — `set_add_entry` perturb+`LINEAR_PROBES`, the
