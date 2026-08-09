@@ -4930,9 +4930,9 @@ fn gen_walrus(seed: u64) -> Vec<String> {
             "    print('SE')".into(),
         ],
         // A walrus inside a lambda default / nested comprehension.
-        6 => vec![
-            format!("print([[(t := i * j) for j in range(2)] for i in range({n} % 3 + 1)], t)"),
-        ],
+        6 => vec![format!(
+            "print([[(t := i * j) for j in range(2)] for i in range({n} % 3 + 1)], t)"
+        )],
         _ => vec![
             format!("total = 0"),
             format!("for i in range({n}):"),
