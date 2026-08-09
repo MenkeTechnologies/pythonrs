@@ -5247,6 +5247,201 @@ fn gen_excgroup(seed: u64) -> Vec<String> {
     }
 }
 
+/// Containers whose elements key by VALUE rather than by identity — a user
+/// instance defining `__hash__` + `__eq__`, or a bridged CPython object (an
+/// `enum` member, a `Decimal`). Every shape here puts such elements in TWO
+/// independently built containers and then relates them (`& | - ^`, the subset
+/// order, `==`, `issubset`/`isdisjoint`, the `*_update` mutators, `dict |` /
+/// `dict.update`, `dict_keys` view algebra), which is exactly what a
+/// same-container membership test cannot exercise.
+///
+/// The `__hash__` body is drawn per seed, including deliberately colliding
+/// hashes (`0`, `self.v % 2`), so the equality scan that resolves a collision is
+/// hit as often as the trivially-distinct case.
+fn gen_valuekey(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    const VK_INTS: &[&str] = &["0", "1", "2", "3", "4", "5"];
+    const HASHES: &[&str] = &["hash(self.v)", "0", "self.v % 2", "self.v // 2"];
+    let (a, b, c, d) = (
+        pick(r, VK_INTS),
+        pick(r, VK_INTS),
+        pick(r, VK_INTS),
+        pick(r, VK_INTS),
+    );
+    let mut out: Vec<String> = vec![
+        "class P:".into(),
+        "    def __init__(self, v): self.v = v".into(),
+        format!("    def __hash__(self): return {}", pick(r, HASHES)),
+        "    def __eq__(self, o): return isinstance(o, P) and self.v == o.v".into(),
+        "    def __repr__(self): return 'P(%d)' % self.v".into(),
+        "def S(x): return sorted(e.v for e in x)".into(),
+        "def D(x): return sorted((k.v, v) for k, v in x.items())".into(),
+    ];
+    match r.below(12) {
+        // The four binary set operators across two separately built sets.
+        0 => {
+            out.push(format!("A = {{P({a}), P({b})}}"));
+            out.push(format!("B = {{P({b}), P({c})}}"));
+            out.push("print(S(A & B), S(A | B), S(A - B), S(A ^ B))".into());
+            out.push("print(S(B - A), len(A), len(B), S(A))".into());
+        }
+        // Equality and the subset partial order.
+        1 => {
+            out.push(format!("A = {{P({a}), P({b})}}"));
+            out.push(format!("B = {{P({a}), P({b}), P({c})}}"));
+            out.push("print(A == B, A != B, A <= B, A < B, A >= B, A > B)".into());
+            out.push(format!(
+                "print(A == {{P({a}), P({b})}}, {{P({a})}} == {{P({a})}})"
+            ));
+        }
+        // `issubset`/`issuperset`/`isdisjoint`, with both a set and a list arg.
+        2 => {
+            out.push(format!("A = {{P({a}), P({b})}}"));
+            out.push(format!(
+                "print(A.issubset({{P({a}), P({b}), P({c})}}), A.issubset([P({a}), P({b})]))"
+            ));
+            out.push(format!(
+                "print(A.issuperset([P({a})]), A.isdisjoint({{P({c})}}), A.isdisjoint([P({a})]))"
+            ));
+        }
+        // The in-place operators (identity-preserving mutation).
+        3 => {
+            out.push(format!("A = {{P({a}), P({b})}}"));
+            out.push(format!("A |= {{P({b}), P({c})}}"));
+            out.push("print(S(A), len(A))".into());
+            out.push(format!("A &= {{P({b}), P({c}), P({d})}}"));
+            out.push("print(S(A))".into());
+            out.push(format!("A -= {{P({c})}}"));
+            out.push("print(S(A))".into());
+            out.push(format!("A ^= {{P({a}), P({b})}}"));
+            out.push("print(S(A))".into());
+        }
+        // The named method forms, including the variadic ones.
+        4 => {
+            out.push(format!("A = {{P({a}), P({b})}}"));
+            out.push(format!("print(S(A.union([P({c})])), S(A.intersection({{P({b})}})), S(A.difference([P({a})])))"));
+            out.push(format!(
+                "print(S(A.symmetric_difference({{P({b}), P({c})}})), S(A))"
+            ));
+            out.push(format!(
+                "print(S(A.union({{P({c})}}, [P({d})])), S(A.intersection(A, [P({a})])))"
+            ));
+        }
+        // The mutating updates.
+        5 => {
+            out.push(format!("A = {{P({a})}}"));
+            out.push(format!("A.update({{P({b})}}, [P({c})])"));
+            out.push("print(S(A))".into());
+            out.push(format!("A.intersection_update({{P({b}), P({c}), P({a})}})"));
+            out.push("print(S(A))".into());
+            out.push(format!("A.difference_update([P({b})])"));
+            out.push("print(S(A))".into());
+            out.push(format!("A.symmetric_difference_update({{P({c}), P({d})}})"));
+            out.push("print(S(A))".into());
+            out.push(format!("A.update([P({a}), P({a})])"));
+            out.push("print(S(A), len(A))".into());
+        }
+        // dict merge / update, where a value-equal key must OVERWRITE, not add.
+        6 => {
+            out.push(format!("d1 = {{P({a}): 'x', P({b}): 'y'}}"));
+            out.push(format!("d2 = {{P({b}): 'Y', P({c}): 'Z'}}"));
+            out.push("print(D(d1 | d2), D(d2 | d1))".into());
+            out.push("d3 = dict(d1)".into());
+            out.push("d3.update(d2)".into());
+            out.push("print(D(d3), len(d3))".into());
+            out.push("d4 = dict(d1)".into());
+            out.push(format!("d4.update([(P({c}), 'q'), (P({a}), 'r')])"));
+            out.push("print(D(d4), len(d4))".into());
+            out.push("print(d1 == dict(d1), d1 == d2)".into());
+        }
+        // `dict_keys` views take part in set algebra.
+        7 => {
+            out.push(format!("d1 = {{P({a}): 1, P({b}): 2}}"));
+            out.push(format!(
+                "print(S(d1.keys() & {{P({b}), P({c})}}), S(d1.keys() | {{P({c})}}))"
+            ));
+            out.push(format!(
+                "print(S(d1.keys() - {{P({a})}}), S(d1.keys() ^ {{P({a}), P({c})}}))"
+            ));
+            out.push(format!(
+                "print(sorted(k.v for k in d1), d1.keys() == {{P({a}), P({b})}})"
+            ));
+        }
+        // frozenset: immutable, hashable, and algebra against a plain set.
+        8 => {
+            out.push(format!("F = frozenset({{P({a}), P({b})}})"));
+            out.push(format!("G = frozenset({{P({b}), P({c})}})"));
+            out.push("print(S(F & G), S(F | G), S(F - G), S(F ^ G))".into());
+            out.push(format!(
+                "print(F == frozenset({{P({a}), P({b})}}), F == G, F <= (F | G))"
+            ));
+            out.push(format!(
+                "print(S({{P({c})}} | F), type(F & G).__name__, len({{F, frozenset(F)}}))"
+            ));
+        }
+        // Bridged CPython objects (`Foreign` keys) hit the same collapse path.
+        9 => {
+            if r.below(2) == 0 {
+                out.push("import enum".into());
+                out.push("class Col(enum.Enum):".into());
+                out.push("    R = 1".into());
+                out.push("    G = 2".into());
+                out.push("    B = 3".into());
+                out.push("X = {Col.R, Col.G}".into());
+                out.push("Y = {Col.G, Col.B}".into());
+                out.push("N = lambda s: sorted(e.name for e in s)".into());
+                out.push("print(N(X & Y), N(X | Y), N(X - Y), N(X ^ Y))".into());
+                out.push(
+                    "print(X == {Col.R, Col.G}, X.issubset({Col.R, Col.G, Col.B}), X.isdisjoint({Col.B}))"
+                        .into(),
+                );
+                out.push("m = {Col.R: 1}".into());
+                out.push("m.update({Col.R: 2, Col.G: 3})".into());
+                out.push("print(sorted((k.name, v) for k, v in m.items()), len(m))".into());
+            } else {
+                out.push("from decimal import Decimal as Dc".into());
+                out.push(format!("X = {{Dc('{a}.5'), Dc('{b}.5')}}"));
+                out.push(format!("Y = {{Dc('{b}.5'), Dc('{c}.5')}}"));
+                out.push("N = lambda s: sorted(str(e) for e in s)".into());
+                out.push("print(N(X & Y), N(X | Y), N(X - Y), N(X ^ Y))".into());
+                out.push(format!(
+                    "print(X == {{Dc('{a}.5'), Dc('{b}.5')}}, X.isdisjoint({{Dc('{c}.5')}}))"
+                ));
+                out.push(format!("m = {{Dc('{a}.5'): 1}}"));
+                out.push(format!("m.update({{Dc('{a}.5'): 2}})"));
+                out.push("print(sorted((str(k), v) for k, v in m.items()), len(m))".into());
+            }
+        }
+        // Value-keyed elements mixed with plain ints in the same containers —
+        // a `P` must never collapse onto an int of the same hash.
+        10 => {
+            out.push(format!("A = {{P({a}), {b}}}"));
+            out.push(format!("B = {{P({b}), {a}}}"));
+            out.push("T = lambda s: sorted(repr(e) for e in s)".into());
+            out.push("print(T(A & B), T(A | B), T(A - B))".into());
+            out.push(format!(
+                "print({{{a}}}.issubset([P({a})]), {{{a}}}.isdisjoint([P({a})]))"
+            ));
+            out.push(format!(
+                "print({{P({a})}}.isdisjoint([{a}]), len({{P({a}), {a}}}))"
+            ));
+        }
+        // Construction-time dedup vs. the cross-container ops, and empty operands.
+        _ => {
+            out.push(format!("A = {{P({a}), P({a}), P({b})}}"));
+            out.push("print(len(A), S(A))".into());
+            out.push(format!("B = set([P(x) for x in ({a}, {b}, {c})])"));
+            out.push("print(len(B), S(B))".into());
+            out.push("print(S(A | set()), S(set() | A), len(A & set()), S(A - set()))".into());
+            out.push("C2 = A.copy()".into());
+            out.push(format!("C2.add(P({a}))"));
+            out.push("print(len(C2), len(A), S(C2))".into());
+            out.push(format!("print(S(A.union(*[[P({c})], [P({d})]])))"));
+        }
+    }
+    out
+}
+
 /// CPython's `Did you mean: 'x'?` hint on an uncaught `NameError`/
 /// `AttributeError`. Every case is uncaught, so this mode is only meaningful
 /// under `--stderr`; the hint is a property of the rendered traceback and never
@@ -5405,6 +5600,7 @@ enum Mode {
     Ctxmgr,
     Excgroup,
     Suggest,
+    Valuekey,
 }
 
 const REAL_MODES: &[Mode] = &[
@@ -5468,6 +5664,7 @@ const REAL_MODES: &[Mode] = &[
     Mode::Ctxmgr,
     Mode::Excgroup,
     Mode::Suggest,
+    Mode::Valuekey,
 ];
 
 /// Generate the statement list for a seed in the selected mode. `Mixed` rotates
@@ -5538,6 +5735,7 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Ctxmgr => gen_ctxmgr(seed),
         Mode::Excgroup => gen_excgroup(seed),
         Mode::Suggest => gen_suggest(seed),
+        Mode::Valuekey => gen_valuekey(seed),
     }
 }
 
@@ -5604,6 +5802,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Ctxmgr => "ctxmgr",
         Mode::Excgroup => "excgroup",
         Mode::Suggest => "suggest",
+        Mode::Valuekey => "valuekey",
     }
 }
 
@@ -5670,6 +5869,7 @@ fn mode_from_name(s: &str) -> Option<Mode> {
         Mode::Ctxmgr,
         Mode::Excgroup,
         Mode::Suggest,
+        Mode::Valuekey,
     ];
     ALL.iter().copied().find(|&m| mode_name(m) == s)
 }
@@ -5797,10 +5997,13 @@ fn parse_args() -> Args {
     let mut jobs = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
+    // Per-process report path: concurrent runs in one checkout (several agents
+    // fuzzing the same tree) must not overwrite each other's divergence dump.
+    // `-o` still pins an explicit path.
     let mut out_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target")
         .join("parity-fuzz")
-        .join("divergences.txt");
+        .join(format!("divergences-{}.txt", std::process::id()));
 
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -5969,6 +6172,12 @@ fn main() {
     let next = AtomicU64::new(0);
     let checked = AtomicU64::new(0);
     let timeouts = AtomicU64::new(0);
+    // Cases the ORACLE did not actually answer — it timed out, exited non-zero,
+    // or printed nothing. Two failing sides compare equal, so such a case scores as a pass
+    // while measuring nothing; a mode whose generator emits programs CPython
+    // rejects would otherwise report a clean run. Counted and reported apart
+    // from `checked` so the headline number can never be inflated by them.
+    let barren = AtomicU64::new(0);
     let stop = AtomicBool::new(false);
     let divergences: Mutex<Vec<(u64, String)>> = Mutex::new(Vec::new());
     let start = Instant::now();
@@ -6000,6 +6209,9 @@ fn main() {
                 let done = checked.fetch_add(1, Ordering::Relaxed) + 1;
                 if o.timed_out || r.timed_out {
                     timeouts.fetch_add(1, Ordering::Relaxed);
+                }
+                if o.timed_out || o.exit != 0 || o.stdout.is_empty() {
+                    barren.fetch_add(1, Ordering::Relaxed);
                 }
                 // oracle-side timeout ⇒ pathological case; not a parity gap.
                 if !o.timed_out && differs(&o, &r) {
@@ -6064,6 +6276,7 @@ fn main() {
 
     let checked = checked.load(Ordering::Relaxed);
     let timeouts = timeouts.load(Ordering::Relaxed);
+    let barren = barren.load(Ordering::Relaxed);
     let mut divergences: Vec<(u64, String)> = divergences.into_inner().unwrap();
     divergences.sort_by_key(|(seed, _)| *seed);
     let divergences: Vec<String> = divergences.into_iter().map(|(_, r)| r).collect();
@@ -6105,7 +6318,9 @@ fn main() {
         "\nfuzzed {checked} cases in {:.1}s ({:.0}/s)\n\
          oracle      : {}\n\
          divergences : {} ({} known / {} new)\n\
-         timeouts    : {}",
+         timeouts    : {}\n\
+         barren      : {} (oracle timed out, exited non-zero, or printed nothing — measured nothing)\n\
+         productive  : {}",
         elapsed.as_secs_f64(),
         checked as f64 / elapsed.as_secs_f64().max(0.001),
         oracle,
@@ -6113,6 +6328,8 @@ fn main() {
         known,
         new_records.len(),
         timeouts,
+        barren,
+        checked.saturating_sub(barren),
     );
 
     if !divergences.is_empty() {
@@ -6151,5 +6368,20 @@ fn main() {
     }
     if known > 0 {
         println!("all {known} divergences are known (in baseline) — OK");
+    }
+    // A run that did not actually execute the cases it was asked for must not
+    // read as clean. `--count 0`, a worker that never started, or a corpus the
+    // oracle could not answer all end here with "divergences : 0" — the exact
+    // shape of a false pass. Only reachable when no divergence was reported
+    // (that path exits above), so a `--max-report` stop is not caught by it.
+    let shortfall = args.count.saturating_sub(checked);
+    let productive = checked.saturating_sub(barren);
+    if shortfall > 0 || productive == 0 {
+        println!(
+            "\nFAILED: {shortfall} of {} case(s) never ran and {productive} produced a comparable \
+             answer — this run measured nothing, it is not a pass",
+            args.count
+        );
+        std::process::exit(3);
     }
 }

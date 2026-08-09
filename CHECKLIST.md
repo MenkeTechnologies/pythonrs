@@ -13,8 +13,13 @@ the ordered, grounded gap list between here and that goal.
   exact observed diff.
 - **`parity-fuzz`** (`src/bin/parity_fuzz.rs`) — differential fuzzer; **50,000
   mixed cases → 0 divergences** as of 2026-08-02 (snapshot at the bottom). It drove
-  the numeric/format classes to zero; per-expression it proves per-op parity, and it
-  is now a regression net rather than a discovery tool.
+  the numeric/format classes to zero; per-expression it proves per-op parity.
+  It is a discovery tool exactly as far as its generator reaches: the whole
+  value-keyed-container class (elements keying through user `__hash__`/`__eq__`)
+  was invisible to it — the generator contained zero occurrences of `__hash__` —
+  so no number it produced said anything about that surface. The `valuekey` mode
+  added on 2026-08-09 found three real divergences in its first 400 cases. Before
+  trusting a clean number, grep the generator for the construct.
 - **Whole-script gauge** — `scripts/dropin_check.sh` + `tests/dropin/*.py`. Runs each
   representative script (file I/O, argv, subprocess, common stdlib, real composites
   like read→count→sort) through pythonrs and `python3` with identical argv and an

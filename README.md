@@ -217,7 +217,8 @@ corpus.
 Beyond the fixed corpus, the `parity-fuzz` binary is a differential fuzzer. It
 generates thousands of grammar-driven, deterministic-output snippets — biased
 toward the historically fragile areas (float `repr`, integer `//`/`%` sign
-rules, bignum, slices, the `format` mini-language, string methods) — runs each
+rules, bignum, slices, the `format` mini-language, string methods, containers
+whose elements key through user `__hash__`/`__eq__`) — runs each
 through `python -c` and the reference `python3 -c`, and reports every case where
 stdout or accept/reject diverges. Each case is seeded, so any divergence is
 delta-debugged to a minimal reproducer and replays exactly:
@@ -232,6 +233,10 @@ cargo build --bin parity-fuzz
 The generator never emits nondeterministic output, so every reported divergence
 is a real gap. `PYTHONRS_FUZZ_PYTHON` names the reference interpreter; a
 `--baseline` allowlist keeps known gaps from failing while new ones exit non-zero.
+A clean run has to be a run that measured something: cases the reference did not
+answer (timed out, exited non-zero, or printed nothing) are reported as `barren`
+and excluded from `productive`, and a run that executed no case — or none the
+reference answered — exits non-zero instead of printing `divergences : 0`.
 
 ## [0x07] STATUS & ROADMAP
 
