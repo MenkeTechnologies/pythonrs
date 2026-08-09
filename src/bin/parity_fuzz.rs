@@ -5503,6 +5503,194 @@ fn gen_valuekey(seed: u64) -> Vec<String> {
     out
 }
 
+/// Raw `hash()` VALUES, not hash comparisons.
+///
+/// Every pre-existing `hash(` site in this generator compares `hash(x) ==
+/// hash(y)`. That shape is satisfied by ANY self-consistent hash function,
+/// including a systematically wrong one — which is exactly how a `hash()` that
+/// matched CPython for no type at all stayed invisible here. A printed raw hash
+/// cannot pass by accident: the only way to agree is to emit CPython's exact
+/// number.
+///
+/// Restricted to the hashes that are actually specified and reproducible:
+///
+/// * numeric (`int`/`float`/`complex`/`bool`) — `hash(n) == n mod (2**61-1)`
+///   and the modular extension that keeps equal numbers hashing equally. Stable
+///   under ANY `PYTHONHASHSEED`.
+/// * `str`/`bytes` — SipHash, randomized per process, so reproducible ONLY
+///   because this harness pins `PYTHONHASHSEED=0` on both children.
+/// * `None`, `tuple`, `frozenset` — derived from the above.
+///
+/// Deliberately EXCLUDED, having been measured as pointer-derived and therefore
+/// unstable run-to-run even at `PYTHONHASHSEED=0` (so no implementation can
+/// match them, and probing them would emit permanent false divergences):
+/// `hash(float('nan'))`, `hash(...)`, `hash(NotImplemented)`, and the default
+/// identity hash of a user instance.
+fn gen_hashval(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    // Numeric subjects, weighted at the boundaries of the `2**61-1` modulus:
+    // the reduction is invisible below it and only a value at/over the modulus
+    // distinguishes "return n" from "return n % P".
+    const INTS: &[&str] = &[
+        "0",
+        "1",
+        "-1",
+        "2",
+        "-2",
+        "7",
+        "-7",
+        "255",
+        "-255",
+        "2**61-1",
+        "-(2**61-1)",
+        "2**61",
+        "-(2**61)",
+        "2**61+1",
+        "2**62",
+        "-(2**62)",
+        "2**63-1",
+        "2**63",
+        "-(2**63)",
+        "2**64",
+        "-(2**64)",
+        "2**64+7",
+        "2**70+12345",
+        "-(2**70+12345)",
+        "2**128",
+        "-(2**128)",
+        "10**30",
+        "-(10**30)",
+        "2**61*3+5",
+        "-(2**61*3+5)",
+    ];
+    const FLOATS: &[&str] = &[
+        "0.0",
+        "-0.0",
+        "1.0",
+        "-1.0",
+        "0.5",
+        "-0.5",
+        "2.5",
+        "-2.5",
+        "0.1",
+        "3.14",
+        "-3.14",
+        "1e300",
+        "-1e300",
+        "1e-300",
+        "2.0**60",
+        "2.0**61",
+        "2.0**62",
+        "float('inf')",
+        "float('-inf')",
+        "1.5e16",
+        "float(2**53)",
+        "1/3",
+        "-(1/3)",
+    ];
+    const OTHERS: &[&str] = &[
+        "None",
+        "True",
+        "False",
+        "1+2j",
+        "3-4j",
+        "complex(0,1)",
+        "complex(2.5,-0.5)",
+        "''",
+        "'a'",
+        "'abc'",
+        "'hello world'",
+        "'\\u00e9'",
+        "'\\u65e5'",
+        "b''",
+        "b'a'",
+        "b'abc'",
+    ];
+    // Any subject whose hash is specified — the element pool for the containers.
+    let atom = |r: &mut Rng| -> String {
+        match r.below(3) {
+            0 => (*pick(r, INTS)).to_string(),
+            1 => (*pick(r, FLOATS)).to_string(),
+            _ => (*pick(r, OTHERS)).to_string(),
+        }
+    };
+    let mut out = Vec::new();
+    match seed % 7 {
+        // Bare integer hashes, including the modular reduction.
+        0 => {
+            for _ in 0..6 {
+                let a = pick(r, INTS);
+                out.push(format!("print(hash({a}))"));
+            }
+        }
+        // Float hashes, and the numeric-tower rule that ties them to `int`.
+        1 => {
+            for _ in 0..4 {
+                let a = pick(r, FLOATS);
+                out.push(format!("print(hash({a}))"));
+            }
+            let n = pick(r, INTS);
+            out.push(format!("print(hash({n}), hash(float({n})) if abs({n}) < 2**52 else hash({n}))"));
+        }
+        // `None`/`bool`/`complex`/`str`/`bytes`.
+        2 => {
+            for _ in 0..6 {
+                let a = pick(r, OTHERS);
+                out.push(format!("print(hash({a}))"));
+            }
+        }
+        // Tuple hashes: the xxPRIME accumulator over element hashes, so a wrong
+        // element hash AND a wrong accumulator both surface here.
+        3 => {
+            out.push("print(hash(()))".into());
+            for _ in 0..4 {
+                let a = atom(r);
+                let b = atom(r);
+                out.push(format!("print(hash(({a},)), hash(({a}, {b})))"));
+            }
+        }
+        // Nested tuples and longer tuples — the accumulator's length term.
+        4 => {
+            let a = atom(r);
+            let b = atom(r);
+            let c = atom(r);
+            out.push(format!("print(hash(({a}, {b}, {c})))"));
+            out.push(format!("print(hash((({a}, {b}), {c})))"));
+            out.push(format!("print(hash(({a}, ({b}, ({c},)))))"));
+            out.push(format!("print(hash(({a},) * 4))"));
+            out.push(format!("print(hash(({a}, {b}) + ({c},)))"));
+        }
+        // `frozenset` hashes: order-independent, so the probe also asserts the
+        // shuffle is commutative rather than accidentally insertion-ordered.
+        5 => {
+            out.push("print(hash(frozenset()))".into());
+            let a = atom(r);
+            let b = atom(r);
+            let c = atom(r);
+            out.push(format!("print(hash(frozenset([{a}])))"));
+            out.push(format!(
+                "print(hash(frozenset([{a}, {b}])), hash(frozenset([{b}, {a}])))"
+            ));
+            out.push(format!("print(hash(frozenset([{a}, {b}, {c}])))"));
+            out.push(format!("print(hash((frozenset([{a}, {b}]), {c})))"));
+        }
+        // The cross-type collapse the numeric hash exists to produce: a value
+        // that is equal across types must hash equal AND share one dict slot.
+        _ => {
+            let n = pick(r, INTS);
+            out.push(format!("v = {n}"));
+            out.push("print(hash(v), hash(-v), hash(v) == hash(v + 0))".into());
+            let f = pick(r, FLOATS);
+            out.push(format!("w = {f}"));
+            out.push("print(hash(w), hash(-w) if w == w else 0)".into());
+            out.push("print(hash(0.0) == hash(-0.0) == hash(0) == hash(False))".into());
+            out.push("print(hash(1) == hash(1.0) == hash(True) == hash(1+0j))".into());
+            out.push("print(len({1, 1.0, True}), len({0, 0.0, False, -0.0}))".into());
+        }
+    }
+    out
+}
+
 /// `re` match POSITIONS over subjects that are not all-ASCII.
 ///
 /// Every other generator in this file draws its strings from `STRS`/`WORDS`,
@@ -5784,6 +5972,7 @@ enum Mode {
     Suggest,
     Valuekey,
     Regex,
+    Hashval,
 }
 
 const REAL_MODES: &[Mode] = &[
@@ -5849,6 +6038,7 @@ const REAL_MODES: &[Mode] = &[
     Mode::Suggest,
     Mode::Valuekey,
     Mode::Regex,
+    Mode::Hashval,
 ];
 
 /// Generate the statement list for a seed in the selected mode. `Mixed` rotates
@@ -5921,6 +6111,7 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Suggest => gen_suggest(seed),
         Mode::Valuekey => gen_valuekey(seed),
         Mode::Regex => gen_regex(seed),
+        Mode::Hashval => gen_hashval(seed),
     }
 }
 
@@ -5989,6 +6180,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Suggest => "suggest",
         Mode::Valuekey => "valuekey",
         Mode::Regex => "regex",
+        Mode::Hashval => "hashval",
     }
 }
 
@@ -6057,6 +6249,7 @@ fn mode_from_name(s: &str) -> Option<Mode> {
         Mode::Suggest,
         Mode::Valuekey,
         Mode::Regex,
+        Mode::Hashval,
     ];
     ALL.iter().copied().find(|&m| mode_name(m) == s)
 }
