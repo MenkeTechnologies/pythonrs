@@ -804,3 +804,58 @@ Still open:
   a scan over a huge subject materializes all of it.
 - **`re.Scanner` and `re.RegexFlag` are absent** (the flag constants exist as
   plain ints; `re.A`/`re.I`/`re.M`/`re.S`/`re.X` all resolve).
+
+### `hash()` values, and the containers that follow from them
+
+**`hash(x)` does not return CPython's number for any type.** Every non-instance
+key is hashed with Rust's `DefaultHasher` (`builtins::hash_key`), so the value is
+internally consistent but bears no relation to CPython's. Measured against
+CPython 3.14.6:
+
+| expression | pythonrs | CPython |
+| --- | --- | --- |
+| `hash(0)`, `hash(1)`, `hash(-1)` | `110868633497842534`, `-2132787436984217633`, `-191408919806194774` | `0`, `1`, `-2` |
+| `hash(2**61-1)`, `hash(2**61)`, `hash(2**62)` | arbitrary | `0`, `1`, `2` |
+| `hash(0.5)`, `hash(-0.5)` | arbitrary | `1152921504606846976`, `-1152921504606846976` |
+| `hash(float('inf'))`, `hash(float('-inf'))` | arbitrary | `314159`, `-314159` |
+| `hash(True)`, `hash(False)`, `hash(None)` | arbitrary | `1`, `0`, `4238894112` |
+| `hash(1+2j)` | arbitrary | `2000007` |
+| `hash(())`, `hash((1,2))`, `hash(frozenset([1]))` | arbitrary | `5740354900026072187`, `-3550055125485641917`, `-558064481276695278` |
+
+This is not an implementation detail CPython leaves open. The numeric hash is
+specified — `hash(n) == n % (2**61 - 1)` with `-1` mapping to `-2`, and the same
+modular scheme extended to `float`, `complex` and `Fraction` so that any two
+equal numbers hash equally. `str`/`bytes` hashing IS randomized (SipHash under
+`PYTHONHASHSEED`) and is the documented boundary; the numeric side is not.
+
+**The consequence is a container bug, not just a cosmetic number.** A bridged
+CPython object carries CPython's own hash (`PKey::Foreign { hash, .. }` from
+`ffi::foreign_hash`), while a native `int`/`float` carries the `DefaultHasher`
+one — so a value-equal pair straddling the bridge lands in two different slots
+and never collapses:
+
+```
+len({1, Decimal(1)})            # pythonrs 2, CPython 1
+len({0.5, Fraction(1, 2)})      # pythonrs 2, CPython 1
+d = {1: 'int'}; d[Decimal(1)] = 'dec'
+d                               # pythonrs {1: 'int', Decimal('1'): 'dec'}
+                                # CPython  {1: 'dec'}
+```
+
+Both parts are one fix: give `hash_key` CPython's algorithm for `int`
+(`long_hash`, already ported as `host::bigint_pyhash` but applied only to a
+user `__hash__` RESULT — `host::cpython_int_hash` is the machine-int arm and is
+wrong above `2**61-1`, where it returns `n` instead of reducing), `float`
+(`_Py_HashDouble`), `complex` (`hashreal + 1000003 * hashimag`), `None`
+(`0xFCA86420`), `tuple` (the xxPRIME accumulator) and `frozenset`
+(`_shuffle_bits`); then widen `prepare_key_walk`'s collapse loop, which today
+only considers a candidate that is ALSO a `PKey::Foreign`, so a native key is
+never a collapse target for a foreign one or the reverse.
+
+The cross-type collapse WITHIN native numbers is already correct and must stay
+so: `len({1, 1.0, True})` is 1, `hash(1) == hash(1.0) == hash(True)`,
+`hash(0.0) == hash(-0.0)`, and `{1: 'a', 1.0: 'b', True: 'c'}` is `{1: 'c'}`.
+
+Not reachable from `parity-fuzz`: the six `hash(` sites in the generator all
+compare `hash(x) == hash(y)`, which any self-consistent hash satisfies. Closing
+this needs a mode that prints the raw value.
