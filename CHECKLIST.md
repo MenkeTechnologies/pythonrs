@@ -67,10 +67,14 @@ dispatch; `[in-flight]` = being implemented in the current host pass.
 - [x] **Custom `__getitem__` with a slice → stack-overflow SIGABRT** — FIXED:
       `repr_of` now formats `PyObj::Slice` directly (`slice(1, 5, 2)`) instead of
       delegating back to `str_of`, which caused infinite `str_of`↔`repr_of` recursion.
-- [x] **`itertools.islice` is eager → hangs on infinite generators** — RESOLVED via
-      the `stdlib-ffi` bridge: `itertools` is now the real CPython module, so
-      `islice`/`count`/`cycle` are natively lazy and `islice(count(), 5)` returns.
-      (The old hand-rolled eager `itertools` shadow was deleted.)
+- [x] **`itertools.islice` is eager → hangs on infinite generators** — FIXED:
+      `islice`/`count`/`cycle` are lazy and `list(islice(count(), 5))` returns
+      `[0, 1, 2, 3, 4]`. NOT via the `stdlib-ffi` bridge, as this line used to
+      claim: `itertools` is a NATIVE shadow in both builds and never reaches
+      CPython (`module_ffi_fallback` covers only math/collections/functools/
+      contextlib). It has no `__file__`, and `hasattr(itertools, 'batched')` is
+      `False` here against `True` in CPython 3.14.6 — a real CPython module
+      could not answer that way. The laziness is pythonrs's own.
 - [x] **`N in range(huge)` hangs** — FIXED: O(1) membership — integer in the
       arithmetic progression and within the half-open bounds (`host.rs contains`).
       Integral floats compare equal to their int value (`2.0 in range(5)` → True).

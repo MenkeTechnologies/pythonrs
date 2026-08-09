@@ -61,8 +61,9 @@ path = "src/bin/gen_docs.rs"
 
 # Differential parity harness: runs the corpus through pythonrs and the reference
 # `python3`, diffing stdout. Development tool — needs `python3` on PATH, so CI
-# never runs it; its frozen outputs live in tests/data/parity_expected.txt, which
-# tests/parity.rs replays with no `python3` installed.
+# never runs it. There is no frozen-output replay: this comment used to point at
+# tests/data/parity_expected.txt and tests/parity.rs, neither of which exists, so
+# nothing here runs without a `python3`.
 [[bin]]
 name = "parity"
 path = "src/bin/parity.rs"
