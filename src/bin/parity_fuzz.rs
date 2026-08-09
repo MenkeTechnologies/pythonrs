@@ -5503,6 +5503,127 @@ fn gen_valuekey(seed: u64) -> Vec<String> {
     out
 }
 
+/// `re` match POSITIONS over subjects that are not all-ASCII.
+///
+/// Every other generator in this file draws its strings from `STRS`/`WORDS`,
+/// which are pure ASCII — and on ASCII a byte offset and a codepoint offset are
+/// the same number, so an all-ASCII corpus cannot tell a `str`-indexing engine
+/// from a byte-indexing one. `re` was, on top of that, entirely unreachable
+/// here: `import re` appeared ZERO times in this file, so no case ever asked the
+/// regex engine for a position at all.
+///
+/// The subject pool therefore mixes 1-, 2-, 3- and 4-byte characters in one
+/// string. That defeats the two ways a wrong answer can still look right: a
+/// pure-ASCII subject makes byte==char, and a subject whose non-ASCII characters
+/// all have the SAME width makes byte==k*char for a fixed k, so a "divide by
+/// two" implementation would score a pass. With é (2), 日 (3) and 😀 (4) in the
+/// same subject no single factor maps bytes onto codepoints.
+///
+/// Positions are asked for in both directions: OUT of the engine (`span`,
+/// `start`, `end`, `pos`, `endpos`, the `repr`) and INTO it (`pos`/`endpos`
+/// arguments to `Pattern.search`/`match`, which CPython counts in codepoints).
+/// A one-directional probe passes if both halves are wrong the same way.
+fn gen_regex(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    // (subject, a literal that occurs in it). Index 0 is all-ASCII on purpose:
+    // the mode has to keep proving the ASCII case as well as breaking it.
+    const SUBJ: &[(&str, &str)] = &[
+        ("'abcabc'", "b"),
+        ("'a\u{e9}b'", "b"),
+        ("'a\u{65e5}b'", "b"),
+        ("'a\u{1f600}b'", "b"),
+        ("'\u{e9}b\u{65e5}\u{672c}'", "b"),
+        ("'na\u{ef}ve caf\u{e9} \u{65e5}\u{672c} b'", "b"),
+        ("'\u{3b1}\u{3b2}b\u{3b3} \u{1f600}\u{e9}'", "b"),
+        ("'x\u{1f600}\u{e9}\u{65e5}b\u{65e5}\u{e9}\u{1f600}'", "b"),
+    ];
+    let (s, lit) = *pick(r, SUBJ);
+    let mut out: Vec<String> = vec!["import re".into(), format!("s = {s}")];
+    match r.below(10) {
+        // The three position accessors of one match, plus the repr (which
+        // renders the group-0 span itself).
+        0 => {
+            out.push(format!("m = re.search(r'{lit}', s)"));
+            out.push("print(m.start(), m.end(), m.span())".into());
+            out.push("print(repr(m), m.group())".into());
+            out.push("print(s[m.start():m.end()] == m.group(), len(s))".into());
+        }
+        // Every match of a one-character pattern: the spans have to walk the
+        // string one CODEPOINT at a time, whatever each one weighs in bytes.
+        1 => {
+            out.push("print([m.span() for m in re.finditer(r'.', s)])".into());
+            out.push("print([m.start() for m in re.finditer(r'.', s, re.S)])".into());
+            out.push("print([s[m.start():m.end()] for m in re.finditer(r'.', s)])".into());
+        }
+        // Group positions, named and numbered, including a group that did not
+        // participate (span (-1, -1) in CPython).
+        2 => {
+            out.push(format!("m = re.search(r'(?P<g>{lit})(.)?', s)"));
+            out.push("print(m.span(), m.span(1), m.span(2), m.span('g'))".into());
+            out.push("print(m.start('g'), m.end('g'), m.groupdict())".into());
+            out.push("print(m.lastindex, m.groups())".into());
+        }
+        // `pos`/`endpos` ARGUMENTS: CPython counts them in codepoints, so a
+        // byte-indexed engine either finds nothing or finds the wrong match.
+        3 => {
+            out.push("p = re.compile(r'.')".into());
+            out.push("print([p.search(s, i).span() for i in range(len(s))])".into());
+            out.push("print([p.match(s, i).group() for i in range(len(s))])".into());
+            out.push("print(p.search(s, 1, 2).span(), p.match(s, len(s)) is None)".into());
+        }
+        // The `pos`/`endpos` ATTRIBUTES of the resulting match.
+        4 => {
+            out.push("p = re.compile(r'.')".into());
+            out.push("m = p.search(s)".into());
+            out.push("print(m.pos, m.endpos, m.string == s)".into());
+            out.push("m2 = p.search(s, 1)".into());
+            out.push("print(m2.pos, m2.endpos, m2.span())".into());
+        }
+        // Zero-width matches: one at every codepoint boundary and no more.
+        5 => {
+            out.push("print([m.span() for m in re.finditer(r'', s)])".into());
+            out.push(format!(
+                "print([m.span() for m in re.finditer(r'(?={lit})', s)])"
+            ));
+            out.push("print(len([1 for _ in re.finditer(r'', s)]), len(s) + 1)".into());
+        }
+        // A callable `sub`: the replacement reads positions off each match, so a
+        // wrong offset shows up in the RESULT STRING, not only in a number.
+        6 => {
+            out.push(format!(
+                "print(re.sub(r'{lit}', lambda m: '<%d:%d>' % (m.start(), m.end()), s))"
+            ));
+            out.push("print(re.subn(r'.', lambda m: str(m.start()), s, count=2))".into());
+        }
+        // The text-returning operations, which slice by the same offsets.
+        7 => {
+            out.push(format!("print(re.split(r'{lit}', s), re.findall(r'.', s))"));
+            out.push(format!(
+                "print(re.sub(r'{lit}', 'ZZ', s), re.subn(r'.', '-', s))"
+            ));
+            out.push(format!("print(re.split(r'({lit})', s, maxsplit=1))"));
+        }
+        // `match`/`fullmatch` anchoring, whose end position is compared against
+        // the subject length.
+        8 => {
+            out.push("print(re.fullmatch(r'.+', s).span(), re.match(r'.', s).span())".into());
+            out.push("print(re.fullmatch(r'.', s), re.match(r'.+', s).end() == len(s))".into());
+            out.push(
+                "print(re.match(r'(.)(.)', s).span(2) if re.match(r'(.)(.)', s) else None)".into(),
+            );
+        }
+        // A compiled pattern reused across the whole surface, so one wrong
+        // conversion cannot be masked by a second one elsewhere.
+        _ => {
+            out.push(format!("p = re.compile(r'({lit})')"));
+            out.push("print([m.span(1) for m in p.finditer(s)], p.findall(s))".into());
+            out.push("print(p.search(s).span(), p.split(s), p.sub('#', s))".into());
+            out.push("print(p.subn('#', s), [m.end() for m in p.finditer(s)])".into());
+        }
+    }
+    out
+}
+
 /// CPython's `Did you mean: 'x'?` hint on an uncaught `NameError`/
 /// `AttributeError`. Every case is uncaught, so this mode is only meaningful
 /// under `--stderr`; the hint is a property of the rendered traceback and never
@@ -5662,6 +5783,7 @@ enum Mode {
     Excgroup,
     Suggest,
     Valuekey,
+    Regex,
 }
 
 const REAL_MODES: &[Mode] = &[
@@ -5726,6 +5848,7 @@ const REAL_MODES: &[Mode] = &[
     Mode::Excgroup,
     Mode::Suggest,
     Mode::Valuekey,
+    Mode::Regex,
 ];
 
 /// Generate the statement list for a seed in the selected mode. `Mixed` rotates
@@ -5797,6 +5920,7 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Excgroup => gen_excgroup(seed),
         Mode::Suggest => gen_suggest(seed),
         Mode::Valuekey => gen_valuekey(seed),
+        Mode::Regex => gen_regex(seed),
     }
 }
 
@@ -5864,6 +5988,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Excgroup => "excgroup",
         Mode::Suggest => "suggest",
         Mode::Valuekey => "valuekey",
+        Mode::Regex => "regex",
     }
 }
 
@@ -5931,6 +6056,7 @@ fn mode_from_name(s: &str) -> Option<Mode> {
         Mode::Excgroup,
         Mode::Suggest,
         Mode::Valuekey,
+        Mode::Regex,
     ];
     ALL.iter().copied().find(|&m| mode_name(m) == s)
 }
