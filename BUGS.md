@@ -328,6 +328,58 @@ written.
   `MKDICT_EX` site), and the rare >255-slot `MKFUNC`/class-base/`MATCH_CLASS`
   sites. CPython lowers all of these too; the same chunked treatment would extend
   to the call/spread paths.
+- **A call resolves its callee AFTER its arguments.** CPython evaluates the
+  callee first, then the arguments left to right. `compile_call`
+  (`src/compiler.rs`) folds callee resolution INTO the call op for its two fast
+  paths — a bare-name callee emits `name_const` + `CALL` (the name is looked up
+  by the op, after the args are on the stack), and an attribute callee emits
+  `GETATTR` inside `CALL_METHOD`. Observable two ways:
+
+      python -c 'aa(bb)'   CPython: NameError: name 'aa' is not defined
+                           pythonrs: NameError: name 'bb' is not defined
+
+      log = []
+      def f(*a): log.append('call'); return 0
+      def g(): log.append('arg'); return 1
+      class K:
+          def __getattr__(s, n): log.append('callee'); return f
+      K().m(g())
+      print(log)          CPython: ['callee', 'arg', 'call']
+                          pythonrs: ['arg', 'callee', 'call']
+
+  Only a callee with a side effect (`__getattr__`, a property, a module
+  `__getattr__`) or an undefined name can tell the difference — a plain name
+  lookup has none. Fixing it means pushing the resolved callee as a value before
+  the arguments, which gives up the by-name `CALL` dispatch and the method fast
+  path; that is a call-protocol change, not a local edit.
+- **No "did you mean" suggestions.** CPython appends a nearest-match hint to a
+  `NameError`/`AttributeError` and to some `SyntaxError`s
+  (`name 'st' is not defined. Did you mean: 'set'?`). pythonrs prints the bare
+  message. This is the largest remaining class in `parity-fuzz --stderr`.
+- **`:=` may rebind a comprehension's iteration variable.** CPython rejects
+  `[(i := 1) for i in range(3)]` at compile time with
+  `SyntaxError: assignment expression cannot rebind comprehension iteration
+  variable 'i'`, covering the element, the `if` conditions, tuple targets, and
+  generator expressions. pythonrs accepts all of them and runs the loop.
+- **`await` outside a function / outside an `async` function is not a
+  `SyntaxError`.** CPython rejects both at compile time
+  (`'await' outside function`, `'await' outside async function`). pythonrs
+  compiles them: a module-level `await 1` fails at run time with
+  `TypeError: object int can't be used in 'await' expression`, and
+  `def f(): await 1` is accepted outright (it only fails if `f` is called). The
+  `return`/`yield` forms of this check are implemented; `await` additionally
+  needs the async-ness of the enclosing scope threaded through `def_depth`.
+- **`except*` does not catch, and `ExceptionGroup` has no `split`/`subgroup`.**
+  `try: raise ExceptionGroup("g", [ValueError(1)])` / `except* ValueError:` runs
+  neither handler and lets the group propagate; `eg.split(ValueError)` raises
+  `AttributeError`. PEP 654 is parsed but not implemented.
+- **`dir()` on a builtin type is not CPython's full slot listing.** Every name it
+  reports is one `getattr` resolves (asserted in both directions by
+  `builtin_dir_lists_only_dispatchable_names` /
+  `builtin_dispatch_is_fully_listed_by_dir`), but the operator slots
+  (`__add__`, `__iadd__`, `__class_getitem__`, `__reduce_ex__`, …) are dispatched
+  natively rather than through per-type descriptor objects, so they are not
+  enumerable. 418 of CPython's 767 names across the 13 builtin types.
 
 ## Tooling
 - **`--build`** (AOT to a standalone native executable): implemented for the
