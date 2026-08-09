@@ -96,6 +96,27 @@ written.
   handling of the above exception …"); `raise X from None` sets
   `__suppress_context__`, hiding the implicit context. Each chained exception's
   frames are captured (`__traceback__`) at the point it is caught.
+- **Exception groups and `except*` (PEP 654).** `ExceptionGroup` /
+  `BaseExceptionGroup` are real: the constructor validates its arguments and
+  narrows (`BaseExceptionGroup` holding only `Exception`s builds an
+  `ExceptionGroup`); `.message`/`.exceptions`/`.args` read back; `str` counts
+  members (`g (2 sub-exceptions)`); `ExceptionGroup` answers `isinstance` for
+  BOTH its bases. `split`/`subgroup`/`derive` are ported from CPython's
+  `exceptiongroup_split_recursive`/`exceptiongroup_subset`, so a nested group is
+  rebuilt with its own nesting on both sides and each part inherits the group's
+  traceback and chaining; the matcher may be a class, a tuple of classes, or a
+  predicate. `except*` runs each clause **at most once** against what is left of
+  the group, binds it to the matching subgroup, wraps a naked exception in a
+  one-element group, and reassembles what the handlers left behind with
+  `_PyExc_PrepReraiseStar`'s rules — a bare re-raise merges back into the
+  original group's nesting, a freshly raised exception becomes a sibling in a new
+  `ExceptionGroup('', …)`. Its three compile-time rules (`except` and `except*`
+  may not be mixed, every clause names a type, no `break`/`continue`/`return`
+  leaves the handler) are enforced. An uncaught group renders CPython's
+  `+-+---------------- n ----------------` tree — a port of `traceback.py`'s
+  `_ExceptionPrintContext`, including the `max_group_width` (15) /
+  `max_group_depth` (10) elisions and each member's own chained blocks. Fuzzed to
+  zero divergences (`parity-fuzz --mode excgroup`, stdout and `--stderr`).
 - **Object model**: `complex` (`(1+2j)*(3-1j)`, `.real`/`.imag`, `abs`),
   `frozenset` (immutable, hashable, set algebra), **metaclasses**
   (`class A(metaclass=M)`, `M.__new__`/`__init__`; `type(A) is M`), `property`
@@ -356,23 +377,6 @@ written.
   `NameError`/`AttributeError` and to some `SyntaxError`s
   (`name 'st' is not defined. Did you mean: 'set'?`). pythonrs prints the bare
   message. This is the largest remaining class in `parity-fuzz --stderr`.
-- **`:=` may rebind a comprehension's iteration variable.** CPython rejects
-  `[(i := 1) for i in range(3)]` at compile time with
-  `SyntaxError: assignment expression cannot rebind comprehension iteration
-  variable 'i'`, covering the element, the `if` conditions, tuple targets, and
-  generator expressions. pythonrs accepts all of them and runs the loop.
-- **`await` outside a function / outside an `async` function is not a
-  `SyntaxError`.** CPython rejects both at compile time
-  (`'await' outside function`, `'await' outside async function`). pythonrs
-  compiles them: a module-level `await 1` fails at run time with
-  `TypeError: object int can't be used in 'await' expression`, and
-  `def f(): await 1` is accepted outright (it only fails if `f` is called). The
-  `return`/`yield` forms of this check are implemented; `await` additionally
-  needs the async-ness of the enclosing scope threaded through `def_depth`.
-- **`except*` does not catch, and `ExceptionGroup` has no `split`/`subgroup`.**
-  `try: raise ExceptionGroup("g", [ValueError(1)])` / `except* ValueError:` runs
-  neither handler and lets the group propagate; `eg.split(ValueError)` raises
-  `AttributeError`. PEP 654 is parsed but not implemented.
 - **`dir()` on a builtin type is not CPython's full slot listing.** Every name it
   reports is one `getattr` resolves (asserted in both directions by
   `builtin_dir_lists_only_dispatchable_names` /

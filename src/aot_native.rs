@@ -196,7 +196,8 @@ pub unsafe extern "C" fn fusevm_aot_register_builtins(vm: *mut VM) {
         }
         for t in &mut img.tries {
             restore_op_hash(&mut t.body);
-            for (typ, _, handler) in &mut t.handlers {
+            for h in &mut t.handlers {
+                let (typ, handler) = (&mut h.typ, &mut h.body);
                 if let Some(typ) = typ {
                     restore_op_hash(typ);
                 }

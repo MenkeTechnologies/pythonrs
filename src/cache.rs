@@ -99,6 +99,9 @@ use std::path::PathBuf;
 /// v31: a `def`/`lambda` with annotations compiles them as a `<annotate>` thunk
 /// (MKFUNC evaluates it with forward-reference NameErrors caught) instead of an
 /// inline dict, so annotated-function bytecode differs.
+/// v44: `except*` compiles to its own handler flag on `TryDef` (a new field in
+/// the cached record), and `await`/`:=`-in-a-comprehension now fail at compile
+/// time — so sources that used to cache successfully must be recompiled.
 /// v43: a call whose callee is a slotted local pushes it as a VALUE rather than
 /// resolving the name, so any such call site's bytecode differs.
 /// v42: an eligible function holds its locals in frame slots (`GetSlot`/
@@ -118,7 +121,7 @@ use std::path::PathBuf;
 /// v37: `%` by an integer literal inside a native slot loop lowers to native
 /// `Mod` + a branchless floor correction instead of the `BINOP` host call, so
 /// loops containing `%` emit different bytecode (and now qualify as native).
-const SCHEMA: u64 = 43;
+const SCHEMA: u64 = 44;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]
@@ -284,7 +287,8 @@ pub fn load(src: &str) -> Option<Program> {
     // an error inside a `try` block would be lost on a cache hit.
     for t in &mut cp.tries {
         restore_op_hash(&mut t.body);
-        for (typ, _, handler) in &mut t.handlers {
+        for h in &mut t.handlers {
+                let (typ, handler) = (&mut h.typ, &mut h.body);
             if let Some(typ) = typ {
                 restore_op_hash(typ);
             }

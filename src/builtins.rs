@@ -4,6 +4,7 @@
 //! (`str`/`list`/`dict`/… methods). Handlers pop their arguments off the VM
 //! stack, call into the `host` object model, and push the result back.
 
+use crate::excgroup;
 use crate::host::{self, ops, with_host, Instance, IterState, PKey, PyObj};
 use fusevm::{NumOp, Value, VM};
 use indexmap::IndexMap;
@@ -2555,6 +2556,9 @@ fn b_try(vm: &mut VM, _: u8) -> Value {
         None => return abort(vm, "internal: unknown try id".into()),
     };
     let mut pending: Option<String> = None;
+    // Whether the `except*` path already ran every clause (it drives them all in
+    // one pass, unlike the first-match `except` loop).
+    let mut handled_star = false;
     // The exception being handled when this `try` was entered. `h.exc` is
     // overwritten by every RAISE, so by the time a handler runs it no longer
     // names the enclosing handler's exception — this snapshot does, and it is
@@ -2602,8 +2606,13 @@ fn b_try(vm: &mut VM, _: u8) -> Value {
                 h.exc = Some(new.clone());
                 new
             });
-            let mut handled = false;
-            for (type_chunk, bind, hbody) in &td.handlers {
+            if td.handlers.iter().any(|h| h.star) {
+                pending = run_star_handlers(&td, &exc, &entry_exc);
+                handled_star = true;
+            }
+            let mut handled = handled_star;
+            for hd in td.handlers.iter().filter(|_| !handled_star) {
+                let (type_chunk, bind, hbody) = (&hd.typ, &hd.name, &hd.body);
                 let matches = match type_chunk {
                     None => true,
                     Some(tc) => {
@@ -2682,6 +2691,105 @@ fn b_try(vm: &mut VM, _: u8) -> Value {
         vm.ip = vm.chunk.ops.len();
     }
     Value::Undef
+}
+
+/// Run a `try`'s `except*` clauses (PEP 654) over the exception it caught, and
+/// return the error to keep propagating (`None` when the group was fully
+/// handled).
+///
+/// Unlike `except`, every clause is considered — in order, each against what is
+/// left of the group — and each runs AT MOST ONCE, bound to the subgroup it
+/// matched. Whatever the handlers raise, plus the part nothing matched, is then
+/// reassembled by [`excgroup::prep_reraise_star`]: a handler that re-raised its
+/// own slice merges back into the original group's nesting, while a freshly
+/// raised exception becomes a sibling in a new group.
+fn run_star_handlers(td: &host::TryDef, exc: &Value, entry_exc: &Option<Value>) -> Option<String> {
+    // Snapshot the caught group's traceback before anything runs: every subgroup
+    // split out of it inherits this (CPython's `exceptiongroup_subset` copies the
+    // traceback across), and clearing the live trace keeps the handlers' own
+    // frames from being appended to the group's.
+    with_host(|h| {
+        h.capture_exc_tb(exc);
+        h.traceback.clear();
+    });
+    // What is still unmatched. `None` once every clause has claimed its part.
+    let mut rest = Some(exc.clone());
+    // Each handler's own escaping exception, then the unmatched remainder.
+    let mut raised: Vec<Value> = Vec::new();
+
+    for hd in &td.handlers {
+        let Some(cur) = rest.clone() else { break };
+        // `except*` always names a type — `except*:` is rejected at compile time.
+        let Some(tc) = &hd.typ else { continue };
+        let tv = host::run_chunk_on(tc.clone()).unwrap_or(Value::Undef);
+        let (matched, remainder) = match excgroup::eg_match(&cur, &tv) {
+            Ok(pair) => pair,
+            Err(e) => return Some(e),
+        };
+        let Some(matched) = matched else { continue };
+        rest = remainder;
+        if let Some(name) = &hd.name {
+            with_host(|h| h.set_name(name, matched.clone()));
+        }
+        with_host(|h| {
+            h.error = None;
+            h.exc = Some(matched.clone());
+            h.traceback.clear();
+        });
+        match host::run_chunk_on(hd.body.clone()) {
+            // Nothing escaped: this part of the group is handled.
+            Ok(_) => with_host(|h| {
+                if h.signal.is_none() {
+                    h.exc = entry_exc.clone();
+                }
+            }),
+            // The handler raised (or re-raised): collect what escaped, with the
+            // frames it unwound through — it is rendered as a group member.
+            Err(_) => {
+                if let Some(e) = with_host(|h| h.exc.clone()) {
+                    with_host(|h| h.capture_exc_tb(&e));
+                    raised.push(e);
+                }
+            }
+        }
+        if let Some(name) = &hd.name {
+            with_host(|h| {
+                let _ = h.del_name(name);
+            });
+        }
+    }
+    raised.extend(rest);
+
+    match excgroup::prep_reraise_star(exc, &raised) {
+        Ok(None) => None,
+        Ok(Some(result)) => {
+            // Re-raise the reconstructed exception: install it as the in-flight
+            // one (so an outer `except` binds THIS object) and hand back its
+            // terse line for the abort.
+            let line = host::raise_value(&result);
+            with_host(|h| {
+                h.traceback.clear();
+                if excgroup::is_piece_of(h, &result, exc) {
+                    // A piece of the caught group keeps the group's traceback, so
+                    // the innermost frame must point back at the original `raise`
+                    // rather than at whatever line the handler stopped on.
+                    let own = match result {
+                        Value::Obj(id) => h.exc_tb.get(&id).and_then(|tb| tb.last()).cloned(),
+                        _ => None,
+                    };
+                    if let Some((_, line, span)) = own {
+                        h.set_cur_line_span(line, span);
+                    }
+                } else if let Value::Obj(id) = result {
+                    // A freshly built group is created after the handler returns,
+                    // so the frame holding this `try` is not in its traceback.
+                    h.tb_starts_empty.insert(id);
+                }
+            });
+            Some(line.unwrap_or_else(|e| e))
+        }
+        Err(e) => Some(e),
+    }
 }
 
 // ── match / case structural helpers ───────────────────────────────────────────
@@ -2874,7 +2982,7 @@ fn synth_exc(h: &mut host::PyHost, err: &str) -> Value {
 
 /// Whether the raised exception matches the handler type value (a class,
 /// exception-class name, or tuple of them).
-fn exc_matches(h: &host::PyHost, exc: &Value, typ: &Value) -> bool {
+pub(crate) fn exc_matches(h: &host::PyHost, exc: &Value, typ: &Value) -> bool {
     let exc_class = match h.get(exc) {
         Some(PyObj::Exception { class, .. }) => class.clone(),
         Some(PyObj::Instance(i)) => i.class.clone(),
@@ -3937,7 +4045,12 @@ pub fn call_builtin_function(
             _ => Err(host::name_error(&format!("_contextvars.{f}"))),
         };
     }
-    // Exception constructors.
+    // Exception constructors. The two group classes validate their arguments and
+    // pick their concrete class (`BaseExceptionGroup` holding only `Exception`s
+    // narrows to `ExceptionGroup`), so they route through PEP 654's constructor.
+    if name == excgroup::GROUP || name == excgroup::BASE_GROUP {
+        return with_host(|h| excgroup::construct(h, name, &args));
+    }
     if is_exception_class(name) {
         return Ok(with_host(|h| {
             h.alloc(PyObj::Exception {
@@ -8415,7 +8528,7 @@ fn exc_parent(name: &str) -> Option<&'static str> {
 
 /// Whether `exc_class` is-a `want` in the exception hierarchy (builtin chain +
 /// user class MRO).
-fn exception_isa(exc_class: &str, want: &str, h: &host::PyHost) -> bool {
+pub(crate) fn exception_isa(exc_class: &str, want: &str, h: &host::PyHost) -> bool {
     if exc_class == want {
         return true;
     }
@@ -8428,6 +8541,16 @@ fn exception_isa(exc_class: &str, want: &str, h: &host::PyHost) -> bool {
     if want == "BaseException" {
         return is_exception_class(exc_class)
             || h.classes.contains_key(exc_class) && h.class_is_exception(exc_class);
+    }
+    // `ExceptionGroup` is the one builtin exception with TWO bases —
+    // `Exception` (the link `EXC_PARENTS` records, so `except Exception` catches
+    // a group) and `BaseExceptionGroup`. The parent table holds a single link
+    // per class, so the second base is answered here.
+    if want == excgroup::BASE_GROUP
+        && exc_class != excgroup::BASE_GROUP
+        && exception_isa(exc_class, excgroup::GROUP, h)
+    {
+        return true;
     }
     // Builtin chain.
     let mut cur = exc_class;
@@ -8750,7 +8873,13 @@ pub fn type_dir_names(typename: &str) -> Vec<&'static str> {
         t if t.starts_with("itertools.") || ITER_PROTOCOL_TYPES.contains(&t) => {
             out.extend_from_slice(&["__next__", "__iter__"])
         }
-        t if is_exception_class(t) => out.extend_from_slice(&["with_traceback", "add_note"]),
+        t if is_exception_class(t) => {
+            out.extend_from_slice(&["with_traceback", "add_note"]);
+            // PEP 654 adds the group protocol on top of `BaseException`'s.
+            if t == excgroup::GROUP || t == excgroup::BASE_GROUP {
+                out.extend_from_slice(&["split", "subgroup", "derive"]);
+            }
+        }
         _ => {}
     }
     if CONTAINS_TYPES.contains(&typename) {
@@ -8825,6 +8954,9 @@ pub fn type_has_method(typename: &str, name: &str) -> bool {
         // REENTRANT-only, and advertising it on a plain lock makes
         // `threading.Condition` bind a method that cannot answer.
         _ if is_exception_class(typename) && matches!(name, "with_traceback" | "add_note") => {
+            return true
+        }
+        excgroup::GROUP | excgroup::BASE_GROUP if matches!(name, "split" | "subgroup" | "derive") => {
             return true
         }
         "lock" => {
@@ -9569,6 +9701,22 @@ pub fn call_type_method(
         "Future" | "Task" => crate::async_rt::future_method(recv, name, args),
         "_UnixSelectorEventLoop" => crate::async_rt::loop_method(name, args),
         "Event" | "Lock" | "Queue" => crate::async_rt::async_obj_method(recv, name, args),
+        // PEP 654's group protocol. `split` returns `(match, rest)` with `None`
+        // for an empty half; `subgroup` is `split` without the remainder.
+        _ if matches!(name, "split" | "subgroup" | "derive")
+            && with_host(|h| excgroup::is_group(h, recv)) =>
+        {
+            let a = arg0(&args)?;
+            match name {
+                "split" => {
+                    let (m, r) = excgroup::split(recv, &a)?;
+                    let pair = vec![m.unwrap_or(Value::Undef), r.unwrap_or(Value::Undef)];
+                    Ok(with_host(|h| h.new_tuple(pair)))
+                }
+                "subgroup" => Ok(excgroup::subgroup(recv, &a)?.unwrap_or(Value::Undef)),
+                _ => excgroup::derive(recv, &a),
+            }
+        }
         // `BaseException`'s own methods. `with_traceback` returns the exception
         // (there is no traceback object to attach), and `add_note` appends to
         // `__notes__`, which `traceback` renders. `unittest.assertRaises` stores

@@ -158,11 +158,11 @@ fn program_chunks(prog: &crate::compiler::Program) -> Vec<(String, Chunk)> {
     }
     for (i, t) in prog.tries.iter().enumerate() {
         out.push((format!("try #{i} body"), t.body.clone()));
-        for (j, (ty, _, handler)) in t.handlers.iter().enumerate() {
-            if let Some(ty) = ty {
+        for (j, h) in t.handlers.iter().enumerate() {
+            if let Some(ty) = &h.typ {
                 out.push((format!("try #{i} except[{j}] type"), ty.clone()));
             }
-            out.push((format!("try #{i} except[{j}]"), handler.clone()));
+            out.push((format!("try #{i} except[{j}]"), h.body.clone()));
         }
         if let Some(c) = &t.orelse {
             out.push((format!("try #{i} else"), c.clone()));

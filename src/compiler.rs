@@ -15,7 +15,7 @@
 //! `MKSTR`.
 
 use crate::ast::*;
-use crate::host::{binop as bop, iop, ops, unop, FuncDef, TryDef};
+use crate::host::{binop as bop, iop, ops, unop, FuncDef, HandlerDef, TryDef};
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 use std::collections::{HashMap, HashSet};
 
@@ -53,7 +53,8 @@ pub fn rebase_program(prog: &mut Program, func_off: usize, try_off: usize) {
     }
     for t in &mut prog.tries {
         rebase_chunk(&mut t.body, func_off, try_off);
-        for (tc, _, hb) in &mut t.handlers {
+        for h in &mut t.handlers {
+                let (tc, hb) = (&mut h.typ, &mut h.body);
             if let Some(tc) = tc {
                 rebase_chunk(tc, func_off, try_off);
             }
@@ -169,6 +170,14 @@ pub struct Compiler {
     /// `return`. Comprehensions lower through `ScopeKind::Function`, which is
     /// right — their synthetic bodies really do `return` the accumulator.
     def_depth: usize,
+    /// Whether `await` is legal at the current point (see [`AwaitScope`]). A
+    /// comprehension inherits it from its enclosing function; a `def`/`lambda`
+    /// and a class body replace it.
+    await_scope: AwaitScope,
+    /// True while lowering a comprehension's hidden body. An illegal `await`
+    /// there is reported as an asynchronous *comprehension* outside an async
+    /// function, which is the message CPython uses.
+    in_comprehension: bool,
     /// The source span of the caret-bearing expression currently being lowered,
     /// peeled from its `Expr::Spanned` wrapper. Recorded against the raising op's
     /// index so an uncaught exception can underline the exact sub-expression
@@ -192,10 +201,38 @@ pub struct Compiler {
 /// `nonlocal` resolution target (class bodies are transparent to `nonlocal`).
 #[derive(Clone, Copy, PartialEq)]
 enum ScopeKind {
-    /// A `def`/`lambda`/comprehension: a real function scope for `nonlocal`.
+    /// A `def`/`lambda`: a real function scope for `nonlocal`.
     Function,
+    /// A comprehension's hidden function. A real function scope for `nonlocal`
+    /// and `return`, but TRANSPARENT to `await`: `[await x for x in xs]` is
+    /// legal exactly where its enclosing function makes `await` legal, so the
+    /// comprehension inherits the enclosing `AwaitScope` instead of opening a
+    /// synchronous one.
+    Comprehension,
     /// A class body: names resolve dynamically and it is skipped by `nonlocal`.
     ClassBody,
+}
+
+impl ScopeKind {
+    /// Whether this scope is a real function scope (`nonlocal` target, own
+    /// locals/freevars/slots) — everything except a class body.
+    fn is_function(self) -> bool {
+        self != ScopeKind::ClassBody
+    }
+}
+
+/// Where the code being lowered sits with respect to `await`. CPython rejects
+/// `await` at compile time outside any function (`'await' outside function`)
+/// and inside a non-`async` one (`'await' outside async function`).
+#[derive(Clone, Copy, PartialEq, Default)]
+enum AwaitScope {
+    /// Module level or a class body — `await` here is "outside function".
+    #[default]
+    Module,
+    /// A plain `def`/`lambda`.
+    Sync,
+    /// An `async def`, and any comprehension lowered inside one.
+    Async,
 }
 
 /// Compile a parsed program. `debug` enables per-statement DAP line markers.
@@ -2034,7 +2071,7 @@ impl Compiler {
         let saved_prefix = self.qual_prefix.clone();
         self.qual_prefix = match kind {
             ScopeKind::ClassBody => format!("{qualname}."),
-            ScopeKind::Function => format!("{qualname}.<locals>."),
+            _ => format!("{qualname}.<locals>."),
         };
         // The scope's local names: everything assigned in the body, minus names
         // it declares `global`/`nonlocal`. Reading one before it is bound is an
@@ -2047,7 +2084,7 @@ impl Compiler {
         };
         // Free variables (`co_freevars`) — computed against the ENCLOSING function
         // scopes, before this scope is pushed. Class bodies form no closure.
-        let freevars = if kind == ScopeKind::Function {
+        let freevars = if kind.is_function() {
             scope_freevars(params, body, &self.func_scopes)
         } else {
             Vec::new()
@@ -2055,7 +2092,7 @@ impl Compiler {
         // Push this scope's bound names (locals + params) so a nested `nonlocal`
         // can resolve against it. Class bodies are transparent to `nonlocal`.
         let mut pushed = false;
-        if kind == ScopeKind::Function {
+        if kind.is_function() {
             let mut bound: HashSet<String> = locals.iter().cloned().collect();
             for p in param_names(params) {
                 bound.insert(p);
@@ -2071,7 +2108,7 @@ impl Compiler {
         let saved_slots = std::mem::take(&mut self.fn_slots);
         let saved_bound = std::mem::take(&mut self.fn_slots_bound);
         let is_gen_or_async = is_async || body_has_yield(body);
-        if kind == ScopeKind::Function && !is_gen_or_async && fn_slots_allowed(body) {
+        if kind.is_function() && !is_gen_or_async && fn_slots_allowed(body) {
             let mut next: u16 = 0;
             let mut table: HashMap<String, u16> = HashMap::new();
             // Parameters first: `bind_params` has already bound them, and the
@@ -2133,9 +2170,21 @@ impl Compiler {
         let saved_icb = self.in_class_body;
         let saved_fs = self.def_depth;
         self.def_depth = match kind {
-            ScopeKind::Function => self.def_depth + 1,
             ScopeKind::ClassBody => 0,
+            _ => self.def_depth + 1,
         };
+        // `await` legality follows the scope: a class body is "outside function"
+        // even inside an `async def`, a `def`/`lambda` opens a synchronous scope,
+        // and a comprehension is transparent (it inherits).
+        let saved_aw = self.await_scope;
+        let saved_inc = self.in_comprehension;
+        self.await_scope = match kind {
+            ScopeKind::ClassBody => AwaitScope::Module,
+            ScopeKind::Comprehension => saved_aw,
+            ScopeKind::Function if is_async => AwaitScope::Async,
+            ScopeKind::Function => AwaitScope::Sync,
+        };
+        self.in_comprehension = kind == ScopeKind::Comprehension;
         self.in_class_body = kind == ScopeKind::ClassBody;
         if self.in_class_body && body.iter().any(is_ann_assign) {
             // `__annotations__ = {}` at the top of the class body.
@@ -2150,6 +2199,8 @@ impl Compiler {
         self.fn_slots_bound = saved_bound;
         self.in_class_body = saved_icb;
         self.def_depth = saved_fs;
+        self.await_scope = saved_aw;
+        self.in_comprehension = saved_inc;
         if pushed {
             self.func_scopes.pop();
         }
@@ -2254,6 +2305,7 @@ impl Compiler {
         if !finalbody.is_empty() {
             collect_finally_escapes(finalbody, &mut self.warnings);
         }
+        check_except_star(handlers)?;
         let body_chunk = self.compile_block_chunk(body)?;
         let mut hs = Vec::new();
         for h in handlers {
@@ -2262,7 +2314,12 @@ impl Compiler {
                 None => None,
             };
             let hbody = self.compile_block_chunk(&h.body)?;
-            hs.push((type_chunk, h.name.clone(), hbody));
+            hs.push(HandlerDef {
+                typ: type_chunk,
+                name: h.name.clone(),
+                body: hbody,
+                star: h.star,
+            });
         }
         let else_chunk = if orelse.is_empty() {
             None
@@ -2680,13 +2737,19 @@ impl Compiler {
                 self.emit_make_func(b, def_id, params)?;
             }
             Expr::ListComp(elt, comps) => {
+                check_comprehension_walrus(&[elt], comps, &[])?;
                 self.compile_comprehension(b, CompKind::List, elt, None, comps)?
             }
             Expr::SetComp(elt, comps) => {
+                check_comprehension_walrus(&[elt], comps, &[])?;
                 self.compile_comprehension(b, CompKind::Set, elt, None, comps)?
             }
-            Expr::GenExp(elt, comps) => self.compile_genexp(b, elt, comps)?,
+            Expr::GenExp(elt, comps) => {
+                check_comprehension_walrus(&[elt], comps, &[])?;
+                self.compile_genexp(b, elt, comps)?
+            }
             Expr::DictComp(k, v, comps) => {
+                check_comprehension_walrus(&[k, v], comps, &[])?;
                 self.compile_comprehension(b, CompKind::Dict, k, Some(v), comps)?
             }
             Expr::NamedExpr(target, value) => {
@@ -2721,6 +2784,29 @@ impl Compiler {
                 self.compile_yield_from(b, inner)?;
             }
             Expr::Await(inner) => {
+                // Outside an `async def`, `await` is a compile-time SyntaxError in
+                // CPython — the module-level form used to lower and fail at run
+                // time with `TypeError: object int can't be used in 'await'
+                // expression`, after the program's own output had been printed,
+                // and `def f(): await 1` was accepted outright.
+                match self.await_scope {
+                    AwaitScope::Async => {}
+                    // Inside a comprehension the awaitable is what makes the
+                    // comprehension asynchronous, so CPython blames the
+                    // comprehension rather than the `await`.
+                    _ if self.in_comprehension => {
+                        return Err(
+                            "SyntaxError: asynchronous comprehension outside of an asynchronous function"
+                                .to_string(),
+                        )
+                    }
+                    AwaitScope::Module => {
+                        return Err("SyntaxError: 'await' outside function".to_string())
+                    }
+                    AwaitScope::Sync => {
+                        return Err("SyntaxError: 'await' outside async function".to_string())
+                    }
+                }
                 // `await E` — evaluate the awaitable, then drive it: the AWAIT op
                 // suspends the running coroutine (yielding up to the event loop)
                 // until the awaitable settles, then leaves its result.
@@ -3448,7 +3534,8 @@ impl Compiler {
             names: vec![".0".into()],
             ..Params::default()
         };
-        let def_id = self.build_function_ex(name, &params, &body, is_async, ScopeKind::Function)?;
+        let def_id =
+            self.build_function_ex(name, &params, &body, is_async, ScopeKind::Comprehension)?;
         self.emit_make_func(b, def_id, &params)?; // [func]
         self.compile_expr(b, outer_iter)?; // [func, iterable]
         b.emit(Op::CallBuiltin(ops::CALL_VALUE, 2), 0); // [result|coroutine]
@@ -4319,6 +4406,265 @@ fn collect_names_fstr(parts: &[FStrPart], out: &mut HashSet<String>) {
             collect_names_fstr(spec, out);
         }
     }
+}
+
+// ── PEP 654: `except*` restrictions ──────────────────────────────────────────
+
+/// The three compile-time rules a `try` with `except*` clauses must satisfy:
+/// every clause names a type, `except` and `except*` may not be mixed on one
+/// `try`, and no `break`/`continue`/`return` may jump out of an `except*` body
+/// (the group has to be reconstructed after every handler has run).
+fn check_except_star(handlers: &[ExceptHandler]) -> Result<(), String> {
+    if !handlers.iter().any(|h| h.star) {
+        return Ok(());
+    }
+    if handlers.iter().any(|h| !h.star) {
+        return Err(
+            "SyntaxError: cannot have both 'except' and 'except*' on the same 'try'".to_string(),
+        );
+    }
+    for h in handlers {
+        if h.typ.is_none() {
+            return Err("SyntaxError: expected one or more exception types".to_string());
+        }
+        if handler_escapes(&h.body) {
+            return Err(
+                "SyntaxError: 'break', 'continue' and 'return' cannot appear in an except* block"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Whether `body` contains a `break`/`continue`/`return` that would leave it.
+/// A loop written INSIDE the handler owns its own `break`/`continue`, and a
+/// nested `def` owns its own `return`, so neither is an escape.
+fn handler_escapes(body: &[Stmt]) -> bool {
+    body.iter().any(|s| match &s.kind {
+        StmtKind::Break | StmtKind::Continue | StmtKind::Return(_) => true,
+        StmtKind::If { body, orelse, .. } => handler_escapes(body) || handler_escapes(orelse),
+        StmtKind::With { body, .. } => handler_escapes(body),
+        StmtKind::Try {
+            body,
+            handlers,
+            orelse,
+            finalbody,
+        } => {
+            handler_escapes(body)
+                || handlers.iter().any(|h| handler_escapes(&h.body))
+                || handler_escapes(orelse)
+                || handler_escapes(finalbody)
+        }
+        StmtKind::Match { cases, .. } => cases.iter().any(|c| handler_escapes(&c.body)),
+        // A loop consumes `break`/`continue`; only a `return` inside it escapes.
+        StmtKind::While { body, orelse, .. } | StmtKind::For { body, orelse, .. } => {
+            has_return(body) || has_return(orelse)
+        }
+        _ => false,
+    })
+}
+
+/// Whether `body` contains a `return` outside any nested `def`/`class`.
+fn has_return(body: &[Stmt]) -> bool {
+    body.iter().any(|s| match &s.kind {
+        StmtKind::Return(_) => true,
+        StmtKind::If { body, orelse, .. } => has_return(body) || has_return(orelse),
+        StmtKind::While { body, orelse, .. } | StmtKind::For { body, orelse, .. } => {
+            has_return(body) || has_return(orelse)
+        }
+        StmtKind::With { body, .. } => has_return(body),
+        StmtKind::Try {
+            body,
+            handlers,
+            orelse,
+            finalbody,
+        } => {
+            has_return(body)
+                || handlers.iter().any(|h| has_return(&h.body))
+                || has_return(orelse)
+                || has_return(finalbody)
+        }
+        StmtKind::Match { cases, .. } => cases.iter().any(|c| has_return(&c.body)),
+        _ => false,
+    })
+}
+
+// ── PEP 572: `:=` restrictions inside a comprehension ────────────────────────
+
+/// Every direct sub-expression of `e`, nested scopes included. A structural walk
+/// the `:=` comprehension checks need and `collect_names_expr` (which keeps only
+/// names) can't give them.
+fn expr_children(e: &Expr) -> Vec<&Expr> {
+    let mut out: Vec<&Expr> = Vec::new();
+    match e.unspanned() {
+        Expr::List(xs) | Expr::Tuple(xs) | Expr::Set(xs) | Expr::BoolOp(_, xs) => {
+            out.extend(xs.iter())
+        }
+        Expr::Dict(pairs) => {
+            for (k, v) in pairs {
+                out.extend(k.iter());
+                out.push(v);
+            }
+        }
+        Expr::Starred(x)
+        | Expr::UnaryOp(_, x)
+        | Expr::YieldFrom(x)
+        | Expr::Await(x)
+        | Expr::Attribute(x, _)
+        | Expr::Yield(Some(x)) => out.push(x),
+        Expr::BinOp(_, a, b) | Expr::Subscript(a, b) | Expr::NamedExpr(a, b) => {
+            out.push(a);
+            out.push(b);
+        }
+        Expr::Compare(a, rest) => {
+            out.push(a);
+            out.extend(rest.iter().map(|(_, x)| x));
+        }
+        Expr::IfExp { test, body, orelse } => out.extend([&**test, &**body, &**orelse]),
+        Expr::Call {
+            func,
+            args,
+            keywords,
+        } => {
+            out.push(func);
+            out.extend(args.iter());
+            out.extend(keywords.iter().map(|k| &k.value));
+        }
+        Expr::Slice { lo, hi, step } => {
+            out.extend([lo, hi, step].into_iter().flatten().map(|b| &**b))
+        }
+        Expr::Lambda { params, body } => {
+            out.extend(params.defaults.iter());
+            out.extend(params.kwonly_defaults.iter().flatten());
+            out.push(body);
+        }
+        Expr::ListComp(elt, comps) | Expr::SetComp(elt, comps) | Expr::GenExp(elt, comps) => {
+            out.push(elt);
+            push_comp_children(comps, &mut out);
+        }
+        Expr::DictComp(k, v, comps) => {
+            out.push(k);
+            out.push(v);
+            push_comp_children(comps, &mut out);
+        }
+        Expr::FString(parts) | Expr::TString(parts) => push_fstr_children(parts, &mut out),
+        _ => {} // literals and bare names have no sub-expressions
+    }
+    out
+}
+
+fn push_comp_children<'a>(comps: &'a [Comprehension], out: &mut Vec<&'a Expr>) {
+    for c in comps {
+        out.push(&c.target);
+        out.push(&c.iter);
+        out.extend(c.ifs.iter());
+    }
+}
+
+fn push_fstr_children<'a>(parts: &'a [FStrPart], out: &mut Vec<&'a Expr>) {
+    for p in parts {
+        if let FStrPart::Expr { expr, spec, .. } = p {
+            out.push(expr);
+            push_fstr_children(spec, out);
+        }
+    }
+}
+
+/// Whether `e` contains a `:=` anywhere, `lambda` bodies and nested
+/// comprehensions included — the reach of CPython's "iterable expression" ban.
+fn expr_has_walrus(e: &Expr) -> bool {
+    matches!(e.unspanned(), Expr::NamedExpr(..)) || expr_children(e).into_iter().any(expr_has_walrus)
+}
+
+/// The names an assignment target binds (`i`, `a, b`, `a, *rest`).
+fn collect_target_names(t: &Expr, out: &mut Vec<String>) {
+    match t.unspanned() {
+        Expr::Name(n) => out.push(n.clone()),
+        Expr::Tuple(xs) | Expr::List(xs) => {
+            for x in xs {
+                collect_target_names(x, out);
+            }
+        }
+        Expr::Starred(x) => collect_target_names(x, out),
+        _ => {}
+    }
+}
+
+/// PEP 572's two comprehension restrictions, both compile-time `SyntaxError`s in
+/// CPython, which pythonrs used to accept and run:
+///
+/// * `:=` may not rebind an iteration variable of the comprehension it sits in,
+///   nor of any comprehension that one is nested in
+///   (`[(i := 1) for i in range(3)]`, `[[(i := 1) for j in r] for i in s]`);
+/// * `:=` may not appear anywhere in a `for … in <iterable>` expression
+///   (`[x for x in range((i := 3))]`) — not even inside a `lambda` written there.
+///
+/// `elts` are the comprehension's value expressions (two for a dict
+/// comprehension); `outer` carries the iteration variables of the enclosing
+/// comprehensions.
+fn check_comprehension_walrus(
+    elts: &[&Expr],
+    comps: &[Comprehension],
+    outer: &[String],
+) -> Result<(), String> {
+    for c in comps {
+        if expr_has_walrus(&c.iter) {
+            return Err("SyntaxError: assignment expression cannot be used in a \
+                        comprehension iterable expression"
+                .to_string());
+        }
+    }
+    let mut bound = outer.to_vec();
+    for c in comps {
+        collect_target_names(&c.target, &mut bound);
+    }
+    for e in elts
+        .iter()
+        .copied()
+        .chain(comps.iter().flat_map(|c| c.ifs.iter()))
+    {
+        check_walrus_rebind(e, &bound)?;
+    }
+    Ok(())
+}
+
+/// Walk `e` looking for a `:=` onto one of `bound`. A `lambda` opens a new scope
+/// (`[(lambda: (i := 1))() for i in range(3)]` is legal), so only its defaults
+/// are visited; a nested comprehension re-enters [`check_comprehension_walrus`]
+/// with `bound` carried in as its outer set.
+fn check_walrus_rebind(e: &Expr, bound: &[String]) -> Result<(), String> {
+    match e.unspanned() {
+        Expr::Lambda { params, .. } => {
+            for d in params
+                .defaults
+                .iter()
+                .chain(params.kwonly_defaults.iter().flatten())
+            {
+                check_walrus_rebind(d, bound)?;
+            }
+            return Ok(());
+        }
+        Expr::ListComp(elt, comps) | Expr::SetComp(elt, comps) | Expr::GenExp(elt, comps) => {
+            return check_comprehension_walrus(&[elt], comps, bound)
+        }
+        Expr::DictComp(k, v, comps) => return check_comprehension_walrus(&[k, v], comps, bound),
+        Expr::NamedExpr(target, _) => {
+            if let Expr::Name(n) = target.unspanned() {
+                if bound.iter().any(|b| b == n) {
+                    return Err(format!(
+                        "SyntaxError: assignment expression cannot rebind \
+                         comprehension iteration variable '{n}'"
+                    ));
+                }
+            }
+        }
+        _ => {}
+    }
+    for c in expr_children(e) {
+        check_walrus_rebind(c, bound)?;
+    }
+    Ok(())
 }
 
 /// Collect every `Name` referenced in one statement, recursing through suites AND

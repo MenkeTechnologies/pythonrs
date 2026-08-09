@@ -4762,6 +4762,12 @@ const DIR_AUDIT_TYPES: &[&str] = &[
     "property",
     "memoryview",
     "slice",
+    // Exception types: `BaseException`'s two methods, plus PEP 654's group
+    // protocol on the two group classes and NOT on any other exception.
+    "ValueError",
+    "BaseException",
+    "ExceptionGroup",
+    "BaseExceptionGroup",
 ];
 
 /// `dir()` must never name something `getattr` cannot produce.
@@ -4875,6 +4881,286 @@ fn invalid_programs_are_rejected_at_compile_time() {
     for src in ok {
         if let Err(e) = eval_str(src) {
             panic!("{src:?} must compile, got: {e}");
+        }
+    }
+}
+
+/// PEP 654 exception groups: the object model and the group protocol
+/// (`split`/`subgroup`/`derive`), each value byte-checked against CPython 3.14.6.
+#[test]
+fn exception_groups_split_and_derive() {
+    // `str` counts members; `repr` shows the constructor arguments; `.message`
+    // and `.exceptions` read them back (the latter always as a tuple).
+    let setup = "eg = ExceptionGroup('g', [ValueError(1), TypeError(2)])\n";
+    assert_eq!(
+        g(&format!("{setup}x = str(eg)"), "x"),
+        "'g (2 sub-exceptions)'"
+    );
+    assert_eq!(
+        g("x = str(ExceptionGroup('one', [ValueError(1)]))", "x"),
+        "'one (1 sub-exception)'"
+    );
+    assert_eq!(
+        g(&format!("{setup}x = repr(eg)"), "x"),
+        "\"ExceptionGroup('g', [ValueError(1), TypeError(2)])\""
+    );
+    assert_eq!(g(&format!("{setup}x = eg.message"), "x"), "'g'");
+    assert_eq!(
+        g(&format!("{setup}x = repr(eg.exceptions)"), "x"),
+        "'(ValueError(1), TypeError(2))'"
+    );
+    // `ExceptionGroup` is BOTH an `Exception` and a `BaseExceptionGroup`; only
+    // the second base needed adding, and neither may leak onto a plain
+    // exception.
+    assert_eq!(
+        g(
+            &format!("{setup}x = (isinstance(eg, Exception), isinstance(eg, BaseExceptionGroup))"),
+            "x"
+        ),
+        "(True, True)"
+    );
+    assert_eq!(
+        g("x = isinstance(ValueError(1), BaseExceptionGroup)", "x"),
+        "False"
+    );
+    // `split` returns (match, rest); each half keeps the group's message and is
+    // `None` when empty.
+    assert_eq!(
+        g(&format!("{setup}x = repr(eg.split(ValueError))"), "x"),
+        "\"(ExceptionGroup('g', [ValueError(1)]), ExceptionGroup('g', [TypeError(2)]))\""
+    );
+    assert_eq!(
+        g(&format!("{setup}x = repr(eg.split(KeyError))"), "x"),
+        "\"(None, ExceptionGroup('g', [ValueError(1), TypeError(2)]))\""
+    );
+    // A nested group is rebuilt with its own nesting on BOTH sides.
+    assert_eq!(
+        g(
+            "eg = ExceptionGroup('out', [ValueError(1), ExceptionGroup('in', [TypeError(2), \
+             ValueError(3)])])\nx = repr(eg.split(ValueError))",
+            "x"
+        ),
+        concat!(
+            "\"(ExceptionGroup('out', [ValueError(1), ExceptionGroup('in', [ValueError(3)])]), ",
+            "ExceptionGroup('out', [ExceptionGroup('in', [TypeError(2)])]))\""
+        )
+    );
+    // `subgroup` is `split` without the remainder, and takes a predicate too.
+    assert_eq!(
+        g(&format!("{setup}x = repr(eg.subgroup(TypeError))"), "x"),
+        "\"ExceptionGroup('g', [TypeError(2)])\""
+    );
+    assert_eq!(
+        g(
+            &format!("{setup}x = repr(eg.subgroup(lambda e: isinstance(e, ValueError)))"),
+            "x"
+        ),
+        "\"ExceptionGroup('g', [ValueError(1)])\""
+    );
+    assert_eq!(g(&format!("{setup}x = eg.subgroup(KeyError)"), "x"), "None");
+    // `derive` keeps the message and takes new members.
+    assert_eq!(
+        g(&format!("{setup}x = repr(eg.derive([KeyError('k')]))"), "x"),
+        "\"ExceptionGroup('g', [KeyError('k')])\""
+    );
+    // `BaseExceptionGroup` narrows to `ExceptionGroup` unless it holds a bare
+    // `BaseException`.
+    assert_eq!(
+        g(
+            "x = type(BaseExceptionGroup('b', [ValueError(1)])).__name__",
+            "x"
+        ),
+        "'ExceptionGroup'"
+    );
+    assert_eq!(
+        g(
+            "x = type(BaseExceptionGroup('b', [KeyboardInterrupt()])).__name__",
+            "x"
+        ),
+        "'BaseExceptionGroup'"
+    );
+    // Constructor validation, message for message.
+    for (src, want) in [
+        (
+            "ExceptionGroup('g', [])",
+            "ValueError: second argument (exceptions) must be a non-empty sequence",
+        ),
+        (
+            "ExceptionGroup('g', [KeyboardInterrupt()])",
+            "TypeError: Cannot nest BaseExceptions in an ExceptionGroup",
+        ),
+        (
+            "ExceptionGroup(1, [ValueError()])",
+            "TypeError: BaseExceptionGroup.__new__() argument 1 must be str, not int",
+        ),
+        (
+            "ExceptionGroup('g', ValueError())",
+            "TypeError: second argument (exceptions) must be a sequence",
+        ),
+        (
+            "ExceptionGroup('g')",
+            "TypeError: BaseExceptionGroup.__new__() takes exactly 2 arguments (1 given)",
+        ),
+        (
+            "ExceptionGroup('g', [ValueError, TypeError()])",
+            "ValueError: Item 0 of second argument (exceptions) is not an exception",
+        ),
+    ] {
+        assert_eq!(
+            eval_str(&format!("x = {src}")).expect_err(src),
+            want,
+            "for {src:?}"
+        );
+    }
+}
+
+/// PEP 654 `except*`: which clause claims which part of the group, and what is
+/// rebuilt from what the handlers left behind. Every expectation is CPython
+/// 3.14.6's, byte-checked against `python3`.
+#[test]
+fn except_star_matches_and_reraises_the_unhandled_part() {
+    // Each clause runs AT MOST ONCE, bound to the subgroup it matched, and the
+    // unmatched remainder propagates as a group.
+    assert_eq!(
+        g(
+            "log = []\n\
+             try:\n\
+             \x20   try:\n\
+             \x20       raise ExceptionGroup('g', [ValueError(1), TypeError(2), KeyError(3)])\n\
+             \x20   except* ValueError as e:\n\
+             \x20       log.append(repr(e))\n\
+             \x20   except* TypeError as e:\n\
+             \x20       log.append(repr(e))\n\
+             except BaseException as outer:\n\
+             \x20   log.append('escaped ' + repr(outer))\n\
+             x = log",
+            "x"
+        ),
+        "[\"ExceptionGroup('g', [ValueError(1)])\", \"ExceptionGroup('g', [TypeError(2)])\", \
+         \"escaped ExceptionGroup('g', [KeyError(3)])\"]"
+    );
+    // A naked exception that matches is wrapped in a one-element group.
+    assert_eq!(
+        g(
+            "try:\n    raise ValueError('bare')\nexcept* ValueError as e:\n    x = repr(e)",
+            "x"
+        ),
+        "\"ExceptionGroup('', (ValueError('bare'),))\""
+    );
+    // A handler that raises becomes a SIBLING of the unhandled remainder...
+    assert_eq!(
+        g(
+            "try:\n\
+             \x20   try:\n\
+             \x20       raise ExceptionGroup('g', [ValueError(1), TypeError(2)])\n\
+             \x20   except* ValueError:\n\
+             \x20       raise RuntimeError('boom')\n\
+             except BaseException as outer:\n\
+             \x20   x = repr(outer)",
+            "x"
+        ),
+        "\"ExceptionGroup('', [RuntimeError('boom'), ExceptionGroup('g', [TypeError(2)])])\""
+    );
+    // ...but a BARE re-raise is merged back into the original group's nesting,
+    // which is the whole point of the projection step.
+    assert_eq!(
+        g(
+            "try:\n\
+             \x20   try:\n\
+             \x20       raise ExceptionGroup('g', [ValueError(1), TypeError(2)])\n\
+             \x20   except* ValueError:\n\
+             \x20       raise\n\
+             except BaseException as outer:\n\
+             \x20   x = repr(outer)",
+            "x"
+        ),
+        "\"ExceptionGroup('g', [ValueError(1), TypeError(2)])\""
+    );
+    // A lone raising handler with nothing left over propagates unwrapped.
+    assert_eq!(
+        g(
+            "try:\n\
+             \x20   try:\n\
+             \x20       raise ExceptionGroup('g', [ValueError(1)])\n\
+             \x20   except* ValueError:\n\
+             \x20       raise RuntimeError('boom')\n\
+             except BaseException as outer:\n\
+             \x20   x = repr(outer)",
+            "x"
+        ),
+        "\"RuntimeError('boom')\""
+    );
+    // `else`/`finally` still work, and the `as` name is unbound afterwards.
+    assert_eq!(
+        g(
+            "log = []\n\
+             try:\n\
+             \x20   pass\n\
+             except* ValueError:\n\
+             \x20   log.append('no')\n\
+             else:\n\
+             \x20   log.append('else')\n\
+             finally:\n\
+             \x20   log.append('finally')\n\
+             x = log",
+            "x"
+        ),
+        "['else', 'finally']"
+    );
+    assert_eq!(
+        g(
+            "try:\n\
+             \x20   raise ExceptionGroup('g', [ValueError(1)])\n\
+             except* ValueError as e:\n\
+             \x20   pass\n\
+             try:\n\
+             \x20   e\n\
+             \x20   x = 'still bound'\n\
+             except NameError:\n\
+             \x20   x = 'unbound'",
+            "x"
+        ),
+        "'unbound'"
+    );
+}
+
+/// PEP 654's compile-time rules for `except*`, which pythonrs used to accept.
+#[test]
+fn except_star_syntax_rules_are_enforced() {
+    for (src, want) in [
+        (
+            "try:\n    pass\nexcept ValueError:\n    pass\nexcept* TypeError:\n    pass",
+            "SyntaxError: cannot have both 'except' and 'except*' on the same 'try'",
+        ),
+        (
+            "try:\n    pass\nexcept*:\n    pass",
+            "SyntaxError: expected one or more exception types",
+        ),
+        (
+            "def f():\n    try:\n        pass\n    except* ValueError:\n        return 1",
+            "SyntaxError: 'break', 'continue' and 'return' cannot appear in an except* block",
+        ),
+        (
+            "for i in [1]:\n    try:\n        pass\n    except* ValueError:\n        continue",
+            "SyntaxError: 'break', 'continue' and 'return' cannot appear in an except* block",
+        ),
+        (
+            "for i in [1]:\n    try:\n        pass\n    except* ValueError:\n        break",
+            "SyntaxError: 'break', 'continue' and 'return' cannot appear in an except* block",
+        ),
+    ] {
+        assert_eq!(eval_str(src).expect_err(src), want, "for {src:?}");
+    }
+    // A loop written INSIDE the handler owns its own `break`/`continue`, and a
+    // nested `def` owns its own `return` — neither leaves the handler.
+    for src in [
+        "try:\n    raise ExceptionGroup('g', [ValueError(1)])\nexcept* ValueError:\n    \
+         for i in range(2):\n        break",
+        "try:\n    raise ExceptionGroup('g', [ValueError(1)])\nexcept* ValueError:\n    \
+         def h():\n        return 1\n    assert h() == 1",
+    ] {
+        if let Err(e) = eval_str(src) {
+            panic!("{src:?} must compile and run, got: {e}");
         }
     }
 }

@@ -257,11 +257,11 @@ fn marker_lines(path: &str) -> HashSet<u32> {
     }
     for t in &prog.tries {
         scan(&t.body);
-        for (type_chunk, _as_name, handler) in &t.handlers {
-            if let Some(tc) = type_chunk {
+        for h in &t.handlers {
+            if let Some(tc) = &h.typ {
                 scan(tc);
             }
-            scan(handler);
+            scan(&h.body);
         }
         if let Some(orelse) = &t.orelse {
             scan(orelse);

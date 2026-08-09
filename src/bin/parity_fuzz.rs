@@ -5124,6 +5124,129 @@ fn gen_ctxmgr(seed: u64) -> Vec<String> {
     }
 }
 
+/// PEP 654 exception groups: the `ExceptionGroup`/`BaseExceptionGroup`
+/// constructors and their validation, `split`/`subgroup`/`derive`, and `except*`
+/// — which clause claims which part, what the handlers leave behind, and the
+/// group that gets re-raised. Uncaught cases (compare under `--stderr`) exercise
+/// the `+-+---- n ----` group traceback.
+fn gen_excgroup(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let a = pick(r, POSINTS);
+    let b = pick(r, POSINTS);
+    // A leaf whose type varies so the same shape lands in different clauses.
+    const LEAFS: &[&str] = &[
+        "ValueError",
+        "TypeError",
+        "KeyError",
+        "IndexError",
+        "ZeroDivisionError",
+        "OSError",
+        "ArithmeticError",
+    ];
+    let (l1, l2) = (pick(r, LEAFS), pick(r, LEAFS));
+    let want = pick(r, LEAFS);
+    match r.below(12) {
+        // Constructor + accessors + str/repr.
+        0 => vec![
+            format!("eg = ExceptionGroup('g', [{l1}({a}), {l2}({b})])"),
+            "print(repr(eg)); print(str(eg)); print(eg.message)".into(),
+            "print(eg.args); print(eg.exceptions)".into(),
+            "print(type(eg).__name__, isinstance(eg, BaseExceptionGroup), isinstance(eg, Exception))"
+                .into(),
+        ],
+        // Constructor rejections.
+        1 => vec![
+            "for expr in ['ExceptionGroup(\"g\", [])', 'ExceptionGroup(\"g\", [KeyboardInterrupt()])', 'ExceptionGroup(1, [ValueError()])', 'ExceptionGroup(\"g\", ValueError())', 'ExceptionGroup(\"g\")', 'ExceptionGroup(\"g\", [ValueError, TypeError()])']:".into(),
+            "    try:".into(),
+            "        eval(expr); print(expr, '-> ok')".into(),
+            "    except BaseException as e:".into(),
+            "        print(expr, '->', type(e).__name__ + ':', e)".into(),
+        ],
+        // `BaseExceptionGroup` narrowing.
+        2 => vec![
+            format!("for excs in [[{l1}({a})], [KeyboardInterrupt()], [{l1}({a}), SystemExit(2)]]:"),
+            "    g = BaseExceptionGroup('b', excs)".into(),
+            "    print(type(g).__name__, repr(g))".into(),
+        ],
+        // split / subgroup by type.
+        3 => vec![
+            format!("eg = ExceptionGroup('g', [{l1}({a}), {l2}({b})])"),
+            format!("m, rest = eg.split({want})"),
+            "print(repr(m)); print(repr(rest))".into(),
+            format!("print(repr(eg.subgroup({want})))"),
+        ],
+        // split of a nested group.
+        4 => vec![
+            format!(
+                "eg = ExceptionGroup('out', [{l1}({a}), ExceptionGroup('in', [{l2}({b}), {l1}({b})])])"
+            ),
+            format!("m, rest = eg.split({want})"),
+            "print(repr(m)); print(repr(rest))".into(),
+        ],
+        // split by predicate, and derive.
+        5 => vec![
+            format!("eg = ExceptionGroup('g', [{l1}({a}), {l2}({b})])"),
+            format!("print(repr(eg.subgroup(lambda e: isinstance(e, {want}))))"),
+            "print(repr(eg.derive([KeyError('d')])))".into(),
+            "print(repr(eg.split(lambda e: False)))".into(),
+        ],
+        // Two `except*` clauses over a flat group.
+        6 => vec![
+            "try:".into(),
+            format!("    raise ExceptionGroup('g', [{l1}({a}), {l2}({b})])"),
+            format!("except* {l1} as e:"),
+            "    print('one', repr(e))".into(),
+            format!("except* {want} as e:"),
+            "    print('two', repr(e))".into(),
+            "print('after')".into(),
+        ],
+        // Unmatched remainder propagates to an outer `except`.
+        7 => vec![
+            "try:".into(),
+            "    try:".into(),
+            format!("        raise ExceptionGroup('g', [{l1}({a}), {l2}({b})])"),
+            format!("    except* {want} as e:"),
+            "        print('handled', repr(e))".into(),
+            "except BaseException as outer:".into(),
+            "    print('escaped', repr(outer))".into(),
+        ],
+        // A naked exception caught by `except*` is wrapped.
+        8 => vec![
+            "try:".into(),
+            format!("    raise {l1}({a})"),
+            format!("except* {want} as e:"),
+            "    print('wrapped', repr(e))".into(),
+        ],
+        // A handler that raises, and one that bare-re-raises.
+        9 => vec![
+            "try:".into(),
+            "    try:".into(),
+            format!("        raise ExceptionGroup('g', [{l1}({a}), {l2}({b})])"),
+            format!("    except* {l1}:"),
+            "        raise RuntimeError('from handler')".into(),
+            format!("    except* {l2}:"),
+            "        raise".into(),
+            "except BaseException as outer:".into(),
+            "    print('outer', repr(outer))".into(),
+        ],
+        // `except*` with a tuple of types, plus else/finally.
+        10 => vec![
+            "try:".into(),
+            format!("    raise ExceptionGroup('g', [{l1}({a}), {l2}({b})])"),
+            format!("except* ({l1}, {l2}) as e:"),
+            "    print('tuple', repr(e))".into(),
+            "finally:".into(),
+            "    print('finally')".into(),
+        ],
+        // Uncaught: the group traceback tree (compared under --stderr).
+        _ => vec![
+            format!(
+                "raise ExceptionGroup('g', [{l1}({a}), ExceptionGroup('in', [{l2}({b})])])"
+            ),
+        ],
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Mode dispatch
 // ---------------------------------------------------------------------------
@@ -5189,6 +5312,7 @@ enum Mode {
     Walrus,
     Functools,
     Ctxmgr,
+    Excgroup,
 }
 
 const REAL_MODES: &[Mode] = &[
@@ -5250,6 +5374,7 @@ const REAL_MODES: &[Mode] = &[
     Mode::Walrus,
     Mode::Functools,
     Mode::Ctxmgr,
+    Mode::Excgroup,
 ];
 
 /// Generate the statement list for a seed in the selected mode. `Mixed` rotates
@@ -5318,6 +5443,7 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Walrus => gen_walrus(seed),
         Mode::Functools => gen_functools(seed),
         Mode::Ctxmgr => gen_ctxmgr(seed),
+        Mode::Excgroup => gen_excgroup(seed),
     }
 }
 
@@ -5382,6 +5508,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Walrus => "walrus",
         Mode::Functools => "functools",
         Mode::Ctxmgr => "ctxmgr",
+        Mode::Excgroup => "excgroup",
     }
 }
 
@@ -5446,6 +5573,7 @@ fn mode_from_name(s: &str) -> Option<Mode> {
         Mode::Walrus,
         Mode::Functools,
         Mode::Ctxmgr,
+        Mode::Excgroup,
     ];
     ALL.iter().copied().find(|&m| mode_name(m) == s)
 }

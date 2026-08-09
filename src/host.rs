@@ -301,11 +301,23 @@ pub type ProcDef = FuncDef;
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct TryDef {
     pub body: Chunk,
-    /// `(type_chunk, as_name, handler_body)` per `except` clause. A `None`
-    /// type_chunk is a bare `except:` (catches everything).
-    pub handlers: Vec<(Option<Chunk>, Option<String>, Chunk)>,
+    pub handlers: Vec<HandlerDef>,
     pub orelse: Option<Chunk>,
     pub finalbody: Option<Chunk>,
+}
+
+/// One compiled `except` / `except*` clause of a [`TryDef`].
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct HandlerDef {
+    /// The exception type expression. `None` is a bare `except:`, which catches
+    /// everything (`except*` always has one — CPython's grammar requires it).
+    pub typ: Option<Chunk>,
+    /// The `as name` binding, unbound again when the handler finishes.
+    pub name: Option<String>,
+    pub body: Chunk,
+    /// `except*` (PEP 654): match against the caught exception GROUP rather than
+    /// the exception itself, and run at most once with the matching subgroup.
+    pub star: bool,
 }
 
 /// A class definition: name, base class names, and its own methods/attrs.
@@ -1359,6 +1371,20 @@ pub struct PyHost {
     /// exception is caught. Used to render `__cause__`/`__context__` chain blocks
     /// in an uncaught traceback (the final exception uses the live `traceback`).
     pub exc_tb: HashMap<u32, Vec<(String, u32, Span)>>,
+    /// For every exception group carved out of another by `split`/`subgroup`/
+    /// `derive`: the heap id of the ROOT group it came from. `except*` reads it
+    /// to tell a piece of the caught group that a handler re-raised (which is
+    /// merged back into the original's nesting) from a group the handler built
+    /// fresh (which becomes a sibling). CPython answers the same question by
+    /// comparing `__cause__`/`__context__`/`__traceback__`/`__notes__` identity;
+    /// an explicit link is exact and cannot alias an unrelated group.
+    pub eg_split_root: HashMap<u32, u32>,
+    /// Exceptions whose traceback starts EMPTY at the frame that produced them:
+    /// the group `except*` reconstructs once its handlers have run. CPython
+    /// builds that group after the handler finishes, so the frame holding the
+    /// `try` is not part of its traceback — only the frames it later unwinds
+    /// through are.
+    pub tb_starts_empty: HashSet<u32>,
     /// Arbitrary attributes assigned to a function object (`func.__dict__`), keyed
     /// by the function's heap id. CPython functions carry a writable dict; the
     /// stdlib uses it for `__isabstractmethod__`, `functools.wraps`, decorators.
@@ -1837,6 +1863,8 @@ impl PyHost {
             total_ordering: HashSet::new(),
             exc_links: HashMap::new(),
             exc_tb: HashMap::new(),
+            eg_split_root: HashMap::new(),
+            tb_starts_empty: HashSet::new(),
             func_attrs: HashMap::new(),
             codec_search: Vec::new(),
             codec_cache: HashMap::new(),
@@ -2403,7 +2431,9 @@ impl PyHost {
         let Value::Obj(id) = exc else { return };
         let mut tb: Vec<(String, u32, Span)> = Vec::new();
         if let Some(f) = self.frames.last() {
-            tb.push((f.name.to_string(), f.line, f.span));
+            if !self.tb_starts_empty.contains(id) {
+                tb.push((f.name.to_string(), f.line, f.span));
+            }
         }
         for f in self.traceback.iter().rev() {
             tb.push(f.clone());
@@ -8309,6 +8339,17 @@ impl PyHost {
                     let a = args.clone();
                     return Ok(self.new_tuple(a));
                 }
+                // `BaseExceptionGroup.message` / `.exceptions` — the two
+                // constructor arguments, the second always exposed as a tuple.
+                if matches!(name, "message" | "exceptions") {
+                    if let Some((msg, excs)) = crate::excgroup::group_parts(self, recv) {
+                        return Ok(if name == "message" {
+                            msg
+                        } else {
+                            self.new_tuple(excs)
+                        });
+                    }
+                }
                 // `StopIteration.value` / `StopAsyncIteration.value` — the first
                 // arg (the generator's `return` value), or `None`.
                 if name == "value" && (class == "StopIteration" || class == "StopAsyncIteration") {
@@ -8360,6 +8401,18 @@ impl PyHost {
                     return Ok(Value::Bool(suppressed));
                 }
                 let class = class.clone();
+                // The exception's own methods (`add_note`, `with_traceback`, and
+                // PEP 654's `split`/`subgroup`/`derive`) as bound methods, which
+                // `dir()` lists and `call_type_method` dispatches. Reaching them
+                // only through a call expression made `e.add_note` — the form
+                // `traceback` and `unittest` pass around — an AttributeError.
+                if crate::builtins::type_has_method(&class, name) {
+                    let b = self.alloc(PyObj::Builtin(name.to_string()));
+                    return Ok(self.alloc(PyObj::BoundMethod {
+                        recv: recv.clone(),
+                        func: b,
+                    }));
+                }
                 Err(format!(
                     "AttributeError: '{class}' object has no attribute '{name}'"
                 ))
@@ -11664,6 +11717,15 @@ impl PyHost {
     }
 
     pub fn exc_message(&self, class: &str, args: &[Value]) -> String {
+        // `BaseExceptionGroup.__str__` counts its members rather than rendering
+        // the `(message, exceptions)` argument tuple.
+        if crate::excgroup::class_is_group(self, class) && args.len() == 2 {
+            if let Some(PyObj::List(l)) | Some(PyObj::Tuple(l)) = self.get(&args[1]) {
+                let n = l.len();
+                let plural = if n > 1 { "s" } else { "" };
+                return format!("{} ({n} sub-exception{plural})", self.str_of(&args[0]));
+            }
+        }
         if args.is_empty() {
             String::new()
         } else if args.len() == 1 {
@@ -12146,6 +12208,43 @@ fn system_exit_outcome(h: &mut PyHost, args: &[Value]) -> TopExit {
     }
 }
 
+/// `traceback.TracebackException`'s `max_group_width` / `max_group_depth`: how
+/// many members of one exception group are listed, and how deep the nesting is
+/// rendered, before the output is elided.
+const MAX_GROUP_WIDTH: usize = 15;
+const MAX_GROUP_DEPTH: usize = 10;
+
+/// `traceback._ExceptionPrintContext` — the indentation and margin state that
+/// draws an exception group's `| ` gutter as the renderer descends into members.
+#[derive(Default)]
+struct GroupCtx {
+    /// Nesting depth inside exception groups; 0 outside any group.
+    depth: usize,
+    /// Whether the current member still owes a `+------` closing frame. A nested
+    /// group draws it on its own innermost level and clears the flag.
+    need_close: bool,
+}
+
+impl GroupCtx {
+    fn indent(&self) -> String {
+        " ".repeat(2 * self.depth)
+    }
+
+    /// Write `text` with the current gutter prefixed to EVERY line — including
+    /// blank ones, as `textwrap.indent(..., lambda line: True)` does.
+    fn emit(&self, out: &mut String, text: &str, margin: char) {
+        let mut prefix = self.indent();
+        if self.depth > 0 {
+            prefix.push(margin);
+            prefix.push(' ');
+        }
+        for line in text.split_inclusive('\n') {
+            out.push_str(&prefix);
+            out.push_str(line);
+        }
+    }
+}
+
 impl PyHost {
     /// Render a CPython `Traceback (most recent call last):` block for an uncaught
     /// exception, ending with `err`, including any `__cause__`/`__context__` chain
@@ -12162,6 +12261,12 @@ impl PyHost {
         }
         for f in self.traceback.iter().rev() {
             final_frames.push(f.clone());
+        }
+        // A group built by an `except*` reconstruction owns no frame of its own:
+        // it came into being after the handler in the innermost frame finished,
+        // so that frame is dropped and only its callers remain.
+        if matches!(&self.exc, Some(Value::Obj(id)) if self.tb_starts_empty.contains(id)) {
+            final_frames.pop();
         }
         // Walk the chain backwards from the final exception. Each ancestor carries
         // the connector line that introduces the *next-newer* exception. Prefer an
@@ -12198,22 +12303,156 @@ impl PyHost {
         // Ancestors are collected newest-first; render oldest-first, each followed
         // by its connector, then the final exception's own block.
         let mut out = String::new();
+        let mut ctx = GroupCtx::default();
         for (exc, connector) in ancestors.iter().rev() {
-            let frames = match exc {
-                Value::Obj(id) => self.exc_tb.get(id).cloned().unwrap_or_default(),
-                _ => Vec::new(),
-            };
-            out.push_str(&self.render_one_tb(&frames, &self.exc_final_line(exc)));
-            out.push_str(connector);
+            let frames = self.frames_of(exc);
+            self.render_exc_block(
+                Some(exc),
+                &frames,
+                &self.exc_final_line(exc),
+                &mut ctx,
+                &mut out,
+            );
+            ctx.emit(&mut out, connector, '|');
         }
-        out.push_str(&self.render_one_tb(&final_frames, err));
+        self.render_exc_block(self.exc.as_ref(), &final_frames, err, &mut ctx, &mut out);
         out
     }
 
-    /// Render one `Traceback (most recent call last):` block: the `frames`
-    /// (outermost-first) followed by the terse `final_line`.
-    fn render_one_tb(&self, frames: &[(String, u32, Span)], final_line: &str) -> String {
-        let mut out = String::from("Traceback (most recent call last):\n");
+    /// The `__cause__`/`__context__` chain of `exc` (oldest first) followed by
+    /// its own block. Used for a group's members, each of which can carry a
+    /// chain of its own.
+    fn render_exc_chain(&self, exc: &Value, ctx: &mut GroupCtx, out: &mut String) {
+        const CAUSE: &str =
+            "\nThe above exception was the direct cause of the following exception:\n\n";
+        const CONTEXT: &str =
+            "\nDuring handling of the above exception, another exception occurred:\n\n";
+        let mut ancestors: Vec<(Value, &'static str)> = Vec::new();
+        let mut cur = exc.clone();
+        let mut seen: HashSet<u32> = HashSet::new();
+        loop {
+            if let Value::Obj(id) = cur {
+                if !seen.insert(id) {
+                    break;
+                }
+            }
+            let (cause, context) = self.exc_link(&cur);
+            let suppressed = matches!(&cur, Value::Obj(id) if self.suppress_context.contains(id));
+            let (pred, connector) = if !matches!(cause, Value::Undef) {
+                (cause, CAUSE)
+            } else if !suppressed && !matches!(context, Value::Undef) {
+                (context, CONTEXT)
+            } else {
+                break;
+            };
+            ancestors.push((pred.clone(), connector));
+            cur = pred;
+        }
+        for (anc, connector) in ancestors.iter().rev() {
+            let frames = self.frames_of(anc);
+            self.render_exc_block(Some(anc), &frames, &self.exc_final_line(anc), ctx, out);
+            ctx.emit(out, connector, '|');
+        }
+        let frames = self.frames_of(exc);
+        self.render_exc_block(Some(exc), &frames, &self.exc_final_line(exc), ctx, out);
+    }
+
+    /// The traceback frames captured for an already-caught exception.
+    fn frames_of(&self, exc: &Value) -> Vec<(String, u32, Span)> {
+        match exc {
+            Value::Obj(id) => self.exc_tb.get(id).cloned().unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// One exception's own block: its `Traceback …` header and frames (when it
+    /// has any) then its terse line — or, for a PEP 654 exception group, the
+    /// `+-+---- n ----` tree of its members. A port of `traceback.py`'s
+    /// `TracebackException.format` (the `exc.exceptions is None` branch and the
+    /// group branch below it), including the `_ExceptionPrintContext` margins.
+    fn render_exc_block(
+        &self,
+        exc: Option<&Value>,
+        frames: &[(String, u32, Span)],
+        final_line: &str,
+        ctx: &mut GroupCtx,
+        out: &mut String,
+    ) {
+        let members = exc.and_then(|e| crate::excgroup::group_parts(self, e));
+        let Some((_, members)) = members else {
+            if !frames.is_empty() {
+                ctx.emit(out, "Traceback (most recent call last):\n", '|');
+                ctx.emit(out, &self.render_frames(frames), '|');
+            }
+            ctx.emit(out, &format!("{final_line}\n"), '|');
+            return;
+        };
+        if ctx.depth > MAX_GROUP_DEPTH {
+            ctx.emit(
+                out,
+                &format!("... (max_group_depth is {MAX_GROUP_DEPTH})\n"),
+                '|',
+            );
+            return;
+        }
+        let is_toplevel = ctx.depth == 0;
+        if is_toplevel {
+            ctx.depth = 1;
+        }
+        if !frames.is_empty() {
+            ctx.emit(
+                out,
+                "Exception Group Traceback (most recent call last):\n",
+                if is_toplevel { '+' } else { '|' },
+            );
+            ctx.emit(out, &self.render_frames(frames), '|');
+        }
+        ctx.emit(out, &format!("{final_line}\n"), '|');
+        // Only the first `MAX_GROUP_WIDTH` members are shown; the slot after them
+        // reports how many were elided.
+        let total = members.len();
+        let shown = total.min(MAX_GROUP_WIDTH + 1);
+        ctx.need_close = false;
+        for (i, member) in members.iter().enumerate().take(shown) {
+            let last = i == shown - 1;
+            if last {
+                ctx.need_close = true;
+            }
+            let truncated = i >= MAX_GROUP_WIDTH;
+            let title = if truncated {
+                "...".to_string()
+            } else {
+                (i + 1).to_string()
+            };
+            out.push_str(&ctx.indent());
+            out.push_str(if i == 0 { "+-" } else { "  " });
+            out.push_str(&format!("+---------------- {title} ----------------\n"));
+            ctx.depth += 1;
+            if truncated {
+                let remaining = total - MAX_GROUP_WIDTH;
+                let plural = if remaining > 1 { "s" } else { "" };
+                ctx.emit(out, &format!("and {remaining} more exception{plural}\n"), '|');
+            } else {
+                self.render_exc_chain(member, ctx, out);
+            }
+            // A nested group emits its own closing frame; only the innermost
+            // level that still needs one draws it.
+            if last && ctx.need_close {
+                out.push_str(&ctx.indent());
+                out.push_str("+------------------------------------\n");
+                ctx.need_close = false;
+            }
+            ctx.depth -= 1;
+        }
+        if is_toplevel {
+            ctx.depth = 0;
+        }
+    }
+
+    /// The `File "…", line N, in scope` lines (plus source and carets) for
+    /// `frames`, outermost-first — CPython's `StackSummary.format`.
+    fn render_frames(&self, frames: &[(String, u32, Span)]) -> String {
+        let mut out = String::new();
         let src_lines: Vec<&str> = self.prog_source.lines().collect();
         for (name, line, span) in frames {
             out.push_str(&format!(
@@ -12235,8 +12474,6 @@ impl PyHost {
                 }
             }
         }
-        out.push_str(final_line);
-        out.push('\n');
         out
     }
 
