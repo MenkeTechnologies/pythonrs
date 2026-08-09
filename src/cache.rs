@@ -9,8 +9,9 @@
 //! a zero-copy rkyv archive (`Shard`), validated on load; each *inner* entry blob
 //! is a bincode-encoded `CProg` (the compiled `fusevm::Chunk`s + func/try
 //! tables), because `fusevm::Chunk` is serde-owned, not `rkyv::Archive`. The key
-//! is a 64-bit hash of the source plus a schema version, so a source or format
-//! change misses cleanly instead of loading stale bytecode.
+//! is a 64-bit hash of the source plus a schema version plus the build's
+//! `CARGO_PKG_VERSION`, so a source, format, or release change misses cleanly
+//! instead of loading stale bytecode.
 
 use crate::ast::Span;
 use crate::compiler::Program;
@@ -187,10 +188,25 @@ fn restore_op_hash(chunk: &mut Chunk) {
     }
 }
 
+/// The release this binary was built as. It is hashed into every cache key
+/// alongside [`SCHEMA`], so a shard written by one release can never be read by
+/// another.
+///
+/// `SCHEMA` alone is not enough, because it is bumped BY HAND. Every codegen
+/// change is supposed to bump it; the one that does not ships a binary that
+/// silently executes the previous release's bytecode out of
+/// `~/.pythonrs/scripts.rkyv` — right answer, wrong program, no error, and the
+/// symptom is "my change did not take". The version is bumped by the release
+/// itself, so it closes that window without anyone having to remember. `SCHEMA`
+/// still earns its keep WITHIN a version: it is what invalidates the cache
+/// between two dev builds that share `0.1.2`.
+const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// A stable content key for a source string (fast `FxHash`, used for lookup).
 pub fn key_for(src: &str) -> u64 {
     let mut h = rustc_hash::FxHasher::default();
     SCHEMA.hash(&mut h);
+    BUILD_VERSION.hash(&mut h);
     src.hash(&mut h);
     h.finish()
 }
@@ -201,6 +217,7 @@ fn verify_for(src: &str) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     let mut h = DefaultHasher::new();
     SCHEMA.hash(&mut h);
+    BUILD_VERSION.hash(&mut h);
     src.len().hash(&mut h);
     src.hash(&mut h);
     h.finish()
@@ -466,4 +483,44 @@ pub fn store_labeled(src: &str, prog: &Program, source: &str) -> Result<(), Stri
         blob,
     });
     write_shard(&shard)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Both cache hashes must depend on the build version, not on `SCHEMA`
+    /// alone. `SCHEMA` is bumped by hand: the release that forgets it would
+    /// otherwise read the PREVIOUS release's bytecode out of the shared shard
+    /// and run the wrong program with no error. Recompute each hash here with
+    /// the version left out and require the real one to differ, so removing
+    /// either `BUILD_VERSION.hash(&mut h)` line fails this test.
+    #[test]
+    fn cache_keys_depend_on_the_build_version() {
+        use std::collections::hash_map::DefaultHasher;
+        let src = "x = 1\n";
+
+        let mut without = rustc_hash::FxHasher::default();
+        SCHEMA.hash(&mut without);
+        src.hash(&mut without);
+        assert_ne!(
+            key_for(src),
+            without.finish(),
+            "key_for must hash the build version, not just SCHEMA"
+        );
+
+        let mut without = DefaultHasher::new();
+        SCHEMA.hash(&mut without);
+        src.len().hash(&mut without);
+        src.hash(&mut without);
+        assert_ne!(
+            verify_for(src),
+            without.finish(),
+            "verify_for must hash the build version, not just SCHEMA"
+        );
+
+        // …and the version that is hashed is this build's, so a release bump
+        // rotates the whole shard.
+        assert_eq!(BUILD_VERSION, env!("CARGO_PKG_VERSION"));
+    }
 }
