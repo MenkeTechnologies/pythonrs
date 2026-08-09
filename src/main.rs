@@ -340,10 +340,15 @@ fn dump(file: &str) -> Result<(), String> {
 /// as emitted.
 fn dump_tokens(file: &str) -> Result<(), String> {
     let src = std::fs::read_to_string(file).map_err(|e| format!("cannot read {file}: {e}"))?;
-    for t in pythonrs::lexer::lex(&src)? {
+    let lexed = pythonrs::lexer::lex(&src)?;
+    for t in lexed.toks {
         println!("{}\t{:?}", t.line, t.tok);
     }
-    Ok(())
+    // The stream stops at a bad dedent; report it after dumping what was read.
+    match lexed.deferred {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// `--dump-ast`: print the parsed Python AST.

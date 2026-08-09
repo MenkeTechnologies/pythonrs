@@ -4618,3 +4618,108 @@ fn break_continue_return_cross_a_try_boundary() {
         "(2, [0, 1])"
     );
 }
+
+/// PEP 634 forbids a pattern that matches everything anywhere another pattern
+/// could still be reached. pythonrs used to accept every one of these and run
+/// the dead branches. Ported from CPython's `pattern_context.allow_irrefutable`
+/// (compile.c): false for a case that is neither last nor guarded, and for every
+/// OR alternative but the last; inherited through `p as n`; reset to true inside
+/// a sequence/mapping/class sub-pattern, where the enclosing pattern is what can
+/// fail. Messages are CPython's verbatim.
+#[test]
+fn an_irrefutable_pattern_may_not_shadow_a_later_one() {
+    let rejected = [
+        // A case that matches everything, above another case.
+        ("match 1:\n case _:\n  pass\n case 1:\n  pass", "wildcard"),
+        (
+            "match 1:\n case y:\n  pass\n case 1:\n  pass",
+            "name capture 'y'",
+        ),
+        // `_ as z` is exactly as irrefutable as `_`.
+        (
+            "match 1:\n case _ as z:\n  pass\n case 1:\n  pass",
+            "wildcard",
+        ),
+        // An OR alternative that is not the last one.
+        ("match 1:\n case _ | 1:\n  pass", "wildcard"),
+        ("match 1:\n case 1 | _ | 2:\n  pass", "wildcard"),
+        ("match 1:\n case y | [x]:\n  pass", "name capture 'y'"),
+        ("match 1:\n case y | y:\n  pass", "name capture 'y'"),
+        // Nested: the sub-pattern context allows one, so only the non-last
+        // alternative inside the sequence is rejected.
+        ("match 1:\n case [x | _]:\n  pass", "name capture 'x'"),
+        // The or-pattern is refutable on its own, but a following case removes
+        // the position that permitted its trailing capture.
+        (
+            "match 1:\n case [x] | y:\n  pass\n case _:\n  pass",
+            "name capture 'y'",
+        ),
+        (
+            "match 1:\n case (1 | y) as z:\n  pass\n case 1:\n  pass",
+            "name capture 'y'",
+        ),
+    ];
+    for (src, needle) in rejected {
+        let e = eval_str(src).expect_err(src);
+        assert!(
+            e.starts_with("SyntaxError:") && e.contains(needle) && e.contains("unreachable"),
+            "{src}\n  expected a SyntaxError naming {needle}, got: {e}"
+        );
+    }
+    let accepted = [
+        // Last case, so nothing follows it.
+        "match 1:\n case 1:\n  pass\n case y:\n  pass",
+        "match 1:\n case 1 | _:\n  pass",
+        // A guard can still fall through to the next case.
+        "match 1:\n case _ if 0:\n  pass\n case 1:\n  pass",
+        "match 1:\n case y if 0:\n  pass\n case 1:\n  pass",
+        // Refutable containers: the capture inside cannot shadow anything.
+        "match 1:\n case [x]:\n  pass\n case 1:\n  pass",
+        "match 1:\n case [_]:\n  pass\n case 1:\n  pass",
+        "match 1:\n case [*rest]:\n  pass\n case 1:\n  pass",
+        "match 1:\n case {}:\n  pass\n case 1:\n  pass",
+        "match 1:\n case {'a': y}:\n  pass\n case 1:\n  pass",
+        "match 1:\n case {**rest}:\n  pass\n case 1:\n  pass",
+        "match 1:\n case 1 as z:\n  pass\n case 1:\n  pass",
+    ];
+    for src in accepted {
+        if let Err(e) = eval_str(src) {
+            panic!("{src}\n  must be accepted, got: {e}");
+        }
+    }
+}
+
+/// A tokenizer error must not pre-empt a parse error on an EARLIER line.
+///
+/// CPython pulls tokens lazily, so `match -3:` with a non-`case` body reports
+/// `SyntaxError: invalid syntax` at the body — even though the line AFTER it
+/// dedents to a column that matches no open block. pythonrs tokenizes the whole
+/// module up front, so the later `IndentationError` used to win. Tokenizing now
+/// stops at the bad dedent and parks the message until the parser has consumed
+/// everything before it.
+#[test]
+fn a_bad_dedent_does_not_pre_empt_an_earlier_syntax_error() {
+    // The parser rejects line 2 (`print` is not a `case`) before line 3's dedent
+    // can matter.
+    let e = eval_str("match -3:\n        print('bad')\n    case _:\n")
+        .expect_err("a match body that is not a case must be rejected");
+    assert!(
+        e.starts_with("SyntaxError:") && !e.contains("IndentationError"),
+        "expected the line-2 SyntaxError, got: {e}"
+    );
+    // With the body well-formed, the dedent IS the only problem and must still
+    // be reported — the deferral must not swallow it.
+    let e = eval_str("match -3:\n        case 1:\n            pass\n    case _:\n        pass\n")
+        .expect_err("an unmatched dedent must still be rejected");
+    assert!(
+        e.starts_with("IndentationError: unindent does not match"),
+        "expected the IndentationError, got: {e}"
+    );
+    // A bad dedent with no match statement anywhere behaves exactly as before.
+    let e = eval_str("if 1:\n        x = 1\n    y = 2\n")
+        .expect_err("an unmatched dedent must be rejected");
+    assert!(
+        e.starts_with("IndentationError: unindent does not match"),
+        "expected the IndentationError, got: {e}"
+    );
+}

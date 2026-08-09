@@ -24,14 +24,21 @@ fn is_keyword(s: &str) -> bool {
 /// blocks are desugared to `__rust_compile(...)` calls before lexing.
 pub fn parse(src: &str) -> Result<Vec<Stmt>, String> {
     let src = crate::rust_ffi::desugar(src);
-    let toks = lex(&src)?;
-    let mut p = Parser { toks, pos: 0 };
+    let lexed = lex(&src)?;
+    let mut p = Parser {
+        toks: lexed.toks,
+        pos: 0,
+        deferred: lexed.deferred,
+    };
     p.parse_module()
 }
 
 struct Parser {
     toks: Vec<Token>,
     pos: usize,
+    /// A tokenizer error held back so an earlier parse error wins. See
+    /// [`crate::lexer::Lexed::deferred`].
+    deferred: Option<String>,
 }
 
 /// Wrap a caret-bearing expression with its source span. `anchor_start ==
@@ -142,7 +149,12 @@ impl Parser {
             self.parse_statement(&mut stmts)?;
             self.skip_newlines();
         }
-        Ok(stmts)
+        // Everything the tokenizer did produce parsed: the bad dedent that cut
+        // it short IS the error, so report it now.
+        match self.deferred.take() {
+            Some(e) => Err(e),
+            None => Ok(stmts),
+        }
     }
 
     /// A suite after a `:` — either a one-line simple statement or an indented

@@ -44,6 +44,32 @@ pub struct Token {
     pub end_col: u32,
 }
 
+/// A tokenized module: the stream, plus an indentation error the parser is to
+/// report only if it consumes that far. See [`Lexed::deferred`].
+pub struct Lexed {
+    pub toks: Vec<Token>,
+    /// An `unindent does not match any outer indentation level` found while
+    /// tokenizing, held back rather than raised.
+    ///
+    /// CPython's tokenizer is pulled lazily by the parser, so a syntax error on
+    /// an EARLIER line wins over a bad dedent on a later one:
+    ///
+    /// ```text
+    /// match -3:
+    ///         print('bad')     <- line 2: not a `case`, SyntaxError
+    ///     case _:              <- line 3: dedent matches nothing
+    /// ```
+    ///
+    /// CPython reports `SyntaxError: invalid syntax` at line 2. pythonrs
+    /// tokenizes the whole module up front, so the line-3 tokenizer error used
+    /// to pre-empt it with `IndentationError`. Tokenizing now STOPS at the bad
+    /// dedent and parks the message here: an earlier parse error surfaces
+    /// first, and if the truncated stream parses cleanly the parser raises this
+    /// instead — which restores the original error for the case where the
+    /// dedent really is the only problem.
+    pub deferred: Option<String>,
+}
+
 struct Lexer {
     src: Vec<char>,
     pos: usize,
@@ -51,6 +77,8 @@ struct Lexer {
     depth: i32,
     indents: Vec<usize>,
     out: Vec<Token>,
+    /// See [`Lexed::deferred`]. Set by `handle_indent`; stops `run`.
+    deferred: Option<String>,
     /// Char index where the current line begins — subtracted from a token's
     /// start/end char index to get its 0-based character column (for carets).
     line_start: usize,
@@ -66,7 +94,7 @@ const OPS2: &[&str] = &[
 ];
 
 /// Tokenize `src` into a token stream ending in `Eof`.
-pub fn lex(src: &str) -> Result<Vec<Token>, String> {
+pub fn lex(src: &str) -> Result<Lexed, String> {
     let mut lx = Lexer {
         src: src.chars().collect(),
         pos: 0,
@@ -74,11 +102,15 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
         depth: 0,
         indents: vec![0],
         out: Vec::new(),
+        deferred: None,
         line_start: 0,
         tok_start: 0,
     };
     lx.run()?;
-    Ok(lx.out)
+    Ok(Lexed {
+        toks: lx.out,
+        deferred: lx.deferred,
+    })
 }
 
 impl Lexer {
@@ -112,7 +144,13 @@ impl Lexer {
         let mut at_line_start = true;
         loop {
             if at_line_start && self.depth == 0 {
-                if self.handle_indent()? {
+                let blank = self.handle_indent()?;
+                if self.deferred.is_some() {
+                    // Bad dedent: stop here so the parser sees only the lines
+                    // before it. See `Lexed::deferred`.
+                    break;
+                }
+                if blank {
                     // Blank/comment-only line consumed; stay at line start.
                     continue;
                 }
@@ -155,8 +193,13 @@ impl Lexer {
                 Some(_) => self.scan_token()?,
             }
         }
-        // Terminate a trailing logical line.
-        if !matches!(self.out.last().map(|t| &t.tok), Some(Tok::Newline) | None) {
+        // Terminate a trailing logical line. A stream cut short by a bad dedent
+        // already ends in the Newline of the last complete line followed by the
+        // Dedents that line closed, so appending another Newline there would put
+        // one AFTER the Dedents and derail the parser.
+        if self.deferred.is_none()
+            && !matches!(self.out.last().map(|t| &t.tok), Some(Tok::Newline) | None)
+        {
             self.push(Tok::Newline);
         }
         while self.indents.len() > 1 {
@@ -216,7 +259,8 @@ impl Lexer {
             }
             if col != *self.indents.last().unwrap() {
                 let _ = start;
-                return Err(format!("IndentationError: unindent does not match any outer indentation level (line {})", self.line));
+                self.deferred = Some(format!("IndentationError: unindent does not match any outer indentation level (line {})", self.line));
+                return Ok(false);
             }
         }
         Ok(false)

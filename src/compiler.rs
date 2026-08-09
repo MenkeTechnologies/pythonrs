@@ -3438,9 +3438,15 @@ impl Compiler {
     ) -> Result<(), String> {
         // Compile-time structural validation (PEP 634): reject before running,
         // matching CPython which raises SyntaxError for the whole module.
-        for case in cases {
+        //
+        // `allow_irrefutable` is CPython's `pattern_context.allow_irrefutable`
+        // (compile.c `compiler_match_inner`): a case may end in a pattern that
+        // matches everything only if nothing can follow it — it is the last
+        // case, or it carries a guard that can still send control onward.
+        for (i, case) in cases.iter().enumerate() {
             let mut names = Vec::new();
-            validate_pattern(&case.pattern, &mut names)?;
+            let allow_irrefutable = case.guard.is_some() || i == cases.len() - 1;
+            validate_pattern(&case.pattern, &mut names, allow_irrefutable)?;
         }
         let subj = format!(".match{}", self.tmp);
         self.tmp += 1;
@@ -3652,19 +3658,52 @@ impl Compiler {
 /// PEP 634 compile-time pattern checks (CPython raises these as `SyntaxError`
 /// for the whole module, before any case runs). `bound` accumulates the capture
 /// names bound so far in the current case pattern. Rejects: a name bound twice,
-/// a duplicate mapping key, a repeated class-keyword attribute, and OR
-/// alternatives that bind different name sets.
-fn validate_pattern(pat: &Pattern, bound: &mut Vec<String>) -> Result<(), String> {
+/// a duplicate mapping key, a repeated class-keyword attribute, OR alternatives
+/// that bind different name sets, and an irrefutable pattern in a position that
+/// makes what follows it unreachable.
+///
+/// `allow_irrefutable` is CPython's `pattern_context.allow_irrefutable`. It is
+/// false wherever a further pattern could still be tried, so a bare `_` or a
+/// bare capture there is rejected rather than silently shadowing the rest:
+///
+///   * an OR alternative that is not the last one (`case 1 | _ | 2`),
+///   * a case that is neither last nor guarded (`case _:` above `case 1:`),
+///   * inherited THROUGH `p as n` — `case _ as z` is as irrefutable as `_`.
+///
+/// A sub-pattern of a sequence/mapping/class pattern resets it to true
+/// (CPython's `compiler_pattern_subpattern`): the surrounding pattern is what
+/// can fail, so `case [x]` binds `x` without shadowing anything.
+fn validate_pattern(
+    pat: &Pattern,
+    bound: &mut Vec<String>,
+    allow_irrefutable: bool,
+) -> Result<(), String> {
     match pat {
-        Pattern::Wildcard | Pattern::Value(_) | Pattern::Star(None) => Ok(()),
-        Pattern::Capture(name) | Pattern::Star(Some(name)) => bind_pattern_name(name, bound),
+        Pattern::Value(_) | Pattern::Star(None) => Ok(()),
+        Pattern::Wildcard => {
+            if !allow_irrefutable {
+                return Err(
+                    "SyntaxError: wildcard makes remaining patterns unreachable".to_string()
+                );
+            }
+            Ok(())
+        }
+        Pattern::Capture(name) => {
+            if !allow_irrefutable {
+                return Err(format!(
+                    "SyntaxError: name capture '{name}' makes remaining patterns unreachable"
+                ));
+            }
+            bind_pattern_name(name, bound)
+        }
+        Pattern::Star(Some(name)) => bind_pattern_name(name, bound),
         Pattern::As(inner, name) => {
-            validate_pattern(inner, bound)?;
+            validate_pattern(inner, bound, allow_irrefutable)?;
             bind_pattern_name(name, bound)
         }
         Pattern::Sequence { elems, .. } => {
             for e in elems {
-                validate_pattern(e, bound)?;
+                validate_pattern(e, bound, true)?;
             }
             Ok(())
         }
@@ -3680,7 +3719,7 @@ fn validate_pattern(pat: &Pattern, bound: &mut Vec<String>) -> Result<(), String
                 }
             }
             for (_, p) in keys {
-                validate_pattern(p, bound)?;
+                validate_pattern(p, bound, true)?;
             }
             if let Some(r) = rest {
                 bind_pattern_name(r, bound)?;
@@ -3699,20 +3738,25 @@ fn validate_pattern(pat: &Pattern, bound: &mut Vec<String>) -> Result<(), String
                 }
             }
             for p in pos {
-                validate_pattern(p, bound)?;
+                validate_pattern(p, bound, true)?;
             }
             for (_, p) in kw {
-                validate_pattern(p, bound)?;
+                validate_pattern(p, bound, true)?;
             }
             Ok(())
         }
         Pattern::Or(alts) => {
-            // Each alternative must bind an identical set of names.
+            // Each alternative must bind an identical set of names. Only the
+            // LAST alternative may be irrefutable, and only if the or-pattern
+            // itself sits in a position that allows one — CPython validates each
+            // alternative as it goes, so an irrefutable early alternative is
+            // reported before any name-set mismatch further along.
+            let last = alts.len().saturating_sub(1);
             let base = bound.len();
             let mut expected: Option<Vec<String>> = None;
-            for alt in alts {
+            for (i, alt) in alts.iter().enumerate() {
                 let mut alt_bound = bound.clone();
-                validate_pattern(alt, &mut alt_bound)?;
+                validate_pattern(alt, &mut alt_bound, allow_irrefutable && i == last)?;
                 let mut added: Vec<String> = alt_bound[base..].to_vec();
                 added.sort();
                 match &expected {
@@ -4509,7 +4553,9 @@ fn collect_bound_stmt(s: &Stmt, out: &mut HashSet<String>) {
             collect_leaked_walrus(subject, out);
             for c in cases {
                 let mut names = Vec::new();
-                let _ = validate_pattern(&c.pattern, &mut names);
+                // Name collection only — `compile_match` does the real
+                // validation, so allow anything here and ignore the result.
+                let _ = validate_pattern(&c.pattern, &mut names, true);
                 for n in names {
                     out.insert(n);
                 }
