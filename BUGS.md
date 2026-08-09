@@ -9,6 +9,26 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **Binary operator slots are real bound methods on the builtin containers.**
+  `{'a': 1}.__ior__({'b': 2})`, `[1].__add__([2])`, `{1, 2}.__and__({2})`,
+  `'a'.__mul__(3)`, `b'a'.__add__(b'b')`, `(1j).__truediv__(2)` — every one of
+  them raised `AttributeError: 'dict' object has no attribute '__ior__'`, even
+  though the operator SYNTAX (`d |= …`) worked, because an operator slot is
+  dispatched natively rather than through a per-type descriptor object. Only
+  `int`/`float`/`bool`, which carry an explicit dunder table, ever answered one.
+  Each type now exposes exactly the set CPython 3.14 puts on an instance of it
+  (`str`/`bytes`/`bytearray`/`list`/`tuple`/`dict`/`set`/`frozenset`/`complex`),
+  the in-place halves mutate and return the receiver, and an operand of the
+  wrong kind answers `NotImplemented` for the set/dict/complex operators exactly
+  as CPython does. The same table drives `dir()`, so dispatch and listing still
+  agree in both directions.
+- **`x %= args` on a `bytes`/`bytearray`.** The in-place fallback carried the
+  `str %` branch but not the PEP 461 one, so `b'%d' % 1` formatted while
+  `x %= 1` on the same receiver raised `unsupported operand type(s) for %:
+  'bytes' and 'tuple'`.
+- **A numeric `AttributeError` names its type.** `(1).__iadd__` reported
+  `AttributeError: object has no attribute '__iadd__'` with no type; CPython
+  names it (`'int' object has no attribute '__iadd__'`).
 - **A value-keyed object NESTED inside a `tuple`/`frozenset` key.** A `tuple`/
   `frozenset` key is hashed element-wise, so an element with a user `__hash__`
   is a key in its own right — but only the TOP-LEVEL object was prepared outside
@@ -497,10 +517,37 @@ written.
 - **`dir()` on a builtin type is not CPython's full slot listing.** Every name it
   reports is one `getattr` resolves (asserted in both directions by
   `builtin_dir_lists_only_dispatchable_names` /
-  `builtin_dispatch_is_fully_listed_by_dir`), but the operator slots
-  (`__add__`, `__iadd__`, `__class_getitem__`, `__reduce_ex__`, …) are dispatched
-  natively rather than through per-type descriptor objects, so they are not
-  enumerable. 418 of CPython's 767 names across the 13 builtin types.
+  `builtin_dispatch_is_fully_listed_by_dir`), but the remaining slots
+  (`__class_getitem__`, `__reduce_ex__`, `__sizeof__`, `__init_subclass__`, …)
+  are dispatched natively rather than through per-type descriptor objects, so
+  they are not enumerable. 476 of CPython's 767 names across the 13 builtin
+  types. The BINARY OPERATOR slots are now real bound methods (see
+  "Implemented"), which is what took the count from 418 to 476.
+- **`collections.deque` implements none of its operators.** `deque + deque`,
+  `deque * n` and `q += […]` all raise `unsupported operand type(s)`, so its
+  `__add__`/`__iadd__`/`__mul__`/`__rmul__`/`__imul__` are deliberately kept out
+  of the bound-method table — exposing them would only move the failure.
+- **`TypeError` messages for a bad sequence repetition operand.** CPython says
+  `can't multiply sequence by non-int of type 'str'` for `[1] * 'a'` and
+  `'str' object cannot be interpreted as an integer` for the `__mul__` spelling;
+  pythonrs says `unsupported operand type(s) for *: 'list' and 'str'` for both.
+- **An unhashable key is not named at the container-op boundary.** CPython 3.12+
+  wraps the error as `cannot use 'list' as a dict key (unhashable type: 'list')`
+  / `... as a set element (...)`; pythonrs reports the bare
+  `unhashable type: 'list'`. Measured across 16 shapes — dict/set displays,
+  `d[k] = v`, `d[k]`, `get`, `in`, `set.add`, `dict(pairs)`, `set(iter)`,
+  `frozenset(iter)`, `dict.fromkeys`, `setdefault`, and the dict/set
+  comprehensions. Bare `hash([1])` correctly keeps the unwrapped message, and
+  `{}.pop([1])` raises `KeyError` in CPython where pythonrs raises the
+  `TypeError`. The traceback frame, source line and carets around it now match
+  (see "Implemented"); only the message text differs.
+- **`[nan] == [nan]` with one shared `nan` is False.** CPython's sequence
+  comparison shortcuts on element IDENTITY before `==`, so a list holding the
+  same `nan` object twice compares equal to itself. pythonrs stores a `float`
+  unboxed, so two equal-valued floats are indistinguishable from one object and
+  the shortcut cannot be reproduced. The identity shortcut IS applied to heap
+  objects, which is what makes `[P(1)] == [P(1)]` and `[x] == [x]` correct for
+  everything with a heap identity.
 
 ## Tooling
 - **`--build`** (AOT to a standalone native executable): implemented for the

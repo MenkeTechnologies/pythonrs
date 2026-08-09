@@ -2208,6 +2208,19 @@ fn inplace_binary_fallback(tag: i64, a: &Value, b: &Value) -> Result<Value, Stri
     if btag == host::binop::MOD && with_host(|h| matches!(h.get(a), Some(PyObj::Str(_)))) {
         return str_percent_format(a, b);
     }
+    // `bytes`/`bytearray` `%` (PEP 461), the same branch `b_binop` carries. Its
+    // absence here made `x %= args` raise `unsupported operand type(s) for %:
+    // 'bytes' and 'tuple'` on a receiver that `x % args` formats fine.
+    if btag == host::binop::MOD {
+        let is_ba = with_host(|h| match h.get(a) {
+            Some(PyObj::Bytes(_)) => Some(false),
+            Some(PyObj::Bytearray(_)) => Some(true),
+            _ => None,
+        });
+        if let Some(is_ba) = is_ba {
+            return bytes_percent_format(a, b, is_ba);
+        }
+    }
     if matches!(
         btag,
         host::binop::BITAND | host::binop::BITOR | host::binop::BITXOR
@@ -9032,6 +9045,9 @@ pub fn type_dir_names(typename: &str) -> Vec<&'static str> {
     if let Some(list) = type_method_names(typename) {
         out.extend_from_slice(list);
     }
+    // The operator dunders dispatch (see `op_dunders`), so they must be listed —
+    // `builtin_dispatch_is_fully_listed_by_dir` asserts that direction.
+    out.extend_from_slice(op_dunders(typename));
     match typename {
         "int" | "bool" => {
             out.extend_from_slice(INT_METHODS);
@@ -9123,6 +9139,11 @@ pub fn type_has_method(typename: &str, name: &str) -> bool {
     // per-type method lists below (which feed `dir()`), and `call_type_method`
     // routes the call through the membership check.
     if name == "__contains__" && CONTAINS_TYPES.contains(&typename) {
+        return true;
+    }
+    // A binary-operator dunder is dispatched natively, so it is absent from
+    // every per-type method table below.
+    if op_dunders(typename).contains(&name) {
         return true;
     }
     if let Some(list) = type_method_names(typename) {
@@ -9592,6 +9613,131 @@ const FLOAT_DUNDERS: &[&str] = &[
     "__hash__",
 ];
 
+/// The binary-operator dunders a builtin type exposes as BOUND METHODS, exactly
+/// the set CPython 3.14 puts on an instance of that type.
+///
+/// pythonrs dispatches operator slots natively rather than through per-type
+/// descriptor objects, so only `int`/`float`/`bool` — which carry an explicit
+/// table above — ever answered one. Every other builtin raised
+/// `AttributeError: 'dict' object has no attribute '__ior__'` while the `d |= …`
+/// SYNTAX worked, which is how the stdlib and user code reach for them
+/// (`functools.reduce(set.__or__, …)`, `dict.__ior__` in a merge helper).
+fn op_dunders(typename: &str) -> &'static [&'static str] {
+    // Immutable text/bytes: concatenation, repetition, and `%` formatting.
+    const TEXT: &[&str] = &["__add__", "__mul__", "__rmul__", "__mod__", "__rmod__"];
+    const MUT_TEXT: &[&str] = &[
+        "__add__", "__iadd__", "__mul__", "__rmul__", "__imul__", "__mod__", "__rmod__",
+    ];
+    const SEQ: &[&str] = &["__add__", "__mul__", "__rmul__"];
+    const MUT_SEQ: &[&str] = &["__add__", "__iadd__", "__mul__", "__rmul__", "__imul__"];
+    const DICT: &[&str] = &["__or__", "__ror__", "__ior__"];
+    const SET: &[&str] = &[
+        "__sub__", "__rsub__", "__isub__", "__and__", "__rand__", "__iand__", "__or__", "__ror__",
+        "__ior__", "__xor__", "__rxor__", "__ixor__",
+    ];
+    // A `frozenset` is immutable, so it has no in-place halves.
+    const FROZENSET: &[&str] = &[
+        "__sub__", "__rsub__", "__and__", "__rand__", "__or__", "__ror__", "__xor__", "__rxor__",
+    ];
+    const COMPLEX: &[&str] = &[
+        "__add__",
+        "__radd__",
+        "__sub__",
+        "__rsub__",
+        "__mul__",
+        "__rmul__",
+        "__truediv__",
+        "__rtruediv__",
+        "__pow__",
+        "__rpow__",
+    ];
+    match typename {
+        "str" | "bytes" => TEXT,
+        "bytearray" => MUT_TEXT,
+        "tuple" => SEQ,
+        // `deque` is absent on purpose: pythonrs implements none of its
+        // operators (`deque + deque`, `deque * n`, `q += […]` all raise
+        // `unsupported operand type(s)`), so exposing the dunders would only
+        // move the failure. Recorded in BUGS.md.
+        "list" => MUT_SEQ,
+        "dict" => DICT,
+        "set" => SET,
+        "frozenset" => FROZENSET,
+        "complex" => COMPLEX,
+        _ => &[],
+    }
+}
+
+/// Whether an operator dunder on a `tn` receiver accepts `b`, or must answer
+/// `NotImplemented`. CPython returns `NotImplemented` rather than raising for
+/// the set/dict/complex operators — that is what lets the interpreter fall
+/// through to the reflected operand and report `unsupported operand type(s)`.
+/// The sequence operators do raise, with the same message their `+`/`*` give.
+fn op_dunder_accepts(tn: &str, name: &str, b: &Value) -> bool {
+    match tn {
+        "set" | "frozenset" => {
+            with_host(|h| matches!(h.get(b), Some(PyObj::Set(_) | PyObj::Frozenset(_))))
+        }
+        // `dict.__ior__` takes anything `update` does (a mapping OR an iterable
+        // of pairs); `|` and its reflection need a mapping.
+        "dict" if name != "__ior__" => with_host(|h| matches!(h.get(b), Some(PyObj::Dict(_)))),
+        "complex" => is_num_like(b) || with_host(|h| h.is_complex(b)),
+        _ => true,
+    }
+}
+
+/// Run a binary-operator dunder called as a bound method (`{'a': 1}.__ior__(
+/// {'b': 2})`). The in-place halves mutate and return the receiver exactly as
+/// `x op= y` does; the rest share `inplace_binary_fallback`, which IS the
+/// `x op y` dispatch (instance dunders, `str`/`bytes` `%`, the set re-key pass,
+/// then the host op) so the two spellings cannot drift apart.
+fn op_dunder(tn: &str, recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
+    use host::iop;
+    let b = args.first().cloned().unwrap_or(Value::Undef);
+    if !op_dunder_accepts(tn, name, &b) {
+        return Ok(with_host(|h| h.alloc(PyObj::NotImplemented)));
+    }
+    let inplace = match name {
+        "__iadd__" => Some(iop::ADD),
+        "__isub__" => Some(iop::SUB),
+        "__imul__" => Some(iop::MUL),
+        "__iand__" => Some(iop::BITAND),
+        "__ior__" => Some(iop::BITOR),
+        "__ixor__" => Some(iop::BITXOR),
+        _ => None,
+    };
+    if let Some(tag) = inplace {
+        if let Some(r) = inplace_builtin(tag, recv, &b) {
+            return r;
+        }
+        return inplace_binary_fallback(tag, recv, &b);
+    }
+    // `__r<op>__` is the same operator with the operands the other way round.
+    let (tag, swap) = match name {
+        "__add__" => (iop::ADD, false),
+        "__radd__" => (iop::ADD, true),
+        "__sub__" => (iop::SUB, false),
+        "__rsub__" => (iop::SUB, true),
+        "__mul__" => (iop::MUL, false),
+        "__rmul__" => (iop::MUL, true),
+        "__truediv__" => (iop::DIV, false),
+        "__rtruediv__" => (iop::DIV, true),
+        "__mod__" => (iop::MOD, false),
+        "__rmod__" => (iop::MOD, true),
+        "__pow__" => (iop::POW, false),
+        "__rpow__" => (iop::POW, true),
+        "__and__" => (iop::BITAND, false),
+        "__rand__" => (iop::BITAND, true),
+        "__or__" => (iop::BITOR, false),
+        "__ror__" => (iop::BITOR, true),
+        "__xor__" => (iop::BITXOR, false),
+        "__rxor__" => (iop::BITXOR, true),
+        _ => return Err(host::type_error(&format!("internal: op dunder {name}"))),
+    };
+    let (l, r) = if swap { (&b, recv) } else { (recv, &b) };
+    inplace_binary_fallback(tag, l, r)
+}
+
 /// Is `name` a numeric dunder pythonrs exposes for base type `tn`?
 fn is_num_dunder(tn: &str, name: &str) -> bool {
     match tn {
@@ -9843,6 +9989,11 @@ pub fn call_type_method(
         return Ok(Value::Bool(disjoint));
     }
     match tn.as_str() {
+        // A binary-operator dunder called as a bound method. First, because no
+        // per-type table names one — an operator slot is dispatched natively, so
+        // every builtin but `int`/`float`/`bool` reported no such attribute for
+        // it even though the operator syntax worked.
+        _ if op_dunders(&tn).contains(&name) => op_dunder(&tn, recv, name, &args),
         // `.format` needs the kwargs (keyword replacement fields); other str
         // methods don't take keywords.
         "str" if name == "format" => {
@@ -12312,7 +12463,12 @@ fn num_dunder(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             let r = with_host(|h| h.binop(bo::MOD, &b, recv))?;
             Ok(with_host(|h| h.new_tuple(vec![q, r])))
         }
-        _ => Err(format!("AttributeError: object has no attribute '{name}'")),
+        _ => Err(with_host(|h| {
+            format!(
+                "AttributeError: '{}' object has no attribute '{name}'",
+                h.type_name(recv)
+            )
+        })),
     }
 }
 
@@ -12375,10 +12531,20 @@ fn num_method(
         }
         "hex" => match recv {
             Value::Float(f) => Ok(new_str(float_hex(*f))),
-            _ => Err(format!("AttributeError: object has no attribute '{name}'")),
+            _ => Err(with_host(|h| {
+                format!(
+                    "AttributeError: '{}' object has no attribute '{name}'",
+                    h.type_name(recv)
+                )
+            })),
         },
         "conjugate" => Ok(recv.clone()),
-        _ => Err(format!("AttributeError: object has no attribute '{name}'")),
+        _ => Err(with_host(|h| {
+            format!(
+                "AttributeError: '{}' object has no attribute '{name}'",
+                h.type_name(recv)
+            )
+        })),
     }
 }
 

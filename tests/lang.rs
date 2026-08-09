@@ -5680,3 +5680,95 @@ class P:\n\
         "[1, 2, True, 1]"
     );
 }
+
+// Operator slots are dispatched natively rather than through per-type descriptor
+// objects, so only `int`/`float`/`bool` (which carry an explicit dunder table)
+// answered one as a BOUND METHOD. Every other builtin raised
+// `AttributeError: 'dict' object has no attribute '__ior__'` while the `d |= …`
+// syntax worked. `dir()` must list exactly what dispatch accepts, so the same
+// table drives both (asserted by `builtin_dispatch_is_fully_listed_by_dir`).
+#[test]
+fn builtin_operator_dunders_are_callable_as_bound_methods() {
+    // dict: the merge operators, with `__ior__` mutating in place and returning
+    // the SAME object (CPython returns self) and taking any `update` argument.
+    assert_eq!(
+        g(
+            "d = {'a': 1}\n\
+             r = d.__ior__({'b': 2})\n\
+             x = [r is d, d, {'a': 1}.__or__({'b': 2}), {'a': 1}.__ror__({'b': 2})]",
+            "x"
+        ),
+        "[True, {'a': 1, 'b': 2}, {'a': 1, 'b': 2}, {'b': 2, 'a': 1}]"
+    );
+    // set: all four operators, forward, reflected and in-place.
+    assert_eq!(
+        g(
+            "s = {1, 2}\n\
+             r = s.__ior__({3})\n\
+             x = [r is s, sorted(s), sorted({1, 2}.__and__({2, 3})), \
+             sorted({1, 2}.__sub__({2})), sorted({1, 2}.__xor__({2, 3}))]",
+            "x"
+        ),
+        "[True, [1, 2, 3], [2], [1], [1, 3]]"
+    );
+    // frozenset has no in-place halves; its `__ror__` keeps the LEFT operand's
+    // type, so `{1}.__ror__(frozenset({2}))` is a frozenset.
+    assert_eq!(
+        g(
+            "x = [sorted(frozenset({1}).__or__({2})), type({1}.__ror__(frozenset({2}))).__name__]",
+            "x"
+        ),
+        "[[1, 2], 'frozenset']"
+    );
+    // Sequences and text: concatenation, repetition (both directions), and `%`.
+    assert_eq!(
+        g(
+            "l = [1]\n\
+             r = l.__iadd__((2,))\n\
+             x = [r is l, l, [1].__add__([2]), (1,).__add__((2,)), 'a'.__mul__(3), \
+             'a'.__rmul__(2), '%d' .__mod__(7), b'a'.__add__(b'b')]",
+            "x"
+        ),
+        "[True, [1, 2], [1, 2], (1, 2), 'aaa', 'aa', '7', b'ab']"
+    );
+    // An operand of the wrong kind answers NotImplemented for the set/dict and
+    // complex operators (CPython returns it rather than raising, which is what
+    // lets `{1} | [2]` report `unsupported operand type(s)`).
+    assert_eq!(
+        g(
+            "x = [{1: 2}.__or__([1]), {1}.__or__([2]), {1}.__sub__([1]), (1j).__add__('a')]",
+            "x"
+        ),
+        "[NotImplemented, NotImplemented, NotImplemented, NotImplemented]"
+    );
+    // The type a builtin does NOT expose stays an AttributeError that names the
+    // type, as CPython's does.
+    assert_eq!(
+        g(
+            "try:\n\
+             \x20   (1).__iadd__(2)\n\
+             except AttributeError as e:\n\
+             \x20   x = str(e)",
+            "x"
+        ),
+        "\"'int' object has no attribute '__iadd__'\""
+    );
+}
+
+// `x %= args` shared a fallback with `x = x % args` that carried the `str %`
+// branch but NOT the `bytes`/`bytearray` one (PEP 461), so `b'%d' % 1` formatted
+// while `x %= 1` on the same receiver raised `unsupported operand type(s)`.
+#[test]
+fn bytes_percent_works_in_place_too() {
+    assert_eq!(
+        g(
+            "x = b'%d-%s'\n\
+             x %= (1, b'z')\n\
+             y = bytearray(b'%d')\n\
+             y %= 5\n\
+             x = [x, y, b'%d'.__mod__(3)]",
+            "x"
+        ),
+        "[b'1-z', bytearray(b'5'), b'3']"
+    );
+}
