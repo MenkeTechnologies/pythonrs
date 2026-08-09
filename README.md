@@ -243,9 +243,10 @@ reference answered — exits non-zero instead of printing `divergences : 0`.
 
 Active, in development. The runtime executes a substantial real subset of Python
 3. The full CPython standard library is importable by default — the `stdlib-ffi`
-bridge (on by default) delegates `import os`/`re`/`json`/… to an embedded
+bridge (on by default) delegates `import os`/`json`/`random`/… to an embedded
 libpython, so only a `--no-default-features` build is limited to the native
-module subset. [BUGS.md](BUGS.md) is the honest ledger of remaining gaps. A DAP
+module subset. `re` and `itertools` are the exception: they are native in BOTH
+builds and never reach CPython. [BUGS.md](BUGS.md) is the honest ledger of remaining gaps. A DAP
 debug adapter (`--dap`) — source-line and function breakpoints, stepping, call
 stack, locals, and expression `evaluate` — ships today, alongside man pages and
 the generated `reference.html`.

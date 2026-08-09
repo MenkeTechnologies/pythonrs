@@ -7777,14 +7777,23 @@ fn re_compile(pattern: &Value, flags: i64) -> Result<Value, String> {
 }
 
 /// Build a `PyObj::Match` from a regex match over `text` (byte spans), recording
-/// the named-group index map from the pattern.
-fn re_build_match(pat_id: usize, text: &str, m_spans: Vec<Option<(usize, usize)>>) -> Value {
+/// the named-group index map from the pattern. `pos`/`endpos` are the byte window
+/// the search ran in — the whole subject unless the caller passed them.
+fn re_build_match(
+    pat_id: usize,
+    text: &str,
+    m_spans: Vec<Option<(usize, usize)>>,
+    pos: usize,
+    endpos: usize,
+) -> Value {
     let named: Vec<(String, usize)> = with_host(|h| h.regexes[pat_id].named_groups());
     with_host(|h| {
         h.alloc(PyObj::Match {
             text: text.to_string(),
             spans: m_spans,
             named,
+            pos,
+            endpos,
         })
     })
 }
@@ -7884,15 +7893,24 @@ pub fn re_pattern_method(
             // Optional `pos`/`endpos` (`p.match(s, pos)`): match within
             // `text[pos:endpos]` but report absolute positions. tomli scans a TOML
             // document with `RE_NUMBER.match(src, pos)`.
-            let pos = args
-                .get(1)
-                .and_then(|v| with_host(|h| h.as_int(v)))
-                .unwrap_or(0)
-                .clamp(0, text.len() as i64) as usize;
+            //
+            // Both arrive as CODEPOINT indices — Python computed them with
+            // `len()`/`str.find` — and the slicing below needs byte offsets.
+            // Consuming them raw made `p.search('aéb', 1)` slice from byte 1,
+            // which is the interior of 'é': `text.get(..)` returned None and the
+            // search reported no match at all.
+            let nchars = text.chars().count() as i64;
+            let pos = crate::regexpr::byte_index_of(
+                &text,
+                args.get(1)
+                    .and_then(|v| with_host(|h| h.as_int(v)))
+                    .unwrap_or(0)
+                    .clamp(0, nchars) as usize,
+            );
             let endpos = args
                 .get(2)
                 .and_then(|v| with_host(|h| h.as_int(v)))
-                .map(|e| (e.clamp(0, text.len() as i64)) as usize)
+                .map(|e| crate::regexpr::byte_index_of(&text, e.clamp(0, nchars) as usize))
                 .unwrap_or(text.len());
             let sub = text.get(pos..endpos).unwrap_or("");
             let anchored = method == "match" || method == "fullmatch";
@@ -7908,7 +7926,7 @@ pub fn re_pattern_method(
                     {
                         return Ok(Value::Undef);
                     }
-                    Ok(re_build_match(pat_id, &text, spans))
+                    Ok(re_build_match(pat_id, &text, spans, pos, endpos))
                 }
                 None => Ok(Value::Undef),
             }
@@ -7959,7 +7977,7 @@ pub fn re_pattern_method(
                 with_host(|h| h.regexes[pat_id].all_captures(&text));
             let matches: Vec<Value> = all
                 .into_iter()
-                .map(|s| re_build_match(pat_id, &text, s))
+                .map(|s| re_build_match(pat_id, &text, s, 0, text.len()))
                 .collect();
             // Return a list iterator (finditer yields lazily in CPython; a list is
             // an acceptable eager stand-in for typical use).
@@ -8050,7 +8068,7 @@ fn re_sub(
             }
             let (ms, me) = s.first().copied().flatten().unwrap_or((0, 0));
             out.push_str(&text[last..ms]);
-            let m = re_build_match(pat_id, text, s);
+            let m = re_build_match(pat_id, text, s, 0, text.len());
             let r = host::invoke(repl, vec![m], vec![])?;
             out.push_str(&with_host(|h| h.as_str(&r)).unwrap_or_default());
             last = me;
@@ -8138,7 +8156,9 @@ fn re_translate_repl(s: &str) -> String {
 /// A `re.Match` object's methods (`m.group(n)`, `m.groups()`, `m.span()`, …).
 pub fn re_match_method(m: &Value, method: &str, args: &[Value]) -> Result<Value, String> {
     let (text, spans, named) = match with_host(|h| h.get(m).cloned()) {
-        Some(PyObj::Match { text, spans, named }) => (text, spans, named),
+        Some(PyObj::Match {
+            text, spans, named, ..
+        }) => (text, spans, named),
         _ => return Err(host::type_error("not a match object")),
     };
     // Resolve a group specifier (int index or str name) to a group number.
@@ -8193,13 +8213,17 @@ pub fn re_match_method(m: &Value, method: &str, args: &[Value]) -> Result<Value,
         "start" | "end" | "span" => {
             let idx = args.first().and_then(group_idx).unwrap_or(0);
             match spans.get(idx).copied().flatten() {
-                Some((s, e)) => Ok(match method {
-                    "start" => Value::Int(s as i64),
-                    "end" => Value::Int(e as i64),
-                    _ => {
-                        with_host(|h| h.new_tuple(vec![Value::Int(s as i64), Value::Int(e as i64)]))
-                    }
-                }),
+                // The stored span is a byte range; Python counts `str` positions
+                // in codepoints. `re.search('b', 'éb').start()` is 1, not 2.
+                Some((s, e)) => {
+                    let s = crate::regexpr::char_index_of(&text, s) as i64;
+                    let e = crate::regexpr::char_index_of(&text, e) as i64;
+                    Ok(match method {
+                        "start" => Value::Int(s),
+                        "end" => Value::Int(e),
+                        _ => with_host(|h| h.new_tuple(vec![Value::Int(s), Value::Int(e)])),
+                    })
+                }
                 None => Ok(match method {
                     "span" => with_host(|h| h.new_tuple(vec![Value::Int(-1), Value::Int(-1)])),
                     _ => Value::Int(-1),

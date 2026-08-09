@@ -703,11 +703,16 @@ pub enum PyObj {
     /// A `re` match object. `text` is the searched string; `spans` holds the
     /// `(start, end)` byte range of each group (group 0 is the whole match), with
     /// `None` for a group that did not participate. `named` maps group names to
-    /// their index.
+    /// their index. `pos`/`endpos` are the window the search ran in, as byte
+    /// offsets like the spans — every one of these is converted to a codepoint
+    /// index by [`crate::regexpr::char_index_of`] on the way out to Python, which
+    /// counts `str` positions in characters and not in bytes.
     Match {
         text: String,
         spans: Vec<Option<(usize, usize)>>,
         named: Vec<(String, usize)>,
+        pos: usize,
+        endpos: usize,
     },
     /// A `time.struct_time` — the 9-field broken-down time sequence
     /// (`tm_year … tm_isdst`) plus the named-only `tm_gmtoff`/`tm_zone`. Indexes
@@ -3654,6 +3659,12 @@ impl PyHost {
                     let (s, e) = spans.first().copied().flatten().unwrap_or((0, 0));
                     let matched = text.get(s..e).unwrap_or("");
                     let q = matched.replace('\\', "\\\\").replace('\'', "\\'");
+                    // The repr renders the group-0 span, so it is a position
+                    // boundary like `span()` and reports codepoints too.
+                    let (s, e) = (
+                        crate::regexpr::char_index_of(text, s),
+                        crate::regexpr::char_index_of(text, e),
+                    );
                     format!("<re.Match object; span=({s}, {e}), match='{q}'>")
                 }
                 Some(PyObj::Union { args }) => {
@@ -9125,7 +9136,13 @@ impl PyHost {
                 }
             }
             // `re.Match` attributes; method names bind as callable methods.
-            Some(PyObj::Match { text, spans, .. }) => match name {
+            Some(PyObj::Match {
+                text,
+                spans,
+                pos,
+                endpos,
+                ..
+            }) => match name {
                 "string" => Ok(self.new_str(text.clone())),
                 "lastindex" => Ok(spans
                     .iter()
@@ -9133,8 +9150,13 @@ impl PyHost {
                     .filter(|&i| i > 0)
                     .map(|i| Value::Int(i as i64))
                     .unwrap_or(Value::Undef)),
-                "pos" => Ok(Value::Int(0)),
-                "endpos" => Ok(Value::Int(text.len() as i64)),
+                // The search window, in codepoints. `pos` was hard-coded to 0 and
+                // `endpos` to the BYTE length, so `p.search(s, 3).pos` reported 0
+                // and `m.endpos` counted 'é' twice.
+                "pos" => Ok(Value::Int(crate::regexpr::char_index_of(text, *pos) as i64)),
+                "endpos" => Ok(Value::Int(
+                    crate::regexpr::char_index_of(text, *endpos) as i64
+                )),
                 "group" | "groups" | "groupdict" | "start" | "end" | "span" => {
                     let func = self.alloc(PyObj::Builtin(format!("__base_method__.{name}")));
                     Ok(self.alloc(PyObj::BoundMethod {

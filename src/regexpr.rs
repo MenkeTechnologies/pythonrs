@@ -21,6 +21,45 @@ pub enum PyRegex {
 /// group that did not participate. Index 0 is the whole match.
 pub type Spans = Vec<Option<(usize, usize)>>;
 
+// ── the byte/codepoint boundary ─────────────────────────────────────────────
+//
+// Both engines index a `&str` by BYTE, and every span, slice and `pos` inside
+// this crate's `re` implementation is a byte offset — which is what the slicing
+// needs. CPython's `re` indexes a `str` by CODEPOINT: `re.search('b', 'éb')`
+// reports `span() == (1, 2)`, not `(2, 3)`.
+//
+// The two agree on ASCII and only on ASCII, so the difference is invisible to
+// an ASCII-only test and silently wrong on every other subject. The conversion
+// therefore happens exactly at the boundary where a position becomes visible to
+// Python (`start`/`end`/`span`/`pos`/`endpos`/the `repr`) or arrives from it
+// (the `pos`/`endpos` arguments), and NOWHERE else: the stored spans stay byte
+// offsets so the slicing that reads them stays correct.
+
+/// The codepoint index of byte offset `byte` in `text` — the number CPython
+/// reports for that position. `byte` is a char boundary for anything the engines
+/// produce; a stray interior offset counts the characters before it.
+pub fn char_index_of(text: &str, byte: usize) -> usize {
+    match text.get(..byte) {
+        Some(prefix) => prefix.chars().count(),
+        // Not on a boundary (or past the end): count what is reachable.
+        None => text
+            .char_indices()
+            .take_while(|(i, _)| *i < byte)
+            .count()
+            .min(text.chars().count()),
+    }
+}
+
+/// The byte offset of codepoint index `ch` in `text` — the inverse of
+/// [`char_index_of`], clamped to the end so an out-of-range `pos` argument
+/// behaves like CPython's (which clamps to `len(string)`).
+pub fn byte_index_of(text: &str, ch: usize) -> usize {
+    text.char_indices()
+        .nth(ch)
+        .map(|(i, _)| i)
+        .unwrap_or(text.len())
+}
+
 impl PyRegex {
     /// Compile `pattern`, preferring the non-backtracking engine. If `regex`
     /// rejects it, retry on `fancy_regex`; if that fails too, report the FIRST

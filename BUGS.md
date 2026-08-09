@@ -670,17 +670,28 @@ module then raises `ModuleNotFoundError`.
   surface — `textwrap.fill(t, width=…)`); the native subsets serve only
   `--no-default-features`.
 - **The rest of the stdlib is served by the `stdlib-ffi` bridge (on by default)**
-  — an embedded libpython over pyo3, so `import re`/`json`/`os`/`random`/`string`/
-  `itertools`/`functools`/`datetime`/`hashlib`/… load the **real CPython
+  — an embedded libpython over pyo3, so `import json`/`os`/`random`/`string`/
+  `functools`/`datetime`/`hashlib`/… load the **real CPython
   modules** (pure `.py` + the C accelerators), not hand-rolled shadows.
-  `functools.partial`/`lru_cache`/`reduce`, `re`, `json`, `os` + `os.path`,
-  `random`, `string`, and `itertools` (natively lazy `count`/`cycle`/`islice`)
-  all come from CPython there (`collections`/`math`/`sys` stay the native arms,
-  which resolve before the FFI fallback). A bare `cargo build` works as-is
-  (`.cargo/config.toml` pins `PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1` for pyo3's
-  3.14 forward-compat check). **Only a `--no-default-features` build drops the
-  bridge** — there `import functools`/`import re`/`import os` all raise
+  `functools.partial`/`lru_cache`/`reduce`, `json`, `os` + `os.path`,
+  `random` and `string` all come from CPython there. A bare `cargo build` works
+  as-is (`.cargo/config.toml` pins `PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1` for
+  pyo3's 3.14 forward-compat check). **Only a `--no-default-features` build drops
+  the bridge** — there `import functools`/`import os` all raise
   `ModuleNotFoundError`.
+- **`re` and `itertools` are NATIVE shadows in BOTH builds — they never reach
+  CPython.** This entry previously listed both among the modules the FFI bridge
+  serves, which was wrong in a way that matters: a probe that "passes" against a
+  bridged module proves CPython works, while a probe against these two proves
+  pythonrs's own code works, and only the second kind is evidence about the port.
+  `module_ffi_fallback` covers exactly `math`, `collections`, `functools` and
+  `contextlib`; `re` is not in that list, so a miss on the native namespace is a
+  hard `AttributeError` and never defers. Checking against CPython 3.14.6:
+  `hasattr(re, 'Scanner')` and `hasattr(re, 'RegexFlag')` are both `False` here
+  and `True` there; `hasattr(itertools, 'batched')` is `False` here and `True`
+  there. `re` is the Rust `regex`/`fancy_regex` engines behind
+  `src/regexpr.rs`, and its remaining gaps are listed under "Standard library —
+  `re`" below.
 - **FFI-boundary integration** — crossing the bridge with a pythonrs object.
   Working: `class C(enum.Enum)` (and other Foreign-base classes) are built by the
   real metaclass via CPython `types.new_class`, so members/`.name`/`.value`,
@@ -739,3 +750,57 @@ module then raises `ModuleNotFoundError`.
     `abc.ABC`/`@abstractmethod` are not yet recognized, so use a plain base class
     (a method raising `NotImplementedError`) for now. A native-base hierarchy's
     `super()`/MRO is unaffected.
+
+### Standard library — `re`
+
+`re` is native (see the entry above): the Rust `regex` engine, with
+`fancy_regex` taking the patterns that need look-around or backreferences.
+
+**Implemented (previously a silent wrong answer): every reported position is a
+CODEPOINT index, not a byte offset.** Both engines index a `&str` by byte, and
+every span, `pos` and slice inside `src/builtins.rs`'s `re` implementation is a
+byte offset — which is what the slicing needs. CPython's `re` indexes a `str` by
+codepoint. The two agree on ASCII and only on ASCII, so on any other subject
+every position was wrong with no error raised:
+`re.search('b', 'éb').span()` was `(2, 3)` against CPython's `(1, 2)`, and
+`[m.span() for m in re.finditer(r'.', 'aéb')]` was
+`[(0, 1), (1, 3), (3, 4)]` against `[(0, 1), (1, 2), (2, 3)]` — so
+`s[m.start():m.end()]` did not even reproduce `m.group()`. The conversion now
+happens at each of the five places a position crosses to or from Python and
+nowhere else, so the stored spans stay byte offsets and the slicing that reads
+them stays correct:
+
+  - `Match.start()`/`.end()`/`.span()` (`re_match_method`), for every group and
+    for a named group;
+  - `Match.pos`/`.endpos`, which were additionally hard-coded to `0` and to the
+    BYTE length — a match now records the window it was found in;
+  - `repr(Match)`, which renders the group-0 span;
+  - the `pos`/`endpos` ARGUMENTS of `Pattern.match`/`.search`/`.fullmatch`,
+    which arrive as codepoint indices (Python computed them with `len()`).
+    Consumed as bytes, `re.compile(r'.').search('aéb', 1)` sliced into the
+    interior of `'é'` and reported NO MATCH at all;
+  - the `fullmatch` end-of-window comparison, which stays on the byte basis
+    because both sides of it are internal.
+
+The pair `regexpr::char_index_of`/`byte_index_of` is the single definition of
+that boundary. Regression test: `re_positions_count_codepoints_not_bytes` in
+`tests/stdlib.rs`, and the `regex` mode of `parity-fuzz`, whose subjects mix
+1-, 2-, 3- and 4-byte characters in one string so that neither `byte == char`
+nor `byte == k*char` can carry a wrong implementation.
+
+Still open:
+- **A `bytes` subject is rejected.** `re.search(rb'b', b'ab')` raises
+  `TypeError: expected string`; CPython matches and reports BYTE offsets there
+  (`span() == (1, 2)` on `'aéb'.encode()` is `(3, 4)`). A bytes PATTERN compiles
+  (each byte is decoded as latin-1, which `json` relies on), but the subject must
+  be a `str`. Supporting it means carrying a bytes/str flag on the match so the
+  position conversion above is skipped.
+- **`Match.regs`, `Match.re`, `Match.lastgroup` and `Match.expand()` are
+  missing** — all four raise `AttributeError`. `m.regs` is the span tuple
+  (`((1, 3), (1, 2), (2, 3))`), so it is a position API and would convert the
+  same way. `m[i]` (`Match.__getitem__`) raises `TypeError`; `m.group(i)` works.
+- **`finditer` is eager.** It builds every match and returns a list iterator, so
+  `type(...).__name__` is `iterator` where CPython says `callable_iterator`, and
+  a scan over a huge subject materializes all of it.
+- **`re.Scanner` and `re.RegexFlag` are absent** (the flag constants exist as
+  plain ints; `re.A`/`re.I`/`re.M`/`re.S`/`re.X` all resolve).

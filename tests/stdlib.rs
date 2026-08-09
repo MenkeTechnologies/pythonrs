@@ -1396,6 +1396,90 @@ x = re.split(r'(a)|(b)', 'zazbz')"#,
 }
 
 #[test]
+fn re_positions_count_codepoints_not_bytes() {
+    // Both regex engines index a `&str` by BYTE; CPython's `re` indexes a `str`
+    // by CODEPOINT. The two agree on ASCII and only on ASCII, so this test uses
+    // a subject holding 1-, 2-, 3- and 4-byte characters at once: an all-ASCII
+    // subject makes byte == char, and a subject of uniform-width non-ASCII makes
+    // byte == k*char for a fixed k, either of which a wrong implementation can
+    // still pass. Every assertion below is CPython 3.14.6's answer.
+    //
+    // 'a\u{e9}b' is 3 characters and 4 bytes.
+    assert_eq!(
+        g("import re\nx = re.search('b', 'a\u{e9}b').span()", "x"),
+        "(2, 3)"
+    );
+    assert_eq!(
+        g("import re\nx = re.search('b', 'a\u{e9}b').start()", "x"),
+        "2"
+    );
+    assert_eq!(
+        g("import re\nx = re.search('b', 'a\u{e9}b').end()", "x"),
+        "3"
+    );
+    // Group spans, named and numbered, over mixed widths.
+    assert_eq!(
+        g(
+            "import re\nx = re.search(r'(?P<g>b)(.)', 'x\u{1f600}\u{e9}\u{65e5}bc').span('g')",
+            "x"
+        ),
+        "(4, 5)"
+    );
+    // Every codepoint boundary, once each — not every byte boundary.
+    assert_eq!(
+        g(
+            "import re\nx = [m.span() for m in re.finditer(r'.', '\u{e9}b\u{65e5}\u{1f600}')]",
+            "x"
+        ),
+        "[(0, 1), (1, 2), (2, 3), (3, 4)]"
+    );
+    // The `repr` renders the group-0 span, so it is a position boundary too.
+    assert_eq!(
+        g("import re\nx = repr(re.search('b', 'a\u{e9}b'))", "x"),
+        "\"<re.Match object; span=(2, 3), match='b'>\""
+    );
+    // `pos`/`endpos` ARGUMENTS arrive as codepoint indices (Python computed them
+    // with `len()`). Consumed as bytes, `pos=1` sliced into the interior of 'é'
+    // and the search reported no match at all.
+    assert_eq!(
+        g(
+            "import re\nx = re.compile(r'.').search('a\u{e9}b', 1).group()",
+            "x"
+        ),
+        "'\u{e9}'"
+    );
+    assert_eq!(
+        g(
+            "import re\nx = re.compile(r'.').search('a\u{e9}b', 1, 2).span()",
+            "x"
+        ),
+        "(1, 2)"
+    );
+    // …and the matching ATTRIBUTES report codepoints: `pos` was hard-coded to 0
+    // and `endpos` to the byte length.
+    assert_eq!(
+        g(
+            "import re\nm = re.compile(r'.').search('a\u{e9}b', 1)\nx = (m.pos, m.endpos)",
+            "x"
+        ),
+        "(1, 3)"
+    );
+    // The ASCII case keeps working — byte and codepoint coincide there.
+    assert_eq!(
+        g("import re\nx = re.search('b', 'ab').span()", "x"),
+        "(1, 2)"
+    );
+    // A slice taken with the reported offsets has to reproduce the match.
+    assert_eq!(
+        g(
+            "import re\ns = 'na\u{ef}ve caf\u{e9} \u{65e5}\u{672c}'\nm = re.search(r'caf.', s)\nx = s[m.start():m.end()] == m.group()",
+            "x"
+        ),
+        "True"
+    );
+}
+
+#[test]
 fn large_integers_compare_exactly() {
     // Equality on integers must be exact at any size. Comparing through `f64` made
     // any two integers within one ULP equal — at 29 digits that is a gap of
