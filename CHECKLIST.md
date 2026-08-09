@@ -24,10 +24,12 @@ the ordered, grounded gap list between here and that goal.
   representative script (file I/O, argv, subprocess, common stdlib, real composites
   like read→count→sort) through pythonrs and `python3` with identical argv and an
   isolated per-script cwd, diffs stdout + exit, reports per-category readiness with
-  the first differing line, and exits 0 only when every script matches. This is what
-  "can pythonrs transparently shadow `python3`" means — the fuzzer proves per-op
-  parity, the corpus proves whole-script parity, and it catches composite gaps the
-  per-expression fuzzer structurally can't (sort **stability**, `json.dumps(sort_keys=)`).
+  the first differing line, and exits 0 only when at least one script ran and every
+  script matches. A missing or empty `tests/dropin/` is exit 2 with the path named,
+  not a vacuous `0/0 OK` pass, and the pass line states the count it measured. This
+  is what "can pythonrs transparently shadow `python3`" means — the fuzzer proves
+  per-op parity, the corpus proves whole-script parity, and it catches composite gaps
+  the per-expression fuzzer structurally can't (sort **stability**, `json.dumps(sort_keys=)`).
 - Re-measure, never weaken the comparison to move a number.
 
 **Readiness snapshot — 2026-08-08: `30/30 OK (100%)`** against committed `main`
