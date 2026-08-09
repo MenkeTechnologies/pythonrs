@@ -5164,3 +5164,49 @@ fn except_star_syntax_rules_are_enforced() {
         }
     }
 }
+
+/// A call evaluates its CALLEE before its arguments (CPython's order). The
+/// bare-name form used to push the name and let the `CALL` op resolve it after
+/// the arguments were on the stack, so `aa(bb)` blamed `bb`.
+#[test]
+fn a_call_resolves_a_bare_name_callee_before_its_arguments() {
+    assert_eq!(
+        eval_str("aa(bb)").expect_err("aa(bb)"),
+        "NameError: name 'aa' is not defined"
+    );
+    assert_eq!(
+        eval_str("aa(bb, cc)").expect_err("aa(bb, cc)"),
+        "NameError: name 'aa' is not defined"
+    );
+    assert_eq!(
+        eval_str("aa(k=bb)").expect_err("aa(k=bb)"),
+        "NameError: name 'aa' is not defined"
+    );
+    // An argument that raises no longer masks the undefined callee.
+    assert_eq!(
+        eval_str("def boom():\n    raise ValueError('arg')\naa(boom())").expect_err("aa(boom())"),
+        "NameError: name 'aa' is not defined"
+    );
+    // The callee is resolved once, before the arguments run.
+    assert_eq!(
+        g(
+            "log = []\n\
+             def f(*a):\n\
+             \x20   log.append('call')\n\
+             \x20   return 0\n\
+             def arg():\n\
+             \x20   log.append('arg')\n\
+             \x20   return 1\n\
+             f(arg())\n\
+             x = log",
+            "x"
+        ),
+        "['arg', 'call']"
+    );
+    // The builtin type objects are interned, so a builtin is one object as in
+    // CPython (`id(len) == id(len)`), not a fresh allocation per read.
+    assert_eq!(
+        g("a = len\nb = len\nx = (a is b, id(a) == id(b))", "x"),
+        "(True, True)"
+    );
+}

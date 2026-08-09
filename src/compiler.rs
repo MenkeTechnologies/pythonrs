@@ -3267,42 +3267,11 @@ impl Compiler {
                     );
                 }
             }
-            // A callee that lives in a frame slot has to be pushed as a VALUE:
-            // the by-name `CALL` below resolves through the environment, which a
-            // slot is invisible to. A comprehension's target is exactly this —
-            // `[f() for f in fs]` calls its own loop variable.
-            Expr::Name(n) if self.slot_of(n).is_some() => {
-                self.compile_expr(b, func)?;
-                self.compile_seq(b, args)?;
-                if named.is_empty() {
-                    span_idx = b.emit(
-                        Op::CallBuiltin(ops::CALL_VALUE, argc(1 + args.len())?),
-                        self.cur_line,
-                    );
-                } else {
-                    build_kw(self, b)?;
-                    span_idx = b.emit(
-                        Op::CallBuiltin(ops::CALL_VALUE_KW, argc(2 + args.len())?),
-                        self.cur_line,
-                    );
-                }
-            }
-            Expr::Name(n) => {
-                self.name_const(b, n);
-                self.compile_seq(b, args)?;
-                if named.is_empty() {
-                    span_idx = b.emit(
-                        Op::CallBuiltin(ops::CALL, argc(1 + args.len())?),
-                        self.cur_line,
-                    );
-                } else {
-                    build_kw(self, b)?;
-                    span_idx = b.emit(
-                        Op::CallBuiltin(ops::CALL_KW, argc(2 + args.len())?),
-                        self.cur_line,
-                    );
-                }
-            }
+            // Everything else — including a BARE NAME callee, which used to push
+            // the name as a constant and let `CALL` resolve it after the
+            // arguments were on the stack. That inverted CPython's order, so
+            // `aa(bb)` blamed `bb`; resolving the name here restores it. The
+            // by-name `CALL`/`CALL_KW` ops stay for `compile_call_ex`.
             _ => {
                 self.compile_expr(b, func)?;
                 self.compile_seq(b, args)?;

@@ -1379,6 +1379,8 @@ pub struct PyHost {
     /// comparing `__cause__`/`__context__`/`__traceback__`/`__notes__` identity;
     /// an explicit link is exact and cannot alias an unrelated group.
     pub eg_split_root: HashMap<u32, u32>,
+    /// Interned type objects for the builtin names (see `builtin_object`).
+    builtin_objects: HashMap<String, Value>,
     /// Exceptions whose traceback starts EMPTY at the frame that produced them:
     /// the group `except*` reconstructs once its handlers have run. CPython
     /// builds that group after the handler finishes, so the frame holding the
@@ -1864,6 +1866,7 @@ impl PyHost {
             exc_links: HashMap::new(),
             exc_tb: HashMap::new(),
             eg_split_root: HashMap::new(),
+            builtin_objects: HashMap::new(),
             tb_starts_empty: HashSet::new(),
             func_attrs: HashMap::new(),
             codec_search: Vec::new(),
@@ -2001,6 +2004,19 @@ impl PyHost {
     pub fn alloc(&mut self, obj: PyObj) -> Value {
         self.heap.push(obj);
         Value::Obj((self.heap.len() - 1) as u32)
+    }
+
+    /// The interned type object for a builtin name (`len`, `int`, `ValueError`).
+    /// CPython's builtins are singletons — `id(len) == id(len)` — and reading one
+    /// is on the hot path of every call whose callee is a builtin, so the object
+    /// is allocated once and handed back.
+    pub fn builtin_object(&mut self, name: &str) -> Value {
+        if let Some(v) = self.builtin_objects.get(name) {
+            return v.clone();
+        }
+        let v = self.alloc(PyObj::Builtin(name.to_string()));
+        self.builtin_objects.insert(name.to_string(), v.clone());
+        v
     }
     /// A stable pseudo-address for an object (its heap index), used only for the
     /// `<… object at 0x…>` reprs where CPython prints an opaque pointer.

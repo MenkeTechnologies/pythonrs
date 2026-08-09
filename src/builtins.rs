@@ -185,7 +185,7 @@ fn b_getlocal(vm: &mut VM, _: u8) -> Value {
         return with_host(|h| h.alloc(PyObj::Ellipsis));
     }
     if is_known_builtin(&name) {
-        return with_host(|h| h.alloc(PyObj::Builtin(name.clone())));
+        return with_host(|h| h.builtin_object(&name));
     }
     abort(vm, host::name_error(&name))
 }

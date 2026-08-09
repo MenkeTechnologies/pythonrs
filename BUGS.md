@@ -349,15 +349,11 @@ written.
   `MKDICT_EX` site), and the rare >255-slot `MKFUNC`/class-base/`MATCH_CLASS`
   sites. CPython lowers all of these too; the same chunked treatment would extend
   to the call/spread paths.
-- **A call resolves its callee AFTER its arguments.** CPython evaluates the
-  callee first, then the arguments left to right. `compile_call`
-  (`src/compiler.rs`) folds callee resolution INTO the call op for its two fast
-  paths — a bare-name callee emits `name_const` + `CALL` (the name is looked up
-  by the op, after the args are on the stack), and an attribute callee emits
-  `GETATTR` inside `CALL_METHOD`. Observable two ways:
-
-      python -c 'aa(bb)'   CPython: NameError: name 'aa' is not defined
-                           pythonrs: NameError: name 'bb' is not defined
+- **A call with an ATTRIBUTE callee resolves it after its arguments.** CPython
+  evaluates the callee first, then the arguments left to right. The bare-name
+  callee now does the same (`aa(bb)` blames `aa`), but `compile_call`
+  (`src/compiler.rs`) still folds the attribute lookup INTO `CALL_METHOD`, so
+  `obj.m(g())` runs `g()` before resolving `m`:
 
       log = []
       def f(*a): log.append('call'); return 0
@@ -369,10 +365,17 @@ written.
                           pythonrs: ['arg', 'callee', 'call']
 
   Only a callee with a side effect (`__getattr__`, a property, a module
-  `__getattr__`) or an undefined name can tell the difference — a plain name
-  lookup has none. Fixing it means pushing the resolved callee as a value before
-  the arguments, which gives up the by-name `CALL` dispatch and the method fast
-  path; that is a call-protocol change, not a local edit.
+  `__getattr__`) can tell the difference; a method that exists on the type has
+  none. Fixing it means resolving the attribute to a value before the arguments,
+  which costs a `Builtin` object plus a `BoundMethod` allocation per call —
+  measured on a debug build, interleaved min-of-7 with the bytecode cache off,
+  `xs.append(i)` **+18.4%**, `d.get("k")` **+12.4%**, a user method **+7.0%**.
+  The bare-name change was taken because its measured cost was **+0.9%** for a
+  user function and **+6.0%** for a builtin (after interning the builtin type
+  objects); the method path was kept for that 12–18%. Closing it without the
+  regression needs a resolve-first opcode that leaves `recv`/`name` on the stack
+  when the type answers the name natively and only materializes a callable when
+  the lookup would run user code.
 - **No "did you mean" suggestions.** CPython appends a nearest-match hint to a
   `NameError`/`AttributeError` and to some `SyntaxError`s
   (`name 'st' is not defined. Did you mean: 'set'?`). pythonrs prints the bare
