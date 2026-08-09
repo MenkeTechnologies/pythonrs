@@ -99,6 +99,9 @@ use std::path::PathBuf;
 /// v31: a `def`/`lambda` with annotations compiles them as a `<annotate>` thunk
 /// (MKFUNC evaluates it with forward-reference NameErrors caught) instead of an
 /// inline dict, so annotated-function bytecode differs.
+/// v48: the `with` desugar calls its entry through the `.__enter__` /
+/// `.__aenter__` sentinel so the context-manager protocol check runs before the
+/// call; a chunk cached before this holds the bare name and would skip it.
 /// v47: an attribute STORE (`SETATTR`) and both DELETE forms (`DELATTR`,
 /// `DELITEM`) now carry the statement line and the target's caret span; a
 /// parenthesized with-item list (`with (a as x, b as y):`) parses at all. The
@@ -133,7 +136,7 @@ use std::path::PathBuf;
 /// v37: `%` by an integer literal inside a native slot loop lowers to native
 /// `Mod` + a branchless floor correction instead of the `BINOP` host call, so
 /// loops containing `%` emit different bytecode (and now qualify as native).
-const SCHEMA: u64 = 47;
+const SCHEMA: u64 = 48;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]

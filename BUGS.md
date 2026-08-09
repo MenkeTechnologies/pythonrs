@@ -9,6 +9,19 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **`with` checks the context-manager protocol before entering.** The desugar
+  called `ctx.__enter__()` directly, so a manager carrying only `__enter__` ran
+  it *and the whole body* and only failed on the way out with
+  `AttributeError: 'E' object has no attribute '__exit__'`. CPython's
+  `SETUP_WITH` looks up `__exit__` FIRST and refuses to enter at all. The entry
+  now routes through a dot-prefixed sentinel (unwriteable in Python source, like
+  the desugar's own `.ctx` temporaries) so the check runs before the call, in
+  CPython's order, with CPython's message: `TypeError: 'E' object does not
+  support the context manager protocol (missed __exit__ method)` — and
+  `missed __enter__ method` for the other half. `async with` reports the
+  `asynchronous context manager protocol` wording against `__aexit__`/
+  `__aenter__`. An explicit `obj.__enter__()` written by the user still raises
+  the ordinary `AttributeError`, as CPython does.
 - **Parenthesized with-items (`with (a as x, b as y):`).** PEP 617 gave CPython
   3.10 a PEG parser that can backtrack over the `(`-ambiguity, so a long `with`
   header can be wrapped in parentheses. pythonrs rejected the whole form with
@@ -424,17 +437,21 @@ written.
   variants; async-generator `asend`/`athrow`/`aclose`.
 
 ## Partial / simplified semantics
-- **A non-context-manager in `with` raises `AttributeError`, not `TypeError`.**
-  `with 1:` reports `AttributeError: 'int' object has no attribute '__enter__'`
-  where CPython reports `TypeError: 'int' object does not support the context
-  manager protocol (missed __exit__ method)` — a different exception TYPE, so an
-  `except TypeError:` around the `with` does not catch it. CPython checks
-  `__exit__` first and `__enter__` second (an object with only `__exit__`
-  reports `missed __enter__ method`). The `with` desugar lowers the entry to an
-  ordinary `ctx.__enter__()` method call (`compiler.rs::desugar_with_single`),
-  which is where the `AttributeError` comes from; a faithful fix needs the
-  protocol check to run as its own operation before the call, without changing
-  what an explicit user-written `obj.__enter__()` raises.
+- **The context-manager protocol check does not reach the natively shadowed
+  managers.** `with <not a context manager>:` now raises CPython's
+  `TypeError: 'X' object does not support the context manager protocol (missed
+  __exit__ method)` for a user instance and for the core scalars/containers, and
+  refuses to enter (see the Implemented entry). It is skipped for a native
+  `File`/`Lock`/`redirect_stdout` and for any bridged CPython object, because
+  those dispatch `__enter__`/`__exit__` inside `call_method_inner` without
+  exposing them as attributes — probing them would report a missing method that
+  is in fact there. A `with` on such a value that genuinely lacks the protocol
+  still reports the old `AttributeError`. A faithful fix needs a
+  "does this native type answer `__exit__`" predicate that agrees with
+  `call_method_inner`'s own dispatch table.
+- **`memoryview` is not a context manager.** `with memoryview(b"ab"):` raises
+  `AttributeError: 'memoryview' object has no attribute '__enter__'`; CPython's
+  `memoryview` supports `with` (the exit releases the buffer).
 - **No private-name mangling.** `self.__x` inside `class C` stays `__x`; CPython
   rewrites it to `_C__x` at compile time. So `C().__dict__` reads
   `{'__x': 1}` where CPython gives `{'_C__x': 1}`, `dir()` lists `__x`, and the

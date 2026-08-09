@@ -5981,3 +5981,84 @@ fn class_assignment_retypes_the_instance() {
          \"can't delete __class__ attribute\"]"
     );
 }
+
+// A value that is not a context manager was entered anyway: the `with` desugar
+// called `ctx.__enter__()` directly, so an object carrying only `__enter__` ran
+// it AND the whole body before failing on the way out with an `AttributeError`.
+// CPython looks up `__exit__` first and refuses to enter, with a `TypeError`.
+#[test]
+fn with_checks_the_context_manager_protocol_before_entering() {
+    assert_eq!(
+        g(
+            "log = []\n\
+             class E:\n\
+             \x20   def __enter__(self):\n\
+             \x20       log.append('entered')\n\
+             \x20       return 1\n\
+             try:\n\
+             \x20   with E():\n\
+             \x20       log.append('body')\n\
+             except TypeError as e:\n\
+             \x20   log.append(str(e))\n\
+             x = log",
+            "x"
+        ),
+        "[\"'E' object does not support the context manager protocol \
+         (missed __exit__ method)\"]"
+    );
+    // With `__exit__` present and `__enter__` missing, the other half is named.
+    assert_eq!(
+        g(
+            "class X:\n\
+             \x20   def __exit__(self, *a): return False\n\
+             try:\n\
+             \x20   with X(): pass\n\
+             except TypeError as e:\n\
+             \x20   x = str(e)",
+            "x"
+        ),
+        "\"'X' object does not support the context manager protocol \
+         (missed __enter__ method)\""
+    );
+    // A plain value reports against `__exit__`, the half CPython checks first.
+    assert_eq!(
+        g(
+            "try:\n\
+             \x20   with 1: pass\n\
+             except TypeError as e:\n\
+             \x20   x = str(e)",
+            "x"
+        ),
+        "\"'int' object does not support the context manager protocol \
+         (missed __exit__ method)\""
+    );
+    // The check belongs to the `with` statement: calling the dunder by hand
+    // still raises the ordinary AttributeError CPython raises for it.
+    assert_eq!(
+        g(
+            "try:\n\
+             \x20   (1).__enter__()\n\
+             except AttributeError as e:\n\
+             \x20   x = str(e).split('.')[0]",
+            "x"
+        ),
+        "\"'int' object has no attribute '__enter__'\""
+    );
+    // A working manager is untouched, and its `__exit__` still runs LIFO.
+    assert_eq!(
+        g(
+            "log = []\n\
+             class C:\n\
+             \x20   def __init__(self, n): self.n = n\n\
+             \x20   def __enter__(self): return self.n\n\
+             \x20   def __exit__(self, *a):\n\
+             \x20       log.append(self.n)\n\
+             \x20       return False\n\
+             with C(1) as a, C(2) as b:\n\
+             \x20   log.append((a, b))\n\
+             x = log",
+            "x"
+        ),
+        "[(1, 2), 2, 1]"
+    );
+}

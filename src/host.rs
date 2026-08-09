@@ -10897,12 +10897,83 @@ fn module_dict_method(
 /// `recv.name(*args, **kwargs)`. The attribute lookup is fused into the call, so
 /// a missing method never reaches `get_attr` — record the receiver here too, or
 /// an uncaught `obj.mispelled()` would render without CPython's hint.
+/// `'X' object does not support the [asynchronous ]context manager protocol
+/// (missed __exit__ method)` — CPython's `SETUP_WITH` / `BEFORE_ASYNC_WITH`
+/// error, naming whichever half of the protocol is absent.
+///
+/// The lookup order is CPython's: `__exit__` is checked FIRST, so an object
+/// carrying only `__enter__` is rejected before that `__enter__` can run, and
+/// an object carrying neither is reported against `__exit__`.
+fn context_manager_error(recv: &Value, is_async: bool) -> Option<String> {
+    // Only receivers whose protocol membership an attribute probe answers
+    // correctly are checked. A user instance resolves its dunders through its
+    // class, and none of the core scalars/containers has an enter/exit half —
+    // for both, `get_attr` is the same lookup the call would do. The natively
+    // shadowed managers (a file, a lock, `contextlib.redirect_stdout`) and any
+    // bridged CPython object dispatch `__enter__`/`__exit__` inside
+    // `call_method_inner` without exposing them as attributes, so probing them
+    // would report a missing method that is in fact there; those keep the
+    // pre-check behavior.
+    let probeable = with_host(|h| {
+        matches!(
+            recv,
+            Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Undef
+        ) || matches!(
+            h.get(recv),
+            Some(PyObj::Instance(_))
+                | Some(PyObj::Str(_))
+                | Some(PyObj::Bytes(_))
+                | Some(PyObj::Bytearray(_))
+                | Some(PyObj::List(_))
+                | Some(PyObj::Tuple(_))
+                | Some(PyObj::Dict(_))
+                | Some(PyObj::Set(_))
+                | Some(PyObj::Frozenset(_))
+                | Some(PyObj::Range { .. })
+                | Some(PyObj::BigInt(_))
+                | Some(PyObj::Complex(_, _))
+                | Some(PyObj::Generator { .. })
+        )
+    });
+    if !probeable {
+        return None;
+    }
+    let (enter, exit, adj) = if is_async {
+        ("__aenter__", "__aexit__", "asynchronous ")
+    } else {
+        ("__enter__", "__exit__", "")
+    };
+    // CPython's order: `__exit__` first, so an object carrying only `__enter__`
+    // is rejected before that `__enter__` runs, and one carrying neither is
+    // reported against `__exit__`.
+    let missing = [exit, enter]
+        .into_iter()
+        .find(|m| with_host(|h| h.get_attr(recv, m)).is_err())?;
+    Some(type_error(&format!(
+        "'{}' object does not support the {adj}context manager protocol \
+         (missed {missing} method)",
+        with_host(|h| h.type_name(recv))
+    )))
+}
+
 pub fn call_method(
     recv: &Value,
     name: &str,
     args: Vec<Value>,
     kwargs: Vec<(String, Value)>,
 ) -> Result<Value, String> {
+    // The `with` desugar routes its ENTRY call through a dot-prefixed sentinel
+    // (`.__enter__` / `.__aenter__`) so the context-manager protocol check runs
+    // before the call. A leading dot is unwriteable in Python source — the same
+    // trick the desugar's `.ctx` temporaries use — so an explicit user
+    // `obj.__enter__()` keeps raising the ordinary `AttributeError` that
+    // CPython raises for it.
+    if let Some(entry) = name.strip_prefix('.') {
+        if let Some(e) = context_manager_error(recv, entry.starts_with("__a")) {
+            return Err(e);
+        }
+        return call_method(recv, entry, args, kwargs);
+    }
     let r = call_method_inner(recv, name, args, kwargs);
     if let Err(e) = &r {
         if e.starts_with("AttributeError:") && e.contains(&format!("'{name}'")) {

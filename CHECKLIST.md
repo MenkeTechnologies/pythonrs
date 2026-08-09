@@ -311,11 +311,14 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
       `True` **suppresses**, `__exit__` receives the live `(type, value, None)` on the
       error path, and the parenthesized with-items form (`with (a as x, b as y):`,
       CPython 3.10+ / PEP 617) parses — including its precedence over the tuple
-      reading, so `with (a, b):` is two context managers. Still open: a value that is
-      not a context manager raises `AttributeError: 'int' object has no attribute
-      '__enter__'` where CPython raises `TypeError: 'int' object does not support the
-      context manager protocol (missed __exit__ method)` — a different exception type,
-      so `except TypeError:` around the `with` does not catch it.
+      reading, so `with (a, b):` is two context managers. The protocol is checked
+      before entry (`__exit__` first, CPython's order), so a manager carrying only
+      `__enter__` no longer runs it and the body before failing on the way out — it
+      raises `TypeError: 'E' object does not support the context manager protocol
+      (missed __exit__ method)`. Still open: that check is skipped for the natively
+      shadowed managers (`File`/`Lock`/`redirect_stdout`) and bridged CPython
+      objects, which still report the old `AttributeError` when they genuinely lack
+      the protocol; and `memoryview` does not support `with` at all.
 - [x] **`__slots__` enforced** — FIXED: a fully-slotted instance (every user class
       in its MRO declares `__slots__`) rejects assignment of an undeclared attribute
       (`… object has no attribute 'z' and no __dict__ …`) and has no `__dict__`; a

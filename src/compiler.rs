@@ -2424,10 +2424,15 @@ impl Compiler {
     /// slot is `None` (pythonrs has no traceback objects); the type and value are
     /// the real exception's.
     fn desugar_with_single(&mut self, it: &WithItem, body: Vec<Stmt>, is_async: bool) -> Vec<Stmt> {
+        // The ENTRY call goes through a dot-prefixed sentinel so
+        // `host::call_method` runs CPython's protocol check first: `__exit__` is
+        // looked up before `__enter__`, so a manager missing its exit half is
+        // rejected with a TypeError instead of running its `__enter__` (and the
+        // whole body) and only failing on the way out.
         let (enter_m, exit_m) = if is_async {
-            ("__aenter__", "__aexit__")
+            (".__aenter__", "__aexit__")
         } else {
-            ("__enter__", "__exit__")
+            (".__enter__", "__exit__")
         };
         let awaited = |e: Expr| -> Expr {
             if is_async {
