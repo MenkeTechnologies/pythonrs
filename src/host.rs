@@ -12322,16 +12322,13 @@ fn check_slots(ns: &IndexMap<String, Value>) -> Result<(), String> {
     let mut names: Vec<String> = Vec::with_capacity(items.len());
     let (mut add_dict, mut add_weak) = (false, false);
     for it in &items {
-        let name = match with_host(|h| match h.get(it) {
+        let name = with_host(|h| match h.get(it) {
             Some(PyObj::Str(s)) => Ok(s.clone()),
             _ => Err(type_error(&format!(
                 "__slots__ items must be strings, not '{}'",
                 h.type_name(it)
             ))),
-        }) {
-            Ok(s) => s,
-            Err(e) => return Err(e),
-        };
+        })?;
         if !crate::builtins::is_identifier(&name) {
             return Err(type_error("__slots__ must be identifiers"));
         }
