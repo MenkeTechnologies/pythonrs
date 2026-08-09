@@ -122,6 +122,38 @@ pub fn init() {
             std::env::set_var("PYTHONHOME", home);
         }
         pyo3::prepare_freethreaded_python();
+        line_buffer_std_streams();
+    });
+}
+
+/// Line-buffer the embedded interpreter's `sys.stdout`/`sys.stderr`.
+///
+/// pythonrs's own `print` writes straight to the fd and flushes every call,
+/// while CPython's `sys.stdout` is block-buffered on a pipe and the embedded
+/// interpreter is never `Py_Finalize`d — the process just exits. Anything that
+/// reaches CPython's real `print` (`functools.partial(print, …)`,
+/// `ExitStack.callback(print, …)`, `atexit.register(print, …)` — a pythonrs
+/// builtin crosses as the genuine CPython builtin) therefore came out in the
+/// wrong order relative to pythonrs's own output, or was dropped entirely at
+/// exit. Line buffering puts each CPython-side line on the fd as it is written,
+/// which is the order a single-interpreter CPython would produce.
+///
+/// `reconfigure` exists only on `TextIOWrapper`; a redirected or detached stream
+/// silently keeps whatever buffering it has.
+fn line_buffer_std_streams() {
+    Python::with_gil(|py| {
+        let sys = match py.import("sys") {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        for stream in ["stdout", "stderr"] {
+            if let Ok(s) = sys.getattr(stream) {
+                let kw = PyDict::new(py);
+                if kw.set_item("line_buffering", true).is_ok() {
+                    let _ = s.call_method("reconfigure", (), Some(&kw));
+                }
+            }
+        }
     });
 }
 
@@ -1316,8 +1348,8 @@ impl PyrsFile {
     // Line iteration for `csv.reader(f)` / `csv.DictReader(f)`: an empty line
     // from `readline` is EOF, which pyo3 turns into `StopIteration`.
     fn __next__(&self, py: Python) -> PyResult<Option<Py<PyAny>>> {
-        let line = crate::host::call_method(&self.target, "readline", vec![], vec![])
-            .map_err(rs_err)?;
+        let line =
+            crate::host::call_method(&self.target, "readline", vec![], vec![]).map_err(rs_err)?;
         let text = with_host(|h| h.str_of(&line));
         if text.is_empty() {
             return Ok(None);

@@ -155,3 +155,44 @@ fn missing_c_and_m_args_exit_2() {
     let (_o2, _e2, c2) = run(&["-m"], None);
     assert_eq!(c2, 2, "`-m` with no argument should exit 2");
 }
+
+#[test]
+fn cpython_side_stdout_interleaves_with_pythonrs_print() {
+    // Two writers share fd 1: pythonrs's own `print` (straight to the fd) and the
+    // embedded interpreter's `sys.stdout`. A pythonrs builtin handed to CPython
+    // crosses as the GENUINE CPython builtin, so `functools.partial(print, …)` and
+    // `ExitStack.callback(print, …)` write through CPython's stream. That stream
+    // is block-buffered on a pipe and the interpreter is never finalized, so its
+    // output used to come out reordered — or, with nothing after it to force a
+    // flush, be dropped at exit entirely. Piped stdout is the failing case, which
+    // is exactly what this harness gives it.
+    let prog = concat!(
+        "import contextlib, functools\n",
+        "print('a')\n",
+        "functools.partial(print, 'b')()\n",
+        "print('c')\n",
+        "with contextlib.ExitStack() as st:\n",
+        "    st.callback(print, 'cb1')\n",
+        "    st.callback(print, 'cb2')\n",
+        "print('d')\n",
+    );
+    let (out, err, code) = run(&["-c", prog], None);
+    assert_eq!(code, 0, "stderr: {err}");
+    // CPython 3.14 for the same program, in program order (callbacks are LIFO).
+    assert_eq!(out, "a\nb\nc\ncb2\ncb1\nd\n");
+}
+
+#[test]
+fn cpython_side_stdout_is_not_dropped_at_exit() {
+    // The write CPython owns is the LAST thing the program does: nothing after it
+    // can force a flush, so only per-line flushing keeps it.
+    let (out, err, code) = run(
+        &[
+            "-c",
+            "import functools\nfunctools.partial(print, 'last')()\n",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert_eq!(out, "last\n");
+}

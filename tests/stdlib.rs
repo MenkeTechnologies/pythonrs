@@ -267,6 +267,73 @@ fn itertools_eager_combinatorics() {
 
 #[cfg(feature = "stdlib-ffi")]
 #[test]
+fn itertools_chain_from_iterable() {
+    // `chain.from_iterable` is an alternate constructor read off the `chain`
+    // callable itself, not a module-level function — the attribute lookup used to
+    // raise `'builtin_function_or_method' object has no attribute
+    // 'from_iterable'`.
+    assert_eq!(
+        g(
+            "import itertools\nx = list(itertools.chain.from_iterable([[1, 2], [3], [4, 5]]))",
+            "x"
+        ),
+        "[1, 2, 3, 4, 5]"
+    );
+    // A generator of generators: nothing is materialized until the chain runs.
+    assert_eq!(
+        g(
+            "from itertools import chain\nx = list(chain.from_iterable((c for c in w) for w in ['ab', 'c']))",
+            "x"
+        ),
+        "['a', 'b', 'c']"
+    );
+    // Empty inners are skipped; an empty outer yields nothing.
+    assert_eq!(
+        g(
+            "from itertools import chain\nx = (list(chain.from_iterable([[], [1], []])), list(chain.from_iterable([])))",
+            "x"
+        ),
+        "([1], [])"
+    );
+}
+
+#[cfg(feature = "stdlib-ffi")]
+#[test]
+fn function_annotate_drives_singledispatch_register() {
+    // PEP 649: CPython 3.14's `singledispatch.register` reads `__annotate__` off
+    // the function (NOT `__annotations__`) to decide it may infer the dispatch
+    // type from the first parameter. Without it, `@show.register` on an annotated
+    // function raised "Invalid first argument to `register()`".
+    assert_eq!(
+        g(
+            "import functools\n@functools.singledispatch\ndef show(v):\n    return 'default'\n@show.register\ndef _(v: str):\n    return 'str'\n@show.register\ndef _(v: list):\n    return 'list'\nx = (show(1), show('a'), show([1]))",
+            "x"
+        ),
+        "('default', 'str', 'list')"
+    );
+    // An unannotated function has no `__annotate__` at all (CPython: `None`).
+    assert_eq!(g("def f(): pass\nx = f.__annotate__", "x"), "None");
+    // With annotations it is callable and answers the VALUE (1) format.
+    assert_eq!(
+        g(
+            "def f(v: str, n: int = 0) -> bool: pass\nx = f.__annotate__(1)",
+            "x"
+        ),
+        "{'v': <class 'str'>, 'n': <class 'int'>, 'return': <class 'bool'>}"
+    );
+    // A format this runtime cannot rebuild raises a bare `NotImplementedError`,
+    // exactly as CPython's compiler-generated `__annotate__` does.
+    assert_eq!(
+        g(
+            "def f(v: str) -> int: pass\ntry:\n    f.__annotate__(4)\n    x = 'returned'\nexcept NotImplementedError as e:\n    x = (repr(e), e.args)",
+            "x"
+        ),
+        "('NotImplementedError()', ())"
+    );
+}
+
+#[cfg(feature = "stdlib-ffi")]
+#[test]
 fn functools_reduce() {
     assert_eq!(
         g(
@@ -706,7 +773,10 @@ fn ffi_native_file_crosses_into_stdlib_calls() {
         h.repr_of(&v)
     });
     let _ = std::fs::remove_file(&path);
-    assert_eq!(got, "('{\"a\": [1, 2], \"b\": 1}', [('a', [1, 2]), ('b', 1)])");
+    assert_eq!(
+        got,
+        "('{\"a\": [1, 2], \"b\": 1}', [('a', [1, 2]), ('b', 1)])"
+    );
 }
 
 /// `csv` drives a file object by ITERATION on the read side (and `.write` on the
@@ -729,7 +799,6 @@ fn ffi_native_file_iterates_for_csv() {
     let _ = std::fs::remove_file(&path);
     assert_eq!(got, "[('ada', '36')]");
 }
-
 
 /// Exercise the `stdlib-ffi` bridge end to end: import a pure module and two
 /// C-accelerator modules, run a call on each, and marshal the result back. Values
@@ -2385,7 +2454,10 @@ fn json_round_trips_objects_with_several_keys() {
 #[test]
 fn ffi_dir_lists_the_real_cpython_attributes() {
     assert_eq!(
-        g("import json\nx = ('dumps' in dir(json), 'JSONDecodeError' in dir(json))", "x"),
+        g(
+            "import json\nx = ('dumps' in dir(json), 'JSONDecodeError' in dir(json))",
+            "x"
+        ),
         "(True, True)"
     );
     assert_eq!(

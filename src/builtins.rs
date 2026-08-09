@@ -2000,6 +2000,19 @@ fn b_binop(vm: &mut VM, _: u8) -> Value {
             return finish(vm, r);
         }
     }
+    // Set algebra between two independently built sets whose elements key
+    // through user code: re-key the right operand into the left's key space
+    // first (a no-op for every other operand pair).
+    if matches!(
+        tag,
+        host::binop::BITAND | host::binop::BITOR | host::binop::BITXOR
+    ) {
+        match host::align_operand(&a, &b) {
+            Ok(Some(b2)) => return finish(vm, with_host(|h| h.binop(tag, &a, &b2))),
+            Ok(None) => {}
+            Err(e) => return finish(vm, Err(e)),
+        }
+    }
     let r = with_host(|h| h.binop(tag, &a, &b));
     finish(vm, r)
 }
@@ -2074,6 +2087,14 @@ fn inplace_binary_fallback(tag: i64, a: &Value, b: &Value) -> Result<Value, Stri
     }
     if btag == host::binop::MOD && with_host(|h| matches!(h.get(a), Some(PyObj::Str(_)))) {
         return str_percent_format(a, b);
+    }
+    if matches!(
+        btag,
+        host::binop::BITAND | host::binop::BITOR | host::binop::BITXOR
+    ) {
+        if let Some(b2) = host::align_operand(a, b)? {
+            return with_host(|h| h.binop(btag, a, &b2));
+        }
     }
     with_host(|h| h.binop(btag, a, b))
 }
@@ -2183,6 +2204,13 @@ fn inplace_builtin(tag: i64, a: &Value, b: &Value) -> Option<Result<Value, Strin
     // form and falls through to the binary op (rebinding a new frozenset).
     let is_set = with_host(|h| matches!(h.get(a), Some(PyObj::Set(_))));
     if is_set && matches!(tag, iop::BITOR | iop::BITAND | iop::SUB | iop::BITXOR) {
+        // Re-key the operand into the receiver's key space when both sides hold
+        // elements that hash through user code (a no-op otherwise).
+        let aligned = match host::align_operand(a, b) {
+            Ok(v) => v,
+            Err(e) => return Some(Err(e)),
+        };
+        let b = aligned.as_ref().unwrap_or(b);
         let y = match with_host(|h| h.setmap_of(b)) {
             Some(y) => y,
             None => return Some(Err(unsupported_operand(iop_symbol(tag), a, b))),
@@ -3101,6 +3129,14 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
     let b_inst = with_host(|h| matches!(h.get(b), Some(PyObj::Instance(_))));
     // No user instance involved → native handling (preserves `1 == 1.0`, etc.).
     if !a_inst && !b_inst {
+        // Set difference, the subset orders, and container `==` all compare keys
+        // structurally inside the borrow; re-key the right operand into the
+        // left's key space first when both hold user-hashed elements.
+        if matches!(op, Sub | Eq | Ne | Lt | Le | Gt | Ge) {
+            if let Some(b2) = host::align_operand(a, b)? {
+                return with_host(|h| h.arith(op, a, &b2));
+            }
+        }
         return with_host(|h| h.arith(op, a, b));
     }
     match op {
@@ -3851,6 +3887,25 @@ pub fn call_builtin_function(
             None => Err(host::type_error(
                 "object.__new__(X): X is not a type object",
             )),
+        };
+    }
+    // `f.__annotate__(format)` (PEP 649). The annotations dict is bound as the
+    // first argument by `get_attr`; `format` selects the representation.
+    // pythonrs evaluates annotations at `def` time, so the already-evaluated
+    // mapping answers both `VALUE` (1) and `FORWARDREF` (3) — there is nothing
+    // left unresolved to turn into a `ForwardRef`. `STRING` (4) and
+    // `VALUE_WITH_FAKE_GLOBALS` (2) would need the un-evaluated source
+    // expressions, which are not retained; CPython's own compiler-generated
+    // `__annotate__` raises `NotImplementedError` for the formats it cannot
+    // produce, so this does too.
+    if name == "function.__annotate__" {
+        let ann = arg0(&args)?;
+        let format = args.get(1).and_then(|v| with_host(|h| h.as_int(v)));
+        return match format {
+            None | Some(1) | Some(3) => Ok(ann),
+            // CPython's compiler-generated `__annotate__` raises a bare
+            // `NotImplementedError` (no message) for a format it cannot build.
+            Some(_) => Err("NotImplementedError: ".into()),
         };
     }
     // `dict.fromkeys(iterable[, value])` reached via the `dict` type object.
@@ -10634,7 +10689,7 @@ fn is_other_id_continue(c: char) -> bool {
 
 /// CPython `str.isidentifier` (approximated with Rust's Unicode categories plus
 /// the `Other_ID_Start`/`Other_ID_Continue` chars CPython adds on top).
-fn is_identifier(s: &str) -> bool {
+pub(crate) fn is_identifier(s: &str) -> bool {
     let mut it = s.chars();
     match it.next() {
         Some(c) if c == '_' || c.is_alphabetic() => {}
@@ -11560,24 +11615,26 @@ fn set_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
                 } else {
                     call_builtin_function("set", vec![a.clone()], vec![])?
                 };
+                let aligned = host::align_operand(&acc, &other_set)?;
+                let other_set = aligned.unwrap_or(other_set);
                 acc = with_host(|h| h.arith(NumOp::Sub, &acc, &other_set))?;
             }
             Ok(acc)
         }
         "issubset" => {
-            let other = iter_keys(&arg0(args)?)?;
+            let other = iter_keys_against(&arg0(args)?, recv)?;
             Ok(Value::Bool(with_host(|h| {
                 set_keys(h, recv).iter().all(|k| other.contains(k))
             })))
         }
         "issuperset" => {
-            let other = iter_keys(&arg0(args)?)?;
+            let other = iter_keys_against(&arg0(args)?, recv)?;
             Ok(Value::Bool(with_host(|h| {
                 other.iter().all(|k| set_keys(h, recv).contains(k))
             })))
         }
         "isdisjoint" => {
-            let other = iter_keys(&arg0(args)?)?;
+            let other = iter_keys_against(&arg0(args)?, recv)?;
             Ok(Value::Bool(with_host(|h| {
                 set_keys(h, recv).iter().all(|k| !other.contains(k))
             })))
@@ -11595,7 +11652,11 @@ fn set_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             for a in args {
                 let items = host::iter_vec(a)?;
                 for it in items {
-                    let k = with_host(|h| h.to_key(&it))?;
+                    // Same keying as `add`: a user `__hash__` must run outside the
+                    // borrow, and a value-equal element already present collapses
+                    // onto its key rather than adding a duplicate slot.
+                    let cands = host::instance_key_candidates_for(recv, Some(&it));
+                    let k = host::with_instance_key(&it, &cands, || with_host(|h| h.to_key(&it)))?;
                     with_host(|h| {
                         if let Some(PyObj::Set(s)) = h.get_mut(recv) {
                             host::set_put(s, k, it);
@@ -11618,7 +11679,7 @@ fn set_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
         // Both variadic: apply each argument's key set in sequence.
         "intersection_update" => {
             for a in args {
-                let other = iter_keys(a)?;
+                let other = iter_keys_against(a, recv)?;
                 with_host(|h| {
                     if let Some(PyObj::Set(s)) = h.get_mut(recv) {
                         s.retain(|k, _| other.contains(k));
@@ -11629,7 +11690,7 @@ fn set_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
         }
         "difference_update" => {
             for a in args {
-                let other = iter_keys(a)?;
+                let other = iter_keys_against(a, recv)?;
                 with_host(|h| {
                     if let Some(PyObj::Set(s)) = h.get_mut(recv) {
                         s.retain(|k, _| !other.contains(k));
@@ -11642,7 +11703,8 @@ fn set_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             // Toggle membership of each element of the other iterable.
             let items = host::iter_vec(&arg0(args)?)?;
             for it in items {
-                let k = with_host(|h| h.to_key(&it))?;
+                let cands = host::instance_key_candidates_for(recv, Some(&it));
+                let k = host::with_instance_key(&it, &cands, || with_host(|h| h.to_key(&it)))?;
                 with_host(|h| {
                     if let Some(PyObj::Set(s)) = h.get_mut(recv) {
                         if s.shift_remove(&k).is_none() {
@@ -11681,6 +11743,26 @@ fn iter_keys(v: &Value) -> Result<Vec<PKey>, String> {
     Ok(ks)
 }
 
+/// The element keys of an iterable argument, re-keyed into `recv`'s key space:
+/// an element that is `__eq__`-equal to one of `recv`'s user-hashed elements
+/// takes that element's key, so the structural key comparison the caller does
+/// (`issubset`, `difference_update`, …) sees them as the same member. Falls back
+/// to [`iter_keys`] when `recv` has no user-hashed element to collapse onto.
+fn iter_keys_against(v: &Value, recv: &Value) -> Result<Vec<PKey>, String> {
+    let cands = host::instance_key_candidates(recv);
+    if cands.is_empty() {
+        return iter_keys(v);
+    }
+    let items = host::iter_vec(v)?;
+    let mut ks = Vec::with_capacity(items.len());
+    for it in items {
+        ks.push(host::with_instance_key(&it, &cands, || {
+            with_host(|h| h.to_key(&it))
+        })?);
+    }
+    Ok(ks)
+}
+
 fn set_binop(recv: &Value, args: &[Value], tag: i64) -> Result<Value, String> {
     let other = arg0(args)?;
     // Coerce a non-set argument to a set first.
@@ -11689,6 +11771,8 @@ fn set_binop(recv: &Value, args: &[Value], tag: i64) -> Result<Value, String> {
     } else {
         call_builtin_function("set", vec![other], vec![])?
     };
+    let aligned = host::align_operand(recv, &other_set)?;
+    let other_set = aligned.unwrap_or(other_set);
     with_host(|h| h.binop(tag, recv, &other_set))
 }
 
@@ -11706,6 +11790,8 @@ fn set_variadic(recv: &Value, args: &[Value], tag: i64) -> Result<Value, String>
         } else {
             call_builtin_function("set", vec![a.clone()], vec![])?
         };
+        let aligned = host::align_operand(&acc, &other_set)?;
+        let other_set = aligned.unwrap_or(other_set);
         acc = with_host(|h| h.binop(tag, &acc, &other_set))?;
     }
     Ok(acc)

@@ -9,6 +9,43 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **Cross-container algebra with value-keyed elements.** A set/dict operation
+  between two *independently built* containers whose elements key through user
+  code — a user instance with `__hash__`+`__eq__`, or a CPython `Foreign` object
+  (enum member, `Decimal`, `Fraction`, `datetime`, …) — now merges value-equal
+  elements across the two operands. `{P(1), P(2)} & {P(2)}` is `{P(2)}`, and
+  `|`/`-`/`^`, the method spellings (`union`/`intersection`/`difference`/
+  `symmetric_difference`), the in-place forms (`|= &= -= ^=`,
+  `update`/`intersection_update`/`difference_update`/
+  `symmetric_difference_update`), the subset orders (`< <= > >=`,
+  `issubset`/`issuperset`/`isdisjoint`), and `==` between two whole sets or dicts
+  all agree with CPython. Such a key carries the heap id of the object it
+  collapsed onto (`PKey::Instance`/`PKey::Foreign`) and the borrowed ops compare
+  keys structurally, so `host::align_operand` re-keys the right operand's
+  elements against the left's through `prepare_key` (running `__hash__`/`__eq__`,
+  or the bridge's, outside the borrow) before the comparison. Containers with no
+  value-keyed element skip the pass entirely. `update` and
+  `symmetric_difference_update` additionally raised `TypeError: unhashable type`
+  on any user-`__hash__` element, because they hashed inside the borrow.
+- **`__slots__` validation** (CPython `type_new_slots_impl`): a slot name also
+  bound in the class body is `ValueError: 'a' in __slots__ conflicts with class
+  variable`; a non-string is `TypeError: __slots__ items must be strings, not
+  'int'`; a non-identifier is `TypeError: __slots__ must be identifiers`; a
+  repeated `__dict__`/`__weakref__` is `TypeError: <name> slot disallowed: we
+  already got one`. `__qualname__` and `__classcell__` — names class creation
+  inserts itself — are exempt from the conflict check.
+- **`itertools.chain.from_iterable`** is reachable as an attribute of `chain`.
+- **`f.__annotate__`** (PEP 649): the callable that yields the annotations for a
+  requested format, `None` on an unannotated function. CPython 3.14's
+  `functools.singledispatch.register` gates on it, so `@generic.register` on an
+  annotated implementation now infers the dispatch type.
+- **CPython-side stdout ordering.** pythonrs's `print` writes straight to the fd,
+  while the embedded interpreter's `sys.stdout` is block-buffered on a pipe and
+  is never `Py_Finalize`d. A pythonrs builtin handed to CPython crosses as the
+  genuine CPython builtin, so `functools.partial(print, …)`,
+  `ExitStack.callback(print, …)` and friends wrote through that stream — their
+  output came out reordered, or was dropped at exit. Both streams are line
+  buffered at bridge init (`ffi::line_buffer_std_streams`).
 - **Generators / `yield`.** A `def` whose body contains `yield` builds a real
   lazy generator, backed by a stackful `corosensei` coroutine on the same thread
   (the thread-local `PyHost` is shared across suspend/resume via a swapped
@@ -278,23 +315,31 @@ written.
   variants; async-generator `asend`/`athrow`/`aclose`.
 
 ## Partial / simplified semantics
-- **Cross-set algebra (`& | - ^`) with hash+`__eq__`-keyed elements** — a set
-  *operation between two independently built sets* whose elements key by value
-  (a user instance with `__hash__`/`__eq__`, or a CPython `Foreign` object — enum
-  member, `Decimal`, `datetime`, …) does not merge value-equal elements across the
-  two operands: `{P(1), P(2)} & {P(2)}` yields `set()` rather than `{P(2)}`, and
-  `|`/`-`/`^` likewise. The dict/set *key* itself carries the heap id of the
-  object it collapsed onto within its own construction (see `PKey::Instance`/
-  `PKey::Foreign`), and the algebra ops compare those keys structurally, so equal
-  elements built from different handles occupy distinct slots. Construction,
-  membership (`in`), lookup, `.index`/`.count`, dedup within one literal, dict
-  keying, and `==` between two whole sets all resolve value equality correctly
-  (via `prepare_key` collapse); only the binary/`update` algebra ops between
-  separate sets miss it. This is one pre-existing bug shared by instance and
-  Foreign keys; a faithful fix re-keys each operand element against the other set
-  (the `prepare_key` collapse) instead of comparing keys structurally. **Foreign
-  set/dict keys otherwise fully work**: `{enum_member}`, `{Decimal(...): v}`,
-  `hash(member)`, `Counter([...])`, and value-equal fresh-handle lookups.
+- **No private-name mangling.** `self.__x` inside `class C` stays `__x`; CPython
+  rewrites it to `_C__x` at compile time. So `C().__dict__` reads
+  `{'__x': 1}` where CPython gives `{'_C__x': 1}`, `dir()` lists `__x`, and the
+  `__slots__` conflict check compares the name as written — `__slots__ = ('__x',)`
+  next to a `_C__x = 1` class variable is accepted where CPython raises
+  `ValueError: '_C__x' in __slots__ conflicts with class variable`. A faithful fix
+  is a compile-time rewrite of every `__name` (not ending in `__`) inside a class
+  body, which has to cover attribute access, plain names, keyword arguments, and
+  `global`/`nonlocal` declarations.
+- **A mutable container read off a bridged CPython object is a fresh copy.** The
+  marshaller converts a CPython `list`/`dict`/`set` to a native pythonrs value by
+  value on every read, so the identity is not preserved and an in-place mutation
+  is lost: with `@dataclass class P: tags: list = field(default_factory=list)`,
+  `p.tags is p.tags` is `False` and `p.tags.append(3)` leaves `p.tags == []`
+  (CPython: `[3]`). Arguments passed INTO a stdlib call are written back
+  (`writeback_mutated_args`), so `random.shuffle(xs)` works; only the attribute
+  read direction copies. A faithful fix keeps the container behind a `Foreign`
+  handle and routes the mutators through the bridge.
+- **`f.__annotate__` is a `functools.partial`, not a `function`.** It is callable,
+  answers the `VALUE`/`FORWARDREF` formats with the def-time annotations dict, and
+  raises a bare `NotImplementedError` otherwise — but `type(f.__annotate__)` and
+  its `repr` differ from CPython's compiler-generated annotate function. Likewise
+  `repr(itertools.chain.from_iterable)` is
+  `<built-in function itertools.chain.from_iterable>` where CPython prints
+  `<built-in method from_iterable of type object at 0x…>`; calling it agrees.
 - **Operator overloading dunders**: dispatched, with `NotImplemented` reflected
   fallback (see Implemented). Covered: arithmetic/bitwise
   (`__add__`/`__sub__`/`__mul__`/`__truediv__`/`__floordiv__`/`__mod__`/`__pow__`/

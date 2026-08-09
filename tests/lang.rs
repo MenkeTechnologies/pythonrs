@@ -3072,6 +3072,159 @@ fn instance_hash_dict_set_keys() {
 }
 
 #[test]
+fn set_algebra_between_independent_user_hashed_sets() {
+    // Two sets built separately hold DIFFERENT objects for the same value, and a
+    // user-`__hash__` key carries the heap id it collapsed onto — so the algebra
+    // has to re-key one operand against the other instead of comparing the stored
+    // keys. Every expectation below is the value CPython 3.14 prints.
+    const C: &str = "class P:\n    def __init__(s, v): s.v = v\n    def __hash__(s): return hash(s.v)\n    def __eq__(s, o): return isinstance(o, P) and s.v == o.v\na = {P(1), P(2)}\nb = {P(2), P(3)}\nv = lambda s: sorted(e.v for e in s)\n";
+    assert_eq!(g(&format!("{C}x = v(a & b)"), "x"), "[2]");
+    assert_eq!(g(&format!("{C}x = v(a | b)"), "x"), "[1, 2, 3]");
+    assert_eq!(g(&format!("{C}x = v(a - b)"), "x"), "[1]");
+    assert_eq!(g(&format!("{C}x = v(a ^ b)"), "x"), "[1, 3]");
+    // The method spellings take the same path as the operators.
+    assert_eq!(g(&format!("{C}x = v(a.intersection(b))"), "x"), "[2]");
+    assert_eq!(g(&format!("{C}x = v(a.difference(b))"), "x"), "[1]");
+    assert_eq!(
+        g(&format!("{C}x = v(a.symmetric_difference(b))"), "x"),
+        "[1, 3]"
+    );
+    // The subset orders, `==`, and `isdisjoint` compare keys the same way.
+    assert_eq!(g(&format!("{C}x = {{P(1)}} == {{P(1)}}"), "x"), "True");
+    assert_eq!(
+        g(&format!("{C}x = ({{P(1)}} <= a, a >= {{P(1)}})"), "x"),
+        "(True, True)"
+    );
+    assert_eq!(
+        g(&format!("{C}x = ({{P(1)}} < a, a < a)"), "x"),
+        "(True, False)"
+    );
+    assert_eq!(
+        g(&format!("{C}x = (a.issubset(a), a.isdisjoint(b))"), "x"),
+        "(True, False)"
+    );
+    // A dict keyed the same way compares by value too.
+    assert_eq!(
+        g(&format!("{C}x = {{P(1): 'a'}} == {{P(1): 'a'}}"), "x"),
+        "True"
+    );
+    // In-place forms mutate the receiver without duplicating the shared element.
+    assert_eq!(
+        g(&format!("{C}s = {{P(1), P(2)}}\ns &= b\nx = v(s)"), "x"),
+        "[2]"
+    );
+    assert_eq!(
+        g(&format!("{C}s = {{P(1), P(2)}}\ns -= b\nx = v(s)"), "x"),
+        "[1]"
+    );
+    assert_eq!(
+        g(&format!("{C}s = {{P(1)}}\ns |= b\nx = v(s)"), "x"),
+        "[1, 2, 3]"
+    );
+    assert_eq!(
+        g(&format!("{C}s = {{P(1), P(2)}}\ns ^= b\nx = v(s)"), "x"),
+        "[1, 3]"
+    );
+    // `update` / `symmetric_difference_update` raised `unhashable type: 'P'`
+    // before, because they hashed the element inside the host borrow.
+    assert_eq!(
+        g(
+            &format!("{C}s = {{P(1)}}\ns.update({{P(1), P(4)}})\nx = v(s)"),
+            "x"
+        ),
+        "[1, 4]"
+    );
+    assert_eq!(
+        g(
+            &format!(
+                "{C}s = {{P(1), P(2)}}\ns.symmetric_difference_update({{P(2), P(3)}})\nx = v(s)"
+            ),
+            "x"
+        ),
+        "[1, 3]"
+    );
+    assert_eq!(
+        g(
+            &format!("{C}s = {{P(1), P(2)}}\ns.intersection_update({{P(2)}})\nx = v(s)"),
+            "x"
+        ),
+        "[2]"
+    );
+    assert_eq!(
+        g(
+            &format!("{C}s = {{P(1), P(2)}}\ns.difference_update({{P(2)}})\nx = v(s)"),
+            "x"
+        ),
+        "[1]"
+    );
+    // A default (identity-hashed) instance must NOT collapse: two `B()`s are
+    // distinct members, so the alignment pass cannot over-merge.
+    assert_eq!(
+        g(
+            "class B: pass\nb1, b2 = B(), B()\nx = (len({b1, b2} & {b1}), len({b1} & {b2}))",
+            "x"
+        ),
+        "(1, 0)"
+    );
+}
+
+#[test]
+fn slots_validation_matches_type_new() {
+    // CPython `type_new_slots_impl`: a slot name that is also bound in the class
+    // body would be shadowed by the slot descriptor, so class creation rejects it.
+    for (src, want) in [
+        (
+            "class C:\n    __slots__ = ('a',)\n    a = 1",
+            "ValueError: 'a' in __slots__ conflicts with class variable",
+        ),
+        // The single-name string form is the same check.
+        (
+            "class C:\n    __slots__ = 'a'\n    a = 1",
+            "ValueError: 'a' in __slots__ conflicts with class variable",
+        ),
+        // A method counts as a class variable.
+        (
+            "class C:\n    __slots__ = ['m']\n    def m(self): pass",
+            "ValueError: 'm' in __slots__ conflicts with class variable",
+        ),
+        // Validity is checked first, for every slot, before any conflict.
+        (
+            "class C:\n    __slots__ = ('a b',)",
+            "TypeError: __slots__ must be identifiers",
+        ),
+        (
+            "class C:\n    __slots__ = (1,)",
+            "TypeError: __slots__ items must be strings, not 'int'",
+        ),
+        (
+            "class C:\n    __slots__ = ('__dict__', '__dict__')",
+            "TypeError: __dict__ slot disallowed: we already got one",
+        ),
+    ] {
+        assert_eq!(pythonrs::eval_str(src).unwrap_err(), want, "for {src:?}");
+    }
+    // Accepted: a slot with no namespace binding, an empty `__slots__` next to a
+    // class variable, a lone `__dict__`, and `__qualname__` (class creation
+    // inserts that one itself, so it is exempt from the conflict check).
+    for src in [
+        "class C:\n    __slots__ = ('a',)\n    def m(self): pass",
+        "class C:\n    __slots__ = ()\n    a = 1",
+        "class C:\n    __slots__ = ('__dict__',)",
+        "class C:\n    __slots__ = ('__qualname__',)",
+    ] {
+        assert!(pythonrs::eval_str(src).is_ok(), "for {src:?}");
+    }
+    // The slot still restricts attributes after passing validation.
+    assert_eq!(
+        g(
+            "class C:\n    __slots__ = ('a',)\nc = C()\nc.a = 1\ntry:\n    c.b = 2\n    x = 'set'\nexcept AttributeError:\n    x = (c.a, 'blocked')",
+            "x"
+        ),
+        "(1, 'blocked')"
+    );
+}
+
+#[test]
 fn walrus_in_comprehension_leaks() {
     // A `:=` target inside a comprehension binds in the enclosing scope (PEP 572),
     // not the hidden comprehension function; the result is unaffected.
@@ -4475,7 +4628,10 @@ fn dir_lists_builtin_type_methods_and_scope_names() {
     // `dir(type)` and `dir(value)` both list the methods the type responds to,
     // so a `"append" in dir(list)` capability check works.
     assert_eq!(
-        g("x = ('append' in dir(list), 'upper' in dir(str), 'upper' in dir('a'))", "x"),
+        g(
+            "x = ('append' in dir(list), 'upper' in dir(str), 'upper' in dir('a'))",
+            "x"
+        ),
         "(True, True, True)"
     );
     // Bare `dir()` is the names bound in the current scope: module globals at
@@ -4516,10 +4672,16 @@ fn str_maketrans_is_reachable_off_an_instance() {
     // `str.maketrans` is a staticmethod, so an instance reaches it too and gets
     // the same table (the receiver string is ignored).
     assert_eq!(
-        g("x = 'abc'.maketrans('ab', 'xy') == str.maketrans('ab', 'xy')", "x"),
+        g(
+            "x = 'abc'.maketrans('ab', 'xy') == str.maketrans('ab', 'xy')",
+            "x"
+        ),
         "True"
     );
-    assert_eq!(g("x = 'abc'.translate('zzz'.maketrans('ab', 'xy'))", "x"), "'xyc'");
+    assert_eq!(
+        g("x = 'abc'.translate('zzz'.maketrans('ab', 'xy'))", "x"),
+        "'xyc'"
+    );
 }
 
 #[test]
@@ -4831,7 +4993,10 @@ fn invalid_programs_are_rejected_at_compile_time() {
         // `return` outside a function ran silently and produced no error.
         ("return 1", "SyntaxError: 'return' outside function"),
         ("return", "SyntaxError: 'return' outside function"),
-        ("if 1:\n    return 2", "SyntaxError: 'return' outside function"),
+        (
+            "if 1:\n    return 2",
+            "SyntaxError: 'return' outside function",
+        ),
         // A class body does not inherit the enclosing function's scope.
         (
             "class C:\n    return 1",
@@ -4849,7 +5014,10 @@ fn invalid_programs_are_rejected_at_compile_time() {
             "SyntaxError: 'yield from' outside function",
         ),
         // A `try` with neither handler nor cleanup parsed and ran its body.
-        ("try:\n    pass", "SyntaxError: expected 'except' or 'finally' block"),
+        (
+            "try:\n    pass",
+            "SyntaxError: expected 'except' or 'finally' block",
+        ),
         (
             "try:\n    pass\nelse:\n    pass",
             "SyntaxError: expected 'except' or 'finally' block",
@@ -4860,7 +5028,10 @@ fn invalid_programs_are_rejected_at_compile_time() {
         ("@dec\nx = 1", "SyntaxError: invalid syntax"),
         ("x = else", "SyntaxError: invalid syntax"),
         ("print(pass)", "SyntaxError: invalid syntax"),
-        ("except ValueError:\n    pass", "SyntaxError: invalid syntax"),
+        (
+            "except ValueError:\n    pass",
+            "SyntaxError: invalid syntax",
+        ),
         ("finally:\n    pass", "SyntaxError: invalid syntax"),
     ];
     for (src, want) in cases {

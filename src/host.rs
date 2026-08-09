@@ -4800,6 +4800,75 @@ pub fn with_instance_key<R>(
     r
 }
 
+/// Whether any of `keys` was resolved through user code — a user
+/// `__hash__`/`__eq__` instance, or a bridged CPython object. Those keys carry
+/// the heap id of the object they collapsed onto (see `PKey::Instance`), so two
+/// independently built containers key value-equal elements differently.
+fn any_value_keyed<'a>(mut keys: impl Iterator<Item = &'a PKey>) -> bool {
+    keys.any(|k| matches!(k, PKey::Instance { .. } | PKey::Foreign { .. }))
+}
+
+/// The right operand of a set/dict operation, re-keyed into the LEFT operand's
+/// key space and returned as a fresh container of the same kind.
+///
+/// The borrowed comparisons that implement the set algebra (`& | - ^`), the
+/// subset orders (`<= < >= >`), and container `==` match keys structurally, and
+/// a key built from user code embeds the heap id of the object it collapsed
+/// onto — so `{P(1), P(2)} & {P(2)}` compared two different keys for the two
+/// `P(2)`s and yielded `set()`. Running every element of `b` back through
+/// [`prepare_key`] against `a`'s existing keys (which calls `__hash__`/`__eq__`,
+/// or the CPython bridge's, outside the borrow) collapses each value-equal
+/// element onto `a`'s key, after which the structural comparison is correct.
+///
+/// Returns `None` — no work done, the caller uses `b` unchanged — unless BOTH
+/// operands are the same kind of container AND both carry a key that resolved
+/// through user code. Nothing else can collapse, so the ordinary
+/// `int`/`str`/tuple-keyed containers keep their existing fast path.
+pub fn align_operand(a: &Value, b: &Value) -> Result<Option<Value>, String> {
+    enum Side {
+        Set(Vec<Value>, bool),
+        Dict(Vec<(Value, Value)>),
+    }
+    let (cands, side) = match with_host(|h| match (h.get(a), h.get(b)) {
+        (Some(PyObj::Set(x) | PyObj::Frozenset(x)), Some(PyObj::Set(y) | PyObj::Frozenset(y))) => {
+            if !any_value_keyed(x.keys()) || !any_value_keyed(y.keys()) {
+                return None;
+            }
+            let items = y.values().cloned().collect();
+            Some((set_local_candidates(x), Side::Set(items, h.is_frozenset(b))))
+        }
+        (Some(PyObj::Dict(x)), Some(PyObj::Dict(y))) => {
+            if !any_value_keyed(x.keys()) || !any_value_keyed(y.keys()) {
+                return None;
+            }
+            let pairs = y.values().cloned().collect();
+            Some((dict_local_candidates(x), Side::Dict(pairs)))
+        }
+        _ => None,
+    }) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    match side {
+        Side::Set(items, frozen) => {
+            let mut out: IndexMap<PKey, Value> = IndexMap::with_capacity(items.len());
+            for it in items {
+                let k = with_instance_key(&it, &cands, || with_host(|h| h.to_key(&it)))?;
+                set_put(&mut out, k, it);
+            }
+            Ok(Some(with_host(|h| h.new_setlike(out, frozen))))
+        }
+        Side::Dict(pairs) => {
+            let mut out: IndexMap<PKey, (Value, Value)> = IndexMap::with_capacity(pairs.len());
+            for (kv, vv) in pairs {
+                let k = with_instance_key(&kv, &cands, || with_host(|h| h.to_key(&kv)))?;
+                dict_put(&mut out, k, kv, vv);
+            }
+            Ok(Some(with_host(|h| h.new_dict(out))))
+        }
+    }
+}
+
 /// Canonical dict/set key for a float. An integral, finite float normalizes to
 /// the matching integer key (`Int`/`Big`) so it unifies with `int`/`bool`
 /// (`1.0 in {1}` → True); everything else keys by its raw bits.
@@ -8771,7 +8840,9 @@ impl PyHost {
                     }
                     "closed" => return Ok(Value::Bool(self.io_closed(id))),
                     // Only a text stream carries a codec, as in CPython.
-                    "encoding" if cls == "TextIOWrapper" => return Ok(self.new_str("UTF-8".to_string())),
+                    "encoding" if cls == "TextIOWrapper" => {
+                        return Ok(self.new_str("UTF-8".to_string()))
+                    }
                     "errors" if cls == "TextIOWrapper" => {
                         return Ok(self.new_str("strict".to_string()))
                     }
@@ -8944,6 +9015,26 @@ impl PyHost {
                 } else {
                     Ok(ann)
                 }
+            }
+            // `f.__annotate__` (PEP 649): the callable that produces the
+            // annotations for a requested format, or `None` on an unannotated
+            // function. CPython 3.14's `functools.singledispatch.register`
+            // gates on its presence before reading the first parameter's type.
+            Some(PyObj::Func(fv)) if name == "__annotate__" => {
+                let ann = fv.annotations.clone();
+                let empty = match self.get(&ann) {
+                    Some(PyObj::Dict(d)) => d.is_empty(),
+                    _ => true,
+                };
+                if empty {
+                    return Ok(Value::Undef);
+                }
+                let f = self.alloc(PyObj::Builtin("function.__annotate__".into()));
+                Ok(self.alloc(PyObj::Partial {
+                    func: f,
+                    args: vec![ann],
+                    kwargs: vec![],
+                }))
             }
             Some(PyObj::BoundMethod { func, .. }) if name == "__annotations__" => {
                 let func = func.clone();
@@ -9152,6 +9243,12 @@ impl PyHost {
                     kind: DescKind::WrapperDescriptor,
                     qual: format!("{n}.{name}"),
                 }))
+            }
+            // `itertools.chain.from_iterable` — the alternate constructor, read
+            // off the `chain` callable itself. `call_itertools` already builds it
+            // from the dotted name; only this lookup was missing.
+            Some(PyObj::Builtin(n)) if n == "itertools.chain" && name == "from_iterable" => {
+                Ok(self.alloc(PyObj::Builtin("itertools.chain.from_iterable".into())))
             }
             // `dict.fromkeys` — a classmethod on the `dict` type, reached as an
             // attribute of the `dict` builtin. Returns a callable builtin.
@@ -10616,6 +10713,14 @@ fn call_method_inner(
             crate::builtins::re_pattern_method(recv, name, &args, &kwargs)
         }
         Some(PyObj::Match { .. }) => crate::builtins::re_match_method(recv, name, &args),
+        // `f.__annotate__(fmt)` as a fused method call. `__annotate__` is a plain
+        // callable attribute rather than a function method, so the attribute has
+        // to be resolved first (an unannotated function yields `None`, and
+        // calling that raises the same `TypeError` CPython does).
+        Some(PyObj::Func(_)) if name == "__annotate__" => {
+            let f = with_host(|h| h.get_attr(recv, name))?;
+            invoke(&f, args, kwargs)
+        }
         // `func.__get__(obj, cls)` invoked directly (not via attribute read):
         // the descriptor bind — `obj` is None → the plain function, else a bound
         // method. Mirrors the `__get__` attribute a function exposes.
@@ -12066,6 +12171,83 @@ pub fn fire_set_name(class_name: &str, ns: &IndexMap<String, Value>) -> Result<(
     Ok(())
 }
 
+/// CPython's `__slots__` validation (`Objects/typeobject.c::type_new_slots_impl`),
+/// run on the class-body namespace before the class is created. Two passes, in
+/// CPython's order:
+///
+/// 1. every slot must be a string (`TypeError: __slots__ items must be strings,
+///    not '<type>'`) and a valid identifier (`TypeError: __slots__ must be
+///    identifiers`); `__dict__` and `__weakref__` may each appear at most once
+///    (`TypeError: __dict__ slot disallowed: we already got one`).
+/// 2. a remaining slot name that is also bound in the class body collides with
+///    the descriptor the slot would install:
+///    `ValueError: 'x' in __slots__ conflicts with class variable`. The three
+///    names class creation itself inserts (`__qualname__`, `__classcell__`,
+///    `__classdictcell__`) are exempt.
+///
+/// CPython mangles each slot name against the class name before the pass-2
+/// lookup; pythonrs has no private-name mangling anywhere, so a `__x` slot is
+/// compared as written (see BUGS.md).
+fn check_slots(ns: &IndexMap<String, Value>) -> Result<(), String> {
+    let slots = match ns.get("__slots__") {
+        Some(v) => v.clone(),
+        None => return Ok(()),
+    };
+    // `__slots__ = 'x'` names one slot; anything else is taken as a sequence
+    // (CPython `PySequence_Tuple`), so a tuple/list/set/dict all work.
+    let items: Vec<Value> = match with_host(|h| match h.get(&slots) {
+        Some(PyObj::Str(s)) => Some(s.clone()),
+        _ => None,
+    }) {
+        Some(s) => vec![with_host(|h| h.new_str(s))],
+        None => iter_vec(&slots)?,
+    };
+    let mut names: Vec<String> = Vec::with_capacity(items.len());
+    let (mut add_dict, mut add_weak) = (false, false);
+    for it in &items {
+        let name = match with_host(|h| match h.get(it) {
+            Some(PyObj::Str(s)) => Ok(s.clone()),
+            _ => Err(type_error(&format!(
+                "__slots__ items must be strings, not '{}'",
+                h.type_name(it)
+            ))),
+        }) {
+            Ok(s) => s,
+            Err(e) => return Err(e),
+        };
+        if !crate::builtins::is_identifier(&name) {
+            return Err(type_error("__slots__ must be identifiers"));
+        }
+        match name.as_str() {
+            "__dict__" if add_dict => {
+                return Err(type_error("__dict__ slot disallowed: we already got one"))
+            }
+            "__dict__" => add_dict = true,
+            "__weakref__" if add_weak => {
+                return Err(type_error(
+                    "__weakref__ slot disallowed: we already got one",
+                ))
+            }
+            "__weakref__" => add_weak = true,
+            _ => names.push(name),
+        }
+    }
+    for name in names {
+        if matches!(
+            name.as_str(),
+            "__qualname__" | "__classcell__" | "__classdictcell__"
+        ) {
+            continue;
+        }
+        if ns.contains_key(&name) {
+            return Err(format!(
+                "ValueError: '{name}' in __slots__ conflicts with class variable"
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn build_class(
     name: &str,
     bases: Vec<String>,
@@ -12078,6 +12260,7 @@ pub fn build_class(
         _ => return Err(type_error("internal: class body is not a function")),
     };
     let ns: IndexMap<String, Value> = run_class_body(name, body_func)?;
+    check_slots(&ns)?;
     // The effective metaclass: the explicit `metaclass=` if given, else the most
     // derived metaclass inherited from the bases (CPython rule). A user metaclass
     // constructs the class via `M(name, bases, namespace)` (firing `M.__new__`/
@@ -15608,7 +15791,11 @@ impl PyHost {
             0 => SeekFrom::Start(offset.max(0) as u64),
             1 => SeekFrom::Current(offset),
             2 => SeekFrom::End(offset),
-            _ => return Err(format!("ValueError: invalid whence ({whence}, should be 0, 1 or 2)")),
+            _ => {
+                return Err(format!(
+                    "ValueError: invalid whence ({whence}, should be 0, 1 or 2)"
+                ))
+            }
         };
         match self.io_handles.get_mut(id as usize) {
             Some(IoCell::File { file: Some(f), .. }) => {
