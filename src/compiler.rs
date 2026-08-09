@@ -708,12 +708,17 @@ impl Compiler {
                     b.emit(Op::Pop, 0);
                 }
             }
+            // Like the subscript store below, an attribute store raises on its
+            // own (`__slots__` rejection, a `property` with no setter, a
+            // read-only builtin attribute), so the op carries the line and the
+            // target's span or the traceback renders `line 0` with no carets.
             Expr::Attribute(recv, attr) => {
                 // stack: [value]; need [recv, name, value]
                 self.compile_expr(b, recv)?; // [value, recv]
                 self.name_const(b, attr); // [value, recv, name]
                 b.emit(Op::Rot, 0); // rotate value to top: [recv, name, value]
-                b.emit(Op::CallBuiltin(ops::SETATTR, 3), 0);
+                let op = b.emit(Op::CallBuiltin(ops::SETATTR, 3), self.cur_line);
+                self.record_span(op);
                 b.emit(Op::Pop, 0);
             }
             // The store op carries the statement's line and the target's span:
@@ -757,6 +762,15 @@ impl Compiler {
     }
 
     fn compile_delete(&mut self, b: &mut ChunkBuilder, target: &Expr) -> Result<(), String> {
+        // `del a.b` / `del a[i]` raise as often as the matching stores do, and
+        // the caret comes from the target's span — so keep the wrapper active
+        // instead of peeling it, exactly as `compile_assign` does.
+        if let Expr::Spanned(inner, sp) = target {
+            let prev = std::mem::replace(&mut self.node_span, *sp);
+            let r = self.compile_delete(b, inner);
+            self.node_span = prev;
+            return r;
+        }
         let target = target.unspanned();
         match target {
             Expr::Name(n) => {
@@ -767,13 +781,15 @@ impl Compiler {
             Expr::Subscript(recv, idx) => {
                 self.compile_expr(b, recv)?;
                 self.compile_subscript_index(b, idx)?;
-                b.emit(Op::CallBuiltin(ops::DELITEM, 2), 0);
+                let op = b.emit(Op::CallBuiltin(ops::DELITEM, 2), self.cur_line);
+                self.record_span(op);
                 b.emit(Op::Pop, 0);
             }
             Expr::Attribute(recv, attr) => {
                 self.compile_expr(b, recv)?;
                 self.name_const(b, attr);
-                b.emit(Op::CallBuiltin(ops::DELATTR, 2), 0);
+                let op = b.emit(Op::CallBuiltin(ops::DELATTR, 2), self.cur_line);
+                self.record_span(op);
                 b.emit(Op::Pop, 0);
             }
             _ => return Err("SyntaxError: cannot delete this expression".into()),

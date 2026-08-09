@@ -583,3 +583,44 @@ fn container_display_and_subscript_store_carry_a_line_and_caret() {
         )
     );
 }
+
+#[test]
+fn attribute_store_and_delete_carry_a_line_and_caret() {
+    // The attribute STORE and both DELETE forms emitted line 0, so every
+    // traceback from a rejected `obj.attr = v` / `del obj.attr` / `del obj[k]`
+    // said `line 0` with no source line and no carets. `__slots__` rejection is
+    // the everyday way to reach the store path.
+    assert_eq!(
+        traceback_of("class S:\n    __slots__ = ()\ns = S()\ns.x = 1\n"),
+        concat!(
+            "Traceback (most recent call last):\n",
+            "  File \"/t.py\", line 4, in <module>\n",
+            "    s.x = 1\n",
+            "    ^^^\n",
+            "AttributeError: 'S' object has no attribute 'x' and no __dict__ \
+             for setting new attributes\n",
+        )
+    );
+    // `del obj.attr` underlines the whole target, `del obj[k]` anchors its
+    // bracket region — the same shapes CPython draws for the stores.
+    assert_eq!(
+        traceback_of("class A: pass\na = A()\ndel a.__class__\n"),
+        concat!(
+            "Traceback (most recent call last):\n",
+            "  File \"/t.py\", line 3, in <module>\n",
+            "    del a.__class__\n",
+            "        ^^^^^^^^^^^\n",
+            "TypeError: can't delete __class__ attribute\n",
+        )
+    );
+    assert_eq!(
+        traceback_of("d = {}\ndel d[1]\n"),
+        concat!(
+            "Traceback (most recent call last):\n",
+            "  File \"/t.py\", line 2, in <module>\n",
+            "    del d[1]\n",
+            "        ~^^^\n",
+            "KeyError: 1\n",
+        )
+    );
+}

@@ -5772,3 +5772,212 @@ fn bytes_percent_works_in_place_too() {
         "[b'1-z', bytearray(b'5'), b'3']"
     );
 }
+
+// PEP 617 (CPython 3.10+) accepts a parenthesized with-item list. The frontend
+// rejected it outright (`SyntaxError: expected ')' but found Name("as")`), which
+// is a hard stop on any modern script that wraps a long `with` header. The
+// parenthesized alternative also has to WIN over the tuple reading, so
+// `with (a, b):` is two context managers.
+#[test]
+fn parenthesized_with_items_parse_as_separate_managers() {
+    assert_eq!(
+        g(
+            "log = []\n\
+             class C:\n\
+             \x20   def __init__(self, n): self.n = n\n\
+             \x20   def __enter__(self):\n\
+             \x20       log.append(('in', self.n))\n\
+             \x20       return self.n\n\
+             \x20   def __exit__(self, *a):\n\
+             \x20       log.append(('out', self.n))\n\
+             \x20       return False\n\
+             with (C(1) as a, C(2) as b):\n\
+             \x20   log.append(('body', a, b))\n\
+             x = log",
+            "x"
+        ),
+        "[('in', 1), ('in', 2), ('body', 1, 2), ('out', 2), ('out', 1)]"
+    );
+    // A trailing comma is allowed, and an item with no `as` still runs.
+    assert_eq!(
+        g(
+            "n = 0\n\
+             class C:\n\
+             \x20   def __enter__(self):\n\
+             \x20       global n\n\
+             \x20       n += 1\n\
+             \x20   def __exit__(self, *a): return False\n\
+             with (C(), C(),):\n\
+             \x20   pass\n\
+             x = n",
+            "x"
+        ),
+        "2"
+    );
+    // `with (expr) as v:` is still ONE item whose context is the parenthesized
+    // expression — the group does not close right before the `:`, so the
+    // item-list reading must not fire.
+    assert_eq!(
+        g(
+            "class C:\n\
+             \x20   def __enter__(self): return 7\n\
+             \x20   def __exit__(self, *a): return False\n\
+             with (C()) as v:\n\
+             \x20   x = v",
+            "x"
+        ),
+        "7"
+    );
+}
+
+// `divmod` was computed as `(a // b, a % b)`, so a class defining `__divmod__`
+// (and nothing else) raised `unsupported operand type(s) for //`. CPython
+// dispatches it as a binary operator in its own right.
+#[test]
+fn divmod_dispatches_the_divmod_dunders() {
+    assert_eq!(
+        g(
+            "class V:\n\
+             \x20   def __divmod__(self, o): return ('dm', o)\n\
+             \x20   def __rdivmod__(self, o): return ('rdm', o)\n\
+             x = [divmod(V(), 3), divmod(3, V())]",
+            "x"
+        ),
+        "[('dm', 3), ('rdm', 3)]"
+    );
+    // `__divmod__` wins over `__floordiv__`/`__mod__` when both are defined.
+    assert_eq!(
+        g(
+            "class M:\n\
+             \x20   def __floordiv__(self, o): return 'fd'\n\
+             \x20   def __mod__(self, o): return 'md'\n\
+             \x20   def __divmod__(self, o): return 'DM'\n\
+             x = divmod(M(), 1)",
+            "x"
+        ),
+        "'DM'"
+    );
+    // Neither dunder: CPython names the builtin in the message.
+    assert_eq!(
+        g(
+            "class V: pass\n\
+             try:\n\
+             \x20   divmod(V(), 3)\n\
+             except TypeError as e:\n\
+             \x20   x = str(e)",
+            "x"
+        ),
+        "\"unsupported operand type(s) for divmod(): 'V' and 'int'\""
+    );
+    // The native path is untouched.
+    assert_eq!(
+        g("x = [divmod(-7, 2), divmod(7, -2)]", "x"),
+        "[(-4, 1), (-4, -1)]"
+    );
+}
+
+// `dir(obj)` listed the class/instance dict and ignored a user `__dir__`.
+// CPython calls `type(obj).__dir__(obj)` and only sorts what comes back — no
+// dedup, and the sort's own errors surface.
+#[test]
+fn dir_dispatches_the_dir_hook() {
+    assert_eq!(
+        g(
+            "class C:\n\
+             \x20   def __dir__(self): return ['z', 'a', 'a']\n\
+             x = dir(C())",
+            "x"
+        ),
+        "['a', 'a', 'z']"
+    );
+    // Any iterable is accepted and becomes a sorted list.
+    assert_eq!(
+        g(
+            "class D:\n\
+             \x20   def __dir__(self): return ('q', 'b')\n\
+             x = dir(D())",
+            "x"
+        ),
+        "['b', 'q']"
+    );
+    // The hook belongs to instances: `dir(TheClass)` still lists the class.
+    assert_eq!(
+        g(
+            "class C:\n\
+             \x20   def __dir__(self): return ['z']\n\
+             x = '__dir__' in dir(C)",
+            "x"
+        ),
+        "True"
+    );
+}
+
+// `obj.__class__ = C` stored a shadowing entry in the instance dict and left
+// `type(obj)` alone — a silently wrong retype. CPython's setter swaps the type
+// when the layouts match and raises otherwise.
+#[test]
+fn class_assignment_retypes_the_instance() {
+    assert_eq!(
+        g(
+            "class A:\n\
+             \x20   def hi(self): return 'A'\n\
+             class B:\n\
+             \x20   def hi(self): return 'B'\n\
+             a = A()\n\
+             a.v = 3\n\
+             a.__class__ = B\n\
+             x = [type(a).__name__, a.__class__ is B, isinstance(a, B), isinstance(a, A), a.hi(), a.v]",
+            "x"
+        ),
+        "['B', True, True, False, 'B', 3]"
+    );
+    // Two classes adding the same slots share a layout; different slot names do
+    // not, and a `__dict__`-carrying class never matches a fully slotted one.
+    assert_eq!(
+        g(
+            "class S1:\n\
+             \x20   __slots__ = ('x',)\n\
+             class S2:\n\
+             \x20   __slots__ = ('x',)\n\
+             s = S1()\n\
+             s.__class__ = S2\n\
+             x = type(s).__name__",
+            "x"
+        ),
+        "'S2'"
+    );
+    assert_eq!(
+        g(
+            "class S1:\n\
+             \x20   __slots__ = ('x',)\n\
+             class S3:\n\
+             \x20   __slots__ = ('y',)\n\
+             try:\n\
+             \x20   S1().__class__ = S3\n\
+             except TypeError as e:\n\
+             \x20   x = str(e)",
+            "x"
+        ),
+        "\"__class__ assignment: 'S3' object layout differs from 'S1'\""
+    );
+    // A non-class value, a static builtin type, and deletion each have their own
+    // CPython message — and the value check runs before the mutability check.
+    assert_eq!(
+        g(
+            "class A: pass\n\
+             out = []\n\
+             for f in (lambda o: setattr(o, '__class__', 5),\n\
+             \x20         lambda o: setattr(o, '__class__', int),\n\
+             \x20         lambda o: delattr(o, '__class__')):\n\
+             \x20   try:\n\
+             \x20       f(A())\n\
+             \x20   except TypeError as e:\n\
+             \x20       out.append(str(e))\n\
+             x = out",
+            "x"
+        ),
+        "[\"__class__ must be set to a class, not 'int' object\", \
+         '__class__ assignment only supported for mutable types or ModuleType subclasses', \
+         \"can't delete __class__ attribute\"]"
+    );
+}

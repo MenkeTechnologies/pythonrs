@@ -516,21 +516,74 @@ impl Parser {
         self.parse_await_postfix()
     }
 
-    fn parse_with(&mut self, out: &mut Vec<Stmt>, line: u32, is_async: bool) -> Result<(), String> {
+    /// A parenthesized with-item list — `with (a as x, b as y):`, CPython 3.10+
+    /// (PEP 617 rewrote the grammar in PEG, which can backtrack over the
+    /// `(`-tuple ambiguity). The alternative is tried FIRST and wins whenever
+    /// the group closes immediately before the `:`, so `with (a, b):` is TWO
+    /// context managers, not one tuple. Anything else — `with (a, b)[0]:`,
+    /// `with (x for x in y):`, `with (a) as x:`, `with ():` — fails the shape
+    /// test, the cursor is restored, and the plain expression path parses it.
+    ///
+    /// Returns `Ok(None)` with the cursor exactly where it started when the
+    /// group is not an item list; a parse error inside the group is not an
+    /// error here, it is a non-match (the fallback path reports the real one).
+    fn parenthesized_with_items(&mut self) -> Option<Vec<WithItem>> {
+        if !self.at_op("(") {
+            return None;
+        }
+        let save = self.pos;
         self.advance();
         let mut items = Vec::new();
-        loop {
-            let context = self.parse_expr()?;
+        let shaped = loop {
+            if self.at_op(")") {
+                // Closing paren: end of a `a, b,` trailing-comma list. An empty
+                // group is the `()` tuple literal, not an item list.
+                break !items.is_empty();
+            }
+            let Ok(context) = self.parse_expr() else {
+                break false;
+            };
             let vars = if self.eat_kw("as") {
-                Some(self.parse_ternary()?)
+                match self.parse_ternary() {
+                    Ok(v) => Some(v),
+                    Err(_) => break false,
+                }
             } else {
                 None
             };
             items.push(WithItem { context, vars });
             if !self.eat_op(",") {
-                break;
+                break true;
             }
+        };
+        if shaped && self.eat_op(")") && self.at_op(":") {
+            return Some(items);
         }
+        self.pos = save;
+        None
+    }
+
+    fn parse_with(&mut self, out: &mut Vec<Stmt>, line: u32, is_async: bool) -> Result<(), String> {
+        self.advance();
+        let items = match self.parenthesized_with_items() {
+            Some(items) => items,
+            None => {
+                let mut items = Vec::new();
+                loop {
+                    let context = self.parse_expr()?;
+                    let vars = if self.eat_kw("as") {
+                        Some(self.parse_ternary()?)
+                    } else {
+                        None
+                    };
+                    items.push(WithItem { context, vars });
+                    if !self.eat_op(",") {
+                        break;
+                    }
+                }
+                items
+            }
+        };
         let body = self.parse_suite("'with' statement", line)?;
         out.push(Stmt::new(
             StmtKind::With {

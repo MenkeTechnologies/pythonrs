@@ -2007,6 +2007,9 @@ fn binop_symbol(lname: &str) -> &'static str {
         "__xor__" => "^",
         "__lshift__" => "<<",
         "__rshift__" => ">>",
+        // `divmod` is a binary operator with no glyph; CPython names the
+        // builtin in the message ("… for divmod(): 'V' and 'int'").
+        "__divmod__" => "divmod()",
         _ => "?",
     }
 }
@@ -4572,6 +4575,14 @@ pub fn call_builtin_function(
         "divmod" => {
             let a = arg0(&args)?;
             let b = args.get(1).cloned().unwrap_or(Value::Int(0));
+            // `divmod` is a binary operator in its own right, not sugar for
+            // `(a // b, a % b)`: CPython dispatches `type(a).__divmod__` and
+            // then the reflected `type(b).__rdivmod__`. A class defining only
+            // `__divmod__` (no `__floordiv__`/`__mod__`) has to work, and one
+            // defining both must see `__divmod__` win.
+            if let Some(r) = try_binop_dunder(&a, &b, "__divmod__", "__rdivmod__") {
+                return r;
+            }
             let q = with_host(|h| h.binop(host::binop::FLOORDIV, &a, &b))?;
             let r = with_host(|h| h.binop(host::binop::MOD, &a, &b))?;
             Ok(with_host(|h| h.new_tuple(vec![q, r])))
@@ -4962,6 +4973,18 @@ pub fn call_builtin_function(
             // lazily-bound `__main__` dunders have to exist by now.
             if args.is_empty() {
                 host::ensure_main_dunders();
+            }
+            // A user `__dir__` REPLACES the default listing: CPython's
+            // `PyObject_Dir` calls `type(obj).__dir__(obj)` and the builtin only
+            // turns the result into a sorted list. It does NOT deduplicate
+            // (`["a","a","z"]` stays three entries), and a non-iterable return
+            // or unorderable elements raise from that list()+sort() — which is
+            // exactly what routing through `sorted` reproduces.
+            if let Some(v) = args.first() {
+                if instance_dunder(v, "__dir__") {
+                    let seq = host::call_method(v, "__dir__", vec![], vec![])?;
+                    return call_builtin_function("sorted", vec![seq], vec![]);
+                }
             }
             Ok(with_host(|h| {
                 let names = match args.first() {

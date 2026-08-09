@@ -9,6 +9,41 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **Parenthesized with-items (`with (a as x, b as y):`).** PEP 617 gave CPython
+  3.10 a PEG parser that can backtrack over the `(`-ambiguity, so a long `with`
+  header can be wrapped in parentheses. pythonrs rejected the whole form with
+  `SyntaxError: expected ')' but found Name("as")` — a hard stop on any modern
+  script. The parenthesized item list is now tried first and wins whenever the
+  group closes immediately before the `:`, so `with (a, b):` is TWO context
+  managers (CPython's reading), while `with (a, b)[0]:`, `with (a) as x:`,
+  `with (x for x in y):` and `with ():` still parse as one expression.
+- **`divmod` dispatches `__divmod__`/`__rdivmod__`.** It was computed as
+  `(a // b, a % b)`, so a class defining only `__divmod__` raised
+  `TypeError: unsupported operand type(s) for //`, and a class defining all
+  three ran the wrong two. `divmod` is a binary operator in its own right, and
+  a missing pair now reports CPython's `unsupported operand type(s) for
+  divmod(): 'V' and 'int'`.
+- **`dir(obj)` honors a user `__dir__`.** The hook was inert: `dir()` always
+  listed the class/instance dict. CPython calls `type(obj).__dir__(obj)` and
+  only sorts the result — no dedup (`['a', 'a', 'z']` stays three entries), and
+  a non-iterable return or unorderable elements raise from that list()+sort().
+- **`obj.__class__ = C` retypes the instance.** The assignment stored a
+  shadowing `__class__` entry in the instance dict and left `type(obj)`
+  untouched — a silent no-op with no error. It now swaps the class (methods,
+  `isinstance`, and `__class__` all follow, the instance dict is kept) when the
+  layouts match, and otherwise raises CPython's message: `__class__ must be set
+  to a class, not 'int' object` for a non-class, `__class__ assignment only
+  supported for mutable types or ModuleType subclasses` for a static type on
+  either side, `__class__ assignment: 'B' object layout differs from 'A'` when
+  the slot layouts disagree. `del obj.__class__` raises
+  `TypeError: can't delete __class__ attribute` instead of an `AttributeError`.
+- **Attribute stores and deletes carry a line and caret.** `SETATTR`, `DELATTR`
+  and `DELITEM` were emitted with line 0, so every traceback out of a rejected
+  `obj.attr = v` (a `__slots__` rejection, a setter-less `property`) or a failed
+  `del obj.attr` / `del obj[k]` rendered `File "…", line 0, in <module>` with no
+  source line and no carets — naming nothing at all. They now carry the
+  statement's line and the target's span, the same fix the container displays
+  and subscript stores got.
 - **Binary operator slots are real bound methods on the builtin containers.**
   `{'a': 1}.__ior__({'b': 2})`, `[1].__add__([2])`, `{1, 2}.__and__({2})`,
   `'a'.__mul__(3)`, `b'a'.__add__(b'b')`, `(1j).__truediv__(2)` — every one of
@@ -389,6 +424,17 @@ written.
   variants; async-generator `asend`/`athrow`/`aclose`.
 
 ## Partial / simplified semantics
+- **A non-context-manager in `with` raises `AttributeError`, not `TypeError`.**
+  `with 1:` reports `AttributeError: 'int' object has no attribute '__enter__'`
+  where CPython reports `TypeError: 'int' object does not support the context
+  manager protocol (missed __exit__ method)` — a different exception TYPE, so an
+  `except TypeError:` around the `with` does not catch it. CPython checks
+  `__exit__` first and `__enter__` second (an object with only `__exit__`
+  reports `missed __enter__ method`). The `with` desugar lowers the entry to an
+  ordinary `ctx.__enter__()` method call (`compiler.rs::desugar_with_single`),
+  which is where the `AttributeError` comes from; a faithful fix needs the
+  protocol check to run as its own operation before the call, without changing
+  what an explicit user-written `obj.__enter__()` raises.
 - **No private-name mangling.** `self.__x` inside `class C` stays `__x`; CPython
   rewrites it to `_C__x` at compile time. So `C().__dict__` reads
   `{'__x': 1}` where CPython gives `{'_C__x': 1}`, `dir()` lists `__x`, and the

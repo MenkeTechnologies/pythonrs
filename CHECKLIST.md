@@ -268,8 +268,12 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
       class `__mro__`/`__bases__`/`__dict__`/`__qualname__` (`object` is the implicit
       MRO/bases tail), and `vars(instance)` (== `__dict__`). User-class repr now
       carries the `__main__.` module qualifier to match CPython (builtins stay bare).
-      Still open: `__subclasses__`; the synthetic `__dict__` dunder entries
-      (`__module__`/`__weakref__`/…); MRO-inconsistency detection.
+      `__subclasses__()` answers for user classes (`A.__subclasses__()` →
+      `[<class '__main__.B'>]`). Still open: `__subclasses__` on a BUILTIN type
+      object returns `[]` (`int.__subclasses__()` omits `bool`, `Exception`'s omits
+      the whole exception tree) and is not even readable as an attribute on `object`;
+      the synthetic `__dict__` dunder entries (`__module__`/`__weakref__`/…);
+      MRO-inconsistency detection.
 - [x] **Iteration protocol** — FIXED: `__iter__`/`__next__` (lazy when `__iter__`
       returns a native iterator, else materialized), `__getitem__(0..)`-fallback
       iteration, `__contains__` (with iterate-and-compare fallback), and
@@ -281,10 +285,11 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
       `True` for partial/lru_cache/namedtuple/static+classmethod callables).
 - [x] **Descriptor protocol** — FIXED (see `property` row above): `__get__`/`__set__`/
       `__set_name__` fire; data-vs-non-data precedence honored.
-- [ ] **Attribute-hook dunders** — `__getattr__` (fires when normal lookup fails),
-      `__getattribute__`, `__setattr__`, and `__delattr__` all FIXED and dispatched.
-      Still inert: `__dir__` — `dir(obj)` returns the class/instance dict rather than
-      the user hook's list.
+- [x] **Attribute-hook dunders** — `__getattr__` (fires when normal lookup fails),
+      `__getattribute__`, `__setattr__`, `__delattr__`, and `__dir__` all FIXED and
+      dispatched. `dir(obj)` now calls `type(obj).__dir__(obj)` and only sorts the
+      result, so it does not deduplicate and a non-iterable return / unorderable
+      elements raise exactly as CPython's list()+sort() do.
 - [x] **`__new__`** — FIXED: `instantiate` calls a user `__new__(cls, *a)` (implicit
       staticmethod) to build the instance; `object.__new__(cls)` allocates a bare
       instance; `__init__` runs only when `__new__` returned an instance of the class
@@ -298,18 +303,26 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
       `PyObj::NotImplemented` singleton resolves as a name and is honored by the
       comparison/arith dispatch (forward → reflected → identity for `==`/`!=`,
       `TypeError` for ordering/arith). Default `__ne__` derives from `__eq__`.
-      `__neg__`/`__pos__`/`__invert__`/`__abs__` dispatched. (`__iadd__`/`__divmod__`
-      still open.)
+      `__neg__`/`__pos__`/`__invert__`/`__abs__` dispatched. `__iadd__` runs through
+      the `INPLACE` op, and `divmod()` dispatches `__divmod__`/`__rdivmod__` as a
+      binary operator (it used to be computed as `(a // b, a % b)`, so a class
+      defining only `__divmod__` raised `unsupported operand type(s) for //`).
 - [ ] **Context managers** — multiple `with` now exit **LIFO**, `__exit__` returning
-      `True` **suppresses**, and `__exit__` receives the live `(type, value, None)` on
-      the error path: all FIXED. Still open: parenthesized `with (a as x, b as y)` is a
-      `SyntaxError: expected ')' but found Name("as")` — the parser does not accept the
-      parenthesized with-items form (CPython 3.10+, via its PEG parser).
+      `True` **suppresses**, `__exit__` receives the live `(type, value, None)` on the
+      error path, and the parenthesized with-items form (`with (a as x, b as y):`,
+      CPython 3.10+ / PEP 617) parses — including its precedence over the tuple
+      reading, so `with (a, b):` is two context managers. Still open: a value that is
+      not a context manager raises `AttributeError: 'int' object has no attribute
+      '__enter__'` where CPython raises `TypeError: 'int' object does not support the
+      context manager protocol (missed __exit__ method)` — a different exception type,
+      so `except TypeError:` around the `with` does not catch it.
 - [x] **`__slots__` enforced** — FIXED: a fully-slotted instance (every user class
       in its MRO declares `__slots__`) rejects assignment of an undeclared attribute
       (`… object has no attribute 'z' and no __dict__ …`) and has no `__dict__`; a
-      non-slotted base restores the dict (no restriction). Still open:
-      `a.__class__ = B` reassignment.
+      non-slotted base restores the dict (no restriction). `a.__class__ = B`
+      reassignment now retypes the instance in place, gated by CPython's layout rule
+      (equal added-slot sets), and rejects a non-class / static type / delete with
+      CPython's three messages.
 - [x] **`__init_subclass__` (PEP 487)** — FIXED: after a class is built and its
       `__set_name__` hooks fire, the parent's `__init_subclass__` (an implicit
       classmethod, resolved along the new class's MRO strictly after itself) is

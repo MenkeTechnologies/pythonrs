@@ -9977,6 +9977,13 @@ impl PyHost {
             attrs.insert(name.to_string(), val);
             return Ok(());
         }
+        // `obj.__class__ = C` RETYPES the object in place (CPython's
+        // `object.__class__` setter) — it is not a normal attribute store, so it
+        // must run before the instance dict / `__slots__` paths, which would
+        // otherwise stash a shadowing entry that `type(obj)` never reads.
+        if name == "__class__" {
+            return self.set_class(recv, &val);
+        }
         // `__slots__` enforcement: a slotted instance rejects any attribute name
         // not declared in its slots.
         if let Some(PyObj::Instance(inst)) = self.get(recv) {
@@ -10079,7 +10086,63 @@ impl PyHost {
         }
     }
 
+    /// `obj.__class__ = C` — retype an instance in place.
+    ///
+    /// CPython's `object.__class__` setter, in its order: the value must be a
+    /// class at all; then both the old and the new type must be mutable (heap)
+    /// types; then their layouts must match. Two pure-Python classes have the
+    /// same layout when they add the same slots — so a `__dict__`-carrying class
+    /// and a fully `__slots__`-ed one are never interchangeable, and two slotted
+    /// classes are only interchangeable when the slot names agree.
+    fn set_class(&mut self, recv: &Value, val: &Value) -> Result<(), String> {
+        let new = match self.get(val).cloned() {
+            Some(PyObj::Class(c)) => c,
+            // A builtin type object (`int`, `ValueError`) is a class, but a
+            // static one — assignment stops at the mutability check.
+            Some(PyObj::Builtin(n))
+                if crate::builtins::BUILTIN_TYPES.contains(&n.as_str())
+                    || crate::builtins::is_exception_class(&n) =>
+            {
+                return Err(type_error(
+                    "__class__ assignment only supported for mutable types or \
+                     ModuleType subclasses",
+                ))
+            }
+            _ => {
+                return Err(type_error(&format!(
+                    "__class__ must be set to a class, not '{}' object",
+                    self.type_name(val)
+                )))
+            }
+        };
+        let old = match self.get(recv) {
+            Some(PyObj::Instance(inst)) => inst.class.clone(),
+            // Everything else (int, str, list, a bridged object, a module) is a
+            // static type as far as pythonrs is concerned.
+            _ => {
+                return Err(type_error(
+                    "__class__ assignment only supported for mutable types or \
+                     ModuleType subclasses",
+                ))
+            }
+        };
+        if self.slots_of(&old) != self.slots_of(&new) {
+            return Err(type_error(&format!(
+                "__class__ assignment: '{new}' object layout differs from '{old}'"
+            )));
+        }
+        if let Some(PyObj::Instance(inst)) = self.get_mut(recv) {
+            inst.class = new;
+        }
+        Ok(())
+    }
+
     pub fn del_attr(&mut self, recv: &Value, name: &str) -> Result<(), String> {
+        // `del obj.__class__` is rejected by the setter slot itself, before any
+        // instance-dict lookup — CPython raises TypeError, not AttributeError.
+        if name == "__class__" {
+            return Err(type_error("can't delete __class__ attribute"));
+        }
         if let Some(PyObj::Instance(inst)) = self.get(recv) {
             let dict = inst.dict.clone();
             if self.inst_attr_del(&dict, name) {
