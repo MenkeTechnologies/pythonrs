@@ -542,7 +542,8 @@ kinds + guards), `for/else`/`while/else`, `try/except/else/finally` ordering all
       implicit `__context__` to the exception being handled (`h.exc` captured before
       the new raise overwrites it). Both readable on builtin `Exception` objects and on
       user exception instances (gated by `class_is_exception` so non-exception objects
-      still `AttributeError`). Still open: `ExceptionGroup` (though `except*` parses).
+      still `AttributeError`). PEP 654 exception groups and `except*` are implemented
+      on top of this (`src/excgroup.rs`); see BUGS.md.
 - [x] **User exception subclasses inherit `BaseException.__init__`/`__str__`/`.args`**
       — FIXED: a `class E(Exception)` instance now behaves like a builtin exception.
       Construction seeds `self.args = tuple(ctor_args)` (`BaseException.__new__`);
