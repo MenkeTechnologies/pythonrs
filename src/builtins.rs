@@ -8635,6 +8635,123 @@ pub fn type_method_names(typename: &str) -> Option<&'static [&'static str]> {
     })
 }
 
+/// Types whose `__contains__` is a real bound method (see [`type_has_method`]).
+const CONTAINS_TYPES: &[&str] = &[
+    "str",
+    "bytes",
+    "bytearray",
+    "list",
+    "tuple",
+    "dict",
+    "set",
+    "frozenset",
+    "range",
+    "deque",
+    "dict_keys",
+    "dict_items",
+    "dict_values",
+];
+
+/// The iterator types whose method set is the iterator protocol.
+const ITER_PROTOCOL_TYPES: &[&str] = &[
+    "zip",
+    "map",
+    "filter",
+    "enumerate",
+    "iterator",
+    "callable_iterator",
+];
+
+/// Every attribute name `typename` responds to — what `dir()` lists.
+///
+/// [`type_method_names`] only covers the types whose methods are a plain table.
+/// The ones decided by a RULE (`int`/`float`/`bool`, the dict subclasses, the
+/// iterators, the locks) answered `None` there, so `dir(int)` and `dir(5)` came
+/// back EMPTY while `(5).bit_length` and `(5).__add__` dispatched perfectly
+/// well. This reproduces every rule so the two agree; `builtin_dir_lists_only_dispatchable_names`
+/// and `builtin_dispatch_is_fully_listed_by_dir` (tests/lang.rs) assert in both
+/// directions that they cannot drift apart.
+pub fn type_dir_names(typename: &str) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    if let Some(list) = type_method_names(typename) {
+        out.extend_from_slice(list);
+    }
+    match typename {
+        "int" | "bool" => {
+            out.extend_from_slice(INT_METHODS);
+            out.extend_from_slice(INT_DUNDERS);
+        }
+        "float" => {
+            out.extend_from_slice(FLOAT_METHODS);
+            out.extend_from_slice(FLOAT_DUNDERS);
+        }
+        "OrderedDict" => {
+            out.extend_from_slice(DICT_METHODS);
+            out.push("move_to_end");
+        }
+        "defaultdict" => out.extend_from_slice(DICT_METHODS),
+        "Counter" => {
+            out.extend_from_slice(DICT_METHODS);
+            out.extend_from_slice(&["most_common", "elements", "subtract", "update", "total"]);
+        }
+        "dict_keys" | "dict_items" => out.push("isdisjoint"),
+        "Context" => out.extend_from_slice(&["run", "copy", "get", "keys", "values", "items"]),
+        "getset_descriptor"
+        | "member_descriptor"
+        | "wrapper_descriptor"
+        | "classmethod_descriptor"
+        | "method-wrapper" => out.extend_from_slice(&["__get__", "__set__", "__delete__"]),
+        "coroutine" => {
+            out.extend_from_slice(GENERATOR_METHODS);
+            out.push("__await__");
+        }
+        "async_generator" => {
+            out.extend_from_slice(&["__aiter__", "__anext__", "asend", "athrow", "aclose"])
+        }
+        "Event" => out.extend_from_slice(&["set", "clear", "is_set", "wait"]),
+        "Lock" => {
+            out.extend_from_slice(&["acquire", "release", "locked", "__aenter__", "__aexit__"])
+        }
+        "lock" => out.extend_from_slice(&[
+            "acquire",
+            "release",
+            "locked",
+            "_at_fork_reinit",
+            "__enter__",
+            "__exit__",
+        ]),
+        "RLock" => out.extend_from_slice(&[
+            "acquire",
+            "release",
+            "locked",
+            "_is_owned",
+            "_at_fork_reinit",
+            "__enter__",
+            "__exit__",
+        ]),
+        "Queue" => out.extend_from_slice(&[
+            "put",
+            "get",
+            "put_nowait",
+            "get_nowait",
+            "qsize",
+            "empty",
+            "full",
+        ]),
+        t if t.starts_with("itertools.") || ITER_PROTOCOL_TYPES.contains(&t) => {
+            out.extend_from_slice(&["__next__", "__iter__"])
+        }
+        t if is_exception_class(t) => out.extend_from_slice(&["with_traceback", "add_note"]),
+        _ => {}
+    }
+    if CONTAINS_TYPES.contains(&typename) {
+        out.push("__contains__");
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 /// Whether `typename` responds to method `name` (used by `getattr`/bound
 /// methods to distinguish a method from an `AttributeError`).
 pub fn type_has_method(typename: &str, name: &str) -> bool {
@@ -8643,24 +8760,7 @@ pub fn type_has_method(typename: &str, name: &str) -> bool {
     // builds `iskeyword`). Recognize it explicitly — it is kept OUT of the
     // per-type method lists below (which feed `dir()`), and `call_type_method`
     // routes the call through the membership check.
-    if name == "__contains__"
-        && matches!(
-            typename,
-            "str"
-                | "bytes"
-                | "bytearray"
-                | "list"
-                | "tuple"
-                | "dict"
-                | "set"
-                | "frozenset"
-                | "range"
-                | "deque"
-                | "dict_keys"
-                | "dict_items"
-                | "dict_values"
-        )
-    {
+    if name == "__contains__" && CONTAINS_TYPES.contains(&typename) {
         return true;
     }
     if let Some(list) = type_method_names(typename) {
@@ -8692,12 +8792,7 @@ pub fn type_has_method(typename: &str, name: &str) -> bool {
         // Every lazy iterator answers the iterator protocol as bound methods.
         // `threading` takes `itertools.count().__next__` as its name counter, and
         // reaching `__next__` only through `next(it)` was not enough.
-        _ if typename.starts_with("itertools.")
-            || matches!(
-                typename,
-                "zip" | "map" | "filter" | "enumerate" | "iterator" | "callable_iterator"
-            ) =>
-        {
+        _ if typename.starts_with("itertools.") || ITER_PROTOCOL_TYPES.contains(&typename) => {
             return matches!(name, "__next__" | "__iter__")
         }
         "coroutine" => return GENERATOR_METHODS.contains(&name) || name == "__await__",

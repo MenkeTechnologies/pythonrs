@@ -4723,3 +4723,96 @@ fn a_bad_dedent_does_not_pre_empt_an_earlier_syntax_error() {
         "expected the IndentationError, got: {e}"
     );
 }
+
+/// The builtin types `dir()` is expected to enumerate. Kept explicit so a new
+/// entry in the dispatch tables has to be added here consciously.
+#[cfg(test)]
+const DIR_AUDIT_TYPES: &[&str] = &[
+    "str",
+    "bytes",
+    "bytearray",
+    "list",
+    "dict",
+    "set",
+    "frozenset",
+    "tuple",
+    "range",
+    "int",
+    "float",
+    "bool",
+    "complex",
+    "deque",
+    "OrderedDict",
+    "defaultdict",
+    "Counter",
+    "generator",
+    "coroutine",
+    "async_generator",
+    "zip",
+    "map",
+    "filter",
+    "enumerate",
+    "iterator",
+    "lock",
+    "RLock",
+    "Event",
+    "Lock",
+    "Queue",
+    "Context",
+    "property",
+    "memoryview",
+    "slice",
+];
+
+/// `dir()` must never name something `getattr` cannot produce.
+///
+/// `dir()` used to read `type_method_names`, which is `None` for every type
+/// whose method set is a RULE rather than a table — so `dir(int)` came back
+/// EMPTY while `(5).bit_length` and `(5).__add__` dispatched fine. It now reads
+/// `type_dir_names`, which reproduces those rules. This asserts the direction
+/// that matters: a listed name is a name that dispatches.
+#[test]
+fn builtin_dir_lists_only_dispatchable_names() {
+    for t in DIR_AUDIT_TYPES {
+        for n in pythonrs::builtins::type_dir_names(t) {
+            assert!(
+                pythonrs::builtins::type_has_method(t, n),
+                "dir({t}) lists {n}, which dispatch does not accept"
+            );
+        }
+    }
+}
+
+/// And the other direction: dispatch must never accept a name `dir()` hides.
+///
+/// The candidate universe is every name any type is known to answer to, which
+/// makes the check enumerable — a name that dispatch accepts for a type but
+/// `type_dir_names` omits is an invisible attribute.
+#[test]
+fn builtin_dispatch_is_fully_listed_by_dir() {
+    let universe: Vec<&'static str> = {
+        let mut u: Vec<&'static str> = Vec::new();
+        for t in DIR_AUDIT_TYPES {
+            u.extend(pythonrs::builtins::type_dir_names(t));
+        }
+        u.sort_unstable();
+        u.dedup();
+        u
+    };
+    assert!(
+        universe.len() > 100,
+        "the candidate universe collapsed to {} names — the tables are not being read",
+        universe.len()
+    );
+    for t in DIR_AUDIT_TYPES {
+        let listed = pythonrs::builtins::type_dir_names(t);
+        for n in &universe {
+            if pythonrs::builtins::type_has_method(t, n) {
+                assert!(
+                    listed.contains(n),
+                    "{t} dispatches {n}, but dir({t}) does not list it"
+                );
+            }
+        }
+    }
+}

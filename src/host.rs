@@ -9129,6 +9129,18 @@ impl PyHost {
                         func: b,
                     }));
                 }
+                // The type-level dunders every value inherits (`[].__init__`,
+                // `(5).__sizeof__`, `"x".__doc__`). CPython resolves these
+                // through the type, so resolve them through the type object here
+                // rather than reporting a name `dir()` lists as absent. The
+                // instance form is a BOUND wrapper in CPython and an unbound one
+                // here, a repr difference only.
+                if matches!(name, "__doc__" | "__init__" | "__new__" | "__sizeof__")
+                    && crate::builtins::is_type_like_builtin(&tn)
+                {
+                    let ty = self.alloc(PyObj::Builtin(tn.clone()));
+                    return self.get_attr(&ty, name);
+                }
                 Err(format!(
                     "AttributeError: '{tn}' object has no attribute '{name}'"
                 ))
@@ -9176,7 +9188,7 @@ impl PyHost {
             // `dir(list)` / `dir(str)` — a builtin TYPE object lists the methods
             // of the type it names; anything else falls through to the value
             // branch below, which lists the methods of its own type.
-            Some(PyObj::Builtin(n)) if crate::builtins::type_method_names(n).is_some() => {
+            Some(PyObj::Builtin(n)) if !crate::builtins::type_dir_names(n).is_empty() => {
                 let n = n.clone();
                 self.collect_builtin_dir(&n, &mut set);
             }
@@ -9194,11 +9206,12 @@ impl PyHost {
     /// Add the method names of builtin type `tn` (plus the object dunders every
     /// value carries) to `set`. Empty for a type with no method table.
     fn collect_builtin_dir(&self, tn: &str, set: &mut BTreeSet<String>) {
-        let Some(names) = crate::builtins::type_method_names(tn) else {
+        let names = crate::builtins::type_dir_names(tn);
+        if names.is_empty() {
             return;
-        };
+        }
         for n in names {
-            set.insert((*n).to_string());
+            set.insert(n.to_string());
         }
         for n in ["__class__", "__doc__", "__init__", "__new__", "__sizeof__"] {
             set.insert(n.to_string());
