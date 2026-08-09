@@ -262,7 +262,12 @@ fn derive_from(h: &mut PyHost, orig: &Value, excs: Vec<Value>) -> Value {
         if let Some(tb) = h.exc_tb.get(src).cloned() {
             h.exc_tb.insert(*dst, tb);
         }
-        if let Some(notes) = h.func_attrs.get(src).and_then(|m| m.get("__notes__")).cloned() {
+        if let Some(notes) = h
+            .func_attrs
+            .get(src)
+            .and_then(|m| m.get("__notes__"))
+            .cloned()
+        {
             h.func_attrs
                 .entry(*dst)
                 .or_default()

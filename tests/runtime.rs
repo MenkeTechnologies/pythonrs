@@ -461,3 +461,75 @@ fn module_docstring_binds_dunder_doc() {
     assert_eq!(g("'''Mod doc.'''\nx = __doc__", "x"), "'Mod doc.'");
     assert_eq!(g("y = 1\nx = __doc__", "x"), "None");
 }
+
+/// CPython's `Did you mean: 'x'?` hint on an uncaught `NameError`/
+/// `AttributeError`. Every expectation is CPython 3.14.6's, byte-checked
+/// against `python3` on the same program.
+#[test]
+fn did_you_mean_suggestions() {
+    // A module global, a frame-slotted function local, and a builtin.
+    assert_eq!(
+        traceback_of("value = 1\nvalu\n"),
+        concat!(
+            "Traceback (most recent call last):\n",
+            "  File \"/t.py\", line 2, in <module>\n",
+            "    valu\n",
+            "NameError: name 'valu' is not defined. Did you mean: 'value'?\n",
+        )
+    );
+    assert!(
+        traceback_of("def f():\n    counter = 1\n    return countr\nf()\n")
+            .ends_with("NameError: name 'countr' is not defined. Did you mean: 'counter'?\n")
+    );
+    assert!(traceback_of("leng([1])\n")
+        .ends_with("NameError: name 'leng' is not defined. Did you mean: 'len'?\n"));
+    // `st` is equally close to `set` and `str`; CPython answers `set`, which is
+    // only reproducible with `suggestions.c`'s tie-breaking (its Python fallback
+    // in `traceback.py` finds neither).
+    assert!(traceback_of("st\n")
+        .ends_with("NameError: name 'st' is not defined. Did you mean: 'set'?\n"));
+    // Attributes: an instance attribute, a method reached through the fused
+    // CALL_METHOD op (which never goes through `get_attr`), and a builtin type.
+    assert!(
+        traceback_of("class C:\n    def __init__(s):\n        s.value = 1\nC().valu\n").ends_with(
+            "AttributeError: 'C' object has no attribute 'valu'. Did you mean: 'value'?\n"
+        )
+    );
+    assert!(
+        traceback_of("class C:\n    def total(s):\n        return 1\nC().totl()\n").ends_with(
+            "AttributeError: 'C' object has no attribute 'totl'. Did you mean: 'total'?\n"
+        )
+    );
+    assert!(traceback_of("x = [1]\nx.appendd(2)\n").ends_with(
+        "AttributeError: 'list' object has no attribute 'appendd'. Did you mean: 'append'?\n"
+    ));
+    // Nothing close enough gets no hint at all.
+    assert!(traceback_of("value = 1\nqqqqqqqqqq\n")
+        .ends_with("NameError: name 'qqqqqqqqqq' is not defined\n"));
+    assert!(traceback_of("x = [1]\nx.zzzzzzzz\n")
+        .ends_with("AttributeError: 'list' object has no attribute 'zzzzzzzz'\n"));
+    // The hint belongs to the rendered traceback, never to the exception: CPython's
+    // `str(e)` and `e.args` carry the bare message.
+    assert_eq!(
+        g(
+            "value = 1\n\
+             try:\n\
+             \x20   valu\n\
+             except NameError as e:\n\
+             \x20   x = (str(e), e.args)",
+            "x"
+        ),
+        "(\"name 'valu' is not defined\", (\"name 'valu' is not defined\",))"
+    );
+    assert_eq!(
+        g(
+            "xs = [1]\n\
+             try:\n\
+             \x20   xs.appendd\n\
+             except AttributeError as e:\n\
+             \x20   x = str(e)",
+            "x"
+        ),
+        "\"'list' object has no attribute 'appendd'\""
+    );
+}

@@ -31,6 +31,7 @@ pub mod regexpr;
 pub mod repl;
 pub mod rust_ffi;
 pub mod stdlib;
+pub mod suggest;
 pub mod tiers;
 
 pub use fusevm::Value;

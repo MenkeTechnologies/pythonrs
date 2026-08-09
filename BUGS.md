@@ -96,6 +96,22 @@ written.
   handling of the above exception …"); `raise X from None` sets
   `__suppress_context__`, hiding the implicit context. Each chained exception's
   frames are captured (`__traceback__`) at the point it is caught.
+- **`Did you mean: 'x'?` on an uncaught `NameError`/`AttributeError`.** A port of
+  `Python/suggestions.c`'s `_Py_CalculateSuggestions` — which is what CPython
+  3.13+ actually runs, and which disagrees with `traceback.py`'s pure-Python
+  fallback (the fallback seeds its running best with `len(wrong_name)`, so `st`
+  suggests nothing there and `set` in the real interpreter). The distance is
+  CPython's modified Levenshtein: moves cost 2, a pure case flip costs 1, common
+  affixes are trimmed, and a row that cannot beat the budget bails out.
+  Candidates are the frame's locals (including the ones held in frame SLOTS,
+  which never reach the environment), then its globals, then the builtins for a
+  `NameError`; `dir(obj)` with private names hidden — unless the code asked for a
+  private one, or the receiver is the running method's own instance — for an
+  `AttributeError`. A bare name that is an attribute of the running method's
+  instance is reported as `self.<name>`. The hint belongs to the RENDERED
+  traceback, never to `str(e)`/`e.args`, as in CPython. Fuzzed to zero
+  divergences (`parity-fuzz --mode suggest --stderr`, 8000 cases; the same mode
+  finds 207 in 2000 against the previous build).
 - **Exception groups and `except*` (PEP 654).** `ExceptionGroup` /
   `BaseExceptionGroup` are real: the constructor validates its arguments and
   narrows (`BaseExceptionGroup` holding only `Exception`s builds an
@@ -376,10 +392,9 @@ written.
   regression needs a resolve-first opcode that leaves `recv`/`name` on the stack
   when the type answers the name natively and only materializes a callable when
   the lookup would run user code.
-- **No "did you mean" suggestions.** CPython appends a nearest-match hint to a
-  `NameError`/`AttributeError` and to some `SyntaxError`s
-  (`name 'st' is not defined. Did you mean: 'set'?`). pythonrs prints the bare
-  message. This is the largest remaining class in `parity-fuzz --stderr`.
+- **No "did you mean" suggestions on a `SyntaxError`.** The `NameError` and
+  `AttributeError` hints are implemented (see below); CPython also suggests a
+  keyword for some `SyntaxError`s, which pythonrs does not.
 - **`dir()` on a builtin type is not CPython's full slot listing.** Every name it
   reports is one `getattr` resolves (asserted in both directions by
   `builtin_dir_lists_only_dispatchable_names` /

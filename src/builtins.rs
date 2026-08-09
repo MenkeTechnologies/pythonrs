@@ -184,9 +184,10 @@ fn b_getlocal(vm: &mut VM, _: u8) -> Value {
     if name == "Ellipsis" {
         return with_host(|h| h.alloc(PyObj::Ellipsis));
     }
-    if is_known_builtin(&name) {
+    if is_known_builtin(&name) || host::is_rust_ffi_name(&name) {
         return with_host(|h| h.builtin_object(&name));
     }
+    with_host(|h| h.note_name_miss(&name));
     abort(vm, host::name_error(&name))
 }
 
@@ -211,9 +212,10 @@ fn b_getglobal(vm: &mut VM, _: u8) -> Value {
     if name == "Ellipsis" {
         return with_host(|h| h.alloc(PyObj::Ellipsis));
     }
-    if is_known_builtin(&name) {
-        return with_host(|h| h.alloc(PyObj::Builtin(name.clone())));
+    if is_known_builtin(&name) || host::is_rust_ffi_name(&name) {
+        return with_host(|h| h.builtin_object(&name));
     }
+    with_host(|h| h.note_name_miss(&name));
     abort(vm, host::name_error(&name))
 }
 
@@ -4970,7 +4972,12 @@ pub fn call_builtin_function(
         "object" => Ok(with_host(|h| {
             h.new_instance("object".into(), IndexMap::new())
         })),
-        _ => Err(host::name_error(name)),
+        // An inline-Rust export reached as a resolved builtin object rather
+        // than by name (the CALL protocol resolves its callee first).
+        _ => match host::call_rust_ffi(name, &args) {
+            Some(r) => r,
+            None => Err(host::name_error(name)),
+        },
     }
 }
 
@@ -8956,7 +8963,9 @@ pub fn type_has_method(typename: &str, name: &str) -> bool {
         _ if is_exception_class(typename) && matches!(name, "with_traceback" | "add_note") => {
             return true
         }
-        excgroup::GROUP | excgroup::BASE_GROUP if matches!(name, "split" | "subgroup" | "derive") => {
+        excgroup::GROUP | excgroup::BASE_GROUP
+            if matches!(name, "split" | "subgroup" | "derive") =>
+        {
             return true
         }
         "lock" => {

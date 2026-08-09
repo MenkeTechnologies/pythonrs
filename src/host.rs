@@ -1387,6 +1387,12 @@ pub struct PyHost {
     /// `try` is not part of its traceback — only the frames it later unwinds
     /// through are.
     pub tb_starts_empty: HashSet<u32>,
+    /// What the last `NameError`/`AttributeError` would need to offer CPython's
+    /// `Did you mean: 'x'?` hint. Captured where the error is raised — the
+    /// candidate scope has unwound by the time the traceback renders — and cheap
+    /// enough to sit on an error path: a name plus either an `Rc` scope handle or
+    /// the receiver.
+    pub suggest: Option<SuggestCtx>,
     /// Arbitrary attributes assigned to a function object (`func.__dict__`), keyed
     /// by the function's heap id. CPython functions carry a writable dict; the
     /// stdlib uses it for `__isabstractmethod__`, `functools.wraps`, decorators.
@@ -1868,6 +1874,7 @@ impl PyHost {
             eg_split_root: HashMap::new(),
             builtin_objects: HashMap::new(),
             tb_starts_empty: HashSet::new(),
+            suggest: None,
             func_attrs: HashMap::new(),
             codec_search: Vec::new(),
             codec_cache: HashMap::new(),
@@ -7897,8 +7904,114 @@ impl PyHost {
         None
     }
 
-    /// `recv.name`.
+    /// `recv.name`, remembering the receiver when the lookup misses so an
+    /// uncaught `AttributeError` can render CPython's "Did you mean" hint. The
+    /// candidates are the receiver's `dir()`, which is gone by the time the
+    /// traceback renders; this keeps only the receiver, and only on the error
+    /// path.
     pub fn get_attr(&mut self, recv: &Value, name: &str) -> Result<Value, String> {
+        let r = self.get_attr_inner(recv, name);
+        if r.is_err() {
+            self.note_attr_miss(recv, name);
+        }
+        r
+    }
+
+    /// Record the receiver of a missed attribute lookup for the hint.
+    pub fn note_attr_miss(&mut self, recv: &Value, name: &str) {
+        let self_obj = self.frames.last().and_then(|f| f.self_obj.clone());
+        self.suggest = Some(SuggestCtx::Attr {
+            wrong: name.to_string(),
+            recv: recv.clone(),
+            self_obj,
+        });
+    }
+
+    /// Remember the scope a bare-name read missed in, for the same hint.
+    pub fn note_name_miss(&mut self, name: &str) {
+        let Some(frame) = self.frames.last() else {
+            return;
+        };
+        // `locals_set` as well as the env: a slotted local never reaches the
+        // environment, so `def f(): counter = 1; print(countr)` would otherwise
+        // have no candidate to match against.
+        let mut slotted: Vec<String> = frame.locals_set.iter().cloned().collect();
+        slotted.sort();
+        let (env, self_obj) = (frame.env.clone(), frame.self_obj.clone());
+        self.suggest = Some(SuggestCtx::Name {
+            wrong: name.to_string(),
+            env,
+            slotted,
+            module: self.cur_module,
+            self_obj,
+        });
+    }
+
+    /// CPython's `_compute_suggestion_error` for a terse `Type: message` line:
+    /// the closest name to the one that missed, or `None` when nothing is close
+    /// enough (or the recorded context belongs to a different error).
+    fn suggestion_for(&self, line: &str) -> Option<String> {
+        match self.suggest.as_ref()? {
+            SuggestCtx::Name {
+                wrong,
+                env,
+                slotted,
+                module,
+                self_obj,
+            } => {
+                if !line.starts_with("NameError:") || !line.contains(&format!("'{wrong}'")) {
+                    return None;
+                }
+                // A bare name that IS an attribute of the running method's
+                // instance is reported as `self.<name>` rather than a near miss.
+                if let Some(obj) = self_obj {
+                    if self.dir_names(obj).iter().any(|n| n == wrong) {
+                        return Some(format!("self.{wrong}"));
+                    }
+                }
+                // CPython's candidates: the frame's locals, then its globals,
+                // then the builtins — in that order, since ties go to the first.
+                let mut candidates: Vec<String> = slotted.clone();
+                let mut scope = Some(env.clone());
+                while let Some(s) = scope {
+                    candidates.extend(s.borrow().vars.keys().cloned());
+                    scope = s.borrow().parent.clone();
+                }
+                candidates.extend(self.module_globals[*module].keys().cloned());
+                // Sorted: CPython's `f_builtins` is the `builtins` module dict,
+                // whose order pythonrs's tables do not reproduce, and equally
+                // close candidates are decided by which comes first (`st`
+                // suggests `set`, not `str`).
+                let mut builtins: Vec<String> = crate::builtins::builtin_names()
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                builtins.sort();
+                candidates.extend(builtins);
+                crate::suggest::closest(&candidates, wrong)
+            }
+            SuggestCtx::Attr {
+                wrong,
+                recv,
+                self_obj,
+            } => {
+                if !line.starts_with("AttributeError:") || !line.contains(&format!("'{wrong}'")) {
+                    return None;
+                }
+                let mut candidates = self.dir_names(recv);
+                // Private names are hidden unless the code asked for one, or the
+                // receiver is the running method's own instance.
+                let own = matches!(self_obj, Some(o) if o == recv);
+                if !wrong.starts_with('_') && !own {
+                    candidates.retain(|n| !n.starts_with('_'));
+                }
+                candidates.sort();
+                crate::suggest::closest(&candidates, wrong)
+            }
+        }
+    }
+
+    fn get_attr_inner(&mut self, recv: &Value, name: &str) -> Result<Value, String> {
         // A CPython object (stdlib-ffi) resolves attributes on the CPython side.
         #[cfg(feature = "stdlib-ffi")]
         if let Some(id) = self.foreign_id(recv) {
@@ -9993,15 +10106,8 @@ pub fn call_named(
     args: Vec<Value>,
     kwargs: Vec<(String, Value)>,
 ) -> Result<Value, String> {
-    // Inline Rust FFI: the `rust { ... }` desugar emits `__rust_compile(b64,
-    // line)`; compile + register the block's exported functions, returning
-    // Python `None` (`Value::Undef`).
-    if name == "__rust_compile" {
-        let b64 = args
-            .first()
-            .map(|v| with_host(|h| h.str_of(v)))
-            .unwrap_or_default();
-        return fusevm::ffi::compile_and_register(&b64).map(|_| Value::Undef);
+    if let Some(r) = call_rust_ffi(name, &args) {
+        return r;
     }
     if let Some(v) = with_host(|h| h.read_name(name)) {
         return invoke(&v, args, kwargs);
@@ -10012,16 +10118,36 @@ pub fn call_named(
     if crate::builtins::is_known_builtin(name) {
         return crate::builtins::call_builtin_function(name, args, kwargs);
     }
-    // A `rust { ... }` block's exported functions are callable by bareword.
-    // Reached only after user names/classes/builtins all miss, so Python code
-    // always wins; the registry membership check keeps this off the hot path.
+    with_host(|h| h.note_name_miss(name));
+    Err(name_error(name))
+}
+
+/// The two names that belong to the inline-Rust FFI rather than to any Python
+/// namespace: `__rust_compile(b64, line)`, which the `rust { ... }` desugar
+/// emits, and every function such a block exported (callable by bareword).
+/// `None` when `name` is neither, so the caller falls through.
+///
+/// Both are reached through a plain CALL, which now resolves its callee to a
+/// VALUE first — so they have to answer as builtin objects too, not only by
+/// name (`is_rust_ffi_name` is what makes a bare-name read produce one).
+pub fn call_rust_ffi(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    if name == "__rust_compile" {
+        let b64 = args
+            .first()
+            .map(|v| with_host(|h| h.str_of(v)))
+            .unwrap_or_default();
+        return Some(fusevm::ffi::compile_and_register(&b64).map(|_| Value::Undef));
+    }
     if fusevm::ffi::is_registered(name) {
         let margs: Vec<Value> = args.iter().map(marshal_ffi_arg).collect();
-        if let Some(r) = fusevm::ffi::try_call(name, &margs) {
-            return r;
-        }
+        return fusevm::ffi::try_call(name, &margs);
     }
-    Err(name_error(name))
+    None
+}
+
+/// Whether a bare name belongs to the inline-Rust FFI (see [`call_rust_ffi`]).
+pub fn is_rust_ffi_name(name: &str) -> bool {
+    name == "__rust_compile" || fusevm::ffi::is_registered(name)
 }
 
 // ── builtin-type subclassing (hybrid instances) ─────────────────────────────
@@ -10381,7 +10507,25 @@ fn module_dict_method(
     }
 }
 
+/// `recv.name(*args, **kwargs)`. The attribute lookup is fused into the call, so
+/// a missing method never reaches `get_attr` — record the receiver here too, or
+/// an uncaught `obj.mispelled()` would render without CPython's hint.
 pub fn call_method(
+    recv: &Value,
+    name: &str,
+    args: Vec<Value>,
+    kwargs: Vec<(String, Value)>,
+) -> Result<Value, String> {
+    let r = call_method_inner(recv, name, args, kwargs);
+    if let Err(e) = &r {
+        if e.starts_with("AttributeError:") && e.contains(&format!("'{name}'")) {
+            with_host(|h| h.note_attr_miss(recv, name));
+        }
+    }
+    r
+}
+
+fn call_method_inner(
     recv: &Value,
     name: &str,
     args: Vec<Value>,
@@ -12224,6 +12368,31 @@ fn system_exit_outcome(h: &mut PyHost, args: &[Value]) -> TopExit {
     }
 }
 
+/// The inputs CPython's `_compute_suggestion_error` needs, captured at the point
+/// the error is raised (see [`PyHost::suggest`]).
+pub enum SuggestCtx {
+    /// A `NameError`: the name that missed, the scope chain and module it missed
+    /// in, and the frame's `self` — CPython suggests `self.x` when the instance
+    /// carries the name the code used bare.
+    Name {
+        wrong: String,
+        env: Env,
+        /// Names local to the scope that live in FRAME SLOTS rather than in
+        /// `env` (see `FuncDef::locals`) — invisible to the env walk.
+        slotted: Vec<String>,
+        module: usize,
+        self_obj: Option<Value>,
+    },
+    /// An `AttributeError`: the receiver whose `dir()` supplies the candidates,
+    /// plus the frame's `self` (an underscored candidate stays visible when the
+    /// code was reading an attribute of its own instance).
+    Attr {
+        wrong: String,
+        recv: Value,
+        self_obj: Option<Value>,
+    },
+}
+
 /// `traceback.TracebackException`'s `max_group_width` / `max_group_depth`: how
 /// many members of one exception group are listed, and how deep the nesting is
 /// rendered, before the output is elided.
@@ -12331,7 +12500,11 @@ impl PyHost {
             );
             ctx.emit(&mut out, connector, '|');
         }
-        self.render_exc_block(self.exc.as_ref(), &final_frames, err, &mut ctx, &mut out);
+        // CPython's "Did you mean" hint is part of the RENDERED traceback, not of
+        // the exception — `str(e)` for a NameError never carries it — so it is
+        // appended here rather than baked into the error string.
+        let err = crate::suggest::with_hint(err, self.suggestion_for(err));
+        self.render_exc_block(self.exc.as_ref(), &final_frames, &err, &mut ctx, &mut out);
         out
     }
 
@@ -12447,7 +12620,11 @@ impl PyHost {
             if truncated {
                 let remaining = total - MAX_GROUP_WIDTH;
                 let plural = if remaining > 1 { "s" } else { "" };
-                ctx.emit(out, &format!("and {remaining} more exception{plural}\n"), '|');
+                ctx.emit(
+                    out,
+                    &format!("and {remaining} more exception{plural}\n"),
+                    '|',
+                );
             } else {
                 self.render_exc_chain(member, ctx, out);
             }

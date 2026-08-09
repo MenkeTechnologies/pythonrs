@@ -291,7 +291,7 @@ pub fn load(src: &str) -> Option<Program> {
     for t in &mut cp.tries {
         restore_op_hash(&mut t.body);
         for h in &mut t.handlers {
-                let (typ, handler) = (&mut h.typ, &mut h.body);
+            let (typ, handler) = (&mut h.typ, &mut h.body);
             if let Some(typ) = typ {
                 restore_op_hash(typ);
             }

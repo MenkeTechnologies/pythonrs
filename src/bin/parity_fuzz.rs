@@ -5247,6 +5247,97 @@ fn gen_excgroup(seed: u64) -> Vec<String> {
     }
 }
 
+/// CPython's `Did you mean: 'x'?` hint on an uncaught `NameError`/
+/// `AttributeError`. Every case is uncaught, so this mode is only meaningful
+/// under `--stderr`; the hint is a property of the rendered traceback and never
+/// of `str(e)`, which the last two shapes assert on stdout.
+fn gen_suggest(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    // A near miss and its target: one deletion, one transposition, one case
+    // flip, one insertion, and a name too far off to match anything.
+    const TYPOS: &[(&str, &str)] = &[
+        ("value", "valu"),
+        ("value", "vlaue"),
+        ("value", "Value"),
+        ("value", "valuee"),
+        ("counter", "countr"),
+        ("counter", "cuonter"),
+        ("payload", "payolad"),
+        ("payload", "paylod"),
+        ("name", "nme"),
+        ("name", "namme"),
+        ("total_count", "total_cout"),
+        ("total_count", "totl_count"),
+        ("x", "qqqqqqqq"),
+        ("data", "zzzz"),
+    ];
+    let (good, typo) = pick(r, TYPOS);
+    // Builtin names a bare typo can land near.
+    const BUILTIN_TYPOS: &[&str] = &[
+        "st",
+        "lenght",
+        "leng",
+        "prnt",
+        "rang",
+        "sortd",
+        "strr",
+        "dictt",
+        "flat",
+        "isinstnce",
+        "enumrate",
+        "revrsed",
+        "ValuError",
+        "TypError",
+        "KeyErrror",
+    ];
+    let bad_builtin = pick(r, BUILTIN_TYPOS);
+    match r.below(8) {
+        // Bare name at module scope, against a module global.
+        0 => vec![format!("{good} = 1"), typo.to_string()],
+        // Bare name at module scope, against the builtins.
+        1 => vec![bad_builtin.to_string()],
+        // A call whose callee name is the typo.
+        2 => vec![format!("{bad_builtin}([1, 2])")],
+        // A function local (which lives in a frame slot, not the environment).
+        3 => vec![
+            "def f():".into(),
+            format!("    {good} = 1"),
+            format!("    return {typo}"),
+            "f()".into(),
+        ],
+        // An instance attribute.
+        4 => vec![
+            "class C:".into(),
+            "    def __init__(s):".into(),
+            format!("        s.{good} = 1"),
+            format!("C().{typo}"),
+        ],
+        // A method name on the class.
+        5 => vec![
+            "class C:".into(),
+            format!("    def {good}(s):"),
+            "        return 1".into(),
+            format!("C().{typo}()"),
+        ],
+        // A builtin type's own method.
+        6 => vec![format!("x = [1]"), format!("x.{typo}")],
+        // The hint belongs to the traceback, never to `str(e)`.
+        _ => vec![
+            format!("{good} = 1"),
+            "try:".into(),
+            format!("    {typo}"),
+            "except NameError as e:".into(),
+            "    print(str(e))".into(),
+            "    print(e.args)".into(),
+            format!("x = [1]"),
+            "try:".into(),
+            format!("    x.{typo}"),
+            "except AttributeError as e:".into(),
+            "    print(str(e))".into(),
+        ],
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Mode dispatch
 // ---------------------------------------------------------------------------
@@ -5313,6 +5404,7 @@ enum Mode {
     Functools,
     Ctxmgr,
     Excgroup,
+    Suggest,
 }
 
 const REAL_MODES: &[Mode] = &[
@@ -5375,6 +5467,7 @@ const REAL_MODES: &[Mode] = &[
     Mode::Functools,
     Mode::Ctxmgr,
     Mode::Excgroup,
+    Mode::Suggest,
 ];
 
 /// Generate the statement list for a seed in the selected mode. `Mixed` rotates
@@ -5444,6 +5537,7 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Functools => gen_functools(seed),
         Mode::Ctxmgr => gen_ctxmgr(seed),
         Mode::Excgroup => gen_excgroup(seed),
+        Mode::Suggest => gen_suggest(seed),
     }
 }
 
@@ -5509,6 +5603,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Functools => "functools",
         Mode::Ctxmgr => "ctxmgr",
         Mode::Excgroup => "excgroup",
+        Mode::Suggest => "suggest",
     }
 }
 
@@ -5574,6 +5669,7 @@ fn mode_from_name(s: &str) -> Option<Mode> {
         Mode::Functools,
         Mode::Ctxmgr,
         Mode::Excgroup,
+        Mode::Suggest,
     ];
     ALL.iter().copied().find(|&m| mode_name(m) == s)
 }

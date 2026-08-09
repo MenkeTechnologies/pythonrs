@@ -54,7 +54,7 @@ pub fn rebase_program(prog: &mut Program, func_off: usize, try_off: usize) {
     for t in &mut prog.tries {
         rebase_chunk(&mut t.body, func_off, try_off);
         for h in &mut t.handlers {
-                let (tc, hb) = (&mut h.typ, &mut h.body);
+            let (tc, hb) = (&mut h.typ, &mut h.body);
             if let Some(tc) = tc {
                 rebase_chunk(tc, func_off, try_off);
             }
@@ -4543,7 +4543,8 @@ fn push_fstr_children<'a>(parts: &'a [FStrPart], out: &mut Vec<&'a Expr>) {
 /// Whether `e` contains a `:=` anywhere, `lambda` bodies and nested
 /// comprehensions included — the reach of CPython's "iterable expression" ban.
 fn expr_has_walrus(e: &Expr) -> bool {
-    matches!(e.unspanned(), Expr::NamedExpr(..)) || expr_children(e).into_iter().any(expr_has_walrus)
+    matches!(e.unspanned(), Expr::NamedExpr(..))
+        || expr_children(e).into_iter().any(expr_has_walrus)
 }
 
 /// The names an assignment target binds (`i`, `a, b`, `a, *rest`).
