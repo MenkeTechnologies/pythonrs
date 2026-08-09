@@ -9,6 +9,32 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **A value-keyed object NESTED inside a `tuple`/`frozenset` key.** A `tuple`/
+  `frozenset` key is hashed element-wise, so an element with a user `__hash__`
+  is a key in its own right — but only the TOP-LEVEL object was prepared outside
+  the host borrow, so `{(P(1),): 5}` raised `TypeError: unhashable type: 'P'`
+  from the borrowed `to_key`, which cannot run user code. The preparation now
+  walks into `tuple`/`frozenset` operands, collapse candidates are collected at
+  every depth (so a nested element merges onto a value-equal one anywhere in the
+  destination), and two equal elements of ONE key collapse onto each other. A
+  `frozenset` key's element keys are recomputed at use, since they were resolved
+  when the frozenset was built and carry heap ids the destination knows nothing
+  about. `hash()` of such a container drops those ids, so
+  `hash((P(1),)) == hash((P(1),))` holds as in CPython. Twenty-one distinct
+  shapes were wrong — subscript, assignment, `in`, `get`, `pop`, `setdefault`,
+  literal dedup, `repr`, whole-container `==`, `set.add`/`update`, the set
+  algebra over tuple elements, and `frozenset`-keyed lookups (which failed with
+  `KeyError` rather than `TypeError`).
+- **Container `==` runs the elements' user `__eq__`.** `list`, `tuple`, `deque`,
+  and a `dict`'s values compared element-wise INSIDE the host borrow, where a
+  user `__eq__` cannot run, so `P(1) == P(1)` was True while `(P(1),) ==
+  (P(1),)`, `[P(1)] == [P(1)]`, `deque([P(1)]) == deque([P(1)])`, and
+  `{1: P(1)} == {1: P(1)}` were all silently False. Element comparison now runs
+  through the full `==` dispatch, with CPython's `PyObject_RichCompareBool`
+  identity shortcut, whenever any element compares through user code; containers
+  of plain values keep the borrowed comparison. `tuple.index`/`tuple.count` had
+  the same gap while their `list` counterparts did not — `(P(1), P(2)).index(
+  P(2))` raised `ValueError: x not in tuple`.
 - **Cross-container algebra with value-keyed elements.** A set/dict operation
   between two *independently built* containers whose elements key through user
   code — a user instance with `__hash__`+`__eq__`, or a CPython `Foreign` object

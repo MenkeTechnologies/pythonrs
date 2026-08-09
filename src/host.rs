@@ -1607,9 +1607,15 @@ fn pending_key_get(id: u32) -> Option<PKey> {
     PENDING_KEY.with(|p| p.borrow().get(&id).cloned())
 }
 
-/// Drop all pending instance keys (called at the end of a container op).
-fn pending_key_clear() {
-    PENDING_KEY.with(|p| p.borrow_mut().clear());
+/// Take the pending-key table, leaving it empty. A container op starts from a
+/// fresh keying context and hands the caller's table back when it finishes.
+fn pending_key_take() -> HashMap<u32, PKey> {
+    PENDING_KEY.with(|p| std::mem::take(&mut *p.borrow_mut()))
+}
+
+/// Put back a table taken by [`pending_key_take`].
+fn pending_key_restore(t: HashMap<u32, PKey>) {
+    PENDING_KEY.with(|p| *p.borrow_mut() = t);
 }
 
 #[cfg(feature = "stdlib-ffi")]
@@ -4107,7 +4113,19 @@ impl PyHost {
                 Some(PyObj::Frozenset(s)) => {
                     // Canonicalize: element keys sorted + deduped, so any two
                     // equal frozensets hash and compare identically.
-                    let mut ks: Vec<PKey> = s.keys().cloned().collect();
+                    let mut ks: Vec<PKey> = if s.keys().any(pkey_is_value_keyed) {
+                        // A value-keyed element's stored key carries the heap id
+                        // of the object it collapsed onto WHEN THE FROZENSET WAS
+                        // BUILT, which is nothing the destination container knows
+                        // about. Recompute it so the `prepare_key` collapse
+                        // against that container applies — otherwise two equal
+                        // frozensets are two different dict slots.
+                        s.values()
+                            .map(|e| self.to_key(e))
+                            .collect::<Result<_, String>>()?
+                    } else {
+                        s.keys().cloned().collect()
+                    };
                     ks.sort();
                     ks.dedup();
                     PKey::Frozenset(ks)
@@ -4685,41 +4703,85 @@ fn bigint_pyhash(b: &num_bigint::BigInt) -> i64 {
 /// that entry (CPython value semantics). A no-op for non-instances and for
 /// identity-hashed instances (`to_key` handles those inline).
 pub fn prepare_key(v: &Value, candidates: &[(PKey, Value)]) -> Result<(), String> {
-    // A CPython Foreign key (enum member, Decimal, datetime, …): hash via the
-    // bridge outside the borrow, then collapse onto a value-equal existing key of
-    // the same hash (CPython `PyObject_RichCompareBool`), so a fresh handle keys
-    // to the same slot as an equal one already present. Mirrors the instance path.
+    let mut collapsed = Vec::new();
+    prepare_key_walk(v, candidates, &mut collapsed)
+}
+
+/// What [`prepare_key_walk`] has to do with a value, decided in ONE host borrow.
+enum KeyPrep {
+    /// A `tuple`/`frozenset`: hashed element-wise, so its elements are keys too.
+    Nested(Vec<Value>),
+    /// A user instance — `(heap id, class name)`.
+    Instance(u32, String),
+    /// A bridged CPython object — `(heap id, foreign id)`.
     #[cfg(feature = "stdlib-ffi")]
-    if let Some((id, fid)) = with_host(|h| match (v, h.get(v)) {
-        (Value::Obj(i), Some(PyObj::Foreign(f))) => Some((*i, *f)),
-        _ => None,
-    }) {
-        let hash = crate::ffi::foreign_hash(fid)?;
-        let mut canonical = PKey::Foreign { hash, id };
-        for (pk, kobj) in candidates {
-            if let PKey::Foreign { hash: ch, .. } = pk {
-                if *ch == hash {
-                    if let Some(cf) = with_host(|h| h.foreign_id(kobj)) {
-                        if crate::ffi::foreign_eq(fid, cf) {
-                            canonical = pk.clone();
-                            break;
+    Foreign(u32, u32),
+    /// Nothing to prepare; `to_key` resolves it without running user code.
+    Plain,
+}
+
+/// The recursive half of [`prepare_key`].
+///
+/// A `tuple`/`frozenset` key is hashed element-wise, so a value-keyed object
+/// NESTED inside one is a key in its own right and needs the same preparation —
+/// `{(P(1),): 5}` raised `unhashable type: 'P'` from the borrowed `to_key`,
+/// which cannot run `__hash__`, because only the TOP-LEVEL object was prepared.
+///
+/// `collapsed` accumulates the keys resolved so far in THIS walk and is searched
+/// after `candidates`, so two equal elements of one key (`((P(1),), (P(1),))`)
+/// collapse onto each other exactly as they would onto an already-stored key.
+/// Without it each took its own heap id and no independently built equal key
+/// could ever match.
+fn prepare_key_walk(
+    v: &Value,
+    candidates: &[(PKey, Value)],
+    collapsed: &mut Vec<(PKey, Value)>,
+) -> Result<(), String> {
+    let what = with_host(|h| match v {
+        Value::Obj(i) => match h.get(v) {
+            Some(PyObj::Tuple(t)) => KeyPrep::Nested(t.clone()),
+            Some(PyObj::Frozenset(s)) => KeyPrep::Nested(s.values().cloned().collect()),
+            Some(PyObj::Instance(inst)) => KeyPrep::Instance(*i, inst.class.clone()),
+            #[cfg(feature = "stdlib-ffi")]
+            Some(PyObj::Foreign(f)) => KeyPrep::Foreign(*i, *f),
+            _ => KeyPrep::Plain,
+        },
+        _ => KeyPrep::Plain,
+    });
+    let (id, class) = match what {
+        KeyPrep::Plain => return Ok(()),
+        KeyPrep::Nested(items) => {
+            for it in &items {
+                prepare_key_walk(it, candidates, collapsed)?;
+            }
+            return Ok(());
+        }
+        // A CPython Foreign key (enum member, Decimal, datetime, …): hash via the
+        // bridge outside the borrow, then collapse onto a value-equal existing key
+        // of the same hash (CPython `PyObject_RichCompareBool`), so a fresh handle
+        // keys to the same slot as an equal one already present. Mirrors the
+        // instance path below.
+        #[cfg(feature = "stdlib-ffi")]
+        KeyPrep::Foreign(id, fid) => {
+            let hash = crate::ffi::foreign_hash(fid)?;
+            let mut canonical = PKey::Foreign { hash, id };
+            for (pk, kobj) in candidates.iter().chain(collapsed.iter()) {
+                if let PKey::Foreign { hash: ch, .. } = pk {
+                    if *ch == hash {
+                        if let Some(cf) = with_host(|h| h.foreign_id(kobj)) {
+                            if crate::ffi::foreign_eq(fid, cf) {
+                                canonical = pk.clone();
+                                break;
+                            }
                         }
                     }
                 }
             }
+            collapsed.push((canonical.clone(), v.clone()));
+            pending_key_set(id, canonical);
+            return Ok(());
         }
-        pending_key_set(id, canonical);
-        return Ok(());
-    }
-    let (id, class) = match with_host(|h| match v {
-        Value::Obj(i) => match h.get(v) {
-            Some(PyObj::Instance(inst)) => Some((*i, inst.class.clone())),
-            _ => None,
-        },
-        _ => None,
-    }) {
-        Some(t) => t,
-        None => return Ok(()),
+        KeyPrep::Instance(id, class) => (id, class),
     };
     let hashf = with_host(|h| h.class_lookup(&class, "__hash__"));
     match &hashf {
@@ -4745,7 +4807,7 @@ pub fn prepare_key(v: &Value, candidates: &[(PKey, Value)]) -> Result<(), String
     // those, so `{P(1): 1, P(2): 2}` was unusable whenever the two hashes
     // collided.
     let mut canonical = PKey::Instance { hash, id };
-    for (pk, kobj) in candidates {
+    for (pk, kobj) in candidates.iter().chain(collapsed.iter()) {
         if let PKey::Instance { hash: ch, .. } = pk {
             if *ch == hash {
                 let eqr = crate::builtins::numeric_hook(NumOp::Eq, v, kobj)?;
@@ -4756,6 +4818,7 @@ pub fn prepare_key(v: &Value, candidates: &[(PKey, Value)]) -> Result<(), String
             }
         }
     }
+    collapsed.push((canonical.clone(), v.clone()));
     pending_key_set(id, canonical);
     Ok(())
 }
@@ -4803,21 +4866,66 @@ pub fn instance_hash_value(v: &Value) -> Result<i64, String> {
     }
 }
 
+/// Whether a key was resolved through user code — a user `__hash__`/`__eq__`
+/// instance or a bridged CPython object — at ANY depth. A `tuple`/`frozenset`
+/// key is hashed element-wise, so one holding such an element is itself
+/// value-keyed and takes part in every collapse the top-level ones do.
+pub fn pkey_is_value_keyed(k: &PKey) -> bool {
+    match k {
+        PKey::Instance { .. } | PKey::Foreign { .. } => true,
+        PKey::Tuple(ks) | PKey::Frozenset(ks) => ks.iter().any(pkey_is_value_keyed),
+        _ => false,
+    }
+}
+
+/// Collect the value-keyed `(key, key-object)` pairs reachable from one
+/// container entry, descending into `tuple`/`frozenset` keys alongside the
+/// object they were built from. A nested element is a collapse candidate for
+/// any nested element of another key: `{P(1): 1, (P(1),): 2}` must key both
+/// `P(1)`s identically or `{(P(1),): 2}[(P(1),)]` cannot find its entry.
+fn collect_key_candidates(h: &PyHost, k: &PKey, obj: &Value, out: &mut Vec<(PKey, Value)>) {
+    match k {
+        PKey::Instance { .. } | PKey::Foreign { .. } => out.push((k.clone(), obj.clone())),
+        PKey::Tuple(ks) => {
+            if let Some(PyObj::Tuple(items)) = h.get(obj) {
+                if items.len() == ks.len() {
+                    for (sub, it) in ks.iter().zip(items.iter()) {
+                        collect_key_candidates(h, sub, it, out);
+                    }
+                }
+            }
+        }
+        // A `PKey::Frozenset`'s element keys are sorted+deduped, so they no
+        // longer line up positionally with anything; walk the frozenset's own
+        // map, which is the authoritative key→object pairing.
+        PKey::Frozenset(_) => {
+            if let Some(PyObj::Frozenset(s)) = h.get(obj) {
+                for (sub, e) in s.iter() {
+                    collect_key_candidates(h, sub, e, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Instance-key collapse candidates from an in-flight set map (a literal/ctor
 /// being built element by element).
-pub fn set_local_candidates(s: &IndexMap<PKey, Value>) -> Vec<(PKey, Value)> {
-    s.iter()
-        .filter(|(k, _)| matches!(k, PKey::Instance { .. } | PKey::Foreign { .. }))
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect()
+pub fn set_local_candidates(h: &PyHost, s: &IndexMap<PKey, Value>) -> Vec<(PKey, Value)> {
+    let mut out = Vec::new();
+    for (k, v) in s.iter() {
+        collect_key_candidates(h, k, v, &mut out);
+    }
+    out
 }
 
 /// Instance-key collapse candidates from an in-flight dict map.
-pub fn dict_local_candidates(d: &IndexMap<PKey, (Value, Value)>) -> Vec<(PKey, Value)> {
-    d.iter()
-        .filter(|(k, _)| matches!(k, PKey::Instance { .. } | PKey::Foreign { .. }))
-        .map(|(k, (kv, _))| (k.clone(), kv.clone()))
-        .collect()
+pub fn dict_local_candidates(h: &PyHost, d: &IndexMap<PKey, (Value, Value)>) -> Vec<(PKey, Value)> {
+    let mut out = Vec::new();
+    for (k, (kv, _)) in d.iter() {
+        collect_key_candidates(h, k, kv, &mut out);
+    }
+    out
 }
 
 /// The `(key, key-object)` pairs of any instance keys already present in a heap
@@ -4834,36 +4942,32 @@ pub fn instance_key_candidates(container: &Value) -> Vec<(PKey, Value)> {
 /// dict was quadratic.
 pub fn instance_key_candidates_for(container: &Value, key: Option<&Value>) -> Vec<(PKey, Value)> {
     if let Some(k) = key {
-        let key_can_collapse = with_host(|h| {
-            matches!(k, Value::Obj(_))
-                && !matches!(
-                    h.get(k),
-                    Some(
-                        PyObj::Str(_)
-                            | PyObj::Bytes(_)
-                            | PyObj::Tuple(_)
-                            | PyObj::BigInt(_)
-                            | PyObj::Frozenset(_)
-                    )
-                )
-        });
-        if !key_can_collapse {
+        if !with_host(|h| value_can_collapse(h, k)) {
             return Vec::new();
         }
     }
     with_host(|h| match h.get(container) {
-        Some(PyObj::Dict(d)) => d
-            .iter()
-            .filter(|(k, _)| matches!(k, PKey::Instance { .. } | PKey::Foreign { .. }))
-            .map(|(k, (kv, _))| (k.clone(), kv.clone()))
-            .collect(),
-        Some(PyObj::Set(s)) | Some(PyObj::Frozenset(s)) => s
-            .iter()
-            .filter(|(k, _)| matches!(k, PKey::Instance { .. } | PKey::Foreign { .. }))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect(),
+        Some(PyObj::Dict(d)) => dict_local_candidates(h, d),
+        Some(PyObj::Set(s)) | Some(PyObj::Frozenset(s)) => set_local_candidates(h, s),
         _ => vec![],
     })
+}
+
+/// Whether `k` could collapse onto an existing value-keyed entry — i.e. whether
+/// scanning the destination container for candidates can pay off. A `str`/`int`/
+/// `bytes` key never can; a `tuple`/`frozenset` can only through an element, so
+/// it is walked rather than rejected outright (the pre-existing blanket
+/// rejection is what left `{(P(1),): 5}[(P(1),)]` unable to find its entry).
+fn value_can_collapse(h: &PyHost, k: &Value) -> bool {
+    match k {
+        Value::Obj(_) => match h.get(k) {
+            Some(PyObj::Str(_) | PyObj::Bytes(_) | PyObj::BigInt(_)) => false,
+            Some(PyObj::Tuple(items)) => items.iter().any(|it| value_can_collapse(h, it)),
+            Some(PyObj::Frozenset(s)) => s.values().any(|e| value_can_collapse(h, e)),
+            _ => true,
+        },
+        _ => false,
+    }
 }
 
 /// Prepare an instance key for a container op, run `f` (the borrowed access that
@@ -4874,9 +4978,15 @@ pub fn with_instance_key<R>(
     candidates: &[(PKey, Value)],
     f: impl FnOnce() -> Result<R, String>,
 ) -> Result<R, String> {
+    // Save the caller's table first. `prepare_key` runs user `__hash__`/`__eq__`,
+    // which can itself perform a container op (`hash(self.v)`, `k in cache`); that
+    // INNER op must not drop the keys the outer one already resolved.
+    // `{(P(1), P(2)): 5}` lost P(1)'s key to the `hash()` call inside P(2)'s
+    // `__hash__` and raised `unhashable type: 'P'`.
+    let saved = pending_key_take();
     let prep = prepare_key(v, candidates);
     let r = prep.and_then(|()| f());
-    pending_key_clear();
+    pending_key_restore(saved);
     r
 }
 
@@ -4885,7 +4995,7 @@ pub fn with_instance_key<R>(
 /// the heap id of the object they collapsed onto (see `PKey::Instance`), so two
 /// independently built containers key value-equal elements differently.
 fn any_value_keyed<'a>(mut keys: impl Iterator<Item = &'a PKey>) -> bool {
-    keys.any(|k| matches!(k, PKey::Instance { .. } | PKey::Foreign { .. }))
+    keys.any(pkey_is_value_keyed)
 }
 
 /// The key map an operand contributes to the set algebra: a `set`/`frozenset`'s
@@ -4927,7 +5037,7 @@ pub fn align_operand(a: &Value, b: &Value) -> Result<Option<Value>, String> {
             }
             let items = y.values().cloned().collect();
             Some((
-                set_local_candidates(&x),
+                set_local_candidates(h, &x),
                 Side::Set(items, h.is_frozenset(b)),
             ))
         }
@@ -4937,7 +5047,7 @@ pub fn align_operand(a: &Value, b: &Value) -> Result<Option<Value>, String> {
                     return None;
                 }
                 let pairs = y.values().cloned().collect();
-                Some((dict_local_candidates(x), Side::Dict(pairs)))
+                Some((dict_local_candidates(h, x), Side::Dict(pairs)))
             }
             _ => None,
         },

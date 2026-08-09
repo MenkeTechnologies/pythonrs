@@ -5543,3 +5543,138 @@ fn a_call_resolves_a_bare_name_callee_before_its_arguments() {
         "(True, True)"
     );
 }
+
+// A user-`__hash__` object NESTED inside a `tuple`/`frozenset` key. The key is
+// hashed element-wise, so the element is a key in its own right — but only the
+// TOP-LEVEL object was ever prepared outside the host borrow, so the borrowed
+// `to_key` hit the nested one with no resolved key and raised
+// `TypeError: unhashable type: 'P'`. CPython answers every line below.
+#[test]
+fn value_keyed_objects_nested_inside_tuple_and_frozenset_keys() {
+    let p = "\
+class P:\n\
+\x20   def __init__(self, v): self.v = v\n\
+\x20   def __hash__(self): return hash(self.v)\n\
+\x20   def __eq__(self, o): return isinstance(o, P) and self.v == o.v\n";
+    // A tuple key: built, looked up, re-assigned, and membership-tested — each
+    // through an independently constructed but value-equal key.
+    assert_eq!(
+        g(
+            &format!(
+                "{p}d = {{(P(1),): 'a', (P(2), P(3)): 'b'}}\n\
+                 d[(P(1),)] = 'c'\n\
+                 x = [d[(P(1),)], d[(P(2), P(3))], len(d), (P(1),) in d, (P(9),) in d]"
+            ),
+            "x"
+        ),
+        "['c', 'b', 2, True, False]"
+    );
+    // Two equal elements in ONE key must collapse onto each other, or two
+    // independently built equal keys take different heap ids and never match.
+    assert_eq!(
+        g(
+            &format!("{p}x = [{{(P(1), P(1)): 7}}[(P(1), P(1))], len({{(P(1), P(1)), (P(1), P(1))}})]"),
+            "x"
+        ),
+        "[7, 1]"
+    );
+    // Deeper nesting, and a tuple key alongside the bare instance: the nested
+    // element collapses onto the top-level key's object WITHOUT the two keys
+    // merging into one slot.
+    assert_eq!(
+        g(
+            &format!("{p}d = {{((P(1),),): 1, P(1): 2}}\nx = [len(d), d[((P(1),),)], d[P(1)]]"),
+            "x"
+        ),
+        "[2, 1, 2]"
+    );
+    // A `frozenset` key's element keys are computed when the frozenset is BUILT,
+    // so they have to be recomputed against the destination container.
+    assert_eq!(
+        g(
+            &format!(
+                "{p}d = {{frozenset([P(1), P(2)]): 'f'}}\n\
+                 d[frozenset([P(2), P(1)])] = 'g'\n\
+                 x = [len(d), d[frozenset([P(1), P(2)])], {{frozenset([P(1)])}} == {{frozenset([P(1)])}}]"
+            ),
+            "x"
+        ),
+        "[1, 'g', True]"
+    );
+    // `hash()` of a container holding a value-keyed element: CPython derives it
+    // from `__hash__()` alone, so the heap id the key carries for slot
+    // discrimination must not reach it.
+    assert_eq!(
+        g(
+            &format!(
+                "{p}x = [hash((P(1),)) == hash((P(1),)), \
+                 hash(((P(1),),)) == hash(((P(1),),)), \
+                 hash(frozenset([P(1)])) == hash(frozenset([P(1)]))]"
+            ),
+            "x"
+        ),
+        "[True, True, True]"
+    );
+    // The set algebra over tuple elements: `align_operand` has to recognise a
+    // tuple key as value-keyed before it will re-key the right operand.
+    assert_eq!(
+        g(
+            &format!(
+                "{p}A = {{(P(1),), (P(2),)}}\nB = {{(P(2),), (P(3),)}}\n\
+                 x = [sorted(e[0].v for e in A & B), sorted(e[0].v for e in A | B), \
+                 A == {{(P(1),), (P(2),)}}]"
+            ),
+            "x"
+        ),
+        "[[2], [1, 2, 3], True]"
+    );
+}
+
+// A `list`/`tuple`/`deque`/`dict` compares element-wise INSIDE the host borrow,
+// where a user `__eq__` cannot run — so `P(1) == P(1)` was True while
+// `(P(1),) == (P(1),)` and `[P(1)] == [P(1)]` were False. Same shape in
+// `tuple.index`/`tuple.count`, which used the borrowed comparison while their
+// `list` counterparts already used the rich one.
+#[test]
+fn container_equality_runs_the_elements_user_eq() {
+    let p = "\
+from collections import deque\n\
+class P:\n\
+\x20   def __init__(self, v): self.v = v\n\
+\x20   def __hash__(self): return hash(self.v)\n\
+\x20   def __eq__(self, o): return isinstance(o, P) and self.v == o.v\n";
+    assert_eq!(
+        g(
+            &format!(
+                "{p}x = [(P(1),) == (P(1),), [P(1)] == [P(1)], [[P(1)]] == [[P(1)]], \
+                 [(P(1),)] == [(P(1),)], deque([P(1)]) == deque([P(1)]), \
+                 {{1: P(1)}} == {{1: P(1)}}, {{P(1): P(2)}} == {{P(1): P(2)}}]"
+            ),
+            "x"
+        ),
+        "[True, True, True, True, True, True, True]"
+    );
+    // The negative side: unequal elements, a length mismatch, and the
+    // list-vs-tuple kind mismatch CPython never calls equal.
+    assert_eq!(
+        g(
+            &format!(
+                "{p}x = [[P(1)] == [P(2)], [P(1)] == [P(1), P(2)], [P(1)] == (P(1),), \
+                 [P(1)] != [P(2)]]"
+            ),
+            "x"
+        ),
+        "[False, False, False, True]"
+    );
+    // `tuple.index`/`tuple.count` against the `list` forms that already worked.
+    assert_eq!(
+        g(
+            &format!(
+                "{p}t = (P(1), P(2), P(1))\n\
+                 x = [t.index(P(2)), t.count(P(1)), P(2) in t, list(t).index(P(2))]"
+            ),
+            "x"
+        ),
+        "[1, 2, True, 1]"
+    );
+}

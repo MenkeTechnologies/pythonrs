@@ -637,7 +637,7 @@ fn b_mkset(vm: &mut VM, argc: u8) -> Value {
     for it in items {
         // Instance elements resolve their key (running `__hash__`, collapsing a
         // value-equal earlier element) before the borrowed `to_key`.
-        let cands = host::set_local_candidates(&set);
+        let cands = with_host(|h| host::set_local_candidates(h, &set));
         let key = host::with_instance_key(&it, &cands, || with_host(|h| h.to_key(&it)));
         match key {
             Ok(k) => host::set_put(&mut set, k, it),
@@ -654,7 +654,7 @@ fn b_mkdict(vm: &mut VM, argc: u8) -> Value {
     while i + 1 < flat.len() {
         let k = flat[i].clone();
         let v = flat[i + 1].clone();
-        let cands = host::dict_local_candidates(&d);
+        let cands = with_host(|h| host::dict_local_candidates(h, &d));
         let key = host::with_instance_key(&k, &cands, || with_host(|h| h.to_key(&k)));
         match key {
             Ok(key) => host::dict_put(&mut d, key, k, v),
@@ -701,7 +701,7 @@ fn b_extend_set(vm: &mut VM, argc: u8) -> Value {
         _ => IndexMap::new(),
     });
     for it in items {
-        let cands = host::set_local_candidates(&set);
+        let cands = with_host(|h| host::set_local_candidates(h, &set));
         let key = host::with_instance_key(&it, &cands, || with_host(|h| h.to_key(&it)));
         match key {
             Ok(k) => host::set_put(&mut set, k, it),
@@ -727,7 +727,7 @@ fn b_extend_dict(vm: &mut VM, argc: u8) -> Value {
     while i + 1 < flat.len() {
         let k = flat[i].clone();
         let v = flat[i + 1].clone();
-        let cands = host::dict_local_candidates(&d);
+        let cands = with_host(|h| host::dict_local_candidates(h, &d));
         let key = host::with_instance_key(&k, &cands, || with_host(|h| h.to_key(&k)));
         match key {
             Ok(key) => host::dict_put(&mut d, key, k, v),
@@ -1824,7 +1824,127 @@ fn elem_equal(elem: &Value, target: &Value) -> Result<bool, String> {
             Dunder::NotImplemented => Ok(with_host(|h| h.equal(elem, target))),
         };
     }
+    if let Some(r) = container_user_eq(elem, target)? {
+        return Ok(r);
+    }
     Ok(with_host(|h| h.equal(elem, target)))
+}
+
+/// How deep [`needs_user_eq`] looks for a user-compared element. A `list` can
+/// hold itself, so the scan is bounded; past the bound it reports "no user
+/// code", falling back to the borrowed comparison that was already in use.
+const USER_EQ_DEPTH: u32 = 32;
+
+/// Whether `v`, or anything nested in a sequence inside it, compares through
+/// user code — a user instance or a bridged CPython object.
+fn needs_user_eq(h: &host::PyHost, v: &Value, depth: u32) -> bool {
+    if depth == 0 {
+        return false;
+    }
+    match h.get(v) {
+        Some(PyObj::Instance(_)) => true,
+        #[cfg(feature = "stdlib-ffi")]
+        Some(PyObj::Foreign(_)) => true,
+        Some(PyObj::List(items)) | Some(PyObj::Tuple(items)) => {
+            items.iter().any(|e| needs_user_eq(h, e, depth - 1))
+        }
+        Some(PyObj::Deque { items, .. }) => items.iter().any(|e| needs_user_eq(h, e, depth - 1)),
+        _ => false,
+    }
+}
+
+/// `==` between two containers whose ELEMENTS compare through user code, run
+/// outside the host borrow.
+///
+/// `PyHost::equal` walks elements inside the borrow, where a user `__eq__`
+/// cannot run — so `P(1) == P(1)` was True while `(P(1),) == (P(1),)`,
+/// `[P(1)] == [P(1)]`, `deque([P(1)]) == deque([P(1)])` and
+/// `{1: P(1)} == {1: P(1)}` were all False. Returns `None` when no element
+/// needs user code, leaving the borrowed comparison (which is already right,
+/// and much cheaper) in charge.
+fn container_user_eq(a: &Value, b: &Value) -> Result<Option<bool>, String> {
+    // Two sequences of the SAME kind — CPython never compares a list equal to a
+    // tuple, so a kind mismatch is left to the borrowed path's `False`.
+    let seq = with_host(|h| {
+        let (x, y) = match (h.get(a), h.get(b)) {
+            (Some(PyObj::List(x)), Some(PyObj::List(y)))
+            | (Some(PyObj::Tuple(x)), Some(PyObj::Tuple(y))) => (x.clone(), y.clone()),
+            (Some(PyObj::Deque { items: x, .. }), Some(PyObj::Deque { items: y, .. })) => {
+                (x.iter().cloned().collect(), y.iter().cloned().collect())
+            }
+            _ => return None,
+        };
+        let needed = x
+            .iter()
+            .chain(y.iter())
+            .any(|e| needs_user_eq(h, e, USER_EQ_DEPTH));
+        needed.then_some((x, y))
+    });
+    if let Some((x, y)) = seq {
+        if x.len() != y.len() {
+            return Ok(Some(false));
+        }
+        for (p, q) in x.iter().zip(y.iter()) {
+            if !elem_pair_equal(p, q)? {
+                return Ok(Some(false));
+            }
+        }
+        return Ok(Some(true));
+    }
+    dict_user_eq(a, b)
+}
+
+/// `dict == dict` when the VALUES compare through user code. The keys are
+/// matched structurally (after [`host::align_operand`] has re-keyed `b` into
+/// `a`'s key space, which is what makes value-keyed KEYS line up); only the
+/// values need the full dispatch.
+fn dict_user_eq(a: &Value, b: &Value) -> Result<Option<bool>, String> {
+    let needed = with_host(|h| match (h.get(a), h.get(b)) {
+        (Some(PyObj::Dict(x)), Some(PyObj::Dict(y))) => x
+            .values()
+            .chain(y.values())
+            .any(|(_, v)| needs_user_eq(h, v, USER_EQ_DEPTH)),
+        _ => false,
+    });
+    if !needed {
+        return Ok(None);
+    }
+    let aligned = host::align_operand(a, b)?;
+    let bref = aligned.as_ref().unwrap_or(b);
+    let paired = with_host(|h| match (h.get(a), h.get(bref)) {
+        (Some(PyObj::Dict(x)), Some(PyObj::Dict(y))) if x.len() == y.len() => {
+            let mut out = Vec::with_capacity(x.len());
+            for (k, (_, xv)) in x.iter() {
+                let (_, yv) = y.get(k)?;
+                out.push((xv.clone(), yv.clone()));
+            }
+            Some(out)
+        }
+        _ => None,
+    });
+    let paired = match paired {
+        Some(p) => p,
+        // Different lengths, or a key of `a` missing from `b`.
+        None => return Ok(Some(false)),
+    };
+    for (xv, yv) in &paired {
+        if !elem_pair_equal(xv, yv)? {
+            return Ok(Some(false));
+        }
+    }
+    Ok(Some(true))
+}
+
+/// One element pair of a container comparison. CPython's
+/// `PyObject_RichCompareBool` shortcuts on identity before calling `__eq__`,
+/// so an element that IS the other element is equal even when its type says
+/// otherwise.
+fn elem_pair_equal(p: &Value, q: &Value) -> Result<bool, String> {
+    if matches!((p, q), (Value::Obj(i), Value::Obj(j)) if i == j) {
+        return Ok(true);
+    }
+    let r = numeric_hook(NumOp::Eq, p, q)?;
+    Ok(with_host(|h| h.truthy(&r)))
 }
 
 fn try_binop_dunder(
@@ -3129,6 +3249,13 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
     let b_inst = with_host(|h| matches!(h.get(b), Some(PyObj::Instance(_))));
     // No user instance involved → native handling (preserves `1 == 1.0`, etc.).
     if !a_inst && !b_inst {
+        // A sequence/dict whose elements compare through user code cannot be
+        // compared inside the borrow at all.
+        if matches!(op, Eq | Ne) {
+            if let Some(r) = container_user_eq(a, b)? {
+                return Ok(Value::Bool(if matches!(op, Eq) { r } else { !r }));
+            }
+        }
         // Set difference, the subset orders, and container `==` all compare keys
         // structurally inside the borrow; re-key the right operand into the
         // left's key space first when both hold user-hashed elements.
@@ -4641,7 +4768,9 @@ pub fn call_builtin_function(
             if with_host(|h| matches!(h.get(&v), Some(PyObj::Instance(_)))) {
                 return host::instance_hash_value(&v).map(Value::Int);
             }
-            let k = with_host(|h| h.to_key(&v))?;
+            // A `tuple`/`frozenset` hashes element-wise, and an element with a
+            // user `__hash__` can only be keyed outside the borrow.
+            let k = host::with_instance_key(&v, &[], || with_host(|h| h.to_key(&v)))?;
             Ok(Value::Int(hash_key(&k)))
         }
         "ord" => {
@@ -4928,7 +5057,7 @@ pub fn call_builtin_function(
             };
             let mut s: IndexMap<PKey, Value> = IndexMap::new();
             for it in items {
-                let cands = host::set_local_candidates(&s);
+                let cands = with_host(|h| host::set_local_candidates(h, &s));
                 let k = host::with_instance_key(&it, &cands, || with_host(|h| h.to_key(&it)))?;
                 host::set_put(&mut s, k, it);
             }
@@ -5306,7 +5435,7 @@ fn arg0(args: &[Value]) -> Result<Value, String> {
 
 pub fn hash_key(k: &PKey) -> i64 {
     use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+    use std::hash::Hasher;
     // A Foreign key's user-visible `hash()` is CPython's own `hash(obj)` (the
     // `hash` field), independent of the handle's heap id — so value-equal objects
     // (`Decimal('1.5')` fetched twice) report equal hashes. The `id` only
@@ -5315,8 +5444,41 @@ pub fn hash_key(k: &PKey) -> i64 {
         return *hash;
     }
     let mut h = DefaultHasher::new();
-    k.hash(&mut h);
+    hash_pkey_into(k, &mut h);
     h.finish() as i64
+}
+
+/// Feed a key to a hasher for its USER-VISIBLE `hash()`, dropping the heap `id`
+/// a value-keyed entry carries at every depth. `PKey`'s derived `Hash` includes
+/// that id — correct for map slotting, wrong for `hash()`, which CPython derives
+/// from `__hash__()` alone: `hash((P(1),)) == hash((P(1),))` is True there and
+/// was False here for anything holding a value-keyed element.
+fn hash_pkey_into<H: std::hash::Hasher>(k: &PKey, st: &mut H) {
+    use std::hash::Hash;
+    match k {
+        PKey::Instance { hash, .. } | PKey::Foreign { hash, .. } => {
+            st.write_u8(0);
+            hash.hash(st);
+        }
+        PKey::Tuple(ks) => {
+            st.write_u8(1);
+            st.write_usize(ks.len());
+            for e in ks {
+                hash_pkey_into(e, st);
+            }
+        }
+        PKey::Frozenset(ks) => {
+            st.write_u8(2);
+            st.write_usize(ks.len());
+            for e in ks {
+                hash_pkey_into(e, st);
+            }
+        }
+        other => {
+            st.write_u8(3);
+            other.hash(st);
+        }
+    }
 }
 
 pub fn py_len(v: &Value) -> Result<usize, String> {
@@ -5910,7 +6072,7 @@ fn construct_dict(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, S
             for p in pairs {
                 let kv = host::iter_vec(&p)?;
                 if kv.len() == 2 {
-                    let cands = host::dict_local_candidates(&d);
+                    let cands = with_host(|h| host::dict_local_candidates(h, &d));
                     let key = host::with_instance_key(&kv[0], &cands, || {
                         with_host(|h| h.to_key(&kv[0]))
                     })?;
@@ -11388,7 +11550,7 @@ fn dict_method(
             let value = args.get(1).cloned().unwrap_or(Value::Undef);
             let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
             for k in keys {
-                let cands = host::dict_local_candidates(&d);
+                let cands = with_host(|h| host::dict_local_candidates(h, &d));
                 let key = host::with_instance_key(&k, &cands, || with_host(|h| h.to_key(&k)))?;
                 host::dict_put(&mut d, key, k, value.clone());
             }
@@ -11948,22 +12110,36 @@ fn tuple_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, Strin
         "index" if args.is_empty() => Err(host::type_error(
             "index expected at least 1 argument, got 0",
         )),
+        // Both searches compare via the rich `==` dunder OUTSIDE the borrow, the
+        // way `list.index`/`list.count` do — `h.equal` cannot run a user
+        // `__eq__`, so `(P(1), P(2)).index(P(2))` raised `ValueError` while the
+        // list form found it.
         "count" => {
             let v = arg0(args)?;
-            Ok(Value::Int(with_host(|h| match h.get(recv) {
-                Some(PyObj::Tuple(l)) => l.iter().filter(|x| h.equal(x, &v)).count() as i64,
-                _ => 0,
-            })))
+            let elems = with_host(|h| match h.get(recv) {
+                Some(PyObj::Tuple(l)) => l.clone(),
+                _ => Vec::new(),
+            });
+            let mut n = 0i64;
+            for e in &elems {
+                if elem_equal(e, &v)? {
+                    n += 1;
+                }
+            }
+            Ok(Value::Int(n))
         }
         "index" => {
             let v = arg0(args)?;
-            with_host(|h| match h.get(recv) {
-                Some(PyObj::Tuple(l)) => match l.iter().position(|x| h.equal(x, &v)) {
-                    Some(p) => Ok(Value::Int(p as i64)),
-                    None => Err("ValueError: tuple.index(x): x not in tuple".into()),
-                },
+            let elems = with_host(|h| match h.get(recv) {
+                Some(PyObj::Tuple(l)) => Ok(l.clone()),
                 _ => Err(host::type_error("not a tuple")),
-            })
+            })?;
+            for (i, e) in elems.iter().enumerate() {
+                if elem_equal(e, &v)? {
+                    return Ok(Value::Int(i as i64));
+                }
+            }
+            Err("ValueError: tuple.index(x): x not in tuple".into())
         }
         _ => Err(format!(
             "AttributeError: 'tuple' object has no attribute '{name}'"

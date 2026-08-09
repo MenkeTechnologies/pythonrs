@@ -5277,7 +5277,7 @@ fn gen_valuekey(seed: u64) -> Vec<String> {
         "def S(x): return sorted(e.v for e in x)".into(),
         "def D(x): return sorted((k.v, v) for k, v in x.items())".into(),
     ];
-    match r.below(12) {
+    match r.below(16) {
         // The four binary set operators across two separately built sets.
         0 => {
             out.push(format!("A = {{P({a}), P({b})}}"));
@@ -5427,7 +5427,7 @@ fn gen_valuekey(seed: u64) -> Vec<String> {
             ));
         }
         // Construction-time dedup vs. the cross-container ops, and empty operands.
-        _ => {
+        11 => {
             out.push(format!("A = {{P({a}), P({a}), P({b})}}"));
             out.push("print(len(A), S(A))".into());
             out.push(format!("B = set([P(x) for x in ({a}, {b}, {c})])"));
@@ -5437,6 +5437,67 @@ fn gen_valuekey(seed: u64) -> Vec<String> {
             out.push(format!("C2.add(P({a}))"));
             out.push("print(len(C2), len(A), S(C2))".into());
             out.push(format!("print(S(A.union(*[[P({c})], [P({d})]])))"));
+        }
+        // A value-keyed object NESTED inside a `tuple` key — the key is hashed
+        // element-wise, so the element is a key in its own right and has to
+        // collapse the same way a top-level one does. Every shape below was
+        // unreachable before (the generator only ever put a `P` at top level),
+        // and every one of them raised `TypeError: unhashable type: 'P'`.
+        12 => {
+            out.push(format!("d = {{(P({a}),): 'x', (P({b}), P({c})): 'y'}}"));
+            out.push(format!("print(d[(P({a}),)], d[(P({b}), P({c}))])"));
+            out.push(format!("d[(P({a}),)] = 'z'"));
+            out.push("print(len(d), sorted(d.values()))".into());
+            out.push(format!(
+                "print((P({a}),) in d, (P({d}),) in d, d.get((P({a}),), 'no'))"
+            ));
+            out.push(format!(
+                "print(d == {{(P({a}),): 'z', (P({b}), P({c})): 'y'}})"
+            ));
+        }
+        // The same nesting one level deeper, and a `tuple` key mixed with the
+        // bare instance — two DIFFERENT slots that must not merge.
+        13 => {
+            out.push(format!(
+                "d = {{((P({a}),),): 1, P({a}): 2, ((P({b}),),): 3}}"
+            ));
+            out.push(format!("print(len(d), d[((P({a}),),)], d[P({a})])"));
+            out.push(format!("print(hash((P({a}),)) == hash((P({a}),)))"));
+            out.push(format!(
+                "print(hash(((P({a}),),)) == hash(((P({a}),),)), hash(frozenset([P({a})])) == hash(frozenset([P({a})])))"
+            ));
+            out.push(format!(
+                "print(len({{(P({a}), P({a})), (P({a}), P({a}))}}), (P({a}), P({a})) == (P({a}), P({a})))"
+            ));
+        }
+        // A `frozenset` as the key (and inside a tuple key): its element keys
+        // are computed when the frozenset is BUILT, so they have to be redone
+        // against the destination container.
+        14 => {
+            out.push(format!("d = {{frozenset([P({a}), P({b})]): 'f'}}"));
+            out.push(format!("print(d[frozenset([P({b}), P({a})])], len(d))"));
+            out.push(format!("d[frozenset([P({a}), P({b})])] = 'g'"));
+            out.push("print(len(d), sorted(d.values()))".into());
+            out.push(format!(
+                "print({{frozenset([P({a})])}} == {{frozenset([P({a})])}}, len({{frozenset([P({a})]), frozenset([P({a})])}}))"
+            ));
+            out.push(format!(
+                "print(len({{(frozenset([P({c})]),): 1, (frozenset([P({c})]),): 2}}))"
+            ));
+        }
+        // Set algebra where the ELEMENTS are tuples holding value-keyed objects:
+        // `align_operand` has to see a tuple key as value-keyed to re-key it.
+        _ => {
+            out.push(format!("A = {{(P({a}),), (P({b}),)}}"));
+            out.push(format!("B = {{(P({b}),), (P({c}),)}}"));
+            out.push("T = lambda s: sorted(e[0].v for e in s)".into());
+            out.push("print(T(A & B), T(A | B), T(A - B), T(A ^ B))".into());
+            out.push(format!(
+                "print(A == {{(P({a}),), (P({b}),)}}, A <= (A | B))"
+            ));
+            out.push(format!("A.add((P({a}),))"));
+            out.push(format!("A.update([(P({d}),)])"));
+            out.push("print(len(A), T(A))".into());
         }
     }
     out
