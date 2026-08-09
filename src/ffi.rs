@@ -57,6 +57,15 @@ fn module_handles() -> &'static Mutex<rustc_hash::FxHashMap<String, u32>> {
     MODULE_HANDLES.get_or_init(|| Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
+/// CPython type-object address → the side-table id its handle occupies. See
+/// [`type_of`]; without it, `type(x)` on a foreign object in a loop would grow
+/// the side-table once per call.
+static TYPE_HANDLES: OnceLock<Mutex<rustc_hash::FxHashMap<usize, u32>>> = OnceLock::new();
+
+fn type_handles() -> &'static Mutex<rustc_hash::FxHashMap<usize, u32>> {
+    TYPE_HANDLES.get_or_init(|| Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
 /// Resolve the CPython prefix to hand to `PYTHONHOME`, or `None` to let the
 /// linked libpython locate its own stdlib (the system-CPython path).
 ///
@@ -196,8 +205,17 @@ fn system_exit_code(py: Python, e: &PyErr) -> i32 {
     }
 }
 
+thread_local! {
+    /// How many side-table slots THIS thread has allocated. The table itself is
+    /// process-global, so its length also counts every other thread's stores —
+    /// useless as a leak metric when several interpreters run concurrently (the
+    /// test suite). This counter attributes growth to the thread that caused it.
+    static STORES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Store a CPython object in the side-table and hand back its `Foreign` id.
 fn store(obj: Py<PyAny>) -> u32 {
+    STORES.with(|n| n.set(n.get() + 1));
     let mut t = table().lock().expect("ffi table poisoned");
     t.push(obj);
     (t.len() - 1) as u32
@@ -207,6 +225,14 @@ fn store(obj: Py<PyAny>) -> u32 {
 /// bridge's own tests to assert bounded growth).
 pub fn table_len() -> usize {
     table().lock().map(|t| t.len()).unwrap_or(0)
+}
+
+/// Side-table slots allocated by the CURRENT thread. Diagnostic only: the
+/// bridge's leak tests take a delta of this rather than of [`table_len`], so a
+/// concurrently-running test's stores cannot be mistaken for a leak in the path
+/// under measurement.
+pub fn table_stores_on_thread() -> usize {
+    STORES.with(|n| n.get())
 }
 
 /// A fresh owned handle to the side-table object `id`, bound to `py`.
@@ -1629,6 +1655,30 @@ pub fn class_name(id: u32) -> Option<String> {
         obj.getattr("__name__")
             .ok()
             .and_then(|n| n.extract::<String>().ok())
+    })
+}
+
+/// A handle to the CPython *type object* of foreign object `id` — what `type(x)`
+/// must return. [`type_name`] only yields the unqualified name (`date`), which
+/// cannot be rebuilt into the class: pythonrs has no `datetime.date`, so
+/// `type()` used to answer with a `Builtin("date")` that printed as
+/// `<built-in function date>`. Handing back CPython's own type object makes
+/// `repr`, `dir`, attribute access, and `==` against the class all correct.
+pub fn type_of(id: u32) -> Option<u32> {
+    Python::with_gil(|py| {
+        let ty = fetch(py, id).ok()?.get_type();
+        // Memoize by the type object's address so `type(x)` in a loop does not
+        // allocate a side-table slot per call. Reuse of a freed address cannot
+        // alias a stale entry: the table holds a strong reference forever, so a
+        // cached type object is never deallocated.
+        let key = ty.as_ptr() as usize;
+        let mut cache = type_handles().lock().expect("ffi type cache poisoned");
+        if let Some(existing) = cache.get(&key) {
+            return Some(*existing);
+        }
+        let fid = store(ty.into_any().unbind());
+        cache.insert(key, fid);
+        Some(fid)
     })
 }
 

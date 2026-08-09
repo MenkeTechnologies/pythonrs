@@ -171,6 +171,7 @@ fn b_ellipsis(_vm: &mut VM, _: u8) -> Value {
 
 fn b_getlocal(vm: &mut VM, _: u8) -> Value {
     let name = sval(&vm.pop());
+    materialize_if_main_dunder(&name);
     match with_host(|h| h.read_name_checked(&name)) {
         host::NameRead::Value(v) => return v,
         host::NameRead::Unbound => return abort(vm, host::unbound_local_error(&name)),
@@ -188,8 +189,18 @@ fn b_getlocal(vm: &mut VM, _: u8) -> Value {
     abort(vm, host::name_error(&name))
 }
 
+/// Fill `__main__`'s lazily-bound `__loader__`/`__builtins__` when the name
+/// about to be read is one of them. The leading `matches!` keeps the cost of a
+/// bare-name read at one discriminant compare.
+fn materialize_if_main_dunder(name: &str) {
+    if matches!(name, "__loader__" | "__builtins__") {
+        host::ensure_main_dunders();
+    }
+}
+
 fn b_getglobal(vm: &mut VM, _: u8) -> Value {
     let name = sval(&vm.pop());
+    materialize_if_main_dunder(&name);
     if let Some(v) = with_host(|h| h.read_global(&name)) {
         return v;
     }
@@ -4285,6 +4296,16 @@ pub fn call_builtin_function(
             }
             // 1-arg form: the object's type.
             let v = arg0(&args)?;
+            // A CPython object the bridge holds by handle: hand back CPython's
+            // own type object. Rebuilding it from `type_name` cannot work —
+            // pythonrs has no `datetime.date`, so the name-based path produced a
+            // `Builtin("date")` that printed as `<built-in function date>`.
+            #[cfg(feature = "stdlib-ffi")]
+            if let Some(fid) = with_host(|h| h.foreign_id(&v)) {
+                if let Some(tid) = crate::ffi::type_of(fid) {
+                    return Ok(with_host(|h| h.alloc(PyObj::Foreign(tid))));
+                }
+            }
             let tn = with_host(|h| h.type_name(&v));
             Ok(with_host(|h| {
                 if h.classes.contains_key(&tn) {
@@ -4615,40 +4636,50 @@ pub fn call_builtin_function(
             // scope, a snapshot of the caller's locals inside a function.
             None => call_builtin_function("locals", vec![], vec![]),
         },
-        "dir" => Ok(with_host(|h| {
-            let names = match args.first() {
-                Some(v) => h.dir_names(v),
-                // Bare `dir()` is the sorted names bound in the current scope.
-                None => {
-                    if h.frame_depth() > 1 {
-                        let mut ns: Vec<String> =
-                            h.caller_locals().into_iter().map(|(k, _)| k).collect();
-                        ns.sort();
-                        ns
-                    } else {
-                        let slot = h.cur_module();
-                        let mut ns: Vec<String> = h
-                            .module_globals_pairs(slot)
-                            .into_iter()
-                            .map(|(k, _)| k)
-                            .collect();
-                        ns.sort();
-                        ns
+        "dir" => {
+            // Bare `dir()` at module scope lists the module namespace, so the
+            // lazily-bound `__main__` dunders have to exist by now.
+            if args.is_empty() {
+                host::ensure_main_dunders();
+            }
+            Ok(with_host(|h| {
+                let names = match args.first() {
+                    Some(v) => h.dir_names(v),
+                    // Bare `dir()` is the sorted names bound in the current scope.
+                    None => {
+                        if h.frame_depth() > 1 {
+                            let mut ns: Vec<String> =
+                                h.caller_locals().into_iter().map(|(k, _)| k).collect();
+                            ns.sort();
+                            ns
+                        } else {
+                            let slot = h.cur_module();
+                            let mut ns: Vec<String> = h
+                                .module_globals_pairs(slot)
+                                .into_iter()
+                                .map(|(k, _)| k)
+                                .collect();
+                            ns.sort();
+                            ns
+                        }
                     }
-                }
-            };
-            let items: Vec<Value> = names.into_iter().map(|n| h.new_str(n)).collect();
-            h.new_list(items)
-        })),
+                };
+                let items: Vec<Value> = names.into_iter().map(|n| h.new_str(n)).collect();
+                h.new_list(items)
+            }))
+        }
         // `globals()` is the running module's namespace itself — a LIVE view, so
         // `globals()['X'] = v` binds a module global. `inspect` builds its whole
         // `CO_*` constant set that way (`mod_dict = globals()` then
         // `mod_dict["CO_" + name] = flag`), and a snapshot silently dropped every
         // one of them.
-        "globals" => Ok(with_host(|h| {
-            let slot = h.cur_module();
-            h.module_dict(slot)
-        })),
+        "globals" => {
+            host::ensure_main_dunders();
+            Ok(with_host(|h| {
+                let slot = h.cur_module();
+                h.module_dict(slot)
+            }))
+        }
         // `locals()` inside a function is a SNAPSHOT, as CPython's is for an
         // optimized frame: writing to it does not rebind a local. At module scope
         // it is `globals()`, and there it is live.
@@ -4658,6 +4689,7 @@ pub fn call_builtin_function(
                     h.caller_locals().into_iter().collect()
                 })))
             } else {
+                host::ensure_main_dunders();
                 Ok(with_host(|h| {
                     let slot = h.cur_module();
                     h.module_dict(slot)

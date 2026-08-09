@@ -1384,6 +1384,16 @@ pub struct PyHost {
     pub argv: Vec<String>,
     /// Absolute path bound to the top-level `__file__`, `None` for `-c`/stdin.
     pub main_file: Option<String>,
+    /// `__main__`'s `__loader__`/`__builtins__` are still placeholders.
+    ///
+    /// Both are real CPython objects (`_frozen_importlib.BuiltinImporter`, the
+    /// `builtins` module), so materializing them boots the embedded interpreter
+    /// — ~12 ms that a script importing nothing should not pay. `init_runtime`
+    /// therefore reserves the two names in CPython's own insertion order and
+    /// leaves this flag set; [`ensure_main_dunders`] fills the values the first
+    /// time anything can observe them. Cleared once filled, and by an
+    /// assignment to either name (the user's value wins).
+    pub pending_main_dunders: bool,
     /// The full program source — used to reconstruct traceback source lines.
     pub prog_source: String,
     /// The filename shown in traceback frames (`<string>`, `<stdin>`, or a path).
@@ -1696,23 +1706,91 @@ pub fn init_runtime(
         // The top-level script always runs as `__main__`.
         let name = h.new_str("__main__");
         h.set_global("__name__", name);
-        // The module dunders CPython binds in `__main__` before the body runs.
-        // `__doc__` is overwritten by the compiled `__doc__ = <docstring>` store
-        // when the script opens with a string literal. `__loader__` and
-        // `__builtins__` are not bound: they need real importer/module objects.
-        for dunder in ["__doc__", "__package__", "__spec__"] {
+        // The module dunders CPython binds in `__main__` before the body runs,
+        // in CPython's own insertion order — `list(globals())` is observable and
+        // module globals are an `IndexMap`. `__doc__` is overwritten by the
+        // compiled `__doc__ = <docstring>` store when the script opens with a
+        // string literal. `__loader__` and `__builtins__` are reserved here and
+        // filled by `ensure_main_dunders` on first observation; reserving them
+        // now is what keeps them in the right position once they are.
+        for dunder in [
+            "__doc__",
+            "__package__",
+            "__loader__",
+            "__spec__",
+            "__builtins__",
+        ] {
             h.set_global(dunder, Value::Undef);
         }
-        // `__cached__` names the bytecode file of the script, so it exists only
-        // when there IS a script — `python -c` has neither it nor `__file__`.
-        if main_file.is_some() {
-            h.set_global("__cached__", Value::Undef);
-        }
+        h.pending_main_dunders = true;
+        // `__file__` and `__cached__` follow, in that order — they exist only
+        // when there IS a script (`python -c` has neither).
         if let Some(path) = main_file {
             let f = h.new_str(path);
             h.set_global("__file__", f);
+            h.set_global("__cached__", Value::Undef);
         }
     });
+}
+
+/// Fill `__main__`'s reserved `__loader__` / `__builtins__` with the real
+/// CPython objects, the first time anything can observe them.
+///
+/// `__builtins__` is the `builtins` module; `__loader__` is
+/// `_frozen_importlib.BuiltinImporter` for `-c`/stdin and a
+/// `_frozen_importlib_external.SourceFileLoader('__main__', path)` for a script
+/// — exactly what CPython's `runpy`/`pymain` bind. Both come back over the FFI
+/// bridge as the interpreter's own objects rather than as synthesized
+/// look-alikes, so their `repr`, `dir`, and attributes are CPython's.
+///
+/// Must NOT be called from inside a `with_host` closure: importing re-enters the
+/// host and would panic on the `RefCell`.
+pub fn ensure_main_dunders() {
+    if !with_host(|h| h.pending_main_dunders) {
+        return;
+    }
+    // Clear first: the import below runs through paths that observe globals, and
+    // a re-entrant call would recurse without a terminating condition.
+    let main_file = with_host(|h| {
+        h.pending_main_dunders = false;
+        h.main_file.clone()
+    });
+    let builtins = import_module("builtins").ok();
+    let loader = main_dunder_loader(main_file.as_deref());
+    with_host(|h| {
+        // Write into `__main__` (slot 0) explicitly: the trigger may have come
+        // from code running with another module's globals current.
+        for (name, val) in [("__loader__", loader), ("__builtins__", builtins)] {
+            if let Some(v) = val {
+                h.module_globals[0].insert(name.to_string(), v);
+            }
+        }
+    });
+}
+
+/// `__main__.__loader__` for this invocation, or `None` when the bridge is off
+/// (the name then stays bound to `None`, as it is for a frozen `__main__`).
+#[cfg(feature = "stdlib-ffi")]
+fn main_dunder_loader(main_file: Option<&str>) -> Option<Value> {
+    let bootstrap = import_module("_frozen_importlib").ok()?;
+    match main_file {
+        // A script is loaded from source: CPython binds a live SourceFileLoader
+        // instance carrying the module name and the path it was read from.
+        Some(path) => {
+            let ext = import_module("_frozen_importlib_external").ok()?;
+            let cls = with_host(|h| h.get_attr(&ext, "SourceFileLoader")).ok()?;
+            let args = with_host(|h| vec![h.new_str("__main__"), h.new_str(path)]);
+            invoke(&cls, args, vec![]).ok()
+        }
+        // `-c` / stdin have no source file, so `__main__` keeps the importer that
+        // handles built-in modules.
+        None => with_host(|h| h.get_attr(&bootstrap, "BuiltinImporter")).ok(),
+    }
+}
+
+#[cfg(not(feature = "stdlib-ffi"))]
+fn main_dunder_loader(_main_file: Option<&str>) -> Option<Value> {
+    None
 }
 
 impl Default for PyHost {
@@ -1767,6 +1845,7 @@ impl PyHost {
             foreign_exc_bases: HashMap::new(),
             argv: vec![String::new()],
             main_file: None,
+            pending_main_dunders: false,
             prog_source: String::new(),
             tb_filename: "<string>".to_string(),
             tb_show_source: true,
@@ -2565,6 +2644,13 @@ impl PyHost {
     /// Assign to `name` following Python scope rules: a `global`-declared name
     /// (or module scope) writes to globals; otherwise the current local env.
     pub fn set_name(&mut self, name: &str, val: Value) {
+        // An explicit `__loader__ = …` / `__builtins__ = …` at module level wins
+        // over the reserved placeholder, so stop planning to overwrite it. The
+        // `bool` short-circuits before the name compares, and it is only ever
+        // true for the handful of stores before the first observation.
+        if self.pending_main_dunders && matches!(name, "__loader__" | "__builtins__") {
+            self.pending_main_dunders = false;
+        }
         if self.frame().globals_decl.contains(name) {
             self.globals_mut().insert(name.to_string(), val);
             return;

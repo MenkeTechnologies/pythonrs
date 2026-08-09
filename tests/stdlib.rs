@@ -28,6 +28,28 @@ fn err(src: &str) -> String {
     eval_str(src).expect_err("program should raise")
 }
 
+/// Serializes the tests that seed CPython's module-global `random.Random`.
+///
+/// pythonrs's host is thread-local, so libtest's one-thread-per-test isolation
+/// covers everything pythonrs owns. It does NOT cover the *embedded CPython
+/// interpreter*: pyo3 links one libpython per process, and `random.seed()`
+/// mutates a Mersenne Twister that every test thread shares. Two tests seeding
+/// it concurrently interleave their `randint`/`shuffle` draws, so a
+/// seed-determinism assertion fails for reasons unrelated to the code under
+/// test. Anything that seeds or draws from the module-level `random` takes this
+/// guard; nothing else in the suite is serialized.
+#[cfg(feature = "stdlib-ffi")]
+static CPYTHON_RANDOM_STATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Lock [`CPYTHON_RANDOM_STATE`], ignoring poisoning — a panic in one of the
+/// guarded tests must not cascade into a second, misleading failure.
+#[cfg(feature = "stdlib-ffi")]
+fn cpython_random_guard() -> std::sync::MutexGuard<'static, ()> {
+    CPYTHON_RANDOM_STATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 #[test]
 fn comparison_typeerror_names_the_operator() {
     // The `'<' not supported …` message must reflect the actual operator, and the
@@ -285,6 +307,7 @@ fn string_constants() {
 #[cfg(feature = "stdlib-ffi")]
 #[test]
 fn random_is_deterministic_after_seed() {
+    let _guard = cpython_random_guard();
     // pythonrs's own PRNG (not CPython-bit-identical), but stable across runs for
     // a fixed seed — so two seeded sequences in one program must match.
     let src = "import random\n\
@@ -800,6 +823,9 @@ fn ffi_marshals_value_types_into_cpython_calls() {
 #[cfg(feature = "stdlib-ffi")]
 #[test]
 fn ffi_inplace_mutation_writes_back() {
+    // The `random.shuffle` leg below seeds the interpreter-global Mersenne
+    // Twister; see `cpython_random_guard`.
+    let _guard = cpython_random_guard();
     // heapq.heapify mutates the list in place.
     assert_eq!(
         g("import heapq\nh = [5, 3, 8, 1, 2]\nheapq.heapify(h)", "h"),
@@ -840,17 +866,22 @@ fn ffi_inplace_mutation_writes_back() {
 #[cfg(feature = "stdlib-ffi")]
 #[test]
 fn ffi_value_marshaled_churn_is_bounded() {
-    let before = pythonrs::ffi::table_len();
+    // Attribute growth to THIS thread. The side-table is process-global, so its
+    // raw length also counts stores made by every other test running in
+    // parallel — which is why the `table_len` form of this assertion failed
+    // nondeterministically. Per-thread attribution measures only the path under
+    // test, so the bound can be tight instead of a 100-slot slush fund.
+    let before = pythonrs::ffi::table_stores_on_thread();
     eval_str(
         "import heapq\nfor i in range(2000):\n    h = [5, 3, 8, 1, 2, i]\n    heapq.heapify(h)",
     )
     .unwrap();
-    let grew = pythonrs::ffi::table_len() - before;
-    // 2000 iterations; a per-iteration leak would add ~2000. A small constant
-    // (module handles, incl. any from other tests sharing the process) is fine.
+    let grew = pythonrs::ffi::table_stores_on_thread() - before;
+    // 2000 iterations; a per-iteration leak would add ~2000. Only the one-time
+    // `heapq` module handle may be stored.
     assert!(
-        grew < 100,
-        "value-marshaled churn grew the side-table by {grew} over 2000 iterations (expected a small constant, not O(iters))"
+        grew <= 4,
+        "value-marshaled churn stored {grew} side-table slots over 2000 iterations (expected the module handle only, not O(iters))"
     );
 }
 
