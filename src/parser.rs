@@ -2020,8 +2020,20 @@ impl Parser {
         Ok(Expr::List(items))
     }
 
-    /// `{...}` — dict/set display or comprehension.
+    /// `{...}` — dict/set display or comprehension, with the whole display as
+    /// its caret span. A display raises on an unhashable element (`{[1]: 2}`),
+    /// and CPython underlines the display; a comprehension raises from inside
+    /// its own hidden function, so it is left unwrapped.
     fn parse_brace(&mut self) -> Result<Expr, String> {
+        let (line, start) = (self.line(), self.col());
+        let e = self.parse_brace_display()?;
+        Ok(match e {
+            Expr::Dict(_) | Expr::Set(_) => spanned(e, line, start, self.prev_end_col(), 0, 0),
+            other => other,
+        })
+    }
+
+    fn parse_brace_display(&mut self) -> Result<Expr, String> {
         self.advance(); // {
         if self.eat_op("}") {
             return Ok(Expr::Dict(Vec::new()));

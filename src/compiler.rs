@@ -687,7 +687,15 @@ impl Compiler {
 
     fn compile_assign(&mut self, b: &mut ChunkBuilder, target: &Expr) -> Result<(), String> {
         // Value is on top of stack. Peel the parser's span wrapper so a target
-        // like `x`, `a.b`, or `a[i]` (all `Spanned`) matches structurally.
+        // like `x`, `a.b`, or `a[i]` (all `Spanned`) matches structurally —
+        // keeping it as the active `node_span`, because a subscript STORE can
+        // raise (`d[[1]] = 2`) and its traceback caret comes from that span.
+        if let Expr::Spanned(inner, sp) = target {
+            let prev = std::mem::replace(&mut self.node_span, *sp);
+            let r = self.compile_assign(b, inner);
+            self.node_span = prev;
+            return r;
+        }
         let target = target.unspanned();
         match target {
             Expr::Name(n) => {
@@ -708,11 +716,15 @@ impl Compiler {
                 b.emit(Op::CallBuiltin(ops::SETATTR, 3), 0);
                 b.emit(Op::Pop, 0);
             }
+            // The store op carries the statement's line and the target's span:
+            // `d[[1]] = 2` raises on the unhashable key, and with line 0 that
+            // traceback rendered `line 0` with no source line and no carets.
             Expr::Subscript(recv, idx) => {
                 self.compile_expr(b, recv)?; // [value, recv]
                 self.compile_subscript_index(b, idx)?; // [value, recv, idx]
                 b.emit(Op::Rot, 0); // [recv, idx, value]
-                b.emit(Op::CallBuiltin(ops::SETITEM, 3), 0);
+                let op = b.emit(Op::CallBuiltin(ops::SETITEM, 3), self.cur_line);
+                self.record_span(op);
                 b.emit(Op::Pop, 0);
             }
             Expr::Tuple(items) | Expr::List(items) => {
@@ -2658,7 +2670,13 @@ impl Compiler {
                             }
                         }
                     }
-                    b.emit(Op::CallBuiltin(ops::MKDICT_EX, argc(pairs.len() * 3)?), 0);
+                    // Carries the line/span for the same reason `build_chunked`
+                    // does: `{**a, [1]: 2}` raises on the unhashable key.
+                    let idx = b.emit(
+                        Op::CallBuiltin(ops::MKDICT_EX, argc(pairs.len() * 3)?),
+                        self.cur_line,
+                    );
+                    self.record_span(idx);
                 } else {
                     // This branch is reached only when every key is `Some`
                     // (the `**`-spread case took the arm above), so each pair
@@ -2865,24 +2883,31 @@ impl Compiler {
         // `extend` chunk reserves 1 slot for the accumulator beneath it.
         let mk_cap = 255 / slots;
         let ext_cap = (255 - 1) / slots;
+        // The build op carries the statement's line and the literal's span: a
+        // set/dict display raises on an unhashable element, and with line 0 that
+        // traceback rendered `line 0` with no source line and no carets.
+        let line = self.cur_line;
         if count <= mk_cap {
             for i in 0..count {
                 emit(self, b, i)?;
             }
-            b.emit(Op::CallBuiltin(mk, (count * slots) as u8), 0);
+            let idx = b.emit(Op::CallBuiltin(mk, (count * slots) as u8), line);
+            self.record_span(idx);
             return Ok(());
         }
         for i in 0..mk_cap {
             emit(self, b, i)?;
         }
-        b.emit(Op::CallBuiltin(mk, (mk_cap * slots) as u8), 0);
+        let idx = b.emit(Op::CallBuiltin(mk, (mk_cap * slots) as u8), line);
+        self.record_span(idx);
         let mut i = mk_cap;
         while i < count {
             let n = ext_cap.min(count - i);
             for j in 0..n {
                 emit(self, b, i + j)?;
             }
-            b.emit(Op::CallBuiltin(extend, (1 + n * slots) as u8), 0);
+            let idx = b.emit(Op::CallBuiltin(extend, (1 + n * slots) as u8), line);
+            self.record_span(idx);
             i += n;
         }
         Ok(())

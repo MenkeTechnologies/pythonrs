@@ -99,6 +99,11 @@ use std::path::PathBuf;
 /// v31: a `def`/`lambda` with annotations compiles them as a `<annotate>` thunk
 /// (MKFUNC evaluates it with forward-reference NameErrors caught) instead of an
 /// inline dict, so annotated-function bytecode differs.
+/// v46: a set/dict/list/tuple display, a `{**a, …}` merge, and a subscript
+/// STORE now carry the statement's line number and the expression's caret span
+/// (they emitted line 0, so an unhashable key rendered `line 0` with no source
+/// line). The line table and the position table of any chunk containing one of
+/// those differ.
 /// v45: a call whose callee is a BARE NAME resolves the name before the
 /// arguments (CPython order) and calls by value, so every such call site emits
 /// different bytecode.
@@ -124,7 +129,7 @@ use std::path::PathBuf;
 /// v37: `%` by an integer literal inside a native slot loop lowers to native
 /// `Mod` + a branchless floor correction instead of the `BINOP` host call, so
 /// loops containing `%` emit different bytecode (and now qualify as native).
-const SCHEMA: u64 = 45;
+const SCHEMA: u64 = 46;
 
 /// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]

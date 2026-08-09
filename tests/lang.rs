@@ -5573,7 +5573,9 @@ class P:\n\
     // independently built equal keys take different heap ids and never match.
     assert_eq!(
         g(
-            &format!("{p}x = [{{(P(1), P(1)): 7}}[(P(1), P(1))], len({{(P(1), P(1)), (P(1), P(1))}})]"),
+            &format!(
+                "{p}x = [{{(P(1), P(1)): 7}}[(P(1), P(1))], len({{(P(1), P(1)), (P(1), P(1))}})]"
+            ),
             "x"
         ),
         "[7, 1]"

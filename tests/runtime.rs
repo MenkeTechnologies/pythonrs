@@ -533,3 +533,53 @@ fn did_you_mean_suggestions() {
         "\"'list' object has no attribute 'appendd'\""
     );
 }
+
+#[test]
+fn container_display_and_subscript_store_carry_a_line_and_caret() {
+    // A set/dict display and a subscript STORE emitted line 0, so an unhashable
+    // key rendered `File "…", line 0, in <module>` with no source line and no
+    // carets — the traceback named nothing at all. They now carry the
+    // statement's line and the expression's span, matching CPython's frame.
+    assert_eq!(
+        traceback_of("d = {[1]: 5}\n"),
+        concat!(
+            "Traceback (most recent call last):\n",
+            "  File \"/t.py\", line 1, in <module>\n",
+            "    d = {[1]: 5}\n",
+            "        ^^^^^^^^\n",
+            "TypeError: unhashable type: 'list'\n",
+        )
+    );
+    assert_eq!(
+        traceback_of("s = {[1]}\n"),
+        concat!(
+            "Traceback (most recent call last):\n",
+            "  File \"/t.py\", line 1, in <module>\n",
+            "    s = {[1]}\n",
+            "        ^^^^^\n",
+            "TypeError: unhashable type: 'list'\n",
+        )
+    );
+    // The store anchors its bracket region, so the receiver renders `~`.
+    assert_eq!(
+        traceback_of("d = {}\nd[[1]] = 2\n"),
+        concat!(
+            "Traceback (most recent call last):\n",
+            "  File \"/t.py\", line 2, in <module>\n",
+            "    d[[1]] = 2\n",
+            "    ~^^^^^\n",
+            "TypeError: unhashable type: 'list'\n",
+        )
+    );
+    // A `{**a, …}` merge takes a different lowering path with the same gap.
+    assert_eq!(
+        traceback_of("a = {}\nd = {**a, [1]: 2}\n"),
+        concat!(
+            "Traceback (most recent call last):\n",
+            "  File \"/t.py\", line 2, in <module>\n",
+            "    d = {**a, [1]: 2}\n",
+            "        ^^^^^^^^^^^^^\n",
+            "TypeError: unhashable type: 'list'\n",
+        )
+    );
+}
