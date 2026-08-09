@@ -14,8 +14,10 @@
 #   ERR   pythonrs failed where python3 succeeded (missing feature/module)
 #   SKIP  reference python3 itself rejected it (bug in the corpus script)
 #
-# Category = filename prefix (io_, re_, json_, ...). Exit 0 iff every script is
-# OK. Needs python3 on PATH, so CI never runs it.
+# Category = filename prefix (io_, re_, json_, ...). Exit 0 iff at least one
+# script ran AND every script is OK — a missing or empty tests/dropin/ is a hard
+# error (exit 2), never a vacuous "0/0 OK" pass. Needs python3 on PATH, so CI
+# never runs it.
 #
 #   PYTHONRS_BIN=... PYTHONRS_REF=python3.14 ./scripts/dropin_check.sh
 set -u
@@ -29,6 +31,16 @@ args=(alpha beta 42)   # the fixed argv every script sees
 command -v "$ref" >/dev/null 2>&1 || { echo "dropin_check: no reference '$ref' on PATH"; exit 2; }
 [ -x "$ours" ] || { echo "dropin_check: pythonrs not built at $ours (run: cargo build)"; exit 2; }
 
+# Resolve the corpus up front. An absent directory or a glob that matches
+# nothing must fail loudly here — if it were left to the loop below, every
+# counter would stay at 0 and the "no DIFF, no ERR, no SKIP" pass condition
+# would report a green "0/0 OK (0%)" while measuring nothing at all.
+[ -d "$corpus" ] || { echo "dropin_check: corpus directory not found at $corpus"; exit 2; }
+shopt -s nullglob
+scripts=("$corpus"/*.py)
+shopt -u nullglob
+[ "${#scripts[@]}" -gt 0 ] || { echo "dropin_check: corpus at $corpus matched zero *.py scripts"; exit 2; }
+
 # Determinism: pin hash seed (sets) and keep the reference from writing .pyc.
 export PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1
 
@@ -40,8 +52,7 @@ ok=0; diff=0; err=0; skip=0; total=0
 declare -A cat_ok cat_tot
 fails=()
 
-for f in "$corpus"/*.py; do
-  [ -e "$f" ] || continue
+for f in "${scripts[@]}"; do
   name="$(basename "$f")"
   cat="${name%%_*}"
   total=$((total+1)); cat_tot[$cat]=$(( ${cat_tot[$cat]:-0} + 1 ))
@@ -80,4 +91,12 @@ done
 echo
 pct=0; [ "$total" -gt 0 ] && pct=$(( ok * 100 / total ))
 echo "readiness: $ok/$total OK (${pct}%)  |  $diff DIFF, $err ERR, $skip SKIP"
-[ "$diff" -eq 0 ] && [ "$err" -eq 0 ] && [ "$skip" -eq 0 ] && exit 0 || exit 1
+# total==0 is unreachable given the pre-flight guard, but the pass condition
+# states it anyway: "nothing failed" must never be satisfiable by "nothing ran".
+[ "$total" -gt 0 ] || { echo "dropin_check: FAIL — measured 0 scripts from $corpus"; exit 2; }
+if [ "$diff" -eq 0 ] && [ "$err" -eq 0 ] && [ "$skip" -eq 0 ]; then
+  echo "dropin_check: PASS — measured $total script(s) from $corpus, all $ok OK"
+  exit 0
+fi
+echo "dropin_check: FAIL — measured $total script(s) from $corpus, $ok OK"
+exit 1
