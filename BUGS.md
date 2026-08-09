@@ -27,6 +27,34 @@ written.
   value-keyed element skip the pass entirely. `update` and
   `symmetric_difference_update` additionally raised `TypeError: unhashable type`
   on any user-`__hash__` element, because they hashed inside the borrow.
+  **`dict.update` keys against the DESTINATION** for the same reason. It copied
+  the source dict's keys verbatim, so a value-equal key opened a SECOND slot —
+  `{P(1): 'a'} | {P(1): 'z'}` was right but `d.update({P(1): 'z'})` and `d |=
+  {P(1): 'z'}` left a dict holding two `P(1)` entries, which CPython cannot
+  produce; its pair-iterable form (`d.update([(P(1), 'z')])`) hashed under the
+  borrow and raised `unhashable type`. Two value-equal keys within one `update`
+  now collapse the way a dict literal's do.
+- **A class may define `__hash__` without `__eq__`.** CPython then inherits
+  `object.__eq__` (identity). The key collapse called `__eq__` directly, so the
+  first hash collision between two such instances raised `AttributeError: 'P'
+  object has no attribute '__eq__'` and made the whole dict/set unusable
+  (`{P(5): 1, P(5): 2}` with `__hash__ = v // 2`). The collapse now runs the full
+  `==` dispatch, which also routes a builtin-type subclass through its payload,
+  so `class S(str)` with its own `__hash__` still merges `S('a')` with `S('a')`.
+- **`dict_keys` / `dict_items` views are set-like**, as in CPython: they take
+  part in `==` and in the subset order (`d.keys() == {1, 2}`,
+  `d.keys() <= {1, 2}`, `d.items() == {(1, 0)}`), not only in `& | - ^`. `==`
+  answered False for every view — including all-`int` keys — and the ordering
+  operators raised `'<=' not supported between instances of 'dict_keys' and
+  'set'`. A `dict_values` view stays non-set-like (two views are never equal).
+  Separately, a key view coerced to a key-set by re-hashing its key OBJECTS, and
+  a value key cannot be hashed under the host borrow — the error was discarded,
+  so `d.keys() & {P(2)}` silently dropped exactly the value-keyed elements and
+  came back empty. A key view now contributes its dict's own key map.
+- **A set predicate answers for an iterable it cannot hash.** `{1}.issubset(
+  [P(1)])` is `False` in CPython, not a `TypeError`; with no candidate key to
+  collapse onto, the argument's elements still have to be hashed outside the
+  borrow rather than short-circuited into it.
 - **`__slots__` validation** (CPython `type_new_slots_impl`): a slot name also
   bound in the class body is `ValueError: 'a' in __slots__ conflicts with class
   variable`; a non-string is `TypeError: __slots__ items must be strings, not

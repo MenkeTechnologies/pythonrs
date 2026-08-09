@@ -11485,19 +11485,19 @@ fn dict_update(
     other: Option<&Value>,
     kwargs: &[(String, Value)],
 ) -> Result<(), String> {
-    // Collect (key, key-value, value) triples to apply, in order.
-    let mut triples: Vec<(PKey, Value, Value)> = Vec::new();
+    // Collect the (key-object, value) pairs to apply, in order.
+    let mut pairs: Vec<(Value, Value)> = Vec::new();
     if let Some(o) = other {
         let is_dict = with_host(|h| matches!(h.get(o), Some(PyObj::Dict(_))));
         if is_dict {
-            let pairs = with_host(|h| match h.get(o) {
+            let src = with_host(|h| match h.get(o) {
                 Some(PyObj::Dict(d)) => d
                     .iter()
-                    .map(|(k, (kv, v))| (k.clone(), kv.clone(), v.clone()))
+                    .map(|(_, (kv, v))| (kv.clone(), v.clone()))
                     .collect::<Vec<_>>(),
                 _ => vec![],
             });
-            triples.extend(pairs);
+            pairs.extend(src);
         } else {
             // An iterable of 2-element pairs.
             for pair in host::iter_vec(o)? {
@@ -11507,14 +11507,29 @@ fn dict_update(
                         "dictionary update sequence element has length != 2",
                     ));
                 }
-                let key = with_host(|h| h.to_key(&elems[0]))?;
-                triples.push((key, elems[0].clone(), elems[1].clone()));
+                pairs.push((elems[0].clone(), elems[1].clone()));
             }
         }
     }
     for (k, v) in kwargs {
         let kv = with_host(|h| h.new_str(k.clone()));
-        triples.push((PKey::Str(k.clone()), kv, v.clone()));
+        pairs.push((kv, v.clone()));
+    }
+    // Key each entry against the destination's CURRENT keys rather than reusing
+    // the source's. A value-keyed key (user `__hash__`/`__eq__`, or a bridged
+    // CPython object) carries the heap id it collapsed onto in ITS OWN dict, so
+    // copying it verbatim gave `{P(1): 'a'}.update({P(1): 'b'})` two slots for
+    // one key; hashing it under the borrow (the pair-iterable arm) raised
+    // `unhashable type` outright. `cands` grows as entries land, so a source
+    // holding two equal keys collapses them the same way a literal does.
+    let mut cands = host::instance_key_candidates(recv);
+    let mut triples: Vec<(PKey, Value, Value)> = Vec::with_capacity(pairs.len());
+    for (kv, v) in pairs {
+        let k = host::with_instance_key(&kv, &cands, || with_host(|h| h.to_key(&kv)))?;
+        if any_value_key(&k) && !cands.iter().any(|(ck, _)| *ck == k) {
+            cands.push((k.clone(), kv.clone()));
+        }
+        triples.push((k, kv, v));
     }
     with_host(|h| {
         if let Some(PyObj::Dict(d)) = h.get_mut(recv) {
@@ -11524,6 +11539,13 @@ fn dict_update(
         }
     });
     Ok(())
+}
+
+/// True for a key whose slot identity came from user code (`PKey::Instance`) or
+/// the CPython bridge (`PKey::Foreign`). Only these collapse by value, so only
+/// these have to be tracked as collapse candidates while a container fills.
+fn any_value_key(k: &PKey) -> bool {
+    matches!(k, PKey::Instance { .. } | PKey::Foreign { .. })
 }
 
 /// Argument-count contract for a `set`/`frozenset` method. The variadic algebra
@@ -11728,21 +11750,6 @@ fn set_keys(h: &host::PyHost, v: &Value) -> Vec<PKey> {
     }
 }
 
-/// The element keys of any iterable (set/frozenset short-circuit; anything else
-/// is materialized and hashed) — for set methods that accept an arbitrary
-/// iterable argument (`issubset([...])`, `isdisjoint((...))`, …).
-fn iter_keys(v: &Value) -> Result<Vec<PKey>, String> {
-    if let Some(ks) = with_host(|h| h.setlike(v).map(|s| s.keys().cloned().collect::<Vec<_>>())) {
-        return Ok(ks);
-    }
-    let items = host::iter_vec(v)?;
-    let mut ks = Vec::with_capacity(items.len());
-    for it in items {
-        ks.push(with_host(|h| h.to_key(&it))?);
-    }
-    Ok(ks)
-}
-
 /// The element keys of an iterable argument, re-keyed into `recv`'s key space:
 /// an element that is `__eq__`-equal to one of `recv`'s user-hashed elements
 /// takes that element's key, so the structural key comparison the caller does
@@ -11750,8 +11757,15 @@ fn iter_keys(v: &Value) -> Result<Vec<PKey>, String> {
 /// to [`iter_keys`] when `recv` has no user-hashed element to collapse onto.
 fn iter_keys_against(v: &Value, recv: &Value) -> Result<Vec<PKey>, String> {
     let cands = host::instance_key_candidates(recv);
+    // With nothing to collapse onto, a set-like argument still short-circuits to
+    // its stored keys. A non-set iterable does NOT: hashing a user-`__hash__`
+    // element under the borrow raises `unhashable type`, where CPython answers
+    // the question (`{1}.issubset([P(1)])` is False, not a TypeError).
     if cands.is_empty() {
-        return iter_keys(v);
+        if let Some(ks) = with_host(|h| h.setlike(v).map(|s| s.keys().cloned().collect::<Vec<_>>()))
+        {
+            return Ok(ks);
+        }
     }
     let items = host::iter_vec(v)?;
     let mut ks = Vec::with_capacity(items.len());

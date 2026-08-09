@@ -2229,6 +2229,62 @@ impl PyHost {
             self.alloc(PyObj::Set(items))
         }
     }
+    /// The backing dict's key map of a `dict_keys` view — the set a key view
+    /// participates as, with the dict's own (already canonical) keys. `None` for
+    /// any other object, including the `dict_values`/`dict_items` views.
+    pub fn keys_view_map(&self, v: &Value) -> Option<IndexMap<PKey, Value>> {
+        let dict = match self.get(v) {
+            Some(PyObj::DictView { dict, kind: 0 }) => dict.clone(),
+            _ => return None,
+        };
+        match self.get(&dict) {
+            Some(PyObj::Dict(d)) => Some(
+                d.iter()
+                    .map(|(k, (kv, _))| (k.clone(), kv.clone()))
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+
+    /// The key-set of a set-like operand for `==` and the subset order: a
+    /// `set`/`frozenset`'s own keys, or a `dict_keys`/`dict_items` view's —
+    /// CPython's key and item views ARE set-like, so `d.keys() == {1, 2}` and
+    /// `d.keys() <= {1, 2}` are real answers, not `False` and a `TypeError`. A
+    /// `dict_values` view has no set behavior, and neither has anything else;
+    /// both give `None`. Unlike [`Self::setmap_operand`] this allocates no
+    /// objects and hashes no user instances, so the borrowed `equal` can use it.
+    pub fn view_keyset(&self, v: &Value) -> Option<Vec<PKey>> {
+        match self.get(v) {
+            Some(PyObj::Set(s) | PyObj::Frozenset(s)) => Some(s.keys().cloned().collect()),
+            Some(PyObj::DictView { dict, kind }) if *kind == 0 || *kind == 2 => {
+                let kind = *kind;
+                match self.get(dict) {
+                    Some(PyObj::Dict(d)) => {
+                        let mut out = Vec::with_capacity(d.len());
+                        for (k, (_, val)) in d {
+                            out.push(if kind == 0 {
+                                k.clone()
+                            } else {
+                                PKey::Tuple(vec![k.clone(), self.to_key(val).ok()?])
+                            });
+                        }
+                        Some(out)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// True when either operand is a dict view — the cue to route a comparison
+    /// through [`Self::view_keyset`] instead of the zero-copy `setlike` path.
+    fn either_is_view(&self, a: &Value, b: &Value) -> bool {
+        matches!(self.get(a), Some(PyObj::DictView { .. }))
+            || matches!(self.get(b), Some(PyObj::DictView { .. }))
+    }
+
     /// The backing map of a `set` or `frozenset`, else `None`.
     pub fn setlike(&self, v: &Value) -> Option<&IndexMap<PKey, Value>> {
         match self.get(v) {
@@ -2345,6 +2401,15 @@ impl PyHost {
             Some(PyObj::DictView { kind, .. }) if *kind == 0 || *kind == 2 => *kind,
             _ => return None,
         };
+        // A `dict_keys` view IS its dict's key map — take it verbatim instead of
+        // re-hashing the key objects. Re-hashing dropped every value key (a user
+        // `__hash__` cannot run under this borrow, and the `Err` was discarded),
+        // so `d.keys() & s` silently lost exactly those elements.
+        if kind == 0 {
+            if let Some(d) = self.keys_view_map(v) {
+                return Some(d);
+            }
+        }
         let items = self.view_items(v)?;
         let mut out: IndexMap<PKey, Value> = IndexMap::new();
         for it in items {
@@ -4219,6 +4284,14 @@ impl PyHost {
                         return ar == br && ai == bi;
                     }
                 }
+                // A `dict_keys`/`dict_items` view compares by membership against
+                // a set/frozenset or another view (`d.keys() == {1, 2}`).
+                if self.either_is_view(a, b) {
+                    if let (Some(x), Some(y)) = (self.view_keyset(a), self.view_keyset(b)) {
+                        let ys: HashSet<&PKey> = y.iter().collect();
+                        return x.len() == y.len() && x.iter().all(|k| ys.contains(k));
+                    }
+                }
                 match (self.get(a), self.get(b)) {
                     (Some(PyObj::Str(x)), Some(PyObj::Str(y))) => x == y,
                     (Some(PyObj::List(x)), Some(PyObj::List(y)))
@@ -4663,12 +4736,19 @@ pub fn prepare_key(v: &Value, candidates: &[(PKey, Value)]) -> Result<(), String
     }
     let hres = call_method(v, "__hash__", vec![], vec![])?;
     let hash = hash_int_of(&hres)?;
-    // Collapse onto a value-equal existing instance key of the same hash.
+    // Collapse onto a value-equal existing instance key of the same hash. The
+    // comparison runs through the full `==` dispatch rather than a bare
+    // `__eq__` call: a class may define `__hash__` WITHOUT `__eq__` (CPython
+    // then inherits `object.__eq__`, i.e. identity), and a builtin-type
+    // subclass compares through its payload. Calling `__eq__` directly raised
+    // `AttributeError: 'P' object has no attribute '__eq__'` for the first of
+    // those, so `{P(1): 1, P(2): 2}` was unusable whenever the two hashes
+    // collided.
     let mut canonical = PKey::Instance { hash, id };
     for (pk, kobj) in candidates {
         if let PKey::Instance { hash: ch, .. } = pk {
             if *ch == hash {
-                let eqr = call_method(v, "__eq__", vec![kobj.clone()], vec![])?;
+                let eqr = crate::builtins::numeric_hook(NumOp::Eq, v, kobj)?;
                 if with_host(|h| h.truthy(&eqr)) {
                     canonical = pk.clone();
                     break;
@@ -4808,6 +4888,15 @@ fn any_value_keyed<'a>(mut keys: impl Iterator<Item = &'a PKey>) -> bool {
     keys.any(|k| matches!(k, PKey::Instance { .. } | PKey::Foreign { .. }))
 }
 
+/// The key map an operand contributes to the set algebra: a `set`/`frozenset`'s
+/// own map, or a `dict_keys` view's backing dict. `None` for everything else.
+fn setlike_map(h: &PyHost, v: &Value) -> Option<IndexMap<PKey, Value>> {
+    match h.get(v) {
+        Some(PyObj::Set(s) | PyObj::Frozenset(s)) => Some(s.clone()),
+        _ => h.keys_view_map(v),
+    }
+}
+
 /// The right operand of a set/dict operation, re-keyed into the LEFT operand's
 /// key space and returned as a fresh container of the same kind.
 ///
@@ -4829,22 +4918,29 @@ pub fn align_operand(a: &Value, b: &Value) -> Result<Option<Value>, String> {
         Set(Vec<Value>, bool),
         Dict(Vec<(Value, Value)>),
     }
-    let (cands, side) = match with_host(|h| match (h.get(a), h.get(b)) {
-        (Some(PyObj::Set(x) | PyObj::Frozenset(x)), Some(PyObj::Set(y) | PyObj::Frozenset(y))) => {
+    let (cands, side) = match with_host(|h| match (setlike_map(h, a), setlike_map(h, b)) {
+        // Both operands set-like: a `set`, a `frozenset`, or a `dict_keys` view
+        // (CPython's key view IS a set and takes part in the same algebra).
+        (Some(x), Some(y)) => {
             if !any_value_keyed(x.keys()) || !any_value_keyed(y.keys()) {
                 return None;
             }
             let items = y.values().cloned().collect();
-            Some((set_local_candidates(x), Side::Set(items, h.is_frozenset(b))))
+            Some((
+                set_local_candidates(&x),
+                Side::Set(items, h.is_frozenset(b)),
+            ))
         }
-        (Some(PyObj::Dict(x)), Some(PyObj::Dict(y))) => {
-            if !any_value_keyed(x.keys()) || !any_value_keyed(y.keys()) {
-                return None;
+        _ => match (h.get(a), h.get(b)) {
+            (Some(PyObj::Dict(x)), Some(PyObj::Dict(y))) => {
+                if !any_value_keyed(x.keys()) || !any_value_keyed(y.keys()) {
+                    return None;
+                }
+                let pairs = y.values().cloned().collect();
+                Some((dict_local_candidates(x), Side::Dict(pairs)))
             }
-            let pairs = y.values().cloned().collect();
-            Some((dict_local_candidates(x), Side::Dict(pairs)))
-        }
-        _ => None,
+            _ => None,
+        },
     }) {
         Some(t) => t,
         None => return Ok(None),
@@ -5570,18 +5666,39 @@ impl PyHost {
         use std::cmp::Ordering;
         // Sets/frozensets use the subset partial order, not a total order — the
         // operands can be incomparable (`{1} < {2}` and `{1} > {2}` both False).
+        let subset_order = |a_sub_b: bool, b_sub_a: bool, la: usize, lb: usize| match op {
+            NumOp::Le => a_sub_b,
+            NumOp::Lt => a_sub_b && la < lb,
+            NumOp::Ge => b_sub_a,
+            NumOp::Gt => b_sub_a && lb < la,
+            _ => unreachable!(),
+        };
         if let (Some(x), Some(y)) = (self.setlike(a), self.setlike(b)) {
             let a_sub_b = x.keys().all(|k| y.contains_key(k)); // a ⊆ b
             let b_sub_a = y.keys().all(|k| x.contains_key(k)); // b ⊆ a
-            let (la, lb) = (x.len(), y.len());
-            let res = match op {
-                NumOp::Le => a_sub_b,
-                NumOp::Lt => a_sub_b && la < lb,
-                NumOp::Ge => b_sub_a,
-                NumOp::Gt => b_sub_a && lb < la,
-                _ => unreachable!(),
-            };
-            return Ok(Value::Bool(res));
+            return Ok(Value::Bool(subset_order(
+                a_sub_b,
+                b_sub_a,
+                x.len(),
+                y.len(),
+            )));
+        }
+        // The same partial order for a `dict_keys`/`dict_items` view against a
+        // set or another view (`d.keys() <= {1, 2}`). Only reached when a view
+        // is involved, so a plain set comparison keeps the zero-copy path above.
+        if self.either_is_view(a, b) {
+            if let (Some(x), Some(y)) = (self.view_keyset(a), self.view_keyset(b)) {
+                let xs: HashSet<&PKey> = x.iter().collect();
+                let ys: HashSet<&PKey> = y.iter().collect();
+                let a_sub_b = xs.iter().all(|k| ys.contains(*k));
+                let b_sub_a = ys.iter().all(|k| xs.contains(*k));
+                return Ok(Value::Bool(subset_order(
+                    a_sub_b,
+                    b_sub_a,
+                    x.len(),
+                    y.len(),
+                )));
+            }
         }
         // The operator symbol drives the `'<' not supported …` message; CPython
         // uses the OUTER operator even for a failing list/tuple element compare

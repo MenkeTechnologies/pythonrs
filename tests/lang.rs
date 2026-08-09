@@ -3169,6 +3169,168 @@ fn set_algebra_between_independent_user_hashed_sets() {
 }
 
 #[test]
+fn dict_update_rekeys_value_equal_keys_onto_the_existing_slot() {
+    // `dict.update` copied the SOURCE's keys verbatim, and a value key carries
+    // the heap id it collapsed onto in its own dict — so a value-equal key added
+    // a SECOND slot, giving a dict with two `P(2)` entries, which CPython cannot
+    // produce. The pair-iterable form hashed under the host borrow instead and
+    // raised `unhashable type: 'P'`. Values are what CPython 3.14 prints.
+    const C: &str = "class P:\n    def __init__(s, v): s.v = v\n    def __hash__(s): return hash(s.v)\n    def __eq__(s, o): return isinstance(o, P) and s.v == o.v\nd = lambda m: sorted((k.v, v) for k, v in m.items())\n";
+    // Mapping form: the later value wins in the FIRST key's slot.
+    assert_eq!(
+        g(
+            &format!(
+                "{C}m = {{P(1): 'a', P(2): 'b'}}\nm.update({{P(2): 'B', P(3): 'C'}})\nx = d(m)"
+            ),
+            "x"
+        ),
+        "[(1, 'a'), (2, 'B'), (3, 'C')]"
+    );
+    // Pair-iterable form, which used to be a TypeError outright.
+    assert_eq!(
+        g(
+            &format!("{C}m = {{P(1): 'a'}}\nm.update([(P(1), 'z'), (P(2), 'q')])\nx = d(m)"),
+            "x"
+        ),
+        "[(1, 'z'), (2, 'q')]"
+    );
+    // `|=` routes through the same update, and `|` through the operator path.
+    assert_eq!(
+        g(
+            &format!("{C}m = {{P(1): 'a'}}\nm |= {{P(1): 'z'}}\nx = (d(m), len(m))"),
+            "x"
+        ),
+        "([(1, 'z')], 1)"
+    );
+    // Two value-equal keys WITHIN one update collapse, as in a dict literal.
+    assert_eq!(
+        g(
+            &format!("{C}m = {{}}\nm.update([(P(1), 'a'), (P(1), 'b')])\nx = (d(m), len(m))"),
+            "x"
+        ),
+        "([(1, 'b')], 1)"
+    );
+    // An identity-hashed instance must still NOT collapse.
+    assert_eq!(
+        g(
+            "class B: pass\nb1, b2 = B(), B()\nm = {b1: 1}\nm.update({b2: 2})\nx = len(m)",
+            "x"
+        ),
+        "2"
+    );
+}
+
+#[test]
+fn user_hash_without_user_eq_falls_back_to_identity() {
+    // CPython lets a class define `__hash__` and inherit `object.__eq__`. The
+    // key collapse called `__eq__` directly, so any two same-hash keys of such a
+    // class raised `AttributeError: 'P' object has no attribute '__eq__'` — the
+    // whole dict/set was unusable. Identity equality means they stay distinct.
+    const C: &str =
+        "class P:\n    def __init__(s, v): s.v = v\n    def __hash__(s): return s.v // 2\n";
+    assert_eq!(g(&format!("{C}x = len({{P(5): 1, P(5): 2}})"), "x"), "2");
+    assert_eq!(g(&format!("{C}x = len({{P(1), P(1)}})"), "x"), "2");
+    assert_eq!(
+        g(
+            &format!("{C}x = (len({{P(1)}} | {{P(1)}}), len({{P(1)}} & {{P(1)}}))"),
+            "x"
+        ),
+        "(2, 0)"
+    );
+    // The SAME object still collapses onto its own slot.
+    assert_eq!(g(&format!("{C}p = P(1)\nx = len({{p, p}})"), "x"), "1");
+    // A builtin-type subclass that adds `__hash__` compares through its payload,
+    // so two equal-valued instances DO collapse.
+    assert_eq!(
+        g(
+            "class S(str):\n    def __hash__(s): return 0\nx = len({S('a'), S('a')})",
+            "x"
+        ),
+        "1"
+    );
+}
+
+#[test]
+fn dict_key_and_item_views_are_set_like() {
+    // CPython's `dict_keys`/`dict_items` are sets: they take part in the algebra,
+    // in `==`, and in the subset order. `==` answered False for every view and
+    // the ordering ops raised `'<=' not supported between instances of
+    // 'dict_keys' and 'set'`.
+    assert_eq!(
+        g(
+            "d = {1: 0, 2: 0}\nx = (d.keys() == {1, 2}, d.keys() == {1}, {1, 2} == d.keys())",
+            "x"
+        ),
+        "(True, False, True)"
+    );
+    assert_eq!(
+        g("d = {1: 0, 2: 0}\nx = (d.keys() <= {1, 2}, d.keys() < {1, 2, 3}, d.keys() >= {1}, d.keys() > {1})", "x"),
+        "(True, True, True, True)"
+    );
+    assert_eq!(
+        g(
+            "d = {1: 0, 2: 0}\nx = (d.items() == {(1, 0), (2, 0)}, d.items() <= {(1, 0), (2, 0)})",
+            "x"
+        ),
+        "(True, True)"
+    );
+    // A `dict_values` view has no set behavior: two views are never equal.
+    assert_eq!(g("d = {1: 0}\nx = d.values() == d.values()", "x"), "False");
+    // A view is not equal to a list, and a keys view is not an items view.
+    assert_eq!(
+        g(
+            "d = {1: 0}\nx = (d.keys() == [1], d.keys() == d.items())",
+            "x"
+        ),
+        "(False, False)"
+    );
+    // The same, with value keys: a keys view re-keys like a set, and the old
+    // re-hash-under-the-borrow path silently DROPPED every value key, so
+    // `d.keys() & s` came back empty.
+    const C: &str = "class P:\n    def __init__(s, v): s.v = v\n    def __hash__(s): return hash(s.v)\n    def __eq__(s, o): return isinstance(o, P) and s.v == o.v\nv = lambda s: sorted(e.v for e in s)\nd = {P(1): 0, P(2): 0}\n";
+    assert_eq!(g(&format!("{C}x = v(d.keys() & {{P(2)}})"), "x"), "[2]");
+    assert_eq!(
+        g(&format!("{C}x = v(d.keys() | {{P(3)}})"), "x"),
+        "[1, 2, 3]"
+    );
+    assert_eq!(g(&format!("{C}x = v(d.keys() - {{P(1)}})"), "x"), "[2]");
+    assert_eq!(
+        g(&format!("{C}x = v(d.keys() ^ {{P(1), P(3)}})"), "x"),
+        "[2, 3]"
+    );
+    assert_eq!(
+        g(
+            &format!("{C}x = (d.keys() == {{P(1), P(2)}}, d.keys() <= {{P(1)}})"),
+            "x"
+        ),
+        "(True, False)"
+    );
+}
+
+#[test]
+fn set_predicates_answer_for_an_unhashable_free_iterable() {
+    // `{1}.issubset([P(1)])` is False in CPython, not a TypeError: the argument's
+    // elements are hashed with the receiver's keys as collapse candidates. With
+    // no candidate to collapse onto, hashing still has to happen OUTSIDE the host
+    // borrow, which the old short-circuit skipped.
+    const C: &str = "class P:\n    def __init__(s, v): s.v = v\n    def __hash__(s): return hash(s.v)\n    def __eq__(s, o): return isinstance(o, P) and s.v == o.v\n";
+    assert_eq!(
+        g(
+            &format!("{C}x = ({{1}}.issubset([P(1)]), {{1}}.isdisjoint([P(1)]))"),
+            "x"
+        ),
+        "(False, True)"
+    );
+    assert_eq!(
+        g(
+            &format!("{C}x = ({{P(1)}}.issubset([P(1)]), {{P(1)}}.isdisjoint([1]))"),
+            "x"
+        ),
+        "(True, True)"
+    );
+}
+
+#[test]
 fn slots_validation_matches_type_new() {
     // CPython `type_new_slots_impl`: a slot name that is also bound in the class
     // body would be shadowed by the slot descriptor, so class creation rejects it.
