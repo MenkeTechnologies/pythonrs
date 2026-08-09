@@ -6062,3 +6062,103 @@ fn with_checks_the_context_manager_protocol_before_entering() {
         "[(1, 2), 2, 1]"
     );
 }
+
+// `frozenset` is immutable, so it must not advertise the mutating half of the
+// `set` method table. Sharing one table made `hasattr(frozenset(), "add")`
+// answer `True` while the call raised `AttributeError`, so duck-typed code
+// (`if hasattr(s, "add"): s.add(x)`) chose the mutable branch and then died.
+// Expected values are CPython 3.14's.
+#[test]
+fn frozenset_advertises_only_its_immutable_methods() {
+    // Every mutator `set` has and `frozenset` does not.
+    for m in [
+        "add",
+        "remove",
+        "discard",
+        "pop",
+        "clear",
+        "update",
+        "intersection_update",
+        "difference_update",
+        "symmetric_difference_update",
+    ] {
+        assert_eq!(
+            g(&format!("x = hasattr(frozenset(), {m:?})"), "x"),
+            "False",
+            "frozenset must not advertise the set mutator {m:?}"
+        );
+        assert_eq!(
+            g(&format!("x = {m:?} in dir(frozenset())"), "x"),
+            "False",
+            "dir(frozenset()) must not list the set mutator {m:?}"
+        );
+        // `set` keeps every one of them.
+        assert_eq!(
+            g(&format!("x = hasattr(set(), {m:?})"), "x"),
+            "True",
+            "set must still advertise {m:?}"
+        );
+    }
+    // The query half survives on both.
+    assert_eq!(
+        g(
+            "x = sorted(n for n in dir(frozenset()) if not n.startswith('_'))",
+            "x"
+        ),
+        "['copy', 'difference', 'intersection', 'isdisjoint', \
+         'issubset', 'issuperset', 'symmetric_difference', 'union']"
+    );
+    // What it advertises, it can actually do — the property the whole table
+    // exists to promise.
+    assert_eq!(
+        g("x = frozenset([1, 2]).union([3])", "x"),
+        "frozenset({1, 2, 3})"
+    );
+}
+
+// A name-dispatched method called with too few arguments must raise TypeError,
+// never abort the process. These six indexed `args[0]`/`args[1]` unchecked; the
+// resulting Rust panic exits 1 — the same status a normal uncaught Python
+// exception uses — so it was invisible to exit-status checks and uncatchable by
+// `except BaseException`. Messages are CPython 3.14's verbatim.
+#[test]
+fn missing_required_argument_raises_typeerror_instead_of_aborting() {
+    let cases = [
+        (
+            "''.join()",
+            "str.join() takes exactly one argument (0 given)",
+        ),
+        (
+            "''.zfill()",
+            "str.zfill() takes exactly one argument (0 given)",
+        ),
+        (
+            "str.maketrans()",
+            "maketrans expected at least 1 argument, got 0",
+        ),
+        ("''.center()", "center expected at least 1 argument, got 0"),
+        ("''.ljust()", "ljust expected at least 1 argument, got 0"),
+        ("''.rjust()", "rjust expected at least 1 argument, got 0"),
+        ("filter(1)", "filter expected 2 arguments, got 1"),
+    ];
+    for (expr, want) in cases {
+        // The exception must be catchable at all — a panic never reaches here.
+        assert_eq!(
+            g(
+                &format!(
+                    "try:\n\x20   {expr}\n\x20   x = 'no error'\nexcept TypeError as e:\n\x20   x = str(e)"
+                ),
+                "x"
+            ),
+            // `repr` of a str with no apostrophe in it — as every message here is.
+            format!("'{want}'"),
+            "{expr} must raise TypeError with CPython's message"
+        );
+    }
+    // The same call one argument later still works, so the arity check did not
+    // swallow the happy path.
+    assert_eq!(g("x = '-'.join('ab')", "x"), "'a-b'");
+    assert_eq!(g("x = '7'.zfill(3)", "x"), "'007'");
+    assert_eq!(g("x = 'ab'.center(6, '.')", "x"), "'..ab..'");
+    assert_eq!(g("x = list(filter(None, [0, 1, 2]))", "x"), "[1, 2]");
+}

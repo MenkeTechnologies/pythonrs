@@ -4521,7 +4521,10 @@ pub fn call_builtin_function(
         "filter" => {
             // Lazy `filter`: items pulled and predicate-tested on demand.
             let f = arg0(&args)?;
-            let source = host::make_iterator(&args[1])?;
+            let it = args.get(1).ok_or_else(|| {
+                host::type_error(&format!("filter expected 2 arguments, got {}", args.len()))
+            })?;
+            let source = host::make_iterator(it)?;
             Ok(with_host(|h| {
                 h.alloc(PyObj::FilterObj {
                     func: f,
@@ -8445,7 +8448,10 @@ fn call_time(f: &str, args: Vec<Value>) -> Result<Value, String> {
             Ok(Value::Float(t as f64))
         }
         "strftime" => {
-            let fmt = with_host(|h| h.as_str(&args[0]))
+            let fmt0 = args.get(0).ok_or_else(|| {
+                host::type_error("strftime() takes at least 1 argument (0 given)")
+            })?;
+            let fmt = with_host(|h| h.as_str(fmt0))
                 .ok_or_else(|| host::type_error("strftime() argument 1 must be str"))?;
             let mut tm = if args.len() > 1 {
                 struct_time_to_tm(&args[1..])?
@@ -9095,7 +9101,8 @@ pub fn type_method_names(typename: &str) -> Option<&'static [&'static str]> {
         "memoryview" => MEMORYVIEW_METHODS,
         "list" => LIST_METHODS,
         "dict" => DICT_METHODS,
-        "set" | "frozenset" => SET_METHODS,
+        "set" => SET_METHODS,
+        "frozenset" => FROZENSET_METHODS,
         "tuple" => TUPLE_METHODS,
         "range" => &["index", "count"],
         "slice" => &["indices"],
@@ -9613,6 +9620,22 @@ const SET_METHODS: &[&str] = &[
     "intersection_update",
     "difference_update",
     "symmetric_difference_update",
+    "copy",
+    "symmetric_difference",
+];
+/// `frozenset` is immutable, so it carries only the QUERY half of
+/// [`SET_METHODS`] — every mutator (`add`, `remove`, `discard`, `pop`, `clear`,
+/// `update`, and the three `*_update` variants) is absent, exactly as in
+/// CPython. Sharing `SET_METHODS` made `hasattr(frozenset(), "add")` answer
+/// `True` while the call raised `AttributeError`, so duck-typed code
+/// (`if hasattr(s, "add"): s.add(x)`) took the mutable branch and then died.
+const FROZENSET_METHODS: &[&str] = &[
+    "union",
+    "intersection",
+    "difference",
+    "issubset",
+    "issuperset",
+    "isdisjoint",
     "copy",
     "symmetric_difference",
 ];
@@ -10689,7 +10712,13 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             Ok(with_host(|h| h.new_list(parts)))
         }
         "join" => {
-            let items = host::iter_vec(&args[0])?;
+            let seq = args.first().ok_or_else(|| {
+                host::type_error(&format!(
+                    "str.join() takes exactly one argument ({} given)",
+                    args.len()
+                ))
+            })?;
+            let items = host::iter_vec(seq)?;
             let mut strs = Vec::new();
             for it in items {
                 strs.push(
@@ -10769,7 +10798,13 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
                     .all(|c| c.is_lowercase()),
         )),
         "zfill" => {
-            let w = with_host(|h| h.as_int(&args[0])).unwrap_or(0) as usize;
+            let wv = args.first().ok_or_else(|| {
+                host::type_error(&format!(
+                    "str.zfill() takes exactly one argument ({} given)",
+                    args.len()
+                ))
+            })?;
+            let w = with_host(|h| h.as_int(wv)).unwrap_or(0) as usize;
             let n = s.chars().count();
             let out = if n < w {
                 let pad = "0".repeat(w - n);
@@ -10783,9 +10818,9 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             };
             Ok(new_str(out))
         }
-        "center" => Ok(new_str(pad_str(&s, args, 'c'))),
-        "ljust" => Ok(new_str(pad_str(&s, args, 'l'))),
-        "rjust" => Ok(new_str(pad_str(&s, args, 'r'))),
+        "center" => Ok(new_str(pad_str(&s, args, 'c', name)?)),
+        "ljust" => Ok(new_str(pad_str(&s, args, 'l', name)?)),
+        "rjust" => Ok(new_str(pad_str(&s, args, 'r', name)?)),
         "removeprefix" => {
             let p = sarg(0);
             Ok(new_str(
@@ -10888,17 +10923,23 @@ fn strip_str(s: &str, args: &[Value], mode: u8) -> String {
     out.to_string()
 }
 
-fn pad_str(s: &str, args: &[Value], mode: char) -> String {
-    let w = with_host(|h| h.as_int(&args[0])).unwrap_or(0) as usize;
+fn pad_str(s: &str, args: &[Value], mode: char, name: &str) -> Result<String, String> {
+    let wv = args.first().ok_or_else(|| {
+        host::type_error(&format!(
+            "{name} expected at least 1 argument, got {}",
+            args.len()
+        ))
+    })?;
+    let w = with_host(|h| h.as_int(wv)).unwrap_or(0) as usize;
     let fill = with_host(|h| args.get(1).and_then(|v| h.as_str(v)))
         .and_then(|f| f.chars().next())
         .unwrap_or(' ');
     let len = s.chars().count();
     if len >= w {
-        return s.to_string();
+        return Ok(s.to_string());
     }
     let total = w - len;
-    match mode {
+    Ok(match mode {
         'l' => format!("{s}{}", fill.to_string().repeat(total)),
         'r' => format!("{}{s}", fill.to_string().repeat(total)),
         _ => {
@@ -10912,7 +10953,7 @@ fn pad_str(s: &str, args: &[Value], mode: char) -> String {
                 fill.to_string().repeat(right)
             )
         }
-    }
+    })
 }
 
 /// `str.format(*args, **kwargs)` — positional `{}` / `{0}` and `{name}` fields.
@@ -11018,7 +11059,13 @@ fn str_maketrans(args: &[Value]) -> Result<Value, String> {
         return Ok(with_host(|h| h.new_dict(d)));
     }
     // Two (or three) string args.
-    let x = with_host(|h| h.as_str(&args[0])).unwrap_or_default();
+    let x0 = args.first().ok_or_else(|| {
+        host::type_error(&format!(
+            "maketrans expected at least 1 argument, got {}",
+            args.len()
+        ))
+    })?;
+    let x = with_host(|h| h.as_str(x0)).unwrap_or_default();
     let y = with_host(|h| h.as_str(args.get(1).unwrap_or(&Value::Undef))).unwrap_or_default();
     let xs: Vec<char> = x.chars().collect();
     let ys: Vec<char> = y.chars().collect();
