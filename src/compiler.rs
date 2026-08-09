@@ -161,6 +161,14 @@ pub struct Compiler {
     /// `__annotations__` dict, so `dataclass`/`typing.NamedTuple` and
     /// `Cls.__annotations__` see the fields.
     in_class_body: bool,
+    /// How many enclosing `def`/`lambda` scopes the code being lowered sits in.
+    ///
+    /// `return`, `yield` and `yield from` are only legal inside one. A CLASS
+    /// body resets this to zero rather than inheriting it: CPython rejects
+    /// `def f(): class C: return 1` exactly as it rejects a bare module-level
+    /// `return`. Comprehensions lower through `ScopeKind::Function`, which is
+    /// right — their synthetic bodies really do `return` the accumulator.
+    def_depth: usize,
     /// The source span of the caret-bearing expression currently being lowered,
     /// peeled from its `Expr::Spanned` wrapper. Recorded against the raising op's
     /// index so an uncaught exception can underline the exact sub-expression
@@ -431,6 +439,12 @@ impl Compiler {
                 self.compile_classdef(b, name, bases, keywords, body, decorators)?;
             }
             StmtKind::Return(e) => {
+                // A module-level (or class-body) `return` is a compile-time
+                // SyntaxError in CPython. pythonrs used to lower it and run it,
+                // so `return 1` as a whole program simply succeeded.
+                if self.def_depth == 0 {
+                    return Err("SyntaxError: 'return' outside function".to_string());
+                }
                 match e {
                     Some(e) => {
                         // CPython omits the caret when `return name(...)`'s call
@@ -465,7 +479,7 @@ impl Compiler {
                 let lc = self
                     .loops
                     .last_mut()
-                    .ok_or("SyntaxError: 'continue' outside loop")?;
+                    .ok_or("SyntaxError: 'continue' not properly in loop")?;
                 if lc.signal {
                     b.emit(Op::CallBuiltin(ops::SIG_CONTINUE, 0), line);
                     b.emit(Op::Pop, line);
@@ -2117,6 +2131,11 @@ impl Compiler {
         // nested def/class resets the flag so its own annotations don't leak into
         // the enclosing class's dict.
         let saved_icb = self.in_class_body;
+        let saved_fs = self.def_depth;
+        self.def_depth = match kind {
+            ScopeKind::Function => self.def_depth + 1,
+            ScopeKind::ClassBody => 0,
+        };
         self.in_class_body = kind == ScopeKind::ClassBody;
         if self.in_class_body && body.iter().any(is_ann_assign) {
             // `__annotations__ = {}` at the top of the class body.
@@ -2130,6 +2149,7 @@ impl Compiler {
         self.fn_slots = saved_slots;
         self.fn_slots_bound = saved_bound;
         self.in_class_body = saved_icb;
+        self.def_depth = saved_fs;
         if pushed {
             self.func_scopes.pop();
         }
@@ -2675,6 +2695,13 @@ impl Compiler {
                 self.compile_assign(b, target)?;
             }
             Expr::Yield(val) => {
+                // Outside any `def`/`lambda`, `yield` is a compile-time
+                // SyntaxError in CPython. pythonrs used to lower it and let the
+                // VM raise `TypeError: 'yield' outside a generator` at run time,
+                // so the program's own output could precede the failure.
+                if self.def_depth == 0 {
+                    return Err("SyntaxError: 'yield' outside function".to_string());
+                }
                 match val {
                     Some(e) => self.compile_expr(b, e)?,
                     None => {
@@ -2686,6 +2713,9 @@ impl Compiler {
                 b.emit(Op::CallBuiltin(ops::YIELDV, 1), 0);
             }
             Expr::YieldFrom(inner) => {
+                if self.def_depth == 0 {
+                    return Err("SyntaxError: 'yield from' outside function".to_string());
+                }
                 // `yield from E` — iterate E, yielding each item. The delegating
                 // expression value (the sub-generator's return) is None here.
                 self.compile_yield_from(b, inner)?;

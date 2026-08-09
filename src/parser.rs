@@ -574,9 +574,14 @@ impl Parser {
         } else if self.at_kw("class") {
             self.parse_classdef(out, line, decorators)
         } else {
-            Err(format!(
-                "SyntaxError: expected def/class after decorator (line {line})"
-            ))
+            // CPython names nothing here — its grammar has no rule left to
+            // try after a decorator that no `def`/`class` follows, so it
+            // reports the generic message. Checked against 3.14.6 for `@dec`
+            // alone, `@dec` + a statement, and `@dec` + a blank line.
+            {
+                let _ = line;
+                Err("SyntaxError: invalid syntax".to_string())
+            }
         }
     }
 
@@ -833,6 +838,13 @@ impl Parser {
         } else {
             Vec::new()
         };
+        // A `try` block that catches nothing and cleans up nothing is not a
+        // statement CPython's grammar admits; pythonrs used to parse it and run
+        // the body. An `else` without a handler does not count — CPython
+        // reports the same message for `try/else` as for a bare `try`.
+        if handlers.is_empty() && finalbody.is_empty() {
+            return Err("SyntaxError: expected 'except' or 'finally' block".to_string());
+        }
         out.push(Stmt::new(
             StmtKind::Try {
                 body,
@@ -1729,9 +1741,16 @@ impl Parser {
                             Ok(Expr::Yield(Some(Box::new(self.parse_exprlist()?))))
                         }
                     }
-                    _ if is_keyword(&n) => Err(format!(
-                        "SyntaxError: unexpected keyword '{n}' (line {line})"
-                    )),
+                    // A reserved word where an atom was expected — a dangling
+                    // `except:` / `else:` at statement level, `x = while`, or
+                    // `print(pass)`. CPython names none of them: its parser has
+                    // no rule left to try and reports the generic message. Every
+                    // one of the 27 reserved words was checked against 3.14.6;
+                    // all give exactly this.
+                    _ if is_keyword(&n) => {
+                        let _ = line;
+                        Err("SyntaxError: invalid syntax".to_string())
+                    }
                     // A bare name load carries its span so an undefined-name
                     // traceback underlines exactly the name.
                     _ => Ok(spanned(Expr::Name(n), nl, nc, ne, 0, 0)),

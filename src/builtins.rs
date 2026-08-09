@@ -1258,8 +1258,17 @@ fn format_field(v: &Value, conv: i64, spec: &str) -> Result<String, String> {
         return apply_format_spec(&s, &sv, spec);
     }
     // No conversion: an instance's `__format__(spec)` wins outright.
+    //
+    // A bridged CPython object counts. `format(x, s)` is
+    // `type(x).__format__(x, s)`, and for a `datetime`/`Decimal` that method is
+    // the whole point of the spec — `f"{date:%Y/%m/%d}"` used to reach
+    // pythonrs's own mini-language, which has no `%Y` and rejected it with
+    // `TypeError: unsupported format string passed to date.__format__`, while
+    // the explicit `date.__format__("%Y/%m/%d")` spelling worked.
     let has_format = with_host(|h| match h.get(v) {
         Some(PyObj::Instance(i)) => h.class_lookup(&i.class, "__format__").is_some(),
+        #[cfg(feature = "stdlib-ffi")]
+        Some(PyObj::Foreign(_)) => true,
         _ => false,
     });
     if has_format {

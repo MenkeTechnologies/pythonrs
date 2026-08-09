@@ -4816,3 +4816,65 @@ fn builtin_dispatch_is_fully_listed_by_dir() {
         }
     }
 }
+
+/// Compile-time syntax checks pythonrs used to skip, letting an invalid program
+/// run. Each message is CPython 3.14.6's, byte-checked against `python3 -c`.
+#[test]
+fn invalid_programs_are_rejected_at_compile_time() {
+    let cases = [
+        // `return` outside a function ran silently and produced no error.
+        ("return 1", "SyntaxError: 'return' outside function"),
+        ("return", "SyntaxError: 'return' outside function"),
+        ("if 1:\n    return 2", "SyntaxError: 'return' outside function"),
+        // A class body does not inherit the enclosing function's scope.
+        (
+            "class C:\n    return 1",
+            "SyntaxError: 'return' outside function",
+        ),
+        (
+            "def f():\n    class C:\n        return 1",
+            "SyntaxError: 'return' outside function",
+        ),
+        // `yield` raised a runtime TypeError instead, so output could precede it.
+        ("yield 1", "SyntaxError: 'yield' outside function"),
+        ("x = [(yield 1)]", "SyntaxError: 'yield' outside function"),
+        (
+            "yield from [1]",
+            "SyntaxError: 'yield from' outside function",
+        ),
+        // A `try` with neither handler nor cleanup parsed and ran its body.
+        ("try:\n    pass", "SyntaxError: expected 'except' or 'finally' block"),
+        (
+            "try:\n    pass\nelse:\n    pass",
+            "SyntaxError: expected 'except' or 'finally' block",
+        ),
+        // Message wording: CPython names neither the keyword nor the decorator.
+        ("continue", "SyntaxError: 'continue' not properly in loop"),
+        ("@dec", "SyntaxError: invalid syntax"),
+        ("@dec\nx = 1", "SyntaxError: invalid syntax"),
+        ("x = else", "SyntaxError: invalid syntax"),
+        ("print(pass)", "SyntaxError: invalid syntax"),
+        ("except ValueError:\n    pass", "SyntaxError: invalid syntax"),
+        ("finally:\n    pass", "SyntaxError: invalid syntax"),
+    ];
+    for (src, want) in cases {
+        assert_eq!(eval_str(src).expect_err(src), want, "for {src:?}");
+    }
+    // The legal forms of each construct still compile and run.
+    let ok = [
+        "def f():\n    return 1\nassert f() == 1",
+        "def g():\n    yield 1\n    yield from [2, 3]\nassert list(g()) == [1, 2, 3]",
+        "f = lambda a: a + 1\nassert f(1) == 2",
+        "try:\n    pass\nexcept ValueError:\n    pass",
+        "try:\n    pass\nfinally:\n    pass",
+        "for i in [1, 2]:\n    continue",
+        "class C:\n    xs = [i for i in range(3)]\nassert C.xs == [0, 1, 2]",
+        "assert sum(i for i in range(4)) == 6",
+        "def d(fn):\n    return fn\n@d\ndef h():\n    return 3\nassert h() == 3",
+    ];
+    for src in ok {
+        if let Err(e) = eval_str(src) {
+            panic!("{src:?} must compile, got: {e}");
+        }
+    }
+}

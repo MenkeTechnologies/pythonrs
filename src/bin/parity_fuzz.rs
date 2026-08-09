@@ -4703,6 +4703,427 @@ fn gen_codec(seed: u64) -> Vec<String> {
     }
 }
 
+/// `__slots__` — the layout that replaces the instance `__dict__`. Probes what
+/// the restriction actually enforces (an unlisted name must raise), what it
+/// leaves visible (`hasattr(x, '__dict__')`, the class attribute itself), how it
+/// composes through inheritance (a slotless base restores the dict), and the
+/// error text for reading a slot before it is assigned — which is a plain
+/// `AttributeError`, not the `UnboundLocalError`-flavored message.
+fn gen_slots(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let v = pick(r, POSINTS);
+    match r.below(8) {
+        0 => vec![
+            "class C:".into(),
+            "    __slots__ = ('a', 'b')".into(),
+            "c = C()".into(),
+            format!("c.a = {v}"),
+            "print(c.a, C.__slots__)".into(),
+            "try:".into(),
+            "    c.z = 1".into(),
+            "except AttributeError as e:".into(),
+            "    print('AE', e)".into(),
+        ],
+        // A slot read before assignment.
+        1 => vec![
+            "class C:".into(),
+            "    __slots__ = ('a',)".into(),
+            "try:".into(),
+            "    print(C().a)".into(),
+            "except AttributeError as e:".into(),
+            "    print('AE', e)".into(),
+        ],
+        // No `__dict__` on a fully slotted class; one reappears under a
+        // slotless base.
+        2 => vec![
+            "class A:".into(),
+            "    __slots__ = ('a',)".into(),
+            "class B(A):".into(),
+            "    __slots__ = ('b',)".into(),
+            "class D(A):".into(),
+            "    pass".into(),
+            "b = B()".into(),
+            format!("b.a = {v}"),
+            "b.b = 2".into(),
+            "d = D()".into(),
+            "d.whatever = 3".into(),
+            "print(b.a, b.b, hasattr(b, '__dict__'), hasattr(d, '__dict__'), d.whatever)".into(),
+        ],
+        // A single string `__slots__` names one slot, not a slot per character.
+        3 => vec![
+            "class C:".into(),
+            "    __slots__ = 'only'".into(),
+            "c = C()".into(),
+            format!("c.only = {v}"),
+            "print(c.only, sorted(dir(c))[-1])".into(),
+        ],
+        // `del` clears a slot, and the next read raises again.
+        4 => vec![
+            "class C:".into(),
+            "    __slots__ = ('a',)".into(),
+            "c = C()".into(),
+            format!("c.a = {v}"),
+            "del c.a".into(),
+            "print(hasattr(c, 'a'))".into(),
+        ],
+        // Slots and a class attribute of the same name conflict at class
+        // creation.
+        5 => vec![
+            "try:".into(),
+            "    class C:".into(),
+            "        __slots__ = ('a',)".into(),
+            "        a = 1".into(),
+            "    print('made')".into(),
+            "except ValueError as e:".into(),
+            "    print('VE', e)".into(),
+        ],
+        // Slots do not stop an unrelated CLASS attribute from resolving.
+        6 => vec![
+            "class C:".into(),
+            "    __slots__ = ('a',)".into(),
+            format!("    k = {v}"),
+            "c = C()".into(),
+            "print(c.k, C.k)".into(),
+        ],
+        _ => vec![
+            "class C:".into(),
+            "    __slots__ = ('x', 'y')".into(),
+            "    def __init__(s, x, y):".into(),
+            "        s.x, s.y = x, y".into(),
+            "    def __repr__(s):".into(),
+            "        return f'C({s.x},{s.y})'".into(),
+            format!("print(C({v}, 2), sorted(C.__slots__))"),
+        ],
+    }
+}
+
+/// `dataclasses` — the generated `__init__`/`__repr__`/`__eq__`/ordering, and
+/// the rules around them: a mutable default needs `default_factory`, `frozen`
+/// blocks assignment, `field(compare=False)` drops a member from `__eq__`, and
+/// `asdict`/`astuple`/`replace` walk the field list.
+fn gen_dataclass(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let a = pick(r, POSINTS);
+    let b = pick(r, POSINTS);
+    match r.below(8) {
+        0 => vec![
+            "from dataclasses import dataclass".into(),
+            "@dataclass".into(),
+            "class P:".into(),
+            "    x: int".into(),
+            "    y: int = 5".into(),
+            format!("p = P({a})"),
+            format!("q = P({a}, {b})"),
+            "print(p, q, p == P(p.x), p == q)".into(),
+        ],
+        1 => vec![
+            "from dataclasses import dataclass".into(),
+            "@dataclass(order=True)".into(),
+            "class P:".into(),
+            "    x: int".into(),
+            "    y: int = 0".into(),
+            format!("print(P({a}) < P({b}), P({a}) <= P({a}), sorted([P({b}), P({a})]))"),
+        ],
+        2 => vec![
+            "from dataclasses import dataclass, field".into(),
+            "@dataclass".into(),
+            "class P:".into(),
+            "    x: int = 0".into(),
+            "    tags: list = field(default_factory=list)".into(),
+            "p = P()".into(),
+            format!("p.tags.append({a})"),
+            "print(p, P().tags)".into(),
+        ],
+        3 => vec![
+            "from dataclasses import dataclass".into(),
+            "@dataclass(frozen=True)".into(),
+            "class P:".into(),
+            "    x: int".into(),
+            format!("p = P({a})"),
+            "try:".into(),
+            "    p.x = 1".into(),
+            "except Exception as e:".into(),
+            "    print(type(e).__name__, e)".into(),
+            "print(p, hash(p) == hash(P(p.x)))".into(),
+        ],
+        4 => vec![
+            "from dataclasses import dataclass, asdict, astuple, replace".into(),
+            "@dataclass".into(),
+            "class P:".into(),
+            "    x: int".into(),
+            "    y: int = 1".into(),
+            format!("p = P({a}, {b})"),
+            "print(asdict(p), astuple(p), replace(p, y=9))".into(),
+        ],
+        5 => vec![
+            "from dataclasses import dataclass, field".into(),
+            "@dataclass".into(),
+            "class P:".into(),
+            "    x: int".into(),
+            "    note: str = field(default='n', compare=False, repr=False)".into(),
+            format!("print(P({a}, 'aa') == P({a}, 'bb'), P({a}, 'aa'))"),
+        ],
+        6 => vec![
+            "from dataclasses import dataclass, fields".into(),
+            "@dataclass".into(),
+            "class P:".into(),
+            "    x: int".into(),
+            "    y: str = 'q'".into(),
+            "print([(f.name, f.default) for f in fields(P)])".into(),
+        ],
+        // A field without a default may not follow one that has a default.
+        _ => vec![
+            "from dataclasses import dataclass".into(),
+            "try:".into(),
+            "    @dataclass".into(),
+            "    class P:".into(),
+            "        x: int = 0".into(),
+            "        y: int".into(),
+            "    print('made')".into(),
+            "except TypeError as e:".into(),
+            "    print('TE', e)".into(),
+        ],
+    }
+}
+
+/// `:=` — the assignment expression. The interesting part is not the value but
+/// the SCOPE: a walrus inside a comprehension binds in the ENCLOSING function,
+/// unlike the loop variable, and it is illegal as the comprehension's own
+/// iteration target.
+fn gen_walrus(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let n = pick(r, POSINTS);
+    match r.below(8) {
+        0 => vec![
+            format!("xs = list(range({n} + 3))"),
+            "print([y for x in xs if (y := x * 2) > 2], y)".into(),
+        ],
+        1 => vec![
+            format!("if (n := {n} + 1) > 2:"),
+            "    print('big', n)".into(),
+            "else:".into(),
+            "    print('small', n)".into(),
+        ],
+        2 => vec![
+            format!("xs = list(range({n} + 2))"),
+            "out = []".into(),
+            "while xs and (v := xs.pop()) >= 0:".into(),
+            "    out.append(v)".into(),
+            "print(out, v)".into(),
+        ],
+        3 => vec![
+            format!("print((z := {n}) + z, z)"),
+            "print([(w := i) for i in range(3)], w)".into(),
+        ],
+        // The walrus target is a plain assignment, so it can be reused as one.
+        4 => vec![
+            format!("d = {{'k': {n}}}"),
+            "if (v := d.get('k')) is not None:".into(),
+            "    v += 1".into(),
+            "print(v, d)".into(),
+        ],
+        // Illegal targets: the iteration variable of the comprehension it is in.
+        5 => vec![
+            "try:".into(),
+            "    exec('[(i := x) for i in range(3)]')".into(),
+            "except SyntaxError as e:".into(),
+            "    print('SE')".into(),
+        ],
+        // A walrus inside a lambda default / nested comprehension.
+        6 => vec![
+            format!("print([[(t := i * j) for j in range(2)] for i in range({n} % 3 + 1)], t)"),
+        ],
+        _ => vec![
+            format!("total = 0"),
+            format!("for i in range({n}):"),
+            "    total += (sq := i * i)".into(),
+            "print(total, sq)".into(),
+        ],
+    }
+}
+
+/// `functools` — memoization bookkeeping (`cache_info` counts are exact and easy
+/// to get wrong), `partial` argument merging, `reduce`'s initializer rule, and
+/// `total_ordering`'s derived operators.
+fn gen_functools(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let n = pick(r, POSINTS);
+    match r.below(8) {
+        0 => vec![
+            "import functools".into(),
+            "@functools.lru_cache(maxsize=2)".into(),
+            "def f(a):".into(),
+            "    return a * a".into(),
+            format!("for a in ({n}, {n}, 1, 2, 3, 1):"),
+            "    f(a)".into(),
+            "ci = f.cache_info()".into(),
+            "print(ci.hits, ci.misses, ci.maxsize, ci.currsize)".into(),
+        ],
+        1 => vec![
+            "import functools".into(),
+            "@functools.cache".into(),
+            "def fib(k):".into(),
+            "    return k if k < 2 else fib(k - 1) + fib(k - 2)".into(),
+            format!("print(fib({n} + 5), fib.cache_info().currsize)"),
+        ],
+        2 => vec![
+            "import functools".into(),
+            format!("print(functools.reduce(lambda a, b: a + b, range({n} + 1)))"),
+            format!("print(functools.reduce(lambda a, b: a * b, range(1, {n} + 1), 1))"),
+            "try:".into(),
+            "    functools.reduce(lambda a, b: a + b, [])".into(),
+            "except TypeError as e:".into(),
+            "    print('TE', e)".into(),
+        ],
+        3 => vec![
+            "import functools".into(),
+            format!("p = functools.partial(pow, {n})"),
+            "q = functools.partial(pow, exp=2)".into(),
+            format!("print(p(2), q(base={n}), p.args, sorted(q.keywords))"),
+        ],
+        4 => vec![
+            "import functools".into(),
+            "@functools.total_ordering".into(),
+            "class C:".into(),
+            "    def __init__(s, v):".into(),
+            "        s.v = v".into(),
+            "    def __eq__(s, o):".into(),
+            "        return s.v == o.v".into(),
+            "    def __lt__(s, o):".into(),
+            "        return s.v < o.v".into(),
+            format!("a, b = C({n}), C({n} + 1)"),
+            "print(a < b, a <= b, a > b, a >= b, a == C(a.v))".into(),
+        ],
+        5 => vec![
+            "import functools".into(),
+            "def base(a, b):".into(),
+            "    'doc of base'".into(),
+            "    return a - b".into(),
+            "@functools.wraps(base)".into(),
+            "def wrapper(a, b):".into(),
+            "    return base(a, b)".into(),
+            format!("print(wrapper.__name__, wrapper.__doc__, wrapper({n}, 1))"),
+        ],
+        6 => vec![
+            "import functools".into(),
+            format!("xs = [3, 1, {n}, 2]"),
+            "print(sorted(xs, key=functools.cmp_to_key(lambda a, b: b - a)))".into(),
+        ],
+        _ => vec![
+            "import functools".into(),
+            "@functools.singledispatch".into(),
+            "def show(v):".into(),
+            "    return 'obj:' + str(v)".into(),
+            "@show.register".into(),
+            "def _(v: int):".into(),
+            "    return 'int:' + str(v)".into(),
+            "@show.register".into(),
+            "def _(v: str):".into(),
+            "    return 'str:' + v".into(),
+            format!("print(show({n}), show('a'), show([1]))"),
+        ],
+    }
+}
+
+/// The `with` protocol — which `__exit__` return value swallows an exception,
+/// the order calls happen in for a multi-item `with`, and what `contextlib`
+/// builds on top (`contextmanager`, `suppress`, `ExitStack`, `closing`).
+fn gen_ctxmgr(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let n = pick(r, POSINTS);
+    match r.below(8) {
+        // A truthy `__exit__` swallows; a falsy one re-raises.
+        0 => {
+            let swallow = if r.below(2) == 0 { "True" } else { "False" };
+            vec![
+                "class C:".into(),
+                "    def __enter__(s):".into(),
+                format!("        print('in'); return {n}"),
+                "    def __exit__(s, t, v, tb):".into(),
+                format!("        print('out', t.__name__ if t else None); return {swallow}"),
+                "try:".into(),
+                "    with C() as v:".into(),
+                "        print(v)".into(),
+                "        raise ValueError('boom')".into(),
+                "    print('fell through')".into(),
+                "except ValueError as e:".into(),
+                "    print('caught', e)".into(),
+            ]
+        }
+        // Multi-item `with`: entered left to right, exited right to left.
+        1 => vec![
+            "class C:".into(),
+            "    def __init__(s, n):".into(),
+            "        s.n = n".into(),
+            "    def __enter__(s):".into(),
+            "        print('enter', s.n); return s.n".into(),
+            "    def __exit__(s, *a):".into(),
+            "        print('exit', s.n); return False".into(),
+            "with C(1) as a, C(2) as b:".into(),
+            "    print(a, b)".into(),
+        ],
+        2 => vec![
+            "import contextlib".into(),
+            "@contextlib.contextmanager".into(),
+            "def cm():".into(),
+            "    print('before')".into(),
+            "    try:".into(),
+            format!("        yield {n}"),
+            "    finally:".into(),
+            "        print('after')".into(),
+            "with cm() as v:".into(),
+            "    print(v)".into(),
+        ],
+        // A generator context manager sees the exception at its `yield`.
+        3 => vec![
+            "import contextlib".into(),
+            "@contextlib.contextmanager".into(),
+            "def cm():".into(),
+            "    try:".into(),
+            "        yield".into(),
+            "    except ValueError as e:".into(),
+            "        print('cm saw', e)".into(),
+            "with cm():".into(),
+            "    raise ValueError('inner')".into(),
+            "print('done')".into(),
+        ],
+        4 => vec![
+            "import contextlib".into(),
+            "with contextlib.suppress(ValueError, KeyError):".into(),
+            format!("    print({n})"),
+            "    raise KeyError('k')".into(),
+            "print('after')".into(),
+        ],
+        // `return` from inside `with` still runs `__exit__`.
+        5 => vec![
+            "class C:".into(),
+            "    def __enter__(s):".into(),
+            "        return 1".into(),
+            "    def __exit__(s, *a):".into(),
+            "        print('exit'); return False".into(),
+            "def f():".into(),
+            "    with C():".into(),
+            format!("        return {n}"),
+            "print(f())".into(),
+        ],
+        6 => vec![
+            "import contextlib".into(),
+            "class R:".into(),
+            "    def close(s):".into(),
+            "        print('closed')".into(),
+            "with contextlib.closing(R()) as r:".into(),
+            format!("    print('body', {n})"),
+        ],
+        _ => vec![
+            "import contextlib".into(),
+            "with contextlib.ExitStack() as st:".into(),
+            format!("    for i in range({n} % 3 + 1):"),
+            "        st.callback(print, 'cb', i)".into(),
+            "    print('body')".into(),
+        ],
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Mode dispatch
 // ---------------------------------------------------------------------------
@@ -4763,6 +5184,11 @@ enum Mode {
     Scoping,
     Codec,
     Subclass,
+    Slots,
+    Dataclass,
+    Walrus,
+    Functools,
+    Ctxmgr,
 }
 
 const REAL_MODES: &[Mode] = &[
@@ -4819,6 +5245,11 @@ const REAL_MODES: &[Mode] = &[
     Mode::Scoping,
     Mode::Codec,
     Mode::Subclass,
+    Mode::Slots,
+    Mode::Dataclass,
+    Mode::Walrus,
+    Mode::Functools,
+    Mode::Ctxmgr,
 ];
 
 /// Generate the statement list for a seed in the selected mode. `Mixed` rotates
@@ -4882,6 +5313,11 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Scoping => gen_scoping(seed),
         Mode::Codec => gen_codec(seed),
         Mode::Subclass => gen_subclass(seed),
+        Mode::Slots => gen_slots(seed),
+        Mode::Dataclass => gen_dataclass(seed),
+        Mode::Walrus => gen_walrus(seed),
+        Mode::Functools => gen_functools(seed),
+        Mode::Ctxmgr => gen_ctxmgr(seed),
     }
 }
 
@@ -4941,6 +5377,11 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Scoping => "scoping",
         Mode::Codec => "codec",
         Mode::Subclass => "subclass",
+        Mode::Slots => "slots",
+        Mode::Dataclass => "dataclass",
+        Mode::Walrus => "walrus",
+        Mode::Functools => "functools",
+        Mode::Ctxmgr => "ctxmgr",
     }
 }
 
@@ -5000,6 +5441,11 @@ fn mode_from_name(s: &str) -> Option<Mode> {
         Mode::Scoping,
         Mode::Codec,
         Mode::Subclass,
+        Mode::Slots,
+        Mode::Dataclass,
+        Mode::Walrus,
+        Mode::Functools,
+        Mode::Ctxmgr,
     ];
     ALL.iter().copied().find(|&m| mode_name(m) == s)
 }

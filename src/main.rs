@@ -190,11 +190,19 @@ fn run_script(cli: &pythonrs::cli::Cli, file: String, args: Vec<String>) -> Exit
 }
 
 /// CPython tolerates a uniformly-indented `-c` program (`python -c '  print(1)'`
-/// prints `1`): the first line's indentation sets the baseline. Strip that exact
-/// leading-whitespace prefix from every line so the lexer sees a column-0
-/// baseline; a line indented MORE than the first keeps its relative indent and
-/// still raises. A script FILE gets no such treatment — a leading indent there is
-/// an `IndentationError`, matching CPython.
+/// prints `1`): the first line's indentation sets the baseline, and that exact
+/// leading-whitespace prefix comes off every line so the lexer sees a column-0
+/// baseline. A script FILE gets no such treatment — a leading indent there is an
+/// `IndentationError`, matching CPython.
+///
+/// The prefix has to be on EVERY non-blank line, comments included, or nothing
+/// is stripped at all. Stripping it only from the lines that happen to carry it
+/// silently accepted programs CPython rejects: `-c '    return x\nprint(1)'`
+/// dedented line 1 to column 0 and left line 2 there, so the mismatch vanished
+/// instead of raising `IndentationError: unexpected indent`. Blank lines are
+/// exempt because they carry no indentation to compare. Verified against
+/// python3 3.14.6 for uniform / deeper / shallower / comment / blank-line and
+/// tab-indented programs.
 fn dedent_command(src: &str) -> String {
     let Some(first) = src.lines().find(|l| !l.trim().is_empty()) else {
         return src.to_string();
@@ -204,6 +212,13 @@ fn dedent_command(src: &str) -> String {
         .take_while(|c| *c == ' ' || *c == '\t')
         .collect();
     if prefix.is_empty() {
+        return src.to_string();
+    }
+    if !src
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .all(|l| l.starts_with(&prefix))
+    {
         return src.to_string();
     }
     src.lines()
