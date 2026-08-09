@@ -5481,19 +5481,67 @@ fn arg0(args: &[Value]) -> Result<Value, String> {
         .ok_or_else(|| host::type_error("missing required argument"))
 }
 
+/// The user-visible `hash()` of a dict/set key — CPython's own number.
+///
+/// This is not cosmetic. CPython's numeric hash is specified (`n` modulo
+/// `2**61 - 1`, extended across the numeric tower), and containers depend on
+/// it: a bridged `Decimal(1)` arrives carrying CPython's `hash` in
+/// [`PKey::Foreign`], so a native `1` that hashed with anything else could
+/// never land in the same bucket and `{1, Decimal(1)}` stayed a 2-element set.
+/// Hashing both sides with [`crate::pyhash`] is what lets them collapse.
+///
+/// The residual [`DefaultHasher`] arm is for keys whose CPython hash is derived
+/// from the object's ADDRESS — a class object, the `Ellipsis`/`NotImplemented`
+/// singletons, and NaN. Those differ between CPython runs, so there is no value
+/// to match; an internally consistent hash is the best available answer.
 pub fn hash_key(k: &PKey) -> i64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::Hasher;
-    // A Foreign key's user-visible `hash()` is CPython's own `hash(obj)` (the
-    // `hash` field), independent of the handle's heap id — so value-equal objects
-    // (`Decimal('1.5')` fetched twice) report equal hashes. The `id` only
-    // discriminates map slots after `prepare_key`'s value collapse.
-    if let PKey::Foreign { hash, .. } = k {
-        return *hash;
+    match k {
+        // A Foreign key's `hash` is CPython's own `hash(obj)`, and an Instance's
+        // is its `__hash__()` result — both are already the number CPython
+        // reports, so they pass straight through.
+        PKey::Foreign { hash, .. } | PKey::Instance { hash, .. } => *hash,
+        PKey::None => crate::pyhash::NONE,
+        PKey::Int(n) => crate::pyhash::int_i64(*n),
+        PKey::Big(b) => crate::pyhash::int_big(b),
+        PKey::Str(s) => crate::pyhash::string(s),
+        PKey::Bytes(b) => crate::pyhash::buffer(b),
+        // A tuple/frozenset hashes from its ELEMENTS' hashes, so recursion here
+        // keeps a nested container consistent with a flat one.
+        PKey::Tuple(ks) => {
+            let elems: Vec<i64> = ks.iter().map(hash_key).collect();
+            crate::pyhash::tuple(&elems)
+        }
+        PKey::Frozenset(ks) => {
+            let elems: Vec<i64> = ks.iter().map(hash_key).collect();
+            crate::pyhash::frozenset(&elems)
+        }
+        // NaN falls through to the address-derived arm below.
+        PKey::FloatBits(bits) => match crate::pyhash::double(f64::from_bits(*bits)) {
+            Some(h) => h,
+            None => {
+                let mut h = DefaultHasher::new();
+                hash_pkey_into(k, &mut h);
+                h.finish() as i64
+            }
+        },
+        PKey::Complex(re, im) => {
+            match crate::pyhash::complex(f64::from_bits(*re), f64::from_bits(*im)) {
+                Some(h) => h,
+                None => {
+                    let mut h = DefaultHasher::new();
+                    hash_pkey_into(k, &mut h);
+                    h.finish() as i64
+                }
+            }
+        }
+        PKey::Class(_) | PKey::Singleton(_) => {
+            let mut h = DefaultHasher::new();
+            hash_pkey_into(k, &mut h);
+            h.finish() as i64
+        }
     }
-    let mut h = DefaultHasher::new();
-    hash_pkey_into(k, &mut h);
-    h.finish() as i64
 }
 
 /// Feed a key to a hasher for its USER-VISIBLE `hash()`, dropping the heap `id`

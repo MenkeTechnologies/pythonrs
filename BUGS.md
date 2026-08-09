@@ -805,57 +805,62 @@ Still open:
 - **`re.Scanner` and `re.RegexFlag` are absent** (the flag constants exist as
   plain ints; `re.A`/`re.I`/`re.M`/`re.S`/`re.X` all resolve).
 
-### `hash()` values, and the containers that follow from them
+### `hash()` values: what is reproduced, and what cannot be
 
-**`hash(x)` does not return CPython's number for any type.** Every non-instance
-key is hashed with Rust's `DefaultHasher` (`builtins::hash_key`), so the value is
-internally consistent but bears no relation to CPython's. Measured against
-CPython 3.14.6:
-
-| expression | pythonrs | CPython |
-| --- | --- | --- |
-| `hash(0)`, `hash(1)`, `hash(-1)` | `110868633497842534`, `-2132787436984217633`, `-191408919806194774` | `0`, `1`, `-2` |
-| `hash(2**61-1)`, `hash(2**61)`, `hash(2**62)` | arbitrary | `0`, `1`, `2` |
-| `hash(0.5)`, `hash(-0.5)` | arbitrary | `1152921504606846976`, `-1152921504606846976` |
-| `hash(float('inf'))`, `hash(float('-inf'))` | arbitrary | `314159`, `-314159` |
-| `hash(True)`, `hash(False)`, `hash(None)` | arbitrary | `1`, `0`, `4238894112` |
-| `hash(1+2j)` | arbitrary | `2000007` |
-| `hash(())`, `hash((1,2))`, `hash(frozenset([1]))` | arbitrary | `5740354900026072187`, `-3550055125485641917`, `-558064481276695278` |
-
-This is not an implementation detail CPython leaves open. The numeric hash is
-specified — `hash(n) == n % (2**61 - 1)` with `-1` mapping to `-2`, and the same
-modular scheme extended to `float`, `complex` and `Fraction` so that any two
-equal numbers hash equally. `str`/`bytes` hashing IS randomized (SipHash under
-`PYTHONHASHSEED`) and is the documented boundary; the numeric side is not.
-
-**The consequence is a container bug, not just a cosmetic number.** A bridged
-CPython object carries CPython's own hash (`PKey::Foreign { hash, .. }` from
-`ffi::foreign_hash`), while a native `int`/`float` carries the `DefaultHasher`
-one — so a value-equal pair straddling the bridge lands in two different slots
-and never collapses:
+`hash(x)` now returns CPython's own number. The algorithms are ported from the
+CPython 3.14.6 C sources in `src/pyhash.rs` (`long_hash`, `_Py_HashDouble`,
+`complex_hash`, `Py_HashBuffer`/`siphash13`, `tuple_hash`, `frozenset_hash`),
+and the cross-bridge container collapse that follows from them works in both
+directions:
 
 ```
-len({1, Decimal(1)})            # pythonrs 2, CPython 1
-len({0.5, Fraction(1, 2)})      # pythonrs 2, CPython 1
-d = {1: 'int'}; d[Decimal(1)] = 'dec'
-d                               # pythonrs {1: 'int', Decimal('1'): 'dec'}
-                                # CPython  {1: 'dec'}
+len({1, Decimal(1)})            # 1        len({0.5, Fraction(1, 2)})   # 1
+{1: 'int'}  | d[Decimal(1)]='dec'  ->  {1: 'dec'}
+{Decimal(1): 'dec'} | e[1]='int'   ->  {Decimal('1'): 'int'}
 ```
 
-Both parts are one fix: give `hash_key` CPython's algorithm for `int`
-(`long_hash`, already ported as `host::bigint_pyhash` but applied only to a
-user `__hash__` RESULT — `host::cpython_int_hash` is the machine-int arm and is
-wrong above `2**61-1`, where it returns `n` instead of reducing), `float`
-(`_Py_HashDouble`), `complex` (`hashreal + 1000003 * hashimag`), `None`
-(`0xFCA86420`), `tuple` (the xxPRIME accumulator) and `frozenset`
-(`_shuffle_bits`); then widen `prepare_key_walk`'s collapse loop, which today
-only considers a candidate that is ALSO a `PKey::Foreign`, so a native key is
-never a collapse target for a foreign one or the reverse.
+Two residues remain, and both are boundaries rather than gaps:
 
-The cross-type collapse WITHIN native numbers is already correct and must stay
-so: `len({1, 1.0, True})` is 1, `hash(1) == hash(1.0) == hash(True)`,
-`hash(0.0) == hash(-0.0)`, and `{1: 'a', 1.0: 'b', True: 'c'}` is `{1: 'c'}`.
+- **Address-derived hashes are not reproducible by anyone.**
+  `hash(float('nan'))`, `hash(...)`, `hash(NotImplemented)` and an instance's
+  default identity hash come from `PyObject_GenericHash`, i.e. the object's
+  address. Measured across CPython runs they differ every time *even under
+  `PYTHONHASHSEED=0`*, so there is no value to match. pythonrs returns a stable
+  internally-consistent number instead.
+- **`str`/`bytes` match only at `PYTHONHASHSEED=0`.** SipHash-1-3 is keyed by
+  `_Py_HashSecret`, which CPython randomizes per process. pythonrs implements
+  the zero-key case, so it agrees with a seed-pinned CPython and cannot agree
+  with an unpinned one. `parity-fuzz` pins the seed on both children.
 
-Not reachable from `parity-fuzz`: the six `hash(` sites in the generator all
-compare `hash(x) == hash(y)`, which any self-consistent hash satisfies. Closing
-this needs a mode that prints the raw value.
+A `__hash__` RESULT is not reduced modulo `2**61-1`. CPython's `slot_tp_hash`
+tries `PyLong_AsSsize_t` first and uses any value that already fits a
+`Py_hash_t` verbatim — `__hash__` returning `2**62` hashes to `2**62`, not `2` —
+falling back to `long.__hash__` only on overflow. Reducing unconditionally would
+rewrite every large in-range hash a user returns.
+
+Reachable from `parity-fuzz --mode hashval`, which prints RAW hash values. The
+six older `hash(` sites only compare `hash(x) == hash(y)`, a shape any
+self-consistent hash satisfies — which is why a hash that matched CPython for no
+type at all went unnoticed.
+
+### `set` iteration order diverges for a set DISPLAY
+
+`setobject.c`'s open-addressing table is ported (`host.rs`, `SetTable`) and
+reproduces the order for `set(iterable)`, `.add()` in a loop, and `frozenset`.
+A set **literal** still diverges:
+
+```
+{1, 2, 3, 10, 20}           # CPython {1, 2, 3, 20, 10}, pythonrs {1, 2, 3, 10, 20}
+{100,200,300,400,500,600}   # CPython [400, 100, 500, 200, 600, 300]
+                            # pythonrs [100, 200, 300, 400, 500, 600]
+```
+
+The cause is a table SIZE difference, not a hash difference. A literal compiles
+to `BUILD_SET 0` + `LOAD_CONST frozenset({...})` + `SET_UPDATE`, and
+`set_update_internal`'s set-to-set path presizes with
+`set_table_resize(so, (so->used + other->used)*2)` — for five elements that is
+`minused = 10`, giving a 16-slot table (`mask` 15). Inserting the same five
+elements one at a time never presizes: the table starts at 8 and grows to 32 on
+the fifth insert (`mask` 31). A 16-slot table reproduces both diverging cases
+above exactly, including the `LINEAR_PROBES` runs that place `500` and `600`.
+Closing this needs the literal's presize modelled, not a change to hashing.

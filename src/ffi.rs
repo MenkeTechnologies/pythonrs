@@ -398,6 +398,46 @@ pub fn foreign_eq_prim(fid: u32, prim: Prim) -> bool {
     })
 }
 
+/// The native number a `Foreign` object is EXACTLY equal to, if there is one.
+///
+/// CPython's numeric tower guarantees that numerically equal values hash
+/// equally and therefore share one dict slot: `{1, Decimal(1)}` is a
+/// one-element set. pythonrs keys a dict by a structural [`PKey`], so a
+/// `PKey::Foreign` and a `PKey::Int` can never be the same slot no matter how
+/// their hashes compare — the equal pair stayed split. Reporting the native
+/// equivalent lets the caller key such an object as that native number, which
+/// puts both in one slot the way CPython's hash table does.
+///
+/// The equality is tested, not assumed, and that is the whole subtlety:
+/// `int(Decimal('1.5'))` is `1` but `Decimal('1.5') != 1`, and
+/// `float(Decimal('0.1'))` is `0.1` but `Decimal('0.1') != 0.1` (the decimal is
+/// exactly one tenth, the float is not) — CPython keeps those as two distinct
+/// keys, and so must this. `int` is tried before `float` so a large exact
+/// integer is not forced through a lossy float.
+///
+/// Returns `None` for anything with no exact numeric equivalent — a `datetime`,
+/// a plain `Enum` member (which compares equal to nothing), `Fraction(1, 3)`.
+#[cfg(feature = "stdlib-ffi")]
+pub fn foreign_numeric_key(fid: u32) -> Option<Value> {
+    Python::with_gil(|py| {
+        let obj = fetch(py, fid).ok()?;
+        let builtins = py.import("builtins").ok()?;
+        // `bool`/`int`/`Decimal(1)`/`IntEnum.RED` → the equal integer.
+        if let Ok(as_int) = builtins.getattr("int").ok()?.call1((&obj,)) {
+            if obj.eq(&as_int).unwrap_or(false) {
+                return with_host(|h| py_to_value(h, py, &as_int)).ok();
+            }
+        }
+        // `Decimal('0.5')`/`Fraction(1, 2)`/`Decimal('Infinity')` → the equal float.
+        if let Ok(as_float) = builtins.getattr("float").ok()?.call1((&obj,)) {
+            if obj.eq(&as_float).unwrap_or(false) {
+                return as_float.extract::<f64>().ok().map(Value::Float);
+            }
+        }
+        None
+    })
+}
+
 /// Rich-compare two `Foreign` handles for ordering (`<`), so foreign elements
 /// order correctly inside a pythonrs list/tuple sort or comparison
 /// (`sorted([(IntEnum, …)])`, `[date] < [date]`). Borrow-free. An error (two

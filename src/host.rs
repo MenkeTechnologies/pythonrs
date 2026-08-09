@@ -4591,24 +4591,33 @@ pub fn set_put(s: &mut IndexMap<PKey, Value>, key: PKey, item: Value) {
 // ── CPython set iteration order (`setobject.c`) ──────────────────────────────
 //
 // A set/frozenset iterates (and reprs) in open-addressing table order, not
-// insertion order. For a set of plain machine ints that order is deterministic
-// (`hash(n) == n`, bar `hash(-1) == -2`), so pythonrs reproduces it faithfully.
-// String/other-object hashes are per-process randomized in CPython (SipHash with
-// a random key), so no interpreter can match them byte-for-byte across runs —
-// those sets stay in insertion order (the documented boundary).
+// insertion order. For a set of plain machine ints that order is deterministic —
+// the hash is `|n|` reduced modulo `2**61-1` with the sign reapplied, so it is
+// the same on every run — and this table reproduces it for `set(iterable)`,
+// for `.add()` in a loop, and for `frozenset`.
+//
+// It does NOT yet reproduce a set DISPLAY. A literal compiles to `BUILD_SET 0`
+// + `LOAD_CONST frozenset({...})` + `SET_UPDATE`, and CPython's set-to-set
+// update presizes the table with `(used + other->used) * 2`, so `{1,2,3,10,20}`
+// gets 16 slots where five separate inserts get 8-then-32. The resulting order
+// differs (`{1, 2, 3, 20, 10}` vs `{1, 2, 3, 10, 20}`); see BUGS.md.
+//
+// String hashes are per-process randomized in CPython (SipHash keyed by
+// `_Py_HashSecret`), so a set of strings can only agree with a CPython pinned to
+// `PYTHONHASHSEED=0` — the documented boundary.
 
 const SET_MINSIZE: usize = 8;
 const SET_LINEAR_PROBES: usize = 9;
 const SET_PERTURB_SHIFT: u32 = 5;
 
-/// CPython's `hash()` for a machine int: the value itself, except `-1` maps to
-/// `-2` (`-1` is CPython's error sentinel for `tp_hash`).
+/// CPython's `hash()` for a machine int.
+///
+/// This returned `n` unchanged (bar `-1`), which is right only below the
+/// modulus: `hash(2**62)` is `2`, not `2**62`. Since the value feeds the set
+/// table's slot probe, a wrong hash placed large ints in the wrong slots and
+/// so produced the wrong ITERATION ORDER, not just a wrong number.
 fn cpython_int_hash(n: i64) -> i64 {
-    if n == -1 {
-        -2
-    } else {
-        n
-    }
+    crate::pyhash::int_i64(n)
 }
 
 /// A faithful port of CPython `setobject.c`'s open-addressing table, restricted
@@ -4709,37 +4718,40 @@ fn cpython_set_order(hashes: &[i64]) -> Vec<usize> {
 /// The `Py_hash_t` (i64) value of a `__hash__` result. CPython truncates a
 /// returned int to the platform hash width; a non-int result is a `TypeError`.
 fn hash_int_of(v: &Value) -> Result<i64, String> {
-    match v {
-        Value::Bool(b) => Ok(*b as i64),
-        Value::Int(n) => Ok(*n),
+    // CPython's `slot_tp_hash` does NOT reduce every `__hash__` result modulo
+    // 2**61-1. It first tries `PyLong_AsSsize_t`, so any value that already
+    // fits in a `Py_hash_t` is used VERBATIM — `__hash__` returning `2**62`
+    // hashes to `2**62`, not to `2`. Only on overflow does it fall back to
+    // `long.__hash__`. That is deliberate: it preserves `x.__hash__() ==
+    // hash(y)` implying `hash(x) == hash(y)`. Reducing unconditionally would
+    // silently rewrite every large in-range hash a user returns.
+    let h = match v {
+        Value::Bool(b) => *b as i64,
+        Value::Int(n) => *n,
         _ => with_host(|h| match h.get(v) {
-            // A bignum `__hash__` result is reduced the way CPython hashes ints
-            // (mod 2**61-1 on 64-bit), keeping equal values' hashes equal.
-            Some(PyObj::BigInt(b)) => Ok(bigint_pyhash(b)),
+            Some(PyObj::BigInt(b)) => {
+                use num_traits::ToPrimitive;
+                // Out of `Py_hash_t` range: only now does `long.__hash__` run.
+                Ok(b.to_i64().unwrap_or_else(|| bigint_pyhash(b)))
+            }
             _ => Err(type_error("__hash__ method should return an integer")),
-        }),
-    }
+        })?,
+    };
+    // `-1` is reserved for errors.
+    Ok(if h == -1 { -2 } else { h })
 }
 
-/// CPython's `long_hash`: `x mod (2**61 - 1)` with sign, `-1` mapped to `-2`.
+/// CPython's `long_hash`: `|x| mod (2**61 - 1)` with the sign applied last,
+/// `-1` mapped to `-2`.
+///
+/// The previous version took a SIGNED remainder and then folded it into
+/// `[0, modulus)` by adding the modulus before negating, which computes
+/// `-(modulus - (|x| mod modulus))` for negatives — measured as
+/// `hash(-(2**64))` returning `-2305843009213693943` where CPython returns
+/// `-8`. CPython reduces the magnitude digits and multiplies by the sign at the
+/// very end, which is what [`crate::pyhash::int_big`] does.
 fn bigint_pyhash(b: &num_bigint::BigInt) -> i64 {
-    use num_bigint::BigInt;
-    use num_traits::ToPrimitive;
-    let modulus = BigInt::from((1i64 << 61) - 1);
-    let mut r = b % &modulus;
-    if r.sign() == num_bigint::Sign::Minus {
-        r += &modulus;
-    }
-    // `r` is now in [0, 2**61-1); re-apply the original sign.
-    let mut h = r.to_i64().unwrap_or(0);
-    if b.sign() == num_bigint::Sign::Minus {
-        h = -h;
-    }
-    if h == -1 {
-        -2
-    } else {
-        h
-    }
+    crate::pyhash::int_big(b)
 }
 
 /// Resolve — outside any host borrow — the dict/set key for a user instance whose
@@ -4810,6 +4822,29 @@ fn prepare_key_walk(
         // instance path below.
         #[cfg(feature = "stdlib-ffi")]
         KeyPrep::Foreign(id, fid) => {
+            // A foreign object that IS a number keys as that native number.
+            //
+            // CPython's dict finds `1` and `Decimal(1)` in one slot because
+            // they hash equally and compare equal — the hash table never asks
+            // what TYPE they are. Here a key is a structural `PKey`, so
+            // `PKey::Foreign` and `PKey::Int` are different slots however their
+            // hashes compare, and `{1, Decimal(1)}` stayed a 2-element set even
+            // once both hashed to 1. Keying the foreign object as its native
+            // equivalent restores CPython's behaviour in BOTH directions: a
+            // native key already present is now found by the foreign one, and a
+            // foreign key already present is found by the native one (which
+            // never reaches this function at all, so a scan of the candidate
+            // list could only ever have fixed one direction).
+            //
+            // The dict stores the key OBJECT alongside its `PKey`, so
+            // `{Decimal(1): 'dec'}` still reprs as `Decimal('1')` — only the
+            // slot is shared, not the identity CPython shows.
+            if let Some(native) = crate::ffi::foreign_numeric_key(fid) {
+                let key = with_host(|h| h.to_key(&native))?;
+                collapsed.push((key.clone(), v.clone()));
+                pending_key_set(id, key);
+                return Ok(());
+            }
             let hash = crate::ffi::foreign_hash(fid)?;
             let mut canonical = PKey::Foreign { hash, id };
             for (pk, kobj) in candidates.iter().chain(collapsed.iter()) {

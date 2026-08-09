@@ -26,6 +26,7 @@ pub mod host;
 pub mod intercepts;
 pub mod lexer;
 pub mod lsp;
+pub mod pyhash;
 pub mod parser;
 pub mod regexpr;
 pub mod repl;
