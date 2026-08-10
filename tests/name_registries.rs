@@ -42,6 +42,8 @@ const SOURCES: &[(&str, &str)] = &[
     ("src/compiler.rs", include_str!("../src/compiler.rs")),
     ("src/excgroup.rs", include_str!("../src/excgroup.rs")),
     ("src/regexpr.rs", include_str!("../src/regexpr.rs")),
+    ("src/pyhash.rs", include_str!("../src/pyhash.rs")),
+    ("src/mangle.rs", include_str!("../src/mangle.rs")),
     ("src/stdlib/mod.rs", include_str!("../src/stdlib/mod.rs")),
     ("src/stdlib/pyio.rs", include_str!("../src/stdlib/pyio.rs")),
     (

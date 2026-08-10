@@ -257,9 +257,7 @@ pub fn string(s: &str) -> i64 {
     let bytes: Vec<u8> = if max < 0x100 {
         s.chars().map(|c| c as u8).collect()
     } else if max < 0x10000 {
-        s.chars()
-            .flat_map(|c| (c as u16).to_le_bytes())
-            .collect()
+        s.chars().flat_map(|c| (c as u16).to_le_bytes()).collect()
     } else {
         s.chars().flat_map(|c| (c as u32).to_le_bytes()).collect()
     };
@@ -346,11 +344,14 @@ mod tests {
     fn matches_cpython_bignums() {
         let p = |s: &str| -> num_bigint::BigInt { s.parse().unwrap() };
         assert_eq!(int_big(&p("18446744073709551616")), 8); // 2**64
-        // The sign bug this port replaces returned -(MODULUS - 8) here.
+                                                            // The sign bug this port replaces returned -(MODULUS - 8) here.
         assert_eq!(int_big(&p("-18446744073709551616")), -8);
         assert_eq!(int_big(&p("1180591620717411315769")), 12857); // 2**70+12345
         assert_eq!(int_big(&p("-1180591620717411315769")), -12857);
-        assert_eq!(int_big(&p("1000000000000000000000000000000")), 465258685558744706);
+        assert_eq!(
+            int_big(&p("1000000000000000000000000000000")),
+            465258685558744706
+        );
     }
 
     #[test]
@@ -383,7 +384,10 @@ mod tests {
         assert_eq!(double(-3.0).unwrap(), int_i64(-3));
         assert_eq!(double(0.0).unwrap(), int_i64(0));
         assert_eq!(complex(1.0, 0.0).unwrap(), int_i64(1));
-        assert_eq!(double(9007199254740992.0).unwrap(), int_i64(9007199254740992));
+        assert_eq!(
+            double(9007199254740992.0).unwrap(),
+            int_i64(9007199254740992)
+        );
     }
 
     #[test]
@@ -420,7 +424,10 @@ mod tests {
             tuple(&[int_i64(1), int_i64(2), int_i64(3)]),
             529344067295497451
         );
-        assert_eq!(tuple(&[int_i64(0), int_i64(0), int_i64(0)]), 3010437511937009226);
+        assert_eq!(
+            tuple(&[int_i64(0), int_i64(0), int_i64(0)]),
+            3010437511937009226
+        );
         assert_eq!(tuple(&[string("a")]), 7319529274390396360);
         // Nested: hash((1, (2, 3))).
         assert_eq!(

@@ -5630,7 +5630,9 @@ fn gen_hashval(seed: u64) -> Vec<String> {
                 out.push(format!("print(hash({a}))"));
             }
             let n = pick(r, INTS);
-            out.push(format!("print(hash({n}), hash(float({n})) if abs({n}) < 2**52 else hash({n}))"));
+            out.push(format!(
+                "print(hash({n}), hash(float({n})) if abs({n}) < 2**52 else hash({n}))"
+            ));
         }
         // `None`/`bool`/`complex`/`str`/`bytes`.
         2 => {
