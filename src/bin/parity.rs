@@ -24,17 +24,42 @@ use std::path::Path;
 use std::process::Command;
 
 fn main() {
+    std::process::exit(run());
+}
+
+/// Every exit here is non-zero unless the corpus was actually measured and every
+/// script agreed.
+///
+/// This harness used to return `0` in four different ways that measured nothing
+/// or measured a failure: a missing `examples/` printed a note and returned; an
+/// `examples/` with no `.py` files ran the loop zero times; a machine without
+/// `python3` printed `skip` for every file; and a run with `fail > 0` still fell
+/// off the end of `main`. In all four the last line was
+/// `parity: N passed, M failed` and the exit status was success, so any caller
+/// reading the status — a shell `&&`, a CI step — saw a green harness that had
+/// compared nothing. `scripts/dropin_check.sh` already refuses an empty corpus
+/// and a missing reference; this one did not.
+fn run() -> i32 {
     let dir = Path::new("examples");
     if !dir.exists() {
-        eprintln!("parity: no examples/ directory");
-        return;
+        eprintln!("parity: no examples/ directory — measured nothing");
+        return 2;
     }
-    let mut files: Vec<_> = std::fs::read_dir(dir)
-        .unwrap()
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().map(|e| e == "py").unwrap_or(false))
-        .collect();
+    let mut files: Vec<_> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().map(|e| e == "py").unwrap_or(false))
+            .collect(),
+        Err(e) => {
+            eprintln!("parity: cannot read examples/: {e}");
+            return 2;
+        }
+    };
     files.sort();
+    if files.is_empty() {
+        eprintln!("parity: examples/ matched zero *.py scripts — measured nothing");
+        return 2;
+    }
 
     // Our `python` binary is a sibling of this harness binary.
     let ours_bin = std::env::current_exe()
@@ -44,6 +69,7 @@ fn main() {
 
     let mut pass = 0;
     let mut fail = 0;
+    let mut skipped = 0;
     for f in &files {
         let ours = Command::new(&ours_bin)
             .arg(f)
@@ -69,9 +95,24 @@ fn main() {
                 println!("ERR  {} (pythonrs failed to run)", f.display());
             }
             (_, None) => {
+                skipped += 1;
                 println!("skip {} (no python3)", f.display());
             }
         }
     }
-    println!("\nparity: {pass} passed, {fail} failed");
+    println!("\nparity: {pass} passed, {fail} failed, {skipped} skipped");
+    if skipped > 0 {
+        eprintln!(
+            "parity: FAIL — {skipped}/{} script(s) had no reference to compare against; \
+             install python3 or this run proves nothing",
+            files.len()
+        );
+        return 2;
+    }
+    if fail > 0 {
+        eprintln!("parity: FAIL — {fail} of {} script(s) diverged", files.len());
+        return 1;
+    }
+    println!("parity: PASS — compared {pass} script(s) against python3");
+    0
 }
