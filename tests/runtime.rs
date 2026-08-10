@@ -462,6 +462,47 @@ fn module_docstring_binds_dunder_doc() {
     assert_eq!(g("y = 1\nx = __doc__", "x"), "None");
 }
 
+/// `__debug__` is a builtin CONSTANT, not a module global: it resolves in every
+/// scope of every module without being bound anywhere, and it is False exactly
+/// when the interpreter is optimized. `if __debug__:` is the ordinary spelling
+/// of a debug-only block, so leaving it unbound made that a `NameError`.
+#[test]
+fn dunder_debug_is_bound_in_every_scope() {
+    assert_eq!(g("x = __debug__", "x"), "True");
+    assert_eq!(g("def f(): return __debug__\nx = f()", "x"), "True");
+    assert_eq!(g("class C:\n    v = __debug__\nx = C.v", "x"), "True");
+    assert_eq!(
+        g("x = 'off'\nif __debug__:\n    x = 'on'", "x"),
+        "'on'",
+        "the guard must fire in an unoptimized interpreter"
+    );
+    // The value tracks `sys.flags.optimize`, whose CLI spelling (`-O`/`-OO`) the
+    // binary folds into `PYTHONOPTIMIZE`. CPython's parse is lax: empty is level
+    // 0, an integer is that integer, and any other non-empty value is 1.
+    for (env, want) in [
+        (None, 0),
+        (Some(""), 0),
+        (Some("0"), 0),
+        (Some("1"), 1),
+        (Some("2"), 2),
+        (Some("x"), 1),
+    ] {
+        // SAFETY: single-threaded test, and the read below is in this process.
+        unsafe {
+            match env {
+                Some(v) => std::env::set_var("PYTHONOPTIMIZE", v),
+                None => std::env::remove_var("PYTHONOPTIMIZE"),
+            }
+        }
+        assert_eq!(
+            pythonrs::host::optimize_level(),
+            want,
+            "for PYTHONOPTIMIZE={env:?}"
+        );
+    }
+    unsafe { std::env::remove_var("PYTHONOPTIMIZE") };
+}
+
 /// CPython's `Did you mean: 'x'?` hint on an uncaught `NameError`/
 /// `AttributeError`. Every expectation is CPython 3.14.6's, byte-checked
 /// against `python3` on the same program.

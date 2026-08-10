@@ -40,13 +40,44 @@ fn generic_subscription_builds_a_genericalias() {
         ),
         "True",
     );
-    // A user class parameterizes too, and its `__origin__` is the class itself.
+    // A user class parameterizes ONLY through `__class_getitem__`; when it has
+    // one, `__origin__` is the class itself.
     assert_eq!(
-        g("class Box: pass\nx = Box[int].__origin__ is Box", "x"),
+        g(
+            "import types\n\
+             class Box:\n\
+             \x20   __class_getitem__ = classmethod(types.GenericAlias)\n\
+             x = Box[int].__origin__ is Box",
+            "x"
+        ),
         "True"
+    );
+    // A plain class does NOT: being a type is not enough, and CPython names the
+    // class in the message rather than its metaclass.
+    assert_eq!(
+        pythonrs::eval_str("class Box: pass\nx = Box[int]").unwrap_err(),
+        "TypeError: type 'Box' is not subscriptable"
+    );
+    assert_eq!(
+        pythonrs::eval_str("x = str[int]").unwrap_err(),
+        "TypeError: type 'str' is not subscriptable"
+    );
+    // A metaclass `__getitem__` makes the class subscriptable as an ordinary
+    // indexing operation — it outranks any generic-alias reading.
+    assert_eq!(
+        g(
+            "class Meta(type):\n\
+             \x20   def __getitem__(cls, item): return ('meta', item)\n\
+             class MC(metaclass=Meta): pass\n\
+             x = MC[int]",
+            "x"
+        ),
+        "('meta', <class 'int'>)"
     );
     // A builtin FUNCTION is not a type: subscripting it stays a TypeError.
     assert!(pythonrs::eval_str("x = len[0]").is_err());
+    // `tuple[int, ...]` prints the ellipsis in its literal spelling.
+    assert_eq!(g("x = repr(tuple[int, ...])", "x"), "'tuple[int, ...]'");
 }
 
 // `builtins` importable as a module (self-contained build). functools/operator/
@@ -82,9 +113,16 @@ fn faithful_types_module_runs_on_native_primitives() {
         g("import types\nx = types.GenericAlias.__name__", "x"),
         "'GenericAlias'"
     );
+    // `types.UnionType` is `typing.Union` as of 3.14, so it reports the typing
+    // name — NOT the pre-3.14 `UnionType` — and `types.UnionType` must still be
+    // the very type `X | Y` builds.
     assert_eq!(
         g("import types\nx = types.UnionType.__name__", "x"),
-        "'UnionType'"
+        "'Union'"
+    );
+    assert_eq!(
+        g("import types\nx = types.UnionType is type(int | str)", "x"),
+        "True"
     );
     for ty in [
         "CodeType",
@@ -220,7 +258,24 @@ fn pep604_union_type() {
     // `X | Y` on types builds a native types.UnionType (used in annotations and
     // isinstance across the faithful stdlib).
     assert_eq!(g("x = int | str", "x"), "int | str");
-    assert_eq!(g("x = type(int | str).__name__", "x"), "'UnionType'");
+    // 3.14 merged the PEP 604 type into `typing.Union`: the name is `Union`, the
+    // module is `typing`, and messages spell it `'typing.Union' object …`. The
+    // pre-3.14 `builtins.UnionType` spelling is gone.
+    assert_eq!(
+        g(
+            "T = type(int | str)\nx = (T.__name__, T.__qualname__, T.__module__)",
+            "x"
+        ),
+        "('Union', 'Union', 'typing')"
+    );
+    assert_eq!(
+        g("x = repr(type(int | str))", "x"),
+        "\"<class 'typing.Union'>\""
+    );
+    assert_eq!(
+        eval_str("x = (int | str)()").unwrap_err(),
+        "TypeError: 'typing.Union' object is not callable"
+    );
     assert_eq!(g("x = int | None", "x"), "int | None");
     assert_eq!(
         g("x = (int | str | float).__args__", "x"),
@@ -256,9 +311,45 @@ fn function_code_object_co_attributes() {
         g("def f(): pass\ny = type(f.__code__).__name__", "y"),
         "'code'"
     );
-    // co_flags: OPTIMIZED|NEWLOCALS|NOFREE = 0x43 plain; generator adds 0x20,
-    // coroutine adds 0x80.
-    assert_eq!(g("def f(): pass\ny = f.__code__.co_flags", "y"), "67");
+    // co_flags: OPTIMIZED|NEWLOCALS = 0x3 for a plain function. CO_NOFREE (0x40)
+    // is NOT part of it — `dis.COMPILER_FLAG_NAMES` still names the bit, but
+    // 3.14's compiler never sets it, so a non-closure reports 3, not 67.
+    assert_eq!(g("def f(): pass\ny = f.__code__.co_flags", "y"), "3");
+    // …and a closure reports 19, not 3: what actually distinguishes a nested
+    // function is CO_NESTED (0x10), which is set for BOTH the closure and the
+    // free-variable-less function beside it.
+    assert_eq!(
+        g(
+            "def o():\n    z = 1\n    def cl(): return z\n    def nf(): pass\n\
+             \x20   return cl, nf\ncl, nf = o()\ny = (cl.__code__.co_flags, nf.__code__.co_flags)",
+            "y"
+        ),
+        "(19, 19)"
+    );
+    // CO_METHOD (0x8000000), new in 3.14, marks a function defined directly in a
+    // class body — including a lambda, and including one nested in a function
+    // (which is then NESTED|METHOD).
+    assert_eq!(
+        g(
+            "class C:\n    def m(self): pass\n    lam = lambda self: 0\n\
+             y = (C.m.__code__.co_flags, C.lam.__code__.co_flags)",
+            "y"
+        ),
+        "(134217731, 134217731)"
+    );
+    assert_eq!(
+        g(
+            "def o():\n    class D:\n        def m(self): pass\n    return D\n\
+             y = o().m.__code__.co_flags",
+            "y"
+        ),
+        "134217747"
+    );
+    // CO_HAS_DOCSTRING (0x4000000) is set when the body opens with a string.
+    assert_eq!(
+        g("def d():\n    'doc'\ny = d.__code__.co_flags", "y"),
+        "67108867"
+    );
     assert_eq!(
         g(
             "def g():\n    yield 1\ny = g.__code__.co_flags & 0x20 != 0",
@@ -347,7 +438,32 @@ fn function_attributes() {
         ),
         "True",
     );
-    assert_eq!(g("def g(): pass\nx = g.__isabstractmethod__", "x"), "False");
+    // …but a function that was never marked has no such attribute at all: the
+    // slot belongs to `staticmethod`/`classmethod`/`property`, not to
+    // `function`. `abc` reads it with a `getattr(…, False)` default precisely
+    // because of this, so answering False here would hide the real shape.
+    assert_eq!(
+        eval_str("def g(): pass\nx = g.__isabstractmethod__").unwrap_err(),
+        "AttributeError: 'function' object has no attribute '__isabstractmethod__'"
+    );
+    assert_eq!(
+        g(
+            "def g(): pass\nx = staticmethod(g).__isabstractmethod__",
+            "x"
+        ),
+        "False"
+    );
+    assert_eq!(
+        g(
+            "def g(): pass\nx = classmethod(g).__isabstractmethod__",
+            "x"
+        ),
+        "False"
+    );
+    assert_eq!(
+        g("def g(): pass\nx = property(g).__isabstractmethod__", "x"),
+        "False"
+    );
     assert_eq!(g("def f(): pass\nf.tag = 42\nx = f.tag", "x"), "42");
     assert_eq!(
         g("def f(): pass\nf.a = 1\nf.b = 2\nx = f.__dict__", "x"),
@@ -986,10 +1102,135 @@ fn bignum_range() {
         g("x = range(10**30)", "x"),
         "range(0, 1000000000000000000000000000000)"
     );
-    // The type-extraction case from _collections_abc: range(1<<1000) is iterable.
+    // The type-extraction case from _collections_abc: range(1<<1000) is iterable
+    // — and CPython gives a bignum range its OWN iterator type, distinct from
+    // the i64 one, so the name is what tells the two cursors apart.
     assert_eq!(
         g("x = type(iter(range(1 << 1000))).__name__", "x"),
+        "'longrange_iterator'"
+    );
+    assert_eq!(
+        g("x = type(iter(range(5))).__name__", "x"),
+        "'range_iterator'"
+    );
+}
+
+/// Every builtin container has its own iterator type in CPython, and the name is
+/// observable through `type(it).__name__`. pythonrs walks most of them with one
+/// snapshot cursor, so without a tag they would all answer `iterator` — the name
+/// CPython reserves for the `__getitem__` sequence iterator alone. Each expected
+/// value is CPython 3.14.6's for the same expression.
+#[test]
+fn builtin_iterator_type_names() {
+    let names = "d = {1: 2}\nx = [type(it).__name__ for it in (\n\
+        \x20 iter([1]), iter((1,)), iter('a'), iter('é'), iter(b'a'),\n\
+        \x20 iter(bytearray(b'a')), iter({1}), iter(frozenset({1})),\n\
+        \x20 iter(d), iter(d.keys()), iter(d.values()), iter(d.items()),\n\
+        \x20 iter(memoryview(b'a')),\n\
+        )]";
+    assert_eq!(
+        g(names, "x"),
+        "['list_iterator', 'tuple_iterator', 'str_ascii_iterator', 'str_iterator', \
+         'bytes_iterator', 'bytearray_iterator', 'set_iterator', 'set_iterator', \
+         'dict_keyiterator', 'dict_keyiterator', 'dict_valueiterator', \
+         'dict_itemiterator', 'memory_iterator']"
+    );
+    // `reversed` splits the same way: `list` and the three dict views have their
+    // own reverse types, `range` reuses its forward one, everything else is the
+    // generic `reversed` object.
+    let rev = "d = {1: 2}\nx = [type(it).__name__ for it in (\n\
+        \x20 reversed([1]), reversed((1,)), reversed('ab'), reversed(range(3)),\n\
+        \x20 reversed(d), reversed(d.keys()), reversed(d.values()), reversed(d.items()),\n\
+        )]";
+    assert_eq!(
+        g(rev, "x"),
+        "['list_reverseiterator', 'reversed', 'reversed', 'range_iterator', \
+         'dict_reversekeyiterator', 'dict_reversekeyiterator', \
+         'dict_reversevalueiterator', 'dict_reverseitemiterator']"
+    );
+    // `iterator` is not a catch-all: it is what the old-style `__getitem__`
+    // sequence protocol produces, and nothing else reaches it.
+    assert_eq!(
+        g(
+            "class S:\n    def __getitem__(self, i): raise IndexError\n\
+             x = type(iter(S())).__name__",
+            "x"
+        ),
         "'iterator'"
+    );
+    // Iterating an iterator hands back the SAME object, so the name survives.
+    assert_eq!(
+        g(
+            "it = iter([1])\nx = (iter(it) is it, type(iter(it)).__name__)",
+            "x"
+        ),
+        "(True, 'list_iterator')"
+    );
+}
+
+/// `iter()`/`next()` on a user-defined iterator. CPython hands back whatever
+/// `__iter__` returned — unchanged and unconsumed — so an object whose
+/// `__iter__` returns `self` keeps its identity and stays lazy. Draining it into
+/// a snapshot instead would hang on any unbounded iterator.
+#[test]
+fn user_iterator_protocol_is_lazy_and_identity_preserving() {
+    let count = "class Count:\n\
+        \x20   def __init__(self): self.i = 0\n\
+        \x20   def __iter__(self): return self\n\
+        \x20   def __next__(self):\n\
+        \x20       self.i += 1\n\
+        \x20       return self.i\n\
+        c = Count()\nit = iter(c)\n";
+    assert_eq!(
+        g(&format!("{count}x = (it is c, type(it).__name__)"), "x"),
+        "(True, 'Count')"
+    );
+    // Unbounded: three steps must return, which they cannot if `iter` drained it.
+    assert_eq!(
+        g(&format!("{count}x = [next(it), next(it), next(it)]"), "x"),
+        "[1, 2, 3]"
+    );
+    // `__iter__` returning a generator stays a generator.
+    assert_eq!(
+        g(
+            "class G:\n\
+             \x20   def __iter__(self):\n\
+             \x20       yield 1\n\
+             \x20       yield 2\n\
+             it = iter(G())\nx = (type(it).__name__, next(it))",
+            "x"
+        ),
+        "('generator', 1)"
+    );
+    // A `__next__` that raises `StopIteration` exhausts rather than propagating.
+    assert_eq!(
+        g(
+            "class Two:\n\
+             \x20   def __init__(self): self.n = 0\n\
+             \x20   def __iter__(self): return self\n\
+             \x20   def __next__(self):\n\
+             \x20       self.n += 1\n\
+             \x20       if self.n > 2: raise StopIteration\n\
+             \x20       return self.n\n\
+             x = list(Two())",
+            "x"
+        ),
+        "[1, 2]"
+    );
+    // `__iter__` must return an iterator, and `next()` needs one — CPython's two
+    // distinct messages.
+    assert_eq!(
+        eval_str("class B:\n    def __iter__(self): return 5\nx = iter(B())").unwrap_err(),
+        "TypeError: iter() returned non-iterator of type 'int'"
+    );
+    assert_eq!(
+        eval_str("class N: pass\nx = next(N())").unwrap_err(),
+        "TypeError: 'N' object is not an iterator"
+    );
+    // `__next__` alone does not make an object iterable.
+    assert_eq!(
+        eval_str("class J:\n    def __next__(self): return 1\nx = iter(J())").unwrap_err(),
+        "TypeError: 'J' object is not iterable"
     );
 }
 
@@ -3373,9 +3614,22 @@ fn slots_validation_matches_type_new() {
         "class C:\n    __slots__ = ()\n    a = 1",
         "class C:\n    __slots__ = ('__dict__',)",
         "class C:\n    __slots__ = ('__qualname__',)",
+        // `__doc__` too, as long as the body has no docstring: CPython's compiler
+        // emits the `__doc__` store ONLY for a real docstring, so there is
+        // nothing for the slot descriptor to collide with. `typing._SpecialForm`
+        // is exactly this shape (`__slots__ = ('_name', '__doc__', '_getitem')`
+        // with no docstring), so a synthesized `__doc__ = None` in the namespace
+        // made `import typing` itself fail.
+        "class C:\n    __slots__ = ('__doc__',)",
+        "class C:\n    __slots__ = ('_name', '__doc__', '_getitem')",
     ] {
         assert!(pythonrs::eval_str(src).is_ok(), "for {src:?}");
     }
+    // A docstring IS a class variable, so slotting `__doc__` beside one conflicts.
+    assert_eq!(
+        pythonrs::eval_str("class C:\n    'doc'\n    __slots__ = ('__doc__',)").unwrap_err(),
+        "ValueError: '__doc__' in __slots__ conflicts with class variable"
+    );
     // The slot still restricts attributes after passing validation.
     assert_eq!(
         g(

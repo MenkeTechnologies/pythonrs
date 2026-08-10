@@ -43,6 +43,13 @@ fn run_main() -> ExitCode {
     if !cli.warnings.is_empty() {
         std::env::set_var("PYTHONWARNINGS", cli.warnings.join(","));
     }
+    // `-O`/`-OO` are the CLI spelling of `PYTHONOPTIMIZE`; folding them into the
+    // env var gives `__debug__` and the embedded interpreter one source of truth.
+    // A bare `PYTHONOPTIMIZE` already in the environment is only overridden when
+    // a `-O` was actually passed, matching CPython's precedence.
+    if cli.optimize > 0 {
+        std::env::set_var("PYTHONOPTIMIZE", cli.optimize.to_string());
+    }
 
     if cli.lsp {
         return match pythonrs::lsp::run() {

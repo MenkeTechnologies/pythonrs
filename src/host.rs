@@ -1142,12 +1142,102 @@ pub enum AttrDel {
     },
 }
 
+/// Which concrete iterator type a snapshot-backed cursor is standing in for.
+///
+/// CPython gives every builtin container its own iterator type, and the name is
+/// observable through `type(it).__name__` and the default `repr`. pythonrs walks
+/// most of them with one snapshot cursor ([`IterState::Seq`]), so the source
+/// type would otherwise be erased and every iterator would answer `iterator` —
+/// the name CPython reserves for the `__getitem__` sequence iterator alone.
+/// Carrying the tag keeps the answer CPython's without a type per container.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IterKind {
+    /// `PySeqIter_Type` — the `__getitem__` protocol fallback, and the default
+    /// for any source whose CPython iterator type pythonrs cannot name.
+    Seq,
+    List,
+    Tuple,
+    /// `str` whose code points are all ASCII; CPython uses a dedicated type.
+    StrAscii,
+    Str,
+    Bytes,
+    Bytearray,
+    /// Both `set` and `frozenset` — CPython names them the same.
+    Set,
+    Memory,
+    Deque,
+    /// `reversed(range(...))` — CPython hands back the same type `iter(range)`
+    /// does, just walking the other way.
+    Range,
+    LongRange,
+    DictKey,
+    DictValue,
+    DictItem,
+    /// `reversed(list)` has its own type; `reversed()` over anything else that
+    /// is not special-cased is the generic `reversed` object.
+    ListReverse,
+    Reversed,
+    DictReverseKey,
+    DictReverseValue,
+    DictReverseItem,
+}
+
+impl IterKind {
+    /// The CPython type name, exactly as `type(it).__name__` reports it.
+    pub fn type_name(self) -> &'static str {
+        match self {
+            IterKind::Seq => "iterator",
+            IterKind::List => "list_iterator",
+            IterKind::Tuple => "tuple_iterator",
+            IterKind::StrAscii => "str_ascii_iterator",
+            IterKind::Str => "str_iterator",
+            IterKind::Bytes => "bytes_iterator",
+            IterKind::Bytearray => "bytearray_iterator",
+            IterKind::Set => "set_iterator",
+            IterKind::Memory => "memory_iterator",
+            IterKind::Deque => "_deque_iterator",
+            IterKind::Range => "range_iterator",
+            IterKind::LongRange => "longrange_iterator",
+            IterKind::DictKey => "dict_keyiterator",
+            IterKind::DictValue => "dict_valueiterator",
+            IterKind::DictItem => "dict_itemiterator",
+            IterKind::ListReverse => "list_reverseiterator",
+            IterKind::Reversed => "reversed",
+            IterKind::DictReverseKey => "dict_reversekeyiterator",
+            IterKind::DictReverseValue => "dict_reversevalueiterator",
+            IterKind::DictReverseItem => "dict_reverseitemiterator",
+        }
+    }
+
+    /// The kind `iter(x)` produces for a `str` — CPython splits ASCII off into
+    /// its own type.
+    pub fn of_str(s: &str) -> IterKind {
+        if s.is_ascii() {
+            IterKind::StrAscii
+        } else {
+            IterKind::Str
+        }
+    }
+
+    /// The kind `reversed(view)` produces for the dict view this kind iterates.
+    pub fn reversed(self) -> IterKind {
+        match self {
+            IterKind::DictKey => IterKind::DictReverseKey,
+            IterKind::DictValue => IterKind::DictReverseValue,
+            IterKind::DictItem => IterKind::DictReverseItem,
+            IterKind::List => IterKind::ListReverse,
+            _ => IterKind::Reversed,
+        }
+    }
+}
+
 /// Iterator cursor state.
 #[derive(Clone)]
 pub enum IterState {
     Seq {
         items: Vec<Value>,
         idx: usize,
+        kind: IterKind,
     },
     RangeIter {
         cur: i64,
@@ -2090,10 +2180,18 @@ impl PyHost {
     pub fn new_tuple(&mut self, items: Vec<Value>) -> Value {
         self.alloc(PyObj::Tuple(items))
     }
-    /// A one-shot sequence iterator (for `reversed`, etc.): `next()` walks the
-    /// items once, then exhausts.
+    /// A one-shot sequence iterator whose CPython type is the `__getitem__`
+    /// protocol iterator: `next()` walks the items once, then exhausts.
     pub fn new_iter_seq(&mut self, items: Vec<Value>) -> Value {
-        self.alloc(PyObj::Iter(IterState::Seq { items, idx: 0 }))
+        self.new_iter_kind(items, IterKind::Seq)
+    }
+    /// The same cursor, standing in for a named CPython iterator type.
+    pub fn new_iter_kind(&mut self, items: Vec<Value>, kind: IterKind) -> Value {
+        self.alloc(PyObj::Iter(IterState::Seq {
+            items,
+            idx: 0,
+            kind,
+        }))
     }
     pub fn new_dict(&mut self, pairs: IndexMap<PKey, (Value, Value)>) -> Value {
         self.alloc(PyObj::Dict(pairs))
@@ -2345,6 +2443,9 @@ impl PyHost {
         match self.get(v) {
             Some(PyObj::Builtin(n)) => n.clone(),
             Some(PyObj::Class(n)) => n.clone(),
+            // `tuple[int, ...]` — inside an alias CPython prints the ellipsis in
+            // its literal spelling, not as the `Ellipsis` repr.
+            Some(PyObj::Ellipsis) => "...".to_string(),
             Some(PyObj::GenericAlias { .. }) | Some(PyObj::Union { .. }) => self.repr_of(v),
             None if matches!(v, Value::Undef) => "None".to_string(),
             _ => self.repr_of(v),
@@ -3300,6 +3401,10 @@ fn type_object_class_name(n: &str) -> Option<String> {
             Some(n)
         }
         "re.Match" => Some("re.Match"),
+        // Since 3.14 the PEP 604 union type IS `typing.Union` — `__name__` is
+        // `Union`, `__module__` is `typing`, and messages name it
+        // `'typing.Union' object …`. It is no longer `builtins.UnionType`.
+        "typing.Union" => Some("typing.Union"),
         "string.templatelib.Template" => Some("string.templatelib.Template"),
         "string.templatelib.Interpolation" => Some("string.templatelib.Interpolation"),
         _ => None,
@@ -3461,7 +3566,12 @@ impl PyHost {
                 Some(PyObj::Instance(i)) => i.class.clone(),
                 Some(PyObj::BoundMethod { .. }) => "method".into(),
                 Some(PyObj::Exception { class, .. }) => class.clone(),
-                Some(PyObj::Iter(_)) => "iterator".into(),
+                // Every builtin container has its own iterator type in CPython;
+                // the snapshot cursor carries which one it is standing in for.
+                Some(PyObj::Iter(IterState::Seq { kind, .. })) => kind.type_name().into(),
+                Some(PyObj::Iter(IterState::RangeIter { .. })) => "range_iterator".into(),
+                Some(PyObj::Iter(IterState::BigRangeIter { .. })) => "longrange_iterator".into(),
+                Some(PyObj::Iter(IterState::DictKeys { .. })) => "dict_keyiterator".into(),
                 Some(PyObj::Zip { .. }) => "zip".into(),
                 Some(PyObj::MapObj { .. }) => "map".into(),
                 Some(PyObj::FilterObj { .. }) => "filter".into(),
@@ -3489,7 +3599,7 @@ impl PyHost {
                 Some(PyObj::NamedTupleType { .. }) => "type".into(),
                 Some(PyObj::Partial { .. }) => "partial".into(),
                 Some(PyObj::Code { .. }) => "code".into(),
-                Some(PyObj::Union { .. }) => "UnionType".into(),
+                Some(PyObj::Union { .. }) => "typing.Union".into(),
                 Some(PyObj::GenericAlias { .. }) => "GenericAlias".into(),
                 Some(PyObj::TypeVarLike { kind, .. }) => kind.type_name().into(),
                 Some(PyObj::StructTime { .. }) => "struct_time".into(),
@@ -7207,10 +7317,22 @@ impl PyHost {
                 }
                 Ok(self.build_union(items))
             }
-            _ => Err(type_error(&format!(
-                "'{}' object is not subscriptable",
-                self.type_name(recv)
-            ))),
+            // A type object that does not parameterize names ITSELF in the
+            // message (`type 'Box' is not subscriptable`), not its metaclass —
+            // `'type' object is not subscriptable` tells the reader nothing about
+            // which class they subscripted.
+            _ => {
+                let msg = match self.get(recv) {
+                    Some(PyObj::Class(n)) => format!("type '{n}' is not subscriptable"),
+                    Some(PyObj::Builtin(n))
+                        if crate::builtins::BUILTIN_TYPES.contains(&n.as_str()) =>
+                    {
+                        format!("type '{n}' is not subscriptable")
+                    }
+                    _ => format!("'{}' object is not subscriptable", self.type_name(recv)),
+                };
+                Err(type_error(&msg))
+            }
         }
     }
 
@@ -7867,7 +7989,8 @@ impl PyHost {
         }
         // A dict view snapshots its live elements at iterator creation.
         if let Some(items) = self.view_items(v) {
-            return Ok(self.alloc(PyObj::Iter(IterState::Seq { items, idx: 0 })));
+            let kind = self.view_iter_kind(v);
+            return Ok(self.new_iter_kind(items, kind));
         }
         // A builtin-subclass instance with no user `__iter__` (a namedtuple, a
         // `list`/`tuple`/`dict`/`str` subclass) iterates its native payload. Reached
@@ -7887,28 +8010,42 @@ impl PyHost {
             }
         }
         let state = match self.get(v) {
-            Some(PyObj::List(l)) | Some(PyObj::Tuple(l)) => IterState::Seq {
+            Some(PyObj::List(l)) => IterState::Seq {
                 items: l.clone(),
                 idx: 0,
+                kind: IterKind::List,
             },
+            Some(PyObj::Tuple(l)) => IterState::Seq {
+                items: l.clone(),
+                idx: 0,
+                kind: IterKind::Tuple,
+            },
+            // `time.struct_time` is a tuple subclass, so CPython hands back the
+            // plain tuple iterator.
             Some(PyObj::StructTime { fields }) => IterState::Seq {
                 items: fields.iter().take(9).cloned().collect(),
                 idx: 0,
+                kind: IterKind::Tuple,
             },
-            Some(PyObj::Str(s)) => IterState::Seq {
-                items: s
-                    .chars()
-                    .map(|c| c.to_string())
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .map(PyObj::Str)
-                    .map(|o| self.alloc(o))
-                    .collect(),
-                idx: 0,
-            },
+            Some(PyObj::Str(s)) => {
+                let kind = IterKind::of_str(s);
+                IterState::Seq {
+                    items: s
+                        .chars()
+                        .map(|c| c.to_string())
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .map(PyObj::Str)
+                        .map(|o| self.alloc(o))
+                        .collect(),
+                    idx: 0,
+                    kind,
+                }
+            }
             Some(PyObj::Set(s)) | Some(PyObj::Frozenset(s)) => IterState::Seq {
                 items: self.set_ordered_values(s),
                 idx: 0,
+                kind: IterKind::Set,
             },
             Some(PyObj::Dict(d)) => IterState::DictKeys {
                 keys: d.values().map(|(k, _)| k.clone()).collect(),
@@ -7934,11 +8071,37 @@ impl PyHost {
             | Some(PyObj::ItertoolsIter { .. })
             | Some(PyObj::CallIter { .. }) => return Ok(v.clone()),
             _ => {
+                // Everything else walks its elements through one snapshot cursor;
+                // the tag is what keeps `type(it).__name__` CPython's.
+                let kind = match self.get(v) {
+                    Some(PyObj::Bytes(_)) => IterKind::Bytes,
+                    Some(PyObj::Bytearray(_)) => IterKind::Bytearray,
+                    Some(PyObj::Memoryview { .. }) => IterKind::Memory,
+                    Some(PyObj::Deque { .. }) => IterKind::Deque,
+                    _ => IterKind::Seq,
+                };
                 let items = self.iter_items(v)?;
-                IterState::Seq { items, idx: 0 }
+                IterState::Seq {
+                    items,
+                    idx: 0,
+                    kind,
+                }
             }
         };
         Ok(self.alloc(PyObj::Iter(state)))
+    }
+
+    /// The CPython iterator type for `iter(view)` on a `dict_keys`/`dict_values`/
+    /// `dict_items` view. Not a view → the `__getitem__` fallback name.
+    pub fn view_iter_kind(&mut self, v: &Value) -> IterKind {
+        match self.get(v) {
+            Some(PyObj::DictView { kind, .. }) => match kind {
+                0 => IterKind::DictKey,
+                1 => IterKind::DictValue,
+                _ => IterKind::DictItem,
+            },
+            _ => IterKind::Seq,
+        }
     }
 
     /// Advance an iterator; `None` on exhaustion.
@@ -7976,7 +8139,7 @@ impl PyHost {
             return Ok(Some(self.norm_big(cur)));
         }
         let out = match self.get_mut(it) {
-            Some(PyObj::Iter(IterState::Seq { items, idx })) => {
+            Some(PyObj::Iter(IterState::Seq { items, idx, .. })) => {
                 if *idx < items.len() {
                     let v = items[*idx].clone();
                     *idx += 1;
@@ -9035,10 +9198,22 @@ impl PyHost {
             {
                 Ok(inner.clone())
             }
-            Some(PyObj::StaticMethod(_)) | Some(PyObj::ClassMethod(_))
+            // `staticmethod`/`classmethod`/`property` each carry a real
+            // `__isabstractmethod__` getset defaulting to False — `abc` reads it
+            // through the decorator to decide whether the wrapped function is
+            // abstract. A plain function does NOT (see below).
+            Some(PyObj::StaticMethod(_))
+            | Some(PyObj::ClassMethod(_))
+            | Some(PyObj::Property { .. })
                 if name == "__isabstractmethod__" =>
             {
-                Ok(Value::Bool(false))
+                let id = if let Value::Obj(i) = recv { *i } else { 0 };
+                Ok(self
+                    .func_attrs
+                    .get(&id)
+                    .and_then(|m| m.get(name))
+                    .cloned()
+                    .unwrap_or(Value::Bool(false)))
             }
             // A function's writable attribute dict.
             Some(PyObj::Func(_)) if name == "__dict__" => {
@@ -9067,11 +9242,14 @@ impl PyHost {
                     .cloned()
                     .unwrap_or(Value::Undef))
             }
-            // `__isabstractmethod__` defaults to False; any user-assigned function
-            // attribute (or an explicit `__isabstractmethod__`) reads from the dict.
+            // A user-assigned function attribute reads from the side dict. Note
+            // that `__isabstractmethod__` gets NO default here: unlike the
+            // decorators above, a plain function has no such slot in CPython, so
+            // reading one that `abc.abstractmethod` never set is an
+            // `AttributeError` — which is exactly what `getattr(f, …, False)`
+            // relies on.
             Some(PyObj::Func(_))
-                if name == "__isabstractmethod__"
-                    || matches!(recv, Value::Obj(id)
+                if matches!(recv, Value::Obj(id)
                         if self.func_attrs.get(id).is_some_and(|m| m.contains_key(name))) =>
             {
                 let id = if let Value::Obj(i) = recv { *i } else { 0 };
@@ -10582,10 +10760,19 @@ fn marshal_ffi_arg(v: &Value) -> Value {
 /// subscripted (`list[int]`, `dict[str, int]`, or any user class). Builtin
 /// FUNCTIONS (`len`, `print`) are excluded — only type builtins qualify.
 pub fn is_generic_subscriptable(recv: &Value) -> bool {
+    let cname = with_host(|h| match h.get(recv) {
+        Some(PyObj::Class(n)) => Some(n.clone()),
+        _ => None,
+    });
+    // A user class parameterizes ONLY if `__class_getitem__` is somewhere in its
+    // MRO — inherited from `Generic`/an ABC, or written on the class. CPython
+    // does not hand every type a generic alias: a plain `class Box: pass` makes
+    // `Box[int]` a `TypeError: type 'Box' is not subscriptable`, and treating it
+    // as parameterization silently accepted programs CPython rejects.
+    if let Some(cname) = cname {
+        return with_host(|h| h.class_lookup(&cname, "__class_getitem__").is_some());
+    }
     with_host(|h| match h.get(recv) {
-        // Every user-defined class is a type: `Cls[T]` is a generic alias
-        // (dispatching `__class_getitem__` when the class defines one).
-        Some(PyObj::Class(_)) => true,
         // The builtin container/type objects that carry `__class_getitem__` in
         // CPython. `str`/`bytes`/`int`/`float`/`bool` do NOT (subscripting them
         // stays a TypeError), matching CPython.
@@ -12290,17 +12477,25 @@ impl PyHost {
     /// needs the type + `co_flags`), `inspect.signature`
     /// (argcounts/varnames/flags), `functools`, `dataclasses`.
     fn code_attr(&mut self, def_id: usize, name: &str) -> Result<Value, String> {
-        // CPython co_flags bits (`Include/cpython/code.h`).
+        // CPython 3.14 co_flags bits (`Include/cpython/code.h`), named exactly as
+        // `dis.COMPILER_FLAG_NAMES` lists them.
+        //
+        // `CO_NOFREE` (0x0040) is deliberately absent: 3.14's compiler never sets
+        // it. `dis.COMPILER_FLAG_NAMES` still *names* the bit, so it is easy to
+        // mistake for live — but `def f(): pass` reports `co_flags == 3`, not 67.
         const CO_OPTIMIZED: i64 = 0x0001;
         const CO_NEWLOCALS: i64 = 0x0002;
         const CO_VARARGS: i64 = 0x0004;
         const CO_VARKEYWORDS: i64 = 0x0008;
-        // CO_NOFREE: the function closes over no free variables (set below only
-        // when `freevars` is empty), matching CPython's flag for non-closures.
-        const CO_NOFREE: i64 = 0x0040;
+        /// Defined inside another function's scope (at any depth).
+        const CO_NESTED: i64 = 0x0010;
         const CO_GENERATOR: i64 = 0x0020;
         const CO_COROUTINE: i64 = 0x0080;
         const CO_ASYNC_GENERATOR: i64 = 0x0200;
+        /// The body opens with a string literal.
+        const CO_HAS_DOCSTRING: i64 = 0x0400_0000;
+        /// Defined directly in a class body (3.14 only).
+        const CO_METHOD: i64 = 0x0800_0000;
         // Pull every field under one short immutable borrow so the alloc/new_str
         // below (which need `&mut self`) don't conflict with it.
         let (co_name, co_qualname, params, posonly, kwonly, star, kwargs, locals, flags) = {
@@ -12311,9 +12506,23 @@ impl PyHost {
                 d.qualname.clone()
             };
             let mut f = CO_OPTIMIZED | CO_NEWLOCALS;
-            // CO_NOFREE unless the function actually closes over a variable.
-            if d.freevars.is_empty() {
-                f |= CO_NOFREE;
+            // The enclosing scope is whatever `__qualname__` names before the final
+            // component: `outer.<locals>.inner` → `outer.<locals>` (a function),
+            // `C.m` → `C` (a class body), `f` → `` (the module). A `<locals>`
+            // anywhere in that path means some enclosing scope is a function
+            // (CO_NESTED); a final component that is NOT `<locals>` means the
+            // *immediate* scope is a class body (CO_METHOD). `outer.<locals>.D.m`
+            // is both, exactly as CPython reports it.
+            if let Some((scope, _)) = q.rsplit_once('.') {
+                if scope.split('.').any(|c| c == "<locals>") {
+                    f |= CO_NESTED;
+                }
+                if !scope.ends_with("<locals>") {
+                    f |= CO_METHOD;
+                }
+            }
+            if d.doc.is_some() {
+                f |= CO_HAS_DOCSTRING;
             }
             if d.star.is_some() {
                 f |= CO_VARARGS;
@@ -12611,12 +12820,21 @@ fn run_class_body(name: &str, body_func: &Value) -> Result<IndexMap<String, Valu
     // `None` there when the body has none — so `Cls.__doc__` always resolves.
     // Without it `contextlib.contextmanager` dies on its own
     // `_GeneratorContextManager.__doc__`, taking every `@contextmanager` with it.
-    vars.entry("__doc__".to_string()).or_insert_with(|| {
-        with_host(|h| match &def.doc {
-            Some(d) => h.new_str(d.clone()),
-            None => Value::Undef,
-        })
-    });
+    // …unless the body slots `__doc__` itself. CPython's compiler emits the
+    // `__doc__` store ONLY for a real docstring, so `__slots__ = ('__doc__',)`
+    // beside no docstring is legal and installs a slot descriptor. Seeding the
+    // default unconditionally made that namespace look like it carried a
+    // `__doc__` class variable, and `typing._SpecialForm` — which slots exactly
+    // that — died with `'__doc__' in __slots__ conflicts with class variable`,
+    // taking the whole `typing` module with it.
+    if def.doc.is_some() || !slots_mention(vars.get("__slots__"), "__doc__") {
+        vars.entry("__doc__".to_string()).or_insert_with(|| {
+            with_host(|h| match &def.doc {
+                Some(d) => h.new_str(d.clone()),
+                None => Value::Undef,
+            })
+        });
+    }
     // `__module__` is the `__name__` of the module the body was DEFINED in, which
     // is `fv.module` — not whatever module happens to be running when a metaclass
     // finally registers the class. `class Month(IntEnum)` in calendar.py is
@@ -12697,6 +12915,22 @@ pub fn fire_set_name(class_name: &str, ns: &IndexMap<String, Value>) -> Result<(
 /// Each slot name is mangled against the class name before the pass-2 lookup,
 /// so `__slots__ = ("__x",)` beside a `_C__x = 1` class variable is the
 /// collision CPython reports it as.
+/// True if a class body's `__slots__` value names `want`. Deliberately silent
+/// about malformed values — [`check_slots`] is where those are diagnosed; this
+/// only answers whether a slot descriptor is about to claim the name.
+fn slots_mention(slots: Option<&Value>, want: &str) -> bool {
+    let Some(slots) = slots else { return false };
+    with_host(|h| match h.get(slots) {
+        Some(PyObj::Str(s)) => s == want,
+        Some(PyObj::Tuple(xs)) | Some(PyObj::List(xs)) => {
+            let xs = xs.clone();
+            xs.iter()
+                .any(|x| matches!(h.get(x), Some(PyObj::Str(s)) if s == want))
+        }
+        _ => false,
+    })
+}
+
 fn check_slots(class: &str, ns: &IndexMap<String, Value>) -> Result<(), String> {
     let slots = match ns.get("__slots__") {
         Some(v) => v.clone(),
@@ -14034,6 +14268,42 @@ pub fn iter_vec(v: &Value) -> Result<Vec<Value>, String> {
     with_host(|h| h.iter_items(v))
 }
 
+/// CPython's optimization level: `sys.flags.optimize`.
+///
+/// `-O`/`-OO` are folded into `PYTHONOPTIMIZE` by the CLI, so this one reader
+/// serves both spellings. CPython's parse is deliberately lax — an empty value
+/// is level 0, an integer is that integer, and anything else non-empty is 1
+/// (`PYTHONOPTIMIZE=x` runs optimized).
+pub fn optimize_level() -> u8 {
+    match std::env::var("PYTHONOPTIMIZE") {
+        Err(_) => 0,
+        Ok(s) if s.is_empty() => 0,
+        Ok(s) => s.parse::<u8>().unwrap_or(1),
+    }
+}
+
+/// True if `v` is an iterator — something [`iter_step`] can advance and CPython
+/// would accept from `next()`. That is a *narrower* question than "is iterable":
+/// a `list` is iterable but is not an iterator, and a class defining `__next__`
+/// is an iterator even without `__iter__`.
+pub fn is_iterator(v: &Value) -> bool {
+    with_host(|h| match h.get(v) {
+        Some(PyObj::Instance(i)) => h.class_lookup(&i.class, "__next__").is_some(),
+        Some(PyObj::Iter(_))
+        | Some(PyObj::Generator { .. })
+        | Some(PyObj::Zip { .. })
+        | Some(PyObj::MapObj { .. })
+        | Some(PyObj::FilterObj { .. })
+        | Some(PyObj::EnumerateObj { .. })
+        | Some(PyObj::ItertoolsIter { .. })
+        | Some(PyObj::CallIter { .. })
+        | Some(PyObj::CsvReader { .. }) => true,
+        #[cfg(feature = "stdlib-ffi")]
+        Some(PyObj::Foreign(id)) => crate::ffi::is_iterator(*id),
+        _ => false,
+    })
+}
+
 /// Turn `v` into something [`iter_step`] can drive, running any user-level
 /// `__iter__` OUTSIDE the host borrow.
 ///
@@ -14061,9 +14331,7 @@ pub fn make_iterator(v: &Value) -> Result<Value, String> {
         // object to hand back, so it is materialized once here.
         Some((false, true)) => {
             let items = iter_instance_items(v)?;
-            Ok(with_host(|h| {
-                h.alloc(PyObj::Iter(IterState::Seq { items, idx: 0 }))
-            }))
+            Ok(with_host(|h| h.new_iter_seq(items)))
         }
         _ => with_host(|h| h.make_iter(v)),
     }
@@ -14438,11 +14706,16 @@ pub fn iter_step(it: &Value) -> Result<Option<Value>, String> {
         Enumerate,
         CallIter,
         Itertools,
+        /// A user object driving its own `__next__` (the class defines it).
+        UserNext,
         #[cfg(feature = "stdlib-ffi")]
         Foreign(u32),
         Plain,
     }
     let step = with_host(|h| match h.get(it) {
+        Some(PyObj::Instance(i)) if h.class_lookup(&i.class, "__next__").is_some() => {
+            Step::UserNext
+        }
         Some(PyObj::Generator { .. }) => Step::Generator,
         Some(PyObj::Zip { .. }) => Step::Zip,
         Some(PyObj::MapObj { .. }) => Step::Map,
@@ -14463,6 +14736,15 @@ pub fn iter_step(it: &Value) -> Result<Option<Value>, String> {
         Step::Enumerate => enumerate_step(it),
         Step::CallIter => calliter_step(it),
         Step::Itertools => itertools_step(it),
+        // A user iterator steps by calling its own `__next__`, which must run
+        // outside the host borrow; `StopIteration` is exhaustion, every other
+        // exception propagates. Never materialize here — the object may be
+        // infinite (`itertools.count`-style), and CPython never drains it.
+        Step::UserNext => match call_method(it, "__next__", vec![], vec![]) {
+            Ok(v) => Ok(Some(v)),
+            Err(e) if e.contains("StopIteration") => Ok(None),
+            Err(e) => Err(e),
+        },
         // A foreign (CPython) iterator advances with the host borrow released so
         // a lazy stdlib iterator running a pythonrs callback can re-enter.
         #[cfg(feature = "stdlib-ffi")]

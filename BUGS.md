@@ -9,6 +9,68 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **`iter()`/`next()` honor the user iterator protocol.** `iter(x)` called
+  `PyHost::make_iter` directly, which cannot run Python, so a class defining
+  `__iter__`/`__next__` was `TypeError: 'Count' object is not iterable` and
+  `next()` on one was `TypeError: not an iterator` — even though `for x in
+  Count()` worked, because the loop took a different path. `iter(x)` now runs
+  `type(x).__iter__` and hands back its result UNCHANGED (so an object whose
+  `__iter__` returns `self` keeps its identity and an unbounded iterator is
+  never drained), falls back to the `__getitem__` sequence protocol when there
+  is no `__iter__`, and rejects a non-iterator result with CPython's
+  `iter() returned non-iterator of type 'int'`. `next()` steps a user `__next__`
+  outside the host borrow, treating `StopIteration` as exhaustion, and names a
+  non-iterator as `'N' object is not an iterator`.
+- **Every builtin iterator reports its own CPython type name.** All of them
+  answered `iterator` — the name CPython reserves for the `__getitem__` sequence
+  iterator alone. The snapshot cursor now carries an `IterKind` tag, so
+  `type(iter(x)).__name__` is `list_iterator` / `tuple_iterator` /
+  `str_ascii_iterator` / `str_iterator` / `bytes_iterator` /
+  `bytearray_iterator` / `set_iterator` / `memory_iterator` /
+  `_deque_iterator` / `dict_keyiterator` / `dict_valueiterator` /
+  `dict_itemiterator` / `range_iterator` / `longrange_iterator`, and `reversed`
+  splits into `list_reverseiterator`, the three `dict_reverse*iterator`s, and
+  the generic `reversed`.
+- **`co_flags` matches the 3.14 compiler.** `CO_NOFREE` (0x40) was set whenever
+  a function had no free variables, so `def f(): pass` reported 67; 3.14's
+  compiler never sets that bit and reports 3. `dis.COMPILER_FLAG_NAMES` still
+  NAMES the bit, which is what made the stale value look right. The three flags
+  that do apply are now derived from `__qualname__` and the docstring:
+  `CO_NESTED` (0x10) for any function inside another function's scope,
+  `CO_METHOD` (0x8000000, new in 3.14) for one defined directly in a class body,
+  and `CO_HAS_DOCSTRING` (0x4000000) when the body opens with a string.
+- **`Cls[T]` requires `__class_getitem__`.** Every user class was treated as
+  parameterizable, so `class Box: pass` silently accepted `Box[int]` as a
+  `types.GenericAlias` where CPython raises. A class now parameterizes only when
+  `__class_getitem__` is in its MRO; a metaclass `__getitem__` is dispatched as
+  ordinary indexing (it outranks the alias reading); and the rejection names the
+  class itself — `type 'Box' is not subscriptable`, not `'type' object is not
+  subscriptable`. `tuple[int, ...]` also prints the ellipsis in its literal
+  spelling rather than as `Ellipsis`.
+- **`types.UnionType` is `typing.Union`.** 3.14 merged the PEP 604 type into
+  `typing`, so `type(int | str)` reports `__name__ == 'Union'`,
+  `__module__ == 'typing'`, `repr` `<class 'typing.Union'>`, and messages such
+  as `'typing.Union' object is not callable`. pythonrs still answered with the
+  pre-3.14 `builtins.UnionType` spelling.
+- **`import typing` works.** `typing._SpecialForm` declares
+  `__slots__ = ('_name', '__doc__', '_getitem')` with no docstring. pythonrs
+  seeded `__doc__` into every class namespace unconditionally, so the slot check
+  saw a class variable that CPython's compiler never emits and the import died
+  with `ValueError: '__doc__' in __slots__ conflicts with class variable`,
+  taking the whole module with it. The default is now skipped exactly when the
+  body slots `__doc__` and has no docstring.
+- **`__debug__` is bound.** It is a builtin constant, so `if __debug__:` — the
+  ordinary spelling of a debug-only block — was a `NameError` in every scope. It
+  now resolves everywhere and is False exactly when the interpreter is
+  optimized; `-O`/`-OO` are folded into `PYTHONOPTIMIZE` so both spellings share
+  one source of truth, with CPython's lax parse (empty is 0, an integer is that
+  integer, any other non-empty value is 1). Assert stripping under `-O` is still
+  not implemented — see "Partial / simplified semantics".
+- **`function.__isabstractmethod__` raises `AttributeError`.** The slot belongs
+  to `staticmethod`/`classmethod`/`property`, not to `function`; answering
+  `False` on a plain function hid the real shape (`abc` reads it with a
+  `getattr(…, False)` default precisely because the attribute is absent).
+  `property` gained the slot it was missing.
 - **A mutable container reached through a bridged CPython object keeps its
   identity.** The marshaller converted an exact CPython `list`/`dict`/`set` to a
   native value on every read, which is right for a call RESULT (a fresh object
@@ -187,7 +249,9 @@ written.
   'int'`; a non-identifier is `TypeError: __slots__ must be identifiers`; a
   repeated `__dict__`/`__weakref__` is `TypeError: <name> slot disallowed: we
   already got one`. `__qualname__` and `__classcell__` — names class creation
-  inserts itself — are exempt from the conflict check.
+  inserts itself — are exempt from the conflict check, and so is `__doc__` in a
+  body that has no docstring (CPython's compiler emits that store only for a
+  real one, so there is nothing for the slot descriptor to collide with).
 - **`itertools.chain.from_iterable`** is reachable as an attribute of `chain`.
 - **`f.__annotate__`** (PEP 649): the callable that yields the annotations for a
   requested format, `None` on an unannotated function. CPython 3.14's
@@ -469,6 +533,38 @@ written.
   variants; async-generator `asend`/`athrow`/`aclose`.
 
 ## Partial / simplified semantics
+- **`-O` reaches `__debug__` and nothing else.** The flag sets `__debug__` to
+  False, but the compiler still emits every `assert` (so an optimized run keeps
+  checking them) and `sys.flags.optimize` still reports 0. Skipping asserts at
+  compile time means threading the level into the bytecode CACHE KEY as well —
+  otherwise a chunk compiled under `-O` would be reused without it — so it is
+  deliberately not bolted on to the flag alone.
+- **`__slots__` installs no member descriptors.** The slot RESTRICTION is
+  enforced (a non-slot attribute is the CPython `AttributeError`), but the
+  names are absent from the class: `class A: __slots__ = ('x',)` then `A.x` is
+  `AttributeError: type object 'A' has no attribute 'x'` where CPython answers
+  `<member 'x' of 'A' objects>`. Reaching a slotted `__doc__` through the class
+  reports `None` for the same reason.
+- **`types.UnionType is type(int | str)` is False on the ffi build.** In the
+  self-contained build `types.py` binds `type(int | str)` and the identity
+  holds. Under `stdlib-ffi`, `types.UnionType` and `typing.Union` are both
+  CPython's own object (identical to each other) while `type(int | str)` stays
+  native, so the union type has two representations that never compare `is`,
+  even though the name, module, repr and messages all match. This is the general
+  cross-bridge type-identity boundary, not specific to `Union`.
+- **PEP 649 forward-ref annotations do not raise.** `def g(x) -> NotYet: ...`
+  then `g.__annotations__` yields `{}`; CPython 3.14 evaluates the annotation
+  lazily on that read and raises `NameError: name 'NotYet' is not defined`.
+  Class bodies drop the unresolvable entry the same way.
+- **Vendored `ast` omits optional-field defaults from `repr`.** In the
+  self-contained build `repr(ast.Constant(1))` is `Constant(value=1)`; CPython
+  says `Constant(value=1, kind=None)`, because every OPTIONAL ASDL field carries
+  a class-level `None` default that `repr` then reads. `_fields` already lists
+  `kind`; what is missing is the optional/required split from `Python.asdl`.
+- **`compile()` is absent** — `NameError: name 'compile' is not defined`. The
+  `-c`/file paths compile internally, but the builtin that exposes it (and so
+  `code`-object construction from source, `exec(compile(...))`, and
+  `dis`-over-source) is not wired up.
 - **The context-manager protocol check does not reach the natively shadowed
   managers.** `with <not a context manager>:` now raises CPython's
   `TypeError: 'X' object does not support the context manager protocol (missed
@@ -814,8 +910,8 @@ Still open:
   (`((1, 3), (1, 2), (2, 3))`), so it is a position API and would convert the
   same way. `m[i]` (`Match.__getitem__`) raises `TypeError`; `m.group(i)` works.
 - **`finditer` is eager.** It builds every match and returns a list iterator, so
-  `type(...).__name__` is `iterator` where CPython says `callable_iterator`, and
-  a scan over a huge subject materializes all of it.
+  `type(...).__name__` is `list_iterator` where CPython says `callable_iterator`,
+  and a scan over a huge subject materializes all of it.
 - **`re.Scanner` and `re.RegexFlag` are absent** (the flag constants exist as
   plain ints; `re.A`/`re.I`/`re.M`/`re.S`/`re.X` all resolve).
 

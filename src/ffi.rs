@@ -1548,6 +1548,12 @@ pub fn make_iter_cb(id: u32) -> Result<Value, String> {
     })
 }
 
+/// True if the foreign object is an iterator (CPython's `PyIter_Check`, i.e.
+/// `type(obj).__next__` exists) — not merely iterable.
+pub fn is_iterator(id: u32) -> bool {
+    Python::with_gil(|py| fetch(py, id).is_ok_and(|obj| obj.hasattr("__next__").unwrap_or(false)))
+}
+
 /// `next(foreign)` — `None` on `StopIteration`. Caller holds the host borrow, so
 /// only safe for iterators that never re-enter pythonrs during `next()` (a plain
 /// CPython container). Callback-driving iterators must use [`iter_next_cb`].

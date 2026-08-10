@@ -5,7 +5,7 @@
 //! stack, call into the `host` object model, and push the result back.
 
 use crate::excgroup;
-use crate::host::{self, ops, with_host, Instance, IterState, PKey, PyObj};
+use crate::host::{self, ops, with_host, Instance, IterKind, PKey, PyObj};
 use fusevm::{NumOp, Value, VM};
 use indexmap::IndexMap;
 
@@ -184,6 +184,13 @@ fn b_getlocal(vm: &mut VM, _: u8) -> Value {
     if name == "Ellipsis" {
         return with_host(|h| h.alloc(PyObj::Ellipsis));
     }
+    // `__debug__` is a builtin constant, not a module global: it resolves in
+    // every scope and every module, and it is False exactly when the
+    // interpreter is optimized. Leaving it unbound made the ordinary
+    // `if __debug__:` guard a NameError.
+    if name == "__debug__" {
+        return Value::Bool(host::optimize_level() == 0);
+    }
     if is_known_builtin(&name) || host::is_rust_ffi_name(&name) {
         return with_host(|h| h.builtin_object(&name));
     }
@@ -211,6 +218,13 @@ fn b_getglobal(vm: &mut VM, _: u8) -> Value {
     }
     if name == "Ellipsis" {
         return with_host(|h| h.alloc(PyObj::Ellipsis));
+    }
+    // `__debug__` is a builtin constant, not a module global: it resolves in
+    // every scope and every module, and it is False exactly when the
+    // interpreter is optimized. Leaving it unbound made the ordinary
+    // `if __debug__:` guard a NameError.
+    if name == "__debug__" {
+        return Value::Bool(host::optimize_level() == 0);
     }
     if is_known_builtin(&name) || host::is_rust_ffi_name(&name) {
         return with_host(|h| h.builtin_object(&name));
@@ -470,6 +484,13 @@ fn b_getitem(vm: &mut VM, _: u8) -> Value {
     }
     // `Cls[item]` on a class with `__class_getitem__` (e.g. generic aliases).
     if let Some(r) = host::class_getitem(&recv, idx.clone()) {
+        return finish(vm, r);
+    }
+    // A metaclass `__getitem__` makes the CLASS subscriptable and outranks any
+    // generic-alias reading: `class M(type): __getitem__` then `C[x]` runs
+    // `M.__getitem__(C, x)`, exactly as an instance's `__getitem__` would.
+    if let Some(m) = with_host(|h| h.metaclass_method(&recv, "__getitem__")) {
+        let r = host::invoke(&m, vec![recv.clone(), idx], vec![]);
         return finish(vm, r);
     }
     // dict-subclass `__missing__`: Counter → 0, defaultdict → default_factory().
@@ -1447,9 +1468,7 @@ fn iter_instance(v: &Value) -> Result<Value, String> {
         }
     }
     let items = host::iter_instance_items(v)?;
-    Ok(with_host(|h| {
-        h.alloc(PyObj::Iter(IterState::Seq { items, idx: 0 }))
-    }))
+    Ok(with_host(|h| h.new_iter_seq(items)))
 }
 
 /// `yield from` result: pop the delegated iterator and push the value it
@@ -4456,19 +4475,32 @@ pub fn call_builtin_function(
                             vec![],
                         )?);
                     }
-                    return Ok(with_host(|h| h.new_iter_seq(items)));
+                    // A `__len__`+`__getitem__` object gets CPython's generic
+                    // `reversed` object, not the sequence iterator.
+                    return Ok(with_host(|h| h.new_iter_kind(items, IterKind::Reversed)));
                 }
                 return Err(host::type_error(&format!(
                     "'{}' object is not reversible",
                     with_host(|h| h.type_name(&v))
                 )));
             }
+            // CPython gives `list` and the three dict views their own reverse
+            // iterator types; `range` reuses `range_iterator`; every other
+            // sequence gets the generic `reversed` object.
+            let kind = with_host(|h| match h.get(&v) {
+                Some(PyObj::List(_)) => IterKind::ListReverse,
+                Some(PyObj::Dict(_)) => IterKind::DictReverseKey,
+                Some(PyObj::DictView { .. }) => h.view_iter_kind(&v).reversed(),
+                Some(PyObj::Range { .. }) => IterKind::Range,
+                Some(PyObj::BigRange { .. }) => IterKind::LongRange,
+                _ => IterKind::Reversed,
+            });
             // `reversed` requires a known-length sequence (never infinite), so a
             // materialize-then-reverse is still lazy in the observable sense: the
             // result is a one-shot iterator (`next()` works, exhausts once).
             let mut items = host::iter_vec(&v)?;
             items.reverse();
-            Ok(with_host(|h| h.new_iter_seq(items)))
+            Ok(with_host(|h| h.new_iter_kind(items, kind)))
         }
         "enumerate" => {
             // Lazy: pairs `(index, value)` pulled on demand. `start=` kwarg or
@@ -4893,10 +4925,47 @@ pub fn call_builtin_function(
                     })
                 }));
             }
-            with_host(|h| h.make_iter(&v))
+            // CPython's `iter(x)`: `type(x).__iter__` wins and its result IS the
+            // iterator, handed back unchanged — an object whose `__iter__`
+            // returns `self` must keep its own identity and stay lazy, so it can
+            // never be drained into a snapshot here. Only a class with no
+            // `__iter__` falls back to the `__getitem__` sequence protocol, and a
+            // class with neither is not iterable even if it defines `__next__`.
+            let proto = with_host(|h| match h.get(&v) {
+                Some(PyObj::Instance(i)) => Some((
+                    h.class_lookup(&i.class, "__iter__").is_some(),
+                    h.class_lookup(&i.class, "__getitem__").is_some(),
+                )),
+                _ => None,
+            });
+            match proto {
+                Some((true, _)) => {
+                    let it = host::call_method(&v, "__iter__", vec![], vec![])?;
+                    if host::is_iterator(&it) {
+                        return Ok(it);
+                    }
+                    Err(host::type_error(&format!(
+                        "iter() returned non-iterator of type '{}'",
+                        with_host(|h| h.type_name(&it))
+                    )))
+                }
+                // The old-style protocol has no iterator object of its own, so
+                // CPython's `iterator` (`PySeqIter_Type`) wraps the indexing.
+                Some((false, true)) => {
+                    let items = host::iter_instance_items(&v)?;
+                    Ok(with_host(|h| h.new_iter_seq(items)))
+                }
+                _ => with_host(|h| h.make_iter(&v)),
+            }
         }
         "next" => {
             let it = arg0(&args)?;
+            if !host::is_iterator(&it) {
+                return Err(host::type_error(&format!(
+                    "'{}' object is not an iterator",
+                    with_host(|h| h.type_name(&it))
+                )));
+            }
             match host::iter_step(&it)? {
                 Some(v) => Ok(v),
                 None => match args.get(1) {
