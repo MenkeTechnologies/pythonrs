@@ -247,6 +247,23 @@ pub fn compile_interactive(stmts: &[Stmt]) -> Result<Program, String> {
 }
 
 fn compile_ex(stmts: &[Stmt], debug: bool, interactive: bool) -> Result<Program, String> {
+    // Private-name mangling: `self.__x` inside `class C` is `self._C__x`.
+    // CPython does this in the compiler, not the parser, and so does pythonrs —
+    // `ast.parse` must keep showing the name as written, and it reaches the same
+    // `parser::parse` without ever coming through here.
+    //
+    // `"_"` as the outermost class name mangles nothing (a class name that is
+    // all underscores has no prefix left to disambiguate with, so `mangle`
+    // declines), which is exactly right for module scope; the pass switches to
+    // the real name at each `ClassDef` it walks into.
+    let mut owned;
+    let stmts = if crate::mangle::has_class(stmts) {
+        owned = stmts.to_vec();
+        crate::mangle::mangle_body("_", &mut owned);
+        &owned[..]
+    } else {
+        stmts
+    };
     let mut c = Compiler {
         debug,
         interactive,

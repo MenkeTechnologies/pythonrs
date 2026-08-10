@@ -9889,16 +9889,22 @@ impl PyHost {
             // A user class without `__slots__` gives the instance a `__dict__`.
             let v = cd.ns.get("__slots__")?;
             any = true;
+            // A slot name is an identifier written inside the class body, so it
+            // mangles like one — against the class that DECLARED it, which is
+            // `c` here and not the instance's own class. `__slots__` itself
+            // keeps the name as written (CPython leaves the tuple alone and
+            // mangles only the descriptor it installs).
+            let mangle = |s: String| crate::mangle::mangle(&c, &s).unwrap_or(s);
             match self.get(v) {
                 Some(PyObj::List(items)) | Some(PyObj::Tuple(items)) => {
                     for it in items {
                         if let Some(s) = self.as_str(it) {
-                            slots.insert(s);
+                            slots.insert(mangle(s));
                         }
                     }
                 }
                 Some(PyObj::Str(s)) => {
-                    slots.insert(s.clone());
+                    slots.insert(mangle(s.clone()));
                 }
                 _ => {}
             }
@@ -12680,10 +12686,10 @@ pub fn fire_set_name(class_name: &str, ns: &IndexMap<String, Value>) -> Result<(
 ///    names class creation itself inserts (`__qualname__`, `__classcell__`,
 ///    `__classdictcell__`) are exempt.
 ///
-/// CPython mangles each slot name against the class name before the pass-2
-/// lookup; pythonrs has no private-name mangling anywhere, so a `__x` slot is
-/// compared as written (see BUGS.md).
-fn check_slots(ns: &IndexMap<String, Value>) -> Result<(), String> {
+/// Each slot name is mangled against the class name before the pass-2 lookup,
+/// so `__slots__ = ("__x",)` beside a `_C__x = 1` class variable is the
+/// collision CPython reports it as.
+fn check_slots(class: &str, ns: &IndexMap<String, Value>) -> Result<(), String> {
     let slots = match ns.get("__slots__") {
         Some(v) => v.clone(),
         None => return Ok(()),
@@ -12721,7 +12727,9 @@ fn check_slots(ns: &IndexMap<String, Value>) -> Result<(), String> {
                 ))
             }
             "__weakref__" => add_weak = true,
-            _ => names.push(name),
+            // Mangled here, not at the identifier check above: `__slots__ must
+            // be identifiers` is judged on the name as written.
+            _ => names.push(crate::mangle::mangle(class, &name).unwrap_or(name)),
         }
     }
     for name in names {
@@ -12752,7 +12760,7 @@ pub fn build_class(
         _ => return Err(type_error("internal: class body is not a function")),
     };
     let ns: IndexMap<String, Value> = run_class_body(name, body_func)?;
-    check_slots(&ns)?;
+    check_slots(name, &ns)?;
     // The effective metaclass: the explicit `metaclass=` if given, else the most
     // derived metaclass inherited from the bases (CPython rule). A user metaclass
     // constructs the class via `M(name, bases, namespace)` (firing `M.__new__`/

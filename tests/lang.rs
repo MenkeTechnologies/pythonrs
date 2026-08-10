@@ -6162,3 +6162,135 @@ fn missing_required_argument_raises_typeerror_instead_of_aborting() {
     assert_eq!(g("x = 'ab'.center(6, '.')", "x"), "'..ab..'");
     assert_eq!(g("x = list(filter(None, [0, 1, 2]))", "x"), "[1, 2]");
 }
+
+// Private-name mangling (CPython `_Py_Mangle`): every `__name` written inside a
+// class body compiles as `_Class__name`. Without it a subclass's `__x` aliases
+// its base's and the privacy guarantee is gone. Expected values are CPython
+// 3.14's for the same program.
+#[test]
+fn private_names_mangle_against_the_enclosing_class() {
+    // The attribute a method stores lands under the mangled key.
+    assert_eq!(
+        g(
+            "class C:\n\x20   def __init__(self): self.__x = 1\nx = C().__dict__",
+            "x"
+        ),
+        "{'_C__x': 1}"
+    );
+    // A class variable mangles, and the body still reads it back.
+    assert_eq!(
+        g(
+            "class D:\n\x20   __y = 2\n\x20   def get(self): return D.__y\n\
+             x = (sorted(n for n in D.__dict__ if 'y' in n), D().get())",
+            "x"
+        ),
+        "(['_D__y'], 2)"
+    );
+    // The AttributeError names the mangled attribute, as CPython's does.
+    assert_eq!(
+        g(
+            "class F:\n\x20   def m(self): return self.__missing\n\
+             try:\n\x20   F().m()\nexcept AttributeError as e:\n\x20   x = str(e)",
+            "x"
+        ),
+        "\"'F' object has no attribute '_F__missing'\""
+    );
+    // Leading underscores are stripped from the class name...
+    assert_eq!(
+        g(
+            "class _K:\n\x20   def __init__(self): self.__v = 1\nx = sorted(_K().__dict__)",
+            "x"
+        ),
+        "['_K__v']"
+    );
+    // ...including when the class name is itself dunder-ish.
+    assert_eq!(
+        g(
+            "class __L:\n\x20   def __init__(self): self.__v = 1\nx = sorted(__L().__dict__)",
+            "x"
+        ),
+        "['_L__v']"
+    );
+    // The INNERMOST enclosing class wins.
+    assert_eq!(
+        g(
+            "class M:\n\x20   class N:\n\x20       def __init__(self): self.__w = 1\n\
+             x = sorted(M.N().__dict__)",
+            "x"
+        ),
+        "['_N__w']"
+    );
+    // `global __g` inside a method declares the MANGLED global: the module
+    // never gains a plain `__g`, so code outside the class cannot reach it by
+    // the name the class wrote.
+    assert_eq!(
+        g(
+            "class P:\n\x20   def m(self):\n\x20       global __g\n\x20       __g = 42\n\
+             \x20       return __g\n\
+             r = P().m()\nx = (r, '_P__g' in globals(), _P__g, '__g' in globals())",
+            "x"
+        ),
+        "(42, True, 42, False)"
+    );
+}
+
+// The exemptions matter as much as the rule: mangling everything that starts
+// with two underscores would break every dunder in the language.
+#[test]
+fn mangling_skips_dunders_single_underscores_and_call_keywords() {
+    // `__x__` has two trailing underscores -> untouched. `__y_` has one -> mangled.
+    // `_z` has one leading -> untouched.
+    assert_eq!(
+        g(
+            "class J:\n\x20   def __init__(self):\n\x20       self.__x__ = 1\n\
+             \x20       self.__y_ = 2\n\x20       self._z = 3\nx = sorted(J().__dict__)",
+            "x"
+        ),
+        "['_J__y_', '__x__', '_z']"
+    );
+    // A CALL keyword is not an identifier reference, so it does not mangle.
+    assert_eq!(
+        g(
+            "class H:\n\x20   def m(self, **kw): return kw\nx = H().m(__k=1)",
+            "x"
+        ),
+        "{'__k': 1}"
+    );
+    // `__init__` itself still binds under its own name — the whole object
+    // protocol depends on dunders surviving the pass.
+    assert_eq!(
+        g(
+            "class Q:\n\x20   def __init__(self): self.v = 1\n\x20   def __len__(self): return 7\n\
+             x = (len(Q()), Q().v)",
+            "x"
+        ),
+        "(7, 1)"
+    );
+    // Nothing outside a class body mangles.
+    assert_eq!(g("__m = 5\nx = __m", "x"), "5");
+}
+
+// A slot name is an identifier in the class body, so it mangles for the
+// descriptor while `__slots__` keeps the name as written. Getting only one half
+// right makes a private slot unusable.
+#[test]
+fn slot_names_mangle_for_the_descriptor_but_not_in_the_tuple() {
+    assert_eq!(
+        g(
+            "class G:\n\x20   __slots__ = ('__s',)\n\x20   def __init__(self): self.__s = 9\n\
+             x = (G().__slots__, G()._G__s)",
+            "x"
+        ),
+        "(('__s',), 9)"
+    );
+    // And the mangled name is what the conflict check compares, so a `_G__x`
+    // class variable beside a `__x` slot is the collision CPython reports.
+    assert_eq!(
+        g(
+            "try:\n\x20   class C:\n\x20       __slots__ = ('__x',)\n\x20       _C__x = 1\n\
+             except ValueError as e:\n\x20   x = str(e)",
+            "x"
+        ),
+        "\"'_C__x' in __slots__ conflicts with class variable\""
+    );
+}

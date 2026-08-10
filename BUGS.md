@@ -9,6 +9,22 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **Private-name mangling.** Every `__name` written inside a class body now
+  compiles as `_Class__name` (CPython `_Py_Mangle`), so `C().__dict__` reads
+  `{'_C__x': 1}`, the `AttributeError` names `_F__missing`, and two classes in
+  one hierarchy can each keep a private `__x` without aliasing. The rewrite
+  (`src/mangle.rs`) runs in the compiler on the parsed AST, not in the parser —
+  `ast.parse` must keep showing the name as written, and it reaches the same
+  `parser::parse` without passing through `compile`. It covers attribute access,
+  plain names, `def`/`class` names, parameters, `global`/`nonlocal`, `import`
+  and `except ... as` bindings, and `match` captures; a CALL keyword
+  (`f(__k=1)`) is not an identifier reference and is left alone, as are `__x__`
+  and `_z`. Leading underscores are stripped from the class name (`_K` -> `_K__v`,
+  `__L` -> `_L__v`) and the innermost enclosing class wins. Slot names mangle for
+  the descriptor they install while `__slots__` keeps the tuple as written, so
+  `__slots__ = ('__x',)` beside a `_C__x = 1` class variable now raises
+  `ValueError: '_C__x' in __slots__ conflicts with class variable`. This changes
+  emitted bytecode, so `cache::SCHEMA` went to 49.
 - **`with` checks the context-manager protocol before entering.** The desugar
   called `ctx.__enter__()` directly, so a manager carrying only `__enter__` ran
   it *and the whole body* and only failed on the way out with
@@ -452,15 +468,6 @@ written.
 - **`memoryview` is not a context manager.** `with memoryview(b"ab"):` raises
   `AttributeError: 'memoryview' object has no attribute '__enter__'`; CPython's
   `memoryview` supports `with` (the exit releases the buffer).
-- **No private-name mangling.** `self.__x` inside `class C` stays `__x`; CPython
-  rewrites it to `_C__x` at compile time. So `C().__dict__` reads
-  `{'__x': 1}` where CPython gives `{'_C__x': 1}`, `dir()` lists `__x`, and the
-  `__slots__` conflict check compares the name as written — `__slots__ = ('__x',)`
-  next to a `_C__x = 1` class variable is accepted where CPython raises
-  `ValueError: '_C__x' in __slots__ conflicts with class variable`. A faithful fix
-  is a compile-time rewrite of every `__name` (not ending in `__`) inside a class
-  body, which has to cover attribute access, plain names, keyword arguments, and
-  `global`/`nonlocal` declarations.
 - **A mutable container read off a bridged CPython object is a fresh copy.** The
   marshaller converts a CPython `list`/`dict`/`set` to a native pythonrs value by
   value on every read, so the identity is not preserved and an in-place mutation
