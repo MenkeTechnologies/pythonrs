@@ -6013,6 +6013,11 @@ fn construct_int(args: &[Value]) -> Result<Value, String> {
         .get(1)
         .and_then(|b| with_host(|h| h.as_int(b)))
         .unwrap_or(10);
+    // `BigInt::parse_bytes` PANICS on a radix outside 2..=36, so an out-of-range
+    // base aborted the interpreter instead of raising.
+    if base != 0 && !(2..=36).contains(&base) {
+        return Err("ValueError: int() base must be >= 2 and <= 36, or 0".to_string());
+    }
     with_host(|h| match &v {
         Value::Int(n) => Ok(Value::Int(*n)),
         Value::Bool(b) => Ok(Value::Int(*b as i64)),
@@ -6038,13 +6043,26 @@ fn construct_int(args: &[Value]) -> Result<Value, String> {
         }
         Value::Obj(_) if matches!(h.get(&v), Some(PyObj::BigInt(_))) => Ok(v.clone()),
         _ => {
-            let s = h.as_str(&v).ok_or_else(|| {
-                host::type_error(&format!(
+            // A bytes-like argument is decoded latin-1 and parsed like a str —
+            // `int(b'12')` is 12 in CPython, and pythonrs rejected it as a bad
+            // argument type even though its own error message promised support.
+            let s = match h.get(&v) {
+                Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) => {
+                    b.iter().map(|&c| c as char).collect::<String>()
+                }
+                Some(PyObj::Memoryview { .. }) => {
+                    h.mv_bytes(&v).iter().map(|&c| c as char).collect::<String>()
+                }
+                _ => h.as_str(&v).ok_or_else(|| {
+                    host::type_error(&format!(
                     "int() argument must be a string, a bytes-like object or a real number, not '{}'",
                     h.type_name(&v)
                 ))
-            })?;
-            let orig = s.clone();
+                })?,
+            };
+            // CPython's message reprs the ARGUMENT, so a bytes literal shows as
+            // `b'x'`, not as the decoded text.
+            let orig_repr = h.repr_of(&v);
             let s = s.trim();
             let (neg, rest) = if let Some(r) = s.strip_prefix('-') {
                 (true, r)
@@ -6054,7 +6072,9 @@ fn construct_int(args: &[Value]) -> Result<Value, String> {
                 (false, s)
             };
             // Detect / strip a base prefix. base 0 → auto-detect from prefix.
+            let base_arg = base;
             let mut base = base;
+            let mut had_no_prefix = false;
             let body = if let Some(r) = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X"))
             {
                 if base == 0 {
@@ -6087,15 +6107,41 @@ fn construct_int(args: &[Value]) -> Result<Value, String> {
                 if base == 0 {
                     base = 10;
                 }
+                had_no_prefix = true;
                 rest
             };
-            let digits = body.replace('_', "");
-            let err =
-                || format!("ValueError: invalid literal for int() with base {base}: '{orig}'");
+            // CPython names the base the CALLER passed. Reporting the
+            // auto-detected one turned `int('010', 0)` into "with base 10".
+            let err = || {
+                format!("ValueError: invalid literal for int() with base {base_arg}: {orig_repr}")
+            };
+            let digits = strip_int_underscores(body, !had_no_prefix).ok_or_else(err)?;
             if digits.is_empty() {
                 return Err(err());
             }
-            match num_bigint::BigInt::parse_bytes(digits.as_bytes(), base as u32) {
+            // Base 0 means "read the prefix". Without one, a leading zero is only
+            // legal if the whole literal is zeros — `int('010', 0)` is a
+            // ValueError in CPython (it is `010`, an octal literal Python 3
+            // removed), while `int('00', 0)` is 0. pythonrs read it as decimal
+            // and returned 10.
+            if had_no_prefix && base_arg == 0 && digits.len() > 1 && digits.starts_with('0') {
+                if !digits.chars().all(|c| c == '0') {
+                    return Err(err());
+                }
+            }
+            // Every digit is converted through its Unicode DECIMAL value, not
+            // just ASCII: CPython accepts any `Nd` character, so `int('١٢')` is
+            // 12. `BigInt::parse_bytes` sees only ASCII, so those literals were
+            // rejected outright.
+            let mut ascii = String::with_capacity(digits.len());
+            for c in digits.chars() {
+                let d = int_digit_value(c).ok_or_else(err)?;
+                if d >= base as u32 {
+                    return Err(err());
+                }
+                ascii.push(char::from_digit(d, 36).unwrap_or('z'));
+            }
+            match num_bigint::BigInt::parse_bytes(ascii.as_bytes(), base as u32) {
                 Some(b) => {
                     let b = if neg { -b } else { b };
                     Ok(h.norm_big(b))
@@ -6104,6 +6150,52 @@ fn construct_int(args: &[Value]) -> Result<Value, String> {
             }
         }
     })
+}
+
+/// Remove the `_` separators from an integer literal, rejecting the placements
+/// CPython rejects. An underscore is legal only BETWEEN digits (and directly
+/// after a base prefix, which the caller has already stripped), so a leading,
+/// trailing or doubled one is an error. `None` = reject.
+///
+/// pythonrs deleted every underscore unconditionally, so `int('_1')`,
+/// `int('1_')` and `int('1__2')` all parsed where CPython raises.
+fn strip_int_underscores(body: &str, after_prefix: bool) -> Option<String> {
+    if body.ends_with('_') || body.contains("__") {
+        return None;
+    }
+    // `0x_10` is legal, `_1` is not: a leading underscore is only the separator
+    // that follows a base prefix.
+    let trimmed = match body.strip_prefix('_') {
+        Some(rest) if after_prefix => rest,
+        Some(_) => return None,
+        None => body,
+    };
+    Some(trimmed.replace('_', ""))
+}
+
+/// The numeric value of one `int()` digit: ASCII `0-9a-zA-Z` as usual, plus any
+/// Unicode DECIMAL character (`Nd`), which CPython accepts wherever its value
+/// fits the base — `int('١٢')` is 12 and `int('١٢', 16)` is 18.
+///
+/// Every `Nd` block is a contiguous run of exactly ten code points starting at
+/// zero, so the value is the distance back to the first non-`Nd` predecessor.
+fn int_digit_value(c: char) -> Option<u32> {
+    if let Some(d) = c.to_digit(36) {
+        return Some(d);
+    }
+    if !is_decimal_char(c) {
+        return None;
+    }
+    let start = c as u32;
+    for back in 0..10u32 {
+        let cur = char::from_u32(start - back)?;
+        let prev = start.checked_sub(back + 1).and_then(char::from_u32);
+        if !prev.is_some_and(is_decimal_char) || back == 9 {
+            let _ = cur;
+            return Some(back);
+        }
+    }
+    None
 }
 
 /// Parse a `complex()` string argument (`"1+2j"`, `"2j"`, `"-1-3j"`, `"(1+2j)"`,
@@ -8618,11 +8710,78 @@ fn call_time(f: &str, args: Vec<Value>) -> Result<Value, String> {
     }
 }
 
+/// CPython's `repr` of a float, for the `got <x>` tail of a math domain error
+/// (`-1.0`, `-inf`, `2.0`).
+fn math_arg_repr(x: f64) -> String {
+    with_host(|h| h.repr_of(&Value::Float(x)))
+}
+
+/// The `ValueError` CPython 3.14 raises for an out-of-domain `math` argument, or
+/// `None` when the call is in range. A NaN argument is always in range — CPython
+/// propagates it.
+fn math_domain_error(name: &str, x: f64, args: &[Value]) -> Option<String> {
+    if x.is_nan() {
+        return None;
+    }
+    let msg = match name {
+        "sqrt" if x < 0.0 => format!("expected a nonnegative input, got {}", math_arg_repr(x)),
+        "log" | "log2" | "log10" if x <= 0.0 => "expected a positive input".to_string(),
+        // `log(x, base)`: the BASE has the same domain as the value.
+        "log" => {
+            let base = args.get(1).and_then(as_f)?;
+            if base <= 0.0 && !base.is_nan() {
+                "expected a positive input".to_string()
+            } else {
+                return None;
+            }
+        }
+        "log1p" if x <= -1.0 => format!("expected argument value > -1, got {}", math_arg_repr(x)),
+        "asin" | "acos" if x.abs() > 1.0 => format!(
+            "expected a number in range from -1 up to 1, got {}",
+            math_arg_repr(x)
+        ),
+        "acosh" if x < 1.0 => format!(
+            "expected argument value not less than 1, got {}",
+            math_arg_repr(x)
+        ),
+        "atanh" if x.abs() >= 1.0 => format!(
+            "expected a number between -1 and 1, got {}",
+            math_arg_repr(x)
+        ),
+        // The gamma pole: every non-positive integer, and -inf.
+        "gamma" | "lgamma" if x <= 0.0 && (x.fract() == 0.0 || x == f64::NEG_INFINITY) => format!(
+            "expected a noninteger or positive integer, got {}",
+            math_arg_repr(x)
+        ),
+        _ => return None,
+    };
+    Some(format!("ValueError: {msg}"))
+}
+
+/// `OverflowError: math range error` when a FINITE argument produced an infinite
+/// result — CPython's `errno == ERANGE` check. An infinite argument legitimately
+/// gives an infinite result and passes through.
+fn math_range_checked(x: f64, out: f64) -> Result<Value, String> {
+    if out.is_infinite() && x.is_finite() {
+        return Err("OverflowError: math range error".to_string());
+    }
+    Ok(Value::Float(out))
+}
+
 fn call_math(name: &str, args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, String> {
     if let Some(spec) = math_arity(name) {
         check_arity(name, &format!("math.{name}"), spec, args.len())?;
     }
     let f0 = args.first().and_then(as_f).unwrap_or(0.0);
+    // Domain and range checks. Rust's `f64` methods answer NaN or an infinity
+    // where CPython raises, so every one of these used to return a value:
+    // `math.sqrt(-1)` was `nan`, `math.log(0)` was `-inf`, `math.exp(10000)` was
+    // `inf`. A NaN INPUT propagates without error in CPython, so each guard
+    // excludes it. The wordings are 3.14's, which replaced the flat
+    // "math domain error" of 3.9-3.13 for these functions.
+    if let Some(e) = math_domain_error(name, f0, args) {
+        return Err(e);
+    }
     match name {
         "sqrt" => Ok(Value::Float(f0.sqrt())),
         "floor" => Ok(with_host(|h| f64_to_int(h, f0.floor()))),
@@ -8670,22 +8829,22 @@ fn call_math(name: &str, args: &[Value], kwargs: &[(String, Value)]) -> Result<V
         "asin" => Ok(Value::Float(f0.asin())),
         "acos" => Ok(Value::Float(f0.acos())),
         "atan" => Ok(Value::Float(f0.atan())),
-        "sinh" => Ok(Value::Float(f0.sinh())),
-        "cosh" => Ok(Value::Float(f0.cosh())),
+        "sinh" => math_range_checked(f0, f0.sinh()),
+        "cosh" => math_range_checked(f0, f0.cosh()),
         "tanh" => Ok(Value::Float(f0.tanh())),
         "asinh" => Ok(Value::Float(f0.asinh())),
         "acosh" => Ok(Value::Float(f0.acosh())),
         "atanh" => Ok(Value::Float(f0.atanh())),
-        "exp" => Ok(Value::Float(f0.exp())),
-        "exp2" => Ok(Value::Float(f0.exp2())),
+        "exp" => math_range_checked(f0, f0.exp()),
+        "exp2" => math_range_checked(f0, f0.exp2()),
         "expm1" => Ok(Value::Float(f0.exp_m1())),
         "log2" => Ok(Value::Float(f0.log2())),
         "log10" => Ok(Value::Float(f0.log10())),
         "log1p" => Ok(Value::Float(f0.ln_1p())),
         // Special functions Rust std lacks — pure-Rust libm keeps `math`
         // self-contained (no C libm) on the no-libpython build.
-        "lgamma" => Ok(Value::Float(libm::lgamma(f0))),
-        "gamma" => Ok(Value::Float(libm::tgamma(f0))),
+        "lgamma" => math_range_checked(f0, libm::lgamma(f0)),
+        "gamma" => math_range_checked(f0, libm::tgamma(f0)),
         "erf" => Ok(Value::Float(libm::erf(f0))),
         "erfc" => Ok(Value::Float(libm::erfc(f0))),
         "cbrt" => Ok(Value::Float(f0.cbrt())),
@@ -8701,7 +8860,14 @@ fn call_math(name: &str, args: &[Value], kwargs: &[(String, Value)]) -> Result<V
         }
         "hypot" => {
             // CPython 3.8+ `hypot(*coords)` — Euclidean norm of any number of args.
-            let sumsq: f64 = args.iter().filter_map(as_f).map(|c| c * c).sum();
+            // IEEE-754 hypot: an INFINITE coordinate gives infinity even when
+            // another is NaN. Squaring and summing propagated the NaN instead,
+            // so `hypot(inf, nan)` was `nan` where CPython gives `inf`.
+            let coords: Vec<f64> = args.iter().filter_map(as_f).collect();
+            if coords.iter().any(|c| c.is_infinite()) {
+                return Ok(Value::Float(f64::INFINITY));
+            }
+            let sumsq: f64 = coords.iter().map(|c| c * c).sum();
             Ok(Value::Float(sumsq.sqrt()))
         }
         "copysign" => {
@@ -8729,6 +8895,11 @@ fn call_math(name: &str, args: &[Value], kwargs: &[(String, Value)]) -> Result<V
         }
         "log" => {
             let base = args.get(1).and_then(as_f);
+            // `log(x, 1)` divides by `ln(1) == 0`; CPython reports the division,
+            // not a domain error.
+            if base == Some(1.0) {
+                return Err("ZeroDivisionError: division by zero".to_string());
+            }
             Ok(Value::Float(match base {
                 Some(b) => f0.log(b),
                 None => f0.ln(),
@@ -8736,7 +8907,16 @@ fn call_math(name: &str, args: &[Value], kwargs: &[(String, Value)]) -> Result<V
         }
         "pow" => {
             let e = args.get(1).and_then(as_f).unwrap_or(0.0);
-            Ok(Value::Float(f0.powf(e)))
+            // `math.pow` keeps the flat "math domain error" wording in 3.14 —
+            // only the single-argument functions were reworded. Two cases:
+            // a zero base with a negative exponent, and a negative base with a
+            // non-integral exponent.
+            let domain = (f0 == 0.0 && e < 0.0 && e.is_finite())
+                || (f0 < 0.0 && e.is_finite() && e.fract() != 0.0);
+            if domain {
+                return Err("ValueError: math domain error".to_string());
+            }
+            math_range_checked(f0, f0.powf(e))
         }
         "gcd" => {
             // `math.gcd(*integers)` — arbitrary count (CPython 3.9+) and
@@ -10551,18 +10731,23 @@ fn str_prefixes(v: &Value) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
-/// Whitespace split for `str.split(None, maxsplit)` / `rsplit`. Runs of Unicode
-/// whitespace (`char::is_whitespace`, matching the `split_whitespace` used
-/// elsewhere) separate fields; no empty fields; leading/trailing whitespace is
-/// dropped. On hitting `maxsplit` the remainder becomes one field (leading
-/// whitespace skipped for forward, trailing preserved; the mirror for reverse).
+/// Whitespace split for `str.split(None, maxsplit)` / `rsplit`. Runs of Python
+/// whitespace ([`is_py_space`]) separate fields; no empty fields;
+/// leading/trailing whitespace is dropped. On hitting `maxsplit` the remainder
+/// becomes one field (leading whitespace skipped for forward, trailing
+/// preserved; the mirror for reverse).
+///
+/// The predicate is Python's, not Rust's: `char::is_whitespace` omits the four
+/// ASCII information separators U+001C..U+001F that CPython counts as
+/// whitespace, so `'a\x1cb'.split()` returned one field where CPython returns
+/// two. `is_py_space` already existed and was wired only to `str.isspace`.
 fn split_ws_str(s: &str, maxsplit: i64, reverse: bool) -> Vec<String> {
     let mut parts: Vec<String> = Vec::new();
     if reverse {
         let mut rest = s;
         let mut splits = 0;
         loop {
-            let trimmed = rest.trim_end_matches(char::is_whitespace);
+            let trimmed = rest.trim_end_matches(is_py_space);
             if trimmed.is_empty() {
                 break;
             }
@@ -10570,7 +10755,7 @@ fn split_ws_str(s: &str, maxsplit: i64, reverse: bool) -> Vec<String> {
                 parts.push(trimmed.to_string());
                 break;
             }
-            match trimmed.rfind(char::is_whitespace) {
+            match trimmed.rfind(is_py_space) {
                 Some(idx) => {
                     let after = idx + trimmed[idx..].chars().next().unwrap().len_utf8();
                     parts.push(trimmed[after..].to_string());
@@ -10588,7 +10773,7 @@ fn split_ws_str(s: &str, maxsplit: i64, reverse: bool) -> Vec<String> {
         let mut rest = s;
         let mut splits = 0;
         loop {
-            let trimmed = rest.trim_start_matches(char::is_whitespace);
+            let trimmed = rest.trim_start_matches(is_py_space);
             if trimmed.is_empty() {
                 break;
             }
@@ -10596,7 +10781,7 @@ fn split_ws_str(s: &str, maxsplit: i64, reverse: bool) -> Vec<String> {
                 parts.push(trimmed.to_string());
                 break;
             }
-            match trimmed.find(char::is_whitespace) {
+            match trimmed.find(is_py_space) {
                 Some(idx) => {
                     parts.push(trimmed[..idx].to_string());
                     rest = &trimmed[idx..];
@@ -11043,7 +11228,9 @@ fn strip_str(s: &str, args: &[Value], mode: u8) -> String {
     let chars: Option<String> = with_host(|h| args.first().and_then(|v| h.as_str(v)));
     let pred = |c: char| match &chars {
         Some(set) => set.contains(c),
-        None => c.is_whitespace(),
+        // Python's whitespace set, not Rust's — see `is_py_space`. With
+        // `char::is_whitespace` here, `'\x1c\x1d'.strip()` stripped nothing.
+        None => is_py_space(c),
     };
     let out = match mode {
         1 => s.trim_start_matches(pred),

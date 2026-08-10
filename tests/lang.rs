@@ -7118,3 +7118,201 @@ fn key_error_carries_the_bare_key_as_its_argument() {
         assert_eq!(g(&prog, "text"), py_quoted(want_str), "str for {src}");
     }
 }
+
+/// Rust primitives that carry the reference's NAME but not its behaviour.
+///
+/// Each row is a place where a Rust `f64`/`str`/parse method was wired to a
+/// Python builtin of the same name. The Rust method type-checks, returns a
+/// plausible value, and is wrong — nothing in the build can see it, and the
+/// probe that catches it has to compare against the reference.
+///
+/// Expected values are CPython 3.14.6's, captured with `python3 -c`.
+#[test]
+fn rust_lookalikes_do_not_stand_in_for_the_reference_semantics() {
+    // `f64::sqrt`/`ln`/`asin`/… answer NaN or an infinity where CPython raises.
+    // Every one of these used to return a value.
+    let raises: &[(&str, &str)] = &[
+        (
+            "import math\nmath.sqrt(-1)",
+            "ValueError: expected a nonnegative input, got -1.0",
+        ),
+        (
+            "import math\nmath.sqrt(float('-inf'))",
+            "ValueError: expected a nonnegative input, got -inf",
+        ),
+        (
+            "import math\nmath.log(0)",
+            "ValueError: expected a positive input",
+        ),
+        (
+            "import math\nmath.log(-1)",
+            "ValueError: expected a positive input",
+        ),
+        (
+            "import math\nmath.log10(0)",
+            "ValueError: expected a positive input",
+        ),
+        (
+            "import math\nmath.log2(0)",
+            "ValueError: expected a positive input",
+        ),
+        // The BASE has the same domain as the value…
+        (
+            "import math\nmath.log(8, 0)",
+            "ValueError: expected a positive input",
+        ),
+        // …and base 1 divides by ln(1), which CPython reports as the division.
+        (
+            "import math\nmath.log(8, 1)",
+            "ZeroDivisionError: division by zero",
+        ),
+        (
+            "import math\nmath.log1p(-1)",
+            "ValueError: expected argument value > -1, got -1.0",
+        ),
+        (
+            "import math\nmath.asin(2)",
+            "ValueError: expected a number in range from -1 up to 1, got 2.0",
+        ),
+        (
+            "import math\nmath.acos(2)",
+            "ValueError: expected a number in range from -1 up to 1, got 2.0",
+        ),
+        (
+            "import math\nmath.acosh(0)",
+            "ValueError: expected argument value not less than 1, got 0.0",
+        ),
+        (
+            "import math\nmath.atanh(1)",
+            "ValueError: expected a number between -1 and 1, got 1.0",
+        ),
+        (
+            "import math\nmath.gamma(0)",
+            "ValueError: expected a noninteger or positive integer, got 0.0",
+        ),
+        (
+            "import math\nmath.lgamma(-1)",
+            "ValueError: expected a noninteger or positive integer, got -1.0",
+        ),
+        // `math.pow` keeps the flat wording — only the one-argument functions
+        // were reworded in 3.14, and copying the new text here would be a
+        // fabrication of its own.
+        (
+            "import math\nmath.pow(0.0, -1)",
+            "ValueError: math domain error",
+        ),
+        (
+            "import math\nmath.pow(-1.0, 0.5)",
+            "ValueError: math domain error",
+        ),
+        // A finite argument that overflows to infinity is a RANGE error.
+        (
+            "import math\nmath.exp(10000)",
+            "OverflowError: math range error",
+        ),
+        (
+            "import math\nmath.exp2(10000)",
+            "OverflowError: math range error",
+        ),
+        (
+            "import math\nmath.cosh(10000)",
+            "OverflowError: math range error",
+        ),
+        (
+            "import math\nmath.gamma(1e300)",
+            "OverflowError: math range error",
+        ),
+        // `BigInt::parse_bytes` PANICS outside radix 2..=36 — this aborted the
+        // whole interpreter rather than raising.
+        (
+            "int('12', 40)",
+            "ValueError: int() base must be >= 2 and <= 36, or 0",
+        ),
+        (
+            "int('12', 1)",
+            "ValueError: int() base must be >= 2 and <= 36, or 0",
+        ),
+        // `str::replace('_', "")` deleted underscores CPython rejects.
+        (
+            "int('_1')",
+            "ValueError: invalid literal for int() with base 10: '_1'",
+        ),
+        (
+            "int('1_')",
+            "ValueError: invalid literal for int() with base 10: '1_'",
+        ),
+        (
+            "int('1__2')",
+            "ValueError: invalid literal for int() with base 10: '1__2'",
+        ),
+        // Base 0 means "read the prefix"; a leading zero without one is the
+        // Python-2 octal spelling and is rejected. The message names the base as
+        // PASSED, not the auto-detected one.
+        (
+            "int('010', 0)",
+            "ValueError: invalid literal for int() with base 0: '010'",
+        ),
+        (
+            "int(b'x')",
+            "ValueError: invalid literal for int() with base 10: b'x'",
+        ),
+        // …and a non-DECIMAL numeric (Nl `Ⅰ`, No `²`) is still not a digit, so
+        // widening to "any numeric character" would be its own wrong answer.
+        (
+            "int('\u{2160}', 16)",
+            "ValueError: invalid literal for int() with base 16: '\u{2160}'",
+        ),
+        (
+            "int('\u{00b2}')",
+            "ValueError: invalid literal for int() with base 10: '\u{00b2}'",
+        ),
+    ];
+    for (src, want) in raises {
+        assert_eq!(&eval_str(src).expect_err("must raise"), want, "for {src:?}");
+    }
+
+    // Values, not errors. A NaN ARGUMENT propagates through the domain guards
+    // rather than tripping them, so adding the guards must not have made these
+    // raise.
+    let values: &[(&str, &str)] = &[
+        ("import math\nx = math.sqrt(float('nan'))", "nan"),
+        ("import math\nx = math.asin(float('nan'))", "nan"),
+        ("import math\nx = math.log(float('inf'))", "inf"),
+        ("import math\nx = math.gamma(float('inf'))", "inf"),
+        ("import math\nx = math.exp(float('inf'))", "inf"),
+        ("import math\nx = math.exp(-10000)", "0.0"),
+        ("import math\nx = math.sqrt(4)", "2.0"),
+        ("import math\nx = math.log(8, 2)", "3.0"),
+        // IEEE-754 hypot: an infinite coordinate wins over a NaN one. Squaring
+        // and summing propagated the NaN instead.
+        (
+            "import math\nx = math.hypot(float('inf'), float('nan'))",
+            "inf",
+        ),
+        ("import math\nx = math.hypot(3, 4)", "5.0"),
+        // `char::is_whitespace` omits U+001C..U+001F, which CPython counts as
+        // whitespace for str (but NOT for bytes, which is ASCII-only).
+        ("x = '\\x1c\\x1d'.lstrip()", "''"),
+        (
+            "x = '\\x0b\\x0c\\x1c\\x1d\\x1e\\x85\\xa0 y '.strip()",
+            "'y'",
+        ),
+        ("x = 'a\\x1cb'.split()", "['a', 'b']"),
+        ("x = 'a\\x1cb'.rsplit()", "['a', 'b']"),
+        ("x = '  a\\x1cb  '.split(None, 1)", "['a', 'b  ']"),
+        ("x = b'a\\x1cb'.split()", "[b'a\\x1cb']"),
+        // Any Unicode DECIMAL character is a digit to `int()`; `to_digit` sees
+        // only ASCII, so these were rejected outright.
+        ("x = int('\\u0661\\u0662')", "12"),
+        ("x = int('\\u0661\\u0662', 16)", "18"),
+        ("x = int('\\u0661\\u0660', 2)", "2"),
+        ("x = int(b'12')", "12"),
+        ("x = int(bytearray(b'ff'), 16)", "255"),
+        ("x = int(memoryview(b'12'))", "12"),
+        ("x = int('0x_10', 16)", "16"),
+        ("x = int('00', 0)", "0"),
+    ];
+    for (src, want) in values {
+        assert_eq!(&g(src, "x"), want, "for {src:?}");
+    }
+}
