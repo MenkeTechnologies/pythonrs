@@ -6907,3 +6907,214 @@ fn slot_names_mangle_for_the_descriptor_but_not_in_the_tuple() {
         "\"'_C__x' in __slots__ conflicts with class variable\""
     );
 }
+
+/// Diagnostics whose wording was transcribed from memory or an older CPython.
+///
+/// Each row was classified by running the same probe under CPython 3.9.25,
+/// 3.10.20, 3.11.15, 3.12.13, 3.13.15 and 3.14.6 and asking two questions: does
+/// 3.14.6 produce this today, and did ANY of those six ever produce it. A row
+/// marked `fabricated` failed the second question — the text was in the
+/// implementation source but in no CPython. `stale` matched an older release.
+///
+/// Expected values are 3.14.6's, captured with `python3 -c`.
+#[test]
+fn diagnostics_match_the_reference_wording() {
+    let cases: &[(&str, &str)] = &[
+        // fabricated: "re-raise" is hyphenated in no CPython 3.9-3.14.
+        ("raise", "RuntimeError: No active exception to reraise"),
+        // fabricated: borrowed factorial's message for a function that reports
+        // WHICH parameter was negative.
+        (
+            "import math\nmath.comb(-1, 2)",
+            "ValueError: n must be a non-negative integer",
+        ),
+        (
+            "import math\nmath.comb(2, -1)",
+            "ValueError: k must be a non-negative integer",
+        ),
+        (
+            "import math\nmath.perm(-1, 2)",
+            "ValueError: n must be a non-negative integer",
+        ),
+        // …but factorial really does word it that way; do not unify them.
+        (
+            "import math\nmath.factorial(-1)",
+            "ValueError: factorial() not defined for negative values",
+        ),
+        // fabricated: echoed the offending string, which CPython never does.
+        (
+            "float.fromhex('zzz')",
+            "ValueError: invalid hexadecimal floating-point string",
+        ),
+        // fabricated: a TypeError for arguments of the right type.
+        (
+            "'ab'.maketrans('ab', 'c')",
+            "ValueError: the first two maketrans arguments must have equal length",
+        ),
+        // …and bytes.maketrans genuinely words it differently. Verified, not a
+        // copy-paste of the line above.
+        (
+            "bytes.maketrans(b'ab', b'c')",
+            "ValueError: maketrans arguments must have same length",
+        ),
+        // fabricated: the generic operand-type message for a sequence repeat.
+        (
+            "'a' * 'b'",
+            "TypeError: can't multiply sequence by non-int of type 'str'",
+        ),
+        (
+            "[1] * [2]",
+            "TypeError: can't multiply sequence by non-int of type 'list'",
+        ),
+        (
+            "'a' * None",
+            "TypeError: can't multiply sequence by non-int of type 'NoneType'",
+        ),
+        // …and a non-sequence still gets the generic one.
+        (
+            "1 * None",
+            "TypeError: unsupported operand type(s) for *: 'int' and 'NoneType'",
+        ),
+        // fabricated: dropped the code point and the index in the template.
+        (
+            "'%z' % 1",
+            "ValueError: unsupported format character 'z' (0x7a) at index 1",
+        ),
+        (
+            "'ab%q' % 1",
+            "ValueError: unsupported format character 'q' (0x71) at index 3",
+        ),
+        (
+            "b'%z' % 1",
+            "ValueError: unsupported format character 'z' (0x7a) at index 1",
+        ),
+        // fabricated: named neither the item index nor the offending type.
+        (
+            "','.join([1])",
+            "TypeError: sequence item 0: expected str instance, int found",
+        ),
+        (
+            "','.join(['a', 2])",
+            "TypeError: sequence item 1: expected str instance, int found",
+        ),
+        // stale (3.9/3.10): 3.11 added the offending type.
+        (
+            "'abc'['a']",
+            "TypeError: string indices must be integers, not 'str'",
+        ),
+        // stale (3.9/3.10): 3.11 named the method, like list/tuple/deque.
+        (
+            "range(3).index(9)",
+            "ValueError: range.index(x): x not in range",
+        ),
+        // stale (3.9-3.11): 3.12 added the surplus count…
+        (
+            "a, b = [1, 2, 3]",
+            "ValueError: too many values to unpack (expected 2, got 3)",
+        ),
+        (
+            "a, b = (1, 2, 3)",
+            "ValueError: too many values to unpack (expected 2, got 3)",
+        ),
+        (
+            "a, b = {1: 0, 2: 0, 3: 0}",
+            "ValueError: too many values to unpack (expected 2, got 3)",
+        ),
+        // …but ONLY for an exact list/tuple/dict. A str, set, range, generator
+        // or list SUBCLASS keeps the bare form, and adding the count everywhere
+        // would be its own fabrication.
+        (
+            "a, b = 'xyz'",
+            "ValueError: too many values to unpack (expected 2)",
+        ),
+        (
+            "a, b = {1, 2, 3}",
+            "ValueError: too many values to unpack (expected 2)",
+        ),
+        (
+            "a, b = range(3)",
+            "ValueError: too many values to unpack (expected 2)",
+        ),
+        (
+            "a, b = iter([1, 2, 3])",
+            "ValueError: too many values to unpack (expected 2)",
+        ),
+        (
+            "class L(list): pass\na, b = L([1, 2, 3])",
+            "ValueError: too many values to unpack (expected 2)",
+        ),
+        // fabricated: the star form never reported what it got.
+        (
+            "a, b, *c = []",
+            "ValueError: not enough values to unpack (expected at least 2, got 0)",
+        ),
+        // the non-star short form always reports it, for every iterable.
+        (
+            "a, b = 'x'",
+            "ValueError: not enough values to unpack (expected 2, got 1)",
+        ),
+        // fabricated: reported `'type' object`, never naming WHICH type.
+        (
+            "str.nonesuch",
+            "AttributeError: type object 'str' has no attribute 'nonesuch'",
+        ),
+        (
+            "int.nonesuch",
+            "AttributeError: type object 'int' has no attribute 'nonesuch'",
+        ),
+        // …an instance still reports its own type, not `type object`.
+        (
+            "(1).nonesuch",
+            "AttributeError: 'int' object has no attribute 'nonesuch'",
+        ),
+    ];
+    for (src, want) in cases {
+        assert_eq!(&eval_str(src).expect_err("must raise"), want, "for {src:?}");
+    }
+}
+
+/// `KeyError.__str__` reprs its single argument, so a message built by hand with
+/// the quotes ALREADY in it gets re-quoted: `str(e)` came out as
+/// `"'pop from an empty set'"` and `e.args` held the quoted text. Three sites
+/// built the string that way and a fourth omitted the quotes entirely, so its
+/// uncaught line was missing them. All four now go through `key_error`, which
+/// stores the bare key.
+///
+/// The traceback line and `str(e)` disagree for a `KeyError` — that is the point
+/// of the repr — so both are pinned, against CPython 3.14.6.
+#[test]
+fn key_error_carries_the_bare_key_as_its_argument() {
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "set().pop()",
+            "('pop from an empty set',)",
+            "'pop from an empty set'",
+        ),
+        (
+            "{}.popitem()",
+            "('popitem(): dictionary is empty',)",
+            "'popitem(): dictionary is empty'",
+        ),
+        ("'{a}'.format()", "('a',)", "'a'"),
+        ("{}['k']", "('k',)", "'k'"),
+        // A non-string key is stored, and repr'd, as itself.
+        ("{1: 2}[3]", "(3,)", "3"),
+    ];
+    // `g` returns the value's PYTHON repr, which prefers single quotes and
+    // switches to double only when the text itself contains an apostrophe —
+    // exactly the case for the `KeyError` args, whose repr is already quoted.
+    fn py_quoted(s: &str) -> String {
+        if s.contains('\'') && !s.contains('"') {
+            format!("\"{s}\"")
+        } else {
+            format!("'{s}'")
+        }
+    }
+    for (src, want_args, want_str) in cases {
+        let prog = format!(
+            "try:\n    {src}\nexcept KeyError as e:\n    args = repr(e.args)\n    text = str(e)\n"
+        );
+        assert_eq!(g(&prog, "args"), py_quoted(want_args), "args for {src}");
+        assert_eq!(g(&prog, "text"), py_quoted(want_str), "str for {src}");
+    }
+}

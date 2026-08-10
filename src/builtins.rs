@@ -1732,7 +1732,9 @@ fn b_reraise(vm: &mut VM, _: u8) -> Value {
     };
     match msg {
         Some(m) => abort(vm, m),
-        None => abort(vm, "RuntimeError: No active exception to re-raise".into()),
+        // CPython spells this "reraise", unhyphenated, in every version from
+        // 3.9 through 3.14.6.
+        None => abort(vm, "RuntimeError: No active exception to reraise".into()),
     }
 }
 
@@ -2667,6 +2669,24 @@ fn b_import_star(vm: &mut VM, _: u8) -> Value {
 
 // ── unpack ───────────────────────────────────────────────────────────────────
 
+/// Whether a too-many-values unpack error names the surplus count. True for an
+/// exact `list`, `tuple` or `dict`; false for every other iterable, including
+/// subclasses of those three. Measured against CPython 3.14.6.
+fn unpack_reports_length(v: &Value) -> bool {
+    with_host(|h| {
+        // A subclass instance carries its payload behind `PyObj::Instance`, so
+        // matching on the payload shape alone would wrongly treat
+        // `class L(list)` as an exact list.
+        if let Some(PyObj::Instance(_)) = h.get(v) {
+            return false;
+        }
+        matches!(
+            h.get(v),
+            Some(PyObj::List(_)) | Some(PyObj::Tuple(_)) | Some(PyObj::Dict(_))
+        )
+    })
+}
+
 fn b_unpack(vm: &mut VM, _: u8) -> Value {
     let star_idx = match vm.pop() {
         Value::Int(n) => n,
@@ -2691,6 +2711,16 @@ fn b_unpack(vm: &mut VM, _: u8) -> Value {
                     "ValueError: not enough values to unpack (expected {count}, got {})",
                     items.len()
                 )
+            } else if unpack_reports_length(&iterable) {
+                // CPython appends the surplus count only when the right-hand
+                // side is an EXACT list, tuple or dict — the shapes whose length
+                // it knows without draining an iterator. A str, set, range,
+                // generator or even a list SUBCLASS gets the bare form; matching
+                // that distinction is what keeps `a, b = 'xyz'` byte-identical.
+                format!(
+                    "ValueError: too many values to unpack (expected {count}, got {})",
+                    items.len()
+                )
             } else {
                 format!("ValueError: too many values to unpack (expected {count})")
             };
@@ -2705,8 +2735,9 @@ fn b_unpack(vm: &mut VM, _: u8) -> Value {
             return abort(
                 vm,
                 format!(
-                    "ValueError: not enough values to unpack (expected at least {})",
-                    before + after
+                    "ValueError: not enough values to unpack (expected at least {}, got {})",
+                    before + after,
+                    items.len()
                 ),
             );
         }
@@ -8829,10 +8860,14 @@ fn call_math(name: &str, args: &[Value], kwargs: &[(String, Value)]) -> Result<V
                 }
                 None => n.clone(), // perm(n) == perm(n, n) == n!
             };
-            if n.sign() == num_bigint::Sign::Minus || k.sign() == num_bigint::Sign::Minus {
-                return Err(format!(
-                    "ValueError: {name}() not defined for negative values"
-                ));
+            // CPython reports WHICH argument was negative and never names the
+            // function here — `{name}() not defined for negative values` is
+            // `factorial`'s message, borrowed for a function that does not use it.
+            if n.sign() == num_bigint::Sign::Minus {
+                return Err("ValueError: n must be a non-negative integer".to_string());
+            }
+            if k.sign() == num_bigint::Sign::Minus {
+                return Err("ValueError: k must be a non-negative integer".to_string());
             }
             if k > n {
                 return Ok(Value::Int(0));
@@ -10810,11 +10845,16 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             })?;
             let items = host::iter_vec(seq)?;
             let mut strs = Vec::new();
-            for it in items {
-                strs.push(
-                    with_host(|h| h.as_str(&it))
-                        .ok_or_else(|| host::type_error("sequence item: expected str instance"))?,
-                );
+            for (n, it) in items.iter().enumerate() {
+                // CPython names WHICH item failed and what it was; the bare
+                // "sequence item: expected str instance" is not a message any
+                // CPython produces.
+                strs.push(with_host(|h| h.as_str(it)).ok_or_else(|| {
+                    host::type_error(&format!(
+                        "sequence item {n}: expected str instance, {} found",
+                        with_host(|h| h.type_name(it))
+                    ))
+                })?);
             }
             Ok(new_str(strs.join(&s)))
         }
@@ -11160,9 +11200,11 @@ fn str_maketrans(args: &[Value]) -> Result<Value, String> {
     let xs: Vec<char> = x.chars().collect();
     let ys: Vec<char> = y.chars().collect();
     if xs.len() != ys.len() {
-        return Err(host::type_error(
-            "the first two maketrans arguments must have equal length",
-        ));
+        // A ValueError in CPython, not a TypeError — the arguments are the right
+        // TYPE, they just disagree on length.
+        return Err(
+            "ValueError: the first two maketrans arguments must have equal length".to_string(),
+        );
     }
     for (a, b) in xs.iter().zip(ys.iter()) {
         let ord = *a as i64;
@@ -11557,7 +11599,12 @@ fn resolve_format_arg(
             .iter()
             .find(|(k, _)| *k == base)
             .map(|(_, v)| v.clone())
-            .ok_or_else(|| format!("KeyError: '{base}'"))?
+            .ok_or_else(|| {
+                with_host(|h| {
+                    let k = h.new_str(base);
+                    h.key_error(&k)
+                })
+            })?
     };
     // Accessor chain.
     while i < nchars.len() {
@@ -12026,7 +12073,10 @@ fn dict_method(
             });
             match got {
                 Some((k, v)) => Ok(with_host(|h| h.new_tuple(vec![k, v]))),
-                None => Err("KeyError: popitem(): dictionary is empty".into()),
+                None => Err(with_host(|h| {
+                    let s = h.new_str("popitem(): dictionary is empty");
+                    h.key_error(&s)
+                })),
             }
         }
         _ => Err(format!(
@@ -12249,7 +12299,14 @@ fn set_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             if let Some(PyObj::Set(s)) = h.get_mut(recv) {
                 match s.pop() {
                     Some((_, v)) => Ok(v),
-                    None => Err("KeyError: 'pop from an empty set'".into()),
+                    // Built through `key_error` so `.args` holds the bare
+                    // message. Baking the quotes into the literal made the arg
+                    // `"'pop from an empty set'"`, and `KeyError.__str__` reprs
+                    // its arg, so `str(e)` came out double-quoted.
+                    None => {
+                        let s = h.new_str("pop from an empty set");
+                        Err(h.key_error(&s))
+                    }
                 }
             } else {
                 Err(host::type_error("not a set"))
@@ -12481,10 +12538,12 @@ fn range_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, Strin
         "count" => Ok(Value::Int(if pos.is_some() { 1 } else { 0 })),
         "index" => match pos {
             Some(k) => Ok(Value::Int(k)),
-            None => Err(format!(
-                "ValueError: {} is not in range",
-                with_host(|h| h.repr_of(&arg))
-            )),
+            // CPython 3.11 changed this to name the method, matching
+            // `list.index(x): x not in list`; the old bare form is 3.9/3.10's.
+            None => {
+                let _ = with_host(|h| h.repr_of(&arg));
+                Err("ValueError: range.index(x): x not in range".to_string())
+            }
         },
         _ => Err(format!(
             "AttributeError: 'range' object has no attribute '{name}'"
@@ -12888,7 +12947,9 @@ fn int_to_bytes(recv: &Value, args: &[Value], kwargs: &[(String, Value)]) -> Res
 /// words. The value `mantissa * 2^exp` is formed exactly as a big rational and
 /// rounded once to the nearest `f64`, matching CPython's correct rounding.
 fn float_fromhex(s: &str) -> Result<f64, String> {
-    let err = || format!("ValueError: invalid hexadecimal floating-point string: {s}");
+    // CPython names no offending string here; appending `: {s}` produced a
+    // message no version emits.
+    let err = || "ValueError: invalid hexadecimal floating-point string".to_string();
     let t = s.trim();
     let low = t.to_ascii_lowercase();
     let (neg, rest) = match low.strip_prefix('-') {
@@ -14211,6 +14272,9 @@ fn bytes_maketrans(args: &[Value]) -> Result<Value, String> {
         .and_then(as_bytes_object)
         .ok_or_else(|| host::type_error("a bytes-like object is required"))?;
     if frm.len() != to.len() {
+        // `bytes.maketrans` really does word this differently from
+        // `str.maketrans` ("same length" vs "equal length", no "first two"),
+        // verified against python3 3.14.6 — do not unify the two.
         return Err("ValueError: maketrans arguments must have same length".into());
     }
     let mut table: Vec<u8> = (0..=255).collect();

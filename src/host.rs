@@ -5868,6 +5868,18 @@ impl PyHost {
                         return Ok(self.alloc(PyObj::Complex(ar * br - ai * bi, ar * bi + ai * br)));
                     }
                 }
+                // A SEQUENCE on either side gets CPython's sequence-specific
+                // message, which names the non-int operand's type; the generic
+                // `unsupported operand type(s) for *` is what CPython says only
+                // when neither side is a sequence.
+                for (seq, other) in [(a, b), (b, a)] {
+                    if self.is_sequence_for_repeat(seq) {
+                        return Err(type_error(&format!(
+                            "can't multiply sequence by non-int of type '{}'",
+                            self.type_name(other)
+                        )));
+                    }
+                }
                 Err(self.optype_err("*", a, b))
             }
             Div => self.binop(binop::DIV, a, b),
@@ -5890,6 +5902,20 @@ impl PyHost {
             Ne => Ok(Value::Bool(!self.equal(a, b))),
             Lt | Gt | Le | Ge => self.compare(op, a, b),
         }
+    }
+
+    /// Whether `v` is one of the built-in sequences `*` repeats — the receivers
+    /// for which CPython raises `can't multiply sequence by non-int` instead of
+    /// the generic operand-type message.
+    fn is_sequence_for_repeat(&self, v: &Value) -> bool {
+        matches!(
+            self.get(v),
+            Some(PyObj::Str(_))
+                | Some(PyObj::List(_))
+                | Some(PyObj::Tuple(_))
+                | Some(PyObj::Bytes(_))
+                | Some(PyObj::Bytearray(_))
+        )
     }
 
     fn optype_err(&self, op: &str, a: &Value, b: &Value) -> String {
@@ -6506,6 +6532,8 @@ impl PyHost {
                 return Err("ValueError: incomplete format".into());
             }
             let conv = chars[i];
+            // CPython's message names WHERE the bad conversion character sits.
+            let conv_at = i;
             i += 1;
             // Resolve the value for this conversion.
             let val = if let Some(key) = &mapping_key {
@@ -6526,17 +6554,19 @@ impl PyHost {
                 ai += 1;
                 v
             };
-            let core = self.format_conv(
-                conv,
-                &val,
-                ConvFlags {
-                    plus: f_plus,
-                    space: f_space,
-                    hash: f_hash,
-                },
-                prec,
-                premap,
-            )?;
+            let core = self
+                .format_conv(
+                    conv,
+                    &val,
+                    ConvFlags {
+                        plus: f_plus,
+                        space: f_space,
+                        hash: f_hash,
+                    },
+                    prec,
+                    premap,
+                )
+                .map_err(|e| locate_unsupported_conv(e, conv, conv_at))?;
             out.push_str(&pad_conv(
                 &core,
                 width,
@@ -6675,6 +6705,7 @@ impl PyHost {
                 return Err("ValueError: incomplete format".into());
             }
             let conv = fmt[i] as char;
+            let conv_at = i;
             i += 1;
             // Resolve the value for this conversion.
             let val = if let Some(key) = &mapping_key {
@@ -6766,8 +6797,10 @@ impl PyHost {
                     (s.into_bytes(), true)
                 }
                 other => {
-                    return Err(format!(
-                        "ValueError: unsupported format character '{other}'"
+                    return Err(locate_unsupported_conv(
+                        format!("ValueError: unsupported format character '{other}'"),
+                        other,
+                        conv_at,
                     ))
                 }
             };
@@ -6953,6 +6986,23 @@ impl PyHost {
             )),
         }
     }
+}
+
+/// Add the code point and format-string index CPython appends to an unsupported
+/// `%`-conversion. CPython's full message is
+/// `unsupported format character 'z' (0x7a) at index 1`; pythonrs reported only
+/// the character, so nothing said WHERE in the template the bad conversion was —
+/// the one piece of the message that is useful in a long format string.
+/// A non-`ValueError` (a type error from the conversion itself) passes through.
+fn locate_unsupported_conv(err: String, conv: char, at: usize) -> String {
+    let bare = format!("ValueError: unsupported format character '{conv}'");
+    if err == bare {
+        return format!(
+            "ValueError: unsupported format character '{conv}' (0x{:x}) at index {at}",
+            conv as u32
+        );
+    }
+    err
 }
 
 /// Whether a `%`-conversion produces a number (eligible for `0`-fill / sign).
@@ -7262,9 +7312,14 @@ impl PyHost {
             Some(PyObj::Str(s)) => {
                 let chars: Vec<char> = s.chars().collect();
                 let n = chars.len() as i64;
-                let i = self
-                    .as_int(idx)
-                    .ok_or_else(|| type_error("string indices must be integers"))?;
+                // CPython 3.11 added the offending type; the bare form is the
+                // 3.9/3.10 wording.
+                let i = self.as_int(idx).ok_or_else(|| {
+                    type_error(&format!(
+                        "string indices must be integers, not '{}'",
+                        self.type_name(idx)
+                    ))
+                })?;
                 let k = if i < 0 { i + n } else { i };
                 if k < 0 || k >= n {
                     return Err("IndexError: string index out of range".into());
@@ -7644,7 +7699,10 @@ impl PyHost {
                 .ok_or_else(|| type_error("module namespace keys must be strings"))?;
             return match self.module_globals[slot].shift_remove(&k) {
                 Some(_) => Ok(()),
-                None => Err(format!("KeyError: '{k}'")),
+                None => {
+                    let kv = self.new_str(k);
+                    Err(self.key_error(&kv))
+                }
             };
         }
         #[cfg(feature = "stdlib-ffi")]
@@ -11273,7 +11331,10 @@ fn module_dict_method(
                 Some(v) => Ok(v),
                 None => match args.get(1) {
                     Some(d) => Ok(d.clone()),
-                    None => Err(format!("KeyError: '{k}'")),
+                    None => Err(with_host(|h| {
+                        let kv = h.new_str(k);
+                        h.key_error(&kv)
+                    })),
                 },
             }
         }
@@ -11282,7 +11343,10 @@ fn module_dict_method(
                 let kv = h.new_str(k);
                 h.new_tuple(vec![kv, v])
             })),
-            None => Err("KeyError: 'popitem(): dictionary is empty'".into()),
+            None => Err(with_host(|h| {
+                let s = h.new_str("popitem(): dictionary is empty");
+                h.key_error(&s)
+            })),
         },
         "clear" => {
             with_host(|h| h.module_globals[slot].clear());
