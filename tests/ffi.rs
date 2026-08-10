@@ -10,12 +10,33 @@
 use std::io::Write;
 use std::process::Command;
 
+/// Whether `rustc` is genuinely ABSENT — as opposed to present and failing.
+///
+/// The old spelling was `.output().map(|o| o.status.success()).unwrap_or(false)`,
+/// so EVERY failure mode collapsed into "not available": a `rustc` that exists
+/// but exits non-zero, a broken toolchain, a spawn refused by the OS. Each of
+/// those turned the two `rust { … }` tests below into a silent pass with zero
+/// assertions executed — the same vacuous-pass shape round 5 removed from the
+/// stdlib-bridge guard. Only `NotFound` is a skip now; anything else is a
+/// toolchain the tests are entitled to depend on.
 fn rustc_available() -> bool {
-    Command::new(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
+    let out = Command::new(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
         .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .output();
+    match out {
+        Ok(o) => {
+            assert!(
+                o.status.success(),
+                "`rustc --version` exited {:?} — the toolchain is present but broken, \
+                 which is a failure rather than a reason to skip\nstderr:\n{}",
+                o.status.code(),
+                String::from_utf8_lossy(&o.stderr)
+            );
+            true
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => panic!("spawning rustc failed with {e:?}, which is not `not found`"),
+    }
 }
 
 /// Write `src` to a temp `.py` file and run it through the built `python`
@@ -85,6 +106,43 @@ print('bridge', itertools.__name__, len(dataclasses.__name__))
     );
     assert!(ok, "bridge sentinel exited non-zero\nstderr:\n{stderr}");
     assert_eq!(stdout, "bridge itertools 11\n", "stderr={stderr}");
+}
+
+/// The two `rust { … }` tests below skip themselves when `rustc` is missing;
+/// this one may not. Without it, a `rustc` that has gone missing turns both into
+/// silent zero-assertion passes and the file still reports all-green — the exact
+/// shape the round-5 bridge sentinel was added to prevent, left uncovered on the
+/// toolchain guard.
+///
+/// `cargo test` cannot have compiled this binary without a Rust compiler, so an
+/// uninvokable `rustc` is a broken environment, not a supported configuration.
+/// Set `RUSTC` if the compiler is not on `PATH` under that name.
+#[test]
+fn the_rust_toolchain_is_present_so_the_two_guards_below_cannot_silently_skip() {
+    assert!(
+        rustc_available(),
+        "`rustc` is not invokable, so `rust_block_exports_are_callable_across_all_v1_signatures` \
+         and `rust_block_with_no_exports_errors` would both pass having asserted nothing. \
+         Point RUSTC at the compiler that built this test binary."
+    );
+}
+
+/// The mirror of `the_stdlib_bridge_is_available_so_the_guards_below_cannot_all_skip`
+/// for the build that has no bridge. On `--no-default-features` that sentinel is
+/// compiled out, so every `bridge_unavailable` guard in this file may skip and
+/// nothing checks that the skips are DESERVED. This asserts the bridge is
+/// genuinely absent — a native build that somehow imports `dataclasses` means
+/// the guards are hiding real coverage rather than standing in for it.
+#[test]
+#[cfg(not(feature = "stdlib-ffi"))]
+fn the_native_build_really_has_no_bridge_so_the_guards_below_are_deserved() {
+    let src = "import dataclasses\nprint('bridge')\n";
+    let (stdout, stderr, ok) = run_py(src);
+    assert!(
+        bridge_unavailable(ok, &stderr),
+        "a --no-default-features build imported `dataclasses` (stdout={stdout:?}) — the \
+         bridge guards in this file are skipping tests that could have run\nstderr:\n{stderr}"
+    );
 }
 
 #[test]
