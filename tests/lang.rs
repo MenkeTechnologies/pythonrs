@@ -7677,3 +7677,434 @@ fn string_methods_reject_a_non_str_argument() {
         "AttributeError: 'Counter' object has no attribute 'foo'"
     );
 }
+
+/// An integer that does not fit `Py_ssize_t`, used where CPython wants an index,
+/// a count or a length.
+///
+/// `PyHost::as_int` answers `None` for a bignum exactly as it does for a string,
+/// so every one of these sites reported "not an integer" — or, worse, took the
+/// `None` as "argument omitted" and silently produced a different answer.
+/// CPython separates the two: `__index__` succeeds and the `Py_ssize_t`
+/// conversion is what fails, with a different exception CLASS per site.
+///
+/// Every expectation is CPython 3.14.6's, captured with
+/// `LC_ALL=C TZ=UTC PYTHONHASHSEED=0 python3 -c`.
+#[test]
+fn a_bignum_index_is_an_overflow_not_a_type_error() {
+    // Subscripts (`PySequence_GetItem` → `PyNumber_AsSsize_t(k, PyExc_IndexError)`).
+    for src in [
+        "[1][10**30]",
+        "[1][-10**30]",
+        "(1,)[10**30]",
+        "\"a\"[10**20]",
+        "b\"a\"[10**20]",
+        "bytearray(b\"a\")[10**20]",
+        "memoryview(b\"ab\")[10**30]",
+        "l = [1]\nl[10**30] = 2",
+        "l = [1]\ndel l[10**30]",
+    ] {
+        assert_eq!(
+            eval_str(src).expect_err("must raise"),
+            "IndexError: cannot fit 'int' into an index-sized integer",
+            "for {src:?}"
+        );
+    }
+    // `range` computes in arbitrary precision, so its bignum subscript is an
+    // ordinary out-of-range rather than the conversion overflow.
+    assert_eq!(
+        eval_str("range(10)[10**30]").expect_err("must raise"),
+        "IndexError: range object index out of range"
+    );
+
+    // Repetition and length (`PyNumber_AsSsize_t(n, PyExc_OverflowError)`).
+    for src in [
+        "[1] * (10**20)",
+        "\"a\" * (10**20)",
+        "b\"a\" * (10**20)",
+        "(1,) * (10**20)",
+        "bytes(10**20)",
+        "bytearray(10**20)",
+        // The conversion runs before the sign check, so even a negative bignum
+        // is the overflow rather than `ValueError: negative count`.
+        "bytes(-10**30)",
+    ] {
+        assert_eq!(
+            eval_str(src).expect_err("must raise"),
+            "OverflowError: cannot fit 'int' into an index-sized integer",
+            "for {src:?}"
+        );
+    }
+
+    // Argument Clinic `Py_ssize_t` parameters.
+    for src in [
+        "\"abc\".ljust(10**20)",
+        "\"abc\".rjust(10**20)",
+        "\"abc\".center(10**20)",
+        "\"abc\".zfill(10**20)",
+        "\"abc\".split(\"b\", 10**20)",
+        "\"abc\".rsplit(\"b\", 10**20)",
+        "\"abc\".replace(\"b\", \"x\", 10**20)",
+        "(1).to_bytes(10**20, \"big\")",
+        "\"%*d\" % (10**20, 1)",
+    ] {
+        assert_eq!(
+            eval_str(src).expect_err("must raise"),
+            "OverflowError: Python int too large to convert to C ssize_t",
+            "for {src:?}"
+        );
+    }
+    // Two sites take a C `int`, and CPython names that width instead.
+    for src in [
+        "\"a\\tb\".expandtabs(10**20)",
+        "\"%.*f\" % (10**20, 1.5)",
+        "import sys\nsys.setrecursionlimit(10**30)",
+    ] {
+        assert_eq!(
+            eval_str(src).expect_err("must raise"),
+            "OverflowError: Python int too large to convert to C int",
+            "for {src:?}"
+        );
+    }
+
+    // `chr` read the bignum as `None` and then as 0, so `chr(10**30)` printed a
+    // NUL instead of raising; a non-integer is the `__index__` TypeError.
+    assert_eq!(
+        eval_str("chr(10**30)").expect_err("must raise"),
+        "ValueError: chr() arg not in range(0x110000)"
+    );
+    assert_eq!(
+        eval_str("chr(-10**30)").expect_err("must raise"),
+        "ValueError: chr() arg not in range(0x110000)"
+    );
+    assert_eq!(
+        eval_str("chr('a')").expect_err("must raise"),
+        "TypeError: 'str' object cannot be interpreted as an integer"
+    );
+    assert_eq!(g("x = chr(65)", "x"), "'A'");
+}
+
+/// A slice bound, unlike a subscript, CLAMPS a bignum.
+///
+/// `_PyEval_SliceIndex` calls `PyNumber_AsSsize_t(v, NULL)`, and the NULL
+/// exception argument means an overflow saturates at `PY_SSIZE_T_MAX`/`MIN`.
+/// pythonrs read the bound with `as_int`, whose `None` means "bound omitted", so
+/// every one of these silently returned the WHOLE sequence.
+#[test]
+fn a_bignum_slice_bound_saturates_instead_of_being_ignored() {
+    let values = [
+        ("x = 'abc'[10**30:]", "''"),
+        ("x = 'abc'[:10**30]", "'abc'"),
+        ("x = 'abc'[-10**30:]", "'abc'"),
+        ("x = 'abc'[:-10**30]", "''"),
+        ("x = 'abc'[::10**30]", "'a'"),
+        ("x = 'abc'[::-10**30]", "'c'"),
+        ("x = [1, 2, 3][10**30:]", "[]"),
+        ("x = (1, 2, 3)[::10**30]", "(1,)"),
+        ("x = b'abc'[10**30:]", "b''"),
+        ("x = range(10)[10**30:]", "range(10, 10)"),
+    ];
+    for (src, want) in values {
+        assert_eq!(&g(src, "x"), want, "for {src:?}");
+    }
+}
+
+/// A width or precision with more digits than a `Py_ssize_t` holds.
+///
+/// The spec parser accumulated with a plain `*`/`+` on a `usize`, so
+/// `format(1, '1' + '0'*20 + 'd')` — and `'{:{}d}'.format(1, 10**20)`, which
+/// splices its argument in as spec text — PANICKED the interpreter with
+/// "attempt to multiply with overflow". A panic is not catchable from Python;
+/// CPython raises `ValueError` from `get_integer`.
+#[test]
+fn a_format_spec_with_too_many_digits_raises_instead_of_panicking() {
+    for src in [
+        "format(1, '1' + '0'*20 + 'd')",
+        "format(1, '9'*19 + 'd')",
+        "'{:{}d}'.format(1, 10**20)",
+        "format(1.0, '.' + '9'*19 + 'f')",
+    ] {
+        assert_eq!(
+            eval_str(src).expect_err("must raise"),
+            "ValueError: Too many decimal digits in format string",
+            "for {src:?}"
+        );
+    }
+    // A precision that fits `Py_ssize_t` but not a C `int` has its own message.
+    assert_eq!(
+        eval_str("format(1.0, '.' + '9'*18 + 'f')").expect_err("must raise"),
+        "ValueError: precision too big"
+    );
+    // Leading zeros never overflow: the first `0` is the fill flag and the rest
+    // accumulate to a small width.
+    assert_eq!(g("x = format(1, '0'*30 + '5')", "x"), "'00001'");
+    // A width the allocator refuses is CPython's MemoryError, not an abort.
+    assert_eq!(
+        eval_str("format(1, '9'*18 + 'd')").expect_err("must raise"),
+        "MemoryError"
+    );
+}
+
+/// A repetition whose result cannot be allocated.
+///
+/// `Vec::with_capacity` and `str::repeat` ABORT the process on a failed
+/// allocation — `'a' * (2**48)` printed `memory allocation of 281474976710656
+/// bytes failed` and exited 134, with no Python-level exception to catch.
+/// CPython raises `MemoryError`, except on the bytes path, which has its own
+/// overflow message.
+#[test]
+fn an_unallocatable_repetition_raises_memoryerror_instead_of_aborting() {
+    for src in [
+        "[1] * (2**48)",
+        "[1] * (2**62)",
+        "'a' * (2**48)",
+        "'a' * (2**62)",
+        "(1,) * (2**62)",
+    ] {
+        assert_eq!(
+            eval_str(src).expect_err("must raise"),
+            "MemoryError",
+            "for {src:?}"
+        );
+    }
+    for src in ["b'ab' * (2**62)", "bytearray(b'ab') * (2**62)"] {
+        assert_eq!(
+            eval_str(src).expect_err("must raise"),
+            "OverflowError: repeated bytes are too long",
+            "for {src:?}"
+        );
+    }
+    // The ordinary sizes still work.
+    assert_eq!(g("x = 'ab' * 3", "x"), "'ababab'");
+    assert_eq!(g("x = [1, 2] * 2", "x"), "[1, 2, 1, 2]");
+    assert_eq!(g("x = b'x' * 4", "x"), "b'xxxx'");
+}
+
+/// Source too deeply nested to parse.
+///
+/// Five shapes used to abort the interpreter thread outright
+/// (`fatal runtime error: stack overflow`, SIGABRT, exit 134) because the
+/// parser, the compiler's walk and the AST's own `Drop` all recurse and nothing
+/// bounded the depth. CPython answers every one with a catchable exception, so
+/// the divergence was not the message but the fact that user code could not
+/// intercept it at all.
+///
+/// The bracket cap is CPython's exact `MAXLEVEL == 200`
+/// (`Parser/lexer/state.h`), verified against
+/// `python3 -c "compile('('*N+'1'+')'*N, '<s>', 'eval')"`: N=200 compiles, N=201
+/// raises `SyntaxError: too many nested parentheses`, and the counter is shared
+/// across `(`, `[` and `{`.
+#[test]
+fn deeply_nested_source_raises_instead_of_overflowing_the_stack() {
+    // Runs on an interpreter-sized stack: see the note on
+    // `deeply_nested_operator_chains_raise_instead_of_overflowing_the_stack`.
+    // Even the 200 levels CPython ACCEPTS need more than libtest's 2 MB worker,
+    // because pythonrs descends ~15 parser frames per bracket.
+    on_interpreter_stack(|| {
+        for (open, close) in [("(", ")"), ("[", "]"), ("{", "}")] {
+            let ok = format!("x = {}1{}", open.repeat(200), close.repeat(200));
+            let r = eval_str(&ok);
+            // A 200-deep `{` literal is a set of sets, which is unhashable at
+            // RUN time — the point here is that it parsed.
+            assert!(
+                r.is_ok() || r.as_ref().unwrap_err().starts_with("TypeError:"),
+                "200 levels of {open} must still parse, got {r:?}"
+            );
+            let too_deep = format!("x = {}1{}", open.repeat(201), close.repeat(201));
+            assert_eq!(
+                eval_str(&too_deep).expect_err("must raise"),
+                "SyntaxError: too many nested parentheses",
+                "for 201 levels of {open}"
+            );
+        }
+        // One counter for all three kinds: 201 opens spread over `([{` trips it.
+        assert_eq!(
+            eval_str(&format!("x = {}", "([{".repeat(67))).expect_err("must raise"),
+            "SyntaxError: too many nested parentheses"
+        );
+        // And the depths real code uses are untouched. A 500-term chain also
+        // needs the interpreter-sized stack: 500 levels is already past what
+        // 2 MB holds, which is the measurement this test exists to make.
+        assert_eq!(g("x = 1 + 2 * 3 - 4 // 2", "x"), "5");
+        assert_eq!(g(&format!("x = 1{}", "+1".repeat(500)), "x"), "501");
+    });
+}
+
+/// Run `body` on a thread sized like the one `src/main.rs` spawns for the
+/// interpreter (512 MB).
+///
+/// The depth guards are calibrated against THAT stack: the parser has to recurse
+/// to its cap before it can report the cap, and libtest's 2 MB worker cannot
+/// hold even the 200 bracket levels CPython accepts. Running the guards on a
+/// matching thread measures the binary's real behaviour; an embedder calling
+/// `eval_str` from a smaller stack has a lower effective ceiling, noted in
+/// BUGS.md.
+fn on_interpreter_stack(body: impl FnOnce() + Send + 'static) {
+    std::thread::Builder::new()
+        .stack_size(512 * 1024 * 1024)
+        .spawn(body)
+        .expect("spawn interpreter-sized thread")
+        .join()
+        .expect("the parser must report the depth rather than abort");
+}
+
+/// The bracket-free half of the same guard, run on a thread sized like the one
+/// `src/main.rs` spawns.
+///
+/// `MAX_TREE_DEPTH` (20 000) is calibrated against that 512 MB interpreter
+/// stack, not against libtest's 2 MB worker — the parser has to RECURSE to the
+/// cap before it can report it, and 20 000 debug frames do not fit in 2 MB. The
+/// thread here reproduces the binary's environment, which is the environment the
+/// guard exists for; an embedder on a smaller stack is a separate limit, noted
+/// in BUGS.md.
+#[test]
+fn deeply_nested_operator_chains_raise_instead_of_overflowing_the_stack() {
+    on_interpreter_stack(|| {
+        let too_complex =
+            "MemoryError: Parser stack overflowed - Python source too complex to parse";
+        for src in [
+            format!("x = {}1", "-".repeat(100_000)),
+            format!("x = {}1", "not ".repeat(30_000)),
+            format!("x = a{}", ".b".repeat(100_000)),
+            format!("x = 1{}", "+1".repeat(200_000)),
+            format!("x = {}1", "lambda: ".repeat(30_000)),
+            format!("x = 1{}", " if 1 else 1".repeat(100_000)),
+        ] {
+            assert_eq!(
+                eval_str(&src).expect_err("must raise"),
+                too_complex,
+                "for a {}-char chain",
+                src.len()
+            );
+        }
+    });
+}
+
+/// `OSError` is not a one-string exception.
+///
+/// CPython's `oserror_init` splits the arguments so `args == (errno, strerror)`
+/// and `.errno` / `.strerror` / `.filename` / `.filename2` each read back;
+/// `if e.errno == errno.ENOENT:` is the standard way to discriminate one.
+/// pythonrs put the whole rendered line in `args[0]` and carried none of the
+/// attributes, so that idiom raised `AttributeError` inside the handler.
+///
+/// Values captured with `LC_ALL=C TZ=UTC python3 -c`.
+#[test]
+fn oserror_carries_errno_strerror_and_filename() {
+    let src = "\
+try:
+    open('/no/such/file')
+except OSError as e:
+    x = (type(e).__name__, e.args, e.errno, e.strerror, e.filename, e.filename2)
+";
+    assert_eq!(
+        g(src, "x"),
+        "('FileNotFoundError', (2, 'No such file or directory'), 2, \
+         'No such file or directory', '/no/such/file', None)"
+    );
+    // Opening a directory used to SUCCEED — `std::fs::File::open` does not fail
+    // on one and pythonrs never checked, so the handle came back and only
+    // failed later at read time.
+    let dir = "\
+try:
+    open('/etc')
+except OSError as e:
+    x = (type(e).__name__, e.errno, e.strerror)
+";
+    assert_eq!(g(dir, "x"), "('IsADirectoryError', 21, 'Is a directory')");
+    // The class still follows the errno, and `except OSError` still catches.
+    assert_eq!(
+        g(
+            "x = isinstance(FileNotFoundError('x'), OSError)",
+            "x"
+        ),
+        "True"
+    );
+}
+
+/// `NameError.name` and `AttributeError.name` (CPython 3.10+).
+///
+/// Both were absent, so `except NameError as e: e.name` — which `traceback` and
+/// several linters use — raised `AttributeError` from inside the handler.
+/// `AttributeError.obj` is still absent; see BUGS.md.
+#[test]
+fn name_and_attribute_errors_carry_the_offending_name() {
+    assert_eq!(
+        g(
+            "try:\n    undefined_zz\nexcept NameError as e:\n    x = e.name",
+            "x"
+        ),
+        "'undefined_zz'"
+    );
+    assert_eq!(
+        g(
+            "try:\n    (1).nope\nexcept AttributeError as e:\n    x = e.name",
+            "x"
+        ),
+        "'nope'"
+    );
+    // The message is unchanged by the added attribute.
+    assert_eq!(
+        eval_str("(1).nope").expect_err("must raise"),
+        "AttributeError: 'int' object has no attribute 'nope'"
+    );
+}
+
+/// A group NUMBER outside the pattern's group count.
+///
+/// `Match.group` accepted any integer and read the span vector out of range,
+/// answering `None` — the value CPython reserves for a group that EXISTS and did
+/// not participate in the match. The two are not interchangeable: `None` means
+/// "optional group did not match", and a caller distinguishing them saw the
+/// wrong one. CPython raises `IndexError: no such group`.
+#[test]
+fn a_regex_group_number_out_of_range_raises_no_such_group() {
+    for src in [
+        "import re\nre.match('(a)', 'a').group(5)",
+        "import re\nre.match('(a)', 'a').group(-1)",
+        "import re\nre.match('(a)', 'a').group(0, 9)",
+        "import re\nre.match('(a)', 'a').group('z')",
+    ] {
+        assert_eq!(
+            eval_str(src).expect_err("must raise"),
+            "IndexError: no such group",
+            "for {src:?}"
+        );
+    }
+    // A group that exists but did not participate is still `None`.
+    assert_eq!(
+        g("import re\nx = re.match('(a)(b)?', 'a').group(2)", "x"),
+        "None"
+    );
+    assert_eq!(
+        g("import re\nx = re.match('(a)', 'a').group(0, 1)", "x"),
+        "('a', 'a')"
+    );
+    assert_eq!(
+        g("import re\nx = re.match('(?P<n>a)', 'a').group('n')", "x"),
+        "'a'"
+    );
+}
+
+/// `sys.setrecursionlimit` validates its argument.
+///
+/// The whole call was `Ok(Value::Undef)`, so `sys.setrecursionlimit(0)` — which
+/// CPython refuses outright — was accepted silently. The limit itself is still
+/// not enforced (see BUGS.md); the ARGUMENT check is CPython's.
+#[test]
+fn setrecursionlimit_rejects_a_limit_below_one() {
+    for src in [
+        "import sys\nsys.setrecursionlimit(0)",
+        "import sys\nsys.setrecursionlimit(-5)",
+    ] {
+        assert_eq!(
+            eval_str(src).expect_err("must raise"),
+            "ValueError: recursion limit must be greater or equal than 1",
+            "for {src:?}"
+        );
+    }
+    assert_eq!(
+        eval_str("import sys\nsys.setrecursionlimit('x')").expect_err("must raise"),
+        "TypeError: 'str' object cannot be interpreted as an integer"
+    );
+    assert!(eval_str("import sys\nsys.setrecursionlimit(2000)").is_ok());
+}

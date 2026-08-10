@@ -903,3 +903,101 @@ fn a_program_imports_its_own_sibling_modules_and_packages() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Binary-mode file I/O.
+///
+/// Every read path decoded UTF-8 unconditionally, so `open(p, 'rb').read()`
+/// answered a `str` and a file holding a byte that is not valid UTF-8 failed
+/// with `OSError: stream did not contain valid UTF-8` where CPython returns the
+/// bytes. BUGS.md listed binary `open()` as working, which it was not.
+///
+/// Driven through the built binary because it writes with `print`. Every
+/// expectation is byte-checked against `LC_ALL=C TZ=UTC python3 <the same file>`
+/// on CPython 3.14.6.
+#[test]
+fn binary_mode_reads_answer_bytes_and_survive_non_utf8() {
+    let dir = std::env::temp_dir().join(format!("pythonrs-binio-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create fixture dir");
+    let blob = dir.join("blob.bin");
+    let prog = dir.join("prog.py");
+    std::fs::write(
+        &prog,
+        format!(
+            "p = {:?}\n\
+             with open(p, 'wb') as f:\n\
+            \x20   print('wrote', f.write(b'\\x00\\x01\\xff\\xfe ab\\nc\\n'))\n\
+             with open(p, 'rb') as f:\n\
+            \x20   d = f.read()\n\
+            \x20   print(type(d).__name__, repr(d))\n\
+             with open(p, 'rb') as f:\n\
+            \x20   print(repr(f.read(3)), repr(f.readline()))\n\
+             with open(p, 'rb') as f:\n\
+            \x20   print(f.readlines())\n\
+             with open(p, 'rb') as f:\n\
+            \x20   print([repr(l) for l in f])\n\
+             try:\n\
+            \x20   open(p, 'wb').write('txt')\n\
+             except TypeError as e:\n\
+            \x20   print('TypeError:', e)\n\
+             try:\n\
+            \x20   open(p, 'w').write(b'bin')\n\
+             except TypeError as e:\n\
+            \x20   print('TypeError:', e)\n",
+            blob.to_string_lossy()
+        ),
+    )
+    .expect("write program");
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_python"))
+        .arg(&prog)
+        .env("LC_ALL", "C")
+        .env("TZ", "UTC")
+        .output()
+        .expect("spawn python binary");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stdout,
+        "wrote 10\n\
+         bytes b'\\x00\\x01\\xff\\xfe ab\\nc\\n'\n\
+         b'\\x00\\x01\\xff' b'\\xfe ab\\n'\n\
+         [b'\\x00\\x01\\xff\\xfe ab\\n', b'c\\n']\n\
+         [\"b'\\\\x00\\\\x01\\\\xff\\\\xfe ab\\\\n'\", \"b'c\\\\n'\"]\n\
+         TypeError: a bytes-like object is required, not 'str'\n\
+         TypeError: write() argument must be str, not bytes\n",
+        "stderr={stderr}"
+    );
+
+    // Text mode is unchanged: a multi-byte character still reads as one char.
+    let tprog = dir.join("t.py");
+    let txt = dir.join("t.txt");
+    std::fs::write(
+        &tprog,
+        format!(
+            "p = {:?}\n\
+             with open(p, 'w') as f:\n\
+            \x20   f.write('h\\u00e9llo\\nworld\\n')\n\
+             with open(p) as f:\n\
+            \x20   print(repr(f.read(3)), repr(f.readline()))\n\
+             with open(p) as f:\n\
+            \x20   print(f.readlines())\n",
+            txt.to_string_lossy()
+        ),
+    )
+    .expect("write text program");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_python"))
+        .arg(&tprog)
+        .env("LC_ALL", "C")
+        .env("TZ", "UTC")
+        .output()
+        .expect("spawn python binary");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "'h\u{e9}l' 'lo\\n'\n['h\u{e9}llo\\n', 'world\\n']\n",
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
