@@ -9,6 +9,22 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **A mutable container reached through a bridged CPython object keeps its
+  identity.** The marshaller converted an exact CPython `list`/`dict`/`set` to a
+  native value on every read, which is right for a call RESULT (a fresh object
+  the caller owns; arguments passed IN are already written back by
+  `writeback_mutated_args`) and wrong for a reference into a live object. With
+  `@dataclass class P: tags: list = field(default_factory=list)`,
+  `p.tags is p.tags` was `False` and `p.tags.append(3)` mutated a copy that was
+  then discarded. An attribute or item read that yields a mutable container now
+  keeps it behind the `Foreign` handle (`ffi::reference_to_value`), so identity
+  holds and the mutation lands on the real object; `__setitem__`/`__delitem__`
+  are routed too, and a slice crosses as a real `slice` (built through the
+  `slice` builtin, so an omitted bound is `None` rather than a sentinel int).
+  The rule applies at every depth — `d.m['k'].append(2)` reaches the inner list
+  by ITEM access on an already-bridged dict. Immutable containers (`tuple`,
+  `frozenset`, `bytes`, `str`, scalars) still cross by value: nothing can
+  observe the difference and operations on them stay native.
 - **Private-name mangling.** Every `__name` written inside a class body now
   compiles as `_Class__name` (CPython `_Py_Mangle`), so `C().__dict__` reads
   `{'_C__x': 1}`, the `AttributeError` names `_F__missing`, and two classes in
@@ -468,15 +484,6 @@ written.
 - **`memoryview` is not a context manager.** `with memoryview(b"ab"):` raises
   `AttributeError: 'memoryview' object has no attribute '__enter__'`; CPython's
   `memoryview` supports `with` (the exit releases the buffer).
-- **A mutable container read off a bridged CPython object is a fresh copy.** The
-  marshaller converts a CPython `list`/`dict`/`set` to a native pythonrs value by
-  value on every read, so the identity is not preserved and an in-place mutation
-  is lost: with `@dataclass class P: tags: list = field(default_factory=list)`,
-  `p.tags is p.tags` is `False` and `p.tags.append(3)` leaves `p.tags == []`
-  (CPython: `[3]`). Arguments passed INTO a stdlib call are written back
-  (`writeback_mutated_args`), so `random.shuffle(xs)` works; only the attribute
-  read direction copies. A faithful fix keeps the container behind a `Foreign`
-  handle and routes the mutators through the bridge.
 - **`f.__annotate__` is a `functools.partial`, not a `function`.** It is callable,
   answers the `VALUE`/`FORWARDREF` formats with the def-time annotations dict, and
   raises a bare `NotImplementedError` otherwise — but `type(f.__annotate__)` and

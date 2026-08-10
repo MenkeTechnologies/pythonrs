@@ -742,6 +742,27 @@ fn value_to_py<'py>(
                     .map(|p| p.into_any().into_bound(py))
                     .map_err(|e| e.to_string())
             }
+            // `foreign[1:]` — a mutable container held behind a handle (see
+            // `get_attr`) is sliced through CPython's own `__getitem__`, so the
+            // slice object has to cross. Each bound is `None` or an int.
+            Some(PyObj::Slice { lo, hi, step }) => {
+                // Built through the `slice` builtin rather than `PySlice::new`,
+                // because an omitted bound must cross as `None`: `xs[1:]` is
+                // `slice(1, None)`, and a sentinel integer would be wrong the
+                // moment the step is negative.
+                let (lo, hi, step) = (lo.clone(), hi.clone(), step.clone());
+                let bound = |b: &Value| match b {
+                    Value::Undef => Ok(py.None().into_bound(py)),
+                    other => value_to_py(host, py, other),
+                };
+                let a = bound(&lo)?;
+                let b = bound(&hi)?;
+                let c = bound(&step)?;
+                py.import("builtins")
+                    .and_then(|m| m.getattr("slice"))
+                    .and_then(|f| f.call1((a, b, c)))
+                    .map_err(|e| e.to_string())
+            }
             _ => Err(crate::host::type_error(&format!(
                 "cannot pass '{}' to a CPython stdlib call",
                 host.type_name(v)
@@ -847,12 +868,40 @@ where
 
 // ── operations routed on a Foreign handle ────────────────────────────────────
 
+/// A value reached THROUGH a bridged object — its attribute or its item.
+///
+/// A mutable container has to keep its identity here, where
+/// [`py_to_value`] would copy it. That copy is right for a call RESULT (a fresh
+/// object the caller owns, and arguments are written back by
+/// [`writeback_mutated_args`]) and wrong for a reference into a live object:
+/// `p.tags is p.tags` was `False` and `p.tags.append(3)` mutated a temporary
+/// that was then discarded. Keeping the handle preserves identity and makes the
+/// mutation land; the mutators, `len`, iteration, `in`, `repr`, and
+/// subscripting all route back through this module.
+///
+/// Applies at every depth: `d.m['k'].append(2)` reaches the inner list through
+/// [`get_item`] on an already-`Foreign` dict, so the item path needs the rule
+/// as much as the attribute path.
+///
+/// Immutable containers (`tuple`, `frozenset`, `bytes`, `str`, scalars) still
+/// cross by value — nothing can observe the difference, and operations on them
+/// stay native.
+fn reference_to_value(host: &mut PyHost, py: Python, obj: &Bound<PyAny>) -> Result<Value, String> {
+    if obj.is_exact_instance_of::<PyList>()
+        || obj.is_exact_instance_of::<PyDict>()
+        || obj.is_exact_instance_of::<PySet>()
+    {
+        return Ok(host.alloc(PyObj::Foreign(store(obj.clone().unbind()))));
+    }
+    py_to_value(host, py, obj)
+}
+
 /// `foreign.name` — attribute access (submodules, functions, constants, …).
 pub fn get_attr(host: &mut PyHost, id: u32, name: &str) -> Result<Value, String> {
     Python::with_gil(|py| {
         let obj = fetch(py, id)?;
         let attr = obj.getattr(name).map_err(|e| e.to_string())?;
-        py_to_value(host, py, &attr)
+        reference_to_value(host, py, &attr)
     })
 }
 
@@ -1437,7 +1486,7 @@ pub fn get_item(host: &mut PyHost, id: u32, idx: &Value) -> Result<Value, String
         let item = obj
             .get_item(key)
             .map_err(|e| pyerr_to_error_h(host, py, &e))?;
-        py_to_value(host, py, &item)
+        reference_to_value(host, py, &item)
     })
 }
 
@@ -1449,7 +1498,31 @@ pub fn get_item_cb(id: u32, idx: &Value) -> Result<Value, String> {
         let key = with_host(|h| value_to_py(h, py, idx))?;
         let obj = fetch(py, id)?;
         let item = obj.get_item(key).map_err(|e| e.to_string())?;
-        with_host(|h| py_to_value(h, py, &item))
+        with_host(|h| reference_to_value(h, py, &item))
+    })
+}
+
+/// `foreign[idx] = value` — routed to CPython's own `__setitem__`, so a
+/// mutable container held behind a handle (see [`get_attr`]) is assignable
+/// through it and the mutation lands on the real object.
+pub fn set_item(host: &mut PyHost, id: u32, idx: &Value, val: &Value) -> Result<(), String> {
+    Python::with_gil(|py| {
+        let obj = fetch(py, id)?;
+        let key = value_to_py(host, py, idx)?;
+        let v = value_to_py(host, py, val)?;
+        obj.set_item(key, v)
+            .map_err(|e| pyerr_to_error_h(host, py, &e))
+    })
+}
+
+/// `del foreign[idx]` — CPython's own `__delitem__`, the other half of
+/// [`set_item`].
+pub fn del_item(host: &mut PyHost, id: u32, idx: &Value) -> Result<(), String> {
+    Python::with_gil(|py| {
+        let obj = fetch(py, id)?;
+        let key = value_to_py(host, py, idx)?;
+        obj.del_item(key)
+            .map_err(|e| pyerr_to_error_h(host, py, &e))
     })
 }
 

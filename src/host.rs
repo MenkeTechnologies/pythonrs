@@ -7407,6 +7407,10 @@ impl PyHost {
             self.module_globals[slot].insert(k, val);
             return Ok(());
         }
+        #[cfg(feature = "stdlib-ffi")]
+        if let Some(id) = self.foreign_id(recv) {
+            return crate::ffi::set_item(self, id, idx, &val);
+        }
         match self.get(recv) {
             Some(PyObj::List(l)) => {
                 let n = l.len() as i64;
@@ -7467,6 +7471,10 @@ impl PyHost {
                 Some(_) => Ok(()),
                 None => Err(format!("KeyError: '{k}'")),
             };
+        }
+        #[cfg(feature = "stdlib-ffi")]
+        if let Some(id) = self.foreign_id(recv) {
+            return crate::ffi::del_item(self, id, idx);
         }
         // Slice deletion: `del x[i:j]`, `del x[::k]`.
         if let Some(PyObj::Slice { lo, hi, step }) = self.get(idx) {

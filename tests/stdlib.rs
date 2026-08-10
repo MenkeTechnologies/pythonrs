@@ -2552,3 +2552,96 @@ fn ffi_dir_lists_the_real_cpython_attributes() {
         "True"
     );
 }
+
+// A MUTABLE container reached through a bridged CPython object keeps its
+// identity instead of crossing by value. The marshaller copies an exact
+// `list`/`dict`/`set`, which is right for a call result but wrong for a
+// reference INTO a live object: the copy had its own identity, so
+// `p.tags is p.tags` was `False` and `p.tags.append(3)` mutated a temporary
+// that was discarded. Expected values are CPython 3.14's.
+#[cfg(feature = "stdlib-ffi")]
+#[test]
+fn a_mutable_container_read_off_a_bridged_object_keeps_its_identity() {
+    const DC: &str = "from dataclasses import dataclass, field\n\
+                      @dataclass\n\
+                      class P:\n\
+                      \x20   tags: list = field(default_factory=list)\n\
+                      \x20   meta: dict = field(default_factory=dict)\n\
+                      \x20   seen: set = field(default_factory=set)\n\
+                      p = P()\n";
+    // Identity survives two reads of the same attribute.
+    assert_eq!(g(&format!("{DC}x = p.tags is p.tags"), "x"), "True");
+    // An in-place mutation through the attribute lands on the real object.
+    assert_eq!(
+        g(
+            &format!("{DC}p.tags.append(3)\np.tags.extend([4])\nx = p.tags"),
+            "x"
+        ),
+        "[3, 4]"
+    );
+    // As does one through a local alias — the whole point of identity.
+    assert_eq!(
+        g(
+            &format!("{DC}q = p.tags\nq.append(5)\nx = (p.tags, p.tags is q)"),
+            "x"
+        ),
+        "([5], True)"
+    );
+    // Item assignment and deletion route to CPython's own __setitem__/__delitem__.
+    assert_eq!(
+        g(
+            &format!("{DC}p.tags.extend([1, 2, 3])\np.tags[0] = 9\ndel p.tags[1]\nx = p.tags"),
+            "x"
+        ),
+        "[9, 3]"
+    );
+    // dict and set halves of the same rule.
+    assert_eq!(
+        g(
+            &format!("{DC}p.meta['a'] = 1\np.meta.update(b=2)\nx = sorted(p.meta.items())"),
+            "x"
+        ),
+        "[('a', 1), ('b', 2)]"
+    );
+    assert_eq!(
+        g(
+            &format!("{DC}p.seen.add('x')\np.seen.add('y')\nx = sorted(p.seen)"),
+            "x"
+        ),
+        "['x', 'y']"
+    );
+    // The rule applies at every depth: the inner list is reached by ITEM access
+    // on an already-bridged dict, not by attribute access.
+    assert_eq!(
+        g(
+            &format!("{DC}p.meta['k'] = [1]\np.meta['k'].append(2)\nx = p.meta"),
+            "x"
+        ),
+        "{'k': [1, 2]}"
+    );
+    // Reads that never mutated still have to answer normally: length, membership,
+    // iteration, slicing, equality, and repr all route back through the bridge.
+    assert_eq!(
+        g(
+            &format!(
+                "{DC}p.tags.extend([1, 2, 3])\n\
+                      x = (len(p.tags), 2 in p.tags, [v * 2 for v in p.tags], \
+                      p.tags[1:], p.tags[-1], p.tags == [1, 2, 3], repr(p.tags))"
+            ),
+            "x"
+        ),
+        "(3, True, [2, 4, 6], [2, 3], 3, True, '[1, 2, 3]')"
+    );
+    // An IMMUTABLE container still crosses by value, so native operations on it
+    // stay native and nothing observes the handle.
+    assert_eq!(
+        g(
+            "from dataclasses import dataclass\n\
+             @dataclass\n\
+             class T:\n\x20   t: tuple = (1, 2)\n\
+             x = (T().t, type(T().t).__name__, T().t + (3,))",
+            "x"
+        ),
+        "((1, 2), 'tuple', (1, 2, 3))"
+    );
+}
