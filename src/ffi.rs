@@ -319,6 +319,57 @@ fn pyerr_to_error_h(host: &mut PyHost, py: Python, err: &PyErr) -> String {
     err.to_string()
 }
 
+/// Entries pythonrs's own `sys.path` holds that the embedded interpreter has not
+/// been told about yet. The bridge delegates `import <unknown>` to CPython's
+/// importer, which searches the EMBEDDED `sys.path` — a list built by libpython
+/// at startup that contains the CPython stdlib and nothing of the running
+/// program. The script's own directory (pythonrs `sys.path[0]`) and anything the
+/// script inserted therefore never took part in resolution, so `import sibling`
+/// beside the script raised `ModuleNotFoundError` on a bridged build.
+fn pending_search_paths() -> &'static Mutex<Vec<String>> {
+    static P: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+    P.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Queue pythonrs's `sys.path` for the embedded interpreter. Called from the
+/// importer just before it delegates, from OUTSIDE any `with_host` borrow (the
+/// bridge cannot re-enter the host). Order is preserved and applied at the front
+/// of CPython's `sys.path`, so the script directory wins over the stdlib exactly
+/// as it does in CPython.
+pub fn queue_search_paths(paths: Vec<String>) {
+    if let Ok(mut q) = pending_search_paths().lock() {
+        *q = paths;
+    }
+}
+
+/// Splice any queued paths into the embedded `sys.path`, skipping entries it
+/// already has. Idempotent: re-importing does not grow the list.
+fn apply_pending_search_paths() {
+    let paths = match pending_search_paths().lock() {
+        Ok(mut q) if !q.is_empty() => std::mem::take(&mut *q),
+        _ => return,
+    };
+    Python::with_gil(|py| {
+        let Ok(sys) = py.import("sys") else { return };
+        let Ok(path) = sys.getattr("path") else {
+            return;
+        };
+        let Ok(path) = path.downcast_into::<PyList>() else {
+            return;
+        };
+        let have: Vec<String> = path
+            .iter()
+            .filter_map(|e| e.extract::<String>().ok())
+            .collect();
+        // Insert in reverse so the queued order survives repeated front-inserts.
+        for p in paths.iter().rev() {
+            if !have.iter().any(|h| h == p) {
+                let _ = path.insert(0, p.as_str());
+            }
+        }
+    });
+}
+
 /// Import `name` (possibly dotted, e.g. `os.path`) via CPython's own importer and
 /// return a `Foreign` handle to the module object.
 pub fn import(name: &str) -> Result<u32, String> {
@@ -330,6 +381,7 @@ pub fn import(name: &str) -> Result<u32, String> {
         return Ok(id);
     }
     init();
+    apply_pending_search_paths();
     Python::with_gil(|py| match py.import(name) {
         Ok(module) => {
             let id = store(module.into_any().unbind());

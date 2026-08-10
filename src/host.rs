@@ -15173,6 +15173,60 @@ fn struct_seq(h: &mut PyHost, type_name: &str, fields: Vec<(&str, Value)>) -> Va
     t
 }
 
+/// pythonrs's live `sys.path` as plain strings: whatever the `sys` module holds
+/// if the program has imported it (so a `sys.path.insert(0, …)` is honored),
+/// otherwise the startup value — the script's directory, or `""` (the current
+/// directory) for `-c`/`-m`/stdin, exactly as CPython seeds `sys.path[0]`.
+/// Non-string entries (a `PathLike`, a custom finder) are skipped rather than
+/// stringified, since the bridge can only pass a path across.
+#[cfg(feature = "stdlib-ffi")]
+fn current_search_paths() -> Vec<String> {
+    with_host(|h| {
+        if let Some(sys) = h.cached_module("sys") {
+            if let Ok(path) = h.get_attr(&sys, "path") {
+                if let Some(PyObj::List(items)) = h.get(&path) {
+                    let items = items.clone();
+                    return items.iter().filter_map(|v| h.as_str(v)).collect();
+                }
+            }
+        }
+        vec![match &h.main_file {
+            Some(f) => std::path::Path::new(f)
+                .parent()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            None => String::new(),
+        }]
+    })
+}
+
+/// Resolve `name` against pythonrs's `sys.path` (the program's own directory and
+/// anything it inserted) and run it on pythonrs itself. `None` = no such file on
+/// those roots, so the caller falls through to the stdlib resolvers.
+///
+/// An empty entry means the current directory, exactly as CPython reads
+/// `sys.path[0] == ''` for `-c`/`-m`/stdin.
+#[cfg(feature = "stdlib-ffi")]
+fn try_import_user_path(name: &str) -> Option<Result<Value, String>> {
+    let rel = name.replace('.', "/");
+    for root in current_search_paths() {
+        let root = std::path::Path::new(if root.is_empty() { "." } else { &root });
+        for cand in [
+            root.join(format!("{rel}.py")),
+            root.join(&rel).join("__init__.py"),
+        ] {
+            if !cand.is_file() {
+                continue;
+            }
+            return Some(match std::fs::read_to_string(&cand) {
+                Ok(src) => run_vendored_module(name, &src, &cand),
+                Err(e) => Err(format!("ImportError: cannot read {}: {e}", cand.display())),
+            });
+        }
+    }
+    None
+}
+
 fn import_module_inner(name: &str) -> Result<Value, String> {
     // `collections.abc` is an alias for the pure-Python `_collections_abc`
     // module; CPython wires it with `sys.modules['collections.abc'] =
@@ -16267,6 +16321,19 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
             // built out. The vendored path is exercised by the native build.
             #[cfg(feature = "stdlib-ffi")]
             {
+                // The program's OWN modules run on pythonrs, never over the
+                // bridge: a sibling `.py` executed by CPython would hand back
+                // `Foreign` classes, and a user exception class defined that way
+                // is not a class pythonrs can `raise`. Resolved from pythonrs's
+                // `sys.path`, which CPython's importer cannot see.
+                if let Some(res) = try_import_user_path(name) {
+                    return res;
+                }
+                // CPython's importer searches the EMBEDDED `sys.path`, which knows
+                // nothing about the running program. Hand it pythonrs's own
+                // `sys.path` anyway so an installed third-party package reachable
+                // only through a program-inserted path still resolves.
+                crate::ffi::queue_search_paths(current_search_paths());
                 let id = crate::ffi::import(name)?;
                 return Ok(with_host(|h| h.alloc(PyObj::Foreign(id))));
             }

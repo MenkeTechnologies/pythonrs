@@ -769,3 +769,115 @@ fn invalid_hash_seed_is_the_cpython_fatal_error() {
         assert_eq!(code, 0, "seed {seed:?} should be accepted, stderr {err}");
     }
 }
+
+/// A program's OWN modules resolve from `sys.path` and run on pythonrs.
+///
+/// CPython seeds `sys.path[0]` with the script's directory (`""`, the current
+/// directory, for `-c`/`-m`/stdin) and its importer searches it before the
+/// stdlib. pythonrs exposed that `sys.path` but no resolver read it: on the
+/// default `stdlib-ffi` build every unknown name went straight to the embedded
+/// libpython, whose `sys.path` contains the CPython stdlib and nothing of the
+/// running program, so `import <sibling>` raised `ModuleNotFoundError` for a
+/// file sitting next to the script.
+///
+/// Each case is pinned to what `python3` prints for the identical tree, and the
+/// class-identity case is the one that fails if the module is resolved but run
+/// over the bridge instead of natively: a CPython-side class comes back as a
+/// `Foreign` handle, which `raise` rejects with `TypeError: exceptions must
+/// derive from BaseException`.
+#[test]
+fn a_program_imports_its_own_sibling_modules_and_packages() {
+    let dir = std::env::temp_dir().join(format!("pythonrs-userimport-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("upkg")).expect("create fixture tree");
+    std::fs::write(
+        dir.join("usib.py"),
+        "V = 7\nclass UErr(ValueError):\n    pass\n",
+    )
+    .expect("write sibling module");
+    std::fs::write(dir.join("upkg/__init__.py"), "P = 'pkg'\n").expect("write package init");
+    std::fs::write(dir.join("upkg/sub.py"), "S = 'sub'\n").expect("write submodule");
+    std::fs::write(
+        dir.join("main.py"),
+        "import usib, upkg.sub\n\
+         print(usib.V, upkg.P, upkg.sub.S)\n\
+         try:\n\
+        \x20   raise usib.UErr('boom')\n\
+         except ValueError as e:\n\
+        \x20   print(type(e).__name__, e)\n\
+         print(usib.__name__, upkg.sub.__name__)\n",
+    )
+    .expect("write main script");
+
+    let run = |args: &[&std::ffi::OsStr], cwd: &std::path::Path| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_python"))
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("spawn python binary");
+        assert!(
+            out.status.success(),
+            "python exited {:?}\nstderr:\n{}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .replace("\r\n", "\n")
+    };
+
+    // What CPython 3.14.6 prints for this tree, verified as
+    // `cd <dir> && python3 main.py`.
+    let expected = "7 pkg sub\nUErr boom\nusib upkg.sub";
+
+    // Script form: `sys.path[0]` is the SCRIPT's directory, so the import works
+    // from any working directory, not just the script's own.
+    let script = dir.join("main.py");
+    assert_eq!(
+        run(
+            &[script.as_os_str()],
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        ),
+        expected,
+        "script-form import must resolve against the script directory"
+    );
+
+    // `-c` form: `sys.path[0]` is `""` — the current directory.
+    assert_eq!(
+        run(
+            &[
+                std::ffi::OsStr::new("-c"),
+                std::ffi::OsStr::new(
+                    "import usib, upkg.sub\n\
+                     print(usib.V, upkg.P, upkg.sub.S)\n\
+                     try:\n    raise usib.UErr('boom')\n\
+                     except ValueError as e:\n    print(type(e).__name__, e)\n\
+                     print(usib.__name__, upkg.sub.__name__)\n"
+                ),
+            ],
+            &dir
+        ),
+        expected,
+        "-c form import must resolve against the current directory"
+    );
+
+    // A path the PROGRAM inserts at run time is honored too — the resolver reads
+    // the live `sys.path`, not a snapshot taken at startup.
+    let inserted = format!(
+        "import sys\nsys.path.insert(0, {:?})\nimport usib\nprint(usib.V)\n",
+        dir.to_string_lossy()
+    );
+    assert_eq!(
+        run(
+            &[
+                std::ffi::OsStr::new("-c"),
+                std::ffi::OsStr::new(inserted.as_str())
+            ],
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        ),
+        "7",
+        "a run-time sys.path.insert must feed the importer"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
