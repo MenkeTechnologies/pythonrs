@@ -9,6 +9,112 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **Source too deeply nested no longer aborts the process.** Five shapes killed
+  the interpreter thread outright — `fatal runtime error: stack overflow`,
+  SIGABRT, exit 134, no traceback and nothing for `except` to see:
+  `exec('('*10000)`, `'-'*100000+'1'`, `'a'+'.b'*100000`, `'1'+'+1'*200000` and
+  `'not '*20000+'1'`. CPython answers all five with an ordinary catchable
+  exception. The tokenizer now carries CPython's `MAXLEVEL` — 200 open brackets,
+  one counter shared by `(`, `[` and `{`, so `'([{'*67` trips it too — and
+  refuses the 201st with `SyntaxError: too many nested parentheses` (measured:
+  `compile('('*200+'1'+')'*200, …)` compiles on 3.14.6 and `'('*201` does not,
+  for all three bracket kinds). Bracket-free operator chains nest just as deeply,
+  so the parser also carries a tree-depth cap (`parser::MAX_TREE_DEPTH`, 20 000)
+  reported as CPython's own `MemoryError: Parser stack overflowed - Python source
+  too complex to parse`. The cap sits above every depth CPython accepts in those
+  shapes (`'1'+'+1'*20000` and `'a'+'.b'*20000` parse there, `*100000` does not)
+  and below where the 512 MB interpreter stack in `src/main.rs` runs out
+  (measured: those shapes survive 25 000 levels and abort by 30 000 on a debug
+  build). See "Partial / simplified semantics" for the two limits that remain.
+- **A format spec with too many width or precision digits raises instead of
+  panicking.** `parse_internal_render_format_spec` accumulated digits with a
+  plain `*`/`+` on a `usize`, so `format(1, '1' + '0'*20 + 'd')` — and
+  `'{:{}d}'.format(1, 10**20)`, which splices its argument in as spec text —
+  aborted with "attempt to multiply with overflow", which no `except` can catch.
+  CPython's `get_integer` raises `ValueError: Too many decimal digits in format
+  string`. The accumulator is checked against `Py_ssize_t`, not `usize`, because
+  `'9'*19` fits one and not the other and CPython rejects it; a precision past
+  `INT_MAX` keeps its own `ValueError: precision too big`; and a width the
+  allocator refuses is `MemoryError` (via `try_reserve`) rather than an abort,
+  matching `format(1, '9'*18 + 'd')`.
+- **A repetition too large to allocate is `MemoryError`, not an abort.**
+  `Vec::with_capacity` and `str::repeat` abort on a failed allocation, so
+  `'a' * (2**48)` printed `memory allocation of 281474976710656 bytes failed` and
+  exited 134. The result length is reserved fallibly now: `[1]*(2**48)`,
+  `'a'*(2**62)` and `(1,)*(2**62)` raise `MemoryError` as CPython does, and the
+  bytes path raises CPython's own `OverflowError: repeated bytes are too long`.
+- **An `int` too large for `Py_ssize_t`, used as an index, a count or a
+  length.** `PyHost::as_int` answers `None` for a bignum exactly as it does for
+  a string, so all three failure modes collapsed into one and every site
+  reported the wrong thing — or, worse, read the `None` as "argument omitted"
+  and silently produced a different answer. `PyHost::index_fit` keeps
+  "fits" / "too large" / "not an int" apart, and each site reports what CPython
+  reports:
+  - a subscript is `IndexError: cannot fit 'int' into an index-sized integer`
+    (`[1][10**30]`, `'a'[10**20]`, `b'a'[10**20]`, `memoryview(b'ab')[10**30]`,
+    `l[10**30] = 2`, `del l[10**30]`) — it was
+    `TypeError: list indices must be integers or slices, not int`. `range` is
+    the exception: it computes in arbitrary precision, so `range(10)[10**30]` is
+    `IndexError: range object index out of range`;
+  - a repetition or a length is `OverflowError: cannot fit 'int' into an
+    index-sized integer` (`[1]*(10**20)`, `b'a'*(10**20)`, `bytes(10**20)`,
+    `bytearray(10**20)`); the `Py_ssize_t` conversion runs before the sign check,
+    so `bytes(-10**30)` is that too rather than `ValueError: negative count`;
+  - an Argument Clinic `Py_ssize_t` parameter is `OverflowError: Python int too
+    large to convert to C ssize_t` (`ljust`/`rjust`/`center`/`zfill`,
+    `split`/`rsplit`'s maxsplit, `replace`'s count, `int.to_bytes`'s length,
+    `'%*d'`'s width). Each of these previously reverted to its DEFAULT and
+    answered silently: `'abc'.ljust(10**20)` was `'abc'`,
+    `'abc'.replace('b','x',10**20)` replaced everywhere;
+  - the two C-`int` parameters name that width instead —
+    `'a\tb'.expandtabs(10**20)` and `'%.*f' % (10**20, 1.5)`.
+
+  A slice bound SATURATES rather than raising, because `_PyEval_SliceIndex`
+  passes a NULL exception type to `PyNumber_AsSsize_t`. Read as "omitted", every
+  one of these returned the whole sequence; they now match CPython:
+  `'abc'[10**30:]` is `''`, `'abc'[::10**30]` is `'a'`, `'abc'[::-10**30]` is
+  `'c'`, `[1,2,3][10**30:]` is `[]`, `range(10)[10**30:]` is `range(10, 10)`.
+  And `chr` read the bignum as `None` and then as `0`, so `chr(10**30)` printed a
+  NUL where CPython raises `ValueError: chr() arg not in range(0x110000)`; a
+  non-integer argument is now the `__index__` `TypeError` CPython gives rather
+  than that `ValueError`.
+- **Binary-mode file reads answer `bytes`.** Every read path decoded UTF-8
+  unconditionally, so `type(open(p, 'rb').read())` was `str` and a file holding a
+  byte that is not valid UTF-8 died with `OSError: stream did not contain valid
+  UTF-8` — CPython returns the bytes. `read`/`read(n)`/`readline`/`readlines`/
+  iteration all answer `bytes` on a `'b'` handle now, `write` rejects the wrong
+  operand type in both directions (`TypeError: a bytes-like object is required,
+  not 'str'` on a binary handle, `TypeError: write() argument must be str, not
+  bytes` on a text one), and `open()` on a DIRECTORY raises
+  `IsADirectoryError: [Errno 21] Is a directory` rather than handing back a
+  handle that only fails at read time. Text mode is unchanged (a multi-byte
+  character still counts as one `read(n)` character).
+- **`OSError` carries `errno`, `strerror`, `filename`, `filename2`.** It was a
+  one-string exception: the whole rendered line sat in `args[0]` and none of the
+  four attributes existed, so `if e.errno == errno.ENOENT:` — the ordinary way to
+  discriminate an `OSError` — raised `AttributeError` from inside the handler.
+  `synth_exc` now splits `[Errno N] strerror: 'filename'` the way CPython's
+  `oserror_init` splits its arguments, so `open('/no/such/file')` gives
+  `args == (2, 'No such file or directory')`, `errno == 2`,
+  `filename == '/no/such/file'`, `filename2 is None`. Any `open` failure other
+  than the three that were hard-coded keeps the OS's own errno and maps it to
+  CPython's subclass.
+- **`NameError.name` and `AttributeError.name`.** Both attributes were absent, so `except NameError as e: e.name` raised from inside the
+  handler. `AttributeError.obj` is still absent — see below.
+- **A regex group NUMBER out of range raises.** `Match.group` accepted any
+  integer and read its span vector out of bounds, answering `None` — which is
+  the value CPython reserves for a group that EXISTS and did not participate in
+  the match, so a caller distinguishing the two saw the wrong one.
+  `re.match('(a)','a').group(5)`, `.group(-1)` and `.group(0, 9)` are
+  `IndexError: no such group`, and a group that really did not match is still
+  `None`.
+- **`sys.setrecursionlimit` validates its argument.** The whole call was
+  `Ok(Value::Undef)`, so `sys.setrecursionlimit(0)` — which CPython refuses —
+  was accepted silently. It reports
+  `ValueError: recursion limit must be greater or equal than 1` below 1,
+  `OverflowError: Python int too large to convert to C int` past a C `int`, and
+  the `__index__` `TypeError` for a non-integer. The limit itself is still not
+  enforced; see below.
 - **The `n` presentation type.** `n` reached no arm of the renderer at all and
   fell through to the no-type one, so `format(1234567.891, 'n')` printed the
   `repr` (`1234567.891`) where CPython gives `1.23457e+06`, and
@@ -471,7 +577,7 @@ written.
   `'{0.real}'.format(x)` (attribute access) — all resolve against the positional
   args, kwargs, and accessor chain.
 - **`\N{NAME}`** named-Unicode escapes decode in normal and f-strings.
-- **File I/O**: `open()` (text/binary, read/write/append), `.read`/`.readline`/
+- **File I/O**: `open()` (text and binary, read/write/append), `.read`/`.readline`/
   `.readlines`/`.write`, line iteration, and `with open(...) as f:` work in the
   default build.
 - **`bytes`/`bytearray` are real heap types** with the full sequence + method
@@ -585,6 +691,67 @@ written.
   variants; async-generator `asend`/`athrow`/`aclose`.
 
 ## Partial / simplified semantics
+- **The depth guards are calibrated for the interpreter's 512 MB stack, not for
+  an embedder's.** `src/main.rs` runs the interpreter on a thread with
+  `stack_size(512 * 1024 * 1024)`, and `parser::MAX_TREE_DEPTH` is chosen against
+  that. pythonrs descends roughly fifteen parser frames per nesting level, so
+  `pythonrs::eval_str` called from an ordinary 2 MB thread overflows well below
+  the cap — libtest's worker cannot hold even the 200 bracket levels CPython
+  accepts, which is why `deeply_nested_source_raises_instead_of_overflowing_the_stack`
+  spawns a matching thread. Lowering the cap to fit 2 MB would reject source
+  CPython accepts; making the levels cheaper is the real fix.
+- **The stage that runs out of parser stack is not reproduced.** CPython reports
+  `MemoryError: Parser stack overflowed …` when its PEG parser is what
+  overflows and `RecursionError: Stack overflow (used N kB) during compilation`
+  when the parse succeeded and the compiler is what overflows —
+  `'-'*100000+'1'` is the first, `'a'+'.b'*100000` and `'1'+'+1'*200000` are the
+  second. pythonrs's cap lives entirely in the parser, so all of them report the
+  `MemoryError` form. Both are catchable, which is the property that was missing;
+  the class split is not. Relatedly, pythonrs is MORE permissive than CPython on
+  two shapes it accepts up to the cap: `'lambda: '*5000+'1'` and
+  `'not '*20000+'1'` parse here and are `MemoryError` there.
+- **`AttributeError.obj` is absent.** `.name` is bound (see above), but the
+  object the failed lookup ran against is not recoverable from the rendered
+  message that `synth_exc` reconstructs the exception from, and fabricating one
+  would be worse than its absence. CPython answers `1` for `(1).nope`.
+- **`UnicodeDecodeError`/`UnicodeEncodeError` carry the rendered message, not the
+  five-tuple.** CPython's `args` is `(encoding, object, start, end, reason)` —
+  `('utf-8', b'\xff', 0, 1, 'invalid start byte')` — with `.encoding`,
+  `.object`, `.start`, `.end` and `.reason` reading back from it; pythonrs has
+  `args == (<the whole message>,)` and none of the five attributes. Unlike the
+  `OSError` case, this one cannot be fixed by parsing the message: the `object`
+  is the offending `bytes`/`str` itself and the message only shows one byte of
+  it. Closing it means carrying the structured arguments from the codec raise
+  sites in `src/stdlib/codecs.rs` through to the exception object, and teaching
+  `exc_message` to render CPython's text back from them.
+- **A bridged exception's type has a two-element MRO.** `struct.error` and
+  `binascii.Error` report `__module__ == 'builtins'` and
+  `type(e).__mro__ == (error, object)`, where CPython says `struct.error` /
+  `binascii.Error` and `(error, Exception, BaseException, object)` /
+  `(Error, ValueError, Exception, BaseException)`. Catching is unaffected —
+  `except struct.error`, `except binascii.Error` and `except ValueError` all
+  match, because handler matching walks the base names captured at raise time
+  rather than the type object — but the traceback's final line reads `error:` /
+  `Error:` rather than `struct.error:` / `binascii.Error:`, and code that reads
+  `__mro__` or `__module__` off a caught exception sees the wrong thing.
+  Separately, `re.error` is not a class at all here (it answers a
+  `builtin_function_or_method`, so `re.error.__mro__` raises), where CPython
+  3.14.6 answers a class named `PatternError` in module `re`.
+- **`int(str)` has no digit limit and `sys.set_int_max_str_digits` is absent.**
+  CPython 3.14.6 caps a decimal `int()` conversion at 4300 digits
+  (`int('9'*100000)` is `ValueError: Exceeds the limit (4300 digits) for integer
+  string conversion: value has 100000 digits; use sys.set_int_max_str_digits() to
+  increase the limit`) and exposes
+  `sys.set_int_max_str_digits`/`get_int_max_str_digits` to change it;
+  `int('9'*100000)` succeeds here. pythonrs is more permissive, so nothing that
+  works under CPython breaks — but a program relying on the guard does not get
+  it.
+- **A binary operator's caret anchor stops at the operator.** When the right
+  operand is PARENTHESIZED, CPython's anchor runs from the left operand's end to
+  the right operand's own `col_offset`, which is INSIDE the parens: `1+("a")`
+  underlines `~^^~~~~` and pythonrs underlines `~^~~~~~`. Unparenthesized
+  operands agree. Only the caret row differs; the message, the line and the span
+  are the same.
 - **`stdout` is never block-buffered, so a merged stream interleaves
   differently.** CPython line-buffers `stdout` on a TTY and BLOCK-buffers it on
   a pipe or file, while `stderr` stays unbuffered; pythonrs flushes `stdout` on
@@ -861,9 +1028,20 @@ surface, so it has to be found by reading code or by writing a new probe.
 | Harness | Compares | Structurally cannot report |
 | --- | --- | --- |
 | `scripts/dropin_check.sh` | stdout bytes + exit code of whole scripts | stderr (discarded); any script the reference exits non-zero on (SKIPped, so the whole nonzero-exit surface); stdin-reading scripts (none supplied); argv shapes other than the one fixed triple; files the script wrote; stdout/stderr INTERLEAVING (separate pipes); timing |
-| `src/bin/parity.rs` | stdout of the `examples/` corpus | stderr; the exit code (not compared at all); everything the corpus does not happen to do; no frozen replay, so a machine without `python3` measures nothing |
+| `src/bin/parity.rs` | stdout of the `examples/` corpus | stderr; the corpus scripts' own exit codes (not compared at all); everything the corpus does not happen to do; no frozen replay, so a machine without `python3` measures nothing — but it now says so and exits 2 rather than reporting success (see below) |
 | `src/bin/parity_fuzz.rs` | stdout bytes + zero/non-zero exit of `-c` one-liners | the exact exit CODE (only success-ness); stderr unless `--stderr`, and then only a normalized last line; anything a generator does not emit — no filesystem, no subprocess, no threads, no stdin, no argv, no multi-file import, no `__main__` semantics; a case whose oracle output is nondeterministic is reported as a permanent gap rather than rejected |
 | in-process `g()` (`tests/*.rs`) | one global's `repr` after `eval_str` | stdout entirely (`print` is invisible); stderr; the exit code; ordering between statements; **and it is not differential at all** — it compares against a value a human transcribed from CPython, so it catches a REGRESSION and can never catch a divergence that was wrong from the first commit |
+
+A harness that reports success having measured nothing is worse than no harness,
+and `src/bin/parity.rs` had four ways to do it: no `examples/` directory (it
+printed a note and returned), an `examples/` with no `.py` files (the loop ran
+zero times), no `python3` on PATH (every file printed `skip` and the summary read
+`0 passed, 0 failed`), and — the sharpest — an actual divergence, since `fail >
+0` still fell off the end of `main`. All four exited 0, so a caller reading the
+status could not tell a clean sweep from a total mismatch. It now exits 1 on a
+divergence, 2 on a run it cannot measure, and prints how many scripts it actually
+compared. `scripts/dropin_check.sh` already refused an empty corpus and a missing
+reference; the two agree now.
 
 Two axes were pinned to a constant across every one of them, which hid the axis
 rather than controlling it:
