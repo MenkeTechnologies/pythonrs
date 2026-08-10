@@ -3240,13 +3240,108 @@ fn synth_exc(h: &mut host::PyHost, err: &str) -> Value {
         Some((c, m)) => (c.to_string(), m.to_string()),
         None => (err.to_string(), String::new()),
     };
+    // An `OSError` is not a one-string exception. CPython's `oserror_init`
+    // splits the arguments into `args == (errno, strerror)` and the separate
+    // `errno` / `strerror` / `filename` / `filename2` attributes, and
+    // `if e.errno == errno.ENOENT:` is how OSError is normally discriminated —
+    // pythonrs put the whole rendered line in `args[0]` and had no `.errno` at
+    // all, so that idiom raised `AttributeError` inside the handler.
+    if let Some((eno, strerror, filename)) = parse_oserror(&msg) {
+        if is_oserror_class(&class) {
+            let se = h.new_str(strerror.clone());
+            let e = h.alloc(PyObj::Exception {
+                class,
+                args: vec![Value::Int(eno), se.clone()],
+            });
+            let _ = h.set_attr(&e, "errno", Value::Int(eno));
+            let _ = h.set_attr(&e, "strerror", se);
+            let fv = match filename {
+                Some(f) => h.new_str(f),
+                None => Value::Undef,
+            };
+            let _ = h.set_attr(&e, "filename", fv);
+            let _ = h.set_attr(&e, "filename2", Value::Undef);
+            return e;
+        }
+    }
     let args = if msg.is_empty() {
         vec![]
     } else {
-        let s = h.new_str(msg);
+        let s = h.new_str(msg.clone());
         vec![s]
     };
-    h.alloc(PyObj::Exception { class, args })
+    let e = h.alloc(PyObj::Exception { class: class.clone(), args });
+    // `NameError.name` (3.10+) and `AttributeError.name` (3.10+): the identifier
+    // that could not be resolved. `AttributeError.obj` is NOT set — the value
+    // the lookup ran against is not recoverable from the rendered message, and
+    // fabricating one would be worse than its absence (see BUGS.md).
+    if let Some(n) = missing_identifier(&class, &msg) {
+        let nv = h.new_str(n);
+        let _ = h.set_attr(&e, "name", nv);
+    }
+    e
+}
+
+/// Whether `class` is `OSError` or one of the `errno`-mapped subclasses CPython
+/// gives `oserror_init`'s two-argument shape.
+fn is_oserror_class(class: &str) -> bool {
+    matches!(
+        class,
+        "OSError"
+            | "IOError"
+            | "EnvironmentError"
+            | "BlockingIOError"
+            | "ChildProcessError"
+            | "ConnectionError"
+            | "BrokenPipeError"
+            | "ConnectionAbortedError"
+            | "ConnectionRefusedError"
+            | "ConnectionResetError"
+            | "FileExistsError"
+            | "FileNotFoundError"
+            | "InterruptedError"
+            | "IsADirectoryError"
+            | "NotADirectoryError"
+            | "PermissionError"
+            | "ProcessLookupError"
+            | "TimeoutError"
+    )
+}
+
+/// Split an OSError message rendered as CPython renders it —
+/// `[Errno 2] No such file or directory: '/no/such'` — back into
+/// `(errno, strerror, filename)`. `None` when the message has no `[Errno N]`
+/// prefix, which is how a non-`errno` OSError is left alone.
+fn parse_oserror(msg: &str) -> Option<(i64, String, Option<String>)> {
+    let rest = msg.strip_prefix("[Errno ")?;
+    let (num, rest) = rest.split_once("] ")?;
+    let eno: i64 = num.parse().ok()?;
+    // The filename tail is `: '<path>'`; a strerror never contains one, because
+    // every producer appends it as the last segment.
+    match rest.rsplit_once(": '") {
+        Some((strerror, tail)) if tail.ends_with('\'') => Some((
+            eno,
+            strerror.to_string(),
+            Some(tail[..tail.len() - 1].to_string()),
+        )),
+        _ => Some((eno, rest.to_string(), None)),
+    }
+}
+
+/// The identifier named by a `NameError`/`AttributeError` message, for the
+/// `.name` attribute CPython 3.10+ carries.
+fn missing_identifier(class: &str, msg: &str) -> Option<String> {
+    let quoted = |after: &str| -> Option<String> {
+        let rest = msg.split_once(after)?.1;
+        let inner = rest.strip_prefix('\'')?;
+        let end = inner.find('\'')?;
+        Some(inner[..end].to_string())
+    };
+    match class {
+        "NameError" | "UnboundLocalError" => quoted("name "),
+        "AttributeError" => quoted("has no attribute "),
+        _ => None,
+    }
 }
 
 /// Whether the raised exception matches the handler type value (a class,
@@ -4963,7 +5058,25 @@ pub fn call_builtin_function(
         }
         "chr" => {
             let a0 = arg0(&args)?;
-            let n = with_host(|h| h.as_int(&a0)).unwrap_or(0);
+            // A bignum is out of range, not a zero: `h.as_int` answered `None`
+            // for it and the `unwrap_or(0)` turned `chr(10**30)` into `chr(0)`,
+            // printing a NUL where CPython raises. A non-integer is
+            // `PyNumber_Index`'s TypeError, not a `ValueError`.
+            let n = match with_host(|h| h.index_fit(&a0)) {
+                host::IndexFit::Fits(n) => n,
+                host::IndexFit::TooLarge(_) => {
+                    return Err("ValueError: chr() arg not in range(0x110000)".to_string())
+                }
+                host::IndexFit::NotInt => {
+                    return Err(host::type_error(&format!(
+                        "'{}' object cannot be interpreted as an integer",
+                        with_host(|h| h.type_name(&a0))
+                    )))
+                }
+            };
+            if !(0..=0x10FFFF).contains(&n) {
+                return Err("ValueError: chr() arg not in range(0x110000)".to_string());
+            }
             match char::from_u32(n as u32) {
                 Some(c) => Ok(with_host(|h| h.new_str(c.to_string()))),
                 // Rust `char` can't hold a lone surrogate (U+D800..U+DFFF), so
@@ -7379,7 +7492,29 @@ fn call_sys(name: &str, args: Vec<Value>) -> Result<Value, String> {
             Err(host::raise_value(&exc)?)
         }
         "getrecursionlimit" => Ok(Value::Int(1000)),
-        "setrecursionlimit" => Ok(Value::Undef),
+        // The limit itself is not enforced yet (see BUGS.md), but the argument
+        // check is CPython's: `sys_setrecursionlimit_impl` refuses anything
+        // below 1 before touching the interpreter state, and pythonrs accepted
+        // `sys.setrecursionlimit(0)` silently.
+        "setrecursionlimit" => {
+            let a0 = arg0(&args)?;
+            match with_host(|h| h.index_fit(&a0)) {
+                // The parameter is a C `int`, so the conversion overflows before
+                // the >= 1 check ever runs.
+                host::IndexFit::TooLarge(_) => {
+                    Err("OverflowError: Python int too large to convert to C int".to_string())
+                }
+                host::IndexFit::Fits(n) if n > i32::MAX as i64 || n < i32::MIN as i64 => {
+                    Err("OverflowError: Python int too large to convert to C int".to_string())
+                }
+                host::IndexFit::Fits(n) if n >= 1 => Ok(Value::Undef),
+                host::IndexFit::NotInt => Err(host::type_error(&format!(
+                    "'{}' object cannot be interpreted as an integer",
+                    with_host(|h| h.type_name(&a0))
+                ))),
+                _ => Err("ValueError: recursion limit must be greater or equal than 1".to_string()),
+            }
+        }
         "getfilesystemencoding" | "getdefaultencoding" => {
             Ok(with_host(|h| h.new_str("utf-8".to_string())))
         }
@@ -8494,9 +8629,15 @@ pub fn re_match_method(m: &Value, method: &str, args: &[Value]) -> Result<Value,
         _ => return Err(host::type_error("not a match object")),
     };
     // Resolve a group specifier (int index or str name) to a group number.
+    // A group NUMBER outside the pattern's group count is `IndexError: no such
+    // group`, exactly as an unknown group NAME is. It used to be accepted and
+    // then read out of range, so `re.match('(a)','a').group(5)` answered `None`
+    // — the value CPython reserves for a group that exists and did not
+    // participate in the match.
+    let ngroups = spans.len();
     let group_idx = |g: &Value| -> Option<usize> {
         if let Some(i) = with_host(|h| h.as_int(g)) {
-            return Some(i as usize);
+            return (i >= 0 && (i as usize) < ngroups).then_some(i as usize);
         }
         with_host(|h| h.as_str(g))
             .and_then(|name| named.iter().find(|(n, _)| *n == name).map(|(_, i)| *i))
@@ -8517,10 +8658,11 @@ pub fn re_match_method(m: &Value, method: &str, args: &[Value]) -> Result<Value,
                     group_idx(&args[0]).ok_or_else(|| "IndexError: no such group".to_string())?;
                 return Ok(group_str(idx));
             }
-            let vals: Vec<Value> = args
-                .iter()
-                .map(|g| group_idx(g).map(group_str).unwrap_or(Value::Undef))
-                .collect();
+            let mut vals: Vec<Value> = Vec::with_capacity(args.len());
+            for g in args {
+                let idx = group_idx(g).ok_or_else(|| "IndexError: no such group".to_string())?;
+                vals.push(group_str(idx));
+            }
             Ok(with_host(|h| h.new_tuple(vals)))
         }
         "groups" => {
@@ -11076,10 +11218,10 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
         }
         "split" | "rsplit" => {
             let reverse = name == "rsplit";
-            let maxsplit = args
-                .get(1)
-                .and_then(|v| with_host(|h| h.as_int(v)))
-                .unwrap_or(-1);
+            let maxsplit = match args.get(1) {
+                Some(v) => ssize_arg(v, -1)?,
+                None => -1,
+            };
             let none_sep = args.is_empty() || matches!(args.first(), Some(Value::Undef));
             let strs: Vec<String> = if none_sep {
                 split_ws_str(&s, maxsplit, reverse)
@@ -11143,7 +11285,13 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
         "replace" => {
             let from = sarg_checked(0, "replace() argument 1")?;
             let to = sarg_checked(1, "replace() argument 2")?;
-            let count = args.get(2).and_then(|v| with_host(|h| h.as_int(v)));
+            let count = match args.get(2) {
+                Some(v) => {
+                    let n = ssize_arg(v, i64::MIN)?;
+                    (n != i64::MIN).then_some(n)
+                }
+                None => None,
+            };
             let out = match count {
                 Some(n) if n >= 0 => s.replacen(&from, &to, n as usize),
                 _ => s.replace(&from, &to),
@@ -11234,7 +11382,7 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
                     args.len()
                 ))
             })?;
-            let w = with_host(|h| h.as_int(wv)).unwrap_or(0) as usize;
+            let w = ssize_arg(wv, 0)?.max(0) as usize;
             let n = s.chars().count();
             let out = if n < w {
                 let pad = "0".repeat(w - n);
@@ -11299,12 +11447,24 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
         "istitle" => Ok(Value::Bool(is_titlecased(&s))),
         "isprintable" => Ok(Value::Bool(s.chars().all(host::is_printable_char))),
         "expandtabs" => {
-            let tabsize = args
-                .first()
-                .and_then(|v| with_host(|h| h.as_int(v)))
-                .unwrap_or(8)
-                .max(0) as usize;
-            Ok(new_str(expand_tabs(&s, tabsize)))
+            // `str.expandtabs` declares `int tabsize`, so its overflow names
+            // `C int` rather than `C ssize_t`.
+            let tabsize = match args.first() {
+                Some(v) => match with_host(|h| h.index_fit(v)) {
+                    host::IndexFit::Fits(n) => n,
+                    host::IndexFit::TooLarge(_) => {
+                        return Err(
+                            "OverflowError: Python int too large to convert to C int".to_string()
+                        )
+                    }
+                    host::IndexFit::NotInt => 8,
+                },
+                None => 8,
+            };
+            if tabsize > i32::MAX as i64 || tabsize < i32::MIN as i64 {
+                return Err("OverflowError: Python int too large to convert to C int".to_string());
+            }
+            Ok(new_str(expand_tabs(&s, tabsize.max(0) as usize)))
         }
         "translate" => {
             let table = arg0(args)?;
@@ -11363,6 +11523,25 @@ fn strip_str(s: &str, args: &[Value], mode: u8, name: &str) -> Result<String, St
     Ok(out.to_string())
 }
 
+/// Read a `Py_ssize_t` parameter — a width, a max-split, a replacement count —
+/// the way Argument Clinic's `Py_ssize_t` converter does.
+///
+/// Every one of these sites used `as_int(..).unwrap_or(default)`, and a bignum
+/// reads as `None` there, so the argument silently reverted to its default:
+/// `'abc'.ljust(10**20)` was `'abc'`, `'abc'.split('b', 10**20)` split
+/// everywhere, `'abc'.replace('b','x',10**20)` replaced everywhere. CPython
+/// raises `OverflowError: Python int too large to convert to C ssize_t` for all
+/// of them.
+fn ssize_arg(v: &Value, default: i64) -> Result<i64, String> {
+    match with_host(|h| h.index_fit(v)) {
+        host::IndexFit::Fits(n) => Ok(n),
+        host::IndexFit::TooLarge(_) => {
+            Err("OverflowError: Python int too large to convert to C ssize_t".to_string())
+        }
+        host::IndexFit::NotInt => Ok(default),
+    }
+}
+
 fn pad_str(s: &str, args: &[Value], mode: char, name: &str) -> Result<String, String> {
     let wv = args.first().ok_or_else(|| {
         host::type_error(&format!(
@@ -11370,7 +11549,7 @@ fn pad_str(s: &str, args: &[Value], mode: char, name: &str) -> Result<String, St
             args.len()
         ))
     })?;
-    let w = with_host(|h| h.as_int(wv)).unwrap_or(0) as usize;
+    let w = ssize_arg(wv, 0)?.max(0) as usize;
     let fill = with_host(|h| args.get(1).and_then(|v| h.as_str(v)))
         .and_then(|f| f.chars().next())
         .unwrap_or(' ');
@@ -13206,8 +13385,19 @@ fn float_hex(f: f64) -> String {
 fn int_to_bytes(recv: &Value, args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, String> {
     let length = match args.first().cloned().or_else(|| kw_get(kwargs, "length")) {
         Some(v) => {
-            let n = with_host(|h| h.as_int(&v))
-                .ok_or_else(|| host::type_error("'length' must be an integer"))?;
+            let n = match with_host(|h| h.index_fit(&v)) {
+                host::IndexFit::Fits(n) => n,
+                // `int.to_bytes` declares `Py_ssize_t length`, so a bignum is the
+                // clinic overflow, not "must be an integer".
+                host::IndexFit::TooLarge(_) => {
+                    return Err(
+                        "OverflowError: Python int too large to convert to C ssize_t".to_string(),
+                    )
+                }
+                host::IndexFit::NotInt => {
+                    return Err(host::type_error("'length' must be an integer"))
+                }
+            };
             if n < 0 {
                 return Err("ValueError: length argument must be non-negative".into());
             }
@@ -14897,11 +15087,27 @@ fn build_bytes(args: &[Value]) -> Result<Vec<u8>, String> {
         None => return Ok(vec![]),
         Some(v) => v,
     };
+    // A bignum count reaches `bytes`/`bytearray` as a heap object, so it used to
+    // fall through to the iterable arm and report `'int' object is not
+    // iterable`. CPython's `bytes_new` runs `PyNumber_AsSsize_t(x,
+    // PyExc_OverflowError)` on any int: `bytes(10**20)` is
+    // `OverflowError: cannot fit 'int' into an index-sized integer`.
+    // The `Py_ssize_t` conversion runs before the sign check, so even
+    // `bytes(-10**30)` is the overflow rather than `negative count`.
+    if matches!(with_host(|h| h.index_fit(v)), host::IndexFit::TooLarge(_)) {
+        return Err(format!("OverflowError: {}", host::INDEX_OVERFLOW));
+    }
     if let Value::Int(n) = v {
         if *n < 0 {
             return Err("ValueError: negative count".into());
         }
-        return Ok(vec![0u8; *n as usize]);
+        // A count that fits `Py_ssize_t` but not memory is CPython's
+        // `MemoryError`, not an allocator abort.
+        let mut out: Vec<u8> = Vec::new();
+        out.try_reserve_exact(*n as usize)
+            .map_err(|_| "MemoryError".to_string())?;
+        out.resize(*n as usize, 0u8);
+        return Ok(out);
     }
     if let Some(b) = as_bytes_object(v) {
         return Ok(b);
@@ -15519,23 +15725,55 @@ fn file_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String
                         .ok_or_else(|| host::type_error("an integer is required"))?,
                 ),
             };
+            // A binary handle answers `bytes`, never a decoded `str`.
+            if with_host(|h| h.io_is_binary(id)) {
+                let b = with_host(|h| h.io_read_n_bytes(id, n))?;
+                return Ok(with_host(|h| h.alloc(PyObj::Bytes(b))));
+            }
             let s = with_host(|h| h.io_read_n(id, n))?;
             Ok(new_str(s))
         }
         "readline" => {
+            if with_host(|h| h.io_is_binary(id)) {
+                let b = with_host(|h| h.io_readline_bytes(id))?;
+                return Ok(with_host(|h| h.alloc(PyObj::Bytes(b))));
+            }
             let s = with_host(|h| h.io_readline(id))?;
             Ok(new_str(s))
         }
         "readlines" => {
+            if with_host(|h| h.io_is_binary(id)) {
+                let lines = with_host(|h| h.io_read_lines_bytes(id))?;
+                let vals: Vec<Value> =
+                    with_host(|h| lines.into_iter().map(|l| h.alloc(PyObj::Bytes(l))).collect());
+                return Ok(with_host(|h| h.new_list(vals)));
+            }
             let lines = with_host(|h| h.io_read_lines(id))?;
             let vals: Vec<Value> = with_host(|h| lines.into_iter().map(|l| h.new_str(l)).collect());
             Ok(with_host(|h| h.new_list(vals)))
         }
         "write" => {
             let s = arg0(args)?;
+            let binary = with_host(|h| h.io_is_binary(id));
             match as_bytes_object(&s) {
-                Some(bytes) => with_host(|h| h.io_write_bytes(id, &bytes)),
+                Some(bytes) => {
+                    // CPython's `TextIOWrapper.write` takes only `str`.
+                    if !binary {
+                        return Err(host::type_error(&format!(
+                            "write() argument must be str, not {}",
+                            with_host(|h| h.type_name(&s))
+                        )));
+                    }
+                    with_host(|h| h.io_write_bytes(id, &bytes))
+                }
                 None => {
+                    // `BufferedWriter.write` takes only a bytes-like object.
+                    if binary {
+                        return Err(host::type_error(&format!(
+                            "a bytes-like object is required, not '{}'",
+                            with_host(|h| h.type_name(&s))
+                        )));
+                    }
                     let txt = with_host(|h| h.str_of(&s));
                     with_host(|h| h.io_write(id, &txt))
                 }
@@ -15702,7 +15940,7 @@ pub fn apply_format_spec(s: &str, v: &Value, spec: &str) -> Result<String, Strin
     }
     let mut width = 0usize;
     while i < chars.len() && chars[i].is_ascii_digit() {
-        width = width * 10 + (chars[i] as usize - '0' as usize);
+        width = accumulate_spec_digit(width, chars[i])?;
         i += 1;
     }
     // Grouping option: `,` (thousands) or `_` (underscore). CPython places this
@@ -15720,8 +15958,13 @@ pub fn apply_format_spec(s: &str, v: &Value, spec: &str) -> Result<String, Strin
         i += 1;
         let mut p = 0usize;
         while i < chars.len() && chars[i].is_ascii_digit() {
-            p = p * 10 + (chars[i] as usize - '0' as usize);
+            p = accumulate_spec_digit(p, chars[i])?;
             i += 1;
+        }
+        // `format_float_internal` rejects a precision past `INT_MAX` before it
+        // reaches the renderer, with its own message.
+        if p > i32::MAX as usize {
+            return Err("ValueError: precision too big".to_string());
         }
         prec = Some(p);
     }
@@ -15904,13 +16147,13 @@ pub fn apply_format_spec(s: &str, v: &Value, spec: &str) -> Result<String, Strin
         } else {
             intpart.to_string()
         };
-        return Ok(pad_to_width(
+        return pad_to_width(
             &format!("{sign_str}{prefix}{grouped}{tail}"),
             width,
             fill,
             align,
             true,
-        ));
+        );
     }
 
     // Grouping size: `_` groups hex/oct/bin by 4; `,` and decimal/float `_`
@@ -15943,18 +16186,62 @@ pub fn apply_format_spec(s: &str, v: &Value, spec: &str) -> Result<String, Strin
         intpart.to_string()
     };
     let body = format!("{sign_str}{prefix}{intpart_g}{tail}");
-    Ok(pad_to_width(&body, width, fill, align, numeric))
+    pad_to_width(&body, width, fill, align, numeric)
+}
+
+/// Accumulate one decimal digit of a format spec's width or precision.
+///
+/// CPython's `get_integer` (`Python/formatter_unicode.c`) builds the number in a
+/// `Py_ssize_t` and raises on overflow rather than wrapping:
+///
+/// ```text
+/// if (numdigits > ...) { PyErr_SetString(PyExc_ValueError,
+///     "Too many decimal digits in format string"); }
+/// ```
+///
+/// pythonrs accumulated into a `usize` with the plain `*`/`+`, so a spec whose
+/// width or precision has more digits than fit — `format(1, '1' + '0'*20 + 'd')`,
+/// or `'{:{}d}'.format(1, 10**20)`, which splices the argument in as spec text —
+/// panicked the interpreter ("attempt to multiply with overflow") where CPython
+/// raises a catchable `ValueError`.
+fn accumulate_spec_digit(acc: usize, c: char) -> Result<usize, String> {
+    let d = c as i64 - '0' as i64;
+    // The overflow that matters is `Py_ssize_t`'s, not `usize`'s: `'9' * 19` is
+    // 9999999999999999999, which fits a `u64` and does not fit a `Py_ssize_t`,
+    // and CPython rejects it.
+    i64::try_from(acc)
+        .ok()
+        .and_then(|a| a.checked_mul(10))
+        .and_then(|a| a.checked_add(d))
+        .and_then(|a| usize::try_from(a).ok())
+        .ok_or_else(|| "ValueError: Too many decimal digits in format string".to_string())
 }
 
 /// Pad a rendered numeric/string body out to `width` under `align`/`fill`.
-fn pad_to_width(body: &str, width: usize, fill: char, align: char, numeric: bool) -> String {
+///
+/// A width past what can be allocated is CPython's `MemoryError` — its own pad
+/// goes through `PyUnicode_New`, which fails the same way (`format(1, '9'*18 +
+/// 'd')` is `MemoryError` there). Rust's infallible `String` allocation would
+/// abort the process instead, so the buffer is reserved fallibly first.
+fn pad_to_width(
+    body: &str,
+    width: usize,
+    fill: char,
+    align: char,
+    numeric: bool,
+) -> Result<String, String> {
     let body = body.to_string();
     let len = body.chars().count();
     if len >= width {
-        return body;
+        return Ok(body);
     }
     let pad = width - len;
-    match align {
+    let mut probe = String::new();
+    probe
+        .try_reserve(pad.saturating_mul(fill.len_utf8()).saturating_add(body.len()))
+        .map_err(|_| "MemoryError".to_string())?;
+    drop(probe);
+    Ok(match align {
         '<' => format!("{body}{}", fill.to_string().repeat(pad)),
         '^' => {
             let l = pad / 2;
@@ -15997,7 +16284,7 @@ fn pad_to_width(body: &str, width: usize, fill: char, align: char, numeric: bool
                 format!("{body}{}", fill.to_string().repeat(pad))
             }
         }
-    }
+    })
 }
 
 /// Validate a parsed format spec against the value's type, matching CPython's

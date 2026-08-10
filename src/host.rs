@@ -628,6 +628,21 @@ impl DescKind {
     }
 }
 
+/// How a value reads as a `Py_ssize_t`. See [`PyHost::index_fit`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IndexFit {
+    /// An integer inside `Py_ssize_t`.
+    Fits(i64),
+    /// An integer outside `Py_ssize_t`; the flag is its sign (true = negative).
+    TooLarge(bool),
+    /// Not an integer at all.
+    NotInt,
+}
+
+/// CPython's `PyNumber_AsSsize_t` overflow text, raised as `IndexError` from a
+/// subscript and as `OverflowError` from a repetition or a length.
+pub const INDEX_OVERFLOW: &str = "cannot fit 'int' into an index-sized integer";
+
 /// A heap object.
 #[derive(Clone)]
 pub enum PyObj {
@@ -4615,6 +4630,61 @@ impl PyHost {
         }
     }
 
+    /// How `v` reads as a `Py_ssize_t`. [`PyHost::as_int`] collapses the two
+    /// failures — "not an integer" and "an integer that does not fit" — into one
+    /// `None`, and every index site then reported the first, so `[1][10**30]`
+    /// was `TypeError: list indices must be integers or slices, not int` where
+    /// CPython raises `IndexError: cannot fit 'int' into an index-sized
+    /// integer`. CPython keeps them apart: `__index__` succeeds and
+    /// `PyLong_AsSsize_t` is what overflows.
+    pub fn index_fit(&self, v: &Value) -> IndexFit {
+        if let Some(n) = self.as_int(v) {
+            return IndexFit::Fits(n);
+        }
+        if matches!(v, Value::Obj(_)) {
+            if let Some(PyObj::BigInt(b)) = self.get(v) {
+                return IndexFit::TooLarge(b.sign() == num_bigint::Sign::Minus);
+            }
+        }
+        IndexFit::NotInt
+    }
+
+    /// A sequence subscript's integer index.
+    ///
+    /// `not_int` builds the `TypeError` text for a subscript that is not an
+    /// integer at all. One that IS an integer but does not fit `Py_ssize_t` is a
+    /// different error in CPython: `PySequence_GetItem`/`SetItem`/`DelItem` call
+    /// `PyNumber_AsSsize_t(key, PyExc_IndexError)`, so `[1][10**30]`,
+    /// `l[10**30] = 2` and `del l[10**30]` all raise
+    /// `IndexError: cannot fit 'int' into an index-sized integer`.
+    pub fn seq_index(
+        &self,
+        idx: &Value,
+        not_int: impl FnOnce() -> String,
+    ) -> Result<i64, String> {
+        match self.index_fit(idx) {
+            IndexFit::Fits(n) => Ok(n),
+            IndexFit::TooLarge(_) => Err(format!("IndexError: {INDEX_OVERFLOW}")),
+            IndexFit::NotInt => Err(not_int()),
+        }
+    }
+
+    /// `v` as a slice bound, saturating rather than raising.
+    ///
+    /// `_PyEval_SliceIndex` calls `PyNumber_AsSsize_t(v, NULL)`, and the NULL
+    /// exception type means an overflow CLAMPS to `PY_SSIZE_T_MAX`/`MIN`
+    /// instead of raising — which is why `'abc'[10**30:]` is `''` in CPython
+    /// and `'abc'[::10**30]` is `'a'`. Reading the bound with
+    /// [`PyHost::as_int`] answered `None` for a bignum, i.e. "bound omitted",
+    /// so both of those silently returned the whole string.
+    pub fn as_slice_index(&self, v: &Value) -> Option<i64> {
+        match self.index_fit(v) {
+            IndexFit::Fits(n) => Some(n),
+            IndexFit::TooLarge(neg) => Some(if neg { i64::MIN } else { i64::MAX }),
+            IndexFit::NotInt => None,
+        }
+    }
+
     /// `v` as an exact integer, but ONLY when its magnitude is past the point
     /// where `f64` stops holding every integer — a heap bignum always, an `i64`
     /// (or an `int`-subclass payload) only past 2^53. `None` means the plain
@@ -5887,6 +5957,15 @@ impl PyHost {
                 // when neither side is a sequence.
                 for (seq, other) in [(a, b), (b, a)] {
                     if self.is_sequence_for_repeat(seq) {
+                        // A count that IS an int and merely does not fit is
+                        // `PySequence_Repeat`'s `PyNumber_AsSsize_t(n,
+                        // PyExc_OverflowError)`, not the non-int TypeError:
+                        // `[1] * 10**20` is
+                        // `OverflowError: cannot fit 'int' into an index-sized
+                        // integer`.
+                        if matches!(self.index_fit(other), IndexFit::TooLarge(_)) {
+                            return Err(format!("OverflowError: {INDEX_OVERFLOW}"));
+                        }
                         return Err(type_error(&format!(
                             "can't multiply sequence by non-int of type '{}'",
                             self.type_name(other)
@@ -5992,14 +6071,26 @@ impl PyHost {
             return Ok(None);
         };
         let n = count.max(0) as usize;
+        // The result length has to be reserved FALLIBLY. `Vec::with_capacity` /
+        // `str::repeat` abort the process on a failed allocation, so
+        // `'a' * (2**48)` printed `memory allocation of … bytes failed` and
+        // exited 134; CPython raises a catchable `MemoryError` for every one of
+        // `[1]*(2**48)`, `'a'*(2**62)` and `(1,)*(2**62)`, and the bytes path
+        // has its own `OverflowError: repeated bytes are too long`.
         match self.get(&seq) {
             Some(PyObj::Str(s)) => {
-                let r = s.repeat(n);
+                let mut r = String::new();
+                reserve_repeat(&mut r, s.len(), n, false)?;
+                let base = s.clone();
+                for _ in 0..n {
+                    r.push_str(&base);
+                }
                 Ok(Some(self.new_str(r)))
             }
             Some(PyObj::List(l)) => {
-                let mut out = Vec::with_capacity(l.len() * n);
                 let base = l.clone();
+                let mut out: Vec<Value> = Vec::new();
+                reserve_repeat(&mut out, base.len(), n, false)?;
                 for _ in 0..n {
                     out.extend(base.clone());
                 }
@@ -6007,7 +6098,8 @@ impl PyHost {
             }
             Some(PyObj::Tuple(l)) => {
                 let base = l.clone();
-                let mut out = Vec::with_capacity(base.len() * n);
+                let mut out: Vec<Value> = Vec::new();
+                reserve_repeat(&mut out, base.len(), n, false)?;
                 for _ in 0..n {
                     out.extend(base.clone());
                 }
@@ -6015,7 +6107,8 @@ impl PyHost {
             }
             Some(PyObj::Bytes(s)) => {
                 let base = s.clone();
-                let mut out = Vec::with_capacity(base.len() * n);
+                let mut out: Vec<u8> = Vec::new();
+                reserve_repeat(&mut out, base.len(), n, true)?;
                 for _ in 0..n {
                     out.extend_from_slice(&base);
                 }
@@ -6023,7 +6116,8 @@ impl PyHost {
             }
             Some(PyObj::Bytearray(s)) => {
                 let base = s.clone();
-                let mut out = Vec::with_capacity(base.len() * n);
+                let mut out: Vec<u8> = Vec::new();
+                reserve_repeat(&mut out, base.len(), n, true)?;
                 for _ in 0..n {
                     out.extend_from_slice(&base);
                 }
@@ -6504,7 +6598,7 @@ impl PyHost {
             let mut width: Option<usize> = None;
             if i < n && chars[i] == '*' {
                 i += 1;
-                let w = self.next_arg_int(&arglist, &mut ai);
+                let w = self.next_arg_int(&arglist, &mut ai, false)?;
                 if w < 0 {
                     f_minus = true;
                     width = Some((-w) as usize);
@@ -6527,7 +6621,7 @@ impl PyHost {
                 i += 1;
                 if i < n && chars[i] == '*' {
                     i += 1;
-                    prec = Some(self.next_arg_int(&arglist, &mut ai).max(0) as usize);
+                    prec = Some(self.next_arg_int(&arglist, &mut ai, true)?.max(0) as usize);
                 } else {
                     let mut pd = String::new();
                     while i < n && chars[i].is_ascii_digit() {
@@ -6677,7 +6771,7 @@ impl PyHost {
             let mut width: Option<usize> = None;
             if i < n && fmt[i] == b'*' {
                 i += 1;
-                let w = self.next_arg_int(&arglist, &mut ai);
+                let w = self.next_arg_int(&arglist, &mut ai, false)?;
                 if w < 0 {
                     f_minus = true;
                     width = Some((-w) as usize);
@@ -6700,7 +6794,7 @@ impl PyHost {
                 i += 1;
                 if i < n && fmt[i] == b'*' {
                     i += 1;
-                    prec = Some(self.next_arg_int(&arglist, &mut ai).max(0) as usize);
+                    prec = Some(self.next_arg_int(&arglist, &mut ai, true)?.max(0) as usize);
                 } else {
                     let mut pd = String::new();
                     while i < n && fmt[i].is_ascii_digit() {
@@ -6829,10 +6923,29 @@ impl PyHost {
     }
 
     /// Pop the next positional arg as an i64 (for `*` width/precision).
-    fn next_arg_int(&self, arglist: &[Value], ai: &mut usize) -> i64 {
+    /// The next `%`-format argument read as a `Py_ssize_t` width or precision
+    /// (the `*` forms). A bignum used to read as `0` — `'%*d' % (10**20, 1)`
+    /// printed `1` — where CPython's `PyLong_AsSsize_t` raises.
+    /// `%`'s `*` width is a `Py_ssize_t` and its `*` precision is a C `int`, and
+    /// the two overflows name different C types.
+    fn next_arg_int(&self, arglist: &[Value], ai: &mut usize, c_int: bool) -> Result<i64, String> {
         let v = arglist.get(*ai).cloned().unwrap_or(Value::Int(0));
         *ai += 1;
-        self.as_int(&v).unwrap_or(0)
+        let too_big = || {
+            if c_int {
+                "OverflowError: Python int too large to convert to C int".to_string()
+            } else {
+                "OverflowError: Python int too large to convert to C ssize_t".to_string()
+            }
+        };
+        match self.index_fit(&v) {
+            IndexFit::Fits(n) if c_int && (n > i32::MAX as i64 || n < i32::MIN as i64) => {
+                Err(too_big())
+            }
+            IndexFit::Fits(n) => Ok(n),
+            IndexFit::TooLarge(_) => Err(too_big()),
+            IndexFit::NotInt => Ok(0),
+        }
     }
 
     /// Render one `%`-conversion's core text (sign included, width padding not).
@@ -7307,7 +7420,7 @@ impl PyHost {
             Some(PyObj::List(l)) | Some(PyObj::Tuple(l)) => {
                 let is_tuple = matches!(self.get(recv), Some(PyObj::Tuple(_)));
                 let n = l.len() as i64;
-                let i = self.as_int(idx).ok_or_else(|| {
+                let i = self.seq_index(idx, || {
                     let ty = if is_tuple { "tuple" } else { "list" };
                     type_error(&format!(
                         "{ty} indices must be integers or slices, not {}",
@@ -7326,7 +7439,7 @@ impl PyHost {
                 let n = chars.len() as i64;
                 // CPython 3.11 added the offending type; the bare form is the
                 // 3.9/3.10 wording.
-                let i = self.as_int(idx).ok_or_else(|| {
+                let i = self.seq_index(idx, || {
                     type_error(&format!(
                         "string indices must be integers, not '{}'",
                         self.type_name(idx)
@@ -7358,9 +7471,18 @@ impl PyHost {
                     Some(PyObj::Range { start, stop, step }) => range_len(*start, *stop, *step),
                     _ => 0,
                 };
-                let i = self
-                    .as_int(idx)
-                    .ok_or_else(|| type_error("range indices must be integers"))?;
+                // `range` computes its index in arbitrary precision
+                // (`compute_range_item`), so a bignum subscript is simply out of
+                // range rather than an `IndexError: cannot fit 'int' …`.
+                let i = match self.index_fit(idx) {
+                    IndexFit::Fits(n) => n,
+                    IndexFit::TooLarge(_) => {
+                        return Err("IndexError: range object index out of range".into())
+                    }
+                    IndexFit::NotInt => {
+                        return Err(type_error("range indices must be integers"))
+                    }
+                };
                 let k = if i < 0 { i + len } else { i };
                 if k < 0 || k >= len {
                     return Err("IndexError: range object index out of range".into());
@@ -7388,8 +7510,7 @@ impl PyHost {
                 let is_ba = matches!(self.get(recv), Some(PyObj::Bytearray(_)));
                 let n = b.len() as i64;
                 let i = self
-                    .as_int(idx)
-                    .ok_or_else(|| type_error("byte indices must be integers"))?;
+                    .seq_index(idx, || type_error("byte indices must be integers"))?;
                 let k = if i < 0 { i + n } else { i };
                 if k < 0 || k >= n {
                     return Err(if is_ba {
@@ -7403,8 +7524,7 @@ impl PyHost {
             Some(PyObj::Deque { items, .. }) => {
                 let n = items.len() as i64;
                 let i = self
-                    .as_int(idx)
-                    .ok_or_else(|| type_error("deque indices must be integers"))?;
+                    .seq_index(idx, || type_error("deque indices must be integers"))?;
                 let k = if i < 0 { i + n } else { i };
                 if k < 0 || k >= n {
                     return Err("IndexError: deque index out of range".into());
@@ -7415,8 +7535,7 @@ impl PyHost {
                 let bytes = self.mv_bytes(recv);
                 let n = bytes.len() as i64;
                 let i = self
-                    .as_int(idx)
-                    .ok_or_else(|| type_error("memoryview: invalid slice key"))?;
+                    .seq_index(idx, || type_error("memoryview: invalid slice key"))?;
                 let k = if i < 0 { i + n } else { i };
                 if k < 0 || k >= n {
                     return Err("IndexError: index out of bounds on dimension 1".into());
@@ -7486,7 +7605,7 @@ impl PyHost {
         hi: &Value,
         step: &Value,
     ) -> Result<Value, String> {
-        let step = self.as_int(step).unwrap_or(1);
+        let step = self.as_slice_index(step).unwrap_or(1);
         if step == 0 {
             return Err("ValueError: slice step cannot be zero".into());
         }
@@ -7657,8 +7776,7 @@ impl PyHost {
             Some(PyObj::List(l)) => {
                 let n = l.len() as i64;
                 let i = self
-                    .as_int(idx)
-                    .ok_or_else(|| type_error("list indices must be integers"))?;
+                    .seq_index(idx, || type_error("list indices must be integers"))?;
                 let k = if i < 0 { i + n } else { i };
                 if k < 0 || k >= n {
                     return Err("IndexError: list assignment index out of range".into());
@@ -7680,15 +7798,26 @@ impl PyHost {
             Some(PyObj::Bytearray(b)) => {
                 let n = b.len() as i64;
                 let i = self
-                    .as_int(idx)
-                    .ok_or_else(|| type_error("bytearray indices must be integers"))?;
+                    .seq_index(idx, || type_error("bytearray indices must be integers"))?;
                 let k = if i < 0 { i + n } else { i };
                 if k < 0 || k >= n {
                     return Err("IndexError: bytearray index out of range".into());
                 }
-                let v = self
-                    .as_int(&val)
-                    .ok_or_else(|| type_error("an integer is required"))?;
+                // `bytearray[i] = huge` is a RANGE error, not a type one:
+                // `PyNumber_AsSsize_t` succeeds on any int and the 0..256 check
+                // is what rejects it.
+                let v = match self.index_fit(&val) {
+                    IndexFit::Fits(v) => v,
+                    IndexFit::TooLarge(_) => {
+                        return Err("ValueError: byte must be in range(0, 256)".into())
+                    }
+                    IndexFit::NotInt => {
+                        return Err(type_error(&format!(
+                            "'{}' object cannot be interpreted as an integer",
+                            self.type_name(&val)
+                        )))
+                    }
+                };
                 if !(0..=255).contains(&v) {
                     return Err("ValueError: byte must be in range(0, 256)".into());
                 }
@@ -7741,8 +7870,7 @@ impl PyHost {
             Some(PyObj::List(l)) => {
                 let n = l.len() as i64;
                 let i = self
-                    .as_int(idx)
-                    .ok_or_else(|| type_error("list indices must be integers"))?;
+                    .seq_index(idx, || type_error("list indices must be integers"))?;
                 let k = if i < 0 { i + n } else { i };
                 if k < 0 || k >= n {
                     return Err("IndexError: list assignment index out of range".into());
@@ -7755,8 +7883,7 @@ impl PyHost {
             Some(PyObj::Bytearray(b)) => {
                 let n = b.len() as i64;
                 let i = self
-                    .as_int(idx)
-                    .ok_or_else(|| type_error("bytearray indices must be integers"))?;
+                    .seq_index(idx, || type_error("bytearray indices must be integers"))?;
                 let k = if i < 0 { i + n } else { i };
                 if k < 0 || k >= n {
                     return Err("IndexError: bytearray index out of range".into());
@@ -7807,7 +7934,7 @@ impl PyHost {
             _ => return Err(type_error("expected a slice")),
         };
         let (lo, hi) = (&lo, &hi);
-        let step = self.as_int(&step).unwrap_or(1);
+        let step = self.as_slice_index(&step).unwrap_or(1);
         if step == 0 {
             return Err("ValueError: slice step cannot be zero".into());
         }
@@ -7914,7 +8041,7 @@ impl PyHost {
         hi: &Value,
         step: &Value,
     ) -> Result<(), String> {
-        let step = self.as_int(step).unwrap_or(1);
+        let step = self.as_slice_index(step).unwrap_or(1);
         if step == 0 {
             return Err("ValueError: slice step cannot be zero".into());
         }
@@ -8003,6 +8130,13 @@ impl PyHost {
             _ => None,
         };
         if let Some(id) = file_id {
+            if self.io_is_binary(id) {
+                let lines = self.io_read_lines_bytes(id)?;
+                return Ok(lines
+                    .into_iter()
+                    .map(|l| self.alloc(PyObj::Bytes(l)))
+                    .collect());
+            }
             let lines = self.io_read_lines(id)?;
             return Ok(lines.into_iter().map(|l| self.new_str(l)).collect());
         }
@@ -8436,14 +8570,70 @@ impl PyHost {
     }
 }
 
+/// Fallibly reserve `unit * count` slots for a sequence repetition.
+///
+/// `bytes`/`bytearray` report CPython's own `OverflowError: repeated bytes are
+/// too long` when the product does not fit; every other sequence reports
+/// `MemoryError`, which is also what a reservation the allocator refuses gives.
+trait RepeatBuf {
+    fn try_reserve_slots(&mut self, n: usize) -> Result<(), ()>;
+}
+impl RepeatBuf for String {
+    fn try_reserve_slots(&mut self, n: usize) -> Result<(), ()> {
+        self.try_reserve_exact(n).map_err(|_| ())
+    }
+}
+impl<T> RepeatBuf for Vec<T> {
+    fn try_reserve_slots(&mut self, n: usize) -> Result<(), ()> {
+        self.try_reserve_exact(n).map_err(|_| ())
+    }
+}
+
+fn reserve_repeat(
+    buf: &mut impl RepeatBuf,
+    unit: usize,
+    count: usize,
+    bytes_like: bool,
+) -> Result<(), String> {
+    let total = unit.checked_mul(count).ok_or_else(|| {
+        if bytes_like {
+            "OverflowError: repeated bytes are too long".to_string()
+        } else {
+            "MemoryError".to_string()
+        }
+    })?;
+    buf.try_reserve_slots(total).map_err(|_| {
+        if bytes_like {
+            "OverflowError: repeated bytes are too long".to_string()
+        } else {
+            "MemoryError".to_string()
+        }
+    })
+}
+
+/// Fill `buf` with as many bytes as the reader has, truncating it to what was
+/// actually read. `Read::read` may return short, so it is called until it says
+/// zero — `f.read(n)` promises n bytes unless the stream ended.
+fn read_up_to(r: &mut impl std::io::Read, buf: &mut Vec<u8>) -> std::io::Result<()> {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        match r.read(&mut buf[filled..])? {
+            0 => break,
+            k => filled += k,
+        }
+    }
+    buf.truncate(filled);
+    Ok(())
+}
+
 fn slice_bounds(lo: &Value, hi: &Value, step: i64, n: i64, h: &PyHost) -> (i64, i64) {
     let lower = if step < 0 { -1 } else { 0 };
     let upper = if step < 0 { n - 1 } else { n };
     let adjust = |x: i64| -> i64 {
-        let x = if x < 0 { x + n } else { x };
+        let x = if x < 0 { x.saturating_add(n) } else { x };
         x.clamp(lower, upper)
     };
-    let start = match h.as_int(lo) {
+    let start = match h.as_slice_index(lo) {
         Some(x) => adjust(x),
         None => {
             if step < 0 {
@@ -8453,7 +8643,7 @@ fn slice_bounds(lo: &Value, hi: &Value, step: i64, n: i64, h: &PyHost) -> (i64, 
             }
         }
     };
-    let stop = match h.as_int(hi) {
+    let stop = match h.as_slice_index(hi) {
         Some(x) => adjust(x),
         None => {
             if step < 0 {
@@ -16630,6 +16820,40 @@ fn run_vendored_module(name: &str, src: &str, path: &std::path::Path) -> Result<
 
 // ── file / I/O side table (ported from rubylang's `IoCell`) ──────────────────
 
+/// The `OSError` subclass CPython maps an errno to (`_PyExc_CreateExceptionObject`'s
+/// table in `Objects/exceptions.c`). Anything unmapped stays a plain `OSError`.
+fn errno_exc_class(eno: i32) -> &'static str {
+    match eno {
+        1 => "PermissionError",   // EPERM
+        2 => "FileNotFoundError", // ENOENT
+        3 => "ProcessLookupError",
+        4 => "InterruptedError",
+        11 => "BlockingIOError", // EAGAIN
+        13 => "PermissionError",
+        17 => "FileExistsError",
+        20 => "NotADirectoryError",
+        21 => "IsADirectoryError",
+        32 => "BrokenPipeError",
+        10 => "ChildProcessError",
+        _ => "OSError",
+    }
+}
+
+/// The `strerror` text for an errno, falling back to the Rust error's own
+/// `Display` when the platform gives nothing.
+fn errno_strerror(eno: i32, e: &std::io::Error) -> String {
+    let raw = e.to_string();
+    // Rust renders `<strerror> (os error N)`; CPython's `strerror` is the first
+    // part alone.
+    match raw.split_once(" (os error ") {
+        Some((s, _)) => s.to_string(),
+        None => {
+            let _ = eno;
+            raw
+        }
+    }
+}
+
 fn io_err(e: std::io::Error) -> String {
     format!("OSError: {e}")
 }
@@ -16711,6 +16935,76 @@ impl PyHost {
             Some(IoCell::File { mode, .. }) => mode.clone(),
             None => String::new(),
         }
+    }
+
+    /// Whether the handle was opened in BINARY mode (`'b'` anywhere in the mode
+    /// string, as CPython's `_io.open` parses it).
+    ///
+    /// Every read path used to decode UTF-8 unconditionally, so a binary handle
+    /// answered a `str` — `type(open(p, 'rb').read())` was `str` — and a file
+    /// holding a byte that is not valid UTF-8 failed outright with
+    /// `OSError: stream did not contain valid UTF-8` where CPython returns the
+    /// bytes.
+    pub fn io_is_binary(&self, id: u32) -> bool {
+        match self.io_handles.get(id as usize) {
+            Some(IoCell::File { mode, .. }) => mode.contains('b'),
+            _ => false,
+        }
+    }
+
+    /// `f.read(n)` on a binary handle — the next `n` raw BYTES, or all of them
+    /// for `None`/negative `n`. No decoding, so a byte sequence round-trips.
+    pub fn io_read_n_bytes(&mut self, id: u32, n: Option<i64>) -> Result<Vec<u8>, String> {
+        use std::io::Read;
+        let want = match n {
+            None => None,
+            Some(k) if k < 0 => None,
+            Some(k) => Some(k as usize),
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        let res = match self.io_handles.get_mut(id as usize) {
+            Some(IoCell::File {
+                file: Some(f),
+                readable: true,
+                ..
+            }) => match want {
+                None => f.read_to_end(&mut buf).map(|_| ()),
+                Some(k) => {
+                    buf.resize(k, 0);
+                    read_up_to(f, &mut buf)
+                }
+            },
+            Some(IoCell::File { file: Some(_), .. }) => return Err(unsupported_read()),
+            Some(IoCell::File { file: None, .. }) => return Err(closed_err()),
+            Some(IoCell::Stdin) => match want {
+                None => std::io::stdin().read_to_end(&mut buf).map(|_| ()),
+                Some(k) => {
+                    buf.resize(k, 0);
+                    read_up_to(&mut std::io::stdin(), &mut buf)
+                }
+            },
+            _ => return Err(unsupported_read()),
+        };
+        res.map_err(io_err)?;
+        Ok(buf)
+    }
+
+    /// `f.readline()` on a binary handle — bytes up to and including the `\n`.
+    pub fn io_readline_bytes(&mut self, id: u32) -> Result<Vec<u8>, String> {
+        let mut buf: Vec<u8> = Vec::new();
+        while let Some(b) = self.io_read_byte(id)? {
+            buf.push(b);
+            if b == b'\n' {
+                break;
+            }
+        }
+        Ok(buf)
+    }
+
+    /// `f.readlines()` / iteration on a binary handle.
+    pub fn io_read_lines_bytes(&mut self, id: u32) -> Result<Vec<Vec<u8>>, String> {
+        let all = self.io_read_n_bytes(id, None)?;
+        Ok(all.split_inclusive(|b| *b == b'\n').map(<[u8]>::to_vec).collect())
     }
 
     /// `f.readable()` / `f.writable()` — the directions the handle was opened
@@ -17161,8 +17455,29 @@ pub fn open_file(path: &str, mode: &str) -> Result<Value, String> {
         std::io::ErrorKind::PermissionDenied => {
             format!("PermissionError: [Errno 13] Permission denied: '{path}'")
         }
-        _ => format!("OSError: {e}: '{path}'"),
+        // Every other `open` failure keeps the OS's own errno and strerror, so
+        // `.errno` and the `OSError` subclass are right rather than a generic
+        // `OSError` carrying Rust's `Display` text. Opening a DIRECTORY is the
+        // common one: `open('/etc')` silently SUCCEEDED before this, because
+        // `std::fs::File::open` on a directory only fails at read time on some
+        // platforms and pythonrs never checked.
+        _ => {
+            let eno = e.raw_os_error().unwrap_or(0);
+            format!(
+                "{}: [Errno {eno}] {}: '{path}'",
+                errno_exc_class(eno),
+                errno_strerror(eno, &e)
+            )
+        }
     })?;
+    // `EISDIR` is not reported by `open(2)` for O_RDONLY on Linux or macOS, so
+    // the directory check is explicit — CPython's `_io.FileIO` does the same
+    // `fstat` and raises `IsADirectoryError` itself.
+    if f.metadata().map(|m| m.is_dir()).unwrap_or(false) {
+        return Err(format!(
+            "IsADirectoryError: [Errno 21] Is a directory: '{path}'"
+        ));
+    }
     Ok(with_host(|h| {
         h.io_alloc_file(f, path.to_string(), mode.to_string(), readable, writable)
     }))

@@ -86,6 +86,10 @@ struct Lexer {
     tok_start: usize,
 }
 
+/// CPython's `MAXLEVEL` (`Parser/lexer/state.h`): the tokenizer tracks at most
+/// 200 simultaneously-open brackets, counting `(`, `[` and `{` together.
+const MAX_PAREN_DEPTH: i32 = 200;
+
 /// Multi-char operators, longest first so the scanner is greedy.
 const OPS3: &[&str] = &["**=", "//=", ">>=", "<<=", "...", "!=="];
 const OPS2: &[&str] = &[
@@ -626,7 +630,22 @@ impl Lexer {
         }
         let c = self.bump().unwrap();
         match c {
-            '(' | '[' | '{' => self.depth += 1,
+            '(' | '[' | '{' => {
+                self.depth += 1;
+                // CPython's tokenizer holds the open brackets in a fixed
+                // `tok->parenstack[MAXLEVEL]` with `MAXLEVEL == 200`
+                // (`Parser/lexer/state.h`), and `tok_get_normal_mode` refuses the
+                // 201st open with `too many nested parentheses` — one counter
+                // shared by `(`, `[` and `{`, so `([{` * 67 trips it too.
+                // Without the cap a deep literal recursed the parser, the
+                // compiler and the AST's own `Drop` until the interpreter
+                // thread's stack ran out: `exec('('*10000)` aborted the process
+                // (SIGABRT, exit 134) where CPython raises a catchable
+                // `SyntaxError`.
+                if self.depth > MAX_PAREN_DEPTH {
+                    return Err("SyntaxError: too many nested parentheses".to_string());
+                }
+            }
             ')' | ']' | '}' => self.depth = (self.depth - 1).max(0),
             _ => {}
         }

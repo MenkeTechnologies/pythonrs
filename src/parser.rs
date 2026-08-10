@@ -29,9 +29,39 @@ pub fn parse(src: &str) -> Result<Vec<Stmt>, String> {
         toks: lexed.toks,
         pos: 0,
         deferred: lexed.deferred,
+        depth: 0,
     };
     p.parse_module()
 }
+
+/// Deepest expression tree the parser will build before refusing the source.
+///
+/// This is a stack guard, not a language rule. Nothing here is recursive in the
+/// tokenizer's bracket sense — `[`/`(`/`{` are already capped at
+/// [`crate::lexer::MAX_PAREN_DEPTH`] — but an operator chain nests just as
+/// deeply without a single bracket: `'-'*100000+'1'`, `'a'+'.b'*100000`,
+/// `'1'+'+1'*200000`, `'not '*20000+'1'` and `'lambda:'*5000+'1'` each build a
+/// tree tens of thousands of levels deep, and the parser, `src/compiler.rs`'s
+/// walk and the AST's own `Drop` all recurse over it. Every one of those five
+/// aborted the interpreter thread (`fatal runtime error: stack overflow`,
+/// SIGABRT) before this cap; CPython answers all five with a catchable
+/// exception.
+///
+/// The value sits above every depth CPython 3.14.6 accepts in those shapes
+/// (measured: `'1'+'+1'*20000` and `'a'+'.b'*20000` parse, `*100000` does not)
+/// and below the depth at which the 512 MB interpreter stack in
+/// `src/main.rs` runs out (measured: the shapes above survive 25 000 levels and
+/// abort by 30 000 on a debug build).
+const MAX_TREE_DEPTH: u32 = 20_000;
+
+/// What CPython's PEG parser raises when its own stack runs out —
+/// `_PyPegen_run_parser`'s `MemoryError`, verified against
+/// `python3 -c "exec('-'*100000+'1')"`. It is an ordinary catchable exception
+/// there, which is the property this port is matching; CPython picks
+/// `RecursionError: Stack overflow (used N kB) during compilation` instead when
+/// the parse succeeds and the *compiler* is the stage that runs out, and that
+/// split is not reproduced (see BUGS.md).
+const TOO_COMPLEX: &str = "MemoryError: Parser stack overflowed - Python source too complex to parse";
 
 struct Parser {
     toks: Vec<Token>,
@@ -39,6 +69,9 @@ struct Parser {
     /// A tokenizer error held back so an earlier parse error wins. See
     /// [`crate::lexer::Lexed::deferred`].
     deferred: Option<String>,
+    /// Levels of expression tree currently under construction. See
+    /// [`MAX_TREE_DEPTH`].
+    depth: u32,
 }
 
 /// Wrap a caret-bearing expression with its source span. `anchor_start ==
@@ -60,6 +93,18 @@ fn spanned(e: Expr, line: u32, start: u32, end: u32, anchor_start: u32, anchor_e
 }
 
 impl Parser {
+    // ── stack guard ───────────────────────────────────────────────────────
+    /// Charge one level of expression nesting. Every caller pairs this with a
+    /// `self.depth = saved` on the success path; the error path never restores
+    /// because it unwinds the whole parse.
+    fn enter(&mut self) -> Result<(), String> {
+        self.depth += 1;
+        if self.depth > MAX_TREE_DEPTH {
+            return Err(TOO_COMPLEX.to_string());
+        }
+        Ok(())
+    }
+
     // ── cursor ────────────────────────────────────────────────────────────
     fn cur(&self) -> &Tok {
         &self.toks[self.pos].tok
@@ -1342,8 +1387,12 @@ impl Parser {
     }
 
     fn parse_ternary(&mut self) -> Result<Expr, String> {
+        let saved = self.depth;
+        self.enter()?;
         if self.at_kw("lambda") {
-            return self.parse_lambda();
+            let e = self.parse_lambda()?;
+            self.depth = saved;
+            return Ok(e);
         }
         let body = self.parse_or()?;
         if self.at_kw("if") {
@@ -1356,12 +1405,14 @@ impl Parser {
                 ));
             }
             let orelse = self.parse_ternary()?;
+            self.depth = saved;
             return Ok(Expr::IfExp {
                 test: Box::new(test),
                 body: Box::new(body),
                 orelse: Box::new(orelse),
             });
         }
+        self.depth = saved;
         Ok(body)
     }
 
@@ -1402,17 +1453,22 @@ impl Parser {
 
     fn parse_not(&mut self) -> Result<Expr, String> {
         if self.eat_kw("not") {
+            let saved = self.depth;
+            self.enter()?;
             let e = self.parse_not()?;
+            self.depth = saved;
             return Ok(Expr::UnaryOp(UnOp::Not, Box::new(e)));
         }
         self.parse_comparison()
     }
 
     fn parse_comparison(&mut self) -> Result<Expr, String> {
+        let saved = self.depth;
         let (sl, sc) = (self.line(), self.col());
         let left = self.parse_bitor()?;
         let mut ops = Vec::new();
         loop {
+            self.enter()?;
             let op = if self.at_op("<") {
                 CmpOp::Lt
             } else if self.at_op(">") {
@@ -1453,6 +1509,7 @@ impl Parser {
             self.advance();
             ops.push((op, self.parse_bitor()?));
         }
+        self.depth = saved;
         if ops.is_empty() {
             Ok(left)
         } else {
@@ -1472,39 +1529,49 @@ impl Parser {
     }
 
     fn parse_bitor(&mut self) -> Result<Expr, String> {
+        let saved = self.depth;
         let (sl, sc) = (self.line(), self.col());
         let mut e = self.parse_bitxor()?;
         while self.at_op("|") {
+            self.enter()?;
             let (opc, ope) = (self.col(), self.cur_end_col());
             self.advance();
             let e2 = Expr::BinOp(BinOp::BitOr, Box::new(e), Box::new(self.parse_bitxor()?));
             e = spanned(e2, sl, sc, self.prev_end_col(), opc, ope);
         }
+        self.depth = saved;
         Ok(e)
     }
     fn parse_bitxor(&mut self) -> Result<Expr, String> {
+        let saved = self.depth;
         let (sl, sc) = (self.line(), self.col());
         let mut e = self.parse_bitand()?;
         while self.at_op("^") {
+            self.enter()?;
             let (opc, ope) = (self.col(), self.cur_end_col());
             self.advance();
             let e2 = Expr::BinOp(BinOp::BitXor, Box::new(e), Box::new(self.parse_bitand()?));
             e = spanned(e2, sl, sc, self.prev_end_col(), opc, ope);
         }
+        self.depth = saved;
         Ok(e)
     }
     fn parse_bitand(&mut self) -> Result<Expr, String> {
+        let saved = self.depth;
         let (sl, sc) = (self.line(), self.col());
         let mut e = self.parse_shift()?;
         while self.at_op("&") {
+            self.enter()?;
             let (opc, ope) = (self.col(), self.cur_end_col());
             self.advance();
             let e2 = Expr::BinOp(BinOp::BitAnd, Box::new(e), Box::new(self.parse_shift()?));
             e = spanned(e2, sl, sc, self.prev_end_col(), opc, ope);
         }
+        self.depth = saved;
         Ok(e)
     }
     fn parse_shift(&mut self) -> Result<Expr, String> {
+        let saved = self.depth;
         let (sl, sc) = (self.line(), self.col());
         let mut e = self.parse_arith()?;
         loop {
@@ -1515,14 +1582,17 @@ impl Parser {
             } else {
                 break;
             };
+            self.enter()?;
             let (opc, ope) = (self.col(), self.cur_end_col());
             self.advance();
             let e2 = Expr::BinOp(op, Box::new(e), Box::new(self.parse_arith()?));
             e = spanned(e2, sl, sc, self.prev_end_col(), opc, ope);
         }
+        self.depth = saved;
         Ok(e)
     }
     fn parse_arith(&mut self) -> Result<Expr, String> {
+        let saved = self.depth;
         let (sl, sc) = (self.line(), self.col());
         let mut e = self.parse_term()?;
         loop {
@@ -1533,15 +1603,18 @@ impl Parser {
             } else {
                 break;
             };
+            self.enter()?;
             let (opc, ope) = (self.col(), self.cur_end_col());
             self.advance();
             let e2 = Expr::BinOp(op, Box::new(e), Box::new(self.parse_term()?));
             let end = self.prev_end_col();
             e = spanned(e2, sl, sc, end, opc, ope);
         }
+        self.depth = saved;
         Ok(e)
     }
     fn parse_term(&mut self) -> Result<Expr, String> {
+        let saved = self.depth;
         let (sl, sc) = (self.line(), self.col());
         let mut e = self.parse_unary()?;
         loop {
@@ -1558,19 +1631,24 @@ impl Parser {
             } else {
                 break;
             };
+            self.enter()?;
             let (opc, ope) = (self.col(), self.cur_end_col());
             self.advance();
             let e2 = Expr::BinOp(op, Box::new(e), Box::new(self.parse_unary()?));
             let end = self.prev_end_col();
             e = spanned(e2, sl, sc, end, opc, ope);
         }
+        self.depth = saved;
         Ok(e)
     }
     fn parse_unary(&mut self) -> Result<Expr, String> {
         let (sl, sc) = (self.line(), self.col());
         let unary = |p: &mut Self, op: UnOp| -> Result<Expr, String> {
+            let saved = p.depth;
+            p.enter()?;
             p.advance();
             let operand = p.parse_unary()?;
+            p.depth = saved;
             let end = p.prev_end_col();
             Ok(spanned(
                 Expr::UnaryOp(op, Box::new(operand)),
@@ -1613,8 +1691,11 @@ impl Parser {
     }
 
     fn parse_await_postfix(&mut self) -> Result<Expr, String> {
+        let saved = self.depth;
         if self.eat_kw("await") {
+            self.enter()?;
             let e = self.parse_await_postfix()?;
+            self.depth = saved;
             return Ok(Expr::Await(Box::new(e)));
         }
         // Span of the whole postfix chain starts at the value's first token; each
@@ -1624,12 +1705,14 @@ impl Parser {
         let mut e = self.parse_atom()?;
         loop {
             if self.at_op("(") {
+                self.enter()?;
                 // Anchor the call's `(...)` bracket region for the `~~~^^^` caret.
                 let paren_col = self.col();
                 e = self.parse_call(e)?;
                 let end = self.prev_end_col();
                 e = spanned(e, start_line, start_col, end, paren_col, end);
             } else if self.at_op("[") {
+                self.enter()?;
                 let bracket_col = self.col();
                 self.advance();
                 let sub = self.parse_subscript()?;
@@ -1643,7 +1726,9 @@ impl Parser {
                     bracket_col,
                     end,
                 );
-            } else if self.eat_op(".") {
+            } else if self.at_op(".") {
+                self.enter()?;
+                self.advance();
                 let attr = self.expect_name()?;
                 let end = self.prev_end_col();
                 e = spanned(
@@ -1658,6 +1743,7 @@ impl Parser {
                 break;
             }
         }
+        self.depth = saved;
         Ok(e)
     }
 
