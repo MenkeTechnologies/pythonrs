@@ -75,7 +75,12 @@ fn generic_subscription_builds_a_genericalias() {
         "('meta', <class 'int'>)"
     );
     // A builtin FUNCTION is not a type: subscripting it stays a TypeError.
-    assert!(pythonrs::eval_str("x = len[0]").is_err());
+    // Pinned to CPython 3.14.6's message so a rejection for some OTHER reason
+    // (a parse failure, a NameError) cannot satisfy this line.
+    assert_eq!(
+        pythonrs::eval_str("x = len[0]").expect_err("subscripting len must fail"),
+        "TypeError: 'builtin_function_or_method' object is not subscriptable"
+    );
     // `tuple[int, ...]` prints the ellipsis in its literal spelling.
     assert_eq!(g("x = repr(tuple[int, ...])", "x"), "'tuple[int, ...]'");
 }
@@ -550,7 +555,23 @@ fn os_module_self_contained() {
     );
     assert_eq!(g("import os\nx = os.getpid() > 0", "x"), "True");
     assert_eq!(g("import os\nx = 'PATH' in os.environ", "x"), "True");
-    assert_eq!(g("import os\nx = os.stat('.').st_size >= 0", "x"), "True");
+    // `st_size >= 0` is true for any non-negative number, including a stub that
+    // always answers 0 — it could not distinguish a real stat from no stat at
+    // all. Size a file this test WRITES, so the exact byte count is known.
+    assert_eq!(
+        g(
+            "import os\n\
+             p = os.path.join(os.environ.get('TMPDIR', '/tmp'), 'pyrs-stat-%d.bin' % os.getpid())\n\
+             f = open(p, 'wb')\n\
+             f.write(b'0123456789')\n\
+             f.close()\n\
+             st = os.stat(p)\n\
+             x = (st.st_size, st[6], os.path.getsize(p), os.stat('.').st_size > 0)\n\
+             os.remove(p)",
+            "x"
+        ),
+        "(10, 10, 10, True)"
+    );
     assert_eq!(g("import contextlib\nx = 1", "x"), "1");
 }
 
@@ -3185,10 +3206,112 @@ fn named_unicode_escape_errors() {
     );
     // CPython matches case-insensitively but NOT loosely: stray whitespace or
     // underscore-for-space must fail.
-    assert!(eval_str("x = '\\N{ SPACE}'").is_err());
-    assert!(eval_str("x = '\\N{GREEK_SMALL_LETTER_ALPHA}'").is_err());
-    // f-string unknown name also errors.
-    assert!(eval_str("x = f'\\N{NOPE}'").is_err());
+    //
+    // A bare `is_err()` here passed on ANY failure, including one whose message
+    // CPython never produced — and pythonrs emitted this diagnostic with no
+    // exception name at all (`(unicode error) …` where CPython prints
+    // `SyntaxError: (unicode error) …`), which `is_err()` could not see. Every
+    // expectation below is byte-checked against `python3 -c` on 3.14.6.
+    for (src, want) in [
+        (
+            "x = '\\N{ SPACE}'",
+            "SyntaxError: (unicode error) 'unicodeescape' codec can't decode bytes \
+             in position 0-9: unknown Unicode character name",
+        ),
+        (
+            "x = '\\N{GREEK_SMALL_LETTER_ALPHA}'",
+            "SyntaxError: (unicode error) 'unicodeescape' codec can't decode bytes \
+             in position 0-27: unknown Unicode character name",
+        ),
+        // f-string unknown name also errors.
+        (
+            "x = f'\\N{NOPE}'",
+            "SyntaxError: (unicode error) 'unicodeescape' codec can't decode bytes \
+             in position 0-7: unknown Unicode character name",
+        ),
+    ] {
+        assert_eq!(
+            eval_str(src).expect_err("must be rejected"),
+            want,
+            "for {src}"
+        );
+    }
+}
+
+/// `\x`/`\u`/`\U` take a FIXED number of hex digits. Too few is a `SyntaxError`,
+/// not a shorter escape — pythonrs read whatever digits were present and silently
+/// produced a different string (`'\x2'` became `'\x02'`, `'\xzz'` became `'zz'`).
+/// Bytes literals reject the same defect with `PyBytes_DecodeEscape`'s different
+/// wording, and do not treat `\u`/`\U`/`\N` as escapes at all.
+///
+/// Every expectation is byte-checked against `python3 -c 'print(repr(<lit>))'`
+/// on CPython 3.14.6.
+#[test]
+fn fixed_width_hex_escapes_reject_a_short_digit_run() {
+    const UNI: &str = "SyntaxError: (unicode error) 'unicodeescape' codec can't decode bytes";
+    for (src, want) in [
+        (
+            "x = '\\x2'",
+            format!("{UNI} in position 0-2: truncated \\xXX escape"),
+        ),
+        (
+            "x = '\\x'",
+            format!("{UNI} in position 0-1: truncated \\xXX escape"),
+        ),
+        // A non-hex character ends the digit run where it stands.
+        (
+            "x = '\\xzz'",
+            format!("{UNI} in position 0-1: truncated \\xXX escape"),
+        ),
+        (
+            "x = '\\u12'",
+            format!("{UNI} in position 0-3: truncated \\uXXXX escape"),
+        ),
+        (
+            "x = '\\uzzzz'",
+            format!("{UNI} in position 0-1: truncated \\uXXXX escape"),
+        ),
+        (
+            "x = '\\U0001'",
+            format!("{UNI} in position 0-5: truncated \\UXXXXXXXX escape"),
+        ),
+        // Past U+10FFFF: the digits are all there, the code point is not legal.
+        (
+            "x = '\\U00110000'",
+            format!("{UNI} in position 0-9: illegal Unicode character"),
+        ),
+        (
+            "x = '\\UFFFFFFFF'",
+            format!("{UNI} in position 0-9: illegal Unicode character"),
+        ),
+        (
+            "x = b'\\x2'",
+            "SyntaxError: (value error) invalid \\x escape at position 0".to_string(),
+        ),
+        (
+            "x = b'\\xzz'",
+            "SyntaxError: (value error) invalid \\x escape at position 0".to_string(),
+        ),
+    ] {
+        assert_eq!(
+            eval_str(src).expect_err("must be rejected"),
+            want,
+            "for {src}"
+        );
+    }
+    // …and the well-formed forms still decode, pinned by VALUE so a fix that
+    // rejected everything would fail here.
+    assert_eq!(g("x = '\\xff'", "x"), "'\u{ff}'");
+    assert_eq!(g("x = '\\u00e9'", "x"), "'\u{e9}'");
+    assert_eq!(g("x = repr('\\U0001F600')", "x"), "\"'\u{1f600}'\"");
+    assert_eq!(g("x = b'\\xff'", "x"), "b'\\xff'");
+    assert_eq!(g("x = b'a\\x2b'", "x"), "b'a+'");
+    assert_eq!(g("x = r'\\x2'", "x"), "'\\\\x2'");
+    // In a bytes literal `\u`/`\U`/`\N` are two literal characters, not escapes:
+    // pythonrs decoded them and turned six bytes into one.
+    assert_eq!(g("x = b'\\u1234'", "x"), "b'\\\\u1234'");
+    assert_eq!(g("x = b'\\N{BULLET}'", "x"), "b'\\\\N{BULLET}'");
+    assert_eq!(g("x = b'\\U0001F600'", "x"), "b'\\\\U0001F600'");
 }
 
 #[test]
@@ -3201,7 +3324,13 @@ fn decode_escapes_named_unicode_unit() {
     );
     // Raw strings keep the escape literal.
     assert_eq!(decode_escapes("\\N{BULLET}", true).unwrap(), "\\N{BULLET}");
-    assert!(decode_escapes("\\N{ SPACE}", false).is_err());
+    // Pinned to the message, not merely to "errored": a bare `is_err()` cannot
+    // tell a correct rejection from a rejection for the wrong reason.
+    assert_eq!(
+        decode_escapes("\\N{ SPACE}", false).expect_err("loose name must be rejected"),
+        "SyntaxError: (unicode error) 'unicodeescape' codec can't decode bytes \
+         in position 0-9: unknown Unicode character name"
+    );
 }
 
 #[test]
@@ -5041,12 +5170,45 @@ fn t_strings_build_templates_not_strings() {
 
 #[test]
 fn t_string_and_f_string_literals_cannot_be_concatenated() {
-    // They produce different types, so there is nothing to join — CPython makes
-    // this a SyntaxError rather than silently picking one.
-    let e = eval_str("x = t'a' f'b'").expect_err("mixing t- and f-strings must fail");
-    assert!(
-        e.contains("SyntaxError"),
-        "expected a SyntaxError, got: {e}"
+    // Adjacent literals concatenate only within one type. A t-string joins other
+    // t-strings and nothing else; bytes join bytes and nothing else. The pieces
+    // produce different types, so there is nothing to concatenate and CPython
+    // rejects the group rather than silently picking one half.
+    //
+    // Asserting only `contains("SyntaxError")` here would pass on ANY syntax
+    // error, including one raised for an unrelated reason and one carrying a
+    // message CPython never produced — this test read that way while the message
+    // said "cannot mix t-string and f-string literals", which no CPython emits.
+    // Each expectation below is byte-checked against `python3 -c` on 3.14.6.
+    const T_MIX: &str = "SyntaxError: cannot mix t-string literals with string or bytes literals";
+    const B_MIX: &str = "SyntaxError: cannot mix bytes and nonbytes literals";
+    let rejected = [
+        ("x = t'a' f'b'", T_MIX),
+        ("x = f'a' t'b'", T_MIX),
+        ("x = t'a' 'b'", T_MIX),
+        ("x = 'a' t'b'", T_MIX),
+        // A t-string beside bytes is reported as the t-string error, not the
+        // bytes one — CPython checks in that order.
+        ("x = t'a' b'b'", T_MIX),
+        ("x = 'a' b'b'", B_MIX),
+        ("x = b'a' 'b'", B_MIX),
+        ("x = f'a' b'b'", B_MIX),
+        ("x = b'a' f'b'", B_MIX),
+    ];
+    for (src, want) in rejected {
+        let e = eval_str(src).expect_err("must be rejected");
+        assert_eq!(e, want, "for {src}");
+    }
+    // …and the same-type groups still concatenate. Before the check above
+    // existed, `'a' b'b'` produced `b'b'` — the text half was silently dropped —
+    // so the accepted cases are pinned by VALUE, not merely by "did not raise".
+    assert_eq!(g("x = 'a' 'b'", "x"), "'ab'");
+    assert_eq!(g("x = b'a' b'b'", "x"), "b'ab'");
+    assert_eq!(g("x = f'a{1}' f'b'", "x"), "'a1b'");
+    assert_eq!(g("x = f'a' 'b'", "x"), "'ab'");
+    assert_eq!(
+        g("x = repr(t'a' t'b')", "x"),
+        "\"Template(strings=('ab',), interpolations=())\""
     );
 }
 
@@ -5534,14 +5696,34 @@ const DIR_AUDIT_TYPES: &[&str] = &[
 /// that matters: a listed name is a name that dispatches.
 #[test]
 fn builtin_dir_lists_only_dispatchable_names() {
+    let mut checked = 0usize;
     for t in DIR_AUDIT_TYPES {
-        for n in pythonrs::builtins::type_dir_names(t) {
+        let listed = pythonrs::builtins::type_dir_names(t);
+        // The regression this test exists for made `type_dir_names` return an
+        // EMPTY list for a rule-driven type, which would satisfy the loop below
+        // vacuously — the failure mode and the pass condition were the same
+        // thing. Every audited type must name at least one attribute.
+        assert!(
+            !listed.is_empty(),
+            "dir({t}) is empty — the rule that produces its names is not being read"
+        );
+        for n in listed {
             assert!(
                 pythonrs::builtins::type_has_method(t, n),
                 "dir({t}) lists {n}, which dispatch does not accept"
             );
+            checked += 1;
         }
     }
+    // A whole-surface floor, so a table that stopped being parsed cannot shrink
+    // the audit silently. The measured total is 500+; the floor is deliberately
+    // slack so adding or removing a method never fails this line.
+    assert!(
+        checked > 300,
+        "only {checked} (type, name) pairs audited across {} types — the dispatch \
+         tables are not being read",
+        DIR_AUDIT_TYPES.len()
+    );
 }
 
 /// And the other direction: dispatch must never accept a name `dir()` hides.

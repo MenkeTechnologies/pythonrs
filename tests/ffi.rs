@@ -38,6 +38,55 @@ fn run_py(src: &str) -> (String, String, bool) {
     )
 }
 
+/// Whether the CPython stdlib bridge is genuinely ABSENT — as opposed to present
+/// and broken.
+///
+/// Every bridge test in this file guards itself so a libpython-less environment
+/// reports a skip rather than a false failure. That guard used to read
+/// `!ok || stderr.contains("ModuleNotFoundError")`. `ok` is `status.success()`,
+/// so the `||` made ANY non-zero exit a skip: an uncaught `TypeError` from a
+/// regressed conversion, a wrong-arity marshalling error, a segfault — each
+/// reported green. Worst of all, the `assert!(!stderr.contains("RefCell"))`
+/// lines written specifically to catch a double-borrow panic in the bridge could
+/// never fire, because the panicking child exits non-zero and the guard returned
+/// before reaching them. If `int(Fraction(7, 2))` started raising, the test that
+/// measures it passed.
+///
+/// A skip now requires BOTH a failure AND an import-shaped diagnostic. A bridge
+/// that exists but misbehaves fails the test that measures it. The `SyntaxError`
+/// arm is the native `--no-default-features` build, where a vendored `pylib/`
+/// module that does not yet parse on pythonrs is the reason the import failed;
+/// it is scoped to a diagnostic that names `pylib` so a syntax error in a test's
+/// OWN source is still a failure.
+fn bridge_unavailable(ok: bool, stderr: &str) -> bool {
+    !ok && (stderr.contains("ModuleNotFoundError")
+        || stderr.contains("ImportError")
+        || (stderr.contains("SyntaxError") && stderr.contains("pylib")))
+}
+
+/// The bridge tests below may each skip themselves; this one may not. Without it
+/// a change that broke the bridge outright would turn every test in this file
+/// into a silent skip and the file would still report all-green.
+///
+/// Asserts the opposite of what the guards test for: on a `stdlib-ffi` build the
+/// bridge IS available, so no test in this file is entitled to skip.
+#[test]
+#[cfg(feature = "stdlib-ffi")]
+fn the_stdlib_bridge_is_available_so_the_guards_below_cannot_all_skip() {
+    let src = "\
+import itertools, functools, enum, dataclasses, textwrap, statistics
+print('bridge', itertools.__name__, len(dataclasses.__name__))
+";
+    let (stdout, stderr, ok) = run_py(src);
+    assert!(
+        !bridge_unavailable(ok, &stderr),
+        "stdlib-ffi build reports the bridge unavailable — every guarded test in \
+         this file would skip and the file would still pass\nstderr:\n{stderr}"
+    );
+    assert!(ok, "bridge sentinel exited non-zero\nstderr:\n{stderr}");
+    assert_eq!(stdout, "bridge itertools 11\n", "stderr={stderr}");
+}
+
 #[test]
 fn rust_block_exports_are_callable_across_all_v1_signatures() {
     if !rustc_available() {
@@ -90,7 +139,7 @@ import math
 print(math.isqrt(100), math.trunc(3.7), math.comb(5, 2), round(math.hypot(3, 4), 1))
 ";
     let (stdout, stderr, ok) = run_py(src);
-    if !ok || stderr.contains("ModuleNotFoundError") {
+    if bridge_unavailable(ok, &stderr) {
         eprintln!("skipping math-ffi test: stdlib bridge unavailable ({stderr})");
         return;
     }
@@ -113,7 +162,7 @@ print(sorted([3, 1, 2], key=functools.cmp_to_key(lambda a, b: b - a)))
 print(sorted(['pie', 'a', 'bb'], key=functools.cmp_to_key(lambda a, b: len(a) - len(b))))
 ";
     let (stdout, stderr, ok) = run_py(src);
-    if !ok || stderr.contains("ModuleNotFoundError") {
+    if bridge_unavailable(ok, &stderr) {
         eprintln!("skipping ffi-callback test: stdlib bridge unavailable ({stderr})");
         return;
     }
@@ -138,7 +187,7 @@ print(float(Fraction(1, 3)), float(Decimal('2.5')))
 print(textwrap.fill('a b c d e f', width=5))
 ";
     let (stdout, stderr, ok) = run_py(src);
-    if !ok || stderr.contains("ModuleNotFoundError") {
+    if bridge_unavailable(ok, &stderr) {
         eprintln!("skipping ffi-float/stdlib test: stdlib bridge unavailable ({stderr})");
         return;
     }
@@ -170,7 +219,7 @@ print(Color.RED.bright(), len(Color))
 print(Pri.HIGH > Pri.LOW, Pri.HIGH + 1, sorted(Pri, reverse=True))
 ";
     let (stdout, stderr, ok) = run_py(src);
-    if !ok || stderr.contains("ModuleNotFoundError") {
+    if bridge_unavailable(ok, &stderr) {
         eprintln!("skipping ffi-enum test: stdlib bridge unavailable ({stderr})");
         return;
     }
@@ -207,7 +256,7 @@ def greet(name):
 print(greet('bob'), greet.__name__)
 ";
     let (stdout, stderr, ok) = run_py(src);
-    if !ok || stderr.contains("ModuleNotFoundError") {
+    if bridge_unavailable(ok, &stderr) {
         eprintln!("skipping ffi-gen/wraps test: stdlib bridge unavailable ({stderr})");
         return;
     }
@@ -241,7 +290,7 @@ q = Pair(1)
 print(q, q.a, q.b, q._asdict(), Pair._fields)
 ";
     let (stdout, stderr, ok) = run_py(src);
-    if !ok || stderr.contains("ModuleNotFoundError") {
+    if bridge_unavailable(ok, &stderr) {
         eprintln!("skipping ffi-dataclass test: stdlib bridge unavailable ({stderr})");
         return;
     }
@@ -299,7 +348,7 @@ print(sorted(rows, key=op.itemgetter(1)))
 print(list(map(op.attrgetter('x'), pts)))
 ";
     let (stdout, stderr, ok) = run_py(src);
-    if !ok || stderr.contains("ModuleNotFoundError") {
+    if bridge_unavailable(ok, &stderr) {
         eprintln!("skipping ffi-instance-proxy test: stdlib bridge unavailable ({stderr})");
         return;
     }
@@ -363,7 +412,7 @@ y = Optional[int]
 print(y)
 ";
     let (stdout, stderr, ok) = run_py(src);
-    if !ok || stderr.contains("ModuleNotFoundError") {
+    if bridge_unavailable(ok, &stderr) {
         eprintln!("skipping ffi-typing-annotation test: stdlib bridge unavailable ({stderr})");
         return;
     }
@@ -414,7 +463,7 @@ class G:
 print(G(1) < G(2), G(2) <= G(2), G(3) >= G(1))
 ";
     let (stdout, stderr, ok) = run_py(src);
-    if !ok || stderr.contains("ModuleNotFoundError") {
+    if bridge_unavailable(ok, &stderr) {
         eprintln!("skipping ffi-total-ordering test: stdlib bridge unavailable ({stderr})");
         return;
     }
@@ -461,7 +510,7 @@ except TypeError as e:
     print(e)
 ";
     let (stdout, stderr, ok) = run_py(src);
-    if !ok || stderr.contains("ModuleNotFoundError") {
+    if bridge_unavailable(ok, &stderr) {
         eprintln!("skipping ffi-cached-property test: stdlib bridge unavailable ({stderr})");
         return;
     }
@@ -485,7 +534,7 @@ print(getcontext().prec)
 print(Decimal(1) / Decimal(7))
 ";
     let (stdout, stderr, ok) = run_py(src);
-    if !ok || stderr.contains("ModuleNotFoundError") {
+    if bridge_unavailable(ok, &stderr) {
         eprintln!("skipping ffi-foreign-setattr test: stdlib bridge unavailable ({stderr})");
         return;
     }
@@ -512,7 +561,7 @@ except ValueError as e:
     print('propagated:', e)
 ";
     let (stdout, stderr, ok) = run_py(src);
-    if !ok || stderr.contains("ModuleNotFoundError") {
+    if bridge_unavailable(ok, &stderr) {
         eprintln!("skipping ffi-foreign-cm test: stdlib bridge unavailable ({stderr})");
         return;
     }
@@ -555,7 +604,7 @@ except ValueError:
 print('after:', repr(buf.getvalue()))
 ";
     let (stdout, stderr, ok) = run_py(src);
-    if !ok || stderr.contains("ModuleNotFoundError") {
+    if bridge_unavailable(ok, &stderr) {
         eprintln!("skipping ffi-stdout-redirect test: stdlib bridge unavailable ({stderr})");
         return;
     }
@@ -582,7 +631,7 @@ print(int(Fraction(7, 2)))
 print(int(Fraction(-9, 4)))
 ";
     let (stdout, stderr, ok) = run_py(src);
-    if !ok || stderr.contains("ModuleNotFoundError") {
+    if bridge_unavailable(ok, &stderr) {
         eprintln!("skipping ffi-int-of-foreign test: stdlib bridge unavailable ({stderr})");
         return;
     }
@@ -605,7 +654,7 @@ print(isinstance(42, abc.Sequence))
 print(isinstance({1, 2}, abc.Set))
 ";
     let (stdout, stderr, ok) = run_py(src);
-    if !ok || stderr.contains("ModuleNotFoundError") {
+    if bridge_unavailable(ok, &stderr) {
         eprintln!("skipping ffi-isinstance-abc test: stdlib bridge unavailable ({stderr})");
         return;
     }
@@ -633,7 +682,7 @@ except Exception as e:
     print('caught', type(e).__name__)
 ";
     let (stdout, stderr, ok) = run_py(src);
-    if !ok || stderr.contains("ModuleNotFoundError") {
+    if bridge_unavailable(ok, &stderr) {
         eprintln!("skipping ffi-foreign-exception test: stdlib bridge unavailable ({stderr})");
         return;
     }
@@ -666,7 +715,7 @@ except ArithmeticError:
     print('ArithmeticError')
 ";
     let (stdout, stderr, ok) = run_py(src);
-    if !ok || stderr.contains("ModuleNotFoundError") {
+    if bridge_unavailable(ok, &stderr) {
         eprintln!("skipping ffi-foreign-exc-base test: stdlib bridge unavailable ({stderr})");
         return;
     }
@@ -706,11 +755,7 @@ except Exception as e:
     // `dataclasses`, and the DEFAULT build (where dataclasses imports from real
     // CPython) still enforces the assertions below. The no-panic invariant is
     // still checked whenever the class is constructed.
-    let stdlib_unavailable = !ok
-        && (stderr.contains("ModuleNotFoundError")
-            || stderr.contains("SyntaxError")
-            || stderr.contains("ImportError"));
-    if stdlib_unavailable {
+    if bridge_unavailable(ok, &stderr) {
         eprintln!(
             "skipping ffi-frozen-setattr test: dataclasses unavailable on this build ({stderr})"
         );
@@ -748,7 +793,7 @@ print(classify(Point(2, 4)))
 print(classify(42))
 ";
     let (stdout, stderr, ok) = run_py(src);
-    if !ok || stderr.contains("ModuleNotFoundError") {
+    if bridge_unavailable(ok, &stderr) {
         eprintln!("skipping ffi-match-dataclass test: stdlib bridge unavailable ({stderr})");
         return;
     }

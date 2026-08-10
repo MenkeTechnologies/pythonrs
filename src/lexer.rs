@@ -491,7 +491,7 @@ impl Lexer {
         } else if is_f {
             self.push(Tok::FString(raw, is_raw));
         } else if is_bytes {
-            let decoded = decode_escapes(&raw, is_raw)?;
+            let decoded = decode_bytes_escapes(&raw, is_raw)?;
             // Each decoded code point is one byte (latin-1): `\xff` -> 0xFF, not
             // its two-byte UTF-8 encoding.
             let bytes: Vec<u8> = decoded.chars().map(|c| c as u32 as u8).collect();
@@ -646,6 +646,19 @@ impl Lexer {
 
 /// Decode Python string escapes. Raw strings keep backslashes literal.
 pub fn decode_escapes(raw: &str, is_raw: bool) -> Result<String, String> {
+    decode_escapes_mode(raw, is_raw, false)
+}
+
+/// Escape decoding for a BYTES literal. Differs from the text form in exactly
+/// the two ways CPython's `PyBytes_DecodeEscape` does: `\u`/`\U`/`\N` are not
+/// escapes at all (the backslash and letter stay literal), and a short `\x`
+/// reports `(value error) invalid \x escape at position N` rather than the
+/// `unicodeescape` wording.
+pub fn decode_bytes_escapes(raw: &str, is_raw: bool) -> Result<String, String> {
+    decode_escapes_mode(raw, is_raw, true)
+}
+
+fn decode_escapes_mode(raw: &str, is_raw: bool, bytes_mode: bool) -> Result<String, String> {
     if is_raw {
         return Ok(raw.to_string());
     }
@@ -682,32 +695,68 @@ pub fn decode_escapes(raw: &str, is_raw: bool) -> Result<String, String> {
                 'f' => out.push('\u{0C}'),
                 'v' => out.push('\u{0B}'),
                 '\n' => {} // line continuation inside string
-                'x' => {
-                    let h: String = chars[i + 1..(i + 3).min(chars.len())].iter().collect();
-                    if let Ok(n) = u32::from_str_radix(&h, 16) {
-                        if let Some(ch) = char::from_u32(n) {
-                            out.push(ch);
-                        }
-                        i += 2;
-                    }
+                // `\xXX`, `\uXXXX`, `\UXXXXXXXX` — a FIXED digit count. Fewer hex
+                // digits than the escape demands is a `SyntaxError` in CPython,
+                // not a shorter escape: pythonrs read as many as were there and
+                // silently produced a different string, so `'\x2'` evaluated to
+                // `'\x02'`, `'\u12'` to `'\x12'` and `'\xzz'` to `'zz'`.
+                // `\u`, `\U` and `\N` are TEXT escapes only; inside a bytes
+                // literal CPython leaves them as the two literal characters.
+                // pythonrs decoded them anyway, so `b'ሴ'` — six bytes in
+                // CPython — came out as the single byte `b'4'`.
+                'u' | 'U' | 'N' if bytes_mode => {
+                    out.push('\\');
+                    out.push(e);
                 }
-                'u' => {
-                    let h: String = chars[i + 1..(i + 5).min(chars.len())].iter().collect();
-                    if let Ok(n) = u32::from_str_radix(&h, 16) {
-                        if let Some(ch) = char::from_u32(n) {
-                            out.push(ch);
+                'x' | 'u' | 'U' => {
+                    let want = match e {
+                        'x' => 2,
+                        'u' => 4,
+                        _ => 8,
+                    };
+                    let start = byte_offset(&chars, i - 1);
+                    // A bytes literal reports the same defect as a `value error`
+                    // out of `PyBytes_DecodeEscape`, with a different wording and
+                    // only the start position.
+                    if bytes_mode {
+                        let digits = chars[i + 1..]
+                            .iter()
+                            .take(want)
+                            .take_while(|c| c.is_ascii_hexdigit())
+                            .count();
+                        if digits < want {
+                            return Err(format!(
+                                "SyntaxError: (value error) invalid \\x escape at position {start}"
+                            ));
                         }
-                        i += 4;
                     }
-                }
-                'U' => {
-                    let h: String = chars[i + 1..(i + 9).min(chars.len())].iter().collect();
-                    if let Ok(n) = u32::from_str_radix(&h, 16) {
-                        if let Some(ch) = char::from_u32(n) {
-                            out.push(ch);
+                    let digits: String = chars[i + 1..]
+                        .iter()
+                        .take(want)
+                        .take_while(|c| c.is_ascii_hexdigit())
+                        .collect();
+                    if digits.len() < want {
+                        // CPython's span covers the backslash, the escape letter,
+                        // and however many hex digits it did manage to read.
+                        return Err(unicode_escape_err(
+                            start,
+                            start + 1 + digits.len(),
+                            EscErr::Truncated(e),
+                        ));
+                    }
+                    let n = u32::from_str_radix(&digits, 16).unwrap_or(u32::MAX);
+                    match char::from_u32(n) {
+                        Some(ch) => out.push(ch),
+                        // Past U+10FFFF (only reachable through `\U`).
+                        None => {
+                            return Err(unicode_escape_err(
+                                start,
+                                start + 1 + want,
+                                EscErr::IllegalChar,
+                            ))
                         }
-                        i += 8;
                     }
+                    i += want;
                 }
                 // Named Unicode escape `\N{NAME}` (e.g. `\N{LATIN SMALL LETTER E WITH ACUTE}`).
                 'N' => {
@@ -715,7 +764,7 @@ pub fn decode_escapes(raw: &str, is_raw: bool) -> Result<String, String> {
                     let start = byte_offset(&chars, i - 1);
                     if chars.get(i + 1) != Some(&'{') {
                         // `\N` not followed by `{` → malformed (covers just `\N`).
-                        return Err(unicode_escape_err(start, start + 1, false));
+                        return Err(unicode_escape_err(start, start + 1, EscErr::MalformedName));
                     }
                     let name_start = i + 2;
                     let mut j = name_start;
@@ -725,12 +774,12 @@ pub fn decode_escapes(raw: &str, is_raw: bool) -> Result<String, String> {
                     if j >= chars.len() {
                         // No closing `}` → malformed (covers to end of the literal).
                         let end = raw.len().saturating_sub(1);
-                        return Err(unicode_escape_err(start, end, false));
+                        return Err(unicode_escape_err(start, end, EscErr::MalformedName));
                     }
                     if j == name_start {
                         // Empty `\N{}` → malformed (covers `\N{`).
                         let end = byte_offset(&chars, i + 1);
-                        return Err(unicode_escape_err(start, end, false));
+                        return Err(unicode_escape_err(start, end, EscErr::MalformedName));
                     }
                     let name: String = chars[name_start..j].iter().collect();
                     // CPython matches names case-insensitively but NOT loosely — leading/
@@ -749,7 +798,7 @@ pub fn decode_escapes(raw: &str, is_raw: bool) -> Result<String, String> {
                         None => {
                             // Unknown name → covers `\N{NAME}` through the closing `}`.
                             let end = byte_offset(&chars, j);
-                            return Err(unicode_escape_err(start, end, true));
+                            return Err(unicode_escape_err(start, end, EscErr::UnknownName));
                         }
                     }
                 }
@@ -793,17 +842,46 @@ fn byte_offset(chars: &[char], idx: usize) -> usize {
     chars[..idx].iter().map(|c| c.len_utf8()).sum()
 }
 
-/// Format CPython's `unicodeescape` error for a `\N{...}` escape. `unknown` picks
-/// between the unknown-name and malformed-escape messages; `start`/`end` are the
-/// inclusive byte positions CPython reports.
-fn unicode_escape_err(start: usize, end: usize, unknown: bool) -> String {
-    let reason = if unknown {
-        "unknown Unicode character name"
-    } else {
-        "malformed \\N character escape"
+/// Which `unicodeescape` failure to report. The four spellings are CPython's own
+/// (`Objects/unicodeobject.c`, `unicode_decode_call_errorhandler_writer`
+/// callers), reproduced verbatim.
+pub(crate) enum EscErr {
+    /// `\N{...}` that is not a well-formed named escape.
+    MalformedName,
+    /// `\N{...}` whose name is not in the Unicode database.
+    UnknownName,
+    /// `\x`/`\u`/`\U` with fewer hex digits than it requires; carries the escape
+    /// letter so the message names the right form.
+    Truncated(char),
+    /// A `\U` code point past U+10FFFF.
+    IllegalChar,
+}
+
+/// Format CPython's `unicodeescape` error. `start`/`end` are the inclusive byte
+/// positions CPython reports.
+fn unicode_escape_err(start: usize, end: usize, kind: EscErr) -> String {
+    let truncated;
+    let reason: &str = match kind {
+        EscErr::UnknownName => "unknown Unicode character name",
+        EscErr::MalformedName => "malformed \\N character escape",
+        EscErr::IllegalChar => "illegal Unicode character",
+        EscErr::Truncated(e) => {
+            let form = match e {
+                'x' => "\\xXX",
+                'u' => "\\uXXXX",
+                _ => "\\UXXXXXXXX",
+            };
+            truncated = format!("truncated {form} escape");
+            &truncated
+        }
     };
+    // CPython raises this as a `SyntaxError` whose `str()` is the parenthesised
+    // `(unicode error) …` text, so the reported line reads
+    // `SyntaxError: (unicode error) …`. The prefix was missing here, and the
+    // escape-decoding errors were the only lexer diagnostics printed without an
+    // exception name in front of them.
     format!(
-        "(unicode error) 'unicodeescape' codec can't decode bytes in position {}-{}: {}",
+        "SyntaxError: (unicode error) 'unicodeescape' codec can't decode bytes in position {}-{}: {}",
         start, end, reason
     )
 }

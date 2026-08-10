@@ -409,8 +409,7 @@ fn stdin_traceback_omits_source_lines() {
 
 #[test]
 fn print_to_stderr_does_not_error() {
-    // `print(..., file=sys.stderr)` routes off stdout without raising (the bytes
-    // land on the process's stderr, which this in-process test can't capture).
+    // `print(..., file=sys.stderr)` routes off stdout without raising.
     let r = run_program(
         "import sys\nprint('x', file=sys.stderr)\nok = True",
         vec![String::new()],
@@ -420,6 +419,29 @@ fn print_to_stderr_does_not_error() {
     );
     assert_eq!(r.exit_code, 0);
     assert_eq!(r.stderr, None);
+
+    // The two assertions above say only "no exception was raised" — `r.stderr`
+    // is the traceback slot, not captured output, so they are equally satisfied
+    // by a `print` that wrote the bytes NOWHERE. Re-run out of process, where
+    // the two streams are real file descriptors, and pin which one got what.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_python"))
+        .args([
+            "-c",
+            "import sys\n\
+             print('to-out')\n\
+             print('to-err', file=sys.stderr)\n\
+             print('err-no-newline', file=sys.stderr, end='')\n\
+             sys.stderr.write('|direct')\n",
+        ])
+        .output()
+        .expect("spawn python binary");
+    assert!(out.status.success(), "exited {:?}", out.status.code());
+    // Byte-checked against `python3 -c` with the same program.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "to-out\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "to-err\nerr-no-newline|direct"
+    );
 }
 
 #[test]

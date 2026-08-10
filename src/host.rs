@@ -10020,6 +10020,21 @@ impl PyHost {
                     let ty = self.alloc(PyObj::Builtin(tn.clone()));
                     return self.get_attr(&ty, name);
                 }
+                // A TYPE object reports itself by name, not as an anonymous
+                // instance of `type`: CPython's `type.__getattribute__` raises
+                // `type object 'str' has no attribute 'x'`. pythonrs answered
+                // `'type' object has no attribute 'x'` for every builtin type, so
+                // the message never said WHICH type was missing the attribute —
+                // the user-class path (which does name its class) already had the
+                // right wording.
+                if let Some(PyObj::Builtin(b)) = self.get(recv) {
+                    let b = b.clone();
+                    if crate::builtins::is_type_like_builtin(&b) {
+                        return Err(format!(
+                            "AttributeError: type object '{b}' has no attribute '{name}'"
+                        ));
+                    }
+                }
                 Err(format!(
                     "AttributeError: '{tn}' object has no attribute '{name}'"
                 ))

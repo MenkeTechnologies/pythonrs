@@ -1834,11 +1834,13 @@ impl Parser {
         let mut parts: Vec<FStrPart> = Vec::new();
         let mut any_f = false;
         let mut any_t = false;
+        let mut any_plain = false;
         let mut byte_acc: Option<Vec<u8>> = None;
         loop {
             match self.cur().clone() {
                 Tok::Str(s) => {
                     self.advance();
+                    any_plain = true;
                     parts.push(FStrPart::Lit(s));
                 }
                 Tok::Bytes(b) => {
@@ -1860,13 +1862,25 @@ impl Parser {
                 _ => break,
             }
         }
+        // A group must be all-bytes or all-text, and a t-string joins only other
+        // t-strings — the pieces produce different types, so there is nothing to
+        // concatenate. Both messages are CPython 3.14.6's, and the t-string check
+        // runs first because CPython reports `t'a' b'b'` as the t-string error.
+        //
+        // pythonrs used to accept every one of these silently and produce a
+        // value: `'a' b'b'` evaluated to `b'b'` (the text half was dropped on the
+        // floor by the early return below) and `t'a' f'b'` to a `Template`.
+        if any_t && (any_f || any_plain || byte_acc.is_some()) {
+            return Err(
+                "SyntaxError: cannot mix t-string literals with string or bytes literals"
+                    .to_string(),
+            );
+        }
+        if byte_acc.is_some() && (any_plain || any_f || any_t) {
+            return Err("SyntaxError: cannot mix bytes and nonbytes literals".to_string());
+        }
         if let Some(b) = byte_acc {
             return Ok(Expr::Bytes(b));
-        }
-        // Concatenating a t-string with an f-string is a SyntaxError in CPython:
-        // the two produce different types, so there is nothing to join.
-        if any_t && any_f {
-            return Err("SyntaxError: cannot mix t-string and f-string literals".to_string());
         }
         if any_t {
             Ok(Expr::TString(parts))
