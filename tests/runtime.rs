@@ -665,3 +665,107 @@ fn attribute_store_and_delete_carry_a_line_and_caret() {
         )
     );
 }
+
+// ── PYTHONHASHSEED (subprocess: the secret is a process-wide OnceLock) ────────
+
+/// Run `python -c <code>` with `PYTHONHASHSEED` set to `seed`, returning
+/// `(stdout, stderr, exit code)`. A subprocess is required: the hash secret
+/// latches once per process, so an in-process test could only ever observe the
+/// seed the test runner itself was started with.
+fn run_with_hash_seed(seed: &str, code: &str) -> (String, String, i32) {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_python"))
+        .env("PYTHONHASHSEED", seed)
+        .args(["-c", code])
+        .output()
+        .expect("spawn python binary");
+    (
+        String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        out.status.code().unwrap_or(-1),
+    )
+}
+
+/// A pinned `PYTHONHASHSEED` reproduces CPython's `str`/`bytes` hashes for that
+/// seed, not just for seed 0.
+///
+/// The expected numbers are CPython 3.14.6's, measured as
+/// `PYTHONHASHSEED=<seed> python3 -c 'print(hash("abc"), hash(b"xyz"), hash("héllo"))'`.
+/// Before `_Py_HashRandomization_Init` was ported, every seed produced the
+/// seed-0 row, so only the first case here would have passed.
+#[test]
+fn pinned_hash_seed_matches_cpython_for_every_seed() {
+    let cases = [
+        (
+            "0",
+            "-4594863902769663758 9013747392277146282 6395329678795984700",
+        ),
+        (
+            "1",
+            "-4667308735975688587 -5634034666027049350 4627783765987660535",
+        ),
+        (
+            "42",
+            "3869580338025362921 -4491887112347156947 -4058713343194919257",
+        ),
+        (
+            "4294967295",
+            "-6122489556238538401 2562532176708456890 3491461287047953188",
+        ),
+    ];
+    for (seed, expect) in cases {
+        let (out, err, code) =
+            run_with_hash_seed(seed, r#"print(hash("abc"), hash(b"xyz"), hash("héllo"))"#);
+        assert_eq!(code, 0, "seed {seed}: exited {code}, stderr {err}");
+        assert_eq!(out, expect, "seed {seed}");
+    }
+}
+
+/// An unset or `random` seed draws per-process entropy, as CPython does, so two
+/// runs disagree. This is the behavior that makes the dict-collision mitigation
+/// real; a fixed default would be a security regression against CPython, not
+/// just a cosmetic one.
+///
+/// The empty string is CPython's "unset" (`_Py_GetEnv` maps it to `NULL`), and
+/// `hash("")` is 0 under every key — so the run that varies and the value that
+/// cannot vary are asserted together, which is what distinguishes "randomized"
+/// from "crashed".
+#[test]
+fn unpinned_hash_seed_varies_per_process() {
+    for seed in ["random", ""] {
+        let code = r#"print(hash("abc"), hash(""))"#;
+        let (a, _, ca) = run_with_hash_seed(seed, code);
+        let (b, _, cb) = run_with_hash_seed(seed, code);
+        assert_eq!((ca, cb), (0, 0), "seed {seed:?} should run");
+        assert_ne!(a, b, "seed {seed:?} should randomize across processes");
+        assert!(
+            a.ends_with(" 0") && b.ends_with(" 0"),
+            "hash('') must stay 0"
+        );
+    }
+}
+
+/// A `PYTHONHASHSEED` CPython refuses is refused here, with CPython's own
+/// pre-initialization message and exit code — accepting it would let a program
+/// run under pythonrs that aborts under `python3`.
+#[test]
+fn invalid_hash_seed_is_the_cpython_fatal_error() {
+    // strtoul semantics: trailing text (including a space), a non-decimal base,
+    // and anything outside [0, 4294967295].
+    for seed in ["abc", "-1", "4294967296", "0x10", "42 ", "1e3", " "] {
+        let (out, err, code) = run_with_hash_seed(seed, "print(1)");
+        assert_eq!(code, 1, "seed {seed:?} should be fatal, stdout {out:?}");
+        assert_eq!(out, "", "seed {seed:?} must not run the program");
+        assert_eq!(
+            err,
+            "Fatal Python error: config_init_hash_seed: PYTHONHASHSEED must be \"random\" \
+             or an integer in range [0; 4294967295]\nPython runtime state: preinitialized",
+            "seed {seed:?}"
+        );
+    }
+    // …and the forms strtoul DOES accept still run: leading space, leading
+    // zeros, an explicit sign.
+    for seed in [" 42", "007", "+7", "-0"] {
+        let (_, err, code) = run_with_hash_seed(seed, "print(1)");
+        assert_eq!(code, 0, "seed {seed:?} should be accepted, stderr {err}");
+    }
+}

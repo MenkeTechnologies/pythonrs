@@ -5294,6 +5294,27 @@ fn as_f(v: &Value) -> Option<f64> {
     }
 }
 
+/// The `f64` a FLOAT presentation type (`f`/`e`/`g`/`%`) must see.
+///
+/// [`as_f`] stops at `i64`, so a bignum falls through it — and a `.unwrap_or(0.0)`
+/// there turns `format(10**20, 'f')` into `0.000000` instead of
+/// `100000000000000000000.000000`. CPython converts through `PyNumber_Float` and
+/// raises when the magnitude is past `f64`, which is what the error arm is.
+fn as_f_wide(v: &Value) -> Result<f64, String> {
+    if let Some(f) = as_f(v) {
+        return Ok(f);
+    }
+    match with_host(|h| h.big_val(v)) {
+        Some(n) => {
+            use num_traits::ToPrimitive;
+            n.to_f64()
+                .filter(|f| f.is_finite())
+                .ok_or_else(|| "OverflowError: int too large to convert to float".to_string())
+        }
+        None => Ok(0.0),
+    }
+}
+
 /// 3-argument `pow(base, exp, mod)` — modular exponentiation. All three must be
 /// integers; `exp` must be non-negative (a negative exponent needs a modular
 /// inverse, which is not yet implemented). The result takes the sign of `mod`
@@ -15120,11 +15141,18 @@ pub fn apply_format_spec(s: &str, v: &Value, spec: &str) -> Result<String, Strin
     // being implied by the `0` flag — CPython rejects an explicit `=` on strings
     // but accepts the `0`-implied form.
     let mut align_explicit = false;
+    // Whether a FILL char was written. Tracked separately from the alignment
+    // because the `0` flag keys off it alone: `'<08d'` writes an alignment but
+    // no fill, so the `0` still becomes the fill (`format(1, '<08d')` is
+    // `10000000`), while `'*<08d'` names its own fill and the `0` is part of
+    // the width instead.
+    let mut fill_explicit = false;
     // [[fill]align]
     if chars.len() >= 2 && matches!(chars[1], '<' | '>' | '^' | '=') {
         fill = chars[0];
         align = chars[1];
         align_explicit = true;
+        fill_explicit = true;
         i = 2;
     } else if !chars.is_empty() && matches!(chars[0], '<' | '>' | '^' | '=') {
         align = chars[0];
@@ -15141,10 +15169,13 @@ pub fn apply_format_spec(s: &str, v: &Value, spec: &str) -> Result<String, Strin
         alt = true;
         i += 1;
     }
-    if i < chars.len() && chars[i] == '0' {
-        if align == '\0' {
+    // `parse_internal_render_format_spec`'s "special case for 0-padding": the
+    // `0` is only a flag when no fill char was named, and it only forces `=`
+    // alignment when no alignment was named either.
+    if i < chars.len() && chars[i] == '0' && !fill_explicit {
+        fill = '0';
+        if !align_explicit {
             align = '=';
-            fill = '0';
         }
         i += 1;
     }
@@ -15185,6 +15216,12 @@ pub fn apply_format_spec(s: &str, v: &Value, spec: &str) -> Result<String, Strin
 
     validate_format_spec(v, ty, sign, alt, group, prec, align, align_explicit)?;
 
+    // `as_f` narrows to f64 and returns `None` for a bignum, so it can't be the
+    // sole numeric test: an int above `i64::MAX` is still numeric and must keep
+    // grouping, the `+`/space sign flag, and `0`-fill interleave. `is_int_like`
+    // covers the `PyObj::BigInt` case that `as_f` drops.
+    let numeric = as_f(v).is_some() || is_int_like(v);
+
     // Render body by type.
     let body =
         match ty {
@@ -15193,17 +15230,17 @@ pub fn apply_format_spec(s: &str, v: &Value, spec: &str) -> Result<String, Strin
                 None => s.to_string(),
             },
             'f' | 'F' => {
-                let f = as_f(v).unwrap_or(0.0);
+                let f = as_f_wide(v)?;
                 fmt_nonfinite(f, ty == 'F')
                     .unwrap_or_else(|| format!("{:.*}", prec.unwrap_or(6), f))
             }
             'e' | 'E' => {
-                let f = as_f(v).unwrap_or(0.0);
+                let f = as_f_wide(v)?;
                 fmt_nonfinite(f, ty == 'E')
                     .unwrap_or_else(|| crate::host::fmt_sci(f, prec.unwrap_or(6), ty == 'E'))
             }
             'g' | 'G' => {
-                let f = as_f(v).unwrap_or(0.0);
+                let f = as_f_wide(v)?;
                 fmt_nonfinite(f, ty == 'G')
                     .unwrap_or_else(|| crate::host::fmt_g(f, prec.unwrap_or(6), ty == 'G', alt))
             }
@@ -15222,33 +15259,55 @@ pub fn apply_format_spec(s: &str, v: &Value, spec: &str) -> Result<String, Strin
             'b' => fmt_int_radix(v, 2, if alt { "0b" } else { "" }, false)
                 .unwrap_or_else(|| s.to_string()),
             '%' => {
-                let f = as_f(v).unwrap_or(0.0);
+                let f = as_f_wide(v)?;
                 match fmt_nonfinite(f, false) {
                     Some(s) => format!("{s}%"),
                     None => format!("{:.*}%", prec.unwrap_or(6), f * 100.0),
                 }
+            }
+            // `n` renders as `d` for an int-like value and as `g` for a float —
+            // `format_float_internal` literally does `if (type == 'n') type = 'g'`.
+            // Only the LOCALE differs, and that is applied below with the digits
+            // already in hand.
+            'n' if is_int_like(v) => match with_host(|h| h.big_val(v)) {
+                Some(n) => n.to_string(),
+                None => s.to_string(),
+            },
+            'n' => {
+                let f = as_f_wide(v)?;
+                fmt_nonfinite(f, false)
+                    .unwrap_or_else(|| crate::host::fmt_g(f, prec.unwrap_or(6), false, alt))
             }
             _ => {
                 let mut body = s.to_string();
                 if let Some(p) = prec {
                     if matches!(v, Value::Str(_)) || is_str(v) {
                         body = body.chars().take(p).collect();
-                    } else if let Some(f) = as_f(v) {
+                    } else if numeric {
                         // A float with a precision but no presentation type uses
                         // CPython's "general" float format, NOT fixed-point.
+                        let f = as_f_wide(v)?;
                         body = fmt_nonfinite(f, false)
-                            .unwrap_or_else(|| crate::host::fmt_none_float(f, p));
+                            .unwrap_or_else(|| crate::host::fmt_none_float(f, p, alt));
                     }
                 }
                 body
             }
         };
 
-    // `as_f` narrows to f64 and returns `None` for a bignum, so it can't be the
-    // sole numeric test: an int above `i64::MAX` is still numeric and must keep
-    // grouping, the `+`/space sign flag, and `0`-fill interleave. `is_int_like`
-    // covers the `PyObj::BigInt` case that `as_f` drops.
-    let numeric = as_f(v).is_some() || is_int_like(v);
+    // `#` on a float conversion is `Py_DTSF_ALT`, which keeps a decimal point in
+    // the output even when the precision rounded every fraction digit away. It
+    // means nothing on an INT (`format(1234, '#n')` is `1234`, and on `x`/`o`/`b`
+    // `#` is the `0x`/`0o`/`0b` prefix instead), so the int-rendered types are
+    // excluded.
+    let float_render = matches!(ty, 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | '%')
+        || ((ty == 'n' || ty == '\0') && !is_int_like(v) && numeric);
+    let body = if alt && float_render {
+        crate::host::alt_decimal_point(&body)
+    } else {
+        body
+    };
+
     // Decompose the numeric body into sign / radix-prefix / integer-digits /
     // trailing (fraction or exponent), so grouping and sign-aware zero-fill can
     // operate on just the integer digits — exactly like CPython.
@@ -15272,15 +15331,66 @@ pub fn apply_format_spec(s: &str, v: &Value, spec: &str) -> Result<String, Strin
     // Split off the fraction / exponent so grouping touches only the integer
     // digits. `e`/`E` are exponent markers ONLY for the float-exp types — for a
     // hex value like `3e517` they are ordinary digits.
-    let split: &[char] = if matches!(ty, 'e' | 'E' | 'g' | 'G') {
-        &['.', 'e', 'E']
+    // `parse_number` (`Python/formatter_unicode.c`): for the FLOAT presentation
+    // types the integer part is exactly the leading run of ASCII digits, and
+    // everything after it is "remainder" that grouping must never reach — the
+    // `.5`, the `e+03`, the `%` suffix (`format(1, '_.0%')` is `100%`, not
+    // `1_00%`), and the whole of `inf`/`nan`. An int-like value already had its
+    // type rewritten to `'d'`, so a no-type spec here is a float.
+    //
+    // The radix types are the opposite case: `ff` IS the digit string in base
+    // 16, so there the integer part runs up to the first `.`.
+    let cut = if matches!(ty, 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | 'n' | '%' | '\0') {
+        rest.find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len())
     } else {
-        &['.']
+        rest.find('.').unwrap_or(rest.len())
     };
-    let (intpart, tail): (&str, &str) = match rest.find(split) {
-        Some(p) => (&rest[..p], &rest[p..]),
-        None => (rest, ""),
-    };
+    let (intpart, tail): (&str, &str) = rest.split_at(cut);
+
+    // Sign-aware zero-fill only interleaves separators when the fill is '0' and
+    // the alignment is '=' (the `0` flag). Any other fill/align groups the
+    // natural digits first, then pads as an opaque block.
+    let zero_interleave = align == '=' && fill == '0';
+
+    // `calc_number_widths` short-circuits `n_grouped_digits` to 0 when there are
+    // no digits, which is what makes `inf`/`nan` ungroupable: their letters are
+    // all remainder, so `format(inf, '012,f')` is `000000000inf`, never
+    // `0,000,000,inf`.
+    let groupable = !intpart.is_empty();
+
+    // `n` is the one spec whose output depends on the process locale: it groups
+    // by `localeconv()`'s widths with `localeconv()`'s separator, and writes its
+    // decimal point (`LT_CURRENT_LOCALE` in `Python/formatter_unicode.c`). The
+    // `,`/`_` grouping below is the fixed built-in locale and never varies.
+    if numeric && ty == 'n' {
+        let loc = locale_numeric();
+        let tail = match tail.strip_prefix('.') {
+            Some(rest) => format!("{}{rest}", loc.decimal_point),
+            None => tail.to_string(),
+        };
+        // `calc_number_widths`: the `0` flag pads the DIGITS out to the width,
+        // so the separators land inside the padding rather than after it.
+        let min_width = if zero_interleave && groupable {
+            width.saturating_sub(
+                sign_str.chars().count() + prefix.chars().count() + tail.chars().count(),
+            )
+        } else {
+            0
+        };
+        let grouped = if groupable {
+            insert_grouping_locale(intpart, &loc.thousands_sep, &loc.grouping, min_width)
+        } else {
+            intpart.to_string()
+        };
+        return Ok(pad_to_width(
+            &format!("{sign_str}{prefix}{grouped}{tail}"),
+            width,
+            fill,
+            align,
+            true,
+        ));
+    }
 
     // Grouping size: `_` groups hex/oct/bin by 4; `,` and decimal/float `_`
     // group by 3. Non-numeric bodies never group.
@@ -15292,12 +15402,7 @@ pub fn apply_format_spec(s: &str, v: &Value, spec: &str) -> Result<String, Strin
     };
     let sep = group.unwrap_or(',');
 
-    // Sign-aware zero-fill only interleaves separators when the fill is '0' and
-    // the alignment is '=' (the `0` flag). Any other fill/align groups the
-    // natural digits first, then pads as an opaque block.
-    let zero_interleave = align == '=' && fill == '0';
-
-    if numeric && group_size > 0 && zero_interleave {
+    if numeric && groupable && group_size > 0 && zero_interleave {
         // Grow the integer-digit count until sign + prefix + grouped(n) + tail
         // reaches the width; leading zeros pad the magnitude, then group.
         let fixed = sign_str.chars().count() + prefix.chars().count() + tail.chars().count();
@@ -15311,19 +15416,24 @@ pub fn apply_format_spec(s: &str, v: &Value, spec: &str) -> Result<String, Strin
     }
 
     // Group the natural integer digits (no interleaved padding).
-    let intpart_g = if numeric && group_size > 0 {
+    let intpart_g = if numeric && groupable && group_size > 0 {
         insert_grouping(intpart, sep, group_size)
     } else {
         intpart.to_string()
     };
     let body = format!("{sign_str}{prefix}{intpart_g}{tail}");
+    Ok(pad_to_width(&body, width, fill, align, numeric))
+}
 
+/// Pad a rendered numeric/string body out to `width` under `align`/`fill`.
+fn pad_to_width(body: &str, width: usize, fill: char, align: char, numeric: bool) -> String {
+    let body = body.to_string();
     let len = body.chars().count();
     if len >= width {
-        return Ok(body);
+        return body;
     }
     let pad = width - len;
-    Ok(match align {
+    match align {
         '<' => format!("{body}{}", fill.to_string().repeat(pad)),
         '^' => {
             let l = pad / 2;
@@ -15366,7 +15476,7 @@ pub fn apply_format_spec(s: &str, v: &Value, spec: &str) -> Result<String, Strin
                 format!("{body}{}", fill.to_string().repeat(pad))
             }
         }
-    })
+    }
 }
 
 /// Validate a parsed format spec against the value's type, matching CPython's
@@ -15443,20 +15553,40 @@ fn validate_format_spec(
     }
 
     // Grouping-vs-type: ',' is illegal with the radix / char / locale types;
-    // '_' is illegal only with 'c'.
+    // '_' is illegal with 'c' and with 'n' — `n` brings its OWN separator from
+    // the locale, so asking for a second one is a contradiction, and CPython's
+    // `parse_internal_render_format_spec` rejects both spellings for it.
     match group {
         Some(',') if matches!(ty, 'x' | 'X' | 'o' | 'b' | 'c' | 'n') => {
             return Err("ValueError: Cannot specify ',' with '?'.".replace('?', &ty.to_string()));
         }
-        Some('_') if ty == 'c' => {
-            return Err("ValueError: Cannot specify '_' with 'c'.".into());
+        Some('_') if matches!(ty, 'c' | 'n') => {
+            return Err("ValueError: Cannot specify '_' with '?'.".replace('?', &ty.to_string()));
         }
         _ => {}
     }
 
-    // Precision is not allowed when the effective type is an integer type.
-    if is_int && prec.is_some() && matches!(ty, '\0' | 'b' | 'o' | 'x' | 'X' | 'c' | 'd') {
+    // Precision is not allowed when the effective type is an integer type. `n`
+    // counts as one for an INT value (it renders through `long.__format__`),
+    // while `format(1.5, '.2n')` is fine — the same spec, judged by the value.
+    if is_int && prec.is_some() && matches!(ty, '\0' | 'b' | 'o' | 'x' | 'X' | 'c' | 'd' | 'n') {
         return Err("ValueError: Precision not allowed in integer format specifier".into());
+    }
+
+    // 'c' produces a CHARACTER, so the numeric decorations make no sense on it:
+    // `format_long_internal`'s `case 'c'` rejects any sign (including an
+    // explicit `-`) and then the alternate form, in that order and after the
+    // precision check above.
+    if ty == 'c' {
+        if sign != '\0' {
+            return Err("ValueError: Sign not allowed with integer format specifier 'c'".into());
+        }
+        if alt {
+            return Err(
+                "ValueError: Alternate form (#) not allowed with integer format specifier 'c'"
+                    .into(),
+            );
+        }
     }
 
     // 'c' codepoint must be in range(0x110000).
@@ -15470,6 +15600,154 @@ fn validate_format_spec(
     }
 
     Ok(())
+}
+
+/// The C library's numeric locale, as `localeconv()` reports it — what
+/// CPython's `n` presentation type reads through `LT_CURRENT_LOCALE`.
+struct LocaleNumeric {
+    /// `localeconv()->decimal_point`.
+    decimal_point: String,
+    /// `localeconv()->thousands_sep`. Empty in the `C` locale, and not
+    /// necessarily one character (`fr_FR.UTF-8` uses U+202F).
+    thousands_sep: String,
+    /// `localeconv()->grouping`: successive group widths from the right. `0`
+    /// repeats the previous width forever, `CHAR_MAX` (127) stops grouping, and
+    /// an empty list means no grouping at all (the `C` locale).
+    grouping: Vec<u8>,
+}
+
+/// Read `localeconv()`. The process locale is whatever `setlocale` last
+/// installed — `locale.setlocale(locale.LC_ALL, '')` in the running program,
+/// most often — so this is deliberately not cached.
+fn locale_numeric() -> LocaleNumeric {
+    // SAFETY: `localeconv()` returns a pointer to libc-owned static storage,
+    // valid until the next `setlocale`/`localeconv`. Everything is copied out
+    // here, before any other libc call can run.
+    unsafe {
+        let lc = libc::localeconv();
+        if lc.is_null() {
+            return LocaleNumeric {
+                decimal_point: ".".into(),
+                thousands_sep: String::new(),
+                grouping: Vec::new(),
+            };
+        }
+        let mut decimal_point = locale_cstr((*lc).decimal_point);
+        if decimal_point.is_empty() {
+            decimal_point.push('.');
+        }
+        LocaleNumeric {
+            decimal_point,
+            thousands_sep: locale_cstr((*lc).thousands_sep),
+            grouping: locale_grouping((*lc).grouping),
+        }
+    }
+}
+
+/// Decode a locale-encoded C string. UTF-8 when it is valid (every `*.UTF-8`
+/// locale), otherwise latin-1 byte-per-char, which is what the `ISO8859-*`
+/// locales store.
+///
+/// # Safety
+/// `p` must be null or a valid NUL-terminated C string.
+unsafe fn locale_cstr(p: *const libc::c_char) -> String {
+    if p.is_null() {
+        return String::new();
+    }
+    let bytes = std::ffi::CStr::from_ptr(p).to_bytes();
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => bytes.iter().map(|&b| b as char).collect(),
+    }
+}
+
+/// Read `localeconv()->grouping` — a NUL-terminated array of group widths, not
+/// a text string.
+///
+/// # Safety
+/// `p` must be null or a valid NUL-terminated C string.
+unsafe fn locale_grouping(p: *const libc::c_char) -> Vec<u8> {
+    if p.is_null() {
+        return Vec::new();
+    }
+    std::ffi::CStr::from_ptr(p).to_bytes().to_vec()
+}
+
+/// `_PyUnicode_InsertThousandsGrouping` (`Objects/unicodeobject.c`) with
+/// `GroupGenerator` from `Objects/stringlib/localeutil.h`.
+///
+/// Groups `digits` from the right using `grouping`'s successive widths, zero-
+/// padding the leftmost group until `min_width` digit positions are filled. The
+/// widths are variable on purpose: `hi_IN` groups `[3, 2, 0]`, so 1234567 is
+/// `12,34,567`, not `1,234,567`. `min_width` is how the `0` flag interleaves
+/// separators into its padding — `format(1234, '012n')` under `de_DE` is
+/// `0.001.234.567`-shaped, not `00000001.234`.
+fn insert_grouping_locale(digits: &str, sep: &str, grouping: &[u8], min_width: usize) -> String {
+    /// `GroupGenerator_next`: the next group width, or `0` to stop.
+    fn next_width(grouping: &[u8], i: &mut usize, previous: &mut isize) -> isize {
+        match grouping.get(*i).copied() {
+            // Past the end is C's NUL terminator: repeat the previous width.
+            None | Some(0) => *previous,
+            // CHAR_MAX means "no further grouping".
+            Some(127) => 0,
+            Some(w) => {
+                *previous = w as isize;
+                *i += 1;
+                w as isize
+            }
+        }
+    }
+
+    let cs: Vec<char> = digits.chars().collect();
+    let sep_len = sep.chars().count() as isize;
+    let mut remaining = cs.len() as isize;
+    let mut min_width = min_width as isize;
+    let mut pos = cs.len();
+    // Pieces are produced right-to-left and reversed at the end, matching
+    // CPython's backwards fill.
+    let mut pieces: Vec<String> = Vec::new();
+    let mut use_separator = false;
+    let mut i = 0usize;
+    let mut previous = 0isize;
+    let mut loop_broken = false;
+
+    let emit = |len: isize, pos: &mut usize, remaining: isize, pieces: &mut Vec<String>| {
+        let n_zeros = (len - remaining).max(0) as usize;
+        let n_chars = remaining.min(len).max(0) as usize;
+        let taken: String = cs[*pos - n_chars..*pos].iter().collect();
+        *pos -= n_chars;
+        pieces.push(format!("{}{taken}", "0".repeat(n_zeros)));
+        n_chars as isize
+    };
+
+    loop {
+        let len = next_width(grouping, &mut i, &mut previous);
+        if len <= 0 {
+            break;
+        }
+        let len = len.min(remaining.max(min_width).max(1));
+        if use_separator {
+            pieces.push(sep.to_string());
+        }
+        let n_chars = emit(len, &mut pos, remaining, &mut pieces);
+        use_separator = true;
+        remaining -= n_chars;
+        min_width -= len;
+        if remaining <= 0 && min_width <= 0 {
+            loop_broken = true;
+            break;
+        }
+        min_width -= sep_len;
+    }
+    if !loop_broken {
+        let len = remaining.max(min_width).max(1);
+        if use_separator {
+            pieces.push(sep.to_string());
+        }
+        emit(len, &mut pos, remaining, &mut pieces);
+    }
+    pieces.reverse();
+    pieces.concat()
 }
 
 /// Length of `n` digits after inserting a group separator every `size` digits

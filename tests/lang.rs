@@ -3834,6 +3834,46 @@ fn format_spec_sign_aware_zero_pad() {
     // A `+`/space sign flag prefixes a non-negative value.
     assert_eq!(g("s = f'{5: d}'", "s"), "' 5'");
     assert_eq!(g("s = f'{7:>6d}'", "s"), "'     7'");
+    // `parse_internal_render_format_spec`'s 0-padding special case keys off
+    // whether a FILL was named, not whether an alignment was: `<08d` writes an
+    // alignment but no fill, so the `0` still becomes the fill and pads on the
+    // right. Naming a fill (`*<08d`) makes the `0` part of the width instead.
+    // CPython 3.14.6.
+    assert_eq!(g("s = format(1, '<08d')", "s"), "'10000000'");
+    assert_eq!(g("s = format(1, '*<08d')", "s"), "'1*******'");
+    assert_eq!(g("s = format(1.0, '< 012.2e')", "s"), "' 1.00e+00000'");
+    assert_eq!(g("s = format(1, '^08d')", "s"), "'00010000'");
+    // Grouping stops at the digits: the `%` suffix and the exponent are
+    // remainder, so neither takes a separator.
+    assert_eq!(g("s = format(1, '_.0%')", "s"), "'100%'");
+    assert_eq!(g("s = format(1234, '_.0%')", "s"), "'123_400%'");
+    assert_eq!(g("s = format(1.5, ',.0')", "s"), "'2e+00'");
+}
+
+/// `c` produces a character, so the numeric decorations are rejected outright —
+/// including a bare `-`, which every other type accepts as the default sign.
+/// CPython 3.14.6 messages.
+#[test]
+fn char_format_rejects_sign_and_alternate_form() {
+    for spec in ["+c", "-c", " c"] {
+        assert_eq!(
+            pythonrs::eval_str(&format!("x = format(65, '{spec}')")).unwrap_err(),
+            "ValueError: Sign not allowed with integer format specifier 'c'",
+            "spec {spec}"
+        );
+    }
+    assert_eq!(
+        pythonrs::eval_str("x = format(65, '#c')").unwrap_err(),
+        "ValueError: Alternate form (#) not allowed with integer format specifier 'c'"
+    );
+    // The precision check runs FIRST, so it wins over both of the above.
+    assert_eq!(
+        pythonrs::eval_str("x = format(65, '+.1c')").unwrap_err(),
+        "ValueError: Precision not allowed in integer format specifier"
+    );
+    // Everything else about `c` still works.
+    assert_eq!(g("x = format(65, '=c')", "x"), "'A'");
+    assert_eq!(g("x = format(65, '05c')", "x"), "'0000A'");
 }
 
 // ── async / await / asyncio (native fusevm event loop) ───────────────────────
@@ -4626,6 +4666,143 @@ fn nonfinite_float_format() {
     // Non-finite still honors width and zero-fill (CPython `00000inf`).
     assert_eq!(g("x = f'{float(\"inf\"):08.2f}'", "x"), "'00000inf'");
     assert_eq!(g("x = f'{float(\"nan\"):>8}'", "x"), "'     nan'");
+    // …but the zero-fill is a plain block: `inf` has no DIGITS, so
+    // `calc_number_widths` short-circuits grouping and the separators never
+    // appear. CPython 3.14.6: `format(float('inf'), '012,f')` == '000000000inf'.
+    assert_eq!(
+        g("x = format(float('inf'), '012,f')", "x"),
+        "'000000000inf'"
+    );
+    assert_eq!(
+        g("x = format(float('nan'), '012,f')", "x"),
+        "'000000000nan'"
+    );
+    assert_eq!(
+        g("x = format(float('-inf'), '012,f')", "x"),
+        "'-00000000inf'"
+    );
+    assert_eq!(
+        g("x = format(float('inf'), '012,g')", "x"),
+        "'000000000inf'"
+    );
+    // `#` on a non-finite adds nothing — there is no fraction to point at.
+    assert_eq!(g("x = format(float('inf'), '#.0f')", "x"), "'inf'");
+}
+
+/// The `n` presentation type: `d` for an int, `g` for a float, and BOTH read
+/// their separator, group widths and decimal point from the process locale
+/// (`LT_CURRENT_LOCALE` in `Python/formatter_unicode.c`).
+///
+/// The tests below pin only the locale-independent half. `LC_NUMERIC` is
+/// whatever the test runner inherited and the `C` locale groups nothing, so
+/// asserting `1.234.567` here would pass or fail by machine; the locale-varying
+/// side is measured by the differential sweep against `python3` instead.
+/// Values from CPython 3.14.6 under `LC_ALL=C`.
+#[test]
+fn locale_aware_n_presentation_type() {
+    // Float `n` is `g`, NOT `str()`: at the default precision of 6 a
+    // seven-digit value goes scientific. This was the whole bug — `n` fell
+    // through to the no-type arm and printed the repr.
+    assert_eq!(g("x = format(1234567.891, 'n')", "x"), "'1.23457e+06'");
+    assert_eq!(g("x = format(123456.7, 'n')", "x"), "'123457'");
+    assert_eq!(g("x = format(100.0, 'n')", "x"), "'100'");
+    assert_eq!(g("x = format(3.14159265358979, 'n')", "x"), "'3.14159'");
+    assert_eq!(g("x = format(1234567.891, '.10n')", "x"), "'1234567.891'");
+    // Int `n` is `d`, and a `bool` goes through the int path like every other
+    // integer spec (`format(True, 'd')` is already `'1'`).
+    assert_eq!(g("x = format(1234567, 'n')", "x"), "'1234567'");
+    assert_eq!(g("x = format(True, 'n')", "x"), "'1'");
+    assert_eq!(g("x = format(-1234567, 'n')", "x"), "'-1234567'");
+    // Width/align/sign all still apply.
+    assert_eq!(g("x = format(1234567, '>12n')", "x"), "'     1234567'");
+    assert_eq!(g("x = format(1234567, '+n')", "x"), "'+1234567'");
+    // `n` brings its own separator from the locale, so asking for a second one
+    // is rejected — for BOTH spellings, and a precision is still illegal on an
+    // integer.
+    assert_eq!(
+        pythonrs::eval_str("x = format(1234, ',n')").unwrap_err(),
+        "ValueError: Cannot specify ',' with 'n'."
+    );
+    assert_eq!(
+        pythonrs::eval_str("x = format(1234, '_n')").unwrap_err(),
+        "ValueError: Cannot specify '_' with 'n'."
+    );
+    assert_eq!(
+        pythonrs::eval_str("x = format(1234, '.2n')").unwrap_err(),
+        "ValueError: Precision not allowed in integer format specifier"
+    );
+    // A float with a precision and `n` is fine — the same spec, judged by the
+    // value's type rather than by the spec alone.
+    assert_eq!(g("x = format(1.5, '.2n')", "x"), "'1.5'");
+}
+
+/// `#` on a FLOAT conversion is `Py_DTSF_ALT`: the decimal point survives even
+/// when the precision rounded every fractional digit away, and `g` keeps its
+/// trailing zeros. Values from CPython 3.14.6.
+#[test]
+fn alternate_form_keeps_the_decimal_point() {
+    assert_eq!(g("x = format(1.0, '#.0f')", "x"), "'1.'");
+    assert_eq!(g("x = format(1.0, '#.0e')", "x"), "'1.e+00'");
+    assert_eq!(g("x = format(1.0, '#.0%')", "x"), "'100.%'");
+    assert_eq!(g("x = format(1.0, '#.0g')", "x"), "'1.'");
+    assert_eq!(g("x = format(255.0, '#.0E')", "x"), "'3.E+02'");
+    assert_eq!(g("x = format(2.0, '#.3')", "x"), "'2.00'");
+    assert_eq!(g("x = format(2.0, '#.1')", "x"), "'2.e+00'");
+    // An INT with a float presentation type takes the same path…
+    assert_eq!(g("x = format(1, '#.0f')", "x"), "'1.'");
+    // …but `#` on an int-rendered type is either the radix prefix or nothing.
+    assert_eq!(g("x = format(255, '#x')", "x"), "'0xff'");
+    assert_eq!(g("x = format(1234, '#n')", "x"), "'1234'");
+    assert_eq!(g("x = format(1234, '#d')", "x"), "'1234'");
+    // `g` at zero must not short-circuit: the sign of `-0.0` and the `#` flag
+    // both survive. Regression — `fmt_g` returned a bare `"0"` for any zero.
+    assert_eq!(g("x = format(0.0, '#g')", "x"), "'0.00000'");
+    assert_eq!(g("x = format(-0.0, 'g')", "x"), "'-0'");
+    assert_eq!(g("x = format(-0.0, '#g')", "x"), "'-0.00000'");
+    assert_eq!(g("x = format(-0.0, '.3g')", "x"), "'-0'");
+    // The printf-style path shares the rule.
+    assert_eq!(g("x = '%#.0e' % 1.0", "x"), "'1.e+00'");
+    assert_eq!(g("x = '%#.0f' % 1.0", "x"), "'1.'");
+}
+
+/// A bignum reaching a FLOAT presentation type converts through `f64` like
+/// CPython's `PyNumber_Float`, and raises when the magnitude is past `f64`.
+/// Before this, `as_f` returned `None` for a bignum and the `.unwrap_or(0.0)`
+/// printed a silent zero. Values from CPython 3.14.6.
+#[test]
+fn bignum_through_a_float_presentation_type() {
+    assert_eq!(
+        g("x = format(10**20, 'f')", "x"),
+        "'100000000000000000000.000000'"
+    );
+    assert_eq!(g("x = format(10**20, '.3e')", "x"), "'1.000e+20'");
+    assert_eq!(g("x = format(10**20, 'g')", "x"), "'1e+20'");
+    assert_eq!(
+        g("x = format(-(10**25), '.2f')", "x"),
+        "'-10000000000000000905969664.00'"
+    );
+    assert_eq!(
+        pythonrs::eval_str("x = format(10**400, 'f')").unwrap_err(),
+        "OverflowError: int too large to convert to float"
+    );
+    // `%d` of a float is a truncation, and it must stay exact past `i64` and
+    // raise on a non-finite rather than saturating.
+    assert_eq!(
+        g("x = '%d' % 1e30", "x"),
+        "'1000000000000000019884624838656'"
+    );
+    assert_eq!(
+        pythonrs::eval_str("x = '%d' % float('inf')").unwrap_err(),
+        "OverflowError: cannot convert float infinity to integer"
+    );
+    assert_eq!(
+        pythonrs::eval_str("x = '%d' % float('nan')").unwrap_err(),
+        "ValueError: cannot convert float NaN to integer"
+    );
+    assert_eq!(
+        pythonrs::eval_str("x = '%c' % (10**20)").unwrap_err(),
+        "OverflowError: %c arg not in range(0x110000)"
+    );
 }
 
 /// A builtin exception class is a type object, so `repr(ValueError)` is

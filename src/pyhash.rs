@@ -29,10 +29,14 @@
 //! runs they differ every time even under `PYTHONHASHSEED=0`, so no
 //! implementation can reproduce them and none is attempted.
 //!
-//! **`str`/`bytes` are reproducible only at `PYTHONHASHSEED=0`.** They use
-//! SipHash-1-3 keyed by `_Py_HashSecret`, which CPython randomizes per process
-//! unless the seed is pinned. [`buffer`] implements the zero-key case, which is
-//! what a pinned `PYTHONHASHSEED=0` produces.
+//! **`str`/`bytes` follow `PYTHONHASHSEED`.** They use SipHash-1-3 keyed by
+//! `_Py_HashSecret`, which CPython derives in `Python/bootstrap_hash.c`
+//! (`_Py_HashRandomization_Init`): seed `0` installs an all-zero secret, any
+//! other pinned seed runs `lcg_urandom` over it, and an unset variable (or
+//! `random`) takes per-process entropy. [`hash_secret`] ports all three, so
+//! `hash('abc')` matches a seed-pinned CPython for EVERY seed, not just `0`.
+//! Against an unpinned CPython no implementation can agree — both sides are
+//! drawing their own entropy — which is a property of the seed, not a gap.
 
 /// `_PyHASH_BITS` — the numeric hash is taken modulo `2**BITS - 1`.
 const BITS: u32 = 61;
@@ -178,17 +182,150 @@ pub fn complex(re: f64, im: f64) -> Option<i64> {
 ///
 /// The empty buffer hashes to `0` (CPython does this deliberately, to avoid
 /// leaking `prefix ^ suffix` of the hash secret). Everything else is SipHash-1-3
-/// under the key from `_Py_HashSecret` — reproduced here for the all-zero key,
-/// which is what `PYTHONHASHSEED=0` installs.
+/// under [`hash_secret`], the `_Py_HashSecret` key `PYTHONHASHSEED` selects.
 pub fn buffer(data: &[u8]) -> i64 {
+    let (k0, k1) = hash_secret();
+    buffer_keyed(k0, k1, data)
+}
+
+/// [`buffer`] against an explicit key, so a test can pin a seed without owning
+/// the process-wide `PYTHONHASHSEED`.
+fn buffer_keyed(k0: u64, k1: u64, data: &[u8]) -> i64 {
     if data.is_empty() {
         return 0;
     }
-    let x = siphash13(0, 0, data);
+    let x = siphash13(k0, k1, data);
     if x == u64::MAX {
         return -2;
     }
     x as i64
+}
+
+/// What `PYTHONHASHSEED` asks for, as CPython's `config_init_hash_seed`
+/// (`Python/initconfig.c`) classifies it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HashSeed {
+    /// A pinned seed in `[0, 4294967295]`. `0` installs the all-zero secret;
+    /// every other value runs `lcg_urandom` over it.
+    Fixed(u32),
+    /// `"random"`, or the variable unset/empty — a per-process random secret.
+    Random,
+}
+
+/// Parse a `PYTHONHASHSEED` value, or `Err` for one CPython rejects.
+///
+/// `raw` is `None` when the variable is unset; CPython's `_Py_GetEnv` also maps
+/// the EMPTY string to unset, so `PYTHONHASHSEED=` is [`HashSeed::Random`].
+/// Anything else goes through `strtoul(s, &end, 10)` and must consume the whole
+/// string and land in `[0, 4294967295]` — which is why `" 42"` and `"007"` are
+/// accepted (leading space and zeros are strtoul's), while `"42 "`, `"0x10"`
+/// and `"-1"` are not (trailing text; `-1` wraps to `ULONG_MAX`).
+pub fn parse_hash_seed(raw: Option<&str>) -> Result<HashSeed, ()> {
+    let s = match raw {
+        None | Some("") => return Ok(HashSeed::Random),
+        Some("random") => return Ok(HashSeed::Random),
+        Some(s) => s,
+    };
+    // strtoul: leading whitespace, then an optional sign, then base-10 digits.
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() && (b[i] as char).is_ascii_whitespace() {
+        i += 1;
+    }
+    let neg = match b.get(i) {
+        Some(b'-') => {
+            i += 1;
+            true
+        }
+        Some(b'+') => {
+            i += 1;
+            false
+        }
+        _ => false,
+    };
+    let digits_start = i;
+    // Saturating: strtoul clamps to ULONG_MAX and sets ERANGE, and CPython
+    // rejects that alongside anything above 4294967295 — same outcome either way.
+    let mut n: u64 = 0;
+    while i < b.len() && b[i].is_ascii_digit() {
+        n = n.saturating_mul(10).saturating_add((b[i] - b'0') as u64);
+        i += 1;
+    }
+    // No digits at all, or trailing text: `*endptr != '\0'`.
+    if i == digits_start || i != b.len() {
+        return Err(());
+    }
+    // strtoul negates modulo 2**64, so any `-N` with N > 0 lands far above the
+    // ceiling; `-0` is still 0 and is accepted.
+    let n = if neg { 0u64.wrapping_sub(n) } else { n };
+    if n > 4_294_967_295 {
+        return Err(());
+    }
+    Ok(HashSeed::Fixed(n as u32))
+}
+
+/// `lcg_urandom` (`Python/bootstrap_hash.c`): the deterministic byte stream
+/// CPython expands a pinned `PYTHONHASHSEED` into. Not a CSPRNG and not meant to
+/// be one — its whole job is to make a pinned seed reproducible.
+fn lcg_urandom(x0: u32, out: &mut [u8]) {
+    let mut x = x0;
+    for slot in out.iter_mut() {
+        x = x.wrapping_mul(214013);
+        x = x.wrapping_add(2531011);
+        *slot = ((x >> 16) & 0xff) as u8;
+    }
+}
+
+/// The `(k0, k1)` SipHash key of `_Py_HashSecret`, resolved once per process.
+///
+/// `_Py_HashRandomization_Init` fills the 24-byte secret and `pysiphash` reads
+/// its first two little-endian `uint64`s as the key. An invalid seed never
+/// reaches here — `main` rejects it at startup, exactly where CPython's
+/// pre-initialization does.
+pub fn hash_secret() -> (u64, u64) {
+    static SECRET: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+    *SECRET.get_or_init(|| {
+        let seed = std::env::var("PYTHONHASHSEED").ok();
+        match parse_hash_seed(seed.as_deref()) {
+            Ok(HashSeed::Fixed(n)) => secret_for(n),
+            // Unreachable in the `python` binary (`main` exits first); a library
+            // embedder that never validated gets the seed-0 key rather than a
+            // panic.
+            Err(()) => secret_for(0),
+            Ok(HashSeed::Random) => random_secret(),
+        }
+    })
+}
+
+/// The `(k0, k1)` key a pinned seed installs. Seed `0` zeroes the secret
+/// outright — `_Py_HashRandomization_Init` `memset`s it and does NOT run the
+/// LCG, so seed 0 is not `lcg_urandom(0, …)`.
+fn secret_for(seed: u32) -> (u64, u64) {
+    if seed == 0 {
+        return (0, 0);
+    }
+    let mut secret = [0u8; 24];
+    lcg_urandom(seed, &mut secret);
+    (
+        u64::from_le_bytes(secret[0..8].try_into().unwrap()),
+        u64::from_le_bytes(secret[8..16].try_into().unwrap()),
+    )
+}
+
+/// A per-process random SipHash key, for an unset or `random` seed.
+///
+/// `RandomState` keys come from the OS entropy source std already uses to seed
+/// `HashMap`, so this is the same class of randomness CPython's `getrandom`
+/// path provides — the point being unpredictability across processes, which is
+/// the dict-collision-DoS mitigation the seed exists for.
+fn random_secret() -> (u64, u64) {
+    use std::hash::{BuildHasher, Hasher};
+    let state = std::collections::hash_map::RandomState::new();
+    let mut a = state.build_hasher();
+    a.write_u8(0);
+    let mut b = state.build_hasher();
+    b.write_u8(1);
+    (a.finish(), b.finish())
 }
 
 /// SipHash-1-3 — one compression round per 8-byte block, three finalization
@@ -253,15 +390,20 @@ fn siphash13(k0: u64, k1: u64, src: &[u8]) -> u64 {
 /// would agree only for pure-ASCII strings, where the two encodings coincide,
 /// and silently diverge for everything else.
 pub fn string(s: &str) -> i64 {
+    buffer(&ucs_units(s))
+}
+
+/// A `str`'s raw code units in the width CPython would have stored it in —
+/// latin-1, UCS-2 or UCS-4 — which is what `unicode_hash` feeds to SipHash.
+fn ucs_units(s: &str) -> Vec<u8> {
     let max = s.chars().map(|c| c as u32).max().unwrap_or(0);
-    let bytes: Vec<u8> = if max < 0x100 {
+    if max < 0x100 {
         s.chars().map(|c| c as u8).collect()
     } else if max < 0x10000 {
         s.chars().flat_map(|c| (c as u16).to_le_bytes()).collect()
     } else {
         s.chars().flat_map(|c| (c as u32).to_le_bytes()).collect()
-    };
-    buffer(&bytes)
+    }
 }
 
 /// `tuple_hash`: the xxHash-derived accumulator over the ELEMENT hashes.
@@ -315,6 +457,22 @@ pub fn frozenset(element_hashes: &[i64]) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `hash(str)` under the `PYTHONHASHSEED=0` key.
+    ///
+    /// The process secret is a `OnceLock` over the AMBIENT `PYTHONHASHSEED`, and
+    /// the default is now per-process entropy (as in CPython). A test that
+    /// reproduces CPython's *seed-0* numbers therefore has to name that seed
+    /// instead of assuming the runner left the variable unset — otherwise it is
+    /// asserting the default, not the algorithm.
+    fn string0(s: &str) -> i64 {
+        buffer_keyed(0, 0, &ucs_units(s))
+    }
+
+    /// `hash(bytes)` under the `PYTHONHASHSEED=0` key. See [`string0`].
+    fn buffer0(b: &[u8]) -> i64 {
+        buffer_keyed(0, 0, b)
+    }
 
     /// Values transcribed from CPython 3.14.6 run under `PYTHONHASHSEED=0`.
     /// These are the reference numbers, not this implementation's output — a
@@ -401,19 +559,23 @@ mod tests {
 
     #[test]
     fn matches_cpython_str_and_bytes() {
-        assert_eq!(string(""), 0);
-        assert_eq!(buffer(b""), 0);
-        assert_eq!(string("a"), 4644417185603328019);
-        assert_eq!(buffer(b"a"), 4644417185603328019);
-        assert_eq!(string("abc"), -4594863902769663758);
-        assert_eq!(buffer(b"abc"), -4594863902769663758);
-        assert_eq!(string("hello world"), -5642461784034726774);
+        assert_eq!(string0(""), 0);
+        assert_eq!(buffer0(b""), 0);
+        assert_eq!(string0("a"), 4644417185603328019);
+        assert_eq!(buffer0(b"a"), 4644417185603328019);
+        assert_eq!(string0("abc"), -4594863902769663758);
+        assert_eq!(buffer0(b"abc"), -4594863902769663758);
+        assert_eq!(string0("hello world"), -5642461784034726774);
         // Non-ASCII: CPython hashes latin-1 / UCS-2 code units, NOT UTF-8. If
         // this hashed UTF-8 these two would both be wrong while every ASCII
         // case above still passed.
-        assert_eq!(string("\u{e9}"), 6047309291227476195);
-        assert_eq!(string("\u{65e5}"), -2037161330753641417);
-        assert_eq!(string("\u{1f600}"), -3536540696076613844);
+        assert_eq!(string0("\u{e9}"), 6047309291227476195);
+        assert_eq!(string0("\u{65e5}"), -2037161330753641417);
+        assert_eq!(string0("\u{1f600}"), -3536540696076613844);
+        // The empty string hashes to 0 under EVERY key, so `string("")` states
+        // the seed-independent half of the pinned assertions above.
+        assert_eq!(string(""), 0);
+        assert_eq!(buffer(b""), 0);
     }
 
     #[test]
@@ -429,7 +591,7 @@ mod tests {
             tuple(&[int_i64(0), int_i64(0), int_i64(0)]),
             3010437511937009226
         );
-        assert_eq!(tuple(&[string("a")]), 7319529274390396360);
+        assert_eq!(tuple(&[string0("a")]), 7319529274390396360);
         // Nested: hash((1, (2, 3))).
         assert_eq!(
             tuple(&[int_i64(1), tuple(&[int_i64(2), int_i64(3)])]),
@@ -446,7 +608,7 @@ mod tests {
             frozenset(&[int_i64(1), int_i64(2), int_i64(3)]),
             -272375401224217160
         );
-        assert_eq!(frozenset(&[string("a")]), -7857795138424989601);
+        assert_eq!(frozenset(&[string0("a")]), -7857795138424989601);
     }
 
     /// A frozenset hash must not depend on element order — the property that
@@ -458,6 +620,75 @@ mod tests {
         let c = frozenset(&[int_i64(2), int_i64(3), int_i64(1)]);
         assert_eq!(a, b);
         assert_eq!(b, c);
+    }
+
+    /// `PYTHONHASHSEED` classification, against CPython 3.14.6 measured with
+    /// `PYTHONHASHSEED=<v> python3 -c 'print(hash("abc"))'`: the accepted values
+    /// printed a number, the rejected ones printed
+    /// `Fatal Python error: config_init_hash_seed: …` and exited 1.
+    #[test]
+    fn parses_hash_seed_like_cpython() {
+        use HashSeed::*;
+        // Unset, empty and "random" all ask for entropy.
+        assert_eq!(parse_hash_seed(None), Ok(Random));
+        assert_eq!(parse_hash_seed(Some("")), Ok(Random));
+        assert_eq!(parse_hash_seed(Some("random")), Ok(Random));
+        // strtoul accepts leading whitespace, a sign, and leading zeros.
+        assert_eq!(parse_hash_seed(Some("0")), Ok(Fixed(0)));
+        assert_eq!(parse_hash_seed(Some("42")), Ok(Fixed(42)));
+        assert_eq!(parse_hash_seed(Some(" 42")), Ok(Fixed(42)));
+        assert_eq!(parse_hash_seed(Some("\t42")), Ok(Fixed(42)));
+        assert_eq!(parse_hash_seed(Some("007")), Ok(Fixed(7)));
+        assert_eq!(parse_hash_seed(Some("+7")), Ok(Fixed(7)));
+        assert_eq!(parse_hash_seed(Some("-0")), Ok(Fixed(0)));
+        assert_eq!(parse_hash_seed(Some("4294967295")), Ok(Fixed(4294967295)));
+        // Trailing text (including a trailing space), a non-decimal base, and
+        // anything out of range are all rejected.
+        assert_eq!(parse_hash_seed(Some("42 ")), Err(()));
+        assert_eq!(parse_hash_seed(Some("  42  ")), Err(()));
+        assert_eq!(parse_hash_seed(Some(" ")), Err(()));
+        assert_eq!(parse_hash_seed(Some("abc")), Err(()));
+        assert_eq!(parse_hash_seed(Some("42abc")), Err(()));
+        assert_eq!(parse_hash_seed(Some("1e3")), Err(()));
+        assert_eq!(parse_hash_seed(Some("0x10")), Err(()));
+        assert_eq!(parse_hash_seed(Some("-1")), Err(()));
+        assert_eq!(parse_hash_seed(Some("4294967296")), Err(()));
+    }
+
+    /// `hash(str)` under a PINNED seed, against CPython 3.14.6 run as
+    /// `PYTHONHASHSEED=<seed> python3 -c 'print(hash("abc"), hash(b"xyz"))'`.
+    /// These are CPython's numbers, not ours: before this, every seed produced
+    /// the seed-0 value, so only the first row would have passed.
+    #[test]
+    fn matches_cpython_str_hash_under_every_pinned_seed() {
+        // (seed, hash("abc"), hash(b"xyz"))
+        let cases: [(u32, i64, i64); 6] = [
+            (0, -4594863902769663758, 9013747392277146282),
+            (1, -4667308735975688587, -5634034666027049350),
+            (2, 4069345407874332860, 2105905292856817549),
+            (42, 3869580338025362921, -4491887112347156947),
+            (123456, -1666233593715650805, 4052602468391041882),
+            (4294967295, -6122489556238538401, 2562532176708456890),
+        ];
+        for (seed, abc, xyz) in cases {
+            let (k0, k1) = secret_for(seed);
+            assert_eq!(buffer_keyed(k0, k1, b"abc"), abc, "hash('abc') @ {seed}");
+            assert_eq!(buffer_keyed(k0, k1, b"xyz"), xyz, "hash(b'xyz') @ {seed}");
+            // The empty buffer is 0 under every key — CPython short-circuits it
+            // so the secret cannot leak.
+            assert_eq!(buffer_keyed(k0, k1, b""), 0, "hash('') @ {seed}");
+        }
+    }
+
+    /// Seed 0 `memset`s the secret; it is NOT `lcg_urandom(0, …)`. Running the
+    /// LCG for 0 would give a different, non-zero key and break every
+    /// `PYTHONHASHSEED=0` value the rest of this module is pinned against.
+    #[test]
+    fn seed_zero_is_the_zero_key_not_the_lcg_of_zero() {
+        assert_eq!(secret_for(0), (0, 0));
+        let mut lcg_of_zero = [0u8; 24];
+        lcg_urandom(0, &mut lcg_of_zero);
+        assert_ne!(lcg_of_zero, [0u8; 24]);
     }
 
     /// No hash may be `-1`: CPython reserves it as `tp_hash`'s error sentinel.

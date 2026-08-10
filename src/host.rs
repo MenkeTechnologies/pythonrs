@@ -6838,9 +6838,15 @@ impl PyHost {
             }
             'c' => {
                 if let Some(cp) = self.as_int(val) {
-                    let ch = char::from_u32(cp as u32)
-                        .ok_or_else(|| "OverflowError: %c arg not in range".to_string())?;
+                    let ch = char::from_u32(cp as u32).ok_or_else(|| {
+                        "OverflowError: %c arg not in range(0x110000)".to_string()
+                    })?;
                     Ok(ch.to_string())
+                } else if self.big_val(val).is_some() {
+                    // An int too large for `as_int` is still an INT, so this is
+                    // a range error and not a type error — `'%c' % 10**20` is
+                    // `OverflowError`, the same as `'%c' % -1`.
+                    Err("OverflowError: %c arg not in range(0x110000)".into())
                 } else if let Some(s) = self.as_str(val) {
                     if s.chars().count() == 1 {
                         Ok(s)
@@ -6858,7 +6864,23 @@ impl PyHost {
                 let b = match self.big_val(val) {
                     Some(b) => b,
                     None if matches!(conv, 'd' | 'i' | 'u') => match self.num_val(val) {
-                        Some(f) => num_bigint::BigInt::from(f.trunc() as i64),
+                        // `PyNumber_Long` on a non-finite float raises rather
+                        // than saturating; `f.trunc() as i64` would silently
+                        // print `9223372036854775807` for `'%d' % inf`. The
+                        // bignum conversion also keeps a large finite float
+                        // exact (`'%d' % 1e30`), which an `i64` cast truncates.
+                        Some(f) if f.is_nan() => {
+                            return Err("ValueError: cannot convert float NaN to integer".into())
+                        }
+                        Some(f) if f.is_infinite() => {
+                            return Err(
+                                "OverflowError: cannot convert float infinity to integer".into()
+                            )
+                        }
+                        Some(f) => {
+                            use num_traits::FromPrimitive;
+                            num_bigint::BigInt::from_f64(f.trunc()).unwrap_or_default()
+                        }
                         None => {
                             return Err(type_error(&format!(
                                 "%{conv} format: a real number is required, not {}",
@@ -6923,6 +6945,7 @@ impl PyHost {
                     'g' => fmt_g(mag, prec.unwrap_or(6), false, hash),
                     _ => fmt_g(mag, prec.unwrap_or(6), true, hash),
                 };
+                let core = if hash { alt_decimal_point(&core) } else { core };
                 Ok(format!("{}{}", sign_str(neg), core))
             }
             other => Err(format!(
@@ -7046,13 +7069,37 @@ pub fn fmt_sci(x: f64, prec: usize, upper: bool) -> String {
     )
 }
 
+/// The `#` alternate form on a FLOAT conversion (`Py_DTSF_ALT`): the output
+/// always keeps a decimal point, even when the precision rounded every
+/// fractional digit away — `'%#.0e' % 1.0` is `1.e+00` and `format(1.0, '#.0f')`
+/// is `1.`.
+///
+/// The point goes right after the integer digits, so an exponent or a trailing
+/// `%` stays behind it. A body with no digits at all (`inf`, `nan`) is returned
+/// untouched: CPython prints those verbatim under `#`.
+pub fn alt_decimal_point(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut i = usize::from(matches!(b.first(), Some(b'-' | b'+' | b' ')));
+    let digits_start = i;
+    while i < b.len() && b[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == digits_start || b.get(i) == Some(&b'.') {
+        return s.to_string();
+    }
+    format!("{}.{}", &s[..i], &s[i..])
+}
+
 /// `%g` / `%G`: choose `f` or `e` style by exponent, `precision` significant
 /// digits (min 1), trailing zeros stripped unless the `#` flag is set.
+///
+/// Zero takes the SAME path as everything else. Short-circuiting it to `"0"`
+/// looks harmless and is wrong twice over: it drops the sign of `-0.0`
+/// (`format(-0.0, 'g')` is `-0`, not `0`) and it ignores `#`
+/// (`format(0.0, '#g')` is `0.00000`). `{:e}` of a zero reports exponent 0, so
+/// the general branch already produces both correctly.
 pub fn fmt_g(x: f64, prec: usize, upper: bool, hash: bool) -> String {
     let p = prec.max(1);
-    if x == 0.0 {
-        return "0".to_string();
-    }
     let exp: i32 = format!("{:e}", x)
         .split_once('e')
         .and_then(|(_, e)| e.parse().ok())
@@ -7078,8 +7125,9 @@ pub fn fmt_g(x: f64, prec: usize, upper: bool, hash: bool) -> String {
 /// differences — it switches to scientific one exponent sooner (`exp >= p-1`
 /// instead of `exp >= p`), and a result that renders as a bare integer keeps a
 /// trailing `.0` (`Py_DTSF_ADD_DOT_0`), so `format(2.0, '.3')` is `'2.0'`, not
-/// `'2'`. Trailing zeros are otherwise stripped as in `'g'`.
-pub fn fmt_none_float(x: f64, prec: usize) -> String {
+/// `'2'`. Trailing zeros are otherwise stripped as in `'g'`, unless `alt` (the
+/// `#` flag) keeps them: `format(2.0, '#.3')` is `'2.00'`.
+pub fn fmt_none_float(x: f64, prec: usize, alt: bool) -> String {
     let p = prec.max(1);
     // Exponent of `x` *after* rounding to `p` significant figures, so a carry
     // (`9.99` → `10.` at `p=2`) bumps the exponent and the scientific-vs-fixed
@@ -7093,11 +7141,16 @@ pub fn fmt_none_float(x: f64, prec: usize) -> String {
             .unwrap_or(0)
     };
     let mut s = if exp < -4 || exp >= p as i32 - 1 {
-        strip_g_sci(&fmt_sci(x, p - 1, false))
+        let sci = fmt_sci(x, p - 1, false);
+        if alt {
+            sci
+        } else {
+            strip_g_sci(&sci)
+        }
     } else {
         let dec = (p as i32 - 1 - exp).max(0) as usize;
         let s = format!("{:.*}", dec, x);
-        if s.contains('.') {
+        if s.contains('.') && !alt {
             s.trim_end_matches('0').trim_end_matches('.').to_string()
         } else {
             s

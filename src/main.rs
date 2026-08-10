@@ -24,6 +24,19 @@ fn main() -> ExitCode {
 }
 
 fn run_main() -> ExitCode {
+    // `PYTHONHASHSEED` is validated before ANYTHING else, because CPython
+    // validates it in pre-initialization — before argv parsing, before the
+    // script is even opened — and dies with this exact text. Accepting a value
+    // CPython refuses would make `PYTHONHASHSEED=0x10 python …` run here and
+    // abort there.
+    if pythonrs::pyhash::parse_hash_seed(std::env::var("PYTHONHASHSEED").ok().as_deref()).is_err() {
+        eprintln!(
+            "Fatal Python error: config_init_hash_seed: PYTHONHASHSEED must be \"random\" \
+             or an integer in range [0; 4294967295]\nPython runtime state: preinitialized\n"
+        );
+        return ExitCode::FAILURE;
+    }
+
     // CPython (`Modules/main.c::pymain_parse_cmdline`) stops interpreter-option
     // parsing at the FIRST of `-c` / `-m` / a script file / `--`; everything from
     // there is the program plus its own `sys.argv`, passed through verbatim (so

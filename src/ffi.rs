@@ -668,7 +668,11 @@ fn value_to_py<'py>(
                 | PyObj::StaticMethod(_)
                 | PyObj::ClassMethod(_),
             ) => {
-                let cb = PyrsCallable { target: v.clone() };
+                let cb = PyrsCallable {
+                    target: v.clone(),
+                    doc: None,
+                    module: None,
+                };
                 Py::new(py, cb)
                     .map(|p| p.into_any().into_bound(py))
                     .map_err(|e| e.to_string())
@@ -1149,10 +1153,44 @@ fn build_call_args<'py>(
 #[pyclass(dict)]
 struct PyrsCallable {
     target: Value,
+    // `__doc__` and `__module__` need their own slots. Every pyclass ALREADY
+    // answers both from its type (`None` and `"builtins"`), so normal lookup
+    // succeeds and `__getattr__` never fires for those two names —
+    // `functools.wraps(f)` therefore copied `None` over the wrapped function's
+    // docstring and `"builtins"` over its module. A getset pair intercepts both
+    // directions: the getter delegates to the target until something assigns.
+    // Every other function dunder (`__name__`, `__qualname__`, …) is absent
+    // from the pyclass type and reaches `__getattr__` normally.
+    doc: Option<Py<PyAny>>,
+    module: Option<Py<PyAny>>,
 }
 
 #[pymethods]
 impl PyrsCallable {
+    /// The wrapped callable's `__doc__`, or whatever was last assigned here.
+    #[getter(__doc__)]
+    fn get_doc(&self, py: Python) -> PyResult<Py<PyAny>> {
+        self.shadowed_dunder(py, self.doc.as_ref(), "__doc__")
+    }
+
+    /// `functools.update_wrapper` assigns `__doc__` directly; without a setter
+    /// the getset descriptor would make that an `AttributeError`.
+    #[setter(__doc__)]
+    fn set_doc(&mut self, value: Py<PyAny>) {
+        self.doc = Some(value);
+    }
+
+    /// The wrapped callable's `__module__` (`'__main__'` for a script-level
+    /// `def`), not the pyclass's own `'builtins'`.
+    #[getter(__module__)]
+    fn get_module(&self, py: Python) -> PyResult<Py<PyAny>> {
+        self.shadowed_dunder(py, self.module.as_ref(), "__module__")
+    }
+
+    #[setter(__module__)]
+    fn set_module(&mut self, value: Py<PyAny>) {
+        self.module = Some(value);
+    }
     /// Delegate a missing attribute (function dunder like `__name__` /
     /// `__qualname__` / `__module__`) to the wrapped fusevm callable, so
     /// `functools.update_wrapper` can copy them off it. `__getattr__` runs only
@@ -1221,6 +1259,29 @@ impl PyrsCallable {
         with_host(|h| value_to_py(h, py, &result))
             .map(|b| b.unbind())
             .map_err(to_pyerr)
+    }
+}
+
+impl PyrsCallable {
+    /// Read a dunder the pyclass type already shadows: the assigned override if
+    /// there is one, else the wrapped callable's own value, else `None` (an
+    /// `AttributeError` here would be wrong — CPython's every function has both
+    /// `__doc__` and `__module__`).
+    fn shadowed_dunder(
+        &self,
+        py: Python,
+        override_value: Option<&Py<PyAny>>,
+        name: &str,
+    ) -> PyResult<Py<PyAny>> {
+        if let Some(v) = override_value {
+            return Ok(v.clone_ref(py));
+        }
+        match with_host(|h| h.get_attr(&self.target, name)) {
+            Ok(v) => with_host(|h| value_to_py(h, py, &v))
+                .map(|b| b.unbind())
+                .map_err(pyo3::exceptions::PyRuntimeError::new_err),
+            Err(_) => Ok(py.None()),
+        }
     }
 }
 
