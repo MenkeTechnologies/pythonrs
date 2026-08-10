@@ -13620,40 +13620,77 @@ fn norm_codec(enc: &str) -> String {
 /// text. Handlers: `strict`, `ignore`, `replace` (`?`), `backslashreplace`
 /// (`\xHH`/`\uHHHH`/`\UHHHHHHHH`), `xmlcharrefreplace` (`&#NNN;`), `namereplace`
 /// (`\N{NAME}`, falling back to `backslashreplace` when the char is unnamed).
-fn encode_error(out: &mut Vec<u8>, c: char, errors: &str, codec: &str) -> Result<(), String> {
+fn encode_error(
+    out: &mut Vec<u8>,
+    run: &[char],
+    errors: &str,
+    codec: &str,
+    pos: usize,
+    limit: u32,
+) -> Result<(), String> {
     match errors {
         "ignore" => Ok(()),
         "replace" => {
-            out.push(b'?');
+            // One `?` per un-encodable character, not one per run.
+            out.extend(std::iter::repeat_n(b'?', run.len()));
             Ok(())
         }
         "backslashreplace" => {
-            let n = c as u32;
-            let esc = if n <= 0xff {
-                format!("\\x{n:02x}")
-            } else if n <= 0xffff {
-                format!("\\u{n:04x}")
-            } else {
-                format!("\\U{n:08x}")
-            };
-            out.extend_from_slice(esc.as_bytes());
-            Ok(())
-        }
-        "xmlcharrefreplace" => {
-            out.extend_from_slice(format!("&#{};", c as u32).as_bytes());
-            Ok(())
-        }
-        "namereplace" => {
-            match unicode_names2::name(c) {
-                Some(name) => out.extend_from_slice(format!("\\N{{{name}}}").as_bytes()),
-                None => return encode_error(out, c, "backslashreplace", codec),
+            for &c in run {
+                out.extend_from_slice(unicode_char_escape(c).as_bytes());
             }
             Ok(())
         }
-        _ => Err(format!(
-            "UnicodeEncodeError: '{codec}' codec can't encode character '\\x{:x}'",
-            c as u32
-        )),
+        "xmlcharrefreplace" => {
+            for &c in run {
+                out.extend_from_slice(format!("&#{};", c as u32).as_bytes());
+            }
+            Ok(())
+        }
+        "namereplace" => {
+            for &c in run {
+                match unicode_names2::name(c) {
+                    Some(name) => out.extend_from_slice(format!("\\N{{{name}}}").as_bytes()),
+                    None => out.extend_from_slice(unicode_char_escape(c).as_bytes()),
+                }
+            }
+            Ok(())
+        }
+        _ => Err(unicode_encode_error(codec, run, pos, limit)),
+    }
+}
+
+/// CPython's `UnicodeEncodeError` text. Names the offending character (or the
+/// RUN of them, which CPython merges into one report), where it starts, and the
+/// ordinal range the codec accepts.
+///
+/// pythonrs emitted only `'ascii' codec can't encode character '\xe9'` — no
+/// position, no range, and no plural form — which is a sentence no CPython
+/// produces.
+fn unicode_encode_error(codec: &str, run: &[char], pos: usize, limit: u32) -> String {
+    let where_ = if run.len() > 1 {
+        format!("characters in position {pos}-{}", pos + run.len() - 1)
+    } else {
+        format!(
+            "character '{}' in position {pos}",
+            unicode_char_escape(run.first().copied().unwrap_or('\0'))
+        )
+    };
+    format!(
+        "UnicodeEncodeError: '{codec}' codec can't encode {where_}: ordinal not in range({limit})"
+    )
+}
+
+/// The `\xNN` / `\uNNNN` / `\UNNNNNNNN` spelling CPython uses for a character
+/// inside a codec diagnostic, chosen by magnitude.
+fn unicode_char_escape(c: char) -> String {
+    let n = c as u32;
+    if n <= 0xff {
+        format!("\\x{n:02x}")
+    } else if n <= 0xffff {
+        format!("\\u{n:04x}")
+    } else {
+        format!("\\U{n:08x}")
     }
 }
 
@@ -13664,7 +13701,14 @@ fn encode_error(out: &mut Vec<u8>, c: char, errors: &str, codec: &str) -> Result
 /// `TypeError` (CPython's "can't handle UnicodeDecodeError in error callback");
 /// an unrecognized name raises `LookupError`. The caller invokes this once per
 /// maximal error subpart, so `replace`'s U+FFFD count matches CPython.
-fn decode_error(out: &mut String, bad: &[u8], errors: &str, codec: &str) -> Result<(), String> {
+fn decode_error(
+    out: &mut String,
+    bad: &[u8],
+    errors: &str,
+    codec: &str,
+    pos: usize,
+    reason: &str,
+) -> Result<(), String> {
     match errors {
         "ignore" => Ok(()),
         "replace" => {
@@ -13677,9 +13721,7 @@ fn decode_error(out: &mut String, bad: &[u8], errors: &str, codec: &str) -> Resu
             }
             Ok(())
         }
-        "strict" => Err(format!(
-            "UnicodeDecodeError: '{codec}' codec can't decode byte"
-        )),
+        "strict" => Err(unicode_decode_error(codec, bad, pos, reason)),
         "namereplace" | "xmlcharrefreplace" => Err(
             "TypeError: don't know how to handle UnicodeDecodeError in error callback".to_string(),
         ),
@@ -13687,6 +13729,50 @@ fn decode_error(out: &mut String, bad: &[u8], errors: &str, codec: &str) -> Resu
             "LookupError: unknown error handler name '{errors}'"
         )),
     }
+}
+
+/// Encode `s` to a codec that accepts only ordinals below `limit` (`ascii` at
+/// 128, `latin-1` at 256), routing each maximal RUN of un-encodable characters
+/// through the error handler.
+///
+/// The run is the unit CPython reports on: `'a€€b'.encode('latin-1')` raises one
+/// error naming `position 1-2`, not two errors naming one character each.
+/// Positions count CHARACTERS, so they are tracked separately from the byte
+/// output.
+fn encode_narrow(s: &str, errors: &str, codec: &str, limit: u32) -> Result<Vec<u8>, String> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = Vec::with_capacity(chars.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if (chars[i] as u32) < limit {
+            out.push(chars[i] as u8);
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < chars.len() && (chars[i] as u32) >= limit {
+            i += 1;
+        }
+        encode_error(&mut out, &chars[start..i], errors, codec, start, limit)?;
+    }
+    Ok(out)
+}
+
+/// CPython's `UnicodeDecodeError` text: the offending byte (or the byte RUN,
+/// which it merges into one report), where it starts, and why it was rejected.
+///
+/// pythonrs emitted a bare `'ascii' codec can't decode byte` — no byte value, no
+/// position, no reason — which no CPython produces.
+fn unicode_decode_error(codec: &str, bad: &[u8], pos: usize, reason: &str) -> String {
+    let where_ = if bad.len() > 1 {
+        format!("bytes in position {pos}-{}", pos + bad.len() - 1)
+    } else {
+        format!(
+            "byte 0x{:02x} in position {pos}",
+            bad.first().copied().unwrap_or(0)
+        )
+    };
+    format!("UnicodeDecodeError: '{codec}' codec can't decode {where_}: {reason}")
 }
 
 /// CPython `str.encode(encoding, errors)`. Supports `utf-8` (default), `ascii`,
@@ -13698,27 +13784,9 @@ fn encode_str(s: &str, encoding: &str, errors: &str) -> Result<Vec<u8>, String> 
     let norm = norm_codec(encoding);
     match norm.as_str() {
         "utf8" | "u8" | "utf" | "cp65001" => Ok(s.as_bytes().to_vec()),
-        "ascii" | "usascii" | "646" => {
-            let mut out = Vec::with_capacity(s.len());
-            for c in s.chars() {
-                if (c as u32) < 0x80 {
-                    out.push(c as u8);
-                } else {
-                    encode_error(&mut out, c, errors, "ascii")?;
-                }
-            }
-            Ok(out)
-        }
+        "ascii" | "usascii" | "646" => encode_narrow(s, errors, "ascii", 128),
         "latin1" | "latin" | "iso88591" | "8859" | "cp819" | "l1" => {
-            let mut out = Vec::with_capacity(s.len());
-            for c in s.chars() {
-                if (c as u32) <= 0xff {
-                    out.push(c as u8);
-                } else {
-                    encode_error(&mut out, c, errors, "latin-1")?;
-                }
-            }
-            Ok(out)
+            encode_narrow(s, errors, "latin-1", 256)
         }
         "utf16"
         | "utf16le"
@@ -13786,16 +13854,29 @@ fn decode_bytes(bytes: &[u8], args: &[Value]) -> Result<Value, String> {
         "utf32" | "utf32le" | "utf32be" | "u32" => decode_utf32(bytes, &norm, &errors)?,
         "ascii" | "usascii" | "646" => {
             let mut out = String::with_capacity(bytes.len());
-            for &b in bytes {
+            for (pos, &b) in bytes.iter().enumerate() {
                 if b < 0x80 {
                     out.push(b as char);
                 } else {
-                    decode_error(&mut out, &[b], &errors, "ascii")?;
+                    // CPython reports ascii bytes ONE at a time even when they
+                    // are adjacent, unlike the utf-8 decoder's maximal subpart.
+                    decode_error(
+                        &mut out,
+                        &[b],
+                        &errors,
+                        "ascii",
+                        pos,
+                        "ordinal not in range(128)",
+                    )?;
                 }
             }
             out
         }
-        _ => utf8_decode_errors(bytes, &errors)?,
+        "utf8" | "u8" | "utf" | "cp65001" => utf8_decode_errors(bytes, &errors)?,
+        // An unrecognized codec used to fall through to utf-8, so
+        // `b'abc'.decode('nonexistent')` silently succeeded — `str.encode`
+        // already raised here, only the decode direction was missing.
+        _ => return Err(format!("LookupError: unknown encoding: {enc}")),
     };
     Ok(new_str(s))
 }
@@ -13827,18 +13908,33 @@ fn decode_utf16(bytes: &[u8], norm: &str, errors: &str) -> Result<String, String
         .collect();
     let trailing = (bytes.len() - start) % 2 != 0;
     let mut out = String::with_capacity(units.len());
-    for r in char::decode_utf16(units) {
+    let label = if be { "utf-16-be" } else { "utf-16-le" };
+    for (n, r) in char::decode_utf16(units).enumerate() {
         match r {
             Ok(c) => out.push(c),
             Err(e) => {
                 let u = e.unpaired_surrogate();
                 let b = if be { u.to_be_bytes() } else { u.to_le_bytes() };
-                decode_error(&mut out, &b, errors, "utf-16")?;
+                decode_error(
+                    &mut out,
+                    &b,
+                    errors,
+                    label,
+                    start + n * 2,
+                    "illegal encoding",
+                )?;
             }
         }
     }
     if trailing {
-        decode_error(&mut out, &bytes[bytes.len() - 1..], errors, "utf-16")?;
+        decode_error(
+            &mut out,
+            &bytes[bytes.len() - 1..],
+            errors,
+            label,
+            bytes.len() - 1,
+            "truncated data",
+        )?;
     }
     Ok(out)
 }
@@ -13859,19 +13955,21 @@ fn decode_utf32(bytes: &[u8], norm: &str, errors: &str) -> Result<String, String
     }
     let body = &bytes[start..];
     let mut out = String::with_capacity(body.len() / 4);
-    for c in body.chunks(4) {
+    let label = if be { "utf-32-be" } else { "utf-32-le" };
+    for (n, c) in body.chunks(4).enumerate() {
+        let pos = start + n * 4;
         if c.len() < 4 {
-            decode_error(&mut out, c, errors, "utf-32")?;
+            decode_error(&mut out, c, errors, label, pos, "truncated data")?;
             break;
         }
-        let n = if be {
+        let word = if be {
             u32::from_be_bytes([c[0], c[1], c[2], c[3]])
         } else {
             u32::from_le_bytes([c[0], c[1], c[2], c[3]])
         };
-        match char::from_u32(n) {
+        match char::from_u32(word) {
             Some(ch) => out.push(ch),
-            None => decode_error(&mut out, c, errors, "utf-32")?,
+            None => decode_error(&mut out, c, errors, label, pos, "code point not in range")?,
         }
     }
     Ok(out)
@@ -13880,6 +13978,13 @@ fn decode_utf32(bytes: &[u8], norm: &str, errors: &str) -> Result<String, String
 /// UTF-8 decode with a CPython-compatible error handler. Invalid sequences are
 /// handled per the "maximal subpart" rule (matching `std::str::from_utf8`'s
 /// error offsets, which follow the same Unicode standard as CPython's decoder).
+/// Whether `b` can begin a multi-byte UTF-8 sequence (`0xC2..=0xF4`). A failure
+/// that starts on one of these is a bad CONTINUATION byte; a failure on anything
+/// else is a bad start byte.
+fn is_utf8_lead(b: u8) -> bool {
+    (0xc2..=0xf4).contains(&b)
+}
+
 fn utf8_decode_errors(bytes: &[u8], errors: &str) -> Result<String, String> {
     let mut out = String::with_capacity(bytes.len());
     let mut rest = bytes;
@@ -13896,7 +14001,25 @@ fn utf8_decode_errors(bytes: &[u8], errors: &str) -> Result<String, String> {
                 // `error_len() == None` means an incomplete sequence at the end:
                 // CPython replaces/ignores it as a single unit.
                 let skip = e.error_len().unwrap_or(rest.len() - valid);
-                decode_error(&mut out, &rest[valid..valid + skip], errors, "utf-8")?;
+                // `error_len() == None` is a truncated sequence at the end of
+                // the input, which CPython calls "unexpected end of data"; a
+                // sized error is either a bad lead byte or a bad continuation.
+                let reason = if e.error_len().is_none() {
+                    "unexpected end of data"
+                } else if is_utf8_lead(rest[valid]) {
+                    "invalid continuation byte"
+                } else {
+                    "invalid start byte"
+                };
+                let pos = bytes.len() - rest.len() + valid;
+                decode_error(
+                    &mut out,
+                    &rest[valid..valid + skip],
+                    errors,
+                    "utf-8",
+                    pos,
+                    reason,
+                )?;
                 rest = &rest[valid + skip..];
                 if rest.is_empty() {
                     break;

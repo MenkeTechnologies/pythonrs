@@ -1664,7 +1664,7 @@ fn percent_format_dispatches_instance_str_repr() {
             "class U:\n    def __repr__(s): return 'é'\nx = '%a' % U()",
             "x"
         ),
-        "'\\\\xe9'"
+        "'\\xe9'"
     );
     // plain values unaffected (no regression)
     assert_eq!(g("x = '%s and %r' % ('a', 'b')", "x"), "\"a and 'b'\"");
@@ -7311,6 +7311,106 @@ fn rust_lookalikes_do_not_stand_in_for_the_reference_semantics() {
         ("x = int(memoryview(b'12'))", "12"),
         ("x = int('0x_10', 16)", "16"),
         ("x = int('00', 0)", "0"),
+    ];
+    for (src, want) in values {
+        assert_eq!(&g(src, "x"), want, "for {src:?}");
+    }
+}
+
+/// Codec diagnostics name the offending character or byte, WHERE it is, and why
+/// the codec rejected it. pythonrs emitted only the first fragment —
+/// `'ascii' codec can't encode character '\xe9'` and, worse, a bare
+/// `'ascii' codec can't decode byte` with no byte at all — neither of which any
+/// CPython produces. A run of un-encodable characters is one report naming a
+/// span, not one report per character.
+///
+/// Expected values are CPython 3.14.6's, captured with `python3 -c`.
+#[test]
+fn codec_errors_name_the_position_and_the_reason() {
+    let raises: &[(&str, &str)] = &[
+        (
+            "'\\u00e9'.encode('ascii')",
+            "UnicodeEncodeError: 'ascii' codec can't encode character '\\xe9' in position 0: \
+             ordinal not in range(128)",
+        ),
+        // A RUN is merged into one report naming the span, and switches to the
+        // plural "characters".
+        (
+            "'\\u00e9\\u00e9a'.encode('ascii')",
+            "UnicodeEncodeError: 'ascii' codec can't encode characters in position 0-1: \
+             ordinal not in range(128)",
+        ),
+        (
+            "'a\\u20ac'.encode('latin-1')",
+            "UnicodeEncodeError: 'latin-1' codec can't encode character '\\u20ac' in position 1: \
+             ordinal not in range(256)",
+        ),
+        // Above U+FFFF the escape widens to \\U........
+        (
+            "'\\U0001F600'.encode('ascii')",
+            "UnicodeEncodeError: 'ascii' codec can't encode character '\\U0001f600' in position 0: \
+             ordinal not in range(128)",
+        ),
+        (
+            "b'a\\xffb'.decode('ascii')",
+            "UnicodeDecodeError: 'ascii' codec can't decode byte 0xff in position 1: \
+             ordinal not in range(128)",
+        ),
+        // utf-8 distinguishes a bad lead byte, a bad continuation, and a
+        // truncated sequence — three different reasons.
+        (
+            "b'\\xff\\xfe'.decode('utf-8')",
+            "UnicodeDecodeError: 'utf-8' codec can't decode byte 0xff in position 0: \
+             invalid start byte",
+        ),
+        (
+            "b'\\xc3\\x28'.decode('utf-8')",
+            "UnicodeDecodeError: 'utf-8' codec can't decode byte 0xc3 in position 0: \
+             invalid continuation byte",
+        ),
+        (
+            "b'\\xc3'.decode('utf-8')",
+            "UnicodeDecodeError: 'utf-8' codec can't decode byte 0xc3 in position 0: \
+             unexpected end of data",
+        ),
+        (
+            "b'\\xe2\\x82'.decode('utf-8')",
+            "UnicodeDecodeError: 'utf-8' codec can't decode bytes in position 0-1: \
+             unexpected end of data",
+        ),
+        // An unknown codec fell through to utf-8 and silently succeeded on the
+        // DECODE side; encode already raised.
+        ("b'abc'.decode('nope')", "LookupError: unknown encoding: nope"),
+        ("'abc'.encode('nope')", "LookupError: unknown encoding: nope"),
+    ];
+    for (src, want) in raises {
+        assert_eq!(&eval_str(src).expect_err("must raise"), want, "for {src:?}");
+    }
+
+    // The non-strict handlers still work, and each applies PER CHARACTER even
+    // though the error is reported per run.
+    let values: &[(&str, &str)] = &[
+        ("x = '\\u00e9'.encode('ascii', 'ignore')", "b''"),
+        ("x = '\\u00e9\\u00e9a'.encode('ascii', 'replace')", "b'??a'"),
+        (
+            "x = '\\u00e9'.encode('ascii', 'backslashreplace')",
+            "b'\\\\xe9'",
+        ),
+        (
+            "x = '\\u00e9'.encode('ascii', 'xmlcharrefreplace')",
+            "b'&#233;'",
+        ),
+        (
+            "x = '\\u00e9'.encode('ascii', 'namereplace')",
+            "b'\\\\N{LATIN SMALL LETTER E WITH ACUTE}'",
+        ),
+        ("x = b'\\xff'.decode('ascii', 'replace')", "'�'"),
+        ("x = b'\\xff'.decode('ascii', 'ignore')", "''"),
+        // A recognized codec still decodes; the LookupError above must not have
+        // swallowed the aliases.
+        ("x = b'\\xc3\\xa9'.decode()", "'é'"),
+        ("x = b'abc'.decode('UTF8')", "'abc'"),
+        ("x = b'abc'.decode('cp65001')", "'abc'"),
     ];
     for (src, want) in values {
         assert_eq!(&g(src, "x"), want, "for {src:?}");
