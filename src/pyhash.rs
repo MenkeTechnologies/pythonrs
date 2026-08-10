@@ -343,8 +343,9 @@ mod tests {
     #[test]
     fn matches_cpython_bignums() {
         let p = |s: &str| -> num_bigint::BigInt { s.parse().unwrap() };
-        assert_eq!(int_big(&p("18446744073709551616")), 8); // 2**64
-                                                            // The sign bug this port replaces returned -(MODULUS - 8) here.
+        // 2**64.
+        assert_eq!(int_big(&p("18446744073709551616")), 8);
+        // The sign bug this port replaces returned -(MODULUS - 8) here.
         assert_eq!(int_big(&p("-18446744073709551616")), -8);
         assert_eq!(int_big(&p("1180591620717411315769")), 12857); // 2**70+12345
         assert_eq!(int_big(&p("-1180591620717411315769")), -12857);
