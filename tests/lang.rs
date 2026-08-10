@@ -1664,7 +1664,7 @@ fn percent_format_dispatches_instance_str_repr() {
             "class U:\n    def __repr__(s): return 'é'\nx = '%a' % U()",
             "x"
         ),
-        "'\\xe9'"
+        "'\\\\xe9'"
     );
     // plain values unaffected (no regression)
     assert_eq!(g("x = '%s and %r' % ('a', 'b')", "x"), "\"a and 'b'\"");
