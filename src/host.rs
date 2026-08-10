@@ -6757,11 +6757,10 @@ impl PyHost {
                 }
                 'c' => {
                     if let Some(cp) = self.as_int(&val) {
+                        // An out-of-range INT is an OverflowError with its own
+                        // wording; the TypeError below is for a wrong TYPE.
                         if !(0..=255).contains(&cp) {
-                            return Err(
-                                "TypeError: %c requires an integer in range(256) or a single byte"
-                                    .into(),
-                            );
+                            return Err("OverflowError: %c arg not in range(256)".into());
                         }
                         (vec![cp as u8], false)
                     } else {
@@ -8390,7 +8389,21 @@ impl PyHost {
                 Ok(in_bounds && (x - start).rem_euclid(step.abs()) == 0)
             }
             _ => {
-                let items = self.iter_items(container)?;
+                // `x in y` on something with neither `__contains__` nor
+                // `__iter__` gets a message about CONTAINMENT, not about
+                // iteration: pythonrs reported the iteration failure verbatim
+                // (`'int' object is not iterable`), which CPython raises for
+                // `for _ in y`, not for `x in y`.
+                let items = self.iter_items(container).map_err(|e| {
+                    if e.ends_with("object is not iterable") {
+                        type_error(&format!(
+                            "argument of type '{}' is not a container or iterable",
+                            self.type_name(container)
+                        ))
+                    } else {
+                        e
+                    }
+                })?;
                 Ok(items.iter().any(|x| self.equal(x, item)))
             }
         }

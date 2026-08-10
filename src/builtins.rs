@@ -474,13 +474,40 @@ pub(crate) fn raw_delattr(recv: &Value, name: &str) -> Result<(), String> {
     }
 }
 
+/// Whether the user class behind an instance defines `name` anywhere in its MRO.
+/// The item protocol dispatches on this: a class with no `__getitem__` is not
+/// subscriptable, and CPython says exactly that instead of reporting the missing
+/// attribute. pythonrs called the dunder unconditionally, so `C()[1]` on a plain
+/// class raised `AttributeError: 'C' object has no attribute '__getitem__'` —
+/// a message no CPython produces, and one that describes the implementation
+/// rather than the mistake.
+fn instance_defines(recv: &Value, name: &str) -> bool {
+    with_host(|h| match h.get(recv) {
+        Some(PyObj::Instance(i)) => {
+            let class = i.class.clone();
+            // A subclass of a builtin sequence/mapping inherits the protocol
+            // from its payload even with nothing in its own MRO, so
+            // `class L(list)` stays subscriptable.
+            h.class_lookup(&class, name).is_some() || h.builtin_base_of(&class).is_some()
+        }
+        _ => false,
+    })
+}
+
 fn b_getitem(vm: &mut VM, _: u8) -> Value {
     let idx = vm.pop();
     let recv = vm.pop();
     // __getitem__ on instances.
-    if with_host(|h| matches!(h.get(&recv), Some(PyObj::Instance(_)))) {
+    if instance_defines(&recv, "__getitem__") {
         let r = host::call_method(&recv, "__getitem__", vec![idx], vec![]);
         return finish(vm, r);
+    }
+    if with_host(|h| matches!(h.get(&recv), Some(PyObj::Instance(_)))) {
+        let tn = with_host(|h| h.type_name(&recv));
+        return abort(
+            vm,
+            host::type_error(&format!("'{tn}' object is not subscriptable")),
+        );
     }
     // `Cls[item]` on a class with `__class_getitem__` (e.g. generic aliases).
     if let Some(r) = host::class_getitem(&recv, idx.clone()) {
@@ -559,9 +586,16 @@ fn b_setitem(vm: &mut VM, _: u8) -> Value {
     let val = vm.pop();
     let idx = vm.pop();
     let recv = vm.pop();
-    if with_host(|h| matches!(h.get(&recv), Some(PyObj::Instance(_)))) {
+    if instance_defines(&recv, "__setitem__") {
         let r = host::call_method(&recv, "__setitem__", vec![idx, val.clone()], vec![]);
         return finish(vm, r);
+    }
+    if with_host(|h| matches!(h.get(&recv), Some(PyObj::Instance(_)))) {
+        let tn = with_host(|h| h.type_name(&recv));
+        return abort(
+            vm,
+            host::type_error(&format!("'{tn}' object does not support item assignment")),
+        );
     }
     // Slice assignment (`x[i:j] = it`): materialize the RHS iterable here, out
     // of any host borrow (it may be a generator), then splice. Slice bounds with
@@ -593,9 +627,16 @@ fn b_delitem(vm: &mut VM, _: u8) -> Value {
     let idx = vm.pop();
     let recv = vm.pop();
     // `del obj[i]` on an instance dispatches to `__delitem__` (raw index/slice).
-    if with_host(|h| matches!(h.get(&recv), Some(PyObj::Instance(_)))) {
+    if instance_defines(&recv, "__delitem__") {
         let r = host::call_method(&recv, "__delitem__", vec![idx], vec![]).map(|_| Value::Undef);
         return finish(vm, r);
+    }
+    if with_host(|h| matches!(h.get(&recv), Some(PyObj::Instance(_)))) {
+        let tn = with_host(|h| h.type_name(&recv));
+        return abort(
+            vm,
+            host::type_error(&format!("'{tn}' object doesn't support item deletion")),
+        );
     }
     // `del seq[Idx():Idx()]` — resolve `__index__` slice bounds (recv is a
     // builtin sequence here; instances were dispatched to `__delitem__` above).
@@ -1525,6 +1566,18 @@ fn b_contains(vm: &mut VM, _: u8) -> Value {
         }
         return match iter_membership(&container, &item) {
             Ok(b) => Value::Bool(b),
+            // Neither `__contains__` nor `__iter__`: the diagnostic is about
+            // CONTAINMENT, not about iteration. `'C' object is not iterable` is
+            // what CPython says for `for _ in c`, not for `x in c`.
+            Err(e) if e.ends_with("object is not iterable") => {
+                let tn = with_host(|h| h.type_name(&container));
+                abort(
+                    vm,
+                    host::type_error(&format!(
+                        "argument of type '{tn}' is not a container or iterable"
+                    )),
+                )
+            }
             Err(e) => abort(vm, e),
         };
     }
@@ -4768,9 +4821,9 @@ pub fn call_builtin_function(
             // `self`; `super(C, obj)` takes them explicitly.
             let (owner, instance) = if args.is_empty() {
                 let owner = with_host(|h| h.current_owner())
-                    .ok_or_else(|| host::type_error("super(): no arguments"))?;
+                    .ok_or_else(|| "RuntimeError: super(): no arguments".to_string())?;
                 let inst = with_host(|h| h.current_self())
-                    .ok_or_else(|| host::type_error("super(): no arguments"))?;
+                    .ok_or_else(|| "RuntimeError: super(): no arguments".to_string())?;
                 (owner, inst)
             } else {
                 let cls = arg0(&args)?;
@@ -6023,12 +6076,15 @@ fn construct_int(args: &[Value]) -> Result<Value, String> {
         Value::Bool(b) => Ok(Value::Int(*b as i64)),
         Value::Float(f) => {
             if !f.is_finite() {
-                let what = if f.is_nan() {
-                    "float NaN"
+                // NaN is a VALUE error (it has no integer counterpart at all);
+                // only an infinity is an OverflowError. pythonrs raised
+                // OverflowError for both, so `except ValueError` around
+                // `int(x)` did not catch the NaN case.
+                return Err(if f.is_nan() {
+                    "ValueError: cannot convert float NaN to integer".to_string()
                 } else {
-                    "float infinity"
-                };
-                return Err(format!("OverflowError: cannot convert {what} to integer"));
+                    "OverflowError: cannot convert float infinity to integer".to_string()
+                });
             }
             // Truncate toward zero, bignum-safe for values beyond i64.
             let t = f.trunc();
@@ -11056,7 +11112,17 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
         "startswith" | "endswith" => {
             let chars: Vec<char> = s.chars().collect();
             let (start, end) = resolve_start_end(chars.len(), args, 1);
-            let region: String = chars[start..end.min(chars.len())].iter().collect();
+            // `start` is deliberately not capped at the length (see
+            // `resolve_start_end`), so the region can be empty by being
+            // out of range — slicing with the raw bounds would panic.
+            // A start past the end of the string matches nothing at all, not
+            // even the empty prefix.
+            if start > chars.len() {
+                return Ok(Value::Bool(false));
+            }
+            let region: String = chars[start..end.max(start).min(chars.len())]
+                .iter()
+                .collect();
             let prefixes = match args.first() {
                 Some(v) if !matches!(v, Value::Undef) => str_prefixes(v)?,
                 _ => return Err(host::type_error("startswith first arg must be str")),
@@ -11763,10 +11829,12 @@ fn resolve_format_arg(
             );
         }
         st.manual = Some(false);
-        let v = args
-            .get(st.counter)
-            .cloned()
-            .ok_or_else(|| format!("IndexError: Replacement index {} out of range", st.counter))?;
+        let v = args.get(st.counter).cloned().ok_or_else(|| {
+            format!(
+                "IndexError: Replacement index {} out of range for positional args tuple",
+                st.counter
+            )
+        })?;
         st.counter += 1;
         v
     } else if let Ok(n) = base.parse::<usize>() {
@@ -11778,9 +11846,9 @@ fn resolve_format_arg(
             );
         }
         st.manual = Some(true);
-        args.get(n)
-            .cloned()
-            .ok_or_else(|| format!("IndexError: Replacement index {n} out of range"))?
+        args.get(n).cloned().ok_or_else(|| {
+            format!("IndexError: Replacement index {n} out of range for positional args tuple")
+        })?
     } else {
         kwargs
             .iter()
@@ -11902,12 +11970,21 @@ fn str_dot_format(s: &str, args: &[Value], kwargs: &[(String, Value)]) -> Result
                     field.push(chars[i]);
                     i += 1;
                 }
+                // An unbalanced `{`: CPython names the stray brace rather than
+                // failing later on whatever it read as a field name. pythonrs
+                // consumed to end-of-string and reported the resulting empty
+                // field as `Replacement index 0 out of range`.
+                if depth > 0 {
+                    return Err("ValueError: Single '{' encountered in format string".to_string());
+                }
                 i += 1; // skip closing }
                 let (fname, conv, spec) = split_format_field(&field);
                 let val = resolve_format_arg(&fname, args, kwargs, &mut auto)?;
                 let spec = substitute_nested_spec(&spec, args, kwargs, &mut auto)?;
                 out.push_str(&format_field(&val, conv, &spec)?);
             }
+            // A lone `}` (not `}}`) is an error, not a literal brace.
+            '}' => return Err("ValueError: Single '}' encountered in format string".to_string()),
             c => {
                 out.push(c);
                 i += 1;
@@ -13399,18 +13476,26 @@ fn mk_bytes(is_ba: bool, v: Vec<u8>) -> Value {
 /// a length-`len` buffer, reading from `args[from]` and `args[from + 1]`.
 fn resolve_start_end(len: usize, args: &[Value], from: usize) -> (usize, usize) {
     let n = len as i64;
-    let norm = |v: &Value, default: i64| -> i64 {
+    // `cap` is the upper clamp. `end` is capped at the length; `start` is NOT —
+    // a start past the end has to stay past the end so the region is empty.
+    // Capping it too made `'abc'.find('', 10)` answer 3, the empty needle
+    // "matching" at the clamped start, where CPython answers -1.
+    let norm = |v: &Value, default: i64, cap: i64| -> i64 {
         match with_host(|h| h.as_int(v)) {
             Some(i) => {
                 let k = if i < 0 { i + n } else { i };
-                k.clamp(0, n)
+                k.clamp(0, cap)
             }
             None => default,
         }
     };
-    let start = args.get(from).map(|v| norm(v, 0)).unwrap_or(0);
-    let end = args.get(from + 1).map(|v| norm(v, n)).unwrap_or(n);
-    (start as usize, (end as usize).max(start as usize))
+    let start = args.get(from).map(|v| norm(v, 0, i64::MAX)).unwrap_or(0);
+    let end = args.get(from + 1).map(|v| norm(v, n, n)).unwrap_or(n);
+    // `end` is NOT raised to `start`: an empty region must stay empty, so a
+    // start past the end finds nothing. Clamping the two together made
+    // `'abc'.find('', 10)` answer 3 (the empty needle "matching" at the clamped
+    // start) where CPython answers -1.
+    (start as usize, end as usize)
 }
 
 /// Search `hay[start..end]` for `needle`, returning an absolute index (or None).
@@ -13424,6 +13509,8 @@ fn slice_find<T: PartialEq>(
     reverse: bool,
 ) -> Option<usize> {
     let end = end.min(hay.len());
+    // An empty region (including a start past the end of the haystack) contains
+    // nothing at all, not even the empty needle.
     if start > end {
         return None;
     }
@@ -14235,7 +14322,10 @@ fn bytes_common_method(
         }
         "startswith" | "endswith" => {
             let (start, end) = resolve_start_end(bytes.len(), args, 1);
-            let region = &bytes[start..end.min(bytes.len())];
+            if start > bytes.len() {
+                return Ok(Value::Bool(false));
+            }
+            let region = &bytes[start..end.max(start).min(bytes.len())];
             let prefixes = match args.first() {
                 Some(v) => bytes_prefix_tuple(v)?,
                 None => return Err(host::type_error("startswith first arg must be bytes-like")),

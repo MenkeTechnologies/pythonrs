@@ -7416,3 +7416,136 @@ fn codec_errors_name_the_position_and_the_reason() {
         assert_eq!(&g(src, "x"), want, "for {src:?}");
     }
 }
+
+/// Protocol failures report the PROTOCOL, not the missing dunder.
+///
+/// `C()[1]` on a class with no `__getitem__` raised
+/// `AttributeError: 'C' object has no attribute '__getitem__'` — the
+/// implementation's lookup leaking out as the user's error. CPython names what
+/// the object cannot do. Same for item assignment, item deletion, and `in`,
+/// where the message was the ITERATION error CPython raises for `for _ in c`.
+///
+/// Expected values are CPython 3.14.6's, captured with `python3 -c`.
+#[test]
+fn protocol_failures_report_the_protocol() {
+    let raises: &[(&str, &str)] = &[
+        (
+            "class C: pass\nC()[1]",
+            "TypeError: 'C' object is not subscriptable",
+        ),
+        (
+            "class C: pass\nC()[1] = 2",
+            "TypeError: 'C' object does not support item assignment",
+        ),
+        (
+            "class C: pass\ndel C()[1]",
+            "TypeError: 'C' object doesn't support item deletion",
+        ),
+        (
+            "class C: pass\n1 in C()",
+            "TypeError: argument of type 'C' is not a container or iterable",
+        ),
+        (
+            "1 in 1",
+            "TypeError: argument of type 'int' is not a container or iterable",
+        ),
+        (
+            "1 in None",
+            "TypeError: argument of type 'NoneType' is not a container or iterable",
+        ),
+        // …but `for` over the same object still reports ITERATION, which is a
+        // different message in CPython and must not have been unified.
+        (
+            "class C: pass\nfor _ in C(): pass",
+            "TypeError: 'C' object is not iterable",
+        ),
+        // NaN has no integer counterpart at all, so it is a ValueError; only an
+        // infinity is an OverflowError. Both raised OverflowError, so
+        // `except ValueError` around `int(x)` missed the NaN case.
+        (
+            "int(float('nan'))",
+            "ValueError: cannot convert float NaN to integer",
+        ),
+        (
+            "int(float('inf'))",
+            "OverflowError: cannot convert float infinity to integer",
+        ),
+        ("super()", "RuntimeError: super(): no arguments"),
+        // An out-of-range %c argument is an OverflowError with its own wording;
+        // the TypeError is for a wrong TYPE.
+        ("b'%c' % 300", "OverflowError: %c arg not in range(256)"),
+        (
+            "b'%c' % 'a'",
+            "TypeError: %c requires an integer in range(256) or a single byte, not str",
+        ),
+        // str.format brace handling: a stray `{` was consumed to end-of-string
+        // and reported as a missing argument; a stray `}` was emitted as a
+        // literal.
+        (
+            "'{'.format()",
+            "ValueError: Single '{' encountered in format string",
+        ),
+        (
+            "'}'.format()",
+            "ValueError: Single '}' encountered in format string",
+        ),
+        (
+            "'a}b'.format()",
+            "ValueError: Single '}' encountered in format string",
+        ),
+        (
+            "'{0}'.format()",
+            "IndexError: Replacement index 0 out of range for positional args tuple",
+        ),
+        ("'abc'.index('', 10)", "ValueError: substring not found"),
+    ];
+    for (src, want) in raises {
+        assert_eq!(&eval_str(src).expect_err("must raise"), want, "for {src:?}");
+    }
+
+    let values: &[(&str, &str)] = &[
+        // A subclass of a builtin container inherits the item protocol from its
+        // payload, so the guard above must not have made it unsubscriptable.
+        ("class L(list): pass\nx = L([1, 2])[0]", "1"),
+        ("class D(dict): pass\nx = D({'a': 1})['a']", "1"),
+        (
+            "class L(list): pass\nl = L([1, 2])\nl[0] = 9\nx = list(l)",
+            "[9, 2]",
+        ),
+        (
+            "class L(list): pass\nl = L([1, 2])\ndel l[0]\nx = list(l)",
+            "[2]",
+        ),
+        (
+            "class C:\n    def __getitem__(s, k): return k * 2\nx = C()[3]",
+            "6",
+        ),
+        (
+            "class C:\n    def __contains__(s, x): return True\nx = 1 in C()",
+            "True",
+        ),
+        (
+            "import collections\nx = collections.defaultdict(int)['z']",
+            "0",
+        ),
+        // A search start past the end of the string finds nothing — not even the
+        // empty needle, which used to "match" at the clamped start.
+        ("x = 'abc'.find('', 10)", "-1"),
+        ("x = 'abc'.rfind('', 10)", "-1"),
+        ("x = 'abc'.count('', 10)", "0"),
+        ("x = b'abc'.find(b'', 10)", "-1"),
+        ("x = 'abc'.startswith('', 10)", "False"),
+        ("x = 'abc'.endswith('', 10)", "False"),
+        // …and an in-range start still behaves.
+        ("x = 'abc'.find('', 3)", "3"),
+        ("x = 'abc'.count('', 3)", "1"),
+        ("x = 'abc'.find('a', -100)", "0"),
+        ("x = 'abc'.startswith('', 3)", "True"),
+        ("x = 'abc'.startswith('b', 1)", "True"),
+        ("x = '{{}}'.format()", "'{}'"),
+        ("x = '{:>{}}'.format('a', 5)", "'    a'"),
+    ];
+    for (src, want) in values {
+        assert_eq!(&g(src, "x"), want, "for {src:?}");
+    }
+}
