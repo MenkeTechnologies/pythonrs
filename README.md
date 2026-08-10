@@ -140,6 +140,13 @@ the embedded-CPython stdlib prefix (checked before the bundled and system
 locations); `PYTHONRS_LIB` overrides the vendored `pylib/` search path used by a
 `--no-default-features` build.
 
+`PYTHONHASHSEED` is honoured exactly as CPython honours it. A pinned seed
+installs the same `_Py_HashSecret` CPython derives (`lcg_urandom` over the seed;
+`0` zeroes it), so `hash('abc')` is byte-identical to `PYTHONHASHSEED=N python3`
+for every `N` in `[0, 4294967295]` — not just for `0`. Unset or `random` draws
+per-process entropy, as CPython does, and a value CPython rejects is rejected
+here with the same message and exit code.
+
 ## [0x03] LANGUAGE FEATURES
 
 Arbitrary-precision integers, real closures, classes with inheritance, operator
@@ -159,7 +166,7 @@ what is not yet implemented.
 | *(none)* | Run the script/one-liner, transparently rkyv-cached. |
 | `-c SRC` | Execute a one-liner (`python -c 'print(1+1)'`). |
 | `-m MODULE …` | Run a library module as a script. Delegates to the embedded CPython (`runpy`), so `-m pip` / `-m venv` / `-m http.server` / `-m json.tool` behave exactly like `python3 -m`; every token after the module is the module's own `sys.argv`. Needs the `stdlib-ffi` bridge (default build). |
-| `-u` | Force unbuffered `stdout`/`stderr` (`PYTHONUNBUFFERED`). |
+| `-u` | Sets `PYTHONUNBUFFERED` for the embedded interpreter. pythonrs's own `print` is already unbuffered on every stream, so the flag changes nothing on that side — see [BUGS.md](BUGS.md) for the buffering divergence this implies. |
 | `-E -I -O -S -B -W` | CPython interpreter flags, accepted for drop-in compatibility (`-u`/`-W` take real effect via the embedded interpreter; the rest are tolerated no-ops). |
 | `--build` | AOT-compile the script to a standalone native executable. Needs a libpython-free runtime — build with `--no-default-features`; a `stdlib-ffi` build refuses up front (its CPython symbols can't be statically linked). |
 | `--dump-bytecode` | Print the lowered `fusevm` bytecode and exit. |
@@ -232,8 +239,15 @@ cargo build --bin parity-fuzz
 ./target/debug/parity-fuzz --seed 51 --once      # replay + minimize one case
 ```
 
-The generator never emits nondeterministic output, so every reported divergence
-is a real gap. `PYTHONRS_FUZZ_PYTHON` names the reference interpreter; a
+The generator is written not to emit nondeterministic output, so a reported
+divergence is meant to be a real gap — but that is a rule about the generator,
+not something the harness can verify: `gen_dataclass` printed a sentinel whose
+`repr` carries an object address and produced a permanent false divergence
+until it was caught by reading the report. `PYTHONHASHSEED` is pinned to the
+same value on both children and **swept** across cases rather than frozen at
+`0`, so `str`/`bytes` hashing and string-keyed container order are measured
+across the seed axis instead of at one point of it.
+`PYTHONRS_FUZZ_PYTHON` names the reference interpreter; a
 `--baseline` allowlist keeps known gaps from failing while new ones exit non-zero.
 A clean run has to be a run that measured something: cases the reference did not
 answer (timed out, exited non-zero, or printed nothing) are reported as `barren`

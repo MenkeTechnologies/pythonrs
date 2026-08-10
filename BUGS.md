@@ -9,6 +9,58 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **The `n` presentation type.** `n` reached no arm of the renderer at all and
+  fell through to the no-type one, so `format(1234567.891, 'n')` printed the
+  `repr` (`1234567.891`) where CPython gives `1.23457e+06`, and
+  `format(True, 'n')` printed `True` where CPython gives `1`. It now renders as
+  `d` for an int-like value and `g` for a float — `format_float_internal`
+  literally does `if (type == 'n') type = 'g'` — and takes its separator, group
+  WIDTHS and decimal point from `localeconv()`, so `format(1234567, 'n')` under
+  `de_DE` is `1.234.567` and under `hi_IN` is `12,34,567` (grouping `[3, 2, 0]`,
+  not a fixed three). `_PyUnicode_InsertThousandsGrouping` and its
+  `GroupGenerator` are ported for the variable widths and the `0`-flag
+  interleave. `,n` and `_n` are both rejected (`n` brings its own separator) and
+  a precision on an int `n` is rejected as it is for `d`.
+- **The `#` alternate form on a float conversion.** `Py_DTSF_ALT` keeps a
+  decimal point even when the precision rounded every fraction digit away:
+  `format(1.0, '#.0f')` is `1.`, `'%#.0e' % 1.0` is `1.e+00`,
+  `format(1.0, '#.0%')` is `100.%`. All of these dropped the point. Relatedly
+  `fmt_g` short-circuited any zero to the string `"0"`, which lost both the sign
+  of `-0.0` (`format(-0.0, 'g')` is `-0`) and the flag (`format(0.0, '#g')` is
+  `0.00000`).
+- **A bignum through a float presentation type.** `as_f` stops at `i64` and the
+  fallback was `.unwrap_or(0.0)`, so `format(10**20, 'f')` printed
+  `0.000000` instead of `100000000000000000000.000000`. It now converts as
+  `PyNumber_Float` does and raises `OverflowError: int too large to convert to
+  float` past `f64`. `'%d' % 1e30` likewise went through an `i64` cast that
+  truncated; it is exact now, and `'%d' % float('inf')` raises
+  `OverflowError: cannot convert float infinity to integer` rather than printing
+  `9223372036854775807`.
+- **Grouping stops at the digits.** `parse_number` counts the leading run of
+  ASCII digits and everything after it is remainder, so a separator can no
+  longer land inside an exponent or a suffix: `format(1, '_.0%')` is `100%` (was
+  `1_00%`), `format(1.5, ',.0')` is `2e+00` (was `2e,+00`), and a non-finite has
+  ZERO digits so `format(float('inf'), '012,f')` is `000000000inf` (was
+  `0,000,000,inf`).
+- **The `0` flag keys off the FILL, not the alignment.**
+  `parse_internal_render_format_spec` takes `0` as the fill whenever no fill char
+  was named — naming an alignment is not enough. `format(1, '<08d')` is
+  `10000000`; it used to be `1` padded with spaces because the explicit `<`
+  suppressed the flag.
+- **`c` rejects a sign and the alternate form.** `format(65, '+c')` /
+  `format(65, '-c')` / `format(65, ' c')` are
+  `ValueError: Sign not allowed with integer format specifier 'c'` and
+  `format(65, '#c')` is the matching `Alternate form (#) …`; all four used to
+  succeed. `'%c' % (10**20)` is `OverflowError: %c arg not in range(0x110000)`
+  rather than a `TypeError` — an int too large is a RANGE error, not a type one.
+- **`PYTHONHASHSEED` is honoured for every seed, not just `0`.** See the
+  `hash()` section below.
+- **`functools.wraps` copies `__doc__` and `__module__` across the bridge.**
+  Every pyclass answers those two names from its own type (`None` and
+  `"builtins"`), so normal attribute lookup succeeded and the proxy's
+  `__getattr__` never fired for them — `functools.wraps(f)` copied `None` over
+  the wrapped function's docstring and `"builtins"` over its module. Both are
+  getset pairs now, delegating to the wrapped callable until something assigns.
 - **`iter()`/`next()` honor the user iterator protocol.** `iter(x)` called
   `PyHost::make_iter` directly, which cannot run Python, so a class defining
   `__iter__`/`__next__` was `TypeError: 'Count' object is not iterable` and
@@ -533,6 +585,50 @@ written.
   variants; async-generator `asend`/`athrow`/`aclose`.
 
 ## Partial / simplified semantics
+- **`stdout` is never block-buffered, so a merged stream interleaves
+  differently.** CPython line-buffers `stdout` on a TTY and BLOCK-buffers it on
+  a pipe or file, while `stderr` stays unbuffered; pythonrs flushes `stdout` on
+  every write. Redirected output therefore comes out in a different order:
+
+      import sys
+      print("out1"); sys.stderr.write("err1\n")
+      print("out2"); sys.stderr.write("err2\n")
+
+      $ python3 prog.py > log 2>&1   ->  err1 err2 out1 out2
+      $ python  prog.py > log 2>&1   ->  out1 err1 out2 err2
+
+  The same difference makes pythonrs KEEP output CPython drops:
+  `print("kept", end=""); os._exit(0)` prints `kept` here and nothing under
+  CPython, because `os._exit` skips the flush of a buffer pythonrs does not
+  have. `-u` cannot be observed on the pythonrs side for the same reason — the
+  streams it would unbuffer are already unbuffered. Neither differential harness
+  can see any of this: `dropin_check.sh` discards stderr and `parity-fuzz` reads
+  the two streams through separate pipes, so the interleaving is never compared.
+  Closing it means owning a real `BufWriter` for `stdout` with a TTY check, a
+  flush at normal exit and before `input()`, and matching buffering on the
+  embedded interpreter's side (`ffi.rs::line_buffer_std_streams` currently
+  line-buffers CPython's streams specifically to match the unbuffered behaviour
+  described here).
+- **A pythonrs generator crossing to CPython has no `throw`/`send`/`close`.**
+  `PyrsIterator` implements `__iter__`/`__next__` only, so anything CPython-side
+  that drives the generator protocol fails:
+
+      import contextlib
+      @contextlib.contextmanager
+      def cm():
+          try: yield
+          except ValueError as e: print('cm saw', e)
+      with cm(): raise ValueError('inner')
+      # CPython : cm saw inner
+      # pythonrs: AttributeError: 'builtins.PyrsIterator' object has no
+      #           attribute 'throw'
+
+  The methods exist natively (`it.throw(ValueError('x'))` on a pythonrs
+  generator works); what is missing is the bridge exposing them. A faithful
+  `throw` also has to marshal the CPython exception INTO the generator and
+  re-raise the original type out of it — returning the host's `Err(String)`
+  would surface as a `RuntimeError`, which `contextlib.__exit__` treats as a
+  distinct case. Reachable from `parity-fuzz --mode ctxmgr`.
 - **`-O` reaches `__debug__` and nothing else.** The flag sets `__debug__` to
   False, but the compiler still emits every `assert` (so an optimized run keeps
   checking them) and `sys.flags.optimize` still reports 0. Skipping asserts at
@@ -612,9 +708,13 @@ written.
 - **`int`** is arbitrary precision (bignum) across `+ - * ** // %` and the bitwise
   ops `& | ^ << >>` — verified byte-identical to CPython on `10**30`-scale values
   (the earlier i64-cap on `//`/`%`/bitwise is gone).
-- **f-string / `str.format` format spec** covers the common mini-language
-  (fill/align/sign/width/`,`/`.prec`/type `d f e x o b % s c g`) and nested field
-  specs (see Implemented).
+- **f-string / `str.format` format spec** is complete for the builtin types.
+  Every presentation type (`b c d e E f F g G n o s x X %` and the omitted one),
+  every flag (fill/align/sign/`#`/`0`/width/`,`/`_`/`.prec`), and nested field
+  specs are covered — measured by sweeping 4 800 generated specs against all of
+  `int`/`bignum`/`bool`/`float`/`-0.0`/`inf`/`nan`/`str` (91 206 pairs) under
+  `LC_ALL` in `C`, `en_US`, `de_DE`, `hi_IN` and `fr_FR`, byte-identical to
+  CPython 3.14.6 in every one.
 - **Lone surrogates in `str`**: `chr(0xD800..0xDFFF)` raises `ValueError` where
   CPython returns a surrogate-bearing `str` (which then fails only on UTF-8
   encode). pythonrs strings are Rust `String` (valid scalar values only), so a
@@ -633,7 +733,7 @@ written.
   full slot listing.** `dir(list)`/`dir("a")` enumerate the names the type really
   responds to (so `'append' in dir(list)` and `'upper' in dir(str)` are right),
   plus `__class__`/`__doc__`/`__init__`/`__new__`/`__sizeof__`. CPython's
-  `dir(list)` is ~46 entries because every slot wrapper (`__add__`, `__iadd__`,
+  `dir(list)` is 48 entries because every slot wrapper (`__add__`, `__iadd__`,
   `__class_getitem__`, …) is a real descriptor on the type; pythonrs dispatches
   those natively rather than through per-type descriptor objects, so they are not
   enumerable. `dir()` of a bridged CPython object (`dir(json)`,
@@ -693,9 +793,11 @@ written.
   `builtin_dispatch_is_fully_listed_by_dir`), but the remaining slots
   (`__class_getitem__`, `__reduce_ex__`, `__sizeof__`, `__init_subclass__`, …)
   are dispatched natively rather than through per-type descriptor objects, so
-  they are not enumerable. 476 of CPython's 767 names across the 13 builtin
-  types. The BINARY OPERATOR slots are now real bound methods (see
-  "Implemented"), which is what took the count from 418 to 476.
+  they are not enumerable. pythonrs reports 459 of CPython's 781 names across
+  the 13 builtin types (`int float bool str bytes bytearray list tuple dict set
+  frozenset complex type`), measured by intersecting `dir(t)` per type against
+  CPython 3.14.6. The BINARY OPERATOR slots are now real bound methods (see
+  "Implemented"), which is what moved the count up.
 - **`collections.deque` implements none of its operators.** `deque + deque`,
   `deque * n` and `q += […]` all raise `unsupported operand type(s)`, so its
   `__add__`/`__iadd__`/`__mul__`/`__rmul__`/`__imul__` are deliberately kept out
@@ -748,6 +850,35 @@ written.
   `_`); multi-line blocks close on a blank line. Passing `--repl` with piped
   (non-TTY) stdin runs the same interactive loop over the piped source, the
   analogue of `python3 -i < file`.
+
+### What the parity harnesses cannot report
+
+Every number this project quotes comes out of one of four measuring tools, and
+each is blind to a definite class of divergence. A gap in this table is not a
+gap that has been ruled out — it is one no amount of running the tool can
+surface, so it has to be found by reading code or by writing a new probe.
+
+| Harness | Compares | Structurally cannot report |
+| --- | --- | --- |
+| `scripts/dropin_check.sh` | stdout bytes + exit code of whole scripts | stderr (discarded); any script the reference exits non-zero on (SKIPped, so the whole nonzero-exit surface); stdin-reading scripts (none supplied); argv shapes other than the one fixed triple; files the script wrote; stdout/stderr INTERLEAVING (separate pipes); timing |
+| `src/bin/parity.rs` | stdout of the `examples/` corpus | stderr; the exit code (not compared at all); everything the corpus does not happen to do; no frozen replay, so a machine without `python3` measures nothing |
+| `src/bin/parity_fuzz.rs` | stdout bytes + zero/non-zero exit of `-c` one-liners | the exact exit CODE (only success-ness); stderr unless `--stderr`, and then only a normalized last line; anything a generator does not emit — no filesystem, no subprocess, no threads, no stdin, no argv, no multi-file import, no `__main__` semantics; a case whose oracle output is nondeterministic is reported as a permanent gap rather than rejected |
+| in-process `g()` (`tests/*.rs`) | one global's `repr` after `eval_str` | stdout entirely (`print` is invisible); stderr; the exit code; ordering between statements; **and it is not differential at all** — it compares against a value a human transcribed from CPython, so it catches a REGRESSION and can never catch a divergence that was wrong from the first commit |
+
+Two axes were pinned to a constant across every one of them, which hid the axis
+rather than controlling it:
+
+* **`PYTHONHASHSEED`** was frozen at `0` by both subprocess harnesses, and
+  pythonrs ignored the variable entirely — so the fuzzer could not have detected
+  that any other seed returned the seed-0 value. Closed: the seed is honoured
+  (see the `hash()` section) and `parity-fuzz` now sweeps it, pinning the same
+  value on both children per case.
+* **`LC_ALL`** was pinned nowhere, which is the opposite failure — every run
+  measured whatever locale the operator's shell had. That is what let
+  `format(n, 'n')` ship with no locale grouping at all: on a `C`-locale machine
+  it is indistinguishable from `d`. Closed: `dropin_check.sh` pins `LC_ALL=C` so
+  a run is reproducible, and the locale-VARYING surface is measured by sweeping
+  `LC_ALL` over the format-spec corpus against `python3`.
 
 ## Standard library
 
@@ -929,7 +1060,17 @@ len({1, Decimal(1)})            # 1        len({0.5, Fraction(1, 2)})   # 1
 {Decimal(1): 'dec'} | e[1]='int'   ->  {Decimal('1'): 'int'}
 ```
 
-Two residues remain, and both are boundaries rather than gaps:
+`PYTHONHASHSEED` is honoured, not ignored. `_Py_HashRandomization_Init`
+(`Python/bootstrap_hash.c`) is ported: seed `0` zeroes the 24-byte secret, any
+other pinned seed expands through `lcg_urandom`, and an unset variable — or
+`random` — draws per-process entropy exactly as CPython does. `hash('abc')` is
+therefore byte-identical to `PYTHONHASHSEED=N python3` for every `N` in
+`[0, 4294967295]`, where before this only `N == 0` agreed and every other seed
+silently returned the seed-0 value. A seed CPython refuses (`0x10`, `-1`,
+`4294967296`, a trailing space) is refused here with CPython's own
+`Fatal Python error: config_init_hash_seed: …` text and exit code 1.
+
+One residue remains, and it is a boundary rather than a gap:
 
 - **Address-derived hashes are not reproducible by anyone.**
   `hash(float('nan'))`, `hash(...)`, `hash(NotImplemented)` and an instance's
@@ -937,10 +1078,13 @@ Two residues remain, and both are boundaries rather than gaps:
   address. Measured across CPython runs they differ every time *even under
   `PYTHONHASHSEED=0`*, so there is no value to match. pythonrs returns a stable
   internally-consistent number instead.
-- **`str`/`bytes` match only at `PYTHONHASHSEED=0`.** SipHash-1-3 is keyed by
-  `_Py_HashSecret`, which CPython randomizes per process. pythonrs implements
-  the zero-key case, so it agrees with a seed-pinned CPython and cannot agree
-  with an unpinned one. `parity-fuzz` pins the seed on both children.
+
+An UNSET seed is likewise unmatchable in principle — both interpreters draw
+their own entropy — which is a property of asking for unpredictability, not a
+divergence. `parity-fuzz` pins the same seed on both children and sweeps it
+across cases rather than freezing it at `0`, so the whole seed axis is measured;
+it was previously frozen, which made a hash-seed divergence structurally
+unreportable.
 
 A `__hash__` RESULT is not reduced modulo `2**61-1`. CPython's `slot_tp_hash`
 tries `PyLong_AsSsize_t` first and uses any value that already fits a
