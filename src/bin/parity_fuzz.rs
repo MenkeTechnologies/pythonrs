@@ -14,8 +14,15 @@
 //! nondeterministic for reasons unrelated to parity (`random`, `time`, `id()`,
 //! object addresses, set iteration order). Every probe is wrapped in `print`
 //! and any `set` is `sorted(...)` before printing, so every reported divergence
-//! is a real parity gap, not a false positive. `PYTHONHASHSEED=0` is forced on
-//! both children as a second belt.
+//! is a real parity gap, not a false positive. The invariant is a rule about the
+//! generator, not something the harness can check — `gen_dataclass` printed a
+//! `MISSING` sentinel whose repr carries an ADDRESS and emitted a permanent
+//! false divergence until it was caught by reading the report.
+//!
+//! `PYTHONHASHSEED` is pinned per case (never left unset) and SWEPT rather than
+//! frozen — see `hash_seed_for`. Freezing it at `0`, which this harness did,
+//! left a whole axis of `str`/`bytes` hashing and string-keyed container order
+//! unmeasurable by construction.
 //!
 //! Subprocess-only: this binary never links the pythonrs library — it compares
 //! two `python` processes, exactly as a user would observe them.
@@ -203,11 +210,17 @@ fn differs(oracle: &RunOut, ours: &RunOut) -> bool {
 /// Run `<prog> -c <src>` with a wall-clock timeout enforced by a watchdog: two
 /// reader threads drain stdout/stderr (so a large writer can't deadlock on a
 /// full pipe) while the main thread polls `try_wait` and `kill()`s on overrun.
-fn run_prog(prog: &Path, src: &str, timeout: Duration, oracle_env: bool) -> RunOut {
+fn run_prog(
+    prog: &Path,
+    src: &str,
+    timeout: Duration,
+    oracle_env: bool,
+    hash_seed: &str,
+) -> RunOut {
     let mut cmd = Command::new(prog);
     cmd.arg("-c")
         .arg(src)
-        .env("PYTHONHASHSEED", "0")
+        .env("PYTHONHASHSEED", hash_seed)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -4864,12 +4877,21 @@ fn gen_dataclass(seed: u64) -> Vec<String> {
             format!("print(P({a}, 'aa') == P({a}, 'bb'), P({a}, 'aa'))"),
         ],
         6 => vec![
-            "from dataclasses import dataclass, fields".into(),
+            "from dataclasses import dataclass, fields, MISSING".into(),
             "@dataclass".into(),
             "class P:".into(),
             "    x: int".into(),
             "    y: str = 'q'".into(),
-            "print([(f.name, f.default) for f in fields(P)])".into(),
+            // `f.default` for a field WITHOUT one is the `MISSING` sentinel,
+            // whose repr is `<dataclasses._MISSING_TYPE object at 0x…>` — an
+            // ADDRESS. Printing it violates this generator's determinism
+            // invariant outright: two runs of the reference disagree with each
+            // other, so the case reported a divergence no implementation could
+            // ever close. Comparing AGAINST the sentinel asks the same question
+            // (does a bare field carry a default?) with a stable answer.
+            "print([(f.name, f.default if f.default is not MISSING else 'MISSING') \
+             for f in fields(P)])"
+                .into(),
         ],
         // A field without a default may not follow one that has a default.
         _ => vec![
@@ -5517,8 +5539,10 @@ fn gen_valuekey(seed: u64) -> Vec<String> {
 /// * numeric (`int`/`float`/`complex`/`bool`) — `hash(n) == n mod (2**61-1)`
 ///   and the modular extension that keeps equal numbers hashing equally. Stable
 ///   under ANY `PYTHONHASHSEED`.
-/// * `str`/`bytes` — SipHash, randomized per process, so reproducible ONLY
-///   because this harness pins `PYTHONHASHSEED=0` on both children.
+/// * `str`/`bytes` — SipHash keyed by `_Py_HashSecret`. Reproducible under ANY
+///   pinned `PYTHONHASHSEED` (pythonrs derives the same key CPython does), and
+///   under none: this harness pins the same seed on both children and sweeps it
+///   across cases.
 /// * `None`, `tuple`, `frozenset` — derived from the above.
 ///
 /// Deliberately EXCLUDED, having been measured as pointer-derived and therefore
@@ -6260,14 +6284,41 @@ fn mode_from_name(s: &str) -> Option<Mode> {
 // Divergence check + delta-debug minimizer
 // ---------------------------------------------------------------------------
 
-fn diverges(script: &str, bin: &Path, oracle: &str, timeout: Duration) -> bool {
-    let o = run_prog(Path::new(oracle), script, timeout, true);
-    let r = run_prog(bin, script, timeout, false);
+/// The `PYTHONHASHSEED` a case runs under — the SAME value on both children.
+///
+/// Pinning every case to `0`, as this harness used to, makes a hash-seed
+/// divergence structurally unreportable: `str`/`bytes` hashes, and with them
+/// `set`/`dict` iteration order for string keys, are measured at exactly one
+/// point of a 2**32-wide axis. Deriving the seed from the case seed sweeps the
+/// axis while keeping every case replayable — `--seed N --once` picks the same
+/// value the batch run did. One case in four stays at `0`, so the surface this
+/// harness has always measured is still measured.
+///
+/// The seed is never left UNSET: CPython then draws its own entropy and no
+/// implementation can agree with it, which would be a false divergence rather
+/// than a finding.
+fn hash_seed_for(seed: u64) -> String {
+    if seed % 4 == 0 {
+        "0".to_string()
+    } else {
+        (seed % 4_294_967_296).to_string()
+    }
+}
+
+fn diverges(script: &str, bin: &Path, oracle: &str, timeout: Duration, hash_seed: &str) -> bool {
+    let o = run_prog(Path::new(oracle), script, timeout, true, hash_seed);
+    let r = run_prog(bin, script, timeout, false, hash_seed);
     !o.timed_out && differs(&o, &r)
 }
 
 /// Delta-debug: greedily drop statements while the divergence survives.
-fn minimize(stmts: Vec<String>, bin: &Path, oracle: &str, timeout: Duration) -> Vec<String> {
+fn minimize(
+    stmts: Vec<String>,
+    bin: &Path,
+    oracle: &str,
+    timeout: Duration,
+    hash_seed: &str,
+) -> Vec<String> {
     let mut cur = stmts;
     let mut changed = true;
     while changed && cur.len() > 1 {
@@ -6278,7 +6329,7 @@ fn minimize(stmts: Vec<String>, bin: &Path, oracle: &str, timeout: Duration) -> 
             if cand.is_empty() {
                 continue;
             }
-            if diverges(&build_program(&cand), bin, oracle, timeout) {
+            if diverges(&build_program(&cand), bin, oracle, timeout, hash_seed) {
                 cur = cand;
                 changed = true;
                 break;
@@ -6528,16 +6579,18 @@ fn main() {
     if args.once {
         let stmts = gen_case(args.base_seed, args.mode);
         let script = build_program(&stmts);
-        let o = run_prog(Path::new(&oracle), &script, timeout, true);
-        let r = run_prog(&bin, &script, timeout, false);
+        let hseed = hash_seed_for(args.base_seed);
+        let o = run_prog(Path::new(&oracle), &script, timeout, true, &hseed);
+        let r = run_prog(&bin, &script, timeout, false, &hseed);
         let diverged = !o.timed_out && differs(&o, &r);
         println!("seed   : {}", args.base_seed);
         println!("mode   : {}", mode_name(args.mode));
+        println!("hashseed: {hseed}");
         let (show, o, r) = if diverged && stmts.len() > 1 {
-            let m = minimize(stmts, &bin, &oracle, timeout);
+            let m = minimize(stmts, &bin, &oracle, timeout, &hseed);
             let ms = build_program(&m);
-            let mo = run_prog(Path::new(&oracle), &ms, timeout, true);
-            let mr = run_prog(&bin, &ms, timeout, false);
+            let mo = run_prog(Path::new(&oracle), &ms, timeout, true, &hseed);
+            let mr = run_prog(&bin, &ms, timeout, false, &hseed);
             (ms, mo, mr)
         } else {
             (script, o, r)
@@ -6586,8 +6639,9 @@ fn main() {
                 let seed = args.base_seed.wrapping_add(idx);
                 let stmts = gen_case(seed, args.mode);
                 let script = build_program(&stmts);
-                let o = run_prog(Path::new(&oracle), &script, timeout, true);
-                let r = run_prog(&bin, &script, timeout, false);
+                let hseed = hash_seed_for(seed);
+                let o = run_prog(Path::new(&oracle), &script, timeout, true, &hseed);
+                let r = run_prog(&bin, &script, timeout, false, &hseed);
                 let done = checked.fetch_add(1, Ordering::Relaxed) + 1;
                 if o.timed_out || r.timed_out {
                     timeouts.fetch_add(1, Ordering::Relaxed);
@@ -6597,10 +6651,10 @@ fn main() {
                 }
                 // oracle-side timeout ⇒ pathological case; not a parity gap.
                 if !o.timed_out && differs(&o, &r) {
-                    let minimal = minimize(stmts, &bin, &oracle, timeout);
+                    let minimal = minimize(stmts, &bin, &oracle, timeout, &hseed);
                     let mscript = build_program(&minimal);
-                    let mo = run_prog(Path::new(&oracle), &mscript, timeout, true);
-                    let mr = run_prog(&bin, &mscript, timeout, false);
+                    let mo = run_prog(Path::new(&oracle), &mscript, timeout, true, &hseed);
+                    let mr = run_prog(&bin, &mscript, timeout, false, &hseed);
                     // Re-verify: a REAL gap diverges every time; a transient
                     // (empty output under resource pressure) won't reproduce.
                     let mut confirmed = differs(&mo, &mr);
@@ -6608,7 +6662,7 @@ fn main() {
                         if !confirmed {
                             break;
                         }
-                        confirmed = diverges(&mscript, &bin, &oracle, timeout);
+                        confirmed = diverges(&mscript, &bin, &oracle, timeout, &hseed);
                     }
                     if !confirmed {
                         continue;

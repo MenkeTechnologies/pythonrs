@@ -19,6 +19,27 @@
 # error (exit 2), never a vacuous "0/0 OK" pass. Needs python3 on PATH, so CI
 # never runs it.
 #
+# What this gauge CANNOT report, by construction — read this before trusting a
+# 100% readiness number:
+#
+#   * stderr is discarded (2>/dev/null on both sides). A divergence that lives
+#     only on stderr — traceback text, a DeprecationWarning, a message written
+#     by the script itself — cannot fail this check.
+#   * a script the REFERENCE exits non-zero on is SKIPped, so the whole
+#     nonzero-exit surface (uncaught exceptions, sys.exit(n) with n != 0) is
+#     unmeasured unless the script also succeeds under python3.
+#   * stdin is never supplied: nothing here exercises input() or sys.stdin.
+#   * argv is the single fixed triple below; no empty-argv, unicode-argv or
+#     embedded-newline-argv case is generated.
+#   * only stdout is diffed. Files the script wrote, and their contents, are
+#     not compared — the sandbox is reset between the two runs precisely so the
+#     second run cannot see the first's output.
+#   * the two runs use separate stdout/stderr pipes, so their INTERLEAVING is
+#     never compared. pythonrs writes stdout unbuffered where CPython
+#     block-buffers a pipe; merged (`2>&1`) output therefore differs in order,
+#     and this gauge is blind to it by design. See BUGS.md.
+#   * timing is not measured at all.
+#
 #   PYTHONRS_BIN=... PYTHONRS_REF=python3.14 ./scripts/dropin_check.sh
 set -u
 
@@ -43,6 +64,14 @@ shopt -u nullglob
 
 # Determinism: pin hash seed (sets) and keep the reference from writing .pyc.
 export PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1
+# Pin the numeric locale too. `format(n, 'n')`, `locale.format_string` and
+# `time.strftime` all read LC_* from the environment, so an unpinned run
+# measures whatever locale the operator's shell happened to have — a de_DE
+# machine and a C machine would disagree on the same corpus for reasons that
+# have nothing to do with pythonrs. LC_ALL=C is the reference point; the
+# locale-VARYING behaviour is measured separately, by sweeping LC_ALL over the
+# format-spec corpus against python3.
+export LC_ALL=C
 
 echo "reference : $("$ref" --version 2>&1)"
 echo "pythonrs  : $ours"

@@ -1,7 +1,24 @@
 //! Differential parity harness (development tool): run the example corpus
 //! through pythonrs and the reference `python3`, diffing stdout. Needs `python3`
-//! on PATH, so CI never runs it. Frozen outputs live in
-//! tests/data/parity_expected.txt for the no-`python3` replay in tests/parity.rs.
+//! on PATH, so CI never runs it.
+//!
+//! What this harness CANNOT report, by construction — it compares one stream of
+//! one run of each interpreter:
+//!
+//! * **stderr** is dropped, so a traceback-text or warning divergence is
+//!   invisible here (`parity-fuzz --stderr` compares a normalized last line).
+//! * **the exit code** is not compared at all: a corpus script that ran to
+//!   completion on both sides passes even if one exited non-zero.
+//! * **the environment** is inherited whole. Nothing is pinned — not
+//!   `PYTHONHASHSEED`, not `LC_ALL` — so a run is only as reproducible as the
+//!   shell it was started from.
+//! * **file-system effects** are not diffed; only what reached stdout is.
+//!
+//! There is no frozen replay of these outputs. A no-`python3` machine measures
+//! nothing here; the CI-safe coverage is `tests/lang.rs` and friends, which
+//! assert against values transcribed from CPython rather than against a live
+//! oracle — and therefore catch a REGRESSION, never a divergence CPython and
+//! pythonrs have always disagreed on.
 
 use std::path::Path;
 use std::process::Command;
