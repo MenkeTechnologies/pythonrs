@@ -69,6 +69,14 @@ written.
   - the two C-`int` parameters name that width instead —
     `'a\tb'.expandtabs(10**20)` and `'%.*f' % (10**20, 1.5)`.
 
+  A range longer than `Py_ssize_t` refuses to materialize instead of looping
+  forever: `list(range(10**25))` built a vector nothing could hold, with no
+  panic and no error to interrupt it, where CPython's `PyObject_LengthHint` asks
+  `range.__len__` first and raises `OverflowError: Python int too large to
+  convert to C ssize_t`. `len(range(10**25))` raised already but named the wrong
+  C type. A bignum range that is SHORT (`range(10**30, 10**30+5)`) still
+  materializes.
+
   A slice bound SATURATES rather than raising, because `_PyEval_SliceIndex`
   passes a NULL exception type to `PyNumber_AsSsize_t`. Read as "omitted", every
   one of these returned the whole sequence; they now match CPython:

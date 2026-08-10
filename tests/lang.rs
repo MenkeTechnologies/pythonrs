@@ -7766,6 +7766,28 @@ fn a_bignum_index_is_an_overflow_not_a_type_error() {
         );
     }
 
+    // A range longer than `Py_ssize_t` cannot be materialized. `list(range(
+    // 10**25))` looped forever building a vector nothing could hold — no panic,
+    // no error, just an unkillable process; CPython asks the range for its
+    // length first (`PyObject_LengthHint`) and refuses there.
+    for src in [
+        "list(range(10**25))",
+        "tuple(range(10**25))",
+        "len(range(10**25))",
+    ] {
+        assert_eq!(
+            eval_str(src).expect_err("must raise"),
+            "OverflowError: Python int too large to convert to C ssize_t",
+            "for {src:?}"
+        );
+    }
+    // A bignum range that is SHORT still materializes.
+    assert_eq!(g("x = len(range(10**30, 10**30 + 5))", "x"), "5");
+    assert_eq!(
+        g("x = list(range(10**30, 10**30 + 2))", "x"),
+        "[1000000000000000000000000000000, 1000000000000000000000000000001]"
+    );
+
     // `chr` read the bignum as `None` and then as 0, so `chr(10**30)` printed a
     // NUL instead of raising; a non-integer is the `__index__` TypeError.
     assert_eq!(

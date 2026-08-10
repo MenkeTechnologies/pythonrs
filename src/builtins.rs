@@ -5895,11 +5895,11 @@ pub fn py_len(v: &Value) -> Result<usize, String> {
         }
         Some(PyObj::BigRange { start, stop, step }) => {
             use num_traits::ToPrimitive;
-            host::big_range_len(start, stop, step)
-                .to_usize()
-                .ok_or_else(|| {
-                    "OverflowError: cannot fit 'int' into an index-sized integer".to_string()
-                })
+            // `range_length` returns a `PyObject*` that `len()` then squeezes
+            // through `PyLong_AsSsize_t`, so the message names the C type.
+            host::big_range_len(start, stop, step).to_usize().ok_or_else(|| {
+                "OverflowError: Python int too large to convert to C ssize_t".to_string()
+            })
         }
         #[cfg(feature = "stdlib-ffi")]
         Some(PyObj::Foreign(id)) => crate::ffi::len(*id),

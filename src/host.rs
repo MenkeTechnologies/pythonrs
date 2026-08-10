@@ -8198,7 +8198,17 @@ impl PyHost {
                 Ok(out)
             }
             Some(PyObj::BigRange { start, stop, step }) => {
-                use num_traits::Zero;
+                use num_traits::{ToPrimitive, Zero};
+                // `list(range(10**25))` looped forever building a vector nothing
+                // could hold — no panic, no error, just an unkillable process.
+                // CPython asks the range for its length first
+                // (`PyObject_LengthHint` -> `range.__len__` -> `PyLong_AsSsize_t`)
+                // and refuses there.
+                if big_range_len(start, stop, step).to_usize().is_none() {
+                    return Err(
+                        "OverflowError: Python int too large to convert to C ssize_t".to_string(),
+                    );
+                }
                 let (stop, step) = (stop.clone(), step.clone());
                 let pos = step > num_bigint::BigInt::zero();
                 let mut out = Vec::new();
