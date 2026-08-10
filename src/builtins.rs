@@ -9250,8 +9250,23 @@ pub(crate) fn exception_isa(exc_class: &str, want: &str, h: &host::PyHost) -> bo
     // `logger.exception(...)` went down the wrong branch and died reaching
     // `True.__traceback__`.
     if want == "BaseException" {
-        return is_exception_class(exc_class)
-            || h.classes.contains_key(exc_class) && h.class_is_exception(exc_class);
+        if is_exception_class(exc_class)
+            || h.classes.contains_key(exc_class) && h.class_is_exception(exc_class)
+        {
+            return true;
+        }
+        // A CPython exception crossing the bridge (`json.JSONDecodeError`,
+        // `binascii.Error`, `struct.error`, `decimal.InvalidOperation`) is
+        // neither a builtin nor a pythonrs class, so the two tests above both
+        // say no and `except BaseException` did not catch it — while
+        // `except Exception` and `except ValueError`, which fall through to the
+        // recorded `__mro__` below, did. A bare `except BaseException:` around
+        // `json.loads` let the exception escape.
+        return h
+            .foreign_exc_bases
+            .get(exc_class)
+            .is_some_and(|bases| bases.iter().any(|b| b == "BaseException"))
+            || exception_isa(exc_class, "Exception", h);
     }
     // `ExceptionGroup` is the one builtin exception with TWO bases —
     // `Exception` (the link `EXC_PARENTS` records, so `except Exception` catches
@@ -10772,17 +10787,28 @@ fn property_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
 
 /// Prefixes for `str.startswith`/`endswith`: a single str, or every str in a
 /// tuple. Mirrors CPython accepting `str | tuple[str, ...]`.
-fn str_prefixes(v: &Value) -> Result<Vec<String>, String> {
+fn str_prefixes(v: &Value, name: &str) -> Result<Vec<String>, String> {
     if let Some(s) = with_host(|h| h.as_str(v)) {
         return Ok(vec![s]);
+    }
+    // Only a TUPLE is accepted; anything else names the offending type. pythonrs
+    // iterated whatever it was given, so `'abc'.startswith(1)` surfaced the
+    // iteration failure (`'int' object is not iterable`) instead.
+    if !matches!(with_host(|h| h.get(v).cloned()), Some(PyObj::Tuple(_))) {
+        return Err(host::type_error(&format!(
+            "{name} first arg must be str or a tuple of str, not {}",
+            with_host(|h| h.type_name(v))
+        )));
     }
     let items = host::iter_vec(v)?;
     let mut out = Vec::with_capacity(items.len());
     for it in items {
-        out.push(
-            with_host(|h| h.as_str(&it))
-                .ok_or_else(|| host::type_error("tuple for startswith must only contain str"))?,
-        );
+        out.push(with_host(|h| h.as_str(&it)).ok_or_else(|| {
+            host::type_error(&format!(
+                "tuple for {name} must only contain str, not {}",
+                with_host(|h| h.type_name(&it))
+            ))
+        })?);
     }
     Ok(out)
 }
@@ -10969,6 +10995,21 @@ fn fold_str_kwargs(
 fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
     let s = with_host(|h| h.as_str(recv)).unwrap_or_default();
     let sarg = |i: usize| with_host(|h| args.get(i).and_then(|v| h.as_str(v))).unwrap_or_default();
+    // The same accessor, but rejecting a non-`str` argument the way CPython
+    // does. `sarg` silently substitutes "" for anything it cannot read as a
+    // string, so `'abc'.find(1)` searched for the EMPTY string and answered 0,
+    // and `'abc'.strip(1)` stripped nothing and returned successfully.
+    let sarg_checked = |i: usize, what: &str| -> Result<String, String> {
+        match args.get(i) {
+            None | Some(Value::Undef) => Ok(String::new()),
+            Some(v) => with_host(|h| h.as_str(v)).ok_or_else(|| {
+                host::type_error(&format!(
+                    "{what} must be str, not {}",
+                    with_host(|h| h.type_name(v))
+                ))
+            }),
+        }
+    };
     match name {
         "upper" => Ok(new_str(s.to_uppercase())),
         "lower" => Ok(new_str(s.to_lowercase())),
@@ -10984,9 +11025,9 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             }
             Ok(new_str(out))
         }
-        "strip" => Ok(new_str(strip_str(&s, args, 3))),
-        "lstrip" => Ok(new_str(strip_str(&s, args, 1))),
-        "rstrip" => Ok(new_str(strip_str(&s, args, 2))),
+        "strip" => Ok(new_str(strip_str(&s, args, 3, "strip")?)),
+        "lstrip" => Ok(new_str(strip_str(&s, args, 1, "lstrip")?)),
+        "rstrip" => Ok(new_str(strip_str(&s, args, 2, "rstrip")?)),
         "swapcase" => Ok(new_str(
             // Unicode-aware: a cased letter maps to the opposite case (case
             // mapping can be 1→many, e.g. `ß` → `SS`); non-cased chars pass
@@ -11100,8 +11141,8 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             Ok(new_str(strs.join(&s)))
         }
         "replace" => {
-            let from = sarg(0);
-            let to = sarg(1);
+            let from = sarg_checked(0, "replace() argument 1")?;
+            let to = sarg_checked(1, "replace() argument 2")?;
             let count = args.get(2).and_then(|v| with_host(|h| h.as_int(v)));
             let out = match count {
                 Some(n) if n >= 0 => s.replacen(&from, &to, n as usize),
@@ -11124,8 +11165,12 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
                 .iter()
                 .collect();
             let prefixes = match args.first() {
-                Some(v) if !matches!(v, Value::Undef) => str_prefixes(v)?,
-                _ => return Err(host::type_error("startswith first arg must be str")),
+                Some(v) if !matches!(v, Value::Undef) => str_prefixes(v, name)?,
+                _ => {
+                    return Err(host::type_error(&format!(
+                        "{name} first arg must be str or a tuple of str, not NoneType"
+                    )))
+                }
             };
             let hit = prefixes.iter().any(|p| {
                 if name == "startswith" {
@@ -11137,14 +11182,18 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             Ok(Value::Bool(hit))
         }
         "find" | "rfind" => {
-            let needle: Vec<char> = sarg(0).chars().collect();
+            let needle: Vec<char> = sarg_checked(0, &format!("{name}() argument 1"))?
+                .chars()
+                .collect();
             let chars: Vec<char> = s.chars().collect();
             let (start, end) = resolve_start_end(chars.len(), args, 1);
             let p = slice_find(&chars, &needle, start, end, name == "rfind");
             Ok(Value::Int(p.map(|x| x as i64).unwrap_or(-1)))
         }
         "index" | "rindex" => {
-            let needle: Vec<char> = sarg(0).chars().collect();
+            let needle: Vec<char> = sarg_checked(0, &format!("{name}() argument 1"))?
+                .chars()
+                .collect();
             let chars: Vec<char> = s.chars().collect();
             let (start, end) = resolve_start_end(chars.len(), args, 1);
             match slice_find(&chars, &needle, start, end, name == "rindex") {
@@ -11153,7 +11202,7 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             }
         }
         "count" => {
-            let sub: Vec<char> = sarg(0).chars().collect();
+            let sub: Vec<char> = sarg_checked(0, "count() argument 1")?.chars().collect();
             let chars: Vec<char> = s.chars().collect();
             let (start, end) = resolve_start_end(chars.len(), args, 1);
             Ok(Value::Int(count_range(&chars, &sub, start, end) as i64))
@@ -11203,13 +11252,13 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
         "ljust" => Ok(new_str(pad_str(&s, args, 'l', name)?)),
         "rjust" => Ok(new_str(pad_str(&s, args, 'r', name)?)),
         "removeprefix" => {
-            let p = sarg(0);
+            let p = sarg_checked(0, "removeprefix() argument")?;
             Ok(new_str(
                 s.strip_prefix(&p).map(|r| r.to_string()).unwrap_or(s),
             ))
         }
         "removesuffix" => {
-            let p = sarg(0);
+            let p = sarg_checked(0, "removesuffix() argument")?;
             Ok(new_str(
                 s.strip_suffix(&p).map(|r| r.to_string()).unwrap_or(s),
             ))
@@ -11290,7 +11339,15 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
     }
 }
 
-fn strip_str(s: &str, args: &[Value], mode: u8) -> String {
+fn strip_str(s: &str, args: &[Value], mode: u8, name: &str) -> Result<String, String> {
+    // A non-str, non-None argument is a TypeError; pythonrs read it as "no
+    // character set" and stripped whitespace instead.
+    if let Some(v) = args.first() {
+        let is_none = matches!(v, Value::Undef);
+        if !is_none && with_host(|h| h.as_str(v)).is_none() {
+            return Err(host::type_error(&format!("{name} arg must be None or str")));
+        }
+    }
     let chars: Option<String> = with_host(|h| args.first().and_then(|v| h.as_str(v)));
     let pred = |c: char| match &chars {
         Some(set) => set.contains(c),
@@ -11303,7 +11360,7 @@ fn strip_str(s: &str, args: &[Value], mode: u8) -> String {
         2 => s.trim_end_matches(pred),
         _ => s.trim_matches(pred),
     };
-    out.to_string()
+    Ok(out.to_string())
 }
 
 fn pad_str(s: &str, args: &[Value], mode: char, name: &str) -> Result<String, String> {

@@ -3378,6 +3378,19 @@ pub fn run_main(chunk: Chunk) -> Result<Value, String> {
 /// where CPython qualifies it. Returns `None` for callable builtins (`len`,
 /// `print`, `math.sqrt`), which repr as `<built-in function …>`. The set mirrors
 /// every name `PyHost::type_name` can emit.
+/// The name an `AttributeError` uses for a value's type. This is CPython's
+/// `tp_name`, which for the C-accelerated `collections` containers is
+/// module-qualified even though their `__name__` is not: `deque().__name__` is
+/// `deque` but the error says `'collections.deque' object`. The pure-Python
+/// `Counter` is NOT qualified, so this is a short explicit list rather than a
+/// blanket "prefix everything in collections".
+fn attr_error_type_name(tn: &str) -> String {
+    match tn {
+        "deque" | "OrderedDict" | "defaultdict" => format!("collections.{tn}"),
+        _ => tn.to_string(),
+    }
+}
+
 fn type_object_class_name(n: &str) -> Option<String> {
     // Module-qualified stdlib types.
     let qualified = match n {
@@ -10107,7 +10120,8 @@ impl PyHost {
                     }
                 }
                 Err(format!(
-                    "AttributeError: '{tn}' object has no attribute '{name}'"
+                    "AttributeError: '{}' object has no attribute '{name}'",
+                    attr_error_type_name(&tn)
                 ))
             }
         }

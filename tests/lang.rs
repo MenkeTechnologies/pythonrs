@@ -7549,3 +7549,131 @@ fn protocol_failures_report_the_protocol() {
         assert_eq!(&g(src, "x"), want, "for {src:?}");
     }
 }
+
+/// `except BaseException` must catch what `except Exception` catches.
+///
+/// A CPython exception crossing the stdlib bridge (`json.JSONDecodeError`,
+/// `struct.error`, `binascii.Error`, `decimal.InvalidOperation`) is neither a
+/// pythonrs builtin nor a pythonrs class. The `BaseException` arm answered from
+/// those two tests alone and said no, while `except Exception` and
+/// `except ValueError` consulted the recorded `__mro__` and said yes — so a
+/// bare `except BaseException:` around `json.loads` let the exception escape and
+/// the program died with a traceback.
+///
+/// Each case asserts the exception is caught by all three, which is what
+/// CPython 3.14.6 does.
+#[test]
+fn base_exception_catches_a_bridged_stdlib_exception() {
+    let cases: &[(&str, &str)] = &[
+        ("import json\njson.loads('{')", "JSONDecodeError"),
+        ("import struct\nstruct.unpack('i', b'ab')", "error"),
+        ("import binascii\nbinascii.unhexlify('zz')", "Error"),
+        ("import decimal\ndecimal.Decimal('x')", "InvalidOperation"),
+    ];
+    for (body, want) in cases {
+        for arm in ["BaseException", "Exception"] {
+            let head = body.split('\n').next().expect("import line");
+            let call = body.split('\n').nth(1).expect("call line");
+            let prog =
+                format!("{head}\ntry:\n    {call}\n    x = 'NOT RAISED'\nexcept {arm} as e:\n    x = type(e).__name__\n");
+            assert_eq!(
+                g(&prog, "x"),
+                format!("{want:?}").replace('"', "'"),
+                "`except {arm}` must catch {want} from {call}"
+            );
+        }
+    }
+}
+
+/// String methods that silently accepted a non-`str` argument.
+///
+/// The shared accessor substituted `""` for anything it could not read as a
+/// string, so `'abc'.find(1)` searched for the EMPTY string and answered 0 and
+/// `'abc'.strip(1)` stripped whitespace and returned successfully — a wrong
+/// VALUE, not a wrong message. Expected values are CPython 3.14.6's.
+#[test]
+fn string_methods_reject_a_non_str_argument() {
+    let raises: &[(&str, &str)] = &[
+        ("'abc'.strip(1)", "TypeError: strip arg must be None or str"),
+        (
+            "'abc'.lstrip(1)",
+            "TypeError: lstrip arg must be None or str",
+        ),
+        (
+            "'abc'.rstrip(1)",
+            "TypeError: rstrip arg must be None or str",
+        ),
+        (
+            "'abc'.removeprefix(1)",
+            "TypeError: removeprefix() argument must be str, not int",
+        ),
+        (
+            "'abc'.removesuffix(1)",
+            "TypeError: removesuffix() argument must be str, not int",
+        ),
+        (
+            "'abc'.find(1)",
+            "TypeError: find() argument 1 must be str, not int",
+        ),
+        (
+            "'abc'.rfind(1)",
+            "TypeError: rfind() argument 1 must be str, not int",
+        ),
+        (
+            "'abc'.index(1)",
+            "TypeError: index() argument 1 must be str, not int",
+        ),
+        (
+            "'abc'.count(1)",
+            "TypeError: count() argument 1 must be str, not int",
+        ),
+        (
+            "'abc'.replace(1, 'x')",
+            "TypeError: replace() argument 1 must be str, not int",
+        ),
+        (
+            "'abc'.startswith(1)",
+            "TypeError: startswith first arg must be str or a tuple of str, not int",
+        ),
+        (
+            "'abc'.endswith(1)",
+            "TypeError: endswith first arg must be str or a tuple of str, not int",
+        ),
+        (
+            "'abc'.startswith((1,))",
+            "TypeError: tuple for startswith must only contain str, not int",
+        ),
+    ];
+    for (src, want) in raises {
+        assert_eq!(&eval_str(src).expect_err("must raise"), want, "for {src:?}");
+    }
+    // The legitimate forms still work, including `None` for the strip family
+    // and a tuple for startswith.
+    let values: &[(&str, &str)] = &[
+        ("x = ' a '.strip()", "'a'"),
+        ("x = ' a '.strip(None)", "'a'"),
+        ("x = 'aab'.strip('a')", "'b'"),
+        ("x = 'abc'.find('b')", "1"),
+        ("x = 'abc'.startswith(('x', 'a'))", "True"),
+        ("x = 'abc'.removeprefix('a')", "'bc'"),
+        ("x = 'abc'.replace('a', 'x')", "'xbc'"),
+        // The C-accelerated collections containers are module-qualified in an
+        // AttributeError even though `__name__` is not; the pure-Python
+        // `Counter` is not, so this is not a blanket prefix.
+        (
+            "import collections\nx = type(collections.deque()).__name__",
+            "'deque'",
+        ),
+    ];
+    for (src, want) in values {
+        assert_eq!(&g(src, "x"), want, "for {src:?}");
+    }
+    assert_eq!(
+        eval_str("import collections\ncollections.deque().foo").expect_err("must raise"),
+        "AttributeError: 'collections.deque' object has no attribute 'foo'"
+    );
+    assert_eq!(
+        eval_str("import collections\ncollections.Counter().foo").expect_err("must raise"),
+        "AttributeError: 'Counter' object has no attribute 'foo'"
+    );
+}
