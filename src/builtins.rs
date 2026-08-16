@@ -3264,16 +3264,34 @@ fn synth_exc(h: &mut host::PyHost, err: &str) -> Value {
             return e;
         }
     }
-    let args = if msg.is_empty() {
-        vec![]
-    } else {
-        let s = h.new_str(msg.clone());
-        vec![s]
+    // An exception raised over the stdlib-ffi bridge records its real `args` and
+    // instance attributes beside the rendered line (see `host::ForeignExc`).
+    // Prefer them: `KeyError.__str__` is `repr(args[0])`, so re-parsing
+    // `KeyError: 'k'` would put the REPR in `args[0]` and double-quote `str(e)`,
+    // and `JSONDecodeError.lineno` is not in the rendering at all.
+    let recorded = match &h.foreign_exc {
+        Some(f) if f.line == err => h.foreign_exc.take(),
+        _ => None,
+    };
+    let attrs = recorded
+        .as_ref()
+        .map(|f| f.attrs.clone())
+        .unwrap_or_default();
+    let args = match recorded {
+        Some(f) => f.args,
+        None if msg.is_empty() => vec![],
+        None => {
+            let s = h.new_str(msg.clone());
+            vec![s]
+        }
     };
     let e = h.alloc(PyObj::Exception {
         class: class.clone(),
         args,
     });
+    for (name, val) in attrs {
+        let _ = h.set_attr(&e, &name, val);
+    }
     // `NameError.name` (3.10+) and `AttributeError.name` (3.10+): the identifier
     // that could not be resolved. `AttributeError.obj` is NOT set — the value
     // the lookup ran against is not recoverable from the rendered message, and

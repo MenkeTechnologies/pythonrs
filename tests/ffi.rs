@@ -860,3 +860,217 @@ print(classify(42))
         "stderr={stderr}"
     );
 }
+
+// ── the exception boundary between user code and the stdlib ─────────────────
+//
+// Values crossing the bridge as EXCEPTIONS lose information that crossing as
+// data does not. The bridge can only hand a fusevm abort a rendered
+// `"Class: message"` line, so rebuilding the exception on the other side assumes
+// `str(exc) == args[0]` and that `args` is all there is — neither holds in
+// general. Each test below pins one such loss, and each asserts on `args` /
+// attributes rather than on the message: the message is the part that already
+// agreed while the exception was still wrong.
+
+/// A `KeyError` raised by a stdlib mapping keeps the KEY in `args`, not the
+/// key's repr. `KeyError.__str__` is `repr(args[0])`, so an implementation that
+/// rebuilds the exception by re-parsing its own rendering (`KeyError: 'X'`)
+/// produces `KeyError("'X'")`: `e.args` holds the repr and `str(e)` gains a
+/// quote layer every time the exception makes the trip.
+#[test]
+fn ffi_stdlib_keyerror_keeps_the_key_in_args() {
+    let src = "\
+import os
+try:
+    os.environ['PYTHONRS_DEFINITELY_NOT_SET_XYZ']
+except KeyError as e:
+    print(type(e).__name__, e.args, repr(str(e)))
+";
+    let (stdout, stderr, ok) = run_py(src);
+    if bridge_unavailable(ok, &stderr) {
+        eprintln!("skipping ffi-keyerror test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(
+        stdout,
+        "KeyError ('PYTHONRS_DEFINITELY_NOT_SET_XYZ',) \"'PYTHONRS_DEFINITELY_NOT_SET_XYZ'\"\n",
+        "stderr={stderr}"
+    );
+}
+
+/// A stdlib exception's attributes beyond `args` survive the crossing.
+/// `except json.JSONDecodeError as e: e.lineno` is the standard way to locate a
+/// parse failure, and none of `lineno`/`colno`/`pos`/`msg`/`doc` appears in the
+/// rendered line — reconstructing the exception from that line alone left the
+/// idiom raising `AttributeError` inside the handler.
+#[test]
+fn ffi_stdlib_exception_keeps_attributes_outside_args() {
+    let src = "\
+import json
+try:
+    json.loads('{\"a\": }')
+except ValueError as e:
+    print(type(e).__name__, e.lineno, e.colno, e.pos, e.msg)
+";
+    let (stdout, stderr, ok) = run_py(src);
+    if bridge_unavailable(ok, &stderr) {
+        eprintln!("skipping ffi-json-attrs test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(
+        stdout, "JSONDecodeError 1 7 6 Expecting value\n",
+        "stderr={stderr}"
+    );
+}
+
+/// `@contextlib.contextmanager` drives a pythonrs generator through the CPython
+/// generator protocol: `__exit__` calls `gen.throw(exc)` to give the body's
+/// exception to the `except` around the `yield`, and reads a `StopIteration`
+/// back as "handled". Without `throw` on the wrapper, every `with cm():` whose
+/// body raised died with `AttributeError: 'builtins.PyrsIterator' object has no
+/// attribute 'throw'` — from inside `contextlib`, nowhere near the user's code.
+#[test]
+fn ffi_contextmanager_throws_into_a_pythonrs_generator() {
+    let src = "\
+import contextlib
+@contextlib.contextmanager
+def cm():
+    print('enter')
+    try:
+        yield 7
+    except ValueError as e:
+        print('handled', e.args)
+    finally:
+        print('exit')
+with cm() as v:
+    print('body', v)
+    raise ValueError('inner')
+print('after')
+";
+    let (stdout, stderr, ok) = run_py(src);
+    if bridge_unavailable(ok, &stderr) {
+        eprintln!("skipping ffi-contextmanager-throw test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(
+        stdout, "enter\nbody 7\nhandled ('inner',)\nexit\nafter\n",
+        "stderr={stderr}"
+    );
+}
+
+/// The other two outcomes of that same `gen.throw`: a context manager that does
+/// NOT catch lets the exception through unchanged, and one that raises a
+/// different exception replaces it — with the new class and args intact after
+/// the round trip out through `contextlib` and back into pythonrs.
+#[test]
+fn ffi_contextmanager_propagates_and_translates_exceptions() {
+    let src = "\
+import contextlib
+@contextlib.contextmanager
+def passthrough():
+    try:
+        yield
+    finally:
+        print('cleanup')
+@contextlib.contextmanager
+def translate():
+    try:
+        yield
+    except ValueError:
+        raise KeyError('replaced')
+try:
+    with passthrough():
+        raise ValueError('through')
+except ValueError as e:
+    print('propagated', e.args)
+try:
+    with translate():
+        raise ValueError('original')
+except KeyError as e:
+    print('translated', e.args, repr(str(e)))
+";
+    let (stdout, stderr, ok) = run_py(src);
+    if bridge_unavailable(ok, &stderr) {
+        eprintln!(
+            "skipping ffi-contextmanager-translate test: stdlib bridge unavailable ({stderr})"
+        );
+        return;
+    }
+    assert_eq!(
+        stdout, "cleanup\npropagated ('through',)\ntranslated ('replaced',) \"'replaced'\"\n",
+        "stderr={stderr}"
+    );
+}
+
+/// `send` and `close` on the same wrapper. `ExitStack`/`closing` call `close()`,
+/// and a stdlib driver that pushes values in uses `send` — including the rule
+/// that an exhausted generator's `return` value comes back as
+/// `StopIteration.value`.
+#[test]
+fn ffi_stdlib_can_send_to_and_close_a_pythonrs_generator() {
+    let src = "\
+import contextlib
+def echo():
+    got = yield 'first'
+    print('got', got)
+    return 'done'
+g = echo()
+print(next(g))
+try:
+    g.send('pushed')
+except StopIteration as e:
+    print('stopped', e.value)
+def closable():
+    try:
+        yield 1
+    except GeneratorExit:
+        print('closing')
+        raise
+with contextlib.closing(closable()) as c:
+    print(next(c))
+print('after')
+";
+    let (stdout, stderr, ok) = run_py(src);
+    if bridge_unavailable(ok, &stderr) {
+        eprintln!("skipping ffi-generator-send-close test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(
+        stdout, "first\ngot pushed\nstopped done\n1\nclosing\nafter\n",
+        "stderr={stderr}"
+    );
+}
+
+/// `send`/`throw`/`close` belong to generators alone. A pythonrs `zip`/`map`
+/// object reaches CPython through the SAME wrapper class as a generator, so the
+/// wrapper has to refuse those methods for a non-generator target — with the
+/// message the real `zip` gives. `contextlib.closing` asks CPython-side, which
+/// is the only way to reach the wrapper's own attribute lookup: a pythonrs-side
+/// `getattr` never leaves the host. A wrapper that answered `close()` for every
+/// lazy iterator would make this block print nothing and exit 0.
+#[test]
+fn ffi_wrapped_non_generator_iterators_refuse_generator_methods() {
+    let src = "\
+import contextlib
+try:
+    with contextlib.closing(zip([1, 2], [3, 4])) as z:
+        print(list(z))
+except AttributeError as e:
+    print('AE', e)
+try:
+    with contextlib.closing(map(str, [1, 2])) as m:
+        print(list(m))
+except AttributeError as e:
+    print('AE', e)
+";
+    let (stdout, stderr, ok) = run_py(src);
+    if bridge_unavailable(ok, &stderr) {
+        eprintln!("skipping ffi-iterator-methods test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(
+        stdout,
+        "[(1, 3), (2, 4)]\nAE 'zip' object has no attribute 'close'\n\
+         ['1', '2']\nAE 'map' object has no attribute 'close'\n",
+        "stderr={stderr}"
+    );
+}

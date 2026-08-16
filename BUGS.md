@@ -784,26 +784,19 @@ written.
   embedded interpreter's side (`ffi.rs::line_buffer_std_streams` currently
   line-buffers CPython's streams specifically to match the unbuffered behaviour
   described here).
-- **A pythonrs generator crossing to CPython has no `throw`/`send`/`close`.**
-  `PyrsIterator` implements `__iter__`/`__next__` only, so anything CPython-side
-  that drives the generator protocol fails:
-
-      import contextlib
-      @contextlib.contextmanager
-      def cm():
-          try: yield
-          except ValueError as e: print('cm saw', e)
-      with cm(): raise ValueError('inner')
-      # CPython : cm saw inner
-      # pythonrs: AttributeError: 'builtins.PyrsIterator' object has no
-      #           attribute 'throw'
-
-  The methods exist natively (`it.throw(ValueError('x'))` on a pythonrs
-  generator works); what is missing is the bridge exposing them. A faithful
-  `throw` also has to marshal the CPython exception INTO the generator and
-  re-raise the original type out of it — returning the host's `Err(String)`
-  would surface as a `RuntimeError`, which `contextlib.__exit__` treats as a
-  distinct case. Reachable from `parity-fuzz --mode ctxmgr`.
+- **A user exception raised out of a wrapped generator loses its identity, not
+  its class.** `PyrsIterator` now implements the generator protocol
+  (`send`/`throw`/`close` beside `__iter__`/`__next__`), so
+  `@contextlib.contextmanager` drives a pythonrs generator: `__exit__` throws the
+  body's exception in, a `try/except` around the `yield` sees it, and
+  `StopIteration` comes back out as "handled". An exception the generator body
+  re-raises unchanged, however, crosses as a NEW CPython object of the same class
+  and args rather than the very object `__exit__` threw in — `contextlib`
+  branches on `exc is not value`, so it re-raises instead of returning False. The
+  message, class and args a caller sees are identical; the traceback is one frame
+  shorter. Closing it means carrying the CPython object's identity through the
+  pythonrs exception value rather than rebuilding from class + args. Reachable
+  from `parity-fuzz --mode ctxmgr` and `--mode stdlibexc`.
 - **`-O` reaches `__debug__` and nothing else.** The flag sets `__debug__` to
   False, but the compiler still emits every `assert` (so an optimized run keeps
   checking them) and `sys.flags.optimize` still reports 0. Skipping asserts at
@@ -1162,7 +1155,13 @@ module then raises `ModuleNotFoundError`.
   at raise time, so `except ValueError` catches a `json.JSONDecodeError` and
   `except ArithmeticError` catches `decimal.InvalidOperation`; the exact foreign
   type (`except json.JSONDecodeError`) matches by its CPython `__name__`. A
-  `@dataclass` instance also matches a `match` class pattern (positional via
+  foreign exception also keeps what its rendered `Class: message` line cannot
+  carry: its real `args` and any instance attributes outside them are recorded at
+  raise time (`host::ForeignExc`) and restored on the pythonrs side, so
+  `os.environ['missing'].args` is the KEY rather than the key's repr (`KeyError.
+  __str__` is `repr(args[0])`, so re-parsing the rendering doubled the quotes)
+  and `except json.JSONDecodeError as e: e.lineno` reaches the real position.
+  A `@dataclass` instance also matches a `match` class pattern (positional via
   `__match_args__`/keyword), routed through CPython `isinstance` + bridge attribute
   reads.
   Remaining gaps:

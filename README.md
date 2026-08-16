@@ -227,7 +227,10 @@ generates thousands of grammar-driven, deterministic-output snippets — biased
 toward the historically fragile areas (float `repr`, integer `//`/`%` sign
 rules, bignum, slices, the `format` mini-language, string methods, containers
 whose elements key through user `__hash__`/`__eq__`, `re` match positions over
-subjects mixing 1-, 2-, 3- and 4-byte characters) — runs each
+subjects mixing 1-, 2-, 3- and 4-byte characters, and the exception boundary
+between user code and the standard library — a stdlib `KeyError` coming back
+with its key, a `@contextlib.contextmanager` driving a user generator through
+`next`/`throw`/`close`) — runs each
 through `python -c` and the reference `python3 -c`, and reports every case where
 stdout or accept/reject diverges. Each case is seeded, so any divergence is
 delta-debugged to a minimal reproducer and replays exactly:

@@ -1522,6 +1522,9 @@ pub struct PyHost {
     /// `except ValueError` matches a foreign `json.JSONDecodeError`, which pythonrs
     /// has no builtin knowledge of. Populated at raise time by the ffi error path.
     pub foreign_exc_bases: HashMap<String, Vec<String>>,
+    /// What the last exception raised over the stdlib-ffi bridge carried beyond
+    /// its rendered line. See [`ForeignExc`].
+    pub foreign_exc: Option<ForeignExc>,
     /// Process arguments exposed to the program as `sys.argv`. Set once per run
     /// by `init_runtime` (`['']` for the REPL/stdin default, `['script', …]` for
     /// a file, `['-c', …]` for `-c`).
@@ -1657,6 +1660,32 @@ struct GenContext {
     /// resume so a generator function defined in a vendored module sees its own
     /// module's names (see [`FuncVal::module`]).
     module: usize,
+}
+
+/// The parts of an exception raised over the stdlib-ffi bridge that its rendered
+/// `"Class: message"` line cannot carry.
+///
+/// The bridge can only hand a fusevm abort a STRING, and rebuilding the
+/// exception by re-parsing that string assumes two things that are often false:
+/// that `str(exc) == args[0]`, and that `args` is all there is. `KeyError`
+/// breaks the first — its `__str__` is `repr(args[0])`, so `os.environ['X']`
+/// came back as `KeyError("'X'")` with a doubled quote layer in both `str(e)`
+/// and `e.args`. `json.JSONDecodeError` breaks the second — `e.lineno`,
+/// `e.colno`, `e.pos`, `e.msg` and `e.doc` live in the instance `__dict__` and
+/// were simply gone, so the standard `except ValueError as e: e.lineno` idiom
+/// raised `AttributeError`.
+///
+/// Recorded at raise time by the ffi error path and consumed by `synth_exc` on
+/// the first byte-identical line match, which also clears it. A stale entry can
+/// only be picked up by an identical rendering, for which its contents are still
+/// the right ones.
+pub struct ForeignExc {
+    /// The `"Class: message"` line the exception rendered to.
+    pub line: String,
+    /// The real `args` tuple.
+    pub args: Vec<Value>,
+    /// Instance attributes beyond `args`, from the exception's `__dict__`.
+    pub attrs: Vec<(String, Value)>,
 }
 
 thread_local! {
@@ -1997,6 +2026,7 @@ impl PyHost {
             codec_errors: HashMap::new(),
             suppress_context: HashSet::new(),
             foreign_exc_bases: HashMap::new(),
+            foreign_exc: None,
             argv: vec![String::new()],
             main_file: None,
             pending_main_dunders: false,
@@ -14446,6 +14476,23 @@ pub fn gen_started(gen: &Value) -> bool {
     match with_host(|h| h.get(gen).cloned()) {
         Some(PyObj::Generator { id }) => with_host(|h| h.generators[id as usize].started),
         _ => false,
+    }
+}
+
+/// The exception OBJECT a generator's body left in flight, or `None` if it is
+/// not raising.
+///
+/// [`gen_resume`] restores the caller's volatile context before returning, so
+/// once it hands back `Err(msg)` the host's own `exc` is the CALLER's exception,
+/// not the generator's — the raised object survives only in the generator's
+/// parked [`GenContext`]. A caller that needs more than the terse `"Class: msg"`
+/// string (the FFI bridge rebuilds the CPython exception from the class and
+/// `args`, because `KeyError('k')` renders as `KeyError: 'k'` and re-parsing
+/// that string yields `KeyError("'k'")`) has to read it from here.
+pub fn gen_pending_exc(gen: &Value) -> Option<Value> {
+    match with_host(|h| h.get(gen).cloned()) {
+        Some(PyObj::Generator { id }) => with_host(|h| h.generators[id as usize].ctx.exc.clone()),
+        _ => None,
     }
 }
 

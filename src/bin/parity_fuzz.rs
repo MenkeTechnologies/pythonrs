@@ -5146,6 +5146,165 @@ fn gen_ctxmgr(seed: u64) -> Vec<String> {
     }
 }
 
+/// The exception BOUNDARY between user code and the standard library — the one
+/// surface `ctxmgr` and `exceptions*` between them leave unmeasured.
+///
+/// Two directions cross here and each drops information if the bridge only
+/// carries a rendered string:
+///
+/// * **stdlib → user.** A `KeyError` raised by a stdlib mapping stringifies as
+///   `repr(args[0])`, so an implementation that rebuilds the exception by
+///   re-parsing its own rendering yields `KeyError("'k'")` — `str(e)` gains a
+///   quote layer and `e.args` holds the repr. Every probe therefore prints
+///   `repr(str(e))` and `e.args`, not just the message: the plain message is
+///   equal on both sides in exactly the case that is broken.
+/// * **user → stdlib.** `@contextlib.contextmanager` drives a USER generator
+///   with `next`/`throw`/`close`, and reads `StopIteration` back out of `throw`
+///   as "the body's exception was handled". A generator that reaches the stdlib
+///   without those methods makes every `with cm():` that raises die with an
+///   `AttributeError` from inside `contextlib`.
+///
+/// Deterministic by construction: no probe prints a path, an address, or a
+/// dict/set iteration order, and the two `os.environ` probes read a name that
+/// cannot be set (`assert` it is absent first would print nothing on success).
+fn gen_stdlibexc(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let key = pick(r, &["k", "missing key", "a'b", "ünïcode", ""]);
+    let n = pick(r, POSINTS);
+    match r.below(10) {
+        // A stdlib mapping's KeyError: `args` must hold the KEY, not its repr.
+        0 => vec![
+            "import os".into(),
+            "try:".into(),
+            "    os.environ['PYTHONRS_NOT_SET_XYZ']".into(),
+            "except KeyError as e:".into(),
+            "    print(repr(str(e)), e.args, type(e).__name__)".into(),
+        ],
+        // Same, through a mapping whose keys carry quotes/non-ASCII.
+        1 => vec![
+            "import types".into(),
+            format!("ns = types.MappingProxyType({{'x': {n}}})"),
+            "try:".into(),
+            format!("    ns[{key:?}]"),
+            "except KeyError as e:".into(),
+            "    print(repr(str(e)), e.args)".into(),
+        ],
+        // A multi-arg stdlib exception: `args` is a pair, and `str` renders the
+        // tuple — losing either half is invisible if only the message is printed.
+        2 => vec![
+            "import struct".into(),
+            "try:".into(),
+            "    struct.unpack('<I', b'ab')".into(),
+            "except struct.error as e:".into(),
+            "    print(type(e).__name__, repr(str(e)), len(e.args))".into(),
+        ],
+        // A stdlib exception with EXTRA attributes beyond `args`.
+        3 => vec![
+            "import json".into(),
+            "try:".into(),
+            "    json.loads('{\"a\": }')".into(),
+            "except ValueError as e:".into(),
+            "    print(type(e).__name__, e.lineno, e.colno, e.pos)".into(),
+        ],
+        // `@contextmanager` + a user generator that SWALLOWS: the stdlib must
+        // read `StopIteration` back out of `gen.throw`.
+        4 => vec![
+            "import contextlib".into(),
+            "@contextlib.contextmanager".into(),
+            "def cm():".into(),
+            "    try:".into(),
+            format!("        yield {n}"),
+            "    except KeyError as e:".into(),
+            "        print('swallowed', repr(str(e)), e.args)".into(),
+            "with cm() as v:".into(),
+            "    print('body', v)".into(),
+            format!("    raise KeyError({key:?})"),
+            "print('after')".into(),
+        ],
+        // `@contextmanager` that TRANSLATES the exception: the new one has to
+        // reach the caller with its own class and args.
+        5 => vec![
+            "import contextlib".into(),
+            "@contextlib.contextmanager".into(),
+            "def cm():".into(),
+            "    try:".into(),
+            "        yield".into(),
+            "    except ValueError:".into(),
+            format!("        raise KeyError({key:?})"),
+            "try:".into(),
+            "    with cm():".into(),
+            format!("        raise ValueError('v{n}')"),
+            "except KeyError as e:".into(),
+            "    print('translated', repr(str(e)), e.args)".into(),
+        ],
+        // `@contextmanager` that lets the body's exception through unchanged.
+        6 => vec![
+            "import contextlib".into(),
+            "@contextlib.contextmanager".into(),
+            "def cm():".into(),
+            "    print('enter')".into(),
+            "    try:".into(),
+            "        yield".into(),
+            "    finally:".into(),
+            "        print('exit')".into(),
+            "try:".into(),
+            "    with cm():".into(),
+            format!("        raise KeyError({key:?})"),
+            "except KeyError as e:".into(),
+            "    print('out', repr(str(e)), e.args)".into(),
+        ],
+        // The stdlib driving a user generator with `send` and reading the
+        // `StopIteration.value` a `return` puts there.
+        7 => vec![
+            "import contextlib".into(),
+            "def g():".into(),
+            "    a = yield 1".into(),
+            "    print('got', a)".into(),
+            format!("    return {n}"),
+            "gen = g()".into(),
+            "print(next(gen))".into(),
+            "try:".into(),
+            "    gen.send('s')".into(),
+            "except StopIteration as e:".into(),
+            "    print('SI', e.value, e.args)".into(),
+        ],
+        // `ExitStack` unwinding user context managers in reverse, with an
+        // exception crossing on the way out.
+        8 => vec![
+            "import contextlib".into(),
+            "@contextlib.contextmanager".into(),
+            "def cm(tag):".into(),
+            "    print('enter', tag)".into(),
+            "    try:".into(),
+            "        yield tag".into(),
+            "    finally:".into(),
+            "        print('exit', tag)".into(),
+            "try:".into(),
+            "    with contextlib.ExitStack() as st:".into(),
+            "        a = st.enter_context(cm('a'))".into(),
+            "        b = st.enter_context(cm('b'))".into(),
+            "        print(a, b)".into(),
+            format!("        raise KeyError({key:?})"),
+            "except KeyError as e:".into(),
+            "    print('out', repr(str(e)))".into(),
+        ],
+        // `close()` on a user generator held by the stdlib.
+        _ => vec![
+            "import contextlib".into(),
+            "def g():".into(),
+            "    try:".into(),
+            format!("        yield {n}"),
+            "    except GeneratorExit:".into(),
+            "        print('closing')".into(),
+            "        raise".into(),
+            "gen = g()".into(),
+            "with contextlib.closing(gen) as c:".into(),
+            "    print(next(c))".into(),
+            "print('done')".into(),
+        ],
+    }
+}
+
 /// PEP 654 exception groups: the `ExceptionGroup`/`BaseExceptionGroup`
 /// constructors and their validation, `split`/`subgroup`/`derive`, and `except*`
 /// — which clause claims which part, what the handlers leave behind, and the
@@ -5999,6 +6158,7 @@ enum Mode {
     Valuekey,
     Regex,
     Hashval,
+    Stdlibexc,
 }
 
 const REAL_MODES: &[Mode] = &[
@@ -6065,6 +6225,7 @@ const REAL_MODES: &[Mode] = &[
     Mode::Valuekey,
     Mode::Regex,
     Mode::Hashval,
+    Mode::Stdlibexc,
 ];
 
 /// Generate the statement list for a seed in the selected mode. `Mixed` rotates
@@ -6138,6 +6299,7 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Valuekey => gen_valuekey(seed),
         Mode::Regex => gen_regex(seed),
         Mode::Hashval => gen_hashval(seed),
+        Mode::Stdlibexc => gen_stdlibexc(seed),
     }
 }
 
@@ -6207,6 +6369,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Valuekey => "valuekey",
         Mode::Regex => "regex",
         Mode::Hashval => "hashval",
+        Mode::Stdlibexc => "stdlibexc",
     }
 }
 
@@ -6276,6 +6439,7 @@ fn mode_from_name(s: &str) -> Option<Mode> {
         Mode::Valuekey,
         Mode::Regex,
         Mode::Hashval,
+        Mode::Stdlibexc,
     ];
     ALL.iter().copied().find(|&m| mode_name(m) == s)
 }

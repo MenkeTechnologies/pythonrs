@@ -306,7 +306,51 @@ fn pyerr_to_error(py: Python, err: &PyErr) -> String {
             h.foreign_exc_bases.insert(class, bases);
         });
     }
-    err.to_string()
+    let line = err.to_string();
+    with_host(|h| record_foreign_exc(h, py, err, &line));
+    line
+}
+
+/// Record what the raised exception carries beyond its rendered line — its real
+/// `args` and its instance `__dict__` — so `synth_exc` can rebuild it without
+/// re-parsing its own rendering (see [`ForeignExc`]).
+fn record_foreign_exc(host: &mut PyHost, py: Python, err: &PyErr, line: &str) {
+    host.foreign_exc = None;
+    let value = err.value(py);
+    let Ok(args) = value.getattr("args").and_then(|a| a.try_iter()) else {
+        return;
+    };
+    let items: Vec<Bound<PyAny>> = args.flatten().collect();
+    let Ok(args) = items
+        .iter()
+        .map(|a| py_to_value(host, py, a))
+        .collect::<Result<Vec<Value>, String>>()
+    else {
+        return;
+    };
+    // `__dict__` holds only what the exception's own `__init__` set — the
+    // `JSONDecodeError.lineno/colno/pos/msg/doc` family. A C-level exception
+    // (`OSError`'s `errno`/`strerror`) keeps those in slots and reports an empty
+    // dict here, which is why `synth_exc` still handles `OSError` on its own.
+    let mut attrs: Vec<(String, Value)> = Vec::new();
+    if let Some(d) = value
+        .getattr("__dict__")
+        .ok()
+        .and_then(|d| d.downcast_into::<PyDict>().ok())
+    {
+        for (k, v) in d.iter() {
+            let (Ok(name), Ok(val)) = (k.extract::<String>(), py_to_value(host, py, &v)) else {
+                continue;
+            };
+            attrs.push((name, val));
+        }
+        attrs.sort_by(|a, b| a.0.cmp(&b.0));
+    }
+    host.foreign_exc = Some(crate::host::ForeignExc {
+        line: line.to_string(),
+        args,
+        attrs,
+    });
 }
 
 /// Like [`pyerr_to_error`] but registers through an already-held `&mut PyHost`
@@ -316,7 +360,9 @@ fn pyerr_to_error_h(host: &mut PyHost, py: Python, err: &PyErr) -> String {
     if let Some((class, bases)) = pyerr_class_bases(py, err) {
         host.foreign_exc_bases.insert(class, bases);
     }
-    err.to_string()
+    let line = err.to_string();
+    record_foreign_exc(host, py, err, &line);
+    line
 }
 
 /// Entries pythonrs's own `sys.path` holds that the embedded interpreter has not
@@ -956,7 +1002,9 @@ fn reference_to_value(host: &mut PyHost, py: Python, obj: &Bound<PyAny>) -> Resu
 pub fn get_attr(host: &mut PyHost, id: u32, name: &str) -> Result<Value, String> {
     Python::with_gil(|py| {
         let obj = fetch(py, id)?;
-        let attr = obj.getattr(name).map_err(|e| e.to_string())?;
+        let attr = obj
+            .getattr(name)
+            .map_err(|e| pyerr_to_error_h(host, py, &e))?;
         reference_to_value(host, py, &attr)
     })
 }
@@ -1012,7 +1060,7 @@ pub fn call_method(
 ) -> Result<Value, String> {
     Python::with_gil(|py| {
         let obj = fetch(py, id)?;
-        let method = obj.getattr(name).map_err(|e| e.to_string())?;
+        let method = obj.getattr(name).map_err(|e| pyerr_to_error(py, &e))?;
         invoke_bound(py, &method, &args, &kwargs)
     })
 }
@@ -1355,15 +1403,243 @@ impl PyrsIterator {
     }
 
     fn __next__(&self, py: Python) -> PyResult<Option<Py<PyAny>>> {
-        let to_pyerr = |e: String| pyo3::exceptions::PyRuntimeError::new_err(e);
-        match crate::host::iter_step(&self.target).map_err(to_pyerr)? {
+        match crate::host::iter_step(&self.target).map_err(rs_err_typed)? {
             // `None` from `__next__` raises `StopIteration` in pyo3.
             None => Ok(None),
             Some(v) => with_host(|h| value_to_py(h, py, &v))
                 .map(|b| Some(b.unbind()))
-                .map_err(to_pyerr),
+                .map_err(rs_err),
         }
     }
+
+    // `gen.send(value)` — resume the wrapped pythonrs generator with `value`.
+    // The stdlib drives a generator this way whenever it owns the pull side:
+    // `contextlib.contextmanager`'s `__enter__` is `next(self.gen)`, and any
+    // coroutine-style helper sends into it.
+    #[pyo3(signature = (value = None))]
+    fn send(&self, py: Python, value: Option<Bound<'_, PyAny>>) -> PyResult<Py<PyAny>> {
+        self.require_generator("send")?;
+        let sent = match value {
+            None => Value::Undef,
+            Some(v) => with_host(|h| py_to_value(h, py, &v)).map_err(rs_err)?,
+        };
+        if !crate::host::gen_started(&self.target) && !matches!(sent, Value::Undef) {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "can't send non-None value to a just-started generator",
+            ));
+        }
+        self.finish_step(py, crate::host::gen_resume(&self.target, sent))
+    }
+
+    // `gen.throw(exc)` / the legacy `gen.throw(type, value, tb)` — raise `exc` at
+    // the generator's current `yield`. This is the whole mechanism behind
+    // `@contextlib.contextmanager`: `_GeneratorContextManager.__exit__` throws
+    // the body's exception into the generator so a `try/except` around the
+    // `yield` can handle it, and reads `StopIteration` back as "suppressed".
+    // Without it a `with cm():` block that raised died with `AttributeError:
+    // 'builtins.PyrsIterator' object has no attribute 'throw'`.
+    #[pyo3(signature = (*args))]
+    fn throw(&self, py: Python, args: &Bound<'_, PyTuple>) -> PyResult<Py<PyAny>> {
+        self.require_generator("throw")?;
+        let exc = normalize_throw_args(py, args)?;
+        let exc_v = pyexc_to_value(py, &exc)?;
+        self.finish_step(py, crate::host::gen_throw(&self.target, exc_v))
+    }
+
+    // `gen.close()` — throw `GeneratorExit` in and require the body to finish.
+    // `contextlib.closing(gen)` and `ExitStack` both call it, as does CPython's
+    // own generator finalization.
+    fn close(&self) -> PyResult<()> {
+        self.require_generator("close")?;
+        if with_host(|h| h.close_unstarted_gen(&self.target)) {
+            return Ok(());
+        }
+        let ge = with_host(|h| {
+            h.alloc(PyObj::Exception {
+                class: "GeneratorExit".into(),
+                args: vec![],
+            })
+        });
+        match crate::host::gen_throw(&self.target, ge) {
+            Ok(Some(_)) => {
+                clear_host_error();
+                Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "generator ignored GeneratorExit",
+                ))
+            }
+            Ok(None) => Ok(()),
+            // `GeneratorExit` (or a clean `StopIteration`) reaching the top is the
+            // normal outcome of `close()`; CPython swallows both.
+            Err(e) if e.contains("GeneratorExit") || e.contains("StopIteration") => {
+                clear_host_error();
+                Ok(())
+            }
+            Err(e) => Err(self.body_err(e)),
+        }
+    }
+}
+
+impl PyrsIterator {
+    /// The CPython exception for an error raised by the wrapped generator's body,
+    /// taken from the parked exception OBJECT when there is one (so `args` — and
+    /// therefore `str(exc)` — survive the crossing) and from the error string
+    /// otherwise. Clears the pythonrs-side error last: ownership moves to CPython.
+    fn body_err(&self, e: String) -> pyo3::PyErr {
+        let err = crate::host::gen_pending_exc(&self.target)
+            .as_ref()
+            .and_then(exc_value_to_pyerr)
+            .unwrap_or_else(|| rs_err_typed(e));
+        clear_host_error();
+        err
+    }
+
+    /// `send`/`throw`/`close` exist on CPython generators only. A pythonrs `zip`/
+    /// `map`/`filter`/`enumerate` object reaches CPython through the same wrapper,
+    /// and asking one for `.throw` must raise `AttributeError` exactly as it does
+    /// on the real `zip` object.
+    fn require_generator(&self, name: &str) -> PyResult<()> {
+        if with_host(|h| matches!(h.get(&self.target), Some(PyObj::Generator { .. }))) {
+            return Ok(());
+        }
+        Err(pyo3::exceptions::PyAttributeError::new_err(format!(
+            "'{}' object has no attribute '{name}'",
+            with_host(|h| h.type_name(&self.target))
+        )))
+    }
+
+    /// Shared tail of `send`/`throw`: a yielded value crosses back, an exhausted
+    /// generator becomes `StopIteration(return_value)`, and a body exception
+    /// becomes the CPython exception of the same class.
+    fn finish_step(&self, py: Python, step: Result<Option<Value>, String>) -> PyResult<Py<PyAny>> {
+        match step {
+            Ok(Some(v)) => with_host(|h| value_to_py(h, py, &v))
+                .map(|b| b.unbind())
+                .map_err(rs_err),
+            Ok(None) => {
+                let ret = crate::host::coro_return_value(&self.target);
+                let arg = match ret {
+                    Value::Undef => None,
+                    v => Some(with_host(|h| value_to_py(h, py, &v)).map_err(rs_err)?),
+                };
+                Err(match arg {
+                    Some(a) => pyo3::exceptions::PyStopIteration::new_err((a.unbind(),)),
+                    None => pyo3::exceptions::PyStopIteration::new_err(()),
+                })
+            }
+            Err(e) => Err(self.body_err(e)),
+        }
+    }
+}
+
+/// Normalize `throw`'s argument forms to a single CPython exception INSTANCE:
+/// `throw(instance)` (the only form CPython's own stdlib uses since 3.13) and the
+/// legacy `throw(type[, value[, tb]])`.
+fn normalize_throw_args<'py>(
+    py: Python<'py>,
+    args: &Bound<'py, PyTuple>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let first = args.get_item(0).map_err(|_| {
+        pyo3::exceptions::PyTypeError::new_err("throw() takes at least 1 argument (0 given)")
+    })?;
+    let base_exc = py.get_type::<pyo3::exceptions::PyBaseException>();
+    // `throw(SomeError, ...)`: instantiate unless arg 1 already is an instance.
+    let is_exc_class = first
+        .downcast::<pyo3::types::PyType>()
+        .ok()
+        .map(|t| t.is_subclass(&base_exc).unwrap_or(false))
+        .unwrap_or(false);
+    if is_exc_class {
+        let second = args.get_item(1).ok().filter(|v| !v.is_none());
+        return match second {
+            Some(v) if v.is_instance(&first)? => Ok(v),
+            Some(v) if v.is_instance_of::<PyTuple>() => {
+                first.call1(v.downcast::<PyTuple>()?.clone())
+            }
+            Some(v) => first.call1((v,)),
+            None => first.call0(),
+        };
+    }
+    if !first.is_instance(&base_exc)? {
+        return Err(pyo3::exceptions::PyTypeError::new_err(
+            "exceptions must derive from BaseException",
+        ));
+    }
+    Ok(first)
+}
+
+/// A CPython exception instance as the pythonrs exception value a fusevm
+/// `except` clause can match. The type's `__mro__` is registered first so a
+/// pythonrs `except ValueError` catches a thrown `json.JSONDecodeError`.
+fn pyexc_to_value(py: Python, exc: &Bound<PyAny>) -> PyResult<Value> {
+    let ty = exc.get_type();
+    let class = ty
+        .name()
+        .map(|n| n.to_string())
+        .unwrap_or_else(|_| "Exception".into());
+    let mut bases: Vec<String> = Vec::new();
+    if let Ok(mro) = ty.getattr("__mro__") {
+        if let Ok(seq) = mro.try_iter() {
+            for c in seq.flatten() {
+                if let Ok(n) = c.getattr("__name__").and_then(|n| n.extract::<String>()) {
+                    bases.push(n);
+                }
+            }
+        }
+    }
+    let args: Vec<Bound<PyAny>> = match exc.getattr("args").and_then(|a| a.try_iter()) {
+        Ok(it) => it.flatten().collect(),
+        Err(_) => Vec::new(),
+    };
+    with_host(|h| {
+        if !bases.is_empty() {
+            h.foreign_exc_bases.insert(class.clone(), bases);
+        }
+        let args = args
+            .iter()
+            .map(|a| py_to_value(h, py, a))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok::<Value, String>(h.alloc(PyObj::Exception { class, args }))
+    })
+    .map_err(rs_err)
+}
+
+/// A pythonrs exception OBJECT rebuilt as the CPython exception of the same
+/// builtin class with the same `args`. `None` when the value is not an exception
+/// or its class has no builtin counterpart — the caller then falls back to
+/// parsing the terse error string, which is lossy for any class whose `__str__`
+/// is not `args[0]` (`KeyError('k')` → `KeyError: 'k'`).
+fn exc_value_to_pyerr(v: &Value) -> Option<pyo3::PyErr> {
+    let (class, args) = with_host(|h| match h.get(v) {
+        Some(PyObj::Exception { class, args }) => Some((class.clone(), args.clone())),
+        _ => None,
+    })?;
+    Python::with_gil(|py| {
+        let ty = py
+            .import("builtins")
+            .and_then(|m| m.getattr(&*class))
+            .ok()?;
+        let is_exc = ty
+            .downcast::<pyo3::types::PyType>()
+            .ok()?
+            .is_subclass(&py.get_type::<pyo3::exceptions::PyBaseException>())
+            .ok()?;
+        if !is_exc {
+            return None;
+        }
+        let pargs = with_host(|h| marshal_seq(h, py, &args)).ok()?;
+        let tup = PyTuple::new(py, pargs).ok()?;
+        ty.call1(tup).ok().map(pyo3::PyErr::from_value)
+    })
+}
+
+/// Drop the pythonrs-side error state once its exception has been handed to
+/// CPython as a `PyErr`. Ownership moves with it: leaving `h.error` set would
+/// make the next fusevm step abort on an exception CPython is already carrying.
+fn clear_host_error() {
+    with_host(|h| {
+        h.error = None;
+        h.exc = None;
+    });
 }
 
 // A CPython view of a pythonrs instance: attribute/item access, comparison,
@@ -1591,6 +1867,53 @@ fn rs_err(e: String) -> pyo3::PyErr {
     pyo3::exceptions::PyRuntimeError::new_err(e)
 }
 
+/// Like [`rs_err`], but preserves the exception CLASS carried in pythonrs's terse
+/// `"Class: message"` error string by reconstructing the real builtin exception.
+///
+/// The class is what the stdlib branches on: `contextlib`'s `__exit__` reads a
+/// `StopIteration` out of `gen.throw` as "the body's exception was suppressed"
+/// and anything else as "re-raise", so collapsing every pythonrs error to
+/// `RuntimeError` (what [`rs_err`] does) turns a handled `with` block into an
+/// unhandled `RuntimeError`. Falls back to `RuntimeError` for a class CPython
+/// has no builtin for — a user-defined exception has no CPython counterpart to
+/// rebuild, and inventing one would let `except SomeUserError` match on the
+/// CPython side by name alone.
+fn rs_err_typed(e: String) -> pyo3::PyErr {
+    let (class, msg) = match e.split_once(": ") {
+        Some((c, m)) => (c, m),
+        None => (e.as_str(), ""),
+    };
+    // A class name is a bare identifier; anything else is a plain message.
+    if class.is_empty() || !class.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return rs_err(e);
+    }
+    Python::with_gil(|py| {
+        let Ok(ty) = py.import("builtins").and_then(|m| m.getattr(class)) else {
+            return rs_err(e.clone());
+        };
+        let is_exc = ty
+            .downcast::<pyo3::types::PyType>()
+            .ok()
+            .map(|t| {
+                t.is_subclass(&py.get_type::<pyo3::exceptions::PyBaseException>())
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        if !is_exc {
+            return rs_err(e.clone());
+        }
+        let built = if msg.is_empty() {
+            ty.call0()
+        } else {
+            ty.call1((msg,))
+        };
+        match built {
+            Ok(obj) => pyo3::PyErr::from_value(obj),
+            Err(_) => rs_err(e.clone()),
+        }
+    })
+}
+
 /// `foreign[idx]`.
 pub fn get_item(host: &mut PyHost, id: u32, idx: &Value) -> Result<Value, String> {
     Python::with_gil(|py| {
@@ -1610,7 +1933,7 @@ pub fn get_item_cb(id: u32, idx: &Value) -> Result<Value, String> {
     Python::with_gil(|py| {
         let key = with_host(|h| value_to_py(h, py, idx))?;
         let obj = fetch(py, id)?;
-        let item = obj.get_item(key).map_err(|e| e.to_string())?;
+        let item = obj.get_item(key).map_err(|e| pyerr_to_error(py, &e))?;
         with_host(|h| reference_to_value(h, py, &item))
     })
 }
