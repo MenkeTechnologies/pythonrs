@@ -663,6 +663,88 @@ written.
   `type(x).__name__` reflect the subclass. Fuzzed to zero divergences
   (`parity-fuzz --mode subclass`).
 
+- **The `itertools`/`collections`/`math` container surface that no probe
+  exercised.** Found by diffing the names `src/builtins.rs` dispatches against
+  the identifiers the fuzz corpus actually writes: a keyword-only argument, a
+  function nobody called, or a method absent from the note-taker's list is
+  invisible to a curated corpus no matter how many cases run. All of the below
+  are now covered by `parity-fuzz --mode containertail` (4 000 cases, zero
+  divergences):
+  - `itertools.accumulate(initial=)` was **ignored**. The seed is yielded before
+    the source is touched, so the result is one longer than the input and
+    `accumulate([], initial=5)` is `[5]` — pythonrs answered `[]`, and
+    `accumulate([1,2,3], operator.mul, initial=10)` answered `[1, 2, 6]` instead
+    of `[10, 10, 20, 60]`.
+  - `itertools.batched` did not exist (`AttributeError: module 'itertools' has no
+    attribute 'batched'`), including its `strict=` form and its two ValueErrors
+    (`batched(): incomplete batch`, `n must be at least one`). `pickle` batches
+    its APPENDS/SETITEMS through it.
+  - `itertools.count(start, step)` coerced both through `as_int`, so
+    `count(1.5, 0.5)` counted `0, 1, 2` — a silently wrong answer, not an error.
+    Start and step are added with the numeric `+` now, so floats count in floats
+    and a bignum start stays exact.
+  - `repr` of `count`/`repeat` printed the generic
+    `<itertools.count object at 0x…>`; CPython gives both a constructor-style
+    repr reporting LIVE state (`count(3)` after two pulls, `repeat('x', 2)`
+    after one).
+  - `collections.deque.insert` did not exist. It clamps like `list.insert`,
+    accepts a negative index, and — unlike `append` — REFUSES on a full bounded
+    deque with `IndexError: deque already at its maximum size` rather than
+    evicting from the far end.
+  - `Counter` held **only ints**: every count went through `as_int`, so
+    `Counter(a=1.5)` stored `0` and `Counter(a=10**30)` stored `0`. The
+    constructor, `update`, `subtract`, `total`, `most_common`, `elements`, the
+    multiset operators and the unary forms all carry counts as values now, added
+    with the numeric `+`/`-`. `Counter.update`/`subtract` also **dropped their
+    keyword counts entirely** — `c.update(a=2)` was a silent no-op.
+  - `Counter.__repr__` used insertion order; CPython's is
+    `f'Counter({dict(self.most_common())!r})'` — descending by count, stable, so
+    ties keep insertion order. `Counter(a=3, b=-1, c=0, d=0)` reprs as
+    `Counter({'a': 3, 'c': 0, 'd': 0, 'b': -1})`.
+  - Unary `+c` / `-c` on a Counter were a `TypeError: bad operand type for unary
+    +: 'Counter'`. CPython defines them as `c - Counter()` and `Counter() - c`,
+    so both drop non-positive counts — the pair that splits a signed tally into
+    its gains and its losses.
+  - `defaultdict.default_factory` did not exist in either direction. It reads
+    back the factory (or `None`) and is writable — assigning `None` turns the
+    defaultdict back into a KeyError-raising dict.
+  - `OrderedDict.popitem(last=)` raised `TypeError: dict.popitem() takes no
+    arguments (1 given)`, so the ordered form could only pop LIFO. `last=False`
+    is how an OrderedDict is used as a FIFO queue. Its empty-dict `KeyError` also
+    carries `'dictionary is empty'`, not `dict`'s
+    `'popitem(): dictionary is empty'`.
+  - `math.prod(start=)` was ignored — `prod([2,3], start=4)` answered `6`. The
+    start also fixes the RESULT TYPE of an empty iterable: `prod([], start=2.5)`
+    is `2.5`, not `1`.
+
+- **`sys.stdlib_module_names`, and the NameError hint built on it.** The
+  attribute did not exist, and with it missing `print(functools)` reported a bare
+  `NameError: name 'functools' is not defined` where CPython adds
+  `. Did you forget to import 'functools'?` (and, when a near miss also matches,
+  the stacked `. Did you mean: 'funtools'? Or did you forget to import
+  'functools'?`). CPython ships the name table as a generated static list;
+  pythonrs COMPUTES it from the three places a stdlib module can actually come
+  from — `sys.builtin_module_names`, the native-only arms of
+  `import_module_inner`, and the bundled `pylib/` tree — so the set can never
+  advertise a module the interpreter would fail to import. CPython's own
+  exclusions are ported (`Tools/build/generate_stdlib_module_names.py`'s `IGNORE`
+  set, plus the install-only `_sysconfigdata_*` / `sitecustomize` /
+  `usercustomize` names its generator never sees). Measured: 217 names, every one
+  of them present in CPython 3.14.7's 297 — zero false positives.
+
+- **A pythonrs value that crossed into CPython and back came home as a NEW
+  object.** `py_to_value` had no case for the four proxy pyclasses this crate
+  hands out (`PyrsCallable`, `PyrsIterator`, `PyrsInstance`, `PyrsFile`), so a
+  round trip through any stdlib API that merely stores a value and returns it
+  minted a fresh `Foreign` handle and `is` went False. The proxy is unwrapped on
+  the way back now. `functools.wraps` needed a second half: it does
+  `setattr(wrapper, '__name__' / '__doc__' / '__wrapped__', …)` and then RETURNS
+  the wrapper, and every one of those assignments landed in the proxy's own
+  `__dict__` and died with it — the decorated function kept its original
+  `__name__` and had no `__wrapped__` at all. `PyrsCallable.__setattr__` writes
+  through to the wrapped pythonrs callable, which is what CPython's in-place
+  semantics mean.
+
 ## Implemented — async/await/asyncio (native fusevm event loop)
 - **`async def` / `await` / `asyncio`.** `async def f()` returns a real coroutine
   object (`type(f()).__name__ == 'coroutine'`; the body does **not** run on call),
@@ -890,6 +972,29 @@ written.
   out-of-range and surrogate paths share CPython's `chr() arg not in
   range(0x110000)` message. `surrogateescape`/`surrogatepass` handlers are
   likewise not reachable for the same reason.
+- **`math.lgamma`/`erf`/`erfc` differ from CPython in the last ULP.** Measured on
+  3.14.7: `math.lgamma(5)` is `3.1780538303479444` there and
+  `3.1780538303479458` here, `math.erf(1)` is `0.8427007929497148` there and
+  `0.8427007929497149` here, `math.erfc(1)` is `0.15729920705028516` there and
+  `0.15729920705028513` here. pythonrs calls the platform libm; CPython does
+  NOT — `Modules/mathmodule.c` carries its own `m_lgamma` (a Lanczos-series
+  implementation with its own coefficient table) and its own `m_erf`
+  /`m_erfc` (`m_erf_series` below 1.5, `m_erfc_contfrac` above), precisely so the
+  answer does not vary with the host's libm. Closing this means porting those
+  three routines from `mathmodule.c` rather than adjusting a rounding mode; every
+  other `math` function measured (`gamma`, `hypot`, `dist`, `fsum`, `sumprod`,
+  `comb`, `perm`, `isqrt`, `lcm`, `ldexp`, `frexp`, `modf`, `nextafter`, `ulp`,
+  `remainder`, `cbrt`, `exp2`, `expm1`, `log1p`, `factorial`, `isclose`) already
+  matches bit-for-bit.
+- **A traceback stops at the pythonrs frame; frames INSIDE a bridged stdlib
+  module are not listed.** `textwrap.shorten('a b c', 4)` raises the right
+  exception with the right message and the right caret line, but CPython's
+  rendering also names the four `textwrap.py` frames between the call site and
+  the `raise` (`shorten` → `fill` → `wrap` → `_wrap_chunks`) and pythonrs's does
+  not. The exception object and its type are correct; only the intermediate
+  frames of the CPython-side call stack are missing, because the bridge returns
+  the error without walking the foreign traceback. This is the same boundary the
+  `During handling of the above exception…` chained section sits behind.
 - **`float` `repr` tie-break**: the shortest-round-trip formatter defers to Rust
   `std`'s Ryū, which breaks an exact tie between two equally-short 17-digit
   decimals toward the larger digit, whereas CPython's dtoa rounds half-to-even.

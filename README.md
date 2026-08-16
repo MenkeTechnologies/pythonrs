@@ -235,6 +235,15 @@ through `python -c` and the reference `python3 -c`, and reports every case where
 stdout or accept/reject diverges. Each case is seeded, so any divergence is
 delta-debugged to a minimal reproducer and replays exactly:
 
+A curated corpus has one structural blind spot worth naming: it can only report
+constructs somebody thought to write down. A keyword-only argument, a function
+nobody happened to call, or a method missing from the note-taker's mental list
+stays invisible no matter how many cases run. Diffing the names `src/` dispatches
+against the identifiers the corpus actually contains is what turns that blind
+spot into a work list — `--mode containertail` exists because that diff surfaced
+a dozen `itertools`/`collections`/`math` gaps at once, several of them silently
+wrong answers rather than errors.
+
 ```sh
 cargo build --bin parity-fuzz
 ./target/debug/parity-fuzz --count 5000          # fuzz every mode

@@ -957,8 +957,37 @@ fn py_to_value(host: &mut PyHost, py: Python, obj: &Bound<PyAny>) -> Result<Valu
         }
         return Ok(host.new_set(map));
     }
+    // A pythonrs value that crossed OUT through one of the proxy pyclasses is
+    // coming back: hand back the ORIGINAL value, not a Foreign handle wrapping
+    // the proxy. Without this the round trip mints a new object every time, so
+    // `is` fails on anything the stdlib merely stores and returns —
+    // `functools.wraps(f)` left `wrapper.__wrapped__ is f` False, and every
+    // stdlib API that hands a callback back (a re-raised exception, a registered
+    // hook, a memoized function) had the same silent identity break.
+    if let Some(v) = unwrap_proxy(obj) {
+        return Ok(v);
+    }
     // Anything else stays on the CPython side behind a Foreign handle.
     Ok(host.alloc(PyObj::Foreign(store(obj.clone().unbind()))))
+}
+
+/// The pythonrs value behind a proxy pyclass, if `obj` is one. Every proxy this
+/// module hands to CPython holds the `Value` it stands for; this is the single
+/// place that reads it back, so a proxy added later only has to be listed here.
+fn unwrap_proxy(obj: &Bound<PyAny>) -> Option<Value> {
+    if let Ok(c) = obj.downcast::<PyrsCallable>() {
+        return Some(c.borrow().target.clone());
+    }
+    if let Ok(c) = obj.downcast::<PyrsIterator>() {
+        return Some(c.borrow().target.clone());
+    }
+    if let Ok(c) = obj.downcast::<PyrsInstance>() {
+        return Some(c.borrow().target.clone());
+    }
+    if let Ok(c) = obj.downcast::<PyrsFile>() {
+        return Some(c.borrow().target.clone());
+    }
+    None
 }
 
 fn unmarshal_seq<'py, I>(host: &mut PyHost, py: Python, items: I) -> Result<Vec<Value>, String>
@@ -1304,6 +1333,26 @@ impl PyrsCallable {
                 .map_err(pyo3::exceptions::PyRuntimeError::new_err),
             Err(e) => Err(pyo3::exceptions::PyAttributeError::new_err(e)),
         }
+    }
+
+    /// Write an assigned attribute THROUGH to the wrapped pythonrs callable
+    /// instead of into the proxy's own `__dict__`.
+    ///
+    /// `functools.wraps` is the case that forces this: it does
+    /// `setattr(wrapper, '__name__' / '__qualname__' / '__doc__' / '__wrapped__',
+    /// …)` and then RETURNS the wrapper. Stored on the proxy, every one of those
+    /// assignments died with the proxy the moment the value crossed back — the
+    /// decorated function kept its own `__name__` and had no `__wrapped__` at
+    /// all. Writing through makes the mutation land on the object the caller
+    /// actually keeps, which is what CPython's in-place semantics mean.
+    ///
+    /// A target that cannot hold attributes (a builtin) reports the host's
+    /// AttributeError, exactly as assigning to `len.x` does in CPython.
+    fn __setattr__(&self, py: Python, name: String, value: Bound<PyAny>) -> PyResult<()> {
+        let v = with_host(|h| py_to_value(h, py, &value))
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+        with_host(|h| h.set_attr(&self.target, &name, v))
+            .map_err(pyo3::exceptions::PyAttributeError::new_err)
     }
 
     /// Descriptor protocol: a pythonrs function stored in a CPython-built class

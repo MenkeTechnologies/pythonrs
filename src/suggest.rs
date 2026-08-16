@@ -127,3 +127,32 @@ pub fn with_hint(line: &str, suggestion: Option<String>) -> String {
         None => line.to_string(),
     }
 }
+
+/// The unbound name in a `NameError: name 'x' is not defined` line, if that is
+/// what `line` is. Parsed back out of the rendered line because that is the only
+/// place the hint is applied (CPython reads `exc.name`, which pythonrs's error
+/// strings do not carry).
+fn name_error_subject(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("NameError: name '")?;
+    let end = rest.find('\'')?;
+    rest[end..]
+        .starts_with("' is not defined")
+        .then_some(&rest[..end])
+}
+
+/// CPython's second NameError hint: when the unbound name IS a stdlib module,
+/// `traceback` adds "did you forget to import it". It stacks with the near-miss
+/// hint above and changes case when it does — a lone hint reads
+/// `. Did you forget to import 'json'?` while a stacked one reads
+/// `. Did you mean: 'jsonx'? Or did you forget to import 'json'?`.
+pub fn with_import_hint(line: String, is_stdlib_module: impl Fn(&str) -> bool) -> String {
+    let subject = match name_error_subject(&line) {
+        Some(s) if is_stdlib_module(s) => s.to_string(),
+        _ => return line,
+    };
+    if line.contains(". Did you mean: '") {
+        format!("{line} Or did you forget to import '{subject}'?")
+    } else {
+        format!("{line}. Did you forget to import '{subject}'?")
+    }
+}

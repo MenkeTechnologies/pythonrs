@@ -2645,3 +2645,272 @@ fn a_mutable_container_read_off_a_bridged_object_keeps_its_identity() {
         "((1, 2), 'tuple', (1, 2, 3))"
     );
 }
+
+/// `sys.stdlib_module_names` must be ACCURATE, not aspirational: it is the set
+/// `traceback`'s "did you forget to import 'x'?" hint consults, so a name in it
+/// that does not import turns a plain NameError into advice that fails when
+/// followed.
+///
+/// The set is a union of three sources — `sys.builtin_module_names`, the
+/// native-only arms of `import_module_inner` (listed in `NATIVE_ONLY_MODULES`,
+/// which no compiler check ties to those arms), and a scan of `pylib/`. Only the
+/// middle one can drift silently, and this test is what catches it: renaming or
+/// deleting an arm without touching the list fails here rather than shipping a
+/// hint for a module that no longer exists.
+#[test]
+fn every_advertised_stdlib_module_name_actually_imports() {
+    let names = pythonrs::host::stdlib_module_names();
+    assert!(
+        names.len() > 100,
+        "expected the bundled stdlib to contribute a substantial set, got {}",
+        names.len()
+    );
+    // `builtins` and `sys` are always importable and anchor the union's two
+    // native sources; `json` anchors the `pylib/` scan.
+    for anchor in [
+        "builtins",
+        "sys",
+        "math",
+        "itertools",
+        "json",
+        "collections",
+    ] {
+        assert!(names.contains(anchor), "{anchor} missing from the set");
+    }
+    // Names CPython deliberately excludes must not appear, or the hint would
+    // advise importing a test fixture or an install artifact.
+    for excluded in ["__hello__", "sitecustomize", "test", "_sysconfigdata_x"] {
+        assert!(
+            !names.contains(excluded),
+            "{excluded} must not be advertised as a stdlib module"
+        );
+    }
+}
+
+/// A `Counter` count is whatever the caller put in — CPython only ever ADDS to
+/// it. Every count used to be forced through `as_int`, which turned a float
+/// count into `0` and truncated a bignum one to `0`: a silently wrong tally
+/// rather than an error, and one that survived into `total`, `most_common` and
+/// the multiset operators.
+#[test]
+fn counter_counts_are_values_not_i64() {
+    assert_eq!(
+        g(
+            "from collections import Counter\nx = Counter(a=1.5, b=2)['a']",
+            "x"
+        ),
+        "1.5"
+    );
+    assert_eq!(
+        g(
+            "from collections import Counter\nc = Counter(a=10**30)\nc.update(a=1)\nx = c['a']",
+            "x"
+        ),
+        "1000000000000000000000000000001"
+    );
+    // Keyword counts reach `update`/`subtract` at all: dropping them made
+    // `c.update(a=2)` a silent no-op.
+    assert_eq!(
+        g(
+            "from collections import Counter\nc = Counter(a=1)\nc.update(a=2, b=1.5)\n\
+             c.subtract(a=0.5)\nx = (c['a'], c['b'], c.total())",
+            "x"
+        ),
+        "(2.5, 1.5, 4.0)"
+    );
+    // The multiset operators keep the operand's own numeric type.
+    assert_eq!(
+        g(
+            "from collections import Counter\n\
+             x = (Counter(a=1.5) + Counter(a=1))['a']",
+            "x"
+        ),
+        "2.5"
+    );
+}
+
+/// `Counter.__repr__` is `f'Counter({dict(self.most_common())!r})'` — descending
+/// by count, and stable, so equal counts keep insertion order. Insertion order
+/// alone (what pythonrs printed) is right only when the counts happen to already
+/// be sorted, which is why it survived so long.
+#[test]
+fn counter_reprs_in_most_common_order() {
+    assert_eq!(
+        g(
+            "from collections import Counter\nx = Counter(a=3, b=-1, c=0, d=0)",
+            "x"
+        ),
+        "Counter({'a': 3, 'c': 0, 'd': 0, 'b': -1})"
+    );
+    // A float count sorts by value, not by insertion position.
+    assert_eq!(
+        g(
+            "from collections import Counter\nx = Counter(a=3, b=-1, c=0, d=1.5)",
+            "x"
+        ),
+        "Counter({'a': 3, 'd': 1.5, 'c': 0, 'b': -1})"
+    );
+}
+
+/// `itertools.count` adds; it does not truncate. Coercing start/step through
+/// `as_int` made `count(1.5, 0.5)` yield `0, 1, 2` — a wrong ANSWER, with no
+/// error to notice.
+#[test]
+fn itertools_count_preserves_the_numeric_type() {
+    assert_eq!(
+        g(
+            "import itertools as it\nx = list(it.islice(it.count(1.5, 0.5), 4))",
+            "x"
+        ),
+        "[1.5, 2.0, 2.5, 3.0]"
+    );
+    assert_eq!(
+        g(
+            "import itertools as it\nx = list(it.islice(it.count(2**63, 2), 3))",
+            "x"
+        ),
+        "[9223372036854775808, 9223372036854775810, 9223372036854775812]"
+    );
+    // `count`/`repeat` are the two itertools iterators with a constructor-style
+    // repr, and it reports LIVE state rather than the construction arguments.
+    assert_eq!(
+        g(
+            "import itertools as it\nc = it.count(1)\nnext(c)\nnext(c)\n\
+             r = it.repeat('x', 3)\nnext(r)\nx = (repr(c), repr(it.count(5, 2)), repr(r))",
+            "x"
+        ),
+        "('count(3)', 'count(5, 2)', \"repeat('x', 2)\")"
+    );
+}
+
+/// `accumulate(initial=)` yields the seed BEFORE touching the source, so the
+/// result is one longer than the input — and it is the only way an empty input
+/// yields anything at all.
+#[test]
+fn itertools_accumulate_honors_initial() {
+    assert_eq!(
+        g(
+            "import itertools as it\nx = list(it.accumulate([], initial=5))",
+            "x"
+        ),
+        "[5]"
+    );
+    assert_eq!(
+        g(
+            "import itertools as it, operator\n\
+             x = list(it.accumulate([1, 2, 3], operator.mul, initial=10))",
+            "x"
+        ),
+        "[10, 10, 20, 60]"
+    );
+}
+
+/// `itertools.batched` — the last batch is short unless `strict`, and a strict
+/// short batch leaves the iterator EXHAUSTED so the error is not re-raised.
+#[test]
+fn itertools_batched_short_tail_and_strict() {
+    assert_eq!(
+        g(
+            "import itertools as it\nx = list(it.batched('abcdefg', 3))",
+            "x"
+        ),
+        "[('a', 'b', 'c'), ('d', 'e', 'f'), ('g',)]"
+    );
+    assert_eq!(
+        g("import itertools as it\nx = list(it.batched([], 3))", "x"),
+        "[]"
+    );
+    assert_eq!(
+        err("import itertools as it\nlist(it.batched('abcdefg', 3, strict=True))"),
+        "ValueError: batched(): incomplete batch"
+    );
+    assert_eq!(
+        err("import itertools as it\nlist(it.batched('ab', 0))"),
+        "ValueError: n must be at least one"
+    );
+}
+
+/// A full BOUNDED deque refuses an insert rather than evicting from the far end
+/// — the one place `deque` does not behave like `list`, and the reason
+/// `insert` cannot just forward to the `append` path.
+#[test]
+fn deque_insert_clamps_but_a_bounded_deque_refuses() {
+    assert_eq!(
+        g(
+            "from collections import deque\nd = deque([1, 2, 3])\n\
+             d.insert(99, 8)\nd.insert(-99, 0)\nx = list(d)",
+            "x"
+        ),
+        "[0, 1, 2, 3, 8]"
+    );
+    assert_eq!(
+        err("from collections import deque\ndeque([1, 2], maxlen=2).insert(1, 9)"),
+        "IndexError: deque already at its maximum size"
+    );
+}
+
+/// `OrderedDict.popitem(last=False)` is how an OrderedDict is used as a FIFO
+/// queue; ignoring the argument turned every such queue into a stack. Its
+/// empty-dict KeyError also differs from `dict`'s.
+#[test]
+fn ordereddict_popitem_pops_from_either_end() {
+    assert_eq!(
+        g(
+            "from collections import OrderedDict\no = OrderedDict(a=1, b=2, c=3)\n\
+             x = (o.popitem(), o.popitem(last=False), o.popitem(True))",
+            "x"
+        ),
+        "(('c', 3), ('a', 1), ('b', 2))"
+    );
+    assert_eq!(
+        err("from collections import OrderedDict\nOrderedDict().popitem()"),
+        "KeyError: 'dictionary is empty'"
+    );
+}
+
+/// `defaultdict.default_factory` is READ-WRITE in CPython: rebinding it changes
+/// what `__missing__` produces, and setting it to `None` turns the defaultdict
+/// back into a plain KeyError-raising dict.
+#[test]
+fn defaultdict_default_factory_reads_and_writes() {
+    assert_eq!(
+        g(
+            "from collections import defaultdict\nd = defaultdict(list)\n\
+             x = repr(d.default_factory)",
+            "x"
+        ),
+        "\"<class 'list'>\""
+    );
+    assert_eq!(
+        g(
+            "from collections import defaultdict\nd = defaultdict(None)\n\
+             d.default_factory = int\nx = (d['q'], repr(d.default_factory))",
+            "x"
+        ),
+        "(0, \"<class 'int'>\")"
+    );
+    assert_eq!(
+        err(
+            "from collections import defaultdict\nd = defaultdict(int)\n\
+             d.default_factory = None\nd['z']"
+        ),
+        "KeyError: 'z'"
+    );
+}
+
+/// `math.prod`'s `start` is not a rounding detail: it fixes the RESULT TYPE of
+/// an empty iterable, which is the whole reason the argument exists.
+#[test]
+fn math_prod_honors_start() {
+    assert_eq!(
+        g(
+            "import math\nx = (math.prod([2, 3], start=4), math.prod([], start=2.5))",
+            "x"
+        ),
+        "(24, 2.5)"
+    );
+    assert_eq!(
+        g("import math\nx = math.prod([10**10, 10**10], start=3)", "x"),
+        "300000000000000000000"
+    );
+}

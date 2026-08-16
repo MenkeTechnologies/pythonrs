@@ -3983,7 +3983,14 @@ pub fn py_repr(v: &Value) -> Result<String, String> {
                 Value::Obj(i) => h.dict_meta.get(i).map(|m| (m.kind, m.factory.clone())),
                 _ => None,
             };
-            Some(Cont::Dict(d.values().cloned().collect(), meta))
+            let mut pairs: Vec<(Value, Value)> = d.values().cloned().collect();
+            // A Counter reprs in `most_common()` order (descending by count,
+            // stable so ties keep insertion order) — CPython's `__repr__` is
+            // `f'Counter({dict(self.most_common())!r})'`.
+            if meta.as_ref().map(|(k, _)| *k) == Some(host::DictKind::Counter) {
+                pairs.sort_by(|a, b| h.count_order(&b.1, &a.1));
+            }
+            Some(Cont::Dict(pairs, meta))
         }
         _ => None,
     });
@@ -6783,15 +6790,27 @@ fn call_itertools(
     let as_i = |v: &Value| with_host(|h| h.as_int(v));
     let kw = |k: &str| kwargs.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
     match name {
+        // `itertools.count(start=0, step=1)` — start/step keep their own numeric
+        // type (CPython adds with `PyNumber_Add`), so `count(1.5, 0.5)` counts in
+        // floats and a bignum start stays exact. They live in `buf` as values
+        // rather than in `nums` as i64 for exactly that reason.
         "count" => {
-            let start = args.first().and_then(&as_i).unwrap_or(0);
-            let step = args.get(1).and_then(&as_i).unwrap_or(1);
+            let start = args
+                .first()
+                .cloned()
+                .or_else(|| kw("start"))
+                .unwrap_or(Value::Int(0));
+            let step = args
+                .get(1)
+                .cloned()
+                .or_else(|| kw("step"))
+                .unwrap_or(Value::Int(1));
             Ok(mk(
                 ItKind::Count,
                 vec![],
                 Value::Undef,
-                vec![start, step],
                 vec![],
+                vec![start, step],
                 false,
             ))
         }
@@ -6852,6 +6871,10 @@ fn call_itertools(
                 false,
             ))
         }
+        // `itertools.accumulate(iterable, func=None, *, initial=None)`. A non-None
+        // `initial` seeds the running total AND is yielded before the first source
+        // item, so the result is one longer than the input — `flag` carries "the
+        // seed is still pending" and `buf` carries the seed itself.
         "accumulate" => {
             let src = iter_of(&arg0(&args)?)?;
             let func = args
@@ -6859,14 +6882,12 @@ fn call_itertools(
                 .cloned()
                 .or_else(|| kw("func"))
                 .unwrap_or(Value::Undef);
-            Ok(mk(
-                ItKind::Accumulate,
-                vec![src],
-                func,
-                vec![],
-                vec![],
-                false,
-            ))
+            let initial = kw("initial").filter(|v| !matches!(v, Value::Undef));
+            let (buf, seeded) = match initial {
+                Some(v) => (vec![v], true),
+                None => (vec![], false),
+            };
+            Ok(mk(ItKind::Accumulate, vec![src], func, vec![], buf, seeded))
         }
         "starmap" => {
             let func = arg0(&args)?;
@@ -6969,6 +6990,30 @@ fn call_itertools(
                 vec![],
                 vec![],
                 false,
+            ))
+        }
+        // `itertools.batched(iterable, n, *, strict=False)` — consecutive
+        // n-tuples, the last one short unless `strict`. `pickle` batches its
+        // APPENDS/SETITEMS through this, so it is load-bearing for the stdlib.
+        "batched" => {
+            let src = iter_of(&arg0(&args)?)?;
+            let n = args
+                .get(1)
+                .cloned()
+                .or_else(|| kw("n"))
+                .and_then(|v| as_i(&v))
+                .ok_or_else(|| host::type_error("batched() missing argument 'n'"))?;
+            if n < 1 {
+                return Err("ValueError: n must be at least one".into());
+            }
+            let strict = kw("strict").map(|v| with_host(|h| h.truthy(&v))) == Some(true);
+            Ok(mk(
+                ItKind::Batched,
+                vec![src],
+                Value::Undef,
+                vec![n],
+                vec![],
+                strict,
             ))
         }
         "product" => itertools_product(&args, &kwargs),
@@ -9170,17 +9215,26 @@ fn call_math(name: &str, args: &[Value], kwargs: &[(String, Value)]) -> Result<V
                 }
             }))
         }
-        // `math.prod(iterable, *, start=1)` — the product of the elements. Stays
-        // bignum-exact for ints (a `start` keyword is handled by the caller's
-        // kwargs, but the positional-only stdlib form passes just the iterable).
+        // `math.prod(iterable, *, start=1)` — the product of the elements, times
+        // `start`. `start` is what makes `prod` usable on a non-numeric monoid and
+        // what fixes the result type of an EMPTY iterable (`prod([], start=2.5)`
+        // is `2.5`, not `1`), so it participates in the int/float choice below
+        // exactly like an element does.
         "prod" => {
             let items = with_host(|h| h.iter_items(&args[0]))?;
-            // Int fast path stays exact; fall to float as soon as any element is a
-            // float (matching CPython's type promotion).
-            let all_int = items.iter().all(|v| with_host(|h| h.big_val(v)).is_some());
+            let start = kwargs
+                .iter()
+                .find(|(k, _)| k == "start")
+                .map(|(_, v)| v.clone())
+                .unwrap_or(Value::Int(1));
+            // Int fast path stays exact; fall to float as soon as any element (or
+            // `start`) is a float, matching CPython's type promotion.
+            let all_int = std::iter::once(&start)
+                .chain(items.iter())
+                .all(|v| with_host(|h| h.big_val(v)).is_some());
             if all_int {
                 use num_traits::ToPrimitive;
-                let mut acc = num_bigint::BigInt::from(1);
+                let mut acc = with_host(|h| h.big_val(&start)).unwrap();
                 for v in &items {
                     acc *= with_host(|h| h.big_val(v)).unwrap();
                 }
@@ -9189,7 +9243,7 @@ fn call_math(name: &str, args: &[Value], kwargs: &[(String, Value)]) -> Result<V
                     None => h.alloc(PyObj::BigInt(acc)),
                 }));
             }
-            let mut acc = 1.0f64;
+            let mut acc = as_f(&start).ok_or_else(|| host::type_error("must be a number"))?;
             for v in &items {
                 acc *= as_f(v).ok_or_else(|| host::type_error("must be a number"))?;
             }
@@ -10056,6 +10110,7 @@ const DEQUE_METHODS: &[&str] = &[
     "count",
     "index",
     "remove",
+    "insert",
 ];
 const FILE_METHODS: &[&str] = &[
     "read",
@@ -15310,6 +15365,35 @@ fn deque_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, Strin
                 None => Err("ValueError: deque.remove(x): x not in deque".into()),
             }
         }
+        // `deque.insert(i, x)` — index is clamped to the ends like `list.insert`
+        // and may be negative. Unlike `append`, a full bounded deque REFUSES the
+        // insert rather than silently evicting from the far end.
+        "insert" => {
+            let idx = args
+                .first()
+                .and_then(|v| with_host(|h| h.as_int(v)))
+                .ok_or_else(|| host::type_error("insert() argument 1 must be an integer"))?;
+            let v = args
+                .get(1)
+                .cloned()
+                .ok_or_else(|| host::type_error("insert expected 2 arguments, got 1"))?;
+            with_host(|h| match h.get_mut(recv) {
+                Some(PyObj::Deque { items, maxlen }) => {
+                    if maxlen.is_some_and(|m| items.len() >= m) {
+                        return Err("IndexError: deque already at its maximum size".to_string());
+                    }
+                    let len = items.len() as i64;
+                    let at = if idx < 0 {
+                        (len + idx).max(0)
+                    } else {
+                        idx.min(len)
+                    };
+                    items.insert(at as usize, v);
+                    Ok(Value::Undef)
+                }
+                _ => Err(host::type_error("not a deque")),
+            })
+        }
         _ => Err(format!(
             "AttributeError: 'collections.deque' object has no attribute '{name}'"
         )),
@@ -15330,31 +15414,80 @@ fn collections_dict_method(
     match (tn, name) {
         ("Counter", "most_common") => Some(counter_most_common(recv, args)),
         ("Counter", "elements") => Some(counter_elements(recv)),
-        ("Counter", "total") => Some(Ok(Value::Int(with_host(|h| match h.get(recv) {
-            Some(PyObj::Dict(d)) => d
-                .values()
-                .map(|(_, v)| h.as_int(v).unwrap_or(0))
-                .sum::<i64>(),
-            _ => 0,
-        })))),
-        ("Counter", "subtract") => Some(counter_add(recv, args, -1)),
-        ("Counter", "update") => Some(counter_add(recv, args, 1)),
+        ("Counter", "total") => Some(counter_total(recv)),
+        ("Counter", "subtract") => Some(counter_add(recv, args, kwargs, -1)),
+        ("Counter", "update") => Some(counter_add(recv, args, kwargs, 1)),
         ("OrderedDict", "move_to_end") => Some(ordered_move_to_end(recv, args, kwargs)),
+        ("OrderedDict", "popitem") => Some(ordered_popitem(recv, args, kwargs)),
         _ => None,
+    }
+}
+
+/// `Counter.total()` — the sum of the counts, added with the numeric `+` so the
+/// result keeps the counts' own type: an all-int Counter totals to an exact
+/// (bignum-safe) int, and one holding a float totals to a float.
+fn counter_total(recv: &Value) -> Result<Value, String> {
+    let counts: Vec<Value> = with_host(|h| match h.get(recv) {
+        Some(PyObj::Dict(d)) => d.values().map(|(_, v)| v.clone()).collect(),
+        _ => vec![],
+    });
+    let mut acc = Value::Int(0);
+    for c in &counts {
+        acc = with_host(|h| h.arith(NumOp::Add, &acc, c))?;
+    }
+    Ok(acc)
+}
+
+/// `OrderedDict.popitem(last=True)` — unlike `dict.popitem`, which is LIFO-only,
+/// the ordered form pops from EITHER end. `last=False` is how an OrderedDict is
+/// used as a FIFO queue (it is what `functools.lru_cache` evicts with), so
+/// silently ignoring the argument turned every such queue into a stack.
+fn ordered_popitem(
+    recv: &Value,
+    args: &[Value],
+    kwargs: &[(String, Value)],
+) -> Result<Value, String> {
+    let last = args
+        .first()
+        .or_else(|| kwargs.iter().find(|(k, _)| k == "last").map(|(_, v)| v))
+        .map(|v| with_host(|h| h.truthy(v)))
+        .unwrap_or(true);
+    let got = with_host(|h| match h.get_mut(recv) {
+        Some(PyObj::Dict(d)) => {
+            if last {
+                d.pop().map(|(_, (k, v))| (k, v))
+            } else {
+                d.shift_remove_index(0).map(|(_, (k, v))| (k, v))
+            }
+        }
+        _ => None,
+    });
+    match got {
+        Some((k, v)) => Ok(with_host(|h| h.new_tuple(vec![k, v]))),
+        None => Err(with_host(|h| {
+            let s = h.new_str("dictionary is empty");
+            h.key_error(&s)
+        })),
     }
 }
 
 /// `Counter.most_common([n])` — `(element, count)` pairs, highest count first,
 /// ties keeping insertion order (CPython uses a stable sort).
 fn counter_most_common(recv: &Value, args: &[Value]) -> Result<Value, String> {
-    let mut pairs: Vec<(Value, i64)> = with_host(|h| match h.get(recv) {
-        Some(PyObj::Dict(d)) => d
-            .values()
-            .map(|(k, v)| (k.clone(), h.as_int(v).unwrap_or(0)))
-            .collect(),
+    // Counts stay as VALUES: a count may be a float or a bignum, and rebuilding
+    // the pair from an `as_int` copy rewrote both.
+    let mut pairs: Vec<(Value, Value)> = with_host(|h| match h.get(recv) {
+        Some(PyObj::Dict(d)) => d.values().map(|(k, v)| (k.clone(), v.clone())).collect(),
         _ => vec![],
     });
-    pairs.sort_by_key(|p| std::cmp::Reverse(p.1)); // stable → ties keep insertion order
+    // Stable descending by count → ties keep insertion order, as CPython's
+    // `sorted(self.items(), key=_itemgetter(1), reverse=True)` does.
+    with_host(|h| {
+        pairs.sort_by(|a, b| match (h.num_val(&b.1), h.num_val(&a.1)) {
+            (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+            _ => std::cmp::Ordering::Equal,
+        })
+    });
     let n = args.first().and_then(|v| with_host(|h| h.as_int(v)));
     if let Some(n) = n {
         pairs.truncate(n.max(0) as usize);
@@ -15362,7 +15495,7 @@ fn counter_most_common(recv: &Value, args: &[Value]) -> Result<Value, String> {
     let tuples: Vec<Value> = with_host(|h| {
         pairs
             .into_iter()
-            .map(|(k, c)| h.new_tuple(vec![k, Value::Int(c)]))
+            .map(|(k, c)| h.new_tuple(vec![k, c]))
             .collect()
     });
     Ok(with_host(|h| h.new_list(tuples)))
@@ -15397,22 +15530,24 @@ fn counter_binop(a: &Value, b: &Value, op: char) -> Option<Result<Value, String>
     if !(is_counter(a) && is_counter(b)) {
         return None;
     }
-    let dump = |v: &Value| -> Vec<(PKey, Value, i64)> {
+    // Counts are VALUES, not i64: `Counter(a=1.5) + Counter(a=1)` is
+    // `Counter({'a': 2.5})` in CPython, and a bignum count has to survive too.
+    let dump = |v: &Value| -> Vec<(PKey, Value, Value)> {
         with_host(|h| match h.get(v) {
             Some(PyObj::Dict(m)) => m
                 .iter()
-                .map(|(k, (kv, cnt))| (k.clone(), kv.clone(), h.as_int(cnt).unwrap_or(0)))
+                .map(|(k, (kv, cnt))| (k.clone(), kv.clone(), cnt.clone()))
                 .collect(),
             _ => Vec::new(),
         })
     };
     let da = dump(a);
     let db = dump(b);
-    let get = |d: &[(PKey, Value, i64)], k: &PKey| {
+    let get = |d: &[(PKey, Value, Value)], k: &PKey| {
         d.iter()
             .find(|(kk, _, _)| kk == k)
-            .map(|(_, _, c)| *c)
-            .unwrap_or(0)
+            .map(|(_, _, c)| c.clone())
+            .unwrap_or(Value::Int(0))
     };
     // Union of keys: first operand's order, then second-only keys.
     let mut keys: Vec<(PKey, Value)> = da
@@ -15428,14 +15563,22 @@ fn counter_binop(a: &Value, b: &Value, op: char) -> Option<Result<Value, String>
     for (k, kv) in keys {
         let (x, y) = (get(&da, &k), get(&db, &k));
         let val = match op {
-            '+' => x + y,
-            '-' => x - y,
-            '&' => x.min(y),
-            '|' => x.max(y),
+            '+' => with_host(|h| h.arith(NumOp::Add, &x, &y)),
+            '-' => with_host(|h| h.arith(NumOp::Sub, &x, &y)),
+            // `min`/`max` pick one OPERAND, so the chosen count keeps its own
+            // type rather than being rebuilt from a float comparison.
+            '&' | '|' => {
+                let lt = with_host(|h| h.num_val(&x) < h.num_val(&y));
+                Ok(if (op == '&') == lt { x } else { y })
+            }
             _ => return None,
         };
-        if val > 0 {
-            out.insert(k, (kv, Value::Int(val)));
+        let val = match val {
+            Ok(v) => v,
+            Err(e) => return Some(Err(e)),
+        };
+        if with_host(|h| h.num_val(&val)).is_some_and(|n| n > 0.0) {
+            out.insert(k, (kv, val));
         }
     }
     Some(Ok(host::alloc_dict_subtype(
@@ -15445,48 +15588,69 @@ fn counter_binop(a: &Value, b: &Value, op: char) -> Option<Result<Value, String>
     )))
 }
 
-fn counter_add(recv: &Value, args: &[Value], sign: i64) -> Result<Value, String> {
-    let other = match args.first() {
-        Some(v) => v.clone(),
-        None => return Ok(Value::Undef),
-    };
+fn counter_add(
+    recv: &Value,
+    args: &[Value],
+    kwargs: &[(String, Value)],
+    sign: i64,
+) -> Result<Value, String> {
     // A mapping contributes its counts; any other iterable contributes 1 each.
-    let is_dict = with_host(|h| matches!(h.get(&other), Some(PyObj::Dict(_))));
-    let deltas: Vec<(PKey, Value, i64)> = if is_dict {
-        with_host(|h| match h.get(&other) {
-            Some(PyObj::Dict(d)) => d
-                .values()
-                .map(|(k, v)| {
-                    let key = h.to_key(k).unwrap_or(PKey::None);
-                    (key, k.clone(), h.as_int(v).unwrap_or(0) * sign)
+    // Keyword counts are applied after the positional argument, exactly as
+    // `Counter.update(self, iterable=None, /, **kwds)` does — dropping them made
+    // `c.update(a=2)` a silent no-op.
+    let mut deltas: Vec<(PKey, Value, Value)> = match args.first() {
+        None | Some(Value::Undef) => Vec::new(),
+        Some(other) => {
+            let other = other.clone();
+            let is_dict = with_host(|h| matches!(h.get(&other), Some(PyObj::Dict(_))));
+            if is_dict {
+                with_host(|h| match h.get(&other) {
+                    Some(PyObj::Dict(d)) => d
+                        .values()
+                        .map(|(k, v)| {
+                            let key = h.to_key(k).unwrap_or(PKey::None);
+                            (key, k.clone(), v.clone())
+                        })
+                        .collect(),
+                    _ => vec![],
                 })
-                .collect(),
-            _ => vec![],
-        })
-    } else {
-        let items = host::iter_vec(&other)?;
-        with_host(|h| {
-            items
-                .into_iter()
-                .map(|it| {
-                    let key = h.to_key(&it).unwrap_or(PKey::None);
-                    (key, it, sign)
+            } else {
+                let items = host::iter_vec(&other)?;
+                with_host(|h| {
+                    items
+                        .into_iter()
+                        .map(|it| {
+                            let key = h.to_key(&it).unwrap_or(PKey::None);
+                            (key, it, Value::Int(1))
+                        })
+                        .collect()
                 })
-                .collect()
-        })
-    };
-    with_host(|h| {
-        if let Some(PyObj::Dict(d)) = h.get_mut(recv) {
-            for (key, kv, delta) in deltas {
-                let entry = d.entry(key).or_insert_with(|| (kv.clone(), Value::Int(0)));
-                let cur = match &entry.1 {
-                    Value::Int(n) => *n,
-                    _ => 0,
-                };
-                entry.1 = Value::Int(cur + delta);
             }
         }
-    });
+    };
+    for (k, v) in kwargs {
+        let kv = new_str(k.clone());
+        deltas.push((PKey::Str(k.clone()), kv, v.clone()));
+    }
+    // Counts go through the numeric `+`/`-`, NOT through an i64 accumulator.
+    // CPython's `Counter.update` is `self[elem] = count + self_get(elem, 0)`, so
+    // a Counter holds whatever its counts are — `Counter(a=1.5)` keeps `1.5`,
+    // and a bignum count stays exact. Truncating to i64 silently rewrote both
+    // to something the caller never put in.
+    let op = if sign < 0 { NumOp::Sub } else { NumOp::Add };
+    for (key, kv, delta) in deltas {
+        let cur = with_host(|h| match h.get(recv) {
+            Some(PyObj::Dict(d)) => d.get(&key).map(|(_, v)| v.clone()),
+            _ => None,
+        })
+        .unwrap_or(Value::Int(0));
+        let next = with_host(|h| h.arith(op, &cur, &delta))?;
+        with_host(|h| {
+            if let Some(PyObj::Dict(d)) = h.get_mut(recv) {
+                d.insert(key, (kv, next));
+            }
+        });
+    }
     Ok(Value::Undef)
 }
 
@@ -15625,16 +15789,13 @@ fn construct_collection(
             Ok(host::alloc_deque(items, maxlen))
         }
         "Counter" => {
+            // CPython's `Counter.__init__` is `self.update(iterable, **kwds)` —
+            // ONE path for the positional argument and the keywords alike. Going
+            // through it means a keyword count is added, not coerced: `1.5` stays
+            // `1.5` and a bignum stays exact, where the old `as_int` store
+            // rewrote both to `0`.
             let c = host::alloc_dict_subtype(IndexMap::new(), host::DictKind::Counter, None);
-            if let Some(v) = args.first() {
-                if !matches!(v, Value::Undef) {
-                    counter_add(&c, std::slice::from_ref(v), 1)?;
-                }
-            }
-            for (k, v) in kwargs {
-                let cnt = with_host(|h| h.as_int(&v)).unwrap_or(0);
-                dict_insert_str(&c, k, Value::Int(cnt))?;
-            }
+            counter_add(&c, &args, &kwargs, 1)?;
             Ok(c)
         }
         "defaultdict" => {

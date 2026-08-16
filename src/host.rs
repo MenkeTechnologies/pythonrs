@@ -538,6 +538,7 @@ pub enum ItKind {
     ISlice,
     ZipLongest,
     Pairwise,
+    Batched,
 }
 
 impl ItKind {
@@ -556,6 +557,7 @@ impl ItKind {
             ItKind::ISlice => "itertools.islice",
             ItKind::ZipLongest => "itertools.zip_longest",
             ItKind::Pairwise => "itertools.pairwise",
+            ItKind::Batched => "itertools.batched",
         }
     }
 }
@@ -3975,6 +3977,38 @@ impl PyHost {
                 }
                 Some(PyObj::Iter(_)) => "<iterator>".into(),
                 Some(PyObj::Zip { .. }) => format!("<zip object at 0x{:012x}>", self.addr_of(v)),
+                // `count` and `repeat` are the two itertools iterators CPython
+                // gives a constructor-style repr (`count(5, 2)`, `repeat('x', 2)`)
+                // instead of the generic `<... object at 0x...>`; both report LIVE
+                // state, so a partly-consumed `repeat('x', 3)` reprs as
+                // `repeat('x', 2)`. `count`'s step is omitted when it is 1, and
+                // `repeat`'s count is omitted when it is unbounded.
+                Some(PyObj::ItertoolsIter {
+                    kind: ItKind::Count,
+                    buf,
+                    ..
+                }) => {
+                    let (cur, step) = (buf[0].clone(), buf[1].clone());
+                    let one = matches!(step, Value::Int(1));
+                    if one {
+                        format!("count({})", self.repr_of(&cur))
+                    } else {
+                        format!("count({}, {})", self.repr_of(&cur), self.repr_of(&step))
+                    }
+                }
+                Some(PyObj::ItertoolsIter {
+                    kind: ItKind::Repeat,
+                    nums,
+                    buf,
+                    ..
+                }) => {
+                    let (obj, left) = (buf[0].clone(), nums[0]);
+                    if left < 0 {
+                        format!("repeat({})", self.repr_of(&obj))
+                    } else {
+                        format!("repeat({}, {left})", self.repr_of(&obj))
+                    }
+                }
                 Some(PyObj::ItertoolsIter { kind, .. }) => {
                     format!(
                         "<{} object at 0x{:012x}>",
@@ -4143,15 +4177,23 @@ impl PyHost {
                     if repr_guard_enter(id) {
                         return "{...}".into();
                     }
-                    let body: Vec<String> = d
-                        .values()
-                        .map(|(k, val)| format!("{}: {}", self.repr_of(k), self.repr_of(val)))
-                        .collect();
-                    let dict_repr = format!("{{{}}}", body.join(", "));
                     let meta = match v {
                         Value::Obj(i) => self.dict_meta.get(i),
                         _ => None,
                     };
+                    // A Counter reprs in `most_common()` order, not insertion
+                    // order: CPython's `Counter.__repr__` is
+                    // `f'Counter({dict(self.most_common())!r})'`. Descending by
+                    // count, stable, so equal counts keep insertion order.
+                    let mut entries: Vec<&(Value, Value)> = d.values().collect();
+                    if meta.map(|m| m.kind) == Some(DictKind::Counter) {
+                        entries.sort_by(|a, b| self.count_order(&b.1, &a.1));
+                    }
+                    let body: Vec<String> = entries
+                        .iter()
+                        .map(|(k, val)| format!("{}: {}", self.repr_of(k), self.repr_of(val)))
+                        .collect();
+                    let dict_repr = format!("{{{}}}", body.join(", "));
                     let empty = d.is_empty();
                     let out = match meta.map(|m| (m.kind, m.factory.clone())) {
                         Some((DictKind::Counter, _)) if empty => "Counter()".into(),
@@ -6011,6 +6053,9 @@ impl PyHost {
                     let (r, i) = (*r, *i);
                     return Ok(self.alloc(PyObj::Complex(-r, -i)));
                 }
+                if let Some(c) = self.counter_unary(a, true) {
+                    return Ok(c);
+                }
                 Err(type_error(&format!(
                     "bad operand type for unary -: '{}'",
                     self.type_name(a)
@@ -6502,6 +6547,69 @@ impl PyHost {
         }
     }
 
+    /// Order two Counter counts for `most_common`/`repr`. Counts are usually
+    /// ints but need not be (`Counter(a=1.5)` is legal), and CPython's
+    /// `most_common` falls back to insertion order when the values are not
+    /// mutually orderable — `Equal` here reproduces that, since the sort is
+    /// stable.
+    pub fn count_order(&self, a: &Value, b: &Value) -> std::cmp::Ordering {
+        match (self.num_val(a), self.num_val(b)) {
+            (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+            _ => std::cmp::Ordering::Equal,
+        }
+    }
+
+    /// `+c` / `-c` on a `collections.Counter`. CPython defines them as
+    /// `c - Counter()` and `Counter() - c`, so both inherit multiset
+    /// subtraction's rule that non-positive counts are DROPPED:
+    /// `+Counter(a=3, b=-1)` is `Counter({'a': 3})` and `-Counter(a=3, b=-1)` is
+    /// `Counter({'b': 1})`. That pair is how a signed tally is split back into
+    /// its gains and its losses. Returns `None` for anything but a Counter so
+    /// the ordinary numeric unary paths still report their TypeError.
+    fn counter_unary(&mut self, v: &Value, negate: bool) -> Option<Value> {
+        let is_counter = match v {
+            Value::Obj(i) => self.dict_meta.get(i).map(|m| m.kind) == Some(DictKind::Counter),
+            _ => false,
+        };
+        if !is_counter {
+            return None;
+        }
+        let entries: Vec<(PKey, Value, Value)> = match self.get(v) {
+            Some(PyObj::Dict(m)) => m
+                .iter()
+                .map(|(k, (kv, cnt))| (k.clone(), kv.clone(), cnt.clone()))
+                .collect(),
+            _ => Vec::new(),
+        };
+        let mut out: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+        for (k, kv, cnt) in entries {
+            // Counts need not be ints (`Counter(a=1.5)`), so negate through the
+            // numeric `-` and test positivity numerically.
+            let cnt = if negate {
+                match self.arith(NumOp::Neg, &cnt, &Value::Undef) {
+                    Ok(n) => n,
+                    Err(_) => continue,
+                }
+            } else {
+                cnt
+            };
+            if self.num_val(&cnt).is_some_and(|n| n > 0.0) {
+                out.insert(k, (kv, cnt));
+            }
+        }
+        let d = self.alloc(PyObj::Dict(out));
+        if let Value::Obj(i) = d {
+            self.dict_meta.insert(
+                i,
+                DictMeta {
+                    kind: DictKind::Counter,
+                    factory: None,
+                },
+            );
+        }
+        Some(d)
+    }
+
     /// `~x` / unary `+x`.
     pub fn unary(&mut self, tag: i64, v: &Value) -> Result<Value, String> {
         // `~x` / unary `+x` on a CPython `Foreign` object (stdlib-ffi) routes
@@ -6529,10 +6637,13 @@ impl PyHost {
                 // `+complex`/`+bignum` return the value unchanged.
                 _ if matches!(self.get(v), Some(PyObj::Complex(..))) => Ok(v.clone()),
                 _ if self.num_val(v).is_some() => Ok(v.clone()),
-                _ => Err(type_error(&format!(
-                    "bad operand type for unary +: '{}'",
-                    self.type_name(v)
-                ))),
+                _ => match self.counter_unary(v, false) {
+                    Some(c) => Ok(c),
+                    None => Err(type_error(&format!(
+                        "bad operand type for unary +: '{}'",
+                        self.type_name(v)
+                    ))),
+                },
             },
             _ => Err(type_error("unknown unary op")),
         }
@@ -10288,6 +10399,19 @@ impl PyHost {
                         self.alloc(PyObj::Builtin(tn))
                     });
                 }
+                // `defaultdict.default_factory` — the zero-arg callable `__missing__`
+                // calls, or `None`. It is a writable attribute in CPython (see the
+                // setter beside `maxlen`'s in `set_attr`), and code that inspects a
+                // defaultdict before extending it reads it constantly.
+                if name == "default_factory" {
+                    if let Value::Obj(i) = recv {
+                        if let Some(m) = self.dict_meta.get(i) {
+                            if m.kind == DictKind::DefaultDict {
+                                return Ok(m.factory.clone().unwrap_or(Value::Undef));
+                            }
+                        }
+                    }
+                }
                 // `deque.maxlen` — the read-only length bound (an int) or `None`.
                 if name == "maxlen" {
                     if let Some(PyObj::Deque { maxlen, .. }) = self.get(recv) {
@@ -10679,6 +10803,19 @@ impl PyHost {
         // otherwise stash a shadowing entry that `type(obj)` never reads.
         if name == "__class__" {
             return self.set_class(recv, &val);
+        }
+        // `defaultdict.default_factory` is writable in CPython: rebinding it
+        // changes what `__missing__` produces from that point on, and setting it
+        // to `None` turns the defaultdict back into a plain KeyError-raising dict.
+        if name == "default_factory" {
+            if let Value::Obj(i) = recv {
+                if let Some(m) = self.dict_meta.get_mut(i) {
+                    if m.kind == DictKind::DefaultDict {
+                        m.factory = (!matches!(val, Value::Undef)).then_some(val);
+                        return Ok(());
+                    }
+                }
+            }
         }
         // `__slots__` enforcement: a slotted instance rejects any attribute name
         // not declared in its slots.
@@ -13805,6 +13942,7 @@ impl PyHost {
         // the exception — `str(e)` for a NameError never carries it — so it is
         // appended here rather than baked into the error string.
         let err = crate::suggest::with_hint(err, self.suggestion_for(err));
+        let err = crate::suggest::with_import_hint(err, |n| stdlib_module_names().contains(n));
         self.render_exc_block(self.exc.as_ref(), &final_frames, &err, &mut ctx, &mut out);
         out
     }
@@ -14814,9 +14952,11 @@ fn itertools_step(it: &Value) -> Result<Option<Value>, String> {
     let mut finished = false;
     let result: Option<Value> = match kind {
         ItKind::Count => {
-            let cur = nums[0];
-            nums[0] = cur.wrapping_add(nums[1]);
-            Some(Value::Int(cur))
+            // buf = [current, step]; advance with the numeric `+` so ints stay
+            // ints, floats stay floats, and a bignum start never truncates.
+            let cur = buf[0].clone();
+            buf[0] = with_host(|h| h.arith(NumOp::Add, &cur, &buf[1]))?;
+            Some(cur)
         }
         ItKind::Repeat => {
             // nums[0] = remaining (-1 = infinite).
@@ -14875,6 +15015,13 @@ fn itertools_step(it: &Value) -> Result<Option<Value>, String> {
                 finished = true;
             }
             out
+        }
+        // `flag` latches a pending `initial=` seed: it is yielded verbatim before
+        // the source is touched at all, which is why `accumulate([], initial=5)`
+        // still yields `[5]`.
+        ItKind::Accumulate if flag => {
+            flag = false;
+            Some(buf[0].clone())
         }
         ItKind::Accumulate => match iter_step(&sources[0])? {
             None => {
@@ -15059,6 +15206,34 @@ fn itertools_step(it: &Value) -> Result<Option<Value>, String> {
                         None
                     }
                 }
+            }
+        }
+        // `itertools.batched(iterable, n, *, strict=False)` — consecutive
+        // n-tuples. `nums[0]` is the batch size, `flag` is `strict`. The last
+        // batch is short when the input does not divide evenly; under `strict`
+        // that short batch is a ValueError instead, and the iterator is left
+        // exhausted so the error is not re-raised on the next pull.
+        ItKind::Batched => {
+            let n = nums[0] as usize;
+            let mut items = Vec::with_capacity(n);
+            while items.len() < n {
+                match iter_step(&sources[0])? {
+                    Some(v) => items.push(v),
+                    None => break,
+                }
+            }
+            if items.is_empty() {
+                finished = true;
+                None
+            } else if items.len() < n && flag {
+                with_host(|h| {
+                    if let Some(PyObj::ItertoolsIter { done, .. }) = h.get_mut(it) {
+                        *done = true;
+                    }
+                });
+                return Err("ValueError: batched(): incomplete batch".into());
+            } else {
+                Some(with_host(|h| h.new_tuple(items)))
             }
         }
     };
@@ -15929,6 +16104,7 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                 "islice",
                 "zip_longest",
                 "pairwise",
+                "batched",
                 "product",
                 "permutations",
                 "combinations",
@@ -16445,8 +16621,19 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                 let vals: Vec<Value> = names.iter().map(|n| h.new_str(*n)).collect();
                 h.new_tuple(vals)
             };
+            // `sys.stdlib_module_names` — a frozenset of every importable stdlib
+            // module name. `traceback`'s "did you forget to import" hint and any
+            // code doing "is this a stdlib module?" both read it.
+            let stdlib_module_names = {
+                let mut items = IndexMap::new();
+                for n in stdlib_module_names() {
+                    items.insert(PKey::Str(n.clone()), h.new_str(n.clone()));
+                }
+                h.new_frozenset(items)
+            };
             vec![
                 ("argv", argv),
+                ("stdlib_module_names", stdlib_module_names),
                 ("maxsize", Value::Int(i64::MAX)),
                 ("version", version),
                 ("version_info", version_info),
@@ -16702,7 +16889,10 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
 ///   2. `<exe_dir>/../lib/pythonrs/pylib` and `<exe_dir>/pylib` (install layout,
 ///      e.g. what a Homebrew formula lays down beside the binary).
 ///   3. `<CARGO_MANIFEST_DIR>/pylib` (the in-repo tree, for `cargo run`/tests).
-#[cfg(not(feature = "stdlib-ffi"))]
+///
+/// Compiled into both builds: only the native build IMPORTS from this tree, but
+/// `stdlib_module_names` enumerates it either way — the ffi build serves the
+/// same module names from CPython, so the listing stays truthful there too.
 fn pylib_dir() -> Option<std::path::PathBuf> {
     if let Some(p) = std::env::var_os("PYTHONRS_LIB") {
         let p = std::path::PathBuf::from(p);
@@ -16734,6 +16924,105 @@ fn pylib_dir() -> Option<std::path::PathBuf> {
 fn pip_dir() -> Option<std::path::PathBuf> {
     let d = dirs::home_dir()?.join(".pythonrs").join("pip");
     d.is_dir().then_some(d)
+}
+
+/// The stdlib modules that exist ONLY as a native arm of `import_module_inner` —
+/// CPython ships each of these as a C extension with no Python source, so no
+/// `pylib/` file names them and (unlike `itertools`) they are not
+/// `sys.builtin_module_names` entries either. Mirrors those arms; the
+/// `stdlib_module_names_all_import` test fails if an entry stops resolving.
+const NATIVE_ONLY_MODULES: &[&str] = &[
+    "_blake2",
+    "_collections",
+    "_csv",
+    "_md5",
+    "_random",
+    "_sha1",
+    "_sha2",
+    "_sha3",
+    "_signal",
+    "_string",
+    "math",
+];
+
+/// Names that live in the stdlib tree but that CPython deliberately keeps OUT of
+/// `sys.stdlib_module_names`. Two groups, both from CPython's generator
+/// (`Tools/build/generate_stdlib_module_names.py`):
+///
+///   * its `IGNORE` set — the frozen-module and C-API test fixtures, which are
+///     shipped but are not stdlib API;
+///   * files that are not in CPython's `Lib/` source tree at all and only appear
+///     in an INSTALLED layout (the build-generated `_sysconfigdata_*` and the
+///     `sitecustomize`/`usercustomize` site hooks). The generator never sees
+///     them, so the shipped table never lists them.
+fn ignored_stdlib_module(name: &str) -> bool {
+    const IGNORE: &[&str] = &[
+        "__hello__",
+        "__hello_alias__",
+        "__hello_only__",
+        "__phello__",
+        "__phello_alias__",
+        "_ctypes_test",
+        "_testbuffer",
+        "_testcapi",
+        "_testclinic",
+        "_testconsole",
+        "_testimportmultiple",
+        "_testinternalcapi",
+        "_testmultiphase",
+        "_testsinglephase",
+        "_xxtestfuzz",
+        "sitecustomize",
+        "test",
+        "usercustomize",
+        "xxlimited",
+        "xxlimited_35",
+        "xxsubtype",
+    ];
+    IGNORE.contains(&name) || name.starts_with("_sysconfigdata_")
+}
+
+/// `sys.stdlib_module_names` — every top-level module name this interpreter can
+/// import. CPython ships it as a generated static table; pythonrs COMPUTES it
+/// from the three places a stdlib module can actually come from (the native
+/// builtins, the native-only arms above, and the bundled `pylib/` tree), so the
+/// set can never advertise a module the interpreter would fail to import.
+///
+/// `traceback`'s NameError hint reads it: an unbound name that IS a stdlib
+/// module gets "Did you forget to import 'x'?" instead of a bare NameError.
+pub fn stdlib_module_names() -> &'static std::collections::BTreeSet<String> {
+    static NAMES: std::sync::OnceLock<std::collections::BTreeSet<String>> =
+        std::sync::OnceLock::new();
+    NAMES.get_or_init(|| {
+        let mut out: std::collections::BTreeSet<String> = crate::stdlib::pyimp::BUILTIN_MODULES
+            .iter()
+            .chain(NATIVE_ONLY_MODULES.iter())
+            .map(|s| (*s).to_string())
+            .collect();
+        // A `pylib/` entry is a module either as `<name>.py` or as a package
+        // directory holding `__init__.py`; anything else in the tree (a data
+        // file, a test fixture) is not importable and must not be listed.
+        if let Some(root) = pylib_dir() {
+            if let Ok(rd) = std::fs::read_dir(&root) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    let stem = match p.file_stem().and_then(|s| s.to_str()) {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    let importable = if p.is_dir() {
+                        p.join("__init__.py").is_file()
+                    } else {
+                        p.extension().and_then(|s| s.to_str()) == Some("py")
+                    };
+                    if importable && !ignored_stdlib_module(stem) {
+                        out.insert(stem.to_string());
+                    }
+                }
+            }
+        }
+        out
+    })
 }
 
 /// Resolve a dotted module name to a source file on the search path, if present:

@@ -5305,6 +5305,169 @@ fn gen_stdlibexc(seed: u64) -> Vec<String> {
     }
 }
 
+/// The `itertools` / `collections` / `math` container surface that the rest of
+/// this corpus reaches only through its most common spelling.
+///
+/// The gap this closes is structural, not incidental: a curated corpus can only
+/// report constructs somebody thought to write down, so a KEYWORD-only argument
+/// (`accumulate(initial=)`, `prod(start=)`, `popitem(last=)`), a whole function
+/// nobody happened to call (`batched`), or a method that exists on the CPython
+/// type but not on the note-taker's mental list (`deque.insert`) is invisible no
+/// matter how many cases run. Every probe below is a name that
+/// `src/builtins.rs` dispatches (or should) and that no other generator writes.
+///
+/// Deterministic by construction: no probe prints an address, a path, or a
+/// set/dict iteration order.
+fn gen_containertail(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let n = pick(r, &["1", "2", "3", "4"]);
+    let seq = pick(r, &["'abcdefg'", "[1, 2, 3, 4, 5]", "range(6)", "''", "[]"]);
+    let init = pick(r, &["0", "10", "-3", "1.5"]);
+    match r.below(16) {
+        // `accumulate(initial=)` yields the seed FIRST, so the result is one
+        // longer than the input — and it is the only way an empty input yields
+        // anything at all.
+        0 => vec![
+            "import itertools as it".into(),
+            format!("print(list(it.accumulate({seq})))"),
+            format!("print(list(it.accumulate({seq}, initial={init})))"),
+            format!("print(list(it.accumulate([], initial={init})))"),
+        ],
+        // `accumulate` with BOTH a binop and a seed.
+        1 => vec![
+            "import itertools as it, operator".into(),
+            format!("print(list(it.accumulate([1, 2, 3], operator.mul, initial={n})))"),
+            "print(list(it.accumulate('abc', initial='X')))".into(),
+            "print(list(it.accumulate([1, 2, 3], lambda a, b: a - b)))".into(),
+        ],
+        // `batched` — short final batch, and `strict` turning it into an error.
+        2 => vec![
+            "import itertools as it".into(),
+            format!("print(list(it.batched({seq}, {n})))"),
+            "print(list(it.batched([], 3)))".into(),
+            "try:".into(),
+            "    print(list(it.batched('abcdefg', 3, strict=True)))".into(),
+            "except ValueError as e:".into(),
+            "    print('ValueError', e)".into(),
+        ],
+        3 => vec![
+            "import itertools as it".into(),
+            "print(list(it.batched('abcdef', 3, strict=True)))".into(),
+            "try:".into(),
+            "    list(it.batched('ab', 0))".into(),
+            "except ValueError as e:".into(),
+            "    print('ValueError', e)".into(),
+        ],
+        // `count`/`repeat` are the two itertools iterators with a
+        // constructor-style repr, and it reports LIVE state.
+        4 => vec![
+            "import itertools as it".into(),
+            format!("c = it.count({n})"),
+            "print(repr(c))".into(),
+            "next(c); next(c)".into(),
+            "print(repr(c))".into(),
+            format!("print(repr(it.count({n}, 2)), repr(it.count()))"),
+        ],
+        5 => vec![
+            "import itertools as it".into(),
+            format!("rp = it.repeat('x', {n})"),
+            "print(repr(rp))".into(),
+            "next(rp)".into(),
+            "print(repr(rp), repr(it.repeat([1, 2])))".into(),
+        ],
+        // `count` must ADD, not truncate: a float step counts in floats.
+        6 => vec![
+            "import itertools as it".into(),
+            "print(list(it.islice(it.count(1.5, 0.5), 4)))".into(),
+            format!("print(list(it.islice(it.count({n}, -1), 3)))"),
+            "print(list(it.islice(it.count(2**63, 2), 3)))".into(),
+        ],
+        // `deque.insert` clamps like `list.insert` but REFUSES when bounded.
+        7 => vec![
+            "from collections import deque".into(),
+            format!("d = deque([1, 2, 3]); d.insert({n}, 9); print(d)"),
+            "d.insert(-1, 8); print(d)".into(),
+            "d.insert(99, 7); print(d)".into(),
+            "d.insert(-99, 6); print(d)".into(),
+        ],
+        8 => vec![
+            "from collections import deque".into(),
+            "d = deque([1, 2], maxlen=2)".into(),
+            "try:".into(),
+            "    d.insert(1, 9)".into(),
+            "except IndexError as e:".into(),
+            "    print('IndexError', e)".into(),
+            "print(d, d.maxlen)".into(),
+        ],
+        // Counter's unary operators split a signed tally into its halves.
+        9 => vec![
+            "from collections import Counter".into(),
+            format!("c = Counter(a=3, b=-1, c=0, d={init})"),
+            "print(+c)".into(),
+            "print(-c)".into(),
+            "print(c)".into(),
+        ],
+        10 => vec![
+            "from collections import Counter".into(),
+            "print(+Counter(), -Counter())".into(),
+            "print(+Counter(x=-1), -Counter(x=1))".into(),
+        ],
+        // `defaultdict.default_factory` reads AND writes.
+        11 => vec![
+            "from collections import defaultdict".into(),
+            "d = defaultdict(list)".into(),
+            "print(d.default_factory)".into(),
+            "d['x'].append(1)".into(),
+            "d.default_factory = int".into(),
+            "print(d['y'], d.default_factory, dict(d))".into(),
+            "d.default_factory = None".into(),
+            "try:".into(),
+            "    d['z']".into(),
+            "except KeyError as e:".into(),
+            "    print('KeyError', e)".into(),
+        ],
+        12 => vec![
+            "from collections import defaultdict".into(),
+            "d = defaultdict(None)".into(),
+            "print(d.default_factory)".into(),
+            format!("d = defaultdict(int, a={n})"),
+            "print(d.default_factory, d['a'], d['b'], dict(d))".into(),
+        ],
+        // `OrderedDict.popitem(last=)` pops from EITHER end.
+        13 => vec![
+            "from collections import OrderedDict".into(),
+            "o = OrderedDict(a=1, b=2, c=3)".into(),
+            "print(o.popitem())".into(),
+            "print(o.popitem(last=False))".into(),
+            "print(o.popitem(True))".into(),
+            "try:".into(),
+            "    o.popitem()".into(),
+            "except KeyError as e:".into(),
+            "    print('KeyError', e)".into(),
+        ],
+        // `math.prod(start=)` fixes both the value and the RESULT TYPE.
+        14 => vec![
+            "import math".into(),
+            format!("print(math.prod([2, 3], start={n}))"),
+            "print(math.prod([], start=2.5))".into(),
+            "print(math.prod([1.5], start=2))".into(),
+            "print(math.prod([], start=7), math.prod([]))".into(),
+            "print(math.prod([10**10, 10**10], start=3))".into(),
+        ],
+        // `sys.stdlib_module_names` drives the NameError import hint, so it must
+        // never claim a module the interpreter cannot import.
+        _ => vec![
+            "import sys".into(),
+            "n = sys.stdlib_module_names".into(),
+            "print(type(n).__name__)".into(),
+            "print('json' in n, 'math' in n, 'sys' in n, 'itertools' in n)".into(),
+            "print('__hello__' in n, 'sitecustomize' in n, 'definitely_not_a_module' in n)".into(),
+            "for name in ('json', 'math', 'collections'):".into(),
+            "    print(name, __import__(name).__name__)".into(),
+        ],
+    }
+}
+
 /// PEP 654 exception groups: the `ExceptionGroup`/`BaseExceptionGroup`
 /// constructors and their validation, `split`/`subgroup`/`derive`, and `except*`
 /// — which clause claims which part, what the handlers leave behind, and the
@@ -6159,6 +6322,7 @@ enum Mode {
     Regex,
     Hashval,
     Stdlibexc,
+    Containertail,
 }
 
 const REAL_MODES: &[Mode] = &[
@@ -6226,6 +6390,7 @@ const REAL_MODES: &[Mode] = &[
     Mode::Regex,
     Mode::Hashval,
     Mode::Stdlibexc,
+    Mode::Containertail,
 ];
 
 /// Generate the statement list for a seed in the selected mode. `Mixed` rotates
@@ -6300,6 +6465,7 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Regex => gen_regex(seed),
         Mode::Hashval => gen_hashval(seed),
         Mode::Stdlibexc => gen_stdlibexc(seed),
+        Mode::Containertail => gen_containertail(seed),
     }
 }
 
@@ -6370,6 +6536,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Regex => "regex",
         Mode::Hashval => "hashval",
         Mode::Stdlibexc => "stdlibexc",
+        Mode::Containertail => "containertail",
     }
 }
 
@@ -6440,6 +6607,7 @@ fn mode_from_name(s: &str) -> Option<Mode> {
         Mode::Regex,
         Mode::Hashval,
         Mode::Stdlibexc,
+        Mode::Containertail,
     ];
     ALL.iter().copied().find(|&m| mode_name(m) == s)
 }
