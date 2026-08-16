@@ -61,7 +61,8 @@ const MAX_TREE_DEPTH: u32 = 20_000;
 /// `RecursionError: Stack overflow (used N kB) during compilation` instead when
 /// the parse succeeds and the *compiler* is the stage that runs out, and that
 /// split is not reproduced (see BUGS.md).
-const TOO_COMPLEX: &str = "MemoryError: Parser stack overflowed - Python source too complex to parse";
+const TOO_COMPLEX: &str =
+    "MemoryError: Parser stack overflowed - Python source too complex to parse";
 
 struct Parser {
     toks: Vec<Token>,

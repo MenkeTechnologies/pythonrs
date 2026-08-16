@@ -4657,11 +4657,7 @@ impl PyHost {
     /// `PyNumber_AsSsize_t(key, PyExc_IndexError)`, so `[1][10**30]`,
     /// `l[10**30] = 2` and `del l[10**30]` all raise
     /// `IndexError: cannot fit 'int' into an index-sized integer`.
-    pub fn seq_index(
-        &self,
-        idx: &Value,
-        not_int: impl FnOnce() -> String,
-    ) -> Result<i64, String> {
+    pub fn seq_index(&self, idx: &Value, not_int: impl FnOnce() -> String) -> Result<i64, String> {
         match self.index_fit(idx) {
             IndexFit::Fits(n) => Ok(n),
             IndexFit::TooLarge(_) => Err(format!("IndexError: {INDEX_OVERFLOW}")),
@@ -7479,9 +7475,7 @@ impl PyHost {
                     IndexFit::TooLarge(_) => {
                         return Err("IndexError: range object index out of range".into())
                     }
-                    IndexFit::NotInt => {
-                        return Err(type_error("range indices must be integers"))
-                    }
+                    IndexFit::NotInt => return Err(type_error("range indices must be integers")),
                 };
                 let k = if i < 0 { i + len } else { i };
                 if k < 0 || k >= len {
@@ -7509,8 +7503,7 @@ impl PyHost {
                 // `bytes` reports the bare message; `bytearray` names the type.
                 let is_ba = matches!(self.get(recv), Some(PyObj::Bytearray(_)));
                 let n = b.len() as i64;
-                let i = self
-                    .seq_index(idx, || type_error("byte indices must be integers"))?;
+                let i = self.seq_index(idx, || type_error("byte indices must be integers"))?;
                 let k = if i < 0 { i + n } else { i };
                 if k < 0 || k >= n {
                     return Err(if is_ba {
@@ -7523,8 +7516,7 @@ impl PyHost {
             }
             Some(PyObj::Deque { items, .. }) => {
                 let n = items.len() as i64;
-                let i = self
-                    .seq_index(idx, || type_error("deque indices must be integers"))?;
+                let i = self.seq_index(idx, || type_error("deque indices must be integers"))?;
                 let k = if i < 0 { i + n } else { i };
                 if k < 0 || k >= n {
                     return Err("IndexError: deque index out of range".into());
@@ -7534,8 +7526,7 @@ impl PyHost {
             Some(PyObj::Memoryview { .. }) => {
                 let bytes = self.mv_bytes(recv);
                 let n = bytes.len() as i64;
-                let i = self
-                    .seq_index(idx, || type_error("memoryview: invalid slice key"))?;
+                let i = self.seq_index(idx, || type_error("memoryview: invalid slice key"))?;
                 let k = if i < 0 { i + n } else { i };
                 if k < 0 || k >= n {
                     return Err("IndexError: index out of bounds on dimension 1".into());
@@ -7775,8 +7766,7 @@ impl PyHost {
         match self.get(recv) {
             Some(PyObj::List(l)) => {
                 let n = l.len() as i64;
-                let i = self
-                    .seq_index(idx, || type_error("list indices must be integers"))?;
+                let i = self.seq_index(idx, || type_error("list indices must be integers"))?;
                 let k = if i < 0 { i + n } else { i };
                 if k < 0 || k >= n {
                     return Err("IndexError: list assignment index out of range".into());
@@ -7797,8 +7787,7 @@ impl PyHost {
             // `ba[i] = int` — a single byte in `0..=256`.
             Some(PyObj::Bytearray(b)) => {
                 let n = b.len() as i64;
-                let i = self
-                    .seq_index(idx, || type_error("bytearray indices must be integers"))?;
+                let i = self.seq_index(idx, || type_error("bytearray indices must be integers"))?;
                 let k = if i < 0 { i + n } else { i };
                 if k < 0 || k >= n {
                     return Err("IndexError: bytearray index out of range".into());
@@ -7869,8 +7858,7 @@ impl PyHost {
             }
             Some(PyObj::List(l)) => {
                 let n = l.len() as i64;
-                let i = self
-                    .seq_index(idx, || type_error("list indices must be integers"))?;
+                let i = self.seq_index(idx, || type_error("list indices must be integers"))?;
                 let k = if i < 0 { i + n } else { i };
                 if k < 0 || k >= n {
                     return Err("IndexError: list assignment index out of range".into());
@@ -7882,8 +7870,7 @@ impl PyHost {
             }
             Some(PyObj::Bytearray(b)) => {
                 let n = b.len() as i64;
-                let i = self
-                    .seq_index(idx, || type_error("bytearray indices must be integers"))?;
+                let i = self.seq_index(idx, || type_error("bytearray indices must be integers"))?;
                 let k = if i < 0 { i + n } else { i };
                 if k < 0 || k >= n {
                     return Err("IndexError: bytearray index out of range".into());
@@ -17014,7 +17001,10 @@ impl PyHost {
     /// `f.readlines()` / iteration on a binary handle.
     pub fn io_read_lines_bytes(&mut self, id: u32) -> Result<Vec<Vec<u8>>, String> {
         let all = self.io_read_n_bytes(id, None)?;
-        Ok(all.split_inclusive(|b| *b == b'\n').map(<[u8]>::to_vec).collect())
+        Ok(all
+            .split_inclusive(|b| *b == b'\n')
+            .map(<[u8]>::to_vec)
+            .collect())
     }
 
     /// `f.readable()` / `f.writable()` — the directions the handle was opened

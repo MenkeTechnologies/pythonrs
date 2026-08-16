@@ -110,7 +110,10 @@ fn run() -> i32 {
         return 2;
     }
     if fail > 0 {
-        eprintln!("parity: FAIL — {fail} of {} script(s) diverged", files.len());
+        eprintln!(
+            "parity: FAIL — {fail} of {} script(s) diverged",
+            files.len()
+        );
         return 1;
     }
     println!("parity: PASS — compared {pass} script(s) against python3");

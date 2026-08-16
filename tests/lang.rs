@@ -8035,10 +8035,7 @@ except OSError as e:
     assert_eq!(g(dir, "x"), "('IsADirectoryError', 21, 'Is a directory')");
     // The class still follows the errno, and `except OSError` still catches.
     assert_eq!(
-        g(
-            "x = isinstance(FileNotFoundError('x'), OSError)",
-            "x"
-        ),
+        g("x = isinstance(FileNotFoundError('x'), OSError)", "x"),
         "True"
     );
 }

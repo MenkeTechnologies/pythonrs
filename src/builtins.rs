@@ -3270,7 +3270,10 @@ fn synth_exc(h: &mut host::PyHost, err: &str) -> Value {
         let s = h.new_str(msg.clone());
         vec![s]
     };
-    let e = h.alloc(PyObj::Exception { class: class.clone(), args });
+    let e = h.alloc(PyObj::Exception {
+        class: class.clone(),
+        args,
+    });
     // `NameError.name` (3.10+) and `AttributeError.name` (3.10+): the identifier
     // that could not be resolved. `AttributeError.obj` is NOT set — the value
     // the lookup ran against is not recoverable from the rendered message, and
@@ -5897,9 +5900,11 @@ pub fn py_len(v: &Value) -> Result<usize, String> {
             use num_traits::ToPrimitive;
             // `range_length` returns a `PyObject*` that `len()` then squeezes
             // through `PyLong_AsSsize_t`, so the message names the C type.
-            host::big_range_len(start, stop, step).to_usize().ok_or_else(|| {
-                "OverflowError: Python int too large to convert to C ssize_t".to_string()
-            })
+            host::big_range_len(start, stop, step)
+                .to_usize()
+                .ok_or_else(|| {
+                    "OverflowError: Python int too large to convert to C ssize_t".to_string()
+                })
         }
         #[cfg(feature = "stdlib-ffi")]
         Some(PyObj::Foreign(id)) => crate::ffi::len(*id),
@@ -15744,8 +15749,12 @@ fn file_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String
         "readlines" => {
             if with_host(|h| h.io_is_binary(id)) {
                 let lines = with_host(|h| h.io_read_lines_bytes(id))?;
-                let vals: Vec<Value> =
-                    with_host(|h| lines.into_iter().map(|l| h.alloc(PyObj::Bytes(l))).collect());
+                let vals: Vec<Value> = with_host(|h| {
+                    lines
+                        .into_iter()
+                        .map(|l| h.alloc(PyObj::Bytes(l)))
+                        .collect()
+                });
                 return Ok(with_host(|h| h.new_list(vals)));
             }
             let lines = with_host(|h| h.io_read_lines(id))?;
@@ -16238,7 +16247,10 @@ fn pad_to_width(
     let pad = width - len;
     let mut probe = String::new();
     probe
-        .try_reserve(pad.saturating_mul(fill.len_utf8()).saturating_add(body.len()))
+        .try_reserve(
+            pad.saturating_mul(fill.len_utf8())
+                .saturating_add(body.len()),
+        )
         .map_err(|_| "MemoryError".to_string())?;
     drop(probe);
     Ok(match align {
