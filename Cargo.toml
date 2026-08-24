@@ -172,3 +172,7 @@ stdlib-ffi = ["dep:pyo3"]
 
 [dev-dependencies]
 tempfile = "3"
+# For `strerror(ERANGE)`: the float-overflow message is the C library's own
+# and is worded differently by Apple libc and glibc, so the test derives it
+# rather than hardcoding either spelling.
+libc = "0.2"

@@ -378,14 +378,25 @@ fn an_int_past_the_f64_range_raises_instead_of_becoming_inf() {
 /// `inf` made an overflow indistinguishable from a genuine infinity.
 #[test]
 fn float_pow_overflow_raises_but_a_real_infinity_does_not() {
-    const OVF: &str = "ERR OverflowError: (34, 'Result too large')";
-    assert_eq!(gx("x = 2.0 ** 10000"), OVF);
-    assert_eq!(gx("x = 10.0 ** 400"), OVF);
-    assert_eq!(gx("x = 1e300 ** 2"), OVF);
-    assert_eq!(gx("x = (-2.0) ** 10001"), OVF);
+    // The message half is the C library's own `strerror(ERANGE)`, which CPython
+    // passes through verbatim: "Result too large" on Apple libc, "Numerical
+    // result out of range" on glibc. Derived here for the same reason host.rs
+    // derives it — a hardcoded spelling passes on one platform and fails on the
+    // other.
+    // SAFETY: `strerror` returns a pointer to a static, NUL-terminated string
+    // for any errno value.
+    let msg = unsafe { std::ffi::CStr::from_ptr(libc::strerror(libc::ERANGE)) }
+        .to_string_lossy()
+        .into_owned();
+    let ovf = format!("ERR OverflowError: ({}, '{msg}')", libc::ERANGE);
+    let ovf = ovf.as_str();
+    assert_eq!(gx("x = 2.0 ** 10000"), ovf);
+    assert_eq!(gx("x = 10.0 ** 400"), ovf);
+    assert_eq!(gx("x = 1e300 ** 2"), ovf);
+    assert_eq!(gx("x = (-2.0) ** 10001"), ovf);
     // 2**1024 overflows; 2**1023 is the largest that does not. An off-by-one
     // here would make the whole test pass for the wrong reason.
-    assert_eq!(gx("x = 2.0 ** 1024"), OVF);
+    assert_eq!(gx("x = 2.0 ** 1024"), ovf);
     assert_eq!(gx("x = 2.0 ** 1023"), "8.98846567431158e+307");
     // An infinite OPERAND is not an overflow: the result is genuinely infinite.
     assert_eq!(gx("x = float('inf') ** 2"), "inf");
