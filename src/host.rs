@@ -6600,7 +6600,19 @@ impl PyHost {
                         // Only a FINITE pair can overflow into one — `2.0 **
                         // float('inf')` and `float('inf') ** 2` stay `inf`.
                         if r.is_infinite() && x.is_finite() && y.is_finite() {
-                            return Err("OverflowError: (34, 'Result too large')".into());
+                            // The message half is the C library's own
+                            // `strerror(ERANGE)`, which CPython passes through
+                            // verbatim — "Result too large" on Apple libc,
+                            // "Numerical result out of range" on glibc. Hard-
+                            // coding either one made this diverge from the
+                            // reference on the other platform.
+                            // SAFETY: `strerror` returns a pointer to a static,
+                            // NUL-terminated string for any errno value.
+                            let msg =
+                                unsafe { std::ffi::CStr::from_ptr(libc::strerror(libc::ERANGE)) }
+                                    .to_string_lossy()
+                                    .into_owned();
+                            return Err(format!("OverflowError: ({}, '{msg}')", libc::ERANGE));
                         }
                         Ok(Value::Float(r))
                     }
