@@ -8127,3 +8127,159 @@ fn setrecursionlimit_rejects_a_limit_below_one() {
     );
     assert!(eval_str("import sys\nsys.setrecursionlimit(2000)").is_ok());
 }
+
+/// A container dunder belongs to the types that implement it, not to every
+/// value. CPython's answer is observable through `hasattr`/`getattr`, and
+/// granting all six universally made 38 builtin-type answers wrong: `hasattr(5,
+/// '__len__')` was True, and `(1, 2).__setitem__` handed back a bound method for
+/// a method a tuple does not have.
+///
+/// Every expected value here is what CPython 3.14 answers for the same call.
+#[test]
+fn container_dunders_are_present_only_on_the_types_that_have_them() {
+    // (expression, has __len__, __getitem__, __setitem__, __iter__, __contains__)
+    let cases = [
+        ("5", "False", "False", "False", "False", "False"),
+        ("None", "False", "False", "False", "False", "False"),
+        ("True", "False", "False", "False", "False", "False"),
+        ("'ab'", "True", "True", "False", "True", "True"),
+        ("(1,)", "True", "True", "False", "True", "True"),
+        ("[1]", "True", "True", "True", "True", "True"),
+        ("{1: 2}", "True", "True", "True", "True", "True"),
+        // A set is sized and iterable but NOT subscriptable, which is the case a
+        // single "is it a container?" flag gets wrong.
+        ("{1}", "True", "False", "False", "True", "True"),
+        ("frozenset()", "True", "False", "False", "True", "True"),
+        ("range(3)", "True", "True", "False", "True", "True"),
+        ("bytearray(b'a')", "True", "True", "True", "True", "True"),
+        ("b'ab'", "True", "True", "False", "True", "True"),
+        // A lazy iterator has `__iter__` and nothing else.
+        ("(n for n in [])", "False", "False", "False", "True", "False"),
+        ("zip()", "False", "False", "False", "True", "False"),
+    ];
+    for (expr, len, getitem, setitem, iter, contains) in cases {
+        for (dunder, want) in [
+            ("__len__", len),
+            ("__getitem__", getitem),
+            ("__setitem__", setitem),
+            ("__iter__", iter),
+            ("__contains__", contains),
+        ] {
+            assert_eq!(
+                g(&format!("x = hasattr({expr}, '{dunder}')"), "x"),
+                want,
+                "hasattr({expr}, {dunder})"
+            );
+        }
+    }
+    // `__bool__` is not universal either: a container's truth comes from
+    // `__len__`, so CPython does not give it one.
+    assert_eq!(g("x = hasattr(5, '__bool__')", "x"), "True");
+    assert_eq!(g("x = hasattr([], '__bool__')", "x"), "False");
+    assert_eq!(g("x = hasattr('a', '__bool__')", "x"), "False");
+    // `__str__`/`__repr__` ARE universal — every object inherits them.
+    assert_eq!(g("x = hasattr(5, '__repr__') and hasattr([], '__str__')", "x"), "True");
+    // A dict_values view has no `__contains__`; membership still works by
+    // iterating it, which is exactly why CPython omits the method.
+    assert_eq!(g("x = hasattr({}.values(), '__contains__')", "x"), "False");
+    assert_eq!(g("x = 2 in {1: 2}.values()", "x"), "True");
+    assert_eq!(g("x = 9 in {1: 2}.values()", "x"), "False");
+}
+
+/// Calling a dunder a type does not have must fail the same way READING it does.
+/// The call path dispatched straight to the native operation without looking the
+/// name up, so `(1, 2).__setitem__(0, 3)` reported the operation's own complaint
+/// — `TypeError: 'tuple' object does not support item assignment` — where
+/// CPython raises `AttributeError`, because there is no such method to call.
+#[test]
+fn calling_an_absent_dunder_is_an_attribute_error() {
+    for (src, want) in [
+        (
+            "(1, 2).__setitem__(0, 3)",
+            "AttributeError: 'tuple' object has no attribute '__setitem__'",
+        ),
+        (
+            "(1, 2).__delitem__(0)",
+            "AttributeError: 'tuple' object has no attribute '__delitem__'",
+        ),
+        (
+            "b'ab'.__setitem__(0, 1)",
+            "AttributeError: 'bytes' object has no attribute '__setitem__'",
+        ),
+    ] {
+        assert_eq!(eval_str(src).expect_err("must raise"), want, "for {src}");
+    }
+    // The types that DO have the method still dispatch to it.
+    assert_eq!(g("a = [1, 2]\na.__setitem__(0, 9)\nx = a", "x"), "[9, 2]");
+    assert_eq!(g("x = {1: 2}.__getitem__(1)", "x"), "2");
+    assert_eq!(g("x = 'ab'.__len__()", "x"), "2");
+}
+
+/// CPython warns at COMPILE time when a literal is called or a literal sequence
+/// is subscripted by something that cannot index one — both are almost always a
+/// comma left out of a display. Only the float/complex index case was covered,
+/// so ten of the twelve shapes went unreported, including every call form.
+#[test]
+fn a_literal_called_or_wrongly_subscripted_warns_about_the_missing_comma() {
+    let warn = |src: &str| {
+        pythonrs::compile(src)
+            .expect("compiles")
+            .warnings
+            .iter()
+            .map(|(_, m)| m.clone())
+            .collect::<Vec<_>>()
+    };
+    for (src, want) in [
+        ("None()", "'NoneType' object is not callable"),
+        ("1(2)", "'int' object is not callable"),
+        ("1.5(2)", "'float' object is not callable"),
+        ("'a'(2)", "'str' object is not callable"),
+        ("True(1)", "'bool' object is not callable"),
+        ("[1, 2](3)", "'list' object is not callable"),
+        ("(1, 2)(3)", "'tuple' object is not callable"),
+        ("{}(3)", "'dict' object is not callable"),
+        ("{1, 2}(3)", "'set' object is not callable"),
+        ("b'a'(1)", "'bytes' object is not callable"),
+        ("...(3)", "'ellipsis' object is not callable"),
+    ] {
+        assert_eq!(
+            warn(src),
+            vec![format!("{want}; perhaps you missed a comma?")],
+            "for {src}"
+        );
+    }
+    for (src, want) in [
+        ("[1, 2]['a']", "list indices must be integers or slices, not str"),
+        ("[1, 2][None]", "list indices must be integers or slices, not NoneType"),
+        ("[1, 2][b'x']", "list indices must be integers or slices, not bytes"),
+        ("[1, 2][0.5]", "list indices must be integers or slices, not float"),
+        ("[1, 2][1j]", "list indices must be integers or slices, not complex"),
+        ("[1, 2][...]", "list indices must be integers or slices, not ellipsis"),
+        ("(1, 2)['a']", "tuple indices must be integers or slices, not str"),
+        ("'ab'[0.5]", "str indices must be integers or slices, not float"),
+        ("b'ab'[0.5]", "bytes indices must be integers or slices, not float"),
+    ] {
+        assert_eq!(
+            warn(src),
+            vec![format!("{want}; perhaps you missed a comma?")],
+            "for {src}"
+        );
+    }
+    // Silent where CPython is silent. An `int`/`bool` index is legal, a slice is
+    // not an index, a `dict` accepts any hashable key, and a NAME has no type
+    // the compiler can know however wrong it looks.
+    for src in [
+        "[1, 2][1]",
+        "[1, 2][True]",
+        "[1, 2][1:2]",
+        "[1, 2]['a':'b']",
+        "{}[0.5]",
+        "{1: 2}[0.5]",
+        "x[0.5]",
+        "x(1)",
+        "print(1)",
+        "(lambda: 1)()",
+    ] {
+        assert!(warn(src).is_empty(), "{src} must not warn, got {:?}", warn(src));
+    }
+}

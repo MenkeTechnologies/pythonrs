@@ -2762,9 +2762,9 @@ impl Compiler {
             }
             Expr::Subscript(recv, idx) => {
                 // CPython `SyntaxWarning` for a literal sequence subscripted by a
-                // float/complex constant (a likely missing comma).
-                if let (Some(ct), Some(it)) = (literal_container_type(recv), float_index_type(idx))
-                {
+                // compile-time value that cannot index one (a likely missing
+                // comma between two elements).
+                if let (Some(ct), Some(it)) = (literal_container_type(recv), bad_index_type(idx)) {
                     self.warnings.push((
                         self.cur_line,
                         format!(
@@ -3292,6 +3292,18 @@ impl Compiler {
         args: &[Expr],
         keywords: &[Keyword],
     ) -> Result<(), String> {
+        // CPython `SyntaxWarning` for CALLING a literal. Every type a literal or
+        // display can have is non-callable, so knowing the callee's type at
+        // compile time is itself the whole test — `None()` and `[1, 2](3)` are
+        // almost always a comma left out between two elements of a display.
+        // Emitted before the `*args`/`**kwargs` handoff so it fires whichever
+        // call shape the arguments take.
+        if let Some(t) = compile_time_type(func) {
+            self.warnings.push((
+                self.cur_line,
+                format!("'{t}' object is not callable; perhaps you missed a comma?"),
+            ));
+        }
         let has_star = args.iter().any(|a| matches!(a, Expr::Starred(_)));
         let has_kwsplat = keywords.iter().any(|k| k.name.is_none());
         if has_star || has_kwsplat {
@@ -4015,15 +4027,54 @@ fn literal_container_type(e: &Expr) -> Option<&'static str> {
     }
 }
 
-/// The type name of a `float`/`complex` literal index (which can't index a
-/// sequence), else `None`.
-fn float_index_type(e: &Expr) -> Option<&'static str> {
+/// The type name of an expression whose value CPython knows at COMPILE time —
+/// a literal, or a display written out in the source — else `None`.
+///
+/// Both "perhaps you missed a comma?" `SyntaxWarning`s are keyed on this, and
+/// that is the whole reason they can exist: CPython can only say `None()` is a
+/// mistake because the operand's type is spelled out where the call is written.
+/// A name, a call, or an f-string carrying interpolations has no compile-time
+/// type and never warns, however obviously wrong it looks.
+///
+/// The names are the ones `type(x).__name__` gives, which is what the warning
+/// text prints — note `NoneType` and `ellipsis`, neither of which is spelled
+/// the way its literal is.
+fn compile_time_type(e: &Expr) -> Option<&'static str> {
     let e = e.unspanned();
     match e {
+        Expr::None => Some("NoneType"),
+        Expr::True | Expr::False => Some("bool"),
+        Expr::Ellipsis => Some("ellipsis"),
+        Expr::Int(_) | Expr::BigInt(_) => Some("int"),
         Expr::Float(_) => Some("float"),
         Expr::Complex(_) => Some("complex"),
+        Expr::Str(_) => Some("str"),
+        Expr::Bytes(_) => Some("bytes"),
+        // An f-string with no interpolations is a plain `str` constant to
+        // CPython's folder, and warns like one; with interpolations it is built
+        // at run time and its type is not known here.
+        Expr::FString(parts) => parts
+            .iter()
+            .all(|p| matches!(p, FStrPart::Lit(_)))
+            .then_some("str"),
+        Expr::List(_) => Some("list"),
+        Expr::Tuple(_) => Some("tuple"),
+        Expr::Set(_) => Some("set"),
+        Expr::Dict(_) => Some("dict"),
         _ => None,
     }
+}
+
+/// The type name of a compile-time index that cannot subscript a SEQUENCE, else
+/// `None`.
+///
+/// `int` and `bool` are the two that can — `[1, 2][True]` is `2`, not a mistake
+/// — and a slice is not an index at all, so `[1, 2][2:3]` must stay silent.
+fn bad_index_type(e: &Expr) -> Option<&'static str> {
+    if matches!(e.unspanned(), Expr::Slice { .. }) {
+        return None;
+    }
+    compile_time_type(e).filter(|t| *t != "int" && *t != "bool")
 }
 
 /// A top-level statement of a class body that is a simple (bare-name)

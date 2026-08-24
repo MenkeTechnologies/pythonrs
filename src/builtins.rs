@@ -3694,26 +3694,108 @@ pub fn shadows_builtin_type(name: &str) -> bool {
         )
 }
 
-/// The universal object dunders that any builtin value exposes as a bound method
-/// (`d.__len__`, `d.__getitem__`, `x.__eq__`), dispatched by `call_type_method`.
-/// The stdlib reaches these directly (e.g. functools.lru_cache uses
-/// `cache.__len__`).
-pub fn is_object_dunder_method(name: &str) -> bool {
-    // Note: __eq__/__ne__/__hash__ are NOT here — those have type-specific
-    // NotImplemented semantics (e.g. int.__eq__(str) is NotImplemented) handled
-    // elsewhere; a generic override would break them.
-    matches!(
-        name,
-        "__len__"
-            | "__getitem__"
-            | "__setitem__"
-            | "__delitem__"
-            | "__iter__"
-            | "__contains__"
-            | "__str__"
-            | "__repr__"
-            | "__bool__"
-    )
+/// The dunders whose presence depends on the receiver's type, so calling one a
+/// type does not have must report the missing ATTRIBUTE rather than letting the
+/// native operation answer with its own complaint. Kept narrow on purpose: the
+/// arithmetic and comparison dunders have their own `NotImplemented` protocol
+/// and are not resolved this way.
+const CONTAINER_DUNDERS: &[&str] = &[
+    "__len__",
+    "__getitem__",
+    "__setitem__",
+    "__delitem__",
+    "__iter__",
+    "__contains__",
+    "__bool__",
+];
+
+/// The dunders a builtin value of type `tn` exposes as a bound method
+/// (`d.__len__`, `d.__getitem__`, `x.__str__`), dispatched by
+/// `call_type_method`. The stdlib reaches these directly (e.g. functools's
+/// `lru_cache` uses `cache.__len__`).
+///
+/// Only `__str__`/`__repr__` are universal — every object inherits them from
+/// `object`. The CONTAINER dunders are not, and CPython's answer is observable
+/// through
+/// `hasattr`/`getattr`: `(1, 2).__setitem__` is an `AttributeError`, not a bound
+/// method that raises when called, and `hasattr(5, '__len__')` is False.
+/// Granting the container six to every value produced 38 wrong answers across
+/// the builtin types, so each is gated on the types that actually implement it.
+///
+/// Note: `__eq__`/`__ne__`/`__hash__` are deliberately absent. Those have
+/// type-specific `NotImplemented` semantics (`int.__eq__(str)`), handled
+/// elsewhere; a generic grant here would break them.
+pub fn is_object_dunder_method(tn: &str, name: &str) -> bool {
+    // Everything sized: `len(x)` works. A set is sized and iterable but NOT
+    // subscriptable, which is why the next list is not simply this one.
+    const SIZED: &[&str] = &[
+        "str", "bytes", "bytearray", "list", "tuple", "dict", "set", "frozenset", "range",
+        "memoryview", "array", "deque", "defaultdict", "OrderedDict", "Counter", "dict_keys",
+        "dict_values", "dict_items",
+    ];
+    // `x[k]` works. Views and sets are excluded: `{}.keys()[0]` is a TypeError.
+    const SUBSCRIPTABLE: &[&str] = &[
+        "str", "bytes", "bytearray", "list", "tuple", "dict", "range", "memoryview", "array",
+        "deque", "defaultdict", "OrderedDict", "Counter",
+    ];
+    // `x[k] = v` / `del x[k]` — the mutable sequences and mappings only.
+    const MUTABLE: &[&str] = &[
+        "bytearray",
+        "list",
+        "dict",
+        "memoryview",
+        "array",
+        "deque",
+        "defaultdict",
+        "OrderedDict",
+        "Counter",
+    ];
+    // Iterable but not sized: a lazy iterator has `__iter__` and nothing else.
+    // A file object belongs here too — iterating it yields lines, but it has no
+    // length and cannot be subscripted.
+    const LAZY: &[&str] = &[
+        "generator",
+        "enumerate",
+        "zip",
+        "map",
+        "filter",
+        "reversed",
+        "TextIOWrapper",
+        "BufferedReader",
+        "BufferedWriter",
+        "BufferedRandom",
+        "FileIO",
+        "BytesIO",
+        "StringIO",
+    ];
+    // `k in x` — sized containers, minus the value view (`{}.values()` has no
+    // `__contains__`) and the memoryview.
+    const CONTAINS_EXCLUDED: &[&str] = &["dict_values", "memoryview"];
+
+    // `__bool__` is NOT universal, despite every object being truthy or falsy:
+    // a container's truth comes from `__len__`, so CPython puts `__bool__` only
+    // on the types that answer it directly. `hasattr([], '__bool__')` is False.
+    const HAS_BOOL: &[&str] = &[
+        "int",
+        "float",
+        "complex",
+        "bool",
+        "NoneType",
+        "NotImplementedType",
+        "range",
+        "type",
+    ];
+
+    match name {
+        "__str__" | "__repr__" => true,
+        "__bool__" => HAS_BOOL.contains(&tn),
+        "__len__" => SIZED.contains(&tn),
+        "__iter__" => SIZED.contains(&tn) || LAZY.contains(&tn),
+        "__contains__" => SIZED.contains(&tn) && !CONTAINS_EXCLUDED.contains(&tn),
+        "__getitem__" => SUBSCRIPTABLE.contains(&tn),
+        "__setitem__" | "__delitem__" => MUTABLE.contains(&tn),
+        _ => false,
+    }
 }
 
 /// True if `n` names a builtin TYPE object (for `isinstance(x, type)`, `__mro__`,
@@ -5709,6 +5791,15 @@ fn run_pysource(want_value: bool, args: &[Value]) -> Result<Value, String> {
 
     let result = (|| -> Result<Value, String> {
         let prog = crate::compile(&to_compile)?;
+        // `eval`/`exec` compile their source, so the compile-time
+        // `SyntaxWarning`s belong to them exactly as they do to a script — CPython
+        // prints them from here too, attributed to `<string>`. They were compiled
+        // and dropped, which made every warning invisible to any code reaching the
+        // compiler through `eval`. There is no file to echo the offending line
+        // from, so only the message is printed.
+        for (line, msg) in &prog.warnings {
+            eprintln!("<string>:{line}: SyntaxWarning: {msg}");
+        }
         let chunk = crate::load_merged(prog);
         crate::host::run_chunk_on(chunk)?;
         Ok(if want_value {
@@ -9746,7 +9837,10 @@ const CONTAINS_TYPES: &[&str] = &[
     "deque",
     "dict_keys",
     "dict_items",
-    "dict_values",
+    // `dict_values` is deliberately absent: CPython gives it no `__contains__`,
+    // so `hasattr({}.values(), '__contains__')` is False. `v in d.values()`
+    // still works — it falls back to iterating the view, which is exactly what
+    // CPython does and why the method is absent rather than merely slow.
 ];
 
 /// The iterator types whose method set is the iterator protocol.
@@ -10615,6 +10709,31 @@ pub fn call_type_method(
     args: Vec<Value>,
     kwargs: Vec<(String, Value)>,
 ) -> Result<Value, String> {
+    // `x.__setitem__(…)` must fail the same way `x.__setitem__` does. Reading the
+    // attribute already reports the truth (`is_object_dunder_method`), but the
+    // CALL path dispatches straight to the native operation without ever looking
+    // the name up, so `(1, 2).__setitem__(0, 3)` reported the operation's own
+    // complaint — `TypeError: 'tuple' object does not support item assignment` —
+    // where CPython raises `AttributeError: 'tuple' object has no attribute
+    // '__setitem__'`. A tuple has no such method to call at all.
+    //
+    // Only builtin receivers are gated: a user class defines its dunders in its
+    // own namespace and is resolved before reaching here.
+    if name.starts_with("__") && name.ends_with("__") {
+        let missing = with_host(|h| {
+            if matches!(h.get(recv), Some(host::PyObj::Instance(_))) {
+                return false;
+            }
+            let tn = h.type_name(recv);
+            !type_has_method(&tn, name) && !is_object_dunder_method(&tn, name)
+        });
+        if missing && CONTAINER_DUNDERS.contains(&name) {
+            let tn = with_host(|h| h.type_name(recv));
+            return Err(format!(
+                "AttributeError: '{tn}' object has no attribute '{name}'"
+            ));
+        }
+    }
     if let Some(r) = context_var_method(recv, name, &args) {
         return r;
     }

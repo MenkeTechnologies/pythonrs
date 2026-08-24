@@ -9987,7 +9987,7 @@ impl PyHost {
                     _ => {}
                 }
                 if crate::builtins::type_has_method("TextIOWrapper", name)
-                    || crate::builtins::is_object_dunder_method(name)
+                    || crate::builtins::is_object_dunder_method(cls, name)
                 {
                     let b = self.alloc(PyObj::Builtin(name.to_string()));
                     let recv = recv.clone();
@@ -10561,7 +10561,7 @@ impl PyHost {
                 // `d.__getitem__`, `x.__eq__`) — hand back a bound builtin method
                 // that `call_type_method` dispatches to the native operation.
                 if crate::builtins::type_has_method(&tn, name)
-                    || crate::builtins::is_object_dunder_method(name)
+                    || crate::builtins::is_object_dunder_method(&tn, name)
                 {
                     let b = self.alloc(PyObj::Builtin(name.to_string()));
                     return Ok(self.alloc(PyObj::BoundMethod {
