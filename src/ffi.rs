@@ -500,7 +500,7 @@ pub fn foreign_eq_prim(fid: u32, prim: Prim) -> bool {
 ///
 /// CPython's numeric tower guarantees that numerically equal values hash
 /// equally and therefore share one dict slot: `{1, Decimal(1)}` is a
-/// one-element set. pythonrs keys a dict by a structural [`PKey`], so a
+/// one-element set. pythonrs keys a dict by a structural `PKey`, so a
 /// `PKey::Foreign` and a `PKey::Int` can never be the same slot no matter how
 /// their hashes compare — the equal pair stayed split. Reporting the native
 /// equivalent lets the caller key such an object as that native number, which

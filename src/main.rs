@@ -29,7 +29,8 @@ fn run_main() -> ExitCode {
     // script is even opened — and dies with this exact text. Accepting a value
     // CPython refuses would make `PYTHONHASHSEED=0x10 python …` run here and
     // abort there.
-    if pythonrs::pyhash::parse_hash_seed(std::env::var("PYTHONHASHSEED").ok().as_deref()).is_err() {
+    if pythonrs::pyhash::parse_hash_seed(std::env::var("PYTHONHASHSEED").ok().as_deref()).is_none()
+    {
         eprintln!(
             "Fatal Python error: config_init_hash_seed: PYTHONHASHSEED must be \"random\" \
              or an integer in range [0; 4294967295]\nPython runtime state: preinitialized\n"

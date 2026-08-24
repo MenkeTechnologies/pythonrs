@@ -742,7 +742,7 @@ fn gen_seqtail(seed: u64) -> Vec<String> {
                 "print(x)".into(),
             ],
             1 => vec![
-                format!("x = list(range(6))"),
+                "x = list(range(6))".to_string(),
                 format!("del x[::{}]", pick(r, &["2", "3", "-2"])),
                 "print(x)".into(),
             ],
@@ -759,7 +759,7 @@ fn gen_seqtail(seed: u64) -> Vec<String> {
                 "    def __init__(self, v): self.v = v".into(),
                 "    def __index__(self): return self.v".into(),
                 format!("print([10, 20, 30, 40, 50][Idx({k})] if -5 <= {k} < 5 else 'oob')"),
-                format!("print(slice(Idx(1), Idx(4), Idx(2)).indices(10))"),
+                "print(slice(Idx(1), Idx(4), Idx(2)).indices(10))".to_string(),
             ]
         }
     }
@@ -2305,7 +2305,7 @@ fn gen_unpacking(seed: u64) -> Vec<String> {
         2 => vec![format!("*init, last = [{a}, {b}, {c}]\nprint(init, last)")],
         3 => vec![format!("(x, y), z = ({a}, {b}), {c}\nprint(x, y, z)")],
         4 => vec![
-            format!("def f(p, q, r): return p * 100 + q * 10 + r"),
+            "def f(p, q, r): return p * 100 + q * 10 + r".to_string(),
             format!("args = [{a}, {b}, {c}]"),
             "print(f(*args))".into(),
             format!("print(*[{a}, {b}, {c}], sep='-')"),
@@ -2359,7 +2359,7 @@ fn gen_dictset(seed: u64) -> Vec<String> {
         )],
         3 => vec![
             format!("fs = frozenset([{a}, {b}, {c}])"),
-            format!("m = {{fs: 'v'}}"),
+            "m = {fs: 'v'}".to_string(),
             format!("print(m[frozenset([{c}, {b}, {a}])])"),
             "print(isinstance(fs, frozenset), isinstance(fs, set))".into(),
         ],
@@ -2471,20 +2471,20 @@ fn gen_numedge(seed: u64) -> Vec<String> {
     let g = pick(r, SD);
     match r.below(20) {
         // ── IEEE-754 specials & signed zero ──────────────────────────────────
-        0 => vec![format!(
+        0 => vec![
             "print(float('inf'), float('-inf'), float('nan'))\n\
              print(float('inf') > 1e308, float('nan') == float('nan'), float('nan') != float('nan'))\n\
-             print(float('inf') + 1, float('inf') - float('inf'), float('nan') + 1)"
-        )],
-        1 => vec![format!(
+             print(float('inf') + 1, float('inf') - float('inf'), float('nan') + 1)".to_string()
+        ],
+        1 => vec![
             "print(repr(-0.0), repr(0.0), 0.0 == -0.0, repr(-0.0) == repr(0.0))\n\
              print(1e308 * 10, -1e308 * 10, repr(float('inf')))\n\
-             print(round(-0.0), repr(round(-0.0)))"
-        )],
+             print(round(-0.0), repr(round(-0.0)))".to_string()
+        ],
         // ── round: banker's rounding, arg count, negative ndigits ────────────
-        2 => vec![format!(
-            "print(round(0.5), round(1.5), round(2.5), round(3.5), round(-0.5), round(-1.5), round(-2.5))"
-        )],
+        2 => vec![
+            "print(round(0.5), round(1.5), round(2.5), round(3.5), round(-0.5), round(-1.5), round(-2.5))".to_string()
+        ],
         3 => vec![format!(
             "print(round({f}), round({f}, 1), round({f}, 0), round({f}, 2))"
         )],
@@ -2493,9 +2493,9 @@ fn gen_numedge(seed: u64) -> Vec<String> {
             let d = pick(r, &["-1", "-2", "-3"]);
             vec![format!("print(round({n}, {d}), round({n}))")]
         }
-        5 => vec![format!(
-            "print(round(0.125, 2), round(0.375, 2), round(2.675, 2), round(1.005, 2))"
-        )],
+        5 => vec![
+            "print(round(0.125, 2), round(0.375, 2), round(2.675, 2), round(1.005, 2))".to_string()
+        ],
         // ── pow: 2-arg, 3-arg, negative-exponent modular inverse ─────────────
         6 => {
             let base = pick(r, &["2", "3", "4", "5"]);
@@ -2510,31 +2510,31 @@ fn gen_numedge(seed: u64) -> Vec<String> {
             let m = pick(r, PRIMES);
             vec![format!("print(pow({base}, -1, {m}), pow({base}, -3, {m}))")]
         }
-        8 => vec![format!(
-            "print(2 ** 0.5, 4 ** 0.5, 2 ** -2, 2 ** -3, (-2) ** 2, -2 ** 2, 2 ** 3 ** 2)"
-        )],
+        8 => vec![
+            "print(2 ** 0.5, 4 ** 0.5, 2 ** -2, 2 ** -3, (-2) ** 2, -2 ** 2, 2 ** 3 ** 2)".to_string()
+        ],
         // ── divmod / floordiv / mod sign conventions (int) ───────────────────
         9 => vec![format!(
             "print(divmod({a}, {b}), {a} // {b}, {a} % {b})"
         )],
-        10 => vec![format!(
-            "print(7 // 3, -7 // 3, 7 // -3, -7 // -3, 7 % 3, -7 % 3, 7 % -3, -7 % -3)"
-        )],
+        10 => vec![
+            "print(7 // 3, -7 // 3, 7 // -3, -7 // -3, 7 % 3, -7 % 3, 7 % -3, -7 % -3)".to_string()
+        ],
         // ── divmod / floordiv / mod (float) ──────────────────────────────────
         11 => vec![format!(
             "print(divmod({f}, {g}), {f} // {g}, {f} % {g})"
         )],
-        12 => vec![format!(
-            "print(7.5 // 2, -7.5 // 2, 7.5 % 2, -7.5 % 2, 10.5 % -3, -10.5 % 3)"
-        )],
+        12 => vec![
+            "print(7.5 // 2, -7.5 // 2, 7.5 % 2, -7.5 % 2, 10.5 % -3, -10.5 % 3)".to_string()
+        ],
         // ── base conversions ─────────────────────────────────────────────────
         13 => {
             let n = pick(r, &["255", "-255", "10", "-10", "4096", "0"]);
             vec![format!("print(bin({n}), oct({n}), hex({n}))")]
         }
-        14 => vec![format!(
-            "print(int('ff', 16), int('-1010', 2), int('777', 8), int('0x1f', 16), int('1_000'), 0x1f, 0o17, 0b1010)"
-        )],
+        14 => vec![
+            "print(int('ff', 16), int('-1010', 2), int('777', 8), int('0x1f', 16), int('1_000'), 0x1f, 0o17, 0b1010)".to_string()
+        ],
         15 => vec![format!(
             "print(int({f}), int(-{f}), int(2.0 ** 60), float('1.5e3'), float('  2.5  '), float('1_000'))"
         )],
@@ -4305,7 +4305,7 @@ fn gen_itertail(seed: u64) -> Vec<String> {
                 format!("    print(rg[{idx}])"),
                 "print(list(rg[1:4]))".into(),
                 "print(list(rg[::-1]))".into(),
-                format!("print(range(0, 10, 2) == range(0, 10, 2))"),
+                "print(range(0, 10, 2) == range(0, 10, 2))".to_string(),
                 "print(range(0, 4) == range(0, 4, 1))".into(),
             ]
         }
@@ -4956,7 +4956,7 @@ fn gen_walrus(seed: u64) -> Vec<String> {
             "print([[(t := i * j) for j in range(2)] for i in range({n} % 3 + 1)], t)"
         )],
         _ => vec![
-            format!("total = 0"),
+            "total = 0".to_string(),
             format!("for i in range({n}):"),
             "    total += (sq := i * i)".into(),
             "print(total, sq)".into(),
@@ -6233,7 +6233,7 @@ fn gen_suggest(seed: u64) -> Vec<String> {
             format!("C().{typo}()"),
         ],
         // A builtin type's own method.
-        6 => vec![format!("x = [1]"), format!("x.{typo}")],
+        6 => vec!["x = [1]".to_string(), format!("x.{typo}")],
         // The hint belongs to the traceback, never to `str(e)`.
         _ => vec![
             format!("{good} = 1"),
@@ -6242,7 +6242,7 @@ fn gen_suggest(seed: u64) -> Vec<String> {
             "except NameError as e:".into(),
             "    print(str(e))".into(),
             "    print(e.args)".into(),
-            format!("x = [1]"),
+            "x = [1]".to_string(),
             "try:".into(),
             format!("    x.{typo}"),
             "except AttributeError as e:".into(),

@@ -14623,7 +14623,7 @@ pub fn gen_started(gen: &Value) -> bool {
 /// [`gen_resume`] restores the caller's volatile context before returning, so
 /// once it hands back `Err(msg)` the host's own `exc` is the CALLER's exception,
 /// not the generator's — the raised object survives only in the generator's
-/// parked [`GenContext`]. A caller that needs more than the terse `"Class: msg"`
+/// parked `GenContext`. A caller that needs more than the terse `"Class: msg"`
 /// string (the FFI bridge rebuilds the CPython exception from the class and
 /// `args`, because `KeyError('k')` renders as `KeyError: 'k'` and re-parsing
 /// that string yields `KeyError("'k'")`) has to read it from here.

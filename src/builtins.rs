@@ -5808,7 +5808,7 @@ fn arg0(args: &[Value]) -> Result<Value, String> {
 /// never land in the same bucket and `{1, Decimal(1)}` stayed a 2-element set.
 /// Hashing both sides with [`crate::pyhash`] is what lets them collapse.
 ///
-/// The residual [`DefaultHasher`] arm is for keys whose CPython hash is derived
+/// The residual `DefaultHasher` arm is for keys whose CPython hash is derived
 /// from the object's ADDRESS — a class object, the `Ellipsis`/`NotImplemented`
 /// singletons, and NaN. Those differ between CPython runs, so there is no value
 /// to match; an internally consistent hash is the best available answer.
@@ -6323,10 +6323,13 @@ fn construct_int(args: &[Value]) -> Result<Value, String> {
             // ValueError in CPython (it is `010`, an octal literal Python 3
             // removed), while `int('00', 0)` is 0. pythonrs read it as decimal
             // and returned 10.
-            if had_no_prefix && base_arg == 0 && digits.len() > 1 && digits.starts_with('0') {
-                if !digits.chars().all(|c| c == '0') {
-                    return Err(err());
-                }
+            if had_no_prefix
+                && base_arg == 0
+                && digits.len() > 1
+                && digits.starts_with('0')
+                && !digits.chars().all(|c| c == '0')
+            {
+                return Err(err());
             }
             // Every digit is converted through its Unicode DECIMAL value, not
             // just ASCII: CPython accepts any `Nd` character, so `int('١٢')` is
@@ -8927,7 +8930,7 @@ fn call_time(f: &str, args: Vec<Value>) -> Result<Value, String> {
             Ok(Value::Float(t as f64))
         }
         "strftime" => {
-            let fmt0 = args.get(0).ok_or_else(|| {
+            let fmt0 = args.first().ok_or_else(|| {
                 host::type_error("strftime() takes at least 1 argument (0 given)")
             })?;
             let fmt = with_host(|h| h.as_str(fmt0))
@@ -14044,7 +14047,7 @@ fn encode_error(
         "ignore" => Ok(()),
         "replace" => {
             // One `?` per un-encodable character, not one per run.
-            out.extend(std::iter::repeat_n(b'?', run.len()));
+            out.extend(std::iter::repeat(b'?').take(run.len()));
             Ok(())
         }
         "backslashreplace" => {

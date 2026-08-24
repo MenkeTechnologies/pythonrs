@@ -16,7 +16,7 @@
 //! | [`double`] | `Python/pyhash.c` `_Py_HashDouble` |
 //! | [`complex`] | `Objects/complexobject.c` `complex_hash` |
 //! | [`buffer`] | `Python/pyhash.c` `Py_HashBuffer` + `siphash13` |
-//! | [`tuple`] | `Objects/tupleobject.c` `tuple_hash` |
+//! | [`fn@tuple`] | `Objects/tupleobject.c` `tuple_hash` |
 //! | [`frozenset`] | `Objects/setobject.c` `frozenset_hash` |
 //!
 //! Every arithmetic step runs in wrapping `u64` to match CPython's
@@ -212,7 +212,7 @@ pub enum HashSeed {
     Random,
 }
 
-/// Parse a `PYTHONHASHSEED` value, or `Err` for one CPython rejects.
+/// Parse a `PYTHONHASHSEED` value, or `None` for one CPython rejects.
 ///
 /// `raw` is `None` when the variable is unset; CPython's `_Py_GetEnv` also maps
 /// the EMPTY string to unset, so `PYTHONHASHSEED=` is [`HashSeed::Random`].
@@ -220,10 +220,10 @@ pub enum HashSeed {
 /// string and land in `[0, 4294967295]` — which is why `" 42"` and `"007"` are
 /// accepted (leading space and zeros are strtoul's), while `"42 "`, `"0x10"`
 /// and `"-1"` are not (trailing text; `-1` wraps to `ULONG_MAX`).
-pub fn parse_hash_seed(raw: Option<&str>) -> Result<HashSeed, ()> {
+pub fn parse_hash_seed(raw: Option<&str>) -> Option<HashSeed> {
     let s = match raw {
-        None | Some("") => return Ok(HashSeed::Random),
-        Some("random") => return Ok(HashSeed::Random),
+        None | Some("") => return Some(HashSeed::Random),
+        Some("random") => return Some(HashSeed::Random),
         Some(s) => s,
     };
     // strtoul: leading whitespace, then an optional sign, then base-10 digits.
@@ -253,15 +253,15 @@ pub fn parse_hash_seed(raw: Option<&str>) -> Result<HashSeed, ()> {
     }
     // No digits at all, or trailing text: `*endptr != '\0'`.
     if i == digits_start || i != b.len() {
-        return Err(());
+        return None;
     }
     // strtoul negates modulo 2**64, so any `-N` with N > 0 lands far above the
     // ceiling; `-0` is still 0 and is accepted.
     let n = if neg { 0u64.wrapping_sub(n) } else { n };
     if n > 4_294_967_295 {
-        return Err(());
+        return None;
     }
-    Ok(HashSeed::Fixed(n as u32))
+    Some(HashSeed::Fixed(n as u32))
 }
 
 /// `lcg_urandom` (`Python/bootstrap_hash.c`): the deterministic byte stream
@@ -287,12 +287,12 @@ pub fn hash_secret() -> (u64, u64) {
     *SECRET.get_or_init(|| {
         let seed = std::env::var("PYTHONHASHSEED").ok();
         match parse_hash_seed(seed.as_deref()) {
-            Ok(HashSeed::Fixed(n)) => secret_for(n),
+            Some(HashSeed::Fixed(n)) => secret_for(n),
             // Unreachable in the `python` binary (`main` exits first); a library
             // embedder that never validated gets the seed-0 key rather than a
             // panic.
-            Err(()) => secret_for(0),
-            Ok(HashSeed::Random) => random_secret(),
+            None => secret_for(0),
+            Some(HashSeed::Random) => random_secret(),
         }
     })
 }
@@ -630,29 +630,29 @@ mod tests {
     fn parses_hash_seed_like_cpython() {
         use HashSeed::*;
         // Unset, empty and "random" all ask for entropy.
-        assert_eq!(parse_hash_seed(None), Ok(Random));
-        assert_eq!(parse_hash_seed(Some("")), Ok(Random));
-        assert_eq!(parse_hash_seed(Some("random")), Ok(Random));
+        assert_eq!(parse_hash_seed(None), Some(Random));
+        assert_eq!(parse_hash_seed(Some("")), Some(Random));
+        assert_eq!(parse_hash_seed(Some("random")), Some(Random));
         // strtoul accepts leading whitespace, a sign, and leading zeros.
-        assert_eq!(parse_hash_seed(Some("0")), Ok(Fixed(0)));
-        assert_eq!(parse_hash_seed(Some("42")), Ok(Fixed(42)));
-        assert_eq!(parse_hash_seed(Some(" 42")), Ok(Fixed(42)));
-        assert_eq!(parse_hash_seed(Some("\t42")), Ok(Fixed(42)));
-        assert_eq!(parse_hash_seed(Some("007")), Ok(Fixed(7)));
-        assert_eq!(parse_hash_seed(Some("+7")), Ok(Fixed(7)));
-        assert_eq!(parse_hash_seed(Some("-0")), Ok(Fixed(0)));
-        assert_eq!(parse_hash_seed(Some("4294967295")), Ok(Fixed(4294967295)));
+        assert_eq!(parse_hash_seed(Some("0")), Some(Fixed(0)));
+        assert_eq!(parse_hash_seed(Some("42")), Some(Fixed(42)));
+        assert_eq!(parse_hash_seed(Some(" 42")), Some(Fixed(42)));
+        assert_eq!(parse_hash_seed(Some("\t42")), Some(Fixed(42)));
+        assert_eq!(parse_hash_seed(Some("007")), Some(Fixed(7)));
+        assert_eq!(parse_hash_seed(Some("+7")), Some(Fixed(7)));
+        assert_eq!(parse_hash_seed(Some("-0")), Some(Fixed(0)));
+        assert_eq!(parse_hash_seed(Some("4294967295")), Some(Fixed(4294967295)));
         // Trailing text (including a trailing space), a non-decimal base, and
         // anything out of range are all rejected.
-        assert_eq!(parse_hash_seed(Some("42 ")), Err(()));
-        assert_eq!(parse_hash_seed(Some("  42  ")), Err(()));
-        assert_eq!(parse_hash_seed(Some(" ")), Err(()));
-        assert_eq!(parse_hash_seed(Some("abc")), Err(()));
-        assert_eq!(parse_hash_seed(Some("42abc")), Err(()));
-        assert_eq!(parse_hash_seed(Some("1e3")), Err(()));
-        assert_eq!(parse_hash_seed(Some("0x10")), Err(()));
-        assert_eq!(parse_hash_seed(Some("-1")), Err(()));
-        assert_eq!(parse_hash_seed(Some("4294967296")), Err(()));
+        assert_eq!(parse_hash_seed(Some("42 ")), None);
+        assert_eq!(parse_hash_seed(Some("  42  ")), None);
+        assert_eq!(parse_hash_seed(Some(" ")), None);
+        assert_eq!(parse_hash_seed(Some("abc")), None);
+        assert_eq!(parse_hash_seed(Some("42abc")), None);
+        assert_eq!(parse_hash_seed(Some("1e3")), None);
+        assert_eq!(parse_hash_seed(Some("0x10")), None);
+        assert_eq!(parse_hash_seed(Some("-1")), None);
+        assert_eq!(parse_hash_seed(Some("4294967296")), None);
     }
 
     /// `hash(str)` under a PINNED seed, against CPython 3.14.6 run as
