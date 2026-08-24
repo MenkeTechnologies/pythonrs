@@ -290,3 +290,147 @@ fn two_native_ints_reach_the_hook_through_augmented_assignment() {
         "9223372036854775808"
     );
 }
+
+/// The `repr` of the value `src` binds to global `x`, or `ERR <message>` when
+/// the program raised — so a test can assert the EXCEPTION with the same call it
+/// uses for a value, and a silently-wrong number can never read as a raise.
+fn gx(src: &str) -> String {
+    match pythonrs::eval_str(src) {
+        Ok(_) => with_host(|h| {
+            let v = h.read_global("x").expect("global x unbound");
+            h.repr_of(&v)
+        }),
+        Err(e) => format!("ERR {e}"),
+    }
+}
+
+/// `int / int` is CPython's `long_true_divide`: a quotient computed in the
+/// INTEGER domain and rounded once. Reading each side as an `f64` first and
+/// dividing is a different operation, and past the `f64` range it is not merely
+/// less precise — it has no answer at all. `2**2000 / 2**1999` is exactly `2.0`,
+/// and `inf / inf` reported it as `nan`.
+///
+/// Every expected value here is what CPython 3.14 prints for the same
+/// expression.
+#[test]
+fn bignum_true_division_is_exact_not_a_float_fallback() {
+    // Quotients that are small and exact, from operands that individually have
+    // no `f64` at all. These are the cases the old path turned into `nan`.
+    assert_eq!(gx("x = (2**2000) / (2**1999)"), "2.0");
+    assert_eq!(gx("x = (2**2000) / (2**2000)"), "1.0");
+    assert_eq!(gx("x = (3**200) / (3**199)"), "3.0");
+    assert_eq!(gx("x = (7**300) / (7**150)"), "5.817092933824343e+126");
+    // Sign is carried by the quotient, including onto a zero.
+    assert_eq!(gx("x = 0 / -1"), "-0.0");
+    assert_eq!(gx("x = -(2**2000) / (2**1999)"), "-2.0");
+    // An inexact quotient must land on the same double, not a neighbour. One
+    // spare bit of quotient is not enough to get this one right — an odd
+    // quotient is itself the tie that round-to-odd exists to break.
+    assert_eq!(gx("x = (10**20) / 3"), "3.333333333333333e+19");
+    assert_eq!(gx("x = (2**53 + 1) / 3"), "3002399751580331.0");
+    // Underflow to zero is not an error, and stays exact into the subnormals.
+    assert_eq!(gx("x = 1 / (2**2000)"), "0.0");
+    assert_eq!(gx("x = 1 / (2**1074)"), "5e-324");
+    assert_eq!(gx("x = 1 / (2**1075)"), "0.0");
+}
+
+/// CPython converts an `int` operand through `PyLong_AsDouble`, which RAISES
+/// past the `f64` range instead of saturating to `inf`. Saturating produced a
+/// wrong NUMBER rather than an error, and the wrong number then travelled: the
+/// `//` and `%` forms below came back as `nan`.
+#[test]
+fn an_int_past_the_f64_range_raises_instead_of_becoming_inf() {
+    const OVF: &str = "ERR OverflowError: int too large to convert to float";
+    for src in [
+        "x = (2**2000) * 1.0",
+        "x = 1.0 * (2**2000)",
+        "x = (2**2000) + 1.0",
+        "x = (2**2000) - 1.0",
+        "x = (2**2000) / 1.0",
+        "x = 1.0 / (2**2000)",
+        "x = (2**2000) // 1.0",
+        "x = (2**2000) % 1.0",
+        "x = (2**2000) ** 1.0",
+        "x = 1.0 ** (2**2000)",
+        "x = (2**2000) ** -1",
+        "x = float(2**2000)",
+        "x = float(-(2**2000))",
+        "x = float(2**1024)",
+    ] {
+        assert_eq!(gx(src), OVF, "{src}");
+    }
+    // `int / int` overflows in the QUOTIENT, which CPython words differently.
+    assert_eq!(
+        gx("x = (2**2000) / 1"),
+        "ERR OverflowError: integer division result too large for a float"
+    );
+    // The boundary still converts: 2**1023 is the largest power of two with an
+    // `f64`, so the check must not be off by one exponent.
+    assert_eq!(gx("x = float(2**1023)"), "8.98846567431158e+307");
+    // COMPARISON never converts — CPython compares exactly at any magnitude, so
+    // the same operand that cannot become a float still orders fine.
+    assert_eq!(gx("x = (2**2000) > 1.0"), "True");
+    assert_eq!(gx("x = (2**2000) == 1.0"), "False");
+}
+
+/// CPython's `float_pow` surfaces the C library's ERANGE as an `OverflowError`
+/// rather than returning an infinity — but only for a FINITE pair. Returning
+/// `inf` made an overflow indistinguishable from a genuine infinity.
+#[test]
+fn float_pow_overflow_raises_but_a_real_infinity_does_not() {
+    const OVF: &str = "ERR OverflowError: (34, 'Result too large')";
+    assert_eq!(gx("x = 2.0 ** 10000"), OVF);
+    assert_eq!(gx("x = 10.0 ** 400"), OVF);
+    assert_eq!(gx("x = 1e300 ** 2"), OVF);
+    assert_eq!(gx("x = (-2.0) ** 10001"), OVF);
+    // 2**1024 overflows; 2**1023 is the largest that does not. An off-by-one
+    // here would make the whole test pass for the wrong reason.
+    assert_eq!(gx("x = 2.0 ** 1024"), OVF);
+    assert_eq!(gx("x = 2.0 ** 1023"), "8.98846567431158e+307");
+    // An infinite OPERAND is not an overflow: the result is genuinely infinite.
+    assert_eq!(gx("x = float('inf') ** 2"), "inf");
+    assert_eq!(gx("x = 2.0 ** float('inf')"), "inf");
+    // Multiplication does NOT raise — CPython only checks ERANGE for `**`.
+    assert_eq!(gx("x = 1e300 * 1e300"), "inf");
+    assert_eq!(gx("x = 1e308 * 10"), "inf");
+    // Underflow is not an error either.
+    assert_eq!(gx("x = 2.0 ** -10000"), "0.0");
+    assert_eq!(gx("x = 1e-300 ** 2"), "0.0");
+}
+
+/// C99 gives `pow(x, ±inf)` a real answer for every negative `x`, which CPython
+/// inherits. `fract()` of an infinity is NaN and NaN is never equal to 0.0, so
+/// the "negative base to a non-integer power is complex" guard swallowed every
+/// infinite exponent: `(-1.0) ** float('inf')` answered `(nan+nanj)`.
+#[test]
+fn a_negative_base_with_an_infinite_exponent_stays_real() {
+    assert_eq!(gx("x = (-1.0) ** float('inf')"), "1.0");
+    assert_eq!(gx("x = (-1.0) ** float('-inf')"), "1.0");
+    assert_eq!(gx("x = (-2.0) ** float('inf')"), "inf");
+    assert_eq!(gx("x = (-2.0) ** float('-inf')"), "0.0");
+    // The guard itself must still fire for a FINITE non-integer exponent.
+    assert_eq!(gx("x = (-8.0) ** (1/3)"), "(1.0000000000000002+1.7320508075688772j)");
+}
+
+/// Every index-taking builtin words a non-integer argument the same way, naming
+/// the OFFENDING type. `range` answered with a message about itself instead,
+/// which named neither the type nor the shared vocabulary.
+#[test]
+fn range_rejects_a_non_integer_by_naming_its_type() {
+    assert_eq!(
+        gx("x = range(1.5)"),
+        "ERR TypeError: 'float' object cannot be interpreted as an integer"
+    );
+    assert_eq!(
+        gx("x = range('a')"),
+        "ERR TypeError: 'str' object cannot be interpreted as an integer"
+    );
+    assert_eq!(
+        gx("x = range(0, [])"),
+        "ERR TypeError: 'list' object cannot be interpreted as an integer"
+    );
+    // A bignum bound is still a perfectly good integer. (`len` of it is a
+    // separate CPython limit — a length must fit a C `ssize_t` — so indexing is
+    // what shows the bound was accepted.)
+    assert_eq!(gx("x = range(2**70)[5]"), "5");
+}

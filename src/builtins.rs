@@ -5970,8 +5970,16 @@ fn make_range(args: &[Value]) -> Result<Value, String> {
     let bigs: Vec<num_bigint::BigInt> = args
         .iter()
         .map(|v| {
-            with_host(|h| h.big_val(v))
-                .ok_or_else(|| host::type_error("'range' requires integer arguments"))
+            // CPython names the offending operand's own type and uses the same
+            // wording every index-taking builtin does — `range(1.5)` is
+            // "'float' object cannot be interpreted as an integer", never a
+            // message about `range` itself.
+            with_host(|h| h.big_val(v)).ok_or_else(|| {
+                host::type_error(&format!(
+                    "'{}' object cannot be interpreted as an integer",
+                    with_host(|h| h.type_name(v))
+                ))
+            })
         })
         .collect::<Result<_, _>>()?;
     use num_traits::{One, Zero};
@@ -6506,7 +6514,15 @@ fn construct_float(args: &[Value]) -> Result<Value, String> {
         Value::Obj(_) if matches!(h.get(&v), Some(PyObj::BigInt(_))) => {
             use num_traits::ToPrimitive;
             match h.get(&v) {
-                Some(PyObj::BigInt(b)) => Ok(Value::Float(b.to_f64().unwrap_or(f64::INFINITY))),
+                // CPython raises rather than saturating: `float(2**2000)` is an
+                // `OverflowError`, not `inf`. Saturating here also leaked into
+                // every caller that reads a float back out, so the wrong answer
+                // travelled instead of the error.
+                Some(PyObj::BigInt(b)) => b
+                    .to_f64()
+                    .filter(|f| f.is_finite())
+                    .map(Value::Float)
+                    .ok_or_else(|| "OverflowError: int too large to convert to float".to_string()),
                 _ => unreachable!(),
             }
         }

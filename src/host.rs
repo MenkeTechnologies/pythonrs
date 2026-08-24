@@ -4692,6 +4692,42 @@ impl PyHost {
         }
     }
 
+    /// Whether `v` is an integer whose magnitude lives in a heap bignum — the
+    /// only way an `int` can be past the `f64` range. An `int` SUBCLASS counts:
+    /// it carries the same payload one level down.
+    fn is_bignum_like(&self, v: &Value) -> bool {
+        if self.is_bignum(v) {
+            return true;
+        }
+        match self.get(v) {
+            Some(PyObj::Instance(_)) => self
+                .base_payload_num(v)
+                .is_some_and(|p| self.is_bignum(&p)),
+            _ => false,
+        }
+    }
+
+    /// A numeric operand as the `f64` a MIXED int/float ARITHMETIC operation
+    /// must see, or the `OverflowError` CPython raises instead of converting.
+    ///
+    /// CPython reads an `int` operand through `PyLong_AsDouble`, which RAISES
+    /// once the magnitude is past the `f64` range rather than saturating to
+    /// `inf`. [`num_val`] saturates deliberately — it also backs comparison,
+    /// where CPython never converts and `(2**2000) > 1.0` must stay `True` — so
+    /// arithmetic needs this checked form. Reading the saturated value instead
+    /// made `(2**2000) * 1.0` answer `inf` and `(2**2000) // 1.0` answer `nan`,
+    /// silently-wrong numbers where CPython raises.
+    ///
+    /// Only an INTEGER operand raises: a `float` operand that already IS an
+    /// infinity converts to itself (`float('inf') * 2.0` is `inf`, not an error).
+    pub fn num_val_arith(&self, v: &Value) -> Result<Option<f64>, String> {
+        let f = self.num_val(v);
+        if matches!(f, Some(x) if !x.is_finite()) && self.is_bignum_like(v) {
+            return Err("OverflowError: int too large to convert to float".into());
+        }
+        Ok(f)
+    }
+
     pub fn as_int(&self, v: &Value) -> Option<i64> {
         match v {
             Value::Int(n) => Some(*n),
@@ -5827,6 +5863,68 @@ fn bigint_to_f64(b: &num_bigint::BigInt) -> f64 {
     b.to_f64().unwrap_or(f64::INFINITY)
 }
 
+/// `int / int` as the exactly-rounded `f64` CPython's `long_true_divide`
+/// produces, or the `OverflowError` it raises when the QUOTIENT is past the
+/// `f64` range.
+///
+/// Converting each side to `f64` and dividing — what the float fallback did —
+/// is wrong twice over once either side is past that range: `2**2000 / 2**1999`
+/// became `inf / inf` = `nan` instead of `2.0`, and a perfectly representable
+/// quotient was reported as `inf` because an OPERAND alone did not fit.
+///
+/// The quotient is therefore formed in the integer domain. It is scaled to carry
+/// 55 significant bits — TWO more than an `f64` mantissa holds — and its lowest
+/// bit is forced ODD whenever the division left a remainder. Round-to-odd is
+/// what makes the two-step rounding exact: the single round-to-nearest-even
+/// inside `to_f64` can no longer be pulled the wrong way by a discarded tail,
+/// including in the subnormal range where naive double rounding is worst.
+///
+/// TWO spare bits, not one, is the load-bearing part. With a single spare bit an
+/// odd quotient sits exactly halfway between two doubles — it IS the tie that
+/// round-to-odd exists to prevent — and `to_f64` then breaks it by its own
+/// half-to-even rule, which knows nothing of the discarded remainder. That cost
+/// one ulp on `(10**20) / 3`: `3.3333333333333336e+19` for CPython's
+/// `3.333333333333333e+19`. With two spare bits a tie is the bit pattern `…10`,
+/// which an odd low bit can never be.
+fn bigint_true_divide(a: &num_bigint::BigInt, b: &num_bigint::BigInt) -> Result<f64, String> {
+    use num_integer::Integer;
+    use num_traits::{Signed, ToPrimitive, Zero};
+
+    if b.is_zero() {
+        return Err("ZeroDivisionError: division by zero".into());
+    }
+    let negative = a.is_negative() != b.is_negative();
+    if a.is_zero() {
+        // CPython keeps the sign of a zero quotient (`0 / -1` is `-0.0`).
+        return Ok(if negative { -0.0 } else { 0.0 });
+    }
+    let (a, b) = (a.abs(), b.abs());
+
+    // `q = floor(a << shift / b)` then has 55 or 56 bits, whatever the inputs.
+    let shift = 55i64 + b.bits() as i64 - a.bits() as i64;
+    let (num, den) = if shift >= 0 {
+        (a << shift as u64, b)
+    } else {
+        (a, b << shift.unsigned_abs())
+    };
+    let (mut q, r) = num.div_rem(&den);
+    if !r.is_zero() && q.is_even() {
+        q += 1u32;
+    }
+
+    // `q` is 56 bits at most, so `to_f64` cannot overflow here; the scaling is
+    // where a too-large quotient becomes infinite, and a too-small one becomes
+    // zero exactly as CPython's does (`1 / 2**2000` is `0.0`, not an error).
+    let scaled = libm::ldexp(
+        q.to_f64().unwrap_or(f64::INFINITY),
+        -shift.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+    );
+    if !scaled.is_finite() {
+        return Err("OverflowError: integer division result too large for a float".into());
+    }
+    Ok(if negative { -scaled } else { scaled })
+}
+
 // ── arithmetic / comparison delegated from the numeric hook ──────────────────
 
 impl PyHost {
@@ -5879,7 +5977,7 @@ impl PyHost {
                     return Ok(self.norm_big(x + y));
                 }
                 // Mixed/float numeric
-                if let (Some(x), Some(y)) = (self.num_val(a), self.num_val(b)) {
+                if let (Some(x), Some(y)) = (self.num_val_arith(a)?, self.num_val_arith(b)?) {
                     return Ok(Value::Float(x + y));
                 }
                 // complex + complex / int + complex / …
@@ -5978,7 +6076,7 @@ impl PyHost {
                 if let (Some(x), Some(y)) = (self.big_val(a), self.big_val(b)) {
                     return Ok(self.norm_big(x - y));
                 }
-                if let (Some(x), Some(y)) = (self.num_val(a), self.num_val(b)) {
+                if let (Some(x), Some(y)) = (self.num_val_arith(a)?, self.num_val_arith(b)?) {
                     return Ok(Value::Float(x - y));
                 }
                 if self.is_complex(a) || self.is_complex(b) {
@@ -6009,7 +6107,7 @@ impl PyHost {
                 if let Some(r) = self.repeat_seq(a, b)? {
                     return Ok(r);
                 }
-                if let (Some(x), Some(y)) = (self.num_val(a), self.num_val(b)) {
+                if let (Some(x), Some(y)) = (self.num_val_arith(a)?, self.num_val_arith(b)?) {
                     return Ok(Value::Float(x * y));
                 }
                 if self.is_complex(a) || self.is_complex(b) {
@@ -6336,13 +6434,33 @@ impl PyHost {
         }
         let ai = self.as_int(a);
         let bi = self.as_int(b);
-        let af = self.num_val(a);
-        let bf = self.num_val(b);
+        // The float reading of each operand is taken per-arm through
+        // `num_val_arith`, not eagerly here: the integer arms below return
+        // without ever needing it, and the conversion can RAISE (a bignum past
+        // the f64 range), which an eager read had no way to report.
         match tag {
-            binop::DIV => match (af, bf) {
-                (Some(_), Some(0.0)) => Err("ZeroDivisionError: division by zero".into()),
-                (Some(x), Some(y)) => Ok(Value::Float(x / y)),
-                _ if self.is_complex(a) || self.is_complex(b) => {
+            binop::DIV => {
+                // Two integers divide in the INTEGER domain (CPython's
+                // `long_true_divide`), never by converting each side to `f64`
+                // first — see `bigint_true_divide`. Small operands take the
+                // shortcut: below 2^53 both convert exactly, so the `f64`
+                // division is already the one correctly-rounded operation the
+                // long path would arrive at.
+                if let (Some(x), Some(y)) = (ai, bi) {
+                    if y == 0 {
+                        return Err("ZeroDivisionError: division by zero".into());
+                    }
+                    if x.unsigned_abs() < (1 << 53) && y.unsigned_abs() < (1 << 53) {
+                        return Ok(Value::Float(x as f64 / y as f64));
+                    }
+                }
+                if let (Some(x), Some(y)) = (self.big_val(a), self.big_val(b)) {
+                    return bigint_true_divide(&x, &y).map(Value::Float);
+                }
+                match (self.num_val_arith(a)?, self.num_val_arith(b)?) {
+                    (Some(_), Some(0.0)) => Err("ZeroDivisionError: division by zero".into()),
+                    (Some(x), Some(y)) => Ok(Value::Float(x / y)),
+                    _ if self.is_complex(a) || self.is_complex(b) => {
                     match (self.complex_val(a), self.complex_val(b)) {
                         (Some((ar, ai)), Some((br, bi))) => {
                             if br == 0.0 && bi == 0.0 {
@@ -6353,9 +6471,10 @@ impl PyHost {
                         }
                         _ => Err(self.optype_err("/", a, b)),
                     }
+                    }
+                    _ => Err(self.optype_err("/", a, b)),
                 }
-                _ => Err(self.optype_err("/", a, b)),
-            },
+            }
             binop::FLOORDIV => {
                 // Python `//` floors toward −∞ (not Rust truncation).
                 if let (Some(x), Some(y)) = (ai, bi) {
@@ -6378,7 +6497,7 @@ impl PyHost {
                     }
                     return Ok(self.norm_big(bigint_floordiv(&x, &y)));
                 }
-                match (af, bf) {
+                match (self.num_val_arith(a)?, self.num_val_arith(b)?) {
                     (Some(_), Some(0.0)) => Err("ZeroDivisionError: division by zero".into()),
                     (Some(x), Some(y)) => Ok(Value::Float(float_divmod(x, y).0)),
                     _ => Err(self.optype_err("//", a, b)),
@@ -6412,7 +6531,7 @@ impl PyHost {
                     }
                     return Ok(self.norm_big(bigint_mod(&x, &y)));
                 }
-                match (af, bf) {
+                match (self.num_val_arith(a)?, self.num_val_arith(b)?) {
                     (Some(_), Some(0.0)) => Err("ZeroDivisionError: division by zero".into()),
                     (Some(x), Some(y)) => Ok(Value::Float(float_divmod(x, y).1)),
                     _ => Err(self.optype_err("%", a, b)),
@@ -6436,7 +6555,7 @@ impl PyHost {
                         _ => Err(self.optype_err("**", a, b)),
                     }
                 }
-                _ => match (af, bf) {
+                _ => match (self.num_val_arith(a)?, self.num_val_arith(b)?) {
                     // `0 ** <negative>` is a division by zero in CPython, not `inf`.
                     // As of 3.14 both int and float bases word it the same way.
                     (Some(x), Some(y)) if x == 0.0 && y < 0.0 => {
@@ -6444,11 +6563,28 @@ impl PyHost {
                     }
                     // A negative real base raised to a non-integer power yields a
                     // complex result in CPython (Rust's `powf` returns NaN).
-                    (Some(x), Some(y)) if x < 0.0 && y.fract() != 0.0 => {
+                    //
+                    // An INFINITE exponent is not a non-integer power: C99 gives
+                    // `pow(-1.0, inf) == 1.0`, which CPython inherits. `fract()`
+                    // of an infinity is NaN, and NaN compares unequal to 0.0, so
+                    // every negative base with an infinite exponent used to fall
+                    // into the complex branch — `(-1.0) ** float('inf')` answered
+                    // `(nan+nanj)` where CPython answers `1.0`.
+                    (Some(x), Some(y)) if x < 0.0 && y.is_finite() && y.fract() != 0.0 => {
                         let (r, i) = c_pow((x, 0.0), (y, 0.0));
                         Ok(self.alloc(PyObj::Complex(r, i)))
                     }
-                    (Some(x), Some(y)) => Ok(Value::Float(x.powf(y))),
+                    (Some(x), Some(y)) => {
+                        let r = x.powf(y);
+                        // CPython's `float_pow` reports the C library's ERANGE
+                        // as `OverflowError` rather than returning an infinity.
+                        // Only a FINITE pair can overflow into one — `2.0 **
+                        // float('inf')` and `float('inf') ** 2` stay `inf`.
+                        if r.is_infinite() && x.is_finite() && y.is_finite() {
+                            return Err("OverflowError: (34, 'Result too large')".into());
+                        }
+                        Ok(Value::Float(r))
+                    }
                     _ => Err(self.optype_err("**", a, b)),
                 },
             },
