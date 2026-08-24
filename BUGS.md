@@ -745,6 +745,65 @@ written.
   through to the wrapped pythonrs callable, which is what CPython's in-place
   semantics mean.
 
+- **`int` → `float` conversion saturated instead of raising.** CPython reads an
+  `int` operand of a mixed arithmetic expression through `PyLong_AsDouble`, which
+  RAISES past the `f64` range. `num_val` saturated to `inf`, so a wrong NUMBER
+  travelled where an error was due: `(2**2000) * 1.0` was `inf` and
+  `(2**2000) // 1.0` was `nan`. Arithmetic now reads operands through
+  `num_val_arith`. Comparison deliberately keeps saturating — CPython never
+  converts there, and `(2**2000) > 1.0` must stay `True`. `float(2**2000)` raises
+  too.
+- **`int / int` divided in the FLOAT domain.** Both sides were read as `f64` and
+  divided, so past the `f64` range the answer was not merely imprecise but
+  absent: `2**2000 / 2**1999` came out `inf / inf` = `nan` instead of `2.0`, and
+  a representable quotient was reported as overflow because an OPERAND alone did
+  not fit. `bigint_true_divide` now runs CPython's `long_true_divide` — the
+  quotient is formed in the integer domain and rounded once, scaled to 55
+  significant bits with the low bit forced odd so the two-step rounding is exact
+  (one spare bit is not enough: an odd quotient is then itself the tie, which
+  cost an ulp on `(10**20) / 3`). 4000 randomized bignum divisions agree with
+  CPython bit-for-bit, compared as `float.hex`.
+- **`2.0 ** 10000` returned `inf`.** CPython's `float_pow` reports the C
+  library's ERANGE as `OverflowError: (34, 'Result too large')`. Only a FINITE
+  pair can overflow into one, so `float('inf') ** 2` stays `inf`. Relatedly
+  `(-1.0) ** float('inf')` answered `(nan+nanj)`: `fract()` of an infinity is
+  NaN, which compares unequal to `0.0` and sent every infinite exponent down the
+  "negative base to a non-integer power is complex" path. C99 gives
+  `pow(-1.0, inf) == 1.0`.
+- **`range()` named itself instead of the offending type.** `range(1.5)` said
+  `'range' requires integer arguments`; CPython uses the vocabulary every
+  index-taking builtin shares — `'float' object cannot be interpreted as an
+  integer`.
+- **Container dunders were granted to every value.** `__len__`, `__getitem__`,
+  `__setitem__`, `__delitem__`, `__iter__`, `__contains__` and `__bool__` were
+  exposed as bound methods on any builtin, which is observable: `hasattr(5,
+  '__len__')` was True and `(1, 2).__setitem__` handed back a bound method for a
+  method a tuple does not have — 38 wrong answers across the builtin types.
+  `is_object_dunder_method` now takes the receiver's type name and gates each on
+  the types CPython gives it to. A container's truth comes from `__len__`, so
+  containers get no `__bool__` either; only `__str__`/`__repr__` stay universal.
+  `dict_values` loses `__contains__` to match, and `v in d.values()` still works
+  by iterating the view — which is exactly why CPython omits the method.
+  CALLING an absent dunder now raises the same `AttributeError` that reading it
+  does, instead of letting the native operation answer with its own complaint.
+- **The "perhaps you missed a comma?" `SyntaxWarning` covered one of its twelve
+  shapes.** Only a literal sequence subscripted by a FLOAT warned. Every non-int
+  compile-time index warns now (`[1, 2]['a']`, `[None]`, `[b'x']`, `[1j]`,
+  `[...]`, and the list/tuple/dict displays), while an `int`/`bool` index, a
+  slice, a `dict`, and a bare NAME stay silent as in CPython. CALLING a literal
+  — `None()`, `1(2)`, `[1, 2](3)` — did not warn at all and now does. `eval` and
+  `exec` compiled their source and DROPPED the warnings entirely; they print them
+  to stderr attributed to `<string>`, as CPython does.
+- **The bytecode cache did not invalidate on a REBUILD.** The key hashed the
+  source, a hand-bumped `SCHEMA`, and `CARGO_PKG_VERSION` — no term that a
+  rebuild moves. Any build between two releases that changed lowering silently
+  replayed the PREVIOUS build's bytecode out of `~/.pythonrs/scripts.rkyv`: no
+  error, no wrong answer to chase, just "my fix did not take". Found when a
+  compiler change emitting a new `SyntaxWarning` appeared to do nothing for every
+  already-cached script on a binary rebuilt seconds earlier; the v49 `SCHEMA`
+  note records the same class of bug biting once before. The key now also hashes
+  the running executable's size and mtime.
+
 ## Implemented — async/await/asyncio (native fusevm event loop)
 - **`async def` / `await` / `asyncio`.** `async def f()` returns a real coroutine
   object (`type(f()).__name__ == 'coroutine'`; the body does **not** run on call),
@@ -781,6 +840,18 @@ written.
   variants; async-generator `asend`/`athrow`/`aclose`.
 
 ## Partial / simplified semantics
+- **`dir()` on a builtin type omits most of the inherited dunders.** Every
+  builtin is missing the `object`-level names (`__delattr__`, `__dir__`,
+  `__format__`, `__getattribute__`, `__getstate__`, `__init_subclass__`,
+  `__reduce__`, `__reduce_ex__`, `__setattr__`, `__subclasshook__`) plus the
+  comparison set and the container dunders it does implement — `dir('a')` is
+  short by 24 names, `dir([1])` by 26, `dir(5)` by 15 (which also lacks
+  `denominator`/`numerator`/`imag`/`real`/`from_bytes`). Attribute ACCESS is
+  unaffected: the names that matter resolve, and `hasattr` agrees with CPython
+  across the container dunders. What this costs is `dir()` itself and the
+  "Did you mean" hint computed from it, so `'a'.__setitem__` reports the right
+  `AttributeError` without CPython's `Did you mean: '__getitem__'?` clause.
+
 - **The depth guards are calibrated for the interpreter's 512 MB stack, not for
   an embedder's.** `src/main.rs` runs the interpreter on a thread with
   `stack_size(512 * 1024 * 1024)`, and `parser::MAX_TREE_DEPTH` is chosen against
