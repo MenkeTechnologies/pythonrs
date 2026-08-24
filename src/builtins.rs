@@ -3729,14 +3729,40 @@ pub fn is_object_dunder_method(tn: &str, name: &str) -> bool {
     // Everything sized: `len(x)` works. A set is sized and iterable but NOT
     // subscriptable, which is why the next list is not simply this one.
     const SIZED: &[&str] = &[
-        "str", "bytes", "bytearray", "list", "tuple", "dict", "set", "frozenset", "range",
-        "memoryview", "array", "deque", "defaultdict", "OrderedDict", "Counter", "dict_keys",
-        "dict_values", "dict_items",
+        "str",
+        "bytes",
+        "bytearray",
+        "list",
+        "tuple",
+        "dict",
+        "set",
+        "frozenset",
+        "range",
+        "memoryview",
+        "array",
+        "deque",
+        "defaultdict",
+        "OrderedDict",
+        "Counter",
+        "dict_keys",
+        "dict_values",
+        "dict_items",
     ];
     // `x[k]` works. Views and sets are excluded: `{}.keys()[0]` is a TypeError.
     const SUBSCRIPTABLE: &[&str] = &[
-        "str", "bytes", "bytearray", "list", "tuple", "dict", "range", "memoryview", "array",
-        "deque", "defaultdict", "OrderedDict", "Counter",
+        "str",
+        "bytes",
+        "bytearray",
+        "list",
+        "tuple",
+        "dict",
+        "range",
+        "memoryview",
+        "array",
+        "deque",
+        "defaultdict",
+        "OrderedDict",
+        "Counter",
     ];
     // `x[k] = v` / `del x[k]` — the mutable sequences and mappings only.
     const MUTABLE: &[&str] = &[

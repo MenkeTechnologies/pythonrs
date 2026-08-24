@@ -65,7 +65,10 @@ fn reference_version() -> Option<(u32, u32)> {
 fn probes(text: &str) -> Vec<String> {
     text.split(SEP)
         .map(|s| s.trim_matches('\n').to_string())
-        .filter(|s| s.lines().any(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#')))
+        .filter(|s| {
+            s.lines()
+                .any(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+        })
         .collect()
 }
 
@@ -146,7 +149,10 @@ fn probes_match_the_reference_python3() {
 
         let (ref_out, ref_err, ref_code) = run(Path::new("python3"), &path);
         let (our_out, our_err, our_code) = run(&ours_bin, &path);
-        let head = probe.lines().find(|l| !l.trim_start().starts_with('#')).unwrap_or("");
+        let head = probe
+            .lines()
+            .find(|l| !l.trim_start().starts_with('#'))
+            .unwrap_or("");
 
         // Compared as BYTES: `from_utf8_lossy` maps every invalid sequence to the
         // same replacement char, so two different invalid outputs would compare

@@ -8154,7 +8154,14 @@ fn container_dunders_are_present_only_on_the_types_that_have_them() {
         ("bytearray(b'a')", "True", "True", "True", "True", "True"),
         ("b'ab'", "True", "True", "False", "True", "True"),
         // A lazy iterator has `__iter__` and nothing else.
-        ("(n for n in [])", "False", "False", "False", "True", "False"),
+        (
+            "(n for n in [])",
+            "False",
+            "False",
+            "False",
+            "True",
+            "False",
+        ),
         ("zip()", "False", "False", "False", "True", "False"),
     ];
     for (expr, len, getitem, setitem, iter, contains) in cases {
@@ -8178,7 +8185,10 @@ fn container_dunders_are_present_only_on_the_types_that_have_them() {
     assert_eq!(g("x = hasattr([], '__bool__')", "x"), "False");
     assert_eq!(g("x = hasattr('a', '__bool__')", "x"), "False");
     // `__str__`/`__repr__` ARE universal — every object inherits them.
-    assert_eq!(g("x = hasattr(5, '__repr__') and hasattr([], '__str__')", "x"), "True");
+    assert_eq!(
+        g("x = hasattr(5, '__repr__') and hasattr([], '__str__')", "x"),
+        "True"
+    );
     // A dict_values view has no `__contains__`; membership still works by
     // iterating it, which is exactly why CPython omits the method.
     assert_eq!(g("x = hasattr({}.values(), '__contains__')", "x"), "False");
@@ -8249,15 +8259,42 @@ fn a_literal_called_or_wrongly_subscripted_warns_about_the_missing_comma() {
         );
     }
     for (src, want) in [
-        ("[1, 2]['a']", "list indices must be integers or slices, not str"),
-        ("[1, 2][None]", "list indices must be integers or slices, not NoneType"),
-        ("[1, 2][b'x']", "list indices must be integers or slices, not bytes"),
-        ("[1, 2][0.5]", "list indices must be integers or slices, not float"),
-        ("[1, 2][1j]", "list indices must be integers or slices, not complex"),
-        ("[1, 2][...]", "list indices must be integers or slices, not ellipsis"),
-        ("(1, 2)['a']", "tuple indices must be integers or slices, not str"),
-        ("'ab'[0.5]", "str indices must be integers or slices, not float"),
-        ("b'ab'[0.5]", "bytes indices must be integers or slices, not float"),
+        (
+            "[1, 2]['a']",
+            "list indices must be integers or slices, not str",
+        ),
+        (
+            "[1, 2][None]",
+            "list indices must be integers or slices, not NoneType",
+        ),
+        (
+            "[1, 2][b'x']",
+            "list indices must be integers or slices, not bytes",
+        ),
+        (
+            "[1, 2][0.5]",
+            "list indices must be integers or slices, not float",
+        ),
+        (
+            "[1, 2][1j]",
+            "list indices must be integers or slices, not complex",
+        ),
+        (
+            "[1, 2][...]",
+            "list indices must be integers or slices, not ellipsis",
+        ),
+        (
+            "(1, 2)['a']",
+            "tuple indices must be integers or slices, not str",
+        ),
+        (
+            "'ab'[0.5]",
+            "str indices must be integers or slices, not float",
+        ),
+        (
+            "b'ab'[0.5]",
+            "bytes indices must be integers or slices, not float",
+        ),
     ] {
         assert_eq!(
             warn(src),
@@ -8280,6 +8317,10 @@ fn a_literal_called_or_wrongly_subscripted_warns_about_the_missing_comma() {
         "print(1)",
         "(lambda: 1)()",
     ] {
-        assert!(warn(src).is_empty(), "{src} must not warn, got {:?}", warn(src));
+        assert!(
+            warn(src).is_empty(),
+            "{src} must not warn, got {:?}",
+            warn(src)
+        );
     }
 }
