@@ -153,16 +153,29 @@ for code in ["1/0", "[][0]", "{}['k']", "int('x')", "None.foo", "undefined_xyz",
              "'abc'.index('z')", "float('x')", "None()", "(1,2).__setitem__(0,3)",
              "(1).foo", "sorted([1,'a'])", "next(iter([]))", "[].pop()",
              "{}.pop('z')", "'a'*'b'", "'a,b'.split('')", "range(1,2,0)",
-             "1<'a'", "1%0", "divmod(1,0)", "int('12',1)", "dict(1)",
+             "1<'a'", "int('12',1)", "dict(1)",
              "2.0**10000", "float(2**2000)", "(2**2000)*1.0", "(2**2000)/1",
              "range(1.5)", "range('a')", "[1,2][0.5]", "abs('x')",
-             "'{'.format()", "'%d' % 'x'", "[].index(1)", "min([])",
+             "'{'.format()", "'%d' % 'x'", "min([])",
              "chr(-1)", "ord('ab')", "'a'.encode('nope')", "b'\\xff'.decode()"]:
     try:
         eval(code)
         print(code, "-> NO-RAISE")
     except BaseException as e:
         print(code, "->", type(e).__name__, ":", e)
+# CPython REWORDED these three, so their MESSAGE is not version-stable, and
+# this corpus is compared against any reference from 3.9 on (tests/parity.rs).
+# 3.12 says "integer modulo by zero", "integer division or modulo by zero" and
+# "1 is not in list"; 3.14 unified the first two to the bare "division by zero",
+# which is the wording pythonrs targets — pinned by tests/lang.rs
+# zero_division_messages_match_314. The exception TYPE is stable in every
+# release, so that is what these three compare.
+for code in ["1%0", "divmod(1,0)", "[].index(1)"]:
+    try:
+        eval(code)
+        print(code, "-> NO-RAISE")
+    except BaseException as e:
+        print(code, "->", type(e).__name__)
 #==#
 # ── repr/str/ascii of every builtin container and scalar ────────────────────
 print(repr("a'b"), repr('a"b'), repr("a\nb"), repr("a\tb"), repr("\\"), repr("\x00"))
