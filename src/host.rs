@@ -329,7 +329,7 @@ pub struct ClassDef {
     pub qualname: String,
     pub bases: Vec<String>,
     /// The class namespace populated by running the class body.
-    pub ns: IndexMap<String, Value>,
+    pub ns: NameMap,
     /// The C3-ish MRO (this class first), by name.
     pub mro: Vec<String>,
     /// The metaclass name (`type(cls)`). `"type"` for an ordinary class; a user
@@ -752,7 +752,7 @@ pub enum PyObj {
     /// argparse results). Attribute reads/writes go through `attrs`; `repr` is
     /// `namespace(k=v, …)`. Native VM object.
     Namespace {
-        attrs: IndexMap<String, Value>,
+        attrs: NameMap,
     },
     /// A read-only view of a mapping (`types.MappingProxyType`) — what a type's
     /// `__dict__` returns. Reads pass through to `dict`; there is no mutating API.
@@ -1335,15 +1335,34 @@ pub struct LruData {
 
 /// A local-variable environment, shared (by `Rc`) between a frame and any nested
 /// function that captures it.
+/// A NAMESPACE: identifier → value, in insertion order.
+///
+/// Every global read, local read, attribute read, and instance-attribute store
+/// is a lookup in one of these, which makes the hash of a short `String` key one
+/// of the most frequently executed operations in the whole runtime. `IndexMap`'s
+/// default `RandomState` hashes it with SipHash, and a profile of an ordinary
+/// `for i in range(n): t += a[i]` loop put the SipHash rounds plus the `String`
+/// comparisons behind them at roughly the weight of the entire fusevm dispatch
+/// loop — for keys that are one or two characters long.
+///
+/// `FxHasher` is the hasher rustc uses for its own identifier tables: a multiply
+/// and a rotate per word. Nothing Python-visible changes with it. An `IndexMap`
+/// keeps INSERTION order whatever the hasher, so `vars()`, `dir()`, `__dict__`,
+/// and module iteration order are exactly as before; and Python's own `hash()`
+/// and `dict` ordering do not run through here at all — they go through
+/// `to_key`/`pyhash`, which implement CPython's algorithm and honor
+/// `PYTHONHASHSEED`.
+pub type NameMap = IndexMap<String, Value, rustc_hash::FxBuildHasher>;
+
 pub struct EnvData {
-    pub vars: IndexMap<String, Value>,
+    pub vars: NameMap,
     pub parent: Option<Env>,
 }
 pub type Env = Rc<RefCell<EnvData>>;
 
 fn new_env(parent: Option<Env>) -> Env {
     Rc::new(RefCell::new(EnvData {
-        vars: IndexMap::new(),
+        vars: NameMap::default(),
         parent,
     }))
 }
@@ -1440,7 +1459,7 @@ pub struct PyHost {
     /// vendored stdlib function sees ITS module's names — not the importer's —
     /// exactly as CPython's `func.__globals__ is module.__dict__`. The slot for an
     /// imported module is kept alive after import for this reason.
-    module_globals: Vec<IndexMap<String, Value>>,
+    module_globals: Vec<NameMap>,
     /// One `__dict__` view per module slot, so `mod.__dict__ is mod.__dict__`.
     module_dicts: HashMap<usize, Value>,
     /// The module whose globals the currently-running code resolves against —
@@ -1508,7 +1527,7 @@ pub struct PyHost {
     /// Arbitrary attributes assigned to a function object (`func.__dict__`), keyed
     /// by the function's heap id. CPython functions carry a writable dict; the
     /// stdlib uses it for `__isabstractmethod__`, `functools.wraps`, decorators.
-    pub func_attrs: HashMap<u32, IndexMap<String, Value>>,
+    pub func_attrs: HashMap<u32, NameMap>,
     /// Codec search functions registered by `_codecs.register` (the `encodings`
     /// package installs one at import), the resolved-codec cache keyed by
     /// normalized name, and user error handlers from `register_error`.
@@ -1574,7 +1593,7 @@ pub struct PyHost {
     /// `import x` returns the cached module object (CPython identity + run-once
     /// side effects) instead of re-executing the vendored `.py`. Populated by
     /// `import_module` on every successful import (native, vendored, or bridged).
-    modules: IndexMap<String, Value>,
+    modules: NameMap,
     /// The live `sys.modules` dict handle (set when `sys` is built). Kept in sync
     /// with the internal cache so Python-level `sys.modules[k] = v` (e.g. os.py's
     /// `sys.modules['os.path'] = path`) is honored by subsequent imports.
@@ -1991,7 +2010,7 @@ impl PyHost {
             classes: IndexMap::new(),
             mro_cache: std::cell::RefCell::new(HashMap::new()),
             tries: Vec::new(),
-            module_globals: vec![IndexMap::new()],
+            module_globals: vec![NameMap::default()],
             module_dicts: HashMap::new(),
             cur_module: 0,
             frames: vec![Frame {
@@ -2039,7 +2058,7 @@ impl PyHost {
             stdout_target: None,
             stderr_target: None,
             capture: None,
-            modules: IndexMap::new(),
+            modules: NameMap::default(),
             sys_modules: None,
             mt_states: HashMap::new(),
             atexit_callbacks: Vec::new(),
@@ -2248,7 +2267,7 @@ impl PyHost {
     /// [`PyObj::Dict`]) seeded from `attrs`. Every `PyObj::Instance` must be
     /// built through here so its `dict` field points at heap storage that
     /// `obj.__dict__` can hand back by handle (see [`Instance`]).
-    pub fn new_instance(&mut self, class: String, attrs: IndexMap<String, Value>) -> Value {
+    pub fn new_instance(&mut self, class: String, attrs: NameMap) -> Value {
         let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::with_capacity(attrs.len());
         for (k, v) in attrs {
             let kv = self.new_str(k.clone());
@@ -2618,8 +2637,8 @@ impl PyHost {
     /// flattened, inner scopes shadowing enclosing ones. This is the `locals()` a
     /// nested `eval`/`exec` reads from when called inside a function. Empty at
     /// module scope (its bindings are the globals, included separately).
-    pub fn caller_locals(&self) -> IndexMap<String, Value> {
-        let mut out: IndexMap<String, Value> = IndexMap::new();
+    pub fn caller_locals(&self) -> NameMap {
+        let mut out: NameMap = NameMap::default();
         if self.frames.len() <= 1 {
             return out;
         }
@@ -2735,13 +2754,13 @@ impl PyHost {
 
     /// The globals of the currently-running module (the `cur_module` slot).
     #[inline]
-    fn globals(&self) -> &IndexMap<String, Value> {
+    fn globals(&self) -> &NameMap {
         &self.module_globals[self.cur_module]
     }
 
     /// Mutable globals of the currently-running module.
     #[inline]
-    fn globals_mut(&mut self) -> &mut IndexMap<String, Value> {
+    fn globals_mut(&mut self) -> &mut NameMap {
         &mut self.module_globals[self.cur_module]
     }
 
@@ -2779,12 +2798,12 @@ impl PyHost {
     /// A specific module's namespace — the same map its functions read globals
     /// from, so a write here is visible to the module's own code.
     #[inline]
-    pub fn module_ns(&self, slot: usize) -> &IndexMap<String, Value> {
+    pub fn module_ns(&self, slot: usize) -> &NameMap {
         &self.module_globals[slot]
     }
 
     #[inline]
-    pub fn module_ns_mut(&mut self, slot: usize) -> &mut IndexMap<String, Value> {
+    pub fn module_ns_mut(&mut self, slot: usize) -> &mut NameMap {
         &mut self.module_globals[slot]
     }
 
@@ -2813,7 +2832,7 @@ impl PyHost {
     /// Allocate a fresh module-globals slot (its `__dict__`) and return its id.
     /// The slot is never freed — functions defined in the module keep resolving
     /// their globals through it for the life of the process.
-    pub fn new_module_slot(&mut self, ns: IndexMap<String, Value>) -> usize {
+    pub fn new_module_slot(&mut self, ns: NameMap) -> usize {
         let id = self.module_globals.len();
         self.module_globals.push(ns);
         id
@@ -3050,14 +3069,14 @@ impl PyHost {
     /// A clone of the whole module-global namespace — the save half of the
     /// save/replace/run/restore used by `eval`/`exec` with an explicit `globals`
     /// dict, so the caller's real globals are untouched by the evaluated code.
-    pub fn snapshot_globals(&self) -> IndexMap<String, Value> {
+    pub fn snapshot_globals(&self) -> NameMap {
         self.globals().clone()
     }
 
     /// Replace the module-global namespace wholesale (the restore/replace half of
     /// the `eval`/`exec` explicit-namespace flow). Builtins resolve through a
     /// separate registry, so they remain available regardless of this map.
-    pub fn replace_globals(&mut self, g: IndexMap<String, Value>) {
+    pub fn replace_globals(&mut self, g: NameMap) {
         *self.globals_mut() = g;
     }
 
@@ -11143,12 +11162,7 @@ impl PyHost {
     }
 
     /// Register a class built from a run class-body namespace.
-    pub fn register_class(
-        &mut self,
-        name: &str,
-        bases: Vec<String>,
-        ns: IndexMap<String, Value>,
-    ) -> Value {
+    pub fn register_class(&mut self, name: &str, bases: Vec<String>, ns: NameMap) -> Value {
         self.register_class_meta(name, bases, ns, "type")
     }
 
@@ -11158,7 +11172,7 @@ impl PyHost {
         &mut self,
         name: &str,
         bases: Vec<String>,
-        ns: IndexMap<String, Value>,
+        ns: NameMap,
         metaclass: &str,
     ) -> Value {
         // Classes live in ONE table keyed by bare name, so a class that shadows
@@ -11725,7 +11739,7 @@ fn new_subclass_or_bare(cname: &str, extra: &[Value]) -> Result<Value, String> {
         }));
     }
     Ok(with_host(|h| {
-        h.new_instance(cname.to_string(), IndexMap::new())
+        h.new_instance(cname.to_string(), NameMap::default())
     }))
 }
 
@@ -12486,7 +12500,7 @@ fn call_method_inner(
             let cls = args.first().cloned().unwrap_or(Value::Undef);
             match with_host(|h| h.get(&cls).cloned()) {
                 Some(PyObj::Class(cname)) => {
-                    Ok(with_host(|h| h.new_instance(cname, IndexMap::new())))
+                    Ok(with_host(|h| h.new_instance(cname, NameMap::default())))
                 }
                 _ => Err(type_error("object.__new__(X): X is not a type object")),
             }
@@ -12697,7 +12711,7 @@ pub fn instantiate_plain(
         with_host(|h| h.new_instance_payload(class.to_string(), payload))
     } else {
         with_host(|h| {
-            let mut attrs = IndexMap::new();
+            let mut attrs = NameMap::default();
             // `BaseException.__new__(cls, *args)` seeds `self.args` with the
             // constructor's positional args (overridable by `__init__`/super).
             if h.class_is_exception(class) {
@@ -12941,7 +12955,7 @@ fn bind_params(
     // A named `*args` (`Some(non-empty)`) soaks up extra positionals; a bare `*`
     // (`Some("")`, keyword-only marker) does not — extras are an error there.
     let has_vararg = def.star.as_deref().is_some_and(|s| !s.is_empty());
-    let mut vars: IndexMap<String, Value> = IndexMap::new();
+    let mut vars: NameMap = NameMap::default();
     let mut star_items = Vec::new();
     let npos = pos.len();
 
@@ -13429,7 +13443,7 @@ impl PyHost {
 /// Run a class-body function on a fresh class frame and return the namespace it
 /// binds (member/method names in definition order). Shared by the native
 /// `build_class` and the foreign-base (CPython metaclass) path.
-fn run_class_body(name: &str, body_func: &Value) -> Result<IndexMap<String, Value>, String> {
+fn run_class_body(name: &str, body_func: &Value) -> Result<NameMap, String> {
     let fv = match with_host(|h| h.get(body_func).cloned()) {
         Some(PyObj::Func(fv)) => fv,
         _ => return Err(type_error("internal: class body is not a function")),
@@ -13532,7 +13546,7 @@ pub fn build_class_foreign(
 /// it, in definition order — the descriptor-naming step CPython runs inside
 /// `type.__new__`. Enum members are created here (each `_proto_member`'s
 /// `__set_name__` builds the real member and records it in `_member_map_`).
-pub fn fire_set_name(class_name: &str, ns: &IndexMap<String, Value>) -> Result<(), String> {
+pub fn fire_set_name(class_name: &str, ns: &NameMap) -> Result<(), String> {
     for (attr_name, val) in ns {
         let fires = with_host(|h| match h.get(val) {
             Some(PyObj::Instance(i)) => h.class_lookup(&i.class, "__set_name__").is_some(),
@@ -13580,7 +13594,7 @@ fn slots_mention(slots: Option<&Value>, want: &str) -> bool {
     })
 }
 
-fn check_slots(class: &str, ns: &IndexMap<String, Value>) -> Result<(), String> {
+fn check_slots(class: &str, ns: &NameMap) -> Result<(), String> {
     let slots = match ns.get("__slots__") {
         Some(v) => v.clone(),
         None => return Ok(()),
@@ -13650,7 +13664,7 @@ pub fn build_class(
         Some(PyObj::Func(fv)) => with_host(|h| h.funcs[fv.def_id].clone()),
         _ => return Err(type_error("internal: class body is not a function")),
     };
-    let ns: IndexMap<String, Value> = run_class_body(name, body_func)?;
+    let ns: NameMap = run_class_body(name, body_func)?;
     check_slots(name, &ns)?;
     // The effective metaclass: the explicit `metaclass=` if given, else the most
     // derived metaclass inherited from the bases (CPython rule). A user metaclass
@@ -13733,7 +13747,7 @@ fn metaclass_create(
     meta: &str,
     name: &str,
     bases: &[String],
-    ns: &IndexMap<String, Value>,
+    ns: &NameMap,
     class_kwargs: &[(String, Value)],
 ) -> Result<Value, String> {
     let name_v = with_host(|h| h.new_str(name.to_string()));
@@ -13847,7 +13861,7 @@ pub fn raise_value(exc: &Value) -> Result<String, String> {
             Some(PyObj::Class(name)) => {
                 // Instantiate a user exception class with no args. An exception
                 // class seeds `self.args = ()` (`BaseException.__new__`).
-                let mut attrs = IndexMap::new();
+                let mut attrs = NameMap::default();
                 if h.class_is_exception(&name) {
                     let t = h.alloc(PyObj::Tuple(vec![]));
                     attrs.insert("args".to_string(), t);
@@ -15955,7 +15969,7 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
     let stdlib_entries: Option<Vec<(String, Value)>> = None;
     if let Some(entries) = stdlib_entries {
         return Ok(with_host(|h| {
-            let mut ns = IndexMap::new();
+            let mut ns = NameMap::default();
             for (k, v) in entries {
                 ns.insert(k, v);
             }
@@ -16067,7 +16081,7 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
         // natively against per-instance MT state.
         "_random" => with_host(|h| {
             if !h.classes.contains_key("_random.Random") {
-                let mut ns: IndexMap<String, Value> = IndexMap::new();
+                let mut ns: NameMap = NameMap::default();
                 for m in ["random", "seed", "getrandbits", "getstate", "setstate"] {
                     ns.insert(
                         m.to_string(),
@@ -16630,7 +16644,7 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                     .unwrap_or_default(),
             );
             let flags = {
-                let mut a: IndexMap<String, Value> = IndexMap::new();
+                let mut a: NameMap = NameMap::default();
                 for (k, v) in [
                     ("debug", 0),
                     ("inspect", 0),
@@ -16679,7 +16693,7 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
             // `sys.implementation` — a SimpleNamespace describing the interpreter
             // (its type is what the faithful `types.py` binds as SimpleNamespace).
             let implementation = {
-                let mut a: IndexMap<String, Value> = IndexMap::new();
+                let mut a: NameMap = NameMap::default();
                 let name = h.new_str("pythonrs");
                 let cache_tag = h.new_str(format!("pythonrs-{PY_MAJOR}{PY_MINOR}"));
                 let hexversion = ((PY_MAJOR) << 24) | ((PY_MINOR) << 16) | ((PY_MICRO) << 8) | 0xf0;
@@ -17003,7 +17017,7 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
         }
     };
     Ok(with_host(|h| {
-        let mut ns = IndexMap::new();
+        let mut ns = NameMap::default();
         for (k, v) in entries {
             ns.insert(k.to_string(), v);
         }
@@ -17228,7 +17242,7 @@ fn run_vendored_module(name: &str, src: &str, path: &std::path::Path) -> Result<
         };
         let package_v = h.new_str(&package);
         // Seed the module dunders CPython sets before executing the body.
-        let mut ns: IndexMap<String, Value> = IndexMap::new();
+        let mut ns: NameMap = NameMap::default();
         ns.insert("__name__".to_string(), name_v);
         ns.insert("__file__".to_string(), file_v);
         ns.insert("__package__".to_string(), package_v);

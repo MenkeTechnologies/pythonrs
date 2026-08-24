@@ -497,6 +497,34 @@ fn instance_defines(recv: &Value, name: &str) -> bool {
 fn b_getitem(vm: &mut VM, _: u8) -> Value {
     let idx = vm.pop();
     let recv = vm.pop();
+    // Fast path: a plain builtin SEQUENCE indexed by a plain integer — `a[i]`,
+    // the most common subscript there is, and the one every check below is
+    // irrelevant to.
+    //
+    // A `list`/`tuple`/`str`/`bytes` can never be an instance with a
+    // `__getitem__`, a class with `__class_getitem__`, a metaclass-subscripted
+    // type, a dict subclass with `__missing__`, a foreign CPython object, or a
+    // generic alias — yet each of those was consulted first, and every one takes
+    // its own thread-local host borrow. So did the `__index__` coercion and the
+    // instance-key walk, neither of which an `Int` index and a sequence receiver
+    // can need. That is roughly ten borrows and two lookups to reach one `Vec`
+    // index; this reaches it in ONE borrow.
+    //
+    // A SUBCLASS of any of these types is a `PyObj::Instance` carrying the
+    // payload, not the payload itself, so it does not match here and keeps the
+    // full path — which is what makes skipping the overrides sound.
+    if matches!(idx, Value::Int(_) | Value::Bool(_)) {
+        let fast = with_host(|h| {
+            matches!(
+                h.get(&recv),
+                Some(PyObj::List(_) | PyObj::Tuple(_) | PyObj::Str(_) | PyObj::Bytes(_))
+            )
+            .then(|| h.get_item(&recv, &idx))
+        });
+        if let Some(r) = fast {
+            return finish(vm, r);
+        }
+    }
     // __getitem__ on instances.
     if instance_defines(&recv, "__getitem__") {
         let r = host::call_method(&recv, "__getitem__", vec![idx], vec![]);
@@ -4372,7 +4400,7 @@ pub fn call_builtin_function(
             _ => None,
         });
         return match cname {
-            Some(c) => Ok(with_host(|h| h.new_instance(c, IndexMap::new()))),
+            Some(c) => Ok(with_host(|h| h.new_instance(c, host::NameMap::default()))),
             None => Err(host::type_error(
                 "object.__new__(X): X is not a type object",
             )),
@@ -5015,7 +5043,7 @@ pub fn call_builtin_function(
                 return Err(host::type_error("no positional arguments expected"));
             }
             Ok(with_host(|h| {
-                let mut attrs = indexmap::IndexMap::new();
+                let mut attrs = host::NameMap::default();
                 for (k, v) in kwargs {
                     attrs.insert(k, v);
                 }
@@ -5607,7 +5635,7 @@ pub fn call_builtin_function(
             host::open_file(&path, &mode)
         }
         "object" => Ok(with_host(|h| {
-            h.new_instance("object".into(), IndexMap::new())
+            h.new_instance("object".into(), host::NameMap::default())
         })),
         // An inline-Rust export reached as a resolved builtin object rather
         // than by name (the CALL protocol resolves its callee first).
@@ -5765,7 +5793,7 @@ fn run_pysource(want_value: bool, args: &[Value]) -> Result<Value, String> {
 
     // Capture the overlay namespace (module globals + caller locals) BEFORE
     // parking frames, since `caller_locals` reads the innermost (calling) frame.
-    let overlay_base: Option<IndexMap<String, Value>> = if !explicit_ns && in_function {
+    let overlay_base: Option<host::NameMap> = if !explicit_ns && in_function {
         let mut base = with_host(|h| h.snapshot_globals());
         for (k, v) in with_host(|h| h.caller_locals()) {
             base.insert(k, v);
@@ -5788,9 +5816,9 @@ fn run_pysource(want_value: bool, args: &[Value]) -> Result<Value, String> {
     // real module globals and discards the writes.
     // Names the namespace already held, so the writeback below can tell a binding
     // the code MADE from one it merely read.
-    let mut pre_existing: IndexMap<String, Value> = IndexMap::new();
+    let mut pre_existing: host::NameMap = host::NameMap::default();
     let fresh_mod: Option<usize> = if explicit_ns {
-        let mut ns: IndexMap<String, Value> = IndexMap::new();
+        let mut ns: host::NameMap = host::NameMap::default();
         for d in [globals_arg.as_ref(), locals_arg.as_ref()]
             .into_iter()
             .flatten()
@@ -5807,7 +5835,7 @@ fn run_pysource(want_value: bool, args: &[Value]) -> Result<Value, String> {
     } else {
         None
     };
-    let overlay_saved: Option<IndexMap<String, Value>> = if let Some(base) = overlay_base {
+    let overlay_saved: Option<host::NameMap> = if let Some(base) = overlay_base {
         let snap = with_host(|h| h.snapshot_globals());
         with_host(|h| h.replace_globals(base));
         Some(snap)
@@ -11865,13 +11893,13 @@ pub fn type_new_meta(
         }
         _ => None,
     });
-    let namespace: IndexMap<String, Value> =
+    let namespace: host::NameMap =
         with_host(|h| match dict_handle.as_ref().and_then(|d| h.get(d)) {
             Some(PyObj::Dict(d)) => d
                 .values()
                 .filter_map(|(k, v)| h.as_str(k).map(|s| (s, v.clone())))
                 .collect(),
-            _ => IndexMap::new(),
+            _ => host::NameMap::default(),
         });
     let cls =
         with_host(|h| h.register_class_meta(&cname, base_names, namespace.clone(), metaclass));
