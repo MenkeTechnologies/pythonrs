@@ -99,8 +99,7 @@ fn run(bin: &Path, path: &Path) -> (Vec<u8>, Vec<u8>, Option<i32>) {
 fn final_line(err: &[u8]) -> String {
     String::from_utf8_lossy(err)
         .lines()
-        .filter(|l| !l.trim().is_empty())
-        .next_back()
+        .rfind(|l| !l.trim().is_empty())
         .unwrap_or("")
         .to_string()
 }
