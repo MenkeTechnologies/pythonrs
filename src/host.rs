@@ -4700,9 +4700,9 @@ impl PyHost {
             return true;
         }
         match self.get(v) {
-            Some(PyObj::Instance(_)) => self
-                .base_payload_num(v)
-                .is_some_and(|p| self.is_bignum(&p)),
+            Some(PyObj::Instance(_)) => {
+                self.base_payload_num(v).is_some_and(|p| self.is_bignum(&p))
+            }
             _ => false,
         }
     }
@@ -6461,16 +6461,16 @@ impl PyHost {
                     (Some(_), Some(0.0)) => Err("ZeroDivisionError: division by zero".into()),
                     (Some(x), Some(y)) => Ok(Value::Float(x / y)),
                     _ if self.is_complex(a) || self.is_complex(b) => {
-                    match (self.complex_val(a), self.complex_val(b)) {
-                        (Some((ar, ai)), Some((br, bi))) => {
-                            if br == 0.0 && bi == 0.0 {
-                                return Err("ZeroDivisionError: division by zero".into());
+                        match (self.complex_val(a), self.complex_val(b)) {
+                            (Some((ar, ai)), Some((br, bi))) => {
+                                if br == 0.0 && bi == 0.0 {
+                                    return Err("ZeroDivisionError: division by zero".into());
+                                }
+                                let (rr, ri) = c_quot(ar, ai, br, bi);
+                                Ok(self.alloc(PyObj::Complex(rr, ri)))
                             }
-                            let (rr, ri) = c_quot(ar, ai, br, bi);
-                            Ok(self.alloc(PyObj::Complex(rr, ri)))
+                            _ => Err(self.optype_err("/", a, b)),
                         }
-                        _ => Err(self.optype_err("/", a, b)),
-                    }
                     }
                     _ => Err(self.optype_err("/", a, b)),
                 }

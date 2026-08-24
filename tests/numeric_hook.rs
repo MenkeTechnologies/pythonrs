@@ -409,7 +409,10 @@ fn a_negative_base_with_an_infinite_exponent_stays_real() {
     assert_eq!(gx("x = (-2.0) ** float('inf')"), "inf");
     assert_eq!(gx("x = (-2.0) ** float('-inf')"), "0.0");
     // The guard itself must still fire for a FINITE non-integer exponent.
-    assert_eq!(gx("x = (-8.0) ** (1/3)"), "(1.0000000000000002+1.7320508075688772j)");
+    assert_eq!(
+        gx("x = (-8.0) ** (1/3)"),
+        "(1.0000000000000002+1.7320508075688772j)"
+    );
 }
 
 /// Every index-taking builtin words a non-integer argument the same way, naming
