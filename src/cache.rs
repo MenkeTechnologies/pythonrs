@@ -9,9 +9,10 @@
 //! a zero-copy rkyv archive (`Shard`), validated on load; each *inner* entry blob
 //! is a bincode-encoded `CProg` (the compiled `fusevm::Chunk`s + func/try
 //! tables), because `fusevm::Chunk` is serde-owned, not `rkyv::Archive`. The key
-//! is a 64-bit hash of the source plus a schema version plus the build's
-//! `CARGO_PKG_VERSION`, so a source, format, or release change misses cleanly
-//! instead of loading stale bytecode.
+//! is a 64-bit hash of the source, a schema version, the build's
+//! `CARGO_PKG_VERSION`, and a fingerprint of the running executable, so a
+//! source, format, release, or REBUILD change misses cleanly instead of loading
+//! stale bytecode.
 
 use crate::ast::Span;
 use crate::compiler::Program;
@@ -196,22 +197,57 @@ fn restore_op_hash(chunk: &mut Chunk) {
 /// The release this binary was built as. It is hashed into every cache key
 /// alongside [`SCHEMA`], so a shard written by one release can never be read by
 /// another.
-///
-/// `SCHEMA` alone is not enough, because it is bumped BY HAND. Every codegen
-/// change is supposed to bump it; the one that does not ships a binary that
-/// silently executes the previous release's bytecode out of
-/// `~/.pythonrs/scripts.rkyv` — right answer, wrong program, no error, and the
-/// symptom is "my change did not take". The version is bumped by the release
-/// itself, so it closes that window without anyone having to remember. `SCHEMA`
-/// still earns its keep WITHIN a version: it is what invalidates the cache
-/// between two dev builds that share `0.1.2`.
 const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// A fingerprint of the RUNNING BINARY — its own size and modification time.
+///
+/// This is what actually keeps the cache honest between two builds, and neither
+/// of the other two key components can do it:
+///
+/// * [`BUILD_VERSION`] only changes at a release. Every build in between shares
+///   it.
+/// * [`SCHEMA`] is bumped BY HAND. Every lowering change is *supposed* to bump
+///   it, and the one that forgets ships a binary that silently executes the
+///   PREVIOUS build's bytecode out of `~/.pythonrs/scripts.rkyv`. There is no
+///   error and no wrong answer to chase — the program simply behaves as it did
+///   before the change, and the symptom is "my fix did not take".
+///
+/// That is not hypothetical: a compiler change that began emitting a
+/// `SyntaxWarning` appeared to do nothing for any script already in the shard,
+/// on a binary rebuilt seconds earlier, because the key had no term that a
+/// rebuild moves. Every script cached before the change kept its old bytecode
+/// until the shard was cleared by hand.
+///
+/// Size and mtime rather than a content hash of the executable: the binary is
+/// ~57 MB, and hashing it on every run would cost far more than the compile the
+/// cache exists to skip. A rebuild always moves the mtime, and an installed
+/// release binary holds both steady, which is exactly the wanted behavior on
+/// each side. If the executable cannot be located the fingerprint is `0` and the
+/// key falls back to the previous `SCHEMA` + version pair — no worse than before.
+fn build_fingerprint() -> u64 {
+    static FINGERPRINT: once_cell::sync::Lazy<u64> = once_cell::sync::Lazy::new(|| {
+        use std::collections::hash_map::DefaultHasher;
+        let Ok(meta) = std::env::current_exe().and_then(std::fs::metadata) else {
+            return 0;
+        };
+        let mut h = DefaultHasher::new();
+        meta.len().hash(&mut h);
+        if let Ok(t) = meta.modified() {
+            if let Ok(d) = t.duration_since(std::time::UNIX_EPOCH) {
+                d.as_nanos().hash(&mut h);
+            }
+        }
+        h.finish()
+    });
+    *FINGERPRINT
+}
 
 /// A stable content key for a source string (fast `FxHash`, used for lookup).
 pub fn key_for(src: &str) -> u64 {
     let mut h = rustc_hash::FxHasher::default();
     SCHEMA.hash(&mut h);
     BUILD_VERSION.hash(&mut h);
+    build_fingerprint().hash(&mut h);
     src.hash(&mut h);
     h.finish()
 }
@@ -223,6 +259,7 @@ fn verify_for(src: &str) -> u64 {
     let mut h = DefaultHasher::new();
     SCHEMA.hash(&mut h);
     BUILD_VERSION.hash(&mut h);
+    build_fingerprint().hash(&mut h);
     src.len().hash(&mut h);
     src.hash(&mut h);
     h.finish()
