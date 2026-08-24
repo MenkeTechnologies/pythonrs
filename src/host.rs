@@ -4712,7 +4712,7 @@ impl PyHost {
     ///
     /// CPython reads an `int` operand through `PyLong_AsDouble`, which RAISES
     /// once the magnitude is past the `f64` range rather than saturating to
-    /// `inf`. [`num_val`] saturates deliberately — it also backs comparison,
+    /// `inf`. `num_val` saturates deliberately — it also backs comparison,
     /// where CPython never converts and `(2**2000) > 1.0` must stay `True` — so
     /// arithmetic needs this checked form. Reading the saturated value instead
     /// made `(2**2000) * 1.0` answer `inf` and `(2**2000) // 1.0` answer `nan`,
