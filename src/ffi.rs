@@ -69,8 +69,15 @@ fn type_handles() -> &'static Mutex<rustc_hash::FxHashMap<usize, u32>> {
 /// Resolve the CPython prefix to hand to `PYTHONHOME`, or `None` to let the
 /// linked libpython locate its own stdlib (the system-CPython path).
 ///
-/// Order: `PYTHONRS_STDLIB` env → bundled `<exe_dir>/../lib/python3.*` →
-/// per-user `~/.pythonrs/lib/python3.*` (the `install.sh` target) → system.
+/// Order: `PYTHONRS_STDLIB` env → bundled `<exe_dir>/../lib/python3.*` → the
+/// same probe through the RESOLVED exe path → per-user `~/.pythonrs/lib/python3.*`
+/// (the `install.sh` target) → an inherited `PYTHONHOME` → system.
+///
+/// The resolved-exe probe is not a duplicate of the first one. `current_exe()`
+/// on macOS reports the path the process was INVOKED by, symlinks intact, and
+/// Homebrew installs pythonrs as `bin/python -> ../libexec/bin/python`. Probing
+/// only the invoked path therefore asked whether `/opt/homebrew/lib/python3.*`
+/// was a stdlib — see [`has_stdlib`] for why the answer used to be "yes".
 fn resolve_home() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("PYTHONRS_STDLIB") {
         return Some(PathBuf::from(p));
@@ -78,8 +85,11 @@ fn resolve_home() -> Option<PathBuf> {
     // A bundled tree next to the binary (`<prefix>/bin/python`,
     // `<prefix>/lib/python3.*`); `PYTHONHOME` wants the prefix (`<exe>/..`).
     if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            if let Some(prefix) = dir.parent() {
+        for candidate in [Some(exe.clone()), std::fs::canonicalize(&exe).ok()]
+            .into_iter()
+            .flatten()
+        {
+            if let Some(prefix) = candidate.parent().and_then(|d| d.parent()) {
                 if has_stdlib(prefix) {
                     return Some(prefix.to_path_buf());
                 }
@@ -94,36 +104,157 @@ fn resolve_home() -> Option<PathBuf> {
             return Some(prefix);
         }
     }
+    // An inherited `PYTHONHOME` is the caller's explicit instruction, so it is
+    // honoured — but only when it really holds a stdlib. Returning it here also
+    // means the caller's value is never silently overwritten by one of ours.
+    if let Some(p) = std::env::var_os("PYTHONHOME") {
+        let prefix = PathBuf::from(p);
+        if has_stdlib(&prefix) {
+            return Some(prefix);
+        }
+    }
     None
 }
 
-/// Whether `prefix/lib/python3.*` (the stdlib tree) exists under `prefix`.
+/// Whether `prefix/lib/python3.*` is a REAL stdlib tree.
+///
+/// The directory existing is not enough, and the difference is the whole bug
+/// this function exists to prevent. Homebrew's `/opt/homebrew/lib/python3.14`
+/// exists on every Mac that has `python@3.14` installed and contains exactly one
+/// entry — `site-packages`. No `encodings`, no `os.py`. Accepting it as a stdlib
+/// set `PYTHONHOME=/opt/homebrew`, and CPython then aborted the whole process
+/// with `Fatal Python error: Failed to import encodings module` before pythonrs
+/// could report anything.
+///
+/// `encodings/__init__.py` is the file whose absence produces that exact fatal
+/// error, and `os.py` is what `Py_Initialize` looks for to confirm a prefix, so
+/// the two together are the check CPython itself is about to make.
 fn has_stdlib(prefix: &std::path::Path) -> bool {
-    let libdir = prefix.join("lib");
-    std::fs::read_dir(&libdir)
-        .map(|entries| {
-            entries.flatten().any(|e| {
-                e.file_name()
-                    .to_str()
-                    .is_some_and(|n| n.starts_with("python3."))
-                    && e.path().is_dir()
-            })
-        })
-        .unwrap_or(false)
+    stdlib_dir(prefix).is_some()
 }
+
+/// The `prefix/lib/python3.*` directory that is a usable stdlib, if any.
+fn stdlib_dir(prefix: &std::path::Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(prefix.join("lib")).ok()?;
+    entries.flatten().map(|e| e.path()).find(|p| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("python3."))
+            && p.join("encodings/__init__.py").is_file()
+            && p.join("os.py").is_file()
+    })
+}
+
+/// The error every bridged entry point reports when the embedded interpreter
+/// cannot be started.
+///
+/// Deliberately an ordinary `ModuleNotFoundError`, byte-identical to the one a
+/// genuinely absent module produces: it is catchable, it leaves the session
+/// alive, and `try: import x / except ImportError:` — the shape every optional
+/// dependency is written with — takes the branch it is supposed to take.
+fn bridge_unavailable(name: &str) -> String {
+    format!("ModuleNotFoundError: No module named '{name}'")
+}
+
+/// The install prefix of the libpython this binary is actually linked against,
+/// derived from the loaded shared object's own path (`<prefix>/lib/libpython3.X`).
+///
+/// Used only to decide whether starting the interpreter is safe when pythonrs
+/// has no stdlib of its own to point at. `dlsym`/`dladdr` are asked rather than
+/// taking a symbol's address directly, because the address of an imported
+/// function in this binary can be a stub that resolves back to this binary.
+#[cfg(unix)]
+fn linked_libpython_prefix() -> Option<PathBuf> {
+    use std::ffi::{CStr, CString, OsStr};
+    use std::os::unix::ffi::OsStrExt;
+
+    let sym = CString::new("Py_IsInitialized").ok()?;
+    // SAFETY: `dlsym` on the global handle with a NUL-terminated name, and
+    // `dladdr` on the pointer it returned. Both are read-only lookups, and
+    // `dli_fname` is owned by the loader and valid for the process lifetime.
+    let path = unsafe {
+        let addr = libc::dlsym(libc::RTLD_DEFAULT, sym.as_ptr());
+        if addr.is_null() {
+            return None;
+        }
+        let mut info: libc::Dl_info = std::mem::zeroed();
+        if libc::dladdr(addr, &mut info) == 0 || info.dli_fname.is_null() {
+            return None;
+        }
+        PathBuf::from(OsStr::from_bytes(CStr::from_ptr(info.dli_fname).to_bytes()))
+    };
+    // `<prefix>/lib/libpython3.X.{dylib,so}` — the prefix is two levels up.
+    path.parent()?.parent().map(PathBuf::from)
+}
+
+/// Non-Unix has no `dladdr`; "unknown" is reported, and [`init`] proceeds as it
+/// always did rather than refusing to start on a platform it cannot inspect.
+#[cfg(not(unix))]
+fn linked_libpython_prefix() -> Option<PathBuf> {
+    None
+}
+
+/// Whether the embedded interpreter can be started at all.
+///
+/// `false` means every `import` of a bridged module raises a catchable
+/// `ModuleNotFoundError` instead of starting CPython. See [`init`].
+static BRIDGE_USABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Initialize the embedded interpreter once, after pinning `PYTHONHOME` so the
 /// stdlib resolves to the intended (bundled or system) tree. Idempotent.
-pub fn init() {
+///
+/// Returns `false` when the interpreter is not usable, which the callers turn
+/// into an ordinary `ImportError`. **Failing to start CPython must never end the
+/// process.** `Py_Initialize` reports its own failures through `Py_FatalError`,
+/// which prints to stderr and calls `abort()`: there is no error to catch and no
+/// stack to unwind, so an interactive session is simply gone — the user is
+/// dropped back to their shell mid-line, and the next thing they type is eaten
+/// by the shell. That outcome is not acceptable for any cause, so the decision is
+/// made HERE, before CPython is started, by checking exactly what CPython is
+/// about to check.
+///
+/// A `None` home is still initialised: that is the system-CPython path, where
+/// the linked libpython finds its own compiled-in prefix and pythonrs has
+/// nothing better to offer than letting it try.
+pub fn init() -> bool {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        if let Some(home) = resolve_home() {
+        // An explicit override that is not a stdlib is a hard stop. Honouring it
+        // aborts the process, and quietly ignoring it would run against some
+        // other tree than the one the caller named — so neither is done.
+        if let Some(p) = std::env::var_os("PYTHONRS_STDLIB") {
+            if !has_stdlib(std::path::Path::new(&p)) {
+                BRIDGE_USABLE.store(false, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+        }
+        match resolve_home() {
             // Set before the interpreter starts — CPython reads it at init only.
-            std::env::set_var("PYTHONHOME", home);
+            Some(home) => std::env::set_var("PYTHONHOME", home),
+            None => {
+                // Nothing we found is usable. An inherited `PYTHONHOME` that did
+                // NOT survive `resolve_home` is a broken one, and leaving it set
+                // is precisely what aborts, so it is removed rather than trusted.
+                if std::env::var_os("PYTHONHOME").is_some() {
+                    std::env::remove_var("PYTHONHOME");
+                }
+                // With no home of our own, CPython falls back to the prefix
+                // compiled into the libpython we are linked against. When THAT
+                // has no stdlib either there is nothing left to try, and starting
+                // the interpreter would abort the process, so the bridge is
+                // declared unusable instead and every import reports it.
+                if let Some(prefix) = linked_libpython_prefix() {
+                    if !has_stdlib(&prefix) {
+                        BRIDGE_USABLE.store(false, std::sync::atomic::Ordering::Relaxed);
+                        return;
+                    }
+                }
+            }
         }
         pyo3::prepare_freethreaded_python();
         line_buffer_std_streams();
     });
+    BRIDGE_USABLE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Line-buffer the embedded interpreter's `sys.stdout`/`sys.stderr`.
@@ -169,7 +300,10 @@ fn line_buffer_std_streams() {
 /// itself, `None` → 0, a str printed to stderr → 1); any other uncaught exception
 /// prints the CPython traceback and returns 1.
 pub fn run_module(modname: &str, args: &[String]) -> i32 {
-    init();
+    if !init() {
+        eprintln!("python: {}", bridge_unavailable("<module>"));
+        return 1;
+    }
     Python::with_gil(|py| {
         let sys = match py.import("sys") {
             Ok(m) => m,
@@ -426,7 +560,9 @@ pub fn import(name: &str) -> Result<u32, String> {
     {
         return Ok(id);
     }
-    init();
+    if !init() {
+        return Err(bridge_unavailable(name));
+    }
     apply_pending_search_paths();
     Python::with_gil(|py| match py.import(name) {
         Ok(module) => {
@@ -569,7 +705,9 @@ pub fn build_foreign_class(
     bases: &[Value],
     members: &[(String, Value)],
 ) -> Result<Value, String> {
-    init();
+    if !init() {
+        return Err(bridge_unavailable(name));
+    }
     Python::with_gil(|py| {
         // Marshal bases + members under a short host borrow; the metaclass call
         // runs with none held (a method body may re-enter fusevm).
