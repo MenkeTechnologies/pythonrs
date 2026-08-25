@@ -1115,6 +1115,31 @@ fn b_mkdict_ex(vm: &mut VM, argc: u8) -> Value {
 // ── truthiness / str / format ────────────────────────────────────────────────
 
 /// Python truthiness with instance dunder dispatch: `__bool__`, else `__len__`,
+/// Validate a user `__len__` result the way CPython's `PyObject_Size` does.
+///
+/// Every failure mode has its own exception, and pythonrs had none of them: it
+/// ran `as_int(...).unwrap_or(0)`, so `__len__` returning a string, or a number
+/// too large for an index, silently became a length of ZERO -- `len(obj)` and
+/// `bool(obj)` both answered as though the object were empty. A negative result
+/// was passed through unchecked, which `len()` then reported as a negative
+/// length. Silent wrong answers, all three.
+///
+/// `bool(obj)` validates too: with no `__bool__`, truth comes from `__len__`,
+/// so CPython raises the same errors from `bool()` as from `len()`.
+fn len_result(r: &Value) -> Result<usize, String> {
+    let Some(n) = with_host(|h| h.big_val(r)) else {
+        return Err(host::type_error(&format!(
+            "'{}' object cannot be interpreted as an integer",
+            with_host(|h| h.type_name(r))
+        )));
+    };
+    if n.sign() == num_bigint::Sign::Minus {
+        return Err("ValueError: __len__() should return >= 0".to_string());
+    }
+    usize::try_from(&n)
+        .map_err(|_| "OverflowError: cannot fit 'int' into an index-sized integer".to_string())
+}
+
 /// else the host's structural truthiness. Used by the TRUTHY op, `bool()`,
 /// `any`/`all`/`filter`.
 fn py_bool(v: &Value) -> Result<bool, String> {
@@ -1131,7 +1156,7 @@ fn py_bool(v: &Value) -> Result<bool, String> {
     }
     if has_len {
         let x = host::call_method(v, "__len__", vec![], vec![])?;
-        return Ok(with_host(|h| h.truthy(&x)));
+        return Ok(len_result(&x)? != 0);
     }
     // A CPython `Foreign` object (stdlib-ffi): run its `__bool__`/`__len__` in
     // CPython OUTSIDE the borrow so a `@dataclass` with a user dunder can re-enter.
@@ -6256,7 +6281,7 @@ pub fn py_len(v: &Value) -> Result<usize, String> {
         // __len__ on instances.
         if with_host(|h| matches!(h.get(v), Some(PyObj::Instance(_)))) {
             let r = host::call_method(v, "__len__", vec![], vec![])?;
-            Ok(with_host(|h| h.as_int(&r)).unwrap_or(0) as usize)
+            len_result(&r)
         } else {
             Err(e)
         }

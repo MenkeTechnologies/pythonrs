@@ -15265,6 +15265,57 @@ pub fn gen_throw(gen: &Value, exc: Value) -> Result<Option<Value>, String> {
 /// body raised. Preserves the shared host: the coroutine is taken out so the
 /// body re-enters `with_host` freely, and the volatile context is swapped so the
 /// caller's frames/signal survive the switch.
+/// PEP 479: a `StopIteration` escaping a generator BODY becomes a `RuntimeError`.
+///
+/// Without it an accidental `StopIteration` inside a generator -- most often a
+/// bare `next(it)` on an exhausted iterator -- is indistinguishable from the
+/// generator returning, so it silently ends whatever loop is driving it instead
+/// of reporting a bug. pythonrs propagated it unchanged, so `list(gen())`
+/// raised `StopIteration` where CPython raises
+/// `RuntimeError: generator raised StopIteration`.
+///
+/// The original is kept as `__cause__`, as CPython does, so the traceback still
+/// shows where it came from.
+fn pep479_replace(e: String) -> String {
+    if e != "StopIteration" && !e.starts_with("StopIteration:") && !e.starts_with("StopIteration\n")
+    {
+        return e;
+    }
+    with_host(|h| {
+        // The live exception is the original `StopIteration` when the unwind
+        // left it there; when it did not, it is rebuilt from the message so the
+        // `__cause__` chain is never empty.
+        let live = h.exc.clone().filter(|x| {
+            matches!(h.get(x), Some(PyObj::Exception { class, .. }) if class == "StopIteration")
+        });
+        let cause = match live {
+            Some(x) => x,
+            None => {
+                let detail = e
+                    .strip_prefix("StopIteration:")
+                    .map(str::trim)
+                    .filter(|m| !m.is_empty());
+                let args = match detail {
+                    Some(m) => vec![h.new_str(m)],
+                    None => vec![],
+                };
+                h.alloc(PyObj::Exception {
+                    class: "StopIteration".into(),
+                    args,
+                })
+            }
+        };
+        let msg = h.new_str("generator raised StopIteration");
+        let rt = h.alloc(PyObj::Exception {
+            class: "RuntimeError".into(),
+            args: vec![msg],
+        });
+        h.set_exc_link(&rt, cause, Value::Undef);
+        h.exc = Some(rt);
+    });
+    "RuntimeError: generator raised StopIteration".to_string()
+}
+
 pub fn gen_resume(gen: &Value, send: Value) -> Result<Option<Value>, String> {
     let id = match with_host(|h| h.get(gen).cloned()) {
         Some(PyObj::Generator { id }) => id,
@@ -15297,7 +15348,7 @@ pub fn gen_resume(gen: &Value, send: Value) -> Result<Option<Value>, String> {
             with_host(|h| h.generators[id as usize].done = true);
             match r {
                 Ok(_) => Ok(None),
-                Err(e) => Err(e),
+                Err(e) => Err(pep479_replace(e)),
             }
         }
     }

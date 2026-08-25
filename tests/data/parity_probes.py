@@ -545,3 +545,50 @@ for expr in ["hash(OnlyEq())", "hash(NoneHash())", "hash(SubDropsHash(1))"]:
         print(expr, "-> NO-RAISE")
     except TypeError as e:
         print(expr, "->", e)
+#==#
+# ── a user __len__ result is validated, and PEP 479 ─────────────────────────
+# Each way `__len__` can be wrong has its own exception, and `bool()` raises
+# the same ones because with no `__bool__` truth comes from `__len__`.
+class NegLen:
+    def __len__(self):
+        return -1
+class HugeLen:
+    def __len__(self):
+        return 2 ** 70
+class StrLen:
+    def __len__(self):
+        return "x"
+class OkLen:
+    def __len__(self):
+        return 3
+for cls in (NegLen, HugeLen, StrLen, OkLen):
+    for fn in (len, bool):
+        try:
+            print(cls.__name__, fn.__name__, "->", fn(cls()))
+        except (ValueError, TypeError, OverflowError) as e:
+            print(cls.__name__, fn.__name__, "->", type(e).__name__ + ":", e)
+# PEP 479: a StopIteration escaping a generator BODY becomes RuntimeError, so an
+# accidental one cannot masquerade as the generator returning.
+def raises_stop():
+    yield 1
+    raise StopIteration("inner")
+def exhausts_iterator():
+    yield 1
+    next(iter([]))
+def returns_normally():
+    yield 1
+    return
+for gen in (raises_stop, exhausts_iterator):
+    try:
+        print(gen.__name__, "->", list(gen()))
+    except RuntimeError as e:
+        print(gen.__name__, "->", type(e).__name__ + ":", e, "| cause:", type(e.__cause__).__name__)
+    except StopIteration as e:
+        print(gen.__name__, "-> LEAKED StopIteration:", e)
+print(list(returns_normally()))
+def catches_its_own():
+    try:
+        next(iter([]))
+    except StopIteration:
+        yield "handled"
+print(list(catches_its_own()))
