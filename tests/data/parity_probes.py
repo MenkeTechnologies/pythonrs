@@ -710,3 +710,15 @@ for label, fn in [("vars slotted", lambda: vars(r)),
         print(label, "-> NO-RAISE")
     except (AttributeError, TypeError) as ex:
         print(label, "->", type(ex).__name__ + ":", ex)
+#==#
+# ── a module carries the dunders its KIND carries ───────────────────────────
+# `sys` is compiled into the interpreter in both implementations, so it is the
+# one module whose shape can be compared directly. A builtin has no `__file__`;
+# everything else here it does have.
+import sys
+print(sorted(k for k in ("__name__", "__doc__", "__package__", "__loader__",
+                         "__spec__") if hasattr(sys, k)))
+print(sys.__name__, repr(sys.__package__), hasattr(sys, "__file__"))
+# A module loaded FROM a file has one, and it is that file.
+import os.path
+print(os.path.__name__, hasattr(os.path, "__file__"))

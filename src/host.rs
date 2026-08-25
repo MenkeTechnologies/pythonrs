@@ -16548,6 +16548,45 @@ fn try_import_user_path(name: &str) -> Option<Result<Value, String>> {
     None
 }
 
+/// Seed the dunders a natively-backed module presents, then let its own entries
+/// override any of them.
+///
+/// A pythonrs native module is compiled INTO the interpreter, which makes it a
+/// builtin module in CPython's sense -- the same category as `sys` -- and this
+/// is the set a CPython builtin carries. Before this, a native module's
+/// namespace held nothing but its functions: `vars(re)` was `[]` against
+/// CPython's 11 entries, and `re.__doc__`/`__package__`/`__spec__` were all
+/// `AttributeError`. (`__name__` alone worked, resolved from the module object
+/// rather than the namespace, which is why the gap was easy to miss.)
+///
+/// **There is deliberately no `__file__`.** CPython gives one to a module that
+/// was LOADED from a file and withholds it from a builtin, and `re` here is the
+/// Rust `regex` engine, not `pylib/re/__init__.py`. Pointing `__file__` at that
+/// file would name source that does not run -- it would send a reader, a
+/// traceback, or `inspect.getsource` to the wrong code. Absent is the accurate
+/// answer, and it is the same answer CPython gives for `sys`.
+///
+/// `__loader__`/`__spec__` are `None` rather than import-machinery objects.
+/// `None` is a value CPython itself uses for a module created without a spec, so
+/// it reports "no import machinery here" without inventing a loader that does
+/// not exist.
+fn seed_module_dunders(h: &mut PyHost, ns: &mut NameMap, name: &str) {
+    let doc = Value::Undef;
+    // A native module is never a package, so its `__package__` is the parent
+    // path -- empty for a top-level name, as CPython's `sys.__package__` is.
+    let package = match name.rsplit_once('.') {
+        Some((parent, _)) => parent.to_string(),
+        None => String::new(),
+    };
+    let name_v = h.new_str(name.to_string());
+    let package_v = h.new_str(package);
+    ns.insert("__name__".to_string(), name_v);
+    ns.insert("__doc__".to_string(), doc);
+    ns.insert("__package__".to_string(), package_v);
+    ns.insert("__loader__".to_string(), Value::Undef);
+    ns.insert("__spec__".to_string(), Value::Undef);
+}
+
 fn import_module_inner(name: &str) -> Result<Value, String> {
     // `collections.abc` is an alias for the pure-Python `_collections_abc`
     // module; CPython wires it with `sys.modules['collections.abc'] =
@@ -16626,6 +16665,7 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
     if let Some(entries) = stdlib_entries {
         return Ok(with_host(|h| {
             let mut ns = NameMap::default();
+            seed_module_dunders(h, &mut ns, name);
             for (k, v) in entries {
                 ns.insert(k, v);
             }
@@ -17674,6 +17714,7 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
     };
     Ok(with_host(|h| {
         let mut ns = NameMap::default();
+        seed_module_dunders(h, &mut ns, name);
         for (k, v) in entries {
             ns.insert(k.to_string(), v);
         }
