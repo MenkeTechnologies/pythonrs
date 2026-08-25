@@ -5488,6 +5488,19 @@ fn value_can_collapse(h: &PyHost, k: &Value) -> bool {
     }
 }
 
+impl PyHost {
+    /// Whether `k` is a key that can NEVER collapse onto an existing value-equal
+    /// entry, so the candidate scan `with_instance_key` performs is guaranteed
+    /// to come back empty and the whole detour can be skipped.
+    ///
+    /// The inverse of [`value_can_collapse`], exposed so the container-op fast
+    /// paths test exactly the same condition the slow path would, rather than
+    /// re-deriving a weaker approximation of it.
+    pub fn key_cannot_collapse(&self, k: &Value) -> bool {
+        !value_can_collapse(self, k)
+    }
+}
+
 /// Prepare an instance key for a container op, run `f` (the borrowed access that
 /// calls `to_key`), then clear the pending table. `candidates` collapses a
 /// value-equal existing key. Any non-instance `v` makes this a thin passthrough.

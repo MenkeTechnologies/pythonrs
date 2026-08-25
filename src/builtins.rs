@@ -610,10 +610,57 @@ fn b_getitem(vm: &mut VM, _: u8) -> Value {
     finish(vm, r)
 }
 
+/// Whether `recv[idx] = v` / `del recv[idx]` can go straight to the store.
+///
+/// The mirror of `b_getitem`'s fast path, and sound for the same reasons: a
+/// `list`/`bytearray`/`dict` is never an `Instance` (a SUBCLASS of one is an
+/// `Instance` carrying the payload, so it does not match here and keeps the full
+/// path), and a key that cannot collapse makes the candidate scan provably
+/// empty. Without this, `a[i] = v` reached one `Vec` write through roughly seven
+/// thread-local borrows: the instance `__setitem__` probe, the
+/// not-an-instance diagnostic probe, the slice probe, the candidate scan (two),
+/// `with_instance_key`, and the store itself.
+///
+/// The whole decision is made INSIDE one borrow on purpose. A first attempt
+/// gated on the index type outside the borrow and then took a borrow only to
+/// ask the receiver's type; for a `dict` receiver that borrow bought nothing and
+/// was pure addition, which a borrow count caught as an 8% REGRESSION on
+/// `d[i] = i` while the list cases improved.
+///
+/// A sequence keeps the integer-index restriction; `dict` accepts any
+/// non-collapsing key, which is what makes the common string-keyed store fast
+/// too. A `Slice` index is an `Obj` that can collapse, so it never reaches here.
+fn fast_store(h: &host::PyHost, recv: &Value, idx: &Value) -> bool {
+    match h.get(recv) {
+        Some(PyObj::List(_) | PyObj::Bytearray(_)) => matches!(idx, Value::Int(_) | Value::Bool(_)),
+        Some(PyObj::Dict(_)) => h.key_cannot_collapse(idx),
+        _ => false,
+    }
+}
+
 fn b_setitem(vm: &mut VM, _: u8) -> Value {
     let val = vm.pop();
     let idx = vm.pop();
     let recv = vm.pop();
+    // Fast path, the mirror of `b_getitem`'s: a plain mutable builtin sequence
+    // written at a plain integer index. `a[i] = v` reached one `Vec` write
+    // through roughly seven thread-local borrows -- the instance `__setitem__`
+    // probe, the not-an-instance diagnostic probe, the slice probe, the
+    // key-collapse candidate scan (two), `with_instance_key`, and finally the
+    // store. None of them can apply here: a `list`/`bytearray` is never an
+    // `Instance` (a SUBCLASS is an `Instance` carrying the payload, so it does
+    // not match and keeps the full path), an `Int` index is never a `Slice`, and
+    // an unboxed scalar never collapses onto an instance key
+    // (`value_can_collapse` is false for every non-`Obj` value), so the
+    // candidate scan is guaranteed empty.
+    if let Some(r) =
+        with_host(|h| fast_store(h, &recv, &idx).then(|| h.set_item(&recv, &idx, val.clone())))
+    {
+        return match r {
+            Ok(()) => val,
+            Err(e) => abort(vm, e),
+        };
+    }
     if instance_defines(&recv, "__setitem__") {
         let r = host::call_method(&recv, "__setitem__", vec![idx, val.clone()], vec![]);
         return finish(vm, r);
@@ -654,6 +701,13 @@ fn b_setitem(vm: &mut VM, _: u8) -> Value {
 fn b_delitem(vm: &mut VM, _: u8) -> Value {
     let idx = vm.pop();
     let recv = vm.pop();
+    // Same fast path as `b_setitem`, and sound for the same reasons.
+    if let Some(r) = with_host(|h| fast_store(h, &recv, &idx).then(|| h.del_item(&recv, &idx))) {
+        return match r {
+            Ok(()) => Value::Undef,
+            Err(e) => abort(vm, e),
+        };
+    }
     // `del obj[i]` on an instance dispatches to `__delitem__` (raw index/slice).
     if instance_defines(&recv, "__delitem__") {
         let r = host::call_method(&recv, "__delitem__", vec![idx], vec![]).map(|_| Value::Undef);
@@ -1595,6 +1649,25 @@ fn b_foriter(vm: &mut VM, _: u8) -> Value {
 fn b_contains(vm: &mut VM, _: u8) -> Value {
     let container = vm.pop();
     let item = vm.pop();
+    // Fast path: an unboxed scalar tested against a HASH container. Every check
+    // below is about something neither operand can be -- a `set`/`frozenset`/
+    // `dict` is not an `Instance` or a generator or a foreign object, and an
+    // unboxed scalar never collapses onto an instance key, so the candidate scan
+    // that follows is guaranteed to come back empty. `list`/`tuple` are
+    // deliberately NOT here: their membership has to scan for an element with a
+    // user `__eq__` first, which is a real check and not an avoidable one.
+    if let Some(r) = with_host(|h| {
+        (matches!(
+            h.get(&container),
+            Some(PyObj::Set(_) | PyObj::Frozenset(_) | PyObj::Dict(_))
+        ) && h.key_cannot_collapse(&item))
+        .then(|| h.contains(&item, &container))
+    }) {
+        return match r {
+            Ok(b) => Value::Bool(b),
+            Err(e) => abort(vm, e),
+        };
+    }
     // Instance `__contains__` wins; else fall back to iterating the instance
     // (via __iter__/__getitem__) and comparing.
     if with_host(|h| matches!(h.get(&container), Some(PyObj::Instance(_)))) {
