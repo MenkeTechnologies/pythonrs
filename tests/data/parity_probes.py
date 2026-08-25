@@ -592,3 +592,38 @@ def catches_its_own():
     except StopIteration:
         yield "handled"
 print(list(catches_its_own()))
+#==#
+# ── an unhashable key names the role it was playing ─────────────────────────
+# CPython reports the bare `unhashable type: 'X'` only from `hash()` itself.
+# Reached through a container it says which role the key was in, and the two
+# type names can DIFFER: the outer one is what the container was handed, the
+# inner one is what actually failed to hash.
+class U:
+    def __eq__(self, o):
+        return True
+u = U()
+d = {}
+for label, expr in [
+    ("set literal", "{u}"),
+    ("dict literal", "{u: 1}"),
+    ("dict merge", "{**d, u: 1}"),
+    ("dict store", "d.__setitem__(u, 1)"),
+    ("dict read", "d[u]"),
+    ("set.add", "set().add(u)"),
+    ("in set", "u in set()"),
+    ("in dict", "u in {}"),
+    ("frozenset", "frozenset([u])"),
+    ("set()", "set([u])"),
+    ("dict.fromkeys", "dict.fromkeys([u])"),
+    ("setdefault", "{}.setdefault(u, 1)"),
+    ("get", "{}.get(u)"),
+    ("tuple key", "{(u,): 1}"),
+    ("list key", "{[1]: 2}"),
+    ("list element", "{[1]}"),
+    ("hash()", "hash(u)"),
+]:
+    try:
+        eval(expr)
+        print(label, "-> NO-RAISE")
+    except TypeError as e:
+        print(label, "->", e)

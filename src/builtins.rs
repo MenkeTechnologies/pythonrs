@@ -606,7 +606,9 @@ fn b_getitem(vm: &mut VM, _: u8) -> Value {
         return finish(vm, host::generic_alias(&recv, &idx));
     }
     let cands = host::instance_key_candidates_for(&recv, Some(&idx));
-    let r = host::with_instance_key(&idx, &cands, || with_host(|h| h.get_item(&recv, &idx)));
+    let r = host::with_instance_key(&idx, host::KeyRole::Of(&recv), &cands, || {
+        with_host(|h| h.get_item(&recv, &idx))
+    });
     finish(vm, r)
 }
 
@@ -690,7 +692,7 @@ fn b_setitem(vm: &mut VM, _: u8) -> Value {
         };
     }
     let cands = host::instance_key_candidates_for(&recv, Some(&idx));
-    match host::with_instance_key(&idx, &cands, || {
+    match host::with_instance_key(&idx, host::KeyRole::Of(&recv), &cands, || {
         with_host(|h| h.set_item(&recv, &idx, val.clone()))
     }) {
         Ok(()) => val,
@@ -731,7 +733,9 @@ fn b_delitem(vm: &mut VM, _: u8) -> Value {
         idx
     };
     let cands = host::instance_key_candidates_for(&recv, Some(&idx));
-    match host::with_instance_key(&idx, &cands, || with_host(|h| h.del_item(&recv, &idx))) {
+    match host::with_instance_key(&idx, host::KeyRole::Of(&recv), &cands, || {
+        with_host(|h| h.del_item(&recv, &idx))
+    }) {
         Ok(()) => Value::Undef,
         Err(e) => abort(vm, e),
     }
@@ -782,7 +786,9 @@ fn b_mkset(vm: &mut VM, argc: u8) -> Value {
         // Instance elements resolve their key (running `__hash__`, collapsing a
         // value-equal earlier element) before the borrowed `to_key`.
         let cands = with_host(|h| host::set_local_candidates(h, &set));
-        let key = host::with_instance_key(&it, &cands, || with_host(|h| h.to_key(&it)));
+        let key = host::with_instance_key(&it, host::KeyRole::Set, &cands, || {
+            with_host(|h| h.to_key(&it))
+        });
         match key {
             Ok(k) => host::set_put(&mut set, k, it),
             Err(e) => return abort(vm, e),
@@ -799,7 +805,9 @@ fn b_mkdict(vm: &mut VM, argc: u8) -> Value {
         let k = flat[i].clone();
         let v = flat[i + 1].clone();
         let cands = with_host(|h| host::dict_local_candidates(h, &d));
-        let key = host::with_instance_key(&k, &cands, || with_host(|h| h.to_key(&k)));
+        let key = host::with_instance_key(&k, host::KeyRole::Dict, &cands, || {
+            with_host(|h| h.to_key(&k))
+        });
         match key {
             Ok(key) => host::dict_put(&mut d, key, k, v),
             Err(e) => return abort(vm, e),
@@ -846,7 +854,9 @@ fn b_extend_set(vm: &mut VM, argc: u8) -> Value {
     });
     for it in items {
         let cands = with_host(|h| host::set_local_candidates(h, &set));
-        let key = host::with_instance_key(&it, &cands, || with_host(|h| h.to_key(&it)));
+        let key = host::with_instance_key(&it, host::KeyRole::Set, &cands, || {
+            with_host(|h| h.to_key(&it))
+        });
         match key {
             Ok(k) => host::set_put(&mut set, k, it),
             Err(e) => return abort(vm, e),
@@ -872,7 +882,9 @@ fn b_extend_dict(vm: &mut VM, argc: u8) -> Value {
         let k = flat[i].clone();
         let v = flat[i + 1].clone();
         let cands = with_host(|h| host::dict_local_candidates(h, &d));
-        let key = host::with_instance_key(&k, &cands, || with_host(|h| h.to_key(&k)));
+        let key = host::with_instance_key(&k, host::KeyRole::Dict, &cands, || {
+            with_host(|h| h.to_key(&k))
+        });
         match key {
             Ok(key) => host::dict_put(&mut d, key, k, v),
             Err(e) => return abort(vm, e),
@@ -1154,7 +1166,14 @@ fn b_mkdict_ex(vm: &mut VM, argc: u8) -> Value {
         } else {
             let k = flat[i + 1].clone();
             let v = flat[i + 2].clone();
-            match with_host(|h| h.to_key(&k)) {
+            // Routed through `with_instance_key` like every other dict store:
+            // keying directly skipped the value-collapse candidates AND the
+            // container context on an unhashable key, so `{**a, [1]: 2}` alone
+            // reported the bare `unhashable type: 'list'`.
+            let cands = host::instance_key_candidates_for(&flat[i + 1], Some(&k));
+            match host::with_instance_key(&k, host::KeyRole::Dict, &cands, || {
+                with_host(|h| h.to_key(&k))
+            }) {
                 Ok(key) => {
                     host::dict_put(&mut d, key, k, v);
                 }
@@ -1168,7 +1187,6 @@ fn b_mkdict_ex(vm: &mut VM, argc: u8) -> Value {
 
 // ── truthiness / str / format ────────────────────────────────────────────────
 
-/// Python truthiness with instance dunder dispatch: `__bool__`, else `__len__`,
 /// Validate a user `__len__` result the way CPython's `PyObject_Size` does.
 ///
 /// Every failure mode has its own exception, and pythonrs had none of them: it
@@ -1194,6 +1212,7 @@ fn len_result(r: &Value) -> Result<usize, String> {
         .map_err(|_| "OverflowError: cannot fit 'int' into an index-sized integer".to_string())
 }
 
+/// Python truthiness with instance dunder dispatch: `__bool__`, else `__len__`,
 /// else the host's structural truthiness. Used by the TRUTHY op, `bool()`,
 /// `any`/`all`/`filter`.
 fn py_bool(v: &Value) -> Result<bool, String> {
@@ -1754,7 +1773,7 @@ fn b_contains(vm: &mut VM, _: u8) -> Value {
         };
     }
     let cands = host::instance_key_candidates_for(&container, Some(&item));
-    let r = host::with_instance_key(&item, &cands, || {
+    let r = host::with_instance_key(&item, host::KeyRole::Of(&container), &cands, || {
         with_host(|h| h.contains(&item, &container))
     });
     match r {
@@ -5454,7 +5473,9 @@ pub fn call_builtin_function(
             }
             // A `tuple`/`frozenset` hashes element-wise, and an element with a
             // user `__hash__` can only be keyed outside the borrow.
-            let k = host::with_instance_key(&v, &[], || with_host(|h| h.to_key(&v)))?;
+            let k = host::with_instance_key(&v, host::KeyRole::Bare, &[], || {
+                with_host(|h| h.to_key(&v))
+            })?;
             Ok(Value::Int(hash_key(&k)))
         }
         "ord" => {
@@ -5807,7 +5828,9 @@ pub fn call_builtin_function(
             let mut s: IndexMap<PKey, Value> = IndexMap::new();
             for it in items {
                 let cands = with_host(|h| host::set_local_candidates(h, &s));
-                let k = host::with_instance_key(&it, &cands, || with_host(|h| h.to_key(&it)))?;
+                let k = host::with_instance_key(&it, host::KeyRole::Set, &cands, || {
+                    with_host(|h| h.to_key(&it))
+                })?;
                 host::set_put(&mut s, k, it);
             }
             if name == "frozenset" {
@@ -7024,7 +7047,7 @@ fn construct_dict(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, S
                 let kv = host::iter_vec(&p)?;
                 if kv.len() == 2 {
                     let cands = with_host(|h| host::dict_local_candidates(h, &d));
-                    let key = host::with_instance_key(&kv[0], &cands, || {
+                    let key = host::with_instance_key(&kv[0], host::KeyRole::Dict, &cands, || {
                         with_host(|h| h.to_key(&kv[0]))
                     })?;
                     host::dict_put(&mut d, key, kv[0].clone(), kv[1].clone());
@@ -14033,7 +14056,9 @@ fn dict_method(
             let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
             for k in keys {
                 let cands = with_host(|h| host::dict_local_candidates(h, &d));
-                let key = host::with_instance_key(&k, &cands, || with_host(|h| h.to_key(&k)))?;
+                let key = host::with_instance_key(&k, host::KeyRole::Dict, &cands, || {
+                    with_host(|h| h.to_key(&k))
+                })?;
                 host::dict_put(&mut d, key, k, value.clone());
             }
             Ok(with_host(|h| h.new_dict(d)))
@@ -14041,7 +14066,9 @@ fn dict_method(
         "get" => {
             let kv = arg0(args)?;
             let cands = host::instance_key_candidates_for(recv, Some(&kv));
-            let key = host::with_instance_key(&kv, &cands, || with_host(|h| h.to_key(&kv)))?;
+            let key = host::with_instance_key(&kv, host::KeyRole::Dict, &cands, || {
+                with_host(|h| h.to_key(&kv))
+            })?;
             Ok(with_host(|h| match h.get(recv) {
                 Some(PyObj::Dict(d)) => d.get(&key).map(|(_, v)| v.clone()),
                 _ => None,
@@ -14051,7 +14078,9 @@ fn dict_method(
         "pop" => {
             let kv = arg0(args)?;
             let cands = host::instance_key_candidates_for(recv, Some(&kv));
-            let key = host::with_instance_key(&kv, &cands, || with_host(|h| h.to_key(&kv)))?;
+            let key = host::with_instance_key(&kv, host::KeyRole::Dict, &cands, || {
+                with_host(|h| h.to_key(&kv))
+            })?;
             let got = with_host(|h| {
                 if let Some(PyObj::Dict(d)) = h.get_mut(recv) {
                     d.shift_remove(&key).map(|(_, v)| v)
@@ -14071,7 +14100,9 @@ fn dict_method(
             let kv = arg0(args)?;
             let default = args.get(1).cloned().unwrap_or(Value::Undef);
             let cands = host::instance_key_candidates_for(recv, Some(&kv));
-            let key = host::with_instance_key(&kv, &cands, || with_host(|h| h.to_key(&kv)))?;
+            let key = host::with_instance_key(&kv, host::KeyRole::Dict, &cands, || {
+                with_host(|h| h.to_key(&kv))
+            })?;
             Ok(with_host(|h| {
                 if let Some(PyObj::Dict(d)) = h.get(recv) {
                     if let Some((_, v)) = d.get(&key) {
@@ -14172,7 +14203,9 @@ fn dict_update(
     let mut cands = host::instance_key_candidates(recv);
     let mut triples: Vec<(PKey, Value, Value)> = Vec::with_capacity(pairs.len());
     for (kv, v) in pairs {
-        let k = host::with_instance_key(&kv, &cands, || with_host(|h| h.to_key(&kv)))?;
+        let k = host::with_instance_key(&kv, host::KeyRole::Dict, &cands, || {
+            with_host(|h| h.to_key(&kv))
+        })?;
         if any_value_key(&k) && !cands.iter().any(|(ck, _)| *ck == k) {
             cands.push((k.clone(), kv.clone()));
         }
@@ -14236,7 +14269,9 @@ fn set_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
         "add" => {
             let v = arg0(args)?;
             let cands = host::instance_key_candidates_for(recv, Some(&v));
-            let k = host::with_instance_key(&v, &cands, || with_host(|h| h.to_key(&v)))?;
+            let k = host::with_instance_key(&v, host::KeyRole::Set, &cands, || {
+                with_host(|h| h.to_key(&v))
+            })?;
             with_host(|h| {
                 if let Some(PyObj::Set(s)) = h.get_mut(recv) {
                     host::set_put(s, k, v);
@@ -14247,7 +14282,9 @@ fn set_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
         "discard" | "remove" => {
             let v = arg0(args)?;
             let cands = host::instance_key_candidates_for(recv, Some(&v));
-            let k = host::with_instance_key(&v, &cands, || with_host(|h| h.to_key(&v)))?;
+            let k = host::with_instance_key(&v, host::KeyRole::Set, &cands, || {
+                with_host(|h| h.to_key(&v))
+            })?;
             let removed = with_host(|h| {
                 if let Some(PyObj::Set(s)) = h.get_mut(recv) {
                     s.shift_remove(&k).is_some()
@@ -14325,7 +14362,9 @@ fn set_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
                     // borrow, and a value-equal element already present collapses
                     // onto its key rather than adding a duplicate slot.
                     let cands = host::instance_key_candidates_for(recv, Some(&it));
-                    let k = host::with_instance_key(&it, &cands, || with_host(|h| h.to_key(&it)))?;
+                    let k = host::with_instance_key(&it, host::KeyRole::Set, &cands, || {
+                        with_host(|h| h.to_key(&it))
+                    })?;
                     with_host(|h| {
                         if let Some(PyObj::Set(s)) = h.get_mut(recv) {
                             host::set_put(s, k, it);
@@ -14380,7 +14419,9 @@ fn set_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             let items = host::iter_vec(&arg0(args)?)?;
             for it in items {
                 let cands = host::instance_key_candidates_for(recv, Some(&it));
-                let k = host::with_instance_key(&it, &cands, || with_host(|h| h.to_key(&it)))?;
+                let k = host::with_instance_key(&it, host::KeyRole::Set, &cands, || {
+                    with_host(|h| h.to_key(&it))
+                })?;
                 with_host(|h| {
                     if let Some(PyObj::Set(s)) = h.get_mut(recv) {
                         if s.shift_remove(&k).is_none() {
@@ -14424,9 +14465,12 @@ fn iter_keys_against(v: &Value, recv: &Value) -> Result<Vec<PKey>, String> {
     let items = host::iter_vec(v)?;
     let mut ks = Vec::with_capacity(items.len());
     for it in items {
-        ks.push(host::with_instance_key(&it, &cands, || {
-            with_host(|h| h.to_key(&it))
-        })?);
+        ks.push(host::with_instance_key(
+            &it,
+            host::KeyRole::Set,
+            &cands,
+            || with_host(|h| h.to_key(&it)),
+        )?);
     }
     Ok(ks)
 }

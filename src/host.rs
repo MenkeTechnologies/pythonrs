@@ -5506,6 +5506,22 @@ impl PyHost {
 /// value-equal existing key. Any non-instance `v` makes this a thin passthrough.
 pub fn with_instance_key<R>(
     v: &Value,
+    role: KeyRole,
+    candidates: &[(PKey, Value)],
+    f: impl FnOnce() -> Result<R, String>,
+) -> Result<R, String> {
+    let out = with_instance_key_inner(v, candidates, f);
+    match out {
+        Ok(r) => Ok(r),
+        // The unhashable failure is raised while PREPARING the key, before the
+        // container op ever runs, which is why wrapping the ops alone left every
+        // construction and membership spelling reporting the bare message.
+        Err(e) => Err(with_host(|h| wrap_unhashable(h, e, role, v))),
+    }
+}
+
+fn with_instance_key_inner<R>(
+    v: &Value,
     candidates: &[(PKey, Value)],
     f: impl FnOnce() -> Result<R, String>,
 ) -> Result<R, String> {
@@ -5590,7 +5606,8 @@ pub fn align_operand(a: &Value, b: &Value) -> Result<Option<Value>, String> {
         Side::Set(items, frozen) => {
             let mut out: IndexMap<PKey, Value> = IndexMap::with_capacity(items.len());
             for it in items {
-                let k = with_instance_key(&it, &cands, || with_host(|h| h.to_key(&it)))?;
+                let k =
+                    with_instance_key(&it, KeyRole::Set, &cands, || with_host(|h| h.to_key(&it)))?;
                 set_put(&mut out, k, it);
             }
             Ok(Some(with_host(|h| h.new_setlike(out, frozen))))
@@ -5598,7 +5615,8 @@ pub fn align_operand(a: &Value, b: &Value) -> Result<Option<Value>, String> {
         Side::Dict(pairs) => {
             let mut out: IndexMap<PKey, (Value, Value)> = IndexMap::with_capacity(pairs.len());
             for (kv, vv) in pairs {
-                let k = with_instance_key(&kv, &cands, || with_host(|h| h.to_key(&kv)))?;
+                let k =
+                    with_instance_key(&kv, KeyRole::Dict, &cands, || with_host(|h| h.to_key(&kv)))?;
                 dict_put(&mut out, k, kv, vv);
             }
             Ok(Some(with_host(|h| h.new_dict(out))))
@@ -7847,7 +7865,18 @@ impl PyHost {
     }
 
     /// `recv[idx]`.
+    /// Thin wrapper: an unhashable-key failure gets CPython's container
+    /// context (`cannot use 'X' as a dict key (...)`). See
+    /// [`wrap_unhashable`]. One place per op, so no call site can forget.
     pub fn get_item(&mut self, recv: &Value, idx: &Value) -> Result<Value, String> {
+        let r = self.get_item_raw(recv, idx);
+        match r {
+            Ok(v) => Ok(v),
+            Err(e) => Err(wrap_unhashable(self, e, KeyRole::Of(recv), idx)),
+        }
+    }
+
+    fn get_item_raw(&mut self, recv: &Value, idx: &Value) -> Result<Value, String> {
         // A module `__dict__` view answers reads from a snapshot of the slot.
         if let Some(d) = self.module_dict_snapshot(recv) {
             return self.get_item(&d, idx);
@@ -8204,7 +8233,18 @@ impl PyHost {
     }
 
     /// `recv[idx] = val`.
+    /// Thin wrapper: an unhashable-key failure gets CPython's container
+    /// context (`cannot use 'X' as a dict key (...)`). See
+    /// [`wrap_unhashable`]. One place per op, so no call site can forget.
     pub fn set_item(&mut self, recv: &Value, idx: &Value, val: Value) -> Result<(), String> {
+        let r = self.set_item_raw(recv, idx, val);
+        match r {
+            Ok(v) => Ok(v),
+            Err(e) => Err(wrap_unhashable(self, e, KeyRole::Of(recv), idx)),
+        }
+    }
+
+    fn set_item_raw(&mut self, recv: &Value, idx: &Value, val: Value) -> Result<(), String> {
         // A module `__dict__` view writes THROUGH to the module's globals, so the
         // module's own functions see the new binding.
         if let Some(slot) = self.module_dict_slot(recv) {
@@ -8277,7 +8317,18 @@ impl PyHost {
         }
     }
 
+    /// Thin wrapper: an unhashable-key failure gets CPython's container
+    /// context (`cannot use 'X' as a dict key (...)`). See
+    /// [`wrap_unhashable`]. One place per op, so no call site can forget.
     pub fn del_item(&mut self, recv: &Value, idx: &Value) -> Result<(), String> {
+        let r = self.del_item_raw(recv, idx);
+        match r {
+            Ok(v) => Ok(v),
+            Err(e) => Err(wrap_unhashable(self, e, KeyRole::Of(recv), idx)),
+        }
+    }
+
+    fn del_item_raw(&mut self, recv: &Value, idx: &Value) -> Result<(), String> {
         if let Some(slot) = self.module_dict_slot(recv) {
             let k = self
                 .as_str(idx)
@@ -8886,7 +8937,18 @@ impl PyHost {
     }
 
     /// `item in container`.
+    /// Thin wrapper: an unhashable-key failure gets CPython's container
+    /// context (`cannot use 'X' as a dict key (...)`). See
+    /// [`wrap_unhashable`]. One place per op, so no call site can forget.
     pub fn contains(&mut self, item: &Value, container: &Value) -> Result<bool, String> {
+        let r = self.contains_raw(item, container);
+        match r {
+            Ok(v) => Ok(v),
+            Err(e) => Err(wrap_unhashable(self, e, KeyRole::Of(container), item)),
+        }
+    }
+
+    fn contains_raw(&mut self, item: &Value, container: &Value) -> Result<bool, String> {
         if let Some(d) = self.module_dict_snapshot(container) {
             return self.contains(item, &d);
         }
@@ -12031,6 +12093,65 @@ pub fn subclass_payload(v: &Value, dunder: &str) -> Option<Value> {
         }
         _ => None,
     })
+}
+
+/// Wrap an unhashable-key `TypeError` with the container context CPython adds.
+///
+/// CPython reports the bare `unhashable type: 'X'` only from `hash()` itself.
+/// Reached through a container it says which role the key was playing:
+///
+/// ```text
+/// {u}        cannot use 'U' as a set element (unhashable type: 'U')
+/// {u: 1}     cannot use 'U' as a dict key (unhashable type: 'U')
+/// ```
+///
+/// The two names can differ, and both are load-bearing: the OUTER one is the
+/// type of the key the container was handed, the INNER one is the type that
+/// actually failed to hash. For `{(u,): 1}` CPython says
+/// `cannot use 'tuple' as a dict key (unhashable type: 'U')` -- the tuple is
+/// what you tried to key with, the instance inside it is what could not hash.
+/// So the outer name comes from `key` here and the inner is left exactly as the
+/// hashing code reported it.
+///
+/// Anything that is not an unhashable-key error passes through untouched.
+/// What a key was being used AS, for the message [`wrap_unhashable`] builds.
+///
+/// A role rather than a sniff of the container, because the two are not the
+/// same question: when a `set`/`dict` is being CONSTRUCTED from an iterable
+/// there is no container yet to inspect, and `hash(x)` has no container at all.
+/// Passing it explicitly also makes the compiler list every site that keys a
+/// value, so a new one cannot quietly inherit the wrong wording.
+#[derive(Clone, Copy)]
+pub enum KeyRole<'a> {
+    /// `hash(x)` — CPython reports the bare `unhashable type: 'X'` here.
+    Bare,
+    Set,
+    Dict,
+    /// Decide from the container's runtime type: a subscript or `in` whose
+    /// receiver may be a list, a dict or a set.
+    Of(&'a Value),
+}
+
+pub fn wrap_unhashable(h: &PyHost, e: String, role: KeyRole, key: &Value) -> String {
+    const PREFIX: &str = "TypeError: unhashable type:";
+    if !e.starts_with(PREFIX) {
+        return e;
+    }
+    let role = match role {
+        KeyRole::Bare => return e,
+        KeyRole::Set => "a set element",
+        KeyRole::Dict => "a dict key",
+        KeyRole::Of(c) => match h.get(c) {
+            Some(PyObj::Set(_) | PyObj::Frozenset(_)) => "a set element",
+            Some(PyObj::Dict(_)) => "a dict key",
+            _ => return e,
+        },
+    };
+    let inner = e.trim_start_matches("TypeError: ");
+    format!(
+        "TypeError: cannot use '{}' as {role} ({inner})",
+        h.type_name(key)
+    )
 }
 
 /// Whether `v` could name a heap object at all.

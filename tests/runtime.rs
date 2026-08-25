@@ -603,6 +603,13 @@ fn container_display_and_subscript_store_carry_a_line_and_caret() {
     // key rendered `File "…", line 0, in <module>` with no source line and no
     // carets — the traceback named nothing at all. They now carry the
     // statement's line and the expression's span, matching CPython's frame.
+    //
+    // The four messages below were `unhashable type: 'list'` when this test was
+    // written, which recorded pythonrs's own wording rather than CPython's.
+    // Every one is verbatim from `python3` 3.14.7 run on the same source: the
+    // outer clause names the type the container was HANDED, the inner one the
+    // type that failed to hash, and a set display says "a set element" where a
+    // dict says "a dict key".
     assert_eq!(
         traceback_of("d = {[1]: 5}\n"),
         concat!(
@@ -610,7 +617,7 @@ fn container_display_and_subscript_store_carry_a_line_and_caret() {
             "  File \"/t.py\", line 1, in <module>\n",
             "    d = {[1]: 5}\n",
             "        ^^^^^^^^\n",
-            "TypeError: unhashable type: 'list'\n",
+            "TypeError: cannot use 'list' as a dict key (unhashable type: 'list')\n",
         )
     );
     assert_eq!(
@@ -620,7 +627,7 @@ fn container_display_and_subscript_store_carry_a_line_and_caret() {
             "  File \"/t.py\", line 1, in <module>\n",
             "    s = {[1]}\n",
             "        ^^^^^\n",
-            "TypeError: unhashable type: 'list'\n",
+            "TypeError: cannot use 'list' as a set element (unhashable type: 'list')\n",
         )
     );
     // The store anchors its bracket region, so the receiver renders `~`.
@@ -631,7 +638,7 @@ fn container_display_and_subscript_store_carry_a_line_and_caret() {
             "  File \"/t.py\", line 2, in <module>\n",
             "    d[[1]] = 2\n",
             "    ~^^^^^\n",
-            "TypeError: unhashable type: 'list'\n",
+            "TypeError: cannot use 'list' as a dict key (unhashable type: 'list')\n",
         )
     );
     // A `{**a, …}` merge takes a different lowering path with the same gap.
@@ -642,7 +649,7 @@ fn container_display_and_subscript_store_carry_a_line_and_caret() {
             "  File \"/t.py\", line 2, in <module>\n",
             "    d = {**a, [1]: 2}\n",
             "        ^^^^^^^^^^^^^\n",
-            "TypeError: unhashable type: 'list'\n",
+            "TypeError: cannot use 'list' as a dict key (unhashable type: 'list')\n",
         )
     );
 }
