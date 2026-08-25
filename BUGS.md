@@ -1479,3 +1479,35 @@ elements one at a time never presizes: the table starts at 8 and grows to 32 on
 the fifth insert (`mask` 31). A 16-slot table reproduces both diverging cases
 above exactly, including the `LINEAR_PROBES` runs that place `500` and `600`.
 Closing this needs the literal's presize modelled, not a change to hashing.
+
+### Open divergences found by round-3 protocol probing
+
+Round 2 probed values -- numbers, strings, containers, exception text. Round 3
+probed the PROTOCOLS: generators, context managers, descriptors, class
+machinery, argument binding, control flow, operators. Most of that surface
+already agreed with CPython 3.14.7 byte for byte. Four bugs came out of it and
+are fixed (`zip`/`map` over a user iterator class, the `__iter__`-returned-a-
+non-iterator message, the implicit `__hash__ = None`, `__len__` validation plus
+PEP 479). Two remain open:
+
+- **An unhashable key reports the bare message, not the context.** CPython 3.14
+  wraps it with where it happened:
+
+  ```
+  {OnlyEq()}      # cannot use 'OnlyEq' as a set element (unhashable type: 'OnlyEq')
+  {OnlyEq(): 1}   # cannot use 'OnlyEq' as a dict key (unhashable type: 'OnlyEq')
+  ```
+
+  pythonrs raises `TypeError: unhashable type: 'OnlyEq'` for both -- the right
+  exception TYPE and the right inner text, missing the outer clause. Closing it
+  means threading a "used as what" tag through the keying entry points, which
+  currently share one `to_key` with no notion of the caller's context.
+
+- **PEP 695 `type X = ...` binds the value, not a `TypeAliasType`.**
+  `type Alias = list[int]` makes `Alias` be `list[int]` itself, so `Alias`
+  reprs and behaves like the aliased type but `Alias.__value__` raises
+  `AttributeError`, and `type(Alias)` is `type` where CPython says
+  `TypeAliasType`. The lazy-evaluation semantics (the value is not computed
+  until `__value__` is read, which is what lets an alias be recursive or refer
+  to a name defined later) are absent with it. `type X = ...` inside a class or
+  function body, and the generic form `type X[T] = ...`, are the same gap.
