@@ -12033,11 +12033,29 @@ pub fn subclass_payload(v: &Value, dunder: &str) -> Option<Value> {
     })
 }
 
+/// Whether `v` could name a heap object at all.
+///
+/// [`PyHost::get`] resolves ONLY `Value::Obj`, so for every other variant --
+/// `Int`, `Float`, `Bool`, `Undef`, and fusevm's inline `Str`/`Arr` -- any
+/// question of the form "is this a `PyObj::X`?" is answered `false` without
+/// consulting the heap. Asking it before taking the thread-local borrow is
+/// therefore exactly equivalent, and skips the borrow entirely for the unboxed
+/// scalars that arithmetic runs on.
+#[inline]
+pub fn is_heap(v: &Value) -> bool {
+    matches!(v, Value::Obj(_))
+}
+
 /// For an operand in an arithmetic/comparison operation: if `v` is a
 /// builtin-subclass instance that does not override the operator `dunder`,
 /// return its native payload (so the native operation runs and yields the base
 /// type — `C(5) + 3 == 8`, a plain `int`). Otherwise return `v` unchanged.
 pub fn subclass_operand(v: &Value, dunder: &str) -> Value {
+    // Both operands of every arithmetic op come through here, and the common
+    // ones are unboxed numbers that cannot be a subclass instance.
+    if !is_heap(v) {
+        return v.clone();
+    }
     with_host(|h| match h.get(v) {
         Some(PyObj::Instance(i)) if !matches!(i.payload, Value::Undef) => {
             if h.builtin_base_of(&i.class).is_some() && h.class_lookup(&i.class, dunder).is_none() {
@@ -18543,6 +18561,9 @@ pub fn alloc_dict_subtype(
 
 /// The `dict_meta` for a value, if it is a tagged `dict` subclass.
 pub fn dict_meta_of(v: &Value) -> Option<DictMeta> {
+    if !is_heap(v) {
+        return None;
+    }
     with_host(|h| match v {
         Value::Obj(i) => h.dict_meta.get(i).cloned(),
         _ => None,

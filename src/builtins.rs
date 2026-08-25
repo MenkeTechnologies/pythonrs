@@ -2447,6 +2447,13 @@ fn inplace_binary_fallback(tag: i64, a: &Value, b: &Value) -> Result<Value, Stri
 /// in-place fast path for this op and the caller should use the binary fallback.
 fn inplace_builtin(tag: i64, a: &Value, b: &Value) -> Option<Result<Value, String>> {
     use host::iop;
+    // Every branch below asks which heap object `a` is -- a subclass instance, a
+    // list, a bytearray, a dict -- and an unboxed scalar is none of them. `n += 1`
+    // took four separate thread-local borrows to establish that and then fell
+    // through to the binary fallback anyway.
+    if !host::is_heap(a) {
+        return None;
+    }
     // A mutable builtin-subclass instance (`class L(list)`, `class S(set)`) keeps
     // its native storage in its payload. Mutate the payload in place, then return
     // the *instance* so `x += ...` preserves x's subclass type (CPython: inherited
@@ -3629,7 +3636,9 @@ fn numeric_hook_inner(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> 
     // borrow the host. `h.arith`'s foreign branch would hold the borrow.
     #[cfg(feature = "stdlib-ffi")]
     if let Some(func) = foreign_binop_func(op) {
-        if with_host(|h| h.foreign_id(a).is_some() || h.foreign_id(b).is_some()) {
+        if (host::is_heap(a) || host::is_heap(b))
+            && with_host(|h| h.foreign_id(a).is_some() || h.foreign_id(b).is_some())
+        {
             return crate::ffi::binary_op_cb(func, a, b);
         }
     }
