@@ -159,6 +159,19 @@ jobs:
             --bin "target/${{ matrix.target }}/release/python" \
             --triple "${{ matrix.target }}"
 
+      # The two assertions are what this step tests: `re` exercises the native
+      # engine, and `hashlib` + `_hashlib` can only work if the bundled stdlib
+      # AND its compiled extensions are found with the system interpreter's
+      # environment unset. Both have always passed.
+      #
+      # The diagnostic prints `hashlib.__file__` rather than `re.__file__`.
+      # pythonrs's `re` is compiled INTO the interpreter -- a builtin module in
+      # CPython's sense -- and a builtin has no `__file__`, so the old line
+      # raised `AttributeError` after both assertions had already succeeded and
+      # failed every release from v0.1.1 on. `hashlib` is genuinely loaded from
+      # a file, and `_hashlib` is a compiled extension out of the bundle's own
+      # `lib-dynload`, so printing their paths shows WHICH tree served the
+      # import -- which is what "system python hidden" is claiming.
       - name: Smoke test the bundle (system python hidden)
         shell: bash
         run: |
@@ -167,7 +180,7 @@ jobs:
             ./bin/python -c 'import re,hashlib,_hashlib; \
               assert re.findall(r"\d+","a1")==["1"]; \
               assert hashlib.sha256(b"x").hexdigest().startswith("2d711642"); \
-              print("bundle OK:", re.__file__)'
+              print("bundle OK:", hashlib.__file__, _hashlib.__file__)'
 
       - name: Package
         shell: bash
