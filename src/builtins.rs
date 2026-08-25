@@ -1381,6 +1381,20 @@ fn index_dunder(v: &Value) -> Result<Option<Value>, String> {
     Ok(Some(r))
 }
 
+/// Apply the `__index__` protocol where CPython's `PyNumber_Index` would, and
+/// pass anything else through untouched.
+///
+/// `__index__` means "this object IS an integer", so CPython honours it at every
+/// boundary that wants one -- not just subscripting. pythonrs consulted it when
+/// indexing a sequence and in `bin`/`hex`/`oct`, and nowhere else, so a class
+/// with a perfectly good `__index__` was accepted by `a[Idx()]` and rejected by
+/// `range(Idx())`, `chr(Idx())` and `bytes(Idx())`. Note `__int__` is NOT a
+/// substitute: it means "this can be CONVERTED to an integer", which is why
+/// `hex()` and `range()` reject an `__int__`-only object in CPython too.
+fn indexed(v: &Value) -> Result<Value, String> {
+    Ok(index_dunder(v)?.unwrap_or_else(|| v.clone()))
+}
+
 fn b_tostr(vm: &mut VM, _: u8) -> Value {
     let v = vm.pop();
     stringify(vm, &v, false)
@@ -2237,6 +2251,19 @@ fn binop_symbol(lname: &str) -> &'static str {
         "__divmod__" => "divmod()",
         _ => "?",
     }
+}
+
+/// `seq * obj` (either way round) where `obj` supplies the count via
+/// `__index__`.
+///
+/// Split out so the coercion happens OUTSIDE the host borrow: `repeat_seq` holds
+/// `&mut PyHost` and can never call the user's `__index__` itself.
+fn repeat_with_index(a: &Value, b: &Value) -> bool {
+    let has_index = |h: &host::PyHost, v: &Value| matches!(h.get(v), Some(PyObj::Instance(i)) if instance_has(h, i, "__index__"));
+    with_host(|h| {
+        (h.is_sequence_for_repeat(a) && has_index(h, b))
+            || (h.is_sequence_for_repeat(b) && has_index(h, a))
+    })
 }
 
 fn unsupported_operand(sym: &str, a: &Value, b: &Value) -> String {
@@ -3764,6 +3791,15 @@ fn numeric_hook_inner(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> 
                 }
                 with_host(|h| h.arith(op, a, b))
             }
+        }
+        // `seq * obj` where `obj` has `__index__`: the object IS a count, so the
+        // repeat runs. `repeat_seq` holds `&mut PyHost` and so can never call
+        // the user's `__index__` itself; the coercion has to happen out here,
+        // before the borrow, which is why `[0] * Idx()` reported
+        // `unsupported operand type(s)` while `a[Idx()]` worked.
+        Mul if repeat_with_index(a, b) => {
+            let (a2, b2) = (indexed(a)?, indexed(b)?);
+            with_host(|h| h.arith(op, &a2, &b2))
         }
         // Arithmetic: forward/reflected dunder, else unsupported-operand TypeError.
         Add | Sub | Mul | Div | Mod | Pow => {
@@ -5512,7 +5548,7 @@ pub fn call_builtin_function(
             Ok(Value::Int(n))
         }
         "chr" => {
-            let a0 = arg0(&args)?;
+            let a0 = indexed(&arg0(&args)?)?;
             // A bignum is out of range, not a zero: `h.as_int` answered `None`
             // for it and the `unwrap_or(0)` turned `chr(10**30)` into `chr(0)`,
             // printing a NUL where CPython raises. A non-integer is
@@ -6397,6 +6433,9 @@ fn make_range(args: &[Value]) -> Result<Value, String> {
     if !matches!(args.len(), 1..=3) {
         return Err(host::type_error("range expected 1 to 3 arguments"));
     }
+    // Every bound goes through `__index__` first, as CPython's does.
+    let args: Vec<Value> = args.iter().map(indexed).collect::<Result<_, _>>()?;
+    let args = &args[..];
     // Fast path: every argument fits `i64`.
     let small: Option<Vec<i64>> = args.iter().map(|v| with_host(|h| h.as_int(v))).collect();
     if let Some(ints) = small {
@@ -16671,6 +16710,9 @@ fn build_bytes(args: &[Value]) -> Result<Vec<u8>, String> {
         None => return Ok(vec![]),
         Some(v) => v,
     };
+    // `bytes(n)` takes a count, so an object with `__index__` is one. Without
+    // this it fell through to the iterable arm and reported "not iterable".
+    let v = &indexed(v)?;
     // A bignum count reaches `bytes`/`bytearray` as a heap object, so it used to
     // fall through to the iterable arm and report `'int' object is not
     // iterable`. CPython's `bytes_new` runs `PyNumber_AsSsize_t(x,

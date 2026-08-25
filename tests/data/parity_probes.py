@@ -627,3 +627,44 @@ for label, expr in [
         print(label, "-> NO-RAISE")
     except TypeError as e:
         print(label, "->", e)
+#==#
+# ── __index__ is honoured wherever an integer is wanted ─────────────────────
+# `__index__` means "this object IS an integer", so CPython accepts it at every
+# boundary that wants one, not just subscripting. `__int__` is NOT a substitute
+# -- it means "can be CONVERTED to one" -- which is why the int-only class is
+# rejected by all of these in CPython too.
+class Idx:
+    def __index__(self):
+        return 3
+class IntOnly:
+    def __int__(self):
+        return 7
+class BadIdx:
+    def __index__(self):
+        return 1.5
+a = [0, 1, 2, 3, 4, 5]
+for label, expr in [
+    ("subscript", "a[Idx()]"),
+    ("slice bound", "a[Idx():]"),
+    ("range", "list(range(Idx()))"),
+    ("range 2-arg", "list(range(Idx(), 5))"),
+    ("repeat r", "[0] * Idx()"),
+    ("repeat l", "Idx() * [0]"),
+    ("str repeat", "'ab' * Idx()"),
+    ("bytes count", "bytes(Idx())"),
+    ("chr", "chr(Idx())"),
+    ("hex", "hex(Idx())"),
+    ("bin", "bin(Idx())"),
+    ("oct", "oct(Idx())"),
+    ("int()", "int(Idx())"),
+    ("int() int-only", "int(IntOnly())"),
+    ("subscript int-only", "a[IntOnly()]"),
+    ("range int-only", "list(range(IntOnly()))"),
+    ("hex int-only", "hex(IntOnly())"),
+    ("chr int-only", "chr(IntOnly())"),
+    ("non-int __index__", "a[BadIdx()]"),
+]:
+    try:
+        print(label, "->", repr(eval(expr)))
+    except TypeError as e:
+        print(label, "-> TypeError:", e)

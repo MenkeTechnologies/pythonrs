@@ -6352,7 +6352,7 @@ impl PyHost {
     /// Whether `v` is one of the built-in sequences `*` repeats — the receivers
     /// for which CPython raises `can't multiply sequence by non-int` instead of
     /// the generic operand-type message.
-    fn is_sequence_for_repeat(&self, v: &Value) -> bool {
+    pub fn is_sequence_for_repeat(&self, v: &Value) -> bool {
         matches!(
             self.get(v),
             Some(PyObj::Str(_))

@@ -1490,8 +1490,8 @@ are fixed (`zip`/`map` over a user iterator class, the `__iter__`-returned-a-
 non-iterator message, the implicit `__hash__ = None`, `__len__` validation plus
 PEP 479). The unhashable-key message was the fifth and is fixed too: an
 unhashable key now names the role it was playing (`cannot use 'X' as a dict
-key (unhashable type: 'X')`), matching CPython at all 17 spellings. One
-remains open:
+key (unhashable type: 'X')`), matching CPython at all 17 spellings. Round 4
+added the `__index__` coercion boundaries. Two remain open:
 
 - **PEP 695 `type X = ...` binds the value, not a `TypeAliasType`.**
   `type Alias = list[int]` makes `Alias` be `list[int]` itself, so `Alias`
@@ -1501,3 +1501,19 @@ remains open:
   until `__value__` is read, which is what lets an alias be recursive or refer
   to a name defined later) are absent with it. `type X = ...` inside a class or
   function body, and the generic form `type X[T] = ...`, are the same gap.
+
+- **`operator.index()` does not see a native `__index__`.** The `operator`
+  module is served by the FFI bridge, so the argument crosses as a
+  `PyrsInstance` proxy, and CPython's `PyNumber_Index` asks the PROXY's type for
+  the slot rather than the pythonrs class behind it:
+
+  ```
+  operator.index(Idx())   # TypeError: 'builtins.PyrsInstance' object cannot be
+                          # interpreted as an integer
+  ```
+
+  Every NATIVE boundary honours it -- subscripting, slice bounds, `range`,
+  sequence repetition, `bytes(n)`, `chr`, `bin`/`hex`/`oct`, `int()` -- so this
+  is the marshalling layer, not the protocol. Closing it means giving
+  `PyrsInstance` an `__index__` that routes back to the pythonrs object, the
+  same way its attribute and comparison slots already do.
