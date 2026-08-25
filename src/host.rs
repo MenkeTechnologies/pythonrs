@@ -10515,6 +10515,26 @@ impl PyHost {
                 };
                 Ok(v.clone())
             }
+            // `range` read-only attributes. Unlike `slice`, these are always
+            // integers — `range` normalizes its omitted bounds at construction,
+            // so `range(3).start` is `0` and `range(3).step` is `1`.
+            Some(PyObj::Range { start, stop, step }) if matches!(name, "start" | "stop" | "step") => {
+                Ok(Value::Int(match name {
+                    "start" => *start,
+                    "stop" => *stop,
+                    _ => *step,
+                }))
+            }
+            Some(PyObj::BigRange { start, stop, step })
+                if matches!(name, "start" | "stop" | "step") =>
+            {
+                let b = match name {
+                    "start" => start.clone(),
+                    "stop" => stop.clone(),
+                    _ => step.clone(),
+                };
+                Ok(self.norm_big(b))
+            }
             _ => {
                 // Numeric `.real`/`.imag` (int/float/bool/bigint/complex are all
                 // read-only descriptors in CPython).
@@ -10559,6 +10579,14 @@ impl PyHost {
                 // `x.__class__` on a builtin-type value is its type object (same
                 // as `type(x)`).
                 let tn = self.type_name(recv);
+                // An unhashable builtin's `__hash__` slot is set to `None`, not
+                // removed: `[].__hash__` READS as None (so `hasattr` is True)
+                // and only calling it fails. Handing back a bound method here
+                // made `if obj.__hash__ is None` — how the stdlib tests
+                // hashability — take the wrong branch on every list and dict.
+                if name == "__hash__" && crate::builtins::UNHASHABLE_TYPES.contains(&tn.as_str()) {
+                    return Ok(Value::Undef);
+                }
                 if name == "__class__" {
                     return Ok(if self.classes.contains_key(&tn) {
                         self.alloc(PyObj::Class(tn))

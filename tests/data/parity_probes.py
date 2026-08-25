@@ -205,3 +205,53 @@ def gen():
     return 3
 g = gen()
 print(next(g), list(gen()), sum(gen()))
+#==#
+# ── dir(): every name it lists must be one getattr can produce ──────────────
+# The invariant, not the list — the list itself moved between releases
+# (`__getstate__` in 3.11, `__buffer__` in 3.12), but "listed implies reachable"
+# has held since 3.9 and is exactly what was broken: `dir()` enumerated each
+# builtin type's own methods and five inherited names, so it was 24 names short
+# on `str` and 26 on `list`.
+VALUES = ["'a'", "b'a'", "bytearray(b'a')", "5", "1.5", "True", "1j", "[1]", "(1,)",
+          "{1: 2}", "{1}", "frozenset([1])", "range(3)", "slice(1, 2)", "None",
+          "...", "NotImplemented", "object"]
+for src in VALUES:
+    x = eval(src)
+    names = dir(x)
+    print(src, len(names) > 20, names == sorted(names), sorted(set(names)) == names,
+          [n for n in names if not hasattr(x, n)])
+#==#
+# ── the object surface every value inherits, reached as a bound method ──────
+print((5).__eq__(5), (5).__eq__(1.5), (1.5).__eq__(5), (5).__eq__("a"), "a".__eq__(5))
+print([].__eq__(()), {1}.__eq__(frozenset([1])), b"a".__eq__(bytearray(b"a")))
+print(None.__eq__(None), None.__eq__(1), (...).__eq__(...), (5).__ne__(2), [].__ne__(5))
+print((5).__lt__(2), (5).__lt__(1.5), (1.5).__lt__(5), "a".__lt__("b"), [].__lt__(5))
+print((5).__hash__() == hash(5), "a".__hash__() == hash("a"), [].__hash__, {}.__hash__)
+print((5).__str__(), (5).__repr__(), "a".__str__(), [1].__repr__(), (5).__format__("x"))
+print([].__getstate__(), (5).__init__(), [].__init_subclass__(), "a".__subclasshook__(int))
+print(type((5).__sizeof__()).__name__, type([].__sizeof__()).__name__)
+print(sorted("a".__dir__()) == dir("a"), (5).__getattribute__("real"))
+#==#
+# ── the attributes dir() was hiding while getattr answered them ─────────────
+print("a".isascii(), "é".isascii(), (5).real, (5).imag, (5).numerator, (5).denominator)
+print(range(1, 7, 2).start, range(1, 7, 2).stop, range(1, 7, 2).step, range(5).start, range(5).step)
+print(slice(1, 7, 2).start, slice(1, 7, 2).stop, slice(1, 7, 2).step, slice(3).start)
+print((5).from_bytes(b"\x01\x02"), int.from_bytes(b"\x01\x02"), (1.5).fromhex("0x1.8p+0"))
+print("ab".__getnewargs__(), (5).__getnewargs__(), True.__getnewargs__(), (1.5).__getnewargs__())
+print((1, 2).__getnewargs__(), b"ab".__getnewargs__(), (1j).__getnewargs__())
+print(list([1, 2].__reversed__()), list({1: 2, 3: 4}.__reversed__()), list(range(3).__reversed__()))
+print(list({1: 2}.keys().__reversed__()), list({1: 2}.items().__reversed__()))
+print([].__class_getitem__(int), dict.__class_getitem__(int), tuple.__class_getitem__(int))
+print((1j).__neg__(), (1j).__pos__(), (1j).__complex__(), b"ab".__bytes__())
+print(bytearray(b"ab").copy(), (1.5).__getformat__("double"), float.__getformat__("float"))
+#==#
+# ── a missing attribute must stay missing, with the type's own hint ─────────
+# Each of these is a name that IS on some other builtin type. Granting the
+# object surface must not have leaked any of them onto a type CPython does not
+# put them on.
+ABSENT = [("'a'", "__class_getitem__"), ("[1]", "__getnewargs__"), ("{1}", "__reversed__"),
+          ("(1,)", "__setitem__"), ("5", "__len__"), ("[1]", "__bool__"),
+          ("'a'", "__iadd__"), ("b'a'", "__alloc__"), ("5", "from_number"),
+          ("[1]", "resize"), ("'a'", "__buffer__"), ("(1,)", "append")]
+for src, attr in ABSENT:
+    print(src, attr, hasattr(eval(src), attr))

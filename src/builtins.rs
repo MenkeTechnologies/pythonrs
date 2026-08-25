@@ -4022,9 +4022,12 @@ pub fn builtin_mro(name: &str) -> Vec<String> {
 pub fn type_classmethods(name: &str) -> &'static [&'static str] {
     match name {
         "dict" => &["fromkeys"],
-        "int" => &["from_bytes"],
+        // `bool` inherits `int`'s, exactly as `dir(True)` reports it.
+        "int" | "bool" => &["from_bytes"],
         "bytes" | "bytearray" => &["fromhex"],
-        "float" => &["fromhex"],
+        // `from_number` is the 3.14 alternate constructor. `int` has none.
+        "float" => &["fromhex", "from_number"],
+        "complex" => &["from_number"],
         _ => &[],
     }
 }
@@ -4549,6 +4552,20 @@ pub fn call_builtin_function(
             .ok_or_else(|| host::type_error("float.fromhex() argument must be str"))?;
         return Ok(Value::Float(float_fromhex(&s)?));
     }
+    // `float.from_number(x)` / `complex.from_number(x)` — the 3.14 alternate
+    // constructors. Unlike the plain constructors they take a NUMBER only: a
+    // string that `float("1.5")` would parse is a TypeError here.
+    if name == "float.from_number" || name == "complex.from_number" {
+        let v = arg0(&args)?;
+        let tn = with_host(|h| h.type_name(&v));
+        let numeric = matches!(tn.as_str(), "int" | "bool" | "float")
+            || (name == "complex.from_number" && tn == "complex");
+        if !numeric {
+            return Err(host::type_error(&format!("must be real number, not {tn}")));
+        }
+        let ctor = name.strip_suffix(".from_number").unwrap_or(name);
+        return call_builtin_function(ctor, vec![v], vec![]);
+    }
     // `bytes.fromhex(...)` / `bytearray.fromhex(...)` via the type object.
     if name == "bytes.fromhex" || name == "bytearray.fromhex" {
         let b = bytes_fromhex(&args)?;
@@ -4565,8 +4582,32 @@ pub fn call_builtin_function(
     // argument is the receiver. Gated by `is_builtin_type` + `type_has_method`
     // so only genuine `type.method` names route here (getattr already rejected a
     // bad name), never a module function like `math.sqrt`.
+    // An alternate constructor reached through a SUBCLASS type object is the
+    // base type's — `bool.from_bytes` IS `int.from_bytes` — and takes no
+    // receiver, unlike the unbound instance methods below.
     if let Some((tp, meth)) = name.split_once('.') {
-        if is_builtin_type(tp) && type_has_method(tp, meth) {
+        if tp == "bool" && type_classmethods(tp).contains(&meth) {
+            // Bound to `bool`, so it CONSTRUCTS a bool: `bool.from_bytes(b'\x02')`
+            // is `True`, not `2`.
+            let n = call_builtin_function(&format!("int.{meth}"), args, kwargs)?;
+            return Ok(Value::Bool(with_host(|h| h.truthy(&n))));
+        }
+        // `list.__class_getitem__(int)` / `float.__getformat__('double')` are
+        // class methods on the type, so the first argument is an ARGUMENT — not
+        // the receiver the unbound-instance-method path below would peel off.
+        if meth == "__class_getitem__" && type_extra_names(tp).contains(&meth) {
+            let ty = with_host(|h| h.alloc(PyObj::Builtin(tp.to_string())));
+            return host::generic_alias(&ty, &arg0(&args)?);
+        }
+        if meth == "__getformat__" && tp == "float" {
+            return float_getformat(args.first());
+        }
+    }
+    if let Some((tp, meth)) = name.split_once('.') {
+        // A classmethod's first argument is not a receiver, so it must not be
+        // peeled off here; each has its own handler above.
+        if is_builtin_type(tp) && type_has_method(tp, meth) && !type_classmethods(tp).contains(&meth)
+        {
             let Some(recv) = args.first().cloned() else {
                 return Err(host::type_error(&format!(
                     "descriptor '{meth}' of '{tp}' object needs an argument"
@@ -10045,6 +10086,11 @@ fn inherits_object_surface(typename: &str) -> bool {
 /// dunders its own type rules grant it, without the inherited `object` surface.
 fn own_dir_names(typename: &str) -> Vec<&'static str> {
     let mut out: Vec<&'static str> = Vec::new();
+    out.extend_from_slice(type_data_attrs(typename));
+    // An alternate constructor is a classmethod, so it is an attribute of every
+    // INSTANCE too — `dir(5)` names `from_bytes`, not only `dir(int)`.
+    out.extend_from_slice(type_classmethods(typename));
+    out.extend_from_slice(type_extra_names(typename));
     if let Some(list) = type_method_names(typename) {
         out.extend_from_slice(list);
     }
@@ -10140,6 +10186,76 @@ fn own_dir_names(typename: &str) -> Vec<&'static str> {
     out
 }
 
+/// The per-type protocol attributes [`builtin_extra_method`] dispatches, listed
+/// against the types that carry them in CPython.
+///
+/// Deliberately per-type rather than blanket: `__reversed__` is on `list` and
+/// `dict` but not on `set`, `__getnewargs__` is on the immutable scalars but not
+/// on any container, and `__class_getitem__` is on the generic containers but
+/// not on `str`/`int`/`float`. Granting any of them universally would put a name
+/// in `dir()` that CPython does not have there.
+fn type_extra_names(tn: &str) -> &'static [&'static str] {
+    match tn {
+        "str" => &["__getnewargs__"],
+        "bytes" => &["__getnewargs__", "__bytes__", "__buffer__"],
+        "bytearray" => &[
+            "__buffer__",
+            "__release_buffer__",
+            "__alloc__",
+            "copy",
+            "resize",
+        ],
+        "int" | "bool" => &["__getnewargs__"],
+        "float" => &["__getnewargs__", "__getformat__"],
+        "complex" => &["__getnewargs__", "__complex__", "__neg__", "__pos__"],
+        "tuple" => &["__getnewargs__", "__class_getitem__"],
+        "list" | "dict" | "deque" | "OrderedDict" | "defaultdict" | "Counter" => {
+            &["__reversed__", "__class_getitem__"]
+        }
+        "set" | "frozenset" | "enumerate" => &["__class_getitem__"],
+        "range" | "dict_keys" | "dict_values" | "dict_items" => &["__reversed__"],
+        "memoryview" => &["__class_getitem__", "__buffer__", "__release_buffer__"],
+        _ => &[],
+    }
+}
+
+/// The read-only DATA attributes of builtin type `tn` — the ones `get_attr`
+/// resolves from the value itself before any method lookup, so they never reach
+/// `call_type_method`.
+///
+/// They are attributes all the same, and `dir()` was hiding every one of them:
+/// `dir(5)` omitted `real`/`imag`/`numerator`/`denominator` while `(5).real`
+/// answered `5`, and `dir(range(3))` omitted `start`/`stop`/`step`. Listing them
+/// here is what lets `dir()` and `getattr` agree, and what gives
+/// `range(3).startt` the `Did you mean: 'start'?` clause CPython appends.
+pub fn type_data_attrs(tn: &str) -> &'static [&'static str] {
+    match tn {
+        // An integer is its own numerator over a denominator of 1, and is its
+        // own real part with a zero imaginary one.
+        "int" | "bool" => &["real", "imag", "numerator", "denominator"],
+        // A float has no exact numerator/denominator pair — CPython gives it
+        // `as_integer_ratio()` as a method instead, not the two attributes.
+        "float" | "complex" => &["real", "imag"],
+        "slice" | "range" => &["start", "stop", "step"],
+        "deque" => &["maxlen"],
+        "defaultdict" => &["default_factory"],
+        "memoryview" => &[
+            "obj",
+            "nbytes",
+            "format",
+            "itemsize",
+            "ndim",
+            "readonly",
+            "shape",
+            "strides",
+            "contiguous",
+            "c_contiguous",
+            "f_contiguous",
+        ],
+        _ => &[],
+    }
+}
+
 /// The types whose ENTIRE attribute surface is `object`'s (plus, for `NoneType`,
 /// the `__bool__` that [`is_object_dunder_method`] grants it). They have no
 /// method table and no rule above, so without this list `dir(None)`,
@@ -10161,6 +10277,15 @@ pub fn type_has_method(typename: &str, name: &str) -> bool {
     // them. `(1, 2).__setitem__` stays an `AttributeError` because `tuple` is
     // not mutable there — the grant is per type, never blanket.
     if CONTAINER_DUNDERS.contains(&name) && is_object_dunder_method(typename, name) {
+        return true;
+    }
+    // A read-only data attribute is not a method, but this predicate answers for
+    // `getattr`, which produces it — and `get_attr` resolves it before ever
+    // asking here, so saying so cannot shadow the real value.
+    if type_extra_names(typename).contains(&name) {
+        return true;
+    }
+    if type_data_attrs(typename).contains(&name) || type_classmethods(typename).contains(&name) {
         return true;
     }
     // `__contains__` is a real bound method on every builtin container in CPython
@@ -10501,6 +10626,7 @@ const STR_METHODS: &[&str] = &[
     "expandtabs",
     "translate",
     "format_map",
+    "isascii",
     // A `staticmethod`, so it is reachable off an instance too ("abc".maketrans).
     "maketrans",
 ];
@@ -11130,9 +11256,11 @@ fn object_dunder(
         // `object.__subclasshook__` is the hook `abc` overrides. The base one
         // never decides, so it is `NotImplemented` for every argument.
         "__subclasshook__" => not_implemented(),
-        // CPython's `object.__dir__` returns the names UNSORTED and `dir()`
-        // sorts them; the set is what is observable, and `dir()` sorts either
-        // way, so this hands back the sorted form.
+        // The same NAMES `dir()` reports. CPython's `object.__dir__` hands back
+        // the type's dict order, which is its C slot layout and reproducible
+        // nowhere else, so `x.__dir__() == dir(x)` is False there and True here.
+        // The ORDER of `__dir__` is unspecified by the data model (only `dir()`
+        // promises sorted), and the set — what every caller reads — matches.
         "__dir__" => Ok(with_host(|h| {
             let items: Vec<Value> = h
                 .dir_names(recv)
@@ -11222,6 +11350,125 @@ fn object_dunder(
         }
         _ => return None,
     })
+}
+
+/// The attributes a builtin type carries beyond its own method table and the
+/// inherited `object` surface: the pickle hook `__getnewargs__`, the alternate
+/// constructors reached off an INSTANCE (`(5).from_bytes`), and the per-type
+/// protocol methods (`__reversed__`, `__class_getitem__`, `__bytes__`).
+///
+/// Every one was a name `dir()` was short of CPython's, and each is here because
+/// it dispatches for real — listing a name that then raises `AttributeError` on
+/// the call is worse than not listing it.
+///
+/// `None` means "not this type's attribute", and the caller falls through.
+fn builtin_extra_method(
+    recv: &Value,
+    tn: &str,
+    name: &str,
+    args: &[Value],
+    kwargs: &[(String, Value)],
+) -> Option<Result<Value, String>> {
+    let arg0 = || args.first().cloned().unwrap_or(Value::Undef);
+    // An alternate constructor is a CLASSMETHOD, so it is reachable off an
+    // instance as well as off the type — `(5).from_bytes(b'\x01')` is `1`, the
+    // receiver contributing nothing but its type.
+    if type_classmethods(tn).contains(&name) {
+        return Some(call_builtin_function(
+            &format!("{tn}.{name}"),
+            args.to_vec(),
+            kwargs.to_vec(),
+        ));
+    }
+    // Gated per type: `'a'.__class_getitem__` must stay the AttributeError it is
+    // in CPython, so a name is dispatched only for the types that carry it.
+    if !type_extra_names(tn).contains(&name) {
+        return None;
+    }
+    Some(match name {
+        // `x.__getnewargs__()` — the arguments `type(x).__new__` needs to
+        // rebuild `x`, as a TUPLE. Only the types CPython gives one.
+        "__getnewargs__" => match type_getnewargs(recv, tn) {
+            Ok(items) => Ok(with_host(|h| h.new_tuple(items))),
+            // A type with no `__getnewargs__` falls through, so the missing
+            // attribute is reported the way every other absent name is.
+            Err(_) => return None,
+        },
+        // `bytes(b)` on a `bytes` hands back the same object; the hook the
+        // conversion goes through is reachable on its own.
+        "__bytes__" if tn == "bytes" => Ok(recv.clone()),
+        "__complex__" if tn == "complex" => Ok(recv.clone()),
+        // `complex` has no `__neg__`/`__pos__` in the numeric dunder tables (it
+        // is not in `op_dunders`), but the operators work — so the methods must.
+        "__neg__" | "__pos__" if tn == "complex" => match with_host(|h| h.get(recv).cloned()) {
+            Some(PyObj::Complex(r, i)) if name == "__neg__" => {
+                Ok(with_host(|h| h.alloc(PyObj::Complex(-r, -i))))
+            }
+            _ => Ok(recv.clone()),
+        },
+        // `x.__reversed__()` is exactly what `reversed(x)` calls, and it yields
+        // the same per-type reverse-iterator object.
+        "__reversed__" => call_builtin_function("reversed", vec![recv.clone()], vec![]),
+        // `[].__class_getitem__(int)` parameterizes the TYPE, not the receiver:
+        // it is `list[int]`, whatever list it was reached through.
+        "__class_getitem__" => {
+            let ty = with_host(|h| h.alloc(PyObj::Builtin(tn.to_string())));
+            host::generic_alias(&ty, &arg0())
+        }
+        // `bytearray.copy()` is a shallow duplicate; `resize(n)` grows with zero
+        // bytes and shrinks by truncation, both in place.
+        "copy" if tn == "bytearray" => Ok(mk_bytes(true, recv_bytes(recv))),
+        "resize" if tn == "bytearray" => {
+            let n = with_host(|h| h.as_int(&arg0()))
+                .ok_or_else(|| host::type_error("an integer is required"));
+            let n = match n {
+                Ok(n) => n,
+                Err(e) => return Some(Err(e)),
+            };
+            if n < 0 {
+                return Some(Err("ValueError: negative size".into()));
+            }
+            with_host(|h| {
+                if let Some(PyObj::Bytearray(b)) = h.get_mut(recv) {
+                    b.resize(n as usize, 0);
+                }
+            });
+            Ok(Value::Undef)
+        }
+        // The buffer the value would expose. pythonrs's `memoryview` is the same
+        // 1-D unsigned-byte window CPython hands back here, and the flags
+        // argument selects a layout every 1-D contiguous buffer satisfies.
+        "__buffer__" if matches!(tn, "bytes" | "bytearray") => {
+            call_builtin_function("memoryview", vec![recv.clone()], vec![])
+        }
+        // Releasing a view is a no-op for a buffer pythonrs never pinned.
+        "__release_buffer__" if tn == "bytearray" => Ok(Value::Undef),
+        // `bytearray.__alloc__()` is the allocated buffer size, which is
+        // implementation-defined — CPython reports its own over-allocation and
+        // this reports pythonrs's. The METHOD is what is portable.
+        "__alloc__" if tn == "bytearray" => Ok(Value::Int(with_host(|h| match h.get(recv) {
+            Some(PyObj::Bytearray(b)) => b.capacity() as i64,
+            _ => 0,
+        }))),
+        "__getformat__" if tn == "float" => float_getformat(args.first()),
+        _ => return None,
+    })
+}
+
+/// `float.__getformat__('double' | 'float')` — the C layout of the requested
+/// type. Every platform pythonrs builds for is IEEE 754, so only the byte order
+/// varies.
+fn float_getformat(arg: Option<&Value>) -> Result<Value, String> {
+    match with_host(|h| arg.and_then(|v| h.as_str(v))).as_deref() {
+        Some("double") | Some("float") => Ok(with_host(|h| {
+            h.new_str(if cfg!(target_endian = "little") {
+                "IEEE, little-endian"
+            } else {
+                "IEEE, big-endian"
+            })
+        })),
+        _ => Err("ValueError: __getformat__() argument 1 must be 'double' or 'float'".to_string()),
+    }
 }
 
 pub fn call_type_method(
@@ -11329,6 +11576,12 @@ pub fn call_type_method(
         if let Some(r) = object_dunder(recv, &tn, name, &args) {
             return r;
         }
+    }
+    // The per-type extras `dir()` lists beyond the method table: the pickle
+    // hook, the alternate constructors reached off an instance, and the
+    // protocol methods (`__reversed__`, `__class_getitem__`, `__bytes__`).
+    if let Some(r) = builtin_extra_method(recv, &tn, name, &args, &kwargs) {
+        return r;
     }
     // Other universal object dunders reached as bound methods (`cache.__len__`,
     // `cache.__getitem__(k)`, `x.__eq__(y)`) — dispatch to the native op.
