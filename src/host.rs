@@ -2497,10 +2497,31 @@ impl PyHost {
             // type object rather than the bare `None` literal.
             Some(PyObj::Builtin(n)) if n == "NoneType" => "None".to_string(),
             Some(PyObj::Builtin(n)) => n.clone(),
-            Some(PyObj::Class(n)) => n.clone(),
+            Some(PyObj::Class(n)) => self.class_display_path(n),
             None if matches!(v, Value::Undef) => "None".to_string(),
             _ => self.repr_of(v),
         }
+    }
+
+    /// A user class's `module.qualname` — how a union or generic alias names it
+    /// (`int | __main__.A`, `list[__main__.Outer.Inner]`), where a builtin type
+    /// is named bare. A nested class contributes its full lexical path, which is
+    /// why this reads `qualname` rather than the registry key.
+    pub fn class_display_path(&self, class: &str) -> String {
+        let Some(cd) = self.classes.get(class) else {
+            return class.to_string();
+        };
+        let module = if cd.module.is_empty() {
+            "__main__"
+        } else {
+            &cd.module
+        };
+        let qual = if cd.qualname.is_empty() {
+            &cd.name
+        } else {
+            &cd.qualname
+        };
+        format!("{module}.{qual}")
     }
 
     /// The display name of a generic-alias argument for `repr` (`list[int]`): a
@@ -2508,7 +2529,7 @@ impl PyHost {
     fn generic_arg_name(&self, v: &Value) -> String {
         match self.get(v) {
             Some(PyObj::Builtin(n)) => n.clone(),
-            Some(PyObj::Class(n)) => n.clone(),
+            Some(PyObj::Class(n)) => self.class_display_path(n),
             // `tuple[int, ...]` — inside an alias CPython prints the ellipsis in
             // its literal spelling, not as the `Ellipsis` repr.
             Some(PyObj::Ellipsis) => "...".to_string(),
@@ -9646,6 +9667,21 @@ impl PyHost {
                         return Ok(v);
                     }
                 }
+                // The `type` surface a class inherits from its metaclass —
+                // `A.mro`, `A.__instancecheck__`, `A.__base__`. AFTER both the
+                // class namespace and the metaclass lookup above: a user
+                // metaclass defining `__instancecheck__` must win, or the
+                // default implementation calls `isinstance`, which calls the
+                // hook, which lands back here.
+                if crate::builtins::TYPE_OBJECT_METHODS.contains(&name) {
+                    let cls = self.alloc(PyObj::Class(cname.clone()));
+                    let func = self.alloc(PyObj::Builtin(name.to_string()));
+                    return Ok(self.alloc(PyObj::BoundMethod { recv: cls, func }));
+                }
+                if matches!(name, "__base__" | "__type_params__" | "__text_signature__") {
+                    let mro = self.mro_of(&cname);
+                    return self.type_object_data_attr(&mro, name);
+                }
                 // An inherited object-slot dunder reached on the class object with
                 // no override (`C.__ne__`, `C.__repr__`) is the unbound slot
                 // wrapper from `object`, as in CPython. (collections' OrderedDict
@@ -10309,6 +10345,30 @@ impl PyHost {
                 };
                 Ok(self.new_str(m))
             }
+            // The `type` surface on a builtin type object — `int.mro()`,
+            // `int.__instancecheck__(5)`, `int | str` as a method. `dir(int)`
+            // does NOT list these (CPython lists a type's INSTANCE attributes,
+            // not its metaclass's), but `getattr` produces every one.
+            Some(PyObj::Builtin(n))
+                if crate::builtins::TYPE_OBJECT_METHODS.contains(&name)
+                    && crate::builtins::is_type_object_name(n)
+                    // A type that defines the name ITSELF shadows the metaclass:
+                    // `int.__or__` is the integer bitwise operator reached
+                    // unbound, not `type.__or__`, which is why CPython answers
+                    // `int.__or__(str)` with a descriptor TypeError while
+                    // `int | str` is a union.
+                    && !crate::builtins::type_has_method(n, name) =>
+            {
+                let recv = recv.clone();
+                let func = self.alloc(PyObj::Builtin(name.to_string()));
+                Ok(self.alloc(PyObj::BoundMethod { recv, func }))
+            }
+            Some(PyObj::Builtin(n))
+                if matches!(name, "__base__" | "__type_params__" | "__text_signature__")
+                    && crate::builtins::is_type_object_name(n) =>
+            {
+                self.type_object_data_attr(&crate::builtins::builtin_mro(n), name)
+            }
             // `<type>.__mro__` / `__bases__` on a type object.
             Some(PyObj::Builtin(n))
                 if (name == "__mro__" || name == "__bases__")
@@ -10733,9 +10793,36 @@ impl PyHost {
 
     /// Add every name defined across `class`'s MRO namespaces (and any
     /// `__slots__` members) to `set`.
+    /// The read-only `type` attributes that are a plain value rather than a
+    /// method: the first entry of the MRO after the class itself, and the two
+    /// signature/type-parameter slots that are empty for everything pythonrs
+    /// builds. `mro` is the class's MRO, its own name first.
+    fn type_object_data_attr(&mut self, mro: &[String], name: &str) -> Result<Value, String> {
+        Ok(match name {
+            // `__base__` is the "solid base" — for every class pythonrs models
+            // that is simply the next entry in the MRO, and `object` for a class
+            // with no bases of its own. Only `object` itself has none.
+            "__base__" => match mro.get(1) {
+                Some(b) => self.class_or_builtin_type(b.clone()),
+                None if mro.first().map(String::as_str) == Some("object") => Value::Undef,
+                None => self.alloc(PyObj::Builtin("object".into())),
+            },
+            // PEP 695 type parameters. pythonrs parses no generic class syntax,
+            // so every class is unparameterized — CPython reports `()` for those
+            // too, so this is the real answer and not a stand-in.
+            "__type_params__" => self.new_tuple(vec![]),
+            // The `__text_signature__` a C type carries in its docstring.
+            // pythonrs has no C signatures to parse, and CPython answers `None`
+            // for every type that has none.
+            _ => Value::Undef,
+        })
+    }
+
     fn collect_class_dir(&self, class: &str, set: &mut BTreeSet<String>) {
+        let mut any_user = false;
         for c in self.mro_of(class) {
             if let Some(cd) = self.classes.get(&c) {
+                any_user = true;
                 for k in cd.ns.keys() {
                     set.insert(k.clone());
                 }
@@ -10745,6 +10832,18 @@ impl PyHost {
             for s in slots {
                 set.insert(s);
             }
+        }
+        // Every class inherits `object`'s surface. Without this, `dir()` on a
+        // user class listed only what its own body defined — five names for a
+        // class CPython reports 32 for — and `dir(object())`, whose class has no
+        // user namespace at all, came back EMPTY.
+        for n in crate::builtins::OBJECT_DUNDERS {
+            set.insert(n.to_string());
+        }
+        // A user class also carries the instance-dict machinery `object` itself
+        // does not have; `object()` must stay at exactly `object`'s 24 names.
+        if any_user {
+            set.insert("__dict__".into());
         }
     }
 
@@ -11387,6 +11486,39 @@ pub fn invoke(
                 .next()
                 .ok_or_else(|| type_error(&format!("unbound method {qual}() needs an argument")))?;
             let rest: Vec<Value> = it.collect();
+            // A slot wrapper type-checks its receiver before running the slot,
+            // exactly as the method descriptors above do: `str.__eq__(5, 'a')`
+            // is a TypeError naming the descriptor, not `NotImplemented` from
+            // int's own comparison.
+            if let Some(e) = crate::builtins::unbound_receiver_error(&base, &method, &recv) {
+                return Err(e);
+            }
+            // `object.__repr__(x)` is `object`'s OWN slot, so it reports the
+            // default `<type object at 0x…>` even for a value whose type
+            // overrides `__repr__` — that is the whole reason to reach for it.
+            if base == "object" && method == "__repr__" {
+                return Ok(with_host(|h| {
+                    let name = match h.get(&recv) {
+                        // A user class is named by its module path here, the
+                        // same way its own default repr names it.
+                        Some(PyObj::Instance(i)) => {
+                            let c = i.class.clone();
+                            h.class_display_path(&c)
+                        }
+                        _ => h.type_name(&recv),
+                    };
+                    let s = format!("<{name} object at 0x{:012x}>", h.addr_of(&recv));
+                    h.new_str(s)
+                }));
+            }
+            // `object.__str__` is not a renderer of its own: it defers to the
+            // object's `__repr__`, so `object.__str__('a')` is `"'a'"`.
+            if base == "object" && method == "__str__" {
+                return Ok(with_host(|h| {
+                    let s = h.repr_of(&recv);
+                    h.new_str(s)
+                }));
+            }
             if crate::builtins::is_type_like_builtin(&base) {
                 let payload =
                     with_host(|h| h.base_payload_any(&recv)).unwrap_or_else(|| recv.clone());
@@ -12301,6 +12433,17 @@ fn call_method_inner(
                     return base_dispatch(recv, &inst.payload, base, name, args, kwargs);
                 }
             }
+            // The `object` slots the class inherited and did not override.
+            // Before `__getattr__` deliberately: in CPython the type lookup
+            // finds `object.__eq__` and succeeds, so `__getattr__` is never
+            // consulted for one of these.
+            if crate::builtins::OBJECT_METHOD_DUNDERS.contains(&name) {
+                if let Some(r) =
+                    crate::builtins::instance_object_dunder(recv, &class, name, &args)
+                {
+                    return r;
+                }
+            }
             // Last resort, as in CPython: `__getattr__` supplies attributes the
             // class does not define, and a METHOD CALL has to consult it too —
             // not just a plain attribute read. `unittest`'s `_WritelnDecorator`
@@ -12373,6 +12516,16 @@ fn call_method_inner(
             }
             if name == "__init_subclass__" {
                 return Ok(Value::Undef);
+            }
+            // The `type` surface a class inherits — `A.mro()`,
+            // `A.__instancecheck__(x)`, `A.__call__()`. LAST, after both the
+            // class namespace and the metaclass: a user metaclass that defines
+            // `__instancecheck__`/`__subclasscheck__` must win, or the default
+            // implementation calls `isinstance`, which calls the hook, which
+            // lands back here.
+            if crate::builtins::TYPE_OBJECT_METHODS.contains(&name) {
+                let cls = with_host(|h| h.alloc(PyObj::Class(cname.clone())));
+                return crate::builtins::call_type_method(&cls, name, args, kwargs);
             }
             Err(format!(
                 "AttributeError: type object '{cname}' has no attribute '{name}'"

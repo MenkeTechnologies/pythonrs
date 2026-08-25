@@ -3933,7 +3933,6 @@ pub fn is_object_dunder_method(tn: &str, name: &str) -> bool {
         "NoneType",
         "NotImplementedType",
         "range",
-        "type",
     ];
 
     match name {
@@ -4613,6 +4612,9 @@ pub fn call_builtin_function(
                     "descriptor '{meth}' of '{tp}' object needs an argument"
                 )));
             };
+            if let Some(e) = unbound_receiver_error(tp, meth, &recv) {
+                return Err(e);
+            }
             return call_type_method(&recv, meth, args[1..].to_vec(), kwargs);
         }
     }
@@ -10098,6 +10100,35 @@ fn own_dir_names(typename: &str) -> Vec<&'static str> {
     // `builtin_dispatch_is_fully_listed_by_dir` asserts that direction.
     out.extend_from_slice(op_dunders(typename));
     match typename {
+        // `dir(type)` is the metaclass's own surface — what a CLASS responds to,
+        // where every other entry here is what an INSTANCE responds to.
+        //
+        // `__abstractmethods__`, `__annotations__` and `__annotate__` are listed
+        // and RAISE on access, in CPython too: they are getset slots on `type`
+        // whose getters report a missing attribute for a type that has none.
+        // The five C-layout numbers CPython also lists here — `__flags__`,
+        // `__basicsize__`, `__itemsize__`, `__dictoffset__`, `__weakrefoffset__`
+        // — are deliberately absent: they describe a `PyTypeObject` struct
+        // pythonrs does not have, and a fabricated number would be read as a
+        // real one by the `Py_TPFLAGS_*` bit tests that consume them.
+        "type" => {
+            out.extend_from_slice(TYPE_OBJECT_METHODS);
+            out.extend_from_slice(&[
+                "__abstractmethods__",
+                "__annotate__",
+                "__annotations__",
+                "__base__",
+                "__bases__",
+                "__dict__",
+                "__module__",
+                "__mro__",
+                "__name__",
+                "__qualname__",
+                "__subclasses__",
+                "__text_signature__",
+                "__type_params__",
+            ]);
+        }
         "int" | "bool" => {
             out.extend_from_slice(INT_METHODS);
             out.extend_from_slice(INT_DUNDERS);
@@ -11352,6 +11383,307 @@ fn object_dunder(
     })
 }
 
+/// `X.method(obj, …)` reached through the TYPE object is CPython's UNBOUND
+/// descriptor, and it type-checks its receiver before running anything:
+/// `str.lower(5)` is a TypeError naming the descriptor, where pythonrs reported
+/// `AttributeError: 'int' object has no attribute 'lower'` — the wrong exception
+/// type, so `except TypeError` around the stdlib's descriptor plumbing missed it.
+///
+/// `None` when the receiver is acceptable.
+pub fn unbound_receiver_error(tp: &str, meth: &str, recv: &Value) -> Option<String> {
+    let rt = with_host(|h| h.type_name(recv));
+    if receiver_is_instance_of(recv, &rt, tp) {
+        return None;
+    }
+    Some(host::type_error(&if is_slot_wrapper(tp, meth) {
+        format!("descriptor '{meth}' requires a '{tp}' object but received a '{rt}'")
+    } else {
+        format!("descriptor '{meth}' for '{tp}' objects doesn't apply to a '{rt}' object")
+    }))
+}
+
+/// Whether `recv` (of type `rt`) is an instance of builtin type `tp` — the check
+/// an unbound descriptor makes on its receiver. Subclasses pass, which is what
+/// keeps `int.bit_length(True)` and `dict.get(OrderedDict(), k)` working.
+fn receiver_is_instance_of(recv: &Value, rt: &str, tp: &str) -> bool {
+    if rt == tp || tp == "object" {
+        return true;
+    }
+    // The builtin subclass relations CPython's C types declare. `bytearray` is
+    // deliberately absent: it is NOT a `bytes` subclass, so `bytes.decode` on
+    // one is the descriptor error CPython raises.
+    let builtin_bases: &[&str] = match rt {
+        "bool" => &["int"],
+        "defaultdict" | "OrderedDict" | "Counter" => &["dict"],
+        _ => &[],
+    };
+    if builtin_bases.contains(&tp) {
+        return true;
+    }
+    with_host(|h| match h.get(recv) {
+        Some(PyObj::Instance(i)) => {
+            let class = i.class.clone();
+            h.mro_of(&class).iter().any(|c| c == tp) || h.builtin_base_of(&class) == Some(tp)
+        }
+        _ => false,
+    })
+}
+
+/// Whether `tp.meth` is a C SLOT wrapper rather than a method-table entry, which
+/// is what decides between CPython's two descriptor-mismatch wordings.
+///
+/// Measured against CPython 3.14.7 over every `(type, name)` pair across the
+/// builtin types: every non-dunder is a method-table entry, every dunder is a
+/// slot EXCEPT the list below, and `__contains__`/`__getitem__` split by type —
+/// the sequences reach them through a slot, the mappings and sets through a
+/// method (and `list.__getitem__` is CPython's fast-path method entry).
+fn is_slot_wrapper(tp: &str, meth: &str) -> bool {
+    const METHOD_FORM: &[&str] = &[
+        "__alloc__",
+        "__bytes__",
+        "__ceil__",
+        "__complex__",
+        "__copy__",
+        "__enter__",
+        "__exit__",
+        "__floor__",
+        "__format__",
+        "__getnewargs__",
+        "__reduce__",
+        "__reduce_ex__",
+        "__reversed__",
+        "__round__",
+        "__sizeof__",
+        "__trunc__",
+    ];
+    const MAPPINGS: &[&str] = &["dict", "defaultdict", "OrderedDict", "Counter"];
+    if !(meth.starts_with("__") && meth.ends_with("__")) || METHOD_FORM.contains(&meth) {
+        return false;
+    }
+    match meth {
+        "__contains__" => !MAPPINGS.contains(&tp) && !matches!(tp, "set" | "frozenset"),
+        "__getitem__" => !MAPPINGS.contains(&tp) && tp != "list",
+        _ => true,
+    }
+}
+
+/// The methods every TYPE object answers to, inherited from `type` itself.
+///
+/// `dir(int)` does not list them — CPython's `dir()` on a class reports what its
+/// INSTANCES respond to, not what its metaclass adds — but `dir(type)` does, and
+/// `getattr` produces each of them off any class: `int.mro()`,
+/// `int.__instancecheck__(5)`, `A.__call__()`.
+pub const TYPE_OBJECT_METHODS: &[&str] = &[
+    "mro",
+    "__instancecheck__",
+    "__subclasscheck__",
+    "__prepare__",
+    "__call__",
+    "__or__",
+    "__ror__",
+];
+
+/// One dispatch for [`TYPE_OBJECT_METHODS`], for a class object or a builtin
+/// type object alike. `None` when `recv` is not a type object, or `name` is not
+/// one of them.
+fn type_object_method(
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+    kwargs: &[(String, Value)],
+) -> Option<Result<Value, String>> {
+    if !TYPE_OBJECT_METHODS.contains(&name) {
+        return None;
+    }
+    let is_type = with_host(|h| match h.get(recv) {
+        Some(PyObj::Class(_)) => true,
+        Some(PyObj::Builtin(n)) => is_type_object_name(n),
+        _ => false,
+    });
+    if !is_type {
+        return None;
+    }
+    let arg0 = || args.first().cloned().unwrap_or(Value::Undef);
+    Some(match name {
+        // `cls.mro()` is the LIST form of `cls.__mro__`; CPython computes it
+        // rather than reading the tuple, but for a class whose MRO is already
+        // resolved the two agree by construction.
+        "mro" => {
+            // `type.mro(int)` passes the class as an argument instead.
+            let cls = if matches!(recv, Value::Obj(_)) && !args.is_empty() {
+                let named = with_host(|h| matches!(h.get(recv), Some(PyObj::Builtin(n)) if n == "type"));
+                if named {
+                    arg0()
+                } else {
+                    recv.clone()
+                }
+            } else {
+                recv.clone()
+            };
+            match with_host(|h| h.get_attr(&cls, "__mro__")).and_then(|m| host::iter_vec(&m)) {
+                Ok(items) => Ok(with_host(|h| h.new_list(items))),
+                Err(e) => Err(e),
+            }
+        }
+        "__instancecheck__" => call_builtin_function(
+            "isinstance",
+            vec![arg0(), recv.clone()],
+            vec![],
+        ),
+        "__subclasscheck__" => call_builtin_function(
+            "issubclass",
+            vec![arg0(), recv.clone()],
+            vec![],
+        ),
+        // `type.__prepare__` returns the mapping a class body is executed in.
+        // The base implementation hands back a plain empty dict.
+        "__prepare__" => Ok(with_host(|h| h.new_dict(Default::default()))),
+        // `cls.__call__(...)` IS constructing an instance.
+        "__call__" => host::invoke(recv, args.to_vec(), kwargs.to_vec()),
+        // `int.__or__(str)` is the `int | str` union, and `__ror__` the union
+        // with the operands the other way round.
+        "__or__" | "__ror__" => {
+            let (a, b) = if name == "__or__" {
+                (recv.clone(), arg0())
+            } else {
+                (arg0(), recv.clone())
+            };
+            with_host(|h| h.binop(host::binop::BITOR, &a, &b))
+        }
+        _ => return None,
+    })
+}
+
+/// The `object`-level surface on a USER instance — the slots a class inherits
+/// and does not override.
+///
+/// Reached only after the MRO lookup has missed, so a class that defines its own
+/// `__eq__`/`__repr__`/… never gets here. `object_dunder` cannot serve these:
+/// its `__setattr__` refuses every write (a builtin value has nowhere to put an
+/// attribute) where an instance has a `__dict__`, and its `__reduce__` cannot
+/// pickle where an instance pickles through `copyreg`.
+///
+/// `None` means "not an inherited slot", and the caller reports the miss.
+pub fn instance_object_dunder(
+    recv: &Value,
+    class: &str,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, String>> {
+    let arg0 = || args.first().cloned().unwrap_or(Value::Undef);
+    let attr_name = |v: &Value| with_host(|h| h.as_str(v));
+    let not_implemented = || Ok(with_host(|h| h.alloc(PyObj::NotImplemented)));
+    Some(match name {
+        // `object`'s equality IS identity, and it declines every ordering so the
+        // interpreter can try the reflected operand before reporting
+        // `'<' not supported between instances of 'A' and 'A'`.
+        "__eq__" | "__ne__" => {
+            if !same_object(recv, &arg0()) {
+                return Some(not_implemented());
+            }
+            Ok(Value::Bool(name == "__eq__"))
+        }
+        "__lt__" | "__le__" | "__gt__" | "__ge__" => return Some(not_implemented()),
+        "__hash__" => call_builtin_function("hash", vec![recv.clone()], vec![]),
+        "__repr__" | "__str__" => Ok(with_host(|h| {
+            let s = h.repr_of(recv);
+            h.new_str(s)
+        })),
+        // `object.__format__` accepts only the EMPTY spec; anything else is the
+        // error CPython raises rather than a silently ignored format.
+        "__format__" => match attr_name(&arg0()).as_deref() {
+            Some("") | None => Ok(with_host(|h| {
+                let s = h.str_of(recv);
+                h.new_str(s)
+            })),
+            Some(spec) => Err(host::type_error(&format!(
+                "unsupported format string passed to {class}.__format__ ({spec})"
+            ))),
+        },
+        "__sizeof__" => Ok(Value::Int(object_sizeof(recv))),
+        "__dir__" => Ok(with_host(|h| {
+            let items: Vec<Value> = h
+                .dir_names(recv)
+                .into_iter()
+                .map(|n| h.new_str(n))
+                .collect();
+            h.new_list(items)
+        })),
+        "__getattribute__" => match attr_name(&arg0()) {
+            Some(n) => with_host(|h| h.get_attr(recv, &n)),
+            None => Err(host::type_error("attribute name must be string")),
+        },
+        "__setattr__" => match attr_name(&arg0()) {
+            Some(n) => with_host(|h| h.set_attr(recv, &n, args.get(1).cloned().unwrap_or(Value::Undef)))
+                .map(|_| Value::Undef),
+            None => Err(host::type_error("attribute name must be string")),
+        },
+        "__delattr__" => match attr_name(&arg0()) {
+            Some(n) => with_host(|h| h.del_attr(recv, &n)).map(|_| Value::Undef),
+            None => Err(host::type_error("attribute name must be string")),
+        },
+        "__init__" | "__init_subclass__" => Ok(Value::Undef),
+        "__subclasshook__" => not_implemented(),
+        // The instance `__dict__` is the pickle state — `None` when empty, which
+        // is what makes `object().__getstate__()` None rather than `{}`.
+        "__getstate__" => Ok(instance_state(recv)),
+        "__reduce__" => instance_reduce(recv, class, 0),
+        "__reduce_ex__" => {
+            let p = with_host(|h| h.as_int(&arg0())).unwrap_or(0);
+            instance_reduce(recv, class, p)
+        }
+        _ => return None,
+    })
+}
+
+/// A user instance's pickle state: its `__dict__`, or `None` when it has no
+/// attributes at all.
+fn instance_state(recv: &Value) -> Value {
+    with_host(|h| {
+        let Some(PyObj::Instance(i)) = h.get(recv) else {
+            return Value::Undef;
+        };
+        let dict = i.dict.clone();
+        match h.get(&dict) {
+            Some(PyObj::Dict(d)) if !d.is_empty() => dict,
+            _ => Value::Undef,
+        }
+    })
+}
+
+/// `instance.__reduce__()` / `.__reduce_ex__(protocol)` — CPython's
+/// `object.__reduce_ex__`, which splits at protocol 2.
+///
+/// Below 2 it goes through `copyreg._reduce_ex`, whose recipe rebuilds the
+/// object with `copyreg._reconstructor(cls, base, state)`; at 2 and above
+/// `reduce_newobj` uses `copyreg.__newobj__` instead. Both callables come from
+/// the real module, because the pickler compares them by IDENTITY.
+fn instance_reduce(recv: &Value, class: &str, protocol: i64) -> Result<Value, String> {
+    let copyreg = host::import_module("copyreg")?;
+    let cls = with_host(|h| h.alloc(PyObj::Class(class.to_string())));
+    let state = instance_state(recv);
+    let (func, args) = if protocol >= 2 {
+        let f = with_host(|h| h.get_attr(&copyreg, "__newobj__"))?;
+        (f, with_host(|h| h.new_tuple(vec![cls])))
+    } else {
+        let f = with_host(|h| h.get_attr(&copyreg, "_reconstructor"))?;
+        let base = with_host(|h| h.alloc(PyObj::Builtin("object".into())));
+        (f, with_host(|h| h.new_tuple(vec![cls, base, Value::Undef])))
+    };
+    Ok(with_host(|h| {
+        // Protocol 2's recipe carries the two item-iterator slots; the older one
+        // stops at the state, and omits even that when there is none.
+        let items = if protocol >= 2 {
+            vec![func, args, state, Value::Undef, Value::Undef]
+        } else if matches!(state, Value::Undef) {
+            vec![func, args]
+        } else {
+            vec![func, args, state]
+        };
+        h.new_tuple(items)
+    }))
+}
+
 /// The attributes a builtin type carries beyond its own method table and the
 /// inherited `object` surface: the pickle hook `__getnewargs__`, the alternate
 /// constructors reached off an INSTANCE (`(5).from_bytes`), and the per-type
@@ -11542,6 +11874,9 @@ pub fn call_type_method(
         }
     }
     if let Some(r) = nt_instance_method(recv, name, &args, &kwargs) {
+        return r;
+    }
+    if let Some(r) = type_object_method(recv, name, &args, &kwargs) {
         return r;
     }
     // `cls.__subclasses__()` — the class's immediate user subclasses.

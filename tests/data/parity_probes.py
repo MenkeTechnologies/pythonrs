@@ -255,3 +255,41 @@ ABSENT = [("'a'", "__class_getitem__"), ("[1]", "__getnewargs__"), ("{1}", "__re
           ("[1]", "resize"), ("'a'", "__buffer__"), ("(1,)", "append")]
 for src, attr in ABSENT:
     print(src, attr, hasattr(eval(src), attr))
+#==#
+# ── the object surface on a user class, and the type surface on a class ─────
+class A:
+    x = 1
+class B(A):
+    pass
+a, b = A(), A()
+print(a.__eq__(a), a.__eq__(b), a.__ne__(b), a.__lt__(b), a.__hash__() == hash(a))
+print(a.__init__(), a.__getstate__(), A.__subclasshook__(int), A.__init_subclass__())
+print(a.__setattr__("z", 1), a.z, a.__getattribute__("z"), a.__delattr__("z"), hasattr(a, "z"))
+print(a.__format__("") == str(a), a.__repr__() == repr(a), a.__str__() == str(a))
+print(type(a.__sizeof__()).__name__, sorted(a.__dir__()) == dir(a))
+print(A.mro(), B.mro(), A.__base__, B.__base__, int.__base__, object.__base__)
+print(A.__instancecheck__(a), A.__instancecheck__(B()), B.__instancecheck__(a))
+print(A.__subclasscheck__(B), B.__subclasscheck__(A), int.__subclasscheck__(bool))
+print(A.__prepare__(), A.__type_params__, A.__text_signature__, int.__type_params__)
+print(A | int, int | A, list[A], type(A.__call__()).__name__, A.__subclasses__())
+print(sorted(dir(object())), len(dir(object())) == len(dir(object)))
+#==#
+# ── an unbound descriptor type-checks its receiver ─────────────────────────
+# Reached through the TYPE object, a method is CPython's unbound descriptor and
+# rejects a receiver of the wrong type before running — with two distinct
+# wordings, one for a C slot and one for a method-table entry. pythonrs answered
+# `AttributeError: 'int' object has no attribute 'lower'`, the wrong exception
+# type entirely, so `except TypeError` around descriptor plumbing missed it.
+CALLS = ["str.lower(5)", "str.upper('a')", "list.append(5, 1)", "dict.get(5, 1)",
+         "int.bit_length('a')", "int.bit_length(True)", "str.lower(True)",
+         "str.join(5, [])", "str.encode(b'a')", "bytes.decode('a')",
+         "float.is_integer(5)", "tuple.count((1, 2), 1)", "list.__len__([1, 2])",
+         "str.__len__(5)", "str.__contains__(5, 'a')", "list.__getitem__(5, 0)",
+         "dict.__contains__(5, 'a')", "set.__contains__(5, 1)", "str.__eq__(5, 'a')",
+         "str.__add__(5, 'a')", "list.__init__(5)", "int.__or__(str)",
+         "object.__repr__(5)[:12]", "object.__str__('a')"]
+for src in CALLS:
+    try:
+        print(src, "->", repr(eval(src)))
+    except BaseException as e:
+        print(src, "->", type(e).__name__, e)
