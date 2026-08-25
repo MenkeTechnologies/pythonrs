@@ -432,6 +432,31 @@ fn isinstance_of_type_for_type_objects() {
     assert_eq!(g("x = isinstance(5, type)", "x"), "False");
 }
 
+/// `property.__name__` — the attribute the property was bound to. Added in
+/// CPython 3.13, so it cannot live in tests/data/parity_probes.py: that corpus
+/// is compared against any reference from 3.9 on and a 3.12 `python3` has no
+/// such attribute at all. Pinned here, where the answer is asserted directly.
+#[test]
+fn property_name_is_the_attribute_it_was_bound_to() {
+    // The decorated form takes the decorated function's name…
+    assert_eq!(
+        g(
+            "class C:\n    @property\n    def x(self): return 1\nx = C.x.__name__",
+            "x"
+        ),
+        "'x'"
+    );
+    // …and the constructed form takes the class attribute it is assigned to,
+    // not the name of the getter passed in.
+    assert_eq!(
+        g(
+            "def get_v(self): return 'bare'\nclass C:\n    y = property(get_v)\nx = C.y.__name__",
+            "x"
+        ),
+        "'y'"
+    );
+}
+
 #[test]
 fn function_attributes() {
     // Functions carry a writable attribute dict (abc's __isabstractmethod__,

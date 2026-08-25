@@ -4621,7 +4621,9 @@ pub fn call_builtin_function(
     if let Some((tp, meth)) = name.split_once('.') {
         // A classmethod's first argument is not a receiver, so it must not be
         // peeled off here; each has its own handler above.
-        if is_builtin_type(tp) && type_has_method(tp, meth) && !type_classmethods(tp).contains(&meth)
+        if is_builtin_type(tp)
+            && type_has_method(tp, meth)
+            && !type_classmethods(tp).contains(&meth)
         {
             let Some(recv) = args.first().cloned() else {
                 return Err(host::type_error(&format!(
@@ -5565,12 +5567,14 @@ pub fn call_builtin_function(
                 .cloned()
                 .or_else(|| kw_get(&kwargs, "fdel"))
                 .unwrap_or(Value::Undef);
-            Ok(with_host(|h| h.alloc(PyObj::Property {
-                fget,
-                fset,
-                fdel,
-                name: String::new(),
-            })))
+            Ok(with_host(|h| {
+                h.alloc(PyObj::Property {
+                    fget,
+                    fset,
+                    fdel,
+                    name: String::new(),
+                })
+            }))
         }
         "vars" => match args.first() {
             // `vars(obj)` == `obj.__dict__`.
@@ -11557,7 +11561,8 @@ fn type_object_method(
         "mro" => {
             // `type.mro(int)` passes the class as an argument instead.
             let cls = if matches!(recv, Value::Obj(_)) && !args.is_empty() {
-                let named = with_host(|h| matches!(h.get(recv), Some(PyObj::Builtin(n)) if n == "type"));
+                let named =
+                    with_host(|h| matches!(h.get(recv), Some(PyObj::Builtin(n)) if n == "type"));
                 if named {
                     arg0()
                 } else {
@@ -11571,16 +11576,12 @@ fn type_object_method(
                 Err(e) => Err(e),
             }
         }
-        "__instancecheck__" => call_builtin_function(
-            "isinstance",
-            vec![arg0(), recv.clone()],
-            vec![],
-        ),
-        "__subclasscheck__" => call_builtin_function(
-            "issubclass",
-            vec![arg0(), recv.clone()],
-            vec![],
-        ),
+        "__instancecheck__" => {
+            call_builtin_function("isinstance", vec![arg0(), recv.clone()], vec![])
+        }
+        "__subclasscheck__" => {
+            call_builtin_function("issubclass", vec![arg0(), recv.clone()], vec![])
+        }
         // `type.__prepare__` returns the mapping a class body is executed in.
         // The base implementation hands back a plain empty dict.
         "__prepare__" => Ok(with_host(|h| h.new_dict(Default::default()))),
@@ -11660,8 +11661,10 @@ pub fn instance_object_dunder(
             None => Err(host::type_error("attribute name must be string")),
         },
         "__setattr__" => match attr_name(&arg0()) {
-            Some(n) => with_host(|h| h.set_attr(recv, &n, args.get(1).cloned().unwrap_or(Value::Undef)))
-                .map(|_| Value::Undef),
+            Some(n) => {
+                with_host(|h| h.set_attr(recv, &n, args.get(1).cloned().unwrap_or(Value::Undef)))
+                    .map(|_| Value::Undef)
+            }
             None => Err(host::type_error("attribute name must be string")),
         },
         "__delattr__" => match attr_name(&arg0()) {
@@ -12356,12 +12359,14 @@ fn property_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
     };
     // The copy keeps the original's learned name: `@x.setter` rebinds the same
     // class key, and CPython's `property.setter` copies `__name__` across.
-    Ok(with_host(|h| h.alloc(PyObj::Property {
-                fget,
-                fset,
-                fdel,
-                name: pname,
-            })))
+    Ok(with_host(|h| {
+        h.alloc(PyObj::Property {
+            fget,
+            fset,
+            fdel,
+            name: pname,
+        })
+    }))
 }
 
 /// Prefixes for `str.startswith`/`endswith`: a single str, or every str in a

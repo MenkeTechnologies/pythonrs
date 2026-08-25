@@ -2213,7 +2213,11 @@ impl PyHost {
             Some(PyObj::Generator { id }) => {
                 let g = &self.generators[*id as usize];
                 let running = g.coro.is_none() && !g.done;
-                Some((g.func_name.clone(), running, g.started && !g.done && !running))
+                Some((
+                    g.func_name.clone(),
+                    running,
+                    g.started && !g.done && !running,
+                ))
             }
             _ => None,
         }
@@ -9996,7 +10000,10 @@ impl PyHost {
             // `yield from` — reporting `None` for any of them would be a
             // wrong answer rather than a missing one.
             Some(PyObj::Generator { .. })
-                if matches!(name, "__name__" | "__qualname__" | "gi_running" | "gi_suspended") =>
+                if matches!(
+                    name,
+                    "__name__" | "__qualname__" | "gi_running" | "gi_suspended"
+                ) =>
             {
                 let Some((fname, running, suspended)) = self.gen_state(recv) else {
                     return Err(format!(
@@ -10720,7 +10727,9 @@ impl PyHost {
             // `range` read-only attributes. Unlike `slice`, these are always
             // integers — `range` normalizes its omitted bounds at construction,
             // so `range(3).start` is `0` and `range(3).step` is `1`.
-            Some(PyObj::Range { start, stop, step }) if matches!(name, "start" | "stop" | "step") => {
+            Some(PyObj::Range { start, stop, step })
+                if matches!(name, "start" | "stop" | "step") =>
+            {
                 Ok(Value::Int(match name {
                     "start" => *start,
                     "stop" => *stop,
@@ -12595,8 +12604,7 @@ fn call_method_inner(
             // finds `object.__eq__` and succeeds, so `__getattr__` is never
             // consulted for one of these.
             if crate::builtins::OBJECT_METHOD_DUNDERS.contains(&name) {
-                if let Some(r) =
-                    crate::builtins::instance_object_dunder(recv, &class, name, &args)
+                if let Some(r) = crate::builtins::instance_object_dunder(recv, &class, name, &args)
                 {
                     return r;
                 }

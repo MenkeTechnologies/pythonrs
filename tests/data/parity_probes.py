@@ -380,7 +380,10 @@ class C:
         self._x = v * 2
     y = property(get_v)
 p, c = C.x, C()
-print(p.fget.__name__, p.fset.__name__, p.fdel, p.__name__, C.y.__name__)
+# `property.__name__` is 3.13+, and this corpus is compared against any
+# reference from 3.9 on, so it is pinned in tests/lang.rs
+# (property_name_is_the_attribute_it_was_bound_to) instead of here.
+print(p.fget.__name__, p.fset.__name__, p.fdel)
 print(p.__isabstractmethod__, p.__get__(None, C) is p)
 print(p.__get__(c), p.__set__(c, 5), p.__get__(c), c._x)
 try:
@@ -388,7 +391,7 @@ try:
 except AttributeError as e:
     print("AttributeError:", e)
 print([n for n in ["fget", "fset", "fdel", "__get__", "__set__", "__delete__",
-                   "__set_name__", "__name__", "__isabstractmethod__",
+                   "__set_name__", "__isabstractmethod__",
                    "getter", "setter", "deleter"] if n not in dir(p)])
 #==#
 # ── a generator knows its own name and whether it is parked ────────────────
