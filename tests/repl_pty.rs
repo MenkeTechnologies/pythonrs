@@ -101,7 +101,34 @@ fn drive_repl(lines: &[&str], stdlib: &std::path::Path) -> Option<(String, bool)
 
     let mut out: Vec<u8> = Vec::new();
     let mut sent = 0usize;
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(60);
+
+    // Wait for the prompt before typing anything. Sending on a timer instead
+    // made this test FLAKY in exactly the direction that hides the bug: on a
+    // cold binary the child needs longer to reach its prompt than any idle
+    // threshold worth using, so the driver typed every line plus EOF into a
+    // process that had not started reading, then reported the missing reply as
+    // a failure. Readiness is a fact to observe, not an interval to guess.
+    while Instant::now() < deadline {
+        let ready = {
+            let seen = String::from_utf8_lossy(&out);
+            seen.contains(">>>") || seen.contains("type an expression")
+        };
+        if ready {
+            break;
+        }
+        match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(chunk) => {
+                if chunk.windows(4).any(|w| w == b"\x1b[6n") {
+                    let _ = pty.write_all(b"\x1b[1;1R");
+                }
+                out.extend_from_slice(&chunk);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(_) => {}
+        }
+    }
+
     let mut quiet = 0;
     while Instant::now() < deadline {
         match rx.recv_timeout(Duration::from_millis(300)) {
