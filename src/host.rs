@@ -1720,6 +1720,36 @@ thread_local! {
 }
 
 thread_local! {
+    /// Native recursion depth inside [`PyHost::equal`], and whether it was ever
+    /// exceeded since the flag was last read.
+    ///
+    /// A self-referential container compared against a DIFFERENT self-referential
+    /// container recurses forever — `a = [1]; a.append(a); b = [1]; b.append(b);
+    /// a == b` walked the cycle until the native stack was gone and the process
+    /// ABORTED, where CPython raises a catchable RecursionError. `equal` returns
+    /// a bare `bool` and cannot report an error, so it records one here and the
+    /// operator entry points turn it into the exception.
+    static EQUAL_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static EQUAL_OVERFLOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// How deep `equal` may nest before it gives up. Comfortably past any real
+/// data — CPython's own comparison limit is the same order — and far short of
+/// the native stack.
+const EQUAL_DEPTH_LIMIT: u32 = 1000;
+
+/// Take the "comparison recursed too deeply" flag, clearing it. `true` means the
+/// last comparison gave up and its `false` answer is not an answer.
+pub fn equal_overflowed() -> bool {
+    EQUAL_OVERFLOW.with(|c| c.replace(false))
+}
+
+/// The error that flag stands for.
+pub fn comparison_recursion_error() -> String {
+    "RecursionError: maximum recursion depth exceeded in comparison".to_string()
+}
+
+thread_local! {
     /// Op-index → source span, keyed by the owning chunk's `op_hash` (stable
     /// across the clones made per call). The compiler registers one table per
     /// chunk it builds; `record_err_line` looks the failing op's span up here to
@@ -4513,6 +4543,33 @@ impl PyHost {
 
     /// Structural equality (`==`).
     pub fn equal(&self, a: &Value, b: &Value) -> bool {
+        // Depth-guarded: two DIFFERENT self-referential containers recurse
+        // without end, and aborting the process is not an answer. See
+        // `EQUAL_DEPTH`.
+        let depth = EQUAL_DEPTH.with(|d| {
+            let n = d.get() + 1;
+            d.set(n);
+            n
+        });
+        let r = if depth > EQUAL_DEPTH_LIMIT {
+            EQUAL_OVERFLOW.with(|c| c.set(true));
+            false
+        } else {
+            self.equal_inner(a, b)
+        };
+        EQUAL_DEPTH.with(|d| d.set(d.get() - 1));
+        r
+    }
+
+    /// One ELEMENT of a container comparison. CPython's `PyObject_RichCompareBool`
+    /// shortcuts on identity first, which is why `a = [1]; a.append(a); a == a`
+    /// is `True` rather than an endless walk of the cycle — the third element IS
+    /// the list being compared.
+    fn elem_equal(&self, p: &Value, q: &Value) -> bool {
+        matches!((p, q), (Value::Obj(i), Value::Obj(j)) if i == j) || self.equal(p, q)
+    }
+
+    fn equal_inner(&self, a: &Value, b: &Value) -> bool {
         // A builtin-subclass instance with no `__eq__` override compares by its
         // native payload value (`'cat' == U('cat')`, `Stack([1]) == [1]`).
         let ua;
@@ -4575,12 +4632,14 @@ impl PyHost {
                     (Some(PyObj::Str(x)), Some(PyObj::Str(y))) => x == y,
                     (Some(PyObj::List(x)), Some(PyObj::List(y)))
                     | (Some(PyObj::Tuple(x)), Some(PyObj::Tuple(y))) => {
-                        x.len() == y.len() && x.iter().zip(y).all(|(p, q)| self.equal(p, q))
+                        x.len() == y.len() && x.iter().zip(y).all(|(p, q)| self.elem_equal(p, q))
                     }
                     (Some(PyObj::Dict(x)), Some(PyObj::Dict(y))) => {
                         x.len() == y.len()
                             && x.iter().all(|(k, (_, xv))| {
-                                y.get(k).map(|(_, yv)| self.equal(xv, yv)).unwrap_or(false)
+                                y.get(k)
+                                    .map(|(_, yv)| self.elem_equal(xv, yv))
+                                    .unwrap_or(false)
                             })
                     }
                     // `set == frozenset` compares by membership, so
@@ -4592,7 +4651,7 @@ impl PyHost {
                         x.len() == y.len() && x.keys().all(|k| y.contains_key(k))
                     }
                     (Some(PyObj::Deque { items: x, .. }), Some(PyObj::Deque { items: y, .. })) => {
-                        x.len() == y.len() && x.iter().zip(y).all(|(p, q)| self.equal(p, q))
+                        x.len() == y.len() && x.iter().zip(y).all(|(p, q)| self.elem_equal(p, q))
                     }
                     // Two unions are equal iff they hold the same members, order
                     // irrelevant: `int | str == str | int`, as in CPython.
@@ -5812,8 +5871,13 @@ fn quote_bytes(b: &[u8], is_bytearray: bool) -> String {
     out
 }
 
-/// Number of elements in `range(start, stop, step)`.
-pub fn range_len(start: i64, stop: i64, step: i64) -> i64 {
+/// Number of elements in `range(start, stop, step)`, EXACTLY — in `i128`,
+/// because the count of a range spanning the i64 domain does not fit an i64.
+///
+/// `len(range(sys.maxsize))` computed `stop - start + step - 1` in `i64` and
+/// overflowed on the `+ step`, panicking the debug build outright.
+pub fn range_len_exact(start: i64, stop: i64, step: i64) -> i128 {
+    let (start, stop, step) = (start as i128, stop as i128, step as i128);
     if step == 0 {
         return 0;
     }
@@ -5828,6 +5892,15 @@ pub fn range_len(start: i64, stop: i64, step: i64) -> i64 {
     } else {
         0
     }
+}
+
+/// Number of elements in `range(start, stop, step)`, saturated to `i64::MAX`.
+///
+/// Every caller but `len()` uses the count for indexing and iteration, where a
+/// range longer than `i64::MAX` cannot be exhausted anyway; `len()` reads
+/// [`range_len_exact`] so it can report the OverflowError CPython raises.
+pub fn range_len(start: i64, stop: i64, step: i64) -> i64 {
+    range_len_exact(start, stop, step).min(i64::MAX as i128) as i64
 }
 
 /// Number of elements in a bignum `range(start, stop, step)`.

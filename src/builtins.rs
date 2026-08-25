@@ -2949,11 +2949,15 @@ fn b_try(vm: &mut VM, _: u8) -> Value {
                     });
                     let hres = host::run_chunk_on(hbody.clone());
                     match hres {
-                        Ok(_) => with_host(|h| {
-                            if h.signal.is_none() {
-                                h.exc = entry_exc.clone();
-                            }
-                        }),
+                        // Unconditionally, signal or not: leaving the handler by
+                        // `return` also leaves the exception state, exactly as
+                        // in CPython. Skipping the restore when a return was
+                        // pending left the handled exception installed as
+                        // "currently being handled" for the rest of the program,
+                        // so the next unrelated `raise` anywhere picked it up as
+                        // its implicit `__context__` and printed a spurious
+                        // "During handling of the above exception" block.
+                        Ok(_) => with_host(|h| h.exc = entry_exc.clone()),
                         Err(e2) => pending = Some(e2),
                     }
                     if let Some(name) = bind {
@@ -3478,6 +3482,18 @@ fn foreign_binop_func(op: NumOp) -> Option<&'static str> {
 ///   EXACTLY — `3**34 == float(3**34)` is False — so only a host that keeps the
 ///   integer exact can answer it. See `PyHost::rounding_int_float_pair`.
 pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
+    let r = numeric_hook_inner(op, a, b);
+    // A comparison that gave up walking a cyclic structure answered `false` for
+    // want of any way to report an error — `PyHost::equal` returns a bare bool.
+    // It is not an answer, so it becomes the RecursionError CPython raises
+    // rather than a silently wrong `False`.
+    if host::equal_overflowed() {
+        return Err(host::comparison_recursion_error());
+    }
+    r
+}
+
+fn numeric_hook_inner(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
     use NumOp::*;
     // A builtin-type subclass operand with no operator override delegates to its
     // native payload, so `C(5) + 3` runs int arithmetic (yielding a plain `int`)
@@ -6209,7 +6225,15 @@ pub fn py_len(v: &Value) -> Result<usize, String> {
             })
         }
         Some(PyObj::Range { start, stop, step }) => {
-            Ok(host::range_len(*start, *stop, *step).max(0) as usize)
+            // `range_length` hands `len()` a `PyObject*` that then goes through
+            // `PyLong_AsSsize_t`, so a count past the platform word raises
+            // rather than truncating — `len(range(-sys.maxsize - 1, sys.maxsize))`
+            // is an OverflowError even though the range itself is fine.
+            i64::try_from(host::range_len_exact(*start, *stop, *step).max(0))
+                .map(|n| n as usize)
+                .map_err(|_| {
+                    "OverflowError: Python int too large to convert to C ssize_t".to_string()
+                })
         }
         Some(PyObj::BigRange { start, stop, step }) => {
             use num_traits::ToPrimitive;

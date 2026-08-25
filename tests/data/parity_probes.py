@@ -293,3 +293,71 @@ for src in CALLS:
         print(src, "->", repr(eval(src)))
     except BaseException as e:
         print(src, "->", type(e).__name__, e)
+#==#
+# ── the exception state is left behind on EVERY exit from a handler ─────────
+# Returning out of an `except` block skipped the restore, so the handled
+# exception stayed installed as "currently being handled" for the rest of the
+# program and the next unrelated `raise` anywhere picked it up as its implicit
+# `__context__` — printing a spurious "During handling of the above exception".
+def ret_from_handler():
+    try:
+        raise KeyError("k")
+    except KeyError:
+        return "returned"
+print(ret_from_handler())
+try:
+    raise ValueError("v")
+except ValueError as e:
+    print(repr(e.__context__), e.__suppress_context__)
+def ret_with_finally():
+    try:
+        raise IndexError("i")
+    except IndexError:
+        return 1
+    finally:
+        pass
+ret_with_finally()
+try:
+    raise TypeError("t")
+except TypeError as e:
+    print(repr(e.__context__))
+# the context that SHOULD be there still is
+try:
+    try:
+        raise KeyError("inner")
+    except KeyError:
+        raise ValueError("during")
+except ValueError as e:
+    print(repr(e.__context__), repr(e.__cause__))
+#==#
+# ── range over the whole word, and cyclic containers ───────────────────────
+import sys
+M = sys.maxsize
+print(len(range(M)), len(range(-M, M, 2)), len(range(M, M)), len(range(0)))
+print(range(-M - 1, M), range(-M - 1, M)[0], range(M)[M - 1], bool(range(M)))
+for src in ["len(range(-M - 1, M))", "len(range(M, -M - 1, -1))"]:
+    try:
+        print(src, "->", eval(src))
+    except BaseException as e:
+        print(src, "->", type(e).__name__, e)
+# A container that contains itself: the identity shortcut in element comparison
+# is what makes this terminate at all.
+a = [1, 2]
+a.append(a)
+b = [1, 2]
+b.append(b)
+print(a, a == a, len(a))
+d = {}
+d["self"] = d
+print(d, d == d)
+t = ([],)
+t[0].append(t)
+print(t)
+# Two DIFFERENT cycles have no shortcut, and recursing the whole way used to
+# abort the process outright. Only the exception TYPE is compared: 3.14 words it
+# with a machine-dependent stack size.
+for src in ["a == b", "d == {'self': {'self': 1}}"]:
+    try:
+        print(src, "->", eval(src))
+    except BaseException as e:
+        print(src, "->", type(e).__name__)
