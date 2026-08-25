@@ -1675,12 +1675,19 @@ fn iter_membership(container: &Value, item: &Value) -> Result<bool, String> {
 fn b_is(vm: &mut VM, _: u8) -> Value {
     let b = vm.pop();
     let a = vm.pop();
-    let same = match (&a, &b) {
+    Value::Bool(same_object(&a, &b))
+}
+
+/// `a is b` — the one definition of pythonrs identity, shared by the `is`
+/// operator and by `object.__eq__`, whose equality IS identity for a type with
+/// no rich-comparison slot of its own.
+pub fn same_object(a: &Value, b: &Value) -> bool {
+    match (a, b) {
         (Value::Obj(x), Value::Obj(y)) => {
             // Type / builtin objects are conceptual singletons: `type(5) is int`
             // and `type(b) is B` hold even across distinct heap allocations.
             x == y
-                || with_host(|h| match (h.get(&a), h.get(&b)) {
+                || with_host(|h| match (h.get(a), h.get(b)) {
                     (Some(PyObj::Class(m)), Some(PyObj::Class(n))) => m == n,
                     (Some(PyObj::Builtin(m)), Some(PyObj::Builtin(n))) => m == n,
                     // `Ellipsis`/`NotImplemented` are singletons: any two
@@ -1702,8 +1709,7 @@ fn b_is(vm: &mut VM, _: u8) -> Value {
         (Value::Int(x), Value::Int(y)) => x == y,
         (Value::Float(x), Value::Float(y)) => x == y,
         _ => false,
-    };
-    Value::Bool(same)
+    }
 }
 
 // ── control ──────────────────────────────────────────────────────────────────
@@ -3722,6 +3728,96 @@ pub fn shadows_builtin_type(name: &str) -> bool {
         )
 }
 
+/// Exactly `dir(object)` in CPython 3.14: the attribute surface EVERY value
+/// inherits, whatever its type.
+///
+/// This is the list `dir()` was short by on every builtin type — `dir('a')` was
+/// 24 names shy of CPython's, `dir([1])` 26, `dir(5)` 15 — because pythonrs
+/// enumerated only each type's OWN methods plus five inherited names. The gap
+/// was not cosmetic: `suggest::did_you_mean` computes its `Did you mean:` hint
+/// from this list, so `'a'.__setitem__` raised the right `AttributeError`
+/// without the clause CPython appends, and `[].__eq__` was an attribute error
+/// where CPython hands back a bound method.
+///
+/// Ordered as `dir()` reports it (sorted), and asserted against a live
+/// `python3` by `tests/data/parity_probes.py`.
+pub const OBJECT_DUNDERS: &[&str] = &[
+    "__class__",
+    "__delattr__",
+    "__dir__",
+    "__doc__",
+    "__eq__",
+    "__format__",
+    "__ge__",
+    "__getattribute__",
+    "__getstate__",
+    "__gt__",
+    "__hash__",
+    "__init__",
+    "__init_subclass__",
+    "__le__",
+    "__lt__",
+    "__ne__",
+    "__new__",
+    "__reduce__",
+    "__reduce_ex__",
+    "__repr__",
+    "__setattr__",
+    "__sizeof__",
+    "__str__",
+    "__subclasshook__",
+];
+
+/// The subset of [`OBJECT_DUNDERS`] that is reached as a bound METHOD and
+/// dispatched by [`call_type_method`].
+///
+/// `__class__` and `__doc__` are data attributes, resolved by `PyHost::get_attr`
+/// before any method lookup; `__new__` is the type's constructor, reached
+/// through the type object. Everything else here is callable off a value.
+pub const OBJECT_METHOD_DUNDERS: &[&str] = &[
+    "__delattr__",
+    "__dir__",
+    "__eq__",
+    "__format__",
+    "__ge__",
+    "__getattribute__",
+    "__getstate__",
+    "__gt__",
+    "__hash__",
+    "__init__",
+    "__init_subclass__",
+    "__le__",
+    "__lt__",
+    "__ne__",
+    "__reduce__",
+    "__reduce_ex__",
+    "__repr__",
+    "__setattr__",
+    "__sizeof__",
+    "__str__",
+    "__subclasshook__",
+];
+
+/// The builtin types whose `__hash__` is `None` — CPython sets the slot to
+/// `None` rather than removing it, so `[].__hash__` READS as `None` and only
+/// calling it fails (`TypeError: 'NoneType' object is not callable`).
+/// `hasattr([], '__hash__')` is therefore True, which is why these cannot
+/// simply be dropped from [`OBJECT_DUNDERS`].
+pub const UNHASHABLE_TYPES: &[&str] = &[
+    "list",
+    "dict",
+    "set",
+    "bytearray",
+    "deque",
+    "defaultdict",
+    "OrderedDict",
+    "Counter",
+    "dict_keys",
+    "dict_values",
+    "dict_items",
+    "array",
+];
+
 /// The dunders whose presence depends on the receiver's type, so calling one a
 /// type does not have must report the missing ATTRIBUTE rather than letting the
 /// native operation answer with its own complaint. Kept narrow on purpose: the
@@ -3841,7 +3937,13 @@ pub fn is_object_dunder_method(tn: &str, name: &str) -> bool {
     ];
 
     match name {
-        "__str__" | "__repr__" => true,
+        // Inherited from `object`, so present on every value regardless of type.
+        // `__sizeof__` reports pythonrs's own object footprint rather than
+        // CPython's byte count — the number is implementation-defined and no two
+        // implementations agree on it — but the METHOD is there and answers an
+        // int, where before the call raised `AttributeError` while `dir()`
+        // listed the name.
+        n if OBJECT_METHOD_DUNDERS.contains(&n) => true,
         "__bool__" => HAS_BOOL.contains(&tn),
         "__len__" => SIZED.contains(&tn),
         "__iter__" => SIZED.contains(&tn) || LAZY.contains(&tn),
@@ -9917,6 +10019,31 @@ const ITER_PROTOCOL_TYPES: &[&str] = &[
 /// and `builtin_dispatch_is_fully_listed_by_dir` (tests/lang.rs) assert in both
 /// directions that they cannot drift apart.
 pub fn type_dir_names(typename: &str) -> Vec<&'static str> {
+    let mut out = own_dir_names(typename);
+    // Everything inherits `object`'s surface — but only for a type pythonrs
+    // actually models. An unknown name still answers with an empty list, which
+    // is what keeps `dir()` from inventing a surface for a value whose type has
+    // no entry here at all.
+    if inherits_object_surface(typename) {
+        out.extend_from_slice(OBJECT_DUNDERS);
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Whether `typename` is a type pythonrs models at all, and so one that carries
+/// the inherited [`OBJECT_DUNDERS`].
+///
+/// Read by BOTH `dir()` and [`type_has_method`], so a name cannot be listed
+/// without dispatching or dispatch without being listed.
+fn inherits_object_surface(typename: &str) -> bool {
+    OBJECT_ONLY_TYPES.contains(&typename) || !own_dir_names(typename).is_empty()
+}
+
+/// The attribute names `typename` defines ITSELF — its own methods and the
+/// dunders its own type rules grant it, without the inherited `object` surface.
+fn own_dir_names(typename: &str) -> Vec<&'static str> {
     let mut out: Vec<&'static str> = Vec::new();
     if let Some(list) = type_method_names(typename) {
         out.extend_from_slice(list);
@@ -10001,14 +10128,41 @@ pub fn type_dir_names(typename: &str) -> Vec<&'static str> {
     if CONTAINS_TYPES.contains(&typename) {
         out.push("__contains__");
     }
-    out.sort_unstable();
-    out.dedup();
+    // The type-dependent dunders, read from the SAME predicate `getattr` uses,
+    // so `dir()` and dispatch cannot disagree about them. Listing them by hand
+    // is what let `dir([1])` omit `__setitem__`/`__len__`/`__iter__` while
+    // `[1].__setitem__(0, 2)` worked perfectly well.
+    for n in CONTAINER_DUNDERS {
+        if is_object_dunder_method(typename, n) {
+            out.push(n);
+        }
+    }
     out
 }
+
+/// The types whose ENTIRE attribute surface is `object`'s (plus, for `NoneType`,
+/// the `__bool__` that [`is_object_dunder_method`] grants it). They have no
+/// method table and no rule above, so without this list `dir(None)`,
+/// `dir(object())` and `dir(...)` all came back EMPTY against CPython's 25, 24
+/// and 24.
+const OBJECT_ONLY_TYPES: &[&str] = &["object", "NoneType", "ellipsis", "NotImplementedType"];
 
 /// Whether `typename` responds to method `name` (used by `getattr`/bound
 /// methods to distinguish a method from an `AttributeError`).
 pub fn type_has_method(typename: &str, name: &str) -> bool {
+    // The `object` surface every modeled type inherits. `__class__`, `__doc__`
+    // and `__new__` are reached as data/constructor attributes rather than
+    // through `call_type_method`, but `getattr` produces all three, and this
+    // predicate answers for `getattr` — not for one dispatch path.
+    if OBJECT_DUNDERS.contains(&name) && inherits_object_surface(typename) {
+        return true;
+    }
+    // The type-dependent container dunders, from the one predicate that decides
+    // them. `(1, 2).__setitem__` stays an `AttributeError` because `tuple` is
+    // not mutable there — the grant is per type, never blanket.
+    if CONTAINER_DUNDERS.contains(&name) && is_object_dunder_method(typename, name) {
+        return true;
+    }
     // `__contains__` is a real bound method on every builtin container in CPython
     // (`frozenset(kwlist).__contains__` is exactly how the stdlib `keyword.py`
     // builds `iskeyword`). Recognize it explicitly — it is kept OUT of the
@@ -10757,6 +10911,319 @@ fn context_var_method(recv: &Value, name: &str, args: &[Value]) -> Option<Result
     })
 }
 
+/// Which operand types a builtin type's rich-comparison slot ACCEPTS.
+///
+/// A slot that does not accept the other operand answers `NotImplemented` — it
+/// does not answer `False`, and it does not raise. That distinction is what lets
+/// the interpreter try the reflected operand and only then report
+/// `'<' not supported between instances of …`, so getting it wrong here would
+/// make `x.__eq__(y)` a silently different answer from `x == y`.
+///
+/// The groups are CPython's `tp_richcompare` implementations, and they are NOT
+/// symmetric: `long_richcompare` takes only integers, so `(5).__eq__(1.5)` is
+/// `NotImplemented`, while `float_richcompare` converts, so `(1.5).__eq__(5)` is
+/// `False`. Same for `bytes` (bytes only) against `bytearray` (any buffer).
+/// Measured against CPython 3.14.7 as a full 17x17 matrix.
+fn richcmp_accepts(tn: &str, other: &str, ordering: bool) -> bool {
+    match tn {
+        // `long_richcompare`: integers only (`bool` IS an integer).
+        "int" | "bool" => matches!(other, "int" | "bool"),
+        // `float_richcompare` widens an integer operand.
+        "float" => matches!(other, "float" | "int" | "bool"),
+        // `complex_richcompare` handles equality across the numeric tower and
+        // refuses every ordering, complex-to-complex included.
+        "complex" => !ordering && matches!(other, "complex" | "float" | "int" | "bool"),
+        "str" | "list" | "tuple" | "slice" => other == tn,
+        // `dict_richcompare` and `range_richcompare` implement equality only.
+        "dict" | "defaultdict" | "OrderedDict" | "Counter" => {
+            !ordering && matches!(other, "dict" | "defaultdict" | "OrderedDict" | "Counter")
+        }
+        "range" => !ordering && other == "range",
+        "set" | "frozenset" => matches!(other, "set" | "frozenset"),
+        "bytes" => other == "bytes",
+        "bytearray" => matches!(other, "bytes" | "bytearray"),
+        "deque" | "array" | "memoryview" => other == tn,
+        // Everything else has no slot of its own and inherits
+        // `object_richcompare`: equality is IDENTITY, and there is no ordering.
+        // The caller resolves the identity part, since a type name cannot.
+        _ => false,
+    }
+}
+
+/// The builtin types that inherit `object_richcompare` — `x == y` is `x is y`,
+/// and every ordering is `NotImplemented`.
+fn richcmp_by_identity(tn: &str) -> bool {
+    !richcmp_accepts(tn, tn, false) && !richcmp_accepts(tn, tn, true)
+}
+
+/// pythonrs's own `x.__sizeof__()` — a fixed object header plus the bytes the
+/// payload occupies here.
+///
+/// CPython's number is the C struct's `tp_basicsize` and no two implementations
+/// agree on it (`(5).__sizeof__()` is 28 there because a CPython int is a
+/// digit-array object). Reporting pythonrs's footprint is the honest answer;
+/// reporting CPython's would be a hard-coded lie about a different runtime.
+fn object_sizeof(recv: &Value) -> i64 {
+    const HEADER: i64 = 16;
+    const SLOT: i64 = std::mem::size_of::<Value>() as i64;
+    with_host(|h| {
+        HEADER
+            + match h.get(recv) {
+                Some(PyObj::Str(s)) => s.len() as i64,
+                Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) => b.len() as i64,
+                Some(PyObj::List(items)) | Some(PyObj::Tuple(items)) => items.len() as i64 * SLOT,
+                Some(PyObj::Dict(d)) => d.len() as i64 * SLOT * 2,
+                Some(PyObj::Set(s)) => s.len() as i64 * SLOT,
+                Some(PyObj::Frozenset(s)) => s.len() as i64 * SLOT,
+                _ => SLOT,
+            }
+    })
+}
+
+/// `x.__reduce_ex__(protocol)`'s `(callable, args, state, listitems, dictitems)`
+/// tuple for protocol >= 2 — CPython's `reduce_newobj` (`Objects/typeobject.c`).
+///
+/// `copyreg.__newobj__` is the real module's function: it is the object the
+/// pickler compares against by identity, so a native look-alike would not be the
+/// same recipe. Under `--no-default-features` there is no `copyreg` (and no
+/// `pickle` to consume the result), so the import error surfaces as-is.
+fn reduce_newobj(recv: &Value, tn: &str) -> Result<Value, String> {
+    let copyreg = host::import_module("copyreg")?;
+    let newobj = with_host(|h| h.get_attr(&copyreg, "__newobj__"))?;
+    let cls = with_host(|h| h.alloc(PyObj::Builtin(tn.to_string())));
+    // `_PyObject_GetNewArguments`: the arguments `cls.__new__` needs to rebuild
+    // an immutable value. A container rebuilds empty and is refilled from the
+    // list/dict iterators instead.
+    let mut newargs = vec![cls];
+    if let Ok(extra) = type_getnewargs(recv, tn) {
+        newargs.extend(extra);
+    }
+    let (listitems, dictitems) = with_host(|h| match h.get(recv) {
+        Some(PyObj::List(_)) => (h.make_iter(recv).ok(), None),
+        Some(PyObj::Dict(_)) => {
+            let items = h.alloc(PyObj::DictView {
+                dict: recv.clone(),
+                kind: 2,
+            });
+            (None, h.make_iter(&items).ok())
+        }
+        _ => (None, None),
+    });
+    Ok(with_host(|h| {
+        let args = h.new_tuple(newargs);
+        let items = [
+            newobj,
+            args,
+            Value::Undef,
+            listitems.unwrap_or(Value::Undef),
+            dictitems.unwrap_or(Value::Undef),
+        ];
+        h.new_tuple(items.to_vec())
+    }))
+}
+
+/// `x.__getnewargs__()`'s elements for the builtin types that define one — the
+/// value itself for the immutable scalars, the two coordinates for `complex`.
+/// `Err` for a type with no `__getnewargs__` at all.
+fn type_getnewargs(recv: &Value, tn: &str) -> Result<Vec<Value>, String> {
+    match tn {
+        "str" | "bytes" | "float" | "tuple" => Ok(vec![recv.clone()]),
+        // `True.__getnewargs__()` is `(1,)`: the argument `bool.__new__` takes is
+        // an int, not the bool itself.
+        "int" | "bool" => Ok(vec![match recv {
+            Value::Bool(b) => Value::Int(*b as i64),
+            other => other.clone(),
+        }]),
+        "complex" => match with_host(|h| h.get(recv).cloned()) {
+            Some(PyObj::Complex(r, i)) => Ok(vec![Value::Float(r), Value::Float(i)]),
+            _ => Ok(vec![Value::Float(0.0), Value::Float(0.0)]),
+        },
+        _ => Err(format!(
+            "AttributeError: '{tn}' object has no attribute '__getnewargs__'"
+        )),
+    }
+}
+
+/// `x.__reduce__()` and `x.__reduce_ex__(protocol)` on a builtin value.
+///
+/// The six types that define their own `__reduce__` in CPython return their
+/// exact recipe at every protocol. Every other builtin has none, so
+/// `object.__reduce_ex__` falls to `copyreg._reduce_ex`, whose `base is cls`
+/// branch RAISES for a non-heap type — which is why `(5).__reduce__()` is a
+/// `TypeError` rather than a pickle recipe. Protocol >= 2 skips `copyreg` and
+/// takes `reduce_newobj` instead.
+fn object_reduce(recv: &Value, tn: &str, protocol: Option<i64>) -> Result<Value, String> {
+    let own = |args: Vec<Value>| {
+        with_host(|h| {
+            let cls = h.alloc(PyObj::Builtin(tn.to_string()));
+            let a = h.new_tuple(args);
+            h.new_tuple(vec![cls, a, Value::Undef])
+        })
+    };
+    match tn {
+        // `set`/`frozenset` rebuild from a LIST of their elements.
+        "set" | "frozenset" => {
+            let items = host::iter_vec(recv)?;
+            let lst = with_host(|h| h.new_list(items));
+            Ok(own(vec![lst]))
+        }
+        // `bytearray` rebuilds from its bytes decoded as latin-1 below protocol
+        // 5, and from a `bytes` object at 5 and above.
+        "bytearray" => {
+            let bytes = with_host(|h| match h.get(recv) {
+                Some(PyObj::Bytearray(b)) => b.clone(),
+                _ => Vec::new(),
+            });
+            if protocol.unwrap_or(0) >= 5 {
+                let b = with_host(|h| h.alloc(PyObj::Bytes(bytes)));
+                return Ok(own(vec![b]));
+            }
+            let latin1: String = bytes.iter().map(|&b| b as char).collect();
+            let (s, enc) = with_host(|h| (h.new_str(latin1), h.new_str("latin-1")));
+            Ok(own(vec![s, enc]))
+        }
+        // `range` and `slice` rebuild from their three fields, with no state
+        // slot at all — their recipe is a 2-tuple, not a 3-tuple.
+        "range" | "slice" => {
+            let fields = with_host(|h| -> Result<Vec<Value>, String> {
+                Ok(vec![
+                    h.get_attr(recv, "start")?,
+                    h.get_attr(recv, "stop")?,
+                    h.get_attr(recv, "step")?,
+                ])
+            })?;
+            Ok(with_host(|h| {
+                let cls = h.alloc(PyObj::Builtin(tn.to_string()));
+                let a = h.new_tuple(fields);
+                h.new_tuple(vec![cls, a])
+            }))
+        }
+        // The singletons pickle by NAME, so their recipe is a bare string.
+        "ellipsis" => Ok(with_host(|h| h.new_str("Ellipsis"))),
+        "NotImplementedType" => Ok(with_host(|h| h.new_str("NotImplemented"))),
+        _ => match protocol {
+            Some(p) if p >= 2 => reduce_newobj(recv, tn),
+            _ => Err(host::type_error(&format!("cannot pickle '{tn}' object"))),
+        },
+    }
+}
+
+/// One dispatch for every name in [`OBJECT_METHOD_DUNDERS`] on a BUILTIN
+/// receiver. `None` means "handled by the dedicated arm further down" —
+/// `__repr__`/`__str__` already route through the host's renderers there.
+fn object_dunder(
+    recv: &Value,
+    tn: &str,
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Value, String>> {
+    let arg0 = || args.first().cloned().unwrap_or(Value::Undef);
+    let attr_name = |v: &Value| with_host(|h| h.as_str(v));
+    let not_implemented = || Ok(with_host(|h| h.alloc(PyObj::NotImplemented)));
+    Some(match name {
+        // Already dispatched below, through the host's own renderers.
+        "__repr__" | "__str__" => return None,
+        // `object.__init__` ignores its arguments and returns None; so do the
+        // class-creation hook and the pickle state hook (a builtin carries no
+        // instance state, so `__getstate__` is None rather than a dict).
+        "__init__" | "__init_subclass__" | "__getstate__" => Ok(Value::Undef),
+        // `object.__subclasshook__` is the hook `abc` overrides. The base one
+        // never decides, so it is `NotImplemented` for every argument.
+        "__subclasshook__" => not_implemented(),
+        // CPython's `object.__dir__` returns the names UNSORTED and `dir()`
+        // sorts them; the set is what is observable, and `dir()` sorts either
+        // way, so this hands back the sorted form.
+        "__dir__" => Ok(with_host(|h| {
+            let items: Vec<Value> = h
+                .dir_names(recv)
+                .into_iter()
+                .map(|n| h.new_str(n))
+                .collect();
+            h.new_list(items)
+        })),
+        "__getattribute__" => match attr_name(&arg0()) {
+            Some(n) => with_host(|h| h.get_attr(recv, &n)),
+            None => Err(host::type_error("attribute name must be string")),
+        },
+        // A builtin value has no instance dict, so there are exactly two
+        // outcomes and CPython distinguishes them: the name is an attribute of
+        // the type (read-only), or it is not (nowhere to put it).
+        "__setattr__" | "__delattr__" => {
+            let Some(n) = attr_name(&arg0()) else {
+                return Some(Err(host::type_error("attribute name must be string")));
+            };
+            if n == "__class__" {
+                let vt = with_host(|h| h.type_name(&args.get(1).cloned().unwrap_or(Value::Undef)));
+                return Some(Err(host::type_error(&format!(
+                    "__class__ must be set to a class, not '{vt}' object"
+                ))));
+            }
+            let known = with_host(|h| h.dir_names(recv)).contains(&n);
+            Err(if known {
+                format!("AttributeError: '{tn}' object attribute '{n}' is read-only")
+            } else {
+                format!(
+                    "AttributeError: '{tn}' object has no attribute '{n}' and no __dict__ for \
+                     setting new attributes"
+                )
+            })
+        }
+        "__eq__" | "__ne__" => {
+            let other = arg0();
+            let ot = with_host(|h| h.type_name(&other));
+            let eq = if richcmp_by_identity(tn) {
+                // `object_richcompare`: identical or `NotImplemented`. There is
+                // exactly one `None`/`Ellipsis`/`NotImplemented`, so identity and
+                // equality coincide for those; a bare `object()` needs the real
+                // identity test.
+                if same_object(recv, &other) {
+                    true
+                } else {
+                    return Some(not_implemented());
+                }
+            } else if richcmp_accepts(tn, &ot, false) {
+                with_host(|h| h.equal(recv, &other))
+            } else {
+                return Some(not_implemented());
+            };
+            Ok(Value::Bool(if name == "__eq__" { eq } else { !eq }))
+        }
+        "__lt__" | "__le__" | "__gt__" | "__ge__" => {
+            let other = arg0();
+            let ot = with_host(|h| h.type_name(&other));
+            if !richcmp_accepts(tn, &ot, true) {
+                return Some(not_implemented());
+            }
+            let op = match name {
+                "__lt__" => NumOp::Lt,
+                "__le__" => NumOp::Le,
+                "__gt__" => NumOp::Gt,
+                _ => NumOp::Ge,
+            };
+            with_host(|h| h.compare(op, recv, &other))
+        }
+        // An unhashable type's `__hash__` slot is `None`, not absent —
+        // `getattr` hands back None and only the CALL fails, with the message
+        // that calling None gives.
+        "__hash__" => {
+            if UNHASHABLE_TYPES.contains(&tn) {
+                return Some(Err(host::type_error("'NoneType' object is not callable")));
+            }
+            call_builtin_function("hash", vec![recv.clone()], vec![])
+        }
+        "__format__" => call_builtin_function("format", vec![recv.clone(), arg0()], vec![]),
+        "__sizeof__" => Ok(Value::Int(object_sizeof(recv))),
+        "__reduce__" => object_reduce(recv, tn, None),
+        "__reduce_ex__" => {
+            let p = with_host(|h| h.big_val(&arg0()))
+                .and_then(|b| i64::try_from(b).ok())
+                .unwrap_or(0);
+            object_reduce(recv, tn, Some(p))
+        }
+        _ => return None,
+    })
+}
+
 pub fn call_type_method(
     recv: &Value,
     name: &str,
@@ -10852,6 +11319,16 @@ pub fn call_type_method(
     if name == "__contains__" {
         let item = arg0(&args)?;
         return Ok(Value::Bool(with_host(|h| h.contains(&item, recv))?));
+    }
+    // The `object`-level surface every value inherits — `dir()` lists all of
+    // [`OBJECT_DUNDERS`] on every builtin type, so each has to ANSWER rather
+    // than fall through to an `AttributeError` at the bottom of this function.
+    // Only reached for a builtin receiver: a user instance resolves its own
+    // dunders before getting here.
+    if OBJECT_METHOD_DUNDERS.contains(&name) {
+        if let Some(r) = object_dunder(recv, &tn, name, &args) {
+            return r;
+        }
     }
     // Other universal object dunders reached as bound methods (`cache.__len__`,
     // `cache.__getitem__(k)`, `x.__eq__(y)`) — dispatch to the native op.

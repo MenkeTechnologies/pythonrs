@@ -10680,9 +10680,9 @@ impl PyHost {
                 self.collect_builtin_dir(&n, &mut set);
             }
             _ => {
-                // `dir(x)` on a builtin VALUE ("abc", [1], 2.5) — the methods its
-                // type responds to. Not CPython's full slot-wrapper listing, but
-                // every name here is one the value really answers to.
+                // `dir(x)` on a builtin VALUE ("abc", [1], 2.5) — the methods
+                // its type responds to, plus the `object` surface every value
+                // inherits. Every name here is one the value really answers to.
                 let tn = self.type_name(v);
                 self.collect_builtin_dir(&tn, &mut set);
             }
@@ -10690,17 +10690,15 @@ impl PyHost {
         set.into_iter().collect()
     }
 
-    /// Add the method names of builtin type `tn` (plus the object dunders every
-    /// value carries) to `set`. Empty for a type with no method table.
+    /// Add the attribute names of builtin type `tn` to `set` — its own methods
+    /// AND the inherited `object` surface, both from `type_dir_names` so a name
+    /// can never be listed without dispatching. Empty for a type with no entry.
     fn collect_builtin_dir(&self, tn: &str, set: &mut BTreeSet<String>) {
         let names = crate::builtins::type_dir_names(tn);
         if names.is_empty() {
             return;
         }
         for n in names {
-            set.insert(n.to_string());
-        }
-        for n in ["__class__", "__doc__", "__init__", "__new__", "__sizeof__"] {
             set.insert(n.to_string());
         }
     }
