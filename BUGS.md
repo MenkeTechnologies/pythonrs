@@ -1491,7 +1491,8 @@ non-iterator message, the implicit `__hash__ = None`, `__len__` validation plus
 PEP 479). The unhashable-key message was the fifth and is fixed too: an
 unhashable key now names the role it was playing (`cannot use 'X' as a dict
 key (unhashable type: 'X')`), matching CPython at all 17 spellings. Round 4
-added the `__index__` coercion boundaries. Two remain open:
+added the `__index__` coercion boundaries and the `__slots__` `"__dict__"`
+entry. Four remain open:
 
 - **PEP 695 `type X = ...` binds the value, not a `TypeAliasType`.**
   `type Alias = list[int]` makes `Alias` be `list[int]` itself, so `Alias`
@@ -1517,3 +1518,39 @@ added the `__index__` coercion boundaries. Two remain open:
   is the marshalling layer, not the protocol. Closing it means giving
   `PyrsInstance` an `__index__` that routes back to the pythonrs object, the
   same way its attribute and comparison slots already do.
+
+- **Slot values live in the instance dict.** pythonrs stores a `__slots__`
+  attribute in the same per-instance dict as any other, and restricts writes by
+  consulting the class's declared slots rather than by having separate storage.
+  Restriction, inheritance and the `"__dict__"` entry all behave correctly, and
+  a fully-slotted instance correctly has no `__dict__` at all. What leaks is
+  introspection of a PARTIALLY slotted hierarchy -- a slotted base with an
+  unslotted subclass, where the instance does have a dict:
+
+  ```
+  class A:  __slots__ = ("a",)
+  class C(A):  pass
+  c = C(); c.a = 1; c.z = 2
+  sorted(vars(c))   # CPython ['z'], pythonrs ['a', 'z']
+  ```
+
+  `A.__dict__["a"]` is likewise absent where CPython has a `member_descriptor`.
+  Closing it means real slot storage separate from the instance dict, not a
+  filter over the dict: `__dict__` is handed out by handle so that mutations
+  through it write through, and filtering the handed-out object would break that
+  identity.
+
+- **A `SyntaxError` from `eval`/`exec` omits the inner frame.** CPython renders
+  the compiled string's own frame under the calling one, with the source line
+  and a caret:
+
+  ```
+    File "<string>", line 1
+      r.nope = 1
+             ^
+  SyntaxError: invalid syntax
+  ```
+
+  pythonrs reports the calling frame and then the bare `SyntaxError: invalid
+  syntax` line, so nothing points at WHERE in the evaluated source the problem
+  is.

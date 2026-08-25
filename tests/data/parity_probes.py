@@ -668,3 +668,45 @@ for label, expr in [
         print(label, "->", repr(eval(expr)))
     except TypeError as e:
         print(label, "-> TypeError:", e)
+#==#
+# ── __slots__: restriction, inheritance, and the "__dict__" entry ───────────
+class A:
+    __slots__ = ("a",)
+class Restricted(A):
+    __slots__ = ("b",)
+class Unrestricted(A):
+    pass
+class Empty(A):
+    __slots__ = ()
+# A literal "__dict__" entry asks for an instance dict ALONGSIDE the slots, so
+# the instance is not restricted at all.
+class WithDict:
+    __slots__ = ("p", "__dict__")
+r = Restricted()
+r.a, r.b = 1, 2
+print(r.a, r.b, A.__slots__, Restricted.__slots__)
+u = Unrestricted()
+u.a, u.anything = 1, 2
+print(u.a, u.anything)
+e = Empty()
+e.a = 5
+print(e.a)
+w = WithDict()
+w.p, w.other = 1, 2
+print(w.p, w.other)
+def try_set(obj, name):
+    try:
+        setattr(obj, name, 1)
+        return "NO-RAISE"
+    except AttributeError as ex:
+        return type(ex).__name__ + ": " + str(ex)
+print("restricted ->", try_set(r, "nope"))
+print("empty slots ->", try_set(e, "nope"))
+print("with-dict   ->", try_set(w, "nope"))
+for label, fn in [("vars slotted", lambda: vars(r)),
+                  ("dict slotted", lambda: r.__dict__)]:
+    try:
+        fn()
+        print(label, "-> NO-RAISE")
+    except (AttributeError, TypeError) as ex:
+        print(label, "->", type(ex).__name__ + ":", ex)

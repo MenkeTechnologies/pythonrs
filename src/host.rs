@@ -11151,18 +11151,26 @@ impl PyHost {
             // keeps the name as written (CPython leaves the tuple alone and
             // mangles only the descriptor it installs).
             let mangle = |s: String| crate::mangle::mangle(&c, &s).unwrap_or(s);
-            match self.get(v) {
+            // A literal `"__dict__"` entry asks for an instance dict ALONGSIDE
+            // the slots, so the instance is not restricted at all. It is a
+            // documented idiom -- `__slots__ = ("p", "__dict__")` is how a class
+            // keeps a fast slot for its hot attribute and still accepts
+            // arbitrary others -- and it used to raise
+            // `'W' object has no attribute 'other' and no __dict__ for setting
+            // new attributes`, i.e. exactly the error the entry exists to
+            // prevent. It is not mangled: CPython matches it verbatim.
+            let names: Vec<String> = match self.get(v) {
                 Some(PyObj::List(items)) | Some(PyObj::Tuple(items)) => {
-                    for it in items {
-                        if let Some(s) = self.as_str(it) {
-                            slots.insert(mangle(s));
-                        }
-                    }
+                    items.iter().filter_map(|it| self.as_str(it)).collect()
                 }
-                Some(PyObj::Str(s)) => {
-                    slots.insert(mangle(s.clone()));
-                }
-                _ => {}
+                Some(PyObj::Str(s)) => vec![s.clone()],
+                _ => Vec::new(),
+            };
+            if names.iter().any(|n| n == "__dict__") {
+                return None;
+            }
+            for n in names {
+                slots.insert(mangle(n));
             }
         }
         if any {

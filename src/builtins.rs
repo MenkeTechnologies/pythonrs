@@ -5732,8 +5732,17 @@ pub fn call_builtin_function(
             }))
         }
         "vars" => match args.first() {
-            // `vars(obj)` == `obj.__dict__`.
-            Some(v) => with_host(|h| h.get_attr(v, "__dict__")),
+            // `vars(obj)` == `obj.__dict__`, but the FAILURE is its own: CPython
+            // reports `vars()`'s complaint, not the attribute lookup's, so a
+            // fully-slotted instance gives a TypeError here and not the
+            // `AttributeError: ... Did you mean: '__dir__'?` the lookup raises.
+            Some(v) => with_host(|h| h.get_attr(v, "__dict__")).map_err(|e| {
+                if e.starts_with("AttributeError") {
+                    host::type_error("vars() argument must have __dict__ attribute")
+                } else {
+                    e
+                }
+            }),
             // Bare `vars()` is `locals()` — the module namespace at module
             // scope, a snapshot of the caller's locals inside a function.
             None => call_builtin_function("locals", vec![], vec![]),
