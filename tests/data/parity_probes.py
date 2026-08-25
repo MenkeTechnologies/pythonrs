@@ -361,3 +361,47 @@ for src in ["a == b", "d == {'self': {'self': 1}}"]:
         print(src, "->", eval(src))
     except BaseException as e:
         print(src, "->", type(e).__name__)
+#==#
+# ── property is a descriptor, and says so ──────────────────────────────────
+# `C.x.fget` and `C.x.__get__(obj)` were AttributeErrors, so any code driving a
+# property through the descriptor protocol by hand — which is how `abc` wraps an
+# abstract property and how `inspect` tells a data descriptor from a plain one —
+# could not touch one.
+def get_v(self):
+    return "bare"
+class C:
+    def __init__(self):
+        self._x = 0
+    @property
+    def x(self):
+        return self._x
+    @x.setter
+    def x(self, v):
+        self._x = v * 2
+    y = property(get_v)
+p, c = C.x, C()
+print(p.fget.__name__, p.fset.__name__, p.fdel, p.__name__, C.y.__name__)
+print(p.__isabstractmethod__, p.__get__(None, C) is p)
+print(p.__get__(c), p.__set__(c, 5), p.__get__(c), c._x)
+try:
+    p.__delete__(c)
+except AttributeError as e:
+    print("AttributeError:", e)
+print([n for n in ["fget", "fset", "fdel", "__get__", "__set__", "__delete__",
+                   "__set_name__", "__name__", "__isabstractmethod__",
+                   "getter", "setter", "deleter"] if n not in dir(p)])
+#==#
+# ── a generator knows its own name and whether it is parked ────────────────
+def gen():
+    yield 1
+    yield 2
+g = gen()
+print(g.__name__, g.__qualname__, g.gi_running, g.gi_suspended)
+next(g)
+print(g.gi_running, g.gi_suspended)
+list(g)
+print(g.gi_running, g.gi_suspended)
+def selfaware():
+    yield (me.gi_running, me.gi_suspended)
+me = selfaware()
+print(next(me))

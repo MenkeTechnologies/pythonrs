@@ -5565,7 +5565,12 @@ pub fn call_builtin_function(
                 .cloned()
                 .or_else(|| kw_get(&kwargs, "fdel"))
                 .unwrap_or(Value::Undef);
-            Ok(with_host(|h| h.alloc(PyObj::Property { fget, fset, fdel })))
+            Ok(with_host(|h| h.alloc(PyObj::Property {
+                fget,
+                fset,
+                fdel,
+                name: String::new(),
+            })))
         }
         "vars" => match args.first() {
             // `vars(obj)` == `obj.__dict__`.
@@ -10292,6 +10297,10 @@ pub fn type_data_attrs(tn: &str) -> &'static [&'static str] {
         // `as_integer_ratio()` as a method instead, not the two attributes.
         "float" | "complex" => &["real", "imag"],
         "slice" | "range" => &["start", "stop", "step"],
+        "property" => &["fget", "fset", "fdel", "__name__", "__isabstractmethod__"],
+        // `gi_code`/`gi_frame`/`gi_yieldfrom` are absent on purpose — see the
+        // generator arm of `PyHost::get_attr`.
+        "generator" | "coroutine" => &["__name__", "__qualname__", "gi_running", "gi_suspended"],
         "deque" => &["maxlen"],
         "defaultdict" => &["default_factory"],
         "memoryview" => &[
@@ -10500,7 +10509,20 @@ const LOOP_METHODS: &[&str] = &[
     "set_debug",
 ];
 
-const PROPERTY_METHODS: &[&str] = &["getter", "setter", "deleter"];
+/// `property`'s own methods: the three accessor-replacing decorators, the
+/// descriptor protocol, and the class-body hook. The read-only `fget`/`fset`/
+/// `fdel`/`__name__` attributes are in [`type_data_attrs`] instead — `get_attr`
+/// resolves those from the property object itself.
+const PROPERTY_METHODS: &[&str] = &[
+    "getter",
+    "setter",
+    "deleter",
+    "__get__",
+    "__set__",
+    "__delete__",
+    "__set_name__",
+    "__isabstractmethod__",
+];
 const GENERATOR_METHODS: &[&str] = &["send", "throw", "close", "__next__", "__iter__"];
 
 const BYTES_METHODS: &[&str] = &[
@@ -12268,9 +12290,58 @@ fn generator_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, S
 /// `property.getter/setter/deleter(func)` — return a copy of the property with
 /// the corresponding accessor replaced (the `@x.setter` decorator form).
 fn property_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
-    let (fget, fset, fdel) = with_host(|h| match h.get(recv) {
-        Some(PyObj::Property { fget, fset, fdel }) => (fget.clone(), fset.clone(), fdel.clone()),
-        _ => (Value::Undef, Value::Undef, Value::Undef),
+    // The descriptor protocol, which is how `abc`, `inspect` and any code that
+    // drives a descriptor by hand reaches a property. Every one of these was an
+    // AttributeError, so `C.x.__get__(obj)` failed where the equivalent
+    // attribute access worked.
+    if matches!(name, "__get__" | "__set__" | "__delete__") {
+        let obj = args.first().cloned().unwrap_or(Value::Undef);
+        // `C.x.__get__(None, C)` — reached through the CLASS rather than an
+        // instance — hands back the property object itself.
+        if matches!(obj, Value::Undef) && name == "__get__" {
+            return Ok(recv.clone());
+        }
+        let pname = with_host(|h| match h.get(recv) {
+            Some(PyObj::Property { name, .. }) => name.clone(),
+            _ => String::new(),
+        });
+        // Through the descriptor-aware helpers, NOT `PyHost::get_attr`: the
+        // accessors are user functions and must run outside the host borrow,
+        // which is exactly what `plan_attr_get`/`plan_attr_set` arrange.
+        return match name {
+            "__get__" => raw_getattr(&obj, &pname),
+            "__set__" => {
+                let v = args.get(1).cloned().unwrap_or(Value::Undef);
+                raw_setattr(&obj, &pname, v).map(|_| Value::Undef)
+            }
+            _ => del_attr_desc(&obj, &pname).map(|_| Value::Undef),
+        };
+    }
+    // `__set_name__(owner, name)` is what the class machinery calls to teach the
+    // property its attribute name; pythonrs fills that in at class-build time,
+    // so calling it by hand simply records the name it is given.
+    if name == "__set_name__" {
+        let n = args.get(1).and_then(|v| with_host(|h| h.as_str(v)));
+        if let Some(n) = n {
+            with_host(|h| {
+                if let Some(PyObj::Property { name, .. }) = h.get_mut(recv) {
+                    *name = n;
+                }
+            });
+        }
+        return Ok(Value::Undef);
+    }
+    if name == "__isabstractmethod__" {
+        return Ok(Value::Bool(false));
+    }
+    let (fget, fset, fdel, pname) = with_host(|h| match h.get(recv) {
+        Some(PyObj::Property {
+            fget,
+            fset,
+            fdel,
+            name,
+        }) => (fget.clone(), fset.clone(), fdel.clone(), name.clone()),
+        _ => (Value::Undef, Value::Undef, Value::Undef, String::new()),
     });
     let f = args.first().cloned().unwrap_or(Value::Undef);
     let (fget, fset, fdel) = match name {
@@ -12283,7 +12354,14 @@ fn property_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
             ))
         }
     };
-    Ok(with_host(|h| h.alloc(PyObj::Property { fget, fset, fdel })))
+    // The copy keeps the original's learned name: `@x.setter` rebinds the same
+    // class key, and CPython's `property.setter` copies `__name__` across.
+    Ok(with_host(|h| h.alloc(PyObj::Property {
+                fget,
+                fset,
+                fdel,
+                name: pname,
+            })))
 }
 
 /// Prefixes for `str.startswith`/`endswith`: a single str, or every str in a

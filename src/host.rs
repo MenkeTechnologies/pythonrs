@@ -1053,6 +1053,11 @@ pub enum PyObj {
         fget: Value,
         fset: Value,
         fdel: Value,
+        /// The attribute name, learned from the class-namespace key the way
+        /// CPython's `property.__set_name__` learns it. Empty for a property
+        /// built outside a class body, where `__name__` falls back to the
+        /// getter's own name.
+        name: String,
     },
     /// A `functools.cached_property` descriptor: a *non-data* descriptor whose
     /// first access computes `func(instance)` and stores it in the instance
@@ -2197,6 +2202,23 @@ impl PyHost {
     }
     /// The value a (sub)generator `return`ed — its `StopIteration.value`, read by
     /// the `yield from` delegation op.
+    /// A generator's introspection state: `(name, running, suspended)`.
+    ///
+    /// `running` is true only while the body is on the stack — the cell's
+    /// coroutine is TAKEN OUT across a resume, so its absence is the running
+    /// flag. `suspended` is CPython 3.13's `gi_suspended`: started, parked at a
+    /// `yield`, and not yet finished.
+    pub fn gen_state(&self, gen: &Value) -> Option<(String, bool, bool)> {
+        match self.get(gen) {
+            Some(PyObj::Generator { id }) => {
+                let g = &self.generators[*id as usize];
+                let running = g.coro.is_none() && !g.done;
+                Some((g.func_name.clone(), running, g.started && !g.done && !running))
+            }
+            _ => None,
+        }
+    }
+
     pub fn gen_return_value(&self, id: u32) -> Value {
         self.generators
             .get(id as usize)
@@ -9967,6 +9989,53 @@ impl PyHost {
                 }
                 Ok(self.new_dict(d))
             }
+            // A generator's introspection attributes. `gi_code`, `gi_frame`
+            // and `gi_yieldfrom` are NOT here: the first two need a code and
+            // frame object pythonrs does not build for a generator body, and
+            // the third needs the delegated iterator tracked across
+            // `yield from` — reporting `None` for any of them would be a
+            // wrong answer rather than a missing one.
+            Some(PyObj::Generator { .. })
+                if matches!(name, "__name__" | "__qualname__" | "gi_running" | "gi_suspended") =>
+            {
+                let Some((fname, running, suspended)) = self.gen_state(recv) else {
+                    return Err(format!(
+                        "AttributeError: 'generator' object has no attribute '{name}'"
+                    ));
+                };
+                Ok(match name {
+                    "gi_running" => Value::Bool(running),
+                    "gi_suspended" => Value::Bool(suspended),
+                    _ => self.new_str(fname),
+                })
+            }
+            // A property's three accessors and its name. `abc` reads `fget`
+            // to wrap an abstract property, and `inspect`/`dataclasses` read
+            // all three to tell a data descriptor from a plain one — every one
+            // of them was an AttributeError.
+            Some(PyObj::Property {
+                fget,
+                fset,
+                fdel,
+                name: pname,
+            }) if matches!(name, "fget" | "fset" | "fdel" | "__name__") => {
+                Ok(match name {
+                    "fget" => fget.clone(),
+                    "fset" => fset.clone(),
+                    "fdel" => fdel.clone(),
+                    // The class-namespace key `__set_name__` recorded, falling
+                    // back to the getter's own name for a property built
+                    // outside any class body.
+                    _ => {
+                        if pname.is_empty() {
+                            let g = fget.clone();
+                            return self.get_attr(&g, "__name__");
+                        }
+                        let n = pname.clone();
+                        self.new_str(n)
+                    }
+                })
+            }
             // An attribute previously assigned onto a `property` or descriptor
             // (`_Instruction.opname.__doc__ = "…"`) reads back from the same side
             // table; `__doc__` defaults to None when never set.
@@ -11455,6 +11524,21 @@ impl PyHost {
             .collect();
         for (val, key) in cp_names {
             if let Some(PyObj::CachedProperty { name, .. }) = self.get_mut(&val) {
+                *name = key;
+            }
+        }
+        // The same `__set_name__` emulation for `property`: `C.x.__name__` is
+        // the class-namespace key, not the getter's name, whenever the two
+        // differ (`y = property(get_x)` names itself `y`).
+        let prop_names: Vec<(Value, String)> = ns
+            .iter()
+            .filter(|(_, v)| {
+                matches!(self.get(v), Some(PyObj::Property { name, .. }) if name.is_empty())
+            })
+            .map(|(k, v)| (v.clone(), k.clone()))
+            .collect();
+        for (val, key) in prop_names {
+            if let Some(PyObj::Property { name, .. }) = self.get_mut(&val) {
                 *name = key;
             }
         }
