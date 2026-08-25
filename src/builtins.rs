@@ -5463,16 +5463,7 @@ pub fn call_builtin_function(
                 _ => None,
             });
             match proto {
-                Some((true, _)) => {
-                    let it = host::call_method(&v, "__iter__", vec![], vec![])?;
-                    if host::is_iterator(&it) {
-                        return Ok(it);
-                    }
-                    Err(host::type_error(&format!(
-                        "iter() returned non-iterator of type '{}'",
-                        with_host(|h| h.type_name(&it))
-                    )))
-                }
+                Some((true, _)) => host::call_iter_dunder(&v),
                 // The old-style protocol has no iterator object of its own, so
                 // CPython's `iterator` (`PySeqIter_Type`) wraps the indexing.
                 Some((false, true)) => {

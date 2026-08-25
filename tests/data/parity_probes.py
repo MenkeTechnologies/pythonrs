@@ -408,3 +408,104 @@ def selfaware():
     yield (me.gi_running, me.gi_suspended)
 me = selfaware()
 print(next(me))
+#==#
+# ── iterator protocol: what __iter__ must return, and where it is checked ────
+# `iter()` validated its result but `list(obj)` and `for x in obj` did not, so
+# the same broken class reported CPython's message from one spelling and a bare
+# "not an iterator" from the other two.
+class BadIter:
+    def __iter__(self):
+        return 42
+class Seq:
+    def __init__(self, n):
+        self.n = n
+    def __getitem__(self, i):
+        if i >= self.n:
+            raise IndexError(i)
+        return i * i
+class Counter3:
+    def __init__(self):
+        self.i = 0
+    def __iter__(self):
+        return self
+    def __next__(self):
+        self.i += 1
+        if self.i > 3:
+            raise StopIteration
+        return self.i
+for label in ["list(BadIter())", "[x for x in BadIter()]", "iter(BadIter())",
+              "tuple(BadIter())", "sum(BadIter())", "sorted(BadIter())"]:
+    try:
+        eval(label)
+        print(label, "-> NO-RAISE")
+    except TypeError as e:
+        print(label, "->", e)
+print(list(Seq(4)), [x for x in Seq(3)], sum(Seq(4)), max(Seq(4)))
+print(list(Counter3()), sum(Counter3()), list(zip(Counter3(), "abcd")))
+it = iter(Counter3())
+print(next(it), list(it), next(it, "exhausted"))
+print(iter(Counter3()) is not None, iter([1]) is not iter([1]))
+#==#
+# ── generators: send / throw / close, yield from, and the return value ──────
+def echo():
+    got = yield "first"
+    got2 = yield f"got:{got}"
+    return f"done:{got2}"
+g = echo()
+print(next(g), g.send("A"))
+try:
+    g.send("B")
+except StopIteration as e:
+    print("StopIteration value", e.value, e.args)
+def inner():
+    yield 1
+    yield 2
+    return "INNER"
+def outer():
+    got = yield from inner()
+    yield f"after:{got}"
+print(list(outer()))
+def with_finally():
+    try:
+        yield 1
+        yield 2
+    finally:
+        print("generator finalized")
+gf = with_finally()
+print(next(gf))
+gf.close()
+def catcher():
+    try:
+        yield "ready"
+    except ValueError as e:
+        yield f"caught:{e}"
+c = catcher()
+print(next(c), c.throw(ValueError("thrown")))
+gexp = (n * n for n in range(4))
+print(list(gexp), list(gexp))
+#==#
+# ── context managers: __exit__ suppression, nesting, parenthesized with ──────
+class CM:
+    def __init__(self, name, suppress=False):
+        self.name = name
+        self.suppress = suppress
+    def __enter__(self):
+        print("enter", self.name)
+        return self.name
+    def __exit__(self, et, ev, tb):
+        print("exit", self.name, et.__name__ if et else None, ev)
+        return self.suppress
+with CM("plain") as v:
+    print("body", v)
+with CM("swallow", True):
+    raise ValueError("suppressed by __exit__")
+print("still running")
+try:
+    with CM("propagate"):
+        raise KeyError("kept")
+except KeyError as e:
+    print("propagated", e)
+with CM("x") as x, CM("y") as y:
+    print("two", x, y)
+with (CM("p") as p, CM("q") as q):
+    print("parenthesized", p, q)

@@ -15341,6 +15341,24 @@ pub fn is_iterator(v: &Value) -> bool {
     })
 }
 
+/// Run a user class's `__iter__` and require that it handed back an ITERATOR.
+///
+/// CPython enforces this where `iter()` is applied, so `for x in obj` and
+/// `list(obj)` report it too — not just the `iter()` builtin. pythonrs checked
+/// it only in the builtin, and the other two paths fell through to a generic
+/// `not an iterator` from whatever tried to step the result. One definition now
+/// serves all three; the message is CPython's.
+pub fn call_iter_dunder(v: &Value) -> Result<Value, String> {
+    let it = call_method(v, "__iter__", vec![], vec![])?;
+    if is_iterator(&it) {
+        return Ok(it);
+    }
+    Err(type_error(&format!(
+        "iter() returned non-iterator of type '{}'",
+        with_host(|h| h.type_name(&it))
+    )))
+}
+
 /// Turn `v` into something [`iter_step`] can drive, running any user-level
 /// `__iter__` OUTSIDE the host borrow.
 ///
@@ -15361,7 +15379,17 @@ pub fn make_iterator(v: &Value) -> Result<Value, String> {
     match protocol {
         // `__iter__` hands back a real iterator, so iteration stays lazy.
         Some((true, _)) => {
-            let it = call_method(v, "__iter__", vec![], vec![])?;
+            let it = call_iter_dunder(v)?;
+            // `call_iter_dunder` has already established that `it` IS an
+            // iterator, and `iter_step` drives a user instance through its own
+            // `__next__`. `make_iter` knows only the native iterables and
+            // rejected it — so `zip`/`map`/`enumerate`/`itertools` over a
+            // hand-written iterator class all raised
+            // `TypeError: 'C' object is not iterable` while `list(C())` and
+            // `for x in C()` (which never come through here) worked.
+            if with_host(|h| matches!(h.get(&it), Some(PyObj::Instance(_)))) {
+                return Ok(it);
+            }
             with_host(|h| h.make_iter(&it))
         }
         // The old-style `__getitem__(0..)` sequence protocol has no iterator
@@ -15391,7 +15419,10 @@ pub fn iter_instance_items(v: &Value) -> Result<Vec<Value>, String> {
         _ => (false, false),
     });
     if has_iter {
-        let it = call_method(v, "__iter__", vec![], vec![])?;
+        // Validated, so `list(obj)`/`for x in obj` report a non-iterator
+        // `__iter__` the way CPython does instead of failing later, inside
+        // whatever tried to step the result.
+        let it = call_iter_dunder(v)?;
         if with_host(|h| {
             matches!(
                 h.get(&it),
