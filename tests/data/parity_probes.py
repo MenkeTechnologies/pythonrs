@@ -509,3 +509,39 @@ with CM("x") as x, CM("y") as y:
     print("two", x, y)
 with (CM("p") as p, CM("q") as q):
     print("parenthesized", p, q)
+#==#
+# ── __eq__ without __hash__ makes a class unhashable ────────────────────────
+# CPython binds the slot to `None` rather than leaving it absent, so
+# `C.__hash__ is None` -- the standard hashability test -- is True while
+# `hasattr(C, '__hash__')` is also True, and only CALLING it fails. The rule is
+# per class BODY: a subclass defining only `__eq__` is unhashable even when its
+# base defined a real `__hash__`.
+class OnlyEq:
+    def __eq__(self, o):
+        return isinstance(o, OnlyEq)
+class EqHash:
+    def __init__(self, v):
+        self.v = v
+    def __eq__(self, o):
+        return isinstance(o, EqHash) and self.v == o.v
+    def __hash__(self):
+        return hash(self.v)
+class Plain:
+    pass
+class NoneHash:
+    __hash__ = None
+class SubDropsHash(EqHash):
+    def __eq__(self, o):
+        return True
+class SubKeepsHash(EqHash):
+    pass
+for cls in (OnlyEq, EqHash, Plain, NoneHash, SubDropsHash, SubKeepsHash):
+    print(cls.__name__, cls.__hash__ is None, hasattr(cls, "__hash__"))
+print(hash(Plain()) == hash(Plain()), len({EqHash(1), EqHash(1), EqHash(2)}))
+print(hash(EqHash(5)) == hash(5), EqHash(1) == EqHash(1), EqHash(1) == EqHash(2))
+for expr in ["hash(OnlyEq())", "hash(NoneHash())", "hash(SubDropsHash(1))"]:
+    try:
+        eval(expr)
+        print(expr, "-> NO-RAISE")
+    except TypeError as e:
+        print(expr, "->", e)

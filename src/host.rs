@@ -4493,6 +4493,10 @@ impl PyHost {
                     // here without user code.
                     if let Some(k) = pending_key_get(id) {
                         k
+                    } else if self.implicit_hash_none(&class) {
+                        // Shadows any inherited `__hash__`; see
+                        // `implicit_hash_none`.
+                        return Err(type_error(&format!("unhashable type: '{class}'")));
                     } else {
                         match self.class_lookup(&class, "__hash__") {
                             // `__hash__ = None` (or `__eq__` without `__hash__`)
@@ -5287,6 +5291,10 @@ fn prepare_key_walk(
         }
         KeyPrep::Instance(id, class) => (id, class),
     };
+    // Shadows any inherited `__hash__`; see `implicit_hash_none`.
+    if with_host(|h| h.implicit_hash_none(&class)) {
+        return Err(type_error(&format!("unhashable type: '{class}'")));
+    }
     let hashf = with_host(|h| h.class_lookup(&class, "__hash__"));
     match &hashf {
         // `__hash__ = None`, or `__eq__` without `__hash__` → unhashable.
@@ -5340,6 +5348,12 @@ pub fn instance_hash_value(v: &Value) -> Result<i64, String> {
         Some(t) => t,
         None => return Err(type_error("unhashable type")),
     };
+    // Asked before the MRO lookup: the implicit `__hash__ = None` shadows an
+    // inherited `__hash__`, so a subclass defining only `__eq__` is unhashable
+    // even though `class_lookup` would find its base's real one.
+    if with_host(|h| h.implicit_hash_none(&class)) {
+        return Err(type_error(&format!("unhashable type: '{class}'")));
+    }
     match with_host(|h| h.class_lookup(&class, "__hash__")) {
         Some(Value::Undef) => Err(type_error(&format!("unhashable type: '{class}'"))),
         None => {
@@ -9515,6 +9529,13 @@ impl PyHost {
                 let class = inst.class.clone();
                 let inst_dict = inst.dict.clone();
                 let inst_payload = inst.payload.clone();
+                // Ahead of the MRO lookup on purpose: the implicit
+                // `__hash__ = None` SHADOWS an inherited `__hash__`, so a
+                // subclass that defines only `__eq__` must report None even
+                // though its base defined a real one.
+                if name == "__hash__" && self.implicit_hash_none(&class) {
+                    return Ok(Value::Undef);
+                }
                 if let Some(v) = self.inst_attr(&inst_dict, name) {
                     return Ok(v);
                 }
@@ -9620,6 +9641,11 @@ impl PyHost {
             }
             Some(PyObj::Class(cname)) => {
                 let cname = cname.clone();
+                // See the instance arm: the implicit `__hash__ = None` shadows
+                // an inherited `__hash__`, so this precedes the MRO lookup.
+                if name == "__hash__" && self.implicit_hash_none(&cname) {
+                    return Ok(Value::Undef);
+                }
                 if name == "__name__" {
                     // The registry KEY may be disambiguated (`Codec#1`) when a
                     // class shadows one of its bases; the display name is the
@@ -10872,6 +10898,38 @@ impl PyHost {
                 ))
             }
         }
+    }
+
+    /// Whether `class` inherits CPython's implicit `__hash__ = None`.
+    ///
+    /// Defining `__eq__` without `__hash__` makes a class unhashable, and
+    /// CPython implements that by BINDING the slot to `None` rather than
+    /// leaving it absent. The difference is observable: `C.__hash__ is None`
+    /// answers True, `hasattr(C, '__hash__')` still answers True, and only
+    /// CALLING it fails. pythonrs already refused to hash such an instance, but
+    /// reported the attribute as an inherited slot wrapper, so the standard
+    /// `cls.__hash__ is None` test for "is this type hashable" said the wrong
+    /// thing about every class that defines `__eq__`.
+    pub fn implicit_hash_none(&self, class: &str) -> bool {
+        // The rule is per class BODY, not per MRO: the first class along the
+        // MRO that writes either name decides, because that is the class whose
+        // slot the subclass inherits. A subclass defining only `__eq__` is
+        // therefore unhashable even when its base defined `__hash__` -- looking
+        // the two names up across the whole MRO instead would find the base's
+        // hash and call the subclass hashable, which CPython does not.
+        for c in self.mro_of(class) {
+            let Some(cd) = self.classes.get(&c) else {
+                continue;
+            };
+            if cd.ns.contains_key("__hash__") {
+                // An explicit `__hash__ = None` lands here too.
+                return matches!(cd.ns.get("__hash__"), Some(Value::Undef));
+            }
+            if cd.ns.contains_key("__eq__") {
+                return true;
+            }
+        }
+        false
     }
 
     /// Does `class` (via its MRO) define method `name`?
