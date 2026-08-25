@@ -1488,20 +1488,10 @@ machinery, argument binding, control flow, operators. Most of that surface
 already agreed with CPython 3.14.7 byte for byte. Four bugs came out of it and
 are fixed (`zip`/`map` over a user iterator class, the `__iter__`-returned-a-
 non-iterator message, the implicit `__hash__ = None`, `__len__` validation plus
-PEP 479). Two remain open:
-
-- **An unhashable key reports the bare message, not the context.** CPython 3.14
-  wraps it with where it happened:
-
-  ```
-  {OnlyEq()}      # cannot use 'OnlyEq' as a set element (unhashable type: 'OnlyEq')
-  {OnlyEq(): 1}   # cannot use 'OnlyEq' as a dict key (unhashable type: 'OnlyEq')
-  ```
-
-  pythonrs raises `TypeError: unhashable type: 'OnlyEq'` for both -- the right
-  exception TYPE and the right inner text, missing the outer clause. Closing it
-  means threading a "used as what" tag through the keying entry points, which
-  currently share one `to_key` with no notion of the caller's context.
+PEP 479). The unhashable-key message was the fifth and is fixed too: an
+unhashable key now names the role it was playing (`cannot use 'X' as a dict
+key (unhashable type: 'X')`), matching CPython at all 17 spellings. One
+remains open:
 
 - **PEP 695 `type X = ...` binds the value, not a `TypeAliasType`.**
   `type Alias = list[int]` makes `Alias` be `list[int]` itself, so `Alias`
