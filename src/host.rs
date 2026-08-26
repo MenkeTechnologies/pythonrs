@@ -5493,7 +5493,7 @@ impl PyHost {
     /// entry, so the candidate scan `with_instance_key` performs is guaranteed
     /// to come back empty and the whole detour can be skipped.
     ///
-    /// The inverse of [`value_can_collapse`], exposed so the container-op fast
+    /// The inverse of `value_can_collapse`, exposed so the container-op fast
     /// paths test exactly the same condition the slow path would, rather than
     /// re-deriving a weaker approximation of it.
     pub fn key_cannot_collapse(&self, k: &Value) -> bool {
