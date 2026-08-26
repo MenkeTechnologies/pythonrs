@@ -15,6 +15,13 @@ jobs:
     # `stdlib-ffi` is on by default (Cargo.toml [features]), so the default
     # build pulls pyo3 and links libpython — it needs a CPython >= 3.13 and the
     # abi3 forward-compat flag, same as the stdlib-ffi job below.
+    #
+    # The pin is 3.14 because that is the CPython pythonrs is ported from
+    # (src/pyhash.rs is 3.14.6, src/mangle.rs verified against 3.14) and
+    # tests/parity.rs asks the interpreter on PATH for its oracle. Under 3.13
+    # the unhashable-key wording alone diverges: 3.14 says
+    # `cannot use 'U' as a set element (unhashable type: 'U')` where 3.13 says
+    # the bare `unhashable type: 'U'` (python/cpython#132828).
     env:
       PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
     steps:
@@ -24,7 +31,7 @@ jobs:
       - name: Install CPython
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: "3.14"
       - name: Format
         run: cargo fmt --check
       - name: Clippy
@@ -53,7 +60,7 @@ jobs:
       - name: Install CPython
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: "3.14"
       - name: Clippy (stdlib-ffi)
         run: cargo clippy --all-targets --features stdlib-ffi -- -D warnings
       - name: Build (stdlib-ffi)
