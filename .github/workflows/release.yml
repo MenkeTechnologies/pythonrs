@@ -76,13 +76,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: '!matrix.use_cross'
 
+      # `--no-default-features` drops `stdlib-ffi`, and with it pyo3 and the
+      # libpython link. These are the PORTABLE artifacts: a binary that linked
+      # libpython would demand a matching CPython on the machine that unpacks
+      # it, which a release tarball cannot assume — and the cross and musl
+      # targets have no interpreter to configure pyo3 against at all (they
+      # failed with "no Python 3.x interpreter found", and the x86_64 native
+      # runner with "cannot set a minimum Python version 3.13 higher than the
+      # interpreter version 3.12"). The FFI build is the `Bundle` job below,
+      # which sets up CPython 3.14 and ships the interpreter alongside it.
       - name: Build (native)
         if: '!matrix.use_cross'
-        run: cargo build --release --locked --target ${{ matrix.target }} --bin python
+        run: cargo build --release --locked --no-default-features --target ${{ matrix.target }} --bin python
 
       - name: Build (cross)
         if: matrix.use_cross
-        run: cross build --release --locked --target ${{ matrix.target }} --bin python
+        run: cross build --release --locked --no-default-features --target ${{ matrix.target }} --bin python
 
       - name: Package
         shell: bash
