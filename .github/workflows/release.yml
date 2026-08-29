@@ -53,6 +53,8 @@ jobs:
             allow_failure: true
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -100,13 +102,13 @@ jobs:
           # the binary inside it is `python`.
           cd target/${{ matrix.target }}/release
           strip python 2>/dev/null || true
-          tar czf ../../../pythonrs-${{ github.ref_name }}-${{ matrix.target }}.tar.gz python
+          tar czf ../../../pythonrs-${{ inputs.tag || github.ref_name }}-${{ matrix.target }}.tar.gz python
           cd ../../..
 
       - uses: actions/upload-artifact@v6
         with:
           name: pythonrs-${{ matrix.target }}
-          path: pythonrs-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          path: pythonrs-${{ inputs.tag || github.ref_name }}-${{ matrix.target }}.tar.gz
 
   # Self-contained bundles (FFI_STDLIB.md §6): build with --features stdlib-ffi and
   # ship the pythonrs binary next to the CPython runtime it imports — the pure
@@ -133,6 +135,8 @@ jobs:
             allow_failure: true
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -197,13 +201,13 @@ jobs:
           # Tar the self-contained tree with bin/ + lib/ at the archive root
           # (`-C dist/<triple>`), preserving the `<exe>/../lib` layout the binary
           # depends on. Extracting anywhere reproduces a runnable prefix.
-          tar czf "pythonrs-${{ github.ref_name }}-${{ matrix.target }}-bundled.tar.gz" \
+          tar czf "pythonrs-${{ inputs.tag || github.ref_name }}-${{ matrix.target }}-bundled.tar.gz" \
             -C "dist/${{ matrix.target }}" bin lib
 
       - uses: actions/upload-artifact@v6
         with:
           name: pythonrs-${{ matrix.target }}-bundled
-          path: pythonrs-${{ github.ref_name }}-${{ matrix.target }}-bundled.tar.gz
+          path: pythonrs-${{ inputs.tag || github.ref_name }}-${{ matrix.target }}-bundled.tar.gz
 
   publish:
     name: Publish GitHub Release
@@ -211,6 +215,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
 
       - uses: actions/download-artifact@v4
         with:
@@ -221,8 +227,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create ${{ github.ref_name }} \
-            --title "${{ github.ref_name }}" \
+          gh release create ${{ inputs.tag || github.ref_name }} \
+            --title "${{ inputs.tag || github.ref_name }}" \
             --generate-notes \
             artifacts/*.tar.gz
 
@@ -250,6 +256,8 @@ jobs:
 
       - uses: actions/checkout@v6
         with:
+          ref: ${{ inputs.tag || github.ref_name }}
+        with:
           repository: MenkeTechnologies/homebrew-menketech
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           path: tap
@@ -257,7 +265,7 @@ jobs:
       - name: Update formula
         shell: bash
         env:
-          VERSION: ${{ github.ref_name }}
+          VERSION: ${{ inputs.tag || github.ref_name }}
           # Self-contained bundles (bin/python + the CPython runtime). Bottling the
           # bundle over `depends_on "python@3.14"` because the tarball carries its
           # own libpython + stdlib — the formula never relies on the user's brew
@@ -329,7 +337,7 @@ jobs:
             echo "no changes — formula already up to date"
             exit 0
           fi
-          git commit -m "pythonrs: bump to ${{ github.ref_name }}"
+          git commit -m "pythonrs: bump to ${{ inputs.tag || github.ref_name }}"
           # The tap is shared by ~30 repos. When several releases land together
           # a bare push loses a non-fast-forward race, so rebase and retry.
           for attempt in 1 2 3 4 5; do
