@@ -86,8 +86,33 @@ cd pythonrs && cargo build --release
 ```
 
 The default build links an embedded libpython (the `stdlib-ffi` bridge), so it
-needs CPython present at build time. `cargo build --no-default-features` drops
-pyo3/libpython entirely and serves `import` from the vendored `pylib/` tree.
+needs CPython **3.13 or newer** present at build time — the `abi3-py313` feature
+sets that floor. pyo3 finds the interpreter by looking up `python3` on `PATH`, so
+a machine whose `python3` is older fails the build with
+
+```
+error: cannot set a minimum Python version 3.13 higher than the interpreter
+version 3.12 (the minimum Python version is implied by the abi3-py313 feature)
+```
+
+even when a newer one is installed alongside. Point pyo3 at it explicitly:
+
+```sh
+PYO3_PYTHON=$(command -v python3.13) cargo build
+```
+
+The built binary links that interpreter's libpython, and finding its standard
+library at RUN time needs `PYTHONHOME` set to the matching prefix (see
+[FFI_STDLIB.md](FFI_STDLIB.md)); without it `import os` raises `ModuleNotFoundError`
+and `sys.path` comes back nearly empty:
+
+```sh
+PYTHONHOME=$(python3.13 -c 'import sys; print(sys.prefix)') ./target/debug/python script.py
+```
+
+`cargo build --no-default-features` drops pyo3/libpython entirely and serves
+`import` from the vendored `pylib/` tree, with no version floor and no
+`PYTHONHOME` to set.
 
 #### Self-contained install (macOS)
 

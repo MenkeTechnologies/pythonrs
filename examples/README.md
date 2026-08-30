@@ -32,6 +32,7 @@ cargo build --bin python --bin parity
 | `context_managers.py` | the `with` protocol, `contextlib`, `redirect_stdout` |
 | `pattern_matching.py` | PEP 634 structural pattern matching |
 | `type_hints.py` | runtime annotations, `typing`, `NamedTuple`, `cached_property` |
+| `async_demo.py` | `async`/`await`, `async for`/`async with`, `gather`, cancellation |
 
 ## Objects
 
@@ -43,6 +44,7 @@ cargo build --bin python --bin parity
 | `dataclasses_demo.py` | `@dataclass`: defaults, ordering, frozen |
 | `enums_demo.py` | `Enum`, `IntEnum`, `Flag`, `auto()` |
 | `state_machine.py` | an event-driven FSM with `Enum` states and dispatch |
+| `descriptors.py` | `__get__`/`__set__`, `property`, `classmethod`/`staticmethod`, `__getattr__`, `__slots__` |
 
 ## Algorithms
 
@@ -65,6 +67,7 @@ cargo build --bin python --bin parity
 | `wordfreq.py` / `wordcount.py` | text analysis and frequency counts |
 | `functional.py` | `map`/`filter`/`reduce`/`partial`/composition |
 | `math_demo.py` | the `math` module, big integers, number theory |
+| `numeric_types.py` | `divmod`/`round` sign and tie rules, `complex`, `bytes`/`bytearray`, `frozenset` |
 
 ## Standard library
 
