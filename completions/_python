@@ -2,7 +2,7 @@
 # zsh completion for pythonrs `python`.
 _python() {
   _arguments -s \
-    '(-c)-c[execute a one-liner]:source' \
+    '(-c --command)'{-c,--command}'[execute a one-liner]:source' \
     '(-m)-m[run a library module as a script (delegates to embedded CPython runpy)]:module' \
     '-u[force unbuffered stdout/stderr]' \
     '-E[ignore PYTHON* env vars (drop-in compat)]' \
