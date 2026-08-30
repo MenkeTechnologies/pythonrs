@@ -156,42 +156,60 @@ fn bridge_unavailable(name: &str) -> String {
     format!("ModuleNotFoundError: No module named '{name}'")
 }
 
-/// The install prefix of the libpython this binary is actually linked against,
-/// derived from the loaded shared object's own path (`<prefix>/lib/libpython3.X`).
+/// The candidate install prefixes of the libpython this binary is actually
+/// linked against, derived from the loaded shared object's own path.
+///
+/// There is no single layout to assume, so both that exist are returned:
+///   * `<prefix>/lib/libpython3.X.{dylib,so}` — the plain Unix install, prefix
+///     two levels up.
+///   * `<prefix>/Python` — the macOS framework install, where the dylib sits
+///     directly in its own prefix (`Python.framework/Versions/3.X/Python`, with
+///     the stdlib at `Python.framework/Versions/3.X/lib/python3.X`). This is how
+///     Homebrew's `python@3.X` ships, so it is the layout on the common Mac.
 ///
 /// Used only to decide whether starting the interpreter is safe when pythonrs
-/// has no stdlib of its own to point at. `dlsym`/`dladdr` are asked rather than
-/// taking a symbol's address directly, because the address of an imported
+/// has no stdlib of its own to point at; [`init`] accepts the linked libpython
+/// when ANY candidate holds a real stdlib. `dlsym`/`dladdr` are asked rather
+/// than taking a symbol's address directly, because the address of an imported
 /// function in this binary can be a stub that resolves back to this binary.
 #[cfg(unix)]
-fn linked_libpython_prefix() -> Option<PathBuf> {
+fn linked_libpython_prefixes() -> Vec<PathBuf> {
     use std::ffi::{CStr, CString, OsStr};
     use std::os::unix::ffi::OsStrExt;
 
-    let sym = CString::new("Py_IsInitialized").ok()?;
+    let Ok(sym) = CString::new("Py_IsInitialized") else {
+        return Vec::new();
+    };
     // SAFETY: `dlsym` on the global handle with a NUL-terminated name, and
     // `dladdr` on the pointer it returned. Both are read-only lookups, and
     // `dli_fname` is owned by the loader and valid for the process lifetime.
     let path = unsafe {
         let addr = libc::dlsym(libc::RTLD_DEFAULT, sym.as_ptr());
         if addr.is_null() {
-            return None;
+            return Vec::new();
         }
         let mut info: libc::Dl_info = std::mem::zeroed();
         if libc::dladdr(addr, &mut info) == 0 || info.dli_fname.is_null() {
-            return None;
+            return Vec::new();
         }
         PathBuf::from(OsStr::from_bytes(CStr::from_ptr(info.dli_fname).to_bytes()))
     };
-    // `<prefix>/lib/libpython3.X.{dylib,so}` — the prefix is two levels up.
-    path.parent()?.parent().map(PathBuf::from)
+    let Some(libdir) = path.parent() else {
+        return Vec::new();
+    };
+    // Framework layout first, plain Unix layout second.
+    let mut out = vec![libdir.to_path_buf()];
+    if let Some(prefix) = libdir.parent() {
+        out.push(prefix.to_path_buf());
+    }
+    out
 }
 
-/// Non-Unix has no `dladdr`; "unknown" is reported, and [`init`] proceeds as it
+/// Non-Unix has no `dladdr`; nothing is reported, and [`init`] proceeds as it
 /// always did rather than refusing to start on a platform it cannot inspect.
 #[cfg(not(unix))]
-fn linked_libpython_prefix() -> Option<PathBuf> {
-    None
+fn linked_libpython_prefixes() -> Vec<PathBuf> {
+    Vec::new()
 }
 
 /// Whether the embedded interpreter can be started at all.
@@ -239,15 +257,15 @@ pub fn init() -> bool {
                     std::env::remove_var("PYTHONHOME");
                 }
                 // With no home of our own, CPython falls back to the prefix
-                // compiled into the libpython we are linked against. When THAT
-                // has no stdlib either there is nothing left to try, and starting
-                // the interpreter would abort the process, so the bridge is
-                // declared unusable instead and every import reports it.
-                if let Some(prefix) = linked_libpython_prefix() {
-                    if !has_stdlib(&prefix) {
-                        BRIDGE_USABLE.store(false, std::sync::atomic::Ordering::Relaxed);
-                        return;
-                    }
+                // compiled into the libpython we are linked against. When NONE
+                // of that libpython's candidate prefixes holds a stdlib there is
+                // nothing left to try, and starting the interpreter would abort
+                // the process, so the bridge is declared unusable instead and
+                // every import reports it.
+                let linked = linked_libpython_prefixes();
+                if !linked.is_empty() && !linked.iter().any(|p| has_stdlib(p)) {
+                    BRIDGE_USABLE.store(false, std::sync::atomic::Ordering::Relaxed);
+                    return;
                 }
             }
         }
