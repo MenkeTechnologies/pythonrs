@@ -2914,3 +2914,111 @@ fn math_prod_honors_start() {
         "300000000000000000000"
     );
 }
+
+/// Read `path` back as raw bytes, for the tests that assert what actually
+/// reached the disk rather than what a decoder handed back.
+fn read_bytes(path: &std::path::Path) -> Vec<u8> {
+    std::fs::read(path).expect("the file the program wrote")
+}
+
+#[test]
+fn text_read_translates_universal_newlines() {
+    // `open(p)` with the default `newline=None` turns `\r\n` and a lone `\r`
+    // into `\n`. pythonrs used to hand the bytes back untouched, so a file
+    // written on Windows read back with its `\r`s still in every line.
+    let path = tmp_path("crlf");
+    std::fs::write(&path, b"l1\r\nl2\rl3").expect("seed the file");
+    let p = path.to_str().unwrap();
+    let got = g(
+        &format!("f = open('{p}')\nx = (f.read(), open('{p}').readlines())\nf.close()\n"),
+        "x",
+    );
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(got, "('l1\\nl2\\nl3', ['l1\\n', 'l2\\n', 'l3'])");
+}
+
+#[test]
+fn newline_empty_keeps_the_line_endings_as_written() {
+    // `newline=''` is how `csv` opens its files: the reader must see the exact
+    // terminators. The argument used to be ignored entirely.
+    let path = tmp_path("nlraw");
+    std::fs::write(&path, b"a\r\nb").expect("seed the file");
+    let p = path.to_str().unwrap();
+    let got = g(&format!("x = open('{p}', newline='').read()\n"), "x");
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(got, "'a\\r\\nb'");
+}
+
+#[test]
+fn read_n_counts_characters_after_newline_translation() {
+    // A translated `\r\n` costs two bytes and yields one character, so a
+    // fixed-count read has to keep going or it comes up short.
+    let path = tmp_path("readn");
+    std::fs::write(&path, b"l1\r\nl2").expect("seed the file");
+    let p = path.to_str().unwrap();
+    let got = g(
+        &format!("f = open('{p}')\nx = (f.read(4), f.read())\n"),
+        "x",
+    );
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(got, "('l1\\nl', '2')");
+}
+
+#[test]
+fn encoding_argument_decides_the_bytes_on_disk() {
+    // `encoding=` used to be parsed and dropped, so every write was UTF-8: a
+    // latin-1 'é' hit the disk as two bytes where CPython writes one.
+    let path = tmp_path("enc");
+    let p = path.to_str().unwrap();
+    eval_str(&format!(
+        "f = open('{p}', 'w', encoding='latin-1')\nf.write('é')\nf.close()\n"
+    ))
+    .expect("latin-1 write should run");
+    let wrote = read_bytes(&path);
+    let back = g(
+        &format!("x = open('{p}', encoding='latin-1').read()\n"),
+        "x",
+    );
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(wrote, vec![0xE9]);
+    assert_eq!(back, "'é'");
+}
+
+#[test]
+fn an_unencodable_character_raises_rather_than_writing_something_else() {
+    let path = tmp_path("encerr");
+    let p = path.to_str().unwrap();
+    let e = err(&format!(
+        "f = open('{p}', 'w', encoding='ascii')\nf.write('中')\n"
+    ));
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        e.starts_with("UnicodeEncodeError: 'ascii' codec can't encode character"),
+        "got: {e}"
+    );
+}
+
+#[test]
+fn an_unknown_encoding_is_rejected_at_open() {
+    // Better than the old behaviour, which accepted the name and wrote UTF-8.
+    let path = tmp_path("enclookup");
+    let p = path.to_str().unwrap();
+    let e = err(&format!("f = open('{p}', 'w', encoding='no-such-codec')\n"));
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(e, "LookupError: unknown encoding: no-such-codec");
+}
+
+#[test]
+fn binary_mode_rejects_the_text_only_arguments() {
+    let path = tmp_path("binargs");
+    let p = path.to_str().unwrap();
+    assert_eq!(
+        err(&format!("f = open('{p}', 'wb', encoding='utf-8')\n")),
+        "ValueError: binary mode doesn't take an encoding argument"
+    );
+    assert_eq!(
+        err(&format!("f = open('{p}', 'wb', newline='')\n")),
+        "ValueError: binary mode doesn't take a newline argument"
+    );
+    let _ = std::fs::remove_file(&path);
+}

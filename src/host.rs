@@ -1295,7 +1295,105 @@ pub enum IoCell {
         mode: String,
         readable: bool,
         writable: bool,
+        /// The `encoding=` a text handle was opened with. `open` used to drop the
+        /// argument on the floor and always use UTF-8, so a latin-1 write
+        /// produced two bytes where CPython produces one.
+        encoding: TextEncoding,
+        /// `newline=None` (the default): translate `\r\n` and a lone `\r` to
+        /// `\n` on read, as CPython's universal newlines do. `newline=''` and an
+        /// explicit terminator both leave the bytes alone.
+        newline_translate: bool,
     },
+}
+
+/// The text encodings a native file handle can be opened with. pythonrs decodes
+/// and encodes these itself; anything else is `LookupError` at `open` time rather
+/// than silently-wrong bytes at write time.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TextEncoding {
+    Utf8,
+    Ascii,
+    Latin1,
+}
+
+impl TextEncoding {
+    /// Resolve a Python encoding name, matching CPython's normalization (case
+    /// and `-`/`_` insensitive) for the three this supports.
+    pub fn from_name(name: &str) -> Option<Self> {
+        let n: String = name
+            .chars()
+            .filter(|c| *c != '-' && *c != '_' && *c != ' ')
+            .flat_map(char::to_lowercase)
+            .collect();
+        match n.as_str() {
+            "utf8" | "u8" | "utf" | "utf8mb4" => Some(Self::Utf8),
+            "ascii" | "usascii" | "646" => Some(Self::Ascii),
+            "latin1" | "latin" | "iso88591" | "8859" | "cp819" | "l1" => Some(Self::Latin1),
+            _ => None,
+        }
+    }
+
+    /// Bytes → text. Undecodable input is replaced rather than raising, matching
+    /// what the UTF-8 path already did (`errors=` is not implemented).
+    fn decode(self, bytes: &[u8]) -> String {
+        match self {
+            Self::Utf8 => String::from_utf8_lossy(bytes).into_owned(),
+            Self::Ascii => bytes
+                .iter()
+                .map(|b| if *b < 0x80 { *b as char } else { '\u{fffd}' })
+                .collect(),
+            Self::Latin1 => bytes.iter().map(|b| *b as char).collect(),
+        }
+    }
+
+    /// Text → bytes. A character the encoding cannot represent is the error
+    /// CPython raises for the same write.
+    fn encode(self, s: &str) -> Result<Vec<u8>, String> {
+        match self {
+            Self::Utf8 => Ok(s.as_bytes().to_vec()),
+            Self::Ascii | Self::Latin1 => {
+                let limit = if self == Self::Ascii { 0x80 } else { 0x100 };
+                let name = if self == Self::Ascii {
+                    "ascii"
+                } else {
+                    "latin-1"
+                };
+                let mut out = Vec::with_capacity(s.len());
+                for (i, c) in s.chars().enumerate() {
+                    let cp = c as u32;
+                    if cp >= limit {
+                        return Err(format!(
+                            "UnicodeEncodeError: '{name}' codec can't encode character \
+                             '\\u{cp:04x}' in position {i}: ordinal not in range({limit})"
+                        ));
+                    }
+                    out.push(cp as u8);
+                }
+                Ok(out)
+            }
+        }
+    }
+}
+
+/// Apply universal newlines to freshly decoded text: `\r\n` and a lone `\r`
+/// both become `\n`.
+fn translate_newlines(s: &str) -> String {
+    if !s.contains('\r') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\r' {
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            out.push('\n');
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 // ── collections side tables ──────────────────────────────────────────────────
@@ -18087,6 +18185,7 @@ fn unsupported_write() -> String {
 
 impl PyHost {
     /// Register an owned `std::fs::File` and hand back a fresh `File` handle.
+    #[allow(clippy::too_many_arguments)]
     pub fn io_alloc_file(
         &mut self,
         file: std::fs::File,
@@ -18094,6 +18193,8 @@ impl PyHost {
         mode: String,
         readable: bool,
         writable: bool,
+        encoding: TextEncoding,
+        newline_translate: bool,
     ) -> Value {
         let id = self.io_handles.len() as u32;
         self.io_handles.push(IoCell::File {
@@ -18102,6 +18203,8 @@ impl PyHost {
             mode,
             readable,
             writable,
+            encoding,
+            newline_translate,
         });
         self.alloc(PyObj::File { id })
     }
@@ -18253,12 +18356,24 @@ impl PyHost {
             Some(k) if k < 0 => return self.io_read_all(id),
             Some(k) => k as usize,
         };
+        let single_byte = !matches!(
+            self.io_handles.get(id as usize),
+            Some(IoCell::File {
+                encoding: TextEncoding::Utf8,
+                ..
+            })
+        );
         let mut buf: Vec<u8> = Vec::new();
-        for _ in 0..want {
+        let mut taken = 0usize;
+        while taken < want {
             let Some(lead) = self.io_read_byte(id)? else {
                 break;
             };
+            taken += 1;
             buf.push(lead);
+            if single_byte {
+                continue;
+            }
             // UTF-8: the lead byte's high bits give the character's total length.
             let extra = match lead {
                 0x00..=0x7F => 0,
@@ -18276,7 +18391,32 @@ impl PyHost {
                 }
             }
         }
-        Ok(String::from_utf8_lossy(&buf).into_owned())
+        let mut text = self.text_decode(id, &buf);
+        // A translated `\r\n` cost two reads and yields one character, so the
+        // result can be short; take more until it is not, or the file ends.
+        while text.chars().count() < want {
+            let Some(b) = self.io_read_byte(id)? else {
+                break;
+            };
+            buf.push(b);
+            if !single_byte {
+                let extra = match b {
+                    0x00..=0x7F => 0,
+                    0xC0..=0xDF => 1,
+                    0xE0..=0xEF => 2,
+                    0xF0..=0xF7 => 3,
+                    _ => 0,
+                };
+                for _ in 0..extra {
+                    match self.io_read_byte(id)? {
+                        Some(x) => buf.push(x),
+                        None => break,
+                    }
+                }
+            }
+            text = self.text_decode(id, &buf);
+        }
+        Ok(text)
     }
 
     /// One byte from a readable handle; `None` at EOF. The shared step behind
@@ -18413,7 +18553,8 @@ impl PyHost {
     }
 
     pub fn io_write(&mut self, id: u32, s: &str) -> Result<Value, String> {
-        self.io_write_bytes(id, s.as_bytes())?;
+        let bytes = self.text_encode(id, s)?;
+        self.io_write_bytes(id, &bytes)?;
         Ok(Value::Int(s.chars().count() as i64))
     }
 
@@ -18498,27 +18639,54 @@ impl PyHost {
         Ok(Value::Int(bytes.len() as i64))
     }
 
+    /// How a text handle turns bytes into `str`: its `encoding=`, then universal
+    /// newlines when it was opened with the default `newline=None`.
+    fn text_decode(&self, id: u32, bytes: &[u8]) -> String {
+        let (encoding, translate) = match self.io_handles.get(id as usize) {
+            Some(IoCell::File {
+                encoding,
+                newline_translate,
+                ..
+            }) => (*encoding, *newline_translate),
+            // A standard stream is UTF-8 and translates, as CPython's are.
+            _ => (TextEncoding::Utf8, true),
+        };
+        let text = encoding.decode(bytes);
+        if translate {
+            translate_newlines(&text)
+        } else {
+            text
+        }
+    }
+
+    /// The reverse: `str` into the bytes this handle's `encoding=` calls for.
+    fn text_encode(&self, id: u32, s: &str) -> Result<Vec<u8>, String> {
+        match self.io_handles.get(id as usize) {
+            Some(IoCell::File { encoding, .. }) => encoding.encode(s),
+            _ => Ok(s.as_bytes().to_vec()),
+        }
+    }
+
     /// `f.read()` — the remaining contents as a string.
     pub fn io_read_all(&mut self, id: u32) -> Result<String, String> {
         use std::io::Read;
-        let mut s = String::new();
+        let mut bytes: Vec<u8> = Vec::new();
         match self.io_handles.get_mut(id as usize) {
             Some(IoCell::File {
                 file: Some(f),
                 readable: true,
                 ..
             }) => {
-                f.read_to_string(&mut s).map_err(io_err)?;
-                Ok(s)
+                f.read_to_end(&mut bytes).map_err(io_err)?;
             }
-            Some(IoCell::File { file: Some(_), .. }) => Err(unsupported_read()),
-            Some(IoCell::File { file: None, .. }) => Err(closed_err()),
+            Some(IoCell::File { file: Some(_), .. }) => return Err(unsupported_read()),
+            Some(IoCell::File { file: None, .. }) => return Err(closed_err()),
             Some(IoCell::Stdin) => {
-                std::io::stdin().read_to_string(&mut s).map_err(io_err)?;
-                Ok(s)
+                std::io::stdin().read_to_end(&mut bytes).map_err(io_err)?;
             }
-            _ => Err(unsupported_read()),
+            _ => return Err(unsupported_read()),
         }
+        Ok(self.text_decode(id, &bytes))
     }
 
     /// `f.readline()` — one line up to and including `\n` (or EOF); "" at EOF.
@@ -18530,7 +18698,7 @@ impl PyHost {
                 break;
             }
         }
-        Ok(String::from_utf8_lossy(&buf).into_owned())
+        Ok(self.text_decode(id, &buf))
     }
 
     /// `f.readlines()` / iteration — the remaining lines, each keeping its `\n`.
@@ -18629,8 +18797,36 @@ impl PyHost {
 /// `open(path, mode)` — open a file and return a `File` handle value. The text
 /// modes `r`/`w`/`a`/`x` and their `+` / `b` / `t` variants are supported; bytes
 /// vs text is handled at the read/write layer, not here.
-pub fn open_file(path: &str, mode: &str) -> Result<Value, String> {
+pub fn open_file(
+    path: &str,
+    mode: &str,
+    encoding: Option<&str>,
+    newline: Option<&str>,
+) -> Result<Value, String> {
     use std::fs::OpenOptions;
+    let binary = mode.contains('b');
+    // CPython rejects both arguments on a binary handle before it opens anything.
+    if binary {
+        if encoding.is_some() {
+            return Err("ValueError: binary mode doesn't take an encoding argument".to_string());
+        }
+        if newline.is_some() {
+            return Err("ValueError: binary mode doesn't take a newline argument".to_string());
+        }
+    }
+    let encoding = match encoding {
+        None => TextEncoding::Utf8,
+        Some(name) => TextEncoding::from_name(name)
+            .ok_or_else(|| format!("LookupError: unknown encoding: {name}"))?,
+    };
+    match newline {
+        None | Some("") | Some("\n") | Some("\r") | Some("\r\n") => {}
+        Some(other) => {
+            return Err(format!("ValueError: illegal newline value: {other}"));
+        }
+    }
+    // Universal newlines are the default; any explicit value turns them off.
+    let newline_translate = !binary && newline.is_none();
     let m: String = mode.chars().filter(|c| *c != 'b' && *c != 't').collect();
     let base = m.chars().next().unwrap_or('r');
     let plus = m.contains('+');
@@ -18700,7 +18896,15 @@ pub fn open_file(path: &str, mode: &str) -> Result<Value, String> {
         ));
     }
     Ok(with_host(|h| {
-        h.io_alloc_file(f, path.to_string(), mode.to_string(), readable, writable)
+        h.io_alloc_file(
+            f,
+            path.to_string(),
+            mode.to_string(),
+            readable,
+            writable,
+            encoding,
+            newline_translate,
+        )
     }))
 }
 
