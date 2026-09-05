@@ -13,17 +13,16 @@ jobs:
   build-test:
     runs-on: ubuntu-latest
     # `stdlib-ffi` is on by default (Cargo.toml [features]), so the default
-    # build pulls pyo3 and links libpython — it needs a CPython >= 3.13 and the
-    # abi3 forward-compat flag, same as the stdlib-ffi job below.
+    # build pulls pyo3 and links libpython — it needs a CPython >= 3.9 on PATH
+    # (`abi3-py39`) and no other env.
     #
     # The pin is 3.14 because that is the CPython pythonrs is ported from
     # (src/pyhash.rs is 3.14.6, src/mangle.rs verified against 3.14) and
     # tests/parity.rs asks the interpreter on PATH for its oracle. Under 3.13
     # the unhashable-key wording alone diverges: 3.14 says
     # `cannot use 'U' as a set element (unhashable type: 'U')` where 3.13 says
-    # the bare `unhashable type: 'U'` (python/cpython#132828).
-    env:
-      PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
+    # the bare `unhashable type: 'U'` (python/cpython#132828). The abi3 FLOOR is
+    # covered separately by the ffi-abi3-floor job below.
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
@@ -47,12 +46,10 @@ jobs:
 
   # Explicit `--features stdlib-ffi` job for the CPython stdlib FFI bridge. It is
   # on by default now, so build-test above already exercises it; this job pins
-  # the feature explicitly (and its CPython >= 3.13 + abi3 forward-compat env) so
-  # the FFI path stays covered even if the default feature set changes.
+  # the feature explicitly so the FFI path stays covered even if the default
+  # feature set changes.
   stdlib-ffi:
     runs-on: ubuntu-latest
-    env:
-      PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
@@ -67,3 +64,23 @@ jobs:
         run: cargo build --verbose --features stdlib-ffi
       - name: Test (stdlib-ffi)
         run: cargo test --verbose --features stdlib-ffi
+
+  # Regression guard for the abi3 FLOOR. `abi3-py313` shipped in v0.1.4 and made
+  # `cargo install pythonrs` fail on every host whose CPython was older than 3.13
+  # ("cannot set a minimum Python version 3.13 higher than the interpreter
+  # version 3.12" — Fedora 40). Building the default feature set against the
+  # oldest CPython the floor claims to support is what catches a raised floor
+  # before it reaches crates.io. Build only: the runtime oracle in tests/parity.rs
+  # and the 3.14 error wordings are the build-test job's business, not this one's.
+  ffi-abi3-floor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup update stable && rustup default stable
+      - name: Install CPython (abi3 floor)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+      - name: Build (default features, CPython 3.9)
+        run: cargo build --verbose

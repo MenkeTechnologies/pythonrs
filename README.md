@@ -79,6 +79,11 @@ Two things set it apart from every other standalone Python:
 # Via the Homebrew tap (bumped by each release; formula is `pythonrs`)
 brew install menketechnologies/menketech/pythonrs
 
+# From crates.io — the default build links libpython, so it needs a CPython
+# >= 3.9 on the machine; `--no-default-features` builds the CPython-free one
+cargo install pythonrs
+cargo install pythonrs --no-default-features
+
 # Or from source
 git clone https://github.com/MenkeTechnologies/pythonrs
 cd pythonrs && cargo build --release
@@ -86,20 +91,17 @@ cd pythonrs && cargo build --release
 ```
 
 The default build links an embedded libpython (the `stdlib-ffi` bridge), so it
-needs CPython **3.13 or newer** present at build time — the `abi3-py313` feature
-sets that floor. pyo3 finds the interpreter by looking up `python3` on `PATH`, so
-a machine whose `python3` is older fails the build with
-
-```
-error: cannot set a minimum Python version 3.13 higher than the interpreter
-version 3.12 (the minimum Python version is implied by the abi3-py313 feature)
-```
-
-even when a newer one is installed alongside. Point pyo3 at it explicitly:
+needs CPython **3.9 or newer** present at build time — the `abi3-py39` feature
+sets that floor, and the stable ABI keeps the resulting binary usable against any
+newer CPython at run time. pyo3 finds the interpreter by looking up `python3` on
+`PATH`; point it elsewhere with
 
 ```sh
-PYO3_PYTHON=$(command -v python3.13) cargo build
+PYO3_PYTHON=$(command -v python3.14) cargo build
 ```
+
+which is also the escape hatch when `python3` on `PATH` is pythonrs itself —
+pyo3 rejects it with "no Python 3.x interpreter found".
 
 The built binary links that interpreter's libpython, and finding its standard
 library at RUN time needs `PYTHONHOME` set to the matching prefix (see
@@ -107,7 +109,7 @@ library at RUN time needs `PYTHONHOME` set to the matching prefix (see
 and `sys.path` comes back nearly empty:
 
 ```sh
-PYTHONHOME=$(python3.13 -c 'import sys; print(sys.prefix)') ./target/debug/python script.py
+PYTHONHOME=$(python3.14 -c 'import sys; print(sys.prefix)') ./target/debug/python script.py
 ```
 
 `cargo build --no-default-features` drops pyo3/libpython entirely and serves

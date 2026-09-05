@@ -165,9 +165,11 @@ CPython calls back into fusevm. Verified byte-identical to `python3` (3.14.6):
 `date < date`, `Decimal('0.1') + Decimal('0.2')` (exact), `Fraction + Fraction`,
 `timedelta * 3`, `Decimal % Decimal`, `abs(Decimal('-5'))`.
 
-Build/run with the feature: `PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 cargo build
---features stdlib-ffi` (CI has a dedicated `stdlib-ffi` job). Default builds never
-pull pyo3 or need libpython, so they import only the native set below.
+`stdlib-ffi` is a default feature, so a bare `cargo build` already links it
+against any CPython 3.9–3.14 (`abi3-py39`, no extra env); `cargo build --features
+stdlib-ffi` names it explicitly, which is what CI's dedicated job runs. Only
+`--no-default-features` drops pyo3 and libpython — that build imports the native
+set below plus the vendored `pylib/` tree.
 
 - The former hand-rolled shadows `src/stdlib/{json,os,random,string,itertools,
   functools}.rs` were **deleted** — the real CPython modules replace them.
