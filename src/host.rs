@@ -14495,6 +14495,21 @@ pub fn classify_top_error(err: &str) -> TopExit {
                 }
             }
         }
+        // A `SystemExit` raised on the CPython side of the bridge — `argparse`
+        // ending the program from `--help` or a usage error, `unittest.main()`,
+        // `runpy` — never becomes a `PyObj::Exception`: it crosses as the error
+        // string plus the `foreign_exc` record. Without this it was reported as an
+        // ordinary uncaught exception, so `--help` exited 1 instead of 0 and a
+        // usage error exited 1 instead of 2, both with a traceback CPython does
+        // not print. Matched against the error being classified (rather than on
+        // `foreign_exc` alone) so a stale record from an earlier, caught bridge
+        // call cannot claim an unrelated failure.
+        if let Some(fe) = &h.foreign_exc {
+            if fe.line == err && (err == "SystemExit" || err.starts_with("SystemExit:")) {
+                let args = fe.args.clone();
+                return system_exit_outcome(h, &args);
+            }
+        }
         TopExit::Uncaught {
             traceback: h.render_traceback(err),
         }
@@ -16521,6 +16536,25 @@ fn current_search_paths() -> Vec<String> {
     })
 }
 
+/// pythonrs's live `sys.argv` as plain strings, for mirroring into the embedded
+/// interpreter. Read from the `sys` module rather than `PyHost::argv` so a
+/// program that rewrote `sys.argv` before importing argparse gets what it set;
+/// `PyHost::argv` (what `init_runtime` installed) is the fallback.
+#[cfg(feature = "stdlib-ffi")]
+fn current_argv() -> Vec<String> {
+    with_host(|h| {
+        if let Some(sys) = h.cached_module("sys") {
+            if let Ok(argv) = h.get_attr(&sys, "argv") {
+                if let Some(PyObj::List(items)) = h.get(&argv) {
+                    let items = items.clone();
+                    return items.iter().filter_map(|v| h.as_str(v)).collect();
+                }
+            }
+        }
+        h.argv.clone()
+    })
+}
+
 /// Resolve `name` against pythonrs's `sys.path` (the program's own directory and
 /// anything it inserted) and run it on pythonrs itself. `None` = no such file on
 /// those roots, so the caller falls through to the stdlib resolvers.
@@ -17707,6 +17741,10 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                 // `sys.path` anyway so an installed third-party package reachable
                 // only through a program-inserted path still resolves.
                 crate::ffi::queue_search_paths(current_search_paths());
+                // …and the program's arguments. `argparse`, `getopt`, `pdb` and
+                // `unittest` all read `sys.argv` on the CPython side, where it is
+                // `['']` unless it is mirrored across.
+                crate::ffi::queue_argv(current_argv());
                 let id = crate::ffi::import(name)?;
                 return Ok(with_host(|h| h.alloc(PyObj::Foreign(id))));
             }
