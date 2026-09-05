@@ -5968,7 +5968,20 @@ pub fn call_builtin_function(
                 .or_else(|| args.get(1).cloned())
                 .and_then(|v| with_host(|h| h.as_str(&v)))
                 .unwrap_or_else(|| "r".into());
-            host::open_file(&path, &mode)
+            // CPython's signature is
+            // `open(file, mode, buffering, encoding, errors, newline, ...)`, so
+            // the positional slots are fixed. `encoding` and `newline` used to be
+            // dropped silently, which made a latin-1 write produce UTF-8 bytes and
+            // a CRLF file read back with its `\r`s intact.
+            let str_arg = |name: &str, pos: usize| -> Option<String> {
+                kw_get(&kwargs, name)
+                    .or_else(|| args.get(pos).cloned())
+                    .filter(|v| !matches!(v, Value::Undef))
+                    .and_then(|v| with_host(|h| h.as_str(&v)))
+            };
+            let encoding = str_arg("encoding", 3);
+            let newline = str_arg("newline", 5);
+            host::open_file(&path, &mode, encoding.as_deref(), newline.as_deref())
         }
         "object" => Ok(with_host(|h| {
             h.new_instance("object".into(), host::NameMap::default())

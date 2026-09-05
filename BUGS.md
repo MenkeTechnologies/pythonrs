@@ -443,6 +443,24 @@ written.
   module rather than from `PyHost::argv` so a program that rewrites `sys.argv`
   before importing argparse gets what it set. A rewrite performed after the last
   bridged import is not mirrored.
+- **`open()` honours `encoding=` and universal newlines.** The builtin parsed
+  only `file` and `mode`; `encoding`, `errors`, `newline` and `buffering` were
+  accepted and dropped. Two silent wrong answers came out of that. A text handle
+  always wrote UTF-8, so `open(p, 'w', encoding='latin-1').write('é')` put two
+  bytes on disk where CPython puts one — the program asked for an encoding, got
+  another, and nothing reported it. And no read translated line endings, so a
+  CRLF file came back as `'a\r\nb'` from `read()` and `['a\r\n', 'b']` from
+  `readlines()` instead of CPython's universal-newline `'a\nb'` / `['a\n', 'b']`.
+  The handle now carries a `TextEncoding` (utf-8, ascii, latin-1, resolved through
+  CPython's own name normalisation) and a `newline_translate` flag, and `open`
+  takes CPython's real positional signature so the arguments land in the right
+  slots. An encoding pythonrs cannot serve is `LookupError: unknown encoding: X`
+  at open time rather than UTF-8 bytes at write time, a character the codec cannot
+  represent is `UnicodeEncodeError` with CPython's wording, and binary mode
+  rejects `encoding=`/`newline=` with CPython's two `ValueError`s. `read(n)` counts
+  characters AFTER translation — a `\r\n` costs two bytes and yields one — so the
+  reader tops up until it has `n` of them or reaches EOF. `errors=` is accepted and
+  still ignored: decoding stays lossy.
 - **A CPython-side file the program never closed keeps its writes.** `io.open`
   hands back a CPython stream, which is block-buffered, and the embedded
   interpreter is never `Py_Finalize`d — so nothing ran the teardown that flushes
@@ -914,6 +932,31 @@ written.
   text. The same gap applies to `unittest`'s `--buffer` and any capture built on
   `redirect_stdout`. Repro: `with contextlib.redirect_stdout(io.StringIO()) as
   buf: functools.partial(print, 'x')()` — `x` appears on stdout, not in `buf`.
+- **A pythonrs callable or object cannot be used from a worker thread.** On the
+  bridged build `import threading` is CPython's, and CPython's `threading.py`
+  imports the REAL C `_thread` — not the native `_thread` this crate ships — so
+  `Thread.start()` spawns a genuine OS thread rather than running the target
+  inline. `PyHost` is a `thread_local`, so on that thread the heap is empty and
+  every pythonrs value resolves to nothing: the target comes back as a bare
+  `object` and the thread dies with `TypeError: 'object' object is not callable`,
+  once per thread, with the program's own result silently missing. Measured:
+  `threading.Thread(target=print, args=('x',)).start()` works (the target is a
+  CPython builtin) while `threading.Thread(target=res.append, args=(1,)).start()`
+  fails for a pythonrs `res`, and `_thread.get_ident() != threading.get_ident()`
+  because two different `_thread` modules are live at once. The native `_thread`
+  arm and its inline-execution semantics therefore only apply to the
+  `--no-default-features` build; the header comment in `src/stdlib/pythread.rs`
+  describes that build, not this one. Closing the gap means putting the native
+  `_thread` into the embedded interpreter's `sys.modules` before `threading` is
+  imported, which would also make every thread on the default build serialise —
+  a decision about what the default build IS, not a defect to patch.
+- **A pythonrs instance cannot be pickled.** `pickle` is CPython's, and a pythonrs
+  object reaches it as the opaque `PyrsInstance` wrapper, which exposes no
+  `__reduce__` and no picklable `__class__`: `pickle.dumps(obj)` raises
+  `TypeError: cannot pickle 'builtins.PyrsInstance' object`. Plain containers of
+  builtins pickle correctly (they cross by value); it is user-defined classes that
+  do not, which also rules out `copy.deepcopy` through the pickle fallback,
+  `multiprocessing` arguments, and anything that caches objects to disk.
 - **`warnings.catch_warnings(record=True)` records nothing.** `warnings.warn` is
   CPython's C `_warnings.warn` while the recording list the context manager
   installs is read back across the bridge by value, so the appended entries are
