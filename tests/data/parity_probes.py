@@ -722,3 +722,100 @@ print(sys.__name__, repr(sys.__package__), hasattr(sys, "__file__"))
 # A module loaded FROM a file has one, and it is that file.
 import os.path
 print(os.path.__name__, hasattr(os.path, "__file__"))
+#==#
+# ── a memoryview is a WINDOW on live memory, not a snapshot ──────────────────
+# pythonrs reported `mv.readonly == False` and then refused every write with
+# `TypeError: 'memoryview' object does not support item assignment` — the view
+# was read-only in fact while advertising otherwise. Each refusal below has its
+# own wording in CPython, and generic text for any of them is a divergence: a
+# read-only view, a non-int element, an out-of-range element, a non-buffer
+# right-hand side and a delete are five different diagnoses.
+ba = bytearray(b"hello")
+mv = memoryview(ba)
+ro = memoryview(b"hello")
+
+
+def t(label, fn):
+    try:
+        fn()
+        print(label, "->", ba)
+    except BaseException as e:
+        print(label, "->", type(e).__name__ + ":", e)
+
+
+print(mv.readonly, ro.readonly, mv.itemsize, mv.format, mv.ndim, mv.shape)
+t("item", lambda: mv.__setitem__(0, 88))
+t("neg", lambda: mv.__setitem__(-1, 89))
+t("ro", lambda: ro.__setitem__(0, 88))
+t("big", lambda: mv.__setitem__(0, 256))
+t("neg-elem", lambda: mv.__setitem__(0, -1))
+t("float-elem", lambda: mv.__setitem__(0, 1.5))
+t("bytes-elem", lambda: mv.__setitem__(0, b"a"))
+t("oob", lambda: mv.__setitem__(9, 1))
+t("oob-neg", lambda: mv.__setitem__(-9, 1))
+t("strkey", lambda: mv.__setitem__("a", 1))
+t("slice", lambda: mv.__setitem__(slice(1, 3), b"YZ"))
+t("slice-short", lambda: mv.__setitem__(slice(1, 3), b"Y"))
+t("slice-list", lambda: mv.__setitem__(slice(1, 3), [1, 2]))
+t("slice-str", lambda: mv.__setitem__(slice(0, 2), "ab"))
+t("slice-step", lambda: mv.__setitem__(slice(None, None, 2), b"abc"))
+t("slice-rev", lambda: mv.__setitem__(slice(None, None, -1), b"12345"))
+t("del", lambda: mv.__delitem__(0))
+t("del-slice", lambda: mv.__delitem__(slice(0, 2)))
+# A write lands in the BACKING buffer, so every other view sees it, and a
+# sliced view's index 0 is the backing buffer's `start`, not its own.
+win = memoryview(ba)[1:3]
+t("window", lambda: win.__setitem__(0, 90))
+print(bytes(mv), bytes(win), ba, mv.tolist(), mv.hex())
+#==#
+# ── `__index__` is honoured on the STORE side, not just the load ─────────────
+# `__index__` means "this object IS an integer", so CPython reaches it wherever
+# one is wanted. pythonrs consulted it when READING a subscript and nowhere
+# else, so `L[Idx(1)]` returned a value and `L[Idx(1)] = 9` raised
+# `TypeError: list indices must be integers`. The explicit dunder call is the
+# same slot in CPython and had drifted the same way.
+class Idx:
+    def __init__(self, n):
+        self.n = n
+
+    def __index__(self):
+        return self.n
+
+
+class Bad:
+    def __index__(self):
+        raise ValueError("boom")
+
+
+class NotInt:
+    def __index__(self):
+        return "x"
+
+
+def r(label, fn):
+    try:
+        print(label, "->", fn())
+    except BaseException as e:
+        print(label, "->", type(e).__name__ + ":", e)
+
+
+L = [10, 20, 30, 40]
+b2 = bytearray(b"abcdef")
+r("load", lambda: L[Idx(1)])
+r("load-dunder", lambda: L.__getitem__(Idx(1)))
+r("store", lambda: (L.__setitem__(Idx(1), 99), L)[1])
+r("store-syntax", lambda: (L.__setitem__(Idx(2), 98), L)[1])
+r("del", lambda: (L.__delitem__(Idx(0)), L)[1])
+r("bounds", lambda: (L.__setitem__(slice(Idx(0), Idx(1)), [7]), L)[1])
+r("ba-subscript", lambda: (b2.__setitem__(Idx(1), 65), b2)[1])
+r("ba-element", lambda: (b2.__setitem__(0, Idx(66)), b2)[1])
+r("mv-element", lambda: (memoryview(b2).__setitem__(2, Idx(67)), b2)[1])
+r("raises", lambda: L.__setitem__(Bad(), 9))
+r("nonint", lambda: L.__setitem__(NotInt(), 9))
+r("elem-raises", lambda: b2.__setitem__(0, Bad()))
+# A MAPPING is the exception: it keys on the OBJECT, so coercing an `__index__`
+# key would merge `d[Idx(1)]` and `d[1]` into one slot.
+d = {}
+d[Idx(1)] = "obj"
+d[1] = "int"
+print(len(d), d[1], sorted(map(type(0).__name__.__eq__, [1])))

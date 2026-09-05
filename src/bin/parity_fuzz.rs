@@ -24,8 +24,13 @@
 //! left a whole axis of `str`/`bytes` hashing and string-keyed container order
 //! unmeasurable by construction.
 //!
-//! Subprocess-only: this binary never links the pythonrs library — it compares
-//! two `python` processes, exactly as a user would observe them.
+//! Subprocess-only where it counts: no Python is ever EVALUATED through the
+//! pythonrs library here. Every program under test runs as a `python` process,
+//! exactly as a user would observe it, so nothing the fuzzer reports can be an
+//! artefact of an in-process shortcut. (The library is linked for one non-
+//! evaluating utility — `pythonrs::oracle`, the shared reference-CPython
+//! resolver — so this harness, `src/bin/parity.rs` and `tests/parity.rs` name
+//! the same interpreter by the same rules instead of by three drifting copies.)
 //!
 //! Build:  cargo build --bin parity-fuzz
 //! Run:    ./target/debug/parity-fuzz --count 5000
@@ -100,49 +105,23 @@ fn ours_bin() -> PathBuf {
 /// unusable this is a HARD ERROR — silently falling back to a different CPython
 /// would answer a different question than the one that was asked.
 fn resolve_oracle() -> String {
-    if let Ok(p) = std::env::var("PYTHONRS_FUZZ_PYTHON") {
-        if version_of(&p).is_none() {
-            eprintln!("parity-fuzz: PYTHONRS_FUZZ_PYTHON={p}: not a usable python");
+    match pythonrs::oracle::resolve() {
+        // Always ABSOLUTE. A bare `python3` is a PATH lookup, not a toolchain:
+        // a report naming one cannot be re-run against the same interpreter by
+        // anyone whose PATH differs, and a venv/pyenv/Homebrew shadow all answer
+        // to it. The divergence corpus is only replayable if the oracle is a file.
+        Ok(p) => p.display().to_string(),
+        Err(e) => {
+            eprintln!("parity-fuzz: {e}");
             std::process::exit(2);
         }
-        return p;
-    }
-    for p in [
-        "python3",
-        "/usr/bin/python3",
-        "/opt/homebrew/bin/python3",
-        "python",
-    ] {
-        if version_of(p).is_some() {
-            return p.to_string();
-        }
-    }
-    eprintln!("parity-fuzz: no reference python3 found; set PYTHONRS_FUZZ_PYTHON");
-    std::process::exit(2);
-}
-
-/// `<prog> --version` output, or None if the program can't be run.
-fn version_of(prog: &str) -> Option<String> {
-    let o = Command::new(prog).arg("--version").output().ok()?;
-    if !o.status.success() && o.stdout.is_empty() && o.stderr.is_empty() {
-        return None;
-    }
-    let mut s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-    if s.is_empty() {
-        s = String::from_utf8_lossy(&o.stderr).trim().to_string();
-    }
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
     }
 }
 
 /// `<path> (<version>)`, for the run header and the report file, so a divergence
 /// record can be attributed to the exact oracle that produced it.
 fn oracle_id(oracle: &str) -> String {
-    let v = version_of(oracle).unwrap_or_else(|| "unknown".to_string());
-    format!("{oracle} ({v})")
+    pythonrs::oracle::identify(Path::new(oracle))
 }
 
 static CMP_STDERR: AtomicBool = AtomicBool::new(false);
@@ -3431,6 +3410,226 @@ fn gen_bytesops(seed: u64) -> Vec<String> {
     vec![e]
 }
 
+/// **Mutable-buffer stores**: writing THROUGH a `memoryview` into its backing
+/// `bytearray`, and the `__index__` protocol on both sides of a subscript STORE
+/// (`a[Idx()] = v`, `ba[i] = Idx()`) and a `del`.
+///
+/// This is a store-side generator on purpose. `gen_bytesops` already writes
+/// `ba[i] = <int literal>` and `ba[i:j] = b'XY'`, and `gen_seqtail` reads
+/// `a[Idx()]` — so the LOAD side of `__index__` and the literal store were both
+/// covered, and every case here still passed. What nothing reached was the
+/// combination: a store or delete whose subscript, or whose stored element, is
+/// an object rather than a literal, and any write through a view at all. Three
+/// real divergences were sitting in that gap (`mv[i] = b` raised
+/// `TypeError: 'memoryview' object does not support item assignment` outright;
+/// `L[Idx()] = v` raised `list indices must be integers`; `ba[i] = Idx()` raised
+/// `cannot be interpreted as an integer`), which is what a blind spot in a
+/// grammar looks like from the inside — 4000 clean cases either side of it.
+///
+/// Error paths are printed rather than raised: each case that CPython refuses is
+/// wrapped so the exception's type and message land on STDOUT. A raise would
+/// only be compared under `--stderr`, and the whole value of these cases is that
+/// the refusals are as specific as the successes — a view distinguishes four
+/// TypeErrors and two ValueErrors by wording, and generic text for any of them
+/// is a divergence worth failing on.
+fn gen_buffer(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    // A fresh backing buffer per case: every write is destructive, so a shared
+    // one would make a case's output depend on which cases ran before it.
+    let backing = pick(
+        r,
+        &["b'abcdef'", "b'hello'", "b'\\x00\\x01\\xfe\\xff'", "b'xy'"],
+    );
+    let i = pick(r, &["0", "1", "2", "-1", "-2", "3", "9", "-9"]);
+    let j = pick(r, &["0", "1", "2", "3", "-1", "5", "None"]);
+    let step = pick(r, &["1", "2", "-1", "-2", "3", "None"]);
+    let elem = pick(
+        r,
+        &[
+            "0", "1", "65", "255", "256", "-1", "1.5", "b'a'", "True", "10**30", "None",
+        ],
+    );
+    let repl = pick(
+        r,
+        &[
+            "b''",
+            "b'Y'",
+            "b'YZ'",
+            "b'YZW'",
+            "bytearray(b'YZ')",
+            "memoryview(b'QQ')",
+            "[1, 2]",
+            "'ab'",
+            "b'12345'",
+        ],
+    );
+    // The `__index__` stand-in. `__index__` means "this object IS an integer",
+    // so CPython honours it wherever one is wanted — subscript, element, slice
+    // bound — and a frontend that honours it on loads only is wrong in a way
+    // that only a store exercises.
+    let idxcls = "class Idx:\n    def __init__(s, n): s.n = n\n    def __index__(s): return s.n";
+    // Reports the OUTCOME on stdout: the value on success, `ExcType: message` on
+    // failure. Both sides are then compared even without `--stderr`.
+    let harness = "def t(label, fn):\n    try:\n        fn()\n        print(label, 'ok', ba)\n    except BaseException as e:\n        print(label, type(e).__name__ + ': ' + str(e))";
+
+    let case = r.below(16);
+    let mut out = vec![format!("ba = bytearray({backing})")];
+    match case {
+        // ── writing through a view into its backing buffer ───────────────────
+        0 => {
+            out.push("mv = memoryview(ba)".into());
+            out.push(harness.into());
+            out.push(format!("t('item', lambda: mv.__setitem__({i}, {elem}))"));
+            out.push("print(bytes(mv), mv.tolist(), mv.readonly, mv.nbytes)".into());
+        }
+        1 => {
+            out.push("mv = memoryview(ba)".into());
+            out.push(harness.into());
+            out.push(format!(
+                "t('slice', lambda: mv.__setitem__(slice({i}, {j}, {step}), {repl}))"
+            ));
+            out.push("print(bytes(mv), ba)".into());
+        }
+        // A view over an IMMUTABLE `bytes` refuses every write by a distinct
+        // message ("cannot modify read-only memory"), not by the generic one.
+        2 => {
+            out.push(format!("ro = memoryview({backing})"));
+            out.push(harness.into());
+            out.push(format!("t('ro-item', lambda: ro.__setitem__({i}, 65))"));
+            out.push(format!(
+                "t('ro-slice', lambda: ro.__setitem__(slice({i}, {j}), b'Y'))"
+            ));
+            out.push("print(bytes(ro), ro.readonly)".into());
+        }
+        // A view is fixed-length: `del` is refused by name, never by the generic
+        // "doesn't support item deletion", and never silently accepted.
+        3 => {
+            out.push("mv = memoryview(ba)".into());
+            out.push(harness.into());
+            out.push(format!("t('del-item', lambda: mv.__delitem__({i}))"));
+            out.push(format!(
+                "t('del-slice', lambda: mv.__delitem__(slice({i}, {j})))"
+            ));
+            out.push("print(bytes(mv))".into());
+        }
+        // A SLICED view is a window with an offset: a write at its index 0 must
+        // land at the backing buffer's `start`, not at its 0.
+        4 => {
+            out.push(format!("mv = memoryview(ba)[{i}:{j}]"));
+            out.push(harness.into());
+            out.push(format!("t('win', lambda: mv.__setitem__(0, {elem}))"));
+            out.push("print(len(mv), bytes(mv), ba)".into());
+        }
+        // Two views over one buffer see each other's writes — the view is a
+        // window on live memory, not a snapshot taken at construction.
+        5 => {
+            out.push("a = memoryview(ba)".into());
+            out.push("b = memoryview(ba)".into());
+            out.push(harness.into());
+            out.push(format!("t('aliased', lambda: a.__setitem__({i}, 88))"));
+            out.push("print(bytes(a), bytes(b), ba)".into());
+        }
+        // A write through the view is visible to the bytearray's own methods,
+        // and a bytearray write is visible through the view.
+        6 => {
+            out.push("mv = memoryview(ba)".into());
+            out.push(harness.into());
+            out.push(format!("t('through', lambda: mv.__setitem__({i}, 90))"));
+            out.push(format!("t('back', lambda: ba.__setitem__({i}, 91))"));
+            out.push("print(bytes(mv), ba.hex(), list(mv))".into());
+        }
+        // ── `__index__` as the SUBSCRIPT of a store / delete ─────────────────
+        7 => {
+            out.push(idxcls.into());
+            out.push(harness.into());
+            out.push(format!("t('ba-idx', lambda: ba.__setitem__(Idx({i}), 65))"));
+            out.push("print(ba)".into());
+        }
+        8 => {
+            out.push(idxcls.into());
+            out.push("L = [10, 20, 30]".into());
+            out.push(harness.into());
+            out.push(format!(
+                "t('list-idx', lambda: L.__setitem__(Idx({i}), 99))"
+            ));
+            out.push(format!("t('list-del', lambda: L.__delitem__(Idx({i})))"));
+            out.push("print(L)".into());
+        }
+        9 => {
+            out.push(idxcls.into());
+            out.push("D = {}".into());
+            out.push(harness.into());
+            // A MAPPING is the exception: it keys on the OBJECT, so coercing an
+            // `__index__` key would merge `d[Idx(1)]` and `d[1]` into one slot.
+            out.push(format!("t('dict', lambda: D.__setitem__(Idx({i}), 'v'))"));
+            out.push(format!("print(len(D), {i} in D, list(D.values()))"));
+        }
+        10 => {
+            out.push(idxcls.into());
+            out.push("mv = memoryview(ba)".into());
+            out.push(harness.into());
+            out.push(format!("t('mv-idx', lambda: mv.__setitem__(Idx({i}), 67))"));
+            out.push("print(bytes(mv))".into());
+        }
+        // ── `__index__` as the stored ELEMENT of a byte container ────────────
+        11 => {
+            out.push(idxcls.into());
+            out.push(harness.into());
+            out.push(format!("t('ba-elem', lambda: ba.__setitem__(0, Idx({i})))"));
+            out.push("print(ba)".into());
+        }
+        12 => {
+            out.push(idxcls.into());
+            out.push("mv = memoryview(ba)".into());
+            out.push(harness.into());
+            out.push(format!("t('mv-elem', lambda: mv.__setitem__(0, Idx({i})))"));
+            out.push("print(bytes(mv))".into());
+        }
+        // An `__index__` that RAISES, or returns a non-int, must surface as
+        // itself rather than as the container's "not an integer" complaint.
+        13 => {
+            out.push("class Bad:\n    def __index__(s): raise ValueError('boom')".into());
+            out.push("class NotInt:\n    def __index__(s): return 'x'".into());
+            out.push("L = [1, 2, 3]".into());
+            out.push(harness.into());
+            out.push("t('raises', lambda: L.__setitem__(Bad(), 9))".into());
+            out.push("t('nonint', lambda: L.__setitem__(NotInt(), 9))".into());
+            out.push("t('elem-raises', lambda: ba.__setitem__(0, Bad()))".into());
+            out.push("print(L, ba)".into());
+        }
+        // Slice bounds through `__index__`, on a store and a delete.
+        14 => {
+            out.push(idxcls.into());
+            out.push("L = [1, 2, 3, 4, 5]".into());
+            out.push(harness.into());
+            out.push(format!(
+                "t('bounds', lambda: L.__setitem__(slice(Idx({i}), Idx({j} if {j} is not None else 0)), [7]))"
+            ));
+            out.push(format!(
+                "t('ba-bounds', lambda: ba.__setitem__(slice(Idx({i}), None), b'Z'))"
+            ));
+            out.push("print(L, ba)".into());
+        }
+        // The whole surface at once, so an inconsistency BETWEEN the view's
+        // reported properties and its behaviour shows up: a view that says it is
+        // writable and then refuses a write is a bug either way round.
+        _ => {
+            out.push("mv = memoryview(ba)".into());
+            out.push(harness.into());
+            out.push(format!("t('mix', lambda: mv.__setitem__({i}, {elem}))"));
+            out.push(format!(
+                "t('mix-slice', lambda: mv.__setitem__(slice(None, None, {step}), {repl}))"
+            ));
+            out.push(
+                "print(mv.readonly, mv.itemsize, mv.format, mv.ndim, mv.shape, mv.contiguous)"
+                    .into(),
+            );
+            out.push("print(bytes(mv), ba, mv.tobytes(), mv.hex())".into());
+        }
+    }
+    out
+}
+
 /// The `bytes`/`bytearray` "tail": str-parallel methods (`swapcase`, `title`,
 /// `center`/`ljust`/`rjust`, the `isX` predicates, `translate`/`maketrans`),
 /// `%`-formatting, `del ba[i]` / `del ba[i:j]`, and `decode(errors=...)`. Every
@@ -6294,6 +6493,7 @@ enum Mode {
     Strfmt2,
     Bytesops,
     Bytestail,
+    Buffer,
     Format2,
     Strformat,
     Async,
@@ -6362,6 +6562,7 @@ const REAL_MODES: &[Mode] = &[
     Mode::Strfmt2,
     Mode::Bytesops,
     Mode::Bytestail,
+    Mode::Buffer,
     Mode::Format2,
     Mode::Strformat,
     Mode::Async,
@@ -6437,6 +6638,7 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Strfmt2 => gen_strfmt2(seed),
         Mode::Bytesops => gen_bytesops(seed),
         Mode::Bytestail => gen_bytestail(seed),
+        Mode::Buffer => gen_buffer(seed),
         Mode::Format2 => gen_format2(seed),
         Mode::Strformat => gen_strformat(seed),
         Mode::Async => gen_async(seed),
@@ -6508,6 +6710,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Strfmt2 => "strfmt2",
         Mode::Bytesops => "bytesops",
         Mode::Bytestail => "bytestail",
+        Mode::Buffer => "buffer",
         Mode::Format2 => "format2",
         Mode::Strformat => "strformat",
         Mode::Async => "async",
@@ -6579,6 +6782,7 @@ fn mode_from_name(s: &str) -> Option<Mode> {
         Mode::Strfmt2,
         Mode::Bytesops,
         Mode::Bytestail,
+        Mode::Buffer,
         Mode::Format2,
         Mode::Strformat,
         Mode::Async,
@@ -6888,7 +7092,7 @@ fn print_help() {
          --baseline FILE  allowlist of known-gap signatures; only a NEW\n\
          divergence (not in FILE) fails the run (exit 1)\n\
          \n\
-         env  PYTHONRS_FUZZ_PYTHON=PATH  the reference CPython to compare against\n\
+         env  PYTHONRS_ORACLE=PATH  the reference CPython to compare against\n\
          (HARD ERROR if set but unusable). Every run prints the oracle it used."
     );
 }

@@ -271,6 +271,17 @@ spot into a work list — `--mode containertail` exists because that diff surfac
 a dozen `itertools`/`collections`/`math` gaps at once, several of them silently
 wrong answers rather than errors.
 
+A generated corpus has the mirror blind spot: it can only report combinations
+the grammar can produce. `--mode buffer` exists because of one — the grammar
+wrote `ba[i] = <int literal>` and read `a[Idx()]`, so the literal store and the
+`__index__` load were both covered while nothing ever reached a store or delete
+whose subscript or element was an OBJECT, or any write through a `memoryview` at
+all. Thousands of clean cases ran either side of that hole while a view was
+advertising `readonly is False` and refusing every write, and `L[Idx(1)] = 9`
+was raising where `L[Idx(1)]` returned. Where a mode's cases are refusals as
+often as successes, the refusal is printed rather than raised, so the exact
+wording is compared on stdout and generic text for a specific diagnosis fails.
+
 ```sh
 cargo build --bin parity-fuzz
 ./target/debug/parity-fuzz --count 5000          # fuzz every mode
@@ -286,8 +297,16 @@ until it was caught by reading the report. `PYTHONHASHSEED` is pinned to the
 same value on both children and **swept** across cases rather than frozen at
 `0`, so `str`/`bytes` hashing and string-keyed container order are measured
 across the seed axis instead of at one point of it.
-`PYTHONRS_FUZZ_PYTHON` names the reference interpreter; a
-`--baseline` allowlist keeps known gaps from failing while new ones exit non-zero.
+`PYTHONRS_ORACLE` names the reference interpreter (`PYTHONRS_FUZZ_PYTHON` still
+works); a `--baseline` allowlist keeps known gaps from failing while new ones
+exit non-zero. Every harness — this one, the `parity` corpus runner, and the
+`tests/parity.rs` integration test — resolves the reference to an ABSOLUTE path
+and prints it before comparing anything, so a result can be attributed to the
+interpreter that produced it. A bare `python3` is a PATH lookup rather than a
+toolchain: a shim, a venv or a pyenv/Homebrew shadow all answer to it, and a run
+that silently compared against the wrong one is indistinguishable from a correct
+one. An explicitly-named oracle that will not run is a hard error, never a
+fallback onto a different CPython.
 A clean run has to be a run that measured something: cases the reference did not
 answer (timed out, exited non-zero, or printed nothing) are reported as `barren`
 and excluded from `productive`, and a run that executed no case — or none the
