@@ -6,9 +6,12 @@ embedded `libpython`. User code runs on fusevm (JIT/rkyv/AOT); `import <stdlib>`
 delegates to CPython.
 
 ## Validated (isolated spike — proven, do not re-litigate)
-- **pyo3 0.24** with feature `abi3-py313` + env `PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1`
-  builds/links against the system CPython **3.14.6** via the stable ABI. (Drop the flag
-  when pyo3 ships native 3.14; abi3 keeps one binary compatible across CPython minors.)
+- **pyo3 0.24** with feature `abi3-py39` builds/links against CPython **3.10, 3.12 and
+  3.14** via the stable ABI, with no `PYO3_USE_ABI3_FORWARD_COMPATIBILITY` and no other
+  extra env. The floor was `abi3-py313`, which broke `cargo install pythonrs` on hosts
+  with an older CPython and simultaneously sat on pyo3 0.24's own 3.13 ceiling (hence the
+  forward-compat flag). 3.9 is as low as the limited API goes here: `#[pyclass(dict)]`
+  in `src/ffi.rs` is rejected under `abi3-py38`.
 - **Import sweep: 61/61 modules** load — pure (`argparse csv textwrap dataclasses enum
   pathlib json logging http email xml…`) and C-accel (`re/_sre hashlib/_hashlib
   datetime/_datetime socket/_socket struct math random pickle/_pickle base64/binascii
@@ -24,14 +27,15 @@ delegates to CPython.
 1. **Cargo** — optional dep, feature ON by default:
    ```toml
    [dependencies]
-   pyo3 = { version = "0.24", features = ["abi3-py313", "auto-initialize"], optional = true }
+   pyo3 = { version = "0.24", features = ["abi3-py39", "auto-initialize"], optional = true }
    [features]
    default = ["stdlib-ffi"]
    stdlib-ffi = ["dep:pyo3"]
    ```
-   `.cargo/config.toml` pins `PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1`, so a bare
-   `cargo build`/`test`/`clippy` links libpython and imports the real stdlib with no
-   extra env. A pyo3-free/libpython-free build uses `cargo build --no-default-features`.
+   A bare `cargo build`/`test`/`clippy` links libpython and imports the real stdlib with
+   no extra env on any CPython 3.9–3.14 (`PYO3_PYTHON` is needed only when `python3` on
+   `PATH` is pythonrs itself, which pyo3 cannot use). A pyo3-free/libpython-free build
+   uses `cargo build --no-default-features`.
 
 2. **`src/ffi.rs`** (`#[cfg(feature = "stdlib-ffi")]`):
    - `init()` once at startup: resolve the stdlib prefix (order: `PYTHONRS_STDLIB` env →

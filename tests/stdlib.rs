@@ -8,7 +8,7 @@
 //! CPython stdlib through the `stdlib-ffi` bridge; their tests are gated on that
 //! feature (compiled out of the default, no-libpython build where those modules
 //! intentionally do not exist) and run against CPython under
-//! `PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 cargo test --features stdlib-ffi`.
+//! `cargo test --features stdlib-ffi`.
 
 use pythonrs::{eval_str, host};
 

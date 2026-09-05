@@ -1393,10 +1393,10 @@ module then raises `ModuleNotFoundError`.
   modules** (pure `.py` + the C accelerators), not hand-rolled shadows.
   `functools.partial`/`lru_cache`/`reduce`, `json`, `os` + `os.path`,
   `random` and `string` all come from CPython there. A bare `cargo build` works
-  as-is (`.cargo/config.toml` pins `PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1` for
-  pyo3's 3.14 forward-compat check). **Only a `--no-default-features` build drops
-  the bridge** — there `import functools`/`import os` all raise
-  `ModuleNotFoundError`.
+  as-is against any CPython 3.9–3.14 (`abi3-py39`; no env pin, and
+  `.cargo/config.toml` is gone with the `abi3-py313` floor that needed it).
+  **Only a `--no-default-features` build drops the bridge** — there
+  `import functools`/`import os` all raise `ModuleNotFoundError`.
 - **`re` and `itertools` are NATIVE shadows in BOTH builds — they never reach
   CPython.** This entry previously listed both among the modules the FFI bridge
   serves, which was wrong in a way that matters: a probe that "passes" against a

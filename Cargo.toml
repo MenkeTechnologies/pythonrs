@@ -155,18 +155,25 @@ num-complex = "0.4"
 # `import <stdlib>` delegates to an embedded libpython over pyo3 instead of a
 # hand-rolled shadow — the real CPython stdlib (pure `.py` + C accelerators).
 # Disable with `--no-default-features` for a pyo3-free, libpython-free build.
-# `abi3-py313` links one binary against any CPython >= 3.13 via the stable ABI
-# (build the FFI config with `PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1` until pyo3
-# ships native 3.14 support). Default builds never pull pyo3 or need libpython.
-pyo3 = { version = "0.24", features = ["abi3-py313", "auto-initialize"], optional = true }
+# `abi3-py39` links one binary against any CPython >= 3.9 via the stable ABI.
+# 3.9 is the floor because it is the oldest the limited API can express what
+# `src/ffi.rs` needs — `#[pyclass(dict)]` is rejected below it — not a taste for
+# old CPython. A higher floor is not free: `abi3-py313` made `cargo install
+# pythonrs` fail outright wherever the host CPython was older ("cannot set a
+# minimum Python version 3.13 higher than the interpreter version 3.12" on
+# Fedora 40), and, being pyo3 0.24's own ceiling, it also demanded
+# `PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1` on 3.14 hosts. At 3.9 neither end
+# fires: 3.9 through 3.14 build with no extra env.
+pyo3 = { version = "0.24", features = ["abi3-py39", "auto-initialize"], optional = true }
 unicode_names2 = "3.1.0"
 unicode-general-category = "1.1.0"
 
 [features]
 # stdlib-ffi is ON by default so `import os` (and the rest of the CPython stdlib)
-# works out of the box. `.cargo/config.toml` pins the pyo3 3.14 forward-compat
-# flag so a bare `cargo build` needs no extra env. `--no-default-features` drops
-# pyo3/libpython for a native-only build (only pythonrs's built-in modules).
+# works out of the box. It needs a CPython >= 3.9 at build time (pyo3 links it);
+# no extra env is required at any version through 3.14. `--no-default-features`
+# drops pyo3/libpython for a native-only build (only pythonrs's built-in
+# modules) — that is what the release binaries ship.
 default = ["stdlib-ffi"]
 stdlib-ffi = ["dep:pyo3"]
 
