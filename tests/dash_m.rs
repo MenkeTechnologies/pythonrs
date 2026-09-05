@@ -97,16 +97,21 @@ fn passthrough_flags_do_not_break_c_eval() {
 // python's own flags. These guard against the regression where clap kept parsing
 // `-u`/`-m`/etc. past the program boundary and dropped them from sys.argv.
 
-/// Write a `print(sys.argv)` script to a temp file and return its path (kept
-/// alive by the returned handle).
-fn argv_script() -> tempfile::NamedTempFile {
+/// Write `src` to a temp `.py` file and return the handle (which owns the path
+/// and keeps the file alive for as long as the caller holds it).
+fn script_file(src: &[u8]) -> tempfile::NamedTempFile {
     let mut f = tempfile::Builder::new()
         .suffix(".py")
         .tempfile()
         .expect("temp file");
-    f.write_all(b"import sys\nprint(sys.argv)\n")
-        .expect("write");
+    f.write_all(src).expect("write");
     f
+}
+
+/// Write a `print(sys.argv)` script to a temp file and return its path (kept
+/// alive by the returned handle).
+fn argv_script() -> tempfile::NamedTempFile {
+    script_file(b"import sys\nprint(sys.argv)\n")
 }
 
 #[test]
@@ -195,4 +200,192 @@ fn cpython_side_stdout_is_not_dropped_at_exit() {
     );
     assert_eq!(code, 0, "stderr: {err}");
     assert_eq!(out, "last\n");
+}
+
+#[test]
+fn bridged_argparse_parses_the_program_arguments() {
+    // argparse runs on the embedded CPython and reads ITS `sys.argv` — a list
+    // libpython builds at startup as `['']`, because nothing hands the program's
+    // arguments to `Py_Initialize`. Unmirrored, this failed SILENTLY: no error,
+    // no traceback, just every option at its default and every positional gone.
+    let f = script_file(
+        b"import argparse\n\
+          p = argparse.ArgumentParser()\n\
+          p.add_argument('--input', default='DEFAULT')\n\
+          p.add_argument('rest', nargs='*')\n\
+          a = p.parse_args()\n\
+          print(a.input, a.rest)\n",
+    );
+    let path = f.path().to_str().unwrap().to_string();
+    let (out, err, code) = run(&[&path, "--input", "GIVEN", "x", "y"], None);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert_eq!(out.trim(), "GIVEN ['x', 'y']");
+}
+
+#[test]
+fn argparse_sees_an_argv_the_program_rewrote() {
+    // The mirror is refreshed on every bridged import, so the argv argparse reads
+    // is the one pythonrs holds when argparse is imported — not a startup
+    // snapshot. A program that builds its own argv (a test runner, a REPL driver)
+    // depends on this.
+    let f = script_file(
+        b"import sys\n\
+          sys.argv = ['prog', '--input', 'REWRITTEN']\n\
+          import argparse\n\
+          p = argparse.ArgumentParser()\n\
+          p.add_argument('--input', default='DEFAULT')\n\
+          print(p.parse_args().input)\n",
+    );
+    let path = f.path().to_str().unwrap().to_string();
+    let (out, err, code) = run(&[&path, "--input", "ORIGINAL"], None);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert_eq!(out.trim(), "REWRITTEN");
+}
+
+#[test]
+fn an_unclosed_bridged_file_is_flushed_at_exit() {
+    // `io.open` hands back a CPython stream, which is block-buffered. The embedded
+    // interpreter is never finalized, so without an explicit flush at teardown a
+    // handle the program never closed lost every byte written to it — the file was
+    // left on disk at the zero length `open` truncated it to, silently.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let target = dir.path().join("unclosed.txt");
+    let f = script_file(
+        format!(
+            "import io\nh = io.open('{}', 'w')\nh.write('payload')\n",
+            target.display()
+        )
+        .as_bytes(),
+    );
+    let path = f.path().to_str().unwrap().to_string();
+    let (_, err, code) = run(&[&path], None);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("the file the program wrote"),
+        "payload"
+    );
+}
+
+#[test]
+fn a_dropped_bridged_file_still_reaches_disk() {
+    // The handle is unreachable the instant the statement ends. CPython would
+    // flush it at refcount zero; pythonrs holds every `Foreign` in the side-table
+    // for the process lifetime, so the exit flush is what saves this one.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let target = dir.path().join("dropped.txt");
+    let f = script_file(
+        format!(
+            "import io\nio.open('{}', 'w').write('payload')\n",
+            target.display()
+        )
+        .as_bytes(),
+    );
+    let path = f.path().to_str().unwrap().to_string();
+    let (_, err, code) = run(&[&path], None);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("the file the program wrote"),
+        "payload"
+    );
+}
+
+/// A script whose `argparse` parser has one option, so `--help` and an unknown
+/// flag both end the program from inside bridged CPython code.
+fn argparse_exit_script() -> tempfile::NamedTempFile {
+    script_file(
+        b"import argparse\n\
+          p = argparse.ArgumentParser(prog='tool')\n\
+          p.add_argument('--input', default='D')\n\
+          p.parse_args()\n\
+          print('reached body')\n",
+    )
+}
+
+#[test]
+fn bridged_help_exits_zero_like_cpython() {
+    // `--help` ends the program with `SystemExit(0)` raised by argparse — on the
+    // CPython side, where it crosses the bridge as an error string rather than a
+    // `PyObj::Exception`. Reported as an ordinary uncaught exception it exited 1
+    // and printed a traceback after the help text.
+    let f = argparse_exit_script();
+    let path = f.path().to_str().unwrap().to_string();
+    let (out, err, code) = run(&[&path, "--help"], None);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        out.starts_with("usage: tool [-h] [--input INPUT]"),
+        "help text on stdout, got: {out:?}"
+    );
+    assert!(
+        !out.contains("reached body"),
+        "the body must not run: {out:?}"
+    );
+    assert!(!err.contains("Traceback"), "no traceback, got: {err:?}");
+}
+
+#[test]
+fn bridged_usage_error_exits_two_like_cpython() {
+    // An unrecognized argument is `SystemExit(2)` from argparse. CPython prints
+    // usage plus one error line and exits 2; the traceback that used to follow was
+    // pythonrs's, and the exit code was 1.
+    let f = argparse_exit_script();
+    let path = f.path().to_str().unwrap().to_string();
+    let (out, err, code) = run(&[&path, "--bogus"], None);
+    assert_eq!(code, 2, "stdout: {out:?} stderr: {err:?}");
+    assert!(
+        err.trim_end()
+            .ends_with("tool: error: unrecognized arguments: --bogus"),
+        "the error line is the last thing on stderr, got: {err:?}"
+    );
+    assert!(!err.contains("Traceback"), "no traceback, got: {err:?}");
+}
+
+#[test]
+fn a_bridged_system_exit_carries_its_code() {
+    // The general shape behind both tests above: any `SystemExit` raised by
+    // bridged CPython code sets the process status, exactly as pythonrs's own
+    // `sys.exit` does.
+    let f = script_file(
+        b"import argparse\n\
+          p = argparse.ArgumentParser(prog='tool')\n\
+          p.exit(7)\n",
+    );
+    let path = f.path().to_str().unwrap().to_string();
+    let (_, err, code) = run(&[&path], None);
+    assert_eq!(code, 7, "stderr: {err:?}");
+    assert!(!err.contains("Traceback"), "no traceback, got: {err:?}");
+}
+
+#[test]
+fn an_exception_from_pythonrs_code_keeps_its_class_for_a_cpython_caller() {
+    // A pythonrs function invoked BY CPython (a `key=` callback, a `json.dumps`
+    // default, a unittest test method) used to have every exception rewritten to
+    // `RuntimeError: KeyError: 'k'`, so a caller's `except KeyError` never fired.
+    let f = script_file(b"import functools\ndef raises_key():\n    raise KeyError('k')\ntry:\n    functools.partial(raises_key)()\nexcept KeyError as e:\n    print('KeyError', e.args)\nexcept Exception as e:\n    print('WRONG', type(e).__name__)\n");
+    let path = f.path().to_str().unwrap().to_string();
+    let (out, err, code) = run(&[&path], None);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert_eq!(out.trim(), "KeyError ('k',)");
+}
+
+#[test]
+fn unittest_reports_a_failed_assertion_as_a_failure_not_an_error() {
+    // `unittest` branches on the exception class: an `AssertionError` is a FAIL,
+    // anything else is an ERROR. Arriving as `RuntimeError` put every failed
+    // assertion in the wrong column, and the count a CI gate reads with it.
+    let f = script_file(b"import unittest, sys\nclass T(unittest.TestCase):\n    def test_fail(self):\n        self.assertEqual(1, 2)\nres = unittest.TextTestRunner(stream=sys.stdout, verbosity=0).run(\n    unittest.TestLoader().loadTestsFromTestCase(T))\nprint('failures', len(res.failures), 'errors', len(res.errors))\n");
+    let path = f.path().to_str().unwrap().to_string();
+    let (out, err, code) = run(&[&path], None);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        out.contains("FAIL: test_fail"),
+        "expected a FAIL line, got: {out}"
+    );
+    assert!(
+        out.contains("AssertionError: 1 != 2"),
+        "the assertion message survives: {out}"
+    );
+    assert!(
+        out.trim_end().ends_with("failures 1 errors 0"),
+        "counted as a failure, not an error: {out}"
+    );
 }

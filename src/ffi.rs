@@ -218,6 +218,12 @@ fn linked_libpython_prefixes() -> Vec<PathBuf> {
 /// `ModuleNotFoundError` instead of starting CPython. See [`init`].
 static BRIDGE_USABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
+/// Whether `Py_Initialize` has actually run. [`flush_open_files`] is called on
+/// every exit, including runs that never touched the bridge, and must not start
+/// an interpreter just to tear one down.
+static INTERPRETER_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Initialize the embedded interpreter once, after pinning `PYTHONHOME` so the
 /// stdlib resolves to the intended (bundled or system) tree. Idempotent.
 ///
@@ -270,6 +276,7 @@ pub fn init() -> bool {
             }
         }
         pyo3::prepare_freethreaded_python();
+        INTERPRETER_STARTED.store(true, std::sync::atomic::Ordering::Relaxed);
         line_buffer_std_streams();
     });
     BRIDGE_USABLE.load(std::sync::atomic::Ordering::Relaxed)
@@ -568,9 +575,119 @@ fn apply_pending_search_paths() {
     });
 }
 
+/// pythonrs's `sys.argv`, waiting to be mirrored into the embedded interpreter.
+///
+/// The bridge delegates `import argparse` (and `getopt`, `unittest`, `pdb`, …) to
+/// CPython, and those modules read the EMBEDDED `sys.argv` — the list libpython
+/// builds at startup, which is `['']` because nothing passes the program's
+/// arguments to `Py_Initialize`. `parser.parse_args()` therefore parsed an empty
+/// argument list and every option came back at its default, silently: no error,
+/// just the wrong answer.
+fn pending_argv() -> &'static Mutex<Option<Vec<String>>> {
+    static A: OnceLock<Mutex<Option<Vec<String>>>> = OnceLock::new();
+    A.get_or_init(|| Mutex::new(None))
+}
+
+/// Queue pythonrs's `sys.argv` for the embedded interpreter. Called from the
+/// importer just before it delegates, from OUTSIDE any `with_host` borrow (the
+/// bridge cannot re-enter the host), and re-queued on every delegation so a
+/// program that rewrote `sys.argv` before importing argparse is honoured.
+pub fn queue_argv(argv: Vec<String>) {
+    if let Ok(mut q) = pending_argv().lock() {
+        *q = Some(argv);
+    }
+}
+
+/// Copy any queued argv into the embedded `sys.argv`, replacing it wholesale —
+/// unlike the search paths, argv is not a set to merge into but the exact list
+/// the program was invoked with. A rewrite of `sys.argv` performed AFTER the last
+/// bridged import is not mirrored; the queue is refreshed on every import, which
+/// is where the modules that read argv come from.
+fn apply_pending_argv() {
+    let argv = match pending_argv().lock() {
+        Ok(mut q) => match q.take() {
+            Some(a) => a,
+            None => return,
+        },
+        Err(_) => return,
+    };
+    Python::with_gil(|py| {
+        let Ok(sys) = py.import("sys") else { return };
+        let list = PyList::empty(py);
+        for a in &argv {
+            let _ = list.append(a.as_str());
+        }
+        let _ = sys.setattr("argv", list);
+    });
+}
+
+/// Flush every writable CPython file still open, then the standard streams.
+///
+/// The embedded interpreter is never `Py_Finalize`d — the process just exits — so
+/// nothing runs the teardown that flushes CPython's block-buffered files. A
+/// handle the program opened through the bridge (`io.open`, `tempfile`,
+/// `gzip`, …) and did not close therefore lost every byte written to it, and the
+/// file was left on disk at the length `open` truncated it to. Refcounting does
+/// not save the dropped-handle case either: the side-table holds a strong
+/// reference to each `Foreign` for the process lifetime, so a file object stays
+/// alive long after the program's last name for it is gone.
+///
+/// `gc.get_objects()` is CPython's own enumeration of live containers, which is
+/// how `Py_FinalizeEx` finds these too. Anything whose flush raises (a stream
+/// closed underneath, a broken pipe) is skipped: this runs at exit, where a
+/// teardown error must not replace the program's own outcome.
+pub fn flush_open_files() {
+    if !INTERPRETER_STARTED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    Python::with_gil(|py| {
+        if let (Ok(gc), Ok(io_mod)) = (py.import("gc"), py.import("io")) {
+            if let (Ok(objects), Ok(base)) =
+                (gc.call_method0("get_objects"), io_mod.getattr("IOBase"))
+            {
+                if let Ok(objects) = objects.downcast_into::<PyList>() {
+                    for obj in objects.iter() {
+                        let Ok(true) = obj.is_instance(&base) else {
+                            continue;
+                        };
+                        // `closed` is a property on a real stream; a subclass may
+                        // raise from it, in which case the object is left alone.
+                        if !matches!(
+                            obj.getattr("closed").and_then(|c| c.extract::<bool>()),
+                            Ok(false)
+                        ) {
+                            continue;
+                        }
+                        if !matches!(
+                            obj.call_method0("writable")
+                                .and_then(|w| w.extract::<bool>()),
+                            Ok(true)
+                        ) {
+                            continue;
+                        }
+                        let _ = obj.call_method0("flush");
+                    }
+                }
+            }
+        }
+        // The standard streams last: a file flush above may have written a
+        // diagnostic through them.
+        if let Ok(sys) = py.import("sys") {
+            for stream in ["stdout", "stderr"] {
+                if let Ok(s) = sys.getattr(stream) {
+                    let _ = s.call_method0("flush");
+                }
+            }
+        }
+    });
+}
+
 /// Import `name` (possibly dotted, e.g. `os.path`) via CPython's own importer and
 /// return a `Foreign` handle to the module object.
 pub fn import(name: &str) -> Result<u32, String> {
+    if INTERPRETER_STARTED.load(std::sync::atomic::Ordering::Relaxed) {
+        apply_pending_argv();
+    }
     if let Some(id) = module_handles()
         .lock()
         .ok()
@@ -582,6 +699,7 @@ pub fn import(name: &str) -> Result<u32, String> {
         return Err(bridge_unavailable(name));
     }
     apply_pending_search_paths();
+    apply_pending_argv();
     Python::with_gil(|py| match py.import(name) {
         Ok(module) => {
             let id = store(module.into_any().unbind());
@@ -1559,7 +1677,7 @@ impl PyrsCallable {
             .map_err(to_pyerr)?,
         };
         // Run the fusevm callable with NO host borrow held (invoke re-enters it).
-        let result = crate::host::invoke(&self.target, rs_args, rs_kwargs).map_err(to_pyerr)?;
+        let result = crate::host::invoke(&self.target, rs_args, rs_kwargs).map_err(call_err)?;
         // Marshal the result back to a CPython object (host borrow window).
         with_host(|h| value_to_py(h, py, &result))
             .map(|b| b.unbind())
@@ -1837,6 +1955,39 @@ fn exc_value_to_pyerr(v: &Value) -> Option<pyo3::PyErr> {
     })
 }
 
+/// Map a pythonrs error raised by USER CODE running under a CPython caller to the
+/// CPython exception of the same class.
+///
+/// Every wrapper used to answer `PyRuntimeError(e)`, so a `raise KeyError(k)` or a
+/// failed `assertEqual` arrived on the CPython side as
+/// `RuntimeError: KeyError: 'k'`. Anything that branches on the class was then
+/// wrong: `unittest` reported a failed assertion as an ERROR rather than a FAIL,
+/// and a caller's `except KeyError` did not fire at all.
+///
+/// Same two steps as [`PyrsCallable::body_err`], which already did this for
+/// generator bodies: rebuild from the live exception object when it is the one
+/// that just propagated (its class must head the error string, so a stale `h.exc`
+/// from an earlier caught exception cannot claim this failure), else parse the
+/// class out of pythonrs's terse `"Class: message"` rendering.
+fn call_err(e: String) -> pyo3::PyErr {
+    let pending = with_host(|h| h.exc.clone());
+    let class = pending.as_ref().and_then(|v| {
+        with_host(|h| match h.get(v) {
+            Some(PyObj::Exception { class, .. }) => Some(class.clone()),
+            _ => None,
+        })
+    });
+    let from_value = match class {
+        Some(c) if e == c || e.starts_with(&format!("{c}: ")) => {
+            pending.as_ref().and_then(exc_value_to_pyerr)
+        }
+        _ => None,
+    };
+    let err = from_value.unwrap_or_else(|| rs_err_typed(e));
+    clear_host_error();
+    err
+}
+
 /// Drop the pythonrs-side error state once its exception has been handed to
 /// CPython as a `PyErr`. Ownership moves with it: leaving `h.error` set would
 /// make the next fusevm step abort on an exception CPython is already carrying.
@@ -1872,7 +2023,7 @@ impl PyrsInstance {
         let to_pyerr = |e: String| pyo3::exceptions::PyRuntimeError::new_err(e);
         let key_v = with_host(|h| py_to_value(h, py, &key)).map_err(to_pyerr)?;
         let r = crate::host::call_method(&self.target, "__getitem__", vec![key_v], vec![])
-            .map_err(to_pyerr)?;
+            .map_err(call_err)?;
         with_host(|h| value_to_py(h, py, &r))
             .map(|b| b.unbind())
             .map_err(to_pyerr)
@@ -1930,7 +2081,7 @@ struct PyrsFile {
 impl PyrsFile {
     /// Call one file method on the wrapped handle and marshal the result back.
     fn call(&self, py: Python, name: &str, args: Vec<Value>) -> PyResult<Py<PyAny>> {
-        let r = crate::host::call_method(&self.target, name, args, vec![]).map_err(rs_err)?;
+        let r = crate::host::call_method(&self.target, name, args, vec![]).map_err(call_err)?;
         with_host(|h| value_to_py(h, py, &r))
             .map(|b| b.unbind())
             .map_err(rs_err)

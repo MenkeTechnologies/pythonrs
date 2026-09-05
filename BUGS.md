@@ -430,6 +430,61 @@ written.
   `ExitStack.callback(print, …)` and friends wrote through that stream — their
   output came out reordered, or was dropped at exit. Both streams are line
   buffered at bridge init (`ffi::line_buffer_std_streams`).
+- **`sys.argv` reaches the bridged stdlib.** `argparse` — and `getopt`, `pdb`,
+  `unittest` — run on the embedded interpreter and read ITS `sys.argv`, a list
+  libpython builds at startup as `['']` because nothing passes the program's
+  arguments to `Py_Initialize`. pythonrs's own `sys.argv` was correct all along,
+  which is what made this so quiet: `parser.parse_args()` raised nothing, printed
+  nothing and returned every option at its default with every positional dropped,
+  so an argument-driven program ran to completion against the wrong inputs.
+  pythonrs's live `sys.argv` is now mirrored across on every bridged import
+  (`host::current_argv` → `ffi::queue_argv` → `ffi::apply_pending_argv`), the same
+  queue-then-apply shape `sys.path` already used, and it is re-read from the `sys`
+  module rather than from `PyHost::argv` so a program that rewrites `sys.argv`
+  before importing argparse gets what it set. A rewrite performed after the last
+  bridged import is not mirrored.
+- **A CPython-side file the program never closed keeps its writes.** `io.open`
+  hands back a CPython stream, which is block-buffered, and the embedded
+  interpreter is never `Py_Finalize`d — so nothing ran the teardown that flushes
+  it. Every byte written to a handle the program did not close was lost, and the
+  file was left on disk at the zero length `open` truncated it to: an empty file
+  where a written one should be, with no error anywhere. Refcounting does not
+  cover the dropped-handle case either (`io.open(p, 'w').write(s)` as a statement,
+  or rebinding the only name), because the `Foreign` side-table holds a strong
+  reference to every CPython object for the process lifetime, so the stream stays
+  alive long past the program's last mention of it. Interpreter shutdown now
+  flushes every writable, still-open `io.IOBase` found through `gc.get_objects()`
+  and then the standard streams (`ffi::flush_open_files`, called from `lib.rs`
+  beside the `atexit` teardown). A flush that raises is skipped: teardown must not
+  replace the program's own outcome.
+- **A `SystemExit` raised on the CPython side sets the exit status.** It crosses
+  the bridge as an error string plus a `foreign_exc` record, never as a
+  `PyObj::Exception`, so `classify_top_error` — which looked only at the latter —
+  called it an ordinary uncaught exception. Every argparse program was affected at
+  its two most common exits: `--help` printed the help text and then a traceback
+  and exited **1** where CPython exits **0**, and a usage error printed CPython's
+  `prog: error: …` line and then a traceback and exited **1** where CPython exits
+  **2** — the status a caller actually tests for. `unittest.main()` and anything
+  else that ends the program from bridged code were wrong the same way.
+  `classify_top_error` now also recognises a foreign `SystemExit` and maps it
+  through the same `system_exit_outcome` helper pythonrs's own `sys.exit` uses, so
+  the code, the `str(code)` stderr message and the absent traceback all match. The
+  record is matched against the error being classified, so a stale one from an
+  earlier caught bridge call cannot claim an unrelated failure.
+- **An exception raised by pythonrs code keeps its class for a CPython caller.**
+  Every wrapper that hands a pythonrs callable to CPython — a `key=` function, a
+  `json.dumps` default, a `unittest` test method, `functools.partial(fn)` — mapped
+  a failure to `PyRuntimeError`, so `raise KeyError('k')` arrived as
+  `RuntimeError: KeyError: 'k'`. A caller's `except KeyError` did not fire, and
+  `unittest` — which decides FAIL vs ERROR purely on the class — logged every
+  failed assertion as an ERROR. `ffi::call_err` now rebuilds the CPython exception
+  from the live pythonrs exception object (falling back to parsing the class out
+  of the `"Class: message"` rendering), the same two steps `body_err` already used
+  for generator bodies, and is used on the three paths where the failure is the
+  user's: `PyrsCallable::__call__`, `PyrsInstance::__getitem__` and the `PyrsFile`
+  methods. The live object is only trusted when its class heads the error string,
+  so a stale `h.exc` cannot claim an unrelated failure. A pythonrs-defined
+  exception class that is not a builtin still arrives as `RuntimeError`.
 - **Generators / `yield`.** A `def` whose body contains `yield` builds a real
   lazy generator, backed by a stackful `corosensei` coroutine on the same thread
   (the thread-local `PyHost` is shared across suspend/resume via a swapped
@@ -840,6 +895,30 @@ written.
   variants; async-generator `asend`/`athrow`/`aclose`.
 
 ## Partial / simplified semantics
+
+- **A bridged exception carries no CPython traceback.** An exception that crosses
+  from pythonrs into CPython is rebuilt as a fresh exception object, so its
+  `__traceback__` is empty. Two visible consequences, both in code that is not
+  otherwise wrong: `logging.exception('…')` inside a pythonrs `except` block logs
+  `NoneType: None` where CPython prints the four-line traceback (CPython's
+  `sys.exc_info()` on the bridge side has no exception to report), and a
+  `unittest` failure report carries the `AssertionError: 1 != 2` line without the
+  `Traceback (most recent call last):` block above it. Repro:
+  `import logging; logging.basicConfig(); \ntry: 1/0\nexcept ZeroDivisionError: logging.exception('boom')`.
+- **`contextlib.redirect_stdout` does not capture CPython-side writes.** pythonrs
+  tracks the redirect in `PyHost::stdout_target`, which its own `print` and
+  `sys.stdout` reads honour, but the embedded interpreter's `sys.stdout` still
+  points at the real fd. Output written through the CPython side —
+  `functools.partial(print, …)`, anything a bridged module prints — escapes the
+  buffer and lands on the terminal, in the wrong order relative to the captured
+  text. The same gap applies to `unittest`'s `--buffer` and any capture built on
+  `redirect_stdout`. Repro: `with contextlib.redirect_stdout(io.StringIO()) as
+  buf: functools.partial(print, 'x')()` — `x` appears on stdout, not in `buf`.
+- **`warnings.catch_warnings(record=True)` records nothing.** `warnings.warn` is
+  CPython's C `_warnings.warn` while the recording list the context manager
+  installs is read back across the bridge by value, so the appended entries are
+  not visible to the pythonrs-side name. `w` stays empty and indexing it raises
+  `IndexError` where CPython reports one `UserWarning`.
 - **`dir()` on a builtin type omits most of the inherited dunders.** Every
   builtin is missing the `object`-level names (`__delattr__`, `__dir__`,
   `__format__`, `__getattribute__`, `__getstate__`, `__init_subclass__`,

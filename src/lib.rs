@@ -275,6 +275,10 @@ pub fn run_program(
     // `atexit` callbacks run at interpreter shutdown, after the top-level program
     // finishes (whether it returned or raised), before teardown warnings.
     host::run_atexit_callbacks();
+    // A CPython-side file the program left open is flushed here: the embedded
+    // interpreter is never finalized, so nothing else would.
+    #[cfg(feature = "stdlib-ffi")]
+    ffi::flush_open_files();
     // CPython emits `RuntimeWarning: coroutine '…' was never awaited` for any
     // coroutine that was created but never driven; do the same at teardown.
     host::warn_unawaited_coroutines();
