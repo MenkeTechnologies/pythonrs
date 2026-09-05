@@ -1,6 +1,12 @@
 //! Differential parity harness (development tool): run the example corpus
-//! through pythonrs and the reference `python3`, diffing stdout. Needs `python3`
-//! on PATH, so CI never runs it.
+//! through pythonrs and the reference CPython, diffing stdout. Needs a CPython
+//! to compare against, so CI never runs it.
+//!
+//! The oracle is resolved to an ABSOLUTE path by `pythonrs::oracle` — the same
+//! resolver `tests/parity.rs` and the fuzzer use — and printed before anything
+//! is compared. A bare `python3` names a PATH lookup rather than a toolchain, so
+//! a run that spawned one could not be attributed to any particular CPython
+//! afterwards; a shim, a venv, or a pyenv/Homebrew shadow all answer to it.
 //!
 //! What this harness CANNOT report, by construction — it compares one stream of
 //! one run of each interpreter:
@@ -9,9 +15,11 @@
 //!   invisible here (`parity-fuzz --stderr` compares a normalized last line).
 //! * **the exit code** is not compared at all: a corpus script that ran to
 //!   completion on both sides passes even if one exited non-zero.
-//! * **the environment** is inherited whole. Nothing is pinned — not
-//!   `PYTHONHASHSEED`, not `LC_ALL` — so a run is only as reproducible as the
-//!   shell it was started from.
+//! * **the environment** is pinned (`PYTHONHASHSEED`, `LC_ALL`, `TZ`,
+//!   `PYTHONIOENCODING`) so the two sides are comparable and a rerun agrees with
+//!   itself. Unpinned, the reference randomizes string hashing per process and
+//!   with it every string-keyed container's iteration order, so a corpus script
+//!   that prints one would diverge at random.
 //! * **file-system effects** are not diffed; only what reached stdout is.
 //!
 //! There is no frozen replay of these outputs. A no-`python3` machine measures
@@ -39,6 +47,21 @@ fn main() {
 /// reading the status — a shell `&&`, a CI step — saw a green harness that had
 /// compared nothing. `scripts/dropin_check.sh` already refuses an empty corpus
 /// and a missing reference; this one did not.
+/// `bin`'s stdout on `f`, under an environment pinned hard enough that the two
+/// sides are comparable — nothing is inherited from the invoking shell.
+fn stdout_of(bin: &Path, f: &Path) -> Option<String> {
+    Command::new(bin)
+        .arg(f)
+        .env("PYTHONHASHSEED", "0")
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("TZ", "UTC")
+        .env("LANG", "en_US.UTF-8")
+        .env("LC_ALL", "en_US.UTF-8")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+}
+
 fn run() -> i32 {
     let dir = Path::new("examples");
     if !dir.exists() {
@@ -61,6 +84,15 @@ fn run() -> i32 {
         return 2;
     }
 
+    let oracle = match pythonrs::oracle::resolve() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("parity: {e} — measured nothing");
+            return 2;
+        }
+    };
+    println!("parity: oracle {}", pythonrs::oracle::identify(&oracle));
+
     // Our `python` binary is a sibling of this harness binary.
     let ours_bin = std::env::current_exe()
         .ok()
@@ -71,16 +103,8 @@ fn run() -> i32 {
     let mut fail = 0;
     let mut skipped = 0;
     for f in &files {
-        let ours = Command::new(&ours_bin)
-            .arg(f)
-            .output()
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
-        let theirs = Command::new("python3")
-            .arg(f)
-            .output()
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+        let ours = stdout_of(&ours_bin, f);
+        let theirs = stdout_of(&oracle, f);
         match (ours, theirs) {
             (Some(a), Some(b)) if a == b => {
                 pass += 1;
@@ -96,7 +120,7 @@ fn run() -> i32 {
             }
             (_, None) => {
                 skipped += 1;
-                println!("skip {} (no python3)", f.display());
+                println!("skip {} (oracle failed to run)", f.display());
             }
         }
     }
@@ -104,7 +128,7 @@ fn run() -> i32 {
     if skipped > 0 {
         eprintln!(
             "parity: FAIL — {skipped}/{} script(s) had no reference to compare against; \
-             install python3 or this run proves nothing",
+             install a CPython or this run proves nothing",
             files.len()
         );
         return 2;
@@ -116,6 +140,9 @@ fn run() -> i32 {
         );
         return 1;
     }
-    println!("parity: PASS — compared {pass} script(s) against python3");
+    println!(
+        "parity: PASS — compared {pass} script(s) against {}",
+        pythonrs::oracle::identify(&oracle)
+    );
     0
 }

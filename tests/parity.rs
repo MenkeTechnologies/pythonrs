@@ -36,28 +36,20 @@ fn ours() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_python"))
 }
 
-/// `(major, minor)` of the reference on PATH, or `None` when there is no usable
-/// `python3` — the signal to skip.
+/// The oracle, as an absolute path, plus its `(major, minor)` — or `None` when
+/// there is no usable `python3`, the signal to skip.
 ///
-/// The version is read from `sys.version_info` rather than parsed out of
-/// `--version`, because it also serves as a liveness check: a `python3` that is
-/// a broken shim, or a stub that prints a version and cannot execute anything,
-/// fails here instead of being mistaken for a working oracle and reported as a
-/// wall of divergences.
-fn reference_version() -> Option<(u32, u32)> {
-    let out = Command::new("python3")
-        .arg("-c")
-        .arg("import sys; print(sys.version_info[0], sys.version_info[1])")
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8(out.stdout).ok()?;
-    let mut it = text.split_whitespace();
-    let major = it.next()?.parse().ok()?;
-    let minor = it.next()?.parse().ok()?;
-    Some((major, minor))
+/// Resolution and the liveness check both live in [`pythonrs::oracle`], shared
+/// with `src/bin/parity.rs` and the fuzzer so all three name the SAME
+/// interpreter by the SAME rules. Two things it buys over the bare `python3`
+/// this used to spawn: the answer is an absolute path, so the run is
+/// attributable to one file rather than to whatever a reader's PATH resolves
+/// later; and an explicitly-named-but-broken oracle is an error instead of a
+/// silent fallback onto a different CPython.
+fn reference() -> Option<(PathBuf, u32, u32)> {
+    let oracle = pythonrs::oracle::resolve().ok()?;
+    let (major, minor) = pythonrs::oracle::version_info(&oracle)?;
+    Some((oracle, major, minor))
 }
 
 /// Split the corpus into probes, dropping the leading comment banner and any
@@ -106,7 +98,7 @@ fn final_line(err: &[u8]) -> String {
 
 #[test]
 fn probes_match_the_reference_python3() {
-    let Some((major, minor)) = reference_version() else {
+    let Some((oracle, major, minor)) = reference() else {
         eprintln!(
             "parity: SKIP — no usable `python3` on PATH, so there is no oracle to \
              compare against. This test measures nothing here by design; the \
@@ -114,6 +106,12 @@ fn probes_match_the_reference_python3() {
         );
         return;
     };
+    // A harness that does not say what it compared against is unfalsifiable: a
+    // clean run and a run against the wrong toolchain look identical. So the
+    // resolved oracle is printed BEFORE anything is compared, and it is the
+    // absolute path, not the name that was looked up.
+    println!("parity: oracle {}", pythonrs::oracle::identify(&oracle));
+    println!("parity: ours   {}", ours().display());
     // stderr is compared in full only against a reference that renders tracebacks
     // the way pythonrs targets.
     let full_stderr = (major, minor) >= (3, 13);
@@ -146,7 +144,7 @@ fn probes_match_the_reference_python3() {
         let path = dir.join(format!("probe_{i:03}.py"));
         std::fs::write(&path, format!("{probe}\n")).expect("write probe");
 
-        let (ref_out, ref_err, ref_code) = run(Path::new("python3"), &path);
+        let (ref_out, ref_err, ref_code) = run(&oracle, &path);
         let (our_out, our_err, our_code) = run(&ours_bin, &path);
         let head = probe
             .lines()
@@ -197,7 +195,8 @@ fn probes_match_the_reference_python3() {
     let _ = std::fs::remove_dir_all(&dir);
     assert!(
         failures.is_empty(),
-        "pythonrs diverged from python3 {major}.{minor} on {} of {} probe(s):\n\n{}",
+        "pythonrs diverged from {} on {} of {} probe(s):\n\n{}",
+        pythonrs::oracle::identify(&oracle),
         failures.len(),
         probes.len(),
         failures.join("\n\n")

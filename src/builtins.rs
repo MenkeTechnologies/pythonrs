@@ -114,6 +114,21 @@ fn sval(v: &Value) -> String {
     with_host(|h| h.as_str(v)).unwrap_or_default()
 }
 
+/// The same, BORROWED where it can be — for the name operands of the variable
+/// ops, which every executed line runs through.
+///
+/// `Value::Str` is an `Arc<String>`, so [`sval`] was heap-allocating and copying
+/// the whole name on every read and every write of every variable, only to drop
+/// it one call later. The name is always a compiler-emitted `Value::Str`
+/// constant, so the borrow is the whole path in practice and the owned arm never
+/// runs; it stays for the operand a future op could push as some other type.
+fn sref(v: &Value) -> std::borrow::Cow<'_, str> {
+    match v {
+        Value::Str(s) => std::borrow::Cow::Borrowed(s.as_str()),
+        _ => std::borrow::Cow::Owned(sval(v)),
+    }
+}
+
 /// Record the source line of the op that is aborting the chunk into the current
 /// frame, so an uncaught exception's traceback can name it. The dispatch loop
 /// pre-increments `ip`, so the failing op sits at `ip - 1`.
@@ -171,7 +186,8 @@ fn b_ellipsis(_vm: &mut VM, _: u8) -> Value {
 }
 
 fn b_getlocal(vm: &mut VM, _: u8) -> Value {
-    let name = sval(&vm.pop());
+    let key = vm.pop();
+    let name = sref(&key);
     materialize_if_main_dunder(&name);
     match with_host(|h| h.read_name_checked(&name)) {
         host::NameRead::Value(v) => return v,
@@ -208,7 +224,8 @@ fn materialize_if_main_dunder(name: &str) {
 }
 
 fn b_getglobal(vm: &mut VM, _: u8) -> Value {
-    let name = sval(&vm.pop());
+    let key = vm.pop();
+    let name = sref(&key);
     materialize_if_main_dunder(&name);
     if let Some(v) = with_host(|h| h.read_global(&name)) {
         return v;
@@ -235,15 +252,15 @@ fn b_getglobal(vm: &mut VM, _: u8) -> Value {
 
 fn b_setlocal(vm: &mut VM, _: u8) -> Value {
     let val = vm.pop();
-    let name = sval(&vm.pop());
-    with_host(|h| h.set_name(&name, val.clone()));
+    let key = vm.pop();
+    with_host(|h| h.set_name(&sref(&key), val.clone()));
     val
 }
 
 fn b_setglobal(vm: &mut VM, _: u8) -> Value {
     let val = vm.pop();
-    let name = sval(&vm.pop());
-    with_host(|h| h.set_global(&name, val.clone()));
+    let key = vm.pop();
+    with_host(|h| h.set_global(&sref(&key), val.clone()));
     val
 }
 
@@ -632,12 +649,38 @@ fn b_getitem(vm: &mut VM, _: u8) -> Value {
 /// A sequence keeps the integer-index restriction; `dict` accepts any
 /// non-collapsing key, which is what makes the common string-keyed store fast
 /// too. A `Slice` index is an `Obj` that can collapse, so it never reaches here.
-fn fast_store(h: &host::PyHost, recv: &Value, idx: &Value) -> bool {
+///
+/// `val` is inspected only for a `bytearray`, whose element must be an INT: a
+/// heap value there may be an instance with `__index__`, which only the slow
+/// path can call (it needs the VM, and this runs inside a host borrow). Letting
+/// it through made `ba[0] = Idx()` raise where CPython stores 65.
+fn fast_store(h: &host::PyHost, recv: &Value, idx: &Value, val: &Value) -> bool {
     match h.get(recv) {
-        Some(PyObj::List(_) | PyObj::Bytearray(_)) => matches!(idx, Value::Int(_) | Value::Bool(_)),
+        Some(PyObj::Bytearray(_)) => {
+            matches!(idx, Value::Int(_) | Value::Bool(_)) && !matches!(val, Value::Obj(_))
+        }
+        Some(PyObj::List(_)) => matches!(idx, Value::Int(_) | Value::Bool(_)),
         Some(PyObj::Dict(_)) => h.key_cannot_collapse(idx),
         _ => false,
     }
+}
+
+/// Resolve a STORE/DELETE subscript through `__index__`, the way `b_getitem`
+/// already resolved a load's.
+///
+/// `__index__` means "this object IS an integer", so CPython honours it on every
+/// side of a subscript — `a[Idx()]`, `a[Idx()] = v` and `del a[Idx()]` all reach
+/// `PyNumber_AsSsize_t`. pythonrs resolved it only on the load, so a class with
+/// a working `__index__` read a list fine and raised
+/// `TypeError: list indices must be integers` the moment it was written through.
+/// A `dict` is excluded for the same reason it is on the load path: a mapping
+/// keys on the OBJECT, and coercing the key would make `d[Idx()]` and `d[1]` the
+/// same slot.
+fn store_index(recv: &Value, idx: Value) -> Result<Value, String> {
+    if with_host(|h| matches!(h.get(recv), Some(PyObj::Dict(_)))) {
+        return Ok(idx);
+    }
+    Ok(index_dunder(&idx)?.unwrap_or(idx))
 }
 
 fn b_setitem(vm: &mut VM, _: u8) -> Value {
@@ -655,9 +698,9 @@ fn b_setitem(vm: &mut VM, _: u8) -> Value {
     // an unboxed scalar never collapses onto an instance key
     // (`value_can_collapse` is false for every non-`Obj` value), so the
     // candidate scan is guaranteed empty.
-    if let Some(r) =
-        with_host(|h| fast_store(h, &recv, &idx).then(|| h.set_item(&recv, &idx, val.clone())))
-    {
+    if let Some(r) = with_host(|h| {
+        fast_store(h, &recv, &idx, &val).then(|| h.set_item(&recv, &idx, val.clone()))
+    }) {
         return match r {
             Ok(()) => val,
             Err(e) => abort(vm, e),
@@ -674,37 +717,76 @@ fn b_setitem(vm: &mut VM, _: u8) -> Value {
             host::type_error(&format!("'{tn}' object does not support item assignment")),
         );
     }
+    match subscript_store(&recv, idx, val.clone()) {
+        Ok(()) => val,
+        Err(e) => abort(vm, e),
+    }
+}
+
+/// The subscript STORE, minus the VM plumbing: everything `a[i] = v` does once
+/// an instance `__setitem__` has been ruled out.
+///
+/// Shared with the explicit-dunder call (`a.__setitem__(i, v)`), which CPython
+/// routes to the very same `mp_ass_subscript` slot. They were separate code here
+/// and had drifted: the dunder path went straight to `PyHost::set_item`, so it
+/// saw no `__index__` coercion, no slice handling and no memoryview buffer
+/// check, and `L.__setitem__(Idx(1), 9)` raised where `L[Idx(1)] = 9` stored.
+/// One function, so a future fix to either cannot miss the other.
+fn subscript_store(recv: &Value, idx: Value, val: Value) -> Result<(), String> {
+    let recv = recv.clone();
     // Slice assignment (`x[i:j] = it`): materialize the RHS iterable here, out
     // of any host borrow (it may be a generator), then splice. Slice bounds with
     // `__index__` are resolved to ints first (`a[Idx():Idx()] = it`).
     if with_host(|h| matches!(h.get(&idx), Some(PyObj::Slice { .. }))) {
-        let idx = match normalize_slice_bounds(&idx) {
-            Ok(v) => v,
-            Err(e) => return abort(vm, e),
-        };
-        let repl = match host::iter_vec(&val) {
-            Ok(v) => v,
-            Err(e) => return abort(vm, e),
-        };
-        return match with_host(|h| h.set_slice_vals(&recv, &idx, repl)) {
-            Ok(()) => val,
-            Err(e) => abort(vm, e),
-        };
+        let idx = normalize_slice_bounds(&idx)?;
+        // A `memoryview` slice store takes a BUFFER, not an iterable: CPython
+        // rejects `mv[0:2] = [1, 2]` and `mv[0:2] = 'ab'` as "a bytes-like object
+        // is required" without ever iterating them. So the bytes-like check has
+        // to happen HERE, ahead of the `iter_vec` below — going through it first
+        // would accept both and silently widen the view's contract.
+        if with_host(|h| matches!(h.get(&recv), Some(PyObj::Memoryview { .. }))) {
+            let repl = match as_bytes_object(&val) {
+                Some(b) => b,
+                None => {
+                    let tn = with_host(|h| h.type_name(&val));
+                    return Err(host::type_error(&format!(
+                        "a bytes-like object is required, not '{tn}'"
+                    )));
+                }
+            };
+            return with_host(|h| h.set_memoryview_slice(&recv, &idx, repl));
+        }
+        let repl = host::iter_vec(&val)?;
+        return with_host(|h| h.set_slice_vals(&recv, &idx, repl));
     }
-    let cands = host::instance_key_candidates_for(&recv, Some(&idx));
-    match host::with_instance_key(&idx, host::KeyRole::Of(&recv), &cands, || {
-        with_host(|h| h.set_item(&recv, &idx, val.clone()))
+    let idx = store_index(&recv, idx)?;
+    // The byte containers want an INT element, so the stored value goes through
+    // `__index__` too (`ba[0] = Idx()`): CPython's `bytearray_ass_subscript` and
+    // `memory_ass_sub` both reach it via `PyNumber_AsSsize_t` / the `'B'` pack.
+    // Every other container stores the object as-is.
+    let val = if with_host(|h| {
+        matches!(
+            h.get(&recv),
+            Some(PyObj::Bytearray(_) | PyObj::Memoryview { .. })
+        )
     }) {
-        Ok(()) => val,
-        Err(e) => abort(vm, e),
-    }
+        indexed(&val)?
+    } else {
+        val
+    };
+    let cands = host::instance_key_candidates_for(&recv, Some(&idx));
+    host::with_instance_key(&idx, host::KeyRole::Of(&recv), &cands, || {
+        with_host(|h| h.set_item(&recv, &idx, val.clone()))
+    })
 }
 
 fn b_delitem(vm: &mut VM, _: u8) -> Value {
     let idx = vm.pop();
     let recv = vm.pop();
     // Same fast path as `b_setitem`, and sound for the same reasons.
-    if let Some(r) = with_host(|h| fast_store(h, &recv, &idx).then(|| h.del_item(&recv, &idx))) {
+    if let Some(r) =
+        with_host(|h| fast_store(h, &recv, &idx, &Value::Undef).then(|| h.del_item(&recv, &idx)))
+    {
         return match r {
             Ok(()) => Value::Undef,
             Err(e) => abort(vm, e),
@@ -722,23 +804,29 @@ fn b_delitem(vm: &mut VM, _: u8) -> Value {
             host::type_error(&format!("'{tn}' object doesn't support item deletion")),
         );
     }
-    // `del seq[Idx():Idx()]` — resolve `__index__` slice bounds (recv is a
-    // builtin sequence here; instances were dispatched to `__delitem__` above).
-    let idx = if with_host(|h| matches!(h.get(&idx), Some(PyObj::Slice { .. }))) {
-        match normalize_slice_bounds(&idx) {
-            Ok(v) => v,
-            Err(e) => return abort(vm, e),
-        }
-    } else {
-        idx
-    };
-    let cands = host::instance_key_candidates_for(&recv, Some(&idx));
-    match host::with_instance_key(&idx, host::KeyRole::Of(&recv), &cands, || {
-        with_host(|h| h.del_item(&recv, &idx))
-    }) {
+    match subscript_delete(&recv, idx) {
         Ok(()) => Value::Undef,
         Err(e) => abort(vm, e),
     }
+}
+
+/// The subscript DELETE, minus the VM plumbing — the `subscript_store` twin, and
+/// shared with `a.__delitem__(i)` for the same reason: CPython routes both to
+/// `mp_ass_subscript` with a NULL value, so a coercion either one applies and
+/// the other does not is a divergence by construction.
+fn subscript_delete(recv: &Value, idx: Value) -> Result<(), String> {
+    let recv = recv.clone();
+    // `del seq[Idx():Idx()]` — resolve `__index__` slice bounds (recv is a
+    // builtin sequence here; instances were dispatched to `__delitem__` above).
+    let idx = if with_host(|h| matches!(h.get(&idx), Some(PyObj::Slice { .. }))) {
+        normalize_slice_bounds(&idx)?
+    } else {
+        store_index(&recv, idx)?
+    };
+    let cands = host::instance_key_candidates_for(&recv, Some(&idx));
+    host::with_instance_key(&idx, host::KeyRole::Of(&recv), &cands, || {
+        with_host(|h| h.del_item(&recv, &idx))
+    })
 }
 
 // ── constructors ─────────────────────────────────────────────────────────────
@@ -12155,17 +12243,33 @@ pub fn call_type_method(
         "__len__" => return Ok(Value::Int(py_len(recv)? as i64)),
         "__getitem__" => {
             let k = arg0(&args)?;
+            // `b_getitem` resolves an `__index__` subscript (and a slice's
+            // `__index__` bounds) before indexing; the dunder call has to do the
+            // same or `a.__getitem__(Idx(1))` reads what `a[Idx(1)]` cannot.
+            // A mapping is excluded there and here: it keys on the object.
+            let k = if with_host(|h| matches!(h.get(recv), Some(PyObj::Slice { .. }))) {
+                k
+            } else if with_host(|h| matches!(h.get(&k), Some(PyObj::Slice { .. }))) {
+                normalize_slice_bounds(&k)?
+            } else {
+                store_index(recv, k)?
+            };
             return with_host(|h| h.get_item(recv, &k));
         }
+        // Through the SAME cores as `a[i] = v` / `del a[i]`. Reaching
+        // `PyHost::set_item`/`del_item` directly skipped `__index__` coercion,
+        // slice handling and the memoryview buffer check, so the dunder call and
+        // the syntax disagreed on `L.__setitem__(Idx(1), 9)`, `ba.__setitem__(0,
+        // Idx(65))` and `mv.__setitem__(0, 1)`.
         "__setitem__" => {
             let k = arg0(&args)?;
             let v = args.get(1).cloned().unwrap_or(Value::Undef);
-            with_host(|h| h.set_item(recv, &k, v))?;
+            subscript_store(recv, k, v)?;
             return Ok(Value::Undef);
         }
         "__delitem__" => {
             let k = arg0(&args)?;
-            with_host(|h| h.del_item(recv, &k))?;
+            subscript_delete(recv, k)?;
             return Ok(Value::Undef);
         }
         "__iter__" => return with_host(|h| h.make_iter(recv)),

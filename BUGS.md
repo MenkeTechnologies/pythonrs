@@ -697,8 +697,21 @@ written.
   `nbytes`, `format` (`'B'`), `itemsize`, `ndim`, `shape`, `strides`,
   `readonly`, `contiguous`. A view over a `bytearray` reflects later mutations
   to the backing buffer and is writable-flagged (`readonly` False); a `bytes`
-  backing is read-only. `<memory at 0x…>` repr. Not covered: `cast` (format
-  reinterpretation), multi-dimensional views, item assignment through the view.
+  backing is read-only. `<memory at 0x…>` repr. Item assignment THROUGH the view
+  writes into the backing `bytearray` — `mv[i] = b`, `mv[i:j:k] = <bytes-like>`
+  (every step, with CPython's fixed-length "different structures" rule rather
+  than a splice), a sliced view writing at its own offset, and aliased views
+  seeing each other's writes — with each refusal distinguished as CPython
+  distinguishes it (`cannot modify read-only memory`,
+  `memoryview: invalid type/value for format 'B'`,
+  `index out of bounds on dimension 1`, `a bytes-like object is required`,
+  `cannot delete memory`). Not covered: `cast` (format reinterpretation),
+  multi-dimensional views, a view over any buffer that is not a
+  `bytes`/`bytearray` (`memoryview(array.array('i', …))` raises
+  `TypeError: memoryview: a bytes-like object is required, not 'array'`; CPython
+  builds an `itemsize 4`, `format 'i'` view), and the export bookkeeping that
+  makes CPython raise `BufferError: Existing exports of data: object cannot be
+  re-sized` when a `bytearray` is resized while a view over it is alive.
 - **Codecs, escapes, and unicode** (byte-verified vs CPython via the `codec`
   fuzz mode, 0 divergences): `str.encode(encoding, errors)` across
   `utf-8`/`ascii`/`latin-1`/`iso-8859-1`/`utf-16`/`utf-32` (bare `utf-16`/`utf-32`

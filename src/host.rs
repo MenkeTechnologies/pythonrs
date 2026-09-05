@@ -1463,6 +1463,24 @@ pub struct EnvData {
 }
 pub type Env = Rc<RefCell<EnvData>>;
 
+/// Bind `name` to `val` in a [`NameMap`], allocating the key ONLY when the name
+/// is new to the map.
+///
+/// `map.insert(name.to_string(), val)` allocates and copies the name on every
+/// write, and the overwhelming majority of writes are REBINDS of a name the map
+/// already holds — a loop counter is stored once per iteration and its key
+/// allocated once per iteration with it. Looking the slot up first makes the
+/// rebind allocation-free at the cost of nothing: `get_mut` and `insert` hash
+/// the name once each, so a genuinely new name pays one extra hash, once.
+pub fn bind_name(map: &mut NameMap, name: &str, val: Value) {
+    match map.get_mut(name) {
+        Some(slot) => *slot = val,
+        None => {
+            map.insert(name.to_string(), val);
+        }
+    }
+}
+
 fn new_env(parent: Option<Env>) -> Env {
     Rc::new(RefCell::new(EnvData {
         vars: NameMap::default(),
@@ -3083,14 +3101,29 @@ impl PyHost {
     /// to an enclosing or global binding). Otherwise it is a normal LEGB read.
     pub fn read_name_checked(&self, name: &str) -> NameRead {
         let f = self.frame();
-        if f.locals_set.contains(name)
-            && !f.globals_decl.contains(name)
-            && !f.nonlocals_decl.contains(name)
+        // Ordered by cost, because this runs on EVERY name read and each set
+        // probe hashes the whole name.
+        //
+        // The two declaration sets go first as `is_empty`, not `contains`: a
+        // `global`/`nonlocal` declaration is rare (most functions have neither),
+        // and an empty set can be excluded without hashing anything.
+        //
+        // Then `vars` — NOT `locals_set` — because a hit there is the answer.
+        // `read_name`'s own first step is this same lookup in this same env, so
+        // a name bound in the current env resolves to the same value down either
+        // path; `locals_set` only ever decided whether a MISS is an unbound local
+        // or a name from an outer scope, and a miss is the rare case. Probing it
+        // first cost a second hash on every successful read to classify a failure
+        // that had not happened.
+        if (f.globals_decl.is_empty() || !f.globals_decl.contains(name))
+            && (f.nonlocals_decl.is_empty() || !f.nonlocals_decl.contains(name))
         {
-            return match self.cur_env().borrow().vars.get(name) {
-                Some(v) => NameRead::Value(v.clone()),
-                None => NameRead::Unbound,
-            };
+            if let Some(v) = self.cur_env().borrow().vars.get(name) {
+                return NameRead::Value(v.clone());
+            }
+            if f.locals_set.contains(name) {
+                return NameRead::Unbound;
+            }
         }
         match self.read_name(name) {
             Some(v) => NameRead::Value(v),
@@ -3122,11 +3155,15 @@ impl PyHost {
         if self.pending_main_dunders && matches!(name, "__loader__" | "__builtins__") {
             self.pending_main_dunders = false;
         }
-        if self.frame().globals_decl.contains(name) {
-            self.globals_mut().insert(name.to_string(), val);
+        // Same empty-set short-circuit as `read_name_checked`, for the same
+        // reason: this is on every variable WRITE, and both declaration sets are
+        // empty in the overwhelming majority of frames.
+        let f = self.frame();
+        if !f.globals_decl.is_empty() && f.globals_decl.contains(name) {
+            bind_name(self.globals_mut(), name, val);
             return;
         }
-        if self.frame().nonlocals_decl.contains(name) {
+        if !self.frame().nonlocals_decl.is_empty() && self.frame().nonlocals_decl.contains(name) {
             // Rebind the nearest ENCLOSING function scope that binds `name`
             // (skip the current env — that is what distinguishes it from a plain
             // local assignment and from `global`).
@@ -3134,7 +3171,7 @@ impl PyHost {
             let mut env = cur.borrow().parent.clone();
             while let Some(e) = env {
                 if e.borrow().vars.contains_key(name) {
-                    e.borrow_mut().vars.insert(name.to_string(), val);
+                    bind_name(&mut e.borrow_mut().vars, name, val);
                     return;
                 }
                 let parent = e.borrow().parent.clone();
@@ -3143,7 +3180,7 @@ impl PyHost {
             // No binding found up the chain: fall back to the immediate parent.
             let parent = cur.borrow().parent.clone();
             if let Some(p) = parent {
-                p.borrow_mut().vars.insert(name.to_string(), val);
+                bind_name(&mut p.borrow_mut().vars, name, val);
                 return;
             }
         }
@@ -3153,14 +3190,14 @@ impl PyHost {
         // to globals (invisible to an `UnboundLocalError`-aware local read).
         let cur = self.cur_env();
         if cur.borrow().parent.is_none() {
-            self.globals_mut().insert(name.to_string(), val);
+            bind_name(self.globals_mut(), name, val);
         } else {
-            cur.borrow_mut().vars.insert(name.to_string(), val);
+            bind_name(&mut cur.borrow_mut().vars, name, val);
         }
     }
 
     pub fn set_global(&mut self, name: &str, val: Value) {
-        self.globals_mut().insert(name.to_string(), val);
+        bind_name(self.globals_mut(), name, val);
     }
 
     /// A `list`/`tuple` of `str` flattened to owned `String`s — reads a module's
@@ -8408,11 +8445,105 @@ impl PyHost {
                 }
                 Ok(())
             }
+            // `mv[i] = int` — one byte written THROUGH the view into its backing
+            // `bytearray`. A view is a window, not a copy, so the store lands in
+            // the backing object and every other view over it sees it.
+            Some(PyObj::Memoryview {
+                obj,
+                start,
+                len,
+                readonly,
+            }) => {
+                let (obj, start, len, readonly) = (obj.clone(), *start, *len, *readonly);
+                if readonly {
+                    return Err(type_error("cannot modify read-only memory"));
+                }
+                let i = self.seq_index(idx, || type_error("memoryview: invalid slice key"))?;
+                let k = if i < 0 { i + len as i64 } else { i };
+                if k < 0 || k >= len as i64 {
+                    return Err("IndexError: index out of bounds on dimension 1".into());
+                }
+                let b = self.mv_byte_value(&val)?;
+                if let Some(PyObj::Bytearray(buf)) = self.get_mut(&obj) {
+                    if let Some(slot) = buf.get_mut(start + k as usize) {
+                        *slot = b;
+                    }
+                }
+                Ok(())
+            }
             _ => Err(type_error(&format!(
                 "'{}' object does not support item assignment",
                 self.type_name(recv)
             ))),
         }
+    }
+
+    /// One `format 'B'` element: an `__index__`-able value inside `0..=255`.
+    ///
+    /// CPython splits the two rejections, and the split is not cosmetic — a
+    /// non-integer is a TYPE error (`memoryview_setitem` never gets a value out
+    /// of `PyNumber_Index`) while an out-of-range integer is a VALUE error (the
+    /// index succeeded and the `unsigned char` pack is what refused it). A
+    /// bignum is out of range, not a non-integer, so it takes the ValueError.
+    fn mv_byte_value(&self, val: &Value) -> Result<u8, String> {
+        const BAD_VALUE: &str = "ValueError: memoryview: invalid value for format 'B'";
+        match self.index_fit(val) {
+            IndexFit::Fits(v) if (0..=255).contains(&v) => Ok(v as u8),
+            IndexFit::Fits(_) | IndexFit::TooLarge(_) => Err(BAD_VALUE.into()),
+            IndexFit::NotInt => Err(type_error("memoryview: invalid type for format 'B'")),
+        }
+    }
+
+    /// `mv[lo:hi:step] = bytes-like`, with the replacement already flattened to
+    /// raw bytes by the caller (a `memoryview` slice store takes a BUFFER, never
+    /// an arbitrary iterable, so the caller must not have iterated it).
+    ///
+    /// CPython requires the two sides to select the same number of elements for
+    /// EVERY step, contiguous included: a view has a fixed length and cannot
+    /// splice, so `mv[1:3] = b'Y'` is an error where `list`'s equivalent is a
+    /// resize.
+    pub fn set_memoryview_slice(
+        &mut self,
+        recv: &Value,
+        idx: &Value,
+        repl: Vec<u8>,
+    ) -> Result<(), String> {
+        let Some(PyObj::Memoryview {
+            obj,
+            start,
+            len,
+            readonly,
+        }) = self.get(recv)
+        else {
+            return Err(type_error("expected a memoryview"));
+        };
+        let (obj, start, len, readonly) = (obj.clone(), *start, *len, *readonly);
+        if readonly {
+            return Err(type_error("cannot modify read-only memory"));
+        }
+        let (lo, hi, step) = match self.get(idx) {
+            Some(PyObj::Slice { lo, hi, step }) => (lo.clone(), hi.clone(), step.clone()),
+            _ => return Err(type_error("expected a slice")),
+        };
+        let step = self.as_slice_index(&step).unwrap_or(1);
+        if step == 0 {
+            return Err("ValueError: slice step cannot be zero".into());
+        }
+        let picks = self.slice_indices(&lo, &hi, step, len as i64);
+        if picks.len() != repl.len() {
+            return Err(
+                "ValueError: memoryview assignment: lvalue and rvalue have different structures"
+                    .into(),
+            );
+        }
+        if let Some(PyObj::Bytearray(buf)) = self.get_mut(&obj) {
+            for (k, b) in picks.iter().zip(repl) {
+                if let Some(slot) = buf.get_mut(start + *k as usize) {
+                    *slot = b;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Thin wrapper: an unhashable-key failure gets CPython's container
@@ -8484,6 +8615,9 @@ impl PyHost {
                 }
                 Ok(())
             }
+            // A view has a fixed length, so there is nothing a delete could mean;
+            // CPython refuses it by name rather than with the generic text.
+            Some(PyObj::Memoryview { .. }) => Err(type_error("cannot delete memory")),
             _ => Err(type_error("object doesn't support item deletion")),
         }
     }
@@ -8639,6 +8773,9 @@ impl PyHost {
         let n = match self.get(recv) {
             Some(PyObj::List(l)) => l.len() as i64,
             Some(PyObj::Bytearray(b)) => b.len() as i64,
+            // A view is fixed-length, so a slice delete is refused by the same
+            // name as a single-element one rather than by the generic text.
+            Some(PyObj::Memoryview { .. }) => return Err(type_error("cannot delete memory")),
             _ => {
                 return Err(type_error(&format!(
                     "'{}' object doesn't support item deletion",

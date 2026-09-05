@@ -27,6 +27,7 @@ pub mod intercepts;
 pub mod lexer;
 pub mod lsp;
 pub mod mangle;
+pub mod oracle;
 pub mod parser;
 pub mod pyhash;
 pub mod regexpr;
