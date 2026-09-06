@@ -638,7 +638,17 @@ written.
 - **`NotImplemented`-driven reflected-op negotiation**: a forward dunder that
   returns `NotImplemented` retries the reflected dunder, for both arithmetic
   (`A().__add__` → `B().__radd__`) and comparison (`A().__lt__` → `B().__gt__`);
-  when neither resolves, a `TypeError` is raised.
+  when neither resolves, a `TypeError` is raised. CPython's two ordering rules
+  hold as well: the RIGHT operand goes first when its type is a proper subclass
+  of the left's and overrides the reflected dunder (`A() + C()` runs
+  `C.__radd__` and never reaches `A.__add__`), and two operands of the SAME type
+  never consult the reflected half for ARITHMETIC — `A() + A()` whose `__add__`
+  declines raises even though `__radd__` exists — while comparison does consult
+  it (`B() < B()` tries `__lt__` then `__gt__`). An augmented assignment that no
+  dunder answers names the augmented operator (`unsupported operand type(s) for
+  >>=`), and a sequence reports its own concat/repeat refusal (`can only
+  concatenate list (not "T") to list`, `can't multiply sequence by non-int of
+  type 'T'`).
 - **`%s`/`%r`/`%a` dispatch a user instance's `__str__`/`__repr__`/`ascii(repr)`**
   (and recurse into containers holding instances), matching f-strings/`.format`;
   the format args' dispatched values are pre-resolved outside the host borrow.
@@ -749,6 +759,16 @@ written.
   `type(x).__name__` reflect the subclass. Fuzzed to zero divergences
   (`parity-fuzz --mode subclass`).
 
+- **`math.gamma`/`lgamma`/`erf`/`erfc` answer bit-for-bit**, which needed each
+  from the same source CPython takes it from. `erf`/`erfc` are the platform's
+  (CPython 3.14 declares them `FUNC1A(erf, erf, …)`); `gamma`/`lgamma` are ports
+  of `m_tgamma`/`m_lgamma` from `Modules/mathmodule.c`, which CPython carries
+  itself because the platform's are not accurate enough. The pure-Rust `libm`
+  crate is neither, and disagreed in the last place on 312/1201, 390/1201,
+  907/1194 and 976/1194 sampled points across `[-6, 6]`; a straight translation
+  of the Lanczos code still disagreed on 524 and 637 until the multiply-add in
+  `lanczos_sum` was contracted the way clang contracts it. `lgamma(-inf)` is
+  `inf` — the log of a magnitude — not the domain error pythonrs raised.
 - **The `itertools`/`collections`/`math` container surface that no probe
   exercised.** Found by diffing the names `src/builtins.rs` dispatches against
   the identifiers the fuzz corpus actually writes: a keyword-only argument, a
@@ -1171,6 +1191,21 @@ written.
   `int`/`bignum`/`bool`/`float`/`-0.0`/`inf`/`nan`/`str` (91 206 pairs) under
   `LC_ALL` in `C`, `en_US`, `de_DE`, `hi_IN` and `fr_FR`, byte-identical to
   CPython 3.14.6 in every one.
+- **A `slice` is not hashable, so it cannot be a dict key or a set member.**
+  CPython made slices hashable in 3.12: `{slice(1, 2): 'v'}` builds there and
+  `d[slice(1.5, 2)]` reads back; here the construction raises `TypeError: cannot
+  use 'slice' as a dict key (unhashable type: 'object')`, and the STORE form
+  `d[slice(1, 2)] = 1` is worse — it is taken for a slice ASSIGNMENT and raises
+  `TypeError: 'int' object is not iterable`, so the key never reaches the dict at
+  all. Closing it means hashing the three bounds (CPython hashes the equivalent
+  tuple) and making the subscript paths tell a slice KEY from a slice INDEX by
+  the receiver rather than by the index's type.
+- **A `slice`'s repr does not dispatch a bound's `__repr__`.** `slice(Idx(),
+  Idx())` renders `slice(<__main__.Idx object at 0x…>, …)` where CPython renders
+  `slice(Idx(), Idx(), None)`. The rendering happens inside `PyHost::repr_of`,
+  which cannot call back into the interpreter while it holds the host borrow —
+  the same constraint `%r` solves by pre-resolving the dispatched values outside
+  the borrow, which is what a slice's bounds would need too.
 - **Lone surrogates in `str`**: `chr(0xD800..0xDFFF)` raises `ValueError` where
   CPython returns a surrogate-bearing `str` (which then fails only on UTF-8
   encode). pythonrs strings are Rust `String` (valid scalar values only), so a
@@ -1178,20 +1213,6 @@ written.
   out-of-range and surrogate paths share CPython's `chr() arg not in
   range(0x110000)` message. `surrogateescape`/`surrogatepass` handlers are
   likewise not reachable for the same reason.
-- **`math.lgamma`/`erf`/`erfc` differ from CPython in the last ULP.** Measured on
-  3.14.7: `math.lgamma(5)` is `3.1780538303479444` there and
-  `3.1780538303479458` here, `math.erf(1)` is `0.8427007929497148` there and
-  `0.8427007929497149` here, `math.erfc(1)` is `0.15729920705028516` there and
-  `0.15729920705028513` here. pythonrs calls the platform libm; CPython does
-  NOT — `Modules/mathmodule.c` carries its own `m_lgamma` (a Lanczos-series
-  implementation with its own coefficient table) and its own `m_erf`
-  /`m_erfc` (`m_erf_series` below 1.5, `m_erfc_contfrac` above), precisely so the
-  answer does not vary with the host's libm. Closing this means porting those
-  three routines from `mathmodule.c` rather than adjusting a rounding mode; every
-  other `math` function measured (`gamma`, `hypot`, `dist`, `fsum`, `sumprod`,
-  `comb`, `perm`, `isqrt`, `lcm`, `ldexp`, `frexp`, `modf`, `nextafter`, `ulp`,
-  `remainder`, `cbrt`, `exp2`, `expm1`, `log1p`, `factorial`, `isclose`) already
-  matches bit-for-bit.
 - **A traceback stops at the pythonrs frame; frames INSIDE a bridged stdlib
   module are not listed.** `textwrap.shorten('a b c', 4)` raises the right
   exception with the right message and the right caret line, but CPython's

@@ -67,7 +67,9 @@ Two things set it apart from every other standalone Python:
 - **Transparent rkyv bytecode cache — on every run.** `python foo.py` hashes the
   source, consults `~/.pythonrs/scripts.rkyv`, and on a hit runs the compiled
   chunks directly with lex/parse/lower skipped entirely. No flags, no separate
-  build step, no `__pycache__` ritual.
+  build step, no `__pycache__` ritual. The shard is an archived INDEX followed by
+  a raw blob region, and a lookup validates only the index: what the cache costs
+  a run is set by how many programs it holds, never by how large they are.
 - **AOT to a native executable.** `python --build foo.py` emits a standalone
   native binary (via `fusevm::aot`, linked against the pythonrs runtime
   staticlib) that runs the script with no interpreter present. This path needs
@@ -270,6 +272,30 @@ against the identifiers the corpus actually contains is what turns that blind
 spot into a work list — `--mode containertail` exists because that diff surfaced
 a dozen `itertools`/`collections`/`math` gaps at once, several of them silently
 wrong answers rather than errors.
+
+The same audit run over the generator corpus itself — which identifiers do the
+66 modes never emit? — is what `--mode binop` and `--mode numproto` came from.
+Not one case in the corpus had ever written `__radd__`, or any other reflected
+dunder; nine of the thirteen forward operators and twelve of the thirteen
+in-place ones were equally absent, as were `__round__`, `__trunc__`, `__floor__`,
+`__ceil__`, `__complex__`, `__pos__` and `__invert__`. Behind that hole sat the
+whole of CPython's operator negotiation — the rule that a subclass's reflected
+dunder runs BEFORE its base's forward one, its mirror that two operands of the
+same type never consult the reflected half for arithmetic, and the augmented
+form's own `op=` wording — plus a `math` module that read every argument as
+`as_f(v).unwrap_or(0.0)`, so `math.sqrt("s")`, `math.cos(None)` and
+`math.sqrt(10**30)` all answered a plausible NUMBER rather than raising. A
+saturated fuzzer is evidence about the grammar, not about the frontend.
+
+`numproto`'s single divergence was one ulp of `math.erf(3)`, and the ulp was the
+finding. Sweeping `[-6, 6]` in hundredths put `erf` 312 points out of 1201 away
+from CPython, `erfc` 390, `gamma` 907 and `lgamma` 976 — pythonrs answered all
+four out of the pure-Rust `libm` crate, and CPython answers none of them from
+there: `erf`/`erfc` are the platform's, while `gamma`/`lgamma` are CPython's own
+Lanczos code, carried in `mathmodule.c` precisely because the platform's are not
+good enough. Porting that code closed three of the four; the fourth needed the
+FMA contraction clang applies to `num*x + coeff` by default, which is one
+rounding where a literal Rust translation has two.
 
 A generated corpus has the mirror blind spot: it can only report combinations
 the grammar can produce. `--mode buffer` exists because of one — the grammar

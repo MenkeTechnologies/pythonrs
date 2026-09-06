@@ -3634,6 +3634,309 @@ fn gen_buffer(seed: u64) -> Vec<String> {
 /// `center`/`ljust`/`rjust`, the `isX` predicates, `translate`/`maketrans`),
 /// `%`-formatting, `del ba[i]` / `del ba[i:j]`, and `decode(errors=...)`. Every
 /// case prints a deterministic value (no error paths) so output stays byte-stable.
+/// The dunder-operator protocol on USER classes: forward, reflected, in-place,
+/// and the subclass-priority rule that decides which of them runs first.
+///
+/// The corpus had 66 modes and not one of them defined `__radd__` — or any other
+/// reflected dunder. Nine of the thirteen forward operators (`__truediv__`,
+/// `__floordiv__`, `__mod__`, `__pow__`, `__matmul__`, `__and__`, `__or__`,
+/// `__xor__`, `__lshift__`, `__rshift__`) never appeared either, and neither did
+/// twelve of the thirteen in-place ones. So a whole dispatch table — the one
+/// CPython spends `SLOT1BINFULL` on — was being exercised only through native
+/// int/str operands, which never reach it.
+fn gen_binop(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    // (glyph, forward, reflected, in-place)
+    const OPS: &[(&str, &str, &str, &str)] = &[
+        ("+", "__add__", "__radd__", "__iadd__"),
+        ("-", "__sub__", "__rsub__", "__isub__"),
+        ("*", "__mul__", "__rmul__", "__imul__"),
+        ("/", "__truediv__", "__rtruediv__", "__itruediv__"),
+        ("//", "__floordiv__", "__rfloordiv__", "__ifloordiv__"),
+        ("%", "__mod__", "__rmod__", "__imod__"),
+        ("**", "__pow__", "__rpow__", "__ipow__"),
+        ("@", "__matmul__", "__rmatmul__", "__imatmul__"),
+        ("&", "__and__", "__rand__", "__iand__"),
+        ("|", "__or__", "__ror__", "__ior__"),
+        ("^", "__xor__", "__rxor__", "__ixor__"),
+        ("<<", "__lshift__", "__rlshift__", "__ilshift__"),
+        (">>", "__rshift__", "__rrshift__", "__irshift__"),
+    ];
+    // (glyph, method, the method the REFLECTED operand is asked for)
+    const CMPS: &[(&str, &str, &str)] = &[
+        ("<", "__lt__", "__gt__"),
+        (">", "__gt__", "__lt__"),
+        ("<=", "__le__", "__ge__"),
+        (">=", "__ge__", "__le__"),
+        ("==", "__eq__", "__eq__"),
+        ("!=", "__ne__", "__ne__"),
+    ];
+    let (glyph, fwd, refl, iop) = *pick(r, OPS);
+    let (cg, cfwd, crefl) = *pick(r, CMPS);
+    // What a dunder hands back. `NotImplemented` is the interesting one: it is
+    // the only way the second operand ever gets asked.
+    let body = pick(
+        r,
+        &[
+            "return NotImplemented",
+            "return ('hit', s.v, getattr(o, 'v', o))",
+            "return s.v",
+            "raise ValueError('boom')",
+        ],
+    );
+    let other = pick(r, &["1", "2.5", "'x'", "[1]", "(1,)", "True", "10**30"]);
+    // The outcome harness: the value on success, `Type: message` on failure, so
+    // both sides are compared on stdout even without `--stderr`.
+    let t = "def t(label, fn):\n    try:\n        print(label, fn())\n    except BaseException as e:\n        print(label, type(e).__name__ + ': ' + str(e))";
+    let base = format!(
+        "class A:\n    def __init__(s, v=1): s.v = v\n    def __repr__(s): return 'A(%r)' % (s.v,)\n    def {fwd}(s, o): {body}"
+    );
+
+    let mut out = vec![t.to_string()];
+    match r.below(9) {
+        // Forward only, against a native right operand: either the dunder
+        // answers or the pair is unsupported, and the message names both types.
+        0 => {
+            out.push(base);
+            out.push(format!("t('fwd', lambda: A(3) {glyph} {other})"));
+            out.push(format!("t('rev', lambda: {other} {glyph} A(3))"));
+        }
+        // Reflected only. The forward operand is native, so the reflected half
+        // is the ONLY thing that can answer.
+        1 => {
+            out.push(format!(
+                "class B:\n    def __init__(s, v=1): s.v = v\n    def __repr__(s): return 'B(%r)' % (s.v,)\n    def {refl}(s, o): {body}"
+            ));
+            out.push(format!("t('r', lambda: {other} {glyph} B(4))"));
+            out.push(format!("t('rr', lambda: B(4) {glyph} {other})"));
+        }
+        // Both halves defined on unrelated classes: forward first, and the
+        // reflected one only when the forward declines.
+        2 => {
+            out.push(base);
+            out.push(format!(
+                "class B:\n    def __init__(s, v=2): s.v = v\n    def {refl}(s, o): return ('refl', s.v)"
+            ));
+            out.push(format!("t('pair', lambda: A(1) {glyph} B(2))"));
+            out.push(format!("t('flip', lambda: B(2) {glyph} A(1))"));
+        }
+        // THE SUBCLASS-PRIORITY RULE. `C(A)` overriding the reflected dunder
+        // answers BEFORE `A`'s forward one — the base never sees the operation.
+        3 => {
+            out.push(base);
+            out.push(format!(
+                "class C(A):\n    def {refl}(s, o): print('C-refl'); return ('sub', s.v)"
+            ));
+            out.push(format!("t('prio', lambda: A(1) {glyph} C(2))"));
+            out.push(format!("t('same', lambda: C(1) {glyph} C(2))"));
+            out.push(format!("t('rev', lambda: C(2) {glyph} A(1))"));
+        }
+        // The same shape with the reflected dunder INHERITED rather than
+        // overridden: not an override, so nothing reorders and the base's
+        // forward runs first.
+        4 => {
+            out.push(format!(
+                "class A:\n    def __init__(s, v=1): s.v = v\n    def {fwd}(s, o): print('fwd'); return ('f', s.v)\n    def {refl}(s, o): print('refl'); return ('r', s.v)"
+            ));
+            out.push("class C(A): pass".to_string());
+            out.push(format!("t('inherit', lambda: A(1) {glyph} C(2))"));
+            out.push(format!("t('both', lambda: C(1) {glyph} A(2))"));
+        }
+        // In-place. `__iop__` may mutate and return self (the name is rebound to
+        // the SAME object), and falls back to the binary pair when absent.
+        5 => {
+            let has_iop = r.below(2) == 0;
+            let iop_def = if has_iop {
+                format!("\n    def {iop}(s, o): s.v = ('i', s.v); return s")
+            } else {
+                String::new()
+            };
+            out.push(format!(
+                "class A:\n    def __init__(s, v=1): s.v = v\n    def __repr__(s): return 'A(%r)' % (s.v,)\n    def {fwd}(s, o): {body}{iop_def}"
+            ));
+            out.push("x = A(3)".to_string());
+            out.push("y = x".to_string());
+            out.push(format!(
+                "t('inplace', lambda: exec('global x\\nx {glyph}= {other}'))"
+            ));
+            out.push("print('after', x, y, x is y)".to_string());
+        }
+        // Rich comparison: the reflected operand is asked for the MIRRORED
+        // method, and the same subclass-priority rule applies.
+        6 => {
+            out.push(format!(
+                "class A:\n    def __init__(s, v=1): s.v = v\n    def {cfwd}(s, o): print('A-{cfwd}'); {body}"
+            ));
+            out.push(format!(
+                "class C(A):\n    def {crefl}(s, o): print('C-{crefl}'); return 'sub'"
+            ));
+            out.push(format!("t('cmp', lambda: A(1) {cg} C(2))"));
+            out.push(format!("t('cmp-native', lambda: A(1) {cg} {other})"));
+            out.push(format!("t('cmp-rev', lambda: {other} {cg} A(1))"));
+        }
+        // `==`/`!=` are the pair with a fallback: identity when both decline,
+        // and a default `__ne__` derived from `__eq__`.
+        7 => {
+            out.push(format!(
+                "class A:\n    def __init__(s, v=1): s.v = v\n    def __eq__(s, o): {body}"
+            ));
+            out.push("a = A(1)".to_string());
+            out.push("t('eq-self', lambda: a == a)".to_string());
+            out.push("t('eq-other', lambda: A(1) == A(1))".to_string());
+            out.push("t('ne', lambda: A(1) != A(1))".to_string());
+            out.push(format!("t('eq-native', lambda: A(1) == {other})"));
+        }
+        // No dunder at all on either side: the unsupported-operand message, and
+        // the comparison message, which is worded differently.
+        _ => {
+            out.push("class N:\n    pass".to_string());
+            out.push(format!("t('none', lambda: N() {glyph} N())"));
+            out.push(format!("t('none-native', lambda: N() {glyph} {other})"));
+            out.push(format!("t('none-cmp', lambda: N() {cg} N())"));
+            out.push(format!("t('none-cmp2', lambda: N() {cg} {other})"));
+        }
+    }
+    out
+}
+
+/// The NUMERIC protocol on objects that are not numbers: `__float__`,
+/// `__index__`, `__complex__`, `__trunc__`/`__floor__`/`__ceil__`, `__round__`,
+/// and the unary dunders — plus the `math` and `complex` entry points that are
+/// supposed to consult them.
+///
+/// `__round__`, `__trunc__`, `__floor__`, `__ceil__`, `__complex__`, `__pos__`
+/// and `__invert__` appeared ZERO times in the corpus, and no case passed a
+/// non-number to `math` at all. That hid a wrong-ANSWER class of bug rather than
+/// a missing error: every `math` arm read its argument as
+/// `as_f(v).unwrap_or(0.0)`, so a string, a `None` or a bignum all computed
+/// against `0.0` and returned a plausible number.
+fn gen_numproto(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    // Single-argument real functions, plus the two-argument ones.
+    const REAL1: &[&str] = &[
+        "sqrt", "fabs", "exp", "log", "log2", "log10", "sin", "cos", "atan", "degrees", "radians",
+        "isnan", "isfinite", "cbrt", "erf",
+    ];
+    const REAL2: &[&str] = &["atan2", "copysign", "fmod", "pow", "remainder", "hypot"];
+    const INTFN: &[&str] = &["isqrt", "factorial", "gcd", "lcm", "comb", "perm"];
+    let f1 = pick(r, REAL1);
+    let f2 = pick(r, REAL2);
+    let fi = pick(r, INTFN);
+    // The argument under test. Half of these are things CPython REFUSES, and the
+    // refusal wording is the answer being compared.
+    let arg = pick(
+        r,
+        &[
+            "F()",
+            "I()",
+            "N()",
+            "'s'",
+            "None",
+            "2.5",
+            "3",
+            "True",
+            "10**30",
+            "-(10**30)",
+            "[]",
+            "b'x'",
+        ],
+    );
+    let n = pick(r, &["0", "1", "2", "-1", "-2", "5"]);
+    let t = "def t(label, fn):\n    try:\n        print(label, fn())\n    except BaseException as e:\n        print(label, type(e).__name__ + ': ' + str(e))";
+    // The three coercion stand-ins, always defined so any case can name them.
+    let cls = "class F:\n    def __float__(s): return 2.25\nclass I:\n    def __index__(s): return 7\nclass N:\n    pass";
+
+    let mut out = vec!["import math".to_string(), t.to_string(), cls.to_string()];
+    match r.below(8) {
+        // A real-valued `math` function against every kind of argument.
+        0 => {
+            out.push(format!("t('r1', lambda: math.{f1}({arg}))"));
+            out.push(format!("t('r2', lambda: math.{f2}({arg}, 2))"));
+            out.push(format!("t('r2b', lambda: math.{f2}(2, {arg}))"));
+        }
+        // The integer-valued ones, which take `__index__` and refuse a float.
+        1 => {
+            out.push(format!("t('i1', lambda: math.{fi}({arg}))"));
+            out.push(format!("t('i2', lambda: math.{fi}({arg}, 2))"));
+            out.push(format!("t('gcd', lambda: math.gcd({arg}, 12))"));
+        }
+        // floor/ceil/trunc: a protocol, not a cast. An INT argument must come
+        // back exact rather than through a `double`.
+        2 => {
+            out.push(format!("t('floor', lambda: math.floor({arg}))"));
+            out.push(format!("t('ceil', lambda: math.ceil({arg}))"));
+            out.push(format!("t('trunc', lambda: math.trunc({arg}))"));
+            out.push(format!("t('round', lambda: round({arg})) "));
+            out.push(format!("t('round-n', lambda: round({arg}, {n}))"));
+        }
+        // A class that supplies the rounding dunders itself: they win over any
+        // numeric fallback, and `round(x, n)` passes the digit count through.
+        3 => {
+            out.push("class R:\n    def __trunc__(s): return 'T'\n    def __floor__(s): return 'FL'\n    def __ceil__(s): return 'CE'\n    def __round__(s, d=None): return ('R', d)".to_string());
+            out.push("t('floor', lambda: math.floor(R()))".to_string());
+            out.push("t('ceil', lambda: math.ceil(R()))".to_string());
+            out.push("t('trunc', lambda: math.trunc(R()))".to_string());
+            out.push("t('round', lambda: round(R()))".to_string());
+            out.push(format!("t('round-n', lambda: round(R(), {n}))"));
+            out.push(format!("t('int', lambda: int(R()))"));
+        }
+        // `complex()`: `__complex__` first, then the real coercion, then a
+        // refusal that names the type.
+        4 => {
+            out.push("class C:\n    def __complex__(s): return 3+4j".to_string());
+            out.push(format!("t('c1', lambda: complex({arg}))"));
+            out.push("t('c2', lambda: complex(C()))".to_string());
+            out.push(format!("t('c3', lambda: complex(1, {arg}))"));
+            out.push(format!("t('c4', lambda: complex({arg}, 1))"));
+        }
+        // The unary dunders, including the two that had never been written.
+        5 => {
+            let defs = pick(
+                r,
+                &[
+                    "    def __neg__(s): return 'neg'",
+                    "    def __pos__(s): return 'pos'",
+                    "    def __invert__(s): return 'inv'",
+                    "    def __abs__(s): return 'abs'",
+                    "    def __neg__(s): return 'neg'\n    def __invert__(s): return 'inv'",
+                    "    pass",
+                ],
+            );
+            out.push(format!("class U:\n{defs}"));
+            out.push("t('neg', lambda: -U())".to_string());
+            out.push("t('pos', lambda: +U())".to_string());
+            out.push("t('inv', lambda: ~U())".to_string());
+            out.push("t('abs', lambda: abs(U()))".to_string());
+        }
+        // `__index__` where an integer is REQUIRED — every one of these consults
+        // it, and a frontend that honours it in only some places is wrong in the
+        // rest.
+        6 => {
+            out.push(format!("t('hex', lambda: hex({arg}))"));
+            out.push(format!("t('bin', lambda: bin({arg}))"));
+            out.push(format!(
+                "t('chr', lambda: chr({arg}) if {arg} != [] else 'skip')"
+            ));
+            out.push(format!("t('slice', lambda: [1, 2, 3, 4, 5][:{arg}])"));
+            out.push(format!("t('rep', lambda: [0] * {arg})"));
+            out.push(format!("t('range', lambda: list(range({arg})))"));
+        }
+        // `divmod` and `@`, the two binary operators with no glyph shortcut in
+        // the corpus, plus the float/int constructors' own coercion errors.
+        _ => {
+            out.push("class D:\n    def __divmod__(s, o): return 'dm'\n    def __rdivmod__(s, o): return 'rdm'\n    def __matmul__(s, o): return 'mm'\n    def __rmatmul__(s, o): return 'rmm'".to_string());
+            out.push(format!("t('dm', lambda: divmod(D(), {arg}))"));
+            out.push(format!("t('rdm', lambda: divmod({arg}, D()))"));
+            out.push(format!("t('mm', lambda: D() @ {arg})"));
+            out.push(format!("t('rmm', lambda: {arg} @ D())"));
+            out.push(format!("t('float', lambda: float({arg}))"));
+            out.push(format!("t('int', lambda: int({arg}))"));
+            out.push(format!("t('dm-plain', lambda: divmod({arg}, 3))"));
+        }
+    }
+    out
+}
+
 fn gen_bytestail(seed: u64) -> Vec<String> {
     let r = &mut Rng::new(seed);
     // Case-varied literals for the case/title/predicate methods.
@@ -6523,6 +6826,8 @@ enum Mode {
     Hashval,
     Stdlibexc,
     Containertail,
+    Binop,
+    Numproto,
 }
 
 const REAL_MODES: &[Mode] = &[
@@ -6592,6 +6897,8 @@ const REAL_MODES: &[Mode] = &[
     Mode::Hashval,
     Mode::Stdlibexc,
     Mode::Containertail,
+    Mode::Binop,
+    Mode::Numproto,
 ];
 
 /// Generate the statement list for a seed in the selected mode. `Mixed` rotates
@@ -6639,6 +6946,8 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Bytesops => gen_bytesops(seed),
         Mode::Bytestail => gen_bytestail(seed),
         Mode::Buffer => gen_buffer(seed),
+        Mode::Binop => gen_binop(seed),
+        Mode::Numproto => gen_numproto(seed),
         Mode::Format2 => gen_format2(seed),
         Mode::Strformat => gen_strformat(seed),
         Mode::Async => gen_async(seed),
@@ -6711,6 +7020,8 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Bytesops => "bytesops",
         Mode::Bytestail => "bytestail",
         Mode::Buffer => "buffer",
+        Mode::Binop => "binop",
+        Mode::Numproto => "numproto",
         Mode::Format2 => "format2",
         Mode::Strformat => "strformat",
         Mode::Async => "async",
@@ -6812,6 +7123,8 @@ fn mode_from_name(s: &str) -> Option<Mode> {
         Mode::Hashval,
         Mode::Stdlibexc,
         Mode::Containertail,
+        Mode::Binop,
+        Mode::Numproto,
     ];
     ALL.iter().copied().find(|&m| mode_name(m) == s)
 }
@@ -7080,7 +7393,8 @@ fn print_help() {
          --mode M         mixed (default; rotates all modes), arith, bignum,\n\
          floatfmt, strings, fstring, slice, listcomp, dictcomp,\n\
          setcomp, sorting, formatspec, boolint, ranges, strmeth,\n\
-         comparison, builtins, ternary, augassign, async, …\n\
+         comparison, builtins, ternary, augassign, async, binop,\n\
+         numproto, …\n\
          (each also accepted as a `--<mode>` shorthand)\n\
          --stderr         also require the normalized error line to match\n\
          --once           run a single case (seed) and print both outputs\n\

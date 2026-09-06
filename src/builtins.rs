@@ -2109,14 +2109,66 @@ enum Dunder {
 /// singleton. Only instance operands are consulted; a `NotImplemented` outcome
 /// means the caller should fall back (native op, identity, or `TypeError`).
 fn dispatch_binop(a: &Value, b: &Value, lname: &str, rname: &str) -> Dunder {
-    if with_host(|h| is_instance_with(h, a, lname)) {
+    dispatch_dunder_pair(a, b, lname, rname, true)
+}
+
+/// The ARITHMETIC form of [`dispatch_binop`]: identical, except that two
+/// operands of the SAME type never consult the reflected dunder.
+///
+/// CPython splits here. `binary_op1` clears the right slot outright when
+/// `Py_TYPE(v) == Py_TYPE(w)` — one type cannot need to be asked twice about a
+/// pair it already declined — so `A() + A()` with `__add__` returning
+/// `NotImplemented` raises even though `__radd__` exists, and a class defining
+/// ONLY `__radd__` cannot add itself to itself. `do_richcompare` has no such
+/// rule: `B() < B()` really does try `__lt__` and then `__gt__`. Running the
+/// comparison rule for arithmetic answered where CPython raises.
+fn dispatch_arith(a: &Value, b: &Value, lname: &str, rname: &str) -> Dunder {
+    dispatch_dunder_pair(a, b, lname, rname, false)
+}
+
+fn dispatch_dunder_pair(
+    a: &Value,
+    b: &Value,
+    lname: &str,
+    rname: &str,
+    same_type_reflects: bool,
+) -> Dunder {
+    // ONE host borrow decides the whole plan. Every question here — does either
+    // side define its half, are the two the same type, does the right one take
+    // priority — reads the same class table, and asking them separately took a
+    // thread-local borrow apiece on a path that runs for every operator
+    // application involving an instance.
+    let (has_fwd, mut has_refl, refl_first) = with_host(|h| {
+        let has_fwd = is_instance_with(h, a, lname);
+        let same = same_instance_type(h, a, b);
+        if !same_type_reflects && same {
+            return (has_fwd, false, false);
+        }
+        (
+            has_fwd,
+            is_instance_with(h, b, rname),
+            reflected_first(h, a, b, rname),
+        )
+    });
+    // CPython's subclass-priority rule: the RIGHT operand goes first when its
+    // type is a proper subclass of the left's AND overrides the reflected slot.
+    if refl_first {
+        match host::call_method(b, rname, vec![a.clone()], vec![]) {
+            Ok(v) if is_not_implemented(&v) => {}
+            Ok(v) => return Dunder::Value(v),
+            Err(e) => return Dunder::Err(e),
+        }
+        // The reflected half already declined; CPython does not retry it.
+        has_refl = false;
+    }
+    if has_fwd {
         match host::call_method(a, lname, vec![b.clone()], vec![]) {
             Ok(v) if is_not_implemented(&v) => {}
             Ok(v) => return Dunder::Value(v),
             Err(e) => return Dunder::Err(e),
         }
     }
-    if with_host(|h| is_instance_with(h, b, rname)) {
+    if has_refl {
         match host::call_method(b, rname, vec![a.clone()], vec![]) {
             Ok(v) if is_not_implemented(&v) => {}
             Ok(v) => return Dunder::Value(v),
@@ -2124,6 +2176,47 @@ fn dispatch_binop(a: &Value, b: &Value, lname: &str, rname: &str) -> Dunder {
         }
     }
     Dunder::NotImplemented
+}
+
+/// Are both operands instances of the SAME class?
+fn same_instance_type(h: &host::PyHost, a: &Value, b: &Value) -> bool {
+    match (h.get(a), h.get(b)) {
+        (Some(PyObj::Instance(x)), Some(PyObj::Instance(y))) => x.class == y.class,
+        _ => false,
+    }
+}
+
+/// Does `b`'s reflected dunder run BEFORE `a`'s forward one?
+///
+/// CPython's `SLOT1BINFULL` (Objects/typeobject.c) and `do_richcompare`
+/// (Objects/object.c) both give the right operand the first move when its type
+/// is a PROPER subclass of the left's *and* that subclass overrides the
+/// reflected method — so a subclass can answer for a pair its base would have
+/// claimed. `A() + C()` with `class C(A)` defining `__radd__` runs `C.__radd__`
+/// and never reaches `A.__add__`; without the rule the base wins every time and
+/// a subclass cannot intercept its own operations.
+///
+/// "Overrides" is CPython's `method_is_overloaded`: the right type must resolve
+/// the name to a DIFFERENT object than the left type does (inheriting the same
+/// function from the base is not an override, and must not reorder anything).
+fn reflected_first(h: &host::PyHost, a: &Value, b: &Value, rname: &str) -> bool {
+    let (Some(PyObj::Instance(ai)), Some(PyObj::Instance(bi))) = (h.get(a), h.get(b)) else {
+        return false;
+    };
+    if ai.class == bi.class {
+        return false;
+    }
+    // A proper subclass: `a`'s class appears in `b`'s MRO.
+    if !h.mro_rc(&bi.class).iter().any(|c| c == &ai.class) {
+        return false;
+    }
+    let Some(bm) = h.class_lookup(&bi.class, rname) else {
+        return false;
+    };
+    match h.class_lookup(&ai.class, rname) {
+        None => true,
+        Some(am) => !identity_eq(&am, &bm),
+    }
 }
 
 /// Python operator overloading for the non-native `BINOP` tags (`//`, `%`, `&`,
@@ -2308,7 +2401,7 @@ fn try_binop_dunder(
     if !involved {
         return None;
     }
-    match dispatch_binop(a, b, lname, rname) {
+    match dispatch_arith(a, b, lname, rname) {
         Dunder::Value(v) => Some(Ok(v)),
         Dunder::Err(e) => Some(Err(e)),
         Dunder::NotImplemented => {
@@ -2351,6 +2444,57 @@ fn repeat_with_index(a: &Value, b: &Value) -> bool {
     with_host(|h| {
         (h.is_sequence_for_repeat(a) && has_index(h, b))
             || (h.is_sequence_for_repeat(b) && has_index(h, a))
+    })
+}
+
+/// CPython's SEQUENCE-specific wording for a `+` or `*` no dunder answered.
+///
+/// A sequence does not report a failed concatenation or repetition as an
+/// unsupported operand pair: `[1] + obj` is `can only concatenate list (not
+/// "T") to list`, `b'' + obj` is `can't concat T to bytes`, and a repeat by a
+/// non-integer is `can't multiply sequence by non-int of type 'T'` whichever
+/// side the sequence is on. Only the sequence-on-the-LEFT case is special for
+/// `+` — `obj + [1]` keeps the generic message, which is why the concat arm
+/// checks one side and the repeat arm both.
+fn sequence_op_error(op: NumOp, a: &Value, b: &Value) -> Option<String> {
+    /// `Some(type name)` when the value is a builtin sequence.
+    fn seq_name(h: &host::PyHost, v: &Value) -> Option<&'static str> {
+        if matches!(v, Value::Str(_)) {
+            return Some("str");
+        }
+        Some(match h.get(v)? {
+            PyObj::List(_) => "list",
+            PyObj::Tuple(_) => "tuple",
+            PyObj::Str(_) => "str",
+            PyObj::Bytes(_) => "bytes",
+            PyObj::Bytearray(_) => "bytearray",
+            _ => return None,
+        })
+    }
+    let int_like = |h: &host::PyHost, v: &Value| {
+        matches!(v, Value::Int(_) | Value::Bool(_)) || matches!(h.get(v), Some(PyObj::BigInt(_)))
+    };
+    with_host(|h| match op {
+        NumOp::Mul => {
+            let other = match (seq_name(h, a), seq_name(h, b)) {
+                (Some(_), _) if !int_like(h, b) => b,
+                (_, Some(_)) if !int_like(h, a) => a,
+                _ => return None,
+            };
+            Some(host::type_error(&format!(
+                "can't multiply sequence by non-int of type '{}'",
+                h.type_name(other)
+            )))
+        }
+        NumOp::Add => {
+            let t = seq_name(h, a)?;
+            let other = h.type_name(b);
+            Some(host::type_error(&match t {
+                "bytes" | "bytearray" => format!("can't concat {other} to {t}"),
+                _ => format!("can only concatenate {t} (not \"{other}\") to {t}"),
+            }))
+        }
+        _ => None,
     })
 }
 
@@ -2522,10 +2666,36 @@ fn iop_symbol(tag: i64) -> &'static str {
     }
 }
 
+/// Re-word a binary failure as the AUGMENTED one CPython reports.
+///
+/// `x >>= y` that no dunder answers is `unsupported operand type(s) for >>=`,
+/// not `for >>` — the binary fallback is an implementation detail of `>>=`, and
+/// naming it leaks that detail into the message for all thirteen operators.
+/// `**` is also spelled `** or pow()` in the binary message and plainly `**=`
+/// in the augmented one, so the rewrite matches on the binary text rather than
+/// assuming the glyph is the augmented one minus its `=`.
+fn as_inplace_error(tag: i64, e: String) -> String {
+    let Some(rest) = e.strip_prefix("TypeError: unsupported operand type(s) for ") else {
+        return e;
+    };
+    match rest.split_once(": ") {
+        Some((_, tail)) => format!(
+            "TypeError: unsupported operand type(s) for {}: {tail}",
+            iop_symbol(tag)
+        ),
+        None => e,
+    }
+}
+
 /// The `x op= y` binary fallback: `x = x op y`. `+`/`-`/`*` route through the
 /// numeric hook (so a user `__add__`/`__radd__` still fires); the rest mirror
 /// `b_binop`'s non-native dispatch (instance dunder, `str %`, then the host op).
+/// Whatever it refuses is reported under the AUGMENTED operator's name.
 fn inplace_binary_fallback(tag: i64, a: &Value, b: &Value) -> Result<Value, String> {
+    inplace_binary_inner(tag, a, b).map_err(|e| as_inplace_error(tag, e))
+}
+
+fn inplace_binary_inner(tag: i64, a: &Value, b: &Value) -> Result<Value, String> {
     use host::iop;
     let btag = match tag {
         iop::ADD => return numeric_hook(NumOp::Add, a, b),
@@ -3892,10 +4062,11 @@ fn numeric_hook_inner(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> 
         // Arithmetic: forward/reflected dunder, else unsupported-operand TypeError.
         Add | Sub | Mul | Div | Mod | Pow => {
             let (l, r) = numop_dunders(op).unwrap();
-            match dispatch_binop(a, b, l, r) {
+            match dispatch_arith(a, b, l, r) {
                 Dunder::Value(v) => Ok(v),
                 Dunder::Err(e) => Err(e),
-                Dunder::NotImplemented => Err(unsupported_operand(binop_symbol(l), a, b)),
+                Dunder::NotImplemented => Err(sequence_op_error(op, a, b)
+                    .unwrap_or_else(|| unsupported_operand(binop_symbol(l), a, b))),
             }
         }
     }
@@ -5386,7 +5557,16 @@ pub fn call_builtin_function(
             if let Some(r) = try_binop_dunder(&a, &b, "__divmod__", "__rdivmod__") {
                 return r;
             }
-            let q = with_host(|h| h.binop(host::binop::FLOORDIV, &a, &b))?;
+            // The native pair still computes the answer, but its refusal names
+            // the operator the caller wrote: an unsupported pair is
+            // `unsupported operand type(s) for divmod():`, never `for //:`.
+            let name_it = |e: String| {
+                e.replace(
+                    "unsupported operand type(s) for //:",
+                    "unsupported operand type(s) for divmod():",
+                )
+            };
+            let q = with_host(|h| h.binop(host::binop::FLOORDIV, &a, &b)).map_err(name_it)?;
             let r = with_host(|h| h.binop(host::binop::MOD, &a, &b))?;
             Ok(with_host(|h| h.new_tuple(vec![q, r])))
         }
@@ -5977,10 +6157,16 @@ pub fn call_builtin_function(
             // `complex("1+2j")` — string parsing (single string arg only).
             if let Some(first) = args.first() {
                 if let Some(s) = with_host(|h| h.as_str(first)) {
+                    // Only the ONE-argument form parses a string. With a second
+                    // argument the first must be a REAL, so a string is refused
+                    // there rather than parsed — which is what CPython 3.14
+                    // reports: the "can't take second arg" message is the 3.9
+                    // wording and no longer appears.
                     if args.len() > 1 {
-                        return Err(host::type_error(
-                            "complex() can't take second arg if first is a string",
-                        ));
+                        return Err(host::type_error(&format!(
+                            "complex() argument 'real' must be a real number, not {}",
+                            with_host(|h| h.type_name(first))
+                        )));
                     }
                     let (r, i) = parse_complex(&s)?;
                     return Ok(with_host(|h| h.alloc(PyObj::Complex(r, i))));
@@ -5995,12 +6181,19 @@ pub fn call_builtin_function(
                     }
                 }
             }
-            let r = args
-                .first()
-                .and_then(|v| with_host(|h| h.as_int(v)).map(|n| n as f64).or(as_f(v)))
-                .unwrap_or(0.0);
-            let i = args.get(1).and_then(as_f).unwrap_or(0.0);
-            Ok(with_host(|h| h.alloc(PyObj::Complex(r, i))))
+            // `complex(x)` is a protocol, not a cast: `__complex__` first, then
+            // the real coercion (`__float__`, `__index__`). Reading it as
+            // `as_f(v).unwrap_or(0.0)` made every object that defines any of
+            // them — and every object that defines none — answer `0j`.
+            let (r, ri) = match args.first() {
+                Some(v) => complex_parts(v, args.len() > 1)?,
+                None => (0.0, 0.0),
+            };
+            let i = match args.get(1) {
+                Some(v) => complex_imag(v)?,
+                None => 0.0,
+            };
+            Ok(with_host(|h| h.alloc(PyObj::Complex(r, i + ri))))
         }
         "bytes" => {
             let b = build_bytes(&args)?;
@@ -6331,10 +6524,81 @@ fn run_pysource(want_value: bool, args: &[Value]) -> Result<Value, String> {
         with_host(|h| h.swap_module(saved_mod));
     }
     with_host(|h| h.restore_scope(parked));
-    if let Some(saved) = overlay_saved {
+    if let Some(mut saved) = overlay_saved {
+        // An in-function `exec` discards its writes because they belong to the
+        // caller's LOCALS mapping — but a `global` declaration in the exec'd
+        // source retargets the write at the module globals, which persist.
+        // Dropping those too made `def f(): exec("global x\nx = 9")` a silent
+        // no-op, and no amount of exec'ing could ever set a module global from
+        // inside a function.
+        for name in exec_global_names(&to_compile) {
+            if let Some(v) = with_host(|h| {
+                h.globals_pairs()
+                    .into_iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| v)
+            }) {
+                saved.insert(name, v);
+            }
+        }
         with_host(|h| h.replace_globals(saved));
     }
     result
+}
+
+/// The names an `exec`'d source declares `global`, in the statements that RUN
+/// when it is exec'd.
+///
+/// A `global` inside a `def` in that source is the nested function's own
+/// declaration and takes effect when IT is called, not here — so function
+/// bodies are not walked. A class body does execute, so it is.
+fn exec_global_names(src: &str) -> Vec<String> {
+    fn walk(stmts: &[crate::ast::Stmt], out: &mut Vec<String>) {
+        use crate::ast::StmtKind::*;
+        for st in stmts {
+            match &st.kind {
+                Global(names) => out.extend(names.iter().cloned()),
+                If { body, orelse, .. } | While { body, orelse, .. } => {
+                    walk(body, out);
+                    walk(orelse, out);
+                }
+                For { body, orelse, .. } => {
+                    walk(body, out);
+                    walk(orelse, out);
+                }
+                With { body, .. } | ClassDef { body, .. } => walk(body, out),
+                Try {
+                    body,
+                    handlers,
+                    orelse,
+                    finalbody,
+                } => {
+                    walk(body, out);
+                    for h in handlers {
+                        walk(&h.body, out);
+                    }
+                    walk(orelse, out);
+                    walk(finalbody, out);
+                }
+                Match { cases, .. } => {
+                    for c in cases {
+                        walk(&c.body, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    // Re-parsing costs nothing to skip when the keyword cannot be there, and
+    // this runs on every in-function `exec`.
+    if !src.contains("global") {
+        return out;
+    }
+    if let Ok(stmts) = crate::parser::parse(src) {
+        walk(&stmts, &mut out);
+    }
+    out
 }
 
 /// Build a `dict` from string-keyed `(name, value)` pairs — the shape returned by
@@ -7059,6 +7323,59 @@ fn parse_py_float(s: &str) -> Option<f64> {
     }
 }
 
+/// The `(real, imag)` a `complex()` FIRST argument contributes.
+///
+/// CPython's `complex_new`: `__complex__` wins (and may contribute an imaginary
+/// part), then the real coercion. `two_args` selects the refusal wording — with
+/// a second argument the first must be a REAL, so a string is refused there
+/// (`argument 'real' must be a real number`) instead of being parsed.
+fn complex_parts(v: &Value, two_args: bool) -> Result<(f64, f64), String> {
+    if let Some(rc) = with_host(|h| match h.get(v) {
+        Some(PyObj::Complex(r, i)) => Some((*r, *i)),
+        _ => None,
+    }) {
+        return Ok(rc);
+    }
+    let has_complex = with_host(
+        |h| matches!(h.get(v), Some(PyObj::Instance(i)) if instance_has(h, i, "__complex__")),
+    );
+    if has_complex {
+        let r = host::call_method(v, "__complex__", vec![], vec![])?;
+        return with_host(|h| match h.get(&r) {
+            Some(PyObj::Complex(re, im)) => Ok((*re, *im)),
+            _ => Err(host::type_error(&format!(
+                "__complex__ returned non-complex (type {})",
+                h.type_name(&r)
+            ))),
+        });
+    }
+    match math_real(v) {
+        Ok(f) => Ok((f, 0.0)),
+        // With a second argument the first is a REAL, not a "string or a
+        // number": `complex('1', 1)` names `'real'` rather than reporting a
+        // string it would have parsed had it stood alone.
+        Err(_) if two_args => Err(host::type_error(&format!(
+            "complex() argument 'real' must be a real number, not {}",
+            with_host(|h| h.type_name(v))
+        ))),
+        Err(_) => Err(host::type_error(&format!(
+            "complex() argument must be a string or a number, not {}",
+            with_host(|h| h.type_name(v))
+        ))),
+    }
+}
+
+/// The `complex()` SECOND argument, which must be real — a `__complex__` object
+/// is refused there outright, with `imag` named in the message.
+fn complex_imag(v: &Value) -> Result<f64, String> {
+    math_real(v).map_err(|_| {
+        host::type_error(&format!(
+            "complex() argument 'imag' must be a real number, not {}",
+            with_host(|h| h.type_name(v))
+        ))
+    })
+}
+
 fn construct_float(args: &[Value]) -> Result<Value, String> {
     let v = match args.first() {
         Some(v) => v.clone(),
@@ -7079,8 +7396,10 @@ fn construct_float(args: &[Value]) -> Result<Value, String> {
         let ok = matches!(r, Value::Float(_));
         if !ok {
             let t = with_host(|h| h.type_name(&r));
+            // CPython names the defining type: "Fl.__float__ returned …".
+            let owner = with_host(|h| h.type_name(&v));
             return Err(host::type_error(&format!(
-                "__float__ returned non-float (type {t})"
+                "{owner}.__float__ returned non-float (type {t})"
             )));
         }
         return Ok(r);
@@ -7120,12 +7439,27 @@ fn construct_float(args: &[Value]) -> Result<Value, String> {
             }
         }
         _ => {
-            let s = h.as_str(&v).ok_or_else(|| {
-                host::type_error(&format!(
-                    "float() argument must be a string or a real number, not '{}'",
-                    h.type_name(&v)
-                ))
-            })?;
+            // `float()` reads a BYTES/BYTEARRAY buffer as the numeric string it
+            // spells, exactly as `int()` already did — `float(b'1.5')` is 1.5,
+            // and a bad one is a ValueError quoting the bytes repr, not a
+            // TypeError about the type.
+            let bytes = match h.get(&v) {
+                Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) => {
+                    Some(b.iter().map(|&c| c as char).collect::<String>())
+                }
+                _ => None,
+            };
+            let shown = bytes.as_ref().map(|_| h.repr_of(&v));
+            let s = match bytes {
+                Some(b) => b,
+                None => h.as_str(&v).ok_or_else(|| {
+                    host::type_error(&format!(
+                        "float() argument must be a string or a real number, not '{}'",
+                        h.type_name(&v)
+                    ))
+                })?,
+            };
+            let shown = shown.unwrap_or_else(|| format!("'{s}'"));
             // Underscores may group digits (`float("1_000.5")`).
             let cleaned = s.trim().replace('_', "");
             match cleaned.as_str() {
@@ -7137,7 +7471,7 @@ fn construct_float(args: &[Value]) -> Result<Value, String> {
                 t => t
                     .parse::<f64>()
                     .map(Value::Float)
-                    .map_err(|_| format!("ValueError: could not convert string to float: '{s}'")),
+                    .map_err(|_| format!("ValueError: could not convert string to float: {shown}")),
             }
         }
     })
@@ -9626,14 +9960,308 @@ fn math_domain_error(name: &str, x: f64, args: &[Value]) -> Option<String> {
             "expected a number between -1 and 1, got {}",
             math_arg_repr(x)
         ),
-        // The gamma pole: every non-positive integer, and -inf.
-        "gamma" | "lgamma" if x <= 0.0 && (x.fract() == 0.0 || x == f64::NEG_INFINITY) => format!(
+        // The gamma pole: every non-positive integer. `-inf` is a domain error
+        // for `gamma` only — `lgamma` is the log of a MAGNITUDE, and CPython's
+        // `m_lgamma` answers `+inf` for either infinity before it looks at the
+        // sign. Refusing it was pythonrs' own rule, not CPython's.
+        "gamma" if x == f64::NEG_INFINITY => format!(
+            "expected a noninteger or positive integer, got {}",
+            math_arg_repr(x)
+        ),
+        "gamma" | "lgamma" if x <= 0.0 && x.fract() == 0.0 => format!(
             "expected a noninteger or positive integer, got {}",
             math_arg_repr(x)
         ),
         _ => return None,
     };
     Some(format!("ValueError: {msg}"))
+}
+
+/// `erf` as the PLATFORM computes it, which is what CPython computes.
+///
+/// CPython 3.14 declares the module function as `FUNC1A(erf, erf, …)` — the C
+/// library's `erf`, with no implementation of its own (the series fallback that
+/// older versions carried is gone). The pure-Rust `libm` crate is a different
+/// approximation, and it disagreed in the last place on 312 of 1201 sampled
+/// points across `[-6, 6]`, `erfc` on 390. Calling the same libm CPython links
+/// removes the whole class rather than narrowing it.
+#[cfg(unix)]
+fn platform_erf(x: f64) -> f64 {
+    unsafe extern "C" {
+        fn erf(x: f64) -> f64;
+    }
+    unsafe { erf(x) }
+}
+
+/// `erfc` from the platform, for the same reason as [`platform_erf`].
+#[cfg(unix)]
+fn platform_erfc(x: f64) -> f64 {
+    unsafe extern "C" {
+        fn erfc(x: f64) -> f64;
+    }
+    unsafe { erfc(x) }
+}
+
+/// Off unix there is no libm to name, so the pure-Rust one stands in — a last-
+/// place disagreement with CPython, not a wrong answer.
+#[cfg(not(unix))]
+fn platform_erf(x: f64) -> f64 {
+    libm::erf(x)
+}
+
+#[cfg(not(unix))]
+fn platform_erfc(x: f64) -> f64 {
+    libm::erfc(x)
+}
+
+/// The Lanczos parameters CPython's gamma uses (`Modules/mathmodule.c`), N=13
+/// and g=6.024680040776729583740234375 — the Boost parameters, with the
+/// coefficients recomputed under MPFR.
+const LANCZOS_N: usize = 13;
+const LANCZOS_G: f64 = 6.024680040776729583740234375;
+const LANCZOS_G_MINUS_HALF: f64 = 5.524680040776729583740234375;
+const LANCZOS_NUM_COEFFS: [f64; LANCZOS_N] = [
+    23531376880.410759688572007674451636754734846804940,
+    42919803642.649098768957899047001988850926355848959,
+    35711959237.355668049440185451547166705960488635843,
+    17921034426.037209699919755754458931112671403265390,
+    6039542586.3520280050642916443072979210699388420708,
+    1439720407.3117216736632230727949123939715485786772,
+    248874557.86205415651146038641322942321632125127801,
+    31426415.585400194380614231628318205362874684987640,
+    2876370.6289353724412254090516208496135991145378768,
+    186056.26539522349504029498971604569928220784236328,
+    8071.6720023658162106380029022722506138218516325024,
+    210.82427775157934587250973392071336271166969580291,
+    2.5066282746310002701649081771338373386264310793408,
+];
+/// The denominator is `x*(x+1)*…*(x+LANCZOS_N-2)`, expanded.
+const LANCZOS_DEN_COEFFS: [f64; LANCZOS_N] = [
+    0.0,
+    39916800.0,
+    120543840.0,
+    150917976.0,
+    105258076.0,
+    45995730.0,
+    13339535.0,
+    2637558.0,
+    357423.0,
+    32670.0,
+    1925.0,
+    66.0,
+    1.0,
+];
+/// `gamma(n)` for the small positive integers, answered exactly rather than
+/// through the approximation.
+const GAMMA_INTEGRAL: [f64; 23] = [
+    1.0,
+    1.0,
+    2.0,
+    6.0,
+    24.0,
+    120.0,
+    720.0,
+    5040.0,
+    40320.0,
+    362880.0,
+    3628800.0,
+    39916800.0,
+    479001600.0,
+    6227020800.0,
+    87178291200.0,
+    1307674368000.0,
+    20922789888000.0,
+    355687428096000.0,
+    6402373705728000.0,
+    121645100408832000.0,
+    2432902008176640000.0,
+    51090942171709440000.0,
+    1124000727777607680000.0,
+];
+const MATH_LOGPI: f64 = 1.144729885849400174143427351353058711647;
+
+/// `a*b + c` the way the C COMPILER that built CPython evaluates it.
+///
+/// This is not a micro-optimization, it is the difference between agreeing with
+/// CPython and being one ulp out. Clang contracts a multiply-add within a single
+/// statement into an FMA by default (`-ffp-contract=on`), so every
+/// `num = num*x + coeff` in `lanczos_sum` is ONE rounding in CPython and two in
+/// a straight Rust translation. Porting the arithmetic without the contraction
+/// left `math.gamma` disagreeing on 524 of 1194 sampled points across
+/// `[-6, 6]`, and `math.lgamma` on 637; contracting took both to zero.
+///
+/// The contraction is applied exactly where the target guarantees the
+/// instruction. FMA is in the ARMv8 base ISA, so clang always contracts there —
+/// measured, this is the machine the zero above was taken on. Baseline x86-64
+/// has no FMA3, so clang emits a separate multiply and add and matching CPython
+/// there means NOT fusing (`f64::mul_add` would fuse anyway, in software, and
+/// introduce the divergence it is meant to remove). Unverified on x86-64: no
+/// such machine was available to measure.
+#[inline]
+fn fp_contract(a: f64, b: f64, c: f64) -> f64 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        a.mul_add(b, c)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        a * b + c
+    }
+}
+
+/// Lanczos' sum `L_g(x)` for positive `x`, as the rational function CPython
+/// evaluates it: in `x` below 5.0, and in `1/x` above, which is what keeps the
+/// numerator from overflowing for large arguments.
+fn lanczos_sum(x: f64) -> f64 {
+    let mut num = 0.0f64;
+    let mut den = 0.0f64;
+    if x < 5.0 {
+        for i in (0..LANCZOS_N).rev() {
+            num = fp_contract(num, x, LANCZOS_NUM_COEFFS[i]);
+            den = fp_contract(den, x, LANCZOS_DEN_COEFFS[i]);
+        }
+    } else {
+        for i in 0..LANCZOS_N {
+            num = num / x + LANCZOS_NUM_COEFFS[i];
+            den = den / x + LANCZOS_DEN_COEFFS[i];
+        }
+    }
+    num / den
+}
+
+/// `sin(pi*x)` computed on the reduced argument, so the reflection formula stays
+/// accurate near the poles instead of losing the argument to `pi`'s rounding.
+fn m_sinpi(x: f64) -> f64 {
+    let y = x.abs() % 2.0;
+    let n = (2.0 * y).round() as i32;
+    let pi = std::f64::consts::PI;
+    let r = match n {
+        0 => (pi * y).sin(),
+        1 => (pi * (y - 0.5)).cos(),
+        // `-sin(pi*(y-1.0))` is NOT equivalent: it gives -0.0 where y == 1.0.
+        2 => (pi * (1.0 - y)).sin(),
+        3 => -(pi * (y - 1.5)).cos(),
+        _ => (pi * (y - 2.0)).sin(),
+    };
+    1.0f64.copysign(x) * r
+}
+
+/// CPython's real gamma function, ported from `m_tgamma` in
+/// `Modules/mathmodule.c`.
+///
+/// CPython does NOT call libm's `tgamma`: it ships its own because the platform
+/// ones (Windows, macOS) are not accurate enough (gh-70309). So matching
+/// CPython means running the same code — the pure-Rust `libm` crate's `tgamma`
+/// disagreed in the last place on 907 of 1194 sampled points across `[-6, 6]`,
+/// and the SYSTEM `tgamma` on 818, because neither is the algorithm CPython
+/// runs. The domain and range errors are raised by the callers
+/// ([`math_domain_error`], [`math_range_checked`]), which is where CPython's
+/// `errno` handling lands.
+fn m_tgamma(x: f64) -> f64 {
+    if !x.is_finite() {
+        // tgamma(nan) = nan, tgamma(inf) = inf, tgamma(-inf) = nan (EDOM).
+        return if x.is_nan() || x > 0.0 { x } else { f64::NAN };
+    }
+    if x == 0.0 {
+        // tgamma(+-0.0) = +-inf, divide-by-zero.
+        return f64::INFINITY.copysign(x);
+    }
+    if x == x.floor() {
+        if x < 0.0 {
+            return f64::NAN; // the poles at the negative integers
+        }
+        if x <= GAMMA_INTEGRAL.len() as f64 {
+            return GAMMA_INTEGRAL[x as usize - 1];
+        }
+    }
+    let absx = x.abs();
+    // Tiny arguments: gamma(x) ~ 1/x near zero.
+    if absx < 1e-20 {
+        return 1.0 / x;
+    }
+    // Large arguments: gamma overflows past 200, and underflows to +-0.0 below
+    // -200 for anything that is not a negative integer.
+    if absx > 200.0 {
+        return if x < 0.0 {
+            0.0 / m_sinpi(x)
+        } else {
+            f64::INFINITY
+        };
+    }
+    let y = absx + LANCZOS_G_MINUS_HALF;
+    // The error in `y`, recovered by subtracting back the larger operand first.
+    // The correction is what a naive `pow(x+g-0.5, x-0.5)/exp(x+g-0.5)` throws
+    // away, and it is worth several ulps for large arguments.
+    let mut z = if absx > LANCZOS_G_MINUS_HALF {
+        let q = y - absx;
+        q - LANCZOS_G_MINUS_HALF
+    } else {
+        let q = y - LANCZOS_G_MINUS_HALF;
+        q - absx
+    };
+    z = z * LANCZOS_G / y;
+    let mut r;
+    if x < 0.0 {
+        r = -std::f64::consts::PI / m_sinpi(absx) / absx * y.exp() / lanczos_sum(absx);
+        r = fp_contract(-z, r, r);
+        if absx < 140.0 {
+            r /= y.powf(absx - 0.5);
+        } else {
+            // Past 140 the single `pow` overflows, so it is taken in halves.
+            let sqrtpow = y.powf(absx / 2.0 - 0.25);
+            r /= sqrtpow;
+            r /= sqrtpow;
+        }
+    } else {
+        r = lanczos_sum(absx) / y.exp();
+        r = fp_contract(z, r, r);
+        if absx < 140.0 {
+            r *= y.powf(absx - 0.5);
+        } else {
+            let sqrtpow = y.powf(absx / 2.0 - 0.25);
+            r *= sqrtpow;
+            r *= sqrtpow;
+        }
+    }
+    r
+}
+
+/// CPython's `m_lgamma`: the natural log of `|gamma(x)|`, where Lanczos' formula
+/// works well across the whole domain. Ported for the same reason as
+/// [`m_tgamma`] — CPython does not call the platform's `lgamma` either.
+fn m_lgamma(x: f64) -> f64 {
+    if !x.is_finite() {
+        // lgamma(nan) = nan, lgamma(+-inf) = +inf.
+        return if x.is_nan() { x } else { f64::INFINITY };
+    }
+    if x == x.floor() && x <= 2.0 {
+        // The poles at the non-positive integers; lgamma(1) == lgamma(2) == 0.
+        return if x <= 0.0 { f64::INFINITY } else { 0.0 };
+    }
+    let absx = x.abs();
+    // Tiny arguments: lgamma(x) ~ -log(|x|).
+    if absx < 1e-20 {
+        return -absx.ln();
+    }
+    let mut r = lanczos_sum(absx).ln() - LANCZOS_G;
+    r = fp_contract(absx - 0.5, (absx + LANCZOS_G - 0.5).ln() - 1.0, r);
+    if x < 0.0 {
+        // The reflection formula carries it to the negative half-line.
+        r = MATH_LOGPI - m_sinpi(absx).abs().ln() - absx.ln() - r;
+    }
+    r
+}
+
+/// The `ValueError` `math.fmod`/`math.remainder` raise for a pair C's `fmod`
+/// answers with a NaN: an infinite dividend, or a zero divisor.
+///
+/// Both were returning that NaN, so `math.fmod(1, 0)` answered `nan` where
+/// CPython raises. A NaN OPERAND is not a domain error — it propagates.
+fn mod_domain_error(x: f64, y: f64) -> Option<String> {
+    if x.is_nan() || y.is_nan() {
+        return None;
+    }
+    (x.is_infinite() || y == 0.0).then(|| "ValueError: math domain error".to_string())
 }
 
 /// `OverflowError: math range error` when a FINITE argument produced an infinite
@@ -9646,10 +10274,187 @@ fn math_range_checked(x: f64, out: f64) -> Result<Value, String> {
     Ok(Value::Float(out))
 }
 
+/// Every `math` function whose positional arguments are ALL real numbers, and
+/// which therefore coerces each one through CPython's `PyFloat_AsDouble`.
+///
+/// The list is explicit because the rest of the module does NOT take reals:
+/// `isqrt`/`gcd`/`lcm`/`factorial`/`comb`/`perm` take integers, `fsum`/`prod`/
+/// `dist`/`sumprod` take iterables, and `ldexp` takes a real and an integer.
+/// Coercing those would turn a correct integer error into a float one.
+const MATH_REAL_FNS: &[&str] = &[
+    "sqrt",
+    "fabs",
+    "sin",
+    "cos",
+    "tan",
+    "asin",
+    "acos",
+    "atan",
+    "sinh",
+    "cosh",
+    "tanh",
+    "asinh",
+    "acosh",
+    "atanh",
+    "exp",
+    "exp2",
+    "expm1",
+    "log",
+    "log2",
+    "log10",
+    "log1p",
+    "lgamma",
+    "gamma",
+    "erf",
+    "erfc",
+    "cbrt",
+    "degrees",
+    "radians",
+    "isnan",
+    "isinf",
+    "isfinite",
+    "atan2",
+    "hypot",
+    "copysign",
+    "fmod",
+    "remainder",
+    "pow",
+    "isclose",
+];
+
+/// One `math` argument as a C `double`, the way CPython's `PyFloat_AsDouble`
+/// reads it: a float or int as itself, anything else through `__float__` and
+/// then `__index__`, and a `TypeError` naming the type when neither exists.
+///
+/// The absence of this was a WRONG-ANSWER bug, not a missing error: every arm of
+/// `call_math` read its argument with `as_f(v).unwrap_or(0.0)`, so
+/// `math.sqrt("s")`, `math.cos(None)` and `math.exp(object())` all answered for
+/// the argument `0.0` instead of raising, and `math.sqrt(10**30)` — a perfectly
+/// valid call — answered `0.0` because a bignum is not an `i64` either.
+fn math_real(v: &Value) -> Result<f64, String> {
+    if let Some(f) = as_f(v) {
+        return Ok(f);
+    }
+    let coercible = with_host(|h| {
+        if matches!(h.get(v), Some(PyObj::BigInt(_))) {
+            return true;
+        }
+        #[cfg(feature = "stdlib-ffi")]
+        if h.foreign_id(v).is_some() {
+            return true;
+        }
+        matches!(h.get(v), Some(PyObj::Instance(i))
+            if instance_has(h, i, "__float__") || instance_has(h, i, "__index__"))
+    });
+    if coercible {
+        return match construct_float(std::slice::from_ref(v))? {
+            Value::Float(f) => Ok(f),
+            other => Ok(as_f(&other).unwrap_or(0.0)),
+        };
+    }
+    Err(host::type_error(&format!(
+        "must be real number, not {}",
+        with_host(|h| h.type_name(v))
+    )))
+}
+
+/// `math.floor` / `math.ceil` / `math.trunc`, which are protocol dispatchers
+/// rather than float functions.
+///
+/// CPython calls the type's `__floor__`/`__ceil__`/`__trunc__` when it defines
+/// one, answers an integer argument with the integer ITSELF (so
+/// `math.floor(10**30)` is exact rather than routed through a `double`), and
+/// only then falls back — to the `double` for floor/ceil, and to a `TypeError`
+/// for trunc, which has no fallback at all.
+fn math_round_to_int(name: &str, v: &Value) -> Result<Value, String> {
+    let dunder = match name {
+        "floor" => "__floor__",
+        "ceil" => "__ceil__",
+        _ => "__trunc__",
+    };
+    let has =
+        with_host(|h| matches!(h.get(v), Some(PyObj::Instance(i)) if instance_has(h, i, dunder)));
+    if has {
+        return host::call_method(v, dunder, vec![], vec![]);
+    }
+    // An integer is already the answer, and only this path keeps it exact.
+    let is_int = with_host(|h| {
+        matches!(v, Value::Int(_) | Value::Bool(_)) || matches!(h.get(v), Some(PyObj::BigInt(_)))
+    });
+    if is_int {
+        return Ok(match v {
+            Value::Bool(b) => Value::Int(*b as i64),
+            other => other.clone(),
+        });
+    }
+    if dunder == "__trunc__" {
+        // `math.trunc` is the one with no float fallback: CPython requires the
+        // slot and names the type when it is absent.
+        if !matches!(v, Value::Float(_)) {
+            return Err(host::type_error(&format!(
+                "type {} doesn't define __trunc__ method",
+                with_host(|h| h.type_name(v))
+            )));
+        }
+    }
+    let f = math_real(v)?;
+    let r = match name {
+        "floor" => f.floor(),
+        "ceil" => f.ceil(),
+        _ => f.trunc(),
+    };
+    Ok(with_host(|h| f64_to_int(h, r)))
+}
+
+/// One `math` argument as an exact integer, the way CPython's
+/// `PyNumber_Index` reads it: an int as itself, anything else through
+/// `__index__`, and a `TypeError` NAMING THE ARGUMENT'S type when there is none.
+///
+/// Both halves were wrong before. `isqrt`/`gcd`/`comb`/`perm` refused every
+/// `__index__` object CPython accepts, and each spelled its refusal
+/// `'float' object cannot be interpreted as an integer` whatever the argument
+/// actually was, so `math.isqrt("s")` blamed a float. `factorial` did not check
+/// at all: `as_int(v).unwrap_or(0)` answered `math.factorial(2.0)` with `1`.
+fn math_integer(v: &Value) -> Result<num_bigint::BigInt, String> {
+    if let Some(n) = with_host(|h| h.big_val(v)) {
+        return Ok(n);
+    }
+    if let Some(r) = index_dunder(v)? {
+        if let Some(n) = with_host(|h| h.big_val(&r)) {
+            return Ok(n);
+        }
+    }
+    Err(host::type_error(&format!(
+        "'{}' object cannot be interpreted as an integer",
+        with_host(|h| h.type_name(v))
+    )))
+}
+
 fn call_math(name: &str, args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, String> {
     if let Some(spec) = math_arity(name) {
         check_arity(name, &format!("math.{name}"), spec, args.len())?;
     }
+    if matches!(name, "floor" | "ceil" | "trunc") {
+        return math_round_to_int(name, args.first().unwrap_or(&Value::Undef));
+    }
+    // Coerce the real-valued arguments ONCE, up front, so every arm below reads
+    // a `Value::Float` and the `unwrap_or(0.0)` fallbacks are unreachable.
+    let coerced: Vec<Value>;
+    let args: &[Value] = if MATH_REAL_FNS.contains(&name) {
+        coerced = args
+            .iter()
+            .map(|v| math_real(v).map(Value::Float))
+            .collect::<Result<Vec<_>, _>>()?;
+        &coerced
+    } else if name == "ldexp" && !args.is_empty() {
+        // `ldexp(x, i)`: the mantissa is a real, the exponent an integer.
+        coerced = std::iter::once(Value::Float(math_real(&args[0])?))
+            .chain(args[1..].iter().cloned())
+            .collect();
+        &coerced
+    } else {
+        args
+    };
     let f0 = args.first().and_then(as_f).unwrap_or(0.0);
     // Domain and range checks. Rust's `f64` methods answer NaN or an infinity
     // where CPython raises, so every one of these used to return a value:
@@ -9662,8 +10467,6 @@ fn call_math(name: &str, args: &[Value], kwargs: &[(String, Value)]) -> Result<V
     }
     match name {
         "sqrt" => Ok(Value::Float(f0.sqrt())),
-        "floor" => Ok(with_host(|h| f64_to_int(h, f0.floor()))),
-        "ceil" => Ok(with_host(|h| f64_to_int(h, f0.ceil()))),
         "fabs" => Ok(Value::Float(f0.abs())),
         // PEP 485: symmetric relative tolerance, defaulting to 1e-09, with an
         // absolute floor of 0.0. Infinities are close only to themselves; NaN is
@@ -9697,8 +10500,23 @@ fn call_math(name: &str, args: &[Value], kwargs: &[(String, Value)]) -> Result<V
             let b = args.get(1).and_then(as_f).unwrap_or(0.0);
             // IEEE 754 remainder: r = a - n*b with n the NEAREST integer quotient
             // (ties to even), unlike `fmod`'s truncated one.
+            if let Some(e) = mod_domain_error(f0, b) {
+                return Err(e);
+            }
+            // A finite dividend against an infinite divisor is the dividend.
+            if b.is_infinite() {
+                return Ok(Value::Float(f0));
+            }
             let n = (f0 / b).round_ties_even();
-            Ok(Value::Float(f0 - n * b))
+            let r = f0 - n * b;
+            // An exact zero keeps the sign of the DIVIDEND (IEEE 754 §5.3.1):
+            // `math.remainder(-2.0, 2)` is `-0.0`, and subtraction alone
+            // produces `+0.0`.
+            Ok(Value::Float(if r == 0.0 {
+                0.0_f64.copysign(f0)
+            } else {
+                r
+            }))
         }
 
         "sin" => Ok(Value::Float(f0.sin())),
@@ -9719,16 +10537,16 @@ fn call_math(name: &str, args: &[Value], kwargs: &[(String, Value)]) -> Result<V
         "log2" => Ok(Value::Float(f0.log2())),
         "log10" => Ok(Value::Float(f0.log10())),
         "log1p" => Ok(Value::Float(f0.ln_1p())),
-        // Special functions Rust std lacks — pure-Rust libm keeps `math`
-        // self-contained (no C libm) on the no-libpython build.
-        "lgamma" => math_range_checked(f0, libm::lgamma(f0)),
-        "gamma" => math_range_checked(f0, libm::tgamma(f0)),
-        "erf" => Ok(Value::Float(libm::erf(f0))),
-        "erfc" => Ok(Value::Float(libm::erfc(f0))),
+        // Special functions Rust std lacks. `gamma`/`lgamma` are CPython's OWN
+        // implementations ([`m_tgamma`]/[`m_lgamma`]); `erf`/`erfc` are the
+        // platform's, which is what CPython 3.14 calls (`FUNC1A(erf, erf, …)`).
+        "lgamma" => math_range_checked(f0, m_lgamma(f0)),
+        "gamma" => math_range_checked(f0, m_tgamma(f0)),
+        "erf" => Ok(Value::Float(platform_erf(f0))),
+        "erfc" => Ok(Value::Float(platform_erfc(f0))),
         "cbrt" => Ok(Value::Float(f0.cbrt())),
         "degrees" => Ok(Value::Float(f0.to_degrees())),
         "radians" => Ok(Value::Float(f0.to_radians())),
-        "trunc" => Ok(with_host(|h| f64_to_int(h, f0.trunc()))),
         "isnan" => Ok(Value::Bool(f0.is_nan())),
         "isinf" => Ok(Value::Bool(f0.is_infinite())),
         "isfinite" => Ok(Value::Bool(f0.is_finite())),
@@ -9754,6 +10572,9 @@ fn call_math(name: &str, args: &[Value], kwargs: &[(String, Value)]) -> Result<V
         }
         "fmod" => {
             let f1 = args.get(1).and_then(as_f).unwrap_or(0.0);
+            if let Some(e) = mod_domain_error(f0, f1) {
+                return Err(e);
+            }
             // C `fmod`: result has the sign of the dividend (unlike Python `%`).
             Ok(Value::Float(f0 % f1))
         }
@@ -9763,9 +10584,7 @@ fn call_math(name: &str, args: &[Value], kwargs: &[(String, Value)]) -> Result<V
         }
         "isqrt" => {
             // Integer square root: floor(sqrt(n)) for a non-negative int, bignum-safe.
-            let n = with_host(|h| h.big_val(&args[0])).ok_or_else(|| {
-                host::type_error("'float' object cannot be interpreted as an integer")
-            })?;
+            let n = math_integer(&args[0])?;
             if n.sign() == num_bigint::Sign::Minus {
                 return Err("ValueError: isqrt() argument must be nonnegative".into());
             }
@@ -9803,18 +10622,39 @@ fn call_math(name: &str, args: &[Value], kwargs: &[(String, Value)]) -> Result<V
             use num_integer::Integer;
             let mut acc = num_bigint::BigInt::from(0);
             for a in args {
-                let n = with_host(|h| h.big_val(a)).ok_or_else(|| {
-                    host::type_error("'float' object cannot be interpreted as an integer")
-                })?;
+                let n = math_integer(a)?;
                 acc = acc.gcd(&n);
             }
             Ok(with_host(|h| h.norm_big(acc)))
         }
+        "lcm" => {
+            // `math.lcm(*integers)` — CPython 3.9+. It had no native arm at all,
+            // so it fell through to the CPython bridge, where a pythonrs
+            // instance arrives as an opaque proxy: `math.lcm(Idx(), 2)` refused
+            // an `__index__` object gcd accepts, blaming `'builtins.PyrsInstance'`.
+            use num_integer::Integer;
+            let mut acc = num_bigint::BigInt::from(1);
+            for a in args {
+                let n = math_integer(a)?;
+                if n.sign() == num_bigint::Sign::NoSign {
+                    return Ok(Value::Int(0));
+                }
+                acc = acc.lcm(&n);
+            }
+            Ok(with_host(|h| h.norm_big(acc)))
+        }
         "factorial" => {
-            let n = with_host(|h| h.as_int(&args[0])).unwrap_or(0);
-            if n < 0 {
+            use num_traits::ToPrimitive as _;
+            let big = math_integer(&args[0])?;
+            // The SIGN is checked before the magnitude: CPython reports
+            // `factorial(-(10**30))` as a negative value, not as an overflow.
+            if big.sign() == num_bigint::Sign::Minus {
                 return Err("ValueError: factorial() not defined for negative values".into());
             }
+            let n = big.to_i64().ok_or_else(|| {
+                "OverflowError: factorial() argument should not exceed 9223372036854775807"
+                    .to_string()
+            })?;
             let mut acc = num_bigint::BigInt::from(1);
             for i in 2..=n {
                 acc *= i;
@@ -9914,18 +10754,23 @@ fn call_math(name: &str, args: &[Value], kwargs: &[(String, Value)]) -> Result<V
         "comb" | "perm" => {
             use num_bigint::BigInt;
             use num_traits::{ToPrimitive, Zero};
-            let n = with_host(|h| h.big_val(&args[0])).ok_or_else(|| {
-                host::type_error("'float' object cannot be interpreted as an integer")
-            })?;
+            let n = math_integer(&args[0])?;
             let is_comb = name == "comb";
             let k = match args.get(1) {
-                Some(v) => with_host(|h| h.big_val(v)).ok_or_else(|| {
-                    host::type_error("'float' object cannot be interpreted as an integer")
-                })?,
+                Some(v) => math_integer(v)?,
                 None if is_comb => {
                     return Err(host::type_error("comb() takes exactly two arguments"))
                 }
-                None => n.clone(), // perm(n) == perm(n, n) == n!
+                None => {
+                    // `perm(n)` IS `n!`, and a negative one is reported as
+                    // factorial's refusal rather than perm's own.
+                    if n.sign() == num_bigint::Sign::Minus {
+                        return Err(
+                            "ValueError: factorial() not defined for negative values".into()
+                        );
+                    }
+                    n.clone()
+                }
             };
             // CPython reports WHICH argument was negative and never names the
             // function here — `{name}() not defined for negative values` is
@@ -9938,6 +10783,23 @@ fn call_math(name: &str, args: &[Value], kwargs: &[(String, Value)]) -> Result<V
             }
             if k > n {
                 return Ok(Value::Int(0));
+            }
+            // `comb(n, k) == comb(n, n - k)`: taking the smaller half is what
+            // makes `comb(10**30, 10**30)` answer `1` instantly instead of
+            // looping 10**30 times.
+            let k = if is_comb && &n - &k < k { &n - &k } else { k };
+            // A loop count past `i64` cannot terminate. CPython reports it as
+            // the factorial overflow it is (`perm(n)` IS `n!`) rather than
+            // hanging, which is what pythonrs did: `math.perm(10**30)` never
+            // returned.
+            {
+                use num_traits::ToPrimitive as _;
+                if k.to_i64().is_none() {
+                    return Err(
+                        "OverflowError: factorial() argument should not exceed 9223372036854775807"
+                            .to_string(),
+                    );
+                }
             }
             // numerator = product(n-k+1 ..= n)
             let mut num = BigInt::from(1);
@@ -14701,9 +15563,10 @@ fn normalize_slice_bounds(idx: &Value) -> Result<Value, String> {
         None => return Ok(idx.clone()),
     };
     let needs = with_host(|h| {
-        [&lo, &hi, &step]
-            .iter()
-            .any(|b| matches!(h.get(b), Some(PyObj::Instance(_))))
+        [&lo, &hi, &step].iter().any(|b| {
+            !matches!(b, Value::Undef | Value::Int(_) | Value::Bool(_))
+                && !matches!(h.get(b), Some(PyObj::BigInt(_)))
+        })
     });
     if !needs {
         return Ok(idx.clone());
@@ -14711,6 +15574,22 @@ fn normalize_slice_bounds(idx: &Value) -> Result<Value, String> {
     let lo = resolve_slice_bound(&lo)?;
     let hi = resolve_slice_bound(&hi)?;
     let step = resolve_slice_bound(&step)?;
+    // A bound that is neither `None`, an integer, nor something `__index__`
+    // just turned into one is a `TypeError`. Letting it through was SILENT:
+    // `slice_bounds` reads an unusable bound as "absent", so `L[:2.5]`,
+    // `L['x':]` and `L[::[]]` all answered with the whole sequence instead of
+    // raising, and the wrong answer travelled.
+    for b in [&lo, &hi, &step] {
+        let ok = with_host(|h| {
+            matches!(b, Value::Undef | Value::Int(_) | Value::Bool(_))
+                || matches!(h.get(b), Some(PyObj::BigInt(_)))
+        });
+        if !ok {
+            return Err(host::type_error(
+                "slice indices must be integers or None or have an __index__ method",
+            ));
+        }
+    }
     Ok(with_host(|h| h.alloc(PyObj::Slice { lo, hi, step })))
 }
 

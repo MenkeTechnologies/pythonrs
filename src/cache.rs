@@ -5,14 +5,17 @@
 //! miss the program is compiled, stored, then run. `python --build` warms the
 //! same shard ahead of time.
 //!
-//! Layout: a single shard at `~/.pythonrs/scripts.rkyv`. The *outer* container is
-//! a zero-copy rkyv archive (`Shard`), validated on load; each *inner* entry blob
-//! is a bincode-encoded `CProg` (the compiled `fusevm::Chunk`s + func/try
-//! tables), because `fusevm::Chunk` is serde-owned, not `rkyv::Archive`. The key
-//! is a 64-bit hash of the source, a schema version, the build's
-//! `CARGO_PKG_VERSION`, and a fingerprint of the running executable, so a
-//! source, format, release, or REBUILD change misses cleanly instead of loading
-//! stale bytecode.
+//! Layout: a single shard at `~/.pythonrs/scripts.rkyv`, as
+//! `[u64 index length][index][blobs]`. The *index* is a zero-copy rkyv archive
+//! (`Index`) of `(key, verify, source, offset, length)` rows, validated on load;
+//! each *blob* is a bincode-encoded `CProg` (the compiled `fusevm::Chunk`s +
+//! func/try tables) read by offset, because `fusevm::Chunk` is serde-owned, not
+//! `rkyv::Archive`. The blobs sit OUTSIDE the archive so that validating it
+//! stays proportional to the number of entries rather than to their total size —
+//! see [`Index`]. The key is a 64-bit hash of the source, a schema version, the
+//! build's `CARGO_PKG_VERSION`, and a fingerprint of the running executable, so
+//! a source, format, release, or REBUILD change misses cleanly instead of
+//! loading stale bytecode.
 
 use crate::ast::Span;
 use crate::compiler::Program;
@@ -143,18 +146,30 @@ use std::path::PathBuf;
 /// v37: `%` by an integer literal inside a native slot loop lowers to native
 /// `Mod` + a branchless floor correction instead of the `BINOP` host call, so
 /// loops containing `%` emit different bytecode (and now qualify as native).
-const SCHEMA: u64 = 49;
+/// v50: the shard is split into a small archived INDEX and a raw blob region
+/// (`[u64 index_len][index archive][blobs]`) instead of one archive holding the
+/// blobs inline. A v49 shard's first eight bytes are archive data, not a length,
+/// so it is rejected as unreadable and rebuilt.
+const SCHEMA: u64 = 50;
 
-/// The outer, rkyv-archived shard: a flat list of (key, bincode-blob) entries.
+/// The shard's INDEX: everything a lookup needs, and nothing it does not.
+///
+/// The blobs live outside this archive on purpose. rkyv validates a whole
+/// archive from its root before anything in it may be read, and validating a
+/// `Vec<u8>` is linear in its bytes — so holding the blobs inline made the cost
+/// of ANY lookup proportional to the total size of every program ever cached
+/// (0.20s of a 0.21s `python empty.py` against a 19.6 MiB shard). Split out, the
+/// validated region is the index alone — a few dozen bytes per entry — and the
+/// blob is a byte range read by offset, checked by bincode when it is decoded.
 #[derive(Archive, RkyvSer, RkyvDe, Default)]
 #[archive(check_bytes)]
-struct Shard {
-    entries: Vec<Entry>,
+struct Index {
+    entries: Vec<IndexEntry>,
 }
 
-#[derive(Archive, RkyvSer, RkyvDe)]
+#[derive(Archive, RkyvSer, RkyvDe, Clone)]
 #[archive(check_bytes)]
-struct Entry {
+struct IndexEntry {
     key: u64,
     /// A second, independent hash of the source. A cache hit requires BOTH `key`
     /// and `verify` to match, so an `FxHash` collision on `key` can never return
@@ -165,7 +180,9 @@ struct Entry {
     /// (`-c`), or `<stdin>`. The cache keys by source CONTENT, so this is
     /// best-effort provenance for `--cacheview`, not part of the lookup.
     source: String,
-    blob: Vec<u8>,
+    /// Where this entry's bincode blob starts, relative to the blob region.
+    off: u64,
+    len: u64,
 }
 
 /// The inner, serde/bincode form of a compiled program.
@@ -311,19 +328,42 @@ impl ShardLock {
     }
 }
 
-fn load_shard() -> Shard {
-    let Some(path) = shard_path() else {
-        return Shard::default();
-    };
-    let Ok(bytes) = std::fs::read(&path) else {
-        return Shard::default();
-    };
-    rkyv::from_bytes::<Shard>(&bytes).unwrap_or_default()
+/// The fixed prefix: the byte length of the index archive that follows it.
+const INDEX_LEN_BYTES: usize = 8;
+
+/// Split shard bytes into `(index archive, blob region)`.
+///
+/// Every malformed shape — too short to hold the length, a length that overruns
+/// the file, a v49 archive whose first eight bytes happen to parse as a huge
+/// number — answers `None`, which the callers read as "no usable cache" and
+/// rebuild. A shard is a cache: an unreadable one costs a recompile, never an
+/// error.
+fn split_shard(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
+    let raw = bytes.get(..INDEX_LEN_BYTES)?;
+    let n = u64::from_le_bytes(raw.try_into().ok()?) as usize;
+    let rest = bytes.get(INDEX_LEN_BYTES..)?;
+    (n <= rest.len()).then(|| rest.split_at(n))
 }
 
-fn write_shard(shard: &Shard) -> Result<(), String> {
+/// The whole shard file alongside its decoded index — the form the rare paths
+/// (`store`, `--cacheview`, `--doctor`) want, since they walk every entry. A
+/// LOOKUP must not come through here: it would pay for decoding the index rows
+/// it will not read. [`load`] reads the index in place instead.
+fn read_shard() -> Option<(Vec<u8>, Index)> {
+    let bytes = std::fs::read(shard_path()?).ok()?;
+    let (index, _) = split_shard(&bytes)?;
+    let index: Index = rkyv::from_bytes(index).ok()?;
+    Some((bytes, index))
+}
+
+/// Write an index and its blob region as one shard file.
+fn write_shard(index: &Index, blobs: &[u8]) -> Result<(), String> {
     let path = shard_path().ok_or("no home dir for cache")?;
-    let bytes = rkyv::to_bytes::<_, 4096>(shard).map_err(|e| format!("cache serialize: {e}"))?;
+    let archived = rkyv::to_bytes::<_, 4096>(index).map_err(|e| format!("cache serialize: {e}"))?;
+    let mut bytes = Vec::with_capacity(INDEX_LEN_BYTES + archived.len() + blobs.len());
+    bytes.extend_from_slice(&(archived.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(&archived);
+    bytes.extend_from_slice(blobs);
     // Atomic replace (write temp + rename) so a concurrent reader — up to 16
     // instances run against the shared shard — never sees a torn file. A losing
     // concurrent writer just drops its entry (recompiled next run); it can never
@@ -341,15 +381,25 @@ fn write_shard(shard: &Shard) -> Result<(), String> {
 }
 
 /// Look up a compiled program for `src`, if present and current.
+///
+/// The INDEX is read as an archive and never deserialized: `check_archived_root`
+/// validates it and hands back a reference into the bytes already read, so a
+/// lookup allocates nothing but the one blob it decodes. `rkyv::from_bytes`
+/// rebuilt every entry in the file — 2485 of them — to answer a question about
+/// one, which was 0.42s of a 0.44s `python empty.py`; see [`Index`] for why
+/// validating in place is not enough on its own.
 pub fn load(src: &str) -> Option<Program> {
     let key = key_for(src);
     let verify = verify_for(src);
-    let shard = load_shard();
-    let entry = shard
+    let bytes = std::fs::read(shard_path()?).ok()?;
+    let (index, blobs) = split_shard(&bytes)?;
+    let index = rkyv::check_archived_root::<Index>(index).ok()?;
+    let entry = index
         .entries
         .iter()
         .find(|e| e.key == key && e.verify == verify)?;
-    let mut cp: CProg = bincode::deserialize(&entry.blob).ok()?;
+    let (off, len) = (entry.off.value() as usize, entry.len.value() as usize);
+    let mut cp: CProg = bincode::deserialize(blobs.get(off..off.checked_add(len)?)?).ok()?;
     // Restore each chunk's serde-skipped `op_hash` so runtime caret lookups match
     // the cached position tables' keys.
     restore_op_hash(&mut cp.main);
@@ -413,7 +463,7 @@ pub fn cache_enabled() -> bool {
 
 /// Entry count and on-disk byte size of the shard (`0`/`0` when absent).
 pub fn stats() -> (usize, u64) {
-    let count = load_shard().entries.len();
+    let count = read_shard().map_or(0, |(_, i)| i.entries.len());
     let bytes = default_cache_path()
         .metadata()
         .map(|m| m.len())
@@ -459,11 +509,20 @@ pub struct EntryInfo {
 /// Summarize every entry in the shard (decoding each blob's counts), in shard
 /// order. Used only by `--cacheview`.
 pub fn entries() -> Vec<EntryInfo> {
-    load_shard()
+    let Some((bytes, index)) = read_shard() else {
+        return Vec::new();
+    };
+    let Some((_, blobs)) = split_shard(&bytes) else {
+        return Vec::new();
+    };
+    index
         .entries
         .iter()
         .map(|e| {
-            let (main_ops, functions, tries, warnings) = bincode::deserialize::<CProg>(&e.blob)
+            let (off, len) = (e.off as usize, e.len as usize);
+            let (main_ops, functions, tries, warnings) = blobs
+                .get(off..off.saturating_add(len))
+                .and_then(|b| bincode::deserialize::<CProg>(b).ok())
                 .map(|cp| {
                     (
                         cp.main.ops.len(),
@@ -477,7 +536,7 @@ pub fn entries() -> Vec<EntryInfo> {
                 key: e.key,
                 source: e.source.clone(),
                 verify: e.verify,
-                blob_len: e.blob.len(),
+                blob_len: len,
                 main_ops,
                 functions,
                 tries,
@@ -516,15 +575,38 @@ pub fn store_labeled(src: &str, prog: &Program, source: &str) -> Result<(), Stri
     // held until this function returns (the guard drops). If the lock cannot be
     // taken, fall through unlocked — a dropped entry only costs a recompile.
     let _guard = ShardLock::acquire();
-    let mut shard = load_shard();
-    shard.entries.retain(|e| e.key != key);
-    shard.entries.push(Entry {
+    // Rebuild the shard: the surviving blobs are COPIED, never decoded, so a
+    // store costs one pass over the file rather than a round trip through every
+    // program in it.
+    let existing = read_shard();
+    let old_blobs = existing
+        .as_ref()
+        .and_then(|(bytes, _)| split_shard(bytes).map(|(_, b)| b))
+        .unwrap_or(&[]);
+    let mut index = Index::default();
+    let mut blobs: Vec<u8> = Vec::with_capacity(old_blobs.len() + blob.len());
+    if let Some((_, old)) = existing.as_ref() {
+        for e in old.entries.iter().filter(|e| e.key != key) {
+            let (off, len) = (e.off as usize, e.len as usize);
+            let Some(b) = old_blobs.get(off..off.saturating_add(len)) else {
+                continue;
+            };
+            index.entries.push(IndexEntry {
+                off: blobs.len() as u64,
+                ..e.clone()
+            });
+            blobs.extend_from_slice(b);
+        }
+    }
+    index.entries.push(IndexEntry {
         key,
         verify,
         source,
-        blob,
+        off: blobs.len() as u64,
+        len: blob.len() as u64,
     });
-    write_shard(&shard)
+    blobs.extend_from_slice(&blob);
+    write_shard(&index, &blobs)
 }
 
 #[cfg(test)]
@@ -564,5 +646,39 @@ mod tests {
         // …and the version that is hashed is this build's, so a release bump
         // rotates the whole shard.
         assert_eq!(BUILD_VERSION, env!("CARGO_PKG_VERSION"));
+    }
+
+    /// The framing must reject every malformed shard rather than panic on one.
+    ///
+    /// A v49 shard is the case that actually occurs: its first eight bytes are
+    /// archive data, so they read as an enormous index length. Slicing with
+    /// that would panic inside the interpreter's startup, on a file the user
+    /// never asked about — so the length is range-checked against what follows
+    /// it and an unusable shard degrades to a recompile.
+    #[test]
+    fn a_malformed_shard_is_rejected_not_panicked_on() {
+        assert!(split_shard(&[]).is_none(), "empty file");
+        assert!(split_shard(&[0; 7]).is_none(), "shorter than the length");
+        let mut overrun = u64::MAX.to_le_bytes().to_vec();
+        overrun.extend_from_slice(b"legacy archive bytes");
+        assert!(split_shard(&overrun).is_none(), "length overruns the file");
+        let mut short = 32u64.to_le_bytes().to_vec();
+        short.extend_from_slice(&[0; 31]);
+        assert!(split_shard(&short).is_none(), "index runs past the end");
+    }
+
+    /// The framing splits exactly where it was written, with no blob region
+    /// when there are no entries.
+    #[test]
+    fn the_framing_round_trips() {
+        let mut bytes = 3u64.to_le_bytes().to_vec();
+        bytes.extend_from_slice(b"idxBLOBS");
+        let (index, blobs) = split_shard(&bytes).expect("well-formed framing");
+        assert_eq!(index, b"idx");
+        assert_eq!(blobs, b"BLOBS");
+
+        let empty = 0u64.to_le_bytes();
+        let (index, blobs) = split_shard(&empty).expect("a zero-length index");
+        assert!(index.is_empty() && blobs.is_empty());
     }
 }

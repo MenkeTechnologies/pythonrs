@@ -819,3 +819,307 @@ d = {}
 d[Idx(1)] = "obj"
 d[1] = "int"
 print(len(d), d[1], sorted(map(type(0).__name__.__eq__, [1])))
+#==#
+# ── the reflected operand goes first when its type is a subclass ─────────────
+# CPython's `SLOT1BINFULL`/`do_richcompare` rule: with `class C(A)` overriding
+# the reflected dunder, `A() op C()` runs `C.__rop__` and never reaches
+# `A.__op__`. pythonrs always ran the forward half first, so a subclass could
+# not intercept its own operations. The mirror-image rule is that two operands
+# of the SAME type never consult the reflected dunder for ARITHMETIC (they do
+# for comparison), so `A() + A()` whose `__add__` declines raises even though
+# `__radd__` exists.
+def t(label, fn):
+    try:
+        print(label, "->", fn())
+    except BaseException as e:
+        print(label, "->", type(e).__name__ + ":", e)
+
+
+class A:
+    def __init__(self, v=1):
+        self.v = v
+
+    def __add__(self, o):
+        print("A.__add__")
+        return NotImplemented
+
+    def __lt__(self, o):
+        print("A.__lt__")
+        return NotImplemented
+
+
+class C(A):
+    def __radd__(self, o):
+        return ("C.radd", self.v)
+
+    def __gt__(self, o):
+        return "C.gt"
+
+
+class Inherit(A):
+    pass
+
+
+class OnlyRefl:
+    def __radd__(self, o):
+        return "only-radd"
+
+
+t("subclass-first", lambda: A(1) + C(2))
+t("subclass-cmp", lambda: A(1) < C(2))
+t("inherited-no-reorder", lambda: A(1) + Inherit(2))
+t("same-type-arith", lambda: A(1) + A(2))
+t("same-type-refl-only", lambda: OnlyRefl() + OnlyRefl())
+t("same-type-cmp", lambda: A(1) < A(2))
+#==#
+# ── an augmented assignment is named `op=` in its own failure ────────────────
+# `x >>= y` that no dunder answers is `unsupported operand type(s) for >>=`.
+# pythonrs reported the binary fallback it used internally (`for >>`, and
+# `for ** or pow()` for `**=`), leaking an implementation detail into all
+# thirteen messages.
+class Bare:
+    pass
+
+
+for op in ("+=", "-=", "*=", "/=", "//=", "%=", "**=", "@=", "&=", "|=", "^=", "<<=", ">>="):
+    try:
+        exec("x = Bare()\nx " + op + " 2")
+    except TypeError as e:
+        print(op, e)
+#==#
+# ── a sequence reports its own concat/repeat refusal ─────────────────────────
+# `[1] + obj` is `can only concatenate list (not "T") to list`, a bytes concat
+# is `can't concat T to bytes`, and a repeat by a non-integer is `can't multiply
+# sequence by non-int of type 'T'` whichever side the sequence is on — none of
+# them the generic unsupported-operand message pythonrs gave.
+class Plain:
+    pass
+
+
+for expr in (
+    "[1] + Plain()",
+    "(1,) + Plain()",
+    "'a' + Plain()",
+    "b'a' + Plain()",
+    "bytearray(b'a') + Plain()",
+    "[1] * Plain()",
+    "Plain() * [1]",
+    "'a' * Plain()",
+    "Plain() + [1]",
+    "{1} + Plain()",
+):
+    try:
+        print(expr, "->", eval(expr))
+    except TypeError as e:
+        print(expr, "->", e)
+#==#
+# ── `math` reads its arguments through the numeric protocol ──────────────────
+# Every arm read its argument as `as_f(v).unwrap_or(0.0)`, so a string, a None
+# and a bignum all computed against `0.0` and returned a plausible NUMBER:
+# `math.sqrt("s")` was `0.0` and `math.sqrt(10**30)` was `0.0`. The integer
+# functions refused every `__index__` object and blamed `'float'` whatever the
+# argument was, and `math.factorial(2.0)` answered `1`.
+import math
+
+
+class F:
+    def __float__(self):
+        return 2.25
+
+
+class I:
+    def __index__(self):
+        return 7
+
+
+class Nope:
+    pass
+
+
+def m(label, fn):
+    try:
+        print(label, "->", fn())
+    except BaseException as e:
+        print(label, "->", type(e).__name__ + ":", e)
+
+
+for tag, arg in (("F", F()), ("I", I()), ("N", Nope()), ("str", "s"), ("none", None)):
+    m("sqrt-" + tag, lambda a=arg: math.sqrt(a))
+    m("floor-" + tag, lambda a=arg: math.floor(a))
+    m("trunc-" + tag, lambda a=arg: math.trunc(a))
+    m("isqrt-" + tag, lambda a=arg: math.isqrt(a))
+    m("fact-" + tag, lambda a=arg: math.factorial(a))
+# An INT argument stays exact: it must not travel through a double.
+print(math.floor(10**30), math.ceil(-(10**30)), math.trunc(10**30), math.sqrt(10**30))
+print(math.gcd(I(), 14), math.lcm(I(), 2), math.lcm(4, 6), math.lcm(0, 5))
+m("fact-float", lambda: math.factorial(2.0))
+# The SIGN is reported before the magnitude, and `perm(n)` is `n!` — so a
+# negative argument to either is factorial's refusal, not an overflow and not
+# perm's own "n must be a non-negative integer".
+m("fact-neg", lambda: math.factorial(-5))
+m("fact-neg-huge", lambda: math.factorial(-(10**30)))
+m("perm-neg", lambda: math.perm(-5))
+m("perm-neg-huge", lambda: math.perm(-(10**30)))
+m("comb-neg", lambda: math.comb(-5, 2))
+m("comb-neg-k", lambda: math.comb(5, -2))
+m("perm-huge", lambda: math.perm(10**30))
+m("comb-full", lambda: math.comb(10**30, 10**30))
+# `fmod`/`remainder` raise where C answers NaN, and an exact zero remainder
+# keeps the dividend's sign.
+m("fmod-zero", lambda: math.fmod(1, 0))
+m("fmod-inf", lambda: math.fmod(float("inf"), 2))
+m("rem-zero", lambda: math.remainder(1, 0))
+m("rem-inf", lambda: math.remainder(1, float("inf")))
+print(math.remainder(-2.0, 2), math.remainder(2.0, 2), math.fmod(float("nan"), 2))
+#==#
+# ── the rounding dunders are consulted, and `complex()` is a protocol ────────
+# `__trunc__`/`__floor__`/`__ceil__` and `__complex__` had no caller at all:
+# `math.floor(obj)` answered `0` and `complex(obj)` answered `0j` for every
+# object, including ones that define none of them.
+import math
+
+
+class R:
+    def __trunc__(self):
+        return "T"
+
+    def __floor__(self):
+        return "FL"
+
+    def __ceil__(self):
+        return "CE"
+
+    def __round__(self, d=None):
+        return ("R", d)
+
+
+class Cx:
+    def __complex__(self):
+        return 3 + 4j
+
+
+class Fl:
+    def __float__(self):
+        return 2.5
+
+
+class Ix:
+    def __index__(self):
+        return 4
+
+
+class Bare2:
+    pass
+
+
+def c(label, fn):
+    try:
+        print(label, "->", fn())
+    except BaseException as e:
+        print(label, "->", type(e).__name__ + ":", e)
+
+
+print(math.floor(R()), math.ceil(R()), math.trunc(R()), round(R()), round(R(), 2))
+c("cx-proto", lambda: complex(Cx()))
+c("cx-float", lambda: complex(Fl()))
+c("cx-index", lambda: complex(Ix()))
+c("cx-none", lambda: complex(Bare2()))
+c("cx-imag", lambda: complex(1, Bare2()))
+c("cx-real-2arg", lambda: complex("1+2j", 1))
+c("cx-pair", lambda: complex(Fl(), Ix()))
+# `float()` names the defining type in a bad `__float__` return, and reads a
+# bytes buffer as the numeric string it spells.
+class BadFloat:
+    def __float__(self):
+        return 1
+
+
+c("bad-float", lambda: float(BadFloat()))
+c("float-bytes", lambda: float(b"1.5"))
+c("float-bytearray", lambda: float(bytearray(b" 2.5 ")))
+c("float-bytes-bad", lambda: float(b"x"))
+c("divmod-unsupported", lambda: divmod([], 3))
+#==#
+# ── a slice bound that is not an integer is refused, not ignored ─────────────
+# `slice_bounds` reads an unusable bound as "absent", so `L[:2.5]`, `L['x':]`
+# and `L[::[]]` all returned the WHOLE sequence instead of raising. Silent
+# wrong answers, not a missing error.
+L = [1, 2, 3, 4, 5]
+
+
+class Ix2:
+    def __index__(self):
+        return 2
+
+
+for expr in (
+    "L[:2.5]",
+    "L['x':]",
+    "L[::[]]",
+    "'abcde'[:2.5]",
+    "(1, 2, 3)[:{}]",
+    "L[:Ix2()]",
+    "L[Ix2():]",
+    "L[None:2]",
+    "L[:10**30]",
+):
+    try:
+        print(expr, "->", eval(expr))
+    except TypeError as e:
+        print(expr, "->", type(e).__name__ + ":", e)
+#==#
+# ── `exec` inside a function persists a `global` binding ─────────────────────
+# An in-function `exec` discards its writes because they belong to the caller's
+# LOCALS mapping — but a `global` declaration retargets the write at the module
+# globals, which persist. pythonrs dropped those too, so no `exec` inside a
+# function could ever set a module global.
+g1 = 1
+g2 = 1
+g3 = 1
+
+
+def set_global():
+    exec("global g1\ng1 = 99")
+
+
+def aug_global():
+    exec("global g2\ng2 += 10")
+
+
+def keep_local():
+    exec("g3 = 77")
+    return "ran"
+
+
+set_global()
+aug_global()
+print(keep_local(), g1, g2, g3)
+#==#
+# ── `gamma`/`lgamma` are CPython's OWN code, and `erf` is the platform's ─────
+# pythonrs answered all four out of the pure-Rust `libm` crate, which is a
+# different approximation from either: across `[-6, 6]` in steps of 0.01 that
+# disagreed in the last place on 312/1201 points for `erf`, 390 for `erfc`,
+# 907 for `gamma` and 976 for `lgamma`. CPython calls the platform's `erf`/
+# `erfc` (`FUNC1A(erf, erf, …)`) but ships its own Lanczos `m_tgamma`/
+# `m_lgamma`, because the platform ones are not accurate enough (gh-70309) —
+# so matching means running each from the same source. `lgamma(-inf)` is `inf`,
+# not the domain error pythonrs raised: it is the log of a MAGNITUDE.
+import math
+
+for i in range(-450, 451, 7):
+    x = i / 100.0
+    row = []
+    for name in ("erf", "erfc", "gamma", "lgamma"):
+        try:
+            row.append(repr(getattr(math, name)(x)))
+        except ValueError as e:
+            row.append(str(e))
+    print(x, " ".join(row))
+for v in (0.0, -0.0, 1e-30, -1e-30, 170.0, 171.0, -140.5, 141.5, -200.5, 200.5,
+          float("inf"), float("-inf")):
+    for name in ("gamma", "lgamma"):
+        try:
+            print(name, repr(v), repr(getattr(math, name)(v)))
+        except (ValueError, OverflowError) as e:
+            print(name, repr(v), type(e).__name__ + ":", e)
+print([math.gamma(n) for n in range(1, 24)] == [float(math.factorial(n - 1)) for n in range(1, 24)])

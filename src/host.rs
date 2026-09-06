@@ -17534,6 +17534,7 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                 "erfc",
                 "isclose",
                 "remainder",
+                "lcm",
             ];
             let mut out: Vec<(&str, Value)> = vec![
                 ("pi", Value::Float(std::f64::consts::PI)),
