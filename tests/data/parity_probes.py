@@ -1123,3 +1123,42 @@ for v in (0.0, -0.0, 1e-30, -1e-30, 170.0, 171.0, -140.5, 141.5, -200.5, 200.5,
         except (ValueError, OverflowError) as e:
             print(name, repr(v), type(e).__name__ + ":", e)
 print([math.gamma(n) for n in range(1, 24)] == [float(math.factorial(n - 1)) for n in range(1, 24)])
+#==#
+# ── keyword binding on builtins that read positionals only ──────────────────
+# `pow`, `math.isclose` and `itertools.groupby` all accept by keyword what they
+# also accept positionally. Each used to read the positional slots alone, so the
+# keyword forms did not raise — they answered with a DEFAULT: `pow(2, exp=3)`
+# was 2, `pow(2, 3, mod=5)` was 8, `isclose(a, b, rel_tol=<obj with __float__>)`
+# compared at 1e-09, and `groupby(xs, key=f)` grouped by the raw element while
+# reporting it as the key. Values only, no message text: this corpus is compared
+# against any reference from 3.9 on and the wordings moved between releases.
+import itertools
+import math
+
+print(pow(2, 3), pow(2, 3, 5), pow(base=2, exp=3), pow(2, exp=3))
+print(pow(base=2, exp=3, mod=5), pow(2, 3, mod=5), pow(2, exp=3, mod=5))
+print([(k, list(g)) for k, g in itertools.groupby([1, 1, 2, 3, 3], key=lambda v: v % 2)])
+print([(k, list(g)) for k, g in itertools.groupby([1, 1, 2, 3, 3], lambda v: v % 2)])
+print([(k, list(g)) for k, g in itertools.groupby(["a", "bb", "cc", "d"], key=len)])
+
+
+class Half:
+    def __float__(self):
+        return 0.5
+
+
+print(math.isclose(1.0, 1.4, rel_tol=Half()), math.isclose(1.0, 1.4, abs_tol=Half()))
+print(math.isclose(1.0, 1.0001, rel_tol=1e-3), math.isclose(1.0, 1.4, abs_tol=1))
+# `bool` inherits int's numeric descriptors, and they all yield an INT.
+print(True.real, False.real, True.numerator, True.conjugate(), (3).real)
+print(type(True.real) is int, True.real is True, (True.imag, True.denominator))
+# A negative `r` is a ValueError from all three combinatoric generators, not an
+# empty (or single-empty-tuple) result. `fn.__name__` is load-bearing here, not
+# decoration: a module-level builtin reports its BARE name, and printing it is
+# what caught `itertools.permutations.__name__` answering the dotted string.
+for fn in (itertools.permutations, itertools.combinations,
+           itertools.combinations_with_replacement):
+    try:
+        print(fn.__name__, list(fn("AB", -1)))
+    except ValueError as e:
+        print(fn.__name__, type(e).__name__, e)

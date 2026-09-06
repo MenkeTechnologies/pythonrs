@@ -457,6 +457,68 @@ fn property_name_is_the_attribute_it_was_bound_to() {
     );
 }
 
+/// A `slice` is hashable and richly comparable — CPython 3.12 made slices
+/// hashable, so a slice is a legal dict key and set member, and two slices with
+/// equal bounds are equal.
+///
+/// Not in tests/data/parity_probes.py: that corpus is compared against any
+/// reference from CPython 3.9 on, and on 3.9-3.11 every construction below is a
+/// `TypeError`. The answers are pinned here instead.
+///
+/// The hash numbers are CPython 3.14.7's own, read from
+/// `/opt/homebrew/bin/python3` under `PYTHONHASHSEED=0`.
+#[test]
+fn a_slice_is_hashable_and_compares_by_its_bounds() {
+    // Equality is the bounds tuple's, and an omitted bound IS `None`.
+    assert_eq!(g("x = slice(1, 2) == slice(1, 2)", "x"), "True");
+    assert_eq!(g("x = slice(1, 2) == slice(1, 2, None)", "x"), "True");
+    assert_eq!(g("x = slice(1, 2) == slice(1, 3)", "x"), "False");
+    // Ordering too, element by element.
+    assert_eq!(g("x = slice(1, 2) < slice(1, 3)", "x"), "True");
+    assert_eq!(g("x = slice(2, 2) > slice(1, 3)", "x"), "True");
+    // Equal-but-distinct slices find each other in a sequence.
+    assert_eq!(g("x = slice(1, 2) in [slice(1, 2)]", "x"), "True");
+
+    // A slice hashes like its bounds run through the tuple accumulator WITHOUT
+    // the length-mangling step, so it is never the tuple's own hash.
+    assert_eq!(g("x = hash(slice(1, 2, 3))", "x"), "-2340833382717974474");
+    assert_eq!(g("x = hash(slice(1, 2))", "x"), "-2178470213028018262");
+    assert_eq!(
+        g("x = hash(slice(1, 2, 3)) == hash((1, 2, 3))", "x"),
+        "False"
+    );
+
+    // As a dict key: the literal, the STATEMENT store (which used to be taken
+    // for a slice assignment and raise before the key ever reached the dict),
+    // the read back, and the delete.
+    assert_eq!(g("x = {slice(1, 2): 'v'}[slice(1, 2)]", "x"), "'v'");
+    assert_eq!(
+        g("d = {}\nd[slice(1, 2)] = 'v'\nx = d[slice(1, 2)]", "x"),
+        "'v'"
+    );
+    assert_eq!(
+        g("d = {slice(1, 2): 'v'}\ndel d[slice(1, 2)]\nx = d", "x"),
+        "{}"
+    );
+    // A slice and the tuple of its bounds are NOT the same key.
+    assert_eq!(
+        g("x = len({slice(1, 2, 3): 'a', (1, 2, 3): 'b'})", "x"),
+        "2"
+    );
+    // As a set member, equal slices collapse.
+    assert_eq!(
+        g("x = len({slice(1, 2), slice(1, 2), slice(1, 3)})", "x"),
+        "2"
+    );
+    // An unhashable BOUND still makes the slice unhashable.
+    assert!(pythonrs::eval_str("x = {slice([], 1): 1}").is_err());
+
+    // Sequences keep splicing: the receiver, not the index, decides.
+    assert_eq!(g("L = [1, 2, 3, 4]\nL[1:3] = [7]\nx = L", "x"), "[1, 7, 4]");
+    assert_eq!(g("L = [1, 2, 3]\ndel L[0:2]\nx = L", "x"), "[3]");
+    assert_eq!(g("x = [1, 2, 3, 4][slice(1, 3)]", "x"), "[2, 3]");
+}
+
 #[test]
 fn function_attributes() {
     // Functions carry a writable attribute dict (abc's __isabstractmethod__,

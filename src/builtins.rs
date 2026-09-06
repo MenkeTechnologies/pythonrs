@@ -737,7 +737,16 @@ fn subscript_store(recv: &Value, idx: Value, val: Value) -> Result<(), String> {
     // Slice assignment (`x[i:j] = it`): materialize the RHS iterable here, out
     // of any host borrow (it may be a generator), then splice. Slice bounds with
     // `__index__` are resolved to ints first (`a[Idx():Idx()] = it`).
-    if with_host(|h| matches!(h.get(&idx), Some(PyObj::Slice { .. }))) {
+    // A slice is a slice ASSIGNMENT on a sequence and a plain KEY on a mapping.
+    // CPython decides by the receiver (`mp_ass_subscript` vs the sequence slice
+    // slot), and deciding by the INDEX's type instead made `d[slice(1, 2)] = 1`
+    // splice into a dict: it raised `'int' object is not iterable` from the RHS
+    // materialization and the key never reached the dict at all. The load path
+    // already gated on the receiver this way; this is the same test.
+    if with_host(|h| {
+        matches!(h.get(&idx), Some(PyObj::Slice { .. }))
+            && !matches!(h.get(&recv), Some(PyObj::Dict(_)))
+    }) {
         let idx = normalize_slice_bounds(&idx)?;
         // A `memoryview` slice store takes a BUFFER, not an iterable: CPython
         // rejects `mv[0:2] = [1, 2]` and `mv[0:2] = 'ab'` as "a bytes-like object
@@ -818,7 +827,12 @@ fn subscript_delete(recv: &Value, idx: Value) -> Result<(), String> {
     let recv = recv.clone();
     // `del seq[Idx():Idx()]` — resolve `__index__` slice bounds (recv is a
     // builtin sequence here; instances were dispatched to `__delitem__` above).
-    let idx = if with_host(|h| matches!(h.get(&idx), Some(PyObj::Slice { .. }))) {
+    // Same receiver-not-index test as `subscript_store`: `del d[slice(1, 2)]`
+    // removes a slice KEY from a dict, it does not splice.
+    let idx = if with_host(|h| {
+        matches!(h.get(&idx), Some(PyObj::Slice { .. }))
+            && !matches!(h.get(&recv), Some(PyObj::Dict(_)))
+    }) {
         normalize_slice_bounds(&idx)?
     } else {
         store_index(&recv, idx)?
@@ -5241,6 +5255,9 @@ pub fn call_builtin_function(
             Ok(Value::Undef)
         }
         "len" => {
+            // METH_O: `len` takes exactly one argument, and taking only the
+            // first silently accepted `len(a, b)`.
+            check_arity("len", "len", Arity::ExactlyOne, args.len())?;
             let v = arg0(&args)?;
             let n = py_len(&v)?;
             Ok(Value::Int(n as i64))
@@ -5268,6 +5285,8 @@ pub fn call_builtin_function(
             Ok(with_host(|h| h.alloc(PyObj::Slice { lo, hi, step })))
         }
         "abs" => {
+            // METH_O, same as `len`: `abs()` and `abs(a, b)` were both accepted.
+            check_arity("abs", "abs", Arity::ExactlyOne, args.len())?;
             let v = arg0(&args)?;
             // Instance overloading: `abs(x)` → `x.__abs__()`.
             if with_host(
@@ -5571,11 +5590,10 @@ pub fn call_builtin_function(
             Ok(with_host(|h| h.new_tuple(vec![q, r])))
         }
         "pow" => {
-            let a = arg0(&args)?;
-            let b = args.get(1).cloned().unwrap_or(Value::Int(1));
-            match args.get(2) {
+            let (a, b, m) = pow_args(&args, &kwargs)?;
+            match m {
                 None | Some(Value::Undef) => with_host(|h| h.binop(host::binop::POW, &a, &b)),
-                Some(m) => pow_mod(&a, &b, m),
+                Some(m) => pow_mod(&a, &b, &m),
             }
         }
         "type" => {
@@ -6306,6 +6324,62 @@ fn as_f_wide(v: &Value) -> Result<f64, String> {
     }
 }
 
+/// Bind `pow(base, exp, mod=None)`'s arguments the way CPython's Argument Clinic
+/// does (Python/bltinmodule.c `builtin_pow`).
+///
+/// All three are bindable BOTH positionally and by keyword. The previous binding
+/// read positionals only and defaulted a missing `exp` to `1`, so every keyword
+/// form was silently wrong rather than an error: `pow(2, exp=3)` returned `2`,
+/// `pow(2, 3, mod=5)` returned `8` instead of `3`, `pow(base=2, exp=3)` raised,
+/// and an extra keyword or a fourth positional was accepted and ignored.
+fn pow_args(
+    args: &[Value],
+    kwargs: &[(String, Value)],
+) -> Result<(Value, Value, Option<Value>), String> {
+    const NAMES: [&str; 3] = ["base", "exp", "mod"];
+    if args.len() > NAMES.len() {
+        return Err(host::type_error(&format!(
+            "pow() takes at most {} arguments ({} given)",
+            NAMES.len(),
+            args.len()
+        )));
+    }
+    let mut slots: [Option<Value>; 3] = [None, None, None];
+    for (i, v) in args.iter().enumerate() {
+        slots[i] = Some(v.clone());
+    }
+    for (k, v) in kwargs {
+        match NAMES.iter().position(|n| n == k) {
+            // A name that already took a positional is CPython's "given by name
+            // and position", which reports the 1-based position of the slot.
+            Some(i) if i < args.len() => {
+                return Err(host::type_error(&format!(
+                    "argument for pow() given by name ('{k}') and position ({})",
+                    i + 1
+                )))
+            }
+            Some(i) => slots[i] = Some(v.clone()),
+            None => {
+                return Err(host::type_error(&format!(
+                    "pow() got an unexpected keyword argument '{k}'"
+                )))
+            }
+        }
+    }
+    // Required arguments are reported in signature order, so a call giving only
+    // `mod` names `base` as missing rather than `exp`.
+    for (i, name) in NAMES[..2].iter().enumerate() {
+        if slots[i].is_none() {
+            return Err(host::type_error(&format!(
+                "pow() missing required argument '{name}' (pos {})",
+                i + 1
+            )));
+        }
+    }
+    let [base, exp, m] = slots;
+    Ok((base.unwrap(), exp.unwrap(), m))
+}
+
 /// 3-argument `pow(base, exp, mod)` — modular exponentiation. All three must be
 /// integers; `exp` must be non-negative (a negative exponent needs a modular
 /// inverse, which is not yet implemented). The result takes the sign of `mod`
@@ -6681,6 +6755,16 @@ pub fn hash_key(k: &PKey) -> i64 {
             let elems: Vec<i64> = ks.iter().map(hash_key).collect();
             crate::pyhash::frozenset(&elems)
         }
+        // NOT `pyhash::tuple`: CPython's `slice.__hash__` runs the same
+        // accumulator loop but SKIPS the length-mangling step, so a slice and
+        // the tuple of its bounds hash to different numbers.
+        PKey::Slice(ks) => {
+            let mut elems = [crate::pyhash::NONE; 3];
+            for (slot, k) in elems.iter_mut().zip(ks) {
+                *slot = hash_key(k);
+            }
+            crate::pyhash::slice(&elems)
+        }
         // NaN falls through to the address-derived arm below.
         PKey::FloatBits(bits) => match crate::pyhash::double(f64::from_bits(*bits)) {
             Some(h) => h,
@@ -6862,6 +6946,16 @@ fn reduce_minmax(
     kwargs: &[(String, Value)],
     want_max: bool,
 ) -> Result<Value, String> {
+    // `min()`/`max()` with no arguments is a TypeError about the ARGUMENT COUNT.
+    // Falling through to the reduction instead reported the empty-iterable
+    // ValueError, which is the message for `min([])` — a different error for a
+    // different mistake.
+    if args.is_empty() {
+        let name = if want_max { "max" } else { "min" };
+        return Err(host::type_error(&format!(
+            "{name} expected at least 1 argument, got 0"
+        )));
+    }
     let items = if args.len() == 1 {
         host::iter_vec(&args[0])?
     } else {
@@ -8020,15 +8114,28 @@ fn itertools_product(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value
     Ok(list_iter(tuples))
 }
 
+/// CPython's message for a negative `r` in `permutations`, `combinations` and
+/// `combinations_with_replacement` (Modules/itertoolsmodule.c: all three raise
+/// the same `ValueError` from their argument parsers).
+fn negative_r_error() -> String {
+    "ValueError: r must be non-negative".to_string()
+}
+
 fn itertools_permutations(args: &[Value]) -> Result<Value, String> {
     let pool = host::iter_vec(&arg0(args)?)?;
     let n = pool.len();
-    let r = args
+    // A negative `r` is a ValueError, not an empty result. Casting it straight to
+    // `usize` wrapped it to a huge value that failed the `r <= n` guard, so
+    // `permutations(xs, -1)` quietly yielded nothing where CPython raises.
+    let r = match args
         .get(1)
         .filter(|v| !matches!(v, Value::Undef))
         .and_then(|v| with_host(|h| h.as_int(v)))
-        .map(|x| x as usize)
-        .unwrap_or(n);
+    {
+        Some(x) if x < 0 => return Err(negative_r_error()),
+        Some(x) => x as usize,
+        None => n,
+    };
     let mut out: Vec<Value> = Vec::new();
     if r <= n {
         let mut indices: Vec<usize> = (0..n).collect();
@@ -8072,8 +8179,13 @@ fn itertools_combinations(args: &[Value], with_repl: bool) -> Result<Value, Stri
     let r = args
         .get(1)
         .and_then(|v| with_host(|h| h.as_int(v)))
-        .ok_or_else(|| host::type_error("combinations() missing r"))?
-        .max(0) as usize;
+        .ok_or_else(|| host::type_error("combinations() missing r"))?;
+    // `.max(0)` clamped a negative `r` to zero, which made `combinations(xs, -1)`
+    // yield the single empty tuple instead of raising.
+    if r < 0 {
+        return Err(negative_r_error());
+    }
+    let r = r as usize;
     let mut out: Vec<Value> = Vec::new();
     let emit = |indices: &[usize]| {
         let row: Vec<Value> = indices.iter().map(|&i| pool[i].clone()).collect();
@@ -8137,9 +8249,17 @@ fn itertools_tee(args: &[Value]) -> Result<Value, String> {
     Ok(with_host(|h| h.new_tuple(iters)))
 }
 
-fn itertools_groupby(args: &[Value], _kwargs: &[(String, Value)]) -> Result<Value, String> {
+fn itertools_groupby(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, String> {
     let items = host::iter_vec(&arg0(args)?)?;
-    let key = args.get(1).filter(|v| !matches!(v, Value::Undef)).cloned();
+    // `groupby(iterable, key=None)` — `key` is bindable BOTH positionally and by
+    // keyword, and taking only the positional form silently grouped by the raw
+    // element while still reporting it as the key, so `groupby(xs, key=f)`
+    // returned an entirely different grouping from `groupby(xs, f)`.
+    let key = args
+        .get(1)
+        .cloned()
+        .or_else(|| kw_get(kwargs, "key"))
+        .filter(|v| !matches!(v, Value::Undef));
     // Materialize consecutive groups as (key, list) tuples (the group is a list,
     // which is iterable like CPython's grouper — eager, not lazily invalidated).
     let mut out: Vec<Value> = Vec::new();
@@ -9004,6 +9124,12 @@ enum Arity {
     VarRange(usize, usize),
     /// Keyword-only (e.g. `list.sort`): "method() takes no positional arguments".
     NoPositional,
+    /// An Argument Clinic function whose parameters can also be passed by
+    /// keyword: "name() takes exactly K positional arguments (N given)". This is
+    /// NOT [`Arity::VarExact`]'s wording — Clinic reports the *positional* count
+    /// and qualifies the name with `()`, where plain `METH_VARARGS` says
+    /// "name expected K arguments, got N".
+    ClinicPositional(usize),
 }
 
 /// Validate `argc` positional args against a method's [`Arity`], returning
@@ -9033,6 +9159,10 @@ fn check_arity(name: &str, qual: &str, spec: Arity, argc: usize) -> Result<(), S
         Arity::NoPositional if argc != 0 => Err(host::type_error(&format!(
             "{name}() takes no positional arguments"
         ))),
+        Arity::ClinicPositional(k) if argc != k => Err(host::type_error(&format!(
+            "{name}() takes exactly {k} positional {} ({argc} given)",
+            plural(k)
+        ))),
         _ => Ok(()),
     }
 }
@@ -9048,7 +9178,7 @@ fn math_arity(name: &str) -> Option<Arity> {
         "gcd" | "lcm" | "hypot" => return None,
         // `isclose(a, b, *, rel_tol=…, abs_tol=…)` — two positionals, keyword-only
         // tolerances.
-        "isclose" => Arity::VarExact(2),
+        "isclose" => Arity::ClinicPositional(2),
 
         // Every other implemented math function is single-argument (METH_O).
         _ => Arity::ExactlyOne,
@@ -10474,15 +10604,25 @@ fn call_math(name: &str, args: &[Value], kwargs: &[(String, Value)]) -> Result<V
         "isclose" => {
             let a = f0;
             let b = args.get(1).and_then(as_f).unwrap_or(0.0);
-            let kw = |n: &str, d: f64| {
-                kwargs
-                    .iter()
-                    .find(|(k, _)| k == n)
-                    .and_then(|(_, v)| as_f(v))
-                    .unwrap_or(d)
-            };
-            let rel = kw("rel_tol", 1e-9);
-            let abs_tol = kw("abs_tol", 0.0);
+            // The tolerances go through `math_real`, the SAME coercion the
+            // positional arguments use, not a bare `as_f`. `as_f` answers `None`
+            // for anything that is not already a number, and the old `unwrap_or`
+            // then silently substituted the DEFAULT: a `rel_tol` with `__float__`
+            // was ignored rather than converted, and `rel_tol="x"` compared at
+            // 1e-09 instead of raising.
+            let mut rel = 1e-9;
+            let mut abs_tol = 0.0;
+            for (k, v) in kwargs.iter() {
+                match k.as_str() {
+                    "rel_tol" => rel = math_real(v)?,
+                    "abs_tol" => abs_tol = math_real(v)?,
+                    _ => {
+                        return Err(host::type_error(&format!(
+                            "isclose() got an unexpected keyword argument '{k}'"
+                        )))
+                    }
+                }
+            }
             if rel < 0.0 || abs_tol < 0.0 {
                 return Err("ValueError: tolerances must be non-negative".to_string());
             }
@@ -15969,7 +16109,12 @@ fn num_method(
                 )
             })),
         },
-        "conjugate" => Ok(recv.clone()),
+        // `int.conjugate` returns an INT, so a `bool` receiver normalizes the way
+        // `.real` and `.numerator` do: `True.conjugate()` is `1`, not `True`.
+        "conjugate" => Ok(match recv {
+            Value::Bool(b) => Value::Int(*b as i64),
+            _ => recv.clone(),
+        }),
         _ => Err(with_host(|h| {
             format!(
                 "AttributeError: '{}' object has no attribute '{name}'",

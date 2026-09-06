@@ -2408,6 +2408,144 @@ fn gen_itertools(seed: u64) -> Vec<String> {
 
 /// Complex arithmetic: `+ - * / **`, `complex()` constructor, `.real`/`.imag`/
 /// `.conjugate()`, `abs`. `repr((a+bj))` is deterministic across impls.
+/// Wrap `expr` so a RAISING case is still a comparison.
+///
+/// A case whose oracle exits non-zero and prints nothing is counted "barren" and
+/// measured nothing at all — so a generator that reaches its error paths by
+/// letting them propagate has, for those cases, tested nothing. Printing the
+/// exception type and message instead turns every raise into ordinary stdout
+/// that both interpreters must agree on, which is the only way a wrong error
+/// (or a missing one) shows up as a divergence.
+fn printed_or_raised(setup: &str, expr: &str) -> Vec<String> {
+    vec![
+        setup.to_string(),
+        "try:".into(),
+        format!("    print({expr})"),
+        "except BaseException as e:".into(),
+        "    print(type(e).__name__, e)".into(),
+    ]
+}
+
+/// The itertools surface that the corpus never reached. Counted, not guessed:
+/// `pairwise`, `starmap`, `groupby`, `zip_longest`, `filterfalse`, `dropwhile`,
+/// `takewhile`, `compress`, `permutations`, `combinations_with_replacement` and
+/// `chain.from_iterable` are all implemented and every one of them occurred
+/// ZERO times across the 68 existing generators — `gen_itertools` covers only
+/// the builtin `zip`/`map`/`filter`/`enumerate`/`reversed`, not the module.
+///
+/// The `r` values deliberately span past the pool length and BELOW zero, and the
+/// key functions are deliberately non-identity: a `key=` that returns the element
+/// unchanged cannot distinguish "the key was applied" from "the key was ignored",
+/// which is exactly the shape that hid `groupby(xs, key=f)` reporting raw
+/// elements as its keys.
+fn gen_itertail2(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let seq = pick(
+        r,
+        &[
+            "[1, 2, 3, 4, 5]",
+            "[]",
+            "[7]",
+            "'abcd'",
+            "[1, 1, 2, 2, 2, 3]",
+            "range(6)",
+            "(4, 4, 1)",
+        ],
+    );
+    // Non-identity keys, so an ignored `key=` changes the answer.
+    let key = pick(r, &["lambda v: v % 2", "len", "str", "bool", "abs"]);
+    let rr = pick(r, &["-1", "0", "1", "2", "3", "7"]);
+    let n = pick(r, &["-1", "0", "1", "2", "3", "9"]);
+    let pred = pick(r, &["lambda v: v", "lambda v: v < 3", "bool", "None"]);
+    let expr = match r.below(14) {
+        0 => format!("list(itertools.pairwise({seq}))"),
+        1 => format!("[(k, list(g)) for k, g in itertools.groupby({seq}, key={key})]"),
+        2 => format!("[(k, list(g)) for k, g in itertools.groupby({seq}, {key})]"),
+        3 => "list(itertools.starmap(divmod, [(7, 2), (9, 4)]))".to_string(),
+        4 => format!("list(itertools.zip_longest({seq}, 'xy', fillvalue={rr}))"),
+        5 => format!("list(itertools.filterfalse({pred}, {seq}))"),
+        6 => format!("list(itertools.dropwhile(lambda v: bool(v), {seq}))"),
+        7 => format!("list(itertools.takewhile(lambda v: bool(v), {seq}))"),
+        8 => format!("list(itertools.compress('abcdef', {seq}))"),
+        9 => format!("list(itertools.permutations({seq}, {rr}))"),
+        10 => format!("list(itertools.combinations_with_replacement({seq}, {rr}))"),
+        11 => format!("list(itertools.combinations({seq}, {rr}))"),
+        12 => format!("list(itertools.chain.from_iterable([{seq}, 'xy', []]))"),
+        _ => format!("list(itertools.batched({seq}, {n}))"),
+    };
+    printed_or_raised("import itertools", &expr)
+}
+
+/// `int`/`float` self-introspection, another counted zero: `bit_length`,
+/// `bit_count`, `as_integer_ratio`, `is_integer`, `int.from_bytes`,
+/// `numerator`/`denominator` never appeared in the corpus and `to_bytes`
+/// appeared once, inside an unrelated case.
+///
+/// `to_bytes`/`from_bytes` are swept over BOTH byteorders and both `signed`
+/// settings at widths that do and do not fit, because the interesting answers
+/// there are the `OverflowError`s rather than the successful encodings — and the
+/// keyword forms are generated alongside the positional ones, since a keyword
+/// that never reaches the implementation is a divergence a positional-only
+/// generator cannot see.
+fn gen_numintro(seed: u64) -> Vec<String> {
+    let r = &mut Rng::new(seed);
+    let n = pick(
+        r,
+        &[
+            "0",
+            "1",
+            "-1",
+            "7",
+            "-7",
+            "255",
+            "256",
+            "-256",
+            "65535",
+            "2**63",
+            "-(2**63)",
+            "2**64 - 1",
+            "10**30",
+            "-(10**30)",
+            "True",
+            "False",
+        ],
+    );
+    let width = pick(r, &["1", "2", "4", "8", "16"]);
+    let order = pick(r, &["'big'", "'little'", "'middle'"]);
+    let signed = pick(r, &["True", "False"]);
+    let f = pick(
+        r,
+        &[
+            "0.0",
+            "-0.0",
+            "1.5",
+            "-1.5",
+            "0.1",
+            "3.0",
+            "1e300",
+            "float('inf')",
+            "float('nan')",
+            "2.0 ** -1074",
+        ],
+    );
+    let expr = match r.below(11) {
+        0 => format!("(({n}).bit_length(), ({n}).bit_count())"),
+        1 => format!("({n}).as_integer_ratio()"),
+        2 => format!("(({n}).numerator, ({n}).denominator, ({n}).real, ({n}).imag)"),
+        3 => format!("({n}).to_bytes({width}, {order}, signed={signed})"),
+        4 => format!("({n}).to_bytes(length={width}, byteorder={order}, signed={signed})"),
+        5 => format!("int.from_bytes(bytes([1, 0, 255])[:{width}], {order}, signed={signed})"),
+        6 => {
+            format!("int.from_bytes(bytearray(b'\\x80\\x01'), byteorder={order}, signed={signed})")
+        }
+        7 => format!("({f}).is_integer()"),
+        8 => format!("({f}).as_integer_ratio()"),
+        9 => format!("({f}).hex()"),
+        _ => format!("float.fromhex(({f}).hex()) == ({f})"),
+    };
+    printed_or_raised("pass", &expr)
+}
+
 fn gen_complexnum(seed: u64) -> Vec<String> {
     let r = &mut Rng::new(seed);
     let a = 1 + r.below(5);
@@ -6828,6 +6966,8 @@ enum Mode {
     Containertail,
     Binop,
     Numproto,
+    Itertail2,
+    Numintro,
 }
 
 const REAL_MODES: &[Mode] = &[
@@ -6899,6 +7039,8 @@ const REAL_MODES: &[Mode] = &[
     Mode::Containertail,
     Mode::Binop,
     Mode::Numproto,
+    Mode::Itertail2,
+    Mode::Numintro,
 ];
 
 /// Generate the statement list for a seed in the selected mode. `Mixed` rotates
@@ -6948,6 +7090,8 @@ fn gen_case(seed: u64, mode: Mode) -> Vec<String> {
         Mode::Buffer => gen_buffer(seed),
         Mode::Binop => gen_binop(seed),
         Mode::Numproto => gen_numproto(seed),
+        Mode::Itertail2 => gen_itertail2(seed),
+        Mode::Numintro => gen_numintro(seed),
         Mode::Format2 => gen_format2(seed),
         Mode::Strformat => gen_strformat(seed),
         Mode::Async => gen_async(seed),
@@ -7022,6 +7166,8 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Buffer => "buffer",
         Mode::Binop => "binop",
         Mode::Numproto => "numproto",
+        Mode::Itertail2 => "itertail2",
+        Mode::Numintro => "numintro",
         Mode::Format2 => "format2",
         Mode::Strformat => "strformat",
         Mode::Async => "async",
@@ -7125,6 +7271,8 @@ fn mode_from_name(s: &str) -> Option<Mode> {
         Mode::Containertail,
         Mode::Binop,
         Mode::Numproto,
+        Mode::Itertail2,
+        Mode::Numintro,
     ];
     ALL.iter().copied().find(|&m| mode_name(m) == s)
 }

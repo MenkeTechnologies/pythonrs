@@ -274,7 +274,7 @@ a dozen `itertools`/`collections`/`math` gaps at once, several of them silently
 wrong answers rather than errors.
 
 The same audit run over the generator corpus itself — which identifiers do the
-66 modes never emit? — is what `--mode binop` and `--mode numproto` came from.
+modes never emit? — is what `--mode binop` and `--mode numproto` came from.
 Not one case in the corpus had ever written `__radd__`, or any other reflected
 dunder; nine of the thirteen forward operators and twelve of the thirteen
 in-place ones were equally absent, as were `__round__`, `__trunc__`, `__floor__`,
@@ -296,6 +296,28 @@ Lanczos code, carried in `mathmodule.c` precisely because the platform's are not
 good enough. Porting that code closed three of the four; the fourth needed the
 FMA contraction clang applies to `num*x + coeff` by default, which is one
 rounding where a literal Rust translation has two.
+
+Counting the corpus again against the 68 modes that preceded them produced
+`--mode itertail2` and `--mode numintro`. `pairwise`, `starmap`, `groupby`,
+`zip_longest`, `filterfalse`, `dropwhile`, `takewhile`, `compress`,
+`permutations`, `combinations_with_replacement` and `chain.from_iterable` are all
+implemented and every one occurred ZERO times — `gen_itertools` covered the
+builtin `zip`/`map`/`filter`/`enumerate`/`reversed`, never the module. So did
+`bit_length`, `bit_count`, `as_integer_ratio`, `is_integer`, `int.from_bytes` and
+`numerator`/`denominator`. The counted hole held `groupby(xs, key=f)` grouping by
+the raw element while reporting it as the key (the positional `groupby(xs, f)`
+was correct, so only the keyword form was wrong), a negative `r` yielding an
+empty result instead of raising, and `True.real` answering `True` where CPython
+answers `1`.
+
+Two things about those modes are the method rather than the subject. A key
+function has to be NON-identity: a `key=` that returns its argument unchanged
+cannot distinguish "the key was applied" from "the key was ignored", which is the
+shape that hid `groupby` for as long as it was hidden. And a case whose oracle
+raises prints NOTHING and is counted barren — measured nothing at all — so
+`itertail2`'s first run reported 138 barren cases, every one of them an error
+path the mode existed to test. Printing the exception instead of letting it
+propagate turned all 138 into comparisons.
 
 A generated corpus has the mirror blind spot: it can only report combinations
 the grammar can produce. `--mode buffer` exists because of one — the grammar

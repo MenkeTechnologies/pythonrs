@@ -9,6 +9,47 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **A `slice` is hashable and richly comparable.** CPython made slices hashable
+  in 3.12; here the construction used to raise and the STORE form
+  `d[slice(1, 2)] = 1` was worse — it was taken for a slice ASSIGNMENT, so the
+  key never reached the dict at all. `PKey::Slice` now keys a slice by its three
+  bounds (a DISTINCT variant from `Tuple`, because a slice and the tuple of its
+  bounds must not share a dict slot), `pyhash::slice` reproduces CPython's own
+  number, and the four subscript paths (`get_item_raw`, `del_item_raw`,
+  `subscript_store`, `subscript_delete`) now tell a slice KEY from a slice INDEX
+  by the RECEIVER, as CPython does, so a mapping takes it as a key while a
+  sequence still splices. Slice `==`/`<`/`>` compare the bounds tuple, which also
+  fixed `slice(1, 2) in [slice(1, 2)]` (it was False for every pair of distinct
+  slice objects). `pyhash::slice` is NOT `pyhash::tuple`: CPython omits the
+  length-mangling step, verified against CPython 3.14.7 over all 1 728 bound
+  triples drawn from `None`/`0`/`1`/`-1`/`±2**63`/`10**30`/`'ab'`/`1.5`/`inf`/
+  `(1, 2)`/`True` with zero mismatches.
+- **Builtins bindable by keyword now read their keywords.** `pow`, `math.isclose`
+  and `itertools.groupby` accept by keyword what they also accept positionally,
+  and each read the positional slots alone — so the keyword forms did not raise,
+  they answered with a DEFAULT: `pow(2, exp=3)` was `2`, `pow(2, 3, mod=5)` was
+  `8`, `isclose(a, b, rel_tol=<obj with __float__>)` compared at `1e-09`, and
+  `groupby(xs, key=f)` grouped by the raw element while reporting it as the key.
+  `pow` now binds through CPython's Argument Clinic contract (`base`/`exp`/`mod`,
+  the given-by-name-and-position error, the unexpected-keyword error and the
+  at-most-3 arity), and `isclose` coerces both tolerances through `math_real`,
+  the same protocol its positionals use.
+- **`bool`'s numeric descriptors yield an `int`.** `True.real` and
+  `True.conjugate()` handed the receiver straight back, so they were `True` where
+  CPython gives `1` (`type(True.real)` is `int` and `True.real is True` is
+  False). `.numerator` already normalized; the other two now match it.
+- **A negative `r` is a `ValueError` from the combinatoric itertools.**
+  `permutations(xs, -1)` cast `-1` to `usize`, wrapped it past the pool length
+  and yielded nothing; `combinations(xs, -1)` clamped it to `0` and yielded the
+  single empty tuple. Both now raise CPython's `ValueError: r must be
+  non-negative`.
+- **A module-level builtin reports its bare `__name__` and its own
+  `__module__`.** `itertools.permutations.__name__` was the dotted
+  `'itertools.permutations'` and `__module__` was `'builtins'`; the name split
+  that type objects already got now applies to functions too.
+- **`len`, `abs`, `min` and `max` check their argument count.** `len(a, b)` and
+  `abs()` read the first slot and ignored the rest, and `min()` reported the
+  empty-iterable `ValueError` — the message for `min([])`, a different mistake.
 - **Source too deeply nested no longer aborts the process.** Five shapes killed
   the interpreter thread outright — `fatal runtime error: stack overflow`,
   SIGABRT, exit 134, no traceback and nothing for `except` to see:
@@ -1191,15 +1232,6 @@ written.
   `int`/`bignum`/`bool`/`float`/`-0.0`/`inf`/`nan`/`str` (91 206 pairs) under
   `LC_ALL` in `C`, `en_US`, `de_DE`, `hi_IN` and `fr_FR`, byte-identical to
   CPython 3.14.6 in every one.
-- **A `slice` is not hashable, so it cannot be a dict key or a set member.**
-  CPython made slices hashable in 3.12: `{slice(1, 2): 'v'}` builds there and
-  `d[slice(1.5, 2)]` reads back; here the construction raises `TypeError: cannot
-  use 'slice' as a dict key (unhashable type: 'object')`, and the STORE form
-  `d[slice(1, 2)] = 1` is worse — it is taken for a slice ASSIGNMENT and raises
-  `TypeError: 'int' object is not iterable`, so the key never reaches the dict at
-  all. Closing it means hashing the three bounds (CPython hashes the equivalent
-  tuple) and making the subscript paths tell a slice KEY from a slice INDEX by
-  the receiver rather than by the index's type.
 - **A `slice`'s repr does not dispatch a bound's `__repr__`.** `slice(Idx(),
   Idx())` renders `slice(<__main__.Idx object at 0x…>, …)` where CPython renders
   `slice(Idx(), Idx(), None)`. The rendering happens inside `PyHost::repr_of`,

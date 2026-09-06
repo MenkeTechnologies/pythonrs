@@ -215,6 +215,14 @@ pub enum PKey {
     /// The `Ellipsis` (`...`) / `NotImplemented` singletons used as dict/set keys.
     /// Hashable by identity; the tag distinguishes the two (`Ellipsis` = 0).
     Singleton(u8),
+    /// A `slice` key — CPython made slices hashable in 3.12. The three bounds,
+    /// keyed in order.
+    ///
+    /// A DISTINCT variant, not `Tuple`: a slice and the tuple of its bounds are
+    /// never equal, so they must not share a dict slot, and keying a slice as
+    /// its bounds tuple would silently unify them. They do not even hash alike —
+    /// see [`crate::pyhash::slice`].
+    Slice(Vec<PKey>),
 }
 
 /// A compiled function template: parameter shape + body chunk. Shared by every
@@ -2935,12 +2943,29 @@ impl PyHost {
     /// LEGB read: local + enclosing chain, then globals. Returns None if unbound
     /// (the caller decides whether it is a builtin or a NameError).
     pub fn read_name(&self, name: &str) -> Option<Value> {
-        let mut env = Some(self.cur_env());
-        while let Some(e) = env {
-            if let Some(v) = e.borrow().vars.get(name) {
+        // The innermost env is BORROWED from the frame rather than cloned out of
+        // it. `cur_env` hands back an `Env`, and an `Env` is an `Rc`, so every
+        // name read used to bump and drop a refcount purely to look at a map the
+        // frame already owns. Only the walk to an ENCLOSING scope needs an owned
+        // handle, because that one outlives the borrow of `self`.
+        //
+        // Each level also takes ONE borrow, not two: the old form re-entered the
+        // `RefCell` to read `parent` after the `vars` miss.
+        let mut env = {
+            let e = self.frame().env.borrow();
+            if let Some(v) = e.vars.get(name) {
                 return Some(v.clone());
             }
-            env = e.borrow().parent.clone();
+            e.parent.clone()
+        };
+        while let Some(e) = env {
+            let b = e.borrow();
+            if let Some(v) = b.vars.get(name) {
+                return Some(v.clone());
+            }
+            let parent = b.parent.clone();
+            drop(b);
+            env = parent;
         }
         self.globals().get(name).cloned()
     }
@@ -3118,7 +3143,12 @@ impl PyHost {
         if (f.globals_decl.is_empty() || !f.globals_decl.contains(name))
             && (f.nonlocals_decl.is_empty() || !f.nonlocals_decl.contains(name))
         {
-            if let Some(v) = self.cur_env().borrow().vars.get(name) {
+            // `self.frame().env`, not `self.cur_env()`: the latter clones the
+            // `Rc` out of the frame, and this is the single hottest read in the
+            // interpreter — every bare-name load in every function body arrives
+            // here. Borrowing the frame's own handle drops an atomic-free but
+            // still non-trivial refcount bump/drop pair per name read.
+            if let Some(v) = self.frame().env.borrow().vars.get(name) {
                 return NameRead::Value(v.clone());
             }
             if f.locals_set.contains(name) {
@@ -3188,11 +3218,12 @@ impl PyHost {
         // `frames.len() == 1`: a generator/coroutine runs on an isolated
         // single-frame stack, so the length test would wrongly route its locals
         // to globals (invisible to an `UnboundLocalError`-aware local read).
-        let cur = self.cur_env();
-        if cur.borrow().parent.is_none() {
+        // Same borrow-don't-clone reason as `read_name_checked`: this is on
+        // every variable WRITE, and the frame already holds the `Env`.
+        if self.frame().env.borrow().parent.is_none() {
             bind_name(self.globals_mut(), name, val);
         } else {
-            bind_name(&mut cur.borrow_mut().vars, name, val);
+            bind_name(&mut self.frame().env.borrow_mut().vars, name, val);
         }
     }
 
@@ -4684,6 +4715,18 @@ impl PyHost {
                         PKey::Foreign { hash, id }
                     }
                 }
+                // `slice` became hashable in CPython 3.12, so a slice is a legal
+                // dict key and set member. The bounds are keyed recursively, and
+                // an UNHASHABLE bound (`slice([], 1)`) propagates that error the
+                // way a tuple's element does.
+                Some(PyObj::Slice { lo, hi, step }) => {
+                    let (lo, hi, step) = (lo.clone(), hi.clone(), step.clone());
+                    PKey::Slice(vec![
+                        self.to_key(&lo)?,
+                        self.to_key(&hi)?,
+                        self.to_key(&step)?,
+                    ])
+                }
                 Some(other) => {
                     return Err(type_error(&format!(
                         "unhashable type: '{}'",
@@ -4798,6 +4841,28 @@ impl PyHost {
                     (Some(PyObj::List(x)), Some(PyObj::List(y)))
                     | (Some(PyObj::Tuple(x)), Some(PyObj::Tuple(y))) => {
                         x.len() == y.len() && x.iter().zip(y).all(|(p, q)| self.elem_equal(p, q))
+                    }
+                    // CPython compares two slices as their `(start, stop, step)`
+                    // tuples, so `slice(1, 2) == slice(1, 2)` and, because an
+                    // omitted bound IS `None`, `slice(1, 2) == slice(1, 2, None)`.
+                    // With no arm here they fell through to identity and every
+                    // distinct slice object compared unequal to every other —
+                    // which also made `slice(1, 2) in [slice(1, 2)]` False.
+                    (
+                        Some(PyObj::Slice {
+                            lo: alo,
+                            hi: ahi,
+                            step: astep,
+                        }),
+                        Some(PyObj::Slice {
+                            lo: blo,
+                            hi: bhi,
+                            step: bstep,
+                        }),
+                    ) => {
+                        self.elem_equal(alo, blo)
+                            && self.elem_equal(ahi, bhi)
+                            && self.elem_equal(astep, bstep)
                     }
                     (Some(PyObj::Dict(x)), Some(PyObj::Dict(y))) => {
                         x.len() == y.len()
@@ -6717,6 +6782,35 @@ impl PyHost {
                 }
                 Ok(x.len().cmp(&y.len()))
             }
+            // Ordering a slice is ordering its bounds tuple, element by element.
+            // Note this makes an incomparable PAIR OF BOUNDS report the BOUNDS'
+            // types, as CPython does: `slice(1, 2) < slice('a', 'b')` says
+            // "between instances of 'int' and 'str'", not "'slice' and 'slice'".
+            (
+                Some(PyObj::Slice {
+                    lo: alo,
+                    hi: ahi,
+                    step: astep,
+                }),
+                Some(PyObj::Slice {
+                    lo: blo,
+                    hi: bhi,
+                    step: bstep,
+                }),
+            ) => {
+                let pairs = [
+                    (alo.clone(), blo.clone()),
+                    (ahi.clone(), bhi.clone()),
+                    (astep.clone(), bstep.clone()),
+                ];
+                for (p, q) in &pairs {
+                    if self.equal(p, q) {
+                        continue;
+                    }
+                    return self.order(p, q, sym);
+                }
+                Ok(Ordering::Equal)
+            }
             // Two CPython Foreign objects order by CPython's own rich comparison,
             // so foreign elements inside a list/tuple sort or `<` compare correctly
             // (`sorted([(IntEnum, …)])`, `[date] < [date]`, `[Decimal] < [Decimal]`).
@@ -8020,10 +8114,15 @@ impl PyHost {
         if let Some(id) = self.foreign_id(recv) {
             return crate::ffi::get_item(self, id, idx);
         }
-        // Slice?
-        if let Some(PyObj::Slice { lo, hi, step }) = self.get(idx) {
-            let (lo, hi, step) = (lo.clone(), hi.clone(), step.clone());
-            return self.get_slice(recv, &lo, &hi, &step);
+        // Slice? On a SEQUENCE. On a mapping a slice is an ordinary key (they
+        // became hashable in CPython 3.12), and dispatching on the index alone
+        // sent `d[slice(1, 2)]` into the sequence-slice path, where a dict is
+        // "not subscriptable".
+        if !matches!(self.get(recv), Some(PyObj::Dict(_))) {
+            if let Some(PyObj::Slice { lo, hi, step }) = self.get(idx) {
+                let (lo, hi, step) = (lo.clone(), hi.clone(), step.clone());
+                return self.get_slice(recv, &lo, &hi, &step);
+            }
         }
         // A `struct_time` indexes as its 9-element sequence (`t[0]` == `tm_year`).
         if let Some(PyObj::StructTime { fields }) = self.get(recv) {
@@ -8574,10 +8673,13 @@ impl PyHost {
         if let Some(id) = self.foreign_id(recv) {
             return crate::ffi::del_item(self, id, idx);
         }
-        // Slice deletion: `del x[i:j]`, `del x[::k]`.
-        if let Some(PyObj::Slice { lo, hi, step }) = self.get(idx) {
-            let (lo, hi, step) = (lo.clone(), hi.clone(), step.clone());
-            return self.del_slice(recv, &lo, &hi, &step);
+        // Slice deletion: `del x[i:j]`, `del x[::k]` — on a SEQUENCE. Same
+        // receiver test as `get_item_raw`: `del d[slice(1, 2)]` removes a key.
+        if !matches!(self.get(recv), Some(PyObj::Dict(_))) {
+            if let Some(PyObj::Slice { lo, hi, step }) = self.get(idx) {
+                let (lo, hi, step) = (lo.clone(), hi.clone(), step.clone());
+                return self.del_slice(recv, &lo, &hi, &step);
+            }
         }
         match self.get(recv) {
             Some(PyObj::Dict(_)) => {
@@ -10801,15 +10903,15 @@ impl PyHost {
                 }
             }
             Some(PyObj::Builtin(n)) if name == "__name__" || name == "__qualname__" => {
-                // `type(x).__name__` / `.__qualname__` — the builtin type's BARE
-                // name. A module-qualified type object (`re.Pattern`,
-                // `string.templatelib.Template`) reports just the trailing
-                // component, as CPython does; the module lives in `__module__`.
+                // `__name__` / `__qualname__` — the BARE name. A qualified type
+                // object (`re.Pattern`, `string.templatelib.Template`) and a
+                // module-level builtin function (`itertools.permutations`,
+                // `math.sqrt`) are both stored under a dotted name and both
+                // report just the trailing component, as CPython does; the module
+                // lives in `__module__`. The split used to be gated on being a
+                // type object, so `permutations.__name__` was the dotted string.
                 let n = n.clone();
-                let bare = match type_object_class_name(&n) {
-                    Some(_) => n.rsplit('.').next().unwrap_or(&n).to_string(),
-                    None => n,
-                };
+                let bare = n.rsplit('.').next().unwrap_or(&n).to_string();
                 Ok(self.new_str(bare))
             }
             // A builtin type object / function reports `builtins` as its module
@@ -10819,13 +10921,15 @@ impl PyHost {
             // `signal.py` copies it off the accelerator onto each wrapper.
             Some(PyObj::Builtin(_)) if name == "__doc__" => Ok(Value::Undef),
             Some(PyObj::Builtin(n)) if name == "__module__" => {
-                // A module-qualified type object reports its own module.
+                // The module is whatever qualifies the name: the LOOKUP's
+                // qualification for a type object (a `Counter` is stored bare but
+                // belongs to `collections`), otherwise the stored name's own
+                // prefix (`math.sqrt` -> `math`). An unqualified builtin — `len`,
+                // `int` — is in `builtins`.
                 let n = n.clone();
-                let m = match type_object_class_name(&n) {
-                    Some(q) => match q.rsplit_once('.') {
-                        Some((module, _)) => module.to_string(),
-                        None => "builtins".to_string(),
-                    },
+                let qualified = type_object_class_name(&n).unwrap_or_else(|| n.clone());
+                let m = match qualified.rsplit_once('.') {
+                    Some((module, _)) => module.to_string(),
                     None => "builtins".to_string(),
                 };
                 Ok(self.new_str(m))
@@ -11091,10 +11195,15 @@ impl PyHost {
                         return Ok(Value::Float(if name == "real" { r } else { i }));
                     }
                     if let Value::Int(_) | Value::Bool(_) = recv {
-                        return Ok(if name == "real" {
-                            recv.clone()
-                        } else {
-                            Value::Int(0)
+                        return Ok(match (name, recv) {
+                            // `bool` inherits `int`'s descriptor, which yields an
+                            // INT: `True.real` is `1`, not `True` (`True.real is
+                            // True` is False and `type(True.real)` is `int`).
+                            // `.numerator` already normalized; `.real` handed the
+                            // receiver straight back and kept the bool.
+                            ("real", Value::Bool(b)) => Value::Int(*b as i64),
+                            ("real", _) => recv.clone(),
+                            _ => Value::Int(0),
                         });
                     }
                     if let Value::Float(f) = recv {
@@ -13764,7 +13873,16 @@ fn bind_params(
     // A named `*args` (`Some(non-empty)`) soaks up extra positionals; a bare `*`
     // (`Some("")`, keyword-only marker) does not — extras are an error there.
     let has_vararg = def.star.as_deref().is_some_and(|s| !s.is_empty());
-    let mut vars: NameMap = NameMap::default();
+    // Size the call environment for the signature it is about to hold. A
+    // default-constructed `NameMap` starts at capacity 0, so binding a two-arg
+    // function's parameters allocated a table and then GREW it, on every call —
+    // `hashbrown::prepare_resize` was the largest single cost under `bind_params`
+    // in a call-heavy profile. The bound is the signature's own width, which is
+    // known here and never exceeded: positional slots, `*args`, keyword-onlys and
+    // `**kwargs` are the only names this function binds.
+    let capacity =
+        np + def.kwonly.len() + usize::from(has_vararg) + usize::from(def.kwargs.is_some());
+    let mut vars: NameMap = NameMap::with_capacity_and_hasher(capacity, Default::default());
     let mut star_items = Vec::new();
     let npos = pos.len();
 
