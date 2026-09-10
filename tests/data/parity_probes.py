@@ -1212,3 +1212,16 @@ for expr in [
         print(expr, "->", repr(eval(expr)))
     except TypeError as e:
         print(expr, "-> TypeError:", e)
+
+
+import re
+
+# CPython 3.13 renamed `re.error` to `re.PatternError` and kept the old name as
+# an ALIAS of the same object, so both `__name__`s read `PatternError` and the
+# two are identical. Either name must still catch a compile error.
+print(re.error.__name__, re.PatternError.__name__, re.PatternError is re.error)
+print(re.error.__module__)
+try:
+    re.compile("(")
+except re.PatternError as _e:
+    print("caught", type(_e).__name__, isinstance(_e, re.error))

@@ -9693,9 +9693,11 @@ fn re_compile_raw(pattern: &str, flags: i64) -> Result<crate::regexpr::PyRegex, 
     } else {
         format!("(?{inline}){pattern}")
     };
+    // Raised under CPython 3.13+'s name for the class; `re.error` is an alias
+    // of the same object, so `except re.error` still catches it.
     // `PyRegex` picks the engine: the linear-time one when it can take the
     // pattern, the backtracking one when the pattern needs look-around.
-    crate::regexpr::PyRegex::new(&full).map_err(|e| format!("re.error: {e}"))
+    crate::regexpr::PyRegex::new(&full).map_err(|e| format!("re.PatternError: {e}"))
 }
 
 /// Compile `pattern` (a str or an already-compiled `Pattern`) with `flags` into a

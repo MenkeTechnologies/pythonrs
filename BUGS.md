@@ -1128,7 +1128,12 @@ written.
   `__mro__` or `__module__` off a caught exception sees the wrong thing.
   Separately, `re.error` is not a class at all here (it answers a
   `builtin_function_or_method`, so `re.error.__mro__` raises), where CPython
-  3.14.6 answers a class named `PatternError` in module `re`.
+  3.14.7 answers a class. Its NAME is no longer part of the gap: CPython 3.13
+  renamed the class `re.PatternError` and kept `re.error` as an alias, and both
+  names now resolve to one object whose `__name__` is `'PatternError'` and whose
+  `__module__` is `'re'`, with the traceback reading `re.PatternError:`. What
+  remains missing is the type object itself — `__mro__` and `isinstance`
+  against a real class.
 - **`int(str)` has no digit limit and `sys.set_int_max_str_digits` is absent.**
   CPython 3.14.6 caps a decimal `int()` conversion at 4300 digits
   (`int('9'*100000)` is `ValueError: Exceeds the limit (4300 digits) for integer

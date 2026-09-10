@@ -17502,8 +17502,13 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
             ] {
                 out.push((name, Value::Int(bit)));
             }
-            // `re.error` is a subclass of Exception; expose the class object.
-            out.push(("error", h.alloc(PyObj::Builtin("re.error".into()))));
+            // The compile-error class. CPython 3.13 renamed it `re.PatternError`
+            // and kept `re.error` as an ALIAS of the same object, so `__name__`
+            // is `'PatternError'` and `re.PatternError is re.error` is True —
+            // one allocation bound under both names, never two.
+            let pat_err = h.alloc(PyObj::Builtin("re.PatternError".into()));
+            out.push(("PatternError", pat_err.clone()));
+            out.push(("error", pat_err));
             // The `Pattern`/`Match` type objects (`isinstance(m, re.Match)`).
             out.push(("Pattern", h.alloc(PyObj::Builtin("re.Pattern".into()))));
             out.push(("Match", h.alloc(PyObj::Builtin("re.Match".into()))));
