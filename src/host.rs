@@ -13886,6 +13886,40 @@ fn bind_params(
     let mut star_items = Vec::new();
     let npos = pos.len();
 
+    // Fast path for the shape nearly every call has: one positional per
+    // parameter and nothing else in the signature. Steps 2-8 below are all
+    // no-ops for it, but they are not FREE no-ops — step 5 alone hashes every
+    // parameter name a second time to ask `contains_key` about a slot step 1
+    // has just filled, and the kwonly and leftover passes still walk their
+    // (empty) collections.
+    //
+    // Every later step is skipped only when the condition that makes it a no-op
+    // is checked here: no keywords to bind or reject, no `*args`/`**kwargs`, no
+    // keyword-onlys, and exactly `np` positionals — so no default can be needed
+    // (every slot is filled) and none can be missing. `posonly` is irrelevant
+    // without keywords, which is the only way to violate it.
+    //
+    // Worth -6.27% of the INSTRUCTIONS RETIRED of a call-heavy benchmark
+    // (8.82G -> 8.27G, 120k calls) against an A/A control of +0.08% on the same
+    // instrument. The saving is per-CALL, not a fixed startup cost: a
+    // subscript-heavy benchmark that makes almost no user calls moves +0.15%,
+    // i.e. nothing, so the absolute deltas are nowhere near equal. Measured on a
+    // `cargo build` (debug) binary, where an unoptimized hash lookup is dear;
+    // the release ratio will differ.
+    if npos == np
+        && kwargs.is_empty()
+        && !has_vararg
+        && def.star.is_none()
+        && def.kwargs.is_none()
+        && def.kwonly.is_empty()
+    {
+        for (i, val) in pos.into_iter().enumerate() {
+            vars.insert(def.params[i].clone(), val);
+        }
+        env.borrow_mut().vars = vars;
+        return Ok(());
+    }
+
     // 1. Place positional args into their slots; keep the overflow aside.
     for (i, val) in pos.into_iter().enumerate() {
         if i < np {
