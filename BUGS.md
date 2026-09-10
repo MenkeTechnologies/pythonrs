@@ -9,6 +9,41 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **A keyword a builtin does not take is now a `TypeError`, not a dropped name.**
+  This is the general form of the `pow`/`isclose`/`groupby` gap below, and it was
+  worse than an error: an unrecognised keyword was DISCARDED, so the call re-ran
+  as its zero-argument form and answered SILENTLY WRONG. `float(x='1.5')` was
+  `0.0`, `str(object=5)` was `''`, `bytes(source=[1,2])` was `b''`,
+  `complex(real=1, imag=2)` was `0j`, `list(iterable=[1,2])` was `[]`,
+  `bool(x=1)` was `False`, `set(iterable=[1])` was `set()`, `int(x='12')` was
+  `0`, and `dir(object=1)` / `vars(object=1)` returned the caller's whole
+  namespace. `round(2.567, ndigits=2)` was `3` and `sum([1,2,3], start=10)` was
+  `6` — the keyword-only halves of two signatures, ignored. `sorted([3,1],
+  bad=1)` and `map(str, [1], bad=1)` simply ran.
+  The 42 names CPython defines without `…_WITH_KEYWORDS` now refuse every
+  keyword (`NO_KWARG_BUILTINS`), and the ones that DO take keywords bind through
+  a single `bind_named` — `round`, `sum`, `str`, `bytes`, `bytearray`,
+  `complex`, `enumerate`, `memoryview`, `int`'s `base`, and `pow`, which was the
+  one-off this generalises. Each name's contract was measured against
+  /opt/homebrew/bin/python3 (Python 3.14.7), not inferred.
+  Two orderings had to be measured rather than assumed. Argument Clinic reports a
+  MISSING required argument BEFORE an unexpected keyword, so `pow(zz=1)` is
+  `missing required argument 'base'` — the previous `pow_args` answered
+  `unexpected keyword argument 'zz'`, so routing it through the shared binder
+  fixed a residual of its own fix. The older `PyArg_ParseTupleAndKeywords` path
+  reverses that and also words the refusal differently, which is why
+  `enumerate(zz=1)` is `'zz' is an invalid keyword argument for enumerate()`
+  (`KwStyle::Invalid`). `sum` counts keywords toward its arity before binding
+  any, so `sum([1], start=1, bad=2)` is `takes at most 2 arguments (3 given)`.
+- **A `slice` reprs its bounds.** `repr(slice(x, y))` printed the default
+  `<Cls object at 0x…>` for an instance bound instead of dispatching its
+  `__repr__`, because the host's `repr_of` is `&self` and cannot call back into a
+  method. Slices now recurse through `py_repr` the way lists, tuples and dicts
+  already did. Deliberately NOT joined to that layer's reentrancy guard:
+  CPython's `slice_repr` takes no `Py_ReprEnter`, so for
+  `l = []; s = slice(l); l.append(s)` the `[...]` marker comes from the list in
+  between and the inner slice re-prints in full —
+  `slice(None, [slice(None, [...], None)], None)`.
 - **A `slice` is hashable and richly comparable.** CPython made slices hashable
   in 3.12; here the construction used to raise and the STORE form
   `d[slice(1, 2)] = 1` was worse — it was taken for a slice ASSIGNMENT, so the

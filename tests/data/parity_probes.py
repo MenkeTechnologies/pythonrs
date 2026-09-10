@@ -1162,3 +1162,53 @@ for fn in (itertools.permutations, itertools.combinations,
         print(fn.__name__, list(fn("AB", -1)))
     except ValueError as e:
         print(fn.__name__, type(e).__name__, e)
+
+
+# A slice reprs its BOUNDS, so an instance bound dispatches its own `__repr__`
+# instead of falling back to the default `<Cls object at 0x…>`. The recursive
+# shape is load-bearing: `slice_repr` takes no reentrancy guard, so the `[...]`
+# marker comes from the list in between and the inner slice re-prints in full.
+class Bound:
+    def __init__(self, v):
+        self.v = v
+
+    def __repr__(self):
+        return "Bound<%s>" % self.v
+
+
+print(repr(slice(Bound(1), Bound(2))), repr(slice(None, Bound(5))))
+print(repr(slice(Bound(1), Bound(2), Bound(3))))
+_cyc = []
+_cyc.append(slice(_cyc))
+print(repr(_cyc[0]))
+
+# Keyword arguments to builtins. A name the callee does not take is a TypeError;
+# it must never be DROPPED, because dropping it silently re-runs the call in its
+# zero-argument form and answers wrong rather than raising.
+print(round(2.567, ndigits=2), round(number=2.567, ndigits=2), round(number=2.567))
+print(sum([1, 2, 3], start=10), sum([1, 2, 3], 10))
+print(str(object=5), str(object=b"ab", encoding="utf-8"), str(b"ab", encoding="utf-8"))
+print(bytes(source=[1, 2]), bytes(source="ab", encoding="utf-8"))
+print(complex(real=1, imag=2), complex(imag=2), complex(real=1))
+print(list(enumerate(iterable=[1, 2], start=3)))
+print(int("ff", base=16))
+for expr in [
+    "float(x='1.5')", "bool(x=1)", "list(iterable=[1,2])", "tuple(iterable=[1,2])",
+    "set(iterable=[1])", "frozenset(iterable=[1])", "len(obj=[1])", "abs(x=-1)",
+    "repr(obj=1)", "hash(obj=1)", "id(obj=1)", "any(iterable=[1])", "all(iterable=[1])",
+    "divmod(x=7,y=2)", "chr(i=65)", "ord(c='a')", "hex(number=255)", "oct(number=8)",
+    "bin(number=5)", "range(stop=3)", "slice(stop=3)", "iter(object=[1])",
+    "dir(object=1)", "vars(object=1)", "ascii(obj=1)", "reversed(sequence=[1])",
+    "getattr(object=1, name='real')", "isinstance(obj=1, class_or_tuple=int)",
+    "format(value=3.5, format_spec='.2f')", "sorted([3,1], bad=1)",
+    "sorted(iterable=[3,1])", "int(x='12')", "int(bad=1)", "int(base=16)",
+    "type(object=1)", "object(x=1)", "map(func=str)", "map(str,[1],bad=1)",
+    "zip([1], iterables=[2])", "sum(bad=1)", "sum([1], start=1, bad=2)",
+    "pow(zz=1)", "round(x=1)", "round(2.567, 2, 3)", "enumerate(zz=1)",
+    "str(bad=1)", "bytes(bad=1)", "complex(real=1, bad=2)",
+    "eval(expression='1')", "exec(source='1')",
+]:
+    try:
+        print(expr, "->", repr(eval(expr)))
+    except TypeError as e:
+        print(expr, "-> TypeError:", e)

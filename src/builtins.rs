@@ -4641,6 +4641,28 @@ pub fn py_repr(v: &Value) -> Result<String, String> {
             return Ok(with_host(|h| h.str_of(&r)));
         }
     }
+    // A slice reprs its three bounds through this layer so an instance bound
+    // dispatches its own `__repr__` (the host's `repr_of` is `&self` and cannot
+    // call back into a method). Deliberately NOT part of the `Cont` recursion
+    // guard below: CPython's `slice_repr` never calls `Py_ReprEnter`, so a slice
+    // reachable from its own bound re-prints once and the marker comes from the
+    // container in between —
+    //   `l = []; s = slice(l); l.append(s); repr(s)`
+    //   → `slice(None, [slice(None, [...], None)], None)`
+    // (/opt/homebrew/bin/python3, Python 3.14.7). Registering the slice in the
+    // guard would instead cut at the inner slice and print `[...]` one level early.
+    let sl = with_host(|h| match h.get(v) {
+        Some(PyObj::Slice { lo, hi, step }) => Some((lo.clone(), hi.clone(), step.clone())),
+        _ => None,
+    });
+    if let Some((lo, hi, step)) = sl {
+        return Ok(format!(
+            "slice({}, {}, {})",
+            py_repr(&lo)?,
+            py_repr(&hi)?,
+            py_repr(&step)?
+        ));
+    }
     // Containers recurse through this layer so instance elements/keys/values
     // dispatch their own `__repr__` (the host's `repr_of` is `&self` and can't
     // call back into a method).
@@ -5231,6 +5253,9 @@ pub fn call_builtin_function(
             })
         }));
     }
+    // A keyword for a builtin that takes none is a TypeError, not a value to
+    // drop on the floor. Central so every arm below can assume it away.
+    reject_kwargs(name, &kwargs)?;
     match name {
         "print" => {
             let sep = kw_get(&kwargs, "sep")
@@ -5338,8 +5363,40 @@ pub fn call_builtin_function(
             // Faithful port of CPython 3.14 `builtin_sum_impl`: an exact integer
             // prefix, then Neumaier compensated summation once the accumulator is
             // a float (so `sum([0.1]*10) == 1.0`), then generic `+` for the tail.
-            let seq = arg0(&args)?;
-            let start = args.get(1).cloned().unwrap_or(Value::Int(0));
+            // `sum(iterable, /, start=0)`: `start` takes a keyword, `iterable`
+            // does not. Dropping `start=` summed from 0 — `sum([1,2,3], start=10)`
+            // was `6`. CPython reports a missing `iterable` as a positional-count
+            // error even when the caller wrote `iterable=`, so the arity check
+            // comes first.
+            // `sum` counts KEYWORDS toward its arity before binding any of them,
+            // so both bounds are checked on the combined total and neither
+            // message names a parameter:
+            //   sum(bad=1)                  -> takes at least 1 positional argument (0 given)
+            //   sum([1], start=1, bad=2)    -> takes at most 2 arguments (3 given)
+            let total = args.len() + kwargs.len();
+            if args.is_empty() {
+                return Err(host::type_error(
+                    "sum() takes at least 1 positional argument (0 given)",
+                ));
+            }
+            if total > 2 {
+                return Err(host::type_error(&format!(
+                    "sum() takes at most 2 arguments ({total} given)"
+                )));
+            }
+            let [seq, startv] = bind_named(
+                "sum",
+                ["iterable", "start"],
+                1,
+                1,
+                KwStyle::Unexpected,
+                &args,
+                &kwargs,
+            )?;
+            let seq = seq.ok_or_else(|| {
+                host::type_error("sum() takes at least 1 positional argument (0 given)")
+            })?;
+            let start = startv.unwrap_or(Value::Int(0));
             // CPython rejects str/bytes/bytearray start values up front.
             if let Some(msg) = sum_bad_start(&start) {
                 return Err(host::type_error(&format!("sum() can't sum {msg}")));
@@ -5449,11 +5506,23 @@ pub fn call_builtin_function(
             Ok(with_host(|h| h.new_iter_kind(items, kind)))
         }
         "enumerate" => {
-            // Lazy: pairs `(index, value)` pulled on demand. `start=` kwarg or
-            // positional second arg sets the initial index.
-            let source = host::make_iterator(&arg0(&args)?)?;
-            let start = kw_get(&kwargs, "start")
-                .or_else(|| args.get(1).cloned())
+            // Lazy: pairs `(index, value)` pulled on demand. Both parameters take
+            // keywords — `enumerate(iterable=…, start=…)` — and an unknown one is
+            // an error rather than a silently dropped name.
+            let [it, startv] = bind_named(
+                "enumerate",
+                ["iterable", "start"],
+                0,
+                1,
+                KwStyle::Invalid,
+                &args,
+                &kwargs,
+            )?;
+            let it = it.ok_or_else(|| {
+                host::type_error("enumerate() missing required argument 'iterable' (pos 1)")
+            })?;
+            let source = host::make_iterator(&it)?;
+            let start = startv
                 .and_then(|v| with_host(|h| h.as_int(&v)))
                 .unwrap_or(0);
             Ok(with_host(|h| {
@@ -5465,6 +5534,12 @@ pub fn call_builtin_function(
             }))
         }
         "zip" => {
+            // `strict` is `zip`'s only keyword; any other was being ignored.
+            if let Some((k, _)) = kwargs.iter().find(|(k, _)| k != "strict") {
+                return Err(host::type_error(&format!(
+                    "zip() got an unexpected keyword argument '{k}'"
+                )));
+            }
             // Lazy `zip`: one iterator per argument, tuple pulled on demand.
             let mut sources = Vec::with_capacity(args.len());
             for a in &args {
@@ -5482,6 +5557,20 @@ pub fn call_builtin_function(
             }))
         }
         "map" => {
+            // 3.14 `map` takes exactly one keyword, `strict`. Any other name was
+            // dropped, so `map(str, [1], bad=1)` mapped happily. The COUNT is
+            // checked before the names, so two bad keywords report the count.
+            if kwargs.len() > 1 {
+                return Err(host::type_error(&format!(
+                    "map() takes at most 1 keyword argument ({} given)",
+                    kwargs.len()
+                )));
+            }
+            if let Some((k, _)) = kwargs.iter().find(|(k, _)| k != "strict") {
+                return Err(host::type_error(&format!(
+                    "map() got an unexpected keyword argument '{k}'"
+                )));
+            }
             // Lazy `map`: `func` applied to items pulled from each iterable.
             let f = arg0(&args)?;
             let mut sources = Vec::with_capacity(args.len().saturating_sub(1));
@@ -5530,10 +5619,23 @@ pub fn call_builtin_function(
             Ok(Value::Bool(true))
         }
         "round" => {
-            let v = arg0(&args)?;
-            // `ndigits` is present only when a second arg was passed and it is not None.
-            let has_nd = matches!(args.get(1), Some(x) if !matches!(x, Value::Undef));
-            let nd = args.get(1).and_then(|v| with_host(|h| h.as_int(v)));
+            // `round(number, ndigits=None)` takes both by keyword. Dropping
+            // `ndigits=` rounded to an integer: `round(2.567, ndigits=2)` was `3`.
+            let [num, ndv] = bind_named(
+                "round",
+                ["number", "ndigits"],
+                0,
+                1,
+                KwStyle::Unexpected,
+                &args,
+                &kwargs,
+            )?;
+            let v = num.ok_or_else(|| {
+                host::type_error("round() missing required argument 'number' (pos 1)")
+            })?;
+            // `ndigits` is present only when it was passed and is not None.
+            let has_nd = matches!(&ndv, Some(x) if !matches!(x, Value::Undef));
+            let nd = ndv.as_ref().and_then(|v| with_host(|h| h.as_int(v)));
             match &v {
                 Value::Bool(b) => Ok(round_int(&num_bigint::BigInt::from(*b as i64), has_nd, nd)),
                 Value::Int(n) => Ok(round_int(&num_bigint::BigInt::from(*n), has_nd, nd)),
@@ -5550,10 +5652,9 @@ pub fn call_builtin_function(
                         _ => h.foreign_id(&v).is_some(),
                     });
                     if has_round {
-                        let margs = if has_nd {
-                            vec![args[1].clone()]
-                        } else {
-                            vec![]
+                        let margs = match (&ndv, has_nd) {
+                            (Some(n), true) => vec![n.clone()],
+                            _ => vec![],
                         };
                         host::call_method(&v, "__round__", margs, vec![])
                     } else {
@@ -5624,6 +5725,12 @@ pub fn call_builtin_function(
                     );
                 }
                 return type_new(&args[0], &args[1], &args[2]);
+            }
+            // Only the 3-argument form takes keywords (they go to the metaclass),
+            // and only 1 or 3 positionals are legal at all. `type(object=1)` was
+            // dropping the keyword and then reporting a generic missing argument.
+            if args.len() != 1 {
+                return Err(host::type_error("type() takes 1 or 3 arguments"));
             }
             // 1-arg form: the object's type.
             let v = arg0(&args)?;
@@ -6113,6 +6220,18 @@ pub fn call_builtin_function(
         "eval" | "exec" => run_pysource(name == "eval", &args),
         // Type constructors.
         "int" => {
+            // `int(x, /, base=10)`: `base` is the ONLY keyword. Any other name
+            // was being dropped, so `int(x='12')` answered `0` instead of
+            // raising — and with no positional left, `int(base=16)` reports a
+            // missing STRING rather than a missing argument.
+            if let Some((k, _)) = kwargs.iter().find(|(k, _)| k != "base") {
+                return Err(host::type_error(&format!(
+                    "int() got an unexpected keyword argument '{k}'"
+                )));
+            }
+            if args.is_empty() && !kwargs.is_empty() {
+                return Err(host::type_error("int() missing string argument"));
+            }
             // Fold an `int(x, base=B)` keyword into the positional base slot.
             let mut a = args.clone();
             if let Some(base) = kw_get(&kwargs, "base") {
@@ -6128,8 +6247,25 @@ pub fn call_builtin_function(
             construct_int(&a)
         }
         "float" => construct_float(&args),
+        // `str(object='', encoding=…, errors=…)` — all three take keywords, so
+        // `str(object=5)` is `'5'`. Dropping the keyword made it `str()` → `''`.
         "str" => {
-            let v = args.first().cloned().unwrap_or_else(|| Value::str(""));
+            let [obj, enc, errs] = bind_named(
+                "str",
+                ["object", "encoding", "errors"],
+                0,
+                0,
+                KwStyle::Unexpected,
+                &args,
+                &kwargs,
+            )?;
+            let v = obj.unwrap_or_else(|| Value::str(""));
+            // With an encoding, `str` DECODES a buffer rather than repr-ing it:
+            // `str(b'ab', encoding='utf-8')` is `'ab'`, not `"b'ab'"`.
+            if enc.is_some() || errs.is_some() {
+                let dargs: Vec<Value> = [enc, errs].into_iter().flatten().collect();
+                return call_type_method(&v, "decode", dargs, vec![]);
+            }
             let s = py_str(&v)?;
             Ok(with_host(|h| h.new_str(s)))
         }
@@ -6172,6 +6308,26 @@ pub fn call_builtin_function(
         }
         "dict" => construct_dict(&args, &kwargs),
         "complex" => {
+            // `complex(real=…, imag=…)` takes both by keyword; dropping them made
+            // `complex(real=1, imag=2)` the zero-argument `0j`.
+            let args: Vec<Value> = if kwargs.is_empty() {
+                args
+            } else {
+                bind_named(
+                    "complex",
+                    ["real", "imag"],
+                    0,
+                    0,
+                    KwStyle::Unexpected,
+                    &args,
+                    &kwargs,
+                )?
+                .into_iter()
+                // `complex(imag=2)` leaves `real` unset, which is 0.0 — the
+                // slots must stay positionally aligned, so fill rather than skip.
+                .map(|s| s.unwrap_or(Value::Float(0.0)))
+                .collect()
+            };
             // `complex("1+2j")` — string parsing (single string arg only).
             if let Some(first) = args.first() {
                 if let Some(s) = with_host(|h| h.as_str(first)) {
@@ -6213,16 +6369,40 @@ pub fn call_builtin_function(
             };
             Ok(with_host(|h| h.alloc(PyObj::Complex(r, i + ri))))
         }
-        "bytes" => {
-            let b = build_bytes(&args)?;
-            Ok(with_host(|h| h.alloc(PyObj::Bytes(b))))
-        }
-        "bytearray" => {
-            let b = build_bytes(&args)?;
-            Ok(with_host(|h| h.alloc(PyObj::Bytearray(b))))
+        // `bytes(source=…, encoding=…, errors=…)` takes all three by keyword;
+        // dropping them made `bytes(source=[1,2])` the empty `bytes()`.
+        "bytes" | "bytearray" => {
+            let slots = bind_named(
+                name,
+                ["source", "encoding", "errors"],
+                0,
+                0,
+                KwStyle::Unexpected,
+                &args,
+                &kwargs,
+            )?;
+            let bargs: Vec<Value> = slots.into_iter().flatten().collect();
+            let b = build_bytes(&bargs)?;
+            Ok(with_host(|h| {
+                if name == "bytes" {
+                    h.alloc(PyObj::Bytes(b))
+                } else {
+                    h.alloc(PyObj::Bytearray(b))
+                }
+            }))
         }
         "memoryview" => {
-            let v = arg0(&args)?;
+            // `memoryview(object=…)` binds by name; the keyword was being dropped.
+            let [obj] = bind_named(
+                "memoryview",
+                ["object"],
+                0,
+                1,
+                KwStyle::Unexpected,
+                &args,
+                &kwargs,
+            )?;
+            let v = obj.unwrap();
             with_host(|h| {
                 let (len, readonly) = match h.get(&v) {
                     Some(PyObj::Bytes(b)) => (b.len(), true),
@@ -6282,9 +6462,16 @@ pub fn call_builtin_function(
             let newline = str_arg("newline", 5);
             host::open_file(&path, &mode, encoding.as_deref(), newline.as_deref())
         }
-        "object" => Ok(with_host(|h| {
-            h.new_instance("object".into(), host::NameMap::default())
-        })),
+        // `object()` takes nothing at all — neither positional nor keyword.
+        // Both were being ignored, so `object(x=1)` built an instance.
+        "object" => {
+            if !args.is_empty() || !kwargs.is_empty() {
+                return Err(host::type_error("object() takes no arguments"));
+            }
+            Ok(with_host(|h| {
+                h.new_instance("object".into(), host::NameMap::default())
+            }))
+        }
         // An inline-Rust export reached as a resolved builtin object rather
         // than by name (the CALL protocol resolves its callee first).
         _ => match host::call_rust_ffi(name, &args) {
@@ -6336,48 +6523,186 @@ fn pow_args(
     args: &[Value],
     kwargs: &[(String, Value)],
 ) -> Result<(Value, Value, Option<Value>), String> {
-    const NAMES: [&str; 3] = ["base", "exp", "mod"];
-    if args.len() > NAMES.len() {
+    let [base, exp, m] = bind_named(
+        "pow",
+        ["base", "exp", "mod"],
+        0,
+        2,
+        KwStyle::Unexpected,
+        args,
+        kwargs,
+    )?;
+    Ok((base.unwrap(), exp.unwrap(), m))
+}
+
+/// Builtins CPython defines with `METH_O`/`METH_FASTCALL`/`METH_VARARGS` — no
+/// `…_WITH_KEYWORDS` — so EVERY keyword is a `TypeError` naming the function,
+/// never a parameter to bind.
+///
+/// pythonrs used to DROP a keyword it did not recognise. The call then ran as
+/// its zero-argument form and answered SILENTLY WRONG rather than raising:
+/// `float(x='1.5')` was `0.0`, `set(iterable=[1])` was `set()`,
+/// `list(iterable=[1,2])` was `[]`, `bool(x=1)` was `False`, and
+/// `dir(object=1)` / `vars(object=1)` returned the caller's whole namespace.
+///
+/// Membership is per name and measured, not guessed — each was run as
+/// `f(<param>=…)` under /opt/homebrew/bin/python3 (Python 3.14.7) and kept only
+/// when CPython answered `f() takes no keyword arguments`. Names whose refusal
+/// has DIFFERENT wording (`object`, `map`, `zip`, `eval`, `exec`, `sorted`,
+/// `type`) are deliberately absent — they keep their own arm's message.
+const NO_KWARG_BUILTINS: &[&str] = &[
+    "abs",
+    "aiter",
+    "all",
+    "any",
+    "ascii",
+    "bin",
+    "bool",
+    "callable",
+    "chr",
+    "delattr",
+    "dir",
+    "divmod",
+    "filter",
+    "float",
+    "format",
+    "frozenset",
+    "getattr",
+    "globals",
+    "hasattr",
+    "hash",
+    "hex",
+    "id",
+    "isinstance",
+    "issubclass",
+    "iter",
+    "len",
+    "list",
+    "locals",
+    "next",
+    "oct",
+    "ord",
+    "range",
+    "repr",
+    "reversed",
+    "set",
+    "setattr",
+    "slice",
+    "staticmethod",
+    "classmethod",
+    "super",
+    "tuple",
+    "vars",
+];
+
+/// Refuse a keyword for a builtin that takes none. See [`NO_KWARG_BUILTINS`].
+fn reject_kwargs(name: &str, kwargs: &[(String, Value)]) -> Result<(), String> {
+    if !kwargs.is_empty() && NO_KWARG_BUILTINS.contains(&name) {
         return Err(host::type_error(&format!(
-            "pow() takes at most {} arguments ({} given)",
-            NAMES.len(),
+            "{name}() takes no keyword arguments"
+        )));
+    }
+    Ok(())
+}
+
+/// How a builtin words its refusal of a keyword it does not have.
+#[derive(Clone, Copy, PartialEq)]
+enum KwStyle {
+    /// `f() got an unexpected keyword argument 'k'` — Argument Clinic's wording,
+    /// used by nearly everything.
+    Unexpected,
+    /// `'k' is an invalid keyword argument for f()` — the older
+    /// `PyArg_ParseTupleAndKeywords` wording that `enumerate` still carries.
+    /// That path also REVERSES the report order: it rejects the unknown name
+    /// before noticing a missing required one, so `enumerate(zz=1)` names `zz`
+    /// where `round(x=1)` names the missing `number`.
+    Invalid,
+}
+
+/// Bind positional `args` and `kwargs` onto the `N` named parameter slots of a
+/// builtin that DOES take keywords. The one binder for every such arm, `pow`
+/// included.
+///
+/// `posonly` is the count of leading positional-ONLY parameters (the `/` in
+/// CPython's signature): naming one is an unexpected-keyword error, because the
+/// name is documentation, not a keyword. `sum(iterable, /, start=0)` is
+/// `posonly=1`, so `sum(iterable=[1,2])` raises rather than binding.
+///
+/// `required` is the count of leading parameters with no default.
+///
+/// ORDER MATTERS, and it is the reverse of what reads naturally: CPython reports
+/// a MISSING required argument BEFORE an unexpected keyword, so
+/// `pow(zz=1)` is `pow() missing required argument 'base' (pos 1)` and
+/// `round(x=1)` is `round() missing required argument 'number' (pos 1)` — not a
+/// complaint about `zz`/`x`. Checking the unknown name first (as the previous
+/// `pow_args` did) gets both of those wrong. An unknown name is therefore
+/// remembered and only raised once every required slot is filled.
+///
+/// Every message here was read off /opt/homebrew/bin/python3 (Python 3.14.7).
+fn bind_named<const N: usize>(
+    fname: &str,
+    names: [&str; N],
+    posonly: usize,
+    required: usize,
+    style: KwStyle,
+    args: &[Value],
+    kwargs: &[(String, Value)],
+) -> Result<[Option<Value>; N], String> {
+    if args.len() > N {
+        return Err(host::type_error(&format!(
+            "{fname}() takes at most {N} arguments ({} given)",
             args.len()
         )));
     }
-    let mut slots: [Option<Value>; 3] = [None, None, None];
+    let mut slots: [Option<Value>; N] = std::array::from_fn(|_| None);
     for (i, v) in args.iter().enumerate() {
         slots[i] = Some(v.clone());
     }
+    let unknown = |k: &str| {
+        host::type_error(&match style {
+            KwStyle::Unexpected => format!("{fname}() got an unexpected keyword argument '{k}'"),
+            KwStyle::Invalid => format!("'{k}' is an invalid keyword argument for {fname}()"),
+        })
+    };
+    let mut deferred: Option<String> = None;
     for (k, v) in kwargs {
-        match NAMES.iter().position(|n| n == k) {
-            // A name that already took a positional is CPython's "given by name
-            // and position", which reports the 1-based position of the slot.
+        match names.iter().position(|n| n == k) {
+            // Filled by a positional already — CPython reports the 1-based slot.
+            // This one DOES win over a missing-argument report, because the call
+            // is contradictory rather than incomplete.
             Some(i) if i < args.len() => {
                 return Err(host::type_error(&format!(
-                    "argument for pow() given by name ('{k}') and position ({})",
+                    "argument for {fname}() given by name ('{k}') and position ({})",
                     i + 1
                 )))
             }
+            // A positional-only slot's name is not a keyword at all.
+            Some(i) if i < posonly => deferred = deferred.or_else(|| Some(unknown(k))),
             Some(i) => slots[i] = Some(v.clone()),
-            None => {
-                return Err(host::type_error(&format!(
-                    "pow() got an unexpected keyword argument '{k}'"
-                )))
-            }
+            None => deferred = deferred.or_else(|| Some(unknown(k))),
         }
     }
-    // Required arguments are reported in signature order, so a call giving only
+    // The old parser rejects the name it does not know before it looks for what
+    // is missing; Argument Clinic does the reverse (see `KwStyle`).
+    if style == KwStyle::Invalid {
+        if let Some(e) = deferred {
+            return Err(e);
+        }
+    }
+    // Required slots are reported in signature order, so a call giving only
     // `mod` names `base` as missing rather than `exp`.
-    for (i, name) in NAMES[..2].iter().enumerate() {
+    for (i, name) in names[..required].iter().enumerate() {
         if slots[i].is_none() {
             return Err(host::type_error(&format!(
-                "pow() missing required argument '{name}' (pos {})",
+                "{fname}() missing required argument '{name}' (pos {})",
                 i + 1
             )));
         }
     }
-    let [base, exp, m] = slots;
-    Ok((base.unwrap(), exp.unwrap(), m))
+    match deferred {
+        Some(e) => Err(e),
+        None => Ok(slots),
+    }
 }
 
 /// 3-argument `pow(base, exp, mod)` — modular exponentiation. All three must be
@@ -6453,9 +6778,13 @@ fn run_pysource(want_value: bool, args: &[Value]) -> Result<Value, String> {
                 "{fname}() arg 1 must be a string, bytes or code object"
             ))
         })?,
+        // `eval`/`exec` take their source positionally-only, so an absent one is
+        // a positional-COUNT complaint rather than a named-argument one —
+        // `eval(expression='1')` is `eval() takes at least 1 positional
+        // argument (0 given)` (/opt/homebrew/bin/python3, Python 3.14.7).
         None => {
             return Err(host::type_error(&format!(
-                "{fname}() missing required argument: 'source' (pos 1)"
+                "{fname}() takes at least 1 positional argument (0 given)"
             )))
         }
     };
@@ -6996,6 +7325,22 @@ fn eval_key(key: &Option<Value>, v: &Value) -> Result<Value, String> {
 }
 
 fn py_sorted(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, String> {
+    // `sorted(iterable, /, *, key=None, reverse=False)`. The iterable is
+    // positional-only, and the arity error comes first — so `sorted(iterable=…)`
+    // is a count complaint, not an unknown-keyword one. An unrecognised keyword
+    // was being ignored outright (`sorted([3,1], bad=1)` just sorted), and
+    // CPython's message for it names `sort()`, the list method it delegates to.
+    if args.is_empty() {
+        return Err(host::type_error(&format!(
+            "sorted expected 1 argument, got {}",
+            args.len()
+        )));
+    }
+    if let Some((k, _)) = kwargs.iter().find(|(k, _)| k != "key" && k != "reverse") {
+        return Err(host::type_error(&format!(
+            "sort() got an unexpected keyword argument '{k}'"
+        )));
+    }
     let mut items = host::iter_vec(&arg0(args)?)?;
     let key = kw_get(kwargs, "key");
     let reverse = kw_get(kwargs, "reverse")
