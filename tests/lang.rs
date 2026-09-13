@@ -8411,3 +8411,67 @@ fn a_literal_called_or_wrongly_subscripted_warns_about_the_missing_comma() {
         );
     }
 }
+
+/// An argument after a keyword one that CPython cannot lower is a `SyntaxError`
+/// at compile time, not a silent reordering.
+///
+/// The AST keeps positionals and keywords in two separate lists, so by the time
+/// anything downstream saw `f(a=1, 2)` the source order was already gone: it
+/// lowered to `args=[2], keywords=[a=1]` and CALLED the function, printing
+/// `(2,) {'a': 1}` and exiting 0 where CPython refuses the program and exits 1.
+/// A wrong answer, not a missing diagnostic.
+///
+/// All three messages, and the precedence between them, were measured against
+/// CPython 3.14.7: `**` unpacking wins the wording whenever it applies, so
+/// `f(a=1, **k, 2)` reports the unpacking form even though a plain keyword came
+/// first.
+#[test]
+fn an_argument_after_a_keyword_is_rejected_like_cpython() {
+    const PRE: &str = "def f(*a, **k): pass\nb = [9]\nk2 = {'z': 1}\nclass Base: pass\n";
+    const POS_KW: &str = "SyntaxError: positional argument follows keyword argument";
+    const POS_UNPACK: &str = "SyntaxError: positional argument follows keyword argument unpacking";
+    const STAR_UNPACK: &str =
+        "SyntaxError: iterable argument unpacking follows keyword argument unpacking";
+    for (tail, want) in [
+        ("f(a=1, 2)", POS_KW),
+        ("f(a=1, b=2, 3)", POS_KW),
+        ("f(a=1, 2, 3)", POS_KW),
+        ("f(a=1, *b, 2)", POS_KW),
+        ("print(sep='', 1)", POS_KW),
+        ("[f(a=1, 2) for _ in [0]]", POS_KW),
+        ("class C(Base, a=1, 2): pass", POS_KW),
+        ("f(**k2, 2)", POS_UNPACK),
+        ("f(*b, **k2, 2)", POS_UNPACK),
+        // A plain keyword came first, but `**` still decides the wording.
+        ("f(a=1, **k2, 2)", POS_UNPACK),
+        ("f(**k2, *b)", STAR_UNPACK),
+        ("f(a=1, **k2, *b)", STAR_UNPACK),
+    ] {
+        assert_eq!(
+            eval_str(&format!("{PRE}{tail}")).expect_err("must be rejected"),
+            want,
+            "for {tail}"
+        );
+    }
+}
+
+/// The other half: every ordering CPython DOES accept must still run. A check
+/// that refused `f(a=1, *b)` or `f(**k, b=1)` would break working programs,
+/// which is the more expensive way to be wrong.
+#[test]
+fn legal_argument_orderings_still_run() {
+    const PRE: &str = "def f(*a, **k): pass\nb = [9]\nk2 = {'z': 1}\nclass Base: pass\n";
+    for tail in [
+        "f(*b, 2)",
+        "f(a=1, *b)",
+        "f(**k2, b=1)",
+        "f(a=1, **k2)",
+        "f(1, a=2)",
+        "f(*b, a=1)",
+        "f(1, 2, a=3, **k2)",
+        "f(x for x in b)",
+        "class C(Base, metaclass=type): pass",
+    ] {
+        eval_str(&format!("{PRE}{tail}")).unwrap_or_else(|e| panic!("{tail} should run: {e}"));
+    }
+}

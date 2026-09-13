@@ -64,6 +64,49 @@ const MAX_TREE_DEPTH: u32 = 20_000;
 const TOO_COMPLEX: &str =
     "MemoryError: Parser stack overflowed - Python source too complex to parse";
 
+/// What an argument list has already seen, so a later argument CPython cannot
+/// lower is refused while parsing instead of being silently reordered.
+///
+/// The AST keeps positionals and keywords in two separate lists, so the source
+/// order is gone by the time anything else could check it: `f(a=1, 2)` simply
+/// became `args=[2], keywords=[a=1]` and called `f` with `(2,) {'a': 1}` where
+/// CPython refuses the program outright. All three messages and the precedence
+/// between them were measured against CPython 3.14.7.
+#[derive(Default)]
+struct ArgOrder {
+    /// A `name=value` argument has been seen.
+    keyword: bool,
+    /// A `**mapping` unpacking has been seen.
+    kw_unpack: bool,
+}
+
+impl ArgOrder {
+    /// A plain positional argument. Illegal once any keyword has appeared;
+    /// `**` unpacking takes precedence in the wording when both apply.
+    fn positional(&self) -> Result<(), String> {
+        if self.kw_unpack {
+            Err("SyntaxError: positional argument follows keyword argument unpacking".into())
+        } else if self.keyword {
+            Err("SyntaxError: positional argument follows keyword argument".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// `*iterable`. Legal after a plain keyword — `f(a=1, *b)` is valid Python —
+    /// but never after `**`.
+    fn star(&self) -> Result<(), String> {
+        if self.kw_unpack {
+            Err(
+                "SyntaxError: iterable argument unpacking follows keyword argument unpacking"
+                    .into(),
+            )
+        } else {
+            Ok(())
+        }
+    }
+}
+
 struct Parser {
     toks: Vec<Token>,
     pos: usize,
@@ -858,8 +901,10 @@ impl Parser {
         let mut bases = Vec::new();
         let mut keywords = Vec::new();
         if self.eat_op("(") {
+            let mut order = ArgOrder::default();
             while !self.at_op(")") {
                 if self.eat_op("**") {
+                    order.kw_unpack = true;
                     keywords.push(Keyword {
                         name: None,
                         value: self.parse_expr()?,
@@ -867,6 +912,7 @@ impl Parser {
                 } else if matches!(self.cur(), Tok::Name(n) if !is_keyword(n))
                     && matches!(&self.toks[self.pos + 1].tok, Tok::Op(o) if o == "=")
                 {
+                    order.keyword = true;
                     let kn = self.expect_name()?;
                     self.expect_op("=")?;
                     keywords.push(Keyword {
@@ -874,6 +920,7 @@ impl Parser {
                         value: self.parse_expr()?,
                     });
                 } else {
+                    order.positional()?;
                     bases.push(self.parse_expr()?);
                 }
                 if !self.eat_op(",") {
@@ -1752,10 +1799,13 @@ impl Parser {
         self.expect_op("(")?;
         let mut args = Vec::new();
         let mut keywords = Vec::new();
+        let mut order = ArgOrder::default();
         while !self.at_op(")") {
             if self.eat_op("*") {
+                order.star()?;
                 args.push(Expr::Starred(Box::new(self.parse_expr()?)));
             } else if self.eat_op("**") {
+                order.kw_unpack = true;
                 keywords.push(Keyword {
                     name: None,
                     value: self.parse_expr()?,
@@ -1763,6 +1813,7 @@ impl Parser {
             } else if matches!(self.cur(), Tok::Name(n) if !is_keyword(n))
                 && matches!(&self.toks[self.pos + 1].tok, Tok::Op(o) if o == "=")
             {
+                order.keyword = true;
                 let kn = self.expect_name()?;
                 self.expect_op("=")?;
                 keywords.push(Keyword {
@@ -1770,6 +1821,7 @@ impl Parser {
                     value: self.parse_expr()?,
                 });
             } else {
+                order.positional()?;
                 let e = self.parse_namedexpr()?;
                 // Generator expression as sole argument: f(x for x in xs)
                 if self.at_comp_for() && args.is_empty() && keywords.is_empty() {

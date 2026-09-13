@@ -9,6 +9,24 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **An argument after a keyword one is now a `SyntaxError`, not a silent
+  reorder.** `f(a=1, 2)` is a compile-time error in CPython; pythonrs RAN the
+  program and called `f` with `(2,) {'a': 1}`, exiting 0 where CPython exits 1.
+  The AST keeps positionals and keywords in two separate lists, so the source
+  order was already gone by the time anything could check it — the parser is the
+  only place that still sees it. `ArgOrder` in `src/parser.rs` now tracks the two
+  facts that matter (a `name=value` was seen, a `**mapping` was seen) in both the
+  call and class-definition argument loops.
+  Three messages, measured against CPython 3.14.7, with `**` unpacking winning
+  the wording whenever it applies (`f(a=1, **k, 2)` reports the unpacking form
+  even though a plain keyword came first):
+  `positional argument follows keyword argument`,
+  `positional argument follows keyword argument unpacking`, and
+  `iterable argument unpacking follows keyword argument unpacking`.
+  The legal orderings are unchanged and were pinned alongside the rejections:
+  `f(*b, 2)`, `f(a=1, *b)`, `f(**k, b=1)`, `f(a=1, **k)` and `f(*b, a=1)` all
+  still run, since `*` unpacking after a plain keyword is valid Python and only
+  `**` forbids it.
 - **A keyword a builtin does not take is now a `TypeError`, not a dropped name.**
   This is the general form of the `pow`/`isclose`/`groupby` gap below, and it was
   worse than an error: an unrecognised keyword was DISCARDED, so the call re-ran
@@ -1395,6 +1413,21 @@ written.
   the shortcut cannot be reproduced. The identity shortcut IS applied to heap
   objects, which is what makes `[P(1)] == [P(1)]` and `[x] == [x]` correct for
   everything with a heap identity.
+
+- **A starred class base is rejected.** `class C(*bases): pass` is valid Python —
+  CPython builds the base list at run time — but the class-definition argument
+  loop has no `*` branch at all, so it stops with `SyntaxError: invalid syntax`.
+  The call loop handles `f(*b)` already; the class loop needs the same branch
+  plus a compiler that builds the base tuple dynamically rather than from a
+  fixed `Vec<Expr>`.
+- **`argparse` orders its usage block after the program's own output, and does
+  not quote invalid choices.** `examples/argparse_demo.py` prints the
+  `usage: …` / `tool: error: argument --mode: invalid choice: …` block AFTER the
+  lines the program itself wrote, where CPython prints it first, and renders
+  `choose from fast, safe, auto` where CPython 3.14 writes
+  `choose from 'fast', 'safe', 'auto'`. The ordering half looks like a
+  stdout/stderr flush-interleaving difference rather than an argparse one. This
+  is the single divergence in the 42-file example corpus.
 
 ## Tooling
 - **`--build`** (AOT to a standalone native executable): implemented for the
