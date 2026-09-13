@@ -4016,7 +4016,7 @@ fn gen_numproto(seed: u64) -> Vec<String> {
             out.push("t('trunc', lambda: math.trunc(R()))".to_string());
             out.push("t('round', lambda: round(R()))".to_string());
             out.push(format!("t('round-n', lambda: round(R(), {n}))"));
-            out.push(format!("t('int', lambda: int(R()))"));
+            out.push("t('int', lambda: int(R()))".to_string());
         }
         // `complex()`: `__complex__` first, then the real coercion, then a
         // refusal that names the type.

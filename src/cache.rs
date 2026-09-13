@@ -12,7 +12,7 @@
 //! func/try tables) read by offset, because `fusevm::Chunk` is serde-owned, not
 //! `rkyv::Archive`. The blobs sit OUTSIDE the archive so that validating it
 //! stays proportional to the number of entries rather than to their total size —
-//! see [`Index`]. The key is a 64-bit hash of the source, a schema version, the
+//! see `Index`. The key is a 64-bit hash of the source, a schema version, the
 //! build's `CARGO_PKG_VERSION`, and a fingerprint of the running executable, so
 //! a source, format, release, or REBUILD change misses cleanly instead of
 //! loading stale bytecode.
@@ -386,7 +386,7 @@ fn write_shard(index: &Index, blobs: &[u8]) -> Result<(), String> {
 /// validates it and hands back a reference into the bytes already read, so a
 /// lookup allocates nothing but the one blob it decodes. `rkyv::from_bytes`
 /// rebuilt every entry in the file — 2485 of them — to answer a question about
-/// one, which was 0.42s of a 0.44s `python empty.py`; see [`Index`] for why
+/// one, which was 0.42s of a 0.44s `python empty.py`; see `Index` for why
 /// validating in place is not enough on its own.
 pub fn load(src: &str) -> Option<Program> {
     let key = key_for(src);
