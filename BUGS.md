@@ -9,6 +9,19 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **A function scope's bindings no longer go through a hash table.** Every
+  bind and every bare-name read hashed the name into an `IndexMap`, for scopes
+  that hold a handful of names. A `sample` profile of a 400k-call benchmark put
+  all 69 samples under `bind_params`' dominant node inside `IndexMap::insert` →
+  `hashbrown::find_or_find_insert_index` — the cost is HASHING AND PROBING, not
+  the key allocation. `EnvVars` (`src/host.rs`) keeps the bindings in a Vec in
+  insertion order until a scope outgrows 12 names and then spills to the same
+  map; `locals()` order, in-place rebinding and `del` are unchanged either side
+  of the spill. -11.32% instructions retired on the call benchmark against a
+  -0.019% A/A control, and the absolute saving doubles exactly when the call
+  count doubles (per-call, not a fixed cost). Module globals are a separate map
+  and are untouched.
+
 - **Every repr that names a live object now names its TYPE and address.** Nine
   of them printed a single shared placeholder, so no two objects of a kind could
   be told apart: `repr(iter(x))` was `<iterator>` for ALL of
@@ -1473,6 +1486,25 @@ written.
   `choose from 'fast', 'safe', 'auto'`. The ordering half looks like a
   stdout/stderr flush-interleaving difference rather than an argparse one. This
   is the single divergence in the 42-file example corpus.
+
+## VM-level limits (fusevm, not fixable from here)
+
+pythonrs is a fusevm frontend and does not modify the VM crate. These are costs
+measured inside it, recorded so the next round does not re-derive them.
+
+- **The block-JIT eligibility answer is thrown away on every call.** fusevm
+  caches it per VM (`VM::block_eligible_cached`, vm.rs:258-264) precisely to
+  avoid a thread-local `HashMap` probe per run — but `VM::reset` clears that
+  field unconditionally (vm.rs:895), and pythonrs's VM pool hands a pooled VM
+  its OWN chunk straight back (`run_chunk_cached`, src/host.rs) and resets it.
+  So the memo never survives a reuse and every Python call re-probes
+  `BLOCK_ELIGIBLE_TLS` (jit.rs:4705-4743), a `std::collections::HashMap` with
+  the default hasher, for an answer that is always the same and, for these
+  chunks, always `false`. In a `sample` profile of a 400k-call benchmark
+  (debug build) `JitCompiler::is_block_eligible` is 93 of 1984 main-thread
+  samples (4.7%), of which 51 are `RandomState`/SipHash hashing the 9-byte
+  `(op_hash, strict)` key. Nothing on the pythonrs side can reach the field or
+  skip the reset: `reset` is the only public way to reuse a VM.
 
 ## Tooling
 - **`--build`** (AOT to a standalone native executable): implemented for the

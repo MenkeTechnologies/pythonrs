@@ -8572,3 +8572,46 @@ fn reprs_name_the_object_type_and_address() {
     );
     assert_eq!(r("x = property()"), "<property object at 0xA>");
 }
+
+/// A scope's bindings live in a Vec until they outgrow `EnvVars::SPILL` and then
+/// in the hash map, and the two must be indistinguishable: same insertion order
+/// out of `locals()`, same in-place rebind, same `del` semantics — across the
+/// boundary, where a scope holds more names than the small form takes. Measured
+/// against CPython 3.14.7: `f()` below prints the same list there.
+#[test]
+fn scope_bindings_survive_the_spill_to_the_hash_map() {
+    // 14 locals, then a delete, a rebind, and one more name — crossing the
+    // bound in both the pre- and post-spill direction.
+    const BODY: &str = "def f():\n    \
+        a=1; b=2; c=3; d=4; e=5; g=6; h=7; i=8; j=9; k=10; l=11; m=12; n=13; o=14\n    \
+        del c\n    \
+        b = 99\n    \
+        p = 15\n    \
+        return list(locals().items())\n\
+        x = f()\n";
+    assert_eq!(
+        g(BODY, "x"),
+        "[('a', 1), ('b', 99), ('d', 4), ('e', 5), ('g', 6), ('h', 7), ('i', 8), \
+         ('j', 9), ('k', 10), ('l', 11), ('m', 12), ('n', 13), ('o', 14), ('p', 15)]"
+    );
+    // The small form: rebind in place, delete, rebind again — `locals()` must
+    // not gain a duplicate or lose the order.
+    assert_eq!(
+        g(
+            "def f(u, v):\n    w = u + v\n    del w\n    w = 5\n    u = 9\n    \
+             return list(locals().items())\nx = f(1, 2)\n",
+            "x"
+        ),
+        "[('u', 9), ('v', 2), ('w', 5)]"
+    );
+    // A closure writing through `nonlocal` must reach the same slot the
+    // enclosing scope reads.
+    assert_eq!(
+        g(
+            "def f():\n    q = 1\n    def inner():\n        nonlocal q\n        q += 1\n    \
+             inner()\n    inner()\n    return q\nx = f()\n",
+            "x"
+        ),
+        "3"
+    );
+}
