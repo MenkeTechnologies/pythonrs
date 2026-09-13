@@ -9,6 +9,34 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **Every repr that names a live object now names its TYPE and address.** Nine
+  of them printed a single shared placeholder, so no two objects of a kind could
+  be told apart: `repr(iter(x))` was `<iterator>` for ALL of
+  `list_iterator`/`tuple_iterator`/`str_ascii_iterator`/`str_iterator`/
+  `set_iterator`/`dict_keyiterator`/`range_iterator`/`longrange_iterator`/
+  `list_reverseiterator`/`collections._deque_iterator`, even though
+  `type(it).__name__` already knew which one it was; `[1].sort` was
+  `<bound method>` where CPython prints `<built-in method sort of list object at
+  0x…>`; `C().f` was `<bound method>` where CPython prints `<bound method C.f of
+  <__main__.C object at 0x…>>`; `C.f` was `<function f>` (the bare `__name__`)
+  where CPython prints `<function C.f at 0x…>` and a nested function
+  `<function g.<locals>.h at 0x…>`; `C().g()` was `<generator object C at 0x…>`
+  (the OWNER class) where CPython prints the qualname `<generator object C.g at
+  0x…>` — and the never-awaited warning had the same bug, reporting
+  `coroutine 'm'` for `C.m`; `property()` and `functools.cached_property` printed
+  no address; `object()` was `<__main__.object object at 0x…>` and
+  `object().__class__` `<class '__main__.object'>`, qualifying a BUILTIN into the
+  running module; and `C().__init__` was `<method-wrapper '__init__' of object>`
+  rather than of the instance's own class.
+  `type()` was wrong alongside the repr: `type([].sort).__name__` answered
+  `method` (a bound Python method) for what CPython calls
+  `builtin_function_or_method`, and a slot dunder is a third thing again —
+  `type([].__len__).__name__` is `method-wrapper`. Which dunders are slot
+  wrappers is per type and irregular (`[].__getitem__` is an ordinary built-in
+  method, `''.__getitem__` is a wrapper), so `SLOT_WRAPPERS_EVERY_TYPE` /
+  `slot_wrappers_of` in `src/host.rs` are a table MEASURED off CPython 3.14.7,
+  with the regeneration command in their doc comment. `PyObj::Descriptor` gained
+  a `recv` so a bound method-wrapper can name its instance.
 - **An argument after a keyword one is now a `SyntaxError`, not a silent
   reorder.** `f(a=1, 2)` is a compile-time error in CPython; pythonrs RAN the
   program and called `f` with `(2,) {'a': 1}`, exiting 0 where CPython exits 1.
@@ -1258,6 +1286,23 @@ written.
   `repr(itertools.chain.from_iterable)` is
   `<built-in function itertools.chain.from_iterable>` where CPython prints
   `<built-in method from_iterable of type object at 0x…>`; calling it agrees.
+- **A builtin type's CLASSMETHOD reprs as an unbound method descriptor.**
+  `repr(dict.fromkeys)` is `<method 'fromkeys' of 'dict' objects>` and
+  `repr(int.from_bytes)` likewise, where CPython prints `<built-in method
+  fromkeys of type object at 0x…>` — the same shape as the
+  `chain.from_iterable` gap above, and the same root cause: which native methods
+  are classmethods is a per-type fact no table here records. The ordinary
+  methods around them (`dict.get`, `int.to_bytes`, `str.join`) already match.
+- **A module-level native function keeps its module in its repr.**
+  `repr(math.sqrt)` is `<built-in function math.sqrt>`; CPython prints the bare
+  `<built-in function sqrt>`. The module qualifier is the key these builtins are
+  registered under, so dropping it in the repr alone would make two different
+  functions with the same leaf name print identically.
+- **`__slots__` exposes no member descriptor on the class.** `class C:
+  __slots__ = ("x",)` then `C.x` is `AttributeError: type object 'C' has no
+  attribute 'x'`; CPython answers `<member 'x' of 'C' objects>`. Instances work;
+  only the class-level descriptor is missing. `sys.getsizeof` is absent for the
+  same reason a slots layout is not modelled — there is no object-size model.
 - **Operator overloading dunders**: dispatched, with `NotImplemented` reflected
   fallback (see Implemented). Covered: arithmetic/bitwise
   (`__add__`/`__sub__`/`__mul__`/`__truediv__`/`__floordiv__`/`__mod__`/`__pow__`/

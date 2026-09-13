@@ -13535,6 +13535,7 @@ pub fn call_type_method(
             Some(host::PyObj::Descriptor {
                 kind: host::DescKind::GetSetDescriptor | host::DescKind::MemberDescriptor,
                 qual,
+                ..
             }) => Some(qual.clone()),
             _ => None,
         }) {

@@ -394,6 +394,261 @@ pub struct Instance {
 /// The `object`-level dunder slots that a type object exposes as
 /// `wrapper_descriptor`s (`type(object.__init__)`). The comparison/hash/attr/
 /// format slots CPython wraps; enough for introspection to classify them.
+/// The dunders CPython implements as a `tp_`/`nb_`/`sq_`/`mp_` SLOT on every
+/// builtin type, so `x.__eq__` reprs as `<method-wrapper '__eq__' of T object at
+/// 0x…>` and not as a built-in method. They come from `object` itself, so every
+/// type has them.
+///
+/// This table and `slot_wrappers_of` were MEASURED against the oracle, not
+/// reasoned about — the split is per type and irregular (`{}.__getitem__` is an
+/// ordinary method while `[].__getitem__` is a slot wrapper). Regenerate with:
+///
+/// ```text
+/// python3 -c 'v={"int":1,"float":1.0,"bool":True,"complex":1j,"str":"a",
+///   "bytes":b"a","bytearray":bytearray(b"a"),"list":[1],"tuple":(1,),
+///   "dict":{"a":1},"set":{1},"frozenset":frozenset([1]),"range":range(3),
+///   "object":object(),"NoneType":None,"slice":slice(1)}
+/// [print(t,sorted(n for n in dir(o) if n.startswith("__")
+///   and type(getattr(o,n,None)).__name__=="method-wrapper")) for t,o in v.items()]'
+/// ```
+///
+/// Last measured on CPython 3.14.7 (`/opt/homebrew/bin/python3`).
+const SLOT_WRAPPERS_EVERY_TYPE: &[&str] = &[
+    "__delattr__",
+    "__eq__",
+    "__ge__",
+    "__getattribute__",
+    "__gt__",
+    "__init__",
+    "__le__",
+    "__lt__",
+    "__ne__",
+    "__repr__",
+    "__setattr__",
+    "__str__",
+];
+
+fn slot_wrappers_of(tp: &str) -> &'static [&'static str] {
+    match tp {
+        "NoneType" => &["__bool__", "__hash__"],
+        "bool" => &[
+            "__abs__",
+            "__add__",
+            "__and__",
+            "__bool__",
+            "__divmod__",
+            "__float__",
+            "__floordiv__",
+            "__hash__",
+            "__index__",
+            "__int__",
+            "__invert__",
+            "__lshift__",
+            "__mod__",
+            "__mul__",
+            "__neg__",
+            "__or__",
+            "__pos__",
+            "__pow__",
+            "__radd__",
+            "__rand__",
+            "__rdivmod__",
+            "__rfloordiv__",
+            "__rlshift__",
+            "__rmod__",
+            "__rmul__",
+            "__ror__",
+            "__rpow__",
+            "__rrshift__",
+            "__rshift__",
+            "__rsub__",
+            "__rtruediv__",
+            "__rxor__",
+            "__sub__",
+            "__truediv__",
+            "__xor__",
+        ],
+        "bytearray" => &[
+            "__add__",
+            "__buffer__",
+            "__contains__",
+            "__delitem__",
+            "__getitem__",
+            "__iadd__",
+            "__imul__",
+            "__iter__",
+            "__len__",
+            "__mod__",
+            "__mul__",
+            "__release_buffer__",
+            "__rmod__",
+            "__rmul__",
+            "__setitem__",
+        ],
+        "bytes" => &[
+            "__add__",
+            "__buffer__",
+            "__contains__",
+            "__getitem__",
+            "__hash__",
+            "__iter__",
+            "__len__",
+            "__mod__",
+            "__mul__",
+            "__rmod__",
+            "__rmul__",
+        ],
+        "complex" => &[
+            "__abs__",
+            "__add__",
+            "__bool__",
+            "__hash__",
+            "__mul__",
+            "__neg__",
+            "__pos__",
+            "__pow__",
+            "__radd__",
+            "__rmul__",
+            "__rpow__",
+            "__rsub__",
+            "__rtruediv__",
+            "__sub__",
+            "__truediv__",
+        ],
+        "dict" => &[
+            "__delitem__",
+            "__ior__",
+            "__iter__",
+            "__len__",
+            "__or__",
+            "__ror__",
+            "__setitem__",
+        ],
+        "float" => &[
+            "__abs__",
+            "__add__",
+            "__bool__",
+            "__divmod__",
+            "__float__",
+            "__floordiv__",
+            "__hash__",
+            "__int__",
+            "__mod__",
+            "__mul__",
+            "__neg__",
+            "__pos__",
+            "__pow__",
+            "__radd__",
+            "__rdivmod__",
+            "__rfloordiv__",
+            "__rmod__",
+            "__rmul__",
+            "__rpow__",
+            "__rsub__",
+            "__rtruediv__",
+            "__sub__",
+            "__truediv__",
+        ],
+        "frozenset" => &[
+            "__and__", "__hash__", "__iter__", "__len__", "__or__", "__rand__", "__ror__",
+            "__rsub__", "__rxor__", "__sub__", "__xor__",
+        ],
+        "int" => &[
+            "__abs__",
+            "__add__",
+            "__and__",
+            "__bool__",
+            "__divmod__",
+            "__float__",
+            "__floordiv__",
+            "__hash__",
+            "__index__",
+            "__int__",
+            "__invert__",
+            "__lshift__",
+            "__mod__",
+            "__mul__",
+            "__neg__",
+            "__or__",
+            "__pos__",
+            "__pow__",
+            "__radd__",
+            "__rand__",
+            "__rdivmod__",
+            "__rfloordiv__",
+            "__rlshift__",
+            "__rmod__",
+            "__rmul__",
+            "__ror__",
+            "__rpow__",
+            "__rrshift__",
+            "__rshift__",
+            "__rsub__",
+            "__rtruediv__",
+            "__rxor__",
+            "__sub__",
+            "__truediv__",
+            "__xor__",
+        ],
+        "list" => &[
+            "__add__",
+            "__contains__",
+            "__delitem__",
+            "__iadd__",
+            "__imul__",
+            "__iter__",
+            "__len__",
+            "__mul__",
+            "__rmul__",
+            "__setitem__",
+        ],
+        "object" => &["__hash__"],
+        "range" => &[
+            "__bool__",
+            "__contains__",
+            "__getitem__",
+            "__hash__",
+            "__iter__",
+            "__len__",
+        ],
+        "set" => &[
+            "__and__", "__iand__", "__ior__", "__isub__", "__iter__", "__ixor__", "__len__",
+            "__or__", "__rand__", "__ror__", "__rsub__", "__rxor__", "__sub__", "__xor__",
+        ],
+        "slice" => &["__hash__"],
+        "str" => &[
+            "__add__",
+            "__contains__",
+            "__getitem__",
+            "__hash__",
+            "__iter__",
+            "__len__",
+            "__mod__",
+            "__mul__",
+            "__rmod__",
+            "__rmul__",
+        ],
+        "tuple" => &[
+            "__add__",
+            "__contains__",
+            "__getitem__",
+            "__hash__",
+            "__iter__",
+            "__len__",
+            "__mul__",
+            "__rmul__",
+        ],
+        _ => &[],
+    }
+}
+
+/// Whether `name` reached on an instance of builtin type `tp` is a slot wrapper
+/// (`<method-wrapper …>`) rather than a native method (`<built-in method …>`).
+/// A repr/`type()` distinction only — both dispatch identically.
+fn is_slot_wrapper(tp: &str, name: &str) -> bool {
+    SLOT_WRAPPERS_EVERY_TYPE.contains(&name) || slot_wrappers_of(tp).contains(&name)
+}
+
 const OBJECT_SLOT_WRAPPERS: &[&str] = &[
     "__init__",
     "__str__",
@@ -774,6 +1029,12 @@ pub enum PyObj {
     Descriptor {
         kind: DescKind,
         qual: String,
+        /// The instance a `MethodWrapper` was reached through
+        /// (`obj.__init__`), which CPython's repr names and addresses:
+        /// `<method-wrapper '__init__' of C object at 0x…>`. Every other
+        /// descriptor kind is reached on the TYPE, is shared, and carries
+        /// `None`.
+        recv: Option<Value>,
     },
     /// An exception's `__traceback__` — a node in the traceback chain over the
     /// captured `(scope, line)` frames. `idx` is this node's position; `tb_next`
@@ -2374,6 +2635,21 @@ impl PyHost {
     }
     /// A stable pseudo-address for an object (its heap index), used only for the
     /// `<… object at 0x…>` reprs where CPython prints an opaque pointer.
+    /// `"__main__."` for a class defined by the running program, `""` for a
+    /// builtin type. CPython's `repr` prints a type's MODULE-qualified name, and
+    /// every class a script defines lives in `__main__` — but `object`, reached
+    /// as `object().__class__`, is a builtin and reprs bare
+    /// (`<class 'object'>`, `<object object at 0x…>`). The registry of
+    /// program-defined classes is the discriminator, so a program that defines
+    /// its own `class int` still reports `__main__.int`.
+    fn repr_module_prefix(&self, class: &str) -> &'static str {
+        if self.classes.contains_key(class) {
+            "__main__."
+        } else {
+            ""
+        }
+    }
+
     pub fn addr_of(&self, v: &Value) -> u64 {
         match v {
             Value::Obj(i) => *i as u64,
@@ -3886,7 +4162,21 @@ impl PyHost {
                     .map(|c| c.metaclass.clone())
                     .unwrap_or_else(|| "type".into()),
                 Some(PyObj::Instance(i)) => i.class.clone(),
-                Some(PyObj::BoundMethod { .. }) => "method".into(),
+                // Only a bound PYTHON function is a `method`; a native method of a
+                // builtin type (`[].sort`, `"a".upper`) is a
+                // `builtin_function_or_method`, the same type as `len`.
+                Some(PyObj::BoundMethod { func, recv }) => match self.get(func) {
+                    Some(PyObj::Func(_)) => "method".into(),
+                    Some(PyObj::Builtin(n)) => {
+                        let n = n.rsplit('.').next().unwrap_or("");
+                        if is_slot_wrapper(&self.type_name(recv), n) {
+                            "method-wrapper".into()
+                        } else {
+                            "builtin_function_or_method".into()
+                        }
+                    }
+                    _ => "builtin_function_or_method".into(),
+                },
                 Some(PyObj::Exception { class, .. }) => class.clone(),
                 // Every builtin container has its own iterator type in CPython;
                 // the snapshot cursor carries which one it is standing in for.
@@ -4043,9 +4333,12 @@ impl PyHost {
                     } else {
                         // `object.__repr__` default: `<__main__.Cls object at 0x…>`.
                         // Instances defined under `-c`/a script live in `__main__`
-                        // (matching the `Class` repr above).
+                        // (matching the `Class` repr above); a BUILTIN type's own
+                        // instance stays bare, as `object()` is
+                        // `<object object at 0x…>` and never `<__main__.object …>`.
                         format!(
-                            "<__main__.{} object at 0x{:012x}>",
+                            "<{}{} object at 0x{:012x}>",
+                            self.repr_module_prefix(&inst.class),
                             inst.class,
                             self.addr_of(v)
                         )
@@ -4053,14 +4346,25 @@ impl PyHost {
                 }
                 // User classes are defined in the top-level module, which under
                 // `-c`/a script CPython names `__main__` (builtins stay bare).
-                Some(PyObj::Class(n)) => format!("<class '__main__.{n}'>"),
+                Some(PyObj::Class(n)) => {
+                    format!("<class '{}{n}'>", self.repr_module_prefix(n))
+                }
+                // `__qualname__`, not `__name__`: CPython reprs a nested or
+                // method function by its dotted path (`<function C.f at 0x…>`,
+                // `<function g.<locals>.h at 0x…>`).
                 Some(PyObj::Func(f)) => {
                     let name = self
                         .funcs
                         .get(f.def_id)
-                        .map(|d| d.name.clone())
+                        .map(|d| {
+                            if d.qualname.is_empty() {
+                                d.name.clone()
+                            } else {
+                                d.qualname.clone()
+                            }
+                        })
                         .unwrap_or_default();
-                    format!("<function {name}>")
+                    format!("<function {name} at 0x{:012x}>", self.addr_of(v))
                 }
                 Some(PyObj::Code { def_id }) => {
                     let name = self
@@ -4129,12 +4433,15 @@ impl PyHost {
                     let dict = dict.clone();
                     format!("mappingproxy({})", self.repr_of(&dict))
                 }
-                Some(PyObj::Descriptor { kind, qual }) => {
-                    let (kind, qual) = (*kind, qual.clone());
+                Some(PyObj::Descriptor { kind, qual, recv }) => {
+                    let (kind, qual, recv) = (*kind, qual.clone(), recv.clone());
                     let (owner, name) = qual.split_once('.').unwrap_or(("", qual.as_str()));
                     match kind {
+                        // A method-wrapper is BOUND: CPython names the instance's
+                        // class and address, not the slot's owner.
                         DescKind::MethodWrapper => {
-                            format!("<method-wrapper '{name}' of object>")
+                            let addr = recv.as_ref().map(|r| self.addr_of(r)).unwrap_or(0);
+                            format!("<method-wrapper '{name}' of {owner} object at 0x{addr:012x}>")
                         }
                         DescKind::GetSetDescriptor | DescKind::MemberDescriptor => {
                             format!("<attribute '{name}' of '{owner}' objects>")
@@ -4185,7 +4492,48 @@ impl PyHost {
                         None => format!("<built-in function {n}>"),
                     }
                 }
-                Some(PyObj::BoundMethod { .. }) => "<bound method>".into(),
+                // CPython has TWO reprs here, and which one applies is decided by
+                // what is bound, not by how it was reached. A Python function
+                // bound to an instance is `<bound method C.f of <__main__.C
+                // object at 0x…>>`; a native method of a builtin type is
+                // `<built-in method sort of list object at 0x…>` — the receiver's
+                // TYPE and address, with no owner in the method name.
+                Some(PyObj::BoundMethod { recv, func }) => {
+                    let (recv, func) = (recv.clone(), func.clone());
+                    match self.get(&func) {
+                        Some(PyObj::Func(f)) => {
+                            let qual = self
+                                .funcs
+                                .get(f.def_id)
+                                .map(|d| {
+                                    if d.qualname.is_empty() {
+                                        d.name.clone()
+                                    } else {
+                                        d.qualname.clone()
+                                    }
+                                })
+                                .unwrap_or_default();
+                            format!("<bound method {qual} of {}>", self.repr_of(&recv))
+                        }
+                        _ => {
+                            // The stored name can be internally qualified
+                            // (`__base_method__.get`, `function.__get__`); CPython
+                            // shows only the method's own name.
+                            let n = match self.get(&func) {
+                                Some(PyObj::Builtin(n)) => n.clone(),
+                                _ => String::new(),
+                            };
+                            let n = n.rsplit('.').next().unwrap_or("").to_string();
+                            let tp = self.type_name(&recv);
+                            let kind = if is_slot_wrapper(&tp, &n) {
+                                format!("method-wrapper '{n}'")
+                            } else {
+                                format!("built-in method {n}")
+                            };
+                            format!("<{kind} of {tp} object at 0x{:012x}>", self.addr_of(&recv))
+                        }
+                    }
+                }
                 Some(PyObj::Exception { class, args }) => self.exc_str(class, args),
                 Some(PyObj::Module { name, .. }) => format!("<module '{name}'>"),
                 Some(PyObj::Template {
@@ -4237,7 +4585,23 @@ impl PyHost {
                         format!("range({start}, {stop}, {step})")
                     }
                 }
-                Some(PyObj::Iter(_)) => "<iterator>".into(),
+                // Every builtin container has its OWN iterator type, and CPython's
+                // repr prints that type's `tp_name` — the same name
+                // `type(it).__name__` already reported, module-qualified where the
+                // type lives outside builtins (`collections._deque_iterator`).
+                Some(PyObj::Iter(st)) => {
+                    let name = match st {
+                        IterState::Seq {
+                            kind: IterKind::Deque,
+                            ..
+                        } => "collections._deque_iterator",
+                        IterState::Seq { kind, .. } => kind.type_name(),
+                        IterState::RangeIter { .. } => "range_iterator",
+                        IterState::BigRangeIter { .. } => "longrange_iterator",
+                        IterState::DictKeys { .. } => "dict_keyiterator",
+                    };
+                    format!("<{name} object at 0x{:012x}>", self.addr_of(v))
+                }
                 Some(PyObj::Zip { .. }) => format!("<zip object at 0x{:012x}>", self.addr_of(v)),
                 // `count` and `repeat` are the two itertools iterators CPython
                 // gives a constructor-style repr (`count(5, 2)`, `repeat('x', 2)`)
@@ -4299,12 +4663,11 @@ impl PyHost {
                 }
                 Some(PyObj::Generator { id }) => {
                     let g = &self.generators[*id as usize];
-                    let nm = g
-                        .ctx
-                        .frames
-                        .first()
-                        .map(|f| f.name.clone())
-                        .unwrap_or_default();
+                    // The defining function's `__qualname__`, which is what
+                    // CPython prints (`<generator object C.g at 0x…>`). The
+                    // frame's name is the OWNER class, so a method's generator
+                    // reprd as `<generator object C at 0x…>`.
+                    let nm = g.func_name.clone();
                     match g.kind {
                         GenKind::Coroutine => {
                             format!("<coroutine object {nm} at 0x{:012x}>", self.addr_of(v))
@@ -4357,8 +4720,15 @@ impl PyHost {
                 Some(PyObj::ClassMethod(f)) => {
                     format!("<classmethod({})>", self.str_of(f))
                 }
-                Some(PyObj::Property { .. }) => "<property object>".into(),
-                Some(PyObj::CachedProperty { .. }) => "<functools.cached_property object>".into(),
+                Some(PyObj::Property { .. }) => {
+                    format!("<property object at 0x{:012x}>", self.addr_of(v))
+                }
+                Some(PyObj::CachedProperty { .. }) => {
+                    format!(
+                        "<functools.cached_property object at 0x{:012x}>",
+                        self.addr_of(v)
+                    )
+                }
                 Some(PyObj::Redirect { stderr, .. }) => {
                     let nm = if *stderr {
                         "redirect_stderr"
@@ -4623,7 +4993,7 @@ impl PyHost {
                 // dispatch table with `_dispatch[dict.__repr__] = ...` and then
                 // looks up `type(obj).__repr__`, which is a DIFFERENT read of the
                 // same slot — hashing by id would never find the entry.
-                Some(PyObj::Descriptor { kind, qual }) => {
+                Some(PyObj::Descriptor { kind, qual, .. }) => {
                     PKey::Class(format!("{}:{qual}", kind.type_name()))
                 }
                 // Functions/methods/other callables hash by identity (heap id).
@@ -10044,6 +10414,7 @@ impl PyHost {
                     return Ok(self.alloc(PyObj::Descriptor {
                         kind: DescKind::MethodWrapper,
                         qual: format!("{class}.{name}"),
+                        recv: Some(recv.clone()),
                     }));
                 }
                 Err(format!(
@@ -10227,6 +10598,7 @@ impl PyHost {
                     return Ok(self.alloc(PyObj::Descriptor {
                         kind: DescKind::WrapperDescriptor,
                         qual: format!("object.{name}"),
+                        recv: None,
                     }));
                 }
                 Err(format!(
@@ -11014,6 +11386,7 @@ impl PyHost {
                         let desc = self.alloc(PyObj::Descriptor {
                             kind: DescKind::GetSetDescriptor,
                             qual: format!("type.{attr}"),
+                            recv: None,
                         });
                         d.insert(PKey::Str(attr.to_string()), (key, desc));
                     }
@@ -11023,6 +11396,7 @@ impl PyHost {
                     let desc = self.alloc(PyObj::Descriptor {
                         kind: DescKind::ClassMethodDescriptor,
                         qual: format!("{n}.{cm}"),
+                        recv: None,
                     });
                     d.insert(PKey::Str((*cm).to_string()), (key, desc));
                 }
@@ -11051,12 +11425,14 @@ impl PyHost {
                 Ok(self.alloc(PyObj::Descriptor {
                     kind: DescKind::GetSetDescriptor,
                     qual: "function.__code__".into(),
+                    recv: None,
                 }))
             }
             Some(PyObj::Builtin(n)) if n == "function" && name == "__globals__" => {
                 Ok(self.alloc(PyObj::Descriptor {
                     kind: DescKind::MemberDescriptor,
                     qual: "function.__globals__".into(),
+                    recv: None,
                 }))
             }
             // A dunder slot reached on a builtin type object (`object.__init__`)
@@ -11070,6 +11446,7 @@ impl PyHost {
                 Ok(self.alloc(PyObj::Descriptor {
                     kind: DescKind::WrapperDescriptor,
                     qual: format!("{n}.{name}"),
+                    recv: None,
                 }))
             }
             // `itertools.chain.from_iterable` — the alternate constructor, read
@@ -12129,6 +12506,7 @@ pub fn invoke(
         Some(PyObj::Descriptor {
             kind: DescKind::WrapperDescriptor,
             qual,
+            ..
         }) => {
             let (base, method) = qual.split_once('.').unwrap_or(("", qual.as_str()));
             let (base, method) = (base.to_string(), method.to_string());
@@ -13764,7 +14142,7 @@ pub fn run_user_func(
                     env,
                     self_val,
                     owner,
-                    def.name.clone(),
+                    gen_qualname(&def),
                     def.locals.clone(),
                 )
             } else {
@@ -13773,7 +14151,7 @@ pub fn run_user_func(
                     env,
                     self_val,
                     owner,
-                    def.name.clone(),
+                    gen_qualname(&def),
                     def.locals.clone(),
                 )
             }
@@ -13783,7 +14161,7 @@ pub fn run_user_func(
                 env,
                 self_val,
                 owner,
-                def.name.clone(),
+                gen_qualname(&def),
                 def.locals.clone(),
             )
         };
@@ -15485,6 +15863,19 @@ pub fn run_atexit_callbacks() {
             with_host(|h| h.exc = None);
             eprintln!("Error in atexit._run_exitfuncs:\n{e}");
         }
+    }
+}
+
+/// The name a generator/coroutine object carries: its function's
+/// `__qualname__`, which CPython shows both in the object's repr
+/// (`<generator object C.g at 0x…>`) and in the never-awaited warning
+/// (`coroutine 'C.m' was never awaited`). Bytecode cached before `qualname`
+/// existed leaves it empty; the bare name is the fallback.
+fn gen_qualname(def: &FuncDef) -> String {
+    if def.qualname.is_empty() {
+        def.name.clone()
+    } else {
+        def.qualname.clone()
     }
 }
 

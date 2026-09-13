@@ -8475,3 +8475,100 @@ fn legal_argument_orderings_still_run() {
         eval_str(&format!("{PRE}{tail}")).unwrap_or_else(|e| panic!("{tail} should run: {e}"));
     }
 }
+
+/// Every repr that names a live object's TYPE and address. CPython prints a
+/// distinct type name per iterator (`list_iterator`, `dict_keyiterator`, …), the
+/// receiver's type and address for a native method, and `__qualname__` for a
+/// function or generator — pythonrs answered `<iterator>`, `<bound method>`,
+/// `<property object>` and `<function f>` for all of them, so the corpus could
+/// not tell any two apart. Addresses are normalized away; every expectation was
+/// measured against CPython 3.14.7 (`/opt/homebrew/bin/python3`).
+#[test]
+fn reprs_name_the_object_type_and_address() {
+    fn r(src: &str) -> String {
+        let mut out = String::new();
+        let mut rest = g(src, "x").as_str().to_string();
+        // Replace every `0x…` run with a fixed marker.
+        while let Some(i) = rest.find("0x") {
+            out.push_str(&rest[..i]);
+            out.push_str("0xA");
+            let tail = rest[i + 2..]
+                .trim_start_matches(|c: char| c.is_ascii_hexdigit())
+                .to_string();
+            rest = tail;
+        }
+        out.push_str(&rest);
+        out
+    }
+    // One repr per iterator type, not one shared `<iterator>`.
+    assert_eq!(r("x = iter([1])"), "<list_iterator object at 0xA>");
+    assert_eq!(r("x = iter((1,))"), "<tuple_iterator object at 0xA>");
+    assert_eq!(r("x = iter('ab')"), "<str_ascii_iterator object at 0xA>");
+    assert_eq!(r("x = iter('é')"), "<str_iterator object at 0xA>");
+    assert_eq!(r("x = iter({1: 2})"), "<dict_keyiterator object at 0xA>");
+    assert_eq!(r("x = iter({1})"), "<set_iterator object at 0xA>");
+    assert_eq!(r("x = iter(range(3))"), "<range_iterator object at 0xA>");
+    assert_eq!(
+        r("x = reversed([1, 2])"),
+        "<list_reverseiterator object at 0xA>"
+    );
+    // A native method carries its receiver; a Python one carries `__qualname__`.
+    assert_eq!(
+        r("x = [1].sort"),
+        "<built-in method sort of list object at 0xA>"
+    );
+    assert_eq!(
+        r("class C:\n  def f(self): pass\nx = C().f"),
+        "<bound method C.f of <__main__.C object at 0xA>>"
+    );
+    assert_eq!(
+        r("class C:\n  def f(self): pass\nx = C.f"),
+        "<function C.f at 0xA>"
+    );
+    assert_eq!(
+        r("def g():\n  def h(): pass\n  return h\nx = g()"),
+        "<function g.<locals>.h at 0xA>"
+    );
+    assert_eq!(
+        r("class C:\n  def g(self):\n    yield 1\nx = C().g()"),
+        "<generator object C.g at 0xA>"
+    );
+    // A slot dunder is a method-wrapper, an ordinary dunder a built-in method —
+    // and the split is per type, measured, not reasoned: `python3 -c "print(repr(
+    // [].__getitem__), repr(''.__getitem__))"` prints a built-in method for the
+    // list and a method-wrapper for the str.
+    assert_eq!(
+        r("x = {}.__len__"),
+        "<method-wrapper '__len__' of dict object at 0xA>"
+    );
+    assert_eq!(
+        r("x = {}.__getitem__"),
+        "<built-in method __getitem__ of dict object at 0xA>"
+    );
+    assert_eq!(
+        r("x = [].__getitem__"),
+        "<built-in method __getitem__ of list object at 0xA>"
+    );
+    assert_eq!(
+        r("x = ''.__getitem__"),
+        "<method-wrapper '__getitem__' of str object at 0xA>"
+    );
+    assert_eq!(g("x = type([].__len__).__name__", "x"), "'method-wrapper'");
+    assert_eq!(
+        g("x = type([].sort).__name__", "x"),
+        "'builtin_function_or_method'"
+    );
+    // A bound method-wrapper names the INSTANCE's class, not `object`.
+    assert_eq!(
+        r("class C: pass\nx = C().__init__"),
+        "<method-wrapper '__init__' of C object at 0xA>"
+    );
+    // `object` is a builtin: no `__main__.` qualifier on it or its instances.
+    assert_eq!(r("x = object()"), "<object object at 0xA>");
+    assert_eq!(r("x = object().__class__"), "<class 'object'>");
+    assert_eq!(
+        r("class C: pass\nx = C().__class__"),
+        "<class '__main__.C'>"
+    );
+    assert_eq!(r("x = property()"), "<property object at 0xA>");
+}
