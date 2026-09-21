@@ -227,10 +227,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create ${{ inputs.tag || github.ref_name }} \
-            --title "${{ inputs.tag || github.ref_name }}" \
-            --generate-notes \
-            artifacts/*.tar.gz
+          tag='${{ inputs.tag || github.ref_name }}'
+          # Re-running this job after a partial release (a tolerated
+          # per-target build failure leaves one) must not fail: `gh release
+          # create` refuses a tag that already has a release. Create it only
+          # when it is missing, then upload over whatever is there.
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" artifacts/*.tar.gz --clobber
+          else
+            gh release create "$tag" \
+              --title "$tag" \
+              --generate-notes \
+              artifacts/*.tar.gz
+          fi
 
   homebrew:
     name: Update Homebrew tap
