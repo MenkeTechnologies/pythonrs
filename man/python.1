@@ -110,6 +110,18 @@ consulted only by a
 .B PYTHONRS_STDLIB
 Override the embedded\-CPython stdlib prefix consulted before the bundled and
 system locations (stdlib\-ffi builds).
+.TP
+.B PYTHONHASHSEED
+Seed for
+.BR hash ()
+of str/bytes, validated exactly as CPython validates it.
+.TP
+.B PYTHONINTMAXSTRDIGITS
+Initial
+.BR sys.get_int_max_str_digits ():
+.B 0
+(unlimited) or at least 640; any other value stops the interpreter at startup.
+Default 4300.
 .SH FILES
 .TP
 .I ~/.pythonrs/scripts.rkyv

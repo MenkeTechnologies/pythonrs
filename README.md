@@ -176,6 +176,13 @@ for every `N` in `[0, 4294967295]` — not just for `0`. Unset or `random` draws
 per-process entropy, as CPython does, and a value CPython rejects is rejected
 here with the same message and exit code.
 
+`PYTHONINTMAXSTRDIGITS` seeds `sys.get_int_max_str_digits()` the same way:
+`0` or at least 640, anything else refused at startup with CPython's fatal
+message. The limit bounds every base-ten int conversion — `int(str)`, `str`/
+`repr`, `%d`, decimal format specs, and decimal literals (a `SyntaxError`) —
+and `sys.set_int_max_str_digits()` changes it at run time; hex, octal and
+binary are never limited.
+
 ## [0x03] LANGUAGE FEATURES
 
 Arbitrary-precision integers, real closures, classes with inheritance, operator
