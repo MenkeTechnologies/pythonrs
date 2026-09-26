@@ -1583,7 +1583,18 @@ fn format_field(v: &Value, conv: i64, spec: &str) -> Result<String, String> {
         let r = host::call_method(v, "__format__", vec![specv], vec![])?;
         return Ok(with_host(|h| h.str_of(&r)));
     }
-    let s = py_str(v)?;
+    // The digit limit guards a DECIMAL rendering only: `format(n, "x")` and the
+    // float presentations of an int are unbounded in CPython, so a huge int
+    // skips the check unless the spec asks for base ten.
+    let decimal = match spec.chars().last() {
+        Some(c) if c.is_ascii_alphabetic() || c == '%' => matches!(c, 'd' | 'n'),
+        _ => true,
+    };
+    let s = if !decimal && with_host(|h| h.int_str_limit_exceeded(v).is_some()) {
+        host::str_of(v)
+    } else {
+        py_str(v)?
+    };
     apply_format_spec(&s, v, spec)
 }
 
@@ -4588,6 +4599,9 @@ const BUILTIN_FUNCS: &[&str] = &[
 
 /// str()/repr() with instance dunder dispatch (free-function form).
 pub fn py_str(v: &Value) -> Result<String, String> {
+    if let Some(e) = with_host(|h| h.int_str_limit_exceeded(v)) {
+        return Err(e);
+    }
     if with_host(|h| matches!(h.get(v), Some(PyObj::Instance(_)))) {
         let (has_str, has_repr, is_exc) = with_host(|h| match h.get(v) {
             Some(PyObj::Instance(i)) => (
@@ -4627,10 +4641,16 @@ pub fn py_str(v: &Value) -> Result<String, String> {
     }
     // `host::str_of` prefetches a `Foreign` object's CPython `str` outside the
     // borrow, so a foreign value with a user `__str__`/`__repr__` cannot re-enter.
+    if let Some(e) = with_host(|h| h.int_subclass_limit_exceeded(v)) {
+        return Err(e);
+    }
     Ok(host::str_of(v))
 }
 
 pub fn py_repr(v: &Value) -> Result<String, String> {
+    if let Some(e) = with_host(|h| h.int_str_limit_exceeded(v)) {
+        return Err(e);
+    }
     if with_host(|h| matches!(h.get(v), Some(PyObj::Instance(_)))) {
         let has_repr = with_host(|h| match h.get(v) {
             Some(PyObj::Instance(i)) => h.class_lookup(&i.class, "__repr__").is_some(),
@@ -4778,6 +4798,9 @@ pub fn py_repr(v: &Value) -> Result<String, String> {
         return result;
     }
     // See `py_str`: prefetch a `Foreign` object's CPython `repr` outside the borrow.
+    if let Some(e) = with_host(|h| h.int_subclass_limit_exceeded(v)) {
+        return Err(e);
+    }
     Ok(host::repr_of(v))
 }
 
@@ -4833,7 +4856,7 @@ pub fn call_builtin_function(
     }
     // sys.* module functions.
     if let Some(f) = name.strip_prefix("sys.") {
-        return call_sys(f, args);
+        return call_sys(f, args, kwargs);
     }
     // asyncio.* module functions (native event loop / futures).
     if let Some(f) = name.strip_prefix("asyncio.") {
@@ -7564,8 +7587,9 @@ fn construct_int(args: &[Value]) -> Result<Value, String> {
                 })?,
             };
             // CPython's message reprs the ARGUMENT, so a bytes literal shows as
-            // `b'x'`, not as the decoded text.
-            let orig_repr = h.repr_of(&v);
+            // `b'x'`, not as the decoded text — and formats it with `%.200R`,
+            // which cuts the repr at 200 characters, closing quote and all.
+            let orig_repr: String = h.repr_of(&v).chars().take(200).collect();
             let s = s.trim();
             let (neg, rest) = if let Some(r) = s.strip_prefix('-') {
                 (true, r)
@@ -7646,6 +7670,14 @@ fn construct_int(args: &[Value]) -> Result<Value, String> {
                     return Err(err());
                 }
                 ascii.push(char::from_digit(d, 36).unwrap_or('z'));
+            }
+            // `sys.get_int_max_str_digits()` bounds a conversion in any base
+            // that is not a power of two, counted over the digits alone (no
+            // sign, no underscores, leading zeros included) and checked only
+            // once the literal is known to be valid.
+            let limit = host::int_max_str_digits();
+            if limit > 0 && !(base as u32).is_power_of_two() && ascii.len() > limit {
+                return Err(host::int_max_str_digits_error(limit, Some(ascii.len())));
             }
             match num_bigint::BigInt::parse_bytes(ascii.as_bytes(), base as u32) {
                 Some(b) => {
@@ -8956,8 +8988,44 @@ fn build_stat_result(md: &std::fs::Metadata) -> Value {
     })
 }
 
-fn call_sys(name: &str, args: Vec<Value>) -> Result<Value, String> {
+fn call_sys(name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Result<Value, String> {
     match name {
+        "get_int_max_str_digits" => Ok(Value::Int(host::int_max_str_digits() as i64)),
+        // `sys_set_int_max_str_digits_impl`: a C `int` parameter bindable by
+        // keyword, then `0` or at least the threshold.
+        "set_int_max_str_digits" => {
+            let [n] = bind_named(
+                "set_int_max_str_digits",
+                ["maxdigits"],
+                0,
+                1,
+                KwStyle::Unexpected,
+                &args,
+                &kwargs,
+            )?;
+            let n = n.unwrap_or(Value::Undef);
+            let n = match with_host(|h| h.index_fit(&n)) {
+                host::IndexFit::Fits(n) if i32::try_from(n).is_ok() => n,
+                host::IndexFit::NotInt => {
+                    return Err(host::type_error(&format!(
+                        "'{}' object cannot be interpreted as an integer",
+                        with_host(|h| h.type_name(&n))
+                    )))
+                }
+                _ => {
+                    return Err(
+                        "OverflowError: Python int too large to convert to C int".to_string()
+                    )
+                }
+            };
+            match usize::try_from(n) {
+                Ok(n) if n == 0 || n >= host::INT_MAX_STR_DIGITS_THRESHOLD => {
+                    with_host(|h| h.set_int_max_str_digits(n));
+                    Ok(Value::Undef)
+                }
+                _ => Err("ValueError: maxdigits must be >= 640 or 0 for unlimited".to_string()),
+            }
+        }
         "exit" => {
             // `sys.exit([code])` == `raise SystemExit(code)`. Build the exception
             // with the given args (0 or 1) and raise it so `except SystemExit`
@@ -13633,17 +13701,18 @@ pub fn call_type_method(
                 None => Err("StopIteration".to_string()),
             }
         }
-        "__str__" => {
+        "__str__" | "__repr__" => {
+            if let Some(e) = with_host(|h| h.int_str_limit_exceeded(recv)) {
+                return Err(e);
+            }
             return Ok(with_host(|h| {
-                let s = h.str_of(recv);
+                let s = if name == "__str__" {
+                    h.str_of(recv)
+                } else {
+                    h.repr_of(recv)
+                };
                 h.new_str(s)
-            }))
-        }
-        "__repr__" => {
-            return Ok(with_host(|h| {
-                let s = h.repr_of(recv);
-                h.new_str(s)
-            }))
+            }));
         }
         "__bool__" => return Ok(Value::Bool(with_host(|h| h.truthy(recv)))),
         _ => {}

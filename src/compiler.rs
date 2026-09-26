@@ -2599,10 +2599,17 @@ impl Compiler {
                 b.emit(Op::LoadFloat(*f), 0);
             }
             Expr::BigInt(s) => {
-                // int("<digits>") — the builtin promotes past i64 into a BigInt.
+                // int("<hex digits>", 16) — the builtin promotes past i64 into a
+                // BigInt. Handed over in HEX because a base-ten conversion is
+                // bounded by `sys.get_int_max_str_digits()`, and a literal the
+                // lexer accepted (a huge `0x…`, or a decimal the limit allowed
+                // when it was lexed) must not fail when it runs.
+                let hex = num_bigint::BigInt::parse_bytes(s.as_bytes(), 10)
+                    .map_or_else(|| s.clone(), |n| n.to_str_radix(16));
                 self.name_const(b, "int");
-                self.strlit(b, s);
-                b.emit(Op::CallBuiltin(ops::CALL, 2), 0);
+                self.strlit(b, &hex);
+                b.emit(Op::LoadInt(16), 0);
+                b.emit(Op::CallBuiltin(ops::CALL, 3), 0);
             }
             Expr::Complex(f) => {
                 // complex(0.0, imag)

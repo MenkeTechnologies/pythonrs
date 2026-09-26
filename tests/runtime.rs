@@ -1008,3 +1008,83 @@ fn binary_mode_reads_answer_bytes_and_survive_non_utf8() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `sys.get_int_max_str_digits()` bounds every BASE-TEN int conversion: `int(str)`
+/// (digits counted without sign or underscores, checked only once the literal is
+/// valid, naming the count), `str`/`repr`/`%d`/`,`/`__str__` (not naming it), an
+/// over-long decimal literal (a `SyntaxError`), an `int` subclass without its own
+/// `__str__` — while hex, octal and binary in either direction stay unbounded.
+/// `set_int_max_str_digits` validates its argument and shows through
+/// `sys.flags`. A bad `int()` literal reprs the argument cut at 200 characters,
+/// CPython's `%.200R`. Expected output recorded from CPython 3.14.7.
+#[test]
+fn int_max_str_digits_bounds_decimal_conversions() {
+    let src = r##"import sys
+def e(f):
+    try:
+        r = f()
+    except (ValueError, SyntaxError, TypeError, OverflowError) as x:
+        return type(x).__name__ + ': ' + str(x)
+    return r if isinstance(r, (bool, int)) and not isinstance(r, bool) and r < 10**20 or isinstance(r, bool) else ('len', len(r) if isinstance(r, str) else r.bit_length())
+print(sys.get_int_max_str_digits(), sys.flags.int_max_str_digits, sys.int_info.default_max_str_digits)
+big = 10 ** 4300
+print(e(lambda: int('9' * 4301)))
+print(e(lambda: int(' -1_000' + '0' * 4300)))
+print(e(lambda: int('1' * 5000 + 'x')))
+print(e(lambda: int('1' * 5000, 36)))
+print(e(lambda: int('f' * 5000, 16)), e(lambda: int('0x' + 'f' * 5000, 0)), e(lambda: int(b'1' * 4300)))
+print(e(lambda: str(big)), e(lambda: str(big // 10)))
+print(e(lambda: repr([big])))
+print(e(lambda: '%d' % big))
+print(e(lambda: f'{big:,}'))
+print(e(lambda: big.__str__()))
+print(e(lambda: format(big, 'x')), e(lambda: '%x' % big))
+class I(int): pass
+class J(int):
+    def __str__(self): return 'J'
+print(e(lambda: str(I(big))), str(J(big)))
+try: eval('1' * 4301)
+except SyntaxError as x: print(type(x).__name__)
+print(e(lambda: eval('0x' + 'f' * 5000)))
+print(e(lambda: sys.set_int_max_str_digits(639)))
+print(e(lambda: sys.set_int_max_str_digits('9')))
+print(e(lambda: sys.set_int_max_str_digits()))
+sys.set_int_max_str_digits(maxdigits=640)
+print(sys.get_int_max_str_digits(), sys.flags.int_max_str_digits)
+print(e(lambda: str(10 ** 640)), e(lambda: str(10 ** 639)))
+sys.set_int_max_str_digits(0)
+print(e(lambda: str(10 ** 9999)), e(lambda: int('7' * 9999)))
+for s in ['x' * 300, b'y' * 300, "ab'c" * 100]:
+    print(e(lambda: int(s)))
+"##;
+    let (result, out) = pythonrs::eval_str_captured(src, &[]);
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        out,
+        r##"4300 4300 4300
+ValueError: Exceeds the limit (4300 digits) for integer string conversion: value has 4301 digits; use sys.set_int_max_str_digits() to increase the limit
+ValueError: Exceeds the limit (4300 digits) for integer string conversion: value has 4304 digits; use sys.set_int_max_str_digits() to increase the limit
+ValueError: invalid literal for int() with base 10: '1111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111
+ValueError: Exceeds the limit (4300 digits) for integer string conversion: value has 5000 digits; use sys.set_int_max_str_digits() to increase the limit
+('len', 20000) ('len', 20000) ('len', 14282)
+ValueError: Exceeds the limit (4300 digits) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit ('len', 4300)
+ValueError: Exceeds the limit (4300 digits) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit
+ValueError: Exceeds the limit (4300 digits) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit
+ValueError: Exceeds the limit (4300 digits) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit
+ValueError: Exceeds the limit (4300 digits) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit
+('len', 3572) ('len', 3572)
+ValueError: Exceeds the limit (4300 digits) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit J
+SyntaxError
+('len', 20000)
+ValueError: maxdigits must be >= 640 or 0 for unlimited
+TypeError: 'str' object cannot be interpreted as an integer
+TypeError: set_int_max_str_digits() missing required argument 'maxdigits' (pos 1)
+640 640
+ValueError: Exceeds the limit (640 digits) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit ('len', 640)
+('len', 10000) ('len', 33216)
+ValueError: invalid literal for int() with base 10: 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+ValueError: invalid literal for int() with base 10: b'yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
+ValueError: invalid literal for int() with base 10: "ab'cab'cab'cab'cab'cab'cab'cab'cab'cab'cab'cab'cab'cab'cab'cab'cab'cab'cab'cab'cab'cab'cab'cab'cab'cab'cab'cab'cab'cab'cab'cab'cab'cab'cab'cab'cab'cab'cab'cab'cab'cab'cab'cab'cab'cab'cab'cab'cab'cab'
+"##
+    );
+}

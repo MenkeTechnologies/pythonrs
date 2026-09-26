@@ -37,6 +37,20 @@ fn run_main() -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
+    // Same stage, same shape: a `PYTHONINTMAXSTRDIGITS` CPython refuses stops the
+    // interpreter before it runs anything.
+    if pythonrs::host::parse_int_max_str_digits(
+        std::env::var("PYTHONINTMAXSTRDIGITS").ok().as_deref(),
+    )
+    .is_none()
+    {
+        eprintln!(
+            "Fatal Python error: config_init_int_max_str_digits: PYTHONINTMAXSTRDIGITS: \
+             invalid limit; must be >= 640 or 0 for unlimited.\nPython runtime state: \
+             preinitialized\n"
+        );
+        return ExitCode::FAILURE;
+    }
 
     // CPython (`Modules/main.c::pymain_parse_cmdline`) stops interpreter-option
     // parsing at the FIRST of `-c` / `-m` / a script file / `--`; everything from

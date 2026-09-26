@@ -599,6 +599,18 @@ impl Lexer {
                 .map_err(|_| format!("SyntaxError: bad float (line {})", self.line))?;
             self.push(Tok::Float(v));
         } else {
+            // A decimal literal is converted like `int(str)` and is bounded by
+            // the same `sys.get_int_max_str_digits()` (hex/octal/binary are not).
+            let limit = crate::host::int_max_str_digits();
+            if limit > 0 && s.len() > limit {
+                let msg = crate::host::int_max_str_digits_error(limit, Some(s.len()));
+                return Err(format!(
+                    "SyntaxError{} - Consider hexadecimal for huge integer literals to avoid \
+                     decimal conversion limits. (line {})",
+                    msg.trim_start_matches("ValueError"),
+                    self.line
+                ));
+            }
             match s.parse::<i64>() {
                 Ok(n) => self.push(Tok::Int(n)),
                 Err(_) => self.push(Tok::BigInt(s)),

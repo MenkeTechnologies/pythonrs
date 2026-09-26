@@ -1726,6 +1726,67 @@ pub struct LruData {
 /// `PYTHONHASHSEED`.
 pub type NameMap = IndexMap<String, Value, rustc_hash::FxBuildHasher>;
 
+/// `sys.int_info.default_max_str_digits` (`_PY_LONG_DEFAULT_MAX_STR_DIGITS`).
+pub const INT_MAX_STR_DIGITS_DEFAULT: usize = 4300;
+/// The smallest nonzero limit `set_int_max_str_digits` accepts
+/// (`_PY_LONG_MAX_STR_DIGITS_THRESHOLD`, `sys.int_info.str_digits_check_threshold`).
+pub const INT_MAX_STR_DIGITS_THRESHOLD: usize = 640;
+
+/// `PYTHONINTMAXSTRDIGITS` as CPython's `config_init_int_max_str_digits` reads
+/// it, or `None` when CPython refuses the value and dies in pre-initialization.
+/// Unset or empty is the default. Otherwise the text is a C `strtol` of the
+/// whole string — leading whitespace, an optional sign and at least one digit,
+/// nothing after — and the value must be `0` or at least the threshold.
+pub fn parse_int_max_str_digits(raw: Option<&str>) -> Option<usize> {
+    let s = match raw {
+        None | Some("") => return Some(INT_MAX_STR_DIGITS_DEFAULT),
+        Some(s) => s.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']),
+    };
+    let (neg, digits) = match s.as_bytes().first() {
+        Some(b'-') => (true, &s[1..]),
+        Some(b'+') => (false, &s[1..]),
+        _ => (false, s),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n: i64 = digits.parse().ok()?;
+    let n = if neg { -n } else { n };
+    match usize::try_from(n) {
+        Ok(0) => Some(0),
+        Ok(n) if n >= INT_MAX_STR_DIGITS_THRESHOLD => Some(n),
+        _ => None,
+    }
+}
+
+thread_local! {
+    /// `sys.get_int_max_str_digits()`: the most decimal digits an `int` may be
+    /// converted from or to (`0` = unlimited). Seeded from
+    /// `PYTHONINTMAXSTRDIGITS`, changed by `sys.set_int_max_str_digits`. Kept
+    /// outside `PyHost` because the LEXER enforces it too — an over-long
+    /// decimal literal is a `SyntaxError` — and the lexer runs without the
+    /// host borrowed.
+    static INT_MAX_STR_DIGITS: std::cell::Cell<usize> = std::cell::Cell::new(
+        parse_int_max_str_digits(std::env::var("PYTHONINTMAXSTRDIGITS").ok().as_deref())
+            .unwrap_or(INT_MAX_STR_DIGITS_DEFAULT),
+    );
+}
+
+/// The current `sys.get_int_max_str_digits()`.
+pub fn int_max_str_digits() -> usize {
+    INT_MAX_STR_DIGITS.with(|c| c.get())
+}
+
+/// The `ValueError` text for a conversion over the limit. Parsing knows the
+/// digit count and names it; formatting (`str(n)`) does not.
+pub fn int_max_str_digits_error(limit: usize, digits: Option<usize>) -> String {
+    let has = digits.map_or(String::new(), |n| format!(": value has {n} digits"));
+    format!(
+        "ValueError: Exceeds the limit ({limit} digits) for integer string conversion{has}; \
+         use sys.set_int_max_str_digits() to increase the limit"
+    )
+}
+
 /// One scope's bindings: a short association list until it outgrows `SPILL`,
 /// then the same `NameMap` as before.
 ///
@@ -2119,6 +2180,9 @@ pub struct PyHost {
     /// consult these.
     pub stdout_target: Option<Value>,
     pub stderr_target: Option<Value>,
+    /// Every `sys.flags` object built so far, so a `set_int_max_str_digits`
+    /// shows up in `sys.flags.int_max_str_digits` as it does in CPython.
+    sys_flags: Vec<Value>,
     /// In-process output sink. When `Some`, everything the program writes to the
     /// native stdout/stderr streams is appended here instead of reaching the
     /// process — what an embedder that owns the terminal (a TUI) needs so a
@@ -2453,6 +2517,14 @@ pub fn reset_host() {
     // the OLD body. Drop them with the table they belong to.
     VM_POOL.with(|p| p.borrow_mut().clear());
     async_rt::reset();
+    // A fresh interpreter starts from the environment's digit limit, not from
+    // whatever `sys.set_int_max_str_digits` the previous program left behind.
+    INT_MAX_STR_DIGITS.with(|c| {
+        c.set(
+            parse_int_max_str_digits(std::env::var("PYTHONINTMAXSTRDIGITS").ok().as_deref())
+                .unwrap_or(INT_MAX_STR_DIGITS_DEFAULT),
+        )
+    });
 }
 
 /// Install the per-run CLI/runtime context on a freshly reset host: `sys.argv`,
@@ -2626,6 +2698,7 @@ impl PyHost {
             traceback: Vec::new(),
             stdout_target: None,
             stderr_target: None,
+            sys_flags: Vec::new(),
             capture: None,
             modules: NameMap::default(),
             sys_modules: None,
@@ -4435,6 +4508,54 @@ impl PyHost {
                 _ => true,
             },
             _ => true,
+        }
+    }
+
+    /// The `ValueError` `str(v)` / `repr(v)` raises when `v` is an `int` with
+    /// more decimal digits than `sys.get_int_max_str_digits()` allows, as
+    /// `long_to_decimal_string_internal` refuses it. An inline `i64` has at most
+    /// 19 digits, under any nonzero limit, so only a `BigInt` is measured: first
+    /// by its bit length, which bounds the digit count from both sides, and only
+    /// in the narrow band where the bounds disagree by rendering it.
+    pub fn int_str_limit_exceeded(&self, v: &Value) -> Option<String> {
+        let limit = int_max_str_digits();
+        if limit == 0 {
+            return None;
+        }
+        let Some(PyObj::BigInt(b)) = self.get(v) else {
+            return None;
+        };
+        let bits = b.bits() as f64;
+        let low = ((bits - 1.0) * std::f64::consts::LOG10_2) as usize + 1;
+        let high = (bits * std::f64::consts::LOG10_2) as usize + 1;
+        let over = if low > limit {
+            true
+        } else if high <= limit {
+            false
+        } else {
+            b.magnitude().to_string().len() > limit
+        };
+        over.then(|| int_max_str_digits_error(limit, None))
+    }
+
+    /// [`Self::int_str_limit_exceeded`] for an `int` subclass instance with no
+    /// `__str__`/`__repr__` of its own, which renders its int payload. Checked
+    /// by the callers only once user dunders have had their turn.
+    pub fn int_subclass_limit_exceeded(&self, v: &Value) -> Option<String> {
+        match self.get(v) {
+            Some(PyObj::Instance(i)) => self.int_str_limit_exceeded(&i.payload),
+            _ => None,
+        }
+    }
+
+    /// `sys.set_int_max_str_digits(n)` after validation: the new limit, mirrored
+    /// into every `sys.flags` object.
+    pub fn set_int_max_str_digits(&mut self, n: usize) {
+        INT_MAX_STR_DIGITS.with(|c| c.set(n));
+        for flags in self.sys_flags.clone() {
+            if let Some(PyObj::Namespace { attrs }) = self.get_mut(&flags) {
+                attrs.insert("int_max_str_digits".to_string(), Value::Int(n as i64));
+            }
         }
     }
 
@@ -8175,6 +8296,13 @@ impl PyHost {
         premap: &HashMap<u32, (String, String, String)>,
     ) -> Result<String, String> {
         let ConvFlags { plus, space, hash } = flags;
+        // Every conversion that renders an int in base ten is bounded by
+        // `sys.get_int_max_str_digits()`.
+        if matches!(conv, 's' | 'r' | 'a' | 'd' | 'i' | 'u') {
+            if let Some(e) = self.int_str_limit_exceeded(val) {
+                return Err(e);
+            }
+        }
         let sign_str = |neg: bool| -> &'static str {
             if neg {
                 "-"
@@ -18325,7 +18453,7 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                     ("dev_mode", 0),
                     ("utf8_mode", 0),
                     ("safe_path", 0),
-                    ("int_max_str_digits", -1),
+                    ("int_max_str_digits", int_max_str_digits() as i64),
                     ("warn_default_encoding", 0),
                     ("gil", 1),
                     ("thread_inherit_context", 1),
@@ -18333,7 +18461,9 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                 ] {
                     a.insert(k.to_string(), Value::Int(v));
                 }
-                h.alloc(PyObj::Namespace { attrs: a })
+                let flags = h.alloc(PyObj::Namespace { attrs: a });
+                h.sys_flags.push(flags.clone());
+                flags
             };
             let modules = h.new_dict(IndexMap::new());
             // Publish the live sys.modules handle + seed it with already-imported
@@ -18470,6 +18600,14 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                 (
                     "setrecursionlimit",
                     h.alloc(PyObj::Builtin("sys.setrecursionlimit".into())),
+                ),
+                (
+                    "get_int_max_str_digits",
+                    h.alloc(PyObj::Builtin("sys.get_int_max_str_digits".into())),
+                ),
+                (
+                    "set_int_max_str_digits",
+                    h.alloc(PyObj::Builtin("sys.set_int_max_str_digits".into())),
                 ),
                 ("_getframe", h.alloc(PyObj::Builtin("sys._getframe".into()))),
                 (

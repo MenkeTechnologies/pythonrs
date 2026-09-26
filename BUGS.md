@@ -9,6 +9,30 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **`int` conversions are bounded by `sys.get_int_max_str_digits()`.** pythonrs
+  had no limit and no `sys.get_int_max_str_digits`/`set_int_max_str_digits`, so
+  `int('9'*100000)` succeeded where CPython 3.14.7 raises `ValueError: Exceeds the
+  limit (4300 digits) for integer string conversion: value has 100000 digits; …`.
+  The limit (default 4300, seeded from `PYTHONINTMAXSTRDIGITS`, which is
+  validated at startup with CPython's fatal message) now bounds every BASE-TEN
+  conversion: `int(str)`/`int(bytes)` in any base that is not a power of two
+  (digits counted without sign or underscores, checked only after the literal
+  is known valid, naming the count), `str`/`repr`/`ascii`, container reprs,
+  `%d`/`%s`/`%r`, `format`/f-strings with a decimal presentation, `int.__str__`,
+  an `int` subclass with no `__str__` of its own, and an over-long decimal
+  LITERAL, which is a `SyntaxError`. Hex, octal and binary are unbounded both
+  ways, as in CPython. `set_int_max_str_digits` takes `maxdigits` by position
+  or keyword, rejects anything but `0` or `>= 640`, and is reflected in
+  `sys.flags.int_max_str_digits`. Two fixes came out of it: a big-int literal
+  now compiles to `int(<hex>, 16)`, so a literal the lexer accepted cannot fail
+  at run time, and the `stdlib-ffi` bridge moves ints past `i64` in HEX in both
+  directions — through decimal, the embedded interpreter's own limit made
+  `int(Decimal('1e5000'))` raise instead of answering.
+- **`int()`'s invalid-literal message cuts the argument's repr at 200
+  characters.** CPython formats it with `%.200R`; pythonrs printed the whole
+  repr, so a long bad literal produced a message thousands of characters long
+  where CPython's stops after 200 characters, mid-string, without its closing
+  quote.
 - **A function scope's bindings no longer go through a hash table.** Every
   bind and every bare-name read hashed the name into an `IndexMap`, for scopes
   that hold a handful of names. A `sample` profile of a 400k-call benchmark put
@@ -1193,15 +1217,6 @@ written.
   `__module__` is `'re'`, with the traceback reading `re.PatternError:`. What
   remains missing is the type object itself — `__mro__` and `isinstance`
   against a real class.
-- **`int(str)` has no digit limit and `sys.set_int_max_str_digits` is absent.**
-  CPython 3.14.6 caps a decimal `int()` conversion at 4300 digits
-  (`int('9'*100000)` is `ValueError: Exceeds the limit (4300 digits) for integer
-  string conversion: value has 100000 digits; use sys.set_int_max_str_digits() to
-  increase the limit`) and exposes
-  `sys.set_int_max_str_digits`/`get_int_max_str_digits` to change it;
-  `int('9'*100000)` succeeds here. pythonrs is more permissive, so nothing that
-  works under CPython breaks — but a program relying on the guard does not get
-  it.
 - **A binary operator's caret anchor stops at the operator.** When the right
   operand is PARENTHESIZED, CPython's anchor runs from the left operand's end to
   the right operand's own `col_offset`, which is INSIDE the parens: `1+("a")`
