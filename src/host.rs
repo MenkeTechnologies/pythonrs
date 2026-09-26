@@ -1777,6 +1777,12 @@ pub fn int_max_str_digits() -> usize {
     INT_MAX_STR_DIGITS.with(|c| c.get())
 }
 
+/// `SyntaxError` and the two builtin classes that inherit its `__init__` and
+/// `__str__` (`SyntaxError_init` / `SyntaxError_str`).
+pub fn is_syntax_error_class(name: &str) -> bool {
+    matches!(name, "SyntaxError" | "IndentationError" | "TabError")
+}
+
 /// The `ValueError` text for a conversion over the limit. Parsing knows the
 /// digit count and names it; formatting (`str(n)`) does not.
 pub fn int_max_str_digits_error(limit: usize, digits: Option<usize>) -> String {
@@ -4804,7 +4810,7 @@ impl PyHost {
                         }
                     }
                 }
-                Some(PyObj::Exception { class, args }) => self.exc_str(class, args),
+                Some(PyObj::Exception { class, args }) => self.exc_str(v, class, args),
                 Some(PyObj::Module { name, .. }) => format!("<module '{name}'>"),
                 Some(PyObj::Template {
                     strings,
@@ -5026,8 +5032,45 @@ impl PyHost {
         }
     }
 
-    fn exc_str(&self, class: &str, args: &[Value]) -> String {
+    fn exc_str(&self, v: &Value, class: &str, args: &[Value]) -> String {
+        if is_syntax_error_class(class) {
+            return self.syntax_error_str(v);
+        }
         self.exc_message(class, args)
+    }
+
+    /// `SyntaxError_str` (Objects/exceptions.c): `msg`, then the BASENAME of
+    /// `filename` when it is a `str` and `lineno` when it is exactly an `int`
+    /// — `m (f.py, line 3)`, `m (f.py)`, `m (line 3)` — all read from the
+    /// instance's attributes, so assigning `e.lineno` changes the rendering.
+    fn syntax_error_str(&self, v: &Value) -> String {
+        let attr = |n: &str| match v {
+            Value::Obj(id) => self
+                .func_attrs
+                .get(id)
+                .and_then(|m| m.get(n))
+                .cloned()
+                .unwrap_or(Value::Undef),
+            _ => Value::Undef,
+        };
+        let msg = self.str_of(&attr("msg"));
+        let file = self
+            .as_str(&attr("filename"))
+            .map(|f| f.rsplit('/').next().unwrap_or("").to_string());
+        let lineno = attr("lineno");
+        let line = match self.get(&lineno) {
+            Some(PyObj::BigInt(b)) => Some(b.to_string()),
+            _ => match lineno {
+                Value::Int(n) => Some(n.to_string()),
+                _ => None,
+            },
+        };
+        match (file, line) {
+            (Some(f), Some(l)) => format!("{msg} ({f}, line {l})"),
+            (Some(f), None) => format!("{msg} ({f})"),
+            (None, Some(l)) => format!("{msg} (line {l})"),
+            (None, None) => msg,
+        }
     }
 
     /// `repr(v)`.

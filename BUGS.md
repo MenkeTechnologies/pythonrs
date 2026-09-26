@@ -9,6 +9,25 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **A `SyntaxError` has its attributes.** `SyntaxError('m', ('f.py', 3, 4,
+  'txt'))` bound none of `msg`/`filename`/`lineno`/`offset`/`text`/
+  `end_lineno`/`end_offset`/`print_file_and_line`, so `e.lineno` inside a
+  handler raised `AttributeError`, and `str(e)` printed the argument tuple
+  where CPython prints `m (f.py, line 3)`. `SyntaxError_init` is ported: every
+  attribute exists (`None` by default), a 4- to 7-item details iterable fills
+  them (fewer or more is CPython's `TypeError`), and `str()` renders from the
+  attributes — the BASENAME of a `str` filename and an exact-`int` lineno —
+  so assigning `e.lineno` changes it. `IndentationError` and `TabError` share
+  it. A SyntaxError the compiler raises gets the same attributes, with
+  `lineno` taken from the ` (line N)` its message carries; its `offset`/`text`
+  stay `None` and its wording is still pythonrs's own (see below).
+- **Misplaced `_` in a numeric literal is a `SyntaxError`.** The lexer skipped
+  every underscore, so `1_`, `1__0`, `1_.5`, `1.5_`, `1e_1`, `1_e1`, `1_j`,
+  `0xf_`, `0b1__1` and `0o7_` all evaluated. A separator is now accepted only
+  between two digits of the literal's base, or directly after a
+  `0x`/`0o`/`0b` prefix, and anything else is `invalid decimal literal` /
+  `invalid hexadecimal literal` / `invalid octal literal` /
+  `invalid binary literal`, as in CPython.
 - **`int` conversions are bounded by `sys.get_int_max_str_digits()`.** pythonrs
   had no limit and no `sys.get_int_max_str_digits`/`set_int_max_str_digits`, so
   `int('9'*100000)` succeeded where CPython 3.14.7 raises `ValueError: Exceeds the
@@ -1106,6 +1125,16 @@ written.
 
 ## Partial / simplified semantics
 
+- **A compiler-raised `SyntaxError` is worded by pythonrs, not CPython, and has
+  no `offset`/`text`.** Measured through `exec`/`eval` against CPython 3.14.7:
+  `x = (` is `invalid syntax` here and `'(' was never closed` there; `"abc` is
+  `unterminated string (line 1)` against `unterminated string literal
+  (detected at line 1)`; `def f(:` leaks the parser's own token dump,
+  `expected a name, found Op(":") (line 1)`, where CPython says `invalid
+  syntax`. Several messages carry no position at all, so their `lineno` is
+  `None`, and `str(e)` never names the `<string>` filename CPython appends.
+  Matching this means porting the PEG parser's error productions, not
+  rewording strings.
 - **A bridged exception carries no CPython traceback.** An exception that crosses
   from pythonrs into CPython is rebuilt as a fresh exception object, so its
   `__traceback__` is empty. Two visible consequences, both in code that is not

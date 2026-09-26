@@ -8615,3 +8615,101 @@ fn scope_bindings_survive_the_spill_to_the_hash_map() {
         "3"
     );
 }
+
+/// `SyntaxError(msg, details)` runs `SyntaxError_init`: every one of `msg`,
+/// `filename`, `lineno`, `offset`, `text`, `end_lineno`, `end_offset` and
+/// `print_file_and_line` exists (`None` by default), a 4- to 7-item details
+/// iterable fills them, and `str()` renders `msg (basename, line N)` from the
+/// ATTRIBUTES. `IndentationError` and `TabError` share it. Recorded from
+/// CPython 3.14.7.
+#[test]
+fn syntax_error_init_and_str() {
+    let src = r##"def s(*a):
+    try:
+        e = SyntaxError(*a); return (str(e), e.args, e.msg, e.filename, e.lineno, e.offset, e.text, e.end_lineno, e.end_offset, e.print_file_and_line)
+    except Exception as x: return (type(x).__name__, str(x))
+for a in [(), (5,), ('m',), ('m', ('d/f.py', 3, 4, 't')), ('m', ('f.py', 3, 4, 't', 3, 6)), ('m', ('f.py', None, 4, 't')), ('m', (None, 3, 4, 't')), ('m', ('f.py', 3)), ('m', 'abcd'), ('m', ('a','b','c','d','e','f','g')), ('m', tuple(range(8))), ('m', 5), ('m', 1, 2), ('m', ('f', 'x', 1, 't')), (None, ('f',3,4,'t')), ('m', ('f', True, 1, 't')), ('m', ('/', 1, 1, 't')), (b'x', ('f', 1, 1, 't'))]:
+    print(a, s(*a))
+e = SyntaxError('m'); e.filename='x/y.py'; e.lineno=7; print(str(e))
+e.msg = 'new'; print(str(e), e.args)
+e = IndentationError('i', ('f', 1, 2, 't')); print(str(e), e.msg, isinstance(e, SyntaxError))
+e = TabError('t', ('f', 1, 2, 't')); print(str(e), e.offset)
+print(repr(SyntaxError('m', ('f', 3, 4, 't'))))
+try:
+    raise SyntaxError('boom', ('f.py', 2, 1, 'x'))
+except SyntaxError as e:
+    print(e, e.lineno, e.text)
+"##;
+    let (result, out) = pythonrs::eval_str_captured(src, &[]);
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        out,
+        r##"() ('None', (), None, None, None, None, None, None, None, None)
+(5,) ('5', (5,), 5, None, None, None, None, None, None, None)
+('m',) ('m', ('m',), 'm', None, None, None, None, None, None, None)
+('m', ('d/f.py', 3, 4, 't')) ('m (f.py, line 3)', ('m', ('d/f.py', 3, 4, 't')), 'm', 'd/f.py', 3, 4, 't', None, None, None)
+('m', ('f.py', 3, 4, 't', 3, 6)) ('m (f.py, line 3)', ('m', ('f.py', 3, 4, 't', 3, 6)), 'm', 'f.py', 3, 4, 't', 3, 6, None)
+('m', ('f.py', None, 4, 't')) ('m (f.py)', ('m', ('f.py', None, 4, 't')), 'm', 'f.py', None, 4, 't', None, None, None)
+('m', (None, 3, 4, 't')) ('m (line 3)', ('m', (None, 3, 4, 't')), 'm', None, 3, 4, 't', None, None, None)
+('m', ('f.py', 3)) ('TypeError', 'function takes at least 4 arguments (2 given)')
+('m', 'abcd') ('m (a)', ('m', 'abcd'), 'm', 'a', 'b', 'c', 'd', None, None, None)
+('m', ('a', 'b', 'c', 'd', 'e', 'f', 'g')) ('m (a)', ('m', ('a', 'b', 'c', 'd', 'e', 'f', 'g')), 'm', 'a', 'b', 'c', 'd', 'e', 'f', None)
+('m', (0, 1, 2, 3, 4, 5, 6, 7)) ('TypeError', 'function takes at most 7 arguments (8 given)')
+('m', 5) ('TypeError', "'int' object is not iterable")
+('m', 1, 2) ('m', ('m', 1, 2), 'm', None, None, None, None, None, None, None)
+('m', ('f', 'x', 1, 't')) ('m (f)', ('m', ('f', 'x', 1, 't')), 'm', 'f', 'x', 1, 't', None, None, None)
+(None, ('f', 3, 4, 't')) ('None (f, line 3)', (None, ('f', 3, 4, 't')), None, 'f', 3, 4, 't', None, None, None)
+('m', ('f', True, 1, 't')) ('m (f)', ('m', ('f', True, 1, 't')), 'm', 'f', True, 1, 't', None, None, None)
+('m', ('/', 1, 1, 't')) ('m (, line 1)', ('m', ('/', 1, 1, 't')), 'm', '/', 1, 1, 't', None, None, None)
+(b'x', ('f', 1, 1, 't')) ("b'x' (f, line 1)", (b'x', ('f', 1, 1, 't')), b'x', 'f', 1, 1, 't', None, None, None)
+m (y.py, line 7)
+new (y.py, line 7) ('m',)
+i (f, line 1) i True
+t (f, line 1) 2
+SyntaxError('m', ('f', 3, 4, 't'))
+boom (f.py, line 2) 2 x
+"##
+    );
+}
+
+/// A `_` in a numeric literal sits between two digits of the literal's own
+/// base (or directly after a `0x`/`0o`/`0b` prefix); anywhere else — last,
+/// doubled, beside the point or the exponent marker — the literal is a
+/// `SyntaxError` naming its kind. Recorded from CPython 3.14.7.
+#[test]
+fn numeric_literal_underscores_are_validated() {
+    let src = r##"for src in ['1_000', '1_', '1__0', '1_.5', '1.5_', '1.0_1', '1e1_0', '1e_1', '1_e1', '0x_f', '0xf_', '0x_', '0b1_1', '0b1__1', '0o7_', '1_j', '1j', '10_0j', '0_0', '00', '1_000.000_1']:
+    try:
+        v = eval(src)
+        print(repr(src), 'OK', repr(v))
+    except SyntaxError as e:
+        print(repr(src), 'SE', e.msg)
+"##;
+    let (result, out) = pythonrs::eval_str_captured(src, &[]);
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        out,
+        r##"'1_000' OK 1000
+'1_' SE invalid decimal literal
+'1__0' SE invalid decimal literal
+'1_.5' SE invalid decimal literal
+'1.5_' SE invalid decimal literal
+'1.0_1' OK 1.01
+'1e1_0' OK 10000000000.0
+'1e_1' SE invalid decimal literal
+'1_e1' SE invalid decimal literal
+'0x_f' OK 15
+'0xf_' SE invalid hexadecimal literal
+'0x_' SE invalid hexadecimal literal
+'0b1_1' OK 3
+'0b1__1' SE invalid binary literal
+'0o7_' SE invalid octal literal
+'1_j' SE invalid decimal literal
+'1j' OK 1j
+'10_0j' OK 100j
+'0_0' OK 0
+'00' OK 0
+'1_000.000_1' OK 1000.0001
+"##
+    );
+}

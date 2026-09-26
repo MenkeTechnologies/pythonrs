@@ -3707,6 +3707,56 @@ fn b_match_class(vm: &mut VM, argc: u8) -> Value {
     Value::Bool(true)
 }
 
+/// The attributes `SyntaxError_init` (Objects/exceptions.c) gives every
+/// `SyntaxError`, in the order the details tuple fills them.
+const SYNTAX_ERROR_ATTRS: [&str; 8] = [
+    "msg",
+    "filename",
+    "lineno",
+    "offset",
+    "text",
+    "end_lineno",
+    "end_offset",
+    "print_file_and_line",
+];
+
+/// `SyntaxError(msg, (filename, lineno, offset, text[, end_lineno, end_offset]))`:
+/// every attribute starts `None`; `msg` is the first argument; with exactly two
+/// arguments the second is unpacked (any iterable of 4 to 7 items — a seventh,
+/// CPython's private `_metadata`, is accepted and dropped). `args` itself is
+/// left as passed. pythonrs bound none of these, so `e.lineno` / `e.msg` raised
+/// `AttributeError` inside the handler that was reading them.
+fn syntax_error_init(e: &Value, args: &[Value]) -> Result<(), String> {
+    let mut vals: [Value; 8] = std::array::from_fn(|_| Value::Undef);
+    if let Some(m) = args.first() {
+        vals[0] = m.clone();
+    }
+    if let [_, info] = args {
+        let info = host::iter_vec(info)?;
+        if info.len() < 4 {
+            return Err(host::type_error(&format!(
+                "function takes at least 4 arguments ({} given)",
+                info.len()
+            )));
+        }
+        if info.len() > 7 {
+            return Err(host::type_error(&format!(
+                "function takes at most 7 arguments ({} given)",
+                info.len()
+            )));
+        }
+        for (slot, v) in vals[1..].iter_mut().zip(info.into_iter().take(6)) {
+            *slot = v;
+        }
+    }
+    with_host(|h| {
+        for (name, v) in SYNTAX_ERROR_ATTRS.iter().zip(vals) {
+            let _ = h.set_attr(e, name, v);
+        }
+    });
+    Ok(())
+}
+
 fn synth_exc(h: &mut host::PyHost, err: &str) -> Value {
     let (class, msg) = match err.split_once(": ") {
         Some((c, m)) => (c.to_string(), m.to_string()),
@@ -3772,7 +3822,36 @@ fn synth_exc(h: &mut host::PyHost, err: &str) -> Value {
         let nv = h.new_str(n);
         let _ = h.set_attr(&e, "name", nv);
     }
+    // An engine-raised `SyntaxError` carries the same attributes a constructed
+    // one does. The compiler appends its position as ` (line N)`; that is
+    // `lineno`, and the text before it is `msg`, so `str(e)` renders unchanged.
+    if host::is_syntax_error_class(&class) {
+        let (text, lineno) = split_line_suffix(&msg);
+        let mut vals: [Value; 8] = std::array::from_fn(|_| Value::Undef);
+        if !msg.is_empty() {
+            vals[0] = h.new_str(text.to_string());
+        }
+        if let Some(n) = lineno {
+            vals[2] = Value::Int(n);
+        }
+        for (name, v) in SYNTAX_ERROR_ATTRS.iter().zip(vals) {
+            let _ = h.set_attr(&e, name, v);
+        }
+    }
     e
+}
+
+/// Split a trailing ` (line N)` off a compiler message: `(text, Some(N))`, or
+/// the message unchanged and `None` when it carries no position.
+fn split_line_suffix(msg: &str) -> (&str, Option<i64>) {
+    if let Some(head) = msg.strip_suffix(')') {
+        if let Some((text, n)) = head.rsplit_once(" (line ") {
+            if let Ok(n) = n.parse() {
+                return (text, Some(n));
+            }
+        }
+    }
+    (msg, None)
 }
 
 /// Whether `class` is `OSError` or one of the `errno`-mapped subclasses CPython
@@ -5269,12 +5348,17 @@ pub fn call_builtin_function(
         return with_host(|h| excgroup::construct(h, name, &args));
     }
     if is_exception_class(name) {
-        return Ok(with_host(|h| {
+        let init = host::is_syntax_error_class(name).then(|| args.clone());
+        let e = with_host(|h| {
             h.alloc(PyObj::Exception {
                 class: name.to_string(),
                 args,
             })
-        }));
+        });
+        if let Some(args) = init {
+            syntax_error_init(&e, &args)?;
+        }
+        return Ok(e);
     }
     // A keyword for a builtin that takes none is a TypeError, not a value to
     // drop on the floor. Central so every arm below can assume it away.

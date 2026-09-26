@@ -522,16 +522,30 @@ impl Lexer {
                         'o' => 8,
                         _ => 2,
                     };
+                    let kind = match radix {
+                        16 => "hexadecimal",
+                        8 => "octal",
+                        _ => "binary",
+                    };
+                    let bad = |line| format!("SyntaxError: invalid {kind} literal (line {line})");
                     let mut digits = String::new();
                     while let Some(c) = self.peek() {
                         if c == '_' {
-                            self.pos += 1;
+                            // A separator sits between two digits, or right after
+                            // the prefix (`0x_f`): never last, never doubled.
+                            match self.src.get(self.pos + 1) {
+                                Some(n) if n.is_digit(radix) => self.pos += 1,
+                                _ => return Err(bad(self.line)),
+                            }
                         } else if c.is_digit(radix) {
                             digits.push(c);
                             self.pos += 1;
                         } else {
                             break;
                         }
+                    }
+                    if digits.is_empty() {
+                        return Err(bad(self.line));
                     }
                     match i64::from_str_radix(&digits, radix) {
                         Ok(n) => self.push(Tok::Int(n)),
@@ -556,7 +570,18 @@ impl Lexer {
                     s.push(c);
                     self.pos += 1;
                 }
+                // A separator sits between two decimal digits — not after the
+                // point or the exponent marker, not last, not doubled.
                 '_' => {
+                    let after_digit = s.ends_with(|p: char| p.is_ascii_digit());
+                    let before_digit =
+                        matches!(self.src.get(self.pos + 1), Some(n) if n.is_ascii_digit());
+                    if !(after_digit && before_digit) {
+                        return Err(format!(
+                            "SyntaxError: invalid decimal literal (line {})",
+                            self.line
+                        ));
+                    }
                     self.pos += 1;
                 }
                 '.' => {
