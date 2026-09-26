@@ -3022,3 +3022,24 @@ fn binary_mode_rejects_the_text_only_arguments() {
     );
     let _ = std::fs::remove_file(&path);
 }
+
+/// An int past 4300 digits crosses the bridge in both directions. Both ways
+/// used to go through a DECIMAL string, which the embedded interpreter's
+/// `sys.get_int_max_str_digits()` refuses, so `int(Decimal('1e5000'))` raised
+/// `ValueError` instead of answering. Expected values from CPython 3.14.7.
+#[cfg(feature = "stdlib-ffi")]
+#[test]
+fn huge_ints_cross_the_bridge_both_ways() {
+    let src = "\
+from decimal import Decimal
+from fractions import Fraction
+n = int(Decimal('1e5000'))
+r = [
+    n.bit_length(),
+    n % 1000003,
+    -n % 1000003,
+    int(Decimal(-(2 ** 20000))) == -(2 ** 20000),
+    Fraction(3 ** 9000, 2).numerator == 3 ** 9000,
+]";
+    assert_eq!(g(src, "r"), "[16610, 754816, 245187, True, True]");
+}

@@ -920,13 +920,17 @@ fn value_to_py<'py>(
             // reflects that back into the pythonrs object.
             Some(PyObj::Bytearray(b)) => Ok(PyByteArray::new(py, b).into_any()),
             Some(PyObj::BigInt(b)) => {
-                // pyo3 has no num-bigint bridge enabled; round-trip through the
-                // decimal string, which CPython's `int` parses into an exact int.
+                // pyo3 has no num-bigint bridge enabled; round-trip through a
+                // HEX string. Decimal would be bounded by the embedded
+                // interpreter's `sys.get_int_max_str_digits()`, so any int past
+                // 4300 digits failed to cross; a power-of-two base is exempt.
                 let int_ctor = py
                     .import("builtins")
                     .and_then(|m| m.getattr("int"))
                     .map_err(|e| e.to_string())?;
-                int_ctor.call1((b.to_string(),)).map_err(|e| e.to_string())
+                int_ctor
+                    .call1((b.to_str_radix(16), 16))
+                    .map_err(|e| e.to_string())
             }
             Some(PyObj::List(items)) => {
                 let elems = marshal_seq(host, py, items)?;
@@ -1158,6 +1162,24 @@ fn marshal_seq<'py>(
     items.iter().map(|it| value_to_py(host, py, it)).collect()
 }
 
+/// A CPython `int` outside `i64` as a `BigInt`, read through `format(n, "x")`.
+/// Its decimal `str()` is refused past the embedded interpreter's
+/// `sys.get_int_max_str_digits()`, which made any int over 4300 digits returned
+/// by a bridged call fail to come back at all; hex is never limited.
+fn big_from_py(obj: &Bound<PyAny>) -> Result<num_bigint::BigInt, String> {
+    let hex = obj
+        .call_method1("__format__", ("x",))
+        .and_then(|s| s.extract::<String>())
+        .map_err(|e| e.to_string())?;
+    let (neg, digits) = match hex.strip_prefix('-') {
+        Some(d) => (true, d),
+        None => (false, hex.as_str()),
+    };
+    let b = num_bigint::BigInt::parse_bytes(digits.as_bytes(), 16)
+        .ok_or_else(|| format!("ffi: cannot marshal int 0x{hex}"))?;
+    Ok(if neg { -b } else { b })
+}
+
 /// CPython object → pythonrs `Value`. Only the *exact* representable types come
 /// back by value; a subclass (namedtuple, `OrderedDict`, `Counter`, `IntEnum`, a
 /// `str` subclass, …) stays a `Foreign` handle so its CPython repr/behavior is
@@ -1179,14 +1201,9 @@ fn py_to_value(host: &mut PyHost, py: Python, obj: &Bound<PyAny>) -> Result<Valu
     if obj.is_exact_instance_of::<PyInt>() {
         return Ok(match obj.extract::<i64>() {
             Ok(n) => Value::Int(n),
-            // Out of i64 range → arbitrary-precision, parsed from the decimal repr.
-            Err(_) => {
-                let s = obj.str().map_err(|e| e.to_string())?.to_string();
-                match s.parse::<num_bigint::BigInt>() {
-                    Ok(b) => host.alloc(PyObj::BigInt(b)),
-                    Err(_) => return Err(format!("ffi: cannot marshal int '{s}'")),
-                }
-            }
+            // Out of i64 range → arbitrary-precision, read back in hex (see
+            // `big_from_py`).
+            Err(_) => host.alloc(PyObj::BigInt(big_from_py(obj)?)),
         });
     }
     if obj.is_exact_instance_of::<PyFloat>() {
@@ -1489,12 +1506,7 @@ fn pure_value(host: &mut PyHost, py: Python, obj: &Bound<PyAny>) -> Option<Value
     if obj.is_exact_instance_of::<PyInt>() {
         return match obj.extract::<i64>() {
             Ok(n) => Some(Value::Int(n)),
-            Err(_) => {
-                let s = obj.str().ok()?.to_string();
-                s.parse::<num_bigint::BigInt>()
-                    .ok()
-                    .map(|b| host.alloc(PyObj::BigInt(b)))
-            }
+            Err(_) => big_from_py(obj).ok().map(|b| host.alloc(PyObj::BigInt(b))),
         };
     }
     if obj.is_exact_instance_of::<PyFloat>() {
