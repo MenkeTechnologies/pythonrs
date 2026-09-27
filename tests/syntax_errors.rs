@@ -333,3 +333,65 @@ for s in cases:
 "#
     );
 }
+
+/// Assignment, augmented-assignment and `del` targets that are not targets:
+/// CPython names the offending expression and, for a lone `x = y` whose
+/// target is an ordinary expression, suggests `==`.
+#[test]
+fn invalid_targets_are_named_at_the_offending_expression() {
+    let out = Command::new(env!("CARGO_BIN_EXE_python"))
+        .args(["-c", r#"for s in ["1 = x", "f() = 1", "a + 1 = 2", "None = 1", "x.y() = 1", "[1] = x", "(a, 1) = x", "1 = x = y", "x = 1 = y", "f() += 1", "(a, b) += 1", "[a] += 1", "1 += 1", "del f()", "del 1", "del (a, 1)", "del a + b", "x() = y = 3", "\"s\" = 1", "a if b else c = 1", "lambda: 1 = 2", "not a = 1", "a < b = 1", "-a = 1", "{1: 2} = x", "{1} = x", "... = x", "True = 1", "f\"x\" = 1", "[x for x in y] = 1", "x = yield = 3", "a, (b, 2) = c", "*a, 1 = x", "del a, f()", "a = b", "a.b = c", "a[0], b = c", "del a, b", "a[1:2] = c", "(a) = 1", "((a, b)) = 1, 2", "[a, *b] = c"]:
+  try: exec(s, {'b': [1,2], 'c': [1,2], 'a': [1,2,3]})
+  except SyntaxError as e: print(repr(s), e.args)
+  except Exception as e: print(repr(s), "RT", type(e).__name__)
+  else: print(repr(s), "OK")
+"#])
+        .output()
+        .expect("spawn python");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        r#"'1 = x' ("cannot assign to literal here. Maybe you meant '==' instead of '='?", ('<string>', 1, 1, '1 = x\n', 1, 2))
+'f() = 1' ("cannot assign to function call here. Maybe you meant '==' instead of '='?", ('<string>', 1, 1, 'f() = 1\n', 1, 4))
+'a + 1 = 2' ("cannot assign to expression here. Maybe you meant '==' instead of '='?", ('<string>', 1, 1, 'a + 1 = 2\n', 1, 6))
+'None = 1' ('cannot assign to None', ('<string>', 1, 1, 'None = 1\n', 1, 5))
+'x.y() = 1' ("cannot assign to function call here. Maybe you meant '==' instead of '='?", ('<string>', 1, 1, 'x.y() = 1\n', 1, 6))
+'[1] = x' ('cannot assign to literal', ('<string>', 1, 2, '[1] = x\n', 1, 3))
+'(a, 1) = x' ('cannot assign to literal', ('<string>', 1, 5, '(a, 1) = x\n', 1, 6))
+'1 = x = y' ('cannot assign to literal', ('<string>', 1, 1, '1 = x = y\n', 1, 2))
+'x = 1 = y' ('cannot assign to literal', ('<string>', 1, 5, 'x = 1 = y\n', 1, 6))
+'f() += 1' ("'function call' is an illegal expression for augmented assignment", ('<string>', 1, 1, 'f() += 1\n', 1, 4))
+'(a, b) += 1' ("'tuple' is an illegal expression for augmented assignment", ('<string>', 1, 1, '(a, b) += 1\n', 1, 7))
+'[a] += 1' ("'list' is an illegal expression for augmented assignment", ('<string>', 1, 1, '[a] += 1\n', 1, 4))
+'1 += 1' ("'literal' is an illegal expression for augmented assignment", ('<string>', 1, 1, '1 += 1\n', 1, 2))
+'del f()' ('cannot delete function call', ('<string>', 1, 5, 'del f()\n', 1, 8))
+'del 1' ('cannot delete literal', ('<string>', 1, 5, 'del 1\n', 1, 6))
+'del (a, 1)' ('cannot delete literal', ('<string>', 1, 9, 'del (a, 1)\n', 1, 10))
+'del a + b' ('cannot delete expression', ('<string>', 1, 5, 'del a + b\n', 1, 10))
+'x() = y = 3' ('cannot assign to function call', ('<string>', 1, 1, 'x() = y = 3\n', 1, 4))
+'"s" = 1' ("cannot assign to literal here. Maybe you meant '==' instead of '='?", ('<string>', 1, 1, '"s" = 1\n', 1, 4))
+'a if b else c = 1' ('cannot assign to conditional expression', ('<string>', 1, 1, 'a if b else c = 1\n', 1, 14))
+'lambda: 1 = 2' ('cannot assign to lambda', ('<string>', 1, 1, 'lambda: 1 = 2\n', 1, 10))
+'not a = 1' ('cannot assign to expression', ('<string>', 1, 1, 'not a = 1\n', 1, 6))
+'a < b = 1' ('cannot assign to comparison', ('<string>', 1, 1, 'a < b = 1\n', 1, 6))
+'-a = 1' ("cannot assign to expression here. Maybe you meant '==' instead of '='?", ('<string>', 1, 1, '-a = 1\n', 1, 3))
+'{1: 2} = x' ("cannot assign to dict literal here. Maybe you meant '==' instead of '='?", ('<string>', 1, 1, '{1: 2} = x\n', 1, 7))
+'{1} = x' ("cannot assign to set display here. Maybe you meant '==' instead of '='?", ('<string>', 1, 1, '{1} = x\n', 1, 4))
+'... = x' ("cannot assign to ellipsis here. Maybe you meant '==' instead of '='?", ('<string>', 1, 1, '... = x\n', 1, 4))
+'True = 1' ('cannot assign to True', ('<string>', 1, 1, 'True = 1\n', 1, 5))
+'f"x" = 1' ("cannot assign to f-string expression here. Maybe you meant '==' instead of '='?", ('<string>', 1, 1, 'f"x" = 1\n', 1, 5))
+'[x for x in y] = 1' ("cannot assign to list comprehension here. Maybe you meant '==' instead of '='?", ('<string>', 1, 1, '[x for x in y] = 1\n', 1, 15))
+'x = yield = 3' ('assignment to yield expression not possible', ('<string>', 1, 5, 'x = yield = 3\n', 1, 10))
+'a, (b, 2) = c' ('cannot assign to literal', ('<string>', 1, 8, 'a, (b, 2) = c\n', 1, 9))
+'*a, 1 = x' ("cannot assign to literal here. Maybe you meant '==' instead of '='?", ('<string>', 1, 5, '*a, 1 = x\n', 1, 6))
+'del a, f()' ('cannot delete function call', ('<string>', 1, 8, 'del a, f()\n', 1, 11))
+'a = b' OK
+'a.b = c' RT AttributeError
+'a[0], b = c' OK
+'del a, b' OK
+'a[1:2] = c' OK
+'(a) = 1' OK
+'((a, b)) = 1, 2' OK
+'[a, *b] = c' OK
+"#
+    );
+}

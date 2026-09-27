@@ -550,6 +550,148 @@ impl Parser {
         Err(self.err_span(&msg, a_start, b_end))
     }
 
+    /// CPython's `invalid_assignment` / `invalid_named_expression`: the first
+    /// target, left to right, that is not a name, attribute, subscript or a
+    /// list/tuple/star of those. A lone `target = value` whose target is an
+    /// ordinary expression is the likely typo for `==`, and says so.
+    fn check_assign_targets(
+        &self,
+        targets: &[Expr],
+        spans: &[(usize, usize)],
+    ) -> Result<(), String> {
+        let single = targets.len() == 1;
+        // `*a, 1 = x`: the LAST item of a bare tuple target is itself read as
+        // `1 = x`, which is the `==` typo CPython's parser meets first.
+        if let (true, Some(Expr::Tuple(items))) = (single, targets.first().map(unspan)) {
+            let (a, b) = spans[0];
+            let bare = !matches!(&self.toks[a].tok, Tok::Op(o) if o == "(");
+            if let (true, Some(last), Some(&(la, lb))) =
+                (bare, items.last(), self.split_commas(a, b).last())
+            {
+                let last = unspan(last);
+                let plain = !matches!(
+                    last,
+                    Expr::Name(_)
+                        | Expr::Attribute(..)
+                        | Expr::Subscript(..)
+                        | Expr::Starred(_)
+                        | Expr::Tuple(_)
+                        | Expr::List(_)
+                        | Expr::GenExp(..)
+                        | Expr::True
+                        | Expr::False
+                        | Expr::None
+                        | Expr::BoolOp(..)
+                        | Expr::UnaryOp(UnOp::Not, _)
+                        | Expr::Compare(..)
+                        | Expr::IfExp { .. }
+                        | Expr::Lambda { .. }
+                        | Expr::NamedExpr(..)
+                );
+                if plain {
+                    return Err(self.err_span(
+                        &format!(
+                            "cannot assign to {} here. Maybe you meant '==' instead of '='?",
+                            expr_name(last)
+                        ),
+                        la,
+                        lb,
+                    ));
+                }
+            }
+        }
+        for (t, &(a, b)) in targets.iter().zip(spans) {
+            let Some((what, (ia, ib))) = self.invalid_target(t, a, b) else {
+                continue;
+            };
+            let e = unspan(t);
+            let comparable = !matches!(
+                e,
+                Expr::Tuple(_)
+                    | Expr::List(_)
+                    | Expr::GenExp(..)
+                    | Expr::True
+                    | Expr::False
+                    | Expr::None
+                    | Expr::BoolOp(..)
+                    | Expr::UnaryOp(UnOp::Not, _)
+                    | Expr::Compare(..)
+                    | Expr::IfExp { .. }
+                    | Expr::Lambda { .. }
+                    | Expr::NamedExpr(..)
+            );
+            if matches!(e, Expr::Yield(_) | Expr::YieldFrom(_)) {
+                return Err(self.err_span("assignment to yield expression not possible", a, b));
+            }
+            let msg = if single && comparable {
+                format!("cannot assign to {what} here. Maybe you meant '==' instead of '='?")
+            } else {
+                format!("cannot assign to {what}")
+            };
+            return Err(self.err_span(&msg, ia, ib));
+        }
+        Ok(())
+    }
+
+    /// The part of `e` — spanning tokens `a..=b` — that cannot be assigned to
+    /// or deleted, with CPython's name for it (`_PyPegen_get_invalid_target`).
+    fn invalid_target(
+        &self,
+        e: &Expr,
+        a: usize,
+        b: usize,
+    ) -> Option<(&'static str, (usize, usize))> {
+        match unspan(e) {
+            Expr::Name(_) | Expr::Attribute(..) | Expr::Subscript(..) => None,
+            Expr::Starred(inner) => self.invalid_target(inner, a + 1, b),
+            Expr::Tuple(items) | Expr::List(items) => {
+                let (ia, ib) = self.strip_brackets(a, b);
+                let parts = self.split_commas(ia, ib);
+                items
+                    .iter()
+                    .zip(parts)
+                    .find_map(|(item, (x, y))| self.invalid_target(item, x, y))
+            }
+            other => Some((expr_name(other), (a, b))),
+        }
+    }
+
+    /// Tokens `a..=b` without one enclosing pair of brackets, if they have one.
+    fn strip_brackets(&self, a: usize, b: usize) -> (usize, usize) {
+        let open = matches!(&self.toks[a].tok, Tok::Op(o) if o == "(" || o == "[");
+        let close = matches!(&self.toks[b].tok, Tok::Op(o) if o == ")" || o == "]");
+        if open && close && b > a + 1 && self.split_commas(a, b).len() == 1 {
+            (a + 1, b - 1)
+        } else {
+            (a, b)
+        }
+    }
+
+    /// The comma-separated items of tokens `a..=b`, at bracket depth 0, as
+    /// token ranges. A trailing comma adds no item.
+    fn split_commas(&self, a: usize, b: usize) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        let mut depth = 0i32;
+        let mut start = a;
+        for i in a..=b.min(self.toks.len() - 1) {
+            match &self.toks[i].tok {
+                Tok::Op(o) if matches!(o.as_str(), "(" | "[" | "{") => depth += 1,
+                Tok::Op(o) if matches!(o.as_str(), ")" | "]" | "}") => depth -= 1,
+                Tok::Op(o) if o == "," && depth == 0 => {
+                    if i > start {
+                        out.push((start, i - 1));
+                    }
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        if start <= b {
+            out.push((start, b));
+        }
+        out
+    }
+
     /// Whether the current token can begin an expression.
     fn starts_expression(&self) -> bool {
         match self.cur() {
@@ -795,7 +937,14 @@ impl Parser {
                 "raise" => return self.parse_raise(out, line),
                 "del" => {
                     self.advance();
+                    let start = self.pos;
                     let targets = self.parse_target_list()?;
+                    let items = self.split_commas(start, self.pos - 1);
+                    for (t, (a, b)) in targets.iter().zip(items) {
+                        if let Some((what, (a, b))) = self.invalid_target(t, a, b) {
+                            return Err(self.err_span(&format!("cannot delete {what}"), a, b));
+                        }
+                    }
                     out.push(Stmt::new(StmtKind::Delete(targets), line));
                     return Ok(());
                 }
@@ -889,9 +1038,25 @@ impl Parser {
             ));
             return Ok(());
         }
+        let first_end = self.pos.saturating_sub(1);
         // Augmented assignment.
         if let Tok::Op(o) = self.cur().clone() {
             if let Some(op) = augassign_op(&o) {
+                // Only a name, an attribute or a subscript can be augmented.
+                let target = unspan(&first);
+                if !matches!(
+                    target,
+                    Expr::Name(_) | Expr::Attribute(..) | Expr::Subscript(..)
+                ) {
+                    return Err(self.err_span(
+                        &format!(
+                            "'{}' is an illegal expression for augmented assignment",
+                            expr_name(target)
+                        ),
+                        first_start,
+                        first_end,
+                    ));
+                }
                 self.advance();
                 let value = self.parse_exprlist()?;
                 out.push(Stmt::new(
@@ -908,14 +1073,18 @@ impl Parser {
         // Plain / chained assignment.
         if self.at_op("=") {
             let mut targets = vec![first];
+            let mut spans = vec![(first_start, first_end)];
             let mut value = None;
             while self.eat_op("=") {
+                let start = self.pos;
                 let e = self.parse_exprlist()?;
                 if let Some(prev) = value.take() {
                     targets.push(prev);
                 }
+                spans.push((start, self.pos - 1));
                 value = Some(e);
             }
+            self.check_assign_targets(&targets, &spans)?;
             out.push(Stmt::new(
                 StmtKind::Assign {
                     targets,
@@ -2470,6 +2639,8 @@ impl Parser {
                             Ok(Expr::YieldFrom(Box::new(self.parse_expr()?)))
                         } else if self.at_newline()
                             || self.at_op(")")
+                            || self.at_op("=")
+                            || self.at_op(";")
                             || matches!(self.cur(), Tok::Eof)
                         {
                             Ok(Expr::Yield(None))
@@ -2992,4 +3163,51 @@ fn augassign_op(o: &str) -> Option<BinOp> {
         "@=" => BinOp::MatMul,
         _ => return None,
     })
+}
+
+/// `e` without the source-span wrapper the parser puts on some expressions.
+fn unspan(e: &Expr) -> &Expr {
+    match e {
+        Expr::Spanned(inner, _) => unspan(inner),
+        other => other,
+    }
+}
+
+/// What CPython calls an expression in a message (`_PyPegen_get_expr_name`).
+fn expr_name(e: &Expr) -> &'static str {
+    match unspan(e) {
+        Expr::None => "None",
+        Expr::True => "True",
+        Expr::False => "False",
+        Expr::Ellipsis => "ellipsis",
+        Expr::Int(_)
+        | Expr::BigInt(_)
+        | Expr::Float(_)
+        | Expr::Complex(_)
+        | Expr::Str(_)
+        | Expr::Bytes(_) => "literal",
+        Expr::FString(_) => "f-string expression",
+        Expr::TString(_) => "t-string expression",
+        Expr::Name(_) => "name",
+        Expr::List(_) => "list",
+        Expr::Tuple(_) => "tuple",
+        Expr::Set(_) => "set display",
+        Expr::Dict(_) => "dict literal",
+        Expr::Starred(_) => "starred",
+        Expr::Compare(..) => "comparison",
+        Expr::IfExp { .. } => "conditional expression",
+        Expr::Call { .. } => "function call",
+        Expr::Attribute(..) => "attribute",
+        Expr::Subscript(..) => "subscript",
+        Expr::Slice { .. } => "slice",
+        Expr::Lambda { .. } => "lambda",
+        Expr::ListComp(..) => "list comprehension",
+        Expr::SetComp(..) => "set comprehension",
+        Expr::DictComp(..) => "dict comprehension",
+        Expr::GenExp(..) => "generator expression",
+        Expr::Yield(_) | Expr::YieldFrom(_) => "yield expression",
+        Expr::Await(_) => "await expression",
+        Expr::NamedExpr(..) => "named expression",
+        _ => "expression",
+    }
 }

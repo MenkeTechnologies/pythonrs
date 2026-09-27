@@ -1162,26 +1162,18 @@ written.
   against CPython 3.14.7 through `exec`:
 
   ```
-  del f()          CPython: cannot delete function call            (1, 5)..(1, 8)
-                   pythonrs: cannot delete this expression          no position
-  1 = x            CPython: cannot assign to literal here. Maybe you meant '==' instead of '='?
-                   pythonrs: cannot assign to this expression       no position
-  (a, b) += 1      CPython: 'tuple' is an illegal expression for augmented assignment
-                   pythonrs: cannot assign to this expression       no position
-  x = yield = 3    CPython: assignment to yield expression not possible
-                   pythonrs: invalid syntax at the second '='
   f(**x, *y)       same message, no position here
   '\N{bogus}'      same message, no position here
   yield 1          same message, no position here ('yield' outside function)
+  for 1 in x: …    cannot assign to this expression, where CPython names it
   ```
 
-  The assignment-target family comes from CPython's `invalid_assignment`
-  productions, which name the kind of expression; pythonrs checks targets in
-  the compiler, after the positions are gone. The compiler's own errors
-  (`yield`/`await` outside a function, pattern-matching errors) carry no
-  position for the same reason. `return`/`break`/`continue` in the wrong
-  place, duplicate parameters and a module-level `nonlocal` are positioned,
-  because the parser raises them.
+  The compiler's own errors (`yield`/`await` outside a function,
+  pattern-matching errors, an invalid `for`/`with`/comprehension target) carry
+  no position: the compiler sees no columns. Assignment, augmented-assignment
+  and `del` targets, `return`/`break`/`continue` in the wrong place, duplicate
+  parameters and a module-level `nonlocal` are positioned, because the parser
+  checks them.
 - **A bridged exception carries no CPython traceback.** An exception that crosses
   from pythonrs into CPython is rebuilt as a fresh exception object, so its
   `__traceback__` is empty. Two visible consequences, both in code that is not
