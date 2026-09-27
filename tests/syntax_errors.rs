@@ -586,3 +586,58 @@ for s in cases:
 "#
     );
 }
+
+/// PEP 758 (3.14): `except A, B:` and `except* A, B:` catch any of the listed
+/// types without parentheses (a trailing comma allowed), while `as` still
+/// requires them — CPython's `multiple exception types must be parenthesized
+/// when using 'as'`, spanning the types through the bound name.
+#[test]
+fn except_accepts_unparenthesized_types() {
+    let out = Command::new(env!("CARGO_BIN_EXE_python"))
+        .args([
+            "-c",
+            r#"cases = [
+    "try: pass\nexcept A, B as e: pass",
+    "try: pass\nexcept* A, B as e: pass",
+    "try: pass\nexcept A, B,: pass",
+    "try: pass\nexcept A,: pass",
+    "try: pass\nexcept (A), B: pass",
+    "try: pass\nexcept A, B, as e: pass",
+]
+for s in cases:
+    try:
+        exec(s)
+        print(repr(s), "ok")
+    except SyntaxError as e:
+        print(repr(s), e.args)
+for exc in (KeyError, ValueError, TypeError):
+    try:
+        try:
+            raise exc("m")
+        except ValueError, KeyError:
+            print("caught", exc.__name__)
+    except TypeError:
+        print("passed", exc.__name__)
+try:
+    raise ExceptionGroup("g", [OSError(1), ValueError(2)])
+except* OSError, ValueError:
+    print("star caught both")
+"#,
+        ])
+        .output()
+        .expect("spawn python");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        r#"'try: pass\nexcept A, B as e: pass' ("multiple exception types must be parenthesized when using 'as'", ('<string>', 2, 8, 'except A, B as e: pass\n', 2, 17))
+'try: pass\nexcept* A, B as e: pass' ("multiple exception types must be parenthesized when using 'as'", ('<string>', 2, 9, 'except* A, B as e: pass\n', 2, 18))
+'try: pass\nexcept A, B,: pass' ok
+'try: pass\nexcept A,: pass' ok
+'try: pass\nexcept (A), B: pass' ok
+'try: pass\nexcept A, B, as e: pass' ("multiple exception types must be parenthesized when using 'as'", ('<string>', 2, 8, 'except A, B, as e: pass\n', 2, 18))
+caught KeyError
+caught ValueError
+passed TypeError
+star caught both
+"#
+    );
+}

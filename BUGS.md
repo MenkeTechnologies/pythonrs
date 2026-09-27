@@ -38,6 +38,11 @@ written.
   outside loop`, `'continue' not properly in loop` and a module-level
   `nonlocal` are raised once the file has parsed, so a syntax error anywhere
   in the file wins over them, as it does in CPython.
+- **PEP 758 `except A, B:`** (3.14) catches any of the listed types without
+  parentheses, for `except*` too; with `as` the parentheses are still required,
+  and leaving them out is CPython's `multiple exception types must be
+  parenthesized when using 'as'`. `site.py` in the vendored stdlib uses the
+  form, and did not compile.
 - **A `SyntaxError` has its attributes.** `SyntaxError('m', ('f.py', 3, 4,
   'txt'))` bound none of `msg`/`filename`/`lineno`/`offset`/`text`/
   `end_lineno`/`end_offset`/`print_file_and_line`, so `e.lineno` inside a

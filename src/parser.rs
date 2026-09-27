@@ -1672,7 +1672,26 @@ impl Parser {
             let (typ, name) = if self.at_op(":") {
                 (None, None)
             } else {
-                let t = self.parse_expr()?;
+                let start = self.pos;
+                let mut t = self.parse_expr()?;
+                // PEP 758 (3.14): `except A, B:` catches either, as the
+                // parenthesized tuple does — but with `as` the parentheses are
+                // still required.
+                if self.at_op(",") {
+                    let mut types = vec![t];
+                    while self.eat_op(",") && !self.at_op(":") && !self.at_kw("as") {
+                        types.push(self.parse_expr()?);
+                    }
+                    if self.eat_kw("as") {
+                        self.expect_name()?;
+                        return Err(self.err_span(
+                            "multiple exception types must be parenthesized when using 'as'",
+                            start,
+                            self.pos - 1,
+                        ));
+                    }
+                    t = Expr::Tuple(types);
+                }
                 let n = if self.eat_kw("as") {
                     Some(self.expect_name()?)
                 } else {
