@@ -395,3 +395,76 @@ fn invalid_targets_are_named_at_the_offending_expression() {
 "#
     );
 }
+
+/// `compile()` — which pythonrs lacked — checks the source in its mode and
+/// returns a code object `exec` and `eval` run as that mode under its
+/// filename; and what `eval` accepts is one expression list and nothing after.
+#[test]
+fn compile_returns_code_that_exec_and_eval_run() {
+    let out = Command::new(env!("CARGO_BIN_EXE_python"))
+        .args(["-c", r#"c = compile("x = 1\ny = x + 1", "<mine>", "exec")
+print(type(c).__name__, c.co_filename, c.co_name, c.co_firstlineno)
+ns = {}
+exec(c, ns)
+print(ns["y"])
+e = compile("1 + 2", "f", "eval")
+print(eval(e), exec(e), eval(c))
+s = compile("1+1", "<s>", "single"); exec(s)
+tests = ["compile()", "compile(\"x\")", "compile(\"x\", \"f\")", "compile(1, \"f\", \"exec\")", "compile(\"x\", 1, \"exec\")", "compile(\"x\", \"f\", 1)", "compile(\"x\", \"f\", \"exec\", flags=\"a\")", "compile(b\"x=1\", \"f\", \"exec\").co_filename", "compile(\"x=1\", b\"f\", \"exec\").co_filename", "compile(\"x=1\\x00\", \"f\", \"exec\")", "compile(\"x = 1\", \"f\", \"eval\")", "compile(\"1\\n2\", \"f\", \"eval\")", "compile(\"\", \"f\", \"eval\")", "compile(\"x = (\", \"fn.py\", \"exec\")", "compile(\"x\", \"f\", \"bad\")", "type(compile(\"x=1\", \"f\", \"exec\", 0x400)).__name__", "compile(\"return\", \"r.py\", \"exec\")"]
+for t in tests:
+    try:
+        print(t, "->", repr(eval(t))[:40])
+    except SyntaxError as err:
+        print(t, "->", type(err).__name__, err.args)
+    except Exception as err:
+        print(t, "->", type(err).__name__, err.args[0] if err.args else "")
+try:
+    exec(compile("x = (", "boom.py", "exec"))
+except SyntaxError as err:
+    print(err.filename, err.lineno)
+for s in ["x = 1", "1\n2", "", "  ", "1;2", "1,2", "(1)\n", "\n\n1\n\n", "def f(): pass", "import os", "1 2"]:
+    try:
+        print(repr(s), eval(s))
+    except SyntaxError as e:
+        print(repr(s), e.args)
+"#])
+        .output()
+        .expect("spawn python");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        r#"code <mine> <module> 1
+2
+3 None None
+2
+compile() -> TypeError compile() missing required argument 'source' (pos 1)
+compile("x") -> TypeError compile() missing required argument 'filename' (pos 2)
+compile("x", "f") -> TypeError compile() missing required argument 'mode' (pos 3)
+compile(1, "f", "exec") -> TypeError compile() arg 1 must be a string, bytes or AST object
+compile("x", 1, "exec") -> TypeError expected str, bytes or os.PathLike object, not int
+compile("x", "f", 1) -> TypeError compile() argument 'mode' must be str, not int
+compile("x", "f", "exec", flags="a") -> TypeError 'str' object cannot be interpreted as an integer
+compile(b"x=1", "f", "exec").co_filename -> 'f'
+compile("x=1", b"f", "exec").co_filename -> 'f'
+compile("x=1\x00", "f", "exec") -> SyntaxError ('source code string cannot contain null bytes',)
+compile("x = 1", "f", "eval") -> SyntaxError ('invalid syntax', ('f', 1, 3, 'x = 1', 1, 4))
+compile("1\n2", "f", "eval") -> SyntaxError ('invalid syntax', ('f', 2, 1, '2', 2, 2))
+compile("", "f", "eval") -> SyntaxError ('invalid syntax', ('f', 0, 0, '', 0, 0))
+compile("x = (", "fn.py", "exec") -> SyntaxError ("'(' was never closed", ('fn.py', 1, 5, 'x = (\n', 1, 0))
+compile("x", "f", "bad") -> ValueError compile() mode must be 'exec', 'eval' or 'single'
+type(compile("x=1", "f", "exec", 0x400)).__name__ -> 'Module'
+compile("return", "r.py", "exec") -> SyntaxError ("'return' outside function", ('r.py', 1, 1, None, 1, 7))
+boom.py 1
+'x = 1' ('invalid syntax', ('<string>', 1, 3, 'x = 1', 1, 4))
+'1\n2' ('invalid syntax', ('<string>', 2, 1, '2', 2, 2))
+'' ('invalid syntax', ('<string>', 0, 0, '', 0, 0))
+'  ' ('invalid syntax', ('<string>', 0, 0, '', 0, 0))
+'1;2' ('invalid syntax', ('<string>', 1, 2, '1;2', 1, 3))
+'1,2' (1, 2)
+'(1)\n' 1
+'\n\n1\n\n' 1
+'def f(): pass' ('invalid syntax', ('<string>', 1, 1, 'def f(): pass', 1, 4))
+'import os' ('invalid syntax', ('<string>', 1, 1, 'import os', 1, 7))
+'1 2' ('invalid syntax', ('<string>', 1, 3, '1 2', 1, 4))
+"#
+    );
+}

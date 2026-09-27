@@ -251,6 +251,46 @@ pub fn render_syntax_block(pos: &SyntaxPos, default_file: &str) -> String {
     out
 }
 
+/// Check `src` is what `eval` accepts — CPython's `eval_input`: one expression
+/// list, then nothing but line breaks. Anything after the expression is the
+/// error, at that token; empty input is an error at line 0.
+pub fn check_eval_input(src: &str) -> Result<(), String> {
+    let lexed = lex(src)?;
+    let mut p = Parser {
+        toks: lexed.toks,
+        pos: 0,
+        deferred: None,
+        depth: 0,
+        in_function: false,
+        loop_depth: 0,
+        nesting: 0,
+        misplaced: None,
+    };
+    p.skip_newlines();
+    if matches!(p.cur(), Tok::Eof) {
+        return Err(with_text(
+            at_pos("SyntaxError: invalid syntax", 0, 0, 0, 0),
+            "",
+        ));
+    }
+    let checked = p.parse_exprlist().and_then(|_| {
+        p.skip_newlines();
+        if matches!(p.cur(), Tok::Eof) {
+            Ok(())
+        } else {
+            Err(p.err_here("invalid syntax"))
+        }
+    });
+    let lineno = checked
+        .as_ref()
+        .err()
+        .and_then(|e| split_syntax_error(e).1?.lineno);
+    checked.map_err(|e| match lineno.and_then(|l| source_line(src, l, false)) {
+        Some(text) => with_text(e, &text),
+        None => e,
+    })
+}
+
 /// Deepest expression tree the parser will build before refusing the source.
 ///
 /// This is a stack guard, not a language rule. Nothing here is recursive in the

@@ -1356,10 +1356,14 @@ written.
   says `Constant(value=1, kind=None)`, because every OPTIONAL ASDL field carries
   a class-level `None` default that `repr` then reads. `_fields` already lists
   `kind`; what is missing is the optional/required split from `Python.asdl`.
-- **`compile()` is absent** — `NameError: name 'compile' is not defined`. The
-  `-c`/file paths compile internally, but the builtin that exposes it (and so
-  `code`-object construction from source, `exec(compile(...))`, and
-  `dis`-over-source) is not wired up.
+- **A `compile()` code object carries its source, not bytecode.**
+  `compile(source, filename, mode)` checks the source in `exec`/`eval`/
+  `single` mode — raising the positioned `SyntaxError` naming `filename` —
+  and returns a `code` object with `co_filename`, `co_name` and
+  `co_firstlineno` that `exec`/`eval` run as that mode (`ast.PyCF_ONLY_AST`
+  returns `ast.parse`'s tree). It holds the source and recompiles it when run,
+  so the rest of the code-object surface (`co_code`, `co_consts`,
+  `co_varnames`, `dis.dis(code)`, `types.CodeType(...)`) is absent.
 - **The context-manager protocol check does not reach the natively shadowed
   managers.** `with <not a context manager>:` now raises CPython's
   `TypeError: 'X' object does not support the context manager protocol (missed

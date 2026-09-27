@@ -911,6 +911,15 @@ pub const INDEX_OVERFLOW: &str = "cannot fit 'int' into an index-sized integer";
 /// A heap object.
 #[derive(Clone)]
 pub enum PyObj {
+    /// A code object from `compile()`: the source it was compiled from, the
+    /// filename it names, and the mode (`exec`/`eval`/`single`). pythonrs keeps
+    /// no bytecode object a program can hold, so `exec`/`eval` of one
+    /// recompile the source — which `compile()` has already checked.
+    CompiledSource {
+        source: String,
+        filename: String,
+        mode: String,
+    },
     Str(String),
     Bytes(Vec<u8>),
     List(Vec<Value>),
@@ -4371,6 +4380,7 @@ impl PyHost {
                     _ => "dict_items".into(),
                 },
                 Some(PyObj::Range { .. }) | Some(PyObj::BigRange { .. }) => "range".into(),
+                Some(PyObj::CompiledSource { .. }) => "code".into(),
                 Some(PyObj::Slice { .. }) => "slice".into(),
                 Some(PyObj::Func(_)) => "function".into(),
                 // A builtin type/exception constructor (`int`, `ValueError`) is a
@@ -4650,6 +4660,10 @@ impl PyHost {
                         .unwrap_or_default();
                     format!("<code object {name} at 0x0000000000000000, file \"<string>\", line 1>")
                 }
+                Some(PyObj::CompiledSource { filename, .. }) => format!(
+                    "<code object <module> at 0x{:012x}, file \"{filename}\", line 1>",
+                    self.addr_of(v)
+                ),
                 Some(PyObj::TypeVarLike { name, .. }) => name.clone(),
                 Some(PyObj::StructTime { fields }) => {
                     let fields = fields.clone();
@@ -11284,6 +11298,19 @@ impl PyHost {
             Some(PyObj::Code { def_id }) => {
                 let def_id = *def_id;
                 self.code_attr(def_id, name)
+            }
+            // A `compile()` result: a module's code, named `<module>`, starting
+            // at line 1 of the file it names.
+            Some(PyObj::CompiledSource { filename, .. }) => {
+                let filename = filename.clone();
+                match name {
+                    "co_filename" => Ok(self.new_str(filename)),
+                    "co_name" | "co_qualname" => Ok(self.new_str("<module>")),
+                    "co_firstlineno" => Ok(Value::Int(1)),
+                    _ => Err(format!(
+                        "AttributeError: 'code' object has no attribute '{name}'"
+                    )),
+                }
             }
             // `(int | str).__args__` -> the member tuple; `__parameters__` is empty
             // (no typevars in a plain union).

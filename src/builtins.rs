@@ -4692,6 +4692,7 @@ const BUILTIN_FUNCS: &[&str] = &[
     "slice",
     "eval",
     "exec",
+    "compile",
     "globals",
     "locals",
 ];
@@ -6347,6 +6348,7 @@ pub fn call_builtin_function(
         // on the current host (so names resolve against — and assignments land in —
         // the live module globals), exactly as the REPL runs a line.
         "eval" | "exec" => run_pysource(name == "eval", &args),
+        "compile" => builtin_compile(&args, &kwargs),
         // Type constructors.
         "int" => {
             // `int(x, /, base=10)`: `base` is the ONLY keyword. Any other name
@@ -6899,9 +6901,27 @@ fn pow_mod(a: &Value, b: &Value, m: &Value) -> Result<Value, String> {
 /// top. Builtins resolve through a separate registry, so they stay available.
 fn run_pysource(want_value: bool, args: &[Value]) -> Result<Value, String> {
     let fname = if want_value { "eval" } else { "exec" };
+    // What the source is: a string is read as the builtin's own mode and names
+    // no file; a `compile()` result carries both its mode and its filename, and
+    // runs as what it was compiled as whichever builtin runs it.
+    let compiled = args.first().and_then(|v| {
+        with_host(|h| match h.get(v) {
+            Some(PyObj::CompiledSource {
+                source,
+                filename,
+                mode,
+            }) => Some((source.clone(), filename.clone(), mode.clone())),
+            _ => None,
+        })
+    });
+    let (filename, source_mode) = match &compiled {
+        Some((_, f, m)) => (f.clone(), m.clone()),
+        None => ("<string>".to_string(), fname.to_string()),
+    };
+    let result_wanted = want_value;
+    let want_value = source_mode == "eval";
     let src = match args.first() {
-        // A pre-compiled code object is unsupported (pythonrs has no code
-        // objects); a string source is required.
+        Some(_) if compiled.is_some() => compiled.map(|c| c.0).unwrap_or_default(),
         Some(v) => with_host(|h| h.as_str(v)).ok_or_else(|| {
             host::type_error(&format!(
                 "{fname}() arg 1 must be a string, bytes or code object"
@@ -6937,12 +6957,11 @@ fn run_pysource(want_value: bool, args: &[Value]) -> Result<Value, String> {
     // series, or a bare newline after an operator is a SyntaxError — the wrapper's
     // parens below would otherwise make some of those parse.
     if want_value {
-        let stmts = crate::parser::parse(src.trim()).map_err(|e| {
-            crate::parser::with_filename(crate::parser::for_eval_input(e, src.trim()), "<string>")
+        crate::parser::parse(src.trim()).map_err(|e| {
+            crate::parser::with_filename(crate::parser::for_eval_input(e, src.trim()), &filename)
         })?;
-        if stmts.len() != 1 || !matches!(stmts[0].kind, crate::ast::StmtKind::Expr(_)) {
-            return Err("SyntaxError: invalid syntax".to_string());
-        }
+        crate::parser::check_eval_input(src.trim())
+            .map_err(|e| crate::parser::with_filename(e, &filename))?;
     }
     // Bind the (validated) expression to a temporary so its value can be read back.
     // The surrounding newlines let a multi-line expression (one whose newlines sit
@@ -7008,9 +7027,15 @@ fn run_pysource(want_value: bool, args: &[Value]) -> Result<Value, String> {
     };
 
     let result = (|| -> Result<Value, String> {
-        // The source is the file `<string>` to a syntax error in it.
-        let prog =
-            crate::compile(&to_compile).map_err(|e| crate::parser::with_filename(e, "<string>"))?;
+        // The source is the file `<string>` — or the name `compile()` was
+        // given — to a syntax error in it. `single` mode echoes each
+        // expression statement's value, as the interactive prompt does.
+        let prog = if source_mode == "single" {
+            crate::compile_interactive(&to_compile)
+        } else {
+            crate::compile(&to_compile)
+        }
+        .map_err(|e| crate::parser::with_filename(e, &filename))?;
         // `eval`/`exec` compile their source, so the compile-time
         // `SyntaxWarning`s belong to them exactly as they do to a script — CPython
         // prints them from here too, attributed to `<string>`. They were compiled
@@ -7018,15 +7043,17 @@ fn run_pysource(want_value: bool, args: &[Value]) -> Result<Value, String> {
         // compiler through `eval`. There is no file to echo the offending line
         // from, so only the message is printed.
         for (line, msg) in &prog.warnings {
-            eprintln!("<string>:{line}: SyntaxWarning: {msg}");
+            eprintln!("{filename}:{line}: SyntaxWarning: {msg}");
         }
         let chunk = crate::load_merged(prog);
         crate::host::run_chunk_on(chunk)?;
-        Ok(if want_value {
+        let value = if want_value {
             with_host(|h| h.del_global(TMP)).unwrap_or(Value::Undef)
         } else {
             Value::Undef
-        })
+        };
+        // `exec` of an expression's code runs it and returns None.
+        Ok(if result_wanted { value } else { Value::Undef })
     })();
 
     if let Some(saved_mod) = fresh_mod {
@@ -7080,6 +7107,113 @@ fn run_pysource(want_value: bool, args: &[Value]) -> Result<Value, String> {
         with_host(|h| h.replace_globals(saved));
     }
     result
+}
+
+/// `compile(source, filename, mode, flags=0, dont_inherit=False, optimize=-1)`:
+/// check the source compiles in `mode` and return a code object that `exec`
+/// and `eval` run as that mode, naming `filename`. A syntax error is raised
+/// here, positioned and naming the file. With `ast.PyCF_ONLY_AST` in `flags`
+/// the result is `ast.parse`'s tree instead.
+fn builtin_compile(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, String> {
+    const PARAMS: [&str; 6] = [
+        "source",
+        "filename",
+        "mode",
+        "flags",
+        "dont_inherit",
+        "optimize",
+    ];
+    const PY_CF_ONLY_AST: i64 = 0x400;
+    if args.len() > PARAMS.len() {
+        return Err(host::type_error(&format!(
+            "compile() takes at most 6 arguments ({} given)",
+            args.len()
+        )));
+    }
+    let mut slots: Vec<Option<Value>> = vec![None; PARAMS.len()];
+    for (slot, a) in slots.iter_mut().zip(args) {
+        *slot = Some(a.clone());
+    }
+    for (k, v) in kwargs {
+        match PARAMS.iter().position(|p| p == k) {
+            Some(i) => slots[i] = Some(v.clone()),
+            None if k == "_feature_version" => {}
+            None => {
+                return Err(host::type_error(&format!(
+                    "compile() got an unexpected keyword argument '{k}'"
+                )))
+            }
+        }
+    }
+    let need = |i: usize| {
+        slots[i].clone().ok_or_else(|| {
+            host::type_error(&format!(
+                "compile() missing required argument '{}' (pos {})",
+                PARAMS[i],
+                i + 1
+            ))
+        })
+    };
+    let (source_v, filename_v, mode_v) = (need(0)?, need(1)?, need(2)?);
+    let type_of = |v: &Value| with_host(|h| h.type_name(v));
+    let text_of = |v: &Value| {
+        with_host(|h| match h.get(v) {
+            Some(PyObj::Bytes(b)) => Some(String::from_utf8_lossy(b).into_owned()),
+            _ => h.as_str(v),
+        })
+    };
+    let source = text_of(&source_v)
+        .ok_or_else(|| host::type_error("compile() arg 1 must be a string, bytes or AST object"))?;
+    let filename = text_of(&filename_v).ok_or_else(|| {
+        host::type_error(&format!(
+            "expected str, bytes or os.PathLike object, not {}",
+            type_of(&filename_v)
+        ))
+    })?;
+    let mode = with_host(|h| h.as_str(&mode_v)).ok_or_else(|| {
+        host::type_error(&format!(
+            "compile() argument 'mode' must be str, not {}",
+            type_of(&mode_v)
+        ))
+    })?;
+    if !matches!(mode.as_str(), "exec" | "eval" | "single") {
+        return Err("ValueError: compile() mode must be 'exec', 'eval' or 'single'".to_string());
+    }
+    let flags = match &slots[3] {
+        None => 0,
+        Some(Value::Int(n)) => *n,
+        Some(Value::Bool(b)) => *b as i64,
+        Some(other) => {
+            return Err(host::type_error(&format!(
+                "'{}' object cannot be interpreted as an integer",
+                type_of(other)
+            )))
+        }
+    };
+    if source.contains('\0') {
+        return Err("SyntaxError: source code string cannot contain null bytes".to_string());
+    }
+    if flags & PY_CF_ONLY_AST != 0 {
+        let ast = host::import_module("ast")?;
+        let parse = with_host(|h| h.get_attr(&ast, "parse"))?;
+        return host::invoke(&parse, vec![source_v, filename_v, mode_v], Vec::new());
+    }
+    let named = |e: String| crate::parser::with_filename(e, &filename);
+    if mode == "eval" {
+        let trimmed = source.trim();
+        crate::parser::parse(trimmed)
+            .map_err(|e| named(crate::parser::for_eval_input(e, trimmed)))?;
+        crate::parser::check_eval_input(trimmed).map_err(named)?;
+    } else {
+        crate::compile(&source).map_err(named)?;
+    }
+    Ok(with_host(|h| {
+        h.alloc(PyObj::CompiledSource {
+            source,
+            filename,
+            mode,
+        })
+    }))
 }
 
 /// The names an `exec`'d source declares `global`, in the statements that RUN
