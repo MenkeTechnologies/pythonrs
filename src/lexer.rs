@@ -734,7 +734,7 @@ impl Lexer {
         } else {
             // `0777`: a decimal integer may not have leading zeros unless it is
             // all zeros. Underlined from the literal's start through the zeros.
-            if s.len() > 1 && s.starts_with('0') && s.trim_start_matches('0').len() > 0 {
+            if s.len() > 1 && s.starts_with('0') && !s.trim_start_matches('0').is_empty() {
                 let start = self.tok_start - self.line_start;
                 let zeros = s.len() - s.trim_start_matches('0').len();
                 return Err(self.tok_err(
