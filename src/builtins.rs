@@ -1437,7 +1437,7 @@ fn b_truthy(vm: &mut VM, _: u8) -> Value {
     }
 }
 
-fn instance_has(h: &host::PyHost, i: &Instance, name: &str) -> bool {
+pub(crate) fn instance_has(h: &host::PyHost, i: &Instance, name: &str) -> bool {
     if h.class_lookup(&i.class, name).is_some() {
         return true;
     }
@@ -1466,7 +1466,7 @@ fn is_int_value(r: &Value) -> bool {
 /// `Ok(None)` when `v` is not an instance with `__index__`, `Err(..)` when the
 /// method raised or returned a non-int. Used by `bin`/`hex`/`oct` and sequence
 /// indexing, where any object may stand in for an integer.
-fn index_dunder(v: &Value) -> Result<Option<Value>, String> {
+pub(crate) fn index_dunder(v: &Value) -> Result<Option<Value>, String> {
     let has = with_host(
         |h| matches!(h.get(v), Some(PyObj::Instance(i)) if instance_has(h, i, "__index__")),
     );

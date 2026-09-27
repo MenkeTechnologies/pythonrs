@@ -1116,8 +1116,20 @@ fn value_to_py<'py>(
             // ("x")(pt)`, `sorted(objs, key=itemgetter(0))`, `json.dumps(obj,
             // default=...)`) is wrapped so CPython's attribute/item access,
             // comparison, hashing, and repr route back to the fusevm object.
-            Some(PyObj::Instance(_)) => {
+            //
+            // A class that defines `__index__` crosses as the subclass that fills
+            // CPython's `nb_index` slot, so `operator.index(obj)`, `range(obj)`
+            // and `lst[obj]` on the CPython side accept it. Only such a class:
+            // CPython probes that slot (`PyIndex_Check`) to CHOOSE a path —
+            // `bytes(x)` takes a length from an index-able `x` — so every other
+            // instance must keep answering "no slot".
+            Some(PyObj::Instance(i)) => {
                 let proxy = PyrsInstance { target: v.clone() };
+                if crate::builtins::instance_has(host, i, "__index__") {
+                    return Py::new(py, (PyrsIndexInstance, proxy))
+                        .map(|p| p.into_any().into_bound(py))
+                        .map_err(|e| e.to_string());
+                }
                 Py::new(py, proxy)
                     .map(|p| p.into_any().into_bound(py))
                     .map_err(|e| e.to_string())
@@ -2015,7 +2027,7 @@ fn clear_host_error() {
 // passed into a CPython call (`operator.attrgetter("x")(obj)`, `sorted(objs,
 // key=itemgetter(0))`, a custom `json.dumps` default). Each host call runs with
 // no host borrow held (CPython invokes these outside the marshalling window).
-#[pyclass]
+#[pyclass(subclass)]
 struct PyrsInstance {
     target: Value,
 }
@@ -2076,6 +2088,31 @@ impl PyrsInstance {
 
     fn __str__(&self) -> PyResult<String> {
         crate::builtins::py_str(&self.target).map_err(pyo3::exceptions::PyRuntimeError::new_err)
+    }
+}
+
+// A [`PyrsInstance`] whose class defines `__index__`: the one slot CPython
+// reads to take an object as an integer. The method runs on the fusevm side
+// and its result is checked as CPython's `PyNumber_Index` checks it.
+#[pyclass(extends = PyrsInstance)]
+struct PyrsIndexInstance;
+
+#[pymethods]
+impl PyrsIndexInstance {
+    fn __index__(slf: PyRef<Self>, py: Python) -> PyResult<Py<PyAny>> {
+        let target = slf.as_super().target.clone();
+        let r = crate::builtins::index_dunder(&target)
+            .map_err(call_err)?
+            // The class lost `__index__` after the object crossed.
+            .ok_or_else(|| {
+                let tn = with_host(|h| h.type_name(&target));
+                pyo3::exceptions::PyTypeError::new_err(format!(
+                    "'{tn}' object cannot be interpreted as an integer"
+                ))
+            })?;
+        with_host(|h| value_to_py(h, py, &r))
+            .map(|b| b.unbind())
+            .map_err(rs_err)
     }
 }
 

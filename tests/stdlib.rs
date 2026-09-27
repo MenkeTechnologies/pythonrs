@@ -3043,3 +3043,21 @@ r = [
 ]";
     assert_eq!(g(src, "r"), "[16610, 754816, 245187, True, True]");
 }
+
+/// A pythonrs instance whose class defines `__index__` is an integer to the
+/// CPython side too: `operator` is the bridged C accelerator, and its `index` /
+/// `getitem` read the `nb_index` slot. An instance WITHOUT `__index__` must not
+/// grow that slot — `sorted` of a plain iterable still iterates it.
+#[cfg(feature = "stdlib-ffi")]
+#[test]
+fn ffi_operator_index_honours_a_user_index_dunder() {
+    let src = "import operator\n\
+               class I:\n    def __index__(self): return 7\n\
+               class J(I): pass\n\
+               class Bad:\n    def __index__(self): return 'x'\n\
+               class It:\n    def __iter__(self): return iter([2, 1])\n\
+               x = (operator.index(I()), operator.index(J()), operator.getitem(list(range(9)), I()), sorted(It()))\n\
+               try:\n    operator.index(Bad())\nexcept TypeError as e:\n    bad = str(e)";
+    assert_eq!(g(src, "x"), "(7, 7, 7, [1, 2])");
+    assert_eq!(g(src, "bad"), "'__index__ returned non-int (type str)'");
+}
