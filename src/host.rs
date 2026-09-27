@@ -2143,6 +2143,10 @@ pub struct PyHost {
     /// by the function's heap id. CPython functions carry a writable dict; the
     /// stdlib uses it for `__isabstractmethod__`, `functools.wraps`, decorators.
     pub func_attrs: HashMap<u32, NameMap>,
+    /// The `member_descriptor` of each `__slots__` entry, by its `qual`
+    /// (`<class key>.<name>`): one object per slot, as the one CPython keeps in
+    /// the declaring class's `__dict__`, so `C.x is C.x`.
+    slot_members: HashMap<String, Value>,
     /// Codec search functions registered by `_codecs.register` (the `encodings`
     /// package installs one at import), the resolved-codec cache keyed by
     /// normalized name, and user error handlers from `register_error`.
@@ -2698,6 +2702,7 @@ impl PyHost {
             tb_starts_empty: HashSet::new(),
             suggest: None,
             func_attrs: HashMap::new(),
+            slot_members: HashMap::new(),
             codec_search: Vec::new(),
             codec_cache: HashMap::new(),
             codec_errors: HashMap::new(),
@@ -4733,8 +4738,13 @@ impl PyHost {
                             let addr = recv.as_ref().map(|r| self.addr_of(r)).unwrap_or(0);
                             format!("<method-wrapper '{name}' of {owner} object at 0x{addr:012x}>")
                         }
-                        DescKind::GetSetDescriptor | DescKind::MemberDescriptor => {
+                        DescKind::GetSetDescriptor => {
                             format!("<attribute '{name}' of '{owner}' objects>")
+                        }
+                        DescKind::MemberDescriptor => {
+                            let (owner, name) = qual.rsplit_once('.').unwrap_or(("", &qual));
+                            let owner = self.classes.get(owner).map_or(owner, |cd| &cd.name);
+                            format!("<member '{name}' of '{owner}' objects>")
                         }
                         // CPython calls a wrapper descriptor a "slot wrapper" in
                         // its repr, even though its type is `wrapper_descriptor`.
@@ -10839,8 +10849,10 @@ impl PyHost {
                 // Every class has `__doc__`, `None` when undocumented. A body
                 // run by `run_class_body` gets one from its docstring; a class
                 // registered natively (the `_io` bases) has no body to read.
+                // A body that slots `__doc__` and has no docstring installs
+                // the slot's member descriptor there instead.
                 if name == "__doc__" && !self.class_has(&cname, "__doc__") {
-                    return Ok(Value::Undef);
+                    return Ok(self.slot_member(&cname, name).unwrap_or(Value::Undef));
                 }
                 if name == "__module__" {
                     let m = self
@@ -10927,7 +10939,20 @@ impl PyHost {
                         let kv = self.new_str(k.clone());
                         d.insert(PKey::Str(k), (kv, val));
                     }
+                    // The member descriptor of each slot the class itself
+                    // declares, in sorted order as `type_new` installs them.
+                    let mut slots = self.own_slots(&cname).unwrap_or_default();
+                    slots.sort();
+                    for s in slots {
+                        if let Some(member) = self.slot_member(&cname, &s) {
+                            let kv = self.new_str(s.clone());
+                            d.insert(PKey::Str(s), (kv, member));
+                        }
+                    }
                     return Ok(self.new_dict(d));
+                }
+                if let Some(member) = self.slot_member(&cname, name) {
+                    return Ok(member);
                 }
                 if let Some(v) = self.class_lookup(&cname, name) {
                     match self.get(&v) {
@@ -11209,6 +11234,31 @@ impl PyHost {
                     "gi_running" => Value::Bool(running),
                     "gi_suspended" => Value::Bool(suspended),
                     _ => self.new_str(fname),
+                })
+            }
+            // A C-level attribute descriptor's identity: the attribute it
+            // names, that name qualified by its owner type, and the owner type
+            // itself. `qual` is `<owner>.<name>`, the owner being a builtin
+            // type name or a user class key (a `__slots__` member).
+            Some(PyObj::Descriptor {
+                kind: DescKind::GetSetDescriptor | DescKind::MemberDescriptor,
+                qual,
+                ..
+            }) if matches!(name, "__name__" | "__qualname__" | "__objclass__") => {
+                let (owner, attr) = qual.rsplit_once('.').unwrap_or(("", qual));
+                let (owner, attr) = (owner.to_string(), attr.to_string());
+                Ok(match name {
+                    "__name__" => self.new_str(attr),
+                    "__qualname__" => {
+                        let q = match self.classes.get(&owner) {
+                            Some(cd) if !cd.qualname.is_empty() => cd.qualname.clone(),
+                            Some(cd) => cd.name.clone(),
+                            None => owner,
+                        };
+                        self.new_str(format!("{q}.{attr}"))
+                    }
+                    _ if self.classes.contains_key(&owner) => self.alloc(PyObj::Class(owner)),
+                    _ => self.alloc(PyObj::Builtin(owner)),
                 })
             }
             // A property's three accessors and its name. `abc` reads `fget`
@@ -12230,11 +12280,10 @@ impl PyHost {
                     set.insert(k.clone());
                 }
             }
-        }
-        if let Some(slots) = self.slots_of(class) {
-            for s in slots {
-                set.insert(s);
-            }
+            // Each slot is a member descriptor in its declaring class's
+            // `__dict__` — listed even when a `"__dict__"` entry leaves the
+            // instance unrestricted.
+            set.extend(self.own_slots(&c).unwrap_or_default());
         }
         // Every class inherits `object`'s surface. Without this, `dir()` on a
         // user class listed only what its own body defined — five names for a
@@ -12257,19 +12306,12 @@ impl PyHost {
         let mut slots = HashSet::new();
         let mut any = false;
         for c in self.mro_of(class) {
-            let cd = match self.classes.get(&c) {
-                Some(cd) => cd,
-                None => continue, // builtin base (e.g. `object`) — implicit, skip
-            };
+            if !self.classes.contains_key(&c) {
+                continue; // builtin base (e.g. `object`) — implicit, skip
+            }
             // A user class without `__slots__` gives the instance a `__dict__`.
-            let v = cd.ns.get("__slots__")?;
+            let names = self.own_slots(&c)?;
             any = true;
-            // A slot name is an identifier written inside the class body, so it
-            // mangles like one — against the class that DECLARED it, which is
-            // `c` here and not the instance's own class. `__slots__` itself
-            // keeps the name as written (CPython leaves the tuple alone and
-            // mangles only the descriptor it installs).
-            let mangle = |s: String| crate::mangle::mangle(&c, &s).unwrap_or(s);
             // A literal `"__dict__"` entry asks for an instance dict ALONGSIDE
             // the slots, so the instance is not restricted at all. It is a
             // documented idiom -- `__slots__ = ("p", "__dict__")` is how a class
@@ -12277,26 +12319,94 @@ impl PyHost {
             // arbitrary others -- and it used to raise
             // `'W' object has no attribute 'other' and no __dict__ for setting
             // new attributes`, i.e. exactly the error the entry exists to
-            // prevent. It is not mangled: CPython matches it verbatim.
-            let names: Vec<String> = match self.get(v) {
-                Some(PyObj::List(items)) | Some(PyObj::Tuple(items)) => {
-                    items.iter().filter_map(|it| self.as_str(it)).collect()
-                }
-                Some(PyObj::Str(s)) => vec![s.clone()],
-                _ => Vec::new(),
-            };
+            // prevent. CPython matches it verbatim.
             if names.iter().any(|n| n == "__dict__") {
                 return None;
             }
-            for n in names {
-                slots.insert(mangle(n));
-            }
+            slots.extend(names);
         }
         if any {
             Some(slots)
         } else {
             None
         }
+    }
+
+    /// The names user class `c` ITSELF declares in `__slots__`, or `None` when
+    /// its body binds no `__slots__`. A slot name is an identifier written
+    /// inside the class body, so it mangles like one — against the class that
+    /// declared it. `__slots__` itself keeps the names as written (CPython
+    /// leaves the tuple alone and mangles only the descriptor it installs).
+    fn own_slots(&self, c: &str) -> Option<Vec<String>> {
+        let v = self.classes.get(c)?.ns.get("__slots__")?;
+        let names: Vec<String> = match self.get(v) {
+            Some(PyObj::List(items)) | Some(PyObj::Tuple(items)) => {
+                items.iter().filter_map(|it| self.as_str(it)).collect()
+            }
+            // `__slots__ = {"x": "doc"}` — the keys are the slots.
+            Some(PyObj::Dict(d)) => d.values().filter_map(|(k, _)| self.as_str(k)).collect(),
+            Some(PyObj::Str(s)) => vec![s.clone()],
+            _ => Vec::new(),
+        };
+        Some(
+            names
+                .into_iter()
+                .map(|s| crate::mangle::mangle(c, &s).unwrap_or(s))
+                .collect(),
+        )
+    }
+
+    /// `descr_check` for a `__slots__` member reached by hand
+    /// (`C.x.__get__(obj)`): it applies only to an instance of the class that
+    /// declared the slot. `owner` is that class's key; a builtin owner is not
+    /// checked.
+    pub fn check_member_applies(&self, owner: &str, attr: &str, obj: &Value) -> Result<(), String> {
+        let Some(cd) = self.classes.get(owner) else {
+            return Ok(());
+        };
+        let applies = match self.get(obj) {
+            Some(PyObj::Instance(i)) => self.mro_rc(&i.class).iter().any(|c| c == owner),
+            _ => false,
+        };
+        if applies {
+            return Ok(());
+        }
+        Err(format!(
+            "TypeError: descriptor '{attr}' for '{}' objects doesn't apply to a '{}' object",
+            cd.name,
+            self.type_name(obj)
+        ))
+    }
+
+    /// The `member_descriptor` that `class.name` reads, when a class in the MRO
+    /// declares `name` in its own `__slots__` before any class binds `name` in
+    /// its namespace — CPython's `type_new` installs one descriptor per slot in
+    /// the declaring class's `__dict__`, so it is found at that MRO position.
+    /// `__dict__` and `__weakref__` entries install no member. The descriptor's
+    /// `qual` is `<class key>.<name>`; its repr shows the class's `__name__`.
+    fn slot_member(&mut self, class: &str, name: &str) -> Option<Value> {
+        if name == "__dict__" || name == "__weakref__" {
+            return None;
+        }
+        let owner = self.mro_rc(class).iter().find_map(|c| {
+            let cd = self.classes.get(c)?;
+            if cd.ns.contains_key(name) {
+                return Some(None);
+            }
+            let declared = self.own_slots(c)?.iter().any(|s| s == name);
+            declared.then(|| Some(c.clone()))
+        })??;
+        let qual = format!("{owner}.{name}");
+        if let Some(v) = self.slot_members.get(&qual) {
+            return Some(v.clone());
+        }
+        let v = self.alloc(PyObj::Descriptor {
+            kind: DescKind::MemberDescriptor,
+            qual: qual.clone(),
+            recv: None,
+        });
+        self.slot_members.insert(qual, v.clone());
+        Some(v)
     }
 
     /// Plan reading `recv.name`, honoring the descriptor protocol (`property`

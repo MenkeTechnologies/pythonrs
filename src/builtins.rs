@@ -13842,18 +13842,37 @@ pub fn call_type_method(
     // `type.__dict__['__annotations__'].__get__`, without tripping `__getattr__`.
     // Everything that imports it — `dataclasses`, `inspect`, `traceback`,
     // `logging`, `unittest` — depends on that line at import time.
-    if name == "__get__" {
-        if let Some(qual) = with_host(|h| match h.get(recv) {
+    //
+    // `__set__`/`__delete__` write and delete that attribute the same way,
+    // and `__get__(None, cls)` — the read through the class — is the
+    // descriptor itself. A `__slots__` member checks its object first, as
+    // `descr_check` does: it applies only to instances of the class that
+    // declared the slot.
+    if matches!(name, "__get__" | "__set__" | "__delete__") {
+        if let Some((kind, qual)) = with_host(|h| match h.get(recv) {
             Some(host::PyObj::Descriptor {
-                kind: host::DescKind::GetSetDescriptor | host::DescKind::MemberDescriptor,
+                kind: kind @ (host::DescKind::GetSetDescriptor | host::DescKind::MemberDescriptor),
                 qual,
                 ..
-            }) => Some(qual.clone()),
+            }) => Some((*kind, qual.clone())),
             _ => None,
         }) {
-            let attr = qual.rsplit('.').next().unwrap_or(&qual).to_string();
+            let (owner, attr) = qual.rsplit_once('.').unwrap_or(("", &qual));
             let obj = args.first().cloned().unwrap_or(Value::Undef);
-            return with_host(|h| h.get_attr(&obj, &attr));
+            if name == "__get__" && matches!(obj, Value::Undef) {
+                return Ok(recv.clone());
+            }
+            if kind == host::DescKind::MemberDescriptor {
+                with_host(|h| h.check_member_applies(owner, attr, &obj))?;
+            }
+            return match name {
+                "__get__" => with_host(|h| h.get_attr(&obj, attr)),
+                "__set__" => {
+                    let v = args.get(1).cloned().unwrap_or(Value::Undef);
+                    raw_setattr(&obj, attr, v).map(|_| Value::Undef)
+                }
+                _ => raw_delattr(&obj, attr).map(|_| Value::Undef),
+            };
         }
     }
     if let Some(r) = nt_instance_method(recv, name, &args, &kwargs) {

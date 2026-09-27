@@ -2910,6 +2910,47 @@ fn slots_enforcement() {
     );
 }
 
+/// A `__slots__` entry installs a `member_descriptor` in the declaring class:
+/// `C.x` reads it (through subclasses too, until a class binds the name),
+/// it drives the slot by hand through `__get__`/`__set__`/`__delete__`, it
+/// applies only to instances of its class, `C.__dict__` and `dir()` carry it,
+/// a slotted `__doc__` with no docstring is one, and dict-valued `__slots__`
+/// declares its keys. Expected values are CPython 3.14.7's.
+#[test]
+fn slots_install_member_descriptors() {
+    let src = r#"class C:
+    __slots__ = ('x', '__y', '__dict__')
+class D(C):
+    __slots__ = ['z']
+class E(D):
+    x = 5
+class S:
+    __slots__ = ('__doc__',)
+class U:
+    __slots__ = {'k': 'doc'}
+m = C.x
+d = D()
+m.__set__(d, 3)
+got = m.__get__(d, C)
+m.__delete__(d)
+try:
+    d.x
+except AttributeError as e:
+    gone = str(e)
+try:
+    m.__get__(5)
+except TypeError as e:
+    bad = str(e)
+u = U()
+u.k = 7
+x = [repr(C.x), repr(D.z), E.x, repr(C._C__y), m.__name__, m.__qualname__, m.__objclass__ is C, got, gone, bad, m.__get__(None, C) is m, C.x is D.x, C.__dict__['x'] is m, 'z' in dir(D), repr(S.__doc__), repr(U.k), u.k]
+"#;
+    assert_eq!(
+        g(src, "x"),
+        r#"["<member 'x' of 'C' objects>", "<member 'z' of 'D' objects>", 5, "<member '_C__y' of 'C' objects>", 'x', 'C.x', True, 3, "'D' object has no attribute 'x'", "descriptor 'x' for 'C' objects doesn't apply to a 'int' object", True, True, True, True, "<member '__doc__' of 'S' objects>", "<member 'k' of 'U' objects>", 7]"#
+    );
+}
+
 #[test]
 fn complex_arithmetic() {
     assert_eq!(g("x = (1+2j) + (3+4j)", "x"), "(4+6j)");

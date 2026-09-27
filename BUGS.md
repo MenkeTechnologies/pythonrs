@@ -625,6 +625,16 @@ written.
   inserts itself — are exempt from the conflict check, and so is `__doc__` in a
   body that has no docstring (CPython's compiler emits that store only for a
   real one, so there is nothing for the slot descriptor to collide with).
+- **`__slots__` members** (CPython `type_new_descriptors`): each slot a class
+  declares is a `member_descriptor` in its `__dict__` — `C.x` is `<member 'x'
+  of 'C' objects>`, found at the declaring class's MRO position (a subclass
+  that binds the name shadows it), one object per slot so `C.x is D.x`. It
+  carries `__name__`, `__qualname__` and `__objclass__`; `__get__`, `__set__`
+  and `__delete__` drive the slot by hand, `__get__(None, C)` is the
+  descriptor, and an object not an instance of the declaring class is
+  `TypeError: descriptor 'x' for 'C' objects doesn't apply to a 'int'
+  object`. A slotted `__doc__` with no docstring reads as its member, `dir()`
+  lists every class's slots, and a dict-valued `__slots__` declares its keys.
 - **`itertools.chain.from_iterable`** is reachable as an attribute of `chain`.
 - **`f.__annotate__`** (PEP 649): the callable that yields the annotations for a
   requested format, `None` on an unannotated function. CPython 3.14's
@@ -1344,12 +1354,6 @@ written.
   compile time means threading the level into the bytecode CACHE KEY as well —
   otherwise a chunk compiled under `-O` would be reused without it — so it is
   deliberately not bolted on to the flag alone.
-- **`__slots__` installs no member descriptors.** The slot RESTRICTION is
-  enforced (a non-slot attribute is the CPython `AttributeError`), but the
-  names are absent from the class: `class A: __slots__ = ('x',)` then `A.x` is
-  `AttributeError: type object 'A' has no attribute 'x'` where CPython answers
-  `<member 'x' of 'A' objects>`. Reaching a slotted `__doc__` through the class
-  reports `None` for the same reason.
 - **`types.UnionType is type(int | str)` is False on the ffi build.** In the
   self-contained build `types.py` binds `type(int | str)` and the identity
   holds. Under `stdlib-ffi`, `types.UnionType` and `typing.Union` are both
@@ -1408,11 +1412,12 @@ written.
   `<built-in function sqrt>`. The module qualifier is the key these builtins are
   registered under, so dropping it in the repr alone would make two different
   functions with the same leaf name print identically.
-- **`__slots__` exposes no member descriptor on the class.** `class C:
-  __slots__ = ("x",)` then `C.x` is `AttributeError: type object 'C' has no
-  attribute 'x'`; CPython answers `<member 'x' of 'C' objects>`. Instances work;
-  only the class-level descriptor is missing. `sys.getsizeof` is absent for the
-  same reason a slots layout is not modelled — there is no object-size model.
+- **`sys.getsizeof` is absent.** There is no object-size model, and no slots
+  layout: a slot is a restricted instance attribute, not a fixed offset.
+- **`type()` of a C-level descriptor is not a type object.** `type(C.x)` for a
+  `__slots__` member (and `type(object.__init__)`) has the right `__name__`
+  and compares equal across reads, but its repr is `<built-in function
+  member_descriptor>` where CPython prints `<class 'member_descriptor'>`.
 - **Operator overloading dunders**: dispatched, with `NotImplemented` reflected
   fallback (see Implemented). Covered: arithmetic/bitwise
   (`__add__`/`__sub__`/`__mul__`/`__truediv__`/`__floordiv__`/`__mod__`/`__pow__`/
