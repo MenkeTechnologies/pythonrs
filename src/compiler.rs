@@ -264,6 +264,9 @@ fn compile_ex(stmts: &[Stmt], debug: bool, interactive: bool) -> Result<Program,
     } else {
         stmts
     };
+    // CPython builds the whole symbol table before it generates code, so its
+    // declaration errors win over every error codegen raises.
+    crate::symtable::check(stmts)?;
     let mut c = Compiler {
         debug,
         interactive,
@@ -556,7 +559,10 @@ impl Compiler {
             }
             StmtKind::Nonlocal(names) => {
                 for n in names {
-                    self.check_nonlocal_binding(n)?;
+                    self.check_nonlocal_binding(n).map_err(|e| match s.span {
+                        Some(span) => crate::symtable::symtable_error(&e, span),
+                        None => e,
+                    })?;
                     self.name_const(b, n);
                     b.emit(Op::CallBuiltin(ops::DECLARE_NONLOCAL, 1), line);
                     b.emit(Op::Pop, line);
@@ -2067,16 +2073,18 @@ impl Compiler {
     }
 
     /// Validate a `nonlocal name` declaration at compile time, mirroring CPython:
-    /// at module level (no enclosing function) it is a `SyntaxError`, and if no
-    /// enclosing function scope binds `name` it is `no binding for nonlocal`.
+    /// if no enclosing function scope binds `name` it is `no binding for
+    /// nonlocal`. A `nonlocal` at module level never gets here — the parser
+    /// reports it.
     fn check_nonlocal_binding(&self, name: &str) -> Result<(), String> {
-        let n = self.func_scopes.len();
-        // `func_scopes.last()` is the current function; a `nonlocal` targets an
-        // ENCLOSING one, so the current scope is excluded from the search.
-        if n == 0 {
-            return Err("SyntaxError: nonlocal declaration not allowed at module level".into());
-        }
-        let bound = self.func_scopes[..n - 1].iter().any(|s| s.contains(name));
+        // In a function, `func_scopes.last()` is that function, and a `nonlocal`
+        // targets an ENCLOSING one, so it is excluded from the search. A class
+        // body is never pushed, so there every entry encloses it.
+        let enclosing = match self.func_scopes.split_last() {
+            Some((_, outer)) if !self.in_class_body => outer,
+            _ => &self.func_scopes[..],
+        };
+        let bound = enclosing.iter().any(|s| s.contains(name));
         if !bound {
             return Err(format!(
                 "SyntaxError: no binding for nonlocal '{name}' found"
@@ -4585,7 +4593,7 @@ fn has_return(body: &[Stmt]) -> bool {
 /// Every direct sub-expression of `e`, nested scopes included. A structural walk
 /// the `:=` comprehension checks need and `collect_names_expr` (which keeps only
 /// names) can't give them.
-fn expr_children(e: &Expr) -> Vec<&Expr> {
+pub(crate) fn expr_children(e: &Expr) -> Vec<&Expr> {
     let mut out: Vec<&Expr> = Vec::new();
     match e.unspanned() {
         Expr::List(xs) | Expr::Tuple(xs) | Expr::Set(xs) | Expr::BoolOp(_, xs) => {

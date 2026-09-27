@@ -747,8 +747,17 @@ written.
 - **`nonlocal`** rebinds the nearest enclosing FUNCTION scope that binds the name
   (distinct from `global`, which targets module scope). Validated at compile
   time: a `nonlocal` with no enclosing binding is `SyntaxError: no binding for
-  nonlocal '<x>' found`, and one at module level is `SyntaxError: nonlocal
-  declaration not allowed at module level`.
+  nonlocal '<x>' found` (a class body inside a function may bind the
+  function's name), and one at module level is `SyntaxError: nonlocal
+  declaration not allowed at module level`. The symbol table's declaration
+  checks run over the whole module before any code is generated
+  (`src/symtable.rs`): a `global`/`nonlocal` for a name already a parameter,
+  used, annotated or bound in that scope is CPython's `name 'x' is parameter
+  and global`, `is used prior to global declaration`, `annotated name 'x'
+  can't be global` or `is assigned to before global declaration` (and the
+  `nonlocal` forms), and a name declared both ways is `name 'x' is nonlocal
+  and global`. Each is positioned at the declaring statement with `args ==
+  (msg,)`, as CPython reports it; pythonrs used to run such a program.
 - **Function/class introspection**: `__name__`, `__qualname__` (the dotted
   `co_qualname` path — `outer.<locals>.inner`, `C.m`, `A.B`), `__module__`
   (`__main__`), and `__defaults__` (positional-default tuple, or `None`) on
@@ -1173,7 +1182,8 @@ written.
   no position: the compiler sees no columns. Assignment, augmented-assignment
   and `del` targets, `return`/`break`/`continue` in the wrong place, duplicate
   parameters and a module-level `nonlocal` are positioned, because the parser
-  checks them.
+  checks them; so are the symbol-table errors on a `global`/`nonlocal`
+  statement, whose extent the parser records.
 - **A bridged exception carries no CPython traceback.** An exception that crosses
   from pythonrs into CPython is rebuilt as a fresh exception object, so its
   `__traceback__` is empty. Two visible consequences, both in code that is not

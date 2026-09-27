@@ -434,11 +434,20 @@ pub struct Alias {
 pub struct Stmt {
     pub kind: StmtKind,
     pub line: u32,
+    /// The statement's extent as a `SyntaxError` reports it — `(lineno,
+    /// offset, end_lineno, end_offset)`, 1-based with an exclusive end. Recorded
+    /// only for `global` / `nonlocal`, the statements CPython's symbol table
+    /// points its declaration errors at (see `symtable.rs`).
+    pub span: Option<(u32, u32, u32, u32)>,
 }
 
 impl Stmt {
     pub fn new(kind: StmtKind, line: u32) -> Stmt {
-        Stmt { kind, line }
+        Stmt {
+            kind,
+            line,
+            span: None,
+        }
     }
 }
 
@@ -447,6 +456,10 @@ impl From<StmtKind> for Stmt {
     /// bodies with no source line; the debug marker skips line-0 statements so
     /// they never become spurious breakpoint targets.
     fn from(kind: StmtKind) -> Stmt {
-        Stmt { kind, line: 0 }
+        Stmt {
+            kind,
+            line: 0,
+            span: None,
+        }
     }
 }

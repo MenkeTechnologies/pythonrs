@@ -468,3 +468,69 @@ boom.py 1
 "#
     );
 }
+
+/// The declaration checks of CPython's symbol table: a `global` or `nonlocal`
+/// after the name was already a parameter, used, annotated or bound in the
+/// same scope, a name declared both ways, and a `nonlocal` with nothing to
+/// bind to — each positioned at the declaring statement, with `args == (msg,)`.
+/// What a nested scope does (a comprehension's own names, a `lambda` body) and
+/// what `import` binds do not count. A class body inside a function may bind
+/// an enclosing function's name with `nonlocal`.
+#[test]
+fn declaration_errors_point_at_the_global_or_nonlocal_statement() {
+    let out = Command::new(env!("CARGO_BIN_EXE_python"))
+        .args([
+            "-c",
+            r#"cases = [
+    "def g(x):\n    global x",
+    "def g():\n    x = 1\n    print(x)\n    global x",
+    "def g():\n    x: int\n    global x",
+    "def g():\n    for x in y:\n        global x",
+    "def g():\n    def h(a=x): pass\n    global x",
+    "def g():\n    [(x := 1) for y in z]\n    global x",
+    "def f():\n    x = 1\n    def g():\n        print(x)\n        nonlocal x",
+    "def f():\n    x = 1\n    def g(x):\n        nonlocal x",
+    "def g():\n    nonlocal x\n    global x",
+    "def f():\n    nonlocal zz",
+    "class C:\n    nonlocal q",
+    "x = 1\nglobal x",
+    "def g():\n    import x\n    global x",
+    "def g():\n    [x for y in z]\n    lambda: x\n    global x",
+]
+for s in cases:
+    try:
+        exec(s, {})
+        print(repr(s), "ok")
+    except SyntaxError as e:
+        print(repr(s), e.args, e.lineno, e.offset, e.end_lineno, e.end_offset)
+def f():
+    x = 1
+    class C:
+        nonlocal x
+        x = 5
+    return x
+print(f())
+"#,
+        ])
+        .output()
+        .expect("spawn python");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        r#"'def g(x):\n    global x' ("name 'x' is parameter and global",) 2 5 2 13
+'def g():\n    x = 1\n    print(x)\n    global x' ("name 'x' is used prior to global declaration",) 4 5 4 13
+'def g():\n    x: int\n    global x' ("annotated name 'x' can't be global",) 3 5 3 13
+'def g():\n    for x in y:\n        global x' ("name 'x' is assigned to before global declaration",) 3 9 3 17
+'def g():\n    def h(a=x): pass\n    global x' ("name 'x' is used prior to global declaration",) 3 5 3 13
+'def g():\n    [(x := 1) for y in z]\n    global x' ("name 'x' is assigned to before global declaration",) 3 5 3 13
+'def f():\n    x = 1\n    def g():\n        print(x)\n        nonlocal x' ("name 'x' is used prior to nonlocal declaration",) 5 9 5 19
+'def f():\n    x = 1\n    def g(x):\n        nonlocal x' ("name 'x' is parameter and nonlocal",) 4 9 4 19
+'def g():\n    nonlocal x\n    global x' ("name 'x' is nonlocal and global",) 2 5 2 15
+'def f():\n    nonlocal zz' ("no binding for nonlocal 'zz' found",) 2 5 2 16
+'class C:\n    nonlocal q' ("no binding for nonlocal 'q' found",) 2 5 2 15
+'x = 1\nglobal x' ("name 'x' is assigned to before global declaration",) 2 1 2 9
+'def g():\n    import x\n    global x' ok
+'def g():\n    [x for y in z]\n    lambda: x\n    global x' ok
+5
+"#
+    );
+}

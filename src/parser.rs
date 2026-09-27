@@ -515,19 +515,26 @@ impl Parser {
 
     /// [`Parser::err_span`] for a subclass: `IndentationError`.
     fn err_span_as(&self, class: &str, msg: &str, from: usize, to: usize) -> String {
+        let (line, offset, end_line, end_offset) = self.token_span(from, to);
+        at_pos(
+            &format!("{class}: {msg}"),
+            line,
+            offset as i64,
+            end_line,
+            end_offset as i64,
+        )
+    }
+
+    /// The extent of tokens `from..=to` in `SyntaxError` terms: `(lineno,
+    /// offset, end_lineno, end_offset)`, 1-based, end exclusive.
+    fn token_span(&self, from: usize, to: usize) -> (u32, u32, u32, u32) {
         let a = &self.toks[from.min(self.toks.len() - 1)];
         let b = &self.toks[to.min(self.toks.len() - 1)];
         let end = match b.tok {
             Tok::Newline | Tok::Eof | Tok::Indent | Tok::Dedent => b.col + 1,
             _ => b.end_col,
         };
-        at_pos(
-            &format!("{class}: {msg}"),
-            a.line,
-            a.col as i64 + 1,
-            b.line,
-            end as i64 + 1,
-        )
+        (a.line, a.col + 1, b.line, end + 1)
     }
 
     /// A simple statement must end the logical line or be followed by `;`.
@@ -1000,9 +1007,12 @@ impl Parser {
                     return Ok(());
                 }
                 "global" => {
+                    let start = self.pos;
                     self.advance();
                     let names = self.parse_name_list()?;
-                    out.push(Stmt::new(StmtKind::Global(names), line));
+                    let mut stmt = Stmt::new(StmtKind::Global(names), line);
+                    stmt.span = Some(self.token_span(start, self.pos - 1));
+                    out.push(stmt);
                     return Ok(());
                 }
                 "nonlocal" => {
@@ -1019,7 +1029,9 @@ impl Parser {
                             e.push_str(&format!("{SYNTAX_FIELD}bare=1"));
                         }
                     }
-                    out.push(Stmt::new(StmtKind::Nonlocal(names), line));
+                    let mut stmt = Stmt::new(StmtKind::Nonlocal(names), line);
+                    stmt.span = Some(self.token_span(start, self.pos - 1));
+                    out.push(stmt);
                     return Ok(());
                 }
                 "import" => return self.parse_import(out, line),
