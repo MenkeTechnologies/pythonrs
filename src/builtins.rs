@@ -3758,6 +3758,9 @@ fn syntax_error_init(e: &Value, args: &[Value]) -> Result<(), String> {
 }
 
 fn synth_exc(h: &mut host::PyHost, err: &str) -> Value {
+    // A syntax error's position rides behind its message (see
+    // `parser::split_syntax_error`); it becomes the exception's attributes.
+    let (err, pos) = crate::parser::split_syntax_error(err);
     let (class, msg) = match err.split_once(": ") {
         Some((c, m)) => (c.to_string(), m.to_string()),
         None => (err.to_string(), String::new()),
@@ -3833,6 +3836,25 @@ fn synth_exc(h: &mut host::PyHost, err: &str) -> Value {
         }
         if let Some(n) = lineno {
             vals[2] = Value::Int(n);
+        }
+        if let Some(p) = &pos {
+            let int = |n: Option<i64>| n.map_or(Value::Undef, Value::Int);
+            vals[1] = p.filename.clone().map_or(Value::Undef, |f| h.new_str(f));
+            vals[2] = int(p.lineno);
+            vals[3] = int(p.offset);
+            vals[4] = p.text.clone().map_or(Value::Undef, |t| h.new_str(t));
+            vals[5] = int(p.end_lineno);
+            vals[6] = int(p.end_offset);
+            // `args` is `(msg, (filename, lineno, offset, text, end_lineno,
+            // end_offset))`, the shape `SyntaxError_init` unpacks — except for
+            // one the symbol table raised, which CPython builds from the message
+            // alone and then positions by attribute.
+            if !p.bare_args {
+                let details = h.new_tuple(vals[1..7].to_vec());
+                if let Some(PyObj::Exception { args, .. }) = h.get_mut(&e) {
+                    args.push(details);
+                }
+            }
         }
         for (name, v) in SYNTAX_ERROR_ATTRS.iter().zip(vals) {
             let _ = h.set_attr(&e, name, v);
@@ -6915,7 +6937,9 @@ fn run_pysource(want_value: bool, args: &[Value]) -> Result<Value, String> {
     // series, or a bare newline after an operator is a SyntaxError — the wrapper's
     // parens below would otherwise make some of those parse.
     if want_value {
-        let stmts = crate::parser::parse(src.trim())?;
+        let stmts = crate::parser::parse(src.trim()).map_err(|e| {
+            crate::parser::with_filename(crate::parser::for_eval_input(e, src.trim()), "<string>")
+        })?;
         if stmts.len() != 1 || !matches!(stmts[0].kind, crate::ast::StmtKind::Expr(_)) {
             return Err("SyntaxError: invalid syntax".to_string());
         }
@@ -6984,7 +7008,9 @@ fn run_pysource(want_value: bool, args: &[Value]) -> Result<Value, String> {
     };
 
     let result = (|| -> Result<Value, String> {
-        let prog = crate::compile(&to_compile)?;
+        // The source is the file `<string>` to a syntax error in it.
+        let prog =
+            crate::compile(&to_compile).map_err(|e| crate::parser::with_filename(e, "<string>"))?;
         // `eval`/`exec` compile their source, so the compile-time
         // `SyntaxWarning`s belong to them exactly as they do to a script — CPython
         // prints them from here too, attributed to `<string>`. They were compiled

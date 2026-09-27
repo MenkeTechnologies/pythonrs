@@ -25,13 +25,230 @@ fn is_keyword(s: &str) -> bool {
 pub fn parse(src: &str) -> Result<Vec<Stmt>, String> {
     let src = crate::rust_ffi::desugar(src);
     let lexed = lex(&src)?;
+    let unclosed = lexed.unclosed;
     let mut p = Parser {
         toks: lexed.toks,
         pos: 0,
         deferred: lexed.deferred,
         depth: 0,
+        in_function: false,
+        loop_depth: 0,
+        nesting: 0,
+        misplaced: None,
     };
-    p.parse_module()
+    let err = match p.parse_module() {
+        Ok(stmts) => match unclosed {
+            Some(e) => e,
+            None => return Ok(stmts),
+        },
+        // CPython's tokenizer reports a bracket still open at end of input
+        // only when the parser gets that far: an error earlier in the file
+        // wins, one at the end of the input is this one.
+        Err(e) => match unclosed {
+            Some(u) if p.pos + 2 >= p.toks.len() => u,
+            _ => e,
+        },
+    };
+    // The offending line, as CPython's parser sees it: newline-terminated.
+    let lineno = split_syntax_error(&err).1.and_then(|p| p.lineno);
+    Err(match lineno.and_then(|l| source_line(&src, l, true)) {
+        Some(text) => with_text(err, &text),
+        None => err,
+    })
+}
+
+// ── SyntaxError positions ────────────────────────────────────────────────────
+//
+// A syntax error travels as an error STRING (`"SyntaxError: msg"`), like every
+// other error in the crate. What CPython attaches to one — `lineno`, `offset`,
+// `end_lineno`, `end_offset`, `text`, `filename` — rides behind the message as
+// a trailer of `\u{1}key=value` fields, which no source text can contain. The
+// exception builder (`builtins::synth_exc`) turns them into attributes, the
+// traceback renderer draws the `File`/source/caret block from them, and every
+// place that shows the raw string strips them with [`split_syntax_error`].
+
+/// Starts each field of a syntax error's position trailer.
+pub const SYNTAX_FIELD: char = '\u{1}';
+
+/// Where a syntax error is, in CPython's terms: 1-based line and column of
+/// the start and end (`end_offset` exclusive, and 0 or -1 where CPython puts
+/// those), the source line, and the file name.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SyntaxPos {
+    pub lineno: Option<i64>,
+    pub offset: Option<i64>,
+    pub end_lineno: Option<i64>,
+    pub end_offset: Option<i64>,
+    pub text: Option<String>,
+    pub filename: Option<String>,
+    /// Raised by the compiler rather than the parser, which gives no source
+    /// line: a traceback shows one only when it can read the file.
+    pub no_source: bool,
+    /// Raised by the symbol table, which builds the exception from its message
+    /// alone (`args == (msg,)`) and sets the position only as attributes.
+    pub bare_args: bool,
+}
+
+/// Attach a position to a syntax error message.
+pub fn at_pos(msg: &str, lineno: u32, offset: i64, end_lineno: u32, end_offset: i64) -> String {
+    format!("{msg}{SYNTAX_FIELD}pos={lineno}:{offset}:{end_lineno}:{end_offset}")
+}
+
+/// Attach the offending source line, unless the error already carries one or
+/// carries no position to show it against.
+pub fn with_text(err: String, text: &str) -> String {
+    let fields = err.find(SYNTAX_FIELD).map_or("", |i| &err[i..]);
+    if !fields.contains("\u{1}pos=")
+        || fields.contains("\u{1}text=")
+        || fields.contains("\u{1}nosrc=")
+    {
+        return err;
+    }
+    format!("{err}{SYNTAX_FIELD}text={text}")
+}
+
+/// Name the file a positioned syntax error came from (`<string>` for `exec`),
+/// unless it already names one.
+pub fn with_filename(err: String, filename: &str) -> String {
+    let fields = err.find(SYNTAX_FIELD).map_or("", |i| &err[i..]);
+    if !fields.contains("\u{1}pos=") || fields.contains("\u{1}file=") {
+        return err;
+    }
+    format!("{err}{SYNTAX_FIELD}file={filename}")
+}
+
+/// The message part of an error string, and its position if it has one.
+pub fn split_syntax_error(err: &str) -> (&str, Option<SyntaxPos>) {
+    let Some(i) = err.find(SYNTAX_FIELD) else {
+        return (err, None);
+    };
+    let mut pos = SyntaxPos::default();
+    for field in err[i + 1..].split(SYNTAX_FIELD) {
+        let Some((key, value)) = field.split_once('=') else {
+            continue;
+        };
+        match key {
+            "pos" => {
+                let n: Vec<Option<i64>> = value.split(':').map(|s| s.parse().ok()).collect();
+                if let [l, o, el, eo] = n[..] {
+                    pos.lineno = l;
+                    pos.offset = o;
+                    pos.end_lineno = el;
+                    pos.end_offset = eo;
+                }
+            }
+            "text" => pos.text = Some(value.to_string()),
+            "nosrc" => pos.no_source = true,
+            "bare" => pos.bare_args = true,
+            "file" => pos.filename = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    (&err[..i], Some(pos))
+}
+
+/// Re-read a syntax error in `eval()` input, which CPython tokenizes WITHOUT
+/// the newline it adds to a file or to `exec` input: the offending line has no
+/// newline unless the source gave it one, and an error at the end of the input
+/// — where that newline would have been — is at offset 0.
+pub fn for_eval_input(err: String, src: &str) -> String {
+    let (head, Some(mut pos)) = split_syntax_error(&err) else {
+        return err;
+    };
+    let last_line = src.split_inclusive('\n').count() as i64;
+    let ends_without_newline = !src.ends_with('\n');
+    if let (Some(text), Some(l)) = (&pos.text, pos.lineno) {
+        if l == last_line && ends_without_newline {
+            let bare = text.trim_end_matches('\n').to_string();
+            let at_end = pos.offset == Some(bare.chars().count() as i64 + 1);
+            if at_end {
+                pos.offset = Some(0);
+                pos.end_offset = Some(0);
+            }
+            pos.text = Some(bare);
+        }
+    }
+    let mut out = head.to_string();
+    if let (Some(l), Some(o), Some(el), Some(eo)) =
+        (pos.lineno, pos.offset, pos.end_lineno, pos.end_offset)
+    {
+        out.push_str(&format!("{SYNTAX_FIELD}pos={l}:{o}:{el}:{eo}"));
+    }
+    if let Some(t) = &pos.text {
+        out.push_str(&format!("{SYNTAX_FIELD}text={t}"));
+    }
+    if let Some(f) = &pos.filename {
+        out.push_str(&format!("{SYNTAX_FIELD}file={f}"));
+    }
+    out
+}
+
+/// The line `lineno` of `src` as a syntax error's `text`: with its newline for
+/// an error the PARSER raised (CPython's parser sees every line newline-
+/// terminated), without it for one the tokenizer raised past the last newline.
+pub fn source_line(src: &str, lineno: i64, keep_newline: bool) -> Option<String> {
+    let idx = usize::try_from(lineno).ok()?.checked_sub(1)?;
+    let line = src.split_inclusive('\n').nth(idx)?;
+    Some(if keep_newline && !line.ends_with('\n') {
+        format!("{line}\n")
+    } else {
+        line.to_string()
+    })
+}
+
+/// CPython's rendering of a positioned syntax error below a traceback
+/// (`traceback.TracebackException._format_syntax_error`): the `File` line, the
+/// source line stripped of its indentation, and a caret run under
+/// `[offset, end_offset)`.
+pub fn render_syntax_block(pos: &SyntaxPos, default_file: &str) -> String {
+    let file = pos.filename.as_deref().unwrap_or(default_file);
+    let mut out = match pos.lineno {
+        Some(l) => format!("  File \"{file}\", line {l}\n"),
+        None => format!("  File \"{file}\"\n"),
+    };
+    let Some(text) = &pos.text else {
+        return out;
+    };
+    let rtext = text.trim_end_matches('\n');
+    let ltext = rtext.trim_start_matches([' ', '\n', '\x0c']);
+    let spaces = (rtext.chars().count() - ltext.chars().count()) as i64;
+    out.push_str(&format!("    {ltext}\n"));
+    let Some(mut offset) = pos.offset else {
+        return out;
+    };
+    let len = rtext.chars().count() as i64;
+    let mut end = if pos.lineno == pos.end_lineno {
+        match pos.end_offset {
+            Some(e) if e != 0 => e,
+            _ => offset,
+        }
+    } else {
+        len + 1
+    };
+    let text_len = text.chars().count() as i64;
+    if offset > text_len {
+        offset = len + 1;
+    }
+    if end > text_len {
+        end = len + 1;
+    }
+    if offset >= end || end < 0 {
+        end = offset + 1;
+    }
+    let col = offset - 1 - spaces;
+    let end_col = end - 1 - spaces;
+    if col >= 0 {
+        let lead: String = ltext
+            .chars()
+            .take(col as usize)
+            .map(|c| if c.is_whitespace() { c } else { ' ' })
+            .collect();
+        out.push_str(&format!(
+            "    {lead}{}\n",
+            "^".repeat((end_col - col).max(0) as usize)
+        ));
+    }
+    out
 }
 
 /// Deepest expression tree the parser will build before refusing the source.
@@ -116,6 +333,18 @@ struct Parser {
     /// Levels of expression tree currently under construction. See
     /// [`MAX_TREE_DEPTH`].
     depth: u32,
+    /// Whether the statements being read are in a function body, and how many
+    /// loop bodies deep they are within it — what `return`, `break` and
+    /// `continue` need. A `class` body starts both afresh.
+    in_function: bool,
+    loop_depth: u32,
+    /// How many `def`/`class` bodies enclose the statements being read.
+    nesting: u32,
+    /// The first `'return' outside function` / `'break' outside loop` /
+    /// `'continue' not properly in loop` met. CPython's compiler raises these
+    /// only once the whole file has PARSED, so a syntax error anywhere in the
+    /// file wins over them; it is reported when the parse succeeds.
+    misplaced: Option<String>,
 }
 
 /// Wrap a caret-bearing expression with its source span. `anchor_start ==
@@ -191,11 +420,15 @@ impl Parser {
         if self.eat_op(s) {
             Ok(())
         } else {
-            Err(format!(
-                "SyntaxError: expected '{s}' but found {:?} (line {})",
-                self.cur(),
-                self.line()
-            ))
+            // A block header that runs into the end of its line lacks its `:`,
+            // which CPython names; anything else found where punctuation was
+            // due is its generic message. Either way the position is the token
+            // found instead.
+            Err(self.err_here(if s == ":" && self.at_newline() {
+                "expected ':'"
+            } else {
+                "invalid syntax"
+            }))
         }
     }
     fn at_kw(&self, kw: &str) -> bool {
@@ -223,10 +456,113 @@ impl Parser {
                 self.advance();
                 Ok(n)
             }
-            other => Err(format!(
-                "SyntaxError: expected a name, found {other:?} (line {})",
-                self.line()
-            )),
+            _ => Err(self.err_here("invalid syntax")),
+        }
+    }
+
+    /// A syntax error spanning the current token.
+    fn err_here(&self, msg: &str) -> String {
+        self.err_span(msg, self.pos, self.pos)
+    }
+
+    /// A syntax error spanning tokens `from..=to`, in CPython's terms: the
+    /// 1-based column of the first token's start and of the last one's end. A
+    /// line break has no width in the source, so CPython underlines one column
+    /// there.
+    fn err_span(&self, msg: &str, from: usize, to: usize) -> String {
+        self.err_span_as("SyntaxError", msg, from, to)
+    }
+
+    /// [`Parser::err_span`] for a subclass: `IndentationError`.
+    fn err_span_as(&self, class: &str, msg: &str, from: usize, to: usize) -> String {
+        let a = &self.toks[from.min(self.toks.len() - 1)];
+        let b = &self.toks[to.min(self.toks.len() - 1)];
+        let end = match b.tok {
+            Tok::Newline | Tok::Eof | Tok::Indent | Tok::Dedent => b.col + 1,
+            _ => b.end_col,
+        };
+        at_pos(
+            &format!("{class}: {msg}"),
+            a.line,
+            a.col as i64 + 1,
+            b.line,
+            end as i64 + 1,
+        )
+    }
+
+    /// A simple statement must end the logical line or be followed by `;`.
+    /// Anything else after it — `a b`, `x = 1 2` — is where CPython's parser
+    /// gives up, except that a bare `print` followed by an expression is the
+    /// Python 2 statement it names.
+    fn check_stmt_end(&self, stmt_start: usize) -> Result<(), String> {
+        if matches!(self.cur(), Tok::Newline | Tok::Eof | Tok::Dedent) || self.at_op(";") {
+            return Ok(());
+        }
+        let legacy = match &self.toks[stmt_start].tok {
+            Tok::Name(n) if self.pos == stmt_start + 1 && (n == "print" || n == "exec") => {
+                Some(n.clone())
+            }
+            _ => None,
+        };
+        if let (Some(n), true) = (legacy, self.starts_expression()) {
+            let mut last = self.pos;
+            while last + 1 < self.toks.len()
+                && !matches!(self.toks[last + 1].tok, Tok::Newline | Tok::Eof)
+            {
+                last += 1;
+            }
+            return Err(self.err_span(
+                &format!("Missing parentheses in call to '{n}'. Did you mean {n}(...)?"),
+                stmt_start,
+                last,
+            ));
+        }
+        Err(self.err_here("invalid syntax"))
+    }
+
+    /// Two expressions side by side inside brackets — `f(a b)`, `[1 2]` — are
+    /// CPython's `invalid_expression`: `invalid syntax. Perhaps you forgot a
+    /// comma?` underlining both. Not when the first is a name directly before
+    /// a string (a mistyped prefix) or the legacy `print`/`exec` statement.
+    fn comma_hint(&mut self, a_start: usize) -> Result<(), String> {
+        if !self.starts_expression() {
+            return Ok(());
+        }
+        let a = self.toks[a_start].tok.clone();
+        let single_name = self.pos == a_start + 1 && matches!(a, Tok::Name(_));
+        if single_name && matches!(self.cur(), Tok::Str(..)) {
+            return Ok(());
+        }
+        let legacy = match &a {
+            Tok::Name(n) if single_name && (n == "print" || n == "exec") => Some(n.clone()),
+            _ => None,
+        };
+        let b_start = self.pos;
+        let b_end = match self.parse_expr() {
+            Ok(_) => self.pos - 1,
+            Err(_) => b_start,
+        };
+        let msg = match legacy {
+            // `invalid_legacy_expression`: the Python 2 statement, named.
+            Some(n) => format!("Missing parentheses in call to '{n}'. Did you mean {n}(...)?"),
+            None => "invalid syntax. Perhaps you forgot a comma?".to_string(),
+        };
+        Err(self.err_span(&msg, a_start, b_end))
+    }
+
+    /// Whether the current token can begin an expression.
+    fn starts_expression(&self) -> bool {
+        match self.cur() {
+            Tok::Name(n) => {
+                !is_keyword(n)
+                    || matches!(
+                        n.as_str(),
+                        "None" | "True" | "False" | "not" | "lambda" | "await"
+                    )
+            }
+            Tok::Op(o) => matches!(o.as_str(), "(" | "[" | "{" | "-" | "+" | "~" | "..."),
+            Tok::Newline | Tok::Indent | Tok::Dedent | Tok::Eof => false,
+            _ => true,
         }
     }
 
@@ -240,10 +576,47 @@ impl Parser {
         }
         // Everything the tokenizer did produce parsed: the bad dedent that cut
         // it short IS the error, so report it now.
-        match self.deferred.take() {
+        match self.deferred.take().or_else(|| self.misplaced.take()) {
             Some(e) => Err(e),
             None => Ok(stmts),
         }
+    }
+
+    /// Record a control statement outside what it controls, spanning the
+    /// statement from `start` to the last token read. See
+    /// [`Parser::misplaced`]. Its text is left for the traceback to read from
+    /// the file, as CPython's compiler leaves it.
+    fn note_misplaced(&mut self, msg: &str, start: usize) {
+        if self.misplaced.is_none() {
+            let e = self.err_span(msg, start, self.pos.saturating_sub(1));
+            self.misplaced = Some(format!("{e}{SYNTAX_FIELD}nosrc=1"));
+        }
+    }
+
+    /// Read a loop body: `break` and `continue` are legal in it.
+    fn parse_loop_body(&mut self, desc: &str, line: u32) -> Result<Vec<Stmt>, String> {
+        self.loop_depth += 1;
+        let body = self.parse_suite(desc, line);
+        self.loop_depth -= 1;
+        body
+    }
+
+    /// Read a `def` or `class` body, which starts a new function context (or,
+    /// for a class, none) with no enclosing loop.
+    fn parse_scope_body(
+        &mut self,
+        desc: &str,
+        line: u32,
+        function: bool,
+    ) -> Result<Vec<Stmt>, String> {
+        let saved = (self.in_function, self.loop_depth);
+        self.in_function = function;
+        self.loop_depth = 0;
+        self.nesting += 1;
+        let body = self.parse_suite(desc, line);
+        self.nesting -= 1;
+        (self.in_function, self.loop_depth) = saved;
+        body
     }
 
     /// A suite after a `:` — either a one-line simple statement or an indented
@@ -253,12 +626,25 @@ impl Parser {
     /// statement`, `function definition`, `class definition`. `kw_line` is the
     /// line of the compound-statement keyword, not the (later) blank/dedent line.
     fn parse_suite(&mut self, desc: &str, kw_line: u32) -> Result<Vec<Stmt>, String> {
+        // `def`, `try`, `else` and `finally` take their `:` as a FORCED token
+        // (`&&':'` in CPython's grammar): whatever stands in its place is
+        // reported as the missing colon.
+        let forced = matches!(
+            desc,
+            "function definition" | "'try' statement" | "'else' statement" | "'finally' statement"
+        );
+        if forced && !self.at_op(":") {
+            return Err(self.err_here("expected ':'"));
+        }
         self.expect_op(":")?;
         if self.at_newline() {
             self.skip_newlines();
             if !matches!(self.cur(), Tok::Indent) {
-                return Err(format!(
-                    "IndentationError: expected an indented block after {desc} on line {kw_line}"
+                return Err(self.err_span_as(
+                    "IndentationError",
+                    &format!("expected an indented block after {desc} on line {kw_line}"),
+                    self.pos,
+                    self.pos,
                 ));
             }
             self.advance(); // Indent
@@ -286,7 +672,16 @@ impl Parser {
         // statement boundary is always stray — CPython's `IndentationError:
         // unexpected indent` (the line lives in the traceback's `File` header).
         if matches!(self.cur(), Tok::Indent) {
-            return Err("IndentationError: unexpected indent".to_string());
+            // CPython's position here is the indentation's WIDTH (so one short
+            // of the first character's 1-based column) and an end of -1.
+            let first = &self.toks[(self.pos + 1).min(self.toks.len() - 1)];
+            return Err(at_pos(
+                "IndentationError: unexpected indent",
+                first.line,
+                first.col as i64,
+                first.line,
+                -1,
+            ));
         }
         if let Tok::Name(n) = self.cur().clone() {
             match n.as_str() {
@@ -338,7 +733,9 @@ impl Parser {
     /// A logical line of one or more `;`-separated simple statements.
     fn parse_simple_line(&mut self, out: &mut Vec<Stmt>) -> Result<(), String> {
         loop {
+            let stmt_start = self.pos;
             self.parse_simple_stmt(out)?;
+            self.check_stmt_end(stmt_start)?;
             if self.eat_op(";") {
                 if self.at_newline() || matches!(self.cur(), Tok::Eof) {
                     break;
@@ -363,16 +760,25 @@ impl Parser {
                     return Ok(());
                 }
                 "break" => {
+                    let start = self.pos;
                     self.advance();
+                    if self.loop_depth == 0 {
+                        self.note_misplaced("'break' outside loop", start);
+                    }
                     out.push(Stmt::new(StmtKind::Break, line));
                     return Ok(());
                 }
                 "continue" => {
+                    let start = self.pos;
                     self.advance();
+                    if self.loop_depth == 0 {
+                        self.note_misplaced("'continue' not properly in loop", start);
+                    }
                     out.push(Stmt::new(StmtKind::Continue, line));
                     return Ok(());
                 }
                 "return" => {
+                    let start = self.pos;
                     self.advance();
                     let v =
                         if self.at_newline() || self.at_op(";") || matches!(self.cur(), Tok::Eof) {
@@ -380,6 +786,9 @@ impl Parser {
                         } else {
                             Some(self.parse_exprlist()?)
                         };
+                    if !self.in_function {
+                        self.note_misplaced("'return' outside function", start);
+                    }
                     out.push(Stmt::new(StmtKind::Return(v), line));
                     return Ok(());
                 }
@@ -408,8 +817,19 @@ impl Parser {
                     return Ok(());
                 }
                 "nonlocal" => {
+                    let start = self.pos;
                     self.advance();
                     let names = self.parse_name_list()?;
+                    if self.nesting == 0 && self.misplaced.is_none() {
+                        self.note_misplaced(
+                            "nonlocal declaration not allowed at module level",
+                            start,
+                        );
+                        // A symbol-table error: see `SyntaxPos::bare_args`.
+                        if let Some(e) = &mut self.misplaced {
+                            e.push_str(&format!("{SYNTAX_FIELD}bare=1"));
+                        }
+                    }
                     out.push(Stmt::new(StmtKind::Nonlocal(names), line));
                     return Ok(());
                 }
@@ -441,7 +861,15 @@ impl Parser {
     }
 
     fn parse_expr_stmt(&mut self, out: &mut Vec<Stmt>, line: u32) -> Result<(), String> {
+        let first_start = self.pos;
         let first = self.parse_exprlist()?;
+        // An assignment expression is not a statement unless parenthesized:
+        // `a := 1` stops at the `:=`.
+        if matches!(first, Expr::NamedExpr(..))
+            && matches!(self.toks[first_start].tok, Tok::Name(_))
+        {
+            return Err(self.err_span("invalid syntax", first_start + 1, first_start + 1));
+        }
         // Annotated assignment: target: ann [= value]
         if self.at_op(":") {
             self.advance();
@@ -534,7 +962,7 @@ impl Parser {
     fn parse_while(&mut self, out: &mut Vec<Stmt>, line: u32) -> Result<(), String> {
         self.advance();
         let test = self.parse_namedexpr()?;
-        let body = self.parse_suite("'while' statement", line)?;
+        let body = self.parse_loop_body("'while' statement", line)?;
         let orelse = if self.at_kw("else") {
             let el = self.line();
             self.advance();
@@ -556,7 +984,7 @@ impl Parser {
             ));
         }
         let iter = self.parse_exprlist()?;
-        let body = self.parse_suite("'for' statement", line)?;
+        let body = self.parse_loop_body("'for' statement", line)?;
         let orelse = if self.at_kw("else") {
             let el = self.line();
             self.advance();
@@ -696,7 +1124,8 @@ impl Parser {
         if self.at_kw("with") {
             return self.parse_with(out, line, true);
         }
-        Err(format!("SyntaxError: invalid 'async' (line {line})"))
+        let _ = line;
+        Err(self.err_here("invalid syntax"))
     }
 
     fn parse_decorated(&mut self, out: &mut Vec<Stmt>, line: u32) -> Result<(), String> {
@@ -805,7 +1234,7 @@ impl Parser {
             let ret = self.parse_expr()?; // return annotation, recorded as `"return"`
             params.annotations.push(("return".to_string(), ret));
         }
-        let body = self.parse_suite("function definition", line)?;
+        let body = self.parse_scope_body("function definition", line, true)?;
         out.push(Stmt::new(
             StmtKind::FuncDef {
                 name,
@@ -821,23 +1250,64 @@ impl Parser {
 
     /// Parse a formal-parameter list, stopping at `close` (`)` for def, `:` for
     /// lambda).
+    /// A parameter list — `def`'s up to `)`, a lambda's up to `:` — with the
+    /// ordering rules CPython's `invalid_parameters` family reports, each at
+    /// the parameter that breaks it. A repeated name is the compiler's
+    /// `duplicate argument`, raised once the whole file has parsed.
     fn parse_params(&mut self, close: &str) -> Result<Params, String> {
         let mut p = Params::default();
         let mut seen_star = false;
+        let mut seen_default = false;
+        let mut seen_kwargs = false;
+        let mut names_seen: Vec<String> = Vec::new();
+        let mut check_dup = |parser: &mut Self, name: &str, at: usize| {
+            if names_seen.iter().any(|n| n == name) {
+                if parser.misplaced.is_none() {
+                    let e = parser.err_span(
+                        &format!("duplicate argument '{name}' in function definition"),
+                        at,
+                        at,
+                    );
+                    parser.misplaced =
+                        Some(format!("{e}{SYNTAX_FIELD}nosrc=1{SYNTAX_FIELD}bare=1"));
+                }
+            } else {
+                names_seen.push(name.to_string());
+            }
+        };
         loop {
             if self.at_op(close) {
                 break;
+            }
+            if seen_kwargs {
+                return Err(self.err_here("arguments cannot follow var-keyword argument"));
             }
             if self.eat_op("/") {
                 p.posonly = p.names.len();
                 let _ = self.eat_op(",");
                 continue;
             }
-            if self.eat_op("*") {
-                if self.at_op(",") || self.at_op(close) {
+            if self.at_op("*") {
+                if seen_star {
+                    return Err(self.err_here("* argument may appear only once"));
+                }
+                let star_at = self.pos;
+                self.advance();
+                if self.at_op(close)
+                    || self.at_op(",")
+                        && matches!(&self.toks[self.pos + 1].tok, Tok::Op(o) if o == close || o == "**")
+                {
+                    // A `def` names the `*`; a lambda's rule raises at the
+                    // token it had read past it.
+                    let at = if close == ")" { star_at } else { self.pos };
+                    return Err(self.err_span("named arguments must follow bare *", at, at));
+                }
+                if self.at_op(",") {
                     p.star = Some(String::new()); // bare `*`
                 } else {
+                    let name_at = self.pos;
                     let star_name = self.expect_name()?;
+                    check_dup(self, &star_name, name_at);
                     if close == ")" && self.at_op(":") {
                         self.advance();
                         let ann = self.parse_expr()?;
@@ -850,7 +1320,10 @@ impl Parser {
                 continue;
             }
             if self.eat_op("**") {
+                let name_at = self.pos;
                 let kw_name = self.expect_name()?;
+                check_dup(self, &kw_name, name_at);
+                seen_kwargs = true;
                 if close == ")" && self.at_op(":") {
                     self.advance();
                     let ann = self.parse_expr()?;
@@ -860,7 +1333,9 @@ impl Parser {
                 let _ = self.eat_op(",");
                 continue;
             }
+            let name_at = self.pos;
             let name = self.expect_name()?;
+            check_dup(self, &name, name_at);
             // `name: annotation` — recorded for `__annotations__` (only in a
             // `def`, `close == ")"`; a `lambda` has no annotations).
             if close == ")" && self.eat_op(":") {
@@ -872,6 +1347,15 @@ impl Parser {
             } else {
                 None
             };
+            if default.is_some() {
+                seen_default = !seen_star;
+            } else if seen_default && !seen_star {
+                return Err(self.err_span(
+                    "parameter without a default follows parameter with a default",
+                    name_at,
+                    name_at,
+                ));
+            }
             if seen_star {
                 p.kwonly.push(name);
                 p.kwonly_defaults.push(default);
@@ -929,7 +1413,7 @@ impl Parser {
             }
             self.expect_op(")")?;
         }
-        let body = self.parse_suite("class definition", line)?;
+        let body = self.parse_scope_body("class definition", line, false)?;
         out.push(Stmt::new(
             StmtKind::ClassDef {
                 name,
@@ -970,6 +1454,30 @@ impl Parser {
                 star,
             });
         }
+        // A `try` block that catches nothing and cleans up nothing is not a
+        // statement CPython's grammar admits; pythonrs used to parse it and run
+        // the body. An `else` there does not help, and is where it is reported:
+        // at whatever follows the body, or — at the end of the input — just
+        // past the last line.
+        if handlers.is_empty() && !self.at_kw("finally") {
+            const MSG: &str = "expected 'except' or 'finally' block";
+            if matches!(self.cur(), Tok::Eof | Tok::Dedent) {
+                if let Some(nl) = self.toks[..self.pos]
+                    .iter()
+                    .rev()
+                    .find(|t| matches!(t.tok, Tok::Newline))
+                {
+                    return Err(at_pos(
+                        &format!("SyntaxError: {MSG}"),
+                        nl.line,
+                        nl.col as i64 + 1,
+                        nl.line,
+                        -1,
+                    ));
+                }
+            }
+            return Err(self.err_here(MSG));
+        }
         let orelse = if self.at_kw("else") {
             let el = self.line();
             self.advance();
@@ -984,13 +1492,6 @@ impl Parser {
         } else {
             Vec::new()
         };
-        // A `try` block that catches nothing and cleans up nothing is not a
-        // statement CPython's grammar admits; pythonrs used to parse it and run
-        // the body. An `else` without a handler does not count — CPython
-        // reports the same message for `try/else` as for a bare `try`.
-        if handlers.is_empty() && finalbody.is_empty() {
-            return Err("SyntaxError: expected 'except' or 'finally' block".to_string());
-        }
         out.push(Stmt::new(
             StmtKind::Try {
                 body,
@@ -1299,6 +1800,7 @@ impl Parser {
 
     fn parse_import(&mut self, out: &mut Vec<Stmt>, line: u32) -> Result<(), String> {
         self.advance();
+        self.names_after_import()?;
         let mut names = Vec::new();
         loop {
             let mut name = self.expect_name()?;
@@ -1320,6 +1822,23 @@ impl Parser {
         Ok(())
     }
 
+    /// `import` with nothing after it on the line: CPython's
+    /// `invalid_import`/`invalid_import_from_targets` wording, at the end of
+    /// the line with no width.
+    fn names_after_import(&self) -> Result<(), String> {
+        if !matches!(self.cur(), Tok::Newline | Tok::Eof) {
+            return Ok(());
+        }
+        let t = &self.toks[self.pos];
+        Err(at_pos(
+            "SyntaxError: Expected one or more names after 'import'",
+            t.line,
+            t.col as i64 + 1,
+            t.line,
+            t.col as i64 + 1,
+        ))
+    }
+
     fn parse_from_import(&mut self, out: &mut Vec<Stmt>, line: u32) -> Result<(), String> {
         self.advance(); // from
         let mut level = 0;
@@ -1338,11 +1857,9 @@ impl Parser {
             Some(m)
         };
         if !self.eat_kw("import") {
-            return Err(format!(
-                "SyntaxError: expected 'import' (line {})",
-                self.line()
-            ));
+            return Err(self.err_here("invalid syntax"));
         }
+        self.names_after_import()?;
         let mut names = Vec::new();
         if self.eat_op("*") {
             names.push(Alias {
@@ -1442,14 +1959,18 @@ impl Parser {
             self.depth = saved;
             return Ok(e);
         }
+        let body_start = self.pos;
         let body = self.parse_or()?;
         if self.at_kw("if") {
             self.advance();
             let test = self.parse_or()?;
             if !self.eat_kw("else") {
-                return Err(format!(
-                    "SyntaxError: ternary missing else (line {})",
-                    self.line()
+                // The whole `body if test`, as CPython's `invalid_expression`
+                // rule underlines it.
+                return Err(self.err_span(
+                    "expected 'else' after 'if' expression",
+                    body_start,
+                    self.pos - 1,
                 ));
             }
             let orelse = self.parse_ternary()?;
@@ -1468,6 +1989,11 @@ impl Parser {
         self.advance(); // lambda
         let params = self.parse_params(":")?;
         self.expect_op(":")?;
+        // A lambda body is an expression, and an unparenthesized `yield` is not
+        // one there.
+        if self.at_kw("yield") {
+            return Err(self.err_here("invalid syntax"));
+        }
         let body = self.parse_ternary()?;
         Ok(Expr::Lambda {
             params,
@@ -1816,18 +2342,32 @@ impl Parser {
                 order.keyword = true;
                 let kn = self.expect_name()?;
                 self.expect_op("=")?;
+                let start = self.pos;
+                let value = self.parse_expr()?;
+                self.comma_hint(start)?;
                 keywords.push(Keyword {
                     name: Some(kn),
-                    value: self.parse_expr()?,
+                    value,
                 });
             } else {
                 order.positional()?;
+                let start = self.pos;
                 let e = self.parse_namedexpr()?;
-                // Generator expression as sole argument: f(x for x in xs)
-                if self.at_comp_for() && args.is_empty() && keywords.is_empty() {
+                // Generator expression as sole argument: f(x for x in xs). With
+                // anything else in the call it must have its own parentheses.
+                if self.at_comp_for() {
                     let comps = self.parse_comprehension_clauses()?;
+                    let alone = args.is_empty() && keywords.is_empty() && self.at_op(")");
+                    if !alone {
+                        return Err(self.err_span(
+                            "Generator expression must be parenthesized",
+                            start,
+                            self.pos - 1,
+                        ));
+                    }
                     args.push(Expr::GenExp(Box::new(e), comps));
                 } else {
+                    self.comma_hint(start)?;
                     args.push(e);
                 }
             }
@@ -1846,11 +2386,15 @@ impl Parser {
     fn parse_subscript(&mut self) -> Result<Expr, String> {
         // A subscript may be a slice, an index, or a tuple of these.
         let parse_one = |p: &mut Self| -> Result<Expr, String> {
+            let lo_start = p.pos;
             let lo = if p.at_op(":") {
                 None
             } else {
                 Some(Box::new(p.parse_expr()?))
             };
+            if lo.is_some() {
+                p.comma_hint(lo_start)?;
+            }
             if p.at_op(":") {
                 p.advance();
                 let hi = if p.at_op(":") || p.at_op("]") || p.at_op(",") {
@@ -1939,9 +2483,10 @@ impl Parser {
                     // no rule left to try and reports the generic message. Every
                     // one of the 27 reserved words was checked against 3.14.6;
                     // all give exactly this.
+                    // The keyword itself — already consumed — is what is wrong.
                     _ if is_keyword(&n) => {
                         let _ = line;
-                        Err("SyntaxError: invalid syntax".to_string())
+                        Err(self.err_span("invalid syntax", self.pos - 1, self.pos - 1))
                     }
                     // A bare name load carries its span so an undefined-name
                     // traceback underlines exactly the name.
@@ -1958,12 +2503,12 @@ impl Parser {
                 }
                 // An operator where an atom was expected — CPython's catch-all
                 // `invalid syntax` (the token/line live in the traceback header).
-                _ => Err("SyntaxError: invalid syntax".to_string()),
+                _ => Err(self.err_here("invalid syntax")),
             },
             // Any other token (Newline, Op, keyword) where an atom was expected.
             _ => {
                 let _ = line;
-                Err("SyntaxError: invalid syntax".to_string())
+                Err(self.err_here("invalid syntax"))
             }
         }
     }
@@ -2182,19 +2727,23 @@ impl Parser {
         if self.eat_op(")") {
             return Ok(Expr::Tuple(Vec::new()));
         }
+        let start = self.pos;
         let first = self.parse_star_or_expr()?;
         if self.at_comp_for() {
             let comps = self.parse_comprehension_clauses()?;
             self.expect_op(")")?;
             return Ok(Expr::GenExp(Box::new(first), comps));
         }
+        self.comma_hint(start)?;
         if self.at_op(",") {
             let mut items = vec![first];
             while self.eat_op(",") {
                 if self.at_op(")") {
                     break;
                 }
+                let start = self.pos;
                 items.push(self.parse_star_or_expr()?);
+                self.comma_hint(start)?;
             }
             self.expect_op(")")?;
             return Ok(Expr::Tuple(items));
@@ -2209,18 +2758,22 @@ impl Parser {
         if self.eat_op("]") {
             return Ok(Expr::List(Vec::new()));
         }
+        let start = self.pos;
         let first = self.parse_star_or_expr()?;
         if self.at_comp_for() {
             let comps = self.parse_comprehension_clauses()?;
             self.expect_op("]")?;
             return Ok(Expr::ListComp(Box::new(first), comps));
         }
+        self.comma_hint(start)?;
         let mut items = vec![first];
         while self.eat_op(",") {
             if self.at_op("]") {
                 break;
             }
+            let start = self.pos;
             items.push(self.parse_star_or_expr()?);
+            self.comma_hint(start)?;
         }
         self.expect_op("]")?;
         Ok(Expr::List(items))
@@ -2263,6 +2816,7 @@ impl Parser {
             self.expect_op("}")?;
             return Ok(Expr::Dict(pairs));
         }
+        let first_start = self.pos;
         let first = self.parse_star_or_expr()?;
         if self.at_op(":") {
             // dict
@@ -2282,8 +2836,21 @@ impl Parser {
                     pairs.push((None, self.parse_expr()?));
                     continue;
                 }
+                let k_start = self.pos;
                 let k = self.parse_expr()?;
-                self.expect_op(":")?;
+                if !self.at_op(":") {
+                    // `invalid_double_starred_kvpairs`: a key with no value,
+                    // located at the key with no end.
+                    let t = &self.toks[k_start];
+                    return Err(at_pos(
+                        "SyntaxError: ':' expected after dictionary key",
+                        t.line,
+                        t.col as i64 + 1,
+                        t.line,
+                        0,
+                    ));
+                }
+                self.advance();
                 pairs.push((Some(k), self.parse_expr()?));
             }
             self.expect_op("}")?;
@@ -2293,12 +2860,15 @@ impl Parser {
             self.expect_op("}")?;
             Ok(Expr::SetComp(Box::new(first), comps))
         } else {
+            self.comma_hint(first_start)?;
             let mut items = vec![first];
             while self.eat_op(",") {
                 if self.at_op("}") {
                     break;
                 }
+                let start = self.pos;
                 items.push(self.parse_star_or_expr()?);
+                self.comma_hint(start)?;
             }
             self.expect_op("}")?;
             Ok(Expr::Set(items))

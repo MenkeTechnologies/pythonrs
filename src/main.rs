@@ -434,6 +434,9 @@ fn atty_stdin() -> bool {
 }
 
 fn fail(msg: &str) -> ExitCode {
+    // A syntax error's position trailer is for the exception builder, not
+    // for a person reading the message.
+    let (msg, _) = pythonrs::parser::split_syntax_error(msg);
     eprintln!("python: {msg}");
     ExitCode::FAILURE
 }

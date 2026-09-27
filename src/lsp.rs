@@ -1300,17 +1300,50 @@ fn compute_diagnostics(text: &str) -> Vec<Diagnostic> {
     match crate::parser::parse(text) {
         Ok(_) => Vec::new(),
         Err(e) => {
-            let line = parse_error_line(&e).saturating_sub(1);
+            // A positioned error underlines exactly its span; one carrying only
+            // a `(line N)` suffix covers the line.
+            let (message, pos) = crate::parser::split_syntax_error(&e);
+            let (start, end) = match pos {
+                Some(crate::parser::SyntaxPos {
+                    lineno: Some(l),
+                    offset: Some(o),
+                    end_lineno,
+                    end_offset,
+                    ..
+                }) => {
+                    let line = (l as u32).saturating_sub(1);
+                    let col = (o as u32).saturating_sub(1);
+                    let end_line = end_lineno.map_or(line, |el| (el as u32).saturating_sub(1));
+                    let end_col = match end_offset {
+                        Some(eo) if eo > o || end_line != line => (eo as u32).saturating_sub(1),
+                        _ => col + 1,
+                    };
+                    (
+                        Position {
+                            line,
+                            character: col,
+                        },
+                        Position {
+                            line: end_line,
+                            character: end_col,
+                        },
+                    )
+                }
+                _ => {
+                    let line = parse_error_line(message).saturating_sub(1);
+                    (
+                        Position { line, character: 0 },
+                        Position {
+                            line,
+                            character: 200,
+                        },
+                    )
+                }
+            };
             vec![Diagnostic {
-                range: Range {
-                    start: Position { line, character: 0 },
-                    end: Position {
-                        line,
-                        character: 200,
-                    },
-                },
+                range: Range { start, end },
                 severity: Some(DiagnosticSeverity::ERROR),
-                message: e,
+                message: message.to_string(),
                 ..Default::default()
             }]
         }

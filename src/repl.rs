@@ -283,9 +283,14 @@ fn run_line(src: &str) {
     match crate::compile_interactive(src) {
         Ok(prog) => match crate::run_compiled(prog) {
             Ok(_) => {}
-            Err(e) => eprintln!("{}", Color::Red.paint(e)),
+            Err(e) => eprintln!("{}", Color::Red.paint(crate::plain_error(e))),
         },
-        Err(e) => eprintln!("{}", Color::Red.paint(e)),
+        // A line that does not compile is shown with its source and caret, as
+        // a script's is.
+        Err(e) => eprint!(
+            "{}",
+            Color::Red.paint(crate::render_compile_error(&e, src, "<stdin>"))
+        ),
     }
 }
 

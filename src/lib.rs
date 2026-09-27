@@ -105,6 +105,8 @@ pub fn compile_or_load(src: &str) -> Result<compiler::Program, String> {
 /// so `--cacheview` attributes each cached blob to the module that produced it,
 /// not the `<string>`/script name of whatever run triggered the import.
 pub fn compile_or_load_labeled(src: &str, source: &str) -> Result<compiler::Program, String> {
+    // A syntax error in the module names the module's file.
+    let compile = |src: &str| compile(src).map_err(|e| parser::with_filename(e, source));
     if !cache::cache_enabled() {
         return compile(src);
     }
@@ -157,7 +159,19 @@ pub fn eval_str(src: &str) -> Result<Value, String> {
     host::reset_host();
     host::init_runtime(vec![String::new()], None, src, "<string>", true);
     // A bare source string (`<string>`) is a throwaway program — don't cache it.
-    run_compiled(compile_or_load_cacheable(src, false)?)
+    compile_or_load_cacheable(src, false)
+        .and_then(run_compiled)
+        .map_err(plain_error)
+}
+
+/// An error as an embedder reads it: a syntax error's position trailer (see
+/// [`parser::split_syntax_error`]) is for the runtime's own exception builder
+/// and traceback, and comes off at the library boundary.
+pub fn plain_error(e: String) -> String {
+    match parser::split_syntax_error(&e) {
+        (head, Some(_)) => head.to_string(),
+        (_, None) => e,
+    }
 }
 
 /// Run a Python source string on a fresh host with `globals` bound and the
@@ -196,7 +210,9 @@ pub fn eval_str_captured(src: &str, globals: &[(&str, &str)]) -> (Result<Value, 
         }
         h.begin_capture();
     });
-    let result = compile_or_load_cacheable(src, false).and_then(run_compiled);
+    let result = compile_or_load_cacheable(src, false)
+        .and_then(run_compiled)
+        .map_err(plain_error);
     let output = host::with_host(|h| h.end_capture());
     (result, output)
 }
@@ -206,7 +222,9 @@ pub fn eval_file(path: &str) -> Result<Value, String> {
     let src = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
     host::reset_host();
     host::init_runtime(vec![path.to_string()], None, &src, path, true);
-    run_compiled(compile_or_load(&src)?)
+    compile_or_load(&src)
+        .and_then(run_compiled)
+        .map_err(plain_error)
 }
 
 /// Run `python -m <module> [args…]`. Delegates to the embedded CPython's
@@ -224,6 +242,47 @@ pub fn run_module(module: &str, args: &[String]) -> i32 {
 pub fn run_module(module: &str, _args: &[String]) -> i32 {
     eprintln!("python: -m requires the stdlib-ffi bridge (not in this build): {module}");
     1
+}
+
+/// A program that does not compile, reported the way CPython reports one: the
+/// `File "…", line N` header, the offending line, a caret run under the
+/// position, and `Class: message`. A message the compiler positioned only by
+/// a ` (line N)` suffix gets the header and the line without carets; one with
+/// no position at all is printed as it is.
+pub fn render_compile_error(err: &str, src: &str, filename: &str) -> String {
+    let (head, pos) = parser::split_syntax_error(err);
+    let mut pos = match pos {
+        Some(p) if p.lineno.is_some() => p,
+        _ => {
+            let Some((text, line)) = head
+                .strip_suffix(')')
+                .and_then(|h| h.rsplit_once(" (line "))
+                .and_then(|(t, n)| n.parse::<i64>().ok().map(|n| (t, n)))
+            else {
+                return format!("{head}\n");
+            };
+            let pos = parser::SyntaxPos {
+                lineno: Some(line),
+                ..Default::default()
+            };
+            return render_positioned(text, pos, src, filename);
+        }
+    };
+    if pos.filename.is_none() {
+        pos.filename = Some(filename.to_string());
+    }
+    render_positioned(head, pos, src, filename)
+}
+
+/// [`render_compile_error`] once the position is known: the source line comes
+/// from `src` when the error did not carry one.
+fn render_positioned(head: &str, mut pos: parser::SyntaxPos, src: &str, filename: &str) -> String {
+    // CPython's traceback reads a missing line from the FILE (`linecache`), so
+    // `-c` code and `<stdin>` show none.
+    if pos.text.is_none() && !filename.starts_with('<') {
+        pos.text = pos.lineno.and_then(|l| parser::source_line(src, l, true));
+    }
+    format!("{}{head}\n", parser::render_syntax_block(&pos, filename))
 }
 
 /// How a program run ended: the process exit code plus any text the runtime must
@@ -255,7 +314,7 @@ pub fn run_program(
         Err(e) => {
             return RunReport {
                 exit_code: 1,
-                stderr: Some(format!("{e}\n")),
+                stderr: Some(render_compile_error(&e, src, tb_filename)),
             }
         }
     };
@@ -304,12 +363,12 @@ pub fn run_program(
 /// Read and run a `.py` file under the DAP debugger.
 pub fn eval_file_debug(path: &str) -> Result<Value, String> {
     let src = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
-    let prog = compile_debug(&src)?;
+    let prog = compile_debug(&src).map_err(plain_error)?;
     host::reset_host();
     host::set_debug_mode(true);
     let r = run_compiled(prog);
     host::set_debug_mode(false);
-    r
+    r.map_err(plain_error)
 }
 
 /// Evaluate `src` and return the `repr` of the last expression's value.

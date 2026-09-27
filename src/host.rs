@@ -5043,6 +5043,56 @@ impl PyHost {
     /// `filename` when it is a `str` and `lineno` when it is exactly an `int`
     /// — `m (f.py, line 3)`, `m (f.py)`, `m (line 3)` — all read from the
     /// instance's attributes, so assigning `e.lineno` changes the rendering.
+    /// For an exception of a `SyntaxError` class, CPython's
+    /// `_format_syntax_error`: the `File`/source/caret block (empty when
+    /// `lineno` is `None`), and the final `Class: msg` line.
+    pub fn syntax_error_block(&self, v: &Value) -> Option<(String, String)> {
+        let class = match self.get(v) {
+            Some(PyObj::Exception { class, .. }) => class.clone(),
+            Some(PyObj::Instance(i)) => i.class.clone(),
+            _ => return None,
+        };
+        let is_syntax = is_syntax_error_class(&class)
+            || matches!(self.get(v), Some(PyObj::Instance(_)))
+                && class_is_subclass(self, &class, "SyntaxError");
+        if !is_syntax {
+            return None;
+        }
+        let attr = |n: &str| match v {
+            Value::Obj(id) => self
+                .func_attrs
+                .get(id)
+                .and_then(|m| m.get(n))
+                .cloned()
+                .unwrap_or(Value::Undef),
+            _ => Value::Undef,
+        };
+        let int = |n: &str| match attr(n) {
+            Value::Int(i) => Some(i),
+            _ => None,
+        };
+        let pos = crate::parser::SyntaxPos {
+            lineno: int("lineno"),
+            offset: int("offset"),
+            end_lineno: int("end_lineno"),
+            end_offset: int("end_offset"),
+            text: self.as_str(&attr("text")).map(|s| s.to_string()),
+            filename: self.as_str(&attr("filename")).map(|s| s.to_string()),
+            no_source: false,
+            bare_args: false,
+        };
+        let msg = match attr("msg") {
+            Value::Undef => "<no detail available>".to_string(),
+            m => self.str_of(&m),
+        };
+        let block = if pos.lineno.is_some() {
+            crate::parser::render_syntax_block(&pos, "<string>")
+        } else {
+            String::new()
+        };
+        Some((block, format!("{class}: {msg}")))
+    }
+
     fn syntax_error_str(&self, v: &Value) -> String {
         let attr = |n: &str| match v {
             Value::Obj(id) => self
@@ -15765,6 +15815,21 @@ impl PyHost {
         // CPython's "Did you mean" hint is part of the RENDERED traceback, not of
         // the exception — `str(e)` for a NameError never carries it — so it is
         // appended here rather than baked into the error string.
+        // A syntax error that was never materialized as an exception object
+        // still carries its position in the error string: draw the source
+        // block from that.
+        let (err, syntax_pos) = crate::parser::split_syntax_error(err);
+        let exc_is_syntax = self
+            .exc
+            .as_ref()
+            .is_some_and(|e| self.syntax_error_block(e).is_some());
+        if let (Some(pos), false) = (syntax_pos, exc_is_syntax) {
+            let block = crate::parser::render_syntax_block(&pos, "<string>");
+            let final_line = format!("{block}{err}");
+            let final_line = final_line.trim_end_matches('\n');
+            self.render_exc_block(None, &final_frames, final_line, &mut ctx, &mut out);
+            return out;
+        }
         let err = crate::suggest::with_hint(err, self.suggestion_for(err));
         let err = crate::suggest::with_import_hint(err, |n| stdlib_module_names().contains(n));
         self.render_exc_block(self.exc.as_ref(), &final_frames, &err, &mut ctx, &mut out);
@@ -15835,6 +15900,13 @@ impl PyHost {
             if !frames.is_empty() {
                 ctx.emit(out, "Traceback (most recent call last):\n", '|');
                 ctx.emit(out, &self.render_frames(frames), '|');
+            }
+            // A syntax error names where in the SOURCE it is, below the frames
+            // that reached it, and its final line is `msg` alone.
+            if let Some((block, last)) = exc.and_then(|e| self.syntax_error_block(e)) {
+                ctx.emit(out, &block, '|');
+                ctx.emit(out, &format!("{last}\n"), '|');
+                return;
             }
             ctx.emit(out, &format!("{final_line}\n"), '|');
             return;

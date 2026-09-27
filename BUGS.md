@@ -9,6 +9,35 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **Syntax errors are positioned and reported the way CPython reports them.**
+  A program that did not compile printed one bare line —
+  `SyntaxError: invalid syntax` for `x = (`, `expected ':' but found Newline
+  (line 2)` for a header without its colon, `expected a name, found Op(":")`
+  for `def f(:` — where CPython prints the `File "…", line N` header, the
+  source line and a caret run, then its own message. The tokenizer and parser
+  now attach CPython's position to every error they raise, the exception built
+  from one gets `lineno`/`offset`/`end_lineno`/`end_offset`/`text`/`filename`
+  and CPython's `args` shape, and the script, `-c`, stdin, REPL, `exec`,
+  `eval` and import paths all render the block. The messages followed:
+  `'(' was never closed`, `unmatched ')'`, `closing parenthesis ']' does not
+  match opening parenthesis '('`, `unterminated [triple-quoted] [f-|t-]string
+  literal (detected at line N)`, `expected ':'` (only where CPython's grammar
+  says so), `expected 'else' after 'if' expression`, `Missing parentheses in
+  call to 'print'`, `invalid syntax. Perhaps you forgot a comma?`, `Generator
+  expression must be parenthesized`, `':' expected after dictionary key`,
+  `Expected one or more names after 'import'`, the parameter-list rules
+  (`named arguments must follow bare *`, `parameter without a default follows
+  parameter with a default`, `* argument may appear only once`, `arguments
+  cannot follow var-keyword argument`, `duplicate argument`), `leading zeros
+  in decimal integer literals are not permitted`, `invalid digit '2' in binary
+  literal`, and `unexpected indent` / `expected an indented block` with
+  CPython's positions. Four programs the parser used to ACCEPT are now refused
+  as CPython refuses them: two expressions side by side (`a b` ran `a`),
+  `print 1`, `a := 1` as a statement, and `lambda: yield`; `0777`, `def f(*)`
+  and duplicate parameters ran too. `'return' outside function`, `'break'
+  outside loop`, `'continue' not properly in loop` and a module-level
+  `nonlocal` are raised once the file has parsed, so a syntax error anywhere
+  in the file wins over them, as it does in CPython.
 - **A `SyntaxError` has its attributes.** `SyntaxError('m', ('f.py', 3, 4,
   'txt'))` bound none of `msg`/`filename`/`lineno`/`offset`/`text`/
   `end_lineno`/`end_offset`/`print_file_and_line`, so `e.lineno` inside a
@@ -1125,16 +1154,34 @@ written.
 
 ## Partial / simplified semantics
 
-- **A compiler-raised `SyntaxError` is worded by pythonrs, not CPython, and has
-  no `offset`/`text`.** Measured through `exec`/`eval` against CPython 3.14.7:
-  `x = (` is `invalid syntax` here and `'(' was never closed` there; `"abc` is
-  `unterminated string (line 1)` against `unterminated string literal
-  (detected at line 1)`; `def f(:` leaks the parser's own token dump,
-  `expected a name, found Op(":") (line 1)`, where CPython says `invalid
-  syntax`. Several messages carry no position at all, so their `lineno` is
-  `None`, and `str(e)` never names the `<string>` filename CPython appends.
-  Matching this means porting the PEG parser's error productions, not
-  rewording strings.
+- **Some `SyntaxError`s are still worded by pythonrs, or carry no position.**
+  The tokenizer's and parser's errors now carry CPython's message, `lineno`,
+  `offset`, `end_lineno`, `end_offset`, `text` and `filename`, and a program
+  that does not compile prints CPython's `File`/source/caret block (see
+  `tests/syntax_errors.rs` for the measured set). What remains, measured
+  against CPython 3.14.7 through `exec`:
+
+  ```
+  del f()          CPython: cannot delete function call            (1, 5)..(1, 8)
+                   pythonrs: cannot delete this expression          no position
+  1 = x            CPython: cannot assign to literal here. Maybe you meant '==' instead of '='?
+                   pythonrs: cannot assign to this expression       no position
+  (a, b) += 1      CPython: 'tuple' is an illegal expression for augmented assignment
+                   pythonrs: cannot assign to this expression       no position
+  x = yield = 3    CPython: assignment to yield expression not possible
+                   pythonrs: invalid syntax at the second '='
+  f(**x, *y)       same message, no position here
+  '\N{bogus}'      same message, no position here
+  yield 1          same message, no position here ('yield' outside function)
+  ```
+
+  The assignment-target family comes from CPython's `invalid_assignment`
+  productions, which name the kind of expression; pythonrs checks targets in
+  the compiler, after the positions are gone. The compiler's own errors
+  (`yield`/`await` outside a function, pattern-matching errors) carry no
+  position for the same reason. `return`/`break`/`continue` in the wrong
+  place, duplicate parameters and a module-level `nonlocal` are positioned,
+  because the parser raises them.
 - **A bridged exception carries no CPython traceback.** An exception that crosses
   from pythonrs into CPython is rebuilt as a fresh exception object, so its
   `__traceback__` is empty. Two visible consequences, both in code that is not
@@ -1922,17 +1969,8 @@ entry. Four remain open:
   through it write through, and filtering the handed-out object would break that
   identity.
 
-- **A `SyntaxError` from `eval`/`exec` omits the inner frame.** CPython renders
-  the compiled string's own frame under the calling one, with the source line
-  and a caret:
-
-  ```
-    File "<string>", line 1
-      r.nope = 1
-             ^
-  SyntaxError: invalid syntax
-  ```
-
-  pythonrs reports the calling frame and then the bare `SyntaxError: invalid
-  syntax` line, so nothing points at WHERE in the evaluated source the problem
-  is.
+- **A `SyntaxError` the compiler raises from `eval`/`exec` omits the inner
+  block.** One the parser or tokenizer raises is rendered as CPython renders
+  it — the calling frames, then the `File "<string>"` block with the source
+  line and caret, then `SyntaxError: msg`. One from the list above that has no
+  position is rendered as the calling frames and the bare message line.

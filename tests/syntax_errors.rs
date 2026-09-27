@@ -1,0 +1,335 @@
+//! Syntax errors as CPython reports them: the `File`/source/caret block a
+//! program that does not compile prints, and the `msg`, `lineno`, `offset`,
+//! `text`, `end_lineno` and `end_offset` a `SyntaxError` from `exec`/`eval`
+//! carries. Every expectation is the verbatim output of CPython 3.14.7 for
+//! the same program.
+
+use std::process::Command;
+
+/// `python -c src`: `(stderr, exit status)`.
+fn run_c(src: &str) -> (String, i32) {
+    let out = Command::new(env!("CARGO_BIN_EXE_python"))
+        .args(["-c", src])
+        .output()
+        .expect("spawn python");
+    (
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.code().unwrap_or(-1),
+    )
+}
+
+/// `(program, stderr, exit status)`.
+const CASES: &[(&str, &str, i32)] = &[
+    (
+        r#"x = ("#,
+        r#"  File "<string>", line 1
+    x = (
+        ^
+SyntaxError: '(' was never closed
+"#,
+        1,
+    ),
+    (
+        r#"if x
+  pass"#,
+        r#"  File "<string>", line 1
+    if x
+        ^
+SyntaxError: expected ':'
+"#,
+        1,
+    ),
+    (
+        r#"a b"#,
+        r#"  File "<string>", line 1
+    a b
+      ^
+SyntaxError: invalid syntax
+"#,
+        1,
+    ),
+    (
+        r#"x = 1 +* 2"#,
+        r#"  File "<string>", line 1
+    x = 1 +* 2
+           ^
+SyntaxError: invalid syntax
+"#,
+        1,
+    ),
+    (
+        r#"def f(:
+  pass"#,
+        r#"  File "<string>", line 1
+    def f(:
+          ^
+SyntaxError: invalid syntax
+"#,
+        1,
+    ),
+    (
+        r#"x = 1
+  y = 2"#,
+        r#"  File "<string>", line 2
+    y = 2
+IndentationError: unexpected indent
+"#,
+        1,
+    ),
+    (
+        r#"s = 'abc"#,
+        r#"  File "<string>", line 1
+    s = 'abc
+        ^
+SyntaxError: unterminated string literal (detected at line 1)
+"#,
+        1,
+    ),
+    (
+        r#"print "hi""#,
+        r#"  File "<string>", line 1
+    print "hi"
+    ^^^^^^^^^^
+SyntaxError: Missing parentheses in call to 'print'. Did you mean print(...)?
+"#,
+        1,
+    ),
+    (
+        r#"x = [1,
+ 2)"#,
+        r#"  File "<string>", line 2
+    2)
+     ^
+SyntaxError: closing parenthesis ')' does not match opening parenthesis '[' on line 1
+"#,
+        1,
+    ),
+    (
+        r#"if True:
+pass"#,
+        r#"  File "<string>", line 2
+    pass
+    ^^^^
+IndentationError: expected an indented block after 'if' statement on line 1
+"#,
+        1,
+    ),
+    (
+        r#"return 5"#,
+        r#"  File "<string>", line 1
+SyntaxError: 'return' outside function
+"#,
+        1,
+    ),
+    (
+        r#"for x in y:
+  def f():
+    break"#,
+        r#"  File "<string>", line 3
+SyntaxError: 'break' outside loop
+"#,
+        1,
+    ),
+    (
+        r#"class A:
+  continue"#,
+        r#"  File "<string>", line 2
+SyntaxError: 'continue' not properly in loop
+"#,
+        1,
+    ),
+    (
+        r#"x = 1
+break
+x = ("#,
+        r#"  File "<string>", line 3
+    x = (
+        ^
+SyntaxError: '(' was never closed
+"#,
+        1,
+    ),
+    (
+        r#"x = )"#,
+        r#"  File "<string>", line 1
+    x = )
+        ^
+SyntaxError: unmatched ')'
+"#,
+        1,
+    ),
+    (
+        r#"f(
+1,
+"#,
+        r#"  File "<string>", line 1
+    f(
+     ^
+SyntaxError: '(' was never closed
+"#,
+        1,
+    ),
+    (
+        r#"x = 5 if y"#,
+        r#"  File "<string>", line 1
+    x = 5 if y
+        ^^^^^^
+SyntaxError: expected 'else' after 'if' expression
+"#,
+        1,
+    ),
+    (
+        r#"s = f'abc"#,
+        r#"  File "<string>", line 1
+    s = f'abc
+        ^
+SyntaxError: unterminated f-string literal (detected at line 1)
+"#,
+        1,
+    ),
+    (
+        r#"s = '''abc
+def"#,
+        r#"  File "<string>", line 1
+    s = '''abc
+        ^
+SyntaxError: unterminated triple-quoted string literal (detected at line 2)
+"#,
+        1,
+    ),
+    (
+        r#"exec("x = (")"#,
+        r#"Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+    exec("x = (")
+    ~~~~^^^^^^^^^
+  File "<string>", line 1
+    x = (
+        ^
+SyntaxError: '(' was never closed
+"#,
+        1,
+    ),
+];
+
+#[test]
+fn a_program_that_does_not_compile_shows_the_line_and_a_caret() {
+    for (src, stderr, status) in CASES {
+        assert_eq!(run_c(src), (stderr.to_string(), *status), "for {src:?}");
+    }
+}
+
+#[test]
+fn syntax_error_attributes_from_exec_and_eval() {
+    let out = Command::new(env!("CARGO_BIN_EXE_python"))
+        .args(["-c", r#"for s in ["x = (", '"abc', "def f(:", "1 +", "if x\n  pass", "print 1", "a b", "x = [1, 2", "return", "break", "x = 1\n  y = 2", "if True:\npass", "x = )", "x = [1,\n 2)"]:
+    try:
+        exec(s, {})
+    except SyntaxError as e:
+        print(type(e).__name__, e.args, str(e))
+for s in ["1 +", "(1", "a b"]:
+    try:
+        eval(s)
+    except SyntaxError as e:
+        print(e.args)
+"#])
+        .output()
+        .expect("spawn python");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        r#"SyntaxError ("'(' was never closed", ('<string>', 1, 5, 'x = (\n', 1, 0)) '(' was never closed (<string>, line 1)
+SyntaxError ('unterminated string literal (detected at line 1)', ('<string>', 1, 1, '"abc', 1, 1)) unterminated string literal (detected at line 1) (<string>, line 1)
+SyntaxError ('invalid syntax', ('<string>', 1, 7, 'def f(:\n', 1, 8)) invalid syntax (<string>, line 1)
+SyntaxError ('invalid syntax', ('<string>', 1, 4, '1 +\n', 1, 5)) invalid syntax (<string>, line 1)
+SyntaxError ("expected ':'", ('<string>', 1, 5, 'if x\n', 1, 6)) expected ':' (<string>, line 1)
+SyntaxError ("Missing parentheses in call to 'print'. Did you mean print(...)?", ('<string>', 1, 1, 'print 1\n', 1, 8)) Missing parentheses in call to 'print'. Did you mean print(...)? (<string>, line 1)
+SyntaxError ('invalid syntax', ('<string>', 1, 3, 'a b\n', 1, 4)) invalid syntax (<string>, line 1)
+SyntaxError ("'[' was never closed", ('<string>', 1, 5, 'x = [1, 2\n', 1, 0)) '[' was never closed (<string>, line 1)
+SyntaxError ("'return' outside function", ('<string>', 1, 1, None, 1, 7)) 'return' outside function (<string>, line 1)
+SyntaxError ("'break' outside loop", ('<string>', 1, 1, None, 1, 6)) 'break' outside loop (<string>, line 1)
+IndentationError ('unexpected indent', ('<string>', 2, 2, '  y = 2\n', 2, -1)) unexpected indent (<string>, line 2)
+IndentationError ("expected an indented block after 'if' statement on line 1", ('<string>', 2, 1, 'pass\n', 2, 5)) expected an indented block after 'if' statement on line 1 (<string>, line 2)
+SyntaxError ("unmatched ')'", ('<string>', 1, 5, 'x = )', 1, 5)) unmatched ')' (<string>, line 1)
+SyntaxError ("closing parenthesis ')' does not match opening parenthesis '[' on line 1", ('<string>', 2, 3, ' 2)', 2, 3)) closing parenthesis ')' does not match opening parenthesis '[' on line 1 (<string>, line 2)
+('invalid syntax', ('<string>', 1, 0, '1 +', 1, 0))
+("'(' was never closed", ('<string>', 1, 1, '(1', 1, 0))
+('invalid syntax', ('<string>', 1, 3, 'a b', 1, 4))
+"#
+    );
+}
+
+/// The position, message and `args` of a broader set of syntax errors: the
+/// parameter-list rules, imports, missing colons, a forgotten comma, a bare
+/// generator argument, number literals, and a `try` with no handler.
+#[test]
+fn syntax_error_positions_across_the_grammar() {
+    let out = Command::new(env!("CARGO_BIN_EXE_python"))
+        .args([
+            "-c",
+            r#"cases = [
+    "def f(*): pass", "lambda *: 1", "def f(a, a): pass", "lambda x, x: 1",
+    "def f(a, b=1, c): pass", "def f(*a, *b): pass", "def f(**k, a): pass",
+    "nonlocal x", "async x", "a := 1", "lambda: yield",
+    "import", "from . import", "from x", "import a b",
+    "while True print(1)", "lambda x x: 1", "else: pass", "try x", "def f() x: pass",
+    "f(a b)", "[1 2]", "(a, b c)", "{1 2}", "x[a b]", "f(a, b=1 c)", "(print 1)",
+    "f(x for x in y, 1)", "f(x for x in y,)", "x = {1: 2, 3}",
+    "0777", "x = 007", "1_", "1__0", "0x", "0b2", "0o8", "0x_",
+    "try:\n  pass", "try:\n  pass\nx = 1", "try: pass", "try:\n  x = 1\nelse:\n  pass",
+]
+for s in cases:
+    try:
+        compile_ok = exec(s, {})
+    except SyntaxError as e:
+        print(repr(s), type(e).__name__, e.args, e.lineno, e.offset, e.end_lineno, e.end_offset)
+"#,
+        ])
+        .output()
+        .expect("spawn python");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        r#"'def f(*): pass' SyntaxError ('named arguments must follow bare *', ('<string>', 1, 7, 'def f(*): pass\n', 1, 8)) 1 7 1 8
+'lambda *: 1' SyntaxError ('named arguments must follow bare *', ('<string>', 1, 9, 'lambda *: 1\n', 1, 10)) 1 9 1 10
+'def f(a, a): pass' SyntaxError ("duplicate argument 'a' in function definition",) 1 10 1 11
+'lambda x, x: 1' SyntaxError ("duplicate argument 'x' in function definition",) 1 11 1 12
+'def f(a, b=1, c): pass' SyntaxError ('parameter without a default follows parameter with a default', ('<string>', 1, 15, 'def f(a, b=1, c): pass\n', 1, 16)) 1 15 1 16
+'def f(*a, *b): pass' SyntaxError ('* argument may appear only once', ('<string>', 1, 11, 'def f(*a, *b): pass\n', 1, 12)) 1 11 1 12
+'def f(**k, a): pass' SyntaxError ('arguments cannot follow var-keyword argument', ('<string>', 1, 12, 'def f(**k, a): pass\n', 1, 13)) 1 12 1 13
+'nonlocal x' SyntaxError ('nonlocal declaration not allowed at module level',) 1 1 1 11
+'async x' SyntaxError ('invalid syntax', ('<string>', 1, 7, 'async x\n', 1, 8)) 1 7 1 8
+'a := 1' SyntaxError ('invalid syntax', ('<string>', 1, 3, 'a := 1\n', 1, 5)) 1 3 1 5
+'lambda: yield' SyntaxError ('invalid syntax', ('<string>', 1, 9, 'lambda: yield\n', 1, 14)) 1 9 1 14
+'import' SyntaxError ("Expected one or more names after 'import'", ('<string>', 1, 7, 'import\n', 1, 7)) 1 7 1 7
+'from . import' SyntaxError ("Expected one or more names after 'import'", ('<string>', 1, 14, 'from . import\n', 1, 14)) 1 14 1 14
+'from x' SyntaxError ('invalid syntax', ('<string>', 1, 7, 'from x\n', 1, 8)) 1 7 1 8
+'import a b' SyntaxError ('invalid syntax', ('<string>', 1, 10, 'import a b\n', 1, 11)) 1 10 1 11
+'while True print(1)' SyntaxError ('invalid syntax', ('<string>', 1, 12, 'while True print(1)\n', 1, 17)) 1 12 1 17
+'lambda x x: 1' SyntaxError ('invalid syntax', ('<string>', 1, 10, 'lambda x x: 1\n', 1, 11)) 1 10 1 11
+'else: pass' SyntaxError ('invalid syntax', ('<string>', 1, 1, 'else: pass\n', 1, 5)) 1 1 1 5
+'try x' SyntaxError ("expected ':'", ('<string>', 1, 5, 'try x\n', 1, 6)) 1 5 1 6
+'def f() x: pass' SyntaxError ("expected ':'", ('<string>', 1, 9, 'def f() x: pass\n', 1, 10)) 1 9 1 10
+'f(a b)' SyntaxError ('invalid syntax. Perhaps you forgot a comma?', ('<string>', 1, 3, 'f(a b)\n', 1, 6)) 1 3 1 6
+'[1 2]' SyntaxError ('invalid syntax. Perhaps you forgot a comma?', ('<string>', 1, 2, '[1 2]\n', 1, 5)) 1 2 1 5
+'(a, b c)' SyntaxError ('invalid syntax. Perhaps you forgot a comma?', ('<string>', 1, 5, '(a, b c)\n', 1, 8)) 1 5 1 8
+'{1 2}' SyntaxError ('invalid syntax. Perhaps you forgot a comma?', ('<string>', 1, 2, '{1 2}\n', 1, 5)) 1 2 1 5
+'x[a b]' SyntaxError ('invalid syntax. Perhaps you forgot a comma?', ('<string>', 1, 3, 'x[a b]\n', 1, 6)) 1 3 1 6
+'f(a, b=1 c)' SyntaxError ('invalid syntax. Perhaps you forgot a comma?', ('<string>', 1, 8, 'f(a, b=1 c)\n', 1, 11)) 1 8 1 11
+'(print 1)' SyntaxError ("Missing parentheses in call to 'print'. Did you mean print(...)?", ('<string>', 1, 2, '(print 1)\n', 1, 9)) 1 2 1 9
+'f(x for x in y, 1)' SyntaxError ('Generator expression must be parenthesized', ('<string>', 1, 3, 'f(x for x in y, 1)\n', 1, 15)) 1 3 1 15
+'f(x for x in y,)' SyntaxError ('Generator expression must be parenthesized', ('<string>', 1, 3, 'f(x for x in y,)\n', 1, 15)) 1 3 1 15
+'x = {1: 2, 3}' SyntaxError ("':' expected after dictionary key", ('<string>', 1, 12, 'x = {1: 2, 3}\n', 1, 0)) 1 12 1 0
+'0777' SyntaxError ('leading zeros in decimal integer literals are not permitted; use an 0o prefix for octal integers', ('<string>', 1, 1, '0777', 1, 2)) 1 1 1 2
+'x = 007' SyntaxError ('leading zeros in decimal integer literals are not permitted; use an 0o prefix for octal integers', ('<string>', 1, 5, 'x = 007', 1, 7)) 1 5 1 7
+'1_' SyntaxError ('invalid decimal literal', ('<string>', 1, 2, '1_', 1, 2)) 1 2 1 2
+'1__0' SyntaxError ('invalid decimal literal', ('<string>', 1, 2, '1__0', 1, 2)) 1 2 1 2
+'0x' SyntaxError ('invalid hexadecimal literal', ('<string>', 1, 2, '0x', 1, 2)) 1 2 1 2
+'0b2' SyntaxError ("invalid digit '2' in binary literal", ('<string>', 1, 3, '0b2', 1, 3)) 1 3 1 3
+'0o8' SyntaxError ("invalid digit '8' in octal literal", ('<string>', 1, 3, '0o8', 1, 3)) 1 3 1 3
+'0x_' SyntaxError ('invalid hexadecimal literal', ('<string>', 1, 3, '0x_', 1, 3)) 1 3 1 3
+'try:\n  pass' SyntaxError ("expected 'except' or 'finally' block", ('<string>', 2, 7, '  pass\n', 2, -1)) 2 7 2 -1
+'try:\n  pass\nx = 1' SyntaxError ("expected 'except' or 'finally' block", ('<string>', 3, 1, 'x = 1\n', 3, 2)) 3 1 3 2
+'try: pass' SyntaxError ("expected 'except' or 'finally' block", ('<string>', 1, 10, 'try: pass\n', 1, -1)) 1 10 1 -1
+'try:\n  x = 1\nelse:\n  pass' SyntaxError ("expected 'except' or 'finally' block", ('<string>', 3, 1, 'else:\n', 3, 5)) 3 1 3 5
+"#
+    );
+}

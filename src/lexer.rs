@@ -68,6 +68,10 @@ pub struct Lexed {
     /// instead — which restores the original error for the case where the
     /// dedent really is the only problem.
     pub deferred: Option<String>,
+    /// A bracket still open at end of input: `'(' was never closed`, pointing
+    /// at the bracket. The parser reports it when it runs out of input there,
+    /// and its own error otherwise.
+    pub unclosed: Option<String>,
 }
 
 struct Lexer {
@@ -84,6 +88,9 @@ struct Lexer {
     line_start: usize,
     /// Char index where the token currently being scanned begins.
     tok_start: usize,
+    /// The brackets currently open: the character, its line, and its 0-based
+    /// column — what `'(' was never closed` and a mismatched closer name.
+    open: Vec<(char, u32, u32)>,
 }
 
 /// CPython's `MAXLEVEL` (`Parser/lexer/state.h`): the tokenizer tracks at most
@@ -109,11 +116,35 @@ pub fn lex(src: &str) -> Result<Lexed, String> {
         deferred: None,
         line_start: 0,
         tok_start: 0,
+        open: Vec::new(),
     };
     lx.run()?;
+    let unclosed = lx.open.first().map(|&(c, line, col)| {
+        // The line the bracket is on, newline-terminated only when nothing but
+        // blank lines follows it — as CPython's tokenizer leaves its buffer.
+        let rest_blank = src
+            .split_inclusive('\n')
+            .skip(line as usize)
+            .all(|l| l.trim().is_empty());
+        let mut text = lx.line_text(line);
+        if rest_blank {
+            text.push('\n');
+        }
+        crate::parser::with_text(
+            crate::parser::at_pos(
+                &format!("SyntaxError: '{c}' was never closed"),
+                line,
+                col as i64 + 1,
+                line,
+                0,
+            ),
+            &text,
+        )
+    });
     Ok(Lexed {
         toks: lx.out,
         deferred: lx.deferred,
+        unclosed,
     })
 }
 
@@ -135,6 +166,34 @@ impl Lexer {
         }
         c
     }
+    /// Source line `line` (1-based), without its newline.
+    fn line_text(&self, line: u32) -> String {
+        let mut cur = 1;
+        let mut out = String::new();
+        for &c in &self.src {
+            if c == '\n' {
+                if cur == line {
+                    break;
+                }
+                cur += 1;
+                continue;
+            }
+            if cur == line {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    /// A tokenizer error at `line`/`col` (0-based column), carrying the line's
+    /// text without its newline, as CPython's tokenizer reports it.
+    fn tok_err(&self, msg: &str, line: u32, col: usize, end_col: i64) -> String {
+        crate::parser::with_text(
+            crate::parser::at_pos(msg, line, col as i64 + 1, line, end_col),
+            &self.line_text(line),
+        )
+    }
+
     fn push(&mut self, tok: Tok) {
         self.out.push(Token {
             tok,
@@ -163,11 +222,19 @@ impl Lexer {
             match self.peek() {
                 None => break,
                 Some('\n') => {
+                    // A Newline token sits where the line break is, so an error
+                    // reported against it names this line, not the next.
+                    let (line, col) = (self.line, (self.pos - self.line_start) as u32);
                     self.bump();
                     if self.depth == 0 {
                         // Collapse runs of blank physical lines to one Newline.
                         if !matches!(self.out.last().map(|t| &t.tok), Some(Tok::Newline) | None) {
-                            self.push(Tok::Newline);
+                            self.out.push(Token {
+                                tok: Tok::Newline,
+                                line,
+                                col,
+                                end_col: col + 1,
+                            });
                         }
                         at_line_start = true;
                     }
@@ -204,6 +271,7 @@ impl Lexer {
         if self.deferred.is_none()
             && !matches!(self.out.last().map(|t| &t.tok), Some(Tok::Newline) | None)
         {
+            self.tok_start = self.pos;
             self.push(Tok::Newline);
         }
         while self.indents.len() > 1 {
@@ -342,12 +410,40 @@ impl Lexer {
         // fields, same PEP 701 nesting, same `{{`/`}}` escapes. Only what the
         // parser BUILDS from it differs.
         let is_f = prefix.contains('f') || is_t;
+        // Where the literal starts — prefix included — which is what an
+        // unterminated one is reported against.
+        let (start_line, start_col) = (self.line, self.tok_start - self.line_start);
         let quote = self.bump().unwrap();
         let triple = self.peek() == Some(quote) && self.peek2() == Some(quote);
         if triple {
             self.bump();
             self.bump();
         }
+        // `_PyTokenizer_syntaxerror`'s wording, naming the kind of literal and
+        // the line the tokenizer had reached.
+        let unterminated = |lx: &Self| {
+            let kind = match (triple, is_t, is_f) {
+                (true, true, _) => "triple-quoted t-string",
+                (true, false, true) => "triple-quoted f-string",
+                (true, false, false) => "triple-quoted string",
+                (false, true, _) => "t-string",
+                (false, false, true) => "f-string",
+                (false, false, false) => "string",
+            };
+            // A final newline ends the last line rather than starting another,
+            // so input that runs out there was detected on the line before.
+            let detected = if lx.pos >= lx.src.len() && lx.src.last() == Some(&'\n') {
+                lx.line - 1
+            } else {
+                lx.line
+            };
+            lx.tok_err(
+                &format!("SyntaxError: unterminated {kind} literal (detected at line {detected})"),
+                start_line,
+                start_col,
+                start_col as i64 + 1,
+            )
+        };
         let mut raw = String::new();
         // For an f-string, a quote inside a `{…}` replacement field does not end
         // the literal (PEP 701 nested strings), so track replacement-field depth.
@@ -419,12 +515,7 @@ impl Lexer {
                 }
             }
             match self.peek() {
-                None => {
-                    return Err(format!(
-                        "SyntaxError: unterminated string (line {})",
-                        self.line
-                    ))
-                }
+                None => return Err(unterminated(self)),
                 Some(c) if c == quote => {
                     if triple {
                         if self.peek2() == Some(quote)
@@ -478,12 +569,7 @@ impl Lexer {
                         brace_depth -= 1;
                     }
                 }
-                Some('\n') if !triple => {
-                    return Err(format!(
-                        "SyntaxError: EOL while scanning string literal (line {})",
-                        self.line
-                    ));
-                }
+                Some('\n') if !triple => return Err(unterminated(self)),
                 Some(c) => {
                     raw.push(c);
                     self.bump();
@@ -527,7 +613,17 @@ impl Lexer {
                         8 => "octal",
                         _ => "binary",
                     };
-                    let bad = |line| format!("SyntaxError: invalid {kind} literal (line {line})");
+                    // Reported at the character at `at` (a char index), as the
+                    // tokenizer's `verify_end_of_number` does.
+                    let bad = |lx: &Self, at: usize| {
+                        let col = at - lx.line_start;
+                        lx.tok_err(
+                            &format!("SyntaxError: invalid {kind} literal"),
+                            lx.line,
+                            col,
+                            col as i64 + 1,
+                        )
+                    };
                     let mut digits = String::new();
                     while let Some(c) = self.peek() {
                         if c == '_' {
@@ -535,17 +631,26 @@ impl Lexer {
                             // the prefix (`0x_f`): never last, never doubled.
                             match self.src.get(self.pos + 1) {
                                 Some(n) if n.is_digit(radix) => self.pos += 1,
-                                _ => return Err(bad(self.line)),
+                                _ => return Err(bad(self, self.pos)),
                             }
                         } else if c.is_digit(radix) {
                             digits.push(c);
                             self.pos += 1;
+                        } else if c.is_ascii_digit() {
+                            // `0b2`, `0o8`: a decimal digit the radix lacks.
+                            let col = self.pos - self.line_start;
+                            return Err(self.tok_err(
+                                &format!("SyntaxError: invalid digit '{c}' in {kind} literal"),
+                                self.line,
+                                col,
+                                col as i64 + 1,
+                            ));
                         } else {
                             break;
                         }
                     }
                     if digits.is_empty() {
-                        return Err(bad(self.line));
+                        return Err(bad(self, self.pos - 1));
                     }
                     match i64::from_str_radix(&digits, radix) {
                         Ok(n) => self.push(Tok::Int(n)),
@@ -577,9 +682,12 @@ impl Lexer {
                     let before_digit =
                         matches!(self.src.get(self.pos + 1), Some(n) if n.is_ascii_digit());
                     if !(after_digit && before_digit) {
-                        return Err(format!(
-                            "SyntaxError: invalid decimal literal (line {})",
-                            self.line
+                        let col = self.pos - self.line_start;
+                        return Err(self.tok_err(
+                            "SyntaxError: invalid decimal literal",
+                            self.line,
+                            col,
+                            col as i64 + 1,
                         ));
                     }
                     self.pos += 1;
@@ -624,6 +732,19 @@ impl Lexer {
                 .map_err(|_| format!("SyntaxError: bad float (line {})", self.line))?;
             self.push(Tok::Float(v));
         } else {
+            // `0777`: a decimal integer may not have leading zeros unless it is
+            // all zeros. Underlined from the literal's start through the zeros.
+            if s.len() > 1 && s.starts_with('0') && s.trim_start_matches('0').len() > 0 {
+                let start = self.tok_start - self.line_start;
+                let zeros = s.len() - s.trim_start_matches('0').len();
+                return Err(self.tok_err(
+                    "SyntaxError: leading zeros in decimal integer literals are not permitted; \
+                     use an 0o prefix for octal integers",
+                    self.line,
+                    start,
+                    (start + zeros) as i64 + 1,
+                ));
+            }
             // A decimal literal is converted like `int(str)` and is bounded by
             // the same `sys.get_int_max_str_digits()` (hex/octal/binary are not).
             let limit = crate::host::int_max_str_digits();
@@ -669,6 +790,8 @@ impl Lexer {
         match c {
             '(' | '[' | '{' => {
                 self.depth += 1;
+                self.open
+                    .push((c, self.line, (self.pos - 1 - self.line_start) as u32));
                 // CPython's tokenizer holds the open brackets in a fixed
                 // `tok->parenstack[MAXLEVEL]` with `MAXLEVEL == 200`
                 // (`Parser/lexer/state.h`), and `tok_get_normal_mode` refuses the
@@ -683,7 +806,42 @@ impl Lexer {
                     return Err("SyntaxError: too many nested parentheses".to_string());
                 }
             }
-            ')' | ']' | '}' => self.depth = (self.depth - 1).max(0),
+            ')' | ']' | '}' => {
+                let col = self.pos - 1 - self.line_start;
+                let opener = match c {
+                    ')' => '(',
+                    ']' => '[',
+                    _ => '{',
+                };
+                match self.open.pop() {
+                    None => {
+                        return Err(self.tok_err(
+                            &format!("SyntaxError: unmatched '{c}'"),
+                            self.line,
+                            col,
+                            col as i64 + 1,
+                        ))
+                    }
+                    Some((o, line, _)) if o != opener => {
+                        let at = if line == self.line {
+                            String::new()
+                        } else {
+                            format!(" on line {line}")
+                        };
+                        return Err(self.tok_err(
+                            &format!(
+                                "SyntaxError: closing parenthesis '{c}' does not match \
+                                 opening parenthesis '{o}'{at}"
+                            ),
+                            self.line,
+                            col,
+                            col as i64 + 1,
+                        ));
+                    }
+                    Some(_) => {}
+                }
+                self.depth = (self.depth - 1).max(0)
+            }
             _ => {}
         }
         if "+-*/%@&|^~<>=(){}[]:,.;".contains(c) {
