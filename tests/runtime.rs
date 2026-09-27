@@ -1088,3 +1088,37 @@ ValueError: invalid literal for int() with base 10: "ab'cab'cab'cab'cab'cab'cab'
 "##
     );
 }
+
+/// Setting an attribute on an instance of a builtin type, which has no
+/// `__dict__` (`PyObject_GenericSetAttr`): a method is read-only, a data
+/// attribute like `int.real` is not writable, and a new name has nowhere to
+/// go — all `AttributeError`, where pythonrs raised `TypeError: … attribute
+/// assignment unsupported`. A bare `object()` has no `__dict__` either, and
+/// used to accept the assignment. Expected values are CPython 3.14.7's.
+#[test]
+fn builtin_instances_refuse_attribute_assignment_as_cpython_does() {
+    let src = r#"
+out = []
+cases = [([1], "b"), (1, "b"), (1, "real"), ([], "append"), ("s", "upper"),
+         (object(), "x"), (len, "x"), ((1,), "x"), (1.5, "imag")]
+for obj, name in cases:
+    try:
+        setattr(obj, name, 1)
+    except AttributeError as e:
+        out.append(str(e))
+has_dict = hasattr(object(), "__dict__")
+"#;
+    assert_eq!(
+        g(src, "out"),
+        "[\"'list' object has no attribute 'b' and no __dict__ for setting new attributes\", \
+         \"'int' object has no attribute 'b' and no __dict__ for setting new attributes\", \
+         \"attribute 'real' of 'int' objects is not writable\", \
+         \"'list' object attribute 'append' is read-only\", \
+         \"'str' object attribute 'upper' is read-only\", \
+         \"'object' object has no attribute 'x' and no __dict__ for setting new attributes\", \
+         \"'builtin_function_or_method' object has no attribute 'x' and no __dict__ for setting new attributes\", \
+         \"'tuple' object has no attribute 'x' and no __dict__ for setting new attributes\", \
+         \"attribute 'imag' of 'float' objects is not writable\"]"
+    );
+    assert_eq!(g(src, "has_dict"), "False");
+}

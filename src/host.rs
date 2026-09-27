@@ -10713,8 +10713,9 @@ impl PyHost {
                     return Ok(self.alloc(PyObj::Class(class)));
                 }
                 if name == "__dict__" {
-                    // A fully-slotted instance has no `__dict__`.
-                    if self.slots_of(&class).is_some() {
+                    // A fully-slotted instance has no `__dict__`, and neither has a
+                    // bare `object()`.
+                    if class == "object" || self.slots_of(&class).is_some() {
                         return Err(format!(
                             "AttributeError: '{class}' object has no attribute '__dict__'"
                         ));
@@ -12496,6 +12497,13 @@ impl PyHost {
         // not declared in its slots.
         if let Some(PyObj::Instance(inst)) = self.get(recv) {
             let class = inst.class.clone();
+            // A bare `object()` has no `__dict__` at all: it takes no attribute.
+            if class == "object" {
+                return Err(format!(
+                    "AttributeError: 'object' object has no attribute '{name}' and no \
+                     __dict__ for setting new attributes"
+                ));
+            }
             if let Some(slots) = self.slots_of(&class) {
                 if !slots.contains(name) {
                     return Err(format!(
@@ -12587,10 +12595,30 @@ impl PyHost {
                 }
                 Ok(())
             }
-            _ => Err(type_error(&format!(
-                "'{}' object attribute assignment unsupported",
-                self.type_name(recv)
-            ))),
+            _ => Err(self.builtin_setattr_error(recv, name)),
+        }
+    }
+
+    /// Why `recv.name = …` fails on an instance of a builtin type, which has
+    /// no `__dict__` (`PyObject_GenericSetAttr`): a method is `read-only`, a
+    /// data attribute such as `int.real` is `not writable`, and any other name
+    /// has nowhere to go.
+    fn builtin_setattr_error(&mut self, recv: &Value, name: &str) -> String {
+        let t = self.type_name(recv);
+        match self.get_attr(recv, name) {
+            Ok(v)
+                if matches!(
+                    self.get(&v),
+                    Some(PyObj::Builtin(_) | PyObj::BoundMethod { .. } | PyObj::Func(_))
+                ) =>
+            {
+                format!("AttributeError: '{t}' object attribute '{name}' is read-only")
+            }
+            Ok(_) => format!("AttributeError: attribute '{name}' of '{t}' objects is not writable"),
+            Err(_) => format!(
+                "AttributeError: '{t}' object has no attribute '{name}' and no __dict__ for \
+                 setting new attributes"
+            ),
         }
     }
 
