@@ -375,10 +375,11 @@ impl Table {
             // The body is a block of its own, and one that can hold no
             // declaration; only the defaults are evaluated here.
             Expr::Lambda { params, .. } => self.defaults(params, b)?,
-            Expr::ListComp(elt, comps) | Expr::SetComp(elt, comps) | Expr::GenExp(elt, comps) => {
-                self.comprehension(&[elt], comps, b)?;
+            Expr::ListComp(..) | Expr::SetComp(..) | Expr::GenExp(..) | Expr::DictComp(..) => {
+                let (elts, comps) = comprehension_parts(e.unspanned());
+                self.comprehension(&elts, comps, b)?;
+                no_yield_in_comprehension(e.unspanned())?;
             }
-            Expr::DictComp(k, v, comps) => self.comprehension(&[k, v], comps, b)?,
             Expr::List(xs) | Expr::Tuple(xs) | Expr::Set(xs) | Expr::BoolOp(_, xs) => {
                 for x in xs {
                     self.expr(x, b)?;
@@ -474,6 +475,67 @@ impl Table {
             b.add(&t, LOCAL);
         }
         Ok(())
+    }
+}
+
+/// The value expressions and the clauses of a comprehension.
+fn comprehension_parts(e: &Expr) -> (Vec<&Expr>, &[Comprehension]) {
+    match e {
+        Expr::ListComp(elt, comps) | Expr::SetComp(elt, comps) | Expr::GenExp(elt, comps) => {
+            (vec![&**elt], comps)
+        }
+        Expr::DictComp(k, v, comps) => (vec![&**k, &**v], comps),
+        _ => (Vec::new(), &[]),
+    }
+}
+
+/// A comprehension's body is a function block of its own, and not one that
+/// may suspend: a `yield` there is `symtable_raise_if_comprehension_block`'s
+/// error, named for the innermost comprehension holding it. Its first iterable
+/// belongs to the enclosing block and is checked there; a `lambda` is a block
+/// of its own.
+fn no_yield_in_comprehension(comp: &Expr) -> Result<(), String> {
+    let kind = match comp {
+        Expr::ListComp(..) => "list comprehension",
+        Expr::SetComp(..) => "set comprehension",
+        Expr::DictComp(..) => "dict comprehension",
+        _ => "generator expression",
+    };
+    let (elts, comps) = comprehension_parts(comp);
+    let mut parts: Vec<&Expr> = elts;
+    for (i, c) in comps.iter().enumerate() {
+        if i > 0 {
+            parts.push(&c.iter);
+        }
+        parts.push(&c.target);
+        parts.extend(c.ifs.iter());
+    }
+    parts.into_iter().try_for_each(|p| yield_in(p, kind))
+}
+
+fn yield_in(e: &Expr, kind: &str) -> Result<(), String> {
+    match e.unspanned() {
+        Expr::Yield(_) | Expr::YieldFrom(_) => {
+            let msg = format!("SyntaxError: 'yield' inside {kind}");
+            let sp = e.span();
+            if !sp.is_some() {
+                return Err(msg);
+            }
+            Err(symtable_error(&msg, (sp.line, sp.start + 1, sp.line, sp.end + 1)))
+        }
+        Expr::Lambda { .. } => Ok(()),
+        inner @ (Expr::ListComp(..) | Expr::SetComp(..) | Expr::GenExp(..) | Expr::DictComp(..)) => {
+            // The nested comprehension's first iterable is evaluated in THIS
+            // one; the rest is its own block.
+            let (_, comps) = comprehension_parts(inner);
+            if let Some(first) = comps.first() {
+                yield_in(&first.iter, kind)?;
+            }
+            no_yield_in_comprehension(inner)
+        }
+        other => crate::compiler::expr_children(other)
+            .into_iter()
+            .try_for_each(|c| yield_in(c, kind)),
     }
 }
 

@@ -534,3 +534,55 @@ print(f())
 "#
     );
 }
+
+/// A `yield` or `await` where it cannot run, positioned at the expression: the
+/// compiler's `'yield' outside function` (a position tuple with no text), the
+/// symbol table's `'await' outside (async) function` and `'yield' inside
+/// <comprehension>` (`args == (msg,)`). A comprehension's first iterable and a
+/// `lambda` body are not the comprehension's block.
+#[test]
+fn misplaced_yield_and_await_are_positioned() {
+    let out = Command::new(env!("CARGO_BIN_EXE_python"))
+        .args([
+            "-c",
+            r#"cases = [
+    "x = 1\nyield 3",
+    "(yield)",
+    "class C:\n    yield 1",
+    "x = yield from y",
+    "await f()",
+    "def f():\n    await g()",
+    "x = [(yield z) for q in r]",
+    "def f():\n    return {k: (yield from v) for k in r}",
+    "def f():\n    return ((yield) for q in r)",
+    "def f():\n    return [x for c in d if (yield)]",
+    "def f():\n    return [x for x in (yield)]",
+    "def f():\n    return [lambda: (yield) for c in d]",
+]
+for s in cases:
+    try:
+        exec(s)
+        print(repr(s), "ok")
+    except SyntaxError as e:
+        print(repr(s), e.args, e.lineno, e.offset, e.end_lineno, e.end_offset)
+"#,
+        ])
+        .output()
+        .expect("spawn python");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        r#"'x = 1\nyield 3' ("'yield' outside function", ('<string>', 2, 1, None, 2, 8)) 2 1 2 8
+'(yield)' ("'yield' outside function", ('<string>', 1, 2, None, 1, 7)) 1 2 1 7
+'class C:\n    yield 1' ("'yield' outside function", ('<string>', 2, 5, None, 2, 12)) 2 5 2 12
+'x = yield from y' ("'yield from' outside function", ('<string>', 1, 5, None, 1, 17)) 1 5 1 17
+'await f()' ("'await' outside function",) 1 1 1 10
+'def f():\n    await g()' ("'await' outside async function",) 2 5 2 14
+'x = [(yield z) for q in r]' ("'yield' inside list comprehension",) 1 7 1 14
+'def f():\n    return {k: (yield from v) for k in r}' ("'yield' inside dict comprehension",) 2 17 2 29
+'def f():\n    return ((yield) for q in r)' ("'yield' inside generator expression",) 2 14 2 19
+'def f():\n    return [x for c in d if (yield)]' ("'yield' inside list comprehension",) 2 30 2 35
+'def f():\n    return [x for x in (yield)]' ok
+'def f():\n    return [lambda: (yield) for c in d]' ok
+"#
+    );
+}

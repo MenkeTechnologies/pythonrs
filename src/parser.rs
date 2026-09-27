@@ -537,6 +537,19 @@ impl Parser {
         (a.line, a.col + 1, b.line, end + 1)
     }
 
+    /// Wrap a `yield` / `yield from` / `await` that starts at token `start`
+    /// and ends at the last token read in its source span, which is where the
+    /// compiler and the symbol table report one in the wrong place. A span
+    /// records one line, so an expression continued onto another line stays
+    /// unwrapped (and its error unpositioned).
+    fn span_suspension(&self, e: Expr, start: usize) -> Expr {
+        let (first, last) = (&self.toks[start], &self.toks[self.pos.saturating_sub(1)]);
+        if first.line != last.line {
+            return e;
+        }
+        spanned(e, first.line, first.col, last.end_col, 0, 0)
+    }
+
     /// A simple statement must end the logical line or be followed by `;`.
     /// Anything else after it — `a b`, `x = 1 2` — is where CPython's parser
     /// gives up, except that a bare `print` followed by an expression is the
@@ -2487,11 +2500,12 @@ impl Parser {
 
     fn parse_await_postfix(&mut self) -> Result<Expr, String> {
         let saved = self.depth;
+        let start = self.pos;
         if self.eat_kw("await") {
             self.enter()?;
             let e = self.parse_await_postfix()?;
             self.depth = saved;
-            return Ok(Expr::Await(Box::new(e)));
+            return Ok(self.span_suspension(Expr::Await(Box::new(e)), start));
         }
         // Span of the whole postfix chain starts at the value's first token; each
         // trailer wraps its result so a call/subscript/attribute that raises
@@ -2687,18 +2701,20 @@ impl Parser {
                         self.parse_lambda()
                     }
                     "yield" => {
-                        if self.eat_kw("from") {
-                            Ok(Expr::YieldFrom(Box::new(self.parse_expr()?)))
+                        let start = self.pos - 1;
+                        let e = if self.eat_kw("from") {
+                            Expr::YieldFrom(Box::new(self.parse_expr()?))
                         } else if self.at_newline()
                             || self.at_op(")")
                             || self.at_op("=")
                             || self.at_op(";")
                             || matches!(self.cur(), Tok::Eof)
                         {
-                            Ok(Expr::Yield(None))
+                            Expr::Yield(None)
                         } else {
-                            Ok(Expr::Yield(Some(Box::new(self.parse_exprlist()?))))
-                        }
+                            Expr::Yield(Some(Box::new(self.parse_exprlist()?)))
+                        };
+                        Ok(self.span_suspension(e, start))
                     }
                     // A reserved word where an atom was expected — a dangling
                     // `except:` / `else:` at statement level, `x = while`, or

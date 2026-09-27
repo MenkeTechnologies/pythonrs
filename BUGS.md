@@ -1183,13 +1183,16 @@ written.
   ```
   f(**x, *y)       same message, no position here
   '\N{bogus}'      same message, no position here
-  yield 1          same message, no position here ('yield' outside function)
   for 1 in x: …    cannot assign to this expression, where CPython names it
   ```
 
-  The compiler's own errors (`yield`/`await` outside a function,
-  pattern-matching errors, an invalid `for`/`with`/comprehension target) carry
-  no position: the compiler sees no columns. Assignment, augmented-assignment
+  The compiler's own errors (pattern-matching errors, an invalid
+  `for`/`with`/comprehension target) carry no position: the compiler sees no
+  columns. A misplaced `yield`/`yield from`/`await` is positioned — the parser
+  records its span — unless it continues onto another line, which a span
+  cannot hold; `'yield' inside list comprehension` (and the set, dict and
+  generator forms) is raised as the symbol table raises it, where pythonrs
+  used to run the program. Assignment, augmented-assignment
   and `del` targets, `return`/`break`/`continue` in the wrong place, duplicate
   parameters and a module-level `nonlocal` are positioned, because the parser
   checks them; so are the symbol-table errors on a `global`/`nonlocal`

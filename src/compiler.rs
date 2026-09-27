@@ -183,6 +183,9 @@ pub struct Compiler {
     /// index so an uncaught exception can underline the exact sub-expression
     /// (CPython 3.11+ traceback carets). `Span::NONE` for synthetic nodes.
     node_span: Span,
+    /// The source span of the `yield`/`yield from`/`await` being lowered, from
+    /// its `Expr::Spanned` wrapper; `Span::NONE` when it has none.
+    suspend_span: Span,
     /// Set before lowering the direct call value of an `x = f(...)` / `return
     /// f(...)` statement; consumed by the outermost `Spanned` peel to mark that
     /// call's span `suppress` (CPython omits the caret when such a call raises).
@@ -2072,6 +2075,28 @@ impl Compiler {
         self.build_function_ex(name, params, body, false, ScopeKind::Function)
     }
 
+    /// A `yield`/`await` in a scope that cannot hold it, positioned at the
+    /// expression when the parser spanned it (`sp`, else `Span::NONE`). The
+    /// compiler raises the `yield` forms (`args` carry a position tuple with no
+    /// text); the symbol table raises the `await` forms (`symtable`: `args ==
+    /// (msg,)`).
+    fn misplaced(msg: &str, symtable: bool, sp: Span) -> String {
+        let msg = format!("SyntaxError: {msg}");
+        if !sp.is_some() {
+            return msg;
+        }
+        let pos = (sp.line, sp.start + 1, sp.line, sp.end + 1);
+        if symtable {
+            return crate::symtable::symtable_error(&msg, pos);
+        }
+        let (l, c, el, ec) = pos;
+        format!(
+            "{}{}nosrc=1",
+            crate::parser::at_pos(&msg, l, c as i64, el, ec as i64),
+            crate::parser::SYNTAX_FIELD
+        )
+    }
+
     /// Validate a `nonlocal name` declaration at compile time, mirroring CPython:
     /// if no enclosing function scope binds `name` it is `no binding for
     /// nonlocal`. A `nonlocal` at module level never gets here — the parser
@@ -2578,6 +2603,18 @@ impl Compiler {
         // node's span. The suppress hint (assign/return direct call value) is
         // consumed by the outermost peel only.
         if let Expr::Spanned(inner, sp) = e {
+            // A `yield`/`await` span locates a misplaced one (see
+            // `misplaced`); it is not a raising op's caret, so the ops it
+            // emits keep the enclosing span.
+            if matches!(
+                inner.unspanned(),
+                Expr::Yield(_) | Expr::YieldFrom(_) | Expr::Await(_)
+            ) {
+                // Read (and cleared) by the `yield`/`await` arm itself, so an
+                // unspanned one nested in its operand never inherits it.
+                self.suspend_span = *sp;
+                return self.compile_expr(b, inner);
+            }
             let mut sp = *sp;
             if std::mem::take(&mut self.suppress_hint)
                 && matches!(inner.unspanned(), Expr::Call { .. })
@@ -2829,12 +2866,13 @@ impl Compiler {
                 self.compile_assign(b, target)?;
             }
             Expr::Yield(val) => {
+                let sp = std::mem::take(&mut self.suspend_span);
                 // Outside any `def`/`lambda`, `yield` is a compile-time
                 // SyntaxError in CPython. pythonrs used to lower it and let the
                 // VM raise `TypeError: 'yield' outside a generator` at run time,
                 // so the program's own output could precede the failure.
                 if self.def_depth == 0 {
-                    return Err("SyntaxError: 'yield' outside function".to_string());
+                    return Err(Self::misplaced("'yield' outside function", false, sp));
                 }
                 match val {
                     Some(e) => self.compile_expr(b, e)?,
@@ -2847,14 +2885,16 @@ impl Compiler {
                 b.emit(Op::CallBuiltin(ops::YIELDV, 1), 0);
             }
             Expr::YieldFrom(inner) => {
+                let sp = std::mem::take(&mut self.suspend_span);
                 if self.def_depth == 0 {
-                    return Err("SyntaxError: 'yield from' outside function".to_string());
+                    return Err(Self::misplaced("'yield from' outside function", false, sp));
                 }
                 // `yield from E` — iterate E, yielding each item. The delegating
                 // expression value (the sub-generator's return) is None here.
                 self.compile_yield_from(b, inner)?;
             }
             Expr::Await(inner) => {
+                let sp = std::mem::take(&mut self.suspend_span);
                 // Outside an `async def`, `await` is a compile-time SyntaxError in
                 // CPython — the module-level form used to lower and fail at run
                 // time with `TypeError: object int can't be used in 'await'
@@ -2872,10 +2912,10 @@ impl Compiler {
                         )
                     }
                     AwaitScope::Module => {
-                        return Err("SyntaxError: 'await' outside function".to_string())
+                        return Err(Self::misplaced("'await' outside function", true, sp))
                     }
                     AwaitScope::Sync => {
-                        return Err("SyntaxError: 'await' outside async function".to_string())
+                        return Err(Self::misplaced("'await' outside async function", true, sp))
                     }
                 }
                 // `await E` — evaluate the awaitable, then drive it: the AWAIT op
