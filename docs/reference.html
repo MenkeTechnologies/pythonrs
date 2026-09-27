@@ -185,7 +185,7 @@ except ZeroDivisionError:
         </article>
         <article class="doc-entry" id="doc-keyword-20">
           <h3><a class="doc-anchor" href="#doc-keyword-20">#</a> <code>except</code></h3>
-          <p>handle a raised exception, optionally by class and `as` name</p>
+          <p>handle a raised exception, optionally by class (or several: `except A, B:`, parenthesized with `as`) and `as` name</p>
           <pre><code class="lang-python">try: raise ValueError("e")
 except ValueError as e: str(e)   # =&gt; 'e'</code></pre>
         </article>

@@ -151,7 +151,7 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
     (
         "except",
         "Keyword",
-        "handle a raised exception, optionally by class and `as` name",
+        "handle a raised exception, optionally by class (or several: `except A, B:`, parenthesized with `as`) and `as` name",
         "try: raise ValueError(\"e\")\nexcept ValueError as e: str(e)   # => 'e'",
     ),
     (
