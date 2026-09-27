@@ -456,6 +456,24 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
         "callable(len)   # => True",
     ),
     (
+        "eval",
+        "Builtin",
+        "evaluate one expression (a string or an `eval`-mode code object) and return its value",
+        "eval('6 * 7')   # => 42",
+    ),
+    (
+        "exec",
+        "Builtin",
+        "run statements (a string or a code object) in the current or given namespace; returns None",
+        "ns = {}; exec('x = 2', ns); ns['x']   # => 2",
+    ),
+    (
+        "compile",
+        "Builtin",
+        "check source in 'exec'/'eval'/'single' mode and return a code object that exec/eval run under the given filename; a syntax error is raised here",
+        "eval(compile('1 + 2', '<calc>', 'eval'))   # => 3",
+    ),
+    (
         "hasattr",
         "Builtin",
         "True if the object has the named attribute",

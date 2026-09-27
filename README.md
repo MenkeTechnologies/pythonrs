@@ -191,7 +191,11 @@ by stackful `corosensei` coroutines), `match`/`case` structural pattern matching
 own-scope comprehensions (list/dict/set) and proper `nonlocal`, f-strings,
 exceptions, and full call-site and literal `*` / `**` unpacking. The `PyHost`
 heap implements the `str` / `list` / `dict` / `tuple` / `set` / instance object
-model with the operator, attribute, item, and iteration protocols. See
+model with the operator, attribute, item, and iteration protocols. A program
+that does not compile is reported the way CPython reports it — the
+`File "…", line N` header, the source line and a caret run, then CPython's
+message — and a `SyntaxError` carries its `lineno`/`offset`/`end_offset`/`text`
+/`filename`; `compile()`, `exec` and `eval` share that path. See
 [\[0x07\]](#0x07-status--roadmap) and [BUGS.md](BUGS.md) for the honest list of
 what is not yet implemented.
 
