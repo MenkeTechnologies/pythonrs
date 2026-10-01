@@ -9,6 +9,32 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **`itertools.groupby` is lazy.** It drained its input and built every group
+  as a list up front, so it never returned on an infinite iterator
+  (`groupby(count(), key=…)`), each group was a `list` instead of an
+  `itertools._grouper`, and advancing the groupby did not empty the group
+  handed out before. It is now a port of `itertoolsmodule.c`'s
+  `groupby`/`_grouper`: the groupers share the input, a grouper is exhausted
+  once its groupby moves on, and keys compare through a user `__eq__`.
+- **A metaclass `__repr__`/`__str__` renders the class.** `repr(cls)`,
+  `str(cls)`, `print(cls)`, f-strings, `%`-formatting and containers printed
+  `<class '__main__.C'>` whatever the metaclass defined.
+- **Builtin argument checks CPython makes.** `print(…, end=None)` printed a
+  literal `None` (and `sep=`/`end=` accepted any type); `bytes('x')` and
+  `bytearray('x')` encoded as UTF-8 instead of raising `string argument without
+  an encoding`, and `bytes('x', errors=…)` took the handler for the encoding;
+  `isinstance(1, 2)`, `issubclass(int, 2)` and `issubclass(1, int)` answered
+  `False`; `reversed()` of a set, a generator or a number drained or misnamed
+  it; `map(f)` with no iterable built an empty map; `'x'.split(None, 'a')`,
+  `'x'.center('a')`, `.zfill(None)` and a non-int `replace` count fell back to
+  a default; and the `%c`, `in <string>` and `split(1)` messages differed. All
+  raise CPython's `TypeError` now.
+- **`isinstance` against `collections` and bridged builtin types.**
+  `isinstance(od, collections.OrderedDict)` (and `defaultdict`, `deque`,
+  `Counter`) was `False`; a native function or generator was not an instance
+  of `types.FunctionType` / `types.GeneratorType` (served by CPython, where the
+  native value is a proxy); and `issubclass` of a bridged class such as a
+  `collections.namedtuple` raised `arg 1 must be a class`.
 - **A `yield` anywhere in a function makes it a generator.** Only a
   statement-level `yield` (`yield x`, `y = yield x`, `return (yield)`) was
   seen, so a function whose `yield` sat inside an expression —
@@ -1258,6 +1284,15 @@ written.
 
 ## Partial / simplified semantics
 
+- **Open from a parity probe against CPython 3.14.8.** Measured, not fixed:
+  `format(EnumClass)` / `f'{EnumClass}'` raises `Enum.__format__() missing 1
+  required positional argument` (the member `__format__` is called on the
+  class); `ABC.register(C)` does not make `isinstance(C(), ABC)` true;
+  `inspect.isgeneratorfunction(f)` raises `cannot pass 'code' to a CPython
+  stdlib call`; an `AttributeError` from `obj.missing()` carets the call
+  (`~~~~~~~~~^^`) where CPython carets the attribute (`^^^^^^^^^`), and the
+  arguments are evaluated before the failed lookup; a nested unpacking target
+  (`a, (b, c) = 1, (2,)`) carets the outer target, CPython the inner one.
 - **Identifiers are not NFKC-normalized.** CPython folds every identifier to
   NFKC, so `ﬁ = 3` binds `fi`; pythonrs keeps the spelling as written, so the
   ligature and the plain letters are two different names.

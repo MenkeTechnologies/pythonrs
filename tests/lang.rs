@@ -8831,3 +8831,136 @@ except ValueError as e: print('VE', e)
         "1\n6\nstop\nret 42\ntruthy\nx 7\n{'k': 'v'}\n5\nr\nVE payload\n"
     );
 }
+
+/// `itertools.groupby` is lazy, as `itertoolsmodule.c` is: each group is an
+/// `itertools._grouper` over the shared input, advancing the groupby empties
+/// the previous grouper, it works over an infinite iterator, and keys compare
+/// through a user `__eq__`. It used to materialize every group into a list up
+/// front.
+#[test]
+fn groupby_is_lazy_and_invalidates_its_groupers() {
+    let src = r##"
+import itertools
+print([(k, list(g)) for k, g in itertools.groupby('aabbbcaa')])
+g = itertools.groupby('aab')
+k, it = next(g)
+print(k, type(it).__name__, type(g).__name__)
+print(next(g)[0], list(it))
+print([list(x) for _, x in list(itertools.groupby('aabb'))])
+cnt = itertools.groupby(itertools.count(), key=lambda x: x // 3)
+for _ in range(2):
+    k, grp = next(cnt)
+    print(k, list(grp))
+class K:
+    def __init__(s, v): s.v = v
+    def __eq__(s, o): return s.v % 2 == o.v % 2
+print([len(list(g)) for _, g in itertools.groupby([K(1), K(3), K(2), K(4), K(5)])])
+"##;
+    let (result, out) = pythonrs::eval_str_captured(src, &[]);
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        out,
+        r##"[('a', ['a', 'a']), ('b', ['b', 'b', 'b']), ('c', ['c']), ('a', ['a', 'a'])]
+a _grouper groupby
+b []
+[[], []]
+0 [0, 1, 2]
+1 [3, 4, 5]
+[2, 2, 1]
+"##
+    );
+}
+
+/// A metaclass `__repr__`/`__str__` renders the class in `repr`, `str`,
+/// `print`, f-strings, `%`-formatting and containers (`type(cls).__repr__(cls)`).
+#[test]
+fn metaclass_repr_and_str_render_the_class() {
+    let src = r##"
+class Meta(type):
+    def __str__(cls): return 'S-' + cls.__name__
+class A(metaclass=Meta): pass
+print(A, repr(A), [A], f'{A}', '%s' % A, str(A))
+class M2(type):
+    def __repr__(cls): return 'R-' + cls.__name__
+class B(metaclass=M2): pass
+print(B, f'{B!r}', '%r' % B, format(B), [B])
+"##;
+    let (result, out) = pythonrs::eval_str_captured(src, &[]);
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        out,
+        r##"S-A <class '__main__.A'> [<class '__main__.A'>] S-A S-A S-A
+R-B R-B R-B R-B [R-B]
+"##
+    );
+}
+
+/// Argument checks CPython makes and pythonrs skipped: `%c`, `in <string>`,
+/// `reversed` of a non-sequence, `map` arity, `bytes`/`bytearray` encoding
+/// pairing, `isinstance`/`issubclass` class arguments, `print` `sep`/`end`
+/// types (`end=None` printed `None`), and integer-only `maxsplit`/width/count.
+#[test]
+fn builtin_argument_checks_match_cpython() {
+    let src = r##"
+def t(f):
+    try: print(f())
+    except Exception as e: print(type(e).__name__ + ":", e)
+t(lambda: "%c" % 1.5)
+t(lambda: "%c" % "ab")
+t(lambda: 1.5 in "a")
+t(lambda: reversed(5))
+t(lambda: reversed({1}))
+t(lambda: reversed(x for x in []))
+t(lambda: map(None))
+t(lambda: bytes("x"))
+t(lambda: bytes("x", errors="strict"))
+t(lambda: bytearray("x"))
+t(lambda: bytes(1, "utf-8"))
+t(lambda: bytes(b"ab", errors="strict"))
+t(lambda: isinstance(1, 2))
+t(lambda: isinstance(1, (int, 2)))
+t(lambda: isinstance(1, (2, int)))
+t(lambda: issubclass(int, 2))
+t(lambda: issubclass(1, int))
+t(lambda: print(end=5))
+t(lambda: print(sep=5))
+t(lambda: print("a", "b", sep=None, end=None))
+t(lambda: "x".split(None, "a"))
+t(lambda: "x".split(1))
+t(lambda: "x".center("a"))
+t(lambda: "x".replace("x", "y", "1"))
+t(lambda: "x".zfill(None))
+"##;
+    let (result, out) = pythonrs::eval_str_captured(src, &[]);
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        out,
+        r##"TypeError: %c requires an int or a unicode character, not float
+TypeError: %c requires an int or a unicode character, not a string of length 2
+TypeError: 'in <string>' requires string as left operand, not float
+TypeError: 'int' object is not reversible
+TypeError: 'set' object is not reversible
+TypeError: 'generator' object is not reversible
+TypeError: map() must have at least two arguments.
+TypeError: string argument without an encoding
+TypeError: string argument without an encoding
+TypeError: string argument without an encoding
+TypeError: encoding without a string argument
+TypeError: errors without a string argument
+TypeError: isinstance() arg 2 must be a type, a tuple of types, or a union
+True
+TypeError: isinstance() arg 2 must be a type, a tuple of types, or a union
+TypeError: issubclass() arg 2 must be a class, a tuple of classes, or a union
+TypeError: issubclass() arg 1 must be a class
+TypeError: end must be None or a string, not int
+TypeError: sep must be None or a string, not int
+a b
+None
+TypeError: 'str' object cannot be interpreted as an integer
+TypeError: must be str or None, not int
+TypeError: 'str' object cannot be interpreted as an integer
+TypeError: 'str' object cannot be interpreted as an integer
+TypeError: 'NoneType' object cannot be interpreted as an integer
+"##
+    );
+}

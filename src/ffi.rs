@@ -2524,6 +2524,37 @@ pub fn isinstance_foreign(host: &mut PyHost, v: &Value, cls_id: u32) -> Result<b
     })
 }
 
+/// `issubclass(sub, cls)` where either side is a CPython object behind a handle
+/// (a `collections.namedtuple` class, a `typing`/`abc` type): both cross the
+/// bridge and CPython's own `issubclass` decides, its `TypeError`s included.
+pub fn issubclass_values(host: &mut PyHost, sub: &Value, cls: &Value) -> Result<bool, String> {
+    Python::with_gil(|py| {
+        let a = value_to_py(host, py, sub)?;
+        let b = value_to_py(host, py, cls)?;
+        py.import("builtins")
+            .and_then(|m| m.getattr("issubclass"))
+            .and_then(|f| f.call1((a, b)))
+            .and_then(|r| r.is_truthy())
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// The `__name__` of a CPython class that lives in `builtins` (`types.FunctionType`
+/// is `builtins.function`, `types.GeneratorType` is `builtins.generator`), or
+/// `None` for any other class. Lets `isinstance(native_fn, types.FunctionType)`
+/// compare against pythonrs's own type of the same name: the native value
+/// crosses the bridge as a proxy, which CPython's check would never accept.
+pub fn foreign_builtin_type_name(cls_id: u32) -> Option<String> {
+    Python::with_gil(|py| {
+        let cls = fetch(py, cls_id).ok()?;
+        let module: String = cls.getattr("__module__").ok()?.extract().ok()?;
+        if module != "builtins" {
+            return None;
+        }
+        cls.getattr("__name__").ok()?.extract().ok()
+    })
+}
+
 /// `isinstance(foreign_v, <builtin type>)` — the mirror case: the VALUE is a
 /// CPython object behind a handle and the class is one of pythonrs's own builtin
 /// type objects, named by `type_name` (`tuple`, `dict`, `int`, …). The handle's

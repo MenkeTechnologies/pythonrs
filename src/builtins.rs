@@ -2336,7 +2336,7 @@ fn reflected_first(h: &host::PyHost, a: &Value, b: &Value, rname: &str) -> bool 
 /// user instance is involved, else native value equality. `elem` is the sequence
 /// element (forward operand), `target` the searched value, matching CPython's
 /// `RichCompareBool(item, value, Py_EQ)`.
-fn elem_equal(elem: &Value, target: &Value) -> Result<bool, String> {
+pub(crate) fn elem_equal(elem: &Value, target: &Value) -> Result<bool, String> {
     if identity_eq(elem, target) {
         return Ok(true);
     }
@@ -3056,8 +3056,9 @@ fn str_percent_format(fmt_val: &Value, args: &Value) -> Result<Value, String> {
         if premap.contains_key(id) {
             continue;
         }
-        // Only instances and containers that may hold instances need the
-        // dispatching path; everything else the host renders correctly itself.
+        // Only instances, containers that may hold instances, and classes whose
+        // metaclass renders them need the dispatching path; everything else the
+        // host renders correctly itself.
         let needs = with_host(|h| {
             matches!(
                 h.get(it),
@@ -3067,7 +3068,8 @@ fn str_percent_format(fmt_val: &Value, args: &Value) -> Result<Value, String> {
                     | Some(PyObj::Dict(_))
                     | Some(PyObj::Set(_))
                     | Some(PyObj::Frozenset(_))
-            )
+            ) || h.metaclass_method(it, "__repr__").is_some()
+                || h.metaclass_method(it, "__str__").is_some()
         });
         if !needs {
             continue;
@@ -4786,6 +4788,15 @@ pub fn py_str(v: &Value) -> Result<String, String> {
     if let Some(e) = with_host(|h| h.int_str_limit_exceeded(v)) {
         return Err(e);
     }
+    // `str(cls)` is `type(cls).__str__(cls)`; a metaclass with only `__repr__`
+    // reaches it through `type.__str__`, which is `repr`.
+    if let Some(m) = with_host(|h| h.metaclass_method(v, "__str__")) {
+        let r = host::invoke(&m, vec![v.clone()], vec![])?;
+        return Ok(with_host(|h| h.str_of(&r)));
+    }
+    if with_host(|h| h.metaclass_method(v, "__repr__").is_some()) {
+        return py_repr(v);
+    }
     if with_host(|h| matches!(h.get(v), Some(PyObj::Instance(_)))) {
         let (has_str, has_repr, is_exc) = with_host(|h| match h.get(v) {
             Some(PyObj::Instance(i)) => (
@@ -4834,6 +4845,12 @@ pub fn py_str(v: &Value) -> Result<String, String> {
 pub fn py_repr(v: &Value) -> Result<String, String> {
     if let Some(e) = with_host(|h| h.int_str_limit_exceeded(v)) {
         return Err(e);
+    }
+    // A class whose metaclass defines `__repr__` reprs through it: `repr(cls)` is
+    // `type(cls).__repr__(cls)`.
+    if let Some(m) = with_host(|h| h.metaclass_method(v, "__repr__")) {
+        let r = host::invoke(&m, vec![v.clone()], vec![])?;
+        return Ok(with_host(|h| h.str_of(&r)));
     }
     if with_host(|h| matches!(h.get(v), Some(PyObj::Instance(_)))) {
         let has_repr = with_host(|h| match h.get(v) {
@@ -5470,12 +5487,23 @@ pub fn call_builtin_function(
     reject_kwargs(name, &kwargs)?;
     match name {
         "print" => {
-            let sep = kw_get(&kwargs, "sep")
-                .map(|v| with_host(|h| h.str_of(&v)))
-                .unwrap_or_else(|| " ".into());
-            let end = kw_get(&kwargs, "end")
-                .map(|v| with_host(|h| h.str_of(&v)))
-                .unwrap_or_else(|| "\n".into());
+            // `sep`/`end` are `None` (the default) or a `str`; anything else is
+            // CPython's TypeError, where it used to be printed through `str()` —
+            // so `print(x, end=None)` wrote a literal `None`.
+            let text_kw = |name: &str, default: &str| -> Result<String, String> {
+                match kw_get(&kwargs, name) {
+                    None | Some(Value::Undef) => Ok(default.to_string()),
+                    Some(v) => with_host(|h| h.as_str(&v)).ok_or_else(|| {
+                        host::type_error(&format!(
+                            "{name} must be None or a string, not {}",
+                            with_host(|h| h.type_name(&v))
+                        ))
+                    }),
+                }
+            };
+            let sep = text_kw("sep", " ")?;
+            let end = text_kw("end", "\n")?;
+
             let mut parts = Vec::new();
             for a in &args {
                 parts.push(py_str(a)?);
@@ -5699,6 +5727,36 @@ pub fn call_builtin_function(
                     with_host(|h| h.type_name(&v))
                 )));
             }
+            // Only a sequence (or a dict / dict view) is reversible: a number, a
+            // set or an iterator has no `__reversed__` and no sequence protocol,
+            // and `reversed` refuses it up front rather than draining it.
+            let not_reversible = with_host(|h| match v {
+                Value::Undef | Value::Bool(_) | Value::Int(_) | Value::Float(_) => true,
+                Value::Obj(_) => matches!(
+                    h.get(&v),
+                    Some(
+                        PyObj::BigInt(_)
+                            | PyObj::Complex(..)
+                            | PyObj::Set(_)
+                            | PyObj::Frozenset(_)
+                            | PyObj::Generator { .. }
+                            | PyObj::Iter(_)
+                            | PyObj::Zip { .. }
+                            | PyObj::MapObj { .. }
+                            | PyObj::FilterObj { .. }
+                            | PyObj::EnumerateObj { .. }
+                            | PyObj::ItertoolsIter { .. }
+                            | PyObj::CallIter { .. }
+                    )
+                ),
+                _ => false,
+            });
+            if not_reversible {
+                return Err(host::type_error(&format!(
+                    "'{}' object is not reversible",
+                    with_host(|h| h.type_name(&v))
+                )));
+            }
             // CPython gives `list` and the three dict views their own reverse
             // iterator types; `range` reuses `range_iterator`; every other
             // sequence gets the generic `reversed` object.
@@ -5782,6 +5840,10 @@ pub fn call_builtin_function(
                 return Err(host::type_error(&format!(
                     "map() got an unexpected keyword argument '{k}'"
                 )));
+            }
+            // `map(func)` with no iterable is refused, not an empty map.
+            if args.len() < 2 {
+                return Err(host::type_error("map() must have at least two arguments."));
             }
             // Lazy `map`: `func` applied to items pulled from each iterable.
             let f = arg0(&args)?;
@@ -6594,6 +6656,23 @@ pub fn call_builtin_function(
                 &args,
                 &kwargs,
             )?;
+            // `bytes_new_impl`'s argument checks: a `str` source needs an
+            // encoding, and an encoding or `errors` needs a `str` source. Without
+            // them `bytes("x")` encoded as UTF-8 and `bytes("x", errors=…)` took
+            // the error handler for the encoding.
+            let [source, encoding, errors] = &slots;
+            let is_text = source
+                .as_ref()
+                .is_some_and(|s| with_host(|h| h.as_str(s).is_some()));
+            let misuse = match (is_text, encoding.is_some(), errors.is_some()) {
+                (true, false, _) => Some("string argument without an encoding"),
+                (false, true, _) => Some("encoding without a string argument"),
+                (false, false, true) => Some("errors without a string argument"),
+                _ => None,
+            };
+            if let Some(msg) = misuse {
+                return Err(host::type_error(msg));
+            }
             let bargs: Vec<Value> = slots.into_iter().flatten().collect();
             let b = build_bytes(&bargs)?;
             Ok(with_host(|h| {
@@ -8956,7 +9035,7 @@ fn itertools_tee(args: &[Value]) -> Result<Value, String> {
 }
 
 fn itertools_groupby(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, String> {
-    let items = host::iter_vec(&arg0(args)?)?;
+    let src = host::make_iterator(&arg0(args)?)?;
     // `groupby(iterable, key=None)` — `key` is bindable BOTH positionally and by
     // keyword, and taking only the positional form silently grouped by the raw
     // element while still reporting it as the key, so `groupby(xs, key=f)`
@@ -8965,36 +9044,19 @@ fn itertools_groupby(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value
         .get(1)
         .cloned()
         .or_else(|| kw_get(kwargs, "key"))
-        .filter(|v| !matches!(v, Value::Undef));
-    // Materialize consecutive groups as (key, list) tuples (the group is a list,
-    // which is iterable like CPython's grouper — eager, not lazily invalidated).
-    let mut out: Vec<Value> = Vec::new();
-    let mut i = 0;
-    while i < items.len() {
-        let k = match &key {
-            Some(f) => host::invoke(f, vec![items[i].clone()], vec![])?,
-            None => items[i].clone(),
-        };
-        let mut group = vec![items[i].clone()];
-        let mut j = i + 1;
-        while j < items.len() {
-            let kj = match &key {
-                Some(f) => host::invoke(f, vec![items[j].clone()], vec![])?,
-                None => items[j].clone(),
-            };
-            if with_host(|h| h.equal(&kj, &k)) {
-                group.push(items[j].clone());
-                j += 1;
-            } else {
-                break;
-            }
-        }
-        let glist = with_host(|h| h.new_list(group));
-        let tup = with_host(|h| h.new_tuple(vec![k, glist]));
-        out.push(tup);
-        i = j;
-    }
-    Ok(list_iter(out))
+        .unwrap_or(Value::Undef);
+    // Lazy, as `itertoolsmodule.c` is: see `ItKind::GroupBy` for the state.
+    Ok(with_host(|h| {
+        h.alloc(PyObj::ItertoolsIter {
+            kind: host::ItKind::GroupBy,
+            sources: vec![src],
+            func: key,
+            nums: vec![0, 0, 0, 0],
+            buf: vec![Value::Undef, Value::Undef, Value::Undef],
+            flag: false,
+            done: false,
+        })
+    }))
 }
 
 /// A `_random.Random` instance method, dispatched against the instance's MT
@@ -12131,6 +12193,13 @@ fn isinstance_dispatch(v: &Value, cls: &Value) -> Result<bool, String> {
     // so structural ABC checks succeed).
     #[cfg(feature = "stdlib-ffi")]
     if let Some(cls_id) = with_host(|h| h.foreign_id(cls)) {
+        if with_host(|h| h.foreign_id(v).is_none()) {
+            if let Some(name) = crate::ffi::foreign_builtin_type_name(cls_id) {
+                if with_host(|h| h.type_name(v)) == name {
+                    return Ok(true);
+                }
+            }
+        }
         return with_host(|h| crate::ffi::isinstance_foreign(h, v, cls_id));
     }
     // The mirror case: a CPython object behind a handle tested against a NATIVE
@@ -12146,7 +12215,45 @@ fn isinstance_dispatch(v: &Value, cls: &Value) -> Result<bool, String> {
             }
         }
     }
+    if with_host(|h| matches!(h.get(cls), Some(PyObj::GenericAlias { .. }))) {
+        return Err(host::type_error(
+            "isinstance() argument 2 cannot be a parameterized generic",
+        ));
+    }
+    if plainly_not_a_class(cls) {
+        return Err(host::type_error(
+            "isinstance() arg 2 must be a type, a tuple of types, or a union",
+        ));
+    }
     Ok(with_host(|h| isinstance(h, v, cls)))
+}
+
+/// Whether `v` is plainly not a class — a number, string, container, function or
+/// plain instance — so `isinstance`/`issubclass` refuse it as CPython's
+/// `check_class` does instead of answering `False`. Deliberately a deny-list:
+/// the many native type objects (`collections.OrderedDict`, `type(gen)`, a
+/// bridged CPython type) must keep passing.
+fn plainly_not_a_class(v: &Value) -> bool {
+    match v {
+        Value::Undef | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_) => true,
+        Value::Obj(_) => with_host(|h| {
+            matches!(
+                h.get(v),
+                Some(
+                    PyObj::Str(_)
+                        | PyObj::BigInt(_)
+                        | PyObj::List(_)
+                        | PyObj::Tuple(_)
+                        | PyObj::Dict(_)
+                        | PyObj::Set(_)
+                        | PyObj::Frozenset(_)
+                        | PyObj::Bytes(_)
+                        | PyObj::Func(_)
+                )
+            )
+        }),
+        _ => false,
+    }
 }
 
 /// `issubclass(sub, cls)` honoring a metaclass `__subclasscheck__` override and a
@@ -12165,10 +12272,22 @@ fn issubclass_dispatch(sub: &Value, cls: &Value) -> Result<bool, String> {
         let res = r?;
         return Ok(with_host(|h| h.truthy(&res)));
     }
+    #[cfg(feature = "stdlib-ffi")]
+    if with_host(|h| h.foreign_id(sub).is_some() || h.foreign_id(cls).is_some()) {
+        return with_host(|h| crate::ffi::issubclass_values(h, sub, cls));
+    }
+    if plainly_not_a_class(sub) {
+        return Err(host::type_error("issubclass() arg 1 must be a class"));
+    }
     let a = match with_host(|h| callable_name(h, sub)) {
         Some(n) => n,
         None => return Err(host::type_error("issubclass() arg 1 must be a class")),
     };
+    if plainly_not_a_class(cls) {
+        return Err(host::type_error(
+            "issubclass() arg 2 must be a class, a tuple of classes, or a union",
+        ));
+    }
     let b = with_host(|h| callable_name(h, cls)).unwrap_or_default();
     Ok(with_host(|h| type_isa(h, &a, &b)))
 }
@@ -12180,6 +12299,12 @@ fn isinstance(h: &host::PyHost, v: &Value, cls: &Value) -> bool {
     let want = match callable_name(h, cls) {
         Some(n) => n,
         None => return false,
+    };
+    // The `collections` container types are reached as `collections.X`
+    // builtins, while their instances report the bare type name.
+    let want = match want.strip_prefix("collections.") {
+        Some(bare @ ("OrderedDict" | "defaultdict" | "Counter" | "deque")) => bare.to_string(),
+        _ => want,
     };
     // A class object (a user `Class` or a builtin type) is an instance of `type`.
     if want == "type" {
@@ -14903,14 +15028,19 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
         "split" | "rsplit" => {
             let reverse = name == "rsplit";
             let maxsplit = match args.get(1) {
-                Some(v) => ssize_arg(v, -1)?,
+                Some(v) => ssize_arg(v)?,
                 None => -1,
             };
             let none_sep = args.is_empty() || matches!(args.first(), Some(Value::Undef));
             let strs: Vec<String> = if none_sep {
                 split_ws_str(&s, maxsplit, reverse)
             } else {
-                let sep = sarg(0);
+                let sep = sarg_checked(0, "").map_err(|_| {
+                    host::type_error(&format!(
+                        "must be str or None, not {}",
+                        with_host(|h| h.type_name(&args[0]))
+                    ))
+                })?;
                 if sep.is_empty() {
                     return Err("ValueError: empty separator".into());
                 }
@@ -14970,10 +15100,7 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             let from = sarg_checked(0, "replace() argument 1")?;
             let to = sarg_checked(1, "replace() argument 2")?;
             let count = match args.get(2) {
-                Some(v) => {
-                    let n = ssize_arg(v, i64::MIN)?;
-                    (n != i64::MIN).then_some(n)
-                }
+                Some(v) => Some(ssize_arg(v)?),
                 None => None,
             };
             let out = match count {
@@ -15066,7 +15193,7 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
                     args.len()
                 ))
             })?;
-            let w = ssize_arg(wv, 0)?.max(0) as usize;
+            let w = ssize_arg(wv)?.max(0) as usize;
             let n = s.chars().count();
             let out = if n < w {
                 let pad = "0".repeat(w - n);
@@ -15216,13 +15343,18 @@ fn strip_str(s: &str, args: &[Value], mode: u8, name: &str) -> Result<String, St
 /// everywhere, `'abc'.replace('b','x',10**20)` replaced everywhere. CPython
 /// raises `OverflowError: Python int too large to convert to C ssize_t` for all
 /// of them.
-fn ssize_arg(v: &Value, default: i64) -> Result<i64, String> {
+fn ssize_arg(v: &Value) -> Result<i64, String> {
     match with_host(|h| h.index_fit(v)) {
         host::IndexFit::Fits(n) => Ok(n),
         host::IndexFit::TooLarge(_) => {
             Err("OverflowError: Python int too large to convert to C ssize_t".to_string())
         }
-        host::IndexFit::NotInt => Ok(default),
+        // A `Py_ssize_t` argument (`maxsplit`, a width, a count) takes only an
+        // integer; `'x'.center('a')` used to fall back to a default.
+        host::IndexFit::NotInt => Err(host::type_error(&format!(
+            "'{}' object cannot be interpreted as an integer",
+            with_host(|h| h.type_name(v))
+        ))),
     }
 }
 
@@ -15233,7 +15365,7 @@ fn pad_str(s: &str, args: &[Value], mode: char, name: &str) -> Result<String, St
             args.len()
         ))
     })?;
-    let w = ssize_arg(wv, 0)?.max(0) as usize;
+    let w = ssize_arg(wv)?.max(0) as usize;
     let fill = with_host(|h| args.get(1).and_then(|v| h.as_str(v)))
         .and_then(|f| f.chars().next())
         .unwrap_or(' ');

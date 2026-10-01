@@ -1107,3 +1107,30 @@ except AttributeError as e:
         "stderr={stderr}"
     );
 }
+
+/// `isinstance`/`issubclass` against types that reach pythonrs from CPython or
+/// as `collections.X` builtins: a `collections` container type matches its
+/// instances, a bridged `types.FunctionType`/`GeneratorType` matches a NATIVE
+/// function/generator (which crosses the bridge as a proxy CPython would
+/// refuse), and a bridged namedtuple class is a class to `issubclass`.
+#[test]
+fn ffi_isinstance_bridged_and_collections_types() {
+    let src = "\
+import collections, types
+od = collections.OrderedDict(); dd = collections.defaultdict(int)
+print(isinstance(od, collections.OrderedDict), isinstance(dd, collections.defaultdict), isinstance(collections.deque(), collections.deque), isinstance(collections.Counter(), collections.Counter), isinstance(od, collections.Counter))
+P = collections.namedtuple('P', 'a')
+print(issubclass(P, tuple), issubclass(P, dict))
+def gen(): yield
+print(isinstance(lambda: 1, types.FunctionType), isinstance(gen(), types.GeneratorType), isinstance(len, types.FunctionType))
+";
+    let (stdout, stderr, ok) = run_py(src);
+    if bridge_unavailable(ok, &stderr) {
+        eprintln!("skipping ffi-isinstance test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(
+        stdout, "True True True True False\nTrue False\nTrue True False\n",
+        "stderr={stderr}"
+    );
+}

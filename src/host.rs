@@ -802,6 +802,15 @@ pub enum ItKind {
     ZipLongest,
     Pairwise,
     Batched,
+    /// `itertools.groupby`, ported from `itertoolsmodule.c`. `sources[0]` is the
+    /// input iterator, `func` the key function (`None` = identity), `buf` is
+    /// `[tgtkey, currkey, currvalue]` and `nums[0..3]` says which of the three
+    /// is set (C's NULL is not `None`); `nums[3]` numbers the current grouper,
+    /// so advancing the groupby invalidates every grouper it handed out.
+    GroupBy,
+    /// An `itertools._grouper`: `sources[0]` is its groupby, `buf[0]` the key it
+    /// yields for, `nums[0]` the grouper number it was created under.
+    Grouper,
 }
 
 impl ItKind {
@@ -821,6 +830,8 @@ impl ItKind {
             ItKind::ZipLongest => "itertools.zip_longest",
             ItKind::Pairwise => "itertools.pairwise",
             ItKind::Batched => "itertools.batched",
+            ItKind::GroupBy => "itertools.groupby",
+            ItKind::Grouper => "itertools._grouper",
         }
     }
 }
@@ -8566,13 +8577,17 @@ impl PyHost {
                     // `OverflowError`, the same as `'%c' % -1`.
                     Err("OverflowError: %c arg not in range(0x110000)".into())
                 } else if let Some(s) = self.as_str(val) {
-                    if s.chars().count() == 1 {
-                        Ok(s)
-                    } else {
-                        Err("TypeError: %c requires int or char".into())
+                    match s.chars().count() {
+                        1 => Ok(s),
+                        n => Err(type_error(&format!(
+                            "%c requires an int or a unicode character, not a string of length {n}"
+                        ))),
                     }
                 } else {
-                    Err("TypeError: %c requires int or char".into())
+                    Err(type_error(&format!(
+                        "%c requires an int or a unicode character, not {}",
+                        self.type_name(val)
+                    )))
                 }
             }
             'd' | 'i' | 'u' | 'x' | 'X' | 'o' => {
@@ -10189,9 +10204,12 @@ impl PyHost {
         }
         match self.get(container) {
             Some(PyObj::Str(s)) => {
-                let needle = self
-                    .as_str(item)
-                    .ok_or_else(|| type_error("'in <string>' requires string as left operand"))?;
+                let needle = self.as_str(item).ok_or_else(|| {
+                    type_error(&format!(
+                        "'in <string>' requires string as left operand, not {}",
+                        self.type_name(item)
+                    ))
+                })?;
                 Ok(s.contains(&needle))
             }
             Some(PyObj::List(l)) | Some(PyObj::Tuple(l)) => {
@@ -17322,6 +17340,65 @@ pub fn iter_instance_items(v: &Value) -> Result<Vec<Value>, String> {
     }
 }
 
+/// `groupby_step`: pull the next value from a groupby's input and compute its
+/// key, making them the current value and key. `false` when the input is
+/// exhausted (the current value and key are left as they were).
+fn groupby_advance(
+    src: &Value,
+    func: &Value,
+    nums: &mut [i64],
+    buf: &mut [Value],
+) -> Result<bool, String> {
+    let Some(v) = iter_step(src)? else {
+        return Ok(false);
+    };
+    let key = if matches!(func, Value::Undef) {
+        v.clone()
+    } else {
+        invoke(func, vec![v.clone()], vec![])?
+    };
+    buf[1] = key;
+    buf[2] = v;
+    nums[1] = 1;
+    nums[2] = 1;
+    Ok(true)
+}
+
+/// One step of an `itertools._grouper` over `parent` (its groupby), yielding
+/// for `tgtkey` while the grouper numbered `serial` is still the current one.
+fn grouper_step(parent: &Value, tgtkey: &Value, serial: i64) -> Result<Option<Value>, String> {
+    let Some(PyObj::ItertoolsIter {
+        sources,
+        func,
+        mut nums,
+        mut buf,
+        ..
+    }) = with_host(|h| h.get(parent).cloned())
+    else {
+        return Err(type_error("not an iterator"));
+    };
+    if nums[3] != serial {
+        return Ok(None);
+    }
+    let mut out = None;
+    if (nums[2] != 0 || groupby_advance(&sources[0], &func, &mut nums, &mut buf)?)
+        && crate::builtins::elem_equal(tgtkey, &buf[1])?
+    {
+        out = Some(std::mem::replace(&mut buf[2], Value::Undef));
+        nums[2] = 0;
+    }
+    with_host(|h| {
+        if let Some(PyObj::ItertoolsIter {
+            nums: n, buf: b, ..
+        }) = h.get_mut(parent)
+        {
+            *n = nums;
+            *b = buf;
+        }
+    });
+    Ok(out)
+}
+
 /// One step of a lazy `itertools` iterator. State is cloned out so the source
 /// pulls / predicate calls run with no host borrow held, then the mutated state
 /// (and any exhaustion latch) is written back.
@@ -17629,6 +17706,42 @@ fn itertools_step(it: &Value) -> Result<Option<Value>, String> {
                 Some(with_host(|h| h.new_tuple(items)))
             }
         }
+        // `groupby_next`: skip the rest of the current group, then hand out the
+        // next key with a fresh grouper over it.
+        ItKind::GroupBy => {
+            nums[3] += 1; // `gbo->currgrouper = NULL`
+            loop {
+                if nums[1] != 0 && (nums[0] == 0 || !crate::builtins::elem_equal(&buf[0], &buf[1])?)
+                {
+                    break;
+                }
+                if !groupby_advance(&sources[0], &func, &mut nums, &mut buf)? {
+                    finished = true;
+                    break;
+                }
+            }
+            if finished {
+                None
+            } else {
+                buf[0] = buf[1].clone();
+                nums[0] = 1;
+                let grouper = with_host(|h| {
+                    h.alloc(PyObj::ItertoolsIter {
+                        kind: ItKind::Grouper,
+                        sources: vec![it.clone()],
+                        func: Value::Undef,
+                        nums: vec![nums[3]],
+                        buf: vec![buf[0].clone()],
+                        flag: false,
+                        done: false,
+                    })
+                });
+                Some(with_host(|h| h.new_tuple(vec![buf[0].clone(), grouper])))
+            }
+        }
+        // `_grouper_next`: yield the parent's current value while its key still
+        // equals this grouper's; a grouper whose groupby moved on is exhausted.
+        ItKind::Grouper => grouper_step(&sources[0], &buf[0], nums[0])?,
     };
     with_host(|h| {
         if let Some(PyObj::ItertoolsIter {
