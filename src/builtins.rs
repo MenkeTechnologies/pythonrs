@@ -10466,11 +10466,14 @@ fn copy_shallow(v: &Value) -> Result<Value, String> {
                 _ => IndexMap::new(),
             };
             let dict = h.alloc(PyObj::Dict(pairs));
-            h.alloc(PyObj::Instance(Instance {
+            let out = h.alloc(PyObj::Instance(Instance {
                 class: inst.class,
                 dict,
                 payload: inst.payload,
-            }))
+            }));
+            let slots = h.slot_values_of(v);
+            h.set_slot_values(&out, slots);
+            out
         }
         K::Same => v.clone(),
     }))
@@ -10613,6 +10616,11 @@ fn copy_deep(v: &Value, memo: &mut std::collections::HashMap<u32, Value>) -> Res
                     *d = nd;
                 }
             });
+            let mut slots = Vec::new();
+            for (name, val) in with_host(|h| h.slot_values_of(v)) {
+                slots.push((name, copy_deep(&val, memo)?));
+            }
+            with_host(|h| h.set_slot_values(&out, slots));
             Ok(out)
         }
         K::Same => Ok(v.clone()),
@@ -15341,7 +15349,7 @@ pub fn instance_object_dunder(
         "__subclasshook__" => not_implemented(),
         // The instance `__dict__` is the pickle state — `None` when empty, which
         // is what makes `object().__getstate__()` None rather than `{}`.
-        "__getstate__" => Ok(instance_state(recv)),
+        "__getstate__" => instance_state(recv),
         "__reduce__" => instance_reduce(recv, class, 0),
         "__reduce_ex__" => {
             let p = with_host(|h| h.as_int(&arg0())).unwrap_or(0);
@@ -15351,19 +15359,42 @@ pub fn instance_object_dunder(
     })
 }
 
-/// A user instance's pickle state: its `__dict__`, or `None` when it has no
-/// attributes at all.
-fn instance_state(recv: &Value) -> Value {
-    with_host(|h| {
-        let Some(PyObj::Instance(i)) = h.get(recv) else {
-            return Value::Undef;
-        };
-        let dict = i.dict.clone();
-        match h.get(&dict) {
-            Some(PyObj::Dict(d)) if !d.is_empty() => dict,
-            _ => Value::Undef,
+/// `object.__getstate__()` for a user instance (`object_getstate_default`):
+/// its `__dict__`, or `None` when it has none or it is empty — and, when any
+/// of its `__slots__` (`copyreg._slotnames`) holds a value, the pair
+/// `(that, {slot: value})`, each value read with `getattr` and an unset slot
+/// skipped.
+fn instance_state(recv: &Value) -> Result<Value, String> {
+    let Some((class, dict)) = with_host(|h| match h.get(recv) {
+        Some(PyObj::Instance(i)) => Some((i.class.clone(), i.dict.clone())),
+        _ => None,
+    }) else {
+        return Ok(Value::Undef);
+    };
+    let state = with_host(|h| match h.get(&dict) {
+        Some(PyObj::Dict(d)) if !d.is_empty() => dict.clone(),
+        _ => Value::Undef,
+    });
+    let mut slots = Vec::new();
+    for name in with_host(|h| h.slot_names(&class)) {
+        match get_attr_desc(recv, &name) {
+            Ok(v) => slots.push((name, v)),
+            Err(e) if is_attr_err(&e) => {}
+            Err(e) => return Err(e),
         }
-    })
+    }
+    if slots.is_empty() {
+        return Ok(state);
+    }
+    Ok(with_host(|h| {
+        let mut pairs = IndexMap::new();
+        for (k, v) in slots {
+            let key = h.new_str(k.clone());
+            pairs.insert(PKey::Str(k), (key, v));
+        }
+        let slot_dict = h.new_dict(pairs);
+        h.new_tuple(vec![state, slot_dict])
+    }))
 }
 
 /// `instance.__reduce__()` / `.__reduce_ex__(protocol)` — CPython's
@@ -15376,7 +15407,19 @@ fn instance_state(recv: &Value) -> Value {
 fn instance_reduce(recv: &Value, class: &str, protocol: i64) -> Result<Value, String> {
     let copyreg = host::import_module("copyreg")?;
     let cls = with_host(|h| h.alloc(PyObj::Class(class.to_string())));
-    let state = instance_state(recv);
+    // `copyreg._reduce_ex` (below protocol 2) refuses a slotted instance whose
+    // class keeps `object.__getstate__`, whose state would drop the slots.
+    if protocol < 2 && !with_host(|h| h.class_has(class, "__getstate__")) {
+        let slots = get_attr_desc(recv, "__slots__").unwrap_or(Value::Undef);
+        if with_host(|h| h.truthy(&slots)) {
+            return Err(host::type_error(
+                "a class that defines __slots__ without defining __getstate__ cannot be pickled",
+            ));
+        }
+    }
+    // The state is what `__getstate__` answers — a class's own override
+    // included, as `_PyObject_GetState` calls it.
+    let state = host::call_method(recv, "__getstate__", vec![], vec![])?;
     let (func, args) = if protocol >= 2 {
         let f = with_host(|h| h.get_attr(&copyreg, "__newobj__"))?;
         (f, with_host(|h| h.new_tuple(vec![cls])))

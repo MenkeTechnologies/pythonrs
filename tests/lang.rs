@@ -6539,6 +6539,59 @@ fn except_star_syntax_rules_are_enforced() {
     }
 }
 
+/// A `__slots__` member keeps its value in the instance itself, beside the
+/// `__dict__`: `vars()` does not list it, the member (a data descriptor) wins
+/// over a same-named dict entry, an empty slot raises on read and on `del`
+/// (`member_set`'s bare `AttributeError(name)`), `__getstate__` and
+/// `__reduce_ex__` carry `(dict_or_None, {slot: value})` in
+/// `copyreg._slotnames` order (caching `__slotnames__` on the class), protocol
+/// 0/1 refuses the class, and `copy` / `deepcopy` carry the slots across.
+/// Expected values from CPython 3.14.
+#[test]
+fn slot_values_live_beside_the_instance_dict() {
+    assert_eq!(
+        g(
+            "import copy\n\
+             class A:  __slots__ = (\"a\", \"b\", \"__p\")\n\
+             class C(A):  pass\n\
+             c = C(); c.a = 1; c.z = 2; c._A__p = 3\n\
+             r = [sorted(vars(c)), c.__dict__ is vars(c)]\n\
+             c.__dict__['a'] = 5\n\
+             r.append((c.a, sorted(c.__dict__.items())))\n\
+             for op in ('get', 'del'):\n\
+             \x20   try:\n\
+             \x20       c.b if op == 'get' else delattr(c, 'b')\n\
+             \x20   except AttributeError as e:\n\
+             \x20       r.append(str(e))\n\
+             del c.a\n\
+             try: c.a\n\
+             except AttributeError as e: r.append(str(e))\n\
+             c.a = 7\n\
+             r.append(c.__getstate__())\n\
+             r.append([c.__reduce_ex__(p)[2] for p in (2, 4)])\n\
+             try: c.__reduce_ex__(1)\n\
+             except TypeError as e: r.append(str(e))\n\
+             r.append((C.__dict__.get('__slotnames__'), '__slotnames__' in A.__dict__))\n\
+             a = A(); r.append(a.__getstate__()); a.a = [1]\n\
+             r.append(a.__getstate__())\n\
+             d = copy.copy(c); e = copy.deepcopy(a)\n\
+             r.append((d.a, d._A__p, vars(d), e.a, e.a is a.a, hasattr(e, 'b')))\n\
+             class S:\n\
+             \x20   __slots__ = ('cb',)\n\
+             \x20   def __init__(s): s.cb = lambda: 'cb'\n\
+             r.append(S().cb())\n\
+             A.a.__set__(a, 9); r.append((a.a, A.a.__get__(a)))\n\
+             A.a.__delete__(a); r.append(hasattr(a, 'a'))\n\
+             class G(A):\n\
+             \x20   def __getattr__(s, n): return 'fallback ' + n\n\
+             r.append(G().b)\n\
+             x = r",
+            "x"
+        ),
+        "[[\x27z\x27], True, (1, [(\x27a\x27, 5), (\x27z\x27, 2)]), \"\x27C\x27 object has no attribute \x27b\x27\", \x27b\x27, \"\x27C\x27 object has no attribute \x27a\x27\", ({\x27z\x27: 2, \x27a\x27: 5}, {\x27a\x27: 7, \x27_A__p\x27: 3}), [({\x27z\x27: 2, \x27a\x27: 5}, {\x27a\x27: 7, \x27_A__p\x27: 3}), ({\x27z\x27: 2, \x27a\x27: 5}, {\x27a\x27: 7, \x27_A__p\x27: 3})], \x27a class that defines __slots__ without defining __getstate__ cannot be pickled\x27, ([\x27a\x27, \x27b\x27, \x27_A__p\x27], False), None, (None, {\x27a\x27: [1]}), (7, 3, {\x27z\x27: 2, \x27a\x27: 5}, [1], False, False), \x27cb\x27, (9, 9), False, \x27fallback b\x27]"
+    );
+}
+
 /// A method call resolves its ATTRIBUTE callee before its arguments, as
 /// CPython's `LOAD_ATTR` method form does: a `__getattr__` or a property runs
 /// first, a missing method raises before any argument is evaluated, and an

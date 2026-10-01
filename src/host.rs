@@ -2181,6 +2181,11 @@ pub struct PyHost {
     /// cache is dropped whenever a class is registered, since a new class can
     /// change what an existing name resolves to.
     mro_cache: std::cell::RefCell<HashMap<String, std::rc::Rc<Vec<String>>>>,
+    /// What `__slots__` give each class's instances ([`SlotLayout`]), memoized
+    /// because every instance attribute read and write consults it. Dropped
+    /// with `mro_cache`, and whenever a class namespace gains or loses a name
+    /// (which can shadow a member).
+    slot_cache: std::cell::RefCell<HashMap<String, std::rc::Rc<SlotLayout>>>,
     /// Character index of the `str` most recently measured or subscripted; see
     /// [`StrIndex`].
     str_index: RefCell<Option<StrIndex>>,
@@ -2272,6 +2277,11 @@ pub struct PyHost {
     /// (`<class key>.<name>`): one object per slot, as the one CPython keeps in
     /// the declaring class's `__dict__`, so `C.x is C.x`.
     slot_members: HashMap<String, Value>,
+    /// The values of each instance's `__slots__` members, by the instance's
+    /// heap id: CPython keeps them in the object itself, beside (never in) its
+    /// `__dict__`, so `vars(obj)` and `obj.__dict__` do not list them. A slot
+    /// that was never assigned (or was deleted) is absent.
+    slot_values: HashMap<u32, HashMap<String, Value>>,
     /// Codec search functions registered by `_codecs.register` (the `encodings`
     /// package installs one at import), the resolved-codec cache keyed by
     /// normalized name, and user error handlers from `register_error`.
@@ -2844,6 +2854,7 @@ impl PyHost {
             classes: IndexMap::new(),
             foreign_class_cells: HashMap::new(),
             mro_cache: std::cell::RefCell::new(HashMap::new()),
+            slot_cache: std::cell::RefCell::new(HashMap::new()),
             str_index: RefCell::new(None),
             tries: Vec::new(),
             module_globals: vec![NameMap::default()],
@@ -2880,6 +2891,7 @@ impl PyHost {
             suggest: None,
             func_attrs: HashMap::new(),
             slot_members: HashMap::new(),
+            slot_values: HashMap::new(),
             codec_search: Vec::new(),
             codec_cache: HashMap::new(),
             codec_errors: HashMap::new(),
@@ -11902,6 +11914,13 @@ impl PyHost {
                 if name == "__hash__" && self.implicit_hash_none(&class) {
                     return Ok(Value::Undef);
                 }
+                // A `__slots__` member is a data descriptor: it answers before
+                // the instance dict, from the instance's slot storage.
+                if let Some(slot) = self.slot_read(recv, name) {
+                    return slot.ok_or_else(|| {
+                        format!("AttributeError: '{class}' object has no attribute '{name}'")
+                    });
+                }
                 if let Some(v) = self.inst_attr(&inst_dict, name) {
                     return Ok(v);
                 }
@@ -13672,6 +13691,10 @@ impl PyHost {
     /// `None` if the instance has a normal `__dict__` (some user class in its MRO
     /// omits `__slots__`). The returned set is the union of every class's slots.
     fn slots_of(&self, class: &str) -> Option<HashSet<String>> {
+        self.slot_layout(class).restricted.clone()
+    }
+
+    fn compute_slots_of(&self, class: &str) -> Option<HashSet<String>> {
         let mut slots = HashSet::new();
         let mut any = false;
         for c in self.mro_of(class) {
@@ -13754,17 +13777,7 @@ impl PyHost {
     /// `__dict__` and `__weakref__` entries install no member. The descriptor's
     /// `qual` is `<class key>.<name>`; its repr shows the class's `__name__`.
     fn slot_member(&mut self, class: &str, name: &str) -> Option<Value> {
-        if name == "__dict__" || name == "__weakref__" {
-            return None;
-        }
-        let owner = self.mro_rc(class).iter().find_map(|c| {
-            let cd = self.classes.get(c)?;
-            if cd.ns.contains_key(name) {
-                return Some(None);
-            }
-            let declared = self.own_slots(c)?.iter().any(|s| s == name);
-            declared.then(|| Some(c.clone()))
-        })??;
+        let owner = self.slot_owner(class, name)?;
         let qual = format!("{owner}.{name}");
         if let Some(v) = self.slot_members.get(&qual) {
             return Some(v.clone());
@@ -13776,6 +13789,194 @@ impl PyHost {
         });
         self.slot_members.insert(qual, v.clone());
         Some(v)
+    }
+
+    /// The class that declares the `__slots__` member `class.name` resolves to:
+    /// the first class along the MRO that declares `name` as a slot, unless an
+    /// earlier one binds `name` in its namespace (then there is no member).
+    /// CPython's `type_new` installs the member in the declaring class's
+    /// `__dict__`, which is where `_PyType_Lookup` finds it. `__dict__` and
+    /// `__weakref__` entries install none.
+    fn slot_owner(&self, class: &str, name: &str) -> Option<String> {
+        if name == "__dict__" || name == "__weakref__" {
+            return None;
+        }
+        for c in self.mro_rc(class).iter() {
+            let Some(cd) = self.classes.get(c) else {
+                continue;
+            };
+            if cd.ns.contains_key(name) {
+                return None;
+            }
+            if self
+                .own_slots(c)
+                .is_some_and(|slots| slots.iter().any(|s| s == name))
+            {
+                return Some(c.clone());
+            }
+        }
+        None
+    }
+
+    /// The names that are `__slots__` members on an instance of `class`: every
+    /// declared slot along the MRO whose lookup lands on its member descriptor
+    /// ([`Self::slot_owner`]). Empty for a class with no `__slots__` anywhere.
+    fn slot_layout(&self, class: &str) -> Rc<SlotLayout> {
+        if let Some(hit) = self.slot_cache.borrow().get(class) {
+            return hit.clone();
+        }
+        let mut members = HashSet::new();
+        for c in self.mro_rc(class).iter() {
+            for n in self.own_slots(c).unwrap_or_default() {
+                if self.slot_owner(class, &n).is_some() {
+                    members.insert(n);
+                }
+            }
+        }
+        let layout = Rc::new(SlotLayout {
+            members,
+            restricted: self.compute_slots_of(class),
+        });
+        self.slot_cache
+            .borrow_mut()
+            .insert(class.to_string(), layout.clone());
+        layout
+    }
+
+    /// Whether `name` is a `__slots__` member on an instance of `class` — the
+    /// test every instance attribute access makes, answered from the memo
+    /// without cloning its handle.
+    fn is_instance_slot(&self, class: &str, name: &str) -> bool {
+        if let Some(hit) = self.slot_cache.borrow().get(class) {
+            return !hit.members.is_empty() && hit.members.contains(name);
+        }
+        self.slot_layout(class).members.contains(name)
+    }
+
+    /// Whether an instance of `class` may take attribute `name`: always when
+    /// it has a `__dict__`, else only a declared slot name.
+    fn slots_allow(&self, class: &str, name: &str) -> bool {
+        let check = |l: &SlotLayout| l.restricted.as_ref().is_none_or(|s| s.contains(name));
+        if let Some(hit) = self.slot_cache.borrow().get(class) {
+            return check(hit);
+        }
+        check(&self.slot_layout(class))
+    }
+
+    /// `obj.name` when it is a `__slots__` member of `obj`'s class:
+    /// `Some(Some(v))` for an assigned slot, `Some(None)` for an empty one, and
+    /// `None` when `name` is not a slot (the instance dict and the class answer
+    /// it). A member is a data descriptor, so it takes precedence over the
+    /// instance dict.
+    pub fn slot_read(&self, recv: &Value, name: &str) -> Option<Option<Value>> {
+        let (Value::Obj(id), Some(PyObj::Instance(inst))) = (recv, self.get(recv)) else {
+            return None;
+        };
+        if !self.is_instance_slot(&inst.class, name) {
+            return None;
+        }
+        Some(self.slot_values.get(id).and_then(|m| m.get(name)).cloned())
+    }
+
+    /// Store `obj.name = val` in `obj`'s slot storage if `name` is one of its
+    /// `__slots__` members; `false` when it is not.
+    fn slot_write(&mut self, recv: &Value, name: &str, val: Value) -> bool {
+        let (Value::Obj(id), Some(PyObj::Instance(inst))) = (recv, self.get(recv)) else {
+            return false;
+        };
+        if !self.is_instance_slot(&inst.class, name) {
+            return false;
+        }
+        self.slot_values
+            .entry(*id)
+            .or_default()
+            .insert(name.to_string(), val);
+        true
+    }
+
+    /// `del obj.name` for a `__slots__` member: `None` when `name` is not one,
+    /// else whether the slot held a value (CPython's `member_set` raises a
+    /// bare `AttributeError(name)` for an empty one).
+    fn slot_delete(&mut self, recv: &Value, name: &str) -> Option<bool> {
+        let (Value::Obj(id), Some(PyObj::Instance(inst))) = (recv, self.get(recv)) else {
+            return None;
+        };
+        if !self.is_instance_slot(&inst.class, name) {
+            return None;
+        }
+        Some(
+            self.slot_values
+                .get_mut(id)
+                .is_some_and(|m| m.remove(name).is_some()),
+        )
+    }
+
+    /// `copyreg._slotnames(cls)`: every `__slots__` name along the MRO, in MRO
+    /// order and then declaration order, mangled, without `__dict__` and
+    /// `__weakref__`. Cached on the class as `__slotnames__`, as `_slotnames`
+    /// caches it.
+    pub fn slot_names(&mut self, class: &str) -> Vec<String> {
+        // `copyreg._slotnames` caches its answer on the class as
+        // `__slotnames__`, and reads that cache first.
+        if let Some(v) = self
+            .classes
+            .get(class)
+            .and_then(|cd| cd.ns.get("__slotnames__"))
+        {
+            if let Some(PyObj::List(items)) = self.get(v) {
+                return items.iter().filter_map(|it| self.as_str(it)).collect();
+            }
+        }
+        let mut names = Vec::new();
+        for c in self.mro_rc(class).iter() {
+            let Some(cd) = self.classes.get(c) else {
+                continue;
+            };
+            if !cd.ns.contains_key("__slots__") {
+                continue;
+            }
+            // The names as written, mangled against the declaring class's
+            // `__name__` with its leading underscores stripped, as `_slotnames`
+            // does (`own_slots` mangles the same way).
+            for n in self.own_slots(c).unwrap_or_default() {
+                if n != "__dict__" && n != "__weakref__" {
+                    names.push(n);
+                }
+            }
+        }
+        // Only a class that has `__slots__` at all (its own or inherited) gets
+        // the cache — `_slotnames` returns early, without caching, otherwise.
+        if self.class_lookup(class, "__slots__").is_some() {
+            let items: Vec<Value> = names.iter().map(|n| self.new_str(n.clone())).collect();
+            let list = self.new_list(items);
+            if let Some(cd) = self.classes.get_mut(class) {
+                cd.ns.insert("__slotnames__".to_string(), list);
+            }
+        }
+        names
+    }
+
+    /// The assigned slot values of `recv`, for `copy.copy` / `deepcopy`.
+    pub fn slot_values_of(&self, recv: &Value) -> Vec<(String, Value)> {
+        match recv {
+            Value::Obj(id) => self
+                .slot_values
+                .get(id)
+                .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Replace `dst`'s slot storage with `values` (a copy's).
+    pub fn set_slot_values(&mut self, dst: &Value, values: Vec<(String, Value)>) {
+        if let Value::Obj(id) = dst {
+            if values.is_empty() {
+                self.slot_values.remove(id);
+            } else {
+                self.slot_values.insert(*id, values.into_iter().collect());
+            }
+        }
     }
 
     /// Whether `func` is a function whose `__annotations__` still have to be
@@ -14025,6 +14226,10 @@ impl PyHost {
                 }
             }
         }
+        // A `__slots__` member stores into the instance's slot storage.
+        if self.slot_write(recv, name, val.clone()) {
+            return Ok(());
+        }
         // `__slots__` enforcement: a slotted instance rejects any attribute name
         // not declared in its slots.
         if let Some(PyObj::Instance(inst)) = self.get(recv) {
@@ -14036,13 +14241,11 @@ impl PyHost {
                      __dict__ for setting new attributes"
                 ));
             }
-            if let Some(slots) = self.slots_of(&class) {
-                if !slots.contains(name) {
-                    return Err(format!(
-                        "AttributeError: '{class}' object has no attribute '{name}' and no \
-                         __dict__ for setting new attributes"
-                    ));
-                }
+            if !self.slots_allow(&class, name) {
+                return Err(format!(
+                    "AttributeError: '{class}' object has no attribute '{name}' and no \
+                     __dict__ for setting new attributes"
+                ));
             }
         }
         if let Some(PyObj::Instance(inst)) = self.get(recv) {
@@ -14121,6 +14324,7 @@ impl PyHost {
                 if let Some(cd) = self.classes.get_mut(&cname) {
                     cd.ns.insert(name.to_string(), val);
                 }
+                self.slot_cache.borrow_mut().clear();
                 Ok(())
             }
             _ => Err(self.builtin_setattr_error(recv, name)),
@@ -14207,6 +14411,11 @@ impl PyHost {
         if name == "__class__" {
             return Err(type_error("can't delete __class__ attribute"));
         }
+        match self.slot_delete(recv, name) {
+            Some(true) => return Ok(()),
+            Some(false) => return Err(format!("AttributeError: {name}")),
+            None => {}
+        }
         if let Some(PyObj::Instance(inst)) = self.get(recv) {
             let dict = inst.dict.clone();
             if self.inst_attr_del(&dict, name) {
@@ -14218,6 +14427,7 @@ impl PyHost {
             let cname = cname.clone();
             if let Some(cd) = self.classes.get_mut(&cname) {
                 if cd.ns.shift_remove(name).is_some() {
+                    self.slot_cache.borrow_mut().clear();
                     return Ok(());
                 }
             }
@@ -14287,6 +14497,7 @@ impl PyHost {
         // shadowing disambiguation above rekeys classes), so every memoized
         // linearization is dropped here.
         self.mro_cache.borrow_mut().clear();
+        self.slot_cache.borrow_mut().clear();
         let mro = {
             let mut out = vec![name_for_key.clone()];
             for b in &bases {
@@ -15270,6 +15481,19 @@ pub fn call_method(
     r
 }
 
+/// What `__slots__` give an instance of one class.
+#[derive(Default)]
+pub struct SlotLayout {
+    /// The declared slots whose lookup lands on their member descriptor
+    /// ([`PyHost::slot_owner`]): their values live in the instance's slot
+    /// storage, not its `__dict__`.
+    members: HashSet<String>,
+    /// Every name declared along the MRO when the instance has no `__dict__`
+    /// (every user class in the MRO declares `__slots__` and none lists
+    /// `"__dict__"`), the names it may take; `None` when it has a dict.
+    restricted: Option<HashSet<String>>,
+}
+
 /// What a method call's callee lookup is, decided without running user code
 /// (see [`PyHost::method_callee`]).
 pub enum MethodCallee {
@@ -15367,6 +15591,10 @@ impl PyHost {
         ) && self.mro_rc(class).iter().any(|c| c == "_random.Random")
         {
             return MethodCallee::Fused;
+        }
+        // A `__slots__` member answers before the dict (a data descriptor).
+        if self.is_instance_slot(class, name) {
+            return MethodCallee::Protocol;
         }
         let in_dict = self.inst_attr(dict, name);
         let Some(attr) = self.class_lookup(class, name) else {
@@ -15650,6 +15878,14 @@ fn call_method_inner(
             )),
         },
         Some(PyObj::Instance(inst)) => {
+            // A `__slots__` member holding a callable, ahead of the dict.
+            if let Some(slot) = with_host(|h| h.slot_read(recv, name)) {
+                let class = &inst.class;
+                let v = slot.ok_or_else(|| {
+                    format!("AttributeError: '{class}' object has no attribute '{name}'")
+                })?;
+                return invoke(&v, args, kwargs);
+            }
             // instance attribute that is callable?
             if let Some(v) = with_host(|h| h.inst_attr(&inst.dict, name)) {
                 return invoke(&v, args, kwargs);

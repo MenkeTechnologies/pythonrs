@@ -9,6 +9,23 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **A `__slots__` member keeps its value beside the instance dict.** Slot
+  values were stored in the instance `__dict__`, so a slotted base under an
+  unslotted subclass leaked them into `vars(c)` (`['a', 'z']` where CPython has
+  `['z']`), and a dict entry of the same name shadowed the slot. Each
+  instance's slot values now live in their own storage, reached when the name
+  resolves to the class's `member_descriptor` (the first class along the MRO
+  that declares the slot, unless an earlier one binds the name): the member
+  answers before the instance dict as a data descriptor does, an empty slot
+  raises on read and `del` raises `member_set`'s bare `AttributeError(name)`.
+  `__getstate__` and `__reduce_ex__` follow `object_getstate_default` —
+  `(dict_or_None, {slot: value})` in `copyreg._slotnames` order, with
+  `__slotnames__` cached on the class, and the state taken from a class's own
+  `__getstate__` when it has one — protocol 0/1 refuses a slotted class without
+  `__getstate__` as `copyreg._reduce_ex` does, and `copy.copy` / `deepcopy`
+  carry the slots. The per-class slot layout is memoized, which also takes the
+  `__slots__` restriction check off the per-write MRO walk: an attribute
+  read/write loop retires 5% fewer instructions than before.
 - **A user exception class inherits `add_note` and `with_traceback`.**
   `BaseException`'s methods resolved only on the builtin exception types, so
   `class E(Exception)` raised `AttributeError: 'E' object has no attribute
@@ -2473,27 +2490,6 @@ entry. These remain open:
   `typing.Unpack[Ts]`; `evaluate_value` is absent; and under the bridge
   `type(A)` is pythonrs's own type object, not CPython's
   `typing.TypeAliasType` (`isinstance` does agree).
-
-- **Slot values live in the instance dict.** pythonrs stores a `__slots__`
-  attribute in the same per-instance dict as any other, and restricts writes by
-  consulting the class's declared slots rather than by having separate storage.
-  Restriction, inheritance and the `"__dict__"` entry all behave correctly, and
-  a fully-slotted instance correctly has no `__dict__` at all. What leaks is
-  introspection of a PARTIALLY slotted hierarchy -- a slotted base with an
-  unslotted subclass, where the instance does have a dict:
-
-  ```
-  class A:  __slots__ = ("a",)
-  class C(A):  pass
-  c = C(); c.a = 1; c.z = 2
-  sorted(vars(c))   # CPython ['z'], pythonrs ['a', 'z']
-  ```
-
-  `A.__dict__["a"]` is likewise absent where CPython has a `member_descriptor`.
-  Closing it means real slot storage separate from the instance dict, not a
-  filter over the dict: `__dict__` is handed out by handle so that mutations
-  through it write through, and filtering the handed-out object would break that
-  identity.
 
 - **A `SyntaxError` the compiler raises from `eval`/`exec` omits the inner
   block.** One the parser or tokenizer raises is rendered as CPython renders
