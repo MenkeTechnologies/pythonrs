@@ -299,6 +299,34 @@ written.
   `OrderedDict.pop` hashes first and keeps the bare `unhashable type` message.
   This was the last shape of the unhashable-key entry: the other sixteen
   already named the container role.
+- **Dict views carry their own set operators; `set` declines a list.**
+  `{1} | [1]`, `[1] & {1}`, `frozenset() ^ (1,)` and `{1} - [1]` returned sets
+  where CPython raises `unsupported operand type(s)` (`set_or` and friends
+  return `NotImplemented` unless both operands are sets), while
+  `d.keys() | 'ab'`, `range(3) - d.keys()` and any view op with a generator,
+  string or range raised it. The view operators are now ports of
+  `dictviews_sub`/`dictviews_or`/`dictviews_xor`/`_PyDictView_Intersect`/
+  `dictitems_xor`: any iterable on either side, always a plain `set`
+  (`frozenset({1}) | d.keys()` included), `d.keys() | 1` is `'int' object is
+  not iterable`. Membership in a keys or items view is a lookup in the dict
+  (`dictkeys_contains`/`dictitems_contains`), so a user-hashed key is found and
+  an unhashable one is named as a dict key.
+- **`set.symmetric_difference_update` makes its argument a set first.**
+  `{1}.symmetric_difference_update([2, 2])` toggled `2` twice and left `{1}`;
+  `s.symmetric_difference_update(s)` now clears, as
+  `set_symmetric_difference_update_impl` does.
+- **Bitwise operator errors name the operator.** `[1] | [2]` said
+  `unsupported operand type(s) for bitop`, and `<<`/`>>` said `for shift`.
+- **An unhashable `collections` object is named by its type.** `hash(deque())`
+  said `unhashable type: 'object'` and an `OrderedDict`/`defaultdict`/`Counter`
+  said `'dict'`; a list subclass said `'list'`. The inner name is the failing
+  type's `tp_name` and the outer `cannot use 'X' as …` name is `%T`, module
+  qualified (`'collections.Counter'`, `'mm.Q'`).
+- **`deque` item assignment and deletion.** `q[i] = v` and `del q[i]` raised
+  `does not support item assignment`/`doesn't support item deletion`. Both now
+  follow `PyObject_SetItem`/`DelItem`'s sequence branch into
+  `deque_ass_item`/`deque_del_item`, and a slice or other non-index key on any
+  of get/set/del is `sequence index must be integer, not 'slice'`.
 - **`stdout`/`stderr` are buffered as CPython buffers them.** pythonrs flushed
   every write, so `python prog.py > log 2>&1` came out in program order where
   CPython's comes out in flush order (`err1 err2 out1 out2` for two
@@ -2357,7 +2385,7 @@ PEP 479). The unhashable-key message was the fifth and is fixed too: an
 unhashable key now names the role it was playing (`cannot use 'X' as a dict
 key (unhashable type: 'X')`), matching CPython at all 17 spellings. Round 4
 added the `__index__` coercion boundaries and the `__slots__` `"__dict__"`
-entry. Three remain open:
+entry. These remain open:
 
 - **PEP 695 `type` aliases: what the native `TypeAliasType` still lacks.**
   The statement builds a lazy `typing.TypeAliasType` (see "Implemented"), but

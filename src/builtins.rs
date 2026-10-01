@@ -764,9 +764,11 @@ fn subscript_store(recv: &Value, idx: Value, val: Value) -> Result<(), String> {
     // splice into a dict: it raised `'int' object is not iterable` from the RHS
     // materialization and the key never reached the dict at all. The load path
     // already gated on the receiver this way; this is the same test.
+    // A deque has item slots but no slice slot, so its slice index is the
+    // sequence-index TypeError `PyHost::set_item` reports.
     if with_host(|h| {
         matches!(h.get(&idx), Some(PyObj::Slice { .. }))
-            && !matches!(h.get(&recv), Some(PyObj::Dict(_)))
+            && !matches!(h.get(&recv), Some(PyObj::Dict(_) | PyObj::Deque { .. }))
     }) {
         let idx = normalize_slice_bounds(&idx)?;
         // A `memoryview` slice store takes a BUFFER, not an iterable: CPython
@@ -1978,6 +1980,24 @@ fn b_foriter(vm: &mut VM, _: u8) -> Value {
 fn b_contains(vm: &mut VM, _: u8) -> Value {
     let container = vm.pop();
     let item = vm.pop();
+    match contains_value(container, item) {
+        Ok(b) => Value::Bool(b),
+        Err(e) => abort(vm, e),
+    }
+}
+
+/// `dict[key]` for a key already known to be present, resolving a user-hashed
+/// key onto the dict's own key first (the borrowed lookup cannot run `__hash__`).
+fn dict_get(dict: &Value, key: &Value) -> Result<Value, String> {
+    let cands = host::instance_key_candidates_for(dict, Some(key));
+    host::with_instance_key(key, host::KeyRole::Dict, &cands, || {
+        with_host(|h| h.get_item(dict, key))
+    })
+}
+
+/// `item in container` -- the `in` operator outside the VM, for the builtins
+/// that test membership the way the operator does (the dict views' `&`).
+pub fn contains_value(container: Value, item: Value) -> Result<bool, String> {
     // Fast path: an unboxed scalar tested against a HASH container. Every check
     // below is about something neither operand can be -- a `set`/`frozenset`/
     // `dict` is not an `Instance` or a generator or a foreign object, and an
@@ -1992,10 +2012,32 @@ fn b_contains(vm: &mut VM, _: u8) -> Value {
         ) && h.key_cannot_collapse(&item))
         .then(|| h.contains(&item, &container))
     }) {
-        return match r {
-            Ok(b) => Value::Bool(b),
-            Err(e) => abort(vm, e),
+        return r;
+    }
+    // `dictkeys_contains` / `dictitems_contains`: a lookup in the view's dict,
+    // so a user-hashed key collapses onto the dict's own key exactly as it does
+    // for `k in d`. Only a 2-tuple can be an item; its value must then equal
+    // the one stored.
+    let view = with_host(|h| match h.get(&container) {
+        Some(PyObj::DictView { dict, kind }) if *kind != 1 => Some((dict.clone(), *kind == 2)),
+        _ => None,
+    });
+    if let Some((dict, is_items)) = view {
+        if !is_items {
+            return contains_value(dict, item);
+        }
+        let pair = with_host(|h| match h.get(&item) {
+            Some(PyObj::Tuple(t)) if t.len() == 2 => Some((t[0].clone(), t[1].clone())),
+            _ => None,
+        });
+        let Some((key, want)) = pair else {
+            return Ok(false);
         };
+        if !contains_value(dict.clone(), key.clone())? {
+            return Ok(false);
+        }
+        let found = dict_get(&dict, &key)?;
+        return elem_equal(&found, &want);
     }
     // Instance `__contains__` wins; else fall back to iterating the instance
     // (via __iter__/__getitem__) and comparing.
@@ -2003,45 +2045,34 @@ fn b_contains(vm: &mut VM, _: u8) -> Value {
         // A builtin-type subclass without `__contains__` tests membership on its
         // native payload (`x in Stack([...])`).
         if let Some(payload) = host::subclass_payload(&container, "__contains__") {
-            return match with_host(|h| h.contains(&item, &payload)) {
-                Ok(b) => Value::Bool(b),
-                Err(e) => abort(vm, e),
-            };
+            return with_host(|h| h.contains(&item, &payload));
         }
         let has_contains = with_host(|h| match h.get(&container) {
             Some(PyObj::Instance(i)) => h.class_lookup(&i.class, "__contains__").is_some(),
             _ => false,
         });
         if has_contains {
-            let r = host::call_method(&container, "__contains__", vec![item], vec![]);
-            return match r {
-                Ok(v) => Value::Bool(with_host(|h| h.truthy(&v))),
-                Err(e) => abort(vm, e),
-            };
+            let v = host::call_method(&container, "__contains__", vec![item], vec![])?;
+            return Ok(with_host(|h| h.truthy(&v)));
         }
         return match iter_membership(&container, &item) {
-            Ok(b) => Value::Bool(b),
+            Ok(b) => Ok(b),
             // Neither `__contains__` nor `__iter__`: the diagnostic is about
             // CONTAINMENT, not about iteration. `'C' object is not iterable` is
             // what CPython says for `for _ in c`, not for `x in c`.
             Err(e) if e.ends_with("object is not iterable") => {
                 let tn = with_host(|h| h.type_name(&container));
-                abort(
-                    vm,
-                    host::type_error(&format!(
-                        "argument of type '{tn}' is not a container or iterable"
-                    )),
-                )
+                Err(host::type_error(&format!(
+                    "argument of type '{tn}' is not a container or iterable"
+                )))
             }
-            Err(e) => abort(vm, e),
+            Err(e) => Err(e),
         };
     }
     // A generator is consumed to test membership (no host borrow held).
     if with_host(|h| matches!(h.get(&container), Some(PyObj::Generator { .. }))) {
-        return match host::iter_vec(&container) {
-            Ok(items) => Value::Bool(with_host(|h| items.iter().any(|x| h.equal(x, &item)))),
-            Err(e) => abort(vm, e),
-        };
+        let items = host::iter_vec(&container)?;
+        return Ok(with_host(|h| items.iter().any(|x| h.equal(x, &item))));
     }
     // A list/tuple whose membership may hit a user `__eq__` (the searched item or
     // any element is an instance) compares element-by-element via the rich `==`
@@ -2065,31 +2096,24 @@ fn b_contains(vm: &mut VM, _: u8) -> Value {
         if any_instance {
             for e in &elems {
                 match elem_equal(e, &item) {
-                    Ok(true) => return Value::Bool(true),
+                    Ok(true) => return Ok(true),
                     Ok(false) => {}
-                    Err(err) => return abort(vm, err),
+                    Err(err) => return Err(err),
                 }
             }
-            return Value::Bool(false);
+            return Ok(false);
         }
     }
     // A CPython `Foreign` container (stdlib-ffi): run `in` (its `__contains__`)
     // OUTSIDE the borrow so a `@dataclass` with a user `__contains__` re-enters.
     #[cfg(feature = "stdlib-ffi")]
     if let Some(id) = with_host(|h| h.foreign_id(&container)) {
-        return match crate::ffi::contains_cb(id, &item) {
-            Ok(b) => Value::Bool(b),
-            Err(e) => abort(vm, e),
-        };
+        return crate::ffi::contains_cb(id, &item);
     }
     let cands = host::instance_key_candidates_for(&container, Some(&item));
-    let r = host::with_instance_key(&item, host::KeyRole::Of(&container), &cands, || {
+    host::with_instance_key(&item, host::KeyRole::Of(&container), &cands, || {
         with_host(|h| h.contains(&item, &container))
-    });
-    match r {
-        Ok(b) => Value::Bool(b),
-        Err(e) => abort(vm, e),
-    }
+    })
 }
 
 /// Materialize an instance iterable and test whether `item` is a member (the
@@ -2806,6 +2830,9 @@ fn b_binop(vm: &mut VM, _: u8) -> Value {
             return finish(vm, res);
         }
     }
+    if let Some(res) = view_setop_for_tag(tag).and_then(|op| dictview_setop(op, &a, &b)) {
+        return finish(vm, res);
+    }
     // `str % args`: pre-resolve any instance / instance-bearing container's
     // dispatched str()/repr()/ascii() OUTSIDE the host borrow (the host `%`
     // formatter runs inside the borrow and cannot call back into __str__/__repr__),
@@ -2937,6 +2964,9 @@ fn inplace_binary_inner(tag: i64, a: &Value, b: &Value) -> Result<Value, String>
         if let Some(res) = try_binop_dunder(a, b, l, r) {
             return res;
         }
+    }
+    if let Some(res) = view_setop_for_tag(btag).and_then(|op| dictview_setop(op, a, b)) {
+        return res;
     }
     if btag == host::binop::MOD && with_host(|h| matches!(h.get(a), Some(PyObj::Str(_)))) {
         return str_percent_format(a, b);
@@ -4464,6 +4494,11 @@ fn numeric_hook_inner(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> 
         if matches!(op, Eq | Ne) {
             if let Some(r) = container_user_eq(a, b)? {
                 return Ok(Value::Bool(if matches!(op, Eq) { r } else { !r }));
+            }
+        }
+        if matches!(op, Sub) {
+            if let Some(res) = dictview_setop(ViewSetOp::Sub, a, b) {
+                return res;
             }
         }
         // Set difference, the subset orders, and container `==` all compare keys
@@ -17780,9 +17815,27 @@ fn set_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             }
             Ok(Value::Undef)
         }
+        // `set_symmetric_difference_update_impl`: the set itself clears; an
+        // exact dict or a set is walked as is; any other iterable is first made
+        // a set, so a repeated element toggles once, not once per occurrence.
         "symmetric_difference_update" => {
-            // Toggle membership of each element of the other iterable.
-            let items = host::iter_vec(&arg0(args)?)?;
+            let other = arg0(args)?;
+            if same_object(recv, &other) {
+                return set_method(recv, "clear", &[]);
+            }
+            let walked = with_host(|h| {
+                h.setlike(&other).is_some()
+                    || (matches!(h.get(&other), Some(PyObj::Dict(_))) && h.type_name(&other) == "dict")
+            });
+            let other = if walked {
+                other
+            } else {
+                call_builtin_function("set", vec![other], vec![])?
+            };
+            let items = match with_host(|h| h.set_entries_in_order(&other)) {
+                Some(entries) => entries.into_iter().map(|(_, v)| v).collect(),
+                None => host::iter_vec(&other)?,
+            };
             for it in items {
                 let cands = host::instance_key_candidates_for(recv, Some(&it));
                 let k = host::with_instance_key(&it, host::KeyRole::Set, &cands, || {
@@ -17852,6 +17905,157 @@ fn set_binop(recv: &Value, args: &[Value], tag: i64) -> Result<Value, String> {
     let aligned = host::align_operand(recv, &other_set)?;
     let other_set = aligned.unwrap_or(other_set);
     with_host(|h| h.binop(tag, recv, &other_set))
+}
+
+/// The set operator a `dict_keys`/`dict_items` view answers (`dictviews_as_number`).
+#[derive(Clone, Copy)]
+pub enum ViewSetOp {
+    Sub,
+    And,
+    Or,
+    Xor,
+}
+
+/// The view set operator a `host::binop` tag names (`&`, `|`, `^`).
+fn view_setop_for_tag(tag: i64) -> Option<ViewSetOp> {
+    match tag {
+        host::binop::BITAND => Some(ViewSetOp::And),
+        host::binop::BITOR => Some(ViewSetOp::Or),
+        host::binop::BITXOR => Some(ViewSetOp::Xor),
+        _ => None,
+    }
+}
+
+/// `Some(is_items)` for a `dict_keys` (`false`) or `dict_items` (`true`) view —
+/// the two view types with set operators. `dict_values` has none.
+fn set_view_kind(v: &Value) -> Option<bool> {
+    with_host(|h| match h.get(v) {
+        Some(PyObj::DictView { kind: 0, .. }) => Some(false),
+        Some(PyObj::DictView { kind: 2, .. }) => Some(true),
+        _ => None,
+    })
+}
+
+/// The length of a dict view (`dictview_len`): its dict's length.
+fn view_len(v: &Value) -> usize {
+    with_host(|h| match h.get(v) {
+        Some(PyObj::DictView { dict, .. }) => match h.get(dict) {
+            Some(PyObj::Dict(d)) => d.len(),
+            _ => 0,
+        },
+        _ => 0,
+    })
+}
+
+/// CPython's `dictviews_to_set`: `set(operand)`, built from the dict itself when
+/// the operand is the keys view of an exact `dict` (`PySet_New`'s dict fast
+/// path, which presizes the table). The operand need not be a view at all: the
+/// slot also runs reflected, as `[1] | d.keys()`.
+fn dictviews_to_set(v: &Value) -> Result<Value, String> {
+    let src = with_host(|h| match h.get(v) {
+        Some(PyObj::DictView { dict, kind: 0 }) if h.type_name(dict) == "dict" => dict.clone(),
+        _ => v.clone(),
+    });
+    call_builtin_function("set", vec![src], vec![])
+}
+
+/// `a op b` where either operand is a `dict_keys` or `dict_items` view — the
+/// view's number slots (`dictviews_sub`, `_PyDictView_Intersect`,
+/// `dictviews_or`, `dictviews_xor`), which accept ANY iterable as the other
+/// operand and always return a plain `set`. `set`'s own operators decline a
+/// non-set operand, so `{1} | d.keys()` reaches the view's slot reflected, with
+/// the set as the slot's `self`. `None` when neither operand is such a view.
+pub fn dictview_setop(op: ViewSetOp, a: &Value, b: &Value) -> Option<Result<Value, String>> {
+    if set_view_kind(a).is_none() && set_view_kind(b).is_none() {
+        return None;
+    }
+    Some(match op {
+        ViewSetOp::And => dictview_intersect(a, b),
+        ViewSetOp::Or => dictviews_to_set(a).and_then(|r| {
+            set_method(&r, "update", std::slice::from_ref(b))?;
+            Ok(r)
+        }),
+        ViewSetOp::Sub => dictviews_to_set(a).and_then(|r| {
+            set_method(&r, "difference_update", std::slice::from_ref(b))?;
+            Ok(r)
+        }),
+        ViewSetOp::Xor if set_view_kind(a) == Some(true) && set_view_kind(b) == Some(true) => {
+            dictitems_xor(a, b)
+        }
+        ViewSetOp::Xor => dictviews_to_set(a).and_then(|r| {
+            set_method(&r, "symmetric_difference_update", std::slice::from_ref(b))?;
+            Ok(r)
+        }),
+    })
+}
+
+/// `_PyDictView_Intersect`: `self` is whichever operand is the view. An exact
+/// `set` at least as large as the view does the work (`set.intersection`);
+/// otherwise the other operand is walked and each element the view contains is
+/// added — after swapping two views so the SMALLER one is walked.
+fn dictview_intersect(a: &Value, b: &Value) -> Result<Value, String> {
+    let (mut view, mut other) = if set_view_kind(a).is_some() {
+        (a.clone(), b.clone())
+    } else {
+        (b.clone(), a.clone())
+    };
+    let len_self = view_len(&view);
+    let other_set_len = with_host(|h| match h.get(&other) {
+        Some(PyObj::Set(s)) if h.type_name(&other) == "set" => Some(s.len()),
+        _ => None,
+    });
+    if other_set_len.is_some_and(|n| len_self <= n) {
+        return set_method(&other, "intersection", &[view]);
+    }
+    if set_view_kind(&other).is_some() && view_len(&other) > len_self {
+        std::mem::swap(&mut view, &mut other);
+    }
+    let result = call_builtin_function("set", vec![], vec![])?;
+    for key in host::iter_vec(&other)? {
+        if contains_value(view.clone(), key.clone())? {
+            set_method(&result, "add", &[key])?;
+        }
+    }
+    Ok(result)
+}
+
+/// `dictitems_xor`: `d1.items() ^ d2.items()`. Walks `d2`; a pair whose key
+/// `d1` holds with an equal value cancels (and is dropped from a copy of `d1`),
+/// any other pair of `d2` is added; then the pairs left in the copy of `d1` are
+/// added.
+fn dictitems_xor(a: &Value, b: &Value) -> Result<Value, String> {
+    let dict_of = |v: &Value| {
+        with_host(|h| match h.get(v) {
+            Some(PyObj::DictView { dict, .. }) => dict.clone(),
+            _ => Value::Undef,
+        })
+    };
+    let (d1, d2) = (dict_of(a), dict_of(b));
+    let temp = call_builtin_function("dict", vec![d1], vec![])?;
+    let result = call_builtin_function("set", vec![], vec![])?;
+    let pairs = host::iter_vec(&host::call_method(&d2, "items", vec![], vec![])?)?;
+    for pair in pairs {
+        let (key, val2) = with_host(|h| match h.get(&pair) {
+            Some(PyObj::Tuple(t)) => (t[0].clone(), t[1].clone()),
+            _ => (Value::Undef, Value::Undef),
+        });
+        let held = contains_value(temp.clone(), key.clone())?;
+        let cancels = held && {
+            let val1 = dict_get(&temp, &key)?;
+            elem_equal(&val1, &val2)?
+        };
+        if cancels {
+            let cands = host::instance_key_candidates_for(&temp, Some(&key));
+            host::with_instance_key(&key, host::KeyRole::Dict, &cands, || {
+                with_host(|h| h.del_item(&temp, &key))
+            })?;
+        } else {
+            set_method(&result, "add", &[pair])?;
+        }
+    }
+    let remaining = host::call_method(&temp, "items", vec![], vec![])?;
+    set_method(&result, "update", &[remaining])?;
+    Ok(result)
 }
 
 /// Variadic set fold (`union`/`intersection`): apply `tag` between the receiver

@@ -3505,3 +3505,32 @@ fn sys_getsizeof_adds_the_preheader_to_sizeof() {
         "(0, 0, 16, 16, 16, 0)"
     );
 }
+
+// `deque` has sequence item slots only: assignment and deletion by index
+// (negative and `__index__` included), `deque index out of range` past either
+// end, and the sequence-index TypeError for a slice or any non-index key.
+#[test]
+fn deque_item_assignment_and_deletion() {
+    let src = r#"from collections import deque
+class I:
+    def __index__(self): return 1
+def e(f):
+    try:
+        return f()
+    except (TypeError, IndexError) as ex:
+        return f'{type(ex).__name__}: {ex}'
+d = deque(range(6), maxlen=8)
+d[0] = 'a'; d[-1] = 'z'; d[I()] = 'i'
+del d[2]; del d[-2]; del d[I()]
+def setitem(i):
+    deque([1])[i] = 0
+def delitem(i):
+    del deque([1])[i]
+x = [d, e(lambda: setitem(1)), e(lambda: delitem(-2)), e(lambda: setitem(slice(0, 1))),
+     e(lambda: delitem('a')), e(lambda: deque([1])[1:]), e(lambda: deque([1])[2**70]), e(lambda: setitem(None))]
+"#;
+    assert_eq!(
+        g(src, "x"),
+        r#"[deque(['a', 3, 'z'], maxlen=8), 'IndexError: deque index out of range', 'IndexError: deque index out of range', "TypeError: sequence index must be integer, not 'slice'", "TypeError: sequence index must be integer, not 'str'", "TypeError: sequence index must be integer, not 'slice'", "IndexError: cannot fit 'int' into an index-sized integer", "TypeError: sequence index must be integer, not 'NoneType'"]"#
+    );
+}

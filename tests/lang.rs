@@ -9720,3 +9720,109 @@ fn set_algebra_results_iterate_in_cpythons_order() {
          94, 95, 97, 355, 238, 243, 378], [48, 97, 94, 95], 1)"
     );
 }
+
+// `dict_keys`/`dict_items` carry their own number slots (`dictviews_or`,
+// `_PyDictView_Intersect`, ...), which take ANY iterable on either side and
+// always build a plain `set`; `set`'s slots decline a non-set operand, so
+// `{1} | [1]` is a TypeError while `range(3) - d.keys()` is a set. A keys or
+// items membership test is a dict lookup, so an unhashable key is named as a
+// dict key.
+#[test]
+fn dict_view_set_operators_take_any_iterable_while_set_operators_refuse_one() {
+    let src = r#"def e(f):
+    try:
+        return f()
+    except TypeError as ex:
+        return str(ex)
+d = {1: 2, 3: 4}
+x = [
+    sorted(d.keys() | range(3)), sorted(range(3) - d.keys()), sorted(d.keys() ^ (5, 1)),
+    sorted(d.keys() & iter([3, 9])), sorted(d.items() & [(1, 2), (3, 5), [], 7]),
+    sorted(d.items() ^ {3: 4, 5: 6}.items()), type(frozenset({1}) | d.keys()).__name__,
+    e(lambda: d.keys() | 1), e(lambda: 1 - d.keys()), e(lambda: d.values() | [1]),
+    e(lambda: {1} | [1]), e(lambda: [1] & {1}), e(lambda: frozenset() ^ (1,)), e(lambda: {1} - [1]),
+    e(lambda: [] in d.keys()), e(lambda: ([], 1) in d.items()), e(lambda: d.keys() & [[]]),
+]
+"#;
+    assert_eq!(
+        g(src, "x"),
+        r#"[[0, 1, 2, 3], [0, 2], [3, 5], [3], [(1, 2)], [(1, 2), (5, 6)], 'set', "'int' object is not iterable", "'int' object is not iterable", "unsupported operand type(s) for |: 'dict_values' and 'list'", "unsupported operand type(s) for |: 'set' and 'list'", "unsupported operand type(s) for &: 'list' and 'set'", "unsupported operand type(s) for ^: 'frozenset' and 'tuple'", "unsupported operand type(s) for -: 'set' and 'list'", "cannot use 'list' as a dict key (unhashable type: 'list')", "cannot use 'list' as a dict key (unhashable type: 'list')", "cannot use 'list' as a dict key (unhashable type: 'list')"]"#
+    );
+}
+
+// The unsupported-operand message names the operator glyph, as
+// `binop_type_error` does, never an internal family name.
+#[test]
+fn bitwise_operator_typeerror_names_the_operator() {
+    let src = r#"def e(f):
+    try:
+        return f()
+    except TypeError as ex:
+        return str(ex)
+x = [e(lambda: [1] | [2]), e(lambda: 1.0 & 2), e(lambda: 'a' ^ 'b'), e(lambda: [1] << 1), e(lambda: {} >> 1)]
+"#;
+    assert_eq!(
+        g(src, "x"),
+        r#"["unsupported operand type(s) for |: 'list' and 'list'", "unsupported operand type(s) for &: 'float' and 'int'", "unsupported operand type(s) for ^: 'str' and 'str'", "unsupported operand type(s) for <<: 'list' and 'int'", "unsupported operand type(s) for >>: 'dict' and 'int'"]"#
+    );
+}
+
+// `set_symmetric_difference_update_impl`: a non-set iterable becomes a set
+// before it is walked (a repeated element toggles once), and the set itself
+// clears.
+#[test]
+fn symmetric_difference_update_makes_the_argument_a_set_first() {
+    let src = r#"a = {1}
+a.symmetric_difference_update([2, 2])
+b = {1, 2}
+b.symmetric_difference_update(b)
+c = {1, 2}
+c.symmetric_difference_update({2: 0, 3: 0})
+x = [a, b, c, {1}.symmetric_difference([2, 2])]
+"#;
+    assert_eq!(
+        g(src, "x"),
+        r#"[{1, 2}, set(), {1, 3}, {1, 2}]"#
+    );
+}
+
+// The inner name is the `tp_name` that failed to hash (`collections.deque`,
+// the bare `Counter` of the pure-Python class, a list subclass's own name); the
+// outer one is `%T`, fully qualified by module.
+#[test]
+fn unhashable_message_names_the_type_as_cpython_does() {
+    let src = r#"import collections
+def e(f):
+    try:
+        return f()
+    except TypeError as ex:
+        return str(ex)
+class L(list): pass
+x = [e(lambda: {collections.deque()}), e(lambda: hash(collections.OrderedDict())),
+     e(lambda: {collections.Counter(): 1}), e(lambda: hash(collections.defaultdict(int))),
+     e(lambda: {L()}), e(lambda: hash(L())), e(lambda: {(L(),): 1})]
+"#;
+    assert_eq!(
+        g(src, "x"),
+        r#"["cannot use 'collections.deque' as a set element (unhashable type: 'collections.deque')", "unhashable type: 'collections.OrderedDict'", "cannot use 'collections.Counter' as a dict key (unhashable type: 'Counter')", "unhashable type: 'collections.defaultdict'", "cannot use 'L' as a set element (unhashable type: 'L')", "unhashable type: 'L'", "cannot use 'tuple' as a dict key (unhashable type: 'L')"]"#
+    );
+}
+
+// `dictkeys_contains`/`dictitems_contains` look the key up in the dict, so a
+// user-hashed key collapses onto the dict's own key as it does for `k in d`;
+// the view set operators test membership the same way.
+#[test]
+fn dict_view_membership_resolves_a_user_hashed_key() {
+    let src = r#"class P:
+    def __init__(s, v): s.v = v
+    def __hash__(s): return hash(s.v)
+    def __eq__(s, o): return isinstance(o, P) and s.v == o.v
+d = {P(1): 0, P(2): 5}
+x = (P(2) in d.keys(), (P(2), 5) in d.items(), (P(2), 4) in d.items(), P(3) in d.keys(),
+     sorted((k.v, w) for k, w in d.items() ^ {P(2): 6}.items()), sorted(k.v for k in d.keys() & [P(2), P(7)]))
+"#;
+    assert_eq!(
+        g(src, "x"),
+        r#"(True, True, False, False, [(1, 0), (2, 5), (2, 6)], [2])"#
+    );
+}

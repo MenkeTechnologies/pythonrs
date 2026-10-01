@@ -3477,7 +3477,7 @@ impl PyHost {
     /// CPython's key and item views ARE set-like, so `d.keys() == {1, 2}` and
     /// `d.keys() <= {1, 2}` are real answers, not `False` and a `TypeError`. A
     /// `dict_values` view has no set behavior, and neither has anything else;
-    /// both give `None`. Unlike [`Self::setmap_operand`] this allocates no
+    /// both give `None`. Unlike [`Self::setmap_of`] this allocates no
     /// objects and hashes no user instances, so the borrowed `equal` can use it.
     pub fn view_keyset(&self, v: &Value) -> Option<Vec<PKey>> {
         match self.get(v) {
@@ -3621,36 +3621,14 @@ impl PyHost {
 
     /// A set-map of `v` for the set-algebra operators: `set`/`frozenset`, or a
     /// `dict_keys`/`dict_items` view coerced to a key-set. `None` otherwise
-    /// (a `dict_values` view has no set algebra).
+    /// (a `dict_values` view has no set algebra). A view's operators with any
+    /// OTHER iterable (`d.keys() - ['a']`) never reach here: they are the
+    /// view's own number slots, run outside the borrow by
+    /// `builtins::dictview_setop`, and a `set` declines a list (`{1} | [1]` is a
+    /// TypeError), so nothing but sets and views is ever a set-map.
     pub fn setmap_of(&mut self, v: &Value) -> Option<IndexMap<PKey, Value>> {
-        self.setmap_operand(v, false)
-    }
-
-    /// The key-set of `v` for a set operation. A `set`/`frozenset` and the
-    /// key/item dict views are always set-like; a list or tuple is coerced only
-    /// when the OTHER operand already is one, which is CPython's rule — a dict
-    /// view's set operators accept any iterable (`d.keys() - ['a']`, which
-    /// `csv.DictWriter` uses to find extra keys), while `[1] - [2]` stays a
-    /// TypeError.
-    pub fn setmap_operand(
-        &mut self,
-        v: &Value,
-        other_is_set: bool,
-    ) -> Option<IndexMap<PKey, Value>> {
         if let Some(PyObj::Set(s)) | Some(PyObj::Frozenset(s)) = self.get(v) {
             return Some(s.clone());
-        }
-        if other_is_set {
-            if let Some(PyObj::List(items)) | Some(PyObj::Tuple(items)) = self.get(v) {
-                let items = items.clone();
-                let mut out: IndexMap<PKey, Value> = IndexMap::new();
-                for it in items {
-                    if let Ok(k) = self.to_key(&it) {
-                        out.insert(k, it);
-                    }
-                }
-                return Some(out);
-            }
         }
         let kind = match self.get(v) {
             Some(PyObj::DictView { kind, .. }) if *kind == 0 || *kind == 2 => *kind,
@@ -4815,6 +4793,23 @@ impl PyHost {
         }
     }
 
+    /// CPython's `%T` (`_PyType_GetFullyQualifiedName`): the type's name
+    /// prefixed by its `__module__` unless that is `builtins` or `__main__` --
+    /// `'mm.Q'` for a class defined in module `mm`, `'collections.Counter'`
+    /// for the pure-Python `Counter`, whose `tp_name` is the bare `'Counter'`.
+    pub fn fq_type_name(&self, v: &Value) -> String {
+        match self.get(v) {
+            Some(PyObj::Instance(inst)) => match self.repr_module_prefix(&inst.class).as_str() {
+                "__main__." => inst.class.clone(),
+                prefix => format!("{prefix}{}", inst.class),
+            },
+            _ => match self.tp_name(v).as_str() {
+                "Counter" => "collections.Counter".into(),
+                tn => tn.into(),
+            },
+        }
+    }
+
     /// The Python type name of `v`.
     pub fn type_name(&self, v: &Value) -> String {
         match v {
@@ -5961,7 +5956,21 @@ impl PyHost {
                             // `class U(str)`) keys and compares identically to
                             // `"a"`. Only a payload-bearing subclass; a plain
                             // `object` subclass keeps the identity hash below.
+                            // An unhashable base (`class L(list)`) passes its
+                            // `tp_hash` down to the subclass, and the subclass
+                            // is the type named: `unhashable type: 'L'`.
                             None if !matches!(inst.payload, Value::Undef) => {
+                                if matches!(
+                                    self.get(&inst.payload),
+                                    Some(
+                                        PyObj::List(_)
+                                            | PyObj::Dict(_)
+                                            | PyObj::Set(_)
+                                            | PyObj::Bytearray(_)
+                                    )
+                                ) {
+                                    return Err(type_error(&format!("unhashable type: '{class}'")));
+                                }
                                 return self.to_key(&inst.payload);
                             }
                             // Default identity hash — no user code needed.
@@ -6044,26 +6053,13 @@ impl PyHost {
                         _ => return Err("ValueError: cannot hash writable memoryview object".into()),
                     }
                 }
-                Some(other) => {
-                    return Err(type_error(&format!(
-                        "unhashable type: '{}'",
-                        self.type_name_obj(other)
-                    )))
+                Some(_) => {
+                    return Err(type_error(&format!("unhashable type: '{}'", self.tp_name(v))))
                 }
                 None => PKey::None,
             },
             _ => return Err(type_error("unhashable type")),
         })
-    }
-
-    fn type_name_obj(&self, o: &PyObj) -> &'static str {
-        match o {
-            PyObj::List(_) => "list",
-            PyObj::Dict(_) => "dict",
-            PyObj::Set(_) => "set",
-            PyObj::Frozenset(_) => "frozenset",
-            _ => "object",
-        }
     }
 
     /// Structural equality (`==`).
@@ -6424,6 +6420,23 @@ impl PyHost {
     /// `PyNumber_AsSsize_t(key, PyExc_IndexError)`, so `[1][10**30]`,
     /// `l[10**30] = 2` and `del l[10**30]` all raise
     /// `IndexError: cannot fit 'int' into an index-sized integer`.
+    /// The slot `deque[idx]` addresses. A deque has only SEQUENCE item slots,
+    /// so `PyObject_GetItem`/`SetItem`/`DelItem` take their sequence branch:
+    /// a key without `__index__` -- a slice included -- is `sequence index must
+    /// be integer, not 'T'`, an index past `Py_ssize_t` is an `IndexError`, a
+    /// negative one counts from the end, and `deque_item`/`deque_ass_item`
+    /// refuse anything still outside the deque.
+    fn deque_slot(&self, idx: &Value, len: usize) -> Result<usize, String> {
+        let i = self.seq_index(idx, || {
+            type_error(&format!("sequence index must be integer, not '{}'", self.tp_name(idx)))
+        })?;
+        let k = if i < 0 { i + len as i64 } else { i };
+        if k < 0 || k >= len as i64 {
+            return Err("IndexError: deque index out of range".into());
+        }
+        Ok(k as usize)
+    }
+
     pub fn seq_index(&self, idx: &Value, not_int: impl FnOnce() -> String) -> Result<i64, String> {
         match self.index_fit(idx) {
             IndexFit::Fits(n) => Ok(n),
@@ -8026,9 +8039,7 @@ impl PyHost {
                 if let Some(out) = self.set_difference(a, b) {
                     return Ok(out);
                 }
-                let a_set = self.setmap_of(a).is_some();
-                if let (Some(mut out), Some(y)) = (self.setmap_of(a), self.setmap_operand(b, a_set))
-                {
+                if let (Some(mut out), Some(y)) = (self.setmap_of(a), self.setmap_of(b)) {
                     for k in y.keys() {
                         out.shift_remove(k);
                     }
@@ -8607,11 +8618,7 @@ impl PyHost {
                 } {
                     return Ok(out);
                 }
-                let a_set = self.setmap_of(a).is_some();
-                let b_set = self.setmap_of(b).is_some();
-                if let (Some(x), Some(y)) =
-                    (self.setmap_operand(a, b_set), self.setmap_operand(b, a_set))
-                {
+                if let (Some(x), Some(y)) = (self.setmap_of(a), self.setmap_of(b)) {
                     let mut out = IndexMap::new();
                     match tag {
                         binop::BITAND => {
@@ -8670,7 +8677,12 @@ impl PyHost {
                         return Ok(self.build_union(xs));
                     }
                 }
-                Err(self.optype_err("bitop", a, b))
+                let sym = match tag {
+                    binop::BITAND => "&",
+                    binop::BITOR => "|",
+                    _ => "^",
+                };
+                Err(self.optype_err(sym, a, b))
             }
             binop::SHL | binop::SHR => {
                 if let (Some(x), Some(y)) = (self.big_val(a), self.big_val(b)) {
@@ -8686,7 +8698,7 @@ impl PyHost {
                     let res = if tag == binop::SHL { x << sh } else { x >> sh };
                     return Ok(self.norm_big(res));
                 }
-                Err(self.optype_err("shift", a, b))
+                Err(self.optype_err(if tag == binop::SHL { "<<" } else { ">>" }, a, b))
             }
             binop::MATMUL => Err(self.optype_err("@", a, b)),
             _ => Err(type_error("unknown binop")),
@@ -9777,6 +9789,10 @@ impl PyHost {
         if let Some(id) = self.foreign_id(recv) {
             return crate::ffi::get_item(self, id, idx);
         }
+        if let Some(PyObj::Deque { items, .. }) = self.get(recv) {
+            let k = self.deque_slot(idx, items.len())?;
+            return Ok(items[k].clone());
+        }
         // Slice? On a SEQUENCE. On a mapping a slice is an ordinary key (they
         // became hashable in CPython 3.12), and dispatching on the index alone
         // sent `d[slice(1, 2)]` into the sequence-slice path, where a dict is
@@ -9925,15 +9941,6 @@ impl PyHost {
                     });
                 }
                 Ok(Value::Int(b[k as usize] as i64))
-            }
-            Some(PyObj::Deque { items, .. }) => {
-                let n = items.len() as i64;
-                let i = self.seq_index(idx, || type_error("deque indices must be integers"))?;
-                let k = if i < 0 { i + n } else { i };
-                if k < 0 || k >= n {
-                    return Err("IndexError: deque index out of range".into());
-                }
-                Ok(items[k as usize].clone())
             }
             Some(PyObj::Memoryview { .. }) => {
                 let bytes = self.mv_bytes(recv)?;
@@ -10209,6 +10216,13 @@ impl PyHost {
         if let Some(id) = self.foreign_id(recv) {
             return crate::ffi::set_item(self, id, idx, &val);
         }
+        if let Some(PyObj::Deque { items, .. }) = self.get(recv) {
+            let k = self.deque_slot(idx, items.len())?;
+            if let Some(PyObj::Deque { items, .. }) = self.get_mut(recv) {
+                items[k] = val;
+            }
+            return Ok(());
+        }
         match self.get(recv) {
             Some(PyObj::List(l)) => {
                 let n = l.len() as i64;
@@ -10397,6 +10411,15 @@ impl PyHost {
         #[cfg(feature = "stdlib-ffi")]
         if let Some(id) = self.foreign_id(recv) {
             return crate::ffi::del_item(self, id, idx);
+        }
+        // `deque_del_item` rotates the slot to the front, pops it and rotates
+        // back: the same survivors in the same order as removing it in place.
+        if let Some(PyObj::Deque { items, .. }) = self.get(recv) {
+            let k = self.deque_slot(idx, items.len())?;
+            if let Some(PyObj::Deque { items, .. }) = self.get_mut(recv) {
+                items.remove(k);
+            }
+            return Ok(());
         }
         // Slice deletion: `del x[i:j]`, `del x[::k]` — on a SEQUENCE. Same
         // receiver test as `get_item_raw`: `del d[slice(1, 2)]` removes a key.
@@ -11019,12 +11042,30 @@ impl PyHost {
             return crate::ffi::contains(self, id, item);
         }
         // A dict view: membership over its live elements. A keys view can test
-        // membership by direct key lookup (O(1)); values/items compare linearly.
+        // membership by direct key lookup (O(1)); values compare linearly.
         if let Some(PyObj::DictView { dict, kind }) = self.get(container) {
             let (dict, kind) = (dict.clone(), *kind);
             if kind == 0 {
                 let key = self.to_key(item)?;
                 return Ok(matches!(self.get(&dict), Some(PyObj::Dict(d)) if d.contains_key(&key)));
+            }
+            // `dictitems_contains`: only a 2-tuple can be a member; its first
+            // element is looked up in the dict -- so an unhashable one is
+            // reported as the dict KEY it was used as -- and the value found
+            // must equal its second.
+            if kind == 2 {
+                let (k, want) = match self.get(item) {
+                    Some(PyObj::Tuple(t)) if t.len() == 2 => (t[0].clone(), t[1].clone()),
+                    _ => return Ok(false),
+                };
+                let key = self
+                    .to_key(&k)
+                    .map_err(|e| wrap_unhashable(self, e, KeyRole::Dict, &k))?;
+                let found = match self.get(&dict) {
+                    Some(PyObj::Dict(d)) => d.get(&key).map(|(_, v)| v.clone()),
+                    _ => None,
+                };
+                return Ok(found.is_some_and(|v| self.elem_equal(&v, &want)));
             }
             let items = self.view_items(container).unwrap_or_default();
             return Ok(items.iter().any(|x| self.equal(x, item)));
@@ -14706,13 +14747,15 @@ pub fn wrap_unhashable(h: &PyHost, e: String, role: KeyRole, key: &Value) -> Str
         KeyRole::Of(c) => match h.get(c) {
             Some(PyObj::Set(_) | PyObj::Frozenset(_)) => "a set element",
             Some(PyObj::Dict(_)) => "a dict key",
+            // `dictkeys_contains` is a lookup in the dict itself.
+            Some(PyObj::DictView { kind: 0, .. }) => "a dict key",
             _ => return e,
         },
     };
     let inner = e.trim_start_matches("TypeError: ");
     format!(
         "TypeError: cannot use '{}' as {role} ({inner})",
-        h.type_name(key)
+        h.fq_type_name(key)
     )
 }
 
