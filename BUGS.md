@@ -25,6 +25,20 @@ written.
   by an indented line is `unexpected indent` the same way. A trailing run of blank
   lines still moves CPython's position onto the last blank line, which this
   does not follow.
+- **`pow()` dispatches the power dunders.** The builtin went straight to the
+  native power, so `pow(P(), 2)` and `pow(2, P())` raised where `P() ** 2`
+  worked, and any three-argument call with a non-integer said
+  `pow() 3rd argument not allowed unless all arguments are integers`. Two
+  arguments are now exactly `a ** b`; three follow CPython 3.14's `ternary_op`
+  (`a.__pow__(b, m)`, then `b.__rpow__(a, m)`, then the three-type
+  `unsupported operand type(s) for ** or pow(): 'A', 'B', 'M'`; `float` and
+  `complex` refuse a modulus). The native `**` failure now says
+  `** or pow()` as CPython's does.
+- **`__bool__`, `__format__` and `__bytes__` results are checked.**
+  `__bool__` returning `1` was accepted (CPython: `__bool__ should return bool,
+  returned int`), `__format__` returning a non-`str` was stringified (CPython:
+  `__format__ must return a str, not int`), and `bytes(x)` never called
+  `x.__bytes__()` at all.
 - **A dedent matching no outer level wins over the parse error after it.**
   `try:` / `if 1:` with a body indented 8 and a following line at 4 reported
   `SyntaxError: expected 'except' or 'finally' block` (or no caret): the

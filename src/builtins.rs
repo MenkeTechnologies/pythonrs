@@ -1408,8 +1408,16 @@ fn py_bool(v: &Value) -> Result<bool, String> {
         _ => (false, false),
     });
     if has_bool {
-        let x = host::call_method(v, "__bool__", vec![], vec![])?;
-        return Ok(with_host(|h| h.truthy(&x)));
+        // `slot_nb_bool` accepts only a `bool`: an `int` (even `1`) is refused.
+        return match host::call_method(v, "__bool__", vec![], vec![])? {
+            Value::Bool(b) => Ok(b),
+            x => Err(with_host(|h| {
+                host::type_error(&format!(
+                    "__bool__ should return bool, returned {}",
+                    h.tp_name(&x)
+                ))
+            })),
+        };
     }
     if has_len {
         let x = host::call_method(v, "__len__", vec![], vec![])?;
@@ -1663,7 +1671,14 @@ fn format_field(v: &Value, conv: i64, spec: &str) -> Result<String, String> {
     if has_format {
         let specv = with_host(|h| h.new_str(spec.to_string()));
         let r = host::call_method(v, "__format__", vec![specv], vec![])?;
-        return Ok(with_host(|h| h.str_of(&r)));
+        // `PyObject_Format` refuses anything but a `str` back.
+        return with_host(|h| match h.as_str(&r) {
+            Some(s) => Ok(s),
+            None => Err(host::type_error(&format!(
+                "__format__ must return a str, not {}",
+                h.tp_name(&r)
+            ))),
+        });
     }
     // The digit limit guards a DECIMAL rendering only: `format(n, "x")` and the
     // float presentations of an int are unbounded in CPython, so a huge int
@@ -2216,7 +2231,7 @@ enum Dunder {
 /// singleton. Only instance operands are consulted; a `NotImplemented` outcome
 /// means the caller should fall back (native op, identity, or `TypeError`).
 fn dispatch_binop(a: &Value, b: &Value, lname: &str, rname: &str) -> Dunder {
-    dispatch_dunder_pair(a, b, lname, rname, true)
+    dispatch_dunder_pair(a, b, lname, rname, true, None)
 }
 
 /// The ARITHMETIC form of [`dispatch_binop`]: identical, except that two
@@ -2230,7 +2245,15 @@ fn dispatch_binop(a: &Value, b: &Value, lname: &str, rname: &str) -> Dunder {
 /// rule: `B() < B()` really does try `__lt__` and then `__gt__`. Running the
 /// comparison rule for arithmetic answered where CPython raises.
 fn dispatch_arith(a: &Value, b: &Value, lname: &str, rname: &str) -> Dunder {
-    dispatch_dunder_pair(a, b, lname, rname, false)
+    dispatch_dunder_pair(a, b, lname, rname, false, None)
+}
+
+/// Three-argument `pow(a, b, m)` through `__pow__` / `__rpow__`: CPython 3.14's
+/// `slot_nb_power` passes the modulus as the extra argument to whichever half
+/// answers (`a.__pow__(b, m)`, then `b.__rpow__(a, m)`), with the same
+/// operand-priority rules as the binary operator.
+fn dispatch_ternary_pow(a: &Value, b: &Value, m: &Value) -> Dunder {
+    dispatch_dunder_pair(a, b, "__pow__", "__rpow__", false, Some(m))
 }
 
 fn dispatch_dunder_pair(
@@ -2239,7 +2262,11 @@ fn dispatch_dunder_pair(
     lname: &str,
     rname: &str,
     same_type_reflects: bool,
+    modulus: Option<&Value>,
 ) -> Dunder {
+    let args = |first: &Value| -> Vec<Value> {
+        std::iter::once(first.clone()).chain(modulus.cloned()).collect()
+    };
     // ONE host borrow decides the whole plan. Every question here — does either
     // side define its half, are the two the same type, does the right one take
     // priority — reads the same class table, and asking them separately took a
@@ -2260,7 +2287,7 @@ fn dispatch_dunder_pair(
     // CPython's subclass-priority rule: the RIGHT operand goes first when its
     // type is a proper subclass of the left's AND overrides the reflected slot.
     if refl_first {
-        match host::call_method(b, rname, vec![a.clone()], vec![]) {
+        match host::call_method(b, rname, args(a), vec![]) {
             Ok(v) if is_not_implemented(&v) => {}
             Ok(v) => return Dunder::Value(v),
             Err(e) => return Dunder::Err(e),
@@ -2269,14 +2296,14 @@ fn dispatch_dunder_pair(
         has_refl = false;
     }
     if has_fwd {
-        match host::call_method(a, lname, vec![b.clone()], vec![]) {
+        match host::call_method(a, lname, args(b), vec![]) {
             Ok(v) if is_not_implemented(&v) => {}
             Ok(v) => return Dunder::Value(v),
             Err(e) => return Dunder::Err(e),
         }
     }
     if has_refl {
-        match host::call_method(b, rname, vec![a.clone()], vec![]) {
+        match host::call_method(b, rname, args(a), vec![]) {
             Ok(v) if is_not_implemented(&v) => {}
             Ok(v) => return Dunder::Value(v),
             Err(e) => return Dunder::Err(e),
@@ -6039,8 +6066,9 @@ pub fn call_builtin_function(
         "pow" => {
             let (a, b, m) = pow_args(&args, &kwargs)?;
             match m {
-                None | Some(Value::Undef) => with_host(|h| h.binop(host::binop::POW, &a, &b)),
-                Some(m) => pow_mod(&a, &b, &m),
+                // Two-argument `pow` IS `a ** b`, dunders and message included.
+                None | Some(Value::Undef) => numeric_hook(NumOp::Pow, &a, &b),
+                Some(m) => ternary_pow(&a, &b, &m),
             }
         }
         "type" => {
@@ -6750,6 +6778,28 @@ pub fn call_builtin_function(
             if let Some(msg) = misuse {
                 return Err(host::type_error(msg));
             }
+            // `bytes(x)` asks `x.__bytes__()` before the buffer and iterable
+            // protocols, and the answer must be `bytes`. `bytearray` has no such
+            // hook.
+            if name == "bytes" {
+                if let Some(src) = source {
+                    let has = with_host(|h| {
+                        matches!(h.get(src), Some(PyObj::Instance(i)) if instance_has(h, i, "__bytes__"))
+                    });
+                    if has {
+                        let r = host::call_method(src, "__bytes__", vec![], vec![])?;
+                        if with_host(|h| matches!(h.get(&r), Some(PyObj::Bytes(_)))) {
+                            return Ok(r);
+                        }
+                        return Err(with_host(|h| {
+                            host::type_error(&format!(
+                                "__bytes__ returned non-bytes (type {})",
+                                h.tp_name(&r)
+                            ))
+                        }));
+                    }
+                }
+            }
             let bargs: Vec<Value> = slots.into_iter().flatten().collect();
             let b = build_bytes(&bargs)?;
             Ok(with_host(|h| {
@@ -7078,6 +7128,80 @@ fn bind_named<const N: usize>(
 /// integers; `exp` must be non-negative (a negative exponent needs a modular
 /// inverse, which is not yet implemented). The result takes the sign of `mod`
 /// (Python's floored convention).
+/// Three-argument `pow(a, b, m)`: CPython's `ternary_op`, which offers the
+/// operation to the `nb_power` slot of each DISTINCT operand type in turn —
+/// `a`'s, then `b`'s, then `m`'s.
+///
+/// `int`'s slot computes only when all three are integers and otherwise
+/// declines; `float`'s and `complex`'s refuse any modulus outright; a user
+/// class's slot is `slot_nb_power`, which runs `a.__pow__(b, m)` and then
+/// `b.__rpow__(a, m)` (3.14 added the reflected call) and is the same slot for
+/// every class, so it is offered once. A type with no slot at all (`str`) is
+/// skipped. Nobody answering is the three-type `unsupported operand` error.
+fn ternary_pow(a: &Value, b: &Value, m: &Value) -> Result<Value, String> {
+    // A builtin-subclass instance that does not override the operator inherits
+    // its base type's slot, so it takes part as its native payload.
+    let a = &host::subclass_operand(a, "__pow__");
+    let b = &host::subclass_operand(b, "__rpow__");
+    let m = &host::subclass_operand(m, "__pow__");
+    #[derive(PartialEq)]
+    enum Slot {
+        Int,
+        Float,
+        Complex,
+        User,
+    }
+    let slot_of = |v: &Value| {
+        with_host(|h| match v {
+            Value::Int(_) | Value::Bool(_) => Some(Slot::Int),
+            Value::Float(_) => Some(Slot::Float),
+            _ => match h.get(v) {
+                Some(PyObj::BigInt(_)) => Some(Slot::Int),
+                Some(PyObj::Complex(..)) => Some(Slot::Complex),
+                Some(PyObj::Instance(_)) => Some(Slot::User),
+                _ => None,
+            },
+        })
+    };
+    let mut offered: Vec<Slot> = Vec::new();
+    for v in [a, b, m] {
+        let Some(slot) = slot_of(v) else { continue };
+        if offered.contains(&slot) {
+            continue;
+        }
+        match slot {
+            Slot::Int => {
+                let all_int = [a, b, m]
+                    .into_iter()
+                    .all(|x| slot_of(x) == Some(Slot::Int));
+                if all_int {
+                    return pow_mod(a, b, m);
+                }
+            }
+            Slot::Float => {
+                return Err(host::type_error(
+                    "pow() 3rd argument not allowed unless all arguments are integers",
+                ))
+            }
+            Slot::Complex => return Err("ValueError: complex modulo".into()),
+            Slot::User => match dispatch_ternary_pow(a, b, m) {
+                Dunder::Value(v) => return Ok(v),
+                Dunder::Err(e) => return Err(e),
+                Dunder::NotImplemented => {}
+            },
+        }
+        offered.push(slot);
+    }
+    Err(with_host(|h| {
+        host::type_error(&format!(
+            "unsupported operand type(s) for ** or pow(): '{}', '{}', '{}'",
+            h.tp_name(a),
+            h.tp_name(b),
+            h.tp_name(m)
+        ))
+    }))
+}
+
 fn pow_mod(a: &Value, b: &Value, m: &Value) -> Result<Value, String> {
     use num_bigint::BigInt;
     use num_traits::ToPrimitive;

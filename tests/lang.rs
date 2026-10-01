@@ -9100,3 +9100,61 @@ fn float_repr_breaks_shortest_ties_to_even() {
          '0.30000000000000004', '-0.0', '123.0', '1.7976931348623157e+308']"
     );
 }
+
+/// `pow()` is the `**` operator: two arguments dispatch `__pow__`/`__rpow__`,
+/// and three go through CPython 3.14's `ternary_op` — each distinct operand
+/// type's `nb_power` in turn, a user class's being `a.__pow__(b, m)` then
+/// `b.__rpow__(a, m)`. The builtin used to skip the dunders entirely.
+#[test]
+fn pow_builtin_dispatches_like_the_operator() {
+    let cls = "class P:\n    def __pow__(s, o, m=None): return ('pow', o, m)\n    \
+               def __rpow__(s, o, m=None): return ('rpow', o, m)\n\
+               class Q:\n    def __pow__(s, o): return ('pow', o)\n\
+               class MyInt(int): pass\n\
+               class N: pass\n";
+    assert_eq!(
+        g(
+            &format!("{cls}x = (pow(P(), 2), pow(2, P()), pow(P(), 2, 5), pow(2, P(), 5), pow(MyInt(2), 3, 5), pow(2, 3, None))"),
+            "x"
+        ),
+        "(('pow', 2, None), ('rpow', 2, None), ('pow', 2, 5), ('rpow', 2, 5), 3, 8)"
+    );
+    for (src, want) in [
+        ("pow(Q(), 2, 5)", "TypeError: Q.__pow__() takes 2 positional arguments but 3 were given"),
+        ("pow(N(), 2, 3)", "TypeError: unsupported operand type(s) for ** or pow(): 'N', 'int', 'int'"),
+        ("pow(2, 3, N())", "TypeError: unsupported operand type(s) for ** or pow(): 'int', 'int', 'N'"),
+        ("pow('a', 2, 3)", "TypeError: unsupported operand type(s) for ** or pow(): 'str', 'int', 'int'"),
+        ("pow(2, 3, 1.5)", "TypeError: pow() 3rd argument not allowed unless all arguments are integers"),
+        ("pow(1j, 2, 3)", "ValueError: complex modulo"),
+        ("pow(N(), 2)", "TypeError: unsupported operand type(s) for ** or pow(): 'N' and 'int'"),
+        ("'a' ** 2", "TypeError: unsupported operand type(s) for ** or pow(): 'str' and 'int'"),
+        ("x = 'a'\nx **= 2", "TypeError: unsupported operand type(s) for **=: 'str' and 'int'"),
+    ] {
+        let src = format!("{cls}{src}");
+        assert_eq!(eval_str(&src).expect_err(&src), want, "{src}");
+    }
+}
+
+/// The result checks CPython's slot wrappers make on a user dunder: `__bool__`
+/// must return a `bool` (`1` is refused), `__format__` a `str`, and `bytes(x)`
+/// consults `__bytes__`, which must return `bytes`.
+#[test]
+fn bool_format_and_bytes_dunders_are_called_and_checked() {
+    let cls = "class B1:\n    def __bool__(s): return 1\n\
+               class F:\n    def __format__(s, spec): return 5\n\
+               class By:\n    def __bytes__(s): return b'by'\n\
+               class BadBy:\n    def __bytes__(s): return 'no'\n";
+    assert_eq!(g(&format!("{cls}x = bytes(By())"), "x"), "b'by'");
+    for (src, want) in [
+        ("bool(B1())", "TypeError: __bool__ should return bool, returned int"),
+        ("not B1()", "TypeError: __bool__ should return bool, returned int"),
+        ("1 if B1() else 2", "TypeError: __bool__ should return bool, returned int"),
+        ("format(F())", "TypeError: __format__ must return a str, not int"),
+        ("f'{F()}'", "TypeError: __format__ must return a str, not int"),
+        ("bytes(BadBy())", "TypeError: __bytes__ returned non-bytes (type str)"),
+        ("bytes(By(), 'utf-8')", "TypeError: encoding without a string argument"),
+    ] {
+        let src = format!("{cls}{src}");
+        assert_eq!(eval_str(&src).expect_err(&src), want, "{src}");
+    }
+}

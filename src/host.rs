@@ -7949,7 +7949,7 @@ impl PyHost {
                             let (r, i) = c_pow(x, y);
                             Ok(self.alloc(PyObj::Complex(r, i)))
                         }
-                        _ => Err(self.optype_err("**", a, b)),
+                        _ => Err(self.optype_err("** or pow()", a, b)),
                     }
                 }
                 _ => match (self.num_val_arith(a)?, self.num_val_arith(b)?) {
@@ -7994,7 +7994,7 @@ impl PyHost {
                         }
                         Ok(Value::Float(r))
                     }
-                    _ => Err(self.optype_err("**", a, b)),
+                    _ => Err(self.optype_err("** or pow()", a, b)),
                 },
             },
             binop::BITAND | binop::BITOR | binop::BITXOR => {
