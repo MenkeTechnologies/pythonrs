@@ -292,6 +292,9 @@ fn run_line(src: &str) {
             Color::Red.paint(crate::render_compile_error(&e, src, "<stdin>"))
         ),
     }
+    // `PyRun_InteractiveOneObject` ends every statement with `flush_io()`, after
+    // reporting its exception, so the next prompt follows everything it wrote.
+    crate::stdio::flush_io();
 }
 
 #[cfg(test)]

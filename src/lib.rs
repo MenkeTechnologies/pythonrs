@@ -33,6 +33,7 @@ pub mod pyhash;
 pub mod regexpr;
 pub mod repl;
 pub mod rust_ffi;
+pub mod stdio;
 pub mod stdlib;
 pub mod suggest;
 pub mod symtable;
@@ -160,9 +161,11 @@ pub fn eval_str(src: &str) -> Result<Value, String> {
     host::reset_host();
     host::init_runtime(vec![String::new()], None, src, "<string>", true);
     // A bare source string (`<string>`) is a throwaway program — don't cache it.
-    compile_or_load_cacheable(src, false)
-        .and_then(run_compiled)
-        .map_err(plain_error)
+    let result = compile_or_load_cacheable(src, false).and_then(run_compiled);
+    // The run is a whole interpreter lifetime: what it buffered on stdout
+    // reaches the descriptor now, as `Py_FinalizeEx` would put it there.
+    stdio::flush_std_files();
+    result.map_err(plain_error)
 }
 
 /// An error as an embedder reads it: a syntax error's position trailer (see
@@ -223,9 +226,9 @@ pub fn eval_file(path: &str) -> Result<Value, String> {
     let src = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
     host::reset_host();
     host::init_runtime(vec![path.to_string()], None, &src, path, true);
-    compile_or_load(&src)
-        .and_then(run_compiled)
-        .map_err(plain_error)
+    let result = compile_or_load(&src).and_then(run_compiled);
+    stdio::flush_std_files();
+    result.map_err(plain_error)
 }
 
 /// Run `python -m <module> [args…]`. Delegates to the embedded CPython's
@@ -293,12 +296,64 @@ pub struct RunReport {
     pub stderr: Option<String>,
 }
 
+/// When the binary flushes the standard streams relative to reporting the
+/// program's uncaught exception — the one place CPython's entry points differ.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReportOrder {
+    /// A script file or stdin (`_PyRun_SimpleFile`): `flush_io()` runs before
+    /// `PyErr_Print`, so the program's buffered stdout precedes the traceback.
+    FlushThenReport,
+    /// `-c` (`pymain_run_command` → `_PyRun_SimpleString`): the traceback is
+    /// printed first and buffered stdout only reaches the descriptor at
+    /// shutdown, after it.
+    ReportThenFlush,
+}
+
 /// Run a top-level program with a fully specified CLI/runtime context and reduce
 /// the outcome to a process exit code + stderr text (uncaught-exception traceback
-/// or `SystemExit` handling). This is the entry the `python` binary uses so that
-/// `sys.argv`, `__name__`/`__file__`, `sys.exit`, and tracebacks all behave like
-/// CPython.
+/// or `SystemExit` handling), running interpreter shutdown (`atexit`, stream
+/// flushes) before returning. The text is returned rather than printed, so an
+/// embedder or a test reads it; [`run_main_program`] is the binary's entry,
+/// which prints it at the point CPython does.
 pub fn run_program(
+    src: &str,
+    argv: Vec<String>,
+    main_file: Option<String>,
+    tb_filename: &str,
+    show_source: bool,
+) -> RunReport {
+    let report = execute_program(src, argv, main_file, tb_filename, show_source);
+    shut_down();
+    report
+}
+
+/// The `python` binary's run: [`run_program`] with the report written to
+/// stderr where CPython writes it — after the program's own buffered stdout for
+/// a script, before it for `-c` (see [`ReportOrder`]) — and before `atexit`
+/// callbacks run, since CPython prints the exception in `PyErr_Print` and runs
+/// `atexit` later, in `Py_FinalizeEx`. Returns the exit code.
+pub fn run_main_program(
+    src: &str,
+    argv: Vec<String>,
+    main_file: Option<String>,
+    tb_filename: &str,
+    show_source: bool,
+    order: ReportOrder,
+) -> i32 {
+    let report = execute_program(src, argv, main_file, tb_filename, show_source);
+    if order == ReportOrder::FlushThenReport {
+        stdio::flush_io();
+    }
+    if let Some(text) = &report.stderr {
+        stdio::write(stdio::Stream::Stderr, text);
+    }
+    shut_down();
+    report.exit_code
+}
+
+/// Compile and run `src` as `__main__`, classifying how it ended. Shutdown is
+/// the caller's.
+fn execute_program(
     src: &str,
     argv: Vec<String>,
     main_file: Option<String>,
@@ -332,18 +387,7 @@ pub fn run_program(
             }
         }
     }
-    let result = run_compiled(prog);
-    // `atexit` callbacks run at interpreter shutdown, after the top-level program
-    // finishes (whether it returned or raised), before teardown warnings.
-    host::run_atexit_callbacks();
-    // A CPython-side file the program left open is flushed here: the embedded
-    // interpreter is never finalized, so nothing else would.
-    #[cfg(feature = "stdlib-ffi")]
-    ffi::flush_open_files();
-    // CPython emits `RuntimeWarning: coroutine '…' was never awaited` for any
-    // coroutine that was created but never driven; do the same at teardown.
-    host::warn_unawaited_coroutines();
-    match result {
+    match run_compiled(prog) {
         Ok(_) => RunReport {
             exit_code: 0,
             stderr: None,
@@ -361,6 +405,22 @@ pub fn run_program(
     }
 }
 
+/// Interpreter shutdown, in `Py_FinalizeEx`'s order: `atexit` callbacks, then
+/// the remaining teardown output, then the standard streams are flushed.
+fn shut_down() {
+    // `atexit` callbacks run at interpreter shutdown, after the top-level program
+    // finishes (whether it returned or raised), before teardown warnings.
+    host::run_atexit_callbacks();
+    // A CPython-side file the program left open is flushed here: the embedded
+    // interpreter is never finalized, so nothing else would.
+    #[cfg(feature = "stdlib-ffi")]
+    ffi::flush_open_files();
+    // CPython emits `RuntimeWarning: coroutine '…' was never awaited` for any
+    // coroutine that was created but never driven; do the same at teardown.
+    host::warn_unawaited_coroutines();
+    stdio::flush_std_files();
+}
+
 /// Read and run a `.py` file under the DAP debugger.
 pub fn eval_file_debug(path: &str) -> Result<Value, String> {
     let src = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
@@ -369,6 +429,7 @@ pub fn eval_file_debug(path: &str) -> Result<Value, String> {
     host::set_debug_mode(true);
     let r = run_compiled(prog);
     host::set_debug_mode(false);
+    stdio::flush_std_files();
     r.map_err(plain_error)
 }
 

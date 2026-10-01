@@ -211,8 +211,9 @@ what is not yet implemented.
 | *(none)* | Run the script/one-liner, transparently rkyv-cached. |
 | `-c SRC` | Execute a one-liner (`python -c 'print(1+1)'`). |
 | `-m MODULE …` | Run a library module as a script. Delegates to the embedded CPython (`runpy`), so `-m pip` / `-m venv` / `-m http.server` / `-m json.tool` behave exactly like `python3 -m`; every token after the module is the module's own `sys.argv`. Needs the `stdlib-ffi` bridge (default build). |
-| `-u` | Sets `PYTHONUNBUFFERED` for the embedded interpreter. pythonrs's own `print` is already unbuffered on every stream, so the flag changes nothing on that side — see [BUGS.md](BUGS.md) for the buffering divergence this implies. |
-| `-E -I -O -S -B -W` | CPython interpreter flags, accepted for drop-in compatibility (`-u`/`-W` take real effect via the embedded interpreter; the rest are tolerated no-ops). |
+| `-u` | Unbuffered `stdout`/`stderr` (`PYTHONUNBUFFERED`). Without it the streams buffer as CPython's do: `stdout` line-buffered on a TTY and block-buffered on a pipe or file, `stderr` line-buffered, flushed at the same points (exit, `input()`, before a script's traceback). |
+| `-O` / `-OO` | Optimize (`PYTHONOPTIMIZE`): `-O` compiles `assert` away and sets `__debug__` to `False`; `-OO` also drops docstrings. `sys.flags.optimize` reports the level. |
+| `-E -I -S -B -W` | CPython interpreter flags, accepted for drop-in compatibility (`-W` takes real effect via the embedded interpreter; the rest are tolerated no-ops). |
 | `--build` | AOT-compile the script to a standalone native executable. Needs a libpython-free runtime — build with `--no-default-features`; a `stdlib-ffi` build refuses up front (its CPython symbols can't be statically linked). |
 | `--dump-bytecode` | Print the lowered `fusevm` bytecode and exit. |
 | `--dump-tokens` | Print the lexer token stream and exit. |

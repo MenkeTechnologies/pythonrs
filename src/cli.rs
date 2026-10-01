@@ -42,8 +42,8 @@ pub struct Cli {
     #[arg(short = 'B')]
     pub no_bytecode: bool,
 
-    /// Optimization level (CPython `-O` / `-OO`). Accepted for drop-in
-    /// compatibility.
+    /// Optimization level (CPython `-O` / `-OO`): `-O` compiles `assert` away,
+    /// `-OO` also drops docstrings.
     #[arg(short = 'O', action = clap::ArgAction::Count)]
     pub optimize: u8,
 

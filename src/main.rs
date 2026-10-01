@@ -6,6 +6,7 @@
 //! chunk; otherwise a file or `-c` one-liner is run. Errors go to stderr in
 //! terse `python: <reason>` form; nothing else is printed.
 
+use pythonrs::ReportOrder;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -126,14 +127,28 @@ fn run_main() -> ExitCode {
             let mut argv = vec!["-c".to_string()];
             argv.extend(args);
             let src = dedent_command(&src);
-            emit(pythonrs::run_program(&src, argv, None, "<string>", true))
+            process_exit(pythonrs::run_main_program(
+                &src,
+                argv,
+                None,
+                "<string>",
+                true,
+                ReportOrder::ReportThenFlush,
+            ))
         }
         // `python - …` reads the script from stdin (argv[0] == '-').
         Prog::Stdin => {
             let src = std::io::read_to_string(std::io::stdin()).unwrap_or_default();
             let mut argv = vec!["-".to_string()];
             argv.extend(args);
-            emit(pythonrs::run_program(&src, argv, None, "<stdin>", false))
+            process_exit(pythonrs::run_main_program(
+                &src,
+                argv,
+                None,
+                "<stdin>",
+                false,
+                ReportOrder::FlushThenReport,
+            ))
         }
         Prog::Script(file) => run_script(&cli, file, args),
         Prog::MissingArg(opt) => fail_usage(&format!("Argument expected for the {opt} option")),
@@ -152,7 +167,14 @@ fn run_main() -> ExitCode {
             let src = std::io::read_to_string(std::io::stdin()).unwrap_or_default();
             let mut argv = vec![String::new()];
             argv.extend(args);
-            emit(pythonrs::run_program(&src, argv, None, "<stdin>", false))
+            process_exit(pythonrs::run_main_program(
+                &src,
+                argv,
+                None,
+                "<stdin>",
+                false,
+                ReportOrder::FlushThenReport,
+            ))
         }
     }
 }
@@ -215,12 +237,13 @@ fn run_script(cli: &pythonrs::cli::Cli, file: String, args: Vec<String>) -> Exit
     let abs = abs_path(&file);
     let mut argv = vec![file];
     argv.extend(args);
-    emit(pythonrs::run_program(
+    process_exit(pythonrs::run_main_program(
         &src,
         argv,
         Some(abs.clone()),
         &abs,
         true,
+        ReportOrder::FlushThenReport,
     ))
 }
 
@@ -346,13 +369,10 @@ fn fail_usage(msg: &str) -> ExitCode {
     ExitCode::from(2)
 }
 
-/// Emit a run's stderr text (traceback / `SystemExit` message) and reduce its
-/// exit code to a process `ExitCode` (masked to 8 bits like the OS does).
-fn emit(report: pythonrs::RunReport) -> ExitCode {
-    if let Some(s) = &report.stderr {
-        eprint!("{s}");
-    }
-    ExitCode::from((report.exit_code & 0xFF) as u8)
+/// Reduce a run's exit code to a process `ExitCode` (masked to 8 bits like the
+/// OS does).
+fn process_exit(code: i32) -> ExitCode {
+    ExitCode::from((code & 0xFF) as u8)
 }
 
 /// CPython's `__file__` rule: an absolute path is kept; a relative one is joined

@@ -157,6 +157,11 @@ pub struct Compiler {
     /// instead of being discarded, so the REPL echoes `repr(value)` for non-`None`
     /// results. Off for ordinary script compiles.
     interactive: bool,
+    /// The interpreter's optimization level (`sys.flags.optimize`, set by
+    /// `-O`/`-OO`/`PYTHONOPTIMIZE`). Level 1 drops every `assert`; level 2 also
+    /// drops docstrings — CPython's `codegen_assert` and the `c_optimize < 2`
+    /// docstring guard in `codegen.c`.
+    optimize: u8,
     /// True while lowering a class body's own statements (not a nested def/class):
     /// a simple annotation (`x: int`) there records `x` into the class's
     /// `__annotations__` dict, so `dataclass`/`typing.NamedTuple` and
@@ -273,6 +278,7 @@ fn compile_ex(stmts: &[Stmt], debug: bool, interactive: bool) -> Result<Program,
     let mut c = Compiler {
         debug,
         interactive,
+        optimize: crate::host::optimize_level(),
         ..Default::default()
     };
     let mut b = ChunkBuilder::new();
@@ -280,7 +286,7 @@ fn compile_ex(stmts: &[Stmt], debug: bool, interactive: bool) -> Result<Program,
     // CPython stores a module's docstring as `__doc__` before running the body,
     // and emits that store ONLY when the body actually opens with a string
     // literal (`exec("x=1", g)` leaves `g` without a `__doc__`).
-    if let Some(doc) = docstring(stmts) {
+    if let Some(doc) = c.docstring(stmts) {
         let store = Stmt::from(StmtKind::Assign {
             targets: vec![Expr::Name("__doc__".to_string())],
             value: Expr::Str(doc),
@@ -1994,12 +2000,28 @@ impl Compiler {
         self.compile_stmts(b, &pre)
     }
 
+    /// The docstring this compile keeps for a module/class/function body: none
+    /// at all under `-OO`, where CPython emits no `__doc__` store and leaves
+    /// `co_consts[0]` without the text.
+    fn docstring(&self, body: &[Stmt]) -> Option<String> {
+        if self.optimize >= 2 {
+            return None;
+        }
+        docstring(body)
+    }
+
     fn compile_assert(
         &mut self,
         b: &mut ChunkBuilder,
         test: &Expr,
         msg: &Option<Expr>,
     ) -> Result<(), String> {
+        // `-O`: CPython compiles an `assert` to nothing at all (`codegen_assert`
+        // returns before emitting the test), so neither the test nor the
+        // message is evaluated.
+        if self.optimize > 0 {
+            return Ok(());
+        }
         self.compile_condition(b, test)?;
         let jok = b.emit(Op::JumpIfTrue(0), 0);
         match msg {
@@ -2329,7 +2351,7 @@ impl Compiler {
             locals,
             is_generator,
             is_async,
-            doc: docstring(body),
+            doc: self.docstring(body),
             freevars,
         };
         self.functions.push((name.to_string(), def));

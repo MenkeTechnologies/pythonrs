@@ -5550,19 +5550,44 @@ pub fn call_builtin_function(
             };
             let sep = text_kw("sep", " ")?;
             let end = text_kw("end", "\n")?;
-
-            let mut parts = Vec::new();
-            for a in &args {
-                parts.push(py_str(a)?);
-            }
-            let out = format!("{}{}", parts.join(&sep), end);
+            let flush = match kw_get(&kwargs, "flush") {
+                None => false,
+                Some(v) => py_bool(&v)?,
+            };
             // An explicit `file=` writes to that stream (a native `File` such as
             // `sys.stderr`, or any object with `write` — a `StringIO`); with no
-            // `file=`, write to the current `sys.stdout` (honoring a redirect).
-            let file = kw_get(&kwargs, "file").filter(|f| !matches!(f, Value::Undef));
-            match file {
-                Some(f) => host::write_to_stream(&f, &out)?,
-                None => host::write_stdout(&out)?,
+            // `file=`, the current `sys.stdout` (honoring a redirect), and
+            // nothing at all when that is `None`.
+            let file = match kw_get(&kwargs, "file").filter(|f| !matches!(f, Value::Undef)) {
+                Some(f) => Some(f),
+                None => match with_host(|h| h.stdout_target.clone()) {
+                    Some(Value::Undef) => return Ok(Value::Undef),
+                    target => target,
+                },
+            };
+            let write = |s: &str| match &file {
+                Some(f) => host::write_to_stream(f, s),
+                None => {
+                    with_host(|h| h.write_out(s, false));
+                    Ok(())
+                }
+            };
+            // `builtin_print_impl` makes one `write` per piece — separator,
+            // `str(arg)`, `end` — converting each argument just before writing
+            // it. The piece boundaries are where a buffered stream decides to
+            // flush, and a `str()` that raises leaves the earlier pieces written.
+            for (i, a) in args.iter().enumerate() {
+                if i > 0 {
+                    write(&sep)?;
+                }
+                write(&py_str(a)?)?;
+            }
+            write(&end)?;
+            if flush {
+                match &file {
+                    Some(f) => host::flush_stream(f)?,
+                    None => crate::stdio::flush(crate::stdio::Stream::Stdout),
+                }
             }
             Ok(Value::Undef)
         }
@@ -6377,10 +6402,15 @@ pub fn call_builtin_function(
             }
         }
         "input" => {
+            // `builtin_input_impl`: flush `sys.stderr`, write the prompt to
+            // `sys.stdout`, flush `sys.stdout` — so a block-buffered stdout still
+            // shows everything printed so far before the program blocks.
+            host::flush_stderr()?;
             if let Some(p) = args.first() {
                 let s = py_str(p)?;
-                with_host(|h| h.write_out(&s, false));
+                host::write_stdout(&s)?;
             }
+            host::flush_stdout()?;
             let mut line = String::new();
             let _ = std::io::stdin().read_line(&mut line);
             let line = line

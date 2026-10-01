@@ -77,6 +77,37 @@ written.
   `OrderedDict.pop` hashes first and keeps the bare `unhashable type` message.
   This was the last shape of the unhashable-key entry: the other sixteen
   already named the container role.
+- **`stdout`/`stderr` are buffered as CPython buffers them.** pythonrs flushed
+  every write, so `python prog.py > log 2>&1` came out in program order where
+  CPython's comes out in flush order (`err1 err2 out1 out2` for two
+  print/stderr pairs), `print("kept", end=""); os._exit(0)` kept output CPython
+  loses, and `-u` had nothing to change. `src/stdio.rs` now ports both layers
+  of `create_stdio`'s stack: `TextIOWrapper.write`'s 8192-byte pending chunk
+  (flushed on a newline when line-buffered, every write when write-through)
+  over `BufferedWriter.write`'s buffer, sized by `io.open`'s
+  `max(min(st_blksize, 8 MiB), DEFAULT_BUFFER_SIZE)`. `stdout` is
+  line-buffered on a TTY and block-buffered otherwise, `stderr` is
+  line-buffered, and `-u`/`PYTHONUNBUFFERED` drops the buffer and writes
+  through. The flush points are CPython's: a script file or stdin flushes
+  before its traceback/`SystemExit` message (`_PyRun_SimpleFile`'s
+  `flush_io`) while `-c` prints the traceback first; `atexit` callbacks run
+  after the report and shutdown flushes stdout then stderr; `input()` flushes
+  stderr, writes the prompt to `sys.stdout` and flushes it; each REPL statement
+  ends with `flush_io`. `print` makes one `write` per separator / argument /
+  `end` (`builtin_print_impl`), honours `flush=`, and prints nothing when
+  `sys.stdout` is `None`. The embedded interpreter's `sys.stdout`/`sys.stderr`
+  are write-through `TextIOWrapper`s over the same streams, so CPython-side
+  `print` shares the one buffer. The DAP adapter switches the streams to
+  write-through so `output` events are not held to the end of the run. This is
+  also what `examples/argparse_demo.py`'s usage block was missing: it now
+  precedes the program's stdout in a merged log, as under CPython (the
+  `choose from 'fast', 'safe', 'auto'` quoting already matched).
+- **`-O`/`-OO` optimize.** `-O` only reached `__debug__`. The compiler now
+  carries the level: at 1 an `assert` compiles to nothing, so neither its test
+  nor its message runs (`codegen_assert`), and at 2 module, class and function
+  docstrings are dropped, so `__doc__` is `None`. `sys.flags.optimize` reports
+  the level, and the level is part of the bytecode-cache key, as it is part of a
+  `.pyc`'s name, so a chunk compiled at one level is never served to another.
 - **`itertools.groupby` is lazy.** It drained its input and built every group
   as a list up front, so it never returned on an infinite iterator
   (`groupby(count(), key=…)`), each group was a `list` instead of an
@@ -616,8 +647,8 @@ written.
   now resolves everywhere and is False exactly when the interpreter is
   optimized; `-O`/`-OO` are folded into `PYTHONOPTIMIZE` so both spellings share
   one source of truth, with CPython's lax parse (empty is 0, an integer is that
-  integer, any other non-empty value is 1). Assert stripping under `-O` is still
-  not implemented — see "Partial / simplified semantics".
+  integer, any other non-empty value is 1). Assert and docstring stripping
+  under `-O`/`-OO` is covered above.
 - **`function.__isabstractmethod__` raises `AttributeError`.** The slot belongs
   to `staticmethod`/`classmethod`/`property`, not to `function`; answering
   `False` on a plain function hid the real shape (`abc` reads it with a
@@ -824,8 +855,9 @@ written.
   is never `Py_Finalize`d. A pythonrs builtin handed to CPython crosses as the
   genuine CPython builtin, so `functools.partial(print, …)`,
   `ExitStack.callback(print, …)` and friends wrote through that stream — their
-  output came out reordered, or was dropped at exit. Both streams are line
-  buffered at bridge init (`ffi::line_buffer_std_streams`).
+  output came out reordered, or was dropped at exit. The embedded interpreter's
+  streams now write through into pythonrs's own (`ffi::route_std_streams`), so
+  there is one buffer.
 - **`sys.argv` reaches the bridged stdlib.** `argparse` — and `getopt`, `pdb`,
   `unittest` — run on the embedded interpreter and read ITS `sys.argv`, a list
   libpython builds at startup as `['']` because nothing passes the program's
@@ -1500,31 +1532,6 @@ written.
   `__module__` is `'re'`, with the traceback reading `re.PatternError:`. What
   remains missing is the type object itself — `__mro__` and `isinstance`
   against a real class.
-
-- **`stdout` is never block-buffered, so a merged stream interleaves
-  differently.** CPython line-buffers `stdout` on a TTY and BLOCK-buffers it on
-  a pipe or file, while `stderr` stays unbuffered; pythonrs flushes `stdout` on
-  every write. Redirected output therefore comes out in a different order:
-
-      import sys
-      print("out1"); sys.stderr.write("err1\n")
-      print("out2"); sys.stderr.write("err2\n")
-
-      $ python3 prog.py > log 2>&1   ->  err1 err2 out1 out2
-      $ python  prog.py > log 2>&1   ->  out1 err1 out2 err2
-
-  The same difference makes pythonrs KEEP output CPython drops:
-  `print("kept", end=""); os._exit(0)` prints `kept` here and nothing under
-  CPython, because `os._exit` skips the flush of a buffer pythonrs does not
-  have. `-u` cannot be observed on the pythonrs side for the same reason — the
-  streams it would unbuffer are already unbuffered. Neither differential harness
-  can see any of this: `dropin_check.sh` discards stderr and `parity-fuzz` reads
-  the two streams through separate pipes, so the interleaving is never compared.
-  Closing it means owning a real `BufWriter` for `stdout` with a TTY check, a
-  flush at normal exit and before `input()`, and matching buffering on the
-  embedded interpreter's side (`ffi.rs::line_buffer_std_streams` currently
-  line-buffers CPython's streams specifically to match the unbuffered behaviour
-  described here).
 - **A user exception raised out of a wrapped generator loses its identity, not
   its class.** `PyrsIterator` now implements the generator protocol
   (`send`/`throw`/`close` beside `__iter__`/`__next__`), so
@@ -1538,12 +1545,6 @@ written.
   shorter. Closing it means carrying the CPython object's identity through the
   pythonrs exception value rather than rebuilding from class + args. Reachable
   from `parity-fuzz --mode ctxmgr` and `--mode stdlibexc`.
-- **`-O` reaches `__debug__` and nothing else.** The flag sets `__debug__` to
-  False, but the compiler still emits every `assert` (so an optimized run keeps
-  checking them) and `sys.flags.optimize` still reports 0. Skipping asserts at
-  compile time means threading the level into the bytecode CACHE KEY as well —
-  otherwise a chunk compiled under `-O` would be reused without it — so it is
-  deliberately not bolted on to the flag alone.
 - **`types.UnionType is type(int | str)` is False on the ffi build.** In the
   self-contained build `types.py` binds `type(int | str)` and the identity
   holds. Under `stdlib-ffi`, `types.UnionType` and `typing.Union` are both
@@ -1745,15 +1746,6 @@ written.
   the shortcut cannot be reproduced. The identity shortcut IS applied to heap
   objects, which is what makes `[P(1)] == [P(1)]` and `[x] == [x]` correct for
   everything with a heap identity.
-
-- **`argparse` orders its usage block after the program's own output, and does
-  not quote invalid choices.** `examples/argparse_demo.py` prints the
-  `usage: …` / `tool: error: argument --mode: invalid choice: …` block AFTER the
-  lines the program itself wrote, where CPython prints it first, and renders
-  `choose from fast, safe, auto` where CPython 3.14 writes
-  `choose from 'fast', 'safe', 'auto'`. The ordering half looks like a
-  stdout/stderr flush-interleaving difference rather than an argparse one. This
-  is the single divergence in the 42-file example corpus.
 
 ## VM-level limits (fusevm, not fixable from here)
 

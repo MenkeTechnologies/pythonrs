@@ -255,7 +255,11 @@ pub extern "C" fn pythonrs_aot_run_embedded() -> i64 {
     // left on the host by `builtins::abort`; render it like the interpreter (a
     // traceback with carets, or a `SystemExit` code/message). fusevm's own runner
     // reports only NATIVE VM errors and drops this, exiting 0 silently.
-    match host::with_host(|h| h.take_error()) {
+    // A standalone binary runs a script file, so its streams are flushed the
+    // way `_PyRun_SimpleFile` flushes them: buffered stdout before the report,
+    // and everything again at exit.
+    crate::stdio::flush_io();
+    let code = match host::with_host(|h| h.take_error()) {
         None => 0,
         Some(e) => match host::classify_top_error(&e) {
             host::TopExit::SystemExit { code, message } => {
@@ -269,5 +273,7 @@ pub extern "C" fn pythonrs_aot_run_embedded() -> i64 {
                 1
             }
         },
-    }
+    };
+    crate::stdio::flush_std_files();
+    code
 }

@@ -277,38 +277,61 @@ pub fn init() -> bool {
         }
         pyo3::prepare_freethreaded_python();
         INTERPRETER_STARTED.store(true, std::sync::atomic::Ordering::Relaxed);
-        line_buffer_std_streams();
+        route_std_streams();
     });
     BRIDGE_USABLE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Line-buffer the embedded interpreter's `sys.stdout`/`sys.stderr`.
+/// Point the embedded interpreter's `sys.stdout`/`sys.stderr` at pythonrs's own
+/// standard streams.
 ///
-/// pythonrs's own `print` writes straight to the fd and flushes every call,
-/// while CPython's `sys.stdout` is block-buffered on a pipe and the embedded
-/// interpreter is never `Py_Finalize`d — the process just exits. Anything that
-/// reaches CPython's real `print` (`functools.partial(print, …)`,
-/// `ExitStack.callback(print, …)`, `atexit.register(print, …)` — a pythonrs
-/// builtin crosses as the genuine CPython builtin) therefore came out in the
-/// wrong order relative to pythonrs's own output, or was dropped entirely at
-/// exit. Line buffering puts each CPython-side line on the fd as it is written,
-/// which is the order a single-interpreter CPython would produce.
+/// One process has one `stdout`, and CPython buffers it in one place. With two
+/// buffers — pythonrs's ([`crate::stdio`]) and the embedded interpreter's own
+/// `TextIOWrapper` — anything that reaches CPython's real `print`
+/// (`functools.partial(print, …)`, `ExitStack.callback(print, …)`,
+/// `atexit.register(print, …)`, a bridged module writing `sys.stdout`) would
+/// reach the descriptor in whichever order the two happened to flush, or be lost
+/// entirely, since the embedded interpreter is never `Py_Finalize`d.
 ///
-/// `reconfigure` exists only on `TextIOWrapper`; a redirected or detached stream
-/// silently keeps whatever buffering it has.
-fn line_buffer_std_streams() {
+/// So each stream is replaced by a `TextIOWrapper` that keeps CPython's text
+/// API (`encoding`, `errors`, `newline`, `write` returning a character count)
+/// but is write-through over a [`PyrsStdStream`], which hands every write to
+/// the same text layer pythonrs's `print` uses. The buffering decisions — line
+/// vs block, `-u` — are then made once, by that layer. `sys.__stdout__` and
+/// `sys.__stderr__` follow, as they name the same object in CPython.
+fn route_std_streams() {
     Python::with_gil(|py| {
-        let sys = match py.import("sys") {
-            Ok(m) => m,
-            Err(_) => return,
+        let (Ok(sys), Ok(io)) = (py.import("sys"), py.import("io")) else {
+            return;
         };
-        for stream in ["stdout", "stderr"] {
-            if let Ok(s) = sys.getattr(stream) {
-                let kw = PyDict::new(py);
-                if kw.set_item("line_buffering", true).is_ok() {
-                    let _ = s.call_method("reconfigure", (), Some(&kw));
+        for (name, stream) in [
+            ("stdout", crate::stdio::Stream::Stdout),
+            ("stderr", crate::stdio::Stream::Stderr),
+        ] {
+            let Ok(old) = sys.getattr(name) else { continue };
+            // A stream CPython left as `None` (its descriptor was closed at
+            // startup) stays `None`.
+            if old.is_none() {
+                continue;
+            }
+            let kw = PyDict::new(py);
+            for attr in ["encoding", "errors"] {
+                if let Ok(v) = old.getattr(attr) {
+                    let _ = kw.set_item(attr, v);
                 }
             }
+            let _ = kw.set_item("newline", "\n");
+            let _ = kw.set_item("write_through", true);
+            let Ok(raw) = Py::new(py, PyrsStdStream { stream }) else { continue };
+            let Ok(new) = io
+                .getattr("TextIOWrapper")
+                .and_then(|cls| cls.call((raw,), Some(&kw)))
+            else {
+                continue;
+            };
+            let _ = new.setattr("mode", "w");
+            let _ = sys.setattr(name, &new);
+            let _ = sys.setattr(format!("__{name}__").as_str(), &new);
         }
     });
 }
@@ -2147,6 +2170,75 @@ impl PyrsIndexInstance {
 // routes back to the same `file_method` the interpreter uses, with no host
 // borrow held (CPython calls these outside the marshalling window). Plain `//`
 // so the doc text doesn't become a leaking `__doc__`.
+// The binary layer under the embedded interpreter's `sys.stdout`/`sys.stderr`
+// (see `route_std_streams`): every byte its write-through `TextIOWrapper` hands
+// down goes into pythonrs's own stream, so both interpreters share one buffer.
+// It answers the probes `TextIOWrapper` and stream users make of a buffer
+// (`readable`/`writable`/`seekable`/`closed`/`fileno`/`isatty`/`name`).
+#[pyclass]
+struct PyrsStdStream {
+    stream: crate::stdio::Stream,
+}
+
+impl PyrsStdStream {
+    fn fd(&self) -> i32 {
+        match self.stream {
+            crate::stdio::Stream::Stdout => 1,
+            crate::stdio::Stream::Stderr => 2,
+        }
+    }
+}
+
+#[pymethods]
+impl PyrsStdStream {
+    fn write(&self, data: &[u8]) -> usize {
+        crate::stdio::write_bytes(self.stream, data);
+        data.len()
+    }
+
+    fn flush(&self) {
+        crate::stdio::flush(self.stream);
+    }
+
+    fn close(&self) {
+        self.flush();
+    }
+
+    fn fileno(&self) -> i32 {
+        self.fd()
+    }
+
+    fn isatty(&self) -> bool {
+        // SAFETY: `isatty` only queries the descriptor.
+        unsafe { libc::isatty(self.fd()) == 1 }
+    }
+
+    fn readable(&self) -> bool {
+        false
+    }
+
+    fn writable(&self) -> bool {
+        true
+    }
+
+    fn seekable(&self) -> bool {
+        false
+    }
+
+    #[getter]
+    fn closed(&self) -> bool {
+        false
+    }
+
+    #[getter]
+    fn name(&self) -> &'static str {
+        match self.stream {
+            crate::stdio::Stream::Stdout => "<stdout>",
+            crate::stdio::Stream::Stderr => "<stderr>",
+        }
+    }
+}
+
 #[pyclass]
 struct PyrsFile {
     target: Value,

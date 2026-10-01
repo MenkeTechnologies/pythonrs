@@ -116,8 +116,10 @@ dispatch; `[in-flight]` = being implemented in the current host pass.
       `stdlib-ffi` bridge; a `--no-default-features` build reports and exits 1.
 - [x] **CPython interpreter flags** `-u -E -I -O/-OO -S -B -W <action>` — accepted
       for drop-in compatibility (previously hard-errored via clap). `-u` →
-      `PYTHONUNBUFFERED`, `-W` → `PYTHONWARNINGS` (real effect on the embedded
-      interpreter); `-E/-I/-O/-S/-B` are tolerated no-ops. (`src/cli.rs`,
+      `PYTHONUNBUFFERED` (unbuffered standard streams, `src/stdio.rs`), `-O`/`-OO`
+      → `PYTHONOPTIMIZE` (asserts / docstrings compiled away), `-W` →
+      `PYTHONWARNINGS` (real effect on the embedded interpreter); `-E/-I/-S/-B`
+      are tolerated no-ops. (`src/cli.rs`,
       `src/main.rs`.)
 
 ## Tier 1 — File & process I/O (top blocker for real scripts)

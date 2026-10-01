@@ -307,6 +307,11 @@ fn launch(program: &str) {
         s.active = true;
     });
 
+    // The pipe is not a TTY, so stdout would block-buffer and every `output`
+    // event would wait for the program to end. A debug adapter relays each write
+    // as it happens (debugpy redirects `sys.stdout` writes the same way), so the
+    // streams go write-through for the session.
+    crate::stdio::set_write_through();
     if let Err(e) = crate::eval_file_debug(program) {
         eprintln!("python: {e}");
     }

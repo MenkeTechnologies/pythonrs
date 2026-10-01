@@ -19249,7 +19249,7 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                     ("debug", 0),
                     ("inspect", 0),
                     ("interactive", 0),
-                    ("optimize", 0),
+                    ("optimize", optimize_level() as i64),
                     ("dont_write_bytecode", 0),
                     ("no_user_site", 0),
                     ("no_site", 0),
@@ -20368,23 +20368,20 @@ impl PyHost {
     }
 
     /// Write program output: into the capture buffer when capturing, else to the
-    /// native stream `stderr` selects. `s` is written verbatim — `print` has
-    /// already applied `sep`/`end`.
+    /// native stream `stderr` selects, which buffers it as CPython's
+    /// `sys.stdout`/`sys.stderr` would (see [`crate::stdio`]). `s` is one
+    /// `write` call's text, verbatim.
     pub fn write_out(&mut self, s: &str, stderr: bool) {
+        self.write_out_bytes(s.as_bytes(), stderr);
+    }
+
+    /// [`write_out`](PyHost::write_out) for text that is already UTF-8 bytes.
+    fn write_out_bytes(&mut self, bytes: &[u8], stderr: bool) {
         if let Some(buf) = &mut self.capture {
-            buf.push_str(s);
+            buf.push_str(&String::from_utf8_lossy(bytes));
             return;
         }
-        use std::io::Write;
-        if stderr {
-            let mut o = std::io::stderr();
-            let _ = o.write_all(s.as_bytes());
-            let _ = o.flush();
-        } else {
-            let mut o = std::io::stdout();
-            let _ = o.write_all(s.as_bytes());
-            let _ = o.flush();
-        }
+        crate::stdio::write_bytes(std_stream(stderr), bytes);
     }
 
     /// `f.write(...)` at the byte layer — returns the number of bytes written.
@@ -20396,7 +20393,7 @@ impl PyHost {
         match self.io_handles.get(id as usize) {
             Some(IoCell::Stdout) | Some(IoCell::Stderr) => {
                 let stderr = matches!(self.io_handles.get(id as usize), Some(IoCell::Stderr));
-                self.write_out(&String::from_utf8_lossy(bytes), stderr);
+                self.write_out_bytes(bytes, stderr);
                 return Ok(Value::Int(bytes.len() as i64));
             }
             _ => {}
@@ -20500,8 +20497,14 @@ impl PyHost {
     pub fn io_flush(&mut self, id: u32) -> Result<(), String> {
         use std::io::Write;
         match self.io_handles.get_mut(id as usize) {
-            Some(IoCell::Stdout) => std::io::stdout().flush().map_err(io_err),
-            Some(IoCell::Stderr) => std::io::stderr().flush().map_err(io_err),
+            Some(IoCell::Stdout) => {
+                crate::stdio::flush(crate::stdio::Stream::Stdout);
+                Ok(())
+            }
+            Some(IoCell::Stderr) => {
+                crate::stdio::flush(crate::stdio::Stream::Stderr);
+                Ok(())
+            }
             Some(IoCell::File { file: Some(f), .. }) => f.flush().map_err(io_err),
             _ => Ok(()),
         }
@@ -20729,6 +20732,48 @@ pub fn write_stderr(s: &str) -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+/// The native stream a `stderr` flag selects.
+fn std_stream(stderr: bool) -> crate::stdio::Stream {
+    if stderr {
+        crate::stdio::Stream::Stderr
+    } else {
+        crate::stdio::Stream::Stdout
+    }
+}
+
+/// `sys.stdout.flush()` on the CURRENT `sys.stdout`: the redirect target's own
+/// `flush` when reassigned, else the native stream.
+pub fn flush_stdout() -> Result<(), String> {
+    match with_host(|h| h.stdout_target.clone()) {
+        Some(t) => flush_stream(&t),
+        None => {
+            crate::stdio::flush(crate::stdio::Stream::Stdout);
+            Ok(())
+        }
+    }
+}
+
+/// `sys.stderr.flush()` on the current `sys.stderr`.
+pub fn flush_stderr() -> Result<(), String> {
+    match with_host(|h| h.stderr_target.clone()) {
+        Some(t) => flush_stream(&t),
+        None => {
+            crate::stdio::flush(crate::stdio::Stream::Stderr);
+            Ok(())
+        }
+    }
+}
+
+/// `file.flush()` on a print target: a native `File` handle flushes its stream,
+/// any other object has its `flush` method called (CPython's `_PyFile_Flush`).
+pub fn flush_stream(target: &Value) -> Result<(), String> {
+    if let Some(id) = with_host(|h| h.file_id(target)) {
+        return with_host(|h| h.io_flush(id));
+    }
+    call_method(target, "flush", vec![], vec![])?;
+    Ok(())
 }
 
 // ── collections constructors ─────────────────────────────────────────────────

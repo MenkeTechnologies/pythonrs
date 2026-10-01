@@ -260,11 +260,17 @@ fn build_fingerprint() -> u64 {
 }
 
 /// A stable content key for a source string (fast `FxHash`, used for lookup).
+///
+/// The optimization level is part of the key, as it is part of a `.pyc`'s name
+/// (`opt-1`/`opt-2`): a chunk compiled under `-O` has no asserts and one compiled
+/// under `-OO` has no docstrings, so neither may be served to a run at another
+/// level.
 pub fn key_for(src: &str) -> u64 {
     let mut h = rustc_hash::FxHasher::default();
     SCHEMA.hash(&mut h);
     BUILD_VERSION.hash(&mut h);
     build_fingerprint().hash(&mut h);
+    crate::host::optimize_level().hash(&mut h);
     src.hash(&mut h);
     h.finish()
 }
@@ -277,6 +283,7 @@ fn verify_for(src: &str) -> u64 {
     SCHEMA.hash(&mut h);
     BUILD_VERSION.hash(&mut h);
     build_fingerprint().hash(&mut h);
+    crate::host::optimize_level().hash(&mut h);
     src.len().hash(&mut h);
     src.hash(&mut h);
     h.finish()

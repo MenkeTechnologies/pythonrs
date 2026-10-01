@@ -1278,3 +1278,224 @@ fn pep479_stopiteration_keeps_the_generator_frame() {
         )
     );
 }
+
+/// Run the binary with stdout AND stderr on one file — `python … > log 2>&1` —
+/// and return the log. `home` keeps the bytecode cache out of the real `~`.
+fn merged_output(args: &[&str], stdin: &str, home: &std::path::Path) -> String {
+    use std::io::Write;
+    let log = home.join(format!("merged-{}.log", args.len()));
+    let out = std::fs::File::create(&log).expect("create log");
+    let err = out.try_clone().expect("dup log handle");
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_python"))
+        .args(args)
+        .env("HOME", home)
+        .env_remove("PYTHONUNBUFFERED")
+        .stdin(std::process::Stdio::piped())
+        .stdout(out)
+        .stderr(err)
+        .spawn()
+        .expect("spawn python binary");
+    child
+        .stdin
+        .take()
+        .expect("stdin pipe")
+        .write_all(stdin.as_bytes())
+        .expect("feed stdin");
+    child.wait().expect("wait for python binary");
+    std::fs::read_to_string(&log).expect("read log")
+}
+
+/// A fresh scratch directory for one test.
+fn scratch_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("pythonrs-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create scratch dir");
+    dir
+}
+
+/// `stdout` is block-buffered on a file and `stderr` line-buffered, as
+/// `create_stdio` sets them up, so a merged log is ordered by FLUSH, not by
+/// program order. Every expectation is python3.14's output for the same
+/// invocation redirected the same way.
+#[test]
+fn merged_streams_order_by_cpython_buffering() {
+    let dir = scratch_dir("stdio");
+    let script = dir.join("prog.py");
+    std::fs::write(
+        &script,
+        "import sys\nprint('out1'); sys.stderr.write('err1\\n')\nprint('out2'); sys.stderr.write('err2\\n')\n",
+    )
+    .expect("write script");
+    let script = script.to_str().expect("utf-8 path");
+
+    // Buffered stdout reaches the file at exit, after both stderr lines.
+    assert_eq!(merged_output(&[script], "", &dir), "err1\nerr2\nout1\nout2\n");
+    // `-u` makes both streams write-through: program order.
+    assert_eq!(
+        merged_output(&["-u", script], "", &dir),
+        "out1\nerr1\nout2\nerr2\n"
+    );
+    // `-c` prints the traceback before shutdown flushes stdout...
+    assert_eq!(
+        merged_output(&["-c", "print('a'); 1/0"], "", &dir),
+        "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n    \
+         print('a'); 1/0\n                ~^~\nZeroDivisionError: division by zero\na\n"
+    );
+    // ...while a script file flushes first (`_PyRun_SimpleFile`'s `flush_io`).
+    let failing = dir.join("fail.py");
+    std::fs::write(&failing, "print('a')\nraise SystemExit('bye')\n").expect("write script");
+    assert_eq!(
+        merged_output(&[failing.to_str().expect("utf-8 path")], "", &dir),
+        "a\nbye\n"
+    );
+    // `stderr` holds a partial line until its newline.
+    assert_eq!(
+        merged_output(
+            &["-c", "import sys; sys.stderr.write('e'); print('a'); sys.stderr.write('f\\n')"],
+            "",
+            &dir
+        ),
+        "ef\na\n"
+    );
+    // `os._exit` skips the flush, so buffered output is lost.
+    assert_eq!(
+        merged_output(&["-c", "print('kept', end=''); import os; os._exit(0)"], "", &dir),
+        ""
+    );
+    // An `atexit` callback prints after the traceback.
+    assert_eq!(
+        merged_output(
+            &["-c", "import atexit; atexit.register(print, 'x'); raise SystemExit('bye')"],
+            "",
+            &dir
+        ),
+        "bye\nx\n"
+    );
+    // `input()` flushes stdout before it blocks, prompt included.
+    assert_eq!(
+        merged_output(
+            &[
+                "-c",
+                "print('a', end=''); x = input('name? '); print('got', x)\n\
+                 import sys; sys.stderr.write('E\\n'); print('z')"
+            ],
+            "bob\n",
+            &dir
+        ),
+        "aname? E\ngot bob\nz\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The block size is `io.open`'s: 128 KiB (`DEFAULT_BUFFER_SIZE`) for a regular
+/// file, filled in `_CHUNK_SIZE` hand-offs from the text layer. With 100-byte
+/// lines the text layer passes 82 lines (8200 bytes) at a time, so the first
+/// write to the file is 15 such chunks — 1230 lines — when the 16th does not
+/// fit, after the 1311th stderr line. The layout is python3.14's.
+#[test]
+fn block_buffered_stdout_flushes_at_cpython_chunk_boundaries() {
+    let dir = scratch_dir("stdio-block");
+    let log = merged_output(
+        &[
+            "-c",
+            "import sys\nfor i in range(3000):\n    sys.stdout.write('%04d' % i + 'x' * 95 + '\\n')\n    sys.stderr.write('E%d\\n' % i)\n",
+        ],
+        "",
+        &dir,
+    );
+    let out = |r: std::ops::Range<usize>| r.map(|i| format!("{i:04}{}\n", "x".repeat(95)));
+    let err = |r: std::ops::Range<usize>| r.map(|i| format!("E{i}\n"));
+    let want: String = err(0..1311)
+        .chain(out(0..1230))
+        .chain(err(1311..2541))
+        .chain(out(1230..2460))
+        .chain(err(2541..3000))
+        .chain(out(2460..3000))
+        .collect();
+    assert!(log == want, "first divergence at byte {}", {
+        log.bytes().zip(want.bytes()).take_while(|(a, b)| a == b).count()
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `print` is one `write` per piece — each separator, each `str(arg)`, then
+/// `end` — then `flush()` when asked, and nothing at all when `sys.stdout` is
+/// `None` (`builtin_print_impl`). A `__str__` that raises leaves the pieces
+/// before it written. Expected list is python3.14's.
+#[test]
+fn print_writes_each_piece_and_honours_flush() {
+    assert_eq!(
+        g(
+            "calls = []\n\
+             class W:\n\
+            \x20   def write(self, s): calls.append(s)\n\
+            \x20   def flush(self): calls.append('<flush>')\n\
+             print(1, 'b', 3.5, sep='-', end='!', file=W())\n\
+             print(file=W(), flush=True)\n\
+             print('x', file=W(), flush=False)\n\
+             class Bad:\n\
+            \x20   def __str__(self): raise ValueError('no')\n\
+             try:\n\
+            \x20   print('ok', Bad(), file=W())\n\
+             except ValueError:\n\
+            \x20   calls.append('<raised>')\n\
+             import sys\n\
+             sys.stdout = None\n\
+             print('dropped')\n\
+             sys.stdout = sys.__stdout__\n",
+            "calls"
+        ),
+        "['1', '-', 'b', '-', '3.5', '!', '\\n', '<flush>', 'x', '\\n', 'ok', ' ', '<raised>']"
+    );
+}
+
+/// `-O` compiles every `assert` away (neither test nor message runs) and `-OO`
+/// also drops docstrings; `sys.flags.optimize` reports the level. The same
+/// script is run at each level against ONE bytecode cache, so a chunk compiled
+/// at one level being served to another shows up as a wrong line. Expected
+/// lines are python3.14's.
+#[test]
+fn optimize_levels_strip_asserts_and_docstrings() {
+    let dir = scratch_dir("optimize");
+    let script = dir.join("opt.py");
+    std::fs::write(
+        &script,
+        "\"\"\"M\"\"\"\n\
+         import sys\n\
+         class C:\n\
+        \x20   \"\"\"cd\"\"\"\n\
+         def f():\n\
+        \x20   \"\"\"fd\"\"\"\n\
+        \x20   assert False, side('fmsg')\n\
+         log = []\n\
+         def side(x):\n\
+        \x20   log.append(x)\n\
+        \x20   return x\n\
+         try:\n\
+        \x20   assert False, side('boom')\n\
+        \x20   a = 'kept'\n\
+         except AssertionError as e:\n\
+        \x20   a = repr(e)\n\
+         try:\n\
+        \x20   f(); b = 'kept'\n\
+         except AssertionError as e:\n\
+        \x20   b = repr(e)\n\
+         print(sys.flags.optimize, __doc__, C.__doc__, f.__doc__, a, b, log, __debug__)\n",
+    )
+    .expect("write script");
+    let run = |flag: Option<&str>| {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_python"));
+        cmd.env("HOME", &dir).env_remove("PYTHONOPTIMIZE");
+        if let Some(f) = flag {
+            cmd.arg(f);
+        }
+        let out = cmd.arg(&script).output().expect("spawn python binary");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let plain = "0 M cd fd AssertionError('boom') AssertionError('fmsg') ['boom', 'fmsg'] True\n";
+    assert_eq!(run(None), plain);
+    assert_eq!(run(Some("-O")), "1 M cd fd kept kept [] False\n");
+    assert_eq!(run(Some("-OO")), "2 None None None kept kept [] False\n");
+    assert_eq!(run(None), plain, "a cached -OO chunk was served to an unoptimized run");
+    let _ = std::fs::remove_dir_all(&dir);
+}
