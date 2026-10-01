@@ -7056,6 +7056,7 @@ pub fn call_builtin_function(
                         len,
                         readonly,
                         released,
+                        ..
                     }) => {
                         if *released {
                             return Err(host::MV_RELEASED.to_string());
@@ -7067,6 +7068,7 @@ pub fn call_builtin_function(
                             len,
                             readonly,
                             released: false,
+                            hashed: Default::default(),
                         }));
                     }
                     _ => {
@@ -7082,6 +7084,7 @@ pub fn call_builtin_function(
                     len,
                     readonly,
                     released: false,
+                    hashed: Default::default(),
                 }))
             })
         }

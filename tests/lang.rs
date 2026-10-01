@@ -775,6 +775,24 @@ fn range_and_readonly_memoryview_are_hashable() {
     );
 }
 
+/// `memory_hash` caches its number on the view (`self->hash`) and consults the
+/// cache before the released check, so a view hashed while live keeps
+/// hashing — and keeps working as a dict key — after `release()`. pythonrs
+/// recomputed every time and raised `operation forbidden on released
+/// memoryview object` for it. Expectations are python3.14's.
+#[test]
+fn memoryview_hash_survives_release_once_computed() {
+    assert_eq!(
+        g(
+            "m = memoryview(b'abc')\nh = hash(m)\nm.release()\n\
+             s = memoryview(b'abcd')[1:3]\nhs = hash(s)\ns.release()\n\
+             x = (hash(m) == h == hash(b'abc'), {m: 1}[m], hash(s) == hs == hash(b'bc'))",
+            "x"
+        ),
+        "(True, 1, True)"
+    );
+}
+
 #[test]
 fn function_attributes() {
     // Functions carry a writable attribute dict (abc's __isabstractmethod__,

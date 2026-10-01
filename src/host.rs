@@ -1348,6 +1348,12 @@ pub enum PyObj {
         /// on a released view then raises CPython's `ValueError: operation
         /// forbidden on released memoryview object`; see [`PyHost::mv_bytes`].
         released: bool,
+        /// Set once the view has been hashed. `memory_hash` caches the number on
+        /// the view (`self->hash`), so a view hashed while live keeps hashing
+        /// after `release()`; one first hashed after release raises. The
+        /// backing is an immutable `bytes` whenever this is set, so the cached
+        /// number is recomputed from the same bytes rather than stored.
+        hashed: std::cell::Cell<bool>,
     },
     /// An open file / standard stream. Holds only an index into
     /// `PyHost.io_handles`; the underlying `std::fs::File` is neither `Clone`
@@ -6007,22 +6013,27 @@ impl PyHost {
                 // hashes — and compares — as the bytes it shows, so it shares
                 // `bytes`' key (`{b'ab', memoryview(b'ab')}` has one element).
                 // Every view here is format `'B'`, the only restriction left to
-                // check.
+                // check. The first successful hash is remembered, so a view
+                // released afterwards still hashes, as `self->hash` does there.
                 Some(PyObj::Memoryview {
                     obj,
                     start,
                     len,
                     readonly,
                     released,
+                    hashed,
                 }) => {
-                    if *released {
+                    if *released && !hashed.get() {
                         return Err(MV_RELEASED.into());
                     }
                     if !*readonly {
                         return Err("ValueError: cannot hash writable memoryview object".into());
                     }
                     match self.get(obj) {
-                        Some(PyObj::Bytes(b)) => PKey::Bytes(b[*start..*start + *len].to_vec()),
+                        Some(PyObj::Bytes(b)) => {
+                            hashed.set(true);
+                            PKey::Bytes(b[*start..*start + *len].to_vec())
+                        }
                         _ => return Err("ValueError: cannot hash writable memoryview object".into()),
                     }
                 }
@@ -10051,6 +10062,7 @@ impl PyHost {
                     len: (hi_i - lo_i) as usize,
                     readonly,
                     released: false,
+                    hashed: Default::default(),
                 }));
             }
             let src = self.mv_bytes(recv)?;
@@ -10078,6 +10090,7 @@ impl PyHost {
                 len,
                 readonly: true,
                 released: false,
+                hashed: Default::default(),
             }));
         }
         // Slicing bytes/bytearray yields a new buffer of the same type.

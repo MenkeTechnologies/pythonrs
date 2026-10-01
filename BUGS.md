@@ -9,6 +9,12 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **A memoryview's hash is cached.** `memory_hash` stores the number on the
+  view and reads it before the released check, so a view hashed while live keeps
+  hashing — and keeps finding itself as a dict key — after `release()`.
+  pythonrs recomputed it from the bytes each time and raised `ValueError:
+  operation forbidden on released memoryview object` for it. The view now
+  remembers that it was hashed; a view first hashed after release still raises.
 - **`--lsp` go-to-definition and signature help.** The server answered only
   completion, hover and diagnostics. `textDocument/definition` now resolves the
   name under the cursor the way the compiler does — innermost function out,
@@ -2253,8 +2259,7 @@ silently returned the seed-0 value. A seed CPython refuses (`0x10`, `-1`,
 `4294967296`, a trailing space) is refused here with CPython's own
 `Fatal Python error: config_init_hash_seed: …` text and exit code 1.
 
-Two residues remain. The first is a boundary rather than a gap; the second
-is a gap:
+One residue remains, and it is a boundary rather than a gap:
 
 - **Address-derived hashes are not reproducible by anyone.**
   `hash(float('nan'))`, `hash(...)`, `hash(NotImplemented)` and an instance's
@@ -2262,11 +2267,6 @@ is a gap:
   address. Measured across CPython runs they differ every time *even under
   `PYTHONHASHSEED=0`*, so there is no value to match. pythonrs returns a stable
   internally-consistent number instead.
-- **A memoryview's hash is not cached.** `memory_hash` stores the number on
-  the view, so a view hashed before `release()` keeps hashing afterwards;
-  pythonrs recomputes it from the bytes each time, so a released view raises
-  `ValueError: operation forbidden on released memoryview object` whether or not
-  it was hashed first.
 
 An UNSET seed is likewise unmatchable in principle — both interpreters draw
 their own entropy — which is a property of asking for unpredictability, not a
