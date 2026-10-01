@@ -997,6 +997,8 @@ pub enum PyObj {
     /// index by [`crate::regexpr::char_index_of`] on the way out to Python, which
     /// counts `str` positions in characters and not in bytes.
     Match {
+        /// The `Pattern` that produced the match (`m.re`).
+        re: Value,
         text: String,
         spans: Vec<Option<(usize, usize)>>,
         named: Vec<(String, usize)>,
@@ -2015,6 +2017,18 @@ pub struct Frame {
     pub span: Span,
 }
 
+/// Why a call's `**mapping` merge failed — held in `pending_kw_dup` until the
+/// call handler can name the callable in the message.
+#[derive(Clone, Debug)]
+pub enum KwSpreadError {
+    /// `f(**a, **b)` / `f(k=v, **{'k': …})` repeat a key.
+    Duplicate(String),
+    /// `f(**x)` where `x` (of this type name) is not a mapping.
+    NotMapping(String),
+    /// A `**` mapping held a key that is not a `str`.
+    NonStrKey,
+}
+
 /// A non-local control signal.
 #[derive(Clone)]
 pub enum Signal {
@@ -2086,12 +2100,13 @@ pub struct PyHost {
     /// The in-flight exception object, if any.
     pub exc: Option<Value>,
     pub signal: Option<Signal>,
-    /// A duplicate keyword key detected while merging a call's `**mapping`
-    /// spreads (set by `BUILD_KWARGS`, consumed by the `CALL_*_EX` handlers so
-    /// the raised `TypeError` can name the callable). `f(**a, **b)` with a shared
+    /// The first error found while merging a call's `**mapping` spreads (set
+    /// by `BUILD_KWARGS`, consumed by the `CALL_*_EX` handlers so the raised
+    /// `TypeError` can name the callable): a duplicate key, a `**` operand that
+    /// is not a mapping, or a non-`str` key. `f(**a, **b)` with a shared
     /// key, or `f(k=v, **{'k': ...})`, is an error in CPython even though a plain
     /// `{**a, **b}` dict display silently keeps the last value.
-    pub pending_kw_dup: Option<String>,
+    pub pending_kw_dup: Option<KwSpreadError>,
     /// Suspended generator coroutines, indexed by `PyObj::Generator.id`.
     generators: Vec<GenCell>,
     /// Live file / standard-stream objects, indexed by `PyObj::File.id`. Slots
@@ -2230,6 +2245,10 @@ pub struct PyHost {
     /// `re` module (backed by the `regex` crate) stores each compiled `Regex`
     /// here so a `PyObj::Pattern` stays cheap to clone.
     pub regexes: Vec<crate::regexpr::PyRegex>,
+    /// `re`'s compile cache: `(source, flags, is_bytes)` to the `Pattern` already
+    /// built for it. `re.match(src, s)` in a loop compiled — and kept — a fresh
+    /// regex per call; CPython's `re._compile` caches, and so does this.
+    pub re_cache: HashMap<(String, i64, bool), Value>,
 }
 
 /// Whether a `GenCell` backs a plain generator, an `async def` coroutine, or
@@ -2725,6 +2744,7 @@ impl PyHost {
             mt_states: HashMap::new(),
             atexit_callbacks: Vec::new(),
             regexes: Vec::new(),
+            re_cache: HashMap::new(),
         }
     }
 
@@ -3683,13 +3703,28 @@ impl PyHost {
     /// a user function/lambda/class is module-qualified (`__main__.f`), while an
     /// unresolved name (i.e. a builtin like `dict`) stays bare.
     pub fn call_display_name(&self, name: &str) -> String {
-        match self.read_name(name).and_then(|v| self.get(&v).cloned()) {
-            Some(PyObj::Func(fv)) => {
-                let q = self.funcs.get(fv.def_id).map_or(name, |d| d.name.as_str());
-                format!("__main__.{q}")
-            }
-            Some(PyObj::Class(_)) => format!("__main__.{name}"),
+        match self.read_name(name) {
+            Some(v) if matches!(self.get(&v), Some(PyObj::Func(_))) => self.callable_display(&v),
+            Some(v) if matches!(self.get(&v), Some(PyObj::Class(_))) => format!("__main__.{name}"),
             _ => name.to_string(),
+        }
+    }
+
+    /// See [`callable_display_name`].
+    pub fn callable_display(&self, callable: &Value) -> String {
+        match self.get(callable) {
+            Some(PyObj::Func(fv)) => match self.funcs.get(fv.def_id) {
+                Some(d) => format!("__main__.{}", gen_qualname(d)),
+                None => "<callable>".to_string(),
+            },
+            Some(PyObj::BoundMethod { recv, func }) => match self.get(func) {
+                Some(PyObj::Builtin(n)) => {
+                    let meth = n.rsplit('.').next().unwrap_or(n);
+                    format!("{}.{meth}", self.type_name(recv))
+                }
+                _ => self.callable_display(func),
+            },
+            _ => "<callable>".to_string(),
         }
     }
 
@@ -3994,20 +4029,14 @@ pub fn type_error(msg: &str) -> String {
     format!("TypeError: {msg}")
 }
 
-/// Callable display for the `**`-merge duplicate-keyword error when the callee
-/// is an already-evaluated value (the `CALL_VALUE_EX` path): a user function is
-/// module-qualified like CPython, anything else falls back to `<callable>`.
+/// Callable display for the `**`-merge errors when the callee is an
+/// already-evaluated value (the `CALL_VALUE_EX` / `CALL_METHOD_EX` paths), as
+/// CPython's `_PyObject_FunctionStr` renders it: a user function is its
+/// module-qualified `__qualname__` (`__main__.C.m`, `__main__.f.<locals>.g`),
+/// a bound method is its function, a builtin method is `type.name`
+/// (`list.append`); anything else falls back to `<callable>`.
 pub fn callable_display_name(callable: &Value) -> String {
-    with_host(|h| match h.get(callable) {
-        Some(PyObj::Func(fv)) => {
-            let q = h
-                .funcs
-                .get(fv.def_id)
-                .map_or("<callable>", |d| d.name.as_str());
-            format!("__main__.{q}")
-        }
-        _ => "<callable>".to_string(),
-    })
+    with_host(|h| h.callable_display(callable))
 }
 
 /// The CPython version pythonrs emulates byte-for-byte. `sys.version`/
@@ -4592,6 +4621,9 @@ impl PyHost {
             Value::Float(f) => fmt_float(*f),
             Value::Str(s) => (**s).clone(),
             Value::Obj(_) => match self.get(v) {
+                // `str()` of a mappingproxy is `str()` of the mapping behind it;
+                // only `repr()` says `mappingproxy(...)`.
+                Some(PyObj::MappingProxy { dict }) => self.str_of(dict),
                 Some(PyObj::StructFmt(f)) => format!("<_struct.Struct object, format '{f}'>"),
                 Some(PyObj::BytesIO { .. }) => "<_io.BytesIO object>".to_string(),
                 Some(PyObj::StringIO { .. }) => "<_io.StringIO object>".to_string(),
@@ -4726,10 +4758,6 @@ impl PyHost {
                         .collect::<Vec<_>>()
                         .join(", ");
                     format!("namespace({inner})")
-                }
-                Some(PyObj::MappingProxy { dict }) => {
-                    let dict = dict.clone();
-                    format!("mappingproxy({})", self.repr_of(&dict))
                 }
                 Some(PyObj::Descriptor { kind, qual, recv }) => {
                     let (kind, qual, recv) = (*kind, qual.clone(), recv.clone());
@@ -5156,6 +5184,9 @@ impl PyHost {
             Value::Str(s) => quote_str(s),
             Value::Obj(_) => match self.get(v) {
                 Some(PyObj::Str(s)) => quote_str(s),
+                Some(PyObj::MappingProxy { dict }) => {
+                    format!("mappingproxy({})", self.repr_of(dict))
+                }
                 Some(PyObj::List(l)) => {
                     let id = if let Value::Obj(i) = v { *i } else { 0 };
                     if repr_guard_enter(id) {
@@ -6436,7 +6467,7 @@ pub fn instance_key_candidates_for(container: &Value, key: Option<&Value>) -> Ve
 /// `bytes` key never can; a `tuple`/`frozenset` can only through an element, so
 /// it is walked rather than rejected outright (the pre-existing blanket
 /// rejection is what left `{(P(1),): 5}[(P(1),)]` unable to find its entry).
-fn value_can_collapse(h: &PyHost, k: &Value) -> bool {
+pub(crate) fn value_can_collapse(h: &PyHost, k: &Value) -> bool {
     match k {
         Value::Obj(_) => match h.get(k) {
             Some(PyObj::Str(_) | PyObj::Bytes(_) | PyObj::BigInt(_)) => false,
@@ -8945,6 +8976,25 @@ impl PyHost {
             Some(PyObj::MappingProxy { dict }) => {
                 let dict = dict.clone();
                 self.get_item(&dict, idx)
+            }
+            // `m[g]` is `m.group(g)` (by number or by name).
+            Some(PyObj::Match {
+                text, spans, named, ..
+            }) => {
+                let g = match self.as_int(idx) {
+                    Some(i) => usize::try_from(i).ok().filter(|&i| i < spans.len()),
+                    None => self
+                        .as_str(idx)
+                        .and_then(|n| named.iter().find(|(k, _)| *k == n).map(|(_, i)| *i)),
+                };
+                let g = g.ok_or_else(|| "IndexError: no such group".to_string())?;
+                Ok(match spans[g] {
+                    Some((a, b)) => {
+                        let s = text[a..b].to_string();
+                        self.new_str(s)
+                    }
+                    None => Value::Undef,
+                })
             }
             Some(PyObj::Range { start, step, .. }) => {
                 let (start, step) = (*start, *step);
@@ -11498,6 +11548,21 @@ impl PyHost {
                     "pattern" => Ok(self.new_str(pattern)),
                     "flags" => Ok(Value::Int(flags)),
                     "groups" => Ok(Value::Int(groups as i64)),
+                    // `{name: number}` for the named groups, read-only.
+                    "groupindex" => {
+                        let id = match self.get(recv) {
+                            Some(PyObj::Pattern { id, .. }) => *id,
+                            _ => unreachable!("matched a Pattern above"),
+                        };
+                        let mut d: indexmap::IndexMap<PKey, (Value, Value)> =
+                            indexmap::IndexMap::new();
+                        for (n, i) in self.regexes[id].named_groups() {
+                            let k = self.new_str(n.clone());
+                            d.insert(PKey::Str(n), (k, Value::Int(i as i64)));
+                        }
+                        let dict = self.new_dict(d);
+                        Ok(self.alloc(PyObj::MappingProxy { dict }))
+                    }
                     "match" | "search" | "fullmatch" | "findall" | "finditer" | "sub" | "subn"
                     | "split" => {
                         let func = self.alloc(PyObj::Builtin(format!("__base_method__.{name}")));
@@ -11513,19 +11578,49 @@ impl PyHost {
             }
             // `re.Match` attributes; method names bind as callable methods.
             Some(PyObj::Match {
+                re,
                 text,
                 spans,
+                named,
                 pos,
                 endpos,
-                ..
             }) => match name {
                 "string" => Ok(self.new_str(text.clone())),
+                "re" => Ok(re.clone()),
                 "lastindex" => Ok(spans
                     .iter()
                     .rposition(|s| s.is_some())
                     .filter(|&i| i > 0)
                     .map(|i| Value::Int(i as i64))
                     .unwrap_or(Value::Undef)),
+                // The NAME of the `lastindex` group, `None` when that group is
+                // unnamed or no group matched.
+                "lastgroup" => {
+                    let last = spans.iter().rposition(|s| s.is_some()).filter(|&i| i > 0);
+                    let name = last.and_then(|i| named.iter().find(|(_, g)| *g == i));
+                    Ok(match name {
+                        Some((n, _)) => self.new_str(n.clone()),
+                        None => Value::Undef,
+                    })
+                }
+                // Every group's span, `(-1, -1)` for one that did not take part.
+                "regs" => {
+                    let (text, spans) = (text.clone(), spans.clone());
+                    let regs: Vec<Value> = spans
+                        .iter()
+                        .map(|s| {
+                            let (a, b) = match s {
+                                Some((a, b)) => (
+                                    crate::regexpr::char_index_of(&text, *a) as i64,
+                                    crate::regexpr::char_index_of(&text, *b) as i64,
+                                ),
+                                None => (-1, -1),
+                            };
+                            self.new_tuple(vec![Value::Int(a), Value::Int(b)])
+                        })
+                        .collect();
+                    Ok(self.new_tuple(regs))
+                }
                 // The search window, in codepoints. `pos` was hard-coded to 0 and
                 // `endpos` to the BYTE length, so `p.search(s, 3).pos` reported 0
                 // and `m.endpos` counted 'é' twice.
@@ -11533,7 +11628,7 @@ impl PyHost {
                 "endpos" => Ok(Value::Int(
                     crate::regexpr::char_index_of(text, *endpos) as i64
                 )),
-                "group" | "groups" | "groupdict" | "start" | "end" | "span" => {
+                "group" | "groups" | "groupdict" | "start" | "end" | "span" | "expand" => {
                     let func = self.alloc(PyObj::Builtin(format!("__base_method__.{name}")));
                     Ok(self.alloc(PyObj::BoundMethod {
                         recv: recv.clone(),
@@ -15064,7 +15159,9 @@ impl PyHost {
             if d.doc.is_some() {
                 f |= CO_HAS_DOCSTRING;
             }
-            if d.star.is_some() {
+            // A bare `*` (keyword-only marker) is stored as an empty name; it
+            // is not a `*args` parameter.
+            if d.star.as_deref().is_some_and(|s| !s.is_empty()) {
                 f |= CO_VARARGS;
             }
             if d.kwargs.is_some() {
@@ -15096,7 +15193,7 @@ impl PyHost {
         let varnames = || -> Vec<String> {
             let mut names = params.clone();
             names.extend(kwonly.iter().cloned());
-            if let Some(s) = &star {
+            if let Some(s) = star.as_ref().filter(|s| !s.is_empty()) {
                 names.push(s.clone());
             }
             if let Some(k) = &kwargs {
@@ -16219,10 +16316,42 @@ impl PyHost {
 /// - the anchor sub-range renders `^`, the rest of the span `~`; a plain span
 ///   renders entirely `^`.
 fn caret_line(text: &str, span: Span) -> Option<String> {
-    if !span.is_some() || span.suppress {
+    if !span.is_some() {
         return None;
     }
     let lead = text.chars().take_while(|c| c.is_whitespace()).count() as u32;
+    // CPython hides a `return f(...)` / `x = f(...)` call only when that
+    // statement is the FIRST on its line: it re-parses the displayed line and
+    // tests `tree.body[0]`, so `def g(): return f(x)` or `if c: y = f(x)` —
+    // whose first statement is the `def`/`if` — keep their carets.
+    if span.suppress {
+        let prefix: String = text
+            .chars()
+            .skip(lead as usize)
+            .take(span.start.saturating_sub(lead) as usize)
+            .collect();
+        let p = prefix.trim_end();
+        let is_ident = |s: &str| {
+            let mut cs = s.chars();
+            cs.next().is_some_and(|c| c == '_' || c.is_alphabetic())
+                && cs.all(|c| c == '_' || c.is_alphanumeric())
+        };
+        let leads_line = p == "return"
+            || p.strip_suffix('=')
+                .is_some_and(|target| is_ident(target.trim_end()));
+        // CPython compares the call's AST offsets, which count UTF-8 BYTES,
+        // with the instruction's, which count characters — so any non-ASCII
+        // text up to the end of the call makes them disagree and the carets
+        // stay (`x = f("é")` shows them).
+        let ascii = text
+            .chars()
+            .skip(lead as usize)
+            .take(span.end.saturating_sub(lead) as usize)
+            .all(|c| c.is_ascii());
+        if leads_line && ascii {
+            return None;
+        }
+    }
     let stripped_len = text.trim().chars().count() as u32;
     // Offsets relative to the stripped (displayed) line.
     let start = span.start.saturating_sub(lead);

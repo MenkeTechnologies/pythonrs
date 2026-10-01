@@ -355,6 +355,12 @@ impl Lexer {
             }
             return self.scan_name();
         }
+        // PEP 3131: an identifier may start with any Unicode letter (`é`, `π`,
+        // `变量`). Only ASCII was accepted, so every non-ASCII name was a bare
+        // `SyntaxError: invalid syntax`.
+        if c.is_alphabetic() {
+            return self.scan_name();
+        }
         if c.is_ascii_digit()
             || (c == '.' && self.peek2().map(|d| d.is_ascii_digit()).unwrap_or(false))
         {
@@ -391,7 +397,7 @@ impl Lexer {
     fn scan_name(&mut self) -> Result<(), String> {
         let mut s = String::new();
         while let Some(c) = self.peek() {
-            if c.is_alphanumeric() || c == '_' {
+            if c.is_alphanumeric() || c == '_' || crate::builtins::is_other_id_continue(c) {
                 s.push(c);
                 self.pos += 1;
             } else {
@@ -848,12 +854,17 @@ impl Lexer {
             self.push(Tok::Op(c.to_string()));
             Ok(())
         } else {
-            // A stray character (`!` outside `!=`, `$`, `?`, backtick, …) is
-            // rejected the way CPython reports it: a bare `SyntaxError: invalid
-            // syntax` (the line/caret live in the traceback's `File` header, not
-            // the message), so the final error line matches `python3` exactly.
-            let _ = c;
-            Err("SyntaxError: invalid syntax".to_string())
+            // A stray character is rejected the way CPython's tokenizer
+            // reports it, positioned at that character: an ASCII one (`!`
+            // outside `!=`, `$`, `?`, backtick, …) is `invalid syntax`, any
+            // other is `invalid character '€' (U+20AC)`.
+            let col = self.pos - 1 - self.line_start;
+            let msg = if c.is_ascii() {
+                "SyntaxError: invalid syntax".to_string()
+            } else {
+                format!("SyntaxError: invalid character '{c}' (U+{:04X})", c as u32)
+            };
+            Err(self.tok_err(&msg, self.line, col, col as i64 + 1))
         }
     }
 }

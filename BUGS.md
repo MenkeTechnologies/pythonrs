@@ -71,6 +71,45 @@ written.
   `0x`/`0o`/`0b` prefix, and anything else is `invalid decimal literal` /
   `invalid hexadecimal literal` / `invalid octal literal` /
   `invalid binary literal`, as in CPython.
+- **`re` iterates, substitutes and reports the way `_sre` does.** All four
+  match walks (`findall`, `finditer`, `sub`, `split`) took the Rust engines'
+  own iterator, which refuses an empty match where a non-empty one just ended;
+  CPython (3.7+) allows it, so `re.sub('x*', '-', 'abxd')` was `-a-b-d-` for
+  `-a-b--d-`. A `sub` template was translated into the `regex` crate's `$`
+  syntax, which dropped the backslash of `\.`, accepted `\q`/`\x41`, ignored
+  octal escapes and out-of-range group references; it is now parsed by a port of
+  `re._parser.parse_template`, with its errors and positions, and `m.expand()`
+  uses the same parser. `p.search(s, pos)` searched the SLICE `s[pos:]`, so `^`,
+  `\b` and look-behind saw a fresh string start at `pos`. `m[g]`, `m.re`,
+  `m.lastgroup`, `m.regs` and `p.groupindex` existed only as `AttributeError`s,
+  `m.start(9)` answered group 0's position instead of `IndexError`, and
+  `p.flags` left out the implied `re.UNICODE` and the pattern's own `(?i)`.
+  `re.match(src, s)` compiled — and kept — a new regex on every call; patterns
+  are now cached by `(source, flags)` like `re._compile`.
+- **`**` and `dict()` take any mapping.** `{**x}` and `f(**x)` spread only a
+  plain `dict`: a `dict` subclass, a `mappingproxy`, a `ChainMap` or a class
+  with `keys()`/`__getitem__` spread as nothing, and a non-mapping (`{**[1]}`,
+  `f(**None)`) was silently empty. They now merge through the same mapping test
+  as `dict.update` (a `dict` subclass from its storage unless it overrides
+  `__iter__`), and the errors are CPython's — `'list' object is not a mapping`,
+  `__main__.f() argument after ** must be a mapping, not list`, `keywords must
+  be strings`. `dict(seq)` skipped a pair of the wrong length instead of raising
+  `dictionary update sequence element #N has length L; 2 is required`. The
+  callee in every `**`-merge error is now named as `_PyObject_FunctionStr`
+  names it (`__main__.C.m`, `__main__.outer.<locals>.inner`, `list.append`),
+  where a method was its bare name.
+- **PEP 3131 identifiers.** The tokenizer started a name only on an ASCII
+  letter, so `π = 3` or `def función(año)` was `SyntaxError: invalid syntax`.
+  A non-ASCII character that cannot be part of a name is now CPython's
+  positioned `invalid character '€' (U+20AC)`, and a stray ASCII one (`$`,
+  `?`) is positioned too.
+- **Traceback carets follow `_should_show_carets`.** A `return f(...)` /
+  `x = f(...)` call hid its carets even when it was not the line's first
+  statement (`def g(): return f(x)`), and even with non-ASCII text in it, where
+  CPython's byte-vs-character offset comparison keeps them. A call through
+  `*`/`**` unpacking had no position at all, so its carets were missing.
+  `str()` of a `mappingproxy` is its mapping's, and a bare `*` no longer shows
+  up in `co_varnames` as an empty name or sets `CO_VARARGS`.
 - **`int` conversions are bounded by `sys.get_int_max_str_digits()`.** pythonrs
   had no limit and no `sys.get_int_max_str_digits`/`set_int_max_str_digits`, so
   `int('9'*100000)` succeeded where CPython 3.14.7 raises `ValueError: Exceeds the
@@ -1186,6 +1225,13 @@ written.
   variants; async-generator `asend`/`athrow`/`aclose`.
 
 ## Partial / simplified semantics
+
+- **Identifiers are not NFKC-normalized.** CPython folds every identifier to
+  NFKC, so `ﬁ = 3` binds `fi`; pythonrs keeps the spelling as written, so the
+  ligature and the plain letters are two different names.
+- **`m.lastindex` / `m.lastgroup` pick the last participating group by
+  number.** CPython's is the group that CLOSED last, so for nested groups
+  (`((a)b)`) it names the outer one (1) where pythonrs names the inner (2).
 
 - **Some `SyntaxError`s are still worded by pythonrs, or carry no position.**
   The tokenizer's and parser's errors now carry CPython's message, `lineno`,

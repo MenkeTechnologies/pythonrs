@@ -94,80 +94,67 @@ impl PyRegex {
 
     /// Spans of the leftmost match at or after the start of `text`.
     pub fn first_captures(&self, text: &str) -> Option<Spans> {
+        self.captures_at(text, 0)
+    }
+
+    /// Spans of the leftmost match starting at or after byte `start`, searched
+    /// with ALL of `text` in view. That is what CPython's `pos` argument means:
+    /// `^`, `\b` and look-behind still see the characters before `start`, so
+    /// `re.compile('^a').search('ba', 1)` is `None` where searching the slice
+    /// `'a'` would have matched.
+    pub fn captures_at(&self, text: &str, start: usize) -> Option<Spans> {
         let n = self.captures_len();
         match self {
-            PyRegex::Fast(re) => re.captures(text).map(|c| collect_spans(&c, n)),
+            PyRegex::Fast(re) => re.captures_at(text, start).map(|c| collect_spans(&c, n)),
             // A backtracking match can fail at runtime (catastrophic backtracking
             // hits the step limit); treat that as "no match" rather than a panic.
             PyRegex::Fancy(re) => re
-                .captures(text)
+                .captures_from_pos(text, start)
                 .ok()
                 .flatten()
                 .map(|c| collect_fancy_spans(&c, n)),
         }
     }
 
-    /// Spans of every non-overlapping match, left to right.
+    /// Spans of every non-overlapping match, left to right, under CPython's
+    /// (3.7+) rule for empty matches — the one `findall`, `finditer`, `sub` and
+    /// `split` all share in `_sre.c`: after an EMPTY match the next one may not
+    /// be empty at the same position (`must_advance`), but after a NON-empty
+    /// match an empty one may sit right where it ended. Both engines' own
+    /// iterators refuse that second case, so `re.sub('x*', '-', 'abxd')` gave
+    /// `-a-b-d-` where CPython gives `-a-b--d-`.
     pub fn all_captures(&self, text: &str) -> Vec<Spans> {
-        let n = self.captures_len();
-        match self {
-            PyRegex::Fast(re) => re
-                .captures_iter(text)
-                .map(|c| collect_spans(&c, n))
-                .collect(),
-            PyRegex::Fancy(re) => re
-                .captures_iter(text)
-                .filter_map(|c| c.ok())
-                .map(|c| collect_fancy_spans(&c, n))
-                .collect(),
-        }
-    }
-
-    /// Split on the pattern. `limit` is the maximum number of PIECES (as
-    /// `re.split`'s `maxsplit + 1`); `None` splits on every match.
-    pub fn split_n(&self, text: &str, limit: Option<usize>) -> Vec<String> {
-        match (self, limit) {
-            (PyRegex::Fast(re), Some(n)) => re.splitn(text, n).map(str::to_string).collect(),
-            (PyRegex::Fast(re), None) => re.split(text).map(str::to_string).collect(),
-            (PyRegex::Fancy(re), Some(n)) => re
-                .splitn(text, n)
-                .filter_map(|s| s.ok())
-                .map(str::to_string)
-                .collect(),
-            (PyRegex::Fancy(re), None) => re
-                .split(text)
-                .filter_map(|s| s.ok())
-                .map(str::to_string)
-                .collect(),
-        }
-    }
-
-    /// Replace the first `count` matches (all of them when `count` is `None`) with
-    /// `repl`, whose `$1`/`$name` references expand as the engines' `Replacer` does.
-    pub fn replace_n(&self, text: &str, count: Option<usize>, repl: &str) -> String {
-        match (self, count) {
-            (PyRegex::Fast(re), Some(n)) => re.replacen(text, n, repl).into_owned(),
-            (PyRegex::Fast(re), None) => re.replace_all(text, repl).into_owned(),
-            (PyRegex::Fancy(re), Some(n)) => re.replacen(text, n, repl).into_owned(),
-            (PyRegex::Fancy(re), None) => re.replace_all(text, repl).into_owned(),
-        }
-    }
-
-    /// How many non-overlapping matches `text` holds, capped at `limit`.
-    pub fn count_matches(&self, text: &str, limit: Option<usize>) -> usize {
-        match self {
-            PyRegex::Fast(re) => match limit {
-                Some(n) => re.find_iter(text).take(n).count(),
-                None => re.find_iter(text).count(),
-            },
-            PyRegex::Fancy(re) => {
-                let it = re.find_iter(text).filter_map(|m| m.ok());
-                match limit {
-                    Some(n) => it.take(n).count(),
-                    None => it.count(),
-                }
+        let mut out = Vec::new();
+        let mut pos = 0usize;
+        let mut must_advance = false;
+        while pos <= text.len() {
+            let Some(mut spans) = self.captures_at(text, pos) else {
+                break;
+            };
+            let Some((mut s, mut e)) = spans.first().copied().flatten() else {
+                break;
+            };
+            if must_advance && s == pos && e == pos {
+                // The engines cannot be asked for "a match that is not empty
+                // here", so resume one character on — the same stand-in their
+                // own iterators use.
+                let Some(next) = text[pos..].chars().next().map(|c| pos + c.len_utf8()) else {
+                    break;
+                };
+                let Some(retry) = self.captures_at(text, next) else {
+                    break;
+                };
+                spans = retry;
+                let Some(span) = spans.first().copied().flatten() else {
+                    break;
+                };
+                (s, e) = span;
             }
+            must_advance = s == e;
+            pos = e;
+            out.push(spans);
         }
+        out
     }
 }
 

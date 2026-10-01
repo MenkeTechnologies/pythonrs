@@ -1151,8 +1151,16 @@ fn b_call_method_ex(vm: &mut VM, _: u8) -> Value {
     let argl = vm.pop();
     let name = sval(&vm.pop());
     let recv = vm.pop();
-    if let Some(a) = check_kw_dup(vm, &name) {
-        return a;
+    // The callable is only named when a `**` merge failed, so the attribute
+    // is resolved for the message alone and only on that path.
+    if with_host(|h| h.pending_kw_dup.is_some()) {
+        let disp = match with_host(|h| h.get_attr(&recv, &name)) {
+            Ok(f) => host::callable_display_name(&f),
+            Err(_) => name.clone(),
+        };
+        if let Some(a) = check_kw_dup(vm, &disp) {
+            return a;
+        }
     }
     let r = host::call_method(&recv, &name, list_args(&argl), kw_pairs(&kwd));
     finish(vm, r)
@@ -1182,67 +1190,133 @@ fn b_build_args(vm: &mut VM, argc: u8) -> Value {
 /// Build a kwargs `dict`: pairs `(key, value)`, a `None`(Undef) key = `**` spread.
 ///
 /// Unlike a `{**a, **b}` dict display, a call's keyword merge rejects a repeated
-/// key (`f(**a, **b)` / `f(k=v, **{'k': ...})`). We can't name the callable yet,
-/// so the first collision is stashed in `pending_kw_dup` for the following
-/// `CALL_*_EX` handler to raise with the correct `<callable>() got multiple
-/// values for keyword argument '<k>'` message.
+/// key (`f(**a, **b)` / `f(k=v, **{'k': ...})`), a `**` operand that is not a
+/// mapping, and a non-`str` key. We can't name the callable yet, so the first
+/// such error is stashed in `pending_kw_dup` for the following `CALL_*_EX`
+/// handler to raise with the callable in the message. Any mapping spreads —
+/// a `dict` subclass, a `mappingproxy`, a user class with `keys()` — where
+/// only a plain `dict` used to, every other operand silently adding nothing.
 fn b_build_kwargs(vm: &mut VM, argc: u8) -> Value {
     let flat = pop_n(vm, argc as usize);
     let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
-    let mut dup: Option<String> = None;
-    let mut note_dup = |k: &PKey, seen: &IndexMap<PKey, (Value, Value)>| {
-        if dup.is_none() && seen.contains_key(k) {
-            if let PKey::Str(s) = k {
-                dup = Some(s.clone());
-            }
-        }
-    };
+    let mut err: Option<host::KwSpreadError> = None;
     let mut i = 0;
-    while i + 1 < flat.len() {
+    while i + 1 < flat.len() && err.is_none() {
         let key = flat[i].clone();
         let val = flat[i + 1].clone();
-        if matches!(key, Value::Undef) {
-            // **mapping spread — copy each str key/value.
-            let pairs = with_host(|h| match h.get(&val) {
-                Some(PyObj::Dict(m)) => m
-                    .iter()
-                    .map(|(k, (kv, v))| (k.clone(), kv.clone(), v.clone()))
-                    .collect::<Vec<_>>(),
-                _ => Vec::new(),
-            });
-            for (k, kv, v) in pairs {
-                note_dup(&k, &d);
-                host::dict_put(&mut d, k, kv, v);
-            }
-        } else {
+        i += 2;
+        if !matches!(key, Value::Undef) {
             let kstr = sval(&key);
             let kv = with_host(|h| h.new_str(kstr.clone()));
-            let pk = PKey::Str(kstr);
-            note_dup(&pk, &d);
+            let pk = PKey::Str(kstr.clone());
+            if d.contains_key(&pk) {
+                err = Some(host::KwSpreadError::Duplicate(kstr));
+            }
             d.insert(pk, (kv, val));
+            continue;
         }
-        i += 2;
+        let pairs = match mapping_pairs(&val) {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                let t = with_host(|h| h.type_name(&val));
+                err = Some(host::KwSpreadError::NotMapping(t));
+                break;
+            }
+            Err(e) => return abort(vm, e),
+        };
+        for (kv, v) in pairs {
+            let Some(k) = with_host(|h| h.as_str(&kv)) else {
+                err = Some(host::KwSpreadError::NonStrKey);
+                break;
+            };
+            let pk = PKey::Str(k.clone());
+            if d.contains_key(&pk) {
+                err = Some(host::KwSpreadError::Duplicate(k));
+                break;
+            }
+            d.insert(pk, (kv, v));
+        }
     }
-    if let Some(k) = dup {
-        with_host(|h| h.pending_kw_dup = Some(k));
+    if let Some(e) = err {
+        with_host(|h| h.pending_kw_dup = Some(e));
     }
     with_host(|h| h.new_dict(d))
 }
 
-/// If the just-built kwargs carried a duplicate key, abort with CPython's
-/// `<callable>() got multiple values for keyword argument '<k>'`. `disp` is the
-/// already-formatted callable name (`__main__.f`, `dict`, …). Returns the abort
-/// sentinel when a duplicate was pending, else `None` to continue the call.
+/// If the just-built kwargs hit an error, abort with CPython's message for it.
+/// `disp` is the already-formatted callable name (`__main__.f`, `dict`, …).
+/// Returns the abort sentinel when an error was pending, else `None` to
+/// continue the call.
 fn check_kw_dup(vm: &mut VM, disp: &str) -> Option<Value> {
-    let dup = with_host(|h| h.pending_kw_dup.take());
-    dup.map(|k| {
-        abort(
-            vm,
-            host::type_error(&format!(
-                "{disp}() got multiple values for keyword argument '{k}'"
-            )),
-        )
+    let pending = with_host(|h| h.pending_kw_dup.take());
+    pending.map(|e| {
+        let msg = match e {
+            host::KwSpreadError::Duplicate(k) => {
+                format!("{disp}() got multiple values for keyword argument '{k}'")
+            }
+            host::KwSpreadError::NotMapping(t) => {
+                format!("{disp}() argument after ** must be a mapping, not {t}")
+            }
+            host::KwSpreadError::NonStrKey => "keywords must be strings".to_string(),
+        };
+        abort(vm, host::type_error(&msg))
     })
+}
+
+/// The `(key, value)` pairs of a mapping, in iteration order, or `None` when
+/// `v` is not one — what CPython's `PyDict_Update` accepts as the operand of a
+/// `**` spread or of `dict(m)`: a `dict` (a subclass through its native
+/// payload unless it overrides `__iter__`), a `mappingproxy`, or any object
+/// with `keys()` and `__getitem__` (a user `Mapping`, `ChainMap`, a bridged
+/// CPython mapping).
+fn mapping_pairs(v: &Value) -> Result<Option<Vec<(Value, Value)>>, String> {
+    let dict_pairs = |h: &host::PyHost, d: &Value| match h.get(d) {
+        Some(PyObj::Dict(m)) => Some(
+            m.values()
+                .map(|(kv, val)| (kv.clone(), val.clone()))
+                .collect::<Vec<_>>(),
+        ),
+        _ => None,
+    };
+    enum Kind {
+        Pairs(Vec<(Value, Value)>),
+        Native,
+        Foreign,
+        NotMapping,
+    }
+    let kind = with_host(|h| match h.get(v) {
+        Some(PyObj::Dict(_)) => Kind::Pairs(dict_pairs(h, v).unwrap_or_default()),
+        Some(PyObj::MappingProxy { dict }) => Kind::Pairs(dict_pairs(h, dict).unwrap_or_default()),
+        // A `dict` subclass merges straight from its storage unless it
+        // overrides `__iter__` (`_PyDict_MergeEx`'s `tp_iter == dict_iter`
+        // test) — an overridden `keys`/`__getitem__` alone is not consulted.
+        Some(PyObj::Instance(inst)) => match dict_pairs(h, &inst.payload) {
+            Some(p) if h.class_lookup(&inst.class, "__iter__").is_none() => Kind::Pairs(p),
+            _ if h.class_lookup(&inst.class, "keys").is_some() => Kind::Native,
+            _ => Kind::NotMapping,
+        },
+        _ if h.foreign_id(v).is_some() => Kind::Foreign,
+        _ => Kind::NotMapping,
+    });
+    let keys = match kind {
+        Kind::Pairs(p) => return Ok(Some(p)),
+        Kind::NotMapping => return Ok(None),
+        Kind::Native | Kind::Foreign => match host::call_method(v, "keys", vec![], vec![]) {
+            Ok(k) => k,
+            // A foreign object without `keys` is not a mapping.
+            Err(_) if matches!(kind, Kind::Foreign) => return Ok(None),
+            Err(e) => return Err(e),
+        },
+    };
+    let mut out = Vec::new();
+    for k in host::iter_vec(&keys)? {
+        let val = match kind {
+            Kind::Native => host::call_method(v, "__getitem__", vec![k.clone()], vec![])?,
+            _ => with_host(|h| h.get_item(v, &k))?,
+        };
+        out.push((k, val));
+    }
+    Ok(Some(out))
 }
 
 /// Build a dict from `{**a, k: v}` literal entries: triples `(tag, a, b)` where
@@ -1253,26 +1327,34 @@ fn b_mkdict_ex(vm: &mut VM, argc: u8) -> Value {
     let mut i = 0;
     while i + 2 < flat.len() {
         let spread = matches!(flat[i], Value::Int(1));
-        if spread {
-            let m = flat[i + 1].clone();
-            let pairs = with_host(|h| match h.get(&m) {
-                Some(PyObj::Dict(map)) => map
-                    .iter()
-                    .map(|(k, (kv, v))| (k.clone(), kv.clone(), v.clone()))
-                    .collect::<Vec<_>>(),
-                _ => Vec::new(),
-            });
-            for (k, kv, v) in pairs {
-                host::dict_put(&mut d, k, kv, v);
+        let entries = if spread {
+            let m = &flat[i + 1];
+            match mapping_pairs(m) {
+                Ok(Some(p)) => p,
+                Ok(None) => {
+                    let t = with_host(|h| h.type_name(m));
+                    return abort(
+                        vm,
+                        host::type_error(&format!("'{t}' object is not a mapping")),
+                    );
+                }
+                Err(e) => return abort(vm, e),
             }
         } else {
-            let k = flat[i + 1].clone();
-            let v = flat[i + 2].clone();
+            vec![(flat[i + 1].clone(), flat[i + 2].clone())]
+        };
+        for (k, v) in entries {
             // Routed through `with_instance_key` like every other dict store:
             // keying directly skipped the value-collapse candidates AND the
             // container context on an unhashable key, so `{**a, [1]: 2}` alone
             // reported the bare `unhashable type: 'list'`.
-            let cands = host::instance_key_candidates_for(&flat[i + 1], Some(&k));
+            let cands = with_host(|h| {
+                if host::value_can_collapse(h, &k) {
+                    host::dict_local_candidates(h, &d)
+                } else {
+                    Vec::new()
+                }
+            });
             match host::with_instance_key(&k, host::KeyRole::Dict, &cands, || {
                 with_host(|h| h.to_key(&k))
             }) {
@@ -8201,7 +8283,11 @@ fn construct_dict(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, S
         let dict_map = with_host(|h| {
             let src = match h.get(v) {
                 Some(PyObj::Dict(_)) => Some(v.clone()),
-                Some(PyObj::Instance(inst)) if !matches!(inst.payload, Value::Undef) => {
+                Some(PyObj::MappingProxy { dict }) => Some(dict.clone()),
+                Some(PyObj::Instance(inst))
+                    if !matches!(inst.payload, Value::Undef)
+                        && h.class_lookup(&inst.class, "__iter__").is_none() =>
+                {
                     Some(inst.payload.clone())
                 }
                 _ => None,
@@ -8240,16 +8326,12 @@ fn construct_dict(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, S
                 host::dict_put(&mut d, key, k, val);
             }
         } else {
-            let pairs = host::iter_vec(v)?;
-            for p in pairs {
-                let kv = host::iter_vec(&p)?;
-                if kv.len() == 2 {
-                    let cands = with_host(|h| host::dict_local_candidates(h, &d));
-                    let key = host::with_instance_key(&kv[0], host::KeyRole::Dict, &cands, || {
-                        with_host(|h| h.to_key(&kv[0]))
-                    })?;
-                    host::dict_put(&mut d, key, kv[0].clone(), kv[1].clone());
-                }
+            for (k, val) in dict_update_seq(v)? {
+                let cands = with_host(|h| host::dict_local_candidates(h, &d));
+                let key = host::with_instance_key(&k, host::KeyRole::Dict, &cands, || {
+                    with_host(|h| h.to_key(&k))
+                })?;
+                host::dict_put(&mut d, key, k, val);
             }
         }
     }
@@ -10024,32 +10106,77 @@ fn re_compile(pattern: &Value, flags: i64) -> Result<Value, String> {
     // so the pattern's byte semantics survive into the str engine unchanged.
     // Rejecting these outright made `import json` fail — its encoder compiles
     // `b'[\x80-\xff]'` at import time, so the whole module was unreachable.
-    let src = match with_host(|h| h.as_str(pattern)) {
-        Some(s) => s,
+    let (src, is_bytes) = match with_host(|h| h.as_str(pattern)) {
+        Some(s) => (s, false),
         None => with_host(|h| match h.get(pattern) {
             Some(PyObj::Bytes(b)) => Some(b.iter().map(|&c| c as char).collect::<String>()),
             _ => None,
         })
+        .map(|s| (s, true))
         .ok_or_else(|| host::type_error("first argument must be string or compiled pattern"))?,
     };
+    let key = (src.clone(), flags, is_bytes);
+    if let Some(p) = with_host(|h| h.re_cache.get(&key).cloned()) {
+        return Ok(p);
+    }
     let re = re_compile_raw(&src, flags)?;
     let groups = re.captures_len().saturating_sub(1);
+    // `Pattern.flags` reports what CPython's does: the leading inline flags
+    // (`(?i)`) folded in, and `re.UNICODE` implied for a str pattern that did
+    // not ask for `re.ASCII` — `re.compile('a', re.I).flags` is 34, not 2.
+    let mut shown = flags | re_inline_flags(&src);
+    if !is_bytes && shown & 256 == 0 {
+        shown |= 32;
+    }
     Ok(with_host(|h| {
         let id = h.regexes.len();
         h.regexes.push(re);
-        h.alloc(PyObj::Pattern {
+        let p = h.alloc(PyObj::Pattern {
             id,
             pattern: src,
-            flags,
+            flags: shown,
             groups,
-        })
+        });
+        h.re_cache.insert(key, p.clone());
+        p
     }))
+}
+
+/// The flag bits of a pattern's leading global inline-flag groups (`(?im)`,
+/// `(?x)(?s)`): `a`=ASCII 256, `i`=2, `L`=4, `m`=8, `s`=16, `u`=32, `x`=64.
+fn re_inline_flags(src: &str) -> i64 {
+    let mut bits = 0;
+    let mut rest = src;
+    while let Some(body) = rest.strip_prefix("(?") {
+        let Some(end) = body.find(')') else { break };
+        let letters = &body[..end];
+        let mut group = 0;
+        for c in letters.chars() {
+            group |= match c {
+                'a' => 256,
+                'i' => 2,
+                'L' => 4,
+                'm' => 8,
+                's' => 16,
+                'u' => 32,
+                'x' => 64,
+                _ => return bits,
+            };
+        }
+        if letters.is_empty() {
+            break;
+        }
+        bits |= group;
+        rest = &body[end + 1..];
+    }
+    bits
 }
 
 /// Build a `PyObj::Match` from a regex match over `text` (byte spans), recording
 /// the named-group index map from the pattern. `pos`/`endpos` are the byte window
 /// the search ran in — the whole subject unless the caller passed them.
 fn re_build_match(
+    pat: &Value,
     pat_id: usize,
     text: &str,
     m_spans: Vec<Option<(usize, usize)>>,
@@ -10059,6 +10186,7 @@ fn re_build_match(
     let named: Vec<(String, usize)> = with_host(|h| h.regexes[pat_id].named_groups());
     with_host(|h| {
         h.alloc(PyObj::Match {
+            re: pat.clone(),
             text: text.to_string(),
             spans: m_spans,
             named,
@@ -10068,17 +10196,18 @@ fn re_build_match(
     })
 }
 
-/// Run a compiled pattern's search/match against `text`, returning the group
-/// spans of the first match at/after `anchored` position, or None.
+/// Run a compiled pattern's search/match against `text` from byte `pos`,
+/// returning the group spans of the first match, or None. `anchored` (`match`,
+/// `fullmatch`) requires that match to start AT `pos`.
 fn re_first_match(
     pat_id: usize,
     text: &str,
+    pos: usize,
     anchored: bool,
 ) -> Option<Vec<Option<(usize, usize)>>> {
     with_host(|h| {
-        let spans = h.regexes[pat_id].first_captures(text)?;
-        // `match` requires the match to start at position 0.
-        if anchored && spans.first().copied().flatten().map(|(s, _)| s) != Some(0) {
+        let spans = h.regexes[pat_id].captures_at(text, pos)?;
+        if anchored && spans.first().copied().flatten().map(|(s, _)| s) != Some(pos) {
             return None;
         }
         Some(spans)
@@ -10182,21 +10311,20 @@ pub fn re_pattern_method(
                 .and_then(|v| with_host(|h| h.as_int(v)))
                 .map(|e| crate::regexpr::byte_index_of(&text, e.clamp(0, nchars) as usize))
                 .unwrap_or(text.len());
-            let sub = text.get(pos..endpos).unwrap_or("");
+            // `endpos` truncates the subject (`$` matches there) while `pos` only
+            // moves where the search starts: `^`, `\b` and look-behind still see
+            // the text before it, as they do in CPython. Searching the slice
+            // `text[pos..]` made `re.compile('^a').search('ba', 1)` match.
+            let window = text.get(..endpos.max(pos)).unwrap_or(&text);
             let anchored = method == "match" || method == "fullmatch";
-            match re_first_match(pat_id, sub, anchored) {
-                Some(rel) => {
-                    // Shift the sub-slice spans back to absolute positions.
-                    let spans: Vec<Option<(usize, usize)>> = rel
-                        .iter()
-                        .map(|s| s.map(|(a, b)| (a + pos, b + pos)))
-                        .collect();
+            match re_first_match(pat_id, window, pos, anchored) {
+                Some(spans) => {
                     if method == "fullmatch"
                         && spans.first().copied().flatten().map(|(_, e)| e) != Some(endpos)
                     {
                         return Ok(Value::Undef);
                     }
-                    Ok(re_build_match(pat_id, &text, spans, pos, endpos))
+                    Ok(re_build_match(pat, pat_id, &text, spans, pos, endpos))
                 }
                 None => Ok(Value::Undef),
             }
@@ -10247,7 +10375,7 @@ pub fn re_pattern_method(
                 with_host(|h| h.regexes[pat_id].all_captures(&text));
             let matches: Vec<Value> = all
                 .into_iter()
-                .map(|s| re_build_match(pat_id, &text, s, 0, text.len()))
+                .map(|s| re_build_match(pat, pat_id, &text, s, 0, text.len()))
                 .collect();
             // Return a list iterator (finditer yields lazily in CPython; a list is
             // an acceptable eager stand-in for typical use).
@@ -10263,7 +10391,7 @@ pub fn re_pattern_method(
                 .and_then(|v| with_host(|h| h.as_int(v)))
                 .or_else(|| kw_int("count"))
                 .unwrap_or(0);
-            re_sub(pat_id, &repl, &text, count, method == "subn")
+            re_sub(pat, pat_id, &repl, &text, count, method == "subn")
         }
         "split" => {
             let text = text.ok_or_else(|| host::type_error("expected string"))?;
@@ -10309,10 +10437,14 @@ pub fn re_pattern_method(
     }
 }
 
-/// `re.sub`/`Pattern.sub` — replace matches. A string replacement translates
-/// Python's `\1`/`\g<name>` backrefs to the `regex` crate's `$1`/`${name}`; a
-/// callable replacement is called with each match object.
+/// `re.sub`/`Pattern.sub` — replace matches. A string replacement is parsed
+/// once into literal and group pieces by [`re_parse_template`] (so a bad
+/// template is an error even when nothing matches, as in CPython) and expanded
+/// per match; a callable replacement is called with each match object. Both
+/// walk the same [`crate::regexpr::PyRegex::all_captures`] matches, so the
+/// count, the empty-match rule and `subn`'s tally all agree with `findall`.
 fn re_sub(
+    pat: &Value,
     pat_id: usize,
     repl: &Value,
     text: &str,
@@ -10325,38 +10457,39 @@ fn re_sub(
             Some(PyObj::Func(_)) | Some(PyObj::BoundMethod { .. }) | Some(PyObj::Builtin(_))
         )
     });
-    if is_callable {
-        // Collect match spans, call repl(match) for each, splice the results.
-        let spans: Vec<Vec<Option<(usize, usize)>>> =
-            with_host(|h| h.regexes[pat_id].all_captures(text));
-        let mut out = String::new();
-        let mut last = 0usize;
-        let mut n = 0i64;
-        for s in spans {
-            if count > 0 && n >= count {
-                break;
-            }
-            let (ms, me) = s.first().copied().flatten().unwrap_or((0, 0));
-            out.push_str(&text[last..ms]);
-            let m = re_build_match(pat_id, text, s, 0, text.len());
-            let r = host::invoke(repl, vec![m], vec![])?;
-            out.push_str(&with_host(|h| h.as_str(&r)).unwrap_or_default());
-            last = me;
-            n += 1;
+    let template = if is_callable {
+        None
+    } else {
+        let rsrc = with_host(|h| h.as_str(repl)).unwrap_or_default();
+        let (groups, named) = with_host(|h| {
+            let re = &h.regexes[pat_id];
+            (re.captures_len() - 1, re.named_groups())
+        });
+        Some(re_parse_template(&rsrc, groups, &named)?)
+    };
+    let all: Vec<Vec<Option<(usize, usize)>>> = with_host(|h| h.regexes[pat_id].all_captures(text));
+    let mut out = String::new();
+    let mut last = 0usize;
+    let mut n = 0i64;
+    for s in all {
+        if count > 0 && n >= count {
+            break;
         }
-        out.push_str(&text[last..]);
-        return finish_sub(with_host(|h| h.new_str(out)), n, want_count);
+        let (ms, me) = s.first().copied().flatten().unwrap_or((0, 0));
+        out.push_str(&text[last..ms]);
+        match &template {
+            Some(pieces) => out.push_str(&re_expand(pieces, text, &s)),
+            None => {
+                let m = re_build_match(pat, pat_id, text, s, 0, text.len());
+                let r = host::invoke(repl, vec![m], vec![])?;
+                out.push_str(&with_host(|h| h.as_str(&r)).unwrap_or_default());
+            }
+        }
+        last = me;
+        n += 1;
     }
-    // String replacement: translate backrefs and apply.
-    let rsrc = with_host(|h| h.as_str(repl)).unwrap_or_default();
-    let rrepl = re_translate_repl(&rsrc);
-    let (result, n) = with_host(|h| {
-        let re = &h.regexes[pat_id];
-        let limit = (count > 0).then_some(count as usize);
-        let s = re.replace_n(text, limit, rrepl.as_str());
-        (s, re.count_matches(text, limit) as i64)
-    });
-    finish_sub(with_host(|h| h.new_str(result)), n, want_count)
+    out.push_str(&text[last..]);
+    finish_sub(with_host(|h| h.new_str(out)), n, want_count)
 }
 
 fn finish_sub(result: Value, n: i64, want_count: bool) -> Result<Value, String> {
@@ -10367,57 +10500,179 @@ fn finish_sub(result: Value, n: i64, want_count: bool) -> Result<Value, String> 
     }
 }
 
-/// Translate a Python `sub` replacement string (`\1`, `\g<n>`, `\g<name>`) into
-/// the `regex` crate's syntax (`${1}`, `${name}`). A literal `$` is escaped.
-fn re_translate_repl(s: &str) -> String {
+/// One piece of a parsed `sub`/`expand` template: literal text, or a group to
+/// splice in (an unmatched group splices in nothing, as it has since 3.5).
+enum ReplPiece {
+    Lit(String),
+    Group(usize),
+}
+
+/// `re.PatternError` for a template, worded and positioned as `re._parser`'s
+/// `error` does: `<msg> at position N`, plus `(line L, column C)` when the
+/// template spans several lines.
+fn re_template_error(src: &[char], msg: &str, pos: usize) -> String {
+    let mut out = format!("re.PatternError: {msg} at position {pos}");
+    if src.contains(&'\n') {
+        let before = &src[..pos.min(src.len())];
+        let line = before.iter().filter(|&&c| c == '\n').count() + 1;
+        let col = before.iter().rev().take_while(|&&c| c != '\n').count() + 1;
+        out.push_str(&format!(" (line {line}, column {col})"));
+    }
+    out
+}
+
+/// Parse a replacement template — a port of `re._parser.parse_template`.
+/// `\g<name>`/`\g<N>` and `\N`/`\NN` are group references, `\0`, `\0oo` and
+/// three-digit `\ooo` are octal escapes, `\a \b \f \n \r \t \v \\` are the
+/// character escapes, any other ASCII letter after `\` is `bad escape`, and
+/// a backslash before anything else stays in the output. `groups` is the
+/// pattern's capture-group count (references may go up to and including it).
+fn re_parse_template(
+    src: &str,
+    groups: usize,
+    named: &[(String, usize)],
+) -> Result<Vec<ReplPiece>, String> {
+    let s: Vec<char> = src.chars().collect();
+    let err = |msg: &str, pos: usize| re_template_error(&s, msg, pos);
+    let is_oct = |c: Option<&char>| matches!(c, Some('0'..='7'));
+    let mut pieces: Vec<ReplPiece> = Vec::new();
+    let mut lit = String::new();
+    // `i` is always the index of the next unread character — `Tokenizer.tell()`,
+    // which every error position is measured back from.
+    let mut i = 0usize;
+    while i < s.len() {
+        if s[i] != '\\' {
+            lit.push(s[i]);
+            i += 1;
+            continue;
+        }
+        let Some(&c) = s.get(i + 1) else {
+            return Err(err("bad escape (end of pattern)", s.len() - 1));
+        };
+        i += 2;
+        let group = match c {
+            'g' => {
+                if s.get(i) != Some(&'<') {
+                    return Err(err("missing <", i));
+                }
+                i += 1;
+                let start = i;
+                let Some(len) = s[start..].iter().position(|&ch| ch == '>') else {
+                    return Err(if start == s.len() {
+                        err("missing group name", s.len())
+                    } else {
+                        err("missing >, unterminated name", start)
+                    });
+                };
+                i = start + len + 1;
+                if len == 0 {
+                    return Err(err("missing group name", start));
+                }
+                let name: String = s[start..start + len].iter().collect();
+                if name.chars().all(|ch| ch.is_ascii_digit()) {
+                    match name.parse::<usize>() {
+                        Ok(n) => (n, start),
+                        Err(_) => {
+                            return Err(err(&format!("invalid group reference {name}"), start));
+                        }
+                    }
+                } else {
+                    let mut chars = name.chars();
+                    let ident = chars
+                        .next()
+                        .is_some_and(|ch| ch == '_' || ch.is_alphabetic())
+                        && chars.all(|ch| ch == '_' || ch.is_alphanumeric());
+                    if !ident {
+                        return Err(err(&format!("bad character in group name '{name}'"), start));
+                    }
+                    match named.iter().find(|(n, _)| *n == name) {
+                        Some((_, idx)) => (*idx, start),
+                        None => return Err(format!("IndexError: unknown group name '{name}'")),
+                    }
+                }
+            }
+            '0' => {
+                let mut v = 0u32;
+                for _ in 0..2 {
+                    if !is_oct(s.get(i)) {
+                        break;
+                    }
+                    v = v * 8 + s[i].to_digit(8).unwrap_or(0);
+                    i += 1;
+                }
+                lit.push(char::from_u32(v & 0xff).unwrap_or('\0'));
+                continue;
+            }
+            '1'..='9' => {
+                let mut digits = String::from(c);
+                if s.get(i).is_some_and(|d| d.is_ascii_digit()) {
+                    digits.push(s[i]);
+                    i += 1;
+                    if is_oct(Some(&c))
+                        && is_oct(digits.chars().nth(1).as_ref())
+                        && is_oct(s.get(i))
+                    {
+                        digits.push(s[i]);
+                        i += 1;
+                        let v = u32::from_str_radix(&digits, 8).unwrap_or(0);
+                        if v > 0o377 {
+                            return Err(err(
+                                &format!("octal escape value \\{digits} outside of range 0-0o377"),
+                                i - digits.len() - 1,
+                            ));
+                        }
+                        lit.push(char::from_u32(v).unwrap_or('\0'));
+                        continue;
+                    }
+                }
+                (
+                    digits.parse::<usize>().unwrap_or(usize::MAX),
+                    i - digits.len(),
+                )
+            }
+            _ => {
+                match c {
+                    'a' => lit.push('\x07'),
+                    'b' => lit.push('\x08'),
+                    'f' => lit.push('\x0c'),
+                    'n' => lit.push('\n'),
+                    'r' => lit.push('\r'),
+                    't' => lit.push('\t'),
+                    'v' => lit.push('\x0b'),
+                    '\\' => lit.push('\\'),
+                    _ if c.is_ascii_alphabetic() => {
+                        return Err(err(&format!("bad escape \\{c}"), i - 2));
+                    }
+                    _ => {
+                        lit.push('\\');
+                        lit.push(c);
+                    }
+                }
+                continue;
+            }
+        };
+        let (index, pos) = group;
+        if index > groups {
+            return Err(err(&format!("invalid group reference {index}"), pos));
+        }
+        pieces.push(ReplPiece::Lit(std::mem::take(&mut lit)));
+        pieces.push(ReplPiece::Group(index));
+    }
+    pieces.push(ReplPiece::Lit(lit));
+    Ok(pieces)
+}
+
+/// Expand a parsed template against one match's byte spans over `text`.
+fn re_expand(pieces: &[ReplPiece], text: &str, spans: &[Option<(usize, usize)>]) -> String {
     let mut out = String::new();
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '$' => out.push_str("$$"),
-            '\\' => match chars.peek() {
-                Some(d) if d.is_ascii_digit() => {
-                    out.push_str("${");
-                    while let Some(d) = chars.peek() {
-                        if d.is_ascii_digit() {
-                            out.push(*d);
-                            chars.next();
-                        } else {
-                            break;
-                        }
-                    }
-                    out.push('}');
+    for p in pieces {
+        match p {
+            ReplPiece::Lit(s) => out.push_str(s),
+            ReplPiece::Group(g) => {
+                if let Some((a, b)) = spans.get(*g).copied().flatten() {
+                    out.push_str(&text[a..b]);
                 }
-                Some('g') => {
-                    chars.next(); // g
-                    if chars.peek() == Some(&'<') {
-                        chars.next(); // <
-                        out.push_str("${");
-                        while let Some(d) = chars.peek() {
-                            if *d == '>' {
-                                chars.next();
-                                break;
-                            }
-                            out.push(*d);
-                            chars.next();
-                        }
-                        out.push('}');
-                    }
-                }
-                Some(other) => {
-                    // `\n`, `\t`, `\\` — keep as the literal char.
-                    let o = *other;
-                    chars.next();
-                    match o {
-                        'n' => out.push('\n'),
-                        't' => out.push('\t'),
-                        'r' => out.push('\r'),
-                        _ => out.push(o),
-                    }
-                }
-                None => out.push('\\'),
-            },
-            _ => out.push(c),
+            }
         }
     }
     out
@@ -10487,8 +10742,22 @@ pub fn re_match_method(m: &Value, method: &str, args: &[Value]) -> Result<Value,
             }
             Ok(with_host(|h| h.new_dict(d)))
         }
+        // `m.expand(template)` — the template `sub` would apply to this match.
+        "expand" => {
+            let t = args
+                .first()
+                .and_then(|v| with_host(|h| h.as_str(v)))
+                .ok_or_else(|| host::type_error("expected str"))?;
+            let pieces = re_parse_template(&t, ngroups - 1, &named)?;
+            Ok(with_host(|h| h.new_str(re_expand(&pieces, &text, &spans))))
+        }
         "start" | "end" | "span" => {
-            let idx = args.first().and_then(group_idx).unwrap_or(0);
+            // An unknown group is `IndexError`, as it is for `group()`; it used
+            // to fall back to group 0 and answer the whole match's position.
+            let idx = match args.first() {
+                Some(g) => group_idx(g).ok_or_else(|| "IndexError: no such group".to_string())?,
+                None => 0,
+            };
             match spans.get(idx).copied().flatten() {
                 // The stored span is a byte range; Python counts `str` positions
                 // in codepoints. `re.search('b', 'éb').start()` is 1, not 2.
@@ -15180,7 +15449,7 @@ fn is_py_space(c: char) -> bool {
 /// CPython identifier "continue" chars beyond `XID_Continue`: the
 /// `Other_ID_Continue` set (U+00B7, U+0387, U+1369..U+1371, U+19DA) plus the
 /// zero-width joiner / non-joiner (U+200C/U+200D), which PEP 3131 permits.
-fn is_other_id_continue(c: char) -> bool {
+pub(crate) fn is_other_id_continue(c: char) -> bool {
     matches!(
         c,
         '\u{00b7}' | '\u{0387}' | '\u{1369}'..='\u{1371}' | '\u{19da}' | '\u{200c}' | '\u{200d}'
@@ -16005,6 +16274,30 @@ fn dict_method(
     }
 }
 
+/// The `(key, value)` pairs of an iterable of 2-element items — the non-mapping
+/// operand of `dict(seq)` and `dict.update(seq)` — with CPython's errors for an
+/// item that is not iterable or not of length 2. A wrong-length item used to be
+/// skipped silently by `dict()` (`dict([(1, 2, 3)])` was `{}`).
+fn dict_update_seq(v: &Value) -> Result<Vec<(Value, Value)>, String> {
+    let mut out = Vec::new();
+    for (n, item) in host::iter_vec(v)?.into_iter().enumerate() {
+        let elems =
+            host::iter_vec(&item).map_err(|_| host::type_error("object is not iterable"))?;
+        if elems.len() != 2 {
+            return Err(format!(
+                "ValueError: dictionary update sequence element #{n} has length {}; 2 is required",
+                elems.len()
+            ));
+        }
+        let mut it = elems.into_iter();
+        out.push((
+            it.next().unwrap_or(Value::Undef),
+            it.next().unwrap_or(Value::Undef),
+        ));
+    }
+    Ok(out)
+}
+
 /// `dict.update(other?, **kwargs)`: `other` may be a mapping (dict/view) OR an
 /// iterable of key/value pairs; keyword args are applied last (they win).
 fn dict_update(
@@ -16015,27 +16308,11 @@ fn dict_update(
     // Collect the (key-object, value) pairs to apply, in order.
     let mut pairs: Vec<(Value, Value)> = Vec::new();
     if let Some(o) = other {
-        let is_dict = with_host(|h| matches!(h.get(o), Some(PyObj::Dict(_))));
-        if is_dict {
-            let src = with_host(|h| match h.get(o) {
-                Some(PyObj::Dict(d)) => d
-                    .iter()
-                    .map(|(_, (kv, v))| (kv.clone(), v.clone()))
-                    .collect::<Vec<_>>(),
-                _ => vec![],
-            });
-            pairs.extend(src);
-        } else {
-            // An iterable of 2-element pairs.
-            for pair in host::iter_vec(o)? {
-                let elems = host::iter_vec(&pair)?;
-                if elems.len() != 2 {
-                    return Err(host::type_error(
-                        "dictionary update sequence element has length != 2",
-                    ));
-                }
-                pairs.push((elems[0].clone(), elems[1].clone()));
-            }
+        // A mapping (dict, mappingproxy, anything with `keys()`) merges by key;
+        // anything else is an iterable of pairs.
+        match mapping_pairs(o)? {
+            Some(p) => pairs.extend(p),
+            None => pairs.extend(dict_update_seq(o)?),
         }
     }
     for (k, v) in kwargs {

@@ -1225,3 +1225,121 @@ try:
     re.compile("(")
 except re.PatternError as _e:
     print("caught", type(_e).__name__, isinstance(_e, re.error))
+#==#
+# ── re: CPython's empty-match rule (3.7+) across findall/finditer/sub/split ──
+# After a NON-empty match an empty one may sit right where it ended; after an
+# EMPTY one the next may not be empty at the same spot. Both Rust engines'
+# iterators refuse the first case, so `x*` over 'abxd' lost the empty match
+# after the 'x'.
+import re
+for p, s in [("x*", "abxd"), ("", "abc"), (r"\b", "ab cd"), ("a*", "baaac"), ("a?", "aab"), ("a|", "bab")]:
+    print(repr(p), re.findall(p, s), re.split(p, s), [m.span() for m in re.finditer(p, s)],
+          re.sub(p, "-", s), re.subn(p, "-", s)[1])
+#==#
+# ── re: replacement templates parsed like re._parser.parse_template ─────────
+import re
+for r in [r"\.", r"\0", r"\101", r"[\2]", r"\g<n>\g<0>\g<1>$1", r"\a\b\f\t\v\\", r"\1\1",
+          r"\q", r"\10", r"\g<5>", r"\g<x>", r"\gx", r"\x41", r"\400"]:
+    try:
+        print(repr(r), repr(re.sub(r"(?P<n>a)(b)?", r, "xa ab")))
+    except (re.error, IndexError) as e:
+        print(repr(r), type(e).__name__, e)
+#==#
+# ── re: `pos` keeps the text before it in view; endpos truncates ────────────
+import re
+p = re.compile(r"^a|b")
+print(p.search("ba", 1), p.search("xa", 1), p.match("ba", 1), p.match("ab", 1).span())
+print(re.compile(r"(?<=x)a").search("xa", 1).span(), re.compile(r"\ba").search("xa", 1))
+print(re.compile("a$").search("ab", 0, 1).span(), re.compile("b").search("abc", 0, 1))
+#==#
+# ── re.Match / re.Pattern surface ───────────────────────────────────────────
+import re
+m = re.search(r"(?P<a>x)(?P<b>y)?(z)", "--xz--")
+print(m[0], m["a"], m[2], m[3], m.regs, m.lastgroup, m.lastindex, m.re.pattern)
+print(m.re is re.compile(r"(?P<a>x)(?P<b>y)?(z)"), m.expand(r"<\1|\g<a>|\2|\3>"))
+print(re.match(r"(?P<k>a)(b)", "ab").lastgroup, re.match(r"(a)(?P<k>b)", "ab").lastgroup)
+for bad in ["m.start(9)", "m.end('q')", "m.span(-1)", "m[5]", "m['zz']"]:
+    try:
+        print(eval(bad))
+    except IndexError as e:
+        print(bad, "IndexError:", e)
+pat = re.compile("(a)(?P<n>b)")
+print(pat.groupindex, pat.groupindex["n"], dict(pat.groupindex), pat.groups)
+print(re.compile("a").flags, re.compile("a", re.I).flags, re.compile("(?im)a").flags,
+      re.compile("a", re.A).flags, re.compile(b"a").flags)
+#==#
+# ── `**` and dict() take ANY mapping, and reject what is not one ────────────
+# Only a plain dict used to spread: a dict subclass, a mappingproxy, ChainMap or
+# a user class with keys()/__getitem__ spread as NOTHING, and `{**[1]}` was {}.
+import collections, types
+class M:
+    def keys(self): return ["a", "b"]
+    def __getitem__(self, k): return k.upper()
+class D(dict): pass
+class K(dict):                      # keys/__getitem__ overridden: storage wins
+    def keys(self): return ["only"]
+    def __getitem__(self, k): return 42
+class K2(K):                        # __iter__ overridden: keys() is consulted
+    def __iter__(self): return iter(["only"])
+def f(**kw): return kw
+for name, obj in [("M", M()), ("D", D(z=1)), ("ChainMap", collections.ChainMap({"p": 1}, {"q": 2})),
+                  ("proxy", types.MappingProxyType({"m": 1})), ("K", K(only=1, other=2)),
+                  ("K2", K2(only=1, other=2))]:
+    print(name, {**obj}, {"k": 0, **obj}, dict(obj), f(**obj))
+u = {}
+u.update(M()); u.update(types.MappingProxyType({"z": 9})); u.update([("p", 1)], q=2)
+print(u)
+for bad in ["{**[1]}", "{**1}", "dict([(1, 2, 3)])", "dict([(1,)])", "{}.update([(1, 2, 3)])",
+            "dict(**{1: 2})", "f(**{1: 2})", "f(**{'a': 1}, **{'a': 2})", "dict(a=1, **{'a': 2})"]:
+    try:
+        print(bad, eval(bad))
+    except (TypeError, ValueError) as e:
+        print(bad, type(e).__name__, e)
+#==#
+# ── `f(**x)` where x is not a mapping names the callable ────────────────────
+def g(**kw): return kw
+g(**[1])
+#==#
+# ── PEP 3131 identifiers ────────────────────────────────────────────────────
+é = 1
+π = 3.14
+变量 = "v"
+def función(año, *, größe=2): return año * größe
+class Ñandú:
+    peso = 5
+    def método(self): return self.peso
+x·y = 7
+print(é, π, 变量, función(3), función(año=1, größe=4), Ñandú().método(), x·y)
+for ñ in range(2): print(ñ)
+print(f"{é + 1}", Ñandú.__name__, función.__code__.co_varnames)
+#==#
+# ── a non-ASCII character that cannot start a name is `invalid character` ───
+y = a€b
+#==#
+# ── carets: `return f(...)` hides them only as the line's FIRST statement ───
+def f(d): return d["missing"]
+def g(): return f({})
+g()
+#==#
+# ── a `**` merge error names the callee as `_PyObject_FunctionStr` does ─────
+class B:
+    def m(self, **kw): pass
+class C(B): pass
+def outer():
+    def inner(**kw): pass
+    fn = inner
+    return [lambda: inner(**{'a': 1}, **{'a': 2}), lambda: fn(**[2])]
+for call in outer() + [lambda: C().m(**[1]), lambda: C().m(a=1, **{'a': 2}),
+                       lambda: [].append(**[1]), lambda: {}.update(**{'a': 1}, **{'a': 2})]:
+    try:
+        call()
+    except TypeError as e:
+        print(e)
+#==#
+# ── a bare `*` is a marker, not a `*args` parameter ─────────────────────────
+def h(a, *, b=2): pass
+def h3(a, *r, b=2, **k): x = 1
+def h4(*, k): pass
+for fn in (h, h3, h4):
+    c = fn.__code__
+    print(c.co_varnames, c.co_flags & 0xF, c.co_nlocals, c.co_argcount, c.co_kwonlyargcount)

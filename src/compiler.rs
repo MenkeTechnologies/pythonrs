@@ -3473,26 +3473,30 @@ impl Compiler {
                 self.name_const(b, attr);
                 self.compile_arg_spread(b, args)?;
                 self.compile_kw_spread(b, keywords)?;
-                b.emit(Op::CallBuiltin(ops::CALL_METHOD_EX, 4), self.cur_line);
+                let idx = b.emit(Op::CallBuiltin(ops::CALL_METHOD_EX, 4), self.cur_line);
+                self.record_span(idx);
             }
             // Same as the plain call: a slotted callee is pushed as a value.
             Expr::Name(n) if self.slot_of(n).is_some() => {
                 self.compile_expr(b, func)?;
                 self.compile_arg_spread(b, args)?;
                 self.compile_kw_spread(b, keywords)?;
-                b.emit(Op::CallBuiltin(ops::CALL_VALUE_EX, 3), self.cur_line);
+                let idx = b.emit(Op::CallBuiltin(ops::CALL_VALUE_EX, 3), self.cur_line);
+                self.record_span(idx);
             }
             Expr::Name(n) => {
                 self.name_const(b, n);
                 self.compile_arg_spread(b, args)?;
                 self.compile_kw_spread(b, keywords)?;
-                b.emit(Op::CallBuiltin(ops::CALL_EX, 3), self.cur_line);
+                let idx = b.emit(Op::CallBuiltin(ops::CALL_EX, 3), self.cur_line);
+                self.record_span(idx);
             }
             _ => {
                 self.compile_expr(b, func)?;
                 self.compile_arg_spread(b, args)?;
                 self.compile_kw_spread(b, keywords)?;
-                b.emit(Op::CallBuiltin(ops::CALL_VALUE_EX, 3), self.cur_line);
+                let idx = b.emit(Op::CallBuiltin(ops::CALL_VALUE_EX, 3), self.cur_line);
+                self.record_span(idx);
             }
         }
         Ok(())

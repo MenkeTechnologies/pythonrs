@@ -198,7 +198,9 @@ message — and a `SyntaxError` carries its `lineno`/`offset`/`end_offset`/`text
 /`filename`; `compile()`, `exec` and `eval` share that path. The symbol
 table's checks run before any code is generated, so a `global`/`nonlocal`
 after the name was used or bound, or a `yield` in a comprehension, is refused
-as CPython refuses it. See
+as CPython refuses it. Names follow PEP 3131 — `π`, `año`, `变量` are
+identifiers, and any other non-ASCII character is CPython's `invalid character`
+error. See
 [\[0x07\]](#0x07-status--roadmap) and [BUGS.md](BUGS.md) for the honest list of
 what is not yet implemented.
 
