@@ -15597,21 +15597,13 @@ pub fn call_type_method(
         // (there is no traceback object to attach), and `add_note` appends to
         // `__notes__`, which `traceback` renders. `unittest.assertRaises` stores
         // its captured exception with `exc.with_traceback(None)`.
-        _ if is_exception_class(&tn) && matches!(name, "with_traceback" | "add_note") => {
+        _ if matches!(name, "with_traceback" | "add_note")
+            && with_host(|h| is_exception_value(h, recv, &tn)) =>
+        {
             if name == "with_traceback" {
                 return Ok(recv.clone());
             }
-            let note = arg0(&args)?;
-            with_host(|h| {
-                let notes = h.get_attr(recv, "__notes__").unwrap_or(Value::Undef);
-                let mut items = match h.get(&notes) {
-                    Some(host::PyObj::List(l)) => l.clone(),
-                    _ => Vec::new(),
-                };
-                items.push(note);
-                let lst = h.new_list(items);
-                h.set_attr(recv, "__notes__", lst)
-            })?;
+            exception_add_note(recv, arg0(&args)?)?;
             Ok(Value::Undef)
         }
         // A `_thread` lock: the operations live on the host object, so route
@@ -15635,6 +15627,43 @@ pub fn call_type_method(
             "AttributeError: '{other}' object has no attribute '{name}'"
         )),
     }
+}
+
+/// Whether `v` (of type name `tn`) is an exception: a builtin one, or an
+/// instance of a class deriving from one (`class E(Exception)`), which inherits
+/// `BaseException`'s methods.
+fn is_exception_value(h: &host::PyHost, v: &Value, tn: &str) -> bool {
+    is_exception_class(tn)
+        || matches!(h.get(v), Some(host::PyObj::Instance(i)) if h.class_is_exception(&i.class))
+}
+
+/// `BaseException.add_note(note)` (`BaseException_add_note_impl`): append to the
+/// exception's `__notes__` list IN PLACE, creating the list on first use.
+fn exception_add_note(exc: &Value, note: Value) -> Result<(), String> {
+    with_host(|h| {
+        if h.as_str(&note).is_none() {
+            return Err(host::type_error(&format!(
+                "add_note() argument must be str, not {}",
+                if matches!(note, Value::Undef) { "None".to_string() } else { h.type_name(&note) }
+            )));
+        }
+        let notes = match h.get_attr(exc, "__notes__") {
+            Ok(n) => n,
+            Err(e) if is_attr_err(&e) => {
+                let n = h.new_list(Vec::new());
+                h.set_attr(exc, "__notes__", n.clone())?;
+                n
+            }
+            Err(e) => return Err(e),
+        };
+        match h.get_mut(&notes) {
+            Some(host::PyObj::List(items)) => {
+                items.push(note);
+                Ok(())
+            }
+            _ => Err(host::type_error("Cannot add note: __notes__ is not a list")),
+        }
+    })
 }
 
 /// `coro.send/throw/close/__await__` — a coroutine's method protocol (shares the

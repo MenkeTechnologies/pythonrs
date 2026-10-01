@@ -9,6 +9,21 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **A user exception class inherits `add_note` and `with_traceback`.**
+  `BaseException`'s methods resolved only on the builtin exception types, so
+  `class E(Exception)` raised `AttributeError: 'E' object has no attribute
+  'add_note'` — including inside `pickle.py`, whose `save` notes every
+  failure. Both now resolve on any exception instance, as a call and as a bound
+  method, and `add_note` is `BaseException_add_note_impl`: it appends to
+  `__notes__` in place (the list keeps its identity, where it used to be
+  replaced), rejects a non-`str` note with `add_note() argument must be str,
+  not int`, and refuses a `__notes__` that is not a list.
+- **A bound `object` slot read off an instance is callable.** `obj.__reduce_ex__`
+  / `obj.__eq__` / `obj.__setattr__` and the other inherited `object` slots
+  read as an attribute and called later — `r = getattr(obj,
+  '__reduce_ex__'); r(4)`, which is how `copy` and `pickle` reach them —
+  raised `TypeError: 'method-wrapper' object is not callable`. The bound
+  wrapper now runs the slot on the instance it was read from.
 - **`operator.index()` sees a native `__index__`.** The `operator` module is
   the bridged C accelerator, and a pythonrs instance crossed as a
   `PyrsInstance` proxy with no `nb_index` slot, so `operator.index(obj)` and

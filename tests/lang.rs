@@ -9826,3 +9826,58 @@ x = (P(2) in d.keys(), (P(2), 5) in d.items(), (P(2), 4) in d.items(), P(3) in d
         r#"(True, True, False, False, [(1, 0), (2, 5), (2, 6)], [2])"#
     );
 }
+
+/// `BaseException.add_note` / `with_traceback` are inherited by a user exception
+/// class, as CPython's are: `add_note` appends to `__notes__` IN PLACE (the list
+/// keeps its identity), rejects a non-`str` note with argument clinic's message,
+/// refuses a `__notes__` that is not a list, and is reachable as a bound method
+/// (`getattr(e, 'add_note')`, as `pickle.py` reaches it). Expected values are
+/// python3.14's.
+#[test]
+fn user_exception_inherits_add_note_and_with_traceback() {
+    let src = "\
+class E(Exception): pass
+class F(ValueError): pass
+e = E('a'); e.add_note('n1'); n = e.__notes__; e.add_note('n2')
+f = F(); f.add_note('z')
+g = KeyError(1); g.add_note('k'); m = g.__notes__; g.add_note('j')
+bad = []
+for note in (1, None):
+    try: E().add_note(note)
+    except TypeError as x: bad.append(str(x))
+h = E(); h.__notes__ = ()
+try: h.add_note('q')
+except TypeError as x: bad.append(str(x))
+eb = E('b'); add = getattr(eb, 'add_note'); add('w')
+x = (e.__notes__, n is e.__notes__, f.__notes__, f.with_traceback(None) is f,
+     g.__notes__, m is g.__notes__, bad, eb.__notes__)
+";
+    assert_eq!(
+        g(src, "x"),
+        "(['n1', 'n2'], True, ['z'], True, ['k', 'j'], True, \
+         ['add_note() argument must be str, not int', \
+         'add_note() argument must be str, not None', \
+         'Cannot add note: __notes__ is not a list'], ['w'])"
+    );
+}
+
+/// An inherited `object` slot read off an instance is a BOUND method that can be
+/// called later — `copy` and `pickle` do `r = getattr(obj, '__reduce_ex__')`
+/// and then `r(proto)`; the bound form used to be an uncallable `method-wrapper`.
+/// Expected values are python3.14's.
+#[test]
+fn bound_object_slots_read_off_an_instance_are_callable() {
+    let src = "\
+class P: pass
+p = P(); p.x = 1
+r = getattr(p, '__reduce_ex__')
+init, eq, ne, setattr_, delattr_, getattribute = p.__init__, p.__eq__, p.__ne__, p.__setattr__, p.__delattr__, p.__getattribute__
+setattr_('y', 2); had = p.y; delattr_('y')
+x = (r(2)[0].__name__, r(2)[1][0] is P, p.__reduce__()[0].__name__, init(), eq(p), eq(1), ne(p),
+     had, hasattr(p, 'y'), getattribute('x'), p.__format__('') == str(p), 'x' in p.__dir__())
+";
+    assert_eq!(
+        g(src, "x"),
+        "('__newobj__', True, '_reconstructor', None, True, NotImplemented, False, 2, False, 1, True, True)"
+    );
+}

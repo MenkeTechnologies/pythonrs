@@ -11843,6 +11843,18 @@ impl PyHost {
                 if name == "args" && self.class_is_exception(&class) {
                     return Ok(self.alloc(PyObj::Tuple(vec![])));
                 }
+                // `BaseException`'s methods, inherited by every exception class
+                // that does not override them.
+                if matches!(name, "add_note" | "with_traceback")
+                    && self.class_is_exception(&class)
+                    && self.class_lookup(&class, name).is_none()
+                {
+                    let func = self.alloc(PyObj::Builtin(name.to_string()));
+                    return Ok(self.alloc(PyObj::BoundMethod {
+                        recv: recv.clone(),
+                        func,
+                    }));
+                }
                 if (name == "__cause__" || name == "__context__" || name == "__suppress_context__")
                     && self.class_is_exception(&class)
                 {
@@ -14371,6 +14383,17 @@ pub fn invoke(
             }
         }
         Some(PyObj::Class(name)) => instantiate(&name, args, kwargs),
+        // An inherited `object` slot reached on an instance and called later
+        // (`r = getattr(obj, '__reduce_ex__'); r(4)`, as `copy` and `pickle`
+        // do) runs the slot on the instance it was bound to.
+        Some(PyObj::Descriptor {
+            kind: DescKind::MethodWrapper,
+            qual,
+            recv: Some(recv),
+        }) => {
+            let method = qual.rsplit_once('.').map_or(qual.as_str(), |(_, m)| m);
+            call_method(&recv, method, args, kwargs)
+        }
         // An unbound slot wrapper (`int.__str__`, `object.__repr__`) is callable:
         // `wrapper(self, *rest)` runs the slot on its first argument. Dispatch to
         // the base type directly — re-looking-up the method on `self` could hit
@@ -15435,6 +15458,12 @@ fn call_method_inner(
                 if let Some(base) = with_host(|h| h.builtin_base_of(&class)) {
                     return base_dispatch(recv, &inst.payload, base, name, args, kwargs);
                 }
+            }
+            // `BaseException`'s methods on an exception subclass instance.
+            if matches!(name, "add_note" | "with_traceback")
+                && with_host(|h| h.class_is_exception(&class))
+            {
+                return crate::builtins::call_type_method(recv, name, args, kwargs);
             }
             // The `object` slots the class inherited and did not override.
             // Before `__getattr__` deliberately: in CPython the type lookup
