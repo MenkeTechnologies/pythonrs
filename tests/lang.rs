@@ -9236,3 +9236,58 @@ fn a_class_reprs_under_its_own_module() {
         "(\"<class 'zz.Q'>\", '<zz.Q', \"<class 'B'>\", '<B', \"<class '__main__.M'>\")"
     );
 }
+
+// Every construct whose operands used to ride in one u8 `argc` accepts more
+// than 255 of them, as CPython does: a call's positional and keyword
+// arguments, a `{**a, …}` display, a `def`/`lambda` with that many defaults, a
+// class header's keywords, and a class/mapping pattern's keys. Expected values
+// are CPython 3.14's.
+#[test]
+fn more_than_255_operands_are_accepted_everywhere() {
+    let join = |n: usize, f: &dyn Fn(usize) -> String| {
+        (0..n).map(f).collect::<Vec<_>>().join(", ")
+    };
+    let pos = join(300, &|i| i.to_string());
+    let kws = join(200, &|i| format!("k{i}={i}"));
+    let src = [
+        "def f(*a, **k): return (len(a), sum(a), len(k), sum(k.values()))".to_string(),
+        format!("r1 = f({pos})"),
+        "class O:\n    def m(self, *a, **k): return (len(a), a[-1], sorted(k)[:2])".to_string(),
+        format!("r2 = O().m({pos}, {kws})"),
+        format!("r3 = f({kws})"),
+        format!(
+            "a = {{'x': 1}}\nd = {{**a, {}, **{{'y': 2}}}}",
+            join(150, &|i| format!("'e{i}': {i}"))
+        ),
+        "r4 = (len(d), d['x'], d['e149'], d['y'], list(d)[:3])".to_string(),
+        format!(
+            "def g({}, *, {}): return p0 + p259 + q9",
+            join(260, &|i| format!("p{i}={i}")),
+            join(10, &|i| format!("q{i}={i}"))
+        ),
+        "r5 = (g(), g(p259=1000), len(g.__defaults__), len(g.__kwdefaults__))".to_string(),
+        format!("lam = lambda {}: p0 + p259", join(260, &|i| format!("p{i}={i}"))),
+        "r6 = (lam(), lam(p0=5))".to_string(),
+        "class S:\n    def __init_subclass__(cls, **kw): cls.n = len(kw)".to_string(),
+        format!("class T(S, {}): pass", join(140, &|i| format!("c{i}={i}"))),
+        "class P:\n    def __init__(self):\n        for i in range(260): setattr(self, f'a{i}', i)"
+            .to_string(),
+        format!(
+            "match P():\n    case P({}):\n        r7 = (v0, v259)",
+            join(260, &|i| format!("a{i}=v{i}"))
+        ),
+        format!(
+            "match {{{}}}:\n    case {{{}, **rest}}:\n        r8 = sorted(rest)[:2]",
+            join(300, &|i| format!("'m{i}': {i}")),
+            join(260, &|i| format!("'m{i}': _"))
+        ),
+        "x = (r1, r2, r3, r4, r5, r6, T.n, r7, r8)".to_string(),
+    ]
+    .join("\n");
+    assert_eq!(
+        g(&src, "x"),
+        "((300, 44850, 0, 0), (300, 299, ['k0', 'k1']), (0, 0, 200, 19900), \
+         (152, 1, 149, 2, ['x', 'e0', 'e1']), (268, 1009, 260, 10), (259, 264), 140, \
+         (0, 259), ['m260', 'm261'])"
+    );
+}

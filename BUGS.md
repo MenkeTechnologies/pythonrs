@@ -9,6 +9,16 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **More than 255 operands anywhere.** `CallBuiltin` carries a `u8` operand
+  count, so a call with >255 arguments, a `{**a, …}` display with >85 entries,
+  a `def`/`lambda` with >252 defaults, >127 class-header keywords, and a class
+  or mapping pattern with >252 keys raised `too many arguments (>255) for one
+  call`. Each now gathers its operands the way CPython's `LIST_EXTEND`/
+  `DICT_MERGE` do: an oversized call goes through the `*args`/`**kwargs` path,
+  whose `BUILD_ARGS`/`BUILD_KWARGS` (and `MKDICT_EX`) take one chunk-built list
+  in place of inline slots, and `MKFUNC`/`MATCH_CLASS` take their defaults and
+  keyword names as lists. Plain collection literals and f-strings were already
+  chunked.
 - **`float` `repr` breaks a shortest-digit tie to even.** Rust `std`'s shortest
   formatter rounds an exact tie between two equally short round-tripping
   decimals up, so `2113325745016023.2` (the double `…023.25`) printed as
@@ -1727,17 +1737,6 @@ written.
   CPython by exactly those two names. Relatedly, `import builtins;
   builtins.len is len` is `False` — the bridged `builtins` module is a distinct
   CPython object from the native builtin dispatch.
-- **256+ argument calls / `**`-spread dict literals**: `CallBuiltin` carries a
-  `u8` operand count, so an op that must name >255 stack slots at once raises
-  `too many arguments (>255) for one call`. Plain collection literals
-  (`[...]`/`(...)`/`{...}` and f-strings) no longer hit this — the compiler now
-  builds them in ≤255-slot chunks via the `EXTEND_LIST`/`EXTEND_TUPLE`/
-  `EXTEND_SET`/`EXTEND_DICT`/`EXTEND_STR` ops (mirrors CPython's
-  LIST_EXTEND/DICT_UPDATE/BUILD_STRING). Still overflowing: a call with >255
-  positional args, a `{**a, …}` dict literal with >127 entries (the tag-packed
-  `MKDICT_EX` site), and the rare >255-slot `MKFUNC`/class-base/`MATCH_CLASS`
-  sites. CPython lowers all of these too; the same chunked treatment would extend
-  to the call/spread paths.
 - **A call with an ATTRIBUTE callee resolves it after its arguments.** CPython
   evaluates the callee first, then the arguments left to right. The bare-name
   callee now does the same (`aa(bb)` blames `aa`), but `compile_call`

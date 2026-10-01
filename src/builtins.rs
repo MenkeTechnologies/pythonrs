@@ -106,6 +106,22 @@ fn pop_n(vm: &mut VM, n: usize) -> Vec<Value> {
     v
 }
 
+/// Pop the operands of a flat build op (`BUILD_ARGS`, `BUILD_KWARGS`,
+/// `MKDICT_EX`). Their entries are pairs or triples, so `argc` 1 never occurs
+/// inline: it is the compiler's single list of every operand for a build too
+/// large for the u8 `argc` (`Compiler::emit_flat_build`).
+fn pop_flat(vm: &mut VM, argc: u8) -> Vec<Value> {
+    let flat = pop_n(vm, argc as usize);
+    if argc != 1 {
+        return flat;
+    }
+    let list = with_host(|h| match h.get(&flat[0]) {
+        Some(PyObj::List(l)) => Some(l.clone()),
+        _ => None,
+    });
+    list.unwrap_or(flat)
+}
+
 /// Read a compiler-internal name string (native `Value::Str` or heap `str`).
 fn sval(v: &Value) -> String {
     if let Value::Str(s) = v {
@@ -1168,7 +1184,7 @@ fn b_call_method_ex(vm: &mut VM, _: u8) -> Value {
 
 /// Flatten a positional-arg spread: pairs `(tag, value)`, tag 1 = `*` spread.
 fn b_build_args(vm: &mut VM, argc: u8) -> Value {
-    let flat = pop_n(vm, argc as usize);
+    let flat = pop_flat(vm, argc);
     let mut out = Vec::new();
     let mut i = 0;
     while i + 1 < flat.len() {
@@ -1197,7 +1213,7 @@ fn b_build_args(vm: &mut VM, argc: u8) -> Value {
 /// a `dict` subclass, a `mappingproxy`, a user class with `keys()` — where
 /// only a plain `dict` used to, every other operand silently adding nothing.
 fn b_build_kwargs(vm: &mut VM, argc: u8) -> Value {
-    let flat = pop_n(vm, argc as usize);
+    let flat = pop_flat(vm, argc);
     let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
     let mut err: Option<host::KwSpreadError> = None;
     let mut i = 0;
@@ -1322,7 +1338,7 @@ fn mapping_pairs(v: &Value) -> Result<Option<Vec<(Value, Value)>>, String> {
 /// Build a dict from `{**a, k: v}` literal entries: triples `(tag, a, b)` where
 /// tag 1 = `**` spread of `a` (b unused), tag 0 = plain `(key a, val b)`.
 fn b_mkdict_ex(vm: &mut VM, argc: u8) -> Value {
-    let flat = pop_n(vm, argc as usize);
+    let flat = pop_flat(vm, argc);
     let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
     let mut i = 0;
     while i + 2 < flat.len() {
@@ -1719,11 +1735,26 @@ fn b_mkfunc(vm: &mut VM, argc: u8) -> Value {
         _ => return abort(vm, "internal: MKFUNC without func id".into()),
     };
     let nkw = match args.pop() {
-        Some(Value::Int(n)) => n as usize,
+        Some(Value::Int(n)) => n,
         _ => return abort(vm, "internal: MKFUNC without kwonly-default count".into()),
     };
-    let split = args.len().saturating_sub(nkw);
-    let kwonly_defaults = args.split_off(split);
+    let kwonly_defaults = if nkw == -1 {
+        // Too many defaults for the u8 `argc`: `[ann, defaults, kwonly]`
+        // with each group gathered into a list (`emit_make_func`).
+        let list_items = |v: Option<Value>| {
+            with_host(|h| match v.as_ref().and_then(|v| h.get(v)) {
+                Some(PyObj::List(l)) => l.clone(),
+                _ => Vec::new(),
+            })
+        };
+        let kwonly = list_items(args.pop());
+        let defaults = list_items(args.pop());
+        args.extend(defaults);
+        kwonly
+    } else {
+        let split = args.len().saturating_sub(nkw as usize);
+        args.split_off(split)
+    };
     // The `__annotations__` are the deepest arg (always present). An unannotated
     // func gets a plain empty dict; an annotated one gets a THUNK — evaluate it
     // now, catching a forward-reference NameError (a self-referential annotation
@@ -3809,7 +3840,15 @@ fn b_match_class(vm: &mut VM, argc: u8) -> Value {
         Value::Int(n) => n as usize,
         _ => 0,
     };
-    let kwnames: Vec<String> = all[3..].iter().map(sval).collect();
+    // The names follow inline, or — past the u8 `argc` — as a single list.
+    let names_list = match all.get(3) {
+        Some(v) if all.len() == 4 => with_host(|h| match h.get(v) {
+            Some(PyObj::List(l)) => Some(l.clone()),
+            _ => None,
+        }),
+        _ => None,
+    };
+    let kwnames: Vec<String> = names_list.as_deref().unwrap_or(&all[3..]).iter().map(sval).collect();
     // `isinstance_dispatch` (not the raw helper) so a foreign class — a
     // `@dataclass`/`enum` mirror — matches via CPython's `isinstance`.
     match isinstance_dispatch(&subject, &class) {

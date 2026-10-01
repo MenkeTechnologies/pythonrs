@@ -2103,18 +2103,33 @@ impl Compiler {
             self.fn_depth -= 1;
             self.emit_make_func(b, thunk_id?, &empty)?; // pushes the thunk value
         }
-        for d in &params.defaults {
-            self.compile_expr(b, d)?;
+        let kwonly: Vec<&Expr> = params.kwonly_defaults.iter().flatten().collect();
+        let total = 1 + params.defaults.len() + kwonly.len() + 2; // annotations + defaults + count + func id
+        if total <= 255 {
+            for d in &params.defaults {
+                self.compile_expr(b, d)?;
+            }
+            for e in &kwonly {
+                self.compile_expr(b, e)?;
+            }
+            b.emit(Op::LoadInt(kwonly.len() as i64), 0); // keyword-only default count
+            b.emit(Op::LoadInt(def_id as i64), 0); // func id (immediately below MKFUNC)
+            b.emit(Op::CallBuiltin(ops::MKFUNC, total as u8), 0);
+        } else {
+            // Too many defaults for the u8 `argc`: each group travels as one
+            // list, flagged by a count of -1 (CPython's MAKE_FUNCTION always
+            // takes its defaults as a tuple).
+            let defaults = &params.defaults;
+            self.build_chunked(b, ops::MKLIST, ops::EXTEND_LIST, defaults.len(), 1, |c, b, i| {
+                c.compile_expr(b, &defaults[i])
+            })?;
+            self.build_chunked(b, ops::MKLIST, ops::EXTEND_LIST, kwonly.len(), 1, |c, b, i| {
+                c.compile_expr(b, kwonly[i])
+            })?;
+            b.emit(Op::LoadInt(-1), 0);
+            b.emit(Op::LoadInt(def_id as i64), 0); // func id (immediately below MKFUNC)
+            b.emit(Op::CallBuiltin(ops::MKFUNC, 5), 0);
         }
-        let mut nkw = 0usize;
-        for e in params.kwonly_defaults.iter().flatten() {
-            self.compile_expr(b, e)?;
-            nkw += 1;
-        }
-        b.emit(Op::LoadInt(nkw as i64), 0); // keyword-only default count
-        b.emit(Op::LoadInt(def_id as i64), 0); // func id (immediately below MKFUNC)
-        let total = 1 + params.defaults.len() + nkw + 2; // annotations + defaults + count + func id
-        b.emit(Op::CallBuiltin(ops::MKFUNC, argc(total)?), 0);
         Ok(())
     }
 
@@ -2404,11 +2419,10 @@ impl Compiler {
             .iter()
             .filter(|k| k.name.is_some() && k.name.as_deref() != Some("metaclass"))
             .collect();
-        for kw in &ckw {
-            self.strlit(b, kw.name.as_ref().unwrap());
-            self.compile_expr(b, &kw.value)?;
-        }
-        b.emit(Op::CallBuiltin(ops::MKDICT, argc(ckw.len() * 2)?), 0); // [meta,bases,name,bodyfunc,kwargs]
+        self.build_chunked(b, ops::MKDICT, ops::EXTEND_DICT, ckw.len(), 2, |c, b, i| {
+            c.strlit(b, ckw[i].name.as_ref().unwrap());
+            c.compile_expr(b, &ckw[i].value)
+        })?; // [meta,bases,name,bodyfunc,kwargs]
         b.emit(Op::CallBuiltin(ops::BUILD_CLASS, 5), 0); // -> class value
         for d in decorators.iter().rev() {
             self.compile_expr(b, d)?;
@@ -2796,26 +2810,32 @@ impl Compiler {
                 if pairs.iter().any(|(k, _)| k.is_none()) {
                     // `{**a, "k": v, **b}` — each entry is (tag, a, b): tag 1 =
                     // `**` spread of `a` (b unused), tag 0 = plain (key a, val b).
-                    for (k, v) in pairs {
-                        match k {
-                            Some(k) => {
-                                b.emit(Op::LoadInt(0), 0);
-                                self.compile_expr(b, k)?;
-                                self.compile_expr(b, v)?;
-                            }
-                            None => {
-                                b.emit(Op::LoadInt(1), 0);
-                                self.compile_expr(b, v)?;
-                                b.emit(Op::LoadUndef, 0);
-                            }
-                        }
-                    }
                     // Carries the line/span for the same reason `build_chunked`
                     // does: `{**a, [1]: 2}` raises on the unhashable key.
-                    let idx = b.emit(
-                        Op::CallBuiltin(ops::MKDICT_EX, argc(pairs.len() * 3)?),
-                        self.cur_line,
-                    );
+                    let line = self.cur_line;
+                    let idx = self.emit_flat_build(
+                        b,
+                        ops::MKDICT_EX,
+                        line,
+                        pairs.len(),
+                        3,
+                        |c, b, i| {
+                            let (k, v) = &pairs[i];
+                            match k {
+                                Some(k) => {
+                                    b.emit(Op::LoadInt(0), 0);
+                                    c.compile_expr(b, k)?;
+                                    c.compile_expr(b, v)
+                                }
+                                None => {
+                                    b.emit(Op::LoadInt(1), 0);
+                                    c.compile_expr(b, v)?;
+                                    b.emit(Op::LoadUndef, 0);
+                                    Ok(())
+                                }
+                            }
+                        },
+                    )?;
                     self.record_span(idx);
                 } else {
                     // This branch is reached only when every key is `Some`
@@ -3416,7 +3436,11 @@ impl Compiler {
         }
         let has_star = args.iter().any(|a| matches!(a, Expr::Starred(_)));
         let has_kwsplat = keywords.iter().any(|k| k.name.is_none());
-        if has_star || has_kwsplat {
+        // The direct call ops name every argument slot in their u8 `argc`
+        // (at most callee + name + kwargs + args). A larger call gathers its
+        // arguments into a list and dict as the EX path does.
+        let oversized = 3 + args.len() > 255 || keywords.len() * 2 > 255;
+        if has_star || has_kwsplat || oversized {
             return self.compile_call_ex(b, func, args, keywords);
         }
         let named: Vec<&Keyword> = keywords.iter().collect();
@@ -3478,39 +3502,63 @@ impl Compiler {
         Ok(())
     }
 
+    /// Emit a flat-operand build op (`BUILD_ARGS`, `BUILD_KWARGS`, `MKDICT_EX`)
+    /// over `count` entries of `slots` stack values each, the op carrying `line`. Within the u8 `argc`
+    /// cap the entries go straight onto the stack; past it they are gathered
+    /// into one list by [`Self::build_chunked`] and the op runs with `argc` 1,
+    /// which its handler reads as that list (see `builtins::pop_flat`) — the
+    /// shape CPython gets from `LIST_EXTEND`/`DICT_MERGE` for an oversized call.
+    fn emit_flat_build(
+        &mut self,
+        b: &mut ChunkBuilder,
+        op: u16,
+        line: u32,
+        count: usize,
+        slots: usize,
+        mut emit: impl FnMut(&mut Self, &mut ChunkBuilder, usize) -> Result<(), String>,
+    ) -> Result<usize, String> {
+        if count * slots <= 255 {
+            for i in 0..count {
+                emit(self, b, i)?;
+            }
+            return Ok(b.emit(Op::CallBuiltin(op, (count * slots) as u8), line));
+        }
+        self.build_chunked(b, ops::MKLIST, ops::EXTEND_LIST, count, slots, emit)?;
+        Ok(b.emit(Op::CallBuiltin(op, 1), line))
+    }
+
     /// Emit the positional-args list for a call/literal that contains `*spread`
     /// elements: each element is `(tag, value)` where tag 1 means spread. The
     /// `BUILD_ARGS` handler flattens spreads and returns a `list`.
     fn compile_arg_spread(&mut self, b: &mut ChunkBuilder, items: &[Expr]) -> Result<(), String> {
-        for it in items {
-            match it {
+        self.emit_flat_build(b, ops::BUILD_ARGS, 0, items.len(), 2, |c, b, i| {
+            match &items[i] {
                 Expr::Starred(inner) => {
                     b.emit(Op::LoadInt(1), 0);
-                    self.compile_expr(b, inner)?;
+                    c.compile_expr(b, inner)
                 }
-                _ => {
+                it => {
                     b.emit(Op::LoadInt(0), 0);
-                    self.compile_expr(b, it)?;
+                    c.compile_expr(b, it)
                 }
             }
-        }
-        b.emit(Op::CallBuiltin(ops::BUILD_ARGS, argc(items.len() * 2)?), 0);
+        })?;
         Ok(())
     }
 
     /// Emit the kwargs dict for a call with `name=v` and `**mapping` keywords:
     /// each entry is `(key, value)` where a `None`-key (Undef) is a `**` spread.
     fn compile_kw_spread(&mut self, b: &mut ChunkBuilder, kws: &[Keyword]) -> Result<(), String> {
-        for kw in kws {
+        self.emit_flat_build(b, ops::BUILD_KWARGS, 0, kws.len(), 2, |c, b, i| {
+            let kw = &kws[i];
             match &kw.name {
-                Some(n) => self.strlit(b, n),
+                Some(n) => c.strlit(b, n),
                 None => {
                     b.emit(Op::LoadUndef, 0);
                 }
             }
-            self.compile_expr(b, &kw.value)?;
-        }
-        b.emit(Op::CallBuiltin(ops::BUILD_KWARGS, argc(kws.len() * 2)?), 0);
+            c.compile_expr(b, &kw.value)
+        })?;
         Ok(())
     }
 
@@ -3889,10 +3937,9 @@ impl Compiler {
         }
         if let Some(rname) = rest {
             self.load_local(b, &mapv);
-            for (keyexpr, _) in keys {
-                self.compile_expr(b, keyexpr)?;
-            }
-            b.emit(Op::CallBuiltin(ops::MKLIST, argc(keys.len())?), 0);
+            self.build_chunked(b, ops::MKLIST, ops::EXTEND_LIST, keys.len(), 1, |c, b, i| {
+                c.compile_expr(b, &keys[i].0)
+            })?;
             b.emit(Op::CallBuiltin(ops::MATCH_MAP_REST, 2), 0); // [rest_dict]
             self.compile_assign(b, &Expr::Name(rname.clone()))?;
         }
@@ -3910,10 +3957,20 @@ impl Compiler {
         // [subject] on top.
         self.compile_expr(b, cls)?; // [subject, class]
         b.emit(Op::LoadInt(pos.len() as i64), 0);
-        for (name, _) in kw {
-            self.strlit(b, name);
+        if 3 + kw.len() <= 255 {
+            for (name, _) in kw {
+                self.strlit(b, name);
+            }
+            b.emit(Op::CallBuiltin(ops::MATCH_CLASS, (3 + kw.len()) as u8), 0); // [list, bool] | [bool]
+        } else {
+            // Too many keyword names for the u8 `argc`: they travel as one
+            // list (CPython's MATCH_CLASS always takes them as a tuple).
+            self.build_chunked(b, ops::MKLIST, ops::EXTEND_LIST, kw.len(), 1, |c, b, i| {
+                c.strlit(b, &kw[i].0);
+                Ok(())
+            })?;
+            b.emit(Op::CallBuiltin(ops::MATCH_CLASS, 4), 0);
         }
-        b.emit(Op::CallBuiltin(ops::MATCH_CLASS, argc(3 + kw.len())?), 0); // [list, bool] | [bool]
         let jf = b.emit(Op::JumpIfFalse(0), 0);
         fails.push(jf);
         let clsv = format!(".cls{}", self.tmp);
