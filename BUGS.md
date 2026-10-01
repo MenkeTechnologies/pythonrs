@@ -9,6 +9,15 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **A native `list[int]` or `int | str` subscripts a CPython `typing` generic.**
+  `def f() -> Optional[tuple[int, int]]` died at definition time with
+  `TypeError: cannot pass 'GenericAlias' to a CPython stdlib call`: the
+  stdlib-bridge conversion had no arm for the native PEP 585 alias or PEP 604
+  union. Each now crosses as CPython's own object — `types.GenericAlias(origin,
+  args)` and `typing.Union[args]` over the converted members — so
+  `Optional[dict[str, list[str]]]` and `List[tuple[int, int | None]]` build and
+  repr as CPython prints them. `type(list[int])` reprs `<class
+  'types.GenericAlias'>` instead of `<built-in function GenericAlias>`.
 - **Syntax errors are positioned and reported the way CPython reports them.**
   A program that did not compile printed one bare line —
   `SyntaxError: invalid syntax` for `x = (`, `expected ':' but found Newline

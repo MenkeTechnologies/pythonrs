@@ -4245,6 +4245,9 @@ fn type_object_class_name(n: &str) -> Option<String> {
         // `Union`, `__module__` is `typing`, and messages name it
         // `'typing.Union' object …`. It is no longer `builtins.UnionType`.
         "typing.Union" => Some("typing.Union"),
+        // `type(list[int])` — `type_name` keeps the bare `GenericAlias` for
+        // `__name__`; the class repr is module-qualified.
+        "GenericAlias" => Some("types.GenericAlias"),
         "string.templatelib.Template" => Some("string.templatelib.Template"),
         "string.templatelib.Interpolation" => Some("string.templatelib.Interpolation"),
         _ => None,

@@ -490,6 +490,39 @@ print(y)
     );
 }
 
+/// A native PEP 585 alias (`tuple[int, bool]`) or PEP 604 union (`int | str`)
+/// subscripting a CPython `typing` generic crosses the bridge as the real
+/// `types.GenericAlias` / `typing.Union`. Regression: the conversion had no arm
+/// for either, so `def f() -> Optional[tuple[int, int]]` died at definition time
+/// with "cannot pass 'GenericAlias' to a CPython stdlib call".
+#[test]
+fn ffi_typing_subscript_native_generic_alias_and_union() {
+    let src = "\
+from typing import Optional, List
+def f(a: dict[str, list[str]]) -> Optional[tuple[int, bool]]:
+    return (1, True)
+print(f({}))
+print(f.__annotations__['return'])
+print(List[tuple[int, int | None]])
+print(Optional[int | str])
+print(type(tuple[int, bool]))
+";
+    let (stdout, stderr, ok) = run_py(src);
+    if bridge_unavailable(ok, &stderr) {
+        eprintln!("skipping ffi-generic-alias test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(
+        stdout,
+        "(1, True)\n\
+         tuple[int, bool] | None\n\
+         typing.List[tuple[int, int | None]]\n\
+         int | str | None\n\
+         <class 'types.GenericAlias'>\n",
+        "stderr={stderr}"
+    );
+}
+
 /// `@functools.total_ordering` runs natively: the decorated class stays a native
 /// pythonrs class (so `__init__` can set attributes — a CPython round trip made it
 /// a Foreign class that couldn't), and comparison dispatch derives the three

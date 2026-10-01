@@ -1155,6 +1155,31 @@ fn value_to_py<'py>(
                     .and_then(|f| f.call1((a, b, c)))
                     .map_err(|e| e.to_string())
             }
+            // A native `list[int]` / `tuple[int, bool]` handed to the CPython
+            // `typing` module (`Optional[tuple[int, int]]` in an annotation)
+            // crosses as a real `types.GenericAlias` over the converted origin
+            // and args, so `typing`'s `_type_check` accepts it.
+            Some(PyObj::GenericAlias { origin, args }) => {
+                let (origin, args) = (origin.clone(), args.clone());
+                let porigin = value_to_py(host, py, &origin)?;
+                let pargs = marshal_seq(host, py, &args)?;
+                let tup = PyTuple::new(py, pargs).map_err(|e| e.to_string())?;
+                py.import("types")
+                    .and_then(|m| m.getattr("GenericAlias"))
+                    .and_then(|ga| ga.call1((porigin, tup)))
+                    .map_err(|e| e.to_string())
+            }
+            // A native PEP 604 union (`int | str`) crosses as `typing.Union[...]`
+            // over the converted members — CPython's own union of the same types.
+            Some(PyObj::Union { args }) => {
+                let args = args.clone();
+                let pargs = marshal_seq(host, py, &args)?;
+                let tup = PyTuple::new(py, pargs).map_err(|e| e.to_string())?;
+                py.import("typing")
+                    .and_then(|m| m.getattr("Union"))
+                    .and_then(|u| u.get_item(tup))
+                    .map_err(|e| e.to_string())
+            }
             _ => Err(crate::host::type_error(&format!(
                 "cannot pass '{}' to a CPython stdlib call",
                 host.type_name(v)
