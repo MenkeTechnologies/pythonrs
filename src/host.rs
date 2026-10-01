@@ -4445,6 +4445,21 @@ fn module_ffi_fallback(
 }
 
 impl PyHost {
+    /// CPython's `Py_TYPE(v)->tp_name`: the name an operator `TypeError`
+    /// (`unsupported operand type(s)`, `can only concatenate`, `can't multiply
+    /// sequence by non-int`) prints. It differs from [`Self::type_name`] only for
+    /// the C-accelerated `collections` containers, whose `tp_name` is
+    /// module-qualified (`'collections.deque'`). A user class keeps its own
+    /// name even when it is spelled `deque`.
+    pub fn tp_name(&self, v: &Value) -> String {
+        let tn = self.type_name(v);
+        if matches!(self.get(v), Some(PyObj::Instance(_))) {
+            tn
+        } else {
+            attr_error_type_name(&tn)
+        }
+    }
+
     /// The Python type name of `v`.
     pub fn type_name(&self, v: &Value) -> String {
         match v {
@@ -7265,6 +7280,22 @@ impl PyHost {
                         interpolations,
                     }));
                 }
+                // `deque_concat`: a copy of the left deque, keeping its `maxlen`,
+                // extended by the right one. Its refusal spells the receiver
+                // `deque` whatever subclass it is, and the other operand by its
+                // `tp_name`.
+                if let Some(PyObj::Deque { items, maxlen }) = self.get(a) {
+                    let (mut out, maxlen) = (items.clone(), *maxlen);
+                    let Some(PyObj::Deque { items: rhs, .. }) = self.get(b) else {
+                        return Err(type_error(&format!(
+                            "can only concatenate deque (not \"{}\") to deque",
+                            self.tp_name(b)
+                        )));
+                    };
+                    out.extend(rhs.iter().cloned());
+                    deque_trim_left(&mut out, maxlen);
+                    return Ok(self.alloc(PyObj::Deque { items: out, maxlen }));
+                }
                 // str + str, list + list, tuple + tuple
                 match (self.get(a), self.get(b)) {
                     (Some(PyObj::Str(x)), Some(PyObj::Str(y))) => {
@@ -7300,7 +7331,7 @@ impl PyHost {
                     // gives the type-specific concat error, not the generic
                     // "unsupported operand type(s)" one.
                     _ => {
-                        let rt = self.type_name(b);
+                        let rt = self.tp_name(b);
                         Err(match self.get(a) {
                             Some(PyObj::Str(_)) => type_error(&format!(
                                 "can only concatenate str (not \"{rt}\") to str"
@@ -7384,7 +7415,7 @@ impl PyHost {
                         }
                         return Err(type_error(&format!(
                             "can't multiply sequence by non-int of type '{}'",
-                            self.type_name(other)
+                            self.tp_name(other)
                         )));
                     }
                 }
@@ -7406,7 +7437,7 @@ impl PyHost {
                 }
                 Err(type_error(&format!(
                     "bad operand type for unary -: '{}'",
-                    self.type_name(a)
+                    self.tp_name(a)
                 )))
             }
             Eq => Ok(Value::Bool(self.equal(a, b))),
@@ -7426,14 +7457,15 @@ impl PyHost {
                 | Some(PyObj::Tuple(_))
                 | Some(PyObj::Bytes(_))
                 | Some(PyObj::Bytearray(_))
+                | Some(PyObj::Deque { .. })
         )
     }
 
     fn optype_err(&self, op: &str, a: &Value, b: &Value) -> String {
         type_error(&format!(
             "unsupported operand type(s) for {op}: '{}' and '{}'",
-            self.type_name(a),
-            self.type_name(b)
+            self.tp_name(a),
+            self.tp_name(b)
         ))
     }
 
@@ -7542,6 +7574,13 @@ impl PyHost {
                 }
                 Ok(Some(self.alloc(PyObj::Bytearray(out))))
             }
+            // `deque_repeat`: a copy keeping the receiver's `maxlen`, repeated in
+            // place.
+            Some(PyObj::Deque { items, maxlen }) => {
+                let maxlen = *maxlen;
+                let items = deque_repeat(items, maxlen, count)?;
+                Ok(Some(self.alloc(PyObj::Deque { items, maxlen })))
+            }
             _ => Ok(None),
         }
     }
@@ -7648,6 +7687,17 @@ impl PyHost {
                 }
                 Ok(x.len().cmp(&y.len()))
             }
+            // `deque_richcompare` orders two deques the way a list orders: by the
+            // first differing element, then by length.
+            (Some(PyObj::Deque { items: x, .. }), Some(PyObj::Deque { items: y, .. })) => {
+                for (p, q) in x.iter().zip(y.iter()) {
+                    let o = self.order(p, q, sym)?;
+                    if o != Ordering::Equal {
+                        return Ok(o);
+                    }
+                }
+                Ok(x.len().cmp(&y.len()))
+            }
             // Ordering a slice is ordering its bounds tuple, element by element.
             // Note this makes an incomparable PAIR OF BOUNDS report the BOUNDS'
             // types, as CPython does: `slice(1, 2) < slice('a', 'b')` says
@@ -7684,8 +7734,8 @@ impl PyHost {
             (Some(PyObj::Foreign(x)), Some(PyObj::Foreign(y))) => crate::ffi::foreign_cmp(*x, *y),
             _ => Err(type_error(&format!(
                 "'{sym}' not supported between instances of '{}' and '{}'",
-                self.type_name(a),
-                self.type_name(b)
+                self.tp_name(a),
+                self.tp_name(b)
             ))),
         }
     }
@@ -8056,7 +8106,7 @@ impl PyHost {
                 Some(n) => Ok(self.norm_big(-(n + num_bigint::BigInt::from(1)))),
                 None => Err(type_error(&format!(
                     "bad operand type for unary ~: '{}'",
-                    self.type_name(v)
+                    self.tp_name(v)
                 ))),
             },
             unop::POS => match v {
@@ -8068,7 +8118,7 @@ impl PyHost {
                     Some(c) => Ok(c),
                     None => Err(type_error(&format!(
                         "bad operand type for unary +: '{}'",
-                        self.type_name(v)
+                        self.tp_name(v)
                     ))),
                 },
             },
@@ -10339,6 +10389,67 @@ impl<T> RepeatBuf for Vec<T> {
     fn try_reserve_slots(&mut self, n: usize) -> Result<(), ()> {
         self.try_reserve_exact(n).map_err(|_| ())
     }
+}
+impl<T> RepeatBuf for VecDeque<T> {
+    fn try_reserve_slots(&mut self, n: usize) -> Result<(), ()> {
+        self.try_reserve_exact(n).map_err(|_| ())
+    }
+}
+
+/// Drop items from the LEFT until a bounded deque fits its `maxlen` — what an
+/// `append`/`extend` onto a full deque does.
+pub fn deque_trim_left(items: &mut VecDeque<Value>, maxlen: Option<usize>) {
+    if let Some(m) = maxlen {
+        let excess = items.len().saturating_sub(m);
+        items.drain(..excess);
+    }
+}
+
+/// The contents of `deque * n` / `deque *= n`, a port of `_collectionsmodule.c`'s
+/// `deque_inplace_repeat`.
+///
+/// A count of one (or an empty deque) is the deque unchanged and a count of zero
+/// or less empties it. Otherwise the items are appended `n - 1` more times, which
+/// on a bounded deque keeps only the last `maxlen` of them. CPython refuses a
+/// product `size * n` past `Py_ssize_t` with `MemoryError` BEFORE it consults
+/// `maxlen` (so `deque([1, 2], maxlen=3) * 2**62` fails), except for a
+/// one-element deque, whose count is clamped to `maxlen` first.
+pub fn deque_repeat(
+    items: &VecDeque<Value>,
+    maxlen: Option<usize>,
+    n: i64,
+) -> Result<VecDeque<Value>, String> {
+    let size = items.len();
+    if size == 0 || n == 1 {
+        return Ok(items.clone());
+    }
+    if n <= 0 {
+        return Ok(VecDeque::new());
+    }
+    let mut n = n as usize;
+    if size == 1 {
+        if let Some(m) = maxlen {
+            n = n.min(m);
+        }
+    } else {
+        if size > isize::MAX as usize / n {
+            return Err("MemoryError".to_string());
+        }
+        // Fewer whole repetitions already fill the bound; the tail they leave is
+        // the same one the full product would.
+        if let Some(m) = maxlen {
+            if n * size > m {
+                n = (m + size - 1) / size + 1;
+            }
+        }
+    }
+    let mut out = VecDeque::new();
+    reserve_repeat(&mut out, size, n, false)?;
+    for _ in 0..n {
+        out.extend(items.iter().cloned());
+    }
+    deque_trim_left(&mut out, maxlen);
+    Ok(out)
 }
 
 fn reserve_repeat(

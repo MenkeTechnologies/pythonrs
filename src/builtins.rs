@@ -2590,12 +2590,12 @@ fn sequence_op_error(op: NumOp, a: &Value, b: &Value) -> Option<String> {
             };
             Some(host::type_error(&format!(
                 "can't multiply sequence by non-int of type '{}'",
-                h.type_name(other)
+                h.tp_name(other)
             )))
         }
         NumOp::Add => {
             let t = seq_name(h, a)?;
-            let other = h.type_name(b);
+            let other = h.tp_name(b);
             Some(host::type_error(&match t {
                 "bytes" | "bytearray" => format!("can't concat {other} to {t}"),
                 _ => format!("can only concatenate {t} (not \"{other}\") to {t}"),
@@ -2609,8 +2609,8 @@ fn unsupported_operand(sym: &str, a: &Value, b: &Value) -> String {
     with_host(|h| {
         host::type_error(&format!(
             "unsupported operand type(s) for {sym}: '{}' and '{}'",
-            h.type_name(a),
-            h.type_name(b)
+            h.tp_name(a),
+            h.tp_name(b)
         ))
     })
 }
@@ -2906,7 +2906,10 @@ fn inplace_builtin(tag: i64, a: &Value, b: &Value) -> Option<Result<Value, Strin
                 return Some(Ok(a.clone()));
             }
             iop::MUL => {
-                let n = with_host(|h| h.as_int(b))?.max(0) as usize; // non-int → binary fallback
+                let n = match inplace_repeat_count(b)? {
+                    Ok(n) => n,
+                    Err(e) => return Some(Err(e)),
+                };
                 with_host(|h| {
                     if let Some(PyObj::List(l)) = h.get_mut(a) {
                         let base = l.clone();
@@ -2917,6 +2920,29 @@ fn inplace_builtin(tag: i64, a: &Value, b: &Value) -> Option<Result<Value, Strin
                     }
                 });
                 return Some(Ok(a.clone()));
+            }
+            _ => return None,
+        }
+    }
+    // deque: `+=` is `deque.extend` (any iterable, honouring `maxlen`); `*=` is
+    // `deque_inplace_repeat`. Both mutate and return the receiver.
+    if with_host(|h| matches!(h.get(a), Some(PyObj::Deque { .. }))) {
+        match tag {
+            iop::ADD => {
+                return Some(deque_method(a, "extend", std::slice::from_ref(b)).map(|_| a.clone()));
+            }
+            iop::MUL => {
+                let n = match inplace_repeat_count(b)? {
+                    Ok(n) => n as i64,
+                    Err(e) => return Some(Err(e)),
+                };
+                return Some(with_host(|h| match h.get_mut(a) {
+                    Some(PyObj::Deque { items, maxlen }) => {
+                        *items = host::deque_repeat(items, *maxlen, n)?;
+                        Ok(a.clone())
+                    }
+                    _ => Err(host::type_error("not a deque")),
+                }));
             }
             _ => return None,
         }
@@ -2935,12 +2961,15 @@ fn inplace_builtin(tag: i64, a: &Value, b: &Value) -> Option<Result<Value, Strin
                 }
                 None => {
                     return Some(Err(with_host(|h| {
-                        host::type_error(&format!("can't concat {} to bytearray", h.type_name(b)))
+                        host::type_error(&format!("can't concat {} to bytearray", h.tp_name(b)))
                     })));
                 }
             },
             iop::MUL => {
-                let n = with_host(|h| h.as_int(b))?.max(0) as usize;
+                let n = match inplace_repeat_count(b)? {
+                    Ok(n) => n,
+                    Err(e) => return Some(Err(e)),
+                };
                 with_host(|h| {
                     if let Some(PyObj::Bytearray(v)) = h.get_mut(a) {
                         let base = v.clone();
@@ -3006,6 +3035,24 @@ fn inplace_builtin(tag: i64, a: &Value, b: &Value) -> Option<Result<Value, Strin
         return Some(Ok(a.clone()));
     }
     None
+}
+
+/// The count of an in-place sequence repetition (`x *= n`), read the way
+/// `PySequence_InPlaceRepeat` reads it: through `__index__`, with an int past
+/// `Py_ssize_t` being `OverflowError`. `None` for a non-integer, which the
+/// caller hands to the binary fallback for the `can't multiply sequence by
+/// non-int` message. Resolving `__index__` here is what keeps `x *= Idx()`
+/// mutating `x` rather than rebinding it to a new object.
+fn inplace_repeat_count(b: &Value) -> Option<Result<usize, String>> {
+    let count = match index_dunder(b) {
+        Ok(v) => v.unwrap_or_else(|| b.clone()),
+        Err(e) => return Some(Err(e)),
+    };
+    match with_host(|h| h.index_fit(&count)) {
+        host::IndexFit::Fits(n) => Some(Ok(n.max(0) as usize)),
+        host::IndexFit::TooLarge(_) => Some(Err(format!("OverflowError: {}", host::INDEX_OVERFLOW))),
+        host::IndexFit::NotInt => None,
+    }
 }
 
 /// `x op= y` (augmented assignment): try `type(x).__i<op>__(x, y)` — mutating `x`
@@ -4234,8 +4281,8 @@ fn numeric_hook_inner(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> 
                     Err(with_host(|h| {
                         host::type_error(&format!(
                             "'{sym}' not supported between instances of '{}' and '{}'",
-                            h.type_name(a),
-                            h.type_name(b)
+                            h.tp_name(a),
+                            h.tp_name(b)
                         ))
                     }))
                 }
@@ -13239,11 +13286,7 @@ fn op_dunders(typename: &str) -> &'static [&'static str] {
         "str" | "bytes" => TEXT,
         "bytearray" => MUT_TEXT,
         "tuple" => SEQ,
-        // `deque` is absent on purpose: pythonrs implements none of its
-        // operators (`deque + deque`, `deque * n`, `q += […]` all raise
-        // `unsupported operand type(s)`), so exposing the dunders would only
-        // move the failure. Recorded in BUGS.md.
-        "list" => MUT_SEQ,
+        "list" | "deque" => MUT_SEQ,
         "dict" => DICT,
         "set" => SET,
         "frozenset" => FROZENSET,
@@ -13281,6 +13324,30 @@ fn op_dunder(tn: &str, recv: &Value, name: &str, args: &[Value]) -> Result<Value
     if !op_dunder_accepts(tn, name, &b) {
         return Ok(with_host(|h| h.alloc(PyObj::NotImplemented)));
     }
+    // A sequence's repetition slot called by name is `wrap_indexargfunc`: the
+    // count goes through `PyNumber_AsSsize_t`, so a non-integer is
+    // `'str' object cannot be interpreted as an integer` — not the
+    // `can't multiply sequence by non-int` the `*` operator reports — and an
+    // int past `Py_ssize_t` is `OverflowError`.
+    let b = if matches!(name, "__mul__" | "__rmul__" | "__imul__") && tn != "complex" {
+        let count = index_dunder(&b)?.unwrap_or(b);
+        match with_host(|h| h.index_fit(&count)) {
+            host::IndexFit::Fits(_) => count,
+            host::IndexFit::TooLarge(_) => {
+                return Err(format!("OverflowError: {}", host::INDEX_OVERFLOW));
+            }
+            host::IndexFit::NotInt => {
+                return Err(with_host(|h| {
+                    host::type_error(&format!(
+                        "'{}' object cannot be interpreted as an integer",
+                        h.tp_name(&count)
+                    ))
+                }));
+            }
+        }
+    } else {
+        b
+    };
     let inplace = match name {
         "__iadd__" => Some(iop::ADD),
         "__isub__" => Some(iop::SUB),
@@ -16330,10 +16397,27 @@ fn dict_method(
         }
         "pop" => {
             let kv = arg0(args)?;
+            let (empty, ordered) = with_host(|h| match h.get(recv) {
+                Some(PyObj::Dict(d)) => (d.is_empty(), h.type_name(recv) == "OrderedDict"),
+                _ => (false, false),
+            });
+            // `PyDict_Pop` answers "not found" for an EMPTY dict before it hashes
+            // the key, so `{}.pop([1])` is `KeyError: [1]` (or the default), not
+            // the unhashable-key `TypeError` a non-empty dict raises.
+            // `OrderedDict.pop` hashes unconditionally, with the bare message.
+            let role = if ordered {
+                host::KeyRole::Bare
+            } else {
+                host::KeyRole::Dict
+            };
+            if empty && !ordered {
+                return match args.get(1) {
+                    Some(d) => Ok(d.clone()),
+                    None => Err(with_host(|h| h.key_error(&kv))),
+                };
+            }
             let cands = host::instance_key_candidates_for(recv, Some(&kv));
-            let key = host::with_instance_key(&kv, host::KeyRole::Dict, &cands, || {
-                with_host(|h| h.to_key(&kv))
-            })?;
+            let key = host::with_instance_key(&kv, role, &cands, || with_host(|h| h.to_key(&kv)))?;
             let got = with_host(|h| {
                 if let Some(PyObj::Dict(d)) = h.get_mut(recv) {
                     d.shift_remove(&key).map(|(_, v)| v)

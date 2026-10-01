@@ -2849,6 +2849,82 @@ fn deque_insert_clamps_but_a_bounded_deque_refuses() {
     );
 }
 
+/// `deque + deque`, `deque * n` and their in-place forms (`_collectionsmodule.c`
+/// `deque_concat` / `deque_repeat` / `deque_inplace_concat` /
+/// `deque_inplace_repeat`). A result keeps the LEFT deque's `maxlen`, so a
+/// bounded deque keeps only its last `maxlen` items; `+=` takes any iterable and
+/// `*=` mutates the receiver. Expected values are CPython 3.14's.
+#[test]
+fn deque_concatenation_and_repetition() {
+    let run = |body: &str| g(&format!("from collections import deque\n{body}"), "x");
+    assert_eq!(run("x = deque([1, 2]) + deque([3])"), "deque([1, 2, 3])");
+    assert_eq!(run("x = (deque([1, 2]) * 2, 2 * deque([1, 2]))"), "(deque([1, 2, 1, 2]), deque([1, 2, 1, 2]))");
+    assert_eq!(run("x = (deque([1, 2]) * 0, deque([1, 2]) * -1)"), "(deque([]), deque([]))");
+    assert_eq!(
+        run("m = deque([1, 2, 3], maxlen=4)\nx = (m + deque([4, 5]), m * 2, deque([1], maxlen=3) * 2**62)"),
+        "(deque([2, 3, 4, 5], maxlen=4), deque([3, 1, 2, 3], maxlen=4), deque([1, 1, 1], maxlen=3))"
+    );
+    // The right operand's bound is irrelevant: the left deque's is copied.
+    assert_eq!(run("x = deque([1, 2]) + deque([3], maxlen=1)"), "deque([1, 2, 3])");
+    assert_eq!(
+        run("q = deque([1]); r = q\nq += (5, 6)\nq *= 2\nq += q\nx = (q, q is r)"),
+        "(deque([1, 5, 6, 1, 5, 6, 1, 5, 6, 1, 5, 6]), True)"
+    );
+    assert_eq!(run("q = deque([1, 2], maxlen=3)\nq *= 2\nx = q"), "deque([2, 1, 2], maxlen=3)");
+    assert_eq!(
+        run("q = deque([7])\nx = (q.__iadd__([8]) is q, q.__imul__(2) is q, q, q.__add__(q), q.__rmul__(2))"),
+        "(True, True, deque([7, 8, 7, 8]), deque([7, 8, 7, 8, 7, 8, 7, 8]), deque([7, 8, 7, 8, 7, 8, 7, 8]))"
+    );
+    assert_eq!(
+        run("x = (deque([1, 2]) < deque([1, 3]), deque([1, 2]) <= deque([1]), deque([2]) > deque([1, 9]))"),
+        "(True, False, True)"
+    );
+
+    let fail = |body: &str| err(&format!("from collections import deque\n{body}"));
+    assert_eq!(
+        fail("deque([1]) + [2]"),
+        "TypeError: can only concatenate deque (not \"list\") to deque"
+    );
+    assert_eq!(
+        fail("[2] + deque([1])"),
+        "TypeError: can only concatenate list (not \"collections.deque\") to list"
+    );
+    assert_eq!(
+        fail("deque([1]) * 'a'"),
+        "TypeError: can't multiply sequence by non-int of type 'str'"
+    );
+    assert_eq!(fail("q = deque([1])\nq += 5"), "TypeError: 'int' object is not iterable");
+    assert_eq!(
+        fail("q = deque([1])\nq *= 1.5"),
+        "TypeError: can't multiply sequence by non-int of type 'float'"
+    );
+    assert_eq!(
+        fail("deque([1]) - deque([1])"),
+        "TypeError: unsupported operand type(s) for -: 'collections.deque' and 'collections.deque'"
+    );
+    assert_eq!(fail("deque([1, 2]) * 2**62"), "MemoryError");
+    assert_eq!(fail("deque([1, 2], maxlen=3) * 2**62"), "MemoryError");
+    assert_eq!(
+        fail("deque([1]) * 10**20"),
+        "OverflowError: cannot fit 'int' into an index-sized integer"
+    );
+}
+
+/// `x *= Idx()` reads the count through `__index__` and mutates `x` in place;
+/// resolving it only in the binary fallback rebound `x` to a new list.
+#[test]
+fn inplace_repetition_by_an_index_object_keeps_identity() {
+    assert_eq!(
+        g(
+            "from collections import deque\nclass I:\n    def __index__(self): return 2\n\
+             l = [1]; b = bytearray(b'a'); q = deque([1])\nl0, b0, q0 = l, b, q\n\
+             l *= I(); b *= I(); q *= I()\nx = (l, l is l0, b, b is b0, q, q is q0)",
+            "x"
+        ),
+        "([1, 1], True, bytearray(b'aa'), True, deque([1, 1]), True)"
+    );
+}
+
 /// `OrderedDict.popitem(last=False)` is how an OrderedDict is used as a FIFO
 /// queue; ignoring the argument turned every such queue into a stack. Its
 /// empty-dict KeyError also differs from `dict`'s.

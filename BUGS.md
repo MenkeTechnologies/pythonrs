@@ -35,6 +35,32 @@ written.
   `SyntaxError: invalid syntax`; the class header now takes `*iterable` with the
   call's ordering rules, and the base list is built as a list display is, so a
   starred base spreads and an oversized base list is chunked.
+- **`collections.deque` operators.** `deque + deque`, `deque * n`, `n * deque`,
+  `q += iterable`, `q *= n`, `<`/`<=`/`>`/`>=`, and the bound
+  `__add__`/`__iadd__`/`__mul__`/`__rmul__`/`__imul__` all raised
+  `unsupported operand type(s)`. They are ports of `_collectionsmodule.c`'s
+  `deque_concat`/`deque_repeat`/`deque_inplace_concat`/`deque_inplace_repeat`:
+  the result keeps the left deque's `maxlen` (so a bounded one keeps its last
+  `maxlen` items), `+=` takes any iterable, `*=` mutates the receiver, and a
+  size-times-count past `Py_ssize_t` is `MemoryError` before the bound is
+  consulted, as in CPython.
+- **A sequence repetition dunder reads its count as an index.**
+  `[1].__mul__('a')` and the other repetition slots called by name said
+  `can't multiply sequence by non-int of type 'str'`; CPython's
+  `wrap_indexargfunc` says `'str' object cannot be interpreted as an integer`
+  (and `OverflowError` past `Py_ssize_t`). `x *= Idx()` on a list, bytearray or
+  deque also rebound `x` to a new object instead of mutating it.
+- **Operator errors name `collections` types by `tp_name`.**
+  `[1] + deque()`, `1 / OrderedDict()`, `-defaultdict()`, `deque() < 1` and the
+  rest printed `'deque'` where CPython prints `'collections.deque'` (the C
+  containers' `tp_name` is module-qualified; `Counter`, being pure Python, is
+  not).
+- **`{}.pop(unhashable)` is a `KeyError`.** `PyDict_Pop` reports an EMPTY dict
+  as "not found" before hashing, so `{}.pop([1])` raises `KeyError: [1]` (or
+  returns the default) where pythonrs raised the unhashable-key `TypeError`;
+  `OrderedDict.pop` hashes first and keeps the bare `unhashable type` message.
+  This was the last shape of the unhashable-key entry: the other sixteen
+  already named the container role.
 - **`itertools.groupby` is lazy.** It drained its input and built every group
   as a list up front, so it never returned on an infinite iterator
   (`groupby(count(), key=…)`), each group was a `list` instead of an
@@ -1696,24 +1722,13 @@ written.
   frozenset complex type`), measured by intersecting `dir(t)` per type against
   CPython 3.14.6. The BINARY OPERATOR slots are now real bound methods (see
   "Implemented"), which is what moved the count up.
-- **`collections.deque` implements none of its operators.** `deque + deque`,
-  `deque * n` and `q += […]` all raise `unsupported operand type(s)`, so its
-  `__add__`/`__iadd__`/`__mul__`/`__rmul__`/`__imul__` are deliberately kept out
-  of the bound-method table — exposing them would only move the failure.
-- **`TypeError` messages for a bad sequence repetition operand.** CPython says
-  `can't multiply sequence by non-int of type 'str'` for `[1] * 'a'` and
-  `'str' object cannot be interpreted as an integer` for the `__mul__` spelling;
-  pythonrs says `unsupported operand type(s) for *: 'list' and 'str'` for both.
-- **An unhashable key is not named at the container-op boundary.** CPython 3.12+
-  wraps the error as `cannot use 'list' as a dict key (unhashable type: 'list')`
-  / `... as a set element (...)`; pythonrs reports the bare
-  `unhashable type: 'list'`. Measured across 16 shapes — dict/set displays,
-  `d[k] = v`, `d[k]`, `get`, `in`, `set.add`, `dict(pairs)`, `set(iter)`,
-  `frozenset(iter)`, `dict.fromkeys`, `setdefault`, and the dict/set
-  comprehensions. Bare `hash([1])` correctly keeps the unwrapped message, and
-  `{}.pop([1])` raises `KeyError` in CPython where pythonrs raises the
-  `TypeError`. The traceback frame, source line and carets around it now match
-  (see "Implemented"); only the message text differs.
+- **A `collections.deque` subclass has no deque behaviour.** `class D(deque)`
+  instances carry no native deque payload (`builtin_base_of` knows `list`,
+  `dict`, `str`, `int`, `float`, `tuple`, `set` and `frozenset` only), so
+  `len(D([1]))` raises `AttributeError: 'D' object has no attribute
+  '__len__'` and `D([1]) + D([2])` is `unsupported operand type(s)`. CPython
+  also routes a subclass result through `type(d)(d, maxlen)`, so `D + D` is a
+  `D` and a subclass `__init__` runs for it.
 - **`[nan] == [nan]` with one shared `nan` is False.** CPython's sequence
   comparison shortcuts on element IDENTITY before `==`, so a list holding the
   same `nan` object twice compares equal to itself. pythonrs stores a `float`

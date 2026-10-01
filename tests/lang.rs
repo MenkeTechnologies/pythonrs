@@ -9013,3 +9013,72 @@ fn identifiers_are_nfkc_normalized() {
         "ValueError: identifier field can't represent 'None' constant"
     );
 }
+
+/// A sequence's repetition slot called BY NAME is `wrap_indexargfunc`, which
+/// reads the count with `PyNumber_AsSsize_t`: a non-integer is `'T' object
+/// cannot be interpreted as an integer` and an int past `Py_ssize_t` is
+/// `OverflowError`. Only the `*` operator says `can't multiply sequence by
+/// non-int`. Messages are CPython 3.14's.
+#[test]
+fn sequence_repeat_dunder_reads_its_count_as_an_index() {
+    for (src, want) in [
+        ("[1].__mul__('a')", "TypeError: 'str' object cannot be interpreted as an integer"),
+        ("'a'.__mul__(2.0)", "TypeError: 'float' object cannot be interpreted as an integer"),
+        ("(1,).__rmul__('a')", "TypeError: 'str' object cannot be interpreted as an integer"),
+        ("b'x'.__mul__(1.5)", "TypeError: 'float' object cannot be interpreted as an integer"),
+        ("bytearray(b'x').__imul__('q')", "TypeError: 'str' object cannot be interpreted as an integer"),
+        ("[1].__imul__(None)", "TypeError: 'NoneType' object cannot be interpreted as an integer"),
+        ("[1].__mul__(10**20)", "OverflowError: cannot fit 'int' into an index-sized integer"),
+        // The operator keeps its own wording.
+        ("[1] * 'a'", "TypeError: can't multiply sequence by non-int of type 'str'"),
+        ("x = [1]\nx *= 'a'", "TypeError: can't multiply sequence by non-int of type 'str'"),
+    ] {
+        assert_eq!(eval_str(src).expect_err(src), want, "{src}");
+    }
+    assert_eq!(
+        g("class I:\n    def __index__(self): return 2\nx = ([1].__mul__(I()), 'ab'.__rmul__(True))", "x"),
+        "([1, 1], 'ab')"
+    );
+}
+
+/// An operator `TypeError` names an operand by its `tp_name`, which is
+/// module-qualified for the C-accelerated `collections` containers — while a
+/// user class spelled the same keeps its bare name.
+#[test]
+fn operator_errors_name_collections_types_by_tp_name() {
+    let pre = "from collections import deque, OrderedDict, defaultdict, Counter\n";
+    for (src, want) in [
+        ("(1,) + deque()", "TypeError: can only concatenate tuple (not \"collections.deque\") to tuple"),
+        ("'a' + OrderedDict()", "TypeError: can only concatenate str (not \"collections.OrderedDict\") to str"),
+        ("b'a' + defaultdict()", "TypeError: can't concat collections.defaultdict to bytes"),
+        ("[1] * deque()", "TypeError: can't multiply sequence by non-int of type 'collections.deque'"),
+        ("1 / OrderedDict()", "TypeError: unsupported operand type(s) for /: 'int' and 'collections.OrderedDict'"),
+        ("-deque()", "TypeError: bad operand type for unary -: 'collections.deque'"),
+        ("~defaultdict()", "TypeError: bad operand type for unary ~: 'collections.defaultdict'"),
+        ("deque() < 1", "TypeError: '<' not supported between instances of 'collections.deque' and 'int'"),
+        // `Counter` is pure Python, so its `tp_name` is bare.
+        ("[1] + Counter()", "TypeError: can only concatenate list (not \"Counter\") to list"),
+        ("class deque: pass\n[1] + deque()", "TypeError: can only concatenate list (not \"deque\") to list"),
+    ] {
+        let src = format!("{pre}{src}");
+        assert_eq!(eval_str(&src).expect_err(&src), want, "{src}");
+    }
+}
+
+/// `PyDict_Pop` answers "absent" for an EMPTY dict before it hashes the key, so
+/// an unhashable key there is a `KeyError` (or the default), not the
+/// `cannot use 'list' as a dict key` `TypeError` a non-empty dict raises.
+/// `OrderedDict.pop` hashes first, with the bare message.
+#[test]
+fn dict_pop_on_an_empty_dict_does_not_hash_the_key() {
+    assert_eq!(eval_str("{}.pop([1])").expect_err("empty pop"), "KeyError: [1]");
+    assert_eq!(g("x = ({}.pop([1], 5), {}.pop({}, None))", "x"), "(5, None)");
+    assert_eq!(
+        eval_str("{1: 2}.pop([1], 5)").expect_err("non-empty pop"),
+        "TypeError: cannot use 'list' as a dict key (unhashable type: 'list')"
+    );
+    assert_eq!(
+        eval_str("from collections import OrderedDict\nOrderedDict().pop([1])").expect_err("odict pop"),
+        "TypeError: unhashable type: 'list'"
+    );
+}
