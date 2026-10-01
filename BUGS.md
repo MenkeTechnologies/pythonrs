@@ -99,6 +99,28 @@ written.
   resolves too. A `classmethod`/`staticmethod` stored in a CPython-built class
   binds as `classmethod.__get__`/`staticmethod.__get__` do (the owner, or
   nothing), where both used to bind the instance like a plain function.
+- **A method call resolves its attribute callee before its arguments.**
+  `obj.m(g())` ran `g()` before looking `m` up, so a `__getattr__`, a property
+  or a failed lookup acted after the arguments (`['arg', 'callee', 'call']`
+  where CPython logs `['callee', 'arg', 'call']`), and the miss carets the call
+  (`~~~~~~~~~^^`) where CPython carets the attribute (`^^^^^^^^^`). The new
+  `LOAD_METHOD` op is CPython's `LOAD_ATTR` method form: it resolves the
+  callee and leaves `[self_or_none, name, callee_or_none]` for `CALL_LOADED` /
+  `CALL_LOADED_KW` / `CALL_LOADED_EX`. A function found on an instance's class
+  travels as `[recv, name, func]` (no bound-method allocation), so an argument
+  that rebinds the attribute does not change what is called; a method the
+  receiver's type answers natively is left for the call to dispatch by name;
+  anything that runs user code goes through the full attribute protocol. A
+  call whose arguments are all inert — literals and frame-slot locals every
+  path has assigned — cannot observe the order and keeps the fused
+  `CALL_METHOD`, which now resolves instance, class and `super` receivers the
+  same way, so it too calls what a `__getattribute__` override, a property or a
+  user descriptor produces rather than the descriptor object (`P().m()` with a
+  property `m` raised `'property' object is not callable`). On a debug build,
+  instructions retired against the previous binary: a module-level
+  `xs.append(i)` (a global argument, so loaded) +11.9%, a user method call
+  there +2.6%, `d.get("k")` +0.8%, and inside a function `xs.append(i)` +0.7%
+  and `c.m(i)` −0.1%.
 - **`--lsp` go-to-definition and signature help.** The server answered only
   completion, hover and diagnostics. `textDocument/definition` now resolves the
   name under the cursor the way the compiler does — innermost function out,
@@ -1451,9 +1473,8 @@ written.
   rules: `~^~` under a binary operator, `~~~^^^` under a subscript/call's
   brackets, a plain `^^^` under a name/attribute, and no caret when the span
   covers the whole line or when an `x = f(...)` / `return f(...)` call raises. A
-  fused name/method call whose *callee lookup* fails (`foo()` on an undefined
-  name, `obj.missing()`) anchors the call brackets rather than the name — the one
-  spot the fused CALL op diverges from CPython's separate LOAD+CALL. **Exception
+  call whose *callee lookup* fails (`foo()` on an undefined name,
+  `obj.missing()`) carets the callee, as CPython does. **Exception
   chaining** renders in full: `raise X from Y` records `__cause__` and prints the
   cause's own block followed by "The above exception was the direct cause …"; an
   exception raised while handling another chains via `__context__` ("During
@@ -1822,9 +1843,7 @@ written.
   required positional argument` (the member `__format__` is called on the
   class); `ABC.register(C)` does not make `isinstance(C(), ABC)` true;
   `inspect.isgeneratorfunction(f)` raises `cannot pass 'code' to a CPython
-  stdlib call`; an `AttributeError` from `obj.missing()` carets the call
-  (`~~~~~~~~~^^`) where CPython carets the attribute (`^^^^^^^^^`), and the
-  arguments are evaluated before the failed lookup; a nested unpacking target
+  stdlib call`; a nested unpacking target
   (`a, (b, c) = 1, (2,)`) carets the outer target, CPython the inner one.
 - **`m.lastindex` / `m.lastgroup` for a group closed inside a look-ahead.**
   Neither engine reports the order in which groups closed, so `lastindex` is
@@ -2046,33 +2065,6 @@ written.
   `.format`, and pythonrs reports that name as is: `co_varnames` is
   `('.format',)` where CPython 3.14 renames it to `format` in the code object
   (and so in the `(format, /)` signature).
-- **A call with an ATTRIBUTE callee resolves it after its arguments.** CPython
-  evaluates the callee first, then the arguments left to right. The bare-name
-  callee now does the same (`aa(bb)` blames `aa`), but `compile_call`
-  (`src/compiler.rs`) still folds the attribute lookup INTO `CALL_METHOD`, so
-  `obj.m(g())` runs `g()` before resolving `m`:
-
-      log = []
-      def f(*a): log.append('call'); return 0
-      def g(): log.append('arg'); return 1
-      class K:
-          def __getattr__(s, n): log.append('callee'); return f
-      K().m(g())
-      print(log)          CPython: ['callee', 'arg', 'call']
-                          pythonrs: ['arg', 'callee', 'call']
-
-  Only a callee with a side effect (`__getattr__`, a property, a module
-  `__getattr__`) can tell the difference; a method that exists on the type has
-  none. Fixing it means resolving the attribute to a value before the arguments,
-  which costs a `Builtin` object plus a `BoundMethod` allocation per call —
-  measured on a debug build, interleaved min-of-7 with the bytecode cache off,
-  `xs.append(i)` **+18.4%**, `d.get("k")` **+12.4%**, a user method **+7.0%**.
-  The bare-name change was taken because its measured cost was **+0.9%** for a
-  user function and **+6.0%** for a builtin (after interning the builtin type
-  objects); the method path was kept for that 12–18%. Closing it without the
-  regression needs a resolve-first opcode that leaves `recv`/`name` on the stack
-  when the type answers the name natively and only materializes a callable when
-  the lookup would run user code.
 - **The `SyntaxError` keyword hint does not see names inside f-strings.**
   `_find_keyword_typos` walks `tokenize`'s NAME tokens, and since 3.12 those
   include the names in an f-string's replacement fields; pythonrs's lexer

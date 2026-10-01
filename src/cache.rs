@@ -150,7 +150,11 @@ use std::path::PathBuf;
 /// (`[u64 index_len][index archive][blobs]`) instead of one archive holding the
 /// blobs inline. A v49 shard's first eight bytes are archive data, not a length,
 /// so it is rejected as unreadable and rebuilt.
-const SCHEMA: u64 = 50;
+/// v51: a method call `recv.name(...)` resolves its callee before the arguments
+/// (`LOAD_METHOD`, then `CALL_LOADED`/`CALL_LOADED_KW`/`CALL_LOADED_EX`, the
+/// last two reusing the ids of the retired `CALL_METHOD_KW`/`CALL_METHOD_EX`),
+/// so every method-call site emits different bytecode.
+const SCHEMA: u64 = 51;
 
 /// The shard's INDEX: everything a lookup needs, and nothing it does not.
 ///

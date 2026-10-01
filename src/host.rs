@@ -79,7 +79,7 @@ pub mod ops {
     pub const DECLARE_NONLOCAL: u16 = 51; // [name] -> mark name nonlocal in this frame
     pub const CALL_EX: u16 = 52; // [name, args_list, kwargs_dict] -> resolve name & call
     pub const CALL_VALUE_EX: u16 = 53; // [callable, args_list, kwargs_dict]
-    pub const CALL_METHOD_EX: u16 = 54; // [recv, name, args_list, kwargs_dict]
+    pub const CALL_LOADED_EX: u16 = 54; // [self_or_none, name, callee_or_none, args_list, kwargs_dict]
     pub const BUILD_ARGS: u16 = 55; // [tag,val,...] -> positional list (tag 1 = *spread)
     pub const BUILD_KWARGS: u16 = 56; // [key,val,...] -> kwargs dict (key Undef = **spread)
     pub const MKDICT_EX: u16 = 57; // [tag,a,b,...] -> dict (tag 1 = **spread of a)
@@ -117,6 +117,9 @@ pub mod ops {
     pub const UNBOUND: u16 = 84; // [] -> the never-assigned frame-slot marker
     pub const TYPE_ALIAS: u16 = 85; // [name, evaluate, [param, kind, ...]] -> TypeAliasType (PEP 695)
     pub const MKSET_CONST: u16 = 86; // [items...] -> set, laid out as a constant display is (presized merge)
+    pub const LOAD_METHOD: u16 = 87; // [recv, name] -> [self_or_none, name, callee_or_none] (resolve before the args)
+    pub const CALL_LOADED: u16 = 88; // [self_or_none, name, callee_or_none, args...]
+    pub const CALL_LOADED_KW: u16 = 89; // [self_or_none, name, callee_or_none, args..., kwdict]
 }
 
 /// In-place (augmented-assignment) op tags carried by `ops::INPLACE`. One per
@@ -4375,7 +4378,7 @@ pub fn type_error(msg: &str) -> String {
 pub const MV_RELEASED: &str = "ValueError: operation forbidden on released memoryview object";
 
 /// Callable display for the `**`-merge errors when the callee is an
-/// already-evaluated value (the `CALL_VALUE_EX` / `CALL_METHOD_EX` paths), as
+/// already-evaluated value (the `CALL_VALUE_EX` / `CALL_LOADED_EX` paths), as
 /// CPython's `_PyObject_FunctionStr` renders it: a user function is its
 /// module-qualified `__qualname__` (`__main__.C.m`, `__main__.f.<locals>.g`),
 /// a bound method is its function, a builtin method is `type.name`
@@ -15234,6 +15237,170 @@ pub fn call_method(
     r
 }
 
+/// What a method call's callee lookup is, decided without running user code
+/// (see [`PyHost::method_callee`]).
+pub enum MethodCallee {
+    /// The lookup runs user code — a `__getattribute__` override, a property,
+    /// a cached property, an object with `__get__` — so it is the full
+    /// attribute read, never the by-name method dispatch.
+    Protocol,
+    /// The receiver's type answers the name natively, or through a path the
+    /// fused [`call_method`] takes by name; resolving it has no observable
+    /// effect, so the call resolves it itself.
+    Fused,
+    /// A plain function found on the receiver's class: called with the
+    /// receiver bound as `self`, as CPython's `LOAD_ATTR` method form leaves
+    /// `[func, self]` on the stack.
+    Method(Value),
+    /// The callee itself (an instance-dict entry, a module global).
+    Callable(Value),
+    /// Nothing answers the name without the full attribute protocol: a
+    /// `__getattr__` may supply it, or the lookup raises.
+    Miss,
+}
+
+impl PyHost {
+    /// Classify `recv.name` as the callee of a call.
+    ///
+    /// An instance is classified in one pass over its class, with the
+    /// precedence of `object.__getattribute__` (`plan_attr_get`): a data
+    /// descriptor, then the instance dict, then a non-data descriptor or a
+    /// plain class attribute. Every other receiver asks `plan_attr_get` whether
+    /// a descriptor is involved.
+    pub fn method_callee(&mut self, recv: &Value, name: &str) -> MethodCallee {
+        if let Some(PyObj::Instance(i)) = self.get(recv) {
+            return self.instance_method_callee(&i.class, &i.dict, &i.payload, name);
+        }
+        if !matches!(self.plan_attr_get(recv, name), AttrGet::Plain) {
+            return MethodCallee::Protocol;
+        }
+        match self.get(recv) {
+            Some(PyObj::Class(c)) => match self.class_lookup(c, name) {
+                Some(_) => MethodCallee::Fused,
+                None => MethodCallee::Miss,
+            },
+            Some(PyObj::Module { slot, .. }) => match self.module_globals[*slot].get(name) {
+                Some(v) => MethodCallee::Callable(v.clone()),
+                None => MethodCallee::Miss,
+            },
+            Some(PyObj::Super { .. }) => MethodCallee::Fused,
+            #[cfg(feature = "stdlib-ffi")]
+            Some(PyObj::Foreign(_)) => MethodCallee::Fused,
+            _ => {
+                // The base type's own method table first: it answers the
+                // ordinary `xs.append(x)` / `d.get(k)` without naming the exact
+                // type (an allocation) or scanning the dunder and data-attribute
+                // tables. A subtype (`defaultdict`, a named tuple) inherits every
+                // method listed for its base, so a hit is always right.
+                let base = match recv {
+                    Value::Str(_) => Some("str"),
+                    _ => match self.get(recv) {
+                        Some(PyObj::Str(_)) => Some("str"),
+                        Some(PyObj::List(_)) => Some("list"),
+                        Some(PyObj::Dict(_)) => Some("dict"),
+                        Some(PyObj::Tuple(_)) => Some("tuple"),
+                        Some(PyObj::Set(_)) => Some("set"),
+                        Some(PyObj::Bytes(_)) => Some("bytes"),
+                        _ => None,
+                    },
+                };
+                let listed = base
+                    .and_then(crate::builtins::type_method_names)
+                    .is_some_and(|methods| methods.contains(&name));
+                if listed || crate::builtins::type_has_method(&self.type_name(recv), name) {
+                    MethodCallee::Fused
+                } else {
+                    MethodCallee::Miss
+                }
+            }
+        }
+    }
+
+    fn instance_method_callee(
+        &self,
+        class: &str,
+        dict: &Value,
+        payload: &Value,
+        name: &str,
+    ) -> MethodCallee {
+        if self.class_has(class, "__getattribute__") {
+            return MethodCallee::Protocol;
+        }
+        // `call_method` answers the `_random.Random` methods from the
+        // instance's generator state before any class lookup.
+        if matches!(
+            name,
+            "random" | "seed" | "getrandbits" | "getstate" | "setstate"
+        ) && self.mro_rc(class).iter().any(|c| c == "_random.Random")
+        {
+            return MethodCallee::Fused;
+        }
+        let in_dict = self.inst_attr(dict, name);
+        let Some(attr) = self.class_lookup(class, name) else {
+            return match in_dict {
+                Some(v) => MethodCallee::Callable(v),
+                None if name == "__class__" => MethodCallee::Fused,
+                None => {
+                    let native_base = !matches!(payload, Value::Undef)
+                        && self
+                            .builtin_base_of(class)
+                            .is_some_and(|b| crate::builtins::type_has_method(b, name));
+                    if native_base || crate::builtins::OBJECT_METHOD_DUNDERS.contains(&name) {
+                        MethodCallee::Fused
+                    } else {
+                        MethodCallee::Miss
+                    }
+                }
+            };
+        };
+        let (descriptor, data) = match self.get(&attr) {
+            Some(PyObj::Property { .. }) => (true, true),
+            Some(PyObj::CachedProperty { .. }) => (true, false),
+            Some(PyObj::Instance(d)) => (
+                self.class_has(&d.class, "__get__"),
+                self.class_has(&d.class, "__set__") || self.class_has(&d.class, "__delete__"),
+            ),
+            _ => (false, false),
+        };
+        match in_dict {
+            _ if descriptor && data => MethodCallee::Protocol,
+            Some(v) => MethodCallee::Callable(v),
+            None if descriptor => MethodCallee::Protocol,
+            None => match self.get(&attr) {
+                Some(PyObj::Func(_)) => MethodCallee::Method(attr),
+                _ => MethodCallee::Fused,
+            },
+        }
+    }
+}
+
+/// Call `func`, a plain function found on `recv`'s class by
+/// [`PyHost::method_callee`], with `recv` bound as `self` — the call
+/// [`call_method`] makes for the same lookup, minus the lookup.
+pub fn call_bound_function(
+    recv: &Value,
+    name: &str,
+    func: &Value,
+    args: Vec<Value>,
+    kwargs: Vec<(String, Value)>,
+) -> Result<Value, String> {
+    let (fv, owner) = with_host(|h| {
+        let owner = match h.get(recv) {
+            Some(PyObj::Instance(i)) => method_owner(h, &i.class, name),
+            _ => None,
+        };
+        let fv = match h.get(func) {
+            Some(PyObj::Func(fv)) => Some(fv.clone()),
+            _ => None,
+        };
+        (fv, owner)
+    });
+    match fv {
+        Some(fv) => run_user_func(&fv, Some(recv.clone()), owner, args, kwargs),
+        None => invoke(func, args, kwargs),
+    }
+}
+
 fn call_method_inner(
     recv: &Value,
     name: &str,
@@ -15888,10 +16055,10 @@ fn super_lookup(h: &PyHost, owner: &str, inst_class: &str, name: &str) -> Option
 }
 
 fn method_owner(h: &PyHost, class: &str, name: &str) -> Option<String> {
-    for c in h.mro_of(class) {
-        if let Some(cd) = h.classes.get(&c) {
+    for c in h.mro_rc(class).iter() {
+        if let Some(cd) = h.classes.get(c) {
             if cd.ns.contains_key(name) {
-                return Some(c);
+                return Some(c.clone());
             }
         }
     }

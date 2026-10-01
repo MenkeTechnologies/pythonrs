@@ -3608,7 +3608,13 @@ impl Compiler {
         // so the parser's span wrapper does not defeat the method-call fast path.
         let span_idx;
         match func.unspanned() {
-            Expr::Attribute(recv, attr) => {
+            // Arguments that can neither act nor fail cannot observe whether the
+            // callee was resolved before them, so the lookup stays fused into the
+            // call: no separate op, and no bound method for a native one.
+            Expr::Attribute(recv, attr)
+                if args.iter().all(|a| self.is_inert(a))
+                    && named.iter().all(|k| self.is_inert(&k.value)) =>
+            {
                 self.compile_expr(b, recv)?;
                 self.name_const(b, attr);
                 self.compile_seq(b, args)?;
@@ -3621,6 +3627,22 @@ impl Compiler {
                     build_kw(self, b)?;
                     span_idx = b.emit(
                         Op::CallBuiltin(ops::CALL_METHOD_KW, argc(3 + args.len())?),
+                        self.cur_line,
+                    );
+                }
+            }
+            Expr::Attribute(recv, attr) => {
+                self.compile_load_method(b, func, recv, attr)?;
+                self.compile_seq(b, args)?;
+                if named.is_empty() {
+                    span_idx = b.emit(
+                        Op::CallBuiltin(ops::CALL_LOADED, argc(3 + args.len())?),
+                        self.cur_line,
+                    );
+                } else {
+                    build_kw(self, b)?;
+                    span_idx = b.emit(
+                        Op::CallBuiltin(ops::CALL_LOADED_KW, argc(4 + args.len())?),
                         self.cur_line,
                     );
                 }
@@ -3711,6 +3733,53 @@ impl Compiler {
         Ok(())
     }
 
+    /// Whether evaluating `e` has no effect, cannot raise, and cannot see the
+    /// effect of anything else: a literal constant, or a read of a frame-slot
+    /// local that every path has assigned (no other scope can rebind one).
+    fn is_inert(&self, e: &Expr) -> bool {
+        match e.unspanned() {
+            Expr::None
+            | Expr::True
+            | Expr::False
+            | Expr::Ellipsis
+            | Expr::Int(_)
+            | Expr::BigInt(_)
+            | Expr::Float(_)
+            | Expr::Complex(_)
+            | Expr::Str(_)
+            | Expr::Bytes(_) => true,
+            Expr::Name(n) => {
+                self.slot_of(n).is_some()
+                    && (!self.fn_slots.contains_key(n) || self.fn_slots_bound.contains(n))
+            }
+            _ => false,
+        }
+    }
+
+    /// Resolve the callee of `recv.attr(...)` BEFORE its arguments, as CPython's
+    /// `LOAD_ATTR` method form does: leaves `[self_or_none, name, callee_or_none]`
+    /// for a `CALL_LOADED*` op. A failed lookup raises here, so its caret
+    /// underlines the attribute (`func`'s span) rather than the whole call.
+    fn compile_load_method(
+        &mut self,
+        b: &mut ChunkBuilder,
+        func: &Expr,
+        recv: &Expr,
+        attr: &str,
+    ) -> Result<(), String> {
+        self.compile_expr(b, recv)?;
+        self.name_const(b, attr);
+        let attr_span = match func {
+            Expr::Spanned(_, sp) => *sp,
+            _ => self.node_span,
+        };
+        let prev = std::mem::replace(&mut self.node_span, attr_span);
+        let idx = b.emit(Op::CallBuiltin(ops::LOAD_METHOD, 2), self.cur_line);
+        self.record_span(idx);
+        self.node_span = prev;
+        Ok(())
+    }
+
     /// Lower a call with `*args`/`**kwargs` unpacking through the EX ops.
     fn compile_call_ex(
         &mut self,
@@ -3721,11 +3790,10 @@ impl Compiler {
     ) -> Result<(), String> {
         match func.unspanned() {
             Expr::Attribute(recv, attr) => {
-                self.compile_expr(b, recv)?;
-                self.name_const(b, attr);
+                self.compile_load_method(b, func, recv, attr)?;
                 self.compile_arg_spread(b, args)?;
                 self.compile_kw_spread(b, keywords)?;
-                let idx = b.emit(Op::CallBuiltin(ops::CALL_METHOD_EX, 4), self.cur_line);
+                let idx = b.emit(Op::CallBuiltin(ops::CALL_LOADED_EX, 5), self.cur_line);
                 self.record_span(idx);
             }
             // Same as the plain call: a slotted callee is pushed as a value.

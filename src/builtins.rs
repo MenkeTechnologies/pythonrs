@@ -40,6 +40,9 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::CALL_KW, b_call_kw);
     vm.register_builtin(ops::CALL_METHOD, b_call_method);
     vm.register_builtin(ops::CALL_METHOD_KW, b_call_method_kw);
+    vm.register_builtin(ops::LOAD_METHOD, b_load_method);
+    vm.register_builtin(ops::CALL_LOADED, b_call_loaded);
+    vm.register_builtin(ops::CALL_LOADED_KW, b_call_loaded_kw);
     vm.register_builtin(ops::CALL_VALUE, b_call_value);
     vm.register_builtin(ops::CALL_VALUE_KW, b_call_value_kw);
     vm.register_builtin(ops::TRUTHY, b_truthy);
@@ -85,7 +88,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::DECLARE_NONLOCAL, b_declare_nonlocal);
     vm.register_builtin(ops::CALL_EX, b_call_ex);
     vm.register_builtin(ops::CALL_VALUE_EX, b_call_value_ex);
-    vm.register_builtin(ops::CALL_METHOD_EX, b_call_method_ex);
+    vm.register_builtin(ops::CALL_LOADED_EX, b_call_loaded_ex);
     vm.register_builtin(ops::BUILD_ARGS, b_build_args);
     vm.register_builtin(ops::BUILD_KWARGS, b_build_kwargs);
     vm.register_builtin(ops::MKDICT_EX, b_mkdict_ex);
@@ -1083,18 +1086,195 @@ fn b_call_kw(vm: &mut VM, argc: u8) -> Value {
 fn b_call_method(vm: &mut VM, argc: u8) -> Value {
     let mut args = pop_n(vm, argc as usize);
     let recv = args.remove(0);
-    let name = sval(&args.remove(0));
-    let r = host::call_method(&recv, &name, args, vec![]);
-    finish(vm, r)
+    let name = args.remove(0);
+    call_method_fused(vm, &recv, &sref(&name), args, vec![])
 }
 
 fn b_call_method_kw(vm: &mut VM, argc: u8) -> Value {
     let mut args = pop_n(vm, argc as usize);
     let kwd = args.pop().unwrap();
     let recv = args.remove(0);
-    let name = sval(&args.remove(0));
-    let kwargs = kw_pairs(&kwd);
-    let r = host::call_method(&recv, &name, args, kwargs);
+    let name = args.remove(0);
+    call_method_fused(vm, &recv, &sref(&name), args, kw_pairs(&kwd))
+}
+
+/// `recv.name(...)` with the lookup fused into the call. The arguments are
+/// inert (see `Compiler::is_inert`), so resolving the callee after them cannot
+/// be observed. An instance, class or `super` receiver is resolved exactly as
+/// `LOAD_METHOD` resolves it — a `__getattribute__` override, a property or
+/// another descriptor yields what the attribute read produces, where the
+/// by-name dispatch of `host::call_method` would call the descriptor object
+/// itself — and a native receiver's methods are dispatched by name. The
+/// protocol calls the runtime makes through `host::call_method` (`__getattr__`,
+/// `__get__`, `__len__`, …) are CPython's special-method lookups, which never
+/// consult `__getattribute__`, and stay unscreened.
+///
+/// A failed lookup carets the attribute, as CPython's does (see
+/// [`abort_at_callee`]); a native receiver's is recognized only once the call
+/// has failed, by a lookup that runs no user code.
+fn call_method_fused(
+    vm: &mut VM,
+    recv: &Value,
+    name: &str,
+    args: Vec<Value>,
+    kwargs: Vec<(String, Value)>,
+) -> Value {
+    let user_lookup = with_host(|h| {
+        matches!(
+            h.get(recv),
+            Some(PyObj::Instance(_) | PyObj::Class(_) | PyObj::Super { .. })
+        )
+    });
+    if user_lookup {
+        let r = match resolve_method(recv, name) {
+            Ok((self_slot, callee)) => call_loaded(&self_slot, name, &callee, args, kwargs),
+            Err(e) => return abort_at_callee(vm, e),
+        };
+        return finish(vm, r);
+    }
+    match host::call_method(recv, name, args, kwargs) {
+        Err(e) if native_lookup_fails(recv, name) => abort_at_callee(vm, e),
+        r => finish(vm, r),
+    }
+}
+
+/// Whether a native receiver has no attribute `name` at all — so a fused call
+/// on it failed at the lookup, not in the method.
+fn native_lookup_fails(recv: &Value, name: &str) -> bool {
+    with_host(|h| {
+        matches!(h.method_callee(recv, name), host::MethodCallee::Miss)
+            && h.get_attr(recv, name).is_err()
+    })
+}
+
+/// `abort` for a fused method call whose callee lookup failed. CPython carets
+/// the attribute (`recv.name`) for that, never omitting it, where a failure in
+/// the call itself carets the whole call: the call's span is cut back to where
+/// its bracket anchor begins.
+fn abort_at_callee(vm: &mut VM, e: String) -> Value {
+    let idx = vm.ip.saturating_sub(1);
+    if let Some(&line) = vm.chunk.lines.get(idx) {
+        if line != 0 {
+            let mut span = crate::host::lookup_position(vm.chunk.op_hash, idx);
+            // A call spanning lines ends before its anchor begins, so the
+            // anchor start is the test, not `has_anchor`.
+            if span.anchor_start > span.start {
+                span.end = span.anchor_start;
+                span.anchor_start = 0;
+                span.anchor_end = 0;
+                span.suppress = false;
+            }
+            with_host(|h| h.set_cur_line_span(line, span));
+        }
+    }
+    with_host(|h| h.error = Some(e));
+    vm.ip = vm.chunk.ops.len();
+    Value::Undef
+}
+
+// ── method calls: callee resolved before the arguments ───────────────────────
+//
+// CPython evaluates `recv.name(args)` as `LOAD_ATTR` (method form) and THEN the
+// arguments, so a `__getattr__`, a property, or a failed lookup acts before any
+// argument expression runs. `LOAD_METHOD` performs that lookup and leaves
+// `[self_or_none, name, callee_or_none]` for the `CALL_LOADED*` ops — CPython's
+// `[callable, self_or_null]` pair, plus the name for the fused path.
+
+/// The empty slot of a loaded method call (CPython's `NULL`). No Python value
+/// lowers to `Value::Status`, so it cannot be confused with one.
+const NO_VALUE: Value = Value::Status(0);
+
+fn is_no_value(v: &Value) -> bool {
+    matches!(v, Value::Status(0))
+}
+
+/// `[recv, name] -> [self_or_none, name, callee_or_none]`.
+///
+/// A lookup that can run user code (a user `__getattribute__`, a property or
+/// other descriptor, `__getattr__`) or that fails is performed in full here, so
+/// its side effects and its `AttributeError` come before the arguments'. A
+/// lookup the type answers natively runs no code and is left to the fused
+/// call (`callee` empty), which allocates no bound method for it; a function
+/// found on an instance's class is carried as `[recv, name, func]`, so an
+/// argument that rebinds the attribute cannot change what is called.
+fn b_load_method(vm: &mut VM, _: u8) -> Value {
+    let name_v = vm.pop();
+    let recv = vm.pop();
+    match resolve_method(&recv, &sref(&name_v)) {
+        Ok((self_slot, callee)) => {
+            vm.push(self_slot);
+            vm.push(name_v);
+            callee
+        }
+        Err(e) => {
+            // Keep the stack shape the call expects; `abort` ends the frame.
+            vm.push(NO_VALUE);
+            vm.push(name_v);
+            abort(vm, e)
+        }
+    }
+}
+
+/// The `[self_or_none, callee_or_none]` pair `LOAD_METHOD` leaves for `recv.name`.
+fn resolve_method(recv: &Value, name: &str) -> Result<(Value, Value), String> {
+    // The `with` desugar's dot-prefixed protocol entry (see `host::call_method`)
+    // runs its own check in the call.
+    if name.starts_with('.') {
+        return Ok((recv.clone(), NO_VALUE));
+    }
+    let full = || get_attr_desc(recv, name).map(|f| (NO_VALUE, f));
+    match with_host(|h| h.method_callee(recv, name)) {
+        host::MethodCallee::Protocol => full(),
+        host::MethodCallee::Fused => Ok((recv.clone(), NO_VALUE)),
+        host::MethodCallee::Method(f) => Ok((recv.clone(), f)),
+        host::MethodCallee::Callable(f) => Ok((NO_VALUE, f)),
+        host::MethodCallee::Miss if instance_dunder(recv, "__getattr__") => full(),
+        // No user code can answer it: the plain read either raises the
+        // `AttributeError` now, or finds something the fused call reaches too.
+        host::MethodCallee::Miss => {
+            with_host(|h| h.get_attr(recv, name)).map(|_| (recv.clone(), NO_VALUE))
+        }
+    }
+}
+
+/// Run a loaded method call.
+fn call_loaded(
+    self_slot: &Value,
+    name: &str,
+    callee: &Value,
+    args: Vec<Value>,
+    kwargs: Vec<(String, Value)>,
+) -> Result<Value, String> {
+    if is_no_value(callee) {
+        host::call_method(self_slot, name, args, kwargs)
+    } else if is_no_value(self_slot) {
+        host::invoke(callee, args, kwargs)
+    } else {
+        host::call_bound_function(self_slot, name, callee, args, kwargs)
+    }
+}
+
+/// Split the `[self_or_none, name, callee_or_none, rest...]` head off a loaded call.
+fn loaded_head(args: &mut Vec<Value>) -> (Value, Value, Value) {
+    let mut head = args.drain(..3);
+    let self_slot = head.next().unwrap();
+    let name = head.next().unwrap();
+    let callee = head.next().unwrap();
+    (self_slot, name, callee)
+}
+
+fn b_call_loaded(vm: &mut VM, argc: u8) -> Value {
+    let mut args = pop_n(vm, argc as usize);
+    let (self_slot, name, callee) = loaded_head(&mut args);
+    let r = call_loaded(&self_slot, &sref(&name), &callee, args, vec![]);
+    finish(vm, r)
+}
+
+fn b_call_loaded_kw(vm: &mut VM, argc: u8) -> Value {
+    let mut args = pop_n(vm, argc as usize);
+    let kwd = args.pop().unwrap();
+    let (self_slot, name, callee) = loaded_head(&mut args);
+    let r = call_loaded(&self_slot, &sref(&name), &callee, args, kw_pairs(&kwd));
     finish(vm, r)
 }
 
@@ -1188,23 +1368,26 @@ fn b_call_value_ex(vm: &mut VM, _: u8) -> Value {
     finish(vm, r)
 }
 
-fn b_call_method_ex(vm: &mut VM, _: u8) -> Value {
+fn b_call_loaded_ex(vm: &mut VM, _: u8) -> Value {
     let kwd = vm.pop();
     let argl = vm.pop();
+    let callee = vm.pop();
     let name = sval(&vm.pop());
-    let recv = vm.pop();
-    // The callable is only named when a `**` merge failed, so the attribute
-    // is resolved for the message alone and only on that path.
+    let self_slot = vm.pop();
+    // The callable is only named when a `**` merge failed, so an unresolved
+    // attribute is resolved for the message alone and only on that path.
     if with_host(|h| h.pending_kw_dup.is_some()) {
-        let disp = match with_host(|h| h.get_attr(&recv, &name)) {
-            Ok(f) => host::callable_display_name(&f),
-            Err(_) => name.clone(),
+        let resolved = if is_no_value(&callee) {
+            with_host(|h| h.get_attr(&self_slot, &name)).ok()
+        } else {
+            Some(callee.clone())
         };
+        let disp = resolved.map_or_else(|| name.clone(), |f| host::callable_display_name(&f));
         if let Some(a) = check_kw_dup(vm, &disp) {
             return a;
         }
     }
-    let r = host::call_method(&recv, &name, list_args(&argl), kw_pairs(&kwd));
+    let r = call_loaded(&self_slot, &name, &callee, list_args(&argl), kw_pairs(&kwd));
     finish(vm, r)
 }
 

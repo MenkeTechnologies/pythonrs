@@ -6539,6 +6539,85 @@ fn except_star_syntax_rules_are_enforced() {
     }
 }
 
+/// A method call resolves its ATTRIBUTE callee before its arguments, as
+/// CPython's `LOAD_ATTR` method form does: a `__getattr__` or a property runs
+/// first, a missing method raises before any argument is evaluated, and an
+/// argument that rebinds the attribute does not change what is called. A
+/// method call whose arguments are inert keeps the fused lookup, but still
+/// calls what a descriptor or a `__getattribute__` override produces rather
+/// than the descriptor object. Expected values from CPython 3.14.
+#[test]
+fn a_call_resolves_an_attribute_callee_before_its_arguments() {
+    assert_eq!(
+        g(
+            "log = []\n\
+             def f(*a, **k):\n\
+             \x20   log.append('call')\n\
+             \x20   return 0\n\
+             def arg():\n\
+             \x20   log.append('arg')\n\
+             \x20   return 1\n\
+             class G:\n\
+             \x20   def __getattr__(s, n):\n\
+             \x20       log.append('callee')\n\
+             \x20       return f\n\
+             class P:\n\
+             \x20   @property\n\
+             \x20   def m(s):\n\
+             \x20       log.append('callee')\n\
+             \x20       return f\n\
+             class R:\n\
+             \x20   def m(s, *a): return 'original'\n\
+             r = R()\n\
+             def rebind():\n\
+             \x20   r.m = lambda *a: 'rebound'\n\
+             \x20   return 1\n\
+             G().m(arg())\n\
+             G().m(k=arg())\n\
+             G().m(*[arg()])\n\
+             P().m(arg(), **{'k': arg()})\n\
+             x = (log, r.m(rebind()))",
+            "x"
+        ),
+        "(['callee', 'arg', 'call', 'callee', 'arg', 'call', 'callee', 'arg', 'call', \
+         'callee', 'arg', 'arg', 'call'], 'original')"
+    );
+    assert_eq!(
+        g(
+            "import math\n\
+             x = []\n\
+             for obj in (object(), [], math):\n\
+             \x20   try:\n\
+             \x20       obj.nope(x.append('arg'))\n\
+             \x20   except AttributeError as e:\n\
+             \x20       x.append(str(e))",
+            "x"
+        ),
+        "[\"'object' object has no attribute 'nope'\", \"'list' object has no attribute \
+         'nope'\", \"module 'math' has no attribute 'nope'\"]"
+    );
+    assert_eq!(
+        g(
+            "log = []\n\
+             class D:\n\
+             \x20   def __get__(s, o, t=None): return lambda: 'desc'\n\
+             class H:\n\
+             \x20   m = D()\n\
+             class A:\n\
+             \x20   def __getattribute__(s, n):\n\
+             \x20       log.append('ga ' + n)\n\
+             \x20       return object.__getattribute__(s, n)\n\
+             \x20   def m(s): return 'm'\n\
+             class P:\n\
+             \x20   @property\n\
+             \x20   def m(s): return lambda: 'prop'\n\
+             x = (H().m(), A().m(), P().m(), log)",
+            "x"
+        ),
+        "('desc', 'm', 'prop', ['ga m'])"
+    );
+}
+
 /// A call evaluates its CALLEE before its arguments (CPython's order). The
 /// bare-name form used to push the name and let the `CALL` op resolve it after
 /// the arguments were on the stack, so `aa(bb)` blamed `bb`.

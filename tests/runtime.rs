@@ -222,6 +222,39 @@ fn binop_anchor_reaches_into_a_parenthesized_right_operand() {
     assert_eq!(caret_rows("x = 1+(\"a\")*2\n"), "    x = 1+(\"a\")*2\n        ~^~~~~~~~");
 }
 
+/// A method call whose callee lookup fails carets the attribute (`recv.name`),
+/// never omitted, where a failure in the call itself carets the whole call —
+/// whether the lookup ran before the arguments or fused into the call, and for
+/// a call spanning lines. Byte-for-byte CPython 3.14.
+#[test]
+fn a_failed_method_lookup_carets_the_attribute() {
+    let caret_rows = |src: &str| {
+        let tb = traceback_of(src);
+        let lines: Vec<&str> = tb.lines().collect();
+        format!("{}\n{}", lines[lines.len() - 3], lines[lines.len() - 2])
+    };
+    let k = "class K: pass\nk = K()\n";
+    assert_eq!(caret_rows(&format!("{k}k.missing()\n")), "    k.missing()\n    ^^^^^^^^^");
+    assert_eq!(
+        caret_rows(&format!("{k}x = k.missing()\n")),
+        "    x = k.missing()\n        ^^^^^^^^^"
+    );
+    assert_eq!(
+        caret_rows(&format!("{k}x = 1\nprint(k.missing(x+1, 2))\n")),
+        "    print(k.missing(x+1, 2))\n          ^^^^^^^^^"
+    );
+    assert_eq!(caret_rows("print([].nope(1))\n"), "    print([].nope(1))\n          ^^^^^^^");
+    assert_eq!(
+        caret_rows(&format!("{k}print(k.missing(\n   1))\n")),
+        "    print(k.missing(\n          ^^^^^^^^^"
+    );
+    // A failure INSIDE the method still carets the call.
+    assert_eq!(
+        caret_rows("print([].index(1))\n"),
+        "    print([].index(1))\n          ~~~~~~~~^^^"
+    );
+}
+
 #[test]
 fn caret_anchor_shapes() {
     // CPython 3.11+ fine-grained caret anchors, byte-for-byte:
@@ -569,8 +602,8 @@ fn did_you_mean_suggestions() {
     // in `traceback.py` finds neither).
     assert!(traceback_of("st\n")
         .ends_with("NameError: name 'st' is not defined. Did you mean: 'set'?\n"));
-    // Attributes: an instance attribute, a method reached through the fused
-    // CALL_METHOD op (which never goes through `get_attr`), and a builtin type.
+    // Attributes: an instance attribute, a method call (whose miss `LOAD_METHOD`
+    // raises before the arguments run), and a builtin type.
     assert!(
         traceback_of("class C:\n    def __init__(s):\n        s.value = 1\nC().valu\n").ends_with(
             "AttributeError: 'C' object has no attribute 'valu'. Did you mean: 'value'?\n"
