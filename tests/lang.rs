@@ -1681,6 +1681,33 @@ fn str_find_rfind_start_end() {
     assert_eq!(g("x = 'héllo'.find('l')", "x"), "2");
 }
 
+// `s[i]` and `len(s)` share a per-string character index (`host::StrIndex`).
+// Alternating between an ASCII and a non-ASCII string of the same length, and
+// indexing strings freshly built inside a loop, must never read one string's
+// offsets for another.
+#[test]
+fn str_subscript_and_len_across_strings() {
+    let src = "\
+a = 'abcd'
+u = 'é€😀z'
+x = []
+for i in range(-4, 4):
+    x.append(a[i] + u[i])
+x.append((len(a), len(u)))
+for n in range(1, 4):
+    s = 'é' * n + 'q'
+    x.append(s[n] + s[-1] + str(len(s)))
+try:
+    u[4]
+except IndexError as e:
+    x.append(str(e))
+";
+    assert_eq!(
+        g(src, "x"),
+        "['aé', 'b€', 'c😀', 'dz', 'aé', 'b€', 'c😀', 'dz', (4, 4), 'qq2', 'qq3', 'qq4', 'string index out of range']"
+    );
+}
+
 #[test]
 fn str_index_rindex_start_end() {
     assert_eq!(g("x = 'abcabc'.index('b', 2)", "x"), "4");

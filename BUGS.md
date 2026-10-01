@@ -9,6 +9,13 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **Walking a `str` by index is linear, not quadratic.** `s[i]` collected the
+  whole string into a `Vec<char>` and `len(s)` counted every character, on each
+  call, so `while j < len(s): c = s[j]` cost O(n²): 40 000 characters took 90 s
+  where CPython takes milliseconds, and brace-matching port-report generators
+  never finished. Both now read a per-string character index (`StrIndex` in
+  `host.rs`: none for ASCII, byte offsets otherwise), built once for the string
+  being walked.
 - **A native `list[int]` or `int | str` subscripts a CPython `typing` generic.**
   `def f() -> Optional[tuple[int, int]]` died at definition time with
   `TypeError: cannot pass 'GenericAlias' to a CPython stdlib call`: the

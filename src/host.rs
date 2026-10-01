@@ -2055,6 +2055,22 @@ pub enum AttrCompletion {
 /// One `atexit`-registered callback: `(func, args, kwargs)`.
 pub type AtexitCallback = (Value, Vec<Value>, Vec<(String, Value)>);
 
+/// Where each character of one heap `str` starts.
+///
+/// Python indexes a `str` by code point and the payload is UTF-8, so `s[i]` and
+/// `len(s)` each had to walk the whole string — and a loop over a string does
+/// both on every iteration, which made `while j < len(s): s[j]` quadratic. Heap
+/// ids are never reused (`alloc` only appends) and a `str` is never mutated in
+/// place, so an index built for an id stays valid. Only the most recent string is
+/// kept: it is the one a loop keeps touching.
+struct StrIndex {
+    id: u32,
+    chars: usize,
+    /// Byte offset of each character, or `None` for an ASCII string, where the
+    /// byte offset already is the character index.
+    offsets: Option<Vec<usize>>,
+}
+
 pub struct PyHost {
     heap: Vec<PyObj>,
     /// Function/lambda templates, indexed by def id.
@@ -2080,6 +2096,9 @@ pub struct PyHost {
     /// cache is dropped whenever a class is registered, since a new class can
     /// change what an existing name resolves to.
     mro_cache: std::cell::RefCell<HashMap<String, std::rc::Rc<Vec<String>>>>,
+    /// Character index of the `str` most recently measured or subscripted; see
+    /// [`StrIndex`].
+    str_index: RefCell<Option<StrIndex>>,
     /// try/except/finally block templates, indexed by try id.
     pub tries: Vec<TryDef>,
     /// Per-module global namespaces (each imported module's `__dict__`), index 0
@@ -2688,6 +2707,7 @@ impl PyHost {
             func_names: Vec::new(),
             classes: IndexMap::new(),
             mro_cache: std::cell::RefCell::new(HashMap::new()),
+            str_index: RefCell::new(None),
             tries: Vec::new(),
             module_globals: vec![NameMap::default()],
             module_dicts: HashMap::new(),
@@ -3336,6 +3356,31 @@ impl PyHost {
         }
         let _ = kind;
         Some(out)
+    }
+
+    /// Code-point length of the `str` payload `s` stored at heap id `id`.
+    pub fn str_char_len(&self, id: u32, s: &str) -> usize {
+        self.with_str_index(id, s, |ix| ix.chars)
+    }
+
+    /// Character `k` (0-based, `k < str_char_len`) of the `str` payload `s` stored
+    /// at heap id `id`.
+    pub fn str_char_at(&self, id: u32, s: &str, k: usize) -> char {
+        self.with_str_index(id, s, |ix| match &ix.offsets {
+            None => s.as_bytes()[k] as char,
+            Some(offsets) => s[offsets[k]..].chars().next().unwrap(),
+        })
+    }
+
+    fn with_str_index<R>(&self, id: u32, s: &str, f: impl FnOnce(&StrIndex) -> R) -> R {
+        let mut slot = self.str_index.borrow_mut();
+        if slot.as_ref().is_none_or(|ix| ix.id != id) {
+            let offsets =
+                (!s.is_ascii()).then(|| s.char_indices().map(|(b, _)| b).collect::<Vec<_>>());
+            let chars = offsets.as_ref().map_or(s.len(), Vec::len);
+            *slot = Some(StrIndex { id, chars, offsets });
+        }
+        f(slot.as_ref().unwrap())
     }
 
     pub fn as_str(&self, v: &Value) -> Option<String> {
@@ -8947,8 +8992,10 @@ impl PyHost {
                 Ok(l[k as usize].clone())
             }
             Some(PyObj::Str(s)) => {
-                let chars: Vec<char> = s.chars().collect();
-                let n = chars.len() as i64;
+                let Value::Obj(id) = *recv else {
+                    unreachable!()
+                };
+                let n = self.str_char_len(id, s) as i64;
                 // CPython 3.11 added the offending type; the bare form is the
                 // 3.9/3.10 wording.
                 let i = self.seq_index(idx, || {
@@ -8961,7 +9008,7 @@ impl PyHost {
                 if k < 0 || k >= n {
                     return Err("IndexError: string index out of range".into());
                 }
-                let ch = chars[k as usize].to_string();
+                let ch = self.str_char_at(id, s, k as usize).to_string();
                 Ok(self.new_str(ch))
             }
             Some(PyObj::Dict(d)) => {

@@ -7512,7 +7512,10 @@ pub fn py_len(v: &Value) -> Result<usize, String> {
         return crate::ffi::len(fid);
     }
     with_host(|h| match h.get(v) {
-        Some(PyObj::Str(s)) => Ok(s.chars().count()),
+        Some(PyObj::Str(s)) => {
+            let Value::Obj(id) = *v else { unreachable!() };
+            Ok(h.str_char_len(id, s))
+        }
         Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) => Ok(b.len()),
         Some(PyObj::Memoryview { len, .. }) => Ok(*len),
         Some(PyObj::Deque { items, .. }) => Ok(items.len()),
