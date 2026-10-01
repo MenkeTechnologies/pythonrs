@@ -7,9 +7,10 @@
 //! `--dap` compiles with `set_debug_mode(true)`, which installs the marker hook
 //! instead of `enable_tracing_jit`). The `DBG_LINE` builtin fires synchronously
 //! at each marker; when it lands on a breakpoint or a step target it pauses IN
-//! PLACE and services DAP requests (`stackTrace`/`scopes`/`variables`/`continue`/
-//! `next`/`stepIn`/`stepOut`) from stdin until a resume command, then returns
-//! control to the VM.
+//! PLACE and services DAP requests (`stackTrace`/`scopes`/`variables`/`evaluate`/
+//! `continue`/`next`/`stepIn`/`stepOut`) from stdin until a resume command, then
+//! returns control to the VM. `evaluate` (watch, hover, debug console) runs any
+//! expression in the paused frame, as `eval` on the stopped line would.
 //!
 //! Because it is single-threaded, an async `pause` of a free-running program is
 //! not supported (the adapter only reads requests while stopped at a marker);
@@ -56,6 +57,9 @@ struct DebugState {
     seq: i64,
     /// True once `launch` has redirected stdout and the debuggee is running.
     active: bool,
+    /// True while an `evaluate` request runs code in the paused frame; its
+    /// statement markers must not stop or move the step bookkeeping.
+    evaluating: bool,
 }
 
 thread_local! {
@@ -70,6 +74,7 @@ thread_local! {
         program: String::new(),
         seq: 1,
         active: false,
+        evaluating: false,
     });
 }
 
@@ -210,19 +215,34 @@ fn set_function_breakpoints(msg: &J, req_seq: i64) {
     );
 }
 
-/// Evaluate a debugger expression. v1 resolves a bare variable name against the
-/// paused frame's locals (mirrors awkrs's snapshot lookup); anything else returns
-/// a hint rather than spawning a sub-interpreter.
-fn evaluate_expression(expr: &str) -> String {
+/// Evaluate a watch / hover / REPL expression in the paused frame, as
+/// `eval(expr)` written on the stopped line would: the frame's locals over the
+/// module globals, so any expression works, not only a bare name. Returns the
+/// value's `repr`, or the exception line when it raises.
+///
+/// The evaluation must leave the paused program exactly as it found it. Its
+/// statement markers are ignored (`evaluating`), so a breakpoint inside a
+/// function the expression calls does not re-enter the adapter, and step depth
+/// bookkeeping is untouched; a raise does not leave its error, exception or
+/// traceback behind for the program to trip over when it resumes.
+fn evaluate_expression(expr: &str) -> Result<String, String> {
     if expr.is_empty() {
-        return String::new();
+        return Ok(String::new());
     }
-    for (name, repr) in crate::host::with_host(|h| h.dbg_locals()) {
-        if name == expr {
-            return repr;
-        }
-    }
-    format!("<cannot evaluate `{expr}`>")
+    let (saved_exc, saved_tb) =
+        crate::host::with_host(|h| (h.exc.clone(), h.traceback.clone()));
+    DBG.with(|d| d.borrow_mut().evaluating = true);
+    // `repr` runs a user `__repr__` like any other call, so it is part of the
+    // evaluation and runs under the same guard.
+    let shown = crate::builtins::eval_in_current_frame(expr)
+        .and_then(|v| crate::builtins::py_repr(&v));
+    DBG.with(|d| d.borrow_mut().evaluating = false);
+    crate::host::with_host(|h| {
+        h.error = None;
+        h.exc = saved_exc;
+        h.traceback = saved_tb;
+    });
+    shown.map_err(crate::plain_error)
 }
 
 /// The set of source lines that carry a `DBG_LINE` marker in the compiled
@@ -351,6 +371,11 @@ pub fn on_ext(vm: &mut VM, id: u16) {
 pub fn on_debug_line(vm: &mut VM) {
     let line = *vm.chunk.lines.get(vm.ip.saturating_sub(1)).unwrap_or(&0);
     if line == 0 {
+        return;
+    }
+    // Code an `evaluate` request runs is not the debuggee's: no stop, and no
+    // change to the depth the step commands compare against.
+    if DBG.with(|d| d.borrow().evaluating) {
         return;
     }
     let (depth, fname) = crate::host::with_host(|h| {
@@ -492,12 +517,14 @@ fn handle_stopped(msg: &J, depth: usize) -> bool {
                 .unwrap_or("")
                 .trim()
                 .to_string();
-            let result = evaluate_expression(&expr);
-            respond(
-                req_seq,
-                command,
-                json!({ "result": result, "variablesReference": 0 }),
-            );
+            match evaluate_expression(&expr) {
+                Ok(result) => respond(
+                    req_seq,
+                    command,
+                    json!({ "result": result, "variablesReference": 0 }),
+                ),
+                Err(message) => respond_error(req_seq, command, &message),
+            }
             false
         }
         "pause" => {
@@ -626,6 +653,20 @@ fn respond(req_seq: i64, command: &str, body: J) {
         "success": true,
         "command": command,
         "body": body,
+    }));
+}
+
+/// A failed request: `success: false` with the reason as its `message`, which
+/// is what a client shows (the exception line of a watch expression that
+/// raises).
+fn respond_error(req_seq: i64, command: &str, message: &str) {
+    send(&json!({
+        "seq": next_seq(),
+        "type": "response",
+        "request_seq": req_seq,
+        "success": false,
+        "command": command,
+        "message": message,
     }));
 }
 

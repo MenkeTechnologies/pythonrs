@@ -2301,7 +2301,9 @@ impl Compiler {
         let saved_slots = std::mem::take(&mut self.fn_slots);
         let saved_bound = std::mem::take(&mut self.fn_slots_bound);
         let is_gen_or_async = is_async || body_has_yield(body);
-        if kind.is_function() && !is_gen_or_async && fn_slots_allowed(body) {
+        // A `--dap` compile keeps every local in the environment, where the
+        // debugger's `variables`/`evaluate` read the paused frame by name.
+        if kind.is_function() && !is_gen_or_async && !self.debug && fn_slots_allowed(body) {
             let mut next: u16 = 0;
             let mut table: HashMap<String, u16> = HashMap::new();
             // Parameters first: `bind_params` has already bound them, and the

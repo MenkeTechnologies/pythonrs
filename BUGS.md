@@ -64,6 +64,16 @@ written.
   raises its `NameError` on each read until it resolves, side effects happen at
   that read, and the result is cached. `__annotate__(1)` evaluates afresh, and
   assigning `__annotations__` makes `__annotate__` `None`, as in CPython.
+- **`--dap` evaluates watch expressions.** `evaluate` only looked a bare name up
+  in the paused frame and answered `<cannot evaluate …>` for anything else. It
+  now runs the expression as `eval` on the stopped line would — the frame's
+  locals over the module globals — and answers its `repr` (a user `__repr__`
+  included), or a failed response carrying the exception line. Markers the
+  evaluation runs through do not stop it or move the step bookkeeping, and a
+  raise leaves no error, exception or traceback behind for the resumed program.
+  A `--dap` compile also keeps every function local in the environment, so
+  `variables` shows locals assigned after entry: only the parameters were
+  visible, because the rest lived in VM frame slots.
 - **More than 255 operands anywhere.** `CallBuiltin` carries a `u8` operand
   count, so a call with >255 arguments, a `{**a, …}` display with >85 entries,
   a `def`/`lambda` with >252 defaults, >127 class-header keywords, and a class
@@ -1906,7 +1916,9 @@ measured inside it, recorded so the next round does not re-derive them.
 - **`--dap`** (Debug Adapter Protocol): implemented — breakpoints, step
   in/out/over/continue, stack trace, locals, and program-stdout capture (pipe +
   dup2 → `output` events). Frame names in the stack use the function name (or
-  `<module>`), shared with the traceback path. Watch expressions not yet added.
+  `<module>`), shared with the traceback path. `evaluate` (watch, hover, debug
+  console) runs any expression in the paused frame, as `eval` on the stopped
+  line would.
 - **`--lsp`**: full corpus — completion (builtins/keywords/methods), position-
   aware hover, and diagnostics via the real parser. Go-to-def and signature help
   not yet added.

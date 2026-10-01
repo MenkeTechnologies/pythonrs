@@ -7371,6 +7371,14 @@ fn pow_mod(a: &Value, b: &Value, m: &Value) -> Result<Value, String> {
     }))
 }
 
+/// `eval(src)` as if called from the innermost running frame: its locals
+/// overlaid on the module globals, writes discarded inside a function. What the
+/// DAP adapter's `evaluate` runs for a watch or hover expression at a stop.
+pub fn eval_in_current_frame(src: &str) -> Result<Value, String> {
+    let source = with_host(|h| h.new_str(src.to_string()));
+    run_pysource(true, &[source])
+}
+
 /// Shared implementation of `eval`/`exec`. `want_value` is true for `eval` (the
 /// source is a single expression whose value is returned); false for `exec`
 /// (statements, returning `None`). `args` is `[source, globals?, locals?]`.
