@@ -16,6 +16,15 @@ written.
   end is CPython's tokenizer raising `IndentationError: unindent does not match
   any outer indentation level` when the parser asks for the next token. It is
   now raised there, positioned just past the end of the line as CPython does.
+- **A binary operator's caret anchor reaches into a parenthesized right operand.**
+  CPython's `ast.BinOp` anchor (`traceback._extract_caret_anchors_from_line_segment`)
+  is one character wider than a one-character operator when the next character
+  lies before the right operand's AST position, and a parenthesized group has no
+  node of its own, so its position is inside the parentheses: `1+("a")`
+  underlines `~^^~~~~`, where pythonrs stopped at the operator (`~^~~~~~`). The
+  parser records each group's inner position and `Parser::binop_tail` applies the
+  rule for every binary operator; a tuple display or a group followed by more of
+  the operand keeps the bare operator, as in CPython.
 - **`itertools.groupby` is lazy.** It drained its input and built every group
   as a list up front, so it never returned on an infinite iterator
   (`groupby(count(), key=…)`), each group was a `list` instead of an
@@ -1442,12 +1451,7 @@ written.
   `__module__` is `'re'`, with the traceback reading `re.PatternError:`. What
   remains missing is the type object itself — `__mro__` and `isinstance`
   against a real class.
-- **A binary operator's caret anchor stops at the operator.** When the right
-  operand is PARENTHESIZED, CPython's anchor runs from the left operand's end to
-  the right operand's own `col_offset`, which is INSIDE the parens: `1+("a")`
-  underlines `~^^~~~~` and pythonrs underlines `~^~~~~~`. Unparenthesized
-  operands agree. Only the caret row differs; the message, the line and the span
-  are the same.
+
 - **`stdout` is never block-buffered, so a merged stream interleaves
   differently.** CPython line-buffers `stdout` on a TTY and BLOCK-buffers it on
   a pipe or file, while `stderr` stays unbuffered; pythonrs flushes `stdout` on

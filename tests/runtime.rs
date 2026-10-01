@@ -204,6 +204,24 @@ fn traceback_of(src: &str) -> String {
     r.stderr.expect("expected a traceback on stderr")
 }
 
+/// CPython's `ast.BinOp` anchor runs one character past a one-character
+/// operator when the next character precedes the right operand's AST position,
+/// which happens only for a parenthesized group: the group has no node, so the
+/// position is inside the parentheses. A tuple display or a group followed by
+/// more of the operand keeps the bare operator.
+#[test]
+fn binop_anchor_reaches_into_a_parenthesized_right_operand() {
+    let caret_rows = |src: &str| {
+        let tb = traceback_of(src);
+        let lines: Vec<&str> = tb.lines().collect();
+        format!("{}\n{}", lines[2], lines[3])
+    };
+    assert_eq!(caret_rows("x = 1+(\"a\")\n"), "    x = 1+(\"a\")\n        ~^^~~~~");
+    assert_eq!(caret_rows("x = 1 -((\"a\"))\n"), "    x = 1 -((\"a\"))\n        ~~^^~~~~~~");
+    assert_eq!(caret_rows("x = 1+(\"a\",)\n"), "    x = 1+(\"a\",)\n        ~^~~~~~~");
+    assert_eq!(caret_rows("x = 1+(\"a\")*2\n"), "    x = 1+(\"a\")*2\n        ~^~~~~~~~");
+}
+
 #[test]
 fn caret_anchor_shapes() {
     // CPython 3.11+ fine-grained caret anchors, byte-for-byte:

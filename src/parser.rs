@@ -35,6 +35,7 @@ pub fn parse(src: &str) -> Result<Vec<Stmt>, String> {
         loop_depth: 0,
         nesting: 0,
         misplaced: None,
+        groups: std::collections::HashMap::new(),
     };
     let err = match p.parse_module() {
         Ok(stmts) => match unclosed {
@@ -272,6 +273,7 @@ pub fn check_eval_input(src: &str) -> Result<(), String> {
         loop_depth: 0,
         nesting: 0,
         misplaced: None,
+        groups: std::collections::HashMap::new(),
     };
     p.skip_newlines();
     if matches!(p.cur(), Tok::Eof) {
@@ -392,6 +394,11 @@ struct Parser {
     /// only once the whole file has PARSED, so a syntax error anywhere in the
     /// file wins over them; it is reported when the parse succeeds.
     misplaced: Option<String>,
+    /// Every parenthesized group read so far, keyed by the token index of its
+    /// `(`: the index of its `)` and the (line, column) of the expression
+    /// inside. CPython's AST has no node for a group, so the position it gives
+    /// `(x)` is `x`'s — see [`Parser::node_start`].
+    groups: std::collections::HashMap<usize, (usize, u32, u32)>,
 }
 
 /// Wrap a caret-bearing expression with its source span. `anchor_start ==
@@ -445,6 +452,51 @@ impl Parser {
     fn prev_end_col(&self) -> u32 {
         self.toks[self.pos.saturating_sub(1)].end_col
     }
+    /// The (line, column) CPython's AST gives the expression spanning tokens
+    /// `[first, end)`: its first token's, unless the expression is one
+    /// parenthesized group, whose position is the inner expression's.
+    fn node_start(&self, first: usize, end: usize) -> (u32, u32) {
+        match self.groups.get(&first) {
+            Some(&(close, line, col)) if close + 1 == end => (line, col),
+            _ => (self.toks[first].line, self.toks[first].col),
+        }
+    }
+
+    /// The rest of a binary operation whose left operand `left` started at
+    /// (`sl`, `sc`) and whose operator `op` is the current token: the operator,
+    /// the right operand `parse_right` reads, and the caret span over both.
+    ///
+    /// The `^` anchor is CPython's `traceback._extract_caret_anchors_from_line_segment`
+    /// for `ast.BinOp`: it starts at the operator and is one character wider than
+    /// a one-character operator when the next character is not blank, `\` or
+    /// `#` and lies before the right operand's AST position. That holds only
+    /// when the right operand is a parenthesized group, whose position is inside
+    /// the parentheses, so `1+("a")` anchors `+(`.
+    fn binop_tail(
+        &mut self,
+        left: Expr,
+        op: BinOp,
+        (sl, sc): (u32, u32),
+        parse_right: fn(&mut Self) -> Result<Expr, String>,
+    ) -> Result<Expr, String> {
+        self.enter()?;
+        let op_tok = self.toks[self.pos].clone();
+        self.advance();
+        let right_first = self.pos;
+        let right = parse_right(self)?;
+        let mut anchor_end = op_tok.end_col;
+        let next = &self.toks[right_first];
+        if op_tok.end_col - op_tok.col == 1
+            && next.line == op_tok.line
+            && next.col == op_tok.end_col
+            && self.node_start(right_first, self.pos) > (op_tok.line, op_tok.end_col)
+        {
+            anchor_end += 1;
+        }
+        let e = Expr::BinOp(op, Box::new(left), Box::new(right));
+        Ok(spanned(e, sl, sc, self.prev_end_col(), op_tok.col, anchor_end))
+    }
+
     fn advance(&mut self) -> Tok {
         let t = self.toks[self.pos].tok.clone();
         if self.pos + 1 < self.toks.len() {
@@ -2401,11 +2453,7 @@ impl Parser {
         let (sl, sc) = (self.line(), self.col());
         let mut e = self.parse_bitxor()?;
         while self.at_op("|") {
-            self.enter()?;
-            let (opc, ope) = (self.col(), self.cur_end_col());
-            self.advance();
-            let e2 = Expr::BinOp(BinOp::BitOr, Box::new(e), Box::new(self.parse_bitxor()?));
-            e = spanned(e2, sl, sc, self.prev_end_col(), opc, ope);
+            e = self.binop_tail(e, BinOp::BitOr, (sl, sc), Self::parse_bitxor)?;
         }
         self.depth = saved;
         Ok(e)
@@ -2415,11 +2463,7 @@ impl Parser {
         let (sl, sc) = (self.line(), self.col());
         let mut e = self.parse_bitand()?;
         while self.at_op("^") {
-            self.enter()?;
-            let (opc, ope) = (self.col(), self.cur_end_col());
-            self.advance();
-            let e2 = Expr::BinOp(BinOp::BitXor, Box::new(e), Box::new(self.parse_bitand()?));
-            e = spanned(e2, sl, sc, self.prev_end_col(), opc, ope);
+            e = self.binop_tail(e, BinOp::BitXor, (sl, sc), Self::parse_bitand)?;
         }
         self.depth = saved;
         Ok(e)
@@ -2429,11 +2473,7 @@ impl Parser {
         let (sl, sc) = (self.line(), self.col());
         let mut e = self.parse_shift()?;
         while self.at_op("&") {
-            self.enter()?;
-            let (opc, ope) = (self.col(), self.cur_end_col());
-            self.advance();
-            let e2 = Expr::BinOp(BinOp::BitAnd, Box::new(e), Box::new(self.parse_shift()?));
-            e = spanned(e2, sl, sc, self.prev_end_col(), opc, ope);
+            e = self.binop_tail(e, BinOp::BitAnd, (sl, sc), Self::parse_shift)?;
         }
         self.depth = saved;
         Ok(e)
@@ -2450,11 +2490,7 @@ impl Parser {
             } else {
                 break;
             };
-            self.enter()?;
-            let (opc, ope) = (self.col(), self.cur_end_col());
-            self.advance();
-            let e2 = Expr::BinOp(op, Box::new(e), Box::new(self.parse_arith()?));
-            e = spanned(e2, sl, sc, self.prev_end_col(), opc, ope);
+            e = self.binop_tail(e, op, (sl, sc), Self::parse_arith)?;
         }
         self.depth = saved;
         Ok(e)
@@ -2471,12 +2507,7 @@ impl Parser {
             } else {
                 break;
             };
-            self.enter()?;
-            let (opc, ope) = (self.col(), self.cur_end_col());
-            self.advance();
-            let e2 = Expr::BinOp(op, Box::new(e), Box::new(self.parse_term()?));
-            let end = self.prev_end_col();
-            e = spanned(e2, sl, sc, end, opc, ope);
+            e = self.binop_tail(e, op, (sl, sc), Self::parse_term)?;
         }
         self.depth = saved;
         Ok(e)
@@ -2499,12 +2530,7 @@ impl Parser {
             } else {
                 break;
             };
-            self.enter()?;
-            let (opc, ope) = (self.col(), self.cur_end_col());
-            self.advance();
-            let e2 = Expr::BinOp(op, Box::new(e), Box::new(self.parse_unary()?));
-            let end = self.prev_end_col();
-            e = spanned(e2, sl, sc, end, opc, ope);
+            e = self.binop_tail(e, op, (sl, sc), Self::parse_unary)?;
         }
         self.depth = saved;
         Ok(e)
@@ -3022,6 +3048,7 @@ impl Parser {
 
     /// `(...)` — parenthesized expr, tuple, or generator expression.
     fn parse_paren(&mut self) -> Result<Expr, String> {
+        let open = self.pos;
         self.advance(); // (
         if self.eat_op(")") {
             return Ok(Expr::Tuple(Vec::new()));
@@ -3048,6 +3075,8 @@ impl Parser {
             return Ok(Expr::Tuple(items));
         }
         self.expect_op(")")?;
+        let (line, col) = self.node_start(start, self.pos - 1);
+        self.groups.insert(open, (self.pos - 1, line, col));
         Ok(first)
     }
 
