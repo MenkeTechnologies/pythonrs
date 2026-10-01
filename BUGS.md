@@ -199,6 +199,38 @@ written.
   docstrings are dropped, so `__doc__` is `None`. `sys.flags.optimize` reports
   the level, and the level is part of the bytecode-cache key, as it is part of a
   `.pyc`'s name, so a chunk compiled at one level is never served to another.
+- **`m.lastindex` / `m.lastgroup` name the group that closed last.** They
+  named the highest-numbered group that took part, so nested groups
+  (`re.match('((a)b)', 'ab')`) answered 2 where CPython's `_sre.c`, which
+  records a group as it closes, answers 1 — the outer group closes after the
+  inner one. `PyRegex` now records where each group's `)` sits and picks the
+  group that ends last, ties going to the later `)`.
+- **`re` matches bytes.** A bytes subject raised `TypeError: expected string`.
+  A bytes pattern now runs over `bytes`, `bytearray` and `memoryview` (decoded
+  latin-1, so codepoint positions are byte offsets: `span() == (3, 4)` on
+  `'aéb'.encode()`), groups/`findall`/`split`/`sub` hand back `bytes`,
+  `m.string` is the subject object, and the pattern is ASCII as CPython's
+  bytes patterns are — `\w \W \d \D \s \S \b \B` and IGNORECASE stop at
+  0x7F (they matched and folded `b'\xe9'`/`b'\xa0'`), which also gives
+  `re.ASCII` its meaning on str patterns (the flag was ignored). Mixing kinds
+  raises CPython's `cannot use a string pattern on a bytes-like object` and
+  its counterparts, `re.compile(b'…', re.U)` is the `ValueError`, and a `sub`
+  replacement or `expand` group of the wrong kind fails with the join's
+  `sequence item N: …` message (a non-str callable result used to be dropped
+  silently). Pattern and Match reprs are CPython's `%R` (truncated to 200 and
+  50 characters) instead of a hand-quoted string.
+- **`finditer` is lazy, and `Pattern.scanner` exists.** `finditer` built every
+  match up front and returned a `list_iterator`; it is now `_sre.c`'s
+  `iter(pattern.scanner(s, pos, endpos).search, None)` — a `callable_iterator`
+  over a native `SRE_Scanner` that finds one match per step (and now honors
+  `pos`/`endpos`).
+- **`re.Scanner` exists.** It is CPython's Python class (`src/stdlib/pyre.rs`),
+  run on pythonrs over `Pattern.scanner` and `lastindex`; the combined pattern
+  is built as text, so the phrase is found by its wrapper group's number
+  rather than `lastindex - 1`.
+- **`Match.regs`, `Match.re`, `Match.lastgroup`, `Match.expand()` and `m[g]`**
+  were listed as missing under `re`; all five already answered as CPython's do
+  (re-measured), and the entry was stale.
 - **`itertools.groupby` is lazy.** It drained its input and built every group
   as a list up front, so it never returned on an infinite iterator
   (`groupby(count(), key=…)`), each group was a `list` instead of an
@@ -1531,9 +1563,12 @@ written.
   (`~~~~~~~~~^^`) where CPython carets the attribute (`^^^^^^^^^`), and the
   arguments are evaluated before the failed lookup; a nested unpacking target
   (`a, (b, c) = 1, (2,)`) carets the outer target, CPython the inner one.
-- **`m.lastindex` / `m.lastgroup` pick the last participating group by
-  number.** CPython's is the group that CLOSED last, so for nested groups
-  (`((a)b)`) it names the outer one (1) where pythonrs names the inner (2).
+- **`m.lastindex` / `m.lastgroup` for a group closed inside a look-ahead.**
+  Neither engine reports the order in which groups closed, so `lastindex` is
+  rebuilt from the result: the group ending last, ties going to the group whose
+  `)` comes later in the pattern (`PyRegex::last_closed_group`). A look-ahead
+  closes its groups early but ends them late, so `re.match(r'(?=(ab))(a)',
+  'ab').lastindex` is 1 here and 2 in CPython.
 
 - **Some `SyntaxError`s are still worded by pythonrs, or carry no position.**
   The tokenizer's and parser's errors now carry CPython's message, `lineno`,
@@ -1956,8 +1991,7 @@ module then raises `ModuleNotFoundError`.
   `module_ffi_fallback` covers exactly `math`, `collections`, `functools` and
   `contextlib`; `re` is not in that list, so a miss on the native namespace is a
   hard `AttributeError` and never defers. Checking against CPython 3.14.6:
-  `hasattr(re, 'Scanner')` and `hasattr(re, 'RegexFlag')` are both `False` here
-  and `True` there; `hasattr(itertools, 'batched')` is `False` here and `True`
+  `hasattr(re, 'RegexFlag')` is `False` here and `True` there; `hasattr(itertools, 'batched')` is `False` here and `True`
   there. `re` is the Rust `regex`/`fancy_regex` engines behind
   `src/regexpr.rs`, and its remaining gaps are listed under "Standard library —
   `re`" below.
@@ -2064,21 +2098,29 @@ that boundary. Regression test: `re_positions_count_codepoints_not_bytes` in
 nor `byte == k*char` can carry a wrong implementation.
 
 Still open:
-- **A `bytes` subject is rejected.** `re.search(rb'b', b'ab')` raises
-  `TypeError: expected string`; CPython matches and reports BYTE offsets there
-  (`span() == (1, 2)` on `'aéb'.encode()` is `(3, 4)`). A bytes PATTERN compiles
-  (each byte is decoded as latin-1, which `json` relies on), but the subject must
-  be a `str`. Supporting it means carrying a bytes/str flag on the match so the
-  position conversion above is skipped.
-- **`Match.regs`, `Match.re`, `Match.lastgroup` and `Match.expand()` are
-  missing** — all four raise `AttributeError`. `m.regs` is the span tuple
-  (`((1, 3), (1, 2), (2, 3))`), so it is a position API and would convert the
-  same way. `m[i]` (`Match.__getitem__`) raises `TypeError`; `m.group(i)` works.
-- **`finditer` is eager.** It builds every match and returns a list iterator, so
-  `type(...).__name__` is `list_iterator` where CPython says `callable_iterator`,
-  and a scan over a huge subject materializes all of it.
-- **`re.Scanner` and `re.RegexFlag` are absent** (the flag constants exist as
-  plain ints; `re.A`/`re.I`/`re.M`/`re.S`/`re.X` all resolve).
+- **`re.RegexFlag` is absent; the flag constants are plain ints.** CPython's
+  `re.I` IS `re.RegexFlag.IGNORECASE`, an `enum.IntFlag` member that reprs as
+  `re.IGNORECASE` and combines to `re.IGNORECASE|re.MULTILINE`. pythonrs has no
+  native `enum`: in the default build `enum.IntFlag` exists only as a CPython
+  class across the FFI bridge, and building `RegexFlag` there makes every
+  `import re` start libpython (measured on the debug build: `-c 'import re'`
+  0.01s, `-c 'import enum'` 0.03s) and turns every `flags` argument into a
+  bridged object the native engine would convert per call; defining the class
+  body on pythonrs fails outright (`__str__ = object.__str__` raises `cannot
+  pass 'wrapper_descriptor' to a CPython stdlib call`). It needs a native
+  `IntFlag`.
+- **`re.ASCII | re.IGNORECASE` on a str subject folds a literal `k`/`s` to
+  U+212A KELVIN SIGN / U+017F LONG S.** Classes, `\w` and non-ASCII literals
+  fold ASCII-only (see the bytes entry in Implemented), but an ASCII letter
+  outside a class keeps the crate's Unicode `(?i)`: `re.findall(r'(?i)k',
+  'K\u212a', re.A)` is `['K', 'K']` here, `['K']` in CPython. Bytes subjects
+  cannot hold those characters, so only str patterns under `re.ASCII` see it.
+- **`SRE_Scanner.match()` after an empty match ends the scan.** `_sre.c` then
+  requires the next match at the same place to be non-empty and tries the
+  pattern's other alternatives for one; the engines cannot be asked for that,
+  so `re.compile(r'x*|a').scanner('a')` answers `match()` with `None` where
+  CPython finds `'a'`. `search()` (and so `finditer`, `findall`, `sub`,
+  `split`) resumes one character on, which is what CPython's search does too.
 
 ### `hash()` values: what is reproduced, and what cannot be
 

@@ -10372,20 +10372,49 @@ fn call_typing(f: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Resul
 ///
 /// Class depth and backslash escapes are tracked so a construct outside a class,
 /// or one that is already escaped, is left alone.
-fn rewrite_class_backspace(pattern: &str, verbose: bool) -> std::borrow::Cow<'_, str> {
-    // Every rewrite happens inside a class, so a pattern with none is unchanged.
-    if !pattern.contains('[') {
+///
+/// `ascii` is `re.ASCII`, which a bytes pattern always has (see
+/// [`ascii_escape`]); `ignorecase` is `re.IGNORECASE`.
+fn rewrite_class_backspace(
+    pattern: &str,
+    verbose: bool,
+    ascii: bool,
+    ignorecase: bool,
+) -> std::borrow::Cow<'_, str> {
+    // Without `re.ASCII` every rewrite happens inside a class, so a pattern with
+    // none is unchanged.
+    if !ascii && !pattern.contains('[') {
         return std::borrow::Cow::Borrowed(pattern);
     }
+    // `re.ASCII` case folding, which the crate's Unicode `(?i)` cannot express.
+    let ascii_fold = ascii && ignorecase;
     let chars: Vec<char> = pattern.chars().collect();
     let mut out = String::with_capacity(pattern.len());
     let mut in_class = false;
+    // Where in `out` the open class began, so it can be rewritten whole.
+    let mut class_start = 0;
     let mut i = 0;
     while i < chars.len() {
         match chars[i] {
             '\\' if i + 1 < chars.len() => {
                 if in_class && chars[i + 1] == 'b' {
                     out.push_str("\\x08");
+                } else if let Some(class) = ascii
+                    .then(|| ascii_escape(chars[i + 1], in_class))
+                    .flatten()
+                {
+                    out.push_str(class);
+                } else if ascii_fold
+                    && !in_class
+                    && chars[i + 1] == 'x'
+                    && is_high_hex(&chars[i + 2..])
+                {
+                    // A non-ASCII byte written `\xHH`: see the literal arm below.
+                    out.push_str("(?-i:\\x");
+                    out.extend(&chars[i + 2..i + 4]);
+                    out.push(')');
+                    i += 4;
+                    continue;
                 } else {
                     out.push('\\');
                     out.push(chars[i + 1]);
@@ -10393,10 +10422,28 @@ fn rewrite_class_backspace(pattern: &str, verbose: bool) -> std::borrow::Cow<'_,
                 i += 2;
                 continue;
             }
+            // A group name (`(?P<name>`, `(?<name>`, `(?P=name)`) is copied as
+            // written: it is not pattern text, and wrapping a non-ASCII letter of
+            // it for case folding would break the group syntax.
+            '(' if !in_class && ascii_fold && chars.get(i + 1) == Some(&'?') => {
+                let rest: String = chars[i + 2..].iter().take(3).collect();
+                let named = rest.starts_with("P<")
+                    || rest.starts_with("P=")
+                    || (rest.starts_with('<') && !rest[1..].starts_with(['=', '!']));
+                let close = if rest.starts_with("P=") { ')' } else { '>' };
+                if named {
+                    if let Some(len) = chars[i..].iter().position(|&c| c == close) {
+                        out.extend(&chars[i..=i + len]);
+                        i += len + 1;
+                        continue;
+                    }
+                }
+            }
             // `^` right after the open negates; `]` in first position is a literal
             // member rather than the close.
             '[' if !in_class => {
                 in_class = true;
+                class_start = out.len();
                 out.push('[');
                 i += 1;
                 if chars.get(i) == Some(&'^') {
@@ -10435,7 +10482,29 @@ fn rewrite_class_backspace(pattern: &str, verbose: bool) -> std::borrow::Cow<'_,
                 i += 2;
                 continue;
             }
-            ']' if in_class => in_class = false,
+            ']' if in_class => {
+                in_class = false;
+                out.push(']');
+                i += 1;
+                if ascii_fold {
+                    if let Some(folded) = ascii_fold_class(&out[class_start..]) {
+                        out.truncate(class_start);
+                        out.push_str(&folded);
+                    }
+                }
+                continue;
+            }
+            // `re.ASCII` folds case for the ASCII letters only, while the crate's
+            // `(?i)` folds by Unicode: `rb'(?i)\xe9'` must not match `b'\xc9'`
+            // ('é' and 'É' as latin-1), so a non-ASCII literal turns folding off
+            // for itself.
+            c if ascii_fold && !in_class && !c.is_ascii() => {
+                out.push_str("(?-i:");
+                out.push(c);
+                out.push(')');
+                i += 1;
+                continue;
+            }
             _ => {}
         }
         out.push(chars[i]);
@@ -10444,9 +10513,120 @@ fn rewrite_class_backspace(pattern: &str, verbose: bool) -> std::borrow::Cow<'_,
     std::borrow::Cow::Owned(out)
 }
 
-/// Translate a Python `re` pattern + flag bits into a `regex`-crate pattern by
-/// prepending the inline-flag group `(?imsx)`, then compile it. `re` flag bits:
-/// I=2, M=8, S=16, X=64 (others are no-ops for the byte/NFA engine here).
+/// A character class (`[…]`, in the crate's syntax) under `re.ASCII` case
+/// folding: case folding off for the class, and the other-case partner of
+/// every ASCII letter it names listed explicitly. The crate's `(?i)` folds a
+/// class by Unicode, so `rb'(?i)[\xe0-\xff]'` matched `b'\xc9'` and
+/// `(?i)[k]` matched U+212A KELVIN SIGN; CPython's `re.ASCII` folds `a-z`
+/// against `A-Z` and nothing else. Spelled this way, `[^a]` still excludes `A`.
+///
+/// `None` (leave the class as written) for a member this does not parse —
+/// an escape other than `\xHH`, a control-character escape or an escaped
+/// punctuation mark.
+fn ascii_fold_class(class: &str) -> Option<String> {
+    let inner = class.strip_prefix('[')?.strip_suffix(']')?;
+    let body: Vec<char> = inner.strip_prefix('^').unwrap_or(inner).chars().collect();
+    let mut partners = String::new();
+    let mut i = 0;
+    while i < body.len() {
+        // A nested class here came from `ascii_escape` (`[^0-9A-Za-z_]`) and
+        // already holds both cases of every letter in it.
+        let Some(lo) = class_member(&body, &mut i)? else {
+            continue;
+        };
+        let mut hi = lo;
+        if body.get(i) == Some(&'-') && i + 1 < body.len() {
+            i += 1;
+            hi = class_member(&body, &mut i)??;
+        }
+        for (first, last) in [('a', 'z'), ('A', 'Z')] {
+            let (from, to) = (lo.max(first), hi.min(last));
+            if from <= to {
+                let swap = |c: char| (c as u8 ^ 0x20) as char;
+                partners.push(swap(from));
+                partners.push('-');
+                partners.push(swap(to));
+            }
+        }
+    }
+    Some(format!("(?-i:{}{partners}])", &class[..class.len() - 1]))
+}
+
+/// Read one member of a class body at `body[*i]`, advancing past it: `Some(c)`
+/// for a single character, `None` for a nested class (skipped whole). The
+/// outer `None` is a member [`ascii_fold_class`] does not parse.
+fn class_member(body: &[char], i: &mut usize) -> Option<Option<char>> {
+    let c = body[*i];
+    *i += 1;
+    match c {
+        '[' => {
+            let len = body[*i..].iter().position(|&ch| ch == ']')?;
+            *i += len + 1;
+            Some(None)
+        }
+        '\\' => {
+            let e = *body.get(*i)?;
+            *i += 1;
+            Some(Some(match e {
+                'x' => {
+                    let hex: String = body.get(*i..*i + 2)?.iter().collect();
+                    *i += 2;
+                    char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?
+                }
+                'n' => '\n',
+                't' => '\t',
+                'r' => '\r',
+                'f' => '\x0c',
+                'v' => '\x0b',
+                'a' => '\x07',
+                _ if !e.is_ascii_alphanumeric() => e,
+                _ => return None,
+            }))
+        }
+        _ => Some(Some(c)),
+    }
+}
+
+/// The crate spelling of a class escape under `re.ASCII` — `None` for an
+/// escape the flag does not change.
+///
+/// `re.ASCII` (and every bytes pattern, which has no other mode) restricts
+/// `\w \W \d \D \s \S \b \B` to ASCII: `\w` is `[a-zA-Z0-9_]`, `\s` is
+/// `[ \t\n\r\f\v]` (`_sre.c`'s `SRE_IS_SPACE`), `\b` sits between an ASCII word
+/// character and anything else. The crate's escapes are Unicode, so on a bytes
+/// subject (decoded latin-1, one char per byte) `\w` matched `b'\xe9'` and `\s`
+/// matched `b'\xa0'`, which CPython's do not. `\w`/`\W` turn case folding off
+/// because the crate's `(?i)` would add U+212A KELVIN SIGN to `[K]`, and the
+/// class already lists both cases. Inside a class the positive escapes become
+/// bare ranges and the negated ones a nested class, which the crate allows.
+fn ascii_escape(c: char, in_class: bool) -> Option<&'static str> {
+    Some(match (c, in_class) {
+        ('w', false) => "(?-i:[0-9A-Za-z_])",
+        ('W', false) => "(?-i:[^0-9A-Za-z_])",
+        ('d', false) => "[0-9]",
+        ('D', false) => "[^0-9]",
+        ('s', false) => "[\\t\\n\\x0B\\x0C\\r\\x20]",
+        ('S', false) => "[^\\t\\n\\x0B\\x0C\\r\\x20]",
+        ('b', false) => "(?-u:\\b)",
+        ('B', false) => "(?-u:\\B)",
+        ('w', true) => "0-9A-Za-z_",
+        ('W', true) => "[^0-9A-Za-z_]",
+        ('d', true) => "0-9",
+        ('D', true) => "[^0-9]",
+        ('s', true) => "\\t\\n\\x0B\\x0C\\r\\x20",
+        ('S', true) => "[^\\t\\n\\x0B\\x0C\\r\\x20]",
+        _ => return None,
+    })
+}
+
+/// Whether `rest` (what follows a `\x`) is two hex digits naming a byte above
+/// 0x7F — a non-ASCII literal written as an escape.
+fn is_high_hex(rest: &[char]) -> bool {
+    rest.len() >= 2
+        && rest[..2].iter().all(|c| c.is_ascii_hexdigit())
+        && matches!(rest[0], '8'..='9' | 'a'..='f' | 'A'..='F')
+}
+
 /// Add `x` to a Shewchuk exact-sum accumulator: `partials` holds non-overlapping
 /// values whose plain sum is the exact total, so the final add rounds once.
 fn exact_sum_push(partials: &mut Vec<f64>, mut x: f64) {
@@ -10468,7 +10648,16 @@ fn exact_sum_push(partials: &mut Vec<f64>, mut x: f64) {
     partials.push(x);
 }
 
-fn re_compile_raw(pattern: &str, flags: i64) -> Result<crate::regexpr::PyRegex, String> {
+/// Translate a Python `re` pattern + flag bits into the engines' syntax and
+/// compile it: the class-syntax and `re.ASCII` rewrites of
+/// [`rewrite_class_backspace`], then the flags as a leading inline group
+/// `(?imsx)`. `re` flag bits: I=2, M=8, S=16, X=64, ASCII=256 — and a bytes
+/// pattern is ASCII whatever its flags say, since bytes have no other mode.
+fn re_compile_raw(
+    pattern: &str,
+    flags: i64,
+    is_bytes: bool,
+) -> Result<crate::regexpr::PyRegex, String> {
     let mut inline = String::new();
     if flags & 2 != 0 {
         inline.push('i');
@@ -10482,7 +10671,9 @@ fn re_compile_raw(pattern: &str, flags: i64) -> Result<crate::regexpr::PyRegex, 
     if flags & 64 != 0 {
         inline.push('x');
     }
-    let pattern = rewrite_class_backspace(pattern, flags & 64 != 0);
+    let ascii = is_bytes || flags & 256 != 0;
+    let ignorecase = (flags | re_inline_flags(pattern)) & 2 != 0;
+    let pattern = rewrite_class_backspace(pattern, flags & 64 != 0, ascii, ignorecase);
     let full = if inline.is_empty() {
         pattern.to_string()
     } else {
@@ -10495,32 +10686,88 @@ fn re_compile_raw(pattern: &str, flags: i64) -> Result<crate::regexpr::PyRegex, 
     crate::regexpr::PyRegex::new(&full).map_err(|e| format!("re.PatternError: {e}"))
 }
 
-/// Compile `pattern` (a str or an already-compiled `Pattern`) with `flags` into a
-/// `PyObj::Pattern`, storing the `Regex` in the host.
+/// Bytes as the str engines see them: each byte decoded as latin-1, which maps
+/// 0x00..=0xFF to U+0000..=U+00FF one to one. A bytes pattern and a bytes
+/// subject both go through it, so they agree byte for byte, and a codepoint
+/// index into the decoded text IS the byte offset CPython reports for a bytes
+/// match (`re.search(rb'b', 'aéb'.encode()).span()` is `(3, 4)`).
+fn latin1_decode(b: &[u8]) -> String {
+    b.iter().map(|&c| c as char).collect()
+}
+
+/// The inverse of [`latin1_decode`]. Text taken from a bytes subject or a bytes
+/// template holds only chars below U+0100, one per original byte.
+fn latin1_encode(s: &str) -> Vec<u8> {
+    s.chars().map(|c| c as u8).collect()
+}
+
+/// Read a `re` subject for a pattern of the given kind: a str as-is, any
+/// bytes-like object (`bytes`, `bytearray`, `memoryview`) through
+/// [`latin1_decode`]. A str pattern on bytes, a bytes pattern on a str, and
+/// anything else are CPython's `TypeError`s, worded as `_sre.c` words them.
+fn re_subject(v: &Value, is_bytes: bool) -> Result<String, String> {
+    if let Some(s) = with_host(|h| h.as_str(v)) {
+        if is_bytes {
+            return Err(host::type_error(
+                "cannot use a bytes pattern on a string-like object",
+            ));
+        }
+        return Ok(s);
+    }
+    // A released `memoryview` (the `Err`) is not a subject `_sre.c` can read,
+    // which it reports as the wrong type.
+    match as_bytes_object(v).ok().flatten() {
+        Some(b) if is_bytes => Ok(latin1_decode(&b)),
+        Some(_) => Err(host::type_error(
+            "cannot use a string pattern on a bytes-like object",
+        )),
+        None => Err(host::type_error(&format!(
+            "expected string or bytes-like object, got '{}'",
+            with_host(|h| h.type_name(v))
+        ))),
+    }
+}
+
+/// Matched text handed back to Python: a `str` from a str subject, `bytes`
+/// from a bytes-like one — `_sre.c` slices every bytes-like subject into
+/// `bytes`, so a `bytearray` subject's groups are `bytes` too.
+pub(crate) fn re_text_value(is_bytes: bool, s: &str) -> Value {
+    with_host(|h| {
+        if is_bytes {
+            h.alloc(PyObj::Bytes(latin1_encode(s)))
+        } else {
+            h.new_str(s.to_string())
+        }
+    })
+}
+
+/// Compile `pattern` (a str, a bytes, or an already-compiled `Pattern`) with
+/// `flags` into a `PyObj::Pattern`, storing the `Regex` in the host.
 fn re_compile(pattern: &Value, flags: i64) -> Result<Value, String> {
     // An already-compiled pattern passes through (`re.match(compiled, s)`).
     if with_host(|h| matches!(h.get(pattern), Some(PyObj::Pattern { .. }))) {
         return Ok(pattern.clone());
     }
-    // A BYTES pattern (`re.compile(b'[\x80-\xff]')`) compiles too. Each byte is
-    // decoded as latin-1, which maps 0x00..=0xFF to U+0000..=U+00FF one to one,
-    // so the pattern's byte semantics survive into the str engine unchanged.
-    // Rejecting these outright made `import json` fail — its encoder compiles
-    // `b'[\x80-\xff]'` at import time, so the whole module was unreachable.
+    // A BYTES pattern (`re.compile(b'[\x80-\xff]')`) is read through
+    // `latin1_decode`, so its byte semantics survive into the str engine
+    // unchanged. `json`'s encoder compiles `b'[\x80-\xff]'` at import time.
     let (src, is_bytes) = match with_host(|h| h.as_str(pattern)) {
         Some(s) => (s, false),
         None => with_host(|h| match h.get(pattern) {
-            Some(PyObj::Bytes(b)) => Some(b.iter().map(|&c| c as char).collect::<String>()),
+            Some(PyObj::Bytes(b)) => Some(latin1_decode(b)),
             _ => None,
         })
         .map(|s| (s, true))
         .ok_or_else(|| host::type_error("first argument must be string or compiled pattern"))?,
     };
+    if is_bytes && (flags | re_inline_flags(&src)) & 32 != 0 {
+        return Err("ValueError: cannot use UNICODE flag with a bytes pattern".into());
+    }
     let key = (src.clone(), flags, is_bytes);
     if let Some(p) = with_host(|h| h.re_cache.get(&key).cloned()) {
         return Ok(p);
     }
-    let re = re_compile_raw(&src, flags)?;
+    let re = re_compile_raw(&src, flags, is_bytes)?;
     let groups = re.captures_len().saturating_sub(1);
     // `Pattern.flags` reports what CPython's does: the leading inline flags
     // (`(?i)`) folded in, and `re.UNICODE` implied for a str pattern that did
@@ -10537,6 +10784,7 @@ fn re_compile(pattern: &Value, flags: i64) -> Result<Value, String> {
             pattern: src,
             flags: shown,
             groups,
+            is_bytes,
         });
         h.re_cache.insert(key, p.clone());
         p
@@ -10574,25 +10822,32 @@ fn re_inline_flags(src: &str) -> i64 {
 }
 
 /// Build a `PyObj::Match` from a regex match over `text` (byte spans), recording
-/// the named-group index map from the pattern. `pos`/`endpos` are the byte window
-/// the search ran in — the whole subject unless the caller passed them.
+/// the named-group index map from the pattern. `subject` is the object that was
+/// searched (`m.string` hands it back as is); `text` is that subject as the
+/// engine saw it. `pos`/`endpos` are the byte window the search ran in — the
+/// whole subject unless the caller passed them.
+#[allow(clippy::too_many_arguments)]
 fn re_build_match(
     pat: &Value,
     pat_id: usize,
+    subject: &Value,
     text: &str,
     m_spans: Vec<Option<(usize, usize)>>,
     pos: usize,
     endpos: usize,
+    is_bytes: bool,
 ) -> Value {
     let named: Vec<(String, usize)> = with_host(|h| h.regexes[pat_id].named_groups());
     with_host(|h| {
         h.alloc(PyObj::Match {
             re: pat.clone(),
+            string: subject.clone(),
             text: text.to_string(),
             spans: m_spans,
             named,
             pos,
             endpos,
+            is_bytes,
         })
     })
 }
@@ -10613,6 +10868,26 @@ fn re_first_match(
         }
         Some(spans)
     })
+}
+
+/// The byte window `(pos, endpos)` of `text` named by the optional `pos` and
+/// `endpos` arguments of `match`/`search`/`fullmatch`/`finditer`/`scanner`.
+///
+/// Both arrive as CODEPOINT indices — Python computed them with
+/// `len()`/`str.find` — and the slicing needs byte offsets. Consuming them raw
+/// made `p.search('aéb', 1)` slice from byte 1, which is the interior of 'é',
+/// and the search reported no match at all. Out-of-range values clamp, as
+/// CPython's do.
+fn re_window(text: &str, pos: Option<&Value>, endpos: Option<&Value>) -> (usize, usize) {
+    let nchars = text.chars().count() as i64;
+    let to_byte = |v: Option<&Value>| {
+        v.and_then(|v| with_host(|h| h.as_int(v)))
+            .map(|i| crate::regexpr::byte_index_of(text, i.clamp(0, nchars) as usize))
+    };
+    (
+        to_byte(pos).unwrap_or(0),
+        to_byte(endpos).unwrap_or(text.len()),
+    )
 }
 
 /// `re.*` module functions: compile a pattern (when given a raw one) and apply
@@ -10682,36 +10957,23 @@ pub fn re_pattern_method(
             .find(|(k, _)| k == name)
             .and_then(|(_, v)| with_host(|h| h.as_int(v)))
     };
-    let (pat_id, groups) = match with_host(|h| h.get(pat).cloned()) {
-        Some(PyObj::Pattern { id, groups, .. }) => (id, groups),
+    let (pat_id, groups, is_bytes) = match with_host(|h| h.get(pat).cloned()) {
+        Some(PyObj::Pattern {
+            id,
+            groups,
+            is_bytes,
+            ..
+        }) => (id, groups, is_bytes),
         _ => return Err(host::type_error("not a compiled pattern")),
     };
-    let text = with_host(|h| h.as_str(args.first().unwrap_or(&Value::Undef)));
+    let subject = args.first().cloned().unwrap_or(Value::Undef);
     match method {
         "match" | "search" | "fullmatch" => {
-            let text = text.ok_or_else(|| host::type_error("expected string"))?;
+            let text = re_subject(&subject, is_bytes)?;
             // Optional `pos`/`endpos` (`p.match(s, pos)`): match within
             // `text[pos:endpos]` but report absolute positions. tomli scans a TOML
             // document with `RE_NUMBER.match(src, pos)`.
-            //
-            // Both arrive as CODEPOINT indices — Python computed them with
-            // `len()`/`str.find` — and the slicing below needs byte offsets.
-            // Consuming them raw made `p.search('aéb', 1)` slice from byte 1,
-            // which is the interior of 'é': `text.get(..)` returned None and the
-            // search reported no match at all.
-            let nchars = text.chars().count() as i64;
-            let pos = crate::regexpr::byte_index_of(
-                &text,
-                args.get(1)
-                    .and_then(|v| with_host(|h| h.as_int(v)))
-                    .unwrap_or(0)
-                    .clamp(0, nchars) as usize,
-            );
-            let endpos = args
-                .get(2)
-                .and_then(|v| with_host(|h| h.as_int(v)))
-                .map(|e| crate::regexpr::byte_index_of(&text, e.clamp(0, nchars) as usize))
-                .unwrap_or(text.len());
+            let (pos, endpos) = re_window(&text, args.get(1), args.get(2));
             // `endpos` truncates the subject (`$` matches there) while `pos` only
             // moves where the search starts: `^`, `\b` and look-behind still see
             // the text before it, as they do in CPython. Searching the slice
@@ -10725,77 +10987,78 @@ pub fn re_pattern_method(
                     {
                         return Ok(Value::Undef);
                     }
-                    Ok(re_build_match(pat, pat_id, &text, spans, pos, endpos))
+                    Ok(re_build_match(
+                        pat, pat_id, &subject, &text, spans, pos, endpos, is_bytes,
+                    ))
                 }
                 None => Ok(Value::Undef),
             }
         }
         "findall" => {
-            let text = text.ok_or_else(|| host::type_error("expected string"))?;
-            // Each match's group strings (group 0 when no groups, else groups 1..).
-            let rows: Vec<Vec<String>> = with_host(|h| {
-                h.regexes[pat_id]
-                    .all_captures(&text)
-                    .into_iter()
-                    .map(|spans| {
-                        let grp = |i: usize| {
-                            spans
-                                .get(i)
-                                .copied()
-                                .flatten()
-                                .map(|(a, b)| text[a..b].to_string())
-                                .unwrap_or_default()
-                        };
-                        match groups {
-                            0 => vec![grp(0)],
-                            _ => (1..=groups).map(grp).collect(),
-                        }
-                    })
-                    .collect()
-            });
-            // 0 or 1 group → list of strings; multiple → list of tuples.
-            let vals: Vec<Value> = rows
-                .into_iter()
-                .map(|row| {
-                    if groups > 1 {
-                        let t: Vec<Value> = row
-                            .iter()
-                            .map(|s| with_host(|h| h.new_str(s.clone())))
-                            .collect();
+            let text = re_subject(&subject, is_bytes)?;
+            let all = with_host(|h| h.regexes[pat_id].all_captures(&text));
+            let grp = |spans: &crate::regexpr::Spans, i: usize| {
+                let s = spans
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .map_or("", |(a, b)| &text[a..b]);
+                re_text_value(is_bytes, s)
+            };
+            // Group 0 when the pattern has no groups, the one group's text when
+            // it has one, a tuple of every group's text when it has several.
+            let vals: Vec<Value> = all
+                .iter()
+                .map(|spans| match groups {
+                    0 => grp(spans, 0),
+                    1 => grp(spans, 1),
+                    _ => {
+                        let t: Vec<Value> = (1..=groups).map(|i| grp(spans, i)).collect();
                         with_host(|h| h.new_tuple(t))
-                    } else {
-                        with_host(|h| h.new_str(row[0].clone()))
                     }
                 })
                 .collect();
             Ok(with_host(|h| h.new_list(vals)))
         }
+        // `finditer` is `iter(scanner.search, None)` in `_sre.c`: a
+        // `callable_iterator` that finds one match per step, so a scan over a
+        // huge subject never materializes more than the match it is on.
         "finditer" => {
-            let text = text.ok_or_else(|| host::type_error("expected string"))?;
-            let all: Vec<Vec<Option<(usize, usize)>>> =
-                with_host(|h| h.regexes[pat_id].all_captures(&text));
-            let matches: Vec<Value> = all
-                .into_iter()
-                .map(|s| re_build_match(pat, pat_id, &text, s, 0, text.len()))
-                .collect();
-            // Return a list iterator (finditer yields lazily in CPython; a list is
-            // an acceptable eager stand-in for typical use).
-            let list = with_host(|h| h.new_list(matches));
-            with_host(|h| h.make_iter(&list))
+            let scanner = re_scanner(pat, pat_id, &subject, args, is_bytes)?;
+            Ok(with_host(|h| {
+                let func = h.alloc(PyObj::Builtin("__base_method__.search".into()));
+                let search = h.alloc(PyObj::BoundMethod {
+                    recv: scanner,
+                    func,
+                });
+                h.alloc(PyObj::CallIter {
+                    func: search,
+                    sentinel: Value::Undef,
+                    done: false,
+                })
+            }))
         }
+        "scanner" => re_scanner(pat, pat_id, &subject, args, is_bytes),
         "sub" | "subn" => {
-            let repl = args.first().cloned().unwrap_or(Value::Undef);
-            let text = with_host(|h| h.as_str(args.get(1).unwrap_or(&Value::Undef)))
-                .ok_or_else(|| host::type_error("expected string"))?;
+            let repl = subject;
+            let target = args.get(1).cloned().unwrap_or(Value::Undef);
             let count = args
                 .get(2)
                 .and_then(|v| with_host(|h| h.as_int(v)))
                 .or_else(|| kw_int("count"))
                 .unwrap_or(0);
-            re_sub(pat, pat_id, &repl, &text, count, method == "subn")
+            re_sub(
+                pat,
+                pat_id,
+                is_bytes,
+                &repl,
+                &target,
+                count,
+                method == "subn",
+            )
         }
         "split" => {
-            let text = text.ok_or_else(|| host::type_error("expected string"))?;
+            let text = re_subject(&subject, is_bytes)?;
             let maxsplit = args
                 .get(1)
                 .and_then(|v| with_host(|h| h.as_int(v)))
@@ -10820,16 +11083,16 @@ pub fn re_pattern_method(
                 let Some((s, e)) = m.first().copied().flatten() else {
                     continue;
                 };
-                vals.push(with_host(|h| h.new_str(text[last..s].to_string())));
+                vals.push(re_text_value(is_bytes, &text[last..s]));
                 for g in 1..groups {
                     vals.push(match m.get(g).copied().flatten() {
-                        Some((a, b)) => with_host(|h| h.new_str(text[a..b].to_string())),
+                        Some((a, b)) => re_text_value(is_bytes, &text[a..b]),
                         None => Value::Undef,
                     });
                 }
                 last = e;
             }
-            vals.push(with_host(|h| h.new_str(text[last..].to_string())));
+            vals.push(re_text_value(is_bytes, &text[last..]));
             Ok(with_host(|h| h.new_list(vals)))
         }
         _ => Err(host::type_error(&format!(
@@ -10838,59 +11101,249 @@ pub fn re_pattern_method(
     }
 }
 
-/// `re.sub`/`Pattern.sub` — replace matches. A string replacement is parsed
-/// once into literal and group pieces by [`re_parse_template`] (so a bad
-/// template is an error even when nothing matches, as in CPython) and expanded
-/// per match; a callable replacement is called with each match object. Both
-/// walk the same [`crate::regexpr::PyRegex::all_captures`] matches, so the
+/// `Pattern.scanner(string, pos=0, endpos=…)` — `_sre.c`'s `SRE_Scanner`, the
+/// object `finditer` and `re.Scanner` step through. `args` are the pattern
+/// method's arguments: the subject, then the optional `pos`/`endpos`.
+fn re_scanner(
+    pat: &Value,
+    pat_id: usize,
+    subject: &Value,
+    args: &[Value],
+    is_bytes: bool,
+) -> Result<Value, String> {
+    let text = re_subject(subject, is_bytes)?;
+    let (pos, endpos) = re_window(&text, args.get(1), args.get(2));
+    Ok(with_host(|h| {
+        h.alloc(PyObj::ReScanner {
+            pattern: pat.clone(),
+            pat_id,
+            string: subject.clone(),
+            text,
+            pos,
+            endpos,
+            next: Some(pos),
+            must_advance: false,
+            is_bytes,
+        })
+    }))
+}
+
+/// `SRE_Scanner.match()` / `.search()`: the next match from where the previous
+/// one ended, or `None` once the subject is exhausted (and on every call after
+/// that). A port of `_sre_SRE_Scanner_match_impl`/`_search_impl`: each call
+/// resumes at the end of the last match, and after an EMPTY match the next one
+/// may not be empty at the same place (`must_advance`, see
+/// [`crate::regexpr::PyRegex::search_from`]).
+///
+/// For `match()` that rule has no stand-in: the engines cannot be asked for a
+/// non-empty match anchored where an empty one was found, so a `match()` that
+/// finds only the empty match again ends the scan — where `_sre.c` would try
+/// the pattern's other alternatives first.
+pub fn re_scanner_method(sc: &Value, method: &str) -> Result<Value, String> {
+    let Some(PyObj::ReScanner {
+        pattern,
+        pat_id,
+        string,
+        text,
+        pos,
+        endpos,
+        next,
+        must_advance,
+        is_bytes,
+    }) = with_host(|h| h.get(sc).cloned())
+    else {
+        return Err(host::type_error("not a scanner"));
+    };
+    if !matches!(method, "match" | "search") {
+        return Err(format!(
+            "AttributeError: '_sre.SRE_Scanner' object has no attribute '{method}'"
+        ));
+    }
+    let Some(start) = next else {
+        return Ok(Value::Undef);
+    };
+    let window = text.get(..endpos.max(start)).unwrap_or(&text);
+    let spans = if method == "search" {
+        with_host(|h| h.regexes[pat_id].search_from(window, start, must_advance))
+    } else {
+        re_first_match(pat_id, window, start, true).filter(|spans| {
+            let empty_here = spans.first().copied().flatten() == Some((start, start));
+            !(must_advance && empty_here)
+        })
+    };
+    let span = spans.as_ref().and_then(|s| s.first().copied().flatten());
+    with_host(|h| {
+        if let Some(PyObj::ReScanner {
+            next, must_advance, ..
+        }) = h.get_mut(sc)
+        {
+            *next = span.map(|(_, e)| e);
+            *must_advance = span.is_some_and(|(s, e)| s == e);
+        }
+    });
+    Ok(match spans {
+        Some(spans) => re_build_match(
+            &pattern, pat_id, &string, &text, spans, pos, endpos, is_bytes,
+        ),
+        None => Value::Undef,
+    })
+}
+
+/// Whether `v` is a `str` or a bytes-like object — the replacements `sub`
+/// parses as a template; anything else is called with each match.
+fn re_is_text(v: &Value) -> bool {
+    // A released `memoryview` counts: reading it is what raises.
+    with_host(|h| h.as_str(v).is_some()) || !matches!(as_bytes_object(v), Ok(None))
+}
+
+/// `_sre.c` joins the pieces of a `sub` (and of a template expansion) with
+/// `str.join` or `bytes.join`, so a piece of the other kind fails there — with
+/// that join's message, numbered by the piece's place in the list.
+fn re_join_error(index: usize, want_bytes: bool, found: &str) -> String {
+    let want = if want_bytes {
+        "a bytes-like object"
+    } else {
+        "str instance"
+    };
+    host::type_error(&format!(
+        "sequence item {index}: expected {want}, {found} found"
+    ))
+}
+
+/// `re.sub`/`Pattern.sub` — replace matches, a port of `_sre.c`'s
+/// `pattern_subx`. A str or bytes-like replacement is parsed once into literal
+/// and group pieces by [`re_parse_template`] (so a bad template is an error
+/// even when nothing matches, as in CPython) and expanded per match; anything
+/// else is called with each match object, and a `None` result adds nothing.
+/// Both walk the same [`crate::regexpr::PyRegex::all_captures`] matches, so the
 /// count, the empty-match rule and `subn`'s tally all agree with `findall`.
+///
+/// `_sre.c` collects the untouched stretches and the replacements in a list
+/// and joins it with the subject's kind (`str` or `bytes`); `items` counts
+/// that list, because a replacement of the wrong kind fails the join with its
+/// index in the message.
+#[allow(clippy::too_many_arguments)]
 fn re_sub(
     pat: &Value,
     pat_id: usize,
+    is_bytes: bool,
     repl: &Value,
-    text: &str,
+    subject: &Value,
     count: i64,
     want_count: bool,
 ) -> Result<Value, String> {
-    let is_callable = with_host(|h| {
-        matches!(
-            h.get(repl),
-            Some(PyObj::Func(_)) | Some(PyObj::BoundMethod { .. }) | Some(PyObj::Builtin(_))
-        )
-    });
-    let template = if is_callable {
-        None
-    } else {
-        let rsrc = with_host(|h| h.as_str(repl)).unwrap_or_default();
+    let text = re_subject(subject, is_bytes)?;
+    let template = if re_is_text(repl) {
+        let t_bytes = with_host(|h| h.as_str(repl)).is_none();
+        let src = re_template_text(repl)?;
         let (groups, named) = with_host(|h| {
             let re = &h.regexes[pat_id];
             (re.captures_len() - 1, re.named_groups())
         });
-        Some(re_parse_template(&rsrc, groups, &named)?)
+        Some((re_parse_template(&src, groups, &named)?, t_bytes))
+    } else {
+        if !re_is_callable(repl) {
+            return Err(host::type_error(&format!(
+                "decoding to str: need a bytes-like object, {} found",
+                with_host(|h| h.type_name(repl))
+            )));
+        }
+        None
     };
-    let all: Vec<Vec<Option<(usize, usize)>>> = with_host(|h| h.regexes[pat_id].all_captures(text));
+    let all: Vec<Vec<Option<(usize, usize)>>> =
+        with_host(|h| h.regexes[pat_id].all_captures(&text));
     let mut out = String::new();
     let mut last = 0usize;
     let mut n = 0i64;
+    let mut items = 0usize;
+    // The first replacement of the wrong kind. `_sre.c` meets it only when it
+    // joins the list after the loop, so an error the loop itself raises (a
+    // callable that raises on a later match) still comes first.
+    let mut bad_item: Option<(usize, String)> = None;
     for s in all {
         if count > 0 && n >= count {
             break;
         }
         let (ms, me) = s.first().copied().flatten().unwrap_or((0, 0));
-        out.push_str(&text[last..ms]);
-        match &template {
-            Some(pieces) => out.push_str(&re_expand(pieces, text, &s)),
-            None => {
-                let m = re_build_match(pat, pat_id, text, s, 0, text.len());
-                let r = host::invoke(repl, vec![m], vec![])?;
-                out.push_str(&with_host(|h| h.as_str(&r)).unwrap_or_default());
+        if last < ms {
+            out.push_str(&text[last..ms]);
+            items += 1;
+        }
+        let piece = match &template {
+            Some((pieces, t_bytes)) => {
+                let piece = re_expand(pieces, *t_bytes, is_bytes, &text, &s)?;
+                if *t_bytes != is_bytes {
+                    let found = if *t_bytes { "bytes" } else { "str" };
+                    bad_item.get_or_insert((items, found.to_string()));
+                }
+                Some(piece)
             }
+            None => {
+                let m = re_build_match(pat, pat_id, subject, &text, s, 0, text.len(), is_bytes);
+                let r = host::invoke(repl, vec![m], vec![])?;
+                if matches!(r, Value::Undef) {
+                    None
+                } else {
+                    let piece = if is_bytes {
+                        as_bytes_object(&r)
+                            .ok()
+                            .flatten()
+                            .map(|b| latin1_decode(&b))
+                    } else {
+                        with_host(|h| h.as_str(&r))
+                    };
+                    if piece.is_none() {
+                        bad_item.get_or_insert((items, with_host(|h| h.type_name(&r))));
+                    }
+                    Some(piece.unwrap_or_default())
+                }
+            }
+        };
+        if let Some(piece) = piece {
+            out.push_str(&piece);
+            items += 1;
         }
         last = me;
         n += 1;
     }
+    if let Some((index, found)) = bad_item {
+        return Err(re_join_error(index, is_bytes, &found));
+    }
     out.push_str(&text[last..]);
-    finish_sub(with_host(|h| h.new_str(out)), n, want_count)
+    finish_sub(re_text_value(is_bytes, &out), n, want_count)
+}
+
+/// A `sub`/`expand` template's text: a str as-is, a bytes-like one through
+/// [`latin1_decode`] (the caller has checked it is one of the two; a released
+/// `memoryview` is the `ValueError` reading it raises).
+fn re_template_text(t: &Value) -> Result<String, String> {
+    if let Some(s) = with_host(|h| h.as_str(t)) {
+        return Ok(s);
+    }
+    Ok(as_bytes_object(t)?
+        .map(|b| latin1_decode(&b))
+        .unwrap_or_default())
+}
+
+/// `callable(v)` for a `sub` replacement. A CPython object that crossed the
+/// bridge (a `functools.partial`, a bound method of a bridged class) is called
+/// and left to report its own error if it is not callable.
+fn re_is_callable(v: &Value) -> bool {
+    with_host(|h| match h.get(v) {
+        Some(PyObj::Func(_))
+        | Some(PyObj::Builtin(_))
+        | Some(PyObj::Class(_))
+        | Some(PyObj::NamedTupleType { .. })
+        | Some(PyObj::Partial { .. })
+        | Some(PyObj::LruCache { .. })
+        | Some(PyObj::StaticMethod(_))
+        | Some(PyObj::ClassMethod(_))
+        | Some(PyObj::BoundMethod { .. }) => true,
+        #[cfg(feature = "stdlib-ffi")]
+        Some(PyObj::Foreign(_)) => true,
+        Some(PyObj::Instance(i)) => h.class_lookup(&i.class, "__call__").is_some(),
+        _ => false,
+    })
 }
 
 fn finish_sub(result: Value, n: i64, want_count: bool) -> Result<Value, String> {
@@ -11063,28 +11516,55 @@ fn re_parse_template(
     Ok(pieces)
 }
 
-/// Expand a parsed template against one match's byte spans over `text`.
-fn re_expand(pieces: &[ReplPiece], text: &str, spans: &[Option<(usize, usize)>]) -> String {
+/// Expand a parsed template against one match's byte spans over `text` — a
+/// port of `_sre.c`'s `expand_template`. `t_bytes` is the template's kind and
+/// `m_bytes` the match's. The expansion is joined with the TEMPLATE's kind, and
+/// the join's list holds the leading literal (always, even when empty), then
+/// each participating group and each later non-empty literal; a group of the
+/// other kind fails the join with its index in that list, as
+/// `re.match(b'(a)', b'a').expand('<\1>')` does at item 1.
+fn re_expand(
+    pieces: &[ReplPiece],
+    t_bytes: bool,
+    m_bytes: bool,
+    text: &str,
+    spans: &[Option<(usize, usize)>],
+) -> Result<String, String> {
     let mut out = String::new();
-    for p in pieces {
+    let mut items = 0usize;
+    for (i, p) in pieces.iter().enumerate() {
         match p {
-            ReplPiece::Lit(s) => out.push_str(s),
+            ReplPiece::Lit(s) => {
+                if i == 0 || !s.is_empty() {
+                    out.push_str(s);
+                    items += 1;
+                }
+            }
             ReplPiece::Group(g) => {
                 if let Some((a, b)) = spans.get(*g).copied().flatten() {
+                    if t_bytes != m_bytes {
+                        let found = if m_bytes { "bytes" } else { "str" };
+                        return Err(re_join_error(items, t_bytes, found));
+                    }
                     out.push_str(&text[a..b]);
+                    items += 1;
                 }
             }
         }
     }
-    out
+    Ok(out)
 }
 
 /// A `re.Match` object's methods (`m.group(n)`, `m.groups()`, `m.span()`, …).
 pub fn re_match_method(m: &Value, method: &str, args: &[Value]) -> Result<Value, String> {
-    let (text, spans, named) = match with_host(|h| h.get(m).cloned()) {
+    let (text, spans, named, is_bytes) = match with_host(|h| h.get(m).cloned()) {
         Some(PyObj::Match {
-            text, spans, named, ..
-        }) => (text, spans, named),
+            text,
+            spans,
+            named,
+            is_bytes,
+            ..
+        }) => (text, spans, named, is_bytes),
         _ => return Err(host::type_error("not a match object")),
     };
     // Resolve a group specifier (int index or str name) to a group number.
@@ -11103,7 +11583,7 @@ pub fn re_match_method(m: &Value, method: &str, args: &[Value]) -> Result<Value,
     };
     let group_str = |idx: usize| -> Value {
         match spans.get(idx).copied().flatten() {
-            Some((s, e)) => with_host(|h| h.new_str(text.get(s..e).unwrap_or("").to_string())),
+            Some((s, e)) => re_text_value(is_bytes, text.get(s..e).unwrap_or("")),
             None => Value::Undef, // an unmatched optional group is None
         }
     };
@@ -11143,14 +11623,20 @@ pub fn re_match_method(m: &Value, method: &str, args: &[Value]) -> Result<Value,
             }
             Ok(with_host(|h| h.new_dict(d)))
         }
-        // `m.expand(template)` — the template `sub` would apply to this match.
+        // `m.expand(template)` — the template `sub` would apply to this match,
+        // returned in the template's kind.
         "expand" => {
-            let t = args
-                .first()
-                .and_then(|v| with_host(|h| h.as_str(v)))
-                .ok_or_else(|| host::type_error("expected str"))?;
-            let pieces = re_parse_template(&t, ngroups - 1, &named)?;
-            Ok(with_host(|h| h.new_str(re_expand(&pieces, &text, &spans))))
+            let t = args.first().cloned().unwrap_or(Value::Undef);
+            if !re_is_text(&t) {
+                return Err(host::type_error(&format!(
+                    "decoding to str: need a bytes-like object, {} found",
+                    with_host(|h| h.type_name(&t))
+                )));
+            }
+            let t_bytes = with_host(|h| h.as_str(&t)).is_none();
+            let pieces = re_parse_template(&re_template_text(&t)?, ngroups - 1, &named)?;
+            let out = re_expand(&pieces, t_bytes, is_bytes, &text, &spans)?;
+            Ok(re_text_value(t_bytes, &out))
         }
         "start" | "end" | "span" => {
             // An unknown group is `IndexError`, as it is for `group()`; it used

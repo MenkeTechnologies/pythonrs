@@ -1002,28 +1002,54 @@ pub enum PyObj {
     },
     /// A compiled `re` pattern (`re.compile(...)`). `id` indexes
     /// [`PyHost::regexes`]; `pattern` is the original source string (for
-    /// `.pattern`), `flags` the `re` flag bits, `groups` the capture-group count.
+    /// `.pattern`; a bytes pattern's bytes decoded as latin-1), `flags` the `re`
+    /// flag bits, `groups` the capture-group count, `is_bytes` whether it was
+    /// compiled from `bytes` (and so matches bytes-like subjects only).
     Pattern {
         id: usize,
         pattern: String,
         flags: i64,
         groups: usize,
+        is_bytes: bool,
     },
-    /// A `re` match object. `text` is the searched string; `spans` holds the
-    /// `(start, end)` byte range of each group (group 0 is the whole match), with
-    /// `None` for a group that did not participate. `named` maps group names to
-    /// their index. `pos`/`endpos` are the window the search ran in, as byte
-    /// offsets like the spans — every one of these is converted to a codepoint
-    /// index by [`crate::regexpr::char_index_of`] on the way out to Python, which
-    /// counts `str` positions in characters and not in bytes.
+    /// A `re` match object. `string` is the searched object as the caller passed
+    /// it (`m.string`) and `text` that subject as the engine saw it — a bytes-like
+    /// subject decoded as latin-1, one char per byte (`is_bytes`); `spans` holds
+    /// the `(start, end)` byte range of each group (group 0 is the whole match),
+    /// with `None` for a group that did not participate. `named` maps group
+    /// names to their index. `pos`/`endpos` are the window the search ran in, as
+    /// byte offsets like the spans — every one of these is converted to a
+    /// codepoint index by [`crate::regexpr::char_index_of`] on the way out to
+    /// Python, which counts `str` positions in characters and not in bytes (and,
+    /// through the latin-1 decoding, a bytes subject's positions in bytes).
     Match {
         /// The `Pattern` that produced the match (`m.re`).
         re: Value,
+        string: Value,
         text: String,
         spans: Vec<Option<(usize, usize)>>,
         named: Vec<(String, usize)>,
         pos: usize,
         endpos: usize,
+        is_bytes: bool,
+    },
+    /// `_sre.SRE_Scanner` (`Pattern.scanner(string)`), the cursor `finditer`
+    /// and `re.Scanner` step through: each `match()`/`search()` resumes at
+    /// `next`, the byte offset where the previous match ended (`None` once a
+    /// call found nothing). `must_advance` is `_sre.c`'s flag that forbids an
+    /// empty match where the previous empty match was. `string`/`text`/
+    /// `pos`/`endpos`/`is_bytes` are what each produced [`PyObj::Match`]
+    /// carries.
+    ReScanner {
+        pattern: Value,
+        pat_id: usize,
+        string: Value,
+        text: String,
+        pos: usize,
+        endpos: usize,
+        next: Option<usize>,
+        must_advance: bool,
+        is_bytes: bool,
     },
     /// A `time.struct_time` — the 9-field broken-down time sequence
     /// (`tm_year … tm_isdst`) plus the named-only `tm_gmtoff`/`tm_zone`. Indexes
@@ -4430,6 +4456,7 @@ fn type_object_class_name(n: &str) -> Option<String> {
             Some(n)
         }
         "re.Match" => Some("re.Match"),
+        "_sre.SRE_Scanner" => Some("_sre.SRE_Scanner"),
         // Since 3.14 the PEP 604 union type IS `typing.Union` — `__name__` is
         // `Union`, `__module__` is `typing`, and messages name it
         // `'typing.Union' object …`. It is no longer `builtins.UnionType`.
@@ -4675,6 +4702,7 @@ impl PyHost {
                 Some(PyObj::StructTime { .. }) => "struct_time".into(),
                 Some(PyObj::Pattern { .. }) => "re.Pattern".into(),
                 Some(PyObj::Match { .. }) => "re.Match".into(),
+                Some(PyObj::ReScanner { .. }) => "_sre.SRE_Scanner".into(),
                 Some(PyObj::Namespace { .. }) => "SimpleNamespace".into(),
                 Some(PyObj::MappingProxy { .. }) => "mappingproxy".into(),
                 Some(PyObj::Descriptor { kind, .. }) => kind.type_name().into(),
@@ -4898,23 +4926,36 @@ impl PyHost {
                         .collect();
                     format!("time.struct_time({})", parts.join(", "))
                 }
-                Some(PyObj::Pattern { pattern, .. }) => {
-                    // CPython truncates a long pattern in the repr.
-                    let shown: String = pattern.chars().take(200).collect();
-                    let q = shown.replace('\\', "\\\\").replace('\'', "\\'");
-                    format!("re.compile('{q}')")
+                // `_sre.c` renders the pattern's repr (a bytes pattern's as
+                // `b'…'`) and keeps its first 200 characters.
+                Some(PyObj::Pattern {
+                    pattern, is_bytes, ..
+                }) => {
+                    let shown = re_quote(pattern, *is_bytes);
+                    format!(
+                        "re.compile({})",
+                        shown.chars().take(200).collect::<String>()
+                    )
                 }
-                Some(PyObj::Match { text, spans, .. }) => {
+                Some(PyObj::Match {
+                    text,
+                    spans,
+                    is_bytes,
+                    ..
+                }) => {
                     let (s, e) = spans.first().copied().flatten().unwrap_or((0, 0));
-                    let matched = text.get(s..e).unwrap_or("");
-                    let q = matched.replace('\\', "\\\\").replace('\'', "\\'");
+                    // `%.50R`: the matched text's repr, cut to 50 characters.
+                    let q: String = re_quote(text.get(s..e).unwrap_or(""), *is_bytes)
+                        .chars()
+                        .take(50)
+                        .collect();
                     // The repr renders the group-0 span, so it is a position
                     // boundary like `span()` and reports codepoints too.
                     let (s, e) = (
                         crate::regexpr::char_index_of(text, s),
                         crate::regexpr::char_index_of(text, e),
                     );
-                    format!("<re.Match object; span=({s}, {e}), match='{q}'>")
+                    format!("<re.Match object; span=({s}, {e}), match={q}>")
                 }
                 Some(PyObj::Union { args }) => {
                     let args = args.clone();
@@ -5190,6 +5231,9 @@ impl PyHost {
                 }
                 Some(PyObj::CallIter { .. }) => {
                     format!("<callable_iterator object at 0x{:012x}>", self.addr_of(v))
+                }
+                Some(PyObj::ReScanner { .. }) => {
+                    format!("<_sre.SRE_Scanner object at 0x{:012x}>", self.addr_of(v))
                 }
                 Some(PyObj::Generator { id }) => {
                     let g = &self.generators[*id as usize];
@@ -6080,6 +6124,15 @@ impl PyHost {
             return Err("OverflowError: int too large to convert to float".into());
         }
         Ok(f)
+    }
+
+    /// `Match.lastindex` for a match of the compiled pattern `re` with these
+    /// `spans` — the group that closed last, `None` when none took part.
+    fn match_last_group(&self, re: &Value, spans: &crate::regexpr::Spans) -> Option<usize> {
+        match self.get(re) {
+            Some(PyObj::Pattern { id, .. }) => self.regexes[*id].last_closed_group(spans),
+            _ => None,
+        }
     }
 
     pub fn as_int(&self, v: &Value) -> Option<i64> {
@@ -7179,6 +7232,17 @@ pub fn is_printable_char(c: char) -> bool {
             | G::ParagraphSeparator
             | G::SpaceSeparator
     )
+}
+
+/// The repr of `re` text: a str's, or — for a bytes pattern or subject, whose
+/// text is held decoded as latin-1, one char per byte — the bytes' `b'…'`.
+fn re_quote(text: &str, is_bytes: bool) -> String {
+    if is_bytes {
+        let raw: Vec<u8> = text.chars().map(|c| c as u8).collect();
+        format!("b{}", quote_bytes(&raw, false))
+    } else {
+        quote_str(text)
+    }
 }
 
 fn quote_str(s: &str) -> String {
@@ -9358,7 +9422,11 @@ impl PyHost {
             }
             // `m[g]` is `m.group(g)` (by number or by name).
             Some(PyObj::Match {
-                text, spans, named, ..
+                text,
+                spans,
+                named,
+                is_bytes,
+                ..
             }) => {
                 let g = match self.as_int(idx) {
                     Some(i) => usize::try_from(i).ok().filter(|&i| i < spans.len()),
@@ -9367,7 +9435,13 @@ impl PyHost {
                         .and_then(|n| named.iter().find(|(k, _)| *k == n).map(|(_, i)| *i)),
                 };
                 let g = g.ok_or_else(|| "IndexError: no such group".to_string())?;
+                let is_bytes = *is_bytes;
                 Ok(match spans[g] {
+                    // A bytes subject's text is latin-1, one char per byte.
+                    Some((a, b)) if is_bytes => {
+                        let raw: Vec<u8> = text[a..b].chars().map(|c| c as u8).collect();
+                        self.alloc(PyObj::Bytes(raw))
+                    }
                     Some((a, b)) => {
                         let s = text[a..b].to_string();
                         self.new_str(s)
@@ -12055,10 +12129,17 @@ impl PyHost {
                 pattern,
                 flags,
                 groups,
+                is_bytes,
                 ..
             }) => {
-                let (pattern, flags, groups) = (pattern.clone(), *flags, *groups);
+                let (pattern, flags, groups, is_bytes) =
+                    (pattern.clone(), *flags, *groups, *is_bytes);
                 match name {
+                    // A bytes pattern is held decoded as latin-1, one char per byte.
+                    "pattern" if is_bytes => {
+                        let raw: Vec<u8> = pattern.chars().map(|c| c as u8).collect();
+                        Ok(self.alloc(PyObj::Bytes(raw)))
+                    }
                     "pattern" => Ok(self.new_str(pattern)),
                     "flags" => Ok(Value::Int(flags)),
                     "groups" => Ok(Value::Int(groups as i64)),
@@ -12078,7 +12159,7 @@ impl PyHost {
                         Ok(self.alloc(PyObj::MappingProxy { dict }))
                     }
                     "match" | "search" | "fullmatch" | "findall" | "finditer" | "sub" | "subn"
-                    | "split" => {
+                    | "split" | "scanner" => {
                         let func = self.alloc(PyObj::Builtin(format!("__base_method__.{name}")));
                         Ok(self.alloc(PyObj::BoundMethod {
                             recv: recv.clone(),
@@ -12093,24 +12174,26 @@ impl PyHost {
             // `re.Match` attributes; method names bind as callable methods.
             Some(PyObj::Match {
                 re,
+                string,
                 text,
                 spans,
                 named,
                 pos,
                 endpos,
+                ..
             }) => match name {
-                "string" => Ok(self.new_str(text.clone())),
+                "string" => Ok(string.clone()),
                 "re" => Ok(re.clone()),
-                "lastindex" => Ok(spans
-                    .iter()
-                    .rposition(|s| s.is_some())
-                    .filter(|&i| i > 0)
+                // The group that CLOSED last: the outer one of nested groups (see
+                // `PyRegex::last_closed_group`), not the highest-numbered one.
+                "lastindex" => Ok(self
+                    .match_last_group(re, spans)
                     .map(|i| Value::Int(i as i64))
                     .unwrap_or(Value::Undef)),
                 // The NAME of the `lastindex` group, `None` when that group is
                 // unnamed or no group matched.
                 "lastgroup" => {
-                    let last = spans.iter().rposition(|s| s.is_some()).filter(|&i| i > 0);
+                    let last = self.match_last_group(re, spans);
                     let name = last.and_then(|i| named.iter().find(|(_, g)| *g == i));
                     Ok(match name {
                         Some((n, _)) => self.new_str(n.clone()),
@@ -12151,6 +12234,20 @@ impl PyHost {
                 }
                 _ => Err(format!(
                     "AttributeError: 're.Match' object has no attribute '{name}'"
+                )),
+            },
+            // `_sre.SRE_Scanner`: its pattern, and the two stepping methods.
+            Some(PyObj::ReScanner { pattern, .. }) => match name {
+                "pattern" => Ok(pattern.clone()),
+                "match" | "search" => {
+                    let func = self.alloc(PyObj::Builtin(format!("__base_method__.{name}")));
+                    Ok(self.alloc(PyObj::BoundMethod {
+                        recv: recv.clone(),
+                        func,
+                    }))
+                }
+                _ => Err(format!(
+                    "AttributeError: '_sre.SRE_Scanner' object has no attribute '{name}'"
                 )),
             },
             // Generic alias: expose origin/args; forward anything else to origin.
@@ -14539,6 +14636,7 @@ fn call_method_inner(
             Some(
                 PyObj::Pattern { .. }
                     | PyObj::Match { .. }
+                    | PyObj::ReScanner { .. }
                     | PyObj::Func(_)
                     | PyObj::MappingProxy { .. }
                     | PyObj::Lock { .. }
@@ -14577,6 +14675,7 @@ fn call_method_inner(
             crate::builtins::re_pattern_method(recv, name, &args, &kwargs)
         }
         Some(PyObj::Match { .. }) => crate::builtins::re_match_method(recv, name, &args),
+        Some(PyObj::ReScanner { .. }) => crate::builtins::re_scanner_method(recv, name),
         // `f.__annotate__(fmt)` as a fused method call. `__annotate__` is a plain
         // callable attribute rather than a function method, so the attribute has
         // to be resolved first (an unannotated function yields `None`, and
@@ -19308,61 +19407,69 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
             out.push(("tzname", tzname));
             out
         }),
-        // `re` — regular expressions, backed natively by the Rust `regex` crate
-        // (a linear-time NFA engine). Faithful for the common syntax
-        // (`\d \w \s`, groups, named groups, alternation, anchors, quantifiers,
-        // inline flags); features the engine lacks (backreferences, lookaround)
-        // raise `re.error` at compile, as documented.
-        "re" => with_host(|h| {
-            const FNS: &[&str] = &[
-                "compile",
-                "match",
-                "search",
-                "fullmatch",
-                "findall",
-                "finditer",
-                "sub",
-                "subn",
-                "split",
-                "escape",
-                "purge",
-            ];
-            let mut out: Vec<(&str, Value)> = FNS
-                .iter()
-                .map(|f| (*f, h.alloc(PyObj::Builtin(format!("re.{f}")))))
-                .collect();
-            // Flag constants (both long and short names).
-            for (name, bit) in [
-                ("IGNORECASE", 2i64),
-                ("I", 2),
-                ("LOCALE", 4),
-                ("L", 4),
-                ("MULTILINE", 8),
-                ("M", 8),
-                ("DOTALL", 16),
-                ("S", 16),
-                ("UNICODE", 32),
-                ("U", 32),
-                ("VERBOSE", 64),
-                ("X", 64),
-                ("ASCII", 256),
-                ("A", 256),
-                ("NOFLAG", 0),
-            ] {
-                out.push((name, Value::Int(bit)));
-            }
-            // The compile-error class. CPython 3.13 renamed it `re.PatternError`
-            // and kept `re.error` as an ALIAS of the same object, so `__name__`
-            // is `'PatternError'` and `re.PatternError is re.error` is True —
-            // one allocation bound under both names, never two.
-            let pat_err = h.alloc(PyObj::Builtin("re.PatternError".into()));
-            out.push(("PatternError", pat_err.clone()));
-            out.push(("error", pat_err));
-            // The `Pattern`/`Match` type objects (`isinstance(m, re.Match)`).
-            out.push(("Pattern", h.alloc(PyObj::Builtin("re.Pattern".into()))));
-            out.push(("Match", h.alloc(PyObj::Builtin("re.Match".into()))));
-            out
-        }),
+        // `re` — regular expressions, backed natively by `src/regexpr.rs` (the
+        // linear-time `regex` crate, with `fancy_regex` taking the patterns that
+        // need look-around or backreferences). `Scanner` is CPython's own Python
+        // class, run from `stdlib::pyre` on top of the native `Pattern.scanner`.
+        "re" => {
+            let mut entries = with_host(|h| {
+                const FNS: &[&str] = &[
+                    "compile",
+                    "match",
+                    "search",
+                    "fullmatch",
+                    "findall",
+                    "finditer",
+                    "sub",
+                    "subn",
+                    "split",
+                    "escape",
+                    "purge",
+                ];
+                let mut out: Vec<(&str, Value)> = FNS
+                    .iter()
+                    .map(|f| (*f, h.alloc(PyObj::Builtin(format!("re.{f}")))))
+                    .collect();
+                // Flag constants (both long and short names).
+                for (name, bit) in [
+                    ("IGNORECASE", 2i64),
+                    ("I", 2),
+                    ("LOCALE", 4),
+                    ("L", 4),
+                    ("MULTILINE", 8),
+                    ("M", 8),
+                    ("DOTALL", 16),
+                    ("S", 16),
+                    ("UNICODE", 32),
+                    ("U", 32),
+                    ("VERBOSE", 64),
+                    ("X", 64),
+                    ("ASCII", 256),
+                    ("A", 256),
+                    ("NOFLAG", 0),
+                ] {
+                    out.push((name, Value::Int(bit)));
+                }
+                // The compile-error class. CPython 3.13 renamed it `re.PatternError`
+                // and kept `re.error` as an ALIAS of the same object, so `__name__`
+                // is `'PatternError'` and `re.PatternError is re.error` is True —
+                // one allocation bound under both names, never two.
+                let pat_err = h.alloc(PyObj::Builtin("re.PatternError".into()));
+                out.push(("PatternError", pat_err.clone()));
+                out.push(("error", pat_err));
+                // The `Pattern`/`Match` type objects (`isinstance(m, re.Match)`).
+                out.push(("Pattern", h.alloc(PyObj::Builtin("re.Pattern".into()))));
+                out.push(("Match", h.alloc(PyObj::Builtin("re.Match".into()))));
+                out
+            });
+            let helper = run_vendored_module(
+                "re._scanner",
+                crate::stdlib::pyre::module_source(),
+                std::path::Path::new("<re._scanner>"),
+            )?;
+            entries.push(("Scanner", with_host(|h| h.get_attr(&helper, "Scanner"))?));
+            entries
+        }
         // `errno` — the platform error numbers (from libc) plus the `errorcode`
         // {number: name} map. A pure constants C-ext, correct natively on any
         // build.

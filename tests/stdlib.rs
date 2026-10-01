@@ -1524,6 +1524,196 @@ fn re_positions_count_codepoints_not_bytes() {
 }
 
 #[test]
+fn re_lastindex_is_the_group_that_closed_last() {
+    // `_sre.c` sets `lastindex` each time a group CLOSES, so an enclosing group
+    // (whose `)` comes after the inner one's) wins over the groups inside it —
+    // not the highest-numbered group that took part. Each value is CPython
+    // 3.14's: nested `((a)b)` and `((a))` name the outer group; sibling groups
+    // ending together name the later one; alternation inside a repeat names
+    // whichever closed in the last iteration; a `#` comment under VERBOSE and a
+    // `(` inside a class open no group.
+    assert_eq!(
+        g(
+            r#"import re
+x = [re.match(p, s).lastindex for p, s in [
+    (r'((a)b)', 'ab'), (r'((a))', 'a'), (r'(a)(b*)', 'a'),
+    (r'(?:(a)|(b))+', 'ba'), (r'(a)(?:(b)|c)', 'ac'),
+    ("(?x) ( a # (c)\n ) (b)", 'ab'), (r'[(](a)', '(a')]]"#,
+            "x"
+        ),
+        "[1, 1, 2, 1, 1, 2, 1]"
+    );
+    assert_eq!(
+        g(
+            "import re\nx = re.match(r'(?P<x>(?P<y>a)b)c', 'abc').lastgroup",
+            "x"
+        ),
+        "'x'"
+    );
+}
+
+#[test]
+fn re_matches_bytes_subjects() {
+    // A bytes pattern runs over any bytes-like subject and reports BYTE
+    // offsets: 'aéb' is 4 bytes, so `b` is at 3. Groups come back as `bytes`
+    // even from a `bytearray`, while `m.string` is the subject itself.
+    assert_eq!(
+        g(
+            "import re\nx = re.search(rb'b', 'a\u{e9}b'.encode()).span()",
+            "x"
+        ),
+        "(3, 4)"
+    );
+    assert_eq!(
+        g(
+            "import re\nm = re.search(b'(a)', bytearray(b'xa'))\nx = (m.group(), m[1], m.string)",
+            "x"
+        ),
+        "(b'a', b'a', bytearray(b'xa'))"
+    );
+    assert_eq!(
+        g(
+            r#"import re
+x = (re.findall(rb'\d+', b'a1b22'), re.split(rb'(,)', b'a,b'),
+     re.subn(b'(b)', rb'[\1]', bytearray(b'abab')))"#,
+            "x"
+        ),
+        "([b'1', b'22'], [b'a', b',', b'b'], (b'a[b]a[b]', 2))"
+    );
+    assert_eq!(
+        g("import re\nx = re.compile(b'a\\'\"')", "x"),
+        r#"re.compile(b'a\'"')"#
+    );
+    // A bytes pattern is always ASCII: `\w`, `\s` and IGNORECASE stop at
+    // 0x7F, so 0xE9 ('é' in latin-1) is no word character, 0xA0/0x85 are no
+    // space, and 0xE9 does not fold to 0xC9 — in a literal, an escape or a
+    // class range. `re.ASCII` gives a str pattern the same classes.
+    assert_eq!(
+        g("import re\nx = re.search(rb'\\w+', b'\\xe9ab\\xe9')", "x"),
+        "<re.Match object; span=(1, 3), match=b'ab'>"
+    );
+    assert_eq!(
+        g(
+            r#"import re
+x = (re.findall(rb'\s', b'\xa0 \x85'), re.findall(rb'(?i)[\xe0-\xff]', b'\xc9\xe9'),
+     re.findall(rb'(?i)\xe9', b'\xc9\xe9'), re.findall(rb'(?i)[^a]', b'aAb'),
+     re.findall(r'\w+', 'é1a', re.A))"#,
+            "x"
+        ),
+        "([b' '], [b'\\xe9'], [b'\\xe9'], [b'b'], ['1a'])"
+    );
+    // Mixing kinds is CPython's TypeError, and so is a replacement of the
+    // wrong kind — reported where `_sre.c` joins the pieces, by index.
+    assert_eq!(
+        err("import re\nre.search('a', b'a')"),
+        "TypeError: cannot use a string pattern on a bytes-like object"
+    );
+    assert_eq!(
+        err("import re\nre.search(b'a', 'a')"),
+        "TypeError: cannot use a bytes pattern on a string-like object"
+    );
+    assert_eq!(
+        err("import re\nre.search('a', 1)"),
+        "TypeError: expected string or bytes-like object, got 'int'"
+    );
+    // A memoryview is a subject like any bytes-like object; a released one is
+    // not readable, which `_sre.c` reports as the wrong type.
+    assert_eq!(
+        g("import re\nx = re.findall(b'a', memoryview(b'aXa'))", "x"),
+        "[b'a', b'a']"
+    );
+    assert_eq!(
+        err("import re\nm = memoryview(b'ab')\nm.release()\nre.search(b'a', m)"),
+        "TypeError: expected string or bytes-like object, got 'memoryview'"
+    );
+    assert_eq!(
+        err("import re\nre.compile(b'a', re.U)"),
+        "ValueError: cannot use UNICODE flag with a bytes pattern"
+    );
+    assert_eq!(
+        err("import re\nre.sub(b'b', 'x', b'ab')"),
+        "TypeError: sequence item 1: expected a bytes-like object, str found"
+    );
+    assert_eq!(
+        err("import re\nre.sub('b', lambda m: 3, 'ab')"),
+        "TypeError: sequence item 1: expected str instance, int found"
+    );
+    assert_eq!(
+        err("import re\nre.match(b'(a)', b'a').expand('<\\\\1>')"),
+        "TypeError: sequence item 1: expected str instance, bytes found"
+    );
+}
+
+#[test]
+fn re_finditer_steps_a_scanner() {
+    // `finditer` is `iter(pattern.scanner(s).search, None)`: a
+    // `callable_iterator` that finds each match when asked, honours
+    // `pos`/`endpos`, and keeps `_sre.c`'s empty-match rule.
+    assert_eq!(
+        g(
+            r#"import re
+it = re.finditer(r'\d', 'a1b2')
+x = (type(it).__name__, next(it).span(), [m.span() for m in it])"#,
+            "x"
+        ),
+        "('callable_iterator', (1, 2), [(3, 4)])"
+    );
+    assert_eq!(
+        g(
+            "import re\nx = [m.span() for m in re.compile('a').finditer('aXaXa', 1, 4)]",
+            "x"
+        ),
+        "[(2, 3)]"
+    );
+    assert_eq!(
+        g(
+            "import re\nx = [m.group() for m in re.finditer('x*', 'abxd')]",
+            "x"
+        ),
+        "['', '', 'x', '', '']"
+    );
+    // The scanner itself: `search()` resumes where the last match ended, and
+    // answers `None` once the subject is exhausted.
+    assert_eq!(
+        g(
+            r#"import re
+sc = re.compile(r'\d+|x*').scanner('12x 3')
+x = ([None if m is None else m.span() for m in [sc.search() for _ in range(6)]],
+     type(sc).__name__)"#,
+            "x"
+        ),
+        "([(0, 2), (2, 3), (3, 3), (4, 5), (5, 5), None], 'SRE_Scanner')"
+    );
+}
+
+#[test]
+fn re_scanner_runs_a_lexicon() {
+    // `re.Scanner` tries each lexicon phrase in order and hands the matched
+    // text to that phrase's action; `None` drops the token, and the unscanned
+    // rest comes back with the results. A phrase with groups of its own still
+    // routes to its own action, and `s.match` is the match being handled.
+    assert_eq!(
+        g(
+            r#"import re
+sc = re.Scanner([(r'[a-z]+', lambda s, t: ('ID', t)), (r'\d+', lambda s, t: int(t)),
+                 (r'\s+', None), (r'(=)(=)?', lambda s, t: ('OP', t, s.match.lastindex))])
+x = (sc.scan('foo 12 == x = 7 ?rest'), re.Scanner.__module__, sorted(vars(sc)))"#,
+            "x"
+        ),
+        "(([('ID', 'foo'), 12, ('OP', '==', 4), ('ID', 'x'), ('OP', '=', 4), 7], '?rest'), 're', ['lexicon', 'match', 'scanner'])"
+    );
+    assert_eq!(
+        g(
+            r#"import re
+x = (re.Scanner([(rb'\d+', lambda s, t: int(t)), (rb' ', None)]).scan(b'1 23'),
+     re.Scanner([(r'a  # x', 'A'), (r'b', 'B')], re.X).scan('abz'))"#,
+            "x"
+        ),
+        "(([1, 23], b''), (['A', 'B'], 'z'))"
+    );
+}
+
+#[test]
 fn large_integers_compare_exactly() {
     // Equality on integers must be exact at any size. Comparing through `f64` made
     // any two integers within one ULP equal — at 29 digits that is a gap of

@@ -11,8 +11,17 @@
 //! same crate) only for the patterns `regex` rejects. The fallback is per-pattern
 //! and decided once, at compile time — matching never pays for the check.
 
-/// A compiled pattern, on whichever engine could take it.
-pub enum PyRegex {
+/// A compiled pattern: the engine that took it, plus the pattern-text position
+/// of every capture group's closing paren (see [`PyRegex::last_closed_group`]).
+pub struct PyRegex {
+    engine: Engine,
+    /// `closes[g]` is the char index of group `g`'s `)` in the compiled
+    /// pattern; index 0 (the whole match) is unused.
+    closes: Vec<usize>,
+}
+
+/// Whichever engine could take the pattern.
+enum Engine {
     Fast(regex::Regex),
     Fancy(fancy_regex::Regex),
 }
@@ -66,35 +75,33 @@ impl PyRegex {
     /// error — the fast engine's message describes the pattern the caller wrote,
     /// while the fallback's would describe a construct it also could not parse.
     pub fn new(pattern: &str) -> Result<Self, String> {
-        let fast_err = match regex::Regex::new(pattern) {
-            Ok(re) => return Ok(PyRegex::Fast(re)),
-            Err(e) => e,
+        let engine = match regex::Regex::new(pattern) {
+            Ok(re) => Engine::Fast(re),
+            Err(fast_err) => match fancy_regex::Regex::new(&fancy_spelling(pattern)) {
+                Ok(re) => Engine::Fancy(re),
+                Err(_) => return Err(last_line(&fast_err.to_string())),
+            },
         };
-        match fancy_regex::Regex::new(pattern) {
-            Ok(re) => Ok(PyRegex::Fancy(re)),
-            Err(_) => Err(last_line(&fast_err.to_string())),
-        }
+        Ok(PyRegex {
+            engine,
+            closes: group_closes(pattern),
+        })
     }
 
     /// Number of capture groups plus one (group 0, the whole match).
     pub fn captures_len(&self) -> usize {
-        match self {
-            PyRegex::Fast(re) => re.captures_len(),
-            PyRegex::Fancy(re) => re.captures_len(),
+        match &self.engine {
+            Engine::Fast(re) => re.captures_len(),
+            Engine::Fancy(re) => re.captures_len(),
         }
     }
 
     /// `(name, index)` for each named group, in pattern order.
     pub fn named_groups(&self) -> Vec<(String, usize)> {
-        match self {
-            PyRegex::Fast(re) => named_from(re.capture_names()),
-            PyRegex::Fancy(re) => named_from(re.capture_names()),
+        match &self.engine {
+            Engine::Fast(re) => named_from(re.capture_names()),
+            Engine::Fancy(re) => named_from(re.capture_names()),
         }
-    }
-
-    /// Spans of the leftmost match at or after the start of `text`.
-    pub fn first_captures(&self, text: &str) -> Option<Spans> {
-        self.captures_at(text, 0)
     }
 
     /// Spans of the leftmost match starting at or after byte `start`, searched
@@ -104,11 +111,11 @@ impl PyRegex {
     /// `'a'` would have matched.
     pub fn captures_at(&self, text: &str, start: usize) -> Option<Spans> {
         let n = self.captures_len();
-        match self {
-            PyRegex::Fast(re) => re.captures_at(text, start).map(|c| collect_spans(&c, n)),
+        match &self.engine {
+            Engine::Fast(re) => re.captures_at(text, start).map(|c| collect_spans(&c, n)),
             // A backtracking match can fail at runtime (catastrophic backtracking
             // hits the step limit); treat that as "no match" rather than a panic.
-            PyRegex::Fancy(re) => re
+            Engine::Fancy(re) => re
                 .captures_from_pos(text, start)
                 .ok()
                 .flatten()
@@ -116,46 +123,183 @@ impl PyRegex {
         }
     }
 
-    /// Spans of every non-overlapping match, left to right, under CPython's
-    /// (3.7+) rule for empty matches — the one `findall`, `finditer`, `sub` and
-    /// `split` all share in `_sre.c`: after an EMPTY match the next one may not
-    /// be empty at the same position (`must_advance`), but after a NON-empty
-    /// match an empty one may sit right where it ended. Both engines' own
-    /// iterators refuse that second case, so `re.sub('x*', '-', 'abxd')` gave
-    /// `-a-b-d-` where CPython gives `-a-b--d-`.
+    /// One step of a left-to-right scan: the leftmost match at or after byte
+    /// `pos`, under CPython's (3.7+) rule for empty matches — the one
+    /// `findall`, `finditer`, `sub`, `split` and the `scanner` object all share
+    /// in `_sre.c`. `must_advance` is `_sre.c`'s flag of that name, set when
+    /// the previous match was EMPTY: the next one may then not be empty at the
+    /// same position. After a NON-empty match an empty one may sit right where
+    /// it ended, which both engines' own iterators refuse, so
+    /// `re.sub('x*', '-', 'abxd')` gave `-a-b-d-` where CPython gives `-a-b--d-`.
+    pub fn search_from(&self, text: &str, pos: usize, must_advance: bool) -> Option<Spans> {
+        let spans = self.captures_at(text, pos)?;
+        let (s, e) = spans.first().copied().flatten()?;
+        if !(must_advance && s == pos && e == pos) {
+            return Some(spans);
+        }
+        // The engines cannot be asked for "a match that is not empty here", so
+        // resume one character on — the same stand-in their own iterators use.
+        let next = pos + text[pos..].chars().next()?.len_utf8();
+        self.captures_at(text, next)
+    }
+
+    /// Spans of every non-overlapping match, left to right (see
+    /// [`PyRegex::search_from`] for the empty-match rule).
     pub fn all_captures(&self, text: &str) -> Vec<Spans> {
         let mut out = Vec::new();
         let mut pos = 0usize;
         let mut must_advance = false;
         while pos <= text.len() {
-            let Some(mut spans) = self.captures_at(text, pos) else {
+            let Some(spans) = self.search_from(text, pos, must_advance) else {
                 break;
             };
-            let Some((mut s, mut e)) = spans.first().copied().flatten() else {
+            let Some((s, e)) = spans.first().copied().flatten() else {
                 break;
             };
-            if must_advance && s == pos && e == pos {
-                // The engines cannot be asked for "a match that is not empty
-                // here", so resume one character on — the same stand-in their
-                // own iterators use.
-                let Some(next) = text[pos..].chars().next().map(|c| pos + c.len_utf8()) else {
-                    break;
-                };
-                let Some(retry) = self.captures_at(text, next) else {
-                    break;
-                };
-                spans = retry;
-                let Some(span) = spans.first().copied().flatten() else {
-                    break;
-                };
-                (s, e) = span;
-            }
             must_advance = s == e;
             pos = e;
             out.push(spans);
         }
         out
     }
+
+    /// `Match.lastindex`: the capture group that CLOSED last in the match, or
+    /// `None` when no group took part.
+    ///
+    /// `_sre.c` records it as the match runs — every time a group's closing
+    /// mark is set, that group becomes `lastindex` — so for nested groups the
+    /// OUTER one wins (`re.match('((a)b)', 'ab').lastindex` is 1, not 2): the
+    /// inner group closes first. Neither engine reports the order in which
+    /// groups closed, so it is reconstructed from the result: a group that
+    /// ends later closed later, and between groups that end at the same
+    /// position the one whose `)` comes later in the pattern closed later
+    /// (an enclosing group's `)` follows every `)` nested inside it, and of two
+    /// sibling groups the second closes second). That reconstruction is exact
+    /// for a match that moves forward through the subject; a group closed
+    /// inside a look-ahead is the case it cannot see, since the look-ahead
+    /// reaches past positions the match closes later groups at.
+    pub fn last_closed_group(&self, spans: &Spans) -> Option<usize> {
+        spans
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter_map(|(g, span)| span.map(|(_, end)| (end, self.closes.get(g).copied(), g)))
+            .max()
+            .map(|(_, _, g)| g)
+    }
+}
+
+/// The char index of each capture group's closing `)` in an engine pattern,
+/// indexed by group number (index 0, the whole match, holds 0).
+///
+/// Group numbers are assigned the way both engines and CPython assign them:
+/// by the position of the OPENING paren, counting only capturing groups — a
+/// bare `(`, `(?P<name>` or `(?<name>`. Everything that cannot open a group is
+/// stepped over: a backslash escape, a character class (including a class
+/// nested inside one, which the crate's syntax allows), a `(?#…)` comment and,
+/// while the `x` flag is on, a `#` comment running to the end of the line.
+fn group_closes(pattern: &str) -> Vec<usize> {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut closes = vec![0];
+    // One entry per open paren: the capture group it opened (if any) and the
+    // verbose state to restore when it closes, so `(?x:…)` stays scoped.
+    let mut open: Vec<(Option<usize>, bool)> = Vec::new();
+    let mut verbose = false;
+    let mut class_depth = 0usize;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '\\' => i += 1,
+            '[' => {
+                class_depth += 1;
+                // A `]` right after the open (or after `^`) is a member.
+                if chars.get(i + 1) == Some(&'^') {
+                    i += 1;
+                }
+                if chars.get(i + 1) == Some(&']') {
+                    i += 1;
+                }
+            }
+            ']' if class_depth > 0 => class_depth -= 1,
+            _ if class_depth > 0 => {}
+            '#' if verbose => {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+            }
+            '(' if chars.get(i + 1) == Some(&'?') => {
+                let rest: String = chars[i + 2..].iter().take(3).collect();
+                if rest.starts_with('#') {
+                    while i < chars.len() && chars[i] != ')' {
+                        i += 1;
+                    }
+                } else if rest.starts_with("P<")
+                    || (rest.starts_with('<') && !rest[1..].starts_with(['=', '!']))
+                {
+                    closes.push(0);
+                    open.push((Some(closes.len() - 1), verbose));
+                } else {
+                    // An inline-flag group: `(?x)` turns the flag on for the rest
+                    // of the enclosing group, `(?x:…)` only inside its own.
+                    let flags: String = chars[i + 2..]
+                        .iter()
+                        .take_while(|ch| ch.is_ascii_alphabetic() || **ch == '-')
+                        .collect();
+                    let after = chars.get(i + 2 + flags.chars().count());
+                    let sets_x = flags.split('-').next().is_some_and(|on| on.contains('x'));
+                    let clears_x = flags.split('-').nth(1).is_some_and(|off| off.contains('x'));
+                    let flagged = (verbose || sets_x) && !clears_x;
+                    if after == Some(&')') {
+                        // Applies to the enclosing group from here on; the paren
+                        // itself opens and closes nothing.
+                        verbose = flagged;
+                        i += 2 + flags.chars().count();
+                    } else {
+                        open.push((None, verbose));
+                        if after == Some(&':') {
+                            verbose = flagged;
+                        }
+                    }
+                }
+            }
+            '(' => {
+                closes.push(0);
+                open.push((Some(closes.len() - 1), verbose));
+            }
+            ')' => {
+                if let Some((group, outer_verbose)) = open.pop() {
+                    if let Some(g) = group {
+                        closes[g] = i;
+                    }
+                    verbose = outer_verbose;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    closes
+}
+
+/// The pattern as `fancy_regex` must be given it. The ASCII rewrite in
+/// `builtins.rs` spells `re.ASCII`'s word boundaries as the crate's
+/// `(?-u:\b)`/`(?-u:\B)`, and `fancy_regex` cannot turn Unicode off, so for
+/// it they become the equivalent look-around over the ASCII word class.
+/// Python has no `(?-u:` syntax, so these sequences come only from that
+/// rewrite.
+fn fancy_spelling(pattern: &str) -> std::borrow::Cow<'_, str> {
+    if !pattern.contains("(?-u:\\") {
+        return std::borrow::Cow::Borrowed(pattern);
+    }
+    const W: &str = "[0-9A-Za-z_]";
+    let boundary = format!("(?:(?<={W})(?!{W})|(?<!{W})(?={W}))");
+    let not_boundary = format!("(?:(?<={W})(?={W})|(?<!{W})(?!{W}))");
+    std::borrow::Cow::Owned(
+        pattern
+            .replace("(?-u:\\b)", &boundary)
+            .replace("(?-u:\\B)", &not_boundary),
+    )
 }
 
 fn named_from<'a>(names: impl Iterator<Item = Option<&'a str>>) -> Vec<(String, usize)> {
