@@ -1673,10 +1673,14 @@ impl PyrsCallable {
     /// wraps-assigned attribute wins over the delegate. A dunder the target
     /// lacks becomes `AttributeError` (which `update_wrapper` silently skips).
     fn __getattr__(&self, py: Python, name: String) -> PyResult<Py<PyAny>> {
-        match with_host(|h| h.get_attr(&self.target, &name)) {
+        // Through the descriptor-aware read, outside the host borrow: a lazy
+        // `__annotations__` runs user code, and its `NameError` must reach
+        // CPython as itself rather than as a missing attribute.
+        match crate::builtins::raw_getattr(&self.target, &name) {
             Ok(v) => with_host(|h| value_to_py(h, py, &v))
                 .map(|b| b.unbind())
                 .map_err(pyo3::exceptions::PyRuntimeError::new_err),
+            Err(e) if !e.starts_with("AttributeError") => Err(call_err(e)),
             Err(e) => Err(pyo3::exceptions::PyAttributeError::new_err(e)),
         }
     }

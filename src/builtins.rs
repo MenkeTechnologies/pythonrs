@@ -397,6 +397,7 @@ pub(crate) fn raw_getattr(recv: &Value, name: &str) -> Result<Value, String> {
             }
             Ok(value)
         }
+        host::AttrGet::Annotations { func } => host::function_annotations(&func),
         host::AttrGet::Plain => with_host(|h| h.get_attr(recv, name)),
     }
 }
@@ -1757,31 +1758,19 @@ fn b_mkfunc(vm: &mut VM, argc: u8) -> Value {
         args.split_off(split)
     };
     // The `__annotations__` are the deepest arg (always present). An unannotated
-    // func gets a plain empty dict; an annotated one gets a THUNK — evaluate it
-    // now, catching a forward-reference NameError (a self-referential annotation
-    // like typing IO's `-> IO[AnyStr]`, or a package's forward-ref type alias),
-    // leaving the annotations empty in that case rather than aborting the def.
-    let mut annotate = Value::Undef;
-    let annotations = if args.is_empty() {
-        Value::Undef
+    // func gets a plain empty dict; an annotated one gets a THUNK, its
+    // `__annotate__`, which is NOT run here: PEP 649 evaluates annotations on
+    // the first `__annotations__` read (`host::function_annotations`), so a
+    // forward reference resolves if the name exists by then and raises its
+    // `NameError` if it does not.
+    let (annotations, annotate) = if args.is_empty() {
+        (Value::Undef, Value::Undef)
     } else {
         let raw = args.remove(0);
         if with_host(|h| matches!(h.get(&raw), Some(PyObj::Func(_)))) {
-            // The compiled `__annotate__`, kept as the function's attribute and
-            // called once with `Format.VALUE` for the `__annotations__` dict.
-            annotate = raw.clone();
-            match host::invoke(&raw, vec![Value::Int(1)], vec![]) {
-                Ok(d) => d,
-                Err(e) if e.contains("NameError") => {
-                    with_host(|h| {
-                        h.take_error();
-                    });
-                    with_host(|h| h.new_dict(indexmap::IndexMap::new()))
-                }
-                Err(e) => return abort(vm, e),
-            }
+            (Value::Undef, raw)
         } else {
-            raw
+            (raw, Value::Undef)
         }
     };
     let defaults = args;

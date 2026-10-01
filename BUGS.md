@@ -55,6 +55,15 @@ written.
   same object on every read, and format 3 (`FORWARDREF`) now raises as CPython's
   does instead of answering. The parameter is CPython's `.format`, so
   `def f(x: format)` still annotates with the builtin.
+- **PEP 649 function annotations are evaluated lazily.** `MKFUNC` ran the
+  annotations function at `def` time and swallowed a `NameError`, so
+  `def g(x) -> NotYet` then `g.__annotations__` was `{}`. The compiled
+  `__annotate__` is now called with `VALUE` on the first `__annotations__` read
+  (`host::function_annotations`, outside the host borrow, also for a bound
+  method and for CPython reading a bridged function): an unresolvable name
+  raises its `NameError` on each read until it resolves, side effects happen at
+  that read, and the result is cached. `__annotate__(1)` evaluates afresh, and
+  assigning `__annotations__` makes `__annotate__` `None`, as in CPython.
 - **More than 255 operands anywhere.** `CallBuiltin` carries a `u8` operand
   count, so a call with >255 arguments, a `{**a, …}` display with >85 entries,
   a `def`/`lambda` with >252 defaults, >127 class-header keywords, and a class
@@ -1710,10 +1719,14 @@ written.
   native, so the union type has two representations that never compare `is`,
   even though the name, module, repr and messages all match. This is the general
   cross-bridge type-identity boundary, not specific to `Union`.
-- **PEP 649 forward-ref annotations do not raise.** `def g(x) -> NotYet: ...`
-  then `g.__annotations__` yields `{}`; CPython 3.14 evaluates the annotation
-  lazily on that read and raises `NameError: name 'NotYet' is not defined`.
-  Class bodies drop the unresolvable entry the same way.
+- **PEP 649: class-body annotations are evaluated eagerly.** Functions are lazy
+  (see "Implemented"), but a class body still evaluates each simple annotation
+  as it runs and drops one whose name does not resolve: `class C: x: Later`
+  then `C.__annotations__` is `{}` where CPython 3.14 evaluates on that read
+  and raises `NameError: name 'Later' is not defined` (or, once `Later`
+  exists, returns it). The class `__dict__` holds the evaluated
+  `__annotations__` where CPython holds `__annotate_func__` (and
+  `__annotations_cache__` after the first read).
 - **A `compile()` code object carries its source, not bytecode.**
   `compile(source, filename, mode)` checks the source in `exec`/`eval`/
   `single` mode — raising the positioned `SyntaxError` naming `filename` —

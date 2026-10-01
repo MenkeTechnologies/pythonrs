@@ -372,8 +372,11 @@ pub struct FuncVal {
     pub bound: Option<Value>,
     /// Owning class name (for `super()` and method identity).
     pub owner: Option<String>,
-    /// The `__annotations__` dict `{param|"return": annotation}`, built at def
-    /// time. A heap [`PyObj::Dict`] handle (empty dict for an unannotated func).
+    /// The `__annotations__` dict `{param|"return": annotation}`: a heap
+    /// [`PyObj::Dict`] handle, or `Undef` while an annotated function's
+    /// annotations have not been read yet (PEP 649: they are evaluated lazily,
+    /// by [`function_annotations`], and cached here). An unannotated function
+    /// carries its empty dict from the start.
     pub annotations: Value,
     /// The PEP 649 `__annotate__` function the compiler generated for this
     /// function's annotations (`Compiler::build_annotate`), or `Value::Undef`
@@ -1451,6 +1454,9 @@ pub enum AttrGet {
         inst: Value,
         name: String,
     },
+    /// `f.__annotations__` (or `inst.m.__annotations__`) on a function whose
+    /// annotations have not been evaluated yet: run [`function_annotations`].
+    Annotations { func: Value },
 }
 
 /// The plan for `recv.name = val` when a descriptor may intercept it.
@@ -12339,26 +12345,30 @@ impl PyHost {
             // Function introspection dunders. `C.m` yields the raw `Func`; a
             // bound `inst.m` delegates to the same underlying function.
             // `f.__annotations__` — the def-time dict `{param|"return": type}`.
-            Some(PyObj::Func(fv)) if name == "__annotations__" => {
-                let ann = fv.annotations.clone();
-                if matches!(ann, Value::Undef) {
-                    Ok(self.new_dict(IndexMap::new()))
-                } else {
-                    Ok(ann)
-                }
-            }
+            // Lazily evaluated annotations are routed out of the host borrow by
+            // `plan_attr_get` (`AttrGet::Annotations`), so only an evaluated
+            // (or unannotated) function's dict is read here.
+            Some(PyObj::Func(fv)) if name == "__annotations__" => match fv.annotations {
+                Value::Undef => Err(
+                    "RuntimeError: function annotations read inside the host borrow".into(),
+                ),
+                ref ann => Ok(ann.clone()),
+            },
             // `f.__annotate__` (PEP 649): the compiler-generated function that
             // produces the annotations for a requested format, or `None` on an
-            // unannotated function. CPython 3.14's
+            // unannotated function or once `__annotations__` was assigned (as
+            // CPython's `func_set_annotations` clears it). CPython 3.14's
             // `functools.singledispatch.register` gates on its presence before
             // reading the first parameter's type.
-            Some(PyObj::Func(fv)) if name == "__annotate__" => Ok(fv.annotate.clone()),
+            Some(PyObj::Func(fv)) if name == "__annotate__" => {
+                let assigned = matches!(recv, Value::Obj(id)
+                    if self.func_attrs.get(id).is_some_and(|m| m.contains_key("__annotations__")));
+                Ok(if assigned { Value::Undef } else { fv.annotate.clone() })
+            }
             Some(PyObj::BoundMethod { func, .. }) if name == "__annotations__" => {
                 let func = func.clone();
                 match self.get(&func) {
-                    Some(PyObj::Func(fv)) if !matches!(fv.annotations, Value::Undef) => {
-                        Ok(fv.annotations.clone())
-                    }
+                    Some(PyObj::Func(_)) => self.get_attr(&func, name),
                     _ => Ok(self.new_dict(IndexMap::new())),
                 }
             }
@@ -13171,9 +13181,28 @@ impl PyHost {
         Some(v)
     }
 
+    /// Whether `func` is a function whose `__annotations__` still have to be
+    /// evaluated: annotated, never read, and not assigned over.
+    fn annotations_pending(&self, func: &Value) -> bool {
+        let assigned = matches!(func, Value::Obj(id)
+            if self.func_attrs.get(id).is_some_and(|m| m.contains_key("__annotations__")));
+        !assigned
+            && matches!(self.get(func), Some(PyObj::Func(fv))
+                if matches!(fv.annotations, Value::Undef) && !matches!(fv.annotate, Value::Undef))
+    }
+
     /// Plan reading `recv.name`, honoring the descriptor protocol (`property`
     /// and user `__get__` descriptors). See [`AttrGet`].
     pub fn plan_attr_get(&mut self, recv: &Value, name: &str) -> AttrGet {
+        if name == "__annotations__" {
+            let func = match self.get(recv) {
+                Some(PyObj::BoundMethod { func, .. }) => func.clone(),
+                _ => recv.clone(),
+            };
+            if self.annotations_pending(&func) {
+                return AttrGet::Annotations { func };
+            }
+        }
         // `super().<name>` resolves along the MRO strictly after `owner`. If it
         // lands on a `property`, route through the out-of-borrow getter path so
         // `super().some_property` invokes its fget (methods/plain attrs fall
@@ -13742,6 +13771,25 @@ impl PyHost {
 }
 
 // ── call machinery (free functions: run user chunks, so hold no host borrow) ──
+
+/// `func.__annotations__` for an annotated function not read yet (PEP 649):
+/// call its `__annotate__(VALUE)` and cache the dict on the function, as
+/// CPython's `func_get_annotations` does. An unresolvable name raises its
+/// `NameError` here, on every read until it resolves.
+pub fn function_annotations(func: &Value) -> Result<Value, String> {
+    let thunk = with_host(|h| match h.get(func) {
+        Some(PyObj::Func(fv)) => fv.annotate.clone(),
+        _ => Value::Undef,
+    });
+    // `Format.VALUE` (1).
+    let dict = invoke(&thunk, vec![Value::Int(1)], vec![])?;
+    with_host(|h| {
+        if let Some(PyObj::Func(fv)) = h.get_mut(func) {
+            Rc::make_mut(fv).annotations = dict.clone();
+        }
+    });
+    Ok(dict)
+}
 
 /// Invoke any callable value with positional + keyword arguments.
 pub fn invoke(

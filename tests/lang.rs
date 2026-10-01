@@ -1156,11 +1156,12 @@ fn typing_type_var_core() {
     );
 }
 
-// Forward references in annotations no longer abort a definition: a function or
+// Forward references in annotations do not abort a definition: a function or
 // class-body annotation that names something not yet bound is compiled as a
-// thunk whose forward-reference NameError is caught (the entry is dropped),
-// while a resolvable annotation still records the real object. Common in
-// third-party packages (tomli, dataclass-heavy code).
+// thunk. A function's runs on the first `__annotations__` read (PEP 649), which
+// raises the NameError as CPython 3.14 does; a class body's forward-ref entry is
+// still dropped (see BUGS.md). Common in third-party packages (tomli,
+// dataclass-heavy code).
 #[test]
 fn forward_reference_annotations_tolerated() {
     // Resolvable function annotations stay real objects.
@@ -1171,13 +1172,11 @@ fn forward_reference_annotations_tolerated() {
         ),
         "{'a': <class 'int'>, 'return': <class 'str'>}",
     );
-    // A forward-ref function annotation leaves annotations empty, not a crash.
+    // A forward-ref function annotation defines fine and raises on the read.
+    assert_eq!(g("def g(x) -> NotYet:\n    return x\nx = g(1)", "x"), "1");
     assert_eq!(
-        g(
-            "def g(x) -> NotYet:\n    return x\ny = g.__annotations__\nx = y",
-            "x"
-        ),
-        "{}"
+        eval_str("def g(x) -> NotYet:\n    return x\ny = g.__annotations__").unwrap_err(),
+        "NameError: name 'NotYet' is not defined"
     );
     // Class body: resolvable kept, forward-ref dropped.
     let cls = "class C:\n    a: int\n    b: Later\n    c: str = 'z'\nx = sorted(C.__annotations__)";
@@ -9545,5 +9544,41 @@ fn more_than_255_operands_are_accepted_everywhere() {
         "((300, 44850, 0, 0), (300, 299, ['k0', 'k1']), (0, 0, 200, 19900), \
          (152, 1, 149, 2, ['x', 'e0', 'e1']), (268, 1009, 260, 10), (259, 264), 140, \
          (0, 259), ['m260', 'm261'])"
+    );
+}
+
+// PEP 649: a function's annotations are evaluated on the first
+// `__annotations__` read, not at `def` time — an unresolvable name raises its
+// `NameError` there (and on every read until it resolves), then the dict is
+// cached; `__annotate__(1)` evaluates afresh. Expected values are CPython 3.14's.
+#[test]
+fn function_annotations_are_evaluated_lazily() {
+    let src = "log = []\n\
+               def g(x) -> NotYet: ...\n\
+               def h(x: log.append('side')): pass\n\
+               log.append('defined')\n\
+               try:\n    g.__annotations__\n\
+               except NameError as e:\n    log.append(str(e))\n\
+               try:\n    g.__annotate__(1)\n\
+               except NameError as e:\n    log.append(str(e))\n\
+               NotYet = int\n\
+               a = g.__annotations__\n\
+               log.append(h.__annotations__)\n\
+               class K:\n    def m(self, a: Later) -> None: pass\n\
+               try:\n    K().m.__annotations__\n\
+               except NameError as e:\n    log.append(str(e))\n\
+               Later = float\n\
+               def w(x: int): pass\n\
+               w.__annotations__ = {'z': 1}\n\
+               def u(x): pass\n\
+               x = (log, a, a is g.__annotations__, g.__annotate__(1) is a,\n\
+               \x20    K().m.__annotations__, w.__annotations__, w.__annotate__,\n\
+               \x20    u.__annotations__, u.__annotate__)";
+    assert_eq!(
+        g(src, "x"),
+        "(['defined', \"name 'NotYet' is not defined\", \"name 'NotYet' is not defined\", \
+         'side', {'x': None}, \"name 'Later' is not defined\"], \
+         {'return': <class 'int'>}, True, False, \
+         {'a': <class 'float'>, 'return': None}, {'z': 1}, None, {}, None)"
     );
 }
