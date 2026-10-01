@@ -1764,7 +1764,15 @@ measured inside it, recorded so the next round does not re-derive them.
   (debug build) `JitCompiler::is_block_eligible` is 93 of 1984 main-thread
   samples (4.7%), of which 51 are `RandomState`/SipHash hashing the 9-byte
   `(op_hash, strict)` key. Nothing on the pythonrs side can reach the field or
-  skip the reset: `reset` is the only public way to reuse a VM.
+  skip the reset in the fusevm pythonrs depends on: there `reset` is the only
+  public way to reuse a VM. **Fixed upstream, not yet consumable:** fusevm main
+  (`a5aa777edf`) adds `VM::rewind`, which restarts the chunk the VM already
+  holds and keeps the eligibility memo (`reset` now delegates to it after
+  clearing the per-chunk memos). What remains is on this side and needs a
+  fusevm crates.io release containing it: bump the `fusevm` requirement and
+  replace the `std::mem::take` + `vm.reset(own)` pair in `run_chunk_cached`
+  with `vm.rewind()`. With fusevm main patched in locally, that one-line swap
+  passes `lang`/`runtime`/`stdlib`/`opcodes`/`parity`.
 
 ## Tooling
 - **`--build`** (AOT to a standalone native executable): implemented for the
