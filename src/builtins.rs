@@ -27,6 +27,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::MKLIST, b_mklist);
     vm.register_builtin(ops::MKTUPLE, b_mktuple);
     vm.register_builtin(ops::MKSET, b_mkset);
+    vm.register_builtin(ops::MKSET_CONST, b_mkset_const);
     vm.register_builtin(ops::MKDICT, b_mkdict);
     vm.register_builtin(ops::EXTEND_LIST, b_extend_list);
     vm.register_builtin(ops::EXTEND_TUPLE, b_extend_tuple);
@@ -917,6 +918,21 @@ fn b_mkset(vm: &mut VM, argc: u8) -> Value {
         }
     }
     with_host(|h| h.new_set(set))
+}
+
+/// A constant set display (`{1, 2, 3, 10, 20}`). CPython folds it to `BUILD_SET 0;
+/// LOAD_CONST frozenset(...); SET_UPDATE`: the constant frozenset is built
+/// element by element, and the display is a presized set-to-set merge of it.
+fn b_mkset_const(vm: &mut VM, argc: u8) -> Value {
+    let display = b_mkset(vm, argc);
+    with_host(|h| {
+        if let Some((folded, start)) = h.set_layout_of(&display) {
+            let empty = IndexMap::new();
+            let n = folded.len();
+            h.set_relayout_after_merge(&display, (&empty, host::SET_MINSIZE), n, Some((&folded, start)));
+        }
+    });
+    display
 }
 
 fn b_mkdict(vm: &mut VM, argc: u8) -> Value {
@@ -3102,6 +3118,19 @@ fn inplace_builtin(tag: i64, a: &Value, b: &Value) -> Option<Result<Value, Strin
             Some(y) => y,
             None => return Some(Err(unsupported_operand(iop_symbol(tag), a, b))),
         };
+        if tag == iop::BITAND && with_host(|h| h.set_intersection_update(a, b)) {
+            return Some(Ok(a.clone()));
+        }
+        // `s ^= t` walks `t` in ITERATION order, discarding or adding each element.
+        let y: IndexMap<PKey, Value> = match with_host(|h| h.set_entries_in_order(b)) {
+            Some(entries) if tag == iop::BITXOR => entries.into_iter().collect(),
+            _ => y,
+        };
+        // `s |= t` is `set_update_internal(s, t)`: a presized set-to-set merge.
+        let merge = match tag {
+            iop::BITOR => set_merge_source(b).map(|m| (m, with_host(|h| h.set_layout_of(a)))),
+            _ => None,
+        };
         with_host(|h| {
             if let Some(PyObj::Set(x)) = h.get_mut(a) {
                 match tag {
@@ -3130,6 +3159,9 @@ fn inplace_builtin(tag: i64, a: &Value, b: &Value) -> Option<Result<Value, Strin
                 }
             }
         });
+        if let Some(((incoming, src), Some(before))) = merge {
+            with_host(|h| h.set_relayout_after_merge(a, (&before.0, before.1), incoming, src_ref(&src)));
+        }
         return Some(Ok(a.clone()));
     }
     None
@@ -5195,8 +5227,8 @@ pub fn py_repr(v: &Value) -> Result<String, String> {
             Some(Cont::Tuple(l.clone(), nt))
         }
         // Element order follows CPython's set hash-table layout (int subset).
-        Some(PyObj::Set(s)) => Some(Cont::Set(h.set_ordered_values(s))),
-        Some(PyObj::Frozenset(s)) => Some(Cont::Frozenset(h.set_ordered_values(s))),
+        Some(PyObj::Set(s)) => Some(Cont::Set(h.set_ordered_values(v, s))),
+        Some(PyObj::Frozenset(s)) => Some(Cont::Frozenset(h.set_ordered_values(v, s))),
         Some(PyObj::Dict(d)) => {
             let meta = match v {
                 Value::Obj(i) => h.dict_meta.get(i).map(|m| (m.kind, m.factory.clone())),
@@ -6867,11 +6899,15 @@ pub fn call_builtin_function(
                 })?;
                 host::set_put(&mut s, k, it);
             }
-            if name == "frozenset" {
-                Ok(with_host(|h| h.new_frozenset(s)))
-            } else {
-                Ok(with_host(|h| h.new_set(s)))
-            }
+            let merged_from = args.first().and_then(set_merge_source);
+            Ok(with_host(|h| {
+                let out = h.new_setlike(s, name == "frozenset");
+                if let Some((incoming, src)) = merged_from {
+                    let empty = IndexMap::new();
+                    h.set_relayout_after_merge(&out, (&empty, host::SET_MINSIZE), incoming, src_ref(&src));
+                }
+                out
+            }))
         }
         "dict" => construct_dict(&args, &kwargs),
         "complex" => {
@@ -17586,6 +17622,7 @@ fn set_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
                 if let Some(PyObj::Set(s)) = h.get_mut(recv) {
                     s.clear();
                 }
+                h.set_forget_layout(recv);
             });
             Ok(Value::Undef)
         }
@@ -17629,17 +17666,28 @@ fn set_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
                 set_keys(h, recv).iter().all(|k| !other.contains(k))
             })))
         }
+        // `set_copy` is `set_update_internal` into a new empty set, so the copy
+        // gets the presized table a set-to-set merge makes.
         "copy" => {
             let (s, frozen) = with_host(|h| match h.get(recv) {
                 Some(PyObj::Set(s)) => (s.clone(), false),
                 Some(PyObj::Frozenset(s)) => (s.clone(), true),
                 _ => (IndexMap::new(), false),
             });
-            Ok(with_host(|h| h.new_setlike(s, frozen)))
+            let src = set_merge_source(recv);
+            Ok(with_host(|h| {
+                let out = h.new_setlike(s, frozen);
+                if let Some((incoming, src)) = src {
+                    let empty = IndexMap::new();
+                    h.set_relayout_after_merge(&out, (&empty, host::SET_MINSIZE), incoming, src_ref(&src));
+                }
+                out
+            }))
         }
         // Variadic: `s.update(*others)` folds in every iterable argument.
         "update" => {
             for a in args {
+                let merge = set_merge_source(a).map(|m| (m, with_host(|h| h.set_layout_of(recv))));
                 let items = host::iter_vec(a)?;
                 for it in items {
                     // Same keying as `add`: a user `__hash__` must run outside the
@@ -17655,13 +17703,24 @@ fn set_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
                         }
                     });
                 }
+                if let Some(((incoming, src), Some(before))) = merge {
+                    with_host(|h| {
+                        h.set_relayout_after_merge(recv, (&before.0, before.1), incoming, src_ref(&src))
+                    });
+                }
             }
             Ok(Value::Undef)
         }
+        // `set_pop` takes the first live slot from its search finger, which for a
+        // table nothing was popped from is the first element in iteration order.
         "pop" => with_host(|h| {
+            let first = h.set_entries_in_order(recv).and_then(|e| e.into_iter().next());
             if let Some(PyObj::Set(s)) = h.get_mut(recv) {
-                match s.pop() {
-                    Some((_, v)) => Ok(v),
+                match first {
+                    Some((k, v)) => {
+                        s.shift_remove(&k);
+                        Ok(v)
+                    }
                     // Built through `key_error` so `.args` holds the bare
                     // message. Baking the quotes into the literal made the arg
                     // `"'pop from an empty set'"`, and `KeyError.__str__` reprs
@@ -17775,6 +17834,24 @@ fn set_binop(recv: &Value, args: &[Value], tag: i64) -> Result<Value, String> {
 /// Variadic set fold (`union`/`intersection`): apply `tag` between the receiver
 /// and every argument in turn, coercing non-set arguments to sets. With no
 /// arguments it returns a copy of the receiver (preserving set/frozenset type).
+/// A set layout as [`host::PyHost::set_layout_of`] hands it out.
+type SetLayout = (IndexMap<PKey, Value>, usize);
+
+/// What `set_update_internal` folds in with ONE presizing resize rather than
+/// element by element: a set or frozenset, or an exact `dict`. Gives the
+/// source's length and, for a set, its layout. `None` for any other iterable.
+fn set_merge_source(v: &Value) -> Option<(usize, Option<SetLayout>)> {
+    with_host(|h| match h.get(v) {
+        Some(PyObj::Set(s) | PyObj::Frozenset(s)) => Some((s.len(), h.set_layout_of(v))),
+        Some(PyObj::Dict(d)) if h.type_name(v) == "dict" => Some((d.len(), None)),
+        _ => None,
+    })
+}
+
+fn src_ref(src: &Option<SetLayout>) -> Option<(&IndexMap<PKey, Value>, usize)> {
+    src.as_ref().map(|(m, start)| (m, *start))
+}
+
 fn set_variadic(recv: &Value, args: &[Value], tag: i64) -> Result<Value, String> {
     if args.is_empty() {
         return set_method(recv, "copy", &[]);

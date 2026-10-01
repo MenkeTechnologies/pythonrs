@@ -502,20 +502,20 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
       methods as well (`{'a':1}.__ior__({'b':2})`, `[1].__add__([2])`,
       `{1,2}.__and__({2})`, `'a'.__mul__(3)`) — each type exposes exactly
       CPython's instance set, and the same table feeds `dir()`.
-- [x] **set repr ordering** — FIXED for the deterministic subset: `set`/`frozenset`
-      of machine ints now repr and iterate in CPython's open-addressing table order
-      (`setobject.c` faithful port — `set_add_entry` perturb+`LINEAR_PROBES`, the
-      `fill*5 >= mask*3` grow trigger, `used*4` resize target, and `set_insert_clean`
-      reinsertion; `hash(n) == n` bar `hash(-1) == -2`). `{3,1,2}` → `{1, 2, 3}`,
-      `set([9,1,17,25,33])` → `{33, 1, 9, 17, 25}`, verified 0-diff vs `python3`
-      across 120+ random int sets and every `set(iterable)` form. Boundary (noted,
-      not faked): (a) string/other-object sets stay in insertion order — CPython
-      SipHash-randomizes those per process, so no fixed order matches byte-for-byte;
-      (b) a *constant* set **literal** with 5+ colliding ints (e.g. `{9,1,17,25,33}`)
-      can differ, because CPython's compiler folds a constant set display to a
-      presized `frozenset` constant, which lays out differently than the incremental
-      build pythonrs (and `set(list)`) performs. Tuple/frozenset `hash()` values still
-      differ (not observable in repr).
+- [x] **set repr ordering** — FIXED for the deterministic subset: a `set`/`frozenset`
+      of ints, floats, complex numbers or tuples of those reprs and iterates in
+      CPython's open-addressing table order (`setobject.c` faithful port —
+      `set_add_entry` perturb+`LINEAR_PROBES`, the `fill*5 >= mask*3` grow trigger,
+      `used*4` resize target, and `set_insert_clean` reinsertion). `{3,1,2}` →
+      `{1, 2, 3}`, `set([9,1,17,25,33])` → `{33, 1, 9, 17, 25}`. The presizing
+      set-to-set and dict merges are modelled too — a constant display (folded by
+      CPython to `BUILD_SET 0; LOAD_CONST frozenset; SET_UPDATE`, so
+      `{1, 2, 3, 10, 20}` → `{1, 2, 3, 20, 10}`), starred displays, `set(s)`,
+      `.copy()`, `|`, `|=`, `.update()`, `&`, `-`, `^` — 0-diff vs `python3` over a
+      400-case differential run. Boundary (noted, not faked): (a) string/other-object
+      sets stay in insertion order — CPython SipHash-randomizes those per process, so
+      no fixed order matches byte-for-byte; (b) a set that has had elements REMOVED
+      can differ, because CPython's dummy slots are not replayed (see BUGS.md).
 
 **Corpus-caught composite gaps** (found by `dropin_check.sh`, not the per-expression fuzzer):
 - [x] **`sorted`/`.sort(key=…)` is stable on ties** — FIXED:

@@ -116,6 +116,7 @@ pub mod ops {
     pub const CHECK_BOUND: u16 = 83; // [name, value] -> value, or UnboundLocalError if unbound
     pub const UNBOUND: u16 = 84; // [] -> the never-assigned frame-slot marker
     pub const TYPE_ALIAS: u16 = 85; // [name, evaluate, [param, kind, ...]] -> TypeAliasType (PEP 695)
+    pub const MKSET_CONST: u16 = 86; // [items...] -> set, laid out as a constant display is (presized merge)
 }
 
 /// In-place (augmented-assignment) op tags carried by `ops::INPLACE`. One per
@@ -2192,6 +2193,12 @@ pub struct PyHost {
     pub dict_meta: HashMap<u32, DictMeta>,
     /// `namedtuple` instance tags, keyed by the `PyObj::Tuple` heap index.
     pub nt_meta: HashMap<u32, NtMeta>,
+    /// The table size a set's iteration-order replay starts from, keyed by the
+    /// `PyObj::Set`/`PyObj::Frozenset` heap index. Absent means CPython's fresh
+    /// 8-slot table; a set built by a presizing merge (a constant display,
+    /// `set(other_set)`, `.copy()`, `|`) records the size CPython resized it to.
+    /// See [`set_merge_layout`].
+    pub set_start: HashMap<u32, usize>,
     /// `lru_cache` memo tables, indexed by `PyObj::LruCache.cache_id`.
     lru_caches: Vec<LruData>,
     /// Names of classes decorated with `functools.total_ordering`. The decorator
@@ -2833,6 +2840,7 @@ impl PyHost {
             io_handles: vec![IoCell::Stdout, IoCell::Stderr, IoCell::Stdin],
             dict_meta: HashMap::new(),
             nt_meta: HashMap::new(),
+            set_start: HashMap::new(),
             lru_caches: Vec::new(),
             total_ordering: HashSet::new(),
             exc_links: HashMap::new(),
@@ -3225,24 +3233,200 @@ impl PyHost {
         self.alloc(PyObj::Set(items))
     }
     /// A set/frozenset's elements in CPython iteration/`repr` order. For a set
-    /// whose every key is a plain machine int this is the open-addressing table
-    /// order (`{3, 1, 2}` → `1, 2, 3`); any other element type falls back to
-    /// insertion order (CPython randomizes those hashes, so no fixed order can
-    /// match byte-for-byte).
-    pub fn set_ordered_values(&self, s: &IndexMap<PKey, Value>) -> Vec<Value> {
-        let mut hashes = Vec::with_capacity(s.len());
-        for k in s.keys() {
-            match k {
-                PKey::Int(n) => hashes.push(cpython_int_hash(*n)),
-                // Not the deterministic subset: keep insertion order.
-                _ => return s.values().cloned().collect(),
+    /// whose every key has a reproducible hash (numbers and tuples of them —
+    /// see `reproducible_hash`) this is the open-addressing table order
+    /// (`{3, 1, 2}` → `1, 2, 3`), replayed from the table size recorded in
+    /// [`PyHost::set_start`]; any other set falls back to insertion order
+    /// (CPython randomizes string hashes, so no fixed order can match
+    /// byte-for-byte).
+    pub fn set_ordered_values(&self, v: &Value, s: &IndexMap<PKey, Value>) -> Vec<Value> {
+        let Some(slots) = set_slot_order(s, self.set_start_of(v)) else {
+            return s.values().cloned().collect();
+        };
+        let vals: Vec<&Value> = s.values().collect();
+        slots.into_iter().map(|i| vals[i].clone()).collect()
+    }
+
+    /// The table size set `v`'s replay starts from.
+    fn set_start_of(&self, v: &Value) -> usize {
+        match v {
+            Value::Obj(id) => self.set_start.get(id).copied().unwrap_or(SET_MINSIZE),
+            _ => SET_MINSIZE,
+        }
+    }
+
+    /// Re-lay set `dst` as CPython's `set_update_internal` leaves it after
+    /// merging a set or an exact dict into it.
+    ///
+    /// `before` is `dst`'s contents (and replay start) before the merge;
+    /// `dst` already holds the merged elements, the new ones appended in the
+    /// source's iteration order; `incoming` is how many elements the source
+    /// had; `src` is the source SET's contents and replay start (`None` for a
+    /// dict). Only a set of reproducibly hashed keys has a reproducible layout,
+    /// so anything else is left in insertion order.
+    pub fn set_relayout_after_merge(
+        &mut self,
+        dst: &Value,
+        before: (&IndexMap<PKey, Value>, usize),
+        incoming: usize,
+        src: Option<(&IndexMap<PKey, Value>, usize)>,
+    ) {
+        let Value::Obj(id) = dst else { return };
+        let Some(PyObj::Set(merged) | PyObj::Frozenset(merged)) = self.get(dst) else {
+            return;
+        };
+        let Some((order, start)) = set_merge_layout(before, merged, incoming, src) else {
+            return;
+        };
+        let relaid: IndexMap<PKey, Value> = order
+            .into_iter()
+            .filter_map(|k| merged.get(&k).map(|v| (k, v.clone())))
+            .collect();
+        if let Some(PyObj::Set(s) | PyObj::Frozenset(s)) = self.get_mut(dst) {
+            *s = relaid;
+        }
+        if start == SET_MINSIZE {
+            self.set_start.remove(id);
+        } else {
+            self.set_start.insert(*id, start);
+        }
+    }
+
+    /// `set.clear()` gives the set a fresh small table again.
+    pub fn set_forget_layout(&mut self, v: &Value) {
+        if let Value::Obj(id) = v {
+            self.set_start.remove(id);
+        }
+    }
+
+    /// `a | b` for two sets (`set_or`): a presized copy of `a` (`set_copy`),
+    /// then `set_update_internal` with `b`. Both steps are set-to-set merges, so
+    /// both shape the result's table. `None` unless both are sets.
+    fn set_union(&mut self, a: &Value, b: &Value) -> Option<Value> {
+        let (b_map, b_start) = self.set_layout_of(b)?;
+        let out = self.set_copy_with_layout(a)?;
+        let (before, start) = self.set_layout_of(&out)?;
+        if let Some(PyObj::Set(s) | PyObj::Frozenset(s)) = self.get_mut(&out) {
+            for (k, v) in &b_map {
+                s.entry(k.clone()).or_insert_with(|| v.clone());
             }
         }
-        let vals: Vec<&Value> = s.values().collect();
-        cpython_set_order(&hashes)
+        self.set_relayout_after_merge(&out, (&before, start), b_map.len(), Some((&b_map, b_start)));
+        Some(out)
+    }
+
+    /// A real set's `(key, element)` entries in CPython iteration order.
+    pub fn set_entries_in_order(&self, v: &Value) -> Option<Vec<(PKey, Value)>> {
+        let s = self.setlike(v)?;
+        let entries: Vec<(&PKey, &Value)> = s.iter().collect();
+        let order = set_slot_order(s, self.set_start_of(v))
+            .unwrap_or_else(|| (0..entries.len()).collect());
+        Some(
+            order
+                .into_iter()
+                .map(|i| (entries[i].0.clone(), entries[i].1.clone()))
+                .collect(),
+        )
+    }
+
+    /// A new set of `a`'s type holding a presized copy of `a` (`set_copy`).
+    fn set_copy_with_layout(&mut self, a: &Value) -> Option<Value> {
+        let (map, start) = self.set_layout_of(a)?;
+        let frozen = self.is_frozenset(a);
+        let n = map.len();
+        let out = self.new_setlike(map.clone(), frozen);
+        let empty = IndexMap::new();
+        self.set_relayout_after_merge(&out, (&empty, SET_MINSIZE), n, Some((&map, start)));
+        Some(out)
+    }
+
+    /// `a - b` for two sets (`set_difference`). When `a` is more than four times
+    /// `b`'s size the result is a presized copy of `a` with `b`'s elements
+    /// discarded; otherwise a new set filled from `a` in iteration order with
+    /// the elements `b` lacks. `None` unless both are sets.
+    fn set_difference(&mut self, a: &Value, b: &Value) -> Option<Value> {
+        let other = self.setlike(b)?.clone();
+        let len_a = self.setlike(a)?.len();
+        if (len_a >> 2) > other.len() {
+            let out = self.set_copy_with_layout(a)?;
+            if let Some(PyObj::Set(s) | PyObj::Frozenset(s)) = self.get_mut(&out) {
+                for k in other.keys() {
+                    s.shift_remove(k);
+                }
+            }
+            return Some(out);
+        }
+        let kept: IndexMap<PKey, Value> = self
+            .set_entries_in_order(a)?
             .into_iter()
-            .map(|i| vals[i].clone())
-            .collect()
+            .filter(|(k, _)| !other.contains_key(k))
+            .collect();
+        let frozen = self.is_frozenset(a);
+        Some(self.new_setlike(kept, frozen))
+    }
+
+    /// `a & b` for two sets (`set_intersection`): a new set of `a`'s type,
+    /// filled by walking the SMALLER set in iteration order (`b` on a tie) and
+    /// keeping the elements the other one holds — the walked set's objects.
+    /// `None` unless both are sets.
+    fn set_intersection(&mut self, a: &Value, b: &Value) -> Option<Value> {
+        let (len_a, len_b) = (self.setlike(a)?.len(), self.setlike(b)?.len());
+        let (walk, probe) = if len_b > len_a { (a, b) } else { (b, a) };
+        let probe = self.setlike(probe)?.clone();
+        let kept: IndexMap<PKey, Value> = self
+            .set_entries_in_order(walk)?
+            .into_iter()
+            .filter(|(k, _)| probe.contains_key(k))
+            .collect();
+        let frozen = self.is_frozenset(a);
+        Some(self.new_setlike(kept, frozen))
+    }
+
+    /// `a ^ b` for two sets (`set_symmetric_difference`): a presized copy of
+    /// `b` (typed as `a`), then each of `a`'s elements, in iteration order,
+    /// discarded if present and added if not. `None` unless both are sets.
+    fn set_symmetric_difference(&mut self, a: &Value, b: &Value) -> Option<Value> {
+        let walk = self.set_entries_in_order(a)?;
+        let (map, start) = self.set_layout_of(b)?;
+        let frozen = self.is_frozenset(a);
+        let n = map.len();
+        let out = self.new_setlike(map.clone(), frozen);
+        let empty = IndexMap::new();
+        self.set_relayout_after_merge(&out, (&empty, SET_MINSIZE), n, Some((&map, start)));
+        if let Some(PyObj::Set(s) | PyObj::Frozenset(s)) = self.get_mut(&out) {
+            for (k, v) in walk {
+                if s.shift_remove(&k).is_none() {
+                    s.insert(k, v);
+                }
+            }
+        }
+        Some(out)
+    }
+
+    /// `s &= t` for two sets (`set_intersection_update`): CPython builds `s & t`
+    /// and swaps its body into `s`, so `s` takes the new set's freshly grown
+    /// table. `false` unless both are sets.
+    pub fn set_intersection_update(&mut self, a: &Value, b: &Value) -> bool {
+        let Some(result) = self.set_intersection(a, b) else {
+            return false;
+        };
+        let Some(PyObj::Set(kept) | PyObj::Frozenset(kept)) = self.get(&result) else {
+            return false;
+        };
+        let kept = kept.clone();
+        if let Some(PyObj::Set(s)) = self.get_mut(a) {
+            *s = kept;
+        }
+        self.set_forget_layout(a);
+        true
+    }
+
+    /// A set's contents and replay start, for passing as a merge source.
+    pub fn set_layout_of(&self, v: &Value) -> Option<(IndexMap<PKey, Value>, usize)> {
+        match self.get(v) {
+            Some(PyObj::Set(s) | PyObj::Frozenset(s)) => Some((s.clone(), self.set_start_of(v))),
+            _ => None,
+        }
     }
 
     pub fn new_frozenset(&mut self, items: IndexMap<PKey, Value>) -> Value {
@@ -5568,7 +5752,7 @@ impl PyHost {
                             return "{...}".into();
                         }
                         let inner: Vec<String> = self
-                            .set_ordered_values(s)
+                            .set_ordered_values(v, s)
                             .iter()
                             .map(|x| self.repr_of(x))
                             .collect();
@@ -5585,7 +5769,7 @@ impl PyHost {
                             return "frozenset(...)".into();
                         }
                         let inner: Vec<String> = self
-                            .set_ordered_values(s)
+                            .set_ordered_values(v, s)
                             .iter()
                             .map(|x| self.repr_of(x))
                             .collect();
@@ -6345,22 +6529,27 @@ pub fn set_put(s: &mut IndexMap<PKey, Value>, key: PKey, item: Value) {
 // ── CPython set iteration order (`setobject.c`) ──────────────────────────────
 //
 // A set/frozenset iterates (and reprs) in open-addressing table order, not
-// insertion order. For a set of plain machine ints that order is deterministic —
-// the hash is `|n|` reduced modulo `2**61-1` with the sign reapplied, so it is
-// the same on every run — and this table reproduces it for `set(iterable)`,
-// for `.add()` in a loop, and for `frozenset`.
+// insertion order. For a set of numbers (and tuples of numbers) that order is
+// deterministic — an int's hash is `|n|` reduced modulo `2**61-1` with the sign
+// reapplied, and a float's and a complex's are built from the same reduction,
+// so they are the same on every run.
 //
-// It does NOT yet reproduce a set DISPLAY. A literal compiles to `BUILD_SET 0`
-// + `LOAD_CONST frozenset({...})` + `SET_UPDATE`, and CPython's set-to-set
-// update presizes the table with `(used + other->used) * 2`, so `{1,2,3,10,20}`
-// gets 16 slots where five separate inserts get 8-then-32. The resulting order
-// differs (`{1, 2, 3, 20, 10}` vs `{1, 2, 3, 10, 20}`); see BUGS.md.
+// pythonrs does not keep the table itself. A set's `IndexMap` holds its elements
+// in an order from which the table can be REPLAYED: inserting them one by one,
+// with `set_add_entry`'s growth rule, into a table of the size recorded in
+// `PyHost::set_start` (8 when absent) lands every element in the slot CPython
+// put it in. `.add()` in a loop and `set(iterable)` need nothing recorded. A
+// merge of a set or exact dict (`set_update_internal`: a constant set display,
+// `set(other_set)`, `.copy()`, `|`, `|=`, `.update()`) presizes the table in one
+// step instead, which `set_merge_layout` turns back into a replayable order and
+// start size. Deleted entries leave no dummies here, so a set that has had
+// elements removed replays as if they had never been inserted.
 //
 // String hashes are per-process randomized in CPython (SipHash keyed by
 // `_Py_HashSecret`), so a set of strings can only agree with a CPython pinned to
 // `PYTHONHASHSEED=0` — the documented boundary.
 
-const SET_MINSIZE: usize = 8;
+pub const SET_MINSIZE: usize = 8;
 const SET_LINEAR_PROBES: usize = 9;
 const SET_PERTURB_SHIFT: u32 = 5;
 
@@ -6386,10 +6575,11 @@ struct SetTable {
 }
 
 impl SetTable {
-    fn new() -> SetTable {
+    /// An empty table of `size` slots (a power of two, at least 8).
+    fn with_size(size: usize) -> SetTable {
         SetTable {
-            slots: vec![None; SET_MINSIZE],
-            mask: SET_MINSIZE - 1,
+            slots: vec![None; size],
+            mask: size - 1,
             fill: 0,
             used: 0,
         }
@@ -6437,10 +6627,7 @@ impl SetTable {
     }
 
     fn resize(&mut self, minused: usize) {
-        let mut newsize = SET_MINSIZE;
-        while newsize <= minused {
-            newsize <<= 1;
-        }
+        let newsize = set_table_size_for(minused);
         let old = std::mem::replace(&mut self.slots, vec![None; newsize]);
         self.mask = newsize - 1;
         self.fill = self.used;
@@ -6451,20 +6638,122 @@ impl SetTable {
             self.slots[slot] = Some((hash, idx));
         }
     }
+
+    /// The insertion indices of the live entries, in slot order.
+    fn slot_order(&self) -> Vec<usize> {
+        self.slots.iter().filter_map(|s| s.map(|(_, idx)| idx)).collect()
+    }
 }
 
-/// The original-insertion indices of `hashes`, reordered into CPython set
-/// iteration order. `hashes[k]` is the CPython hash of the `k`-th inserted
-/// element.
-fn cpython_set_order(hashes: &[i64]) -> Vec<usize> {
-    let mut t = SetTable::new();
-    for (idx, &h) in hashes.iter().enumerate() {
-        t.add(h, idx);
+/// `set_table_resize`'s table size for `minused`: the smallest power of two,
+/// at least 8, that is greater than it.
+fn set_table_size_for(minused: usize) -> usize {
+    let mut newsize = SET_MINSIZE;
+    while newsize <= minused {
+        newsize <<= 1;
     }
-    t.slots
-        .iter()
-        .filter_map(|s| s.map(|(_, idx)| idx))
-        .collect()
+    newsize
+}
+
+/// CPython's `hash()` of a key, for the keys whose hash does not depend on
+/// the per-process string-hash secret or on an object address: ints of any
+/// size, floats other than NaN, complex numbers, and tuples of those.
+fn reproducible_hash(k: &PKey) -> Option<i64> {
+    match k {
+        PKey::Int(n) => Some(cpython_int_hash(*n)),
+        PKey::Big(b) => Some(crate::pyhash::int_big(b)),
+        PKey::FloatBits(bits) => crate::pyhash::double(f64::from_bits(*bits)),
+        PKey::Complex(re, im) => crate::pyhash::complex(f64::from_bits(*re), f64::from_bits(*im)),
+        PKey::Tuple(items) => {
+            let hashes: Option<Vec<i64>> = items.iter().map(reproducible_hash).collect();
+            Some(crate::pyhash::tuple(&hashes?))
+        }
+        _ => None,
+    }
+}
+
+/// Replay `s` into a table that starts with `start` slots. `None` when a key
+/// has no reproducible hash ([`reproducible_hash`]).
+fn set_replay(s: &IndexMap<PKey, Value>, start: usize) -> Option<SetTable> {
+    let mut t = SetTable::with_size(start);
+    for (idx, k) in s.keys().enumerate() {
+        t.add(reproducible_hash(k)?, idx);
+    }
+    Some(t)
+}
+
+/// The insertion indices of `s`, reordered into CPython set iteration order
+/// for a replay starting at `start` slots.
+fn set_slot_order(s: &IndexMap<PKey, Value>, start: usize) -> Option<Vec<usize>> {
+    set_replay(s, start).map(|t| t.slot_order())
+}
+
+/// The replayable layout — key order and starting table size — CPython's
+/// `set_update_internal` produces when it merges a set (`set_merge_lock_held`)
+/// or an exact dict into a set.
+///
+/// `before` is the receiver's contents and replay start before the merge;
+/// `merged` its contents after, the new keys appended in the source's iteration
+/// order; `incoming` the source's length; `src` the source set's contents and
+/// replay start (`None` for a dict). The steps are CPython's:
+///
+/// 1. One presizing resize when `(fill + incoming) * 5 >= mask * 3`, to
+///    `set_table_resize(so, (used + incoming) * 2)` — the existing entries are
+///    reinserted in slot order, so that order becomes the replay order.
+/// 2. Into an EMPTY receiver whose table is now the source's size, the source's
+///    slots are copied verbatim, which the source's own replay reproduces.
+/// 3. Otherwise each source key is inserted in the source's iteration order —
+///    `set_insert_clean` into an empty receiver, `set_add_entry` (with its growth
+///    rule) into a non-empty one; the replay does exactly that.
+///
+/// `None` when a key has no reproducible hash ([`reproducible_hash`]).
+fn set_merge_layout(
+    before: (&IndexMap<PKey, Value>, usize),
+    merged: &IndexMap<PKey, Value>,
+    incoming: usize,
+    src: Option<(&IndexMap<PKey, Value>, usize)>,
+) -> Option<(Vec<PKey>, usize)> {
+    let (before_keys, mut start) = before;
+    if merged.keys().any(|k| reproducible_hash(k).is_none()) {
+        return None;
+    }
+    let table = set_replay(before_keys, start)?;
+    let keys: Vec<&PKey> = before_keys.keys().collect();
+    let mut order: Vec<PKey> = keys.iter().map(|k| (*k).clone()).collect();
+    let mut mask = table.mask;
+    if incoming == 0 {
+        return Some((order, start));
+    }
+    if (table.fill + incoming) * 5 >= table.mask * 3 {
+        start = set_table_size_for((table.used + incoming) * 2);
+        mask = start - 1;
+        order = table.slot_order().into_iter().map(|i| keys[i].clone()).collect();
+    }
+    if table.used == 0 {
+        if let Some((src_keys, src_start)) = src {
+            if set_replay(src_keys, src_start)?.mask == mask {
+                return Some((src_keys.keys().cloned().collect(), src_start));
+            }
+        }
+    }
+    // The new keys go in in the source's ITERATION order, whatever order the
+    // caller appended them in.
+    let added: Vec<&PKey> = merged.keys().skip(before_keys.len()).collect();
+    match src {
+        Some((src_keys, src_start)) => {
+            let src_list: Vec<&PKey> = src_keys.keys().collect();
+            let added: HashSet<&PKey> = added.into_iter().collect();
+            order.extend(
+                set_slot_order(src_keys, src_start)?
+                    .into_iter()
+                    .map(|i| src_list[i])
+                    .filter(|k| added.contains(k))
+                    .cloned(),
+            );
+        }
+        None => order.extend(added.into_iter().cloned()),
+    }
+    Some((order, start))
 }
 
 // ── instance hashing (user `__hash__` / `__eq__` as dict/set keys) ───────────
@@ -7716,6 +8005,9 @@ impl PyHost {
                 }
                 // set difference (result type follows the left operand;
                 // dict_keys/dict_items views participate as key-sets)
+                if let Some(out) = self.set_difference(a, b) {
+                    return Ok(out);
+                }
                 let a_set = self.setmap_of(a).is_some();
                 if let (Some(mut out), Some(y)) = (self.setmap_of(a), self.setmap_operand(b, a_set))
                 {
@@ -8290,6 +8582,13 @@ impl PyHost {
                 }
                 // set operations (result type follows the left operand;
                 // dict_keys/dict_items views participate as key-sets)
+                if let Some(out) = match tag {
+                    binop::BITAND => self.set_intersection(a, b),
+                    binop::BITXOR => self.set_symmetric_difference(a, b),
+                    _ => None,
+                } {
+                    return Ok(out);
+                }
                 let a_set = self.setmap_of(a).is_some();
                 let b_set = self.setmap_of(b).is_some();
                 if let (Some(x), Some(y)) =
@@ -8324,6 +8623,11 @@ impl PyHost {
                         }
                     }
                     let frozen = self.is_frozenset(a);
+                    if tag == binop::BITOR {
+                        if let Some(out) = self.set_union(a, b) {
+                            return Ok(out);
+                        }
+                    }
                     return Ok(self.new_setlike(out, frozen));
                 }
                 if let (Some(x), Some(y)) = (self.big_val(a), self.big_val(b)) {
@@ -10409,7 +10713,7 @@ impl PyHost {
                     .collect();
                 Ok(chars)
             }
-            Some(PyObj::Set(s)) | Some(PyObj::Frozenset(s)) => Ok(self.set_ordered_values(s)),
+            Some(PyObj::Set(s)) | Some(PyObj::Frozenset(s)) => Ok(self.set_ordered_values(v, s)),
             Some(PyObj::Dict(d)) => Ok(d.values().map(|(k, _)| k.clone()).collect()),
             Some(PyObj::Range { start, stop, step }) => {
                 let (start, stop, step) = (*start, *stop, *step);
@@ -10541,7 +10845,7 @@ impl PyHost {
                 }
             }
             Some(PyObj::Set(s)) | Some(PyObj::Frozenset(s)) => IterState::Seq {
-                items: self.set_ordered_values(s),
+                items: self.set_ordered_values(v, s),
                 idx: 0,
                 kind: IterKind::Set,
             },

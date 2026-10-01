@@ -9632,3 +9632,73 @@ fn type_alias_is_an_instance_of_bridged_type_alias_type() {
         "True"
     );
 }
+
+/// Set iteration order where CPython presizes the table in one step rather than
+/// growing it insert by insert: a constant display (`BUILD_SET 0; LOAD_CONST
+/// frozenset; SET_UPDATE`), `set(s)`/`frozenset(s)`/`.copy()`/`|`/`|=`/
+/// `.update()` of a set, `set(dict)`, and a starred display's spreads. A
+/// display that is merely ITERATED (`for x in {…}`) is the folded frozenset
+/// itself, built one element at a time. Numbers and tuples of numbers have
+/// reproducible hashes; the order of each is CPython 3.14's.
+#[test]
+fn set_layout_follows_cpythons_presizing_merges() {
+    assert_eq!(
+        g(
+            "s5 = {1, 2, 3, 10, 20}\n\
+             x = (s5, list({100, 200, 300, 400, 500, 600}), [x for x in {100, 200, 300, 400, 500, 600}])",
+            "x"
+        ),
+        "({1, 2, 3, 20, 10}, [400, 100, 500, 200, 600, 300], [100, 200, 300, 400, 500, 600])"
+    );
+    // A non-constant element keeps `BUILD_SET n`; a starred display builds its
+    // leading run, then merges each spread.
+    assert_eq!(
+        g(
+            "s5 = {1, 2, 3, 10, 20}\nv = 600\n\
+             x = (list({100, 200, 300, 400, 500, v}), {*s5}, {1, 2, 3, *[10, 20]}, {1, 2, 3, 10, 20, *[]})",
+            "x"
+        ),
+        "([100, 200, 300, 400, 500, 600], {1, 2, 3, 20, 10}, {1, 2, 3, 10, 20}, {1, 2, 3, 20, 10})"
+    );
+    assert_eq!(
+        g(
+            "t = set()\nfor v in [1, 2, 3, 10, 20]:\n    t.add(v)\n\
+             x = (t, set(t), frozenset(t), t.copy(), t | set(), set(t) | t, set({1: 0, 2: 0, 3: 0, 10: 0, 20: 0}))",
+            "x"
+        ),
+        "({1, 2, 3, 10, 20}, {1, 2, 3, 20, 10}, frozenset({1, 2, 3, 20, 10}), {1, 2, 3, 20, 10}, \
+         {1, 2, 3, 20, 10}, {1, 2, 3, 10, 20}, {1, 2, 3, 20, 10})"
+    );
+    assert_eq!(
+        g(
+            "a = {1, 2, 3}\na |= {10, 20, 40, 80, 160}\nb = {1, 2, 3}\nb.update({10, 20, 40, 80, 160}, {7, 15})\n\
+             x = (a, b, {-1, -2, 2**64, 7, 15, 31, 63}, {1.5, 2.5, 0.5, 3.25, -1.5}, \
+             {(1, 2), (3, 4), (5, 6), (7, 8), (9, 10)})",
+            "x"
+        ),
+        "({160, 1, 2, 3, 40, 10, 80, 20}, {160, 1, 2, 3, 7, 40, 10, 15, 80, 20}, \
+         {-1, 7, 18446744073709551616, 31, 63, -2, 15}, {0.5, 1.5, 2.5, 3.25, -1.5}, \
+         {(9, 10), (1, 2), (3, 4), (5, 6), (7, 8)})"
+    );
+}
+
+/// `&`, `-` and `^` build their result the way `setobject.c` does — `&` walks
+/// the smaller set in iteration order, `-` walks `a` (when `a` is not over four
+/// times `b`'s size), `^` merges a copy of `b` and walks `a` — and `&=` takes
+/// the body of `s & t`. `set.pop()` takes the first element in iteration order.
+/// Orders are CPython 3.14's.
+#[test]
+fn set_algebra_results_iterate_in_cpythons_order() {
+    assert_eq!(
+        g(
+            "a = set([286, 399, 238, 231, 260, 300, 97, 94, 262, 243, 322, 314, 95, 48])\n\
+             b = set([155, 72, 46, 275, 355, 324, 21, 304, 202, 231, 334, 378, 315, 332])\n\
+             c = set(a)\nc &= {95, 48, 94, 97, 1000}\n\
+             x = (list(a & b), list(a - b), list(a ^ b), list(c), set([1, 300, 5, 77]).pop())",
+            "x"
+        ),
+        "([231], [97, 322, 260, 262, 300, 238, 399, 48, 243, 95, 314, 94, 286], \
+         [260, 262, 399, 275, 21, 155, 286, 300, 46, 304, 48, 314, 315, 322, 324, 72, 202, 332, 334, \
+         94, 95, 97, 355, 238, 243, 378], [48, 97, 94, 95], 1)"
+    );
+}

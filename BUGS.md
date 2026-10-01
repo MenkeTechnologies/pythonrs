@@ -144,6 +144,20 @@ written.
   memoryview hashes and keys as the bytes it shows (`{b'ab',
   memoryview(b'ab')}` has one element), and a writable one raises
   `ValueError: cannot hash writable memoryview object`.
+- **`set` iteration order for displays and set-to-set merges.**
+  `{1, 2, 3, 10, 20}` printed `{1, 2, 3, 10, 20}` where CPython prints
+  `{1, 2, 3, 20, 10}`: a constant display is `BUILD_SET 0; LOAD_CONST
+  frozenset; SET_UPDATE`, and `set_update_internal` presizes the table in one
+  step instead of growing it insert by insert. Each set now records the table
+  size its order replays from, and the merges are ported — constant and
+  starred displays (but not a display that is only iterated, which CPython
+  loads as the folded frozenset), `set(s)`, `frozenset(s)`, `set(dict)`,
+  `.copy()`, `|`, `|=`, `.update()`, and `&`/`&=`/`-`/`^`'s construction order.
+  Floats, complex numbers and tuples of numbers join ints as reproducibly
+  ordered, and `set.pop()` takes the first element in iteration order rather
+  than the last inserted. A 400-case differential run over displays and merges
+  matches CPython 3.14 on all 1,600 lines (1,298 differed before). Removal is
+  what remains (see "`set` iteration order after an element is removed").
 - **`float` `repr` breaks a shortest-digit tie to even.** Rust `std`'s shortest
   formatter rounds an exact tie between two equally short round-tripping
   decimals up, so `2113325745016023.2` (the double `…023.25`) printed as
@@ -2272,27 +2286,32 @@ six older `hash(` sites only compare `hash(x) == hash(y)`, a shape any
 self-consistent hash satisfies — which is why a hash that matched CPython for no
 type at all went unnoticed.
 
-### `set` iteration order diverges for a set DISPLAY
+### `set` iteration order after an element is removed
 
-`setobject.c`'s open-addressing table is ported (`host.rs`, `SetTable`) and
-reproduces the order for `set(iterable)`, `.add()` in a loop, and `frozenset`.
-A set **literal** still diverges:
+`setobject.c`'s table is reproduced by REPLAY (`host.rs`, `SetTable`): a set
+keeps its elements in an order that, inserted one by one into a table of a
+recorded starting size, lands each in CPython's slot. That covers every way a
+set is BUILT — `.add()`, `set(iterable)`, constant and starred displays, the
+presizing set/dict merges (`set(s)`, `.copy()`, `|`, `|=`, `.update()`), and
+`&`, `&=` and the fresh-set path of `-` — for elements whose hash is
+reproducible (ints, floats, complex, tuples of those). It does not cover
+REMOVAL. CPython leaves a dummy in a removed element's slot, which later
+probes step over and a resize later drops, and `.pop()` resumes from a search
+finger. pythonrs replays a set that has lost elements as if they had never
+been inserted, so a set shaped by `.discard()`/`.remove()`/`.pop()`/`-=`, by
+`a - b` when `a` is over four times `b`'s size (a copy of `a` with `b`'s
+elements deleted), or by `^` with shared elements can iterate differently:
 
 ```
-{1, 2, 3, 10, 20}           # CPython {1, 2, 3, 20, 10}, pythonrs {1, 2, 3, 10, 20}
-{100,200,300,400,500,600}   # CPython [400, 100, 500, 200, 600, 300]
-                            # pythonrs [100, 200, 300, 400, 500, 600]
+a = set([14, 275, 22, 264, 205, 278, 288, 62, 251, 47, 353, 85])
+a - {275, 234}   # CPython [..., 85, 22, 278, 251, 62]
+                 # pythonrs [..., 85, 278, 22, 251, 62]
 ```
 
-The cause is a table SIZE difference, not a hash difference. A literal compiles
-to `BUILD_SET 0` + `LOAD_CONST frozenset({...})` + `SET_UPDATE`, and
-`set_update_internal`'s set-to-set path presizes with
-`set_table_resize(so, (so->used + other->used)*2)` — for five elements that is
-`minused = 10`, giving a 16-slot table (`mask` 15). Inserting the same five
-elements one at a time never presizes: the table starts at 8 and grows to 32 on
-the fifth insert (`mask` 31). A 16-slot table reproduces both diverging cases
-above exactly, including the `LINEAR_PROBES` runs that place `500` and `600`.
-Closing this needs the literal's presize modelled, not a change to hashing.
+A 300-case differential run over `&`, `-`, `^`, `.intersection`,
+`.difference`, discards, `-=` and `pop` differs from CPython 3.14 on 114 of its
+1,500 output lines (942 before the merge layouts were modelled). Closing it
+means recording deletions — the dummies and `pop`'s finger — in the replay.
 
 ### Open divergences found by round-3 protocol probing
 

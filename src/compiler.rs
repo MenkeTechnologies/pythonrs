@@ -1768,7 +1768,7 @@ impl Compiler {
         if loop_needs_signal(body) {
             return self.compile_for_signal(b, target, iter, body, orelse, line);
         }
-        self.compile_expr(b, iter)?;
+        self.compile_iterable(b, iter)?;
         self.emit_loop_iter_op(b, Op::CallBuiltin(ops::GETITER, 1), iter, line); // [iterator]
         let start = b.current_pos();
         self.emit_loop_iter_op(b, Op::CallBuiltin(ops::FORITER, 0), iter, line); // [iterator, value, has_next]
@@ -1881,7 +1881,7 @@ impl Compiler {
         line: u32,
     ) -> Result<(), String> {
         let id = self.register_loop_body(body)?;
-        self.compile_expr(b, iter)?;
+        self.compile_iterable(b, iter)?;
         self.emit_loop_iter_op(b, Op::CallBuiltin(ops::GETITER, 1), iter, line); // [iterator]
         let start = b.current_pos();
         self.emit_loop_iter_op(b, Op::CallBuiltin(ops::FORITER, 0), iter, line); // [iterator, value, has_next] | [iterator, false]
@@ -2886,13 +2886,46 @@ impl Compiler {
             }
             Expr::Set(items) => {
                 if items.iter().any(|e| matches!(e, Expr::Starred(_))) {
-                    self.name_const(b, "set");
-                    self.compile_arg_spread(b, items)?;
-                    b.emit(Op::CallBuiltin(ops::CALL, 2), 0);
+                    // CPython builds `{a, b, *c, d}` from the leading run (a
+                    // `BUILD_SET`, folded like any constant display), then a
+                    // `SET_UPDATE` per starred element and a `SET_ADD` per plain
+                    // one. A set or dict spread is therefore a presized merge,
+                    // exactly as `set.update` does it.
+                    let lead = items
+                        .iter()
+                        .take_while(|e| !matches!(e, Expr::Starred(_)))
+                        .count();
+                    let mk = if is_constant_set_display(&items[..lead]) {
+                        ops::MKSET_CONST
+                    } else {
+                        ops::MKSET
+                    };
+                    self.build_chunked(b, mk, ops::EXTEND_SET, lead, 1, |c, b, i| {
+                        c.compile_expr(b, &items[i])
+                    })?;
+                    for item in &items[lead..] {
+                        let (method, arg) = match item {
+                            Expr::Starred(x) => ("update", &**x),
+                            plain => ("add", plain),
+                        };
+                        b.emit(Op::Dup, 0);
+                        self.name_const(b, method);
+                        self.compile_expr(b, arg)?;
+                        let idx = b.emit(Op::CallBuiltin(ops::CALL_METHOD, 3), self.cur_line);
+                        self.record_span(idx);
+                        b.emit(Op::Pop, 0);
+                    }
                 } else {
+                    // A display CPython folds to a constant frozenset is a presized
+                    // merge of it; any other is built element by element.
+                    let mk = if is_constant_set_display(items) {
+                        ops::MKSET_CONST
+                    } else {
+                        ops::MKSET
+                    };
                     self.build_chunked(
                         b,
-                        ops::MKSET,
+                        mk,
                         ops::EXTEND_SET,
                         items.len(),
                         1,
@@ -3132,6 +3165,28 @@ impl Compiler {
     /// and each further chunk folds in via `extend` ([acc, items...]) — the same
     /// shape CPython uses for oversized literals (LIST_EXTEND/DICT_UPDATE/…).
     /// `emit(self, b, i)` pushes element `i`'s `slots` values.
+    /// Compile an expression whose only use is to be iterated (`for x in e`, a
+    /// comprehension's outermost `in e`).
+    ///
+    /// A constant set display there is NOT the presized merge it is elsewhere:
+    /// CPython's flowgraph sees `GET_ITER` after the `BUILD_SET` and loads the
+    /// folded frozenset itself, which was built element by element — so
+    /// `for x in {100, 200, 300, 400, 500, 600}` walks the elements in
+    /// one-at-a-time order while `list({…})` sees the presized table's.
+    fn compile_iterable(&mut self, b: &mut ChunkBuilder, e: &Expr) -> Result<(), String> {
+        match e.unspanned() {
+            Expr::Set(items) if is_constant_set_display(items) => {
+                for item in items {
+                    self.compile_expr(b, item)?;
+                }
+                let idx = b.emit(Op::CallBuiltin(ops::MKSET, argc(items.len())?), self.cur_line);
+                self.record_span(idx);
+                Ok(())
+            }
+            _ => self.compile_expr(b, e),
+        }
+    }
+
     fn build_chunked(
         &mut self,
         b: &mut ChunkBuilder,
@@ -3837,7 +3892,7 @@ impl Compiler {
         let def_id =
             self.build_function_ex(name, &params, &body, is_async, ScopeKind::Comprehension)?;
         self.emit_make_func(b, def_id, &params)?; // [func]
-        self.compile_expr(b, outer_iter)?; // [func, iterable]
+        self.compile_iterable(b, outer_iter)?; // [func, iterable]
         b.emit(Op::CallBuiltin(ops::CALL_VALUE, 2), 0); // [result|coroutine]
         if is_async {
             // The hidden coroutine is awaited in the enclosing async scope.
@@ -6190,4 +6245,128 @@ fn loop_needs_signal(body: &[Stmt]) -> bool {
         })
     }
     scan(body, false)
+}
+
+// ── constant set displays ────────────────────────────────────────────────────
+
+/// What CPython's optimizer folds a display element to. Only an integer's VALUE
+/// is kept: it feeds the size guards on `*`, `**` and `<<`.
+enum Folded {
+    Int(num_bigint::BigInt),
+    Float,
+    Other,
+}
+
+/// `MAX_INT_SIZE` in CPython's constant folder: an integer result wider than
+/// this many bits is left to run time.
+const FOLD_MAX_INT_BITS: u64 = 128;
+
+/// The constant CPython 3.14 folds `e` to, or `None` when it stays an
+/// expression evaluated at run time.
+///
+/// Literals, `__debug__`, unary operators on constants, tuples of constants, a
+/// conditional whose test is a constant, and binary arithmetic on constants
+/// within the folder's limits: `safe_multiply`/`safe_power`/`safe_lshift` refuse
+/// an integer result past `MAX_INT_SIZE` bits, and an operation that would raise
+/// (`1 // 0`, `1 << -1`, `'a' - 1`) is not folded.
+fn fold_constant(e: &Expr) -> Option<Folded> {
+    use num_bigint::BigInt;
+    use num_traits::{Signed, ToPrimitive, Zero};
+    Some(match e.unspanned() {
+        Expr::Int(n) => Folded::Int(BigInt::from(*n)),
+        Expr::BigInt(s) => Folded::Int(BigInt::parse_bytes(s.as_bytes(), 10)?),
+        Expr::True => Folded::Int(BigInt::from(1)),
+        Expr::False => Folded::Int(BigInt::from(0)),
+        Expr::Float(_) => Folded::Float,
+        Expr::None | Expr::Ellipsis | Expr::Complex(_) | Expr::Str(_) | Expr::Bytes(_) => {
+            Folded::Other
+        }
+        Expr::Name(n) if n == "__debug__" => Folded::Other,
+        Expr::Tuple(xs) => {
+            for x in xs {
+                fold_constant(x)?;
+            }
+            Folded::Other
+        }
+        Expr::UnaryOp(op, x) => match (op, fold_constant(x)?) {
+            (UnOp::Not, _) => Folded::Other,
+            (UnOp::Neg, Folded::Int(n)) => Folded::Int(-n),
+            (UnOp::Pos, Folded::Int(n)) => Folded::Int(n),
+            (UnOp::Invert, Folded::Int(n)) => Folded::Int(-n - 1),
+            (UnOp::Neg | UnOp::Pos, Folded::Float) => Folded::Float,
+            _ => return None,
+        },
+        Expr::IfExp { test, body, orelse } => {
+            let truthy = match test.unspanned() {
+                Expr::True => true,
+                Expr::False | Expr::None => false,
+                Expr::Int(n) => *n != 0,
+                _ => return None,
+            };
+            fold_constant(if truthy { body } else { orelse })?
+        }
+        Expr::BinOp(op, l, r) => {
+            let (l, r) = (fold_constant(l)?, fold_constant(r)?);
+            match (l, r) {
+                (Folded::Int(a), Folded::Int(b)) => {
+                    let bits = |n: &BigInt| n.bits();
+                    Folded::Int(match op {
+                        BinOp::Add => a + b,
+                        BinOp::Sub => a - b,
+                        BinOp::BitAnd => a & b,
+                        BinOp::BitOr => a | b,
+                        BinOp::BitXor => a ^ b,
+                        BinOp::Mul => {
+                            if !a.is_zero() && !b.is_zero() && bits(&a) + bits(&b) > FOLD_MAX_INT_BITS {
+                                return None;
+                            }
+                            a * b
+                        }
+                        BinOp::FloorDiv | BinOp::Mod if b.is_zero() => return None,
+                        BinOp::FloorDiv => num_integer::Integer::div_floor(&a, &b),
+                        BinOp::Mod => num_integer::Integer::mod_floor(&a, &b),
+                        BinOp::Div if b.is_zero() => return None,
+                        BinOp::Div => return Some(Folded::Float),
+                        BinOp::Pow if b.is_negative() => {
+                            return if a.is_zero() { None } else { Some(Folded::Float) };
+                        }
+                        BinOp::Pow => {
+                            let w = b.to_u64()?;
+                            if !a.is_zero() && w > 0 && bits(&a) > FOLD_MAX_INT_BITS / w {
+                                return None;
+                            }
+                            num_traits::pow(a, usize::try_from(w).ok()?)
+                        }
+                        BinOp::Shl => {
+                            let w = b.to_u64()?;
+                            if !a.is_zero() && w > 0 && (bits(&a) > FOLD_MAX_INT_BITS || w > FOLD_MAX_INT_BITS - bits(&a)) {
+                                return None;
+                            }
+                            a << w
+                        }
+                        BinOp::Shr => a >> b.to_u64()?,
+                        BinOp::MatMul => return None,
+                    })
+                }
+                (Folded::Int(_) | Folded::Float, Folded::Int(_) | Folded::Float) => match op {
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Pow | BinOp::Div | BinOp::FloorDiv | BinOp::Mod => {
+                        Folded::Float
+                    }
+                    _ => return None,
+                },
+                _ => return None,
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// Whether a set display is one CPython builds from a folded constant: no
+/// starred element, at least `MIN_CONST_SEQUENCE_SIZE` (3) and at most
+/// `STACK_USE_GUIDELINE` (30) elements, every one a constant. Such a display is
+/// `BUILD_SET 0; LOAD_CONST frozenset(...); SET_UPDATE`, whose presized merge
+/// gives it a different table — and iteration order — than adding the elements
+/// one by one would.
+fn is_constant_set_display(items: &[Expr]) -> bool {
+    (3..=30).contains(&items.len()) && items.iter().all(|e| fold_constant(e).is_some())
 }
