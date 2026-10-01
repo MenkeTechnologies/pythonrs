@@ -3255,6 +3255,20 @@ impl PyHost {
         }))
     }
 
+    /// Store `name = value` straight into an instance's `__dict__`, bypassing any
+    /// `__setattr__` — what restoring a pickled object's state does (`BUILD`
+    /// updates `inst.__dict__`).
+    pub fn instance_dict_set(&mut self, inst: &Value, name: &str, value: Value) {
+        let dict = match self.get(inst) {
+            Some(PyObj::Instance(i)) => i.dict.clone(),
+            _ => return,
+        };
+        let key = self.new_str(name.to_string());
+        if let Some(PyObj::Dict(d)) = self.get_mut(&dict) {
+            d.insert(PKey::Str(name.to_string()), (key, value));
+        }
+    }
+
     /// Allocate a builtin-subclass instance carrying `payload` (the inherited
     /// native list/dict/str/int/… storage). Attributes start empty.
     pub fn new_instance_payload(&mut self, class: String, payload: Value) -> Value {
@@ -4038,6 +4052,29 @@ impl PyHost {
         let id = self.module_globals.len();
         self.module_globals.push(ns);
         id
+    }
+
+    /// `repr(module)` for a module without a spec, as
+    /// `importlib._bootstrap._module_repr` falls through for one: `from
+    /// <__file__>` when the module has a file, else its `__loader__` in
+    /// parentheses, else the bare name — `<module '__main__' from 'x.py'>`,
+    /// `<module '__main__' (<class '_frozen_importlib.BuiltinImporter'>)>`.
+    fn module_repr(&self, name: &str, slot: usize) -> String {
+        let ns = &self.module_globals[slot];
+        let bound = |key: &str| ns.get(key).filter(|v| !matches!(v, Value::Undef));
+        let name = quote_str(&bound("__name__").and_then(|v| self.as_str(v)).unwrap_or_else(|| name.to_string()));
+        if let Some(file) = bound("__file__") {
+            return format!("<module {name} from {}>", self.repr_of(file));
+        }
+        match bound("__loader__") {
+            Some(loader) => format!("<module {name} ({})>", self.repr_of(loader)),
+            None => format!("<module {name}>"),
+        }
+    }
+
+    /// One global of module slot `slot` (`0` is `__main__`), if bound.
+    pub fn module_global(&self, slot: usize, name: &str) -> Option<Value> {
+        self.module_globals.get(slot)?.get(name).cloned()
     }
 
     /// Read-only view of a specific module's globals (for building its
@@ -5458,7 +5495,7 @@ impl PyHost {
                     }
                 }
                 Some(PyObj::Exception { class, args }) => self.exc_str(v, class, args),
-                Some(PyObj::Module { name, .. }) => format!("<module '{name}'>"),
+                Some(PyObj::Module { name, slot }) => self.module_repr(name, *slot),
                 Some(PyObj::Template {
                     strings,
                     interpolations,
@@ -16137,6 +16174,16 @@ fn call_method_inner(
             if name == "__init__" {
                 return Ok(Value::Undef);
             }
+            // Pickling a builtin-subclass instance is `object`'s protocol on the
+            // INSTANCE (its class, its `__dict__`), not the payload's: a
+            // `class L(list)` reduces to `L`, not to `list`.
+            if !matches!(inst.payload, Value::Undef)
+                && matches!(name, "__reduce_ex__" | "__reduce__" | "__getstate__")
+            {
+                if let Some(r) = crate::builtins::instance_object_dunder(recv, &class, name, &args) {
+                    return r;
+                }
+            }
             // Builtin-subclass instance: inherited methods / protocol dunders
             // delegate to the native payload (`stack.append(x)`, `u.upper()`,
             // `d.keys()`, and the `__len__`/`__getitem__`/… protocol).
@@ -20084,6 +20131,9 @@ fn import_in_progress(name: &str) -> bool {
 /// first import runs (native arm, vendored `.py`, or bridge), later imports of the
 /// same name return the identical cached object — CPython's run-once semantics.
 pub fn import_module(name: &str) -> Result<Value, String> {
+    if name == "__main__" {
+        ensure_main_dunders();
+    }
     if let Some(m) = with_host(|h| h.cached_module(name)) {
         return Ok(m);
     }
@@ -20278,12 +20328,14 @@ fn current_argv() -> Vec<String> {
 /// those roots, so the caller falls through to the stdlib resolvers.
 ///
 /// An empty entry means the current directory, exactly as CPython reads
-/// `sys.path[0] == ''` for `-c`/`-m`/stdin.
+/// `sys.path[0] == ''` for `-c`/`-m`/stdin. Each root is made absolute first,
+/// as `FileFinder` makes its path (`_os.getcwd()` for an empty one), so a
+/// module's `__file__` is an absolute path.
 #[cfg(feature = "stdlib-ffi")]
 fn try_import_user_path(name: &str) -> Option<Result<Value, String>> {
     let rel = name.replace('.', "/");
     for root in current_search_paths() {
-        let root = std::path::Path::new(if root.is_empty() { "." } else { &root });
+        let root = std::env::current_dir().unwrap_or_default().join(&root);
         for cand in [
             root.join(format!("{rel}.py")),
             root.join(&rel).join("__init__.py"),
@@ -20346,6 +20398,19 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
     // from a native arm (which never runs that line), so alias it here.
     if name == "collections.abc" {
         return import_module("_collections_abc");
+    }
+    // `__main__` is the running program's own module — its globals are module
+    // slot 0 — as CPython's `sys.modules['__main__']` is the script's namespace.
+    // Resolving it anywhere else (the bridge hands back the embedded
+    // interpreter's empty `__main__`) breaks every lookup by module path:
+    // `pickle` finding a class or function, `__import__('__main__').X`.
+    if name == "__main__" {
+        return Ok(with_host(|h| {
+            h.alloc(PyObj::Module {
+                name: "__main__".to_string(),
+                slot: 0,
+            })
+        }));
     }
     // `_ast` — the node types `ast.py` is built on. They are pure data (a name, a
     // base, a `_fields` tuple), so the module is DECLARED by a table in Rust and
@@ -21141,6 +21206,14 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
             // modules, so Python-level assignment/reads stay consistent with the
             // internal import cache.
             h.sys_modules = Some(modules.clone());
+            // CPython registers the program's own module before it runs.
+            if !h.modules.contains_key("__main__") {
+                let main = h.alloc(PyObj::Module {
+                    name: "__main__".to_string(),
+                    slot: 0,
+                });
+                h.modules.insert("__main__".to_string(), main);
+            }
             let cached: Vec<(String, Value)> = h
                 .modules
                 .iter()

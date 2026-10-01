@@ -88,6 +88,54 @@ written.
   (`__mro__`, `isinstance`) whose constructor is `re/_constants.py`'s
   (`msg`/`pattern`/`pos`/`lineno`/`colno`), and an exception reprs by its
   type's short name.
+- **A pythonrs object pickles.** `pickle` is CPython's C pickler, and a pythonrs
+  instance reached it as an opaque `PyrsInstance` (`TypeError: cannot pickle
+  'builtins.PyrsInstance' object`), a class or function as a fresh wrapper on
+  every crossing (so `__main__.P` could never be found again as the same
+  object), and CPython's `__main__` was the embedded interpreter's empty module.
+  Five pieces close it. A native class crosses as ONE cached mirror per class,
+  and a callable or instance as one cached proxy, so identity holds across
+  crossings; a mirror's metaclass constructs the native class when called and
+  detaches it from the native class the moment CPython code changes it (as
+  `@dataclass` does, whose result stays the CPython class it was). An instance
+  proxy's `__class__` is the mirror and its `__reduce_ex__`/`__reduce__` are the
+  native object's. CPython's `__main__` answers a missing name (PEP 562
+  `__getattr__`) from the program's own namespace. And a mirror, or an
+  instance CPython made of one with `object.__new__` (`copyreg.__newobj__`,
+  `copyreg._reconstructor`), crosses back as the native class / a native
+  instance carrying its attributes — one object for the life of the process, so
+  a class's `__setstate__` running mid-load and the finished object agree. The
+  pickle bytes are CPython's at every protocol, `pickle.loads` gives `type(p) is
+  P`, a class or function round-trips as the very object, and a bound method
+  pickles as `getattr(obj, name)`. `object.__reduce_ex__` on a user instance is
+  now CPython's: a class's own `__reduce__`, `__getstate__`, `__getnewargs__` and
+  `__getnewargs_ex__` (`copyreg.__newobj_ex__`) are honoured, a builtin
+  subclass reduces to its own class (below protocol 2 with the builtin base and
+  its value), a `list`/`dict` subclass carries its items and a `set` subclass
+  uses `set_reduce`; it used to ignore all of these. Slot values loaded back
+  land in the native class's slot storage.
+  A `bytearray` reduces with `bytes` from protocol 3 (not 5) and with no
+  arguments when empty, as `bytearray.__reduce_ex__` does.
+- **A native class named in an annotation is that class again.** A class
+  crossed as a fresh mirror every time and came back as a `Foreign` handle, so
+  `dataclasses.fields(F)[0].type is E` and `typing.get_type_hints(N)['e'] is E`
+  were `False`; with the class crossing as one cached mirror that crosses back
+  as the native class, both hold, inside a generic alias too.
+- **Self-referential and shared containers cross the bridge as a graph.** Every
+  conversion was a tree walk, so a list containing itself recursed until the
+  native stack was gone and the process ABORTED (`json.dumps(l)`,
+  `pickle.dumps(l)`, even `operator.is_(l, l)` through the argument write-back),
+  and a list reached twice crossed as two objects (`pickle.loads(pickle.dumps([x,
+  x]))` lost the sharing). One marshal now memoizes the containers it has
+  converted, registering a list or dict before its elements, in both
+  directions and across all the arguments of one call.
+- **`import __main__` is the program's own module.** It resolved over the
+  bridge to the embedded interpreter's empty `__main__`, so
+  `__import__('__main__').X` raised `AttributeError`; it is now module slot 0,
+  present in `sys.modules` from the start, and a module without a spec reprs as
+  `importlib._bootstrap._module_repr` does (`<module '__main__' from
+  'x.py'>`). A module imported from a relative `sys.path` entry (`''` under
+  `-c`) carries an absolute `__file__`, as `FileFinder` makes it.
 - **A user exception class inherits `add_note` and `with_traceback`.**
   `BaseException`'s methods resolved only on the builtin exception types, so
   `class E(Exception)` raised `AttributeError: 'E' object has no attribute
@@ -2001,13 +2049,12 @@ written.
   `_thread` into the embedded interpreter's `sys.modules` before `threading` is
   imported, which would also make every thread on the default build serialise —
   a decision about what the default build IS, not a defect to patch.
-- **A pythonrs instance cannot be pickled.** `pickle` is CPython's, and a pythonrs
-  object reaches it as the opaque `PyrsInstance` wrapper, which exposes no
-  `__reduce__` and no picklable `__class__`: `pickle.dumps(obj)` raises
-  `TypeError: cannot pickle 'builtins.PyrsInstance' object`. Plain containers of
-  builtins pickle correctly (they cross by value); it is user-defined classes that
-  do not, which also rules out `copy.deepcopy` through the pickle fallback,
-  `multiprocessing` arguments, and anything that caches objects to disk.
+- **Pickling across the bridge: what is still not CPython.** A class or function
+  defined in an imported program module (not `__main__`) is looked up by CPython's
+  importer under that module's name, which imports a separate CPython copy of the
+  file, so `pickle` reports it is not the same object. `copy.copy`/`deepcopy` are
+  native and do not consult `__copy__`/`__deepcopy__`/`__reduce_ex__`. A
+  `bytearray` subclass is not a native builtin subclass at all.
 - **A warning raised from pythonrs code is attributed to `<sys>:0`.**
   `warnings.warn` is CPython's C `_warnings.warn`, which locates the warning
   by walking CPython frames; a call from pythonrs has none, so the message
@@ -2381,11 +2428,6 @@ module then raises `ModuleNotFoundError`.
   A `@dataclass` instance also matches a `match` class pattern (positional via
   `__match_args__`/keyword), routed through CPython `isinstance` + bridge attribute
   reads.
-  Remaining gap:
-  - **`collections.namedtuple` field *types*** cross as `PyrsCallable` wrappers,
-    not the CPython type objects, so `dataclasses.fields(x)[i].type` on a mirrored
-    class is a proxy — the generated `__init__`/`__repr__`/`__eq__` (which use only
-    field names) are unaffected.
 
 ### Standard library — `re`
 

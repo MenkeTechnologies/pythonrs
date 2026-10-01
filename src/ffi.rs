@@ -278,8 +278,39 @@ pub fn init() -> bool {
         pyo3::prepare_freethreaded_python();
         INTERPRETER_STARTED.store(true, std::sync::atomic::Ordering::Relaxed);
         route_std_streams();
+        install_main_module_hook();
     });
     BRIDGE_USABLE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// CPython's `__main__` is the embedded interpreter's own, empty module, while
+/// the program's names live in pythonrs's `__main__` (module slot 0). A module
+/// `__getattr__` (PEP 562) answers a name CPython looks up there from the
+/// program's namespace — `pickle` finding `__main__.P` or `__main__.f` by
+/// module path, `getattr(sys.modules['__main__'], 'X')` in CPython code. It
+/// resolves against the host of the calling thread, the one whose program
+/// handed the object over.
+fn install_main_module_hook() {
+    Python::with_gil(|py| {
+        let Ok(main) = py.import("__main__") else {
+            return;
+        };
+        if let Ok(f) = wrap_pyfunction!(main_getattr, py) {
+            let _ = main.setattr("__getattr__", f);
+        }
+    });
+}
+
+#[pyfunction]
+fn main_getattr(py: Python, name: String) -> PyResult<Py<PyAny>> {
+    match crate::host::try_with_host(|h| h.module_global(0, &name)).flatten() {
+        Some(v) => with_host(|h| value_to_py(h, py, &v))
+            .map(|b| b.unbind())
+            .map_err(rs_err),
+        None => Err(pyo3::exceptions::PyAttributeError::new_err(format!(
+            "module '__main__' has no attribute '{name}'"
+        ))),
+    }
 }
 
 /// Point the embedded interpreter's `sys.stdout`/`sys.stderr` at pythonrs's own
@@ -1171,11 +1202,382 @@ def new(cls, args):
     Ok(module)
 }
 
+// ── native classes and functions as CPython sees them ────────────────────────
+
+/// The CPython objects this thread's native classes and callables cross as.
+///
+/// A CPython class or function is ONE object: `pickle` stores a class or a
+/// function by module path and refuses one whose path leads to a different
+/// object (`found is not obj`), and `is` on anything the stdlib hands back
+/// relies on the same. So a native class crosses as one cached mirror and a
+/// native callable as one cached proxy, per host generation (heap ids are
+/// never reused within one).
+#[derive(Default)]
+struct BridgeIdentity {
+    /// (generation, class key) → the class's mirror.
+    mirrors: std::collections::HashMap<(u64, String), Py<PyAny>>,
+    /// Mirror address → (generation, class key) while the mirror stands for
+    /// the native class alone. CPython code that CHANGES a mirror —
+    /// `@dataclass` setting `__init__` — makes it a CPython class in its own
+    /// right (the decorated class the program continues with), which then
+    /// crosses back as a `Foreign` handle rather than as the native class.
+    pristine: std::collections::HashMap<usize, (u64, String)>,
+    /// (generation, heap id) → the callable's proxy.
+    callables: std::collections::HashMap<(u64, u32), Py<PyAny>>,
+    /// (generation, heap id) → the instance's proxy.
+    instances: std::collections::HashMap<(u64, u32), Py<PyAny>>,
+    /// CPython instance of a mirror (by address) → (generation, the instance,
+    /// the native instance it became); see [`instance_from_mirror`].
+    converted: std::collections::HashMap<usize, (u64, Py<PyAny>, Value)>,
+}
+
+thread_local! {
+    static IDENTITY: std::cell::RefCell<BridgeIdentity> =
+        std::cell::RefCell::new(BridgeIdentity::default());
+}
+
+/// The cached `_pyrs_mirror` helper module: the metaclass a mirror is built
+/// with, and `make_mirror`. Calling a pristine mirror constructs the NATIVE
+/// class (`pickle` rebuilding `P(*args)` from a `__reduce__`), and any change
+/// to a mirror detaches it from the native class.
+fn mirror_helper(py: Python) -> Result<Bound<PyAny>, String> {
+    static HELPER: OnceLock<Py<PyAny>> = OnceLock::new();
+    if let Some(m) = HELPER.get() {
+        return Ok(m.bind(py).clone());
+    }
+    let code = cr#"
+import types
+
+class PyrsMirror(type):
+    def __call__(cls, /, *args, **kwargs):
+        native = _native_class(cls)
+        if native is None:
+            return super().__call__(*args, **kwargs)
+        return native(*args, **kwargs)
+
+    def __setattr__(cls, name, value):
+        _detach(cls)
+        super().__setattr__(name, value)
+
+    def __delattr__(cls, name):
+        _detach(cls)
+        super().__delattr__(name)
+
+def make_mirror(name, members):
+    def body(ns):
+        for k in members:
+            ns[k] = members[k]
+    return types.new_class(name, (object,), {'metaclass': PyrsMirror}, body)
+"#;
+    let module = PyModule::from_code(py, code, c"_pyrs_mirror.py", c"_pyrs_mirror")
+        .map_err(|e| e.to_string())?;
+    let install = |f: PyResult<Bound<pyo3::types::PyCFunction>>| -> Result<(), String> {
+        module.add_function(f.map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+    };
+    install(wrap_pyfunction!(_native_class, &module))?;
+    install(wrap_pyfunction!(_detach, &module))?;
+    let _ = HELPER.set(module.clone().into_any().unbind());
+    Ok(module.into_any())
+}
+
+/// The native class a pristine mirror stands for, as a callable that
+/// constructs it, or `None` once the mirror has been changed (or belongs to
+/// another thread's or an earlier host's heap).
+#[pyfunction]
+fn _native_class(py: Python, cls: &Bound<PyAny>) -> PyResult<Option<Py<PyAny>>> {
+    let Some(generation) = crate::host::try_with_host(|h| h.generation) else {
+        return Ok(None);
+    };
+    let Some(cname) = pristine_class(cls, generation) else {
+        return Ok(None);
+    };
+    let class = with_host(|h| h.alloc(PyObj::Class(cname)));
+    let proxy = PyrsCallable {
+        target: class,
+        doc: None,
+        module: None,
+    };
+    Ok(Some(Py::new(py, proxy)?.into_any()))
+}
+
+/// A mirror was changed by CPython code: it no longer stands for the native class.
+#[pyfunction]
+fn _detach(cls: &Bound<PyAny>) {
+    let key = cls.as_ptr() as usize;
+    IDENTITY.with(|m| m.borrow_mut().pristine.remove(&key));
+}
+
+/// The class key of the native class `obj` mirrors, if `obj` is a mirror that
+/// still stands for it in the host of `generation` (this thread's live one).
+fn pristine_class(obj: &Bound<PyAny>, generation: u64) -> Option<String> {
+    IDENTITY.with(|m| {
+        m.borrow()
+            .pristine
+            .get(&(obj.as_ptr() as usize))
+            .filter(|(g, _)| *g == generation)
+            .map(|(_, cname)| cname.clone())
+    })
+}
+
+/// A native class as CPython sees it: a class over `object` carrying the
+/// native namespace — methods as `PyrsCallable` descriptors (they bind `self`),
+/// `__annotations__` and class variables by value — so a decorator
+/// (`@dataclass`) can read the fields and add methods, and introspection
+/// (`dataclasses.fields(Cls)`) sees what CPython would. Built once per class
+/// and refreshed from the namespace on every later crossing while it is
+/// pristine, so a class changed after it first crossed is seen as it is now.
+fn class_mirror<'py>(
+    host: &PyHost,
+    py: Python<'py>,
+    cname: &str,
+) -> Result<Bound<'py, PyAny>, String> {
+    let class_def = host.classes.get(cname);
+    let members: Vec<(String, Value)> = class_def
+        .map(|c| c.ns.iter().map(|(k, val)| (k.clone(), val.clone())).collect())
+        .unwrap_or_default();
+    let ns_dict = PyDict::new(py);
+    for (k, val) in &members {
+        let pv = value_to_py(host, py, val)?;
+        ns_dict.set_item(k.as_str(), pv).map_err(|e| e.to_string())?;
+    }
+    let name = class_def.map_or(cname, |c| c.name.as_str());
+    let qualname = class_def
+        .map(|c| c.qualname.as_str())
+        .filter(|q| !q.is_empty())
+        .unwrap_or(name);
+    if !ns_dict.contains("__module__").unwrap_or(false) {
+        let module = class_def.map_or("__main__", |c| c.module.as_str());
+        let _ = ns_dict.set_item("__module__", module);
+    }
+    let _ = ns_dict.set_item("__qualname__", qualname);
+    let key = (host.generation, cname.to_string());
+    let cached = IDENTITY.with(|m| m.borrow().mirrors.get(&key).map(|o| o.clone_ref(py)));
+    if let Some(mirror) = cached {
+        let mirror = mirror.into_bound(py);
+        let still_pristine = IDENTITY.with(|m| {
+            m.borrow().pristine.contains_key(&(mirror.as_ptr() as usize))
+        });
+        if still_pristine {
+            // `type.__setattr__` itself: the metaclass's override would detach.
+            let set = py
+                .get_type::<pyo3::types::PyType>()
+                .getattr("__setattr__")
+                .map_err(|e| e.to_string())?;
+            for (k, v) in ns_dict.iter() {
+                set.call1((&mirror, k, v)).map_err(|e| e.to_string())?;
+            }
+        }
+        return Ok(mirror);
+    }
+    let mirror = mirror_helper(py)?
+        .getattr("make_mirror")
+        .and_then(|f| f.call1((name, ns_dict)))
+        .map_err(|e| e.to_string())?;
+    IDENTITY.with(|m| {
+        let mut m = m.borrow_mut();
+        m.pristine.insert(mirror.as_ptr() as usize, key.clone());
+        m.mirrors.insert(key, mirror.clone().unbind());
+    });
+    Ok(mirror)
+}
+
+/// A pythonrs callable (lambda / def / builtin / bound method / lru_cache)
+/// passed as a callback (`functools.reduce(f, …)`, `sorted(key=f)`, …), wrapped
+/// so CPython can call back into fusevm — the same wrapper every time.
+fn callable_proxy<'py>(host: &PyHost, py: Python<'py>, v: &Value) -> Result<Bound<'py, PyAny>, String> {
+    let Value::Obj(id) = v else {
+        return Err(crate::host::type_error("unsupported value for CPython call"));
+    };
+    let key = (host.generation, *id);
+    if let Some(p) = IDENTITY.with(|m| m.borrow().callables.get(&key).map(|o| o.clone_ref(py))) {
+        return Ok(p.into_bound(py));
+    }
+    let proxy = PyrsCallable {
+        target: v.clone(),
+        doc: None,
+        module: None,
+    };
+    let proxy = Py::new(py, proxy).map_err(|e| e.to_string())?.into_any();
+    IDENTITY.with(|m| m.borrow_mut().callables.insert(key, proxy.clone_ref(py)));
+    Ok(proxy.into_bound(py))
+}
+
+/// A CPython instance of a pristine mirror — made by `object.__new__(mirror)`,
+/// which is how `pickle` (`copyreg.__newobj__`, `copyreg._reconstructor`)
+/// rebuilds an object before restoring its state — crosses back as an instance
+/// of the native class carrying the same attributes.
+///
+/// It is ONE native object however often it crosses: a class's own
+/// `__setstate__` runs on it mid-load, and the finished object crosses again at
+/// the end, so the pair is recorded for the life of the process (like the
+/// side-table, never freed — the CPython object is kept alive with it, so its
+/// address is not reused). It registers itself before its attributes are
+/// converted, so an attribute that refers back to the object is the native one.
+fn instance_from_mirror(
+    host: &mut PyHost,
+    py: Python,
+    obj: &Bound<PyAny>,
+    cname: String,
+) -> Result<Value, String> {
+    let key = obj.as_ptr() as usize;
+    let known = IDENTITY.with(|m| {
+        m.borrow()
+            .converted
+            .get(&key)
+            .filter(|(generation, _, _)| *generation == host.generation)
+            .map(|(_, _, v)| v.clone())
+    });
+    if let Some(inst) = known {
+        return Ok(inst);
+    }
+    let inst = host.new_instance(cname.clone(), crate::host::NameMap::default());
+    IDENTITY.with(|m| {
+        m.borrow_mut()
+            .converted
+            .insert(key, (host.generation, obj.clone().unbind(), inst.clone()))
+    });
+    remember_from_py(obj, &inst);
+    // `BUILD` puts the state into `__dict__` and the slot values (named as
+    // `copyreg._slotnames` names them, mangled) through `setattr`. The mirror
+    // of a subclass does not inherit its base's slots, so a value is routed by
+    // the NATIVE class's slots, wherever the mirror instance kept it.
+    let mut dict_attrs: Vec<(Bound<PyAny>, Bound<PyAny>)> = Vec::new();
+    if let Ok(dict) = obj.getattr("__dict__") {
+        if let Ok(dict) = dict.downcast::<PyDict>() {
+            dict_attrs.extend(dict.iter());
+        }
+    }
+    // Slot values are read by the native class's slot names: asking CPython's
+    // `copyreg._slotnames` would cache `__slotnames__` on the mirror, a change
+    // that detaches it.
+    let native_slots = host.slot_names(&cname);
+    let mut slot_attrs: Vec<(Bound<PyAny>, Bound<PyAny>)> = Vec::new();
+    for name in &native_slots {
+        if let Ok(value) = obj.getattr(name.as_str()) {
+            slot_attrs.push((PyString::new(py, name).into_any(), value));
+        }
+    }
+    for (k, v) in dict_attrs.into_iter().chain(slot_attrs) {
+        let name: String = k.extract().map_err(|e| e.to_string())?;
+        let value = py_to_value(host, py, &v)?;
+        if native_slots.contains(&name) {
+            host.set_attr(&inst, &name, value)?;
+        } else {
+            host.instance_dict_set(&inst, &name, value);
+        }
+    }
+    Ok(inst)
+}
+
 // ── marshaling: pythonrs Value ↔ CPython object ──────────────────────────────
+
+/// The containers one marshal has already converted, so the object GRAPH
+/// crosses rather than a tree: a container reached twice (`[x, x]`, or the same
+/// list passed as two arguments) becomes ONE object on the far side, and a
+/// container that reaches itself (`l.append(l)`) terminates instead of
+/// recursing until the native stack is gone — which aborted the process for
+/// `json.dumps(l)` and `pickle.dumps(l)` where CPython raises or round-trips.
+/// A mutable container registers itself BEFORE its elements are converted, so
+/// a cycle back to it finds the object under construction. The memo lives for
+/// one outermost marshal ([`MemoScope`]), never across a call.
+struct Memo<K, V> {
+    depth: usize,
+    seen: std::collections::HashMap<K, V>,
+}
+
+impl<K, V> Default for Memo<K, V> {
+    fn default() -> Self {
+        Memo {
+            depth: 0,
+            seen: std::collections::HashMap::new(),
+        }
+    }
+}
+
+type MemoKey<K, V> = std::thread::LocalKey<std::cell::RefCell<Memo<K, V>>>;
+
+thread_local! {
+    /// pythonrs heap id → the CPython object it crossed as.
+    static TO_PY_MEMO: std::cell::RefCell<Memo<u32, Py<PyAny>>> =
+        std::cell::RefCell::new(Memo::default());
+    /// CPython object address → the pythonrs value it crossed as.
+    static FROM_PY_MEMO: std::cell::RefCell<Memo<usize, Value>> =
+        std::cell::RefCell::new(Memo::default());
+}
+
+/// One (possibly nested) marshal: the memo is cleared when the outermost scope
+/// ends, so it never holds an object past the conversion that made it.
+struct MemoScope<K: 'static, V: 'static>(&'static MemoKey<K, V>);
+
+impl<K: 'static, V: 'static> MemoScope<K, V> {
+    fn enter(key: &'static MemoKey<K, V>) -> Self {
+        key.with(|m| m.borrow_mut().depth += 1);
+        MemoScope(key)
+    }
+}
+
+impl<K: 'static, V: 'static> Drop for MemoScope<K, V> {
+    fn drop(&mut self) {
+        // Taken out of the cell before it is dropped: releasing a `Py` can run
+        // CPython code, which must not find the memo borrowed.
+        let finished = self.0.with(|m| {
+            let mut m = m.borrow_mut();
+            m.depth -= 1;
+            (m.depth == 0).then(|| std::mem::take(&mut m.seen))
+        });
+        drop(finished);
+    }
+}
+
+/// Record that pythonrs container `v` crossed as `obj`.
+fn remember_to_py(v: &Value, obj: &Bound<PyAny>) {
+    if let Value::Obj(id) = v {
+        TO_PY_MEMO.with(|m| m.borrow_mut().seen.insert(*id, obj.clone().unbind()));
+    }
+}
+
+/// Record that CPython container `obj` crossed as `v`.
+fn remember_from_py(obj: &Bound<PyAny>, v: &Value) {
+    FROM_PY_MEMO.with(|m| m.borrow_mut().seen.insert(obj.as_ptr() as usize, v.clone()));
+}
 
 /// pythonrs `Value` → CPython object. By value for the representable types;
 /// a `Foreign` handle passes the underlying CPython object straight through.
+/// A container already converted in this marshal is the same object again.
 fn value_to_py<'py>(
+    host: &PyHost,
+    py: Python<'py>,
+    v: &Value,
+) -> Result<Bound<'py, PyAny>, String> {
+    let _scope = MemoScope::enter(&TO_PY_MEMO);
+    let Value::Obj(id) = v else {
+        return value_to_py_node(host, py, v);
+    };
+    if let Some(obj) = TO_PY_MEMO.with(|m| m.borrow().seen.get(id).map(|o| o.clone_ref(py))) {
+        return Ok(obj.into_bound(py));
+    }
+    let obj = value_to_py_node(host, py, v)?;
+    if matches!(
+        host.get(v),
+        Some(
+            PyObj::List(_)
+                | PyObj::Tuple(_)
+                | PyObj::Dict(_)
+                | PyObj::Set(_)
+                | PyObj::Frozenset(_)
+                | PyObj::Bytearray(_)
+                | PyObj::Deque { .. }
+                | PyObj::Instance(_)
+        )
+    ) {
+        remember_to_py(v, &obj);
+    }
+    Ok(obj)
+}
+
+/// One node of [`value_to_py`]: converts `v`, going back through
+/// [`value_to_py`] for its elements.
+fn value_to_py_node<'py>(
     host: &PyHost,
     py: Python<'py>,
     v: &Value,
@@ -1209,10 +1611,13 @@ fn value_to_py<'py>(
                     .map_err(|e| e.to_string())
             }
             Some(PyObj::List(items)) => {
-                let elems = marshal_seq(host, py, items)?;
-                Ok(PyList::new(py, elems)
-                    .map_err(|e| e.to_string())?
-                    .into_any())
+                let list = PyList::empty(py);
+                remember_to_py(v, list.as_any());
+                for item in items {
+                    list.append(value_to_py(host, py, item)?)
+                        .map_err(|e| e.to_string())?;
+                }
+                Ok(list.into_any())
             }
             Some(PyObj::Tuple(items)) => {
                 let elems = marshal_seq(host, py, items)?;
@@ -1263,6 +1668,7 @@ fn value_to_py<'py>(
             }
             Some(PyObj::Dict(d)) => {
                 let dict = PyDict::new(py);
+                remember_to_py(v, dict.as_any());
                 for (k, val) in d.values() {
                     let pk = value_to_py(host, py, k)?;
                     let pv = value_to_py(host, py, val)?;
@@ -1319,52 +1725,13 @@ fn value_to_py<'py>(
                 | PyObj::LruCache { .. }
                 | PyObj::StaticMethod(_)
                 | PyObj::ClassMethod(_),
-            ) => {
-                let cb = PyrsCallable {
-                    target: v.clone(),
-                    doc: None,
-                    module: None,
-                };
-                Py::new(py, cb)
-                    .map(|p| p.into_any().into_bound(py))
-                    .map_err(|e| e.to_string())
-            }
+            ) => callable_proxy(host, py, v),
             // A native pythonrs class passed into a CPython call (`@dataclass`,
             // `dataclasses.fields(Cls)`): build a CPython mirror over `object`
             // with the class namespace — methods cross as `PyrsCallable`
             // descriptors (they bind `self`), `__annotations__`/class-vars by
             // value — so the decorator can read the fields and add methods.
-            Some(PyObj::Class(cname)) => {
-                let members: Vec<(String, Value)> = host
-                    .classes
-                    .get(cname)
-                    .map(|c| {
-                        c.ns.iter()
-                            .map(|(k, val)| (k.clone(), val.clone()))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let ns_dict = PyDict::new(py);
-                for (k, val) in &members {
-                    let pv = value_to_py(host, py, val)?;
-                    ns_dict
-                        .set_item(k.as_str(), pv)
-                        .map_err(|e| e.to_string())?;
-                }
-                if !ns_dict.contains("__module__").unwrap_or(false) {
-                    let _ = ns_dict.set_item("__module__", "__main__");
-                }
-                let _ = ns_dict.set_item("__qualname__", cname.as_str());
-                let obj_base = py
-                    .import("builtins")
-                    .and_then(|m| m.getattr("object"))
-                    .map_err(|e| e.to_string())?;
-                let bases = PyTuple::new(py, &[obj_base]).map_err(|e| e.to_string())?;
-                let helper = make_class_helper(py)?;
-                helper
-                    .call1((cname.as_str(), bases, ns_dict))
-                    .map_err(|e| e.to_string())
-            }
+            Some(PyObj::Class(cname)) => class_mirror(host, py, cname),
             // An exception passed into a CPython call — the value handed to a
             // foreign context manager's `__exit__`, a `gen.throw` argument, an
             // error leaving a callback: the CPython object it is paired with.
@@ -1391,19 +1758,30 @@ fn value_to_py<'py>(
             // CPython probes that slot (`PyIndex_Check`) to CHOOSE a path —
             // `bytes(x)` takes a length from an index-able `x` — so every other
             // instance must keep answering "no slot".
+            //
+            // The proxy is the same object every time the instance crosses,
+            // as the instance is one object: `pickle` reaches an object again
+            // through its own state (`a.me = a`) and recognises it by identity.
             Some(PyObj::Instance(i)) => {
                 if let Some(exc) = exc_to_py(host, py, v)? {
                     return Ok(exc);
                 }
-                let proxy = PyrsInstance { target: v.clone() };
-                if crate::builtins::instance_has(host, i, "__index__") {
-                    return Py::new(py, (PyrsIndexInstance, proxy))
-                        .map(|p| p.into_any().into_bound(py))
-                        .map_err(|e| e.to_string());
+                let Value::Obj(id) = v else {
+                    return Err(crate::host::type_error("unsupported value for CPython call"));
+                };
+                let key = (host.generation, *id);
+                if let Some(p) = IDENTITY.with(|m| m.borrow().instances.get(&key).map(|o| o.clone_ref(py))) {
+                    return Ok(p.into_bound(py));
                 }
-                Py::new(py, proxy)
-                    .map(|p| p.into_any().into_bound(py))
-                    .map_err(|e| e.to_string())
+                let proxy = PyrsInstance { target: v.clone() };
+                let proxy = if crate::builtins::instance_has(host, i, "__index__") {
+                    Py::new(py, (PyrsIndexInstance, proxy)).map(|p| p.into_any())
+                } else {
+                    Py::new(py, proxy).map(|p| p.into_any())
+                }
+                .map_err(|e| e.to_string())?;
+                IDENTITY.with(|m| m.borrow_mut().instances.insert(key, proxy.clone_ref(py)));
+                Ok(proxy.into_bound(py))
             }
             // `foreign[1:]` — a mutable container held behind a handle (see
             // `get_attr`) is sliced through CPython's own `__getitem__`, so the
@@ -1493,6 +1871,25 @@ fn big_from_py(obj: &Bound<PyAny>) -> Result<num_bigint::BigInt, String> {
 /// `str` subclass, …) stays a `Foreign` handle so its CPython repr/behavior is
 /// preserved. Anything unrepresentable is likewise kept as `Foreign`.
 fn py_to_value(host: &mut PyHost, py: Python, obj: &Bound<PyAny>) -> Result<Value, String> {
+    let _scope = MemoScope::enter(&FROM_PY_MEMO);
+    let key = obj.as_ptr() as usize;
+    if let Some(v) = FROM_PY_MEMO.with(|m| m.borrow().seen.get(&key).cloned()) {
+        return Ok(v);
+    }
+    let v = py_to_value_node(host, py, obj)?;
+    if obj.is_exact_instance_of::<PyTuple>()
+        || obj.is_exact_instance_of::<PySet>()
+        || obj.is_exact_instance_of::<PyFrozenSet>()
+    {
+        remember_from_py(obj, &v);
+    }
+    Ok(v)
+}
+
+/// One node of [`py_to_value`]: converts `obj`, going back through
+/// [`py_to_value`] for its elements. A list or dict registers itself (see
+/// [`Memo`]) before its elements are converted.
+fn py_to_value_node(host: &mut PyHost, py: Python, obj: &Bound<PyAny>) -> Result<Value, String> {
     if obj.is_none() {
         return Ok(Value::Undef);
     }
@@ -1528,8 +1925,13 @@ fn py_to_value(host: &mut PyHost, py: Python, obj: &Bound<PyAny>) -> Result<Valu
     }
     if obj.is_exact_instance_of::<PyList>() {
         let list = obj.downcast::<PyList>().map_err(|e| e.to_string())?;
+        let out = host.new_list(Vec::new());
+        remember_from_py(obj, &out);
         let items = unmarshal_seq(host, py, list.iter())?;
-        return Ok(host.new_list(items));
+        if let Some(PyObj::List(slot)) = host.get_mut(&out) {
+            *slot = items;
+        }
+        return Ok(out);
     }
     if obj.is_exact_instance_of::<PyTuple>() {
         let tup = obj.downcast::<PyTuple>().map_err(|e| e.to_string())?;
@@ -1538,6 +1940,8 @@ fn py_to_value(host: &mut PyHost, py: Python, obj: &Bound<PyAny>) -> Result<Valu
     }
     if obj.is_exact_instance_of::<PyDict>() {
         let dict = obj.downcast::<PyDict>().map_err(|e| e.to_string())?;
+        let out = host.new_dict(indexmap::IndexMap::new());
+        remember_from_py(obj, &out);
         let mut map = indexmap::IndexMap::new();
         for (k, v) in dict.iter() {
             let kv = py_to_value(host, py, &k)?;
@@ -1545,7 +1949,10 @@ fn py_to_value(host: &mut PyHost, py: Python, obj: &Bound<PyAny>) -> Result<Valu
             let key = host.to_key(&kv)?;
             map.insert(key, (kv, vv));
         }
-        return Ok(host.new_dict(map));
+        if let Some(PyObj::Dict(slot)) = host.get_mut(&out) {
+            *slot = map;
+        }
+        return Ok(out);
     }
     if obj.is_exact_instance_of::<PySet>() || obj.is_exact_instance_of::<PyFrozenSet>() {
         let mut map = indexmap::IndexMap::new();
@@ -1569,6 +1976,14 @@ fn py_to_value(host: &mut PyHost, py: Python, obj: &Bound<PyAny>) -> Result<Valu
     // An exception that crossed before is the object it crossed as.
     if let Some(v) = paired_exception(host, obj) {
         return Ok(v);
+    }
+    // A native class's mirror is the native class; an instance CPython made of
+    // one (`pickle` rebuilding it) is an instance of the native class.
+    if let Some(cname) = pristine_class(obj, host.generation) {
+        return Ok(host.alloc(PyObj::Class(cname)));
+    }
+    if let Some(cname) = pristine_class(obj.get_type().as_any(), host.generation) {
+        return instance_from_mirror(host, py, obj, cname);
     }
     // A CPython builtin type pythonrs implements natively (`int`, `list`, …)
     // comes back as the native type object — the one a bare `int` names — so
@@ -1804,6 +2219,11 @@ fn writeback_mutated_args(
     args: &[Value],
     arg_tuple: &Bound<PyTuple>,
 ) {
+    // Each argument's copy maps back to the argument itself, so a container
+    // that holds one of the arguments (itself included) is rebuilt around the
+    // original rather than recursing through the cycle.
+    let _scope = MemoScope::enter(&FROM_PY_MEMO);
+    let mut mutable = Vec::new();
     for (i, orig) in args.iter().enumerate() {
         let kind = match host.get(orig) {
             Some(PyObj::List(_)) => MutKind::List,
@@ -1814,6 +2234,10 @@ fn writeback_mutated_args(
         let Ok(cpy) = arg_tuple.get_item(i) else {
             continue;
         };
+        remember_from_py(&cpy, orig);
+        mutable.push((orig, cpy, kind));
+    }
+    for (orig, cpy, kind) in mutable {
         if let Some(obj) = rebuild_mutable(host, py, &cpy, kind) {
             if let Some(slot) = host.get_mut(orig) {
                 *slot = obj;
@@ -1869,6 +2293,12 @@ fn pure_seq(host: &mut PyHost, py: Python, cpy: &Bound<PyAny>) -> Option<Vec<Val
 /// unrepresentable results as `Foreign`; the two contracts differ, so they stay
 /// separate functions.
 fn pure_value(host: &mut PyHost, py: Python, obj: &Bound<PyAny>) -> Option<Value> {
+    // A container this write-back already reached (an argument itself, when a
+    // list contains itself) is that same pythonrs object.
+    let key = obj.as_ptr() as usize;
+    if let Some(v) = FROM_PY_MEMO.with(|m| m.borrow().seen.get(&key).cloned()) {
+        return Some(v);
+    }
     if obj.is_none() {
         return Some(Value::Undef);
     }
@@ -1896,8 +2326,13 @@ fn pure_value(host: &mut PyHost, py: Python, obj: &Bound<PyAny>) -> Option<Value
         return Some(host.alloc(PyObj::Bytearray(b.to_vec())));
     }
     if obj.is_exact_instance_of::<PyList>() {
+        let out = host.new_list(Vec::new());
+        remember_from_py(obj, &out);
         let items = pure_seq(host, py, obj)?;
-        return Some(host.new_list(items));
+        if let Some(PyObj::List(slot)) = host.get_mut(&out) {
+            *slot = items;
+        }
+        return Some(out);
     }
     if obj.is_exact_instance_of::<PyTuple>() {
         let items = pure_seq(host, py, obj)?;
@@ -1913,6 +2348,8 @@ fn build_call_args<'py>(
     args: &[Value],
     kwargs: &[(String, Value)],
 ) -> Result<(Bound<'py, PyTuple>, Option<Bound<'py, PyDict>>), String> {
+    // One marshal for the whole call, so an object passed twice is one object.
+    let _scope = MemoScope::enter(&TO_PY_MEMO);
     let py_args = marshal_seq(host, py, args)?;
     let arg_tuple = PyTuple::new(py, py_args).map_err(|e| e.to_string())?;
     let kw = if kwargs.is_empty() {
@@ -2055,6 +2492,30 @@ impl PyrsCallable {
                 .call1((slf, instance)),
             _ => Ok(slf.into_any()),
         }
+    }
+
+    /// How CPython pickles a callable: a function or builtin BY NAME — its
+    /// qualified name, looked up again in its module on load (the proxy is the
+    /// one object that lookup finds) — and a bound method as `getattr(obj,
+    /// name)`, as `method.__reduce__` does.
+    fn __reduce__(&self, py: Python) -> PyResult<Py<PyAny>> {
+        let bound = with_host(|h| match h.get(&self.target) {
+            Some(PyObj::BoundMethod { recv, func }) => Some((recv.clone(), func.clone())),
+            _ => None,
+        });
+        if let Some((recv, func)) = bound {
+            let name = run_for_cpython(|| crate::builtins::raw_getattr(&func, "__name__"))?;
+            let getattr = py.import("builtins")?.getattr("getattr")?;
+            let args = with_host(|h| -> Result<_, String> {
+                Ok((value_to_py(h, py, &recv)?, value_to_py(h, py, &name)?))
+            })
+            .map_err(rs_err)?;
+            return Ok((getattr, args).into_pyobject(py)?.into_any().unbind());
+        }
+        let qualname = run_for_cpython(|| crate::builtins::raw_getattr(&self.target, "__qualname__"))?;
+        with_host(|h| value_to_py(h, py, &qualname))
+            .map(|b| b.unbind())
+            .map_err(rs_err)
     }
 
     #[pyo3(signature = (*args, **kwargs))]
@@ -2476,6 +2937,57 @@ struct PyrsInstance {
 
 #[pymethods]
 impl PyrsInstance {
+    /// The object's class as CPython sees it — the class's mirror — so
+    /// `pickle`'s `obj.__class__ is cls` check, `isinstance` against the
+    /// mirror and `type(obj).__name__`-style reporting through `__class__`
+    /// all name the program's class rather than the proxy type.
+    #[getter(__class__)]
+    fn get_class(&self, py: Python) -> PyResult<Py<PyAny>> {
+        let class = with_host(|h| h.get_attr(&self.target, "__class__")).map_err(rs_err)?;
+        with_host(|h| value_to_py(h, py, &class))
+            .map(|b| b.unbind())
+            .map_err(rs_err)
+    }
+
+    /// `obj.__reduce_ex__(protocol)` as the native object answers it — the
+    /// class's own `__reduce_ex__`/`__reduce__`/`__getstate__` or `object`'s —
+    /// so `pickle` and `copyreg` serialize the program's object, with its
+    /// class crossing as the mirror `__class__` names.
+    fn __reduce_ex__(&self, py: Python, protocol: Bound<PyAny>) -> PyResult<Py<PyAny>> {
+        let protocol = with_host(|h| py_to_value(h, py, &protocol)).map_err(rs_err)?;
+        let r = run_for_cpython(|| {
+            crate::host::call_method(&self.target, "__reduce_ex__", vec![protocol], vec![])
+        })?;
+        with_host(|h| value_to_py(h, py, &r))
+            .map(|b| b.unbind())
+            .map_err(rs_err)
+    }
+
+    fn __reduce__(&self, py: Python) -> PyResult<Py<PyAny>> {
+        let r = run_for_cpython(|| crate::host::call_method(&self.target, "__reduce__", vec![], vec![]))?;
+        with_host(|h| value_to_py(h, py, &r))
+            .map(|b| b.unbind())
+            .map_err(rs_err)
+    }
+
+    /// An attribute CPython code assigns lands on the native object.
+    fn __setattr__(&self, py: Python, name: String, value: Bound<PyAny>) -> PyResult<()> {
+        let v = with_host(|h| py_to_value(h, py, &value)).map_err(rs_err)?;
+        let name_v = with_host(|h| h.new_str(name));
+        run_for_cpython(|| {
+            crate::builtins::call_builtin_function("setattr", vec![self.target.clone(), name_v, v], vec![])
+        })
+        .map(|_| ())
+    }
+
+    fn __delattr__(&self, name: String) -> PyResult<()> {
+        let name_v = with_host(|h| h.new_str(name));
+        run_for_cpython(|| {
+            crate::builtins::call_builtin_function("delattr", vec![self.target.clone(), name_v], vec![])
+        })
+        .map(|_| ())
+    }
+
     fn __getattr__(&self, py: Python, name: String) -> PyResult<Py<PyAny>> {
         match with_host(|h| h.get_attr(&self.target, &name)) {
             Ok(v) => with_host(|h| value_to_py(h, py, &v))

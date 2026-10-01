@@ -1402,3 +1402,292 @@ fn uncaught_bridged_exceptions_show_their_cpython_frames_and_qualified_type() {
         "stderr={stderr}"
     );
 }
+
+/// A pythonrs object crosses into `pickle` (CPython's C pickler) as CPython
+/// would hand it over: an instance's `__class__` is its class's mirror, which
+/// `__main__` resolves by name (the embedded `__main__` answers from the
+/// program's namespace), and its `__reduce_ex__` is the native one, so the bytes
+/// are CPython's at every protocol. Loading rebuilds NATIVE objects: `type(p) is
+/// P`, a class or function pickled by name is the very object, `__reduce__`
+/// recipes and `__getstate__`/`__setstate__` run, a dataclass and an enum member
+/// round-trip, and an object reached twice — or through itself — is one object.
+/// Expected output is python3.14's for the same script.
+#[test]
+fn pickle_round_trips_native_classes_instances_and_functions() {
+    let src = "\
+import pickle, dataclasses, enum
+class P:
+    def __init__(self, x): self.x = x
+    def __eq__(self, o): return type(o) is P and o.x == self.x
+    def __repr__(self): return f'P({self.x!r})'
+class R:
+    def __init__(self, a, b): self.a, self.b = a, b
+    def __reduce__(self): return (R, (self.a, self.b))
+    def __repr__(self): return f'R({self.a}, {self.b})'
+class S:
+    def __init__(self): self.v = 1
+    def __getstate__(self): return {'v': self.v * 10}
+    def __setstate__(self, st): self.v = st['v'] + 1
+class Outer:
+    class Inner:
+        def __init__(self): self.k = 'in'
+def f(a): return a + 1
+@dataclasses.dataclass
+class D:
+    a: int
+    b: list
+class Color(enum.Enum):
+    RED = 1
+for proto in range(6):
+    b = pickle.dumps(P(3), proto)
+    p = pickle.loads(b)
+    print(proto, b, type(p).__name__, p.x, p == P(3), isinstance(p, P))
+print(pickle.loads(pickle.dumps(R(1, [2]))))
+s = pickle.loads(pickle.dumps(S())); print(type(s) is S, s.v)
+i = pickle.loads(pickle.dumps(Outer.Inner())); print(type(i) is Outer.Inner, i.k)
+print(pickle.loads(pickle.dumps(f)) is f, pickle.loads(pickle.dumps(f))(1))
+print(pickle.loads(pickle.dumps(P)) is P, pickle.dumps(P))
+d = pickle.loads(pickle.dumps(D(1, [2]))); print(d, d == D(1, [2]))
+print(pickle.loads(pickle.dumps(Color.RED)) is Color.RED)
+a = P(1); a.me = a; g = [a, a]
+h = pickle.loads(pickle.dumps(g)); print(h[0] is h[1], h[0].me is h[0], h[0].x)
+try: pickle.dumps(lambda: 1)
+except Exception as e: print(type(e).__name__)
+m = pickle.loads(pickle.dumps(P(5).__eq__)); print(m(P(5)))
+print(pickle.dumps({'k': P([1, 2])}, 2))
+";
+    let (stdout, stderr, ok) = run_py(src);
+    if bridge_unavailable(ok, &stderr) {
+        eprintln!("skipping pickle test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(
+        stdout,
+        r#"
+0 b'ccopy_reg\n_reconstructor\np0\n(c__main__\nP\np1\nc__builtin__\nobject\np2\nNtp3\nRp4\n(dp5\nVx\np6\nI3\nsb.' P 3 True True
+1 b'ccopy_reg\n_reconstructor\nq\x00(c__main__\nP\nq\x01c__builtin__\nobject\nq\x02Ntq\x03Rq\x04}q\x05X\x01\x00\x00\x00xq\x06K\x03sb.' P 3 True True
+2 b'\x80\x02c__main__\nP\nq\x00)\x81q\x01}q\x02X\x01\x00\x00\x00xq\x03K\x03sb.' P 3 True True
+3 b'\x80\x03c__main__\nP\nq\x00)\x81q\x01}q\x02X\x01\x00\x00\x00xq\x03K\x03sb.' P 3 True True
+4 b'\x80\x04\x95\x1f\x00\x00\x00\x00\x00\x00\x00\x8c\x08__main__\x94\x8c\x01P\x94\x93\x94)\x81\x94}\x94\x8c\x01x\x94K\x03sb.' P 3 True True
+5 b'\x80\x05\x95\x1f\x00\x00\x00\x00\x00\x00\x00\x8c\x08__main__\x94\x8c\x01P\x94\x93\x94)\x81\x94}\x94\x8c\x01x\x94K\x03sb.' P 3 True True
+R(1, [2])
+True 11
+True in
+True 2
+True b'\x80\x05\x95\x12\x00\x00\x00\x00\x00\x00\x00\x8c\x08__main__\x94\x8c\x01P\x94\x93\x94.'
+D(a=1, b=[2]) True
+True
+True True 1
+PicklingError
+True
+b'\x80\x02}q\x00X\x01\x00\x00\x00kq\x01c__main__\nP\nq\x02)\x81q\x03}q\x04X\x01\x00\x00\x00xq\x05]q\x06(K\x01K\x02esbs.'
+"#
+        .trim_start(),
+        "stderr={stderr}"
+    );
+}
+
+/// `object.__reduce_ex__` on a user instance is CPython's (`reduce_newobj`,
+/// `object_getstate`, `copyreg._reduce_ex`): a class's own `__getstate__`,
+/// `__reduce__`, `__getnewargs__` and `__getnewargs_ex__` are honoured, slot
+/// values travel as `(state, slots)` under their mangled names, protocols 0 and
+/// 1 refuse a slotted class without `__getstate__`, and a builtin subclass
+/// reduces to ITS class with the list/dict items (or, below protocol 2, the
+/// builtin base and its value). Expected output is python3.14's.
+#[test]
+fn object_reduce_ex_follows_copyreg_for_user_instances() {
+    let src = "\
+class S:
+    def __init__(self): self.v = 1
+    def __getstate__(self): return {'v': self.v * 10}
+class T:
+    __slots__ = ('a', 'b', '__c')
+    def __init__(self): self.a = 1; self.__c = 3
+class U(T):
+    def __init__(self): super().__init__(); self.z = 2
+class E: pass
+class R:
+    def __reduce__(self): return (R, ())
+class NA:
+    def __init__(self, x): self.x = x
+    def __getnewargs__(self): return (self.x,)
+class NE:
+    def __getnewargs_ex__(self): return ((1,), {'k': 2})
+class L(list): pass
+class Dd(dict): pass
+class I(int): pass
+def show(o, protos=(0, 1, 2, 5)):
+    for p in protos:
+        try: r = o.__reduce_ex__(p)
+        except Exception as e: r = f'{type(e).__name__}: {e}'
+        print(type(o).__name__, p, r if isinstance(r, str) else (getattr(r[0], '__name__', r[0]),) + tuple(r[1:]))
+show(S()); show(T()); show(U()); show(E()); show(R()); show(NA(4), (2,)); show(NE(), (2,))
+l = L([1, 2]); l.q = 1
+r = l.__reduce_ex__(2); print(r[0].__name__, r[1], r[2], list(r[3]), r[4])
+d = Dd(a=1); r = d.__reduce_ex__(2); print(r[1], r[2], r[3], list(r[4]))
+show(I(5), (2,)); show(L([1]), (0,))
+print(T().__getstate__(), U().__getstate__(), E().__getstate__(), S().__getstate__())
+class S2(set): pass
+s2 = S2({1}); s2.t = 1
+print(s2.__reduce_ex__(2)[0].__name__, s2.__reduce_ex__(2)[1:], S2().__reduce__())
+";
+    let (stdout, stderr, ok) = run_py(src);
+    if bridge_unavailable(ok, &stderr) {
+        eprintln!("skipping reduce test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(
+        stdout,
+        r#"
+S 0 ('_reconstructor', (<class '__main__.S'>, <class 'object'>, None), {'v': 10})
+S 1 ('_reconstructor', (<class '__main__.S'>, <class 'object'>, None), {'v': 10})
+S 2 ('__newobj__', (<class '__main__.S'>,), {'v': 10}, None, None)
+S 5 ('__newobj__', (<class '__main__.S'>,), {'v': 10}, None, None)
+T 0 TypeError: a class that defines __slots__ without defining __getstate__ cannot be pickled
+T 1 TypeError: a class that defines __slots__ without defining __getstate__ cannot be pickled
+T 2 ('__newobj__', (<class '__main__.T'>,), (None, {'a': 1, '_T__c': 3}), None, None)
+T 5 ('__newobj__', (<class '__main__.T'>,), (None, {'a': 1, '_T__c': 3}), None, None)
+U 0 TypeError: a class that defines __slots__ without defining __getstate__ cannot be pickled
+U 1 TypeError: a class that defines __slots__ without defining __getstate__ cannot be pickled
+U 2 ('__newobj__', (<class '__main__.U'>,), ({'z': 2}, {'a': 1, '_T__c': 3}), None, None)
+U 5 ('__newobj__', (<class '__main__.U'>,), ({'z': 2}, {'a': 1, '_T__c': 3}), None, None)
+E 0 ('_reconstructor', (<class '__main__.E'>, <class 'object'>, None))
+E 1 ('_reconstructor', (<class '__main__.E'>, <class 'object'>, None))
+E 2 ('__newobj__', (<class '__main__.E'>,), None, None, None)
+E 5 ('__newobj__', (<class '__main__.E'>,), None, None, None)
+R 0 ('R', ())
+R 1 ('R', ())
+R 2 ('R', ())
+R 5 ('R', ())
+NA 2 ('__newobj__', (<class '__main__.NA'>, 4), {'x': 4}, None, None)
+NE 2 ('__newobj_ex__', (<class '__main__.NE'>, (1,), {'k': 2}), None, None, None)
+__newobj__ (<class '__main__.L'>,) {'q': 1} [1, 2] None
+(<class '__main__.Dd'>,) None None [('a', 1)]
+I 2 ('__newobj__', (<class '__main__.I'>, 5), None, None, None)
+L 0 ('_reconstructor', (<class '__main__.L'>, <class 'list'>, [1]))
+(None, {'a': 1, '_T__c': 3}) ({'z': 2}, {'a': 1, '_T__c': 3}) None {'v': 10}
+S2 (([1],), {'t': 1}) (<class '__main__.S2'>, ([],), None)
+"#
+        .trim_start(),
+        "stderr={stderr}"
+    );
+}
+
+/// The object GRAPH crosses the bridge, not a tree: a list that contains itself
+/// reaches `json` (which reports the cycle) and `pickle` (which round-trips it)
+/// instead of recursing until the process aborts, and a list reached twice is
+/// one CPython object, so `pickle` stores it once and loads it shared — in both
+/// directions. Expected output is python3.14's.
+#[test]
+fn self_referential_and_shared_containers_cross_as_a_graph() {
+    let src = "\
+import json, pickle, copy
+l = [1]; l.append(l)
+try: json.dumps(l)
+except ValueError as e: print('json', e)
+d = {}; d['self'] = d
+try: json.dumps(d)
+except ValueError as e: print('json', e)
+x = [1]
+y = pickle.loads(pickle.dumps([x, x, (x,)]))
+print(y, y[0] is y[1], y[2][0] is y[0])
+z = pickle.loads(pickle.dumps(l))
+print(z[1] is z, z)
+import operator
+print(operator.is_(l, l), l[1] is l)
+";
+    let (stdout, stderr, ok) = run_py(src);
+    if bridge_unavailable(ok, &stderr) {
+        eprintln!("skipping graph test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(
+        stdout,
+        "json Circular reference detected\n\
+         json Circular reference detected\n\
+         [[1], [1], ([1],)] True True\n\
+         True [1, [...]]\n\
+         True True\n",
+        "stderr={stderr}"
+    );
+}
+
+/// `import __main__` is the running program's own module — the namespace its
+/// globals live in, registered in `sys.modules` before the body runs and
+/// repr'd as CPython reprs a script's module — not the embedded interpreter's
+/// empty `__main__`. Expected output is python3.14's.
+#[test]
+fn import_main_is_the_programs_own_module() {
+    let src = "\
+import sys
+X = 1
+import __main__
+print(__main__.X, __import__('__main__').X, sys.modules['__main__'] is __main__, __main__.__dict__ is globals())
+print(repr(__main__) == f\"<module '__main__' from {__file__!r}>\")
+";
+    let (stdout, stderr, ok) = run_py(src);
+    if bridge_unavailable(ok, &stderr) {
+        eprintln!("skipping __main__ test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(stdout, "1 1 True True\nTrue\n", "stderr={stderr}");
+}
+
+/// A native class crosses as one CPython object and comes back as itself, so a
+/// class named in an annotation is that class again on the far side:
+/// `dataclasses.fields(F)[0].type is E`, `typing.get_type_hints(N)['e'] is E`,
+/// and inside a generic alias. Expected output is python3.14's.
+#[test]
+fn a_native_class_in_an_annotation_round_trips_as_itself() {
+    let src = "\
+import typing, dataclasses, collections
+class E: pass
+class N(typing.NamedTuple):
+    e: E
+    i: int
+print(N.__annotations__['e'] is E, typing.get_type_hints(N)['e'] is E, N(E(), 1).i)
+@dataclasses.dataclass
+class F:
+    e: E
+    g: list[E]
+print(dataclasses.fields(F)[0].type is E, dataclasses.fields(F)[1].type, dataclasses.fields(F)[1].type.__args__[0] is E)
+";
+    let (stdout, stderr, ok) = run_py(src);
+    if bridge_unavailable(ok, &stderr) {
+        eprintln!("skipping annotation identity test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(stdout, "True True 1\nTrue list[__main__.E] True\n", "stderr={stderr}");
+}
+
+/// Slot values pickle as `(state, slots)` and come back into the native class's
+/// slot storage — including a slotted base's slots under an unslotted subclass,
+/// whose mirror does not carry them — so the reloaded object pickles to the same
+/// bytes. Expected output is python3.14's.
+#[test]
+fn pickle_round_trips_slot_values() {
+    let src = "\
+import pickle
+class T:
+    __slots__ = ('a', '__c')
+    def __init__(self): self.a = 1; self.__c = 3
+    def c(self): return self.__c
+class U(T):
+    pass
+u = U(); u.z = 5
+for o in (T(), u):
+    for p in (2, 5):
+        r = pickle.loads(pickle.dumps(o, p))
+        print(type(r).__name__, r.a, r.c(), getattr(r, 'z', None), pickle.dumps(o, p) == pickle.dumps(r, p))
+";
+    let (stdout, stderr, ok) = run_py(src);
+    if bridge_unavailable(ok, &stderr) {
+        eprintln!("skipping slot pickle test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(
+        stdout,
+        "T 1 3 None True\nT 1 3 None True\nU 1 3 5 True\nU 1 3 5 True\n",
+        "stderr={stderr}"
+    );
+}

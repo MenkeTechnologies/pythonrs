@@ -15031,6 +15031,23 @@ fn type_getnewargs(recv: &Value, tn: &str) -> Result<Vec<Value>, String> {
 /// branch RAISES for a non-heap type — which is why `(5).__reduce__()` is a
 /// `TypeError` rather than a pickle recipe. Protocol >= 2 skips `copyreg` and
 /// takes `reduce_newobj` instead.
+/// The constructor arguments of a `bytearray` recipe (`_common_reduce` in
+/// `Objects/bytearrayobject.c`): none for an empty one, its bytes decoded as
+/// latin-1 below protocol 3 (the Python 2 compatible form), a `bytes` from 3 on.
+fn bytearray_reduce_args(bytes: Vec<u8>, protocol: i64) -> Vec<Value> {
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+    with_host(|h| {
+        if protocol < 3 {
+            let latin1: String = bytes.iter().map(|&b| b as char).collect();
+            vec![h.new_str(latin1), h.new_str("latin-1")]
+        } else {
+            vec![h.alloc(PyObj::Bytes(bytes))]
+        }
+    })
+}
+
 fn object_reduce(recv: &Value, tn: &str, protocol: Option<i64>) -> Result<Value, String> {
     let own = |args: Vec<Value>| {
         with_host(|h| {
@@ -15046,20 +15063,13 @@ fn object_reduce(recv: &Value, tn: &str, protocol: Option<i64>) -> Result<Value,
             let lst = with_host(|h| h.new_list(items));
             Ok(own(vec![lst]))
         }
-        // `bytearray` rebuilds from its bytes decoded as latin-1 below protocol
-        // 5, and from a `bytes` object at 5 and above.
         "bytearray" => {
             let bytes = with_host(|h| match h.get(recv) {
                 Some(PyObj::Bytearray(b)) => b.clone(),
                 _ => Vec::new(),
             });
-            if protocol.unwrap_or(0) >= 5 {
-                let b = with_host(|h| h.alloc(PyObj::Bytes(bytes)));
-                return Ok(own(vec![b]));
-            }
-            let latin1: String = bytes.iter().map(|&b| b as char).collect();
-            let (s, enc) = with_host(|h| (h.new_str(latin1), h.new_str("latin-1")));
-            Ok(own(vec![s, enc]))
+            // `bytearray.__reduce__()` is the protocol-2 recipe.
+            Ok(own(bytearray_reduce_args(bytes, protocol.unwrap_or(2))))
         }
         // `range` and `slice` rebuild from their three fields, with no state
         // slot at all — their recipe is a 2-tuple, not a 3-tuple.
@@ -15445,13 +15455,14 @@ pub fn instance_object_dunder(
         },
         "__init__" | "__init_subclass__" => Ok(Value::Undef),
         "__subclasshook__" => not_implemented(),
-        // The instance `__dict__` is the pickle state — `None` when empty, which
-        // is what makes `object().__getstate__()` None rather than `{}`.
-        "__getstate__" => instance_state(recv),
-        "__reduce__" => instance_reduce(recv, class, 0),
+        // `object.__getstate__()` takes no argument, so the state is not
+        // `required`: an instance with no attributes gives `None`.
+        "__getstate__" => object_getstate_default(recv, class, false),
+        "__reduce__" => builtin_base_reduce(recv, class)
+            .unwrap_or_else(|| instance_common_reduce(recv, class, 0)),
         "__reduce_ex__" => {
             let p = with_host(|h| h.as_int(&arg0())).unwrap_or(0);
-            instance_reduce(recv, class, p)
+            instance_reduce_ex(recv, class, p)
         }
         _ => return None,
     })
@@ -15495,48 +15506,216 @@ fn instance_state(recv: &Value) -> Result<Value, String> {
     }))
 }
 
-/// `instance.__reduce__()` / `.__reduce_ex__(protocol)` — CPython's
-/// `object.__reduce_ex__`, which splits at protocol 2.
-///
-/// Below 2 it goes through `copyreg._reduce_ex`, whose recipe rebuilds the
-/// object with `copyreg._reconstructor(cls, base, state)`; at 2 and above
-/// `reduce_newobj` uses `copyreg.__newobj__` instead. Both callables come from
-/// the real module, because the pickler compares them by IDENTITY.
-fn instance_reduce(recv: &Value, class: &str, protocol: i64) -> Result<Value, String> {
+// ── pickling a user instance: `Objects/typeobject.c` and `Lib/copyreg.py` ────
+//
+// `copyreg`'s callables (`__newobj__`, `__newobj_ex__`, `_reconstructor`) come
+// from the real module, because the pickler compares them by IDENTITY.
+
+/// `object.__reduce_ex__(protocol)` (`object___reduce_ex___impl`): a class that
+/// overrides `__reduce__` is asked for its own recipe; any other instance gets
+/// the common one.
+fn instance_reduce_ex(recv: &Value, class: &str, protocol: i64) -> Result<Value, String> {
+    if with_host(|h| h.class_lookup(class, "__reduce__")).is_some() {
+        return host::call_method(recv, "__reduce__", vec![], vec![]);
+    }
+    if let Some(r) = builtin_base_reduce(recv, class) {
+        return r;
+    }
+    instance_common_reduce(recv, class, protocol)
+}
+
+/// The recipe of a builtin base that defines its own `__reduce__`, applied to a
+/// subclass instance: `set`/`frozenset` (`set_reduce`) rebuild as
+/// `(type(self), (list(self),), state)`, the state being `object_getstate`'s.
+/// `None` for every other base, which uses `object`'s protocol.
+fn builtin_base_reduce(recv: &Value, class: &str) -> Option<Result<Value, String>> {
+    let base = with_host(|h| h.builtin_base_of(class))?;
+    if !matches!(base, "set" | "frozenset") {
+        return None;
+    }
+    let args = match call_builtin_function("list", vec![recv.clone()], vec![]) {
+        Ok(items) => vec![items],
+        Err(e) => return Some(Err(e)),
+    };
+    Some(object_getstate(recv, class, false).map(|state| {
+        with_host(|h| {
+            let cls = h.alloc(PyObj::Class(class.to_string()));
+            let args = h.new_tuple(args);
+            h.new_tuple(vec![cls, args, state])
+        })
+    }))
+}
+
+/// `_common_reduce`: protocol 2 and above is `reduce_newobj`, below it
+/// `copyreg._reduce_ex`.
+fn instance_common_reduce(recv: &Value, class: &str, protocol: i64) -> Result<Value, String> {
+    if protocol >= 2 {
+        instance_reduce_newobj(recv, class)
+    } else {
+        copyreg_reduce_ex(recv, class)
+    }
+}
+
+/// `reduce_newobj`: `(copyreg.__newobj__, (cls, *args), state, listitems,
+/// dictitems)`, or `__newobj_ex__` with `(cls, args, kwargs)` when
+/// `__getnewargs_ex__` supplies keyword arguments.
+fn instance_reduce_newobj(recv: &Value, class: &str) -> Result<Value, String> {
+    let (args, kwargs) = instance_new_arguments(recv, class)?;
     let copyreg = host::import_module("copyreg")?;
-    let cls = with_host(|h| h.alloc(PyObj::Class(class.to_string())));
-    // `copyreg._reduce_ex` (below protocol 2) refuses a slotted instance whose
-    // class keeps `object.__getstate__`, whose state would drop the slots.
-    if protocol < 2 && !with_host(|h| h.class_has(class, "__getstate__")) {
-        let slots = get_attr_desc(recv, "__slots__").unwrap_or(Value::Undef);
-        if with_host(|h| h.truthy(&slots)) {
+    let base = with_host(|h| h.builtin_base_of(class));
+    let has_kwargs = kwargs
+        .as_ref()
+        .is_some_and(|k| with_host(|h| matches!(h.get(k), Some(PyObj::Dict(d)) if !d.is_empty())));
+    let (newobj, newargs) = with_host(|h| -> Result<_, String> {
+        let cls = h.alloc(PyObj::Class(class.to_string()));
+        if has_kwargs {
+            let args = args.clone().unwrap_or_else(|| h.new_tuple(Vec::new()));
+            let kwargs = kwargs.clone().unwrap_or(Value::Undef);
+            Ok((h.get_attr(&copyreg, "__newobj_ex__")?, h.new_tuple(vec![cls, args, kwargs])))
+        } else {
+            let mut items = vec![cls];
+            if let Some(Some(PyObj::Tuple(extra))) = args.as_ref().map(|a| h.get(a)) {
+                items.extend(extra.iter().cloned());
+            }
+            Ok((h.get_attr(&copyreg, "__newobj__")?, h.new_tuple(items)))
+        }
+    })?;
+    let required = !(args.is_some() || matches!(base, Some("list" | "dict")));
+    let state = object_getstate(recv, class, required)?;
+    // `_PyObject_GetItemsIter`: a list subclass refills from `iter(obj)`, a dict
+    // subclass from `iter(obj.items())`.
+    let listitems = match base {
+        Some("list") => call_builtin_function("iter", vec![recv.clone()], vec![])?,
+        _ => Value::Undef,
+    };
+    let dictitems = match base {
+        Some("dict") => {
+            let items = host::call_method(recv, "items", vec![], vec![])?;
+            call_builtin_function("iter", vec![items], vec![])?
+        }
+        _ => Value::Undef,
+    };
+    Ok(with_host(|h| h.new_tuple(vec![newobj, newargs, state, listitems, dictitems])))
+}
+
+/// `_PyObject_GetNewArguments`: `__getnewargs_ex__()` as `(args, kwargs)`, else
+/// `__getnewargs__()` as `(args, None)`, else neither — each looked up on the
+/// type, as a special method is, and checked as CPython checks it.
+fn instance_new_arguments(recv: &Value, class: &str) -> Result<(Option<Value>, Option<Value>), String> {
+    let tuple_items = |v: &Value| with_host(|h| match h.get(v) {
+        Some(PyObj::Tuple(items)) => Some(items.clone()),
+        _ => None,
+    });
+    let type_name = |v: &Value| with_host(|h| h.type_name(v));
+    if with_host(|h| h.class_lookup(class, "__getnewargs_ex__")).is_some() {
+        let r = host::call_method(recv, "__getnewargs_ex__", vec![], vec![])?;
+        let Some(pair) = tuple_items(&r) else {
+            return Err(host::type_error(&format!(
+                "__getnewargs_ex__ should return a tuple, not '{}'",
+                type_name(&r)
+            )));
+        };
+        let [args, kwargs] = pair.as_slice() else {
+            return Err(format!(
+                "ValueError: __getnewargs_ex__ should return a tuple of length 2, not {}",
+                pair.len()
+            ));
+        };
+        if tuple_items(args).is_none() {
+            return Err(host::type_error(&format!(
+                "first item of the tuple returned by __getnewargs_ex__ must be a tuple, not '{}'",
+                type_name(args)
+            )));
+        }
+        if !with_host(|h| matches!(h.get(kwargs), Some(PyObj::Dict(_)))) {
+            return Err(host::type_error(&format!(
+                "second item of the tuple returned by __getnewargs_ex__ must be a dict, not '{}'",
+                type_name(kwargs)
+            )));
+        }
+        return Ok((Some(args.clone()), Some(kwargs.clone())));
+    }
+    let own = with_host(|h| h.class_lookup(class, "__getnewargs__")).is_some();
+    let args = if own {
+        host::call_method(recv, "__getnewargs__", vec![], vec![])?
+    } else {
+        // A builtin base that defines `__getnewargs__` (`int`, `str`, `tuple`, …)
+        // answers from the instance's native payload.
+        let base_args = with_host(|h| {
+            let base = h.builtin_base_of(class)?;
+            let payload = match h.get(recv) {
+                Some(PyObj::Instance(i)) => i.payload.clone(),
+                _ => return None,
+            };
+            Some((base, payload))
+        });
+        match base_args.and_then(|(base, payload)| type_getnewargs(&payload, base).ok()) {
+            Some(items) => with_host(|h| h.new_tuple(items)),
+            None => return Ok((None, None)),
+        }
+    };
+    if tuple_items(&args).is_none() {
+        return Err(host::type_error(&format!(
+            "__getnewargs__ should return a tuple, not '{}'",
+            type_name(&args)
+        )));
+    }
+    Ok((Some(args), None))
+}
+
+/// `object_getstate`: the class's own `__getstate__` if it has one, else the
+/// default state.
+fn object_getstate(recv: &Value, class: &str, required: bool) -> Result<Value, String> {
+    if with_host(|h| h.class_lookup(class, "__getstate__")).is_some() {
+        return host::call_method(recv, "__getstate__", vec![], vec![]);
+    }
+    object_getstate_default(recv, class, required)
+}
+
+/// `object_getstate_default`: [`instance_state`], except that a `required`
+/// state of a variable-size builtin subclass cannot be produced.
+fn object_getstate_default(recv: &Value, class: &str, required: bool) -> Result<Value, String> {
+    if required && with_host(|h| matches!(h.builtin_base_of(class), Some("int" | "bytes" | "tuple"))) {
+        let name = with_host(|h| h.classes.get(class).map_or(class.to_string(), |c| c.name.clone()));
+        return Err(host::type_error(&format!("cannot pickle '{name}' object")));
+    }
+    instance_state(recv)
+}
+
+/// `copyreg._reduce_ex(self, proto)` for protocols 0 and 1:
+/// `(copyreg._reconstructor, (cls, base, state), dict)`, where `base` is the
+/// nearest builtin type in the MRO and `state` the instance converted to it,
+/// and `dict` is the `__getstate__()` result (left off when falsy).
+fn copyreg_reduce_ex(recv: &Value, class: &str) -> Result<Value, String> {
+    let copyreg = host::import_module("copyreg")?;
+    let reconstructor = with_host(|h| h.get_attr(&copyreg, "_reconstructor"))?;
+    let base = with_host(|h| h.builtin_base_of(class)).unwrap_or("object");
+    let state = if base == "object" {
+        Value::Undef
+    } else {
+        call_builtin_function(base, vec![recv.clone()], vec![])?
+    };
+    let args = with_host(|h| {
+        let cls = h.alloc(PyObj::Class(class.to_string()));
+        let base = h.builtin_object(base);
+        h.new_tuple(vec![cls, base, state])
+    });
+    let dict = if with_host(|h| h.class_lookup(class, "__getstate__")).is_some() {
+        host::call_method(recv, "__getstate__", vec![], vec![])?
+    } else {
+        if with_host(|h| h.class_lookup(class, "__slots__").is_some_and(|s| h.truthy(&s))) {
             return Err(host::type_error(
                 "a class that defines __slots__ without defining __getstate__ cannot be pickled",
             ));
         }
-    }
-    // The state is what `__getstate__` answers — a class's own override
-    // included, as `_PyObject_GetState` calls it.
-    let state = host::call_method(recv, "__getstate__", vec![], vec![])?;
-    let (func, args) = if protocol >= 2 {
-        let f = with_host(|h| h.get_attr(&copyreg, "__newobj__"))?;
-        (f, with_host(|h| h.new_tuple(vec![cls])))
-    } else {
-        let f = with_host(|h| h.get_attr(&copyreg, "_reconstructor"))?;
-        let base = with_host(|h| h.alloc(PyObj::Builtin("object".into())));
-        (f, with_host(|h| h.new_tuple(vec![cls, base, Value::Undef])))
+        object_getstate_default(recv, class, false)?
     };
     Ok(with_host(|h| {
-        // Protocol 2's recipe carries the two item-iterator slots; the older one
-        // stops at the state, and omits even that when there is none.
-        let items = if protocol >= 2 {
-            vec![func, args, state, Value::Undef, Value::Undef]
-        } else if matches!(state, Value::Undef) {
-            vec![func, args]
+        if h.truthy(&dict) {
+            h.new_tuple(vec![reconstructor, args, dict])
         } else {
-            vec![func, args, state]
-        };
-        h.new_tuple(items)
+            h.new_tuple(vec![reconstructor, args])
+        }
     }))
 }
 
