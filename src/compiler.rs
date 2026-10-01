@@ -255,6 +255,20 @@ pub fn compile_interactive(stmts: &[Stmt]) -> Result<Program, String> {
 }
 
 fn compile_ex(stmts: &[Stmt], debug: bool, interactive: bool) -> Result<Program, String> {
+    // Every walk checks the native stack (`_Py_EnterRecursiveCall(" during
+    // compilation")`). One that cannot return an error records it and stops
+    // descending; the error it recorded is raised in place of whatever the
+    // compile went on to produce, which was built from a partial answer.
+    crate::stack::clear_pending();
+    let compiled =
+        crate::stack::with_frontend_stack(|| compile_checked(stmts, debug, interactive));
+    match crate::stack::take_pending() {
+        Some(overflow) => Err(overflow),
+        None => compiled,
+    }
+}
+
+fn compile_checked(stmts: &[Stmt], debug: bool, interactive: bool) -> Result<Program, String> {
     // Private-name mangling: `self.__x` inside `class C` is `self._C__x`.
     // CPython does this in the compiler, not the parser, and so does pythonrs —
     // `ast.parse` must keep showing the name as written, and it reaches the same
@@ -394,6 +408,7 @@ impl Compiler {
     }
 
     fn compile_stmt(&mut self, b: &mut ChunkBuilder, s: &Stmt) -> Result<(), String> {
+        crate::stack::enter_compile()?;
         if s.line != 0 {
             self.cur_line = s.line;
         }
@@ -723,6 +738,7 @@ impl Compiler {
     }
 
     fn compile_assign(&mut self, b: &mut ChunkBuilder, target: &Expr) -> Result<(), String> {
+        crate::stack::enter_compile()?;
         // Value is on top of stack. Peel the parser's span wrapper so a target
         // like `x`, `a.b`, or `a[i]` (all `Spanned`) matches structurally —
         // keeping it as the active `node_span`, because a subscript STORE can
@@ -802,6 +818,7 @@ impl Compiler {
     }
 
     fn compile_delete(&mut self, b: &mut ChunkBuilder, target: &Expr) -> Result<(), String> {
+        crate::stack::enter_compile()?;
         // `del a.b` / `del a[i]` raise as often as the matching stores do, and
         // the caret comes from the target's span — so keep the wrapper active
         // instead of peeling it, exactly as `compile_assign` does.
@@ -2770,6 +2787,7 @@ impl Compiler {
 
     // ── expressions ──────────────────────────────────────────────────────
     fn compile_expr(&mut self, b: &mut ChunkBuilder, e: &Expr) -> Result<(), String> {
+        crate::stack::enter_compile()?;
         // Peel the parser's span wrapper: set it as the active `node_span` while
         // lowering the inner node, so the raising op (name load / binop / subscript
         // / call / attribute / unary) records it. Children save/restore around
@@ -2800,6 +2818,17 @@ impl Compiler {
             self.node_span = prev;
             return r;
         }
+        self.compile_expr_node(b, e)
+    }
+
+    /// Lower one expression node, its span (if it had one) already active.
+    ///
+    /// Kept apart from [`Compiler::compile_expr`]'s span handling so that a
+    /// chain of spanned nodes — `a.b.c…`, `f()()…`, `1+1+1…`, one `Spanned`
+    /// per link — costs one large frame per link rather than two, which is
+    /// what decides how long a chain fits the stack before the compile raises
+    /// `RecursionError`.
+    fn compile_expr_node(&mut self, b: &mut ChunkBuilder, e: &Expr) -> Result<(), String> {
         match e {
             Expr::Spanned(_, _) => unreachable!("peeled above"),
             Expr::None => {
@@ -4048,6 +4077,7 @@ impl Compiler {
         pat: &Pattern,
         fails: &mut Vec<usize>,
     ) -> Result<(), String> {
+        crate::stack::enter_compile()?;
         match &pat.kind {
             PatternKind::Wildcard => {
                 b.emit(Op::Pop, 0);
@@ -4250,6 +4280,7 @@ fn validate_pattern(
     bound: &mut Vec<String>,
     allow_irrefutable: bool,
 ) -> Result<(), String> {
+    crate::stack::enter_compile()?;
     match &pat.kind {
         PatternKind::Value(_) | PatternKind::Star(None) => Ok(()),
         PatternKind::Wildcard => {
@@ -4436,6 +4467,9 @@ fn wrap_comp_clauses(mut inner: Vec<Stmt>, comps: &[Comprehension]) -> Vec<Stmt>
 /// on `x is <literal>`. `None` for names, containers CPython doesn't fold
 /// (`list`/`dict`/`set`), and the singletons (`None`/`True`/`False`).
 fn const_literal_type(e: &Expr) -> Option<&'static str> {
+    if crate::stack::compile_overflowed() {
+        return None;
+    }
     let e = e.unspanned();
     match e {
         Expr::Int(_) | Expr::BigInt(_) => Some("int"),
@@ -4536,6 +4570,9 @@ fn bad_index_type(e: &Expr) -> Option<&'static str> {
 /// Recursion stops at a nested `def`/`class`: those open their own scope and
 /// their annotations belong to it, not to this class.
 fn is_ann_assign(s: &Stmt) -> bool {
+    if crate::stack::compile_overflowed() {
+        return false;
+    }
     match &s.kind {
         StmtKind::AnnAssign { target, .. } => matches!(target.unspanned(), Expr::Name(_)),
         StmtKind::If { body, orelse, .. } => {
@@ -4638,6 +4675,9 @@ fn fn_slots_allowed(body: &[Stmt]) -> bool {
 }
 
 fn stmt_slot_safe(s: &Stmt) -> bool {
+    if crate::stack::compile_overflowed() {
+        return false;
+    }
     let exprs_ok = |es: &[&Expr]| es.iter().all(|e| expr_slot_safe(e));
     match &s.kind {
         StmtKind::FuncDef { .. }
@@ -4697,6 +4737,9 @@ fn stmt_slot_safe(s: &Stmt) -> bool {
 /// Whether an expression opens a nested scope (a lambda or a comprehension) or
 /// suspends the frame.
 fn expr_slot_safe(e: &Expr) -> bool {
+    if crate::stack::compile_overflowed() {
+        return false;
+    }
     let all = |es: &[Expr]| es.iter().all(expr_slot_safe);
     match e.unspanned() {
         Expr::Lambda { .. }
@@ -4829,6 +4872,9 @@ fn scope_freevars(params: &Params, body: &[Stmt], enclosing: &[HashSet<String>])
 /// and nested scopes. Over-collection (nested-scope locals) is harmless: callers
 /// filter by an enclosing-scope set those names can't be in.
 fn collect_names_expr(e: &Expr, out: &mut HashSet<String>) {
+    if crate::stack::compile_overflowed() {
+        return;
+    }
     match e.unspanned() {
         Expr::Name(n) => {
             out.insert(n.clone());
@@ -5094,12 +5140,18 @@ fn push_fstr_children<'a>(parts: &'a [FStrPart], out: &mut Vec<&'a Expr>) {
 /// Whether `e` contains a `:=` anywhere, `lambda` bodies and nested
 /// comprehensions included — the reach of CPython's "iterable expression" ban.
 fn expr_has_walrus(e: &Expr) -> bool {
+    if crate::stack::compile_overflowed() {
+        return false;
+    }
     matches!(e.unspanned(), Expr::NamedExpr(..))
         || expr_children(e).into_iter().any(expr_has_walrus)
 }
 
 /// The names an assignment target binds (`i`, `a, b`, `a, *rest`).
 fn collect_target_names(t: &Expr, out: &mut Vec<String>) {
+    if crate::stack::compile_overflowed() {
+        return;
+    }
     match t.unspanned() {
         Expr::Name(n) => out.push(n.clone()),
         Expr::Tuple(xs) | Expr::List(xs) => {
@@ -5155,6 +5207,7 @@ fn check_comprehension_walrus(
 /// are visited; a nested comprehension re-enters [`check_comprehension_walrus`]
 /// with `bound` carried in as its outer set.
 fn check_walrus_rebind(e: &Expr, bound: &[String]) -> Result<(), String> {
+    crate::stack::enter_compile()?;
     match e.unspanned() {
         Expr::Lambda { params, .. } => {
             for d in params
@@ -5191,6 +5244,9 @@ fn check_walrus_rebind(e: &Expr, bound: &[String]) -> Result<(), String> {
 /// Collect every `Name` referenced in one statement, recursing through suites AND
 /// into nested `def`/`class` bodies (their free references may resolve outward).
 fn collect_names_stmt(s: &Stmt, out: &mut HashSet<String>) {
+    if crate::stack::compile_overflowed() {
+        return;
+    }
     match &s.kind {
         StmtKind::Expr(e) => collect_names_expr(e, out),
         // The value runs in a nested scope that may read enclosing names.
@@ -5339,6 +5395,9 @@ fn collect_names_stmt(s: &Stmt, out: &mut HashSet<String>) {
 /// Add every simple-name binding target in `e` (a `Name`, or the names nested in
 /// tuple/list/starred unpacking). Attribute/subscript targets bind no local name.
 fn bind_target(e: &Expr, out: &mut HashSet<String>) {
+    if crate::stack::compile_overflowed() {
+        return;
+    }
     let e = e.unspanned();
     match e {
         Expr::Name(n) => {
@@ -5358,6 +5417,9 @@ fn bind_target(e: &Expr, out: &mut HashSet<String>) {
 /// control-flow suites at this scope level but NOT into nested `def`/`class`
 /// bodies. See [`scope_locals`].
 fn collect_bound_stmt(s: &Stmt, out: &mut HashSet<String>) {
+    if crate::stack::compile_overflowed() {
+        return;
+    }
     match &s.kind {
         StmtKind::Assign { targets, value } => {
             for t in targets {
@@ -5483,6 +5545,9 @@ fn collect_bound_stmt(s: &Stmt, out: &mut HashSet<String>) {
 /// Collect the names a suite declares `global` / `nonlocal` at this scope level
 /// (recursing control flow, not nested `def`/`class` bodies).
 fn collect_scope_decls_stmt(s: &Stmt, g: &mut HashSet<String>, nl: &mut HashSet<String>) {
+    if crate::stack::compile_overflowed() {
+        return;
+    }
     match &s.kind {
         StmtKind::Global(names) => {
             for n in names {
@@ -5536,6 +5601,9 @@ fn collect_scope_decls_stmt(s: &Stmt, g: &mut HashSet<String>, nl: &mut HashSet<
 /// whose walrus (`:=`) targets leak to the enclosing function scope (PEP 572) —
 /// while still stopping at a nested `def`/lambda, which owns its walrus targets.
 fn collect_leaked_walrus(e: &Expr, out: &mut HashSet<String>) {
+    if crate::stack::compile_overflowed() {
+        return;
+    }
     let e = e.unspanned();
     match e {
         Expr::NamedExpr(target, value) => {
@@ -5629,6 +5697,9 @@ fn collect_leaked_walrus(e: &Expr, out: &mut HashSet<String>) {
 /// descending into a nested scope (lambda / comprehension / genexpr), whose
 /// walrus targets belong to that inner scope.
 fn collect_walrus_targets(e: &Expr, out: &mut Vec<String>) {
+    if crate::stack::compile_overflowed() {
+        return;
+    }
     let e = e.unspanned();
     match e {
         Expr::NamedExpr(target, value) => {
@@ -5736,6 +5807,9 @@ fn docstring(body: &[Stmt]) -> Option<String> {
 /// `def`/`class` body is its own scope; only what the enclosing scope evaluates
 /// for it (decorators, defaults, bases) counts.
 fn stmt_has_yield(s: &Stmt) -> bool {
+    if crate::stack::compile_overflowed() {
+        return false;
+    }
     let any = |es: &[Expr]| es.iter().any(expr_has_yield);
     let opt = |e: &Option<Expr>| e.as_ref().is_some_and(expr_has_yield);
     match &s.kind {
@@ -5816,6 +5890,9 @@ fn stmt_has_yield(s: &Stmt) -> bool {
 /// are searched; a comprehension's `yield` is a `SyntaxError` the symbol table
 /// raises, so descending into one finds only the outermost iterable's.
 fn expr_has_yield(e: &Expr) -> bool {
+    if crate::stack::compile_overflowed() {
+        return false;
+    }
     match e.unspanned() {
         Expr::Yield(_) | Expr::YieldFrom(_) => true,
         Expr::Lambda { params, .. } => {
@@ -5912,6 +5989,9 @@ impl IntNames<'_> {
 /// slot with, and `Only` for expressions evaluated BEFORE those guards run (the
 /// range bounds), where a namespace read could still hold anything.
 fn native_safe_value(e: &Expr, reads: &mut Vec<String>, int_names: IntNames) -> bool {
+    if crate::stack::compile_overflowed() {
+        return false;
+    }
     match e.unspanned() {
         Expr::Int(_) => true,
         Expr::Name(n) => {
@@ -5948,6 +6028,9 @@ fn native_safe_value(e: &Expr, reads: &mut Vec<String>, int_names: IntNames) -> 
 /// instance with `__mod__`) — `emit_native_mod`'s remainder correction compares
 /// the result against `0`, which only types the numeric hook orders can survive.
 fn provably_int(e: &Expr, int_names: IntNames) -> bool {
+    if crate::stack::compile_overflowed() {
+        return false;
+    }
     match e.unspanned() {
         Expr::Int(_) => true,
         Expr::Name(n) => int_names.contains(n),
@@ -6217,6 +6300,9 @@ fn analyze_native_tree_at(
 /// Collect names read in an expression that are not yet in `defined` — those
 /// need their pre-loop namespace value loaded into a slot.
 fn reads_needing_load(e: &Expr, defined: &[String], loads: &mut Vec<String>) {
+    if crate::stack::compile_overflowed() {
+        return;
+    }
     match e.unspanned() {
         Expr::Name(n) => {
             if !defined.iter().any(|d| d == n) {
@@ -6387,6 +6473,9 @@ const FOLD_MAX_INT_BITS: u64 = 128;
 /// an integer result past `MAX_INT_SIZE` bits, and an operation that would raise
 /// (`1 // 0`, `1 << -1`, `'a' - 1`) is not folded.
 fn fold_constant(e: &Expr) -> Option<Folded> {
+    if crate::stack::compile_overflowed() {
+        return None;
+    }
     use num_bigint::BigInt;
     use num_traits::{Signed, ToPrimitive, Zero};
     Some(match e.unspanned() {

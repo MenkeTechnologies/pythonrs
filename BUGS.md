@@ -9,6 +9,32 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **Deep source is measured as CPython measures it.** pythonrs bounded every
+  shape with one tree-depth cap (`MAX_TREE_DEPTH`, 20 000) calibrated for the
+  512 MB interpreter thread, reported everything as the parser's `MemoryError`,
+  accepted `'lambda: '*5000+'1'` and `'not '*20000+'1'` that CPython refuses,
+  refused `'a'+'.b'*20000` that CPython compiles, and aborted an embedder's
+  2 MB thread on 50 brackets. Now the parser counts pegen's rule levels
+  (`MAXSTACK`, 6000) as `Parser/parser.c` does — one per `-`, `not` and
+  `else`, two per `lambda` and `**`, and the levels each context adds — so
+  `'-'*5968+'1'` parses and `'-'*5969+'1'` raises `MemoryError: Parser stack
+  overflowed`, across 33 statement contexts and 47 shapes measured against
+  CPython 3.14.8. A left-recursive chain grows in a loop, as pegen's does, and
+  fails in the compiler instead: every walk checks the native stack the way
+  `_Py_EnterRecursiveCall(" during compilation")` does (`src/stack.rs`, after
+  `Python/ceval.c`'s `hardware_stack_limits`/`tstate_set_stack`) and raises
+  `RecursionError: Stack overflow (used N kB) during compilation`, the class
+  CPython raises for `'a'+'.b'*100000`; the AST drops iteratively so the failed
+  tree cannot overflow on the way out. The parser and the compiler run on a
+  512 MB stack of their own when the caller's has less than 64 MB to spare,
+  so `eval_str` on libtest's 2 MB worker runs the 200 brackets CPython
+  allows, `compile` on a 256 KB thread accepts and refuses what CPython does,
+  and neither aborts; a generator's coroutine stack is measured as its own.
+- **A starred display item is a `bitwise_or`.** `[*a if b else c]`, `x = *a or
+  b,`, `{*a or b}` and `[*not a]` compiled and ran; `star_named_expression`
+  and `star_expression` take `'*' bitwise_or`, so CPython refuses them with
+  `invalid syntax` at the operator, and so does pythonrs now. A call argument
+  still takes `'*' expression`.
 - **Annotation scopes in a class body see the class namespace.** A class
   annotation (`class K: T = int; x: T`), an annotated method's
   `__annotate__` (`def m(self, a: T) -> T`) and a `type` alias value were
@@ -1980,25 +2006,27 @@ written.
   error path — plus each frame's filename and module globals for
   `warn_explicit`'s registry.
 
-- **The depth guards are calibrated for the interpreter's 512 MB stack, not for
-  an embedder's.** `src/main.rs` runs the interpreter on a thread with
-  `stack_size(512 * 1024 * 1024)`, and `parser::MAX_TREE_DEPTH` is chosen against
-  that. pythonrs descends roughly fifteen parser frames per nesting level, so
-  `pythonrs::eval_str` called from an ordinary 2 MB thread overflows well below
-  the cap — libtest's worker cannot hold even the 200 bracket levels CPython
-  accepts, which is why `deeply_nested_source_raises_instead_of_overflowing_the_stack`
-  spawns a matching thread. Lowering the cap to fit 2 MB would reject source
-  CPython accepts; making the levels cheaper is the real fix.
-- **The stage that runs out of parser stack is not reproduced.** CPython reports
-  `MemoryError: Parser stack overflowed …` when its PEG parser is what
-  overflows and `RecursionError: Stack overflow (used N kB) during compilation`
-  when the parse succeeded and the compiler is what overflows —
-  `'-'*100000+'1'` is the first, `'a'+'.b'*100000` and `'1'+'+1'*200000` are the
-  second. pythonrs's cap lives entirely in the parser, so all of them report the
-  `MemoryError` form. Both are catchable, which is the property that was missing;
-  the class split is not. Relatedly, pythonrs is MORE permissive than CPython on
-  two shapes it accepts up to the cap: `'lambda: '*5000+'1'` and
-  `'not '*20000+'1'` parse here and are `MemoryError` there.
+- **A left-recursive chain CPython compiles can exceed pythonrs's compile
+  stack.** `a.b.c…`, `1+1+1…`, `f()()…` parse in a loop and fail, as in
+  CPython, in the compiler's walks with `RecursionError: Stack overflow (used N
+  kB) during compilation` once the stack runs out. Where that happens is a
+  function of the stack and of each walk's frame size in both interpreters
+  (CPython's own limit moves with the platform's thread stack): on macOS
+  CPython 3.14.8 compiles up to 74 490 links, a debug pythonrs on its 512 MB
+  stack up to 57 973 attributes, 50 617 additions and 48 563 calls, so a chain
+  in that window compiles there and raises here.
+- **pegen's level count is reproduced along the alternatives modelled.** The
+  parser counts pegen's rule levels and refuses at `MAXSTACK` exactly where
+  CPython does for every shape measured (unary, `not`, `lambda`, `**` and
+  conditional chains; displays, calls, subscripts, slices, comprehensions,
+  f-string fields and decorators; the statement contexts from a bare line to
+  a nested `elif`). pegen's count is the deepest descent it makes, including
+  alternatives it abandons, and those are modelled where they decide the
+  answer — a statement's leading primary tried as an assignment target, the
+  `genexp` tried before a call's arguments, an `expression` tried where none
+  starts. Patterns, type parameters, `*args`/`**kwargs` annotations and
+  format-spec fields follow the successful parse only, and can give way a few
+  levels from CPython.
 - **A CPython exception object raised from pythonrs is caught as a copy.**
   `e = binascii.Error('x'); raise e` raises (and `except ValueError as x`
   catches) the pythonrs exception paired with `e`, so `x is e` is `False`

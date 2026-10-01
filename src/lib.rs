@@ -36,6 +36,7 @@ pub mod regexpr;
 pub mod repl;
 pub mod rust_ffi;
 pub mod stdio;
+pub mod stack;
 pub mod stdlib;
 pub mod suggest;
 pub mod symtable;

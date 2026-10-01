@@ -120,6 +120,7 @@ impl Table {
     }
 
     fn stmt(&mut self, s: &Stmt, b: &mut Block) -> Result<(), String> {
+        crate::stack::enter_compile()?;
         match &s.kind {
             StmtKind::Expr(e) => self.expr(e, b)?,
             // The value is a scope of its own, evaluated lazily.
@@ -312,6 +313,7 @@ impl Table {
     /// An assignment or `del` target: a name is bound, and the object of an
     /// attribute or subscript target is read.
     fn store(&mut self, t: &Expr, b: &mut Block) -> Result<(), String> {
+        crate::stack::enter_compile()?;
         match t.unspanned() {
             Expr::Name(n) => b.add(n, LOCAL),
             Expr::Tuple(xs) | Expr::List(xs) => {
@@ -326,6 +328,7 @@ impl Table {
     }
 
     fn pattern(&mut self, p: &Pattern, b: &mut Block) -> Result<(), String> {
+        crate::stack::enter_compile()?;
         match &p.kind {
             PatternKind::Wildcard | PatternKind::Star(None) => {}
             PatternKind::Capture(n) | PatternKind::Star(Some(n)) => b.add(n, LOCAL),
@@ -368,6 +371,7 @@ impl Table {
 
     /// An expression evaluated in this block.
     fn expr(&mut self, e: &Expr, b: &mut Block) -> Result<(), String> {
+        crate::stack::enter_compile()?;
         match e.unspanned() {
             Expr::Name(n) => b.add(n, USE),
             Expr::NamedExpr(target, value) => {
@@ -516,6 +520,7 @@ fn no_yield_in_comprehension(comp: &Expr) -> Result<(), String> {
 }
 
 fn yield_in(e: &Expr, kind: &str) -> Result<(), String> {
+    crate::stack::enter_compile()?;
     match e.unspanned() {
         Expr::Yield(_) | Expr::YieldFrom(_) => {
             let msg = format!("SyntaxError: 'yield' inside {kind}");
@@ -544,6 +549,9 @@ fn yield_in(e: &Expr, kind: &str) -> Result<(), String> {
 /// The `:=` targets inside `e`, nested comprehensions included (their targets
 /// bind in the same enclosing function) but not `lambda` bodies.
 fn walrus_targets(e: &Expr, out: &mut Vec<String>) {
+    if crate::stack::compile_overflowed() {
+        return;
+    }
     let e = e.unspanned();
     if let Expr::NamedExpr(t, _) = e {
         if let Expr::Name(n) = t.unspanned() {

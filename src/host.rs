@@ -2419,6 +2419,10 @@ struct GenCell {
     /// (drives `type().__name__` and `repr`, and gates `next()`/`for`).
     kind: GenKind,
     coro: Option<corosensei::Coroutine<Value, Value, Result<Value, String>>>,
+    /// The coroutine stack `coro` runs on, `(limit, base)` — its lowest usable
+    /// and its highest address — so the stack checks a resume makes measure
+    /// it rather than the thread's (see `crate::stack::with_bounds`).
+    stack: (usize, usize),
     /// Raw pointer to the coroutine body's `Yielder`, published on entry (same
     /// thread → valid for the body's life). Read by `yield` to suspend.
     yielder: *const (),
@@ -18606,6 +18610,7 @@ fn make_gen_kind(
         h.generators.push(GenCell {
             kind,
             coro: None,
+            stack: (0, 0),
             yielder: std::ptr::null(),
             ctx: GenContext {
                 frames: vec![frame],
@@ -18634,6 +18639,10 @@ fn make_gen_kind(
     const GENERATOR_STACK: usize = 64 * 1024 * 1024;
     let stack =
         corosensei::stack::DefaultStack::new(GENERATOR_STACK).expect("allocate generator stack");
+    let bounds = {
+        use corosensei::stack::Stack;
+        (stack.limit().get(), stack.base().get())
+    };
     let coro = corosensei::Coroutine::with_stack(
         stack,
         move |yielder: &corosensei::Yielder<Value, Value>, _first: Value| {
@@ -18652,7 +18661,10 @@ fn make_gen_kind(
             r.map(|_| Value::Undef)
         },
     );
-    with_host(|h| h.generators[id as usize].coro = Some(coro));
+    with_host(|h| {
+        h.generators[id as usize].coro = Some(coro);
+        h.generators[id as usize].stack = bounds;
+    });
     with_host(|h| h.alloc(PyObj::Generator { id }))
 }
 
@@ -18999,7 +19011,9 @@ pub fn gen_resume(gen: &Value, send: Value) -> Result<Option<Value>, String> {
     let prev = CUR_GEN.with(|c| c.replace(Some(id)));
     with_host(|h| h.generators[id as usize].started = true);
 
-    let out = coro.resume(send); // no host borrow held; body drives its own VM
+    // No host borrow held; the body drives its own VM, on its own stack.
+    let (base, top) = with_host(|h| h.generators[id as usize].stack);
+    let out = crate::stack::with_bounds(base, top, || coro.resume(send));
 
     // An exception escaping the body unwinds past the generator's own frame, so
     // the traceback names it (`File …, line N, in g` / `in <genexpr>`) between

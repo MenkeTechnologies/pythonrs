@@ -130,6 +130,9 @@ fn block(class: &str, body: &mut [Stmt]) {
 }
 
 fn stmt(class: &str, s: &mut Stmt) {
+    if crate::stack::compile_overflowed() {
+        return;
+    }
     match &mut s.kind {
         StmtKind::Expr(e) => expr(class, e),
         StmtKind::TypeAlias { name, value, .. } => {
@@ -332,6 +335,9 @@ fn parameters(class: &str, p: &mut Params) {
 }
 
 fn pat(class: &str, p: &mut Pattern) {
+    if crate::stack::compile_overflowed() {
+        return;
+    }
     match &mut p.kind {
         PatternKind::Wildcard => {}
         PatternKind::Capture(n) => fix(class, n),
@@ -396,6 +402,9 @@ fn fparts(class: &str, ps: &mut [FStrPart]) {
 }
 
 fn expr(class: &str, e: &mut Expr) {
+    if crate::stack::compile_overflowed() {
+        return;
+    }
     match e {
         Expr::Name(n) => fix(class, n),
         // `value.__attr` — the attribute name mangles, the value is an

@@ -189,9 +189,11 @@ pub enum Expr {
         step: Option<Box<Expr>>,
     },
 
-    /// `lambda params: body`.
+    /// `lambda params: body`. The parameter list is boxed: inline it is the
+    /// largest payload by far and would set every `Expr`'s size, and with it the
+    /// stack frame of every function that holds one.
     Lambda {
-        params: Params,
+        params: Box<Params>,
         body: Box<Expr>,
     },
 
@@ -505,6 +507,75 @@ impl From<StmtKind> for Stmt {
             kind,
             line: 0,
             span: None,
+        }
+    }
+}
+
+/// Dropping an expression is a loop, not a recursion.
+///
+/// The parser builds a left-recursive chain — `a.b.c…`, `1+1+1…`, `f()()…`,
+/// `a[0][0]…` — in a loop, exactly as pegen's left-recursion does, so nothing
+/// bounds its depth at parse time: CPython bounds it at compile time instead,
+/// where the first walk that runs out of stack raises `RecursionError` (see
+/// [`crate::stack`]). The derived drop glue would then recurse once per link
+/// and abort on the very tree whose compile just failed cleanly. Each boxed
+/// child is moved onto a worklist and replaced by a leaf, so the depth of the
+/// drop is one frame whatever the depth of the tree.
+///
+/// Only boxed children are taken. A child held in a `Vec` (a call's arguments,
+/// a display's elements, a comprehension's clauses) is dropped by the vector,
+/// which runs this same impl on it; the nesting that reaches through vectors is
+/// bounded by the tokenizer's 200-bracket limit.
+impl Drop for Expr {
+    fn drop(&mut self) {
+        let mut pending = Vec::new();
+        self.take_boxed_children(&mut pending);
+        while let Some(mut child) = pending.pop() {
+            child.take_boxed_children(&mut pending);
+        }
+    }
+}
+
+impl Expr {
+    /// Move every boxed child into `out`, leaving `Expr::None` in its place.
+    fn take_boxed_children(&mut self, out: &mut Vec<Expr>) {
+        let mut take = |b: &mut Box<Expr>| {
+            if !matches!(**b, Expr::None) {
+                out.push(std::mem::replace(&mut **b, Expr::None));
+            }
+        };
+        match self {
+            Expr::Starred(x)
+            | Expr::UnaryOp(_, x)
+            | Expr::Attribute(x, _)
+            | Expr::YieldFrom(x)
+            | Expr::Await(x)
+            | Expr::Spanned(x, _)
+            | Expr::Compare(x, _)
+            | Expr::Call { func: x, .. }
+            | Expr::Lambda { body: x, .. }
+            | Expr::ListComp(x, _)
+            | Expr::SetComp(x, _)
+            | Expr::GenExp(x, _)
+            | Expr::Yield(Some(x)) => take(x),
+            Expr::BinOp(_, a, b)
+            | Expr::Subscript(a, b)
+            | Expr::NamedExpr(a, b)
+            | Expr::DictComp(a, b, _) => {
+                take(a);
+                take(b);
+            }
+            Expr::IfExp { test, body, orelse } => {
+                take(test);
+                take(body);
+                take(orelse);
+            }
+            Expr::Slice { lo, hi, step } => {
+                for b in [lo, hi, step].into_iter().flatten() {
+                    take(b);
+                }
+            }
+            _ => {}
         }
     }
 }

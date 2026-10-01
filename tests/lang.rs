@@ -8576,90 +8576,173 @@ fn an_unallocatable_repetition_raises_memoryerror_instead_of_aborting() {
 /// `python3 -c "compile('('*N+'1'+')'*N, '<s>', 'eval')"`: N=200 compiles, N=201
 /// raises `SyntaxError: too many nested parentheses`, and the counter is shared
 /// across `(`, `[` and `{`.
+///
+/// This runs on libtest's own 2 MB worker. It used to need a thread sized like
+/// the interpreter's 512 MB one, because the parser recursed on the caller's
+/// stack and an unoptimised build spends some 25 KB per bracket; the parser
+/// and compiler now move to a stack of their own when the caller's is short.
 #[test]
 fn deeply_nested_source_raises_instead_of_overflowing_the_stack() {
-    // Runs on an interpreter-sized stack: see the note on
-    // `deeply_nested_operator_chains_raise_instead_of_overflowing_the_stack`.
-    // Even the 200 levels CPython ACCEPTS need more than libtest's 2 MB worker,
-    // because pythonrs descends ~15 parser frames per bracket.
-    on_interpreter_stack(|| {
-        for (open, close) in [("(", ")"), ("[", "]"), ("{", "}")] {
-            let ok = format!("x = {}1{}", open.repeat(200), close.repeat(200));
-            let r = eval_str(&ok);
-            // A 200-deep `{` literal is a set of sets, which is unhashable at
-            // RUN time — the point here is that it parsed.
-            assert!(
-                r.is_ok() || r.as_ref().unwrap_err().starts_with("TypeError:"),
-                "200 levels of {open} must still parse, got {r:?}"
-            );
-            let too_deep = format!("x = {}1{}", open.repeat(201), close.repeat(201));
-            assert_eq!(
-                eval_str(&too_deep).expect_err("must raise"),
-                "SyntaxError: too many nested parentheses",
-                "for 201 levels of {open}"
-            );
-        }
-        // One counter for all three kinds: 201 opens spread over `([{` trips it.
-        assert_eq!(
-            eval_str(&format!("x = {}", "([{".repeat(67))).expect_err("must raise"),
-            "SyntaxError: too many nested parentheses"
+    for (open, close) in [("(", ")"), ("[", "]"), ("{", "}")] {
+        let ok = format!("x = {}1{}", open.repeat(200), close.repeat(200));
+        let r = eval_str(&ok);
+        // A 200-deep `{` literal is a set of sets, which is unhashable at RUN
+        // time — the point here is that it parsed.
+        assert!(
+            r.is_ok() || r.as_ref().unwrap_err().starts_with("TypeError:"),
+            "200 levels of {open} must still parse, got {r:?}"
         );
-        // And the depths real code uses are untouched. A 500-term chain also
-        // needs the interpreter-sized stack: 500 levels is already past what
-        // 2 MB holds, which is the measurement this test exists to make.
-        assert_eq!(g("x = 1 + 2 * 3 - 4 // 2", "x"), "5");
-        assert_eq!(g(&format!("x = 1{}", "+1".repeat(500)), "x"), "501");
-    });
+        let too_deep = format!("x = {}1{}", open.repeat(201), close.repeat(201));
+        assert_eq!(
+            eval_str(&too_deep).expect_err("must raise"),
+            "SyntaxError: too many nested parentheses",
+            "for 201 levels of {open}"
+        );
+    }
+    // One counter for all three kinds: 201 opens spread over `([{` trips it.
+    assert_eq!(
+        eval_str(&format!("x = {}", "([{".repeat(67))).expect_err("must raise"),
+        "SyntaxError: too many nested parentheses"
+    );
+    // And the depths real code uses are untouched.
+    assert_eq!(g("x = 1 + 2 * 3 - 4 // 2", "x"), "5");
+    assert_eq!(g(&format!("x = 1{}", "+1".repeat(500)), "x"), "501");
 }
 
-/// Run `body` on a thread sized like the one `src/main.rs` spawns for the
-/// interpreter (512 MB).
-///
-/// The depth guards are calibrated against THAT stack: the parser has to recurse
-/// to its cap before it can report the cap, and libtest's 2 MB worker cannot
-/// hold even the 200 bracket levels CPython accepts. Running the guards on a
-/// matching thread measures the binary's real behaviour; an embedder calling
-/// `eval_str` from a smaller stack has a lower effective ceiling, noted in
-/// BUGS.md.
-fn on_interpreter_stack(body: impl FnOnce() + Send + 'static) {
-    std::thread::Builder::new()
-        .stack_size(512 * 1024 * 1024)
-        .spawn(body)
-        .expect("spawn interpreter-sized thread")
-        .join()
-        .expect("the parser must report the depth rather than abort");
+const TOO_COMPLEX: &str =
+    "MemoryError: Parser stack overflowed - Python source too complex to parse";
+
+/// Whether compiling `src` stops in the parser: pegen's `MAXSTACK` (6000 rule
+/// levels) reproduced by count.
+fn parser_overflows(src: &str) -> bool {
+    match pythonrs::compile(src) {
+        Ok(_) => false,
+        Err(e) if e == TOO_COMPLEX => true,
+        Err(e) => panic!("{src:.40?}…: expected success or {TOO_COMPLEX:?}, got {e:?}"),
+    }
 }
 
-/// The bracket-free half of the same guard, run on a thread sized like the one
-/// `src/main.rs` spawns.
-///
-/// `MAX_TREE_DEPTH` (20 000) is calibrated against that 512 MB interpreter
-/// stack, not against libtest's 2 MB worker — the parser has to RECURSE to the
-/// cap before it can report it, and 20 000 debug frames do not fit in 2 MB. The
-/// thread here reproduces the binary's environment, which is the environment the
-/// guard exists for; an embedder on a smaller stack is a separate limit, noted
-/// in BUGS.md.
+/// pegen counts one level per grammar rule on its C stack and refuses the
+/// source when a rule is entered with 6000 already open; the parser here
+/// charges the levels its counterpart rules occupy, so every shape gives way at
+/// the same nesting. Each pair is the largest count python3.14 accepts and the
+/// first it refuses: one level per `-`, `not` and `else`, two per `lambda` and
+/// per `**`, and the contexts that move the start — an assignment's value
+/// (under `assignment` and its group), a function body (`def` → `block` →
+/// `statement`), a call argument at the start of a line (read first as a
+/// `t_primary` target's `genexp`), a parenthesis, an empty call, a default.
 #[test]
-fn deeply_nested_operator_chains_raise_instead_of_overflowing_the_stack() {
-    on_interpreter_stack(|| {
-        let too_complex =
-            "MemoryError: Parser stack overflowed - Python source too complex to parse";
-        for src in [
-            format!("x = {}1", "-".repeat(100_000)),
-            format!("x = {}1", "not ".repeat(30_000)),
-            format!("x = a{}", ".b".repeat(100_000)),
-            format!("x = 1{}", "+1".repeat(200_000)),
-            format!("x = {}1", "lambda: ".repeat(30_000)),
-            format!("x = 1{}", " if 1 else 1".repeat(100_000)),
-        ] {
-            assert_eq!(
-                eval_str(&src).expect_err("must raise"),
-                too_complex,
-                "for a {}-char chain",
-                src.len()
-            );
-        }
-    });
+fn parser_levels_give_way_where_pegens_do() {
+    let neg = |n: usize| "-".repeat(n);
+    let cases: Vec<(Box<dyn Fn(usize) -> String>, usize)> = vec![
+        (Box::new(move |n| format!("{}1", neg(n))), 5969),
+        (Box::new(|n| format!("{}x", "not ".repeat(n))), 5970),
+        (Box::new(|n| format!("{}x", "lambda: ".repeat(n))), 2985),
+        (Box::new(|n| format!("2{}", "**2".repeat(n))), 2985),
+        (Box::new(|n| format!("{}1", "1 if 1 else ".repeat(n))), 5969),
+        (Box::new(|n| format!("x = {}1", "-".repeat(n))), 5967),
+        (
+            Box::new(|n| format!("def f():\n    return {}1", "-".repeat(n))),
+            5961,
+        ),
+        (Box::new(|n| format!("print({}1)", "-".repeat(n))), 5964),
+        (Box::new(|n| format!("({}1)", "-".repeat(n))), 5960),
+        (Box::new(|n| format!("x = [{}1]", "-".repeat(n))), 5956),
+        (Box::new(|n| format!("{}f()", "-".repeat(n))), 5945),
+        (Box::new(|n| format!("a < {}1", "-".repeat(n))), 5966),
+        (
+            Box::new(|n| format!("def f(a={}1): pass", "-".repeat(n))),
+            5964,
+        ),
+        (Box::new(|n| format!("f\"{{{}1}}\"", "-".repeat(n))), 5955),
+    ];
+    for (shape, first_refused) in &cases {
+        let accepted = shape(first_refused - 1);
+        let refused = shape(*first_refused);
+        assert!(
+            !parser_overflows(&accepted),
+            "{:.30?}… must parse",
+            accepted
+        );
+        assert!(
+            parser_overflows(&refused),
+            "{:.30?}… must overflow",
+            refused
+        );
+    }
+}
+
+/// A left-recursive chain is not deep for pegen, which grows `a.b.c…`,
+/// `1+1+1…` and `f()()…` in a loop; the tree it builds is, and the compiler's
+/// walks are what run out of stack. CPython 3.14 raises `RecursionError: Stack
+/// overflow (used N kB) during compilation` for these, where `N` is however
+/// much of the stack was in use, and still compiles them at 20 000 links.
+#[test]
+fn left_recursive_chains_overflow_in_the_compiler() {
+    for src in [
+        format!("a{}", ".b".repeat(100_000)),
+        format!("1{}", "+1".repeat(200_000)),
+        format!("f{}", "()".repeat(100_000)),
+        format!("x = a{}", "[0]".repeat(100_000)),
+    ] {
+        let e = pythonrs::compile(&src).err().expect("must raise");
+        assert!(
+            e.starts_with("RecursionError: Stack overflow (used ")
+                && e.ends_with(" kB) during compilation"),
+            "for a {}-char chain: {e}",
+            src.len()
+        );
+    }
+    assert!(pythonrs::compile(&format!("a{}", ".b".repeat(20_000))).is_ok());
+    assert_eq!(g(&format!("x = 1{}", "+1".repeat(20_000)), "x"), "20001");
+}
+
+/// The parser's and the compiler's limits hold on an embedder's thread however
+/// small its stack: each runs on a stack of its own when the caller's is short,
+/// so a 256 KB thread compiles what CPython compiles and raises what CPython
+/// raises, where it used to abort the whole process at the first deep source.
+#[test]
+fn deep_source_is_measured_the_same_on_a_small_thread() {
+    std::thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            let brackets = format!("x = {}1{}", "[".repeat(200), "]".repeat(200));
+            assert!(pythonrs::compile(&brackets).is_ok());
+            assert!(!parser_overflows(&format!("{}1", "-".repeat(5968))));
+            assert!(parser_overflows(&format!("{}1", "-".repeat(5969))));
+            let chain = pythonrs::compile(&format!("a{}", ".b".repeat(100_000))).err();
+            assert!(chain
+                .expect("must raise")
+                .starts_with("RecursionError: Stack overflow"));
+        })
+        .expect("spawn a small thread")
+        .join()
+        .expect("deep source must raise, not abort");
+}
+
+/// A starred item of a display or an expression list is `'*' bitwise_or`, so
+/// a boolean, conditional or `not` operand needs its own parentheses there —
+/// only a call argument takes `'*' expression`. These ran instead of failing to
+/// compile.
+#[test]
+fn a_starred_display_item_is_a_bitwise_or() {
+    for src in [
+        "x = [*[1] if 1 else [2]]",
+        "x = *[1] or [2],",
+        "x = {*[1] or [2]}",
+        "x = [*not 1]",
+    ] {
+        assert_eq!(
+            eval_str(src).expect_err("must not compile"),
+            "SyntaxError: invalid syntax",
+            "for {src}"
+        );
+    }
+    assert_eq!(g("x = [*{1} | {2}, *(3,)]", "x"), "[1, 2, 3]");
+    assert_eq!(
+        g("def f(*a): return a\nx = f(*[1] if 1 else [2])", "x"),
+        "(1,)"
+    );
 }
 
 /// `OSError` is not a one-string exception.

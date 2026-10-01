@@ -33,14 +33,19 @@ pub(crate) fn is_soft_keyword(s: &str) -> bool {
 /// tokenizer or parser error carries the source as its `_metadata` (see
 /// [`with_metadata`]).
 pub fn parse(src: &str) -> Result<Vec<Stmt>, String> {
-    parse_source(src).map_err(|e| with_metadata(e, &exec_input_source(src)))
+    crate::stack::with_frontend_stack(|| parse_source(src, 0))
+        .map_err(|e| with_metadata(e, &exec_input_source(src)))
 }
 
-fn parse_source(src: &str) -> Result<Vec<Stmt>, String> {
+/// Parse `src` with `level` rules already open around it — `0` for a module,
+/// more for an f-string's replacement field, read as a module of its own (see
+/// [`Parser::build_fstring_field`]).
+fn parse_source(src: &str, level: u32) -> Result<Vec<Stmt>, String> {
     let src = crate::rust_ffi::desugar(src);
     let lexed = lex(&src)?;
     let unclosed = lexed.unclosed;
     let mut p = Parser::new(lexed.toks, lexed.deferred, &src);
+    p.level = level;
     let err = match p.parse_module() {
         Ok(stmts) => match unclosed {
             Some(e) => e,
@@ -388,6 +393,10 @@ fn render_source_and_carets(pos: &SyntaxPos) -> String {
 /// list, then nothing but line breaks. Anything after the expression is the
 /// error, at that token; empty input is an error at line 0.
 pub fn check_eval_input(src: &str) -> Result<(), String> {
+    crate::stack::with_frontend_stack(|| check_eval_input_here(src))
+}
+
+fn check_eval_input_here(src: &str) -> Result<(), String> {
     let lexed = lex(src)?;
     let mut p = Parser::new(lexed.toks, None, src);
     p.skip_newlines();
@@ -446,33 +455,45 @@ pub fn is_incomplete_input(src: &str) -> bool {
     p.at_end_of_input(in_bracket)
 }
 
-/// Deepest expression tree the parser will build before refusing the source.
+/// How deep pegen's rules may nest: `MAXSTACK` in `Parser/parser.c` (6000 on
+/// every 64-bit build that is neither a debug nor a sanitizer build).
 ///
-/// This is a stack guard, not a language rule. Nothing here is recursive in the
-/// tokenizer's bracket sense — `[`/`(`/`{` are already capped at
-/// [`crate::lexer::MAX_PAREN_DEPTH`] — but an operator chain nests just as
-/// deeply without a single bracket: `'-'*100000+'1'`, `'a'+'.b'*100000`,
-/// `'1'+'+1'*200000`, `'not '*20000+'1'` and `'lambda:'*5000+'1'` each build a
-/// tree tens of thousands of levels deep, and the parser, `src/compiler.rs`'s
-/// walk and the AST's own `Drop` all recurse over it. Every one of those five
-/// aborted the interpreter thread (`fatal runtime error: stack overflow`,
-/// SIGABRT) before this cap; CPython answers all five with a catchable
-/// exception.
+/// pegen counts one level per rule function on the C stack (`p->level`), and a
+/// rule entered with the count already at `MAXSTACK` raises `MemoryError:
+/// Parser stack overflowed`. The parser here is not pegen, so it reproduces the
+/// count rather than inheriting it: each parse function charges the levels its
+/// counterpart rules occupy — `expression` 1, a left-recursive rule such as
+/// `sum` 2 (the rule and its `_raw` body), `atom` 1 and the `_tmp` rule of the
+/// `&(STRING|FSTRING_START|TSTRING_START)` lookahead another — and the
+/// thresholds come out where pegen's do: `'-'*5968+'1'` parses and
+/// `'-'*5969+'1'` does not, two levels per `lambda` and per `**` but one per
+/// `not`, `-` and `else`.
 ///
-/// The value sits above every depth CPython 3.14.6 accepts in those shapes
-/// (measured: `'1'+'+1'*20000` and `'a'+'.b'*20000` parse, `*100000` does not)
-/// and below the depth at which the 512 MB interpreter stack in
-/// `src/main.rs` runs out (measured: the shapes above survive 25 000 levels and
-/// abort by 30 000 on a debug build).
-const MAX_TREE_DEPTH: u32 = 20_000;
+/// What the count does not cover is a left-recursive CHAIN. pegen grows `a.b.c`,
+/// `1+1+1` or `f()()` in a loop, so the parse is shallow however long the chain
+/// is, and the tree it builds is as deep as the chain. Such a tree is the
+/// compiler's problem: its walks check the native stack (see [`crate::stack`])
+/// and raise `RecursionError: Stack overflow (used N kB) during compilation`,
+/// the class CPython raises for `'a'+'.b'*100000`.
+///
+/// The count is exact where the deepest descent pegen makes is the parse that
+/// succeeds. Where pegen first descends into a construct while trying an
+/// alternative that later fails — the leading primary of a statement, tried as
+/// an assignment target (`print(...)`, `[...]` at the start of a line), is the
+/// common case and is modelled — the levels it reached in that attempt are
+/// reproduced only as far as the attempt is modelled here.
+const MAXSTACK: u32 = 6000;
 
-/// What CPython's PEG parser raises when its own stack runs out —
-/// `_PyPegen_run_parser`'s `MemoryError`, verified against
-/// `python3 -c "exec('-'*100000+'1')"`. It is an ordinary catchable exception
-/// there, which is the property this port is matching; CPython picks
-/// `RecursionError: Stack overflow (used N kB) during compilation` instead when
-/// the parse succeeds and the *compiler* is the stage that runs out, and that
-/// split is not reproduced (see BUGS.md).
+/// The levels from an `expression` rule down to the `_tmp` rule of `atom`'s
+/// `&(STRING|FSTRING_START|TSTRING_START)` lookahead, both counted:
+/// `expression`, `disjunction`, `conjunction`, `inversion`, `comparison`, the
+/// six two-level left-recursive rules `bitwise_or` … `term`, `factor`, `power`,
+/// `await_primary`, `primary` and its `_raw`, `atom`, the lookahead.
+const EXPRESSION_TO_LOOKAHEAD: u32 = 23;
+
+/// What pegen raises when its rules nest past [`MAXSTACK`] or the native stack
+/// runs low — `_Pypegen_stack_overflow`'s `MemoryError`, verified against
+/// `python3 -c "exec('-'*100000+'1')"`.
 const TOO_COMPLEX: &str =
     "MemoryError: Parser stack overflowed - Python source too complex to parse";
 
@@ -525,9 +546,24 @@ struct Parser {
     /// A tokenizer error held back so an earlier parse error wins. See
     /// [`crate::lexer::Lexed::deferred`].
     deferred: Option<String>,
-    /// Levels of expression tree currently under construction. See
-    /// [`MAX_TREE_DEPTH`].
-    depth: u32,
+    /// pegen's `p->level`: how many grammar rules enclose the one being read.
+    /// See [`MAXSTACK`].
+    level: u32,
+    /// Tokens at which a statement's leading primary starts, each with the
+    /// level of the `t_primary_raw` rule pegen reads it under. pegen tries a
+    /// statement's start as an assignment target before it tries it as an
+    /// expression, and the target rules descend into the primary's atom and
+    /// trailers (`print(...)`, `[...]`, `a[...]`) — so that, shallower, descent
+    /// is the one its level count records. A statement opening with `(` has
+    /// two: its `'(' single_target ')'` alternative reaches the primary inside
+    /// the parenthesis one level below where the parenthesis itself is read.
+    /// See [`Parser::parse_primary`].
+    lead: Vec<(usize, u32)>,
+    /// The token of a `yield` whose `yield_expr` rule sits at the given level:
+    /// a `yield` statement, or one on the right of `=`, an augmented `=` or an
+    /// annotated assignment's `=`. Read as an atom here, it is a rule of its
+    /// own there, close to the statement. Any other `yield` is in parentheses.
+    yield_at: Option<(usize, u32)>,
     /// Whether the statements being read are in a function body, and how many
     /// loop bodies deep they are within it — what `return`, `break` and
     /// `continue` need. A `class` body starts both afresh.
@@ -574,7 +610,9 @@ impl Parser {
             toks,
             pos: 0,
             deferred,
-            depth: 0,
+            level: 0,
+            lead: Vec::new(),
+            yield_at: None,
             in_function: false,
             loop_depth: 0,
             nesting: 0,
@@ -601,15 +639,49 @@ impl Parser {
     }
 
     // ── stack guard ───────────────────────────────────────────────────────
-    /// Charge one level of expression nesting. Every caller pairs this with a
-    /// `self.depth = saved` on the success path; the error path never restores
-    /// because it unwinds the whole parse.
-    fn enter(&mut self) -> Result<(), String> {
-        self.depth += 1;
-        if self.depth > MAX_TREE_DEPTH {
+    /// Enter `n` nested rules, pegen's `p->level++` on entry to each, and
+    /// answer the level to restore on the way out. Every caller pairs this
+    /// with `self.level = saved` on the success path; the error path never
+    /// restores because it unwinds the whole parse.
+    fn rule(&mut self, n: u32) -> Result<u32, String> {
+        let saved = self.level;
+        self.level += n;
+        self.reach(self.level)?;
+        Ok(saved)
+    }
+
+    /// A rule entered at `level` and left again — a lookahead's `_tmp` rule, or
+    /// an alternative pegen tries before the one that succeeds. pegen checks
+    /// on every entry, so a level reached only in passing still counts; and
+    /// beside the count it asks whether the native stack is running low
+    /// (`_Py_ReachedRecursionLimitWithMargin(tstate, 1)`).
+    fn reach(&self, level: u32) -> Result<(), String> {
+        if level > MAXSTACK || crate::stack::parser_exhausted() {
             return Err(TOO_COMPLEX.to_string());
         }
         Ok(())
+    }
+
+    /// pegen tried an `expression` at `level` where none starts — in empty
+    /// brackets, after a trailing comma, for a missing slice bound — and went
+    /// down every rule of the precedence chain before failing at `atom`'s
+    /// string lookahead: [`EXPRESSION_TO_LOOKAHEAD`] levels further.
+    fn reach_absent_expression(&self, level: u32) -> Result<(), String> {
+        self.reach(level + EXPRESSION_TO_LOOKAHEAD)
+    }
+
+    /// Run `f` as the child of a rule at `level`: what `f` charges, it charges
+    /// from there. Restores the level `f` was entered with.
+    fn under<T>(
+        &mut self,
+        level: u32,
+        f: impl FnOnce(&mut Self) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let saved = self.level;
+        self.level = level;
+        let r = f(self)?;
+        self.level = saved;
+        Ok(r)
     }
 
     // ── cursor ────────────────────────────────────────────────────────────
@@ -659,7 +731,6 @@ impl Parser {
         (sl, sc): (u32, u32),
         parse_right: fn(&mut Self) -> Result<Expr, String>,
     ) -> Result<Expr, String> {
-        self.enter()?;
         let op_tok = self.toks[self.pos].clone();
         self.advance();
         let right_first = self.pos;
@@ -1163,10 +1234,10 @@ impl Parser {
         start: usize,
         parse: impl FnOnce(&mut Self) -> Result<Expr, String>,
     ) -> Option<(Expr, usize)> {
-        let saved = (self.pos, self.depth, self.misplaced.clone());
+        let saved = (self.pos, self.level, self.misplaced.clone());
         self.pos = start;
         let parsed = parse(self).ok().map(|e| (e, self.pos - 1));
-        (self.pos, self.depth, self.misplaced) = saved;
+        (self.pos, self.level, self.misplaced) = saved;
         parsed
     }
 
@@ -1250,7 +1321,10 @@ impl Parser {
     }
 
     // ── module / suites ───────────────────────────────────────────────────
+    /// `file`: `file` → `statements` → `statement+`'s `_loop1`, three levels,
+    /// under which each `statement` is read.
     fn parse_module(&mut self) -> Result<Vec<Stmt>, String> {
+        self.rule(3)?;
         let mut stmts = Vec::new();
         self.skip_newlines();
         while !matches!(self.cur(), Tok::Eof) {
@@ -1303,7 +1377,8 @@ impl Parser {
     }
 
     /// A suite after a `:` — either a one-line simple statement or an indented
-    /// block.
+    /// block — read under the compound statement's rule (the current level),
+    /// whose `block` is one level further.
     /// `desc` names the construct for the missing-block error (CPython's
     /// `expected an indented block after <desc> on line <kw_line>`), e.g. `'if'
     /// statement`, `function definition`, `class definition`. `kw_line` is the
@@ -1331,9 +1406,11 @@ impl Parser {
                 ));
             }
             self.advance(); // Indent
+                            // `block` → `statements` → `_loop1`, each statement under them.
+            let statements = self.level + 3;
             let mut body = Vec::new();
             while !matches!(self.cur(), Tok::Dedent | Tok::Eof) {
-                self.parse_statement(&mut body)?;
+                self.under(statements, |p| p.parse_statement(&mut body))?;
                 self.skip_newlines();
             }
             if matches!(self.cur(), Tok::Dedent) {
@@ -1341,15 +1418,26 @@ impl Parser {
             }
             Ok(body)
         } else {
-            // Simple statement(s) on the same line.
+            // Simple statement(s) on the same line: `block`'s `simple_stmts`
+            // alternative.
             let mut body = Vec::new();
-            self.parse_simple_line(&mut body)?;
+            let block = self.level + 1;
+            self.under(block, |p| p.parse_simple_line(&mut body))?;
             Ok(body)
         }
     }
 
-    /// Dispatch one statement (simple or compound) into `out`.
+    /// `statement`: one level, over a compound statement or a line of simple
+    /// ones.
     fn parse_statement(&mut self, out: &mut Vec<Stmt>) -> Result<(), String> {
+        let saved = self.rule(1)?;
+        self.parse_statement_kind(out)?;
+        self.level = saved;
+        Ok(())
+    }
+
+    /// Dispatch one statement (simple or compound) into `out`.
+    fn parse_statement_kind(&mut self, out: &mut Vec<Stmt>) -> Result<(), String> {
         let line = self.line();
         // A block consumes its own `Indent` in `parse_suite`, so an `Indent` at a
         // statement boundary is always stray — CPython's `IndentationError:
@@ -1404,11 +1492,23 @@ impl Parser {
             )
     }
 
-    /// A logical line of one or more `;`-separated simple statements.
+    /// `simple_stmts`: a logical line of one or more `;`-separated simple
+    /// statements. The first `simple_stmt` is one level under it; a statement
+    /// after a `;` is read by the `';'.simple_stmt+` alternative, under its
+    /// gather and loop, two further.
     fn parse_simple_line(&mut self, out: &mut Vec<Stmt>) -> Result<(), String> {
+        let saved = self.rule(1)?;
+        let simple_stmts = self.level;
+        let mut first = true;
         loop {
             let stmt_start = self.pos;
-            self.parse_simple_stmt(out)?;
+            let level = if first {
+                simple_stmts
+            } else {
+                simple_stmts + 2
+            };
+            first = false;
+            self.under(level, |p| p.parse_simple_stmt(out))?;
             self.check_stmt_end(stmt_start)?;
             if self.eat_op(";") {
                 if self.at_newline() || matches!(self.cur(), Tok::Eof) {
@@ -1421,11 +1521,23 @@ impl Parser {
         if self.at_newline() {
             self.advance();
         }
+        self.level = saved;
         Ok(())
     }
 
+    /// `simple_stmt`: one level. Each statement's own rule (`return_stmt`,
+    /// `assert_stmt`, `assignment`, …) is one further, and reads its
+    /// expressions under it.
     fn parse_simple_stmt(&mut self, out: &mut Vec<Stmt>) -> Result<(), String> {
+        let saved = self.rule(1)?;
+        self.parse_simple_stmt_kind(out)?;
+        self.level = saved;
+        Ok(())
+    }
+
+    fn parse_simple_stmt_kind(&mut self, out: &mut Vec<Stmt>) -> Result<(), String> {
         let line = self.line();
+        let stmt = self.level + 1;
         if let Tok::Name(n) = self.cur().clone() {
             match n.as_str() {
                 "pass" => {
@@ -1456,9 +1568,11 @@ impl Parser {
                     self.advance();
                     let v =
                         if self.at_newline() || self.at_op(";") || matches!(self.cur(), Tok::Eof) {
+                            // `[star_expressions]` tried one anyway.
+                            self.reach_absent_expression(stmt + 3)?;
                             None
                         } else {
-                            Some(self.parse_exprlist()?)
+                            Some(self.under(stmt, Self::parse_exprlist)?)
                         };
                     if !self.in_function {
                         self.note_misplaced("'return' outside function", start);
@@ -1470,7 +1584,11 @@ impl Parser {
                 "del" => {
                     self.advance();
                     let start = self.pos;
-                    let targets = self.parse_target_list()?;
+                    // `del_targets` → its gather → `del_target` → `t_primary`
+                    // and its `_raw`: each target is a primary read as a
+                    // target, the first at `del_stmt` + 5 and the rest under
+                    // the gather's loop.
+                    let targets = self.parse_target_list(stmt + 5)?;
                     let items = self.split_commas(start, self.pos - 1);
                     for (t, (a, b)) in targets.iter().zip(items) {
                         if let Some((what, (a, b))) = self.invalid_target(t, a, b) {
@@ -1482,9 +1600,9 @@ impl Parser {
                 }
                 "assert" => {
                     self.advance();
-                    let test = self.parse_expr()?;
+                    let test = self.under(stmt, Self::parse_expr)?;
                     let msg = if self.eat_op(",") {
-                        Some(self.parse_expr()?)
+                        Some(self.under(stmt, Self::parse_expr)?)
                     } else {
                         None
                     };
@@ -1547,8 +1665,16 @@ impl Parser {
         let name = self.expect_name()?;
         let params = self.parse_type_params()?;
         self.expect_op("=")?;
-        let value = self.parse_expr()?;
-        out.push(Stmt::new(StmtKind::TypeAlias { name, params, value }, line));
+        // `simple_stmt` → `type_alias` → `expression`.
+        let value = self.under(self.level + 1, Self::parse_expr)?;
+        out.push(Stmt::new(
+            StmtKind::TypeAlias {
+                name,
+                params,
+                value,
+            },
+            line,
+        ));
         Ok(())
     }
 
@@ -1560,19 +1686,45 @@ impl Parser {
         Ok(names)
     }
 
-    fn parse_target_list(&mut self) -> Result<Vec<Expr>, String> {
+    /// A `del` statement's targets, each a primary whose `t_primary_raw` is at
+    /// `raw` for the first and one level further for the rest.
+    fn parse_target_list(&mut self, raw: u32) -> Result<Vec<Expr>, String> {
+        self.lead = vec![(self.pos, raw)];
         let mut ts = vec![self.parse_expr()?];
         while self.eat_op(",") {
             if self.at_newline() || matches!(self.cur(), Tok::Eof) {
                 break;
             }
+            self.lead = vec![(self.pos, raw + 1)];
             ts.push(self.parse_expr()?);
         }
         Ok(ts)
     }
 
+    /// An expression statement or an assignment, read under `simple_stmt`
+    /// (`SS`, the current level).
+    ///
+    /// pegen tries `assignment` first, and its `single_subscript_attribute_target`
+    /// alternative reads the statement's leading primary as a `t_primary`,
+    /// whose `_raw` is at SS+5, before `star_expressions` (SS+1) reads the
+    /// statement as an expression. The right-hand sides of `=` are read under
+    /// the `(yield_expr | star_expressions)` group (`star_expressions` at
+    /// SS+3), each first tried as a further `star_targets` whose `t_primary_raw`
+    /// is at SS+8; an augmented assignment's right-hand side under the same
+    /// group, with no target attempt; an annotation as an `expression` under
+    /// `assignment` and its value under `annotated_rhs` (`star_expressions` at
+    /// SS+4).
     fn parse_expr_stmt(&mut self, out: &mut Vec<Stmt>, line: u32) -> Result<(), String> {
+        let simple_stmt = self.level;
         let first_start = self.pos;
+        if self.at_kw("yield") {
+            // `yield_stmt` → `yield_expr`.
+            self.yield_at = Some((self.pos, simple_stmt + 2));
+        }
+        self.lead = vec![(self.pos, simple_stmt + 5)];
+        if self.at_op("(") {
+            self.lead.push((self.pos + 1, simple_stmt + 6));
+        }
         let first = self.parse_exprlist()?;
         // An assignment expression is not a statement unless parenthesized:
         // `a := 1` stops at the `:=`.
@@ -1584,9 +1736,12 @@ impl Parser {
         // Annotated assignment: target: ann [= value]
         if self.at_op(":") {
             self.advance();
-            let annotation = self.parse_expr()?;
+            let annotation = self.under(simple_stmt + 1, Self::parse_expr)?;
             let value = if self.eat_op("=") {
-                Some(self.parse_exprlist()?)
+                if self.at_kw("yield") {
+                    self.yield_at = Some((self.pos, simple_stmt + 4));
+                }
+                Some(self.under(simple_stmt + 3, Self::parse_exprlist)?)
             } else {
                 None
             };
@@ -1620,7 +1775,10 @@ impl Parser {
                     ));
                 }
                 self.advance();
-                let value = self.parse_exprlist()?;
+                if self.at_kw("yield") {
+                    self.yield_at = Some((self.pos, simple_stmt + 3));
+                }
+                let value = self.under(simple_stmt + 2, Self::parse_exprlist)?;
                 out.push(Stmt::new(
                     StmtKind::AugAssign {
                         target: first,
@@ -1639,7 +1797,11 @@ impl Parser {
             let mut value = None;
             while self.eat_op("=") {
                 let start = self.pos;
-                let e = self.parse_exprlist()?;
+                if self.at_kw("yield") {
+                    self.yield_at = Some((self.pos, simple_stmt + 3));
+                }
+                self.lead = vec![(self.pos, simple_stmt + 8)];
+                let e = self.under(simple_stmt + 2, Self::parse_exprlist)?;
                 if let Some(prev) = value.take() {
                     targets.push(prev);
                 }
@@ -1673,23 +1835,37 @@ impl Parser {
     }
 
     // ── compound statements ───────────────────────────────────────────────
+    /// `if_stmt`, under `compound_stmt`: two levels, with the condition's
+    /// `named_expression` and the `block` one further. Each `elif` is an
+    /// `elif_stmt` one level under the clause before it, so a chain of them
+    /// nests; an `else` is an `else_block` one under its clause.
     fn parse_if(&mut self, out: &mut Vec<Stmt>, line: u32) -> Result<(), String> {
+        let saved = self.rule(2)?;
+        self.parse_if_clause(out, line)?;
+        self.level = saved;
+        Ok(())
+    }
+
+    /// An `if` or `elif` clause and what follows it, at the clause's rule.
+    fn parse_if_clause(&mut self, out: &mut Vec<Stmt>, line: u32) -> Result<(), String> {
+        let clause = self.level;
         let kw = if matches!(self.cur(), Tok::Name(n) if n == "elif") {
             "'elif' statement"
         } else {
             "'if' statement"
         };
         self.advance(); // if / elif
-        let test = self.parse_namedexpr()?;
+        let test = self.under(clause + 1, Self::parse_namedexpr)?;
         let body = self.parse_suite(kw, line)?;
         let mut orelse = Vec::new();
         self.skip_newlines_shallow();
         if self.at_kw("elif") {
-            self.parse_if(&mut orelse, self.line())?;
+            let elif_line = self.line();
+            self.under(clause + 1, |p| p.parse_if_clause(&mut orelse, elif_line))?;
         } else if self.at_kw("else") {
             let else_line = self.line();
             self.advance();
-            orelse = self.parse_suite("'else' statement", else_line)?;
+            orelse = self.under(clause + 1, |p| p.parse_suite("'else' statement", else_line))?;
         }
         out.push(Stmt::new(StmtKind::If { test, body, orelse }, line));
         Ok(())
@@ -1702,22 +1878,30 @@ impl Parser {
         // sits at the same indent with no leading Newline to skip. Nothing to do.
     }
 
+    /// `while_stmt`, laid out as `if_stmt` is.
     fn parse_while(&mut self, out: &mut Vec<Stmt>, line: u32) -> Result<(), String> {
+        let saved = self.rule(2)?;
+        let rule = self.level;
         self.advance();
-        let test = self.parse_namedexpr()?;
+        let test = self.under(rule + 1, Self::parse_namedexpr)?;
         let body = self.parse_loop_body("'while' statement", line)?;
         let orelse = if self.at_kw("else") {
             let el = self.line();
             self.advance();
-            self.parse_suite("'else' statement", el)?
+            self.under(rule + 1, |p| p.parse_suite("'else' statement", el))?
         } else {
             Vec::new()
         };
+        self.level = saved;
         out.push(Stmt::new(StmtKind::While { test, body, orelse }, line));
         Ok(())
     }
 
+    /// `for_stmt`, under `compound_stmt`: its iterable is `star_expressions`
+    /// one level under it.
     fn parse_for(&mut self, out: &mut Vec<Stmt>, line: u32, is_async: bool) -> Result<(), String> {
+        let saved = self.rule(2)?;
+        let rule = self.level;
         self.advance();
         let start = self.pos;
         let target = self.parse_target_tuple()?;
@@ -1728,10 +1912,11 @@ impl Parser {
         let orelse = if self.at_kw("else") {
             let el = self.line();
             self.advance();
-            self.parse_suite("'else' statement", el)?
+            self.under(rule + 1, |p| p.parse_suite("'else' statement", el))?
         } else {
             Vec::new()
         };
+        self.level = saved;
         out.push(Stmt::new(
             StmtKind::For {
                 target,
@@ -1802,7 +1987,8 @@ impl Parser {
         if !self.at_op("(") {
             return Ok(None);
         }
-        let save = self.pos;
+        let save = (self.pos, self.level);
+        let with_stmt = self.level;
         self.advance();
         let mut items = Vec::new();
         let shaped = loop {
@@ -1811,7 +1997,8 @@ impl Parser {
                 // group is the `()` tuple literal, not an item list.
                 break !items.is_empty();
             }
-            let Ok(context) = self.parse_expr() else {
+            let item = with_stmt + if items.is_empty() { 2 } else { 3 };
+            let Ok(context) = self.under(item, Self::parse_expr) else {
                 break false;
             };
             let vars = if self.eat_kw("as") {
@@ -1832,18 +2019,24 @@ impl Parser {
         if shaped && self.eat_op(")") && self.at_op(":") {
             return Ok(Some(items));
         }
-        self.pos = save;
+        (self.pos, self.level) = save;
         Ok(None)
     }
 
+    /// `with_stmt`, under `compound_stmt`: each item's `expression` is under
+    /// the items' gather and `with_item`, the first at `with_stmt` + 3 and the
+    /// rest under the gather's loop.
     fn parse_with(&mut self, out: &mut Vec<Stmt>, line: u32, is_async: bool) -> Result<(), String> {
+        let saved = self.rule(2)?;
+        let with_stmt = self.level;
         self.advance();
         let items = match self.parenthesized_with_items()? {
             Some(items) => items,
             None => {
                 let mut items = Vec::new();
                 loop {
-                    let context = self.parse_expr()?;
+                    let item = with_stmt + if items.is_empty() { 2 } else { 3 };
+                    let context = self.under(item, Self::parse_expr)?;
                     let vars = if self.eat_kw("as") {
                         let start = self.pos;
                         let v = self.parse_ternary()?;
@@ -1861,6 +2054,7 @@ impl Parser {
             }
         };
         let body = self.parse_suite("'with' statement", line)?;
+        self.level = saved;
         out.push(Stmt::new(
             StmtKind::With {
                 items,
@@ -1887,10 +2081,14 @@ impl Parser {
         Err(self.err_here("invalid syntax"))
     }
 
+    /// Decorators, read under `function_def`/`class_def` (two levels under the
+    /// statement) → `decorators` → its `_loop1` → the `('@' named_expression
+    /// NEWLINE)` group: each `named_expression` six levels under the statement.
     fn parse_decorated(&mut self, out: &mut Vec<Stmt>, line: u32) -> Result<(), String> {
+        let decorator = self.level + 6;
         let mut decorators = Vec::new();
         while self.eat_op("@") {
-            decorators.push(self.parse_namedexpr()?);
+            decorators.push(self.under(decorator, Self::parse_namedexpr)?);
             if self.at_newline() {
                 self.advance();
             }
@@ -1996,6 +2194,10 @@ impl Parser {
         decorators: Vec<Expr>,
         is_async: bool,
     ) -> Result<(), String> {
+        // `compound_stmt` → `function_def` → `function_def_raw`, whose `block`
+        // and parameter list are under it.
+        let saved = self.rule(3)?;
+        let rule = self.level;
         self.advance(); // def
         let name = self.expect_name()?;
         let type_params = self.parse_type_params()?; // PEP 695 `def f[T](...)`
@@ -2004,10 +2206,13 @@ impl Parser {
         let mut params = self.parse_params(")")?;
         self.expect_op(")")?;
         if self.eat_op("->") {
-            let ret = self.parse_expr()?; // return annotation, recorded as `"return"`
+            // Return annotation, recorded as `"return"`: an `expression` under
+            // the `['->' expression]` group.
+            let ret = self.under(rule + 1, Self::parse_expr)?;
             params.annotations.push(("return".to_string(), ret));
         }
         let body = self.parse_scope_body("function definition", line, true)?;
+        self.level = saved;
         out.push(Stmt::new(
             StmtKind::FuncDef {
                 name,
@@ -2027,7 +2232,17 @@ impl Parser {
     /// ordering rules CPython's `invalid_parameters` family reports, each at
     /// the parameter that breaks it. A repeated name is the compiler's
     /// `duplicate argument`, raised once the whole file has parsed.
+    ///
+    /// Read under the `def` or `lambda` rule (the current level). pegen first
+    /// reads parameters with `slash_with_default`/`slash_no_default`, the
+    /// earliest alternatives of `parameters`, so a default is an `expression`
+    /// under `params`, `parameters`, `slash_with_default`, its loop,
+    /// `param_with_default` and `default` — seven levels further — and an
+    /// annotation one deeper, under `param_no_default`, `param` and
+    /// `annotation`.
     fn parse_params(&mut self, close: &str) -> Result<Params, String> {
+        let default_level = self.level + 6;
+        let annotation_level = self.level + 7;
         let mut p = Params::default();
         let mut seen_star = false;
         let mut seen_default = false;
@@ -2083,7 +2298,7 @@ impl Parser {
                     check_dup(self, &star_name, name_at);
                     if close == ")" && self.at_op(":") {
                         self.advance();
-                        let ann = self.parse_expr()?;
+                        let ann = self.under(annotation_level, Self::parse_expr)?;
                         p.annotations.push((star_name.clone(), ann));
                     }
                     p.star = Some(star_name);
@@ -2099,7 +2314,7 @@ impl Parser {
                 seen_kwargs = true;
                 if close == ")" && self.at_op(":") {
                     self.advance();
-                    let ann = self.parse_expr()?;
+                    let ann = self.under(annotation_level, Self::parse_expr)?;
                     p.annotations.push((kw_name.clone(), ann));
                 }
                 p.kwargs = Some(kw_name);
@@ -2112,11 +2327,11 @@ impl Parser {
             // `name: annotation` — recorded for `__annotations__` (only in a
             // `def`, `close == ")"`; a `lambda` has no annotations).
             if close == ")" && self.eat_op(":") {
-                let ann = self.parse_expr()?;
+                let ann = self.under(annotation_level, Self::parse_expr)?;
                 p.annotations.push((name.clone(), ann));
             }
             let default = if self.eat_op("=") {
-                Some(self.parse_expr()?)
+                Some(self.under(default_level, Self::parse_expr)?)
             } else {
                 None
             };
@@ -2151,6 +2366,13 @@ impl Parser {
         line: u32,
         decorators: Vec<Expr>,
     ) -> Result<(), String> {
+        // `compound_stmt` → `class_def` → `class_def_raw`. Its bases are a
+        // call's `arguments` under the `['(' [arguments] ')']` group, with no
+        // `genexp` tried first: `expression` at `_raw` + 6 for the first and
+        // + 7 under the gather's loop for the rest.
+        let saved = self.rule(3)?;
+        let rule = self.level;
+        let first_base = rule + 6;
         self.advance(); // class
         let name = self.expect_name()?;
         let type_params = self.parse_type_params()?; // PEP 695 `class C[T](...)`
@@ -2162,14 +2384,21 @@ impl Parser {
             while !self.at_op(")") {
                 // `class C(*bases)`: the base list is built at run time, as
                 // a call's `*iterable` argument is.
+                let level = if bases.is_empty() && keywords.is_empty() {
+                    first_base
+                } else {
+                    first_base + 1
+                };
                 if self.eat_op("*") {
                     order.star().map_err(|e| self.star_error_span(e))?;
-                    bases.push(Expr::Starred(Box::new(self.parse_expr()?)));
+                    bases.push(Expr::Starred(Box::new(
+                        self.under(level, Self::parse_expr)?,
+                    )));
                 } else if self.eat_op("**") {
                     order.kw_unpack = true;
                     keywords.push(Keyword {
                         name: None,
-                        value: self.parse_expr()?,
+                        value: self.under(level, Self::parse_expr)?,
                     });
                 } else if self.at_identifier()
                     && matches!(&self.toks[self.pos + 1].tok, Tok::Op(o) if o == "=")
@@ -2179,11 +2408,11 @@ impl Parser {
                     self.expect_op("=")?;
                     keywords.push(Keyword {
                         name: Some(kn),
-                        value: self.parse_expr()?,
+                        value: self.under(level, Self::parse_expr)?,
                     });
                 } else {
                     order.positional()?;
-                    bases.push(self.parse_expr()?);
+                    bases.push(self.under(level, Self::parse_expr)?);
                 }
                 if !self.eat_op(",") {
                     break;
@@ -2192,6 +2421,7 @@ impl Parser {
             self.expect_op(")")?;
         }
         let body = self.parse_scope_body("class definition", line, false)?;
+        self.level = saved;
         out.push(Stmt::new(
             StmtKind::ClassDef {
                 name,
@@ -2205,7 +2435,16 @@ impl Parser {
         Ok(())
     }
 
+    /// `try_stmt`, under `compound_stmt`. Its `block` is one level under it,
+    /// and so are an `else_block` and a `finally_block`; an `except_block` is
+    /// two, under the `except_block+` loop. A handler's type is an
+    /// `expression` under its block's rule and each block one further.
     fn parse_try(&mut self, out: &mut Vec<Stmt>, line: u32) -> Result<(), String> {
+        let saved = self.rule(2)?;
+        // `else_block` and `finally_block` directly under `try_stmt`; each
+        // `except_block` under the `except_block+` loop.
+        let clause = self.level + 1;
+        let handler = self.level + 2;
         self.advance();
         let body = self.parse_suite("'try' statement", line)?;
         let mut handlers = Vec::new();
@@ -2217,14 +2456,14 @@ impl Parser {
                 (None, None)
             } else {
                 let start = self.pos;
-                let mut t = self.parse_expr()?;
+                let mut t = self.under(handler, Self::parse_expr)?;
                 // PEP 758 (3.14): `except A, B:` catches either, as the
                 // parenthesized tuple does — but with `as` the parentheses are
                 // still required.
                 if self.at_op(",") {
                     let mut types = vec![t];
                     while self.eat_op(",") && !self.at_op(":") && !self.at_kw("as") {
-                        types.push(self.parse_expr()?);
+                        types.push(self.under(handler, Self::parse_expr)?);
                     }
                     if self.eat_kw("as") {
                         self.expect_name()?;
@@ -2243,7 +2482,9 @@ impl Parser {
                 };
                 (Some(t), n)
             };
-            let hbody = self.parse_suite("'except' statement", except_line)?;
+            let hbody = self.under(handler, |p| {
+                p.parse_suite("'except' statement", except_line)
+            })?;
             handlers.push(ExceptHandler {
                 typ,
                 name,
@@ -2278,17 +2519,18 @@ impl Parser {
         let orelse = if self.at_kw("else") {
             let el = self.line();
             self.advance();
-            self.parse_suite("'else' statement", el)?
+            self.under(clause, |p| p.parse_suite("'else' statement", el))?
         } else {
             Vec::new()
         };
         let finalbody = if self.at_kw("finally") {
             let fl = self.line();
             self.advance();
-            self.parse_suite("'finally' statement", fl)?
+            self.under(clause, |p| p.parse_suite("'finally' statement", fl))?
         } else {
             Vec::new()
         };
+        self.level = saved;
         out.push(Stmt::new(
             StmtKind::Try {
                 body,
@@ -2342,9 +2584,18 @@ impl Parser {
         false
     }
 
+    /// `match_stmt`, under `compound_stmt`. The subject is `subject_expr` one
+    /// level under it; each `case_block` is two, under `case_block+`'s loop,
+    /// with its guard's `named_expression` under `guard` and its `block` one
+    /// further.
     fn parse_match(&mut self, out: &mut Vec<Stmt>, line: u32) -> Result<(), String> {
+        let saved = self.rule(2)?;
+        let rule = self.level;
         self.advance(); // match
-        let subject = self.parse_exprlist()?;
+                        // `subject_expr` → `star_named_expression` → `named_expression`: its
+                        // `expression` four levels under `match_stmt`, one deeper than
+                        // `star_expressions` puts it.
+        let subject = self.under(rule + 1, Self::parse_exprlist)?;
         self.expect_op(":")?;
         self.skip_newlines();
         if !matches!(self.cur(), Tok::Indent) {
@@ -2357,13 +2608,15 @@ impl Parser {
         while self.at_kw("case") {
             let case_line = self.line();
             self.advance(); // case
-            let pattern = self.parse_patterns()?;
+                            // `case_block+`'s loop, then `case_block`.
+            let case_block = rule + 2;
+            let pattern = self.under(case_block, Self::parse_patterns)?;
             let guard = if self.eat_kw("if") {
-                Some(self.parse_namedexpr()?)
+                Some(self.under(case_block + 2, Self::parse_namedexpr)?)
             } else {
                 None
             };
-            let body = self.parse_suite("'case' statement", case_line)?;
+            let body = self.under(case_block, |p| p.parse_suite("'case' statement", case_line))?;
             self.skip_newlines();
             cases.push(MatchCase {
                 pattern,
@@ -2374,6 +2627,7 @@ impl Parser {
         if matches!(self.cur(), Tok::Dedent) {
             self.advance();
         }
+        self.level = saved;
         out.push(Stmt::new(StmtKind::Match { subject, cases }, line));
         Ok(())
     }
@@ -2488,8 +2742,8 @@ impl Parser {
         if self.at_op("(") {
             return self.parse_class_pattern(expr, start);
         }
-        let kind = match expr {
-            Expr::Name(n) if !dotted => PatternKind::Capture(n),
+        let kind = match (&expr, dotted) {
+            (Expr::Name(n), false) => PatternKind::Capture(n.clone()),
             _ => PatternKind::Value(expr),
         };
         Ok(self.pattern(kind, start))
@@ -2638,9 +2892,11 @@ impl Parser {
         {
             (None, None)
         } else {
-            let e = self.parse_expr()?;
+            // `simple_stmt` → `raise_stmt` → `expression`, for both.
+            let raise = self.level + 1;
+            let e = self.under(raise, Self::parse_expr)?;
             let c = if self.eat_kw("from") {
-                Some(self.parse_expr()?)
+                Some(self.under(raise, Self::parse_expr)?)
             } else {
                 None
             };
@@ -2753,20 +3009,27 @@ impl Parser {
     // ── expressions ───────────────────────────────────────────────────────
 
     /// Top-level expression list: builds a Tuple on a trailing/interior comma.
+    /// `star_expressions`: one `star_expression`, or a comma-separated tuple of
+    /// them. The first is read at `star_expressions` + 1; the rest under the
+    /// `(',' star_expression)+` loop and its group, two levels deeper.
     fn parse_exprlist(&mut self) -> Result<Expr, String> {
-        let first = self.parse_star_or_expr()?;
-        if self.at_op(",") {
+        let saved = self.rule(1)?;
+        let level = self.level;
+        let first = self.under(level + 1, Self::parse_star_expression)?;
+        let e = if self.at_op(",") {
             let mut items = vec![first];
             while self.eat_op(",") {
                 if self.stop_exprlist() {
                     break;
                 }
-                items.push(self.parse_star_or_expr()?);
+                items.push(self.under(level + 3, Self::parse_star_expression)?);
             }
-            Ok(Expr::Tuple(items))
+            Expr::Tuple(items)
         } else {
-            Ok(first)
-        }
+            first
+        };
+        self.level = saved;
+        Ok(e)
     }
 
     fn stop_exprlist(&self) -> bool {
@@ -2780,19 +3043,37 @@ impl Parser {
             || self.at_op("}")
     }
 
-    fn parse_star_or_expr(&mut self) -> Result<Expr, String> {
+    /// `star_expression`, at its own level: `'*' bitwise_or`, or an
+    /// `expression` one level up.
+    ///
+    /// The starred operand is a `bitwise_or`, not an expression: `*a or b`,
+    /// `*a if b else c` and `*not a` are syntax errors in a display or an
+    /// expression list (only a call argument takes `'*' expression`).
+    fn parse_star_expression(&mut self) -> Result<Expr, String> {
         if self.eat_op("*") {
-            return Ok(Expr::Starred(Box::new(self.parse_expr()?)));
+            return Ok(Expr::Starred(Box::new(self.parse_bitor()?)));
         }
         self.parse_namedexpr()
     }
 
-    /// `namedexpr_test`: test [`:=` test].
+    /// `star_named_expression`, at its own level: `'*' bitwise_or`, or a
+    /// `named_expression` one level up.
+    fn parse_star_named(&mut self) -> Result<Expr, String> {
+        if self.eat_op("*") {
+            return Ok(Expr::Starred(Box::new(self.parse_bitor()?)));
+        }
+        let level = self.level + 1;
+        self.under(level, Self::parse_namedexpr)
+    }
+
+    /// `named_expression`, called at its own level: `expression` one level up,
+    /// and an `assignment_expression`'s value two.
     fn parse_namedexpr(&mut self) -> Result<Expr, String> {
         let e = self.parse_ternary()?;
         if self.at_op(":=") {
             self.advance();
-            let v = self.parse_ternary()?;
+            let level = self.level + 1;
+            let v = self.under(level, Self::parse_ternary)?;
             return Ok(Expr::NamedExpr(Box::new(e), Box::new(v)));
         }
         Ok(e)
@@ -2803,12 +3084,14 @@ impl Parser {
         self.parse_namedexpr()
     }
 
+    /// `expression`: a conditional expression, a `disjunction` or a `lambdef`,
+    /// each one level up; the `else` branch is another `expression`, so a chain
+    /// of them costs one level per `else`.
     fn parse_ternary(&mut self) -> Result<Expr, String> {
-        let saved = self.depth;
-        self.enter()?;
+        let saved = self.rule(1)?;
         if self.at_kw("lambda") {
             let e = self.parse_lambda()?;
-            self.depth = saved;
+            self.level = saved;
             return Ok(e);
         }
         let body_start = self.pos;
@@ -2826,18 +3109,21 @@ impl Parser {
                 ));
             }
             let orelse = self.parse_ternary()?;
-            self.depth = saved;
+            self.level = saved;
             return Ok(Expr::IfExp {
                 test: Box::new(test),
                 body: Box::new(body),
                 orelse: Box::new(orelse),
             });
         }
-        self.depth = saved;
+        self.level = saved;
         Ok(body)
     }
 
+    /// `lambdef`: one level, and its body an `expression` under it — two levels
+    /// per `lambda` of a nested chain.
     fn parse_lambda(&mut self) -> Result<Expr, String> {
+        let saved = self.rule(1)?;
         self.advance(); // lambda
         let params = self.parse_params(":")?;
         self.expect_op(":")?;
@@ -2847,54 +3133,68 @@ impl Parser {
             return Err(self.err_here("invalid syntax"));
         }
         let body = self.parse_ternary()?;
+        self.level = saved;
         Ok(Expr::Lambda {
-            params,
+            params: Box::new(params),
             body: Box::new(body),
         })
     }
 
+    /// `disjunction`: its first operand one level up, the rest under the
+    /// `('or' conjunction)+` loop and its group, two levels further.
     fn parse_or(&mut self) -> Result<Expr, String> {
+        let saved = self.rule(1)?;
+        let level = self.level;
         let mut e = self.parse_and()?;
         if self.at_kw("or") {
             let mut items = vec![e];
             while self.eat_kw("or") {
-                items.push(self.parse_and()?);
+                items.push(self.under(level + 2, Self::parse_and)?);
             }
             e = Expr::BoolOp(BoolOp::Or, items);
         }
+        self.level = saved;
         Ok(e)
     }
 
+    /// `conjunction`, laid out as `disjunction` is.
     fn parse_and(&mut self) -> Result<Expr, String> {
+        let saved = self.rule(1)?;
+        let level = self.level;
         let mut e = self.parse_not()?;
         if self.at_kw("and") {
             let mut items = vec![e];
             while self.eat_kw("and") {
-                items.push(self.parse_not()?);
+                items.push(self.under(level + 2, Self::parse_not)?);
             }
             e = Expr::BoolOp(BoolOp::And, items);
         }
+        self.level = saved;
         Ok(e)
     }
 
+    /// `inversion`: one level, and one more per `not`.
     fn parse_not(&mut self) -> Result<Expr, String> {
-        if self.eat_kw("not") {
-            let saved = self.depth;
-            self.enter()?;
-            let e = self.parse_not()?;
-            self.depth = saved;
-            return Ok(Expr::UnaryOp(UnOp::Not, Box::new(e)));
-        }
-        self.parse_comparison()
+        let saved = self.rule(1)?;
+        let e = if self.eat_kw("not") {
+            Expr::UnaryOp(UnOp::Not, Box::new(self.parse_not()?))
+        } else {
+            self.parse_comparison()?
+        };
+        self.level = saved;
+        Ok(e)
     }
 
+    /// `comparison`: the left operand one level up; each right operand under
+    /// `compare_op_bitwise_or_pair+`, the pair and the operator's own rule
+    /// (`lt_bitwise_or`, …), three levels further.
     fn parse_comparison(&mut self) -> Result<Expr, String> {
-        let saved = self.depth;
+        let saved = self.rule(1)?;
+        let right = self.level + 3;
         let (sl, sc) = (self.line(), self.col());
         let left = self.parse_bitor()?;
         let mut ops = Vec::new();
         loop {
-            self.enter()?;
             let op = if self.at_op("<") {
                 CmpOp::Lt
             } else if self.at_op(">") {
@@ -2912,16 +3212,16 @@ impl Parser {
             } else if self.at_kw("is") {
                 self.advance();
                 if self.eat_kw("not") {
-                    ops.push((CmpOp::IsNot, self.parse_bitor()?));
+                    ops.push((CmpOp::IsNot, self.under(right, Self::parse_bitor)?));
                 } else {
-                    ops.push((CmpOp::Is, self.parse_bitor()?));
+                    ops.push((CmpOp::Is, self.under(right, Self::parse_bitor)?));
                 }
                 continue;
             } else if self.at_kw("not") {
                 // `not in`
                 self.advance();
                 if self.eat_kw("in") {
-                    ops.push((CmpOp::NotIn, self.parse_bitor()?));
+                    ops.push((CmpOp::NotIn, self.under(right, Self::parse_bitor)?));
                     continue;
                 } else {
                     return Err(format!(
@@ -2933,9 +3233,9 @@ impl Parser {
                 break;
             };
             self.advance();
-            ops.push((op, self.parse_bitor()?));
+            ops.push((op, self.under(right, Self::parse_bitor)?));
         }
-        self.depth = saved;
+        self.level = saved;
         if ops.is_empty() {
             Ok(left)
         } else {
@@ -2954,38 +3254,41 @@ impl Parser {
         }
     }
 
+    // `bitwise_or` down to `term` are left-recursive: two levels each (the
+    // rule and its `_raw` body), and a chain of one operator grows in a loop at
+    // that level rather than nesting.
     fn parse_bitor(&mut self) -> Result<Expr, String> {
-        let saved = self.depth;
+        let saved = self.rule(2)?;
         let (sl, sc) = (self.line(), self.col());
         let mut e = self.parse_bitxor()?;
         while self.at_op("|") {
             e = self.binop_tail(e, BinOp::BitOr, (sl, sc), Self::parse_bitxor)?;
         }
-        self.depth = saved;
+        self.level = saved;
         Ok(e)
     }
     fn parse_bitxor(&mut self) -> Result<Expr, String> {
-        let saved = self.depth;
+        let saved = self.rule(2)?;
         let (sl, sc) = (self.line(), self.col());
         let mut e = self.parse_bitand()?;
         while self.at_op("^") {
             e = self.binop_tail(e, BinOp::BitXor, (sl, sc), Self::parse_bitand)?;
         }
-        self.depth = saved;
+        self.level = saved;
         Ok(e)
     }
     fn parse_bitand(&mut self) -> Result<Expr, String> {
-        let saved = self.depth;
+        let saved = self.rule(2)?;
         let (sl, sc) = (self.line(), self.col());
         let mut e = self.parse_shift()?;
         while self.at_op("&") {
             e = self.binop_tail(e, BinOp::BitAnd, (sl, sc), Self::parse_shift)?;
         }
-        self.depth = saved;
+        self.level = saved;
         Ok(e)
     }
     fn parse_shift(&mut self) -> Result<Expr, String> {
-        let saved = self.depth;
+        let saved = self.rule(2)?;
         let (sl, sc) = (self.line(), self.col());
         let mut e = self.parse_arith()?;
         loop {
@@ -2998,11 +3301,11 @@ impl Parser {
             };
             e = self.binop_tail(e, op, (sl, sc), Self::parse_arith)?;
         }
-        self.depth = saved;
+        self.level = saved;
         Ok(e)
     }
     fn parse_arith(&mut self) -> Result<Expr, String> {
-        let saved = self.depth;
+        let saved = self.rule(2)?;
         let (sl, sc) = (self.line(), self.col());
         let mut e = self.parse_term()?;
         loop {
@@ -3015,11 +3318,11 @@ impl Parser {
             };
             e = self.binop_tail(e, op, (sl, sc), Self::parse_term)?;
         }
-        self.depth = saved;
+        self.level = saved;
         Ok(e)
     }
     fn parse_term(&mut self) -> Result<Expr, String> {
-        let saved = self.depth;
+        let saved = self.rule(2)?;
         let (sl, sc) = (self.line(), self.col());
         let mut e = self.parse_unary()?;
         loop {
@@ -3038,17 +3341,22 @@ impl Parser {
             };
             e = self.binop_tail(e, op, (sl, sc), Self::parse_unary)?;
         }
-        self.depth = saved;
+        self.level = saved;
         Ok(e)
     }
+    /// `factor`: one level, and one more per unary operator.
     fn parse_unary(&mut self) -> Result<Expr, String> {
+        let saved = self.rule(1)?;
+        let e = self.parse_factor()?;
+        self.level = saved;
+        Ok(e)
+    }
+
+    fn parse_factor(&mut self) -> Result<Expr, String> {
         let (sl, sc) = (self.line(), self.col());
         let unary = |p: &mut Self, op: UnOp| -> Result<Expr, String> {
-            let saved = p.depth;
-            p.enter()?;
             p.advance();
             let operand = p.parse_unary()?;
-            p.depth = saved;
             let end = p.prev_end_col();
             Ok(spanned(
                 Expr::UnaryOp(op, Box::new(operand)),
@@ -3070,7 +3378,10 @@ impl Parser {
         }
         self.parse_power()
     }
+    /// `power`: one level; the exponent is a `factor` under it, so a `**` chain
+    /// costs two levels per operator.
     fn parse_power(&mut self) -> Result<Expr, String> {
+        let saved = self.rule(1)?;
         let (sl, sc) = (self.line(), self.col());
         let base = self.parse_await_postfix()?;
         if self.at_op("**") {
@@ -3078,6 +3389,7 @@ impl Parser {
             self.advance();
             let exp = self.parse_unary()?; // right-assoc, binds unary on the right
             let end = self.prev_end_col();
+            self.level = saved;
             return Ok(spanned(
                 Expr::BinOp(BinOp::Pow, Box::new(base), Box::new(exp)),
                 sl,
@@ -3087,33 +3399,75 @@ impl Parser {
                 ope,
             ));
         }
+        self.level = saved;
         Ok(base)
     }
 
+    /// `await_primary`: one level, over `'await' primary` or a bare `primary`.
     fn parse_await_postfix(&mut self) -> Result<Expr, String> {
-        let saved = self.depth;
+        let saved = self.rule(1)?;
         let start = self.pos;
-        if self.eat_kw("await") {
-            self.enter()?;
-            let e = self.parse_await_postfix()?;
-            self.depth = saved;
-            return Ok(self.span_suspension(Expr::Await(Box::new(e)), start));
-        }
-        // Span of the whole postfix chain starts at the value's first token; each
-        // trailer wraps its result so a call/subscript/attribute that raises
-        // underlines from here to its closing bracket / attribute name.
-        let (start_line, start_col) = (self.line(), self.col());
-        let mut e = self.parse_atom()?;
+        let e = if self.eat_kw("await") {
+            // The operand is a `primary` directly under this rule: read it one
+            // level down so its own `await_primary` charge lands back here.
+            let operand = self.under(self.level - 1, Self::parse_await_postfix)?;
+            self.span_suspension(Expr::Await(Box::new(operand)), start)
+        } else {
+            self.parse_primary()?
+        };
+        self.level = saved;
+        Ok(e)
+    }
+
+    /// `primary`: the rule and its left-recursive `_raw` body, two levels. The
+    /// atom and every trailer's contents are read under `_raw`, and a chain of
+    /// trailers grows in a loop there rather than nesting.
+    ///
+    /// A primary that leads its statement was read by pegen first as the
+    /// `t_primary` of an assignment target, whose `_raw` sits higher than this
+    /// one, and what that attempt parsed was memoised; its contents are read at
+    /// that level instead (see [`Parser::lead`]).
+    fn parse_primary(&mut self) -> Result<Expr, String> {
+        let saved = self.rule(2)?;
+        let raw = self.take_lead().unwrap_or(self.level);
+        let e = self.under(raw, |p| {
+            // Span of the whole postfix chain starts at the value's first
+            // token; each trailer wraps its result so a call/subscript/attribute
+            // that raises underlines from here to its closing bracket /
+            // attribute name.
+            let start = (p.line(), p.col());
+            let atom = p.parse_atom()?;
+            p.parse_trailers(atom, start)
+        })?;
+        self.level = saved;
+        Ok(e)
+    }
+
+    /// The `t_primary_raw` level [`Parser::lead`] holds for a primary at the
+    /// current token, if any. An entry for a token already passed is stale —
+    /// the statement did not begin with a primary there after all.
+    fn take_lead(&mut self) -> Option<u32> {
+        let pos = self.pos;
+        self.lead.retain(|&(at, _)| at >= pos);
+        let i = self.lead.iter().position(|&(at, _)| at == pos)?;
+        Some(self.lead.swap_remove(i).1)
+    }
+
+    /// The trailers after a primary's atom, each read under the primary's
+    /// `_raw` rule (the current level).
+    fn parse_trailers(
+        &mut self,
+        mut e: Expr,
+        (start_line, start_col): (u32, u32),
+    ) -> Result<Expr, String> {
         loop {
             if self.at_op("(") {
-                self.enter()?;
                 // Anchor the call's `(...)` bracket region for the `~~~^^^` caret.
                 let paren_col = self.col();
                 e = self.parse_call(e)?;
                 let end = self.prev_end_col();
                 e = spanned(e, start_line, start_col, end, paren_col, end);
             } else if self.at_op("[") {
-                self.enter()?;
                 let bracket_col = self.col();
                 self.advance();
                 let sub = self.parse_subscript()?;
@@ -3128,7 +3482,6 @@ impl Parser {
                     end,
                 );
             } else if self.at_op(".") {
-                self.enter()?;
                 self.advance();
                 let attr = self.expect_name()?;
                 let end = self.prev_end_col();
@@ -3141,36 +3494,71 @@ impl Parser {
                     0,
                 );
             } else {
-                break;
+                return Ok(e);
             }
         }
-        self.depth = saved;
-        Ok(e)
     }
 
+    /// A call's parenthesized arguments, read under the primary's `_raw` rule
+    /// (`R`, the current level).
+    ///
+    /// pegen tries the parentheses as a `genexp` first, whose `(assignment_expression
+    /// | expression !':=')` group puts the first argument's `expression` at
+    /// R+3. When that fails, `arguments` → `args` → its `_gather` reads a
+    /// positional through two groups (`expression` at R+6 for the first, R+7
+    /// under the gather's loop for the rest), and `kwargs` reads a keyword at
+    /// R+6 — R+7 when positionals precede it, which puts `kwargs` under one more
+    /// group — with each later keyword under its own gather's loop.
     fn parse_call(&mut self, func: Expr) -> Result<Expr, String> {
+        let raw = self.level;
         self.expect_op("(")?;
         let mut args = Vec::new();
         let mut keywords = Vec::new();
         let mut order = ArgOrder::default();
+        // Where `kwargs`'s first element sits, once a keyword has been met.
+        let mut kwargs: Option<u32> = None;
+        // A keyword-section element: the first at `kwargs`'s gather, every later
+        // one under its loop.
+        let kwarg_level = |kwargs: &mut Option<u32>, seen_positional: bool| match *kwargs {
+            Some(base) => base + 1,
+            None => {
+                let base = raw + if seen_positional { 6 } else { 5 };
+                *kwargs = Some(base);
+                base
+            }
+        };
+        if self.at_op(")") {
+            // `genexp`'s group tried an `expression` at the `)`.
+            self.reach_absent_expression(raw + 3)?;
+        }
         while !self.at_op(")") {
+            let first = args.is_empty() && keywords.is_empty();
             if self.eat_op("*") {
                 order.star().map_err(|e| self.star_error_span(e))?;
-                args.push(Expr::Starred(Box::new(self.parse_expr()?)));
+                let level = match kwargs {
+                    Some(_) => kwarg_level(&mut kwargs, true),
+                    None if first => raw + 5,
+                    None => raw + 6,
+                };
+                args.push(Expr::Starred(Box::new(
+                    self.under(level, Self::parse_expr)?,
+                )));
             } else if self.eat_op("**") {
                 order.kw_unpack = true;
+                let level = kwarg_level(&mut kwargs, !first);
                 keywords.push(Keyword {
                     name: None,
-                    value: self.parse_expr()?,
+                    value: self.under(level, Self::parse_expr)?,
                 });
             } else if self.at_identifier()
                 && matches!(&self.toks[self.pos + 1].tok, Tok::Op(o) if o == "=")
             {
                 order.keyword = true;
+                let level = kwarg_level(&mut kwargs, !first);
                 let kn = self.expect_name()?;
                 self.expect_op("=")?;
                 let start = self.pos;
-                let value = self.parse_expr()?;
+                let value = self.under(level, Self::parse_expr)?;
                 self.comma_hint(start)?;
                 keywords.push(Keyword {
                     name: Some(kn),
@@ -3179,11 +3567,13 @@ impl Parser {
             } else {
                 order.positional()?;
                 let start = self.pos;
-                let e = self.parse_namedexpr()?;
+                let level = if first { raw + 2 } else { raw + 6 };
+                let e = self.under(level, Self::parse_namedexpr)?;
                 // Generator expression as sole argument: f(x for x in xs). With
                 // anything else in the call it must have its own parentheses.
                 if self.at_comp_for() {
-                    let comps = self.parse_comprehension_clauses()?;
+                    // The `genexp` rule, directly under `_raw`.
+                    let comps = self.under(raw + 1, Self::parse_comprehension_clauses)?;
                     let alone = args.is_empty() && keywords.is_empty() && self.at_op(")");
                     if !alone {
                         return Err(self.err_span(
@@ -3201,6 +3591,10 @@ impl Parser {
             if !self.eat_op(",") {
                 break;
             }
+            if self.at_op(")") && kwargs.is_none() {
+                // The positionals' gather tried one more item after the comma.
+                self.reach_absent_expression(raw + 7)?;
+            }
         }
         self.expect_op(")")?;
         Ok(Expr::Call {
@@ -3210,14 +3604,21 @@ impl Parser {
         })
     }
 
+    /// A subscript — a slice, an index, or a tuple of these — read under the
+    /// primary's `_raw` rule (`R`, the current level): `slices` at R+1 and its
+    /// `slice` at R+2, whose bounds are `expression`s (the step under one more
+    /// group); a tuple's later items are `slice`s three levels further, under
+    /// the gather, its loop and their group.
     fn parse_subscript(&mut self) -> Result<Expr, String> {
-        // A subscript may be a slice, an index, or a tuple of these.
-        let parse_one = |p: &mut Self| -> Result<Expr, String> {
+        let raw = self.level;
+        let parse_one = |p: &mut Self, slice: u32| -> Result<Expr, String> {
             let lo_start = p.pos;
+            // A missing bound is still an `expression` pegen tried.
             let lo = if p.at_op(":") {
+                p.reach_absent_expression(slice + 1)?;
                 None
             } else {
-                Some(Box::new(p.parse_expr()?))
+                Some(Box::new(p.under(slice, Self::parse_expr)?))
             };
             if lo.is_some() {
                 p.comma_hint(lo_start)?;
@@ -3225,15 +3626,17 @@ impl Parser {
             if p.at_op(":") {
                 p.advance();
                 let hi = if p.at_op(":") || p.at_op("]") || p.at_op(",") {
+                    p.reach_absent_expression(slice + 1)?;
                     None
                 } else {
-                    Some(Box::new(p.parse_expr()?))
+                    Some(Box::new(p.under(slice, Self::parse_expr)?))
                 };
                 let step = if p.eat_op(":") {
                     if p.at_op("]") || p.at_op(",") {
+                        p.reach_absent_expression(slice + 2)?;
                         None
                     } else {
-                        Some(Box::new(p.parse_expr()?))
+                        Some(Box::new(p.under(slice + 1, Self::parse_expr)?))
                     }
                 } else {
                     None
@@ -3243,14 +3646,14 @@ impl Parser {
                 Ok(*lo.unwrap())
             }
         };
-        let first = parse_one(self)?;
+        let first = parse_one(self, raw + 2)?;
         if self.at_op(",") {
             let mut items = vec![first];
             while self.eat_op(",") {
                 if self.at_op("]") {
                     break;
                 }
-                items.push(parse_one(self)?);
+                items.push(parse_one(self, raw + 5)?);
             }
             Ok(Expr::Tuple(items))
         } else {
@@ -3259,7 +3662,25 @@ impl Parser {
     }
 
     // ── atoms ─────────────────────────────────────────────────────────────
+    /// `atom`: one level. Every token but a name, `True`, `False` and `None`
+    /// is first tested by the `&(STRING|FSTRING_START|TSTRING_START)`
+    /// lookahead, whose `_tmp` rule is one level further, and a string goes on
+    /// through `strings`, its `_loop1` and their group to `string`, four.
     fn parse_atom(&mut self) -> Result<Expr, String> {
+        let saved = self.rule(1)?;
+        let probe = match self.cur() {
+            Tok::Name(n) if !is_keyword(n) || matches!(n.as_str(), "True" | "False" | "None") => 0,
+            Tok::Ident(_) => 0,
+            Tok::Str(_) | Tok::FString(_, _) | Tok::TString(_, _) | Tok::Bytes(_) => 4,
+            _ => 1,
+        };
+        self.reach(self.level + probe)?;
+        let e = self.parse_atom_token()?;
+        self.level = saved;
+        Ok(e)
+    }
+
+    fn parse_atom_token(&mut self) -> Result<Expr, String> {
         let line = self.line();
         match self.cur().clone() {
             Tok::Int(n) => {
@@ -3294,8 +3715,16 @@ impl Parser {
                     }
                     "yield" => {
                         let start = self.pos - 1;
+                        // `yield_expr`: where its context put it, else in a
+                        // group — `(` `yield_expr` `)`, the group three levels
+                        // under the parentheses' `atom`, whose own group is one
+                        // further than this atom's.
+                        let yield_expr = match self.yield_at.take() {
+                            Some((pos, level)) if pos == start => level,
+                            _ => self.level + 4,
+                        };
                         let e = if self.eat_kw("from") {
-                            Expr::YieldFrom(Box::new(self.parse_expr()?))
+                            Expr::YieldFrom(Box::new(self.under(yield_expr, Self::parse_expr)?))
                         } else if self.at_newline()
                             || self.at_op(")")
                             || self.at_op("=")
@@ -3304,7 +3733,8 @@ impl Parser {
                         {
                             Expr::Yield(None)
                         } else {
-                            Expr::Yield(Some(Box::new(self.parse_exprlist()?)))
+                            let operand = self.under(yield_expr, Self::parse_exprlist)?;
+                            Expr::Yield(Some(Box::new(operand)))
                         };
                         Ok(self.span_suspension(e, start))
                     }
@@ -3536,7 +3966,19 @@ impl Parser {
             conv = Some('r');
         }
         let expr_src = expr_src.trim();
-        let sub = parse(&format!("({expr_src})")).map_err(|e| format!("f-string: {e}"))?;
+        // pegen reads the field as `fstring_replacement_field` → `annotated_rhs`
+        // → `star_expressions` → `star_expression` → `expression`, eleven levels
+        // under the f-string's `atom` (the current level); read here as the
+        // parenthesized statement `(field)`, the expression lands eighteen
+        // levels under the module, so the module starts seven above the atom.
+        let sub =
+            parse_source(&format!("({expr_src})"), self.level.saturating_sub(7)).map_err(|e| {
+                if e == TOO_COMPLEX {
+                    e
+                } else {
+                    format!("f-string: {e}")
+                }
+            })?;
         let expr = match sub.into_iter().next() {
             Some(Stmt {
                 kind: StmtKind::Expr(e),
@@ -3558,16 +4000,31 @@ impl Parser {
     }
 
     /// `(...)` — parenthesized expr, tuple, or generator expression.
+    ///
+    /// Read under the `atom` rule (`A`, the current level). pegen tries
+    /// `tuple` first, through `(tuple | group | genexp)`'s group: its first
+    /// item is a `star_named_expression` under one more group, at A+4, so the
+    /// first item's `named_expression` is at A+5 whatever the parentheses turn
+    /// out to hold; a tuple's second item is one level further (under
+    /// `star_named_expressions`' gather) and the rest two (under its loop).
     fn parse_paren(&mut self) -> Result<Expr, String> {
+        let atom = self.level;
         let open = self.pos;
         self.advance(); // (
         if self.eat_op(")") {
+            // `tuple`'s first item, tried at the `)`.
+            self.reach_absent_expression(atom + 6)?;
             return Ok(Expr::Tuple(Vec::new()));
         }
         let start = self.pos;
-        let first = self.parse_star_or_expr()?;
+        if self.at_kw("yield") {
+            // `group`'s `(yield_expr | named_expression)`.
+            self.yield_at = Some((self.pos, atom + 4));
+        }
+        let first = self.under(atom + 4, Self::parse_star_named)?;
         if self.at_comp_for() {
-            let comps = self.parse_comprehension_clauses()?;
+            // The `genexp` rule, under the group.
+            let comps = self.under(atom + 2, Self::parse_comprehension_clauses)?;
             self.expect_op(")")?;
             return Ok(Expr::GenExp(Box::new(first), comps));
         }
@@ -3575,11 +4032,13 @@ impl Parser {
         if self.at_op(",") {
             let mut items = vec![first];
             while self.eat_op(",") {
+                let level = if items.len() == 1 { atom + 6 } else { atom + 7 };
                 if self.at_op(")") {
+                    self.reach_absent_expression(level + 2)?;
                     break;
                 }
                 let start = self.pos;
-                items.push(self.parse_star_or_expr()?);
+                items.push(self.under(level, Self::parse_star_named)?);
                 self.comma_hint(start)?;
             }
             self.expect_op(")")?;
@@ -3592,15 +4051,23 @@ impl Parser {
     }
 
     /// `[...]` — list display or list comprehension.
+    ///
+    /// Read under the `atom` rule (`A`): `(list | listcomp)`'s group at A+1,
+    /// `list` at A+2, then `star_named_expressions` and its gather, so the
+    /// first item's `named_expression` is at A+6 and the rest, under the
+    /// gather's loop, at A+7.
     fn parse_list(&mut self) -> Result<Expr, String> {
+        let atom = self.level;
         self.advance(); // [
         if self.eat_op("]") {
+            self.reach_absent_expression(atom + 7)?;
             return Ok(Expr::List(Vec::new()));
         }
         let start = self.pos;
-        let first = self.parse_star_or_expr()?;
+        let first = self.under(atom + 5, Self::parse_star_named)?;
         if self.at_comp_for() {
-            let comps = self.parse_comprehension_clauses()?;
+            // The `listcomp` rule, under the group.
+            let comps = self.under(atom + 2, Self::parse_comprehension_clauses)?;
             self.expect_op("]")?;
             return Ok(Expr::ListComp(Box::new(first), comps));
         }
@@ -3608,10 +4075,11 @@ impl Parser {
         let mut items = vec![first];
         while self.eat_op(",") {
             if self.at_op("]") {
+                self.reach_absent_expression(atom + 8)?;
                 break;
             }
             let start = self.pos;
-            items.push(self.parse_star_or_expr()?);
+            items.push(self.under(atom + 6, Self::parse_star_named)?);
             self.comma_hint(start)?;
         }
         self.expect_op("]")?;
@@ -3631,52 +4099,64 @@ impl Parser {
         })
     }
 
+    /// Read under the `atom` rule (`A`). pegen tries `dict` first, through
+    /// `(dict | set | dictcomp | setcomp)`'s group: `double_starred_kvpairs`,
+    /// its gather, `double_starred_kvpair` and `kvpair` put the first key and
+    /// value at A+7 (and a set's first item, read there as a would-be key);
+    /// later pairs, under the gather's loop, at A+8. A set's later items are
+    /// `set` → `star_named_expressions` → gather → loop, `named_expression`
+    /// at A+7.
     fn parse_brace_display(&mut self) -> Result<Expr, String> {
+        let atom = self.level;
         self.advance(); // {
         if self.eat_op("}") {
+            // `kvpair`'s key, tried at the `}`.
+            self.reach_absent_expression(atom + 7)?;
             return Ok(Expr::Dict(Vec::new()));
         }
         // `**mapping` spread implies dict.
         if self.eat_op("**") {
-            let v = self.parse_expr()?;
+            let v = self.under(atom + 5, Self::parse_expr)?;
             let mut pairs = vec![(None, v)];
             while self.eat_op(",") {
                 if self.at_op("}") {
                     break;
                 }
                 if self.eat_op("**") {
-                    pairs.push((None, self.parse_expr()?));
+                    pairs.push((None, self.under(atom + 6, Self::parse_expr)?));
                 } else {
-                    let k = self.parse_expr()?;
+                    let k = self.under(atom + 7, Self::parse_expr)?;
                     self.expect_op(":")?;
-                    pairs.push((Some(k), self.parse_expr()?));
+                    pairs.push((Some(k), self.under(atom + 7, Self::parse_expr)?));
                 }
             }
             self.expect_op("}")?;
             return Ok(Expr::Dict(pairs));
         }
         let first_start = self.pos;
-        let first = self.parse_star_or_expr()?;
+        let first = self.under(atom + 5, Self::parse_star_named)?;
         if self.at_op(":") {
             // dict
             self.advance();
-            let v = self.parse_expr()?;
+            let v = self.under(atom + 6, Self::parse_expr)?;
             if self.at_comp_for() {
-                let comps = self.parse_comprehension_clauses()?;
+                // The `dictcomp` rule, under the group.
+                let comps = self.under(atom + 2, Self::parse_comprehension_clauses)?;
                 self.expect_op("}")?;
                 return Ok(Expr::DictComp(Box::new(first), Box::new(v), comps));
             }
             let mut pairs = vec![(Some(first), v)];
             while self.eat_op(",") {
                 if self.at_op("}") {
+                    self.reach_absent_expression(atom + 8)?;
                     break;
                 }
                 if self.eat_op("**") {
-                    pairs.push((None, self.parse_expr()?));
+                    pairs.push((None, self.under(atom + 6, Self::parse_expr)?));
                     continue;
                 }
                 let k_start = self.pos;
-                let k = self.parse_expr()?;
+                let k = self.under(atom + 7, Self::parse_expr)?;
                 if !self.at_op(":") {
                     // `invalid_double_starred_kvpairs`: a key with no value,
                     // located at the key with no end.
@@ -3690,12 +4170,13 @@ impl Parser {
                     ));
                 }
                 self.advance();
-                pairs.push((Some(k), self.parse_expr()?));
+                pairs.push((Some(k), self.under(atom + 7, Self::parse_expr)?));
             }
             self.expect_op("}")?;
             Ok(Expr::Dict(pairs))
         } else if self.at_comp_for() {
-            let comps = self.parse_comprehension_clauses()?;
+            // The `setcomp` rule, under the group.
+            let comps = self.under(atom + 2, Self::parse_comprehension_clauses)?;
             self.expect_op("}")?;
             Ok(Expr::SetComp(Box::new(first), comps))
         } else {
@@ -3703,10 +4184,11 @@ impl Parser {
             let mut items = vec![first];
             while self.eat_op(",") {
                 if self.at_op("}") {
+                    self.reach_absent_expression(atom + 8)?;
                     break;
                 }
                 let start = self.pos;
-                items.push(self.parse_star_or_expr()?);
+                items.push(self.under(atom + 6, Self::parse_star_named)?);
                 self.comma_hint(start)?;
             }
             self.expect_op("}")?;
@@ -3720,7 +4202,13 @@ impl Parser {
         self.at_kw("for") || self.at_kw("async")
     }
 
+    /// The `for`/`if` clauses of a comprehension, read under the comprehension's
+    /// own rule (`genexp`, `listcomp`, …; the current level `C`):
+    /// `for_if_clauses` and its `_loop1` put each `for_if_clause` at C+3, whose
+    /// iterable is a `disjunction` directly under it and whose conditions are
+    /// `disjunction`s under the `('if' disjunction)*` loop and group.
     fn parse_comprehension_clauses(&mut self) -> Result<Vec<Comprehension>, String> {
+        let clause = self.level + 3;
         let mut comps = Vec::new();
         while self.at_kw("for") || self.at_kw("async") {
             let is_async = self.eat_kw("async");
@@ -3729,11 +4217,11 @@ impl Parser {
             let target = self.parse_target_tuple()?;
             self.check_for_target(&target, start, true)?;
             self.advance(); // in
-            let iter = self.parse_or()?;
+            let iter = self.under(clause, Self::parse_or)?;
             let mut ifs = Vec::new();
             while self.at_kw("if") {
                 self.advance();
-                ifs.push(self.parse_or()?);
+                ifs.push(self.under(clause + 2, Self::parse_or)?);
             }
             comps.push(Comprehension {
                 target: Box::new(target),
