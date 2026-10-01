@@ -49,6 +49,18 @@ written.
   returned int`), `__format__` returning a non-`str` was stringified (CPython:
   `__format__ must return a str, not int`), and `bytes(x)` never called
   `x.__bytes__()` at all.
+- **`AttributeError.obj` and the `name=`/`obj=` constructor keywords.** An
+  `AttributeError` escaping an attribute read now carries the receiver as
+  `obj` and the attribute as `name`, which is CPython's
+  `set_attribute_error_context`: the lookup that missed records the receiver
+  beside the rendered line (`PyHost::note_attr_miss`, the record the "Did you
+  mean" hint already used) and `synth_exc` reads it back on an exact line match;
+  a user `__getattr__` or property raising its own `AttributeError` has the live
+  object augmented, unless it already carries a name or object. A property
+  whose body misses on another object keeps that inner context, as in CPython.
+  `AttributeError(…, name=, obj=)` and `NameError(…, name=)` take their
+  keyword-only arguments with `getargs.c`'s refusals, and the slots read `None`
+  when unset, where they raised `AttributeError`.
 - **A dedent matching no outer level wins over the parse error after it.**
   `try:` / `if 1:` with a body indented 8 and a following line at 4 reported
   `SyntaxError: expected 'except' or 'finally' block` (or no caret): the
@@ -549,7 +561,7 @@ written.
   than the three that were hard-coded keeps the OS's own errno and maps it to
   CPython's subclass.
 - **`NameError.name` and `AttributeError.name`.** Both attributes were absent, so `except NameError as e: e.name` raised from inside the
-  handler. `AttributeError.obj` is still absent — see below.
+  handler. `AttributeError.obj` is bound too — see the entry above.
 - **A regex group NUMBER out of range raises.** `Match.group` accepted any
   integer and read its span vector out of bounds, answering `None` — which is
   the value CPython reserves for a group that EXISTS and did not participate in
@@ -1571,10 +1583,6 @@ written.
   the class split is not. Relatedly, pythonrs is MORE permissive than CPython on
   two shapes it accepts up to the cap: `'lambda: '*5000+'1'` and
   `'not '*20000+'1'` parse here and are `MemoryError` there.
-- **`AttributeError.obj` is absent.** `.name` is bound (see above), but the
-  object the failed lookup ran against is not recoverable from the rendered
-  message that `synth_exc` reconstructs the exception from, and fabricating one
-  would be worse than its absence. CPython answers `1` for `(1).nope`.
 - **`UnicodeDecodeError`/`UnicodeEncodeError` carry the rendered message, not the
   five-tuple.** CPython's `args` is `(encoding, object, start, end, reason)` —
   `('utf-8', b'\xff', 0, 1, 'invalid start byte')` — with `.encoding`,

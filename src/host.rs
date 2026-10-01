@@ -10807,20 +10807,70 @@ impl PyHost {
     /// path.
     pub fn get_attr(&mut self, recv: &Value, name: &str) -> Result<Value, String> {
         let r = self.get_attr_inner(recv, name);
-        if r.is_err() {
-            self.note_attr_miss(recv, name);
+        if let Err(e) = &r {
+            self.note_attr_miss(e, recv, name, true);
         }
         r
     }
 
-    /// Record the receiver of a missed attribute lookup for the hint.
-    pub fn note_attr_miss(&mut self, recv: &Value, name: &str) {
-        let self_obj = self.frames.last().and_then(|f| f.self_obj.clone());
-        self.suggest = Some(SuggestCtx::Attr {
-            wrong: name.to_string(),
-            recv: recv.clone(),
-            self_obj,
-        });
+    /// CPython's `set_attribute_error_context` (Objects/object.c), run where an
+    /// attribute read of `name` on `recv` failed with the error `line`: an
+    /// `AttributeError` gets `name` and `obj` unless it already carries either.
+    ///
+    /// A native miss is not an exception object yet, only its rendered line
+    /// until `synth_exc` builds one, so the receiver is recorded beside the line
+    /// (the same record feeds the "Did you mean" hint) and `synth_exc` reads
+    /// `obj` back on an exact line match. When the line is the in-flight
+    /// exception object's (a user `raise` inside `__getattr__` or a property),
+    /// that object is augmented directly.
+    ///
+    /// `innermost` marks the lookup that produced the miss. An enclosing
+    /// boundary (the full read protocol, a fused method call) keeps a record
+    /// already made for the same line, as CPython keeps the context an inner
+    /// lookup set: a property whose body misses `self.other.zz` reports `other`,
+    /// not the instance whose property was read. Like `ForeignExc`, a stale
+    /// record is only picked up by a byte-identical line.
+    pub fn note_attr_miss(&mut self, line: &str, recv: &Value, name: &str, innermost: bool) {
+        let same_line =
+            matches!(&self.suggest, Some(SuggestCtx::Attr { line: l, .. }) if l == line);
+        if innermost || !same_line {
+            let self_obj = self.frames.last().and_then(|f| f.self_obj.clone());
+            self.suggest = Some(SuggestCtx::Attr {
+                wrong: name.to_string(),
+                recv: recv.clone(),
+                self_obj,
+                line: line.to_string(),
+            });
+        }
+        if !line.starts_with("AttributeError") {
+            return;
+        }
+        let Some(exc) = self.exc.clone() else {
+            return;
+        };
+        if self.exc_line_of(&exc).as_deref() != Some(line) {
+            return;
+        }
+        let unset = |h: &mut Self, attr: &str| {
+            matches!(h.get_attr_inner(&exc, attr), Ok(Value::Undef) | Err(_))
+        };
+        if unset(self, "name") && unset(self, "obj") {
+            let nv = self.new_str(name.to_string());
+            let _ = self.set_attr(&exc, "name", nv);
+            let _ = self.set_attr(&exc, "obj", recv.clone());
+        }
+    }
+
+    /// The attribute name and receiver recorded for the miss that rendered to
+    /// `line`: `AttributeError.name` / `.obj` for the exception `synth_exc`
+    /// builds from that line.
+    pub fn attr_miss_for(&self, line: &str) -> Option<(String, Value)> {
+        match &self.suggest {
+            Some(SuggestCtx::Attr {
+                wrong, recv, line: l, ..
+            }) if l == line => Some((wrong.clone(), recv.clone())),
+            _ => None,
+        }
     }
 
     /// Remember the scope a bare-name read missed in, for the same hint.
@@ -10890,6 +10940,7 @@ impl PyHost {
                 wrong,
                 recv,
                 self_obj,
+                ..
             } => {
                 if !line.starts_with("AttributeError:") || !line.contains(&format!("'{wrong}'")) {
                     return None;
@@ -11469,6 +11520,12 @@ impl PyHost {
                     let suppressed =
                         matches!(recv, Value::Obj(id) if self.suppress_context.contains(id));
                     return Ok(Value::Bool(suppressed));
+                }
+                // `AttributeError.name`/`.obj` and `NameError.name` are member
+                // slots that start NULL and read as `None`, whichever path built
+                // the exception. A value set on the instance was answered above.
+                if crate::builtins::name_error_attrs(class).is_some_and(|a| a.contains(&name)) {
+                    return Ok(Value::Undef);
                 }
                 let class = class.clone();
                 // The exception's own methods (`add_note`, `with_traceback`, and
@@ -14227,7 +14284,7 @@ pub fn call_method(
     let r = call_method_inner(recv, name, args, kwargs);
     if let Err(e) = &r {
         if e.starts_with("AttributeError:") && e.contains(&format!("'{name}'")) {
-            with_host(|h| h.note_attr_miss(recv, name));
+            with_host(|h| h.note_attr_miss(e, recv, name, false));
         }
     }
     r
@@ -14532,7 +14589,9 @@ fn call_method_inner(
             // so `self.write(...)` inside it went straight to AttributeError.
             if with_host(|h| h.class_has(&class, "__getattr__")) {
                 let key = with_host(|h| h.new_str(name.to_string()));
-                let attr = call_method(recv, "__getattr__", vec![key], vec![])?;
+                let attr = call_method(recv, "__getattr__", vec![key], vec![]).inspect_err(|e| {
+                    with_host(|h| h.note_attr_miss(e, recv, name, false));
+                })?;
                 return invoke(&attr, args, kwargs);
             }
             Err(format!(
@@ -16310,6 +16369,9 @@ pub enum SuggestCtx {
         wrong: String,
         recv: Value,
         self_obj: Option<Value>,
+        /// The `"AttributeError: …"` line the miss rendered to, which is how a
+        /// synthesized exception finds its `obj` (see [`PyHost::note_attr_miss`]).
+        line: String,
     },
 }
 

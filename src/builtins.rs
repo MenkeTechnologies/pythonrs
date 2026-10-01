@@ -349,6 +349,7 @@ fn get_attr_desc(recv: &Value, name: &str) -> Result<Value, String> {
         }
         Err(e) => Err(e),
     }
+    .inspect_err(|e| with_host(|h| h.note_attr_miss(e, recv, name, false)))
 }
 
 /// The default `object.__getattribute__`: descriptor-aware lookup (data
@@ -3955,6 +3956,54 @@ fn syntax_error_init(e: &Value, args: &[Value]) -> Result<(), String> {
     Ok(())
 }
 
+/// The keyword-only attributes `AttributeError_init` (`name`, `obj`) and
+/// `NameError_init` (`name`) accept, in kwlist order; `UnboundLocalError`
+/// inherits `NameError`'s. `None` for a class whose `__init__` takes no
+/// keywords of its own.
+pub(crate) fn name_error_attrs(class: &str) -> Option<&'static [&'static str]> {
+    match class {
+        "AttributeError" => Some(&["name", "obj"]),
+        "NameError" | "UnboundLocalError" => Some(&["name"]),
+        _ => None,
+    }
+}
+
+/// `AttributeError(*args, name=None, obj=None)` / `NameError(*args, name=None)`:
+/// the positional arguments are `args` as for any exception, the keywords set
+/// the attributes, and an attribute not passed is `None`. The refusals are
+/// `getargs.c`'s for the `"|$OO:AttributeError"` / `"|$O:NameError"` formats,
+/// worded as /opt/homebrew/bin/python3.14 words them — the format names
+/// `NameError` for `UnboundLocalError` too.
+fn name_error_init(e: &Value, class: &str, kwargs: &[(String, Value)]) -> Result<(), String> {
+    let Some(attrs) = name_error_attrs(class) else {
+        return Ok(());
+    };
+    let fname = if class == "AttributeError" { "AttributeError" } else { "NameError" };
+    if kwargs.len() > attrs.len() {
+        let plural = if attrs.len() == 1 { "" } else { "s" };
+        return Err(host::type_error(&format!(
+            "{fname}() takes at most {} keyword argument{plural} ({} given)",
+            attrs.len(),
+            kwargs.len()
+        )));
+    }
+    if let Some((k, _)) = kwargs.iter().find(|(k, _)| !attrs.contains(&k.as_str())) {
+        let names: Vec<String> = attrs.iter().map(|a| a.to_string()).collect();
+        let hint = crate::suggest::closest(&names, k)
+            .map(|s| format!(". Did you mean '{s}'?"))
+            .unwrap_or_default();
+        return Err(host::type_error(&format!(
+            "{fname}() got an unexpected keyword argument '{k}'{hint}"
+        )));
+    }
+    with_host(|h| {
+        for attr in attrs {
+            let _ = h.set_attr(e, attr, kw_get(kwargs, attr).unwrap_or(Value::Undef));
+        }
+    });
+    Ok(())
+}
+
 fn synth_exc(h: &mut host::PyHost, err: &str) -> Value {
     // A syntax error's position rides behind its message (see
     // `parser::split_syntax_error`); it becomes the exception's attributes.
@@ -4015,13 +4064,24 @@ fn synth_exc(h: &mut host::PyHost, err: &str) -> Value {
     for (name, val) in attrs {
         let _ = h.set_attr(&e, &name, val);
     }
-    // `NameError.name` (3.10+) and `AttributeError.name` (3.10+): the identifier
-    // that could not be resolved. `AttributeError.obj` is NOT set — the value
-    // the lookup ran against is not recoverable from the rendered message, and
-    // fabricating one would be worse than its absence (see BUGS.md).
-    if let Some(n) = missing_identifier(&class, &msg) {
-        let nv = h.new_str(n);
-        let _ = h.set_attr(&e, "name", nv);
+    // `NameError.name` (3.10+) and `AttributeError.name`/`.obj` (3.10+): the
+    // identifier that could not be resolved and the object the lookup ran
+    // against. The object is not in the rendered message; the lookup that
+    // missed recorded it beside the line (`PyHost::note_attr_miss`). Both are
+    // `None` when nothing names them, as on a constructed exception.
+    if let Some(attrs) = name_error_attrs(&class) {
+        let recorded = (class == "AttributeError")
+            .then(|| h.attr_miss_for(err))
+            .flatten();
+        let (name, obj) = match recorded {
+            Some((n, o)) => (Some(n), o),
+            None => (missing_identifier(&class, &msg), Value::Undef),
+        };
+        let nv = name.map_or(Value::Undef, |n| h.new_str(n));
+        let _ = h.set_attr(&e, attrs[0], nv);
+        if let Some(obj_attr) = attrs.get(1) {
+            let _ = h.set_attr(&e, obj_attr, obj);
+        }
     }
     // An engine-raised `SyntaxError` carries the same attributes a constructed
     // one does. The compiler appends its position as ` (line N)`; that is
@@ -5594,6 +5654,7 @@ pub fn call_builtin_function(
         if let Some(args) = init {
             syntax_error_init(&e, &args)?;
         }
+        name_error_init(&e, name, &kwargs)?;
         return Ok(e);
     }
     // A keyword for a builtin that takes none is a TypeError, not a value to
