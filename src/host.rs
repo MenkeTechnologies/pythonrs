@@ -8606,7 +8606,23 @@ impl PyHost {
                         for (k, (kv, vv)) in y.clone() {
                             dict_put(&mut out, k, kv, vv);
                         }
-                        return Ok(self.new_dict(out));
+                        // `defdict_or`/`odict_or` build the result by calling the
+                        // operand's own type (`type(self)(left)`, a defaultdict
+                        // with its factory) then updating it, so the result is
+                        // that type -- the left operand's when it is one, else
+                        // the right's (the slot runs reflected).
+                        let meta = [a, b].into_iter().find_map(|v| match v {
+                            Value::Obj(i) => self.dict_meta.get(i).filter(|m| {
+                                matches!(m.kind, DictKind::DefaultDict | DictKind::OrderedDict)
+                            }),
+                            _ => None,
+                        });
+                        let meta = meta.cloned();
+                        let d = self.new_dict(out);
+                        if let (Some(meta), Value::Obj(i)) = (meta, &d) {
+                            self.dict_meta.insert(*i, meta);
+                        }
+                        return Ok(d);
                     }
                 }
                 // set operations (result type follows the left operand;

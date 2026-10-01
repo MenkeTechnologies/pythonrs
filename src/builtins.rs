@@ -4489,6 +4489,9 @@ fn numeric_hook_inner(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> 
     let b_inst = with_host(|h| matches!(h.get(b), Some(PyObj::Instance(_))));
     // No user instance involved → native handling (preserves `1 == 1.0`, etc.).
     if !a_inst && !b_inst {
+        if let Some(r) = collections_compare(op, a, b) {
+            return r;
+        }
         // A sequence/dict whose elements compare through user code cannot be
         // compared inside the borrow at all.
         if matches!(op, Eq | Ne) {
@@ -14211,6 +14214,11 @@ fn op_dunders(typename: &str) -> &'static [&'static str] {
     const SEQ: &[&str] = &["__add__", "__mul__", "__rmul__"];
     const MUT_SEQ: &[&str] = &["__add__", "__iadd__", "__mul__", "__rmul__", "__imul__"];
     const DICT: &[&str] = &["__or__", "__ror__", "__ior__"];
+    // `dictviews_as_number`: the four set operators, each slot answering both
+    // halves, and no in-place forms (`v |= x` rebinds `v` to a set).
+    const VIEW: &[&str] = &[
+        "__sub__", "__rsub__", "__and__", "__rand__", "__or__", "__ror__", "__xor__", "__rxor__",
+    ];
     const SET: &[&str] = &[
         "__sub__", "__rsub__", "__isub__", "__and__", "__rand__", "__iand__", "__or__", "__ror__",
         "__ior__", "__xor__", "__rxor__", "__ixor__",
@@ -14236,8 +14244,9 @@ fn op_dunders(typename: &str) -> &'static [&'static str] {
         "bytearray" => MUT_TEXT,
         "tuple" => SEQ,
         "list" | "deque" => MUT_SEQ,
-        "dict" => DICT,
+        "dict" | "defaultdict" | "OrderedDict" => DICT,
         "set" => SET,
+        "dict_keys" | "dict_items" => VIEW,
         "frozenset" => FROZENSET,
         "complex" => COMPLEX,
         _ => &[],
@@ -14256,7 +14265,9 @@ fn op_dunder_accepts(tn: &str, name: &str, b: &Value) -> bool {
         }
         // `dict.__ior__` takes anything `update` does (a mapping OR an iterable
         // of pairs); `|` and its reflection need a mapping.
-        "dict" if name != "__ior__" => with_host(|h| matches!(h.get(b), Some(PyObj::Dict(_)))),
+        "dict" | "defaultdict" | "OrderedDict" if name != "__ior__" => {
+            with_host(|h| matches!(h.get(b), Some(PyObj::Dict(_))))
+        }
         "complex" => is_num_like(b) || with_host(|h| h.is_complex(b)),
         _ => true,
     }
@@ -17526,12 +17537,18 @@ fn dict_method(
             });
             Ok(Value::Undef)
         }
+        // `Counter.copy` is `self.__class__(self)`, `defaultdict.copy` is
+        // `new_defdict(self, self)` and `OrderedDict.copy` is `type(self)(self)`:
+        // the copy keeps the receiver's type, and a defaultdict its factory.
         "copy" => {
             let d = with_host(|h| match h.get(recv) {
                 Some(PyObj::Dict(d)) => d.clone(),
                 _ => IndexMap::new(),
             });
-            Ok(with_host(|h| h.new_dict(d)))
+            Ok(match host::dict_meta_of(recv) {
+                Some(meta) => host::alloc_dict_subtype(d, meta.kind, meta.factory),
+                None => with_host(|h| h.new_dict(d)),
+            })
         }
         "popitem" => {
             let got = with_host(|h| {
@@ -20713,6 +20730,76 @@ fn counter_elements(recv: &Value) -> Result<Value, String> {
         }
     }
     Ok(with_host(|h| h.new_list(out)))
+}
+
+/// The rich comparisons `collections` defines between two operands of its own
+/// dict types: `Counter`'s six (missing counts read as zero) and
+/// `OrderedDict`'s order-sensitive `==`/`!=` (`odict_richcompare`). `None`
+/// for any other pair, which compares as plain dicts do.
+fn collections_compare(op: NumOp, a: &Value, b: &Value) -> Option<Result<Value, String>> {
+    use host::DictKind;
+    if !matches!(op, NumOp::Eq | NumOp::Ne | NumOp::Lt | NumOp::Le | NumOp::Gt | NumOp::Ge) {
+        return None;
+    }
+    let kind_a = host::dict_meta_of(a)?.kind;
+    let kind_b = host::dict_meta_of(b)?.kind;
+    match (kind_a, kind_b) {
+        (DictKind::Counter, DictKind::Counter) => {
+            Some(counter_compare(op, a, b).map(Value::Bool))
+        }
+        // `dict.__eq__(self, other) and all(map(_eq, self, other))`: two
+        // OrderedDicts whose keys run in a different order are unequal. Same
+        // order leaves exactly the plain-dict comparison.
+        (DictKind::OrderedDict, DictKind::OrderedDict) if matches!(op, NumOp::Eq | NumOp::Ne) => {
+            let same_order = with_host(|h| match (h.get(a), h.get(b)) {
+                (Some(PyObj::Dict(x)), Some(PyObj::Dict(y))) => {
+                    x.len() != y.len() || x.keys().eq(y.keys())
+                }
+                _ => true,
+            });
+            (!same_order).then(|| Ok(Value::Bool(matches!(op, NumOp::Ne))))
+        }
+        _ => None,
+    }
+}
+
+/// `Counter.__eq__`/`__le__`/`__ge__` -- `all(self[e] OP other[e] for c in
+/// (self, other) for e in c)` -- and the three derived from them (`__ne__` is
+/// `not ==`, `__lt__` is `<= and !=`, `__gt__` is `>= and !=`).
+fn counter_compare(op: NumOp, a: &Value, b: &Value) -> Result<bool, String> {
+    let all = |cmp: NumOp| -> Result<bool, String> {
+        for c in [a, b] {
+            let keys = with_host(|h| match h.get(c) {
+                Some(PyObj::Dict(d)) => d.values().map(|(k, _)| k.clone()).collect(),
+                _ => Vec::new(),
+            });
+            for e in keys {
+                let (x, y) = (counter_count(a, &e)?, counter_count(b, &e)?);
+                let r = numeric_hook(cmp, &x, &y)?;
+                if !py_bool(&r)? {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    };
+    match op {
+        NumOp::Eq => all(NumOp::Eq),
+        NumOp::Ne => all(NumOp::Eq).map(|eq| !eq),
+        NumOp::Le => all(NumOp::Le),
+        NumOp::Ge => all(NumOp::Ge),
+        NumOp::Lt => Ok(all(NumOp::Le)? && !all(NumOp::Eq)?),
+        _ => Ok(all(NumOp::Ge)? && !all(NumOp::Eq)?),
+    }
+}
+
+/// `counter[e]`: the stored count, or `0` from `Counter.__missing__`.
+fn counter_count(counter: &Value, e: &Value) -> Result<Value, String> {
+    if contains_value(counter.clone(), e.clone())? {
+        dict_get(counter, e)
+    } else {
+        Ok(Value::Int(0))
+    }
 }
 
 /// `Counter.update(iterable_or_mapping)` / `.subtract(...)` with `sign` +1 / -1.

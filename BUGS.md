@@ -342,6 +342,16 @@ written.
   follow `PyObject_SetItem`/`DelItem`'s sequence branch into
   `deque_ass_item`/`deque_del_item`, and a slice or other non-index key on any
   of get/set/del is `sequence index must be integer, not 'slice'`.
+- **`collections` dict types keep their type through `|` and `.copy()`, and
+  compare as CPython does.** `defaultdict(int) | {}` and `OrderedDict() | {}`
+  (either side) and `.copy()` of both came back a plain `dict`; they now take
+  the type `defdict_or`/`odict_or`/`defdict_copy` build, a defaultdict keeping
+  its `default_factory`. Two OrderedDicts with the keys in a different order
+  compared equal; `Counter(a=1) == Counter(a=1, b=0)` was False and
+  `Counter <= Counter` a TypeError -- the six `Counter` comparisons now read a
+  missing count as zero. The operator slots of `defaultdict`/`OrderedDict` and
+  of the keys/items views also answer as bound methods (`dd.__or__(d)`,
+  `d.keys().__rsub__(it)`).
 - **`stdout`/`stderr` are buffered as CPython buffers them.** pythonrs flushed
   every write, so `python prog.py > log 2>&1` came out in program order where
   CPython's comes out in flush order (`err1 err2 out1 out2` for two

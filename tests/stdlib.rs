@@ -3534,3 +3534,60 @@ x = [d, e(lambda: setitem(1)), e(lambda: delitem(-2)), e(lambda: setitem(slice(0
         r#"[deque(['a', 3, 'z'], maxlen=8), 'IndexError: deque index out of range', 'IndexError: deque index out of range', "TypeError: sequence index must be integer, not 'slice'", "TypeError: sequence index must be integer, not 'str'", "TypeError: sequence index must be integer, not 'slice'", "IndexError: cannot fit 'int' into an index-sized integer", "TypeError: sequence index must be integer, not 'NoneType'"]"#
     );
 }
+
+// `Counter`'s six comparisons read a missing count as zero and decline a plain
+// dict; two OrderedDicts are equal only with their keys in the same order,
+// while an OrderedDict against a plain dict compares as dicts do.
+#[test]
+fn counter_and_ordereddict_rich_comparisons() {
+    let src = r#"from collections import Counter, OrderedDict
+def e(f):
+    try:
+        return f()
+    except TypeError as ex:
+        return str(ex)
+a, b = Counter(a=3, b=1), Counter(a=3, b=1, c=0)
+x = [a == b, a != b, a <= b, a < b, a >= b, a > b, Counter(a=1) < Counter(a=2), Counter(a=2) > Counter(a=1, b=-1),
+     Counter(a=1) == {'a': 1}, Counter(a=1, b=0) == {'a': 1}, e(lambda: Counter() <= {}), Counter(a=1.0) == Counter(a=1),
+     OrderedDict(a=1, b=2) == OrderedDict(b=2, a=1), OrderedDict(a=1, b=2) != OrderedDict(b=2, a=1),
+     OrderedDict(a=1, b=2) == OrderedDict(a=1, b=2), OrderedDict(a=1, b=2) == {'b': 2, 'a': 1},
+     OrderedDict(a=1) == OrderedDict(a=2)]
+"#;
+    assert_eq!(
+        g(src, "x"),
+        r#"[True, False, True, False, True, False, True, True, True, False, "'<=' not supported between instances of 'Counter' and 'dict'", True, False, True, True, True, False]"#
+    );
+}
+
+// `defdict_or`/`odict_or` build the result by calling the operand's own type,
+// so `|` keeps it (the left operand's when it has one, else the right's), and
+// `.copy()` keeps it too -- a defaultdict with its `default_factory`.
+#[test]
+fn defaultdict_and_ordereddict_merge_and_copy_keep_their_type() {
+    let src = r#"from collections import defaultdict, OrderedDict
+dd = defaultdict(int, a=1)
+od = OrderedDict(a=1)
+r = [dd | {'b': 2}, {'b': 2} | dd, od | {'b': 2}, {'b': 2} | od, dd | od, dd.copy(), od.copy()]
+x = [(type(v).__name__, list(v.items()), getattr(v, 'default_factory', None)) for v in r]
+"#;
+    assert_eq!(
+        g(src, "x"),
+        r#"[('defaultdict', [('a', 1), ('b', 2)], <class 'int'>), ('defaultdict', [('b', 2), ('a', 1)], <class 'int'>), ('OrderedDict', [('a', 1), ('b', 2)], None), ('OrderedDict', [('b', 2), ('a', 1)], None), ('defaultdict', [('a', 1)], <class 'int'>), ('defaultdict', [('a', 1)], <class 'int'>), ('OrderedDict', [('a', 1)], None)]"#
+    );
+}
+
+// The operator slots of defaultdict/OrderedDict and of the keys/items views,
+// called as bound methods; a dict merge with a non-mapping is NotImplemented.
+#[test]
+fn mapping_and_view_operator_dunders_answer_by_name() {
+    let src = r#"from collections import defaultdict, OrderedDict
+dd = defaultdict(int, a=1)
+k = {1: 2}.keys()
+x = [dd.__or__({'b': 2}), dd.__ror__({'z': 0}), dd.__or__([]), OrderedDict(a=1).__or__({'b': 2}),
+     k.__or__([5]), k.__rsub__([5, 1]), k.__and__(range(3)), k.__rxor__((1, 7)), {1: 2}.items().__or__([(3, 4)])]
+"#;
+    assert_eq!(
+        g(src, "x"),
+        r#"[defaultdict(<class 'int'>, {'a': 1, 'b': 2}), defaultdict(<class 'int'>, {'z': 0, 'a': 1}), NotImplemented, OrderedDict({'a': 1, 'b': 2}), {1, 5}, {5}, {1}, {7}, {(1, 2), (3, 4)}]"#
+    );
+}
