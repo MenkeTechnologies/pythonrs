@@ -221,7 +221,7 @@ what is not yet implemented.
 | `--disasm` | Print a `fusevm` bytecode disassembly listing and exit. |
 | `--tiers` | Run the script, then report which fusevm execution tier took each of its chunks. |
 | `--repl` | Start the interactive REPL. |
-| `--lsp` | Run the Language Server Protocol server over stdio. |
+| `--lsp` | Run the Language Server Protocol server over stdio — diagnostics, completion, hover, go-to-definition, signature help. |
 | `--dap` | Run the Debug Adapter Protocol server over stdio — breakpoints, stepping, stack trace, locals, expression `evaluate`. |
 | `--doctor` | Print a diagnostic report — runtime, embedded CPython, fusevm engine, bytecode cache, `PYTHON*` env, and every `python*` interpreter on `PATH` — and exit. |
 | `--cacheview` | List the compiled programs held in the rkyv bytecode cache (`~/.pythonrs/scripts.rkyv`): per-entry hashes, blob size, and op/function/try/warning counts. |

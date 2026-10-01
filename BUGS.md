@@ -9,6 +9,17 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **`--lsp` go-to-definition and signature help.** The server answered only
+  completion, hover and diagnostics. `textDocument/definition` now resolves the
+  name under the cursor the way the compiler does — innermost function out,
+  class bodies invisible from their methods, `global` names in the module — to
+  the nearest binding above the cursor (`def`, `class`, parameter, assignment,
+  `for`/`with`/`except` target, import, `match` capture), or the first one when
+  all come later. `textDocument/signatureHelp` shows the parameters of the call
+  being typed exactly as its `def` header writes them (a class shows `__init__`
+  without `self`), with the active one picked by position, by `name=`, or as the
+  `*args` collector; commas inside strings and nested calls are not counted, and
+  a document left unparsable by the half-typed line is re-parsed without it.
 - **`dir()` of a builtin type is CPython's full listing.** `dir(int)`,
   `dir(str)`, `dir(list)`, `dir(dict)` and the rest of the 13 builtin types (and
   their values: `dir(5) == dir(int)`) name every slot wrapper, classmethod, data
@@ -1961,8 +1972,11 @@ measured inside it, recorded so the next round does not re-derive them.
   console) runs any expression in the paused frame, as `eval` on the stopped
   line would.
 - **`--lsp`**: full corpus — completion (builtins/keywords/methods), position-
-  aware hover, and diagnostics via the real parser. Go-to-def and signature help
-  not yet added.
+  aware hover, diagnostics via the real parser, go-to-definition and signature
+  help. The last two resolve names within the open document only — through its
+  module, function and class scopes (`src/lsp_nav.rs`) — so a builtin, an
+  attribute (`obj.name`, `self.method`) or a name imported from another file
+  has no definition or signature to show.
 - **REPL** echoes bare-expression values through `sys.displayhook` (CPython
   "single" mode: prints `repr(value)` for non-`None` top-level results and binds
   `_`); multi-line blocks close on a blank line. Passing `--repl` with piped

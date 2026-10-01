@@ -2,9 +2,11 @@
 //!
 //! Self-contained and read-only: diagnostics come from the same `parser::parse`
 //! the runtime uses (a syntax error maps to the reported line); hover and
-//! completion draw on the builtin/keyword/method corpus below. No output ever
-//! reaches the terminal — JSON-RPC on stdio only. Structure follows the sibling
-//! `-rs` interpreters' `lsp.rs` (see `rubylang/src/lsp.rs`).
+//! completion draw on the builtin/keyword/method corpus below; go-to-definition
+//! and signature help resolve names through the document's scopes
+//! (`crate::lsp_nav`). No output ever reaches the terminal — JSON-RPC on stdio
+//! only. Structure follows the sibling `-rs` interpreters' `lsp.rs` (see
+//! `rubylang/src/lsp.rs`).
 
 use std::collections::HashMap;
 
@@ -13,9 +15,14 @@ use lsp_types::notification::{
     DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, Notification as _,
     PublishDiagnostics,
 };
-use lsp_types::request::{Completion, HoverRequest, Request as _};
+use lsp_types::request::{
+    Completion, GotoDefinition, HoverRequest, Request as _, SignatureHelpRequest,
+};
 use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
+    Documentation, GotoDefinitionParams, GotoDefinitionResponse, Location, OneOf,
+    ParameterInformation, ParameterLabel, SignatureHelp, SignatureHelpOptions,
+    SignatureHelpParams, SignatureInformation,
     Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, Hover, HoverContents, HoverParams, HoverProviderCapability,
     MarkupContent, MarkupKind, Position, PublishDiagnosticsParams, Range, ServerCapabilities,
@@ -1153,6 +1160,11 @@ fn server_capabilities() -> ServerCapabilities {
             ..Default::default()
         }),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
+        definition_provider: Some(OneOf::Left(true)),
+        signature_help_provider: Some(SignatureHelpOptions {
+            trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
+            ..Default::default()
+        }),
         ..Default::default()
     }
 }
@@ -1182,6 +1194,10 @@ fn dispatch_request(conn: &Connection, docs: &Docs, req: Request) {
     match req.method.as_str() {
         Completion::METHOD => handle(conn, req, |_p: CompletionParams| completions()),
         HoverRequest::METHOD => handle(conn, req, |p: HoverParams| hover(docs, &p)),
+        GotoDefinition::METHOD => handle(conn, req, |p: GotoDefinitionParams| definition(docs, &p)),
+        SignatureHelpRequest::METHOD => {
+            handle(conn, req, |p: SignatureHelpParams| signature_help(docs, &p))
+        }
         _ => {
             let _ = conn.sender.send(
                 Response::new_err(req.id, ErrorCode::MethodNotFound as i32, "unhandled".into())
@@ -1276,6 +1292,52 @@ fn hover(docs: &Docs, params: &HoverParams) -> Hover {
         }),
         range: None,
     }
+}
+
+/// Go-to-definition for the name under the cursor, resolved through the
+/// document's own scopes (see [`crate::lsp_nav`]). `null` when the name is a
+/// builtin, an attribute, or bound nowhere in the document.
+fn definition(docs: &Docs, params: &GotoDefinitionParams) -> Option<GotoDefinitionResponse> {
+    let at = &params.text_document_position_params;
+    let text = docs.get(at.text_document.uri.as_str())?;
+    let (line, character, len) =
+        crate::lsp_nav::definition(text, at.position.line, at.position.character)?;
+    Some(GotoDefinitionResponse::Scalar(Location {
+        uri: at.text_document.uri.clone(),
+        range: Range {
+            start: Position { line, character },
+            end: Position {
+                line,
+                character: character + len,
+            },
+        },
+    }))
+}
+
+/// Signature help for the call around the cursor, when the document defines
+/// the callee (see [`crate::lsp_nav::signature_help`]).
+fn signature_help(docs: &Docs, params: &SignatureHelpParams) -> Option<SignatureHelp> {
+    let at = &params.text_document_position_params;
+    let text = docs.get(at.text_document.uri.as_str())?;
+    let sig = crate::lsp_nav::signature_help(text, at.position.line, at.position.character)?;
+    Some(SignatureHelp {
+        signatures: vec![SignatureInformation {
+            label: sig.label,
+            documentation: sig.doc.map(Documentation::String),
+            parameters: Some(
+                sig.params
+                    .into_iter()
+                    .map(|p| ParameterInformation {
+                        label: ParameterLabel::Simple(p),
+                        documentation: None,
+                    })
+                    .collect(),
+            ),
+            active_parameter: Some(sig.active),
+        }],
+        active_signature: Some(0),
+        active_parameter: Some(sig.active),
+    })
 }
 
 /// Extract the identifier (`[A-Za-z0-9_]+`) spanning the given position, if any.
