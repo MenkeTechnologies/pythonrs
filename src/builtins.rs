@@ -1981,7 +1981,7 @@ fn b_mkfunc(vm: &mut VM, argc: u8) -> Value {
         }
     };
     let defaults = args;
-    let env = with_host(|h| h.current_env_capture());
+    let env = with_host(|h| h.env_capture_for(h.funcs[def_id].sees_class_scope));
     with_host(|h| {
         h.alloc(PyObj::Func(std::rc::Rc::new(host::FuncVal {
             def_id,

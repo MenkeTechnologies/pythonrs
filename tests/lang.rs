@@ -6539,6 +6539,49 @@ fn except_star_syntax_rules_are_enforced() {
     }
 }
 
+/// An annotation scope defined in a class body — a class annotation, a
+/// method's `__annotate__`, a `type` alias value — reads the class namespace
+/// (CPython's `__classdict__`) before the enclosing scopes, while an ordinary
+/// method still does not see it. Lazily evaluated scopes see the namespace as
+/// the body left it. Expected values from CPython 3.14.
+#[test]
+fn annotation_scopes_see_the_class_namespace() {
+    assert_eq!(
+        g(
+            "def outer():\n\
+             \x20   T = str\n\
+             \x20   W = bytes\n\
+             \x20   class G:\n\
+             \x20       T = int\n\
+             \x20       U = int\n\
+             \x20       x: U\n\
+             \x20       y: W\n\
+             \x20       def m(self, a: T) -> W: pass\n\
+             \x20       type A = list[T]\n\
+             \x20       T = float\n\
+             \x20   return G\n\
+             G = outer()\n\
+             x = (G.__annotations__, G.m.__annotations__, G.A.__value__)\n\
+             class H:\n\
+             \x20   def m(self) -> T: pass\n\
+             \x20   T = complex\n\
+             try:\n\
+             \x20   h = H.m.__annotations__\n\
+             except NameError as e:\n\
+             \x20   h = str(e)\n\
+             x = x + (h,)\n\
+             def n():\n\
+             \x20   return T\n\
+             try:\n\
+             \x20   n()\n\
+             except NameError as e:\n\
+             \x20   x = x + (str(e),)",
+            "x"
+        ),
+        "({\x27x\x27: <class \x27int\x27>, \x27y\x27: <class \x27bytes\x27>}, {\x27a\x27: <class \x27float\x27>, \x27return\x27: <class \x27bytes\x27>}, list[float], {\x27return\x27: <class \x27complex\x27>}, \"name \x27T\x27 is not defined\")"
+    );
+}
+
 /// A `__slots__` member keeps its value in the instance itself, beside the
 /// `__dict__`: `vars()` does not list it, the member (a data descriptor) wins
 /// over a same-named dict entry, an empty slot raises on read and on `del`

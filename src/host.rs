@@ -281,6 +281,13 @@ pub struct FuncDef {
     /// function scope (`co_freevars`; drives `func.__closure__`). Sorted.
     #[serde(default)]
     pub freevars: Vec<String>,
+    /// An annotation scope defined directly in a class body — a class's or a
+    /// method's `__annotate__`, a `type` alias's value (PEP 649/695). It sees
+    /// the class namespace (CPython's `__classdict__`), where an ordinary
+    /// function defined there does not: it captures the class body's own
+    /// environment rather than the enclosing one.
+    #[serde(default)]
+    pub sees_class_scope: bool,
 }
 
 impl FuncDef {
@@ -307,6 +314,7 @@ impl FuncDef {
             is_async: self.is_async,
             doc: self.doc.clone(),
             freevars: self.freevars.clone(),
+            sees_class_scope: self.sees_class_scope,
         }
     }
 }
@@ -17094,7 +17102,17 @@ impl PyHost {
     /// return x` resolves `x` in the enclosing/module scope, not the class body.
     /// The class namespace stays reachable only via `self`/`C`, never by name.
     pub fn current_env_capture(&self) -> Env {
+        self.env_capture_for(false)
+    }
+
+    /// The environment a closure defined in the current frame captures;
+    /// `sees_class_scope` (an annotation scope, see `FuncDef`) keeps a class
+    /// body's own environment, so the class namespace stays visible to it.
+    pub fn env_capture_for(&self, sees_class_scope: bool) -> Env {
         let f = self.frame();
+        if sees_class_scope {
+            return f.env.clone();
+        }
         if f.is_class_body {
             if let Some(parent) = f.env.borrow().parent.clone() {
                 return parent;

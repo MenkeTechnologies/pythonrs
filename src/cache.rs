@@ -154,7 +154,10 @@ use std::path::PathBuf;
 /// (`LOAD_METHOD`, then `CALL_LOADED`/`CALL_LOADED_KW`/`CALL_LOADED_EX`, the
 /// last two reusing the ids of the retired `CALL_METHOD_KW`/`CALL_METHOD_EX`),
 /// so every method-call site emits different bytecode.
-const SCHEMA: u64 = 51;
+/// v52: an annotation scope in a class body (`FuncDef::sees_class_scope`, a new
+/// field) captures the class environment, so a class body holding an
+/// annotation, an annotated method or a `type` alias compiles differently.
+const SCHEMA: u64 = 52;
 
 /// The shard's INDEX: everything a lookup needs, and nothing it does not.
 ///

@@ -9,6 +9,16 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **Annotation scopes in a class body see the class namespace.** A class
+  annotation (`class K: T = int; x: T`), an annotated method's
+  `__annotate__` (`def m(self, a: T) -> T`) and a `type` alias value were
+  ordinary nested functions, which skip the class scope, so each raised
+  `NameError` (the class annotation was silently dropped). They are now
+  PEP 649/695 annotation scopes: built with `FuncDef::sees_class_scope`, they
+  capture the class body's own environment — CPython's `__classdict__` — and
+  read it before the enclosing function and module scopes; a lazily evaluated
+  one sees the namespace as the body left it. An ordinary method still does not
+  see class names.
 - **A `__slots__` member keeps its value beside the instance dict.** Slot
   values were stored in the instance `__dict__`, so a slotted base under an
   unslotted subclass leaked them into `vars(c)` (`['a', 'z']` where CPython has
@@ -1999,9 +2009,21 @@ written.
   as it runs and drops one whose name does not resolve: `class C: x: Later`
   then `C.__annotations__` is `{}` where CPython 3.14 evaluates on that read
   and raises `NameError: name 'Later' is not defined` (or, once `Later`
-  exists, returns it). The class `__dict__` holds the evaluated
-  `__annotations__` where CPython holds `__annotate_func__` (and
-  `__annotations_cache__` after the first read).
+  exists, returns it), and a class name rebound later in the body is seen at
+  its old value. The class `__dict__` holds the evaluated `__annotations__`
+  where CPython holds `__annotate_func__` (and `__annotations_cache__` after
+  the first read). The annotation does see the class namespace (see
+  "Implemented"). Making it lazy is blocked on the `FORWARDREF` substrate,
+  not on the compiler: `typing.NamedTuple` and `TypedDict` (and `dataclasses`
+  on a forward reference) read a namespace with no `__annotations__` through
+  `annotationlib.call_annotate_function(..., FORWARDREF)`, which — the
+  compiler's `__annotate__` refusing every format above 2, as CPython's does —
+  re-runs the function under `types.FunctionType(annotate.__code__,
+  fake_globals, closure=...)`. pythonrs functions have no `__builtins__` and a
+  code object cannot be re-bound to other globals (measured:
+  `call_annotate_function(f.__annotate__, Format.FORWARDREF)` raises
+  `AttributeError: 'function' object has no attribute '__builtins__'`), so
+  every `NamedTuple` class would stop building.
 - **A `compile()` code object carries its source, not bytecode.**
   `compile(source, filename, mode)` checks the source in `exec`/`eval`/
   `single` mode — raising the positioned `SyntaxError` naming `filename` —
@@ -2480,11 +2502,9 @@ added the `__index__` coercion boundaries and the `__slots__` `"__dict__"`
 entry. These remain open:
 
 - **PEP 695 `type` aliases: what the native `TypeAliasType` still lacks.**
-  The statement builds a lazy `typing.TypeAliasType` (see "Implemented"), but
-  its value is compiled as an ordinary nested function, not an annotation
-  scope, so inside a class body it cannot see the class's own names
-  (`class K: X = int; type A = X` then `K.A.__value__` raises `NameError`
-  where CPython returns `int`). A type parameter's bound, constraints and
+  The statement builds a lazy `typing.TypeAliasType` (see "Implemented"),
+  whose value is an annotation scope (inside a class body it reads the class
+  namespace). A type parameter's bound, constraints and
   default (`type B[T: int] = …`) are parsed and discarded (`__bound__` is
   `None`); `__parameters__` lists a `TypeVarTuple` bare where CPython shows
   `typing.Unpack[Ts]`; `evaluate_value` is absent; and under the bridge

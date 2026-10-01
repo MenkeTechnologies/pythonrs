@@ -453,7 +453,7 @@ impl Compiler {
                         let ann_body = vec![Stmt::from(StmtKind::Return(Some(annotation.clone())))];
                         let empty = Params::default();
                         self.fn_depth += 1;
-                        let thunk_id = self.build_function("<annotate>", &empty, &ann_body);
+                        let thunk_id = self.build_annotation_scope("<annotate>", &empty, &ann_body);
                         self.fn_depth -= 1;
                         self.emit_make_func(b, thunk_id?, &empty)?; // [dict, key, thunk]
                         b.emit(Op::CallBuiltin(ops::TRY_ANNOTATION, 3), 0);
@@ -2180,10 +2180,25 @@ impl Compiler {
         let owner = self.functions[def_id].1.qualname.clone();
         let saved_prefix = std::mem::replace(&mut self.qual_prefix, format!("{owner}."));
         self.fn_depth += 1;
-        let id = self.build_function("__annotate__", &params, &body);
+        let id = self.build_annotation_scope("__annotate__", &params, &body);
         self.fn_depth -= 1;
         self.qual_prefix = saved_prefix;
         id
+    }
+
+    /// Build an annotation scope (PEP 649/695): a function that, defined
+    /// directly in a class body, reads the class namespace (see
+    /// `FuncDef::sees_class_scope`); anywhere else an ordinary function.
+    fn build_annotation_scope(
+        &mut self,
+        name: &str,
+        params: &Params,
+        body: &[Stmt],
+    ) -> Result<usize, String> {
+        let in_class_body = self.in_class_body;
+        let id = self.build_function(name, params, body)?;
+        self.functions[id].1.sees_class_scope = in_class_body;
+        Ok(id)
     }
 
     fn build_function(
@@ -2423,6 +2438,7 @@ impl Compiler {
             is_async,
             doc: self.docstring(body),
             freevars,
+            sees_class_scope: false,
         };
         self.functions.push((name.to_string(), def));
         Ok(self.functions.len() - 1)
@@ -2506,7 +2522,7 @@ impl Compiler {
         };
         let body = vec![Stmt::from(StmtKind::Return(Some(value.clone())))];
         self.fn_depth += 1;
-        let eval_id = self.build_function(name, &fparams, &body);
+        let eval_id = self.build_annotation_scope(name, &fparams, &body);
         self.fn_depth -= 1;
         self.strlit(b, name); // [name]
         self.emit_make_func(b, eval_id?, &Params::default())?; // [name, evaluate]
