@@ -9080,5 +9080,20 @@ fn dict_pop_on_an_empty_dict_does_not_hash_the_key() {
     assert_eq!(
         eval_str("from collections import OrderedDict\nOrderedDict().pop([1])").expect_err("odict pop"),
         "TypeError: unhashable type: 'list'"
+// `repr(float)` breaks an exact tie between two equally short round-tripping
+// decimals toward the even last digit, as CPython's dtoa does: the double
+// `…023.25` is nearest both `…023.2` and `…023.3`. Expected values are CPython
+// 3.14's, including the layout cases around the scientific-notation switch.
+#[test]
+fn float_repr_breaks_shortest_ties_to_even() {
+    let src = "xs = [2113325745016023.2, 1125899906842624.25, 1125899906842625.75,\n\
+               \x20     -2113325745016023.25, 5e-324, 1e23, 1e16, 1.5e-05, 0.1 + 0.2,\n\
+               \x20     -0.0, 123.0, 1.7976931348623157e308]\n\
+               x = [repr(v) for v in xs]";
+    assert_eq!(
+        g(src, "x"),
+        "['2113325745016023.2', '1125899906842624.2', '1125899906842625.8', \
+         '-2113325745016023.2', '5e-324', '1e+23', '1e+16', '1.5e-05', \
+         '0.30000000000000004', '-0.0', '123.0', '1.7976931348623157e+308']"
     );
 }

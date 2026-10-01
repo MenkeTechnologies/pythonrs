@@ -6756,27 +6756,95 @@ pub fn fmt_float(f: f64) -> String {
     if f.is_nan() {
         return "nan".into();
     }
-    // Python's `repr(float)`: the shortest round-trip decimal, switching to
-    // scientific notation when the base-10 exponent is < -4 or >= 16, with a
-    // sign and a min-2-digit exponent (`1e+16`, `1e-05`, `1.5e+300`). Rust's `{}`
-    // never uses exponent form (so `1e16` prints as a 17-digit integer) and its
-    // `{:e}` writes `e3`/`e-5` (no sign, no zero-pad) — neither matches CPython.
-    let sci = format!("{f:e}"); // shortest scientific: "1.2345e3", "1e-5", "-1.5e300"
-    let epos = sci
-        .rfind('e')
-        .expect("scientific format carries an exponent");
+    // Python's `repr(float)` (`float_repr_style == 'short'`): the shortest
+    // round-trip decimal, in scientific notation when the base-10 exponent is
+    // < -4 or >= 16, with a sign and a min-2-digit exponent (`1e+16`, `1e-05`).
+    // Rust's `{:e}` supplies the shortest digits; `shortest_tie_to_even` then
+    // applies dtoa's tie rule, which Rust's formatter does not share.
+    let sci = format!("{:e}", f.abs()); // "2.1133257450160233e15", "1e-5"
+    let epos = sci.rfind('e').expect("scientific format carries an exponent");
     let exp: i32 = sci[epos + 1..].parse().expect("valid exponent");
-    if (-4..16).contains(&exp) {
-        let mut s = format!("{f}");
-        if !s.contains('.') {
-            s.push_str(".0"); // integral value in fixed range -> Python's trailing `.0`
-        }
-        s
-    } else {
-        let mantissa = &sci[..epos];
-        let sign = if exp < 0 { '-' } else { '+' };
-        format!("{mantissa}e{sign}{:02}", exp.abs())
+    let mut digits: String = sci[..epos].chars().filter(|c| *c != '.').collect();
+    // Exponent of the LAST digit: value = digits * 10^last.
+    let last = exp - (digits.len() as i32 - 1);
+    if let Some(even) = shortest_tie_to_even(f.abs(), &digits, last) {
+        digits = even;
     }
+    // A neighbour ending in 0 is one digit shorter, so `exp` (that of the first
+    // digit) is recomputed from the corrected digit string.
+    let exp = last + digits.len() as i32 - 1;
+    let digits = digits.trim_end_matches('0');
+    let digits = if digits.is_empty() { "0" } else { digits };
+    let sign = if f.is_sign_negative() { "-" } else { "" };
+    if (-4..16).contains(&exp) {
+        let body = if exp < 0 {
+            format!("0.{}{digits}", "0".repeat((-exp - 1) as usize))
+        } else {
+            let int_len = exp as usize + 1;
+            if digits.len() <= int_len {
+                format!("{digits}{}.0", "0".repeat(int_len - digits.len()))
+            } else {
+                format!("{}.{}", &digits[..int_len], &digits[int_len..])
+            }
+        };
+        format!("{sign}{body}")
+    } else {
+        let mantissa = if digits.len() == 1 {
+            digits.to_string()
+        } else {
+            format!("{}.{}", &digits[..1], &digits[1..])
+        };
+        let esign = if exp < 0 { '-' } else { '+' };
+        format!("{sign}{mantissa}e{esign}{:02}", exp.abs())
+    }
+}
+
+/// David Gay's dtoa (CPython's `_Py_dg_dtoa`, mode 0) breaks an exact tie
+/// between two equally short round-tripping decimals toward the EVEN last
+/// digit; Rust's shortest formatter rounds such a tie up. `x` (positive,
+/// finite) is `digits * 10^last` rounded; when `x` lies exactly halfway
+/// between that and an adjacent `digits ± 1` that also round-trips and ends in
+/// an even digit, return the neighbour's digits. `2113325745016023.25` is the
+/// double nearest both `…023.2` and `…023.3`; CPython prints `…023.2`.
+fn shortest_tie_to_even(x: f64, digits: &str, last: i32) -> Option<String> {
+    use num_bigint::BigInt;
+    // Two shortest candidates one unit apart can both round-trip only when
+    // that unit is below the double's spacing: 16 or 17 significant digits.
+    if digits.len() < 16 || !digits.ends_with(['1', '3', '5', '7', '9']) {
+        return None;
+    }
+    let d: BigInt = digits.parse().ok()?;
+    // x = mant * 2^e2 exactly.
+    let bits = x.to_bits();
+    let biased = ((bits >> 52) & 0x7ff) as i32;
+    let frac = bits & ((1u64 << 52) - 1);
+    let (mant, e2) = if biased == 0 {
+        (frac, -1074)
+    } else {
+        (frac | (1u64 << 52), biased - 1075)
+    };
+    // Is 2x == (2d ± 1) * 10^last, i.e. x exactly halfway to a neighbour?
+    let halfway = |neighbour_side: i32| -> bool {
+        let mut lhs = BigInt::from(mant);
+        let mut rhs = BigInt::from(2) * &d + BigInt::from(neighbour_side);
+        if e2 + 1 >= 0 {
+            lhs <<= (e2 + 1) as usize;
+        } else {
+            rhs <<= (-(e2 + 1)) as usize;
+        }
+        let ten = BigInt::from(10u32);
+        if last >= 0 {
+            rhs *= num_traits::pow(ten, last as usize);
+        } else {
+            lhs *= num_traits::pow(ten, (-last) as usize);
+        }
+        lhs == rhs
+    };
+    [-1, 1].into_iter().find_map(|side| {
+        let neighbour = &d + BigInt::from(side);
+        let round_trips = format!("{neighbour}e{last}").parse::<f64>().ok() == Some(x);
+        (round_trips && halfway(side)).then(|| neighbour.to_string())
+    })
 }
 
 /// Float `//` and `%`, ported from CPython's `float_divmod` (floatobject.c).

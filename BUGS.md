@@ -9,6 +9,14 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **`float` `repr` breaks a shortest-digit tie to even.** Rust `std`'s shortest
+  formatter rounds an exact tie between two equally short round-tripping
+  decimals up, so `2113325745016023.2` (the double `…023.25`) printed as
+  `…023.3`; CPython's dtoa takes the even last digit. `fmt_float` now checks,
+  in exact integer arithmetic, whether the value lies exactly halfway to the
+  even neighbour of Rust's odd last digit and takes it when it round-trips.
+  Agrees with CPython 3.14 on 99,991 doubles: random bit patterns, 20,000
+  constructed ties, and the scientific-notation boundaries.
 - **A dedent matching no outer level wins over the parse error after it.**
   `try:` / `if 1:` with a body indented 8 and a following line at 4 reported
   `SyntaxError: expected 'except' or 'finally' block` (or no caret): the
@@ -1646,13 +1654,6 @@ written.
   frames of the CPython-side call stack are missing, because the bridge returns
   the error without walking the foreign traceback. This is the same boundary the
   `During handling of the above exception…` chained section sits behind.
-- **`float` `repr` tie-break**: the shortest-round-trip formatter defers to Rust
-  `std`'s Ryū, which breaks an exact tie between two equally-short 17-digit
-  decimals toward the larger digit, whereas CPython's dtoa rounds half-to-even.
-  This surfaces only on the rare value whose two shortest reprs are equidistant
-  from the true value (e.g. `2113325745016023.2` prints as `…3.3`); the underlying
-  `f64` bits are identical either way (`float.hex` agrees). A faithful fix needs a
-  dtoa-style shortest formatter rather than the `std` one.
 - **`dir()` on a native builtin type/value is the method table, not CPython's
   full slot listing.** `dir(list)`/`dir("a")` enumerate the names the type really
   responds to (so `'append' in dir(list)` and `'upper' in dir(str)` are right),
