@@ -9,6 +9,16 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **`operator.index()` sees a native `__index__`.** The `operator` module is
+  the bridged C accelerator, and a pythonrs instance crossed as a
+  `PyrsInstance` proxy with no `nb_index` slot, so `operator.index(obj)` and
+  `operator.getitem(seq, obj)` raised `TypeError: 'builtins.PyrsInstance'
+  object cannot be interpreted as an integer`. An instance whose class defines
+  `__index__` now crosses as `PyrsIndexInstance`, a proxy subclass that fills
+  the slot, runs the method on the fusevm side and checks its result as
+  `PyNumber_Index` does. Every other instance keeps the slotless proxy, since
+  CPython probes that slot (`PyIndex_Check`) to choose a path — `bytes(x)`
+  takes a length from an index-able `x`.
 - **A memoryview's hash is cached.** `memory_hash` stores the number on the
   view and reads it before the released check, so a view hashed while live keeps
   hashing — and keeps finding itself as a dict key — after `release()`.
@@ -2347,7 +2357,7 @@ PEP 479). The unhashable-key message was the fifth and is fixed too: an
 unhashable key now names the role it was playing (`cannot use 'X' as a dict
 key (unhashable type: 'X')`), matching CPython at all 17 spellings. Round 4
 added the `__index__` coercion boundaries and the `__slots__` `"__dict__"`
-entry. Four remain open:
+entry. Three remain open:
 
 - **PEP 695 `type` aliases: what the native `TypeAliasType` still lacks.**
   The statement builds a lazy `typing.TypeAliasType` (see "Implemented"), but
@@ -2360,22 +2370,6 @@ entry. Four remain open:
   `typing.Unpack[Ts]`; `evaluate_value` is absent; and under the bridge
   `type(A)` is pythonrs's own type object, not CPython's
   `typing.TypeAliasType` (`isinstance` does agree).
-
-- **`operator.index()` does not see a native `__index__`.** The `operator`
-  module is served by the FFI bridge, so the argument crosses as a
-  `PyrsInstance` proxy, and CPython's `PyNumber_Index` asks the PROXY's type for
-  the slot rather than the pythonrs class behind it:
-
-  ```
-  operator.index(Idx())   # TypeError: 'builtins.PyrsInstance' object cannot be
-                          # interpreted as an integer
-  ```
-
-  Every NATIVE boundary honours it -- subscripting, slice bounds, `range`,
-  sequence repetition, `bytes(n)`, `chr`, `bin`/`hex`/`oct`, `int()` -- so this
-  is the marshalling layer, not the protocol. Closing it means giving
-  `PyrsInstance` an `__index__` that routes back to the pythonrs object, the
-  same way its attribute and comparison slots already do.
 
 - **Slot values live in the instance dict.** pythonrs stores a `__slots__`
   attribute in the same per-instance dict as any other, and restricts writes by
