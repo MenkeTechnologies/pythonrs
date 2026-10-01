@@ -1291,6 +1291,10 @@ pub enum PyObj {
         start: usize,
         len: usize,
         readonly: bool,
+        /// Set by `release()` (and by leaving a `with` block). Every operation
+        /// on a released view then raises CPython's `ValueError: operation
+        /// forbidden on released memoryview object`; see [`PyHost::mv_bytes`].
+        released: bool,
     },
     /// An open file / standard stream. Holds only an index into
     /// `PyHost.io_handles`; the underlying `std::fs::File` is neither `Clone`
@@ -2946,18 +2950,21 @@ impl PyHost {
     }
     /// A stable pseudo-address for an object (its heap index), used only for the
     /// `<… object at 0x…>` reprs where CPython prints an opaque pointer.
-    /// `"__main__."` for a class defined by the running program, `""` for a
-    /// builtin type. CPython's `repr` prints a type's MODULE-qualified name, and
-    /// every class a script defines lives in `__main__` — but `object`, reached
-    /// as `object().__class__`, is a builtin and reprs bare
-    /// (`<class 'object'>`, `<object object at 0x…>`). The registry of
-    /// program-defined classes is the discriminator, so a program that defines
-    /// its own `class int` still reports `__main__.int`.
-    fn repr_module_prefix(&self, class: &str) -> &'static str {
-        if self.classes.contains_key(class) {
-            "__main__."
-        } else {
-            ""
+    /// `"<module>."` for a class defined by the running program — its
+    /// `__module__`, so a class a script defines is `__main__.C` and one an
+    /// imported module defines is `fractions.Fraction` — and `""` for a builtin
+    /// type. CPython's `type_repr` / `object_repr` print the MODULE-qualified
+    /// name and drop a `builtins` module; `object`, reached as
+    /// `object().__class__`, is a builtin and reprs bare (`<class 'object'>`,
+    /// `<object object at 0x…>`). The registry of program-defined classes is
+    /// the discriminator, so a program that defines its own `class int` still
+    /// reports `__main__.int`.
+    fn repr_module_prefix(&self, class: &str) -> String {
+        match self.classes.get(class) {
+            Some(c) if c.module == "builtins" => String::new(),
+            Some(c) if !c.module.is_empty() => format!("{}.", c.module),
+            Some(_) => "__main__.".to_string(),
+            None => String::new(),
         }
     }
 
@@ -4104,6 +4111,9 @@ pub fn type_error(msg: &str) -> String {
     format!("TypeError: {msg}")
 }
 
+/// CPython's `CHECK_RELEASED` error: any operation on a released `memoryview`.
+pub const MV_RELEASED: &str = "ValueError: operation forbidden on released memoryview object";
+
 /// Callable display for the `**`-merge errors when the callee is an
 /// already-evaluated value (the `CALL_VALUE_EX` / `CALL_METHOD_EX` paths), as
 /// CPython's `_PyObject_FunctionStr` renders it: a user function is its
@@ -4330,6 +4340,10 @@ fn type_object_class_name(n: &str) -> Option<String> {
         "OrderedDict" => Some("collections.OrderedDict"),
         "deque" => Some("collections.deque"),
         "partial" => Some("functools.partial"),
+        // The native `asyncio` primitives (`async_rt::AsyncObj`).
+        "Lock" => Some("asyncio.locks.Lock"),
+        "Event" => Some("asyncio.locks.Event"),
+        "Queue" => Some("asyncio.queues.Queue"),
         "TextIOWrapper" => Some("_io.TextIOWrapper"),
         "BufferedReader" => Some("_io.BufferedReader"),
         "BufferedWriter" => Some("_io.BufferedWriter"),
@@ -5110,8 +5124,9 @@ impl PyHost {
                 }
                 Some(PyObj::AsyncObj { id }) => async_rt::async_obj_repr(*id),
                 Some(PyObj::Bytearray(b)) => format!("bytearray(b{})", quote_bytes(b, true)),
-                Some(PyObj::Memoryview { .. }) => {
-                    format!("<memory at 0x{:012x}>", self.addr_of(v))
+                Some(PyObj::Memoryview { released, .. }) => {
+                    let kind = if *released { "released memory" } else { "memory" };
+                    format!("<{kind} at 0x{:012x}>", self.addr_of(v))
                 }
                 Some(PyObj::File { id }) => self.file_repr(*id),
                 Some(PyObj::Deque { items, maxlen }) => {
@@ -5801,11 +5816,15 @@ impl PyHost {
                                 | Some(PyObj::Bytearray(_))
                         ) =>
                     {
+                        // `memory_richcompare`: a released view equals only itself.
+                        if self.mv_released(a) || self.mv_released(b) {
+                            return matches!((a, b), (Value::Obj(i), Value::Obj(j)) if i == j);
+                        }
                         let yb = match self.get(b) {
                             Some(PyObj::Bytes(y)) | Some(PyObj::Bytearray(y)) => y.clone(),
-                            _ => self.mv_bytes(b),
+                            _ => self.mv_bytes(b).unwrap_or_default(),
                         };
-                        self.mv_bytes(a) == yb
+                        self.mv_bytes(a).unwrap_or_default() == yb
                     }
                     (_, Some(PyObj::Memoryview { .. }))
                         if matches!(
@@ -5817,7 +5836,7 @@ impl PyHost {
                             Some(PyObj::Bytes(x)) | Some(PyObj::Bytearray(x)) => x.clone(),
                             _ => Vec::new(),
                         };
-                        xb == self.mv_bytes(b)
+                        !self.mv_released(b) && xb == self.mv_bytes(b).unwrap_or_default()
                     }
                     // Type/function objects compare by name, so `type(5) == int`
                     // and `type(b) == B` hold regardless of heap identity.
@@ -9072,20 +9091,35 @@ impl PyHost {
     /// The current bytes a `memoryview` exposes, read from its live backing
     /// `bytes`/`bytearray` object (so a view over a `bytearray` reflects
     /// mutations). Empty for a non-memoryview or a stale/out-of-bounds window.
-    pub fn mv_bytes(&self, recv: &Value) -> Vec<u8> {
+    /// The bytes a `memoryview` currently sees, or CPython's `ValueError` once
+    /// the view has been released — every read of a view goes through here,
+    /// which is what makes `CHECK_RELEASED` hold for all of them.
+    pub fn mv_bytes(&self, recv: &Value) -> Result<Vec<u8>, String> {
         if let Some(PyObj::Memoryview {
-            obj, start, len, ..
+            obj,
+            start,
+            len,
+            released,
+            ..
         }) = self.get(recv)
         {
+            if *released {
+                return Err(MV_RELEASED.to_string());
+            }
             let (start, len) = (*start, *len);
             if let Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) = self.get(obj) {
-                return b
+                return Ok(b
                     .get(start..start + len)
                     .map(|s| s.to_vec())
-                    .unwrap_or_default();
+                    .unwrap_or_default());
             }
         }
-        Vec::new()
+        Ok(Vec::new())
+    }
+
+    /// Whether `v` is a `memoryview` that has been released.
+    pub fn mv_released(&self, v: &Value) -> bool {
+        matches!(self.get(v), Some(PyObj::Memoryview { released: true, .. }))
     }
 
     /// `recv[idx]`.
@@ -9258,7 +9292,7 @@ impl PyHost {
                 Ok(items[k as usize].clone())
             }
             Some(PyObj::Memoryview { .. }) => {
-                let bytes = self.mv_bytes(recv);
+                let bytes = self.mv_bytes(recv)?;
                 let n = bytes.len() as i64;
                 let i = self.seq_index(idx, || type_error("memoryview: invalid slice key"))?;
                 let k = if i < 0 { i + n } else { i };
@@ -9358,8 +9392,12 @@ impl PyHost {
             start,
             len,
             readonly,
+            ..
         }) = self.get(recv)
         {
+            if self.mv_released(recv) {
+                return Err(MV_RELEASED.to_string());
+            }
             let (obj, start, readonly) = (obj.clone(), *start, *readonly);
             let n = *len as i64;
             let (mut i, stop) = slice_bounds(lo, hi, step, n, self);
@@ -9371,9 +9409,10 @@ impl PyHost {
                     start: start + lo_i as usize,
                     len: (hi_i - lo_i) as usize,
                     readonly,
+                    released: false,
                 }));
             }
-            let src = self.mv_bytes(recv);
+            let src = self.mv_bytes(recv)?;
             let mut out = Vec::new();
             if step > 0 {
                 while i < stop {
@@ -9397,6 +9436,7 @@ impl PyHost {
                 start: 0,
                 len,
                 readonly: true,
+                released: false,
             }));
         }
         // Slicing bytes/bytearray yields a new buffer of the same type.
@@ -9568,8 +9608,12 @@ impl PyHost {
                 start,
                 len,
                 readonly,
+                ..
             }) => {
                 let (obj, start, len, readonly) = (obj.clone(), *start, *len, *readonly);
+                if self.mv_released(recv) {
+                    return Err(MV_RELEASED.to_string());
+                }
                 if readonly {
                     return Err(type_error("cannot modify read-only memory"));
                 }
@@ -9628,11 +9672,15 @@ impl PyHost {
             start,
             len,
             readonly,
+            ..
         }) = self.get(recv)
         else {
             return Err(type_error("expected a memoryview"));
         };
         let (obj, start, len, readonly) = (obj.clone(), *start, *len, *readonly);
+        if self.mv_released(recv) {
+            return Err(MV_RELEASED.to_string());
+        }
         if readonly {
             return Err(type_error("cannot modify read-only memory"));
         }
@@ -10008,7 +10056,7 @@ impl PyHost {
                 Ok(b.iter().map(|&x| Value::Int(x as i64)).collect())
             }
             Some(PyObj::Memoryview { .. }) => Ok(self
-                .mv_bytes(v)
+                .mv_bytes(v)?
                 .iter()
                 .map(|&x| Value::Int(x as i64))
                 .collect()),
@@ -10373,7 +10421,7 @@ impl PyHost {
             }
             // `int in memoryview` tests byte-value membership over the view.
             Some(PyObj::Memoryview { .. }) => {
-                let hay = self.mv_bytes(container);
+                let hay = self.mv_bytes(container)?;
                 match self.as_int(item) {
                     Some(n) if (0..=255).contains(&n) => Ok(hay.contains(&(n as u8))),
                     _ => Ok(false),
@@ -12320,6 +12368,9 @@ impl PyHost {
                     | "f_contiguous"
             ) =>
             {
+                if self.mv_released(recv) {
+                    return Err(MV_RELEASED.to_string());
+                }
                 let (obj, len, readonly) = (obj.clone(), *len, *readonly);
                 Ok(match name {
                     "obj" => obj,
@@ -14064,68 +14115,97 @@ fn module_dict_method(
     }
 }
 
-/// `recv.name(*args, **kwargs)`. The attribute lookup is fused into the call, so
-/// a missing method never reaches `get_attr` — record the receiver here too, or
-/// an uncaught `obj.mispelled()` would render without CPython's hint.
 /// `'X' object does not support the [asynchronous ]context manager protocol
 /// (missed __exit__ method)` — CPython's `SETUP_WITH` / `BEFORE_ASYNC_WITH`
 /// error, naming whichever half of the protocol is absent.
 ///
 /// The lookup order is CPython's: `__exit__` is checked FIRST, so an object
 /// carrying only `__enter__` is rejected before that `__enter__` can run, and
-/// an object carrying neither is reported against `__exit__`.
+/// an object carrying neither is reported against `__exit__`. `X` is the
+/// type's `%T` name ([`with_protocol_type_name`]).
 fn context_manager_error(recv: &Value, is_async: bool) -> Option<String> {
-    // Only receivers whose protocol membership an attribute probe answers
-    // correctly are checked. A user instance resolves its dunders through its
-    // class, and none of the core scalars/containers has an enter/exit half —
-    // for both, `get_attr` is the same lookup the call would do. The natively
-    // shadowed managers (a file, a lock, `contextlib.redirect_stdout`) and any
-    // bridged CPython object dispatch `__enter__`/`__exit__` inside
-    // `call_method_inner` without exposing them as attributes, so probing them
-    // would report a missing method that is in fact there; those keep the
-    // pre-check behavior.
-    let probeable = with_host(|h| {
-        matches!(
-            recv,
-            Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Undef
-        ) || matches!(
-            h.get(recv),
-            Some(PyObj::Instance(_))
-                | Some(PyObj::Str(_))
-                | Some(PyObj::Bytes(_))
-                | Some(PyObj::Bytearray(_))
-                | Some(PyObj::List(_))
-                | Some(PyObj::Tuple(_))
-                | Some(PyObj::Dict(_))
-                | Some(PyObj::Set(_))
-                | Some(PyObj::Frozenset(_))
-                | Some(PyObj::Range { .. })
-                | Some(PyObj::BigInt(_))
-                | Some(PyObj::Complex(_, _))
-                | Some(PyObj::Generator { .. })
-        )
-    });
-    if !probeable {
-        return None;
-    }
     let (enter, exit, adj) = if is_async {
         ("__aenter__", "__aexit__", "asynchronous ")
     } else {
         ("__enter__", "__exit__", "")
     };
-    // CPython's order: `__exit__` first, so an object carrying only `__enter__`
-    // is rejected before that `__enter__` runs, and one carrying neither is
-    // reported against `__exit__`.
-    let missing = [exit, enter]
-        .into_iter()
-        .find(|m| with_host(|h| h.get_attr(recv, m)).is_err())?;
+    let has = |m: &str| with_host(|h| type_defines_special(h, recv, m));
+    let missing = [exit, enter].into_iter().find(|m| !has(m))?;
+    // `_PyEval_SpecialMethodCanSuggest`: an object that implements the OTHER
+    // protocol in full gets pointed at the statement it does support.
+    let suggestion = if is_async {
+        (has("__enter__") && has("__exit__"))
+            .then_some(" but it supports the context manager protocol. Did you mean to use 'with'?")
+    } else {
+        (has("__aenter__") && has("__aexit__")).then_some(
+            " but it supports the asynchronous context manager protocol. \
+             Did you mean to use 'async with'?",
+        )
+    };
     Some(type_error(&format!(
         "'{}' object does not support the {adj}context manager protocol \
-         (missed {missing} method)",
-        with_host(|h| h.type_name(recv))
+         (missed {missing} method){}",
+        with_host(|h| with_protocol_type_name(h, recv)),
+        suggestion.unwrap_or("")
     )))
 }
 
+/// Whether `recv`'s TYPE defines the special method `name` — CPython's
+/// `_PyObject_LookupSpecial`, which consults the type's MRO and never the
+/// instance, so a class object is asked about its METACLASS (`with C:` on a
+/// plain class is an error even when `C` defines `__enter__`).
+///
+/// Each arm answers from the same place the call itself dispatches through
+/// (`call_method_inner`): a user instance from its class (or the builtin base
+/// it extends), a CPython object from CPython, and every native value from its
+/// type's method table — the table `type_has_method` reads for `getattr` and
+/// `call_type_method` dispatches against.
+fn type_defines_special(h: &PyHost, recv: &Value, name: &str) -> bool {
+    match h.get(recv) {
+        #[cfg(feature = "stdlib-ffi")]
+        Some(PyObj::Foreign(id)) => crate::ffi::type_defines(*id, name),
+        Some(PyObj::Instance(i)) => crate::builtins::instance_has(h, i, name),
+        Some(PyObj::Class(c)) => h
+            .classes
+            .get(c)
+            .is_some_and(|cd| h.class_has(&cd.metaclass, name)),
+        _ => crate::builtins::type_has_method(&h.type_name(recv), name),
+    }
+}
+
+/// The name CPython's `%T` format prints for `recv`'s type
+/// (`_PyType_GetFullyQualifiedName`): `module.qualname`, the module omitted
+/// for `builtins` and `__main__` — so a script's own class is `'C'`, a
+/// stdlib one `'collections.OrderedDict'`, a builtin `'function'`.
+fn with_protocol_type_name(h: &PyHost, recv: &Value) -> String {
+    let qualify = |module: &str, qualname: &str| match module {
+        "" | "builtins" | "__main__" => qualname.to_string(),
+        m => format!("{m}.{qualname}"),
+    };
+    match h.get(recv) {
+        #[cfg(feature = "stdlib-ffi")]
+        Some(PyObj::Foreign(id)) => crate::ffi::type_qualified_name(*id),
+        Some(PyObj::Instance(i)) => match h.classes.get(&i.class) {
+            Some(cd) => qualify(&cd.module, &cd.qualname),
+            None => i.class.clone(),
+        },
+        Some(PyObj::Class(c)) => match h.classes.get(c) {
+            Some(cd) if cd.metaclass != "type" => match h.classes.get(&cd.metaclass) {
+                Some(meta) => qualify(&meta.module, &meta.qualname),
+                None => cd.metaclass.clone(),
+            },
+            _ => "type".to_string(),
+        },
+        _ => {
+            let tn = h.type_name(recv);
+            type_object_class_name(&tn).unwrap_or(tn)
+        }
+    }
+}
+
+/// `recv.name(*args, **kwargs)`. The attribute lookup is fused into the call, so
+/// a missing method never reaches `get_attr` — record the receiver here too, or
+/// an uncaught `obj.mispelled()` would render without CPython's hint.
 pub fn call_method(
     recv: &Value,
     name: &str,

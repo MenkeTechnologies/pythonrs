@@ -1078,6 +1078,50 @@ fn memoryview_slicing_and_membership() {
     assert_eq!(g("x = bool(memoryview(b'a'))", "x"), "True");
 }
 
+/// `memoryview` is a context manager whose exit releases the view
+/// (`memory_enter`/`memory_exit`), and a released view refuses every
+/// operation with CPython's `ValueError` — reads, writes, attribute reads,
+/// `len`, conversion and re-entry alike — while still comparing equal to
+/// itself. Expected values are python3.14's for the same program.
+#[test]
+fn memoryview_with_block_releases_the_view() {
+    const RELEASED: &str = "ValueError: operation forbidden on released memoryview object";
+    assert_eq!(
+        g(
+            "m = memoryview(b'ab')\nwith m as v:\n    x = (v is m, v.tobytes(), len(v))",
+            "x"
+        ),
+        "(True, b'ab', 2)"
+    );
+    let released = "m = memoryview(bytearray(b'ab'))\nwith m:\n    pass\n";
+    for op in [
+        "m.tobytes()",
+        "len(m)",
+        "m[0]",
+        "m[0:1]",
+        "m.nbytes",
+        "m.obj",
+        "bytes(m)",
+        "list(m)",
+        "97 in m",
+        "memoryview(m)",
+        "m[0] = 1",
+        "m[0:1] = b'q'",
+    ] {
+        assert_eq!(err(&format!("{released}{op}")), RELEASED, "{op}");
+    }
+    assert_eq!(err(&format!("{released}with m:\n    pass")), RELEASED);
+    assert_eq!(
+        g(&format!("{released}x = (m == m, m == b'ab', repr(m)[:16])"), "x"),
+        "(True, False, '<released memory')"
+    );
+    // `release()` is idempotent, and is what `__exit__` does.
+    assert_eq!(
+        g("m = memoryview(b'a')\nm.release()\nm.release()\nx = repr(m)[:9]", "x"),
+        "'<released'"
+    );
+}
+
 #[test]
 fn memoryview_reflects_bytearray_mutation() {
     // A view over a bytearray sees later mutations to the backing buffer.
@@ -1888,8 +1932,87 @@ fn vendored_ast_node_types_run_on_pythonrs() {
             "import ast\nx = repr(ast.BinOp(ast.Constant(1), ast.Add(), ast.Constant(2)))",
             "x"
         ),
-        "'BinOp(left=Constant(value=1), op=Add(), right=Constant(value=2))'"
+        "'BinOp(left=Constant(value=1, kind=None), op=Add(), right=Constant(value=2, kind=None))'"
     );
+}
+
+/// `_ast` follows CPython 3.14's `ast_type_init` / `ast_repr`: an unset
+/// optional field reads as the class-level `None` (and so shows in the repr),
+/// a sequence field defaults to a fresh `[]`, an `expr_context` to `Load()`,
+/// a missing required field or an unknown keyword warns with CPython's
+/// `DeprecationWarning` text, and the repr nests at most three nodes deep and
+/// elides the middle of a sequence longer than two. Expected values are
+/// python3.14's.
+#[cfg(not(feature = "stdlib-ffi"))]
+#[test]
+fn vendored_ast_fills_field_defaults_like_cpython() {
+    let r = |expr: &str| g(&format!("import ast\nx = repr({expr})"), "x");
+    assert_eq!(r("ast.Constant(1)"), "'Constant(value=1, kind=None)'");
+    assert_eq!(r("ast.Name('x')"), "\"Name(id='x', ctx=Load())\"");
+    assert_eq!(
+        r("ast.arguments()"),
+        "'arguments(posonlyargs=[], args=[], vararg=None, kwonlyargs=[], \
+         kw_defaults=[], kwarg=None, defaults=[])'"
+    );
+    // Only what was passed or defaulted lives on the instance; the optional
+    // field's `None` is the class attribute.
+    assert_eq!(
+        g(
+            "import ast\nx = (ast.Constant(1).__dict__, ast.Constant.kind, 'kind' in ast.Constant.__dict__)",
+            "x"
+        ),
+        "({'value': 1}, None, True)"
+    );
+    assert_eq!(
+        r("ast.Global(names=('a',))") + &r("ast.Global(names=['a', 'b', 'c'])"),
+        "\"Global(names=('a'))\"\"Global(names=['a', ..., 'c'])\""
+    );
+    assert_eq!(
+        r("ast.Module([ast.Expr(ast.Call(ast.Name('f'), [ast.Call(ast.Name('g'))]))])"),
+        "'Module(body=[Expr(value=Call(func=Name(...), args=[Call(...)], keywords=[]))], \
+         type_ignores=[])'"
+    );
+    assert_eq!(
+        g("import ast\nn = ast.List([])\nn.elts.append(n)\nx = repr(n)", "x"),
+        "'List(elts=[List(...)], ctx=Load())'"
+    );
+    assert_eq!(
+        g(
+            "import ast\nx = repr(ast.FunctionDef._field_types['returns']), ast.Name.__module__",
+            "x"
+        ),
+        "('ast.expr | None', 'ast')"
+    );
+    assert_eq!(
+        g(
+            "import ast, warnings\n\
+             with warnings.catch_warnings(record=True) as w:\n\
+             \x20   warnings.simplefilter('always')\n\
+             \x20   ast.Name(foo=1)\n\
+             x = [str(m.message) for m in w]",
+            "x"
+        ),
+        "[\"Name.__init__ got an unexpected keyword argument 'foo'. Support for arbitrary \
+         keyword arguments is deprecated and will be removed in Python 3.15.\", \
+         \"Name.__init__ missing 1 required positional argument: 'id'. This will become an \
+         error in Python 3.15.\"]"
+    );
+    for (src, msg) in [
+        (
+            "ast.Name('a', 'b', 'c')",
+            "TypeError: Name constructor takes at most 2 positional arguments",
+        ),
+        (
+            "ast.Name('a', id='b')",
+            "TypeError: Name got multiple values for argument 'id'",
+        ),
+        (
+            "ast.Load(1)",
+            "TypeError: Load constructor takes at most 0 positional arguments",
+        ),
+    ] {
+        assert_eq!(err(&format!("import ast\n{src}")), msg);
+    }
 }
 
 #[test]

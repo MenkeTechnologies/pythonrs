@@ -713,6 +713,53 @@ written.
   `asynchronous context manager protocol` wording against `__aexit__`/
   `__aenter__`. An explicit `obj.__enter__()` written by the user still raises
   the ordinary `AttributeError`, as CPython does.
+- **The `with` protocol check reaches every receiver.** It used to run only for
+  user instances and the core scalars/containers, because the natively
+  shadowed managers (a file, a lock, `contextlib.redirect_stdout`) and bridged
+  CPython objects answered `__enter__`/`__exit__` only inside
+  `call_method_inner`; `with len:`, `with sys:`, `with some_function:` and
+  `with decimal.Decimal(1):` still failed with the old
+  `AttributeError: ... has no attribute '__enter__'`. The check is now
+  CPython's `_PyObject_LookupSpecial` — a lookup on the TYPE: a user instance
+  asks its class (or the builtin base it extends), a class object asks its
+  METACLASS (so `with C:` is an error even when `C` defines `__enter__`, and a
+  metaclass defining the pair makes it work), a CPython object asks CPython's
+  `type(obj).__mro__`, and every native value asks its type's method table, the
+  same table `call_type_method` dispatches from. An `__exit__` stored on the
+  instance no longer counts. The message names the type with CPython's `%T`
+  (`'collections.OrderedDict' object …`, a script's own class bare), and an
+  object implementing only the other protocol gets CPython 3.14's hint: `… but
+  it supports the asynchronous context manager protocol. Did you mean to use
+  'async with'?` (and the `with` counterpart).
+- **`memoryview` is a context manager, and `release()` releases.** `with
+  memoryview(b"ab"):` raised `AttributeError: ... '__enter__'`, and `release()`
+  was a no-op. `memory_enter`/`memory_exit` are ported (enter yields the view,
+  exit releases it), and a released view now refuses every operation with
+  `ValueError: operation forbidden on released memoryview object` — methods,
+  descriptor attributes, `len`, indexing and slicing, item and slice stores,
+  iteration, membership, `bytes()`/`int()`/buffer conversion, re-wrapping in
+  `memoryview()`, and entering it again — reprs as `<released memory at 0x…>`,
+  and compares equal only to itself (`memory_richcompare`).
+- **Vendored `_ast` fills field defaults and reprs like CPython.** In the
+  self-contained build `repr(ast.Constant(1))` was `Constant(value=1)` and an
+  unpassed field was simply absent. `AST.__init__` and `AST.__repr__` are now
+  ports of 3.14's `ast_type_init` / `ast_repr`, driven by a `_field_types`
+  table transcribed from CPython's ASDL-generated module: an optional field
+  defaults to a class-level `None` (`Constant(value=1, kind=None)`), a sequence
+  field to a fresh `[]`, an `expr_context` to `Load()`; a missing required
+  field or an unknown keyword emits CPython's `DeprecationWarning` text; the
+  constructor errors (`… takes at most N positional arguments`, `… got
+  multiple values for argument 'id'`) match; the repr nests three nodes deep
+  (`Name(...)`), elides the middle of a sequence longer than two, and guards
+  self-reference. Node classes report `__module__ == 'ast'` and carry
+  `__match_args__` and `_field_types`.
+- **A class reprs with its own module.** `repr(cls)` and the default
+  `<… object at 0x…>` repr prefixed every program-defined class with
+  `__main__.`, so a class from an imported module read `<class
+  '__main__.Fraction'>` in the self-contained build and a class body's
+  `__module__ = 'zz'` was ignored. The prefix is now the class's `__module__`
+  (dropped for `builtins`), as CPython's `type_repr` does. The native `asyncio`
+  primitives name their CPython modules too (`asyncio.locks.Lock`).
 - **Parenthesized with-items (`with (a as x, b as y):`).** PEP 617 gave CPython
   3.10 a PEG parser that can backtrack over the `(`-ambiguity, so a long `with`
   header can be wrapped in parentheses. pythonrs rejected the whole form with
@@ -1570,11 +1617,6 @@ written.
   then `g.__annotations__` yields `{}`; CPython 3.14 evaluates the annotation
   lazily on that read and raises `NameError: name 'NotYet' is not defined`.
   Class bodies drop the unresolvable entry the same way.
-- **Vendored `ast` omits optional-field defaults from `repr`.** In the
-  self-contained build `repr(ast.Constant(1))` is `Constant(value=1)`; CPython
-  says `Constant(value=1, kind=None)`, because every OPTIONAL ASDL field carries
-  a class-level `None` default that `repr` then reads. `_fields` already lists
-  `kind`; what is missing is the optional/required split from `Python.asdl`.
 - **A `compile()` code object carries its source, not bytecode.**
   `compile(source, filename, mode)` checks the source in `exec`/`eval`/
   `single` mode — raising the positioned `SyntaxError` naming `filename` —
@@ -1583,21 +1625,12 @@ written.
   returns `ast.parse`'s tree). It holds the source and recompiles it when run,
   so the rest of the code-object surface (`co_code`, `co_consts`,
   `co_varnames`, `dis.dis(code)`, `types.CodeType(...)`) is absent.
-- **The context-manager protocol check does not reach the natively shadowed
-  managers.** `with <not a context manager>:` now raises CPython's
-  `TypeError: 'X' object does not support the context manager protocol (missed
-  __exit__ method)` for a user instance and for the core scalars/containers, and
-  refuses to enter (see the Implemented entry). It is skipped for a native
-  `File`/`Lock`/`redirect_stdout` and for any bridged CPython object, because
-  those dispatch `__enter__`/`__exit__` inside `call_method_inner` without
-  exposing them as attributes — probing them would report a missing method that
-  is in fact there. A `with` on such a value that genuinely lacks the protocol
-  still reports the old `AttributeError`. A faithful fix needs a
-  "does this native type answer `__exit__`" predicate that agrees with
-  `call_method_inner`'s own dispatch table.
-- **`memoryview` is not a context manager.** `with memoryview(b"ab"):` raises
-  `AttributeError: 'memoryview' object has no attribute '__enter__'`; CPython's
-  `memoryview` supports `with` (the exit releases the buffer).
+- **`bool()` of a released `memoryview` answers instead of raising.** Every
+  other operation on a released view raises CPython's `ValueError: operation
+  forbidden on released memoryview object` (see the Implemented entry), but
+  truthiness goes through `PyHost::truthy`, which cannot fail, so
+  `bool(released)` answers from the view's length where CPython's
+  `memory_length` raises.
 - **`f.__annotate__` is a `functools.partial`, not a `function`.** It is callable,
   answers the `VALUE`/`FORWARDREF` formats with the def-time annotations dict, and
   raises a bare `NotImplementedError` otherwise — but `type(f.__annotate__)` and

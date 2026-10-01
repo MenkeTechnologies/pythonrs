@@ -2832,3 +2832,50 @@ pub fn type_name(id: u32) -> String {
         Err(_) => "object".into(),
     })
 }
+
+/// Whether `type(foreign)` defines `name` somewhere on its MRO — CPython's
+/// `_PyType_Lookup`, the lookup `_PyObject_LookupSpecial` does for a special
+/// method. The instance dict and the metatype are deliberately not consulted:
+/// `with` checks the TYPE, so an `__exit__` stored on the instance does not
+/// make it a context manager.
+pub fn type_defines(id: u32, name: &str) -> bool {
+    Python::with_gil(|py| {
+        let Ok(obj) = fetch(py, id) else {
+            return false;
+        };
+        let Ok(mro) = obj.get_type().getattr("__mro__") else {
+            return false;
+        };
+        let Ok(classes) = mro.try_iter() else {
+            return false;
+        };
+        classes.flatten().any(|cls| {
+            cls.getattr("__dict__")
+                .and_then(|d| d.contains(name))
+                .unwrap_or(false)
+        })
+    })
+}
+
+/// `type(foreign)`'s fully qualified name — CPython's `%T` format,
+/// `_PyType_GetFullyQualifiedName`: `module.qualname`, with the module left
+/// off for `builtins` and `__main__`.
+pub fn type_qualified_name(id: u32) -> String {
+    Python::with_gil(|py| {
+        let Ok(obj) = fetch(py, id) else {
+            return "object".into();
+        };
+        let ty = obj.get_type();
+        let qualname = ty
+            .getattr("__qualname__")
+            .and_then(|q| q.extract::<String>())
+            .unwrap_or_else(|_| "object".into());
+        match ty
+            .getattr("__module__")
+            .and_then(|m| m.extract::<String>())
+        {
+            Ok(m) if m != "builtins" && m != "__main__" => format!("{m}.{qualname}"),
+            _ => qualname,
+        }
+    })
+}

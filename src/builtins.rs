@@ -754,7 +754,7 @@ fn subscript_store(recv: &Value, idx: Value, val: Value) -> Result<(), String> {
         // to happen HERE, ahead of the `iter_vec` below — going through it first
         // would accept both and silently widen the view's contract.
         if with_host(|h| matches!(h.get(&recv), Some(PyObj::Memoryview { .. }))) {
-            let repl = match as_bytes_object(&val) {
+            let repl = match as_bytes_object(&val)? {
                 Some(b) => b,
                 None => {
                     let tn = with_host(|h| h.type_name(&val));
@@ -2978,7 +2978,8 @@ fn inplace_builtin(tag: i64, a: &Value, b: &Value) -> Option<Result<Value, Strin
     if with_host(|h| matches!(h.get(a), Some(PyObj::Bytearray(_)))) {
         match tag {
             iop::ADD => match as_bytes_object(b) {
-                Some(bytes) => {
+                Err(e) => return Some(Err(e)),
+                Ok(Some(bytes)) => {
                     with_host(|h| {
                         if let Some(PyObj::Bytearray(v)) = h.get_mut(a) {
                             v.extend_from_slice(&bytes);
@@ -2986,7 +2987,7 @@ fn inplace_builtin(tag: i64, a: &Value, b: &Value) -> Option<Result<Value, Strin
                     });
                     return Some(Ok(a.clone()));
                 }
-                None => {
+                Ok(None) => {
                     return Some(Err(with_host(|h| {
                         host::type_error(&format!("can't concat {} to bytearray", h.tp_name(b)))
                     })));
@@ -6832,13 +6833,18 @@ pub fn call_builtin_function(
                         start,
                         len,
                         readonly,
+                        released,
                     }) => {
+                        if *released {
+                            return Err(host::MV_RELEASED.to_string());
+                        }
                         let (obj, start, len, readonly) = (obj.clone(), *start, *len, *readonly);
                         return Ok(h.alloc(PyObj::Memoryview {
                             obj,
                             start,
                             len,
                             readonly,
+                            released: false,
                         }));
                     }
                     _ => {
@@ -6853,6 +6859,7 @@ pub fn call_builtin_function(
                     start: 0,
                     len,
                     readonly,
+                    released: false,
                 }))
             })
         }
@@ -7797,6 +7804,7 @@ pub fn py_len(v: &Value) -> Result<usize, String> {
             Ok(h.str_char_len(id, s))
         }
         Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) => Ok(b.len()),
+        Some(PyObj::Memoryview { released: true, .. }) => Err(host::MV_RELEASED.to_string()),
         Some(PyObj::Memoryview { len, .. }) => Ok(*len),
         Some(PyObj::Deque { items, .. }) => Ok(items.len()),
         Some(PyObj::List(l)) | Some(PyObj::Tuple(l)) => Ok(l.len()),
@@ -8186,7 +8194,7 @@ fn construct_int(args: &[Value]) -> Result<Value, String> {
                     b.iter().map(|&c| c as char).collect::<String>()
                 }
                 Some(PyObj::Memoryview { .. }) => {
-                    h.mv_bytes(&v).iter().map(|&c| c as char).collect::<String>()
+                    h.mv_bytes(&v)?.iter().map(|&c| c as char).collect::<String>()
                 }
                 _ => h.as_str(&v).ok_or_else(|| {
                     host::type_error(&format!(
@@ -12940,6 +12948,9 @@ pub fn type_has_method(typename: &str, name: &str) -> bool {
             )
         }
         "Event" => return matches!(name, "set" | "clear" | "is_set" | "wait"),
+        // The native `contextlib.redirect_stdout`/`redirect_stderr`: only the
+        // context-manager pair, which `call_method_inner` dispatches.
+        "redirect_stdout" | "redirect_stderr" => return matches!(name, "__enter__" | "__exit__"),
         "Lock" => {
             return matches!(
                 name,
@@ -13155,7 +13166,14 @@ const BYTEARRAY_METHODS: &[&str] = &[
     "istitle",
     "isascii",
 ];
-const MEMORYVIEW_METHODS: &[&str] = &["tobytes", "hex", "tolist", "release"];
+const MEMORYVIEW_METHODS: &[&str] = &[
+    "tobytes",
+    "hex",
+    "tolist",
+    "release",
+    "__enter__",
+    "__exit__",
+];
 const DEQUE_METHODS: &[&str] = &[
     "append",
     "appendleft",
@@ -17798,12 +17816,15 @@ fn arg_bytes_like(v: &Value) -> Option<Vec<u8>> {
     }
 }
 
-/// Only a `bytes`/`bytearray` (not an int) as raw bytes — for `file.write(b'…')`.
-fn as_bytes_object(v: &Value) -> Option<Vec<u8>> {
+/// Only a `bytes`/`bytearray`/`memoryview` (not an int) as raw bytes — for
+/// `file.write(b'…')`. `Ok(None)` is "not bytes-like"; the error is a released
+/// `memoryview`, which CPython refuses with a `ValueError` rather than calling
+/// it the wrong type.
+fn as_bytes_object(v: &Value) -> Result<Option<Vec<u8>>, String> {
     with_host(|h| match h.get(v) {
-        Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) => Some(b.clone()),
-        Some(PyObj::Memoryview { .. }) => Some(h.mv_bytes(v)),
-        _ => None,
+        Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) => Ok(Some(b.clone())),
+        Some(PyObj::Memoryview { .. }) => h.mv_bytes(v).map(Some),
+        _ => Ok(None),
     })
 }
 
@@ -18475,10 +18496,25 @@ fn bytes_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, Strin
 
 /// `memoryview` methods over the view's live bytes (`m.tobytes()`, `m.hex()`,
 /// `m.tolist()`). `hex` reuses the `bytes` implementation (so `sep` /
-/// `bytes_per_sep` work); `release` is a no-op in this owned-heap model.
+/// `bytes_per_sep` work).
+///
+/// `release()` marks the view released (idempotent), after which every other
+/// operation raises — the backing buffer is shared heap state, so there is no
+/// export count to drop. The context-manager pair is `memory_enter` /
+/// `memory_exit`: entering checks the view is still live and yields it,
+/// exiting releases it.
 fn memoryview_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
-    let bytes = with_host(|h| h.mv_bytes(recv));
+    if matches!(name, "release" | "__exit__") {
+        with_host(|h| {
+            if let Some(PyObj::Memoryview { released, .. }) = h.get_mut(recv) {
+                *released = true;
+            }
+        });
+        return Ok(Value::Undef);
+    }
+    let bytes = with_host(|h| h.mv_bytes(recv))?;
     match name {
+        "__enter__" => Ok(recv.clone()),
         "tobytes" => Ok(with_host(|h| h.alloc(PyObj::Bytes(bytes)))),
         "tolist" => Ok(with_host(|h| {
             let items = bytes.iter().map(|&b| Value::Int(b as i64)).collect();
@@ -18488,7 +18524,6 @@ fn memoryview_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, 
             let tmp = with_host(|h| h.alloc(PyObj::Bytes(bytes)));
             bytes_method(&tmp, "hex", args)
         }
-        "release" => Ok(Value::Undef),
         _ => Err(format!(
             "AttributeError: 'memoryview' object has no attribute '{name}'"
         )),
@@ -18602,7 +18637,9 @@ fn bytes_common_method(
     // A required bytes-like argument (bytes/bytearray, not an int).
     let need_sub = |i: usize| -> Result<Vec<u8>, String> {
         args.get(i)
-            .and_then(as_bytes_object)
+            .map(as_bytes_object)
+            .transpose()?
+            .flatten()
             .ok_or_else(|| host::type_error("a bytes-like object is required"))
     };
     // `find`/`rfind`/`index`/`count` accept an int (single byte) or bytes-like.
@@ -18701,7 +18738,7 @@ fn bytes_common_method(
             let parts = match sep_arg {
                 None => split_ws(&bytes, maxsplit, reverse),
                 Some(v) => {
-                    let sep = as_bytes_object(v)
+                    let sep = as_bytes_object(v)?
                         .ok_or_else(|| host::type_error("must be str or None, not int"))?;
                     if sep.is_empty() {
                         return Err("ValueError: empty separator".into());
@@ -18731,7 +18768,7 @@ fn bytes_common_method(
                 if i > 0 {
                     out.extend_from_slice(&sep);
                 }
-                let piece = as_bytes_object(it).ok_or_else(|| {
+                let piece = as_bytes_object(it)?.ok_or_else(|| {
                     host::type_error(&format!(
                         "sequence item {i}: expected a bytes-like object, {} found",
                         with_host(|h| h.type_name(it))
@@ -18926,7 +18963,7 @@ fn pad_bytes(bytes: &[u8], args: &[Value], mode: char) -> Result<Vec<u8>, String
     let fill: u8 = match args.get(1) {
         None | Some(Value::Undef) => b' ',
         Some(v) => {
-            let fb = as_bytes_object(v).ok_or_else(|| {
+            let fb = as_bytes_object(v)?.ok_or_else(|| {
                 host::type_error(&format!(
                     "{}() argument 2 must be a byte string of length 1, not {}",
                     match mode {
@@ -18985,7 +19022,7 @@ fn bytes_translate(bytes: &[u8], args: &[Value]) -> Result<Vec<u8>, String> {
     let table: Option<Vec<u8>> = match args.first() {
         None | Some(Value::Undef) => None,
         Some(v) => {
-            let t = as_bytes_object(v)
+            let t = as_bytes_object(v)?
                 .ok_or_else(|| host::type_error("a bytes-like object is required"))?;
             if t.len() != 256 {
                 return Err("ValueError: translation table must be 256 characters long".into());
@@ -18996,7 +19033,7 @@ fn bytes_translate(bytes: &[u8], args: &[Value]) -> Result<Vec<u8>, String> {
     let delete: Vec<u8> = match args.get(1) {
         None | Some(Value::Undef) => Vec::new(),
         Some(v) => {
-            as_bytes_object(v).ok_or_else(|| host::type_error("a bytes-like object is required"))?
+            as_bytes_object(v)?.ok_or_else(|| host::type_error("a bytes-like object is required"))?
         }
     };
     let mut out = Vec::with_capacity(bytes.len());
@@ -19017,11 +19054,15 @@ fn bytes_translate(bytes: &[u8], args: &[Value]) -> Result<Vec<u8>, String> {
 fn bytes_maketrans(args: &[Value]) -> Result<Value, String> {
     let frm = args
         .first()
-        .and_then(as_bytes_object)
+        .map(as_bytes_object)
+        .transpose()?
+        .flatten()
         .ok_or_else(|| host::type_error("a bytes-like object is required"))?;
     let to = args
         .get(1)
-        .and_then(as_bytes_object)
+        .map(as_bytes_object)
+        .transpose()?
+        .flatten()
         .ok_or_else(|| host::type_error("a bytes-like object is required"))?;
     if frm.len() != to.len() {
         // `bytes.maketrans` really does word this differently from
@@ -19063,7 +19104,7 @@ fn is_bytes_titlecased(bytes: &[u8]) -> bool {
 
 /// A `startswith`/`endswith` first argument: a bytes-like, or a tuple of them.
 fn bytes_prefix_tuple(v: &Value) -> Result<Vec<Vec<u8>>, String> {
-    if let Some(b) = as_bytes_object(v) {
+    if let Some(b) = as_bytes_object(v)? {
         return Ok(vec![b]);
     }
     let is_tuple = with_host(|h| matches!(h.get(v), Some(PyObj::Tuple(_))));
@@ -19071,7 +19112,7 @@ fn bytes_prefix_tuple(v: &Value) -> Result<Vec<Vec<u8>>, String> {
         let items = host::iter_vec(v)?;
         let mut out = Vec::with_capacity(items.len());
         for it in items {
-            let b = as_bytes_object(&it)
+            let b = as_bytes_object(&it)?
                 .ok_or_else(|| host::type_error("a bytes-like object is required"))?;
             out.push(b);
         }
@@ -19130,7 +19171,7 @@ fn replace_bytes(hay: &[u8], old: &[u8], new: &[u8], count: i64) -> Vec<u8> {
 fn strip_bytes(bytes: &[u8], chars: Option<&Value>, which: &str) -> Result<Vec<u8>, String> {
     let set: Option<Vec<u8>> = match chars {
         Some(v) => Some(
-            as_bytes_object(v)
+            as_bytes_object(v)?
                 .ok_or_else(|| host::type_error("a bytes-like object is required"))?,
         ),
         None => None,
@@ -19217,7 +19258,7 @@ fn build_bytes(args: &[Value]) -> Result<Vec<u8>, String> {
         out.resize(*n as usize, 0u8);
         return Ok(out);
     }
-    if let Some(b) = as_bytes_object(v) {
+    if let Some(b) = as_bytes_object(v)? {
         return Ok(b);
     }
     if let Some(s) = with_host(|h| h.as_str(v)) {
@@ -19238,7 +19279,7 @@ fn build_bytes(args: &[Value]) -> Result<Vec<u8>, String> {
 /// Collect a bytes-like / iterable-of-ints argument into raw bytes (for
 /// `bytearray.extend`, `bytes(iterable)`, …).
 fn collect_bytes(v: &Value) -> Result<Vec<u8>, String> {
-    if let Some(b) = as_bytes_object(v) {
+    if let Some(b) = as_bytes_object(v)? {
         return Ok(b);
     }
     let items = host::iter_vec(v)?;
@@ -19973,7 +20014,7 @@ fn file_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String
         "write" => {
             let s = arg0(args)?;
             let binary = with_host(|h| h.io_is_binary(id));
-            match as_bytes_object(&s) {
+            match as_bytes_object(&s)? {
                 Some(bytes) => {
                     // CPython's `TextIOWrapper.write` takes only `str`.
                     if !binary {
@@ -20000,7 +20041,7 @@ fn file_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String
         "writelines" => {
             let items = host::iter_vec(&arg0(args)?)?;
             for it in items {
-                match as_bytes_object(&it) {
+                match as_bytes_object(&it)? {
                     Some(bytes) => {
                         with_host(|h| h.io_write_bytes(id, &bytes))?;
                     }

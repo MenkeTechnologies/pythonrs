@@ -6831,6 +6831,64 @@ fn with_checks_the_context_manager_protocol_before_entering() {
     );
 }
 
+// The protocol check reaches every receiver, not just user instances and the
+// core containers: builtins, functions, class objects, modules, iterators and
+// the natively shadowed stdlib types all raise CPython's `TypeError` (named by
+// the `%T` fully qualified type name), a class object is asked about its
+// METACLASS, an `__exit__` stored on the instance does not count, and an object
+// with only the async protocol gets CPython 3.14's `async with` hint. Expected
+// list produced by python3.14 for the same program.
+#[test]
+fn with_protocol_check_covers_native_and_shadowed_receivers() {
+    let missed = |t: &str| {
+        format!("\"'{t}' object does not support the context manager protocol (missed __exit__ method)\"")
+    };
+    let expected = format!(
+        "[{}, {}, {}, {}, {}, {}, \"'A' object does not support the context manager protocol \
+         (missed __exit__ method) but it supports the asynchronous context manager protocol. \
+         Did you mean to use 'async with'?\", {}, {}, ('K', 's', b'm')]",
+        missed("builtin_function_or_method"),
+        missed("function"),
+        missed("type"),
+        missed("module"),
+        missed("slice"),
+        missed("collections.OrderedDict"),
+        missed("Q"),
+        missed("list_iterator"),
+    );
+    assert_eq!(
+        g(
+            "import io, sys, collections\n\
+             class A:\n\
+             \x20   async def __aenter__(self): pass\n\
+             \x20   async def __aexit__(self, *a): pass\n\
+             class M(type):\n\
+             \x20   def __enter__(cls): return cls.__name__\n\
+             \x20   def __exit__(cls, *a): return False\n\
+             class K(metaclass=M): pass\n\
+             class P:\n\
+             \x20   def __enter__(self): return self\n\
+             \x20   def __exit__(self, *a): return False\n\
+             class Q: pass\n\
+             q = Q()\n\
+             q.__enter__ = lambda: 1\n\
+             q.__exit__ = lambda *a: False\n\
+             out = []\n\
+             for v in (len, lambda: 0, P, sys, slice(1), collections.OrderedDict(), A(), q, iter([])):\n\
+             \x20   try:\n\
+             \x20       with v: pass\n\
+             \x20       out.append('ok')\n\
+             \x20   except TypeError as e:\n\
+             \x20       out.append(str(e))\n\
+             with K as name, io.StringIO('s') as s, memoryview(b'm') as m:\n\
+             \x20   out.append((name, s.read(), m.tobytes()))\n\
+             x = out",
+            "x"
+        ),
+        expected
+    );
+}
+
 // `frozenset` is immutable, so it must not advertise the mutating half of the
 // `set` method table. Sharing one table made `hasattr(frozenset(), "add")`
 // answer `True` while the call raised `AttributeError`, so duck-typed code
@@ -9157,4 +9215,24 @@ fn bool_format_and_bytes_dunders_are_called_and_checked() {
         let src = format!("{cls}{src}");
         assert_eq!(eval_str(&src).expect_err(&src), want, "{src}");
     }
+}
+
+// `type_repr` / `object_repr` qualify a class by its own `__module__` — a class
+// body that sets `__module__` reprs under that module, and `builtins` is
+// dropped — rather than prefixing every program-defined class with
+// `__main__.`. Expected tuple produced by python3.14.
+#[test]
+fn a_class_reprs_under_its_own_module() {
+    assert_eq!(
+        g(
+            "class Q:\n\
+             \x20   __module__ = 'zz'\n\
+             class B:\n\
+             \x20   __module__ = 'builtins'\n\
+             class M: pass\n\
+             x = (repr(Q), repr(Q()).split(' object')[0], repr(B), repr(B()).split(' object')[0], repr(M))",
+            "x"
+        ),
+        "(\"<class 'zz.Q'>\", '<zz.Q', \"<class 'B'>\", '<B', \"<class '__main__.M'>\")"
+    );
 }
