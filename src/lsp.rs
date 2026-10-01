@@ -20,13 +20,13 @@ use lsp_types::request::{
 };
 use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
-    Documentation, GotoDefinitionParams, GotoDefinitionResponse, Location, OneOf,
-    ParameterInformation, ParameterLabel, SignatureHelp, SignatureHelpOptions,
-    SignatureHelpParams, SignatureInformation,
     Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, Hover, HoverContents, HoverParams, HoverProviderCapability,
-    MarkupContent, MarkupKind, Position, PublishDiagnosticsParams, Range, ServerCapabilities,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions, Uri,
+    DidOpenTextDocumentParams, Documentation, GotoDefinitionParams, GotoDefinitionResponse, Hover,
+    HoverContents, HoverParams, HoverProviderCapability, Location, MarkupContent, MarkupKind,
+    OneOf, ParameterInformation, ParameterLabel, Position, PublishDiagnosticsParams, Range,
+    ServerCapabilities, SignatureHelp, SignatureHelpOptions, SignatureHelpParams,
+    SignatureInformation, TextDocumentSyncCapability, TextDocumentSyncKind,
+    TextDocumentSyncOptions, Uri,
 };
 
 /// The builtin / keyword / method corpus: (name, chapter, one-line doc, example).
@@ -1294,16 +1294,68 @@ fn hover(docs: &Docs, params: &HoverParams) -> Hover {
     }
 }
 
+/// The local path a `file:` URI names, percent-escapes decoded.
+fn uri_path(uri: &Uri) -> Option<std::path::PathBuf> {
+    let rest = uri.as_str().strip_prefix("file://")?;
+    let bytes = rest.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        match (
+            bytes[i],
+            bytes.get(i + 1).copied().and_then(hex),
+            bytes.get(i + 2).copied().and_then(hex),
+        ) {
+            (b'%', Some(hi), Some(lo)) => {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+            }
+            (b, _, _) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    Some(std::path::PathBuf::from(String::from_utf8(out).ok()?))
+}
+
+/// The `file:` URI of a local path, every byte outside RFC 3986's unreserved
+/// set and `/` percent-escaped.
+fn path_uri(path: &std::path::Path) -> Option<Uri> {
+    let mut s = String::from("file://");
+    for &b in path.to_str()?.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'.' | b'_' | b'~') {
+            s.push(b as char);
+        } else {
+            s.push_str(&format!("%{b:02X}"));
+        }
+    }
+    s.parse().ok()
+}
+
 /// Go-to-definition for the name under the cursor, resolved through the
-/// document's own scopes (see [`crate::lsp_nav`]). `null` when the name is a
-/// builtin, an attribute, or bound nowhere in the document.
+/// document's scopes and on into the modules it imports and the classes it
+/// defines (see [`crate::lsp_nav`]). `null` when the name is a builtin, an
+/// attribute of a value the document does not determine, or bound nowhere it
+/// can see.
 fn definition(docs: &Docs, params: &GotoDefinitionParams) -> Option<GotoDefinitionResponse> {
     let at = &params.text_document_position_params;
     let text = docs.get(at.text_document.uri.as_str())?;
-    let (line, character, len) =
-        crate::lsp_nav::definition(text, at.position.line, at.position.character)?;
+    let doc = uri_path(&at.text_document.uri);
+    let target = crate::lsp_nav::definition_at(
+        text,
+        doc.as_deref(),
+        at.position.line,
+        at.position.character,
+    )?;
+    let uri = match &target.file {
+        Some(path) => path_uri(path)?,
+        None => at.text_document.uri.clone(),
+    };
+    let (line, character, len) = (target.line, target.character, target.len);
     Some(GotoDefinitionResponse::Scalar(Location {
-        uri: at.text_document.uri.clone(),
+        uri,
         range: Range {
             start: Position { line, character },
             end: Position {
@@ -1314,12 +1366,18 @@ fn definition(docs: &Docs, params: &GotoDefinitionParams) -> Option<GotoDefiniti
     }))
 }
 
-/// Signature help for the call around the cursor, when the document defines
-/// the callee (see [`crate::lsp_nav::signature_help`]).
+/// Signature help for the call around the cursor, when the document can see
+/// the callee's definition (see [`crate::lsp_nav::signature_help_at`]).
 fn signature_help(docs: &Docs, params: &SignatureHelpParams) -> Option<SignatureHelp> {
     let at = &params.text_document_position_params;
     let text = docs.get(at.text_document.uri.as_str())?;
-    let sig = crate::lsp_nav::signature_help(text, at.position.line, at.position.character)?;
+    let doc = uri_path(&at.text_document.uri);
+    let sig = crate::lsp_nav::signature_help_at(
+        text,
+        doc.as_deref(),
+        at.position.line,
+        at.position.character,
+    )?;
     Some(SignatureHelp {
         signatures: vec![SignatureInformation {
             label: sig.label,

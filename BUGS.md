@@ -9,6 +9,17 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **`--lsp` go-to-definition and signature help reach attributes and other
+  files.** Both resolved names within the open document only. An attribute now
+  resolves as it does at run time where the document determines the receiver:
+  `self.x`/`cls.x` in a method (the class body, then an instance attribute a
+  method assigns through its first parameter, then the bases left to right),
+  `Class.x`, and `module.x`; a method called on `self` shows its signature
+  without `self`. An imported name — `from m import f`, `import m` then
+  `m.f`, a relative import — resolves into the module's file, found beside the
+  document or in its package as `sys.path[0]` finds it, following a package
+  `__init__.py`'s re-export to the definition, and the answer names that file
+  by its `file:` URI.
 - **A `--build` binary runs, and reports an error the VM raised itself.** The
   runner deserialized fusevm's embedded chunk without stripping its format tag
   (`AOT_CHUNK_MAGIC`), so every built binary failed with `corrupt embedded
@@ -2283,10 +2294,12 @@ measured inside it, recorded so the next round does not re-derive them.
   line would.
 - **`--lsp`**: full corpus — completion (builtins/keywords/methods), position-
   aware hover, diagnostics via the real parser, go-to-definition and signature
-  help. The last two resolve names within the open document only — through its
-  module, function and class scopes (`src/lsp_nav.rs`) — so a builtin, an
-  attribute (`obj.name`, `self.method`) or a name imported from another file
-  has no definition or signature to show.
+  help (see Implemented for how far the last two resolve). A builtin has no
+  definition or signature to show: it has no Python source, and the
+  signatures CPython publishes for it (`__text_signature__`) are not read.
+  Neither is an attribute of a value the document does not determine — a call's
+  result, a parameter, a subscript — nor a module found anywhere but beside the
+  document or in its package (`sys.path` beyond `sys.path[0]`).
 - **REPL** echoes bare-expression values through `sys.displayhook` (CPython
   "single" mode: prints `repr(value)` for non-`None` top-level results and binds
   `_`); multi-line blocks close on a blank line. Passing `--repl` with piped

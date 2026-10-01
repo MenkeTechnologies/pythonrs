@@ -1,5 +1,6 @@
-//! Name resolution over one open document, for the LSP's go-to-definition and
-//! signature help (`src/lsp.rs`).
+//! Name resolution for the LSP's go-to-definition and signature help
+//! (`src/lsp.rs`): over the open document, and from there into the modules it
+//! imports and the classes it defines.
 //!
 //! The document is parsed with the runtime's own parser and every binding is
 //! filed under the scope Python gives it: the module, a function (its
@@ -10,10 +11,20 @@
 //! the first one when every binding comes later (a module function called from
 //! a function defined above it).
 //!
+//! An attribute resolves the way it does at run time for the receivers whose
+//! value the document itself determines: `self.x` / `cls.x` in a method — the
+//! enclosing class, its instance attributes (`self.x = …` in any of its
+//! methods) and then its bases, left to right — a class the document defines,
+//! and a module it imports. An imported name resolves into the imported
+//! module's file, found as `sys.path[0]` finds it — beside the document — or,
+//! for a relative import, in the document's package; a name that module itself
+//! imports is followed on.
+//!
 //! Positions are 0-based `(line, character)` with `character` counted in
 //! `char`s, as the rest of the server counts them.
 
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use crate::ast::{Expr, Params, Pattern, PatternKind, Stmt, StmtKind};
 
@@ -26,7 +37,7 @@ enum BindKind {
     Other,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Binding {
     name: String,
     /// 1-based line of the binding statement (a `def`'s own line for its
@@ -35,6 +46,20 @@ struct Binding {
     kind: BindKind,
     /// For a `def`/`class`, the definition itself (signature help reads it).
     stmt: Option<Stmt>,
+    /// For a name an `import` binds, the module (and name) it comes from.
+    origin: Option<ImportOrigin>,
+}
+
+/// What an `import` binds a name to.
+#[derive(Clone, Debug)]
+struct ImportOrigin {
+    /// The dotted module path as written (`""` for `from . import x`).
+    module: String,
+    /// Leading dots of a relative import.
+    level: usize,
+    /// The name taken from the module (`from m import name`), or `None` when
+    /// the binding is the module itself (`import m`).
+    name: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -53,6 +78,8 @@ struct Scope {
     parent: Option<usize>,
     bindings: Vec<Binding>,
     globals: HashSet<String>,
+    /// For a class body, the `class` statement it is the body of.
+    class: Option<Stmt>,
 }
 
 /// Every scope of a parsed document.
@@ -67,12 +94,25 @@ impl Scopes {
             parent: None,
             bindings: Vec::new(),
             globals: HashSet::new(),
+            class: None,
         }]);
         scopes.block(stmts, 0, u32::MAX);
         scopes
     }
 
     fn bind(&mut self, scope: usize, name: &str, line: u32, kind: BindKind, stmt: Option<&Stmt>) {
+        self.bind_from(scope, name, line, kind, stmt, None);
+    }
+
+    fn bind_from(
+        &mut self,
+        scope: usize,
+        name: &str,
+        line: u32,
+        kind: BindKind,
+        stmt: Option<&Stmt>,
+        origin: Option<ImportOrigin>,
+    ) {
         // A `global` name assigned in a function is a module binding.
         let scope = if self.0[scope].globals.contains(name) {
             0
@@ -84,6 +124,7 @@ impl Scopes {
             line,
             kind,
             stmt: stmt.cloned(),
+            origin,
         });
     }
 
@@ -112,6 +153,7 @@ impl Scopes {
             StmtKind::ClassDef { name, body, .. } => {
                 self.bind(scope, name, s.line, BindKind::Class, Some(s));
                 let inner = self.open(ScopeKind::Class, s.line, reach, scope);
+                self.0[inner].class = Some(s.clone());
                 self.block(body, inner, reach);
             }
             StmtKind::Assign { targets, .. } => {
@@ -170,18 +212,37 @@ impl Scopes {
             }
             StmtKind::Import(aliases) => {
                 for a in aliases {
-                    let bound = match &a.asname {
-                        Some(n) => n.as_str(),
-                        None => a.name.split('.').next().unwrap_or(&a.name),
+                    // `import a.b` binds the top package `a`; `import a.b as
+                    // m` binds the submodule.
+                    let (bound, module) = match &a.asname {
+                        Some(n) => (n.as_str(), a.name.as_str()),
+                        None => {
+                            let top = a.name.split('.').next().unwrap_or(&a.name);
+                            (top, top)
+                        }
                     };
-                    self.bind(scope, bound, s.line, BindKind::Other, None);
+                    let origin = ImportOrigin {
+                        module: module.to_string(),
+                        level: 0,
+                        name: None,
+                    };
+                    self.bind_from(scope, bound, s.line, BindKind::Other, None, Some(origin));
                 }
             }
-            StmtKind::ImportFrom { names, .. } => {
+            StmtKind::ImportFrom {
+                module,
+                names,
+                level,
+            } => {
                 for a in names {
                     let bound = a.asname.as_deref().unwrap_or(&a.name);
                     if bound != "*" {
-                        self.bind(scope, bound, s.line, BindKind::Other, None);
+                        let origin = ImportOrigin {
+                            module: module.clone().unwrap_or_default(),
+                            level: *level,
+                            name: Some(a.name.clone()),
+                        };
+                        self.bind_from(scope, bound, s.line, BindKind::Other, None, Some(origin));
                     }
                 }
             }
@@ -211,6 +272,7 @@ impl Scopes {
             parent: Some(parent),
             bindings: Vec::new(),
             globals: HashSet::new(),
+            class: None,
         });
         self.0.len() - 1
     }
@@ -405,26 +467,379 @@ fn word_at(lines: &[&str], line0: usize, char0: usize) -> Option<String> {
     (start < end).then(|| chars[start..end].iter().collect())
 }
 
-/// Go-to-definition: where the name under the cursor is bound, as
-/// `(line0, char0, length)`. `None` for a builtin, an attribute, or a name the
-/// document never binds.
-pub fn definition(text: &str, line0: u32, char0: u32) -> Option<(u32, u32, u32)> {
-    let lines: Vec<&str> = text.lines().collect();
-    let name = word_at(&lines, line0 as usize, char0 as usize)?;
-    // `obj.name` is an attribute, not a name lookup.
-    let chars: Vec<char> = lines[line0 as usize].chars().collect();
-    let start = (0..=(char0 as usize).min(chars.len()))
+/// A source file and its scopes: the open document, or a module it imports.
+struct Source {
+    /// `None` for the open document.
+    path: Option<PathBuf>,
+    /// The directory its imports are looked up from.
+    dir: Option<PathBuf>,
+    text: String,
+    scopes: Scopes,
+}
+
+/// What a name, or a step along an attribute chain, has reached. Files are
+/// indices into [`Sources`].
+#[derive(Clone)]
+enum Reached {
+    /// A module: the file itself.
+    Module(usize),
+    /// An instance of the class whose body is scope `.1` of file `.0` — what
+    /// a method's `self` is.
+    Instance(usize, usize),
+    /// A binding in file `.0`.
+    Binding(usize, Binding),
+}
+
+/// How many imports and base classes a lookup follows before giving up: a
+/// cycle (`a` importing `b` importing `a`, a class deriving from itself) ends
+/// here instead of looping.
+const MAX_HOPS: usize = 16;
+
+/// Every file a lookup has read; the open document is index 0. Each file is
+/// read and parsed once.
+struct Sources(Vec<Source>);
+
+impl Sources {
+    fn new(text: &str, stmts: &[Stmt], doc: Option<&Path>) -> Sources {
+        Sources(vec![Source {
+            path: None,
+            dir: doc.and_then(Path::parent).map(Path::to_path_buf),
+            text: text.to_string(),
+            scopes: Scopes::build(stmts),
+        }])
+    }
+
+    /// The file at `path`, read and parsed on first use.
+    fn load(&mut self, path: PathBuf) -> Option<usize> {
+        if let Some(i) = self.0.iter().position(|s| s.path.as_ref() == Some(&path)) {
+            return Some(i);
+        }
+        let text = std::fs::read_to_string(&path).ok()?;
+        let stmts = crate::parser::parse(&text).ok()?;
+        self.0.push(Source {
+            dir: path.parent().map(Path::to_path_buf),
+            path: Some(path),
+            scopes: Scopes::build(&stmts),
+            text,
+        });
+        Some(self.0.len() - 1)
+    }
+
+    /// The module `import module` (with `level` leading dots) reads from file
+    /// `from`.
+    fn module(&mut self, from: usize, module: &str, level: usize) -> Option<usize> {
+        let path = module_file(self.0[from].dir.as_deref()?, module, level)?;
+        self.load(path)
+    }
+
+    /// Submodule `name` of the package file `m` is the `__init__.py` of.
+    fn submodule(&mut self, m: usize, name: &str) -> Option<usize> {
+        let init = self.0[m].path.clone()?;
+        if init.file_name()? != "__init__.py" {
+            return None;
+        }
+        let path = module_file(init.parent()?, name, 0)?;
+        self.load(path)
+    }
+
+    /// The module scope's last binding of `name` in file `src` — the binding
+    /// an importer sees once the module has run.
+    fn top_level(&self, src: usize, name: &str) -> Option<Binding> {
+        let module = &self.0[src].scopes.0[0];
+        module
+            .bindings
+            .iter()
+            .rev()
+            .find(|b| b.name == name)
+            .cloned()
+    }
+
+    /// What an import binding of file `from` names: the binding in the
+    /// imported module, or the module itself.
+    fn import(&mut self, from: usize, origin: &ImportOrigin) -> Option<Reached> {
+        let m = self.module(from, &origin.module, origin.level);
+        let Some(name) = &origin.name else {
+            return m.map(Reached::Module);
+        };
+        match m.and_then(|m| Some((m, self.top_level(m, name)?))) {
+            Some((m, b)) => Some(Reached::Binding(m, b)),
+            // `from package import submodule`.
+            None => self.submodule(m?, name).map(Reached::Module),
+        }
+    }
+
+    /// Follow `at` through imports to what is finally bound: a package's
+    /// `__init__.py` re-export leads to the definition.
+    fn settle(&mut self, at: Reached) -> Option<Reached> {
+        let mut at = at;
+        for _ in 0..MAX_HOPS {
+            match &at {
+                Reached::Binding(src, b) => match &b.origin {
+                    Some(origin) => at = self.import(*src, &origin.clone())?,
+                    None => return Some(at),
+                },
+                _ => return Some(at),
+            }
+        }
+        None
+    }
+
+    /// `attr` on what `at` reached.
+    fn attribute(&mut self, at: Reached, attr: &str, hops: usize) -> Option<Reached> {
+        if hops > MAX_HOPS {
+            return None;
+        }
+        match self.settle(at)? {
+            Reached::Module(m) => match self.top_level(m, attr) {
+                Some(b) => Some(Reached::Binding(m, b)),
+                None => self.submodule(m, attr).map(Reached::Module),
+            },
+            Reached::Instance(src, class) => self.class_member(src, class, attr, hops),
+            Reached::Binding(src, b) => {
+                let class = class_scope(&self.0[src].scopes, &b)?;
+                self.class_member(src, class, attr, hops)
+            }
+        }
+    }
+
+    /// `attr` looked up on the class whose body is scope `class` of file
+    /// `src`: the class body's own binding, else an instance attribute one of
+    /// its methods assigns through its first parameter, else its bases, left
+    /// to right.
+    fn class_member(
+        &mut self,
+        src: usize,
+        class: usize,
+        attr: &str,
+        hops: usize,
+    ) -> Option<Reached> {
+        let scope = &self.0[src].scopes.0[class];
+        if let Some(b) = scope.bindings.iter().rev().find(|b| b.name == attr) {
+            return Some(Reached::Binding(src, b.clone()));
+        }
+        let StmtKind::ClassDef { body, bases, .. } = &scope.class.as_ref()?.kind else {
+            return None;
+        };
+        if let Some(line) = instance_attribute(body, attr) {
+            let b = Binding {
+                name: attr.to_string(),
+                line,
+                kind: BindKind::Other,
+                stmt: None,
+                origin: None,
+            };
+            return Some(Reached::Binding(src, b));
+        }
+        let class_line = scope.start;
+        let bases: Vec<String> = bases
+            .iter()
+            .filter_map(|e| match e.unspanned() {
+                Expr::Name(n) => Some(n.clone()),
+                _ => None,
+            })
+            .collect();
+        bases.iter().find_map(|base| {
+            let b = self.0[src].scopes.resolve(base, class_line)?.clone();
+            self.attribute(Reached::Binding(src, b), attr, hops + 1)
+        })
+    }
+
+    /// What the dotted `chain` (`helper`, `self.x`, `Box.area`,
+    /// `os.path.join`) names from `line` (1-based) of the open document.
+    fn resolve(&mut self, chain: &[String], line: u32) -> Option<Reached> {
+        let (first, rest) = chain.split_first()?;
+        let scopes = &self.0[0].scopes;
+        let mut at = match enclosing_class(scopes, first, line) {
+            Some(class) if !rest.is_empty() => Reached::Instance(0, class),
+            _ => Reached::Binding(0, scopes.resolve(first, line)?.clone()),
+        };
+        for attr in rest {
+            at = self.attribute(at, attr, 0)?;
+        }
+        Some(at)
+    }
+}
+
+/// The file `import module` (with `level` leading dots) reads, looked for as
+/// `sys.path[0]` finds it — in `dir`, the importing file's directory — or, for
+/// a relative import, in the package `level - 1` directories above: `m.py`,
+/// else `m/__init__.py`.
+fn module_file(dir: &Path, module: &str, level: usize) -> Option<PathBuf> {
+    let mut stem = dir.to_path_buf();
+    for _ in 1..level {
+        stem = stem.parent()?.to_path_buf();
+    }
+    let parts: Vec<&str> = module.split('.').filter(|p| !p.is_empty()).collect();
+    for p in &parts {
+        stem.push(p);
+    }
+    let candidates = if parts.is_empty() {
+        vec![stem.join("__init__.py")]
+    } else {
+        vec![stem.with_extension("py"), stem.join("__init__.py")]
+    };
+    candidates.into_iter().find(|f| f.is_file())
+}
+
+/// The first line (1-based) of `body`'s methods that assigns `attr` through
+/// the method's first parameter — `self.attr = …`, `self.attr += …`,
+/// `self.attr: T = …` — which is where an instance attribute is defined.
+fn instance_attribute(body: &[Stmt], attr: &str) -> Option<u32> {
+    fn assigns(stmts: &[Stmt], me: &str, attr: &str) -> Option<u32> {
+        let hits = |t: &Expr| {
+            matches!(t.unspanned(), Expr::Attribute(recv, a)
+                if a == attr && matches!(recv.unspanned(), Expr::Name(n) if n == me))
+        };
+        stmts.iter().find_map(|s| match &s.kind {
+            StmtKind::Assign { targets, .. } if targets.iter().any(hits) => Some(s.line),
+            StmtKind::AugAssign { target, .. } | StmtKind::AnnAssign { target, .. }
+                if hits(target) =>
+            {
+                Some(s.line)
+            }
+            StmtKind::If { body, orelse, .. }
+            | StmtKind::While { body, orelse, .. }
+            | StmtKind::For { body, orelse, .. } => {
+                assigns(body, me, attr).or_else(|| assigns(orelse, me, attr))
+            }
+            StmtKind::With { body, .. } => assigns(body, me, attr),
+            StmtKind::Try {
+                body,
+                handlers,
+                orelse,
+                finalbody,
+            } => assigns(body, me, attr)
+                .or_else(|| handlers.iter().find_map(|h| assigns(&h.body, me, attr)))
+                .or_else(|| assigns(orelse, me, attr))
+                .or_else(|| assigns(finalbody, me, attr)),
+            _ => None,
+        })
+    }
+    body.iter().find_map(|s| match &s.kind {
+        StmtKind::FuncDef { params, body, .. } => {
+            let me = params.names.first()?;
+            assigns(body, me, attr)
+        }
+        _ => None,
+    })
+}
+
+/// The dotted names before the `.` at char index `dot` of `chars` — `self` in
+/// `self.x`, `os.path` in `os.path.join` — or `None` when the receiver is not
+/// a plain dotted name (a call, a subscript, a literal).
+fn receiver_chain(chars: &[char], dot: usize) -> Option<Vec<String>> {
+    let mut names = Vec::new();
+    let mut end = dot;
+    loop {
+        let mut start = end;
+        while start > 0 && is_ident(chars[start - 1]) {
+            start -= 1;
+        }
+        if start == end || chars[start].is_ascii_digit() {
+            return None;
+        }
+        names.push(chars[start..end].iter().collect::<String>());
+        if start > 0 && chars[start - 1] == '.' {
+            end = start - 1;
+        } else {
+            names.reverse();
+            return Some(names);
+        }
+    }
+}
+
+/// The class scope a method's first parameter (`self`, `cls`) stands for,
+/// when `name` is that parameter of the function enclosing `line`.
+fn enclosing_class(scopes: &Scopes, name: &str, line: u32) -> Option<usize> {
+    let func = &scopes.0[scopes.innermost(line)];
+    if func.kind != ScopeKind::Function {
+        return None;
+    }
+    let first = func.bindings.iter().find(|b| b.kind == BindKind::Param)?;
+    let class = func.parent?;
+    (first.name == name && scopes.0[class].kind == ScopeKind::Class).then_some(class)
+}
+
+/// The scope of the class body a `class` binding defines.
+fn class_scope(scopes: &Scopes, b: &Binding) -> Option<usize> {
+    if b.kind != BindKind::Class {
+        return None;
+    }
+    scopes
+        .0
+        .iter()
+        .position(|s| s.kind == ScopeKind::Class && s.start == b.line)
+}
+
+/// The dotted name ending at the identifier spanning `(line0, char0)`:
+/// `["self", "width"]` for the cursor on `width` in `self.width`.
+fn chain_at(lines: &[&str], line0: usize, char0: usize) -> Option<Vec<String>> {
+    let name = word_at(lines, line0, char0)?;
+    let chars: Vec<char> = lines.get(line0)?.chars().collect();
+    let start = (0..=char0.min(chars.len()))
         .rev()
         .find(|&i| i == 0 || !is_ident(chars[i - 1]))
         .unwrap_or(0);
-    if start > 0 && chars[start - 1] == '.' {
-        return None;
-    }
+    let mut chain = if start > 0 && chars[start - 1] == '.' {
+        receiver_chain(&chars, start - 1)?
+    } else {
+        Vec::new()
+    };
+    chain.push(name);
+    Some(chain)
+}
+
+/// Where a definition is: `file` is `None` for the open document; `line` and
+/// `character` are 0-based and `len` is the name's length in chars (0 for a
+/// module, which is the start of its file).
+#[derive(Debug, PartialEq)]
+pub struct Target {
+    pub file: Option<PathBuf>,
+    pub line: u32,
+    pub character: u32,
+    pub len: u32,
+}
+
+/// Go-to-definition: where the name under the cursor is bound, in the open
+/// document or in a module it imports. `doc` is the document's own path, which
+/// the imports are found relative to. `None` for a builtin, an attribute of a
+/// value the document does not determine, or a name bound nowhere it can see.
+pub fn definition_at(text: &str, doc: Option<&Path>, line0: u32, char0: u32) -> Option<Target> {
+    let lines: Vec<&str> = text.lines().collect();
+    let chain = chain_at(&lines, line0 as usize, char0 as usize)?;
     let stmts = parse_tolerant(text, line0 as usize)?;
-    let scopes = Scopes::build(&stmts);
-    let b = scopes.resolve(&name, line0 + 1)?;
-    let (l, c) = binding_position(&lines, b);
-    Some((l, c, name.chars().count() as u32))
+    let mut sources = Sources::new(text, &stmts, doc);
+    let at = sources.resolve(&chain, line0 + 1)?;
+    // A name imported from another module goes on to its definition there;
+    // when that module cannot be read, the import itself is the answer.
+    let at = sources.settle(at.clone()).unwrap_or(at);
+    match at {
+        Reached::Module(m) => Some(Target {
+            file: sources.0[m].path.clone(),
+            line: 0,
+            character: 0,
+            len: 0,
+        }),
+        Reached::Binding(src, b) => {
+            let source = &sources.0[src];
+            let lines: Vec<&str> = source.text.lines().collect();
+            let (line, character) = binding_position(&lines, &b);
+            Some(Target {
+                file: source.path.clone(),
+                line,
+                character,
+                len: b.name.chars().count() as u32,
+            })
+        }
+        Reached::Instance(..) => None,
+    }
+}
+
+/// [`definition_at`] within the open document only, as `(line0, char0,
+/// length)`.
+pub fn definition(text: &str, line0: u32, char0: u32) -> Option<(u32, u32, u32)> {
+    let t = definition_at(text, None, line0, char0)?;
+    t.file.is_none().then_some((t.line, t.character, t.len))
 }
 
 /// A signature to show: the label, each parameter's text, the active
@@ -574,33 +989,46 @@ fn docstring(body: &[Stmt]) -> Option<String> {
     }
 }
 
-/// Signature help for the call the cursor is inside, when its callee is a name
-/// this document defines with `def` or `class` (a class shows `__init__`
-/// without `self`).
+/// Signature help for the call the cursor is inside, when its callee is a
+/// function or class the document can see: defined in it, imported from a
+/// module beside it, or a method reached through `self`, a class or a module
+/// (a class shows `__init__` without `self`, and so does a method called on
+/// `self`).
 pub fn signature_help(text: &str, line0: u32, char0: u32) -> Option<Signature> {
+    signature_help_at(text, None, line0, char0)
+}
+
+/// [`signature_help`], with the document's path to find its imports from.
+pub fn signature_help_at(
+    text: &str,
+    doc: Option<&Path>,
+    line0: u32,
+    char0: u32,
+) -> Option<Signature> {
     let (open, args) = open_call(text, line0 as usize, char0 as usize)?;
-    // The callee is the identifier right before the `(`.
+    // The callee is the dotted name right before the `(`.
     let chars: Vec<char> = text.chars().collect();
     let mut end = open - 1;
     while end > 0 && chars[end - 1].is_whitespace() {
         end -= 1;
     }
-    let mut start = end;
-    while start > 0 && is_ident(chars[start - 1]) {
-        start -= 1;
-    }
-    if start == end || (start > 0 && chars[start - 1] == '.') {
-        return None;
-    }
-    let callee: String = chars[start..end].iter().collect();
-    let call_line = chars[..start].iter().filter(|c| **c == '\n').count();
+    let chain = receiver_chain(&chars, end)?;
+    let callee = chain.last()?.clone();
+    let call_line = chars[..end].iter().filter(|c| **c == '\n').count();
 
-    let lines: Vec<&str> = text.lines().collect();
     let stmts = parse_tolerant(text, line0 as usize)?;
-    let scopes = Scopes::build(&stmts);
-    let b = scopes.resolve(&callee, call_line as u32 + 1)?;
+    let mut sources = Sources::new(text, &stmts, doc);
+    let reached = sources.resolve(&chain, call_line as u32 + 1)?;
+    let Reached::Binding(src, b) = sources.settle(reached)? else {
+        return None;
+    };
+    // A method called through `self`/`cls` is bound: its first parameter is
+    // not passed.
+    let bound = chain.len() > 1
+        && enclosing_class(&sources.0[0].scopes, &chain[0], call_line as u32 + 1).is_some();
+    let lines: Vec<&str> = sources.0[src].text.lines().collect();
     let (def_name, def_line, body, drop_self) = match &b.stmt.as_ref()?.kind {
-        StmtKind::FuncDef { name, body, .. } => (name.clone(), b.line, body.clone(), false),
+        StmtKind::FuncDef { name, body, .. } => (name.clone(), b.line, body.clone(), bound),
         StmtKind::ClassDef { body, .. } => {
             let init = body
                 .iter()
@@ -769,5 +1197,126 @@ def size_of(box):
         );
         // Outside any call there is nothing to show.
         assert_eq!(signature_help(SRC, 1, 3), None);
+    }
+    /// The receivers whose value the document determines: a method's `self`
+    /// (instance attributes assigned in any method, the class body, then the
+    /// bases left to right) and a class named directly.
+    #[test]
+    fn attributes_resolve_through_self_and_classes() {
+        let src = "\
+class Base:
+    def ping(self):
+        return 1
+
+class Box(Base):
+    size = 3
+    def __init__(self, width):
+        if width:
+            self.width = width
+    def area(self):
+        return self.width * self.size + self.ping()
+
+def make():
+    return Box.size, Box(1).area
+";
+        let at = |line0: u32, word: &str| {
+            let text = src.lines().nth(line0 as usize).unwrap();
+            let col = find_word(text, word, 0).expect("word on line") as u32;
+            definition(src, line0, col)
+        };
+        // An instance attribute, from the method that assigns it.
+        assert_eq!(at(10, "width"), Some((8, 17, 5)));
+        // A class attribute and an inherited method, through `self`.
+        assert_eq!(at(10, "size"), Some((5, 4, 4)));
+        assert_eq!(at(10, "ping"), Some((1, 8, 4)));
+        // A class attribute through the class's name.
+        assert_eq!(at(13, "size"), Some((5, 4, 4)));
+        // A call's result is not a value the document determines.
+        assert_eq!(at(13, "area"), None);
+        // A method called on `self` is bound: no `self` in the signature.
+        let class: Vec<&str> = src.lines().take(11).collect();
+        let text = format!(
+            "{}\n    def grow(self):\n        self.area(",
+            class.join("\n")
+        );
+        let sig = signature_help(&text, 12, 18).expect("signature");
+        assert_eq!(sig.label, "area()");
+    }
+
+    /// An imported name resolves into the module beside the document, through
+    /// a package's `__init__.py` re-export, and a module's attributes resolve
+    /// into its file.
+    #[test]
+    fn imports_resolve_into_the_imported_module() {
+        let dir = std::env::temp_dir().join(format!("pythonrs_lsp_nav_{}", std::process::id()));
+        let pkg = dir.join("pkg");
+        std::fs::create_dir_all(&pkg).expect("temp package");
+        std::fs::write(dir.join("helpers.py"), "X = 1\n\ndef scale(value, factor=10):\n    \"\"\"Scale.\"\"\"\n    return value * factor\n").unwrap();
+        std::fs::write(pkg.join("__init__.py"), "from .core import Engine\n").unwrap();
+        std::fs::write(
+            pkg.join("core.py"),
+            "import os\n\nclass Engine:\n    def run(self, n):\n        return n\n",
+        )
+        .unwrap();
+        let doc = dir.join("main.py");
+        let src = "from helpers import scale\nimport pkg\nfrom pkg import Engine\nscale(1)\npkg.Engine\nEngine.run\n";
+        let at = |line0: u32, col: u32| definition_at(src, Some(&doc), line0, col);
+        let helpers = Some(dir.join("helpers.py"));
+        let core = Some(pkg.join("core.py"));
+        // `scale` called, and named in its own import.
+        let scale = Target {
+            file: helpers.clone(),
+            line: 2,
+            character: 4,
+            len: 5,
+        };
+        assert_eq!(at(3, 1), Some(scale));
+        assert_eq!(at(0, 21).map(|t| t.file), Some(helpers));
+        // `Engine` through `pkg/__init__.py`'s re-export.
+        let engine = Target {
+            file: core.clone(),
+            line: 2,
+            character: 6,
+            len: 6,
+        };
+        assert_eq!(at(2, 17), Some(engine));
+        let engine = Target {
+            file: core.clone(),
+            line: 2,
+            character: 6,
+            len: 6,
+        };
+        assert_eq!(at(4, 6), Some(engine));
+        // A method of the imported class, and the package itself.
+        let run = Target {
+            file: core,
+            line: 3,
+            character: 8,
+            len: 3,
+        };
+        assert_eq!(at(5, 8), Some(run));
+        let init = Target {
+            file: Some(pkg.join("__init__.py")),
+            line: 0,
+            character: 0,
+            len: 0,
+        };
+        assert_eq!(at(1, 8), Some(init));
+        // Signature help reads the imported definition.
+        let text = format!("{src}scale(2, ");
+        let sig = signature_help_at(&text, Some(&doc), 6, 9).expect("signature");
+        assert_eq!(sig.label, "scale(value, factor=10)");
+        assert_eq!(sig.active, 1);
+        assert_eq!(sig.doc.as_deref(), Some("Scale."));
+        // Without the document's path the module cannot be found, and the
+        // import statement is as far as the name goes.
+        let import = Target {
+            file: None,
+            line: 0,
+            character: 20,
+            len: 5,
+        };
+        assert_eq!(definition_at(src, None, 3, 1), Some(import));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
