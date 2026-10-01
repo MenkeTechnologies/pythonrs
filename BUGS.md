@@ -15,6 +15,21 @@ written.
   pythonrs recomputed it from the bytes each time and raised `ValueError:
   operation forbidden on released memoryview object` for it. The view now
   remembers that it was hashed; a view first hashed after release still raises.
+- **The compiler's pattern-matching `SyntaxError`s are positioned.**
+  `name capture 'a' makes remaining patterns unreachable`, `wildcard makes
+  remaining patterns unreachable`, `multiple assignments to name 'a' in
+  pattern`, `mapping pattern checks duplicate key`, `attribute name repeated
+  in class pattern` and `alternative patterns bind different names` had
+  `lineno`/`offset`/`end_lineno`/`end_offset` of `None`, so a program that
+  raised one printed no `File` line position or caret, and one raised inside
+  `exec`/`eval` lost its inner `File "<string>", line N` block. Every
+  `Pattern` now carries CPython's AST `Loc` (UTF-8 byte columns), and each
+  error is raised at the node `codegen_pattern_*` hands `_PyCompile_Error`:
+  the irrefutable capture or wildcard, the re-binding node (the whole mapping
+  for `**rest`), the whole mapping for a duplicate key, the repeated keyword's
+  sub-pattern, the whole or-pattern. `args` is `(msg, (filename, lineno,
+  offset, None, end_lineno, end_offset))`, as `_PyErr_RaiseSyntaxError`
+  builds it, and the offsets are bytes plus one (`case ('éé', a, a)` is 19).
 - **`--lsp` go-to-definition and signature help.** The server answered only
   completion, hover and diagnostics. `textDocument/definition` now resolves the
   name under the cursor the way the compiler does — innermost function out,
@@ -1695,16 +1710,14 @@ written.
   closes its groups early but ends them late, so `re.match(r'(?=(ab))(a)',
   'ab').lastindex` is 1 here and 2 in CPython.
 
-- **The compiler's pattern-matching `SyntaxError`s carry no position.**
-  `name capture 'a' makes remaining patterns unreachable`, `wildcard makes
-  remaining patterns unreachable`, `multiple assignments to name 'a' in
-  pattern` and `alternative patterns bind different names` are CPython's
-  wording, but `exec` gives them `lineno`/`offset`/`end_lineno`/`end_offset`
-  of `None` where CPython 3.14 positions them on the pattern (`case a | b:` is
-  line 2, offsets 10-11; `text` stays `None` in both, as for any compiler
-  error). The `Pattern` AST carries no spans for the compiler to report.
-  Everything else measured in `tests/syntax_errors.rs` — tokenizer, parser,
-  symbol-table and target errors — is positioned and worded as CPython's.
+- **A misplaced `yield` after non-ASCII text is positioned in characters.**
+  CPython's compiler raises `'yield' outside function` (and the other
+  compiler-side `yield` errors) at `col_offset + 1`, a UTF-8 BYTE column, so
+  `x = ("éé", (yield 1))` in a class body is offset 17 there and 15 here,
+  and the caret CPython draws sits two columns further right. The parser
+  records the `yield`'s `Span` in characters, which is what a runtime
+  traceback caret needs; the compiler has no source to convert it with.
+  Pattern errors carry their own byte-based `Loc` and are exact.
 - **A bridged exception carries no CPython traceback.** An exception that crosses
   from pythonrs into CPython is rebuilt as a fresh exception object, so its
   `__traceback__` is empty. Two visible consequences, both in code that is not

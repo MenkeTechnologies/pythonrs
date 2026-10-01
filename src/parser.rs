@@ -43,6 +43,7 @@ pub fn parse(src: &str) -> Result<Vec<Stmt>, String> {
         nesting: 0,
         misplaced: None,
         groups: std::collections::HashMap::new(),
+        lines: src.lines().map(str::to_string).collect(),
     };
     let err = match p.parse_module() {
         Ok(stmts) => match unclosed {
@@ -287,6 +288,7 @@ pub fn check_eval_input(src: &str) -> Result<(), String> {
         nesting: 0,
         misplaced: None,
         groups: std::collections::HashMap::new(),
+        lines: Vec::new(),
     };
     p.skip_newlines();
     if matches!(p.cur(), Tok::Eof) {
@@ -412,6 +414,9 @@ struct Parser {
     /// inside. CPython's AST has no node for a group, so the position it gives
     /// `(x)` is `x`'s — see [`Parser::node_start`].
     groups: std::collections::HashMap<usize, (usize, u32, u32)>,
+    /// The source lines, for converting a token's character column to the
+    /// UTF-8 byte column CPython's AST positions are in (see [`Loc`]).
+    lines: Vec<String>,
 }
 
 /// Wrap a caret-bearing expression with its source span. `anchor_start ==
@@ -2214,6 +2219,7 @@ impl Parser {
     /// Top-level pattern for a `case`: an open sequence (`case 1, 2`) or a single
     /// OR-pattern.
     fn parse_patterns(&mut self) -> Result<Pattern, String> {
+        let start = self.pos;
         let first = self.parse_pattern()?;
         if self.at_op(",") {
             let mut elems = vec![first];
@@ -2223,8 +2229,7 @@ impl Parser {
                 }
                 elems.push(self.parse_pattern()?);
             }
-            let star = elems.iter().position(|p| matches!(p, Pattern::Star(_)));
-            Ok(Pattern::Sequence { elems, star })
+            Ok(self.sequence_pattern(elems, start))
         } else {
             Ok(first)
         }
@@ -2233,29 +2238,32 @@ impl Parser {
     /// A full pattern (PEP 634 `pattern`): an OR-pattern optionally followed by
     /// `as name`. `as` binds looser than `|`, so `1 | 2 as x` is `(1 | 2) as x`.
     fn parse_pattern(&mut self) -> Result<Pattern, String> {
+        let start = self.pos;
         let p = self.parse_or_pattern()?;
         if self.eat_kw("as") {
             let name = self.expect_name()?;
-            Ok(Pattern::As(Box::new(p), name))
+            Ok(self.pattern(PatternKind::As(Box::new(p), name), start))
         } else {
             Ok(p)
         }
     }
 
     fn parse_or_pattern(&mut self) -> Result<Pattern, String> {
+        let start = self.pos;
         let first = self.parse_closed_pattern()?;
         if self.at_op("|") {
             let mut alts = vec![first];
             while self.eat_op("|") {
                 alts.push(self.parse_closed_pattern()?);
             }
-            Ok(Pattern::Or(alts))
+            Ok(self.pattern(PatternKind::Or(alts), start))
         } else {
             Ok(first)
         }
     }
 
     fn parse_closed_pattern(&mut self) -> Result<Pattern, String> {
+        let start = self.pos;
         // `*name` / `*_` (only valid inside a sequence, checked structurally).
         if self.eat_op("*") {
             let name = if self.at_kw("_") {
@@ -2264,20 +2272,17 @@ impl Parser {
             } else {
                 Some(self.expect_name()?)
             };
-            return Ok(Pattern::Star(name));
+            return Ok(self.pattern(PatternKind::Star(name), start));
         }
         // Bracketed / parenthesized sequence pattern.
         if self.eat_op("[") {
-            return self.parse_sequence_pattern("]");
+            return self.parse_sequence_pattern("]", start);
         }
         if self.at_op("(") {
             self.advance();
             // A single parenthesized pattern is a group; commas make a sequence.
             if self.eat_op(")") {
-                return Ok(Pattern::Sequence {
-                    elems: vec![],
-                    star: None,
-                });
+                return Ok(self.sequence_pattern(vec![], start));
             }
             let first = self.parse_pattern()?;
             if self.at_op(",") {
@@ -2289,10 +2294,10 @@ impl Parser {
                     elems.push(self.parse_pattern()?);
                 }
                 self.expect_op(")")?;
-                let star = elems.iter().position(|p| matches!(p, Pattern::Star(_)));
-                return Ok(Pattern::Sequence { elems, star });
+                return Ok(self.sequence_pattern(elems, start));
             }
             self.expect_op(")")?;
+            // A group has no node of its own: `(p)` sits where `p` does.
             return Ok(first);
         }
         // Mapping pattern.
@@ -2308,7 +2313,7 @@ impl Parser {
         let wildcard = self.at_kw("_");
         let name = self.expect_name()?;
         if wildcard {
-            return Ok(Pattern::Wildcard);
+            return Ok(self.pattern(PatternKind::Wildcard, start));
         }
         // Build a (possibly dotted) value expression.
         let mut expr = Expr::Name(name);
@@ -2319,24 +2324,23 @@ impl Parser {
             dotted = true;
         }
         if self.at_op("(") {
-            return self.parse_class_pattern(expr);
+            return self.parse_class_pattern(expr, start);
         }
-        if dotted {
-            Ok(Pattern::Value(expr))
-        } else {
-            match expr {
-                Expr::Name(n) => Ok(Pattern::Capture(n)),
-                _ => Ok(Pattern::Value(expr)),
-            }
-        }
+        let kind = match expr {
+            Expr::Name(n) if !dotted => PatternKind::Capture(n),
+            _ => PatternKind::Value(expr),
+        };
+        Ok(self.pattern(kind, start))
     }
 
     fn try_literal_pattern(&mut self) -> Result<Option<Pattern>, String> {
+        let start = self.pos;
         // Signed numbers, strings, True/False/None.
         if self.at_op("-") {
             self.advance();
             let e = self.parse_atom()?;
-            return Ok(Some(Pattern::Value(Expr::UnaryOp(UnOp::Neg, Box::new(e)))));
+            let neg = Expr::UnaryOp(UnOp::Neg, Box::new(e));
+            return Ok(Some(self.pattern(PatternKind::Value(neg), start)));
         }
         let lit = match self.cur().clone() {
             Tok::Int(_)
@@ -2350,10 +2354,11 @@ impl Parser {
             Tok::Name(n) if n == "None" || n == "True" || n == "False" => Some(self.parse_atom()?),
             _ => None,
         };
-        Ok(lit.map(Pattern::Value))
+        Ok(lit.map(|e| self.pattern(PatternKind::Value(e), start)))
     }
 
-    fn parse_sequence_pattern(&mut self, close: &str) -> Result<Pattern, String> {
+    /// The `[...]` after its `[` (token `start`), up to and including `close`.
+    fn parse_sequence_pattern(&mut self, close: &str, start: usize) -> Result<Pattern, String> {
         let mut elems = Vec::new();
         while !self.at_op(close) {
             elems.push(self.parse_pattern()?);
@@ -2362,11 +2367,45 @@ impl Parser {
             }
         }
         self.expect_op(close)?;
-        let star = elems.iter().position(|p| matches!(p, Pattern::Star(_)));
-        Ok(Pattern::Sequence { elems, star })
+        Ok(self.sequence_pattern(elems, start))
+    }
+
+    /// A sequence pattern over tokens `start` to the last one read.
+    fn sequence_pattern(&self, elems: Vec<Pattern>, start: usize) -> Pattern {
+        let star = elems.iter().position(|p| matches!(p.kind, PatternKind::Star(_)));
+        self.pattern(PatternKind::Sequence { elems, star }, start)
+    }
+
+    /// A pattern node over tokens `start` to the last one read.
+    fn pattern(&self, kind: PatternKind, start: usize) -> Pattern {
+        Pattern {
+            kind,
+            loc: self.loc(start, self.pos - 1),
+        }
+    }
+
+    /// The [`Loc`] of tokens `from..=to`, as CPython's AST records a node
+    /// built over them.
+    fn loc(&self, from: usize, to: usize) -> Loc {
+        let (a, b) = (&self.toks[from], &self.toks[to]);
+        Loc {
+            lineno: a.line,
+            col_offset: self.byte_col(a.line, a.col),
+            end_lineno: b.line,
+            end_col_offset: self.byte_col(b.line, b.end_col),
+        }
+    }
+
+    /// Character column `col` of `line` as a UTF-8 byte column.
+    fn byte_col(&self, line: u32, col: u32) -> u32 {
+        match (line as usize).checked_sub(1).and_then(|i| self.lines.get(i)) {
+            Some(text) => text.chars().take(col as usize).map(|c| c.len_utf8() as u32).sum(),
+            None => col,
+        }
     }
 
     fn parse_mapping_pattern(&mut self) -> Result<Pattern, String> {
+        let start = self.pos;
         self.advance(); // {
         let mut keys = Vec::new();
         let mut rest = None;
@@ -2386,10 +2425,11 @@ impl Parser {
             }
         }
         self.expect_op("}")?;
-        Ok(Pattern::Mapping { keys, rest })
+        Ok(self.pattern(PatternKind::Mapping { keys, rest }, start))
     }
 
-    fn parse_class_pattern(&mut self, cls: Expr) -> Result<Pattern, String> {
+    /// `Cls(...)` after the class name, whose first token is `start`.
+    fn parse_class_pattern(&mut self, cls: Expr, start: usize) -> Result<Pattern, String> {
         self.expect_op("(")?;
         let mut pos = Vec::new();
         let mut kw = Vec::new();
@@ -2427,7 +2467,7 @@ impl Parser {
             return Err(self.err_span("positional patterns follow keyword patterns", first, last));
         }
         self.expect_op(")")?;
-        Ok(Pattern::Class { cls, pos, kw })
+        Ok(self.pattern(PatternKind::Class { cls, pos, kw }, start))
     }
 
     fn parse_raise(&mut self, out: &mut Vec<Stmt>, line: u32) -> Result<(), String> {

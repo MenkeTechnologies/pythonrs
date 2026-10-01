@@ -54,7 +54,8 @@
 //! body with `N`.
 
 use crate::ast::{
-    Comprehension, ExceptHandler, Expr, FStrPart, Keyword, MatchCase, Params, Pattern, Stmt,
+    Comprehension, ExceptHandler, Expr, FStrPart, Keyword, MatchCase, Params, Pattern, PatternKind,
+    Stmt,
     StmtKind, WithItem,
 };
 
@@ -331,27 +332,27 @@ fn parameters(class: &str, p: &mut Params) {
 }
 
 fn pat(class: &str, p: &mut Pattern) {
-    match p {
-        Pattern::Wildcard => {}
-        Pattern::Capture(n) => fix(class, n),
-        Pattern::Value(e) => expr(class, e),
-        Pattern::Or(ps) => {
+    match &mut p.kind {
+        PatternKind::Wildcard => {}
+        PatternKind::Capture(n) => fix(class, n),
+        PatternKind::Value(e) => expr(class, e),
+        PatternKind::Or(ps) => {
             for q in ps {
                 pat(class, q);
             }
         }
-        Pattern::As(inner, n) => {
+        PatternKind::As(inner, n) => {
             pat(class, inner);
             fix(class, n);
         }
-        Pattern::Sequence { elems, .. } => {
+        PatternKind::Sequence { elems, .. } => {
             for q in elems {
                 pat(class, q);
             }
         }
-        Pattern::Star(Some(n)) => fix(class, n),
-        Pattern::Star(None) => {}
-        Pattern::Mapping { keys, rest } => {
+        PatternKind::Star(Some(n)) => fix(class, n),
+        PatternKind::Star(None) => {}
+        PatternKind::Mapping { keys, rest } => {
             for (k, q) in keys {
                 expr(class, k);
                 pat(class, q);
@@ -360,7 +361,7 @@ fn pat(class: &str, p: &mut Pattern) {
                 fix(class, n);
             }
         }
-        Pattern::Class { cls, pos, kw } => {
+        PatternKind::Class { cls, pos, kw } => {
             expr(class, cls);
             for q in pos {
                 pat(class, q);

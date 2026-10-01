@@ -694,6 +694,57 @@ for s in cases:
     );
 }
 
+/// The compiler's pattern-matching errors, raised at the node CPython's
+/// `codegen_pattern_*` passes to `_PyCompile_Error`: `offset`/`end_offset` are
+/// UTF-8 byte columns plus one (`'éé'` counts four), and `args` carries the
+/// position tuple with no text.
+#[test]
+fn pattern_errors_are_positioned_at_the_offending_pattern() {
+    let out = Command::new(env!("CARGO_BIN_EXE_python"))
+        .args([
+            "-c",
+            r#"cases = [
+    "match x:\n case a | b:\n  pass",
+    "match x:\n case _:\n  pass\n case 1:\n  pass",
+    "match x:\n case [a, a]: pass",
+    "match x:\n case {'k': a, **a}: pass",
+    "match x:\n case (a as b) | c: pass",
+    "match x:\n case [1, *a] as a: pass",
+    "match x:\n case C(a=1, a=2): pass",
+    "match x:\n case {'k': 1, 'k': 2}: pass",
+    "match x:\n case {\n 1: a,\n 1: b}: pass",
+    "match x:\n case [1, a] | [b, 2]: pass",
+    "match x:\n case a, b, a,: pass",
+    "match x:\n case ('\u00e9\u00e9', a, a): pass",
+]
+for s in cases:
+    try:
+        exec(s)
+        print(repr(s), "ok")
+    except SyntaxError as e:
+        print(repr(s), e.args, e.lineno, e.offset, e.end_lineno, e.end_offset)
+"#,
+        ])
+        .output()
+        .expect("spawn python");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        r#"'match x:\n case a | b:\n  pass' ("name capture 'a' makes remaining patterns unreachable", ('<string>', 2, 7, None, 2, 8)) 2 7 2 8
+'match x:\n case _:\n  pass\n case 1:\n  pass' ('wildcard makes remaining patterns unreachable', ('<string>', 2, 7, None, 2, 8)) 2 7 2 8
+'match x:\n case [a, a]: pass' ("multiple assignments to name 'a' in pattern", ('<string>', 2, 11, None, 2, 12)) 2 11 2 12
+"match x:\n case {'k': a, **a}: pass" ("multiple assignments to name 'a' in pattern", ('<string>', 2, 7, None, 2, 20)) 2 7 2 20
+'match x:\n case (a as b) | c: pass' ("name capture 'a' makes remaining patterns unreachable", ('<string>', 2, 8, None, 2, 9)) 2 8 2 9
+'match x:\n case [1, *a] as a: pass' ("multiple assignments to name 'a' in pattern", ('<string>', 2, 7, None, 2, 19)) 2 7 2 19
+'match x:\n case C(a=1, a=2): pass' ('attribute name repeated in class pattern: a', ('<string>', 2, 16, None, 2, 17)) 2 16 2 17
+"match x:\n case {'k': 1, 'k': 2}: pass" ("mapping pattern checks duplicate key ('k')", ('<string>', 2, 7, None, 2, 23)) 2 7 2 23
+'match x:\n case {\n 1: a,\n 1: b}: pass' ('mapping pattern checks duplicate key (1)', ('<string>', 2, 7, None, 4, 7)) 2 7 4 7
+'match x:\n case [1, a] | [b, 2]: pass' ('alternative patterns bind different names', ('<string>', 2, 7, None, 2, 22)) 2 7 2 22
+'match x:\n case a, b, a,: pass' ("multiple assignments to name 'a' in pattern", ('<string>', 2, 13, None, 2, 14)) 2 13 2 14
+"match x:\n case ('éé', a, a): pass" ("multiple assignments to name 'a' in pattern", ('<string>', 2, 19, None, 2, 20)) 2 19 2 20
+"#
+    );
+}
+
 /// PEP 758 (3.14): `except A, B:` and `except* A, B:` catch any of the listed
 /// types without parentheses (a trailing comma allowed), while `as` still
 /// requires them — CPython's `multiple exception types must be parenthesized

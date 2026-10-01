@@ -3964,14 +3964,14 @@ impl Compiler {
         pat: &Pattern,
         fails: &mut Vec<usize>,
     ) -> Result<(), String> {
-        match pat {
-            Pattern::Wildcard => {
+        match &pat.kind {
+            PatternKind::Wildcard => {
                 b.emit(Op::Pop, 0);
             }
-            Pattern::Capture(name) => {
+            PatternKind::Capture(name) => {
                 self.compile_assign(b, &Expr::Name(name.clone()))?;
             }
-            Pattern::Value(e) => {
+            PatternKind::Value(e) => {
                 self.compile_expr(b, e)?; // [v, e]
                                           // Singleton patterns (None/True/False) match by identity (`is`),
                                           // every other literal/value pattern by equality (`==`) — PEP 634.
@@ -3983,13 +3983,13 @@ impl Compiler {
                 let jf = b.emit(Op::JumpIfFalse(0), 0);
                 fails.push(jf);
             }
-            Pattern::As(inner, name) => {
+            PatternKind::As(inner, name) => {
                 // Bind name to the whole value, then re-match inner against it.
                 self.compile_assign(b, &Expr::Name(name.clone()))?;
                 self.load_local(b, name);
                 self.compile_pattern(b, inner, fails)?;
             }
-            Pattern::Or(alts) => {
+            PatternKind::Or(alts) => {
                 let orv = format!(".or{}", self.tmp);
                 self.tmp += 1;
                 self.store_name(b, &orv);
@@ -4010,18 +4010,18 @@ impl Compiler {
                     b.patch_jump(j, after);
                 }
             }
-            Pattern::Star(_) => {
+            PatternKind::Star(_) => {
                 // A bare star is only meaningful inside a sequence pattern, which
                 // handles it directly; reaching here means a stray value.
                 b.emit(Op::Pop, 0);
             }
-            Pattern::Sequence { elems, star } => {
+            PatternKind::Sequence { elems, star } => {
                 self.compile_seq_pattern(b, elems, *star, fails)?;
             }
-            Pattern::Mapping { keys, rest } => {
+            PatternKind::Mapping { keys, rest } => {
                 self.compile_map_pattern(b, keys, rest, fails)?;
             }
-            Pattern::Class { cls, pos, kw } => {
+            PatternKind::Class { cls, pos, kw } => {
                 self.compile_class_pattern(b, cls, pos, kw, fails)?;
             }
         }
@@ -4048,11 +4048,11 @@ impl Compiler {
             self.load_local(b, &seqv);
             b.emit(Op::LoadInt(k as i64), 0);
             b.emit(Op::CallBuiltin(ops::GETITEM, 2), 0); // [element]
-            match sub {
-                Pattern::Star(Some(name)) => {
+            match &sub.kind {
+                PatternKind::Star(Some(name)) => {
                     self.compile_assign(b, &Expr::Name(name.clone()))?;
                 }
-                Pattern::Star(None) => {
+                PatternKind::Star(None) => {
                     b.emit(Op::Pop, 0);
                 }
                 _ => self.compile_pattern(b, sub, fails)?,
@@ -4154,47 +4154,59 @@ impl Compiler {
 /// A sub-pattern of a sequence/mapping/class pattern resets it to true
 /// (CPython's `compiler_pattern_subpattern`): the surrounding pattern is what
 /// can fail, so `case [x]` binds `x` without shadowing anything.
+///
+/// Each error is raised at the node CPython's `codegen_pattern_*` passes to
+/// `_PyCompile_Error` (see [`pattern_error`]): the irrefutable capture or
+/// wildcard itself, the node that binds a name a second time (the whole
+/// mapping pattern for its `**rest`), the whole mapping pattern for a
+/// duplicate key, the sub-pattern of a repeated class keyword, and the whole
+/// or-pattern for alternatives that bind different names.
 fn validate_pattern(
     pat: &Pattern,
     bound: &mut Vec<String>,
     allow_irrefutable: bool,
 ) -> Result<(), String> {
-    match pat {
-        Pattern::Value(_) | Pattern::Star(None) => Ok(()),
-        Pattern::Wildcard => {
+    match &pat.kind {
+        PatternKind::Value(_) | PatternKind::Star(None) => Ok(()),
+        PatternKind::Wildcard => {
             if !allow_irrefutable {
-                return Err(
-                    "SyntaxError: wildcard makes remaining patterns unreachable".to_string()
-                );
+                return Err(pattern_error(
+                    "wildcard makes remaining patterns unreachable",
+                    pat.loc,
+                ));
             }
             Ok(())
         }
-        Pattern::Capture(name) => {
+        PatternKind::Capture(name) => {
             if !allow_irrefutable {
-                return Err(format!(
-                    "SyntaxError: name capture '{name}' makes remaining patterns unreachable"
+                return Err(pattern_error(
+                    &format!("name capture '{name}' makes remaining patterns unreachable"),
+                    pat.loc,
                 ));
             }
-            bind_pattern_name(name, bound)
+            bind_pattern_name(name, pat.loc, bound)
         }
-        Pattern::Star(Some(name)) => bind_pattern_name(name, bound),
-        Pattern::As(inner, name) => {
+        PatternKind::Star(Some(name)) => bind_pattern_name(name, pat.loc, bound),
+        PatternKind::As(inner, name) => {
             validate_pattern(inner, bound, allow_irrefutable)?;
-            bind_pattern_name(name, bound)
+            bind_pattern_name(name, pat.loc, bound)
         }
-        Pattern::Sequence { elems, .. } => {
+        PatternKind::Sequence { elems, .. } => {
             for e in elems {
                 validate_pattern(e, bound, true)?;
             }
             Ok(())
         }
-        Pattern::Mapping { keys, rest } => {
+        PatternKind::Mapping { keys, rest } => {
             for i in 0..keys.len() {
                 for j in 0..i {
                     if keys[i].0 == keys[j].0 {
-                        return Err(format!(
-                            "SyntaxError: mapping pattern checks duplicate key ({})",
-                            pattern_key_repr(&keys[i].0)
+                        return Err(pattern_error(
+                            &format!(
+                                "mapping pattern checks duplicate key ({})",
+                                pattern_key_repr(&keys[i].0)
+                            ),
+                            pat.loc,
                         ));
                     }
                 }
@@ -4203,17 +4215,17 @@ fn validate_pattern(
                 validate_pattern(p, bound, true)?;
             }
             if let Some(r) = rest {
-                bind_pattern_name(r, bound)?;
+                bind_pattern_name(r, pat.loc, bound)?;
             }
             Ok(())
         }
-        Pattern::Class { pos, kw, .. } => {
+        PatternKind::Class { pos, kw, .. } => {
             for i in 0..kw.len() {
                 for j in 0..i {
                     if kw[i].0 == kw[j].0 {
-                        return Err(format!(
-                            "SyntaxError: attribute name repeated in class pattern: {}",
-                            kw[i].0
+                        return Err(pattern_error(
+                            &format!("attribute name repeated in class pattern: {}", kw[i].0),
+                            kw[i].1.loc,
                         ));
                     }
                 }
@@ -4226,7 +4238,7 @@ fn validate_pattern(
             }
             Ok(())
         }
-        Pattern::Or(alts) => {
+        PatternKind::Or(alts) => {
             // Each alternative must bind an identical set of names. Only the
             // LAST alternative may be irrefutable, and only if the or-pattern
             // itself sits in a position that allows one — CPython validates each
@@ -4243,7 +4255,10 @@ fn validate_pattern(
                 match &expected {
                     None => expected = Some(added),
                     Some(exp) if *exp != added => {
-                        return Err("SyntaxError: alternative patterns bind different names".into())
+                        return Err(pattern_error(
+                            "alternative patterns bind different names",
+                            pat.loc,
+                        ))
                     }
                     _ => {}
                 }
@@ -4256,14 +4271,32 @@ fn validate_pattern(
     }
 }
 
-fn bind_pattern_name(name: &str, bound: &mut Vec<String>) -> Result<(), String> {
+fn bind_pattern_name(name: &str, loc: Loc, bound: &mut Vec<String>) -> Result<(), String> {
     if bound.iter().any(|n| n == name) {
-        return Err(format!(
-            "SyntaxError: multiple assignments to name '{name}' in pattern"
+        return Err(pattern_error(
+            &format!("multiple assignments to name '{name}' in pattern"),
+            loc,
         ));
     }
     bound.push(name.to_string());
     Ok(())
+}
+
+/// A compiler `SyntaxError` at `loc`, as `_PyCompile_Error` raises it: `offset`
+/// and `end_offset` are the node's UTF-8 byte columns plus one, and no source
+/// text is attached (`text` is read back from the file only when one exists).
+fn pattern_error(msg: &str, loc: Loc) -> String {
+    format!(
+        "{}{}nosrc=1",
+        crate::parser::at_pos(
+            &format!("SyntaxError: {msg}"),
+            loc.lineno,
+            loc.col_offset as i64 + 1,
+            loc.end_lineno,
+            loc.end_col_offset as i64 + 1,
+        ),
+        crate::parser::SYNTAX_FIELD
+    )
 }
 
 /// CPython-style repr of a mapping-pattern key for the duplicate-key error.

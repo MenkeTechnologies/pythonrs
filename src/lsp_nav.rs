@@ -15,7 +15,7 @@
 
 use std::collections::HashSet;
 
-use crate::ast::{Expr, Params, Pattern, Stmt, StmtKind};
+use crate::ast::{Expr, Params, Pattern, PatternKind, Stmt, StmtKind};
 
 /// What introduced a binding, which decides where on its line the name sits.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -294,24 +294,24 @@ fn param_names(p: &Params) -> Vec<String> {
 
 /// The names a `case` pattern captures.
 fn pattern_names(p: &Pattern, out: &mut Vec<String>) {
-    match p {
-        Pattern::Capture(n) => out.push(n.clone()),
-        Pattern::As(inner, n) => {
+    match &p.kind {
+        PatternKind::Capture(n) => out.push(n.clone()),
+        PatternKind::As(inner, n) => {
             pattern_names(inner, out);
             out.push(n.clone());
         }
-        Pattern::Or(alts) => alts.iter().for_each(|a| pattern_names(a, out)),
-        Pattern::Sequence { elems, .. } => elems.iter().for_each(|e| pattern_names(e, out)),
-        Pattern::Star(Some(n)) => out.push(n.clone()),
-        Pattern::Mapping { keys, rest } => {
+        PatternKind::Or(alts) => alts.iter().for_each(|a| pattern_names(a, out)),
+        PatternKind::Sequence { elems, .. } => elems.iter().for_each(|e| pattern_names(e, out)),
+        PatternKind::Star(Some(n)) => out.push(n.clone()),
+        PatternKind::Mapping { keys, rest } => {
             keys.iter().for_each(|(_, v)| pattern_names(v, out));
             out.extend(rest.iter().cloned());
         }
-        Pattern::Class { pos, kw, .. } => {
+        PatternKind::Class { pos, kw, .. } => {
             pos.iter().for_each(|q| pattern_names(q, out));
             kw.iter().for_each(|(_, q)| pattern_names(q, out));
         }
-        Pattern::Wildcard | Pattern::Value(_) | Pattern::Star(None) => {}
+        PatternKind::Wildcard | PatternKind::Value(_) | PatternKind::Star(None) => {}
     }
 }
 

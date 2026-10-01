@@ -326,25 +326,25 @@ impl Table {
     }
 
     fn pattern(&mut self, p: &Pattern, b: &mut Block) -> Result<(), String> {
-        match p {
-            Pattern::Wildcard | Pattern::Star(None) => {}
-            Pattern::Capture(n) | Pattern::Star(Some(n)) => b.add(n, LOCAL),
-            Pattern::Value(e) => self.expr(e, b)?,
-            Pattern::Or(alts) => {
+        match &p.kind {
+            PatternKind::Wildcard | PatternKind::Star(None) => {}
+            PatternKind::Capture(n) | PatternKind::Star(Some(n)) => b.add(n, LOCAL),
+            PatternKind::Value(e) => self.expr(e, b)?,
+            PatternKind::Or(alts) => {
                 for a in alts {
                     self.pattern(a, b)?;
                 }
             }
-            Pattern::As(inner, n) => {
+            PatternKind::As(inner, n) => {
                 self.pattern(inner, b)?;
                 b.add(n, LOCAL);
             }
-            Pattern::Sequence { elems, .. } => {
+            PatternKind::Sequence { elems, .. } => {
                 for e in elems {
                     self.pattern(e, b)?;
                 }
             }
-            Pattern::Mapping { keys, rest } => {
+            PatternKind::Mapping { keys, rest } => {
                 for (k, v) in keys {
                     self.expr(k, b)?;
                     self.pattern(v, b)?;
@@ -353,7 +353,7 @@ impl Table {
                     b.add(r, LOCAL);
                 }
             }
-            Pattern::Class { cls, pos, kw } => {
+            PatternKind::Class { cls, pos, kw } => {
                 self.expr(cls, b)?;
                 for p in pos {
                     self.pattern(p, b)?;

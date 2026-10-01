@@ -413,9 +413,29 @@ pub struct MatchCase {
     pub body: Vec<Stmt>,
 }
 
-/// A `match` pattern (PEP 634).
+/// A `match` pattern (PEP 634): its shape and where it sits in the source.
 #[derive(Debug, Clone, PartialEq)]
-pub enum Pattern {
+pub struct Pattern {
+    pub kind: PatternKind,
+    pub loc: Loc,
+}
+
+/// A node's extent as CPython's AST records it: 1-based lines and 0-based
+/// UTF-8 BYTE columns, end exclusive (`lineno`, `col_offset`, `end_lineno`,
+/// `end_col_offset`). The compiler raises its pattern `SyntaxError`s at this
+/// extent, and `compiler_error` reports `col_offset + 1` — a byte column — as
+/// the exception's `offset`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Loc {
+    pub lineno: u32,
+    pub col_offset: u32,
+    pub end_lineno: u32,
+    pub end_col_offset: u32,
+}
+
+/// The shape of a [`Pattern`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum PatternKind {
     /// `_` — matches anything, binds nothing.
     Wildcard,
     /// A capture name — matches anything, binds it.
