@@ -17,6 +17,14 @@ written.
   even neighbour of Rust's odd last digit and takes it when it round-trips.
   Agrees with CPython 3.14 on 99,991 doubles: random bit patterns, 20,000
   constructed ties, and the scientific-notation boundaries.
+- **`unexpected unindent`.** A block whose body is only a decorator (`try:` +
+  `    @dataclass`, then a dedent or the end of input) reported an unpositioned
+  `SyntaxError: invalid syntax`; pegen's generic failure on a DEDENT token is
+  `IndentationError: unexpected unindent`, positioned at the next statement's
+  indentation or just past the end of the last line. A decorator followed
+  by an indented line is `unexpected indent` the same way. A trailing run of blank
+  lines still moves CPython's position onto the last blank line, which this
+  does not follow.
 - **A dedent matching no outer level wins over the parse error after it.**
   `try:` / `if 1:` with a body indented 8 and a following line at 4 reported
   `SyntaxError: expected 'except' or 'finally' block` (or no caret): the

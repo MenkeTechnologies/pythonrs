@@ -32,6 +32,34 @@ IndentationError: unindent does not match any outer indentation level
 "#,
         1,
     ),
+    // A decorator that a dedent follows instead of a `def`/`class`: pegen's
+    // generic failure on a DEDENT is `unexpected unindent`, positioned past the
+    // line's end at the end of input, at the next statement's indent otherwise.
+    (
+        "try:\n    @dataclass",
+        r#"  File "<string>", line 2
+    @dataclass
+              ^
+IndentationError: unexpected unindent
+"#,
+        1,
+    ),
+    (
+        "try:\n    @d\nx=1",
+        r#"  File "<string>", line 3
+    x=1
+IndentationError: unexpected unindent
+"#,
+        1,
+    ),
+    (
+        "@dataclass\n    y: int",
+        r#"  File "<string>", line 2
+    y: int
+IndentationError: unexpected indent
+"#,
+        1,
+    ),
     (
         "if 1:\n        y = 1\n    x",
         r#"  File "<string>", line 3

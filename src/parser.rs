@@ -581,7 +581,64 @@ impl Parser {
 
     /// A syntax error spanning the current token.
     fn err_here(&self, msg: &str) -> String {
+        if msg == "invalid syntax" {
+            match self.cur() {
+                Tok::Dedent => return self.unexpected_unindent(),
+                Tok::Indent => return self.unexpected_indent(),
+                _ => {}
+            }
+        }
         self.err_span(msg, self.pos, self.pos)
+    }
+
+    /// `IndentationError: unexpected indent` for the INDENT token at `pos`: a
+    /// stray indent at a statement boundary, and pegen's generic failure on an
+    /// INDENT (`@dec` followed by an indented line). CPython's position is the
+    /// indentation's WIDTH (so one short of the first character's 1-based
+    /// column) and an end of -1.
+    fn unexpected_indent(&self) -> String {
+        let first = &self.toks[(self.pos + 1).min(self.toks.len() - 1)];
+        at_pos(
+            "IndentationError: unexpected indent",
+            first.line,
+            first.col as i64,
+            first.line,
+            -1,
+        )
+    }
+
+    /// pegen's generic failure on a DEDENT token is `IndentationError:
+    /// unexpected unindent` rather than `invalid syntax` (`try:` whose body is
+    /// only a decorator). A dedent before a statement is positioned at that
+    /// statement's indentation width; one at the end of the input just past
+    /// the end of the last line. The end offset is -1.
+    fn unexpected_unindent(&self) -> String {
+        let next = self.toks[self.pos..]
+            .iter()
+            .find(|t| !matches!(t.tok, Tok::Dedent))
+            .filter(|t| !matches!(t.tok, Tok::Eof));
+        let (line, offset) = match next {
+            Some(t) => (t.line, t.col as i64),
+            None => {
+                // A stream the tokenizer cut short at a bad dedent ends here:
+                // its deferred error is what CPython raises.
+                if let Some(d) = &self.deferred {
+                    return d.clone();
+                }
+                let nl = self.toks[..self.pos]
+                    .iter()
+                    .rev()
+                    .find(|t| !matches!(t.tok, Tok::Dedent | Tok::Indent));
+                nl.map_or((self.line(), 0), |t| (t.line, t.col as i64 + 1))
+            }
+        };
+        at_pos(
+            "IndentationError: unexpected unindent",
+            line,
+            offset,
+            line,
+            -1,
+        )
     }
 
     /// A syntax error spanning tokens `from..=to`, in CPython's terms: the
@@ -960,16 +1017,7 @@ impl Parser {
         // statement boundary is always stray — CPython's `IndentationError:
         // unexpected indent` (the line lives in the traceback's `File` header).
         if matches!(self.cur(), Tok::Indent) {
-            // CPython's position here is the indentation's WIDTH (so one short
-            // of the first character's 1-based column) and an end of -1.
-            let first = &self.toks[(self.pos + 1).min(self.toks.len() - 1)];
-            return Err(at_pos(
-                "IndentationError: unexpected indent",
-                first.line,
-                first.col as i64,
-                first.line,
-                -1,
-            ));
+            return Err(self.unexpected_indent());
         }
         if let Tok::Name(n) = self.cur().clone() {
             match n.as_str() {
@@ -1496,10 +1544,15 @@ impl Parser {
             // try after a decorator that no `def`/`class` follows, so it
             // reports the generic message. Checked against 3.14.6 for `@dec`
             // alone, `@dec` + a statement, and `@dec` + a blank line.
-            {
-                let _ = line;
-                Err("SyntaxError: invalid syntax".to_string())
+            // When a dedent is what follows, pegen's generic failure is
+            // `unexpected unindent` (`try:` whose body is only `@dec`).
+            match self.cur() {
+                Tok::Dedent => return Err(self.unexpected_unindent()),
+                Tok::Indent => return Err(self.unexpected_indent()),
+                _ => {}
             }
+            let _ = line;
+            Err("SyntaxError: invalid syntax".to_string())
         }
     }
 
