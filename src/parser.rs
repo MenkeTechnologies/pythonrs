@@ -543,6 +543,13 @@ impl Parser {
     /// records one line, so an expression continued onto another line stays
     /// unwrapped (and its error unpositioned).
     fn span_suspension(&self, e: Expr, start: usize) -> Expr {
+        self.span_from(e, start)
+    }
+
+    /// Wrap `e`, read from token `start` up to the last token consumed, with that
+    /// extent as its caret span. A span records one line, so an expression
+    /// continued onto another line is returned unwrapped.
+    fn span_from(&self, e: Expr, start: usize) -> Expr {
         let (first, last) = (&self.toks[start], &self.toks[self.pos.saturating_sub(1)]);
         if first.line != last.line {
             return e;
@@ -1150,6 +1157,18 @@ impl Parser {
                 value = Some(e);
             }
             self.check_assign_targets(&targets, &spans)?;
+            // A tuple/list target raises on a wrong item count, and CPython
+            // carets the whole target (`a, b = [1]` → `^^^^`). Parenthesized
+            // ones already carry a span; a bare `a, b` gets its token extent.
+            for (t, &(from, to)) in targets.iter_mut().zip(&spans) {
+                if matches!(t, Expr::Tuple(_) | Expr::List(_)) {
+                    let (a, b) = (&self.toks[from], &self.toks[to]);
+                    if a.line == b.line {
+                        let bare = std::mem::replace(t, Expr::Tuple(Vec::new()));
+                        *t = spanned(bare, a.line, a.col, b.end_col, 0, 0);
+                    }
+                }
+            }
             out.push(Stmt::new(
                 StmtKind::Assign {
                     targets,
@@ -1243,8 +1262,9 @@ impl Parser {
     /// Targets parse at postfix level so a trailing `in` is left for the `for`
     /// clause rather than being consumed as an `in` comparison.
     fn parse_target_tuple(&mut self) -> Result<Expr, String> {
+        let start = self.pos;
         let first = self.parse_target_atom()?;
-        if self.at_op(",") {
+        let target = if self.at_op(",") {
             let mut items = vec![first];
             while self.eat_op(",") {
                 if self.at_kw("in") || self.at_op("=") || self.at_op(":") {
@@ -1252,9 +1272,20 @@ impl Parser {
                 }
                 items.push(self.parse_target_atom()?);
             }
-            Ok(Expr::Tuple(items))
+            Expr::Tuple(items)
         } else {
-            Ok(first)
+            first
+        };
+        Ok(self.span_unpack_target(target, start))
+    }
+
+    /// An unpacking target (`a, b` / `(a, b)` / `[a, b]`) raises on a wrong
+    /// item count, and CPython carets the whole target, parentheses included
+    /// (`for a, b in …` → `^^^^`). Any other target is returned as it is.
+    fn span_unpack_target(&self, target: Expr, start: usize) -> Expr {
+        match target {
+            Expr::Tuple(_) | Expr::List(_) => self.span_from(target, start),
+            other => other,
         }
     }
 
@@ -1295,8 +1326,9 @@ impl Parser {
                 break false;
             };
             let vars = if self.eat_kw("as") {
+                let start = self.pos;
                 match self.parse_ternary() {
-                    Ok(v) => Some(v),
+                    Ok(v) => Some(self.span_unpack_target(v, start)),
                     Err(_) => break false,
                 }
             } else {
@@ -1323,7 +1355,9 @@ impl Parser {
                 loop {
                     let context = self.parse_expr()?;
                     let vars = if self.eat_kw("as") {
-                        Some(self.parse_ternary()?)
+                        let start = self.pos;
+                        let v = self.parse_ternary()?;
+                        Some(self.span_unpack_target(v, start))
                     } else {
                         None
                     };

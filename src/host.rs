@@ -2697,6 +2697,24 @@ impl Default for PyHost {
     }
 }
 
+/// Fold every list/set/dict comprehension frame into its caller, in a frame
+/// list ordered outermost-first. pythonrs runs a comprehension as a hidden
+/// `<comp>` function, but CPython 3.12+ inlines it (PEP 709): there is no frame
+/// for it, and the failing line and caret inside it belong to the enclosing
+/// frame. The caller keeps its name and takes the comprehension's position.
+fn inline_comprehension_frames(frames: &mut Vec<(String, u32, Span)>) {
+    let mut i = 1;
+    while i < frames.len() {
+        if frames[i].0 == "<comp>" {
+            let (_, line, span) = frames.remove(i);
+            frames[i - 1].1 = line;
+            frames[i - 1].2 = span;
+        } else {
+            i += 1;
+        }
+    }
+}
+
 impl PyHost {
     pub fn new() -> PyHost {
         let module_env = new_env(None);
@@ -3374,7 +3392,7 @@ impl PyHost {
 
     fn with_str_index<R>(&self, id: u32, s: &str, f: impl FnOnce(&StrIndex) -> R) -> R {
         let mut slot = self.str_index.borrow_mut();
-        if slot.as_ref().is_none_or(|ix| ix.id != id) {
+        if slot.as_ref().map_or(true, |ix| ix.id != id) {
             let offsets =
                 (!s.is_ascii()).then(|| s.char_indices().map(|(b, _)| b).collect::<Vec<_>>());
             let chars = offsets.as_ref().map_or(s.len(), Vec::len);
@@ -3488,6 +3506,7 @@ impl PyHost {
         for f in self.traceback.iter().rev() {
             tb.push(f.clone());
         }
+        inline_comprehension_frames(&mut tb);
         self.exc_tb.insert(*id, tb);
     }
     /// The call stack as (frame name, line) pairs, innermost first — for the DAP
@@ -16071,6 +16090,7 @@ impl PyHost {
         for f in self.traceback.iter().rev() {
             final_frames.push(f.clone());
         }
+        inline_comprehension_frames(&mut final_frames);
         // A group built by an `except*` reconstruction owns no frame of its own:
         // it came into being after the handler in the innermost frame finished,
         // so that frame is dropped and only its callers remain.
@@ -16632,7 +16652,12 @@ fn make_gen_kind(
         is_class_body: false,
         self_obj: self_val,
         owner: owner.clone(),
-        name: owner.map_or_else(|| Rc::from("<genexpr>"), |o| Rc::from(o.as_str())),
+        // A traceback names the frame by its code name (`g`, `<genexpr>`), the
+        // last part of the qualname — not the defining class.
+        name: Rc::from(match func_name.rsplit('.').next() {
+            Some(n) if !n.is_empty() => n,
+            _ => "<genexpr>",
+        }),
         line: 0,
         span: Span::NONE,
     };
@@ -16965,9 +16990,18 @@ pub fn gen_throw(gen: &Value, exc: Value) -> Result<Option<Value>, String> {
 ///
 /// The original is kept as `__cause__`, as CPython does, so the traceback still
 /// shows where it came from.
-fn pep479_replace(e: String) -> String {
-    if e != "StopIteration" && !e.starts_with("StopIteration:") && !e.starts_with("StopIteration\n")
-    {
+/// Whether an abort string is a `StopIteration` escaping a generator body — the
+/// case PEP 479 turns into a `RuntimeError`.
+fn is_stop_iteration_abort(e: &str) -> bool {
+    e == "StopIteration" || e.starts_with("StopIteration:") || e.starts_with("StopIteration\n")
+}
+
+/// PEP 479: a `StopIteration` escaping a generator body becomes `RuntimeError:
+/// generator raised StopIteration`, chained from it. `stop_tb` is the
+/// `StopIteration`'s own traceback (the generator's frames, outermost-first);
+/// the `RuntimeError` starts at the resumer, as in CPython.
+fn pep479_replace(e: String, stop_tb: Option<Vec<(String, u32, Span)>>) -> String {
+    if !is_stop_iteration_abort(&e) {
         return e;
     }
     with_host(|h| {
@@ -16999,6 +17033,9 @@ fn pep479_replace(e: String) -> String {
             class: "RuntimeError".into(),
             args: vec![msg],
         });
+        if let (Value::Obj(cid), Some(tb)) = (&cause, stop_tb) {
+            h.exc_tb.insert(*cid, tb);
+        }
         h.set_exc_link(&rt, cause, Value::Undef);
         h.exc = Some(rt);
     });
@@ -17024,6 +17061,27 @@ pub fn gen_resume(gen: &Value, send: Value) -> Result<Option<Value>, String> {
 
     let out = coro.resume(send); // no host borrow held; body drives its own VM
 
+    // An exception escaping the body unwinds past the generator's own frame, so
+    // the traceback names it (`File …, line N, in g` / `in <genexpr>`) between
+    // the frames it called and the resumer — captured while the generator's
+    // frame stack is still the installed one. A `StopIteration` keeps those
+    // frames for itself: PEP 479 replaces it, and the replacement's traceback
+    // starts at the resumer.
+    let mut stop_tb = None;
+    if let corosensei::CoroutineResult::Return(Err(e)) = &out {
+        with_host(|h| {
+            if is_stop_iteration_abort(e) {
+                let mut tb: Vec<(String, u32, Span)> = Vec::new();
+                if let Some(f) = h.frames.last() {
+                    tb.push((f.name.to_string(), f.line, f.span));
+                }
+                tb.extend(h.traceback.drain(..).rev());
+                stop_tb = Some(tb);
+            } else {
+                h.push_tb_frame();
+            }
+        });
+    }
     CUR_GEN.with(|c| c.set(prev));
     let gen_ctx = with_host(|h| h.install_gen_ctx(caller_ctx));
     with_host(|h| {
@@ -17037,7 +17095,7 @@ pub fn gen_resume(gen: &Value, send: Value) -> Result<Option<Value>, String> {
             with_host(|h| h.generators[id as usize].done = true);
             match r {
                 Ok(_) => Ok(None),
-                Err(e) => Err(pep479_replace(e)),
+                Err(e) => Err(pep479_replace(e, stop_tb)),
             }
         }
     }

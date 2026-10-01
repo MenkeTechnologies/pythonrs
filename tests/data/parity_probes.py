@@ -1343,3 +1343,27 @@ def h4(*, k): pass
 for fn in (h, h3, h4):
     c = fn.__code__
     print(c.co_varnames, c.co_flags & 0xF, c.co_nlocals, c.co_argcount, c.co_kwonlyargcount)
+#==#
+# ── a `yield` nested in an expression makes a generator ─────────────────────
+def g1():
+    print((yield 1) + 1)
+    d = {'k': (yield 2)}
+    raise ValueError((yield d))
+gen = g1()
+print(next(gen), gen.send(5), gen.send('v'))
+try:
+    gen.send('payload')
+except ValueError as e:
+    print('VE', e)
+#==#
+# ── a comprehension has no frame of its own (PEP 709) ───────────────────────
+def f(xs):
+    return [x.z for x in xs]
+f([1])
+#==#
+# ── a generator's frame is in the traceback; `for` advances on its iterable ─
+def g(n):
+    yield 1
+    yield 1 / n
+for v in g(0):
+    pass

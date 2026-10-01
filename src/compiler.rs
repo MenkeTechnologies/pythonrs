@@ -780,7 +780,10 @@ impl Compiler {
         // stack [iterable] -> UNPACK pushes items with items[0] on top.
         b.emit(Op::LoadInt(items.len() as i64), 0);
         b.emit(Op::LoadInt(star_idx), 0);
-        b.emit(Op::CallBuiltin(ops::UNPACK, 3), 0);
+        // A wrong item count raises here, so the op carries the line and the
+        // target's span (`a, b = [1]` carets `a, b`), as CPython's UNPACK_SEQUENCE.
+        let op = b.emit(Op::CallBuiltin(ops::UNPACK, 3), self.cur_line);
+        self.record_span(op);
         for t in items {
             self.compile_assign(b, t)?;
         }
@@ -801,7 +804,9 @@ impl Compiler {
         match target {
             Expr::Name(n) => {
                 self.name_const(b, n);
-                b.emit(Op::CallBuiltin(ops::DELNAME, 1), 0);
+                // An unbound name raises `NameError` here, caret on the name.
+                let op = b.emit(Op::CallBuiltin(ops::DELNAME, 1), self.cur_line);
+                self.record_span(op);
                 b.emit(Op::Pop, 0);
             }
             Expr::Subscript(recv, idx) => {
@@ -1697,9 +1702,25 @@ impl Compiler {
         orelse: &[Stmt],
     ) -> Result<(), String> {
         let bound_target = self.bind_loop_target(target);
-        let r = self.compile_for_inner(b, target, iter, body, orelse);
+        // The body is compiled before the iteration ops in some lowerings and
+        // moves `cur_line`; those ops belong to the `for` line.
+        let line = self.cur_line;
+        let r = self.compile_for_inner(b, target, iter, body, orelse, line);
         self.unbind_loop_target(bound_target);
         r
+    }
+
+    /// Emit a `for` loop's `GETITER` / `FORITER` op. Either one raises (`for x
+    /// in 5`, an exception from `__next__` or a generator body), and CPython
+    /// positions both on the iterable expression of the `for` line.
+    fn emit_loop_iter_op(&mut self, b: &mut ChunkBuilder, op: Op, iter: &Expr, line: u32) -> usize {
+        let idx = b.emit(op, line);
+        if let Expr::Spanned(_, sp) = iter {
+            let prev = std::mem::replace(&mut self.node_span, *sp);
+            self.record_span(idx);
+            self.node_span = prev;
+        }
+        idx
     }
 
     fn compile_for_inner(
@@ -1709,6 +1730,7 @@ impl Compiler {
         iter: &Expr,
         body: &[Stmt],
         orelse: &[Stmt],
+        line: u32,
     ) -> Result<(), String> {
         // Fast path: a `for i in range(...)` whose body is slot-safe integer
         // arithmetic lowers to a native counted loop (fusevm slots + Add/Sub/Mul),
@@ -1733,12 +1755,12 @@ impl Compiler {
             }
         }
         if loop_needs_signal(body) {
-            return self.compile_for_signal(b, target, iter, body, orelse);
+            return self.compile_for_signal(b, target, iter, body, orelse, line);
         }
         self.compile_expr(b, iter)?;
-        b.emit(Op::CallBuiltin(ops::GETITER, 1), 0); // [iterator]
+        self.emit_loop_iter_op(b, Op::CallBuiltin(ops::GETITER, 1), iter, line); // [iterator]
         let start = b.current_pos();
-        b.emit(Op::CallBuiltin(ops::FORITER, 0), 0); // [iterator, value, has_next]
+        self.emit_loop_iter_op(b, Op::CallBuiltin(ops::FORITER, 0), iter, line); // [iterator, value, has_next]
         let jdone = b.emit(Op::JumpIfFalse(0), 0); // pops has_next
                                                    // [iterator, value] — assign to target.
         self.compile_assign(b, target)?; // pops value -> [iterator]
@@ -1845,12 +1867,13 @@ impl Compiler {
         iter: &Expr,
         body: &[Stmt],
         orelse: &[Stmt],
+        line: u32,
     ) -> Result<(), String> {
         let id = self.register_loop_body(body)?;
         self.compile_expr(b, iter)?;
-        b.emit(Op::CallBuiltin(ops::GETITER, 1), 0); // [iterator]
+        self.emit_loop_iter_op(b, Op::CallBuiltin(ops::GETITER, 1), iter, line); // [iterator]
         let start = b.current_pos();
-        b.emit(Op::CallBuiltin(ops::FORITER, 0), 0); // [iterator, value, has_next] | [iterator, false]
+        self.emit_loop_iter_op(b, Op::CallBuiltin(ops::FORITER, 0), iter, line); // [iterator, value, has_next] | [iterator, false]
         let jdone = b.emit(Op::JumpIfFalse(0), 0); // pops has_next
         self.compile_assign(b, target)?; // pops value -> [iterator]
         b.emit(Op::LoadInt(id as i64), 0);
@@ -1985,7 +2008,14 @@ impl Compiler {
                 b.emit(Op::LoadUndef, 0);
             }
         }
-        b.emit(Op::CallBuiltin(ops::ASSERT_FAIL, 1), 0);
+        // The raise carries the statement's line and the TEST's span: CPython
+        // carets the asserted expression, not the message.
+        let op = b.emit(Op::CallBuiltin(ops::ASSERT_FAIL, 1), self.cur_line);
+        if let Expr::Spanned(_, sp) = test {
+            let prev = std::mem::replace(&mut self.node_span, *sp);
+            self.record_span(op);
+            self.node_span = prev;
+        }
         let ok = b.current_pos();
         b.patch_jump(jok, ok);
         Ok(())
@@ -2882,7 +2912,12 @@ impl Compiler {
                 }
                 // YIELDV suspends and leaves the value sent by `.send()`/`next`
                 // on the stack (None for plain iteration).
-                b.emit(Op::CallBuiltin(ops::YIELDV, 1), 0);
+                // A `.throw()` / `.close()` raises AT this yield, so it carries the
+                // line and the yield's span.
+                let op = b.emit(Op::CallBuiltin(ops::YIELDV, 1), self.cur_line);
+                let prev = std::mem::replace(&mut self.node_span, sp);
+                self.record_span(op);
+                self.node_span = prev;
             }
             Expr::YieldFrom(inner) => {
                 let sp = std::mem::take(&mut self.suspend_span);
@@ -5347,15 +5382,55 @@ fn docstring(body: &[Stmt]) -> Option<String> {
     }
 }
 
+/// Whether `s` makes its enclosing function a generator: a `yield` /
+/// `yield from` ANYWHERE in the function's own scope, as CPython's symbol table
+/// decides it — inside a call argument (`print((yield))`), an operand
+/// (`(yield) + 1`), a condition, an iterable, a `with` item. A nested
+/// `def`/`class` body is its own scope; only what the enclosing scope evaluates
+/// for it (decorators, defaults, bases) counts.
 fn stmt_has_yield(s: &Stmt) -> bool {
+    let any = |es: &[Expr]| es.iter().any(expr_has_yield);
+    let opt = |e: &Option<Expr>| e.as_ref().is_some_and(expr_has_yield);
     match &s.kind {
-        StmtKind::Expr(e) | StmtKind::Return(Some(e)) => expr_has_yield(e),
-        StmtKind::Assign { value, .. } => expr_has_yield(value),
-        StmtKind::AugAssign { value, .. } => expr_has_yield(value),
-        StmtKind::If { body, orelse, .. } => body_has_yield(body) || body_has_yield(orelse),
-        StmtKind::While { body, orelse, .. } => body_has_yield(body) || body_has_yield(orelse),
-        StmtKind::For { body, orelse, .. } => body_has_yield(body) || body_has_yield(orelse),
-        StmtKind::With { body, .. } => body_has_yield(body),
+        StmtKind::Expr(e) => expr_has_yield(e),
+        StmtKind::Return(e) => opt(e),
+        StmtKind::Assign { targets, value } => any(targets) || expr_has_yield(value),
+        StmtKind::AugAssign { target, value, .. } => {
+            expr_has_yield(target) || expr_has_yield(value)
+        }
+        StmtKind::AnnAssign { target, value, .. } => expr_has_yield(target) || opt(value),
+        StmtKind::If { test, body, orelse } | StmtKind::While { test, body, orelse } => {
+            expr_has_yield(test) || body_has_yield(body) || body_has_yield(orelse)
+        }
+        StmtKind::For {
+            target,
+            iter,
+            body,
+            orelse,
+            ..
+        } => {
+            expr_has_yield(target)
+                || expr_has_yield(iter)
+                || body_has_yield(body)
+                || body_has_yield(orelse)
+        }
+        StmtKind::With { items, body, .. } => {
+            items
+                .iter()
+                .any(|it| expr_has_yield(&it.context) || opt(&it.vars))
+                || body_has_yield(body)
+        }
+        StmtKind::FuncDef {
+            params, decorators, ..
+        } => any(decorators) || any(&params.defaults) || params.kwonly_defaults.iter().any(opt),
+        StmtKind::ClassDef {
+            bases,
+            keywords,
+            decorators,
+            ..
+        } => any(bases) || any(decorators) || keywords.iter().any(|k| expr_has_yield(&k.value)),
+        StmtKind::Delete(targets) => any(targets),
+        StmtKind::Raise { exc, cause } => opt(exc) || opt(cause),
         StmtKind::Try {
             body,
             handlers,
@@ -5365,15 +5440,41 @@ fn stmt_has_yield(s: &Stmt) -> bool {
             body_has_yield(body)
                 || body_has_yield(orelse)
                 || body_has_yield(finalbody)
-                || handlers.iter().any(|h| body_has_yield(&h.body))
+                || handlers
+                    .iter()
+                    .any(|h| opt(&h.typ) || body_has_yield(&h.body))
         }
-        StmtKind::Match { cases, .. } => cases.iter().any(|c| body_has_yield(&c.body)),
-        _ => false,
+        StmtKind::Assert { test, msg } => expr_has_yield(test) || opt(msg),
+        StmtKind::Match { subject, cases } => {
+            expr_has_yield(subject)
+                || cases
+                    .iter()
+                    .any(|c| opt(&c.guard) || body_has_yield(&c.body))
+        }
+        StmtKind::Pass
+        | StmtKind::Break
+        | StmtKind::Continue
+        | StmtKind::Import(_)
+        | StmtKind::ImportFrom { .. }
+        | StmtKind::Global(_)
+        | StmtKind::Nonlocal(_) => false,
     }
 }
 
+/// Whether `e` contains a `yield` in the CURRENT scope. A lambda is its own
+/// scope (its defaults are not, but `expr_children` lists those with the body,
+/// and a `yield` in a lambda body is itself the lambda's), so only the defaults
+/// are searched; a comprehension's `yield` is a `SyntaxError` the symbol table
+/// raises, so descending into one finds only the outermost iterable's.
 fn expr_has_yield(e: &Expr) -> bool {
-    matches!(e.unspanned(), Expr::Yield(_) | Expr::YieldFrom(_))
+    match e.unspanned() {
+        Expr::Yield(_) | Expr::YieldFrom(_) => true,
+        Expr::Lambda { params, .. } => {
+            params.defaults.iter().any(expr_has_yield)
+                || params.kwonly_defaults.iter().flatten().any(expr_has_yield)
+        }
+        _ => expr_children(e).into_iter().any(expr_has_yield),
+    }
 }
 
 /// Collect the `(line, keyword)` of every `return`/`break`/`continue` that would

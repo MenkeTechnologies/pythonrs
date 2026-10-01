@@ -1122,3 +1122,141 @@ has_dict = hasattr(object(), "__dict__")
     );
     assert_eq!(g(src, "has_dict"), "False");
 }
+
+/// A wrong-length unpack (assignment and `for` target), a failed `assert` and a
+/// `del` of an unbound name rendered `line 0` with no source line: their ops
+/// carried no line. CPython positions each on the target / asserted test.
+#[test]
+fn unpack_assert_and_del_are_positioned() {
+    assert_eq!(
+        traceback_of("a, b = [1]\n"),
+        concat!(
+            "Traceback (most recent call last):\n",
+            "  File \"/t.py\", line 1, in <module>\n",
+            "    a, b = [1]\n",
+            "    ^^^^\n",
+            "ValueError: not enough values to unpack (expected 2, got 1)\n",
+        )
+    );
+    assert_eq!(
+        traceback_of("def g(x):\n    assert x > 1\ng(0)\n"),
+        concat!(
+            "Traceback (most recent call last):\n",
+            "  File \"/t.py\", line 3, in <module>\n",
+            "    g(0)\n",
+            "    ~^^^\n",
+            "  File \"/t.py\", line 2, in g\n",
+            "    assert x > 1\n",
+            "           ^^^^^\n",
+            "AssertionError\n",
+        )
+    );
+    assert_eq!(
+        traceback_of("del undefined_x\n"),
+        concat!(
+            "Traceback (most recent call last):\n",
+            "  File \"/t.py\", line 1, in <module>\n",
+            "    del undefined_x\n",
+            "        ^^^^^^^^^^^\n",
+            "NameError: name 'undefined_x' is not defined\n",
+        )
+    );
+    assert_eq!(
+        traceback_of("for a, b in [[1]]: pass\n"),
+        concat!(
+            "Traceback (most recent call last):\n",
+            "  File \"/t.py\", line 1, in <module>\n",
+            "    for a, b in [[1]]: pass\n",
+            "        ^^^^\n",
+            "ValueError: not enough values to unpack (expected 2, got 1)\n",
+        )
+    );
+}
+
+/// A list/set/dict comprehension runs as a hidden function here, but CPython
+/// 3.12+ inlines it (PEP 709): no `<comp>` frame, and its caller shows the
+/// failing line and caret.
+#[test]
+fn comprehension_frame_is_inlined() {
+    assert_eq!(
+        traceback_of("def f():\n    return [y.z for y in [1]]\nf()\n"),
+        concat!(
+            "Traceback (most recent call last):\n",
+            "  File \"/t.py\", line 3, in <module>\n",
+            "    f()\n",
+            "    ~^^\n",
+            "  File \"/t.py\", line 2, in f\n",
+            "    return [y.z for y in [1]]\n",
+            "            ^^^\n",
+            "AttributeError: 'int' object has no attribute 'z'\n",
+        )
+    );
+}
+
+/// An exception escaping a generator body names the generator's frame (by its
+/// code name, not the defining class), and a `for` loop's advance is
+/// positioned on its iterable.
+#[test]
+fn generator_frames_appear_in_tracebacks() {
+    assert_eq!(
+        traceback_of("def g():\n    yield 1/0\nfor v in g():\n    pass\n"),
+        concat!(
+            "Traceback (most recent call last):\n",
+            "  File \"/t.py\", line 3, in <module>\n",
+            "    for v in g():\n",
+            "             ~^^\n",
+            "  File \"/t.py\", line 2, in g\n",
+            "    yield 1/0\n",
+            "          ~^~\n",
+            "ZeroDivisionError: division by zero\n",
+        )
+    );
+    assert_eq!(
+        traceback_of("print(list(1/x for x in [0]))\n"),
+        concat!(
+            "Traceback (most recent call last):\n",
+            "  File \"/t.py\", line 1, in <module>\n",
+            "    print(list(1/x for x in [0]))\n",
+            "          ~~~~^^^^^^^^^^^^^^^^^^\n",
+            "  File \"/t.py\", line 1, in <genexpr>\n",
+            "    print(list(1/x for x in [0]))\n",
+            "               ~^~\n",
+            "ZeroDivisionError: division by zero\n",
+        )
+    );
+    assert_eq!(
+        traceback_of("class C:\n    def g(self):\n        yield 1\n        raise KeyError(5)\nlist(C().g())\n"),
+        concat!(
+            "Traceback (most recent call last):\n",
+            "  File \"/t.py\", line 5, in <module>\n",
+            "    list(C().g())\n",
+            "    ~~~~^^^^^^^^^\n",
+            "  File \"/t.py\", line 4, in g\n",
+            "    raise KeyError(5)\n",
+            "KeyError: 5\n",
+        )
+    );
+}
+
+/// PEP 479: the `StopIteration` keeps the generator's frame; the
+/// `RuntimeError` replacing it starts at the resumer.
+#[test]
+fn pep479_stopiteration_keeps_the_generator_frame() {
+    assert_eq!(
+        traceback_of("def g():\n    raise StopIteration\n    yield\nnext(g())\n"),
+        concat!(
+            "Traceback (most recent call last):\n",
+            "  File \"/t.py\", line 2, in g\n",
+            "    raise StopIteration\n",
+            "StopIteration\n",
+            "\n",
+            "The above exception was the direct cause of the following exception:\n",
+            "\n",
+            "Traceback (most recent call last):\n",
+            "  File \"/t.py\", line 4, in <module>\n",
+            "    next(g())\n",
+            "    ~~~~^^^^^\n",
+            "RuntimeError: generator raised StopIteration\n",
+        )
+    );
+}

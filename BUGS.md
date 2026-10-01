@@ -9,6 +9,31 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **A `yield` anywhere in a function makes it a generator.** Only a
+  statement-level `yield` (`yield x`, `y = yield x`, `return (yield)`) was
+  seen, so a function whose `yield` sat inside an expression —
+  `print((yield 1))`, `y = (yield) + 1`, `if (yield):`, `for x in (yield):`,
+  `{'k': (yield)}`, `raise E((yield))` — ran as a plain function and died with
+  `TypeError: 'yield' outside a generator`. The test now walks every
+  expression the function's own scope evaluates, as CPython's symbol table
+  does; a `yield` in a nested `lambda`/`def` body still belongs to that body.
+- **Tracebacks carry generator frames and drop comprehension frames.** An
+  exception escaping a generator body left the generator's own frame out of
+  the traceback (and named it after the defining class when it had one);
+  it is now listed as `in g` / `in <genexpr>` between the frames it called
+  and the resumer. PEP 479's `RuntimeError` starts at the resumer while the
+  chained `StopIteration` keeps the generator's frame, as in CPython. A
+  list/set/dict comprehension, which runs as a hidden function here, showed
+  an extra `in <comp>` frame under a `line 0` caller; CPython 3.12+ inlines
+  comprehensions (PEP 709), so that frame is folded into its caller, which
+  takes its line and caret.
+- **Unpacking, `assert`, `del`, `for` and `.throw()` raise positioned.** A
+  wrong-length unpack (`a, b = [1]`, `for a, b in …`, `with … as (a, b)`), a
+  failed `assert`, a `del` of an unbound name, a `for` loop whose iterable
+  raised on `iter()`/`next()`, and an exception thrown into a generator at
+  its `yield` all rendered `line 0` with no source line. Each op now carries
+  its line and CPython's caret: the target (`^^^^` under `a, b`), the asserted
+  test, the deleted name, the loop's iterable, the `yield`.
 - **Walking a `str` by index is linear, not quadratic.** `s[i]` collected the
   whole string into a `Vec<char>` and `len(s)` counted every character, on each
   call, so `while j < len(s): c = s[j]` cost O(n²): 40 000 characters took 90 s

@@ -8781,3 +8781,53 @@ fn numeric_literal_underscores_are_validated() {
 "##
     );
 }
+
+/// A `yield` nested inside an expression — a call argument, an operand, a
+/// condition, an iterable, a `with` item, a dict display, an `assert` or
+/// `raise` — makes the function a generator, as CPython's symbol table
+/// decides it. Only a statement-level `yield` was seen, so `print((yield 1))`
+/// ran as a plain function and died with `'yield' outside a generator`; a
+/// `yield` in a lambda body still belongs to the lambda.
+#[test]
+fn nested_yield_makes_a_generator() {
+    let src = r##"
+def g1():
+    print((yield 1) + 1)
+gen = g1(); print(next(gen))
+try: gen.send(5)
+except StopIteration: print('stop')
+def g2():
+    y = (yield 'a') * 2
+    return y
+gen = g2(); next(gen)
+try: gen.send(21)
+except StopIteration as e: print('ret', e.value)
+def g3():
+    if (yield 1): print('truthy')
+    for x in (yield 3): print('x', x)
+gen = g3(); next(gen); gen.send(1)
+try: gen.send([7])
+except StopIteration: pass
+def g5():
+    d = {'k': (yield 1)}
+    print(d)
+gen = g5(); next(gen)
+try: gen.send('v')
+except StopIteration: pass
+def notgen():
+    l = lambda: (yield)
+    return 5
+print(notgen())
+def g7():
+    raise ValueError((yield 'r'))
+gen = g7(); print(next(gen))
+try: gen.send('payload')
+except ValueError as e: print('VE', e)
+"##;
+    let (result, out) = pythonrs::eval_str_captured(src, &[]);
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        out,
+        "1\n6\nstop\nret 42\ntruthy\nx 7\n{'k': 'v'}\n5\nr\nVE payload\n"
+    );
+}
