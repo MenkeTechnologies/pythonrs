@@ -131,6 +131,10 @@ fn block(class: &str, body: &mut [Stmt]) {
 fn stmt(class: &str, s: &mut Stmt) {
     match &mut s.kind {
         StmtKind::Expr(e) => expr(class, e),
+        StmtKind::TypeAlias { name, value, .. } => {
+            fix(class, name);
+            expr(class, value);
+        }
         StmtKind::Assign { targets, value } => {
             for t in targets {
                 expr(class, t);

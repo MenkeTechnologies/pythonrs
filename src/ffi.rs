@@ -2833,19 +2833,22 @@ pub fn issubclass_values(host: &mut PyHost, sub: &Value, cls: &Value) -> Result<
     })
 }
 
-/// The `__name__` of a CPython class that lives in `builtins` (`types.FunctionType`
-/// is `builtins.function`, `types.GeneratorType` is `builtins.generator`), or
-/// `None` for any other class. Lets `isinstance(native_fn, types.FunctionType)`
-/// compare against pythonrs's own type of the same name: the native value
-/// crosses the bridge as a proxy, which CPython's check would never accept.
+/// A CPython class's name as pythonrs's `type_name` spells a native type: the
+/// bare `__name__` for a class in `builtins` (`types.FunctionType` is
+/// `builtins.function`, `types.GeneratorType` is `builtins.generator`), else
+/// `module.qualname` (`typing.TypeAliasType`, `re.Pattern`). Lets
+/// `isinstance(native_fn, types.FunctionType)` compare against pythonrs's own
+/// type of the same name: the native value crosses the bridge as a proxy,
+/// which CPython's check would never accept.
 pub fn foreign_builtin_type_name(cls_id: u32) -> Option<String> {
     Python::with_gil(|py| {
         let cls = fetch(py, cls_id).ok()?;
         let module: String = cls.getattr("__module__").ok()?.extract().ok()?;
-        if module != "builtins" {
-            return None;
+        if module == "builtins" {
+            return cls.getattr("__name__").ok()?.extract().ok();
         }
-        cls.getattr("__name__").ok()?.extract().ok()
+        let qualname: String = cls.getattr("__qualname__").ok()?.extract().ok()?;
+        Some(format!("{module}.{qualname}"))
     })
 }
 

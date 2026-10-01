@@ -1183,10 +1183,35 @@ impl Parser {
                 }
                 "import" => return self.parse_import(out, line),
                 "from" => return self.parse_from_import(out, line),
+                // `type` is a soft keyword: a type alias statement only when a
+                // name and then `=` or a `[` type-parameter list follow it.
+                "type" if self.looks_like_type_alias() => return self.parse_type_alias(out, line),
                 _ => {}
             }
         }
         self.parse_expr_stmt(out, line)
+    }
+
+    /// `type NAME =` / `type NAME[`: the PEP 695 `type_alias` rule's start.
+    fn looks_like_type_alias(&self) -> bool {
+        let tok = |i: usize| self.toks.get(self.pos + i).map(|t| &t.tok);
+        let name = match tok(1) {
+            Some(Tok::Name(n)) => !is_keyword(n),
+            Some(Tok::Ident(_)) => true,
+            _ => false,
+        };
+        name && matches!(tok(2), Some(Tok::Op(o)) if o == "=" || o == "[")
+    }
+
+    /// `type NAME [type_params] = expression` (PEP 695).
+    fn parse_type_alias(&mut self, out: &mut Vec<Stmt>, line: u32) -> Result<(), String> {
+        self.advance(); // type
+        let name = self.expect_name()?;
+        let params = self.parse_type_params()?;
+        self.expect_op("=")?;
+        let value = self.parse_expr()?;
+        out.push(Stmt::new(StmtKind::TypeAlias { name, params, value }, line));
+        Ok(())
     }
 
     fn parse_name_list(&mut self) -> Result<Vec<String>, String> {
@@ -1556,18 +1581,19 @@ impl Parser {
         }
     }
 
-    /// PEP 695: parse an optional type-parameter list after a class/def name
-    /// (`class C[T]`, `def f[T, *Ts, **P]`) and return the parameter names.
-    /// Bounds/constraints/defaults (`[T: int]`, `[T = str]`) are consumed and
-    /// discarded. Type parameters are a static-typing construct — pythonrs
-    /// evaluates annotations eagerly, so [`bind_type_params`] binds each name to
-    /// `object` in the enclosing scope so an annotation like `-> T` resolves
-    /// (the runtime does not depend on which concrete type parameters exist).
-    fn parse_type_params(&mut self) -> Result<Vec<String>, String> {
+    /// PEP 695: parse an optional type-parameter list after a class/def/`type`
+    /// name (`class C[T]`, `def f[T, *Ts, **P]`) and return each parameter's
+    /// name and kind. Bounds/constraints/defaults (`[T: int]`, `[T = str]`) are
+    /// consumed and discarded. A `type` alias creates real `TypeVar`-likes from
+    /// these; for a class/def, [`bind_type_params`] binds each name to `object`
+    /// in the enclosing scope so an annotation like `-> T` resolves (the runtime
+    /// does not depend on which concrete type parameters exist).
+    fn parse_type_params(&mut self) -> Result<Vec<TypeParam>, String> {
         let mut names = Vec::new();
         if !self.at_op("[") {
             return Ok(names);
         }
+        let mut kind = TypeParamKind::TypeVar;
         self.advance(); // [
         let mut depth = 1usize;
         // A parameter name is the first identifier of each comma-separated item,
@@ -1587,11 +1613,19 @@ impl Parser {
                         return Ok(names);
                     }
                 }
-                Tok::Op(o) if depth == 1 && o == "," => expect_name = true,
-                Tok::Op(o) if depth == 1 && (o == "*" || o == "**") => {}
+                Tok::Op(o) if depth == 1 && o == "," => {
+                    expect_name = true;
+                    kind = TypeParamKind::TypeVar;
+                }
+                Tok::Op(o) if depth == 1 && expect_name && o == "*" => {
+                    kind = TypeParamKind::TypeVarTuple;
+                }
+                Tok::Op(o) if depth == 1 && expect_name && o == "**" => {
+                    kind = TypeParamKind::ParamSpec;
+                }
                 Tok::Op(_) if depth == 1 => expect_name = false, // `:` / `=`
-                Tok::Name(n) if depth == 1 && expect_name => {
-                    names.push(n);
+                Tok::Name(name) | Tok::Ident(name) if depth == 1 && expect_name => {
+                    names.push(TypeParam { name, kind });
                     expect_name = false;
                 }
                 Tok::Eof => return Err("SyntaxError: unterminated type-parameter list".to_string()),
@@ -1604,11 +1638,11 @@ impl Parser {
     /// Emit `T = object` bindings for PEP 695 type parameters into `out`, ahead of
     /// the class/def they precede, so eagerly-evaluated annotations that reference
     /// them resolve. See [`parse_type_params`].
-    fn bind_type_params(&self, out: &mut Vec<Stmt>, params: &[String], line: u32) {
-        for name in params {
+    fn bind_type_params(&self, out: &mut Vec<Stmt>, params: &[TypeParam], line: u32) {
+        for p in params {
             out.push(Stmt::new(
                 StmtKind::Assign {
-                    targets: vec![Expr::Name(name.clone())],
+                    targets: vec![Expr::Name(p.name.clone())],
                     value: Expr::Name("object".to_string()),
                 },
                 line,

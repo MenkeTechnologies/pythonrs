@@ -115,6 +115,7 @@ pub mod ops {
     pub const TEMPLATE: u16 = 82; // [segments(list of str|Interpolation)] -> Template
     pub const CHECK_BOUND: u16 = 83; // [name, value] -> value, or UnboundLocalError if unbound
     pub const UNBOUND: u16 = 84; // [] -> the never-assigned frame-slot marker
+    pub const TYPE_ALIAS: u16 = 85; // [name, evaluate, [param, kind, ...]] -> TypeAliasType (PEP 695)
 }
 
 /// In-place (augmented-assignment) op tags carried by `ops::INPLACE`. One per
@@ -1071,6 +1072,19 @@ pub enum PyObj {
         name: String,
         attrs: Value,
     },
+    /// A PEP 695 `type` alias — `typing.TypeAliasType`, built by `TYPE_ALIAS`.
+    /// `params` is the `__type_params__` tuple; `evaluate` is the compiled
+    /// function of those parameters that computes the value, called on the
+    /// first `__value__` read (see [`type_alias_value`]), which caches the
+    /// result in `value` (`Undef` until then). `module` is the defining
+    /// module's `__name__`.
+    TypeAlias {
+        name: String,
+        module: Value,
+        params: Value,
+        evaluate: Value,
+        value: Value,
+    },
     /// A `types.SimpleNamespace` — a mutable attribute bag (`sys.implementation`,
     /// argparse results). Attribute reads/writes go through `attrs`; `repr` is
     /// `namespace(k=v, …)`. Native VM object.
@@ -1457,6 +1471,8 @@ pub enum AttrGet {
     /// `f.__annotations__` (or `inst.m.__annotations__`) on a function whose
     /// annotations have not been evaluated yet: run [`function_annotations`].
     Annotations { func: Value },
+    /// A `type` alias's `__value__` not computed yet: run [`type_alias_value`].
+    TypeAliasValue { alias: Value },
 }
 
 /// The plan for `recv.name = val` when a descriptor may intercept it.
@@ -3309,13 +3325,19 @@ impl PyHost {
         matches!(self.get(v), Some(PyObj::Frozenset(_)))
     }
 
-    /// If `v` is a valid PEP 604 union member — a type object, an existing union
-    /// (flattened), or `None` (as `NoneType`) — return its member list. `None`
+    /// If `v` is a valid PEP 604 union member — a type object, a generic or
+    /// `type` alias, a type parameter, an existing union (flattened), or `None`
+    /// (as `NoneType`) — return its member list. `None`
     /// otherwise, so `|` falls through to its numeric/set meanings.
     fn union_members(&self, v: &Value) -> Option<Vec<Value>> {
         match self.get(v) {
             Some(PyObj::Union { args }) => Some(args.clone()),
-            Some(PyObj::Class(_)) | Some(PyObj::GenericAlias { .. }) => Some(vec![v.clone()]),
+            // A type alias and a type parameter join a union as themselves
+            // (`typealias_or`, `typevar.__or__`).
+            Some(PyObj::Class(_))
+            | Some(PyObj::GenericAlias { .. })
+            | Some(PyObj::TypeAlias { .. })
+            | Some(PyObj::TypeVarLike { .. }) => Some(vec![v.clone()]),
             Some(PyObj::Builtin(n)) if crate::builtins::is_type_object_name(n) => {
                 Some(vec![v.clone()])
             }
@@ -4482,6 +4504,7 @@ fn type_object_class_name(n: &str) -> Option<String> {
         // `Union`, `__module__` is `typing`, and messages name it
         // `'typing.Union' object …`. It is no longer `builtins.UnionType`.
         "typing.Union" => Some("typing.Union"),
+        "typing.TypeAliasType" => Some("typing.TypeAliasType"),
         // `type(list[int])` — `type_name` keeps the bare `GenericAlias` for
         // `__name__`; the class repr is module-qualified.
         "GenericAlias" => Some("types.GenericAlias"),
@@ -4720,6 +4743,7 @@ impl PyHost {
                 Some(PyObj::Union { .. }) => "typing.Union".into(),
                 Some(PyObj::GenericAlias { .. }) => "GenericAlias".into(),
                 Some(PyObj::TypeVarLike { kind, .. }) => kind.type_name().into(),
+                Some(PyObj::TypeAlias { .. }) => "typing.TypeAliasType".into(),
                 Some(PyObj::StructTime { .. }) => "struct_time".into(),
                 Some(PyObj::Pattern { .. }) => "re.Pattern".into(),
                 Some(PyObj::Match { .. }) => "re.Match".into(),
@@ -4937,6 +4961,7 @@ impl PyHost {
                     self.addr_of(v)
                 ),
                 Some(PyObj::TypeVarLike { name, .. }) => name.clone(),
+                Some(PyObj::TypeAlias { name, .. }) => name.clone(),
                 Some(PyObj::StructTime { fields }) => {
                     let fields = fields.clone();
                     let parts: Vec<String> = STRUCT_TIME_FIELDS
@@ -5694,7 +5719,8 @@ impl PyHost {
                     | PyObj::Module { .. }
                     | PyObj::Code { .. }
                     | PyObj::Lock { .. }
-                    | PyObj::TypeVarLike { .. },
+                    | PyObj::TypeVarLike { .. }
+                    | PyObj::TypeAlias { .. },
                 ) => {
                     let id = match v {
                         Value::Obj(i) => *i,
@@ -9597,6 +9623,21 @@ impl PyHost {
                 }
                 Ok(Value::Int(bytes[k as usize] as i64))
             }
+            // `Alias[int]` — `typealias_subscript`: only a generic alias takes
+            // arguments, and the result is a `GenericAlias` over the alias.
+            Some(PyObj::TypeAlias { params, .. }) => {
+                if !matches!(self.get(params), Some(PyObj::Tuple(t)) if !t.is_empty()) {
+                    return Err(type_error("Only generic type aliases are subscriptable"));
+                }
+                let args = match self.get(idx) {
+                    Some(PyObj::Tuple(xs)) => xs.clone(),
+                    _ => vec![idx.clone()],
+                };
+                Ok(self.alloc(PyObj::GenericAlias {
+                    origin: recv.clone(),
+                    args,
+                }))
+            }
             // `typing.Union[X, Y]`. Since 3.14 `typing.Union` IS `types.UnionType`,
             // so subscripting it builds exactly what `X | Y` builds — same flatten,
             // same dedupe, same collapse-to-one. `Union[int]` is `int`, and a Union
@@ -12142,6 +12183,30 @@ impl PyHost {
             // A TypeVar/ParamSpec/TypeVarTuple exposes its dunder attributes from
             // the backing dict; `has_default()` reflects whether `__default__` was
             // set (not the `NoDefault` sentinel).
+            // `typing.TypeAliasType`'s own members; anything else (`__class__`,
+            // a missing name) takes the generic object path. An uncomputed
+            // `__value__` is routed out of the host borrow by `plan_attr_get`.
+            Some(PyObj::TypeAlias {
+                name: alias,
+                module,
+                params,
+                value,
+                ..
+            }) if matches!(
+                name,
+                "__name__" | "__module__" | "__type_params__" | "__parameters__" | "__value__"
+            ) =>
+            {
+                match name {
+                    "__name__" => {
+                        let alias = alias.clone();
+                        Ok(self.new_str(alias))
+                    }
+                    "__module__" => Ok(module.clone()),
+                    "__type_params__" | "__parameters__" => Ok(params.clone()),
+                    _ => Ok(value.clone()),
+                }
+            }
             Some(PyObj::TypeVarLike { attrs, .. }) => {
                 let attrs = attrs.clone();
                 if let Some(PyObj::Dict(d)) = self.get(&attrs) {
@@ -13263,6 +13328,13 @@ impl PyHost {
     /// Plan reading `recv.name`, honoring the descriptor protocol (`property`
     /// and user `__get__` descriptors). See [`AttrGet`].
     pub fn plan_attr_get(&mut self, recv: &Value, name: &str) -> AttrGet {
+        if name == "__value__"
+            && matches!(self.get(recv), Some(PyObj::TypeAlias { value: Value::Undef, .. }))
+        {
+            return AttrGet::TypeAliasValue {
+                alias: recv.clone(),
+            };
+        }
         if name == "__annotations__" {
             let func = match self.get(recv) {
                 Some(PyObj::BoundMethod { func, .. }) => func.clone(),
@@ -13836,6 +13908,32 @@ impl PyHost {
 }
 
 // ── call machinery (free functions: run user chunks, so hold no host borrow) ──
+
+/// `alias.__value__` on first read (PEP 695): call the alias's evaluate
+/// function with its type parameters and cache the result, as CPython's
+/// `typealias_value` does. An unresolvable name raises its `NameError` here, on
+/// every read until it resolves; a recursive alias reads itself by name.
+pub fn type_alias_value(alias: &Value) -> Result<Value, String> {
+    let (evaluate, params) = with_host(|h| match h.get(alias) {
+        Some(PyObj::TypeAlias {
+            evaluate, params, ..
+        }) => {
+            let params = match h.get(params) {
+                Some(PyObj::Tuple(t)) => t.clone(),
+                _ => Vec::new(),
+            };
+            (evaluate.clone(), params)
+        }
+        _ => (Value::Undef, Vec::new()),
+    });
+    let value = invoke(&evaluate, params, vec![])?;
+    with_host(|h| {
+        if let Some(PyObj::TypeAlias { value: slot, .. }) = h.get_mut(alias) {
+            *slot = value.clone();
+        }
+    });
+    Ok(value)
+}
 
 /// `func.__annotations__` for an annotated function not read yet (PEP 649):
 /// call its `__annotate__(VALUE)` and cache the dict on the function, as

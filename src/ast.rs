@@ -378,6 +378,31 @@ pub enum StmtKind {
         subject: Expr,
         cases: Vec<MatchCase>,
     },
+    /// `type Name[params] = value` (PEP 695). `value` is evaluated lazily, on
+    /// the first read of the alias's `__value__`.
+    TypeAlias {
+        name: String,
+        params: Vec<TypeParam>,
+        value: Expr,
+    },
+}
+
+/// One PEP 695 type parameter: `T`, `*Ts` or `**P`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeParam {
+    pub name: String,
+    pub kind: TypeParamKind,
+}
+
+/// Which `typing` object a [`TypeParam`] creates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypeParamKind {
+    /// `T` — a `TypeVar`.
+    TypeVar,
+    /// `*Ts` — a `TypeVarTuple`.
+    TypeVarTuple,
+    /// `**P` — a `ParamSpec`.
+    ParamSpec,
 }
 
 /// One `case pattern [if guard]: body` of a `match`.

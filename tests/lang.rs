@@ -9582,3 +9582,53 @@ fn function_annotations_are_evaluated_lazily() {
          {'a': <class 'float'>, 'return': None}, {'z': 1}, None, {}, None)"
     );
 }
+
+// PEP 695 `type` aliases: a lazily evaluated `typing.TypeAliasType` whose
+// value is computed on the first `__value__` read (so it may refer to itself
+// or to a later name), with real type parameters for the generic form.
+// Expected values are CPython 3.14's.
+#[test]
+fn type_alias_statement_builds_a_lazy_type_alias_type() {
+    let src = "log = []\n\
+               type Alias = list[int]\n\
+               type Rec = list[Rec] | int\n\
+               type Later = Undefined\n\
+               try:\n    Later.__value__\n\
+               except NameError as e:\n    log.append(str(e))\n\
+               Undefined = str\n\
+               type G[T, *Ts, **P] = dict[T, P]\n\
+               type C[T] = T | None\n\
+               def f():\n    type Local = int\n    return Local\n\
+               class K:\n    type Inner = float\n\
+               for bad in ('Alias[int]', 'Alias()'):\n\
+               \x20   try:\n        eval(bad)\n\
+               \x20   except TypeError as e:\n        log.append(str(e))\n\
+               kinds = [type(p).__name__ for p in G.__type_params__]\n\
+               type = 5\n\
+               x = (log, repr(Alias), Alias.__name__, Alias.__value__, Alias.__module__,\n\
+               \x20    Alias.__type_params__, repr(Rec.__value__), Later.__value__,\n\
+               \x20    G.__type_params__, kinds,\n\
+               \x20    repr(G.__value__), repr(G[int]), repr(C[int]), repr(C.__value__),\n\
+               \x20    f(), f().__value__, K.Inner.__value__, repr(Alias | None),\n\
+               \x20    Alias.__class__.__name__, {Alias: 1}[Alias], type)";
+    assert_eq!(
+        g(src, "x"),
+        "([\"name 'Undefined' is not defined\", 'Only generic type aliases are subscriptable', \
+         \"'typing.TypeAliasType' object is not callable\"], 'Alias', 'Alias', list[int], \
+         '__main__', (), 'list[Rec] | int', <class 'str'>, (T, Ts, P), \
+         ['TypeVar', 'TypeVarTuple', 'ParamSpec'], 'dict[T, P]', 'G[int]', 'C[int]', \
+         'T | None', Local, <class 'int'>, <class 'float'>, 'Alias | None', \
+         'TypeAliasType', 1, 5)"
+    );
+}
+
+// A native `type` alias is an instance of CPython's `typing.TypeAliasType`
+// when `typing` is served by the bridge, as `isinstance` answers in CPython.
+#[cfg(feature = "stdlib-ffi")]
+#[test]
+fn type_alias_is_an_instance_of_bridged_type_alias_type() {
+    assert_eq!(
+        g("import typing\ntype A = int\nx = isinstance(A, typing.TypeAliasType)", "x"),
+        "True"
+    );
+}

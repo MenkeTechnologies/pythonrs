@@ -70,6 +70,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(ops::TEMPLATE, b_template);
     vm.register_builtin(ops::CHECK_BOUND, b_check_bound);
     vm.register_builtin(ops::UNBOUND, |_, _| with_host(|h| h.alloc(PyObj::Unbound)));
+    vm.register_builtin(ops::TYPE_ALIAS, b_type_alias);
     vm.register_builtin(ops::UNPACK, b_unpack);
     vm.register_builtin(ops::BINOP, b_binop);
     vm.register_builtin(ops::INPLACE, b_inplace);
@@ -398,6 +399,7 @@ pub(crate) fn raw_getattr(recv: &Value, name: &str) -> Result<Value, String> {
             Ok(value)
         }
         host::AttrGet::Annotations { func } => host::function_annotations(&func),
+        host::AttrGet::TypeAliasValue { alias } => host::type_alias_value(&alias),
         host::AttrGet::Plain => with_host(|h| h.get_attr(recv, name)),
     }
 }
@@ -1787,6 +1789,48 @@ fn b_mkfunc(vm: &mut VM, argc: u8) -> Value {
             annotations,
             annotate,
         })))
+    })
+}
+
+/// `TYPE_ALIAS [name, evaluate, [param, kind, ...]]` — the PEP 695
+/// `typing.TypeAliasType` for `type name[params] = value`. Each parameter
+/// becomes its `TypeVar` (kind 0), `TypeVarTuple` (1) or `ParamSpec` (2); the
+/// value is left for the first `__value__` read (`host::type_alias_value`).
+fn b_type_alias(vm: &mut VM, _: u8) -> Value {
+    let params = vm.pop();
+    let evaluate = vm.pop();
+    let name = sval(&vm.pop());
+    let flat = with_host(|h| match h.get(&params) {
+        Some(PyObj::List(l)) => l.clone(),
+        _ => Vec::new(),
+    });
+    let specs: Vec<(host::TypeVarKind, String)> = flat
+        .chunks(2)
+        .map(|pair| {
+            let kind = match pair[1] {
+                Value::Int(1) => host::TypeVarKind::TypeVarTuple,
+                Value::Int(2) => host::TypeVarKind::ParamSpec,
+                _ => host::TypeVarKind::TypeVar,
+            };
+            (kind, sval(&pair[0]))
+        })
+        .collect();
+    with_host(|h| {
+        let type_params: Vec<Value> = specs
+            .into_iter()
+            .map(|(kind, pname)| h.make_type_var(kind, pname, vec![], vec![]))
+            .collect();
+        let module = h
+            .read_global("__name__")
+            .unwrap_or_else(|| h.new_str("__main__".to_string()));
+        let params = h.new_tuple(type_params);
+        h.alloc(PyObj::TypeAlias {
+            name,
+            module,
+            params,
+            evaluate,
+            value: Value::Undef,
+        })
     })
 }
 

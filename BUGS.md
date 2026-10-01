@@ -20,6 +20,17 @@ written.
   without `self`), with the active one picked by position, by `name=`, or as the
   `*args` collector; commas inside strings and nested calls are not counted, and
   a document left unparsable by the half-typed line is re-parsed without it.
+- **PEP 695 `type X = ...` builds a `typing.TypeAliasType`.** The statement
+  did not parse (`SyntaxError`). It is now the `type` soft keyword's
+  `type_alias` rule: `TYPE_ALIAS` creates the alias with one `TypeVar`/
+  `TypeVarTuple`/`ParamSpec` per type parameter, and the value — compiled as a
+  function of those parameters — runs on the first `__value__` read and is
+  cached, so an alias may be recursive or name something defined later (a
+  missing name raises `NameError` at that read). `__name__`, `__module__`,
+  `__type_params__`, `repr`, `X | Y`, `G[int]` (a `GenericAlias`; a
+  non-generic alias raises `Only generic type aliases are subscriptable`),
+  hashing and `not callable` follow CPython, in module, class and function
+  bodies alike. A `TypeVar` now also joins a `|` union.
 - **`dir()` of a builtin type is CPython's full listing.** `dir(int)`,
   `dir(str)`, `dir(list)`, `dir(dict)` and the rest of the 13 builtin types (and
   their values: `dir(5) == dir(int)`) name every slot wrapper, classmethod, data
@@ -2297,14 +2308,17 @@ key (unhashable type: 'X')`), matching CPython at all 17 spellings. Round 4
 added the `__index__` coercion boundaries and the `__slots__` `"__dict__"`
 entry. Four remain open:
 
-- **PEP 695 `type X = ...` binds the value, not a `TypeAliasType`.**
-  `type Alias = list[int]` makes `Alias` be `list[int]` itself, so `Alias`
-  reprs and behaves like the aliased type but `Alias.__value__` raises
-  `AttributeError`, and `type(Alias)` is `type` where CPython says
-  `TypeAliasType`. The lazy-evaluation semantics (the value is not computed
-  until `__value__` is read, which is what lets an alias be recursive or refer
-  to a name defined later) are absent with it. `type X = ...` inside a class or
-  function body, and the generic form `type X[T] = ...`, are the same gap.
+- **PEP 695 `type` aliases: what the native `TypeAliasType` still lacks.**
+  The statement builds a lazy `typing.TypeAliasType` (see "Implemented"), but
+  its value is compiled as an ordinary nested function, not an annotation
+  scope, so inside a class body it cannot see the class's own names
+  (`class K: X = int; type A = X` then `K.A.__value__` raises `NameError`
+  where CPython returns `int`). A type parameter's bound, constraints and
+  default (`type B[T: int] = …`) are parsed and discarded (`__bound__` is
+  `None`); `__parameters__` lists a `TypeVarTuple` bare where CPython shows
+  `typing.Unpack[Ts]`; `evaluate_value` is absent; and under the bridge
+  `type(A)` is pythonrs's own type object, not CPython's
+  `typing.TypeAliasType` (`isinstance` does agree).
 
 - **`operator.index()` does not see a native `__index__`.** The `operator`
   module is served by the FFI bridge, so the argument crosses as a

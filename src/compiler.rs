@@ -504,6 +504,11 @@ impl Compiler {
             } => {
                 self.compile_classdef(b, name, bases, keywords, body, decorators)?;
             }
+            StmtKind::TypeAlias {
+                name,
+                params,
+                value,
+            } => self.compile_type_alias(b, name, params, value)?,
             StmtKind::Return(e) => {
                 // A module-level (or class-body) `return` is a compile-time
                 // SyntaxError in CPython. pythonrs used to lower it and run it,
@@ -2479,6 +2484,45 @@ impl Compiler {
             b.emit(Op::Swap, 0);
             b.emit(Op::CallBuiltin(ops::CALL_VALUE, 2), 0);
         }
+        self.store_name(b, name);
+        Ok(())
+    }
+
+    /// `type NAME[params] = value` (PEP 695). The value compiles into a
+    /// function of the type parameters, named after the alias as CPython's
+    /// evaluate function is; `TYPE_ALIAS` builds the `TypeAliasType`, creating
+    /// one `TypeVar`/`TypeVarTuple`/`ParamSpec` per parameter, and the value is
+    /// computed by calling that function on the first `__value__` read.
+    fn compile_type_alias(
+        &mut self,
+        b: &mut ChunkBuilder,
+        name: &str,
+        params: &[TypeParam],
+        value: &Expr,
+    ) -> Result<(), String> {
+        let fparams = Params {
+            names: params.iter().map(|p| p.name.clone()).collect(),
+            ..Params::default()
+        };
+        let body = vec![Stmt::from(StmtKind::Return(Some(value.clone())))];
+        self.fn_depth += 1;
+        let eval_id = self.build_function(name, &fparams, &body);
+        self.fn_depth -= 1;
+        self.strlit(b, name); // [name]
+        self.emit_make_func(b, eval_id?, &Params::default())?; // [name, evaluate]
+        // The parameters as flat `name, kind` pairs (kind: 0 TypeVar,
+        // 1 TypeVarTuple, 2 ParamSpec).
+        self.build_chunked(b, ops::MKLIST, ops::EXTEND_LIST, params.len(), 2, |c, b, i| {
+            c.strlit(b, &params[i].name);
+            let kind = match params[i].kind {
+                TypeParamKind::TypeVar => 0,
+                TypeParamKind::TypeVarTuple => 1,
+                TypeParamKind::ParamSpec => 2,
+            };
+            b.emit(Op::LoadInt(kind), 0);
+            Ok(())
+        })?; // [name, evaluate, params]
+        b.emit(Op::CallBuiltin(ops::TYPE_ALIAS, 3), self.cur_line);
         self.store_name(b, name);
         Ok(())
     }
@@ -4977,6 +5021,8 @@ fn check_walrus_rebind(e: &Expr, bound: &[String]) -> Result<(), String> {
 fn collect_names_stmt(s: &Stmt, out: &mut HashSet<String>) {
     match &s.kind {
         StmtKind::Expr(e) => collect_names_expr(e, out),
+        // The value runs in a nested scope that may read enclosing names.
+        StmtKind::TypeAlias { value, .. } => collect_names_expr(value, out),
         StmtKind::Assign { targets, value } => {
             for t in targets {
                 collect_names_expr(t, out);
@@ -5212,7 +5258,9 @@ fn collect_bound_stmt(s: &Stmt, out: &mut HashSet<String>) {
                 }
             }
         }
-        StmtKind::FuncDef { name, .. } | StmtKind::ClassDef { name, .. } => {
+        StmtKind::FuncDef { name, .. }
+        | StmtKind::ClassDef { name, .. }
+        | StmtKind::TypeAlias { name, .. } => {
             out.insert(name.clone());
         }
         StmtKind::Import(aliases) => {
@@ -5520,6 +5568,8 @@ fn stmt_has_yield(s: &Stmt) -> bool {
     let opt = |e: &Option<Expr>| e.as_ref().is_some_and(expr_has_yield);
     match &s.kind {
         StmtKind::Expr(e) => expr_has_yield(e),
+        // A type alias's value is its own (lazily evaluated) scope.
+        StmtKind::TypeAlias { .. } => false,
         StmtKind::Return(e) => opt(e),
         StmtKind::Assign { targets, value } => any(targets) || expr_has_yield(value),
         StmtKind::AugAssign { target, value, .. } => {

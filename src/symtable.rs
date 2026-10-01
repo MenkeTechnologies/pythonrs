@@ -122,6 +122,8 @@ impl Table {
     fn stmt(&mut self, s: &Stmt, b: &mut Block) -> Result<(), String> {
         match &s.kind {
             StmtKind::Expr(e) => self.expr(e, b)?,
+            // The value is a scope of its own, evaluated lazily.
+            StmtKind::TypeAlias { name, .. } => b.add(name, LOCAL),
             StmtKind::Assign { targets, value } => {
                 for t in targets {
                     self.store(t, b)?;
