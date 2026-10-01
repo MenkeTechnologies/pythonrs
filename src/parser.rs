@@ -64,9 +64,15 @@ pub fn parse(src: &str) -> Result<Vec<Stmt>, String> {
             },
         },
     };
-    // The offending line, as CPython's parser sees it: newline-terminated.
-    let lineno = split_syntax_error(&err).1.and_then(|p| p.lineno);
+    // The offending line, as CPython's parser sees it: newline-terminated,
+    // unless the error spans further lines — pegen then reads the line back
+    // from the tokenizer's buffers, which drop the newline (measured:
+    // `f(**x,\n  *y)`, `(1 +\n 2) = 3`).
+    let pos = split_syntax_error(&err).1;
+    let lineno = pos.as_ref().and_then(|p| p.lineno);
+    let multiline = pos.is_some_and(|p| p.end_lineno.zip(p.lineno).is_some_and(|(e, l)| e > l));
     Err(match lineno.and_then(|l| source_line(&src, l, true)) {
+        Some(text) if multiline => with_text(err, text.trim_end_matches('\n')),
         Some(text) => with_text(err, &text),
         None => err,
     })
@@ -501,7 +507,14 @@ impl Parser {
             anchor_end += 1;
         }
         let e = Expr::BinOp(op, Box::new(left), Box::new(right));
-        Ok(spanned(e, sl, sc, self.prev_end_col(), op_tok.col, anchor_end))
+        Ok(spanned(
+            e,
+            sl,
+            sc,
+            self.prev_end_col(),
+            op_tok.col,
+            anchor_end,
+        ))
     }
 
     fn advance(&mut self) -> Tok {
@@ -844,18 +857,176 @@ impl Parser {
         a: usize,
         b: usize,
     ) -> Option<(&'static str, (usize, usize))> {
+        self.invalid_target_of(e, a, b, false)
+    }
+
+    /// [`Parser::invalid_target`], or with `for_targets` its `FOR_TARGETS`
+    /// case: a `for` clause read as expressions turns `a in b` into a
+    /// comparison, so an `in` comparison stands for its left side and any other
+    /// comparison is not reported.
+    fn invalid_target_of(
+        &self,
+        e: &Expr,
+        a: usize,
+        b: usize,
+        for_targets: bool,
+    ) -> Option<(&'static str, (usize, usize))> {
+        // A parenthesized group has no node, so the part named is inside it:
+        // `for (1) in x` points at the `1`.
+        if matches!(self.groups.get(&a), Some(&(close, _, _)) if close == b) {
+            return self.invalid_target_of(e, a + 1, b - 1, for_targets);
+        }
         match unspan(e) {
             Expr::Name(_) | Expr::Attribute(..) | Expr::Subscript(..) => None,
-            Expr::Starred(inner) => self.invalid_target(inner, a + 1, b),
+            Expr::Starred(inner) => self.invalid_target_of(inner, a + 1, b, for_targets),
             Expr::Tuple(items) | Expr::List(items) => {
                 let (ia, ib) = self.strip_brackets(a, b);
                 let parts = self.split_commas(ia, ib);
                 items
                     .iter()
                     .zip(parts)
-                    .find_map(|(item, (x, y))| self.invalid_target(item, x, y))
+                    .find_map(|(item, (x, y))| self.invalid_target_of(item, x, y, for_targets))
             }
+            Expr::Compare(left, ops) if for_targets => match ops.first() {
+                Some((CmpOp::In, _)) => {
+                    let in_tok = self.top_level_in(a, b)?;
+                    self.invalid_target_of(left, a, in_tok - 1, for_targets)
+                }
+                _ => None,
+            },
             other => Some((expr_name(other), (a, b))),
+        }
+    }
+
+    /// Position `err`, an argument-order error raised at a `*iterable` whose
+    /// `*` was just consumed, as CPython's `invalid_arguments` does: from the
+    /// `,` before it (`RAISE_SYNTAX_ERROR_STARTING_FROM`) to the end of the
+    /// furthest token the tokenizer read, which is the one after the run of
+    /// `*` arguments that follows — past one more `,` when there is one. That
+    /// end is the tokenizer's cursor (`CURRENT_POS`), which pegen reports
+    /// without the 1-based adjustment it gives a column, so it is one short of
+    /// the token's own end offset.
+    fn star_error_span(&mut self, err: String) -> String {
+        let star = self.pos - 1;
+        let msg = err
+            .strip_prefix("SyntaxError: ")
+            .unwrap_or(&err)
+            .to_string();
+        let run_end = self.reparse(star, |p| loop {
+            p.expect_op("*")?;
+            p.parse_expr()?;
+            if !(p.at_op(",") && matches!(&p.toks[p.pos + 1].tok, Tok::Op(o) if o == "*")) {
+                return Ok(Expr::None);
+            }
+            p.advance();
+        });
+        let Some((_, last)) = run_end else {
+            return err;
+        };
+        let mut furthest = last + 1;
+        if matches!(&self.toks[furthest].tok, Tok::Op(o) if o == ",") {
+            furthest += 1;
+        }
+        let (line, offset, end_line, end_offset) = self.token_span(star - 1, furthest);
+        at_pos(
+            &format!("SyntaxError: {msg}"),
+            line,
+            offset as i64,
+            end_line,
+            end_offset as i64 - 1,
+        )
+    }
+
+    /// What stands between a `for` clause's targets, read from token `start`,
+    /// and its `in`, checked the way CPython's grammar falls back when the
+    /// clause does not parse: in a comprehension first `invalid_for_if_clause`
+    /// (`bitwise_or` items not followed by `in`), then `invalid_for_target`,
+    /// then the generic error at the current token. Leaves the cursor on `in`.
+    fn check_for_target(
+        &mut self,
+        target: &Expr,
+        start: usize,
+        comprehension: bool,
+    ) -> Result<(), String> {
+        let invalid = self.invalid_target(target, start, self.pos - 1);
+        if self.at_kw("in") && invalid.is_none() {
+            return Ok(());
+        }
+        if comprehension {
+            let items = self.reparse(start, |p| {
+                p.parse_bitor()?;
+                while p.eat_op(",") && p.starts_expression() {
+                    p.parse_bitor()?;
+                }
+                Ok(Expr::None)
+            });
+            if let Some((_, end)) = items {
+                if !matches!(&self.toks[end + 1].tok, Tok::Name(n) if n == "in") {
+                    let msg = "'in' expected after for-loop variables";
+                    return Err(self.err_span(msg, end + 1, end + 1));
+                }
+            }
+        }
+        if let Some(e) = self.invalid_for_target(start) {
+            return Err(e);
+        }
+        Err(match invalid {
+            Some((what, (a, b))) => self.err_span(&format!("cannot assign to {what}"), a, b),
+            None => self.err_here("invalid syntax"),
+        })
+    }
+
+    /// CPython's `invalid_for_target`, for a `for` statement or a comprehension's
+    /// `for` clause whose targets start at token `start` and did not parse as
+    /// targets followed by `in`. The clause is re-read as `star_expressions`;
+    /// a trailing `in` makes that a comparison whose left side is the target
+    /// (`_PyPegen_get_invalid_target`'s `FOR_TARGETS` case). The error names the
+    /// first part that cannot be assigned to, or is `None` when every part can.
+    fn invalid_for_target(&mut self, start: usize) -> Option<String> {
+        let (target, end) = self.reparse(start, |p| p.parse_exprlist())?;
+        let (what, (a, b)) = self.invalid_target_of(&target, start, end, true)?;
+        Some(self.err_span(&format!("cannot assign to {what}"), a, b))
+    }
+
+    /// Parse with `parse` from token `start` without moving the cursor or
+    /// keeping any state the attempt changed: the expression and the index of
+    /// its last token, or `None` when it does not parse.
+    fn reparse(
+        &mut self,
+        start: usize,
+        parse: impl FnOnce(&mut Self) -> Result<Expr, String>,
+    ) -> Option<(Expr, usize)> {
+        let saved = (self.pos, self.depth, self.misplaced.clone());
+        self.pos = start;
+        let parsed = parse(self).ok().map(|e| (e, self.pos - 1));
+        (self.pos, self.depth, self.misplaced) = saved;
+        parsed
+    }
+
+    /// The first `in` keyword in tokens `a..=b` outside brackets.
+    fn top_level_in(&self, a: usize, b: usize) -> Option<usize> {
+        let mut depth = 0i32;
+        (a..=b).find(|&i| {
+            match &self.toks[i].tok {
+                Tok::Op(o) if matches!(o.as_str(), "(" | "[" | "{") => depth += 1,
+                Tok::Op(o) if matches!(o.as_str(), ")" | "]" | "}") => depth -= 1,
+                Tok::Name(n) => return depth == 0 && n == "in",
+                _ => {}
+            }
+            false
+        })
+    }
+
+    /// A `with` item's `as` target that cannot be assigned to — CPython's
+    /// `invalid_with_item`, which applies when the target is followed by `,`,
+    /// `)` or `:` — positioned on the part that cannot be.
+    fn check_with_target(&self, target: &Expr, start: usize) -> Result<(), String> {
+        if !(self.at_op(",") || self.at_op(")") || self.at_op(":")) {
+            return Ok(());
+        }
+        match self.invalid_target(target, start, self.pos - 1) {
+            Some((what, (a, b))) => Err(self.err_span(&format!("cannot assign to {what}"), a, b)),
+            None => Ok(()),
         }
     }
 
@@ -1381,13 +1552,10 @@ impl Parser {
 
     fn parse_for(&mut self, out: &mut Vec<Stmt>, line: u32, is_async: bool) -> Result<(), String> {
         self.advance();
+        let start = self.pos;
         let target = self.parse_target_tuple()?;
-        if !self.eat_kw("in") {
-            return Err(format!(
-                "SyntaxError: expected 'in' in for (line {})",
-                self.line()
-            ));
-        }
+        self.check_for_target(&target, start, false)?;
+        self.advance(); // in
         let iter = self.parse_exprlist()?;
         let body = self.parse_loop_body("'for' statement", line)?;
         let orelse = if self.at_kw("else") {
@@ -1461,9 +1629,11 @@ impl Parser {
     /// Returns `Ok(None)` with the cursor exactly where it started when the
     /// group is not an item list; a parse error inside the group is not an
     /// error here, it is a non-match (the fallback path reports the real one).
-    fn parenthesized_with_items(&mut self) -> Option<Vec<WithItem>> {
+    /// The one error it does report is CPython's `invalid_with_item`: an `as`
+    /// target that cannot be assigned to.
+    fn parenthesized_with_items(&mut self) -> Result<Option<Vec<WithItem>>, String> {
         if !self.at_op("(") {
-            return None;
+            return Ok(None);
         }
         let save = self.pos;
         self.advance();
@@ -1479,10 +1649,11 @@ impl Parser {
             };
             let vars = if self.eat_kw("as") {
                 let start = self.pos;
-                match self.parse_ternary() {
-                    Ok(v) => Some(self.span_unpack_target(v, start)),
-                    Err(_) => break false,
-                }
+                let Ok(v) = self.parse_ternary() else {
+                    break false;
+                };
+                self.check_with_target(&v, start)?;
+                Some(self.span_unpack_target(v, start))
             } else {
                 None
             };
@@ -1492,15 +1663,15 @@ impl Parser {
             }
         };
         if shaped && self.eat_op(")") && self.at_op(":") {
-            return Some(items);
+            return Ok(Some(items));
         }
         self.pos = save;
-        None
+        Ok(None)
     }
 
     fn parse_with(&mut self, out: &mut Vec<Stmt>, line: u32, is_async: bool) -> Result<(), String> {
         self.advance();
-        let items = match self.parenthesized_with_items() {
+        let items = match self.parenthesized_with_items()? {
             Some(items) => items,
             None => {
                 let mut items = Vec::new();
@@ -1509,6 +1680,7 @@ impl Parser {
                     let vars = if self.eat_kw("as") {
                         let start = self.pos;
                         let v = self.parse_ternary()?;
+                        self.check_with_target(&v, start)?;
                         Some(self.span_unpack_target(v, start))
                     } else {
                         None
@@ -1824,7 +1996,7 @@ impl Parser {
                 // `class C(*bases)`: the base list is built at run time, as
                 // a call's `*iterable` argument is.
                 if self.eat_op("*") {
-                    order.star()?;
+                    order.star().map_err(|e| self.star_error_span(e))?;
                     bases.push(Expr::Starred(Box::new(self.parse_expr()?)));
                 } else if self.eat_op("**") {
                     order.kw_unpack = true;
@@ -2221,7 +2393,11 @@ impl Parser {
         self.expect_op("(")?;
         let mut pos = Vec::new();
         let mut kw = Vec::new();
+        // The token span of every positional sub-pattern that follows a keyword
+        // one, for CPython's `invalid_class_pattern`.
+        let mut late: Vec<(usize, usize)> = Vec::new();
         while !self.at_op(")") {
+            let start = self.pos;
             // keyword sub-pattern: name=pattern
             if self.at_identifier()
                 && matches!(&self.toks[self.pos + 1].tok, Tok::Op(o) if o == "=")
@@ -2231,10 +2407,24 @@ impl Parser {
                 kw.push((kn, self.parse_pattern()?));
             } else {
                 pos.push(self.parse_pattern()?);
+                if !kw.is_empty() {
+                    late.push((start, self.pos - 1));
+                }
             }
             if !self.eat_op(",") {
                 break;
             }
+        }
+        // `[positional ','] keyword_patterns ',' positional_patterns`: the
+        // error spans the first run of positional sub-patterns after a keyword.
+        if let Some(&(first, mut last)) = late.first() {
+            for &(a, b) in &late[1..] {
+                if a != last + 2 {
+                    break;
+                }
+                last = b;
+            }
+            return Err(self.err_span("positional patterns follow keyword patterns", first, last));
         }
         self.expect_op(")")?;
         Ok(Pattern::Class { cls, pos, kw })
@@ -2763,7 +2953,7 @@ impl Parser {
         let mut order = ArgOrder::default();
         while !self.at_op(")") {
             if self.eat_op("*") {
-                order.star()?;
+                order.star().map_err(|e| self.star_error_span(e))?;
                 args.push(Expr::Starred(Box::new(self.parse_expr()?)));
             } else if self.eat_op("**") {
                 order.kw_unpack = true;
@@ -3333,13 +3523,10 @@ impl Parser {
         while self.at_kw("for") || self.at_kw("async") {
             let is_async = self.eat_kw("async");
             self.advance(); // for
+            let start = self.pos;
             let target = self.parse_target_tuple()?;
-            if !self.eat_kw("in") {
-                return Err(format!(
-                    "SyntaxError: comprehension missing 'in' (line {})",
-                    self.line()
-                ));
-            }
+            self.check_for_target(&target, start, true)?;
+            self.advance(); // in
             let iter = self.parse_or()?;
             let mut ifs = Vec::new();
             while self.at_kw("if") {

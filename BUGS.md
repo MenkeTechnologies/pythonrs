@@ -31,6 +31,20 @@ written.
   non-generic alias raises `Only generic type aliases are subscriptable`),
   hashing and `not callable` follow CPython, in module, class and function
   bodies alike. A `TypeVar` now also joins a `|` union.
+- **`for`/`with`/comprehension targets, `*` after `**`, undecodable literals
+  and late positional class sub-patterns are positioned `SyntaxError`s.** An
+  invalid `for` or comprehension target was the compiler's unpositioned
+  `cannot assign to this expression`; the parser now ports
+  `invalid_for_target` (re-reading the clause as `star_expressions`, so
+  `for a + b in x` names the `expression`), `invalid_for_if_clause` (`'in'
+  expected after for-loop variables`) and `invalid_with_item`, naming the part
+  that cannot be assigned at its position, inside the parentheses of a group;
+  a `for` with no `in` is `invalid syntax` at the next token rather than a
+  pythonrs sentence. `f(**x, *y)` runs from the comma to the tokenizer's
+  cursor as `RAISE_SYNTAX_ERROR_STARTING_FROM` does; a string or bytes literal
+  that fails to decode spans the literal; `C(x=1, 2)` is `positional patterns
+  follow keyword patterns` where it used to run; and a span that reaches a later
+  line leaves `text` without its newline, as pegen does.
 - **`dir()` of a builtin type is CPython's full listing.** `dir(int)`,
   `dir(str)`, `dir(list)`, `dir(dict)` and the rest of the 13 builtin types (and
   their values: `dir(5) == dir(int)`) name every slot wrapper, classmethod, data
@@ -1661,30 +1675,16 @@ written.
   closes its groups early but ends them late, so `re.match(r'(?=(ab))(a)',
   'ab').lastindex` is 1 here and 2 in CPython.
 
-- **Some `SyntaxError`s are still worded by pythonrs, or carry no position.**
-  The tokenizer's and parser's errors now carry CPython's message, `lineno`,
-  `offset`, `end_lineno`, `end_offset`, `text` and `filename`, and a program
-  that does not compile prints CPython's `File`/source/caret block (see
-  `tests/syntax_errors.rs` for the measured set). What remains, measured
-  against CPython 3.14.7 through `exec`:
-
-  ```
-  f(**x, *y)       same message, no position here
-  '\N{bogus}'      same message, no position here
-  for 1 in x: …    cannot assign to this expression, where CPython names it
-  ```
-
-  The compiler's own errors (pattern-matching errors, an invalid
-  `for`/`with`/comprehension target) carry no position: the compiler sees no
-  columns. A misplaced `yield`/`yield from`/`await` is positioned — the parser
-  records its span — unless it continues onto another line, which a span
-  cannot hold; `'yield' inside list comprehension` (and the set, dict and
-  generator forms) is raised as the symbol table raises it, where pythonrs
-  used to run the program. Assignment, augmented-assignment
-  and `del` targets, `return`/`break`/`continue` in the wrong place, duplicate
-  parameters and a module-level `nonlocal` are positioned, because the parser
-  checks them; so are the symbol-table errors on a `global`/`nonlocal`
-  statement, whose extent the parser records.
+- **The compiler's pattern-matching `SyntaxError`s carry no position.**
+  `name capture 'a' makes remaining patterns unreachable`, `wildcard makes
+  remaining patterns unreachable`, `multiple assignments to name 'a' in
+  pattern` and `alternative patterns bind different names` are CPython's
+  wording, but `exec` gives them `lineno`/`offset`/`end_lineno`/`end_offset`
+  of `None` where CPython 3.14 positions them on the pattern (`case a | b:` is
+  line 2, offsets 10-11; `text` stays `None` in both, as for any compiler
+  error). The `Pattern` AST carries no spans for the compiler to report.
+  Everything else measured in `tests/syntax_errors.rs` — tokenizer, parser,
+  symbol-table and target errors — is positioned and worded as CPython's.
 - **A bridged exception carries no CPython traceback.** An exception that crosses
   from pythonrs into CPython is rebuilt as a fresh exception object, so its
   `__traceback__` is empty. Two visible consequences, both in code that is not

@@ -190,6 +190,29 @@ impl Lexer {
         out
     }
 
+    /// An error decoding the string literal just scanned, positioned over the
+    /// whole literal as CPython positions the errors its string parser raises
+    /// (`_PyPegen_decode_string`'s caller reports the token): from its first
+    /// character on its first line to just past its closing quote. The text is
+    /// that first line, newline-terminated only when the literal ends on it
+    /// (measured against CPython 3.14's `SyntaxError.text`).
+    fn literal_err(&self, err: String) -> String {
+        let before = &self.src[..self.tok_start];
+        let line = 1 + before.iter().filter(|&&c| c == '\n').count() as u32;
+        let line_start = before.iter().rposition(|&c| c == '\n').map_or(0, |i| i + 1);
+        let col = (self.tok_start - line_start) as i64;
+        let text = self.line_text(line);
+        // pegen converts every offset against the FIRST line's text, which
+        // clamps an end on a later line to one past that line's length.
+        let mut end_offset = (self.pos - self.line_start) as i64 + 1;
+        if line != self.line {
+            end_offset = end_offset.min(text.chars().count() as i64 + 1);
+        }
+        let err = crate::parser::at_pos(&err, line, col + 1, self.line, end_offset);
+        let newline = if line == self.line { "\n" } else { "" };
+        crate::parser::with_text(err, &format!("{text}{newline}"))
+    }
+
     /// A tokenizer error at `line`/`col` (0-based column), carrying the line's
     /// text without its newline, as CPython's tokenizer reports it.
     fn tok_err(&self, msg: &str, line: u32, col: usize, end_col: i64) -> String {
@@ -623,13 +646,13 @@ impl Lexer {
         } else if is_f {
             self.push(Tok::FString(raw, is_raw));
         } else if is_bytes {
-            let decoded = decode_bytes_escapes(&raw, is_raw)?;
+            let decoded = decode_bytes_escapes(&raw, is_raw).map_err(|e| self.literal_err(e))?;
             // Each decoded code point is one byte (latin-1): `\xff` -> 0xFF, not
             // its two-byte UTF-8 encoding.
             let bytes: Vec<u8> = decoded.chars().map(|c| c as u32 as u8).collect();
             self.push(Tok::Bytes(bytes));
         } else {
-            let decoded = decode_escapes(&raw, is_raw)?;
+            let decoded = decode_escapes(&raw, is_raw).map_err(|e| self.literal_err(e))?;
             self.push(Tok::Str(decoded));
         }
         Ok(())

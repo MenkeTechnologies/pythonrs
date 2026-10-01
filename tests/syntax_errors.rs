@@ -445,6 +445,64 @@ fn invalid_targets_are_named_at_the_offending_expression() {
     );
 }
 
+/// The `for`, comprehension and `with` targets CPython's `invalid_for_target`,
+/// `invalid_for_if_clause` and `invalid_with_item` name at the offending part
+/// (the parenthesized group's contents for a group), `*iterable` after `**`
+/// from its comma to the tokenizer's cursor, a string literal that does not
+/// decode over the whole literal, and a positional class sub-pattern after a
+/// keyword one. A span reaching a later line leaves `text` without its newline.
+#[test]
+fn for_with_targets_unpacking_and_literals_are_positioned() {
+    let out = Command::new(env!("CARGO_BIN_EXE_python"))
+        .args(["-c", r#"for s in ['f(**x, *y)', 'f(**x, *y, *z)', 'f(**x, *y, z)', 'f(a, **x, *y)', 'f(**x, a=1, *y)', 'f(**x,\n  *y)', 'class C(**k, *b): pass', "'\\N{bogus}'", "x = '''a\n\\N{bogus}'''", "x = b'\\x4'", "x = '\\U00110000'", 'for 1 in x: pass', 'for f() in x: pass', 'for x, 1 in y: pass', 'for (x, f()) in y: pass', 'for [*a, 1] in y: pass', 'for 1 x: pass', 'for a + b in x: pass', 'for None in x: pass', 'for (1) in x: pass', 'for a x: pass', 'for a: pass', '[x for 1 in y]', '{x for f() in y}', 'f(x for 1 in y)', '[x for (yield) in y]', '[x for a x in y]', '[x for a]', 'with a as 1: pass', 'with (a as 1, b as c): pass', 'with a as (b, 1): pass', 'with a as b.c, d as 1: pass', '(1) = 2', 'del (1)', 'match x:\n    case C(1, x=1, 2, 3): pass', 'match x:\n    case C(x=1, 2, y=3, 4): pass']:
+  try: compile(s, '<s>', 'exec')
+  except SyntaxError as e: print(repr(s), (e.msg, e.lineno, e.offset, e.end_lineno, e.end_offset, e.text))
+  else: print(repr(s), 'OK')
+"#])
+        .output()
+        .expect("spawn python");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        r#"'f(**x, *y)' ('iterable argument unpacking follows keyword argument unpacking', 1, 6, 1, 10, 'f(**x, *y)\n')
+'f(**x, *y, *z)' ('iterable argument unpacking follows keyword argument unpacking', 1, 6, 1, 14, 'f(**x, *y, *z)\n')
+'f(**x, *y, z)' ('iterable argument unpacking follows keyword argument unpacking', 1, 6, 1, 12, 'f(**x, *y, z)\n')
+'f(a, **x, *y)' ('iterable argument unpacking follows keyword argument unpacking', 1, 9, 1, 13, 'f(a, **x, *y)\n')
+'f(**x, a=1, *y)' ('iterable argument unpacking follows keyword argument unpacking', 1, 11, 1, 15, 'f(**x, a=1, *y)\n')
+'f(**x,\n  *y)' ('iterable argument unpacking follows keyword argument unpacking', 1, 6, 2, 5, 'f(**x,')
+'class C(**k, *b): pass' ('iterable argument unpacking follows keyword argument unpacking', 1, 12, 1, 16, 'class C(**k, *b): pass\n')
+"'\\N{bogus}'" ("(unicode error) 'unicodeescape' codec can't decode bytes in position 0-8: unknown Unicode character name", 1, 1, 1, 12, "'\\N{bogus}'\n")
+"x = '''a\n\\N{bogus}'''" ("(unicode error) 'unicodeescape' codec can't decode bytes in position 2-10: unknown Unicode character name", 1, 5, 2, 9, "x = '''a")
+"x = b'\\x4'" ('(value error) invalid \\x escape at position 0', 1, 5, 1, 11, "x = b'\\x4'\n")
+"x = '\\U00110000'" ("(unicode error) 'unicodeescape' codec can't decode bytes in position 0-9: illegal Unicode character", 1, 5, 1, 17, "x = '\\U00110000'\n")
+'for 1 in x: pass' ('cannot assign to literal', 1, 5, 1, 6, 'for 1 in x: pass\n')
+'for f() in x: pass' ('cannot assign to function call', 1, 5, 1, 8, 'for f() in x: pass\n')
+'for x, 1 in y: pass' ('cannot assign to literal', 1, 8, 1, 9, 'for x, 1 in y: pass\n')
+'for (x, f()) in y: pass' ('cannot assign to function call', 1, 9, 1, 12, 'for (x, f()) in y: pass\n')
+'for [*a, 1] in y: pass' ('cannot assign to literal', 1, 10, 1, 11, 'for [*a, 1] in y: pass\n')
+'for 1 x: pass' ('cannot assign to literal', 1, 5, 1, 6, 'for 1 x: pass\n')
+'for a + b in x: pass' ('cannot assign to expression', 1, 5, 1, 10, 'for a + b in x: pass\n')
+'for None in x: pass' ('cannot assign to None', 1, 5, 1, 9, 'for None in x: pass\n')
+'for (1) in x: pass' ('cannot assign to literal', 1, 6, 1, 7, 'for (1) in x: pass\n')
+'for a x: pass' ('invalid syntax', 1, 7, 1, 8, 'for a x: pass\n')
+'for a: pass' ('invalid syntax', 1, 6, 1, 7, 'for a: pass\n')
+'[x for 1 in y]' ('cannot assign to literal', 1, 8, 1, 9, '[x for 1 in y]\n')
+'{x for f() in y}' ('cannot assign to function call', 1, 8, 1, 11, '{x for f() in y}\n')
+'f(x for 1 in y)' ('cannot assign to literal', 1, 9, 1, 10, 'f(x for 1 in y)\n')
+'[x for (yield) in y]' ('cannot assign to yield expression', 1, 9, 1, 14, '[x for (yield) in y]\n')
+'[x for a x in y]' ("'in' expected after for-loop variables", 1, 10, 1, 11, '[x for a x in y]\n')
+'[x for a]' ("'in' expected after for-loop variables", 1, 9, 1, 10, '[x for a]\n')
+'with a as 1: pass' ('cannot assign to literal', 1, 11, 1, 12, 'with a as 1: pass\n')
+'with (a as 1, b as c): pass' ('cannot assign to literal', 1, 12, 1, 13, 'with (a as 1, b as c): pass\n')
+'with a as (b, 1): pass' ('cannot assign to literal', 1, 15, 1, 16, 'with a as (b, 1): pass\n')
+'with a as b.c, d as 1: pass' ('cannot assign to literal', 1, 21, 1, 22, 'with a as b.c, d as 1: pass\n')
+'(1) = 2' ("cannot assign to literal here. Maybe you meant '==' instead of '='?", 1, 2, 1, 3, '(1) = 2\n')
+'del (1)' ('cannot delete literal', 1, 6, 1, 7, 'del (1)\n')
+'match x:\n    case C(1, x=1, 2, 3): pass' ('positional patterns follow keyword patterns', 2, 20, 2, 24, '    case C(1, x=1, 2, 3): pass\n')
+'match x:\n    case C(x=1, 2, y=3, 4): pass' ('positional patterns follow keyword patterns', 2, 17, 2, 18, '    case C(x=1, 2, y=3, 4): pass\n')
+"#
+    );
+}
+
 /// `compile()` — which pythonrs lacked — checks the source in its mode and
 /// returns a code object `exec` and `eval` run as that mode under its
 /// filename; and what `eval` accepts is one expression list and nothing after.
