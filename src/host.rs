@@ -13349,6 +13349,14 @@ impl PyHost {
                         }
                     }
                 }
+                // `dictview.mapping` — a read-only `mappingproxy` over the
+                // view's dict (`dictview_mapping`).
+                if name == "mapping" {
+                    if let Some(PyObj::DictView { dict, .. }) = self.get(recv) {
+                        let dict = dict.clone();
+                        return Ok(self.alloc(PyObj::MappingProxy { dict }));
+                    }
+                }
                 // `deque.maxlen` — the read-only length bound (an int) or `None`.
                 if name == "maxlen" {
                     if let Some(PyObj::Deque { maxlen, .. }) = self.get(recv) {

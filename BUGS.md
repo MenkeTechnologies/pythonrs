@@ -380,6 +380,15 @@ written.
   missing count as zero. The operator slots of `defaultdict`/`OrderedDict` and
   of the keys/items views also answer as bound methods (`dd.__or__(d)`,
   `d.keys().__rsub__(it)`).
+- **`Counter`'s in-place operators, `deque.copy`/`reverse`, `__missing__`.**
+  `c += d` rebound `c` to a new Counter, `c += {'a': 1}` and `c -= …` raised
+  TypeError, `c &= …` was unsupported and `c |= …` kept non-positive counts;
+  they are now ports of `Counter.__iadd__`/`__isub__`/`__ior__`/`__iand__`
+  (any mapping's `items()`, `_keep_positive`, the receiver returned). The
+  Counter operator and comparison dunders answer by name. `deque.copy()`,
+  `deque.__copy__()` and `deque.reverse()` did not exist, nor
+  `defaultdict.__missing__`/`__copy__`, `Counter.__missing__` or a dict view's
+  `mapping`.
 - **`stdout`/`stderr` are buffered as CPython buffers them.** pythonrs flushed
   every write, so `python prog.py > log 2>&1` came out in program order where
   CPython's comes out in flush order (`err1 err2 out1 out2` for two

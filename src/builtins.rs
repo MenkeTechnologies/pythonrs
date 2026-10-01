@@ -535,6 +535,13 @@ fn instance_defines(recv: &Value, name: &str) -> bool {
 fn b_getitem(vm: &mut VM, _: u8) -> Value {
     let idx = vm.pop();
     let recv = vm.pop();
+    let r = getitem_value(recv, idx);
+    finish(vm, r)
+}
+
+/// `recv[idx]` -- the subscript load outside the VM, for builtins that index
+/// the way the operator does (`Counter.__iand__` reading `other[elem]`).
+pub fn getitem_value(recv: Value, idx: Value) -> Result<Value, String> {
     // Fast path: a plain builtin SEQUENCE indexed by a plain integer — `a[i]`,
     // the most common subscript there is, and the one every check below is
     // irrelevant to.
@@ -560,31 +567,28 @@ fn b_getitem(vm: &mut VM, _: u8) -> Value {
             .then(|| h.get_item(&recv, &idx))
         });
         if let Some(r) = fast {
-            return finish(vm, r);
+            return r;
         }
     }
     // __getitem__ on instances.
     if instance_defines(&recv, "__getitem__") {
         let r = host::call_method(&recv, "__getitem__", vec![idx], vec![]);
-        return finish(vm, r);
+        return r;
     }
     if with_host(|h| matches!(h.get(&recv), Some(PyObj::Instance(_)))) {
         let tn = with_host(|h| h.type_name(&recv));
-        return abort(
-            vm,
-            host::type_error(&format!("'{tn}' object is not subscriptable")),
-        );
+        return Err(host::type_error(&format!("'{tn}' object is not subscriptable")));
     }
     // `Cls[item]` on a class with `__class_getitem__` (e.g. generic aliases).
     if let Some(r) = host::class_getitem(&recv, idx.clone()) {
-        return finish(vm, r);
+        return r;
     }
     // A metaclass `__getitem__` makes the CLASS subscriptable and outranks any
     // generic-alias reading: `class M(type): __getitem__` then `C[x]` runs
     // `M.__getitem__(C, x)`, exactly as an instance's `__getitem__` would.
     if let Some(m) = with_host(|h| h.metaclass_method(&recv, "__getitem__")) {
         let r = host::invoke(&m, vec![recv.clone(), idx], vec![]);
-        return finish(vm, r);
+        return r;
     }
     // dict-subclass `__missing__`: Counter → 0, defaultdict → default_factory().
     if let Some(meta) = host::dict_meta_of(&recv) {
@@ -597,7 +601,7 @@ fn b_getitem(vm: &mut VM, _: u8) -> Value {
         });
         if missing {
             match meta.kind {
-                host::DictKind::Counter => return finish(vm, Ok(Value::Int(0))),
+                host::DictKind::Counter => return Ok(Value::Int(0)),
                 host::DictKind::DefaultDict => {
                     if let Some(factory) = meta.factory {
                         let r = (|| {
@@ -605,7 +609,7 @@ fn b_getitem(vm: &mut VM, _: u8) -> Value {
                             with_host(|h| h.set_item(&recv, &idx, default.clone()))?;
                             Ok(default)
                         })();
-                        return finish(vm, r);
+                        return r;
                     }
                 }
                 host::DictKind::OrderedDict => {}
@@ -619,13 +623,13 @@ fn b_getitem(vm: &mut VM, _: u8) -> Value {
         if with_host(|h| matches!(h.get(&idx), Some(PyObj::Slice { .. }))) {
             match normalize_slice_bounds(&idx) {
                 Ok(v) => v,
-                Err(e) => return abort(vm, e),
+                Err(e) => return Err(e),
             }
         } else {
             match index_dunder(&idx) {
                 Ok(Some(v)) => v,
                 Ok(None) => idx,
-                Err(e) => return abort(vm, e),
+                Err(e) => return Err(e),
             }
         }
     } else {
@@ -635,19 +639,19 @@ fn b_getitem(vm: &mut VM, _: u8) -> Value {
     // OUTSIDE the borrow so a `@dataclass` with a user `__getitem__` re-enters.
     #[cfg(feature = "stdlib-ffi")]
     if let Some(id) = with_host(|h| h.foreign_id(&recv)) {
-        return finish(vm, crate::ffi::get_item_cb(id, &idx));
+        return crate::ffi::get_item_cb(id, &idx);
     }
     // Subscripting a TYPE object is generic parameterization, not indexing:
     // `list[int]`, `dict[str, int]`, `Cls[T]` -> a `types.GenericAlias`. Handle it
     // here (outside the `get_item` borrow) because it can re-enter the VM.
     if host::is_generic_subscriptable(&recv) {
-        return finish(vm, host::generic_alias(&recv, &idx));
+        return host::generic_alias(&recv, &idx);
     }
     let cands = host::instance_key_candidates_for(&recv, Some(&idx));
     let r = host::with_instance_key(&idx, host::KeyRole::Of(&recv), &cands, || {
         with_host(|h| h.get_item(&recv, &idx))
     });
-    finish(vm, r)
+    r
 }
 
 /// Whether `recv[idx] = v` / `del recv[idx]` can go straight to the store.
@@ -3025,6 +3029,9 @@ fn inplace_builtin(tag: i64, a: &Value, b: &Value) -> Option<Result<Value, Strin
             Some(Ok(_)) => Some(Ok(a.clone())),
             other => other,
         };
+    }
+    if let Some(r) = counter_inplace(tag, a, b) {
+        return Some(r);
     }
     // list: `+=` extends with any iterable; `*=` repeats in place.
     if with_host(|h| matches!(h.get(a), Some(PyObj::List(_)))) {
@@ -13493,10 +13500,13 @@ fn own_dir_names(typename: &str) -> Vec<&'static str> {
             out.extend_from_slice(DICT_METHODS);
             out.push("move_to_end");
         }
-        "defaultdict" => out.extend_from_slice(DICT_METHODS),
+        "defaultdict" => {
+            out.extend_from_slice(DICT_METHODS);
+            out.extend_from_slice(DEFAULTDICT_EXTRA);
+        }
         "Counter" => {
             out.extend_from_slice(DICT_METHODS);
-            out.extend_from_slice(&["most_common", "elements", "subtract", "update", "total"]);
+            out.extend_from_slice(COUNTER_EXTRA);
         }
         "dict_keys" | "dict_items" => out.push("isdisjoint"),
         "Context" => out.extend_from_slice(&["run", "copy", "get", "keys", "values", "items"]),
@@ -13626,6 +13636,7 @@ pub fn type_data_attrs(tn: &str) -> &'static [&'static str] {
         "generator" | "coroutine" => &["__name__", "__qualname__", "gi_running", "gi_suspended"],
         "deque" => &["maxlen"],
         "defaultdict" => &["default_factory"],
+        "dict_keys" | "dict_values" | "dict_items" => &["mapping"],
         "memoryview" => &[
             "obj",
             "nbytes",
@@ -13695,14 +13706,10 @@ pub fn type_has_method(typename: &str, name: &str) -> bool {
     // table-backed types already answered above via `type_method_names`.
     let list: &[&str] = match typename {
         "OrderedDict" => return DICT_METHODS.contains(&name) || name == "move_to_end",
-        "defaultdict" => return DICT_METHODS.contains(&name),
-        "Counter" => {
-            return DICT_METHODS.contains(&name)
-                || matches!(
-                    name,
-                    "most_common" | "elements" | "subtract" | "update" | "total"
-                )
+        "defaultdict" => {
+            return DICT_METHODS.contains(&name) || DEFAULTDICT_EXTRA.contains(&name)
         }
+        "Counter" => return DICT_METHODS.contains(&name) || COUNTER_EXTRA.contains(&name),
         "dict_keys" | "dict_items" => return name == "isdisjoint",
         // A C-level attribute descriptor is callable through the descriptor
         // protocol: `type.__dict__['__annotations__'].__get__(cls)`.
@@ -13967,6 +13974,9 @@ const DEQUE_METHODS: &[&str] = &[
     "index",
     "remove",
     "insert",
+    "copy",
+    "__copy__",
+    "reverse",
 ];
 const FILE_METHODS: &[&str] = &[
     "read",
@@ -14245,6 +14255,9 @@ fn op_dunders(typename: &str) -> &'static [&'static str] {
         "tuple" => SEQ,
         "list" | "deque" => MUT_SEQ,
         "dict" | "defaultdict" | "OrderedDict" => DICT,
+        // `Counter` overrides `__or__` (see `COUNTER_EXTRA`) but inherits
+        // `dict.__ror__`.
+        "Counter" => &["__ror__"],
         "set" => SET,
         "dict_keys" | "dict_items" => VIEW,
         "frozenset" => FROZENSET,
@@ -14265,7 +14278,7 @@ fn op_dunder_accepts(tn: &str, name: &str, b: &Value) -> bool {
         }
         // `dict.__ior__` takes anything `update` does (a mapping OR an iterable
         // of pairs); `|` and its reflection need a mapping.
-        "dict" | "defaultdict" | "OrderedDict" if name != "__ior__" => {
+        "dict" | "defaultdict" | "OrderedDict" | "Counter" if name != "__ior__" => {
             with_host(|h| matches!(h.get(b), Some(PyObj::Dict(_))))
         }
         "complex" => is_num_like(b) || with_host(|h| h.is_complex(b)),
@@ -15411,6 +15424,21 @@ pub fn call_type_method(
     if name == "__contains__" {
         let item = arg0(&args)?;
         return Ok(Value::Bool(with_host(|h| h.contains(&item, recv))?));
+    }
+    // `Counter` and `OrderedDict` define their own comparisons, which outrank
+    // `object`'s: a Counter compares only with a Counter (else
+    // NotImplemented), and two OrderedDicts compare in order.
+    if let Some(op) = comparison_dunder_op(name) {
+        if tn == "Counter" || tn == "OrderedDict" {
+            let other = arg0(&args)?;
+            match collections_compare(op, recv, &other) {
+                Some(r) => return r,
+                None if tn == "Counter" => {
+                    return Ok(with_host(|h| h.alloc(PyObj::NotImplemented)))
+                }
+                None => {}
+            }
+        }
     }
     // The `object`-level surface every value inherits — `dir()` lists all of
     // [`OBJECT_DUNDERS`] on every builtin type, so each has to ANSWER rather
@@ -20441,6 +20469,23 @@ fn collect_bytes(v: &Value) -> Result<Vec<u8>, String> {
 
 fn deque_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
     match name {
+        // `deque_copy`: a new deque holding the same items, with the same `maxlen`.
+        "copy" | "__copy__" => with_host(|h| match h.get(recv) {
+            Some(PyObj::Deque { items, maxlen }) => {
+                let (items, maxlen) = (items.clone(), *maxlen);
+                Ok(h.alloc(PyObj::Deque { items, maxlen }))
+            }
+            _ => Err(host::type_error("descriptor requires a 'collections.deque' object")),
+        }),
+        // `deque_reverse`: in place, returning None.
+        "reverse" => {
+            with_host(|h| {
+                if let Some(PyObj::Deque { items, .. }) = h.get_mut(recv) {
+                    items.make_contiguous().reverse();
+                }
+            });
+            Ok(Value::Undef)
+        }
         "append" => {
             let v = arg0(args)?;
             with_host(|h| {
@@ -20632,8 +20677,82 @@ fn collections_dict_method(
         ("Counter", "update") => Some(counter_add(recv, args, kwargs, 1)),
         ("OrderedDict", "move_to_end") => Some(ordered_move_to_end(recv, args, kwargs)),
         ("OrderedDict", "popitem") => Some(ordered_popitem(recv, args, kwargs)),
+        ("defaultdict", "__missing__") => Some(arg0(args).and_then(|key| defdict_missing(recv, key))),
+        ("defaultdict", "__copy__") => Some(dict_method(recv, "copy", &[], &[])),
+        ("Counter", "__missing__") => Some(arg0(args).map(|_| Value::Int(0))),
+        ("Counter", _) => counter_dunder(recv, name, args),
         _ => None,
     }
+}
+
+/// The names `defaultdict` adds to `dict`'s methods.
+const DEFAULTDICT_EXTRA: &[&str] = &["__missing__", "__copy__"];
+
+/// The names `Counter` adds to `dict`'s methods: its own methods, `__missing__`
+/// and the operator dunders `collections/__init__.py` defines.
+const COUNTER_EXTRA: &[&str] = &[
+    "most_common",
+    "elements",
+    "subtract",
+    "update",
+    "total",
+    "__missing__",
+    "__add__",
+    "__sub__",
+    "__or__",
+    "__and__",
+    "__pos__",
+    "__neg__",
+    "__iadd__",
+    "__isub__",
+    "__ior__",
+    "__iand__",
+];
+
+/// `defaultdict.__missing__(key)` (`defdict_missing`): with no factory it raises
+/// `KeyError(key)`; otherwise it stores `default_factory()` under the key and
+/// returns it.
+fn defdict_missing(recv: &Value, key: Value) -> Result<Value, String> {
+    let factory = host::dict_meta_of(recv).and_then(|m| m.factory);
+    match factory {
+        Some(f) if !matches!(f, Value::Undef) => {
+            let value = host::invoke(&f, vec![], vec![])?;
+            subscript_store(recv, key, value.clone())?;
+            Ok(value)
+        }
+        _ => Err(with_host(|h| h.key_error(&key))),
+    }
+}
+
+/// `Counter`'s operator dunders called by name. The binary ones answer
+/// `NotImplemented` for a non-Counter operand, as their `isinstance` guard
+/// does; the in-place and unary ones run what the operators run..
+fn counter_dunder(recv: &Value, name: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    use host::iop;
+    let binary = |sym: char| -> Result<Value, String> {
+        let other = arg0(args)?;
+        match counter_binop(recv, &other, sym) {
+            Some(r) => r,
+            None => Ok(with_host(|h| h.alloc(PyObj::NotImplemented))),
+        }
+    };
+    let inplace = |tag: i64| -> Result<Value, String> {
+        let other = arg0(args)?;
+        counter_inplace(tag, recv, &other).unwrap_or_else(|| Ok(recv.clone()))
+    };
+    Some(match name {
+        "__add__" => binary('+'),
+        "__sub__" => binary('-'),
+        "__or__" => binary('|'),
+        "__and__" => binary('&'),
+        "__pos__" => with_host(|h| h.unary(host::unop::POS, recv)),
+        "__neg__" => numeric_hook(NumOp::Neg, recv, &Value::Undef),
+        "__iadd__" => inplace(iop::ADD),
+        "__isub__" => inplace(iop::SUB),
+        "__ior__" => inplace(iop::BITOR),
+        "__iand__" => inplace(iop::BITAND),
+        _ => return None,
+    })
 }
 
 /// `Counter.total()` — the sum of the counts, added with the numeric `+` so the
@@ -20730,6 +20849,88 @@ fn counter_elements(recv: &Value) -> Result<Value, String> {
         }
     }
     Ok(with_host(|h| h.new_list(out)))
+}
+
+/// `mapping.items()` as `(key, value)` pairs -- what `Counter`'s in-place
+/// operators walk. A non-mapping fails as `other.items()` does.
+fn mapping_items(m: &Value) -> Result<Vec<(Value, Value)>, String> {
+    let view = host::call_method(m, "items", vec![], vec![])?;
+    let mut out = Vec::new();
+    for pair in host::iter_vec(&view)? {
+        let kv = with_host(|h| match h.get(&pair) {
+            Some(PyObj::Tuple(t)) if t.len() == 2 => Some((t[0].clone(), t[1].clone())),
+            _ => None,
+        });
+        out.push(kv.ok_or_else(|| host::type_error("items() must yield (key, value) pairs"))?);
+    }
+    Ok(out)
+}
+
+/// `Counter.__iadd__`/`__isub__`/`__ior__`/`__iand__`: update the receiver in
+/// place from `other.items()` (`&=` walks the receiver and reads `other[elem]`
+/// instead), then `_keep_positive()` and return the receiver itself. `None`
+/// unless the receiver is a `Counter` and the operator one of those four.
+fn counter_inplace(tag: i64, a: &Value, b: &Value) -> Option<Result<Value, String>> {
+    use host::iop;
+    if host::dict_meta_of(a)?.kind != host::DictKind::Counter
+        || !matches!(tag, iop::ADD | iop::SUB | iop::BITOR | iop::BITAND)
+    {
+        return None;
+    }
+    let is_true = |op: NumOp, x: &Value, y: &Value| py_bool(&numeric_hook(op, x, y)?);
+    let run = || -> Result<Value, String> {
+        if tag == iop::BITAND {
+            for (elem, count) in mapping_items(a)? {
+                let other_count = getitem_value(b.clone(), elem.clone())?;
+                if is_true(NumOp::Lt, &other_count, &count)? {
+                    subscript_store(a, elem, other_count)?;
+                }
+            }
+        } else {
+            for (elem, count) in mapping_items(b)? {
+                let current = getitem_value(a.clone(), elem.clone())?;
+                match tag {
+                    iop::ADD => subscript_store(a, elem, numeric_hook(NumOp::Add, &current, &count)?)?,
+                    iop::SUB => subscript_store(a, elem, numeric_hook(NumOp::Sub, &current, &count)?)?,
+                    _ => {
+                        if is_true(NumOp::Gt, &count, &current)? {
+                            subscript_store(a, elem, count)?;
+                        }
+                    }
+                }
+            }
+        }
+        counter_keep_positive(a)?;
+        Ok(a.clone())
+    };
+    Some(run())
+}
+
+/// `Counter._keep_positive`: delete every element whose count is not `> 0`.
+fn counter_keep_positive(c: &Value) -> Result<(), String> {
+    let mut nonpositive = Vec::new();
+    for (elem, count) in mapping_items(c)? {
+        if !py_bool(&numeric_hook(NumOp::Gt, &count, &Value::Int(0))?)? {
+            nonpositive.push(elem);
+        }
+    }
+    for elem in nonpositive {
+        subscript_delete(c, elem)?;
+    }
+    Ok(())
+}
+
+/// The rich comparison a comparison dunder name spells.
+fn comparison_dunder_op(name: &str) -> Option<NumOp> {
+    Some(match name {
+        "__eq__" => NumOp::Eq,
+        "__ne__" => NumOp::Ne,
+        "__lt__" => NumOp::Lt,
+        "__le__" => NumOp::Le,
+        "__gt__" => NumOp::Gt,
+        "__ge__" => NumOp::Ge,
+        _ => return None,
+    })
 }
 
 /// The rich comparisons `collections` defines between two operands of its own

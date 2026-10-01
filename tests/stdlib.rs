@@ -3591,3 +3591,74 @@ x = [dd.__or__({'b': 2}), dd.__ror__({'z': 0}), dd.__or__([]), OrderedDict(a=1).
         r#"[defaultdict(<class 'int'>, {'a': 1, 'b': 2}), defaultdict(<class 'int'>, {'z': 0, 'a': 1}), NotImplemented, OrderedDict({'a': 1, 'b': 2}), {1, 5}, {5}, {1}, {7}, {(1, 2), (3, 4)}]"#
     );
 }
+
+// `deque_copy` keeps `maxlen` and shares nothing with the original;
+// `deque_reverse` reverses in place and returns None.
+#[test]
+fn deque_copy_and_reverse() {
+    let src = r#"from collections import deque
+q = deque([1, 2, 3], maxlen=5)
+c = q.copy()
+c.append(4)
+r = deque('abc')
+r.reverse()
+x = [q, c, q.__copy__(), r, deque().reverse()]
+"#;
+    assert_eq!(
+        g(src, "x"),
+        r#"[deque([1, 2, 3], maxlen=5), deque([1, 2, 3, 4], maxlen=5), deque([1, 2, 3], maxlen=5), deque(['c', 'b', 'a']), None]"#
+    );
+}
+
+// `Counter.__iadd__`/`__isub__`/`__ior__`/`__iand__` update the receiver in
+// place from any mapping's `items()` (`&=` reads `other[elem]`, so a plain
+// dict missing a key raises KeyError), then drop non-positive counts and
+// return the receiver. The operator and comparison dunders answer by name,
+// NotImplemented for a non-Counter operand where `isinstance` guards them.
+#[test]
+fn counter_inplace_operators_and_dunders_by_name() {
+    let src = r#"from collections import Counter
+def run(op, other):
+    c = Counter(a=2, b=-1)
+    c0 = c
+    try:
+        if op == '+': c += other
+        elif op == '-': c -= other
+        elif op == '|': c |= other
+        else: c &= other
+    except KeyError as e:
+        return f'KeyError {e}'
+    return (c, c is c0)
+x = [run(op, other) for op in '+-|&' for other in (Counter(a=1, c=3), {'a': 1})]
+y = Counter(a=2)
+x += [y.__or__(Counter(b=1)), y.__add__({}), +Counter(a=1, b=0, c=-1), y.__neg__(), y.__missing__('z'),
+      y.__eq__(Counter(a=2, z=0)), y.__eq__({'a': 2}), y.__ror__({'q': 1}), y.__iadd__(Counter(a=1)) is y, y]
+"#;
+    assert_eq!(
+        g(src, "x"),
+        r#"[(Counter({'a': 3, 'c': 3}), True), (Counter({'a': 3}), True), (Counter({'a': 1}), True), (Counter({'a': 1}), True), (Counter({'c': 3, 'a': 2}), True), (Counter({'a': 2}), True), (Counter({'a': 1}), True), "KeyError 'b'", Counter({'a': 2, 'b': 1}), NotImplemented, Counter({'a': 1}), Counter(), 0, True, NotImplemented, {'q': 1, 'a': 2}, True, Counter({'a': 3})]"#
+    );
+}
+
+// `defdict_missing` stores and returns `default_factory()`, or raises
+// `KeyError(key)` with no factory; `__copy__` is `copy`; a dict view's
+// `mapping` is a mappingproxy over its dict.
+#[test]
+fn defaultdict_missing_copy_and_view_mapping() {
+    let src = r#"from collections import defaultdict
+def e(f):
+    try:
+        return f()
+    except KeyError as ex:
+        return f'KeyError {ex}'
+dd = defaultdict(list)
+v = dd.__missing__('k')
+v.append(1)
+d = {1: 2}
+x = [dd, dd.__copy__(), e(lambda: defaultdict().__missing__('k')), d.keys().mapping, d.items().mapping[1]]
+"#;
+    assert_eq!(
+        g(src, "x"),
+        r#"[defaultdict(<class 'list'>, {'k': [1]}), defaultdict(<class 'list'>, {'k': [1]}), "KeyError 'k'", mappingproxy({1: 2}), 2]"#
+    );
+}
