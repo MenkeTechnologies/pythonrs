@@ -9080,6 +9080,9 @@ fn dict_pop_on_an_empty_dict_does_not_hash_the_key() {
     assert_eq!(
         eval_str("from collections import OrderedDict\nOrderedDict().pop([1])").expect_err("odict pop"),
         "TypeError: unhashable type: 'list'"
+    );
+}
+
 // `repr(float)` breaks an exact tie between two equally short round-tripping
 // decimals toward the even last digit, as CPython's dtoa does: the double
 // `…023.25` is nearest both `…023.2` and `…023.3`. Expected values are CPython
