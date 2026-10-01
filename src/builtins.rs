@@ -2997,6 +2997,11 @@ fn b_binop(vm: &mut VM, _: u8) -> Value {
         Value::Int(n) => n,
         _ => return abort(vm, "internal: BINOP tag".into()),
     };
+    if tag == host::binop::BITOR {
+        if let Some(r) = mapping_subclass_or(&a, &b) {
+            return finish(vm, r);
+        }
+    }
     // A builtin-type subclass operand with no override delegates to its native
     // payload, so the native op runs on the base value (`S1 | S2`, `C(5) // 2`).
     let (a, b) = match binop_tag_dunders(tag) {
@@ -4710,6 +4715,9 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
 
 fn numeric_hook_inner(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
     use NumOp::*;
+    if let Some(r) = deque_subclass_op(op, a, b) {
+        return r;
+    }
     // A builtin-type subclass operand with no operator override delegates to its
     // native payload, so `C(5) + 3` runs int arithmetic (yielding a plain `int`)
     // and `Stack([1]) + [2]` runs list concatenation (a plain `list`).
@@ -6367,6 +6375,10 @@ pub fn call_builtin_function(
             let v = arg0(&args)?;
             // Instance `__reversed__` wins; else `__getitem__`+`__len__` reverse.
             if with_host(|h| matches!(h.get(&v), Some(PyObj::Instance(_)))) {
+                // A builtin-subclass instance not overriding it reverses its payload.
+                if let Some(payload) = host::subclass_payload(&v, "__reversed__") {
+                    return call_builtin_function("reversed", vec![payload], vec![]);
+                }
                 let (has_rev, has_gi) = with_host(|h| match h.get(&v) {
                     Some(PyObj::Instance(i)) => (
                         h.class_lookup(&i.class, "__reversed__").is_some(),
@@ -18883,6 +18895,97 @@ fn num_dunder(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
     }
 }
 
+/// `deque_concat`/`deque_repeat` with a `deque` subclass instance as the deque
+/// operand (and no `__add__`/`__mul__` of its own): `deque_copy` builds the
+/// result through the subclass, then `extend` or `*=` fills it, so `Q + Q` is a
+/// `Q` and the subclass `__init__` runs for it. `None` for anything else.
+fn deque_subclass_op(op: NumOp, a: &Value, b: &Value) -> Option<Result<Value, String>> {
+    let is_deque_sub = |v: &Value, dunder: &str| {
+        host::collections_subclass_of(v).is_some_and(|(base, _, class)| {
+            base == "collections.deque"
+                && with_host(|h| h.class_lookup(&class, dunder).is_none())
+        })
+    };
+    match op {
+        NumOp::Add if is_deque_sub(a, "__add__") => Some((|| {
+            let other_is_deque = with_host(|h| matches!(h.get(b), Some(PyObj::Deque { .. })))
+                || host::collections_subclass_of(b).is_some_and(|(base, ..)| base == "collections.deque");
+            if !other_is_deque {
+                return Err(with_host(|h| {
+                    host::type_error(&format!(
+                        "can only concatenate deque (not \"{}\") to deque",
+                        h.tp_name(b)
+                    ))
+                }));
+            }
+            let new = host::collections_subclass_copy(a).unwrap()?;
+            if let Some((_, payload, _)) = host::collections_subclass_of(&new) {
+                call_type_method(&payload, "extend", vec![b.clone()], vec![])?;
+            }
+            Ok(new)
+        })()),
+        NumOp::Mul if is_deque_sub(a, "__mul__") || is_deque_sub(b, "__rmul__") => {
+            let (d, n) = if is_deque_sub(a, "__mul__") { (a, b) } else { (b, a) };
+            let has_index = with_host(|h| {
+                matches!(h.get(n), Some(PyObj::Instance(i)) if instance_has(h, i, "__index__"))
+            });
+            if !is_int_like(n) && !has_index {
+                return None;
+            }
+            Some((|| {
+                // `deque_inplace_repeat` on the copy's own storage, as the C
+                // code calls it directly rather than through `__imul__`.
+                let new = host::collections_subclass_copy(d).unwrap()?;
+                if let Some((_, payload, _)) = host::collections_subclass_of(&new) {
+                    call_type_method(&payload, "__imul__", vec![n.clone()], vec![])?;
+                }
+                Ok(new)
+            })())
+        }
+        _ => None,
+    }
+}
+
+/// `odict_or`/`defdict_or` with an instance of a user subclass of
+/// `OrderedDict`/`defaultdict` on either side (the left one when both): the
+/// result is built by calling that instance's class -- `type(self)(left)`, or
+/// `type(self)(self.default_factory, left)` -- and then updated from the
+/// right operand, so `OD | d` is an `OD`. `None` unless such an operand
+/// (without its own `__or__`/`__ror__`) meets a dict.
+fn mapping_subclass_or(a: &Value, b: &Value) -> Option<Result<Value, String>> {
+    let subclass = |v: &Value, dunder: &str| {
+        host::collections_subclass_of(v).filter(|(base, _, class)| {
+            matches!(*base, "collections.OrderedDict" | "collections.defaultdict")
+                && with_host(|h| h.class_lookup(class, dunder).is_none())
+        })
+    };
+    let is_dict = |v: &Value| {
+        with_host(|h| matches!(h.get(v), Some(PyObj::Dict(_))))
+            || host::subclass_payload(v, "__getitem__")
+                .is_some_and(|p| with_host(|h| matches!(h.get(&p), Some(PyObj::Dict(_)))))
+    };
+    let (this, other) = match (subclass(a, "__or__"), subclass(b, "__ror__")) {
+        (Some(s), _) => (s, b),
+        (None, Some(s)) => (s, a),
+        _ => return None,
+    };
+    if !is_dict(other) {
+        return None;
+    }
+    let (base, payload, class) = this;
+    Some((|| {
+        let cls = with_host(|h| h.alloc(PyObj::Class(class)));
+        let mut args = Vec::new();
+        if base == "collections.defaultdict" {
+            args.push(host::dict_meta_of(&payload).and_then(|m| m.factory).unwrap_or(Value::Undef));
+        }
+        args.push(a.clone());
+        let new = host::invoke(&cls, args, vec![])?;
+        host::call_method(&new, "update", vec![b.clone()], vec![])?;
+        Ok(new)
+    })())
+}
+
 /// The `host::binop` tag for a forward binary numeric dunder name.
 fn binop_dunder_tag(name: &str) -> i64 {
     use host::binop as bo;
@@ -21445,6 +21548,11 @@ fn counter_add(
         None | Some(Value::Undef) => Vec::new(),
         Some(other) => {
             let other = other.clone();
+            // A dict-subclass instance (`C(c)` for `class C(Counter)`) is a
+            // mapping too: its counts are its native payload's.
+            let other = host::subclass_payload(&other, "__getitem__")
+                .filter(|p| with_host(|h| matches!(h.get(p), Some(PyObj::Dict(_)))))
+                .unwrap_or(other);
             let is_dict = with_host(|h| matches!(h.get(&other), Some(PyObj::Dict(_))));
             if is_dict {
                 with_host(|h| match h.get(&other) {
@@ -21531,60 +21639,6 @@ fn ordered_move_to_end(
 
 // ── collections constructors ─────────────────────────────────────────────────
 
-/// Insert `key: val` (a `str` key) into a dict-backed target in place.
-fn dict_insert_str(target: &Value, key: String, val: Value) -> Result<(), String> {
-    let kv = new_str(key);
-    let k = with_host(|h| h.to_key(&kv))?;
-    with_host(|h| {
-        if let Some(PyObj::Dict(d)) = h.get_mut(target) {
-            d.insert(k, (kv, val));
-        }
-    });
-    Ok(())
-}
-
-/// Fill a dict-backed target from a mapping or an iterable of `(key, value)`
-/// pairs (`dict()`-style initialization).
-fn fill_dict_from(target: &Value, src: &Value) -> Result<(), String> {
-    if matches!(src, Value::Undef) {
-        return Ok(());
-    }
-    let is_dict = with_host(|h| matches!(h.get(src), Some(PyObj::Dict(_))));
-    if is_dict {
-        let pairs = with_host(|h| match h.get(src) {
-            Some(PyObj::Dict(d)) => d
-                .iter()
-                .map(|(k, (kv, v))| (k.clone(), kv.clone(), v.clone()))
-                .collect::<Vec<_>>(),
-            _ => vec![],
-        });
-        with_host(|h| {
-            if let Some(PyObj::Dict(d)) = h.get_mut(target) {
-                for (k, kv, v) in pairs {
-                    host::dict_put(d, k, kv, v);
-                }
-            }
-        });
-    } else {
-        let items = host::iter_vec(src)?;
-        for it in items {
-            let pair = host::iter_vec(&it)?;
-            if pair.len() != 2 {
-                return Err(host::type_error(
-                    "dictionary update sequence element has length != 2",
-                ));
-            }
-            let k = with_host(|h| h.to_key(&pair[0]))?;
-            let (kv, v) = (pair[0].clone(), pair[1].clone());
-            with_host(|h| {
-                if let Some(PyObj::Dict(d)) = h.get_mut(target) {
-                    host::dict_put(d, k, kv, v);
-                }
-            });
-        }
-    }
-    Ok(())
-}
 
 /// Construct a `collections` type: `deque` / `Counter` / `defaultdict` /
 /// `OrderedDict` / `namedtuple`.
@@ -21653,34 +21707,38 @@ fn construct_collection(
             counter_add(&c, &args, &kwargs, 1)?;
             Ok(c)
         }
+        // `defdict_init`: the first positional is the factory (callable or
+        // None); the rest go to `dict.__init__`, which takes one mapping or
+        // iterable of pairs plus keywords.
         "defaultdict" => {
-            // A dict first-arg is initial data, not a factory.
             let factory = match args.first() {
-                None => None,
-                Some(Value::Undef) => None,
-                Some(v) if with_host(|h| matches!(h.get(v), Some(PyObj::Dict(_)))) => None,
-                Some(v) => Some(v.clone()),
+                None | Some(Value::Undef) => None,
+                Some(v) if is_callable(v)? => Some(v.clone()),
+                Some(_) => return Err(host::type_error("first argument must be callable or None")),
             };
+            let rest = args.get(1..).unwrap_or(&[]);
+            if rest.len() > 1 {
+                return Err(host::type_error(&format!(
+                    "dict expected at most 1 argument, got {}",
+                    rest.len()
+                )));
+            }
             let dd =
                 host::alloc_dict_subtype(IndexMap::new(), host::DictKind::DefaultDict, factory);
-            for v in &args {
-                if with_host(|h| matches!(h.get(v), Some(PyObj::Dict(_)))) {
-                    fill_dict_from(&dd, v)?;
-                }
-            }
-            for (k, v) in kwargs {
-                dict_insert_str(&dd, k, v)?;
-            }
+            dict_method(&dd, "update", rest, &kwargs)?;
             Ok(dd)
         }
+        // `OrderedDict.__init__(other=(), /, **kwds)` is `self.__update(other,
+        // **kwds)`: any mapping (by `keys()`) or iterable of pairs.
         "OrderedDict" => {
+            if args.len() > 1 {
+                return Err(host::type_error(&format!(
+                    "expected at most 1 argument, got {}",
+                    args.len()
+                )));
+            }
             let od = host::alloc_dict_subtype(IndexMap::new(), host::DictKind::OrderedDict, None);
-            if let Some(v) = args.first() {
-                fill_dict_from(&od, v)?;
-            }
-            for (k, v) in kwargs {
-                dict_insert_str(&od, k, v)?;
-            }
+            dict_method(&od, "update", &args, &kwargs)?;
             Ok(od)
         }
         "namedtuple" => {
@@ -22660,4 +22718,10 @@ fn as_i(v: &Value) -> Option<i64> {
 
 fn is_str(v: &Value) -> bool {
     matches!(v, Value::Str(_)) || with_host(|h| h.as_str(v).is_some())
+}
+
+/// `callable(v)`, through the builtin so every callable kind it knows counts.
+fn is_callable(v: &Value) -> Result<bool, String> {
+    let r = call_builtin_function("callable", vec![v.clone()], vec![])?;
+    Ok(matches!(r, Value::Bool(true)))
 }

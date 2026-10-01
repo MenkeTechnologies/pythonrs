@@ -3281,6 +3281,10 @@ impl PyHost {
                 "tuple" => return Some("tuple"),
                 "set" => return Some("set"),
                 "frozenset" => return Some("frozenset"),
+                "collections.deque" => return Some("collections.deque"),
+                "collections.Counter" => return Some("collections.Counter"),
+                "collections.OrderedDict" => return Some("collections.OrderedDict"),
+                "collections.defaultdict" => return Some("collections.defaultdict"),
                 _ => {}
             }
         }
@@ -5205,7 +5209,12 @@ impl PyHost {
                         // Builtin-type subclass without a `__str__`/`__repr__`
                         // override: the base type's string form (`str(Stack(...))`
                         // → the list form, `str(U("hi"))` → `"hi"`).
-                        self.str_of(&inst.payload)
+                        match self.builtin_base_of(&inst.class) {
+                            Some(base) if base.starts_with("collections.") => {
+                                self.builtin_subclass_repr(inst)
+                            }
+                            _ => self.str_of(&inst.payload),
+                        }
                     } else {
                         // `object.__repr__` default: `<__main__.Cls object at 0x…>`.
                         // Instances defined under `-c`/a script live in `__main__`
@@ -5958,7 +5967,7 @@ impl PyHost {
                         && self.builtin_base_of(&inst.class).is_some()
                         && self.class_lookup(&inst.class, "__repr__").is_none() =>
                 {
-                    self.repr_of(&inst.payload)
+                    self.builtin_subclass_repr(inst)
                 }
                 Some(PyObj::Slice { lo, hi, step }) => format!(
                     "slice({}, {}, {})",
@@ -9863,12 +9872,6 @@ impl PyHost {
     }
 
     /// Whether `v` is a `memoryview` that has been released.
-    /// `type(v)` for a value that is not a CPython object: its class, or the
-    /// builtin type object `type_name` names. Under the bridge a PEP 604 union's
-    /// type is CPython's own `typing.Union` — the single object 3.14's
-    /// `types.UnionType` and `typing.Union` both name — so `type(int | str) is
-    /// types.UnionType` holds, and `type(u)[int, str]` subscripts as CPython's
-    /// does.
     /// The ffi handle of the CPython exception `v` was raised as, when `v` is an
     /// exception CPython raised and its class is not one pythonrs has a type
     /// for — a builtin exception (`KeyError`) keeps its native type, so
@@ -9888,6 +9891,27 @@ impl PyHost {
             .flatten()
     }
 
+    /// The repr of a builtin-subclass instance that does not override it: the
+    /// base type's. The `collections` containers name the instance's own type
+    /// there (`deque_repr`, `odict_repr` and `defdict_repr` use
+    /// `_PyType_Name(Py_TYPE(self))`, `Counter.__repr__` uses
+    /// `self.__class__.__name__`), so `class Q(deque)` reprs as `Q([1])`;
+    /// `list`/`dict`/... reprs carry no type name at all.
+    fn builtin_subclass_repr(&self, inst: &Instance) -> String {
+        let r = self.repr_of(&inst.payload);
+        let base = self.builtin_base_of(&inst.class).unwrap_or("");
+        match base.strip_prefix("collections.").and_then(|bare| r.strip_prefix(bare)) {
+            Some(rest) => format!("{}{rest}", inst.class),
+            None => r,
+        }
+    }
+
+    /// `type(v)` for a value that is not a CPython object: its class, or the
+    /// builtin type object `type_name` names. Under the bridge a PEP 604 union's
+    /// type is CPython's own `typing.Union` — the single object 3.14's
+    /// `types.UnionType` and `typing.Union` both name — so `type(int | str) is
+    /// types.UnionType` holds, and `type(u)[int, str]` subscripts as CPython's
+    /// does.
     pub fn builtin_type_of(&mut self, v: &Value) -> Value {
         #[cfg(feature = "stdlib-ffi")]
         if matches!(self.get(v), Some(PyObj::Union { .. })) {
@@ -11638,6 +11662,14 @@ impl PyHost {
             .map(|cd| cd.bases.clone())
             .unwrap_or_default();
         if bases.is_empty() {
+            // A native `collections` mapping is a `dict` subclass, so a class
+            // deriving from it linearizes `dict` in after it.
+            if class
+                .strip_prefix("collections.")
+                .is_some_and(|b| matches!(b, "Counter" | "OrderedDict" | "defaultdict"))
+            {
+                return vec![class.to_string(), "dict".to_string()];
+            }
             return vec![class.to_string()];
         }
         let mut seqs: Vec<Vec<String>> = bases.iter().map(|b| (*self.mro_rc(b)).clone()).collect();
@@ -15100,6 +15132,12 @@ pub fn base_provides(base: &str, dunder: &str) -> bool {
             dunder,
             "__repr__" | "__str__" | "__hash__" | "__bool__" | "__int__" | "__float__"
         ),
+        // The native `collections` containers carry the item protocol of the
+        // sequence or mapping they are.
+        "collections.deque" => base_provides("list", dunder),
+        "collections.Counter" | "collections.OrderedDict" | "collections.defaultdict" => {
+            base_provides("dict", dunder) || dunder == "__reversed__"
+        }
         _ => false,
     }
 }
@@ -15217,6 +15255,41 @@ pub fn subclass_operand(v: &Value, dunder: &str) -> Value {
     })
 }
 
+/// The `collections` base and native payload of a user subclass instance
+/// (`class Q(deque)`), or `None` for anything else.
+pub fn collections_subclass_of(v: &Value) -> Option<(&'static str, Value, String)> {
+    with_host(|h| match h.get(v) {
+        Some(PyObj::Instance(i)) if !matches!(i.payload, Value::Undef) => {
+            let base = h.builtin_base_of(&i.class)?;
+            base.starts_with("collections.")
+                .then(|| (base, i.payload.clone(), i.class.clone()))
+        }
+        _ => None,
+    })
+}
+
+/// A copy of a `collections` subclass instance, built the way each base copies
+/// a subclass: by calling the instance's own class -- `deque_copy` as
+/// `type(d)(d, maxlen)` (`type(d)(d)` unbounded), `defdict_copy` as
+/// `type(dd)(dd.default_factory, dd)`, `OrderedDict.copy`/`Counter.copy` as
+/// `type(self)(self)`. A subclass `__init__` therefore runs for the copy.
+pub fn collections_subclass_copy(v: &Value) -> Option<Result<Value, String>> {
+    let (base, payload, class) = collections_subclass_of(v)?;
+    let cls = with_host(|h| h.alloc(PyObj::Class(class)));
+    let mut args = Vec::new();
+    if base == "collections.defaultdict" {
+        let factory = dict_meta_of(&payload).and_then(|m| m.factory).unwrap_or(Value::Undef);
+        args.push(factory);
+    }
+    args.push(v.clone());
+    if base == "collections.deque" {
+        if let Some(PyObj::Deque { maxlen: Some(m), .. }) = with_host(|h| h.get(&payload).cloned()) {
+            args.push(Value::Int(m as i64));
+        }
+    }
+    Some(invoke(&cls, args, vec![]))
+}
+
 /// Run method/dunder `name` on a builtin-subclass instance by delegating to its
 /// native payload. Container/value dunders route to the native heap ops; named
 /// methods (`append`, `upper`, `keys`, …) route to [`call_type_method`]. `recv`
@@ -15230,6 +15303,12 @@ fn base_dispatch(
     kwargs: Vec<(String, Value)>,
 ) -> Result<Value, String> {
     match name {
+        "copy" if base.starts_with("collections.") => {
+            collections_subclass_copy(recv).unwrap_or_else(|| Ok(recv.clone()))
+        }
+        "__copy__" if matches!(base, "collections.deque" | "collections.defaultdict") => {
+            collections_subclass_copy(recv).unwrap_or_else(|| Ok(recv.clone()))
+        }
         "__len__" => {
             let n = crate::builtins::py_len(payload)?;
             Ok(Value::Int(n as i64))
@@ -15238,7 +15317,12 @@ fn base_dispatch(
         "__getitem__" => {
             let idx = args.into_iter().next().unwrap_or(Value::Undef);
             // A `dict` subclass with a `__missing__` hook: fire it on a miss.
-            if base == "dict" {
+            let mapping = base == "dict"
+                || matches!(
+                    base,
+                    "collections.Counter" | "collections.OrderedDict" | "collections.defaultdict"
+                );
+            if mapping {
                 let missing = with_host(|h| match h.to_key(&idx) {
                     Ok(k) => matches!(h.get(payload), Some(PyObj::Dict(d)) if !d.contains_key(&k)),
                     Err(_) => false,
@@ -15252,6 +15336,11 @@ fn base_dispatch(
                         return call_method(recv, "__missing__", vec![idx], vec![]);
                     }
                 }
+            }
+            // Otherwise the base's own `__missing__` (Counter's 0, a
+            // defaultdict's factory) runs on the payload as on the base type.
+            if base.starts_with("collections.") {
+                return crate::builtins::getitem_value(payload.clone(), idx);
             }
             with_host(|h| h.get_item(payload, &idx))
         }
@@ -15328,12 +15417,20 @@ fn base_super_init(
     kwargs: Vec<(String, Value)>,
 ) -> Result<Value, String> {
     match base {
-        "list" | "dict" | "set" => {
+        // A `collections` base is rebuilt the same way, and the payload also
+        // takes the rebuilt object's tag (a defaultdict's factory, ...).
+        "list" | "dict" | "set" | "collections.deque" | "collections.Counter"
+        | "collections.OrderedDict" | "collections.defaultdict" => {
             let built = crate::builtins::call_builtin_function(base, args, kwargs)?;
             with_host(|h| {
                 if let Some(o) = h.get(&built).cloned() {
                     if let Some(slot) = h.get_mut(payload) {
                         *slot = o;
+                    }
+                }
+                if let (Value::Obj(src), Value::Obj(dst)) = (&built, payload) {
+                    if let Some(meta) = h.dict_meta.get(src).cloned() {
+                        h.dict_meta.insert(*dst, meta);
                     }
                 }
             });

@@ -3723,3 +3723,34 @@ x += [q, OrderedDict.fromkeys('ab', 1), defaultdict.fromkeys('a'), OrderedDict(z
         r#"[(True, "<class 'collections.deque'>", True), (True, "<class 'collections.Counter'>", True), (True, "<class 'collections.OrderedDict'>", True), (True, "<class 'collections.defaultdict'>", True), deque([1]), OrderedDict({'a': 1}), <method 'append' of 'collections.deque' objects>, <slot wrapper '__setitem__' of 'collections.deque' objects>, (<class 'collections.deque'>, <class 'object'>), (<class 'collections.Counter'>, <class 'dict'>, <class 'object'>), True, True, 1, deque([1, 2, 3]), OrderedDict({'a': 1, 'b': 1}), defaultdict(None, {'a': None}), OrderedDict({'c': None}), 'NotImplementedError: Counter.fromkeys() is undefined.  Use Counter(iterable) instead.', 'NotImplementedError: Counter.fromkeys() is undefined.  Use Counter(iterable) instead.']"#
     );
 }
+
+// A user subclass of deque/OrderedDict/Counter/defaultdict carries a native
+// payload of its base: item access (with the base's `__missing__`), reversal,
+// the base repr under the subclass's name, `dict` in the MRO, and the copies
+// and merges the C code builds through `type(self)(...)` -- so `Q + Q`, `q * 2`,
+// `q.copy()`, `o | d`, `d | o` and `dd.copy()` come back as the subclass and its
+// `__init__` runs for each (`Counter`'s operators still build a plain Counter).
+#[test]
+fn collections_container_subclasses_behave_as_their_base() {
+    let src = r#"from collections import deque, Counter, OrderedDict, defaultdict
+log = []
+class Q(deque):
+    def __init__(self, it=(), maxlen=None):
+        log.append((list(it), maxlen))
+        super().__init__(it, maxlen)
+class O(OrderedDict): pass
+class C(Counter): pass
+class D(defaultdict): pass
+q, o, c, d = Q([1, 2], 4), O(a=1, b=2), C('aab'), D(list)
+d['k'].append(1)
+x = [q, o, c, d, len(q), q[0], o['a'], c['z'], list(reversed(q)), list(reversed(o)), c.most_common(1),
+     isinstance(o, dict), isinstance(q, deque), O.__mro__,
+     q + deque([3]), q * 2, 2 * q, q.copy(), type(q.__copy__()).__name__,
+     o.copy(), d.copy(), c.copy(), c + C('a'), o | {'z': 0}, {'z': 0} | o, D(int, a=1) | {'b': 2}]
+x.append(log)
+"#;
+    assert_eq!(
+        g(src, "x"),
+        r#"[Q([1, 2], maxlen=4), O({'a': 1, 'b': 2}), C({'a': 2, 'b': 1}), D(<class 'list'>, {'k': [1]}), 2, 1, 1, 0, [2, 1], ['b', 'a'], [('a', 2)], True, True, (<class '__main__.O'>, <class 'collections.OrderedDict'>, <class 'dict'>, <class 'object'>), Q([1, 2, 3], maxlen=4), Q([1, 2, 1, 2], maxlen=4), Q([1, 2, 1, 2], maxlen=4), Q([1, 2], maxlen=4), 'Q', O({'a': 1, 'b': 2}), D(<class 'list'>, {'k': [1]}), C({'a': 2, 'b': 1}), Counter({'a': 3, 'b': 1}), O({'a': 1, 'b': 2, 'z': 0}), O({'z': 0, 'a': 1, 'b': 2}), D(<class 'int'>, {'a': 1, 'b': 2}), [([1, 2], 4), ([1, 2], 4), ([1, 2], 4), ([1, 2], 4), ([1, 2], 4), ([1, 2], 4)]]"#
+    );
+}

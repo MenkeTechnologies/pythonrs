@@ -507,6 +507,19 @@ written.
   (so `issubclass(Counter, dict)` holds), and `fromkeys` through any of the
   three mappings builds that mapping (`Counter.fromkeys` raises
   `NotImplementedError` as CPython's does).
+- **Subclasses of the `collections` containers.** `class Q(deque)`,
+  `class O(OrderedDict)`, `class C(Counter)` and `class D(defaultdict)`
+  instances carried no native payload, so `len(Q([1]))` raised, `O(a=1)` reprd
+  as `<__main__.O object …>` and `isinstance(O(), OrderedDict)` was False.
+  They now hold their base's payload like a `list`/`dict` subclass: item
+  access (with the base's `__missing__`), iteration and reversal, the base
+  repr under the subclass's own name, `dict` in the mapping subclasses' MRO,
+  and `super().__init__(it, maxlen)`. The results the C code builds through
+  `type(self)(…)` are the subclass too -- `Q + Q`, `q * n`, `q.copy()`,
+  `o.copy()`, `dd.copy()`, `o | d`, `d | o`, `dd | d` -- with the subclass
+  `__init__` run for each. `defaultdict(x)` with a non-callable `x` is now
+  `first argument must be callable or None`, and `OrderedDict`/`defaultdict`
+  take any mapping (by `keys()`) as their initial data.
 - **`stdout`/`stderr` are buffered as CPython buffers them.** pythonrs flushed
   every write, so `python prog.py > log 2>&1` came out in program order where
   CPython's comes out in flush order (`err1 err2 out1 out2` for two
@@ -2157,13 +2170,6 @@ written.
   ten-name budget nor get tried themselves. `x = f"{a}{b}{c}{d}{e}{f}{g}{h}{i}{j}"`
   followed by `whille x: pass` gets `Did you mean 'while'?` here and no hint
   in CPython, whose budget the ten field names exhausted.
-- **A `collections.deque` subclass has no deque behaviour.** `class D(deque)`
-  instances carry no native deque payload (`builtin_base_of` knows `list`,
-  `dict`, `str`, `int`, `float`, `tuple`, `set` and `frozenset` only), so
-  `len(D([1]))` raises `AttributeError: 'D' object has no attribute
-  '__len__'` and `D([1]) + D([2])` is `unsupported operand type(s)`. CPython
-  also routes a subclass result through `type(d)(d, maxlen)`, so `D + D` is a
-  `D` and a subclass `__init__` runs for it.
 - **`[nan] == [nan]` with one shared `nan` is False.** CPython's sequence
   comparison shortcuts on element IDENTITY before `==`, so a list holding the
   same `nan` object twice compares equal to itself. pythonrs stores a `float`
