@@ -447,6 +447,19 @@ const SLOT_WRAPPERS_EVERY_TYPE: &[&str] = &[
 
 fn slot_wrappers_of(tp: &str) -> &'static [&'static str] {
     match tp {
+        "deque" => &[
+            "__add__",
+            "__contains__",
+            "__delitem__",
+            "__getitem__",
+            "__iadd__",
+            "__imul__",
+            "__iter__",
+            "__len__",
+            "__mul__",
+            "__rmul__",
+            "__setitem__",
+        ],
         "NoneType" => &["__bool__", "__hash__"],
         "bool" => &[
             "__abs__",
@@ -4657,6 +4670,8 @@ fn type_object_class_name(n: &str) -> Option<String> {
         "defaultdict" => Some("collections.defaultdict"),
         "OrderedDict" => Some("collections.OrderedDict"),
         "deque" => Some("collections.deque"),
+        "collections.Counter" | "collections.defaultdict" | "collections.OrderedDict"
+        | "collections.deque" => Some(n),
         "partial" => Some("functools.partial"),
         // The native `asyncio` primitives (`async_rt::AsyncObj`).
         "Lock" => Some("asyncio.locks.Lock"),
@@ -5287,10 +5302,13 @@ impl PyHost {
                         "<built-in method {meth} of type object at 0x{:012x}>",
                         self.builtin_type_addr(owner)
                     ),
+                    // The owner is named by `tp_name`: `'collections.deque'`.
                     NativeCallable::SlotWrapper { owner, meth } => {
+                        let owner = type_object_class_name(owner).unwrap_or_else(|| owner.into());
                         format!("<slot wrapper '{meth}' of '{owner}' objects>")
                     }
                     NativeCallable::MethodDescriptor { owner, meth } => {
+                        let owner = type_object_class_name(owner).unwrap_or_else(|| owner.into());
                         format!("<method '{meth}' of '{owner}' objects>")
                     }
                     NativeCallable::Function(name) => format!("<built-in function {name}>"),
@@ -9774,10 +9792,17 @@ impl PyHost {
         }
         let tn = self.type_name(v);
         if self.classes.contains_key(&tn) {
-            self.alloc(PyObj::Class(tn))
-        } else {
-            self.alloc(PyObj::Builtin(tn))
+            return self.alloc(PyObj::Class(tn));
         }
+        // A native `collections` container's type object is the builtin the
+        // module exports (see `builtins::native_type_key`), so that
+        // `type(deque()) is deque` and `type(q)(q)` constructs.
+        let tn = if crate::builtins::is_native_collection(&tn) {
+            format!("collections.{tn}")
+        } else {
+            tn
+        };
+        self.alloc(PyObj::Builtin(tn))
     }
 
     /// Point `sys.stdout` (`stderr` false) or `sys.stderr` at `target` — `None`
@@ -13170,8 +13195,15 @@ impl PyHost {
             }
             // `dict.fromkeys` — a classmethod on the `dict` type, reached as an
             // attribute of the `dict` builtin. Returns a callable builtin.
-            Some(PyObj::Builtin(n)) if n == "dict" && name == "fromkeys" => {
-                Ok(self.alloc(PyObj::Builtin("dict.fromkeys".into())))
+            Some(PyObj::Builtin(n))
+                if name == "fromkeys"
+                    && matches!(
+                        crate::builtins::native_type_key(n),
+                        "dict" | "OrderedDict" | "defaultdict" | "Counter"
+                    ) =>
+            {
+                let key = crate::builtins::native_type_key(n);
+                Ok(self.alloc(PyObj::Builtin(format!("{key}.fromkeys"))))
             }
             // `str.maketrans` — a static method on the `str` type.
             Some(PyObj::Builtin(n)) if n == "str" && name == "maketrans" => {
@@ -13201,6 +13233,7 @@ impl PyHost {
             // `type_has_method`, so a non-method name falls through to
             // AttributeError below.
             Some(PyObj::Builtin(n)) if crate::builtins::type_has_method(n, name) => {
+                let n = crate::builtins::native_type_key(n);
                 Ok(self.alloc(PyObj::Builtin(format!("{n}.{name}"))))
             }
             // `memoryview` read-only descriptor attributes. A faithful 1-D

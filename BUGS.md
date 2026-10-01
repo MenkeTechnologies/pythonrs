@@ -418,6 +418,16 @@ written.
   `list_index_impl` (`slice_index` bounds, each type's own `x not in …`
   message). `deque.rotate('a')` rotated by one, and `deque(maxlen=-1)` /
   `deque(it, 'x')` built a deque; they raise as `deque_rotate`/`deque_init` do.
+- **A `collections` type object is the type of its instances.**
+  `type(deque()) is deque` was False and `type(q)(q)` raised
+  `NameError: name 'deque' is not defined`: `type()` handed back a bare
+  `deque` builtin while the module exported `collections.deque`. Both are now
+  the one type object, which reprs as `<class 'collections.deque'>` (it printed
+  `<built-in function deque>`), answers `deque.append`/`deque.__setitem__`
+  unbound, lists `dict` in the MRO of `Counter`/`OrderedDict`/`defaultdict`
+  (so `issubclass(Counter, dict)` holds), and `fromkeys` through any of the
+  three mappings builds that mapping (`Counter.fromkeys` raises
+  `NotImplementedError` as CPython's does).
 - **`stdout`/`stderr` are buffered as CPython buffers them.** pythonrs flushed
   every write, so `python prog.py > log 2>&1` came out in program order where
   CPython's comes out in flush order (`err1 err2 out1 out2` for two

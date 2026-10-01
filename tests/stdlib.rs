@@ -3695,3 +3695,31 @@ x.append(q)
         r#"[3, 'ValueError: tuple.index(x): x not in tuple', 2, 1, 'TypeError: slice indices must be integers or have an __index__ method', 'TypeError: slice indices must be integers or have an __index__ method', 'ValueError: list.index(x): x not in list', 0, 2, 'ValueError: deque.index(x): x not in deque', 'ValueError: deque.index(x): x not in deque', "TypeError: 'str' object cannot be interpreted as an integer", 'OverflowError: Python int too large to convert to C ssize_t', 'ValueError: maxlen must be non-negative', 'TypeError: an integer is required', 'TypeError: an integer is required', 'ValueError: maxlen must be non-negative', deque([2], maxlen=1), deque([3, 1, 2])]"#
     );
 }
+
+// The type object of a native `collections` container is the one the module
+// exports: `type(deque()) is deque`, it reprs and constructs as the class, its
+// methods are reached unbound off it, its MRO includes `dict` for the three
+// mappings, and `fromkeys` builds the class it is called on (Counter refuses).
+#[test]
+fn collections_type_objects_are_the_types_of_their_instances() {
+    let src = r#"from collections import deque, Counter, OrderedDict, defaultdict
+def e(f):
+    try:
+        return f()
+    except Exception as ex:
+        return f'{type(ex).__name__}: {ex}'
+objs = (deque([1]), Counter('a'), OrderedDict(a=1), defaultdict(int, a=1))
+types_ = (deque, Counter, OrderedDict, defaultdict)
+x = [(type(o) is T, repr(T), type(T) is type) for o, T in zip(objs, types_)]
+x += [type(objs[0])(objs[0]), type(objs[2])(objs[2]), deque.append, deque.__setitem__, deque.__mro__, Counter.__mro__,
+      issubclass(Counter, dict), issubclass(OrderedDict, dict), {deque: 1}[type(deque())]]
+q = deque([1, 2])
+deque.append(q, 3)
+x += [q, OrderedDict.fromkeys('ab', 1), defaultdict.fromkeys('a'), OrderedDict(z=0).fromkeys('c'),
+      e(lambda: Counter.fromkeys('a')), e(lambda: Counter().fromkeys('a'))]
+"#;
+    assert_eq!(
+        g(src, "x"),
+        r#"[(True, "<class 'collections.deque'>", True), (True, "<class 'collections.Counter'>", True), (True, "<class 'collections.OrderedDict'>", True), (True, "<class 'collections.defaultdict'>", True), deque([1]), OrderedDict({'a': 1}), <method 'append' of 'collections.deque' objects>, <slot wrapper '__setitem__' of 'collections.deque' objects>, (<class 'collections.deque'>, <class 'object'>), (<class 'collections.Counter'>, <class 'dict'>, <class 'object'>), True, True, 1, deque([1, 2, 3]), OrderedDict({'a': 1, 'b': 1}), defaultdict(None, {'a': None}), OrderedDict({'c': None}), 'NotImplementedError: Counter.fromkeys() is undefined.  Use Counter(iterable) instead.', 'NotImplementedError: Counter.fromkeys() is undefined.  Use Counter(iterable) instead.']"#
+    );
+}

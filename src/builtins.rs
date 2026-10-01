@@ -5206,10 +5206,35 @@ pub fn is_type_object_name(n: &str) -> bool {
 /// The method-resolution order of a builtin type object, as type names from the
 /// type up to `object`. Exceptions follow their class chain; `bool` subclasses
 /// `int`; everything else is `[name, object]`.
+/// The name the native method tables know a `collections` container type by.
+///
+/// The type OBJECT of a native `collections` container is the builtin named
+/// `collections.deque` (and `collections.Counter`, `.OrderedDict`,
+/// `.defaultdict`): it is what the module exports, what `type()` of an instance
+/// returns, and what reprs as `<class 'collections.deque'>`. An instance's
+/// `type_name` is the bare `deque`, which is what the method and `dir` tables
+/// are keyed by. Every other name passes through.
+pub fn native_type_key(name: &str) -> &str {
+    match name.strip_prefix("collections.") {
+        Some(bare) if is_native_collection(bare) => bare,
+        _ => name,
+    }
+}
+
+/// Whether `name` is the bare type name of a native `collections` container.
+pub fn is_native_collection(name: &str) -> bool {
+    matches!(name, "deque" | "Counter" | "OrderedDict" | "defaultdict")
+}
+
 pub fn builtin_mro(name: &str) -> Vec<String> {
     let mut chain = vec![name.to_string()];
     if name == "bool" {
         chain.push("int".to_string());
+    } else if matches!(
+        native_type_key(name),
+        "Counter" | "OrderedDict" | "defaultdict"
+    ) {
+        chain.push("dict".to_string());
     } else if is_exception_class(name) {
         let mut cur = name;
         while let Some((_, parent)) = EXC_PARENTS.iter().find(|(c, _)| *c == cur) {
@@ -5228,7 +5253,7 @@ pub fn builtin_mro(name: &str) -> Vec<String> {
 /// `int.from_bytes`, …). Used to populate a type object's `__dict__` proxy.
 pub fn type_classmethods(name: &str) -> &'static [&'static str] {
     match name {
-        "dict" => &["fromkeys"],
+        "dict" | "OrderedDict" | "defaultdict" | "Counter" => &["fromkeys"],
         // `bool` inherits `int`'s, exactly as `dir(True)` reports it.
         "int" | "bool" => &["from_bytes"],
         "bytes" | "bytearray" => &["fromhex"],
@@ -5772,9 +5797,13 @@ pub fn call_builtin_function(
             )),
         };
     }
-    // `dict.fromkeys(iterable[, value])` reached via the `dict` type object.
-    if name == "dict.fromkeys" {
-        return dict_method(&Value::Undef, "fromkeys", &args, &[]);
+    // `dict.fromkeys(iterable[, value])` reached via a dict type object.
+    match name {
+        "dict.fromkeys" => return dict_fromkeys(None, &args),
+        "OrderedDict.fromkeys" => return dict_fromkeys(Some(host::DictKind::OrderedDict), &args),
+        "defaultdict.fromkeys" => return dict_fromkeys(Some(host::DictKind::DefaultDict), &args),
+        "Counter.fromkeys" => return dict_fromkeys(Some(host::DictKind::Counter), &args),
+        _ => {}
     }
     // `str.maketrans(...)` reached via the `str` type object.
     if name == "str.maketrans" {
@@ -5848,7 +5877,7 @@ pub fn call_builtin_function(
     if let Some((tp, meth)) = name.split_once('.') {
         // A classmethod's first argument is not a receiver, so it must not be
         // peeled off here; each has its own handler above.
-        if is_builtin_type(tp)
+        if (is_builtin_type(tp) || is_native_collection(tp))
             && type_has_method(tp, meth)
             && !type_classmethods(tp).contains(&meth)
         {
@@ -13481,10 +13510,7 @@ fn isinstance(h: &host::PyHost, v: &Value, cls: &Value) -> bool {
     };
     // The `collections` container types are reached as `collections.X`
     // builtins, while their instances report the bare type name.
-    let want = match want.strip_prefix("collections.") {
-        Some(bare @ ("OrderedDict" | "defaultdict" | "Counter" | "deque")) => bare.to_string(),
-        _ => want,
-    };
+    let want = native_type_key(&want).to_string();
     // A class object (a user `Class` or a builtin type) is an instance of `type`.
     if want == "type" {
         match h.get(v) {
@@ -13512,6 +13538,7 @@ fn isinstance(h: &host::PyHost, v: &Value, cls: &Value) -> bool {
 }
 
 fn type_isa(h: &host::PyHost, a: &str, b: &str) -> bool {
+    let (a, b) = (native_type_key(a), native_type_key(b));
     if a == b || b == "object" {
         return true;
     }
@@ -13527,7 +13554,7 @@ fn type_isa(h: &host::PyHost, a: &str, b: &str) -> bool {
         return true;
     }
     if h.classes.contains_key(a) {
-        return h.mro_of(a).iter().any(|c| c == b);
+        return h.mro_of(a).iter().any(|c| native_type_key(c) == b);
     }
     false
 }
@@ -13604,6 +13631,7 @@ const ITER_PROTOCOL_TYPES: &[&str] = &[
 /// and `builtin_dispatch_is_fully_listed_by_dir` (tests/lang.rs) assert in both
 /// directions that they cannot drift apart.
 pub fn type_dir_names(typename: &str) -> Vec<&'static str> {
+    let typename = native_type_key(typename);
     let mut out = own_dir_names(typename);
     // Everything inherits `object`'s surface — but only for a type pythonrs
     // actually models. An unknown name still answers with an empty list, which
@@ -13847,6 +13875,7 @@ const OBJECT_ONLY_TYPES: &[&str] = &["object", "NoneType", "ellipsis", "NotImple
 /// Whether `typename` responds to method `name` (used by `getattr`/bound
 /// methods to distinguish a method from an `AttributeError`).
 pub fn type_has_method(typename: &str, name: &str) -> bool {
+    let typename = native_type_key(typename);
     // The `object` surface every modeled type inherits. `__class__`, `__doc__`
     // and `__new__` are reached as data/constructor attributes rather than
     // through `call_type_method`, but `getattr` produces all three, and this
@@ -17588,6 +17617,33 @@ fn dict_arity(name: &str) -> Option<Arity> {
     })
 }
 
+/// `cls.fromkeys(iterable[, value])` for `dict` (`kind` None) and the
+/// `collections` dict types: `dict_fromkeys` builds `cls()` and stores each key,
+/// so an OrderedDict comes back an OrderedDict and a defaultdict a defaultdict
+/// with no factory. `Counter` overrides it to refuse outright.
+fn dict_fromkeys(kind: Option<host::DictKind>, args: &[Value]) -> Result<Value, String> {
+    if kind == Some(host::DictKind::Counter) {
+        return Err(
+            "NotImplementedError: Counter.fromkeys() is undefined.  Use Counter(iterable) instead."
+                .into(),
+        );
+    }
+    let keys = host::iter_vec(&arg0(args)?)?;
+    let value = args.get(1).cloned().unwrap_or(Value::Undef);
+    let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+    for k in keys {
+        let cands = with_host(|h| host::dict_local_candidates(h, &d));
+        let key = host::with_instance_key(&k, host::KeyRole::Dict, &cands, || {
+            with_host(|h| h.to_key(&k))
+        })?;
+        host::dict_put(&mut d, key, k, value.clone());
+    }
+    Ok(match kind {
+        Some(kind) => host::alloc_dict_subtype(d, kind, None),
+        None => with_host(|h| h.new_dict(d)),
+    })
+}
+
 fn dict_method(
     recv: &Value,
     name: &str,
@@ -17616,21 +17672,9 @@ fn dict_method(
                 kind: 2,
             })
         })),
-        "fromkeys" => {
-            // `dict.fromkeys(iterable[, value])` — unbound classmethod form; here
-            // `recv` is the dict the method was fetched from (unused).
-            let keys = host::iter_vec(&arg0(args)?)?;
-            let value = args.get(1).cloned().unwrap_or(Value::Undef);
-            let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
-            for k in keys {
-                let cands = with_host(|h| host::dict_local_candidates(h, &d));
-                let key = host::with_instance_key(&k, host::KeyRole::Dict, &cands, || {
-                    with_host(|h| h.to_key(&k))
-                })?;
-                host::dict_put(&mut d, key, k, value.clone());
-            }
-            Ok(with_host(|h| h.new_dict(d)))
-        }
+        // `fromkeys` is a classmethod: reached through an instance it builds
+        // the instance's own type (`OrderedDict(x=1).fromkeys(...)`).
+        "fromkeys" => dict_fromkeys(host::dict_meta_of(recv).map(|m| m.kind), args),
         "get" => {
             let kv = arg0(args)?;
             let cands = host::instance_key_candidates_for(recv, Some(&kv));
