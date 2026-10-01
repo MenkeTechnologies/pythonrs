@@ -1687,26 +1687,10 @@ impl TextEncoding {
     fn encode(self, s: &str) -> Result<Vec<u8>, String> {
         match self {
             Self::Utf8 => Ok(s.as_bytes().to_vec()),
-            Self::Ascii | Self::Latin1 => {
-                let limit = if self == Self::Ascii { 0x80 } else { 0x100 };
-                let name = if self == Self::Ascii {
-                    "ascii"
-                } else {
-                    "latin-1"
-                };
-                let mut out = Vec::with_capacity(s.len());
-                for (i, c) in s.chars().enumerate() {
-                    let cp = c as u32;
-                    if cp >= limit {
-                        return Err(format!(
-                            "UnicodeEncodeError: '{name}' codec can't encode character \
-                             '\\u{cp:04x}' in position {i}: ordinal not in range({limit})"
-                        ));
-                    }
-                    out.push(cp as u8);
-                }
-                Ok(out)
-            }
+            // The strict codec `str.encode` runs, so a write reports the same
+            // run-merged `UnicodeEncodeError` with its arguments.
+            Self::Ascii => crate::builtins::encode_narrow(s, "strict", "ascii", 0x80),
+            Self::Latin1 => crate::builtins::encode_narrow(s, "strict", "latin-1", 0x100),
         }
     }
 }
@@ -5371,6 +5355,9 @@ impl PyHost {
     fn exc_str(&self, v: &Value, class: &str, args: &[Value]) -> String {
         if is_syntax_error_class(class) {
             return self.syntax_error_str(v);
+        }
+        if let Some(s) = crate::excunicode::str_from_attrs(self, v, class) {
+            return s;
         }
         self.exc_message(class, args)
     }
@@ -11176,7 +11163,10 @@ impl PyHost {
     pub fn attr_miss_for(&self, line: &str) -> Option<(String, Value)> {
         match &self.suggest {
             Some(SuggestCtx::Attr {
-                wrong, recv, line: l, ..
+                wrong,
+                recv,
+                line: l,
+                ..
             }) if l == line => Some((wrong.clone(), recv.clone())),
             _ => None,
         }
@@ -14998,9 +14988,10 @@ fn call_method_inner(
             // so `self.write(...)` inside it went straight to AttributeError.
             if with_host(|h| h.class_has(&class, "__getattr__")) {
                 let key = with_host(|h| h.new_str(name.to_string()));
-                let attr = call_method(recv, "__getattr__", vec![key], vec![]).inspect_err(|e| {
-                    with_host(|h| h.note_attr_miss(e, recv, name, false));
-                })?;
+                let attr =
+                    call_method(recv, "__getattr__", vec![key], vec![]).inspect_err(|e| {
+                        with_host(|h| h.note_attr_miss(e, recv, name, false));
+                    })?;
                 return invoke(&attr, args, kwargs);
             }
             Err(format!(
@@ -15371,12 +15362,7 @@ pub fn instantiate(
 ) -> Result<Value, String> {
     // Builtin exception classes construct exception objects.
     if crate::builtins::is_exception_class(class) && !with_host(|h| h.classes.contains_key(class)) {
-        return Ok(with_host(|h| {
-            h.alloc(PyObj::Exception {
-                class: class.to_string(),
-                args,
-            })
-        }));
+        return crate::builtins::construct_builtin_exception(class, args, &kwargs);
     }
     // If `class`'s metaclass defines `__call__`, it controls instantiation:
     // `A(...)` dispatches to `type(A).__call__(A, ...)`.
@@ -16148,6 +16134,9 @@ impl PyHost {
     }
 
     pub fn exc_message(&self, class: &str, args: &[Value]) -> String {
+        if let Some(m) = crate::excunicode::message(self, class, args) {
+            return m;
+        }
         // `BaseExceptionGroup.__str__` counts its members rather than rendering
         // the `(message, exceptions)` argument tuple.
         if crate::excgroup::class_is_group(self, class) && args.len() == 2 {

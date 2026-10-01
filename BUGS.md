@@ -74,6 +74,21 @@ written.
   A `--dap` compile also keeps every function local in the environment, so
   `variables` shows locals assigned after entry: only the parameters were
   visible, because the rest lived in VM frame slots.
+- **`UnicodeDecodeError`/`UnicodeEncodeError`/`UnicodeTranslateError` carry
+  their five-tuple.** `args` was the rendered message alone and none of
+  `.encoding`/`.object`/`.start`/`.end`/`.reason` existed. `src/excunicode.rs`
+  ports the three `_init`/`_str` pairs of `Objects/exceptions.c`: the
+  constructor checks its arguments as `PyArg_ParseTuple` does (a decoder's
+  bytes-like object is kept as `bytes`), the attributes read the tuple back, and
+  `__str__` is rendered from the attributes, so reassigning one changes it. A
+  native codec raise site (`str.encode`, `bytes.decode`, a text file's encoder,
+  `_codecs`) records the tuple beside the error line for `synth_exc`, as
+  `ForeignExc` does for the bridge, and one raised by CPython's codecs has the
+  attributes bound from its recorded `args`. The utf-16 and utf-32 decoders now
+  report CPython's positions and reasons (`illegal UTF-16 surrogate`,
+  `unexpected end of data`, `code point not in range(0x110000)`, the surrogate
+  range), and a text file's ascii/latin-1 write merges a run as `str.encode`
+  does.
 - **More than 255 operands anywhere.** `CallBuiltin` carries a `u8` operand
   count, so a call with >255 arguments, a `{**a, …}` display with >85 entries,
   a `def`/`lambda` with >252 defaults, >127 class-header keywords, and a class
@@ -1724,16 +1739,6 @@ written.
   the class split is not. Relatedly, pythonrs is MORE permissive than CPython on
   two shapes it accepts up to the cap: `'lambda: '*5000+'1'` and
   `'not '*20000+'1'` parse here and are `MemoryError` there.
-- **`UnicodeDecodeError`/`UnicodeEncodeError` carry the rendered message, not the
-  five-tuple.** CPython's `args` is `(encoding, object, start, end, reason)` —
-  `('utf-8', b'\xff', 0, 1, 'invalid start byte')` — with `.encoding`,
-  `.object`, `.start`, `.end` and `.reason` reading back from it; pythonrs has
-  `args == (<the whole message>,)` and none of the five attributes. Unlike the
-  `OSError` case, this one cannot be fixed by parsing the message: the `object`
-  is the offending `bytes`/`str` itself and the message only shows one byte of
-  it. Closing it means carrying the structured arguments from the codec raise
-  sites in `src/stdlib/codecs.rs` through to the exception object, and teaching
-  `exc_message` to render CPython's text back from them.
 - **A bridged exception's type has a two-element MRO.** `struct.error` and
   `binascii.Error` report `__module__ == 'builtins'` and
   `type(e).__mro__ == (error, object)`, where CPython says `struct.error` /

@@ -51,15 +51,29 @@ impl Errors {
     }
 }
 
-fn enc_err(enc: &str, pos: usize, ch: char) -> String {
-    format!(
-        "UnicodeEncodeError: '{enc}' codec can't encode character '\\u{:04x}' in position {pos}",
-        ch as u32
-    )
+/// The `UnicodeEncodeError` for the character at `pos` of `s`, carrying its
+/// arguments (see `crate::excunicode`).
+fn enc_err(enc: &str, s: &str, pos: usize, limit: u32) -> String {
+    crate::excunicode::raise(crate::excunicode::UnicodeErrorArgs {
+        class: "UnicodeEncodeError",
+        encoding: enc.to_string(),
+        object: crate::excunicode::CodecInput::Str(s.to_string()),
+        start: pos,
+        end: pos + 1,
+        reason: format!("ordinal not in range({})", limit + 1),
+    })
 }
 
-fn dec_err(enc: &str, pos: usize, why: &str) -> String {
-    format!("UnicodeDecodeError: '{enc}' codec can't decode byte in position {pos}: {why}")
+/// The `UnicodeDecodeError` for `b[start..end]`, carrying its arguments.
+fn dec_err(enc: &str, b: &[u8], (start, end): (usize, usize), why: &str) -> String {
+    crate::excunicode::raise(crate::excunicode::UnicodeErrorArgs {
+        class: "UnicodeDecodeError",
+        encoding: enc.to_string(),
+        object: crate::excunicode::CodecInput::Bytes(b.to_vec()),
+        start,
+        end,
+        reason: why.to_string(),
+    })
 }
 
 /// Encode `s` to a single-byte codec whose repertoire is `0..=limit`.
@@ -72,7 +86,7 @@ fn encode_single_byte(enc: &str, s: &str, limit: u32, errors: Errors) -> Result<
             continue;
         }
         match errors {
-            Errors::Strict => return Err(enc_err(enc, i, c)),
+            Errors::Strict => return Err(enc_err(enc, s, i, limit)),
             Errors::Ignore => {}
             Errors::Replace => out.push(b'?'),
             Errors::BackslashReplace => {
@@ -92,7 +106,7 @@ fn encode_single_byte(enc: &str, s: &str, limit: u32, errors: Errors) -> Result<
                 if (0xdc80..=0xdcff).contains(&cp) {
                     out.push((cp - 0xdc00) as u8);
                 } else {
-                    return Err(enc_err(enc, i, c));
+                    return Err(enc_err(enc, s, i, limit));
                 }
             }
         }
@@ -109,7 +123,7 @@ fn decode_single_byte(enc: &str, b: &[u8], limit: u32, errors: Errors) -> Result
             continue;
         }
         match errors {
-            Errors::Strict => return Err(dec_err(enc, i, "ordinal not in range(128)")),
+            Errors::Strict => return Err(dec_err(enc, b, (i, i + 1), "ordinal not in range(128)")),
             Errors::Ignore => {}
             Errors::Replace => out.push('\u{fffd}'),
             Errors::SurrogateEscape => {
@@ -117,7 +131,7 @@ fn decode_single_byte(enc: &str, b: &[u8], limit: u32, errors: Errors) -> Result
                 // the mapping reversible.
                 out.push(char::from_u32(0xdc00 + byte as u32).unwrap_or('\u{fffd}'));
             }
-            _ => return Err(dec_err(enc, i, "ordinal not in range(128)")),
+            _ => return Err(dec_err(enc, b, (i, i + 1), "ordinal not in range(128)")),
         }
     }
     Ok(out)
@@ -130,7 +144,12 @@ fn utf8_decode(b: &[u8], errors: Errors) -> Result<(String, usize), String> {
             let valid = e.valid_up_to();
             let mut out = String::from(std::str::from_utf8(&b[..valid]).unwrap_or(""));
             match errors {
-                Errors::Strict => Err(dec_err("utf-8", valid, "invalid start byte")),
+                Errors::Strict => Err(dec_err(
+                    "utf-8",
+                    b,
+                    (valid, valid + 1),
+                    "invalid start byte",
+                )),
                 _ => {
                     // Walk the remainder byte by byte, re-syncing on each valid
                     // sequence, applying the handler to everything that isn't.
@@ -156,7 +175,14 @@ fn utf8_decode(b: &[u8], errors: Errors) -> Result<(String, usize), String> {
                                     Errors::SurrogateEscape => out.push(
                                         char::from_u32(0xdc00 + b[i] as u32).unwrap_or('\u{fffd}'),
                                     ),
-                                    _ => return Err(dec_err("utf-8", i, "invalid start byte")),
+                                    _ => {
+                                        return Err(dec_err(
+                                            "utf-8",
+                                            b,
+                                            (i, i + 1),
+                                            "invalid start byte",
+                                        ))
+                                    }
                                 }
                                 i += 1;
                             }
@@ -207,7 +233,12 @@ fn utf_x_decode(
     errors: Errors,
 ) -> Result<String, String> {
     if b.len() % width != 0 && errors == Errors::Strict {
-        return Err(dec_err(enc, b.len() - (b.len() % width), "truncated data"));
+        return Err(dec_err(
+            enc,
+            b,
+            (b.len() - (b.len() % width), b.len()),
+            "truncated data",
+        ));
     }
     let mut units: Vec<u32> = Vec::with_capacity(b.len() / width);
     for chunk in b.chunks_exact(width) {
@@ -240,7 +271,14 @@ fn utf_x_decode(
         match char::from_u32(u) {
             Some(c) => out.push(c),
             None => match errors {
-                Errors::Strict => return Err(dec_err(enc, i * width, "illegal encoding")),
+                Errors::Strict => {
+                    return Err(dec_err(
+                        enc,
+                        b,
+                        (i * width, (i + 1) * width),
+                        "illegal encoding",
+                    ))
+                }
                 Errors::Ignore => {}
                 _ => out.push('\u{fffd}'),
             },

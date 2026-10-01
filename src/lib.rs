@@ -19,6 +19,7 @@ pub mod cli;
 pub mod compiler;
 pub mod dap;
 pub mod excgroup;
+pub mod excunicode;
 pub mod extensions;
 #[cfg(feature = "stdlib-ffi")]
 pub mod ffi;

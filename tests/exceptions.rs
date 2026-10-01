@@ -58,3 +58,49 @@ for s in ["AttributeError('x', nam=1)", "AttributeError(a=1, b=2, c=3)", "NameEr
          'NameError() takes at most 1 keyword argument (2 given)']"
     );
 }
+
+/// `UnicodeDecodeError`/`UnicodeEncodeError`/`UnicodeTranslateError` carry
+/// CPython's argument tuple, `(encoding, object, start, end, reason)`, with the
+/// five attributes reading it back and `__str__` rendered from it: for an error
+/// a codec raised (the bytes and str methods, the utf-16/utf-32 decoders, a text
+/// file's encoder) and for one the program constructs, with the constructor's
+/// argument checks. Expected values are CPython 3.14's.
+#[test]
+fn unicode_errors_carry_their_five_tuple() {
+    let src = r#"
+out = []
+def args_of(f):
+    try: f()
+    except UnicodeError as e: return (type(e).__name__, e.args, (e.encoding, e.object, e.start, e.end, e.reason), str(e))
+out.append(args_of(lambda: b'a\xffb'.decode('utf-8')))
+out.append(args_of(lambda: bytearray(b'\xe2\x82').decode()))
+out.append(args_of(lambda: 'a\xe9€b'.encode('ascii')))
+out.append(args_of(lambda: '€'.encode('latin-1')))
+out.append(args_of(lambda: b'\x00\xd8a'.decode('utf-16-le')))
+out.append(args_of(lambda: b'a\x00\x00\xdc'.decode('utf-16-le')))
+out.append(args_of(lambda: b'a\x00\x00\x00\x00\xd8\x00\x00'.decode('utf-32-le')))
+out.append(args_of(lambda: open('/dev/null', 'w', encoding='ascii').write('a\xe9€b')))
+e = UnicodeDecodeError('e', bytearray(b'ab'), 0, 1, 'r')
+out.append((e.object, e.args, str(e)))
+out.append(str(UnicodeEncodeError('e', '\U0001f600', 0, 1, 'r')))
+out.append((str(UnicodeTranslateError('aĀ', 1, 2, 'r')), UnicodeTranslateError('abc', 0, 2, 'r').encoding))
+for s in ["UnicodeDecodeError('x')", "UnicodeDecodeError('e', 'a', 0, 1, 'r')", "UnicodeEncodeError('e', b'a', 0, 1, 'r')", "UnicodeDecodeError('e', b'a', 'x', 1, 'r')"]:
+    try: eval(s)
+    except TypeError as e: out.append(str(e))
+"#;
+    assert_eq!(g(src, "out"), r#"[('UnicodeDecodeError', ('utf-8', b'a\xffb', 1, 2, 'invalid start byte'), ('utf-8', b'a\xffb', 1, 2, 'invalid start byte'), "'utf-8' codec can't decode byte 0xff in position 1: invalid start byte"), ('UnicodeDecodeError', ('utf-8', b'\xe2\x82', 0, 2, 'unexpected end of data'), ('utf-8', b'\xe2\x82', 0, 2, 'unexpected end of data'), "'utf-8' codec can't decode bytes in position 0-1: unexpected end of data"), ('UnicodeEncodeError', ('ascii', 'aé€b', 1, 3, 'ordinal not in range(128)'), ('ascii', 'aé€b', 1, 3, 'ordinal not in range(128)'), "'ascii' codec can't encode characters in position 1-2: ordinal not in range(128)"), ('UnicodeEncodeError', ('latin-1', '€', 0, 1, 'ordinal not in range(256)'), ('latin-1', '€', 0, 1, 'ordinal not in range(256)'), "'latin-1' codec can't encode character '\\u20ac' in position 0: ordinal not in range(256)"), ('UnicodeDecodeError', ('utf-16-le', b'\x00\xd8a', 0, 3, 'unexpected end of data'), ('utf-16-le', b'\x00\xd8a', 0, 3, 'unexpected end of data'), "'utf-16-le' codec can't decode bytes in position 0-2: unexpected end of data"), ('UnicodeDecodeError', ('utf-16-le', b'a\x00\x00\xdc', 2, 4, 'illegal encoding'), ('utf-16-le', b'a\x00\x00\xdc', 2, 4, 'illegal encoding'), "'utf-16-le' codec can't decode bytes in position 2-3: illegal encoding"), ('UnicodeDecodeError', ('utf-32-le', b'a\x00\x00\x00\x00\xd8\x00\x00', 4, 8, 'code point in surrogate code point range(0xd800, 0xe000)'), ('utf-32-le', b'a\x00\x00\x00\x00\xd8\x00\x00', 4, 8, 'code point in surrogate code point range(0xd800, 0xe000)'), "'utf-32-le' codec can't decode bytes in position 4-7: code point in surrogate code point range(0xd800, 0xe000)"), ('UnicodeEncodeError', ('ascii', 'aé€b', 1, 3, 'ordinal not in range(128)'), ('ascii', 'aé€b', 1, 3, 'ordinal not in range(128)'), "'ascii' codec can't encode characters in position 1-2: ordinal not in range(128)"), (b'ab', ('e', bytearray(b'ab'), 0, 1, 'r'), "'e' codec can't decode byte 0x61 in position 0: r"), "'e' codec can't encode character '\\U0001f600' in position 0: r", ("can't translate character '\\u0100' in position 1: r", None), 'function takes exactly 5 arguments (1 given)', "a bytes-like object is required, not 'str'", 'argument 2 must be str, not bytes', "'str' object cannot be interpreted as an integer"]"#);
+}
+
+/// `__str__` reads the attributes, not `args`, as CPython's
+/// `UnicodeDecodeError_str` reads the instance fields: reassigning them changes
+/// the rendering and leaves `args` alone.
+#[test]
+fn unicode_error_str_follows_reassigned_attributes() {
+    let src = "e = UnicodeDecodeError('e', b'ab', 0, 1, 'r')\n\
+               e.reason = 'changed'; e.start = 1\n\
+               x = (str(e), e.args)";
+    assert_eq!(
+        g(src, "x"),
+        "(\"'e' codec can't decode bytes in position 1-0: changed\", ('e', b'ab', 0, 1, 'r'))"
+    );
+}
