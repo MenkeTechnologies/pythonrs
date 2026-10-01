@@ -9,6 +9,13 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **A dedent matching no outer level wins over the parse error after it.**
+  `try:` / `if 1:` with a body indented 8 and a following line at 4 reported
+  `SyntaxError: expected 'except' or 'finally' block` (or no caret): the
+  tokenizer stops at the bad dedent, and the parser failing at that truncated
+  end is CPython's tokenizer raising `IndentationError: unindent does not match
+  any outer indentation level` when the parser asks for the next token. It is
+  now raised there, positioned just past the end of the line as CPython does.
 - **`itertools.groupby` is lazy.** It drained its input and built every group
   as a list up front, so it never returned on an infinite iterator
   (`groupby(count(), key=…)`), each group was a `list` instead of an

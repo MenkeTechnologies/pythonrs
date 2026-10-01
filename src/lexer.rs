@@ -330,8 +330,19 @@ impl Lexer {
                 self.push(Tok::Dedent);
             }
             if col != *self.indents.last().unwrap() {
-                let _ = start;
-                self.deferred = Some(format!("IndentationError: unindent does not match any outer indentation level (line {})", self.line));
+                // CPython positions it just past the end of the offending line
+                // (offset = its length + 1, no end offset).
+                let len = self.src[start..]
+                    .iter()
+                    .take_while(|c| !matches!(c, '\n' | '\r'))
+                    .count();
+                self.deferred = Some(crate::parser::at_pos(
+                    "IndentationError: unindent does not match any outer indentation level",
+                    self.line,
+                    len as i64 + 1,
+                    self.line,
+                    -1,
+                ));
                 return Ok(false);
             }
         }

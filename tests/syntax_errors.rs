@@ -20,6 +20,27 @@ fn run_c(src: &str) -> (String, i32) {
 
 /// `(program, stderr, exit status)`.
 const CASES: &[(&str, &str, i32)] = &[
+    // A dedent matching no outer level is positioned past the end of its line,
+    // and it wins over the parse error the parser would hit asking for the
+    // token after it (`try:` whose body it ends wanted an `except`).
+    (
+        "try:\n        y: int\n    print(1)",
+        r#"  File "<string>", line 3
+    print(1)
+            ^
+IndentationError: unindent does not match any outer indentation level
+"#,
+        1,
+    ),
+    (
+        "if 1:\n        y = 1\n    x",
+        r#"  File "<string>", line 3
+    x
+     ^
+IndentationError: unindent does not match any outer indentation level
+"#,
+        1,
+    ),
     (
         r#"x = ("#,
         r#"  File "<string>", line 1

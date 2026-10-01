@@ -46,7 +46,14 @@ pub fn parse(src: &str) -> Result<Vec<Stmt>, String> {
         // wins, one at the end of the input is this one.
         Err(e) => match unclosed {
             Some(u) if p.pos + 2 >= p.toks.len() => u,
-            _ => e,
+            // The parser failed while asking for the token after the bad
+            // dedent that cut the stream short (`try:` whose body ends there
+            // wants an `except`): in CPython that request is what raises the
+            // tokenizer's `IndentationError`.
+            _ => match p.deferred.take() {
+                Some(d) if matches!(p.cur(), Tok::Eof) => d,
+                _ => e,
+            },
         },
     };
     // The offending line, as CPython's parser sees it: newline-terminated.
