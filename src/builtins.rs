@@ -4332,6 +4332,16 @@ pub(crate) fn exc_matches(h: &host::PyHost, exc: &Value, typ: &Value) -> bool {
     exception_isa(&exc_class, &want, h)
 }
 
+/// Zero-arg `super()` in a method of a class CPython built: CPython's
+/// `super(cls, inst)` (or the explicit `super(cls[, obj])` against a class CPython
+/// built), so attribute reads walk the real MRO past `cls`.
+#[cfg(feature = "stdlib-ffi")]
+fn foreign_super(args: Vec<Value>) -> Result<Value, String> {
+    let builtins = crate::ffi::import("builtins")?;
+    let sup = with_host(|h| crate::ffi::get_attr(h, builtins, "super"))?;
+    host::invoke(&sup, args, Vec::new())
+}
+
 /// The name of a callable value (builtin or class).
 fn callable_name(h: &host::PyHost, v: &Value) -> Option<String> {
     match h.get(v) {
@@ -6394,9 +6404,19 @@ pub fn call_builtin_function(
                     .ok_or_else(|| "RuntimeError: super(): no arguments".to_string())?;
                 let inst = with_host(|h| h.current_self())
                     .ok_or_else(|| "RuntimeError: super(): no arguments".to_string())?;
+                // A method of a class CPython built: its `__class__` cell is
+                // that class, so the proxy is CPython's own `super(cls, inst)`.
+                #[cfg(feature = "stdlib-ffi")]
+                if let Some(cls) = with_host(|h| h.foreign_class_cell(&owner)) {
+                    return foreign_super(vec![cls, inst]);
+                }
                 (owner, inst)
             } else {
                 let cls = arg0(&args)?;
+                #[cfg(feature = "stdlib-ffi")]
+                if with_host(|h| h.foreign_id(&cls)).is_some() {
+                    return foreign_super(args);
+                }
                 let owner = with_host(|h| callable_name(h, &cls))
                     .ok_or_else(|| host::type_error("super() argument 1 must be a type"))?;
                 let inst = args.get(1).cloned().unwrap_or(Value::Undef);

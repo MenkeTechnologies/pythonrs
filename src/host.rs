@@ -2150,6 +2150,12 @@ pub struct PyHost {
     pub func_names: Vec<Rc<str>>,
     /// Class templates by name.
     pub classes: IndexMap<String, ClassDef>,
+    /// The `__class__` cell of each method defined in the body of a class that
+    /// CPython built (a class with a foreign base, see [`build_class_foreign`]),
+    /// keyed by the owner tag its `FuncVal::owner` carries. Such a class has no
+    /// `ClassDef`, so zero-arg `super()` in one of its methods resolves through
+    /// this `Foreign` class handle and CPython's own `super`.
+    pub foreign_class_cells: HashMap<String, Value>,
     /// Memoized C3 linearizations, keyed by class name.
     ///
     /// `mro_of` is on the path of every attribute read, every method dispatch and
@@ -2820,6 +2826,7 @@ impl PyHost {
             func_locals: Vec::new(),
             func_names: Vec::new(),
             classes: IndexMap::new(),
+            foreign_class_cells: HashMap::new(),
             mro_cache: std::cell::RefCell::new(HashMap::new()),
             str_index: RefCell::new(None),
             tries: Vec::new(),
@@ -15960,8 +15967,11 @@ pub fn run_user_func(
     // `__new__` is an implicit staticmethod (no bound receiver), but zero-arg
     // `super()` inside it resolves against the class passed as the first argument.
     // Expose that as the frame's `self` without prepending it to the parameters.
+    // The same holds for any method called with its receiver as a plain argument
+    // (`C.m(obj)`, or CPython calling a method stored in a class it built): CPython's
+    // zero-arg `super()` reads the frame's first argument, not a bound receiver.
     let frame_self = self_val.clone().or_else(|| {
-        if def.name == "__new__" {
+        if def.name == "__new__" || (fv.owner.is_some() && !def.params.is_empty()) {
             pos.first().cloned()
         } else {
             None
@@ -16728,7 +16738,38 @@ pub fn build_class_foreign(
         let q = with_host(|h| h.new_str(name.to_string()));
         members.push(("__qualname__".to_string(), q));
     }
-    crate::ffi::build_foreign_class(name, &bases, &members)
+    let cls = crate::ffi::build_foreign_class(name, &bases, &members)?;
+    with_host(|h| h.fill_foreign_class_cell(&cls, &members));
+    Ok(cls)
+}
+
+impl PyHost {
+    /// `type.__new__` sets the body's `__class__` cell to the class it built, so
+    /// zero-arg `super()` in a method finds its defining class. A class CPython
+    /// built has no `ClassDef` to name, so each function defined in its body is
+    /// tagged with a key into `foreign_class_cells`, which holds the class.
+    #[cfg(feature = "stdlib-ffi")]
+    fn fill_foreign_class_cell(&mut self, cls: &Value, members: &[(String, Value)]) {
+        let tag = format!("\u{1}foreign-class-{}", self.foreign_class_cells.len());
+        self.foreign_class_cells.insert(tag.clone(), cls.clone());
+        for (_, member) in members {
+            let func = match self.get(member) {
+                Some(PyObj::StaticMethod(inner) | PyObj::ClassMethod(inner)) => inner.clone(),
+                _ => member.clone(),
+            };
+            if let Some(PyObj::Func(fv)) = self.get_mut(&func) {
+                if fv.owner.is_none() {
+                    Rc::make_mut(fv).owner = Some(tag.clone());
+                }
+            }
+        }
+    }
+
+    /// The class a foreign-class method's owner tag names (see
+    /// [`PyHost::fill_foreign_class_cell`]), or `None` for a native owner.
+    pub fn foreign_class_cell(&self, owner: &str) -> Option<Value> {
+        self.foreign_class_cells.get(owner).cloned()
+    }
 }
 
 /// Fire `__set_name__(owner, attr)` on each namespace value whose type defines

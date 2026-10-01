@@ -1848,6 +1848,25 @@ impl PyrsCallable {
         obj: Option<Bound<'py, PyAny>>,
         _owner: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        // `classmethod.__get__` binds the owner (or `type(obj)`), and
+        // `staticmethod.__get__` binds nothing, on instance and class access alike.
+        let kind = with_host(|h| match h.get(&slf.borrow().target) {
+            Some(PyObj::ClassMethod(_)) => Some(true),
+            Some(PyObj::StaticMethod(_)) => Some(false),
+            _ => None,
+        });
+        match kind {
+            Some(true) => {
+                let cls = match (_owner, obj) {
+                    (Some(owner), _) if !owner.is_none() => owner,
+                    (_, Some(instance)) if !instance.is_none() => instance.get_type().into_any(),
+                    _ => return Ok(slf.into_any()),
+                };
+                return py.import("types")?.getattr("MethodType")?.call1((slf, cls));
+            }
+            Some(false) => return Ok(slf.into_any()),
+            None => {}
+        }
         match obj {
             Some(instance) if !instance.is_none() => py
                 .import("types")?

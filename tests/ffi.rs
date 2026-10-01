@@ -1225,3 +1225,65 @@ print(dataclasses.fields(D)[0].type is int, type(types.SimpleNamespace(m=[]).m) 
         "stderr={stderr}"
     );
 }
+
+/// Zero-arg `super()` in a class CPython built (any class with a foreign base,
+/// here `abc.ABC` and `enum.Enum`) resolves through the class's `__class__` cell
+/// to CPython's own `super`, in `__init__`, a classmethod, and across two levels
+/// of overriding; an explicit `super(Cls, obj)` against such a class is
+/// CPython's `super` too. A native method called with its receiver as a plain
+/// argument (`Kid.g(obj)`, `map(Kid.g, …)`) reads `super()`'s instance from its
+/// first argument, as CPython does. Expected output is python3.14's.
+#[test]
+fn zero_arg_super_in_a_class_with_a_foreign_base() {
+    let src = "\
+import abc, enum
+class Shape(abc.ABC):
+    def __init__(self, name): self.name = name
+    @abc.abstractmethod
+    def area(self): ...
+    @classmethod
+    def make(cls): return cls.__name__
+    def describe(self): return f'{self.name}:{self.area()}'
+class Sq(Shape):
+    def __init__(self, s):
+        super().__init__('sq')
+        self.s = s
+    def area(self): return self.s * self.s
+    @classmethod
+    def make(cls): return 'Sq+' + super().make()
+    def describe(self): return '[' + super().describe() + ']'
+class Sq2(Sq):
+    def area(self): return super().area() + 1
+q = Sq2(3)
+print(q.describe(), Sq2.make(), q.name, isinstance(q, Shape))
+print(type(super(Sq, q)).__name__)
+class Color(enum.Enum):
+    RED = 1
+    def label(self): return 'c:' + super().__str__()
+print(Color.RED.label())
+class Base:
+    def g(self): return 'Base.g'
+class Kid(Base):
+    def g(self): return 'Kid+' + super().g()
+print(Kid.g(Kid()), list(map(Kid.g, [Kid()])))
+class M:
+    @staticmethod
+    def s(): return super()
+try: M.s()
+except RuntimeError as e: print('RE', e)
+";
+    let (stdout, stderr, ok) = run_py(src);
+    if bridge_unavailable(ok, &stderr) {
+        eprintln!("skipping foreign super test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(
+        stdout,
+        "[sq:10] Sq+Sq2 sq True\n\
+         super\n\
+         c:Color.RED\n\
+         Kid+Base.g ['Kid+Base.g']\n\
+         RE super(): no arguments\n",
+        "stderr={stderr}"
+    );
+}

@@ -30,6 +30,22 @@ written.
   sub-pattern, the whole or-pattern. `args` is `(msg, (filename, lineno,
   offset, None, end_lineno, end_offset))`, as `_PyErr_RaiseSyntaxError`
   builds it, and the offsets are bytes plus one (`case ('éé', a, a)` is 19).
+- **Zero-arg `super()` works in a class CPython built.** A class with a foreign
+  base (`class C(abc.ABC)`, an `enum.Enum` subclass) is built by CPython's
+  metaclass and has no native `ClassDef`, and its methods are called through
+  CPython, so `super()` in one raised `RuntimeError: super(): no arguments` —
+  every `abc.ABC` hierarchy that chains `__init__` broke on it. `type.__new__`
+  fills the body's `__class__` cell with the class it built; pythonrs now does
+  the same by tagging each function defined in the body (and the function
+  inside a `classmethod`/`staticmethod`) with the built class
+  (`PyHost::foreign_class_cells`), and `super()` there is CPython's own
+  `super(cls, inst)`, as is an explicit `super(Cls, obj)` against such a class.
+  Its instance is the frame's first argument, which is CPython's rule
+  (`super_init_without_args` reads `localsplus[0]`), so a native method called
+  with its receiver as a plain argument — `Kid.g(obj)`, `map(Kid.g, objs)` —
+  resolves too. A `classmethod`/`staticmethod` stored in a CPython-built class
+  binds as `classmethod.__get__`/`staticmethod.__get__` do (the owner, or
+  nothing), where both used to bind the instance like a plain function.
 - **`--lsp` go-to-definition and signature help.** The server answered only
   completion, hover and diagnostics. `textDocument/definition` now resolves the
   name under the cursor the way the compiler does — innermost function out,
@@ -2171,18 +2187,11 @@ module then raises `ModuleNotFoundError`.
   A `@dataclass` instance also matches a `match` class pattern (positional via
   `__match_args__`/keyword), routed through CPython `isinstance` + bridge attribute
   reads.
-  Remaining gaps:
+  Remaining gap:
   - **`collections.namedtuple` field *types*** cross as `PyrsCallable` wrappers,
     not the CPython type objects, so `dataclasses.fields(x)[i].type` on a mirrored
     class is a proxy — the generated `__init__`/`__repr__`/`__eq__` (which use only
     field names) are unaffected.
-  - **A class with a foreign base cascades to a foreign class**, so a zero-arg
-    `super()` in one of its methods raises `super(): no arguments` — the pythonrs
-    method runs on the CPython mirror without a native `__class__`/`self` frame.
-    This bites `class C(abc.ABC)` hierarchies (`abc.ABC` is foreign): native
-    `abc.ABC`/`@abstractmethod` are not yet recognized, so use a plain base class
-    (a method raising `NotImplementedError`) for now. A native-base hierarchy's
-    `super()`/MRO is unaffected.
 
 ### Standard library — `re`
 
