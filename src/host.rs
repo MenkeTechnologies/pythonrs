@@ -2289,6 +2289,12 @@ pub struct PyHost {
     /// consult these.
     pub stdout_target: Option<Value>,
     pub stderr_target: Option<Value>,
+    /// Distinguishes this host from every other one the process creates (one
+    /// per thread, a fresh one per `reset_host`). A pythonrs value handed to
+    /// the embedded interpreter as its `sys.stdout` records it, so a write
+    /// reaching that stream after the host is gone cannot resolve the value
+    /// against a different heap.
+    pub generation: u64,
     /// Every `sys.flags` object built so far, so a `set_int_max_str_digits`
     /// shows up in `sys.flags.int_max_str_digits` as it does in CPython.
     sys_flags: Vec<Value>,
@@ -2621,9 +2627,30 @@ pub fn with_host<R>(f: impl FnOnce(&mut PyHost) -> R) -> R {
     HOST.with(|h| f(&mut h.borrow_mut()))
 }
 
+/// [`with_host`] for a caller that may run while the host is already borrowed
+/// (a CPython callback fired from inside a marshalling window): `None` instead
+/// of a double-borrow panic.
+pub fn try_with_host<R>(f: impl FnOnce(&mut PyHost) -> R) -> Option<R> {
+    HOST.with(|h| h.try_borrow_mut().ok().map(|mut host| f(&mut host)))
+}
+
 /// Reset the host to a clean slate (fresh module frame).
 pub fn reset_host() {
-    with_host(|h| *h = PyHost::new());
+    // A program that ended inside a redirect leaves the embedded interpreter's
+    // `sys.stdout` pointing at its target; the fresh host starts unredirected.
+    with_host(|h| {
+        for stderr in [false, true] {
+            let redirected = if stderr {
+                h.stderr_target.is_some()
+            } else {
+                h.stdout_target.is_some()
+            };
+            if redirected {
+                h.set_std_target(stderr, None);
+            }
+        }
+        *h = PyHost::new();
+    });
     // The VM pool is keyed by `def_id`, which indexes the host's function table —
     // a table this call restarts at zero. A VM left over from the previous
     // program would be handed to whatever function takes that id next, running
@@ -2831,6 +2858,10 @@ impl PyHost {
             traceback: Vec::new(),
             stdout_target: None,
             stderr_target: None,
+            generation: {
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            },
             sys_flags: Vec::new(),
             capture: None,
             modules: NameMap::default(),
@@ -9334,6 +9365,58 @@ impl PyHost {
     }
 
     /// Whether `v` is a `memoryview` that has been released.
+    /// `type(v)` for a value that is not a CPython object: its class, or the
+    /// builtin type object `type_name` names. Under the bridge a PEP 604 union's
+    /// type is CPython's own `typing.Union` — the single object 3.14's
+    /// `types.UnionType` and `typing.Union` both name — so `type(int | str) is
+    /// types.UnionType` holds, and `type(u)[int, str]` subscripts as CPython's
+    /// does.
+    pub fn builtin_type_of(&mut self, v: &Value) -> Value {
+        #[cfg(feature = "stdlib-ffi")]
+        if matches!(self.get(v), Some(PyObj::Union { .. })) {
+            if let Ok(typing) = crate::ffi::import("typing") {
+                if let Ok(union) = crate::ffi::get_attr(self, typing, "Union") {
+                    return union;
+                }
+            }
+        }
+        let tn = self.type_name(v);
+        if self.classes.contains_key(&tn) {
+            self.alloc(PyObj::Class(tn))
+        } else {
+            self.alloc(PyObj::Builtin(tn))
+        }
+    }
+
+    /// Point `sys.stdout` (`stderr` false) or `sys.stderr` at `target` — `None`
+    /// for the native stream, `Value::Undef` for `sys.stdout = None`.
+    ///
+    /// pythonrs's own `print` reads the host field. Under the bridge the
+    /// embedded interpreter's `sys.stdout` is swapped too, because CPython has
+    /// exactly one: a `redirect_stdout(buf)` block captures what a bridged
+    /// module or a CPython-side `print` (`functools.partial(print, …)`) writes,
+    /// while an object that grabbed the stream earlier (a `logging` handler
+    /// configured before the block) keeps writing where it pointed.
+    pub fn set_std_target(&mut self, stderr: bool, target: Option<Value>) {
+        #[cfg(feature = "stdlib-ffi")]
+        {
+            let cpython = match &target {
+                None => crate::ffi::StdTarget::Native,
+                Some(Value::Undef) => crate::ffi::StdTarget::Null,
+                Some(v) => match self.get(v) {
+                    Some(PyObj::Foreign(id)) => crate::ffi::StdTarget::Foreign(*id),
+                    _ => crate::ffi::StdTarget::Pyrs(v.clone(), self.generation),
+                },
+            };
+            crate::ffi::set_std_target(stderr, cpython);
+        }
+        if stderr {
+            self.stderr_target = target;
+        } else {
+            self.stdout_target = target;
+        }
+    }
+
     pub fn mv_released(&self, v: &Value) -> bool {
         matches!(self.get(v), Some(PyObj::Memoryview { released: true, .. }))
     }
@@ -12777,11 +12860,7 @@ impl PyHost {
                     return Ok(Value::Undef);
                 }
                 if name == "__class__" {
-                    return Ok(if self.classes.contains_key(&tn) {
-                        self.alloc(PyObj::Class(tn))
-                    } else {
-                        self.alloc(PyObj::Builtin(tn))
-                    });
+                    return Ok(self.builtin_type_of(recv));
                 }
                 // `defaultdict.default_factory` — the zero-arg callable `__missing__`
                 // calls, or `None`. It is a writable attribute in CPython (see the
@@ -13460,11 +13539,7 @@ impl PyHost {
                     }
                     _ => Some(val.clone()),
                 };
-                if is_stdout {
-                    self.stdout_target = target;
-                } else {
-                    self.stderr_target = target;
-                }
+                self.set_std_target(!is_stdout, target);
             }
         }
         // An exception instance carries arbitrary attributes, as CPython's do:
@@ -14828,12 +14903,7 @@ fn call_method_inner(
                     if let Some(PyObj::Redirect { saved, .. }) = h.get_mut(recv) {
                         *saved = cur;
                     }
-                    let new = Some(target.clone());
-                    if stderr {
-                        h.stderr_target = new;
-                    } else {
-                        h.stdout_target = new;
-                    }
+                    h.set_std_target(stderr, Some(target.clone()));
                 });
                 Ok(target)
             }
@@ -14843,11 +14913,7 @@ fn call_method_inner(
                         Some(PyObj::Redirect { saved, .. }) => saved.clone(),
                         _ => None,
                     };
-                    if stderr {
-                        h.stderr_target = saved;
-                    } else {
-                        h.stdout_target = saved;
-                    }
+                    h.set_std_target(stderr, saved);
                 });
                 Ok(Value::Bool(false))
             }

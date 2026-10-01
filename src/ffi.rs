@@ -333,7 +333,79 @@ fn route_std_streams() {
             let _ = sys.setattr(name, &new);
             let _ = sys.setattr(format!("__{name}__").as_str(), &new);
         }
+        // A redirect pythonrs installed before the interpreter existed.
+        for stderr in [false, true] {
+            if let Some(target) = PENDING_STD_TARGET.with(|p| p.borrow_mut()[stderr as usize].take()) {
+                apply_std_target(py, stderr, target);
+            }
+        }
     });
+}
+
+/// What the embedded interpreter's `sys.stdout`/`sys.stderr` should be — the
+/// CPython half of [`crate::host::PyHost::set_std_target`].
+pub enum StdTarget {
+    /// Not redirected: the routed stream `sys.__stdout__` names.
+    Native,
+    /// `sys.stdout = None`.
+    Null,
+    /// A CPython object (an `io.StringIO`), installed as itself so CPython code
+    /// sees the very object the program assigned.
+    Foreign(u32),
+    /// A pythonrs value, with the generation of the host that owns it.
+    Pyrs(Value, u64),
+}
+
+thread_local! {
+    /// A redirect set before the interpreter started, applied by
+    /// [`route_std_streams`] once it does. Index 0 is stdout, 1 stderr.
+    static PENDING_STD_TARGET: std::cell::RefCell<[Option<StdTarget>; 2]> =
+        const { std::cell::RefCell::new([None, None]) };
+}
+
+/// Swap the embedded interpreter's `sys.stdout` (or `sys.stderr`) to match a
+/// pythonrs redirect. Before the interpreter starts there is nothing to swap;
+/// the target is held until [`route_std_streams`] runs.
+pub fn set_std_target(stderr: bool, target: StdTarget) {
+    if !INTERPRETER_STARTED.load(std::sync::atomic::Ordering::Relaxed) {
+        PENDING_STD_TARGET.with(|p| {
+            p.borrow_mut()[stderr as usize] = match target {
+                StdTarget::Native => None,
+                other => Some(other),
+            }
+        });
+        return;
+    }
+    Python::with_gil(|py| apply_std_target(py, stderr, target));
+}
+
+fn apply_std_target(py: Python, stderr: bool, target: StdTarget) {
+    let name = if stderr { "stderr" } else { "stdout" };
+    let Ok(sys) = py.import("sys") else { return };
+    // What CPython already wrote goes out before the stream changes hands.
+    if let Ok(current) = sys.getattr(name) {
+        if !current.is_none() {
+            let _ = current.call_method0("flush");
+        }
+    }
+    let new = match target {
+        StdTarget::Native => sys.getattr(format!("__{name}__").as_str()),
+        StdTarget::Null => Ok(py.None().into_bound(py)),
+        StdTarget::Foreign(id) => fetch(py, id).map_err(pyo3::exceptions::PyRuntimeError::new_err),
+        StdTarget::Pyrs(target, generation) => Py::new(
+            py,
+            PyrsRedirectStream {
+                target,
+                stderr,
+                thread: std::thread::current().id(),
+                generation,
+            },
+        )
+        .map(|p| p.into_any().into_bound(py)),
+    };
+    if let Ok(new) = new {
+        let _ = sys.setattr(name, new);
+    }
 }
 
 /// Run `python -m <modname> [args…]` on the embedded CPython by calling
@@ -1318,8 +1390,30 @@ fn py_to_value(host: &mut PyHost, py: Python, obj: &Bound<PyAny>) -> Result<Valu
     if let Some(v) = unwrap_proxy(obj) {
         return Ok(v);
     }
+    // A CPython builtin type pythonrs implements natively (`int`, `list`, …)
+    // comes back as the native type object — the one a bare `int` names — so
+    // `dataclasses.fields(dc)[0].type is int` holds and the type constructs
+    // native values.
+    if let Some(name) = native_builtin_type(py, obj) {
+        return Ok(host.builtin_object(name));
+    }
     // Anything else stays on the CPython side behind a Foreign handle.
     Ok(host.alloc(PyObj::Foreign(store(obj.clone().unbind()))))
+}
+
+/// The native name of `obj` when it IS one of CPython's builtin type objects
+/// that pythonrs also implements ([`crate::builtins::BUILTIN_TYPES`]).
+fn native_builtin_type(py: Python, obj: &Bound<PyAny>) -> Option<&'static str> {
+    if !obj.is_instance_of::<pyo3::types::PyType>() {
+        return None;
+    }
+    let name: String = obj.getattr("__name__").ok()?.extract().ok()?;
+    let native = crate::builtins::BUILTIN_TYPES
+        .iter()
+        .copied()
+        .find(|n| *n == name)?;
+    let builtin = py.import("builtins").ok()?.getattr(native).ok()?;
+    builtin.is(obj).then_some(native)
 }
 
 /// The pythonrs value behind a proxy pyclass, if `obj` is one. Every proxy this
@@ -1336,6 +1430,9 @@ fn unwrap_proxy(obj: &Bound<PyAny>) -> Option<Value> {
         return Some(c.borrow().target.clone());
     }
     if let Ok(c) = obj.downcast::<PyrsFile>() {
+        return Some(c.borrow().target.clone());
+    }
+    if let Ok(c) = obj.downcast::<PyrsRedirectStream>() {
         return Some(c.borrow().target.clone());
     }
     None
@@ -1463,8 +1560,43 @@ fn invoke_bound(
         // mutable-container argument (`heapq.heapify(lst)`, `random.shuffle(lst)`,
         // `struct.pack_into(fmt, buf, …)`) back into the pythonrs object.
         writeback_mutated_args(h, py, args, &arg_tuple);
-        py_to_value(h, py, &result)
+        call_result_to_value(h, py, &result, args, &arg_tuple, kw.as_ref())
     })
+}
+
+/// Marshal a call's result, keeping identity where the result is not fresh.
+///
+/// A call that hands back one of its own (by-value) arguments returns the
+/// pythonrs original, which [`writeback_mutated_args`] has already updated.
+/// Otherwise a mutable container is copied only when the call created it: one
+/// that something else still holds (refcount above the result's own
+/// reference) is a live object — `catch_warnings(record=True).__enter__()`
+/// returns the list `warnings.warn` goes on appending to — and stays behind a
+/// handle, like an attribute read ([`reference_to_value`]). The arguments'
+/// own marshalled copies are excluded from that test: the argument tuple is
+/// what holds them.
+fn call_result_to_value(
+    host: &mut PyHost,
+    py: Python,
+    result: &Bound<PyAny>,
+    args: &[Value],
+    arg_tuple: &Bound<PyTuple>,
+    kwargs: Option<&Bound<PyDict>>,
+) -> Result<Value, String> {
+    if let Some(i) = arg_tuple.iter().position(|a| a.is(result)) {
+        if matches!(
+            host.get(&args[i]),
+            Some(PyObj::List(_) | PyObj::Bytearray(_) | PyObj::Deque { .. })
+        ) {
+            return Ok(args[i].clone());
+        }
+        return py_to_value(host, py, result);
+    }
+    let is_kwarg = kwargs.is_some_and(|d| d.values().iter().any(|v| v.is(result)));
+    if !is_kwarg && result.get_refcnt() > 1 {
+        return reference_to_value(host, py, result);
+    }
+    py_to_value(host, py, result)
 }
 
 /// The pythonrs mutable-container kinds whose in-place mutation by a CPython
@@ -2240,6 +2372,72 @@ impl PyrsStdStream {
             crate::stdio::Stream::Stdout => "<stdout>",
             crate::stdio::Stream::Stderr => "<stderr>",
         }
+    }
+}
+
+// The embedded interpreter's `sys.stdout`/`sys.stderr` while pythonrs has it
+// redirected to one of its own values (`redirect_stdout(writer)`,
+// `sys.stdout = writer`): a text stream whose writes go to that value. It is
+// bound to the host that owns the value — a write from another thread, after
+// that host was reset, or while it is mid-borrow (CPython printing during a
+// marshalling window) goes to the native stream instead of resolving the
+// value against the wrong heap.
+#[pyclass]
+struct PyrsRedirectStream {
+    target: Value,
+    stderr: bool,
+    thread: std::thread::ThreadId,
+    generation: u64,
+}
+
+impl PyrsRedirectStream {
+    fn usable(&self) -> bool {
+        std::thread::current().id() == self.thread
+            && crate::host::try_with_host(|h| h.generation == self.generation).unwrap_or(false)
+    }
+
+    fn native(&self) -> crate::stdio::Stream {
+        if self.stderr {
+            crate::stdio::Stream::Stderr
+        } else {
+            crate::stdio::Stream::Stdout
+        }
+    }
+}
+
+#[pymethods]
+impl PyrsRedirectStream {
+    fn write(&self, text: &str) -> PyResult<usize> {
+        if self.usable() {
+            crate::host::write_to_stream(&self.target, text).map_err(call_err)?;
+        } else {
+            crate::stdio::write_bytes(self.native(), text.as_bytes());
+        }
+        Ok(text.chars().count())
+    }
+
+    // A target with only `write` is a valid stream and has nothing to flush.
+    fn flush(&self) -> PyResult<()> {
+        if !self.usable() {
+            crate::stdio::flush(self.native());
+            return Ok(());
+        }
+        if with_host(|h| h.get_attr(&self.target, "flush")).is_ok() {
+            crate::host::call_method(&self.target, "flush", vec![], vec![]).map_err(call_err)?;
+        }
+        Ok(())
+    }
+
+    // Everything else a stream user reads (`encoding`, `getvalue`, `isatty`)
+    // is the target's own attribute.
+    fn __getattr__(&self, py: Python, name: String) -> PyResult<Py<PyAny>> {
+        if !self.usable() {
+            return Err(pyo3::exceptions::PyAttributeError::new_err(name));
+        }
+        let v = with_host(|h| h.get_attr(&self.target, &name)).map_err(rs_err_typed)?;
+        with_host(|h| value_to_py(h, py, &v))
+            .map(|b| b.unbind())
+            .map_err(rs_err)
     }
 }
 

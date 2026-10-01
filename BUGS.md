@@ -881,6 +881,41 @@ written.
   (`Name(...)`), elides the middle of a sequence longer than two, and guards
   self-reference. Node classes report `__module__ == 'ast'` and carry
   `__match_args__` and `_field_types`.
+- **`contextlib.redirect_stdout` captures CPython-side writes.** pythonrs
+  tracked the redirect only in `PyHost::stdout_target`, so output written
+  through the embedded interpreter — `functools.partial(print, …)`, a bridged
+  module printing — escaped the buffer and reached the terminal out of order.
+  Every redirect (`redirect_stdout`/`redirect_stderr` enter and exit, `sys.stdout
+  = x`) now goes through `PyHost::set_std_target`, which swaps the embedded
+  interpreter's `sys.stdout` as well, since CPython has exactly one: a CPython
+  target (`io.StringIO`) is installed as itself (`sys.stdout is buf` holds on
+  both sides), a pythonrs target behind a write-through stream
+  (`ffi::PyrsRedirectStream`) that receives CPython's piecewise `print` writes,
+  and `None` as `None`. An object that grabbed the stream before the block — a
+  `logging.StreamHandler` — keeps writing where it pointed, as in CPython. A
+  redirect set before the interpreter starts is applied when it does. The
+  stream is bound to the owning host's thread and generation, so a write from
+  another thread or after a `reset_host` goes to the native stream rather than
+  resolving the value against another heap.
+- **A CPython call result that is not fresh keeps its identity.** Every call
+  result was copied into a native value, so `with
+  warnings.catch_warnings(record=True) as w:` bound a COPY of the list
+  `warnings.warn` appends to — `w` stayed empty — and an `lru_cache`d list, or
+  an argument the call handed back, came back as a new object. A result that
+  is one of the call's own by-value arguments now returns the pythonrs
+  original (already updated by the argument write-back), and a mutable
+  container something else still references (refcount above the result's own)
+  stays behind a handle like an attribute read. Only a container the call
+  created is copied.
+- **CPython's builtin types cross as pythonrs's, and `type(int | str) is
+  types.UnionType` holds on the ffi build.** A CPython `int`/`list`/`dict`/…
+  type object returned over the bridge (`dataclasses.fields(D)[0].type`) was a
+  handle, so `is int` failed, and `type(handle_to_a_list)` was CPython's
+  `list` rather than pythonrs's, so `type(x) is list` failed. Both now resolve
+  to the native type object. The reverse holds for unions: `type(int | str)`
+  and `(int | str).__class__` are CPython's own `typing.Union` — the object
+  3.14's `types.UnionType` and `typing.Union` both name — so identity,
+  `isinstance`, and `type(u)[int, None]` behave as in CPython.
 - **A class reprs with its own module.** `repr(cls)` and the default
   `<… object at 0x…>` repr prefixed every program-defined class with
   `__main__.`, so a class from an imported module read `<class
@@ -1622,15 +1657,18 @@ written.
   `unittest` failure report carries the `AssertionError: 1 != 2` line without the
   `Traceback (most recent call last):` block above it. Repro:
   `import logging; logging.basicConfig(); \ntry: 1/0\nexcept ZeroDivisionError: logging.exception('boom')`.
-- **`contextlib.redirect_stdout` does not capture CPython-side writes.** pythonrs
-  tracks the redirect in `PyHost::stdout_target`, which its own `print` and
-  `sys.stdout` reads honour, but the embedded interpreter's `sys.stdout` still
-  points at the real fd. Output written through the CPython side —
-  `functools.partial(print, …)`, anything a bridged module prints — escapes the
-  buffer and lands on the terminal, in the wrong order relative to the captured
-  text. The same gap applies to `unittest`'s `--buffer` and any capture built on
-  `redirect_stdout`. Repro: `with contextlib.redirect_stdout(io.StringIO()) as
-  buf: functools.partial(print, 'x')()` — `x` appears on stdout, not in `buf`.
+- **A CPython-side `sys.stdout` reassignment does not redirect pythonrs's
+  `print`.** The pythonrs → CPython direction is covered (see the Implemented
+  entry on `redirect_stdout`); the reverse is not. When CPython code assigns
+  the embedded interpreter's `sys.stdout` — `unittest`'s `buffer=True`
+  runner, a CPython-side `contextlib` — pythonrs's `print` and `sys.stdout`
+  still write to the native stream, so a buffered test run prints its
+  captured output to the terminal (`TextTestRunner(buffer=True)` with a test
+  that prints shows the text where CPython shows nothing). Seeing the
+  assignment needs either a per-write probe of CPython's `sys.stdout` (a GIL
+  round-trip on every `print`) or a `__setattr__` hook on the `sys` module
+  (by reassigning its `__class__` to a `ModuleType` subclass, which changes
+  `type(sys)`); neither is in place.
 - **A pythonrs callable or object cannot be used from a worker thread.** On the
   bridged build `import threading` is CPython's, and CPython's `threading.py`
   imports the REAL C `_thread` — not the native `_thread` this crate ships — so
@@ -1656,11 +1694,16 @@ written.
   builtins pickle correctly (they cross by value); it is user-defined classes that
   do not, which also rules out `copy.deepcopy` through the pickle fallback,
   `multiprocessing` arguments, and anything that caches objects to disk.
-- **`warnings.catch_warnings(record=True)` records nothing.** `warnings.warn` is
-  CPython's C `_warnings.warn` while the recording list the context manager
-  installs is read back across the bridge by value, so the appended entries are
-  not visible to the pythonrs-side name. `w` stays empty and indexing it raises
-  `IndexError` where CPython reports one `UserWarning`.
+- **A warning raised from pythonrs code is attributed to `<sys>:0`.**
+  `warnings.warn` is CPython's C `_warnings.warn`, which locates the warning
+  by walking CPython frames; a call from pythonrs has none, so the message
+  renders as `<sys>:0: UserWarning: boom` with no source line (CPython:
+  `script.py:3: UserWarning: boom` plus the line), a recorded warning's
+  `filename`/`lineno` are `'<sys>'`/`0`, and `stacklevel=` has nothing to
+  walk. Attributing it needs the executing line of every pythonrs frame at the
+  moment of the call — `Frame::line` is only maintained by the DAP hook and the
+  error path — plus each frame's filename and module globals for
+  `warn_explicit`'s registry.
 
 - **The depth guards are calibrated for the interpreter's 512 MB stack, not for
   an embedder's.** `src/main.rs` runs the interpreter on a thread with
@@ -1722,13 +1765,6 @@ written.
   shorter. Closing it means carrying the CPython object's identity through the
   pythonrs exception value rather than rebuilding from class + args. Reachable
   from `parity-fuzz --mode ctxmgr` and `--mode stdlibexc`.
-- **`types.UnionType is type(int | str)` is False on the ffi build.** In the
-  self-contained build `types.py` binds `type(int | str)` and the identity
-  holds. Under `stdlib-ffi`, `types.UnionType` and `typing.Union` are both
-  CPython's own object (identical to each other) while `type(int | str)` stays
-  native, so the union type has two representations that never compare `is`,
-  even though the name, module, repr and messages all match. This is the general
-  cross-bridge type-identity boundary, not specific to `Union`.
 - **PEP 649: class-body annotations are evaluated eagerly.** Functions are lazy
   (see "Implemented"), but a class body still evaluates each simple annotation
   as it runs and drops one whose name does not resolve: `class C: x: Later`

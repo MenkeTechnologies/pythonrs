@@ -1134,3 +1134,94 @@ print(isinstance(lambda: 1, types.FunctionType), isinstance(gen(), types.Generat
         "stderr={stderr}"
     );
 }
+
+/// `contextlib.redirect_stdout` captures what the CPython side writes too: the
+/// embedded interpreter's `sys.stdout` IS the target inside the block (so
+/// `functools.partial(print, …)` lands in the buffer, in order, and
+/// `sys.stdout is buf`), a pythonrs writer object receives CPython's
+/// piecewise `print` writes, and a `logging` handler that grabbed the real
+/// stream before the block keeps writing there. Expected output is
+/// python3.14's for the same script.
+#[test]
+fn redirect_stdout_captures_cpython_side_writes() {
+    let src = "\
+import contextlib, io, functools, sys, logging
+with contextlib.redirect_stdout(io.StringIO()) as buf:
+    print('a')
+    functools.partial(print, 'x')()
+    print('b')
+    same = sys.stdout is buf
+print(repr(buf.getvalue()), same)
+class W:
+    def __init__(self): self.parts = []
+    def write(self, s): self.parts.append(s)
+w = W()
+with contextlib.redirect_stdout(w):
+    functools.partial(print, 'y', 'z', sep='-')()
+print(w.parts)
+h = logging.StreamHandler(sys.stdout)
+lg = logging.getLogger('t'); lg.addHandler(h); lg.propagate = False
+with contextlib.redirect_stdout(io.StringIO()) as b2:
+    lg.warning('kept')
+print(repr(b2.getvalue()))
+";
+    let (stdout, stderr, ok) = run_py(src);
+    if bridge_unavailable(ok, &stderr) {
+        eprintln!("skipping redirect test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(
+        stdout,
+        "'a\\nx\\nb\\n' True\n['y', '-', 'z', '\\n']\nkept\n''\n",
+        "stderr={stderr}"
+    );
+}
+
+/// A CPython call result keeps its identity when it is not fresh: the list
+/// `catch_warnings(record=True)` returns is the one `warnings.warn` appends to,
+/// an `lru_cache`d list is the cached object, and a call that returns one of
+/// its own arguments returns the pythonrs original. CPython's builtin types
+/// cross as pythonrs's (`fields(D)[0].type is int`, `type(handle) is list`),
+/// and a PEP 604 union's type IS 3.14's `types.UnionType`/`typing.Union`.
+/// Expected output is python3.14's for the same script.
+#[test]
+fn bridged_results_and_types_keep_their_identity() {
+    let src = "\
+import warnings, functools, types, typing, dataclasses
+with warnings.catch_warnings(record=True) as w:
+    warnings.simplefilter('always')
+    warnings.warn('boom')
+    warnings.warn('dep', DeprecationWarning)
+print(len(w), [str(x.message) for x in w], [x.category.__name__ for x in w])
+@functools.lru_cache
+def cached():
+    return [1]
+cached().append(2)
+print(cached(), cached() is cached())
+lst = [3, 1, 2]
+print(functools.reduce(lambda acc, x: acc, [], lst) is lst)
+fresh = functools.reduce(lambda acc, x: acc + [x], [1, 2], [])
+print(fresh, type(fresh) is list)
+u = type(int | str)
+print(u is types.UnionType, u is typing.Union, (int | str).__class__ is types.UnionType, u[int, None])
+@dataclasses.dataclass
+class D:
+    a: int
+print(dataclasses.fields(D)[0].type is int, type(types.SimpleNamespace(m=[]).m) is list)
+";
+    let (stdout, stderr, ok) = run_py(src);
+    if bridge_unavailable(ok, &stderr) {
+        eprintln!("skipping identity test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(
+        stdout,
+        "2 ['boom', 'dep'] ['UserWarning', 'DeprecationWarning']\n\
+         [1, 2] True\n\
+         True\n\
+         [1, 2] True\n\
+         True True True int | None\n\
+         True True\n",
+        "stderr={stderr}"
+    );
+}

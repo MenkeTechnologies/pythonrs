@@ -6230,17 +6230,18 @@ pub fn call_builtin_function(
             #[cfg(feature = "stdlib-ffi")]
             if let Some(fid) = with_host(|h| h.foreign_id(&v)) {
                 if let Some(tid) = crate::ffi::type_of(fid) {
+                    // A CPython builtin type pythonrs also has (`list`, `dict`, …) is
+                    // answered with the native type object, so `type(x) is list`
+                    // holds for a list kept behind a handle.
+                    if let Some(name) = crate::ffi::foreign_builtin_type_name(tid)
+                        .filter(|n| BUILTIN_TYPES.contains(&n.as_str()))
+                    {
+                        return Ok(with_host(|h| h.builtin_object(&name)));
+                    }
                     return Ok(with_host(|h| h.alloc(PyObj::Foreign(tid))));
                 }
             }
-            let tn = with_host(|h| h.type_name(&v));
-            Ok(with_host(|h| {
-                if h.classes.contains_key(&tn) {
-                    h.alloc(PyObj::Class(tn))
-                } else {
-                    h.alloc(PyObj::Builtin(tn))
-                }
-            }))
+            Ok(with_host(|h| h.builtin_type_of(&v)))
         }
         // `types.SimpleNamespace(**kwargs)` — a mutable attribute bag. CPython
         // takes keyword arguments only (a single positional mapping is also
