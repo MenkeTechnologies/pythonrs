@@ -2089,19 +2089,8 @@ impl Compiler {
         if params.annotations.is_empty() {
             b.emit(Op::CallBuiltin(ops::MKDICT, 0), 0);
         } else {
-            let dict_expr = Expr::Dict(
-                params
-                    .annotations
-                    .iter()
-                    .map(|(name, ann)| (Some(Expr::Str(name.clone())), ann.clone()))
-                    .collect(),
-            );
-            let bodystmt = vec![Stmt::from(StmtKind::Return(Some(dict_expr)))];
-            let empty = Params::default();
-            self.fn_depth += 1;
-            let thunk_id = self.build_function("<annotate>", &empty, &bodystmt);
-            self.fn_depth -= 1;
-            self.emit_make_func(b, thunk_id?, &empty)?; // pushes the thunk value
+            let annotate_id = self.build_annotate(def_id, &params.annotations)?;
+            self.emit_make_func(b, annotate_id, &Params::default())?; // pushes `__annotate__`
         }
         let kwonly: Vec<&Expr> = params.kwonly_defaults.iter().flatten().collect();
         let total = 1 + params.defaults.len() + kwonly.len() + 2; // annotations + defaults + count + func id
@@ -2131,6 +2120,65 @@ impl Compiler {
             b.emit(Op::CallBuiltin(ops::MKFUNC, 5), 0);
         }
         Ok(())
+    }
+
+    /// Compile the PEP 649 `__annotate__` function of the function `def_id`,
+    /// the way CPython 3.14's `codegen_annotations` does:
+    ///
+    /// ```text
+    /// def __annotate__(format, /):
+    ///     if format > 2:            # VALUE_WITH_FAKE_GLOBALS
+    ///         raise NotImplementedError
+    ///     return {"x": <ann>, ..., "return": <ann>}
+    /// ```
+    ///
+    /// Its `__qualname__` is the owner's plus `.__annotate__` (no `<locals>`).
+    /// The parameter is spelled `.format`, CPython's own symtable name for it,
+    /// so an annotation that mentions `format` still reaches the enclosing scope
+    /// (`def f(x: format)` annotates with the builtin) rather than the argument.
+    fn build_annotate(
+        &mut self,
+        def_id: usize,
+        annotations: &[(String, Expr)],
+    ) -> Result<usize, String> {
+        const FORMAT: &str = ".format";
+        // `Format.VALUE_WITH_FAKE_GLOBALS`, the highest format the compiler's
+        // annotate function answers.
+        const VALUE_WITH_FAKE_GLOBALS: i64 = 2;
+        let dict_expr = Expr::Dict(
+            annotations
+                .iter()
+                .map(|(name, ann)| (Some(Expr::Str(name.clone())), ann.clone()))
+                .collect(),
+        );
+        let too_new = Expr::Compare(
+            Box::new(Expr::Name(FORMAT.into())),
+            vec![(CmpOp::Gt, Expr::Int(VALUE_WITH_FAKE_GLOBALS))],
+        );
+        let raise = Stmt::from(StmtKind::Raise {
+            exc: Some(Expr::Name("NotImplementedError".into())),
+            cause: None,
+        });
+        let body = vec![
+            Stmt::from(StmtKind::If {
+                test: too_new,
+                body: vec![raise],
+                orelse: vec![],
+            }),
+            Stmt::from(StmtKind::Return(Some(dict_expr))),
+        ];
+        let params = Params {
+            names: vec![FORMAT.into()],
+            posonly: 1,
+            ..Params::default()
+        };
+        let owner = self.functions[def_id].1.qualname.clone();
+        let saved_prefix = std::mem::replace(&mut self.qual_prefix, format!("{owner}."));
+        self.fn_depth += 1;
+        let id = self.build_function("__annotate__", &params, &body);
+        self.fn_depth -= 1;
+        self.qual_prefix = saved_prefix;
+        id
     }
 
     fn build_function(

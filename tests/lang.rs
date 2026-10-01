@@ -229,6 +229,217 @@ fn introspection_descriptor_types() {
     );
 }
 
+/// `dir()` of a builtin type is CPython's full listing — every slot wrapper,
+/// classmethod, data attribute and the inherited `object` surface, not just the
+/// method table. The expected names are CPython 3.14's `dir(T)`, so a name
+/// pythonrs drops (or invents) shows up as the symmetric difference.
+#[test]
+fn builtin_type_dir_is_cpythons_full_listing() {
+    let cases: &[(&str, &str)] = &[
+        (
+            "int",
+            "__abs__ __add__ __and__ __bool__ __ceil__ __class__ __delattr__ __dir__ \
+             __divmod__ __doc__ __eq__ __float__ __floor__ __floordiv__ __format__ __ge__ \
+             __getattribute__ __getnewargs__ __getstate__ __gt__ __hash__ __index__ __init__ \
+             __init_subclass__ __int__ __invert__ __le__ __lshift__ __lt__ __mod__ __mul__ \
+             __ne__ __neg__ __new__ __or__ __pos__ __pow__ __radd__ __rand__ __rdivmod__ \
+             __reduce__ __reduce_ex__ __repr__ __rfloordiv__ __rlshift__ __rmod__ __rmul__ \
+             __ror__ __round__ __rpow__ __rrshift__ __rshift__ __rsub__ __rtruediv__ __rxor__ \
+             __setattr__ __sizeof__ __str__ __sub__ __subclasshook__ __truediv__ __trunc__ \
+             __xor__ as_integer_ratio bit_count bit_length conjugate denominator from_bytes \
+             imag is_integer numerator real to_bytes",
+        ),
+        (
+            "str",
+            "__add__ __class__ __contains__ __delattr__ __dir__ __doc__ __eq__ __format__ \
+             __ge__ __getattribute__ __getitem__ __getnewargs__ __getstate__ __gt__ __hash__ \
+             __init__ __init_subclass__ __iter__ __le__ __len__ __lt__ __mod__ __mul__ __ne__ \
+             __new__ __reduce__ __reduce_ex__ __repr__ __rmod__ __rmul__ __setattr__ \
+             __sizeof__ __str__ __subclasshook__ capitalize casefold center count encode \
+             endswith expandtabs find format format_map index isalnum isalpha isascii \
+             isdecimal isdigit isidentifier islower isnumeric isprintable isspace istitle \
+             isupper join ljust lower lstrip maketrans partition removeprefix removesuffix \
+             replace rfind rindex rjust rpartition rsplit rstrip split splitlines startswith \
+             strip swapcase title translate upper zfill",
+        ),
+        (
+            "list",
+            "__add__ __class__ __class_getitem__ __contains__ __delattr__ __delitem__ __dir__ \
+             __doc__ __eq__ __format__ __ge__ __getattribute__ __getitem__ __getstate__ \
+             __gt__ __hash__ __iadd__ __imul__ __init__ __init_subclass__ __iter__ __le__ \
+             __len__ __lt__ __mul__ __ne__ __new__ __reduce__ __reduce_ex__ __repr__ \
+             __reversed__ __rmul__ __setattr__ __setitem__ __sizeof__ __str__ \
+             __subclasshook__ append clear copy count extend index insert pop remove reverse \
+             sort",
+        ),
+        (
+            "dict",
+            "__class__ __class_getitem__ __contains__ __delattr__ __delitem__ __dir__ __doc__ \
+             __eq__ __format__ __ge__ __getattribute__ __getitem__ __getstate__ __gt__ \
+             __hash__ __init__ __init_subclass__ __ior__ __iter__ __le__ __len__ __lt__ \
+             __ne__ __new__ __or__ __reduce__ __reduce_ex__ __repr__ __reversed__ __ror__ \
+             __setattr__ __setitem__ __sizeof__ __str__ __subclasshook__ clear copy fromkeys \
+             get items keys pop popitem setdefault update values",
+        ),
+    ];
+    for (ty, names) in cases {
+        let src = format!("x = sorted(set('{names}'.split()) ^ set(dir({ty})))");
+        assert_eq!(g(&src, "x"), "[]", "dir({ty}) differs from CPython's");
+    }
+    // The size of every other builtin type's listing, read off CPython 3.14.
+    let counts = [
+
+        ("float", 60),
+        ("bool", 74),
+        ("bytes", 78),
+        ("bytearray", 91),
+        ("tuple", 35),
+        ("set", 57),
+        ("frozenset", 44),
+        ("complex", 44),
+    ];
+    for (ty, n) in counts {
+        assert_eq!(g(&format!("x = len(dir({ty}))"), "x"), n.to_string(), "len(dir({ty}))");
+    }
+    // A VALUE lists its type's names: `dir(5)` is `dir(int)`.
+    assert_eq!(g("x = dir(5) == dir(int) and dir('a') == dir(str)", "x"), "True");
+}
+
+/// `type()` of a C-level descriptor, slot wrapper or container iterator is a
+/// real type object: it reprs as a class, its own type is `type`, calling it is
+/// CPython's `cannot create` TypeError, and it is not mistaken for an exception
+/// class. Every expected value is CPython 3.14's.
+#[test]
+fn c_level_descriptor_and_iterator_types_are_type_objects() {
+    let slotted = "class C:\n    __slots__ = ('x',)\n";
+    assert_eq!(g(&format!("{slotted}x = repr(type(C.x))"), "x"), "\"<class 'member_descriptor'>\"");
+    assert_eq!(g(&format!("{slotted}x = type(type(C.x)) is type"), "x"), "True");
+    assert_eq!(g(&format!("{slotted}x = isinstance(C.x, Exception)"), "x"), "False");
+    let cases = [
+        ("object.__init__", "wrapper_descriptor"),
+        ("int.__add__", "wrapper_descriptor"),
+        ("str.upper", "method_descriptor"),
+        ("list.append", "method_descriptor"),
+        ("dict.__dict__['fromkeys']", "classmethod_descriptor"),
+        ("type.__dict__['__name__']", "getset_descriptor"),
+        ("(1).__add__", "method-wrapper"),
+        ("iter([])", "list_iterator"),
+        ("iter('a')", "str_ascii_iterator"),
+        ("iter(range(3))", "range_iterator"),
+        ("iter({})", "dict_keyiterator"),
+        ("reversed([])", "list_reverseiterator"),
+        ("iter(lambda: 1, 2)", "callable_iterator"),
+    ];
+    for (expr, tn) in cases {
+        let src = format!(
+            "t = type({expr})\n\
+             try:\n    t()\n    made = 'made'\n\
+             except TypeError as e:\n    made = str(e)\n\
+             x = (repr(t), type(t) is type, made)"
+        );
+        assert_eq!(
+            g(&src, "x"),
+            format!("(\"<class '{tn}'>\", True, \"cannot create '{tn}' instances\")"),
+            "type({expr})"
+        );
+    }
+}
+
+/// The repr of a builtin type's methods follows what the method is BOUND to:
+/// a classmethod or static method is bound to the type object (`<built-in
+/// method fromkeys of type object at 0x…>`, even when reached through an
+/// instance), a slot is a `slot wrapper`, a classmethod descriptor is a
+/// `method`, and a module function prints its bare name. CPython 3.14.
+#[test]
+fn builtin_method_and_function_reprs() {
+    // A classmethod's `__self__` is the type: the address is `id(dict)`.
+    for (expr, meth, owner) in [
+        ("dict.fromkeys", "fromkeys", "dict"),
+        ("{}.fromkeys", "fromkeys", "dict"),
+        ("int.from_bytes", "from_bytes", "int"),
+        ("(5).from_bytes", "from_bytes", "int"),
+        ("float.fromhex", "fromhex", "float"),
+        ("bytes.fromhex", "fromhex", "bytes"),
+        ("str.maketrans", "maketrans", "str"),
+    ] {
+        let src = format!(
+            "r = repr({expr})\n\
+             head, addr = r[:-1].rsplit(' ', 1)\n\
+             x = (head, int(addr, 16) == id({owner}), type({expr}).__name__)"
+        );
+        assert_eq!(
+            g(&src, "x"),
+            format!("('<built-in method {meth} of type object at', True, 'builtin_function_or_method')"),
+            "repr({expr})"
+        );
+    }
+    assert_eq!(
+        g("import itertools\nx = repr(itertools.chain.from_iterable).startswith('<built-in method from_iterable of type object at 0x')", "x"),
+        "True"
+    );
+    assert_eq!(g("x = repr(int.__add__)", "x"), "\"<slot wrapper '__add__' of 'int' objects>\"");
+    assert_eq!(g("x = repr(str.upper)", "x"), "\"<method 'upper' of 'str' objects>\"");
+    assert_eq!(
+        g("x = repr(dict.__dict__['fromkeys'])", "x"),
+        "\"<method 'fromkeys' of 'dict' objects>\""
+    );
+    // A module-level function names only itself.
+    assert_eq!(
+        g("import math, time\nx = (repr(math.sqrt), repr(time.time), repr(len))", "x"),
+        "('<built-in function sqrt>', '<built-in function time>', '<built-in function len>')"
+    );
+}
+
+/// A slice's repr dispatches each bound's own `__repr__`, and CPython's
+/// `slice_repr` takes no recursion guard, so a self-containing slice re-prints
+/// once with the marker coming from the list in between. CPython 3.14.
+#[test]
+fn slice_repr_dispatches_bound_reprs() {
+    assert_eq!(
+        g("class Idx:\n    def __repr__(self): return 'Idx()'\nx = repr(slice(Idx(), Idx()))", "x"),
+        "'slice(Idx(), Idx(), None)'"
+    );
+    assert_eq!(
+        g("l = []\ns = slice(l)\nl.append(s)\nx = repr(s)", "x"),
+        "'slice(None, [slice(None, [...], None)], None)'"
+    );
+}
+
+/// PEP 649: `f.__annotate__` is the compiler-generated FUNCTION —
+/// `def __annotate__(format, /)` qualified under its owner, answering formats
+/// 1 and 2 with a fresh annotations dict and raising a bare
+/// `NotImplementedError` above `VALUE_WITH_FAKE_GLOBALS`. Its parameter does
+/// not shadow an annotation that names `format`. CPython 3.14.
+#[test]
+fn function_annotate_is_the_compiled_annotate_function() {
+    let f = "def f(x: int) -> str: pass\na = f.__annotate__\n";
+    assert_eq!(
+        g(&format!("{f}x = (type(a).__name__, a.__name__, a.__qualname__, a is f.__annotate__)"), "x"),
+        "('function', '__annotate__', 'f.__annotate__', True)"
+    );
+    assert_eq!(
+        g(&format!("{f}x = (a(1), a(2) == a(1), a(1) is a(1))"), "x"),
+        "({'x': <class 'int'>, 'return': <class 'str'>}, True, False)"
+    );
+    for fmt in [3, 4] {
+        assert_eq!(
+            g(&format!("{f}try:\n    a({fmt})\n    x = 'returned'\nexcept NotImplementedError as e:\n    x = e.args"), "x"),
+            "()",
+            "format {fmt}"
+        );
+    }
+    assert_eq!(
+        g("class C:\n    def m(self, y: 'C'): pass\nx = C.m.__annotate__.__qualname__", "x"),
+        "'C.m.__annotate__'"
+    );
+    assert_eq!(
+        g("def outer():\n    def inner(z: int): pass\n    return inner\nx = outer().__annotate__.__qualname__", "x"),
+        "'outer.<locals>.inner.__annotate__'"
+    );
+    assert_eq!(g("def h(x: format): pass\nx = h.__annotations__['x'] is format", "x"), "True");
+    assert_eq!(g("def u(): pass\nx = (u.__annotate__, (lambda: 0).__annotate__)", "x"), "(None, None)");
+}
+
 #[test]
 fn simplenamespace_and_sys_implementation() {
     // sys.implementation is a native SimpleNamespace; its type is what the

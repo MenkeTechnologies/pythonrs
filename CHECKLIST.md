@@ -103,7 +103,8 @@ dispatch; `[in-flight]` = being implemented in the current host pass.
 - [x] **`sys` completeness** — `stdin`/`stdout`/`stderr` file objects
       (`print(file=sys.stderr)` routes correctly), `version` (reports the emulated
       `3.14.6`), `version_info` (a namedtuple), `platform`, `maxsize`, `path`
-      (list), `executable`, `modules`, `getrecursionlimit()`/`setrecursionlimit()`.
+      (list), `executable`, `modules`, `getrecursionlimit()`/`setrecursionlimit()`,
+      `getsizeof()` (`__sizeof__` plus CPython's GC/managed-dict pre-header).
 - [x] `python -c`, `python file.py`, stdin-as-script dispatch run; non-zero exit on error.
 - [x] **`python -m MODULE [args…]`** — delegates to the embedded CPython
       (`runpy._run_module_as_main`, the same entry CPython's own `-m` uses), so

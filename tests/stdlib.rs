@@ -3260,3 +3260,58 @@ fn ffi_operator_index_honours_a_user_index_dunder() {
     assert_eq!(g(src, "x"), "(7, 7, 7, [1, 2])");
     assert_eq!(g(src, "bad"), "'__index__ returned non-int (type str)'");
 }
+
+/// `sys.getsizeof` is `type(o).__sizeof__(o)` plus CPython's pre-header: 16
+/// bytes of GC head for a GC type, 16 more for an instance with a managed
+/// `__dict__`, nothing for a non-GC value or a static type object. A
+/// non-negative int is required; with `default`, a `TypeError` yields it and
+/// anything else still raises. Every expected value is CPython 3.14's.
+#[test]
+fn sys_getsizeof_adds_the_preheader_to_sizeof() {
+    let classes = "import sys\n\
+        class A:\n    def __sizeof__(self): return 100\n\
+        class S:\n    __slots__ = ('x',)\n    def __sizeof__(self): return 100\n\
+        class E:\n    __slots__ = ()\n    def __sizeof__(self): return 100\n\
+        class B:\n    def __sizeof__(self): return True\n\
+        class L(list):\n    def __sizeof__(self): return 7\n\
+        class N:\n    def __sizeof__(self): return -1\n\
+        class T:\n    def __sizeof__(self): return 'x'\n\
+        class R:\n    def __sizeof__(self): raise TypeError('nope')\n\
+        def err(f):\n    try:\n        return f()\n    except Exception as e:\n        return (type(e).__name__, str(e))\n";
+    assert_eq!(
+        g(&format!("{classes}x = [sys.getsizeof(c()) for c in (A, S, E, B, L)]"), "x"),
+        "[132, 116, 116, 33, 39]"
+    );
+    assert_eq!(
+        g(&format!("{classes}x = [err(lambda: sys.getsizeof(c())) for c in (N, T, R)]"), "x"),
+        "[('ValueError', '__sizeof__() should return >= 0'), ('TypeError', 'an integer is required'), ('TypeError', 'nope')]"
+    );
+    assert_eq!(
+        g(&format!("{classes}x = [err(lambda: sys.getsizeof(c(), 'dflt')) for c in (N, T, R)]"), "x"),
+        "[('ValueError', '__sizeof__() should return >= 0'), 'dflt', 'dflt']"
+    );
+    assert_eq!(
+        g(&format!("{classes}x = (sys.getsizeof(A(), default=5), sys.getsizeof(object=A()))"), "x"),
+        "(132, 132)"
+    );
+    assert_eq!(
+        g(
+            &format!("{classes}x = [err(lambda: sys.getsizeof()), err(lambda: sys.getsizeof(1, 2, 3)), err(lambda: sys.getsizeof(1, foo=2))]"),
+            "x"
+        ),
+        "[('TypeError', \"getsizeof() missing required argument 'object' (pos 1)\"), \
+         ('TypeError', 'getsizeof() takes at most 2 arguments (3 given)'), \
+         ('TypeError', \"getsizeof() got an unexpected keyword argument 'foo'\")]"
+    );
+    // The pre-header per kind: none for a scalar or a static type, the GC head
+    // for a container and for a class object.
+    assert_eq!(
+        g(
+            &format!("{classes}x = (sys.getsizeof(5) - (5).__sizeof__(), sys.getsizeof('ab') - 'ab'.__sizeof__(), \
+                 sys.getsizeof([]) - [].__sizeof__(), sys.getsizeof({{}}) - {{}}.__sizeof__(), \
+                 sys.getsizeof(A) - type.__sizeof__(A), sys.getsizeof(int) - type.__sizeof__(int))"),
+            "x"
+        ),
+        "(0, 0, 16, 16, 16, 0)"
+    );
+}

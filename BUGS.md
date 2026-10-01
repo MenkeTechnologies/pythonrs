@@ -9,6 +9,52 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **`dir()` of a builtin type is CPython's full listing.** `dir(int)`,
+  `dir(str)`, `dir(list)`, `dir(dict)` and the rest of the 13 builtin types (and
+  their values: `dir(5) == dir(int)`) name every slot wrapper, classmethod, data
+  attribute and the inherited `object` surface — every name
+  CPython 3.14 lists except `dir(type)`'s five C-layout numbers (see the open
+  entry). `builtin_type_dir_is_cpythons_full_listing` pins four exact
+  listings and eight counts.
+- **A builtin type's classmethod reprs as a method bound to the type.**
+  `repr(dict.fromkeys)`, `repr({}.fromkeys)`, `int.from_bytes`,
+  `float.fromhex`, `str.maketrans` and `itertools.chain.from_iterable` are
+  `<built-in method fromkeys of type object at 0x…>` with the type's own `id`,
+  where they printed `<method 'fromkeys' of 'dict' objects>` (and
+  `<built-in function itertools.chain.from_iterable>`). A slot reached through
+  the type is a `slot wrapper` (`<slot wrapper '__add__' of 'int' objects>`),
+  and `dict.__dict__['fromkeys']` reprs as CPython's `<method 'fromkeys' of
+  'dict' objects>` rather than `<classmethod_descriptor …>`.
+- **A module-level native function reprs by its bare name.**
+  `repr(math.sqrt)` is `<built-in function sqrt>`, not
+  `<built-in function math.sqrt>` — CPython's `meth_repr` prints `__name__`
+  alone when `__self__` is a module.
+- **`sys.getsizeof`.** A port of `sys_getsizeof`/`_PySys_GetSizeOf`:
+  `type(o).__sizeof__(o)` (a class through its metaclass) plus
+  `_PyType_PreHeaderSize` — 16 for a GC type, 32 for an instance with a managed
+  `__dict__`, 0 for a scalar or a static type object — with CPython's
+  `an integer is required`/`__sizeof__() should return >= 0` errors and the
+  `default` returned only for a `TypeError`. A bridged CPython object is sized
+  by CPython. The `__sizeof__` of a native builtin value is pythonrs's own
+  footprint, so those totals are not CPython's; a user `__sizeof__` and the
+  pre-header around it are exact.
+- **`type()` of a C-level descriptor or iterator is a type object.**
+  `type(C.x)` for a slot, `type(object.__init__)`, `type(str.upper)`
+  (`method_descriptor`, was `builtin_function_or_method`),
+  `type(dict.__dict__['fromkeys'])`, `type((1).__add__)` and every container
+  iterator type (`list_iterator`, `dict_keyiterator`, …) repr as
+  `<class '…'>`, are instances of `type`, and raise CPython's
+  `cannot create '…' instances` when called. `isinstance(C.x, Exception)` was
+  `True`. The same change made `type(zip)`, `type(property)` and the other
+  builtin type objects' own type `type`.
+- **`f.__annotate__` is the compiled annotate function.** It was a
+  `functools.partial` around the def-time dict. The compiler now emits CPython's
+  `def __annotate__(format, /)` — qualname `f.__annotate__`, `if format > 2:
+  raise NotImplementedError`, a fresh dict per call — and `MKFUNC` keeps it as
+  the function's attribute, so `type(f.__annotate__)` is `function`, it is the
+  same object on every read, and format 3 (`FORWARDREF`) now raises as CPython's
+  does instead of answering. The parameter is CPython's `.format`, so
+  `def f(x: format)` still annotates with the builtin.
 - **More than 255 operands anywhere.** `CallBuiltin` carries a `u8` operand
   count, so a call with >255 arguments, a `{**a, …}` display with >85 entries,
   a `def`/`lambda` with >252 defaults, >127 class-header keywords, and a class
@@ -1561,17 +1607,6 @@ written.
   installs is read back across the bridge by value, so the appended entries are
   not visible to the pythonrs-side name. `w` stays empty and indexing it raises
   `IndexError` where CPython reports one `UserWarning`.
-- **`dir()` on a builtin type omits most of the inherited dunders.** Every
-  builtin is missing the `object`-level names (`__delattr__`, `__dir__`,
-  `__format__`, `__getattribute__`, `__getstate__`, `__init_subclass__`,
-  `__reduce__`, `__reduce_ex__`, `__setattr__`, `__subclasshook__`) plus the
-  comparison set and the container dunders it does implement — `dir('a')` is
-  short by 24 names, `dir([1])` by 26, `dir(5)` by 15 (which also lacks
-  `denominator`/`numerator`/`imag`/`real`/`from_bytes`). Attribute ACCESS is
-  unaffected: the names that matter resolve, and `hasattr` agrees with CPython
-  across the container dunders. What this costs is `dir()` itself and the
-  "Did you mean" hint computed from it, so `'a'.__setitem__` reports the right
-  `AttributeError` without CPython's `Did you mean: '__getitem__'?` clause.
 
 - **The depth guards are calibrated for the interpreter's 512 MB stack, not for
   an embedder's.** `src/main.rs` runs the interpreter on a thread with
@@ -1658,31 +1693,6 @@ written.
   truthiness goes through `PyHost::truthy`, which cannot fail, so
   `bool(released)` answers from the view's length where CPython's
   `memory_length` raises.
-- **`f.__annotate__` is a `functools.partial`, not a `function`.** It is callable,
-  answers the `VALUE`/`FORWARDREF` formats with the def-time annotations dict, and
-  raises a bare `NotImplementedError` otherwise — but `type(f.__annotate__)` and
-  its `repr` differ from CPython's compiler-generated annotate function. Likewise
-  `repr(itertools.chain.from_iterable)` is
-  `<built-in function itertools.chain.from_iterable>` where CPython prints
-  `<built-in method from_iterable of type object at 0x…>`; calling it agrees.
-- **A builtin type's CLASSMETHOD reprs as an unbound method descriptor.**
-  `repr(dict.fromkeys)` is `<method 'fromkeys' of 'dict' objects>` and
-  `repr(int.from_bytes)` likewise, where CPython prints `<built-in method
-  fromkeys of type object at 0x…>` — the same shape as the
-  `chain.from_iterable` gap above, and the same root cause: which native methods
-  are classmethods is a per-type fact no table here records. The ordinary
-  methods around them (`dict.get`, `int.to_bytes`, `str.join`) already match.
-- **A module-level native function keeps its module in its repr.**
-  `repr(math.sqrt)` is `<built-in function math.sqrt>`; CPython prints the bare
-  `<built-in function sqrt>`. The module qualifier is the key these builtins are
-  registered under, so dropping it in the repr alone would make two different
-  functions with the same leaf name print identically.
-- **`sys.getsizeof` is absent.** There is no object-size model, and no slots
-  layout: a slot is a restricted instance attribute, not a fixed offset.
-- **`type()` of a C-level descriptor is not a type object.** `type(C.x)` for a
-  `__slots__` member (and `type(object.__init__)`) has the right `__name__`
-  and compares equal across reads, but its repr is `<built-in function
-  member_descriptor>` where CPython prints `<class 'member_descriptor'>`.
 - **Operator overloading dunders**: dispatched, with `NotImplemented` reflected
   fallback (see Implemented). Covered: arithmetic/bitwise
   (`__add__`/`__sub__`/`__mul__`/`__truediv__`/`__floordiv__`/`__mod__`/`__pow__`/
@@ -1715,12 +1725,6 @@ written.
   `int`/`bignum`/`bool`/`float`/`-0.0`/`inf`/`nan`/`str` (91 206 pairs) under
   `LC_ALL` in `C`, `en_US`, `de_DE`, `hi_IN` and `fr_FR`, byte-identical to
   CPython 3.14.6 in every one.
-- **A `slice`'s repr does not dispatch a bound's `__repr__`.** `slice(Idx(),
-  Idx())` renders `slice(<__main__.Idx object at 0x…>, …)` where CPython renders
-  `slice(Idx(), Idx(), None)`. The rendering happens inside `PyHost::repr_of`,
-  which cannot call back into the interpreter while it holds the host borrow —
-  the same constraint `%r` solves by pre-resolving the dispatched values outside
-  the borrow, which is what a slice's bounds would need too.
 - **Lone surrogates in `str`**: `chr(0xD800..0xDFFF)` raises `ValueError` where
   CPython returns a surrogate-bearing `str` (which then fails only on UTF-8
   encode). pythonrs strings are Rust `String` (valid scalar values only), so a
@@ -1737,23 +1741,34 @@ written.
   frames of the CPython-side call stack are missing, because the bridge returns
   the error without walking the foreign traceback. This is the same boundary the
   `During handling of the above exception…` chained section sits behind.
-- **`dir()` on a native builtin type/value is the method table, not CPython's
-  full slot listing.** `dir(list)`/`dir("a")` enumerate the names the type really
-  responds to (so `'append' in dir(list)` and `'upper' in dir(str)` are right),
-  plus `__class__`/`__doc__`/`__init__`/`__new__`/`__sizeof__`. CPython's
-  `dir(list)` is 48 entries because every slot wrapper (`__add__`, `__iadd__`,
-  `__class_getitem__`, …) is a real descriptor on the type; pythonrs dispatches
-  those natively rather than through per-type descriptor objects, so they are not
-  enumerable. `dir()` of a bridged CPython object (`dir(json)`,
-  `dir(datetime.date(...))`) IS exact — it delegates to CPython's own `dir()`.
-- **`__loader__` / `__builtins__` are not bound in module globals.** `__name__`,
-  `__file__`, `__doc__`, `__package__`, `__spec__` and (for a script)
-  `__cached__` all match CPython, but the remaining two need real importer and
-  module objects: `__loader__` is a `_frozen_importlib` class and `__builtins__`
-  is the `builtins` module itself. `sorted(globals())` therefore differs from
-  CPython by exactly those two names. Relatedly, `import builtins;
-  builtins.len is len` is `False` — the bridged `builtins` module is a distinct
-  CPython object from the native builtin dispatch.
+- **`dir()` of a native non-type VALUE is short or empty.** `dir()` of the 13
+  builtin types (and their values) is CPython's full listing, but the other
+  native kinds still come back empty — a function, a bound or unbound method, a
+  builtin function, `super`, `staticmethod`/`classmethod`, a code object, the
+  container iterators — or partial (an exception lacks `args`/`__traceback__`/
+  `__cause__`/`__context__`/`__suppress_context__`/`__dict__`/`__setstate__`;
+  `dict_keys`/`dict_items` lack the set operators and `mapping`; `memoryview`
+  lacks `cast`/`count`/`index`/`toreadonly`/`suboffsets`/`__enter__`/`__exit__`).
+  Listing them is gated on attribute access agreeing name for name, and several
+  do not resolve yet: `f.__globals__`/`__builtins__`/`__call__`/
+  `__type_params__`, `m.__func__`/`__self__`, `len.__self__`/
+  `__text_signature__`, an iterator's `__length_hint__`/`__setstate__`, a code
+  object's `co_code`/`co_lines`/`replace`.
+- **`dir(type)` omits the five C-layout numbers.** `__basicsize__`,
+  `__dictoffset__`, `__flags__`, `__itemsize__` and `__weakrefoffset__` describe
+  a `PyTypeObject` struct pythonrs does not have, and a fabricated number would
+  be read as a real one by the `Py_TPFLAGS_*` bit tests that consume them.
+- **The `builtins` module is CPython's, not the native builtins.** `__main__`'s
+  `__builtins__` and `__loader__` are bound (to the bridged `builtins` module
+  and a `SourceFileLoader`/`BuiltinImporter`), but `import builtins` is the
+  CPython module rather than the namespace pythonrs resolves names in, so
+  `builtins.len is len` is `False` and `builtins.foo = 5` does not make a bare
+  `foo` resolve (CPython prints `5`; pythonrs raises `NameError`).
+- **`f.__annotate__`'s parameter introspects as `.format`.** The compiled
+  annotate function binds its argument under CPython's internal symtable name
+  `.format`, and pythonrs reports that name as is: `co_varnames` is
+  `('.format',)` where CPython 3.14 renames it to `format` in the code object
+  (and so in the `(format, /)` signature).
 - **A call with an ATTRIBUTE callee resolves it after its arguments.** CPython
   evaluates the callee first, then the arguments left to right. The bare-name
   callee now does the same (`aa(bb)` blames `aa`), but `compile_call`
@@ -1784,17 +1799,6 @@ written.
 - **No "did you mean" suggestions on a `SyntaxError`.** The `NameError` and
   `AttributeError` hints are implemented (see below); CPython also suggests a
   keyword for some `SyntaxError`s, which pythonrs does not.
-- **`dir()` on a builtin type is not CPython's full slot listing.** Every name it
-  reports is one `getattr` resolves (asserted in both directions by
-  `builtin_dir_lists_only_dispatchable_names` /
-  `builtin_dispatch_is_fully_listed_by_dir`), but the remaining slots
-  (`__class_getitem__`, `__reduce_ex__`, `__sizeof__`, `__init_subclass__`, …)
-  are dispatched natively rather than through per-type descriptor objects, so
-  they are not enumerable. pythonrs reports 459 of CPython's 781 names across
-  the 13 builtin types (`int float bool str bytes bytearray list tuple dict set
-  frozenset complex type`), measured by intersecting `dir(t)` per type against
-  CPython 3.14.6. The BINARY OPERATOR slots are now real bound methods (see
-  "Implemented"), which is what moved the count up.
 - **A `collections.deque` subclass has no deque behaviour.** `class D(deque)`
   instances carry no native deque payload (`builtin_base_of` knows `list`,
   `dict`, `str`, `int`, `float`, `tuple`, `set` and `frozenset` only), so

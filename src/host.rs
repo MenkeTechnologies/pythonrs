@@ -375,6 +375,10 @@ pub struct FuncVal {
     /// The `__annotations__` dict `{param|"return": annotation}`, built at def
     /// time. A heap [`PyObj::Dict`] handle (empty dict for an unannotated func).
     pub annotations: Value,
+    /// The PEP 649 `__annotate__` function the compiler generated for this
+    /// function's annotations (`Compiler::build_annotate`), or `Value::Undef`
+    /// (`None`) for an unannotated one.
+    pub annotate: Value,
 }
 
 /// A user-defined class instance. Its attribute storage (`__dict__`) is a real
@@ -2973,6 +2977,13 @@ impl PyHost {
         }
     }
 
+    /// The pseudo-address of builtin type `tp`'s interned type object — what
+    /// `id(dict)` reports, and what a classmethod's repr names as its `__self__`.
+    /// `0` when nothing has materialized that type object yet.
+    fn builtin_type_addr(&self, tp: &str) -> u64 {
+        self.builtin_objects.get(tp).map_or(0, |v| self.addr_of(v))
+    }
+
     pub fn addr_of(&self, v: &Value) -> u64 {
         match v {
             Value::Obj(i) => *i as u64,
@@ -4337,6 +4348,61 @@ fn attr_error_type_name(tn: &str) -> String {
     }
 }
 
+/// What a `PyObj::Builtin` named `n` IS, as CPython would see it. `repr` and
+/// `type()` both read this, so the two can never disagree about an object.
+enum NativeCallable<'a> {
+    /// A type object: `int`, `ValueError`, `type(C.x)` — `<class '…'>`.
+    TypeObject(String),
+    /// A class- or static method of a builtin type reached through the type
+    /// (`dict.fromkeys`, `str.maketrans`): a `builtin_function_or_method` whose
+    /// `__self__` is the type, so it reprs as
+    /// `<built-in method fromkeys of type object at 0x…>`.
+    TypeBoundMethod { owner: &'a str, meth: &'a str },
+    /// A slot of a builtin type reached through the type (`int.__add__`): a
+    /// `wrapper_descriptor`, `<slot wrapper '__add__' of 'int' objects>`.
+    SlotWrapper { owner: &'a str, meth: &'a str },
+    /// An ordinary method of a builtin type reached through the type
+    /// (`str.upper`): a `method_descriptor`, `<method 'upper' of 'str' objects>`.
+    MethodDescriptor { owner: &'a str, meth: &'a str },
+    /// A plain function — a builtin (`len`) or a native module's (`math.sqrt`).
+    /// CPython's `meth_repr` prints only `__name__` when `__self__` is a module
+    /// (or absent), so the leaf is all the repr shows: `<built-in function sqrt>`.
+    Function(&'a str),
+}
+
+/// The class- and static methods of builtin types that a `PyObj::Builtin` can
+/// name, as `owner.meth`: [`crate::builtins::type_classmethods`] plus the
+/// `maketrans` static methods and `itertools.chain.from_iterable`. Each is
+/// bound to its type, never to an instance.
+fn is_type_bound_method(owner: &str, meth: &str) -> bool {
+    crate::builtins::type_classmethods(owner).contains(&meth)
+        || matches!(
+            (owner, meth),
+            ("str" | "bytes" | "bytearray", "maketrans") | ("itertools.chain", "from_iterable")
+        )
+}
+
+fn classify_native(n: &str) -> NativeCallable<'_> {
+    if let Some(cls) = type_object_class_name(n) {
+        return NativeCallable::TypeObject(cls);
+    }
+    if let Some((owner, meth)) = n.rsplit_once('.') {
+        if is_type_bound_method(owner, meth) {
+            return NativeCallable::TypeBoundMethod { owner, meth };
+        }
+    }
+    if let Some((owner, meth)) = n.split_once('.') {
+        if crate::builtins::type_has_method(owner, meth) {
+            return if is_slot_wrapper(owner, meth) {
+                NativeCallable::SlotWrapper { owner, meth }
+            } else {
+                NativeCallable::MethodDescriptor { owner, meth }
+            };
+        }
+    }
+    NativeCallable::Function(n.rsplit('.').next().unwrap_or(n))
+}
+
 fn type_object_class_name(n: &str) -> Option<String> {
     // Module-qualified stdlib types.
     let qualified = match n {
@@ -4427,7 +4493,9 @@ fn type_object_class_name(n: &str) -> Option<String> {
             | "dict_values"
             | "dict_items"
     );
-    unqualified.then(|| n.to_string())
+    // The constructor-less C types (descriptors, iterators) are type objects too.
+    let uninstantiable = crate::builtins::UNINSTANTIABLE_TYPES.contains(&n);
+    (unqualified || uninstantiable).then(|| n.to_string())
 }
 
 /// A native-shadowed stdlib module whose native namespace is only a fast-path
@@ -4534,9 +4602,15 @@ impl PyHost {
                 // is a `builtin_function_or_method`.
                 Some(PyObj::Builtin(n)) => {
                     if crate::builtins::is_type_like_builtin(n) {
-                        "type".into()
-                    } else {
-                        "builtin_function_or_method".into()
+                        return "type".into();
+                    }
+                    match classify_native(n) {
+                        NativeCallable::TypeObject(_) => "type".into(),
+                        NativeCallable::SlotWrapper { .. } => "wrapper_descriptor".into(),
+                        NativeCallable::MethodDescriptor { .. } => "method_descriptor".into(),
+                        NativeCallable::TypeBoundMethod { .. } | NativeCallable::Function(_) => {
+                            "builtin_function_or_method".into()
+                        }
                     }
                 }
                 // `type(cls)` is the class's metaclass (`type` unless overridden).
@@ -4891,7 +4965,11 @@ impl PyHost {
                         DescKind::WrapperDescriptor => {
                             format!("<slot wrapper '{name}' of '{owner}' objects>")
                         }
-                        _ => format!("<{} '{name}' of '{owner}' objects>", kind.type_name()),
+                        // `descr_repr` names a classmethod descriptor "method",
+                        // exactly like a plain method descriptor.
+                        DescKind::ClassMethodDescriptor => {
+                            format!("<method '{name}' of '{owner}' objects>")
+                        }
                     }
                 }
                 Some(PyObj::Traceback { .. }) => {
@@ -4921,17 +4999,20 @@ impl PyHost {
                 // (`str.upper`), a *type object* returned by `type(x)` (repr
                 // `<class 'X'>`), or a plain callable builtin (`len`,
                 // `math.sqrt` -> `<built-in function X>`).
-                Some(PyObj::Builtin(n)) => {
-                    if let Some((tp, meth)) = n.split_once('.') {
-                        if crate::builtins::type_has_method(tp, meth) {
-                            return format!("<method '{meth}' of '{tp}' objects>");
-                        }
+                Some(PyObj::Builtin(n)) => match classify_native(n) {
+                    NativeCallable::TypeObject(cls) => format!("<class '{cls}'>"),
+                    NativeCallable::TypeBoundMethod { owner, meth } => format!(
+                        "<built-in method {meth} of type object at 0x{:012x}>",
+                        self.builtin_type_addr(owner)
+                    ),
+                    NativeCallable::SlotWrapper { owner, meth } => {
+                        format!("<slot wrapper '{meth}' of '{owner}' objects>")
                     }
-                    match type_object_class_name(n) {
-                        Some(cls) => format!("<class '{cls}'>"),
-                        None => format!("<built-in function {n}>"),
+                    NativeCallable::MethodDescriptor { owner, meth } => {
+                        format!("<method '{meth}' of '{owner}' objects>")
                     }
-                }
+                    NativeCallable::Function(name) => format!("<built-in function {name}>"),
+                },
                 // CPython has TWO reprs here, and which one applies is decided by
                 // what is bound, not by how it was reached. A Python function
                 // bound to an instance is `<bound method C.f of <__main__.C
@@ -4965,6 +5046,15 @@ impl PyHost {
                             };
                             let n = n.rsplit('.').next().unwrap_or("").to_string();
                             let tp = self.type_name(&recv);
+                            // A classmethod is bound to the TYPE even when reached
+                            // through an instance: `{}.fromkeys` is `<built-in
+                            // method fromkeys of type object at 0x…>`.
+                            if is_type_bound_method(&tp, &n) {
+                                return format!(
+                                    "<built-in method {n} of type object at 0x{:012x}>",
+                                    self.builtin_type_addr(&tp)
+                                );
+                            }
                             let kind = if is_slot_wrapper(&tp, &n) {
                                 format!("method-wrapper '{n}'")
                             } else {
@@ -12160,26 +12250,12 @@ impl PyHost {
                     Ok(ann)
                 }
             }
-            // `f.__annotate__` (PEP 649): the callable that produces the
-            // annotations for a requested format, or `None` on an unannotated
-            // function. CPython 3.14's `functools.singledispatch.register`
-            // gates on its presence before reading the first parameter's type.
-            Some(PyObj::Func(fv)) if name == "__annotate__" => {
-                let ann = fv.annotations.clone();
-                let empty = match self.get(&ann) {
-                    Some(PyObj::Dict(d)) => d.is_empty(),
-                    _ => true,
-                };
-                if empty {
-                    return Ok(Value::Undef);
-                }
-                let f = self.alloc(PyObj::Builtin("function.__annotate__".into()));
-                Ok(self.alloc(PyObj::Partial {
-                    func: f,
-                    args: vec![ann],
-                    kwargs: vec![],
-                }))
-            }
+            // `f.__annotate__` (PEP 649): the compiler-generated function that
+            // produces the annotations for a requested format, or `None` on an
+            // unannotated function. CPython 3.14's
+            // `functools.singledispatch.register` gates on its presence before
+            // reading the first parameter's type.
+            Some(PyObj::Func(fv)) if name == "__annotate__" => Ok(fv.annotate.clone()),
             Some(PyObj::BoundMethod { func, .. }) if name == "__annotations__" => {
                 let func = func.clone();
                 match self.get(&func) {
@@ -12628,6 +12704,12 @@ impl PyHost {
                 if crate::builtins::type_has_method(&tn, name)
                     || crate::builtins::is_object_dunder_method(&tn, name)
                 {
+                    // A classmethod reached through an instance is still bound
+                    // to the type, and its repr names that type object's
+                    // address — so the interned type object has to exist.
+                    if is_type_bound_method(&tn, name) {
+                        self.builtin_object(&tn);
+                    }
                     let b = self.alloc(PyObj::Builtin(name.to_string()));
                     return Ok(self.alloc(PyObj::BoundMethod {
                         recv: recv.clone(),
@@ -12821,6 +12903,64 @@ impl PyHost {
         // does not have; `object()` must stay at exactly `object`'s 24 names.
         if any_user {
             set.insert("__dict__".into());
+        }
+    }
+
+    /// The bytes `sys.getsizeof` adds on top of `__sizeof__()` for `v`: CPython's
+    /// `_PyType_PreHeaderSize(type(v))` (`Include/internal/pycore_object.h`) —
+    /// a 16-byte `PyGC_Head` when the type is garbage-collected, plus two
+    /// pointers more when the instance keeps a managed `__dict__`/weakref list.
+    /// A static type object (`int`, `type(len)`) is exempt: `_PySys_GetSizeOf`
+    /// adds no pre-header for a non-heap type.
+    ///
+    /// The table is CPython 3.14's, read per type off
+    /// `sys.getsizeof(x) - type(x).__sizeof__(x)`: the immutable scalars, `str`,
+    /// `bytes`, `bytearray`, `range`, `code` and the hash objects are not GC
+    /// types; a user instance with a `__dict__`, a Python-level class's instance
+    /// that pythonrs models natively (`Counter`, `cached_property`, the asyncio
+    /// loop and future, `redirect_stdout`) and `_thread.lock`/`TypeVar` (heap
+    /// types with a managed weakref list) carry the full 32; everything else
+    /// pythonrs models is a GC container worth 16.
+    pub fn sizeof_preheader(&self, v: &Value) -> i64 {
+        const GC_HEAD: i64 = 16;
+        const MANAGED: i64 = 2 * 8;
+        let Value::Obj(i) = v else {
+            return 0;
+        };
+        match self.get(v) {
+            Some(
+                PyObj::Str(_)
+                | PyObj::Bytes(_)
+                | PyObj::Bytearray(_)
+                | PyObj::BigInt(_)
+                | PyObj::Complex(..)
+                | PyObj::Range { .. }
+                | PyObj::BigRange { .. }
+                | PyObj::CompiledSource { .. }
+                | PyObj::Hasher { .. }
+                | PyObj::NotImplemented
+                | PyObj::Ellipsis,
+            ) => 0,
+            Some(PyObj::Builtin(n)) if matches!(classify_native(n), NativeCallable::TypeObject(_)) => 0,
+            Some(PyObj::Instance(inst)) => {
+                let managed = if self.slots_of(&inst.class).is_none() { MANAGED } else { 0 };
+                GC_HEAD + managed
+            }
+            Some(PyObj::Dict(_))
+                if self.dict_meta.get(i).map(|m| m.kind) == Some(DictKind::Counter) =>
+            {
+                GC_HEAD + MANAGED
+            }
+            Some(
+                PyObj::Lock { .. }
+                | PyObj::TypeVarLike { .. }
+                | PyObj::CachedProperty { .. }
+                | PyObj::Future { .. }
+                | PyObj::EventLoop { .. }
+                | PyObj::Redirect { .. },
+            ) => GC_HEAD + MANAGED,
+            None => 0,
+            _ => GC_HEAD,
         }
     }
 
@@ -19630,6 +19770,7 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                     h.alloc(PyObj::Builtin("sys.getdefaultencoding".into())),
                 ),
                 ("intern", h.alloc(PyObj::Builtin("sys.intern".into()))),
+                ("getsizeof", h.alloc(PyObj::Builtin("sys.getsizeof".into()))),
                 // Exception reporting. `threading` captures `sys.excepthook` and
                 // `sys.exc_info` when a `Thread` is constructed, so every
                 // `Thread(...)` reaches these.

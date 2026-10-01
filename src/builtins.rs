@@ -1761,12 +1761,16 @@ fn b_mkfunc(vm: &mut VM, argc: u8) -> Value {
     // now, catching a forward-reference NameError (a self-referential annotation
     // like typing IO's `-> IO[AnyStr]`, or a package's forward-ref type alias),
     // leaving the annotations empty in that case rather than aborting the def.
+    let mut annotate = Value::Undef;
     let annotations = if args.is_empty() {
         Value::Undef
     } else {
         let raw = args.remove(0);
         if with_host(|h| matches!(h.get(&raw), Some(PyObj::Func(_)))) {
-            match host::invoke(&raw, vec![], vec![]) {
+            // The compiled `__annotate__`, kept as the function's attribute and
+            // called once with `Format.VALUE` for the `__annotations__` dict.
+            annotate = raw.clone();
+            match host::invoke(&raw, vec![Value::Int(1)], vec![]) {
                 Ok(d) => d,
                 Err(e) if e.contains("NameError") => {
                     with_host(|h| {
@@ -1792,6 +1796,7 @@ fn b_mkfunc(vm: &mut VM, argc: u8) -> Value {
             bound: None,
             owner: None,
             annotations,
+            annotate,
         })))
     })
 }
@@ -4514,6 +4519,41 @@ fn cs_to_double(hi: f64, lo: f64) -> f64 {
     }
 }
 
+/// The C-level types whose `tp_new` is NULL or that carry
+/// `Py_TPFLAGS_DISALLOW_INSTANTIATION`: the attribute descriptors, the bound
+/// slot wrapper, and every builtin container's iterator. `type(x)` hands these
+/// out as real type objects (`<class 'member_descriptor'>`, whose own type is
+/// `type`), but calling one raises `TypeError: cannot create 'X' instances`
+/// (`Objects/typeobject.c` `tp_new_wrapper` / `type_call`). The names are
+/// exactly what `PyHost::type_name` reports for those values.
+pub const UNINSTANTIABLE_TYPES: &[&str] = &[
+    "member_descriptor",
+    "wrapper_descriptor",
+    "method_descriptor",
+    "classmethod_descriptor",
+    "getset_descriptor",
+    "method-wrapper",
+    "iterator",
+    "callable_iterator",
+    "list_iterator",
+    "list_reverseiterator",
+    "tuple_iterator",
+    "str_iterator",
+    "str_ascii_iterator",
+    "bytes_iterator",
+    "bytearray_iterator",
+    "range_iterator",
+    "longrange_iterator",
+    "set_iterator",
+    "memory_iterator",
+    "dict_keyiterator",
+    "dict_valueiterator",
+    "dict_itemiterator",
+    "dict_reversekeyiterator",
+    "dict_reversevalueiterator",
+    "dict_reverseitemiterator",
+];
+
 /// `True` if `name` names a builtin *type* (constructor) or exception class —
 /// i.e. `type(<that>)` is `type`. Used by `PyHost::type_name` to distinguish a
 /// builtin type object (`int`, `ValueError`) from a builtin function (`len`).
@@ -5192,6 +5232,10 @@ pub fn call_builtin_function(
     args: Vec<Value>,
     kwargs: Vec<(String, Value)>,
 ) -> Result<Value, String> {
+    // `type(C.x)()`, `type(iter([]))()`: a type object with no constructor.
+    if UNINSTANTIABLE_TYPES.contains(&name) {
+        return Err(host::type_error(&format!("cannot create '{name}' instances")));
+    }
     // math.* module functions.
     if let Some(m) = name.strip_prefix("math.") {
         return call_math(m, &args, &kwargs);
@@ -5379,25 +5423,6 @@ pub fn call_builtin_function(
             None => Err(host::type_error(
                 "object.__new__(X): X is not a type object",
             )),
-        };
-    }
-    // `f.__annotate__(format)` (PEP 649). The annotations dict is bound as the
-    // first argument by `get_attr`; `format` selects the representation.
-    // pythonrs evaluates annotations at `def` time, so the already-evaluated
-    // mapping answers both `VALUE` (1) and `FORWARDREF` (3) — there is nothing
-    // left unresolved to turn into a `ForwardRef`. `STRING` (4) and
-    // `VALUE_WITH_FAKE_GLOBALS` (2) would need the un-evaluated source
-    // expressions, which are not retained; CPython's own compiler-generated
-    // `__annotate__` raises `NotImplementedError` for the formats it cannot
-    // produce, so this does too.
-    if name == "function.__annotate__" {
-        let ann = arg0(&args)?;
-        let format = args.get(1).and_then(|v| with_host(|h| h.as_int(v)));
-        return match format {
-            None | Some(1) | Some(3) => Ok(ann),
-            // CPython's compiler-generated `__annotate__` raises a bare
-            // `NotImplementedError` (no message) for a format it cannot build.
-            Some(_) => Err("NotImplementedError: ".into()),
         };
     }
     // `dict.fromkeys(iterable[, value])` reached via the `dict` type object.
@@ -9739,6 +9764,7 @@ fn call_sys(name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Resul
             });
             Err(host::raise_value(&exc)?)
         }
+        "getsizeof" => sys_getsizeof(&args, &kwargs),
         "getrecursionlimit" => Ok(Value::Int(1000)),
         // The limit itself is not enforced yet (see BUGS.md), but the argument
         // check is CPython's: `sys_setrecursionlimit_impl` refuses anything
@@ -12458,6 +12484,7 @@ pub(crate) fn exception_isa(exc_class: &str, want: &str, h: &host::PyHost) -> bo
         && !is_exception_class(exc_class)
         && !h.classes.contains_key(exc_class)
         && !is_type_like_builtin(exc_class)
+        && !UNINSTANTIABLE_TYPES.contains(&exc_class)
         && !matches!(
             exc_class,
             "NoneType" | "function" | "module" | "method" | "builtin_function_or_method"
@@ -13855,6 +13882,90 @@ fn object_sizeof(recv: &Value) -> i64 {
                 _ => SLOT,
             }
     })
+}
+
+/// `sys.getsizeof(object[, default])` — CPython's `sys_getsizeof`
+/// (`Python/sysmodule.c`). The size is `type(object).__sizeof__(object)` plus
+/// the GC/managed-dict pre-header ([`host::PyHost::sizeof_preheader`]). When the
+/// size cannot be had because of a `TypeError` (no usable `__sizeof__`, or a
+/// non-int result) and `default` was given, `default` is returned instead; any
+/// other error propagates.
+///
+/// For the builtin values the `__sizeof__` half is pythonrs's own footprint
+/// ([`object_sizeof`]), so those numbers are not CPython's; a user `__sizeof__`
+/// and the pre-header arithmetic around it are.
+fn sys_getsizeof(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, String> {
+    let [obj, default] = bind_named(
+        "getsizeof",
+        ["object", "default"],
+        0,
+        1,
+        KwStyle::Unexpected,
+        args,
+        kwargs,
+    )?;
+    let obj = obj.unwrap_or(Value::Undef);
+    // A bridged CPython object is sized by CPython itself.
+    #[cfg(feature = "stdlib-ffi")]
+    if with_host(|h| h.foreign_id(&obj)).is_some() {
+        let sys = crate::ffi::import("sys")?;
+        let f = with_host(|h| crate::ffi::get_attr(h, sys, "getsizeof"))?;
+        return host::invoke(&f, args.to_vec(), kwargs.to_vec());
+    }
+    match sizeof_with_preheader(&obj) {
+        Ok(n) => Ok(Value::Int(n)),
+        Err(e) => {
+            let class = e.split_once(": ").map_or(e.as_str(), |(c, _)| c);
+            match default {
+                Some(d) if with_host(|h| exception_isa(class, "TypeError", h)) => {
+                    with_host(|h| {
+                        h.take_error();
+                    });
+                    Ok(d)
+                }
+                _ => Err(e),
+            }
+        }
+    }
+}
+
+/// `_PySys_GetSizeOf`: look `__sizeof__` up on the TYPE (so a class object is
+/// sized by its metaclass, never by its own unbound `__sizeof__`), require a
+/// non-negative `int`, and add the pre-header.
+fn sizeof_with_preheader(obj: &Value) -> Result<i64, String> {
+    let res = if let Some(m) = with_host(|h| h.metaclass_method(obj, "__sizeof__")) {
+        host::invoke(&m, vec![obj.clone()], vec![])?
+    } else if with_host(|h| {
+        matches!(h.get(obj), Some(PyObj::Class(_)))
+            || matches!(h.type_name(obj).as_str(), "type")
+    }) {
+        Value::Int(object_sizeof(obj))
+    } else {
+        host::call_method(obj, "__sizeof__", vec![], vec![])?
+    };
+    // `PyLong_AsSsize_t`: an exact `int` (or subclass), nothing that merely
+    // has `__index__`.
+    let size = match res {
+        Value::Int(n) => n,
+        Value::Bool(b) => i64::from(b),
+        ref v => match with_host(|h| h.get(v).cloned()) {
+            Some(PyObj::BigInt(_)) => {
+                return Err(
+                    "OverflowError: Python int too large to convert to C ssize_t".to_string()
+                )
+            }
+            // An `int` subclass instance carries its value as the payload.
+            Some(PyObj::Instance(host::Instance {
+                payload: Value::Int(n),
+                ..
+            })) => n,
+            _ => return Err(host::type_error("an integer is required")),
+        },
+    };
+    if size < 0 {
+        return Err("ValueError: __sizeof__() should return >= 0".to_string());
+    }
+    Ok(size + with_host(|h| h.sizeof_preheader(obj)))
 }
 
 /// `x.__reduce_ex__(protocol)`'s `(callable, args, state, listitems, dictitems)`
