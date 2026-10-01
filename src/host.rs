@@ -2308,6 +2308,9 @@ pub struct PyHost {
     /// What the last exception raised over the stdlib-ffi bridge carried beyond
     /// its rendered line. See [`ForeignExc`].
     pub foreign_exc: Option<ForeignExc>,
+    /// Exception objects that have crossed the bridge, paired with their
+    /// CPython counterparts in both directions. See [`ExcBridge`].
+    pub exc_bridge: RefCell<ExcBridge>,
     /// Process arguments exposed to the program as `sys.argv`. Set once per run
     /// by `init_runtime` (`['']` for the REPL/stdin default, `['script', …]` for
     /// a file, `['-c', …]` for `-c`).
@@ -2458,6 +2461,49 @@ struct GenContext {
     module: usize,
 }
 
+/// Exception identity across the stdlib-ffi bridge.
+///
+/// An exception that crosses keeps being the same object on both sides: the
+/// pythonrs exception a CPython exception arrived as is handed back when that
+/// exception comes round again, and a pythonrs exception sent to CPython is
+/// sent as the same CPython object every time. `contextlib` relies on it
+/// (`_GeneratorContextManager.__exit__` returns `False` only when the
+/// generator re-raised `exc is value`), as does any `except E as e` that
+/// compares what it caught with what it raised. Both sides hold their objects
+/// for the life of the host (the heap and the ffi table never free), so a heap
+/// id and a CPython object address stay unique keys.
+#[derive(Default)]
+pub struct ExcBridge {
+    /// Heap id of a pythonrs exception → ffi handle of its CPython object.
+    pub to_py: HashMap<u32, u32>,
+    /// CPython object address → the pythonrs exception value it stands for.
+    pub from_py: HashMap<usize, Value>,
+    /// Heap ids of the exceptions CPython raised (not mirrors of pythonrs
+    /// ones): their type is CPython's (`type(e) is json.JSONDecodeError`) and
+    /// their traceback holds the CPython frames they passed through.
+    pub foreign: HashSet<u32>,
+    /// A pythonrs exception class → the ffi handle of the CPython class
+    /// mirroring it, built once per class.
+    pub mirrors: HashMap<String, u32>,
+}
+
+impl ExcBridge {
+    /// Record that pythonrs exception `v` and the CPython exception at `addr`
+    /// (held at ffi handle `handle`) are one object. `raised_by_cpython` marks
+    /// an exception CPython raised, as opposed to a mirror built for a
+    /// pythonrs one.
+    pub fn pair(&mut self, v: &Value, handle: u32, addr: usize, raised_by_cpython: bool) {
+        let Value::Obj(id) = v else {
+            return;
+        };
+        self.to_py.insert(*id, handle);
+        self.from_py.insert(addr, v.clone());
+        if raised_by_cpython {
+            self.foreign.insert(*id);
+        }
+    }
+}
+
 /// The parts of an exception raised over the stdlib-ffi bridge that its rendered
 /// `"Class: message"` line cannot carry.
 ///
@@ -2482,6 +2528,19 @@ pub struct ForeignExc {
     pub args: Vec<Value>,
     /// Instance attributes beyond `args`, from the exception's `__dict__`.
     pub attrs: Vec<(String, Value)>,
+    /// The raised CPython exception itself (see [`ExcBridge`]).
+    pub origin: Option<ExcOrigin>,
+}
+
+/// Where a CPython exception raised over the bridge came from.
+pub enum ExcOrigin {
+    /// It is the CPython side of a pythonrs exception that crossed earlier — a
+    /// callback's error coming back out of the CPython code that called it —
+    /// so it arrives as that same pythonrs exception.
+    Paired(Value),
+    /// CPython raised it: the ffi handle and address of the exception object,
+    /// to pair with the pythonrs exception rebuilt from it.
+    Raised { handle: u32, addr: usize },
 }
 
 thread_local! {
@@ -2906,6 +2965,7 @@ impl PyHost {
             suppress_context: HashSet::new(),
             foreign_exc_bases: HashMap::new(),
             foreign_exc: None,
+            exc_bridge: RefCell::default(),
             argv: vec![String::new()],
             main_file: None,
             pending_main_dunders: false,
@@ -5872,9 +5932,13 @@ impl PyHost {
                     };
                     format!("{label}([{}])", inner.join(", "))
                 }
+                // `BaseException_repr` names the type by `_PyType_Name`, the part
+                // of `tp_name` after its last dot: `re.PatternError('x')` reprs
+                // as `PatternError('x')`.
                 Some(PyObj::Exception { class, args }) => {
                     let inner: Vec<String> = args.iter().map(|a| self.repr_of(a)).collect();
-                    format!("{class}({})", inner.join(", "))
+                    let name = class.rsplit('.').next().unwrap_or(class);
+                    format!("{name}({})", inner.join(", "))
                 }
                 // A user exception instance reprs as `Class(repr(arg), …)` from
                 // its stored `args`, mirroring `BaseException.__repr__`.
@@ -9801,6 +9865,25 @@ impl PyHost {
     /// `types.UnionType` and `typing.Union` both name — so `type(int | str) is
     /// types.UnionType` holds, and `type(u)[int, str]` subscripts as CPython's
     /// does.
+    /// The ffi handle of the CPython exception `v` was raised as, when `v` is an
+    /// exception CPython raised and its class is not one pythonrs has a type
+    /// for — a builtin exception (`KeyError`) keeps its native type, so
+    /// `type(e) is KeyError` holds.
+    pub fn foreign_exception_handle(&self, v: &Value) -> Option<u32> {
+        let (Value::Obj(id), Some(PyObj::Exception { class, .. })) = (v, self.get(v)) else {
+            return None;
+        };
+        if crate::builtins::is_exception_class(class) || self.classes.contains_key(class) {
+            return None;
+        }
+        let bridge = self.exc_bridge.borrow();
+        bridge
+            .foreign
+            .contains(id)
+            .then(|| bridge.to_py.get(id).copied())
+            .flatten()
+    }
+
     pub fn builtin_type_of(&mut self, v: &Value) -> Value {
         #[cfg(feature = "stdlib-ffi")]
         if matches!(self.get(v), Some(PyObj::Union { .. })) {
@@ -9808,6 +9891,15 @@ impl PyHost {
                 if let Ok(union) = crate::ffi::get_attr(self, typing, "Union") {
                     return union;
                 }
+            }
+        }
+        // An exception CPython raised whose class pythonrs has no type of its
+        // own for (`json.JSONDecodeError`): its type is CPython's class, with
+        // that class's name, module and `__mro__`.
+        #[cfg(feature = "stdlib-ffi")]
+        if let Some(handle) = self.foreign_exception_handle(v) {
+            if let Some(tid) = crate::ffi::type_of(handle) {
+                return self.alloc(PyObj::Foreign(tid));
             }
         }
         let tn = self.type_name(v);
@@ -12267,8 +12359,7 @@ impl PyHost {
                 if name == "__class__" {
                     // The exception's type object (`e.__class__ is ValueError`,
                     // `e.__class__.__name__`).
-                    let c = class.clone();
-                    return Ok(self.alloc(PyObj::Builtin(c)));
+                    return Ok(self.builtin_type_of(recv));
                 }
                 if name == "args" {
                     let a = args.clone();
@@ -17648,6 +17739,13 @@ pub fn class_inherits_type(h: &PyHost, class: &str) -> bool {
 
 /// Turn a raised value into an exception + the error string to abort with.
 pub fn raise_value(exc: &Value) -> Result<String, String> {
+    // A CPython exception (or exception class) raised from pythonrs code —
+    // `raise struct.error('x')` with `struct` bridged — is raised as the
+    // pythonrs exception it crosses as.
+    #[cfg(feature = "stdlib-ffi")]
+    if let Some(id) = with_host(|h| h.foreign_id(exc)) {
+        return raise_value(&crate::ffi::raised_foreign(id)?);
+    }
     with_host(|h| {
         let obj = h.get(exc).cloned();
         match obj {
@@ -17907,6 +18005,7 @@ impl PyHost {
             self.render_exc_block(
                 Some(exc),
                 &frames,
+                self.cpython_raised_handle(exc),
                 &self.exc_final_line(exc),
                 &mut ctx,
                 &mut out,
@@ -17927,12 +18026,14 @@ impl PyHost {
         if let (Some(pos), false) = (syntax_pos, exc_is_syntax) {
             let final_line = crate::parser::render_syntax_head(&pos, err, "<string>");
             let final_line = final_line.trim_end_matches('\n');
-            self.render_exc_block(None, &final_frames, final_line, &mut ctx, &mut out);
+            self.render_exc_block(None, &final_frames, None, final_line, &mut ctx, &mut out);
             return out;
         }
-        let err = crate::suggest::with_hint(err, self.suggestion_for(err));
+        let cpython = self.cpython_raised_for_err(err);
+        let err = self.with_foreign_type_name(err);
+        let err = crate::suggest::with_hint(&err, self.suggestion_for(&err));
         let err = crate::suggest::with_import_hint(err, |n| stdlib_module_names().contains(n));
-        self.render_exc_block(self.exc.as_ref(), &final_frames, &err, &mut ctx, &mut out);
+        self.render_exc_block(self.exc.as_ref(), &final_frames, cpython, &err, &mut ctx, &mut out);
         out
     }
 
@@ -17967,11 +18068,13 @@ impl PyHost {
         }
         for (anc, connector) in ancestors.iter().rev() {
             let frames = self.frames_of(anc);
-            self.render_exc_block(Some(anc), &frames, &self.exc_final_line(anc), ctx, out);
+            let cpython = self.cpython_raised_handle(anc);
+            self.render_exc_block(Some(anc), &frames, cpython, &self.exc_final_line(anc), ctx, out);
             ctx.emit(out, connector, '|');
         }
         let frames = self.frames_of(exc);
-        self.render_exc_block(Some(exc), &frames, &self.exc_final_line(exc), ctx, out);
+        let cpython = self.cpython_raised_handle(exc);
+        self.render_exc_block(Some(exc), &frames, cpython, &self.exc_final_line(exc), ctx, out);
     }
 
     /// The traceback frames captured for an already-caught exception.
@@ -17987,19 +18090,35 @@ impl PyHost {
     /// `+-+---- n ----` tree of its members. A port of `traceback.py`'s
     /// `TracebackException.format` (the `exc.exceptions is None` branch and the
     /// group branch below it), including the `_ExceptionPrintContext` margins.
+    ///
+    /// `cpython` is the CPython exception the block's exception was raised as,
+    /// when CPython raised it: the frames it passed through inside CPython
+    /// (`textwrap.shorten` → `fill` → `wrap` → `_wrap_chunks`) follow the
+    /// pythonrs frames that called in, as one traceback.
+    #[allow(clippy::too_many_arguments)]
     fn render_exc_block(
         &self,
         exc: Option<&Value>,
         frames: &[(String, u32, Span)],
+        cpython: Option<u32>,
         final_line: &str,
         ctx: &mut GroupCtx,
         out: &mut String,
     ) {
         let members = exc.and_then(|e| crate::excgroup::group_parts(self, e));
         let Some((_, members)) = members else {
-            if !frames.is_empty() {
-                ctx.emit(out, "Traceback (most recent call last):\n", '|');
+            #[cfg(feature = "stdlib-ffi")]
+            let cpython_frames = cpython.and_then(crate::ffi::traceback_text).unwrap_or_default();
+            #[cfg(not(feature = "stdlib-ffi"))]
+            let cpython_frames = {
+                let _ = cpython;
+                String::new()
+            };
+            if !frames.is_empty() || !cpython_frames.is_empty() {
+                ctx.emit(out, "Traceback (most recent call last):
+", '|');
                 ctx.emit(out, &self.render_frames(frames), '|');
+                ctx.emit(out, &cpython_frames, '|');
             }
             // A syntax error names where in the SOURCE it is, below the frames
             // that reached it, and its final line is `msg` alone.
@@ -18105,11 +18224,64 @@ impl PyHost {
         out
     }
 
+    /// The ffi handle of the CPython exception `v` is paired with, when CPython
+    /// raised it (rather than it being a pythonrs exception that crossed).
+    fn cpython_raised_handle(&self, v: &Value) -> Option<u32> {
+        let Value::Obj(id) = v else {
+            return None;
+        };
+        let bridge = self.exc_bridge.borrow();
+        bridge.foreign.contains(id).then(|| bridge.to_py.get(id).copied()).flatten()
+    }
+
+    /// The CPython exception the error line `err` came from, when CPython
+    /// raised it: the exception being handled renders to `err`, or `err` is
+    /// the line of the exception the bridge last recorded, uncaught since.
+    fn cpython_raised_for_err(&self, err: &str) -> Option<u32> {
+        match &self.exc {
+            Some(e) if self.exc_line_of(e).as_deref() == Some(err) => self.cpython_raised_handle(e),
+            _ => match &self.foreign_exc {
+                Some(ForeignExc {
+                    line,
+                    origin: Some(ExcOrigin::Raised { handle, .. }),
+                    ..
+                }) if line == err => Some(*handle),
+                _ => None,
+            },
+        }
+    }
+
+    /// `err` with its class named as CPython names the type of the CPython
+    /// exception it came from (`error: …` → `struct.error: …`), when it came
+    /// from one: the exception being handled renders to it, or it is the
+    /// line of the exception the bridge last recorded, uncaught since.
+    fn with_foreign_type_name(&self, err: &str) -> String {
+        #[cfg(feature = "stdlib-ffi")]
+        {
+            let class = err.split_once(": ").map_or(err, |(c, _)| c);
+            let native = crate::builtins::is_exception_class(class) || self.classes.contains_key(class);
+            let handle = self.cpython_raised_for_err(err).filter(|_| !native);
+            if let Some(name) = handle.and_then(crate::ffi::exception_type_name) {
+                return format!("{name}{}", &err[class.len()..]);
+            }
+        }
+        err.to_string()
+    }
+
     /// The terse `ExcType: message` line for a chained exception object (a bare
     /// `ExcType` when it has no message). Empty for a non-exception value.
     fn exc_final_line(&self, exc: &Value) -> String {
         match self.get(exc) {
             Some(PyObj::Exception { class, args }) => {
+                // An exception CPython raised is named as CPython names its
+                // type, module included (`struct.error`, `json.decoder.JSONDecodeError`).
+                #[cfg(feature = "stdlib-ffi")]
+                if let Some(name) = self
+                    .foreign_exception_handle(exc)
+                    .and_then(crate::ffi::exception_type_name)
+                {
+                    return join_exc(&name, &self.exc_message(class, args));
+                }
                 join_exc(class, &self.exc_message(class, args))
             }
             Some(PyObj::Instance(i)) if self.class_is_exception(&i.class) => {

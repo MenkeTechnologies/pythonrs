@@ -2448,13 +2448,14 @@ fn b_reraise(vm: &mut VM, _: u8) -> Value {
     // Re-raise the active exception preserving its *class* (not just its
     // message): use the "Class: msg" / "Class" form so a driver that recovers
     // the exception from the abort string alone (e.g. an asyncio Task settling a
-    // re-raised `CancelledError`) still sees the right type. `exc_error_string`
-    // itself borrows the host, so pull `h.exc` out before calling it.
-    let active = with_host(|h| h.exc.clone());
-    let msg = match active {
-        Some(ref v) => Some(exc_error_string(v)),
-        None => with_host(|h| h.error.clone()),
-    };
+    // re-raised `CancelledError`) still sees the right type. A user exception
+    // instance renders through its class like a builtin one; reading every
+    // non-builtin value as a `StopIteration` re-raised a caught `MyErr` as
+    // `StopIteration` from any handler that had called out first.
+    let msg = with_host(|h| match h.exc.clone() {
+        Some(v) => Some(h.exc_line_of(&v).unwrap_or_else(|| "StopIteration".into())),
+        None => h.error.clone(),
+    });
     match msg {
         Some(m) => abort(vm, m),
         // CPython spells this "reraise", unhyphenated, in every version from
@@ -4322,7 +4323,72 @@ pub(crate) fn construct_builtin_exception(
         crate::excunicode::init(&e, class, &args)?;
     }
     name_error_init(&e, class, kwargs)?;
+    if class == "re.PatternError" {
+        pattern_error_init(&e, &args, kwargs)?;
+    }
     Ok(e)
+}
+
+/// `re.PatternError.__init__(msg, pattern=None, pos=None)` (`re/_constants.py`):
+/// binds `msg`, `pattern`, `pos`, `lineno` and `colno`, and calls
+/// `Exception.__init__` with the message extended by the position — `" at
+/// position N"`, plus `" (line L, column C)"` when the pattern spans lines —
+/// so `args` is that one string.
+fn pattern_error_init(e: &Value, args: &[Value], kwargs: &[(String, Value)]) -> Result<(), String> {
+    let param = |i: usize, name: &str| args.get(i).cloned().or_else(|| kw_get(kwargs, name));
+    let msg = param(0, "msg").ok_or_else(|| {
+        host::type_error("PatternError.__init__() missing 1 required positional argument: 'msg'")
+    })?;
+    let pattern = param(1, "pattern").unwrap_or(Value::Undef);
+    let pos = param(2, "pos").unwrap_or(Value::Undef);
+    let mut text = host::str_of(&msg);
+    let (mut lineno, mut colno) = (Value::Undef, Value::Undef);
+    if !matches!(pattern, Value::Undef) && !matches!(pos, Value::Undef) {
+        let Value::Int(p) = pos else {
+            return Err(host::type_error(&format!(
+                "%d format: a real number is required, not {}",
+                with_host(|h| h.type_name(&pos))
+            )));
+        };
+        text = format!("{text} at position {p}");
+        // The pattern's units before `pos`: characters of a `str`, bytes of a
+        // `bytes`, as `count`/`rfind` slice them.
+        let units: Vec<u32> = with_host(|h| match h.get(&pattern) {
+            Some(PyObj::Bytes(b)) => Ok(b.iter().map(|&c| c as u32).collect()),
+            _ => match h.as_str(&pattern) {
+                Some(s) => Ok(s.chars().map(|c| c as u32).collect()),
+                None => Err(format!(
+                    "AttributeError: '{}' object has no attribute 'count'",
+                    h.type_name(&pattern)
+                )),
+            },
+        })?;
+        let before = &units[..usize::try_from(p).unwrap_or(0).min(units.len())];
+        let newline = '\n' as u32;
+        let line = before.iter().filter(|&&c| c == newline).count() as i64 + 1;
+        let last_newline = before.iter().rposition(|&c| c == newline).map_or(-1, |i| i as i64);
+        lineno = Value::Int(line);
+        colno = Value::Int(p - last_newline);
+        if units.contains(&newline) {
+            text = format!("{text} (line {line}, column {})", p - last_newline);
+        }
+    }
+    with_host(|h| {
+        let message = h.new_str(text);
+        if let Some(PyObj::Exception { args, .. }) = h.get_mut(e) {
+            *args = vec![message];
+        }
+        for (name, v) in [
+            ("msg", msg),
+            ("pattern", pattern),
+            ("pos", pos),
+            ("lineno", lineno),
+            ("colno", colno),
+        ] {
+            let _ = h.set_attr(e, name, v);
+        }
+    });
+    Ok(())
 }
 
 fn synth_exc(h: &mut host::PyHost, err: &str) -> Value {
@@ -4362,9 +4428,18 @@ fn synth_exc(h: &mut host::PyHost, err: &str) -> Value {
     // Prefer them: `KeyError.__str__` is `repr(args[0])`, so re-parsing
     // `KeyError: 'k'` would put the REPR in `args[0]` and double-quote `str(e)`,
     // and `JSONDecodeError.lineno` is not in the rendering at all.
-    let recorded = match &h.foreign_exc {
+    let mut recorded = match &h.foreign_exc {
         Some(f) if f.line == err => h.foreign_exc.take(),
         _ => None,
+    };
+    // The CPython exception may be the far side of a pythonrs one — an error a
+    // callback raised, coming back out of the CPython code that called it —
+    // which is then what was raised here (see `host::ExcBridge`).
+    let origin = recorded.as_mut().and_then(|f| f.origin.take());
+    let raised = match origin {
+        Some(crate::host::ExcOrigin::Paired(v)) => return v,
+        Some(crate::host::ExcOrigin::Raised { handle, addr }) => Some((handle, addr)),
+        None => None,
     };
     let attrs = recorded
         .as_ref()
@@ -4386,6 +4461,9 @@ fn synth_exc(h: &mut host::PyHost, err: &str) -> Value {
         class: class.clone(),
         args: args.clone(),
     });
+    if let Some((handle, addr)) = raised {
+        h.exc_bridge.borrow_mut().pair(&e, handle, addr, true);
+    }
     // The codec's arguments are its attributes too, whether the codec ran here
     // or in CPython (whose C-level fields are not in the recorded `__dict__`).
     if crate::excunicode::is_unicode_error_class(&class) {
@@ -5667,6 +5745,9 @@ pub fn call_builtin_function(
     }
     // `re.*` — regular expressions (module-level functions).
     if let Some(f) = name.strip_prefix("re.") {
+        if f == "PatternError" {
+            return construct_builtin_exception(name, args, &kwargs);
+        }
         return call_re(f, args, kwargs);
     }
     // `atexit.*` — shutdown-callback registry.
@@ -13199,6 +13280,11 @@ const EXC_PARENTS: &[(&str, &str)] = &[
     // stdlib actually catches it with.
     ("UnsupportedOperation", "ValueError"),
     ("_csv.Error", "Exception"),
+    // The native modules' own exception classes, under their dotted names.
+    ("struct.error", "Exception"),
+    ("binascii.Error", "ValueError"),
+    ("binascii.Incomplete", "Exception"),
+    ("re.PatternError", "Exception"),
     ("UnicodeError", "ValueError"),
     ("TypeError", "Exception"),
     ("NameError", "Exception"),

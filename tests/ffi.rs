@@ -1287,3 +1287,118 @@ except RuntimeError as e: print('RE', e)
         "stderr={stderr}"
     );
 }
+
+/// An exception keeps its identity across the bridge, both ways: a pythonrs
+/// exception — builtin or user-defined — thrown into a generator by CPython's
+/// `contextlib` comes back as the same object (so `__exit__` sees `exc is
+/// value` and declines, and the `with` re-raises it), and one a callback
+/// raises inside CPython code (`json.dumps(default=…)`) is caught as itself,
+/// with its class and attributes. One CPython raised has CPython's class as
+/// its type, with that class's `__mro__`. Expected output is CPython 3.14's.
+#[test]
+fn exceptions_keep_identity_and_type_across_the_bridge() {
+    let src = r#"
+import contextlib, json, struct
+
+class MyErr(ValueError):
+    def __init__(self, msg, code):
+        super().__init__(msg)
+        self.code = code
+
+@contextlib.contextmanager
+def plain():
+    yield
+
+@contextlib.contextmanager
+def reraising():
+    try:
+        yield
+    except KeyError:
+        raise
+
+for cm in (plain, reraising):
+    for exc in (KeyError('k'), MyErr('m', 7)):
+        try:
+            with cm():
+                raise exc
+        except (KeyError, MyErr) as caught:
+            print(cm.__name__, repr(caught), caught is exc)
+
+raised = None
+def default(o):
+    global raised
+    raised = MyErr('bad', 3)
+    raise raised
+try:
+    json.dumps(object(), default=default)
+except MyErr as e:
+    print('callback', repr(e), e.code, e is raised)
+try:
+    json.dumps(object(), default=default)
+except ValueError as e:
+    print('callback as ValueError', type(e).__name__)
+
+try:
+    json.loads('{bad')
+except ValueError as e:
+    t = type(e)
+    print(t, t.__mro__, t is json.JSONDecodeError, e.__class__ is t, e.lineno)
+try:
+    struct.pack('i')
+except struct.error as e:
+    print(type(e), type(e).__mro__, type(e) is struct.error)
+try:
+    raise struct.error('direct')
+except struct.error as e:
+    print('raised', repr(e))
+"#;
+    let (stdout, stderr, ok) = run_py(src);
+    if bridge_unavailable(ok, &stderr) {
+        eprintln!("skipping exception-identity test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(
+        stdout,
+        r#"plain KeyError('k') True
+plain MyErr('m') True
+reraising KeyError('k') True
+reraising MyErr('m') True
+callback MyErr('bad') 3 True
+callback as ValueError MyErr
+<class 'json.decoder.JSONDecodeError'> (<class 'json.decoder.JSONDecodeError'>, <class 'ValueError'>, <class 'Exception'>, <class 'BaseException'>, <class 'object'>) True True 1
+<class 'struct.error'> (<class 'struct.error'>, <class 'Exception'>, <class 'BaseException'>, <class 'object'>) True
+raised error('direct')
+"#,
+        "stderr={stderr}"
+    );
+}
+
+/// An uncaught exception CPython raised shows the frames it passed through
+/// inside CPython after the pythonrs ones (`traceback.format_tb` of its own
+/// traceback), and its last line names the type as CPython does, module
+/// included (`struct.error`).
+#[test]
+fn uncaught_bridged_exceptions_show_their_cpython_frames_and_qualified_type() {
+    let (_, stderr, ok) = run_py("import textwrap\ntextwrap.shorten('a b c', 4)\n");
+    if bridge_unavailable(ok, &stderr) {
+        eprintln!("skipping bridged-traceback test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    let frames: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("textwrap.py\", line "))
+        .map(|l| l.rsplit(", in ").next().unwrap_or(""))
+        .collect();
+    assert_eq!(frames, ["shorten", "fill", "wrap", "_wrap_chunks"], "stderr={stderr}");
+    assert!(
+        stderr.ends_with(
+            "    raise ValueError(\"placeholder too large for max width\")\nValueError: placeholder too large for max width\n"
+        ),
+        "stderr={stderr}"
+    );
+    let (_, stderr, _) = run_py("import struct\nstruct.pack('i')\n");
+    assert!(
+        stderr.ends_with("\nstruct.error: pack expected 1 items for packing (got 0)\n"),
+        "stderr={stderr}"
+    );
+}

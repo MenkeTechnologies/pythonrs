@@ -36,6 +36,32 @@ written.
   carry the slots. The per-class slot layout is memoized, which also takes the
   `__slots__` restriction check off the per-write MRO walk: an attribute
   read/write loop retires 5% fewer instructions than before.
+- **An exception keeps its identity, type and CPython frames across the
+  bridge.** `host::ExcBridge` pairs every exception that crosses with its
+  CPython counterpart, both ways. A pythonrs exception sent to CPython is the
+  same CPython object every time — a builtin class's own, or for a user or
+  native-module class an instance of a mirror class (subclass of its nearest
+  builtin exception ancestor, its own name/module, `str`/`repr`/attributes
+  answered by the pythonrs exception) — and comes back as the pythonrs
+  original. So `@contextlib.contextmanager` sees `exc is value` and declines
+  (the body's exception propagated as a new object, and a user exception did
+  not cross at all: `exceptions must derive from BaseException`), and an
+  exception a callback raises inside CPython code is caught as itself
+  (`json.dumps(default=f)` turned `MyErr` into `RuntimeError: MyErr: bad`).
+  An exception CPython raised has CPython's class as `type(e)`/`e.__class__`
+  (`json.JSONDecodeError`, not a `<built-in function>` with a two-element
+  `__mro__`), its uncaught last line names it as CPython does
+  (`struct.error:`, not `error:`), and its traceback continues with the
+  frames it passed through inside CPython (`textwrap.shorten` → `fill` →
+  `wrap` → `_wrap_chunks`, rendered by CPython's `traceback.format_tb`).
+  `raise` of a CPython exception or exception class works. Two native bugs
+  this exposed are fixed with it: a bare `raise` re-raised a caught user
+  exception as `StopIteration` (`b_reraise` rendered every non-builtin value
+  that way), and handing an error to CPython cleared the exception the
+  calling handler was still handling. `re.PatternError` is a real class
+  (`__mro__`, `isinstance`) whose constructor is `re/_constants.py`'s
+  (`msg`/`pattern`/`pos`/`lineno`/`colno`), and an exception reprs by its
+  type's short name.
 - **A user exception class inherits `add_note` and `with_traceback`.**
   `BaseException`'s methods resolved only on the builtin exception types, so
   `class E(Exception)` raised `AttributeError: 'E' object has no attribute
@@ -1973,37 +1999,19 @@ written.
   the class split is not. Relatedly, pythonrs is MORE permissive than CPython on
   two shapes it accepts up to the cap: `'lambda: '*5000+'1'` and
   `'not '*20000+'1'` parse here and are `MemoryError` there.
-- **A bridged exception's type has a two-element MRO.** `struct.error` and
-  `binascii.Error` report `__module__ == 'builtins'` and
-  `type(e).__mro__ == (error, object)`, where CPython says `struct.error` /
-  `binascii.Error` and `(error, Exception, BaseException, object)` /
-  `(Error, ValueError, Exception, BaseException)`. Catching is unaffected —
-  `except struct.error`, `except binascii.Error` and `except ValueError` all
-  match, because handler matching walks the base names captured at raise time
-  rather than the type object — but the traceback's final line reads `error:` /
-  `Error:` rather than `struct.error:` / `binascii.Error:`, and code that reads
-  `__mro__` or `__module__` off a caught exception sees the wrong thing.
-  Separately, `re.error` is not a class at all here (it answers a
-  `builtin_function_or_method`, so `re.error.__mro__` raises), where CPython
-  3.14.7 answers a class. Its NAME is no longer part of the gap: CPython 3.13
-  renamed the class `re.PatternError` and kept `re.error` as an alias, and both
-  names now resolve to one object whose `__name__` is `'PatternError'` and whose
-  `__module__` is `'re'`, with the traceback reading `re.PatternError:`. What
-  remains missing is the type object itself — `__mro__` and `isinstance`
-  against a real class.
-- **A user exception raised out of a wrapped generator loses its identity, not
-  its class.** `PyrsIterator` now implements the generator protocol
-  (`send`/`throw`/`close` beside `__iter__`/`__next__`), so
-  `@contextlib.contextmanager` drives a pythonrs generator: `__exit__` throws the
-  body's exception in, a `try/except` around the `yield` sees it, and
-  `StopIteration` comes back out as "handled". An exception the generator body
-  re-raises unchanged, however, crosses as a NEW CPython object of the same class
-  and args rather than the very object `__exit__` threw in — `contextlib`
-  branches on `exc is not value`, so it re-raises instead of returning False. The
-  message, class and args a caller sees are identical; the traceback is one frame
-  shorter. Closing it means carrying the CPython object's identity through the
-  pythonrs exception value rather than rebuilding from class + args. Reachable
-  from `parity-fuzz --mode ctxmgr` and `--mode stdlibexc`.
+- **A CPython exception object raised from pythonrs is caught as a copy.**
+  `e = binascii.Error('x'); raise e` raises (and `except ValueError as x`
+  catches) the pythonrs exception paired with `e`, so `x is e` is `False`
+  where CPython says `True`; class, args and type are right. A CPython
+  exception held as a value stays a `Foreign` handle (keeping every attribute
+  CPython gives it), while a raised one has to be a pythonrs exception for
+  `except` matching, and nothing unifies the two.
+- **`re.PatternError` from the regex engine has no `msg`/`pattern`/`pos`.**
+  The class and its constructor are CPython's (see Implemented), but the
+  native engine raises from a rendered line, so `re.compile('(')`'s error
+  reads `'unclosed group'`-style wording and lacks the attributes
+  `sre_parse` sets (`msg='missing ), unterminated subpattern'`, `pos=0`,
+  `pattern='('`).
 - **PEP 649: class-body annotations are evaluated eagerly.** Functions are lazy
   (see "Implemented"), but a class body still evaluates each simple annotation
   as it runs and drops one whose name does not resolve: `class C: x: Later`
@@ -2077,15 +2085,15 @@ written.
   out-of-range and surrogate paths share CPython's `chr() arg not in
   range(0x110000)` message. `surrogateescape`/`surrogatepass` handlers are
   likewise not reachable for the same reason.
-- **A traceback stops at the pythonrs frame; frames INSIDE a bridged stdlib
-  module are not listed.** `textwrap.shorten('a b c', 4)` raises the right
-  exception with the right message and the right caret line, but CPython's
-  rendering also names the four `textwrap.py` frames between the call site and
-  the `raise` (`shorten` → `fill` → `wrap` → `_wrap_chunks`) and pythonrs's does
-  not. The exception object and its type are correct; only the intermediate
-  frames of the CPython-side call stack are missing, because the bridge returns
-  the error without walking the foreign traceback. This is the same boundary the
-  `During handling of the above exception…` chained section sits behind.
+- **CPython frames between two pythonrs frames are not listed.** A pythonrs
+  exception raised in a callback that CPython code called
+  (`json.dumps(obj, default=f)` with `f` raising) is caught as itself, but its
+  traceback goes straight from the calling line to `f`, where CPython lists
+  `json/__init__.py` `dumps` → `encoder.py` `encode` → `iterencode` between
+  them. The frames pythonrs captures carry no marker for where the error
+  left for CPython, so the CPython traceback cannot be spliced in there. (An
+  exception CPython itself raised does list its CPython frames — see
+  Implemented.)
 - **`dir()` of a native non-type VALUE is short or empty.** `dir()` of the 13
   builtin types (and their values) is CPython's full listing, but the other
   native kinds still come back empty — a function, a bound or unbound method, a

@@ -104,3 +104,44 @@ fn unicode_error_str_follows_reassigned_attributes() {
         "(\"'e' codec can't decode bytes in position 1-0: changed\", ('e', b'ab', 0, 1, 'r'))"
     );
 }
+
+/// A bare `raise` re-raises the exception its handler caught even after the
+/// handler threw that same object into a generator that let it escape (the
+/// shape of `contextlib`'s `__exit__`), and `re.PatternError` is a class whose
+/// constructor is `re/_constants.py`'s: `msg`, `pattern`, `pos`, `lineno` and
+/// `colno`, with the position folded into the one argument. Expected values
+/// are CPython 3.14's.
+#[test]
+fn reraise_after_a_generator_throw_and_pattern_error_construction() {
+    let src = r#"
+import re
+class MyErr(Exception): pass
+def g():
+    yield
+def throw_into(value):
+    gen = g(); next(gen)
+    try:
+        gen.throw(value)
+    except BaseException:
+        return False
+out = []
+try:
+    try:
+        raise MyErr('m')
+    except MyErr as v:
+        throw_into(v)
+        raise
+except BaseException as e:
+    out.append(repr(e))
+for a in [('m',), ('m', 'ab\ncd', 4), ('m', b'ab\ncd', 4), ('m', 'abc', 1), ('m', None, 3)]:
+    e = re.PatternError(*a)
+    out.append((repr(e), e.args, e.msg, e.pattern, e.pos, e.lineno, e.colno))
+out.append(re.PatternError('m', pos=2, pattern='abc').args)
+out.append(re.error is re.PatternError and isinstance(re.PatternError('x'), Exception))
+out.append([c.__name__ for c in re.error.__mro__])
+"#;
+    assert_eq!(
+        g(src, "out"),
+        r#"["MyErr('m')", ("PatternError('m')", ('m',), 'm', None, None, None, None), ("PatternError('m at position 4 (line 2, column 2)')", ('m at position 4 (line 2, column 2)',), 'm', 'ab\ncd', 4, 2, 2), ("PatternError('m at position 4 (line 2, column 2)')", ('m at position 4 (line 2, column 2)',), 'm', b'ab\ncd', 4, 2, 2), ("PatternError('m at position 1')", ('m at position 1',), 'm', 'abc', 1, 1, 2), ("PatternError('m')", ('m',), 'm', None, 3, None, None), ('m at position 2',), True, ['PatternError', 'Exception', 'BaseException', 'object']]"#
+    );
+}
