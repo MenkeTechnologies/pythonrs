@@ -17334,47 +17334,11 @@ fn list_method(
             Ok(Value::Undef)
         }
         "index" => {
-            // `list.index(x[, start[, stop]])` — search the half-open `[start, stop)`
-            // window; negative bounds normalize against `len` (clamped, like a slice).
-            let v = arg0(args)?;
-            let n = with_host(|h| match h.get(recv) {
-                Some(PyObj::List(l)) => l.len() as i64,
-                _ => 0,
-            });
-            let mut start = match args.get(1) {
-                Some(a) => with_host(|h| h.as_int(a)).unwrap_or(0),
-                None => 0,
-            };
-            let mut stop = match args.get(2) {
-                Some(a) => with_host(|h| h.as_int(a)).unwrap_or(n),
-                None => n,
-            };
-            if start < 0 {
-                start += n;
-                if start < 0 {
-                    start = 0;
-                }
-            }
-            if stop < 0 {
-                stop += n;
-            }
-            if stop > n {
-                stop = n;
-            }
-            // Compare via the rich `==` dunder (outside the borrow) so a user
-            // `__eq__` is honored; the element is the forward operand.
             let elems = with_host(|h| match h.get(recv) {
                 Some(PyObj::List(l)) => l.clone(),
                 _ => Vec::new(),
             });
-            let mut i = start;
-            while i < stop {
-                if elem_equal(&elems[i as usize], &v)? {
-                    return Ok(Value::Int(i));
-                }
-                i += 1;
-            }
-            Err("ValueError: list.index(x): x not in list".into())
+            sequence_index(&elems, args, "list.index(x): x not in list")
         }
         "count" => {
             let v = arg0(args)?;
@@ -18314,6 +18278,37 @@ fn range_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, Strin
     }
 }
 
+/// `seq.index(x[, start[, stop]])` -- `list_index_impl`, `tuple_index_impl` and
+/// `deque_index_impl` share it. The bounds are `slice_index` arguments
+/// (`__index__`-able, saturating past `Py_ssize_t`), a negative one counts
+/// from the end and clamps at 0, and the window is searched with the rich `==`
+/// (outside the borrow, so a user `__eq__` runs).
+fn sequence_index(elems: &[Value], args: &[Value], not_found: &str) -> Result<Value, String> {
+    let v = arg0(args)?;
+    let n = elems.len() as i64;
+    let bound = |a: Option<&Value>, default: i64| -> Result<i64, String> {
+        let Some(a) = a else { return Ok(default) };
+        let a = index_dunder(a)?.unwrap_or_else(|| a.clone());
+        with_host(|h| h.as_slice_index(&a)).ok_or_else(|| {
+            host::type_error("slice indices must be integers or have an __index__ method")
+        })
+    };
+    let mut start = bound(args.get(1), 0)?;
+    let mut stop = bound(args.get(2), n)?;
+    if start < 0 {
+        start = start.saturating_add(n).max(0);
+    }
+    if stop < 0 {
+        stop = stop.saturating_add(n).max(0);
+    }
+    for i in start..stop.min(n) {
+        if elem_equal(&elems[i as usize], &v)? {
+            return Ok(Value::Int(i));
+        }
+    }
+    Err(format!("ValueError: {not_found}"))
+}
+
 fn tuple_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
     match name {
         "count" if args.len() != 1 => Err(host::type_error(&format!(
@@ -18346,17 +18341,11 @@ fn tuple_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, Strin
             Ok(Value::Int(n))
         }
         "index" => {
-            let v = arg0(args)?;
             let elems = with_host(|h| match h.get(recv) {
                 Some(PyObj::Tuple(l)) => Ok(l.clone()),
                 _ => Err(host::type_error("not a tuple")),
             })?;
-            for (i, e) in elems.iter().enumerate() {
-                if elem_equal(e, &v)? {
-                    return Ok(Value::Int(i as i64));
-                }
-            }
-            Err("ValueError: tuple.index(x): x not in tuple".into())
+            sequence_index(&elems, args, "tuple.index(x): x not in tuple")
         }
         _ => Err(format!(
             "AttributeError: 'tuple' object has no attribute '{name}'"
@@ -20467,6 +20456,9 @@ fn collect_bytes(v: &Value) -> Result<Vec<u8>, String> {
 
 // ── collections.deque ────────────────────────────────────────────────────────
 
+/// `PyLong_AsSsize_t`'s overflow message.
+const SSIZE_OVERFLOW: &str = "OverflowError: Python int too large to convert to C ssize_t";
+
 fn deque_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
     match name {
         // `deque_copy`: a new deque holding the same items, with the same `maxlen`.
@@ -20556,11 +20548,27 @@ fn deque_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, Strin
             });
             Ok(Value::Undef)
         }
+        // `deque_rotate`'s `n` is a `Py_ssize_t` argument: `__index__` is
+        // honoured and a value past the C type is OverflowError.
         "rotate" => {
-            let n = args
-                .first()
-                .and_then(|v| with_host(|h| h.as_int(v)))
-                .unwrap_or(1);
+            let n = match args.first() {
+                None => 1,
+                Some(a) => {
+                    let a = index_dunder(a)?.unwrap_or_else(|| a.clone());
+                    match with_host(|h| h.index_fit(&a)) {
+                        host::IndexFit::Fits(n) => n,
+                        host::IndexFit::TooLarge(_) => return Err(SSIZE_OVERFLOW.into()),
+                        host::IndexFit::NotInt => {
+                            return Err(with_host(|h| {
+                                host::type_error(&format!(
+                                    "'{}' object cannot be interpreted as an integer",
+                                    h.tp_name(&a)
+                                ))
+                            }));
+                        }
+                    }
+                }
+            };
             with_host(|h| {
                 if let Some(PyObj::Deque { items, .. }) = h.get_mut(recv) {
                     if !items.is_empty() {
@@ -20594,16 +20602,11 @@ fn deque_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, Strin
             })))
         }
         "index" => {
-            let v = arg0(args)?;
-            with_host(|h| match h.get(recv) {
-                Some(PyObj::Deque { items, .. }) => {
-                    match items.iter().position(|x| h.equal(x, &v)) {
-                        Some(p) => Ok(Value::Int(p as i64)),
-                        None => Err(format!("ValueError: {} is not in deque", h.repr_of(&v))),
-                    }
-                }
+            let elems: Vec<Value> = with_host(|h| match h.get(recv) {
+                Some(PyObj::Deque { items, .. }) => Ok(items.iter().cloned().collect()),
                 _ => Err(host::type_error("not a deque")),
-            })
+            })?;
+            sequence_index(&elems, args, "deque.index(x): x not in deque")
         }
         "remove" => {
             let v = arg0(args)?;
@@ -21249,21 +21252,33 @@ fn construct_collection(
                 Some(v) if !matches!(v, Value::Undef) => Some(v.clone()),
                 _ => kw("iterable"),
             };
+            let maxlen_val = match args.get(1) {
+                Some(v) if !matches!(v, Value::Undef) => Some(v.clone()),
+                _ => kw("maxlen"),
+            };
+            // `deque_init` reads `maxlen` with `PyLong_AsSsize_t` -- an int,
+            // `__index__` not consulted -- and rejects it before the iterable
+            // is consumed.
+            let maxlen = match maxlen_val {
+                Some(v) if !matches!(v, Value::Undef) => match with_host(|h| h.index_fit(&v)) {
+                    host::IndexFit::Fits(n) if n < 0 => {
+                        return Err("ValueError: maxlen must be non-negative".into());
+                    }
+                    host::IndexFit::Fits(n) => Some(n as usize),
+                    host::IndexFit::TooLarge(_) => {
+                        return Err(SSIZE_OVERFLOW.into());
+                    }
+                    host::IndexFit::NotInt => {
+                        return Err(host::type_error("an integer is required"));
+                    }
+                },
+                _ => None,
+            };
             let mut items: std::collections::VecDeque<Value> = match iterable {
                 Some(v) if !matches!(v, Value::Undef) => {
                     std::collections::VecDeque::from(host::iter_vec(&v)?)
                 }
                 _ => std::collections::VecDeque::new(),
-            };
-            let maxlen_val = match args.get(1) {
-                Some(v) if !matches!(v, Value::Undef) => Some(v.clone()),
-                _ => kw("maxlen"),
-            };
-            let maxlen = match maxlen_val {
-                Some(v) if !matches!(v, Value::Undef) => {
-                    with_host(|h| h.as_int(&v)).map(|n| n.max(0) as usize)
-                }
-                _ => None,
             };
             if let Some(m) = maxlen {
                 while items.len() > m {

@@ -389,6 +389,13 @@ written.
   `deque.__copy__()` and `deque.reverse()` did not exist, nor
   `defaultdict.__missing__`/`__copy__`, `Counter.__missing__` or a dict view's
   `mapping`.
+- **`index()` bounds on tuple and deque; deque argument checks.**
+  `tuple.index(x, start, stop)` ignored its bounds, a non-integer bound to any
+  of the three was silently treated as absent, and `deque.index` said
+  `5 is not in deque` and ignored its bounds; all three now share one port of
+  `list_index_impl` (`slice_index` bounds, each type's own `x not in …`
+  message). `deque.rotate('a')` rotated by one, and `deque(maxlen=-1)` /
+  `deque(it, 'x')` built a deque; they raise as `deque_rotate`/`deque_init` do.
 - **`stdout`/`stderr` are buffered as CPython buffers them.** pythonrs flushed
   every write, so `python prog.py > log 2>&1` came out in program order where
   CPython's comes out in flush order (`err1 err2 out1 out2` for two

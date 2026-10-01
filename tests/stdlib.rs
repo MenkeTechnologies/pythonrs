@@ -3662,3 +3662,36 @@ x = [dd, dd.__copy__(), e(lambda: defaultdict().__missing__('k')), d.keys().mapp
         r#"[defaultdict(<class 'list'>, {'k': [1]}), defaultdict(<class 'list'>, {'k': [1]}), "KeyError 'k'", mappingproxy({1: 2}), 2]"#
     );
 }
+
+// `list.index`/`tuple.index`/`deque.index` share one search: `slice_index`
+// bounds (`__index__`-able, saturating, negative from the end), the rich `==`,
+// and each type's own not-found message. `deque.rotate` takes a `Py_ssize_t`
+// count; `deque(maxlen=...)` is read with `PyLong_AsSsize_t` and checked
+// before the iterable is consumed.
+#[test]
+fn sequence_index_bounds_and_deque_argument_checks() {
+    let src = r#"from collections import deque
+class I:
+    def __index__(self): return 1
+class P:
+    def __init__(s, v): s.v = v
+    def __eq__(s, o): return isinstance(o, P) and s.v == o.v
+def e(f):
+    try:
+        return f()
+    except Exception as ex:
+        return f'{type(ex).__name__}: {ex}'
+x = [[1, 2, 3, 2].index(2, -2), e(lambda: (1, 2).index(2, 0, 1)), (1, 2, 1).index(1, I()), (P(1), P(2)).index(P(2)),
+     e(lambda: [1].index(1, 'a')), e(lambda: (1,).index(1, None)), e(lambda: [1].index(1, 2**80)), [1].index(1, -2**80),
+     deque([1, 2, 3]).index(3, -1), e(lambda: deque([1, 2]).index(5)), e(lambda: deque([1, 2, 3]).index(1, 1)),
+     e(lambda: deque([1]).rotate('a')), e(lambda: deque([1]).rotate(2**80)), e(lambda: deque(maxlen=-1)),
+     e(lambda: deque([1], 'x')), e(lambda: deque([1], I())), e(lambda: deque(5, maxlen=-1)), deque([1, 2], maxlen=True)]
+q = deque([1, 2, 3])
+q.rotate(I())
+x.append(q)
+"#;
+    assert_eq!(
+        g(src, "x"),
+        r#"[3, 'ValueError: tuple.index(x): x not in tuple', 2, 1, 'TypeError: slice indices must be integers or have an __index__ method', 'TypeError: slice indices must be integers or have an __index__ method', 'ValueError: list.index(x): x not in list', 0, 2, 'ValueError: deque.index(x): x not in deque', 'ValueError: deque.index(x): x not in deque', "TypeError: 'str' object cannot be interpreted as an integer", 'OverflowError: Python int too large to convert to C ssize_t', 'ValueError: maxlen must be non-negative', 'TypeError: an integer is required', 'TypeError: an integer is required', 'ValueError: maxlen must be non-negative', deque([2], maxlen=1), deque([3, 1, 2])]"#
+    );
+}
