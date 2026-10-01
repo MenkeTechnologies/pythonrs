@@ -519,6 +519,51 @@ fn a_slice_is_hashable_and_compares_by_its_bounds() {
     assert_eq!(g("x = [1, 2, 3, 4][slice(1, 3)]", "x"), "[2, 3]");
 }
 
+/// `range` and a read-only `memoryview` are hashable (`range_hash`,
+/// `memory_hash`); both raised `TypeError: unhashable type: 'object'`.
+///
+/// A range hashes as the tuple `(len, start, step)` with `None` for what does
+/// not decide the sequence, so equal ranges key equal, yet a range is never the
+/// same key as that tuple. A memoryview hashes and compares as the bytes it
+/// shows, so it shares `bytes`' key; a writable one refuses. Every expectation
+/// is python3.14's (range hashes are seed-independent: a tuple of ints).
+#[test]
+fn range_and_readonly_memoryview_are_hashable() {
+    assert_eq!(g("x = hash(range(1, 10, 2))", "x"), "-8580228179051518038");
+    assert_eq!(g("x = hash(range(5, 5))", "x"), "2676694398852732306");
+    assert_eq!(g("x = hash(range(2**70, 2**71, 3))", "x"), "-5630244664538985369");
+    assert_eq!(
+        g(
+            "x = {range(0): 'a', range(3, 3): 'b', range(1, 2, 5): 'c', \
+             range(1, 3, 9): 'd', (5, 1, 2): 't', range(1, 10, 2): 'r'}",
+            "x"
+        ),
+        "{range(0, 0): 'b', range(1, 2, 5): 'd', (5, 1, 2): 't', range(1, 10, 2): 'r'}"
+    );
+    assert_eq!(
+        g(
+            "x = (hash(memoryview(b'ab')) == hash(b'ab'), len({b'ab', memoryview(b'ab')}), \
+             hash(memoryview(b'abcd')[1:3]) == hash(b'bc'), {memoryview(b'x'): 1}[b'x'])",
+            "x"
+        ),
+        "(True, 1, True, 1)"
+    );
+    assert_eq!(
+        g(
+            "try:\n    hash(memoryview(bytearray(b'a')))\nexcept ValueError as e:\n    x = str(e)",
+            "x"
+        ),
+        "'cannot hash writable memoryview object'"
+    );
+    assert_eq!(
+        g(
+            "m = memoryview(b'a')\nm.release()\ntry:\n    hash(m)\nexcept ValueError as e:\n    x = str(e)",
+            "x"
+        ),
+        "'operation forbidden on released memoryview object'"
+    );
+}
+
 #[test]
 fn function_attributes() {
     // Functions carry a writable attribute dict (abc's __isabstractmethod__,

@@ -223,6 +223,11 @@ pub enum PKey {
     /// its bounds tuple would silently unify them. They do not even hash alike —
     /// see [`crate::pyhash::slice`].
     Slice(Vec<PKey>),
+    /// A `range` key: `(len, start, step)` canonicalized as `range_hash` does
+    /// (see [`range_pkey`]). Distinct from `Tuple` for the same reason as
+    /// `Slice` — a range never equals a tuple — though here the two do hash
+    /// alike, because CPython hashes the range AS that tuple.
+    Range(Vec<PKey>),
 }
 
 /// A compiled function template: parameter shape + body chunk. Shared by every
@@ -5623,6 +5628,36 @@ impl PyHost {
                         self.to_key(&step)?,
                     ])
                 }
+                Some(PyObj::Range { start, stop, step }) => {
+                    let len = num_bigint::BigInt::from(range_len_exact(*start, *stop, *step));
+                    range_pkey(len, (*start).into(), (*step).into())
+                }
+                Some(PyObj::BigRange { start, stop, step }) => {
+                    range_pkey(big_range_len(start, stop, step), start.clone(), step.clone())
+                }
+                // `memory_hash`: only a live, read-only view hashes, and it
+                // hashes — and compares — as the bytes it shows, so it shares
+                // `bytes`' key (`{b'ab', memoryview(b'ab')}` has one element).
+                // Every view here is format `'B'`, the only restriction left to
+                // check.
+                Some(PyObj::Memoryview {
+                    obj,
+                    start,
+                    len,
+                    readonly,
+                    released,
+                }) => {
+                    if *released {
+                        return Err(MV_RELEASED.into());
+                    }
+                    if !*readonly {
+                        return Err("ValueError: cannot hash writable memoryview object".into());
+                    }
+                    match self.get(obj) {
+                        Some(PyObj::Bytes(b)) => PKey::Bytes(b[*start..*start + *len].to_vec()),
+                        _ => return Err("ValueError: cannot hash writable memoryview object".into()),
+                    }
+                }
                 Some(other) => {
                     return Err(type_error(&format!(
                         "unhashable type: '{}'",
@@ -6727,6 +6762,27 @@ pub fn align_operand(a: &Value, b: &Value) -> Result<Option<Value>, String> {
 /// Canonical dict/set key for a float. An integral, finite float normalizes to
 /// the matching integer key (`Int`/`Big`) so it unifies with `int`/`bool`
 /// (`1.0 in {1}` → True); everything else keys by its raw bits.
+/// The key of `range` with these bounds — `range_hash`'s tuple
+/// (`Objects/rangeobject.c`): `(len, None, None)` when empty, `(len, start,
+/// None)` for one element, else `(len, start, step)`. Exactly the parts that
+/// decide which integers the range yields, so ranges that compare equal
+/// (`range(0) == range(5, 5)`, `range(1, 2, 3) == range(1, 3, 9)`) key equal.
+fn range_pkey(len: num_bigint::BigInt, start: num_bigint::BigInt, step: num_bigint::BigInt) -> PKey {
+    use num_traits::{One, Zero};
+    let int = |b: num_bigint::BigInt| match i64::try_from(&b) {
+        Ok(n) => PKey::Int(n),
+        Err(_) => PKey::Big(b),
+    };
+    let (start, step) = if len.is_zero() {
+        (PKey::None, PKey::None)
+    } else if len.is_one() {
+        (int(start), PKey::None)
+    } else {
+        (int(start), int(step))
+    };
+    PKey::Range(vec![int(len), start, step])
+}
+
 fn float_pkey(f: f64) -> PKey {
     if f.is_finite() && f.fract() == 0.0 {
         if f >= i64::MIN as f64 && f <= i64::MAX as f64 {

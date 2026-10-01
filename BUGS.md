@@ -19,6 +19,15 @@ written.
   in place of inline slots, and `MKFUNC`/`MATCH_CLASS` take their defaults and
   keyword names as lists. Plain collection literals and f-strings were already
   chunked.
+- **`range` and a read-only `memoryview` are hashable.** Both raised
+  `TypeError: unhashable type: 'object'`, so neither could be a dict key or set
+  member. A range now keys as `range_hash`'s tuple — `(len, None, None)` when
+  empty, `(len, start, None)` for one element, else `(len, start, step)` — so
+  equal ranges (`range(0)`, `range(5, 5)`) are one key and hash to CPython's
+  number, while staying a different key from that tuple. A read-only
+  memoryview hashes and keys as the bytes it shows (`{b'ab',
+  memoryview(b'ab')}` has one element), and a writable one raises
+  `ValueError: cannot hash writable memoryview object`.
 - **`float` `repr` breaks a shortest-digit tie to even.** Rust `std`'s shortest
   formatter rounds an exact tie between two equally short round-tripping
   decimals up, so `2113325745016023.2` (the double `…023.25`) printed as
@@ -2072,7 +2081,9 @@ Still open:
 `hash(x)` now returns CPython's own number. The algorithms are ported from the
 CPython 3.14.6 C sources in `src/pyhash.rs` (`long_hash`, `_Py_HashDouble`,
 `complex_hash`, `Py_HashBuffer`/`siphash13`, `tuple_hash`, `frozenset_hash`),
-and the cross-bridge container collapse that follows from them works in both
+`range` and a read-only `memoryview` hash as `range_hash` and `memory_hash`
+define them (a `(len, start, step)` tuple; the viewed bytes), and the
+cross-bridge container collapse that follows from them works in both
 directions:
 
 ```
@@ -2091,7 +2102,8 @@ silently returned the seed-0 value. A seed CPython refuses (`0x10`, `-1`,
 `4294967296`, a trailing space) is refused here with CPython's own
 `Fatal Python error: config_init_hash_seed: …` text and exit code 1.
 
-One residue remains, and it is a boundary rather than a gap:
+Two residues remain. The first is a boundary rather than a gap; the second
+is a gap:
 
 - **Address-derived hashes are not reproducible by anyone.**
   `hash(float('nan'))`, `hash(...)`, `hash(NotImplemented)` and an instance's
@@ -2099,6 +2111,11 @@ One residue remains, and it is a boundary rather than a gap:
   address. Measured across CPython runs they differ every time *even under
   `PYTHONHASHSEED=0`*, so there is no value to match. pythonrs returns a stable
   internally-consistent number instead.
+- **A memoryview's hash is not cached.** `memory_hash` stores the number on
+  the view, so a view hashed before `release()` keeps hashing afterwards;
+  pythonrs recomputes it from the bytes each time, so a released view raises
+  `ValueError: operation forbidden on released memoryview object` whether or not
+  it was hashed first.
 
 An UNSET seed is likewise unmatchable in principle — both interpreters draw
 their own entropy — which is a property of asking for unpredictability, not a

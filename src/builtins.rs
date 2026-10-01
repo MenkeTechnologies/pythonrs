@@ -7812,7 +7812,8 @@ pub fn hash_key(k: &PKey) -> i64 {
         PKey::Bytes(b) => crate::pyhash::buffer(b),
         // A tuple/frozenset hashes from its ELEMENTS' hashes, so recursion here
         // keeps a nested container consistent with a flat one.
-        PKey::Tuple(ks) => {
+        // `range_hash` hashes the range as the tuple its key holds.
+        PKey::Tuple(ks) | PKey::Range(ks) => {
             let elems: Vec<i64> = ks.iter().map(hash_key).collect();
             crate::pyhash::tuple(&elems)
         }
