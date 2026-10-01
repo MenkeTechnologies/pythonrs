@@ -9,7 +9,8 @@
 use crate::ast::*;
 use crate::lexer::{lex, Tok, Token};
 
-const KEYWORDS: &[&str] = &[
+/// `keyword.kwlist`: the hard keywords, in its (sorted) order.
+pub(crate) const KEYWORDS: &[&str] = &[
     "False", "None", "True", "and", "as", "assert", "async", "await", "break", "class", "continue",
     "def", "del", "elif", "else", "except", "finally", "for", "from", "global", "if", "import",
     "in", "is", "lambda", "nonlocal", "not", "or", "pass", "raise", "return", "try", "while",
@@ -28,23 +29,18 @@ pub(crate) fn is_soft_keyword(s: &str) -> bool {
 }
 
 /// Parse a full module into a list of statements. Inline `rust { ... }` FFI
-/// blocks are desugared to `__rust_compile(...)` calls before lexing.
+/// blocks are desugared to `__rust_compile(...)` calls before lexing. A
+/// tokenizer or parser error carries the source as its `_metadata` (see
+/// [`with_metadata`]).
 pub fn parse(src: &str) -> Result<Vec<Stmt>, String> {
+    parse_source(src).map_err(|e| with_metadata(e, &exec_input_source(src)))
+}
+
+fn parse_source(src: &str) -> Result<Vec<Stmt>, String> {
     let src = crate::rust_ffi::desugar(src);
     let lexed = lex(&src)?;
     let unclosed = lexed.unclosed;
-    let mut p = Parser {
-        toks: lexed.toks,
-        pos: 0,
-        deferred: lexed.deferred,
-        depth: 0,
-        in_function: false,
-        loop_depth: 0,
-        nesting: 0,
-        misplaced: None,
-        groups: std::collections::HashMap::new(),
-        lines: src.lines().map(str::to_string).collect(),
-    };
+    let mut p = Parser::new(lexed.toks, lexed.deferred, &src);
     let err = match p.parse_module() {
         Ok(stmts) => match unclosed {
             Some(e) => e,
@@ -54,7 +50,7 @@ pub fn parse(src: &str) -> Result<Vec<Stmt>, String> {
         // only when the parser gets that far: an error earlier in the file
         // wins, one at the end of the input is this one.
         Err(e) => match unclosed {
-            Some(u) if p.pos + 2 >= p.toks.len() => u,
+            Some(u) if p.at_end_of_input(true) => u,
             // The parser failed while asking for the token after the bad
             // dedent that cut the stream short (`try:` whose body ends there
             // wants an `except`): in CPython that request is what raises the
@@ -109,6 +105,72 @@ pub struct SyntaxPos {
     /// Raised by the symbol table, which builds the exception from its message
     /// alone (`args == (msg,)`) and sets the position only as attributes.
     pub bare_args: bool,
+    /// `_metadata`, for an error the tokenizer or the parser raised.
+    pub metadata: Option<SyntaxMetadata>,
+}
+
+/// `SyntaxError._metadata` as the parser sets it: `(lineno, offset, source)`.
+/// pegen (`_PyPegen_raise_error_known_location`) records the whole source it
+/// was reading, with line and offset 0; `traceback`'s keyword-typo search
+/// (`TracebackException._find_keyword_typos`) reads the lines before the error
+/// from it. A compiler or symbol-table error has none.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SyntaxMetadata {
+    pub lineno: i64,
+    pub offset: i64,
+    /// `None` when user code built the tuple with no source; `traceback` then
+    /// reads the file, or falls back to the error's `text`.
+    pub source: Option<String>,
+}
+
+/// Attach the source a tokenizer or parser error was raised over as its
+/// [`SyntaxMetadata`], unless the error is positionless, raised by the
+/// compiler or the symbol table (`nosrc`), or already carries one.
+pub fn with_metadata(err: String, source: &str) -> String {
+    let fields = err.find(SYNTAX_FIELD).map_or("", |i| &err[i..]);
+    if !fields.contains("\u{1}pos=")
+        || fields.contains("\u{1}nosrc=")
+        || fields.contains("\u{1}meta=")
+    {
+        return err;
+    }
+    // The source is the one field whose value can hold anything, so the
+    // field separator (and the escape character itself) is escaped in it.
+    let escaped = source.replace('\u{2}', "\u{2}2").replace(SYNTAX_FIELD, "\u{2}1");
+    format!("{err}{SYNTAX_FIELD}meta={escaped}")
+}
+
+fn unescape_metadata(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{2}' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('1') => out.push(SYNTAX_FIELD),
+            _ => out.push('\u{2}'),
+        }
+    }
+    out
+}
+
+/// The source as CPython's tokenizer holds it for `exec`/file input, which is
+/// what pegen records in `_metadata`: newlines translated to `\n` and one
+/// appended when the source does not end with one.
+pub fn exec_input_source(src: &str) -> String {
+    let mut s = translate_newlines(src);
+    if !s.ends_with('\n') {
+        s.push('\n');
+    }
+    s
+}
+
+/// `\r\n` and a lone `\r` become `\n`, as the tokenizer's
+/// `translate_newlines` makes them.
+pub fn translate_newlines(src: &str) -> String {
+    src.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 /// Attach a position to a syntax error message.
@@ -163,10 +225,30 @@ pub fn split_syntax_error(err: &str) -> (&str, Option<SyntaxPos>) {
             "nosrc" => pos.no_source = true,
             "bare" => pos.bare_args = true,
             "file" => pos.filename = Some(value.to_string()),
+            "meta" => {
+                pos.metadata = Some(SyntaxMetadata {
+                    lineno: 0,
+                    offset: 0,
+                    source: Some(unescape_metadata(value)),
+                })
+            }
             _ => {}
         }
     }
     (&err[..i], Some(pos))
+}
+
+/// Check the source given to `eval` (or `compile(..., 'eval')`): it parses,
+/// and it is one expression list. A syntax error in it is positioned as eval
+/// input positions it ([`for_eval_input`]), and its `_metadata` is the source
+/// as the eval tokenizer holds it — leading spaces and tabs stripped (as
+/// `builtin_eval` strips them), newlines translated, none appended.
+pub fn check_eval_source(given: &str) -> Result<(), String> {
+    let src = given.trim();
+    parse(src)
+        .map_err(|e| for_eval_input(e, src))
+        .and_then(|_| check_eval_input(src))
+        .map_err(|e| with_metadata(e, &translate_newlines(given.trim_start_matches([' ', '\t']))))
 }
 
 /// Re-read a syntax error in `eval()` input, which CPython tokenizes WITHOUT
@@ -221,13 +303,42 @@ pub fn source_line(src: &str, lineno: i64, keep_newline: bool) -> Option<String>
 /// CPython's rendering of a positioned syntax error below a traceback
 /// (`traceback.TracebackException._format_syntax_error`): the `File` line, the
 /// source line stripped of its indentation, and a caret run under
-/// `[offset, end_offset)`.
-pub fn render_syntax_block(pos: &SyntaxPos, default_file: &str) -> String {
+/// `[offset, end_offset)`; plus `msg` as the final line shows it. Once the
+/// `File` line is out, `_find_keyword_typos` may move the source line and the
+/// carets to a misspelled keyword and reword the message
+/// ([`crate::suggest::keyword_typo`]).
+pub fn render_syntax_error(pos: &SyntaxPos, msg: &str, default_file: &str) -> (String, String) {
     let file = pos.filename.as_deref().unwrap_or(default_file);
     let mut out = match pos.lineno {
         Some(l) => format!("  File \"{file}\", line {l}\n"),
         None => format!("  File \"{file}\"\n"),
     };
+    if pos.text.is_none() {
+        return (out, msg.to_string());
+    }
+    let (pos, msg) = match crate::suggest::keyword_typo(msg, pos) {
+        Some((typo_pos, typo_msg)) => (typo_pos, typo_msg),
+        None => (pos.clone(), msg.to_string()),
+    };
+    out.push_str(&render_source_and_carets(&pos));
+    (out, msg)
+}
+
+/// [`render_syntax_error`] for an error string's `Class: msg` head: the block
+/// followed by the head as it is to be shown.
+pub fn render_syntax_head(pos: &SyntaxPos, head: &str, default_file: &str) -> String {
+    match head.split_once(": ") {
+        Some((class, msg)) => {
+            let (block, msg) = render_syntax_error(pos, msg, default_file);
+            format!("{block}{class}: {msg}")
+        }
+        None => format!("{}{head}", render_syntax_error(pos, "", default_file).0),
+    }
+}
+
+/// The offending line and its carets, below the `File` line.
+fn render_source_and_carets(pos: &SyntaxPos) -> String {
+    let mut out = String::new();
     let Some(text) = &pos.text else {
         return out;
     };
@@ -278,18 +389,7 @@ pub fn render_syntax_block(pos: &SyntaxPos, default_file: &str) -> String {
 /// error, at that token; empty input is an error at line 0.
 pub fn check_eval_input(src: &str) -> Result<(), String> {
     let lexed = lex(src)?;
-    let mut p = Parser {
-        toks: lexed.toks,
-        pos: 0,
-        deferred: None,
-        depth: 0,
-        in_function: false,
-        loop_depth: 0,
-        nesting: 0,
-        misplaced: None,
-        groups: std::collections::HashMap::new(),
-        lines: Vec::new(),
-    };
+    let mut p = Parser::new(lexed.toks, None, src);
     p.skip_newlines();
     if matches!(p.cur(), Tok::Eof) {
         return Err(with_text(
@@ -313,6 +413,37 @@ pub fn check_eval_input(src: &str) -> Result<(), String> {
         Some(text) => with_text(e, &text),
         None => e,
     })
+}
+
+/// Whether `src` fails to parse only because it stops early — what CPython
+/// raises as `_IncompleteInputError` under `PyCF_ALLOW_INCOMPLETE_INPUT`
+/// (`codeop` sets it to tell "more lines needed" from "invalid"). pegen raises
+/// it when the parse fails with the tokenizer at the end of the source
+/// (`_is_end_of_source`): out of tokens with a bracket still open, inside a
+/// triple-quoted string, after a line continuation, or at the ENDMARKER. With
+/// `PyCF_DONT_IMPLY_DEDENT` CPython's tokenizer adds no closing DEDENTs, so a
+/// parse that fails on one of the DEDENTs pythonrs's lexer closes the input
+/// with has failed where CPython's would meet the ENDMARKER (`try:\n  pass`,
+/// `class A:\n  def f(self):`). A failure on the final NEWLINE is not one:
+/// `x = 1 +` and `for x in y` are errors, not incomplete.
+pub fn is_incomplete_input(src: &str) -> bool {
+    let src = crate::rust_ffi::desugar(src);
+    let lexed = match lex(&src) {
+        Ok(lexed) => lexed,
+        Err(e) => {
+            let (head, _) = split_syntax_error(&e);
+            return head.starts_with("SyntaxError: unterminated triple-quoted string literal")
+                || head == "SyntaxError: unexpected EOF while parsing";
+        }
+    };
+    // Inside an open bracket CPython's tokenizer reads no NEWLINE at all, so
+    // the lexer's closing one is part of the end of the input there.
+    let in_bracket = lexed.unclosed.is_some();
+    let mut p = Parser::new(lexed.toks, lexed.deferred, &src);
+    if p.parse_module().is_ok() {
+        return in_bracket;
+    }
+    p.at_end_of_input(in_bracket)
 }
 
 /// Deepest expression tree the parser will build before refusing the source.
@@ -438,6 +569,37 @@ fn spanned(e: Expr, line: u32, start: u32, end: u32, anchor_start: u32, anchor_e
 }
 
 impl Parser {
+    fn new(toks: Vec<Token>, deferred: Option<String>, src: &str) -> Parser {
+        Parser {
+            toks,
+            pos: 0,
+            deferred,
+            depth: 0,
+            in_function: false,
+            loop_depth: 0,
+            nesting: 0,
+            misplaced: None,
+            groups: std::collections::HashMap::new(),
+            lines: src.lines().map(str::to_string).collect(),
+        }
+    }
+
+    /// Whether the parser stands on the run of tokens the lexer closes the
+    /// input with — the DEDENTs and the EOF, and, inside a bracket left open
+    /// (where CPython's tokenizer reads no NEWLINE), the NEWLINE before them.
+    /// A parse that fails there failed where CPython's tokenizer reports the
+    /// end of the source.
+    fn at_end_of_input(&self, in_bracket: bool) -> bool {
+        let mut end = self.toks.len();
+        while end > 0
+            && (matches!(self.toks[end - 1].tok, Tok::Dedent | Tok::Eof)
+                || in_bracket && matches!(self.toks[end - 1].tok, Tok::Newline))
+        {
+            end -= 1;
+        }
+        self.pos >= end
+    }
+
     // ── stack guard ───────────────────────────────────────────────────────
     /// Charge one level of expression nesting. Every caller pairs this with a
     /// `self.depth = saved` on the success path; the error path never restores

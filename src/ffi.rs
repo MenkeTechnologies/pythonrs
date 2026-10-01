@@ -1195,7 +1195,22 @@ fn value_to_py<'py>(
                     .map_err(|e| e.to_string())?;
                 let pargs = marshal_seq(host, py, args)?;
                 let tup = PyTuple::new(py, pargs).map_err(|e| e.to_string())?;
-                ctor.call1(tup).map_err(|e| e.to_string())
+                let exc = ctor.call1(tup).map_err(|e| e.to_string())?;
+                // A parser-raised `SyntaxError`'s `_metadata` is set beside its
+                // `args`, not from them; `traceback`'s keyword-typo hint reads it.
+                let meta = match v {
+                    Value::Obj(id) if crate::host::is_syntax_error_class(class) => host
+                        .func_attrs
+                        .get(id)
+                        .and_then(|attrs| attrs.get("_metadata"))
+                        .filter(|m| !matches!(m, Value::Undef)),
+                    _ => None,
+                };
+                if let Some(meta) = meta {
+                    let pmeta = value_to_py(host, py, meta)?;
+                    exc.setattr("_metadata", pmeta).map_err(|e| e.to_string())?;
+                }
+                Ok(exc)
             }
             // A pythonrs `open()` handle passed into a CPython call
             // (`json.dump(cfg, f)`, `csv.writer(f)`, `csv.DictReader(f)`) is

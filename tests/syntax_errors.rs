@@ -745,6 +745,289 @@ for s in cases:
     );
 }
 
+/// `traceback`'s keyword-typo hint (`_find_keyword_typos`, 3.14): a bare
+/// `invalid syntax` whose source compiles once a name is replaced by a keyword
+/// it resembles points at that name and suggests the keyword. Each program is
+/// run as `-c`; the expectation is CPython's stderr for it. Covered: a typo
+/// fixed into incomplete input (`while x:` at the end, a `def` with no body),
+/// a candidate the full compile rejects (`yield` outside a function, so
+/// `yiel` gets `del`), no fix that compiles (`whille (x:`, a compound
+/// statement after `;`), the ten-name budget, a `Perhaps you forgot a comma`
+/// message, a name written in full-width letters, and the hint inside the
+/// traceback of an `exec`.
+const KEYWORD_TYPOS: &[(&str, &str)] = &[
+    (
+        "whille x: pass",
+        r#"  File "<string>", line 1
+    whille x: pass
+    ^^^^^^
+SyntaxError: invalid syntax. Did you mean 'while'?
+"#,
+    ),
+    (
+        "x = 1\nwhille x:",
+        r#"  File "<string>", line 2
+    whille x:
+    ^^^^^^
+SyntaxError: invalid syntax. Did you mean 'while'?
+"#,
+    ),
+    (
+        "def f():\n  retrun 1",
+        r#"  File "<string>", line 2
+    retrun 1
+    ^^^^^^
+SyntaxError: invalid syntax. Did you mean 'return'?
+"#,
+    ),
+    (
+        "from os improt path",
+        r#"  File "<string>", line 1
+    from os improt path
+            ^^^^^^
+SyntaxError: invalid syntax. Did you mean 'import'?
+"#,
+    ),
+    (
+        "for x inn y: pass",
+        r#"  File "<string>", line 1
+    for x inn y: pass
+          ^^^
+SyntaxError: invalid syntax. Did you mean 'in'?
+"#,
+    ),
+    (
+        "if x:\n    pass\nelsee:\n    pass",
+        r#"  File "<string>", line 3
+    elsee:
+    ^^^^^
+SyntaxError: invalid syntax. Did you mean 'else'?
+"#,
+    ),
+    (
+        "x = 1 iff y else 2",
+        r#"  File "<string>", line 1
+    x = 1 iff y else 2
+          ^^^
+SyntaxError: invalid syntax. Did you mean 'if'?
+"#,
+    ),
+    (
+        "a = b c",
+        r#"  File "<string>", line 1
+    a = b c
+          ^
+SyntaxError: invalid syntax
+"#,
+    ),
+    (
+        "class A:\n  deff f(self):",
+        r#"  File "<string>", line 2
+    deff f(self):
+    ^^^^
+SyntaxError: invalid syntax. Did you mean 'def'?
+"#,
+    ),
+    (
+        "Whille x: pass",
+        r#"  File "<string>", line 1
+    Whille x: pass
+    ^^^^^^
+SyntaxError: invalid syntax. Did you mean 'while'?
+"#,
+    ),
+    (
+        "tru: pass",
+        r#"  File "<string>", line 1
+    tru: pass
+    ^^^
+SyntaxError: invalid syntax. Did you mean 'try'?
+"#,
+    ),
+    (
+        "yiel x",
+        r#"  File "<string>", line 1
+    yiel x
+    ^^^^
+SyntaxError: invalid syntax. Did you mean 'del'?
+"#,
+    ),
+    (
+        "x = Nonee 1",
+        r#"  File "<string>", line 1
+    x = Nonee 1
+              ^
+SyntaxError: invalid syntax
+"#,
+    ),
+    (
+        "whille (x:",
+        r#"  File "<string>", line 1
+    whille (x:
+             ^
+SyntaxError: invalid syntax
+"#,
+    ),
+    (
+        "f\"{a}\" ; whille x: pass",
+        r#"  File "<string>", line 1
+    f"{a}" ; whille x: pass
+                    ^
+SyntaxError: invalid syntax
+"#,
+    ),
+    (
+        "a b c d e f g h i j k l whille x: pass",
+        r#"  File "<string>", line 1
+    a b c d e f g h i j k l whille x: pass
+      ^
+SyntaxError: invalid syntax
+"#,
+    ),
+    (
+        "x = (1,\n2 3)",
+        r#"  File "<string>", line 2
+    2 3)
+    ^^^
+SyntaxError: invalid syntax. Perhaps you forgot a comma?
+"#,
+    ),
+    (
+        "ｗhille x: pass",
+        r#"  File "<string>", line 1
+    ｗhille x: pass
+    ^^^^^^
+SyntaxError: invalid syntax. Did you mean 'while'?
+"#,
+    ),
+    (
+        "exec(\"x=1\\nimprot os\")",
+        r#"Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+    exec("x=1\nimprot os")
+    ~~~~^^^^^^^^^^^^^^^^^^
+  File "<string>", line 2
+    improt os
+    ^^^^^^
+SyntaxError: invalid syntax. Did you mean 'import'?
+"#,
+    ),
+];
+
+#[test]
+fn misspelled_keywords_are_suggested_as_traceback_suggests_them() {
+    for (src, stderr) in KEYWORD_TYPOS {
+        assert_eq!(run_c(src), (stderr.to_string(), 1), "for {src:?}");
+    }
+}
+
+/// `SyntaxError._metadata`: `(0, 0, source)` on an error the tokenizer or the
+/// parser raised — the exec source newline-translated and newline-terminated,
+/// the eval source as given (leading blanks stripped) — `None` on a compiler
+/// or symbol-table error, and the seventh item of the details tuple when
+/// constructed. `traceback.format_exception_only` (CPython's own, across the
+/// bridge) reads it for the keyword hint.
+#[test]
+fn syntax_error_metadata_carries_the_parsed_source() {
+    let out = Command::new(env!("CARGO_BIN_EXE_python"))
+        .args(["-c", r#"
+import traceback
+def meta(f, *a):
+    try:
+        f(*a)
+    except SyntaxError as e:
+        return e._metadata
+print(meta(eval, '1 +* 2\n'))
+print(meta(eval, '  1 +* 2'))
+print(meta(eval, '1 2'))
+print(meta(exec, 'x = 1 +* 2\r\ny'))
+print(meta(exec, 'x = "abc'))
+print(meta(exec, 'match x:\n case a: pass\n case 1: pass'))
+print(meta(exec, 'return 1'))
+print(meta(compile, 'x = (1,\n2 3)', 'f', 'exec'))
+print(meta(compile, '1 2', 'f', 'eval'))
+print(meta(exec, 'def f():\n  global x\n  x = 1\n  nonlocal y'))
+e = SyntaxError('m', ('f', 1, 1, 't', 1, 2, (0, 0, 'src')))
+print(e._metadata, e.args)
+print(SyntaxError('m')._metadata)
+e = SyntaxError('invalid syntax', ('f', 1, 8, 'whille x: pass\n', 1, 9, (0, 0, 'whille x: pass\n')))
+print(''.join(traceback.format_exception_only(e)), end='')
+e = SyntaxError('invalid syntax', ('f', 1, 8, 'whille x: pass\n', 1, 9))
+print(''.join(traceback.format_exception_only(e)), end='')
+try:
+    raise SyntaxError('invalid syntax', ('<x>', 1, 8, 'whille x: pass\n', 1, 9, (0, 0, None)))
+except SyntaxError as e:
+    print(''.join(traceback.format_exception_only(e)), end='')
+"#])
+        .output()
+        .expect("spawn python");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        r#"(0, 0, '1 +* 2\n')
+(0, 0, '1 +* 2')
+(0, 0, '1 2')
+(0, 0, 'x = 1 +* 2\ny\n')
+(0, 0, 'x = "abc\n')
+None
+None
+(0, 0, 'x = (1,\n2 3)\n')
+(0, 0, '1 2')
+None
+(0, 0, 'src') ('m', ('f', 1, 1, 't', 1, 2, (0, 0, 'src')))
+None
+  File "f", line 1
+    whille x: pass
+    ^^^^^^
+SyntaxError: invalid syntax. Did you mean 'while'?
+  File "f", line 1
+    whille x: pass
+           ^
+SyntaxError: invalid syntax
+  File "<x>", line 1
+    whille x: pass
+    ^^^^^^
+SyntaxError: invalid syntax. Did you mean 'while'?
+"#
+    );
+}
+
+/// A line continuation with nothing after it is the tokenizer's end of input
+/// (`unexpected EOF while parsing`, just past the `\`, end -1) unless a
+/// bracket is open; a `\` followed by more of its line is `unexpected
+/// character after line continuation character`; and a bracket left open at
+/// the end of an indented block is reported as never closed, as it is at
+/// module level.
+#[test]
+fn continuation_and_unclosed_bracket_at_end_of_input() {
+    let out = Command::new(env!("CARGO_BIN_EXE_python"))
+        .args(["-c", r#"
+for s in ['x = 1 +\\', 'x = 1\ny = 2 + \\', 'x = 1 + \\\n2 + \\', '\\', 'if x:\n    y = \\', 'x = 1 \\ 2', 'x = (1 + \\', 'x = 1 + \\\n\n', 'x = 1 + \\\r\n', 'def f():\n  retrun (1,', 'def f():\n  f(1,', 'class C:\n  def f(self):\n    x = [1,']:
+    try:
+        compile(s, 's', 'exec')
+        print(repr(s), 'ok')
+    except SyntaxError as e:
+        print(repr(s), e.args)
+"#])
+        .output()
+        .expect("spawn python");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        r#"'x = 1 +\\' ('unexpected EOF while parsing', ('s', 1, 9, 'x = 1 +\\\n', 1, -1))
+'x = 1\ny = 2 + \\' ('unexpected EOF while parsing', ('s', 2, 10, 'y = 2 + \\\n', 2, -1))
+'x = 1 + \\\n2 + \\' ('unexpected EOF while parsing', ('s', 2, 6, '2 + \\\n', 2, -1))
+'\\' ('unexpected EOF while parsing', ('s', 1, 2, '\\\n', 1, -1))
+'if x:\n    y = \\' ('unexpected EOF while parsing', ('s', 2, 10, '    y = \\\n', 2, -1))
+'x = 1 \\ 2' ('unexpected character after line continuation character', ('s', 1, 8, 'x = 1 \\ 2\n', 1, 0))
+'x = (1 + \\' ("'(' was never closed", ('s', 1, 5, 'x = (1 + \\\n', 1, 0))
+'x = 1 + \\\n\n' ('invalid syntax', ('s', 2, 1, '\n', 2, 2))
+'x = 1 + \\\r\n' ('unexpected EOF while parsing', ('s', 1, 10, 'x = 1 + \\\n', 1, -1))
+'def f():\n  retrun (1,' ("'(' was never closed", ('s', 2, 10, '  retrun (1,\n', 2, 0))
+'def f():\n  f(1,' ("'(' was never closed", ('s', 2, 4, '  f(1,\n', 2, 0))
+'class C:\n  def f(self):\n    x = [1,' ("'[' was never closed", ('s', 3, 9, '    x = [1,\n', 3, 0))
+"#
+    );
+}
+
 /// PEP 758 (3.14): `except A, B:` and `except* A, B:` catch any of the listed
 /// types without parentheses (a trailing comma allowed), while `as` still
 /// requires them — CPython's `multiple exception types must be parenthesized

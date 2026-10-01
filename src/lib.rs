@@ -288,7 +288,7 @@ fn render_positioned(head: &str, mut pos: parser::SyntaxPos, src: &str, filename
     if pos.text.is_none() && !filename.starts_with('<') {
         pos.text = pos.lineno.and_then(|l| parser::source_line(src, l, true));
     }
-    format!("{}{head}\n", parser::render_syntax_block(&pos, filename))
+    format!("{}\n", parser::render_syntax_head(&pos, head, filename))
 }
 
 /// How a program run ended: the process exit code plus any text the runtime must

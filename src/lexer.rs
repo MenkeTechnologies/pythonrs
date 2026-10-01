@@ -231,6 +231,40 @@ impl Lexer {
         });
     }
 
+    /// A `\` outside a literal. It must end its line, or it is the
+    /// tokenizer's "unexpected character after line continuation character"
+    /// (positioned on the character after it, end 0); and a line must follow
+    /// it, or the input ran out — exec input always ends in a newline, so a
+    /// `\` at the very end continues onto nothing — which pegen reports as
+    /// "unexpected EOF while parsing" just past the `\`, end -1. Inside an
+    /// open bracket running out is that bracket's error instead.
+    fn line_continuation(&mut self) -> Result<(), String> {
+        let (line, col) = (self.line, (self.pos - self.line_start) as i64);
+        let text = format!("{}\n", self.line_text(line).trim_end_matches('\r'));
+        self.bump(); // `\`
+        match self.peek() {
+            Some('\n') => {
+                self.bump();
+            }
+            Some('\r') => {
+                self.bump();
+                if self.peek() == Some('\n') {
+                    self.bump();
+                }
+            }
+            None => {}
+            Some(_) => {
+                let msg = "SyntaxError: unexpected character after line continuation character";
+                return Err(crate::parser::with_text(crate::parser::at_pos(msg, line, col + 2, line, 0), &text));
+            }
+        }
+        if self.peek().is_none() && self.depth == 0 {
+            let msg = "SyntaxError: unexpected EOF while parsing";
+            return Err(crate::parser::with_text(crate::parser::at_pos(msg, line, col + 2, line, -1), &text));
+        }
+        Ok(())
+    }
+
     fn run(&mut self) -> Result<(), String> {
         let mut at_line_start = true;
         loop {
@@ -278,17 +312,7 @@ impl Lexer {
                         self.bump();
                     }
                 }
-                Some('\\') if self.peek2() == Some('\n') => {
-                    self.bump();
-                    self.bump();
-                }
-                Some('\\') if self.peek2() == Some('\r') => {
-                    self.bump();
-                    self.bump();
-                    if self.peek() == Some('\n') {
-                        self.bump();
-                    }
-                }
+                Some('\\') => self.line_continuation()?,
                 Some(_) => self.scan_token()?,
             }
         }

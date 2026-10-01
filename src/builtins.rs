@@ -4007,8 +4007,9 @@ fn b_match_class(vm: &mut VM, argc: u8) -> Value {
 }
 
 /// The attributes `SyntaxError_init` (Objects/exceptions.c) gives every
-/// `SyntaxError`, in the order the details tuple fills them.
-const SYNTAX_ERROR_ATTRS: [&str; 8] = [
+/// `SyntaxError`, in the order the details tuple fills them (`_metadata` is
+/// its optional seventh item).
+const SYNTAX_ERROR_ATTRS: [&str; 9] = [
     "msg",
     "filename",
     "lineno",
@@ -4016,17 +4017,18 @@ const SYNTAX_ERROR_ATTRS: [&str; 8] = [
     "text",
     "end_lineno",
     "end_offset",
+    "_metadata",
     "print_file_and_line",
 ];
 
 /// `SyntaxError(msg, (filename, lineno, offset, text[, end_lineno, end_offset]))`:
 /// every attribute starts `None`; `msg` is the first argument; with exactly two
-/// arguments the second is unpacked (any iterable of 4 to 7 items — a seventh,
-/// CPython's private `_metadata`, is accepted and dropped). `args` itself is
+/// arguments the second is unpacked (any iterable of 4 to 7 items — a seventh
+/// is CPython's private `_metadata`). `args` itself is
 /// left as passed. pythonrs bound none of these, so `e.lineno` / `e.msg` raised
 /// `AttributeError` inside the handler that was reading them.
 fn syntax_error_init(e: &Value, args: &[Value]) -> Result<(), String> {
-    let mut vals: [Value; 8] = std::array::from_fn(|_| Value::Undef);
+    let mut vals: [Value; 9] = std::array::from_fn(|_| Value::Undef);
     if let Some(m) = args.first() {
         vals[0] = m.clone();
     }
@@ -4044,7 +4046,7 @@ fn syntax_error_init(e: &Value, args: &[Value]) -> Result<(), String> {
                 info.len()
             )));
         }
-        for (slot, v) in vals[1..].iter_mut().zip(info.into_iter().take(6)) {
+        for (slot, v) in vals[1..].iter_mut().zip(info.into_iter().take(7)) {
             *slot = v;
         }
     }
@@ -4226,7 +4228,7 @@ fn synth_exc(h: &mut host::PyHost, err: &str) -> Value {
     // `lineno`, and the text before it is `msg`, so `str(e)` renders unchanged.
     if host::is_syntax_error_class(&class) {
         let (text, lineno) = split_line_suffix(&msg);
-        let mut vals: [Value; 8] = std::array::from_fn(|_| Value::Undef);
+        let mut vals: [Value; 9] = std::array::from_fn(|_| Value::Undef);
         if !msg.is_empty() {
             vals[0] = h.new_str(text.to_string());
         }
@@ -4241,6 +4243,10 @@ fn synth_exc(h: &mut host::PyHost, err: &str) -> Value {
             vals[4] = p.text.clone().map_or(Value::Undef, |t| h.new_str(t));
             vals[5] = int(p.end_lineno);
             vals[6] = int(p.end_offset);
+            if let Some(m) = &p.metadata {
+                let source = m.source.clone().map_or(Value::Undef, |s| h.new_str(s));
+                vals[7] = h.new_tuple(vec![Value::Int(m.lineno), Value::Int(m.offset), source]);
+            }
             // `args` is `(msg, (filename, lineno, offset, text, end_lineno,
             // end_offset))`, the shape `SyntaxError_init` unpacks — except for
             // one the symbol table raised, which CPython builds from the message
@@ -7617,10 +7623,7 @@ fn run_pysource(want_value: bool, args: &[Value]) -> Result<Value, String> {
     // series, or a bare newline after an operator is a SyntaxError — the wrapper's
     // parens below would otherwise make some of those parse.
     if want_value {
-        crate::parser::parse(src.trim()).map_err(|e| {
-            crate::parser::with_filename(crate::parser::for_eval_input(e, src.trim()), &filename)
-        })?;
-        crate::parser::check_eval_input(src.trim())
+        crate::parser::check_eval_source(&src)
             .map_err(|e| crate::parser::with_filename(e, &filename))?;
     }
     // Bind the (validated) expression to a temporary so its value can be read back.
@@ -7860,10 +7863,7 @@ fn builtin_compile(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, 
     }
     let named = |e: String| crate::parser::with_filename(e, &filename);
     if mode == "eval" {
-        let trimmed = source.trim();
-        crate::parser::parse(trimmed)
-            .map_err(|e| named(crate::parser::for_eval_input(e, trimmed)))?;
-        crate::parser::check_eval_input(trimmed).map_err(named)?;
+        crate::parser::check_eval_source(&source).map_err(named)?;
     } else {
         crate::compile(&source).map_err(named)?;
     }
@@ -15992,7 +15992,7 @@ fn is_line_boundary(c: char) -> bool {
 /// CPython `str.splitlines(keepends)`: split at Unicode line boundaries, joining
 /// `\r\n` into a single break. A trailing boundary does not yield a final empty
 /// line. With `keepends`, the boundary character(s) stay attached to their line.
-fn str_splitlines(s: &str, keepends: bool) -> Vec<String> {
+pub(crate) fn str_splitlines(s: &str, keepends: bool) -> Vec<String> {
     let mut out = Vec::new();
     let chars: Vec<char> = s.chars().collect();
     let mut start = 0;
@@ -16717,7 +16717,7 @@ fn to_titlecase(ch: char) -> String {
 /// CPython `str.isspace` / `Py_UNICODE_ISSPACE`: Rust's `White_Space` set plus
 /// the four ASCII information separators U+001C..U+001F, which CPython counts as
 /// whitespace (bidirectional category B/S) but Rust does not.
-fn is_py_space(c: char) -> bool {
+pub(crate) fn is_py_space(c: char) -> bool {
     c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
 }
 

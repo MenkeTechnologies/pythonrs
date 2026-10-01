@@ -34,6 +34,34 @@ written.
   `PyNumber_Index` does. Every other instance keeps the slotless proxy, since
   CPython probes that slot (`PyIndex_Check`) to choose a path — `bytes(x)`
   takes a length from an index-able `x`.
+- **"Did you mean" for a misspelled keyword on a `SyntaxError`.** 3.14's
+  `traceback` (`TracebackException._find_keyword_typos`) turns a bare
+  `invalid syntax` (or `Perhaps you forgot a comma`) into `invalid syntax.
+  Did you mean 'while'?`, carets on the misspelled name, when replacing one
+  of the first ten non-keyword names before the error with a keyword it
+  resembles makes the source compile or merely incomplete; pythonrs never
+  did. `suggest::keyword_typo` ports it, with `difflib.get_close_matches`
+  (`SequenceMatcher` with autojunk), `textwrap.dedent`, the `_suggestions`
+  distance already used for `NameError`, and `codeop`'s acceptance test —
+  a full compile, or `parser::is_incomplete_input`, pegen's
+  `_IncompleteInputError` (the parse fails having reached the end of the
+  source). It runs for a program that does not compile, for an uncaught
+  `SyntaxError` object, and — because the parser now records `_metadata`
+  as `(0, 0, source)` (exec input newline-translated and newline-terminated,
+  eval input as given), it crosses the bridge, and `SyntaxError(msg,
+  details)` keeps a seventh details item as `_metadata` instead of dropping
+  it — for CPython's own `traceback.format_exception_only`.
+- **A line continuation at the end of input, or followed by more of its
+  line.** `x = 1 + \` with nothing after it was `invalid syntax` at the `\`;
+  CPython's tokenizer reports `unexpected EOF while parsing` just past it
+  (end offset -1), or the open bracket's `was never closed` inside one. A
+  `\` followed by anything but the line break is the tokenizer's `unexpected
+  character after line continuation character` (pythonrs: `invalid
+  syntax`).
+- **A bracket left open at the end of an indented block is `never closed`.**
+  `def f():\n  f(1,` reported `invalid syntax` at the last token, because
+  the lexer's closing DEDENTs hid that the parser had reached the end of the
+  input; the end is now the whole closing run of NEWLINE/DEDENT/EOF tokens.
 - **A memoryview's hash is cached.** `memory_hash` stores the number on the
   view and reads it before the released check, so a view hashed while live keeps
   hashing — and keeps finding itself as a dict key — after `release()`.
@@ -2029,9 +2057,13 @@ written.
   regression needs a resolve-first opcode that leaves `recv`/`name` on the stack
   when the type answers the name natively and only materializes a callable when
   the lookup would run user code.
-- **No "did you mean" suggestions on a `SyntaxError`.** The `NameError` and
-  `AttributeError` hints are implemented (see below); CPython also suggests a
-  keyword for some `SyntaxError`s, which pythonrs does not.
+- **The `SyntaxError` keyword hint does not see names inside f-strings.**
+  `_find_keyword_typos` walks `tokenize`'s NAME tokens, and since 3.12 those
+  include the names in an f-string's replacement fields; pythonrs's lexer
+  keeps an f-string as one token, so those names neither use up the
+  ten-name budget nor get tried themselves. `x = f"{a}{b}{c}{d}{e}{f}{g}{h}{i}{j}"`
+  followed by `whille x: pass` gets `Did you mean 'while'?` here and no hint
+  in CPython, whose budget the ten field names exhausted.
 - **A `collections.deque` subclass has no deque behaviour.** `class D(deque)`
   instances carry no native deque payload (`builtin_base_of` knows `list`,
   `dict`, `str`, `int`, `float`, `tuple`, `set` and `frozenset` only), so

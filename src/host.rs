@@ -5620,17 +5620,43 @@ impl PyHost {
             filename: self.as_str(&attr("filename")).map(|s| s.to_string()),
             no_source: false,
             bare_args: false,
+            metadata: self.syntax_metadata(&attr("_metadata")),
         };
         let msg = match attr("msg") {
             Value::Undef => "<no detail available>".to_string(),
             m => self.str_of(&m),
         };
-        let block = if pos.lineno.is_some() {
-            crate::parser::render_syntax_block(&pos, "<string>")
-        } else {
-            String::new()
-        };
+        if pos.lineno.is_none() {
+            return Some((String::new(), format!("{class}: {msg}")));
+        }
+        let (block, msg) = crate::parser::render_syntax_error(&pos, &msg, "<string>");
         Some((block, format!("{class}: {msg}")))
+    }
+
+    /// A `SyntaxError._metadata` value as `traceback` unpacks it — `line,
+    /// offset, source = self._exc_metadata` — or `None` when it is falsy or
+    /// does not unpack that way: the unpacking then raises inside the
+    /// `suppress(Exception)` around the keyword-typo search, which suggests
+    /// nothing.
+    fn syntax_metadata(&self, v: &Value) -> Option<crate::parser::SyntaxMetadata> {
+        let Some(PyObj::Tuple(items)) = self.get(v) else {
+            return None;
+        };
+        let [Value::Int(lineno), offset, source] = &items[..] else {
+            return None;
+        };
+        let source = match source {
+            Value::Undef => None,
+            s => Some(self.as_str(s)?.to_string()),
+        };
+        Some(crate::parser::SyntaxMetadata {
+            lineno: *lineno,
+            offset: match offset {
+                Value::Int(o) => *o,
+                _ => 0,
+            },
+            source,
+        })
     }
 
     fn syntax_error_str(&self, v: &Value) -> String {
@@ -17437,8 +17463,7 @@ impl PyHost {
             .as_ref()
             .is_some_and(|e| self.syntax_error_block(e).is_some());
         if let (Some(pos), false) = (syntax_pos, exc_is_syntax) {
-            let block = crate::parser::render_syntax_block(&pos, "<string>");
-            let final_line = format!("{block}{err}");
+            let final_line = crate::parser::render_syntax_head(&pos, err, "<string>");
             let final_line = final_line.trim_end_matches('\n');
             self.render_exc_block(None, &final_frames, final_line, &mut ctx, &mut out);
             return out;
