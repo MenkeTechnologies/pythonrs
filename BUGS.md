@@ -9,6 +9,19 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **A `--build` binary runs, and reports an error the VM raised itself.** The
+  runner deserialized fusevm's embedded chunk without stripping its format tag
+  (`AOT_CHUNK_MAGIC`), so every built binary failed with `corrupt embedded
+  chunk` or hung allocating; and an error a native fast-path op raised (`int +
+  str`) sat in fusevm's run result rather than on the host, so the binary
+  exited 0 with no traceback. It now strips the tag (refusing a binary built by
+  another fusevm, as fusevm's own runner does), takes the result
+  (`VM::take_aot_result`), records the failing op's line and caret as the
+  interpreter does, and prints the traceback with exit status 1.
+- **A failing unary operator names its line.** `-x`, `+x` and `~x` were
+  emitted with line 0, so `z = -"s"` reported `File "<string>", line 0, in
+  <module>` with no source line or caret; they now carry their statement's
+  line as binary operators do.
 - **Deep source is measured as CPython measures it.** pythonrs bounded every
   shape with one tree-depth cap (`MAX_TREE_DEPTH`, 20 000) calibrated for the
   512 MB interpreter thread, reported everything as the parser's `MemoryError`,
@@ -2259,13 +2272,9 @@ measured inside it, recorded so the next round does not re-derive them.
   `File`/source line + CPython carets — and exits non-zero (the embedded image
   carries the source, filename, and caret position tables, and the binary
   recomputes each chunk's serde-skipped `op_hash` so caret lookups hit).
-  `sys.exit(n)` returns `n`. Two limits: (1) a `stdlib-ffi` build cannot AOT (its
+  `sys.exit(n)` returns `n`. A `stdlib-ffi` build cannot AOT (its
   CPython/pyo3 symbols can't be statically linked into a standalone binary — the
-  build fails up front with that instruction); (2) an error from a **native
-  fast-path op** (`int + str`, unary `-` on a bad type) is held in fusevm's
-  private AOT result rather than on the host, so it exits silently instead of
-  printing a traceback — every builtin-dispatched error (index/key/type-via-
-  method/name/division/attribute) renders correctly.
+  build fails up front with that instruction).
 - **`--dap`** (Debug Adapter Protocol): implemented — breakpoints, step
   in/out/over/continue, stack trace, locals, and program-stdout capture (pipe +
   dup2 → `output` events). Frame names in the stack use the function name (or

@@ -3408,7 +3408,9 @@ impl Compiler {
         match op {
             UnOp::Neg => {
                 self.compile_expr(b, e)?;
-                let idx = b.emit(Op::Negate, 0);
+                // The raising op carries its statement's line, as a binary op
+                // does: with 0 the traceback named `line 0` and showed no source.
+                let idx = b.emit(Op::Negate, self.cur_line);
                 self.record_span(idx);
             }
             UnOp::Not => {
@@ -3418,13 +3420,13 @@ impl Compiler {
             UnOp::Invert => {
                 b.emit(Op::LoadInt(unop::INVERT), 0);
                 self.compile_expr(b, e)?;
-                let idx = b.emit(Op::CallBuiltin(ops::UNARY, 2), 0);
+                let idx = b.emit(Op::CallBuiltin(ops::UNARY, 2), self.cur_line);
                 self.record_span(idx);
             }
             UnOp::Pos => {
                 b.emit(Op::LoadInt(unop::POS), 0);
                 self.compile_expr(b, e)?;
-                let idx = b.emit(Op::CallBuiltin(ops::UNARY, 2), 0);
+                let idx = b.emit(Op::CallBuiltin(ops::UNARY, 2), self.cur_line);
                 self.record_span(idx);
             }
         }

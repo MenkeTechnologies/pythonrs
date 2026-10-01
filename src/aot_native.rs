@@ -217,8 +217,8 @@ pub unsafe extern "C" fn fusevm_aot_register_builtins(vm: *mut VM) {
 /// The AOT entry the emitted `main` calls: run the embedded chunk, then surface
 /// an uncaught pythonrs exception the way the interpreter does — a rendered
 /// traceback (with carets) to stderr and a non-zero exit — rather than fusevm's
-/// generic runner, which only reports NATIVE VM errors and silently drops a
-/// pythonrs error left on the host.
+/// generic runner, which reports a NATIVE VM error as a bare `fusevm aot:` line
+/// and silently drops a pythonrs error left on the host.
 ///
 /// # Safety
 /// Relies on the fusevm-emitted `fusevm_aot_chunk_blob`/`_len`/`fusevm_aot_entry`
@@ -234,7 +234,18 @@ pub extern "C" fn pythonrs_aot_run_embedded() -> i64 {
     let mut chunk: Chunk = unsafe {
         let len = fusevm_aot_chunk_len as usize;
         let bytes = std::slice::from_raw_parts(&fusevm_aot_chunk_blob as *const u8, len);
-        match bincode::deserialize(bytes) {
+        // The blob is fusevm's chunk-format tag followed by the bincode chunk
+        // (`fusevm::aot::embed_chunk`); bincode reading the tag as data either
+        // fails or runs away allocating.
+        let Some(body) = bytes.strip_prefix(fusevm::aot::AOT_CHUNK_MAGIC.as_slice()) else {
+            eprintln!(
+                "pythonrs aot: this binary was built by a different fusevm — expected chunk \
+                 format {}; rebuild it",
+                String::from_utf8_lossy(fusevm::aot::AOT_CHUNK_MAGIC)
+            );
+            return 1;
+        };
+        match bincode::deserialize(body) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("pythonrs aot: corrupt embedded chunk: {e}");
@@ -250,6 +261,17 @@ pub extern "C" fn pythonrs_aot_run_embedded() -> i64 {
     unsafe { fusevm_aot_register_builtins(&mut vm as *mut VM) };
     // SAFETY: the compiled entry has the declared C ABI and reads `vm`.
     unsafe { fusevm_aot_entry(&mut vm as *mut VM) };
+    // An op the VM itself raised from (`int + str` on the native fast path,
+    // after a deopt) leaves its error in the run's result, not on the host:
+    // record its line and caret the way `host::finish_run` does for the
+    // interpreter, and report it as the program's uncaught error.
+    let native_error = match vm.take_aot_result() {
+        fusevm::VMResult::Error(e) => {
+            crate::builtins::record_err_line(&vm);
+            Some(e)
+        }
+        _ => None,
+    };
 
     // A pythonrs error (`IndexError`, `TypeError`, `NameError`, `sys.exit`, …) is
     // left on the host by `builtins::abort`; render it like the interpreter (a
@@ -259,7 +281,7 @@ pub extern "C" fn pythonrs_aot_run_embedded() -> i64 {
     // way `_PyRun_SimpleFile` flushes them: buffered stdout before the report,
     // and everything again at exit.
     crate::stdio::flush_io();
-    let code = match host::with_host(|h| h.take_error()) {
+    let code = match host::with_host(|h| h.take_error()).or(native_error) {
         None => 0,
         Some(e) => match host::classify_top_error(&e) {
             host::TopExit::SystemExit { code, message } => {

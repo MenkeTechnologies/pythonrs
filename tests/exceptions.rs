@@ -145,3 +145,33 @@ out.append([c.__name__ for c in re.error.__mro__])
         r#"["MyErr('m')", ("PatternError('m')", ('m',), 'm', None, None, None, None), ("PatternError('m at position 4 (line 2, column 2)')", ('m at position 4 (line 2, column 2)',), 'm', 'ab\ncd', 4, 2, 2), ("PatternError('m at position 4 (line 2, column 2)')", ('m at position 4 (line 2, column 2)',), 'm', b'ab\ncd', 4, 2, 2), ("PatternError('m at position 1')", ('m at position 1',), 'm', 'abc', 1, 1, 2), ("PatternError('m')", ('m',), 'm', None, 3, None, None), ('m at position 2',), True, ['PatternError', 'Exception', 'BaseException', 'object']]"#
     );
 }
+
+/// `python -c src`'s stderr.
+fn stderr_of(src: &str) -> String {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_python"))
+        .args(["-c", src])
+        .env("PYTHONRS_CACHE", "0")
+        .output()
+        .expect("spawn python");
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+/// A unary operator that raises names its line and underlines its operand, as
+/// a binary one does. The op was emitted with line 0, so the traceback read
+/// `File "<string>", line 0, in <module>` with no source line under it. The
+/// expected text is CPython 3.14.8's.
+#[test]
+fn a_failing_unary_operator_names_its_line() {
+    assert_eq!(
+        stderr_of("z = -\"s\""),
+        "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n    \
+         z = -\"s\"\n        ^^^^\nTypeError: bad operand type for unary -: 'str'\n"
+    );
+    assert_eq!(
+        stderr_of("def f(s):\n    return ~s\nf(\"x\")"),
+        "Traceback (most recent call last):\n  File \"<string>\", line 3, in <module>\n    \
+         f(\"x\")\n    ~^^^^^\n  File \"<string>\", line 2, in f\n    return ~s\n           \
+         ^^\nTypeError: bad operand type for unary ~: 'str'\n"
+    );
+    assert!(stderr_of("z = +[1]").contains("line 1, in <module>\n    z = +[1]\n        ^^^^\n"));
+}
