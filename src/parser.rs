@@ -16,8 +16,15 @@ const KEYWORDS: &[&str] = &[
     "with", "yield",
 ];
 
-fn is_keyword(s: &str) -> bool {
+pub(crate) fn is_keyword(s: &str) -> bool {
     KEYWORDS.contains(&s)
+}
+
+/// The soft keywords: names everywhere except where the grammar asks for the
+/// literal spelling (`match` / `case` statements, the `type` alias statement,
+/// the `_` wildcard pattern).
+pub(crate) fn is_soft_keyword(s: &str) -> bool {
+    matches!(s, "match" | "case" | "type" | "_")
 }
 
 /// Parse a full module into a list of statements. Inline `rust { ... }` FFI
@@ -549,9 +556,22 @@ impl Parser {
             self.advance();
         }
     }
+    /// The current token is an identifier (not a reserved word): what
+    /// [`Self::expect_name`] would accept.
+    fn at_identifier(&self) -> bool {
+        match self.cur() {
+            Tok::Name(n) => !is_keyword(n),
+            Tok::Ident(_) => true,
+            _ => false,
+        }
+    }
     fn expect_name(&mut self) -> Result<String, String> {
         match self.cur().clone() {
             Tok::Name(n) if !is_keyword(&n) => {
+                self.advance();
+                Ok(n)
+            }
+            Tok::Ident(n) => {
                 self.advance();
                 Ok(n)
             }
@@ -1714,13 +1734,18 @@ impl Parser {
         if self.eat_op("(") {
             let mut order = ArgOrder::default();
             while !self.at_op(")") {
-                if self.eat_op("**") {
+                // `class C(*bases)`: the base list is built at run time, as
+                // a call's `*iterable` argument is.
+                if self.eat_op("*") {
+                    order.star()?;
+                    bases.push(Expr::Starred(Box::new(self.parse_expr()?)));
+                } else if self.eat_op("**") {
                     order.kw_unpack = true;
                     keywords.push(Keyword {
                         name: None,
                         value: self.parse_expr()?,
                     });
-                } else if matches!(self.cur(), Tok::Name(n) if !is_keyword(n))
+                } else if self.at_identifier()
                     && matches!(&self.toks[self.pos + 1].tok, Tok::Op(o) if o == "=")
                 {
                     order.keyword = true;
@@ -2020,8 +2045,10 @@ impl Parser {
             return Ok(p);
         }
         // Name-based: capture, wildcard, dotted value, or class pattern.
+        // Only the literal spelling `_` is the wildcard; `＿` captures `_`.
+        let wildcard = self.at_kw("_");
         let name = self.expect_name()?;
-        if name == "_" {
+        if wildcard {
             return Ok(Pattern::Wildcard);
         }
         // Build a (possibly dotted) value expression.
@@ -2109,7 +2136,7 @@ impl Parser {
         let mut kw = Vec::new();
         while !self.at_op(")") {
             // keyword sub-pattern: name=pattern
-            if matches!(self.cur(), Tok::Name(n) if !is_keyword(n))
+            if self.at_identifier()
                 && matches!(&self.toks[self.pos + 1].tok, Tok::Op(o) if o == "=")
             {
                 let kn = self.expect_name()?;
@@ -2657,7 +2684,7 @@ impl Parser {
                     name: None,
                     value: self.parse_expr()?,
                 });
-            } else if matches!(self.cur(), Tok::Name(n) if !is_keyword(n))
+            } else if self.at_identifier()
                 && matches!(&self.toks[self.pos + 1].tok, Tok::Op(o) if o == "=")
             {
                 order.keyword = true;
@@ -2817,6 +2844,11 @@ impl Parser {
                     // traceback underlines exactly the name.
                     _ => Ok(spanned(Expr::Name(n), nl, nc, ne, 0, 0)),
                 }
+            }
+            Tok::Ident(n) => {
+                let (nl, nc, ne) = (self.line(), self.col(), self.cur_end_col());
+                self.advance();
+                Ok(spanned(Expr::Name(n), nl, nc, ne, 0, 0))
             }
             Tok::Op(o) => match o.as_str() {
                 "(" => self.parse_paren(),

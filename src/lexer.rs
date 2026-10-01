@@ -12,6 +12,11 @@
 #[derive(Debug, Clone, PartialEq)]
 pub enum Tok {
     Name(String),
+    /// A non-ASCII identifier whose NFKC form spells a keyword or soft keyword
+    /// (`ｉｆ`, `ｍatch`). CPython recognizes keywords by the token's raw
+    /// spelling and normalizes only afterwards, so this is always a plain name
+    /// (`ｉｆ = 1` binds `if`) and never starts a statement or a pattern.
+    Ident(String),
     Int(i64),
     /// Integer literal too wide for `i64`, kept as decimal text.
     BigInt(String),
@@ -415,7 +420,27 @@ impl Lexer {
                 break;
             }
         }
-        self.push(Tok::Name(s));
+        // PEP 3131: a non-ASCII identifier is NFKC-normalized once tokenized
+        // (CPython's `_PyPegen_new_identifier`), so `ﬁ` and `fi` are one name.
+        // Keyword recognition has already used the raw spelling; see `Ident`.
+        if s.is_ascii() {
+            self.push(Tok::Name(s));
+        } else {
+            use unicode_normalization::UnicodeNormalization;
+            let norm: String = s.nfkc().collect();
+            // CPython's AST validator refuses an identifier spelling a constant
+            // (`Ｎｏｎｅ`), whatever position it is in.
+            if matches!(norm.as_str(), "None" | "True" | "False") {
+                return Err(format!(
+                    "ValueError: identifier field can't represent '{norm}' constant"
+                ));
+            }
+            if crate::parser::is_keyword(&norm) || crate::parser::is_soft_keyword(&norm) {
+                self.push(Tok::Ident(norm));
+            } else {
+                self.push(Tok::Name(norm));
+            }
+        }
         Ok(())
     }
 

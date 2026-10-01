@@ -25,6 +25,16 @@ written.
   parser records each group's inner position and `Parser::binop_tail` applies the
   rule for every binary operator; a tuple display or a group followed by more of
   the operand keeps the bare operator, as in CPython.
+- **Identifiers are NFKC-normalized (PEP 3131).** The lexer folds every
+  non-ASCII identifier to NFKC, as CPython's `_PyPegen_new_identifier` does, so
+  `ﬁ = 3` binds `fi` and `def ｆ()` defines `f`. Keywords are still recognized
+  by the raw spelling first: `ｉｆ = 1` binds the name `if`, `ｍatch x:` is not a
+  match statement, and `Ｎｏｎｅ` raises CPython's `ValueError: identifier field
+  can't represent 'None' constant`.
+- **A starred class base spreads at run time.** `class C(*bases)` raised
+  `SyntaxError: invalid syntax`; the class header now takes `*iterable` with the
+  call's ordering rules, and the base list is built as a list display is, so a
+  starred base spreads and an oversized base list is chunked.
 - **`itertools.groupby` is lazy.** It drained its input and built every group
   as a list up front, so it never returned on an infinite iterator
   (`groupby(count(), key=…)`), each group was a `list` instead of an
@@ -1309,9 +1319,6 @@ written.
   (`~~~~~~~~~^^`) where CPython carets the attribute (`^^^^^^^^^`), and the
   arguments are evaluated before the failed lookup; a nested unpacking target
   (`a, (b, c) = 1, (2,)`) carets the outer target, CPython the inner one.
-- **Identifiers are not NFKC-normalized.** CPython folds every identifier to
-  NFKC, so `ﬁ = 3` binds `fi`; pythonrs keeps the spelling as written, so the
-  ligature and the plain letters are two different names.
 - **`m.lastindex` / `m.lastgroup` pick the last participating group by
   number.** CPython's is the group that CLOSED last, so for nested groups
   (`((a)b)`) it names the outer one (1) where pythonrs names the inner (2).
@@ -1715,12 +1722,6 @@ written.
   objects, which is what makes `[P(1)] == [P(1)]` and `[x] == [x]` correct for
   everything with a heap identity.
 
-- **A starred class base is rejected.** `class C(*bases): pass` is valid Python —
-  CPython builds the base list at run time — but the class-definition argument
-  loop has no `*` branch at all, so it stops with `SyntaxError: invalid syntax`.
-  The call loop handles `f(*b)` already; the class loop needs the same branch
-  plus a compiler that builds the base tuple dynamically rather than from a
-  fixed `Vec<Expr>`.
 - **`argparse` orders its usage block after the program's own output, and does
   not quote invalid choices.** `examples/argparse_demo.py` prints the
   `usage: …` / `tool: error: argument --mode: invalid choice: …` block AFTER the

@@ -2370,11 +2370,9 @@ impl Compiler {
                 b.emit(Op::LoadUndef, 0);
             }
         }
-        // bases list
-        for base in bases {
-            self.compile_expr(b, base)?;
-        }
-        b.emit(Op::CallBuiltin(ops::MKLIST, argc(bases.len())?), 0); // [meta, bases]
+        // The bases list is built exactly as a list display is: a `*iterable`
+        // base spreads at run time and an oversized base list is chunked.
+        self.compile_expr(b, &Expr::List(bases.to_vec()))?; // [meta, bases]
         self.name_const(b, name); // [meta, bases, name]
         self.emit_make_func(b, def_id, &empty)?; // [meta, bases, name, bodyfunc]
                                                  // The remaining (non-`metaclass`) class keywords become a dict passed to

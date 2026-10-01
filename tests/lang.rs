@@ -8964,3 +8964,52 @@ TypeError: 'NoneType' object cannot be interpreted as an integer
 "##
     );
 }
+
+// `class C(*bases)` builds its base list at run time, as a call's `*iterable`
+// argument is; expected values are CPython 3.14's.
+#[test]
+fn starred_class_bases_spread_at_run_time() {
+    let src = "class A: pass\n\
+               class B: pass\n\
+               bs = (A, B)\n\
+               class C(*bs, metaclass=type): pass\n\
+               class D(*[], *(A,)): pass\n\
+               class E(*iter([B])): pass\n\
+               x = ([k.__name__ for k in C.__mro__], D.__bases__ == (A,), E.__bases__ == (B,))";
+    assert_eq!(g(src, "x"), "(['C', 'A', 'B', 'object'], True, True)");
+    assert_eq!(
+        pythonrs::eval_str("class C(**{}, *()): pass").unwrap_err(),
+        "SyntaxError: iterable argument unpacking follows keyword argument unpacking"
+    );
+}
+
+// PEP 3131: every non-ASCII identifier is NFKC-normalized, so a ligature or a
+// fullwidth spelling is the same name as its plain form — but keywords are
+// recognized by the RAW spelling first, so `ｉｆ` is the name `if`. Expected
+// values are CPython 3.14's.
+#[test]
+fn identifiers_are_nfkc_normalized() {
+    assert_eq!(g("\u{fb01} = 3\nx = fi", "x"), "3");
+    assert_eq!(
+        g("def \u{ff46}(\u{fb01}=1): return fi\nx = (\u{ff46}.__name__, f(fi=5))", "x"),
+        "('f', 5)"
+    );
+    assert_eq!(
+        g("class K:\n    \u{fb00} = 2\nx = (K.ff, getattr(K, '\u{fb00}', 'no'))", "x"),
+        "(2, 'no')"
+    );
+    assert_eq!(g("\u{ff49}\u{ff46} = 1\nx = globals()['if']", "x"), "1");
+    assert_eq!(
+        g("def f(\u{ff49}\u{ff46}=1): return \u{ff49}\u{ff46}\nx = f(**{'if': 4})", "x"),
+        "4"
+    );
+    // A normalized soft keyword is a plain name: `ｍatch x:` is not a statement.
+    assert_eq!(g("\u{ff4d}atch = 3\nx = match", "x"), "3");
+    assert!(pythonrs::eval_str("x = 1\n\u{ff4d}atch x:\n    case 1: pass\n")
+        .unwrap_err()
+        .starts_with("SyntaxError: invalid syntax"));
+    assert_eq!(
+        pythonrs::eval_str("\u{ff2e}\u{ff4f}\u{ff4e}\u{ff45} = 1").unwrap_err(),
+        "ValueError: identifier field can't represent 'None' constant"
+    );
+}

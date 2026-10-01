@@ -167,6 +167,9 @@ num-complex = "0.4"
 pyo3 = { version = "0.24", features = ["abi3-py39", "auto-initialize"], optional = true }
 unicode_names2 = "3.1.0"
 unicode-general-category = "1.1.0"
+# PEP 3131 NFKC identifier normalization in the lexer (CPython folds every
+# non-ASCII identifier with `unicodedata.normalize("NFKC", …)`).
+unicode-normalization = "0.1"
 
 [features]
 # stdlib-ffi is ON by default so `import os` (and the rest of the CPython stdlib)
