@@ -2248,11 +2248,14 @@ impl Compiler {
         if symtable {
             return crate::symtable::symtable_error(&msg, pos);
         }
+        // `sp` is in characters; the compile entry turns it into the byte
+        // columns `_PyCompile_Error` reports (`parser::with_byte_columns`).
         let (l, c, el, ec) = pos;
         format!(
-            "{}{}nosrc=1",
+            "{}{}nosrc=1{}",
             crate::parser::at_pos(&msg, l, c as i64, el, ec as i64),
-            crate::parser::SYNTAX_FIELD
+            crate::parser::SYNTAX_FIELD,
+            crate::parser::CHAR_COLUMNS
         )
     }
 

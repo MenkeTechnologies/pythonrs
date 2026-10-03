@@ -183,6 +183,61 @@ pub fn at_pos(msg: &str, lineno: u32, offset: i64, end_lineno: u32, end_offset: 
     format!("{msg}{SYNTAX_FIELD}pos={lineno}:{offset}:{end_lineno}:{end_offset}")
 }
 
+/// The trailer field marking a compiler or symbol-table error whose position
+/// was measured in characters (a [`crate::ast::Span`]) and still has to be
+/// turned into the UTF-8 byte columns CPython reports. See
+/// [`with_byte_columns`].
+pub const CHAR_COLUMNS: &str = "\u{1}charcols=1";
+
+/// Character column `col` (0-based) of `text` as a UTF-8 byte column. A
+/// column past the end of the line (an error positioned after its last
+/// character) moves one byte per column there.
+pub fn byte_column(text: &str, col: u32) -> u32 {
+    let mut chars = 0;
+    let mut bytes = 0;
+    for c in text.chars().take(col as usize) {
+        chars += 1;
+        bytes += c.len_utf8() as u32;
+    }
+    bytes + (col - chars)
+}
+
+/// Turn the character position of a compiler or symbol-table error marked
+/// [`CHAR_COLUMNS`] into byte columns, reading its lines from `src`, the
+/// source it was compiled from. `_PyCompile_Error` and the symbol table's
+/// `PyErr_RangedSyntaxLocationObject` report a node's `col_offset + 1`, and
+/// `col_offset` is a UTF-8 byte column — unlike a parser error, which pegen
+/// converts to characters — so `'yield' outside function` after `"éé"` is two
+/// columns further right per accented letter. An error with no mark is
+/// returned as is.
+pub fn with_byte_columns(err: String, src: &str) -> String {
+    let Some(at) = err.find(CHAR_COLUMNS) else {
+        return err;
+    };
+    let mut err = err;
+    err.replace_range(at..at + CHAR_COLUMNS.len(), "");
+    let Some(field) = err.find("\u{1}pos=") else {
+        return err;
+    };
+    let value_start = field + "\u{1}pos=".len();
+    let value_end = err[value_start..].find(SYNTAX_FIELD).map_or(err.len(), |i| value_start + i);
+    let n: Vec<Option<i64>> = err[value_start..value_end].split(':').map(|s| s.parse().ok()).collect();
+    let [Some(l), Some(o), Some(el), Some(eo)] = n[..] else {
+        return err;
+    };
+    let lines: Vec<&str> = src.split('\n').collect();
+    let to_bytes = |line: i64, offset: i64| -> i64 {
+        let text = usize::try_from(line - 1).ok().and_then(|i| lines.get(i));
+        match text {
+            Some(text) if offset > 0 => byte_column(text.trim_end_matches('\r'), offset as u32 - 1) as i64 + 1,
+            _ => offset,
+        }
+    };
+    let value = format!("{l}:{}:{el}:{}", to_bytes(l, o), to_bytes(el, eo));
+    err.replace_range(value_start..value_end, &value);
+    err
+}
+
 /// Attach the offending source line, unless the error already carries one or
 /// carries no position to show it against.
 pub fn with_text(err: String, text: &str) -> String {
@@ -900,6 +955,20 @@ impl Parser {
         self.err_span_as("SyntaxError", msg, from, to)
     }
 
+    /// [`Parser::err_span`] for an error CPython's compiler or symbol table
+    /// raises, which it positions in UTF-8 byte columns (see
+    /// [`with_byte_columns`]).
+    fn compiler_err_span(&self, msg: &str, from: usize, to: usize) -> String {
+        let (line, offset, end_line, end_offset) = self.token_span(from, to);
+        at_pos(
+            &format!("SyntaxError: {msg}"),
+            line,
+            self.byte_col(line, offset - 1) as i64 + 1,
+            end_line,
+            self.byte_col(end_line, end_offset - 1) as i64 + 1,
+        )
+    }
+
     /// [`Parser::err_span`] for a subclass: `IndentationError`.
     fn err_span_as(&self, class: &str, msg: &str, from: usize, to: usize) -> String {
         let (line, offset, end_line, end_offset) = self.token_span(from, to);
@@ -1345,7 +1414,7 @@ impl Parser {
     /// the file, as CPython's compiler leaves it.
     fn note_misplaced(&mut self, msg: &str, start: usize) {
         if self.misplaced.is_none() {
-            let e = self.err_span(msg, start, self.pos.saturating_sub(1));
+            let e = self.compiler_err_span(msg, start, self.pos.saturating_sub(1));
             self.misplaced = Some(format!("{e}{SYNTAX_FIELD}nosrc=1"));
         }
     }
@@ -2251,7 +2320,7 @@ impl Parser {
         let mut check_dup = |parser: &mut Self, name: &str, at: usize| {
             if names_seen.iter().any(|n| n == name) {
                 if parser.misplaced.is_none() {
-                    let e = parser.err_span(
+                    let e = parser.compiler_err_span(
                         &format!("duplicate argument '{name}' in function definition"),
                         at,
                         at,
@@ -2815,7 +2884,7 @@ impl Parser {
     /// Character column `col` of `line` as a UTF-8 byte column.
     fn byte_col(&self, line: u32, col: u32) -> u32 {
         match (line as usize).checked_sub(1).and_then(|i| self.lines.get(i)) {
-            Some(text) => text.chars().take(col as usize).map(|c| c.len_utf8() as u32).sum(),
+            Some(text) => byte_column(text, col),
             None => col,
         }
     }

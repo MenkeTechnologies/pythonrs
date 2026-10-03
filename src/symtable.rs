@@ -581,10 +581,13 @@ fn param_names(p: &Params) -> Vec<&str> {
 
 /// A symbol-table `SyntaxError` at `span`: it carries the position as
 /// attributes only (`args == (msg,)`) and no source text of its own — see
-/// `SyntaxPos::bare_args` and `SyntaxPos::no_source`.
+/// `SyntaxPos::bare_args` and `SyntaxPos::no_source`. `span` is in
+/// characters; the compile entry turns it into the byte columns CPython
+/// reports ([`crate::parser::with_byte_columns`]).
 pub(crate) fn symtable_error(msg: &str, (line, col, end_line, end_col): (u32, u32, u32, u32)) -> String {
     format!(
-        "{}{SYNTAX_FIELD}nosrc=1{SYNTAX_FIELD}bare=1",
-        at_pos(msg, line, col as i64, end_line, end_col as i64)
+        "{}{SYNTAX_FIELD}nosrc=1{SYNTAX_FIELD}bare=1{}",
+        at_pos(msg, line, col as i64, end_line, end_col as i64),
+        crate::parser::CHAR_COLUMNS
     )
 }

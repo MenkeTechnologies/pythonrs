@@ -48,13 +48,13 @@ pub use fusevm::Value;
 /// Compile a source string to a runnable program.
 pub fn compile(src: &str) -> Result<compiler::Program, String> {
     let stmts = parser::parse(src)?;
-    compiler::compile(&stmts, false)
+    compiler::compile(&stmts, false).map_err(|e| parser::with_byte_columns(e, src))
 }
 
 /// Compile with per-statement DAP line markers enabled (`python --dap`).
 pub fn compile_debug(src: &str) -> Result<compiler::Program, String> {
     let stmts = parser::parse(src)?;
-    compiler::compile(&stmts, true)
+    compiler::compile(&stmts, true).map_err(|e| parser::with_byte_columns(e, src))
 }
 
 /// Compile one interactive REPL line in CPython "single" mode: a top-level
@@ -62,7 +62,7 @@ pub fn compile_debug(src: &str) -> Result<compiler::Program, String> {
 /// `repr(value)` for non-`None` results and binds `_`). Not used for scripts.
 pub fn compile_interactive(src: &str) -> Result<compiler::Program, String> {
     let stmts = parser::parse(src)?;
-    compiler::compile_interactive(&stmts)
+    compiler::compile_interactive(&stmts).map_err(|e| parser::with_byte_columns(e, src))
 }
 
 /// Rebase a freshly compiled program's func/try ids above those already loaded

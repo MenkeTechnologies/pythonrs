@@ -22,6 +22,20 @@ written.
   (`TbEntry::CPython`), and every call records its line in the calling
   frame, so a frame below the innermost knows where it is without an error
   (measured on a call-heavy debug-build loop: 0.7% more instructions).
+- **Compiler and symbol-table errors are positioned in UTF-8 bytes.** CPython's
+  compiler (`_PyCompile_Error`) and symbol table report a node's
+  `col_offset + 1`, a UTF-8 BYTE column, where a parser error is converted to
+  characters; pythonrs reported characters for all of them, so `x = ("éé",
+  (yield 1))` in a class body was offset 15 where CPython says 17 and the
+  caret sat two columns left of CPython's. The compiler and symbol table still
+  measure the parser's character `Span`, and mark the error; the compile entry
+  (`lib::compile`, which holds the source) turns the marked position into
+  bytes (`parser::with_byte_columns`). The compiler-side errors the parser
+  records itself (`'return' outside function`, `'break' outside loop`,
+  `'continue' not properly in loop`, a duplicate argument, a module-level
+  `nonlocal`) are converted where they are raised. Covered: `yield`, `yield
+  from`, `await`, `'yield' inside` a comprehension, the `global`/`nonlocal`
+  declaration errors.
 - **The `SyntaxError` keyword hint sees the names inside f-strings.**
   `_find_keyword_typos` walks `tokenize`'s NAME tokens, which since 3.12
   include the names in an f-/t-string's replacement fields; pythonrs's lexer
@@ -2173,14 +2187,6 @@ written.
   closes its groups early but ends them late, so `re.match(r'(?=(ab))(a)',
   'ab').lastindex` is 1 here and 2 in CPython.
 
-- **A misplaced `yield` after non-ASCII text is positioned in characters.**
-  CPython's compiler raises `'yield' outside function` (and the other
-  compiler-side `yield` errors) at `col_offset + 1`, a UTF-8 BYTE column, so
-  `x = ("éé", (yield 1))` in a class body is offset 17 there and 15 here,
-  and the caret CPython draws sits two columns further right. The parser
-  records the `yield`'s `Span` in characters, which is what a runtime
-  traceback caret needs; the compiler has no source to convert it with.
-  Pattern errors carry their own byte-based `Loc` and are exact.
 - **A bridged exception carries no CPython traceback.** An exception that crosses
   from pythonrs into CPython is rebuilt as a fresh exception object, so its
   `__traceback__` is empty. Two visible consequences, both in code that is not

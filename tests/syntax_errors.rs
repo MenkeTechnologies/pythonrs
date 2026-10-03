@@ -704,6 +704,78 @@ for s in cases:
     );
 }
 
+/// A compiler or symbol-table error is positioned in UTF-8 BYTE columns, as
+/// `_PyCompile_Error` and `PyErr_RangedSyntaxLocationObject` report the
+/// node's `col_offset + 1`: each `é` before the node counts two, `€` three
+/// and `𝄞` four. A parser error, which pegen converts, stays in characters.
+/// A traceback read from the file draws the caret where CPython draws it —
+/// shifted right by the extra bytes.
+#[test]
+fn compiler_errors_are_positioned_in_utf8_bytes() {
+    let out = Command::new(env!("CARGO_BIN_EXE_python"))
+        .args([
+            "-c",
+            r#"cases = [
+    "class C:\n    x = ('éé', (yield 1))",
+    "class C:\n    x = ('éé', (yield from 1))",
+    "x = ('éé', (await 1))",
+    "def f():\n    x = ('éé', (await 1))",
+    "x = ('éé', [(yield) for y in z])",
+    "x = ('éé'); return 5",
+    "x = ('é'); break",
+    "x = ('€'); continue",
+    "def f():\n  x = ('éé'); nonlocal q",
+    "def f(é):\n  x = ('éé'); global é",
+    "def f(é, é): pass",
+    "'𝄞'; nonlocal x",
+    "x = ('éé'; 1)",
+]
+for s in cases:
+    try:
+        exec(s)
+        print(repr(s), "ok")
+    except SyntaxError as e:
+        print(repr(s), e.args, e.lineno, e.offset, e.end_lineno, e.end_offset)
+"#,
+        ])
+        .output()
+        .expect("spawn python");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        r#""class C:\n    x = ('éé', (yield 1))" ("'yield' outside function", ('<string>', 2, 19, None, 2, 26)) 2 19 2 26
+"class C:\n    x = ('éé', (yield from 1))" ("'yield from' outside function", ('<string>', 2, 19, None, 2, 31)) 2 19 2 31
+"x = ('éé', (await 1))" ("'await' outside function",) 1 15 1 22
+"def f():\n    x = ('éé', (await 1))" ("'await' outside async function",) 2 19 2 26
+"x = ('éé', [(yield) for y in z])" ("'yield' inside list comprehension",) 1 16 1 21
+"x = ('éé'); return 5" ("'return' outside function", ('<string>', 1, 15, None, 1, 23)) 1 15 1 23
+"x = ('é'); break" ("'break' outside loop", ('<string>', 1, 13, None, 1, 18)) 1 13 1 18
+"x = ('€'); continue" ("'continue' not properly in loop", ('<string>', 1, 14, None, 1, 22)) 1 14 1 22
+"def f():\n  x = ('éé'); nonlocal q" ("no binding for nonlocal 'q' found",) 2 17 2 27
+"def f(é):\n  x = ('éé'); global é" ("name 'é' is parameter and global",) 2 17 2 26
+'def f(é, é): pass' ("duplicate argument 'é' in function definition",) 1 11 1 13
+"'𝄞'; nonlocal x" ('nonlocal declaration not allowed at module level',) 1 9 1 19
+"x = ('éé'; 1)" ('invalid syntax', ('<string>', 1, 10, "x = ('éé'; 1)\n", 1, 11)) 1 10 1 11
+"#
+    );
+    let dir = std::env::temp_dir().join(format!("pyrs-bytecol-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("y.py");
+    std::fs::write(&script, "class C:\n    x = (\"éé\", (yield 1))\n").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_python")).arg(&script).output().expect("spawn python");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!(
+            r#"  File "{}", line 2
+    x = ("éé", (yield 1))
+                  ^^^^^^^
+SyntaxError: 'yield' outside function
+"#,
+            script.display()
+        )
+    );
+}
+
 /// The compiler's pattern-matching errors, raised at the node CPython's
 /// `codegen_pattern_*` passes to `_PyCompile_Error`: `offset`/`end_offset` are
 /// UTF-8 byte columns plus one (`'éé'` counts four), and `args` carries the
