@@ -181,7 +181,6 @@ const KEYWORD_TYPO_MAX_SOURCE: usize = 1024;
 /// CPython reports them.
 pub fn keyword_typo(msg: &str, pos: &crate::parser::SyntaxPos) -> Option<(crate::parser::SyntaxPos, String)> {
     use crate::builtins::str_splitlines;
-    use crate::lexer::Tok;
     if msg != "invalid syntax" && !msg.contains("Perhaps you forgot a comma") {
         return None;
     }
@@ -219,13 +218,10 @@ pub fn keyword_typo(msg: &str, pos: &crate::parser::SyntaxPos) -> Option<(crate:
     // `\n` only), and each token reports the physical line it is on.
     let physical: Vec<&str> = error_code.split_inclusive('\n').collect();
     // Any failure to tokenize is suppressed by `traceback`, ending the search.
-    let tokens = crate::lexer::lex(&error_code).ok()?.toks;
+    let tokens = name_tokens(&error_code)?;
     let keywords: Vec<String> = crate::parser::KEYWORDS.iter().map(|k| k.to_string()).collect();
     let mut tokens_left = KEYWORD_TYPO_TOKENS;
     for token in tokens {
-        if !matches!(token.tok, Tok::Name(_) | Tok::Ident(_)) {
-            continue;
-        }
         let row = token.line as i64;
         let the_end = if line == 0 { end_line } else { end_line + 1 };
         if from_filename && row + line != the_end {
@@ -271,6 +267,242 @@ pub fn keyword_typo(msg: &str, pos: &crate::parser::SyntaxPos) -> Option<(crate:
         }
     }
     None
+}
+
+/// Where a `NAME` token sits: 1-based line, 0-based character columns.
+struct NameAt {
+    line: u32,
+    col: u32,
+    end_col: u32,
+}
+
+/// The `NAME` tokens `tokenize.generate_tokens` yields for `code`, in source
+/// order. Since 3.12 (PEP 701) `tokenize` splits an f-string (and a t-string)
+/// into its parts, so the names in its replacement fields — the expression,
+/// a `!conv` conversion, and the fields nested in a format spec — are `NAME`
+/// tokens of their own, where pythonrs's lexer keeps the literal as one
+/// token. `None` when `code` does not tokenize; a replacement field that does
+/// not ends the list there, as `tokenize` raising part-way ends the search.
+fn name_tokens(code: &str) -> Option<Vec<NameAt>> {
+    use crate::lexer::Tok;
+    let chars: Vec<char> = code.chars().collect();
+    let starts = line_starts(&chars);
+    let mut names = Vec::new();
+    for token in crate::lexer::lex(code).ok()?.toks {
+        match &token.tok {
+            Tok::Name(_) | Tok::Ident(_) => names.push(NameAt {
+                line: token.line,
+                col: token.col,
+                end_col: token.end_col,
+            }),
+            Tok::FString(raw, is_raw) | Tok::TString(raw, is_raw) => {
+                let end = starts[token.line as usize - 1] + token.end_col as usize;
+                let body = string_body_start(&chars, end, raw)?;
+                let line = starts.partition_point(|&s| s <= body);
+                let body = FieldScan::new(raw, *is_raw, line as u32, (body - starts[line - 1]) as u32);
+                if !body.literal(0, body.chars.len(), false, &mut names) {
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(names)
+}
+
+/// The index in `chars` of each line's first character.
+fn line_starts(chars: &[char]) -> Vec<usize> {
+    std::iter::once(0)
+        .chain(chars.iter().enumerate().filter(|&(_, &c)| c == '\n').map(|(i, _)| i + 1))
+        .collect()
+}
+
+/// Where the body `raw` of a string literal ending just before `end` starts
+/// in `chars`. Worked back from the end because the lexer positions a token
+/// that spans lines on its last line. The literal closes with three quotes
+/// when its last three characters are one quote character: a body cannot end
+/// in an unescaped quote, so a one-quote literal never ends that way.
+fn string_body_start(chars: &[char], end: usize, raw: &str) -> Option<usize> {
+    let quote = *chars.get(end.checked_sub(1)?)?;
+    let triple = end >= 3 && chars[end - 3..end].iter().all(|&c| c == quote);
+    let body_end = end - if triple { 3 } else { 1 };
+    body_end.checked_sub(raw.chars().count())
+}
+
+/// An f-/t-string body read the way `tokenize` reads it, for its `NAME`s.
+/// `chars` is the body as written (the lexer keeps escapes verbatim) and
+/// `at[i]` the source position of `chars[i]`.
+struct FieldScan {
+    chars: Vec<char>,
+    at: Vec<(u32, u32)>,
+    is_raw: bool,
+}
+
+impl FieldScan {
+    fn new(raw: &str, is_raw: bool, line: u32, col: u32) -> Self {
+        let chars: Vec<char> = raw.chars().collect();
+        let mut at = Vec::with_capacity(chars.len() + 1);
+        let (mut line, mut col) = (line, col);
+        for &c in &chars {
+            at.push((line, col));
+            if c == '\n' {
+                (line, col) = (line + 1, 0);
+            } else {
+                col += 1;
+            }
+        }
+        at.push((line, col));
+        FieldScan { chars, at, is_raw }
+    }
+
+    /// The literal text `chars[from..to]` and the replacement fields in it.
+    /// Outside a format spec `{{`/`}}` are escaped braces; inside one the
+    /// tokenizer reads every `{` as a nested field. A non-raw `\N{...}` is a
+    /// named escape, not a field. `false` once a field fails to tokenize.
+    fn literal(&self, from: usize, to: usize, in_spec: bool, names: &mut Vec<NameAt>) -> bool {
+        let mut i = from;
+        let mut literal_start = from;
+        while i < to {
+            match self.chars[i] {
+                '{' if !in_spec && self.chars.get(i + 1) == Some(&'{') => i += 2,
+                '}' if !in_spec && self.chars.get(i + 1) == Some(&'}') => i += 2,
+                '{' => {
+                    let lead: String = self.chars[literal_start..i].iter().collect();
+                    if crate::lexer::ends_with_named_escape_lead(&lead, self.is_raw) {
+                        while i < to && self.chars[i] != '}' {
+                            i += 1;
+                        }
+                        i += 1;
+                        continue;
+                    }
+                    let close = self.field_end(i + 1, to);
+                    if !self.field(i + 1, close, names) {
+                        return false;
+                    }
+                    i = close + 1;
+                    literal_start = i;
+                }
+                _ => i += 1,
+            }
+        }
+        true
+    }
+
+    /// The `}` closing the field that starts at `from`: the first one outside
+    /// brackets and quotes (`to` when the field is not closed).
+    fn field_end(&self, from: usize, to: usize) -> usize {
+        self.top_level(from, to, |c, _| c == '}').unwrap_or(to)
+    }
+
+    /// The first index in `from..to` outside brackets and string literals
+    /// where `hit(char, next char)` holds.
+    fn top_level(&self, from: usize, to: usize, hit: impl Fn(char, Option<char>) -> bool) -> Option<usize> {
+        let mut depth = 0i32;
+        let mut quote: Option<char> = None;
+        let mut i = from;
+        while i < to {
+            let c = self.chars[i];
+            if let Some(q) = quote {
+                if c == '\\' {
+                    i += 1;
+                } else if c == q {
+                    quote = None;
+                }
+                i += 1;
+                continue;
+            }
+            match c {
+                '\'' | '"' => quote = Some(c),
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' if depth > 0 => depth -= 1,
+                '}' if depth > 0 => depth -= 1,
+                _ if depth == 0 && hit(c, self.chars.get(i + 1).copied()) => return Some(i),
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// One replacement field, `chars[from..to]` between its braces:
+    /// the expression's names, the conversion's name, then the format spec.
+    /// The expression ends at a top-level `!` that does not start `!=` or at
+    /// a top-level `:`, as `tokenize` ends it.
+    fn field(&self, from: usize, to: usize, names: &mut Vec<NameAt>) -> bool {
+        let spec = self.top_level(from, to, |c, _| c == ':');
+        let expr_end = spec.unwrap_or(to);
+        let conv = self.top_level(from, expr_end, |c, next| c == '!' && next != Some('='));
+        if !self.expression_names(from, conv.unwrap_or(expr_end), names) {
+            return false;
+        }
+        if let Some(bang) = conv {
+            let start = (bang + 1..expr_end).find(|&j| !self.chars[j].is_whitespace()).unwrap_or(expr_end);
+            let mut end = start;
+            while end < expr_end && (self.chars[end].is_alphanumeric() || self.chars[end] == '_') {
+                end += 1;
+            }
+            if end > start {
+                let (line, col) = self.at[start];
+                names.push(NameAt {
+                    line,
+                    col,
+                    end_col: col + (end - start) as u32,
+                });
+            }
+        }
+        match spec {
+            Some(colon) => self.literal(colon + 1, to, true, names),
+            None => true,
+        }
+    }
+
+    /// The names of the expression `chars[from..to]`, tokenized inside
+    /// parentheses so a line break in a triple-quoted field is not a
+    /// statement boundary, mapped back to their source positions.
+    fn expression_names(&self, from: usize, to: usize, names: &mut Vec<NameAt>) -> bool {
+        use crate::lexer::Tok;
+        let text: String = std::iter::once('(')
+            .chain(self.chars[from..to].iter().copied())
+            .chain(std::iter::once(')'))
+            .collect();
+        let Ok(lexed) = crate::lexer::lex(&text) else {
+            return false;
+        };
+        let text_chars: Vec<char> = text.chars().collect();
+        let starts = line_starts(&text_chars);
+        for token in lexed.toks {
+            // Index in `text`; `self.chars` index is one less (the `(`).
+            let index = starts[token.line as usize - 1] + token.col as usize;
+            match &token.tok {
+                Tok::Name(_) | Tok::Ident(_) => {
+                    let (line, col) = self.at[from + index - 1];
+                    names.push(NameAt {
+                        line,
+                        col,
+                        end_col: col + token.end_col - token.col,
+                    });
+                }
+                // A string nested in the field is split into its parts too.
+                Tok::FString(raw, is_raw) | Tok::TString(raw, is_raw) => {
+                    let end = starts[token.line as usize - 1] + token.end_col as usize;
+                    let Some(body) = string_body_start(&text_chars, end, raw) else {
+                        return false;
+                    };
+                    let start = from + body - 1;
+                    let nested = FieldScan {
+                        chars: raw.chars().collect(),
+                        at: self.at[start..=start + raw.chars().count()].to_vec(),
+                        is_raw: *is_raw,
+                    };
+                    if !nested.literal(0, nested.chars.len(), false, names) {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+        true
+    }
 }
 
 /// Whether `codeop.compile_command(code, symbol="exec",

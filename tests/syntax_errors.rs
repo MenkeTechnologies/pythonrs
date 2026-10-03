@@ -69,6 +69,16 @@ IndentationError: unindent does not match any outer indentation level
 "#,
         1,
     ),
+    // A line break inside a string nested in an f-string field is counted once.
+    (
+        "x = f\"\"\"{f\"\"\"\n\"\"\"}\"\"\"\ny = )",
+        r#"  File "<string>", line 3
+    y = )
+        ^
+SyntaxError: unmatched ')'
+"#,
+        1,
+    ),
     (
         r#"x = ("#,
         r#"  File "<string>", line 1
@@ -750,6 +760,7 @@ for s in cases:
 /// it resembles points at that name and suggests the keyword. Each program is
 /// run as `-c`; the expectation is CPython's stderr for it. Covered: a typo
 /// fixed into incomplete input (`while x:` at the end, a `def` with no body),
+/// the names in f-string replacement fields,
 /// a candidate the full compile rejects (`yield` outside a function, so
 /// `yiel` gets `del`), no fix that compiles (`whille (x:`, a compound
 /// statement after `;`), the ten-name budget, a `Perhaps you forgot a comma`
@@ -898,6 +909,41 @@ SyntaxError: invalid syntax. Perhaps you forgot a comma?
     ｗhille x: pass
     ^^^^^^
 SyntaxError: invalid syntax. Did you mean 'while'?
+"#,
+    ),
+    // Since 3.12 `tokenize` yields the names in an f-string's replacement
+    // fields (expression, `!conv`, nested spec fields, nested f-strings) as
+    // NAME tokens, and they use up the ten-name budget.
+    (
+        "x = f\"{a}{b}{c}{d}{e}{f}{g}{h}{i}{j}\" foor y",
+        r#"  File "<string>", line 1
+    x = f"{a}{b}{c}{d}{e}{f}{g}{h}{i}{j}" foor y
+                                          ^^^^
+SyntaxError: invalid syntax
+"#,
+    ),
+    (
+        "x = f\"{a!r:>{b}}{c}{d}{e}{f}{g}{h}\" foor y",
+        r#"  File "<string>", line 1
+    x = f"{a!r:>{b}}{c}{d}{e}{f}{g}{h}" foor y
+                                        ^^^^
+SyntaxError: invalid syntax
+"#,
+    ),
+    (
+        "x = f\"{a!r:>{b}}{c}{d}{e}{f}{g}\" foor y",
+        r#"  File "<string>", line 1
+    x = f"{a!r:>{b}}{c}{d}{e}{f}{g}" foor y
+                                     ^^^^
+SyntaxError: invalid syntax. Did you mean 'or'?
+"#,
+    ),
+    (
+        "x = f\"\"\"{a}\n{b}{c}{f\"\"\"{d}\n{e}\"\"\"}{f}{g}{h}{i}\"\"\" foor y",
+        r#"  File "<string>", line 3
+    {e}"""}{f}{g}{h}{i}""" foor y
+                           ^^^^
+SyntaxError: invalid syntax
 "#,
     ),
     (

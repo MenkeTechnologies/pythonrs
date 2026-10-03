@@ -9,6 +9,17 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **The `SyntaxError` keyword hint sees the names inside f-strings.**
+  `_find_keyword_typos` walks `tokenize`'s NAME tokens, which since 3.12
+  include the names in an f-/t-string's replacement fields; pythonrs's lexer
+  keeps the literal as one token, so those names neither used up the ten-name
+  budget nor were tried, and `x = f"{a}{b}{c}{d}{e}{f}{g}{h}{i}{j}" foor y`
+  got `Did you mean 'or'?` where CPython gives none. The hint now splits the
+  literal as `tokenize` does — each field's expression, a `!conv` name, the
+  fields nested in a format spec, and f-strings nested in a field — at the
+  names' source positions (a multi-line literal is located from its end).
+  A line break inside a string nested in an f-string field was also counted
+  twice, so every later line number was one too high.
 - **`--lsp` go-to-definition and signature help reach attributes and other
   files.** Both resolved names within the open document only. An attribute now
   resolves as it does at run time where the document determines the receiver:
@@ -2234,13 +2245,6 @@ written.
   `.format`, and pythonrs reports that name as is: `co_varnames` is
   `('.format',)` where CPython 3.14 renames it to `format` in the code object
   (and so in the `(format, /)` signature).
-- **The `SyntaxError` keyword hint does not see names inside f-strings.**
-  `_find_keyword_typos` walks `tokenize`'s NAME tokens, and since 3.12 those
-  include the names in an f-string's replacement fields; pythonrs's lexer
-  keeps an f-string as one token, so those names neither use up the
-  ten-name budget nor get tried themselves. `x = f"{a}{b}{c}{d}{e}{f}{g}{h}{i}{j}"`
-  followed by `whille x: pass` gets `Did you mean 'while'?` here and no hint
-  in CPython, whose budget the ten field names exhausted.
 - **`[nan] == [nan]` with one shared `nan` is False.** CPython's sequence
   comparison shortcuts on element IDENTITY before `==`, so a list holding the
   same `nan` object twice compares equal to itself. pythonrs stores a `float`

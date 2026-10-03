@@ -591,9 +591,7 @@ impl Lexer {
                                     }
                                 }
                                 Some(c) => {
-                                    if c == '\n' {
-                                        self.line += 1;
-                                    }
+                                    // `bump` counts the line a newline ends.
                                     raw.push(c);
                                     self.bump();
                                 }
