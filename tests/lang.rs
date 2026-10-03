@@ -440,6 +440,20 @@ fn function_annotate_is_the_compiled_annotate_function() {
     assert_eq!(g("def u(): pass\nx = (u.__annotate__, (lambda: 0).__annotate__)", "x"), "(None, None)");
 }
 
+/// The annotate function binds its argument as `.format` (above: the
+/// annotation `format` is the builtin), yet its code object names that local
+/// `format` — CPython 3.14's `codegen_finish_annotations_scope` rewrites
+/// `co_localsplusnames[0]` — so the posonly signature reads `(format, /)`.
+#[test]
+fn annotate_code_names_its_parameter_format() {
+    let f = "def f(x: format) -> str: pass\nc = f.__annotate__.__code__\n";
+    assert_eq!(
+        g(&format!("{f}x = (c.co_varnames, c.co_argcount, c.co_posonlyargcount, c.co_nlocals)"), "x"),
+        "(('format',), 1, 1, 1)"
+    );
+    assert_eq!(g(&format!("{f}x = f.__annotations__['x'] is format"), "x"), "True");
+}
+
 #[test]
 fn simplenamespace_and_sys_implementation() {
     // sys.implementation is a native SimpleNamespace; its type is what the

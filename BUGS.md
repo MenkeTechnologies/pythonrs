@@ -410,6 +410,12 @@ written.
   `cannot create '…' instances` when called. `isinstance(C.x, Exception)` was
   `True`. The same change made `type(zip)`, `type(property)` and the other
   builtin type objects' own type `type`.
+- **An `__annotate__` code object names its parameter `format`.** The
+  compiled annotate function binds its argument as `.format` (CPython's
+  symtable name, so `def f(x: format)` still annotates with the builtin), and
+  `co_varnames` reported that name as is. It is now `('format',)`, as CPython's
+  `codegen_finish_annotations_scope` rewrites `co_localsplusnames[0]`
+  (`FuncDef::is_annotate`).
 - **`f.__annotate__` is the compiled annotate function.** It was a
   `functools.partial` around the def-time dict. The compiler now emits CPython's
   `def __annotate__(format, /)` — qualname `f.__annotate__`, `if format > 2:
@@ -2290,11 +2296,12 @@ written.
   CPython module rather than the namespace pythonrs resolves names in, so
   `builtins.len is len` is `False` and `builtins.foo = 5` does not make a bare
   `foo` resolve (CPython prints `5`; pythonrs raises `NameError`).
-- **`f.__annotate__`'s parameter introspects as `.format`.** The compiled
-  annotate function binds its argument under CPython's internal symtable name
-  `.format`, and pythonrs reports that name as is: `co_varnames` is
-  `('.format',)` where CPython 3.14 renames it to `format` in the code object
-  (and so in the `(format, /)` signature).
+- **`inspect.signature` of a pythonrs function fails on the ffi build.**
+  `inspect` is CPython's, and it reads `func.__code__`, which is a native code
+  object that cannot cross the bridge: `inspect.signature(f)` raises
+  `TypeError: cannot pass 'code' to a CPython stdlib call` for every `def`,
+  lambda and `__annotate__` (CPython: `(format, /)` for the last). The
+  annotate function's `co_varnames` itself is `('format',)` (see Implemented).
 - **`[nan] == [nan]` with one shared `nan` is False.** CPython's sequence
   comparison shortcuts on element IDENTITY before `==`, so a list holding the
   same `nan` object twice compares equal to itself. pythonrs stores a `float`

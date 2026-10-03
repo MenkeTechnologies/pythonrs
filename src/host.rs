@@ -288,6 +288,13 @@ pub struct FuncDef {
     /// environment rather than the enclosing one.
     #[serde(default)]
     pub sees_class_scope: bool,
+    /// A function's PEP 649 `__annotate__`. Its parameter is bound as `.format`
+    /// (CPython's symtable name, so an annotation naming `format` still reaches
+    /// the builtin), but the code object reports it as `format`, as CPython's
+    /// `codegen_finish_annotations_scope` rewrites `co_localsplusnames[0]` —
+    /// so `co_varnames` is `('format',)` and the signature `(format, /)`.
+    #[serde(default)]
+    pub is_annotate: bool,
 }
 
 impl FuncDef {
@@ -315,6 +322,7 @@ impl FuncDef {
             doc: self.doc.clone(),
             freevars: self.freevars.clone(),
             sees_class_scope: self.sees_class_scope,
+            is_annotate: self.is_annotate,
         }
     }
 }
@@ -17193,7 +17201,7 @@ impl PyHost {
         const CO_METHOD: i64 = 0x0800_0000;
         // Pull every field under one short immutable borrow so the alloc/new_str
         // below (which need `&mut self`) don't conflict with it.
-        let (co_name, co_qualname, params, posonly, kwonly, star, kwargs, locals, flags) = {
+        let (co_name, co_qualname, params, posonly, kwonly, star, kwargs, locals, flags, is_annotate) = {
             let d = &self.funcs[def_id];
             let q = if d.qualname.is_empty() {
                 d.name.clone()
@@ -17246,6 +17254,7 @@ impl PyHost {
                 d.kwargs.clone(),
                 d.locals.clone(),
                 f,
+                d.is_annotate,
             )
         };
         // co_varnames: parameters (positional then keyword-only), then
@@ -17263,6 +17272,11 @@ impl PyHost {
                 if !names.contains(l) {
                     names.push(l.clone());
                 }
+            }
+            // `codegen_finish_annotations_scope`: an `__annotate__` code object
+            // names its first local `format`, whatever the symtable called it.
+            if is_annotate {
+                names[0] = "format".to_string();
             }
             names
         };

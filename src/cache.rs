@@ -157,7 +157,9 @@ use std::path::PathBuf;
 /// v52: an annotation scope in a class body (`FuncDef::sees_class_scope`, a new
 /// field) captures the class environment, so a class body holding an
 /// annotation, an annotated method or a `type` alias compiles differently.
-const SCHEMA: u64 = 52;
+/// v53: a function's `__annotate__` is marked (`FuncDef::is_annotate`, a new
+/// field) so its code object names the parameter `format`.
+const SCHEMA: u64 = 53;
 
 /// The shard's INDEX: everything a lookup needs, and nothing it does not.
 ///

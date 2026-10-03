@@ -2158,6 +2158,7 @@ impl Compiler {
     /// The parameter is spelled `.format`, CPython's own symtable name for it,
     /// so an annotation that mentions `format` still reaches the enclosing scope
     /// (`def f(x: format)` annotates with the builtin) rather than the argument.
+    /// The code object still reports it as `format` (`FuncDef::is_annotate`).
     fn build_annotate(
         &mut self,
         def_id: usize,
@@ -2200,7 +2201,9 @@ impl Compiler {
         let id = self.build_annotation_scope("__annotate__", &params, &body);
         self.fn_depth -= 1;
         self.qual_prefix = saved_prefix;
-        id
+        let id = id?;
+        self.functions[id].1.is_annotate = true;
+        Ok(id)
     }
 
     /// Build an annotation scope (PEP 649/695): a function that, defined
@@ -2456,6 +2459,7 @@ impl Compiler {
             doc: self.docstring(body),
             freevars,
             sees_class_scope: false,
+            is_annotate: false,
         };
         self.functions.push((name.to_string(), def));
         Ok(self.functions.len() - 1)
