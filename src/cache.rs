@@ -206,7 +206,8 @@ struct CProg {
 }
 
 /// Recompute a chunk's `op_hash` exactly as `fusevm::ChunkBuilder::build` does
-/// (a `DefaultHasher` over ops then constants). `op_hash` is `#[serde(skip)]`, so
+/// (a `DefaultHasher` over ops then constants, then `true` when the chunk sets
+/// `nan_result_hook`). `op_hash` is `#[serde(skip)]`, so
 /// a deserialized chunk carries `0`; restoring it (from the pre-rebase cached
 /// ops, which match the compile-time hash) lets caret lookups by `op_hash` hit.
 fn restore_op_hash(chunk: &mut Chunk) {
@@ -214,6 +215,9 @@ fn restore_op_hash(chunk: &mut Chunk) {
     let mut h = DefaultHasher::new();
     chunk.ops.hash(&mut h);
     chunk.constants.hash(&mut h);
+    if chunk.nan_result_hook {
+        true.hash(&mut h);
+    }
     chunk.op_hash = h.finish();
     for sub in &mut chunk.sub_chunks {
         restore_op_hash(sub);
@@ -696,5 +700,28 @@ mod tests {
         let empty = 0u64.to_le_bytes();
         let (index, blobs) = split_shard(&empty).expect("a zero-length index");
         assert!(index.is_empty() && blobs.is_empty());
+    }
+
+    /// A cached chunk's caret table is keyed by the `op_hash` the compiler
+    /// registered, which `ChunkBuilder::build` computes; `restore_op_hash` must
+    /// reproduce it for every chunk the compiler emits, flagged or not, or every
+    /// traceback after a cache hit loses its carets.
+    #[test]
+    fn restored_op_hash_matches_the_built_one() {
+        for nan_hook in [false, true] {
+            let mut b = fusevm::ChunkBuilder::new();
+            b.set_nan_result_hook(nan_hook);
+            b.emit(fusevm::Op::LoadInt(7), 1);
+            b.emit(fusevm::Op::Return, 1);
+            let built = b.build();
+            let mut cached: Chunk =
+                bincode::deserialize(&bincode::serialize(&built).unwrap()).unwrap();
+            assert_eq!(cached.op_hash, 0, "serde skips op_hash");
+            restore_op_hash(&mut cached);
+            assert_eq!(
+                cached.op_hash, built.op_hash,
+                "nan_result_hook = {nan_hook}"
+            );
+        }
     }
 }
