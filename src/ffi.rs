@@ -3982,6 +3982,21 @@ pub fn repr_of(id: u32) -> String {
     )
 }
 
+/// `repr(module)` for a module whose `__spec__` is the CPython `ModuleSpec`
+/// `spec`: `importlib._bootstrap._module_repr_from_spec`, which is what
+/// `_module_repr` returns for any module carrying a spec
+/// (`<module 'builtins' (built-in)>`). Reads only the bridge, never the host.
+pub fn module_repr_from_spec(spec: u32) -> Option<String> {
+    Python::with_gil(|py| {
+        let spec = fetch(py, spec).ok()?;
+        py.import("_frozen_importlib")
+            .and_then(|m| m.getattr("_module_repr_from_spec"))
+            .and_then(|f| f.call1((spec,)))
+            .and_then(|r| r.extract::<String>())
+            .ok()
+    })
+}
+
 /// `bool(foreign)`.
 pub fn truthy(id: u32) -> bool {
     Python::with_gil(|py| {

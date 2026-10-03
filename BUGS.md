@@ -445,6 +445,20 @@ written.
   `cannot create '…' instances` when called. `isinstance(C.x, Exception)` was
   `True`. The same change made `type(zip)`, `type(property)` and the other
   builtin type objects' own type `type`.
+- **`builtins` is the namespace bare names fall back to.** `import builtins`
+  was the bridged CPython module, unrelated to the names pythonrs resolves, so
+  `builtins.len is len` was `False` and `builtins.foo = 5` left a bare `foo` a
+  `NameError`. It is now a native module (`PyHost::builtins_slot`) holding the
+  interned objects bare names resolve to, and once a program can reach it
+  (`import builtins`, `__builtins__`) every bare-name miss — `LOAD_GLOBAL`/
+  `LOAD_NAME`, a call by name — looks there (`PyHost::lookup_builtin`):
+  writing a name makes it resolve everywhere, rebinding one (`builtins.abs =
+  …`) is seen by every call, and deleting one makes it a `NameError`. The ffi
+  build adds what only CPython's module has — its `__spec__`/`__loader__`
+  (so it reprs `<module 'builtins' (built-in)>`) and `aiter`, `anext`,
+  `breakpoint`, `help`, … — which also resolve as bare names before anything
+  imported `builtins`. `del module.attr` on a native module now unbinds the
+  name (it raised `AttributeError`).
 - **An `__annotate__` code object names its parameter `format`.** The
   compiled annotate function binds its argument as `.format` (CPython's
   symtable name, so `def f(x: format)` still annotates with the builtin), and
@@ -2323,12 +2337,17 @@ written.
   `__dictoffset__`, `__flags__`, `__itemsize__` and `__weakrefoffset__` describe
   a `PyTypeObject` struct pythonrs does not have, and a fabricated number would
   be read as a real one by the `Py_TPFLAGS_*` bit tests that consume them.
-- **The `builtins` module is CPython's, not the native builtins.** `__main__`'s
-  `__builtins__` and `__loader__` are bound (to the bridged `builtins` module
-  and a `SourceFileLoader`/`BuiltinImporter`), but `import builtins` is the
-  CPython module rather than the namespace pythonrs resolves names in, so
-  `builtins.len is len` is `False` and `builtins.foo = 5` does not make a bare
-  `foo` resolve (CPython prints `5`; pythonrs raises `NameError`).
+- **A rebound `range` does not reach a native counted loop.** `for i in
+  range(n)` whose body qualifies is compiled to a native slot loop, which
+  checks only for a `range` bound in an enclosing FUNCTION scope at compile
+  time. A module-level `range = r` or `builtins.range = r` is honored by every
+  other use of the name but not by such a loop: `range = lambda *a: [100]`
+  then `for i in range(3): t += i` sums `0..2` (`3`) where CPython adds `100`.
+  A run-time check would be a `CallBuiltin` in the loop's preamble, and fusevm
+  refuses to block-JIT any chunk containing one (`CallBuiltin` is not in
+  `is_block_eligible_op_at`, fusevm 0.26.0 jit.rs), so it would take the block JIT
+  away from every otherwise eligible chunk holding such a loop; it needs a
+  guard op fusevm can lower.
 - **`inspect.signature` of a pythonrs function fails on the ffi build.**
   `inspect` is CPython's, and it reads `func.__code__`, which is a native code
   object that cannot cross the bridge: `inspect.signature(f)` raises

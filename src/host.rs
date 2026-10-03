@@ -2273,6 +2273,15 @@ pub struct PyHost {
     pub eg_split_root: HashMap<u32, u32>,
     /// Interned type objects for the builtin names (see `builtin_object`).
     builtin_objects: HashMap<String, Value>,
+    /// The `builtins` module's namespace slot (`module_globals` index), once a
+    /// program can reach the module (`import builtins`, `__builtins__`). From
+    /// then on it is the dict a bare name falls back to after the module's
+    /// globals, as CPython's `LOAD_GLOBAL`/`LOAD_NAME` fall back to
+    /// `f_builtins`: `builtins.foo = 5` makes `foo` resolve, and deleting
+    /// `builtins.len` makes `len` a `NameError`. Before that the native builtin
+    /// of the name answers directly — the same answer, since nothing can have
+    /// changed a namespace no program has seen. See [`PyHost::lookup_builtin`].
+    builtins_slot: Option<usize>,
     /// Exceptions whose traceback starts EMPTY at the frame that produced them:
     /// the group `except*` reconstructs once its handlers have run. CPython
     /// builds that group after the handler finishes, so the frame holding the
@@ -2963,6 +2972,7 @@ impl PyHost {
             exc_tb: HashMap::new(),
             eg_split_root: HashMap::new(),
             builtin_objects: HashMap::new(),
+            builtins_slot: None,
             tb_starts_empty: HashSet::new(),
             suggest: None,
             func_attrs: HashMap::new(),
@@ -3145,6 +3155,63 @@ impl PyHost {
         let v = self.alloc(PyObj::Builtin(name.to_string()));
         self.builtin_objects.insert(name.to_string(), v.clone());
         v
+    }
+
+    /// What a bare name that no enclosing scope or module global binds
+    /// resolves to: its entry in the `builtins` namespace once that exists
+    /// (`builtins_slot`), else the native builtin of that name. `None` is a
+    /// `NameError`.
+    pub fn lookup_builtin(&mut self, name: &str) -> Option<Value> {
+        if let Some(slot) = self.builtins_slot {
+            return self.module_globals[slot].get(name).cloned();
+        }
+        self.native_builtin(name)
+    }
+
+    /// Whether the `builtins` namespace has been built (see `builtins_slot`).
+    pub fn has_builtins_namespace(&self) -> bool {
+        self.builtins_slot.is_some()
+    }
+
+    /// The native object a builtin name denotes, ignoring any change a program
+    /// made to the `builtins` module.
+    fn native_builtin(&mut self, name: &str) -> Option<Value> {
+        match name {
+            "NotImplemented" => Some(self.alloc(PyObj::NotImplemented)),
+            "Ellipsis" => Some(self.alloc(PyObj::Ellipsis)),
+            // `__debug__` is False exactly when the interpreter is optimized.
+            "__debug__" => Some(Value::Bool(optimize_level() == 0)),
+            _ if crate::builtins::is_known_builtin(name) => Some(self.builtin_object(name)),
+            _ => None,
+        }
+    }
+
+    /// The `builtins` module's namespace slot, building it on first use from
+    /// every native builtin (the interned objects a bare name resolves to, so
+    /// `builtins.len is len`) and the singletons. Whatever only CPython
+    /// provides is added by the importer (`import_module_inner`), which can
+    /// reach the bridge.
+    pub fn builtins_slot(&mut self) -> usize {
+        if let Some(slot) = self.builtins_slot {
+            return slot;
+        }
+        let mut ns = NameMap::default();
+        seed_module_dunders(self, &mut ns, "builtins");
+        for n in crate::builtins::builtin_names() {
+            let v = self.builtin_object(n);
+            ns.insert(n.to_string(), v);
+        }
+        for n in ["NotImplemented", "Ellipsis", "__debug__"] {
+            if let Some(v) = self.native_builtin(n) {
+                ns.insert(n.to_string(), v);
+            }
+        }
+        ns.insert("None".to_string(), Value::Undef);
+        ns.insert("True".to_string(), Value::Bool(true));
+        ns.insert("False".to_string(), Value::Bool(false));
+        let slot = self.new_module_slot(ns);
+        self.builtins_slot = Some(slot);
+        slot
     }
     /// A stable pseudo-address for an object (its heap index), used only for the
     /// `<… object at 0x…>` reprs where CPython prints an opaque pointer.
@@ -4067,6 +4134,14 @@ impl PyHost {
     fn module_repr(&self, name: &str, slot: usize) -> String {
         let ns = &self.module_globals[slot];
         let bound = |key: &str| ns.get(key).filter(|v| !matches!(v, Value::Undef));
+        // A module carrying a CPython `ModuleSpec` (`builtins`) reprs from it,
+        // as `_module_repr` does before falling back to the attributes below.
+        #[cfg(feature = "stdlib-ffi")]
+        if let Some(spec) = bound("__spec__").and_then(|v| self.foreign_id(v)) {
+            if let Some(r) = crate::ffi::module_repr_from_spec(spec) {
+                return r;
+            }
+        }
         let name = quote_str(&bound("__name__").and_then(|v| self.as_str(v)).unwrap_or_else(|| name.to_string()));
         if let Some(file) = bound("__file__") {
             return format!("<module {name} from {}>", self.repr_of(file));
@@ -14757,6 +14832,14 @@ impl PyHost {
                 return Ok(());
             }
         }
+        // A module attribute is an entry of its namespace (`del builtins.len`
+        // unbinds the builtin everywhere).
+        if let Some(PyObj::Module { slot, .. }) = self.get(recv) {
+            let slot = *slot;
+            if self.module_globals[slot].shift_remove(name).is_some() {
+                return Ok(());
+            }
+        }
         Err(format!(
             "AttributeError: '{}' object has no attribute '{name}'",
             self.type_name(recv)
@@ -15203,11 +15286,66 @@ pub fn call_named(
     if with_host(|h| h.classes.contains_key(name)) {
         return instantiate(name, args, kwargs);
     }
-    if crate::builtins::is_known_builtin(name) {
-        return crate::builtins::call_builtin_function(name, args, kwargs);
+    if let Some(v) = resolve_builtin(name) {
+        return invoke(&v, args, kwargs);
     }
     with_host(|h| h.note_name_miss(name));
     Err(name_error(name))
+}
+
+/// The builtins of CPython 3.14 that pythonrs has no native object for: they
+/// exist only in the embedded interpreter's `builtins` module (`aiter`,
+/// `anext`, `breakpoint`, `__build_class__`, `_IncompleteInputError`, and the
+/// `help`/`copyright`/`credits`/`license` objects `site` installs there).
+/// Listing them lets a bare name resolve to one without building the
+/// `builtins` namespace — and so without starting CPython — on every other
+/// `NameError`. A test in tests/ffi.rs checks the list against the bridge.
+#[cfg(feature = "stdlib-ffi")]
+pub const CPYTHON_ONLY_BUILTINS: &[&str] = &[
+    "_IncompleteInputError",
+    "__build_class__",
+    "aiter",
+    "anext",
+    "breakpoint",
+    "copyright",
+    "credits",
+    "help",
+    "license",
+];
+
+/// Resolve a bare name through the builtins (see [`PyHost::lookup_builtin`]).
+/// Must not be called inside `with_host`: a CPython-only builtin builds the
+/// `builtins` module, which imports.
+pub fn resolve_builtin(name: &str) -> Option<Value> {
+    if let Some(v) = with_host(|h| h.lookup_builtin(name)) {
+        return Some(v);
+    }
+    #[cfg(feature = "stdlib-ffi")]
+    if CPYTHON_ONLY_BUILTINS.contains(&name) && !with_host(|h| h.has_builtins_namespace()) {
+        import_module("builtins").ok()?;
+        return with_host(|h| h.lookup_builtin(name));
+    }
+    None
+}
+
+/// Add to the `builtins` namespace `slot` what only CPython's module has: the
+/// names no native object answers for, and the module's own `__doc__`,
+/// `__loader__` (`BuiltinImporter`) and `__spec__`.
+#[cfg(feature = "stdlib-ffi")]
+fn add_cpython_builtins(slot: usize) {
+    let Ok(id) = crate::ffi::import("builtins") else {
+        return;
+    };
+    for name in crate::ffi::dir_names(id) {
+        let wanted = matches!(name.as_str(), "__doc__" | "__loader__" | "__spec__")
+            || with_host(|h| !h.module_globals[slot].contains_key(&name));
+        if !wanted {
+            continue;
+        }
+        if let Ok(v) = with_host(|h| crate::ffi::get_attr(h, id, &name)) {
+            with_host(|h| h.module_globals[slot].insert(name, v));
+        }
+    }
 }
 
 /// The two names that belong to the inline-Rust FFI rather than to any Python
@@ -20559,6 +20697,21 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
             })
         }));
     }
+    // `builtins` is the namespace a bare name falls back to (see
+    // `PyHost::lookup_builtin`), so a write to the module is seen by every
+    // lookup. Every build serves it natively; the ffi build adds what only
+    // CPython's module has.
+    if name == "builtins" {
+        let slot = with_host(|h| h.builtins_slot());
+        #[cfg(feature = "stdlib-ffi")]
+        add_cpython_builtins(slot);
+        return Ok(with_host(|h| {
+            h.alloc(PyObj::Module {
+                name: "builtins".to_string(),
+                slot,
+            })
+        }));
+    }
     // `_ast` — the node types `ast.py` is built on. They are pure data (a name, a
     // base, a `_fields` tuple), so the module is DECLARED by a table in Rust and
     // DEFINED by running the Python that table expands to — the same relationship
@@ -20642,25 +20795,6 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
     }
 
     let entries: Vec<(&str, Value)> = match name {
-        // `builtins` as an importable module: every builtin function/type/exception
-        // resolves to the same `PyObj::Builtin` a bare-name lookup would, plus the
-        // singletons. The self-contained build needs this — `functools`, `operator`,
-        // `enum`, `re` all `import builtins`. On the ffi build CPython's richer
-        // builtins module (with `open`/`compile`/`vars`/… pythonrs lacks) is used.
-        #[cfg(not(feature = "stdlib-ffi"))]
-        "builtins" => with_host(|h| {
-            let mut v: Vec<(&str, Value)> = Vec::new();
-            for n in crate::builtins::builtin_names() {
-                v.push((n, h.alloc(PyObj::Builtin(n.to_string()))));
-            }
-            v.push(("None", Value::Undef));
-            v.push(("True", Value::Bool(true)));
-            v.push(("False", Value::Bool(false)));
-            v.push(("NotImplemented", h.alloc(PyObj::NotImplemented)));
-            v.push(("Ellipsis", h.alloc(PyObj::Ellipsis)));
-            v.push(("__debug__", Value::Bool(true)));
-            v
-        }),
         // `copy` is native (a CPython round-trip would deep-copy by value, losing
         // shallow-copy sharing and instance identity).
         "copy" => with_host(|h| {

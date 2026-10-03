@@ -3803,3 +3803,73 @@ x.append(log)
         r#"[Q([1, 2], maxlen=4), O({'a': 1, 'b': 2}), C({'a': 2, 'b': 1}), D(<class 'list'>, {'k': [1]}), 2, 1, 1, 0, [2, 1], ['b', 'a'], [('a', 2)], True, True, (<class '__main__.O'>, <class 'collections.OrderedDict'>, <class 'dict'>, <class 'object'>), Q([1, 2, 3], maxlen=4), Q([1, 2, 1, 2], maxlen=4), Q([1, 2, 1, 2], maxlen=4), Q([1, 2], maxlen=4), 'Q', O({'a': 1, 'b': 2}), D(<class 'list'>, {'k': [1]}), C({'a': 2, 'b': 1}), Counter({'a': 3, 'b': 1}), O({'a': 1, 'b': 2, 'z': 0}), O({'z': 0, 'a': 1, 'b': 2}), D(<class 'int'>, {'a': 1, 'b': 2}), [([1, 2], 4), ([1, 2], 4), ([1, 2], 4), ([1, 2], 4), ([1, 2], 4), ([1, 2], 4)]]"#
     );
 }
+
+/// `builtins` is the namespace a bare name falls back to, in every build: its
+/// members are the objects bare names resolve to, a name written to it
+/// resolves everywhere, and one deleted from it is a `NameError`. Expected
+/// values are CPython 3.14's.
+#[test]
+fn the_builtins_module_is_the_namespace_names_fall_back_to() {
+    assert_eq!(
+        g(
+            "import builtins\n\
+             x = (builtins.len is len, builtins.print is print, builtins.ValueError is ValueError,\n\
+             \x20    builtins.open is open, getattr(builtins, 'None'), builtins.Ellipsis is ...)",
+            "x"
+        ),
+        "(True, True, True, True, None, True)"
+    );
+    assert_eq!(
+        g(
+            "import builtins\nbuiltins.foo = 5\ndef f(): return foo\nx = (foo, f())",
+            "x"
+        ),
+        "(5, 5)"
+    );
+    assert_eq!(
+        g("import builtins\nbuiltins.abs = lambda v: 'mine'\nx = abs(-1)", "x"),
+        "'mine'"
+    );
+    assert_eq!(
+        err("import builtins\ndel builtins.len\nlen"),
+        "NameError: name 'len' is not defined"
+    );
+    assert_eq!(
+        g("import builtins, sys\nx = (sys.modules['builtins'] is builtins, __builtins__ is builtins)", "x"),
+        "(True, True)"
+    );
+    // A program-defined global still shadows the builtin of the same name.
+    assert_eq!(g("import builtins\nbuiltins.zz = 1\nzz = 2\nx = zz", "x"), "2");
+}
+
+/// The bridge adds what only CPython's `builtins` module has — the module's
+/// spec and the builtins pythonrs has no native object for — and those resolve
+/// as bare names before anything imported `builtins`.
+#[cfg(feature = "stdlib-ffi")]
+#[test]
+fn builtins_only_in_cpython_matches_the_bridge() {
+    assert_eq!(g("import builtins\nx = repr(builtins)", "x"), "\"<module 'builtins' (built-in)>\"");
+    assert_eq!(g("x = aiter.__name__", "x"), "'aiter'");
+    // `CPYTHON_ONLY_BUILTINS` is exactly CPython's names minus the native ones.
+    let cpython_only = g(
+        "import builtins\n\
+         x = sorted(n for n in builtins.__dict__\n\
+         \x20          if not n.startswith('__') or n == '__build_class__')",
+        "x",
+    );
+    let native: Vec<&str> = pythonrs::builtins::builtin_names();
+    let listed: Vec<String> = pythonrs::host::CPYTHON_ONLY_BUILTINS.iter().map(|s| s.to_string()).collect();
+    let all: Vec<String> = cpython_only
+        .trim_matches(|c| c == '[' || c == ']')
+        .split(", ")
+        .map(|s| s.trim_matches('\'').to_string())
+        .collect();
+    let expected: Vec<String> = all
+        .into_iter()
+        .filter(|n| {
+            !native.contains(&n.as_str())
+                && !matches!(n.as_str(), "None" | "True" | "False" | "NotImplemented" | "Ellipsis")
+        })
+        .collect();
+    assert_eq!(listed, expected);
+}

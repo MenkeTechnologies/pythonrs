@@ -215,20 +215,12 @@ fn b_getlocal(vm: &mut VM, _: u8) -> Value {
         host::NameRead::Unbound => return abort(vm, host::unbound_local_error(&name)),
         host::NameRead::Missing => {}
     }
-    if name == "NotImplemented" {
-        return with_host(|h| h.alloc(PyObj::NotImplemented));
+    // Not bound in any scope or the module: the builtins namespace — which
+    // also holds `NotImplemented`, `Ellipsis` and `__debug__`.
+    if let Some(v) = host::resolve_builtin(&name) {
+        return v;
     }
-    if name == "Ellipsis" {
-        return with_host(|h| h.alloc(PyObj::Ellipsis));
-    }
-    // `__debug__` is a builtin constant, not a module global: it resolves in
-    // every scope and every module, and it is False exactly when the
-    // interpreter is optimized. Leaving it unbound made the ordinary
-    // `if __debug__:` guard a NameError.
-    if name == "__debug__" {
-        return Value::Bool(host::optimize_level() == 0);
-    }
-    if is_known_builtin(&name) || host::is_rust_ffi_name(&name) {
+    if host::is_rust_ffi_name(&name) {
         return with_host(|h| h.builtin_object(&name));
     }
     with_host(|h| h.note_name_miss(&name));
@@ -251,20 +243,12 @@ fn b_getglobal(vm: &mut VM, _: u8) -> Value {
     if let Some(v) = with_host(|h| h.read_global(&name)) {
         return v;
     }
-    if name == "NotImplemented" {
-        return with_host(|h| h.alloc(PyObj::NotImplemented));
+    // Not bound in any scope or the module: the builtins namespace — which
+    // also holds `NotImplemented`, `Ellipsis` and `__debug__`.
+    if let Some(v) = host::resolve_builtin(&name) {
+        return v;
     }
-    if name == "Ellipsis" {
-        return with_host(|h| h.alloc(PyObj::Ellipsis));
-    }
-    // `__debug__` is a builtin constant, not a module global: it resolves in
-    // every scope and every module, and it is False exactly when the
-    // interpreter is optimized. Leaving it unbound made the ordinary
-    // `if __debug__:` guard a NameError.
-    if name == "__debug__" {
-        return Value::Bool(host::optimize_level() == 0);
-    }
-    if is_known_builtin(&name) || host::is_rust_ffi_name(&name) {
+    if host::is_rust_ffi_name(&name) {
         return with_host(|h| h.builtin_object(&name));
     }
     with_host(|h| h.note_name_miss(&name));
