@@ -1714,6 +1714,55 @@ x = (re.Scanner([(rb'\d+', lambda s, t: int(t)), (rb' ', None)]).scan(b'1 23'),
 }
 
 #[test]
+fn re_ascii_ignorecase_folds_k_and_s_by_ascii() {
+    // Under `re.ASCII` case folding pairs `a-z` with `A-Z` and nothing else.
+    // Unicode folds U+212A KELVIN SIGN to `k` and U+017F LONG S to `s`, so a
+    // Unicode `(?i)` matches them; `re.ASCII` must not — whether the flags are
+    // arguments or scoped to a group (`(?i:s)`). Group names,
+    // inline-flag letters and `(?#…)` comments are not literals. Without
+    // `re.ASCII` the Unicode folding stays. Every value is CPython 3.14's.
+    assert_eq!(
+        g(
+            r#"import re
+x = (re.findall(r"(?i)k", "KK", re.A), re.findall(r"s", "Ssſ", re.A | re.I),
+     re.findall(r"K", "kK", re.A | re.I), re.findall(r"(?i:s)S", "sSſS", re.A),
+     re.findall(r"k", "kKK", re.A), re.findall(r"(?i)k", "KK"),
+     re.findall(r"(?P<sk>k)(?P=sk)", "kk", re.A), re.findall(r"(?#ks)(?s:k.)", "k\n", re.A|re.I))"#,
+            "x"
+        ),
+        "(['K'], ['S', 's'], ['k'], ['sS'], ['k'], ['K', '\u{212a}'], ['k'], ['k\\n'])"
+    );
+}
+
+#[test]
+fn re_flags_are_regexflag_members() {
+    // `re.I` IS `re.RegexFlag.IGNORECASE`: an `int` that reprs (and, through
+    // `__str__ = object.__str__`, prints) as `re.IGNORECASE`, combines into
+    // cached composites, keeps unknown bits (`KEEP` boundary) and inverts every
+    // bit. Arithmetic other than `| & ^ ~` is plain `int`; `Pattern.flags` is a
+    // plain `int`. Every value is CPython 3.14's.
+    assert_eq!(
+        g(
+            r#"import re
+x = (repr(re.I), str(re.M), f"{re.S}", f"{re.X:x}", repr(re.I | re.M), repr(re.I | 1024),
+     repr(~re.I), repr(re.I & re.M), re.I is re.RegexFlag.IGNORECASE, re.I is re.IGNORECASE,
+     (re.I | re.M) is (re.M | re.I), repr(list(re.I | re.M)), re.I in (re.I | re.M),
+     len(re.RegexFlag), re.RegexFlag["DOTALL"] is re.S, re.RegexFlag(8) is re.M,
+     type(re.I | 1).__name__, type(re.I + 1).__name__, re.compile("a", re.I | re.M).flags,
+     re.I.name, (re.I | re.M).name, re.NOFLAG.value, repr(re.RegexFlag(0)),
+     repr(type(re.I)), re.RegexFlag.__module__)"#,
+            "x"
+        ),
+        "('re.IGNORECASE', 're.MULTILINE', 're.DOTALL', '40', 're.IGNORECASE|re.MULTILINE', \
+         're.IGNORECASE|0x400', \
+         're.ASCII|re.LOCALE|re.UNICODE|re.MULTILINE|re.DOTALL|re.VERBOSE|re.DEBUG|0x1', \
+         're.NOFLAG', True, True, True, '[re.IGNORECASE, re.MULTILINE]', True, 8, True, True, \
+         'RegexFlag', 'int', 42, 'IGNORECASE', 'IGNORECASE|MULTILINE', 0, 're.NOFLAG', \
+         \"<flag 'RegexFlag'>\", 're')"
+    );
+}
+
+#[test]
 fn large_integers_compare_exactly() {
     // Equality on integers must be exact at any size. Comparing through `f64` made
     // any two integers within one ULP equal — at 29 digits that is a gap of

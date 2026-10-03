@@ -289,17 +289,21 @@ fn group_closes(pattern: &str) -> Vec<usize> {
 /// Python has no `(?-u:` syntax, so these sequences come only from that
 /// rewrite.
 fn fancy_spelling(pattern: &str) -> std::borrow::Cow<'_, str> {
-    if !pattern.contains("(?-u:\\") {
+    if !pattern.contains("(?-u:") {
         return std::borrow::Cow::Borrowed(pattern);
     }
     const W: &str = "[0-9A-Za-z_]";
     let boundary = format!("(?:(?<={W})(?!{W})|(?<!{W})(?={W}))");
     let not_boundary = format!("(?:(?<={W})(?={W})|(?<!{W})(?!{W}))");
-    std::borrow::Cow::Owned(
-        pattern
-            .replace("(?-u:\\b)", &boundary)
-            .replace("(?-u:\\B)", &not_boundary),
-    )
+    let mut spelled = pattern
+        .replace("(?-u:\\b)", &boundary)
+        .replace("(?-u:\\B)", &not_boundary);
+    // The `re.ASCII` spelling of a `k`/`s` literal: the plain letter, whose
+    // case folding here is the crate's Unicode one.
+    for letter in ["k", "K", "s", "S"] {
+        spelled = spelled.replace(&format!("(?-u:{letter})"), letter);
+    }
+    std::borrow::Cow::Owned(spelled)
 }
 
 fn named_from<'a>(names: impl Iterator<Item = Option<&'a str>>) -> Vec<(String, usize)> {

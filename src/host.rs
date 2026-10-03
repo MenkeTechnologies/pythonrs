@@ -12217,6 +12217,12 @@ impl PyHost {
                 // binding it to a name (`_count_elements`'s `mapping.get`) lands here.
                 if !matches!(inst_payload, Value::Undef) {
                     if let Some(base) = self.builtin_base_of(&class) {
+                        // A data descriptor of the base (`int.real`,
+                        // `int.numerator`) reads the payload: an `int` subclass
+                        // instance's `.real` is the plain `int`, as in CPython.
+                        if crate::builtins::type_data_attrs(base).contains(&name) {
+                            return self.get_attr_inner(&inst_payload, name);
+                        }
                         if crate::builtins::type_has_method(base, name) {
                             let func =
                                 self.alloc(PyObj::Builtin(format!("__base_method__.{name}")));
@@ -14935,13 +14941,14 @@ pub fn invoke(
                     h.new_str(s)
                 }));
             }
-            // `object.__str__` is not a renderer of its own: it defers to the
-            // object's `__repr__`, so `object.__str__('a')` is `"'a'"`.
+            // `object.__str__` is not a renderer of its own: it runs the type's
+            // `tp_repr` (`object_str` in `Objects/typeobject.c`), so
+            // `object.__str__('a')` is `"'a'"` and a class that sets
+            // `__str__ = object.__str__` (as `re.RegexFlag` does) stringifies
+            // through its own `__repr__`.
             if base == "object" && method == "__str__" {
-                return Ok(with_host(|h| {
-                    let s = h.repr_of(&recv);
-                    h.new_str(s)
-                }));
+                let s = crate::builtins::py_repr(&recv)?;
+                return Ok(with_host(|h| h.new_str(s)));
             }
             if crate::builtins::is_type_like_builtin(&base) {
                 let payload =
@@ -20938,26 +20945,6 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                     .iter()
                     .map(|f| (*f, h.alloc(PyObj::Builtin(format!("re.{f}")))))
                     .collect();
-                // Flag constants (both long and short names).
-                for (name, bit) in [
-                    ("IGNORECASE", 2i64),
-                    ("I", 2),
-                    ("LOCALE", 4),
-                    ("L", 4),
-                    ("MULTILINE", 8),
-                    ("M", 8),
-                    ("DOTALL", 16),
-                    ("S", 16),
-                    ("UNICODE", 32),
-                    ("U", 32),
-                    ("VERBOSE", 64),
-                    ("X", 64),
-                    ("ASCII", 256),
-                    ("A", 256),
-                    ("NOFLAG", 0),
-                ] {
-                    out.push((name, Value::Int(bit)));
-                }
                 // The compile-error class. CPython 3.13 renamed it `re.PatternError`
                 // and kept `re.error` as an ALIAS of the same object, so `__name__`
                 // is `'PatternError'` and `re.PatternError is re.error` is True —
@@ -20976,6 +20963,22 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                 std::path::Path::new("<re._scanner>"),
             )?;
             entries.push(("Scanner", with_host(|h| h.get_attr(&helper, "Scanner"))?));
+            // `RegexFlag` and its members, each bound under its long and short
+            // name (`re.I is re.IGNORECASE is re.RegexFlag.IGNORECASE`), as
+            // `enum.global_enum` exports them into CPython's `re` namespace.
+            let flags = run_vendored_module(
+                "re._regexflag",
+                crate::stdlib::pyreflag::module_source(),
+                std::path::Path::new("<re._regexflag>"),
+            )?;
+            let regex_flag = with_host(|h| h.get_attr(&flags, "RegexFlag"))?;
+            for name in [
+                "NOFLAG", "ASCII", "A", "IGNORECASE", "I", "LOCALE", "L", "UNICODE", "U",
+                "MULTILINE", "M", "DOTALL", "S", "VERBOSE", "X", "DEBUG",
+            ] {
+                entries.push((name, with_host(|h| h.get_attr(&regex_flag, name))?));
+            }
+            entries.push(("RegexFlag", regex_flag));
             entries
         }
         // `errno` — the platform error numbers (from libc) plus the `errorcode`

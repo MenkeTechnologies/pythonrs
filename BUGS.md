@@ -37,6 +37,42 @@ written.
   `MAXREPEAT`. `Pattern.flags` is the parse's, and a `sub`/`expand`
   template's error carries the same attributes (its group-name check is
   `checkgroupname`'s, `%a` for bytes).
+- **`re.RegexFlag` exists, and the flag constants are its members.** `re.I`
+  was the plain int `2`; it is now `re.RegexFlag.IGNORECASE`, as in CPython:
+  `repr(re.I)` and `str(re.I)` are `re.IGNORECASE`, `re.I | re.M` is the cached
+  composite `re.IGNORECASE|re.MULTILINE`, unknown bits are kept
+  (`re.I | 1024` is `re.IGNORECASE|0x400`), `~re.I` inverts every bit,
+  `list(re.RegexFlag)`, `len`, `RegexFlag['I']`, `RegexFlag(8)`, `.name`,
+  `.value`, `__members__` and `dir(re.RegexFlag)` answer as CPython's, while
+  `+`, `-` and `Pattern.flags` stay plain `int`. Building it on `enum` would
+  start libpython on every `import re` (`enum` is CPython's across the bridge),
+  so `src/stdlib/pyreflag.rs` ports the parts of `enum.Flag`/`IntFlag` that
+  `RegexFlag` uses — `Flag._missing_` under the `KEEP` boundary,
+  `global_flag_repr`, the bitwise operators, `EnumType`'s class protocol — as
+  Python source run natively when `re` is imported. That needed four
+  interpreter fixes, each general: `object.__str__` runs the type's own
+  `__repr__` (it used the default repr, so `__str__ = object.__str__` printed
+  `<… object at 0x…>`); `len(cls)`, `x in cls` and `dir(cls)` dispatch to the
+  metaclass's `__len__`/`__contains__` (or `__iter__`)/`__dir__`; and an `int`
+  or `float` subclass instance's `.real`/`.imag`/`.numerator`/`.denominator`
+  read its value (they were bound methods). What differs: `RegexFlag`'s bases
+  are `(int,)`, so `isinstance(re.I, enum.IntFlag)` is False and
+  `type(type(re.I))` is not `enum.EnumType`; and `copy.copy`/`pickle` of a
+  member go through the general gaps listed under "Pickling across the
+  bridge". Measured on the debug build with a fresh bytecode cache,
+  `import re` went from 1.1 ms to 5.0 ms. Regression test:
+  `re_flags_are_regexflag_members` in `tests/stdlib.rs`.
+- **`re.ASCII | re.IGNORECASE` no longer folds a literal `k`/`s` to U+212A
+  KELVIN SIGN / U+017F LONG S** on the linear-time engine. In Unicode's case
+  folding those two are the only non-ASCII characters that fold to an ASCII
+  letter, so the crate's `(?i)` matched them where `re.ASCII` folds `a-z`
+  against `A-Z` only: `re.findall(r'(?i)k', 'KK', re.A)` was
+  `['K', 'K']`, CPython's `['K']`. Under `re.ASCII` (an argument, or a leading
+  `(?a)`) such a literal is spelled `(?-u:k)`, which keeps whatever case
+  sensitivity is in force there — a scoped `(?i:s)` included — and folds by
+  ASCII; group names, inline-flag letters and `(?#…)` comments are left
+  alone. Regression test: `re_ascii_ignorecase_folds_k_and_s_by_ascii` in
+  `tests/stdlib.rs`.
 - **`--lsp` go-to-definition and signature help reach attributes and other
   files.** Both resolved names within the open document only. An attribute now
   resolves as it does at run time where the document determines the receiver:
@@ -2412,8 +2448,7 @@ module then raises `ModuleNotFoundError`.
   `module_ffi_fallback` covers exactly `math`, `collections`, `functools` and
   `contextlib`; `re` is not in that list, so a miss on the native namespace is a
   hard `AttributeError` and never defers. Checking against CPython 3.14.6:
-  `hasattr(re, 'RegexFlag')` is `False` here and `True` there; `hasattr(itertools, 'batched')` is `False` here and `True`
-  there. `re` is the Rust `regex`/`fancy_regex` engines behind
+  `hasattr(itertools, 'batched')` is `False` here and `True` there. `re` is the Rust `regex`/`fancy_regex` engines behind
   `src/regexpr.rs`, and its remaining gaps are listed under "Standard library —
   `re`" below.
 - **FFI-boundary integration** — crossing the bridge with a pythonrs object.
@@ -2515,23 +2550,12 @@ Still open:
   a three-digit octal escape (`\012`, which the rewrite hands the engine as
   a back-reference, `error: backreferences are not supported`) compile in
   CPython.
-- **`re.RegexFlag` is absent; the flag constants are plain ints.** CPython's
-  `re.I` IS `re.RegexFlag.IGNORECASE`, an `enum.IntFlag` member that reprs as
-  `re.IGNORECASE` and combines to `re.IGNORECASE|re.MULTILINE`. pythonrs has no
-  native `enum`: in the default build `enum.IntFlag` exists only as a CPython
-  class across the FFI bridge, and building `RegexFlag` there makes every
-  `import re` start libpython (measured on the debug build: `-c 'import re'`
-  0.01s, `-c 'import enum'` 0.03s) and turns every `flags` argument into a
-  bridged object the native engine would convert per call; defining the class
-  body on pythonrs fails outright (`__str__ = object.__str__` raises `cannot
-  pass 'wrapper_descriptor' to a CPython stdlib call`). It needs a native
-  `IntFlag`.
-- **`re.ASCII | re.IGNORECASE` on a str subject folds a literal `k`/`s` to
-  U+212A KELVIN SIGN / U+017F LONG S.** Classes, `\w` and non-ASCII literals
-  fold ASCII-only (see the bytes entry in Implemented), but an ASCII letter
-  outside a class keeps the crate's Unicode `(?i)`: `re.findall(r'(?i)k',
-  'K\u212a', re.A)` is `['K', 'K']` here, `['K']` in CPython. Bytes subjects
-  cannot hold those characters, so only str patterns under `re.ASCII` see it.
+- **`re.ASCII | re.IGNORECASE` on a pattern the backtracking engine takes
+  folds a literal `k`/`s` to U+212A KELVIN SIGN / U+017F LONG S.** On the
+  linear-time engine this is fixed (see Implemented); `fancy_regex` cannot turn
+  Unicode off, so a pattern with look-around or a backreference keeps the
+  Unicode `(?i)` for an ASCII `k`/`s`: `re.findall(r'(?=k)k', 'KK',
+  re.A | re.I)` is `['K', 'K']` here, `['K']` in CPython.
 - **`SRE_Scanner.match()` after an empty match ends the scan.** `_sre.c` then
   requires the next match at the same place to be non-empty and tries the
   pattern's other alternatives for one; the engines cannot be asked for that,

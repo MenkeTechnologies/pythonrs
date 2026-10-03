@@ -2226,6 +2226,16 @@ pub fn contains_value(container: Value, item: Value) -> Result<bool, String> {
         let found = dict_get(&dict, &key)?;
         return elem_equal(&found, &want);
     }
+    // `x in cls` is `type(cls).__contains__(cls, x)`, falling back to iterating
+    // the class through its metaclass `__iter__`: an enum class is a container
+    // of its members.
+    if let Some(m) = with_host(|h| h.metaclass_method(&container, "__contains__")) {
+        let v = host::invoke(&m, vec![container, item], vec![])?;
+        return Ok(with_host(|h| h.truthy(&v)));
+    }
+    if with_host(|h| h.metaclass_method(&container, "__iter__").is_some()) {
+        return iter_membership(&container, &item);
+    }
     // Instance `__contains__` wins; else fall back to iterating the instance
     // (via __iter__/__getitem__) and comparing.
     if with_host(|h| matches!(h.get(&container), Some(PyObj::Instance(_)))) {
@@ -7171,6 +7181,12 @@ pub fn call_builtin_function(
                     let seq = host::call_method(v, "__dir__", vec![], vec![])?;
                     return call_builtin_function("sorted", vec![seq], vec![]);
                 }
+                // The same for a class: `type(cls).__dir__(cls)`, so a
+                // metaclass (`enum.EnumType`) chooses what `dir(cls)` lists.
+                if let Some(m) = with_host(|h| h.metaclass_method(v, "__dir__")) {
+                    let seq = host::invoke(&m, vec![v.clone()], vec![])?;
+                    return call_builtin_function("sorted", vec![seq], vec![]);
+                }
             }
             Ok(with_host(|h| {
                 let names = match args.first() {
@@ -8441,6 +8457,11 @@ pub fn py_len(v: &Value) -> Result<usize, String> {
     #[cfg(feature = "stdlib-ffi")]
     if let Some(fid) = with_host(|h| h.foreign_id(v)) {
         return crate::ffi::len(fid);
+    }
+    // `len(cls)` is `type(cls).__len__(cls)`: an enum class counts its members.
+    if let Some(m) = with_host(|h| h.metaclass_method(v, "__len__")) {
+        let r = host::invoke(&m, vec![v.clone()], vec![])?;
+        return len_result(&r);
     }
     with_host(|h| match h.get(v) {
         Some(PyObj::Str(s)) => {
@@ -10948,22 +10969,53 @@ fn rewrite_class_backspace(
                 i += 2;
                 continue;
             }
-            // A group name (`(?P<name>`, `(?<name>`, `(?P=name)`) is copied as
-            // written: it is not pattern text, and wrapping a non-ASCII letter of
-            // it for case folding would break the group syntax.
-            '(' if !in_class && ascii_fold && chars.get(i + 1) == Some(&'?') => {
+            // A group name (`(?P<name>`, `(?<name>`, `(?P=name)`), a
+            // conditional's group reference (`(?(name)`), an inline-flag group
+            // (`(?as)`, `(?i-s:`) and a `(?#…)` comment are copied as written:
+            // none of them is pattern text, and the `re.ASCII` rewrites below
+            // (a non-ASCII letter for case folding, a `k`/`s` literal) would
+            // break their syntax.
+            '(' if !in_class && ascii && chars.get(i + 1) == Some(&'?') => {
                 let rest: String = chars[i + 2..].iter().take(3).collect();
                 let named = rest.starts_with("P<")
                     || rest.starts_with("P=")
+                    || rest.starts_with('(')
                     || (rest.starts_with('<') && !rest[1..].starts_with(['=', '!']));
-                let close = if rest.starts_with("P=") { ')' } else { '>' };
-                if named {
+                let flag_letters = chars[i + 2..]
+                    .iter()
+                    .take_while(|c| c.is_ascii_alphabetic() || **c == '-')
+                    .count();
+                let after_flags = chars.get(i + 2 + flag_letters).copied();
+                let close = if named && (rest.starts_with("P<") || rest.starts_with('<')) {
+                    Some('>')
+                } else if named || rest.starts_with('#') {
+                    Some(')')
+                } else if flag_letters > 0 && matches!(after_flags, Some(':' | ')')) {
+                    after_flags
+                } else {
+                    None
+                };
+                if let Some(close) = close {
                     if let Some(len) = chars[i..].iter().position(|&c| c == close) {
                         out.extend(&chars[i..=i + len]);
                         i += len + 1;
                         continue;
                     }
                 }
+            }
+            // `re.ASCII` folds `k` and `s` against `K` and `S` only, but in
+            // Unicode's case folding (CaseFolding.txt) U+212A KELVIN SIGN folds to
+            // `k` and U+017F LATIN SMALL LETTER LONG S to `s` — the only two
+            // non-ASCII characters that fold to an ASCII letter — so the crate's
+            // `(?i)` matched them. `(?-u:…)` keeps whatever case-sensitivity is in
+            // force at this point (a scoped `(?i:…)` included) and makes the
+            // folding ASCII's.
+            c if ascii && !in_class && matches!(c, 'k' | 'K' | 's' | 'S') => {
+                out.push_str("(?-u:");
+                out.push(c);
+                out.push(')');
+                i += 1;
+                continue;
             }
             // `^` right after the open negates; `]` in first position is a literal
             // member rather than the close.
@@ -11197,7 +11249,7 @@ fn re_compile_raw(
     if flags & 64 != 0 {
         inline.push('x');
     }
-    let ascii = is_bytes || flags & 256 != 0;
+    let ascii = is_bytes || (flags | re_inline_flags(pattern)) & 256 != 0;
     let ignorecase = (flags | re_inline_flags(pattern)) & 2 != 0;
     let pattern = rewrite_class_backspace(pattern, flags & 64 != 0, ascii, ignorecase);
     let full = if inline.is_empty() {
