@@ -353,7 +353,9 @@ fn route_std_streams() {
             }
             let _ = kw.set_item("newline", "\n");
             let _ = kw.set_item("write_through", true);
-            let Ok(raw) = Py::new(py, PyrsStdStream { stream }) else { continue };
+            let Ok(raw) = Py::new(py, PyrsStdStream { stream }) else {
+                continue;
+            };
             let Ok(new) = io
                 .getattr("TextIOWrapper")
                 .and_then(|cls| cls.call((raw,), Some(&kw)))
@@ -366,7 +368,9 @@ fn route_std_streams() {
         }
         // A redirect pythonrs installed before the interpreter existed.
         for stderr in [false, true] {
-            if let Some(target) = PENDING_STD_TARGET.with(|p| p.borrow_mut()[stderr as usize].take()) {
+            if let Some(target) =
+                PENDING_STD_TARGET.with(|p| p.borrow_mut()[stderr as usize].take())
+            {
                 apply_std_target(py, stderr, target);
             }
         }
@@ -397,7 +401,7 @@ thread_local! {
 
 /// Swap the embedded interpreter's `sys.stdout` (or `sys.stderr`) to match a
 /// pythonrs redirect. Before the interpreter starts there is nothing to swap;
-/// the target is held until [`route_std_streams`] runs.
+/// the target is held until `route_std_streams` runs.
 pub fn set_std_target(stderr: bool, target: StdTarget) {
     if !INTERPRETER_STARTED.load(std::sync::atomic::Ordering::Relaxed) {
         PENDING_STD_TARGET.with(|p| {
@@ -466,7 +470,8 @@ fn apply_std_target(py: Python, stderr: bool, target: StdTarget) {
 /// not yet applied to the host.
 static STD_ASSIGNED: Mutex<[Option<StdTarget>; 2]> = Mutex::new([None, None]);
 /// Whether [`STD_ASSIGNED`] holds anything — the fast path of every read.
-static STD_ASSIGNED_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static STD_ASSIGNED_DIRTY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 thread_local! {
     /// Set while [`apply_std_target`] installs a pythonrs-side redirect, whose
@@ -515,13 +520,18 @@ fn watch_sys_streams(py: Python) {
         return;
     }
     let Ok(sys) = py.import("sys") else { return };
-    let Ok(dict) = sys.getattr("__dict__") else { return };
+    let Ok(dict) = sys.getattr("__dict__") else {
+        return;
+    };
     // SAFETY: the pointers were resolved from the running libpython and carry
     // the declared C signatures; the GIL is held, as both calls require.
     unsafe {
-        let add: unsafe extern "C" fn(DictWatchCallback) -> std::ffi::c_int = std::mem::transmute(add);
-        let watch: unsafe extern "C" fn(std::ffi::c_int, *mut pyo3::ffi::PyObject) -> std::ffi::c_int =
-            std::mem::transmute(watch);
+        let add: unsafe extern "C" fn(DictWatchCallback) -> std::ffi::c_int =
+            std::mem::transmute(add);
+        let watch: unsafe extern "C" fn(
+            std::ffi::c_int,
+            *mut pyo3::ffi::PyObject,
+        ) -> std::ffi::c_int = std::mem::transmute(watch);
         let id = add(sys_dict_watcher);
         if id < 0 {
             pyo3::ffi::PyErr_Clear();
@@ -552,7 +562,10 @@ unsafe extern "C" fn sys_dict_watcher(
     // references to a live key and value.
     let py = unsafe { Python::assume_gil_acquired() };
     let key = unsafe { Bound::from_borrowed_ptr(py, key) };
-    let name = key.downcast::<PyString>().ok().and_then(|s| s.to_cow().ok());
+    let name = key
+        .downcast::<PyString>()
+        .ok()
+        .and_then(|s| s.to_cow().ok());
     let stderr = match name.as_deref() {
         Some("stdout") => false,
         Some("stderr") => true,
@@ -1177,7 +1190,13 @@ def _make(name, bases, members):
 // ── exceptions across the bridge ─────────────────────────────────────────────
 
 /// [`crate::host::ExcBridge::pair`] for CPython object `obj`.
-fn pair_exception(host: &PyHost, v: &Value, obj: &Bound<PyAny>, handle: u32, raised_by_cpython: bool) {
+fn pair_exception(
+    host: &PyHost,
+    v: &Value,
+    obj: &Bound<PyAny>,
+    handle: u32,
+    raised_by_cpython: bool,
+) {
     host.exc_bridge
         .borrow_mut()
         .pair(v, handle, obj.as_ptr() as usize, raised_by_cpython);
@@ -1186,7 +1205,11 @@ fn pair_exception(host: &PyHost, v: &Value, obj: &Bound<PyAny>, handle: u32, rai
 /// The pythonrs exception CPython object `obj` stands for, if it has crossed
 /// before (in either direction).
 fn paired_exception(host: &PyHost, obj: &Bound<PyAny>) -> Option<Value> {
-    host.exc_bridge.borrow().from_py.get(&(obj.as_ptr() as usize)).cloned()
+    host.exc_bridge
+        .borrow()
+        .from_py
+        .get(&(obj.as_ptr() as usize))
+        .cloned()
 }
 
 /// The CPython object for pythonrs exception `v`, or `None` when `v` is not an
@@ -1196,7 +1219,11 @@ fn paired_exception(host: &PyHost, obj: &Bound<PyAny>) -> Option<Value> {
 /// `_metadata`), and any other class — a user exception, a native module's
 /// (`struct.error`) — becomes an instance of its mirror class (see
 /// [`exception_mirror`]).
-fn exc_to_py<'py>(host: &PyHost, py: Python<'py>, v: &Value) -> Result<Option<Bound<'py, PyAny>>, String> {
+fn exc_to_py<'py>(
+    host: &PyHost,
+    py: Python<'py>,
+    v: &Value,
+) -> Result<Option<Bound<'py, PyAny>>, String> {
     let Value::Obj(id) = v else {
         return Ok(None);
     };
@@ -1206,7 +1233,10 @@ fn exc_to_py<'py>(host: &PyHost, py: Python<'py>, v: &Value) -> Result<Option<Bo
     let (class, args, builtin) = match host.get(v) {
         Some(PyObj::Exception { class, args }) => (class.clone(), args.clone(), true),
         Some(PyObj::Instance(i)) if host.class_is_exception(&i.class) => {
-            let args = match host.inst_attr(&i.dict, "args").map(|t| host.get(&t).cloned()) {
+            let args = match host
+                .inst_attr(&i.dict, "args")
+                .map(|t| host.get(&t).cloned())
+            {
                 Some(Some(PyObj::Tuple(items))) => items,
                 _ => Vec::new(),
             };
@@ -1217,7 +1247,11 @@ fn exc_to_py<'py>(host: &PyHost, py: Python<'py>, v: &Value) -> Result<Option<Bo
     let pargs = marshal_seq(host, py, &args)?;
     let tup = PyTuple::new(py, pargs).map_err(|e| e.to_string())?;
     let builtin_type = builtin
-        .then(|| py.import("builtins").and_then(|m| m.getattr(class.as_str())).ok())
+        .then(|| {
+            py.import("builtins")
+                .and_then(|m| m.getattr(class.as_str()))
+                .ok()
+        })
         .flatten()
         .filter(|t| is_exception_type(py, t));
     let exc = match builtin_type {
@@ -1250,7 +1284,10 @@ fn exc_to_py<'py>(host: &PyHost, py: Python<'py>, v: &Value) -> Result<Option<Bo
 fn is_exception_type(py: Python, t: &Bound<PyAny>) -> bool {
     t.downcast::<pyo3::types::PyType>()
         .ok()
-        .and_then(|t| t.is_subclass(&py.get_type::<pyo3::exceptions::PyBaseException>()).ok())
+        .and_then(|t| {
+            t.is_subclass(&py.get_type::<pyo3::exceptions::PyBaseException>())
+                .ok()
+        })
         .unwrap_or(false)
 }
 
@@ -1260,16 +1297,30 @@ fn is_exception_type(py: Python, t: &Bound<PyAny>) -> bool {
 /// are answered by the pythonrs exception it mirrors — so a user exception
 /// (`class MyErr(ValueError)`) is caught by a CPython `except ValueError`, and
 /// prints and reads (`e.code`) as itself.
-fn exception_mirror<'py>(host: &PyHost, py: Python<'py>, class: &str) -> Result<Bound<'py, PyAny>, String> {
+fn exception_mirror<'py>(
+    host: &PyHost,
+    py: Python<'py>,
+    class: &str,
+) -> Result<Bound<'py, PyAny>, String> {
     if let Some(&handle) = host.exc_bridge.borrow().mirrors.get(class) {
         return fetch(py, handle);
     }
     let builtins = py.import("builtins").map_err(|e| e.to_string())?;
     let (name, qualname, module, ancestors) = match host.classes.get(class) {
-        Some(c) => (c.name.clone(), c.qualname.clone(), c.module.clone(), host.mro_of(class)),
+        Some(c) => (
+            c.name.clone(),
+            c.qualname.clone(),
+            c.module.clone(),
+            host.mro_of(class),
+        ),
         None => {
             let (module, name) = class.rsplit_once('.').unwrap_or(("builtins", class));
-            (name.to_string(), name.to_string(), module.to_string(), crate::builtins::builtin_mro(class))
+            (
+                name.to_string(),
+                name.to_string(),
+                module.to_string(),
+                crate::builtins::builtin_mro(class),
+            )
         }
     };
     let base = ancestors
@@ -1279,14 +1330,21 @@ fn exception_mirror<'py>(host: &PyHost, py: Python<'py>, class: &str) -> Result<
         .find(|t| is_exception_type(py, t))
         .map_or_else(|| builtins.getattr("Exception"), Ok)
         .map_err(|e| e.to_string())?;
-    let module = if module.is_empty() { "__main__".to_string() } else { module };
+    let module = if module.is_empty() {
+        "__main__".to_string()
+    } else {
+        module
+    };
     let delegate = wrap_pyfunction!(exception_mirror_delegate, py).map_err(|e| e.to_string())?;
     let mirror = exception_helpers(py)?
         .getattr("mirror")
         .and_then(|f| f.call1((name, qualname, module, base, delegate)))
         .map_err(|e| e.to_string())?;
     let handle = store(mirror.clone().unbind());
-    host.exc_bridge.borrow_mut().mirrors.insert(class.to_string(), handle);
+    host.exc_bridge
+        .borrow_mut()
+        .mirrors
+        .insert(class.to_string(), handle);
     Ok(mirror)
 }
 
@@ -1418,7 +1476,9 @@ def make_mirror(name, members):
     let module = PyModule::from_code(py, code, c"_pyrs_mirror.py", c"_pyrs_mirror")
         .map_err(|e| e.to_string())?;
     let install = |f: PyResult<Bound<pyo3::types::PyCFunction>>| -> Result<(), String> {
-        module.add_function(f.map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+        module
+            .add_function(f.map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())
     };
     install(wrap_pyfunction!(_native_class, &module))?;
     install(wrap_pyfunction!(_detach, &module))?;
@@ -1479,12 +1539,18 @@ fn class_mirror<'py>(
 ) -> Result<Bound<'py, PyAny>, String> {
     let class_def = host.classes.get(cname);
     let members: Vec<(String, Value)> = class_def
-        .map(|c| c.ns.iter().map(|(k, val)| (k.clone(), val.clone())).collect())
+        .map(|c| {
+            c.ns.iter()
+                .map(|(k, val)| (k.clone(), val.clone()))
+                .collect()
+        })
         .unwrap_or_default();
     let ns_dict = PyDict::new(py);
     for (k, val) in &members {
         let pv = value_to_py(host, py, val)?;
-        ns_dict.set_item(k.as_str(), pv).map_err(|e| e.to_string())?;
+        ns_dict
+            .set_item(k.as_str(), pv)
+            .map_err(|e| e.to_string())?;
     }
     let name = class_def.map_or(cname, |c| c.name.as_str());
     let qualname = class_def
@@ -1501,7 +1567,9 @@ fn class_mirror<'py>(
     if let Some(mirror) = cached {
         let mirror = mirror.into_bound(py);
         let still_pristine = IDENTITY.with(|m| {
-            m.borrow().pristine.contains_key(&(mirror.as_ptr() as usize))
+            m.borrow()
+                .pristine
+                .contains_key(&(mirror.as_ptr() as usize))
         });
         if still_pristine {
             // `type.__setattr__` itself: the metaclass's override would detach.
@@ -1530,9 +1598,15 @@ fn class_mirror<'py>(
 /// A pythonrs callable (lambda / def / builtin / bound method / lru_cache)
 /// passed as a callback (`functools.reduce(f, …)`, `sorted(key=f)`, …), wrapped
 /// so CPython can call back into fusevm — the same wrapper every time.
-fn callable_proxy<'py>(host: &PyHost, py: Python<'py>, v: &Value) -> Result<Bound<'py, PyAny>, String> {
+fn callable_proxy<'py>(
+    host: &PyHost,
+    py: Python<'py>,
+    v: &Value,
+) -> Result<Bound<'py, PyAny>, String> {
     let Value::Obj(id) = v else {
-        return Err(crate::host::type_error("unsupported value for CPython call"));
+        return Err(crate::host::type_error(
+            "unsupported value for CPython call",
+        ));
     };
     let key = (host.generation, *id);
     if let Some(p) = IDENTITY.with(|m| m.borrow().callables.get(&key).map(|o| o.clone_ref(py))) {
@@ -1883,7 +1957,10 @@ fn value_to_py_node<'py>(
                     .import("builtins")
                     .and_then(|m| m.getattr("complex"))
                     .map_err(|e| e.to_string())?;
-                let (re, im) = (crate::host::export_float(*re), crate::host::export_float(*im));
+                let (re, im) = (
+                    crate::host::export_float(*re),
+                    crate::host::export_float(*im),
+                );
                 cplx.call1((re, im)).map_err(|e| e.to_string())
             }
             Some(PyObj::Deque { items, maxlen }) => {
@@ -1968,8 +2045,9 @@ fn value_to_py_node<'py>(
             // An exception passed into a CPython call — the value handed to a
             // foreign context manager's `__exit__`, a `gen.throw` argument, an
             // error leaving a callback: the CPython object it is paired with.
-            Some(PyObj::Exception { .. }) => exc_to_py(host, py, v)?
-                .ok_or_else(|| "ffi: exception did not cross".to_string()),
+            Some(PyObj::Exception { .. }) => {
+                exc_to_py(host, py, v)?.ok_or_else(|| "ffi: exception did not cross".to_string())
+            }
             // A pythonrs `open()` handle passed into a CPython call
             // (`json.dump(cfg, f)`, `csv.writer(f)`, `csv.DictReader(f)`) is
             // wrapped as a file-like object whose read/write/iteration route
@@ -2000,10 +2078,14 @@ fn value_to_py_node<'py>(
                     return Ok(exc);
                 }
                 let Value::Obj(id) = v else {
-                    return Err(crate::host::type_error("unsupported value for CPython call"));
+                    return Err(crate::host::type_error(
+                        "unsupported value for CPython call",
+                    ));
                 };
                 let key = (host.generation, *id);
-                if let Some(p) = IDENTITY.with(|m| m.borrow().instances.get(&key).map(|o| o.clone_ref(py))) {
+                if let Some(p) =
+                    IDENTITY.with(|m| m.borrow().instances.get(&key).map(|o| o.clone_ref(py)))
+                {
                     return Ok(p.into_bound(py));
                 }
                 let proxy = PyrsInstance { target: v.clone() };
@@ -2743,7 +2825,8 @@ impl PyrsCallable {
             .map_err(rs_err)?;
             return Ok((getattr, args).into_pyobject(py)?.into_any().unbind());
         }
-        let qualname = run_for_cpython(|| crate::builtins::raw_getattr(&self.target, "__qualname__"))?;
+        let qualname =
+            run_for_cpython(|| crate::builtins::raw_getattr(&self.target, "__qualname__"))?;
         with_host(|h| value_to_py(h, py, &qualname))
             .map(|b| b.unbind())
             .map_err(rs_err)
@@ -2999,7 +3082,7 @@ fn normalize_throw_args<'py>(
 }
 
 /// `raise obj` for a CPython object held at `id`: an exception instance is
-/// raised as the pythonrs exception it is paired with (see [`exc_to_py`]), an
+/// raised as the pythonrs exception it is paired with (see `exc_to_py`), an
 /// exception class is instantiated first (`raise struct.error`), and anything
 /// else is CPython's `TypeError`.
 pub fn raised_foreign(id: u32) -> Result<Value, String> {
@@ -3012,7 +3095,9 @@ pub fn raised_foreign(id: u32) -> Result<Value, String> {
         };
         let base_exc = py.get_type::<pyo3::exceptions::PyBaseException>();
         if !exc.is_instance(&base_exc).unwrap_or(false) {
-            return Err(crate::host::type_error("exceptions must derive from BaseException"));
+            return Err(crate::host::type_error(
+                "exceptions must derive from BaseException",
+            ));
         }
         pyexc_to_value(py, &exc).map_err(|e| e.to_string())
     })
@@ -3024,7 +3109,10 @@ pub fn raised_foreign(id: u32) -> Result<Value, String> {
 pub fn traceback_text(handle: u32) -> Option<String> {
     Python::with_gil(|py| {
         let exc = fetch(py, handle).ok()?;
-        let tb = exc.getattr("__traceback__").ok().filter(|tb| !tb.is_none())?;
+        let tb = exc
+            .getattr("__traceback__")
+            .ok()
+            .filter(|tb| !tb.is_none())?;
         let lines = py
             .import("traceback")
             .and_then(|m| m.getattr("format_tb"))
@@ -3211,7 +3299,9 @@ impl PyrsInstance {
     }
 
     fn __reduce__(&self, py: Python) -> PyResult<Py<PyAny>> {
-        let r = run_for_cpython(|| crate::host::call_method(&self.target, "__reduce__", vec![], vec![]))?;
+        let r = run_for_cpython(|| {
+            crate::host::call_method(&self.target, "__reduce__", vec![], vec![])
+        })?;
         with_host(|h| value_to_py(h, py, &r))
             .map(|b| b.unbind())
             .map_err(rs_err)
@@ -3222,7 +3312,11 @@ impl PyrsInstance {
         let v = with_host(|h| py_to_value(h, py, &value)).map_err(rs_err)?;
         let name_v = with_host(|h| h.new_str(name));
         run_for_cpython(|| {
-            crate::builtins::call_builtin_function("setattr", vec![self.target.clone(), name_v, v], vec![])
+            crate::builtins::call_builtin_function(
+                "setattr",
+                vec![self.target.clone(), name_v, v],
+                vec![],
+            )
         })
         .map(|_| ())
     }
@@ -3230,7 +3324,11 @@ impl PyrsInstance {
     fn __delattr__(&self, name: String) -> PyResult<()> {
         let name_v = with_host(|h| h.new_str(name));
         run_for_cpython(|| {
-            crate::builtins::call_builtin_function("delattr", vec![self.target.clone(), name_v], vec![])
+            crate::builtins::call_builtin_function(
+                "delattr",
+                vec![self.target.clone(), name_v],
+                vec![],
+            )
         })
         .map(|_| ())
     }
@@ -4107,10 +4205,7 @@ pub fn type_qualified_name(id: u32) -> String {
             .getattr("__qualname__")
             .and_then(|q| q.extract::<String>())
             .unwrap_or_else(|_| "object".into());
-        match ty
-            .getattr("__module__")
-            .and_then(|m| m.extract::<String>())
-        {
+        match ty.getattr("__module__").and_then(|m| m.extract::<String>()) {
             Ok(m) if m != "builtins" && m != "__main__" => format!("{m}.{qualname}"),
             _ => qualname,
         }

@@ -1171,8 +1171,7 @@ print(repr(b2.getvalue()))
         return;
     }
     assert_eq!(
-        stdout,
-        "'a\\nx\\nb\\n' True\n['y', '-', 'z', '\\n']\nkept\n''\n",
+        stdout, "'a\\nx\\nb\\n' True\n['y', '-', 'z', '\\n']\nkept\n''\n",
         "stderr={stderr}"
     );
 }
@@ -1446,7 +1445,11 @@ fn uncaught_bridged_exceptions_show_their_cpython_frames_and_qualified_type() {
         .filter(|l| l.contains("textwrap.py\", line "))
         .map(|l| l.rsplit(", in ").next().unwrap_or(""))
         .collect();
-    assert_eq!(frames, ["shorten", "fill", "wrap", "_wrap_chunks"], "stderr={stderr}");
+    assert_eq!(
+        frames,
+        ["shorten", "fill", "wrap", "_wrap_chunks"],
+        "stderr={stderr}"
+    );
     assert!(
         stderr.ends_with(
             "    raise ValueError(\"placeholder too large for max width\")\nValueError: placeholder too large for max width\n"
@@ -1714,7 +1717,10 @@ print(dataclasses.fields(F)[0].type is E, dataclasses.fields(F)[1].type, datacla
         eprintln!("skipping annotation identity test: stdlib bridge unavailable ({stderr})");
         return;
     }
-    assert_eq!(stdout, "True True 1\nTrue list[__main__.E] True\n", "stderr={stderr}");
+    assert_eq!(
+        stdout, "True True 1\nTrue list[__main__.E] True\n",
+        "stderr={stderr}"
+    );
 }
 
 /// Slot values pickle as `(state, slots)` and come back into the native class's
@@ -1743,8 +1749,7 @@ for o in (T(), u):
         return;
     }
     assert_eq!(
-        stdout,
-        "T 1 3 None True\nT 1 3 None True\nU 1 3 5 True\nU 1 3 5 True\n",
+        stdout, "T 1 3 None True\nT 1 3 None True\nU 1 3 5 True\nU 1 3 5 True\n",
         "stderr={stderr}"
     );
 }

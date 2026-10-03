@@ -330,8 +330,7 @@ impl Scopes {
                 if let Some(first) = found.next() {
                     let before = std::iter::once(first)
                         .chain(found)
-                        .filter(|b| b.line <= line)
-                        .last();
+                        .rfind(|b| b.line <= line);
                     return Some(before.unwrap_or(first));
                 }
             }
@@ -416,7 +415,7 @@ fn find_word(line: &str, name: &str, from: usize) -> Option<usize> {
     (from..chars.len().saturating_sub(want.len() - 1)).find(|&i| {
         chars[i..].starts_with(&want)
             && (i == 0 || !is_ident(chars[i - 1]))
-            && chars.get(i + want.len()).is_none_or(|c| !is_ident(*c))
+            && chars.get(i + want.len()).map_or(true, |c| !is_ident(*c))
     })
 }
 
@@ -487,7 +486,7 @@ enum Reached {
     /// a method's `self` is.
     Instance(usize, usize),
     /// A binding in file `.0`.
-    Binding(usize, Binding),
+    Binding(usize, Box<Binding>),
 }
 
 /// How many imports and base classes a lookup follows before giving up: a
@@ -562,7 +561,7 @@ impl Sources {
             return m.map(Reached::Module);
         };
         match m.and_then(|m| Some((m, self.top_level(m, name)?))) {
-            Some((m, b)) => Some(Reached::Binding(m, b)),
+            Some((m, b)) => Some(Reached::Binding(m, Box::new(b))),
             // `from package import submodule`.
             None => self.submodule(m?, name).map(Reached::Module),
         }
@@ -591,7 +590,7 @@ impl Sources {
         }
         match self.settle(at)? {
             Reached::Module(m) => match self.top_level(m, attr) {
-                Some(b) => Some(Reached::Binding(m, b)),
+                Some(b) => Some(Reached::Binding(m, Box::new(b))),
                 None => self.submodule(m, attr).map(Reached::Module),
             },
             Reached::Instance(src, class) => self.class_member(src, class, attr, hops),
@@ -615,7 +614,7 @@ impl Sources {
     ) -> Option<Reached> {
         let scope = &self.0[src].scopes.0[class];
         if let Some(b) = scope.bindings.iter().rev().find(|b| b.name == attr) {
-            return Some(Reached::Binding(src, b.clone()));
+            return Some(Reached::Binding(src, Box::new(b.clone())));
         }
         let StmtKind::ClassDef { body, bases, .. } = &scope.class.as_ref()?.kind else {
             return None;
@@ -628,7 +627,7 @@ impl Sources {
                 stmt: None,
                 origin: None,
             };
-            return Some(Reached::Binding(src, b));
+            return Some(Reached::Binding(src, Box::new(b)));
         }
         let class_line = scope.start;
         let bases: Vec<String> = bases
@@ -640,7 +639,7 @@ impl Sources {
             .collect();
         bases.iter().find_map(|base| {
             let b = self.0[src].scopes.resolve(base, class_line)?.clone();
-            self.attribute(Reached::Binding(src, b), attr, hops + 1)
+            self.attribute(Reached::Binding(src, Box::new(b)), attr, hops + 1)
         })
     }
 
@@ -651,7 +650,7 @@ impl Sources {
         let scopes = &self.0[0].scopes;
         let mut at = match enclosing_class(scopes, first, line) {
             Some(class) if !rest.is_empty() => Reached::Instance(0, class),
-            _ => Reached::Binding(0, scopes.resolve(first, line)?.clone()),
+            _ => Reached::Binding(0, Box::new(scopes.resolve(first, line)?.clone())),
         };
         for attr in rest {
             at = self.attribute(at, attr, 0)?;

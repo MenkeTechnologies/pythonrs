@@ -229,13 +229,12 @@ fn evaluate_expression(expr: &str) -> Result<String, String> {
     if expr.is_empty() {
         return Ok(String::new());
     }
-    let (saved_exc, saved_tb) =
-        crate::host::with_host(|h| (h.exc.clone(), h.traceback.clone()));
+    let (saved_exc, saved_tb) = crate::host::with_host(|h| (h.exc.clone(), h.traceback.clone()));
     DBG.with(|d| d.borrow_mut().evaluating = true);
     // `repr` runs a user `__repr__` like any other call, so it is part of the
     // evaluation and runs under the same guard.
-    let shown = crate::builtins::eval_in_current_frame(expr)
-        .and_then(|v| crate::builtins::py_repr(&v));
+    let shown =
+        crate::builtins::eval_in_current_frame(expr).and_then(|v| crate::builtins::py_repr(&v));
     DBG.with(|d| d.borrow_mut().evaluating = false);
     crate::host::with_host(|h| {
         h.error = None;

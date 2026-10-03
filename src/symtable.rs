@@ -138,7 +138,11 @@ impl Table {
             StmtKind::AnnAssign { target, value, .. } => {
                 match target.unspanned() {
                     Expr::Name(n) => {
-                        let flag = if value.is_some() { ANNOT | LOCAL } else { ANNOT };
+                        let flag = if value.is_some() {
+                            ANNOT | LOCAL
+                        } else {
+                            ANNOT
+                        };
                         b.add(n, flag);
                     }
                     _ => self.store(target, b)?,
@@ -284,7 +288,9 @@ impl Table {
             } else if cur & ANNOT != 0 {
                 Some(format!("annotated name '{n}' can't be {word}"))
             } else if cur & LOCAL != 0 {
-                Some(format!("name '{n}' is assigned to before {word} declaration"))
+                Some(format!(
+                    "name '{n}' is assigned to before {word} declaration"
+                ))
             } else {
                 None
             };
@@ -528,10 +534,14 @@ fn yield_in(e: &Expr, kind: &str) -> Result<(), String> {
             if !sp.is_some() {
                 return Err(msg);
             }
-            Err(symtable_error(&msg, (sp.line, sp.start + 1, sp.end_line, sp.end + 1)))
+            Err(symtable_error(
+                &msg,
+                (sp.line, sp.start + 1, sp.end_line, sp.end + 1),
+            ))
         }
         Expr::Lambda { .. } => Ok(()),
-        inner @ (Expr::ListComp(..) | Expr::SetComp(..) | Expr::GenExp(..) | Expr::DictComp(..)) => {
+        inner
+        @ (Expr::ListComp(..) | Expr::SetComp(..) | Expr::GenExp(..) | Expr::DictComp(..)) => {
             // The nested comprehension's first iterable is evaluated in THIS
             // one; the rest is its own block.
             let (_, comps) = comprehension_parts(inner);
@@ -584,7 +594,10 @@ fn param_names(p: &Params) -> Vec<&str> {
 /// `SyntaxPos::bare_args` and `SyntaxPos::no_source`. `span` is in
 /// characters; the compile entry turns it into the byte columns CPython
 /// reports ([`crate::parser::with_byte_columns`]).
-pub(crate) fn symtable_error(msg: &str, (line, col, end_line, end_col): (u32, u32, u32, u32)) -> String {
+pub(crate) fn symtable_error(
+    msg: &str,
+    (line, col, end_line, end_col): (u32, u32, u32, u32),
+) -> String {
     format!(
         "{}{SYNTAX_FIELD}nosrc=1{SYNTAX_FIELD}bare=1{}",
         at_pos(msg, line, col as i64, end_line, end_col as i64),

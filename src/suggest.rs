@@ -179,7 +179,10 @@ const KEYWORD_TYPO_MAX_SOURCE: usize = 1024;
 /// there); with none, `traceback` reads the file, else the error's `text`.
 /// The positions are those of the DEDENTED excerpt the search tokenizes, as
 /// CPython reports them.
-pub fn keyword_typo(msg: &str, pos: &crate::parser::SyntaxPos) -> Option<(crate::parser::SyntaxPos, String)> {
+pub fn keyword_typo(
+    msg: &str,
+    pos: &crate::parser::SyntaxPos,
+) -> Option<(crate::parser::SyntaxPos, String)> {
     use crate::builtins::str_splitlines;
     if msg != "invalid syntax" && !msg.contains("Perhaps you forgot a comma") {
         return None;
@@ -191,7 +194,10 @@ pub fn keyword_typo(msg: &str, pos: &crate::parser::SyntaxPos) -> Option<(crate:
     let lines: Vec<String> = match &meta.source {
         Some(source) => str_splitlines(source, false),
         None => {
-            let read = pos.filename.as_deref().and_then(|f| std::fs::read_to_string(f).ok());
+            let read = pos
+                .filename
+                .as_deref()
+                .and_then(|f| std::fs::read_to_string(f).ok());
             match read {
                 Some(file) => {
                     from_filename = true;
@@ -208,7 +214,10 @@ pub fn keyword_typo(msg: &str, pos: &crate::parser::SyntaxPos) -> Option<(crate:
     };
     let start = if line > 0 { line - 1 } else { 0 } as usize;
     let stop = usize::try_from(end_line).unwrap_or(0).min(lines.len());
-    let excerpt = lines.get(start..stop.max(start)).unwrap_or_default().join("\n");
+    let excerpt = lines
+        .get(start..stop.max(start))
+        .unwrap_or_default()
+        .join("\n");
     let error_code = dedent(&excerpt);
     if error_code.chars().count() > KEYWORD_TYPO_MAX_SOURCE {
         return None;
@@ -219,7 +228,10 @@ pub fn keyword_typo(msg: &str, pos: &crate::parser::SyntaxPos) -> Option<(crate:
     let physical: Vec<&str> = error_code.split_inclusive('\n').collect();
     // Any failure to tokenize is suppressed by `traceback`, ending the search.
     let tokens = name_tokens(&error_code)?;
-    let keywords: Vec<String> = crate::parser::KEYWORDS.iter().map(|k| k.to_string()).collect();
+    let keywords: Vec<String> = crate::parser::KEYWORDS
+        .iter()
+        .map(|k| k.to_string())
+        .collect();
     let mut tokens_left = KEYWORD_TYPO_TOKENS;
     for token in tokens {
         let row = token.line as i64;
@@ -263,7 +275,10 @@ pub fn keyword_typo(msg: &str, pos: &crate::parser::SyntaxPos) -> Option<(crate:
             typo_pos.end_offset = Some(end_col as i64 + 1);
             typo_pos.lineno = Some(row);
             typo_pos.end_lineno = Some(row);
-            return Some((typo_pos, format!("invalid syntax. Did you mean '{suggestion}'?")));
+            return Some((
+                typo_pos,
+                format!("invalid syntax. Did you mean '{suggestion}'?"),
+            ));
         }
     }
     None
@@ -299,7 +314,8 @@ fn name_tokens(code: &str) -> Option<Vec<NameAt>> {
                 let end = starts[token.line as usize - 1] + token.end_col as usize;
                 let body = string_body_start(&chars, end, raw)?;
                 let line = starts.partition_point(|&s| s <= body);
-                let body = FieldScan::new(raw, *is_raw, line as u32, (body - starts[line - 1]) as u32);
+                let body =
+                    FieldScan::new(raw, *is_raw, line as u32, (body - starts[line - 1]) as u32);
                 if !body.literal(0, body.chars.len(), false, &mut names) {
                     break;
                 }
@@ -313,7 +329,13 @@ fn name_tokens(code: &str) -> Option<Vec<NameAt>> {
 /// The index in `chars` of each line's first character.
 fn line_starts(chars: &[char]) -> Vec<usize> {
     std::iter::once(0)
-        .chain(chars.iter().enumerate().filter(|&(_, &c)| c == '\n').map(|(i, _)| i + 1))
+        .chain(
+            chars
+                .iter()
+                .enumerate()
+                .filter(|&(_, &c)| c == '\n')
+                .map(|(i, _)| i + 1),
+        )
         .collect()
 }
 
@@ -396,7 +418,12 @@ impl FieldScan {
 
     /// The first index in `from..to` outside brackets and string literals
     /// where `hit(char, next char)` holds.
-    fn top_level(&self, from: usize, to: usize, hit: impl Fn(char, Option<char>) -> bool) -> Option<usize> {
+    fn top_level(
+        &self,
+        from: usize,
+        to: usize,
+        hit: impl Fn(char, Option<char>) -> bool,
+    ) -> Option<usize> {
         let mut depth = 0i32;
         let mut quote: Option<char> = None;
         let mut i = from;
@@ -436,7 +463,9 @@ impl FieldScan {
             return false;
         }
         if let Some(bang) = conv {
-            let start = (bang + 1..expr_end).find(|&j| !self.chars[j].is_whitespace()).unwrap_or(expr_end);
+            let start = (bang + 1..expr_end)
+                .find(|&j| !self.chars[j].is_whitespace())
+                .unwrap_or(expr_end);
             let mut end = start;
             while end < expr_end && (self.chars[end].is_alphanumeric() || self.chars[end] == '_') {
                 end += 1;
@@ -521,12 +550,20 @@ fn dedent(text: &str) -> String {
     use crate::builtins::is_py_space;
     let lines: Vec<&str> = text.split('\n').collect();
     let blank = |l: &str| !l.is_empty() && l.chars().all(is_py_space);
-    let non_blank: Vec<&str> = lines.iter().copied().filter(|l| !l.is_empty() && !blank(l)).collect();
+    let non_blank: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|l| !l.is_empty() && !blank(l))
+        .collect();
     let l1 = non_blank.iter().min().copied().unwrap_or("");
     let l2 = non_blank.iter().max().copied().unwrap_or("");
     // `for margin, c in enumerate(l1): if c != l2[margin] or c not in ' \t': break`
     let mut margin = 0;
-    for (i, (c, d)) in l1.chars().zip(l2.chars().chain(std::iter::repeat('\0'))).enumerate() {
+    for (i, (c, d)) in l1
+        .chars()
+        .zip(l2.chars().chain(std::iter::repeat('\0')))
+        .enumerate()
+    {
         margin = i;
         if c != d || !matches!(c, ' ' | '\t') {
             break;
@@ -534,7 +571,13 @@ fn dedent(text: &str) -> String {
     }
     lines
         .iter()
-        .map(|l| if blank(l) { String::new() } else { l.chars().skip(margin).collect() })
+        .map(|l| {
+            if blank(l) {
+                String::new()
+            } else {
+                l.chars().skip(margin).collect()
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -599,7 +642,14 @@ impl<'b> SequenceMatcher<'b> {
 
     /// `find_longest_match(alo, ahi, blo, bhi)`. With no junk, only the first
     /// pair of extension loops can move the match (over popular elements).
-    fn find_longest_match(&self, a: &[char], alo: usize, ahi: usize, blo: usize, bhi: usize) -> (usize, usize, usize) {
+    fn find_longest_match(
+        &self,
+        a: &[char],
+        alo: usize,
+        ahi: usize,
+        blo: usize,
+        bhi: usize,
+    ) -> (usize, usize, usize) {
         let b = self.b;
         let (mut besti, mut bestj, mut bestsize) = (alo, blo, 0);
         let mut j2len: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
@@ -612,7 +662,12 @@ impl<'b> SequenceMatcher<'b> {
                 if j >= bhi {
                     break;
                 }
-                let k = j.checked_sub(1).and_then(|p| j2len.get(&p)).copied().unwrap_or(0) + 1;
+                let k = j
+                    .checked_sub(1)
+                    .and_then(|p| j2len.get(&p))
+                    .copied()
+                    .unwrap_or(0)
+                    + 1;
                 newj2len.insert(j, k);
                 if k > bestsize {
                     (besti, bestj, bestsize) = (i + 1 - k, j + 1 - k, k);
@@ -623,7 +678,10 @@ impl<'b> SequenceMatcher<'b> {
         while besti > alo && bestj > blo && a[besti - 1] == b[bestj - 1] {
             (besti, bestj, bestsize) = (besti - 1, bestj - 1, bestsize + 1);
         }
-        while besti + bestsize < ahi && bestj + bestsize < bhi && a[besti + bestsize] == b[bestj + bestsize] {
+        while besti + bestsize < ahi
+            && bestj + bestsize < bhi
+            && a[besti + bestsize] == b[bestj + bestsize]
+        {
             bestsize += 1;
         }
         (besti, bestj, bestsize)

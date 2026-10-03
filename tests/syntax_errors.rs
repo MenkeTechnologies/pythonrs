@@ -761,7 +761,10 @@ for s in cases:
     std::fs::create_dir_all(&dir).unwrap();
     let script = dir.join("y.py");
     std::fs::write(&script, "class C:\n    x = (\"éé\", (yield 1))\n").unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_python")).arg(&script).output().expect("spawn python");
+    let out = Command::new(env!("CARGO_BIN_EXE_python"))
+        .arg(&script)
+        .output()
+        .expect("spawn python");
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
@@ -1048,7 +1051,9 @@ fn misspelled_keywords_are_suggested_as_traceback_suggests_them() {
 #[test]
 fn syntax_error_metadata_carries_the_parsed_source() {
     let out = Command::new(env!("CARGO_BIN_EXE_python"))
-        .args(["-c", r#"
+        .args([
+            "-c",
+            r#"
 import traceback
 def meta(f, *a):
     try:
@@ -1076,7 +1081,8 @@ try:
     raise SyntaxError('invalid syntax', ('<x>', 1, 8, 'whille x: pass\n', 1, 9, (0, 0, None)))
 except SyntaxError as e:
     print(''.join(traceback.format_exception_only(e)), end='')
-"#])
+"#,
+        ])
         .output()
         .expect("spawn python");
     assert_eq!(

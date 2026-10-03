@@ -288,7 +288,6 @@ fn builtin_type_dir_is_cpythons_full_listing() {
     }
     // The size of every other builtin type's listing, read off CPython 3.14.
     let counts = [
-
         ("float", 60),
         ("bool", 74),
         ("bytes", 78),
@@ -299,10 +298,17 @@ fn builtin_type_dir_is_cpythons_full_listing() {
         ("complex", 44),
     ];
     for (ty, n) in counts {
-        assert_eq!(g(&format!("x = len(dir({ty}))"), "x"), n.to_string(), "len(dir({ty}))");
+        assert_eq!(
+            g(&format!("x = len(dir({ty}))"), "x"),
+            n.to_string(),
+            "len(dir({ty}))"
+        );
     }
     // A VALUE lists its type's names: `dir(5)` is `dir(int)`.
-    assert_eq!(g("x = dir(5) == dir(int) and dir('a') == dir(str)", "x"), "True");
+    assert_eq!(
+        g("x = dir(5) == dir(int) and dir('a') == dir(str)", "x"),
+        "True"
+    );
 }
 
 /// `type()` of a C-level descriptor, slot wrapper or container iterator is a
@@ -312,9 +318,18 @@ fn builtin_type_dir_is_cpythons_full_listing() {
 #[test]
 fn c_level_descriptor_and_iterator_types_are_type_objects() {
     let slotted = "class C:\n    __slots__ = ('x',)\n";
-    assert_eq!(g(&format!("{slotted}x = repr(type(C.x))"), "x"), "\"<class 'member_descriptor'>\"");
-    assert_eq!(g(&format!("{slotted}x = type(type(C.x)) is type"), "x"), "True");
-    assert_eq!(g(&format!("{slotted}x = isinstance(C.x, Exception)"), "x"), "False");
+    assert_eq!(
+        g(&format!("{slotted}x = repr(type(C.x))"), "x"),
+        "\"<class 'member_descriptor'>\""
+    );
+    assert_eq!(
+        g(&format!("{slotted}x = type(type(C.x)) is type"), "x"),
+        "True"
+    );
+    assert_eq!(
+        g(&format!("{slotted}x = isinstance(C.x, Exception)"), "x"),
+        "False"
+    );
     let cases = [
         ("object.__init__", "wrapper_descriptor"),
         ("int.__add__", "wrapper_descriptor"),
@@ -369,7 +384,9 @@ fn builtin_method_and_function_reprs() {
         );
         assert_eq!(
             g(&src, "x"),
-            format!("('<built-in method {meth} of type object at', True, 'builtin_function_or_method')"),
+            format!(
+                "('<built-in method {meth} of type object at', True, 'builtin_function_or_method')"
+            ),
             "repr({expr})"
         );
     }
@@ -377,15 +394,24 @@ fn builtin_method_and_function_reprs() {
         g("import itertools\nx = repr(itertools.chain.from_iterable).startswith('<built-in method from_iterable of type object at 0x')", "x"),
         "True"
     );
-    assert_eq!(g("x = repr(int.__add__)", "x"), "\"<slot wrapper '__add__' of 'int' objects>\"");
-    assert_eq!(g("x = repr(str.upper)", "x"), "\"<method 'upper' of 'str' objects>\"");
+    assert_eq!(
+        g("x = repr(int.__add__)", "x"),
+        "\"<slot wrapper '__add__' of 'int' objects>\""
+    );
+    assert_eq!(
+        g("x = repr(str.upper)", "x"),
+        "\"<method 'upper' of 'str' objects>\""
+    );
     assert_eq!(
         g("x = repr(dict.__dict__['fromkeys'])", "x"),
         "\"<method 'fromkeys' of 'dict' objects>\""
     );
     // A module-level function names only itself.
     assert_eq!(
-        g("import math, time\nx = (repr(math.sqrt), repr(time.time), repr(len))", "x"),
+        g(
+            "import math, time\nx = (repr(math.sqrt), repr(time.time), repr(len))",
+            "x"
+        ),
         "('<built-in function sqrt>', '<built-in function time>', '<built-in function len>')"
     );
 }
@@ -396,7 +422,10 @@ fn builtin_method_and_function_reprs() {
 #[test]
 fn slice_repr_dispatches_bound_reprs() {
     assert_eq!(
-        g("class Idx:\n    def __repr__(self): return 'Idx()'\nx = repr(slice(Idx(), Idx()))", "x"),
+        g(
+            "class Idx:\n    def __repr__(self): return 'Idx()'\nx = repr(slice(Idx(), Idx()))",
+            "x"
+        ),
         "'slice(Idx(), Idx(), None)'"
     );
     assert_eq!(
@@ -414,7 +443,10 @@ fn slice_repr_dispatches_bound_reprs() {
 fn function_annotate_is_the_compiled_annotate_function() {
     let f = "def f(x: int) -> str: pass\na = f.__annotate__\n";
     assert_eq!(
-        g(&format!("{f}x = (type(a).__name__, a.__name__, a.__qualname__, a is f.__annotate__)"), "x"),
+        g(
+            &format!("{f}x = (type(a).__name__, a.__name__, a.__qualname__, a is f.__annotate__)"),
+            "x"
+        ),
         "('function', '__annotate__', 'f.__annotate__', True)"
     );
     assert_eq!(
@@ -429,15 +461,30 @@ fn function_annotate_is_the_compiled_annotate_function() {
         );
     }
     assert_eq!(
-        g("class C:\n    def m(self, y: 'C'): pass\nx = C.m.__annotate__.__qualname__", "x"),
+        g(
+            "class C:\n    def m(self, y: 'C'): pass\nx = C.m.__annotate__.__qualname__",
+            "x"
+        ),
         "'C.m.__annotate__'"
     );
     assert_eq!(
         g("def outer():\n    def inner(z: int): pass\n    return inner\nx = outer().__annotate__.__qualname__", "x"),
         "'outer.<locals>.inner.__annotate__'"
     );
-    assert_eq!(g("def h(x: format): pass\nx = h.__annotations__['x'] is format", "x"), "True");
-    assert_eq!(g("def u(): pass\nx = (u.__annotate__, (lambda: 0).__annotate__)", "x"), "(None, None)");
+    assert_eq!(
+        g(
+            "def h(x: format): pass\nx = h.__annotations__['x'] is format",
+            "x"
+        ),
+        "True"
+    );
+    assert_eq!(
+        g(
+            "def u(): pass\nx = (u.__annotate__, (lambda: 0).__annotate__)",
+            "x"
+        ),
+        "(None, None)"
+    );
 }
 
 /// The annotate function binds its argument as `.format` (above: the
@@ -448,10 +495,16 @@ fn function_annotate_is_the_compiled_annotate_function() {
 fn annotate_code_names_its_parameter_format() {
     let f = "def f(x: format) -> str: pass\nc = f.__annotate__.__code__\n";
     assert_eq!(
-        g(&format!("{f}x = (c.co_varnames, c.co_argcount, c.co_posonlyargcount, c.co_nlocals)"), "x"),
+        g(
+            &format!("{f}x = (c.co_varnames, c.co_argcount, c.co_posonlyargcount, c.co_nlocals)"),
+            "x"
+        ),
         "(('format',), 1, 1, 1)"
     );
-    assert_eq!(g(&format!("{f}x = f.__annotations__['x'] is format"), "x"), "True");
+    assert_eq!(
+        g(&format!("{f}x = f.__annotations__['x'] is format"), "x"),
+        "True"
+    );
 }
 
 #[test]
@@ -756,7 +809,10 @@ fn a_slice_is_hashable_and_compares_by_its_bounds() {
 fn range_and_readonly_memoryview_are_hashable() {
     assert_eq!(g("x = hash(range(1, 10, 2))", "x"), "-8580228179051518038");
     assert_eq!(g("x = hash(range(5, 5))", "x"), "2676694398852732306");
-    assert_eq!(g("x = hash(range(2**70, 2**71, 3))", "x"), "-5630244664538985369");
+    assert_eq!(
+        g("x = hash(range(2**70, 2**71, 3))", "x"),
+        "-5630244664538985369"
+    );
     assert_eq!(
         g(
             "x = {range(0): 'a', range(3, 3): 'b', range(1, 2, 5): 'c', \
@@ -8648,7 +8704,9 @@ fn parser_overflows(src: &str) -> bool {
 #[test]
 fn parser_levels_give_way_where_pegens_do() {
     let neg = |n: usize| "-".repeat(n);
-    let cases: Vec<(Box<dyn Fn(usize) -> String>, usize)> = vec![
+    /// Builds the source nested `n` deep.
+    type Source = Box<dyn Fn(usize) -> String>;
+    let cases: Vec<(Source, usize)> = vec![
         (Box::new(move |n| format!("{}1", neg(n))), 5969),
         (Box::new(|n| format!("{}x", "not ".repeat(n))), 5970),
         (Box::new(|n| format!("{}x", "lambda: ".repeat(n))), 2985),
@@ -9594,23 +9652,34 @@ fn starred_class_bases_spread_at_run_time() {
 fn identifiers_are_nfkc_normalized() {
     assert_eq!(g("\u{fb01} = 3\nx = fi", "x"), "3");
     assert_eq!(
-        g("def \u{ff46}(\u{fb01}=1): return fi\nx = (\u{ff46}.__name__, f(fi=5))", "x"),
+        g(
+            "def \u{ff46}(\u{fb01}=1): return fi\nx = (\u{ff46}.__name__, f(fi=5))",
+            "x"
+        ),
         "('f', 5)"
     );
     assert_eq!(
-        g("class K:\n    \u{fb00} = 2\nx = (K.ff, getattr(K, '\u{fb00}', 'no'))", "x"),
+        g(
+            "class K:\n    \u{fb00} = 2\nx = (K.ff, getattr(K, '\u{fb00}', 'no'))",
+            "x"
+        ),
         "(2, 'no')"
     );
     assert_eq!(g("\u{ff49}\u{ff46} = 1\nx = globals()['if']", "x"), "1");
     assert_eq!(
-        g("def f(\u{ff49}\u{ff46}=1): return \u{ff49}\u{ff46}\nx = f(**{'if': 4})", "x"),
+        g(
+            "def f(\u{ff49}\u{ff46}=1): return \u{ff49}\u{ff46}\nx = f(**{'if': 4})",
+            "x"
+        ),
         "4"
     );
     // A normalized soft keyword is a plain name: `ｍatch x:` is not a statement.
     assert_eq!(g("\u{ff4d}atch = 3\nx = match", "x"), "3");
-    assert!(pythonrs::eval_str("x = 1\n\u{ff4d}atch x:\n    case 1: pass\n")
-        .unwrap_err()
-        .starts_with("SyntaxError: invalid syntax"));
+    assert!(
+        pythonrs::eval_str("x = 1\n\u{ff4d}atch x:\n    case 1: pass\n")
+            .unwrap_err()
+            .starts_with("SyntaxError: invalid syntax")
+    );
     assert_eq!(
         pythonrs::eval_str("\u{ff2e}\u{ff4f}\u{ff4e}\u{ff45} = 1").unwrap_err(),
         "ValueError: identifier field can't represent 'None' constant"
@@ -9625,16 +9694,43 @@ fn identifiers_are_nfkc_normalized() {
 #[test]
 fn sequence_repeat_dunder_reads_its_count_as_an_index() {
     for (src, want) in [
-        ("[1].__mul__('a')", "TypeError: 'str' object cannot be interpreted as an integer"),
-        ("'a'.__mul__(2.0)", "TypeError: 'float' object cannot be interpreted as an integer"),
-        ("(1,).__rmul__('a')", "TypeError: 'str' object cannot be interpreted as an integer"),
-        ("b'x'.__mul__(1.5)", "TypeError: 'float' object cannot be interpreted as an integer"),
-        ("bytearray(b'x').__imul__('q')", "TypeError: 'str' object cannot be interpreted as an integer"),
-        ("[1].__imul__(None)", "TypeError: 'NoneType' object cannot be interpreted as an integer"),
-        ("[1].__mul__(10**20)", "OverflowError: cannot fit 'int' into an index-sized integer"),
+        (
+            "[1].__mul__('a')",
+            "TypeError: 'str' object cannot be interpreted as an integer",
+        ),
+        (
+            "'a'.__mul__(2.0)",
+            "TypeError: 'float' object cannot be interpreted as an integer",
+        ),
+        (
+            "(1,).__rmul__('a')",
+            "TypeError: 'str' object cannot be interpreted as an integer",
+        ),
+        (
+            "b'x'.__mul__(1.5)",
+            "TypeError: 'float' object cannot be interpreted as an integer",
+        ),
+        (
+            "bytearray(b'x').__imul__('q')",
+            "TypeError: 'str' object cannot be interpreted as an integer",
+        ),
+        (
+            "[1].__imul__(None)",
+            "TypeError: 'NoneType' object cannot be interpreted as an integer",
+        ),
+        (
+            "[1].__mul__(10**20)",
+            "OverflowError: cannot fit 'int' into an index-sized integer",
+        ),
         // The operator keeps its own wording.
-        ("[1] * 'a'", "TypeError: can't multiply sequence by non-int of type 'str'"),
-        ("x = [1]\nx *= 'a'", "TypeError: can't multiply sequence by non-int of type 'str'"),
+        (
+            "[1] * 'a'",
+            "TypeError: can't multiply sequence by non-int of type 'str'",
+        ),
+        (
+            "x = [1]\nx *= 'a'",
+            "TypeError: can't multiply sequence by non-int of type 'str'",
+        ),
     ] {
         assert_eq!(eval_str(src).expect_err(src), want, "{src}");
     }
@@ -9651,17 +9747,47 @@ fn sequence_repeat_dunder_reads_its_count_as_an_index() {
 fn operator_errors_name_collections_types_by_tp_name() {
     let pre = "from collections import deque, OrderedDict, defaultdict, Counter\n";
     for (src, want) in [
-        ("(1,) + deque()", "TypeError: can only concatenate tuple (not \"collections.deque\") to tuple"),
-        ("'a' + OrderedDict()", "TypeError: can only concatenate str (not \"collections.OrderedDict\") to str"),
-        ("b'a' + defaultdict()", "TypeError: can't concat collections.defaultdict to bytes"),
-        ("[1] * deque()", "TypeError: can't multiply sequence by non-int of type 'collections.deque'"),
-        ("1 / OrderedDict()", "TypeError: unsupported operand type(s) for /: 'int' and 'collections.OrderedDict'"),
-        ("-deque()", "TypeError: bad operand type for unary -: 'collections.deque'"),
-        ("~defaultdict()", "TypeError: bad operand type for unary ~: 'collections.defaultdict'"),
-        ("deque() < 1", "TypeError: '<' not supported between instances of 'collections.deque' and 'int'"),
+        (
+            "(1,) + deque()",
+            "TypeError: can only concatenate tuple (not \"collections.deque\") to tuple",
+        ),
+        (
+            "'a' + OrderedDict()",
+            "TypeError: can only concatenate str (not \"collections.OrderedDict\") to str",
+        ),
+        (
+            "b'a' + defaultdict()",
+            "TypeError: can't concat collections.defaultdict to bytes",
+        ),
+        (
+            "[1] * deque()",
+            "TypeError: can't multiply sequence by non-int of type 'collections.deque'",
+        ),
+        (
+            "1 / OrderedDict()",
+            "TypeError: unsupported operand type(s) for /: 'int' and 'collections.OrderedDict'",
+        ),
+        (
+            "-deque()",
+            "TypeError: bad operand type for unary -: 'collections.deque'",
+        ),
+        (
+            "~defaultdict()",
+            "TypeError: bad operand type for unary ~: 'collections.defaultdict'",
+        ),
+        (
+            "deque() < 1",
+            "TypeError: '<' not supported between instances of 'collections.deque' and 'int'",
+        ),
         // `Counter` is pure Python, so its `tp_name` is bare.
-        ("[1] + Counter()", "TypeError: can only concatenate list (not \"Counter\") to list"),
-        ("class deque: pass\n[1] + deque()", "TypeError: can only concatenate list (not \"deque\") to list"),
+        (
+            "[1] + Counter()",
+            "TypeError: can only concatenate list (not \"Counter\") to list",
+        ),
+        (
+            "class deque: pass\n[1] + deque()",
+            "TypeError: can only concatenate list (not \"deque\") to list",
+        ),
     ] {
         let src = format!("{pre}{src}");
         assert_eq!(eval_str(&src).expect_err(&src), want, "{src}");
@@ -9674,14 +9800,21 @@ fn operator_errors_name_collections_types_by_tp_name() {
 /// `OrderedDict.pop` hashes first, with the bare message.
 #[test]
 fn dict_pop_on_an_empty_dict_does_not_hash_the_key() {
-    assert_eq!(eval_str("{}.pop([1])").expect_err("empty pop"), "KeyError: [1]");
-    assert_eq!(g("x = ({}.pop([1], 5), {}.pop({}, None))", "x"), "(5, None)");
+    assert_eq!(
+        eval_str("{}.pop([1])").expect_err("empty pop"),
+        "KeyError: [1]"
+    );
+    assert_eq!(
+        g("x = ({}.pop([1], 5), {}.pop({}, None))", "x"),
+        "(5, None)"
+    );
     assert_eq!(
         eval_str("{1: 2}.pop([1], 5)").expect_err("non-empty pop"),
         "TypeError: cannot use 'list' as a dict key (unhashable type: 'list')"
     );
     assert_eq!(
-        eval_str("from collections import OrderedDict\nOrderedDict().pop([1])").expect_err("odict pop"),
+        eval_str("from collections import OrderedDict\nOrderedDict().pop([1])")
+            .expect_err("odict pop"),
         "TypeError: unhashable type: 'list'"
     );
 }
@@ -9723,15 +9856,39 @@ fn pow_builtin_dispatches_like_the_operator() {
         "(('pow', 2, None), ('rpow', 2, None), ('pow', 2, 5), ('rpow', 2, 5), 3, 8)"
     );
     for (src, want) in [
-        ("pow(Q(), 2, 5)", "TypeError: Q.__pow__() takes 2 positional arguments but 3 were given"),
-        ("pow(N(), 2, 3)", "TypeError: unsupported operand type(s) for ** or pow(): 'N', 'int', 'int'"),
-        ("pow(2, 3, N())", "TypeError: unsupported operand type(s) for ** or pow(): 'int', 'int', 'N'"),
-        ("pow('a', 2, 3)", "TypeError: unsupported operand type(s) for ** or pow(): 'str', 'int', 'int'"),
-        ("pow(2, 3, 1.5)", "TypeError: pow() 3rd argument not allowed unless all arguments are integers"),
+        (
+            "pow(Q(), 2, 5)",
+            "TypeError: Q.__pow__() takes 2 positional arguments but 3 were given",
+        ),
+        (
+            "pow(N(), 2, 3)",
+            "TypeError: unsupported operand type(s) for ** or pow(): 'N', 'int', 'int'",
+        ),
+        (
+            "pow(2, 3, N())",
+            "TypeError: unsupported operand type(s) for ** or pow(): 'int', 'int', 'N'",
+        ),
+        (
+            "pow('a', 2, 3)",
+            "TypeError: unsupported operand type(s) for ** or pow(): 'str', 'int', 'int'",
+        ),
+        (
+            "pow(2, 3, 1.5)",
+            "TypeError: pow() 3rd argument not allowed unless all arguments are integers",
+        ),
         ("pow(1j, 2, 3)", "ValueError: complex modulo"),
-        ("pow(N(), 2)", "TypeError: unsupported operand type(s) for ** or pow(): 'N' and 'int'"),
-        ("'a' ** 2", "TypeError: unsupported operand type(s) for ** or pow(): 'str' and 'int'"),
-        ("x = 'a'\nx **= 2", "TypeError: unsupported operand type(s) for **=: 'str' and 'int'"),
+        (
+            "pow(N(), 2)",
+            "TypeError: unsupported operand type(s) for ** or pow(): 'N' and 'int'",
+        ),
+        (
+            "'a' ** 2",
+            "TypeError: unsupported operand type(s) for ** or pow(): 'str' and 'int'",
+        ),
+        (
+            "x = 'a'\nx **= 2",
+            "TypeError: unsupported operand type(s) for **=: 'str' and 'int'",
+        ),
     ] {
         let src = format!("{cls}{src}");
         assert_eq!(eval_str(&src).expect_err(&src), want, "{src}");
@@ -9749,13 +9906,34 @@ fn bool_format_and_bytes_dunders_are_called_and_checked() {
                class BadBy:\n    def __bytes__(s): return 'no'\n";
     assert_eq!(g(&format!("{cls}x = bytes(By())"), "x"), "b'by'");
     for (src, want) in [
-        ("bool(B1())", "TypeError: __bool__ should return bool, returned int"),
-        ("not B1()", "TypeError: __bool__ should return bool, returned int"),
-        ("1 if B1() else 2", "TypeError: __bool__ should return bool, returned int"),
-        ("format(F())", "TypeError: __format__ must return a str, not int"),
-        ("f'{F()}'", "TypeError: __format__ must return a str, not int"),
-        ("bytes(BadBy())", "TypeError: __bytes__ returned non-bytes (type str)"),
-        ("bytes(By(), 'utf-8')", "TypeError: encoding without a string argument"),
+        (
+            "bool(B1())",
+            "TypeError: __bool__ should return bool, returned int",
+        ),
+        (
+            "not B1()",
+            "TypeError: __bool__ should return bool, returned int",
+        ),
+        (
+            "1 if B1() else 2",
+            "TypeError: __bool__ should return bool, returned int",
+        ),
+        (
+            "format(F())",
+            "TypeError: __format__ must return a str, not int",
+        ),
+        (
+            "f'{F()}'",
+            "TypeError: __format__ must return a str, not int",
+        ),
+        (
+            "bytes(BadBy())",
+            "TypeError: __bytes__ returned non-bytes (type str)",
+        ),
+        (
+            "bytes(By(), 'utf-8')",
+            "TypeError: encoding without a string argument",
+        ),
     ] {
         let src = format!("{cls}{src}");
         assert_eq!(eval_str(&src).expect_err(&src), want, "{src}");
@@ -9789,9 +9967,7 @@ fn a_class_reprs_under_its_own_module() {
 // are CPython 3.14's.
 #[test]
 fn more_than_255_operands_are_accepted_everywhere() {
-    let join = |n: usize, f: &dyn Fn(usize) -> String| {
-        (0..n).map(f).collect::<Vec<_>>().join(", ")
-    };
+    let join = |n: usize, f: &dyn Fn(usize) -> String| (0..n).map(f).collect::<Vec<_>>().join(", ");
     let pos = join(300, &|i| i.to_string());
     let kws = join(200, &|i| format!("k{i}={i}"));
     let src = [
@@ -9811,7 +9987,10 @@ fn more_than_255_operands_are_accepted_everywhere() {
             join(10, &|i| format!("q{i}={i}"))
         ),
         "r5 = (g(), g(p259=1000), len(g.__defaults__), len(g.__kwdefaults__))".to_string(),
-        format!("lam = lambda {}: p0 + p259", join(260, &|i| format!("p{i}={i}"))),
+        format!(
+            "lam = lambda {}: p0 + p259",
+            join(260, &|i| format!("p{i}={i}"))
+        ),
         "r6 = (lam(), lam(p0=5))".to_string(),
         "class S:\n    def __init_subclass__(cls, **kw): cls.n = len(kw)".to_string(),
         format!("class T(S, {}): pass", join(140, &|i| format!("c{i}={i}"))),
@@ -9918,7 +10097,10 @@ fn type_alias_statement_builds_a_lazy_type_alias_type() {
 #[test]
 fn type_alias_is_an_instance_of_bridged_type_alias_type() {
     assert_eq!(
-        g("import typing\ntype A = int\nx = isinstance(A, typing.TypeAliasType)", "x"),
+        g(
+            "import typing\ntype A = int\nx = isinstance(A, typing.TypeAliasType)",
+            "x"
+        ),
         "True"
     );
 }
@@ -10052,10 +10234,7 @@ c = {1, 2}
 c.symmetric_difference_update({2: 0, 3: 0})
 x = [a, b, c, {1}.symmetric_difference([2, 2])]
 "#;
-    assert_eq!(
-        g(src, "x"),
-        r#"[{1, 2}, set(), {1, 3}, {1, 2}]"#
-    );
+    assert_eq!(g(src, "x"), r#"[{1, 2}, set(), {1, 3}, {1, 2}]"#);
 }
 
 // The inner name is the `tp_name` that failed to hash (`collections.deque`,

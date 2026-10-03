@@ -1112,12 +1112,18 @@ fn memoryview_with_block_releases_the_view() {
     }
     assert_eq!(err(&format!("{released}with m:\n    pass")), RELEASED);
     assert_eq!(
-        g(&format!("{released}x = (m == m, m == b'ab', repr(m)[:16])"), "x"),
+        g(
+            &format!("{released}x = (m == m, m == b'ab', repr(m)[:16])"),
+            "x"
+        ),
         "(True, False, '<released memory')"
     );
     // `release()` is idempotent, and is what `__exit__` does.
     assert_eq!(
-        g("m = memoryview(b'a')\nm.release()\nm.release()\nx = repr(m)[:9]", "x"),
+        g(
+            "m = memoryview(b'a')\nm.release()\nm.release()\nx = repr(m)[:9]",
+            "x"
+        ),
         "'<released'"
     );
 }
@@ -2212,7 +2218,10 @@ fn vendored_ast_fills_field_defaults_like_cpython() {
          type_ignores=[])'"
     );
     assert_eq!(
-        g("import ast\nn = ast.List([])\nn.elts.append(n)\nx = repr(n)", "x"),
+        g(
+            "import ast\nn = ast.List([])\nn.elts.append(n)\nx = repr(n)",
+            "x"
+        ),
         "'List(elts=[List(...)], ctx=Load())'"
     );
     assert_eq!(
@@ -3220,19 +3229,31 @@ fn deque_insert_clamps_but_a_bounded_deque_refuses() {
 fn deque_concatenation_and_repetition() {
     let run = |body: &str| g(&format!("from collections import deque\n{body}"), "x");
     assert_eq!(run("x = deque([1, 2]) + deque([3])"), "deque([1, 2, 3])");
-    assert_eq!(run("x = (deque([1, 2]) * 2, 2 * deque([1, 2]))"), "(deque([1, 2, 1, 2]), deque([1, 2, 1, 2]))");
-    assert_eq!(run("x = (deque([1, 2]) * 0, deque([1, 2]) * -1)"), "(deque([]), deque([]))");
+    assert_eq!(
+        run("x = (deque([1, 2]) * 2, 2 * deque([1, 2]))"),
+        "(deque([1, 2, 1, 2]), deque([1, 2, 1, 2]))"
+    );
+    assert_eq!(
+        run("x = (deque([1, 2]) * 0, deque([1, 2]) * -1)"),
+        "(deque([]), deque([]))"
+    );
     assert_eq!(
         run("m = deque([1, 2, 3], maxlen=4)\nx = (m + deque([4, 5]), m * 2, deque([1], maxlen=3) * 2**62)"),
         "(deque([2, 3, 4, 5], maxlen=4), deque([3, 1, 2, 3], maxlen=4), deque([1, 1, 1], maxlen=3))"
     );
     // The right operand's bound is irrelevant: the left deque's is copied.
-    assert_eq!(run("x = deque([1, 2]) + deque([3], maxlen=1)"), "deque([1, 2, 3])");
+    assert_eq!(
+        run("x = deque([1, 2]) + deque([3], maxlen=1)"),
+        "deque([1, 2, 3])"
+    );
     assert_eq!(
         run("q = deque([1]); r = q\nq += (5, 6)\nq *= 2\nq += q\nx = (q, q is r)"),
         "(deque([1, 5, 6, 1, 5, 6, 1, 5, 6, 1, 5, 6]), True)"
     );
-    assert_eq!(run("q = deque([1, 2], maxlen=3)\nq *= 2\nx = q"), "deque([2, 1, 2], maxlen=3)");
+    assert_eq!(
+        run("q = deque([1, 2], maxlen=3)\nq *= 2\nx = q"),
+        "deque([2, 1, 2], maxlen=3)"
+    );
     assert_eq!(
         run("q = deque([7])\nx = (q.__iadd__([8]) is q, q.__imul__(2) is q, q, q.__add__(q), q.__rmul__(2))"),
         "(True, True, deque([7, 8, 7, 8]), deque([7, 8, 7, 8, 7, 8, 7, 8]), deque([7, 8, 7, 8, 7, 8, 7, 8]))"
@@ -3255,7 +3276,10 @@ fn deque_concatenation_and_repetition() {
         fail("deque([1]) * 'a'"),
         "TypeError: can't multiply sequence by non-int of type 'str'"
     );
-    assert_eq!(fail("q = deque([1])\nq += 5"), "TypeError: 'int' object is not iterable");
+    assert_eq!(
+        fail("q = deque([1])\nq += 5"),
+        "TypeError: 'int' object is not iterable"
+    );
     assert_eq!(
         fail("q = deque([1])\nq *= 1.5"),
         "TypeError: can't multiply sequence by non-int of type 'float'"
@@ -3518,7 +3542,10 @@ fn sys_getsizeof_adds_the_preheader_to_sizeof() {
         class R:\n    def __sizeof__(self): raise TypeError('nope')\n\
         def err(f):\n    try:\n        return f()\n    except Exception as e:\n        return (type(e).__name__, str(e))\n";
     assert_eq!(
-        g(&format!("{classes}x = [sys.getsizeof(c()) for c in (A, S, E, B, L)]"), "x"),
+        g(
+            &format!("{classes}x = [sys.getsizeof(c()) for c in (A, S, E, B, L)]"),
+            "x"
+        ),
         "[132, 116, 116, 33, 39]"
     );
     assert_eq!(
@@ -3526,11 +3553,17 @@ fn sys_getsizeof_adds_the_preheader_to_sizeof() {
         "[('ValueError', '__sizeof__() should return >= 0'), ('TypeError', 'an integer is required'), ('TypeError', 'nope')]"
     );
     assert_eq!(
-        g(&format!("{classes}x = [err(lambda: sys.getsizeof(c(), 'dflt')) for c in (N, T, R)]"), "x"),
+        g(
+            &format!("{classes}x = [err(lambda: sys.getsizeof(c(), 'dflt')) for c in (N, T, R)]"),
+            "x"
+        ),
         "[('ValueError', '__sizeof__() should return >= 0'), 'dflt', 'dflt']"
     );
     assert_eq!(
-        g(&format!("{classes}x = (sys.getsizeof(A(), default=5), sys.getsizeof(object=A()))"), "x"),
+        g(
+            &format!("{classes}x = (sys.getsizeof(A(), default=5), sys.getsizeof(object=A()))"),
+            "x"
+        ),
         "(132, 132)"
     );
     assert_eq!(
@@ -3827,7 +3860,10 @@ fn the_builtins_module_is_the_namespace_names_fall_back_to() {
         "(5, 5)"
     );
     assert_eq!(
-        g("import builtins\nbuiltins.abs = lambda v: 'mine'\nx = abs(-1)", "x"),
+        g(
+            "import builtins\nbuiltins.abs = lambda v: 'mine'\nx = abs(-1)",
+            "x"
+        ),
         "'mine'"
     );
     assert_eq!(
@@ -3839,7 +3875,10 @@ fn the_builtins_module_is_the_namespace_names_fall_back_to() {
         "(True, True)"
     );
     // A program-defined global still shadows the builtin of the same name.
-    assert_eq!(g("import builtins\nbuiltins.zz = 1\nzz = 2\nx = zz", "x"), "2");
+    assert_eq!(
+        g("import builtins\nbuiltins.zz = 1\nzz = 2\nx = zz", "x"),
+        "2"
+    );
 }
 
 /// The bridge adds what only CPython's `builtins` module has — the module's
@@ -3848,7 +3887,10 @@ fn the_builtins_module_is_the_namespace_names_fall_back_to() {
 #[cfg(feature = "stdlib-ffi")]
 #[test]
 fn builtins_only_in_cpython_matches_the_bridge() {
-    assert_eq!(g("import builtins\nx = repr(builtins)", "x"), "\"<module 'builtins' (built-in)>\"");
+    assert_eq!(
+        g("import builtins\nx = repr(builtins)", "x"),
+        "\"<module 'builtins' (built-in)>\""
+    );
     assert_eq!(g("x = aiter.__name__", "x"), "'aiter'");
     // `CPYTHON_ONLY_BUILTINS` is exactly CPython's names minus the native ones.
     let cpython_only = g(
@@ -3858,7 +3900,10 @@ fn builtins_only_in_cpython_matches_the_bridge() {
         "x",
     );
     let native: Vec<&str> = pythonrs::builtins::builtin_names();
-    let listed: Vec<String> = pythonrs::host::CPYTHON_ONLY_BUILTINS.iter().map(|s| s.to_string()).collect();
+    let listed: Vec<String> = pythonrs::host::CPYTHON_ONLY_BUILTINS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     let all: Vec<String> = cpython_only
         .trim_matches(|c| c == '[' || c == ']')
         .split(", ")
@@ -3868,7 +3913,10 @@ fn builtins_only_in_cpython_matches_the_bridge() {
         .into_iter()
         .filter(|n| {
             !native.contains(&n.as_str())
-                && !matches!(n.as_str(), "None" | "True" | "False" | "NotImplemented" | "Ellipsis")
+                && !matches!(
+                    n.as_str(),
+                    "None" | "True" | "False" | "NotImplemented" | "Ellipsis"
+                )
         })
         .collect();
     assert_eq!(listed, expected);

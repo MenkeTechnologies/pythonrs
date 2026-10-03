@@ -216,10 +216,22 @@ fn binop_anchor_reaches_into_a_parenthesized_right_operand() {
         let lines: Vec<&str> = tb.lines().collect();
         format!("{}\n{}", lines[2], lines[3])
     };
-    assert_eq!(caret_rows("x = 1+(\"a\")\n"), "    x = 1+(\"a\")\n        ~^^~~~~");
-    assert_eq!(caret_rows("x = 1 -((\"a\"))\n"), "    x = 1 -((\"a\"))\n        ~~^^~~~~~~");
-    assert_eq!(caret_rows("x = 1+(\"a\",)\n"), "    x = 1+(\"a\",)\n        ~^~~~~~~");
-    assert_eq!(caret_rows("x = 1+(\"a\")*2\n"), "    x = 1+(\"a\")*2\n        ~^~~~~~~~");
+    assert_eq!(
+        caret_rows("x = 1+(\"a\")\n"),
+        "    x = 1+(\"a\")\n        ~^^~~~~"
+    );
+    assert_eq!(
+        caret_rows("x = 1 -((\"a\"))\n"),
+        "    x = 1 -((\"a\"))\n        ~~^^~~~~~~"
+    );
+    assert_eq!(
+        caret_rows("x = 1+(\"a\",)\n"),
+        "    x = 1+(\"a\",)\n        ~^~~~~~~"
+    );
+    assert_eq!(
+        caret_rows("x = 1+(\"a\")*2\n"),
+        "    x = 1+(\"a\")*2\n        ~^~~~~~~~"
+    );
 }
 
 /// A method call whose callee lookup fails carets the attribute (`recv.name`),
@@ -234,7 +246,10 @@ fn a_failed_method_lookup_carets_the_attribute() {
         format!("{}\n{}", lines[lines.len() - 3], lines[lines.len() - 2])
     };
     let k = "class K: pass\nk = K()\n";
-    assert_eq!(caret_rows(&format!("{k}k.missing()\n")), "    k.missing()\n    ^^^^^^^^^");
+    assert_eq!(
+        caret_rows(&format!("{k}k.missing()\n")),
+        "    k.missing()\n    ^^^^^^^^^"
+    );
     assert_eq!(
         caret_rows(&format!("{k}x = k.missing()\n")),
         "    x = k.missing()\n        ^^^^^^^^^"
@@ -243,7 +258,10 @@ fn a_failed_method_lookup_carets_the_attribute() {
         caret_rows(&format!("{k}x = 1\nprint(k.missing(x+1, 2))\n")),
         "    print(k.missing(x+1, 2))\n          ^^^^^^^^^"
     );
-    assert_eq!(caret_rows("print([].nope(1))\n"), "    print([].nope(1))\n          ^^^^^^^");
+    assert_eq!(
+        caret_rows("print([].nope(1))\n"),
+        "    print([].nope(1))\n          ^^^^^^^"
+    );
     assert_eq!(
         caret_rows(&format!("{k}print(k.missing(\n   1))\n")),
         "    print(k.missing(\n          ^^^^^^^^^"
@@ -1362,7 +1380,10 @@ fn merged_streams_order_by_cpython_buffering() {
     let script = script.to_str().expect("utf-8 path");
 
     // Buffered stdout reaches the file at exit, after both stderr lines.
-    assert_eq!(merged_output(&[script], "", &dir), "err1\nerr2\nout1\nout2\n");
+    assert_eq!(
+        merged_output(&[script], "", &dir),
+        "err1\nerr2\nout1\nout2\n"
+    );
     // `-u` makes both streams write-through: program order.
     assert_eq!(
         merged_output(&["-u", script], "", &dir),
@@ -1384,7 +1405,10 @@ fn merged_streams_order_by_cpython_buffering() {
     // `stderr` holds a partial line until its newline.
     assert_eq!(
         merged_output(
-            &["-c", "import sys; sys.stderr.write('e'); print('a'); sys.stderr.write('f\\n')"],
+            &[
+                "-c",
+                "import sys; sys.stderr.write('e'); print('a'); sys.stderr.write('f\\n')"
+            ],
             "",
             &dir
         ),
@@ -1392,13 +1416,20 @@ fn merged_streams_order_by_cpython_buffering() {
     );
     // `os._exit` skips the flush, so buffered output is lost.
     assert_eq!(
-        merged_output(&["-c", "print('kept', end=''); import os; os._exit(0)"], "", &dir),
+        merged_output(
+            &["-c", "print('kept', end=''); import os; os._exit(0)"],
+            "",
+            &dir
+        ),
         ""
     );
     // An `atexit` callback prints after the traceback.
     assert_eq!(
         merged_output(
-            &["-c", "import atexit; atexit.register(print, 'x'); raise SystemExit('bye')"],
+            &[
+                "-c",
+                "import atexit; atexit.register(print, 'x'); raise SystemExit('bye')"
+            ],
             "",
             &dir
         ),
@@ -1446,7 +1477,10 @@ fn block_buffered_stdout_flushes_at_cpython_chunk_boundaries() {
         .chain(out(2460..3000))
         .collect();
     assert!(log == want, "first divergence at byte {}", {
-        log.bytes().zip(want.bytes()).take_while(|(a, b)| a == b).count()
+        log.bytes()
+            .zip(want.bytes())
+            .take_while(|(a, b)| a == b)
+            .count()
     });
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1529,6 +1563,10 @@ fn optimize_levels_strip_asserts_and_docstrings() {
     assert_eq!(run(None), plain);
     assert_eq!(run(Some("-O")), "1 M cd fd kept kept [] False\n");
     assert_eq!(run(Some("-OO")), "2 None None None kept kept [] False\n");
-    assert_eq!(run(None), plain, "a cached -OO chunk was served to an unoptimized run");
+    assert_eq!(
+        run(None),
+        plain,
+        "a cached -OO chunk was served to an unoptimized run"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

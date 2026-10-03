@@ -35,7 +35,10 @@ fn a_frame_names_its_own_modules_file() {
     let main = "import helper\ndef f():\n    helper.boom(0)\ntry:\n    f()\nexcept ZeroDivisionError as e:\n    \
                 print(e.__traceback__.tb_next.tb_next.tb_lineno)\ntry:\n    import bad\nexcept IndexError:\n    \
                 print('import failed')\nf()\n";
-    let (out, err) = run_files(&[("helper.py", helper), ("bad.py", bad), ("main.py", main)], "main.py");
+    let (out, err) = run_files(
+        &[("helper.py", helper), ("bad.py", bad), ("main.py", main)],
+        "main.py",
+    );
     assert_eq!(out, "2\nimport failed\n");
     assert_eq!(
         err,

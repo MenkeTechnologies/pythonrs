@@ -577,7 +577,9 @@ pub fn getitem_value(recv: Value, idx: Value) -> Result<Value, String> {
     }
     if with_host(|h| matches!(h.get(&recv), Some(PyObj::Instance(_)))) {
         let tn = with_host(|h| h.type_name(&recv));
-        return Err(host::type_error(&format!("'{tn}' object is not subscriptable")));
+        return Err(host::type_error(&format!(
+            "'{tn}' object is not subscriptable"
+        )));
     }
     // `Cls[item]` on a class with `__class_getitem__` (e.g. generic aliases).
     if let Some(r) = host::class_getitem(&recv, idx.clone()) {
@@ -621,10 +623,7 @@ pub fn getitem_value(recv: Value, idx: Value) -> Result<Value, String> {
     // A `slice` bound with `__index__` is resolved the same way (`a[Idx():Idx()]`).
     let idx = if with_host(|h| !matches!(h.get(&recv), Some(PyObj::Dict(_)))) {
         if with_host(|h| matches!(h.get(&idx), Some(PyObj::Slice { .. }))) {
-            match normalize_slice_bounds(&idx) {
-                Ok(v) => v,
-                Err(e) => return Err(e),
-            }
+            normalize_slice_bounds(&idx)?
         } else {
             match index_dunder(&idx) {
                 Ok(Some(v)) => v,
@@ -935,7 +934,12 @@ fn b_mkset_const(vm: &mut VM, argc: u8) -> Value {
         if let Some((folded, start)) = h.set_layout_of(&display) {
             let empty = IndexMap::new();
             let n = folded.len();
-            h.set_relayout_after_merge(&display, (&empty, host::SET_MINSIZE), n, Some((&folded, start)));
+            h.set_relayout_after_merge(
+                &display,
+                (&empty, host::SET_MINSIZE),
+                n,
+                Some((&folded, start)),
+            );
         }
     });
     display
@@ -2587,7 +2591,9 @@ fn dispatch_dunder_pair(
     modulus: Option<&Value>,
 ) -> Dunder {
     let args = |first: &Value| -> Vec<Value> {
-        std::iter::once(first.clone()).chain(modulus.cloned()).collect()
+        std::iter::once(first.clone())
+            .chain(modulus.cloned())
+            .collect()
     };
     // ONE host borrow decides the whole plan. Every question here — does either
     // side define its half, are the two the same type, does the right one take
@@ -3403,7 +3409,9 @@ fn inplace_builtin(tag: i64, a: &Value, b: &Value) -> Option<Result<Value, Strin
             }
         });
         if let Some(((incoming, src), Some(before))) = merge {
-            with_host(|h| h.set_relayout_after_merge(a, (&before.0, before.1), incoming, src_ref(&src)));
+            with_host(|h| {
+                h.set_relayout_after_merge(a, (&before.0, before.1), incoming, src_ref(&src))
+            });
         }
         return Some(Ok(a.clone()));
     }
@@ -3423,7 +3431,9 @@ fn inplace_repeat_count(b: &Value) -> Option<Result<usize, String>> {
     };
     match with_host(|h| h.index_fit(&count)) {
         host::IndexFit::Fits(n) => Some(Ok(n.max(0) as usize)),
-        host::IndexFit::TooLarge(_) => Some(Err(format!("OverflowError: {}", host::INDEX_OVERFLOW))),
+        host::IndexFit::TooLarge(_) => {
+            Some(Err(format!("OverflowError: {}", host::INDEX_OVERFLOW)))
+        }
         host::IndexFit::NotInt => None,
     }
 }
@@ -4162,7 +4172,12 @@ fn b_match_class(vm: &mut VM, argc: u8) -> Value {
         }),
         _ => None,
     };
-    let kwnames: Vec<String> = names_list.as_deref().unwrap_or(&all[3..]).iter().map(sval).collect();
+    let kwnames: Vec<String> = names_list
+        .as_deref()
+        .unwrap_or(&all[3..])
+        .iter()
+        .map(sval)
+        .collect();
     // `isinstance_dispatch` (not the raw helper) so a foreign class — a
     // `@dataclass`/`enum` mirror — matches via CPython's `isinstance`.
     match isinstance_dispatch(&subject, &class) {
@@ -4404,7 +4419,10 @@ fn pattern_error_bind(
         let before = &units[..usize::try_from(p).unwrap_or(0).min(units.len())];
         let newline = '\n' as u32;
         let line = before.iter().filter(|&&c| c == newline).count() as i64 + 1;
-        let last_newline = before.iter().rposition(|&c| c == newline).map_or(-1, |i| i as i64);
+        let last_newline = before
+            .iter()
+            .rposition(|&c| c == newline)
+            .map_or(-1, |i| i as i64);
         lineno = Value::Int(line);
         colno = Value::Int(p - last_newline);
         if units.contains(&newline) {
@@ -5761,7 +5779,9 @@ pub fn call_builtin_function(
 ) -> Result<Value, String> {
     // `type(C.x)()`, `type(iter([]))()`: a type object with no constructor.
     if UNINSTANTIABLE_TYPES.contains(&name) {
-        return Err(host::type_error(&format!("cannot create '{name}' instances")));
+        return Err(host::type_error(&format!(
+            "cannot create '{name}' instances"
+        )));
     }
     // math.* module functions.
     if let Some(m) = name.strip_prefix("math.") {
@@ -7356,7 +7376,12 @@ pub fn call_builtin_function(
                 let out = h.new_setlike(s, name == "frozenset");
                 if let Some((incoming, src)) = merged_from {
                     let empty = IndexMap::new();
-                    h.set_relayout_after_merge(&out, (&empty, host::SET_MINSIZE), incoming, src_ref(&src));
+                    h.set_relayout_after_merge(
+                        &out,
+                        (&empty, host::SET_MINSIZE),
+                        incoming,
+                        src_ref(&src),
+                    );
                 }
                 out
             }))
@@ -7458,9 +7483,9 @@ pub fn call_builtin_function(
             // hook.
             if name == "bytes" {
                 if let Some(src) = source {
-                    let has = with_host(|h| {
-                        matches!(h.get(src), Some(PyObj::Instance(i)) if instance_has(h, i, "__bytes__"))
-                    });
+                    let has = with_host(
+                        |h| matches!(h.get(src), Some(PyObj::Instance(i)) if instance_has(h, i, "__bytes__")),
+                    );
                     if has {
                         let r = host::call_method(src, "__bytes__", vec![], vec![])?;
                         if with_host(|h| matches!(h.get(&r), Some(PyObj::Bytes(_)))) {
@@ -7855,9 +7880,7 @@ fn ternary_pow(a: &Value, b: &Value, m: &Value) -> Result<Value, String> {
         }
         match slot {
             Slot::Int => {
-                let all_int = [a, b, m]
-                    .into_iter()
-                    .all(|x| slot_of(x) == Some(Slot::Int));
+                let all_int = [a, b, m].into_iter().all(|x| slot_of(x) == Some(Slot::Int));
                 if all_int {
                     return pow_mod(a, b, m);
                 }
@@ -9091,7 +9114,11 @@ fn parse_imag(s: &str) -> Result<f64, String> {
 /// (`float('-nan')` is negative), so it gets an identity of its own.
 fn parse_py_float(s: &str) -> Option<f64> {
     let f = s.trim().replace('_', "").parse::<f64>().ok()?;
-    Some(if f.is_nan() { host::fresh_nan(f.is_sign_negative()) } else { f })
+    Some(if f.is_nan() {
+        host::fresh_nan(f.is_sign_negative())
+    } else {
+        f
+    })
 }
 
 /// The `(real, imag)` a `complex()` FIRST argument contributes.
@@ -11957,8 +11984,15 @@ enum ReplPiece {
 /// raises it: `PatternError(msg, template, pos)`, so `str(e)` is `<msg> at
 /// position N`, plus `(line L, column C)` when the template spans several lines.
 fn re_template_error(src: &[char], istext: bool, msg: &str, pos: usize) -> String {
-    let msg = if istext { msg.to_string() } else { host::ascii_of(msg) };
-    let refusal = crate::sre_parse::Refusal::Pattern { msg, pos: Some(pos) };
+    let msg = if istext {
+        msg.to_string()
+    } else {
+        host::ascii_of(msg)
+    };
+    let refusal = crate::sre_parse::Refusal::Pattern {
+        msg,
+        pos: Some(pos),
+    };
     crate::sre_parse::raise(refusal, src, istext)
 }
 
@@ -12973,7 +13007,11 @@ fn call_math(name: &str, args: &[Value], kwargs: &[(String, Value)]) -> Result<V
     })
 }
 
-fn call_math_value(name: &str, args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, String> {
+fn call_math_value(
+    name: &str,
+    args: &[Value],
+    kwargs: &[(String, Value)],
+) -> Result<Value, String> {
     if let Some(spec) = math_arity(name) {
         check_arity(name, &format!("math.{name}"), spec, args.len())?;
     }
@@ -14134,9 +14172,7 @@ pub fn type_has_method(typename: &str, name: &str) -> bool {
     // table-backed types already answered above via `type_method_names`.
     let list: &[&str] = match typename {
         "OrderedDict" => return DICT_METHODS.contains(&name) || name == "move_to_end",
-        "defaultdict" => {
-            return DICT_METHODS.contains(&name) || DEFAULTDICT_EXTRA.contains(&name)
-        }
+        "defaultdict" => return DICT_METHODS.contains(&name) || DEFAULTDICT_EXTRA.contains(&name),
         "Counter" => return DICT_METHODS.contains(&name) || COUNTER_EXTRA.contains(&name),
         "dict_keys" | "dict_items" => return name == "isdisjoint",
         // A C-level attribute descriptor is callable through the descriptor
@@ -15037,8 +15073,7 @@ fn sizeof_with_preheader(obj: &Value) -> Result<i64, String> {
     let res = if let Some(m) = with_host(|h| h.metaclass_method(obj, "__sizeof__")) {
         host::invoke(&m, vec![obj.clone()], vec![])?
     } else if with_host(|h| {
-        matches!(h.get(obj), Some(PyObj::Class(_)))
-            || matches!(h.type_name(obj).as_str(), "type")
+        matches!(h.get(obj), Some(PyObj::Class(_))) || matches!(h.type_name(obj).as_str(), "type")
     }) {
         Value::Int(object_sizeof(obj))
     } else {
@@ -15052,7 +15087,7 @@ fn sizeof_with_preheader(obj: &Value) -> Result<i64, String> {
         ref v => match with_host(|h| h.get(v).cloned()) {
             Some(PyObj::BigInt(_)) => {
                 return Err(
-                    "OverflowError: Python int too large to convert to C ssize_t".to_string()
+                    "OverflowError: Python int too large to convert to C ssize_t".to_string(),
                 )
             }
             // An `int` subclass instance carries its value as the payload.
@@ -15681,7 +15716,10 @@ fn instance_reduce_newobj(recv: &Value, class: &str) -> Result<Value, String> {
         if has_kwargs {
             let args = args.clone().unwrap_or_else(|| h.new_tuple(Vec::new()));
             let kwargs = kwargs.clone().unwrap_or(Value::Undef);
-            Ok((h.get_attr(&copyreg, "__newobj_ex__")?, h.new_tuple(vec![cls, args, kwargs])))
+            Ok((
+                h.get_attr(&copyreg, "__newobj_ex__")?,
+                h.new_tuple(vec![cls, args, kwargs]),
+            ))
         } else {
             let mut items = vec![cls];
             if let Some(Some(PyObj::Tuple(extra))) = args.as_ref().map(|a| h.get(a)) {
@@ -15705,17 +15743,24 @@ fn instance_reduce_newobj(recv: &Value, class: &str) -> Result<Value, String> {
         }
         _ => Value::Undef,
     };
-    Ok(with_host(|h| h.new_tuple(vec![newobj, newargs, state, listitems, dictitems])))
+    Ok(with_host(|h| {
+        h.new_tuple(vec![newobj, newargs, state, listitems, dictitems])
+    }))
 }
 
 /// `_PyObject_GetNewArguments`: `__getnewargs_ex__()` as `(args, kwargs)`, else
 /// `__getnewargs__()` as `(args, None)`, else neither — each looked up on the
 /// type, as a special method is, and checked as CPython checks it.
-fn instance_new_arguments(recv: &Value, class: &str) -> Result<(Option<Value>, Option<Value>), String> {
-    let tuple_items = |v: &Value| with_host(|h| match h.get(v) {
-        Some(PyObj::Tuple(items)) => Some(items.clone()),
-        _ => None,
-    });
+fn instance_new_arguments(
+    recv: &Value,
+    class: &str,
+) -> Result<(Option<Value>, Option<Value>), String> {
+    let tuple_items = |v: &Value| {
+        with_host(|h| match h.get(v) {
+            Some(PyObj::Tuple(items)) => Some(items.clone()),
+            _ => None,
+        })
+    };
     let type_name = |v: &Value| with_host(|h| h.type_name(v));
     if with_host(|h| h.class_lookup(class, "__getnewargs_ex__")).is_some() {
         let r = host::call_method(recv, "__getnewargs_ex__", vec![], vec![])?;
@@ -15785,8 +15830,14 @@ fn object_getstate(recv: &Value, class: &str, required: bool) -> Result<Value, S
 /// `object_getstate_default`: [`instance_state`], except that a `required`
 /// state of a variable-size builtin subclass cannot be produced.
 fn object_getstate_default(recv: &Value, class: &str, required: bool) -> Result<Value, String> {
-    if required && with_host(|h| matches!(h.builtin_base_of(class), Some("int" | "bytes" | "tuple"))) {
-        let name = with_host(|h| h.classes.get(class).map_or(class.to_string(), |c| c.name.clone()));
+    if required
+        && with_host(|h| matches!(h.builtin_base_of(class), Some("int" | "bytes" | "tuple")))
+    {
+        let name = with_host(|h| {
+            h.classes
+                .get(class)
+                .map_or(class.to_string(), |c| c.name.clone())
+        });
         return Err(host::type_error(&format!("cannot pickle '{name}' object")));
     }
     instance_state(recv)
@@ -15813,7 +15864,10 @@ fn copyreg_reduce_ex(recv: &Value, class: &str) -> Result<Value, String> {
     let dict = if with_host(|h| h.class_lookup(class, "__getstate__")).is_some() {
         host::call_method(recv, "__getstate__", vec![], vec![])?
     } else {
-        if with_host(|h| h.class_lookup(class, "__slots__").is_some_and(|s| h.truthy(&s))) {
+        if with_host(|h| {
+            h.class_lookup(class, "__slots__")
+                .is_some_and(|s| h.truthy(&s))
+        }) {
             return Err(host::type_error(
                 "a class that defines __slots__ without defining __getstate__ cannot be pickled",
             ));
@@ -16325,7 +16379,11 @@ fn exception_add_note(exc: &Value, note: Value) -> Result<(), String> {
         if h.as_str(&note).is_none() {
             return Err(host::type_error(&format!(
                 "add_note() argument must be str, not {}",
-                if matches!(note, Value::Undef) { "None".to_string() } else { h.type_name(&note) }
+                if matches!(note, Value::Undef) {
+                    "None".to_string()
+                } else {
+                    h.type_name(&note)
+                }
             )));
         }
         let notes = match h.get_attr(exc, "__notes__") {
@@ -18432,7 +18490,12 @@ fn set_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
                 let out = h.new_setlike(s, frozen);
                 if let Some((incoming, src)) = src {
                     let empty = IndexMap::new();
-                    h.set_relayout_after_merge(&out, (&empty, host::SET_MINSIZE), incoming, src_ref(&src));
+                    h.set_relayout_after_merge(
+                        &out,
+                        (&empty, host::SET_MINSIZE),
+                        incoming,
+                        src_ref(&src),
+                    );
                 }
                 out
             }))
@@ -18458,7 +18521,12 @@ fn set_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
                 }
                 if let Some(((incoming, src), Some(before))) = merge {
                     with_host(|h| {
-                        h.set_relayout_after_merge(recv, (&before.0, before.1), incoming, src_ref(&src))
+                        h.set_relayout_after_merge(
+                            recv,
+                            (&before.0, before.1),
+                            incoming,
+                            src_ref(&src),
+                        )
                     });
                 }
             }
@@ -18467,7 +18535,9 @@ fn set_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
         // `set_pop` takes the first live slot from its search finger, which for a
         // table nothing was popped from is the first element in iteration order.
         "pop" => with_host(|h| {
-            let first = h.set_entries_in_order(recv).and_then(|e| e.into_iter().next());
+            let first = h
+                .set_entries_in_order(recv)
+                .and_then(|e| e.into_iter().next());
             if let Some(PyObj::Set(s)) = h.get_mut(recv) {
                 match first {
                     Some((k, v)) => {
@@ -18520,7 +18590,8 @@ fn set_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             }
             let walked = with_host(|h| {
                 h.setlike(&other).is_some()
-                    || (matches!(h.get(&other), Some(PyObj::Dict(_))) && h.type_name(&other) == "dict")
+                    || (matches!(h.get(&other), Some(PyObj::Dict(_)))
+                        && h.type_name(&other) == "dict")
             });
             let other = if walked {
                 other
@@ -19191,14 +19262,14 @@ fn num_dunder(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
 fn deque_subclass_op(op: NumOp, a: &Value, b: &Value) -> Option<Result<Value, String>> {
     let is_deque_sub = |v: &Value, dunder: &str| {
         host::collections_subclass_of(v).is_some_and(|(base, _, class)| {
-            base == "collections.deque"
-                && with_host(|h| h.class_lookup(&class, dunder).is_none())
+            base == "collections.deque" && with_host(|h| h.class_lookup(&class, dunder).is_none())
         })
     };
     match op {
         NumOp::Add if is_deque_sub(a, "__add__") => Some((|| {
             let other_is_deque = with_host(|h| matches!(h.get(b), Some(PyObj::Deque { .. })))
-                || host::collections_subclass_of(b).is_some_and(|(base, ..)| base == "collections.deque");
+                || host::collections_subclass_of(b)
+                    .is_some_and(|(base, ..)| base == "collections.deque");
             if !other_is_deque {
                 return Err(with_host(|h| {
                     host::type_error(&format!(
@@ -19214,10 +19285,14 @@ fn deque_subclass_op(op: NumOp, a: &Value, b: &Value) -> Option<Result<Value, St
             Ok(new)
         })()),
         NumOp::Mul if is_deque_sub(a, "__mul__") || is_deque_sub(b, "__rmul__") => {
-            let (d, n) = if is_deque_sub(a, "__mul__") { (a, b) } else { (b, a) };
-            let has_index = with_host(|h| {
-                matches!(h.get(n), Some(PyObj::Instance(i)) if instance_has(h, i, "__index__"))
-            });
+            let (d, n) = if is_deque_sub(a, "__mul__") {
+                (a, b)
+            } else {
+                (b, a)
+            };
+            let has_index = with_host(
+                |h| matches!(h.get(n), Some(PyObj::Instance(i)) if instance_has(h, i, "__index__")),
+            );
             if !is_int_like(n) && !has_index {
                 return None;
             }
@@ -19266,7 +19341,11 @@ fn mapping_subclass_or(a: &Value, b: &Value) -> Option<Result<Value, String>> {
         let cls = with_host(|h| h.alloc(PyObj::Class(class)));
         let mut args = Vec::new();
         if base == "collections.defaultdict" {
-            args.push(host::dict_meta_of(&payload).and_then(|m| m.factory).unwrap_or(Value::Undef));
+            args.push(
+                host::dict_meta_of(&payload)
+                    .and_then(|m| m.factory)
+                    .unwrap_or(Value::Undef),
+            );
         }
         args.push(a.clone());
         let new = host::invoke(&cls, args, vec![])?;
@@ -20939,9 +21018,8 @@ fn bytes_translate(bytes: &[u8], args: &[Value]) -> Result<Vec<u8>, String> {
     };
     let delete: Vec<u8> = match args.get(1) {
         None | Some(Value::Undef) => Vec::new(),
-        Some(v) => {
-            as_bytes_object(v)?.ok_or_else(|| host::type_error("a bytes-like object is required"))?
-        }
+        Some(v) => as_bytes_object(v)?
+            .ok_or_else(|| host::type_error("a bytes-like object is required"))?,
     };
     let mut out = Vec::with_capacity(bytes.len());
     for &b in bytes {
@@ -21215,7 +21293,9 @@ fn deque_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, Strin
                 let (items, maxlen) = (items.clone(), *maxlen);
                 Ok(h.alloc(PyObj::Deque { items, maxlen }))
             }
-            _ => Err(host::type_error("descriptor requires a 'collections.deque' object")),
+            _ => Err(host::type_error(
+                "descriptor requires a 'collections.deque' object",
+            )),
         }),
         // `deque_reverse`: in place, returning None.
         "reverse" => {
@@ -21428,7 +21508,9 @@ fn collections_dict_method(
         ("Counter", "update") => Some(counter_add(recv, args, kwargs, 1)),
         ("OrderedDict", "move_to_end") => Some(ordered_move_to_end(recv, args, kwargs)),
         ("OrderedDict", "popitem") => Some(ordered_popitem(recv, args, kwargs)),
-        ("defaultdict", "__missing__") => Some(arg0(args).and_then(|key| defdict_missing(recv, key))),
+        ("defaultdict", "__missing__") => {
+            Some(arg0(args).and_then(|key| defdict_missing(recv, key)))
+        }
         ("defaultdict", "__copy__") => Some(dict_method(recv, "copy", &[], &[])),
         ("Counter", "__missing__") => Some(arg0(args).map(|_| Value::Int(0))),
         ("Counter", _) => counter_dunder(recv, name, args),
@@ -21641,8 +21723,12 @@ fn counter_inplace(tag: i64, a: &Value, b: &Value) -> Option<Result<Value, Strin
             for (elem, count) in mapping_items(b)? {
                 let current = getitem_value(a.clone(), elem.clone())?;
                 match tag {
-                    iop::ADD => subscript_store(a, elem, numeric_hook(NumOp::Add, &current, &count)?)?,
-                    iop::SUB => subscript_store(a, elem, numeric_hook(NumOp::Sub, &current, &count)?)?,
+                    iop::ADD => {
+                        subscript_store(a, elem, numeric_hook(NumOp::Add, &current, &count)?)?
+                    }
+                    iop::SUB => {
+                        subscript_store(a, elem, numeric_hook(NumOp::Sub, &current, &count)?)?
+                    }
                     _ => {
                         if is_true(NumOp::Gt, &count, &current)? {
                             subscript_store(a, elem, count)?;
@@ -21690,15 +21776,16 @@ fn comparison_dunder_op(name: &str) -> Option<NumOp> {
 /// for any other pair, which compares as plain dicts do.
 fn collections_compare(op: NumOp, a: &Value, b: &Value) -> Option<Result<Value, String>> {
     use host::DictKind;
-    if !matches!(op, NumOp::Eq | NumOp::Ne | NumOp::Lt | NumOp::Le | NumOp::Gt | NumOp::Ge) {
+    if !matches!(
+        op,
+        NumOp::Eq | NumOp::Ne | NumOp::Lt | NumOp::Le | NumOp::Gt | NumOp::Ge
+    ) {
         return None;
     }
     let kind_a = host::dict_meta_of(a)?.kind;
     let kind_b = host::dict_meta_of(b)?.kind;
     match (kind_a, kind_b) {
-        (DictKind::Counter, DictKind::Counter) => {
-            Some(counter_compare(op, a, b).map(Value::Bool))
-        }
+        (DictKind::Counter, DictKind::Counter) => Some(counter_compare(op, a, b).map(Value::Bool)),
         // `dict.__eq__(self, other) and all(map(_eq, self, other))`: two
         // OrderedDicts whose keys run in a different order are unequal. Same
         // order leaves exactly the plain-dict comparison.
@@ -21709,7 +21796,7 @@ fn collections_compare(op: NumOp, a: &Value, b: &Value) -> Option<Result<Value, 
                 }
                 _ => true,
             });
-            (!same_order).then(|| Ok(Value::Bool(matches!(op, NumOp::Ne))))
+            (!same_order).then_some(Ok(Value::Bool(matches!(op, NumOp::Ne))))
         }
         _ => None,
     }
@@ -21927,7 +22014,6 @@ fn ordered_move_to_end(
 }
 
 // ── collections constructors ─────────────────────────────────────────────────
-
 
 /// Construct a `collections` type: `deque` / `Counter` / `defaultdict` /
 /// `OrderedDict` / `namedtuple`.

@@ -251,7 +251,10 @@ impl<'a> Tokenizer<'a> {
 /// or `None` for a good name. Shared with the template parser.
 pub fn group_name_error(name: &str, istext: bool) -> Option<String> {
     if !(istext || name.is_ascii()) {
-        return Some(format!("bad character in group name {}", crate::host::ascii_of(&repr(name))));
+        return Some(format!(
+            "bad character in group name {}",
+            crate::host::ascii_of(&repr(name))
+        ));
     }
     if !crate::builtins::is_identifier(name) {
         return Some(format!("bad character in group name {}", repr(name)));
@@ -291,7 +294,11 @@ enum Node {
     /// `AT`: an anchor, which nothing can repeat.
     At,
     /// `MAX_REPEAT`/`MIN_REPEAT`/`POSSESSIVE_REPEAT`.
-    Repeat { min: u128, max: u128, item: Vec<Node> },
+    Repeat {
+        min: u128,
+        max: u128,
+        item: Vec<Node>,
+    },
     /// `SUBPATTERN`: a group, capturing (`group`) or carrying scoped flags.
     Group {
         group: Option<usize>,
@@ -302,9 +309,15 @@ enum Node {
     AtomicGroup(Vec<Node>),
     Branch(Vec<Vec<Node>>),
     GroupRef(usize),
-    GroupRefExists { yes: Vec<Node>, no: Option<Vec<Node>> },
+    GroupRefExists {
+        yes: Vec<Node>,
+        no: Option<Vec<Node>>,
+    },
     /// `ASSERT`/`ASSERT_NOT`; `dir < 0` is a look-behind.
-    Assert { dir: i8, p: Vec<Node> },
+    Assert {
+        dir: i8,
+        p: Vec<Node>,
+    },
     Failure,
 }
 
@@ -333,7 +346,10 @@ impl State {
     }
 
     fn group_named(&self, name: &str) -> Option<usize> {
-        self.groupdict.iter().find(|(n, _)| n == name).map(|&(_, g)| g)
+        self.groupdict
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|&(_, g)| g)
     }
 
     /// `opengroup(name)`; the error is the bare message, which the caller
@@ -580,7 +596,12 @@ fn escape(source: &mut Tokenizer, c: char, state: &State) -> Res<Node> {
 }
 
 /// `_parse_sub`: an alternation.
-fn parse_sub(source: &mut Tokenizer, state: &mut State, mut verbose: bool, nested: usize) -> Res<Vec<Node>> {
+fn parse_sub(
+    source: &mut Tokenizer,
+    state: &mut State,
+    mut verbose: bool,
+    nested: usize,
+) -> Res<Vec<Node>> {
     let mut items: Vec<Vec<Node>> = Vec::new();
     loop {
         let first = nested == 0 && items.is_empty();
@@ -599,7 +620,13 @@ fn parse_sub(source: &mut Tokenizer, state: &mut State, mut verbose: bool, neste
 }
 
 /// `_parse`: a sequence of items, up to `|`, `)` or the end.
-fn parse(source: &mut Tokenizer, state: &mut State, mut verbose: bool, nested: usize, first: bool) -> Res<Vec<Node>> {
+fn parse(
+    source: &mut Tokenizer,
+    state: &mut State,
+    mut verbose: bool,
+    nested: usize,
+    first: bool,
+) -> Res<Vec<Node>> {
     let mut subpattern: Vec<Node> = Vec::new();
     while let Some(this) = source.next {
         if this.is_in("|)") {
@@ -638,7 +665,9 @@ fn parse(source: &mut Tokenizer, state: &mut State, mut verbose: bool, nested: u
             }
             '.' => subpattern.push(Node::Unit),
             '(' => {
-                if let Some(node) = parse_group(source, state, &mut verbose, nested, first, &subpattern)? {
+                if let Some(node) =
+                    parse_group(source, state, &mut verbose, nested, first, &subpattern)?
+                {
                     subpattern.push(node);
                 }
             }
@@ -747,7 +776,9 @@ fn parse_repeat(source: &mut Tokenizer, subpattern: &mut Vec<Node>, c: char) -> 
                     return Err(Refusal::Overflow);
                 }
                 if max < min {
-                    return Err(source.error("min repeat greater than max repeat", source.tell() - here));
+                    return Err(
+                        source.error("min repeat greater than max repeat", source.tell() - here)
+                    );
                 }
             }
             (min, max)
@@ -792,7 +823,9 @@ fn parse_group(
     let mut atomic = false;
     let mut name: Option<String> = None;
     let (mut add_flags, mut del_flags) = (0, 0);
-    let unterminated = |source: &Tokenizer| source.error("missing ), unterminated subpattern", source.tell() - start);
+    let unterminated = |source: &Tokenizer| {
+        source.error("missing ), unterminated subpattern", source.tell() - start)
+    };
     if source.matches('?')? {
         let Some(char) = source.get()? else {
             return Err(source.error("unexpected end of pattern", 0));
@@ -808,7 +841,9 @@ fn parse_group(
                     source.checkgroupname(&n, 1)?;
                     let len = n.chars().count();
                     let Some(gid) = state.group_named(&n) else {
-                        return Err(source.error(&format!("unknown group name {}", repr(&n)), len + 1));
+                        return Err(
+                            source.error(&format!("unknown group name {}", repr(&n)), len + 1)
+                        );
                     };
                     if !state.checkgroup(gid) {
                         return Err(source.error("cannot refer to an open group", len + 1));
@@ -827,7 +862,9 @@ fn parse_group(
             Tok::Char('#') => {
                 loop {
                     if source.next.is_none() {
-                        return Err(source.error("missing ), unterminated comment", source.tell() - start));
+                        return Err(
+                            source.error("missing ), unterminated comment", source.tell() - start)
+                        );
                     }
                     if source.get()?.is_some_and(|t| t.is(')')) {
                         break;
@@ -896,7 +933,9 @@ fn parse_group(
                 let no = if source.matches('|')? {
                     let no = parse(source, state, *verbose, nested + 1, false)?;
                     if source.next == Some(Tok::Char('|')) {
-                        return Err(source.error("conditional backref with more than two branches", 0));
+                        return Err(
+                            source.error("conditional backref with more than two branches", 0)
+                        );
                     }
                     Some(no)
                 } else {
@@ -967,7 +1006,11 @@ fn parse_group(
 
 /// `_parse_flags`: `None` for global flags `(?i)`, else the scoped
 /// `(add, del)` of `(?i-s:...)`.
-fn parse_flags(source: &mut Tokenizer, state: &mut State, mut char: char) -> Res<Option<(i64, i64)>> {
+fn parse_flags(
+    source: &mut Tokenizer,
+    state: &mut State,
+    mut char: char,
+) -> Res<Option<(i64, i64)>> {
     let (mut add_flags, mut del_flags) = (0, 0);
     // The token after the flag letters, as `_parse_flags` reads it.
     let mut tok = Tok::Char(char);
@@ -976,14 +1019,23 @@ fn parse_flags(source: &mut Tokenizer, state: &mut State, mut char: char) -> Res
             let flag = flag_bit(char).unwrap_or(0);
             if source.istext {
                 if char == 'L' {
-                    return Err(source.error("bad inline flags: cannot use 'L' flag with a str pattern", 0));
+                    return Err(source.error(
+                        "bad inline flags: cannot use 'L' flag with a str pattern",
+                        0,
+                    ));
                 }
             } else if char == 'u' {
-                return Err(source.error("bad inline flags: cannot use 'u' flag with a bytes pattern", 0));
+                return Err(source.error(
+                    "bad inline flags: cannot use 'u' flag with a bytes pattern",
+                    0,
+                ));
             }
             add_flags |= flag;
             if flag & TYPE_FLAGS != 0 && add_flags & TYPE_FLAGS != flag {
-                return Err(source.error("bad inline flags: flags 'a', 'u' and 'L' are incompatible", 0));
+                return Err(source.error(
+                    "bad inline flags: flags 'a', 'u' and 'L' are incompatible",
+                    0,
+                ));
             }
             let Some(next) = source.get()? else {
                 return Err(source.error("missing -, : or )", 0));
@@ -995,7 +1047,11 @@ fn parse_flags(source: &mut Tokenizer, state: &mut State, mut char: char) -> Res
             match tok {
                 Tok::Char(c) if flag_bit(c).is_some() => char = c,
                 _ => {
-                    let msg = if is_alpha(tok) { "unknown flag" } else { "missing -, : or )" };
+                    let msg = if is_alpha(tok) {
+                        "unknown flag"
+                    } else {
+                        "missing -, : or )"
+                    };
                     return Err(source.error(msg, tok.len()));
                 }
             }
@@ -1015,14 +1071,21 @@ fn parse_flags(source: &mut Tokenizer, state: &mut State, mut char: char) -> Res
         let mut c = match next {
             Tok::Char(c) if flag_bit(c).is_some() => c,
             _ => {
-                let msg = if is_alpha(next) { "unknown flag" } else { "missing flag" };
+                let msg = if is_alpha(next) {
+                    "unknown flag"
+                } else {
+                    "missing flag"
+                };
                 return Err(source.error(msg, next.len()));
             }
         };
         loop {
             let flag = flag_bit(c).unwrap_or(0);
             if flag & TYPE_FLAGS != 0 {
-                return Err(source.error("bad inline flags: cannot turn off flags 'a', 'u' and 'L'", 0));
+                return Err(source.error(
+                    "bad inline flags: cannot turn off flags 'a', 'u' and 'L'",
+                    0,
+                ));
             }
             del_flags |= flag;
             let Some(next) = source.get()? else {
@@ -1034,7 +1097,11 @@ fn parse_flags(source: &mut Tokenizer, state: &mut State, mut char: char) -> Res
             match next {
                 Tok::Char(n) if flag_bit(n).is_some() => c = n,
                 _ => {
-                    let msg = if is_alpha(next) { "unknown flag" } else { "missing :" };
+                    let msg = if is_alpha(next) {
+                        "unknown flag"
+                    } else {
+                        "missing :"
+                    };
                     return Err(source.error(msg, next.len()));
                 }
             }
@@ -1059,19 +1126,27 @@ fn is_alpha(tok: Tok) -> bool {
 fn fix_flags(istext: bool, mut flags: i64) -> Res<i64> {
     if istext {
         if flags & FLAG_LOCALE != 0 {
-            return Err(Refusal::Value("cannot use LOCALE flag with a str pattern".into()));
+            return Err(Refusal::Value(
+                "cannot use LOCALE flag with a str pattern".into(),
+            ));
         }
         if flags & FLAG_ASCII == 0 {
             flags |= FLAG_UNICODE;
         } else if flags & FLAG_UNICODE != 0 {
-            return Err(Refusal::Value("ASCII and UNICODE flags are incompatible".into()));
+            return Err(Refusal::Value(
+                "ASCII and UNICODE flags are incompatible".into(),
+            ));
         }
     } else {
         if flags & FLAG_UNICODE != 0 {
-            return Err(Refusal::Value("cannot use UNICODE flag with a bytes pattern".into()));
+            return Err(Refusal::Value(
+                "cannot use UNICODE flag with a bytes pattern".into(),
+            ));
         }
         if flags & FLAG_LOCALE != 0 && flags & FLAG_ASCII != 0 {
-            return Err(Refusal::Value("ASCII and LOCALE flags are incompatible".into()));
+            return Err(Refusal::Value(
+                "ASCII and LOCALE flags are incompatible".into(),
+            ));
         }
     }
     Ok(flags)
@@ -1234,20 +1309,35 @@ mod tests {
         assert_eq!(refusal("a**"), at("multiple repeat", 2));
         assert_eq!(refusal("x{2}{3}"), at("multiple repeat", 4));
         assert_eq!(refusal("^*"), at("nothing to repeat", 1));
-        assert_eq!(refusal("a{2,1}"), at("min repeat greater than max repeat", 2));
+        assert_eq!(
+            refusal("a{2,1}"),
+            at("min repeat greater than max repeat", 2)
+        );
         assert_eq!(refusal("[z-a]"), at("bad character range z-a", 1));
         assert_eq!(refusal("[\\d-z]"), at("bad character range \\d-z", 1));
-        assert_eq!(refusal("(?P<1>a)"), at("bad character in group name '1'", 4));
+        assert_eq!(
+            refusal("(?P<1>a)"),
+            at("bad character in group name '1'", 4)
+        );
         assert_eq!(
             refusal("(?P<a>x)(?P<a>y)"),
             at("redefinition of group name 'a' as group 2; was group 1", 12)
         );
-        assert_eq!(refusal("(?(1)a|b|c)"), at("conditional backref with more than two branches", 8));
+        assert_eq!(
+            refusal("(?(1)a|b|c)"),
+            at("conditional backref with more than two branches", 8)
+        );
         assert_eq!(refusal("(?(2)a)(b)"), at("invalid group reference 2", 3));
-        assert_eq!(refusal("\\777"), at("octal escape value \\777 outside of range 0-0o377", 0));
+        assert_eq!(
+            refusal("\\777"),
+            at("octal escape value \\777 outside of range 0-0o377", 0)
+        );
         assert_eq!(refusal("(a)\\2"), at("invalid group reference 2", 4));
         assert_eq!(refusal("(?ix-s"), at("missing :", 6));
-        assert_eq!(refusal("a(?i)"), at("global flags not at the start of the expression", 1));
+        assert_eq!(
+            refusal("a(?i)"),
+            at("global flags not at the start of the expression", 1)
+        );
         assert_eq!(refusal("\\"), at("bad escape (end of pattern)", 0));
         assert_eq!(refusal("a{99999999999}"), Refusal::Overflow);
         assert_eq!(
@@ -1262,7 +1352,10 @@ mod tests {
     #[test]
     fn accepted_patterns_report_their_flags() {
         let chars: Vec<char> = "(?i)a{,3}[]-]\\1?(x)(?<=(a))\\2".chars().collect();
-        assert!(check(&chars, true, 0).is_err(), "\\1 before group 1 closes is an error");
+        assert!(
+            check(&chars, true, 0).is_err(),
+            "\\1 before group 1 closes is an error"
+        );
         let ok: Vec<char> = "(?i)(a)b{,3}[]-](?<=\\1)".chars().collect();
         assert_eq!(check(&ok, true, 0), Ok(2 | FLAG_UNICODE));
         assert_eq!(check(&['a'], false, 0), Ok(0));

@@ -229,7 +229,7 @@ pub enum PKey {
     /// see [`crate::pyhash::slice`].
     Slice(Vec<PKey>),
     /// A `range` key: `(len, start, step)` canonicalized as `range_hash` does
-    /// (see [`range_pkey`]). Distinct from `Tuple` for the same reason as
+    /// (see `range_pkey`). Distinct from `Tuple` for the same reason as
     /// `Slice` — a range never equals a tuple — though here the two do hash
     /// alike, because CPython hashes the range AS that tuple.
     Range(Vec<PKey>),
@@ -2284,7 +2284,7 @@ pub struct PyHost {
     /// `PyObj::Set`/`PyObj::Frozenset` heap index. Absent means CPython's fresh
     /// 8-slot table; a set built by a presizing merge (a constant display,
     /// `set(other_set)`, `.copy()`, `|`) records the size CPython resized it to.
-    /// See [`set_merge_layout`].
+    /// See `set_merge_layout`.
     pub set_start: HashMap<u32, usize>,
     /// `lru_cache` memo tables, indexed by `PyObj::LruCache.cache_id`.
     lru_caches: Vec<LruData>,
@@ -2958,7 +2958,9 @@ fn inline_comprehension_frames(frames: &mut Vec<TbEntry>) {
     let mut i = 1;
     while i < frames.len() {
         let comp = match (&frames[i - 1], &frames[i]) {
-            (TbEntry::Frame(_), TbEntry::Frame(f)) if &*f.name == "<comp>" => Some((f.line, f.span)),
+            (TbEntry::Frame(_), TbEntry::Frame(f)) if &*f.name == "<comp>" => {
+                Some((f.line, f.span))
+            }
             _ => None,
         };
         match comp {
@@ -3569,8 +3571,8 @@ impl PyHost {
     pub fn set_entries_in_order(&self, v: &Value) -> Option<Vec<(PKey, Value)>> {
         let s = self.setlike(v)?;
         let entries: Vec<(&PKey, &Value)> = s.iter().collect();
-        let order = set_slot_order(s, self.set_start_of(v))
-            .unwrap_or_else(|| (0..entries.len()).collect());
+        let order =
+            set_slot_order(s, self.set_start_of(v)).unwrap_or_else(|| (0..entries.len()).collect());
         Some(
             order
                 .into_iter()
@@ -4190,7 +4192,11 @@ impl PyHost {
                 return r;
             }
         }
-        let name = quote_str(&bound("__name__").and_then(|v| self.as_str(v)).unwrap_or_else(|| name.to_string()));
+        let name = quote_str(
+            &bound("__name__")
+                .and_then(|v| self.as_str(v))
+                .unwrap_or_else(|| name.to_string()),
+        );
         if let Some(file) = bound("__file__") {
             return format!("<module {name} from {}>", self.repr_of(file));
         }
@@ -4923,7 +4929,9 @@ fn type_object_class_name(n: &str) -> Option<String> {
         "defaultdict" => Some("collections.defaultdict"),
         "OrderedDict" => Some("collections.OrderedDict"),
         "deque" => Some("collections.deque"),
-        "collections.Counter" | "collections.defaultdict" | "collections.OrderedDict"
+        "collections.Counter"
+        | "collections.defaultdict"
+        | "collections.OrderedDict"
         | "collections.deque" => Some(n),
         "partial" => Some("functools.partial"),
         // The native `asyncio` primitives (`async_rt::AsyncObj`).
@@ -5781,7 +5789,11 @@ impl PyHost {
                 Some(PyObj::AsyncObj { id }) => async_rt::async_obj_repr(*id),
                 Some(PyObj::Bytearray(b)) => format!("bytearray(b{})", quote_bytes(b, true)),
                 Some(PyObj::Memoryview { released, .. }) => {
-                    let kind = if *released { "released memory" } else { "memory" };
+                    let kind = if *released {
+                        "released memory"
+                    } else {
+                        "memory"
+                    };
                     format!("<{kind} at 0x{:012x}>", self.addr_of(v))
                 }
                 Some(PyObj::File { id }) => self.file_repr(*id),
@@ -6331,9 +6343,11 @@ impl PyHost {
                     let len = num_bigint::BigInt::from(range_len_exact(*start, *stop, *step));
                     range_pkey(len, (*start).into(), (*step).into())
                 }
-                Some(PyObj::BigRange { start, stop, step }) => {
-                    range_pkey(big_range_len(start, stop, step), start.clone(), step.clone())
-                }
+                Some(PyObj::BigRange { start, stop, step }) => range_pkey(
+                    big_range_len(start, stop, step),
+                    start.clone(),
+                    step.clone(),
+                ),
                 // `memory_hash`: only a live, read-only view hashes, and it
                 // hashes — and compares — as the bytes it shows, so it shares
                 // `bytes`' key (`{b'ab', memoryview(b'ab')}` has one element).
@@ -6359,11 +6373,16 @@ impl PyHost {
                             hashed.set(true);
                             PKey::Bytes(b[*start..*start + *len].to_vec())
                         }
-                        _ => return Err("ValueError: cannot hash writable memoryview object".into()),
+                        _ => {
+                            return Err("ValueError: cannot hash writable memoryview object".into())
+                        }
                     }
                 }
                 Some(_) => {
-                    return Err(type_error(&format!("unhashable type: '{}'", self.tp_name(v))))
+                    return Err(type_error(&format!(
+                        "unhashable type: '{}'",
+                        self.tp_name(v)
+                    )))
                 }
                 None => PKey::None,
             },
@@ -6737,7 +6756,10 @@ impl PyHost {
     /// refuse anything still outside the deque.
     fn deque_slot(&self, idx: &Value, len: usize) -> Result<usize, String> {
         let i = self.seq_index(idx, || {
-            type_error(&format!("sequence index must be integer, not '{}'", self.tp_name(idx)))
+            type_error(&format!(
+                "sequence index must be integer, not '{}'",
+                self.tp_name(idx)
+            ))
         })?;
         let k = if i < 0 { i + len as i64 } else { i };
         if k < 0 || k >= len as i64 {
@@ -6981,7 +7003,10 @@ impl SetTable {
 
     /// The insertion indices of the live entries, in slot order.
     fn slot_order(&self) -> Vec<usize> {
-        self.slots.iter().filter_map(|s| s.map(|(_, idx)| idx)).collect()
+        self.slots
+            .iter()
+            .filter_map(|s| s.map(|(_, idx)| idx))
+            .collect()
     }
 }
 
@@ -7067,7 +7092,11 @@ fn set_merge_layout(
     if (table.fill + incoming) * 5 >= table.mask * 3 {
         start = set_table_size_for((table.used + incoming) * 2);
         mask = start - 1;
-        order = table.slot_order().into_iter().map(|i| keys[i].clone()).collect();
+        order = table
+            .slot_order()
+            .into_iter()
+            .map(|i| keys[i].clone())
+            .collect();
     }
     if table.used == 0 {
         if let Some((src_keys, src_start)) = src {
@@ -7589,7 +7618,11 @@ pub fn align_operand(a: &Value, b: &Value) -> Result<Option<Value>, String> {
 /// None)` for one element, else `(len, start, step)`. Exactly the parts that
 /// decide which integers the range yields, so ranges that compare equal
 /// (`range(0) == range(5, 5)`, `range(1, 2, 3) == range(1, 3, 9)`) key equal.
-fn range_pkey(len: num_bigint::BigInt, start: num_bigint::BigInt, step: num_bigint::BigInt) -> PKey {
+fn range_pkey(
+    len: num_bigint::BigInt,
+    start: num_bigint::BigInt,
+    step: num_bigint::BigInt,
+) -> PKey {
     use num_traits::{One, Zero};
     let int = |b: num_bigint::BigInt| match i64::try_from(&b) {
         Ok(n) => PKey::Int(n),
@@ -7759,7 +7792,9 @@ pub fn fmt_float(f: f64) -> String {
     // Rust's `{:e}` supplies the shortest digits; `shortest_tie_to_even` then
     // applies dtoa's tie rule, which Rust's formatter does not share.
     let sci = format!("{:e}", f.abs()); // "2.1133257450160233e15", "1e-5"
-    let epos = sci.rfind('e').expect("scientific format carries an exponent");
+    let epos = sci
+        .rfind('e')
+        .expect("scientific format carries an exponent");
     let exp: i32 = sci[epos + 1..].parse().expect("valid exponent");
     let mut digits: String = sci[..epos].chars().filter(|c| *c != '.').collect();
     // Exponent of the LAST digit: value = digits * 10^last.
@@ -10165,7 +10200,10 @@ impl PyHost {
     fn builtin_subclass_repr(&self, inst: &Instance) -> String {
         let r = self.repr_of(&inst.payload);
         let base = self.builtin_base_of(&inst.class).unwrap_or("");
-        match base.strip_prefix("collections.").and_then(|bare| r.strip_prefix(bare)) {
+        match base
+            .strip_prefix("collections.")
+            .and_then(|bare| r.strip_prefix(bare))
+        {
             Some(rest) => format!("{}{rest}", inst.class),
             None => r,
         }
@@ -11766,7 +11804,7 @@ pub fn deque_repeat(
         // the same one the full product would.
         if let Some(m) = maxlen {
             if n * size > m {
-                n = (m + size - 1) / size + 1;
+                n = m.div_ceil(size) + 1;
             }
         }
     }
@@ -13395,9 +13433,9 @@ impl PyHost {
             // `plan_attr_get` (`AttrGet::Annotations`), so only an evaluated
             // (or unannotated) function's dict is read here.
             Some(PyObj::Func(fv)) if name == "__annotations__" => match fv.annotations {
-                Value::Undef => Err(
-                    "RuntimeError: function annotations read inside the host borrow".into(),
-                ),
+                Value::Undef => {
+                    Err("RuntimeError: function annotations read inside the host borrow".into())
+                }
                 ref ann => Ok(ann.clone()),
             },
             // `f.__annotate__` (PEP 649): the compiler-generated function that
@@ -13409,7 +13447,11 @@ impl PyHost {
             Some(PyObj::Func(fv)) if name == "__annotate__" => {
                 let assigned = matches!(recv, Value::Obj(id)
                     if self.func_attrs.get(id).is_some_and(|m| m.contains_key("__annotations__")));
-                Ok(if assigned { Value::Undef } else { fv.annotate.clone() })
+                Ok(if assigned {
+                    Value::Undef
+                } else {
+                    fv.annotate.clone()
+                })
             }
             Some(PyObj::BoundMethod { func, .. }) if name == "__annotations__" => {
                 let func = func.clone();
@@ -14106,9 +14148,17 @@ impl PyHost {
                 | PyObj::NotImplemented
                 | PyObj::Ellipsis,
             ) => 0,
-            Some(PyObj::Builtin(n)) if matches!(classify_native(n), NativeCallable::TypeObject(_)) => 0,
+            Some(PyObj::Builtin(n))
+                if matches!(classify_native(n), NativeCallable::TypeObject(_)) =>
+            {
+                0
+            }
             Some(PyObj::Instance(inst)) => {
-                let managed = if self.slots_of(&inst.class).is_none() { MANAGED } else { 0 };
+                let managed = if self.slots_of(&inst.class).is_none() {
+                    MANAGED
+                } else {
+                    0
+                };
                 GC_HEAD + managed
             }
             Some(PyObj::Dict(_))
@@ -14121,7 +14171,7 @@ impl PyHost {
                 | PyObj::TypeVarLike { .. }
                 | PyObj::CachedProperty { .. }
                 | PyObj::Future { .. }
-                | PyObj::EventLoop { .. }
+                | PyObj::EventLoop
                 | PyObj::Redirect { .. },
             ) => GC_HEAD + MANAGED,
             None => 0,
@@ -14298,7 +14348,7 @@ impl PyHost {
     /// Whether an instance of `class` may take attribute `name`: always when
     /// it has a `__dict__`, else only a declared slot name.
     fn slots_allow(&self, class: &str, name: &str) -> bool {
-        let check = |l: &SlotLayout| l.restricted.as_ref().is_none_or(|s| s.contains(name));
+        let check = |l: &SlotLayout| l.restricted.as_ref().map_or(true, |s| s.contains(name));
         if let Some(hit) = self.slot_cache.borrow().get(class) {
             return check(hit);
         }
@@ -14435,7 +14485,13 @@ impl PyHost {
     /// and user `__get__` descriptors). See [`AttrGet`].
     pub fn plan_attr_get(&mut self, recv: &Value, name: &str) -> AttrGet {
         if name == "__value__"
-            && matches!(self.get(recv), Some(PyObj::TypeAlias { value: Value::Undef, .. }))
+            && matches!(
+                self.get(recv),
+                Some(PyObj::TypeAlias {
+                    value: Value::Undef,
+                    ..
+                })
+            )
         {
             return AttrGet::TypeAliasValue {
                 alias: recv.clone(),
@@ -15649,12 +15705,17 @@ pub fn collections_subclass_copy(v: &Value) -> Option<Result<Value, String>> {
     let cls = with_host(|h| h.alloc(PyObj::Class(class)));
     let mut args = Vec::new();
     if base == "collections.defaultdict" {
-        let factory = dict_meta_of(&payload).and_then(|m| m.factory).unwrap_or(Value::Undef);
+        let factory = dict_meta_of(&payload)
+            .and_then(|m| m.factory)
+            .unwrap_or(Value::Undef);
         args.push(factory);
     }
     args.push(v.clone());
     if base == "collections.deque" {
-        if let Some(PyObj::Deque { maxlen: Some(m), .. }) = with_host(|h| h.get(&payload).cloned()) {
+        if let Some(PyObj::Deque {
+            maxlen: Some(m), ..
+        }) = with_host(|h| h.get(&payload).cloned())
+        {
             args.push(Value::Int(m as i64));
         }
     }
@@ -15790,8 +15851,13 @@ fn base_super_init(
     match base {
         // A `collections` base is rebuilt the same way, and the payload also
         // takes the rebuilt object's tag (a defaultdict's factory, ...).
-        "list" | "dict" | "set" | "collections.deque" | "collections.Counter"
-        | "collections.OrderedDict" | "collections.defaultdict" => {
+        "list"
+        | "dict"
+        | "set"
+        | "collections.deque"
+        | "collections.Counter"
+        | "collections.OrderedDict"
+        | "collections.defaultdict" => {
             let built = crate::builtins::call_builtin_function(base, args, kwargs)?;
             with_host(|h| {
                 if let Some(o) = h.get(&built).cloned() {
@@ -16510,7 +16576,8 @@ fn call_method_inner(
             if !matches!(inst.payload, Value::Undef)
                 && matches!(name, "__reduce_ex__" | "__reduce__" | "__getstate__")
             {
-                if let Some(r) = crate::builtins::instance_object_dunder(recv, &class, name, &args) {
+                if let Some(r) = crate::builtins::instance_object_dunder(recv, &class, name, &args)
+                {
                     return r;
                 }
             }
@@ -17491,7 +17558,18 @@ impl PyHost {
         const CO_METHOD: i64 = 0x0800_0000;
         // Pull every field under one short immutable borrow so the alloc/new_str
         // below (which need `&mut self`) don't conflict with it.
-        let (co_name, co_qualname, params, posonly, kwonly, star, kwargs, locals, flags, is_annotate) = {
+        let (
+            co_name,
+            co_qualname,
+            params,
+            posonly,
+            kwonly,
+            star,
+            kwargs,
+            locals,
+            flags,
+            is_annotate,
+        ) = {
             let d = &self.funcs[def_id];
             let q = if d.qualname.is_empty() {
                 d.name.clone()
@@ -17919,7 +17997,7 @@ impl PyHost {
     }
 
     /// The class a foreign-class method's owner tag names (see
-    /// [`PyHost::fill_foreign_class_cell`]), or `None` for a native owner.
+    /// `PyHost::fill_foreign_class_cell`), or `None` for a native owner.
     pub fn foreign_class_cell(&self, owner: &str) -> Option<Value> {
         self.foreign_class_cells.get(owner).cloned()
     }
@@ -18519,7 +18597,14 @@ impl PyHost {
         let err = self.with_foreign_type_name(err);
         let err = crate::suggest::with_hint(&err, self.suggestion_for(&err));
         let err = crate::suggest::with_import_hint(err, |n| stdlib_module_names().contains(n));
-        self.render_exc_block(self.exc.as_ref(), &final_frames, cpython, &err, &mut ctx, &mut out);
+        self.render_exc_block(
+            self.exc.as_ref(),
+            &final_frames,
+            cpython,
+            &err,
+            &mut ctx,
+            &mut out,
+        );
         out
     }
 
@@ -18555,12 +18640,26 @@ impl PyHost {
         for (anc, connector) in ancestors.iter().rev() {
             let frames = self.frames_of(anc);
             let cpython = self.cpython_raised_handle(anc);
-            self.render_exc_block(Some(anc), &frames, cpython, &self.exc_final_line(anc), ctx, out);
+            self.render_exc_block(
+                Some(anc),
+                &frames,
+                cpython,
+                &self.exc_final_line(anc),
+                ctx,
+                out,
+            );
             ctx.emit(out, connector, '|');
         }
         let frames = self.frames_of(exc);
         let cpython = self.cpython_raised_handle(exc);
-        self.render_exc_block(Some(exc), &frames, cpython, &self.exc_final_line(exc), ctx, out);
+        self.render_exc_block(
+            Some(exc),
+            &frames,
+            cpython,
+            &self.exc_final_line(exc),
+            ctx,
+            out,
+        );
     }
 
     /// The traceback frames captured for an already-caught exception.
@@ -18594,15 +18693,21 @@ impl PyHost {
         let members = exc.and_then(|e| crate::excgroup::group_parts(self, e));
         let Some((_, members)) = members else {
             #[cfg(feature = "stdlib-ffi")]
-            let cpython_frames = cpython.and_then(crate::ffi::traceback_text).unwrap_or_default();
+            let cpython_frames = cpython
+                .and_then(crate::ffi::traceback_text)
+                .unwrap_or_default();
             #[cfg(not(feature = "stdlib-ffi"))]
             let cpython_frames = {
                 let _ = cpython;
                 String::new()
             };
             if !frames.is_empty() || !cpython_frames.is_empty() {
-                ctx.emit(out, "Traceback (most recent call last):
-", '|');
+                ctx.emit(
+                    out,
+                    "Traceback (most recent call last):
+",
+                    '|',
+                );
                 ctx.emit(out, &self.render_frames(frames), '|');
                 ctx.emit(out, &cpython_frames, '|');
             }
@@ -18723,7 +18828,8 @@ impl PyHost {
     /// `__file__` otherwise. A slot with no `__file__` — code `exec` runs in a
     /// namespace of its own — is shown under the program's name.
     pub fn module_filename(&self, module: usize) -> String {
-        self.module_file(module).unwrap_or_else(|| self.tb_filename.clone())
+        self.module_file(module)
+            .unwrap_or_else(|| self.tb_filename.clone())
     }
 
     /// `__file__` of a module other than `__main__`.
@@ -18742,7 +18848,11 @@ impl PyHost {
     pub fn source_line(&self, module: usize, line: u32) -> Option<String> {
         let idx = (line as usize).checked_sub(1)?;
         match self.module_file(module) {
-            Some(path) => std::fs::read_to_string(path).ok()?.lines().nth(idx).map(str::to_string),
+            Some(path) => std::fs::read_to_string(path)
+                .ok()?
+                .lines()
+                .nth(idx)
+                .map(str::to_string),
             None if self.tb_show_source => self.prog_source.lines().nth(idx).map(str::to_string),
             None => None,
         }
@@ -18755,7 +18865,11 @@ impl PyHost {
             return None;
         };
         let bridge = self.exc_bridge.borrow();
-        bridge.foreign.contains(id).then(|| bridge.to_py.get(id).copied()).flatten()
+        bridge
+            .foreign
+            .contains(id)
+            .then(|| bridge.to_py.get(id).copied())
+            .flatten()
     }
 
     /// The CPython exception the error line `err` came from, when CPython
@@ -18783,7 +18897,8 @@ impl PyHost {
         #[cfg(feature = "stdlib-ffi")]
         {
             let class = err.split_once(": ").map_or(err, |(c, _)| c);
-            let native = crate::builtins::is_exception_class(class) || self.classes.contains_key(class);
+            let native =
+                crate::builtins::is_exception_class(class) || self.classes.contains_key(class);
             let handle = self.cpython_raised_for_err(err).filter(|_| !native);
             if let Some(name) = handle.and_then(crate::ffi::exception_type_name) {
                 return format!("{name}{}", &err[class.len()..]);
@@ -21315,8 +21430,22 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
             )?;
             let regex_flag = with_host(|h| h.get_attr(&flags, "RegexFlag"))?;
             for name in [
-                "NOFLAG", "ASCII", "A", "IGNORECASE", "I", "LOCALE", "L", "UNICODE", "U",
-                "MULTILINE", "M", "DOTALL", "S", "VERBOSE", "X", "DEBUG",
+                "NOFLAG",
+                "ASCII",
+                "A",
+                "IGNORECASE",
+                "I",
+                "LOCALE",
+                "L",
+                "UNICODE",
+                "U",
+                "MULTILINE",
+                "M",
+                "DOTALL",
+                "S",
+                "VERBOSE",
+                "X",
+                "DEBUG",
             ] {
                 entries.push((name, with_host(|h| h.get_attr(&regex_flag, name))?));
             }
@@ -21492,7 +21621,8 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
             let stdout = h.alloc(PyObj::File { id: 0 });
             let stderr = h.alloc(PyObj::File { id: 1 });
             let stdin = h.alloc(PyObj::File { id: 2 });
-            let (orig_stdout, orig_stderr, orig_stdin) = (stdout.clone(), stderr.clone(), stdin.clone());
+            let (orig_stdout, orig_stderr, orig_stdin) =
+                (stdout.clone(), stderr.clone(), stdin.clone());
             // `sys.version_info` — a `(major, minor, micro, releaselevel, serial)`
             // namedtuple matching the emulated CPython.
             let vi_vals = vec![

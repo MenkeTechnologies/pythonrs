@@ -255,12 +255,18 @@ impl Lexer {
             None => {}
             Some(_) => {
                 let msg = "SyntaxError: unexpected character after line continuation character";
-                return Err(crate::parser::with_text(crate::parser::at_pos(msg, line, col + 2, line, 0), &text));
+                return Err(crate::parser::with_text(
+                    crate::parser::at_pos(msg, line, col + 2, line, 0),
+                    &text,
+                ));
             }
         }
         if self.peek().is_none() && self.depth == 0 {
             let msg = "SyntaxError: unexpected EOF while parsing";
-            return Err(crate::parser::with_text(crate::parser::at_pos(msg, line, col + 2, line, -1), &text));
+            return Err(crate::parser::with_text(
+                crate::parser::at_pos(msg, line, col + 2, line, -1),
+                &text,
+            ));
         }
         Ok(())
     }

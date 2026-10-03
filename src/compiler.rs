@@ -264,8 +264,7 @@ fn compile_ex(stmts: &[Stmt], debug: bool, interactive: bool) -> Result<Program,
     // descending; the error it recorded is raised in place of whatever the
     // compile went on to produce, which was built from a partial answer.
     crate::stack::clear_pending();
-    let compiled =
-        crate::stack::with_frontend_stack(|| compile_checked(stmts, debug, interactive));
+    let compiled = crate::stack::with_frontend_stack(|| compile_checked(stmts, debug, interactive));
     match crate::stack::take_pending() {
         Some(overflow) => Err(overflow),
         None => compiled,
@@ -2139,12 +2138,22 @@ impl Compiler {
             // list, flagged by a count of -1 (CPython's MAKE_FUNCTION always
             // takes its defaults as a tuple).
             let defaults = &params.defaults;
-            self.build_chunked(b, ops::MKLIST, ops::EXTEND_LIST, defaults.len(), 1, |c, b, i| {
-                c.compile_expr(b, &defaults[i])
-            })?;
-            self.build_chunked(b, ops::MKLIST, ops::EXTEND_LIST, kwonly.len(), 1, |c, b, i| {
-                c.compile_expr(b, kwonly[i])
-            })?;
+            self.build_chunked(
+                b,
+                ops::MKLIST,
+                ops::EXTEND_LIST,
+                defaults.len(),
+                1,
+                |c, b, i| c.compile_expr(b, &defaults[i]),
+            )?;
+            self.build_chunked(
+                b,
+                ops::MKLIST,
+                ops::EXTEND_LIST,
+                kwonly.len(),
+                1,
+                |c, b, i| c.compile_expr(b, kwonly[i]),
+            )?;
             b.emit(Op::LoadInt(-1), 0);
             b.emit(Op::LoadInt(def_id as i64), 0); // func id (immediately below MKFUNC)
             b.emit(Op::CallBuiltin(ops::MKFUNC, 5), 0);
@@ -2549,18 +2558,25 @@ impl Compiler {
         self.fn_depth -= 1;
         self.strlit(b, name); // [name]
         self.emit_make_func(b, eval_id?, &Params::default())?; // [name, evaluate]
-        // The parameters as flat `name, kind` pairs (kind: 0 TypeVar,
-        // 1 TypeVarTuple, 2 ParamSpec).
-        self.build_chunked(b, ops::MKLIST, ops::EXTEND_LIST, params.len(), 2, |c, b, i| {
-            c.strlit(b, &params[i].name);
-            let kind = match params[i].kind {
-                TypeParamKind::TypeVar => 0,
-                TypeParamKind::TypeVarTuple => 1,
-                TypeParamKind::ParamSpec => 2,
-            };
-            b.emit(Op::LoadInt(kind), 0);
-            Ok(())
-        })?; // [name, evaluate, params]
+                                                               // The parameters as flat `name, kind` pairs (kind: 0 TypeVar,
+                                                               // 1 TypeVarTuple, 2 ParamSpec).
+        self.build_chunked(
+            b,
+            ops::MKLIST,
+            ops::EXTEND_LIST,
+            params.len(),
+            2,
+            |c, b, i| {
+                c.strlit(b, &params[i].name);
+                let kind = match params[i].kind {
+                    TypeParamKind::TypeVar => 0,
+                    TypeParamKind::TypeVarTuple => 1,
+                    TypeParamKind::ParamSpec => 2,
+                };
+                b.emit(Op::LoadInt(kind), 0);
+                Ok(())
+            },
+        )?; // [name, evaluate, params]
         b.emit(Op::CallBuiltin(ops::TYPE_ALIAS, 3), self.cur_line);
         self.store_name(b, name);
         Ok(())
@@ -2991,14 +3007,9 @@ impl Compiler {
                     } else {
                         ops::MKSET
                     };
-                    self.build_chunked(
-                        b,
-                        mk,
-                        ops::EXTEND_SET,
-                        items.len(),
-                        1,
-                        |c, b, i| c.compile_expr(b, &items[i]),
-                    )?;
+                    self.build_chunked(b, mk, ops::EXTEND_SET, items.len(), 1, |c, b, i| {
+                        c.compile_expr(b, &items[i])
+                    })?;
                 }
             }
             Expr::Dict(pairs) => {
@@ -3250,7 +3261,10 @@ impl Compiler {
                 for item in items {
                     self.compile_expr(b, item)?;
                 }
-                let idx = b.emit(Op::CallBuiltin(ops::MKSET, argc(items.len())?), self.cur_line);
+                let idx = b.emit(
+                    Op::CallBuiltin(ops::MKSET, argc(items.len())?),
+                    self.cur_line,
+                );
                 self.record_span(idx);
                 Ok(())
             }
@@ -3775,8 +3789,13 @@ impl Compiler {
     /// elements: each element is `(tag, value)` where tag 1 means spread. The
     /// `BUILD_ARGS` handler flattens spreads and returns a `list`.
     fn compile_arg_spread(&mut self, b: &mut ChunkBuilder, items: &[Expr]) -> Result<(), String> {
-        self.emit_flat_build(b, ops::BUILD_ARGS, 0, items.len(), 2, |c, b, i| {
-            match &items[i] {
+        self.emit_flat_build(
+            b,
+            ops::BUILD_ARGS,
+            0,
+            items.len(),
+            2,
+            |c, b, i| match &items[i] {
                 Expr::Starred(inner) => {
                     b.emit(Op::LoadInt(1), 0);
                     c.compile_expr(b, inner)
@@ -3785,8 +3804,8 @@ impl Compiler {
                     b.emit(Op::LoadInt(0), 0);
                     c.compile_expr(b, it)
                 }
-            }
-        })?;
+            },
+        )?;
         Ok(())
     }
 
@@ -4249,9 +4268,14 @@ impl Compiler {
         }
         if let Some(rname) = rest {
             self.load_local(b, &mapv);
-            self.build_chunked(b, ops::MKLIST, ops::EXTEND_LIST, keys.len(), 1, |c, b, i| {
-                c.compile_expr(b, &keys[i].0)
-            })?;
+            self.build_chunked(
+                b,
+                ops::MKLIST,
+                ops::EXTEND_LIST,
+                keys.len(),
+                1,
+                |c, b, i| c.compile_expr(b, &keys[i].0),
+            )?;
             b.emit(Op::CallBuiltin(ops::MATCH_MAP_REST, 2), 0); // [rest_dict]
             self.compile_assign(b, &Expr::Name(rname.clone()))?;
         }
@@ -5205,9 +5229,10 @@ enum CompRun {
 fn genexp_is_async(elt: &Expr, comps: &[Comprehension]) -> bool {
     comps.iter().any(|c| c.is_async)
         || awaits_in_scope(elt)
-        || comps.iter().enumerate().any(|(i, c)| {
-            (i > 0 && awaits_in_scope(&c.iter)) || c.ifs.iter().any(awaits_in_scope)
-        })
+        || comps
+            .iter()
+            .enumerate()
+            .any(|(i, c)| (i > 0 && awaits_in_scope(&c.iter)) || c.ifs.iter().any(awaits_in_scope))
 }
 
 /// Whether evaluating `e` awaits in the scope it is written in.
@@ -6685,7 +6710,10 @@ fn fold_constant(e: &Expr) -> Option<Folded> {
                         BinOp::BitOr => a | b,
                         BinOp::BitXor => a ^ b,
                         BinOp::Mul => {
-                            if !a.is_zero() && !b.is_zero() && bits(&a) + bits(&b) > FOLD_MAX_INT_BITS {
+                            if !a.is_zero()
+                                && !b.is_zero()
+                                && bits(&a) + bits(&b) > FOLD_MAX_INT_BITS
+                            {
                                 return None;
                             }
                             a * b
@@ -6696,7 +6724,11 @@ fn fold_constant(e: &Expr) -> Option<Folded> {
                         BinOp::Div if b.is_zero() => return None,
                         BinOp::Div => return Some(Folded::Float),
                         BinOp::Pow if b.is_negative() => {
-                            return if a.is_zero() { None } else { Some(Folded::Float) };
+                            return if a.is_zero() {
+                                None
+                            } else {
+                                Some(Folded::Float)
+                            };
                         }
                         BinOp::Pow => {
                             let w = b.to_u64()?;
@@ -6707,7 +6739,11 @@ fn fold_constant(e: &Expr) -> Option<Folded> {
                         }
                         BinOp::Shl => {
                             let w = b.to_u64()?;
-                            if !a.is_zero() && w > 0 && (bits(&a) > FOLD_MAX_INT_BITS || w > FOLD_MAX_INT_BITS - bits(&a)) {
+                            if !a.is_zero()
+                                && w > 0
+                                && (bits(&a) > FOLD_MAX_INT_BITS
+                                    || w > FOLD_MAX_INT_BITS - bits(&a))
+                            {
                                 return None;
                             }
                             a << w
@@ -6717,9 +6753,13 @@ fn fold_constant(e: &Expr) -> Option<Folded> {
                     })
                 }
                 (Folded::Int(_) | Folded::Float, Folded::Int(_) | Folded::Float) => match op {
-                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Pow | BinOp::Div | BinOp::FloorDiv | BinOp::Mod => {
-                        Folded::Float
-                    }
+                    BinOp::Add
+                    | BinOp::Sub
+                    | BinOp::Mul
+                    | BinOp::Pow
+                    | BinOp::Div
+                    | BinOp::FloorDiv
+                    | BinOp::Mod => Folded::Float,
                     _ => return None,
                 },
                 _ => return None,

@@ -141,7 +141,9 @@ pub fn with_metadata(err: String, source: &str) -> String {
     }
     // The source is the one field whose value can hold anything, so the
     // field separator (and the escape character itself) is escaped in it.
-    let escaped = source.replace('\u{2}', "\u{2}2").replace(SYNTAX_FIELD, "\u{2}1");
+    let escaped = source
+        .replace('\u{2}', "\u{2}2")
+        .replace(SYNTAX_FIELD, "\u{2}1");
     format!("{err}{SYNTAX_FIELD}meta={escaped}")
 }
 
@@ -220,8 +222,13 @@ pub fn with_byte_columns(err: String, src: &str) -> String {
         return err;
     };
     let value_start = field + "\u{1}pos=".len();
-    let value_end = err[value_start..].find(SYNTAX_FIELD).map_or(err.len(), |i| value_start + i);
-    let n: Vec<Option<i64>> = err[value_start..value_end].split(':').map(|s| s.parse().ok()).collect();
+    let value_end = err[value_start..]
+        .find(SYNTAX_FIELD)
+        .map_or(err.len(), |i| value_start + i);
+    let n: Vec<Option<i64>> = err[value_start..value_end]
+        .split(':')
+        .map(|s| s.parse().ok())
+        .collect();
     let [Some(l), Some(o), Some(el), Some(eo)] = n[..] else {
         return err;
     };
@@ -229,7 +236,9 @@ pub fn with_byte_columns(err: String, src: &str) -> String {
     let to_bytes = |line: i64, offset: i64| -> i64 {
         let text = usize::try_from(line - 1).ok().and_then(|i| lines.get(i));
         match text {
-            Some(text) if offset > 0 => byte_column(text.trim_end_matches('\r'), offset as u32 - 1) as i64 + 1,
+            Some(text) if offset > 0 => {
+                byte_column(text.trim_end_matches('\r'), offset as u32 - 1) as i64 + 1
+            }
             _ => offset,
         }
     };
@@ -308,7 +317,12 @@ pub fn check_eval_source(given: &str) -> Result<(), String> {
     parse(src)
         .map_err(|e| for_eval_input(e, src))
         .and_then(|_| check_eval_input(src))
-        .map_err(|e| with_metadata(e, &translate_newlines(given.trim_start_matches([' ', '\t']))))
+        .map_err(|e| {
+            with_metadata(
+                e,
+                &translate_newlines(given.trim_start_matches([' ', '\t'])),
+            )
+        })
 }
 
 /// Re-read a syntax error in `eval()` input, which CPython tokenizes WITHOUT
@@ -2545,7 +2559,9 @@ impl Parser {
             self.advance();
             let star_tok = self.pos;
             let star = self.eat_op("*");
-            let mixed = handlers.first().is_some_and(|h: &ExceptHandler| h.star != star);
+            let mixed = handlers
+                .first()
+                .is_some_and(|h: &ExceptHandler| h.star != star);
             if star && (self.at_op(":") || self.at_newline()) {
                 // `invalid_except_star_stmt_indent`'s `'except' '*' (NEWLINE |
                 // ':')`, raised at the token after the `*`; after a plain
@@ -2904,7 +2920,9 @@ impl Parser {
 
     /// A sequence pattern over tokens `start` to the last one read.
     fn sequence_pattern(&self, elems: Vec<Pattern>, start: usize) -> Pattern {
-        let star = elems.iter().position(|p| matches!(p.kind, PatternKind::Star(_)));
+        let star = elems
+            .iter()
+            .position(|p| matches!(p.kind, PatternKind::Star(_)));
         self.pattern(PatternKind::Sequence { elems, star }, start)
     }
 
@@ -2930,7 +2948,10 @@ impl Parser {
 
     /// Character column `col` of `line` as a UTF-8 byte column.
     fn byte_col(&self, line: u32, col: u32) -> u32 {
-        match (line as usize).checked_sub(1).and_then(|i| self.lines.get(i)) {
+        match (line as usize)
+            .checked_sub(1)
+            .and_then(|i| self.lines.get(i))
+        {
             Some(text) => byte_column(text, col),
             None => col,
         }

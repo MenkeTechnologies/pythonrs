@@ -87,12 +87,16 @@ impl TextStream {
         }
         self.configured = true;
         // `config_get_env` treats an empty variable as unset.
-        let buffered = std::env::var_os("PYTHONUNBUFFERED").is_none_or(|v| v.is_empty());
+        let buffered = std::env::var_os("PYTHONUNBUFFERED").map_or(true, |v| v.is_empty());
         // SAFETY: `isatty`/`fstat` only query the descriptor.
         let isatty = unsafe { libc::isatty(self.fd) == 1 };
         self.write_through = !buffered;
         self.line_buffering = buffered && (isatty || self.fd == 2);
-        self.buffer_size = if buffered { buffer_size_for(self.fd) } else { 0 };
+        self.buffer_size = if buffered {
+            buffer_size_for(self.fd)
+        } else {
+            0
+        };
     }
 
     /// `TextIOWrapper.write` for already-encoded text.
@@ -100,8 +104,7 @@ impl TextStream {
         self.configure();
         // Only consulted when line-buffered, as in `textio.c` (POSIX writes
         // `\n` untranslated, so `writetranslate` never asks).
-        let needflush =
-            self.line_buffering && bytes.iter().any(|&b| b == b'\n' || b == b'\r');
+        let needflush = self.line_buffering && bytes.iter().any(|&b| b == b'\n' || b == b'\r');
         // A large write first pushes out what is pending, so the two are not
         // concatenated (CPython gh-87426).
         if bytes.len() >= CHUNK_SIZE {
@@ -176,7 +179,7 @@ fn buffer_size_for(fd: i32) -> usize {
             DEFAULT_BUFFER_SIZE
         }
     };
-    blksize.min(MAX_BLKSIZE).max(DEFAULT_BUFFER_SIZE)
+    blksize.clamp(DEFAULT_BUFFER_SIZE, MAX_BLKSIZE)
 }
 
 /// Put bytes on the descriptor. Going through Rust's handles (and flushing
@@ -244,4 +247,3 @@ pub fn set_write_through() {
         s.buffer_size = 0;
     }
 }
-

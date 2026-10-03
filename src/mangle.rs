@@ -55,8 +55,7 @@
 
 use crate::ast::{
     Comprehension, ExceptHandler, Expr, FStrPart, Keyword, MatchCase, Params, Pattern, PatternKind,
-    Stmt,
-    StmtKind, WithItem,
+    Stmt, StmtKind, WithItem,
 };
 
 /// CPython `Python/compile.c:_Py_Mangle`. `None` when `name` is not private.

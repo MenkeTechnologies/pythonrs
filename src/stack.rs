@@ -178,7 +178,7 @@ const FRONTEND_STACK: usize = 512 * 1024 * 1024;
 const FRONTEND_ROOM: usize = 64 * 1024 * 1024;
 
 /// Run the parser or the compiler: in place when the current stack has
-/// [`FRONTEND_ROOM`] to spare, otherwise on a fresh [`FRONTEND_STACK`] of its
+/// `FRONTEND_ROOM` to spare, otherwise on a fresh `FRONTEND_STACK` of its
 /// own, on the same thread (the object heap is thread-local). A panic in `f`
 /// propagates to the caller either way.
 pub fn with_frontend_stack<R>(f: impl FnOnce() -> R) -> R {
