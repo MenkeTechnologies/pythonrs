@@ -175,3 +175,34 @@ fn a_failing_unary_operator_names_its_line() {
     );
     assert!(stderr_of("z = +[1]").contains("line 1, in <module>\n    z = +[1]\n        ^^^^\n"));
 }
+
+/// A pattern CPython's `re._parser` refuses is refused with its
+/// `re.PatternError`: `msg`, `pattern` (the `str` or `bytes` compiled),
+/// `pos`, `lineno`, `colno` and the positioned message — including patterns
+/// the engines would have taken (`a**`, a redefined group name, a
+/// variable-width look-behind, which has no position). A bad flag combination
+/// is `ValueError`, an oversized repeat `OverflowError`, and a template's
+/// error carries its attributes too. `Pattern.flags` folds in the inline
+/// flags. Expected values are CPython 3.14's.
+#[test]
+fn pattern_errors_carry_sre_parse_msg_pattern_and_pos() {
+    let src = r#"
+import re
+out = []
+for p in ['(', 'a\nb(', 'a**', '(?P<a>x)(?P<a>y)', b'(?P<\xe9>a)', '(?<=a|bc)', '[z-a]', '\\N{NOPE}']:
+    try:
+        re.compile(p)
+    except re.error as e:
+        out.append((type(e).__name__, e.msg, e.pattern, e.pos, e.lineno, e.colno, e.args))
+for f, a in [(re.compile, ('a', re.L)), (re.compile, ('a{4294967295}',)), (re.sub, ('(a)', 'a\n\\g<2>', 'a'))]:
+    try:
+        f(*a)
+    except Exception as e:
+        out.append((type(e).__name__, getattr(e, 'pos', None), str(e)))
+out.append(re.compile('(?i)(?x) a').flags)
+"#;
+    assert_eq!(
+        g(src, "out"),
+        r#"[('PatternError', 'missing ), unterminated subpattern', '(', 0, 1, 1, ('missing ), unterminated subpattern at position 0',)), ('PatternError', 'missing ), unterminated subpattern', 'a\nb(', 3, 2, 2, ('missing ), unterminated subpattern at position 3 (line 2, column 2)',)), ('PatternError', 'multiple repeat', 'a**', 2, 1, 3, ('multiple repeat at position 2',)), ('PatternError', "redefinition of group name 'a' as group 2; was group 1", '(?P<a>x)(?P<a>y)', 12, 1, 13, ("redefinition of group name 'a' as group 2; was group 1 at position 12",)), ('PatternError', "bad character in group name '\\xe9'", b'(?P<\xe9>a)', 4, 1, 5, ("bad character in group name '\\xe9' at position 4",)), ('PatternError', 'look-behind requires fixed-width pattern', None, None, None, None, ('look-behind requires fixed-width pattern',)), ('PatternError', 'bad character range z-a', '[z-a]', 1, 1, 2, ('bad character range z-a at position 1',)), ('PatternError', "undefined character name 'NOPE'", '\\N{NOPE}', 0, 1, 1, ("undefined character name 'NOPE' at position 0",)), ('ValueError', None, 'cannot use LOCALE flag with a str pattern'), ('OverflowError', None, 'the repetition number is too large'), ('PatternError', 5, 'invalid group reference 2 at position 5 (line 2, column 4)'), 98]"#
+    );
+}

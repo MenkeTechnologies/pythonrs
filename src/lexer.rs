@@ -1088,15 +1088,7 @@ fn decode_escapes_mode(raw: &str, is_raw: bool, bytes_mode: bool) -> Result<Stri
                         return Err(unicode_escape_err(start, end, EscErr::MalformedName));
                     }
                     let name: String = chars[name_start..j].iter().collect();
-                    // CPython matches names case-insensitively but NOT loosely — leading/
-                    // trailing whitespace or `_`/`-` swaps must fail. `unicode_names2` does
-                    // UAX#44 loose matching, so round-trip through the canonical name and
-                    // require it to equal the uppercased input exactly.
-                    let upper = name.to_ascii_uppercase();
-                    let resolved = unicode_names2::character(&upper).filter(|&ch| {
-                        unicode_names2::name(ch).is_some_and(|n| n.to_string() == upper)
-                    });
-                    match resolved {
+                    match lookup_char_name(&name) {
                         Some(ch) => {
                             out.push(ch);
                             i = j; // land on `}`; the `i += 1` below steps past it.
@@ -1120,6 +1112,17 @@ fn decode_escapes_mode(raw: &str, is_raw: bool, bytes_mode: bool) -> Result<Stri
         }
     }
     Ok(out)
+}
+
+/// The character a `\N{name}` escape names, as CPython resolves it: the name
+/// matched case-insensitively but NOT loosely — leading/trailing whitespace
+/// or `_`/`-` swaps must fail. `unicode_names2` does UAX#44 loose matching,
+/// so the lookup round-trips through the canonical name and requires it to
+/// equal the uppercased input exactly. Shared with `re`'s `\N{...}`.
+pub fn lookup_char_name(name: &str) -> Option<char> {
+    let upper = name.to_ascii_uppercase();
+    unicode_names2::character(&upper)
+        .filter(|&ch| unicode_names2::name(ch).is_some_and(|n| n.to_string() == upper))
 }
 
 /// True if `lit` ends with an active `\N` escape lead — a trailing `N` preceded by

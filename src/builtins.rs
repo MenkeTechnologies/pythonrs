@@ -4346,28 +4346,44 @@ fn pattern_error_init(e: &Value, args: &[Value], kwargs: &[(String, Value)]) -> 
     })?;
     let pattern = param(1, "pattern").unwrap_or(Value::Undef);
     let pos = param(2, "pos").unwrap_or(Value::Undef);
-    let mut text = host::str_of(&msg);
+    let text = host::str_of(&msg);
+    with_host(|h| pattern_error_bind(h, e, text, msg, pattern, pos))
+}
+
+/// The body of `PatternError.__init__` once `str(msg)` is known (`text`), on
+/// a held host: also how the exception the pattern parser refused a pattern
+/// with is built (see [`crate::sre_parse::raise`]).
+fn pattern_error_bind(
+    h: &mut host::PyHost,
+    e: &Value,
+    mut text: String,
+    msg: Value,
+    pattern: Value,
+    pos: Value,
+) -> Result<(), String> {
     let (mut lineno, mut colno) = (Value::Undef, Value::Undef);
     if !matches!(pattern, Value::Undef) && !matches!(pos, Value::Undef) {
         let Value::Int(p) = pos else {
             return Err(host::type_error(&format!(
                 "%d format: a real number is required, not {}",
-                with_host(|h| h.type_name(&pos))
+                h.type_name(&pos)
             )));
         };
         text = format!("{text} at position {p}");
         // The pattern's units before `pos`: characters of a `str`, bytes of a
         // `bytes`, as `count`/`rfind` slice them.
-        let units: Vec<u32> = with_host(|h| match h.get(&pattern) {
-            Some(PyObj::Bytes(b)) => Ok(b.iter().map(|&c| c as u32).collect()),
+        let units: Vec<u32> = match h.get(&pattern) {
+            Some(PyObj::Bytes(b)) => b.iter().map(|&c| c as u32).collect(),
             _ => match h.as_str(&pattern) {
-                Some(s) => Ok(s.chars().map(|c| c as u32).collect()),
-                None => Err(format!(
-                    "AttributeError: '{}' object has no attribute 'count'",
-                    h.type_name(&pattern)
-                )),
+                Some(s) => s.chars().map(|c| c as u32).collect(),
+                None => {
+                    return Err(format!(
+                        "AttributeError: '{}' object has no attribute 'count'",
+                        h.type_name(&pattern)
+                    ))
+                }
             },
-        })?;
+        };
         let before = &units[..usize::try_from(p).unwrap_or(0).min(units.len())];
         let newline = '\n' as u32;
         let line = before.iter().filter(|&&c| c == newline).count() as i64 + 1;
@@ -4378,22 +4394,41 @@ fn pattern_error_init(e: &Value, args: &[Value], kwargs: &[(String, Value)]) -> 
             text = format!("{text} (line {line}, column {})", p - last_newline);
         }
     }
-    with_host(|h| {
-        let message = h.new_str(text);
-        if let Some(PyObj::Exception { args, .. }) = h.get_mut(e) {
-            *args = vec![message];
-        }
-        for (name, v) in [
-            ("msg", msg),
-            ("pattern", pattern),
-            ("pos", pos),
-            ("lineno", lineno),
-            ("colno", colno),
-        ] {
-            let _ = h.set_attr(e, name, v);
-        }
-    });
+    let message = h.new_str(text);
+    if let Some(PyObj::Exception { args, .. }) = h.get_mut(e) {
+        *args = vec![message];
+    }
+    for (name, v) in [
+        ("msg", msg),
+        ("pattern", pattern),
+        ("pos", pos),
+        ("lineno", lineno),
+        ("colno", colno),
+    ] {
+        let _ = h.set_attr(e, name, v);
+    }
     Ok(())
+}
+
+/// The `re.PatternError` the pattern parser refused a pattern (or a
+/// template) with, built as `re._parser` constructs it:
+/// `PatternError(msg, pattern, pos)` with the `str` or `bytes` that was
+/// compiled, or — for the compiler's position-less look-behind errors —
+/// `PatternError(msg)`, whose `pattern` is `None`.
+fn pattern_error_from(h: &mut host::PyHost, p: crate::sre_parse::PendingPatternError) -> Value {
+    let e = h.alloc(PyObj::Exception {
+        class: "re.PatternError".into(),
+        args: vec![],
+    });
+    let msg = h.new_str(p.msg.clone());
+    let pattern = match (p.pos, p.istext) {
+        (None, _) => Value::Undef,
+        (Some(_), true) => h.new_str(p.pattern.iter().collect::<String>()),
+        (Some(_), false) => h.alloc(PyObj::Bytes(p.pattern.iter().map(|&c| c as u8).collect())),
+    };
+    let pos = p.pos.map_or(Value::Undef, |n| Value::Int(n as i64));
+    let _ = pattern_error_bind(h, &e, p.msg, msg, pattern, pos);
+    e
 }
 
 fn synth_exc(h: &mut host::PyHost, err: &str) -> Value {
@@ -4404,6 +4439,11 @@ fn synth_exc(h: &mut host::PyHost, err: &str) -> Value {
         Some((c, m)) => (c.to_string(), m.to_string()),
         None => (err.to_string(), String::new()),
     };
+    if class == "re.PatternError" {
+        if let Some(pending) = crate::sre_parse::take_pending(err) {
+            return pattern_error_from(h, pending);
+        }
+    }
     // An `OSError` is not a one-string exception. CPython's `oserror_init`
     // splits the arguments into `args == (errno, strerror)` and the separate
     // `errno` / `strerror` / `filename` / `filename2` attributes, and
@@ -11165,11 +11205,11 @@ fn re_compile_raw(
     } else {
         format!("(?{inline}){pattern}")
     };
-    // Raised under CPython 3.13+'s name for the class; `re.error` is an alias
-    // of the same object, so `except re.error` still catches it.
     // `PyRegex` picks the engine: the linear-time one when it can take the
-    // pattern, the backtracking one when the pattern needs look-around.
-    crate::regexpr::PyRegex::new(&full).map_err(|e| format!("re.PatternError: {e}"))
+    // pattern, the backtracking one when the pattern needs look-around. The
+    // error is the engine's own message, for a pattern CPython accepts and
+    // neither engine can run.
+    crate::regexpr::PyRegex::new(&full)
 }
 
 /// Bytes as the str engines see them: each byte decoded as latin-1, which maps
@@ -11246,22 +11286,27 @@ fn re_compile(pattern: &Value, flags: i64) -> Result<Value, String> {
         .map(|s| (s, true))
         .ok_or_else(|| host::type_error("first argument must be string or compiled pattern"))?,
     };
-    if is_bytes && (flags | re_inline_flags(&src)) & 32 != 0 {
-        return Err("ValueError: cannot use UNICODE flag with a bytes pattern".into());
-    }
     let key = (src.clone(), flags, is_bytes);
     if let Some(p) = with_host(|h| h.re_cache.get(&key).cloned()) {
         return Ok(p);
     }
-    let re = re_compile_raw(&src, flags, is_bytes)?;
+    // The pattern is parsed as CPython's `re._parser` parses it first: what
+    // CPython refuses is refused with its `PatternError` (message, `pattern`,
+    // `pos`), and what it accepts reaches an engine. The parse also yields
+    // `Pattern.flags` as CPython reports it — the inline global flags (`(?i)`)
+    // folded in and `re.UNICODE` implied for a str pattern that did not ask for
+    // `re.ASCII`: `re.compile('a', re.I).flags` is 34, not 2.
+    let chars: Vec<char> = src.chars().collect();
+    let shown = crate::sre_parse::check(&chars, !is_bytes, flags)
+        .map_err(|refusal| crate::sre_parse::raise(refusal, &chars, !is_bytes))?;
+    // A pattern no engine takes is still raised as a `PatternError` (under
+    // CPython 3.13+'s name for the class; `re.error` is an alias of the same
+    // object), with no position: the parse above found nothing wrong with it.
+    let re = re_compile_raw(&src, flags, is_bytes).map_err(|msg| {
+        let refusal = crate::sre_parse::Refusal::Pattern { msg, pos: None };
+        crate::sre_parse::raise(refusal, &chars, !is_bytes)
+    })?;
     let groups = re.captures_len().saturating_sub(1);
-    // `Pattern.flags` reports what CPython's does: the leading inline flags
-    // (`(?i)`) folded in, and `re.UNICODE` implied for a str pattern that did
-    // not ask for `re.ASCII` — `re.compile('a', re.I).flags` is 34, not 2.
-    let mut shown = flags | re_inline_flags(&src);
-    if !is_bytes && shown & 256 == 0 {
-        shown |= 32;
-    }
     Ok(with_host(|h| {
         let id = h.regexes.len();
         h.regexes.push(re);
@@ -11726,7 +11771,7 @@ fn re_sub(
             let re = &h.regexes[pat_id];
             (re.captures_len() - 1, re.named_groups())
         });
-        Some((re_parse_template(&src, groups, &named)?, t_bytes))
+        Some((re_parse_template(&src, !t_bytes, groups, &named)?, t_bytes))
     } else {
         if !re_is_callable(repl) {
             return Err(host::type_error(&format!(
@@ -11847,18 +11892,13 @@ enum ReplPiece {
     Group(usize),
 }
 
-/// `re.PatternError` for a template, worded and positioned as `re._parser`'s
-/// `error` does: `<msg> at position N`, plus `(line L, column C)` when the
-/// template spans several lines.
-fn re_template_error(src: &[char], msg: &str, pos: usize) -> String {
-    let mut out = format!("re.PatternError: {msg} at position {pos}");
-    if src.contains(&'\n') {
-        let before = &src[..pos.min(src.len())];
-        let line = before.iter().filter(|&&c| c == '\n').count() + 1;
-        let col = before.iter().rev().take_while(|&&c| c != '\n').count() + 1;
-        out.push_str(&format!(" (line {line}, column {col})"));
-    }
-    out
+/// `re.PatternError` for a template, raised as `re._parser`'s `Tokenizer.error`
+/// raises it: `PatternError(msg, template, pos)`, so `str(e)` is `<msg> at
+/// position N`, plus `(line L, column C)` when the template spans several lines.
+fn re_template_error(src: &[char], istext: bool, msg: &str, pos: usize) -> String {
+    let msg = if istext { msg.to_string() } else { host::ascii_of(msg) };
+    let refusal = crate::sre_parse::Refusal::Pattern { msg, pos: Some(pos) };
+    crate::sre_parse::raise(refusal, src, istext)
 }
 
 /// Parse a replacement template — a port of `re._parser.parse_template`.
@@ -11869,11 +11909,12 @@ fn re_template_error(src: &[char], msg: &str, pos: usize) -> String {
 /// pattern's capture-group count (references may go up to and including it).
 fn re_parse_template(
     src: &str,
+    istext: bool,
     groups: usize,
     named: &[(String, usize)],
 ) -> Result<Vec<ReplPiece>, String> {
     let s: Vec<char> = src.chars().collect();
-    let err = |msg: &str, pos: usize| re_template_error(&s, msg, pos);
+    let err = |msg: &str, pos: usize| re_template_error(&s, istext, msg, pos);
     let is_oct = |c: Option<&char>| matches!(c, Some('0'..='7'));
     let mut pieces: Vec<ReplPiece> = Vec::new();
     let mut lit = String::new();
@@ -11917,17 +11958,15 @@ fn re_parse_template(
                         }
                     }
                 } else {
-                    let mut chars = name.chars();
-                    let ident = chars
-                        .next()
-                        .is_some_and(|ch| ch == '_' || ch.is_alphabetic())
-                        && chars.all(|ch| ch == '_' || ch.is_alphanumeric());
-                    if !ident {
-                        return Err(err(&format!("bad character in group name '{name}'"), start));
+                    if let Some(msg) = crate::sre_parse::group_name_error(&name, istext) {
+                        return Err(err(&msg, start));
                     }
                     match named.iter().find(|(n, _)| *n == name) {
                         Some((_, idx)) => (*idx, start),
-                        None => return Err(format!("IndexError: unknown group name '{name}'")),
+                        None => {
+                            let name = host::quote_str(&name);
+                            return Err(format!("IndexError: unknown group name {name}"));
+                        }
                     }
                 }
             }
@@ -12120,7 +12159,7 @@ pub fn re_match_method(m: &Value, method: &str, args: &[Value]) -> Result<Value,
                 )));
             }
             let t_bytes = with_host(|h| h.as_str(&t)).is_none();
-            let pieces = re_parse_template(&re_template_text(&t)?, ngroups - 1, &named)?;
+            let pieces = re_parse_template(&re_template_text(&t)?, !t_bytes, ngroups - 1, &named)?;
             let out = re_expand(&pieces, t_bytes, is_bytes, &text, &spans)?;
             Ok(re_text_value(t_bytes, &out))
         }

@@ -33,6 +33,7 @@ pub mod oracle;
 pub mod parser;
 pub mod pyhash;
 pub mod regexpr;
+pub mod sre_parse;
 pub mod repl;
 pub mod rust_ffi;
 pub mod stdio;

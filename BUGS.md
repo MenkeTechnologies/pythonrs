@@ -20,6 +20,23 @@ written.
   names' source positions (a multi-line literal is located from its end).
   A line break inside a string nested in an f-string field was also counted
   twice, so every later line number was one too high.
+- **A pattern is refused as CPython's `re._parser` refuses it.** `re.compile`
+  raised the engine's own error (`re.compile('(')` read `error: unclosed
+  group`, with no `msg`/`pattern`/`pos`), and accepted what CPython refuses
+  but the engines take: `a**`, `^*`, `x{2}{3}`, a redefined group name, a
+  group named `1`, `a(?i)`, `(?i-i:x)`, a conditional with three branches or
+  an unknown group, a variable-width look-behind. `src/sre_parse.rs` ports
+  `re/_parser.py`'s grammar (`parse`, `_parse_sub`, `_parse`,
+  `_parse_flags`, `_escape`, `_class_escape`, `Tokenizer`, `State`,
+  `getwidth`, `fix_flags`) and `_compiler`'s look-behind width check, and
+  every pattern goes through it before an engine sees it: a refusal is the
+  `PatternError(msg, pattern, pos)` CPython raises (`lineno`/`colno`, the
+  `(line L, column C)` suffix, a bytes pattern's ASCII-escaped message), a
+  position-less one for a look-behind, `ValueError` for a flag combination
+  `fix_flags` refuses and `OverflowError` for a repeat bound at
+  `MAXREPEAT`. `Pattern.flags` is the parse's, and a `sub`/`expand`
+  template's error carries the same attributes (its group-name check is
+  `checkgroupname`'s, `%a` for bytes).
 - **`--lsp` go-to-definition and signature help reach attributes and other
   files.** Both resolved names within the open document only. An attribute now
   resolves as it does at run time where the document determines the receiver:
@@ -2132,12 +2149,6 @@ written.
   exception held as a value stays a `Foreign` handle (keeping every attribute
   CPython gives it), while a raised one has to be a pythonrs exception for
   `except` matching, and nothing unifies the two.
-- **`re.PatternError` from the regex engine has no `msg`/`pattern`/`pos`.**
-  The class and its constructor are CPython's (see Implemented), but the
-  native engine raises from a rendered line, so `re.compile('(')`'s error
-  reads `'unclosed group'`-style wording and lacks the attributes
-  `sre_parse` sets (`msg='missing ), unterminated subpattern'`, `pos=0`,
-  `pattern='('`).
 - **PEP 649: class-body annotations are evaluated eagerly.** Functions are lazy
   (see "Implemented"), but a class body still evaluates each simple annotation
   as it runs and drops one whose name does not resolve: `class C: x: Later`
@@ -2496,6 +2507,14 @@ that boundary. Regression test: `re_positions_count_codepoints_not_bytes` in
 nor `byte == k*char` can carry a wrong implementation.
 
 Still open:
+- **A pattern CPython accepts that neither engine runs raises.** The
+  pattern passes the `re._parser` port (see Implemented) and then fails in
+  the engine, as a position-less `PatternError` carrying the engine's own
+  message: a repeated look-around (`re.compile('(?=a)*')`, `error:
+  look-around, including look-ahead and look-behind, is not supported`) and
+  a three-digit octal escape (`\012`, which the rewrite hands the engine as
+  a back-reference, `error: backreferences are not supported`) compile in
+  CPython.
 - **`re.RegexFlag` is absent; the flag constants are plain ints.** CPython's
   `re.I` IS `re.RegexFlag.IGNORECASE`, an `enum.IntFlag` member that reprs as
   `re.IGNORECASE` and combines to `re.IGNORECASE|re.MULTILINE`. pythonrs has no

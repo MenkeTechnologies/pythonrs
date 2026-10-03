@@ -7793,7 +7793,7 @@ fn re_quote(text: &str, is_bytes: bool) -> String {
     }
 }
 
-fn quote_str(s: &str) -> String {
+pub(crate) fn quote_str(s: &str) -> String {
     let has_single = s.contains('\'');
     let has_double = s.contains('"');
     let (q, esc_q) = if has_single && !has_double {
