@@ -1177,6 +1177,63 @@ print(repr(b2.getvalue()))
     );
 }
 
+/// CPython code that reassigns the embedded interpreter's `sys.stdout`
+/// redirects pythonrs's `print` too, since CPython has one `sys.stdout`:
+/// `unittest`'s `buffer=True` runner swallows a passing test's output and
+/// replays a failing one's (to the stream that was current, which may be a
+/// pythonrs-side redirect), `mock.patch('sys.stdout', …)` captures and restores,
+/// and `sys.stdout is sys.__stdout__` holds again afterwards. Expected stdout is
+/// python3.14's for the same script.
+#[test]
+fn cpython_side_stdout_assignment_redirects_print() {
+    let src = "\
+import sys, io, unittest, contextlib
+import unittest.mock
+class T(unittest.TestCase):
+    def test_ok(self):
+        print('passing-output')
+    def test_fail(self):
+        print('failing-output')
+        sys.stderr.write('err-output\\n')
+        self.assertEqual(1, 2)
+stream = io.StringIO()
+r = unittest.TextTestRunner(buffer=True, stream=stream, verbosity=0)
+res = r.run(unittest.defaultTestLoader.loadTestsFromTestCase(T))
+out = stream.getvalue()
+print(res.testsRun, len(res.failures), 'failing-output' in out, 'err-output' in out, 'passing-output' in out)
+print(sys.stdout is sys.__stdout__, sys.stderr is sys.__stderr__)
+class W:
+    def __init__(self): self.parts = []
+    def write(self, s): self.parts.append(s)
+w = W()
+with contextlib.redirect_stdout(w):
+    unittest.TextTestRunner(buffer=True, stream=io.StringIO()).run(
+        unittest.defaultTestLoader.loadTestsFromTestCase(T))
+    print('after-run')
+print(w.parts)
+buf = io.StringIO()
+with unittest.mock.patch('sys.stdout', new=buf):
+    print('into-buf')
+    same = sys.stdout is buf
+print(repr(buf.getvalue()), same, sys.stdout is sys.__stdout__)
+with unittest.mock.patch('sys.stdout', new=None):
+    print('dropped')
+print('back')
+";
+    let (stdout, stderr, ok) = run_py(src);
+    if bridge_unavailable(ok, &stderr) {
+        eprintln!("skipping stdout-assignment test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(
+        stdout,
+        "\nStdout:\nfailing-output\n2 1 True True False\nTrue True\n\
+         ['\\nStdout:\\nfailing-output\\n', 'after-run', '\\n']\n\
+         'into-buf\\n' True True\nback\n",
+        "stderr={stderr}"
+    );
+}
+
 /// A CPython call result keeps its identity when it is not fresh: the list
 /// `catch_warnings(record=True)` returns is the one `warnings.warn` appends to,
 /// an `lru_cache`d list is the cached object, and a call that returns one of

@@ -2342,9 +2342,10 @@ pub struct PyHost {
     /// `contextlib.redirect_stdout`). `None` = the native stream. Tracked on the
     /// host (not a module ns) because `import` is not cached, so different `sys`
     /// module instances must share one redirect. `print` and the REPL displayhook
-    /// consult these.
-    pub stdout_target: Option<Value>,
-    pub stderr_target: Option<Value>,
+    /// consult these through [`PyHost::std_target`], which first applies an
+    /// assignment CPython code made to its own `sys.stdout`.
+    stdout_target: Option<Value>,
+    stderr_target: Option<Value>,
     /// Distinguishes this host from every other one the process creates (one
     /// per thread, a fresh one per `reset_host`). A pythonrs value handed to
     /// the embedded interpreter as its `sys.stdout` records it, so a write
@@ -2756,11 +2757,7 @@ pub fn reset_host() {
     // `sys.stdout` pointing at its target; the fresh host starts unredirected.
     with_host(|h| {
         for stderr in [false, true] {
-            let redirected = if stderr {
-                h.stderr_target.is_some()
-            } else {
-                h.stdout_target.is_some()
-            };
+            let redirected = h.std_target(stderr).is_some();
             if redirected {
                 h.set_std_target(stderr, None);
             }
@@ -9991,6 +9988,40 @@ impl PyHost {
     /// module or a CPython-side `print` (`functools.partial(print, …)`) writes,
     /// while an object that grabbed the stream earlier (a `logging` handler
     /// configured before the block) keeps writing where it pointed.
+    /// The stream `sys.stdout` (`stderr` false) or `sys.stderr` currently names:
+    /// `None` for the native stream, `Value::Undef` for `None`, else the object.
+    ///
+    /// Under the bridge, CPython code may have reassigned the embedded
+    /// interpreter's `sys.stdout` since the last read (`unittest`'s buffered
+    /// runner); that assignment is adopted here, since CPython has one
+    /// `sys.stdout` and pythonrs's `print` writes to it. See
+    /// [`crate::ffi::take_cpython_std_assignment`].
+    pub fn std_target(&mut self, stderr: bool) -> Option<Value> {
+        #[cfg(feature = "stdlib-ffi")]
+        if let Some(assigned) = crate::ffi::take_cpython_std_assignment(stderr) {
+            let target = match assigned {
+                crate::ffi::StdTarget::Native => None,
+                crate::ffi::StdTarget::Null => Some(Value::Undef),
+                crate::ffi::StdTarget::Foreign(id) => Some(self.alloc(PyObj::Foreign(id))),
+                // One of pythonrs's own redirects, restored by CPython code. A
+                // value from a host that no longer exists names nothing here.
+                crate::ffi::StdTarget::Pyrs(v, generation) => {
+                    (generation == self.generation).then_some(v)
+                }
+            };
+            if stderr {
+                self.stderr_target = target;
+            } else {
+                self.stdout_target = target;
+            }
+        }
+        if stderr {
+            self.stderr_target.clone()
+        } else {
+            self.stdout_target.clone()
+        }
+    }
+
     pub fn set_std_target(&mut self, stderr: bool, target: Option<Value>) {
         #[cfg(feature = "stdlib-ffi")]
         {
@@ -11966,18 +11997,17 @@ impl PyHost {
         // `sys.stdout` / `sys.stderr` resolve to the current redirect target when
         // one is active (`redirect_stdout`, or `sys.stdout = …`), so the attribute
         // reflects the live stream regardless of which `sys` instance is read
-        // (`import` is not cached). `sys.__stdout__` keeps the native stream.
+        // (`import` is not cached). Unredirected, it is the native stream
+        // `sys.__stdout__` names, as in CPython (`sys.stdout is sys.__stdout__`),
+        // whatever the namespace slot was last assigned: a redirect CPython code
+        // undid never wrote that slot back.
         if let Some(PyObj::Module { name: mname, .. }) = self.get(recv) {
-            if mname == "sys" {
-                if name == "stdout" {
-                    if let Some(t) = self.stdout_target.clone() {
-                        return Ok(t);
-                    }
-                } else if name == "stderr" {
-                    if let Some(t) = self.stderr_target.clone() {
-                        return Ok(t);
-                    }
-                }
+            if mname == "sys" && (name == "stdout" || name == "stderr") {
+                let stderr = name == "stderr";
+                return match self.std_target(stderr) {
+                    Some(t) => Ok(t),
+                    None => self.get_attr(recv, if stderr { "__stderr__" } else { "__stdout__" }),
+                };
             }
         }
         // A `_csv` reader is its own iterator.
@@ -16088,11 +16118,7 @@ fn call_method_inner(
         Some(PyObj::Redirect { stderr, target, .. }) => match name {
             "__enter__" => {
                 with_host(|h| {
-                    let cur = if stderr {
-                        h.stderr_target.clone()
-                    } else {
-                        h.stdout_target.clone()
-                    };
+                    let cur = h.std_target(stderr);
                     if let Some(PyObj::Redirect { saved, .. }) = h.get_mut(recv) {
                         *saved = cur;
                     }
@@ -21115,14 +21141,13 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
             let argv_items: Vec<Value> = argv_strs.into_iter().map(|s| h.new_str(s)).collect();
             let argv = h.new_list(argv_items);
             // Standard streams are `File` handles over the fixed side-table slots.
+            // `sys.__stdout__` / `__stderr__` / `__stdin__` name the same objects
+            // (`sys.stdout is sys.__stdout__` at startup); a reassignment rebinds
+            // `sys.stdout` and leaves them as they were.
             let stdout = h.alloc(PyObj::File { id: 0 });
             let stderr = h.alloc(PyObj::File { id: 1 });
             let stdin = h.alloc(PyObj::File { id: 2 });
-            // `sys.__stdout__` / `__stderr__` / `__stdin__` — the original streams,
-            // unaffected by a `sys.stdout` reassignment or `redirect_stdout`.
-            let orig_stdout = h.alloc(PyObj::File { id: 0 });
-            let orig_stderr = h.alloc(PyObj::File { id: 1 });
-            let orig_stdin = h.alloc(PyObj::File { id: 2 });
+            let (orig_stdout, orig_stderr, orig_stdin) = (stdout.clone(), stderr.clone(), stdin.clone());
             // `sys.version_info` — a `(major, minor, micro, releaselevel, serial)`
             // namedtuple matching the emulated CPython.
             let vi_vals = vec![
@@ -22649,7 +22674,7 @@ pub fn write_to_stream(target: &Value, s: &str) -> Result<(), String> {
 /// (`sys.stdout = io.StringIO()`, `contextlib.redirect_stdout`), else the native
 /// stdout stream.
 pub fn write_stdout(s: &str) -> Result<(), String> {
-    match with_host(|h| h.stdout_target.clone()) {
+    match with_host(|h| h.std_target(false)) {
         Some(t) => write_to_stream(&t, s),
         None => {
             with_host(|h| h.write_out(s, false));
@@ -22661,7 +22686,7 @@ pub fn write_stdout(s: &str) -> Result<(), String> {
 /// Write `s` to the current `sys.stderr` — its redirect target if reassigned,
 /// else the native stderr stream.
 pub fn write_stderr(s: &str) -> Result<(), String> {
-    match with_host(|h| h.stderr_target.clone()) {
+    match with_host(|h| h.std_target(true)) {
         Some(t) => write_to_stream(&t, s),
         None => {
             with_host(|h| h.write_out(s, true));
@@ -22682,7 +22707,7 @@ fn std_stream(stderr: bool) -> crate::stdio::Stream {
 /// `sys.stdout.flush()` on the CURRENT `sys.stdout`: the redirect target's own
 /// `flush` when reassigned, else the native stream.
 pub fn flush_stdout() -> Result<(), String> {
-    match with_host(|h| h.stdout_target.clone()) {
+    match with_host(|h| h.std_target(false)) {
         Some(t) => flush_stream(&t),
         None => {
             crate::stdio::flush(crate::stdio::Stream::Stdout);
@@ -22693,7 +22718,7 @@ pub fn flush_stdout() -> Result<(), String> {
 
 /// `sys.stderr.flush()` on the current `sys.stderr`.
 pub fn flush_stderr() -> Result<(), String> {
-    match with_host(|h| h.stderr_target.clone()) {
+    match with_host(|h| h.std_target(true)) {
         Some(t) => flush_stream(&t),
         None => {
             crate::stdio::flush(crate::stdio::Stream::Stderr);

@@ -1985,6 +1985,21 @@ written.
   already-cached script on a binary rebuilt seconds earlier; the v49 `SCHEMA`
   note records the same class of bug biting once before. The key now also hashes
   the running executable's size and mtime.
+- **A CPython-side `sys.stdout` reassignment redirects pythonrs's `print`.**
+  Only the pythonrs → CPython direction was covered: CPython code assigning the
+  embedded interpreter's `sys.stdout` (`unittest`'s `buffer=True` runner,
+  `mock.patch('sys.stdout', …)`) left pythonrs's `print` on the native stream,
+  so a buffered test run printed its captured output to the terminal. A dict
+  watcher on `sys.__dict__` (`PyDict_AddWatcher`/`PyDict_Watch`, resolved with
+  `dlsym` because they are outside the `abi3` API) records each CPython-side
+  `stdout`/`stderr` assignment, classified as the routed native stream, `None`,
+  a pythonrs redirect being restored (its own target comes back), or any other
+  CPython object; `PyHost::std_target` adopts it on the next read, so `print`
+  costs one atomic load when nothing changed and `type(sys)` is untouched.
+  `sys.stdout` with no redirect is the object `sys.__stdout__` names, and the
+  two are one object at startup (`sys.stdout is sys.__stdout__` was `False`).
+  On a 3.9–3.11 interpreter, which has no dict watchers, a CPython-side
+  assignment is still not seen.
 
 ## Implemented — async/await/asyncio (native fusevm event loop)
 - **`async def` / `await` / `asyncio`.** `async def f()` returns a real coroutine
@@ -2054,18 +2069,6 @@ written.
   `unittest` failure report carries the `AssertionError: 1 != 2` line without the
   `Traceback (most recent call last):` block above it. Repro:
   `import logging; logging.basicConfig(); \ntry: 1/0\nexcept ZeroDivisionError: logging.exception('boom')`.
-- **A CPython-side `sys.stdout` reassignment does not redirect pythonrs's
-  `print`.** The pythonrs → CPython direction is covered (see the Implemented
-  entry on `redirect_stdout`); the reverse is not. When CPython code assigns
-  the embedded interpreter's `sys.stdout` — `unittest`'s `buffer=True`
-  runner, a CPython-side `contextlib` — pythonrs's `print` and `sys.stdout`
-  still write to the native stream, so a buffered test run prints its
-  captured output to the terminal (`TextTestRunner(buffer=True)` with a test
-  that prints shows the text where CPython shows nothing). Seeing the
-  assignment needs either a per-write probe of CPython's `sys.stdout` (a GIL
-  round-trip on every `print`) or a `__setattr__` hook on the `sys` module
-  (by reassigning its `__class__` to a `ModuleType` subclass, which changes
-  `type(sys)`); neither is in place.
 - **A pythonrs callable or object cannot be used from a worker thread.** On the
   bridged build `import threading` is CPython's, and CPython's `threading.py`
   imports the REAL C `_thread` — not the native `_thread` this crate ships — so

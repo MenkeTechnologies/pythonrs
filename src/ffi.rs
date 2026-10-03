@@ -370,6 +370,7 @@ fn route_std_streams() {
                 apply_std_target(py, stderr, target);
             }
         }
+        watch_sys_streams(py);
     });
 }
 
@@ -435,8 +436,153 @@ fn apply_std_target(py: Python, stderr: bool, target: StdTarget) {
         .map(|p| p.into_any().into_bound(py)),
     };
     if let Ok(new) = new {
+        APPLYING_STD_TARGET.with(|a| a.set(true));
         let _ = sys.setattr(name, new);
+        APPLYING_STD_TARGET.with(|a| a.set(false));
     }
+}
+
+// ── CPython-side `sys.stdout` / `sys.stderr` assignment ──────────────────────
+//
+// pythonrs's `print` writes to the host's `stdout_target`. CPython code can
+// reassign the embedded interpreter's `sys.stdout` behind pythonrs's back —
+// `unittest`'s `buffer=True` runner, a CPython-side `contextlib.redirect_stdout`
+// — and CPython has exactly one `sys.stdout`, so pythonrs's `print` must follow.
+//
+// The assignment is observed with a dict watcher on `sys.__dict__`
+// (`PyDict_AddWatcher`/`PyDict_Watch`, CPython >= 3.12): the callback runs as
+// the dict is modified, classifies the new stream, and parks it here. The host
+// applies it the next time it reads its target ([`take_cpython_std_assignment`]),
+// so `print` pays one relaxed atomic load when nothing changed, and nothing
+// changes `type(sys)`. The callback cannot apply it itself: it runs inside a
+// CPython call, while the host may be mid-borrow.
+//
+// The watcher API is outside the limited API this crate builds against
+// (`abi3-py39`), so it is resolved with `dlsym` at runtime: on a 3.9–3.11
+// interpreter the symbols are absent and CPython-side assignments go unseen,
+// as before.
+
+/// The latest CPython-side assignment per stream (index 0 stdout, 1 stderr),
+/// not yet applied to the host.
+static STD_ASSIGNED: Mutex<[Option<StdTarget>; 2]> = Mutex::new([None, None]);
+/// Whether [`STD_ASSIGNED`] holds anything — the fast path of every read.
+static STD_ASSIGNED_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+thread_local! {
+    /// Set while [`apply_std_target`] installs a pythonrs-side redirect, whose
+    /// own `sys.stdout = …` the watcher must not report back as CPython's.
+    static APPLYING_STD_TARGET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The CPython-side assignment to `sys.stdout` (`stderr` false) or `sys.stderr`
+/// made since the last call, if any. Called by the host before it reads the
+/// stream it writes to.
+pub fn take_cpython_std_assignment(stderr: bool) -> Option<StdTarget> {
+    if !STD_ASSIGNED_DIRTY.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    let mut pending = STD_ASSIGNED.lock().expect("std assignment lock poisoned");
+    let taken = pending[stderr as usize].take();
+    if pending.iter().all(Option::is_none) {
+        STD_ASSIGNED_DIRTY.store(false, std::sync::atomic::Ordering::Release);
+    }
+    taken
+}
+
+/// `PyDict_WatchEvent` values `ADDED` and `MODIFIED` (`cpython/dictobject.h`).
+const PYDICT_EVENT_ADDED: std::ffi::c_int = 0;
+const PYDICT_EVENT_MODIFIED: std::ffi::c_int = 1;
+
+type DictWatchCallback = unsafe extern "C" fn(
+    std::ffi::c_int,
+    *mut pyo3::ffi::PyObject,
+    *mut pyo3::ffi::PyObject,
+    *mut pyo3::ffi::PyObject,
+) -> std::ffi::c_int;
+
+/// Watch `sys.__dict__` for `stdout`/`stderr` assignments. A no-op on an
+/// interpreter without dict watchers.
+fn watch_sys_streams(py: Python) {
+    // SAFETY: `dlsym` with a NUL-terminated name only looks the symbol up. The
+    // two signatures are CPython's own (`cpython/dictobject.h`, 3.12+).
+    let (add, watch) = unsafe {
+        (
+            libc::dlsym(libc::RTLD_DEFAULT, c"PyDict_AddWatcher".as_ptr()),
+            libc::dlsym(libc::RTLD_DEFAULT, c"PyDict_Watch".as_ptr()),
+        )
+    };
+    if add.is_null() || watch.is_null() {
+        return;
+    }
+    let Ok(sys) = py.import("sys") else { return };
+    let Ok(dict) = sys.getattr("__dict__") else { return };
+    // SAFETY: the pointers were resolved from the running libpython and carry
+    // the declared C signatures; the GIL is held, as both calls require.
+    unsafe {
+        let add: unsafe extern "C" fn(DictWatchCallback) -> std::ffi::c_int = std::mem::transmute(add);
+        let watch: unsafe extern "C" fn(std::ffi::c_int, *mut pyo3::ffi::PyObject) -> std::ffi::c_int =
+            std::mem::transmute(watch);
+        let id = add(sys_dict_watcher);
+        if id < 0 {
+            pyo3::ffi::PyErr_Clear();
+            return;
+        }
+        if watch(id, dict.as_ptr()) < 0 {
+            pyo3::ffi::PyErr_Clear();
+        }
+    }
+}
+
+/// The `sys.__dict__` watcher: records an assignment to `stdout`/`stderr`.
+/// Runs with the GIL held, before the dict changes; it must not raise.
+unsafe extern "C" fn sys_dict_watcher(
+    event: std::ffi::c_int,
+    _dict: *mut pyo3::ffi::PyObject,
+    key: *mut pyo3::ffi::PyObject,
+    new_value: *mut pyo3::ffi::PyObject,
+) -> std::ffi::c_int {
+    if !(event == PYDICT_EVENT_ADDED || event == PYDICT_EVENT_MODIFIED)
+        || key.is_null()
+        || new_value.is_null()
+        || APPLYING_STD_TARGET.with(|a| a.get())
+    {
+        return 0;
+    }
+    // SAFETY: the callback is invoked with the GIL held and with borrowed
+    // references to a live key and value.
+    let py = unsafe { Python::assume_gil_acquired() };
+    let key = unsafe { Bound::from_borrowed_ptr(py, key) };
+    let name = key.downcast::<PyString>().ok().and_then(|s| s.to_cow().ok());
+    let stderr = match name.as_deref() {
+        Some("stdout") => false,
+        Some("stderr") => true,
+        _ => return 0,
+    };
+    let value = unsafe { Bound::from_borrowed_ptr(py, new_value) };
+    let target = classify_std_assignment(py, stderr, &value);
+    STD_ASSIGNED.lock().expect("std assignment lock poisoned")[stderr as usize] = Some(target);
+    STD_ASSIGNED_DIRTY.store(true, std::sync::atomic::Ordering::Release);
+    0
+}
+
+/// What a CPython-side `sys.stdout = value` means to pythonrs: the routed
+/// native stream (`sys.__stdout__`, what a redirect restores), `None`, one of
+/// pythonrs's own redirect streams (restoring a pythonrs-side redirect hands
+/// back its target), or any other CPython object.
+fn classify_std_assignment(py: Python, stderr: bool, value: &Bound<PyAny>) -> StdTarget {
+    if value.is_none() {
+        return StdTarget::Null;
+    }
+    let dunder = if stderr { "__stderr__" } else { "__stdout__" };
+    let native = py.import("sys").and_then(|sys| sys.getattr(dunder));
+    if native.is_ok_and(|n| n.is(value)) {
+        return StdTarget::Native;
+    }
+    if let Ok(redirect) = value.downcast::<PyrsRedirectStream>() {
+        let r = redirect.borrow();
+        return StdTarget::Pyrs(r.target.clone(), r.generation);
+    }
+    StdTarget::Foreign(store(value.clone().unbind()))
 }
 
 /// Run `python -m <modname> [args…]` on the embedded CPython by calling

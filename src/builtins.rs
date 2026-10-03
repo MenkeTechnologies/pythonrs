@@ -6167,7 +6167,7 @@ pub fn call_builtin_function(
             // nothing at all when that is `None`.
             let file = match kw_get(&kwargs, "file").filter(|f| !matches!(f, Value::Undef)) {
                 Some(f) => Some(f),
-                None => match with_host(|h| h.stdout_target.clone()) {
+                None => match with_host(|h| h.std_target(false)) {
                     Some(Value::Undef) => return Ok(Value::Undef),
                     target => target,
                 },
