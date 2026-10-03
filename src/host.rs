@@ -6273,7 +6273,7 @@ impl PyHost {
     /// is `True` rather than an endless walk of the cycle — the third element IS
     /// the list being compared.
     fn elem_equal(&self, p: &Value, q: &Value) -> bool {
-        matches!((p, q), (Value::Obj(i), Value::Obj(j)) if i == j) || self.equal(p, q)
+        value_identity(p, q) || self.equal(p, q)
     }
 
     fn equal_inner(&self, a: &Value, b: &Value) -> bool {
@@ -7480,6 +7480,106 @@ fn range_pkey(len: num_bigint::BigInt, start: num_bigint::BigInt, step: num_bigi
         (int(start), int(step))
     };
     PKey::Range(vec![int(len), start, step])
+}
+
+// ── float identity ───────────────────────────────────────────────────────────
+//
+// A `float` is unboxed (`Value::Float`), so the only thing that can carry its
+// object identity is its bit pattern. `x is y`, and the identity shortcut of
+// `PyObject_RichCompareBool` that makes `[n] == [n]` and `n in [n]` true for one
+// shared NaN `n`, both read it through `same_float`.
+//
+// For every value but NaN, equal bits behave exactly like CPython's objects:
+// equal non-NaN floats are `==` anyway, so the shortcut never changes an
+// answer. NaN is where identity shows, and CPython makes a NEW object for every
+// NaN it produces. pythonrs gives each NaN that `float('nan')`, `math.nan`,
+// `float.fromhex('nan')` or a `math` function creates a pattern of its own:
+//
+//   sign | exponent 0x7ff | quiet bit 0 | NAN_ID_MARK (bits 50..40) | serial (39..0)
+//
+// The quiet bit is clear (a signalling NaN), so arithmetic on a minted NaN
+// (`n + 1`) yields a QUIET NaN whose bits differ — a new object, as in CPython.
+// NaNs the VM's own float arithmetic produces (`inf - inf`, `n + 1`) are not
+// minted (fusevm computes them, not pythonrs), so they cannot be told apart:
+// such a NaN is `is` nothing, not even itself. The marker keeps the minted range
+// away from payloads data actually carries; a NaN wearing it (quieted or not)
+// is pythonrs-internal, and `export_float` rewrites it to the NaN CPython's
+// `float('nan')` has before the bits leave the process.
+
+/// The payload bits every minted NaN carries (bits 50..40).
+const NAN_ID_MARK: u64 = 0x7ff << 40;
+/// The serial-number field of a minted NaN (bits 39..0).
+const NAN_ID_SERIAL: u64 = (1 << 40) - 1;
+/// A NaN's all-ones exponent.
+const NAN_EXP: u64 = 0x7ff << 52;
+/// The quiet bit: set in every NaN arithmetic produces, clear in a minted one.
+const NAN_QUIET: u64 = 1 << 51;
+/// CPython's `Py_NAN` (`float('nan')`), sign bit aside: a quiet NaN, no payload.
+pub const PY_NAN_BITS: u64 = NAN_EXP | NAN_QUIET;
+/// The bits that, set and with `NAN_QUIET` clear, identify a minted NaN.
+const NAN_ID_BITS: u64 = NAN_EXP | NAN_ID_MARK;
+
+/// A new NaN object, as `float('nan')` makes one: a NaN pattern no other live
+/// float has, so it `is` only itself (see the section comment above).
+/// `negative` sets the sign bit, as `float('-nan')` does.
+pub fn fresh_nan(negative: bool) -> f64 {
+    static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & NAN_ID_SERIAL;
+    let sign = if negative { 1u64 << 63 } else { 0 };
+    f64::from_bits(sign | NAN_ID_BITS | serial)
+}
+
+/// `f` as a float result CPython allocated anew (an arithmetic result, `abs(n)`,
+/// `math.fabs(n)`): a NaN becomes a fresh minted one with its sign, so it is not
+/// the NaN it was computed from. A NaN whose payload is neither `Py_NAN`'s nor a
+/// minted one's came from binary data and keeps its bits, which `struct.pack`
+/// must write back as CPython would (the payload propagates through arithmetic);
+/// such a NaN has no identity pythonrs can track. Every other value is unchanged.
+pub fn new_float(f: f64) -> f64 {
+    let payload = f.to_bits() & !(1 << 63);
+    if f.is_nan() && (payload == PY_NAN_BITS || payload & NAN_ID_MARK == NAN_ID_MARK) {
+        fresh_nan(f.is_sign_negative())
+    } else {
+        f
+    }
+}
+
+/// `f` as it must look outside pythonrs (handed to CPython, packed to bytes): a
+/// NaN pythonrs minted, or one arithmetic derived from it, becomes CPython's own
+/// `Py_NAN` with the same sign — the payload was only ever an identity. Every
+/// other value, including a NaN read in with a payload of its own, is unchanged.
+pub fn export_float(f: f64) -> f64 {
+    let bits = f.to_bits();
+    if bits & NAN_ID_BITS == NAN_ID_BITS {
+        f64::from_bits((bits & (1 << 63)) | PY_NAN_BITS)
+    } else {
+        f
+    }
+}
+
+/// `a is b` for two unboxed floats: equal bits, unless the value is a NaN
+/// pythonrs did not mint, whose bits say nothing about which object it is.
+pub fn same_float(a: f64, b: f64) -> bool {
+    a.to_bits() == b.to_bits() && (!a.is_nan() || is_minted_nan(a))
+}
+
+/// Whether `f` is a NaN `fresh_nan` minted (not one arithmetic derived from it).
+pub fn is_minted_nan(f: f64) -> bool {
+    f.to_bits() & (NAN_ID_BITS | NAN_QUIET) == NAN_ID_BITS
+}
+
+/// Raw-handle identity: `a is b` for everything a `Value` holds inline (a heap
+/// handle, `None`, a `bool`, a small `int`, a `float`), without the singleton
+/// rules `builtins::same_object` adds for type and `Ellipsis` objects.
+pub fn value_identity(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Obj(x), Value::Obj(y)) => x == y,
+        (Value::Undef, Value::Undef) => true,
+        (Value::Bool(x), Value::Bool(y)) => x == y,
+        (Value::Int(x), Value::Int(y)) => x == y,
+        (Value::Float(x), Value::Float(y)) => same_float(*x, *y),
+        _ => false,
+    }
 }
 
 fn float_pkey(f: f64) -> PKey {
@@ -11368,7 +11468,7 @@ impl PyHost {
             }
             Some(PyObj::List(l)) | Some(PyObj::Tuple(l)) => {
                 let l = l.clone();
-                Ok(l.iter().any(|x| self.equal(x, item)))
+                Ok(l.iter().any(|x| self.elem_equal(x, item)))
             }
             Some(PyObj::Dict(d)) => {
                 let key = self.to_key(item)?;
@@ -19658,7 +19758,7 @@ fn itertools_step(it: &Value) -> Result<Option<Value>, String> {
                 let s = iter_step(&sources[1])?;
                 match (d, s) {
                     (Some(dv), Some(sv)) => {
-                        if with_host(|h| h.truthy(&sv)) {
+                        if crate::builtins::py_bool(&sv)? {
                             out = Some(dv);
                             break;
                         }
@@ -19683,7 +19783,7 @@ fn itertools_step(it: &Value) -> Result<Option<Value>, String> {
                     Some(v) => {
                         if flag {
                             let keep = invoke(&func, vec![v.clone()], vec![])?;
-                            if with_host(|h| h.truthy(&keep)) {
+                            if crate::builtins::py_bool(&keep)? {
                                 continue; // still dropping
                             }
                             flag = false;
@@ -19702,7 +19802,7 @@ fn itertools_step(it: &Value) -> Result<Option<Value>, String> {
             }
             Some(v) => {
                 let keep = invoke(&func, vec![v.clone()], vec![])?;
-                if with_host(|h| h.truthy(&keep)) {
+                if crate::builtins::py_bool(&keep)? {
                     Some(v)
                 } else {
                     finished = true;
@@ -19720,10 +19820,10 @@ fn itertools_step(it: &Value) -> Result<Option<Value>, String> {
                     }
                     Some(v) => {
                         let truthy = if matches!(func, Value::Undef) {
-                            with_host(|h| h.truthy(&v))
+                            crate::builtins::py_bool(&v)?
                         } else {
                             let r = invoke(&func, vec![v.clone()], vec![])?;
-                            with_host(|h| h.truthy(&r))
+                            crate::builtins::py_bool(&r)?
                         };
                         if !truthy {
                             out = Some(v);
@@ -20109,10 +20209,10 @@ fn filter_step(it: &Value) -> Result<Option<Value>, String> {
         match iter_step(&source)? {
             Some(v) => {
                 let keep = if matches!(func, Value::Undef) {
-                    with_host(|h| h.truthy(&v))
+                    crate::builtins::py_bool(&v)?
                 } else {
                     let r = invoke(&func, vec![v.clone()], vec![])?;
-                    with_host(|h| h.truthy(&r))
+                    crate::builtins::py_bool(&r)?
                 };
                 if keep {
                     return Ok(Some(v));
@@ -21145,7 +21245,7 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                 ("e", Value::Float(std::f64::consts::E)),
                 ("tau", Value::Float(std::f64::consts::TAU)),
                 ("inf", Value::Float(f64::INFINITY)),
-                ("nan", Value::Float(f64::NAN)),
+                ("nan", Value::Float(fresh_nan(false))),
             ];
             for &f in MATH_FNS {
                 out.push((f, h.alloc(PyObj::Builtin(format!("math.{f}")))));

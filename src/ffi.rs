@@ -1034,7 +1034,7 @@ pub fn foreign_eq_prim(fid: u32, prim: Prim) -> bool {
                 Ok(o) => o.into_any(),
                 Err(_) => return false,
             },
-            Prim::Float(f) => match f.into_pyobject(py) {
+            Prim::Float(f) => match crate::host::export_float(f).into_pyobject(py) {
                 Ok(o) => o.into_any(),
                 Err(_) => return false,
             },
@@ -1721,6 +1721,92 @@ fn value_to_py<'py>(
     Ok(obj)
 }
 
+/// NaN identity across the bridge.
+///
+/// A float crosses by value, but a NaN's identity is observable (`[n] == [n]`,
+/// `n in d`), and pythonrs carries it in the NaN's bits (`host::fresh_nan`).
+/// This table pairs each CPython NaN object that crossed with the minted NaN
+/// that stands for it, in both directions: a CPython NaN read twice
+/// (`json.loads('[NaN, NaN]')`, whose two elements are its one `NaN` constant)
+/// is the same pythonrs NaN, and a pythonrs NaN handed over twice (`[n, n]`) is
+/// the same CPython object, and comes back as itself.
+///
+/// Only a NaN with CPython's own `Py_NAN` payload is paired. A NaN carrying a
+/// payload of its own (read with `struct.unpack`) crosses with its bits
+/// untouched, so packing it again writes the same bytes.
+///
+/// Each entry holds its CPython object alive, so its address cannot be reused
+/// while the entry exists. An entry whose object nothing but this table
+/// references can never be read back from CPython again, so it is dropped when
+/// the table has doubled since the last sweep; the pythonrs copies keep their
+/// minted bits, which no later NaN reuses.
+#[derive(Default)]
+struct NanBridge {
+    /// CPython object address → (the object, the minted NaN standing for it).
+    by_addr: rustc_hash::FxHashMap<usize, (Py<PyAny>, f64)>,
+    /// Minted NaN bits → the CPython object's address.
+    by_bits: rustc_hash::FxHashMap<u64, usize>,
+    /// Entry count at which the next sweep runs.
+    sweep_at: usize,
+}
+
+static NAN_BRIDGE: OnceLock<Mutex<NanBridge>> = OnceLock::new();
+
+impl NanBridge {
+    fn with<R>(f: impl FnOnce(&mut NanBridge) -> R) -> R {
+        let m = NAN_BRIDGE.get_or_init(|| Mutex::new(NanBridge::default()));
+        f(&mut m.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    fn insert(&mut self, py: Python<'_>, obj: Py<PyAny>, nan: f64) {
+        if self.by_addr.len() >= self.sweep_at {
+            self.by_addr.retain(|_, (o, _)| o.get_refcnt(py) > 1);
+            let live: rustc_hash::FxHashSet<usize> = self.by_addr.keys().copied().collect();
+            self.by_bits.retain(|_, addr| live.contains(addr));
+            self.sweep_at = (self.by_addr.len() * 2).max(64);
+        }
+        let addr = obj.as_ptr() as usize;
+        self.by_bits.insert(nan.to_bits(), addr);
+        self.by_addr.insert(addr, (obj, nan));
+    }
+}
+
+/// A CPython `float` as a pythonrs float, keeping a NaN's identity (see
+/// [`NanBridge`]).
+fn float_from_py(obj: &Bound<'_, PyAny>) -> PyResult<f64> {
+    let f = obj.extract::<f64>()?;
+    if f.to_bits() & !(1 << 63) != crate::host::PY_NAN_BITS {
+        return Ok(f);
+    }
+    let addr = obj.as_ptr() as usize;
+    Ok(NanBridge::with(|t| {
+        if let Some((_, nan)) = t.by_addr.get(&addr) {
+            return *nan;
+        }
+        let nan = crate::host::fresh_nan(f.is_sign_negative());
+        t.insert(obj.py(), obj.clone().unbind(), nan);
+        nan
+    }))
+}
+
+/// A pythonrs float as a CPython `float`: a minted NaN is the CPython object
+/// already paired with it, or a new one paired from now on (see [`NanBridge`]).
+fn float_to_py<'py>(py: Python<'py>, f: f64) -> PyResult<Bound<'py, PyAny>> {
+    if !crate::host::is_minted_nan(f) {
+        return crate::host::export_float(f).into_bound_py_any(py);
+    }
+    NanBridge::with(|t| {
+        if let Some(addr) = t.by_bits.get(&f.to_bits()) {
+            if let Some((obj, _)) = t.by_addr.get(addr) {
+                return Ok(obj.bind(py).clone());
+            }
+        }
+        let obj = crate::host::export_float(f).into_bound_py_any(py)?;
+        t.insert(py, obj.clone().unbind(), f);
+        Ok(obj)
+    })
+}
+
 /// One node of [`value_to_py`]: converts `v`, going back through
 /// [`value_to_py`] for its elements.
 fn value_to_py_node<'py>(
@@ -1733,7 +1819,7 @@ fn value_to_py_node<'py>(
         Value::Undef => Ok(py.None().into_bound(py)),
         Value::Bool(b) => conv(b.into_bound_py_any(py)),
         Value::Int(n) => conv(n.into_bound_py_any(py)),
-        Value::Float(f) => conv(f.into_bound_py_any(py)),
+        Value::Float(f) => conv(float_to_py(py, *f)),
         Value::Str(s) => conv(s.as_str().into_bound_py_any(py)),
         Value::Obj(_) => match host.get(v) {
             Some(PyObj::Str(s)) => conv(s.as_str().into_bound_py_any(py)),
@@ -1797,7 +1883,8 @@ fn value_to_py_node<'py>(
                     .import("builtins")
                     .and_then(|m| m.getattr("complex"))
                     .map_err(|e| e.to_string())?;
-                cplx.call1((*re, *im)).map_err(|e| e.to_string())
+                let (re, im) = (crate::host::export_float(*re), crate::host::export_float(*im));
+                cplx.call1((re, im)).map_err(|e| e.to_string())
             }
             Some(PyObj::Deque { items, maxlen }) => {
                 let elems = marshal_seq(host, py, &items.iter().cloned().collect::<Vec<_>>())?;
@@ -2058,9 +2145,7 @@ fn py_to_value_node(host: &mut PyHost, py: Python, obj: &Bound<PyAny>) -> Result
         });
     }
     if obj.is_exact_instance_of::<PyFloat>() {
-        return Ok(Value::Float(
-            obj.extract::<f64>().map_err(|e| e.to_string())?,
-        ));
+        return Ok(Value::Float(float_from_py(obj).map_err(|e| e.to_string())?));
     }
     if obj.is_exact_instance_of::<pyo3::types::PyString>() {
         return Ok(host.new_str(obj.extract::<String>().map_err(|e| e.to_string())?));
@@ -2458,7 +2543,7 @@ fn pure_value(host: &mut PyHost, py: Python, obj: &Bound<PyAny>) -> Option<Value
         };
     }
     if obj.is_exact_instance_of::<PyFloat>() {
-        return obj.extract::<f64>().ok().map(Value::Float);
+        return float_from_py(obj).ok().map(Value::Float);
     }
     if obj.is_exact_instance_of::<PyString>() {
         return obj.extract::<String>().ok().map(|s| host.new_str(s));

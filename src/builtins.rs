@@ -1624,7 +1624,7 @@ fn len_result(r: &Value) -> Result<usize, String> {
 /// Python truthiness with instance dunder dispatch: `__bool__`, else `__len__`,
 /// else the host's structural truthiness. Used by the TRUTHY op, `bool()`,
 /// `any`/`all`/`filter`.
-fn py_bool(v: &Value) -> Result<bool, String> {
+pub(crate) fn py_bool(v: &Value) -> Result<bool, String> {
     let (has_bool, has_len) = with_host(|h| match h.get(v) {
         Some(PyObj::Instance(i)) => (
             instance_has(h, i, "__bool__"),
@@ -1654,7 +1654,14 @@ fn py_bool(v: &Value) -> Result<bool, String> {
     if let Some(fid) = with_host(|h| h.foreign_id(v)) {
         return Ok(crate::ffi::truthy(fid));
     }
-    Ok(with_host(|h| h.truthy(v)))
+    with_host(|h| {
+        // A memoryview has no `nb_bool`, so its truthiness is `memory_length`,
+        // which refuses a released view (`CHECK_RELEASED_INT`).
+        if h.mv_released(v) {
+            return Err(host::MV_RELEASED.to_string());
+        }
+        Ok(h.truthy(v))
+    })
 }
 
 /// `IS_INT` — the type guard a native counted loop emits over the values it
@@ -2355,7 +2362,7 @@ pub fn same_object(a: &Value, b: &Value) -> bool {
         (Value::Undef, Value::Undef) => true,
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Int(x), Value::Int(y)) => x == y,
-        (Value::Float(x), Value::Float(y)) => x == y,
+        (Value::Float(x), Value::Float(y)) => host::same_float(*x, *y),
         _ => false,
     }
 }
@@ -2952,14 +2959,7 @@ fn unsupported_operand(sym: &str, a: &Value, b: &Value) -> String {
 
 /// Identity comparison (mirrors the `is` operator) for the `==`/`!=` fallback.
 fn identity_eq(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::Obj(x), Value::Obj(y)) => x == y,
-        (Value::Undef, Value::Undef) => true,
-        (Value::Bool(x), Value::Bool(y)) => x == y,
-        (Value::Int(x), Value::Int(y)) => x == y,
-        (Value::Float(x), Value::Float(y)) => x == y,
-        _ => false,
-    }
+    host::value_identity(a, b)
 }
 
 /// (forward, reflected) dunder names for a non-native binop tag (`host::binop`).
@@ -4763,6 +4763,18 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
     r
 }
 
+/// A result the host computed natively, as the new object CPython allocates for
+/// it: a NaN `float` gets an identity of its own (`host::new_float`), so
+/// `inf - inf` is a NaN that `is` itself and nothing else. fusevm hands its own
+/// `+`/`-`/`*` NaN results here too (`Chunk::nan_result_hook`, set by
+/// `Compiler::finish_chunk`).
+fn new_object_result(v: Value) -> Value {
+    match v {
+        Value::Float(f) => Value::Float(host::new_float(f)),
+        v => v,
+    }
+}
+
 fn numeric_hook_inner(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
     use NumOp::*;
     if let Some(r) = deque_subclass_op(op, a, b) {
@@ -4844,7 +4856,7 @@ fn numeric_hook_inner(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> 
                 return with_host(|h| h.arith(op, a, &b2));
             }
         }
-        return with_host(|h| h.arith(op, a, b));
+        return with_host(|h| h.arith(op, a, b)).map(new_object_result);
     }
     match op {
         Eq => match dispatch_binop(a, b, "__eq__", "__eq__") {
@@ -6307,7 +6319,8 @@ pub fn call_builtin_function(
                     Some(a) => Value::Int(a),
                     None => h.norm_big(-num_bigint::BigInt::from(*n)),
                 }),
-                Value::Float(f) => Ok(Value::Float(f.abs())),
+                // A new object, so `abs(nan)` is not the NaN it was given.
+                Value::Float(f) => Ok(Value::Float(host::new_float(f.abs()))),
                 Value::Bool(b) => Ok(Value::Int(*b as i64)),
                 Value::Obj(_) if matches!(h.get(&v), Some(PyObj::BigInt(_))) => match h.get(&v) {
                     Some(PyObj::BigInt(b)) => {
@@ -9065,15 +9078,13 @@ fn parse_imag(s: &str) -> Result<f64, String> {
     }
 }
 
-/// Parse a Python float literal (with `inf`/`nan`/underscores), or `None`.
+/// Parse a Python float string (`inf`/`infinity`/`nan` in any case and with a
+/// sign, as `_Py_parse_inf_or_nan` reads them; underscores), or `None`. A NaN
+/// spelled in the string is a NEW float object carrying the string's sign
+/// (`float('-nan')` is negative), so it gets an identity of its own.
 fn parse_py_float(s: &str) -> Option<f64> {
-    let cleaned = s.trim().replace('_', "");
-    match cleaned.as_str() {
-        "inf" | "infinity" | "Infinity" | "+inf" | "+infinity" => Some(f64::INFINITY),
-        "-inf" | "-infinity" => Some(f64::NEG_INFINITY),
-        "nan" | "+nan" | "-nan" => Some(f64::NAN),
-        t => t.parse::<f64>().ok(),
-    }
+    let f = s.trim().replace('_', "").parse::<f64>().ok()?;
+    Some(if f.is_nan() { host::fresh_nan(f.is_sign_negative()) } else { f })
 }
 
 /// The `(real, imag)` a `complex()` FIRST argument contributes.
@@ -9214,18 +9225,9 @@ fn construct_float(args: &[Value]) -> Result<Value, String> {
             };
             let shown = shown.unwrap_or_else(|| format!("'{s}'"));
             // Underscores may group digits (`float("1_000.5")`).
-            let cleaned = s.trim().replace('_', "");
-            match cleaned.as_str() {
-                "inf" | "infinity" | "Infinity" | "+inf" | "+infinity" => {
-                    Ok(Value::Float(f64::INFINITY))
-                }
-                "-inf" | "-infinity" => Ok(Value::Float(f64::NEG_INFINITY)),
-                "nan" | "+nan" | "-nan" => Ok(Value::Float(f64::NAN)),
-                t => t
-                    .parse::<f64>()
-                    .map(Value::Float)
-                    .map_err(|_| format!("ValueError: could not convert string to float: {shown}")),
-            }
+            parse_py_float(&s)
+                .map(Value::Float)
+                .ok_or_else(|| format!("ValueError: could not convert string to float: {shown}"))
         }
     })
 }
@@ -12954,7 +12956,17 @@ fn math_integer(v: &Value) -> Result<num_bigint::BigInt, String> {
     )))
 }
 
+/// A `math` function call. Every float CPython's `math` returns is a new object
+/// (`PyFloat_FromDouble`), so a NaN result is minted afresh rather than keeping
+/// the identity of the NaN argument it passed through (`math.fabs(nan)`).
 fn call_math(name: &str, args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, String> {
+    Ok(match call_math_value(name, args, kwargs)? {
+        Value::Float(f) => Value::Float(host::new_float(f)),
+        v => v,
+    })
+}
+
+fn call_math_value(name: &str, args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, String> {
     if let Some(spec) = math_arity(name) {
         check_arity(name, &format!("math.{name}"), spec, args.len())?;
     }
@@ -19461,7 +19473,7 @@ fn float_fromhex(s: &str) -> Result<f64, String> {
                 f64::INFINITY
             })
         }
-        "nan" => return Ok(f64::NAN),
+        "nan" => return Ok(host::fresh_nan(neg)),
         _ => {}
     }
     let body = rest.strip_prefix("0x").unwrap_or(rest);

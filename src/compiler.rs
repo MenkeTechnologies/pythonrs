@@ -364,7 +364,11 @@ impl Compiler {
     /// Finalize `b` into a `Chunk` and register the open position frame under the
     /// chunk's `op_hash` (stable across the clones made per call), padded to the
     /// op count. `record_err_line` looks the table up at raise time.
-    fn finish_chunk(&mut self, b: ChunkBuilder) -> Chunk {
+    fn finish_chunk(&mut self, mut b: ChunkBuilder) -> Chunk {
+        // A native `+`/`-`/`*` that makes a NaN hands it to the numeric hook,
+        // which mints it as a new float object (`builtins::new_object_result`):
+        // CPython's `inf - inf` is a fresh object with an identity of its own.
+        b.set_nan_result_hook(true);
         let c = b.build();
         let mut frame = self.positions.pop().unwrap_or_default();
         frame.resize(c.ops.len(), Span::NONE);

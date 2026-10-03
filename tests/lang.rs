@@ -10153,3 +10153,112 @@ x = (r(2)[0].__name__, r(2)[1][0] is P, p.__reduce__()[0].__name__, init(), eq(p
         "('__newobj__', True, '_reconstructor', None, True, NotImplemented, False, 2, False, 1, True, True)"
     );
 }
+
+/// A NaN is an object with an identity of its own. `PyObject_RichCompareBool`
+/// shortcuts on identity before `==`, so one shared NaN compares equal to itself
+/// inside a container and is found by `in`/`count`/`index`/`remove`, while two
+/// NaNs `float('nan')` made separately are different objects — as is every NaN
+/// arithmetic produces (`inf - inf`, `n + 1`), which still `is` itself once bound.
+/// Expected values are python3.14's.
+#[test]
+fn a_nan_is_an_object_with_an_identity() {
+    let src = "\
+import math
+n = float('nan')
+shared = ([n] == [n], (n,) == (n,), n in [n], [n].count(n), [n].index(n), {'a': n} == {'a': n},
+          n is n, n == n)
+fresh = (float('nan') is float('nan'), [float('nan')] == [float('nan')],
+         float('nan') in {n: 1}, n in {n: 1}, len({float('nan'), float('nan')}), len({n, n}))
+consts = (math.nan is math.nan, [math.nan] == [math.nan], math.nan is float('nan'))
+inf = float('inf')
+y = inf - inf
+computed = (y is y, [y] == [y], [inf - inf] == [inf - inf], (n + 1) is n, [n + 1] == [n * 2],
+            abs(n) is n, math.fabs(n) is n, math.copysign(n, 1) is n, max(n, 1.0) is n)
+L = [n]; L.remove(n)
+x = (shared, fresh, consts, computed, L)
+";
+    assert_eq!(
+        g(src, "x"),
+        "((True, True, True, 1, 0, True, True, False), (False, False, False, True, 2, 1), \
+         (True, True, False), (True, True, False, False, False, False, False, False, True), [])"
+    );
+}
+
+/// A NaN's identity lives in its bits, which never leave the process: packed or
+/// handed to CPython, `float('nan')` is CPython's own `Py_NAN` (sign kept), a NaN
+/// read from bytes with a payload of its own writes the same bytes back (and its
+/// payload propagates through arithmetic as in CPython), and a CPython NaN read
+/// twice — `json`'s single `NaN` constant — is one object.
+/// Expected values are python3.14's.
+#[test]
+fn a_nan_keeps_its_bytes_and_identity_across_the_bridge() {
+    let src = "\
+import struct, json
+n = float('nan')
+p = lambda f: struct.pack('<d', f).hex()
+s = struct.unpack('<d', bytes.fromhex('010000000000f47f'))[0]
+a, b = json.loads('[NaN, NaN]')
+x = (p(n), p(-n), p(float('-nan')), p(n * 2), p(float('NaN')),
+     p(s), p(s + 1), p(-s), struct.pack('<f', n).hex(), struct.pack('<e', n).hex(),
+     a is b, [a] == [b], json.loads(json.dumps([n]))[0] is n)
+";
+    assert_eq!(
+        g(src, "x"),
+        "('000000000000f87f', '000000000000f8ff', '000000000000f8ff', '000000000000f87f', \
+         '000000000000f87f', '010000000000f47f', '010000000000fc7f', \
+         '010000000000f4ff', '0000c07f', '007e', True, True, False)"
+    );
+}
+
+/// A memoryview has no `nb_bool`: its truthiness is `memory_length`, which
+/// refuses a released view, so every truth test raises — `bool()`, a condition,
+/// `not`, `and`/`or`, `any`/`all`, `filter`. Expected values are python3.14's.
+#[test]
+fn the_truth_of_a_released_memoryview_raises() {
+    let src = "\
+m = memoryview(b'ab'); m.release()
+def t(f):
+    try:
+        return f()
+    except ValueError as e:
+        return str(e)
+def loop():
+    while m:
+        return 1
+x = (t(lambda: bool(m)), t(lambda: 1 if m else 0), t(lambda: not m), t(lambda: m and 1),
+     t(lambda: m or 1), t(lambda: any([m])), t(lambda: all([m])), t(lambda: list(filter(None, [m]))),
+     t(loop), t(lambda: [1 for _ in [1] if m]), bool(memoryview(b'')), bool(memoryview(b'a')))
+";
+    let msg = "'operation forbidden on released memoryview object'";
+    assert_eq!(
+        g(src, "x"),
+        format!("({}, False, True)", [msg; 10].join(", "))
+    );
+}
+
+/// `filter` and the predicate itertools test each value with
+/// `PyObject_IsTrue`, so a `__bool__` decides (and its exception propagates)
+/// rather than every instance counting as true. Expected values are python3.14's.
+#[test]
+fn filter_and_the_predicate_itertools_honor_bool() {
+    let src = "\
+import itertools
+class F:
+    def __bool__(self): return False
+class E:
+    def __bool__(self): raise KeyError('boom')
+def raised(f):
+    try:
+        return f()
+    except KeyError as e:
+        return repr(e)
+x = (list(filter(None, [F(), 1])), list(filter(lambda v: v, [F()])),
+     [type(v).__name__ for v in itertools.filterfalse(None, [F(), 1])], list(itertools.compress([1, 2], [F(), 1])),
+     list(itertools.takewhile(lambda v: F(), [1, 2])), list(itertools.dropwhile(lambda v: F(), [1, 2])),
+     raised(lambda: list(filter(None, [E()]))))
+";
+    assert_eq!(
+        g(src, "x"),
+        "([1], [], ['F'], [2], [], [1, 2], \"KeyError('boom')\")"
+    );
+}

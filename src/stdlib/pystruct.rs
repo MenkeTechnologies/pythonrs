@@ -351,6 +351,7 @@ impl FormatSpec {
             FormatType::Half | FormatType::Float | FormatType::Double => {
                 let f = h
                     .num_val(v)
+                    .map(crate::host::export_float)
                     .ok_or_else(|| err("required argument is not a float"))?;
                 let bytes: Vec<u8> = match code.code {
                     FormatType::Float => (f as f32).to_le_bytes().to_vec(),

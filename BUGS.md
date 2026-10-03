@@ -73,6 +73,41 @@ written.
   ASCII; group names, inline-flag letters and `(?#…)` comments are left
   alone. Regression test: `re_ascii_ignorecase_folds_k_and_s_by_ascii` in
   `tests/stdlib.rs`.
+- **A NaN is an object with an identity: `[n] == [n]` with one shared `nan` is
+  True.** CPython's sequence comparison shortcuts on element identity before
+  `==`, so one shared NaN equals itself inside a container and is found by
+  `in`/`count`/`index`/`remove`. pythonrs keeps a `float` unboxed, and a float
+  compared `is` by `==` of its value, so no NaN was ever itself (`y is y` was
+  False) and every NaN was the same dict key (`float('nan') in {n: 1}` was
+  True). A float's identity is now its bit pattern (`host::same_float`), and
+  every NaN that CPython would allocate gets a pattern of its own: `float('nan')`
+  (any spelling, sign kept — `float('-nan')` was positive), `math.nan`,
+  `float.fromhex('nan')`, `abs`/`math.*` results, and the NaN results of `+`
+  `-` `*` (handed over by fusevm 0.26.9's `Chunk::nan_result_hook`, which every
+  chunk now sets) and of the host-computed ops. A minted NaN is a signalling
+  NaN marked in its payload, so arithmetic on it never yields the same bits;
+  `host::export_float` rewrites it to CPython's `Py_NAN` before the bits leave
+  the process (`struct.pack`, the CPython bridge), and a NaN read from bytes with
+  a payload of its own keeps its bits, packing back identically and propagating
+  its payload through arithmetic as CPython's does. Across the bridge a CPython
+  NaN object and the minted NaN standing for it are paired both ways
+  (`ffi::NanBridge`), so `json.loads('[NaN, NaN]')`'s two elements — json's one
+  `NaN` constant — are one object here too. Measured (debug build, `hyperfine`,
+  min of 15 runs on a loaded machine): a 600 000-iteration float `+`/`*`/`-`
+  loop 1.226 s before, 1.210 s after.
+- **The truth of a released `memoryview` raises.** A memoryview has no
+  `nb_bool`, so its truthiness is `memory_length`, which refuses a released view;
+  `bool(m)`, `if m:`, `not m`, `m and x`, `any`/`all`, `filter` all answered from
+  the view's length. `builtins::py_bool` — the truth test every one of them goes
+  through — now raises `ValueError: operation forbidden on released memoryview
+  object`.
+- **`filter` and the predicate itertools honor `__bool__`.** `filter`,
+  `itertools.filterfalse`, `compress`, `takewhile` and `dropwhile` tested each
+  value or predicate result with the host's structural truthiness, which counts
+  every instance as true and never runs `__bool__`/`__len__`, so
+  `filter(None, [F()])` kept an `F` whose `__bool__` is False and an exception
+  raised by `__bool__` was lost. They use `PyObject_IsTrue`'s port
+  (`builtins::py_bool`) now.
 - **`--lsp` go-to-definition and signature help reach attributes and other
   files.** Both resolved names within the open document only. An attribute now
   resolves as it does at run time where the document determines the receiver:
@@ -2219,12 +2254,10 @@ written.
   returns `ast.parse`'s tree). It holds the source and recompiles it when run,
   so the rest of the code-object surface (`co_code`, `co_consts`,
   `co_varnames`, `dis.dis(code)`, `types.CodeType(...)`) is absent.
-- **`bool()` of a released `memoryview` answers instead of raising.** Every
-  other operation on a released view raises CPython's `ValueError: operation
-  forbidden on released memoryview object` (see the Implemented entry), but
-  truthiness goes through `PyHost::truthy`, which cannot fail, so
-  `bool(released)` answers from the view's length where CPython's
-  `memory_length` raises.
+- **A `memoryview` cannot be passed to a CPython stdlib call.** The bridge has
+  no conversion for it, so `operator.truth(m)`, `operator.not_(m)` and any other
+  CPython function given a view raise `TypeError: cannot pass 'memoryview' to a
+  CPython stdlib call`.
 - **Operator overloading dunders**: dispatched, with `NotImplemented` reflected
   fallback (see Implemented). Covered: arithmetic/bitwise
   (`__add__`/`__sub__`/`__mul__`/`__truediv__`/`__floordiv__`/`__mod__`/`__pow__`/
@@ -2302,13 +2335,16 @@ written.
   `TypeError: cannot pass 'code' to a CPython stdlib call` for every `def`,
   lambda and `__annotate__` (CPython: `(format, /)` for the last). The
   annotate function's `co_varnames` itself is `('format',)` (see Implemented).
-- **`[nan] == [nan]` with one shared `nan` is False.** CPython's sequence
-  comparison shortcuts on element IDENTITY before `==`, so a list holding the
-  same `nan` object twice compares equal to itself. pythonrs stores a `float`
-  unboxed, so two equal-valued floats are indistinguishable from one object and
-  the shortcut cannot be reproduced. The identity shortcut IS applied to heap
-  objects, which is what makes `[P(1)] == [P(1)]` and `[x] == [x]` correct for
-  everything with a heap identity.
+- **A negated NaN keeps its operand's identity.** NaN identity is the NaN's bit
+  pattern (see the Implemented entry), and fusevm's native `Negate` flips the
+  sign bit without consulting the host, so `-(-n) is n` and `-n is -n` are True
+  where CPython's `float_neg` allocates a new object each time (False). The NaN
+  results of `+`/`-`/`*` reach the host through `Chunk::nan_result_hook`; `Neg`
+  needs the same hand-off in fusevm (interpreter, block/trace JIT and AOT
+  tiers), which 0.26.9 does not have. A NaN read from binary data with a payload
+  of its own (not CPython's `Py_NAN`) keeps its bits so it packs back
+  identically, and therefore has no identity pythonrs can track: it `is`
+  nothing, not even itself.
 
 ## VM-level limits (fusevm, not fixable from here)
 
@@ -2328,14 +2364,14 @@ measured inside it, recorded so the next round does not re-derive them.
   samples (4.7%), of which 51 are `RandomState`/SipHash hashing the 9-byte
   `(op_hash, strict)` key. Nothing on the pythonrs side can reach the field or
   skip the reset in the fusevm pythonrs depends on: there `reset` is the only
-  public way to reuse a VM. **Fixed upstream, not yet consumable:** fusevm main
-  (`a5aa777edf`) adds `VM::rewind`, which restarts the chunk the VM already
-  holds and keeps the eligibility memo (`reset` now delegates to it after
-  clearing the per-chunk memos). What remains is on this side and needs a
-  fusevm crates.io release containing it: bump the `fusevm` requirement and
-  replace the `std::mem::take` + `vm.reset(own)` pair in `run_chunk_cached`
-  with `vm.rewind()`. With fusevm main patched in locally, that one-line swap
-  passes `lang`/`runtime`/`stdlib`/`opcodes`/`parity`.
+  public way to reuse a VM. **Fixed upstream, now consumable:** fusevm
+  `a5aa777edf`, released in 0.26.9 (the current requirement), adds
+  `VM::rewind`, which restarts the chunk the VM already holds and keeps the
+  eligibility memo (`reset` now delegates to it after clearing the per-chunk
+  memos). What remains is on this side: replace the `std::mem::take` +
+  `vm.reset(own)` pair in `run_chunk_cached` with `vm.rewind()`. With fusevm
+  main patched in locally, that one-line swap passes
+  `lang`/`runtime`/`stdlib`/`opcodes`/`parity`.
 
 ## Tooling
 - **`--build`** (AOT to a standalone native executable): implemented for the
