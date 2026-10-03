@@ -165,6 +165,19 @@ pub(crate) fn record_err_line(vm: &VM) {
     }
 }
 
+/// Record the line of the call op now executing into the current frame, as
+/// CPython's frame always knows its line: a callee that walks its callers —
+/// `warnings.warn` attributing to `stacklevel`, `logging` finding the caller,
+/// a CPython traceback built through the frame — reads where each caller is.
+/// The span is left to the error path, which needs it only for a caret.
+fn note_call_line(vm: &VM) {
+    if let Some(&line) = vm.chunk.lines.get(vm.ip.wrapping_sub(1)) {
+        if line != 0 {
+            with_host(|h| h.set_cur_line(line));
+        }
+    }
+}
+
 fn abort(vm: &mut VM, e: String) -> Value {
     record_err_line(vm);
     with_host(|h| h.error = Some(e));
@@ -1052,6 +1065,7 @@ fn b_mkslice(vm: &mut VM, _: u8) -> Value {
 // ── calls ────────────────────────────────────────────────────────────────────
 
 fn b_call(vm: &mut VM, argc: u8) -> Value {
+    note_call_line(vm);
     let mut args = pop_n(vm, argc as usize);
     let name = sval(&args.remove(0));
     let r = host::call_named(&name, args, vec![]);
@@ -1059,6 +1073,7 @@ fn b_call(vm: &mut VM, argc: u8) -> Value {
 }
 
 fn b_call_kw(vm: &mut VM, argc: u8) -> Value {
+    note_call_line(vm);
     let mut args = pop_n(vm, argc as usize);
     let kwd = args.pop().unwrap();
     let name = sval(&args.remove(0));
@@ -1103,6 +1118,7 @@ fn call_method_fused(
     args: Vec<Value>,
     kwargs: Vec<(String, Value)>,
 ) -> Value {
+    note_call_line(vm);
     let user_lookup = with_host(|h| {
         matches!(
             h.get(recv),
@@ -1248,6 +1264,7 @@ fn loaded_head(args: &mut Vec<Value>) -> (Value, Value, Value) {
 }
 
 fn b_call_loaded(vm: &mut VM, argc: u8) -> Value {
+    note_call_line(vm);
     let mut args = pop_n(vm, argc as usize);
     let (self_slot, name, callee) = loaded_head(&mut args);
     let r = call_loaded(&self_slot, &sref(&name), &callee, args, vec![]);
@@ -1255,6 +1272,7 @@ fn b_call_loaded(vm: &mut VM, argc: u8) -> Value {
 }
 
 fn b_call_loaded_kw(vm: &mut VM, argc: u8) -> Value {
+    note_call_line(vm);
     let mut args = pop_n(vm, argc as usize);
     let kwd = args.pop().unwrap();
     let (self_slot, name, callee) = loaded_head(&mut args);
@@ -1263,6 +1281,7 @@ fn b_call_loaded_kw(vm: &mut VM, argc: u8) -> Value {
 }
 
 fn b_call_value(vm: &mut VM, argc: u8) -> Value {
+    note_call_line(vm);
     let mut args = pop_n(vm, argc as usize);
     let callable = args.remove(0);
     let r = host::invoke(&callable, args, vec![]);
@@ -1270,6 +1289,7 @@ fn b_call_value(vm: &mut VM, argc: u8) -> Value {
 }
 
 fn b_call_value_kw(vm: &mut VM, argc: u8) -> Value {
+    note_call_line(vm);
     let mut args = pop_n(vm, argc as usize);
     let kwd = args.pop().unwrap();
     let callable = args.remove(0);
@@ -1331,6 +1351,7 @@ fn list_args(v: &Value) -> Vec<Value> {
 }
 
 fn b_call_ex(vm: &mut VM, _: u8) -> Value {
+    note_call_line(vm);
     let kwd = vm.pop();
     let argl = vm.pop();
     let name = sval(&vm.pop());
@@ -1342,6 +1363,7 @@ fn b_call_ex(vm: &mut VM, _: u8) -> Value {
 }
 
 fn b_call_value_ex(vm: &mut VM, _: u8) -> Value {
+    note_call_line(vm);
     let kwd = vm.pop();
     let argl = vm.pop();
     let callable = vm.pop();
@@ -1353,6 +1375,7 @@ fn b_call_value_ex(vm: &mut VM, _: u8) -> Value {
 }
 
 fn b_call_loaded_ex(vm: &mut VM, _: u8) -> Value {
+    note_call_line(vm);
     let kwd = vm.pop();
     let argl = vm.pop();
     let callee = vm.pop();
@@ -3999,8 +4022,8 @@ fn run_star_handlers(td: &host::TryDef, exc: &Value, entry_exc: &Option<Value>) 
                         Value::Obj(id) => h.exc_tb.get(&id).and_then(|tb| tb.last()).cloned(),
                         _ => None,
                     };
-                    if let Some((_, line, span)) = own {
-                        h.set_cur_line_span(line, span);
+                    if let Some(host::TbEntry::Frame(f)) = own {
+                        h.set_cur_line_span(f.line, f.span);
                     }
                 } else if let Value::Obj(id) = result {
                     // A freshly built group is created after the handler returns,

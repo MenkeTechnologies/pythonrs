@@ -2104,12 +2104,50 @@ pub struct Frame {
     /// a class name for a class body). `Rc` for the same reason as `owner` — this
     /// used to be two `String` allocations on every single Python call.
     pub name: Rc<str>,
-    /// Source line currently executing in this frame — updated by the DAP debug
-    /// line hook (`--dap`) and by the error path when an exception aborts a chunk.
+    /// Source line currently executing in this frame — updated by every call the
+    /// frame makes (so a callee that walks its callers, `warnings.warn`'s
+    /// `stacklevel`, reads where each one is), by the DAP debug line hook
+    /// (`--dap`), and by the error path when an exception aborts a chunk.
     pub line: u32,
     /// Source span of the op that aborted this frame — set alongside `line` by
     /// the error path, used to draw the traceback caret. `Span::NONE` otherwise.
     pub span: Span,
+    /// The module whose code this frame runs (its globals slot): names the
+    /// file a traceback shows for the frame and the module CPython sees it in.
+    pub module: usize,
+}
+
+/// One pythonrs frame an exception passed through: the scope name, the line
+/// and caret span it was executing, and the module whose file holds it.
+#[derive(Clone, Debug)]
+pub struct TbFrame {
+    pub name: Rc<str>,
+    pub line: u32,
+    pub span: Span,
+    pub module: usize,
+}
+
+impl TbFrame {
+    fn of(f: &Frame) -> TbFrame {
+        TbFrame {
+            name: f.name.clone(),
+            line: f.line,
+            span: f.span,
+            module: f.module,
+        }
+    }
+}
+
+/// One entry of an exception's traceback (`__traceback__`), outermost first
+/// once captured.
+#[derive(Clone, Debug)]
+pub enum TbEntry {
+    /// A pythonrs frame.
+    Frame(TbFrame),
+    /// The frames the exception passed through inside CPython, between two
+    /// pythonrs frames or below the innermost one: the ffi handle of a CPython
+    /// traceback chain holding exactly those frames.
+    CPython(u32),
 }
 
 /// Why a call's `**mapping` merge failed — held in `pending_kw_dup` until the
@@ -2262,7 +2300,7 @@ pub struct PyHost {
     /// heap index: the outermost-first `(scope, line)` stack captured when the
     /// exception is caught. Used to render `__cause__`/`__context__` chain blocks
     /// in an uncaught traceback (the final exception uses the live `traceback`).
-    pub exc_tb: HashMap<u32, Vec<(String, u32, Span)>>,
+    pub exc_tb: HashMap<u32, Vec<TbEntry>>,
     /// For every exception group carved out of another by `split`/`subgroup`/
     /// `derive`: the heap id of the ROOT group it came from. `except*` reads it
     /// to tell a piece of the caught group that a handler re-raised (which is
@@ -2352,8 +2390,9 @@ pub struct PyHost {
     /// false for stdin — CPython cannot retrieve stdin source).
     pub tb_show_source: bool,
     /// Frames captured (innermost first) as an exception unwinds the call stack,
-    /// each `(scope_name, line, span)`. Cleared when the exception is caught.
-    pub traceback: Vec<(String, u32, Span)>,
+    /// each a pythonrs frame or the CPython frames between two of them. Cleared
+    /// when the exception is caught.
+    pub traceback: Vec<TbEntry>,
     /// The current `sys.stdout` / `sys.stderr` targets when reassigned away from
     /// the native streams (`sys.stdout = io.StringIO()`,
     /// `contextlib.redirect_stdout`). `None` = the native stream. Tracked on the
@@ -2915,15 +2954,22 @@ impl Default for PyHost {
 /// `<comp>` function, but CPython 3.12+ inlines it (PEP 709): there is no frame
 /// for it, and the failing line and caret inside it belong to the enclosing
 /// frame. The caller keeps its name and takes the comprehension's position.
-fn inline_comprehension_frames(frames: &mut Vec<(String, u32, Span)>) {
+fn inline_comprehension_frames(frames: &mut Vec<TbEntry>) {
     let mut i = 1;
     while i < frames.len() {
-        if frames[i].0 == "<comp>" {
-            let (_, line, span) = frames.remove(i);
-            frames[i - 1].1 = line;
-            frames[i - 1].2 = span;
-        } else {
-            i += 1;
+        let comp = match (&frames[i - 1], &frames[i]) {
+            (TbEntry::Frame(_), TbEntry::Frame(f)) if &*f.name == "<comp>" => Some((f.line, f.span)),
+            _ => None,
+        };
+        match comp {
+            Some((line, span)) => {
+                frames.remove(i);
+                if let TbEntry::Frame(caller) = &mut frames[i - 1] {
+                    caller.line = line;
+                    caller.span = span;
+                }
+            }
+            None => i += 1,
         }
     }
 }
@@ -2956,6 +3002,7 @@ impl PyHost {
                 name: Rc::from("<module>"),
                 line: 0,
                 span: Span::NONE,
+                module: 0,
             }],
             error: None,
             exc: None,
@@ -3933,7 +3980,8 @@ impl PyHost {
     pub fn frame_depth(&self) -> usize {
         self.frames.len()
     }
-    /// Record the source line the innermost frame is executing (DAP line hook).
+    /// Record the source line the innermost frame is executing (a call it makes,
+    /// the DAP line hook).
     pub fn set_cur_line(&mut self, line: u32) {
         if let Some(f) = self.frames.last_mut() {
             f.line = line;
@@ -3953,7 +4001,7 @@ impl PyHost {
     /// popped.
     pub fn push_tb_frame(&mut self) {
         if let Some(f) = self.frames.last() {
-            self.traceback.push((f.name.to_string(), f.line, f.span));
+            self.traceback.push(TbEntry::Frame(TbFrame::of(f)));
         }
     }
     /// Snapshot `exc`'s traceback (outermost-first) into `exc_tb`, just before the
@@ -3965,10 +4013,10 @@ impl PyHost {
     /// exception's frames when it appears as a `__cause__`/`__context__`.
     pub fn capture_exc_tb(&mut self, exc: &Value) {
         let Value::Obj(id) = exc else { return };
-        let mut tb: Vec<(String, u32, Span)> = Vec::new();
+        let mut tb: Vec<TbEntry> = Vec::new();
         if let Some(f) = self.frames.last() {
             if !self.tb_starts_empty.contains(id) {
-                tb.push((f.name.to_string(), f.line, f.span));
+                tb.push(TbEntry::Frame(TbFrame::of(f)));
             }
         }
         for f in self.traceback.iter().rev() {
@@ -12700,7 +12748,10 @@ impl PyHost {
                             .get(id)
                             .map(|fs| {
                                 fs.iter()
-                                    .map(|(s, l, _)| (s.clone(), *l))
+                                    .filter_map(|e| match e {
+                                        TbEntry::Frame(f) => Some((f.name.to_string(), f.line)),
+                                        TbEntry::CPython(_) => None,
+                                    })
                                     .collect::<Vec<_>>()
                             })
                             .unwrap_or_default(),
@@ -17127,6 +17178,7 @@ pub fn run_user_func(
             name: frame_name,
             line: 0,
             span: Span::NONE,
+            module: fv.module,
         });
         saved
     });
@@ -17764,6 +17816,7 @@ fn run_class_body(name: &str, body_func: &Value) -> Result<NameMap, String> {
             name: Rc::from(name),
             line: 0,
             span: Span::NONE,
+            module: fv.module,
         });
         saved
     });
@@ -18383,9 +18436,9 @@ impl PyHost {
         // The final (uncaught) exception's frames: the module frame still on the
         // stack, then the function frames it unwound past (innermost-first),
         // reversed to outermost-first.
-        let mut final_frames: Vec<(String, u32, Span)> = Vec::new();
+        let mut final_frames: Vec<TbEntry> = Vec::new();
         if let Some(f) = self.frames.first() {
-            final_frames.push((f.name.to_string(), f.line, f.span));
+            final_frames.push(TbEntry::Frame(TbFrame::of(f)));
         }
         for f in self.traceback.iter().rev() {
             final_frames.push(f.clone());
@@ -18511,7 +18564,7 @@ impl PyHost {
     }
 
     /// The traceback frames captured for an already-caught exception.
-    fn frames_of(&self, exc: &Value) -> Vec<(String, u32, Span)> {
+    fn frames_of(&self, exc: &Value) -> Vec<TbEntry> {
         match exc {
             Value::Obj(id) => self.exc_tb.get(id).cloned().unwrap_or_default(),
             _ => Vec::new(),
@@ -18532,7 +18585,7 @@ impl PyHost {
     fn render_exc_block(
         &self,
         exc: Option<&Value>,
-        frames: &[(String, u32, Span)],
+        frames: &[TbEntry],
         cpython: Option<u32>,
         final_line: &str,
         ctx: &mut GroupCtx,
@@ -18631,30 +18684,68 @@ impl PyHost {
 
     /// The `File "…", line N, in scope` lines (plus source and carets) for
     /// `frames`, outermost-first — CPython's `StackSummary.format`.
-    fn render_frames(&self, frames: &[(String, u32, Span)]) -> String {
+    fn render_frames(&self, frames: &[TbEntry]) -> String {
         let mut out = String::new();
-        let src_lines: Vec<&str> = self.prog_source.lines().collect();
-        for (name, line, span) in frames {
+        for entry in frames {
+            let f = match entry {
+                TbEntry::Frame(f) => f,
+                TbEntry::CPython(_handle) => {
+                    #[cfg(feature = "stdlib-ffi")]
+                    out.push_str(&crate::ffi::traceback_segment_text(*_handle).unwrap_or_default());
+                    continue;
+                }
+            };
             out.push_str(&format!(
                 "  File \"{}\", line {}, in {}\n",
-                self.tb_filename, line, name
+                self.module_filename(f.module),
+                f.line,
+                f.name
             ));
-            if self.tb_show_source && *line > 0 {
-                if let Some(text) = src_lines.get((*line as usize).saturating_sub(1)) {
-                    let stripped = text.trim();
-                    if !stripped.is_empty() {
-                        out.push_str(&format!("    {stripped}\n"));
-                        if span.line == *line {
-                            if let Some(carets) = caret_line(text, *span) {
-                                out.push_str(&carets);
-                                out.push('\n');
-                            }
+            let text = self.source_line(f.module, f.line);
+            if let Some(text) = text.as_deref() {
+                let stripped = text.trim();
+                if !stripped.is_empty() {
+                    out.push_str(&format!("    {stripped}\n"));
+                    if f.span.line == f.line {
+                        if let Some(carets) = caret_line(text, f.span) {
+                            out.push_str(&carets);
+                            out.push('\n');
                         }
                     }
                 }
             }
         }
         out
+    }
+
+    /// The file a traceback names for a frame of `module`: the program's own
+    /// (`<string>`, `<stdin>` or its path) for `__main__`, a module's
+    /// `__file__` otherwise. A slot with no `__file__` — code `exec` runs in a
+    /// namespace of its own — is shown under the program's name.
+    pub fn module_filename(&self, module: usize) -> String {
+        self.module_file(module).unwrap_or_else(|| self.tb_filename.clone())
+    }
+
+    /// `__file__` of a module other than `__main__`.
+    fn module_file(&self, module: usize) -> Option<String> {
+        if module == 0 {
+            return None;
+        }
+        let file = self.module_globals.get(module)?.get("__file__")?;
+        self.as_str(file)
+    }
+
+    /// Line `line` of the source a frame of `module` runs, as a traceback
+    /// shows it: the program's source (unless it came from stdin, which
+    /// CPython cannot read back), or the module's file read as `linecache`
+    /// reads it — at the time of rendering.
+    pub fn source_line(&self, module: usize, line: u32) -> Option<String> {
+        let idx = (line as usize).checked_sub(1)?;
+        match self.module_file(module) {
+            Some(path) => std::fs::read_to_string(path).ok()?.lines().nth(idx).map(str::to_string),
+            None if self.tb_show_source => self.prog_source.lines().nth(idx).map(str::to_string),
+            None => None,
+        }
     }
 
     /// The ffi handle of the CPython exception `v` is paired with, when CPython
@@ -19033,6 +19124,9 @@ fn make_gen_kind(
         }),
         line: 0,
         span: Span::NONE,
+        // The generator body runs in the module the function was defined in,
+        // which is the current one while it is built.
+        module: with_host(|h| h.cur_module()),
     };
     let id = with_host(|h| {
         let id = h.generators.len() as u32;
@@ -19381,7 +19475,7 @@ fn is_stop_iteration_abort(e: &str) -> bool {
 /// generator raised StopIteration`, chained from it. `stop_tb` is the
 /// `StopIteration`'s own traceback (the generator's frames, outermost-first);
 /// the `RuntimeError` starts at the resumer, as in CPython.
-fn pep479_replace(e: String, stop_tb: Option<Vec<(String, u32, Span)>>) -> String {
+fn pep479_replace(e: String, stop_tb: Option<Vec<TbEntry>>) -> String {
     if !is_stop_iteration_abort(&e) {
         return e;
     }
@@ -19454,9 +19548,9 @@ pub fn gen_resume(gen: &Value, send: Value) -> Result<Option<Value>, String> {
     if let corosensei::CoroutineResult::Return(Err(e)) = &out {
         with_host(|h| {
             if is_stop_iteration_abort(e) {
-                let mut tb: Vec<(String, u32, Span)> = Vec::new();
+                let mut tb: Vec<TbEntry> = Vec::new();
                 if let Some(f) = h.frames.last() {
-                    tb.push((f.name.to_string(), f.line, f.span));
+                    tb.push(TbEntry::Frame(TbFrame::of(f)));
                 }
                 tb.extend(h.traceback.drain(..).rev());
                 stop_tb = Some(tb);
@@ -22076,8 +22170,12 @@ fn run_vendored_module(name: &str, src: &str, path: &std::path::Path) -> Result<
         ns.insert("__doc__".to_string(), Value::Undef);
         let mid = h.new_module_slot(ns);
         let saved = h.swap_module(mid);
-        (mid, saved)
+        // The body runs on the module frame, which is this module's while it
+        // does (a traceback through it names this module's file).
+        let saved_frame_module = std::mem::replace(&mut h.frames[0].module, mid);
+        (mid, (saved, saved_frame_module))
     });
+    let (saved_mod, saved_frame_module) = saved_mod;
 
     // Create the module object and cache it NOW — before running the body — so a
     // circular import during the body (os <-> posixpath) resolves to this same,
@@ -22101,7 +22199,14 @@ fn run_vendored_module(name: &str, src: &str, path: &std::path::Path) -> Result<
     })();
 
     with_host(|h| {
+        // An error leaving the body unwinds through the module's own frame,
+        // which CPython lists below the `import` line (the importlib frames
+        // between them are removed from an import's traceback).
+        if run.is_err() {
+            h.push_tb_frame();
+        }
         h.swap_module(saved_mod);
+        h.frames[0].module = saved_frame_module;
         h.restore_scope(parked);
         if run.is_ok() {
             // Nothing to copy: the module object points AT slot `mid`, so every

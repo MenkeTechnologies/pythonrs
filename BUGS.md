@@ -9,6 +9,19 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **A traceback frame names its own module's file.** Every frame was shown
+  under the main script's name with the main script's line at that number,
+  so an error in an imported module's function read `File "main.py", line 2,
+  in boom` over an unrelated line, and a module body failing during `import`
+  was not listed at all. A frame now records the module it runs in
+  (`Frame::module`, carried into the traceback as `TbFrame`), the file is that
+  module's `__file__` and its line is read from the file when the traceback
+  is rendered (as `linecache` does); a body that fails under `import` is
+  listed below the `import` line, as CPython lists it once importlib's frames
+  are removed. A traceback entry can also be a run of CPython frames
+  (`TbEntry::CPython`), and every call records its line in the calling
+  frame, so a frame below the innermost knows where it is without an error
+  (measured on a call-heavy debug-build loop: 0.7% more instructions).
 - **The `SyntaxError` keyword hint sees the names inside f-strings.**
   `_find_keyword_typos` walks `tokenize`'s NAME tokens, which since 3.12
   include the names in an f-/t-string's replacement fields; pythonrs's lexer

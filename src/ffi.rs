@@ -3035,6 +3035,22 @@ pub fn traceback_text(handle: u32) -> Option<String> {
     })
 }
 
+/// CPython's rendering (`traceback.format_tb`) of the traceback chain at ffi
+/// handle `handle` — the CPython frames an exception passed through between
+/// two pythonrs frames (see [`crate::host::TbEntry::CPython`]).
+pub fn traceback_segment_text(handle: u32) -> Option<String> {
+    Python::with_gil(|py| {
+        let tb = fetch(py, handle).ok()?;
+        let lines = py
+            .import("traceback")
+            .and_then(|m| m.getattr("format_tb"))
+            .and_then(|f| f.call1((tb,)))
+            .ok()?;
+        let lines: Vec<String> = lines.extract().ok()?;
+        Some(lines.concat())
+    })
+}
+
 /// The name a traceback's last line gives the type of the CPython exception at
 /// ffi handle `handle`: `module.qualname`, without a `builtins` or `__main__`
 /// module (`traceback.TracebackException.format_exception_only`).
