@@ -528,7 +528,7 @@ fn yield_in(e: &Expr, kind: &str) -> Result<(), String> {
             if !sp.is_some() {
                 return Err(msg);
             }
-            Err(symtable_error(&msg, (sp.line, sp.start + 1, sp.line, sp.end + 1)))
+            Err(symtable_error(&msg, (sp.line, sp.start + 1, sp.end_line, sp.end + 1)))
         }
         Expr::Lambda { .. } => Ok(()),
         inner @ (Expr::ListComp(..) | Expr::SetComp(..) | Expr::GenExp(..) | Expr::DictComp(..)) => {

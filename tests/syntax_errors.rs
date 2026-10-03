@@ -1200,3 +1200,160 @@ star caught both
 "#
     );
 }
+
+/// The symbol table's comprehension errors, positioned at the node as
+/// CPython's symbol table positions them (`args == (msg,)`): an assignment
+/// expression in an iterable (at the `:=` expression), one rebinding an
+/// iteration variable or used in a class body's comprehension (at its target),
+/// a later clause iterating over a name an earlier condition assigned (at
+/// that clause's target), and an asynchronous comprehension outside an async
+/// function (at the outermost comprehension of the nearest non-comprehension
+/// scope, a span that may cover several lines, as a misplaced `yield` may).
+/// An `await` in a generator expression makes it an asynchronous generator
+/// expression, legal anywhere.
+#[test]
+fn symbol_table_comprehension_errors_are_positioned_at_the_node() {
+    let out = Command::new(env!("CARGO_BIN_EXE_python"))
+        .args([
+            "-c",
+            r##"cases = [
+ '[i := 0 for i, j in x]',
+ '[j for i in x if (j := 1) for j in y]',
+ '[(j := 1) for i in x for j in y]',
+ 'class C:\n  [(z := 1) for x in y]',
+ 'class C:\n  [(x := 1) for x in y]',
+ 'def f():\n class C:\n  [(z:=1) for x in y]',
+ 'class C:\n  [lambda: (z := 1) for x in y]',
+ 'class C:\n  [x for x in (z := y)]',
+ 'class C:\n  [[(z := 1) for a in b] for x in y]',
+ '[x for x in y if [(x := 1) for q in r]]',
+ '[x for x in [(a := 1) for q in r]]',
+ '[(a, b) for a in [1] for b in (lambda: (c := 2))()]',
+ 'x = [y for y in z for w in (q := 1)]',
+ '{(k := 1): 2 for k in y}',
+ '[x for x in y if (x\n := 1)]',
+ '[[await y for y in z] for w in v]',
+ 'def f():\n  return [[await y for y in z] for w in v]',
+ 'def f():\n  return [x for x in [await y for y in z]]',
+ 'def f():\n  return (await y for y in z)',
+ 'def f():\n  return [(await y for y in z) for q in r]',
+ 'def f():\n  return [x for x in (await y for y in z)]',
+ 'def f():\n  return {a: b async for a in c}',
+ 'def f():\n  return {a async for a in c}',
+ 'def f():\n  return [a async for a in c\n   if 1]',
+ 'class C:\n  [await a for a in b]',
+ '[x async for x in y]',
+ 'async def f():\n  def g():\n    [x async for x in y]',
+ 'async def f():\n  [[x async for x in y] for z in w]',
+ 'async def f():\n  lambda: [x async for x in y]',
+ "def f():\n  (yield\n   1)\nclass C:\n  x = (yield\n 1)",
+]
+for s in cases:
+    try:
+        compile(s, '<s>', 'exec')
+        print('ok', repr(s))
+    except SyntaxError as e:
+        print(repr(s), e.args[0], len(e.args), e.lineno, e.offset, e.end_lineno, e.end_offset)
+"##,
+        ])
+        .output()
+        .expect("spawn python");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        r##"'[i := 0 for i, j in x]' assignment expression cannot rebind comprehension iteration variable 'i' 1 1 2 1 3
+'[j for i in x if (j := 1) for j in y]' comprehension inner loop cannot rebind assignment expression target 'j' 1 1 31 1 32
+'[(j := 1) for i in x for j in y]' assignment expression cannot rebind comprehension iteration variable 'j' 1 1 3 1 4
+'class C:\n  [(z := 1) for x in y]' assignment expression within a comprehension cannot be used in a class body 1 2 5 2 6
+'class C:\n  [(x := 1) for x in y]' assignment expression cannot rebind comprehension iteration variable 'x' 1 2 5 2 6
+'def f():\n class C:\n  [(z:=1) for x in y]' assignment expression within a comprehension cannot be used in a class body 1 3 5 3 6
+ok 'class C:\n  [lambda: (z := 1) for x in y]'
+'class C:\n  [x for x in (z := y)]' assignment expression cannot be used in a comprehension iterable expression 1 2 16 2 22
+'class C:\n  [[(z := 1) for a in b] for x in y]' assignment expression within a comprehension cannot be used in a class body 1 2 6 2 7
+'[x for x in y if [(x := 1) for q in r]]' assignment expression cannot rebind comprehension iteration variable 'x' 1 1 20 1 21
+'[x for x in [(a := 1) for q in r]]' assignment expression cannot be used in a comprehension iterable expression 1 1 15 1 21
+'[(a, b) for a in [1] for b in (lambda: (c := 2))()]' assignment expression cannot be used in a comprehension iterable expression 1 1 41 1 47
+'x = [y for y in z for w in (q := 1)]' assignment expression cannot be used in a comprehension iterable expression 1 1 29 1 35
+'{(k := 1): 2 for k in y}' assignment expression cannot rebind comprehension iteration variable 'k' 1 1 3 1 4
+'[x for x in y if (x\n := 1)]' assignment expression cannot rebind comprehension iteration variable 'x' 1 1 19 1 20
+'[[await y for y in z] for w in v]' asynchronous comprehension outside of an asynchronous function 1 1 1 1 34
+'def f():\n  return [[await y for y in z] for w in v]' asynchronous comprehension outside of an asynchronous function 1 2 10 2 43
+'def f():\n  return [x for x in [await y for y in z]]' asynchronous comprehension outside of an asynchronous function 1 2 22 2 42
+ok 'def f():\n  return (await y for y in z)'
+ok 'def f():\n  return [(await y for y in z) for q in r]'
+ok 'def f():\n  return [x for x in (await y for y in z)]'
+'def f():\n  return {a: b async for a in c}' asynchronous comprehension outside of an asynchronous function 1 2 10 2 33
+'def f():\n  return {a async for a in c}' asynchronous comprehension outside of an asynchronous function 1 2 10 2 30
+'def f():\n  return [a async for a in c\n   if 1]' asynchronous comprehension outside of an asynchronous function 1 2 10 3 9
+'class C:\n  [await a for a in b]' asynchronous comprehension outside of an asynchronous function 1 2 3 2 23
+'[x async for x in y]' asynchronous comprehension outside of an asynchronous function 1 1 1 1 21
+'async def f():\n  def g():\n    [x async for x in y]' asynchronous comprehension outside of an asynchronous function 1 3 5 3 25
+ok 'async def f():\n  [[x async for x in y] for z in w]'
+'async def f():\n  lambda: [x async for x in y]' asynchronous comprehension outside of an asynchronous function 1 2 11 2 31
+'def f():\n  (yield\n   1)\nclass C:\n  x = (yield\n 1)' 'yield' outside function 2 5 8 6 3
+"##
+    );
+}
+
+/// `except*` errors: a clause with no type and a `try` mixing `except` with
+/// `except*` are the parser's (`invalid_except_star_stmt_indent`,
+/// `invalid_try_stmt`), with the source line; a `break`/`continue`/`return`
+/// leaving an `except*` body is the compiler's, at the statement. Uncaught
+/// from `exec`, such an error renders the inner `File "<string>"` block.
+#[test]
+fn except_star_errors_are_positioned() {
+    let out = Command::new(env!("CARGO_BIN_EXE_python"))
+        .args([
+            "-c",
+            r##"cases = [
+ 'try:\n  pass\nexcept* ValueError:\n  pass\nexcept TypeError:\n  pass',
+ 'try:\n  pass\nexcept ValueError:\n  pass\nexcept* TypeError:\n  pass',
+ 'try:\n  pass\nexcept:\n  pass\nexcept *TypeError as e:\n  pass',
+ 'try:\n  pass\nexcept*:\n  pass',
+ 'try:\n  pass\nexcept*\n  pass',
+ 'try:\n  pass\nexcept* A:\n  pass\nexcept* :\n  pass',
+ 'try:\n  pass\nexcept ValueError:\n  pass\nexcept* :\n  pass',
+ 'for x in y:\n  try:\n    pass\n  except* E:\n    break',
+ 'for x in y:\n  try:\n    pass\n  except* E:\n    if x:\n      continue',
+ 'def f():\n  try:\n    pass\n  except* E:\n    for q in r:\n      return ("é", 1)',
+ 'def f():\n  try:\n    pass\n  except* E:\n    for q in r:\n      break\n    def g():\n      return 1',
+]
+for s in cases:
+    try:
+        compile(s, '<s>', 'exec')
+        print('ok', repr(s))
+    except SyntaxError as e:
+        print(repr(s), e.args, e.lineno, e.offset, e.end_lineno, e.end_offset)
+"##,
+        ])
+        .output()
+        .expect("spawn python");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        r##"'try:\n  pass\nexcept* ValueError:\n  pass\nexcept TypeError:\n  pass' ("cannot have both 'except' and 'except*' on the same 'try'", ('<s>', 5, 1, 'except TypeError:\n', 5, 7)) 5 1 5 7
+'try:\n  pass\nexcept ValueError:\n  pass\nexcept* TypeError:\n  pass' ("cannot have both 'except' and 'except*' on the same 'try'", ('<s>', 5, 1, 'except* TypeError:\n', 5, 8)) 5 1 5 8
+'try:\n  pass\nexcept:\n  pass\nexcept *TypeError as e:\n  pass' ("cannot have both 'except' and 'except*' on the same 'try'", ('<s>', 5, 1, 'except *TypeError as e:\n', 5, 9)) 5 1 5 9
+'try:\n  pass\nexcept*:\n  pass' ('expected one or more exception types', ('<s>', 3, 8, 'except*:\n', 3, 9)) 3 8 3 9
+'try:\n  pass\nexcept*\n  pass' ('expected one or more exception types', ('<s>', 3, 8, 'except*\n', 3, 9)) 3 8 3 9
+'try:\n  pass\nexcept* A:\n  pass\nexcept* :\n  pass' ('expected one or more exception types', ('<s>', 5, 9, 'except* :\n', 5, 10)) 5 9 5 10
+'try:\n  pass\nexcept ValueError:\n  pass\nexcept* :\n  pass' ('invalid syntax', ('<s>', 5, 7, 'except* :\n', 5, 8)) 5 7 5 8
+'for x in y:\n  try:\n    pass\n  except* E:\n    break' ("'break', 'continue' and 'return' cannot appear in an except* block", ('<s>', 5, 5, None, 5, 10)) 5 5 5 10
+'for x in y:\n  try:\n    pass\n  except* E:\n    if x:\n      continue' ("'break', 'continue' and 'return' cannot appear in an except* block", ('<s>', 6, 7, None, 6, 15)) 6 7 6 15
+'def f():\n  try:\n    pass\n  except* E:\n    for q in r:\n      return ("é", 1)' ("'break', 'continue' and 'return' cannot appear in an except* block", ('<s>', 6, 7, None, 6, 23)) 6 7 6 23
+ok 'def f():\n  try:\n    pass\n  except* E:\n    for q in r:\n      break\n    def g():\n      return 1'
+"##
+    );
+    assert_eq!(
+        run_c("exec('for x in y:\\n  try:\\n    pass\\n  except* E:\\n    break')"),
+        (
+            r#"Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+    exec('for x in y:\n  try:\n    pass\n  except* E:\n    break')
+    ~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<string>", line 5
+SyntaxError: 'break', 'continue' and 'return' cannot appear in an except* block
+"#
+            .to_string(),
+            1
+        )
+    );
+}

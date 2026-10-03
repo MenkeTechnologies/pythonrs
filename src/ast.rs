@@ -102,6 +102,10 @@ pub struct Keyword {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Span {
     pub line: u32,
+    /// The line the node ends on: `line` for every caret span. Only the
+    /// spans that locate a compile-time error (a misplaced `yield`/`await`,
+    /// a comprehension, an assignment expression) may run past `line`.
+    pub end_line: u32,
     pub start: u32,
     pub end: u32,
     pub anchor_start: u32,
@@ -114,6 +118,7 @@ pub struct Span {
 impl Span {
     pub const NONE: Span = Span {
         line: 0,
+        end_line: 0,
         start: 0,
         end: 0,
         anchor_start: 0,
@@ -122,6 +127,10 @@ impl Span {
     };
     pub fn is_some(&self) -> bool {
         self.line != 0
+    }
+    /// A span within one line, which is what a traceback caret can draw.
+    pub fn is_one_line(&self) -> bool {
+        self.end_line == self.line
     }
     pub fn has_anchor(&self) -> bool {
         self.anchor_end > self.anchor_start
@@ -482,9 +491,10 @@ pub struct Stmt {
     pub kind: StmtKind,
     pub line: u32,
     /// The statement's extent as a `SyntaxError` reports it — `(lineno,
-    /// offset, end_lineno, end_offset)`, 1-based with an exclusive end. Recorded
-    /// only for `global` / `nonlocal`, the statements CPython's symbol table
-    /// points its declaration errors at (see `symtable.rs`).
+    /// offset, end_lineno, end_offset)`, 1-based with an exclusive end, in
+    /// characters. Recorded only for the statements CPython's symbol table or
+    /// compiler points an error at: `global` / `nonlocal` (see `symtable.rs`)
+    /// and `break` / `continue` / `return` (an escape from an `except*` block).
     pub span: Option<(u32, u32, u32, u32)>,
 }
 

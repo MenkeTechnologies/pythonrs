@@ -10262,3 +10262,17 @@ x = (list(filter(None, [F(), 1])), list(filter(lambda v: v, [F()])),
         "([1], [], ['F'], [2], [], [1, 2], \"KeyError('boom')\")"
     );
 }
+
+#[test]
+fn asynchronous_generator_expressions() {
+    // An `async for` or an `await` in a generator expression makes it an
+    // asynchronous generator expression: calling it builds an async generator
+    // (not awaited), and it is legal inside a plain `def` too.
+    assert_eq!(
+        g(
+            "import asyncio\nasync def ag():\n    for i in range(3):\n        yield i\nasync def one(v):\n    return v\ndef plain():\n    return (await one(y) for y in range(2))\nasync def main():\n    g1 = (x * 2 async for x in ag())\n    g2 = (await one(x) for x in range(3))\n    return (type(g1).__name__, [x async for x in g1], [x async for x in g2], [x async for x in plain()])\nr = asyncio.run(main())",
+            "r"
+        ),
+        "('async_generator', [0, 2, 4], [0, 1, 2], [0, 1])"
+    );
+}

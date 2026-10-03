@@ -183,6 +183,10 @@ pub struct Compiler {
     /// there is reported as an asynchronous *comprehension* outside an async
     /// function, which is the message CPython uses.
     in_comprehension: bool,
+    /// The extent of the outermost list/set/dict comprehension being lowered
+    /// in the nearest non-comprehension scope, where CPython's symbol table
+    /// reports an asynchronous comprehension outside an async function.
+    comp_span: Span,
     /// The source span of the caret-bearing expression currently being lowered,
     /// peeled from its `Expr::Spanned` wrapper. Recorded against the raising op's
     /// index so an uncaught exception can underline the exact sub-expression
@@ -2240,23 +2244,14 @@ impl Compiler {
     /// text); the symbol table raises the `await` forms (`symtable`: `args ==
     /// (msg,)`).
     fn misplaced(msg: &str, symtable: bool, sp: Span) -> String {
-        let msg = format!("SyntaxError: {msg}");
         if !sp.is_some() {
-            return msg;
+            return format!("SyntaxError: {msg}");
         }
-        let pos = (sp.line, sp.start + 1, sp.line, sp.end + 1);
+        let pos = (sp.line, sp.start + 1, sp.end_line, sp.end + 1);
         if symtable {
-            return crate::symtable::symtable_error(&msg, pos);
+            return crate::symtable::symtable_error(&format!("SyntaxError: {msg}"), pos);
         }
-        // `sp` is in characters; the compile entry turns it into the byte
-        // columns `_PyCompile_Error` reports (`parser::with_byte_columns`).
-        let (l, c, el, ec) = pos;
-        format!(
-            "{}{}nosrc=1{}",
-            crate::parser::at_pos(&msg, l, c as i64, el, ec as i64),
-            crate::parser::SYNTAX_FIELD,
-            crate::parser::CHAR_COLUMNS
-        )
+        compiler_error(msg, Some(pos))
     }
 
     /// Validate a `nonlocal name` declaration at compile time, mirroring CPython:
@@ -2818,6 +2813,23 @@ impl Compiler {
                 self.suspend_span = *sp;
                 return self.compile_expr(b, inner);
             }
+            // An assignment expression's or a comprehension's span locates
+            // the symbol table's errors only; neither is a raising op's caret.
+            match inner.unspanned() {
+                Expr::NamedExpr(..) => return self.compile_expr(b, inner),
+                Expr::ListComp(..) | Expr::SetComp(..) | Expr::DictComp(..) => {
+                    // An asynchronous comprehension is blamed on the outermost
+                    // comprehension of the nearest non-comprehension scope.
+                    if self.in_comprehension {
+                        return self.compile_expr(b, inner);
+                    }
+                    let prev = std::mem::replace(&mut self.comp_span, *sp);
+                    let r = self.compile_expr(b, inner);
+                    self.comp_span = prev;
+                    return r;
+                }
+                _ => {}
+            }
             let mut sp = *sp;
             if std::mem::take(&mut self.suppress_hint)
                 && matches!(inner.unspanned(), Expr::Call { .. })
@@ -3098,19 +3110,19 @@ impl Compiler {
                 self.emit_make_func(b, def_id, params)?;
             }
             Expr::ListComp(elt, comps) => {
-                check_comprehension_walrus(&[elt], comps, &[])?;
+                check_comprehension_walrus(&[elt], comps, &[], self.in_class_body)?;
                 self.compile_comprehension(b, CompKind::List, elt, None, comps)?
             }
             Expr::SetComp(elt, comps) => {
-                check_comprehension_walrus(&[elt], comps, &[])?;
+                check_comprehension_walrus(&[elt], comps, &[], self.in_class_body)?;
                 self.compile_comprehension(b, CompKind::Set, elt, None, comps)?
             }
             Expr::GenExp(elt, comps) => {
-                check_comprehension_walrus(&[elt], comps, &[])?;
+                check_comprehension_walrus(&[elt], comps, &[], self.in_class_body)?;
                 self.compile_genexp(b, elt, comps)?
             }
             Expr::DictComp(k, v, comps) => {
-                check_comprehension_walrus(&[k, v], comps, &[])?;
+                check_comprehension_walrus(&[k, v], comps, &[], self.in_class_body)?;
                 self.compile_comprehension(b, CompKind::Dict, k, Some(v), comps)?
             }
             Expr::NamedExpr(target, value) => {
@@ -3138,7 +3150,10 @@ impl Compiler {
                 // A `.throw()` / `.close()` raises AT this yield, so it carries the
                 // line and the yield's span.
                 let op = b.emit(Op::CallBuiltin(ops::YIELDV, 1), self.cur_line);
-                let prev = std::mem::replace(&mut self.node_span, sp);
+                // A caret is drawn on one line; a `yield` spanning several
+                // carries none, as before its span recorded its end line.
+                let caret = if sp.is_one_line() { sp } else { Span::NONE };
+                let prev = std::mem::replace(&mut self.node_span, caret);
                 self.record_span(op);
                 self.node_span = prev;
             }
@@ -3164,10 +3179,10 @@ impl Compiler {
                     // comprehension asynchronous, so CPython blames the
                     // comprehension rather than the `await`.
                     _ if self.in_comprehension => {
-                        return Err(
-                            "SyntaxError: asynchronous comprehension outside of an asynchronous function"
-                                .to_string(),
-                        )
+                        return Err(node_error(
+                            "SyntaxError: asynchronous comprehension outside of an asynchronous function",
+                            self.comp_span,
+                        ))
                     }
                     AwaitScope::Module => {
                         return Err(Self::misplaced("'await' outside function", true, sp))
@@ -3949,8 +3964,12 @@ impl Compiler {
         // An asynchronous comprehension (`[x async for x in ag()]` / an `await` in
         // any clause) runs the hidden function as a coroutine that the enclosing
         // (necessarily async) scope awaits.
-        let is_async = comps.iter().any(|c| c.is_async);
-        self.emit_comp_call(b, "<comp>", body, &comps[0].iter, is_async)
+        let run = if comps.iter().any(|c| c.is_async) {
+            CompRun::Awaited
+        } else {
+            CompRun::Sync
+        };
+        self.emit_comp_call(b, "<comp>", body, &comps[0].iter, run)
     }
 
     /// Build the `global`/`nonlocal` declarations for every walrus (`:=`) target
@@ -3997,7 +4016,15 @@ impl Compiler {
     ) -> Result<(), String> {
         let yield_stmt: Stmt = StmtKind::Expr(Expr::Yield(Some(Box::new(elt.clone())))).into();
         let body = wrap_comp_clauses(vec![yield_stmt], comps);
-        self.emit_comp_call(b, "<genexpr>", body, &comps[0].iter, false)
+        // An `async for` or an `await` makes it an asynchronous generator
+        // expression, legal in any scope: calling it builds an async
+        // generator, which is not awaited.
+        let run = if genexp_is_async(elt, comps) {
+            CompRun::AsyncGen
+        } else {
+            CompRun::Sync
+        };
+        self.emit_comp_call(b, "<genexpr>", body, &comps[0].iter, run)
     }
 
     /// Build the hidden comprehension/genexpr function `def name(.0): body` and
@@ -4009,18 +4036,27 @@ impl Compiler {
         name: &str,
         body: Vec<Stmt>,
         outer_iter: &Expr,
-        is_async: bool,
+        run: CompRun,
     ) -> Result<(), String> {
         let params = Params {
             names: vec![".0".into()],
             ..Params::default()
         };
+        let is_async = !matches!(run, CompRun::Sync);
+        // An asynchronous generator expression is an async scope of its own,
+        // whatever encloses it; a comprehension inherits its scope's.
+        let saved_aw = self.await_scope;
+        if matches!(run, CompRun::AsyncGen) {
+            self.await_scope = AwaitScope::Async;
+        }
         let def_id =
-            self.build_function_ex(name, &params, &body, is_async, ScopeKind::Comprehension)?;
+            self.build_function_ex(name, &params, &body, is_async, ScopeKind::Comprehension);
+        self.await_scope = saved_aw;
+        let def_id = def_id?;
         self.emit_make_func(b, def_id, &params)?; // [func]
         self.compile_iterable(b, outer_iter)?; // [func, iterable]
         b.emit(Op::CallBuiltin(ops::CALL_VALUE, 2), 0); // [result|coroutine]
-        if is_async {
+        if matches!(run, CompRun::Awaited) {
             // The hidden coroutine is awaited in the enclosing async scope.
             b.emit(Op::CallBuiltin(ops::AWAIT, 1), 0);
         }
@@ -4989,84 +5025,83 @@ fn collect_names_fstr(parts: &[FStrPart], out: &mut HashSet<String>) {
 
 // ── PEP 654: `except*` restrictions ──────────────────────────────────────────
 
-/// The three compile-time rules a `try` with `except*` clauses must satisfy:
-/// every clause names a type, `except` and `except*` may not be mixed on one
-/// `try`, and no `break`/`continue`/`return` may jump out of an `except*` body
-/// (the group has to be reconstructed after every handler has run).
+/// The compile-time rule a `try` with `except*` clauses must satisfy: no
+/// `break`/`continue`/`return` may jump out of an `except*` body (the group
+/// has to be reconstructed after every handler has run). Raised by CPython's
+/// compiler at the statement. The parser has already refused a clause with no
+/// type and a `try` mixing `except` with `except*`.
 fn check_except_star(handlers: &[ExceptHandler]) -> Result<(), String> {
-    if !handlers.iter().any(|h| h.star) {
-        return Ok(());
-    }
-    if handlers.iter().any(|h| !h.star) {
-        return Err(
-            "SyntaxError: cannot have both 'except' and 'except*' on the same 'try'".to_string(),
-        );
-    }
-    for h in handlers {
-        if h.typ.is_none() {
-            return Err("SyntaxError: expected one or more exception types".to_string());
-        }
-        if handler_escapes(&h.body) {
-            return Err(
-                "SyntaxError: 'break', 'continue' and 'return' cannot appear in an except* block"
-                    .to_string(),
-            );
+    for h in handlers.iter().filter(|h| h.star) {
+        if let Some(stmt) = escape_in(&h.body) {
+            return Err(compiler_error(
+                "'break', 'continue' and 'return' cannot appear in an except* block",
+                stmt.span,
+            ));
         }
     }
     Ok(())
 }
 
-/// Whether `body` contains a `break`/`continue`/`return` that would leave it.
-/// A loop written INSIDE the handler owns its own `break`/`continue`, and a
+/// A `SyntaxError` CPython's compiler raises (`_PyCompile_Error`): `args`
+/// carry a position tuple with no text. `pos` is the statement's character
+/// extent; the compile entry turns it into byte columns
+/// (`parser::with_byte_columns`). The bare message when there is none.
+fn compiler_error(msg: &str, pos: Option<(u32, u32, u32, u32)>) -> String {
+    let msg = format!("SyntaxError: {msg}");
+    let Some((l, c, el, ec)) = pos else {
+        return msg;
+    };
+    format!(
+        "{}{}nosrc=1{}",
+        crate::parser::at_pos(&msg, l, c as i64, el, ec as i64),
+        crate::parser::SYNTAX_FIELD,
+        crate::parser::CHAR_COLUMNS
+    )
+}
+
+/// The first `break`/`continue`/`return` in `body` that would leave it. A
+/// loop written INSIDE the handler owns its own `break`/`continue`, and a
 /// nested `def` owns its own `return`, so neither is an escape.
-fn handler_escapes(body: &[Stmt]) -> bool {
-    body.iter().any(|s| match &s.kind {
-        StmtKind::Break | StmtKind::Continue | StmtKind::Return(_) => true,
-        StmtKind::If { body, orelse, .. } => handler_escapes(body) || handler_escapes(orelse),
-        StmtKind::With { body, .. } => handler_escapes(body),
-        StmtKind::Try {
-            body,
-            handlers,
-            orelse,
-            finalbody,
-        } => {
-            handler_escapes(body)
-                || handlers.iter().any(|h| handler_escapes(&h.body))
-                || handler_escapes(orelse)
-                || handler_escapes(finalbody)
-        }
-        StmtKind::Match { cases, .. } => cases.iter().any(|c| handler_escapes(&c.body)),
+fn escape_in(body: &[Stmt]) -> Option<&Stmt> {
+    body.iter().find_map(|s| match &s.kind {
+        StmtKind::Break | StmtKind::Continue | StmtKind::Return(_) => Some(s),
         // A loop consumes `break`/`continue`; only a `return` inside it escapes.
         StmtKind::While { body, orelse, .. } | StmtKind::For { body, orelse, .. } => {
-            has_return(body) || has_return(orelse)
+            return_in(body).or_else(|| return_in(orelse))
         }
-        _ => false,
+        _ => nested_suites(s).into_iter().find_map(escape_in),
     })
 }
 
-/// Whether `body` contains a `return` outside any nested `def`/`class`.
-fn has_return(body: &[Stmt]) -> bool {
-    body.iter().any(|s| match &s.kind {
-        StmtKind::Return(_) => true,
-        StmtKind::If { body, orelse, .. } => has_return(body) || has_return(orelse),
+/// The first `return` in `body` outside any nested `def`/`class`.
+fn return_in(body: &[Stmt]) -> Option<&Stmt> {
+    body.iter().find_map(|s| match &s.kind {
+        StmtKind::Return(_) => Some(s),
         StmtKind::While { body, orelse, .. } | StmtKind::For { body, orelse, .. } => {
-            has_return(body) || has_return(orelse)
+            return_in(body).or_else(|| return_in(orelse))
         }
-        StmtKind::With { body, .. } => has_return(body),
+        _ => nested_suites(s).into_iter().find_map(return_in),
+    })
+}
+
+/// The suites of a compound statement that run in its own scope, in source
+/// order (a loop's are handled by the callers; a `def`/`class` has none).
+fn nested_suites(s: &Stmt) -> Vec<&[Stmt]> {
+    match &s.kind {
+        StmtKind::If { body, orelse, .. } => vec![body, orelse],
+        StmtKind::With { body, .. } => vec![body],
         StmtKind::Try {
             body,
             handlers,
             orelse,
             finalbody,
-        } => {
-            has_return(body)
-                || handlers.iter().any(|h| has_return(&h.body))
-                || has_return(orelse)
-                || has_return(finalbody)
-        }
-        StmtKind::Match { cases, .. } => cases.iter().any(|c| has_return(&c.body)),
-        _ => false,
-    })
+        } => std::iter::once(&body[..])
+            .chain(handlers.iter().map(|h| &h.body[..]))
+            .chain([&orelse[..], &finalbody[..]])
+            .collect(),
+        StmtKind::Match { cases, .. } => cases.iter().map(|c| &c.body[..]).collect(),
+        _ => Vec::new(),
+    }
 }
 
 // ── PEP 572: `:=` restrictions inside a comprehension ────────────────────────
@@ -5150,41 +5185,92 @@ fn push_fstr_children<'a>(parts: &'a [FStrPart], out: &mut Vec<&'a Expr>) {
     }
 }
 
-/// Whether `e` contains a `:=` anywhere, `lambda` bodies and nested
-/// comprehensions included — the reach of CPython's "iterable expression" ban.
-fn expr_has_walrus(e: &Expr) -> bool {
+/// How the hidden function of a comprehension or generator expression runs.
+#[derive(Clone, Copy)]
+enum CompRun {
+    /// Called for its result (a list, set, dict, or a generator).
+    Sync,
+    /// An asynchronous comprehension: a coroutine the enclosing scope awaits.
+    Awaited,
+    /// An asynchronous generator expression: an async generator, not awaited.
+    AsyncGen,
+}
+
+/// Whether a generator expression is asynchronous, as CPython's symbol table
+/// decides (`ste_coroutine`): an `async for` clause, or an `await` in its own
+/// scope — its element, conditions and every iterable but the first, which
+/// runs in the enclosing scope — including one that makes a comprehension
+/// nested there asynchronous. A nested `lambda` or generator expression is a
+/// scope of its own.
+fn genexp_is_async(elt: &Expr, comps: &[Comprehension]) -> bool {
+    comps.iter().any(|c| c.is_async)
+        || awaits_in_scope(elt)
+        || comps.iter().enumerate().any(|(i, c)| {
+            (i > 0 && awaits_in_scope(&c.iter)) || c.ifs.iter().any(awaits_in_scope)
+        })
+}
+
+/// Whether evaluating `e` awaits in the scope it is written in.
+fn awaits_in_scope(e: &Expr) -> bool {
     if crate::stack::compile_overflowed() {
         return false;
     }
-    matches!(e.unspanned(), Expr::NamedExpr(..))
-        || expr_children(e).into_iter().any(expr_has_walrus)
-}
-
-/// The names an assignment target binds (`i`, `a, b`, `a, *rest`).
-fn collect_target_names(t: &Expr, out: &mut Vec<String>) {
-    if crate::stack::compile_overflowed() {
-        return;
-    }
-    match t.unspanned() {
-        Expr::Name(n) => out.push(n.clone()),
-        Expr::Tuple(xs) | Expr::List(xs) => {
-            for x in xs {
-                collect_target_names(x, out);
-            }
+    match e.unspanned() {
+        Expr::Await(_) => true,
+        Expr::Lambda { params, .. } => params
+            .defaults
+            .iter()
+            .chain(params.kwonly_defaults.iter().flatten())
+            .any(awaits_in_scope),
+        // Only its first iterable is evaluated here.
+        Expr::GenExp(_, comps) => awaits_in_scope(&comps[0].iter),
+        Expr::ListComp(_, comps) | Expr::SetComp(_, comps) | Expr::DictComp(_, _, comps)
+            if comps.iter().any(|c| c.is_async) =>
+        {
+            true
         }
-        Expr::Starred(x) => collect_target_names(x, out),
-        _ => {}
+        _ => expr_children(e).into_iter().any(awaits_in_scope),
     }
 }
 
-/// PEP 572's two comprehension restrictions, both compile-time `SyntaxError`s in
-/// CPython, which pythonrs used to accept and run:
+/// The first `:=` in `e` (its spanned node), `lambda` bodies and nested
+/// comprehensions included — the reach of CPython's "iterable expression" ban.
+fn find_walrus(e: &Expr) -> Option<&Expr> {
+    if crate::stack::compile_overflowed() {
+        return None;
+    }
+    if matches!(e.unspanned(), Expr::NamedExpr(..)) {
+        return Some(e);
+    }
+    expr_children(e).into_iter().find_map(find_walrus)
+}
+
+/// A symbol-table `SyntaxError` at the node whose span is `sp`, or the bare
+/// message when the node has none.
+fn node_error(msg: &str, sp: Span) -> String {
+    if !sp.is_some() {
+        return msg.to_string();
+    }
+    crate::symtable::symtable_error(msg, (sp.line, sp.start + 1, sp.end_line, sp.end + 1))
+}
+
+/// PEP 572's comprehension restrictions, compile-time `SyntaxError`s CPython's
+/// symbol table raises (`args == (msg,)`, positioned at the node), visited in
+/// the symbol table's order: the first iterable, then each clause's target,
+/// its iterable after the first, its conditions, and the element(s) last.
 ///
+/// * `:=` may not appear anywhere in a `for … in <iterable>` expression
+///   (`[x for x in range((i := 3))]`) — not even inside a `lambda` written
+///   there — positioned at the assignment expression;
 /// * `:=` may not rebind an iteration variable of the comprehension it sits in,
 ///   nor of any comprehension that one is nested in
-///   (`[(i := 1) for i in range(3)]`, `[[(i := 1) for j in r] for i in s]`);
-/// * `:=` may not appear anywhere in a `for … in <iterable>` expression
-///   (`[x for x in range((i := 3))]`) — not even inside a `lambda` written there.
+///   (`[(i := 1) for i in range(3)]`, `[[(i := 1) for j in r] for i in s]`),
+///   positioned at its target;
+/// * a later clause may not iterate over a name an earlier condition bound
+///   with `:=` (`[j for i in x if (j := 1) for j in y]`), positioned at the
+///   clause's target;
+/// * outside a rebinding, `:=` in a comprehension whose nearest enclosing
+///   non-comprehension scope is a class body (`in_class`) is refused.
 ///
 /// `elts` are the comprehension's value expressions (two for a dict
 /// comprehension); `outer` carries the iteration variables of the enclosing
@@ -5193,33 +5279,83 @@ fn check_comprehension_walrus(
     elts: &[&Expr],
     comps: &[Comprehension],
     outer: &[String],
+    in_class: bool,
 ) -> Result<(), String> {
-    for c in comps {
-        if expr_has_walrus(&c.iter) {
-            return Err("SyntaxError: assignment expression cannot be used in a \
-                        comprehension iterable expression"
-                .to_string());
+    let mut bound = outer.to_vec();
+    // The names this comprehension's own `:=`s have bound so far.
+    let mut assigned: Vec<String> = Vec::new();
+    for (i, c) in comps.iter().enumerate() {
+        if i == 0 {
+            check_iterable_walrus(&c.iter)?;
+        }
+        let mut targets = Vec::new();
+        collect_target_spans(&c.target, &mut targets);
+        for (name, sp) in targets {
+            if assigned.contains(&name) {
+                return Err(node_error(
+                    &format!(
+                        "SyntaxError: comprehension inner loop cannot rebind \
+                         assignment expression target '{name}'"
+                    ),
+                    sp,
+                ));
+            }
+            bound.push(name);
+        }
+        if i > 0 {
+            check_iterable_walrus(&c.iter)?;
+        }
+        for cond in &c.ifs {
+            check_walrus_rebind(cond, &bound, in_class, &mut assigned)?;
         }
     }
-    let mut bound = outer.to_vec();
-    for c in comps {
-        collect_target_names(&c.target, &mut bound);
-    }
-    for e in elts
-        .iter()
-        .copied()
-        .chain(comps.iter().flat_map(|c| c.ifs.iter()))
-    {
-        check_walrus_rebind(e, &bound)?;
+    for e in elts {
+        check_walrus_rebind(e, &bound, in_class, &mut assigned)?;
     }
     Ok(())
 }
 
-/// Walk `e` looking for a `:=` onto one of `bound`. A `lambda` opens a new scope
-/// (`[(lambda: (i := 1))() for i in range(3)]` is legal), so only its defaults
-/// are visited; a nested comprehension re-enters [`check_comprehension_walrus`]
-/// with `bound` carried in as its outer set.
-fn check_walrus_rebind(e: &Expr, bound: &[String]) -> Result<(), String> {
+/// A comprehension's iterable may hold no `:=` at all.
+fn check_iterable_walrus(iter: &Expr) -> Result<(), String> {
+    match find_walrus(iter) {
+        Some(walrus) => Err(node_error(
+            "SyntaxError: assignment expression cannot be used in a \
+             comprehension iterable expression",
+            walrus.span(),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The names an assignment target binds, each with its span.
+fn collect_target_spans(t: &Expr, out: &mut Vec<(String, Span)>) {
+    if crate::stack::compile_overflowed() {
+        return;
+    }
+    match t.unspanned() {
+        Expr::Name(n) => out.push((n.clone(), t.span())),
+        Expr::Tuple(xs) | Expr::List(xs) => {
+            for x in xs {
+                collect_target_spans(x, out);
+            }
+        }
+        Expr::Starred(x) => collect_target_spans(x, out),
+        _ => {}
+    }
+}
+
+/// Walk `e` for the `:=`s of the comprehension it belongs to: one onto a name
+/// in `bound` is a rebinding, any other in a class body's comprehension is
+/// refused, and each target is recorded in `assigned`. A `lambda` opens a new
+/// scope (`[(lambda: (i := 1))() for i in range(3)]` is legal), so only its
+/// defaults are visited; a nested comprehension re-enters
+/// [`check_comprehension_walrus`] with `bound` carried in as its outer set.
+fn check_walrus_rebind(
+    e: &Expr,
+    bound: &[String],
+    in_class: bool,
+    assigned: &mut Vec<String>,
+) -> Result<(), String> {
     crate::stack::enter_compile()?;
     match e.unspanned() {
         Expr::Lambda { params, .. } => {
@@ -5228,28 +5364,41 @@ fn check_walrus_rebind(e: &Expr, bound: &[String]) -> Result<(), String> {
                 .iter()
                 .chain(params.kwonly_defaults.iter().flatten())
             {
-                check_walrus_rebind(d, bound)?;
+                check_walrus_rebind(d, bound, in_class, assigned)?;
             }
             return Ok(());
         }
         Expr::ListComp(elt, comps) | Expr::SetComp(elt, comps) | Expr::GenExp(elt, comps) => {
-            return check_comprehension_walrus(&[elt], comps, bound)
+            return check_comprehension_walrus(&[elt], comps, bound, in_class)
         }
-        Expr::DictComp(k, v, comps) => return check_comprehension_walrus(&[k, v], comps, bound),
+        Expr::DictComp(k, v, comps) => {
+            return check_comprehension_walrus(&[k, v], comps, bound, in_class)
+        }
         Expr::NamedExpr(target, _) => {
             if let Expr::Name(n) = target.unspanned() {
                 if bound.iter().any(|b| b == n) {
-                    return Err(format!(
-                        "SyntaxError: assignment expression cannot rebind \
-                         comprehension iteration variable '{n}'"
+                    return Err(node_error(
+                        &format!(
+                            "SyntaxError: assignment expression cannot rebind \
+                             comprehension iteration variable '{n}'"
+                        ),
+                        target.span(),
                     ));
                 }
+                if in_class {
+                    return Err(node_error(
+                        "SyntaxError: assignment expression within a comprehension \
+                         cannot be used in a class body",
+                        target.span(),
+                    ));
+                }
+                assigned.push(n.clone());
             }
         }
         _ => {}
     }
     for c in expr_children(e) {
-        check_walrus_rebind(c, bound)?;
+        check_walrus_rebind(c, bound, in_class, assigned)?;
     }
     Ok(())
 }

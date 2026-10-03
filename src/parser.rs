@@ -650,6 +650,7 @@ fn spanned(e: Expr, line: u32, start: u32, end: u32, anchor_start: u32, anchor_e
         Box::new(e),
         Span {
             line,
+            end_line: line,
             start,
             end,
             anchor_start,
@@ -955,6 +956,14 @@ impl Parser {
         self.err_span_as("SyntaxError", msg, from, to)
     }
 
+    /// A statement read from token `start` to the last one consumed, carrying
+    /// that extent for the compiler's errors about it.
+    fn spanned_stmt(&self, kind: StmtKind, line: u32, start: usize) -> Stmt {
+        let mut stmt = Stmt::new(kind, line);
+        stmt.span = Some(self.token_span(start, self.pos - 1));
+        stmt
+    }
+
     /// [`Parser::err_span`] for an error CPython's compiler or symbol table
     /// raises, which it positions in UTF-8 byte columns (see
     /// [`with_byte_columns`]).
@@ -995,11 +1004,24 @@ impl Parser {
 
     /// Wrap a `yield` / `yield from` / `await` that starts at token `start`
     /// and ends at the last token read in its source span, which is where the
-    /// compiler and the symbol table report one in the wrong place. A span
-    /// records one line, so an expression continued onto another line stays
-    /// unwrapped (and its error unpositioned).
+    /// compiler and the symbol table report one in the wrong place. The span
+    /// may cover several lines: it locates an error, never a caret.
     fn span_suspension(&self, e: Expr, start: usize) -> Expr {
-        self.span_from(e, start)
+        self.span_lines_from(e, start)
+    }
+
+    /// Wrap `e`, read from token `start` up to the last token consumed, with
+    /// that extent, which may cover several lines (see [`Span::end_line`]).
+    fn span_lines_from(&self, e: Expr, start: usize) -> Expr {
+        let (first, last) = (&self.toks[start], &self.toks[self.pos.saturating_sub(1)]);
+        let span = Span {
+            line: first.line,
+            end_line: last.line,
+            start: first.col,
+            end: last.end_col,
+            ..Span::NONE
+        };
+        Expr::Spanned(Box::new(e), span)
     }
 
     /// Wrap `e`, read from token `start` up to the last token consumed, with that
@@ -1620,7 +1642,7 @@ impl Parser {
                     if self.loop_depth == 0 {
                         self.note_misplaced("'break' outside loop", start);
                     }
-                    out.push(Stmt::new(StmtKind::Break, line));
+                    out.push(self.spanned_stmt(StmtKind::Break, line, start));
                     return Ok(());
                 }
                 "continue" => {
@@ -1629,7 +1651,7 @@ impl Parser {
                     if self.loop_depth == 0 {
                         self.note_misplaced("'continue' not properly in loop", start);
                     }
-                    out.push(Stmt::new(StmtKind::Continue, line));
+                    out.push(self.spanned_stmt(StmtKind::Continue, line, start));
                     return Ok(());
                 }
                 "return" => {
@@ -1646,7 +1668,7 @@ impl Parser {
                     if !self.in_function {
                         self.note_misplaced("'return' outside function", start);
                     }
-                    out.push(Stmt::new(StmtKind::Return(v), line));
+                    out.push(self.spanned_stmt(StmtKind::Return(v), line, start));
                     return Ok(());
                 }
                 "raise" => return self.parse_raise(out, line),
@@ -1797,7 +1819,7 @@ impl Parser {
         let first = self.parse_exprlist()?;
         // An assignment expression is not a statement unless parenthesized:
         // `a := 1` stops at the `:=`.
-        if matches!(first, Expr::NamedExpr(..))
+        if matches!(first.unspanned(), Expr::NamedExpr(..))
             && matches!(self.toks[first_start].tok, Tok::Name(_))
         {
             return Err(self.err_span("invalid syntax", first_start + 1, first_start + 1));
@@ -2519,8 +2541,22 @@ impl Parser {
         let mut handlers = Vec::new();
         while self.at_kw("except") {
             let except_line = self.line();
+            let except_tok = self.pos;
             self.advance();
+            let star_tok = self.pos;
             let star = self.eat_op("*");
+            let mixed = handlers.first().is_some_and(|h: &ExceptHandler| h.star != star);
+            if star && (self.at_op(":") || self.at_newline()) {
+                // `invalid_except_star_stmt_indent`'s `'except' '*' (NEWLINE |
+                // ':')`, raised at the token after the `*`; after a plain
+                // `except` no `except*` rule is left to try, and pegen fails
+                // at the `*`.
+                return Err(if mixed {
+                    self.err_span("invalid syntax", star_tok, star_tok)
+                } else {
+                    self.err_span("expected one or more exception types", self.pos, self.pos)
+                });
+            }
             let (typ, name) = if self.at_op(":") {
                 (None, None)
             } else {
@@ -2551,6 +2587,17 @@ impl Parser {
                 };
                 (Some(t), n)
             };
+            if mixed && self.at_op(":") {
+                // `invalid_try_stmt`: an `except*` after `except` blocks is
+                // reported over `except *`, an `except` after `except*`
+                // blocks at its keyword.
+                let to = if star { star_tok } else { except_tok };
+                return Err(self.err_span(
+                    "cannot have both 'except' and 'except*' on the same 'try'",
+                    except_tok,
+                    to,
+                ));
+            }
             let hbody = self.under(handler, |p| {
                 p.parse_suite("'except' statement", except_line)
             })?;
@@ -3138,12 +3185,14 @@ impl Parser {
     /// `named_expression`, called at its own level: `expression` one level up,
     /// and an `assignment_expression`'s value two.
     fn parse_namedexpr(&mut self) -> Result<Expr, String> {
+        let start = self.pos;
         let e = self.parse_ternary()?;
         if self.at_op(":=") {
             self.advance();
             let level = self.level + 1;
             let v = self.under(level, Self::parse_ternary)?;
-            return Ok(Expr::NamedExpr(Box::new(e), Box::new(v)));
+            // Its extent locates the symbol table's errors.
+            return Ok(self.span_lines_from(Expr::NamedExpr(Box::new(e), Box::new(v)), start));
         }
         Ok(e)
     }
@@ -4127,6 +4176,7 @@ impl Parser {
     /// gather's loop, at A+7.
     fn parse_list(&mut self) -> Result<Expr, String> {
         let atom = self.level;
+        let open = self.pos;
         self.advance(); // [
         if self.eat_op("]") {
             self.reach_absent_expression(atom + 7)?;
@@ -4138,7 +4188,8 @@ impl Parser {
             // The `listcomp` rule, under the group.
             let comps = self.under(atom + 2, Self::parse_comprehension_clauses)?;
             self.expect_op("]")?;
-            return Ok(Expr::ListComp(Box::new(first), comps));
+            // Its extent locates the symbol table's errors.
+            return Ok(self.span_lines_from(Expr::ListComp(Box::new(first), comps), open));
         }
         self.comma_hint(start)?;
         let mut items = vec![first];
@@ -4160,10 +4211,12 @@ impl Parser {
     /// and CPython underlines the display; a comprehension raises from inside
     /// its own hidden function, so it is left unwrapped.
     fn parse_brace(&mut self) -> Result<Expr, String> {
-        let (line, start) = (self.line(), self.col());
+        let (open, line, start) = (self.pos, self.line(), self.col());
         let e = self.parse_brace_display()?;
         Ok(match e {
             Expr::Dict(_) | Expr::Set(_) => spanned(e, line, start, self.prev_end_col(), 0, 0),
+            // A comprehension's extent locates the symbol table's errors.
+            Expr::DictComp(..) | Expr::SetComp(..) => self.span_lines_from(e, open),
             other => other,
         })
     }

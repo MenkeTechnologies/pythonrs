@@ -22,6 +22,26 @@ written.
   (`TbEntry::CPython`), and every call records its line in the calling
   frame, so a frame below the innermost knows where it is without an error
   (measured on a call-heavy debug-build loop: 0.7% more instructions).
+- **A `SyntaxError` the compiler raises from `eval`/`exec` shows its inner
+  block.** Every compiler and symbol-table error now carries CPython's
+  position, so an uncaught one from `exec`/`eval` renders the calling
+  frames, then `File "<string>", line N`, then the message, as CPython does.
+  Newly positioned: an asynchronous comprehension outside an async function
+  (at the outermost comprehension of the nearest non-comprehension scope),
+  the assignment-expression errors in a comprehension (at the `:=` in an
+  iterable, at the target of a rebinding), a `break`/`continue`/`return`
+  leaving an `except*` block (at the statement), and a `yield`/`await`
+  spanning several lines (its span records its end line). Two errors were
+  CPython's parser's, not its compiler's, and are now raised there with the
+  source line: `except*` with no type (`expected one or more exception
+  types`, at the token after the `*`) and a `try` mixing `except` with
+  `except*`. Found alongside and fixed: `assignment expression within a
+  comprehension cannot be used in a class body` (pythonrs reported `no
+  binding for nonlocal`), `comprehension inner loop cannot rebind assignment
+  expression target`, which pythonrs accepted, and asynchronous generator
+  expressions — an `await` or `async for` in a generator expression makes it
+  an async generator, legal in a plain `def`; pythonrs rejected it there and,
+  inside an `async def`, built a plain generator.
 - **Compiler and symbol-table errors are positioned in UTF-8 bytes.** CPython's
   compiler (`_PyCompile_Error`) and symbol table report a node's
   `col_offset + 1`, a UTF-8 BYTE column, where a parser error is converted to
@@ -2748,8 +2768,21 @@ entry. These remain open:
   `type(A)` is pythonrs's own type object, not CPython's
   `typing.TypeAliasType` (`isinstance` does agree).
 
-- **A `SyntaxError` the compiler raises from `eval`/`exec` omits the inner
-  block.** One the parser or tokenizer raises is rendered as CPython renders
-  it — the calling frames, then the `File "<string>"` block with the source
-  line and caret, then `SyntaxError: msg`. One from the list above that has no
-  position is rendered as the calling frames and the bare message line.
+- **Compile-time errors CPython raises that pythonrs accepts, or words
+  differently.** Measured against 3.14.8, each compiles here: `f(a=1, a=2)`
+  (`keyword argument repeated: a`), `from __future__ import nope` (`future
+  feature nope is not defined`) and a `from __future__` import after other
+  code (`must occur at the beginning of the file`), `type X = (yield)` (`yield
+  expression cannot be used within a type alias`), `def f[T, T](): pass`
+  (`duplicate type parameter 'T'`), `return 2` in an async generator
+  (`'return' with value in async generator`), `yield from` in an `async def`
+  (`'yield from' inside async function`), and binding `__debug__` by
+  assignment, parameter, `del`, keyword argument or `import … as` (`cannot
+  assign to __debug__`). `x = (yield) = 1` reads `assignment to yield
+  expression not possible` at the parentheses where CPython reads `cannot
+  assign to yield expression` at the `yield`.
+- **A node inside an f-string replacement field is positioned within the
+  field.** The field is parsed as a module of its own, so `f"{(yield)}"`'s
+  error is at offset 3 (the `yield` within `(yield)`) where CPython, whose
+  tokenizer reads the field in place, says 5; the same holds for every
+  compile-time error raised over a node inside a field.
