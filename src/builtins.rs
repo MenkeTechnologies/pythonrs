@@ -9690,11 +9690,11 @@ fn call_itertools(
             let src = iter_of(&arg0(&args)?)?;
             // islice(it, stop) | islice(it, start, stop[, step])
             let (start, stop, step) = if args.len() <= 2 {
-                (0, args.get(1).and_then(&as_i).unwrap_or(-1), 1)
+                (0, args.get(1).and_then(as_i).unwrap_or(-1), 1)
             } else {
                 (
-                    args.get(1).and_then(&as_i).unwrap_or(0),
-                    args.get(2).and_then(&as_i).unwrap_or(-1),
+                    args.get(1).and_then(as_i).unwrap_or(0),
+                    args.get(2).and_then(as_i).unwrap_or(-1),
                     args.get(3).and_then(as_i).unwrap_or(1),
                 )
             };
