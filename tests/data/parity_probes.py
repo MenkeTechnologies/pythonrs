@@ -1790,3 +1790,66 @@ attempt(["range(3).start = 1", "del slice(1).stop", "(1j).real = 2", "f.__global
 attempt(["int.foo = 1", "del int.real", "type(None).x = 1", "del (1).x",
          "o = object(); del o.x"], sys.stderr)
 print('end', file=sys.stderr)
+#==#
+# ── positional-count checks of builtins and builtin methods ──────────────────
+# Each calling convention words its refusal its own way: METH_O "takes exactly
+# one argument", METH_NOARGS "takes no arguments", METH_VARARGS "expected at
+# most N arguments, got K", Argument Clinic "takes at most N arguments (K
+# given)" counting keywords too. Wording that moved since 3.9 goes to stderr.
+import sys
+stable = ["ascii()", "callable(1, 2)", "divmod(1)", "isinstance(1)", "sorted([], [])",
+          "iter()", "next(iter([]), 1, 2)", "range()", "slice()", "float(1, 2)",
+          "list(1, 2)", "dict({}, {})", "locals(1)", "complex(1, 2, 3)", "'a'.upper(1)",
+          "'a'.center()", "'a'.join()",
+          "'a'.partition()", "'a'.encode('a', 'b', 'c')", "'a'.split(',', 1, maxsplit=2)",
+          "'a'.splitlines(1, 2)", "b'a'.decode(1, 2, 3)", "b'a'.replace(b'a')",
+          "bytearray().pop(1, 2)", "bytes.fromhex()", "(5).bit_length(1)", "(1.5).hex(1)",
+          "range(3).count()", "{1}.issubset()", "frozenset().isdisjoint(1, 2)",
+          "{}.fromkeys()", "[].sort(1)", "[].sort(1, 2, 3)",
+          "enumerate([], 1, x=1)",
+          "list(enumerate(start=3, iterable='ab'))", "enumerate('a', start='s')",
+          "'a'.center(5, 'xy')", "'a'.ljust(3, 7)", "'a'.join(5)", "b'a'.join(5)",
+          "format([1], 'x')", "format(None, '{}')",
+          "issubclass(zip, BaseException)", "isinstance(map(len, []), Exception)"]
+unstable = ["enumerate()", "'a'.replace('a')", "str(b'a', 'utf-8', 'x', 1)",
+            "int.from_bytes()", "filter(1, 2, 3)", "map(len)",
+            "'a'.count()", "'a'.find('a', 1, 2, 3)", "(5).to_bytes(1, 'big', True)",
+            "enumerate(start=1)", "enumerate('ab', iterable=1)", "callable(aiter)"]
+for group, out in [(stable, sys.stdout), (unstable, sys.stderr)]:
+    for e in group:
+        try:
+            print(e, '->', repr(eval(e)), file=out)
+        except (TypeError, ValueError, NameError) as x:
+            print(e, '!', type(x).__name__, x, file=out)
+print('end', file=sys.stderr)
+#==#
+# ── str.format: MarkupIterator / parse_field / get_field_object ──────────────
+# Conversions are validated after the field's object is fetched; a nested
+# spec is a full format string one level down; field names index by any
+# script's decimal digits; format_map has no positional fields.
+class M(dict):
+    def __missing__(self, k):
+        return '<' + k + '>'
+class G:
+    def __getattr__(self, n):
+        return n.upper()
+    def __repr__(self):
+        return 'G()'
+tests = ["{!z}", "{!}", "{!rr}", "{!r:}", "{0!}", "{!r", "{!z:>3}", "{", "}", "a}}b{{c",
+         "{0[}", "{0[1]}x", "{a{b}", "{0:{1}}", "{0!r:>{1}}", "{!s:{}}", "{:",
+         "{0:{", "{[0]}", "{0]}", "{0!r}}", "{}{{}}{}", "{a}", "{a.b}", "{a[x]}", "{a[0]}",
+         "{a[]}", "{a.}", "{a[0]x}", "{a[0", "{a:{w}}", "{a:{w:{w}}}", "{+1}", "{-1}",
+         "{٣}", "{0!\x01}"]
+for t in tests:
+    for f in [lambda t: t.format_map(M(a=G(), w=6)),
+              lambda t: t.format('p', 5, 3, 4, a=[1, 'x'], w=4,
+                                 **{'+1': 'plus', '-1': 'minus'})]:
+        try:
+            print(repr(t), repr(f(t)))
+        except (ValueError, KeyError, IndexError, TypeError, AttributeError) as e:
+            print(repr(t), type(e).__name__, e)
+for t in ['{}{0}', '{0}{}']:
+    try:
+        t.format(1)
+    except ValueError as e:
+        print(e)

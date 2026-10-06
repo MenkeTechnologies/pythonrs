@@ -9,6 +9,36 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **Builtins and builtin methods check their argument count.** Each refuses a
+  wrong count in its calling convention's own words: `ascii()` "takes exactly
+  one argument (0 given)", `globals(1)` "takes no arguments", `divmod(1)`
+  "expected 2 arguments, got 1", `complex(1, 2, 3)` "takes at most 2
+  arguments (3 given)", `'a'.upper(1)` "str.upper() takes no arguments",
+  `'a'.split(',', 1, maxsplit=2)` "takes at most 2 arguments (3 given)"
+  (Argument Clinic counts keywords), `[].sort(1)` "takes no positional
+  arguments", and so on across `str`/`bytes`/`bytearray`, `int`/`float`/
+  `complex`, `range`, `set`/`frozenset` and the alternate constructors.
+  Extra arguments used to be ignored (`callable(1, 2)`, `'a'.count()` was
+  `2`, `input(1, 2)` prompted) and missing ones read as a generic `missing
+  required argument`. `enumerate` binds as `enumerate_vectorcall` does
+  (`'start' is an invalid keyword argument for enumerate()` on its own) and
+  passes `start` through `__index__`.
+- **`str.center`/`ljust`/`rjust` validate the fill character**, and `join`
+  over a non-iterable is `can only join an iterable`.
+- **`str.format` and `format_map` parse fields as CPython does**
+  (`MarkupIterator_next`, `parse_field`, `get_field_object`): an unknown
+  conversion is `Unknown conversion specifier z` after the object is fetched,
+  `{!rr}` / `{!}` / `{0[}` / `{a[0]x}` / `{a.}` raise their own errors, a
+  nested spec is a full format string expanded one level down (`{0:{{}}}`
+  is the literal spec `{}`; a third level is `Max string recursion
+  exceeded`), an argument index may be written in any script's decimal
+  digits while `+1` is a keyword, attribute lookups run `__getattr__`, and
+  `format_map` refuses positional fields. `object.__format__` refuses any
+  non-empty spec before parsing it.
+- **`issubclass(zip, BaseException)` is `False`** — the catch-all treating an
+  unknown name as an `Exception` subclass now excludes every type object
+  (`zip`, `map`, `enumerate`, `super`, …) — and `callable()` asks CPython
+  about a bridged object (`functools.reduce`, `aiter`).
 - **`T.__new__(cls, …)` runs `tp_new_wrapper`'s checks.** `object.__new__`
   and the data types' `__new__` (`int`, `str`, `float`, `tuple`, `list`,
   `dict`, `set`, `frozenset`) refuse a missing `cls` (`T.__new__(): not enough

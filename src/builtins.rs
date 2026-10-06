@@ -6172,6 +6172,19 @@ pub fn call_builtin_function(
         return call_builtin_function(ctor, vec![v], vec![]);
     }
     // `bytes.fromhex(...)` / `bytearray.fromhex(...)` via the type object.
+    // The alternate constructors' own argument counts.
+    if let Some((tn, m)) = name
+        .split_once('.')
+        .filter(|(_, m)| matches!(*m, "fromhex" | "from_number" | "from_bytes" | "fromkeys"))
+    {
+        let spec = match (tn, m) {
+            ("bytes" | "bytearray", "fromhex") => Some(Arity::ExactlyOne),
+            _ => builtin_method_arity(tn, m),
+        };
+        if let Some(spec) = spec {
+            check_arity_kw(m, name, spec, args.len(), kwargs.len())?;
+        }
+    }
     if name == "bytes.fromhex" || name == "bytearray.fromhex" {
         let b = bytes_fromhex(&args)?;
         return Ok(with_host(|h| {
@@ -6382,6 +6395,7 @@ pub fn call_builtin_function(
     // A keyword for a builtin that takes none is a TypeError, not a value to
     // drop on the floor. Central so every arm below can assume it away.
     reject_kwargs(name, &kwargs)?;
+    check_builtin_arity(name, args.len())?;
     match name {
         "print" => {
             // `sep`/`end` are `None` (the default) or a `str`; anything else is
@@ -6703,25 +6717,25 @@ pub fn call_builtin_function(
             Ok(with_host(|h| h.new_iter_kind(items, kind)))
         }
         "enumerate" => {
-            // Lazy: pairs `(index, value)` pulled on demand. Both parameters take
-            // keywords — `enumerate(iterable=…, start=…)` — and an unknown one is
-            // an error rather than a silently dropped name.
-            let [it, startv] = bind_named(
-                "enumerate",
-                ["iterable", "start"],
-                0,
-                1,
-                KwStyle::Invalid,
-                &args,
-                &kwargs,
-            )?;
-            let it = it.ok_or_else(|| {
-                host::type_error("enumerate() missing required argument 'iterable' (pos 1)")
-            })?;
+            // Lazy: pairs `(index, value)` pulled on demand. The arguments are
+            // bound as `enumerate_vectorcall` binds them, keywords in the order
+            // given: one keyword must be the one its position leaves open.
+            let (it, startv) = enumerate_args(&args, &kwargs)?;
+            // `enum_new_impl`: `start` goes through `PyNumber_Index` first.
+            let start = match startv {
+                Some(v) => {
+                    let v = index_dunder(&v)?.unwrap_or(v);
+                    if with_host(|h| h.big_val(&v)).is_none() {
+                        return Err(host::type_error(&format!(
+                            "'{}' object cannot be interpreted as an integer",
+                            with_host(|h| h.type_name(&v))
+                        )));
+                    }
+                    with_host(|h| h.as_int(&v)).unwrap_or(0)
+                }
+                None => 0,
+            };
             let source = host::make_iterator(&it)?;
-            let start = startv
-                .and_then(|v| with_host(|h| h.as_int(&v)))
-                .unwrap_or(0);
             Ok(with_host(|h| {
                 h.alloc(PyObj::EnumerateObj {
                     source,
@@ -7317,6 +7331,8 @@ pub fn call_builtin_function(
                     | Some(PyObj::BoundMethod { .. }) => true,
                     // An instance is callable iff its class defines `__call__`.
                     Some(PyObj::Instance(i)) => h.class_lookup(&i.class, "__call__").is_some(),
+                    #[cfg(feature = "stdlib-ffi")]
+                    Some(PyObj::Foreign(id)) => crate::ffi::is_callable(*id),
                     _ => false,
                 }
             })))
@@ -7891,6 +7907,82 @@ const NO_KWARG_BUILTINS: &[&str] = &[
     "tuple",
     "vars",
 ];
+
+/// `enumerate_vectorcall`'s binding of `enumerate(iterable, start=…)`.
+fn enumerate_args(
+    args: &[Value],
+    kwargs: &[(String, Value)],
+) -> Result<(Value, Option<Value>), String> {
+    let invalid = |k: &str| {
+        Err(host::type_error(&format!(
+            "'{k}' is an invalid keyword argument for enumerate()"
+        )))
+    };
+    let mut all: Vec<Value> = args.to_vec();
+    all.extend(kwargs.iter().map(|(_, v)| v.clone()));
+    let kw: Vec<&str> = kwargs.iter().map(|(k, _)| k.as_str()).collect();
+    match (all.len(), kw.as_slice()) {
+        (2, [k]) if *k != "start" => invalid(k),
+        (2, ["start", k]) if *k != "iterable" => invalid(k),
+        (2, ["start", _]) => Ok((all[1].clone(), Some(all[0].clone()))),
+        (2, [k, _]) if *k != "iterable" => invalid(k),
+        (2, [_, k]) if *k != "start" => invalid(k),
+        (2, _) => Ok((all[0].clone(), Some(all[1].clone()))),
+        (1, [k]) if *k != "iterable" => invalid(k),
+        (1, _) => Ok((all[0].clone(), None)),
+        _ if args.is_empty() => Err(host::type_error(
+            "enumerate() missing required argument 'iterable'",
+        )),
+        (n, _) => Err(host::type_error(&format!(
+            "enumerate() takes at most 2 arguments ({n} given)"
+        ))),
+    }
+}
+
+/// The positional-count check each builtin's calling convention makes before
+/// it looks at an argument (`bltinmodule.c` and the type constructors), with
+/// the convention's own wording. Measured name by name against CPython 3.14.
+fn check_builtin_arity(name: &str, argc: usize) -> Result<(), String> {
+    let spec = match name {
+        "aiter" | "all" | "any" | "ascii" | "bin" | "callable" | "chr" | "hash" | "hex" | "id"
+        | "oct" | "ord" | "repr" => Arity::ExactlyOne,
+        "globals" | "locals" => Arity::NoArgs,
+        "divmod" | "isinstance" | "issubclass" | "filter" => Arity::VarExact(2),
+        "reversed" | "sorted" | "classmethod" | "staticmethod" => Arity::VarExact(1),
+        "anext" | "format" | "iter" | "next" => Arity::VarRange(1, 2),
+        "range" | "slice" => Arity::VarRange(1, 3),
+        "dir" | "vars" | "bool" | "float" | "list" | "tuple" | "set" | "frozenset" | "dict"
+        | "input" => Arity::VarRange(0, 1),
+        "int" => Arity::VarRange(0, 2),
+        "str" => Arity::VarRange(0, 3),
+        // Argument Clinic functions with keyword-capable parameters.
+        "complex" | "eval" | "exec" | "memoryview" | "property" => {
+            let max = match name {
+                "complex" => 2,
+                "eval" => 3,
+                "exec" | "property" => 4,
+                _ => 1,
+            };
+            if argc > max {
+                return Err(host::type_error(&format!(
+                    "{name}() takes at most {max} argument{} ({argc} given)",
+                    if max == 1 { "" } else { "s" }
+                )));
+            }
+            return Ok(());
+        }
+        "map" if argc < 2 => {
+            return Err(host::type_error("map() must have at least two arguments."))
+        }
+        "super" if argc > 2 => {
+            return Err(host::type_error(&format!(
+                "super() expected at most 2 arguments, got {argc}"
+            )))
+        }
+        _ => return Ok(()),
+    };
+    check_arity(name, name, spec, argc)
+}
 
 /// Refuse a keyword for a builtin that takes none. See [`NO_KWARG_BUILTINS`].
 fn reject_kwargs(name: &str, kwargs: &[(String, Value)]) -> Result<(), String> {
@@ -11294,14 +11386,20 @@ enum Arity {
     /// `METH_VARARGS` with optional trailing args: "method expected at most MAX
     /// argument(s), got N", or "…at least MIN…" when too few.
     VarRange(usize, usize),
-    /// Keyword-only (e.g. `list.sort`): "method() takes no positional arguments".
-    NoPositional,
     /// An Argument Clinic function whose parameters can also be passed by
     /// keyword: "name() takes exactly K positional arguments (N given)". This is
     /// NOT [`Arity::VarExact`]'s wording — Clinic reports the *positional* count
     /// and qualifies the name with `()`, where plain `METH_VARARGS` says
     /// "name expected K arguments, got N".
     ClinicPositional(usize),
+    /// An Argument Clinic function with keyword-capable parameters
+    /// (`_PyArg_UnpackKeywords`): `(min, max_positional, max_total)`. More
+    /// arguments than parameters, keywords included, is "name() takes at most
+    /// MAX argument(s) (N given)"; more positionals than the positional-capable
+    /// parameters is "takes at most K positional argument(s)" ("takes no
+    /// positional arguments" when K is 0); too few is "takes at least MIN
+    /// positional argument(s)". Use [`check_arity_kw`] to count keywords.
+    ClinicRange(usize, usize, usize),
 }
 
 /// Validate `argc` positional args against a method's [`Arity`], returning
@@ -11328,15 +11426,52 @@ fn check_arity(name: &str, qual: &str, spec: Arity, argc: usize) -> Result<(), S
             "{name} expected at least {min} {}, got {argc}",
             plural(min)
         ))),
-        Arity::NoPositional if argc != 0 => Err(host::type_error(&format!(
-            "{name}() takes no positional arguments"
-        ))),
+        Arity::ClinicRange(..) => check_arity_kw(name, qual, spec, argc, 0),
         Arity::ClinicPositional(k) if argc != k => Err(host::type_error(&format!(
             "{name}() takes exactly {k} positional {} ({argc} given)",
             plural(k)
         ))),
         _ => Ok(()),
     }
+}
+
+/// [`check_arity`] for a call that also passed `nkw` keyword arguments, which
+/// only Argument Clinic's [`Arity::ClinicRange`] counts.
+fn check_arity_kw(
+    name: &str,
+    qual: &str,
+    spec: Arity,
+    nargs: usize,
+    nkw: usize,
+) -> Result<(), String> {
+    let Arity::ClinicRange(min, max_pos, max_total) = spec else {
+        return check_arity(name, qual, spec, nargs);
+    };
+    let plural = |k: usize| if k == 1 { "argument" } else { "arguments" };
+    let total = nargs + nkw;
+    if total > max_total {
+        return Err(host::type_error(&format!(
+            "{name}() takes at most {max_total} {} ({total} given)",
+            plural(max_total)
+        )));
+    }
+    if nargs > max_pos {
+        return Err(host::type_error(&if max_pos == 0 {
+            format!("{name}() takes no positional arguments")
+        } else {
+            format!(
+                "{name}() takes at most {max_pos} positional {} ({nargs} given)",
+                plural(max_pos)
+            )
+        }));
+    }
+    if nkw == 0 && nargs < min {
+        return Err(host::type_error(&format!(
+            "{name}() takes at least {min} positional {} ({nargs} given)",
+            plural(min)
+        )));
+    }
+    Ok(())
 }
 
 /// The argument-count contract for a `math` module function, or `None` for the
@@ -14057,7 +14192,7 @@ pub(crate) fn exception_isa(exc_class: &str, want: &str, h: &host::PyHost) -> bo
     if want == "Exception"
         && !is_exception_class(exc_class)
         && !h.classes.contains_key(exc_class)
-        && !is_type_like_builtin(exc_class)
+        && !is_type_object_name(exc_class)
         && !UNINSTANTIABLE_TYPES.contains(&exc_class)
         && !matches!(
             exc_class,
@@ -16350,6 +16485,12 @@ fn builtin_extra_method(
     kwargs: &[(String, Value)],
 ) -> Option<Result<Value, String>> {
     let arg0 = || args.first().cloned().unwrap_or(Value::Undef);
+    if let Some(spec) = builtin_method_arity(tn, name) {
+        let qual = format!("{}.{name}", if tn == "bool" { "int" } else { tn });
+        if let Err(e) = check_arity_kw(name, &qual, spec, args.len(), kwargs.len()) {
+            return Some(Err(e));
+        }
+    }
     // An alternate constructor is a CLASSMETHOD, so it is reachable off an
     // instance as well as off the type — `(5).from_bytes(b'\x01')` is `1`, the
     // receiver contributing nothing but its type.
@@ -16670,6 +16811,10 @@ pub fn call_type_method(
             .iter()
             .any(|e| theirs.iter().any(|o| with_host(|h| h.equal(e, o))));
         return Ok(Value::Bool(disjoint));
+    }
+    if let Some(spec) = builtin_method_arity(&tn, name) {
+        let qual = format!("{}.{name}", if tn == "bool" { "int" } else { tn.as_str() });
+        check_arity_kw(name, &qual, spec, args.len(), kwargs.len())?;
     }
     match tn.as_str() {
         // A binary-operator dunder called as a bound method. First, because no
@@ -17398,7 +17543,7 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
                     args.len()
                 ))
             })?;
-            let items = host::iter_vec(seq)?;
+            let items = join_items(seq)?;
             let mut strs = Vec::new();
             for (n, it) in items.iter().enumerate() {
                 // CPython names WHICH item failed and what it was; the bare
@@ -17675,6 +17820,19 @@ fn ssize_arg(v: &Value) -> Result<i64, String> {
     }
 }
 
+/// The items a `join` concatenates: `PySequence_Fast(seq, "can only join an
+/// iterable")`, whose `TypeError` from taking the iterator is replaced.
+fn join_items(seq: &Value) -> Result<Vec<Value>, String> {
+    let it = host::make_iterator(seq).map_err(|e| {
+        if e.starts_with("TypeError:") {
+            host::type_error("can only join an iterable")
+        } else {
+            e
+        }
+    })?;
+    host::iter_vec(&it)
+}
+
 fn pad_str(s: &str, args: &[Value], mode: char, name: &str) -> Result<String, String> {
     let wv = args.first().ok_or_else(|| {
         host::type_error(&format!(
@@ -17683,9 +17841,27 @@ fn pad_str(s: &str, args: &[Value], mode: char, name: &str) -> Result<String, St
         ))
     })?;
     let w = ssize_arg(wv)?.max(0) as usize;
-    let fill = with_host(|h| args.get(1).and_then(|v| h.as_str(v)))
-        .and_then(|f| f.chars().next())
-        .unwrap_or(' ');
+    // `convert_uc`: the fill must be a `str` of exactly one character.
+    let fill = match args.get(1) {
+        None => ' ',
+        Some(v) => {
+            let f = with_host(|h| h.as_str(v)).ok_or_else(|| {
+                host::type_error(&format!(
+                    "The fill character must be a unicode character, not {}",
+                    with_host(|h| h.tp_name(v))
+                ))
+            })?;
+            let mut chars = f.chars();
+            match (chars.next(), chars.next()) {
+                (Some(c), None) => c,
+                _ => {
+                    return Err(host::type_error(
+                        "The fill character must be exactly one character long",
+                    ))
+                }
+            }
+        }
+    };
     let len = s.chars().count();
     if len >= w {
         return Ok(s.to_string());
@@ -18137,109 +18313,6 @@ fn format_map_get(mapping: &Value, key: &str) -> Result<Value, String> {
     with_host(|h| h.get_item(mapping, &keyv))
 }
 
-/// CPython `str.format_map(mapping)`: like `.format` but named fields resolve
-/// from `mapping` and it is not copied.
-fn str_format_map(s: &str, mapping: &Value) -> Result<Value, String> {
-    let mut out = String::new();
-    let chars: Vec<char> = s.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        match chars[i] {
-            '{' if chars.get(i + 1) == Some(&'{') => {
-                out.push('{');
-                i += 2;
-            }
-            '}' if chars.get(i + 1) == Some(&'}') => {
-                out.push('}');
-                i += 2;
-            }
-            '{' => {
-                let mut field = String::new();
-                i += 1;
-                while i < chars.len() && chars[i] != '}' {
-                    field.push(chars[i]);
-                    i += 1;
-                }
-                i += 1;
-                let (name_conv, spec) = match field.split_once(':') {
-                    Some((a, b)) => (a.to_string(), b.to_string()),
-                    None => (field, String::new()),
-                };
-                let (fname, conv) = match name_conv.split_once('!') {
-                    Some((n, c)) => (
-                        n.to_string(),
-                        match c {
-                            "s" => 1,
-                            "r" => 2,
-                            "a" => 3,
-                            _ => 0,
-                        },
-                    ),
-                    None => (name_conv, 0),
-                };
-                let val = format_map_get(mapping, &fname)?;
-                out.push_str(&format_field(&val, conv, &spec)?);
-            }
-            c => {
-                out.push(c);
-                i += 1;
-            }
-        }
-    }
-    Ok(new_str(out))
-}
-
-/// A conversion code (`!s`/`!r`/`!a` → 1/2/3, 0 = none) from the trailing part
-/// of a field-name segment (the part before any `:` format spec).
-fn conv_code(c: &str) -> i64 {
-    match c {
-        "s" => 1,
-        "r" => 2,
-        "a" => 3,
-        _ => 0,
-    }
-}
-
-/// Split a replacement field's inner text into `(field_name, conv, spec)`. The
-/// `:` (format-spec separator) and `!` (conversion) are only recognized at
-/// bracket-depth 0, so a subscript key may itself contain them (`{d[a:b]}`).
-fn split_format_field(field: &str) -> (String, i64, String) {
-    let fchars: Vec<char> = field.chars().collect();
-    let mut depth = 0i32;
-    let mut colon = None;
-    let mut bang = None;
-    for (i, &c) in fchars.iter().enumerate() {
-        match c {
-            '[' => depth += 1,
-            ']' => depth -= 1,
-            ':' if depth == 0 => {
-                colon = Some(i);
-                break;
-            }
-            '!' if depth == 0 && bang.is_none() => bang = Some(i),
-            _ => {}
-        }
-    }
-    let (head, spec) = match colon {
-        Some(i) => (
-            fchars[..i].iter().collect::<String>(),
-            fchars[i + 1..].iter().collect::<String>(),
-        ),
-        None => (field.to_string(), String::new()),
-    };
-    // Re-scan the head for a `!conv` (must precede the spec).
-    match bang.filter(|&b| colon.map(|c| b < c).unwrap_or(true)) {
-        Some(b) => {
-            let name: String = fchars[..b].iter().collect();
-            let conv: String = fchars[b + 1..colon.unwrap_or(fchars.len())]
-                .iter()
-                .collect();
-            (name, conv_code(&conv), spec)
-        }
-        None => (head, 0, spec),
-    }
-}
-
 /// Shared automatic/manual field-numbering state for one `str.format` call.
 /// `mode` is `None` until the first `{}`/`{0}` fixes the numbering discipline;
 /// mixing the two afterwards is a `ValueError`, exactly as in CPython.
@@ -18250,194 +18323,384 @@ struct FieldNum {
     manual: Option<bool>,
 }
 
-/// Resolve a `str.format` field name (`arg_name` plus `.attr` / `[index]`
-/// accessor chain) against positional `args`, `kwargs`, and the shared
-/// automatic/manual field-numbering state `st`.
-fn resolve_format_arg(
-    name: &str,
-    args: &[Value],
-    kwargs: &[(String, Value)],
-    st: &mut FieldNum,
-) -> Result<Value, String> {
-    let nchars: Vec<char> = name.chars().collect();
-    // Base arg_name ends at the first `.` or `[`.
-    let mut i = 0;
-    while i < nchars.len() && nchars[i] != '.' && nchars[i] != '[' {
-        i += 1;
-    }
-    let base: String = nchars[..i].iter().collect();
-    let mut val = if base.is_empty() {
-        if st.manual == Some(true) {
-            return Err(
-                "ValueError: cannot switch from manual field specification to \
-                        automatic field numbering"
-                    .into(),
-            );
-        }
-        st.manual = Some(false);
-        let v = args.get(st.counter).cloned().ok_or_else(|| {
-            format!(
-                "IndexError: Replacement index {} out of range for positional args tuple",
-                st.counter
-            )
-        })?;
-        st.counter += 1;
-        v
-    } else if let Ok(n) = base.parse::<usize>() {
-        if st.manual == Some(false) {
-            return Err(
-                "ValueError: cannot switch from automatic field numbering to \
-                        manual field specification"
-                    .into(),
-            );
-        }
-        st.manual = Some(true);
-        args.get(n).cloned().ok_or_else(|| {
-            format!("IndexError: Replacement index {n} out of range for positional args tuple")
-        })?
-    } else {
-        kwargs
-            .iter()
-            .find(|(k, _)| *k == base)
-            .map(|(_, v)| v.clone())
-            .ok_or_else(|| {
-                with_host(|h| {
-                    let k = h.new_str(base);
-                    h.key_error(&k)
-                })
-            })?
-    };
-    // Accessor chain.
-    while i < nchars.len() {
-        match nchars[i] {
-            '.' => {
-                i += 1;
-                let start = i;
-                while i < nchars.len() && nchars[i] != '.' && nchars[i] != '[' {
-                    i += 1;
-                }
-                let attr: String = nchars[start..i].iter().collect();
-                val = with_host(|h| h.get_attr(&val, &attr))?;
-            }
-            '[' => {
-                i += 1;
-                let start = i;
-                while i < nchars.len() && nchars[i] != ']' {
-                    i += 1;
-                }
-                let key: String = nchars[start..i].iter().collect();
-                if i < nchars.len() {
-                    i += 1; // skip ]
-                }
-                let keyv = if let Ok(n) = key.parse::<i64>() {
-                    Value::Int(n)
-                } else {
-                    with_host(|h| h.new_str(key))
-                };
-                val = with_host(|h| h.get_item(&val, &keyv))?;
-            }
-            _ => break,
-        }
-    }
-    Ok(val)
+fn str_dot_format(s: &str, args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, String> {
+    let chars: Vec<char> = s.chars().collect();
+    let src = FormatSource::Call(args, kwargs);
+    Ok(new_str(format_build_string(
+        &chars,
+        &src,
+        2,
+        &mut FieldNum::default(),
+    )?))
 }
 
-/// Substitute any `{…}` replacement fields inside a format spec (one nesting
-/// level, per CPython), formatting each with its default `str()` and threading
-/// the shared automatic/manual field-numbering state.
-fn substitute_nested_spec(
-    spec: &str,
-    args: &[Value],
-    kwargs: &[(String, Value)],
-    st: &mut FieldNum,
+/// `str.format_map(mapping)`: `build_string` with no positional arguments and
+/// `mapping` (not copied) as the keyword source.
+fn str_format_map(s: &str, mapping: &Value) -> Result<Value, String> {
+    let chars: Vec<char> = s.chars().collect();
+    let src = FormatSource::Map(mapping);
+    Ok(new_str(format_build_string(
+        &chars,
+        &src,
+        2,
+        &mut FieldNum::default(),
+    )?))
+}
+
+/// Where a format string's fields come from: `format(*args, **kwargs)`, or
+/// `format_map(mapping)` (`build_string`'s `args == NULL`).
+enum FormatSource<'a> {
+    Call(&'a [Value], &'a [(String, Value)]),
+    Map(&'a Value),
+}
+
+/// `build_string` / `do_markup` / `output_markup`
+/// (`Objects/stringlib/unicode_format.h`): literal text copied, each field's
+/// object looked up, converted, and formatted with its spec — a spec holding
+/// `{` is itself expanded first, one level less deep.
+fn format_build_string(
+    chars: &[char],
+    src: &FormatSource,
+    depth: i32,
+    auto: &mut FieldNum,
 ) -> Result<String, String> {
-    if !spec.contains('{') {
-        return Ok(spec.to_string());
+    if depth <= 0 {
+        return Err("ValueError: Max string recursion exceeded".into());
     }
-    let chars: Vec<char> = spec.chars().collect();
     let mut out = String::new();
-    let mut i = 0;
-    while i < chars.len() {
-        match chars[i] {
-            '{' => {
-                i += 1;
-                let mut inner = String::new();
-                while i < chars.len() && chars[i] != '}' {
-                    inner.push(chars[i]);
-                    i += 1;
-                }
-                if i < chars.len() {
-                    i += 1; // skip }
-                }
-                let (fname, conv, _) = split_format_field(&inner);
-                let val = resolve_format_arg(&fname, args, kwargs, st)?;
-                out.push_str(&format_field(&val, conv, "")?);
+    let mut pos = 0;
+    while let Some((literal, field)) = markup_next(chars, &mut pos)? {
+        out.push_str(&literal);
+        let Some((fname, conversion, spec)) = field else {
+            continue;
+        };
+        let val = format_field_object(&fname, src, auto)?;
+        let conv = match conversion {
+            None => 0,
+            Some('s') => 1,
+            Some('r') => 2,
+            Some('a') => 3,
+            Some(c) if (c as u32) > 32 && (c as u32) < 127 => {
+                return Err(format!("ValueError: Unknown conversion specifier {c}"))
             }
-            c => {
-                out.push(c);
-                i += 1;
+            Some(c) => {
+                return Err(format!(
+                    "ValueError: Unknown conversion specifier \\x{:x}",
+                    c as u32
+                ))
             }
-        }
+        };
+        let spec = if spec.contains('{') {
+            let spec_chars: Vec<char> = spec.chars().collect();
+            format_build_string(&spec_chars, src, depth - 1, auto)?
+        } else {
+            spec
+        };
+        out.push_str(&format_field(&val, conv, &spec)?);
     }
     Ok(out)
 }
 
-fn str_dot_format(s: &str, args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, String> {
-    let mut out = String::new();
-    let chars: Vec<char> = s.chars().collect();
-    let mut i = 0;
-    let mut auto = FieldNum::default();
+/// `get_integer`: a field-name part made only of decimal digits (any script's)
+/// is an index; `None` for anything else, including the empty string.
+fn format_get_integer(part: &[char]) -> Result<Option<usize>, String> {
+    if part.is_empty() {
+        return Ok(None);
+    }
+    let mut acc: usize = 0;
+    for &c in part {
+        if !(c.is_ascii_digit() || is_decimal_char(c)) {
+            return Ok(None);
+        }
+        let d = int_digit_value(c).unwrap_or(0) as usize;
+        if acc > (isize::MAX as usize - d) / 10 {
+            return Err("ValueError: Too many decimal digits in format string".into());
+        }
+        acc = acc * 10 + d;
+    }
+    Ok(Some(acc))
+}
+
+/// `get_field_object` with `field_name_split` and `FieldNameIterator`: the
+/// object a field name designates — an argument by position (explicit or
+/// automatically numbered) or by keyword, then each `.attr` and `[key]`.
+fn format_field_object(
+    name: &str,
+    src: &FormatSource,
+    auto: &mut FieldNum,
+) -> Result<Value, String> {
+    let chars: Vec<char> = name.chars().collect();
+    let mut i = chars
+        .iter()
+        .position(|&c| c == '.' || c == '[')
+        .unwrap_or(chars.len());
+    let first = &chars[..i];
+    let mut index = format_get_integer(first)?;
+    let empty = first.is_empty();
+    if empty || index.is_some() {
+        if auto.manual.is_none() {
+            auto.manual = Some(!empty);
+        }
+        match (auto.manual, empty) {
+            (Some(true), true) => {
+                return Err(
+                    "ValueError: cannot switch from manual field specification to \
+                            automatic field numbering"
+                        .into(),
+                )
+            }
+            (Some(false), false) => {
+                return Err(
+                    "ValueError: cannot switch from automatic field numbering to \
+                            manual field specification"
+                        .into(),
+                )
+            }
+            _ => {}
+        }
+        if empty {
+            index = Some(auto.counter);
+            auto.counter += 1;
+        }
+    }
+    let mut obj = match (index, src) {
+        (None, FormatSource::Call(_, kwargs)) => {
+            let key: String = first.iter().collect();
+            match kwargs.iter().find(|(k, _)| *k == key) {
+                Some((_, v)) => v.clone(),
+                None => {
+                    return Err(with_host(|h| {
+                        let k = h.new_str(key);
+                        h.key_error(&k)
+                    }))
+                }
+            }
+        }
+        (None, FormatSource::Map(mapping)) => {
+            format_map_get(mapping, &first.iter().collect::<String>())?
+        }
+        (Some(_), FormatSource::Map(_)) => {
+            return Err("ValueError: Format string contains positional fields".into())
+        }
+        (Some(n), FormatSource::Call(args, _)) => args.get(n).cloned().ok_or_else(|| {
+            format!("IndexError: Replacement index {n} out of range for positional args tuple")
+        })?,
+    };
     while i < chars.len() {
-        match chars[i] {
-            '{' if chars.get(i + 1) == Some(&'{') => {
-                out.push('{');
-                i += 2;
-            }
-            '}' if chars.get(i + 1) == Some(&'}') => {
-                out.push('}');
-                i += 2;
-            }
-            '{' => {
-                // Extract the field, honoring nested `{…}` inside the spec.
-                let mut field = String::new();
-                let mut depth = 1;
-                i += 1;
-                while i < chars.len() && depth > 0 {
-                    match chars[i] {
-                        '{' => depth += 1,
-                        '}' => {
-                            depth -= 1;
-                            if depth == 0 {
-                                break;
-                            }
-                        }
-                        _ => {}
-                    }
-                    field.push(chars[i]);
+        let c = chars[i];
+        i += 1;
+        let start = i;
+        let (part, is_attr) = match c {
+            '.' => {
+                while i < chars.len() && chars[i] != '.' && chars[i] != '[' {
                     i += 1;
                 }
-                // An unbalanced `{`: CPython names the stray brace rather than
-                // failing later on whatever it read as a field name. pythonrs
-                // consumed to end-of-string and reported the resulting empty
-                // field as `Replacement index 0 out of range`.
-                if depth > 0 {
-                    return Err("ValueError: Single '{' encountered in format string".to_string());
-                }
-                i += 1; // skip closing }
-                let (fname, conv, spec) = split_format_field(&field);
-                let val = resolve_format_arg(&fname, args, kwargs, &mut auto)?;
-                let spec = substitute_nested_spec(&spec, args, kwargs, &mut auto)?;
-                out.push_str(&format_field(&val, conv, &spec)?);
+                (&chars[start..i], true)
             }
-            // A lone `}` (not `}}`) is an error, not a literal brace.
-            '}' => return Err("ValueError: Single '}' encountered in format string".to_string()),
-            c => {
-                out.push(c);
+            '[' => {
+                while i < chars.len() && chars[i] != ']' {
+                    i += 1;
+                }
+                if i >= chars.len() {
+                    return Err("ValueError: Missing ']' in format string".into());
+                }
                 i += 1;
+                (&chars[start..i - 1], false)
+            }
+            _ => {
+                return Err(
+                    "ValueError: Only '.' or '[' may follow ']' in format field \
+                            specifier"
+                        .into(),
+                )
+            }
+        };
+        let item_index = if is_attr {
+            None
+        } else {
+            format_get_integer(part)?
+        };
+        if part.is_empty() {
+            return Err("ValueError: Empty attribute in format string".into());
+        }
+        let text: String = part.iter().collect();
+        obj = if is_attr {
+            get_attr_desc(&obj, &text)?
+        } else {
+            let key = match item_index {
+                Some(n) => Value::Int(n as i64),
+                None => with_host(|h| h.new_str(text)),
+            };
+            getitem_value(obj, key)?
+        };
+    }
+    Ok(obj)
+}
+
+/// A replacement field: its name, its `!` conversion and its format spec.
+type MarkupField = (String, Option<char>, String);
+
+/// `MarkupIterator_next` (`Objects/stringlib/unicode_format.h`): the literal
+/// text up to the next markup (with `{{`/`}}` unescaped one at a time) and
+/// the field that follows it, or `None` at the end of the string.
+fn markup_next(
+    chars: &[char],
+    pos: &mut usize,
+) -> Result<Option<(String, Option<MarkupField>)>, String> {
+    if *pos >= chars.len() {
+        return Ok(None);
+    }
+    let start = *pos;
+    let mut c = '\0';
+    let mut markup_follows = false;
+    while *pos < chars.len() {
+        c = chars[*pos];
+        *pos += 1;
+        if c == '{' || c == '}' {
+            markup_follows = true;
+            break;
+        }
+    }
+    let at_end = *pos >= chars.len();
+    let mut len = *pos - start;
+    if c == '}' && (at_end || chars[*pos] != c) {
+        return Err("ValueError: Single '}' encountered in format string".into());
+    }
+    if at_end && c == '{' {
+        return Err("ValueError: Single '{' encountered in format string".into());
+    }
+    if !at_end {
+        if chars[*pos] == c {
+            // An escaped brace: literal text up to and including it.
+            *pos += 1;
+            markup_follows = false;
+        } else {
+            len -= 1;
+        }
+    }
+    let literal: String = chars[start..start + len].iter().collect();
+    if !markup_follows {
+        return Ok(Some((literal, None)));
+    }
+    Ok(Some((literal, Some(parse_markup_field(chars, pos)?))))
+}
+
+/// `parse_field`: `field_name[!conversion][:format_spec]}` after a `{`.
+fn parse_markup_field(chars: &[char], pos: &mut usize) -> Result<MarkupField, String> {
+    let name_start = *pos;
+    let mut c = '\0';
+    while *pos < chars.len() {
+        c = chars[*pos];
+        *pos += 1;
+        match c {
+            '{' => return Err("ValueError: unexpected '{' in field name".into()),
+            '[' => {
+                while *pos < chars.len() && chars[*pos] != ']' {
+                    *pos += 1;
+                }
+                continue;
+            }
+            '}' | ':' | '!' => break,
+            _ => continue,
+        }
+    }
+    let name: String = chars[name_start..*pos - 1].iter().collect();
+    if c != '!' && c != ':' {
+        if c != '}' {
+            return Err("ValueError: expected '}' before end of string".into());
+        }
+        return Ok((name, None, String::new()));
+    }
+    let mut conversion = None;
+    if c == '!' {
+        let Some(&conv) = chars.get(*pos) else {
+            return Err("ValueError: end of string while looking for conversion specifier".into());
+        };
+        *pos += 1;
+        conversion = Some(conv);
+        if let Some(&next) = chars.get(*pos) {
+            *pos += 1;
+            if next == '}' {
+                return Ok((name, conversion, String::new()));
+            }
+            if next != ':' {
+                return Err("ValueError: expected ':' after conversion specifier".into());
             }
         }
     }
-    Ok(new_str(out))
+    let spec_start = *pos;
+    let mut count = 1;
+    while *pos < chars.len() {
+        let ch = chars[*pos];
+        *pos += 1;
+        match ch {
+            '{' => count += 1,
+            '}' => {
+                count -= 1;
+                if count == 0 {
+                    let spec = chars[spec_start..*pos - 1].iter().collect();
+                    return Ok((name, conversion, spec));
+                }
+            }
+            _ => {}
+        }
+    }
+    Err("ValueError: unmatched '{' in format spec".into())
+}
+
+/// The argument-count contract of a method of `str`/`bytes`/`bytearray`,
+/// `int`/`float`/`complex` or `range`, by calling convention (the type's
+/// `*object.c` and clinic files), measured against CPython 3.14. Checked
+/// before any keyword is folded into the positional list.
+fn builtin_method_arity(tn: &str, name: &str) -> Option<Arity> {
+    match (tn, name) {
+        ("int" | "bool", "as_integer_ratio" | "bit_count" | "bit_length" | "conjugate")
+        | ("int" | "bool", "is_integer")
+        | ("float", "as_integer_ratio" | "conjugate" | "hex" | "is_integer")
+        | ("complex", "conjugate") => return Some(Arity::NoArgs),
+        ("int" | "bool", "to_bytes") => return Some(Arity::ClinicRange(0, 2, 3)),
+        ("int" | "bool", "from_bytes") => return Some(Arity::ClinicRange(0, 2, 3)),
+        ("float", "fromhex" | "from_number") | ("complex", "from_number") => {
+            return Some(Arity::ExactlyOne)
+        }
+        ("range", "count" | "index") => return Some(Arity::ExactlyOne),
+        _ => {}
+    }
+    let bytes = matches!(tn, "bytes" | "bytearray");
+    if tn != "str" && !bytes {
+        return None;
+    }
+    Some(match name {
+        "capitalize" | "isalnum" | "isalpha" | "isascii" | "isdigit" | "islower" | "isspace"
+        | "istitle" | "isupper" | "lower" | "swapcase" | "title" | "upper" => Arity::NoArgs,
+        "casefold" | "isdecimal" | "isidentifier" | "isnumeric" | "isprintable" if !bytes => {
+            Arity::NoArgs
+        }
+        "clear" | "copy" | "reverse" if tn == "bytearray" => Arity::NoArgs,
+        "join" | "partition" | "removeprefix" | "removesuffix" | "rpartition" | "zfill" => {
+            Arity::ExactlyOne
+        }
+        "format_map" | "translate" if !bytes => Arity::ExactlyOne,
+        "fromhex" if bytes => Arity::ExactlyOne,
+        "append" | "extend" | "remove" | "resize" if tn == "bytearray" => Arity::ExactlyOne,
+        "center" | "ljust" | "rjust" => Arity::VarRange(1, 2),
+        "count" | "endswith" | "find" | "index" | "rfind" | "rindex" | "startswith" => {
+            Arity::VarRange(1, 3)
+        }
+        "maketrans" if !bytes => Arity::VarRange(1, 3),
+        "maketrans" => Arity::VarExact(2),
+        "insert" if tn == "bytearray" => Arity::VarExact(2),
+        "pop" if tn == "bytearray" => Arity::VarRange(0, 1),
+        "lstrip" | "rstrip" | "strip" => Arity::VarRange(0, 1),
+        "split" | "rsplit" => Arity::ClinicRange(0, 2, 2),
+        "encode" if !bytes => Arity::ClinicRange(0, 2, 2),
+        "decode" | "hex" if bytes => Arity::ClinicRange(0, 2, 2),
+        "expandtabs" | "splitlines" => Arity::ClinicRange(0, 1, 1),
+        "replace" if !bytes => Arity::ClinicRange(2, 3, 3),
+        "replace" => Arity::VarRange(2, 3),
+        "translate" => Arity::ClinicRange(1, 1, 2),
+        _ => return None,
+    })
 }
 
 /// The argument-count contract for a `list` method (positional args only; `sort`
@@ -18450,7 +18713,7 @@ fn list_arity(name: &str) -> Option<Arity> {
         "insert" => Arity::VarExact(2),
         "pop" => Arity::VarRange(0, 1),
         "index" => Arity::VarRange(1, 3),
-        "sort" => Arity::NoPositional,
+        "sort" => Arity::ClinicRange(0, 0, 2),
         _ => return None,
     })
 }
@@ -18462,7 +18725,13 @@ fn list_method(
     kwargs: &[(String, Value)],
 ) -> Result<Value, String> {
     if let Some(spec) = list_arity(name) {
-        check_arity(name, &format!("list.{name}"), spec, args.len())?;
+        check_arity_kw(
+            name,
+            &format!("list.{name}"),
+            spec,
+            args.len(),
+            kwargs.len(),
+        )?;
     }
     match name {
         "append" => {
@@ -18642,6 +18911,12 @@ fn dict_fromkeys(kind: Option<host::DictKind>, args: &[Value]) -> Result<Value, 
                 .into(),
         );
     }
+    check_arity(
+        "fromkeys",
+        "dict.fromkeys",
+        Arity::VarRange(1, 2),
+        args.len(),
+    )?;
     let keys = host::iter_vec(&arg0(args)?)?;
     let value = args.get(1).cloned().unwrap_or(Value::Undef);
     let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
@@ -18889,7 +19164,14 @@ fn any_value_key(k: &PKey) -> bool {
 /// methods (`union`, `intersection`, …) accept any count and are omitted.
 fn set_arity(name: &str) -> Option<Arity> {
     Some(match name {
-        "add" | "discard" | "remove" => Arity::ExactlyOne,
+        "add"
+        | "discard"
+        | "remove"
+        | "isdisjoint"
+        | "issubset"
+        | "issuperset"
+        | "symmetric_difference"
+        | "symmetric_difference_update" => Arity::ExactlyOne,
         "clear" | "copy" | "pop" => Arity::NoArgs,
         _ => return None,
     })
@@ -18898,9 +19180,15 @@ fn set_arity(name: &str) -> Option<Arity> {
 fn set_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
     // Real `set` only: a `frozenset` mutator (`add`/`discard`/…) must raise the
     // AttributeError below first, so arity is not checked for it here.
-    if !with_host(|h| h.is_frozenset(recv)) {
+    let frozen = with_host(|h| h.is_frozenset(recv));
+    let pure = matches!(
+        name,
+        "copy" | "isdisjoint" | "issubset" | "issuperset" | "symmetric_difference"
+    );
+    if !frozen || pure {
         if let Some(spec) = set_arity(name) {
-            check_arity(name, &format!("set.{name}"), spec, args.len())?;
+            let tn = if frozen { "frozenset" } else { "set" };
+            check_arity(name, &format!("{tn}.{name}"), spec, args.len())?;
         }
     }
     // `frozenset` is immutable: it has no in-place mutators.
@@ -20188,9 +20476,9 @@ fn ldexp(base: f64, exp: i64) -> f64 {
 /// `int.from_bytes(bytes, byteorder='big', *, signed=False)` — build an int from
 /// a bytes-like object or an iterable of ints. Faithful to CPython.
 fn int_from_bytes(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, String> {
-    let src = args
-        .first()
-        .ok_or_else(|| host::type_error("from_bytes() missing required argument 'bytes'"))?;
+    let src = args.first().ok_or_else(|| {
+        host::type_error("from_bytes() missing required argument 'bytes' (pos 1)")
+    })?;
     let mut bytes: Vec<u8> = match with_host(|h| match h.get(src) {
         Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) => Some(b.clone()),
         _ => None,
@@ -21290,7 +21578,7 @@ fn bytes_common_method(
         }
         "join" => {
             let sep = bytes.clone();
-            let items = host::iter_vec(&arg0(args)?)?;
+            let items = join_items(&arg0(args)?)?;
             let mut out = Vec::new();
             for (i, it) in items.iter().enumerate() {
                 if i > 0 {
@@ -23176,6 +23464,14 @@ pub fn apply_format_spec(s: &str, v: &Value, spec: &str) -> Result<String, Strin
         _ => None,
     }) {
         return format_complex(re, im, spec);
+    }
+    // `object.__format__` refuses any non-empty spec without parsing it.
+    let numeric = matches!(v, Value::Float(_)) || with_host(|h| h.big_val(v)).is_some();
+    if !numeric && !is_str(v) {
+        return Err(format!(
+            "TypeError: unsupported format string passed to {}.__format__",
+            with_host(|h| h.type_name(v))
+        ));
     }
     let FormatSpec {
         fill,

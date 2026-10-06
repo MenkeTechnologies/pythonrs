@@ -4116,6 +4116,11 @@ pub fn str_of(id: u32) -> String {
     )
 }
 
+/// `callable(foreign)`.
+pub fn is_callable(id: u32) -> bool {
+    Python::with_gil(|py| fetch(py, id).is_ok_and(|o| o.is_callable()))
+}
+
 /// `repr(foreign)`.
 pub fn repr_of(id: u32) -> String {
     Python::with_gil(
