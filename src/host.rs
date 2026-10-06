@@ -2122,6 +2122,9 @@ pub struct Frame {
     /// The module whose code this frame runs (its globals slot): names the
     /// file a traceback shows for the frame and the module CPython sees it in.
     pub module: usize,
+    /// The file of code `eval`/`exec`/`compile` built from a string (its
+    /// `co_filename`, `<string>` by default); `None` is the module's file.
+    pub file: Option<Rc<str>>,
 }
 
 /// One pythonrs frame an exception passed through: the scope name, the line
@@ -2132,6 +2135,9 @@ pub struct TbFrame {
     pub line: u32,
     pub span: Span,
     pub module: usize,
+    /// The file named for code `eval`/`exec` compiled from a string (its
+    /// `compile()` filename, `<string>` by default); `None` names the module's.
+    pub file: Option<Rc<str>>,
 }
 
 impl TbFrame {
@@ -2141,6 +2147,7 @@ impl TbFrame {
             line: f.line,
             span: f.span,
             module: f.module,
+            file: f.file.clone(),
         }
     }
 }
@@ -2303,6 +2310,9 @@ pub struct PyHost {
     /// `.0` = `__cause__` (`raise X from Y`), `.1` = `__context__` (the
     /// exception being handled when this one was raised). `Value::Undef` = unset.
     pub exc_links: HashMap<u32, (Value, Value)>,
+    /// The `co_filename` of each function compiled by `eval`/`exec` from a
+    /// string, by def id; a function absent here lives in its module's file.
+    pub code_files: HashMap<usize, Rc<str>>,
     /// Per-exception traceback frames (`__traceback__`), keyed by the exception's
     /// heap index: the outermost-first `(scope, line)` stack captured when the
     /// exception is caught. Used to render `__cause__`/`__context__` chain blocks
@@ -3021,6 +3031,7 @@ impl PyHost {
                 line: 0,
                 span: Span::NONE,
                 module: 0,
+                file: None,
             }],
             error: None,
             exc: None,
@@ -3034,6 +3045,7 @@ impl PyHost {
             lru_caches: Vec::new(),
             total_ordering: HashSet::new(),
             exc_links: HashMap::new(),
+            code_files: HashMap::new(),
             exc_tb: HashMap::new(),
             eg_split_root: HashMap::new(),
             builtin_objects: HashMap::new(),
@@ -4026,6 +4038,18 @@ impl PyHost {
         }
         if let Some(f) = self.frames.last() {
             self.traceback.push(TbEntry::Frame(TbFrame::of(f)));
+        }
+    }
+    /// An exception is leaving code `eval`/`exec` ran: that code's `<module>`
+    /// frame — which ran in the innermost frame's slot, at the line it
+    /// recorded — joins the traceback under `filename`, as CPython lists the
+    /// `<string>` frame between the caller and what the code called.
+    pub fn push_code_tb_frame(&mut self, filename: &str) {
+        if let Some(f) = self.frames.last() {
+            let mut entry = TbFrame::of(f);
+            entry.name = Rc::from("<module>");
+            entry.file = Some(Rc::from(filename));
+            self.traceback.push(TbEntry::Frame(entry));
         }
     }
     /// Whether the innermost frame is the one a bare `raise` re-raised from
@@ -17724,6 +17748,7 @@ pub fn run_user_func(
         let saved_mod = with_host(|h| h.swap_module(fv.module));
         // These park the body on a coroutine stack, so they need an owned chunk.
         let body = def.chunk.clone();
+        let file = with_host(|h| h.code_files.get(&fv.def_id).cloned());
         let obj = if def.is_async {
             if def.is_generator {
                 make_async_generator(
@@ -17733,6 +17758,7 @@ pub fn run_user_func(
                     owner,
                     gen_qualname(&def),
                     def.locals.clone(),
+                    file.clone(),
                 )
             } else {
                 make_coroutine(
@@ -17742,6 +17768,7 @@ pub fn run_user_func(
                     owner,
                     gen_qualname(&def),
                     def.locals.clone(),
+                    file.clone(),
                 )
             }
         } else {
@@ -17752,6 +17779,7 @@ pub fn run_user_func(
                 owner,
                 gen_qualname(&def),
                 def.locals.clone(),
+                file,
             )
         };
         with_host(|h| h.swap_module(saved_mod));
@@ -17778,6 +17806,7 @@ pub fn run_user_func(
             line: 0,
             span: Span::NONE,
             module: fv.module,
+            file: h.code_files.get(&fv.def_id).cloned(),
         });
         saved
     });
@@ -18498,6 +18527,7 @@ fn run_class_body(name: &str, body_func: &Value) -> Result<NameMap, String> {
             line: 0,
             span: Span::NONE,
             module: fv.module,
+            file: h.code_files.get(&fv.def_id).cloned(),
         });
         saved
     });
@@ -19529,7 +19559,10 @@ impl PyHost {
                     continue;
                 }
             };
-            let filename = self.module_filename(f.module);
+            let filename = match &f.file {
+                Some(file) => file.to_string(),
+                None => self.module_filename(f.module),
+            };
             let key = (filename.clone(), f.line, f.name.clone());
             if last.as_ref() != Some(&key) {
                 flush(&mut out, count);
@@ -19544,7 +19577,11 @@ impl PyHost {
                 "  File \"{}\", line {}, in {}\n",
                 filename, f.line, f.name
             ));
-            let text = self.source_line(f.module, f.line);
+            // Code compiled from a string has no file to read its line from.
+            let text = match f.file {
+                Some(_) => None,
+                None => self.source_line(f.module, f.line),
+            };
             if let Some(text) = text.as_deref() {
                 let stripped = text.trim();
                 if !stripped.is_empty() {
@@ -19586,7 +19623,11 @@ impl PyHost {
             .and_then(|g| g.get("__name__"))
             .and_then(|n| self.as_str(n))
             .unwrap_or_else(|| "<string>".into());
-        Some((self.module_filename(frame.module), frame.line, module))
+        let filename = match &frame.file {
+            Some(file) => file.to_string(),
+            None => self.module_filename(frame.module),
+        };
+        Some((filename, frame.line, module))
     }
 
     /// `__file__` of a module other than `__main__`.
@@ -19800,8 +19841,9 @@ fn make_generator(
     owner: Option<String>,
     func_name: String,
     locals: Vec<String>,
+    file: Option<Rc<str>>,
 ) -> Value {
-    make_gen_kind(
+    let obj = make_gen_kind(
         chunk,
         env,
         self_val,
@@ -19809,7 +19851,9 @@ fn make_generator(
         GenKind::Generator,
         func_name,
         locals,
-    )
+    );
+    set_generator_file(&obj, file);
+    obj
 }
 
 /// Build a suspended `async def` coroutine object. Identical backing to a
@@ -19822,8 +19866,9 @@ pub fn make_coroutine(
     owner: Option<String>,
     func_name: String,
     locals: Vec<String>,
+    file: Option<Rc<str>>,
 ) -> Value {
-    make_gen_kind(
+    let obj = make_gen_kind(
         chunk,
         env,
         self_val,
@@ -19831,7 +19876,9 @@ pub fn make_coroutine(
         GenKind::Coroutine,
         func_name,
         locals,
-    )
+    );
+    set_generator_file(&obj, file);
+    obj
 }
 
 /// Build a suspended async generator (`async def` containing `yield`). Its body
@@ -19844,8 +19891,9 @@ pub fn make_async_generator(
     owner: Option<String>,
     func_name: String,
     locals: Vec<String>,
+    file: Option<Rc<str>>,
 ) -> Value {
-    make_gen_kind(
+    let obj = make_gen_kind(
         chunk,
         env,
         self_val,
@@ -19853,7 +19901,9 @@ pub fn make_async_generator(
         GenKind::AsyncGen,
         func_name,
         locals,
-    )
+    );
+    set_generator_file(&obj, file);
+    obj
 }
 
 /// Whether `v` is an async generator object.
@@ -19976,6 +20026,20 @@ fn gen_qualname(def: &FuncDef) -> String {
     }
 }
 
+/// Name the file a generator's frame runs (see [`Frame::file`]).
+fn set_generator_file(obj: &Value, file: Option<Rc<str>>) {
+    if file.is_none() {
+        return;
+    }
+    with_host(|h| {
+        if let Some(PyObj::Generator { id, .. }) = h.get(obj).cloned() {
+            if let Some(f) = h.generators[id as usize].ctx.frames.first_mut() {
+                f.file = file;
+            }
+        }
+    });
+}
+
 fn make_gen_kind(
     chunk: Chunk,
     env: Env,
@@ -20004,6 +20068,7 @@ fn make_gen_kind(
         // The generator body runs in the module the function was defined in,
         // which is the current one while it is built.
         module: with_host(|h| h.cur_module()),
+        file: None,
     };
     let id = with_host(|h| {
         let id = h.generators.len() as u32;

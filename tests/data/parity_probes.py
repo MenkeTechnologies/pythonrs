@@ -1985,3 +1985,31 @@ def c(n):
 nums = [1, 2, 0]
 c(6) if nums[0] else \
     nums[1] / nums[2]
+#==#
+# ── code eval/exec compiled from a string is its own traceback frame ─────────
+# `File "<string>", line N, in <module>` (or the compile() filename) sits
+# between the caller and what the code called, and a function or generator
+# the code defines is named by that file too.
+def inner():
+    raise KeyError('deep')
+try:
+    eval("(1 +\n inner())")
+except KeyError as e:
+    tb = e.__traceback__
+    n = 0
+    while tb:
+        n += 1
+        tb = tb.tb_next
+    print('entries', n)
+code = compile("x = 1\ny = x / 0", "myfile.py", "exec")
+try:
+    exec(code)
+except ZeroDivisionError as e:
+    print('caught', e.__traceback__.tb_next.tb_lineno)
+exec("def k():\n    yield 1\n    raise ValueError('g')\n")
+exec("x = 1\n\n\ndef h():\n    return [x][1]\n")
+try:
+    list(k())
+except ValueError as e:
+    print('gen', e.__traceback__.tb_next.tb_lineno)
+h()

@@ -8432,8 +8432,27 @@ fn run_pysource(want_value: bool, args: &[Value]) -> Result<Value, String> {
         for (line, msg) in &prog.warnings {
             eprintln!("{filename}:{line}: SyntaxWarning: {msg}");
         }
+        // Functions the code defines are named by its file in a traceback.
+        let (first_def, _) = with_host(|h| h.program_offsets());
+        let ndefs = prog.functions.len();
         let chunk = crate::load_merged(prog);
-        crate::host::run_chunk_on(chunk)?;
+        let file: std::rc::Rc<str> = std::rc::Rc::from(filename.as_str());
+        with_host(|h| {
+            for id in first_def..first_def + ndefs {
+                h.code_files.insert(id, file.clone());
+            }
+        });
+        // The code runs in the innermost frame's slot; the caller's line and
+        // span are its own again afterwards.
+        let caller_at = with_host(|h| h.cur_line_span());
+        let ran = crate::host::run_chunk_on(chunk);
+        if ran.is_err() {
+            with_host(|h| h.push_code_tb_frame(&filename));
+        }
+        if let Some((line, span)) = caller_at {
+            with_host(|h| h.set_cur_line_span(line, span));
+        }
+        ran?;
         let value = if want_value {
             with_host(|h| h.del_global(TMP)).unwrap_or(Value::Undef)
         } else {

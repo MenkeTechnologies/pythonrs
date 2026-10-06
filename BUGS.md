@@ -9,6 +9,12 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **Code `eval`/`exec` compile from a string is a traceback frame of its
+  own**: `File "<string>", line N, in <module>` (or the `compile()`
+  filename) between the caller and what it called, and a function or
+  generator that code defines is named by that file (`File "<string>", line
+  5, in h`), as its `co_filename` makes it in CPython. Both used to be
+  missing or shown under the calling script's path.
 - **An instruction carries its expression's line, not its statement's.**
   `y = x[0] + \` / `x[1] / x[2]` fails on the second line, a call on a
   continuation line is that line in `f_lineno`, `tb_lineno` and the
