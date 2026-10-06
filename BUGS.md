@@ -9,6 +9,15 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **`min`/`max` follow `min_max`**: `key`/`default` are keyword-only with
+  CPython's refusals (`max() got an unexpected keyword argument 'x'`, `takes
+  at most 2 keyword arguments`), a `default` beside several positional
+  arguments is `Cannot specify a default for max() with multiple positional
+  arguments`, and the key is called as each item is pulled from the iterable
+  rather than after draining it. `round(x, nd)` takes `nd` through
+  `__index__` (`round(1.5, 'a')` was `2`), `iter(v, w)` requires a callable
+  `v`, `super(1)` names the type (`must be a type, not int`), and
+  `type(name, bases, ns)` checks `type.__new__`'s argument types.
 - **Builtins and builtin methods check their argument count.** Each refuses a
   wrong count in its calling convention's own words: `ascii()` "takes exactly
   one argument (0 given)", `globals(1)` "takes no arguments", `divmod(1)`

@@ -1853,3 +1853,28 @@ for t in ['{}{0}', '{0}{}']:
         t.format(1)
     except ValueError as e:
         print(e)
+#==#
+# ── min/max (min_max), round's ndigits, iter(v, w), super(), type() args ─────
+# min/max parse `key`/`default` as keyword-only, refuse a default beside
+# several positionals, and call the key as each item is pulled; round takes
+# ndigits through __index__; iter's two-argument form needs a callable;
+# super() and type() name the type they were handed.
+import sys
+def g():
+    for i in range(3):
+        print('y', i)
+        yield i
+print(max(g(), key=lambda v: print('k', v) or v))
+stable = ["max(1, 2, default=3)", "max([], default=5)", "min(1, 2, key=None)",
+          "min([3, 1, 1.0])", "max('abc', key=ord)", "round(2.567, True)", "round(25, -1.0)",
+          "round(1.25, None)", "round(1.5, 'a')", "iter(1, 2)", "list(iter([1, 2, 3].pop, 1))",
+          "type('a', 1, {})", "type('a', (), 1)", "type(1, (), {})", "type('a', [], {})",
+          "type('T', (int,), {'x': 1}).x"]
+unstable = ["max(1, 2, x=1)", "max([1], default=1, key=None, x=2)", "super(1)", "super(len)"]
+for group, out in [(stable, sys.stdout), (unstable, sys.stderr)]:
+    for e in group:
+        try:
+            print(e, '->', repr(eval(e)), file=out)
+        except (TypeError, ValueError) as x:
+            print(e, '!', type(x).__name__, x, file=out)
+print('end', file=sys.stderr)

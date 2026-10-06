@@ -6850,6 +6850,23 @@ pub fn call_builtin_function(
             })?;
             // `ndigits` is present only when it was passed and is not None.
             let has_nd = matches!(&ndv, Some(x) if !matches!(x, Value::Undef));
+            // `float.__round__`/`int.__round__` take `ndigits` through
+            // `__index__` (`PyNumber_AsSsize_t` / `PyNumber_Index`).
+            let builtin_number = matches!(v, Value::Bool(_) | Value::Int(_) | Value::Float(_))
+                || with_host(|h| matches!(h.get(&v), Some(PyObj::BigInt(_))));
+            let ndv = match ndv {
+                Some(x) if has_nd && builtin_number => {
+                    let x = index_dunder(&x)?.unwrap_or(x);
+                    if with_host(|h| h.big_val(&x)).is_none() {
+                        return Err(host::type_error(&format!(
+                            "'{}' object cannot be interpreted as an integer",
+                            with_host(|h| h.type_name(&x))
+                        )));
+                    }
+                    Some(x)
+                }
+                other => other,
+            };
             let nd = ndv.as_ref().and_then(|v| with_host(|h| h.as_int(v)));
             match &v {
                 Value::Bool(b) => Ok(round_int(&num_bigint::BigInt::from(*b as i64), has_nd, nd)),
@@ -7032,7 +7049,19 @@ pub fn call_builtin_function(
                     return foreign_super(args);
                 }
                 let owner = with_host(|h| callable_name(h, &cls))
-                    .ok_or_else(|| host::type_error("super() argument 1 must be a type"))?;
+                    .filter(|_| {
+                        with_host(|h| match h.get(&cls) {
+                            Some(PyObj::Class(_) | PyObj::NamedTupleType { .. }) => true,
+                            Some(PyObj::Builtin(n)) => is_type_object_name(n),
+                            _ => false,
+                        })
+                    })
+                    .ok_or_else(|| {
+                        host::type_error(&format!(
+                            "super() argument 1 must be a type, not {}",
+                            with_host(|h| h.tp_name(&cls))
+                        ))
+                    })?;
                 let inst = args.get(1).cloned().unwrap_or(Value::Undef);
                 (owner, inst)
             };
@@ -7228,6 +7257,9 @@ pub fn call_builtin_function(
             // Two-argument form: `iter(callable, sentinel)` calls `callable()`
             // repeatedly, yielding results until one equals `sentinel`.
             if let Some(sentinel) = args.get(1) {
+                if !is_callable(&v)? {
+                    return Err(host::type_error("iter(v, w): v must be callable"));
+                }
                 let sentinel = sentinel.clone();
                 return Ok(with_host(|h| {
                     h.alloc(PyObj::CallIter {
@@ -9040,46 +9072,71 @@ fn reduce_minmax(
     kwargs: &[(String, Value)],
     want_max: bool,
 ) -> Result<Value, String> {
-    // `min()`/`max()` with no arguments is a TypeError about the ARGUMENT COUNT.
-    // Falling through to the reduction instead reported the empty-iterable
-    // ValueError, which is the message for `min([])` — a different error for a
-    // different mistake.
+    // `min_max` (`bltinmodule.c`), step for step.
+    let name = if want_max { "max" } else { "min" };
     if args.is_empty() {
-        let name = if want_max { "max" } else { "min" };
         return Err(host::type_error(&format!(
             "{name} expected at least 1 argument, got 0"
         )));
     }
-    let items = if args.len() == 1 {
-        host::iter_vec(&args[0])?
+    // `|$OO:max` with keywords `key`, `default`.
+    if kwargs.len() > 2 {
+        return Err(host::type_error(&format!(
+            "{name}() takes at most 2 keyword arguments ({} given)",
+            kwargs.len()
+        )));
+    }
+    if let Some((k, _)) = kwargs.iter().find(|(k, _)| k != "key" && k != "default") {
+        return Err(host::type_error(&format!(
+            "{name}() got an unexpected keyword argument '{k}'"
+        )));
+    }
+    let default = kw_get(kwargs, "default");
+    let positional = args.len() > 1;
+    if positional && default.is_some() {
+        return Err(host::type_error(&format!(
+            "Cannot specify a default for {name}() with multiple positional arguments"
+        )));
+    }
+    let it = if positional {
+        None
     } else {
-        args.to_vec()
+        Some(host::make_iterator(&args[0])?)
     };
-    if items.is_empty() {
-        if let Some(d) = kw_get(kwargs, "default") {
-            return Ok(d);
-        }
-        return Err(format!(
-            "ValueError: {}() iterable argument is empty",
-            if want_max { "max" } else { "min" }
-        ));
-    }
     let key = kw_get(kwargs, "key");
-    let mut best = items[0].clone();
-    let mut best_k = eval_key(&key, &best)?;
-    for it in &items[1..] {
-        let k = eval_key(&key, it)?;
-        // Strict replacement so ties keep the FIRST element (CPython: `max`
-        // returns the first maximal, `min` the first minimal). A non-strict test
-        // (`!(k > best_k)` for min) would overwrite on equal keys.
-        let cmp = if want_max { NumOp::Gt } else { NumOp::Lt };
-        let take = numeric_hook(cmp, &k, &best_k)?;
-        if with_host(|h| h.truthy(&take)) {
-            best = it.clone();
-            best_k = k;
-        }
+    let cmp = if want_max { NumOp::Gt } else { NumOp::Lt };
+    let mut rest = args.iter();
+    let mut best: Option<(Value, Value)> = None;
+    loop {
+        let item = match &it {
+            None => match rest.next() {
+                Some(v) => v.clone(),
+                None => break,
+            },
+            Some(it) => match host::iter_step(it)? {
+                Some(v) => v,
+                None => break,
+            },
+        };
+        let val = eval_key(&key, &item)?;
+        best = match best {
+            None => Some((item, val)),
+            // Strict comparison: ties keep the FIRST extreme element.
+            Some((bi, bv)) => {
+                let take = numeric_hook(cmp, &val, &bv)?;
+                if with_host(|h| h.truthy(&take)) {
+                    Some((item, val))
+                } else {
+                    Some((bi, bv))
+                }
+            }
+        };
     }
-    Ok(best)
+    match (best, default) {
+        (Some((item, _)), _) => Ok(item),
+        (None, Some(d)) => Ok(d),
+        (None, None) => Err(format!("ValueError: {name}() iterable argument is empty")),
+    }
 }
 
 fn eval_key(key: &Option<Value>, v: &Value) -> Result<Value, String> {
@@ -17905,8 +17962,28 @@ pub fn type_new_meta(
     metaclass: &str,
     class_kwargs: Vec<(String, Value)>,
 ) -> Result<Value, String> {
-    let cname = with_host(|h| h.as_str(name))
-        .ok_or_else(|| host::type_error("type() argument 1 must be str"))?;
+    // `type.__new__`'s `UO!O!` arguments: a str, a tuple and a dict (or
+    // subclasses of them).
+    let kind_ok = |v: &Value, want: fn(&PyObj) -> bool| {
+        with_host(|h| match h.get(v) {
+            Some(PyObj::Instance(i)) => h.get(&i.payload).is_some_and(want),
+            Some(o) => want(o),
+            None => false,
+        })
+    };
+    let refuse = |n: usize, want: &str, v: &Value| {
+        host::type_error(&format!(
+            "type.__new__() argument {n} must be {want}, not {}",
+            with_host(|h| h.tp_name(v))
+        ))
+    };
+    let cname = with_host(|h| h.as_str(name)).ok_or_else(|| refuse(1, "str", name))?;
+    if !kind_ok(bases, |o| matches!(o, PyObj::Tuple(_))) {
+        return Err(refuse(2, "tuple", bases));
+    }
+    if !kind_ok(ns, |o| matches!(o, PyObj::Dict(_))) {
+        return Err(refuse(3, "dict", ns));
+    }
     // Base class names from the bases tuple (a bare `object` base is implicit).
     let base_names: Vec<String> = with_host(|h| match h.get(bases) {
         Some(PyObj::Tuple(items)) | Some(PyObj::List(items)) => items
