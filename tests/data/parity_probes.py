@@ -1688,3 +1688,47 @@ def check(x):
     if x < 0: raise ValueError('negative: %d' % x)
     return x
 check(-1)
+#==#
+# ── `type.__new__` refuses an MRO it cannot build ────────────────────────────
+# `mro_implementation`: a base listed twice, or bases whose linearizations
+# cannot be merged (the message names every unmerged list head once).
+class X: pass
+class Y(X): pass
+for bases in [(X, Y), (X, X)]:
+    try:
+        type('Z', bases, {})
+    except TypeError as e:
+        print(e)
+class A: pass
+class B: pass
+class C(A, B): pass
+class D(B, A): pass
+try:
+    class E(C, D): pass
+except TypeError as e:
+    print(e)
+class H(Y, X): pass
+print([k.__name__ for k in H.__mro__])
+#==#
+# ── `open()` takes any path-like `file` ──────────────────────────────────────
+# `os.fspath` semantics: a `__fspath__` object opens the path it names, a bytes
+# path is named by its repr in the error, anything else is a TypeError.
+import pathlib, tempfile, os
+d = tempfile.mkdtemp()
+p = pathlib.Path(d) / 'f.txt'
+with open(p, 'w') as f:
+    f.write('hi')
+with open(str(p).encode()) as f:
+    print(f.read())
+class Where:
+    def __fspath__(self):
+        return str(p)
+with open(Where()) as f:
+    print(f.read())
+os.remove(p)
+os.rmdir(d)
+for bad in [None, [], b'/no/such/file', "/no/such/it's"]:
+    try:
+        open(bad)
+    except (TypeError, OSError) as e:
+        print(type(e).__name__, e)

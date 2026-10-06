@@ -412,6 +412,32 @@ pub(crate) fn raw_getattr(recv: &Value, name: &str) -> Result<Value, String> {
     }
 }
 
+/// `PyOS_FSPath`: a `str` or `bytes` path as it is, otherwise the answer of the
+/// object's `__fspath__`, which must itself be `str` or `bytes`.
+fn fspath(v: &Value) -> Result<Value, String> {
+    let is_path = |v: &Value| {
+        matches!(v, Value::Str(_))
+            || with_host(|h| matches!(h.get(v), Some(PyObj::Str(_)) | Some(PyObj::Bytes(_))))
+    };
+    if is_path(v) {
+        return Ok(v.clone());
+    }
+    let tname = with_host(|h| h.type_name(v));
+    let Ok(method) = get_attr_desc(v, "__fspath__") else {
+        return Err(host::type_error(&format!(
+            "expected str, bytes or os.PathLike object, not {tname}"
+        )));
+    };
+    let r = host::invoke(&method, vec![], vec![])?;
+    if is_path(&r) {
+        return Ok(r);
+    }
+    let rname = with_host(|h| h.type_name(&r));
+    Err(host::type_error(&format!(
+        "expected {tname}.__fspath__() to return str or bytes, not {rname}"
+    )))
+}
+
 /// The exception object for error line `e`. `h.exc` is authoritative only when
 /// it matches the line just produced (an explicit `raise`, or a builtin that
 /// installed its own exception, e.g. `KeyError`). Otherwise `h.exc` is a stale
@@ -7676,8 +7702,16 @@ pub fn call_builtin_function(
             let file = kw_get(&kwargs, "file")
                 .or_else(|| args.first().cloned())
                 .ok_or_else(|| host::type_error("open() missing required argument: 'file'"))?;
-            let path = with_host(|h| h.as_str(&file))
-                .ok_or_else(|| host::type_error("open() argument 'file' must be str"))?;
+            // `_io.open` takes any path-like `file` (`os.fspath`), and an
+            // `OSError` names it by its `repr` — `b'…'` for a bytes path.
+            let file = fspath(&file)?;
+            let (path, shown) = with_host(|h| {
+                let path = match h.get(&file) {
+                    Some(PyObj::Bytes(b)) => String::from_utf8_lossy(b).into_owned(),
+                    _ => h.as_str(&file).unwrap_or_default().to_string(),
+                };
+                (path, h.repr_of(&file))
+            });
             let mode = kw_get(&kwargs, "mode")
                 .or_else(|| args.get(1).cloned())
                 .and_then(|v| with_host(|h| h.as_str(&v)))
@@ -7695,7 +7729,13 @@ pub fn call_builtin_function(
             };
             let encoding = str_arg("encoding", 3);
             let newline = str_arg("newline", 5);
-            host::open_file(&path, &mode, encoding.as_deref(), newline.as_deref())
+            host::open_file(
+                &path,
+                &shown,
+                &mode,
+                encoding.as_deref(),
+                newline.as_deref(),
+            )
         }
         // `object()` takes nothing at all — neither positional nor keyword.
         // Both were being ignored, so `object(x=1)` built an instance.
@@ -17545,6 +17585,7 @@ pub fn type_new_meta(
                 .collect(),
             _ => host::NameMap::default(),
         });
+    with_host(|h| h.check_mro(&base_names))?;
     let cls =
         with_host(|h| h.register_class_meta(&cname, base_names, namespace.clone(), metaclass));
     // Descriptor naming and PEP 487 both run inside `type.__new__` in CPython —

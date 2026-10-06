@@ -160,7 +160,8 @@ use std::path::PathBuf;
 /// v53: a function's `__annotate__` is marked (`FuncDef::is_annotate`, a new
 /// field) so its code object names the parameter `format`.
 /// v54: a `raise` statement's op carries the statement's extent as its caret span.
-const SCHEMA: u64 = 54;
+/// v55: `BUILD_CLASS` carries the class statement's line.
+const SCHEMA: u64 = 55;
 
 /// The shard's INDEX: everything a lookup needs, and nothing it does not.
 ///

@@ -12273,6 +12273,59 @@ impl PyHost {
         result
     }
 
+    /// The refusals `mro_implementation` (`Objects/typeobject.c`) makes before a
+    /// class with these `bases` is created: a base listed twice
+    /// (`check_duplicates`), and bases whose linearizations cannot be merged
+    /// (`set_mro_error`, which names the head of every list still unmerged,
+    /// each class once, in list order).
+    pub fn check_mro(&self, bases: &[String]) -> Result<(), String> {
+        let name_of = |c: &str| match self.classes.get(c) {
+            Some(cd) => cd.name.clone(),
+            None => c.rsplit('.').next().unwrap_or(c).to_string(),
+        };
+        if let Some((_, dup)) = bases
+            .iter()
+            .enumerate()
+            .find(|(i, b)| bases[..*i].contains(b))
+        {
+            return Err(type_error(&format!(
+                "duplicate base class {}",
+                name_of(dup)
+            )));
+        }
+        let mut seqs: Vec<Vec<String>> = bases.iter().map(|b| self.mro_of(b)).collect();
+        seqs.push(bases.to_vec());
+        loop {
+            seqs.retain(|s| !s.is_empty());
+            if seqs.is_empty() {
+                return Ok(());
+            }
+            let head = seqs
+                .iter()
+                .map(|s| &s[0])
+                .find(|h| !seqs.iter().any(|t| t[1..].contains(h)))
+                .cloned();
+            let Some(head) = head else {
+                let mut heads: Vec<&String> = Vec::new();
+                for s in &seqs {
+                    if !heads.contains(&&s[0]) {
+                        heads.push(&s[0]);
+                    }
+                }
+                let names: Vec<String> = heads.iter().map(|c| name_of(c)).collect();
+                return Err(type_error(&format!(
+                    "Cannot create a consistent method resolution order (MRO) for bases {}",
+                    names.join(", ")
+                )));
+            };
+            for s in &mut seqs {
+                if s.first() == Some(&head) {
+                    s.remove(0);
+                }
+            }
+        }
+    }
+
     /// Look up a name in a class's MRO namespace.
     pub fn class_lookup(&self, class: &str, name: &str) -> Option<Value> {
         // `mro_rc` rather than `mro_of`: this runs on every attribute read, and
@@ -18496,7 +18549,10 @@ pub fn build_class(
     };
     let cls = match &effective_meta {
         Some(m) => metaclass_create(m, name, &bases, &ns, &class_kwargs)?,
-        None => with_host(|h| h.register_class(name, bases, ns.clone())),
+        None => {
+            with_host(|h| h.check_mro(&bases))?;
+            with_host(|h| h.register_class(name, bases, ns.clone()))
+        }
     };
     // Record the class's `__qualname__` (carried on the class-body `FuncDef`,
     // whose qualname was set to the class's dotted path at compile time).
@@ -23609,8 +23665,11 @@ impl PyHost {
 /// `open(path, mode)` — open a file and return a `File` handle value. The text
 /// modes `r`/`w`/`a`/`x` and their `+` / `b` / `t` variants are supported; bytes
 /// vs text is handled at the read/write layer, not here.
+/// `shown` is the file argument as an `OSError` names it: its `repr` (`'a.txt'`,
+/// `b'a.txt'`).
 pub fn open_file(
     path: &str,
+    shown: &str,
     mode: &str,
     encoding: Option<&str>,
     newline: Option<&str>,
@@ -23676,13 +23735,13 @@ pub fn open_file(
     };
     let f = opts.open(path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => {
-            format!("FileNotFoundError: [Errno 2] No such file or directory: '{path}'")
+            format!("FileNotFoundError: [Errno 2] No such file or directory: {shown}")
         }
         std::io::ErrorKind::AlreadyExists => {
-            format!("FileExistsError: [Errno 17] File exists: '{path}'")
+            format!("FileExistsError: [Errno 17] File exists: {shown}")
         }
         std::io::ErrorKind::PermissionDenied => {
-            format!("PermissionError: [Errno 13] Permission denied: '{path}'")
+            format!("PermissionError: [Errno 13] Permission denied: {shown}")
         }
         // Every other `open` failure keeps the OS's own errno and strerror, so
         // `.errno` and the `OSError` subclass are right rather than a generic
@@ -23693,7 +23752,7 @@ pub fn open_file(
         _ => {
             let eno = e.raw_os_error().unwrap_or(0);
             format!(
-                "{}: [Errno {eno}] {}: '{path}'",
+                "{}: [Errno {eno}] {}: {shown}",
                 errno_exc_class(eno),
                 errno_strerror(eno, &e)
             )
@@ -23704,7 +23763,7 @@ pub fn open_file(
     // `fstat` and raises `IsADirectoryError` itself.
     if f.metadata().map(|m| m.is_dir()).unwrap_or(false) {
         return Err(format!(
-            "IsADirectoryError: [Errno 21] Is a directory: '{path}'"
+            "IsADirectoryError: [Errno 21] Is a directory: {shown}"
         ));
     }
     Ok(with_host(|h| {

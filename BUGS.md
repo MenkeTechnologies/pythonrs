@@ -46,6 +46,16 @@ written.
   the traceback is printed, for the final exception and each one in its
   `__cause__`/`__context__` chain; one that raises or answers a non-`str` is
   `<exception str() failed>`.
+- **`type.__new__` refuses an MRO it cannot build.** A base listed twice is
+  `TypeError: duplicate base class X`, and bases whose linearizations do not
+  merge are `Cannot create a consistent method resolution order (MRO) for
+  bases X, Y`; both classes used to be created with a best-effort MRO. An
+  error raised while a class is being created is reported at the `class`
+  line (it was `line 0`).
+- **`open()` takes any path-like `file`** (`pathlib.Path`, an object with
+  `__fspath__`, a bytes path), refuses anything else with `expected str, bytes
+  or os.PathLike object, not T`, and names the file in an `OSError` by its
+  `repr` (`b'…'`, or double quotes around a path holding `'`).
 - **A `raise` statement is underlined in a traceback** when it does not fill
   its line (`x = 1; raise ValueError('x')`, `def f(): raise E`), and an
   exception's `__notes__` (`add_note`) are printed under its final line.
@@ -2454,6 +2464,19 @@ written.
   never runs. Closing it at the loop is not a fix: whether the loop held the
   LAST reference is not visible there (`it = gen(); for v in it: break;
   next(it)` must keep it open).
+- **f-string syntax errors.** The body of an f-string is split on braces at
+  the string level, so an unmatched `}` (`f'}'`) and an empty field (`f'{}'`)
+  are accepted, and an unterminated field (`f'{'`, `f'{x!'`) or a bad
+  conversion (`f'{x!z}'`) reports `unterminated string` / `invalid syntax`
+  without a position, where CPython's PEP 701 tokenizer reports `f-string:
+  single '}' is not allowed`, `f-string: valid expression required before
+  '}'`, `f-string: expecting '}'` and `f-string: invalid conversion character
+  'z': expected 's', 'r', or 'a'` at the column concerned.
+- **`open(fd)` and a file's `name`.** An integer file descriptor is not
+  accepted, and `f.name` is the decoded `str` for a bytes path where CPython
+  keeps the `bytes`.
+- **A class statement with a non-class base** (`class X(5): pass`) is
+  accepted; CPython raises from the metaclass call.
 - **A traceback entry for a statement or expression spread over several
   lines shows only its first line.** CPython 3.13+ prints every line of the
   failing node with its carets (`int(\n    'x')` shows `int(` with `~~~^` and

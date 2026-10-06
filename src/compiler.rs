@@ -2512,6 +2512,7 @@ impl Compiler {
     ) -> Result<(), String> {
         // Class body compiles as a parameterless function that assigns members
         // into its local env; BUILD_CLASS captures that env as the namespace.
+        let class_line = self.cur_line;
         let empty = Params::default();
         self.fn_depth += 1;
         let def_id = self.build_function_qn(
@@ -2551,7 +2552,9 @@ impl Compiler {
             c.strlit(b, ckw[i].name.as_ref().unwrap());
             c.compile_expr(b, &ckw[i].value)
         })?; // [meta,bases,name,bodyfunc,kwargs]
-        b.emit(Op::CallBuiltin(ops::BUILD_CLASS, 5), 0); // -> class value
+             // The class statement's line: `type.__new__`'s refusals (an
+             // inconsistent MRO, a duplicate base) and `__init_subclass__` raise here.
+        b.emit(Op::CallBuiltin(ops::BUILD_CLASS, 5), class_line); // -> class value
         for d in decorators.iter().rev() {
             self.compile_expr(b, d)?;
             b.emit(Op::Swap, 0);
