@@ -4341,12 +4341,26 @@ fn name_error_init(e: &Value, class: &str, kwargs: &[(String, Value)]) -> Result
 /// A builtin exception class called with `args`/`kwargs`: the exception object
 /// plus whatever its own `__init__` binds beyond `args` — `SyntaxError`'s
 /// location, `AttributeError`'s and `NameError`'s keywords, the Unicode
-/// errors' five-tuple.
+/// errors' five-tuple, and the `OSError` family's `oserror_init` split (which
+/// can also narrow `OSError` itself to the errno's subclass).
 pub(crate) fn construct_builtin_exception(
     class: &str,
     args: Vec<Value>,
     kwargs: &[(String, Value)],
 ) -> Result<Value, String> {
+    if is_oserror_class(class) {
+        return Ok(with_host(|h| {
+            let parts = host::oserror_parts(h, class, args);
+            let e = h.alloc(PyObj::Exception {
+                class: parts.class,
+                args: parts.args,
+            });
+            for (name, val) in parts.attrs {
+                let _ = h.set_attr(&e, name, val);
+            }
+            e
+        }));
+    }
     let e = with_host(|h| {
         h.alloc(PyObj::Exception {
             class: class.to_string(),
@@ -4628,7 +4642,7 @@ fn split_line_suffix(msg: &str) -> (&str, Option<i64>) {
 
 /// Whether `class` is `OSError` or one of the `errno`-mapped subclasses CPython
 /// gives `oserror_init`'s two-argument shape.
-fn is_oserror_class(class: &str) -> bool {
+pub fn is_oserror_class(class: &str) -> bool {
     matches!(
         class,
         "OSError"
@@ -7441,13 +7455,15 @@ pub fn call_builtin_function(
             // them — and every object that defines none — answer `0j`.
             let (r, ri) = match args.first() {
                 Some(v) => complex_parts(v, args.len() > 1)?,
-                None => (0.0, 0.0),
+                None => (0.0, None),
             };
-            let i = match args.get(1) {
-                Some(v) => complex_imag(v)?,
-                None => 0.0,
+            // `ci.real += cr.imag` only when the first argument was complex.
+            let i = match (args.get(1), ri) {
+                (Some(v), Some(ri)) => complex_imag(v)? + ri,
+                (Some(v), None) => complex_imag(v)?,
+                (None, ri) => ri.unwrap_or(0.0),
             };
-            Ok(with_host(|h| h.alloc(PyObj::Complex(r, i + ri))))
+            Ok(with_host(|h| h.alloc(PyObj::Complex(r, i))))
         }
         // `bytes(source=…, encoding=…, errors=…)` takes all three by keyword;
         // dropping them made `bytes(source=[1,2])` the empty `bytes()`.
@@ -7461,28 +7477,24 @@ pub fn call_builtin_function(
                 &args,
                 &kwargs,
             )?;
-            // `bytes_new_impl`'s argument checks: a `str` source needs an
-            // encoding, and an encoding or `errors` needs a `str` source. Without
-            // them `bytes("x")` encoded as UTF-8 and `bytes("x", errors=…)` took
-            // the error handler for the encoding.
-            let [source, encoding, errors] = &slots;
-            let is_text = source
-                .as_ref()
-                .is_some_and(|s| with_host(|h| h.as_str(s).is_some()));
-            let misuse = match (is_text, encoding.is_some(), errors.is_some()) {
-                (true, false, _) => Some("string argument without an encoding"),
-                (false, true, _) => Some("encoding without a string argument"),
-                (false, false, true) => Some("errors without a string argument"),
-                _ => None,
-            };
-            if let Some(msg) = misuse {
-                return Err(host::type_error(msg));
+            // `bytes_new_impl`'s argument checks come first: `encoding`/`errors`
+            // must be `str`, a `str` source needs an encoding and goes through
+            // that codec, and an encoding or `errors` needs a `str` source.
+            let [source, encoding, errors] = slots;
+            if let Some(b) = bytes_text_args(name, source.as_ref(), encoding, errors)? {
+                return Ok(with_host(|h| {
+                    if name == "bytes" {
+                        h.alloc(PyObj::Bytes(b))
+                    } else {
+                        h.alloc(PyObj::Bytearray(b))
+                    }
+                }));
             }
             // `bytes(x)` asks `x.__bytes__()` before the buffer and iterable
             // protocols, and the answer must be `bytes`. `bytearray` has no such
             // hook.
             if name == "bytes" {
-                if let Some(src) = source {
+                if let Some(src) = &source {
                     let has = with_host(
                         |h| matches!(h.get(src), Some(PyObj::Instance(i)) if instance_has(h, i, "__bytes__")),
                     );
@@ -7500,8 +7512,7 @@ pub fn call_builtin_function(
                     }
                 }
             }
-            let bargs: Vec<Value> = slots.into_iter().flatten().collect();
-            let b = build_bytes(&bargs)?;
+            let b = build_bytes(source.as_ref())?;
             Ok(with_host(|h| {
                 if name == "bytes" {
                     h.alloc(PyObj::Bytes(b))
@@ -8457,6 +8468,8 @@ pub fn hash_key(k: &PKey) -> i64 {
             hash_pkey_into(k, &mut h);
             h.finish() as i64
         }
+        // `meth_hash`: the receiver's identity hash XOR the function's hash.
+        PKey::Method { recv, func } => hash_key(recv) ^ hash_key(func),
     }
 }
 
@@ -8795,18 +8808,54 @@ fn round_float(f: f64, has_nd: bool, nd: Option<i64>) -> Result<Value, String> {
                 },
             }
         }
+        // `float_round_impl`: past `NDIGITS_MAX` every digit is kept, below
+        // `NDIGITS_MIN` the result is a zero carrying `x`'s sign.
+        Some(d) if d > 323 => Value::Float(f),
+        Some(d) if d < -308 => Value::Float(0.0 * f),
         Some(d) if d >= 0 => {
             let s = format!("{f:.*}", d as usize);
             Value::Float(s.parse::<f64>().unwrap_or(f))
         }
-        Some(d) => {
-            // Negative ndigits: round-half-even at 10**-d, keep the float type.
-            let p = 10f64.powi((-d) as i32);
-            let scaled = f / p;
-            let rounded: f64 = format!("{scaled:.0}").parse().unwrap_or(scaled);
-            Value::Float(rounded * p)
-        }
+        Some(d) => Value::Float(round_float_neg(f, (-d) as u32)?),
     })
+}
+
+/// `double_round` for a negative `ndigits`: round the EXACT binary value of `f`
+/// half-to-even at `10**k` (what `_Py_dg_dtoa` mode 3 does) and read the digits
+/// back with a correctly rounded parse. Dividing by a power of ten in floating
+/// point first, as this used to, rounded twice: `round(1.5e300, -300)` was
+/// `1.0000000000000006e+300` instead of `2e+300`.
+fn round_float_neg(f: f64, k: u32) -> Result<f64, String> {
+    use num_bigint::BigInt;
+    use num_integer::Integer;
+    let bits = f.to_bits();
+    let raw_exp = ((bits >> 52) & 0x7ff) as i64;
+    let frac = bits & ((1u64 << 52) - 1);
+    // f = mant * 2**exp, exactly.
+    let (mant, exp) = if raw_exp == 0 {
+        (frac, -1074)
+    } else {
+        (frac | (1u64 << 52), raw_exp - 1075)
+    };
+    let pow10 = BigInt::from(10).pow(k);
+    let (num, den) = if exp >= 0 {
+        (BigInt::from(mant) << exp as usize, pow10)
+    } else {
+        (BigInt::from(mant), pow10 << (-exp) as usize)
+    };
+    let (q, r) = num.div_rem(&den);
+    let twice: BigInt = r * 2u32;
+    let q = if twice > den || (twice == den && q.is_odd()) {
+        q + 1u32
+    } else {
+        q
+    };
+    let sign = if f.is_sign_negative() { "-" } else { "" };
+    let rounded: f64 = format!("{sign}{q}e{k}").parse().unwrap_or(f);
+    if rounded.is_infinite() {
+        return Err("OverflowError: rounded value too large to represent".into());
+    }
+    Ok(rounded)
 }
 
 fn int_radix(args: &[Value], radix: u32, prefix: &str) -> Result<Value, String> {
@@ -8857,10 +8906,37 @@ fn construct_int(args: &[Value]) -> Result<Value, String> {
             return Ok(r);
         }
     }
-    let base = args
-        .get(1)
-        .and_then(|b| with_host(|h| h.as_int(b)))
-        .unwrap_or(10);
+    // An explicit base (`long_new_impl`): it must be an integer, and only a
+    // `str`, `bytes` or `bytearray` can be read in it — `int(5, 2)` and
+    // `int(1.5, 10)` are TypeErrors, not the value they would be in base 10.
+    let base = match args.get(1) {
+        None => 10,
+        Some(b) => {
+            // `PyNumber_AsSsize_t(obase, NULL)`: `__index__` is honoured, and a
+            // base past `Py_ssize_t` clamps (so it fails the range check below).
+            let b = indexed(b)?;
+            let base = match with_host(|h| (h.as_int(&b), h.big_val(&b))) {
+                (Some(n), _) => n,
+                (None, Some(_)) => i64::MAX,
+                (None, None) => {
+                    return Err(host::type_error(&format!(
+                        "'{}' object cannot be interpreted as an integer",
+                        with_host(|h| h.type_name(&b))
+                    )))
+                }
+            };
+            let textual = with_host(|h| {
+                h.as_str(&v).is_some()
+                    || matches!(h.get(&v), Some(PyObj::Bytes(_) | PyObj::Bytearray(_)))
+            });
+            if !textual {
+                return Err(host::type_error(
+                    "int() can't convert non-string with explicit base",
+                ));
+            }
+            base
+        }
+    };
     // `BigInt::parse_bytes` PANICS on a radix outside 2..=36, so an out-of-range
     // base aborted the interpreter instead of raising.
     if base != 0 && !(2..=36).contains(&base) {
@@ -9066,7 +9142,15 @@ fn int_digit_value(c: char) -> Option<u32> {
 /// that isn't an exponent sign separates the real and imaginary parts.
 fn parse_complex(s: &str) -> Result<(f64, f64), String> {
     let err = || "ValueError: complex() arg is a malformed string".to_string();
-    let mut t = s.trim();
+    // The WHOLE string is normalized first (`complex_from_string` runs the
+    // decimal/space transform and the underscore check before splitting).
+    let text = strip_number_underscores(&ascii_numeric(s)).ok_or_else(|| {
+        format!(
+            "ValueError: could not convert string to complex: {}",
+            host::quote_str(s)
+        )
+    })?;
+    let mut t = text.trim();
     if let Some(inner) = t.strip_prefix('(').and_then(|x| x.strip_suffix(')')) {
         t = inner.trim();
     }
@@ -9108,12 +9192,59 @@ fn parse_imag(s: &str) -> Result<f64, String> {
     }
 }
 
+/// Port of `_PyUnicode_TransformDecimalAndSpaceToASCII`, the first step of
+/// `float()`/`complex()` on a `str`: Unicode whitespace becomes a space, a
+/// Unicode decimal digit its ASCII digit, and any other non-ASCII character
+/// `?`, which no number grammar accepts.
+fn ascii_numeric(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if is_py_space(c) {
+                ' '
+            } else if c.is_ascii() {
+                c
+            } else if is_decimal_char(c) {
+                int_digit_value(c)
+                    .and_then(|d| char::from_digit(d, 10))
+                    .unwrap_or('?')
+            } else {
+                '?'
+            }
+        })
+        .collect()
+}
+
+/// Port of `_Py_string_to_number_with_underscores`: an `_` is legal only
+/// between two digits, and is dropped. `None` for a misplaced one.
+fn strip_number_underscores(s: &str) -> Option<String> {
+    let mut out = String::with_capacity(s.len());
+    let mut prev = '\0';
+    for c in s.chars() {
+        if c == '_' {
+            if !prev.is_ascii_digit() {
+                return None;
+            }
+        } else {
+            if prev == '_' && !c.is_ascii_digit() {
+                return None;
+            }
+            out.push(c);
+        }
+        prev = c;
+    }
+    (prev != '_').then_some(out)
+}
+
 /// Parse a Python float string (`inf`/`infinity`/`nan` in any case and with a
-/// sign, as `_Py_parse_inf_or_nan` reads them; underscores), or `None`. A NaN
-/// spelled in the string is a NEW float object carrying the string's sign
-/// (`float('-nan')` is negative), so it gets an identity of its own.
+/// sign, as `_Py_parse_inf_or_nan` reads them; PEP 515 underscores; Unicode
+/// digits and whitespace), or `None`. A NaN spelled in the string is a NEW
+/// float object carrying the string's sign (`float('-nan')` is negative), so
+/// it gets an identity of its own.
 fn parse_py_float(s: &str) -> Option<f64> {
-    let f = s.trim().replace('_', "").parse::<f64>().ok()?;
+    let f = strip_number_underscores(&ascii_numeric(s))?
+        .trim()
+        .parse::<f64>()
+        .ok()?;
     Some(if f.is_nan() {
         host::fresh_nan(f.is_sign_negative())
     } else {
@@ -9121,15 +9252,17 @@ fn parse_py_float(s: &str) -> Option<f64> {
     })
 }
 
-/// The `(real, imag)` a `complex()` FIRST argument contributes.
+/// The `(real, imag)` a `complex()` FIRST argument contributes; `imag` is
+/// `None` when the argument was not complex (CPython's `cr_is_complex`), so the
+/// caller adds nothing to the imaginary part and a `-0.0` there survives.
 ///
 /// CPython's `complex_new`: `__complex__` wins (and may contribute an imaginary
 /// part), then the real coercion. `two_args` selects the refusal wording — with
 /// a second argument the first must be a REAL, so a string is refused there
 /// (`argument 'real' must be a real number`) instead of being parsed.
-fn complex_parts(v: &Value, two_args: bool) -> Result<(f64, f64), String> {
+fn complex_parts(v: &Value, two_args: bool) -> Result<(f64, Option<f64>), String> {
     if let Some(rc) = with_host(|h| match h.get(v) {
-        Some(PyObj::Complex(r, i)) => Some((*r, *i)),
+        Some(PyObj::Complex(r, i)) => Some((*r, Some(*i))),
         _ => None,
     }) {
         return Ok(rc);
@@ -9140,7 +9273,7 @@ fn complex_parts(v: &Value, two_args: bool) -> Result<(f64, f64), String> {
     if has_complex {
         let r = host::call_method(v, "__complex__", vec![], vec![])?;
         return with_host(|h| match h.get(&r) {
-            Some(PyObj::Complex(re, im)) => Ok((*re, *im)),
+            Some(PyObj::Complex(re, im)) => Ok((*re, Some(*im))),
             _ => Err(host::type_error(&format!(
                 "__complex__ returned non-complex (type {})",
                 h.type_name(&r)
@@ -9148,7 +9281,7 @@ fn complex_parts(v: &Value, two_args: bool) -> Result<(f64, f64), String> {
         });
     }
     match math_real(v) {
-        Ok(f) => Ok((f, 0.0)),
+        Ok(f) => Ok((f, None)),
         // With a second argument the first is a REAL, not a "string or a
         // number": `complex('1', 1)` names `'real'` rather than reporting a
         // string it would have parsed had it stood alone.
@@ -9257,8 +9390,9 @@ fn construct_float(args: &[Value]) -> Result<Value, String> {
                     ))
                 })?,
             };
-            let shown = shown.unwrap_or_else(|| format!("'{s}'"));
-            // Underscores may group digits (`float("1_000.5")`).
+            // The message shows the ARGUMENT's repr (`float('1.5\x00')` names
+            // the NUL escaped), not the text as parsed.
+            let shown = shown.unwrap_or_else(|| h.repr_of(&v));
             parse_py_float(&s)
                 .map(Value::Float)
                 .ok_or_else(|| format!("ValueError: could not convert string to float: {shown}"))
@@ -16432,7 +16566,7 @@ fn async_generator_method(recv: &Value, name: &str, args: Vec<Value>) -> Result<
 fn exc_error_string(exc: &Value) -> String {
     with_host(|h| match h.get(exc) {
         Some(PyObj::Exception { class, args }) => {
-            let msg = h.exc_message(class, args);
+            let msg = h.exc_obj_message(exc, class, args);
             if msg.is_empty() {
                 class.clone()
             } else {
@@ -19120,6 +19254,22 @@ fn num_dunder(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
         }
     };
 
+    // Ternary `__pow__(exp, mod)` / `__rpow__(base, mod)`: a modulus that is not
+    // `None` makes it three-argument `pow()`, as `long_pow`/`float_pow` do once
+    // the operand has been accepted.
+    if let ("__pow__" | "__rpow__", Some(m)) = (name, args.get(1)) {
+        if !matches!(m, Value::Undef) {
+            if !accepts(&b) {
+                return ni();
+            }
+            return if name == "__pow__" {
+                pow_mod(recv, &b, m)
+            } else {
+                pow_mod(&b, recv, m)
+            };
+        }
+    }
+
     match name {
         // --- unary / conversion (operand ignored) ---
         "__abs__" => call_builtin_function("abs", vec![recv.clone()], vec![]),
@@ -21210,13 +21360,54 @@ fn split_lines(bytes: &[u8], keepends: bool) -> Vec<Vec<u8>> {
     out
 }
 
-/// Build the byte content for a `bytes()` / `bytearray()` constructor call.
-/// Handles `()` → empty, `int` → that many zero bytes, a bytes-like copy, a
-/// `str` (with an optional encoding), and an iterable of ints.
-fn build_bytes(args: &[Value]) -> Result<Vec<u8>, String> {
-    let v = match args.first() {
-        None => return Ok(vec![]),
-        Some(v) => v,
+/// The argument rules `bytes_new` and `bytearray___init__` share for
+/// `encoding`/`errors`: both must be `str`; a `str` source needs an encoding
+/// and is run through that codec (with `errors`); an encoding or errors
+/// handler with no `str` to apply it to is a `TypeError`. `Some` is the encoded
+/// text; `None` means the source is not a `str` and neither was given.
+fn bytes_text_args(
+    name: &str,
+    source: Option<&Value>,
+    encoding: Option<Value>,
+    errors: Option<Value>,
+) -> Result<Option<Vec<u8>>, String> {
+    let text_arg = |v: Option<Value>, arg: &str| -> Result<Option<String>, String> {
+        let Some(v) = v else { return Ok(None) };
+        with_host(|h| match h.as_str(&v) {
+            Some(s) => Ok(Some(s)),
+            None => Err(host::type_error(&format!(
+                "{name}() argument '{arg}' must be str, not {}",
+                h.type_name(&v)
+            ))),
+        })
+    };
+    let encoding = text_arg(encoding, "encoding")?;
+    let errors = text_arg(errors, "errors")?;
+    let unused = || {
+        host::type_error(if encoding.is_some() {
+            "encoding without a string argument"
+        } else {
+            "errors without a string argument"
+        })
+    };
+    if let Some(s) = source.and_then(|v| with_host(|h| h.as_str(v))) {
+        return match &encoding {
+            Some(enc) => encode_str(&s, enc, errors.as_deref().unwrap_or("strict")).map(Some),
+            None => Err(host::type_error("string argument without an encoding")),
+        };
+    }
+    if encoding.is_some() || errors.is_some() {
+        return Err(unused());
+    }
+    Ok(None)
+}
+
+/// Build the byte content for a `bytes()` / `bytearray()` source that is not a
+/// `str` (see [`bytes_text_args`]): none is empty, an `int` that many zero
+/// bytes, a bytes-like a copy, and anything else an iterable of ints.
+fn build_bytes(source: Option<&Value>) -> Result<Vec<u8>, String> {
+    let Some(v) = source else {
+        return Ok(vec![]);
     };
     // `bytes(n)` takes a count, so an object with `__index__` is one. Without
     // this it fell through to the iterable arm and reported "not iterable".
@@ -21245,18 +21436,6 @@ fn build_bytes(args: &[Value]) -> Result<Vec<u8>, String> {
     }
     if let Some(b) = as_bytes_object(v)? {
         return Ok(b);
-    }
-    if let Some(s) = with_host(|h| h.as_str(v)) {
-        let enc = args
-            .get(1)
-            .and_then(|e| with_host(|h| h.as_str(e)))
-            .map(|e| e.to_lowercase().replace(['-', '_'], ""));
-        return match enc.as_deref() {
-            Some("latin1") | Some("latin") | Some("iso88591") | Some("l1") => {
-                Ok(s.chars().map(|c| c as u32 as u8).collect())
-            }
-            _ => Ok(s.into_bytes()),
-        };
     }
     collect_bytes(v)
 }
@@ -22364,87 +22543,260 @@ fn fmt_nonfinite(f: f64, upper: bool) -> Option<String> {
     }
 }
 
-pub fn apply_format_spec(s: &str, v: &Value, spec: &str) -> Result<String, String> {
-    if spec.is_empty() {
-        return Ok(s.to_string());
-    }
+/// A parsed `[[fill]align][sign]["z"]["#"]["0"][width][grouping]["." precision][type]`
+/// format spec: the fields of CPython's `InternalFormatSpec`.
+struct FormatSpec {
+    fill: char,
+    /// `'\0'` when no alignment was written or implied.
+    align: char,
+    /// Whether alignment was written explicitly (`<`/`>`/`^`/`=`), as opposed to
+    /// being implied by the `0` flag — CPython rejects an explicit `=` on
+    /// strings but accepts the `0`-implied form.
+    align_explicit: bool,
+    sign: char,
+    /// `z` (PEP 682): a float that rounds to zero loses its `-`.
+    no_neg_0: bool,
+    alt: bool,
+    /// `0` when no width was written.
+    width: usize,
+    group: Option<char>,
+    prec: Option<usize>,
+    /// `'\0'` when no presentation type was written.
+    ty: char,
+}
+
+/// Port of `parse_internal_render_format_spec` (`Python/formatter_unicode.c`).
+/// Only the checks that look at the spec alone live here — the per-type ones
+/// are [`validate_format_spec`]'s and the complex ones [`format_complex`]'s.
+/// `tyname` names the formatted value's type for the trailing-junk error.
+fn parse_format_spec(spec: &str, tyname: impl Fn() -> String) -> Result<FormatSpec, String> {
     let chars: Vec<char> = spec.chars().collect();
+    let is_align = |c: char| matches!(c, '<' | '>' | '^' | '=');
+    let mut f = FormatSpec {
+        fill: ' ',
+        align: '\0',
+        align_explicit: false,
+        sign: '\0',
+        no_neg_0: false,
+        alt: false,
+        width: 0,
+        group: None,
+        prec: None,
+        ty: '\0',
+    };
     let mut i = 0;
-    let mut fill = ' ';
-    let mut align = '\0';
-    // Whether alignment was written explicitly (`<`/`>`/`^`/`=`), as opposed to
-    // being implied by the `0` flag — CPython rejects an explicit `=` on strings
-    // but accepts the `0`-implied form.
-    let mut align_explicit = false;
-    // Whether a FILL char was written. Tracked separately from the alignment
-    // because the `0` flag keys off it alone: `'<08d'` writes an alignment but
-    // no fill, so the `0` still becomes the fill (`format(1, '<08d')` is
-    // `10000000`), while `'*<08d'` names its own fill and the `0` is part of
-    // the width instead.
+    // Whether a FILL char was written. The `0` flag keys off it alone: `'<08d'`
+    // writes an alignment but no fill, so the `0` still becomes the fill
+    // (`format(1, '<08d')` is `10000000`), while `'*<08d'` names its own fill
+    // and the `0` is part of the width instead.
     let mut fill_explicit = false;
-    // [[fill]align]
-    if chars.len() >= 2 && matches!(chars[1], '<' | '>' | '^' | '=') {
-        fill = chars[0];
-        align = chars[1];
-        align_explicit = true;
+    if chars.len() >= 2 && is_align(chars[1]) {
+        f.fill = chars[0];
+        f.align = chars[1];
+        f.align_explicit = true;
         fill_explicit = true;
         i = 2;
-    } else if !chars.is_empty() && matches!(chars[0], '<' | '>' | '^' | '=') {
-        align = chars[0];
-        align_explicit = true;
+    } else if chars.first().is_some_and(|&c| is_align(c)) {
+        f.align = chars[0];
+        f.align_explicit = true;
         i = 1;
     }
-    let mut sign = '\0';
-    if i < chars.len() && matches!(chars[i], '+' | '-' | ' ') {
-        sign = chars[i];
+    let at = |i: usize, c: char| chars.get(i) == Some(&c);
+    if chars.get(i).is_some_and(|c| matches!(c, '+' | '-' | ' ')) {
+        f.sign = chars[i];
         i += 1;
     }
-    let mut alt = false;
-    if i < chars.len() && chars[i] == '#' {
-        alt = true;
+    if at(i, 'z') {
+        f.no_neg_0 = true;
         i += 1;
     }
-    // `parse_internal_render_format_spec`'s "special case for 0-padding": the
-    // `0` is only a flag when no fill char was named, and it only forces `=`
-    // alignment when no alignment was named either.
-    if i < chars.len() && chars[i] == '0' && !fill_explicit {
-        fill = '0';
-        if !align_explicit {
-            align = '=';
+    if at(i, '#') {
+        f.alt = true;
+        i += 1;
+    }
+    // The "special case for 0-padding": the `0` is only a flag when no fill
+    // char was named, and it only forces `=` alignment when no alignment was
+    // named either.
+    if at(i, '0') && !fill_explicit {
+        f.fill = '0';
+        if !f.align_explicit {
+            f.align = '=';
         }
         i += 1;
     }
-    let mut width = 0usize;
-    while i < chars.len() && chars[i].is_ascii_digit() {
-        width = accumulate_spec_digit(width, chars[i])?;
+    while chars.get(i).is_some_and(|c| c.is_ascii_digit()) {
+        f.width = accumulate_spec_digit(f.width, chars[i])?;
         i += 1;
     }
-    // Grouping option: `,` (thousands) or `_` (underscore). CPython places this
-    // between the width and the `.precision`; both are parsed here so `_x` etc.
-    // never collide with the trailing type char.
-    let group: Option<char> = match chars.get(i).copied() {
-        Some(c @ (',' | '_')) => {
-            i += 1;
-            Some(c)
-        }
-        _ => None,
-    };
-    let mut prec: Option<usize> = None;
-    if i < chars.len() && chars[i] == '.' {
+    let both = || Err("ValueError: Cannot specify both ',' and '_'.".to_string());
+    if at(i, ',') {
+        f.group = Some(',');
         i += 1;
+    }
+    if at(i, '_') {
+        if f.group.is_some() {
+            return both();
+        }
+        f.group = Some('_');
+        i += 1;
+    }
+    if at(i, ',') && f.group == Some('_') {
+        return both();
+    }
+    if at(i, '.') {
+        i += 1;
+        let start = i;
         let mut p = 0usize;
-        while i < chars.len() && chars[i].is_ascii_digit() {
+        while chars.get(i).is_some_and(|c| c.is_ascii_digit()) {
             p = accumulate_spec_digit(p, chars[i])?;
             i += 1;
+        }
+        if i == start {
+            return Err("ValueError: Format specifier missing precision".to_string());
         }
         // `format_float_internal` rejects a precision past `INT_MAX` before it
         // reaches the renderer, with its own message.
         if p > i32::MAX as usize {
             return Err("ValueError: precision too big".to_string());
         }
-        prec = Some(p);
+        f.prec = Some(p);
     }
-    let ty = chars.get(i).copied().unwrap_or('\0');
+    match chars.len() - i {
+        0 => {}
+        1 => f.ty = chars[i],
+        _ => {
+            return Err(format!(
+                "ValueError: Invalid format specifier '{spec}' for object of type '{}'",
+                tyname()
+            ))
+        }
+    }
+    // `,`/`_` are legal only with the decimal and float types (PEP 378), and
+    // `_` with the radix types too (PEP 515).
+    if let Some(g) = f.group {
+        let ok = matches!(f.ty, 'd' | 'e' | 'f' | 'g' | 'E' | 'G' | '%' | 'F' | '\0')
+            || (g == '_' && matches!(f.ty, 'b' | 'o' | 'x' | 'X'));
+        if !ok {
+            return Err(format!("ValueError: Cannot specify '{g}' with '{}'.", f.ty));
+        }
+    }
+    Ok(f)
+}
+
+/// Drop the `-` from a rendered float that rounded to zero — `Py_DTSF_NO_NEG_0`,
+/// the `z` flag. Only a finite body whose mantissa digits are all `0` qualifies.
+fn strip_neg_zero(body: String) -> String {
+    let Some(rest) = body.strip_prefix('-') else {
+        return body;
+    };
+    let mantissa = rest.split(['e', 'E']).next().unwrap_or("");
+    let zero = mantissa.chars().any(|c| c == '0')
+        && mantissa.chars().all(|c| matches!(c, '0' | '.' | '%'));
+    if zero {
+        rest.to_string()
+    } else {
+        body
+    }
+}
+
+/// `complex.__format__`: port of `format_complex_internal`
+/// (`Python/formatter_unicode.c`). Each part is a float formatted under the
+/// same spec (minus the padding); the imaginary part always carries a sign
+/// unless the real part is omitted. With no presentation type the parts are
+/// repr-style (`r`) and the result is parenthesised like `repr`, with a
+/// positive-zero real part dropped (`format(1j, '')` is `1j`).
+fn format_complex(re: f64, im: f64, spec: &str) -> Result<String, String> {
+    let f = parse_format_spec(spec, || "complex".to_string())?;
+    if !matches!(f.ty, '\0' | 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | 'n') {
+        return Err(format!(
+            "ValueError: Unknown format code '{}' for object of type 'complex'",
+            f.ty
+        ));
+    }
+    if f.fill == '0' {
+        return Err(
+            "ValueError: Zero padding is not allowed in complex format specifier".to_string(),
+        );
+    }
+    if f.align == '=' {
+        return Err(
+            "ValueError: '=' alignment flag is not allowed in complex format specifier".to_string(),
+        );
+    }
+    let repr_style = f.ty == '\0';
+    let skip_re = repr_style && re == 0.0 && re.is_sign_positive();
+    let add_parens = repr_style && !skip_re;
+    // `r` with a precision is `g`; plain `r` is the shortest repr without the
+    // `.0` a float's own `''` type would add.
+    let ty = match (repr_style, f.prec) {
+        (true, Some(_)) => "g".to_string(),
+        (true, None) => String::new(),
+        (false, _) => f.ty.to_string(),
+    };
+    let part = |x: f64, sign: char| -> Result<String, String> {
+        let mut sub = String::new();
+        if sign != '\0' {
+            sub.push(sign);
+        }
+        if f.no_neg_0 {
+            sub.push('z');
+        }
+        if f.alt {
+            sub.push('#');
+        }
+        if let Some(g) = f.group {
+            sub.push(g);
+        }
+        if let Some(p) = f.prec {
+            sub.push_str(&format!(".{p}"));
+        }
+        sub.push_str(&ty);
+        let shown = crate::host::fmt_float(x);
+        let out = apply_format_spec(&shown, &Value::Float(x), &sub)?;
+        Ok(if repr_style && f.prec.is_none() {
+            out.strip_suffix(".0").map(str::to_string).unwrap_or(out)
+        } else {
+            out
+        })
+    };
+    let mut body = String::new();
+    if add_parens {
+        body.push('(');
+    }
+    if !skip_re {
+        body.push_str(&part(re, f.sign)?);
+    }
+    body.push_str(&part(im, if skip_re { f.sign } else { '+' })?);
+    body.push('j');
+    if add_parens {
+        body.push(')');
+    }
+    let align = if f.align == '\0' { '>' } else { f.align };
+    pad_to_width(&body, f.width, f.fill, align, true)
+}
+
+pub fn apply_format_spec(s: &str, v: &Value, spec: &str) -> Result<String, String> {
+    if spec.is_empty() {
+        return Ok(s.to_string());
+    }
+    if let Some((re, im)) = with_host(|h| match h.get(v) {
+        Some(PyObj::Complex(re, im)) => Some((*re, *im)),
+        _ => None,
+    }) {
+        return format_complex(re, im, spec);
+    }
+    let FormatSpec {
+        fill,
+        align,
+        align_explicit,
+        sign,
+        no_neg_0,
+        alt,
+        width,
+        group,
+        prec,
+        ty,
+    } = parse_format_spec(spec, || with_host(|h| h.type_name(v)))?;
     // An int-like value (`int`/`bool`/bignum) with no explicit presentation type
     // formats as a decimal integer, so `format(False, "5")` is `    0` (the int
     // value) rather than the string `"False"`.
@@ -22455,6 +22807,15 @@ pub fn apply_format_spec(s: &str, v: &Value, spec: &str) -> Result<String, Strin
     };
 
     validate_format_spec(v, ty, sign, alt, group, prec, align, align_explicit)?;
+    // `z` means something only to the float renderer: an int formatted with a
+    // float type gets there, an int formatted as an int (or a str) does not.
+    let int_render = is_int_like(v) && matches!(ty, 'b' | 'c' | 'd' | 'o' | 'x' | 'X' | 'n');
+    if no_neg_0 && (int_render || is_str(v)) {
+        let kind = if int_render { "integer" } else { "string" };
+        return Err(format!(
+            "ValueError: Negative zero coercion (z) not allowed in {kind} format specifier"
+        ));
+    }
 
     // `as_f` narrows to f64 and returns `None` for a bignum, so it can't be the
     // sole numeric test: an int above `i64::MAX` is still numeric and must keep
@@ -22544,6 +22905,11 @@ pub fn apply_format_spec(s: &str, v: &Value, spec: &str) -> Result<String, Strin
         || ((ty == 'n' || ty == '\0') && !is_int_like(v) && numeric);
     let body = if alt && float_render {
         crate::host::alt_decimal_point(&body)
+    } else {
+        body
+    };
+    let body = if no_neg_0 && float_render {
+        strip_neg_zero(body)
     } else {
         body
     };
@@ -22824,33 +23190,22 @@ fn validate_format_spec(
         return Ok(());
     }
 
-    // 's' requires a string value.
-    if ty == 's' {
+    // The presentation types each `__format__` knows (`format_obj`'s switch
+    // for float, `format_long`'s for int, which hands the float types on to
+    // the float renderer); anything else is unknown for that type.
+    let known = if is_float {
+        matches!(ty, '\0' | 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | 'n' | '%')
+    } else {
+        matches!(
+            ty,
+            'b' | 'c' | 'd' | 'o' | 'x' | 'X' | 'n' | 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | '%'
+        )
+    };
+    if !known {
         return Err(format!(
-            "ValueError: Unknown format code 's' for object of type '{}'",
+            "ValueError: Unknown format code '{ty}' for object of type '{}'",
             tyname()
         ));
-    }
-
-    // Integer-only presentation types reject a float value.
-    if is_float && matches!(ty, 'b' | 'o' | 'x' | 'X' | 'c' | 'd') {
-        return Err(format!(
-            "ValueError: Unknown format code '{ty}' for object of type 'float'"
-        ));
-    }
-
-    // Grouping-vs-type: ',' is illegal with the radix / char / locale types;
-    // '_' is illegal with 'c' and with 'n' — `n` brings its OWN separator from
-    // the locale, so asking for a second one is a contradiction, and CPython's
-    // `parse_internal_render_format_spec` rejects both spellings for it.
-    match group {
-        Some(',') if matches!(ty, 'x' | 'X' | 'o' | 'b' | 'c' | 'n') => {
-            return Err("ValueError: Cannot specify ',' with '?'.".replace('?', &ty.to_string()));
-        }
-        Some('_') if matches!(ty, 'c' | 'n') => {
-            return Err("ValueError: Cannot specify '_' with '?'.".replace('?', &ty.to_string()));
-        }
-        _ => {}
     }
 
     // Precision is not allowed when the effective type is an integer type. `n`

@@ -1367,3 +1367,235 @@ def g(n):
     yield 1 / n
 for v in g(0):
     pass
+#==#
+# ── `dict()` pair sequences, and the three-argument `__pow__` ───────────────
+# A pair of the wrong length names its index and length (`dict_merge_from_seq2`);
+# it used to be a TypeError with no index. `__pow__(exp, mod)` is three-argument
+# `pow()` — the modulus was being dropped.
+for bad in ([(1, 2, 3)], [(1, 2), 'abc'], [[1]]):
+    for build in (dict, lambda s: {}.update(s)):
+        try:
+            build(bad)
+        except ValueError as e:
+            print(type(e).__name__, e)
+print((5).__pow__(2, 3), (5).__rpow__(2, 3), (5).__pow__(2, None), True.__pow__(2, 3))
+for args in ((2, 0), (2.5, 3)):
+    try:
+        print((5).__pow__(*args))
+    except ValueError as e:
+        print(type(e).__name__, e)
+try:
+    (2.0).__pow__(2, 3)
+except TypeError as e:
+    print(type(e).__name__, e)
+#==#
+# ── `OSError(...)` splits its arguments and picks the errno's subclass ───────
+# `oserror_init`: two to five arguments are (errno, strerror, filename,
+# winerror, filename2), `args` keeps the first two, and constructing `OSError`
+# itself narrows to the subclass the errno maps to (`errno.EAGAIN` is 35 on
+# macOS and 11 on Linux, so the map is keyed by the platform's constants).
+import errno
+for args in [(errno.ENOENT, 'nf'), (errno.ENOENT, 'nf', 'f.txt'),
+             (errno.EACCES, 'pd', 'a', None, 'b'), ('just',), (),
+             (errno.EAGAIN, 'again'), (errno.ECONNREFUSED, 'r'), (errno.ETIMEDOUT, 't'),
+             (errno.EPIPE, 'p'), (errno.ESRCH, 's'), (errno.EISDIR, 'd'), (10 ** 6, 'x')]:
+    e = OSError(*args)
+    print(type(e).__name__, repr(e.args), '|', e, '|', e.errno, e.strerror, e.filename, e.filename2)
+print(type(IOError(errno.ENOENT, 'x')).__name__, type(PermissionError(errno.ENOENT, 'x')).__name__)
+b = BlockingIOError(errno.EAGAIN, 'again', 7)
+print(b.characters_written, b.filename, b)
+class MyOS(OSError):
+    pass
+class Wrapped(OSError):
+    def __init__(self, *a):
+        super().__init__(*a)
+        self.extra = 1
+for cls in (MyOS, Wrapped):
+    e = cls(errno.ENOENT, 'm', 'p')
+    print(type(e).__name__, e, e.args, e.errno, e.strerror, e.filename)
+try:
+    raise OSError(errno.EEXIST, 'exists', '/x')
+except FileExistsError as e:
+    print('caught', e, e.errno)
+#==#
+# ── `complex`: signed zeros survive construction and repr ────────────────────
+# `complex(0, -0.0)` kept a `-0.0` imaginary part only if the first argument
+# was not complex (`ci.real += cr.imag` runs only for a complex `real`), and
+# repr chose the imaginary sign by `>= 0.0`, which a `-0.0` passes.
+for c in [complex(0, -0.0), complex(-0.0, -0.0), complex(1, -0.0), -(0j),
+          complex(-0.0, 1), complex('1-0j')]:
+    print(repr(c), str(c), c.real, c.imag)
+#==#
+# ── `complex.__format__` ─────────────────────────────────────────────────────
+# Each part is a float under the same spec; the imaginary part always carries a
+# sign unless the real part is dropped; no presentation type means repr-style
+# parts in parentheses. Zero padding and `=` alignment are refused.
+for spec in ['', '.2f', '>20', '+.3e', 'g', '.3g', '^30.1f', '10', ',.2f', '.0f',
+             'E', 'G', 'n', '#.0f', '+', ' ', '.0', '*^20.2f', '<12', '_.1e', ',']:
+    print(repr(spec), [format(c, spec) for c in (1 + 2j, -1.5 - 0.25j, 3j, -0j, 1234.5 + 6789j)])
+for spec in ['%', 'x', 's', '010', '=10', '0<10']:
+    try:
+        format(1j, spec)
+    except ValueError as e:
+        print(repr(spec), e)
+print(f'{1+2j:*^20.2f}|{2j:.1f}|{(1+1j)!r:>10}|{complex("nan+infj"):F}')
+#==#
+# ── a format spec is parsed whole before it is applied ───────────────────────
+# Trailing characters, a `.` with no precision, `,` with `_`, and a
+# presentation type the value's `__format__` does not know are all errors,
+# not silently ignored. (The trailing-junk message gained its operand in 3.11,
+# so only the exception type is compared for those three.)
+for value, spec in [(1.5, '.2fx'), (1, 'dd'), ('a', 'ss')]:
+    try:
+        format(value, spec)
+    except ValueError as e:
+        print(repr(spec), type(e).__name__)
+for value, spec in [(1.5, '.f'), (1, ',_'),
+                    (1, '_,'), (1.5, 'q'), (1, 'q'), (True, 'q'), (2 ** 70, 'q'),
+                    (1.5, 'r'), (1.5, 'd'), (1, ',x'), (1, '_c'), (1, ',n')]:
+    try:
+        print(repr(spec), repr(format(value, spec)))
+    except ValueError as e:
+        print(repr(spec), e)
+print(format(255, '_b'), format(255, '_x'), format(1.5, ',%'), format(1, 'e'), format(1, '%'))
+#==#
+# ── `round(x, ndigits)` rounds the exact binary value ────────────────────────
+# A negative `ndigits` used to divide by a power of ten in floating point first,
+# rounding twice: `round(1.5e300, -300)` was `1.0000000000000006e+300`.
+for v in [1.5e300, 1250.0, 1350.0, -1250.0, 2.5e-5, 123456.789, 5e-324, -15.0,
+          25.0, 1e22, 9.5e15, -0.0, 1234.5678]:
+    print(v, [round(v, d) for d in (-1, -2, -3, -300, -308, -309, -400, 0, 2, 323, 324)])
+try:
+    round(1.7976931348623157e308, -308)
+except OverflowError as e:
+    print(type(e).__name__, e)
+#==#
+# ── the structured `UnicodeError`s ───────────────────────────────────────────
+# `UnicodeDecodeError(encoding, object, start, end, reason)` and its two
+# siblings validate their arguments, expose them as attributes, and render
+# their message from them; a codec failure carries the same five arguments.
+for make in ["UnicodeDecodeError('utf-8', b'\\xff', 0, 1, 'bad')",
+             "UnicodeDecodeError('utf-8', b'ab\\xff\\xfe', 2, 4, 'bad')",
+             "UnicodeDecodeError('utf-8', bytearray(b'\\xff'), 0, 1, 'r')",
+             "UnicodeEncodeError('ascii', 'a\\xe9', 1, 2, 'nope')",
+             "UnicodeEncodeError('ascii', '\\u20ac', 0, 1, 'nope')",
+             "UnicodeEncodeError('ascii', '\\U0001f600', 0, 1, 'nope')",
+             "UnicodeEncodeError('ascii', 'abcd', 1, 3, 'nope')",
+             "UnicodeTranslateError('abc', 1, 2, 'why')",
+             "UnicodeTranslateError('abc', 0, 3, 'why')",
+             "UnicodeDecodeError('x')", "UnicodeDecodeError(1, b'', 0, 1, 'r')",
+             "UnicodeDecodeError('u', 'str', 0, 1, 'r')",
+             "UnicodeEncodeError('ascii', b'x', 0, 1, 'nope')"]:
+    try:
+        e = eval(make)
+        print(repr(e), '|', e, '|', repr(e.encoding), repr(e.object), e.start, e.end, e.reason)
+    except TypeError as x:
+        print(make, '->', x)
+for data, enc in [(b'a\xffb', 'ascii'), (b'\xe2\x82', 'utf-8'), (bytearray(b'\xff'), 'utf-8'),
+                  (b'\x00\xd8', 'utf-16-le'), (b'\x00\xd8a\x00', 'utf-16-le'),
+                  (b'\x00\xdca\x00', 'utf-16-le'), (b'ab\x00', 'utf-16-le'),
+                  (b'\x00\x00\x11\x00', 'utf-32-le'), (b'\x00\xd8\x00\x00', 'utf-32-le')]:
+    try:
+        data.decode(enc)
+    except UnicodeDecodeError as e:
+        print(enc, e.args, e.start, e.end, repr(e.object), '|', e)
+for text, enc in [('a€b€€', 'latin-1'), ('\U0001f600x', 'ascii')]:
+    try:
+        text.encode(enc)
+    except UnicodeEncodeError as e:
+        print(enc, e.args, e.start, e.end, '|', e)
+e = UnicodeDecodeError('utf-8', b'\xff', 0, 1, 'bad')
+e.reason = 'changed'
+print(e, e.args)
+#==#
+# ── an iteration's own terminator is not left behind as exception context ────
+# The `StopIteration` a user `__next__` ends with, and the `IndexError` that
+# ends `__getitem__` iteration, are consumed by the loop; they used to stay
+# installed and became the `__context__` of every later exception.
+class Seq:
+    def __getitem__(self, i):
+        if i >= 3:
+            raise IndexError
+        return i
+class It:
+    def __init__(self):
+        self.n = 0
+    def __iter__(self):
+        return self
+    def __next__(self):
+        self.n += 1
+        if self.n > 2:
+            raise StopIteration
+        return self.n
+def context_after(label):
+    try:
+        raise KeyError(label)
+    except KeyError as e:
+        print(label, repr(e.__context__))
+for x in Seq():
+    pass
+context_after('for over __getitem__')
+list(It()); context_after('list(iterator)')
+sorted(It()); context_after('sorted(iterator)')
+for x in It():
+    pass
+context_after('for over iterator')
+x, y = It(); context_after('unpacking')
+dict(zip(It(), It())); context_after('zip')
+try:
+    raise ValueError('outer')
+except ValueError:
+    list(Seq())
+    try:
+        raise KeyError('inner')
+    except KeyError as e:
+        print('inside a handler', repr(e.__context__))
+#==#
+# ── a bound method's `__self__`/`__func__`, equality and hash ────────────────
+# Each `o.m` read is a new method object; two are equal (and hash alike) when
+# they bind the same receiver to equal functions (`method_richcompare`).
+class M:
+    def m(self):
+        return 'm'
+    def n(self):
+        pass
+    @classmethod
+    def c(cls):
+        pass
+o, p = M(), M()
+bm = o.m
+print(bm.__self__ is o, bm.__func__ is M.m, bm.__func__(o), M.c.__self__ is M, o.c.__self__ is M)
+lst = []
+print(lst.append.__self__ is lst, 'x'.upper.__self__)
+try:
+    lst.append.__func__
+except AttributeError as e:
+    print(e)
+print(o.m == o.m, o.m != o.m, o.m == p.m, o.m == o.n, o.m is o.m, lst.append == lst.append, M.m == M.m)
+print({o.m: 1}.get(o.m), o.m in {o.m}, [o.m].index(o.m), hash(o.m) == hash(o.m))
+#==#
+# ── `float()`/`complex()` read Unicode digits and check underscores ──────────
+# The text is put through `_PyUnicode_TransformDecimalAndSpaceToASCII`, and an
+# `_` is legal only between two digits.
+for s in ['١.٥', '１２', ' 1.5 ', '1__0', '_1', '1_', '1_e5',
+          '1e_5', '1_000.000_1', 'Infinity_', 'INF', '-NaN', '1.5\x00', 'nan(1)', 'é']:
+    for conv in (float, complex):
+        try:
+            print(repr(s), conv.__name__, repr(conv(s)))
+        except ValueError as e:
+            print(repr(s), conv.__name__, e)
+#==#
+# ── `bytes()`/`bytearray()` and `int()` refuse arguments they cannot use ─────
+# A `str` needs an encoding and is run through that codec; an encoding with no
+# `str` is refused. An explicit `int()` base only reads str/bytes/bytearray.
+for src in ["bytes('x')", "bytearray('x')", "bytes('x', errors='strict')",
+            "bytes(b'x', 'utf-8')", "bytes(5, 'utf-8')", "bytearray(b'x', 'ascii')",
+            "bytes(encoding='ascii')", "bytearray(errors='x')",
+            "bytes('\\xe9', 'ascii')", "bytes('\\xe9', 'utf-16')", "bytes('x', 'nope')",
+            "bytes('\\xe9a', 'ascii', 'ignore')", "bytearray('\\xe9', 'latin-1')",
+            "int(5, 2)", "int(1.5, 10)", "int(True, 2)", "int(memoryview(b'1'), 10)",
+            "int('5', 1.5)", "int('10', 2 ** 70)", "int(bytearray(b'11'), 2)", "int('11', base=2)"]:
+    try:
+        print(src, '->', repr(eval(src)))
+    except Exception as e:
+        print(src, '->', type(e).__name__, e)

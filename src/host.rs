@@ -233,6 +233,13 @@ pub enum PKey {
     /// `Slice` — a range never equals a tuple — though here the two do hash
     /// alike, because CPython hashes the range AS that tuple.
     Range(Vec<PKey>),
+    /// A bound method: its receiver keyed by IDENTITY and its function, the
+    /// pair `method_richcompare` compares, so `{o.m: 1}[o.m]` finds the entry
+    /// although each `o.m` read is a fresh method object.
+    Method {
+        recv: Box<PKey>,
+        func: Box<PKey>,
+    },
 }
 
 /// A compiled function template: parameter shape + body chunk. Shared by every
@@ -5372,8 +5379,7 @@ impl PyHost {
                     // A user exception instance stringifies to its message
                     // (`BaseException.__str__`): ''/str(arg)/repr(tuple).
                     if self.class_is_exception(&inst.class) {
-                        let a = self.exc_instance_args(&inst.dict);
-                        self.exc_message(&inst.class, &a)
+                        self.exc_inst_message(&inst.class, &inst.dict)
                     } else if !matches!(inst.payload, Value::Undef)
                         && self.builtin_base_of(&inst.class).is_some()
                         && self.class_lookup(&inst.class, "__str__").is_none()
@@ -5864,6 +5870,11 @@ impl PyHost {
         if is_syntax_error_class(class) {
             return self.syntax_error_str(v);
         }
+        if crate::builtins::is_oserror_class(class) {
+            if let Some(s) = self.oserror_obj_str(v) {
+                return s;
+            }
+        }
         if let Some(s) = crate::excunicode::str_from_attrs(self, v, class) {
             return s;
         }
@@ -6223,10 +6234,23 @@ impl PyHost {
                 Some(PyObj::Descriptor { kind, qual, .. }) => {
                     PKey::Class(format!("{}:{qual}", kind.type_name()))
                 }
-                // Functions/methods/other callables hash by identity (heap id).
+                Some(PyObj::BoundMethod { recv, func }) => {
+                    let (recv, func) = (recv.clone(), func.clone());
+                    let recv = match recv {
+                        Value::Obj(id) => PKey::Instance {
+                            hash: id as i64,
+                            id,
+                        },
+                        scalar => self.to_key(&scalar)?,
+                    };
+                    PKey::Method {
+                        recv: Box::new(recv),
+                        func: Box::new(self.to_key(&func)?),
+                    }
+                }
+                // Functions and other callables hash by identity (heap id).
                 Some(
                     PyObj::Func(_)
-                    | PyObj::BoundMethod { .. }
                     | PyObj::StaticMethod(_)
                     | PyObj::ClassMethod(_)
                     | PyObj::Module { .. }
@@ -6587,6 +6611,13 @@ impl PyHost {
                     // and `type(b) == B` hold regardless of heap identity.
                     (Some(PyObj::Builtin(x)), Some(PyObj::Builtin(y))) => x == y,
                     (Some(PyObj::Class(x)), Some(PyObj::Class(y))) => x == y,
+                    // `method_richcompare`: two bound methods are equal when they
+                    // bind the SAME receiver (identity) to equal functions, so
+                    // `o.m == o.m` although each read allocates a new method.
+                    (
+                        Some(PyObj::BoundMethod { recv: r1, func: f1 }),
+                        Some(PyObj::BoundMethod { recv: r2, func: f2 }),
+                    ) => r1 == r2 && self.equal(f1, f2),
                     // Singletons compare equal to themselves regardless of heap
                     // identity (`... == ...`, and `lst.count(...)`).
                     (Some(PyObj::Ellipsis), Some(PyObj::Ellipsis))
@@ -7948,7 +7979,11 @@ fn fmt_complex(r: f64, i: f64) -> String {
     if r == 0.0 && r.is_sign_positive() {
         format!("{}j", fmt_complex_part(i))
     } else {
-        let sign = if i >= 0.0 || i.is_nan() { "+" } else { "-" };
+        let sign = if i.is_sign_positive() || i.is_nan() {
+            "+"
+        } else {
+            "-"
+        };
         format!(
             "({}{}{}j)",
             fmt_complex_part(r),
@@ -12734,6 +12769,13 @@ impl PyHost {
                         return Ok(v.clone());
                     }
                 }
+                // An `OSError` field that was never set reads as `None` (the
+                // member getters in `OSError_members` map NULL to None).
+                if crate::builtins::is_oserror_class(class)
+                    && matches!(name, "errno" | "strerror" | "filename" | "filename2")
+                {
+                    return Ok(Value::Undef);
+                }
                 if name == "__class__" {
                     // The exception's type object (`e.__class__ is ValueError`,
                     // `e.__class__.__name__`).
@@ -13475,6 +13517,20 @@ impl PyHost {
                 let (def_id, defaults) = (fv.def_id, fv.defaults.clone());
                 let kwd = fv.kwonly_defaults.clone();
                 self.func_dunder(name, def_id, &defaults, &kwd)
+            }
+            // `method.__self__` is the receiver, `method.__func__` the plain
+            // function it wraps. A bound BUILTIN method is a
+            // `builtin_function_or_method`, which has `__self__` but no `__func__`.
+            Some(PyObj::BoundMethod { recv, .. }) if name == "__self__" => Ok(recv.clone()),
+            Some(PyObj::BoundMethod { func, .. }) if name == "__func__" => {
+                let func = func.clone();
+                match self.get(&func) {
+                    Some(PyObj::Builtin(_)) => Err(
+                        "AttributeError: 'builtin_function_or_method' object has no attribute '__func__'"
+                            .to_string(),
+                    ),
+                    _ => Ok(func),
+                }
             }
             Some(PyObj::BoundMethod { func, recv })
                 if matches!(
@@ -15913,27 +15969,15 @@ fn module_dict_method(
                     _ => match call_method(src, "items", vec![], vec![]) {
                         Ok(items) => {
                             let mut out = Vec::new();
-                            for it in iter_vec(&items)? {
-                                let kv = iter_vec(&it)?;
-                                if kv.len() != 2 {
-                                    return Err(type_error(
-                                        "dictionary update sequence element has length != 2",
-                                    ));
-                                }
-                                out.push((kv[0].clone(), kv[1].clone()));
+                            for (i, it) in iter_vec(&items)?.iter().enumerate() {
+                                out.push(dict_seq2_pair(it, i)?);
                             }
                             out
                         }
                         Err(_) => {
                             let mut out = Vec::new();
-                            for it in iter_vec(src)? {
-                                let kv = iter_vec(&it)?;
-                                if kv.len() != 2 {
-                                    return Err(type_error(
-                                        "dictionary update sequence element has length != 2",
-                                    ));
-                                }
-                                out.push((kv[0].clone(), kv[1].clone()));
+                            for (i, it) in iter_vec(src)?.iter().enumerate() {
+                                out.push(dict_seq2_pair(it, i)?);
                             }
                             out
                         }
@@ -16381,6 +16425,14 @@ fn call_method_inner(
             return invoke(&f, args, kwargs);
         }
     }
+    // `m.__func__(obj)` / `m.__self__(…)` on a bound method: the attribute is a
+    // value, not a method of the `method` type, so it is read and then called.
+    if matches!(name, "__func__" | "__self__")
+        && with_host(|h| matches!(h.get(recv), Some(PyObj::BoundMethod { .. })))
+    {
+        let f = with_host(|h| h.get_attr(recv, name))?;
+        return invoke(&f, args, kwargs);
+    }
     if !needs_owned {
         return crate::builtins::call_type_method(recv, name, args, kwargs);
     }
@@ -16813,10 +16865,7 @@ fn call_method_inner(
                 // otherwise the `object.__init__` no-op default.
                 None if name == "__init__" => {
                     if with_host(|h| h.class_is_exception(&inst_class)) {
-                        with_host(|h| {
-                            let t = h.alloc(PyObj::Tuple(args.clone()));
-                            let _ = h.set_attr(&instance, "args", t);
-                        });
+                        with_host(|h| exception_init(h, &instance, args.clone()));
                     }
                     Ok(Value::Undef)
                 }
@@ -16891,10 +16940,7 @@ fn call_method_inner(
             let mut it = args.into_iter();
             if let Some(inst) = it.next() {
                 let rest: Vec<Value> = it.collect();
-                with_host(|h| {
-                    let t = h.alloc(PyObj::Tuple(rest));
-                    let _ = h.set_attr(&inst, "args", t);
-                });
+                with_host(|h| exception_init(h, &inst, rest));
             }
             Ok(Value::Undef)
         }
@@ -17008,6 +17054,51 @@ pub fn instantiate(
 /// The default `type.__call__`: build a class instance via `__new__`/`__init__`
 /// (or a metaclass's class object), *without* consulting a metaclass `__call__`.
 /// Reached directly and from a metaclass's `super().__call__(...)`.
+/// `BaseException.__init__(self, *args)` — `OSError.__init__` for that family —
+/// called explicitly or through `super()`: rebind `self.args` and, for an
+/// `OSError`, the fields `oserror_init` derives from them.
+fn exception_init(h: &mut PyHost, inst: &Value, args: Vec<Value>) {
+    let class = match h.get(inst) {
+        Some(PyObj::Instance(i)) => i.class.clone(),
+        Some(PyObj::Exception { class, .. }) => class.clone(),
+        _ => String::new(),
+    };
+    let args = if h.mro_of(&class).iter().any(|c| c == "OSError")
+        || crate::builtins::is_oserror_class(&class)
+    {
+        let parts = oserror_parts(h, &class, args);
+        for (name, val) in parts.attrs {
+            let _ = h.set_attr(inst, name, val);
+        }
+        parts.args
+    } else {
+        args
+    };
+    let t = h.alloc(PyObj::Tuple(args));
+    let _ = h.set_attr(inst, "args", t);
+}
+
+/// `BaseException.__new__(cls, *args)` for a user exception class: seed
+/// `self.args` (overridable by `__init__`/super). An `OSError` subclass also
+/// gets `oserror_init`'s split — the four fields (None when not given) and an
+/// `args` cut to `(errno, strerror)`.
+fn seed_exception_attrs(h: &mut PyHost, class: &str, args: Vec<Value>, attrs: &mut NameMap) {
+    let args = if h.mro_of(class).iter().any(|c| c == "OSError") {
+        let parts = oserror_parts(h, class, args);
+        for name in ["errno", "strerror", "filename", "filename2"] {
+            attrs.insert(name.to_string(), Value::Undef);
+        }
+        for (name, val) in parts.attrs {
+            attrs.insert(name.to_string(), val);
+        }
+        parts.args
+    } else {
+        args
+    };
+    let t = h.alloc(PyObj::Tuple(args));
+    attrs.insert("args".to_string(), t);
+}
+
 pub fn instantiate_plain(
     class: &str,
     args: Vec<Value>,
@@ -17065,8 +17156,7 @@ pub fn instantiate_plain(
             // `BaseException.__new__(cls, *args)` seeds `self.args` with the
             // constructor's positional args (overridable by `__init__`/super).
             if h.class_is_exception(class) {
-                let t = h.alloc(PyObj::Tuple(args.clone()));
-                attrs.insert("args".to_string(), t);
+                seed_exception_attrs(h, class, args.clone(), &mut attrs);
             }
             h.new_instance(class.to_string(), attrs)
         })
@@ -17788,6 +17878,77 @@ impl PyHost {
         }
     }
 
+    /// `OSError.__str__` (`OSError_str` in `Objects/exceptions.c`), reading the
+    /// four fields through `get` (absent = never set): `[Errno N] strerror`,
+    /// with `: 'filename'` and `-> 'filename2'` when those were given. `None`
+    /// means neither form applies and `BaseException.__str__` renders `args`.
+    pub fn oserror_str(&self, get: impl Fn(&str) -> Option<Value>) -> Option<String> {
+        let set = |n: &str| get(n).filter(|v| !matches!(v, Value::Undef));
+        let (errno, strerror) = (get("errno"), get("strerror"));
+        if let Some(f) = set("filename") {
+            let (e, s) = (
+                errno.unwrap_or(Value::Undef),
+                strerror.unwrap_or(Value::Undef),
+            );
+            let head = format!(
+                "[Errno {}] {}: {}",
+                self.str_of(&e),
+                self.str_of(&s),
+                self.repr_of(&f)
+            );
+            return Some(match set("filename2") {
+                Some(f2) => format!("{head} -> {}", self.repr_of(&f2)),
+                None => head,
+            });
+        }
+        match (errno, strerror) {
+            (Some(e), Some(s)) => Some(format!("[Errno {}] {}", self.str_of(&e), self.str_of(&s))),
+            _ => None,
+        }
+    }
+
+    /// [`Self::oserror_str`] of a builtin `OSError`-family exception object,
+    /// whose fields are attributes on the object.
+    fn oserror_obj_str(&self, exc: &Value) -> Option<String> {
+        let Value::Obj(id) = exc else {
+            return None;
+        };
+        let attrs = self.func_attrs.get(id);
+        self.oserror_str(|n| attrs.and_then(|m| m.get(n)).cloned())
+    }
+
+    /// The message of an exception object's `Class: message` line: `str(exc)`
+    /// for the classes whose `__str__` reads attributes (the `OSError` family
+    /// and the structured `UnicodeError`s), `BaseException.__str__` otherwise.
+    pub fn exc_obj_message(&self, exc: &Value, class: &str, args: &[Value]) -> String {
+        if crate::builtins::is_oserror_class(class)
+            || crate::excunicode::is_unicode_error_class(class)
+        {
+            return self.exc_str(exc, class, args);
+        }
+        self.exc_message(class, args)
+    }
+
+    /// `str()` of a user exception instance: as [`Self::exc_obj_message`], with
+    /// the `OSError` fields read from the instance dict.
+    pub fn exc_inst_message(&self, class: &str, dict: &Value) -> String {
+        if self.mro_of(class).iter().any(|c| c == "OSError") {
+            let errno_set = self
+                .inst_attr(dict, "errno")
+                .is_some_and(|v| !matches!(v, Value::Undef));
+            let get = |n: &str| {
+                // The instance dict holds all four fields (None when unset), so
+                // `errno`/`strerror` count as present only when non-None.
+                let v = self.inst_attr(dict, n)?;
+                (errno_set || !matches!(n, "errno" | "strerror")).then_some(v)
+            };
+            if let Some(s) = self.oserror_str(get) {
+                return s;
+            }
+        }
+        self.exc_message(class, &self.exc_instance_args(dict))
+    }
+
     pub fn exc_message(&self, class: &str, args: &[Value]) -> String {
         if let Some(m) = crate::excunicode::message(self, class, args) {
             return m;
@@ -17833,12 +17994,12 @@ impl PyHost {
     pub fn exc_line_of(&self, exc: &Value) -> Option<String> {
         match self.get(exc) {
             Some(PyObj::Exception { class, args }) => {
-                Some(join_exc(class, &self.exc_message(class, args)))
+                Some(join_exc(class, &self.exc_obj_message(exc, class, args)))
             }
-            Some(PyObj::Instance(i)) if self.class_is_exception(&i.class) => {
-                let a = self.exc_instance_args(&i.dict);
-                Some(join_exc(&i.class, &self.exc_message(&i.class, &a)))
-            }
+            Some(PyObj::Instance(i)) if self.class_is_exception(&i.class) => Some(join_exc(
+                &i.class,
+                &self.exc_inst_message(&i.class, &i.dict),
+            )),
             _ => None,
         }
     }
@@ -18314,7 +18475,7 @@ pub fn raise_value(exc: &Value) -> Result<String, String> {
         let obj = h.get(exc).cloned();
         match obj {
             Some(PyObj::Exception { class, args }) => {
-                let msg = h.exc_message(&class, &args);
+                let msg = h.exc_obj_message(exc, &class, &args);
                 h.exc = Some(exc.clone());
                 Ok(join_exc(&class, &msg))
             }
@@ -18342,8 +18503,7 @@ pub fn raise_value(exc: &Value) -> Result<String, String> {
                 let class = i.class.clone();
                 // A user exception instance's uncaught line shows its message.
                 let line = if h.class_is_exception(&class) {
-                    let a = h.exc_instance_args(&i.dict);
-                    join_exc(&class, &h.exc_message(&class, &a))
+                    join_exc(&class, &h.exc_inst_message(&class, &i.dict))
                 } else {
                     class
                 };
@@ -18919,13 +19079,12 @@ impl PyHost {
                     .foreign_exception_handle(exc)
                     .and_then(crate::ffi::exception_type_name)
                 {
-                    return join_exc(&name, &self.exc_message(class, args));
+                    return join_exc(&name, &self.exc_obj_message(exc, class, args));
                 }
-                join_exc(class, &self.exc_message(class, args))
+                join_exc(class, &self.exc_obj_message(exc, class, args))
             }
             Some(PyObj::Instance(i)) if self.class_is_exception(&i.class) => {
-                let a = self.exc_instance_args(&i.dict);
-                join_exc(&i.class, &self.exc_message(&i.class, &a))
+                join_exc(&i.class, &self.exc_inst_message(&i.class, &i.dict))
             }
             _ => String::new(),
         }
@@ -19693,6 +19852,28 @@ pub fn gen_resume(gen: &Value, send: Value) -> Result<Option<Value>, String> {
     }
 }
 
+/// Split element `idx` of a `dict()`/`dict.update()` pair sequence into its key
+/// and value, port of the per-item step of CPython 3.14's `PyDict_MergeFromSeq2`:
+/// an element that cannot be iterated is `TypeError: object is not iterable`
+/// (3.13 and earlier named the element index instead), and one of the wrong
+/// length is a `ValueError` naming index and length.
+pub fn dict_seq2_pair(item: &Value, idx: usize) -> Result<(Value, Value), String> {
+    let kv = iter_vec(item).map_err(|e| {
+        if e.starts_with("TypeError") {
+            type_error("object is not iterable")
+        } else {
+            e
+        }
+    })?;
+    match <[Value; 2]>::try_from(kv) {
+        Ok([k, v]) => Ok((k, v)),
+        Err(kv) => Err(format!(
+            "ValueError: dictionary update sequence element #{idx} has length {}; 2 is required",
+            kv.len()
+        )),
+    }
+}
+
 /// Materialize any iterable — including a generator — into a `Vec`. Unlike the
 /// `&mut self` `iter_items`, this holds NO host borrow across a generator
 /// resume, so it is safe for generator-typed operands.
@@ -19850,6 +20031,24 @@ pub fn make_iterator(v: &Value) -> Result<Value, String> {
     }
 }
 
+/// Whether error line `e` from a user `__next__`/`__getitem__` is a `base`
+/// (or subclass) exception that ENDS the iteration rather than escaping it.
+/// When it is, the exception is consumed the way CPython's iteration loops
+/// `PyErr_Clear` it: the pending error is dropped and the exception state goes
+/// back to `saved`, what it was before the call. Leaving the terminator in
+/// place made it the `__context__` of every exception raised afterwards.
+fn ends_iteration(e: &str, base: &str, saved: &Option<Value>) -> bool {
+    let class = e.split(':').next().unwrap_or("");
+    let matches = class == base || with_host(|h| h.mro_of(class).iter().any(|c| c == base));
+    if matches {
+        with_host(|h| {
+            h.error = None;
+            h.exc = saved.clone();
+        });
+    }
+    matches
+}
+
 /// Materialize a user instance's iteration into a concrete vector: `__iter__`
 /// then repeated `__next__` (draining a native iterator/generator if `__iter__`
 /// returned one), else the old-style `__getitem__(0..)` sequence protocol.
@@ -19879,11 +20078,12 @@ pub fn iter_instance_items(v: &Value) -> Result<Vec<Value>, String> {
         }) {
             return iter_vec(&it);
         }
+        let saved = with_host(|h| h.exc.clone());
         let mut items = Vec::new();
         loop {
             match call_method(&it, "__next__", vec![], vec![]) {
                 Ok(x) => items.push(x),
-                Err(e) if e.contains("StopIteration") => break,
+                Err(e) if ends_iteration(&e, "StopIteration", &saved) => break,
                 Err(e) => return Err(e),
             }
             if items.len() > 10_000_000 {
@@ -19892,12 +20092,18 @@ pub fn iter_instance_items(v: &Value) -> Result<Vec<Value>, String> {
         }
         Ok(items)
     } else if has_getitem {
+        let saved = with_host(|h| h.exc.clone());
         let mut items = Vec::new();
         let mut i: i64 = 0;
         loop {
             match call_method(v, "__getitem__", vec![Value::Int(i)], vec![]) {
                 Ok(x) => items.push(x),
-                Err(e) if e.contains("IndexError") || e.contains("StopIteration") => break,
+                Err(e)
+                    if ends_iteration(&e, "IndexError", &saved)
+                        || ends_iteration(&e, "StopIteration", &saved) =>
+                {
+                    break
+                }
                 Err(e) => return Err(e),
             }
             i += 1;
@@ -20388,11 +20594,14 @@ pub fn iter_step(it: &Value) -> Result<Option<Value>, String> {
         // outside the host borrow; `StopIteration` is exhaustion, every other
         // exception propagates. Never materialize here — the object may be
         // infinite (`itertools.count`-style), and CPython never drains it.
-        Step::UserNext => match call_method(it, "__next__", vec![], vec![]) {
-            Ok(v) => Ok(Some(v)),
-            Err(e) if e.contains("StopIteration") => Ok(None),
-            Err(e) => Err(e),
-        },
+        Step::UserNext => {
+            let saved = with_host(|h| h.exc.clone());
+            match call_method(it, "__next__", vec![], vec![]) {
+                Ok(v) => Ok(Some(v)),
+                Err(e) if ends_iteration(&e, "StopIteration", &saved) => Ok(None),
+                Err(e) => Err(e),
+            }
+        }
         // A foreign (CPython) iterator advances with the host borrow released so
         // a lazy stdlib iterator running a pythonrs callback can re-enter.
         #[cfg(feature = "stdlib-ffi")]
@@ -22365,21 +22574,81 @@ fn run_vendored_module(name: &str, src: &str, path: &std::path::Path) -> Result<
 
 // ── file / I/O side table (ported from rubylang's `IoCell`) ──────────────────
 
-/// The `OSError` subclass CPython maps an errno to (`_PyExc_CreateExceptionObject`'s
-/// table in `Objects/exceptions.c`). Anything unmapped stays a plain `OSError`.
-fn errno_exc_class(eno: i32) -> &'static str {
+/// What `OSError(*args)` builds: the concrete class, the `args` tuple it keeps,
+/// and the attributes it sets.
+pub struct OsErrorParts {
+    pub class: String,
+    pub args: Vec<Value>,
+    pub attrs: Vec<(&'static str, Value)>,
+}
+
+/// Port of `oserror_parse_args` + `oserror_new` + `oserror_init`
+/// (`Objects/exceptions.c`, POSIX build). With 2..=5 arguments they are
+/// `(errno, strerror, filename, winerror, filename2)`: `errno`/`strerror` are
+/// set, a non-None `filename`/`filename2` too, and `args` keeps only the first
+/// two. Constructing `OSError` itself (or its `IOError`/`EnvironmentError`
+/// aliases) with an int errno narrows to the errno's subclass. A
+/// `BlockingIOError` takes a numeric third argument as `characters_written`.
+pub fn oserror_parts(h: &PyHost, class: &str, args: Vec<Value>) -> OsErrorParts {
+    let base = matches!(class, "OSError" | "IOError" | "EnvironmentError");
+    let mut class = if base { "OSError" } else { class }.to_string();
+    let mut attrs = Vec::new();
+    if !(2..=5).contains(&args.len()) {
+        return OsErrorParts { class, args, attrs };
+    }
+    if base {
+        if let Some(eno) = match &args[0] {
+            Value::Int(n) => i32::try_from(*n).ok(),
+            Value::Bool(b) => Some(*b as i32),
+            _ => None,
+        } {
+            class = errno_exc_class(eno).to_string();
+        }
+    }
+    attrs.push(("errno", args[0].clone()));
+    attrs.push(("strerror", args[1].clone()));
+    let given = |i: usize| args.get(i).filter(|v| !matches!(v, Value::Undef)).cloned();
+    if let Some(f) = given(2) {
+        let numeric = matches!(f, Value::Int(_) | Value::Bool(_) | Value::Float(_))
+            || h.big_val(&f).is_some();
+        if class == "BlockingIOError" && numeric {
+            attrs.push(("characters_written", f));
+        } else {
+            attrs.push(("filename", f));
+            if let Some(f2) = given(4) {
+                attrs.push(("filename2", f2));
+            }
+        }
+    }
+    let kept = args[..2].to_vec();
+    OsErrorParts {
+        class,
+        args: kept,
+        attrs,
+    }
+}
+
+/// The `OSError` subclass CPython maps an errno to: the `ADD_ERRNO` table in
+/// `Objects/exceptions.c` (`_PyBuiltins_AddExceptions`), keyed by the PLATFORM
+/// errno constants, so `EAGAIN` is 35 on macOS and 11 on Linux. Anything
+/// unmapped stays a plain `OSError`.
+pub fn errno_exc_class(eno: i32) -> &'static str {
+    use libc::*;
     match eno {
-        1 => "PermissionError",   // EPERM
-        2 => "FileNotFoundError", // ENOENT
-        3 => "ProcessLookupError",
-        4 => "InterruptedError",
-        11 => "BlockingIOError", // EAGAIN
-        13 => "PermissionError",
-        17 => "FileExistsError",
-        20 => "NotADirectoryError",
-        21 => "IsADirectoryError",
-        32 => "BrokenPipeError",
-        10 => "ChildProcessError",
+        EAGAIN | EALREADY | EINPROGRESS => "BlockingIOError",
+        EPIPE | ESHUTDOWN => "BrokenPipeError",
+        ECHILD => "ChildProcessError",
+        ECONNABORTED => "ConnectionAbortedError",
+        ECONNREFUSED => "ConnectionRefusedError",
+        ECONNRESET => "ConnectionResetError",
+        EEXIST => "FileExistsError",
+        ENOENT => "FileNotFoundError",
+        EISDIR => "IsADirectoryError",
+        ENOTDIR => "NotADirectoryError",
+        EINTR => "InterruptedError",
+        EACCES | EPERM => "PermissionError",
+        ESRCH => "ProcessLookupError",
+        ETIMEDOUT => "TimeoutError",
         _ => "OSError",
     }
 }

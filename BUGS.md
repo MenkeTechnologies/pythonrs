@@ -2403,6 +2403,20 @@ written.
   of its own (not CPython's `Py_NAN`) keeps its bits so it packs back
   identically, and therefore has no identity pythonrs can track: it `is`
   nothing, not even itself.
+- **An abandoned generator is never finalized.** CPython closes a generator when
+  its last reference goes, so `for v in gen(): break` runs the generator's
+  `finally` (and `with` exits) right after the `break`. pythonrs has no
+  reference counting, so the `finally` of a generator dropped mid-iteration
+  never runs. Closing it at the loop is not a fix: whether the loop held the
+  LAST reference is not visible there (`it = gen(); for v in it: break;
+  next(it)` must keep it open).
+- **3.14's mixed-mode complex arithmetic is not implemented.** CPython 3.14
+  stopped promoting a real operand to `complex` in `+ - * /` (C99 Annex G
+  rules), which changes signed zeros: `complex(0.0, 0.0) * -1` is `(-0-0j)` and
+  `-0.0 - 0j` is `(-0-0j)` in 3.14, `(-0+0j)` in 3.13 and in pythonrs.
+- **A builtin function has no `__self__`.** `len.__self__` is the `builtins`
+  module in CPython (`math.sqrt.__self__` is `math`); pythonrs raises
+  `AttributeError`. Bound builtin METHODS (`[].append.__self__`) are correct.
 
 ## VM-level limits (fusevm, not fixable from here)
 

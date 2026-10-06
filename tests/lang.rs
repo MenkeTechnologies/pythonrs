@@ -10455,3 +10455,47 @@ fn asynchronous_generator_expressions() {
         "('async_generator', [0, 2, 4], [0, 1, 2], [0, 1])"
     );
 }
+
+/// PEP 682's `z` flag drops the `-` from a float that ROUNDS to zero, in every
+/// float presentation type and in both parts of a complex; an int or str
+/// formatted as itself refuses it. The corpus cannot carry this (the flag is
+/// 3.11+ and the corpus is held to 3.9), so it is pinned here; expectations
+/// measured against CPython 3.14.8.
+#[test]
+fn the_z_flag_coerces_a_rounded_negative_zero() {
+    assert_eq!(
+        g(
+            "x = [format(-0.0001, 'z.1f'), format(-0.0, 'z'), format(-0.0, '+z.2f'), \
+             format(-1e-9, 'z.3e'), format(-0.0, 'z%'), format(-0.4, 'z.0f'), \
+             format(1, 'z.1f'), format(float('-inf'), 'z'), format(-0.001, 'z.1g'), \
+             format(-0.0-0.0001j, 'z.2f'), format(-0.0, 'z#.0f')]",
+            "x"
+        ),
+        "['0.0', '0.0', '+0.00', '-1.000e-09', '0.000000%', '0', '1.0', '-inf', \
+         '-0.001', '0.00+0.00j', '0.']"
+    );
+    assert_eq!(
+        pythonrs::eval_str("format(1, 'z')").unwrap_err(),
+        "ValueError: Negative zero coercion (z) not allowed in integer format specifier"
+    );
+    assert_eq!(
+        pythonrs::eval_str("format('a', 'z')").unwrap_err(),
+        "ValueError: Negative zero coercion (z) not allowed in string format specifier"
+    );
+}
+
+/// A `dict()`/`dict.update()` pair element that cannot be iterated is CPython
+/// 3.14's `TypeError: object is not iterable` (3.13 and earlier said `cannot
+/// convert dictionary update sequence element #0 to a sequence`), which is why
+/// this lives here rather than in the version-spanning corpus.
+#[test]
+fn a_non_iterable_dict_pair_element_is_refused_with_the_3_14_wording() {
+    assert_eq!(
+        pythonrs::eval_str("dict([1])").unwrap_err(),
+        "TypeError: object is not iterable"
+    );
+    assert_eq!(
+        pythonrs::eval_str("{}.update([None])").unwrap_err(),
+        "TypeError: object is not iterable"
+    );
+}
