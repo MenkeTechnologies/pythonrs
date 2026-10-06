@@ -247,6 +247,26 @@ enum AwaitScope {
     Async,
 }
 
+thread_local! {
+    static EXPR_LINE_SHIFT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// While alive, expression lines are numbered this many lines up: `eval`
+/// compiles its source inside a wrapper that pushes it one line down.
+pub struct ExprLineShift(u32);
+
+impl ExprLineShift {
+    pub fn set(shift: u32) -> ExprLineShift {
+        ExprLineShift(EXPR_LINE_SHIFT.with(|s| s.replace(shift)))
+    }
+}
+
+impl Drop for ExprLineShift {
+    fn drop(&mut self) {
+        EXPR_LINE_SHIFT.with(|s| s.set(self.0));
+    }
+}
+
 /// Compile a parsed program. `debug` enables per-statement DAP line markers.
 pub fn compile(stmts: &[Stmt], debug: bool) -> Result<Program, String> {
     compile_ex(stmts, debug, false)
@@ -2881,7 +2901,15 @@ impl Compiler {
                 sp.suppress = true;
             }
             let prev = std::mem::replace(&mut self.node_span, sp);
+            // An instruction's line is its node's (`LOCATION` in codegen), not
+            // its statement's: `y = a + \` / `b / c` fails on the second line.
+            let prev_line = self.cur_line;
+            if sp.line != 0 {
+                let shift = EXPR_LINE_SHIFT.with(|s| s.get());
+                self.cur_line = sp.line.saturating_sub(shift).max(1);
+            }
             let r = self.compile_expr(b, inner);
+            self.cur_line = prev_line;
             self.node_span = prev;
             return r;
         }

@@ -9,6 +9,14 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **An instruction carries its expression's line, not its statement's.**
+  `y = x[0] + \` / `x[1] / x[2]` fails on the second line, a call on a
+  continuation line is that line in `f_lineno`, `tb_lineno` and the
+  traceback, as CPython's per-node instruction locations give.
+- **A traceback collapses repeated entries**: past three consecutive
+  entries for the same file, line and scope the rest print as `[Previous
+  line repeated N more times]` (`StackSummary.format`'s
+  `_RECURSIVE_CUTOFF`), so a `RecursionError` is a dozen lines, not 3000.
 - **`~` on a bool raises 3.12's `DeprecationWarning`** (`Bitwise inversion
   '~' on bool is deprecated…`), attributed to the line doing it, for the
   operator and for `True.__invert__()`; runtime warnings go through the same

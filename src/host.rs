@@ -19504,21 +19504,45 @@ impl PyHost {
     /// The `File "…", line N, in scope` lines (plus source and carets) for
     /// `frames`, outermost-first — CPython's `StackSummary.format`.
     fn render_frames(&self, frames: &[TbEntry]) -> String {
+        // `_RECURSIVE_CUTOFF`: past three consecutive entries for the same
+        // file, line and scope, the rest are counted, not shown.
+        const RECURSIVE_CUTOFF: usize = 3;
+        let flush = |out: &mut String, count: usize| {
+            if count > RECURSIVE_CUTOFF {
+                let n = count - RECURSIVE_CUTOFF;
+                let s = if n > 1 { "s" } else { "" };
+                out.push_str(&format!("  [Previous line repeated {n} more time{s}]\n"));
+            }
+        };
         let mut out = String::new();
+        let mut last: Option<(String, u32, Rc<str>)> = None;
+        let mut count = 0;
         for entry in frames {
             let f = match entry {
                 TbEntry::Frame(f) => f,
                 TbEntry::CPython(_handle) => {
+                    flush(&mut out, count);
+                    last = None;
+                    count = 0;
                     #[cfg(feature = "stdlib-ffi")]
                     out.push_str(&crate::ffi::traceback_segment_text(*_handle).unwrap_or_default());
                     continue;
                 }
             };
+            let filename = self.module_filename(f.module);
+            let key = (filename.clone(), f.line, f.name.clone());
+            if last.as_ref() != Some(&key) {
+                flush(&mut out, count);
+                last = Some(key);
+                count = 0;
+            }
+            count += 1;
+            if count > RECURSIVE_CUTOFF {
+                continue;
+            }
             out.push_str(&format!(
                 "  File \"{}\", line {}, in {}\n",
-                self.module_filename(f.module),
-                f.line,
-                f.name
+                filename, f.line, f.name
             ));
             let text = self.source_line(f.module, f.line);
             if let Some(text) = text.as_deref() {
@@ -19534,6 +19558,7 @@ impl PyHost {
                 }
             }
         }
+        flush(&mut out, count);
         out
     }
 

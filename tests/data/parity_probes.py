@@ -1952,3 +1952,36 @@ with warnings.catch_warnings(record=True) as w:
     ~x
 print([(r.category.__name__, r.lineno) for r in w], file=sys.stderr)
 print('end', file=sys.stderr)
+#==#
+# ── an instruction's line is its node's; repeated traceback lines collapse ────
+# A call or operator on a continuation line reports that line (f_lineno,
+# tb_lineno, the traceback), and past three identical traceback entries the
+# rest are counted as `[Previous line repeated N more times]`.
+import sys
+def where():
+    return sys._getframe(1).f_lineno
+x = (where(),
+     where(),
+     [where()
+      for _ in range(1)])
+print(x)
+def boom():
+    raise ValueError
+try:
+    y = (1 +
+         boom())
+except ValueError as e:
+    print(e.__traceback__.tb_lineno, e.__traceback__.tb_next.tb_lineno)
+def a(n):
+    if n == 0:
+        raise KeyError(n)
+    return b(n)
+def b(n):
+    return a(n - 1)
+def c(n):
+    if n:
+        return c(n - 1)
+    return a(3)
+nums = [1, 2, 0]
+c(6) if nums[0] else \
+    nums[1] / nums[2]

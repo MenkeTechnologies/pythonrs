@@ -8414,6 +8414,9 @@ fn run_pysource(want_value: bool, args: &[Value]) -> Result<Value, String> {
         // The source is the file `<string>` — or the name `compile()` was
         // given — to a syntax error in it. `single` mode echoes each
         // expression statement's value, as the interactive prompt does.
+        // The expression sits one line down in its `TMP = (` wrapper; its
+        // instructions are numbered from the source's own first line.
+        let _shift = crate::compiler::ExprLineShift::set(u32::from(want_value));
         let prog = if source_mode == "single" {
             crate::compile_interactive(&to_compile)
         } else {
