@@ -1878,3 +1878,62 @@ for group, out in [(stable, sys.stdout), (unstable, sys.stderr)]:
         except (TypeError, ValueError) as x:
             print(e, '!', type(x).__name__, x, file=out)
 print('end', file=sys.stderr)
+#==#
+# ── warnings: invalid escapes at compile time, warnings.warn's location ──────
+# The tokenizer warns once per literal, on the line of its first invalid
+# escape (an unknown letter or an octal escape above \377), f-string pieces
+# included. warnings.warn from pythonrs code is attributed to the pythonrs
+# frame `stacklevel` out, with the module's own registry.
+import sys
+import warnings
+a = "x\d\q"
+b = b"\d"
+c = "\400"
+e = """line1
+line2 \w
+"""
+f = f"""{a}
+\p {a!r}"""
+g = ("ok"
+     "\z")
+print(len(a + c + e + f + g), b)
+def warn_twice():
+    warnings.warn('careful', UserWarning)
+for i in range(3):
+    warn_twice()
+def outer():
+    warnings.warn('blame the caller', stacklevel=2)
+outer()
+warnings.warn(RuntimeWarning('an instance'))
+try:
+    warnings.warn('x', int)
+except TypeError as exc:
+    print(exc)
+with warnings.catch_warnings(record=True) as w:
+    warnings.simplefilter('always')
+    warnings.warn('recorded')
+    warn_twice()
+    outer()
+print([(x.lineno, str(x.message), x.category.__name__) for x in w])
+warnings.simplefilter('error')
+try:
+    warnings.warn('boom')
+except UserWarning as exc:
+    print('raised', exc)
+print('end', file=sys.stderr)
+#==#
+# ── an f-string piece's invalid escape is reported against its closing quotes ─
+# CPython decodes each literal piece (split at fields and doubled braces)
+# against the FSTRING_END token, so the warning's line is the closing quotes'
+# line plus the newlines before the escape within that piece.
+import sys
+x = 5
+print(f"a{{b}}c{x}d{{", f"{{}}", f"}}{x}{{", f"\N{DIGIT ONE}{x}", f"""{{
+\q{x}""", f"{x!r:>4}{{x}}")
+print(f"\d{{\q", f"x{{\n\y}}")
+k = f"""{x}
+\p
+{x}
+"""
+print(len(k), 'end')
+print('end', file=sys.stderr)

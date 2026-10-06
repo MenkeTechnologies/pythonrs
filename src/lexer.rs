@@ -674,13 +674,15 @@ impl Lexer {
         } else if is_f {
             self.push(Tok::FString(raw, is_raw));
         } else if is_bytes {
-            let decoded = decode_bytes_escapes(&raw, is_raw).map_err(|e| self.literal_err(e))?;
+            let decoded =
+                decode_bytes_escapes(&raw, is_raw, start_line).map_err(|e| self.literal_err(e))?;
             // Each decoded code point is one byte (latin-1): `\xff` -> 0xFF, not
             // its two-byte UTF-8 encoding.
             let bytes: Vec<u8> = decoded.chars().map(|c| c as u32 as u8).collect();
             self.push(Tok::Bytes(bytes));
         } else {
-            let decoded = decode_escapes(&raw, is_raw).map_err(|e| self.literal_err(e))?;
+            let decoded =
+                decode_escapes_at(&raw, is_raw, start_line).map_err(|e| self.literal_err(e))?;
             self.push(Tok::Str(decoded));
         }
         Ok(())
@@ -956,9 +958,55 @@ impl Lexer {
     }
 }
 
+thread_local! {
+    /// The invalid-escape `SyntaxWarning`s the tokenizer and the f-string
+    /// parser raised for the program being compiled, as `(line, message)`.
+    static ESCAPE_WARNINGS: std::cell::RefCell<Vec<(u32, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Take the invalid-escape warnings recorded since the last call, in source
+/// order (the tokenizer reports plain literals before the parser reaches an
+/// f-string's; CPython reads both in one pass).
+pub fn take_escape_warnings() -> Vec<(u32, String)> {
+    let mut w = ESCAPE_WARNINGS.with(|w| std::mem::take(&mut *w.borrow_mut()));
+    w.sort_by_key(|(line, _)| *line);
+    w
+}
+
+/// `warn_invalid_escape_sequence` (`Parser/string_parser.c`): the first
+/// invalid escape of a literal whose body starts on `line` — an unknown
+/// escape character, or an octal escape above `\377` — as a `SyntaxWarning`
+/// on the line its backslash is on.
+fn note_invalid_escape(raw: &str, line: u32, first_invalid: Option<(usize, String)>) {
+    let Some((idx, esc)) = first_invalid else {
+        return;
+    };
+    let line = line + raw.chars().take(idx).filter(|&c| c == '\n').count() as u32;
+    let kind = if esc.chars().count() > 1 {
+        "invalid octal escape sequence"
+    } else {
+        "invalid escape sequence"
+    };
+    let msg = format!(
+        "\"\\{esc}\" is an {kind}. Such sequences will not work in the future. \
+         Did you mean \"\\\\{esc}\"? A raw string is also an option."
+    );
+    ESCAPE_WARNINGS.with(|w| w.borrow_mut().push((line, msg)));
+}
+
 /// Decode Python string escapes. Raw strings keep backslashes literal.
 pub fn decode_escapes(raw: &str, is_raw: bool) -> Result<String, String> {
-    decode_escapes_mode(raw, is_raw, false)
+    decode_escapes_mode(raw, is_raw, false, &mut None)
+}
+
+/// [`decode_escapes`] for a literal whose body starts on `line`, recording
+/// its first invalid escape as a `SyntaxWarning`.
+pub fn decode_escapes_at(raw: &str, is_raw: bool, line: u32) -> Result<String, String> {
+    let mut first_invalid = None;
+    let out = decode_escapes_mode(raw, is_raw, false, &mut first_invalid)?;
+    note_invalid_escape(raw, line, first_invalid);
+    Ok(out)
 }
 
 /// Escape decoding for a BYTES literal. Differs from the text form in exactly
@@ -966,11 +1014,21 @@ pub fn decode_escapes(raw: &str, is_raw: bool) -> Result<String, String> {
 /// escapes at all (the backslash and letter stay literal), and a short `\x`
 /// reports `(value error) invalid \x escape at position N` rather than the
 /// `unicodeescape` wording.
-pub fn decode_bytes_escapes(raw: &str, is_raw: bool) -> Result<String, String> {
-    decode_escapes_mode(raw, is_raw, true)
+pub fn decode_bytes_escapes(raw: &str, is_raw: bool, line: u32) -> Result<String, String> {
+    let mut first_invalid = None;
+    let out = decode_escapes_mode(raw, is_raw, true, &mut first_invalid)?;
+    note_invalid_escape(raw, line, first_invalid);
+    Ok(out)
 }
 
-fn decode_escapes_mode(raw: &str, is_raw: bool, bytes_mode: bool) -> Result<String, String> {
+/// Decode `raw`, setting `first_invalid` to the char index of the backslash
+/// and the text of the first invalid escape (`d` for `\d`, `400` for `\400`).
+fn decode_escapes_mode(
+    raw: &str,
+    is_raw: bool,
+    bytes_mode: bool,
+    first_invalid: &mut Option<(usize, String)>,
+) -> Result<String, String> {
     if is_raw {
         return Ok(raw.to_string());
     }
@@ -995,6 +1053,10 @@ fn decode_escapes_mode(raw: &str, is_raw: bool, bytes_mode: bool) -> Result<Stri
                     while oct.len() < 3 && matches!(chars.get(i + 1), Some('0'..='7')) {
                         i += 1;
                         oct.push(chars[i]);
+                    }
+                    // Three digits above `\377`: still decoded, but warned of.
+                    if oct.len() == 3 && oct.as_bytes()[0] > b'3' && first_invalid.is_none() {
+                        *first_invalid = Some((i - 3, oct.clone()));
                     }
                     if let Ok(n) = u32::from_str_radix(&oct, 8) {
                         if let Some(ch) = char::from_u32(n) {
@@ -1107,6 +1169,9 @@ fn decode_escapes_mode(raw: &str, is_raw: bool, bytes_mode: bool) -> Result<Stri
                     }
                 }
                 other => {
+                    if first_invalid.is_none() {
+                        *first_invalid = Some((i - 1, other.to_string()));
+                    }
                     out.push('\\');
                     out.push(other);
                 }

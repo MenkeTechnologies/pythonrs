@@ -19546,6 +19546,24 @@ impl PyHost {
             .unwrap_or_else(|| self.tb_filename.clone())
     }
 
+    /// Where `warnings.warn(…, stacklevel=n)` called from pythonrs code
+    /// attributes the warning (`_warnings.c` `setup_context`): the frame `n`
+    /// out from the caller of `warn` (a level below 1 is the caller itself),
+    /// as `(filename, lineno, module name)`. `None` past the outermost frame,
+    /// which CPython reports as `<sys>`.
+    pub fn warning_context(&self, stacklevel: i64) -> Option<(String, u32, String)> {
+        let back = usize::try_from(stacklevel.max(1)).ok()?;
+        let idx = self.frames.len().checked_sub(back)?;
+        let frame = self.frames.get(idx)?;
+        let module = self
+            .module_globals
+            .get(frame.module)
+            .and_then(|g| g.get("__name__"))
+            .and_then(|n| self.as_str(n))
+            .unwrap_or_else(|| "<string>".into());
+        Some((self.module_filename(frame.module), frame.line, module))
+    }
+
     /// `__file__` of a module other than `__main__`.
     fn module_file(&self, module: usize) -> Option<String> {
         if module == 0 {

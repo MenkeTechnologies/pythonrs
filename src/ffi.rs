@@ -2480,6 +2480,121 @@ pub fn call_builtin_type_new(
     })
 }
 
+/// The `__warningregistry__` CPython keeps per module, held on the CPython
+/// side by module name so `default`/`once`/`module` actions de-duplicate
+/// across calls.
+static WARN_REGISTRIES: OnceLock<Mutex<rustc_hash::FxHashMap<String, u32>>> = OnceLock::new();
+
+/// `warnings.warn(message, category=None, stacklevel=1, source=None)` called
+/// from pythonrs code. CPython's `_warnings.warn` locates the warning by
+/// walking CPython frames, of which a pythonrs caller has none, so the call is
+/// answered here as `warn` does it: the category from `get_category`, the
+/// location from the pythonrs frame `stacklevel` out ([`PyHost::warning_context`]),
+/// then `warnings.warn_explicit` with that module's registry. `None` when
+/// `callable` is not `warnings.warn` or the call is not one this binds
+/// (CPython then reports its own argument error).
+fn warn_from_pythonrs(
+    py: Python,
+    callable: &Bound<PyAny>,
+    args: &[Value],
+    kwargs: &[(String, Value)],
+) -> Option<Result<Value, String>> {
+    let warnings = py.import("warnings").ok()?;
+    if !callable.is(&warnings.getattr("warn").ok()?) {
+        return None;
+    }
+    let names = ["message", "category", "stacklevel", "source"];
+    if args.len() > names.len() {
+        return None;
+    }
+    let mut slots: [Option<Value>; 4] = Default::default();
+    for (slot, v) in slots.iter_mut().zip(args) {
+        *slot = Some(v.clone());
+    }
+    for (k, v) in kwargs {
+        let i = names.iter().position(|n| n == k)?;
+        if slots[i].is_some() {
+            return None;
+        }
+        slots[i] = Some(v.clone());
+    }
+    let [message, category, stacklevel, source] = slots;
+    let message = message?;
+    let stacklevel = match &stacklevel {
+        None => 1,
+        Some(v) => with_host(|h| h.as_int(v))?,
+    };
+    Some((|| {
+        let context = with_host(|h| h.warning_context(stacklevel));
+        let (filename, lineno, module) =
+            context.unwrap_or_else(|| ("<sys>".into(), 0, "sys".into()));
+        let to_py = |v: &Value| with_host(|h| value_to_py(h, py, v));
+        let message = to_py(&message)?;
+        let warning = py.get_type::<pyo3::exceptions::PyWarning>();
+        // `get_category`.
+        let category = if message.is_instance(&warning).unwrap_or(false) {
+            message.get_type().into_any()
+        } else {
+            match &category {
+                None | Some(Value::Undef) => {
+                    py.get_type::<pyo3::exceptions::PyUserWarning>().into_any()
+                }
+                Some(c) => {
+                    let c = to_py(c)?;
+                    let ok = c
+                        .downcast::<pyo3::types::PyType>()
+                        .is_ok_and(|t| t.is_subclass(&warning).unwrap_or(false));
+                    if !ok {
+                        return Err(format!(
+                            "TypeError: category must be a Warning subclass, not '{}'",
+                            c.get_type()
+                                .name()
+                                .map(|n| n.to_string())
+                                .unwrap_or_default()
+                        ));
+                    }
+                    c
+                }
+            }
+        };
+        let registry_id = {
+            let mut map = WARN_REGISTRIES
+                .get_or_init(|| Mutex::new(Default::default()))
+                .lock()
+                .map_err(|e| e.to_string())?;
+            match map.get(&module) {
+                Some(&id) => id,
+                None => {
+                    let id = store(pyo3::types::PyDict::new(py).into_any().unbind());
+                    map.insert(module.clone(), id);
+                    id
+                }
+            }
+        };
+        let registry = fetch(py, registry_id)?;
+        let source = match &source {
+            Some(v) => to_py(v)?,
+            None => py.None().into_bound(py),
+        };
+        warnings
+            .getattr("warn_explicit")
+            .and_then(|f| {
+                f.call1((
+                    message,
+                    category,
+                    filename,
+                    lineno,
+                    module,
+                    registry,
+                    py.None(),
+                    source,
+                ))
+            })
+            .map_err(|e| pyerr_to_error(py, &e))?;
+        Ok(Value::Undef)
+    })())
+}
+
 /// Marshal args (host borrow held only here, no user code runs), make the CPython
 /// call (no host borrow — reverse callbacks are free to run), then marshal the
 /// result back (fresh host borrow).
@@ -2489,6 +2604,9 @@ fn invoke_bound(
     args: &[Value],
     kwargs: &[(String, Value)],
 ) -> Result<Value, String> {
+    if let Some(r) = warn_from_pythonrs(py, callable, args, kwargs) {
+        return r;
+    }
     let (arg_tuple, kw) = with_host(|h| build_call_args(h, py, args, kwargs))?;
     let result = callable
         .call(&arg_tuple, kw.as_ref())

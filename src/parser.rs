@@ -3940,15 +3940,19 @@ impl Parser {
                     byte_acc.get_or_insert_with(Vec::new).extend(b);
                 }
                 Tok::FString(raw, is_raw) => {
+                    // The line the token ends on: its closing quotes.
+                    let line = self.line();
                     self.advance();
                     any_f = true;
-                    let mut sub = self.parse_fstring(&raw, is_raw)?;
+                    let mut sub = self.parse_fstring(&raw, is_raw, Some(line))?;
                     parts.append(&mut sub);
                 }
                 Tok::TString(raw, is_raw) => {
+                    // The line the token ends on: its closing quotes.
+                    let line = self.line();
                     self.advance();
                     any_t = true;
-                    let mut sub = self.parse_fstring(&raw, is_raw)?;
+                    let mut sub = self.parse_fstring(&raw, is_raw, Some(line))?;
                     parts.append(&mut sub);
                 }
                 _ => break,
@@ -3990,39 +3994,63 @@ impl Parser {
     }
 
     /// Expand an f-string body into literal/expression parts.
-    fn parse_fstring(&self, raw: &str, is_raw: bool) -> Result<Vec<FStrPart>, String> {
+    /// The pieces of an f-string body. `line` is the line the literal's
+    /// closing quotes are on (`None` for a format spec): CPython decodes each
+    /// literal piece against the `FSTRING_END` token, so an invalid escape's
+    /// `SyntaxWarning` is reported on that line plus the newlines before the
+    /// escape within its piece — a piece ending at a field or a doubled brace
+    /// (`_PyPegen_decode_fstring_part`).
+    fn parse_fstring(
+        &self,
+        raw: &str,
+        is_raw: bool,
+        line: Option<u32>,
+    ) -> Result<Vec<FStrPart>, String> {
         let chars: Vec<char> = raw.chars().collect();
+        let decode = |seg: &str| match line {
+            Some(l) => crate::lexer::decode_escapes_at(seg, is_raw, l),
+            None => crate::lexer::decode_escapes(seg, is_raw),
+        };
         let mut parts = Vec::new();
-        let mut lit = String::new();
+        // The literal being built: the decoded pieces so far, and the raw text
+        // of the piece in progress.
+        let mut acc = String::new();
+        let mut seg = String::new();
+        let mut has_lit = false;
         let mut i = 0;
         while i < chars.len() {
             let c = chars[i];
+            if (c == '{' || c == '}') && chars.get(i + 1) == Some(&c) {
+                // A doubled brace ends a tokenizer piece, the brace kept.
+                seg.push(c);
+                acc.push_str(&decode(&seg)?);
+                seg.clear();
+                has_lit = true;
+                i += 2;
+                continue;
+            }
             if c == '{' {
-                if chars.get(i + 1) == Some(&'{') {
-                    lit.push('{');
-                    i += 2;
-                    continue;
-                }
                 // `\N{NAME}` named-Unicode escape: the braces belong to the escape,
                 // not a replacement field. Absorb `{...}` into the literal so
                 // `decode_escapes` resolves the name.
-                if crate::lexer::ends_with_named_escape_lead(&lit, is_raw) {
-                    lit.push('{');
+                if crate::lexer::ends_with_named_escape_lead(&seg, is_raw) {
+                    seg.push('{');
                     i += 1;
                     while i < chars.len() && chars[i] != '}' {
-                        lit.push(chars[i]);
+                        seg.push(chars[i]);
                         i += 1;
                     }
                     if i < chars.len() {
-                        lit.push('}');
+                        seg.push('}');
                         i += 1;
                     }
                     continue;
                 }
-                if !lit.is_empty() {
-                    let decoded = crate::lexer::decode_escapes(&lit, is_raw)?;
-                    parts.push(FStrPart::Lit(decoded));
-                    lit.clear();
+                if has_lit || !seg.is_empty() {
+                    acc.push_str(&decode(&seg)?);
+                    parts.push(FStrPart::Lit(std::mem::take(&mut acc)));
+                    seg.clear();
+                    has_lit = false;
                 }
                 // Collect balanced field text up to the matching `}`.
                 let mut depth = 1;
@@ -4045,22 +4073,14 @@ impl Parser {
                     i += 1;
                 }
                 parts.extend(self.build_fstring_field(&field, is_raw)?);
-            } else if c == '}' {
-                if chars.get(i + 1) == Some(&'}') {
-                    lit.push('}');
-                    i += 2;
-                    continue;
-                }
-                lit.push('}');
-                i += 1;
             } else {
-                lit.push(c);
+                seg.push(c);
                 i += 1;
             }
         }
-        if !lit.is_empty() {
-            let decoded = crate::lexer::decode_escapes(&lit, is_raw)?;
-            parts.push(FStrPart::Lit(decoded));
+        if has_lit || !seg.is_empty() {
+            acc.push_str(&decode(&seg)?);
+            parts.push(FStrPart::Lit(acc));
         }
         Ok(parts)
     }
@@ -4089,7 +4109,7 @@ impl Parser {
         // format spec — itself a mini joined-string, so a nested replacement field
         // (`{w}` in `{x:{w}.2f}`) is evaluated at runtime and spliced into the spec.
         if let Some(idx) = find_top_level(field, ':') {
-            spec = self.parse_fstring(&field[idx + 1..], is_raw)?;
+            spec = self.parse_fstring(&field[idx + 1..], is_raw, None)?;
             expr_src = &field[..idx];
         }
         // conversion !s/!r/!a

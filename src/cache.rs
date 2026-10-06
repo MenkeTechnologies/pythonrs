@@ -161,7 +161,9 @@ use std::path::PathBuf;
 /// field) so its code object names the parameter `format`.
 /// v54: a `raise` statement's op carries the statement's extent as its caret span.
 /// v55: `BUILD_CLASS` carries the class statement's line.
-const SCHEMA: u64 = 55;
+/// v56: `CProg.warnings` leads with the invalid-escape `SyntaxWarning`s the
+/// tokenizer and the f-string parser raise.
+const SCHEMA: u64 = 56;
 
 /// The shard's INDEX: everything a lookup needs, and nothing it does not.
 ///

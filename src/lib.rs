@@ -47,14 +47,36 @@ pub use fusevm::Value;
 
 /// Compile a source string to a runnable program.
 pub fn compile(src: &str) -> Result<compiler::Program, String> {
-    let stmts = parser::parse(src)?;
-    compiler::compile(&stmts, false).map_err(|e| parser::with_byte_columns(e, src))
+    let (stmts, warnings) = parse_with_warnings(src)?;
+    compiler::compile(&stmts, false)
+        .map(|p| with_parse_warnings(p, warnings))
+        .map_err(|e| parser::with_byte_columns(e, src))
+}
+
+/// `SyntaxWarning`s as `(line, message)`.
+type Warnings = Vec<(u32, String)>;
+
+/// Parse `src`, collecting the `SyntaxWarning`s the tokenizer and parser
+/// raise along the way (invalid escapes), which precede the compiler's own.
+fn parse_with_warnings(src: &str) -> Result<(Vec<ast::Stmt>, Warnings), String> {
+    let _ = lexer::take_escape_warnings();
+    let stmts = parser::parse(src);
+    let warnings = lexer::take_escape_warnings();
+    Ok((stmts?, warnings))
+}
+
+fn with_parse_warnings(mut prog: compiler::Program, mut warnings: Warnings) -> compiler::Program {
+    warnings.append(&mut prog.warnings);
+    prog.warnings = warnings;
+    prog
 }
 
 /// Compile with per-statement DAP line markers enabled (`python --dap`).
 pub fn compile_debug(src: &str) -> Result<compiler::Program, String> {
-    let stmts = parser::parse(src)?;
-    compiler::compile(&stmts, true).map_err(|e| parser::with_byte_columns(e, src))
+    let (stmts, warnings) = parse_with_warnings(src)?;
+    compiler::compile(&stmts, true)
+        .map(|p| with_parse_warnings(p, warnings))
+        .map_err(|e| parser::with_byte_columns(e, src))
 }
 
 /// Compile one interactive REPL line in CPython "single" mode: a top-level

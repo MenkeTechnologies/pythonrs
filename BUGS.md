@@ -9,6 +9,22 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **`warnings.warn` from pythonrs code names the pythonrs caller.** The call
+  is answered as `_warnings.warn` answers it — `get_category`, then
+  `setup_context` walking `stacklevel` frames out over the pythonrs frame
+  stack (each frame records the line of the call it is making), then
+  `warnings.warn_explicit` with a per-module registry kept on the CPython
+  side — so a warning reads `script.py:3: UserWarning: boom` with its source
+  line, `stacklevel=2` blames the caller, a `default` filter shows a
+  location once, a recorded warning carries the real `filename`/`lineno`,
+  and a `DeprecationWarning` in `__main__` is shown. It was `<sys>:0` for
+  every call.
+- **Invalid escape sequences are `SyntaxWarning`s at compile time**, once
+  per literal on the line of the first one (`"\d" is an invalid escape
+  sequence…`, `"\400" is an invalid octal escape sequence…`), bytes literals
+  included. An f-string's literal pieces are reported as CPython reports them:
+  against the line of the closing quotes plus the newlines before the escape
+  within the piece, a piece ending at a field or a doubled brace.
 - **`min`/`max` follow `min_max`**: `key`/`default` are keyword-only with
   CPython's refusals (`max() got an unexpected keyword argument 'x'`, `takes
   at most 2 keyword arguments`), a `default` beside several positional
@@ -2363,16 +2379,6 @@ written.
   file, so `pickle` reports it is not the same object. `copy.copy`/`deepcopy` are
   native and do not consult `__copy__`/`__deepcopy__`/`__reduce_ex__`. A
   `bytearray` subclass is not a native builtin subclass at all.
-- **A warning raised from pythonrs code is attributed to `<sys>:0`.**
-  `warnings.warn` is CPython's C `_warnings.warn`, which locates the warning
-  by walking CPython frames; a call from pythonrs has none, so the message
-  renders as `<sys>:0: UserWarning: boom` with no source line (CPython:
-  `script.py:3: UserWarning: boom` plus the line), a recorded warning's
-  `filename`/`lineno` are `'<sys>'`/`0`, and `stacklevel=` has nothing to
-  walk. Attributing it needs the executing line of every pythonrs frame at the
-  moment of the call — `Frame::line` is only maintained by the DAP hook and the
-  error path — plus each frame's filename and module globals for
-  `warn_explicit`'s registry.
 
 - **A left-recursive chain CPython compiles can exceed pythonrs's compile
   stack.** `a.b.c…`, `1+1+1…`, `f()()…` parse in a loop and fail, as in
