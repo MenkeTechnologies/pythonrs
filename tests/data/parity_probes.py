@@ -1732,3 +1732,61 @@ for bad in [None, [], b'/no/such/file', "/no/such/it's"]:
         open(bad)
     except (TypeError, OSError) as e:
         print(type(e).__name__, e)
+#==#
+# ── `T.__new__(cls)`: tp_new_wrapper's checks; getattr & co. arity ───────────
+# `cls` must be a type, a subtype of `T`, and its nearest base without a Python
+# `__new__` must allocate with `T`'s own `tp_new`. getattr/setattr/delattr/
+# hasattr check their argument count and that the name is a str. Wording that
+# moved since 3.9 goes to stderr, which an old reference compares by final line.
+import sys
+class Foo: pass
+class S(str): pass
+class I(int): pass
+class T(S):
+    def __new__(cls):
+        return 1
+for e in ["object.__new__()", "object.__new__(1)", "object.__new__(Foo).__class__.__name__",
+          "object.__new__(S)", "object.__new__(int)", "object.__new__(T)", "int.__new__(1)",
+          "int.__new__()", "int.__new__(str)", "int.__new__(Foo)", "int.__new__(bool)",
+          "int.__new__(I, '7')", "type(int.__new__(I, 5)).__name__", "str.__new__(T)",
+          "list.__new__(dict)", "getattr()", "getattr(1, 'real', 2, 3)", "setattr(1, 2)",
+          "delattr(1)", "hasattr(1)", "setattr(1, 2, 3)", "delattr(1, 2)"]:
+    try:
+        print(e, repr(eval(e)))
+    except TypeError as x:
+        print(e, x)
+for e in ["getattr(1, 2)", "hasattr(1, 2)"]:
+    try:
+        eval(e)
+    except TypeError as x:
+        print(e, x, file=sys.stderr)
+print('end', file=sys.stderr)
+#==#
+# ── attribute stores a builtin refuses ───────────────────────────────────────
+# A static type refuses every store (`type_setattro`); a READONLY member says
+# `readonly attribute`; a getset without a setter `is not writable`; a plain
+# type-dict entry such as `__doc__` is `read-only`; function and exception
+# setters type-check their value. Wording that moved since 3.9 goes to stderr.
+import sys
+def f(a=1):
+    return a
+class E(Exception):
+    pass
+def attempt(cases, out):
+    for s in cases:
+        try:
+            exec(s)
+            print(s, 'ok', file=out)
+        except (TypeError, AttributeError) as x:
+            print(s, type(x).__name__, x, file=out)
+attempt(["range(3).start = 1", "del slice(1).stop", "(1j).real = 2", "f.__globals__ = 1",
+         "property().fget = 1", "staticmethod(f).__func__ = 1", "(1).real = 2",
+         "del [].append", "(1).__doc__ = 'x'", "[].__hash__ = 1", "f.__name__ = 1",
+         "f.__qualname__ = 1", "f.__code__ = 1", "f.__defaults__ = 5", "f.__kwdefaults__ = 1",
+         "f.__dict__ = 1", "del f.__name__", "e = ValueError(); e.__cause__ = 1",
+         "e = E(); e.__context__ = 1", "e = E(); e.__traceback__ = 1",
+         "e = ValueError(); del e.args", "e = E(); e.args = 5",
+         "e = ValueError(); e.args = [1, 2]; print(e.args, str(e))"], sys.stdout)
+attempt(["int.foo = 1", "del int.real", "type(None).x = 1", "del (1).x",
+         "o = object(); del o.x"], sys.stderr)
+print('end', file=sys.stderr)

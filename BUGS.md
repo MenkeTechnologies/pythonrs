@@ -9,6 +9,36 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **`T.__new__(cls, …)` runs `tp_new_wrapper`'s checks.** `object.__new__`
+  and the data types' `__new__` (`int`, `str`, `float`, `tuple`, `list`,
+  `dict`, `set`, `frozenset`) refuse a missing `cls` (`T.__new__(): not enough
+  arguments`), a non-type (`X is not a type object (int)`), a type that is not
+  a subtype of `T`, and a type whose nearest base without a Python `__new__`
+  allocates with a different `tp_new` (`object.__new__(S) is not safe, use
+  S.__new__()` for a `str` subclass). They used to build whatever they were
+  handed: `int.__new__(str)` was `0`, `object.__new__(dict_subclass)` an
+  instance without the dict. A CPython class as `cls` is CPython's own
+  `T.__new__`, so `tuple.__new__(namedtuple_cls, it)` builds the namedtuple.
+- **`getattr`/`setattr`/`delattr`/`hasattr` check their arguments**: the
+  count (`getattr expected at most 3 arguments, got 4`, where an extra
+  argument was ignored) and that the name is a `str` (`attribute name must be
+  string, not 'int'`, where `getattr(1, 2)` looked up the attribute `'2'`).
+- **Attribute stores a builtin refuses are refused as CPython does.** A static
+  builtin type takes no attribute at all (`int.foo = 1`, `del int.real`:
+  `TypeError: cannot set 'foo' attribute of immutable type 'int'`); a
+  `READONLY` member (`range.start`, `slice.stop`, `complex.real`,
+  `function.__globals__`, `property.fget`, `staticmethod.__func__`,
+  `re.Pattern.pattern`, `code.co_*`, …) is `AttributeError: readonly
+  attribute`; a plain type-dict entry (`(1).__doc__`, `[].__hash__`) is
+  `read-only`; the `deque` type is named `collections.deque`. Deleting an
+  attribute of an object without a `__dict__` gives the same refusals as
+  storing it, and deleting one of a CPython object deletes it there. The
+  function setters type-check (`__name__ must be set to a string object`,
+  `__code__`, `__defaults__`, `__kwdefaults__`, `__dict__`,
+  `__annotations__`, `__type_params__`) where any value was stored, and the
+  exception setters do too (`exception cause must be None or derive from
+  BaseException`, `__traceback__ must be a traceback or None`, `args may not
+  be deleted`); `e.args = [1, 2]` stores `tuple(value)`, which `str(e)` shows.
 - **3.14's mixed-mode complex arithmetic.** `COMPLEX_BINOP` no longer promotes a
   real operand to `complex`: `float + complex` adds to the real part only, `real
   - complex` negates the imaginary part, a real factor or divisor scales each

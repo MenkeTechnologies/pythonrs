@@ -15003,6 +15003,9 @@ impl PyHost {
         if let Some(id) = self.foreign_id(recv) {
             return crate::ffi::set_attr(self, id, name, &val);
         }
+        self.immutable_type_check(recv, name)?;
+        self.readonly_member_check(recv, name)?;
+        self.typed_setter_check(recv, name, Some(&val))?;
         // SimpleNamespace: attribute writes go into its bag.
         if let Some(PyObj::Namespace { attrs }) = self.get_mut(recv) {
             attrs.insert(name.to_string(), val);
@@ -15076,6 +15079,15 @@ impl PyHost {
         // `unittest`'s runner stamps bookkeeping onto the exceptions it catches,
         // and `raise X from Y` style helpers attach their own state.
         if matches!(self.get(recv), Some(PyObj::Exception { .. })) {
+            // `args` is the exception's own field (what `str(e)` renders).
+            if name == "args" {
+                if let Some(PyObj::Tuple(items)) = self.get(&val).cloned() {
+                    if let Some(PyObj::Exception { args, .. }) = self.get_mut(recv) {
+                        *args = items;
+                        return Ok(());
+                    }
+                }
+            }
             if let Value::Obj(id) = recv {
                 let id = *id;
                 self.func_attrs
@@ -15133,13 +15145,168 @@ impl PyHost {
         }
     }
 
+    /// `type_setattro`'s first check: a static builtin type
+    /// (`Py_TPFLAGS_IMMUTABLETYPE`) refuses every attribute store and delete,
+    /// whatever the name.
+    fn immutable_type_check(&self, recv: &Value, name: &str) -> Result<(), String> {
+        match self.get(recv) {
+            Some(PyObj::Builtin(t)) if crate::builtins::is_type_object_name(t) => {
+                Err(type_error(&format!(
+                    "cannot set {} attribute of immutable type '{t}'",
+                    quote_str(name)
+                )))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Whether `v` is an exception instance (native, user-defined or CPython's).
+    pub fn is_exception_value(&self, v: &Value) -> bool {
+        match self.get(v) {
+            Some(PyObj::Exception { .. }) => true,
+            Some(PyObj::Instance(inst)) => self.class_is_exception(&inst.class),
+            _ => self.foreign_exception_handle(v).is_some(),
+        }
+    }
+
+    /// The type checks of the getset setters on functions (`funcobject.c`)
+    /// and exceptions (`exceptions.c`). `val` is `None` for a delete, which
+    /// the setters that cannot take NULL refuse with the same message or a
+    /// `may not be deleted`.
+    fn typed_setter_check(
+        &self,
+        recv: &Value,
+        name: &str,
+        val: Option<&Value>,
+    ) -> Result<(), String> {
+        let is = |pred: fn(&PyObj) -> bool| val.is_some_and(|v| self.get(v).is_some_and(pred));
+        let is_none = val.is_some_and(|v| matches!(v, Value::Undef));
+        let refuse = |msg: &str| Err(type_error(msg));
+        match self.get(recv) {
+            Some(PyObj::Func(_)) => match name {
+                "__name__" | "__qualname__" if !is(|o| matches!(o, PyObj::Str(_))) => {
+                    refuse(&format!("{name} must be set to a string object"))
+                }
+                "__code__" if !is(|o| matches!(o, PyObj::Code { .. })) => {
+                    refuse("__code__ must be set to a code object")
+                }
+                "__defaults__"
+                    if val.is_some() && !is_none && !is(|o| matches!(o, PyObj::Tuple(_))) =>
+                {
+                    refuse("__defaults__ must be set to a tuple object")
+                }
+                "__kwdefaults__"
+                    if val.is_some() && !is_none && !is(|o| matches!(o, PyObj::Dict(_))) =>
+                {
+                    refuse("__kwdefaults__ must be set to a dict object")
+                }
+                "__annotations__"
+                    if val.is_some() && !is_none && !is(|o| matches!(o, PyObj::Dict(_))) =>
+                {
+                    refuse("__annotations__ must be set to a dict object")
+                }
+                "__type_params__" if !is(|o| matches!(o, PyObj::Tuple(_))) => {
+                    refuse("__type_params__ must be set to a tuple")
+                }
+                "__dict__" => match val {
+                    None => refuse("cannot delete __dict__"),
+                    Some(v) if !matches!(self.get(v), Some(PyObj::Dict(_))) => refuse(&format!(
+                        "__dict__ must be set to a dictionary, not a '{}'",
+                        self.tp_name(v)
+                    )),
+                    _ => Ok(()),
+                },
+                _ => Ok(()),
+            },
+            _ if self.is_exception_value(recv) => match (name, val) {
+                ("args" | "__traceback__" | "__cause__" | "__context__", None) => {
+                    refuse(&format!("{name} may not be deleted"))
+                }
+                ("__traceback__", Some(v))
+                    if !is_none && !matches!(self.get(v), Some(PyObj::Traceback { .. })) =>
+                {
+                    refuse("__traceback__ must be a traceback or None")
+                }
+                ("__cause__", Some(v)) if !is_none && !self.is_exception_value(v) => {
+                    refuse("exception cause must be None or derive from BaseException")
+                }
+                ("__context__", Some(v)) if !is_none && !self.is_exception_value(v) => {
+                    refuse("exception context must be None or derive from BaseException")
+                }
+                ("__suppress_context__", Some(v)) if !matches!(v, Value::Bool(_)) => {
+                    refuse("attribute value type must be bool")
+                }
+                _ => Ok(()),
+            },
+            _ => Ok(()),
+        }
+    }
+
+    /// A `READONLY` `PyMemberDef` of a builtin type (`range.start`,
+    /// `function.__globals__`): `PyMember_SetOne` refuses a store or delete
+    /// with a bare `readonly attribute`.
+    fn readonly_member_check(&self, recv: &Value, name: &str) -> Result<(), String> {
+        const READONLY_MEMBERS: &[(&str, &[&str])] = &[
+            ("range", &["start", "stop", "step"]),
+            ("slice", &["start", "stop", "step"]),
+            ("complex", &["real", "imag"]),
+            ("function", &["__builtins__", "__closure__", "__globals__"]),
+            ("method", &["__func__", "__self__"]),
+            ("staticmethod", &["__func__", "__wrapped__"]),
+            ("classmethod", &["__func__", "__wrapped__"]),
+            ("property", &["fget", "fset", "fdel"]),
+            ("Union", &["__args__"]),
+            ("Pattern", &["pattern", "flags", "groups"]),
+            ("Match", &["string", "re", "pos", "endpos"]),
+            ("GenericAlias", &["__origin__", "__args__", "__unpacked__"]),
+            (
+                "code",
+                &[
+                    "co_argcount",
+                    "co_consts",
+                    "co_exceptiontable",
+                    "co_filename",
+                    "co_firstlineno",
+                    "co_flags",
+                    "co_kwonlyargcount",
+                    "co_linetable",
+                    "co_name",
+                    "co_names",
+                    "co_nlocals",
+                    "co_posonlyargcount",
+                    "co_qualname",
+                    "co_stacksize",
+                ],
+            ),
+        ];
+        if matches!(self.get(recv), Some(PyObj::Instance(_))) {
+            return Ok(());
+        }
+        let t = self.type_name(recv);
+        // Keyed by `__name__`: `re.Pattern` and `typing.Union` are `Pattern`, `Union`.
+        let t = t.rsplit('.').next().unwrap_or(&t);
+        match READONLY_MEMBERS.iter().find(|(tn, _)| *tn == t) {
+            Some((_, names)) if names.contains(&name) => {
+                Err("AttributeError: readonly attribute".to_string())
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Why `recv.name = …` fails on an instance of a builtin type, which has
     /// no `__dict__` (`PyObject_GenericSetAttr`): a method is `read-only`, a
     /// data attribute such as `int.real` is `not writable`, and any other name
     /// has nowhere to go.
     fn builtin_setattr_error(&mut self, recv: &Value, name: &str) -> String {
-        let t = self.type_name(recv);
+        let t = self.tp_name(recv);
+        // `__doc__`, and the `__hash__ = None` of an unhashable type, are plain
+        // entries of the type's dict, not data descriptors.
+        let plain_type_entry =
+            |v: &Value| name == "__doc__" || (name == "__hash__" && matches!(v, Value::Undef));
         match self.get_attr(recv, name) {
+            Ok(v) if plain_type_entry(&v) => {
+                format!("AttributeError: '{t}' object attribute '{name}' is read-only")
+            }
             Ok(v)
                 if matches!(
                     self.get(&v),
@@ -15208,6 +15375,17 @@ impl PyHost {
     }
 
     pub fn del_attr(&mut self, recv: &Value, name: &str) -> Result<(), String> {
+        #[cfg(feature = "stdlib-ffi")]
+        if let Some(id) = self.foreign_id(recv) {
+            return crate::ffi::del_attr(self, id, name);
+        }
+        self.immutable_type_check(recv, name)?;
+        self.readonly_member_check(recv, name)?;
+        self.typed_setter_check(recv, name, None)?;
+        // A bare `object()` has no `__dict__`: nothing to delete from.
+        if matches!(self.get(recv), Some(PyObj::Instance(inst)) if inst.class == "object") {
+            return Err(self.builtin_setattr_error(recv, name));
+        }
         // `del obj.__class__` is rejected by the setter slot itself, before any
         // instance-dict lookup — CPython raises TypeError, not AttributeError.
         if name == "__class__" {
@@ -15251,10 +15429,27 @@ impl PyHost {
                 return Ok(());
             }
         }
-        Err(format!(
-            "AttributeError: '{}' object has no attribute '{name}'",
-            self.type_name(recv)
-        ))
+        // An object with an attribute dict misses the name; one without (an
+        // instance of a builtin type) refuses the delete the way it refuses a
+        // store (`PyObject_GenericSetAttr` with a NULL value).
+        if matches!(
+            self.get(recv),
+            Some(
+                PyObj::Instance(_)
+                    | PyObj::Module { .. }
+                    | PyObj::Namespace { .. }
+                    | PyObj::Func(_)
+                    | PyObj::Exception { .. }
+                    | PyObj::Property { .. }
+                    | PyObj::Descriptor { .. }
+            )
+        ) {
+            return Err(format!(
+                "AttributeError: '{}' object has no attribute '{name}'",
+                self.type_name(recv)
+            ));
+        }
+        Err(self.builtin_setattr_error(recv, name))
     }
 
     /// Register a class built from a run class-body namespace.
@@ -17149,13 +17344,12 @@ fn call_method_inner(
         // `object.__new__(cls)` — allocate a bare instance of `cls` (the default
         // `__new__`, reached from a user `__new__` override).
         Some(PyObj::Builtin(bname)) if bname == "object" && name == "__new__" => {
-            let cls = args.first().cloned().unwrap_or(Value::Undef);
-            match with_host(|h| h.get(&cls).cloned()) {
-                Some(PyObj::Class(cname)) => {
-                    Ok(with_host(|h| h.new_instance(cname, NameMap::default())))
-                }
-                _ => Err(type_error("object.__new__(X): X is not a type object")),
-            }
+            let cname = match crate::builtins::tp_new_wrapper_check("object", &args)? {
+                crate::builtins::NewTarget::Class(c)
+                | crate::builtins::NewTarget::Builtin(c)
+                | crate::builtins::NewTarget::NamedTuple(c, _) => c,
+            };
+            Ok(with_host(|h| h.new_instance(cname, NameMap::default())))
         }
         // `object.__getattribute__/__setattr__/__delattr__(self, ...)` — the
         // default attribute protocol, reached when a user override cooperates via

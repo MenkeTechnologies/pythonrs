@@ -2425,6 +2425,15 @@ pub fn set_attr(host: &mut PyHost, id: u32, name: &str, value: &Value) -> Result
     })
 }
 
+/// `del foreign.name` — delete an attribute of a foreign (CPython) object.
+pub fn del_attr(host: &mut PyHost, id: u32, name: &str) -> Result<(), String> {
+    Python::with_gil(|py| {
+        let obj = fetch(py, id)?;
+        obj.delattr(name)
+            .map_err(|e| pyerr_to_error_h(host, py, &e))
+    })
+}
+
 /// `foreign(*args, **kwargs)` — call the foreign object.
 ///
 /// The host borrow is dropped for the duration of the CPython call so a pythonrs
@@ -2447,6 +2456,27 @@ pub fn call_method(
         let obj = fetch(py, id)?;
         let method = obj.getattr(name).map_err(|e| pyerr_to_error(py, &e))?;
         invoke_bound(py, &method, &args, &kwargs)
+    })
+}
+
+/// `T.__new__(*args, **kwargs)` for the builtin type `builtins.T`, looked up
+/// and called on the CPython side, so neither the type nor its `__new__` is
+/// marshalled back into the native type it would map to.
+pub fn call_builtin_type_new(
+    t: &str,
+    args: Vec<Value>,
+    kwargs: Vec<(String, Value)>,
+) -> Result<Value, String> {
+    if !init() {
+        return Err(bridge_unavailable("builtins"));
+    }
+    Python::with_gil(|py| {
+        let new = py
+            .import("builtins")
+            .and_then(|b| b.getattr(t))
+            .and_then(|ty| ty.getattr("__new__"))
+            .map_err(|e| pyerr_to_error(py, &e))?;
+        invoke_bound(py, &new, &args, &kwargs)
     })
 }
 

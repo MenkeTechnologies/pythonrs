@@ -577,7 +577,16 @@ pub(crate) fn raw_setattr(recv: &Value, name: &str, val: Value) -> Result<(), St
         host::AttrSet::Descriptor { desc, inst, val } => {
             host::call_method(&desc, "__set__", vec![inst, val], vec![]).map(|_| ())
         }
-        host::AttrSet::Plain => with_host(|h| h.set_attr(recv, name, val)),
+        host::AttrSet::Plain => {
+            // `BaseException.args`'s setter stores `tuple(value)`.
+            let val = if name == "args" && with_host(|h| h.is_exception_value(recv)) {
+                let items = host::iter_vec(&val)?;
+                with_host(|h| h.alloc(PyObj::Tuple(items)))
+            } else {
+                val
+            };
+            with_host(|h| h.set_attr(recv, name, val))
+        }
     }
 }
 
@@ -6068,19 +6077,29 @@ pub fn call_builtin_function(
             "int" | "str" | "float" | "tuple" | "frozenset" | "list" | "dict" | "set"
         )
     }) {
-        let cls = arg0(&args)?;
+        #[cfg(feature = "stdlib-ffi")]
+        if let Some(r) = foreign_tp_new(base, &args, &kwargs) {
+            return r;
+        }
+        let target = tp_new_wrapper_check(base, &args)?;
         let rest: Vec<Value> = args.iter().skip(1).cloned().collect();
-        let cname = with_host(|h| match h.get(&cls) {
-            Some(PyObj::Class(n)) => Some(n.clone()),
-            _ => None,
-        });
-        return match cname {
-            Some(c) => {
+        return match target {
+            NewTarget::Class(c) => {
                 let payload = call_builtin_function(base, rest, kwargs)?;
                 Ok(with_host(|h| h.new_instance_payload(c, payload)))
             }
             // `str.__new__(str, 'x')` on the base type itself → the plain value.
-            None => call_builtin_function(base, rest, kwargs),
+            NewTarget::Builtin(_) => call_builtin_function(base, rest, kwargs),
+            // `tuple.__new__(P, iterable)` skips `P.__new__`'s field binding.
+            NewTarget::NamedTuple(type_name, fields) => {
+                let tup = call_builtin_function(base, rest, kwargs)?;
+                with_host(|h| {
+                    if let Value::Obj(idx) = tup {
+                        h.nt_meta.insert(idx, host::NtMeta { type_name, fields });
+                    }
+                });
+                Ok(tup)
+            }
         };
     }
     // `mappingproxy(mapping)` — `types.MappingProxyType(d)` (which is
@@ -6101,17 +6120,16 @@ pub fn call_builtin_function(
     // `object.__new__(cls, *args)` — build a bare instance of the class argument
     // (the args beyond `cls` are consumed by `__init__`, per CPython).
     if name == "object.__new__" {
-        let cls = arg0(&args)?;
-        let cname = with_host(|h| match h.get(&cls) {
-            Some(PyObj::Class(n)) => Some(n.clone()),
-            _ => None,
+        #[cfg(feature = "stdlib-ffi")]
+        if let Some(r) = foreign_tp_new("object", &args, &kwargs) {
+            return r;
+        }
+        return Ok(match tp_new_wrapper_check("object", &args)? {
+            NewTarget::Class(c) => with_host(|h| h.new_instance(c, host::NameMap::default())),
+            NewTarget::Builtin(_) | NewTarget::NamedTuple(..) => {
+                with_host(|h| h.new_instance("object".into(), host::NameMap::default()))
+            }
         });
-        return match cname {
-            Some(c) => Ok(with_host(|h| h.new_instance(c, host::NameMap::default()))),
-            None => Err(host::type_error(
-                "object.__new__(X): X is not a type object",
-            )),
-        };
     }
     // `dict.fromkeys(iterable[, value])` reached via a dict type object.
     match name {
@@ -7045,8 +7063,9 @@ pub fn call_builtin_function(
             host::import_module(&target)
         }
         "hasattr" => {
+            check_arity("hasattr", "hasattr", Arity::VarExact(2), args.len())?;
             let v = arg0(&args)?;
-            let n = with_host(|h| h.str_of(&args.get(1).cloned().unwrap_or(Value::Undef)));
+            let n = attr_name_arg(&args[1])?;
             // Only AttributeError becomes `False`; any other exception propagates.
             match get_attr_desc(&v, &n) {
                 Ok(_) => Ok(Value::Bool(true)),
@@ -7055,8 +7074,9 @@ pub fn call_builtin_function(
             }
         }
         "getattr" => {
+            check_arity("getattr", "getattr", Arity::VarRange(2, 3), args.len())?;
             let v = arg0(&args)?;
-            let n = with_host(|h| h.str_of(&args.get(1).cloned().unwrap_or(Value::Undef)));
+            let n = attr_name_arg(&args[1])?;
             match get_attr_desc(&v, &n) {
                 Ok(x) => Ok(x),
                 // The default substitutes only for AttributeError; a getter
@@ -7068,15 +7088,17 @@ pub fn call_builtin_function(
             }
         }
         "setattr" => {
+            check_arity("setattr", "setattr", Arity::VarExact(3), args.len())?;
             let v = arg0(&args)?;
-            let n = with_host(|h| h.str_of(&args.get(1).cloned().unwrap_or(Value::Undef)));
+            let n = attr_name_arg(&args[1])?;
             let val = args.get(2).cloned().unwrap_or(Value::Undef);
             set_attr_desc(&v, &n, val)?;
             Ok(Value::Undef)
         }
         "delattr" => {
+            check_arity("delattr", "delattr", Arity::VarExact(2), args.len())?;
             let v = arg0(&args)?;
-            let n = with_host(|h| h.str_of(&args.get(1).cloned().unwrap_or(Value::Undef)));
+            let n = attr_name_arg(&args[1])?;
             del_attr_desc(&v, &n)?;
             Ok(Value::Undef)
         }
@@ -8524,6 +8546,163 @@ fn dict_str_pairs(d: &Value) -> Result<Vec<(String, Value)>, String> {
                 .collect()),
             _ => Err(host::type_error("globals must be a real dictionary")),
         }
+    })
+}
+
+/// The type `T.__new__(cls, ...)` was asked to build, once `tp_new_wrapper`'s
+/// checks pass: a user class, or the builtin type `T` itself.
+pub(crate) enum NewTarget {
+    Class(String),
+    Builtin(String),
+    /// A `collections.namedtuple` class: its name and fields.
+    NamedTuple(String, Vec<String>),
+}
+
+/// `T.__new__(cls, ...)` with a CPython class as `cls` is CPython's own
+/// `T.__new__`, which runs `tp_new_wrapper`'s checks on its side. `None` when
+/// `cls` is not a CPython object.
+#[cfg(feature = "stdlib-ffi")]
+fn foreign_tp_new(
+    t: &str,
+    args: &[Value],
+    kwargs: &[(String, Value)],
+) -> Option<Result<Value, String>> {
+    with_host(|h| h.foreign_id(args.first()?))?;
+    Some(crate::ffi::call_builtin_type_new(
+        t,
+        args.to_vec(),
+        kwargs.to_vec(),
+    ))
+}
+
+/// The `tp_new` a class ends up with when no class on its `tp_base` chain
+/// defines `__new__`: its native root's. Exception classes share
+/// `BaseException_new`, metaclasses `type_new`, a data-type subclass its data
+/// type's, everything else `object_new`.
+fn native_new_root(h: &host::PyHost, class: &str) -> String {
+    if !h.classes.contains_key(class) {
+        return if is_exception_class(class) {
+            "BaseException".into()
+        } else if is_type_object_name(class) {
+            class.to_string()
+        } else {
+            // A bridged CPython class: assume `object_new`.
+            "object".into()
+        };
+    }
+    if h.class_is_exception(class) {
+        return "BaseException".into();
+    }
+    if let Some(b) = h.builtin_base_of(class) {
+        return b.to_string();
+    }
+    if host::class_inherits_type(h, class) {
+        return "type".into();
+    }
+    "object".into()
+}
+
+/// A user class's `tp_base`: the base carrying the same native layout (the
+/// solid base `best_base` picks), else the first base; `object` when none.
+fn tp_base_of(h: &host::PyHost, class: &str) -> String {
+    let bases = h
+        .classes
+        .get(class)
+        .map(|cd| cd.bases.clone())
+        .unwrap_or_default();
+    let root = native_new_root(h, class);
+    bases
+        .iter()
+        .find(|b| native_new_root(h, b) == root)
+        .or_else(|| bases.first())
+        .cloned()
+        .unwrap_or_else(|| "object".into())
+}
+
+/// Whether `class`'s `tp_new` is `slot_tp_new`: it, or a class above it on
+/// the `tp_base` chain, defines `__new__` in Python.
+fn has_slot_new(h: &host::PyHost, class: &str) -> bool {
+    let mut c = class.to_string();
+    while let Some(cd) = h.classes.get(&c) {
+        if cd.ns.contains_key("__new__") {
+            return true;
+        }
+        let base = tp_base_of(h, &c);
+        if base == c {
+            break;
+        }
+        c = base;
+    }
+    false
+}
+
+/// `tp_new_wrapper`'s argument checks for `T.__new__(cls, ...)`
+/// (`typeobject.c`): `cls` must be present, a type, a subtype of `T`, and the
+/// nearest class on its `tp_base` chain without a Python `__new__` (its
+/// "static base") must allocate with `T`'s own `tp_new` — otherwise
+/// `object.__new__(dict)` would build a dict without a dict's storage.
+pub(crate) fn tp_new_wrapper_check(t: &str, args: &[Value]) -> Result<NewTarget, String> {
+    let Some(cls) = args.first() else {
+        return Err(host::type_error(&format!(
+            "{t}.__new__(): not enough arguments"
+        )));
+    };
+    with_host(|h| {
+        let target = match h.get(cls) {
+            Some(PyObj::Class(n)) => NewTarget::Class(n.clone()),
+            Some(PyObj::Builtin(n)) if is_type_object_name(n) => NewTarget::Builtin(n.clone()),
+            Some(PyObj::NamedTupleType { type_name, fields }) => {
+                NewTarget::NamedTuple(type_name.clone(), fields.clone())
+            }
+            _ => {
+                return Err(host::type_error(&format!(
+                    "{t}.__new__(X): X is not a type object ({})",
+                    h.tp_name(cls)
+                )))
+            }
+        };
+        let name = match &target {
+            NewTarget::Class(n) | NewTarget::Builtin(n) | NewTarget::NamedTuple(n, _) => n.clone(),
+        };
+        // A namedtuple class derives from `tuple` and defines `__new__` in
+        // Python, so its static base is `tuple`.
+        let namedtuple = matches!(target, NewTarget::NamedTuple(..));
+        let is_subtype = t == "object"
+            || (namedtuple && t == "tuple")
+            || name == t
+            || (name == "bool" && t == "int")
+            || (h.classes.contains_key(&name) && h.mro_of(&name).iter().any(|c| c == t));
+        if !is_subtype {
+            return Err(host::type_error(&format!(
+                "{t}.__new__({name}): {name} is not a subtype of {t}"
+            )));
+        }
+        let mut staticbase = if namedtuple {
+            "tuple".to_string()
+        } else {
+            name.clone()
+        };
+        while has_slot_new(h, &staticbase) {
+            staticbase = tp_base_of(h, &staticbase);
+        }
+        if native_new_root(h, &staticbase) != native_new_root(h, t) {
+            return Err(host::type_error(&format!(
+                "{t}.__new__({name}) is not safe, use {staticbase}.__new__()"
+            )));
+        }
+        Ok(target)
+    })
+}
+
+/// The `name` argument of `getattr`/`setattr`/`delattr`/`hasattr`: a `str` (or
+/// subclass), else `PyObject_GetAttr`'s `attribute name must be string, not 'T'`.
+fn attr_name_arg(name: &Value) -> Result<String, String> {
+    with_host(|h| match h.as_str(name) {
+        Some(s) => Ok(s),
+        None => Err(host::type_error(&format!(
+            "attribute name must be string, not '{}'",
+            h.tp_name(name)
+        ))),
     })
 }
 
