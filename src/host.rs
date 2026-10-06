@@ -19093,6 +19093,44 @@ impl PyHost {
         }
     }
 
+    /// The `__notes__` lines `TracebackException.format_exception_only` prints
+    /// under an exception's final line: each note of a sequence split on
+    /// newlines, or the `repr` of a `__notes__` that is not a sequence. Empty
+    /// when there are none.
+    fn exc_notes_text(&self, exc: Option<&Value>) -> String {
+        let Some(exc) = exc else {
+            return String::new();
+        };
+        let notes = match self.get(exc) {
+            Some(PyObj::Instance(i)) => self.inst_attr(&i.dict, "__notes__"),
+            Some(PyObj::Exception { .. }) => match exc {
+                Value::Obj(id) => self
+                    .func_attrs
+                    .get(id)
+                    .and_then(|m| m.get("__notes__"))
+                    .cloned(),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(notes) = notes.filter(|v| !matches!(v, Value::Undef)) else {
+            return String::new();
+        };
+        let items: Vec<String> = match self.get(&notes) {
+            Some(PyObj::List(l)) => l.iter().map(|v| self.str_of(v)).collect(),
+            Some(PyObj::Tuple(t)) => t.iter().map(|v| self.str_of(v)).collect(),
+            _ => match self.as_str(&notes) {
+                Some(s) => s.chars().map(String::from).collect(),
+                None => return format!("{}\n", self.repr_of(&notes)),
+            },
+        };
+        items
+            .iter()
+            .flat_map(|n| n.split('\n'))
+            .map(|l| format!("{l}\n"))
+            .collect()
+    }
+
     /// One exception's own block: its `Traceback …` header and frames (when it
     /// has any) then its terse line — or, for a PEP 654 exception group, the
     /// `+-+---- n ----` tree of its members. A port of `traceback.py`'s
@@ -19139,9 +19177,11 @@ impl PyHost {
             if let Some((block, last)) = exc.and_then(|e| self.syntax_error_block(e)) {
                 ctx.emit(out, &block, '|');
                 ctx.emit(out, &format!("{last}\n"), '|');
+                ctx.emit(out, &self.exc_notes_text(exc), '|');
                 return;
             }
             ctx.emit(out, &format!("{final_line}\n"), '|');
+            ctx.emit(out, &self.exc_notes_text(exc), '|');
             return;
         };
         if ctx.depth > MAX_GROUP_DEPTH {
@@ -19165,6 +19205,7 @@ impl PyHost {
             ctx.emit(out, &self.render_frames(frames), '|');
         }
         ctx.emit(out, &format!("{final_line}\n"), '|');
+        ctx.emit(out, &self.exc_notes_text(exc), '|');
         // Only the first `MAX_GROUP_WIDTH` members are shown; the slot after them
         // reports how many were elided.
         let total = members.len();

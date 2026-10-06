@@ -1682,3 +1682,9 @@ try:
     raise Shown(1, 2)
 except Shown:
     raise Broken(3)
+#==#
+# ── a `raise` that does not fill its line is underlined ──────────────────────
+def check(x):
+    if x < 0: raise ValueError('negative: %d' % x)
+    return x
+check(-1)

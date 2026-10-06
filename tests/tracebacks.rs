@@ -54,3 +54,22 @@ fn a_frame_names_its_own_modules_file() {
          File \"DIR/bad.py\", line 2, in h\n    return [][0]\n           ~~^^^\nIndexError: list index out of range\n"
     );
 }
+
+/// An exception's `__notes__` print under its final line, one line per line of
+/// each note (`add_note` is 3.11+, so this is not in the 3.9-spanning parity
+/// corpus); a re-raise keeps the entries the exception already had, and a
+/// `raise` that does not fill its line is underlined.
+#[test]
+fn notes_print_under_the_final_line_of_a_reraised_exception() {
+    let main =
+        "def f():\n    e = KeyError('k'); e.add_note('first\\nsecond'); raise e\ntry:\n    f()\n\
+                except KeyError as e:\n    e.add_note('more')\n    raise\n";
+    let (out, err) = run_files(&[("main.py", main)], "main.py");
+    assert_eq!(out, "");
+    assert_eq!(
+        err,
+        "Traceback (most recent call last):\n  File \"DIR/main.py\", line 4, in <module>\n    f()\n    ~^^\n  \
+         File \"DIR/main.py\", line 2, in f\n    e = KeyError('k'); e.add_note('first\\nsecond'); raise e\n    \
+         \x20                                               ^^^^^^^\nKeyError: 'k'\nfirst\nsecond\nmore\n"
+    );
+}

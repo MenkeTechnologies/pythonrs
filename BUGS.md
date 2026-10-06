@@ -46,6 +46,9 @@ written.
   the traceback is printed, for the final exception and each one in its
   `__cause__`/`__context__` chain; one that raises or answers a non-`str` is
   `<exception str() failed>`.
+- **A `raise` statement is underlined in a traceback** when it does not fill
+  its line (`x = 1; raise ValueError('x')`, `def f(): raise E`), and an
+  exception's `__notes__` (`add_note`) are printed under its final line.
 - **Calling a builtin type's method with no receiver** says `unbound method
   list.append() needs an argument` for a method descriptor and `descriptor
   '__len__' of 'list' object needs an argument` for a slot wrapper; the two
@@ -2451,10 +2454,11 @@ written.
   never runs. Closing it at the loop is not a fix: whether the loop held the
   LAST reference is not visible there (`it = gen(); for v in it: break;
   next(it)` must keep it open).
-- **A `raise` statement's traceback entry has no caret line.** CPython
-  underlines the whole `raise …` statement when it does not fill its line
-  (`x = 1; raise ValueError('x')`, `if c: raise E`); the parser records no
-  extent for a `raise`, so pythonrs prints the source line alone.
+- **A traceback entry for a statement or expression spread over several
+  lines shows only its first line.** CPython 3.13+ prints every line of the
+  failing node with its carets (`int(\n    'x')` shows `int(` with `~~~^` and
+  `'x')` with `^^^^`); a caret span here records one line, so the first line is
+  printed with its carets and the continuation lines are dropped.
 - **`traceback.format_tb(e.__traceback__)` fails across the bridge.** The
   native `traceback` object cannot be passed to CPython's `traceback` module
   (`TypeError: cannot pass 'traceback' to a CPython stdlib call`).

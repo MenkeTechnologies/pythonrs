@@ -396,6 +396,29 @@ impl Compiler {
         }
     }
 
+    /// Give op `idx` a statement's one-line extent as its caret span (CPython
+    /// underlines a whole `raise` statement). `span` is the parser's 1-based
+    /// `(lineno, offset, end_lineno, end_offset)`; one spread over several
+    /// lines carets nothing.
+    fn record_stmt_span(&mut self, idx: usize, span: Option<(u32, u32, u32, u32)>) {
+        let Some((line, offset, end_line, end_offset)) = span else {
+            return;
+        };
+        if line != end_line {
+            return;
+        }
+        let sp = Span {
+            line,
+            end_line: line,
+            start: offset - 1,
+            end: end_offset - 1,
+            ..Span::NONE
+        };
+        let prev = std::mem::replace(&mut self.node_span, sp);
+        self.record_span(idx);
+        self.node_span = prev;
+    }
+
     // ── emit helpers ─────────────────────────────────────────────────────
     fn name_const(&self, b: &mut ChunkBuilder, s: &str) {
         let k = b.add_constant(Value::str(s));
@@ -614,11 +637,13 @@ impl Compiler {
                         // exc first, then cause, and wires `__cause__`.
                         self.compile_expr(b, c)?;
                         self.compile_expr(b, e)?;
-                        b.emit(Op::CallBuiltin(ops::RAISE, 2), line);
+                        let op = b.emit(Op::CallBuiltin(ops::RAISE, 2), line);
+                        self.record_stmt_span(op, s.span);
                     }
                     None => {
                         self.compile_expr(b, e)?;
-                        b.emit(Op::CallBuiltin(ops::RAISE, 1), line);
+                        let op = b.emit(Op::CallBuiltin(ops::RAISE, 1), line);
+                        self.record_stmt_span(op, s.span);
                     }
                 },
                 None => {

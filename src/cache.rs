@@ -159,7 +159,8 @@ use std::path::PathBuf;
 /// annotation, an annotated method or a `type` alias compiles differently.
 /// v53: a function's `__annotate__` is marked (`FuncDef::is_annotate`, a new
 /// field) so its code object names the parameter `format`.
-const SCHEMA: u64 = 53;
+/// v54: a `raise` statement's op carries the statement's extent as its caret span.
+const SCHEMA: u64 = 54;
 
 /// The shard's INDEX: everything a lookup needs, and nothing it does not.
 ///

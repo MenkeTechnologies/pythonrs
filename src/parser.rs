@@ -3024,6 +3024,7 @@ impl Parser {
     }
 
     fn parse_raise(&mut self, out: &mut Vec<Stmt>, line: u32) -> Result<(), String> {
+        let start = self.pos;
         self.advance();
         let (exc, cause) = if self.at_newline() || self.at_op(";") || matches!(self.cur(), Tok::Eof)
         {
@@ -3039,7 +3040,9 @@ impl Parser {
             };
             (Some(e), c)
         };
-        out.push(Stmt::new(StmtKind::Raise { exc, cause }, line));
+        // The extent is the traceback caret of a `raise` that does not fill
+        // its line (`x = 1; raise E`).
+        out.push(self.spanned_stmt(StmtKind::Raise { exc, cause }, line, start));
         Ok(())
     }
 
