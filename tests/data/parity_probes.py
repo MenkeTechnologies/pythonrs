@@ -1937,3 +1937,18 @@ k = f"""{x}
 """
 print(len(k), 'end')
 print('end', file=sys.stderr)
+#==#
+# ── `~` on a bool is a DeprecationWarning (3.12+), at the line doing it ──────
+import sys
+import warnings
+x = True
+print(~x, ~False, (True).__invert__(), ~5)
+def f(b):
+    return ~b
+for i in range(2):
+    print(f(i == 0))
+with warnings.catch_warnings(record=True) as w:
+    warnings.simplefilter('always')
+    ~x
+print([(r.category.__name__, r.lineno) for r in w], file=sys.stderr)
+print('end', file=sys.stderr)

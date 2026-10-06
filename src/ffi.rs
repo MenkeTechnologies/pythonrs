@@ -2557,42 +2557,74 @@ fn warn_from_pythonrs(
                 }
             }
         };
-        let registry_id = {
-            let mut map = WARN_REGISTRIES
-                .get_or_init(|| Mutex::new(Default::default()))
-                .lock()
-                .map_err(|e| e.to_string())?;
-            match map.get(&module) {
-                Some(&id) => id,
-                None => {
-                    let id = store(pyo3::types::PyDict::new(py).into_any().unbind());
-                    map.insert(module.clone(), id);
-                    id
-                }
-            }
-        };
-        let registry = fetch(py, registry_id)?;
         let source = match &source {
             Some(v) => to_py(v)?,
             None => py.None().into_bound(py),
         };
-        warnings
-            .getattr("warn_explicit")
-            .and_then(|f| {
-                f.call1((
-                    message,
-                    category,
-                    filename,
-                    lineno,
-                    module,
-                    registry,
-                    py.None(),
-                    source,
-                ))
-            })
-            .map_err(|e| pyerr_to_error(py, &e))?;
+        warn_explicit_at(py, message, category, (filename, lineno, module), source)?;
         Ok(Value::Undef)
     })())
+}
+
+/// `warnings.warn_explicit` for a warning located at `(filename, lineno,
+/// module)`, with that module's registry.
+fn warn_explicit_at<'py>(
+    py: Python<'py>,
+    message: Bound<'py, PyAny>,
+    category: Bound<'py, PyAny>,
+    (filename, lineno, module): (String, u32, String),
+    source: Bound<'py, PyAny>,
+) -> Result<(), String> {
+    let registry_id = {
+        let mut map = WARN_REGISTRIES
+            .get_or_init(|| Mutex::new(Default::default()))
+            .lock()
+            .map_err(|e| e.to_string())?;
+        match map.get(&module) {
+            Some(&id) => id,
+            None => {
+                let id = store(pyo3::types::PyDict::new(py).into_any().unbind());
+                map.insert(module.clone(), id);
+                id
+            }
+        }
+    };
+    let registry = fetch(py, registry_id)?;
+    py.import("warnings")
+        .and_then(|w| w.getattr("warn_explicit"))
+        .and_then(|f| {
+            f.call1((
+                message,
+                category,
+                filename,
+                lineno,
+                module,
+                registry,
+                py.None(),
+                source,
+            ))
+        })
+        .map_err(|e| pyerr_to_error(py, &e))?;
+    Ok(())
+}
+
+/// A warning the runtime itself raises (`PyErr_WarnEx(category, msg, 1)`),
+/// attributed to the pythonrs line now executing. `category` names a builtin
+/// warning class.
+pub fn warn_native(category: &str, msg: &str) -> Result<(), String> {
+    if !init() {
+        return Ok(());
+    }
+    Python::with_gil(|py| {
+        let context = with_host(|h| h.warning_context(1));
+        let location = context.unwrap_or_else(|| ("<sys>".into(), 0, "sys".into()));
+        let category = py
+            .import("builtins")
+            .and_then(|b| b.getattr(category))
+            .map_err(|e| pyerr_to_error(py, &e))?;
+        let message = pyo3::types::PyString::new(py, msg).into_any();
+        warn_explicit_at(py, message, category, location, py.None().into_bound(py))
+    })
 }
 
 /// Marshal args (host borrow held only here, no user code runs), make the CPython

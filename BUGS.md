@@ -9,6 +9,10 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **`~` on a bool raises 3.12's `DeprecationWarning`** (`Bitwise inversion
+  '~' on bool is deprecated…`), attributed to the line doing it, for the
+  operator and for `True.__invert__()`; runtime warnings go through the same
+  `warn_explicit` path as `warnings.warn` (`ffi::warn_native`).
 - **`warnings.warn` from pythonrs code names the pythonrs caller.** The call
   is answered as `_warnings.warn` answers it — `get_category`, then
   `setup_context` walking `stacklevel` frames out over the pythonrs frame

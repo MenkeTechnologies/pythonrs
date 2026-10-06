@@ -3731,8 +3731,28 @@ fn b_unary(vm: &mut VM, _: u8) -> Value {
             return finish(vm, crate::ffi::unary_op_cb(func, &v));
         }
     }
+    if tag == host::unop::INVERT && matches!(v, Value::Bool(_)) {
+        note_call_line(vm);
+        if let Err(e) = bool_invert_warning() {
+            return abort(vm, e);
+        }
+    }
     let r = with_host(|h| h.unary(tag, &v));
     finish(vm, r)
+}
+
+/// `bool_invert`'s `DeprecationWarning` (3.14): `~` on a bool.
+fn bool_invert_warning() -> Result<(), String> {
+    #[cfg(feature = "stdlib-ffi")]
+    return crate::ffi::warn_native(
+        "DeprecationWarning",
+        "Bitwise inversion '~' on bool is deprecated and will be removed in Python 3.16. \
+         This returns the bitwise inversion of the underlying int object and is usually \
+         not what you expect from negating a bool. Use the 'not' operator for boolean \
+         negation or ~int(x) if you really want the bitwise inversion of the underlying int.",
+    );
+    #[cfg(not(feature = "stdlib-ffi"))]
+    Ok(())
 }
 
 // ── import ───────────────────────────────────────────────────────────────────
@@ -20032,6 +20052,9 @@ fn num_dunder(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
         "__pos__" => Ok(to_int_value(recv)),
         // `~x == -(x + 1)`; integers only (float has no `__invert__`).
         "__invert__" => {
+            if matches!(recv, Value::Bool(_)) {
+                bool_invert_warning()?;
+            }
             let x = with_host(|h| h.big_val(recv)).unwrap_or_default();
             Ok(with_host(|h| {
                 h.norm_big(-(x + num_bigint::BigInt::from(1)))
