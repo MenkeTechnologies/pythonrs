@@ -10499,3 +10499,41 @@ fn a_non_iterable_dict_pair_element_is_refused_with_the_3_14_wording() {
         "TypeError: object is not iterable"
     );
 }
+
+/// 3.14's mixed-mode complex arithmetic (C11 Annex G): a real operand is not
+/// promoted to `complex` before `+ - * /`, so no `±0.0 * x` term flips the sign
+/// of a zero; an infinity that computes as nan+nanj is recovered; and `**`
+/// reports `complex_pow`'s `EDOM`/`ERANGE`. 3.13 and earlier promote, which is
+/// why this is pinned here rather than in the version-spanning corpus;
+/// expectations measured against CPython 3.14.8.
+#[test]
+fn complex_arithmetic_does_not_promote_a_real_operand() {
+    assert_eq!(
+        g(
+            "x = [complex(0.0, 0.0) * -1, -0.0 - 0j, 0.0 + (-0.0j), (-0.0) * (1 + 0j), \
+             3 - (1 - 0j), 2 / (1 + 1j), (1 + 2j) ** -3, \
+             1 / complex(float('inf'), float('nan')), \
+             complex(float('inf'), float('nan')) * (1 + 1j)]",
+            "x"
+        ),
+        "[(-0-0j), (-0-0j), -0j, (-0-0j), (2+0j), (1-1j), (-0.08800000000000001+0.016j), \
+         -0j, (inf+infj)]"
+    );
+    for (src, err) in [
+        (
+            "0j ** -1",
+            "ZeroDivisionError: zero to a negative or complex power",
+        ),
+        (
+            "complex('inf') ** 2",
+            "OverflowError: complex exponentiation",
+        ),
+        (
+            "(1e200 + 1j) ** 2.5",
+            "OverflowError: complex exponentiation",
+        ),
+        ("(1 + 2j) / 0.0", "ZeroDivisionError: division by zero"),
+    ] {
+        assert_eq!(pythonrs::eval_str(src).unwrap_err(), err, "for {src}");
+    }
+}

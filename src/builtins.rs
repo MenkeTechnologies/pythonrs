@@ -401,8 +401,104 @@ pub(crate) fn raw_getattr(recv: &Value, name: &str) -> Result<Value, String> {
         }
         host::AttrGet::Annotations { func } => host::function_annotations(&func),
         host::AttrGet::TypeAliasValue { alias } => host::type_alias_value(&alias),
-        host::AttrGet::Plain => with_host(|h| h.get_attr(recv, name)),
+        host::AttrGet::Plain => {
+            if name == "__self__" {
+                if let Some(r) = builtin_function_self(recv) {
+                    return r;
+                }
+            }
+            with_host(|h| h.get_attr(recv, name))
+        }
     }
+}
+
+/// The exception object for error line `e`. `h.exc` is authoritative only when
+/// it matches the line just produced (an explicit `raise`, or a builtin that
+/// installed its own exception, e.g. `KeyError`). Otherwise `h.exc` is a stale
+/// still-being-handled exception: a native error like `[..][5]` never updates
+/// it. Then a fresh exception is synthesized from the line, the stale one wired
+/// as its `__context__`, and the new one installed.
+fn materialize_error(h: &mut host::PyHost, e: &str) -> Value {
+    let consistent = h
+        .exc
+        .clone()
+        .and_then(|x| h.exc_line_of(&x))
+        .is_some_and(|line| line == e);
+    if consistent {
+        return h.exc.clone().unwrap();
+    }
+    let context = h.exc.clone().unwrap_or(Value::Undef);
+    let new = synth_exc(h, e);
+    let ctx = match &context {
+        Value::Obj(_) if new != context => context,
+        _ => Value::Undef,
+    };
+    h.set_exc_link(&new, Value::Undef, ctx);
+    h.exc = Some(new.clone());
+    new
+}
+
+/// `builtin_function_or_method.__self__` (`meth_get__self__`, the C function's
+/// `m_self`) for a native function: the type an alternate constructor is a
+/// classmethod of, `None` for a staticmethod, and otherwise the module the
+/// function belongs to — `builtins` for an unqualified one. Resolved outside the
+/// host borrow because the module may have to be imported. `None` when `recv`
+/// is not a native function.
+fn builtin_function_self(recv: &Value) -> Option<Result<Value, String>> {
+    let n = with_host(|h| match h.get(recv) {
+        Some(PyObj::Builtin(n)) if h.type_name(recv) == "builtin_function_or_method" => {
+            Some(n.clone())
+        }
+        _ => None,
+    })?;
+    let owner = match n.rsplit_once('.') {
+        None => return Some(host::import_module("builtins")),
+        Some((owner, _)) => owner.to_string(),
+    };
+    Some(match n.as_str() {
+        "str.maketrans" | "bytes.maketrans" | "bytearray.maketrans" => Ok(Value::Undef),
+        "itertools.chain.from_iterable"
+        | "dict.fromkeys"
+        | "OrderedDict.fromkeys"
+        | "defaultdict.fromkeys"
+        | "Counter.fromkeys"
+        | "int.from_bytes"
+        | "float.fromhex"
+        | "bytes.fromhex"
+        | "bytearray.fromhex" => Ok(with_host(|h| h.alloc(PyObj::Builtin(owner)))),
+        _ => return module_function_self(&owner, n.rsplit('.').next().unwrap_or(&n)),
+    })
+}
+
+/// `__self__` of the native stand-in for `module.leaf`. Which module a C
+/// function's `m_self` is (`os.getcwd` lives in `posix`), and whether CPython's
+/// `module.leaf` is a function at all rather than a class (`itertools.count`) or
+/// a Python-level function (`re.compile`), is CPython's own fact, so it is asked
+/// of the embedded interpreter; the module it names is then imported here, so
+/// `math.sqrt.__self__ is math` holds. `None` (the plain `AttributeError`) when
+/// CPython's object has no `__self__`.
+#[cfg(feature = "stdlib-ffi")]
+fn module_function_self(owner: &str, leaf: &str) -> Option<Result<Value, String>> {
+    let id = crate::ffi::import(owner).ok()?;
+    let f = with_host(|h| crate::ffi::get_attr(h, id, leaf)).ok()?;
+    let m = with_host(|h| h.get_attr(&f, "__self__")).ok()?;
+    let is_module = with_host(|h| h.type_name(&m) == "module");
+    if !is_module {
+        return Some(Ok(m));
+    }
+    let name = with_host(|h| {
+        h.get_attr(&m, "__name__")
+            .ok()
+            .and_then(|v| h.as_str(&v).map(|s| s.to_string()))
+    })?;
+    Some(host::import_module(&name))
+}
+
+/// Without the embedded interpreter there is no CPython object to ask, so the
+/// function's own module is the answer.
+#[cfg(not(feature = "stdlib-ffi"))]
+fn module_function_self(owner: &str, _leaf: &str) -> Option<Result<Value, String>> {
+    Some(host::import_module(owner))
 }
 
 fn b_setattr(vm: &mut VM, _: u8) -> Value {
@@ -2457,6 +2553,7 @@ fn b_raise(vm: &mut VM, argc: u8) -> Value {
                         _ => Value::Undef,
                     };
                     h.set_exc_link(&new_exc, cause.clone(), ctx);
+                    h.continue_traceback(&new_exc, false);
                     // Any explicit `from` clause (including `from None`) sets
                     // `__suppress_context__`, hiding the implicit context.
                     if argc >= 2 {
@@ -2481,7 +2578,10 @@ fn b_reraise(vm: &mut VM, _: u8) -> Value {
     // non-builtin value as a `StopIteration` re-raised a caught `MyErr` as
     // `StopIteration` from any handler that had called out first.
     let msg = with_host(|h| match h.exc.clone() {
-        Some(v) => Some(h.exc_line_of(&v).unwrap_or_else(|| "StopIteration".into())),
+        Some(v) => {
+            h.continue_traceback(&v, true);
+            Some(h.exc_line_of(&v).unwrap_or_else(|| "StopIteration".into()))
+        }
         None => h.error.clone(),
     });
     match msg {
@@ -3837,26 +3937,7 @@ fn b_try(vm: &mut VM, _: u8) -> Value {
             // native error like `[..][5]` never updates it, so matching against
             // that stale class would pick the wrong handler. Synthesize a fresh
             // exception from the string and wire the stale one as `__context__`.
-            let exc = with_host(|h| {
-                let consistent = h
-                    .exc
-                    .clone()
-                    .and_then(|x| h.exc_line_of(&x))
-                    .map(|line| line == e)
-                    .unwrap_or(false);
-                if consistent {
-                    return h.exc.clone().unwrap();
-                }
-                let context = h.exc.clone().unwrap_or(Value::Undef);
-                let new = synth_exc(h, &e);
-                let ctx = match &context {
-                    Value::Obj(_) if new != context => context,
-                    _ => Value::Undef,
-                };
-                h.set_exc_link(&new, Value::Undef, ctx);
-                h.exc = Some(new.clone());
-                new
-            });
+            let exc = with_host(|h| materialize_error(h, &e));
             if td.handlers.iter().any(|h| h.star) {
                 pending = run_star_handlers(&td, &exc, &entry_exc);
                 handled_star = true;
@@ -3893,7 +3974,7 @@ fn b_try(vm: &mut VM, _: u8) -> Value {
                         h.error = None;
                         h.exc = Some(exc.clone());
                         h.capture_exc_tb(&exc);
-                        h.traceback.clear();
+                        h.reset_traceback();
                     });
                     let hres = host::run_chunk_on(hbody.clone());
                     match hres {
@@ -3906,7 +3987,15 @@ fn b_try(vm: &mut VM, _: u8) -> Value {
                         // its implicit `__context__` and printed a spurious
                         // "During handling of the above exception" block.
                         Ok(_) => with_host(|h| h.exc = entry_exc.clone()),
-                        Err(e2) => pending = Some(e2),
+                        // A native error inside the handler (`[][0]`) installed
+                        // no exception object; give it one now, while the
+                        // handled exception is still current, so it carries
+                        // that one as its `__context__` the way a `raise` in
+                        // the handler does.
+                        Err(e2) => {
+                            with_host(|h| materialize_error(h, &e2));
+                            pending = Some(e2);
+                        }
                     }
                     if let Some(name) = bind {
                         with_host(|h| {
@@ -3926,10 +4015,19 @@ fn b_try(vm: &mut VM, _: u8) -> Value {
     // finally always runs; a finally error/return supersedes.
     if let Some(fin) = &td.finalbody {
         let sig_before = with_host(|h| h.signal.take());
+        // An exception passing through the `finally` is re-raised from where
+        // it was raised (`RERAISE` restores the frame's position), not from
+        // the last line the `finally` body ran.
+        let raised_at = pending
+            .as_ref()
+            .and_then(|_| with_host(|h| h.cur_line_span()));
         match host::run_chunk_on(fin.clone()) {
             Ok(_) => {
                 if with_host(|h| h.signal.is_none()) {
                     with_host(|h| h.signal = sig_before);
+                }
+                if let Some((line, span)) = raised_at {
+                    with_host(|h| h.set_cur_line_span(line, span));
                 }
             }
             Err(e) => {
@@ -3965,7 +4063,7 @@ fn run_star_handlers(td: &host::TryDef, exc: &Value, entry_exc: &Option<Value>) 
     // frames from being appended to the group's.
     with_host(|h| {
         h.capture_exc_tb(exc);
-        h.traceback.clear();
+        h.reset_traceback();
     });
     // What is still unmatched. `None` once every clause has claimed its part.
     let mut rest = Some(exc.clone());
@@ -3989,7 +4087,7 @@ fn run_star_handlers(td: &host::TryDef, exc: &Value, entry_exc: &Option<Value>) 
         with_host(|h| {
             h.error = None;
             h.exc = Some(matched.clone());
-            h.traceback.clear();
+            h.reset_traceback();
         });
         match host::run_chunk_on(hd.body.clone()) {
             // Nothing escaped: this part of the group is handled.
@@ -4023,7 +4121,7 @@ fn run_star_handlers(td: &host::TryDef, exc: &Value, entry_exc: &Option<Value>) 
             // terse line for the abort.
             let line = host::raise_value(&result);
             with_host(|h| {
-                h.traceback.clear();
+                h.reset_traceback();
                 if excgroup::is_piece_of(h, &result, exc) {
                     // A piece of the caught group keeps the group's traceback, so
                     // the innermost frame must point back at the original `raise`
@@ -6074,9 +6172,7 @@ pub fn call_builtin_function(
             && !type_classmethods(tp).contains(&meth)
         {
             let Some(recv) = args.first().cloned() else {
-                return Err(host::type_error(&format!(
-                    "descriptor '{meth}' of '{tp}' object needs an argument"
-                )));
+                return Err(host::unbound_call_without_receiver(tp, meth));
             };
             if let Some(e) = unbound_receiver_error(tp, meth, &recv) {
                 return Err(e);
@@ -16984,46 +17080,46 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
         "swapcase" => Ok(new_str(
             // Unicode-aware: a cased letter maps to the opposite case (case
             // mapping can be 1→many, e.g. `ß` → `SS`); non-cased chars pass
-            // through. ASCII-only mapping left `ï`/`é` unchanged.
+            // through. `do_swapcase` lowers with `lower_ucs4`, so a capital
+            // sigma that ends a word becomes `ς`.
             s.chars()
-                .flat_map(|c| {
+                .zip(lower_in_context(&s))
+                .map(|(c, low)| {
                     if c.is_uppercase() {
-                        c.to_lowercase().collect::<Vec<_>>()
+                        low
                     } else if c.is_lowercase() {
-                        c.to_uppercase().collect::<Vec<_>>()
+                        c.to_uppercase().collect()
                     } else {
-                        vec![c]
+                        c.to_string()
                     }
                 })
                 .collect::<String>(),
         )),
         "capitalize" => {
-            // CPython titlecases the first character (`ǳ` → `ǲ`, not `Ǳ`) and
-            // lowercases the rest.
-            let mut c = s.chars();
-            let out = match c.next() {
-                Some(f) => to_titlecase(f) + &c.as_str().to_lowercase(),
+            // `do_capitalize`: the first character titlecased (`ǳ` → `ǲ`, not
+            // `Ǳ`; `ﬁ` → `Fi`), the rest lowercased in the context of the WHOLE
+            // string, so a sigma after the first letter can be word-final.
+            let lower = lower_in_context(&s);
+            let out = match s.chars().next() {
+                Some(f) => to_titlecase(f) + &lower[1..].concat(),
                 None => String::new(),
             };
             Ok(new_str(out))
         }
         "title" => {
-            let mut out = String::new();
+            // `do_title`: a character after a CASED one is lowercased (in
+            // context, for the final sigma), any other is titlecased, and
+            // casedness — not `isalpha` — decides the word boundary.
+            let lower = lower_in_context(&s);
+            let mut out = String::with_capacity(s.len());
             let mut prev_cased = false;
-            for ch in s.chars() {
-                // CPython's `str.title` cases word boundaries by the *cased*
-                // property (letters + titlecase-mapped digraphs), not `isalpha`.
-                if ch.is_alphabetic() {
-                    if prev_cased {
-                        out.extend(ch.to_lowercase());
-                    } else {
-                        out.push_str(&to_titlecase(ch));
-                    }
-                    prev_cased = true;
+            for (ch, low) in s.chars().zip(&lower) {
+                if prev_cased {
+                    out.push_str(low);
                 } else {
-                    out.push(ch);
-                    prev_cased = false;
+                    out.push_str(&to_titlecase(ch));
                 }
+                prev_cased = is_cased_char(ch);
             }
             Ok(new_str(out))
         }
@@ -17562,18 +17658,94 @@ fn is_digit_char(c: char) -> bool {
             | '\u{10E60}'..='\u{10E68}' | '\u{11052}'..='\u{1105A}' | '\u{1F100}'..='\u{1F10A}')
 }
 
-/// The titlecase form of `ch` (CPython's `str.title`/`capitalize` first-letter
-/// mapping). Rust's std only exposes uppercase; the Latin digraph ligatures whose
-/// titlecase differs from their uppercase (`ǳ` → `ǲ`, not `Ǳ`) are handled
-/// explicitly, everything else uppercases.
+/// `_PyUnicode_ToTitleFull`: the full titlecase mapping of `ch`, used for the
+/// first letter by `str.title`/`capitalize`. Rust's std exposes only the
+/// uppercase mapping, so the characters whose titlecase differs from it are
+/// listed: the simple titlecase field of `UnicodeData.txt` (the Latin digraphs,
+/// Georgian Mkhedruli, which titlecases to itself although it uppercases to
+/// Mtavruli, and the Greek letters with ypogegrammeni/prosgegrammeni) and the
+/// title column of `SpecialCasing.txt`.
 fn to_titlecase(ch: char) -> String {
-    match ch {
-        '\u{01C4}' | '\u{01C5}' | '\u{01C6}' => "\u{01C5}".to_string(),
-        '\u{01C7}' | '\u{01C8}' | '\u{01C9}' => "\u{01C8}".to_string(),
-        '\u{01CA}' | '\u{01CB}' | '\u{01CC}' => "\u{01CB}".to_string(),
-        '\u{01F1}' | '\u{01F2}' | '\u{01F3}' => "\u{01F2}".to_string(),
-        _ => ch.to_uppercase().collect(),
+    let simple = |c: u32| char::from_u32(c).map(String::from);
+    let mapped = match ch as u32 {
+        0x01C4..=0x01C6 => simple(0x01C5),
+        0x01C7..=0x01C9 => simple(0x01C8),
+        0x01CA..=0x01CC => simple(0x01CB),
+        0x01F1..=0x01F3 => simple(0x01F2),
+        0x10D0..=0x10FA | 0x10FD..=0x10FF => Some(ch.to_string()),
+        // ᾀ..ᾇ → ᾈ..ᾏ (and the same for the ᾐ and ᾠ rows); the titlecase
+        // letters themselves map to themselves.
+        c @ (0x1F80..=0x1FAF) => simple(c | 0x08),
+        0x1FB3 | 0x1FBC => simple(0x1FBC),
+        0x1FC3 | 0x1FCC => simple(0x1FCC),
+        0x1FF3 | 0x1FFC => simple(0x1FFC),
+        _ => None,
+    };
+    if let Some(m) = mapped {
+        return m;
     }
+    let special = match ch {
+        'ß' => "Ss",
+        'և' => "Եւ",
+        '\u{1fb2}' => "\u{1fba}\u{345}",
+        '\u{1fb4}' => "\u{386}\u{345}",
+        '\u{1fb7}' => "\u{391}\u{342}\u{345}",
+        '\u{1fc2}' => "\u{1fca}\u{345}",
+        '\u{1fc4}' => "\u{389}\u{345}",
+        '\u{1fc7}' => "\u{397}\u{342}\u{345}",
+        '\u{1ff2}' => "\u{1ffa}\u{345}",
+        '\u{1ff4}' => "\u{38f}\u{345}",
+        '\u{1ff7}' => "\u{3a9}\u{342}\u{345}",
+        'ﬀ' => "Ff",
+        'ﬁ' => "Fi",
+        'ﬂ' => "Fl",
+        'ﬃ' => "Ffi",
+        'ﬄ' => "Ffl",
+        'ﬅ' | 'ﬆ' => "St",
+        'ﬓ' => "Մն",
+        'ﬔ' => "Մե",
+        'ﬕ' => "Մի",
+        'ﬖ' => "Վն",
+        'ﬗ' => "Մխ",
+        _ => return ch.to_uppercase().collect(),
+    };
+    special.to_string()
+}
+
+/// `Py_UNICODE_ISTITLE`: general category `Lt`.
+fn is_titlecase_char(ch: char) -> bool {
+    use unicode_general_category::{get_general_category, GeneralCategory};
+    get_general_category(ch) == GeneralCategory::TitlecaseLetter
+}
+
+/// `_PyUnicode_IsCased`: the derived `Cased` property — `Lowercase`,
+/// `Uppercase` or category `Lt`.
+fn is_cased_char(ch: char) -> bool {
+    ch.is_lowercase() || ch.is_uppercase() || is_titlecase_char(ch)
+}
+
+/// The lowercase of each character of `s` IN CONTEXT, as CPython's
+/// `lower_ucs4` produces it: a capital sigma becomes `ς` when it ends a word
+/// (`handle_capital_sigma`, Unicode's `Final_Sigma` condition, which reads
+/// the characters around it). Rust's `str::to_lowercase` applies the same
+/// condition over the whole string, so each character's slice of that result
+/// is taken; only `Σ` is context-dependent, and both of its lowercases are two
+/// bytes, so the slices line up with the characters.
+fn lower_in_context(s: &str) -> Vec<String> {
+    let all = s.to_lowercase();
+    let mut off = 0;
+    s.chars()
+        .map(|ch| {
+            let len = if ch == '\u{3a3}' {
+                2
+            } else {
+                ch.to_lowercase().map(char::len_utf8).sum()
+            };
+            let piece = all[off..off + len].to_string();
+            off += len;
+            piece
+        })
+        .collect()
 }
 
 /// CPython `str.isspace` / `Py_UNICODE_ISSPACE`: Rust's `White_Space` set plus
@@ -17610,7 +17782,7 @@ fn is_titlecased(s: &str) -> bool {
     let mut cased = false;
     let mut prev_cased = false;
     for c in s.chars() {
-        if c.is_uppercase() {
+        if c.is_uppercase() || is_titlecase_char(c) {
             if prev_cased {
                 return false;
             }

@@ -1599,3 +1599,86 @@ for src in ["bytes('x')", "bytearray('x')", "bytes('x', errors='strict')",
         print(src, '->', repr(eval(src)))
     except Exception as e:
         print(src, '->', type(e).__name__, e)
+#==#
+# ── titlecase: the full mapping, `Lt` letters, and the final sigma ───────────
+# `str.title`/`capitalize` titlecase through `_PyUnicode_ToTitleFull` (ligatures
+# split, Georgian stays Mkhedruli, Greek iota-subscript letters keep their
+# titlecase form), `istitle` counts category `Lt` as an uppercase start, and
+# `title`/`capitalize`/`swapcase` lowercase a word-final capital sigma to `ς`.
+for s in ['ﬁx ﬂow', 'ß', 'ა', 'ᾳ ᾲ ᾷ', 'ǆa', 'ΣΑΣ ΟΔΟΣ', 'aΣ b', '1st 2nd', 'ŉ']:
+    print(ascii(s.title()), ascii(s.capitalize()), ascii(s.swapcase()))
+print('ǅ'.istitle(), 'ǅa'.istitle(), 'Aǅ'.istitle(), 'ᾈ'.istitle(), 'ΑΣ'.capitalize())
+import sys
+print(sys.maxunicode)
+#==#
+# ── `builtin_function_or_method.__self__` ─────────────────────────────────────
+# A module-level C function's `__self__` is its module (`builtins` for `len`), a
+# classmethod's is its type, a staticmethod's is None.
+import math, time
+print(len.__self__ is __import__('builtins'), math.sqrt.__self__ is math, time.time.__self__ is time)
+print(abs.__self__.__name__, dict.fromkeys.__self__, int.from_bytes.__self__, str.maketrans.__self__)
+#==#
+# ── calling a type's method with no receiver ─────────────────────────────────
+# A method descriptor names the unbound method; a slot wrapper the descriptor.
+for f in (list.append, str.upper, dict.get, list.__len__, int.__add__, object.__str__):
+    try:
+        f()
+    except TypeError as e:
+        print(e)
+#==#
+# ── an error raised natively inside a handler chains to the handled one ──────
+# `[][0]` installs no exception object of its own; it must still carry the
+# exception being handled as its `__context__`, uncaught or caught.
+try:
+    try:
+        1 / 0
+    except ZeroDivisionError:
+        [][0]
+except IndexError as e:
+    print(repr(e.__context__))
+try:
+    {}['k']
+except KeyError:
+    int('x')
+#==#
+# ── a re-raised exception keeps its traceback ────────────────────────────────
+# A bare `raise` adds no entry for its own frame; `raise e` adds one at its
+# line before the entries the exception already had; an exception passing
+# through `finally` is reported where it was raised.
+def a():
+    1 / 0
+def b():
+    try:
+        a()
+    except ZeroDivisionError:
+        print('handled')
+        raise
+try:
+    b()
+except ZeroDivisionError as e:
+    err = e
+def later():
+    raise err
+later()
+#==#
+def f():
+    try:
+        raise TypeError('t')
+    finally:
+        print('finally')
+f()
+#==#
+# ── an uncaught exception's line is its `str()` ──────────────────────────────
+# `traceback` renders `str(exc)` at print time, so a user `__str__` decides the
+# message, for the final exception and for one in its context chain; one that
+# raises is `<exception str() failed>`.
+class Shown(Exception):
+    def __str__(self):
+        return 'shown:' + repr(self.args)
+class Broken(Exception):
+    def __str__(self):
+        raise RuntimeError
+try:
+    raise Shown(1, 2)
+except Shown:
+    raise Broken(3)

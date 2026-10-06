@@ -9,6 +9,47 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **3.14's mixed-mode complex arithmetic.** `COMPLEX_BINOP` no longer promotes a
+  real operand to `complex`: `float + complex` adds to the real part only, `real
+  - complex` negates the imaginary part, a real factor or divisor scales each
+  part (`_Py_rc_quot` divides a real by a complex without the numerator's
+  imaginary term), so `complex(0.0, 0.0) * -1` and `-0.0 - 0j` are `(-0-0j)`.
+  `_Py_c_prod` and `_Py_c_quot` recover the infinities and zeros Annex G
+  prescribes from a nan+nanj result; `c_powi` takes a negative power as
+  `_Py_c_quot(1, c_powu(x, -n))`; and `**` raises `complex_pow`'s
+  `ZeroDivisionError: zero to a negative or complex power` and `OverflowError:
+  complex exponentiation` where it returned `0j`, `nan` or `inf` parts.
+- **A builtin function's `__self__`.** `len.__self__` is the `builtins` module,
+  `math.sqrt.__self__ is math`, a native classmethod's is its type
+  (`dict.fromkeys.__self__`), a staticmethod's `None`. Which module a C
+  function belongs to (`os.getcwd` lives in `posix`), and whether CPython's
+  object is a function at all, is read from CPython over the bridge.
+- **`str.title`/`capitalize`/`istitle`/`swapcase` follow CPython's case data.**
+  The first letter takes the FULL titlecase mapping (`ﬁ` → `Fi`, `ß` → `Ss`,
+  Georgian Mkhedruli stays itself, `ᾳ` → `ᾼ`), `title` breaks words on the
+  `Cased` property rather than `isalpha`, `istitle` counts category `Lt`
+  (`ǅ`, `ᾈ`) as an uppercase start, and a capital sigma lowered by `title`,
+  `capitalize` or `swapcase` is `ς` at the end of a word, judged against the
+  whole string. Compared over every code point against CPython 3.14.8; the
+  only differences left are characters Unicode 17 added or recased after the
+  Unicode 16 database CPython 3.14 carries. `sys.maxunicode` exists.
+- **An error raised natively inside an `except` block chains to the handled
+  exception.** `[][0]` or `int('x')` in a handler installed no exception object,
+  so an uncaught one printed no `During handling of the above exception`
+  section and a caught one had no `__context__`.
+- **A re-raised exception keeps its traceback.** A bare `raise` adds no entry
+  for its own frame (`RAISE_VARARGS 0` skips `PyTraceBack_Here`), `raise e`
+  adds one at its line in front of the entries `e` already carries, and an
+  exception passing through `finally` is reported at the line that raised it,
+  not the last line the `finally` ran.
+- **An uncaught exception's line is its `str()`.** A user `__str__` is run when
+  the traceback is printed, for the final exception and each one in its
+  `__cause__`/`__context__` chain; one that raises or answers a non-`str` is
+  `<exception str() failed>`.
+- **Calling a builtin type's method with no receiver** says `unbound method
+  list.append() needs an argument` for a method descriptor and `descriptor
+  '__len__' of 'list' object needs an argument` for a slot wrapper; the two
+  wordings were swapped.
 - **A traceback frame names its own module's file.** Every frame was shown
   under the main script's name with the main script's line at that number,
   so an error in an imported module's function read `File "main.py", line 2,
@@ -2369,8 +2410,8 @@ written.
   lacks `cast`/`count`/`index`/`toreadonly`/`suboffsets`/`__enter__`/`__exit__`).
   Listing them is gated on attribute access agreeing name for name, and several
   do not resolve yet: `f.__globals__`/`__builtins__`/`__call__`/
-  `__type_params__`, `m.__func__`/`__self__`, `len.__self__`/
-  `__text_signature__`, an iterator's `__length_hint__`/`__setstate__`, a code
+  `__type_params__`, `len.__text_signature__`, an iterator's
+  `__length_hint__`/`__setstate__`, a code
   object's `co_code`/`co_lines`/`replace`.
 - **`dir(type)` omits the five C-layout numbers.** `__basicsize__`,
   `__dictoffset__`, `__flags__`, `__itemsize__` and `__weakrefoffset__` describe
@@ -2410,13 +2451,27 @@ written.
   never runs. Closing it at the loop is not a fix: whether the loop held the
   LAST reference is not visible there (`it = gen(); for v in it: break;
   next(it)` must keep it open).
-- **3.14's mixed-mode complex arithmetic is not implemented.** CPython 3.14
-  stopped promoting a real operand to `complex` in `+ - * /` (C99 Annex G
-  rules), which changes signed zeros: `complex(0.0, 0.0) * -1` is `(-0-0j)` and
-  `-0.0 - 0j` is `(-0-0j)` in 3.14, `(-0+0j)` in 3.13 and in pythonrs.
-- **A builtin function has no `__self__`.** `len.__self__` is the `builtins`
-  module in CPython (`math.sqrt.__self__` is `math`); pythonrs raises
-  `AttributeError`. Bound builtin METHODS (`[].append.__self__`) are correct.
+- **A `raise` statement's traceback entry has no caret line.** CPython
+  underlines the whole `raise …` statement when it does not fill its line
+  (`x = 1; raise ValueError('x')`, `if c: raise E`); the parser records no
+  extent for a `raise`, so pythonrs prints the source line alone.
+- **`traceback.format_tb(e.__traceback__)` fails across the bridge.** The
+  native `traceback` object cannot be passed to CPython's `traceback` module
+  (`TypeError: cannot pass 'traceback' to a CPython stdlib call`).
+- **The object-level methods of a builtin type are typed as slot wrappers.**
+  `int.__format__`, `__dir__`, `__reduce__`, `__reduce_ex__` and `__sizeof__`
+  report `wrapper_descriptor` where CPython says `method_descriptor`;
+  `__init_subclass__`/`__subclasshook__` are `builtin_function_or_method` (class
+  methods) there, `__new__` a `builtin_function_or_method`, `__class__` a
+  `getset_descriptor` and `int.real`/`imag`/`numerator`/`denominator` a
+  `getset_descriptor` / `member_descriptor`, all of which pythonrs reports as
+  method or slot descriptors. Calling them behaves the same; `type()` and the
+  repr differ.
+- **A pure-Python `collections.Counter` method called through the class with
+  no receiver** says `unbound method Counter.most_common() needs an argument`;
+  CPython's `Counter` is a Python class, so the call is a missing-`self`
+  `TypeError` (`Counter.most_common() missing 1 required positional argument:
+  'self'`).
 
 ## VM-level limits (fusevm, not fixable from here)
 

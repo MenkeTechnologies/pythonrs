@@ -698,7 +698,7 @@ fn slot_wrappers_of(tp: &str) -> &'static [&'static str] {
 /// Whether `name` reached on an instance of builtin type `tp` is a slot wrapper
 /// (`<method-wrapper …>`) rather than a native method (`<built-in method …>`).
 /// A repr/`type()` distinction only — both dispatch identically.
-fn is_slot_wrapper(tp: &str, name: &str) -> bool {
+pub(crate) fn is_slot_wrapper(tp: &str, name: &str) -> bool {
     SLOT_WRAPPERS_EVERY_TYPE.contains(&name) || slot_wrappers_of(tp).contains(&name)
 }
 
@@ -2400,6 +2400,15 @@ pub struct PyHost {
     /// each a pythonrs frame or the CPython frames between two of them. Cleared
     /// when the exception is caught.
     pub traceback: Vec<TbEntry>,
+    /// The frame depth of a bare `raise` re-raising an exception that keeps
+    /// its traceback: that frame already appears in it (at the line the
+    /// exception first passed through), so CPython adds no entry for it
+    /// (`RAISE_VARARGS 0` jumps to `exception_unwind`, past `PyTraceBack_Here`).
+    /// Cleared with the traceback when the exception is caught.
+    pub tb_skip_frame: Option<usize>,
+    /// `str()` lines of uncaught user exceptions with their own `__str__`,
+    /// computed before the traceback is rendered (see `user_str_lines`).
+    pub user_str_lines: HashMap<u32, String>,
     /// The current `sys.stdout` / `sys.stderr` targets when reassigned away from
     /// the native streams (`sys.stdout = io.StringIO()`,
     /// `contextlib.redirect_stdout`). `None` = the native stream. Tracked on the
@@ -2859,7 +2868,7 @@ pub fn init_runtime(
         h.prog_source = source.to_string();
         h.tb_filename = tb_filename.to_string();
         h.tb_show_source = tb_show_source;
-        h.traceback.clear();
+        h.reset_traceback();
         // The top-level script always runs as `__main__`.
         let name = h.new_str("__main__");
         h.set_global("__name__", name);
@@ -3048,6 +3057,8 @@ impl PyHost {
             tb_filename: "<string>".to_string(),
             tb_show_source: true,
             traceback: Vec::new(),
+            tb_skip_frame: None,
+            user_str_lines: HashMap::new(),
             stdout_target: None,
             stderr_target: None,
             generation: {
@@ -4009,9 +4020,43 @@ impl PyHost {
     /// traceback as an exception unwinds past it. Called just before the frame is
     /// popped.
     pub fn push_tb_frame(&mut self) {
+        if self.skips_innermost_frame() {
+            self.tb_skip_frame = None;
+            return;
+        }
         if let Some(f) = self.frames.last() {
             self.traceback.push(TbEntry::Frame(TbFrame::of(f)));
         }
+    }
+    /// Whether the innermost frame is the one a bare `raise` re-raised from
+    /// (see [`Self::tb_skip_frame`]).
+    fn skips_innermost_frame(&self) -> bool {
+        self.tb_skip_frame.is_some() && self.tb_skip_frame == self.frames.len().checked_sub(1)
+    }
+    /// Forget the in-flight traceback: the exception was caught.
+    pub fn reset_traceback(&mut self) {
+        self.traceback.clear();
+        self.tb_skip_frame = None;
+    }
+    /// Re-raising `exc` continues ITS traceback, as CPython's does: the entries
+    /// it collected before it was caught become the inner end of the new one,
+    /// and the frames it now unwinds through are added outside them. A bare
+    /// `raise` adds no entry for its own frame; `raise e` does, at its line.
+    pub fn continue_traceback(&mut self, exc: &Value, bare: bool) {
+        let Value::Obj(id) = exc else { return };
+        let Some(tb) = self.exc_tb.get(id) else {
+            return;
+        };
+        self.traceback = tb.iter().rev().cloned().collect();
+        self.tb_skip_frame = if bare {
+            self.frames.len().checked_sub(1)
+        } else {
+            None
+        };
+    }
+    /// The innermost frame's current line and span.
+    pub fn cur_line_span(&self) -> Option<(u32, Span)> {
+        self.frames.last().map(|f| (f.line, f.span))
     }
     /// Snapshot `exc`'s traceback (outermost-first) into `exc_tb`, just before the
     /// caught exception's live `traceback` is cleared. The exception's own trace
@@ -4024,7 +4069,7 @@ impl PyHost {
         let Value::Obj(id) = exc else { return };
         let mut tb: Vec<TbEntry> = Vec::new();
         if let Some(f) = self.frames.last() {
-            if !self.tb_starts_empty.contains(id) {
+            if !self.tb_starts_empty.contains(id) && !self.skips_innermost_frame() {
                 tb.push(TbEntry::Frame(TbFrame::of(f)));
             }
         }
@@ -6676,6 +6721,34 @@ impl PyHost {
         self.num_val(v).map(|r| (r, 0.0))
     }
 
+    /// `a <op> b` for `op` in `+ - * /` when either side is a `complex`
+    /// (`COMPLEX_BINOP`): the other side may be a real, which is converted by
+    /// `real_to_double` but not promoted to `complex`. `None` when neither side
+    /// is complex or the other side is not a number.
+    pub fn complex_binop(
+        &mut self,
+        op: char,
+        a: &Value,
+        b: &Value,
+    ) -> Result<Option<Value>, String> {
+        let operand = |h: &Self, v: &Value| -> Result<Option<CxOperand>, String> {
+            if let Some(PyObj::Complex(r, i)) = h.get(v) {
+                return Ok(Some(CxOperand::Complex((*r, *i))));
+            }
+            Ok(h.num_val_arith(v)?.map(CxOperand::Real))
+        };
+        if !self.is_complex(a) && !self.is_complex(b) {
+            return Ok(None);
+        }
+        let (Some(x), Some(y)) = (operand(self, a)?, operand(self, b)?) else {
+            return Ok(None);
+        };
+        match complex_arith(op, x, y) {
+            Some((r, i)) => Ok(Some(self.alloc(PyObj::Complex(r, i)))),
+            None => Err("ZeroDivisionError: division by zero".into()),
+        }
+    }
+
     /// True if `v` is a `complex` heap object.
     pub fn is_complex(&self, v: &Value) -> bool {
         matches!(self.get(v), Some(PyObj::Complex(..)))
@@ -7944,10 +8017,11 @@ fn float_divmod(vx: f64, wx: f64) -> (f64, f64) {
 /// Smith's algorithm with fused multiply-add. Scaling by the larger-magnitude
 /// divisor component avoids intermediate overflow, and the `fma` (Rust's
 /// `mul_add`) reproduces CPython's rounding bit-for-bit.
+/// A nan+nanj quotient is then recovered as Annex G.5.2 prescribes.
 fn c_quot(ar: f64, ai: f64, br: f64, bi: f64) -> (f64, f64) {
     let abs_br = br.abs();
     let abs_bi = bi.abs();
-    if abs_br >= abs_bi {
+    let r = if abs_br >= abs_bi {
         // Divide top and bottom by br.
         if abs_br == 0.0 {
             (0.0, 0.0)
@@ -7970,7 +8044,105 @@ fn c_quot(ar: f64, ai: f64, br: f64, bi: f64) -> (f64, f64) {
     } else {
         // At least one of br or bi is NaN.
         (f64::NAN, f64::NAN)
+    };
+    // Recover infinities and zeros that computed as nan+nanj (C11 Annex G.5.2,
+    // `_Cdivd`).
+    if r.0.is_nan() && r.1.is_nan() {
+        if (ar.is_infinite() || ai.is_infinite()) && br.is_finite() && bi.is_finite() {
+            let x = inf_box(ar);
+            let y = inf_box(ai);
+            return (
+                f64::INFINITY * (x * br + y * bi),
+                f64::INFINITY * (y * br - x * bi),
+            );
+        }
+        if (abs_br.is_infinite() || abs_bi.is_infinite()) && ar.is_finite() && ai.is_finite() {
+            let x = inf_box(br);
+            let y = inf_box(bi);
+            return (0.0 * (ar * x + ai * y), 0.0 * (ai * x - ar * y));
+        }
     }
+    r
+}
+
+/// Annex G's "box" of a component: `±1` for an infinity, `±0` otherwise, the
+/// sign kept (`copysign(isinf(v) ? 1.0 : 0.0, v)`).
+fn inf_box(v: f64) -> f64 {
+    (if v.is_infinite() { 1.0f64 } else { 0.0 }).copysign(v)
+}
+
+/// `_Py_rc_quot`: a real number divided by a complex one, `_Py_c_quot` without
+/// the numerator's imaginary part (so no `0 * imag` term flips a zero's sign).
+/// `None` is the `EDOM` of a zero divisor.
+fn rc_quot(a: f64, (br, bi): (f64, f64)) -> Option<(f64, f64)> {
+    let abs_br = br.abs();
+    let abs_bi = bi.abs();
+    let r = if abs_br >= abs_bi {
+        if abs_br == 0.0 {
+            return None;
+        }
+        let ratio = bi / br;
+        let denom = bi.mul_add(ratio, br); // br + bi*ratio
+        (a / denom, (-a * ratio) / denom)
+    } else if abs_bi >= abs_br {
+        let ratio = br / bi;
+        let denom = br.mul_add(ratio, bi); // br*ratio + bi
+        ((a * ratio) / denom, (-a) / denom)
+    } else {
+        (f64::NAN, f64::NAN)
+    };
+    if r.0.is_nan()
+        && r.1.is_nan()
+        && a.is_finite()
+        && (abs_br.is_infinite() || abs_bi.is_infinite())
+    {
+        let x = inf_box(br);
+        let y = inf_box(bi);
+        return Some((0.0 * (a * x), 0.0 * (-a * y)));
+    }
+    Some(r)
+}
+
+/// `_Py_cr_quot`: a complex number divided by a real one, part by part.
+/// `None` is the `EDOM` of a zero divisor.
+fn cr_quot((ar, ai): (f64, f64), b: f64) -> Option<(f64, f64)> {
+    (b != 0.0).then(|| (ar / b, ai / b))
+}
+
+/// One of `complex`'s four arithmetic operators, `COMPLEX_BINOP` in
+/// `Objects/complexobject.c`. Since 3.14 a REAL operand is not promoted to
+/// `complex(x, 0.0)` first (C11 Annex G.5.1/G.5.2): `float + complex` adds to
+/// the real part only, `real - complex` negates the imaginary part, and a real
+/// factor or divisor scales each part — so no `±0.0 * x` term can flip the sign
+/// of a zero. `None` is the `EDOM` of a division by zero.
+fn complex_arith(op: char, a: CxOperand, b: CxOperand) -> Option<(f64, f64)> {
+    use CxOperand::{Complex as C, Real as R};
+    Some(match (op, a, b) {
+        ('+', C(x), C(y)) => (x.0 + y.0, x.1 + y.1),
+        ('+', R(x), C(y)) | ('+', C(y), R(x)) => (y.0 + x, y.1),
+        ('-', C(x), C(y)) => (x.0 - y.0, x.1 - y.1),
+        ('-', C(x), R(y)) => (x.0 - y, x.1),
+        ('-', R(x), C(y)) => (x - y.0, -y.1),
+        ('*', C(x), C(y)) => c_prod(x, y),
+        ('*', R(x), C(y)) | ('*', C(y), R(x)) => (y.0 * x, y.1 * x),
+        ('/', C(x), C(y)) => {
+            if y.0 == 0.0 && y.1 == 0.0 {
+                return None;
+            }
+            c_quot(x.0, x.1, y.0, y.1)
+        }
+        ('/', C(x), R(y)) => return cr_quot(x, y),
+        ('/', R(x), C(y)) => return rc_quot(x, y),
+        _ => unreachable!("complex_arith: no complex operand or unknown op {op}"),
+    })
+}
+
+/// An operand of [`complex_arith`]: a `complex`, or a real (`int`/`float`)
+/// already converted by `real_to_double`.
+#[derive(Clone, Copy)]
+enum CxOperand {
+    Complex((f64, f64)),
+    Real(f64),
 }
 
 fn fmt_complex(r: f64, i: f64) -> String {
@@ -8005,45 +8177,89 @@ fn fmt_complex_part(f: f64) -> String {
 /// Complex exponentiation (`complex.__pow__`), a faithful port of CPython's
 /// `complex_pow` (`Objects/complexobject.c`): a small integral exponent uses
 /// exact repeated-squaring (`c_powi`); anything else the polar `_Py_c_pow`.
-fn c_pow(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
-    if b.1 == 0.0 && b.0 == b.0.floor() && b.0.abs() <= 100.0 {
-        return c_powi(a, b.0 as i64);
+/// The errors are its `errno` checks: `EDOM` (a zero base under a negative or
+/// complex exponent) first, then `_Py_ADJUST_ERANGE2`'s `ERANGE` (a part came
+/// out infinite).
+fn c_pow(a: (f64, f64), b: (f64, f64)) -> Result<(f64, f64), String> {
+    let p = if b.1 == 0.0 && b.0 == b.0.floor() && b.0.abs() <= 100.0 {
+        c_powi(a, b.0 as i64)
+    } else {
+        c_pow_polar(a, b)
+    };
+    let Some(p) = p else {
+        return Err("ZeroDivisionError: zero to a negative or complex power".into());
+    };
+    if p.0.is_infinite() || p.1.is_infinite() {
+        return Err("OverflowError: complex exponentiation".into());
     }
-    c_pow_polar(a, b)
+    Ok(p)
 }
 
-fn c_pow_polar(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
+/// `_Py_c_pow`. `None` is its `EDOM`.
+fn c_pow_polar(a: (f64, f64), b: (f64, f64)) -> Option<(f64, f64)> {
     if b.0 == 0.0 && b.1 == 0.0 {
-        return (1.0, 0.0);
+        return Some((1.0, 0.0));
     }
     if a.0 == 0.0 && a.1 == 0.0 {
-        return (0.0, 0.0);
+        return (b.1 == 0.0 && b.0 >= 0.0).then_some((0.0, 0.0));
     }
     let vabs = a.0.hypot(a.1);
     let mut len = vabs.powf(b.0);
     let at = a.1.atan2(a.0);
     let mut phase = at * b.0;
     if b.1 != 0.0 {
-        len /= (at * b.1).exp();
+        len *= (-at * b.1).exp();
         phase += b.1 * vabs.ln();
     }
-    (len * phase.cos(), len * phase.sin())
+    Some((len * phase.cos(), len * phase.sin()))
 }
 
-fn c_prod(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
-    (a.0 * b.0 - a.1 * b.1, a.0 * b.1 + a.1 * b.0)
-}
-
-/// `c_powi`: integer complex power via repeated squaring (CPython's `c_powu`,
-/// with the reciprocal for a negative exponent).
-fn c_powi(x: (f64, f64), n: i64) -> (f64, f64) {
-    if n < 0 {
-        let p = c_powu(x, -n);
-        // reciprocal 1/p
-        let d = p.0 * p.0 + p.1 * p.1;
-        return (p.0 / d, -p.1 / d);
+/// `_Py_c_prod`, with Annex G.5.1's recovery (`_Cmultd`) of an infinity that
+/// computed as nan+nanj.
+fn c_prod((mut a, mut b): (f64, f64), (mut c, mut d): (f64, f64)) -> (f64, f64) {
+    let (ac, bd, ad, bc) = (a * c, b * d, a * d, b * c);
+    let r = (ac - bd, ad + bc);
+    if !(r.0.is_nan() && r.1.is_nan()) {
+        return r;
     }
-    c_powu(x, n)
+    let zero_nan = |v: f64| if v.is_nan() { 0.0f64.copysign(v) } else { v };
+    let mut recalc = false;
+    if a.is_infinite() || b.is_infinite() {
+        (a, b) = (inf_box(a), inf_box(b));
+        (c, d) = (zero_nan(c), zero_nan(d));
+        recalc = true;
+    }
+    if c.is_infinite() || d.is_infinite() {
+        (c, d) = (inf_box(c), inf_box(d));
+        (a, b) = (zero_nan(a), zero_nan(b));
+        recalc = true;
+    }
+    if !recalc && [ac, bd, ad, bc].iter().any(|v| v.is_infinite()) {
+        (a, b, c, d) = (zero_nan(a), zero_nan(b), zero_nan(c), zero_nan(d));
+        recalc = true;
+    }
+    if recalc {
+        (
+            f64::INFINITY * (a * c - b * d),
+            f64::INFINITY * (a * d + b * c),
+        )
+    } else {
+        r
+    }
+}
+
+/// `c_powi`: integer complex power by repeated squaring (`c_powu`), a negative
+/// exponent as `_Py_c_quot(1, c_powu(x, -n))`. `None` is that quotient's
+/// `EDOM` — the power came out zero (`0j ** -1`, or an underflow).
+fn c_powi(x: (f64, f64), n: i64) -> Option<(f64, f64)> {
+    if n > 0 {
+        return Some(c_powu(x, n));
+    }
+    let p = c_powu(x, -n);
+    if p.0 == 0.0 && p.1 == 0.0 {
+        return None;
+    }
+    Some(c_quot(1.0, 0.0, p.0, p.1))
 }
 
 fn c_powu(x: (f64, f64), n: i64) -> (f64, f64) {
@@ -8392,12 +8608,8 @@ impl PyHost {
                     return Ok(Value::Float(x + y));
                 }
                 // complex + complex / int + complex / …
-                if self.is_complex(a) || self.is_complex(b) {
-                    if let (Some((ar, ai)), Some((br, bi))) =
-                        (self.complex_val(a), self.complex_val(b))
-                    {
-                        return Ok(self.alloc(PyObj::Complex(ar + br, ai + bi)));
-                    }
+                if let Some(v) = self.complex_binop('+', a, b)? {
+                    return Ok(v);
                 }
                 // Two templates concatenate: the seam joins the left's trailing
                 // literal to the right's leading one, keeping
@@ -8506,12 +8718,8 @@ impl PyHost {
                 if let (Some(x), Some(y)) = (self.num_val_arith(a)?, self.num_val_arith(b)?) {
                     return Ok(Value::Float(x - y));
                 }
-                if self.is_complex(a) || self.is_complex(b) {
-                    if let (Some((ar, ai)), Some((br, bi))) =
-                        (self.complex_val(a), self.complex_val(b))
-                    {
-                        return Ok(self.alloc(PyObj::Complex(ar - br, ai - bi)));
-                    }
+                if let Some(v) = self.complex_binop('-', a, b)? {
+                    return Ok(v);
                 }
                 // set difference (result type follows the left operand;
                 // dict_keys/dict_items views participate as key-sets)
@@ -8538,12 +8746,8 @@ impl PyHost {
                 if let (Some(x), Some(y)) = (self.num_val_arith(a)?, self.num_val_arith(b)?) {
                     return Ok(Value::Float(x * y));
                 }
-                if self.is_complex(a) || self.is_complex(b) {
-                    if let (Some((ar, ai)), Some((br, bi))) =
-                        (self.complex_val(a), self.complex_val(b))
-                    {
-                        return Ok(self.alloc(PyObj::Complex(ar * br - ai * bi, ar * bi + ai * br)));
-                    }
+                if let Some(v) = self.complex_binop('*', a, b)? {
+                    return Ok(v);
                 }
                 // A SEQUENCE on either side gets CPython's sequence-specific
                 // message, which names the non-int operand's type; the generic
@@ -8936,19 +9140,10 @@ impl PyHost {
                 match (self.num_val_arith(a)?, self.num_val_arith(b)?) {
                     (Some(_), Some(0.0)) => Err("ZeroDivisionError: division by zero".into()),
                     (Some(x), Some(y)) => Ok(Value::Float(x / y)),
-                    _ if self.is_complex(a) || self.is_complex(b) => {
-                        match (self.complex_val(a), self.complex_val(b)) {
-                            (Some((ar, ai)), Some((br, bi))) => {
-                                if br == 0.0 && bi == 0.0 {
-                                    return Err("ZeroDivisionError: division by zero".into());
-                                }
-                                let (rr, ri) = c_quot(ar, ai, br, bi);
-                                Ok(self.alloc(PyObj::Complex(rr, ri)))
-                            }
-                            _ => Err(self.optype_err("/", a, b)),
-                        }
-                    }
-                    _ => Err(self.optype_err("/", a, b)),
+                    _ => match self.complex_binop('/', a, b)? {
+                        Some(v) => Ok(v),
+                        None => Err(self.optype_err("/", a, b)),
+                    },
                 }
             }
             binop::FLOORDIV => {
@@ -9025,7 +9220,7 @@ impl PyHost {
                 _ if self.is_complex(a) || self.is_complex(b) => {
                     match (self.complex_val(a), self.complex_val(b)) {
                         (Some(x), Some(y)) => {
-                            let (r, i) = c_pow(x, y);
+                            let (r, i) = c_pow(x, y)?;
                             Ok(self.alloc(PyObj::Complex(r, i)))
                         }
                         _ => Err(self.optype_err("** or pow()", a, b)),
@@ -9047,7 +9242,7 @@ impl PyHost {
                     // into the complex branch — `(-1.0) ** float('inf')` answered
                     // `(nan+nanj)` where CPython answers `1.0`.
                     (Some(x), Some(y)) if x < 0.0 && y.is_finite() && y.fract() != 0.0 => {
-                        let (r, i) = c_pow((x, 0.0), (y, 0.0));
+                        let (r, i) = c_pow((x, 0.0), (y, 0.0))?;
                         Ok(self.alloc(PyObj::Complex(r, i)))
                     }
                     (Some(x), Some(y)) => {
@@ -15268,7 +15463,7 @@ pub fn invoke(
             let mut it = args.into_iter();
             let recv = it
                 .next()
-                .ok_or_else(|| type_error(&format!("unbound method {qual}() needs an argument")))?;
+                .ok_or_else(|| unbound_call_without_receiver(&base, &method))?;
             let rest: Vec<Value> = it.collect();
             // A slot wrapper type-checks its receiver before running the slot,
             // exactly as the method descriptors above do: `str.__eq__(5, 'a')`
@@ -18523,6 +18718,70 @@ fn join_exc(class: &str, msg: &str) -> String {
     }
 }
 
+/// The final lines of the exceptions an uncaught traceback will show whose
+/// class is a user class defining `__str__`: `traceback.py` renders `str(exc)`
+/// at print time, so the user method runs (outside the host borrow, with the
+/// in-flight error state put back afterwards) and its answer replaces the
+/// `args`-based message recorded at raise time. Every exception in the
+/// `__cause__`/`__context__` chain is covered and recorded in
+/// `user_str_lines` for the renderer; the return value is the line for the
+/// final exception, when `err` is its line. A `__str__` that raises or answers
+/// a non-`str` is CPython's `<exception str() failed>`.
+fn user_str_lines(err: &str) -> Option<String> {
+    let mut chain = Vec::new();
+    let mut cur = with_host(|h| h.exc.clone());
+    while let Some(e @ Value::Obj(id)) = cur {
+        if chain.iter().any(|(_, seen, _)| *seen == id) {
+            break;
+        }
+        let (class, next) = with_host(|h| {
+            let class = match h.get(&e) {
+                Some(PyObj::Instance(i))
+                    if h.class_is_exception(&i.class)
+                        && h.class_lookup(&i.class, "__str__").is_some() =>
+                {
+                    Some(i.class.clone())
+                }
+                _ => None,
+            };
+            let (cause, context) = h.exc_link(&e);
+            let next = if matches!(cause, Value::Undef) {
+                context
+            } else {
+                cause
+            };
+            (class, Some(next).filter(|v| matches!(v, Value::Obj(_))))
+        });
+        chain.push((e.clone(), id, class));
+        cur = next;
+    }
+    let mut final_line = None;
+    for (i, (exc, id, class)) in chain.iter().enumerate() {
+        let Some(class) = class else { continue };
+        let saved = with_host(|h| {
+            (
+                h.exc.clone(),
+                h.error.clone(),
+                std::mem::take(&mut h.traceback),
+                h.tb_skip_frame,
+            )
+        });
+        let text = call_method(exc, "__str__", vec![], vec![])
+            .ok()
+            .and_then(|v| with_host(|h| h.as_str(&v).map(|s| s.to_string())))
+            .unwrap_or_else(|| "<exception str() failed>".to_string());
+        let line = join_exc(class, &text);
+        with_host(|h| {
+            (h.exc, h.error, h.traceback, h.tb_skip_frame) = saved;
+            if i == 0 && h.exc_line_of(exc).as_deref() == Some(err) {
+                final_line = Some(line.clone());
+            }
+            h.user_str_lines.insert(*id, line);
+        });
+    }
+    final_line
+}
+
 /// How an uncaught top-level exception ends the process.
 pub enum TopExit {
     /// An uncaught `SystemExit`: exit with `code`, optionally after writing
@@ -18537,6 +18796,8 @@ pub enum TopExit {
 /// line. An uncaught `SystemExit` maps to CPython's exit-code rules; anything
 /// else formats a `Traceback (most recent call last):` block.
 pub fn classify_top_error(err: &str) -> TopExit {
+    let user_line = user_str_lines(err);
+    let err = user_line.as_deref().unwrap_or(err);
     with_host(|h| {
         // Uncaught SystemExit (from `sys.exit` or `raise SystemExit`): CPython
         // prints no traceback and derives the exit status from the code.
@@ -18676,7 +18937,9 @@ impl PyHost {
         // reversed to outermost-first.
         let mut final_frames: Vec<TbEntry> = Vec::new();
         if let Some(f) = self.frames.first() {
-            final_frames.push(TbEntry::Frame(TbFrame::of(f)));
+            if self.tb_skip_frame != Some(0) {
+                final_frames.push(TbEntry::Frame(TbFrame::of(f)));
+            }
         }
         for f in self.traceback.iter().rev() {
             final_frames.push(f.clone());
@@ -19084,6 +19347,12 @@ impl PyHost {
                 join_exc(class, &self.exc_obj_message(exc, class, args))
             }
             Some(PyObj::Instance(i)) if self.class_is_exception(&i.class) => {
+                if let Some(line) = match exc {
+                    Value::Obj(id) => self.user_str_lines.get(id),
+                    _ => None,
+                } {
+                    return line.clone();
+                }
                 join_exc(&i.class, &self.exc_inst_message(&i.class, &i.dict))
             }
             _ => String::new(),
@@ -22031,6 +22300,7 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                 ("argv", argv),
                 ("stdlib_module_names", stdlib_module_names),
                 ("maxsize", Value::Int(i64::MAX)),
+                ("maxunicode", Value::Int(0x10FFFF)),
                 ("version", version),
                 ("version_info", version_info),
                 ("implementation", implementation),
@@ -23672,4 +23942,17 @@ fn lru_invoke(
     let result = invoke(func, args, kwargs)?;
     with_host(|h| h.lru_store(cache_id, key, result.clone()));
     Ok(result)
+}
+
+/// The `TypeError` for calling a builtin type's method through the type with no
+/// receiver: a slot wrapper (`wrapperdescr_call`) names the descriptor, a method
+/// descriptor (`method_check_args`) names the unbound method.
+pub fn unbound_call_without_receiver(tp: &str, meth: &str) -> String {
+    if is_slot_wrapper(tp, meth) {
+        type_error(&format!(
+            "descriptor '{meth}' of '{tp}' object needs an argument"
+        ))
+    } else {
+        type_error(&format!("unbound method {tp}.{meth}() needs an argument"))
+    }
 }
