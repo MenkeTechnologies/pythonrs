@@ -7971,9 +7971,6 @@ fn check_builtin_arity(name: &str, argc: usize) -> Result<(), String> {
             }
             return Ok(());
         }
-        "map" if argc < 2 => {
-            return Err(host::type_error("map() must have at least two arguments."))
-        }
         "super" if argc > 2 => {
             return Err(host::type_error(&format!(
                 "super() expected at most 2 arguments, got {argc}"
