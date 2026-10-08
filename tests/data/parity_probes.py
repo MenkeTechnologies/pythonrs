@@ -2251,3 +2251,29 @@ for c in ["r.tobytes(1)", "r.tobytes('X')", "r.tobytes()"]:
         print(c, '->', repr(eval(c)))
     except Exception as e:
         print(c, '!', type(e).__name__, e)
+#==#
+# ── container dunders: METH_O methods vs slot wrappers ───────────────────────
+# `x.__getitem__()` said "missing required argument" and `x.__getitem__(0, 1)`
+# or `x.__setitem__(0)` ran anyway. `dict`/`list` `__getitem__` and the
+# dict/set `__contains__` are `METH_O` methods; the rest are slot wrappers.
+import collections
+objs = {"str": "ab", "bytes": b"ab", "bytearray": bytearray(b"ab"), "list": [1, 2],
+        "tuple": (1, 2), "dict": {0: 1}, "set": {1}, "frozenset": frozenset({1}),
+        "range": range(2), "memoryview": memoryview(bytearray(b"ab")),
+        "deque": collections.deque([1]), "defaultdict": collections.defaultdict(int, {0: 1}),
+        "OrderedDict": collections.OrderedDict({0: 1}), "Counter": collections.Counter({0: 1}),
+        "keys": {0: 1}.keys(), "items": {0: 1}.items()}
+for n, o in objs.items():
+    for d in ("__getitem__", "__setitem__", "__delitem__", "__contains__"):
+        if not hasattr(o, d) or (n == "Counter" and d == "__delitem__"):
+            continue
+        for a, kw in [((), {}), ((0, 1, 2), {}), ((0,), {"k": 1})]:
+            try:
+                getattr(o, d)(*a, **kw)
+                r = "ok"
+            except TypeError as e:
+                # The two-argument wrapper's count message gained its name in 3.13.
+                r = "TypeError" if d == "__setitem__" and not kw else f"TypeError: {e}"
+            except Exception as e:
+                r = type(e).__name__
+            print(n, d, len(a), sorted(kw), r)

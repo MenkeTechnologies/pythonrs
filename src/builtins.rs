@@ -16844,7 +16844,7 @@ fn is_c_slot_type(tn: &str) -> bool {
         || matches!(
             native_type_key(tn),
             "zip" | "map" | "filter" | "enumerate" | "reversed" | "generator" | "NoneType"
-                | "deque" | "defaultdict" | "OrderedDict"
+                | "deque" | "defaultdict" | "OrderedDict" | "dict_keys" | "dict_values" | "dict_items"
         )
 }
 
@@ -16857,10 +16857,14 @@ fn check_slot_wrapper_call(
     args: &[Value],
     kwargs: &[(String, Value)],
 ) -> Result<(), String> {
+    let tn = with_host(|h| h.type_name(recv));
+    if matches!(name, "__getitem__" | "__setitem__" | "__delitem__" | "__contains__") {
+        return check_container_dunder_call(&tn, name, args, kwargs);
+    }
     let Some((min, max)) = slot_wrapper_arity(name) else {
         return Ok(());
     };
-    if !is_c_slot_type(&with_host(|h| h.type_name(recv))) {
+    if !is_c_slot_type(&tn) {
         return Ok(());
     }
     if !kwargs.is_empty() {
@@ -16878,6 +16882,59 @@ fn check_slot_wrapper_call(
         format!("{min} or {max} arguments")
     };
     Err(host::type_error(&format!("expected {want}, got {n}")))
+}
+
+/// The argument contract of `__getitem__`/`__setitem__`/`__delitem__`/
+/// `__contains__` on a builtin container. `dict` (and its C and Python
+/// subclasses) defines `__getitem__` and `__contains__`, and `list` defines
+/// `__getitem__`, as `METH_O` methods (`dict.__getitem__() takes exactly one
+/// argument (0 given)`); everywhere else they are slot wrappers —
+/// `wrap_binaryfunc`/`wrap_objobjproc`/`wrap_delitem` take one argument and
+/// `wrap_objobjargproc` two (`__setitem__ expected 2 arguments, got 1`).
+/// `Counter.__delitem__` is a Python function and keeps its own errors.
+fn check_container_dunder_call(
+    tn: &str,
+    name: &str,
+    args: &[Value],
+    kwargs: &[(String, Value)],
+) -> Result<(), String> {
+    let key = native_type_key(tn);
+    let dictlike = matches!(key, "dict" | "defaultdict" | "OrderedDict" | "Counter");
+    if key == "Counter" && name == "__delitem__" || !(dictlike || is_c_slot_type(tn)) {
+        return Ok(());
+    }
+    let n = args.len();
+    let meth_o = match name {
+        "__getitem__" => dictlike || key == "list",
+        "__contains__" => dictlike || matches!(key, "set" | "frozenset"),
+        _ => false,
+    };
+    if meth_o {
+        if !kwargs.is_empty() {
+            return Err(host::type_error(&format!(
+                "{tn}.{name}() takes no keyword arguments"
+            )));
+        }
+        if n != 1 {
+            return Err(host::type_error(&format!(
+                "{tn}.{name}() takes exactly one argument ({n} given)"
+            )));
+        }
+        return Ok(());
+    }
+    if !kwargs.is_empty() {
+        return Err(host::type_error(&format!(
+            "wrapper {name}() takes no keyword arguments"
+        )));
+    }
+    match name {
+        "__setitem__" if n != 2 => Err(host::type_error(&format!(
+            "__setitem__ expected 2 arguments, got {n}"
+        ))),
+        "__setitem__" => Ok(()),
+        _ if n != 1 => Err(host::type_error(&format!("expected 1 argument, got {n}"))),
+        _ => Ok(()),
+    }
 }
 
 pub fn call_type_method(
