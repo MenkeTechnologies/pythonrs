@@ -18814,7 +18814,7 @@ fn builtin_method_arity(tn: &str, name: &str) -> Option<Arity> {
         "expandtabs" | "splitlines" => Arity::ClinicRange(0, 1, 1),
         "replace" if !bytes => Arity::ClinicRange(2, 3, 3),
         "replace" => Arity::VarRange(2, 3),
-        "translate" => Arity::ClinicRange(1, 1, 2),
+        "translate" => Arity::ClinicRange(1, 2, 2),
         _ => return None,
     })
 }

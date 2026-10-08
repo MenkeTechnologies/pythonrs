@@ -2013,3 +2013,11 @@ try:
 except ValueError as e:
     print('gen', e.__traceback__.tb_next.tb_lineno)
 h()
+#==#
+# ── bytes.translate(table, /, delete=b'') takes `delete` positionally too ────
+print(b'abc'.translate(None, b'b'), bytearray(b'abc').translate(None, b'a'))
+for call in (lambda: b'a'.translate(None, b'', b''), lambda: 'a'.translate(None, 1)):
+    try:
+        call()
+    except TypeError as e:
+        print(e)
