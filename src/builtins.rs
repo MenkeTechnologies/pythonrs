@@ -5493,7 +5493,9 @@ pub fn is_object_dunder_method(tn: &str, name: &str) -> bool {
         n if OBJECT_METHOD_DUNDERS.contains(&n) => true,
         "__bool__" => HAS_BOOL.contains(&tn),
         "__len__" => SIZED.contains(&tn),
-        "__iter__" => SIZED.contains(&tn) || LAZY.contains(&tn),
+        // Every iterator is its own iterable: `list_iterator`, `dict_keyiterator`,
+        // `callable_iterator`, … all carry `__iter__` beside `__next__`.
+        "__iter__" => SIZED.contains(&tn) || LAZY.contains(&tn) || tn.ends_with("iterator"),
         "__contains__" => SIZED.contains(&tn) && !CONTAINS_EXCLUDED.contains(&tn),
         "__getitem__" => SUBSCRIPTABLE.contains(&tn),
         "__setitem__" | "__delitem__" => MUTABLE.contains(&tn),
@@ -14663,6 +14665,13 @@ const ITER_PROTOCOL_TYPES: &[&str] = &[
     "callable_iterator",
 ];
 
+/// A lazy iterator type: one of [`ITER_PROTOCOL_TYPES`], an `itertools` type, or
+/// a builtin container's own iterator (`list_iterator`, `dict_keyiterator`,
+/// `list_reverseiterator`, …).
+fn is_iter_protocol_type(t: &str) -> bool {
+    t.starts_with("itertools.") || t.ends_with("iterator") || ITER_PROTOCOL_TYPES.contains(&t)
+}
+
 /// Every attribute name `typename` responds to — what `dir()` lists.
 ///
 /// [`type_method_names`] only covers the types whose methods are a plain table.
@@ -14805,7 +14814,7 @@ fn own_dir_names(typename: &str) -> Vec<&'static str> {
             "empty",
             "full",
         ]),
-        t if t.starts_with("itertools.") || ITER_PROTOCOL_TYPES.contains(&t) => {
+        t if is_iter_protocol_type(t) => {
             out.extend_from_slice(&["__next__", "__iter__"])
         }
         t if is_exception_class(t) => {
@@ -14976,7 +14985,7 @@ pub fn type_has_method(typename: &str, name: &str) -> bool {
         // Every lazy iterator answers the iterator protocol as bound methods.
         // `threading` takes `itertools.count().__next__` as its name counter, and
         // reaching `__next__` only through `next(it)` was not enough.
-        _ if typename.starts_with("itertools.") || ITER_PROTOCOL_TYPES.contains(&typename) => {
+        _ if is_iter_protocol_type(typename) => {
             return matches!(name, "__next__" | "__iter__")
         }
         "coroutine" => return GENERATOR_METHODS.contains(&name) || name == "__await__",
@@ -16793,6 +16802,84 @@ fn float_getformat(arg: Option<&Value>) -> Result<Value, String> {
     }
 }
 
+/// The argument count a slot wrapper (`typeobject.c` `slotdefs`) takes, for the
+/// dunders that are wrappers on every C type that has them: `Some((min, max))`.
+/// `__pow__`/`__rpow__` are `wrap_ternaryfunc` (an optional modulus); the rest
+/// are `wrap_unaryfunc`/`wrap_lenfunc`/`wrap_next`/`wrap_inquirypred`/
+/// `wrap_hashfunc` (none) or `wrap_binaryfunc[_l/_r]`/`wrap_richcmpfunc` (one).
+fn slot_wrapper_arity(name: &str) -> Option<(usize, usize)> {
+    match name {
+        "__next__" | "__iter__" | "__len__" | "__repr__" | "__str__" | "__hash__"
+        | "__bool__" | "__neg__" | "__pos__" | "__abs__" | "__invert__" | "__int__"
+        | "__float__" | "__index__" => Some((0, 0)),
+        "__pow__" | "__rpow__" => Some((1, 2)),
+        _ if comparison_dunder_op(name).is_some() => Some((1, 1)),
+        _ => {
+            // A forward, reflected (`__r…__`) or in-place (`__i…__`) binary op.
+            let binop = |o: &str| {
+                matches!(
+                    o,
+                    "add" | "sub" | "mul" | "matmul" | "truediv" | "floordiv" | "mod"
+                        | "divmod" | "lshift" | "rshift" | "and" | "or" | "xor"
+                )
+            };
+            let op = name.strip_prefix("__")?.strip_suffix("__")?;
+            let is_binop = binop(op)
+                || op.strip_prefix('r').is_some_and(binop)
+                || op.strip_prefix('i').is_some_and(binop);
+            is_binop.then_some((1, 1))
+        }
+    }
+}
+
+/// Whether a builtin value of type `tn` is an instance of a type CPython
+/// implements in C, so its dunders are slot wrappers. Natively modelled types
+/// that are pure Python in CPython (`Fraction`, `Counter`, …) define those
+/// dunders as ordinary functions with their own argument errors, so they are
+/// left alone.
+fn is_c_slot_type(tn: &str) -> bool {
+    is_builtin_type(tn)
+        || tn.ends_with("iterator")
+        || tn.starts_with("itertools.")
+        || matches!(
+            native_type_key(tn),
+            "zip" | "map" | "filter" | "enumerate" | "reversed" | "generator" | "NoneType"
+                | "deque" | "defaultdict" | "OrderedDict"
+        )
+}
+
+/// `wrapper_call` then the wrapper's own count check: a slot wrapper refuses
+/// every keyword (`wrapper __next__() takes no keyword arguments`) before
+/// `check_num_args` / `PyArg_UnpackTuple` count the positionals.
+fn check_slot_wrapper_call(
+    recv: &Value,
+    name: &str,
+    args: &[Value],
+    kwargs: &[(String, Value)],
+) -> Result<(), String> {
+    let Some((min, max)) = slot_wrapper_arity(name) else {
+        return Ok(());
+    };
+    if !is_c_slot_type(&with_host(|h| h.type_name(recv))) {
+        return Ok(());
+    }
+    if !kwargs.is_empty() {
+        return Err(host::type_error(&format!(
+            "wrapper {name}() takes no keyword arguments"
+        )));
+    }
+    let n = args.len();
+    if (min..=max).contains(&n) {
+        return Ok(());
+    }
+    let want = if min == max {
+        format!("{min} argument{}", if min == 1 { "" } else { "s" })
+    } else {
+        format!("{min} or {max} arguments")
+    };
+    Err(host::type_error(&format!("expected {want}, got {n}")))
+}
+
 pub fn call_type_method(
     recv: &Value,
     name: &str,
@@ -16822,6 +16909,9 @@ pub fn call_type_method(
             return Err(format!(
                 "AttributeError: '{tn}' object has no attribute '{name}'"
             ));
+        }
+        if !missing {
+            check_slot_wrapper_call(recv, name, &args, &kwargs)?;
         }
     }
     if let Some(r) = context_var_method(recv, name, &args) {

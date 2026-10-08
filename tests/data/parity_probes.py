@@ -2201,3 +2201,32 @@ for c in ["type.__new__(type, 'A', (), {}).__name__", "type.__new__(type, 'A', (
           "type.__new__(1, 'A', (), {})", "type(type.__new__(type, 'G', (type.__new__(M, 'H', (), {}),), {})).__name__",
           "type.__new__(type, 'A', (), {}, **{}).__mro__"]:
     t(c)
+#==#
+# ── slot wrappers refuse keywords and count their arguments ──────────────────
+# `it.__next__(x=1)`, `[].__len__(1)` and `(1).__add__(1, 2)` ignored what they
+# were given; a slot wrapper refuses every keyword, then checks the count. An
+# iterator's own `__iter__` was an AttributeError when called.
+cases = [
+    "iter([1]).__next__(x=1)", "iter([1]).__next__(1)", "iter('ab').__next__(x=1)",
+    "iter(range(3)).__next__(1)", "iter({1: 2}).__next__(x=1)", "reversed([1]).__next__(x=1)",
+    "enumerate([1]).__next__(x=1)", "zip([1]).__next__(x=1)", "map(abs, [1]).__next__(x=1)",
+    "(i for i in [1]).__next__(x=1)", "(i for i in [1]).__next__(1)", "[].__len__(1)",
+    "[].__len__(x=1)", "[1].__iter__(x=1)", "iter([]).__iter__(1)", "(1).__neg__(x=1)",
+    "(1).__add__()", "(1).__add__(1, 2)", "(1).__radd__()", "[].__iadd__()",
+    "[].__imul__(1, x=2)", "(1).__pow__(2, x=1)", "(1).__rpow__(2, 5)",
+    "(1).__eq__()", "'a'.__lt__('b', 'c')", "(1).__hash__(1)", "None.__bool__(1)",
+    "None.__repr__(x=1)", "'a'.__str__(1)", "(1.5).__int__(1)", "'a'.__mod__()",
+]
+for c in cases:
+    try:
+        print(c, '->', repr(eval(c)))
+    except Exception as e:
+        print(c, '!', type(e).__name__, e)
+# The optional-modulus wrappers' count message was reworded in 3.13.
+for c in ["(1).__pow__()", "(1).__pow__(1, 2, 3)", "(1).__rpow__()"]:
+    try:
+        print(c, '->', repr(eval(c)))
+    except Exception as e:
+        print(c, '!', type(e).__name__)
+it = iter([1, 2])
+print(it.__iter__() is it, list(iter(range(2)).__iter__()))
