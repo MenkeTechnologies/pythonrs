@@ -2067,3 +2067,18 @@ for c in cases:
         print(c, '->', repr(eval(c)))
     except Exception as e:
         print(c, '!', type(e).__name__, e)
+#==#
+# ── builtins: keywords count toward the clinic total; str() decoding ─────────
+# `memoryview(b'a', x=1)` named `x` instead of counting it, `type(1, x=1)`
+# dropped it, and `str(b, errors=…)` read the error handler as the encoding.
+cases = [
+    "memoryview(b'a', x=1)", "property(None, None, None, None, x=1)", "open(mode='r')",
+    "exec('1', None, None, None)", "complex(1, 2, imag=3)", "type(1, x=1)",
+    "str(1, 'utf-8')", "str('a', 'utf-8')", "str(b'\\xff', errors='replace')",
+    "str(memoryview(b'a'), 'ascii')", "str(b'a', encoding=1)", "str([1], errors='x')",
+]
+for c in cases:
+    try:
+        print(c, '->', repr(eval(c)))
+    except Exception as e:
+        print(c, '!', type(e).__name__, e)

@@ -6431,9 +6431,14 @@ pub fn call_builtin_function(
     // A keyword for a builtin that takes none is a TypeError, not a value to
     // drop on the floor. Central so every arm below can assume it away.
     reject_kwargs(name, &kwargs)?;
-    check_builtin_arity(name, args.len())?;
+    check_builtin_arity(name, args.len(), kwargs.len())?;
     match name {
         "print" => {
+            // `print(*args, sep=' ', end='\n', file=None, flush=False)`: every
+            // parameter after `*args` is keyword-only.
+            clinic_kw_check("print", 0, &kwargs, |k| {
+                ["sep", "end", "file", "flush"].iter().position(|n| *n == k)
+            })?;
             // `sep`/`end` are `None` (the default) or a `str`; anything else is
             // CPython's TypeError, where it used to be printed through `str()` —
             // so `print(x, end=None)` wrote a literal `None`.
@@ -7001,6 +7006,10 @@ pub fn call_builtin_function(
             if args.len() != 1 {
                 return Err(host::type_error("type() takes 1 or 3 arguments"));
             }
+            // `type_vectorcall`'s one-argument fast path: `_PyArg_NoKwnames`.
+            if !kwargs.is_empty() {
+                return Err(host::type_error("type() takes no keyword arguments"));
+            }
             // 1-arg form: the object's type.
             let v = arg0(&args)?;
             // A CPython object the bridge holds by handle: hand back CPython's
@@ -7406,6 +7415,8 @@ pub fn call_builtin_function(
             })))
         }
         "property" => {
+            let names = ["fget", "fset", "fdel", "doc"];
+            bind_named("property", names, 0, 0, KwStyle::Unexpected, &args, &kwargs)?;
             let fget = args
                 .first()
                 .cloned()
@@ -7529,6 +7540,20 @@ pub fn call_builtin_function(
         // and returns None. Both compile the source on the fly and re-enter the VM
         // on the current host (so names resolve against — and assignments land in —
         // the live module globals), exactly as the REPL runs a line.
+        // `eval(source, /, globals=None, locals=None)` and `exec(source, /,
+        // globals=None, locals=None, *, closure=None)`: the namespaces bind by
+        // keyword too. An unbound slot is `None`, which is what it defaults to.
+        "eval" | "exec" if !kwargs.is_empty() && !args.is_empty() => {
+            let bound: Vec<Option<Value>> = if name == "eval" {
+                let names = ["source", "globals", "locals"];
+                bind_named(name, names, 1, 0, KwStyle::Unexpected, &args, &kwargs)?.into()
+            } else {
+                let names = ["source", "globals", "locals", "closure"];
+                bind_named(name, names, 1, 0, KwStyle::Unexpected, &args, &kwargs)?.into()
+            };
+            let bound: Vec<Value> = bound.into_iter().map(|v| v.unwrap_or(Value::Undef)).collect();
+            run_pysource(name == "eval", &bound)
+        }
         "eval" | "exec" => run_pysource(name == "eval", &args),
         "compile" => builtin_compile(&args, &kwargs),
         // Type constructors.
@@ -7575,9 +7600,28 @@ pub fn call_builtin_function(
             let v = obj.unwrap_or_else(|| Value::str(""));
             // With an encoding, `str` DECODES a buffer rather than repr-ing it:
             // `str(b'ab', encoding='utf-8')` is `'ab'`, not `"b'ab'"`.
+            // `unicode_new_impl` → `PyUnicode_FromEncodedObject`: both text
+            // arguments are converted first, then only a buffer decodes.
             if enc.is_some() || errs.is_some() {
-                let dargs: Vec<Value> = [enc, errs].into_iter().flatten().collect();
-                return call_type_method(&v, "decode", dargs, vec![]);
+                let text = |a: Option<Value>, which: &str, default: &str| match a {
+                    None => Ok(new_str(default.to_string())),
+                    Some(a) if with_host(|h| h.as_str(&a)).is_some() => Ok(a),
+                    Some(a) => Err(host::type_error(&format!(
+                        "str() argument '{which}' must be str, not {}",
+                        with_host(|h| h.type_name(&a))
+                    ))),
+                };
+                let dargs = [text(enc, "encoding", "utf-8")?, text(errs, "errors", "strict")?];
+                if with_host(|h| h.as_str(&v)).is_some() {
+                    return Err(host::type_error("decoding str is not supported"));
+                }
+                let bytes = as_bytes_object(&v)?.ok_or_else(|| {
+                    host::type_error(&format!(
+                        "decoding to str: need a bytes-like object, {} found",
+                        with_host(|h| h.type_name(&v))
+                    ))
+                })?;
+                return decode_bytes(&bytes, &dargs);
             }
             let s = py_str(&v)?;
             Ok(with_host(|h| h.new_str(s)))
@@ -7805,9 +7849,20 @@ pub fn call_builtin_function(
             })
         }
         "open" => {
+            let names = [
+                "file",
+                "mode",
+                "buffering",
+                "encoding",
+                "errors",
+                "newline",
+                "closefd",
+                "opener",
+            ];
+            bind_named("open", names, 0, 1, KwStyle::Unexpected, &args, &kwargs)?;
             let file = kw_get(&kwargs, "file")
                 .or_else(|| args.first().cloned())
-                .ok_or_else(|| host::type_error("open() missing required argument: 'file'"))?;
+                .ok_or_else(|| host::type_error("open() missing required argument 'file' (pos 1)"))?;
             // `_io.open` takes any path-like `file` (`os.fspath`), and an
             // `OSError` names it by its `repr` — `b'…'` for a bytes path.
             let file = fspath(&file)?;
@@ -8010,7 +8065,7 @@ fn enumerate_args(
 /// The positional-count check each builtin's calling convention makes before
 /// it looks at an argument (`bltinmodule.c` and the type constructors), with
 /// the convention's own wording. Measured name by name against CPython 3.14.
-fn check_builtin_arity(name: &str, argc: usize) -> Result<(), String> {
+fn check_builtin_arity(name: &str, argc: usize, nkw: usize) -> Result<(), String> {
     let spec = match name {
         "aiter" | "all" | "any" | "ascii" | "bin" | "callable" | "chr" | "hash" | "hex" | "id"
         | "oct" | "ord" | "repr" => Arity::ExactlyOne,
@@ -8023,22 +8078,14 @@ fn check_builtin_arity(name: &str, argc: usize) -> Result<(), String> {
         | "input" => Arity::VarRange(0, 1),
         "int" => Arity::VarRange(0, 2),
         "str" => Arity::VarRange(0, 3),
-        // Argument Clinic functions with keyword-capable parameters.
-        "complex" | "eval" | "exec" | "memoryview" | "property" => {
-            let max = match name {
-                "complex" => 2,
-                "eval" => 3,
-                "exec" | "property" => 4,
-                _ => 1,
-            };
-            if argc > max {
-                return Err(host::type_error(&format!(
-                    "{name}() takes at most {max} argument{} ({argc} given)",
-                    if max == 1 { "" } else { "s" }
-                )));
-            }
-            return Ok(());
-        }
+        // Argument Clinic functions with keyword-capable parameters, whose
+        // total counts the keywords too: `memoryview(b'a', x=1)` is "takes at
+        // most 1 argument (2 given)" before the name `x` is looked at.
+        "complex" => Arity::ClinicRange(0, 2, 2),
+        "eval" => Arity::ClinicRange(1, 3, 3),
+        "exec" => Arity::ClinicRange(1, 3, 4),
+        "memoryview" => Arity::ClinicRange(0, 1, 1),
+        "property" => Arity::ClinicRange(0, 4, 4),
         "super" if argc > 2 => {
             return Err(host::type_error(&format!(
                 "super() expected at most 2 arguments, got {argc}"
@@ -8046,7 +8093,7 @@ fn check_builtin_arity(name: &str, argc: usize) -> Result<(), String> {
         }
         _ => return Ok(()),
     };
-    check_arity(name, name, spec, argc)
+    check_arity_kw(name, name, spec, argc, nkw)
 }
 
 /// Refuse a keyword for a builtin that takes none. See [`NO_KWARG_BUILTINS`].

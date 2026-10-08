@@ -10537,3 +10537,26 @@ fn complex_arithmetic_does_not_promote_a_real_operand() {
         assert_eq!(pythonrs::eval_str(src).unwrap_err(), err, "for {src}");
     }
 }
+
+// Builtins that take keywords check their names and bind them: an unknown name
+// is Argument Clinic's "unexpected keyword argument", and `eval`/`exec` take
+// their namespaces by keyword (3.13+). Each was dropped or ignored before.
+// Expected value: CPython 3.14's output for the same program.
+#[test]
+fn builtin_keywords_are_checked_and_bound() {
+    let src = r#"
+def r(f):
+    try:
+        return repr(f())
+    except TypeError as e:
+        return str(e)
+x = [r(lambda: print(1, flush=1, x=2, sep=3)), r(lambda: open('/dev/null', y=1)),
+     r(lambda: property(x=1)), r(lambda: eval('1', x=1)),
+     r(lambda: eval('x', globals={'x': 1})), r(lambda: eval('x', {}, locals={'x': 2})),
+     r(lambda: eval('x', {'x': 1}, globals={})), r(lambda: exec('y = 1', globals={}))]
+"#;
+    assert_eq!(
+        g(src, "x"),
+        r#"["print() got an unexpected keyword argument 'x'", "open() got an unexpected keyword argument 'y'", "property() got an unexpected keyword argument 'x'", "eval() got an unexpected keyword argument 'x'", '1', '2', "argument for eval() given by name ('globals') and position (2)", 'None']"#
+    );
+}
