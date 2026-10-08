@@ -2044,3 +2044,26 @@ for c in cases:
         print(c, '->', repr(eval(c)))
     except Exception as e:
         print(c, '!', type(e).__name__, e)
+#==#
+# ── keywords refused by builtin methods of every type, and clinic name checks ─
+# A keyword to a method that takes none used to be dropped (`{1}.update(x=…)`
+# returned None, `(1).bit_length(x=1)` answered) or misreported as a missing
+# argument; `int.from_bytes`/`to_bytes` never checked their keyword names.
+import collections
+cases = [
+    "(1, 2).index(value=1)", "(1, 2).count(x=1)", "{1}.add(x=1)", "set().update(x=[1])",
+    "frozenset({1}).union(x=1)", "collections.deque([1]).append(x=1)",
+    "collections.deque([1]).rotate(n=1)", "range(3).count(value=1)", "slice(1, 2).indices(length=3)",
+    "(1).bit_length(x=1)", "(1.5).hex(x=1)", "(1j).conjugate(x=1)", "{}.get(key=1)", "{}.pop(k=1)",
+    "[].append(object=1)", "[3, 1].index(value=3)", "{1: 2}.setdefault(key=1)",
+    "memoryview(b'ab').tolist(x=1)", "memoryview(b'abc').hex(sep=':', bytes_per_sep=2)",
+    "(i for i in [1]).send(value=1)", "dict.fromkeys(iterable=[1])", "bytes.fromhex(string='61')",
+    "float.fromhex(string='1')", "int.from_bytes(bytes=b'\\x01', byteorder='little', signed=True)",
+    "int.from_bytes(b'\\x01', bytes=b'')", "(1).to_bytes(1, length=2)",
+    "(1).to_bytes(2, 'little', byteorder='big')", "(-1).to_bytes(2, signed=True)",
+]
+for c in cases:
+    try:
+        print(c, '->', repr(eval(c)))
+    except Exception as e:
+        print(c, '!', type(e).__name__, e)

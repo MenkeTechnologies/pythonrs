@@ -6151,6 +6151,22 @@ pub fn call_builtin_function(
             }
         });
     }
+    // The positional-only alternate constructors refuse any keyword before
+    // looking at their arguments, as their method descriptors do.
+    if !kwargs.is_empty()
+        && matches!(
+            name,
+            "dict.fromkeys"
+                | "defaultdict.fromkeys"
+                | "bytes.fromhex"
+                | "bytearray.fromhex"
+                | "float.fromhex"
+                | "float.from_number"
+                | "complex.from_number"
+        )
+    {
+        return Err(host::type_error(&format!("{name}() takes no keyword arguments")));
+    }
     // `dict.fromkeys(iterable[, value])` reached via a dict type object.
     match name {
         "dict.fromkeys" => return dict_fromkeys(None, &args),
@@ -16931,6 +16947,9 @@ pub fn call_type_method(
         "bytearray" => {
             bytearray_method(recv, name, &fold_method_kwargs(&tn, name, &args, &kwargs)?)
         }
+        "memoryview" if name == "hex" => {
+            memoryview_method(recv, name, &fold_method_kwargs(&tn, name, &args, &kwargs)?)
+        }
         "memoryview" => memoryview_method(recv, name, &args),
         "list" => list_method(recv, name, &args, &kwargs),
         "dict" => dict_method(recv, name, &args, &kwargs),
@@ -17424,7 +17443,7 @@ fn method_kwarg_pos(bytes: bool, method: &str, kw: &str) -> Option<usize> {
 fn method_accepts_kwargs(bytes: bool, method: &str) -> bool {
     match method {
         "split" | "rsplit" | "expandtabs" | "splitlines" => true,
-        "encode" | "replace" => !bytes,
+        "encode" | "replace" | "format" => !bytes,
         "decode" | "hex" | "translate" => bytes,
         _ => false,
     }
@@ -17438,6 +17457,46 @@ fn method_accepts_kwargs(bytes: bool, method: &str) -> bool {
 /// is reported first (lowest position wins), then the first keyword naming no
 /// parameter at all. Unfilled interior slots become `Value::Undef`, which the
 /// bodies read as the parameter's `None` default.
+/// The keyword-name checks `_PyArg_UnpackKeywords` makes once the argument
+/// count has passed, in its order: a parameter supplied both by position and
+/// by name is reported first (the lowest position wins), then the first
+/// keyword naming no keyword-capable parameter. `pos_of` gives a keyword's
+/// parameter index, `None` for a name the function does not take by keyword.
+fn clinic_kw_check(
+    fname: &str,
+    nargs: usize,
+    kwargs: &[(String, Value)],
+    pos_of: impl Fn(&str) -> Option<usize>,
+) -> Result<(), String> {
+    let dup = kwargs
+        .iter()
+        .filter_map(|(k, _)| pos_of(k).filter(|&p| p < nargs).map(|p| (p, k)))
+        .min_by_key(|&(p, _)| p);
+    if let Some((pos, k)) = dup {
+        return Err(host::type_error(&format!(
+            "argument for {fname}() given by name ('{k}') and position ({})",
+            pos + 1
+        )));
+    }
+    if let Some((k, _)) = kwargs.iter().find(|(k, _)| pos_of(k).is_none()) {
+        return Err(host::type_error(&format!(
+            "{fname}() got an unexpected keyword argument '{k}'"
+        )));
+    }
+    Ok(())
+}
+
+/// [`clinic_kw_check`] for a function whose keyword-capable parameters are
+/// `names`, in parameter order from the first.
+fn clinic_kw_names(
+    fname: &str,
+    names: &[&str],
+    nargs: usize,
+    kwargs: &[(String, Value)],
+) -> Result<(), String> {
+    clinic_kw_check(fname, nargs, kwargs, |k| names.iter().position(|n| *n == k))
+}
+
 fn fold_method_kwargs(
     tn: &str,
     method: &str,
@@ -17453,28 +17512,10 @@ fn fold_method_kwargs(
             "{tn}.{method}() takes no keyword arguments"
         )));
     }
-    let named: Vec<(Option<usize>, &String, &Value)> = kwargs
-        .iter()
-        .map(|(k, v)| (method_kwarg_pos(bytes, method, k), k, v))
-        .collect();
-    if let Some((pos, k, _)) = named
-        .iter()
-        .filter_map(|&(p, k, v)| p.filter(|&p| p < args.len()).map(|p| (p, k, v)))
-        .min_by_key(|&(p, _, _)| p)
-    {
-        return Err(host::type_error(&format!(
-            "argument for {method}() given by name ('{k}') and position ({})",
-            pos + 1
-        )));
-    }
-    if let Some((_, k, _)) = named.iter().find(|(p, _, _)| p.is_none()) {
-        return Err(host::type_error(&format!(
-            "{method}() got an unexpected keyword argument '{k}'"
-        )));
-    }
+    clinic_kw_check(method, args.len(), kwargs, |k| method_kwarg_pos(bytes, method, k))?;
     let mut out: Vec<Option<Value>> = args.iter().cloned().map(Some).collect();
-    for (pos, _, v) in named {
-        let pos = pos.unwrap_or_default();
+    for (k, v) in kwargs {
+        let pos = method_kwarg_pos(bytes, method, k).unwrap_or_default();
         if pos >= out.len() {
             out.resize(pos + 1, None);
         }
@@ -18753,15 +18794,36 @@ fn parse_markup_field(chars: &[char], pos: &mut usize) -> Result<MarkupField, St
 /// `'a'.center(fillchar='x')` is "str.center() takes no keyword arguments",
 /// not a missing `width`.
 fn check_builtin_method_call(tn: &str, name: &str, nargs: usize, nkw: usize) -> Result<(), String> {
-    let Some(spec) = builtin_method_arity(tn, name) else {
-        return Ok(());
-    };
-    let qual = format!("{}.{name}", if tn == "bool" { "int" } else { tn });
-    let text_like = matches!(tn, "str" | "bytes" | "bytearray");
-    if text_like && nkw > 0 && !method_accepts_kwargs(tn != "str", name) {
-        return Err(host::type_error(&format!("{qual}() takes no keyword arguments")));
+    let qual = || format!("{}.{name}", if tn == "bool" { "int" } else { tn });
+    if nkw > 0 && refuses_kwargs(tn, name) {
+        return Err(host::type_error(&format!("{}() takes no keyword arguments", qual())));
     }
-    check_arity_kw(name, &qual, spec, nargs, nkw)
+    match builtin_method_arity(tn, name) {
+        Some(spec) => check_arity_kw(name, &qual(), spec, nargs, nkw),
+        None => Ok(()),
+    }
+}
+
+/// Whether `tn.name` is a builtin method whose descriptor refuses keyword
+/// arguments outright (`METH_O`, `METH_NOARGS`, `METH_VARARGS`, or a clinic
+/// signature that is all positional-only): `(1, 2).index(value=1)` is
+/// "tuple.index() takes no keyword arguments", whatever the count. The
+/// exceptions are the methods with a keyword-capable parameter. Dunders are
+/// left out — a slot wrapper words the refusal differently.
+fn refuses_kwargs(tn: &str, name: &str) -> bool {
+    if name.starts_with("__") || !type_has_method(tn, name) {
+        return false;
+    }
+    match tn {
+        "str" | "bytes" | "bytearray" => !method_accepts_kwargs(tn != "str", name),
+        "list" => name != "sort",
+        "dict" => name != "update",
+        "int" | "bool" => !matches!(name, "to_bytes" | "from_bytes"),
+        "memoryview" => !matches!(name, "hex" | "tobytes" | "cast"),
+        "tuple" | "set" | "frozenset" | "range" | "slice" | "deque" | "float" | "complex"
+        | "generator" => true,
+        _ => false,
+    }
 }
 
 /// The argument-count contract of a method of `str`/`bytes`/`bytearray`,
@@ -20416,6 +20478,8 @@ fn float_hex(f: f64) -> String {
 /// CPython: unsigned negatives and values too large for `length` raise
 /// `OverflowError`; signed values use two's complement sign extension.
 fn int_to_bytes(recv: &Value, args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, String> {
+    // `to_bytes(length=1, byteorder='big', *, signed=False)`.
+    clinic_kw_names("to_bytes", &["length", "byteorder", "signed"], args.len(), kwargs)?;
     let length = match args.first().cloned().or_else(|| kw_get(kwargs, "length")) {
         Some(v) => {
             let n = match with_host(|h| h.index_fit(&v)) {
@@ -20595,7 +20659,11 @@ fn ldexp(base: f64, exp: i64) -> f64 {
 /// `int.from_bytes(bytes, byteorder='big', *, signed=False)` — build an int from
 /// a bytes-like object or an iterable of ints. Faithful to CPython.
 fn int_from_bytes(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, String> {
-    let src = args.first().ok_or_else(|| {
+    // `from_bytes(bytes, byteorder='big', *, signed=False)`: the name checks
+    // `_PyArg_UnpackKeywords` makes once the count has passed.
+    clinic_kw_names("from_bytes", &["bytes", "byteorder", "signed"], args.len(), kwargs)?;
+    let src = args.first().cloned().or_else(|| kw_get(kwargs, "bytes"));
+    let src = &src.ok_or_else(|| {
         host::type_error("from_bytes() missing required argument 'bytes' (pos 1)")
     })?;
     let mut bytes: Vec<u8> = match with_host(|h| match h.get(src) {
