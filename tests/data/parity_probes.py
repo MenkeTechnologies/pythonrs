@@ -2277,3 +2277,28 @@ for n, o in objs.items():
             except Exception as e:
                 r = type(e).__name__
             print(n, d, len(a), sorted(kw), r)
+#==#
+# ── Counter/defaultdict through __getitem__ and del ──────────────────────────
+# `Counter().__getitem__(k)` raised KeyError where `dict_subscript` runs
+# `__missing__`, and `del counter[missing]` raised where `Counter.__delitem__`
+# forgives it.
+import collections
+c = collections.Counter({'a': 1})
+print(c['z'], 'z' in c, c.__getitem__('z'))
+d = collections.defaultdict(list)
+print(d.__getitem__('q'), dict(d))
+class D(dict):
+    def __missing__(self, k): return k * 2
+print(D().__getitem__(3), D()[3])
+del c['nope']
+c.__delitem__('also-missing')
+print(c)
+# The unhashable-key wording moved in 3.13; the exception type did not.
+for stmt in ["del c[[1]]", "c.__delitem__([1])", "del collections.defaultdict(int)['x']"]:
+    try:
+        exec(stmt)
+        print(stmt, 'ok')
+    except Exception as e:
+        print(stmt, '!', type(e).__name__)
+del c['a']
+print(c, c.__getitem__('a'))

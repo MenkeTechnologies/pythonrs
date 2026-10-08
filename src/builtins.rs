@@ -949,10 +949,16 @@ fn subscript_store(recv: &Value, idx: Value, val: Value) -> Result<(), String> {
 fn b_delitem(vm: &mut VM, _: u8) -> Value {
     let idx = vm.pop();
     let recv = vm.pop();
-    // Same fast path as `b_setitem`, and sound for the same reasons.
-    if let Some(r) =
-        with_host(|h| fast_store(h, &recv, &idx, &Value::Undef).then(|| h.del_item(&recv, &idx)))
-    {
+    // Same fast path as `b_setitem`, and sound for the same reasons — except for
+    // a `Counter`, whose `__delitem__` forgives a missing element.
+    let is_counter = |h: &host::PyHost| {
+        matches!(&recv, Value::Obj(i)
+            if h.dict_meta.get(i).is_some_and(|m| m.kind == host::DictKind::Counter))
+    };
+    if let Some(r) = with_host(|h| {
+        (fast_store(h, &recv, &idx, &Value::Undef) && !is_counter(h))
+            .then(|| h.del_item(&recv, &idx))
+    }) {
         return match r {
             Ok(()) => Value::Undef,
             Err(e) => abort(vm, e),
@@ -982,6 +988,13 @@ fn b_delitem(vm: &mut VM, _: u8) -> Value {
 /// the other does not is a divergence by construction.
 fn subscript_delete(recv: &Value, idx: Value) -> Result<(), String> {
     let recv = recv.clone();
+    // `Counter.__delitem__` is `if elem in self: super().__delitem__(elem)` —
+    // deleting a missing element is a no-op, not a KeyError.
+    if host::dict_meta_of(&recv).is_some_and(|m| m.kind == host::DictKind::Counter)
+        && !with_host(|h| h.contains(&idx, &recv))?
+    {
+        return Ok(());
+    }
     // `del seq[Idx():Idx()]` — resolve `__index__` slice bounds (recv is a
     // builtin sequence here; instances were dispatched to `__delitem__` above).
     // Same receiver-not-index test as `subscript_store`: `del d[slice(1, 2)]`
@@ -17096,6 +17109,13 @@ pub fn call_type_method(
         "__len__" => return Ok(Value::Int(py_len(recv)? as i64)),
         "__getitem__" => {
             let k = arg0(&args)?;
+            // `dict.__getitem__` is `dict_subscript`, which consults a
+            // subclass's `__missing__` on a miss — `Counter().__getitem__(k)`
+            // is 0 and `defaultdict.__getitem__` inserts the default, exactly
+            // as the subscript does.
+            if host::dict_meta_of(recv).is_some() {
+                return getitem_value(recv.clone(), k);
+            }
             // `b_getitem` resolves an `__index__` subscript (and a slice's
             // `__index__` bounds) before indexing; the dunder call has to do the
             // same or `a.__getitem__(Idx(1))` reads what `a[Idx(1)]` cannot.
