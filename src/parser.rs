@@ -653,6 +653,10 @@ struct Parser {
     /// The source lines, for converting a token's character column to the
     /// UTF-8 byte column CPython's AST positions are in (see [`Loc`]).
     lines: Vec<String>,
+    /// Inside `expression_without_invalid`: the expressions read are the
+    /// items of an `invalid_expression` match being tried, under which pegen
+    /// runs no `invalid_*` rule. See [`Parser::string_interrupted`].
+    without_invalid: bool,
 }
 
 /// Wrap a caret-bearing expression with its source span. `anchor_start ==
@@ -689,6 +693,7 @@ impl Parser {
             misplaced: None,
             groups: std::collections::HashMap::new(),
             lines: src.lines().map(str::to_string).collect(),
+            without_invalid: false,
         }
     }
 
@@ -3230,6 +3235,62 @@ impl Parser {
     /// each one level up; the `else` branch is another `expression`, so a chain
     /// of them costs one level per `else`.
     fn parse_ternary(&mut self) -> Result<Expr, String> {
+        let start = self.pos;
+        let e = self.parse_ternary_inner()?;
+        if !self.without_invalid && self.starts_expression() {
+            self.string_interrupted(start)?;
+        }
+        Ok(e)
+    }
+
+    /// The first alternative of CPython 3.14's `invalid_expression`:
+    /// `STRING (!STRING expression_without_invalid)+ STRING` — an expression
+    /// that opens with a string literal, runs into more expressions, and
+    /// closes on another string, the shape of a quote typed inside a string
+    /// (`'it's'`). Tried only where the expression read from `start` is
+    /// followed by the start of another one, which no valid program has. It
+    /// underlines the expressions between the two strings, each at its AST
+    /// position (a parenthesized group at what it encloses); when the shape
+    /// does not match, the parser is left where it was.
+    fn string_interrupted(&mut self, start: usize) -> Result<(), String> {
+        let is_string = |t: &Tok| matches!(t, Tok::Str(_) | Tok::Bytes(_));
+        if !is_string(&self.toks[start].tok) {
+            return Ok(());
+        }
+        let (saved_pos, saved_level) = (self.pos, self.level);
+        self.pos = start + 1;
+        self.without_invalid = true;
+        let mut items: Vec<(usize, usize)> = Vec::new();
+        while !is_string(self.cur()) && self.starts_expression() {
+            let item_start = self.pos;
+            if self.parse_ternary_inner().is_err() {
+                break;
+            }
+            items.push((item_start, self.pos - 1));
+        }
+        self.without_invalid = false;
+        let closed = is_string(self.cur());
+        self.pos = saved_pos;
+        self.level = saved_level;
+        let (Some(&first), Some(&last), true) = (items.first(), items.last(), closed) else {
+            return Ok(());
+        };
+        // A group has no node of its own: `'a' (x) 'b'` underlines the `x`.
+        let ungroup = |(mut a, mut b): (usize, usize)| {
+            while matches!(self.groups.get(&a), Some(&(close, _, _)) if close == b) {
+                a += 1;
+                b -= 1;
+            }
+            (a, b)
+        };
+        Err(self.err_span(
+            "invalid syntax. Is this intended to be part of the string?",
+            ungroup(first).0,
+            ungroup(last).1,
+        ))
+    }
+
+    fn parse_ternary_inner(&mut self) -> Result<Expr, String> {
         let saved = self.rule(1)?;
         if self.at_kw("lambda") {
             let e = self.parse_lambda()?;

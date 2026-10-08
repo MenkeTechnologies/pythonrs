@@ -269,6 +269,36 @@ SyntaxError: '(' was never closed
 "#,
         1,
     ),
+    // `invalid_expression`'s first alternative: a string, expressions, then a
+    // string. The underline spans the expressions between, a unary `+` among
+    // them, and a parenthesized one at what it encloses.
+    (
+        r#"print("it's" + 'it' s 'x')"#,
+        r#"  File "<string>", line 1
+    print("it's" + 'it' s 'x')
+                 ^^^^^^^^
+SyntaxError: invalid syntax. Is this intended to be part of the string?
+"#,
+        1,
+    ),
+    (
+        "x = ('a' (y) z 'b')",
+        r#"  File "<string>", line 1
+    x = ('a' (y) z 'b')
+              ^^^^
+SyntaxError: invalid syntax. Is this intended to be part of the string?
+"#,
+        1,
+    ),
+    (
+        "f(b'a' x + 1 y 'b')",
+        r#"  File "<string>", line 1
+    f(b'a' x + 1 y 'b')
+           ^^^^^^^
+SyntaxError: invalid syntax. Is this intended to be part of the string?
+"#,
+        1,
+    ),
 ];
 
 #[test]
