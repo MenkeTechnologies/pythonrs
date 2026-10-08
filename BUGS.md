@@ -2509,8 +2509,9 @@ written.
 - **`dir()` of a native non-type VALUE is short or empty.** `dir()` of the 13
   builtin types (and their values) is CPython's full listing, but the other
   native kinds still come back empty — a function, a bound or unbound method, a
-  builtin function, `super`, `staticmethod`/`classmethod`, a code object, the
-  container iterators — or partial (an exception lacks `args`/`__traceback__`/
+  builtin function, `super`, `staticmethod`/`classmethod`, a code object — or
+  partial (a container iterator lacks `__length_hint__`/`__setstate__`; an
+  exception lacks `args`/`__traceback__`/
   `__cause__`/`__context__`/`__suppress_context__`/`__dict__`/`__setstate__`;
   `dict_keys`/`dict_items` lack the set operators and `mapping`; `memoryview`
   lacks `cast`/`count`/`index`/`toreadonly`/`suboffsets`/`__enter__`/`__exit__`).
