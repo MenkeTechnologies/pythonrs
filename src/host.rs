@@ -6849,6 +6849,23 @@ impl PyHost {
         }
     }
 
+    /// `v` as one byte — CPython's `_getbytevalue`, which every `bytearray`
+    /// store goes through (`ba[i] = v`, `append`, `insert`, `remove`): any
+    /// integer converts, and one outside `0..256`, however large, is a RANGE
+    /// error rather than a type one.
+    pub fn byte_value(&self, v: &Value) -> Result<u8, String> {
+        match self.index_fit(v) {
+            IndexFit::Fits(n) if (0..=255).contains(&n) => Ok(n as u8),
+            IndexFit::Fits(_) | IndexFit::TooLarge(_) => {
+                Err("ValueError: byte must be in range(0, 256)".into())
+            }
+            IndexFit::NotInt => Err(type_error(&format!(
+                "'{}' object cannot be interpreted as an integer",
+                self.type_name(v)
+            ))),
+        }
+    }
+
     /// How `v` reads as a `Py_ssize_t`. [`PyHost::as_int`] collapses the two
     /// failures — "not an integer" and "an integer that does not fit" — into one
     /// `None`, and every index site then reported the first, so `[1][10**30]`
@@ -11053,26 +11070,9 @@ impl PyHost {
                 if k < 0 || k >= n {
                     return Err("IndexError: bytearray index out of range".into());
                 }
-                // `bytearray[i] = huge` is a RANGE error, not a type one:
-                // `PyNumber_AsSsize_t` succeeds on any int and the 0..256 check
-                // is what rejects it.
-                let v = match self.index_fit(&val) {
-                    IndexFit::Fits(v) => v,
-                    IndexFit::TooLarge(_) => {
-                        return Err("ValueError: byte must be in range(0, 256)".into())
-                    }
-                    IndexFit::NotInt => {
-                        return Err(type_error(&format!(
-                            "'{}' object cannot be interpreted as an integer",
-                            self.type_name(&val)
-                        )))
-                    }
-                };
-                if !(0..=255).contains(&v) {
-                    return Err("ValueError: byte must be in range(0, 256)".into());
-                }
+                let v = self.byte_value(&val)?;
                 if let Some(PyObj::Bytearray(b)) = self.get_mut(recv) {
-                    b[k as usize] = v as u8;
+                    b[k as usize] = v;
                 }
                 Ok(())
             }

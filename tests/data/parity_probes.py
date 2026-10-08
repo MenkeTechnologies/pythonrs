@@ -2107,3 +2107,24 @@ for d in ({'ab': 1}, {1.0: 1}):
         str.maketrans(d)
     except Exception as e:
         print(type(e).__name__)
+#==#
+# ── index and byte arguments of list/deque/bytearray mutators ────────────────
+# `bytearray.pop(i)` ignored `i` and popped the last byte; `insert`/`pop`
+# read a non-integer or bignum index as 0 or "no index"; `bytearray` byte
+# values said "an integer is required" where `_getbytevalue` names the type.
+import collections
+cases = [
+    "bytearray(b'abc').pop(0)", "bytearray(b'abc').pop(-3)", "bytearray(b'abc').pop(5)",
+    "bytearray(b'abc').pop('a')", "bytearray(b'abc').remove(300)", "bytearray(b'abc').remove('a')",
+    "bytearray(b'a').insert(0, 'a')", "bytearray(b'a').insert('a', 1)", "bytearray(b'a').insert(2**70, 1)",
+    "bytearray(b'a').append('a')", "bytearray(b'a').append(2**70)", "bytearray(b'a').append(1.0)",
+    "[1].insert('a', 0)", "[1].insert(2**70, 0)", "[1].pop('a')", "[1].pop(2**70)", "[1].pop(None)",
+    "collections.deque([1]).insert('a', 1)", "collections.deque([1]).insert(2**70, 1)",
+]
+for c in cases:
+    try:
+        print(c, '->', repr(eval(c)))
+    except Exception as e:
+        print(c, '!', type(e).__name__, e)
+ba = bytearray(b'abcd')
+print(ba.pop(1), ba.pop(-1), ba)

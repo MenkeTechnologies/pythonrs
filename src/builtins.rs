@@ -18989,8 +18989,7 @@ fn list_method(
             Ok(Value::Undef)
         }
         "insert" => {
-            let a0 = arg0(args)?;
-            let idx = with_host(|h| h.as_int(&a0)).unwrap_or(0);
+            let idx = ssize_arg(&arg0(args)?)?;
             let v = args.get(1).cloned().unwrap_or(Value::Undef);
             with_host(|h| {
                 if let Some(PyObj::List(l)) = h.get_mut(recv) {
@@ -19006,7 +19005,7 @@ fn list_method(
             Ok(Value::Undef)
         }
         "pop" => {
-            let idx = args.first().and_then(|v| with_host(|h| h.as_int(v)));
+            let idx = args.first().map(ssize_arg).transpose()?;
             with_host(|h| {
                 if let Some(PyObj::List(l)) = h.get_mut(recv) {
                     if l.is_empty() {
@@ -21590,15 +21589,10 @@ fn bytearray_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, S
     // bytearray-only mutators; everything else shares the bytes methods.
     match name {
         "append" => {
-            let a0 = arg0(args)?;
-            let n = with_host(|h| h.as_int(&a0))
-                .ok_or_else(|| host::type_error("an integer is required"))?;
-            if !(0..=255).contains(&n) {
-                return Err("ValueError: byte must be in range(0, 256)".into());
-            }
+            let n = with_host(|h| h.byte_value(&arg0(args)?))?;
             with_host(|h| {
                 if let Some(PyObj::Bytearray(b)) = h.get_mut(recv) {
-                    b.push(n as u8);
+                    b.push(n);
                 }
             });
             Ok(Value::Undef)
@@ -21613,33 +21607,38 @@ fn bytearray_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, S
             });
             Ok(Value::Undef)
         }
+        // `bytearray_insert_impl(index: Py_ssize_t, item: bytesvalue)`: the
+        // index clamps like `list.insert` (negative from the end, out of range
+        // to [0, len]).
         "insert" => {
-            let idx_v = arg0(args)?;
-            let val_v = args.get(1).cloned().unwrap_or(Value::Undef);
-            let idx = with_host(|h| h.as_int(&idx_v)).unwrap_or(0);
-            let n = with_host(|h| h.as_int(&val_v))
-                .ok_or_else(|| host::type_error("an integer is required"))?;
-            if !(0..=255).contains(&n) {
-                return Err("ValueError: byte must be in range(0, 256)".into());
-            }
+            let idx = ssize_arg(&arg0(args)?)?;
+            let n = with_host(|h| h.byte_value(&args.get(1).cloned().unwrap_or(Value::Undef)))?;
             with_host(|h| {
                 if let Some(PyObj::Bytearray(b)) = h.get_mut(recv) {
-                    // CPython clamps the index like list.insert (negative from
-                    // the end, out-of-range to [0, len]).
                     let len = b.len() as i64;
                     let i = (if idx < 0 { idx + len } else { idx }).clamp(0, len) as usize;
-                    b.insert(i, n as u8);
+                    b.insert(i, n);
                 }
             });
             Ok(Value::Undef)
         }
+        // `bytearray_pop_impl(index: Py_ssize_t = -1)`.
         "pop" => {
-            let got = with_host(|h| match h.get_mut(recv) {
-                Some(PyObj::Bytearray(b)) => b.pop(),
-                _ => None,
-            });
-            got.map(|x| Value::Int(x as i64))
-                .ok_or_else(|| "IndexError: pop from empty bytearray".into())
+            let idx = args.first().map(ssize_arg).transpose()?.unwrap_or(-1);
+            with_host(|h| match h.get_mut(recv) {
+                Some(PyObj::Bytearray(b)) => {
+                    if b.is_empty() {
+                        return Err("IndexError: pop from empty bytearray".to_string());
+                    }
+                    let n = b.len() as i64;
+                    let k = if idx < 0 { idx + n } else { idx };
+                    if k < 0 || k >= n {
+                        return Err("IndexError: pop index out of range".to_string());
+                    }
+                    Ok(Value::Int(b.remove(k as usize) as i64))
+                }
+                _ => Err(host::type_error("not a bytearray")),
+            })
         }
         "reverse" => {
             with_host(|h| {
@@ -21650,11 +21649,10 @@ fn bytearray_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, S
             Ok(Value::Undef)
         }
         "remove" => {
-            let a0 = arg0(args)?;
-            let n = with_host(|h| h.as_int(&a0)).unwrap_or(-1);
+            let n = with_host(|h| h.byte_value(&arg0(args)?))?;
             let removed = with_host(|h| {
                 if let Some(PyObj::Bytearray(b)) = h.get_mut(recv) {
-                    if let Some(pos) = b.iter().position(|&x| x as i64 == n) {
+                    if let Some(pos) = b.iter().position(|&x| x == n) {
                         b.remove(pos);
                         return true;
                     }
@@ -22573,10 +22571,7 @@ fn deque_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, Strin
         // and may be negative. Unlike `append`, a full bounded deque REFUSES the
         // insert rather than silently evicting from the far end.
         "insert" => {
-            let idx = args
-                .first()
-                .and_then(|v| with_host(|h| h.as_int(v)))
-                .ok_or_else(|| host::type_error("insert() argument 1 must be an integer"))?;
+            let idx = ssize_arg(&arg0(args)?)?;
             let v = args
                 .get(1)
                 .cloned()
