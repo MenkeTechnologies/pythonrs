@@ -6216,7 +6216,9 @@ pub fn call_builtin_function(
                 | "complex.from_number"
         )
     {
-        return Err(host::type_error(&format!("{name}() takes no keyword arguments")));
+        return Err(host::type_error(&format!(
+            "{name}() takes no keyword arguments"
+        )));
     }
     // `dict.fromkeys(iterable[, value])` reached via a dict type object.
     match name {
@@ -7603,7 +7605,10 @@ pub fn call_builtin_function(
                 let names = ["source", "globals", "locals", "closure"];
                 bind_named(name, names, 1, 0, KwStyle::Unexpected, &args, &kwargs)?.into()
             };
-            let bound: Vec<Value> = bound.into_iter().map(|v| v.unwrap_or(Value::Undef)).collect();
+            let bound: Vec<Value> = bound
+                .into_iter()
+                .map(|v| v.unwrap_or(Value::Undef))
+                .collect();
             run_pysource(name == "eval", &bound)
         }
         "eval" | "exec" => run_pysource(name == "eval", &args),
@@ -7663,7 +7668,10 @@ pub fn call_builtin_function(
                         with_host(|h| h.type_name(&a))
                     ))),
                 };
-                let dargs = [text(enc, "encoding", "utf-8")?, text(errs, "errors", "strict")?];
+                let dargs = [
+                    text(enc, "encoding", "utf-8")?,
+                    text(errs, "errors", "strict")?,
+                ];
                 if with_host(|h| h.as_str(&v)).is_some() {
                     return Err(host::type_error("decoding str is not supported"));
                 }
@@ -7914,7 +7922,9 @@ pub fn call_builtin_function(
             bind_named("open", names, 0, 1, KwStyle::Unexpected, &args, &kwargs)?;
             let file = kw_get(&kwargs, "file")
                 .or_else(|| args.first().cloned())
-                .ok_or_else(|| host::type_error("open() missing required argument 'file' (pos 1)"))?;
+                .ok_or_else(|| {
+                    host::type_error("open() missing required argument 'file' (pos 1)")
+                })?;
             // `_io.open` takes any path-like `file` (`os.fspath`), and an
             // `OSError` names it by its `repr` — `b'…'` for a bytes path.
             let file = fspath(&file)?;
@@ -14827,9 +14837,7 @@ fn own_dir_names(typename: &str) -> Vec<&'static str> {
             "empty",
             "full",
         ]),
-        t if is_iter_protocol_type(t) => {
-            out.extend_from_slice(&["__next__", "__iter__"])
-        }
+        t if is_iter_protocol_type(t) => out.extend_from_slice(&["__next__", "__iter__"]),
         t if is_exception_class(t) => {
             out.extend_from_slice(&["with_traceback", "add_note"]);
             // PEP 654 adds the group protocol on top of `BaseException`'s.
@@ -14998,9 +15006,7 @@ pub fn type_has_method(typename: &str, name: &str) -> bool {
         // Every lazy iterator answers the iterator protocol as bound methods.
         // `threading` takes `itertools.count().__next__` as its name counter, and
         // reaching `__next__` only through `next(it)` was not enough.
-        _ if is_iter_protocol_type(typename) => {
-            return matches!(name, "__next__" | "__iter__")
-        }
+        _ if is_iter_protocol_type(typename) => return matches!(name, "__next__" | "__iter__"),
         "coroutine" => return GENERATOR_METHODS.contains(&name) || name == "__await__",
         "async_generator" => {
             return matches!(
@@ -16822,9 +16828,9 @@ fn float_getformat(arg: Option<&Value>) -> Result<Value, String> {
 /// `wrap_hashfunc` (none) or `wrap_binaryfunc[_l/_r]`/`wrap_richcmpfunc` (one).
 fn slot_wrapper_arity(name: &str) -> Option<(usize, usize)> {
     match name {
-        "__next__" | "__iter__" | "__len__" | "__repr__" | "__str__" | "__hash__"
-        | "__bool__" | "__neg__" | "__pos__" | "__abs__" | "__invert__" | "__int__"
-        | "__float__" | "__index__" => Some((0, 0)),
+        "__next__" | "__iter__" | "__len__" | "__repr__" | "__str__" | "__hash__" | "__bool__"
+        | "__neg__" | "__pos__" | "__abs__" | "__invert__" | "__int__" | "__float__"
+        | "__index__" => Some((0, 0)),
         "__pow__" | "__rpow__" => Some((1, 2)),
         _ if comparison_dunder_op(name).is_some() => Some((1, 1)),
         _ => {
@@ -16832,8 +16838,19 @@ fn slot_wrapper_arity(name: &str) -> Option<(usize, usize)> {
             let binop = |o: &str| {
                 matches!(
                     o,
-                    "add" | "sub" | "mul" | "matmul" | "truediv" | "floordiv" | "mod"
-                        | "divmod" | "lshift" | "rshift" | "and" | "or" | "xor"
+                    "add"
+                        | "sub"
+                        | "mul"
+                        | "matmul"
+                        | "truediv"
+                        | "floordiv"
+                        | "mod"
+                        | "divmod"
+                        | "lshift"
+                        | "rshift"
+                        | "and"
+                        | "or"
+                        | "xor"
                 )
             };
             let op = name.strip_prefix("__")?.strip_suffix("__")?;
@@ -16856,8 +16873,19 @@ fn is_c_slot_type(tn: &str) -> bool {
         || tn.starts_with("itertools.")
         || matches!(
             native_type_key(tn),
-            "zip" | "map" | "filter" | "enumerate" | "reversed" | "generator" | "NoneType"
-                | "deque" | "defaultdict" | "OrderedDict" | "dict_keys" | "dict_values" | "dict_items"
+            "zip"
+                | "map"
+                | "filter"
+                | "enumerate"
+                | "reversed"
+                | "generator"
+                | "NoneType"
+                | "deque"
+                | "defaultdict"
+                | "OrderedDict"
+                | "dict_keys"
+                | "dict_values"
+                | "dict_items"
         )
 }
 
@@ -16871,7 +16899,10 @@ fn check_slot_wrapper_call(
     kwargs: &[(String, Value)],
 ) -> Result<(), String> {
     let tn = with_host(|h| h.type_name(recv));
-    if matches!(name, "__getitem__" | "__setitem__" | "__delitem__" | "__contains__") {
+    if matches!(
+        name,
+        "__getitem__" | "__setitem__" | "__delitem__" | "__contains__"
+    ) {
         return check_container_dunder_call(&tn, name, args, kwargs);
     }
     let Some((min, max)) = slot_wrapper_arity(name) else {
@@ -17528,12 +17559,25 @@ fn property_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
                 doc.unwrap_or(Value::Undef),
             )
         }
-        _ => (Value::Undef, Value::Undef, Value::Undef, String::new(), false, Value::Undef),
+        _ => (
+            Value::Undef,
+            Value::Undef,
+            Value::Undef,
+            String::new(),
+            false,
+            Value::Undef,
+        ),
     });
     // `property_copy`: an accessor passed as None keeps the original's, so
     // `p.setter(None)` copies `p` rather than dropping its setter.
     let f = args.first().cloned().unwrap_or(Value::Undef);
-    let keep = |new: Value, old: Value| if matches!(new, Value::Undef) { old } else { new };
+    let keep = |new: Value, old: Value| {
+        if matches!(new, Value::Undef) {
+            old
+        } else {
+            new
+        }
+    };
     let (fget, fset, fdel) = match name {
         "getter" => (keep(f, fget), fset, fdel),
         "setter" => (fget, keep(f, fset), fdel),
@@ -17861,7 +17905,9 @@ fn fold_method_kwargs(
             "{tn}.{method}() takes no keyword arguments"
         )));
     }
-    clinic_kw_check(method, args.len(), kwargs, |k| method_kwarg_pos(bytes, method, k))?;
+    clinic_kw_check(method, args.len(), kwargs, |k| {
+        method_kwarg_pos(bytes, method, k)
+    })?;
     let mut out: Vec<Option<Value>> = args.iter().cloned().map(Some).collect();
     for (k, v) in kwargs {
         let pos = method_kwarg_pos(bytes, method, k).unwrap_or_default();
@@ -18450,8 +18496,9 @@ fn str_maketrans(args: &[Value]) -> Result<Value, String> {
                     let n = s.chars().next().unwrap() as i64;
                     Ok((n, Value::Int(n)))
                 }
-                Some(_) => Err("ValueError: string keys in translatetable must be of length 1"
-                    .to_string()),
+                Some(_) => {
+                    Err("ValueError: string keys in translatetable must be of length 1".to_string())
+                }
                 None => h.as_int(&k).map(|n| (n, k.clone())).ok_or_else(|| {
                     host::type_error("keys in translate table mustbe strings or integers")
                 }),
@@ -19130,7 +19177,10 @@ fn parse_markup_field(chars: &[char], pos: &mut usize) -> Result<MarkupField, St
 fn check_builtin_method_call(tn: &str, name: &str, nargs: usize, nkw: usize) -> Result<(), String> {
     let qual = || format!("{}.{name}", if tn == "bool" { "int" } else { tn });
     if nkw > 0 && refuses_kwargs(tn, name) {
-        return Err(host::type_error(&format!("{}() takes no keyword arguments", qual())));
+        return Err(host::type_error(&format!(
+            "{}() takes no keyword arguments",
+            qual()
+        )));
     }
     match builtin_method_arity(tn, name) {
         Some(spec) => check_arity_kw(name, &qual(), spec, nargs, nkw),
@@ -20816,7 +20866,12 @@ fn float_hex(f: f64) -> String {
 /// `OverflowError`; signed values use two's complement sign extension.
 fn int_to_bytes(recv: &Value, args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, String> {
     // `to_bytes(length=1, byteorder='big', *, signed=False)`.
-    clinic_kw_names("to_bytes", &["length", "byteorder", "signed"], args.len(), kwargs)?;
+    clinic_kw_names(
+        "to_bytes",
+        &["length", "byteorder", "signed"],
+        args.len(),
+        kwargs,
+    )?;
     let length = match args.first().cloned().or_else(|| kw_get(kwargs, "length")) {
         Some(v) => {
             let n = match with_host(|h| h.index_fit(&v)) {
@@ -20998,7 +21053,12 @@ fn ldexp(base: f64, exp: i64) -> f64 {
 fn int_from_bytes(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, String> {
     // `from_bytes(bytes, byteorder='big', *, signed=False)`: the name checks
     // `_PyArg_UnpackKeywords` makes once the count has passed.
-    clinic_kw_names("from_bytes", &["bytes", "byteorder", "signed"], args.len(), kwargs)?;
+    clinic_kw_names(
+        "from_bytes",
+        &["bytes", "byteorder", "signed"],
+        args.len(),
+        kwargs,
+    )?;
     let src = args.first().cloned().or_else(|| kw_get(kwargs, "bytes"));
     let src = &src.ok_or_else(|| {
         host::type_error("from_bytes() missing required argument 'bytes' (pos 1)")
@@ -22343,7 +22403,10 @@ fn bytes_hex(bytes: &[u8], args: &[Value]) -> Result<String, String> {
     }
     let sep = with_host(|h| match h.get(sep_v) {
         Some(PyObj::Bytes(b)) => Some(u32::from(b[0])),
-        _ => h.as_str(sep_v).and_then(|s| s.chars().next()).map(u32::from),
+        _ => h
+            .as_str(sep_v)
+            .and_then(|s| s.chars().next())
+            .map(u32::from),
     });
     let sep = match sep {
         Some(c) if c > 0x7f => return Err("ValueError: sep must be ASCII.".into()),
@@ -22369,7 +22432,11 @@ fn bytes_hex(bytes: &[u8], args: &[Value]) -> Result<String, String> {
     let n = bytes.len();
     let mut out = String::with_capacity(n * 3);
     for (i, b) in bytes.iter().enumerate() {
-        let boundary = if group > 0 { (n - i) % g == 0 } else { i % g == 0 };
+        let boundary = if group > 0 {
+            (n - i) % g == 0
+        } else {
+            i % g == 0
+        };
         if i > 0 && boundary {
             out.push(sep);
         }
@@ -22415,13 +22482,13 @@ fn bytes_maketrans(args: &[Value]) -> Result<Value, String> {
     let frm = args
         .first()
         .map(need_bytes_like)
-            .transpose()?
-            .ok_or_else(|| host::type_error("a bytes-like object is required"))?;
+        .transpose()?
+        .ok_or_else(|| host::type_error("a bytes-like object is required"))?;
     let to = args
         .get(1)
         .map(need_bytes_like)
-            .transpose()?
-            .ok_or_else(|| host::type_error("a bytes-like object is required"))?;
+        .transpose()?
+        .ok_or_else(|| host::type_error("a bytes-like object is required"))?;
     if frm.len() != to.len() {
         // `bytes.maketrans` really does word this differently from
         // `str.maketrans` ("same length" vs "equal length", no "first two"),
@@ -22528,9 +22595,7 @@ fn replace_bytes(hay: &[u8], old: &[u8], new: &[u8], count: i64) -> Vec<u8> {
 /// remove; `None`/absent strips ASCII whitespace.
 fn strip_bytes(bytes: &[u8], chars: Option<&Value>, which: &str) -> Result<Vec<u8>, String> {
     let set: Option<Vec<u8>> = match chars {
-        Some(v) => Some(
-            need_bytes_like(v)?,
-        ),
+        Some(v) => Some(need_bytes_like(v)?),
         None => None,
     };
     let strip_c = |b: u8| -> bool {
