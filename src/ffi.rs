@@ -275,7 +275,7 @@ pub fn init() -> bool {
                 }
             }
         }
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         INTERPRETER_STARTED.store(true, std::sync::atomic::Ordering::Relaxed);
         route_std_streams();
         install_main_module_hook();
@@ -291,7 +291,7 @@ pub fn init() -> bool {
 /// resolves against the host of the calling thread, the one whose program
 /// handed the object over.
 fn install_main_module_hook() {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let Ok(main) = py.import("__main__") else {
             return;
         };
@@ -331,7 +331,7 @@ fn main_getattr(py: Python, name: String) -> PyResult<Py<PyAny>> {
 /// vs block, `-u` — are then made once, by that layer. `sys.__stdout__` and
 /// `sys.__stderr__` follow, as they name the same object in CPython.
 fn route_std_streams() {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let (Ok(sys), Ok(io)) = (py.import("sys"), py.import("io")) else {
             return;
         };
@@ -412,7 +412,7 @@ pub fn set_std_target(stderr: bool, target: StdTarget) {
         });
         return;
     }
-    Python::with_gil(|py| apply_std_target(py, stderr, target));
+    Python::attach(|py| apply_std_target(py, stderr, target));
 }
 
 fn apply_std_target(py: Python, stderr: bool, target: StdTarget) {
@@ -560,10 +560,10 @@ unsafe extern "C" fn sys_dict_watcher(
     }
     // SAFETY: the callback is invoked with the GIL held and with borrowed
     // references to a live key and value.
-    let py = unsafe { Python::assume_gil_acquired() };
+    let py = unsafe { Python::assume_attached() };
     let key = unsafe { Bound::from_borrowed_ptr(py, key) };
     let name = key
-        .downcast::<PyString>()
+        .cast::<PyString>()
         .ok()
         .and_then(|s| s.to_cow().ok());
     let stderr = match name.as_deref() {
@@ -591,7 +591,7 @@ fn classify_std_assignment(py: Python, stderr: bool, value: &Bound<PyAny>) -> St
     if native.is_ok_and(|n| n.is(value)) {
         return StdTarget::Native;
     }
-    if let Ok(redirect) = value.downcast::<PyrsRedirectStream>() {
+    if let Ok(redirect) = value.cast::<PyrsRedirectStream>() {
         let r = redirect.borrow();
         return StdTarget::Pyrs(r.target.clone(), r.generation);
     }
@@ -614,7 +614,7 @@ pub fn run_module(modname: &str, args: &[String]) -> i32 {
         eprintln!("python: {}", bridge_unavailable("<module>"));
         return 1;
     }
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let sys = match py.import("sys") {
             Ok(m) => m,
             Err(e) => {
@@ -780,7 +780,7 @@ fn record_foreign_exc(host: &mut PyHost, py: Python, err: &PyErr, line: &str) {
     if let Some(d) = value
         .getattr("__dict__")
         .ok()
-        .and_then(|d| d.downcast_into::<PyDict>().ok())
+        .and_then(|d| d.cast_into::<PyDict>().ok())
     {
         for (k, v) in d.iter() {
             let (Ok(name), Ok(val)) = (k.extract::<String>(), py_to_value(host, py, &v)) else {
@@ -846,12 +846,12 @@ fn apply_pending_search_paths() {
         Ok(mut q) if !q.is_empty() => std::mem::take(&mut *q),
         _ => return,
     };
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let Ok(sys) = py.import("sys") else { return };
         let Ok(path) = sys.getattr("path") else {
             return;
         };
-        let Ok(path) = path.downcast_into::<PyList>() else {
+        let Ok(path) = path.cast_into::<PyList>() else {
             return;
         };
         let have: Vec<String> = path
@@ -903,7 +903,7 @@ fn apply_pending_argv() {
         },
         Err(_) => return,
     };
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let Ok(sys) = py.import("sys") else { return };
         let list = PyList::empty(py);
         for a in &argv {
@@ -932,12 +932,12 @@ pub fn flush_open_files() {
     if !INTERPRETER_STARTED.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         if let (Ok(gc), Ok(io_mod)) = (py.import("gc"), py.import("io")) {
             if let (Ok(objects), Ok(base)) =
                 (gc.call_method0("get_objects"), io_mod.getattr("IOBase"))
             {
-                if let Ok(objects) = objects.downcast_into::<PyList>() {
+                if let Ok(objects) = objects.cast_into::<PyList>() {
                     for obj in objects.iter() {
                         let Ok(true) = obj.is_instance(&base) else {
                             continue;
@@ -992,7 +992,7 @@ pub fn import(name: &str) -> Result<u32, String> {
     }
     apply_pending_search_paths();
     apply_pending_argv();
-    Python::with_gil(|py| match py.import(name) {
+    Python::attach(|py| match py.import(name) {
         Ok(module) => {
             let id = store(module.into_any().unbind());
             if let Ok(mut m) = module_handles().lock() {
@@ -1008,7 +1008,7 @@ pub fn import(name: &str) -> Result<u32, String> {
 /// identity). Enum members and other CPython singletons compare equal under `is`
 /// even when fetched into distinct handles.
 pub fn same_object(a: u32, b: u32) -> bool {
-    Python::with_gil(|py| match (fetch(py, a), fetch(py, b)) {
+    Python::attach(|py| match (fetch(py, a), fetch(py, b)) {
         (Ok(x), Ok(y)) => x.is(&y),
         _ => false,
     })
@@ -1021,7 +1021,7 @@ pub fn same_object(a: u32, b: u32) -> bool {
 /// (unlike [`binary_op_cb`], which re-borrows the host to marshal a native
 /// operand). Enum members — and any two equal CPython objects — compare True.
 pub fn foreign_eq(a: u32, b: u32) -> bool {
-    Python::with_gil(|py| match (fetch(py, a), fetch(py, b)) {
+    Python::attach(|py| match (fetch(py, a), fetch(py, b)) {
         (Ok(x), Ok(y)) => x.eq(&y).unwrap_or(false),
         _ => false,
     })
@@ -1040,7 +1040,7 @@ pub enum Prim<'a> {
 /// scalar is built directly, no host marshaling, so it is safe to call from
 /// `PyHost::equal` (which holds the host borrow) for `in`/`.index`/`.count`.
 pub fn foreign_eq_prim(fid: u32, prim: Prim) -> bool {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let Ok(x) = fetch(py, fid) else { return false };
         let other: Bound<PyAny> = match prim {
             Prim::Int(n) => match n.into_pyobject(py) {
@@ -1081,7 +1081,7 @@ pub fn foreign_eq_prim(fid: u32, prim: Prim) -> bool {
 /// a plain `Enum` member (which compares equal to nothing), `Fraction(1, 3)`.
 #[cfg(feature = "stdlib-ffi")]
 pub fn foreign_numeric_key(fid: u32) -> Option<Value> {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let obj = fetch(py, fid).ok()?;
         let builtins = py.import("builtins").ok()?;
         // `bool`/`int`/`Decimal(1)`/`IntEnum.RED` → the equal integer.
@@ -1105,7 +1105,7 @@ pub fn foreign_numeric_key(fid: u32) -> Option<Value> {
 /// (`sorted([(IntEnum, …)])`, `[date] < [date]`). Borrow-free. An error (two
 /// unorderable foreign types) surfaces CPython's `TypeError`.
 pub fn foreign_cmp(a: u32, b: u32) -> Result<std::cmp::Ordering, String> {
-    Python::with_gil(|py| match (fetch(py, a), fetch(py, b)) {
+    Python::attach(|py| match (fetch(py, a), fetch(py, b)) {
         (Ok(x), Ok(y)) => x.compare(&y).map_err(|e| e.to_string()),
         _ => Err("ffi: invalid foreign handle".into()),
     })
@@ -1117,7 +1117,7 @@ pub fn foreign_cmp(a: u32, b: u32) -> Result<std::cmp::Ordering, String> {
 /// only the FFI table). An unhashable CPython object (a marshaled `list`/`dict`
 /// never reaches here) surfaces its `TypeError`.
 pub fn foreign_hash(id: u32) -> Result<i64, String> {
-    Python::with_gil(|py| match fetch(py, id) {
+    Python::attach(|py| match fetch(py, id) {
         Ok(x) => x.hash().map(|h| h as i64).map_err(|e| e.to_string()),
         Err(e) => Err(e),
     })
@@ -1136,7 +1136,7 @@ pub fn build_foreign_class(
     if !init() {
         return Err(bridge_unavailable(name));
     }
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         // Marshal bases + members under a short host borrow; the metaclass call
         // runs with none held (a method body may re-enter fusevm).
         let (bases_tuple, members_dict): (Bound<PyAny>, Bound<PyAny>) =
@@ -1282,7 +1282,7 @@ fn exc_to_py<'py>(
 }
 
 fn is_exception_type(py: Python, t: &Bound<PyAny>) -> bool {
-    t.downcast::<pyo3::types::PyType>()
+    t.cast::<pyo3::types::PyType>()
         .ok()
         .and_then(|t| {
             t.is_subclass(&py.get_type::<pyo3::exceptions::PyBaseException>())
@@ -1663,7 +1663,7 @@ fn instance_from_mirror(
     // the NATIVE class's slots, wherever the mirror instance kept it.
     let mut dict_attrs: Vec<(Bound<PyAny>, Bound<PyAny>)> = Vec::new();
     if let Ok(dict) = obj.getattr("__dict__") {
-        if let Ok(dict) = dict.downcast::<PyDict>() {
+        if let Ok(dict) = dict.cast::<PyDict>() {
             dict_attrs.extend(dict.iter());
         }
     }
@@ -1678,7 +1678,7 @@ fn instance_from_mirror(
         }
     }
     for (k, v) in dict_attrs.into_iter().chain(slot_attrs) {
-        let name: String = k.extract().map_err(|e| e.to_string())?;
+        let name = k.extract::<String>().map_err(|e| e.to_string())?;
         let value = py_to_value(host, py, &v)?;
         if native_slots.contains(&name) {
             host.set_attr(&inst, &name, value)?;
@@ -1832,9 +1832,9 @@ impl NanBridge {
         f(&mut m.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
-    fn insert(&mut self, py: Python<'_>, obj: Py<PyAny>, nan: f64) {
+    fn insert(&mut self, _py: Python<'_>, obj: Py<PyAny>, nan: f64) {
         if self.by_addr.len() >= self.sweep_at {
-            self.by_addr.retain(|_, (o, _)| o.get_refcnt(py) > 1);
+            self.by_addr.retain(|_, (o, _)| unsafe { pyo3::ffi::Py_REFCNT(o.as_ptr()) } > 1);
             let live: rustc_hash::FxHashSet<usize> = self.by_addr.keys().copied().collect();
             self.by_bits.retain(|_, addr| live.contains(addr));
             self.sweep_at = (self.by_addr.len() * 2).max(64);
@@ -2233,11 +2233,11 @@ fn py_to_value_node(host: &mut PyHost, py: Python, obj: &Bound<PyAny>) -> Result
         return Ok(host.new_str(obj.extract::<String>().map_err(|e| e.to_string())?));
     }
     if obj.is_exact_instance_of::<PyBytes>() {
-        let b = obj.downcast::<PyBytes>().map_err(|e| e.to_string())?;
+        let b = obj.cast::<PyBytes>().map_err(|e| e.to_string())?;
         return Ok(host.alloc(PyObj::Bytes(b.as_bytes().to_vec())));
     }
     if obj.is_exact_instance_of::<PyList>() {
-        let list = obj.downcast::<PyList>().map_err(|e| e.to_string())?;
+        let list = obj.cast::<PyList>().map_err(|e| e.to_string())?;
         let out = host.new_list(Vec::new());
         remember_from_py(obj, &out);
         let items = unmarshal_seq(host, py, list.iter())?;
@@ -2247,12 +2247,12 @@ fn py_to_value_node(host: &mut PyHost, py: Python, obj: &Bound<PyAny>) -> Result
         return Ok(out);
     }
     if obj.is_exact_instance_of::<PyTuple>() {
-        let tup = obj.downcast::<PyTuple>().map_err(|e| e.to_string())?;
+        let tup = obj.cast::<PyTuple>().map_err(|e| e.to_string())?;
         let items = unmarshal_seq(host, py, tup.iter())?;
         return Ok(host.new_tuple(items));
     }
     if obj.is_exact_instance_of::<PyDict>() {
-        let dict = obj.downcast::<PyDict>().map_err(|e| e.to_string())?;
+        let dict = obj.cast::<PyDict>().map_err(|e| e.to_string())?;
         let out = host.new_dict(indexmap::IndexMap::new());
         remember_from_py(obj, &out);
         let mut map = indexmap::IndexMap::new();
@@ -2328,19 +2328,19 @@ fn native_builtin_type(py: Python, obj: &Bound<PyAny>) -> Option<&'static str> {
 /// module hands to CPython holds the `Value` it stands for; this is the single
 /// place that reads it back, so a proxy added later only has to be listed here.
 fn unwrap_proxy(obj: &Bound<PyAny>) -> Option<Value> {
-    if let Ok(c) = obj.downcast::<PyrsCallable>() {
+    if let Ok(c) = obj.cast::<PyrsCallable>() {
         return Some(c.borrow().target.clone());
     }
-    if let Ok(c) = obj.downcast::<PyrsIterator>() {
+    if let Ok(c) = obj.cast::<PyrsIterator>() {
         return Some(c.borrow().target.clone());
     }
-    if let Ok(c) = obj.downcast::<PyrsInstance>() {
+    if let Ok(c) = obj.cast::<PyrsInstance>() {
         return Some(c.borrow().target.clone());
     }
-    if let Ok(c) = obj.downcast::<PyrsFile>() {
+    if let Ok(c) = obj.cast::<PyrsFile>() {
         return Some(c.borrow().target.clone());
     }
-    if let Ok(c) = obj.downcast::<PyrsRedirectStream>() {
+    if let Ok(c) = obj.cast::<PyrsRedirectStream>() {
         return Some(c.borrow().target.clone());
     }
     None
@@ -2385,7 +2385,7 @@ fn reference_to_value(host: &mut PyHost, py: Python, obj: &Bound<PyAny>) -> Resu
 
 /// `foreign.name` — attribute access (submodules, functions, constants, …).
 pub fn get_attr(host: &mut PyHost, id: u32, name: &str) -> Result<Value, String> {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let obj = fetch(py, id)?;
         let attr = obj
             .getattr(name)
@@ -2398,7 +2398,7 @@ pub fn get_attr(host: &mut PyHost, id: u32, name: &str) -> Result<Value, String>
 /// or an instance's real attribute list is what a caller sees. Returns an empty
 /// list rather than an error if CPython declines: `dir()` never raises.
 pub fn dir_names(id: u32) -> Vec<String> {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let Ok(obj) = fetch(py, id) else {
             return Vec::new();
         };
@@ -2417,7 +2417,7 @@ pub fn dir_names(id: u32) -> Vec<String> {
 /// `foreign.name = value` — set an attribute on a foreign (CPython) object, e.g.
 /// `decimal.getcontext().prec = 6`.
 pub fn set_attr(host: &mut PyHost, id: u32, name: &str, value: &Value) -> Result<(), String> {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let obj = fetch(py, id)?;
         let v = value_to_py(host, py, value)?;
         obj.setattr(name, v)
@@ -2427,7 +2427,7 @@ pub fn set_attr(host: &mut PyHost, id: u32, name: &str, value: &Value) -> Result
 
 /// `del foreign.name` — delete an attribute of a foreign (CPython) object.
 pub fn del_attr(host: &mut PyHost, id: u32, name: &str) -> Result<(), String> {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let obj = fetch(py, id)?;
         obj.delattr(name)
             .map_err(|e| pyerr_to_error_h(host, py, &e))
@@ -2439,7 +2439,7 @@ pub fn del_attr(host: &mut PyHost, id: u32, name: &str) -> Result<(), String> {
 /// The host borrow is dropped for the duration of the CPython call so a pythonrs
 /// callback (a `PyrsCallable` passed as an argument) can re-enter the host.
 pub fn call(id: u32, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Result<Value, String> {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let obj = fetch(py, id)?;
         invoke_bound(py, &obj, &args, &kwargs)
     })
@@ -2452,7 +2452,7 @@ pub fn call_method(
     args: Vec<Value>,
     kwargs: Vec<(String, Value)>,
 ) -> Result<Value, String> {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let obj = fetch(py, id)?;
         let method = obj.getattr(name).map_err(|e| pyerr_to_error(py, &e))?;
         invoke_bound(py, &method, &args, &kwargs)
@@ -2470,7 +2470,7 @@ pub fn call_builtin_type_new(
     if !init() {
         return Err(bridge_unavailable("builtins"));
     }
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let new = py
             .import("builtins")
             .and_then(|b| b.getattr(t))
@@ -2542,7 +2542,7 @@ fn warn_from_pythonrs(
                 Some(c) => {
                     let c = to_py(c)?;
                     let ok = c
-                        .downcast::<pyo3::types::PyType>()
+                        .cast::<pyo3::types::PyType>()
                         .is_ok_and(|t| t.is_subclass(&warning).unwrap_or(false));
                     if !ok {
                         return Err(format!(
@@ -2615,7 +2615,7 @@ pub fn warn_native(category: &str, msg: &str) -> Result<(), String> {
     if !init() {
         return Ok(());
     }
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let context = with_host(|h| h.warning_context(1));
         let location = context.unwrap_or_else(|| ("<sys>".into(), 0, "sys".into()));
         let category = py
@@ -2681,7 +2681,7 @@ fn call_result_to_value(
         return py_to_value(host, py, result);
     }
     let is_kwarg = kwargs.is_some_and(|d| d.values().iter().any(|v| v.is(result)));
-    if !is_kwarg && result.get_refcnt() > 1 {
+    if !is_kwarg && unsafe { pyo3::ffi::Py_REFCNT(result.as_ptr()) } > 1 {
         return reference_to_value(host, py, result);
     }
     py_to_value(host, py, result)
@@ -2750,7 +2750,7 @@ fn rebuild_mutable(
 ) -> Option<PyObj> {
     match kind {
         MutKind::Bytearray => {
-            let ba = cpy.downcast::<PyByteArray>().ok()?;
+            let ba = cpy.cast::<PyByteArray>().ok()?;
             Some(PyObj::Bytearray(ba.to_vec()))
         }
         MutKind::List => {
@@ -2811,11 +2811,11 @@ fn pure_value(host: &mut PyHost, py: Python, obj: &Bound<PyAny>) -> Option<Value
         return obj.extract::<String>().ok().map(|s| host.new_str(s));
     }
     if obj.is_exact_instance_of::<PyBytes>() {
-        let b = obj.downcast::<PyBytes>().ok()?;
+        let b = obj.cast::<PyBytes>().ok()?;
         return Some(host.alloc(PyObj::Bytes(b.as_bytes().to_vec())));
     }
     if obj.is_exact_instance_of::<PyByteArray>() {
-        let b = obj.downcast::<PyByteArray>().ok()?;
+        let b = obj.cast::<PyByteArray>().ok()?;
         return Some(host.alloc(PyObj::Bytearray(b.to_vec())));
     }
     if obj.is_exact_instance_of::<PyList>() {
@@ -3238,7 +3238,7 @@ fn normalize_throw_args<'py>(
     let base_exc = py.get_type::<pyo3::exceptions::PyBaseException>();
     // `throw(SomeError, ...)`: instantiate unless arg 1 already is an instance.
     let is_exc_class = first
-        .downcast::<pyo3::types::PyType>()
+        .cast::<pyo3::types::PyType>()
         .ok()
         .map(|t| t.is_subclass(&base_exc).unwrap_or(false))
         .unwrap_or(false);
@@ -3247,7 +3247,7 @@ fn normalize_throw_args<'py>(
         return match second {
             Some(v) if v.is_instance(&first)? => Ok(v),
             Some(v) if v.is_instance_of::<PyTuple>() => {
-                first.call1(v.downcast::<PyTuple>()?.clone())
+                first.call1(v.cast::<PyTuple>()?.clone())
             }
             Some(v) => first.call1((v,)),
             None => first.call0(),
@@ -3266,7 +3266,7 @@ fn normalize_throw_args<'py>(
 /// exception class is instantiated first (`raise struct.error`), and anything
 /// else is CPython's `TypeError`.
 pub fn raised_foreign(id: u32) -> Result<Value, String> {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let obj = fetch(py, id)?;
         let exc = if is_exception_type(py, &obj) {
             obj.call0().map_err(|e| pyerr_to_error(py, &e))?
@@ -3287,7 +3287,7 @@ pub fn raised_foreign(id: u32) -> Result<Value, String> {
 /// passed through on the CPython side — `traceback.format_tb` over its
 /// `__traceback__` — or `None` when it has none.
 pub fn traceback_text(handle: u32) -> Option<String> {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let exc = fetch(py, handle).ok()?;
         let tb = exc
             .getattr("__traceback__")
@@ -3307,7 +3307,7 @@ pub fn traceback_text(handle: u32) -> Option<String> {
 /// handle `handle` — the CPython frames an exception passed through between
 /// two pythonrs frames (see [`crate::host::TbEntry::CPython`]).
 pub fn traceback_segment_text(handle: u32) -> Option<String> {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let tb = fetch(py, handle).ok()?;
         let lines = py
             .import("traceback")
@@ -3323,7 +3323,7 @@ pub fn traceback_segment_text(handle: u32) -> Option<String> {
 /// ffi handle `handle`: `module.qualname`, without a `builtins` or `__main__`
 /// module (`traceback.TracebackException.format_exception_only`).
 pub fn exception_type_name(handle: u32) -> Option<String> {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let ty = fetch(py, handle).ok()?.get_type();
         let qualname: String = ty.getattr("__qualname__").ok()?.extract().ok()?;
         let module: Option<String> = ty.getattr("__module__").ok().and_then(|m| m.extract().ok());
@@ -3379,7 +3379,7 @@ fn pyexc_to_value(py: Python, exc: &Bound<PyAny>) -> PyResult<Value> {
 /// [`exc_to_py`]). `None` when the value is not an exception or cannot cross —
 /// the caller then falls back to parsing the terse error string.
 fn exc_value_to_pyerr(v: &Value) -> Option<pyo3::PyErr> {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let exc = with_host(|h| exc_to_py(h, py, v)).ok()??;
         Some(pyo3::PyErr::from_value(exc))
     })
@@ -3906,12 +3906,12 @@ fn rs_err_typed(e: String) -> pyo3::PyErr {
     if class.is_empty() || !class.chars().all(|c| c.is_alphanumeric() || c == '_') {
         return rs_err(e);
     }
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let Ok(ty) = py.import("builtins").and_then(|m| m.getattr(class)) else {
             return rs_err(e.clone());
         };
         let is_exc = ty
-            .downcast::<pyo3::types::PyType>()
+            .cast::<pyo3::types::PyType>()
             .ok()
             .map(|t| {
                 t.is_subclass(&py.get_type::<pyo3::exceptions::PyBaseException>())
@@ -3935,7 +3935,7 @@ fn rs_err_typed(e: String) -> pyo3::PyErr {
 
 /// `foreign[idx]`.
 pub fn get_item(host: &mut PyHost, id: u32, idx: &Value) -> Result<Value, String> {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let obj = fetch(py, id)?;
         let key = value_to_py(host, py, idx)?;
         let item = obj
@@ -3949,7 +3949,7 @@ pub fn get_item(host: &mut PyHost, id: u32, idx: &Value) -> Result<Value, String
 /// borrow, so a `Foreign` object whose `__getitem__` is a pythonrs method can
 /// re-enter. Key and result marshal under fresh short borrows.
 pub fn get_item_cb(id: u32, idx: &Value) -> Result<Value, String> {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let key = with_host(|h| value_to_py(h, py, idx))?;
         let obj = fetch(py, id)?;
         let item = obj.get_item(key).map_err(|e| pyerr_to_error(py, &e))?;
@@ -3961,7 +3961,7 @@ pub fn get_item_cb(id: u32, idx: &Value) -> Result<Value, String> {
 /// mutable container held behind a handle (see [`get_attr`]) is assignable
 /// through it and the mutation lands on the real object.
 pub fn set_item(host: &mut PyHost, id: u32, idx: &Value, val: &Value) -> Result<(), String> {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let obj = fetch(py, id)?;
         let key = value_to_py(host, py, idx)?;
         let v = value_to_py(host, py, val)?;
@@ -3973,7 +3973,7 @@ pub fn set_item(host: &mut PyHost, id: u32, idx: &Value, val: &Value) -> Result<
 /// `del foreign[idx]` — CPython's own `__delitem__`, the other half of
 /// [`set_item`].
 pub fn del_item(host: &mut PyHost, id: u32, idx: &Value) -> Result<(), String> {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let obj = fetch(py, id)?;
         let key = value_to_py(host, py, idx)?;
         obj.del_item(key)
@@ -3983,7 +3983,7 @@ pub fn del_item(host: &mut PyHost, id: u32, idx: &Value) -> Result<(), String> {
 
 /// `iter(foreign)` — returns a `Foreign` iterator handle.
 pub fn make_iter(host: &mut PyHost, id: u32) -> Result<Value, String> {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let obj = fetch(py, id)?;
         let it = obj.try_iter().map_err(|e| e.to_string())?;
         Ok(host.alloc(PyObj::Foreign(store(it.into_any().unbind()))))
@@ -3995,7 +3995,7 @@ pub fn make_iter(host: &mut PyHost, id: u32) -> Result<Value, String> {
 /// re-enter. `try_iter` (which runs `__iter__`) is called with no borrow held;
 /// only the resulting handle is allocated under a fresh short borrow.
 pub fn make_iter_cb(id: u32) -> Result<Value, String> {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let obj = fetch(py, id)?;
         let it = obj.try_iter().map_err(|e| e.to_string())?;
         let handle = it.into_any().unbind();
@@ -4006,14 +4006,14 @@ pub fn make_iter_cb(id: u32) -> Result<Value, String> {
 /// True if the foreign object is an iterator (CPython's `PyIter_Check`, i.e.
 /// `type(obj).__next__` exists) — not merely iterable.
 pub fn is_iterator(id: u32) -> bool {
-    Python::with_gil(|py| fetch(py, id).is_ok_and(|obj| obj.hasattr("__next__").unwrap_or(false)))
+    Python::attach(|py| fetch(py, id).is_ok_and(|obj| obj.hasattr("__next__").unwrap_or(false)))
 }
 
 /// `next(foreign)` — `None` on `StopIteration`. Caller holds the host borrow, so
 /// only safe for iterators that never re-enter pythonrs during `next()` (a plain
 /// CPython container). Callback-driving iterators must use [`iter_next_cb`].
 pub fn iter_next(host: &mut PyHost, id: u32) -> Result<Option<Value>, String> {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let obj = fetch(py, id)?;
         let mut it = obj.try_iter().map_err(|e| e.to_string())?;
         match it.next() {
@@ -4031,7 +4031,7 @@ pub fn iter_next(host: &mut PyHost, id: u32) -> Result<Option<Value>, String> {
 /// advance therefore happens with no borrow held; the result is marshaled under
 /// a fresh short borrow, exactly like `invoke_bound`.
 pub fn iter_next_cb(id: u32) -> Result<Option<Value>, String> {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let obj = fetch(py, id)?;
         let mut it = obj.try_iter().map_err(|e| e.to_string())?;
         match it.next() {
@@ -4044,7 +4044,7 @@ pub fn iter_next_cb(id: u32) -> Result<Option<Value>, String> {
 
 /// `item in foreign`.
 pub fn contains(host: &mut PyHost, id: u32, item: &Value) -> Result<bool, String> {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let obj = fetch(py, id)?;
         let needle = value_to_py(host, py, item)?;
         obj.contains(needle).map_err(|e| e.to_string())
@@ -4055,7 +4055,7 @@ pub fn contains(host: &mut PyHost, id: u32, item: &Value) -> Result<bool, String
 /// borrow, so a `Foreign` object whose `__contains__` is a pythonrs method can
 /// re-enter. The needle marshals under a fresh short borrow.
 pub fn contains_cb(id: u32, item: &Value) -> Result<bool, String> {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let needle = with_host(|h| value_to_py(h, py, item))?;
         let obj = fetch(py, id)?;
         obj.contains(needle).map_err(|e| e.to_string())
@@ -4074,7 +4074,7 @@ pub fn contains_cb(id: u32, item: &Value) -> Result<bool, String> {
 /// `Decimal`, `datetime < datetime` → a `bool`). A `TypeError`/`NotImplemented`
 /// from CPython surfaces as a pythonrs error string, never a bridge panic.
 pub fn binary_op(host: &mut PyHost, func: &str, a: &Value, b: &Value) -> Result<Value, String> {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let pa = value_to_py(host, py, a)?;
         let pb = value_to_py(host, py, b)?;
         let op = py
@@ -4090,7 +4090,7 @@ pub fn binary_op(host: &mut PyHost, func: &str, a: &Value, b: &Value) -> Result<
 /// (`Fraction`, `Decimal`, `numpy` scalars, …) and `__index__` are honored. A
 /// `TypeError` (no conversion) surfaces as a pythonrs error string.
 pub fn to_float(id: u32) -> Result<f64, String> {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let obj = fetch(py, id)?;
         let f = py
             .import("builtins")
@@ -4106,7 +4106,7 @@ pub fn to_float(id: u32) -> Result<f64, String> {
 /// CPython form (a native list crosses as a `list`, etc.) and CPython's
 /// `isinstance` decides, so an ABC's structural `__instancecheck__` runs.
 pub fn isinstance_foreign(host: &mut PyHost, v: &Value, cls_id: u32) -> Result<bool, String> {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let obj = value_to_py(host, py, v)?;
         let cls = fetch(py, cls_id)?;
         obj.is_instance(&cls).map_err(|e| e.to_string())
@@ -4117,7 +4117,7 @@ pub fn isinstance_foreign(host: &mut PyHost, v: &Value, cls_id: u32) -> Result<b
 /// (a `collections.namedtuple` class, a `typing`/`abc` type): both cross the
 /// bridge and CPython's own `issubclass` decides, its `TypeError`s included.
 pub fn issubclass_values(host: &mut PyHost, sub: &Value, cls: &Value) -> Result<bool, String> {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let a = value_to_py(host, py, sub)?;
         let b = value_to_py(host, py, cls)?;
         py.import("builtins")
@@ -4136,7 +4136,7 @@ pub fn issubclass_values(host: &mut PyHost, sub: &Value, cls: &Value) -> Result<
 /// type of the same name: the native value crosses the bridge as a proxy,
 /// which CPython's check would never accept.
 pub fn foreign_builtin_type_name(cls_id: u32) -> Option<String> {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let cls = fetch(py, cls_id).ok()?;
         let module: String = cls.getattr("__module__").ok()?.extract().ok()?;
         if module == "builtins" {
@@ -4156,7 +4156,7 @@ pub fn foreign_builtin_type_name(cls_id: u32) -> Option<String> {
 /// `false` when the name is not a builtin (a dotted native dispatch name, a user
 /// class), which leaves the native check to decide.
 pub fn foreign_isinstance_of_builtin(fid: u32, type_name: &str) -> bool {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let (Ok(obj), Ok(builtins)) = (fetch(py, fid), py.import("builtins")) else {
             return false;
         };
@@ -4171,7 +4171,7 @@ pub fn foreign_isinstance_of_builtin(fid: u32, type_name: &str) -> bool {
 /// `__index__` and an `IntEnum` member (an `int` subclass) convert. The result
 /// crosses back by value (bignum-safe via `py_to_value`).
 pub fn to_int(host: &mut PyHost, id: u32) -> Result<Value, String> {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let obj = fetch(py, id)?;
         let i = py
             .import("builtins")
@@ -4186,7 +4186,7 @@ pub fn to_int(host: &mut PyHost, id: u32) -> Result<Value, String> {
 /// so a `Foreign` object whose `__int__`/`__index__` is a pythonrs method can
 /// re-enter. Only the result marshals back, under a fresh short borrow.
 pub fn to_int_cb(id: u32) -> Result<Value, String> {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let obj = fetch(py, id)?;
         let i = py
             .import("builtins")
@@ -4203,7 +4203,7 @@ pub fn to_int_cb(id: u32) -> Result<Value, String> {
 /// `functools.cmp_to_key` wrapper's `__lt__` invoking the user cmp function) can
 /// re-enter the host. Args and result are marshaled under fresh short borrows.
 pub fn binary_op_cb(func: &str, a: &Value, b: &Value) -> Result<Value, String> {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let (pa, pb) = with_host(|h| -> Result<_, String> {
             Ok((value_to_py(h, py, a)?, value_to_py(h, py, b)?))
         })?;
@@ -4221,7 +4221,7 @@ pub fn binary_op_cb(func: &str, a: &Value, b: &Value) -> Result<Value, String> {
 /// `func` is the `operator`-module attribute; the CPython result marshals back the
 /// same way as [`binary_op`].
 pub fn unary_op(host: &mut PyHost, func: &str, v: &Value) -> Result<Value, String> {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let pv = value_to_py(host, py, v)?;
         let op = py
             .import("operator")
@@ -4237,7 +4237,7 @@ pub fn unary_op(host: &mut PyHost, func: &str, v: &Value) -> Result<Value, Strin
 /// `__neg__`/`__abs__`/… is a pythonrs method (a `@dataclass` with user dunders)
 /// can re-enter the host. Arg and result marshal under fresh short borrows.
 pub fn unary_op_cb(func: &str, v: &Value) -> Result<Value, String> {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let pv = with_host(|h| value_to_py(h, py, v))?;
         let op = py
             .import("operator")
@@ -4250,7 +4250,7 @@ pub fn unary_op_cb(func: &str, v: &Value) -> Result<Value, String> {
 
 /// `len(foreign)`.
 pub fn len(id: u32) -> Result<usize, String> {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let obj = fetch(py, id)?;
         obj.len().map_err(|e| e.to_string())
     })
@@ -4258,7 +4258,7 @@ pub fn len(id: u32) -> Result<usize, String> {
 
 /// `str(foreign)`.
 pub fn str_of(id: u32) -> String {
-    Python::with_gil(
+    Python::attach(
         |py| match fetch(py, id).and_then(|o| o.str().map_err(|e| e.to_string())) {
             Ok(s) => s.to_string(),
             Err(e) => e,
@@ -4268,12 +4268,12 @@ pub fn str_of(id: u32) -> String {
 
 /// `callable(foreign)`.
 pub fn is_callable(id: u32) -> bool {
-    Python::with_gil(|py| fetch(py, id).is_ok_and(|o| o.is_callable()))
+    Python::attach(|py| fetch(py, id).is_ok_and(|o| o.is_callable()))
 }
 
 /// `repr(foreign)`.
 pub fn repr_of(id: u32) -> String {
-    Python::with_gil(
+    Python::attach(
         |py| match fetch(py, id).and_then(|o| o.repr().map_err(|e| e.to_string())) {
             Ok(s) => s.to_string(),
             Err(e) => e,
@@ -4286,7 +4286,7 @@ pub fn repr_of(id: u32) -> String {
 /// `_module_repr` returns for any module carrying a spec
 /// (`<module 'builtins' (built-in)>`). Reads only the bridge, never the host.
 pub fn module_repr_from_spec(spec: u32) -> Option<String> {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let spec = fetch(py, spec).ok()?;
         py.import("_frozen_importlib")
             .and_then(|m| m.getattr("_module_repr_from_spec"))
@@ -4298,7 +4298,7 @@ pub fn module_repr_from_spec(spec: u32) -> Option<String> {
 
 /// `bool(foreign)`.
 pub fn truthy(id: u32) -> bool {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         fetch(py, id)
             .ok()
             .and_then(|o| o.is_truthy().ok())
@@ -4310,7 +4310,7 @@ pub fn truthy(id: u32) -> bool {
 /// The `__name__` of a foreign *class* object (`except json.JSONDecodeError` →
 /// `"JSONDecodeError"`). `None` if the handle isn't a class / has no `__name__`.
 pub fn class_name(id: u32) -> Option<String> {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let obj = fetch(py, id).ok()?;
         obj.getattr("__name__")
             .ok()
@@ -4325,7 +4325,7 @@ pub fn class_name(id: u32) -> Option<String> {
 /// `<built-in function date>`. Handing back CPython's own type object makes
 /// `repr`, `dir`, attribute access, and `==` against the class all correct.
 pub fn type_of(id: u32) -> Option<u32> {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let ty = fetch(py, id).ok()?.get_type();
         // Memoize by the type object's address so `type(x)` in a loop does not
         // allocate a side-table slot per call. Reuse of a freed address cannot
@@ -4343,7 +4343,7 @@ pub fn type_of(id: u32) -> Option<u32> {
 }
 
 pub fn type_name(id: u32) -> String {
-    Python::with_gil(|py| match fetch(py, id) {
+    Python::attach(|py| match fetch(py, id) {
         Ok(obj) => obj
             .get_type()
             .name()
@@ -4359,7 +4359,7 @@ pub fn type_name(id: u32) -> String {
 /// `with` checks the TYPE, so an `__exit__` stored on the instance does not
 /// make it a context manager.
 pub fn type_defines(id: u32, name: &str) -> bool {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let Ok(obj) = fetch(py, id) else {
             return false;
         };
@@ -4381,7 +4381,7 @@ pub fn type_defines(id: u32, name: &str) -> bool {
 /// `_PyType_GetFullyQualifiedName`: `module.qualname`, with the module left
 /// off for `builtins` and `__main__`.
 pub fn type_qualified_name(id: u32) -> String {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let Ok(obj) = fetch(py, id) else {
             return "object".into();
         };

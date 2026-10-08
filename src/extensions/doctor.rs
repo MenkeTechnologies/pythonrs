@@ -62,8 +62,8 @@ fn embedded_cpython() {
 
     println!("{}", bold("Embedded CPython (stdlib-ffi)"));
     crate::ffi::init();
-    pyo3::Python::with_gil(|py| {
-        let version = py.version().replace('\n', " ");
+    pyo3::Python::attach(|py| {
+        let version = pyo3::Python::version_str().replace('\n', " ");
         println!("  linked:      {} {}", green("OK"), cyan(version.trim()));
         let get = |attr: &str| -> Option<String> {
             let sys = py.import("sys").ok()?;
