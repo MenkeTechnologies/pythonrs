@@ -2082,3 +2082,28 @@ for c in cases:
         print(c, '->', repr(eval(c)))
     except Exception as e:
         print(c, '!', type(e).__name__, e)
+#==#
+# ── str/bytes argument conversion: partition, affix tuples, buffers, maketrans ─
+# `partition('')` split at nothing, a tuple of affixes was type-checked whole
+# before any match was tried, a non-buffer argument did not name its type, and
+# an out-of-range byte needle read as "not an integer".
+cases = [
+    "'abc'.partition('')", "'abc'.rpartition(None)", "b'abc'.partition(None)",
+    "'abc'.startswith(('a', 1))", "'abc'.endswith(('x', 'c', 1))", "'abc'.startswith(('x', 1))",
+    "'abc'.startswith(1, 5)", "b'abc'.startswith((b'a', 1))", "b'abc'.startswith((b'x', 1))",
+    "b'abc'.startswith(1, 5)", "b'abc'.endswith('a')", "b'a'.replace(None, b'')",
+    "b'a'.removeprefix(1)", "b'a'.split(1)", "b'a'.strip(1)", "b'a'.find(None)",
+    "b'a'.find(256)", "b'a'.find(-1)", "b'ab'.find(memoryview(b'b'))", "b'a'.translate(1)",
+    "str.maketrans({'a': 1, True: None})",
+]
+for c in cases:
+    try:
+        print(c, '->', repr(eval(c)))
+    except Exception as e:
+        print(c, '!', type(e).__name__, e)
+# The wording of these two moved between releases; the exception type did not.
+for d in ({'ab': 1}, {1.0: 1}):
+    try:
+        str.maketrans(d)
+    except Exception as e:
+        print(type(e).__name__)

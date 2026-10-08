@@ -17317,11 +17317,29 @@ fn property_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
     }))
 }
 
-/// Prefixes for `str.startswith`/`endswith`: a single str, or every str in a
-/// tuple. Mirrors CPython accepting `str | tuple[str, ...]`.
-fn str_prefixes(v: &Value, name: &str) -> Result<Vec<String>, String> {
+/// The separator of `str.partition`/`rpartition`: a non-empty `str`
+/// (`PyUnicode_Partition` refuses anything else before searching).
+fn partition_sep(v: Option<&Value>) -> Result<String, String> {
+    let v = v.cloned().unwrap_or(Value::Undef);
+    let sep = with_host(|h| h.as_str(&v)).ok_or_else(|| {
+        host::type_error(&format!(
+            "must be str, not {}",
+            with_host(|h| h.type_name(&v))
+        ))
+    })?;
+    if sep.is_empty() {
+        return Err("ValueError: empty separator".into());
+    }
+    Ok(sep)
+}
+
+/// `str.startswith`/`endswith` against a str, or a tuple of str tried IN
+/// ORDER: the first match answers `True`, and an item that is not a str
+/// raises only when it is reached (`unicode_startswith`'s loop), so
+/// `'abc'.startswith(('a', 1))` is `True`.
+fn str_affix_hit(v: &Value, name: &str, test: impl Fn(&str) -> bool) -> Result<bool, String> {
     if let Some(s) = with_host(|h| h.as_str(v)) {
-        return Ok(vec![s]);
+        return Ok(test(&s));
     }
     // Only a TUPLE is accepted; anything else names the offending type. pythonrs
     // iterated whatever it was given, so `'abc'.startswith(1)` surfaced the
@@ -17332,17 +17350,18 @@ fn str_prefixes(v: &Value, name: &str) -> Result<Vec<String>, String> {
             with_host(|h| h.type_name(v))
         )));
     }
-    let items = host::iter_vec(v)?;
-    let mut out = Vec::with_capacity(items.len());
-    for it in items {
-        out.push(with_host(|h| h.as_str(&it)).ok_or_else(|| {
+    for it in host::iter_vec(v)? {
+        let s = with_host(|h| h.as_str(&it)).ok_or_else(|| {
             host::type_error(&format!(
                 "tuple for {name} must only contain str, not {}",
                 with_host(|h| h.type_name(&it))
             ))
-        })?);
+        })?;
+        if test(&s) {
+            return Ok(true);
+        }
     }
-    Ok(out)
+    Ok(false)
 }
 
 /// Whitespace split for `str.split(None, maxsplit)` / `rsplit`. Runs of Python
@@ -17573,11 +17592,9 @@ fn fold_method_kwargs(
 
 fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String> {
     let s = with_host(|h| h.as_str(recv)).unwrap_or_default();
-    let sarg = |i: usize| with_host(|h| args.get(i).and_then(|v| h.as_str(v))).unwrap_or_default();
-    // The same accessor, but rejecting a non-`str` argument the way CPython
-    // does. `sarg` silently substitutes "" for anything it cannot read as a
-    // string, so `'abc'.find(1)` searched for the EMPTY string and answered 0,
-    // and `'abc'.strip(1)` stripped nothing and returned successfully.
+    // A `str` argument, rejecting anything else the way CPython does (a
+    // lenient reader that substituted "" made `'abc'.find(1)` search for the
+    // EMPTY string and answer 0).
     let sarg_checked = |i: usize, what: &str| -> Result<String, String> {
         match args.get(i) {
             None | Some(Value::Undef) => Ok(String::new()),
@@ -17744,28 +17761,25 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             // `resolve_start_end`), so the region can be empty by being
             // out of range — slicing with the raw bounds would panic.
             // A start past the end of the string matches nothing at all, not
-            // even the empty prefix.
-            if start > chars.len() {
-                return Ok(Value::Bool(false));
-            }
-            let region: String = chars[start..end.max(start).min(chars.len())]
-                .iter()
-                .collect();
-            let prefixes = match args.first() {
-                Some(v) if !matches!(v, Value::Undef) => str_prefixes(v, name)?,
+            // even the empty prefix — but the argument is still checked.
+            let region: Option<String> = (start <= chars.len()).then(|| {
+                chars[start..end.max(start).min(chars.len())]
+                    .iter()
+                    .collect()
+            });
+            let test = |p: &str| match &region {
+                Some(r) if name == "startswith" => r.starts_with(p),
+                Some(r) => r.ends_with(p),
+                None => false,
+            };
+            let hit = match args.first() {
+                Some(v) if !matches!(v, Value::Undef) => str_affix_hit(v, name, test)?,
                 _ => {
                     return Err(host::type_error(&format!(
                         "{name} first arg must be str or a tuple of str, not NoneType"
                     )))
                 }
             };
-            let hit = prefixes.iter().any(|p| {
-                if name == "startswith" {
-                    region.starts_with(p.as_str())
-                } else {
-                    region.ends_with(p.as_str())
-                }
-            });
             Ok(Value::Bool(hit))
         }
         "find" | "rfind" => {
@@ -17851,7 +17865,7 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             ))
         }
         "partition" => {
-            let sep = sarg(0);
+            let sep = partition_sep(args.first())?;
             let (a, b, c) = match s.find(&sep) {
                 Some(p) => (
                     s[..p].to_string(),
@@ -17866,7 +17880,7 @@ fn str_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             }))
         }
         "rpartition" => {
-            let sep = sarg(0);
+            let sep = partition_sep(args.first())?;
             let (a, b, c) = match s.rfind(&sep) {
                 Some(p) => (
                     s[..p].to_string(),
@@ -18151,25 +18165,22 @@ fn str_maketrans(args: &[Value]) -> Result<Value, String> {
             _ => vec![],
         });
         for (k, v) in pairs {
-            let ord = with_host(|h| {
-                if let Some(n) = h.as_int(&k) {
-                    Some(n)
-                } else {
-                    h.as_str(&k)
-                        .filter(|s| s.chars().count() == 1)
-                        .map(|s| s.chars().next().unwrap() as i64)
+            // `unicode_maketrans_impl`: a str key must be one character, and
+            // anything that is neither a str nor an int is refused — with
+            // CPython's own spelling of both messages. An int key is kept as the
+            // object it is (`True` stays `True`); a str key becomes its ordinal.
+            let (ord, key) = with_host(|h| match h.as_str(&k) {
+                Some(s) if s.chars().count() == 1 => {
+                    let n = s.chars().next().unwrap() as i64;
+                    Ok((n, Value::Int(n)))
                 }
-            });
-            match ord {
-                Some(n) => {
-                    host::dict_put(&mut d, PKey::Int(n), Value::Int(n), v);
-                }
-                None => {
-                    return Err(host::type_error(
-                        "keys in translate table must be strings of length 1",
-                    ))
-                }
-            }
+                Some(_) => Err("ValueError: string keys in translatetable must be of length 1"
+                    .to_string()),
+                None => h.as_int(&k).map(|n| (n, k.clone())).ok_or_else(|| {
+                    host::type_error("keys in translate table mustbe strings or integers")
+                }),
+            })?;
+            host::dict_put(&mut d, PKey::Int(ord), key, v);
         }
         return Ok(with_host(|h| h.new_dict(d)));
     }
@@ -20825,20 +20836,15 @@ fn recv_bytes(recv: &Value) -> Vec<u8> {
     })
 }
 
-/// A bytes-like argument as raw bytes: a `bytes`/`bytearray`, or a single
-/// `int` in `0..=255`. `None` for anything else (a `str`, out-of-range int, …).
-fn arg_bytes_like(v: &Value) -> Option<Vec<u8>> {
-    let obj = with_host(|h| match h.get(v) {
-        Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) => Some(b.clone()),
-        _ => None,
-    });
-    if obj.is_some() {
-        return obj;
-    }
-    match v {
-        Value::Int(n) if (0..=255).contains(n) => Some(vec![*n as u8]),
-        _ => None,
-    }
+/// A buffer argument (`y*`/`Py_buffer`) as raw bytes, or the `TypeError` its
+/// conversion raises for anything else, naming the type.
+fn need_bytes_like(v: &Value) -> Result<Vec<u8>, String> {
+    as_bytes_object(v)?.ok_or_else(|| {
+        host::type_error(&format!(
+            "a bytes-like object is required, not '{}'",
+            with_host(|h| h.type_name(v))
+        ))
+    })
 }
 
 /// Only a `bytes`/`bytearray`/`memoryview` (not an int) as raw bytes — for
@@ -21687,16 +21693,26 @@ fn bytes_common_method(
     // A required bytes-like argument (bytes/bytearray, not an int).
     let need_sub = |i: usize| -> Result<Vec<u8>, String> {
         args.get(i)
-            .map(as_bytes_object)
+            .map(need_bytes_like)
             .transpose()?
-            .flatten()
             .ok_or_else(|| host::type_error("a bytes-like object is required"))
     };
-    // `find`/`rfind`/`index`/`count` accept an int (single byte) or bytes-like.
+    // `parse_args_finds_byte`: a buffer, or an integer that must be a byte.
     let find_needle = || -> Result<Vec<u8>, String> {
-        args.first()
-            .and_then(arg_bytes_like)
-            .ok_or_else(|| host::type_error("argument should be integer or bytes-like object"))
+        let v = args.first().cloned().unwrap_or(Value::Undef);
+        if let Some(b) = as_bytes_object(&v)? {
+            return Ok(b);
+        }
+        match with_host(|h| h.index_fit(&v)) {
+            host::IndexFit::Fits(n) if (0..=255).contains(&n) => Ok(vec![n as u8]),
+            host::IndexFit::Fits(_) | host::IndexFit::TooLarge(_) => {
+                Err("ValueError: byte must be in range(0, 256)".into())
+            }
+            host::IndexFit::NotInt => Err(host::type_error(&format!(
+                "argument should be integer or bytes-like object, not '{}'",
+                with_host(|h| h.type_name(&v))
+            ))),
+        }
     };
     match name {
         "decode" => decode_bytes(&bytes, args),
@@ -21726,21 +21742,15 @@ fn bytes_common_method(
         }
         "startswith" | "endswith" => {
             let (start, end) = resolve_start_end(bytes.len(), args, 1);
-            if start > bytes.len() {
-                return Ok(Value::Bool(false));
-            }
-            let region = &bytes[start..end.max(start).min(bytes.len())];
-            let prefixes = match args.first() {
-                Some(v) => bytes_prefix_tuple(v)?,
-                None => return Err(host::type_error("startswith first arg must be bytes-like")),
+            // A start past the end matches nothing, once the argument checks.
+            let region =
+                (start <= bytes.len()).then(|| &bytes[start..end.max(start).min(bytes.len())]);
+            let test = |p: &[u8]| match region {
+                Some(r) if name == "startswith" => r.starts_with(p),
+                Some(r) => r.ends_with(p),
+                None => false,
             };
-            let hit = prefixes.iter().any(|p| {
-                if name == "startswith" {
-                    region.starts_with(p)
-                } else {
-                    region.ends_with(p)
-                }
-            });
+            let hit = bytes_affix_hit(&arg0(args)?, name, test)?;
             Ok(Value::Bool(hit))
         }
         "split" | "rsplit" => {
@@ -21753,8 +21763,7 @@ fn bytes_common_method(
             let parts = match sep_arg {
                 None => split_ws(&bytes, maxsplit, reverse),
                 Some(v) => {
-                    let sep = as_bytes_object(v)?
-                        .ok_or_else(|| host::type_error("must be str or None, not int"))?;
+                    let sep = need_bytes_like(v)?;
                     if sep.is_empty() {
                         return Err("ValueError: empty separator".into());
                     }
@@ -22090,8 +22099,7 @@ fn bytes_translate(bytes: &[u8], args: &[Value]) -> Result<Vec<u8>, String> {
     let table: Option<Vec<u8>> = match args.first() {
         None | Some(Value::Undef) => None,
         Some(v) => {
-            let t = as_bytes_object(v)?
-                .ok_or_else(|| host::type_error("a bytes-like object is required"))?;
+            let t = need_bytes_like(v)?;
             if t.len() != 256 {
                 return Err("ValueError: translation table must be 256 characters long".into());
             }
@@ -22100,8 +22108,7 @@ fn bytes_translate(bytes: &[u8], args: &[Value]) -> Result<Vec<u8>, String> {
     };
     let delete: Vec<u8> = match args.get(1) {
         None | Some(Value::Undef) => Vec::new(),
-        Some(v) => as_bytes_object(v)?
-            .ok_or_else(|| host::type_error("a bytes-like object is required"))?,
+        Some(v) => need_bytes_like(v)?,
     };
     let mut out = Vec::with_capacity(bytes.len());
     for &b in bytes {
@@ -22121,16 +22128,14 @@ fn bytes_translate(bytes: &[u8], args: &[Value]) -> Result<Vec<u8>, String> {
 fn bytes_maketrans(args: &[Value]) -> Result<Value, String> {
     let frm = args
         .first()
-        .map(as_bytes_object)
-        .transpose()?
-        .flatten()
-        .ok_or_else(|| host::type_error("a bytes-like object is required"))?;
+        .map(need_bytes_like)
+            .transpose()?
+            .ok_or_else(|| host::type_error("a bytes-like object is required"))?;
     let to = args
         .get(1)
-        .map(as_bytes_object)
-        .transpose()?
-        .flatten()
-        .ok_or_else(|| host::type_error("a bytes-like object is required"))?;
+        .map(need_bytes_like)
+            .transpose()?
+            .ok_or_else(|| host::type_error("a bytes-like object is required"))?;
     if frm.len() != to.len() {
         // `bytes.maketrans` really does word this differently from
         // `str.maketrans` ("same length" vs "equal length", no "first two"),
@@ -22169,25 +22174,25 @@ fn is_bytes_titlecased(bytes: &[u8]) -> bool {
     cased
 }
 
-/// A `startswith`/`endswith` first argument: a bytes-like, or a tuple of them.
-fn bytes_prefix_tuple(v: &Value) -> Result<Vec<Vec<u8>>, String> {
+/// `bytes.startswith`/`endswith` against a bytes-like, or a tuple of them
+/// tried in order — the first match answers, and a non-buffer item raises
+/// only when reached (see [`str_affix_hit`]).
+fn bytes_affix_hit(v: &Value, name: &str, test: impl Fn(&[u8]) -> bool) -> Result<bool, String> {
     if let Some(b) = as_bytes_object(v)? {
-        return Ok(vec![b]);
+        return Ok(test(&b));
     }
-    let is_tuple = with_host(|h| matches!(h.get(v), Some(PyObj::Tuple(_))));
-    if is_tuple {
-        let items = host::iter_vec(v)?;
-        let mut out = Vec::with_capacity(items.len());
-        for it in items {
-            let b = as_bytes_object(&it)?
-                .ok_or_else(|| host::type_error("a bytes-like object is required"))?;
-            out.push(b);
+    if !with_host(|h| matches!(h.get(v), Some(PyObj::Tuple(_)))) {
+        return Err(host::type_error(&format!(
+            "{name} first arg must be bytes or a tuple of bytes, not {}",
+            with_host(|h| h.type_name(v))
+        )));
+    }
+    for it in host::iter_vec(v)? {
+        if test(&need_bytes_like(&it)?) {
+            return Ok(true);
         }
-        return Ok(out);
     }
-    Err(host::type_error(
-        "startswith first arg must be bytes or a tuple of bytes",
-    ))
+    Ok(false)
 }
 
 /// `bytes.replace(old, new[, count])` — non-overlapping, left to right. A
@@ -22238,8 +22243,7 @@ fn replace_bytes(hay: &[u8], old: &[u8], new: &[u8], count: i64) -> Vec<u8> {
 fn strip_bytes(bytes: &[u8], chars: Option<&Value>, which: &str) -> Result<Vec<u8>, String> {
     let set: Option<Vec<u8>> = match chars {
         Some(v) => Some(
-            as_bytes_object(v)?
-                .ok_or_else(|| host::type_error("a bytes-like object is required"))?,
+            need_bytes_like(v)?,
         ),
         None => None,
     };
