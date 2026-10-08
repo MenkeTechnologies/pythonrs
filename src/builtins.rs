@@ -6998,7 +6998,10 @@ pub fn call_builtin_function(
                         kwargs,
                     );
                 }
-                return type_new(&args[0], &args[1], &args[2]);
+                // `type_new_impl` hands the keywords on to the new class's
+                // `__init_subclass__` (`type_new_init_subclass`), which is where
+                // `object`'s refuses them.
+                return type_new_meta(&args[0], &args[1], &args[2], "type", kwargs);
             }
             // Only the 3-argument form takes keywords (they go to the metaclass),
             // and only 1 or 3 positionals are legal at all. `type(object=1)` was
@@ -18127,13 +18130,6 @@ fn pad_str(s: &str, args: &[Value], mode: char, name: &str) -> Result<String, St
 /// CPython `str.maketrans`: build a translation table (a dict of ordinal→
 /// int/str/None). Either a single mapping arg, or two equal-length strings
 /// (`x`→`y`), with an optional third string whose chars map to `None`.
-/// `type(name, bases, namespace)` — dynamic class creation. `bases` is a tuple
-/// of class objects; `namespace` a dict of the class body. Registers the class
-/// and returns it.
-fn type_new(name: &Value, bases: &Value, ns: &Value) -> Result<Value, String> {
-    type_new_meta(name, bases, ns, "type", vec![])
-}
-
 /// `type.__new__(mcls, name, bases, namespace, **kwds)` — like `type_new` but
 /// tags the new class's metaclass as `metaclass` (so `type(cls) is mcls`) and
 /// fires the class-creation hooks (`__set_name__`, `__init_subclass__`) that

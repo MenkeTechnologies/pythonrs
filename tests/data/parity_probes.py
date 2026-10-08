@@ -2164,3 +2164,14 @@ class C:
     @x.setter
     def x(self, v): pass
 print(C.x.__doc__)
+#==#
+# ── type(name, bases, ns, **kw): the keywords reach __init_subclass__ ────────
+# The 3-argument `type()` dropped its keywords, so `object.__init_subclass__`
+# never refused them and a user hook received `{}`.
+class B:
+    def __init_subclass__(cls, **kw): print("isc", cls.__name__, kw)
+for c in ["type('A', (), {}, x=1)", "type('A', (), {}, **{}).__name__", "type('C', (B,), {}, x=1).__name__"]:
+    try:
+        print(c, '->', repr(eval(c)))
+    except Exception as e:
+        print(c, '!', type(e).__name__, e)
