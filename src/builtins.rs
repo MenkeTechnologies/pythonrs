@@ -6137,6 +6137,42 @@ pub fn call_builtin_function(
         .ok_or_else(|| host::type_error("mappingproxy() argument must be a mapping, not ..."))?;
         return Ok(with_host(|h| h.alloc(PyObj::MappingProxy { dict })));
     }
+    // `type.__new__(mcls, name, bases, ns, **kwds)` called directly (`type_new`).
+    // The most-derived of `mcls` and the bases' metaclasses builds the class; a
+    // winner with a `__new__` of its own is handed the whole call instead
+    // (`type_new_get_bases`). The keywords go on to `__init_subclass__`.
+    if name == "type.__new__" {
+        let mcls = match tp_new_wrapper_check("type", &args)? {
+            NewTarget::Class(c) => c,
+            _ => "type".to_string(),
+        };
+        let rest = &args[1..];
+        if rest.len() != 3 {
+            return Err(host::type_error(&format!(
+                "type.__new__() takes exactly 3 arguments ({} given)",
+                rest.len()
+            )));
+        }
+        let base_names: Vec<String> = with_host(|h| match h.get(&rest[1]) {
+            Some(PyObj::Tuple(items)) => items
+                .iter()
+                .filter_map(|b| match h.get(b) {
+                    Some(PyObj::Class(n)) => Some(n.clone()),
+                    _ => None,
+                })
+                .collect(),
+            _ => vec![],
+        });
+        let winner = with_host(|h| host::calculate_metaclass(h, &mcls, &base_names));
+        if winner != mcls && with_host(|h| has_slot_new(h, &winner)) {
+            let wobj = with_host(|h| h.alloc(PyObj::Class(winner)));
+            let new = get_attr_desc(&wobj, "__new__")?;
+            let mut call_args = vec![wobj];
+            call_args.extend(rest.iter().cloned());
+            return host::invoke(&new, call_args, kwargs);
+        }
+        return type_new_meta(&rest[0], &rest[1], &rest[2], &winner, kwargs);
+    }
     // `object.__new__(cls, *args)` — build a bare instance of the class argument
     // (the args beyond `cls` are consumed by `__init__`, per CPython).
     if name == "object.__new__" {

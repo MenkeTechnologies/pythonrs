@@ -13980,13 +13980,14 @@ impl PyHost {
             // `<type>.__new__` on a builtin type object — a callable constructor.
             // A data type builds a payload-carrying instance when its `__new__`
             // is invoked on a subclass (enum's `_new_member_ = str.__new__`,
-            // `int.__new__`, …); other builtin types fall back to the generic
-            // bare-instance `object.__new__`.
+            // `int.__new__`, …), `type.__new__` builds a class; other builtin types
+            // fall back to the generic bare-instance `object.__new__`.
             Some(PyObj::Builtin(n))
                 if name == "__new__" && crate::builtins::is_type_object_name(n) =>
             {
                 let ctor = match n.as_str() {
-                    "int" | "str" | "float" | "tuple" | "frozenset" | "list" | "dict" | "set" => {
+                    "int" | "str" | "float" | "tuple" | "frozenset" | "list" | "dict" | "set"
+                    | "type" => {
                         format!("{n}.__new__")
                     }
                     _ => "object.__new__".to_string(),
@@ -18898,7 +18899,13 @@ fn metaclass_create(
 /// with no explicit `metaclass=`): the metaclass that is a subclass of every
 /// base's metaclass. `"type"` when no base carries a user metaclass.
 pub fn default_metaclass(h: &PyHost, bases: &[String]) -> String {
-    let mut winner = "type".to_string();
+    calculate_metaclass(h, "type", bases)
+}
+
+/// `_PyType_CalculateMetaclass`: starting from `meta`, the most-derived of it and
+/// every base's metaclass.
+pub fn calculate_metaclass(h: &PyHost, meta: &str, bases: &[String]) -> String {
+    let mut winner = meta.to_string();
     for b in bases {
         let mb = h
             .classes

@@ -2175,3 +2175,29 @@ for c in ["type('A', (), {}, x=1)", "type('A', (), {}, **{}).__name__", "type('C
         print(c, '->', repr(eval(c)))
     except Exception as e:
         print(c, '!', type(e).__name__, e)
+#==#
+# ── type.__new__ called directly ─────────────────────────────────────────────
+# `type.__new__` resolved to `object.__new__`, so every direct call raised
+# "object.__new__(type) is not safe"; the winning metaclass and a winner with
+# its own `__new__` (`type_new_get_bases`) are part of the same call.
+def t(c):
+    try:
+        print(c, "->", repr(eval(c)))
+    except Exception as e:
+        print(c, "!", type(e).__name__, e)
+class B:
+    def __init_subclass__(cls, **kw): print("isc", cls.__name__, kw)
+class M(type):
+    pass
+class N(type):
+    def __new__(m, name, bases, ns, **kw):
+        print("N.__new__", m.__name__, name, kw)
+        return super().__new__(m, name, bases, ns)
+class WithN(metaclass=N): pass
+for c in ["type.__new__(type, 'A', (), {}).__name__", "type.__new__(type, 'A', (), {}, x=1)",
+          "type.__new__(type, 'D', (B,), {}, y=2).__name__", "type(type.__new__(M, 'E', (), {})).__name__",
+          "type(type.__new__(type, 'F', (WithN,), {}, z=3)).__name__", "type.__new__(type, 1)",
+          "type.__new__(type, 'A', [], {})", "type.__new__(int, 'A', (), {})", "type.__new__()",
+          "type.__new__(1, 'A', (), {})", "type(type.__new__(type, 'G', (type.__new__(M, 'H', (), {}),), {})).__name__",
+          "type.__new__(type, 'A', (), {}, **{}).__mro__"]:
+    t(c)
