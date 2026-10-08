@@ -17124,6 +17124,24 @@ pub fn call_type_method(
         "memoryview" if name == "hex" => {
             memoryview_method(recv, name, &fold_method_kwargs(&tn, name, &args, &kwargs)?)
         }
+        "memoryview" if name == "tobytes" => {
+            clinic_kw_names("tobytes", &["order"], args.len(), &kwargs)?;
+            // The clinic conversion (`str(accept={str, NoneType})`) runs before
+            // the body's released-view check; the value is checked after it.
+            let order = args.first().cloned().or_else(|| kw_get(&kwargs, "order"));
+            if let Some(o) = order.as_ref().filter(|o| !matches!(o, Value::Undef)) {
+                let s = with_host(|h| h.as_str(o)).ok_or_else(|| {
+                    host::type_error(&format!(
+                        "tobytes() argument 'order' must be str or None, not {}",
+                        with_host(|h| h.tp_name(o))
+                    ))
+                })?;
+                if s.contains('\0') {
+                    return Err("ValueError: embedded null character".into());
+                }
+            }
+            memoryview_method(recv, name, &order.into_iter().collect::<Vec<_>>())
+        }
         "memoryview" => memoryview_method(recv, name, &args),
         "list" => list_method(recv, name, &args, &kwargs),
         "dict" => dict_method(recv, name, &args, &kwargs),
@@ -19081,6 +19099,10 @@ fn builtin_method_arity(tn: &str, name: &str) -> Option<Arity> {
             return Some(Arity::ExactlyOne)
         }
         ("range", "count" | "index") => return Some(Arity::ExactlyOne),
+        // `memoryobject.c`'s clinic signatures.
+        ("memoryview", "tolist" | "release") => return Some(Arity::NoArgs),
+        ("memoryview", "tobytes") => return Some(Arity::ClinicRange(0, 1, 1)),
+        ("memoryview", "hex") => return Some(Arity::ClinicRange(0, 2, 2)),
         _ => {}
     }
     let bytes = matches!(tn, "bytes" | "bytearray");
@@ -21751,7 +21773,15 @@ fn memoryview_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, 
     let bytes = with_host(|h| h.mv_bytes(recv))?;
     match name {
         "__enter__" => Ok(recv.clone()),
-        "tobytes" => Ok(with_host(|h| h.alloc(PyObj::Bytes(bytes)))),
+        // `memoryview_tobytes_impl`: `order` is validated even though a 1-D
+        // contiguous view reads the same bytes in every order.
+        "tobytes" => {
+            let order = args.first().and_then(|o| with_host(|h| h.as_str(o)));
+            if order.is_some_and(|s| !matches!(s.as_str(), "C" | "F" | "A")) {
+                return Err("ValueError: order must be 'C', 'F' or 'A'".into());
+            }
+            Ok(with_host(|h| h.alloc(PyObj::Bytes(bytes))))
+        }
         "tolist" => Ok(with_host(|h| {
             let items = bytes.iter().map(|&b| Value::Int(b as i64)).collect();
             h.new_list(items)

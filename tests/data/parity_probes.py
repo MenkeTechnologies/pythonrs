@@ -2230,3 +2230,24 @@ for c in ["(1).__pow__()", "(1).__pow__(1, 2, 3)", "(1).__rpow__()"]:
         print(c, '!', type(e).__name__)
 it = iter([1, 2])
 print(it.__iter__() is it, list(iter(range(2)).__iter__()))
+#==#
+# ── memoryview method arguments: tobytes(order=), counts, keyword names ──────
+# `tobytes` ignored its `order` (and any keyword at all), and `tolist`/`hex`
+# accepted any number of positionals.
+m = memoryview(b"abcd")
+for c in ["m.tobytes(1, 2)", "m.tobytes(order=1)", "m.tobytes(1)", "m.tobytes('X')", "m.tobytes('C', order='C')", "m.tobytes(order='F')", "m.tobytes(None)", "m.tobytes('A\\0')", "m.tobytes(order='')", "m[1:3].tobytes(order='A')", "m.tolist(1)", "m.hex(1,2,3)"]:
+    try:
+        print(c, '->', repr(eval(c)))
+    except Exception as e:
+        print(c, '!', type(e).__name__, e)
+# The unknown-keyword wording moved in 3.13; the exception type did not.
+try:
+    m.tobytes(foo=1)
+except TypeError as e:
+    print("tobytes(foo=1)", type(e).__name__)
+r = memoryview(b"ab"); r.release()
+for c in ["r.tobytes(1)", "r.tobytes('X')", "r.tobytes()"]:
+    try:
+        print(c, '->', repr(eval(c)))
+    except Exception as e:
+        print(c, '!', type(e).__name__, e)
