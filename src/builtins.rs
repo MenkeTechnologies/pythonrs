@@ -11489,9 +11489,11 @@ enum Arity {
     /// "name expected K arguments, got N".
     ClinicPositional(usize),
     /// An Argument Clinic function with keyword-capable parameters
-    /// (`_PyArg_UnpackKeywords`): `(min, max_positional, max_total)`. More
-    /// arguments than parameters, keywords included, is "name() takes at most
-    /// MAX argument(s) (N given)"; more positionals than the positional-capable
+    /// (`_PyArg_UnpackKeywords`): `(min, max_positional, max_total)`, where `min`
+    /// counts the required positional-ONLY parameters (the ones no keyword can
+    /// fill). More arguments than parameters, keywords included, is "name() takes
+    /// at most MAX argument(s) (N given)" ("keyword argument(s)" when none was
+    /// positional); more positionals than the positional-capable
     /// parameters is "takes at most K positional argument(s)" ("takes no
     /// positional arguments" when K is 0); too few is "takes at least MIN
     /// positional argument(s)". Use [`check_arity_kw`] to count keywords.
@@ -11546,8 +11548,11 @@ fn check_arity_kw(
     let plural = |k: usize| if k == 1 { "argument" } else { "arguments" };
     let total = nargs + nkw;
     if total > max_total {
+        // "keyword" when nothing was positional (bpo-31229): the count is then
+        // all keywords, and "at most 1 argument" would misdescribe the call.
         return Err(host::type_error(&format!(
-            "{name}() takes at most {max_total} {} ({total} given)",
+            "{name}() takes at most {max_total} {}{} ({total} given)",
+            if nargs == 0 { "keyword " } else { "" },
             plural(max_total)
         )));
     }
@@ -11561,9 +11566,12 @@ fn check_arity_kw(
             )
         }));
     }
-    if nkw == 0 && nargs < min {
+    // `min` counts only the required POSITIONAL-ONLY parameters, which no
+    // keyword can supply: `b''.translate(delete=b'')` still lacks `table`.
+    if nargs < min {
         return Err(host::type_error(&format!(
-            "{name}() takes at least {min} positional {} ({nargs} given)",
+            "{name}() takes {} {min} positional {} ({nargs} given)",
+            if min < max_pos { "at least" } else { "exactly" },
             plural(min)
         )));
     }
@@ -16581,11 +16589,8 @@ fn builtin_extra_method(
     kwargs: &[(String, Value)],
 ) -> Option<Result<Value, String>> {
     let arg0 = || args.first().cloned().unwrap_or(Value::Undef);
-    if let Some(spec) = builtin_method_arity(tn, name) {
-        let qual = format!("{}.{name}", if tn == "bool" { "int" } else { tn });
-        if let Err(e) = check_arity_kw(name, &qual, spec, args.len(), kwargs.len()) {
-            return Some(Err(e));
-        }
+    if let Err(e) = check_builtin_method_call(tn, name, args.len(), kwargs.len()) {
+        return Some(Err(e));
     }
     // An alternate constructor is a CLASSMETHOD, so it is reachable off an
     // instance as well as off the type — `(5).from_bytes(b'\x01')` is `1`, the
@@ -16908,10 +16913,7 @@ pub fn call_type_method(
             .any(|e| theirs.iter().any(|o| with_host(|h| h.equal(e, o))));
         return Ok(Value::Bool(disjoint));
     }
-    if let Some(spec) = builtin_method_arity(&tn, name) {
-        let qual = format!("{}.{name}", if tn == "bool" { "int" } else { tn.as_str() });
-        check_arity_kw(name, &qual, spec, args.len(), kwargs.len())?;
-    }
+    check_builtin_method_call(&tn, name, args.len(), kwargs.len())?;
     match tn.as_str() {
         // A binary-operator dunder called as a bound method. First, because no
         // per-type table names one — an operator slot is dispatched natively, so
@@ -16924,56 +16926,11 @@ pub fn call_type_method(
             let s = with_host(|h| h.as_str(recv)).unwrap_or_default();
             str_dot_format(&s, &args, &kwargs)
         }
-        // `str.splitlines(keepends=...)` — fold the keyword into the positional
-        // arg `str_method` reads.
-        "str" if name == "splitlines" && !kwargs.is_empty() => {
-            let a: Vec<Value> = kwargs
-                .iter()
-                .find(|(k, _)| k == "keepends")
-                .map(|(_, v)| v.clone())
-                .into_iter()
-                .collect();
-            str_method(recv, name, &a)
+        "str" => str_method(recv, name, &fold_method_kwargs(&tn, name, &args, &kwargs)?),
+        "bytes" => bytes_method(recv, name, &fold_method_kwargs(&tn, name, &args, &kwargs)?),
+        "bytearray" => {
+            bytearray_method(recv, name, &fold_method_kwargs(&tn, name, &args, &kwargs)?)
         }
-        // `str.encode(encoding=..., errors=...)` — fold keywords into the
-        // positional (encoding, errors) order `str_method`'s `encode` expects.
-        "str" if name == "encode" && !kwargs.is_empty() => {
-            let mut enc = args.first().cloned();
-            let mut err = args.get(1).cloned();
-            for (k, v) in &kwargs {
-                match k.as_str() {
-                    "encoding" => enc = Some(v.clone()),
-                    "errors" => err = Some(v.clone()),
-                    _ => {}
-                }
-            }
-            let mut a2 = vec![enc.unwrap_or_else(|| new_str("utf-8".into()))];
-            if let Some(e) = err {
-                a2.push(e);
-            }
-            str_method(recv, name, &a2)
-        }
-        "str" => str_method(recv, name, &fold_str_kwargs(name, &args, &kwargs)?),
-        // `bytes/bytearray.decode(encoding=..., errors=...)` — fold keywords into
-        // the positional (encoding, errors) order the decoder expects.
-        "bytes" | "bytearray" if name == "decode" && !kwargs.is_empty() => {
-            let mut enc = args.first().cloned();
-            let mut err = args.get(1).cloned();
-            for (k, v) in &kwargs {
-                match k.as_str() {
-                    "encoding" => enc = Some(v.clone()),
-                    "errors" => err = Some(v.clone()),
-                    _ => {}
-                }
-            }
-            let mut a2 = vec![enc.unwrap_or_else(|| new_str("utf-8".into()))];
-            if let Some(e) = err {
-                a2.push(e);
-            }
-            decode_bytes(&recv_bytes(recv), &a2)
-        }
-        "bytes" => bytes_method(recv, name, &args),
-        "bytearray" => bytearray_method(recv, name, &args),
         "memoryview" => memoryview_method(recv, name, &args),
         "list" => list_method(recv, name, &args, &kwargs),
         "dict" => dict_method(recv, name, &args, &kwargs),
@@ -17436,40 +17393,53 @@ pub(crate) fn str_splitlines(s: &str, keepends: bool) -> Vec<String> {
     out
 }
 
-/// The positional index a keyword argument occupies for a `str` method that
-/// accepts keywords (`"a b".split(maxsplit=1)` → `maxsplit` is arg 1). Only the
-/// argument-clinic methods below take keywords; every other `str` method is
-/// `METH_VARARGS`-only and rejects them (see `str_accepts_kwargs`). `None` = an
-/// unexpected keyword for that method.
-fn str_kwarg_pos(method: &str, kw: &str) -> Option<usize> {
+/// The positional index a keyword argument occupies for a `str`/`bytes`/
+/// `bytearray` method that accepts keywords (`"a b".split(maxsplit=1)` →
+/// `maxsplit` is arg 1). These are the Argument Clinic methods whose parameters
+/// are not all positional-only; a positional-only parameter (`str.replace`'s
+/// `old`/`new`, `bytes.translate`'s `table`) has no keyword name, so it is
+/// `None` here like any other unexpected keyword. Every other method of these
+/// types rejects keywords outright (see [`method_accepts_kwargs`]).
+fn method_kwarg_pos(bytes: bool, method: &str, kw: &str) -> Option<usize> {
     Some(match (method, kw) {
         ("split" | "rsplit", "sep") => 0,
         ("split" | "rsplit", "maxsplit") => 1,
-        ("replace", "old") => 0,
-        ("replace", "new") => 1,
-        ("replace", "count") => 2,
         ("expandtabs", "tabsize") | ("splitlines", "keepends") => 0,
+        ("encode", "encoding") if !bytes => 0,
+        ("encode", "errors") if !bytes => 1,
+        ("replace", "count") if !bytes => 2,
+        ("decode", "encoding") if bytes => 0,
+        ("decode", "errors") if bytes => 1,
+        ("hex", "sep") if bytes => 0,
+        ("hex", "bytes_per_sep") if bytes => 1,
+        ("translate", "delete") if bytes => 1,
         _ => return None,
     })
 }
 
-/// Whether CPython accepts keyword arguments for this `str` method. Most reject
-/// them (`str.center() takes no keyword arguments`); only these argument-clinic
-/// methods accept keywords. (`encode`/`splitlines`-with-kwargs are folded by
-/// dedicated arms before reaching here; both are listed for completeness.)
-fn str_accepts_kwargs(method: &str) -> bool {
-    matches!(
-        method,
-        "split" | "rsplit" | "replace" | "expandtabs" | "splitlines" | "encode"
-    )
+/// Whether CPython accepts keyword arguments for this `str`/`bytes`/`bytearray`
+/// method. The rest are `METH_O`/`METH_VARARGS`/positional-only `METH_FASTCALL`,
+/// whose descriptor refuses any keyword with `str.center() takes no keyword
+/// arguments` BEFORE the argument count is looked at.
+fn method_accepts_kwargs(bytes: bool, method: &str) -> bool {
+    match method {
+        "split" | "rsplit" | "expandtabs" | "splitlines" => true,
+        "encode" | "replace" => !bytes,
+        "decode" | "hex" | "translate" => bytes,
+        _ => false,
+    }
 }
 
-/// Fold keyword arguments into the positional slots `str_method` reads, so a
-/// keyword call (`"a b c".split(maxsplit=1)`) behaves like the positional form.
-/// A method that does not accept keywords, or an unexpected keyword name, raises
-/// the same `TypeError` CPython does. Unfilled interior slots become
-/// `Value::Undef` (treated as "not given").
-fn fold_str_kwargs(
+/// Fold keyword arguments into the positional slots the `str`/`bytes` method
+/// bodies read, so a keyword call (`b"a b c".split(maxsplit=1)`) behaves like
+/// the positional form. The argument COUNT has already been checked
+/// ([`check_arity_kw`]); what remains is `_PyArg_UnpackKeywords`'s name
+/// matching, in its order: a parameter supplied both by position and by name
+/// is reported first (lowest position wins), then the first keyword naming no
+/// parameter at all. Unfilled interior slots become `Value::Undef`, which the
+/// bodies read as the parameter's `None` default.
+fn fold_method_kwargs(
+    tn: &str,
     method: &str,
     args: &[Value],
     kwargs: &[(String, Value)],
@@ -17477,26 +17447,38 @@ fn fold_str_kwargs(
     if kwargs.is_empty() {
         return Ok(args.to_vec());
     }
-    if !str_accepts_kwargs(method) {
-        return Err(format!(
-            "TypeError: str.{method}() takes no keyword arguments"
-        ));
+    let bytes = tn != "str";
+    if !method_accepts_kwargs(bytes, method) {
+        return Err(host::type_error(&format!(
+            "{tn}.{method}() takes no keyword arguments"
+        )));
+    }
+    let named: Vec<(Option<usize>, &String, &Value)> = kwargs
+        .iter()
+        .map(|(k, v)| (method_kwarg_pos(bytes, method, k), k, v))
+        .collect();
+    if let Some((pos, k, _)) = named
+        .iter()
+        .filter_map(|&(p, k, v)| p.filter(|&p| p < args.len()).map(|p| (p, k, v)))
+        .min_by_key(|&(p, _, _)| p)
+    {
+        return Err(host::type_error(&format!(
+            "argument for {method}() given by name ('{k}') and position ({})",
+            pos + 1
+        )));
+    }
+    if let Some((_, k, _)) = named.iter().find(|(p, _, _)| p.is_none()) {
+        return Err(host::type_error(&format!(
+            "{method}() got an unexpected keyword argument '{k}'"
+        )));
     }
     let mut out: Vec<Option<Value>> = args.iter().cloned().map(Some).collect();
-    for (k, v) in kwargs {
-        match str_kwarg_pos(method, k) {
-            Some(pos) => {
-                if pos >= out.len() {
-                    out.resize(pos + 1, None);
-                }
-                out[pos] = Some(v.clone());
-            }
-            None => {
-                return Err(format!(
-                    "TypeError: {method}() got an unexpected keyword argument '{k}'"
-                ))
-            }
+    for (pos, _, v) in named {
+        let pos = pos.unwrap_or_default();
+        if pos >= out.len() {
+            out.resize(pos + 1, None);
         }
+        out[pos] = Some(v.clone());
     }
     Ok(out.into_iter().map(|o| o.unwrap_or(Value::Undef)).collect())
 }
@@ -18762,6 +18744,24 @@ fn parse_markup_field(chars: &[char], pos: &mut usize) -> Result<MarkupField, St
         }
     }
     Err("ValueError: unmatched '{' in format spec".into())
+}
+
+/// The argument contract of a builtin method, checked before any keyword is
+/// folded into the positional list: [`builtin_method_arity`]'s count, preceded
+/// for `str`/`bytes`/`bytearray` by the descriptor's own refusal of keywords.
+/// A method that takes none refuses them before the count is looked at —
+/// `'a'.center(fillchar='x')` is "str.center() takes no keyword arguments",
+/// not a missing `width`.
+fn check_builtin_method_call(tn: &str, name: &str, nargs: usize, nkw: usize) -> Result<(), String> {
+    let Some(spec) = builtin_method_arity(tn, name) else {
+        return Ok(());
+    };
+    let qual = format!("{}.{name}", if tn == "bool" { "int" } else { tn });
+    let text_like = matches!(tn, "str" | "bytes" | "bytearray");
+    if text_like && nkw > 0 && !method_accepts_kwargs(tn != "str", name) {
+        return Err(host::type_error(&format!("{qual}() takes no keyword arguments")));
+    }
+    check_arity_kw(name, &qual, spec, nargs, nkw)
 }
 
 /// The argument-count contract of a method of `str`/`bytes`/`bytearray`,
@@ -21585,42 +21585,7 @@ fn bytes_common_method(
     };
     match name {
         "decode" => decode_bytes(&bytes, args),
-        "hex" => {
-            // `hex(sep=None, bytes_per_sep=1)`: with a separator, insert it every
-            // `|bytes_per_sep|` bytes — grouping from the RIGHT for a positive
-            // count, from the LEFT for a negative one (CPython's rule).
-            match args.first() {
-                None => Ok(new_str(bytes.iter().map(|b| format!("{b:02x}")).collect())),
-                Some(sep_v) => {
-                    let sep = with_host(|h| h.as_str(sep_v))
-                        .ok_or_else(|| host::type_error("sep must be str or bytes"))?;
-                    let group = args
-                        .get(1)
-                        .and_then(|v| with_host(|h| h.as_int(v)))
-                        .unwrap_or(1);
-                    if group == 0 {
-                        return Err("ValueError: bytes_per_sep must not be zero".into());
-                    }
-                    let g = group.unsigned_abs() as usize;
-                    let n = bytes.len();
-                    let mut out = String::with_capacity(n * 2 + n);
-                    for (i, b) in bytes.iter().enumerate() {
-                        if i > 0 {
-                            let boundary = if group > 0 {
-                                (n - i) % g == 0
-                            } else {
-                                i % g == 0
-                            };
-                            if boundary {
-                                out.push_str(&sep);
-                            }
-                        }
-                        out.push_str(&format!("{b:02x}"));
-                    }
-                    Ok(new_str(out))
-                }
-            }
-        }
+        "hex" => Ok(new_str(bytes_hex(&bytes, args)?)),
         // `fromhex` is a classmethod but is also reachable through an instance.
         "fromhex" => Ok(mk_bytes(is_ba, bytes_fromhex(args)?)),
         "upper" => Ok(mk_bytes(is_ba, bytes.to_ascii_uppercase())),
@@ -21946,6 +21911,59 @@ fn pad_bytes(bytes: &[u8], args: &[Value], mode: char) -> Result<Vec<u8>, String
             out.extend_from_slice(bytes);
             out.extend(std::iter::repeat(fill).take(right));
         }
+    }
+    Ok(out)
+}
+
+/// `bytes.hex(sep=<unset>, bytes_per_sep=1)`, ported from CPython's
+/// `_Py_strhex_impl` (`Python/pystrhex.c`). `sep` is a 1-character `str` or a
+/// 1-byte `bytes`, inserted every `|bytes_per_sep|` bytes — grouping from the
+/// RIGHT for a positive count, from the LEFT for a negative one; a count of 0
+/// inserts nothing. `bytes_per_sep` is a C `int`. An unset `sep` ignores the
+/// count entirely. (`Value::Undef` is read as unset, so an explicit `None`
+/// does not raise the `has no len()` CPython gives it.)
+fn bytes_hex(bytes: &[u8], args: &[Value]) -> Result<String, String> {
+    let digits = |b: &[u8]| b.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let sep_v = match args.first() {
+        None | Some(Value::Undef) => return Ok(digits(bytes)),
+        Some(v) => v,
+    };
+    if py_len(sep_v)? != 1 {
+        return Err("ValueError: sep must be length 1.".into());
+    }
+    let sep = with_host(|h| match h.get(sep_v) {
+        Some(PyObj::Bytes(b)) => Some(u32::from(b[0])),
+        _ => h.as_str(sep_v).and_then(|s| s.chars().next()).map(u32::from),
+    });
+    let sep = match sep {
+        Some(c) if c > 0x7f => return Err("ValueError: sep must be ASCII.".into()),
+        Some(c) => c as u8 as char,
+        None => return Err(host::type_error("sep must be str or bytes.")),
+    };
+    let group = match args.get(1) {
+        None => 1,
+        Some(v) => match with_host(|h| h.index_fit(v)) {
+            host::IndexFit::Fits(n) => i32::try_from(n).map_err(|_| {
+                "OverflowError: Python int too large to convert to C int".to_string()
+            })?,
+            host::IndexFit::TooLarge(_) => {
+                return Err("OverflowError: Python int too large to convert to C int".into())
+            }
+            host::IndexFit::NotInt => ssize_arg(v)? as i32,
+        },
+    };
+    if group == 0 {
+        return Ok(digits(bytes));
+    }
+    let g = group.unsigned_abs() as usize;
+    let n = bytes.len();
+    let mut out = String::with_capacity(n * 3);
+    for (i, b) in bytes.iter().enumerate() {
+        let boundary = if group > 0 { (n - i) % g == 0 } else { i % g == 0 };
+        if i > 0 && boundary {
+            out.push(sep);
+        }
+        out.push_str(&format!("{b:02x}"));
     }
     Ok(out)
 }

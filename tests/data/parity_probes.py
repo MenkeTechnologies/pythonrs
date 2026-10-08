@@ -2021,3 +2021,26 @@ for call in (lambda: b'a'.translate(None, b'', b''), lambda: 'a'.translate(None,
         call()
     except TypeError as e:
         print(e)
+#==#
+# ── str/bytes method keywords: folded for bytes too, refused before the count ─
+# `bytes` dropped every keyword but `decode`'s, so `split(maxsplit=1)` split
+# everywhere; `_PyArg_UnpackKeywords`'s own diagnostics in their own order.
+for T in (bytes, bytearray):
+    b = T(b'a b\tc\nd')
+    print(b.split(maxsplit=1), b.rsplit(sep=b' ', maxsplit=1))
+    print(b.splitlines(keepends=True), b.expandtabs(tabsize=2))
+    print(b.translate(None, delete=b'a'), b.hex(sep=':'), b.hex(b'-', bytes_per_sep=-3))
+cases = [
+    "b'a b'.split(b' ', sep=b'x')", "b'a'.center(3, fillchar=b'*')",
+    "b'a'.translate(delete=b'')", "b'a'.replace(b'a', b'b', count=1)",
+    "'a'.center(fillchar='x')", "'a'.translate(table=None)", "'a'.format_map(x=1)",
+    "'a'.expandtabs(tabsize=1, foo=2)",
+    "'a b'.split(' ', sep='x')", "'a'.encode('utf-8', encoding='x')",
+    "b'ab'.hex(b'--')", "b'ab'.hex('\\xe9')", "b'ab'.hex(bytearray(b'-'))", "b'abc'.hex(':', 0)",
+    "b'abc'.hex(':', 2**70)",
+]
+for c in cases:
+    try:
+        print(c, '->', repr(eval(c)))
+    except Exception as e:
+        print(c, '!', type(e).__name__, e)
