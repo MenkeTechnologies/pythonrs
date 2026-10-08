@@ -2128,3 +2128,39 @@ for c in cases:
         print(c, '!', type(e).__name__, e)
 ba = bytearray(b'abcd')
 print(ba.pop(1), ba.pop(-1), ba)
+#==#
+# ── property __doc__: doc=, the getter's docstring, getter()/setter() copies ──
+# `property(doc=…)` dropped the doc and never borrowed the getter's docstring,
+# so every `__doc__` read None; `getter()` must re-read the NEW getter's doc
+# only when the original borrowed it, and an accessor of None keeps the old one.
+def g(s):
+    "getdoc"
+def h(s):
+    "hdoc"
+def nd(s): pass
+class Bad:
+    @property
+    def __doc__(self): raise ValueError("boom")
+    def __call__(self, s): return 1
+cases = [
+    "property(nd, doc='hello').__doc__", "property(g).__doc__", "property(g, None, None, 'x').__doc__",
+    "property(fget=g, doc=None).__doc__", "property().__doc__", "property(g).getter(h).__doc__",
+    "property(g, doc='keep').getter(h).__doc__", "property(g).setter(h).__doc__",
+    "property(g).getter(nd).__doc__", "property(g).getter(None).fget is g",
+    "property(g, h).setter(None).fset is h", "property(Bad()).__doc__",
+]
+for c in cases:
+    try:
+        print(c, '->', repr(eval(c)))
+    except Exception as e:
+        print(c, '!', type(e).__name__, e)
+p = property(g, h)
+p.__doc__ = "assigned"
+print(p.deleter(nd).__doc__)
+class C:
+    @property
+    def x(self):
+        "xdoc"
+    @x.setter
+    def x(self, v): pass
+print(C.x.__doc__)

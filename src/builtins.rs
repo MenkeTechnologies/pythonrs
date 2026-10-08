@@ -7432,14 +7432,12 @@ pub fn call_builtin_function(
                 .cloned()
                 .or_else(|| kw_get(&kwargs, "fdel"))
                 .unwrap_or(Value::Undef);
-            Ok(with_host(|h| {
-                h.alloc(PyObj::Property {
-                    fget,
-                    fset,
-                    fdel,
-                    name: String::new(),
-                })
-            }))
+            let doc = args
+                .get(3)
+                .cloned()
+                .or_else(|| kw_get(&kwargs, "doc"))
+                .unwrap_or(Value::Undef);
+            new_property(fget, fset, fdel, doc, String::new())
         }
         "vars" => match args.first() {
             // `vars(obj)` == `obj.__dict__`, but the FAILURE is its own: CPython
@@ -17285,35 +17283,96 @@ fn property_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
     if name == "__isabstractmethod__" {
         return Ok(Value::Bool(false));
     }
-    let (fget, fset, fdel, pname) = with_host(|h| match h.get(recv) {
+    let (fget, fset, fdel, pname, getter_doc, doc) = with_host(|h| match h.get(recv) {
         Some(PyObj::Property {
             fget,
             fset,
             fdel,
             name,
-        }) => (fget.clone(), fset.clone(), fdel.clone(), name.clone()),
-        _ => (Value::Undef, Value::Undef, Value::Undef, String::new()),
+            getter_doc,
+        }) => {
+            let doc = match recv {
+                Value::Obj(id) => h.func_attrs.get(id).and_then(|m| m.get("__doc__")).cloned(),
+                _ => None,
+            };
+            (
+                fget.clone(),
+                fset.clone(),
+                fdel.clone(),
+                name.clone(),
+                *getter_doc,
+                doc.unwrap_or(Value::Undef),
+            )
+        }
+        _ => (Value::Undef, Value::Undef, Value::Undef, String::new(), false, Value::Undef),
     });
+    // `property_copy`: an accessor passed as None keeps the original's, so
+    // `p.setter(None)` copies `p` rather than dropping its setter.
     let f = args.first().cloned().unwrap_or(Value::Undef);
+    let keep = |new: Value, old: Value| if matches!(new, Value::Undef) { old } else { new };
     let (fget, fset, fdel) = match name {
-        "getter" => (f, fset, fdel),
-        "setter" => (fget, f, fdel),
-        "deleter" => (fget, fset, f),
+        "getter" => (keep(f, fget), fset, fdel),
+        "setter" => (fget, keep(f, fset), fdel),
+        "deleter" => (fget, fset, keep(f, fdel)),
         _ => {
             return Err(format!(
                 "AttributeError: 'property' object has no attribute '{name}'"
             ))
         }
     };
+    // A docstring the original borrowed from its getter is re-read from the
+    // copy's getter; an explicit one is carried over unchanged.
+    let doc = if getter_doc && !matches!(fget, Value::Undef) {
+        Value::Undef
+    } else {
+        doc
+    };
     // The copy keeps the original's learned name: `@x.setter` rebinds the same
     // class key, and CPython's `property.setter` copies `__name__` across.
+    new_property(fget, fset, fdel, doc, pname)
+}
+
+/// `property.__init__` (`property_init_impl`): an explicit non-None `doc` is the
+/// property's `__doc__`; failing that, the getter's own non-None `__doc__` is
+/// borrowed and the property remembers that it was (`getter_doc`). Only an
+/// `AttributeError` from that lookup is swallowed, as `PyObject_GetOptionalAttr`
+/// swallows only that.
+fn new_property(
+    fget: Value,
+    fset: Value,
+    fdel: Value,
+    doc: Value,
+    name: String,
+) -> Result<Value, String> {
+    let (doc, getter_doc) = if !matches!(doc, Value::Undef) {
+        (doc, false)
+    } else if !matches!(fget, Value::Undef) {
+        match get_attr_desc(&fget, "__doc__") {
+            Ok(Value::Undef) => (Value::Undef, false),
+            Ok(d) => (d, true),
+            Err(e) if is_attr_err(&e) => (Value::Undef, false),
+            Err(e) => return Err(e),
+        }
+    } else {
+        (Value::Undef, false)
+    };
     Ok(with_host(|h| {
-        h.alloc(PyObj::Property {
+        let prop = h.alloc(PyObj::Property {
             fget,
             fset,
             fdel,
-            name: pname,
-        })
+            name,
+            getter_doc,
+        });
+        // `__doc__` is a writable member; it lives in the side table an
+        // assignment to it writes (see `PyHost::set_attr`).
+        if let (Value::Obj(id), false) = (&prop, matches!(doc, Value::Undef)) {
+            h.func_attrs
+                .entry(*id)
+                .or_default()
+                .insert("__doc__".to_string(), doc);
+        }
+        prop
     }))
 }
 

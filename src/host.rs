@@ -1451,6 +1451,10 @@ pub enum PyObj {
         /// built outside a class body, where `__name__` falls back to the
         /// getter's own name.
         name: String,
+        /// Whether `__doc__` was taken from the getter (`getter_doc` in
+        /// `propertyobject`): a copy made by `getter()` then re-reads the NEW
+        /// getter's docstring instead of keeping the old one.
+        getter_doc: bool,
     },
     /// A `functools.cached_property` descriptor: a *non-data* descriptor whose
     /// first access computes `func(instance)` and stores it in the instance
@@ -13291,6 +13295,7 @@ impl PyHost {
                 fset,
                 fdel,
                 name: pname,
+                ..
             }) if matches!(name, "fget" | "fset" | "fdel" | "__name__") => {
                 Ok(match name {
                     "fget" => fget.clone(),
