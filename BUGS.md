@@ -2357,6 +2357,14 @@ written.
   `inspect.isgeneratorfunction(f)` raises `cannot pass 'code' to a CPython
   stdlib call`; a nested unpacking target
   (`a, (b, c) = 1, (2,)`) carets the outer target, CPython the inner one.
+- **A builtin container iterator walks a snapshot.** `iter(list)`, `iter(dict)`
+  and the other `IterState::Seq`/`DictKeys` cursors copy the items when the
+  iterator is made, so `L = [1, 2]; it = iter(L); L.append(3); list(it)` is
+  `[1, 2]` (CPython `[1, 2, 3]`), a dict grown during iteration ends with
+  `StopIteration` instead of `RuntimeError: dictionary changed size during
+  iteration`, and an iterator has no `__length_hint__` (`operator.length_hint`
+  answers 0). Live cursors over the container are a representation change, not
+  a local fix.
 - **`m.lastindex` / `m.lastgroup` for a group closed inside a look-ahead.**
   Neither engine reports the order in which groups closed, so `lastindex` is
   rebuilt from the result: the group ending last, ties going to the group whose
