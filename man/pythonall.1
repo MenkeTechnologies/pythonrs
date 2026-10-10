@@ -55,25 +55,25 @@ concatenation, bignum promotion, and object construction \(em is served by the
 .B PyHost
 object heap, whose
 .BR str / list / dict / tuple / set
-and instance cells ride through the VM as handles. It is the first compiled
-standalone Python runtime.
+and instance cells ride through the VM as handles.
 .SH 3. ARCHITECTURE
 .EX
 Python source \[->] lexer \[->] parser (AST) \[->] lower to fusevm bytecode \[->] fusevm VM + Cranelift JIT
 .EE
 .PP
 There is no bespoke VM or JIT; execution and codegen live in fusevm, the shared
-engine behind zshrs, stryke, awkrs, elisp, and ruby. Every ordinary run
+engine hosting other language frontends. Every script file run
 transparently caches compiled bytecode in
 .I ~/.pythonrs/scripts.rkyv
-(an rkyv shard); a cache hit skips lex/parse/lower entirely.
+(an rkyv shard); a cache hit skips lex/parse/lower entirely. \fB\-c\fR and stdin
+programs are not cached.
 .SH 4. TOOLING
 .SS Language server (\-\-lsp)
 .B python \-\-lsp
-speaks LSP over stdio: completion and hover from the symbol corpus (the same table
-that generates
-.IR docs/reference.html ),
-and diagnostics from the runtime's own parser. It is read\-only; no output reaches
+speaks LSP over stdio: completion, hover, go\-to\-definition and signature help from the symbol corpus (the
+same table that generates
+.IR docs/reference.html )
+and document scopes, and diagnostics from the runtime's own parser. It is read\-only; no output reaches
 the terminal.
 .SS Debugger (\-\-dap)
 .B python \-\-dap
@@ -95,7 +95,9 @@ FFI runtime), and its exports become callable by name from Python
 .RB ( src/rust_ffi.rs ).
 .SS Deployment and dumps
 .B \-\-build
-AOT\-compiles the script to a standalone native executable.
+compiles the script to a standalone native executable next to the source and warms
+the bytecode cache; it requires a build made with
+.BR "\-\-no\-default\-features" .
 .B \-\-dump\-tokens
 prints the token stream,
 .B \-\-dump\-ast

@@ -11,12 +11,14 @@ lexes and parses Python 3 and lowers it to
 bytecode executed on a three\-tier Cranelift JIT over a PyHost object heap.
 There is no bespoke VM or JIT; execution and codegen live in fusevm.
 .PP
-Every ordinary run transparently caches compiled bytecode in
+Every script file run transparently caches compiled bytecode in
 .I ~/.pythonrs/scripts.rkyv
 (rkyv shard); a cache hit skips lex/parse/lower entirely.
+Script files and imported modules are cached; \fB\-c\fR and stdin programs are
+not.
 .SH OPTIONS
 .TP
-.B \-c \fISRC\fR
+.B \-c \fISRC\fR, \-\-command \fISRC\fR
 Execute a one\-liner instead of a file.
 .TP
 .B \-m \fIMODULE\fR [\fIargs\fR...]
@@ -56,7 +58,10 @@ CPython interpreter flags, accepted for drop\-in compatibility.
 takes real effect via the embedded interpreter; the rest are tolerated no\-ops.
 .TP
 .B \-\-build
-Ahead\-of\-time compile the script to a standalone native executable.
+Compile the script to a standalone native executable named after the source stem,
+next to the source, and warm the bytecode cache. Fails with an error in the
+default (\fBstdlib\-ffi\fR) build; it needs a build made with
+.BR "\-\-no\-default\-features" .
 .TP
 .B \-\-dump\-bytecode
 Print the compiled fusevm bytecode for the script and exit.
@@ -120,6 +125,11 @@ consulted only by a
 .B PYTHONRS_STDLIB
 Override the embedded\-CPython stdlib prefix consulted before the bundled and
 system locations (stdlib\-ffi builds).
+.TP
+.B PYTHONRS_STATICLIB
+Path to the libpythonrs.a consulted by
+.BR \-\-build
+in place of the one beside the running binary.
 .TP
 .B PYTHONHASHSEED
 Seed for
