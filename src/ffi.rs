@@ -2208,7 +2208,7 @@ fn py_to_value_node(host: &mut PyHost, py: Python, obj: &Bound<PyAny>) -> Result
     }
     // CPython `Ellipsis` (`...`) crosses back as the native singleton (distinct
     // from `None`) so identity and repr match.
-    if obj.is(&py.Ellipsis()) {
+    if obj.is(py.Ellipsis()) {
         return Ok(host.alloc(PyObj::Ellipsis));
     }
     if obj.is_exact_instance_of::<PyBool>() {
