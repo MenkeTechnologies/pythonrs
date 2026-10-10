@@ -52,7 +52,7 @@ OrderedDict/namedtuple), `functools.partial`/`lru_cache`, the 3 numeric-core fix
 (**`%`-format full spec, integer floor `//`/`%` divisor-sign, 3-arg modular `pow`**),
 the `with` single-eval + LIFO fix, and wiring for `re/datetime/heapq/bisect/textwrap/
 statistics`. The corpus has no remaining ERR or DIFF rows; grow it before
-reading the 100% as "done" — it is 30 scripts, not a conformance suite.
+reading the 100% as "done" — it is a small script corpus, not a conformance suite.
 
 Tiers are ordered by blast radius toward drop-in. **P0** = the interpreter
 *crashes or hangs* where CPython returns a value — a drop-in must never do this.
@@ -648,19 +648,11 @@ are all closed, and each root cause is checked off in the tiers above:
 
 Re-measure: `cargo build && ./target/debug/parity-fuzz --count 50000`.
 Replay one: `./target/debug/parity-fuzz --once --seed <N>`.
-Per-mode: `--<mode>`, one of the 53 real modes (`mixed` rotates all of them) —
-arith, bignum, floatfmt, strings, fstring, slice, listcomp, dictcomp, setcomp,
-sorting, formatspec, boolint, ranges, strmeth, comparison, builtins, ternary,
-augassign, classes, iterproto, generators, exceptions, unpacking, comprehension,
-dictset, itertools, complexnum, numedge, exceptions2, exceptions3, exceptions4,
-closures, oop2, strfmt2, bytesops, bytestail, format2, strformat, async, async2,
-augwith, descriptors, attr, calls, match, conttail, itertail, metatype, seqtail,
-display, scoping, codec, subclass.
+Per-mode: `--<mode>`, one of the modes defined in `src/bin/parity_fuzz.rs` (`mixed` rotates them).
 
-The generated programs import only `sys` and `asyncio` (both native arms), so no
-case ever crosses the CPython bridge — every bridge defect is structurally
-invisible to `parity-fuzz` and has to be caught by `scripts/dropin_check.sh`
-(which is exactly how the `TextIOWrapper`-into-a-stdlib-call gap surfaced).
+Most generated programs import only native-arm modules, so few cases cross the
+CPython bridge — most bridge defects are invisible to `parity-fuzz` and have to
+be caught by `scripts/dropin_check.sh` (which is exactly how the `TextIOWrapper`-into-a-stdlib-call gap surfaced).
 
 **Object-model modes added 2026-07-19** (`classes`, `iterproto`, `exceptions`) —
 each generates deterministic-stdout programs exercising the OOP surface and is in

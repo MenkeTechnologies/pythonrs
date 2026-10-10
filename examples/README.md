@@ -23,6 +23,7 @@ cargo build --bin python --bin parity
 
 | Script | Shows |
 | --- | --- |
+| `hello.py` | a function, a loop, string concatenation |
 | `fizzbuzz.py` | control flow, three ways |
 | `comprehensions.py` | list/dict/set/generator comprehensions, nesting, walrus |
 | `closures.py` | lexical scope, `nonlocal`, factories, late vs early binding |

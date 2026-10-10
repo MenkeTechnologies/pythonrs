@@ -22,16 +22,11 @@ frontend — a lexer/parser and compiler that lowers Python 3 to `fusevm::Chunk`
 bytecode running on the fusevm three-tier Cranelift JIT, over a `PyHost` object
 heap. There is no bespoke VM and no bespoke JIT: pythonrs is a pure front end;
 execution and codegen live in `fusevm` — the same engine behind
-[`zshrs`](https://github.com/MenkeTechnologies/zshrs),
-[`strykelang`](https://github.com/MenkeTechnologies/strykelang),
-[`awkrs`](https://github.com/MenkeTechnologies/awkrs),
-[`vimlrs`](https://github.com/MenkeTechnologies/vimlrs),
-[`elisprs`](https://github.com/MenkeTechnologies/elisprs), and
-[`rubylang`](https://github.com/MenkeTechnologies/rubylang).
+[`zshrs`](https://github.com/MenkeTechnologies/zshrs) and
+other language frontends.
 
-It is the first compiled standalone Python runtime that both
-**transparently caches bytecode via rkyv on every run** and **AOT-compiles a
-script to a native executable**.
+pythonrs both **transparently caches bytecode via rkyv on every run** and
+**AOT-compiles a script to a native executable**.
 
 ### [`Read the Docs`](https://menketechnologies.github.io/pythonrs/) &middot; [`Engineering Report`](https://menketechnologies.github.io/pythonrs/report.html) &middot; [`Builtin Reference`](https://menketechnologies.github.io/pythonrs/reference.html)
 
@@ -62,7 +57,7 @@ promotion, exact `int`-against-`float` comparison, attribute and method dispatch
 runs through a strict numeric hook and a numbered builtin-call protocol into the
 `PyHost` object heap.
 
-Two things set it apart from every other standalone Python:
+Two properties of the runtime:
 
 - **Transparent rkyv bytecode cache — on every run.** `python foo.py` hashes the
   source, consults `~/.pythonrs/scripts.rkyv`, and on a hit runs the compiled
@@ -323,7 +318,7 @@ good enough. Porting that code closed three of the four; the fourth needed the
 FMA contraction clang applies to `num*x + coeff` by default, which is one
 rounding where a literal Rust translation has two.
 
-Counting the corpus again against the 68 modes that preceded them produced
+Counting the corpus again against the modes that preceded them produced
 `--mode itertail2` and `--mode numintro`. `pairwise`, `starmap`, `groupby`,
 `zip_longest`, `filterfalse`, `dropwhile`, `takewhile`, `compress`,
 `permutations`, `combinations_with_replacement` and `chain.from_iterable` are all
@@ -403,7 +398,7 @@ the generated `reference.html`.
 - **Docs site** — <https://menketechnologies.github.io/pythonrs/>
 - **Engineering report** — <https://menketechnologies.github.io/pythonrs/report.html>
 - **Builtin reference** — <https://menketechnologies.github.io/pythonrs/reference.html>
-- **The shared VM** — [`fusevm`](https://github.com/MenkeTechnologies/fusevm), also behind `zshrs`, `strykelang`, `awkrs`, `vimlrs`, `elisprs`, `rubylang`.
+- **The shared VM** — [`fusevm`](https://github.com/MenkeTechnologies/fusevm), shared with other language frontends.
 
 ## [0xFF] LICENSE
 

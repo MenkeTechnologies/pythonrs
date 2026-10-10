@@ -27,7 +27,7 @@ delegates to CPython.
 1. **Cargo** — optional dep, feature ON by default:
    ```toml
    [dependencies]
-   pyo3 = { version = "0.24", features = ["abi3-py39", "auto-initialize"], optional = true }
+   pyo3 = { version = "0.29", features = ["abi3-py39", "auto-initialize"], optional = true }
    [features]
    default = ["stdlib-ffi"]
    stdlib-ffi = ["dep:pyo3"]
@@ -89,7 +89,7 @@ delegates to CPython.
    `re/datetime/heapq/bisect`), along with their `import_module`/`call_builtin_function`/
    `is_builtin_function` wiring. What remains under `src/stdlib/` is the genuinely-native
    set the bridge does not serve: `binascii codecs pyast pycsv pyhash pyimp pyio pyopcode
-   pysignal pystruct pythread pytokenize`. `sys` stays wholly native (its `argv`/`exit`/
+   pyre pyreflag pysignal pystruct pythread pytokenize`. `sys` stays wholly native (its `argv`/`exit`/
    `stdout` are fusevm-runtime objects, deliberately never deferred), while `math`,
    `collections`, `functools`, and `contextlib` resolve their native arms first and
    defer to CPython only on a miss (`module_ffi_fallback`, `src/host.rs`).
