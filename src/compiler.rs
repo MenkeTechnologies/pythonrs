@@ -183,6 +183,10 @@ pub struct Compiler {
     /// there is reported as an asynchronous *comprehension* outside an async
     /// function, which is the message CPython uses.
     in_comprehension: bool,
+    /// The free variables (`co_freevars`) of the function being lowered. A
+    /// read of one that has no value is `NameError: cannot access free
+    /// variable ...`, not the plain `name ... is not defined`.
+    cur_freevars: HashSet<String>,
     /// The extent of the outermost list/set/dict comprehension being lowered
     /// in the nearest non-comprehension scope, where CPython's symbol table
     /// reports an asynchronous comprehension outside an async function.
@@ -392,8 +396,29 @@ impl Compiler {
         // which mints it as a new float object (`builtins::new_object_result`):
         // CPython's `inf - inf` is a fresh object with an identity of its own.
         b.set_nan_result_hook(true);
-        let c = b.build();
         let mut frame = self.positions.pop().unwrap_or_default();
+        // Position tables are looked up by the chunk's `op_hash` (ops and
+        // constants), so two chunks with identical ops at different places in
+        // the source would share one table and draw each other's carets. A
+        // constant derived from the spans keeps their hashes apart.
+        {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            for sp in &frame {
+                (
+                    sp.line,
+                    sp.end_line,
+                    sp.start,
+                    sp.end,
+                    sp.anchor_start,
+                    sp.anchor_end,
+                )
+                    .hash(&mut h);
+                sp.suppress.hash(&mut h);
+            }
+            b.add_constant(Value::Int((h.finish() >> 1) as i64));
+        }
+        let c = b.build();
         frame.resize(c.ops.len(), Span::NONE);
         // Collect rather than register: `load_merged` registers the whole set at
         // run time, so a cache-loaded program (which skips compilation) registers
@@ -2469,6 +2494,14 @@ impl Compiler {
         // and a comprehension is transparent (it inherits).
         let saved_aw = self.await_scope;
         let saved_inc = self.in_comprehension;
+        let saved_free = std::mem::replace(
+            &mut self.cur_freevars,
+            if kind == ScopeKind::ClassBody {
+                HashSet::new()
+            } else {
+                freevars.iter().cloned().collect()
+            },
+        );
         self.await_scope = match kind {
             ScopeKind::ClassBody => AwaitScope::Module,
             ScopeKind::Comprehension => saved_aw,
@@ -2492,6 +2525,7 @@ impl Compiler {
         self.def_depth = saved_fs;
         self.await_scope = saved_aw;
         self.in_comprehension = saved_inc;
+        self.cur_freevars = saved_free;
         if pushed {
             self.func_scopes.pop();
         }
@@ -2988,7 +3022,12 @@ impl Compiler {
                     }
                 } else {
                     self.name_const(b, n);
-                    let idx = b.emit(Op::CallBuiltin(ops::GETLOCAL, 1), self.cur_line);
+                    let op = if self.cur_freevars.contains(n) {
+                        ops::GETFREE
+                    } else {
+                        ops::GETLOCAL
+                    };
+                    let idx = b.emit(Op::CallBuiltin(op, 1), self.cur_line);
                     self.record_span(idx);
                 }
             }

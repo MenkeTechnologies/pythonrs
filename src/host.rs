@@ -120,6 +120,7 @@ pub mod ops {
     pub const LOAD_METHOD: u16 = 87; // [recv, name] -> [self_or_none, name, callee_or_none] (resolve before the args)
     pub const CALL_LOADED: u16 = 88; // [self_or_none, name, callee_or_none, args...]
     pub const CALL_LOADED_KW: u16 = 89; // [self_or_none, name, callee_or_none, args..., kwdict]
+    pub const GETFREE: u16 = 90; // [name] -> a free variable's value, or "cannot access free variable" NameError
 }
 
 /// In-place (augmented-assignment) op tags carried by `ops::INPLACE`. One per
@@ -864,6 +865,11 @@ pub enum ItKind {
     /// An `itertools._grouper`: `sources[0]` is its groupby, `buf[0]` the key it
     /// yields for, `nums[0]` the grouper number it was created under.
     Grouper,
+    /// One branch of an `itertools.tee`: `sources[0]` is the shared input
+    /// iterator, `sources[1]` the shared list of items pulled so far, and
+    /// `nums[0]` this branch's read position in that list. The branch that is
+    /// furthest ahead pulls from the input; the others replay the list.
+    Tee,
 }
 
 impl ItKind {
@@ -885,6 +891,7 @@ impl ItKind {
             ItKind::Batched => "itertools.batched",
             ItKind::GroupBy => "itertools.groupby",
             ItKind::Grouper => "itertools._grouper",
+            ItKind::Tee => "itertools._tee",
         }
     }
 }
@@ -1156,6 +1163,9 @@ pub enum PyObj {
     Traceback {
         frames: Vec<(String, u32)>,
         idx: usize,
+        /// The same frames in full (file, caret span), so a traceback handed
+        /// to `traceback.format_tb` renders as the uncaught one does.
+        entries: Rc<Vec<TbFrame>>,
     },
     /// A stack frame object (`tb.tb_frame`). Minimal: the scope name and current
     /// line, with `f_globals` the running module's globals.
@@ -1297,6 +1307,15 @@ pub enum PyObj {
     CallIter {
         func: Value,
         sentinel: Value,
+        done: bool,
+    },
+    /// CPython's `iterator` (`PySeqIter_Type`) over an object with only
+    /// `__getitem__`: each step calls `obj[idx]` (idx = 0, 1, ...), and an
+    /// `IndexError`/`StopIteration` ends it for good (`done`). Lazy, as CPython
+    /// is — the sequence may be unbounded.
+    SeqIter {
+        obj: Value,
+        idx: i64,
         done: bool,
     },
     /// An imported module. The namespace is NOT stored here — it is the module's
@@ -2131,6 +2150,13 @@ pub struct Frame {
     pub file: Option<Rc<str>>,
 }
 
+/// `(filename, scope, line, caret start, caret end)` of a frame a CPython
+/// traceback is synthesized from.
+pub type TbFrameSpec = (String, String, u32, u32, u32);
+/// `(filename, line, scope, caret columns)` of a frame a `StackSummary` is
+/// built from.
+pub type SummaryPart = (String, u32, String, Option<(u32, u32)>);
+
 /// One pythonrs frame an exception passed through: the scope name, the line
 /// and caret span it was executing, and the module whose file holds it.
 #[derive(Clone, Debug)]
@@ -2314,6 +2340,9 @@ pub struct PyHost {
     /// `.0` = `__cause__` (`raise X from Y`), `.1` = `__context__` (the
     /// exception being handled when this one was raised). `Value::Undef` = unset.
     pub exc_links: HashMap<u32, (Value, Value)>,
+    /// Per class name, the last `name#n` registry key handed out, so a name
+    /// reused many times (a class built inside a loop) does not rescan.
+    pub class_key_counter: HashMap<String, usize>,
     /// The `co_filename` of each function compiled by `eval`/`exec` from a
     /// string, by def id; a function absent here lives in its module's file.
     pub code_files: HashMap<usize, Rc<str>>,
@@ -2621,6 +2650,12 @@ pub struct ForeignExc {
     pub attrs: Vec<(String, Value)>,
     /// The raised CPython exception itself (see [`ExcBridge`]).
     pub origin: Option<ExcOrigin>,
+    /// Its `__cause__`, `__context__` and `__suppress_context__`, as CPython
+    /// set them (`raise X from None` inside the stdlib suppresses the context
+    /// it still records).
+    pub cause: Value,
+    pub context: Value,
+    pub suppress_context: bool,
 }
 
 /// Where a CPython exception raised over the bridge came from.
@@ -3049,6 +3084,7 @@ impl PyHost {
             lru_caches: Vec::new(),
             total_ordering: HashSet::new(),
             exc_links: HashMap::new(),
+            class_key_counter: HashMap::new(),
             code_files: HashMap::new(),
             exc_tb: HashMap::new(),
             eg_split_root: HashMap::new(),
@@ -3214,6 +3250,20 @@ impl PyHost {
         }
     }
 
+    /// A generator's `(function name, finished, current line)` for its
+    /// `gi_frame`/`gi_code` — the line is the one its suspended frame stopped
+    /// on, 0 before the first resume.
+    pub fn gen_frame_info(&self, gen: &Value) -> Option<(String, bool, u32)> {
+        match self.get(gen) {
+            Some(PyObj::Generator { id }) => {
+                let g = &self.generators[*id as usize];
+                let line = g.ctx.frames.last().map_or(0, |f| f.line);
+                Some((g.func_name.clone(), g.done, line))
+            }
+            _ => None,
+        }
+    }
+
     pub fn gen_return_value(&self, id: u32) -> Value {
         self.generators
             .get(id as usize)
@@ -3307,6 +3357,44 @@ impl PyHost {
     /// `<object object at 0x…>`). The registry of program-defined classes is
     /// the discriminator, so a program that defines its own `class int` still
     /// reports `__main__.int`.
+    /// The name a class goes by (`__name__`), for the registry key `key`: the
+    /// key itself unless the class was filed as `name#n` because its name was
+    /// already taken (see `register_class_meta`).
+    pub fn class_display_name(&self, key: &str) -> String {
+        self.classes
+            .get(key)
+            .map_or_else(|| key.to_string(), |c| c.name.clone())
+    }
+
+    /// How a traceback's last line names the exception class `key`
+    /// (`traceback.format_exception_only`): `__qualname__`, behind the module
+    /// unless that is `__main__` or `builtins`.
+    pub fn class_exc_label(&self, key: &str) -> String {
+        let Some(c) = self.classes.get(key) else {
+            return key.to_string();
+        };
+        let qual = if c.qualname.is_empty() {
+            &c.name
+        } else {
+            &c.qualname
+        };
+        match c.module.as_str() {
+            "" | "__main__" | "builtins" => qual.clone(),
+            m => format!("{m}.{qual}"),
+        }
+    }
+
+    /// `module.__qualname__` for the registry key `key` (the module omitted for
+    /// `builtins`) — what `repr(cls)` and an instance's default repr show.
+    pub fn class_repr_path(&self, key: &str) -> String {
+        let qual = match self.classes.get(key) {
+            Some(c) if !c.qualname.is_empty() => c.qualname.clone(),
+            Some(c) => c.name.clone(),
+            None => key.to_string(),
+        };
+        format!("{}{qual}", self.repr_module_prefix(key))
+    }
+
     fn repr_module_prefix(&self, class: &str) -> String {
         match self.classes.get(class) {
             Some(c) if c.module == "builtins" => String::new(),
@@ -3374,6 +3462,14 @@ impl PyHost {
     }
     pub fn new_tuple(&mut self, items: Vec<Value>) -> Value {
         self.alloc(PyObj::Tuple(items))
+    }
+    /// The lazy `iterator` over an object that has only `__getitem__`.
+    pub fn new_seq_iter(&mut self, obj: Value) -> Value {
+        self.alloc(PyObj::SeqIter {
+            obj,
+            idx: 0,
+            done: false,
+        })
     }
     /// A one-shot sequence iterator whose CPython type is the `__getitem__`
     /// protocol iterator: `next()` walks the items once, then exhausts.
@@ -4011,6 +4107,43 @@ impl PyHost {
         out
     }
 
+    /// What `locals()` answers inside a function: the frame's own bindings.
+    /// A comprehension runs as a frame of its own here but is part of its
+    /// enclosing function in CPython (PEP 709), so its `locals()` also sees
+    /// that function's bindings — and, unlike [`Self::caller_locals`], nothing
+    /// further out.
+    pub fn frame_locals(&self) -> NameMap {
+        let mut out: NameMap = NameMap::default();
+        let f = self.frame();
+        let mut envs = vec![f.env.clone()];
+        let inlined = matches!(
+            &*f.name,
+            "<comp>" | "<listcomp>" | "<setcomp>" | "<dictcomp>"
+        );
+        if inlined {
+            if let Some(parent) = f.env.borrow().parent.clone() {
+                envs.push(parent);
+            }
+        }
+        for e in envs.into_iter().rev() {
+            for (k, v) in e.borrow().vars.iter() {
+                // The compiler's own temporaries are not Python-visible; a
+                // generator expression's `.0` (its iterator argument) is.
+                if k.starts_with('.') && !(k == ".0" && !inlined) {
+                    continue;
+                }
+                out.insert(k.clone(), v.clone());
+            }
+        }
+        out
+    }
+
+    /// Whether the innermost frame is the module's own (where `locals()` is the
+    /// module dict), as opposed to a function or generator body.
+    pub fn in_module_frame(&self) -> bool {
+        &*self.frame().name == "<module>" && !self.frame().is_class_body
+    }
+
     // ── DAP debug introspection (used only under `--dap`) ────────────────────
     /// Number of active call frames (the debugger's step-depth reference).
     pub fn frame_depth(&self) -> usize {
@@ -4151,6 +4284,14 @@ impl PyHost {
         //
         // Each level also takes ONE borrow, not two: the old form re-entered the
         // `RefCell` to read `parent` after the `vars` miss.
+        // A name declared `global` here is the module's, never an enclosing
+        // function's local of the same name.
+        {
+            let gd = &self.frame().globals_decl;
+            if !gd.is_empty() && gd.contains(name) {
+                return self.globals().get(name).cloned();
+            }
+        }
         let mut env = {
             let e = self.frame().env.borrow();
             if let Some(v) = e.vars.get(name) {
@@ -4704,6 +4845,13 @@ impl PyHost {
 pub fn name_error(name: &str) -> String {
     format!("NameError: name '{name}' is not defined")
 }
+/// CPython's `NameError` for a closure cell that has no value (the enclosing
+/// function never bound the variable, or already deleted it).
+pub fn free_variable_error(name: &str) -> String {
+    format!(
+        "NameError: cannot access free variable '{name}' where it is not associated with a value in enclosing scope"
+    )
+}
 /// CPython's `UnboundLocalError` message (a `NameError` subclass), raised when a
 /// function reads a local name before it has been bound.
 pub fn unbound_local_error(name: &str) -> String {
@@ -5158,10 +5306,19 @@ impl PyHost {
     /// for the pure-Python `Counter`, whose `tp_name` is the bare `'Counter'`.
     pub fn fq_type_name(&self, v: &Value) -> String {
         match self.get(v) {
-            Some(PyObj::Instance(inst)) => match self.repr_module_prefix(&inst.class).as_str() {
-                "__main__." => inst.class.clone(),
-                prefix => format!("{prefix}{}", inst.class),
-            },
+            Some(PyObj::Instance(inst)) => {
+                // `module.__qualname__`: a class made inside a function is
+                // `f.<locals>.C`, not `C`.
+                let qn = match self.classes.get(&inst.class) {
+                    Some(c) if !c.qualname.is_empty() => c.qualname.clone(),
+                    Some(c) => c.name.clone(),
+                    _ => inst.class.clone(),
+                };
+                match self.repr_module_prefix(&inst.class).as_str() {
+                    "__main__." => qn,
+                    prefix => format!("{prefix}{qn}"),
+                }
+            }
             _ => match self.tp_name(v).as_str() {
                 "Counter" => "collections.Counter".into(),
                 tn => tn.into(),
@@ -5241,7 +5398,7 @@ impl PyHost {
                     .get(n)
                     .map(|c| c.metaclass.clone())
                     .unwrap_or_else(|| "type".into()),
-                Some(PyObj::Instance(i)) => i.class.clone(),
+                Some(PyObj::Instance(i)) => self.class_display_name(&i.class),
                 // Only a bound PYTHON function is a `method`; a native method of a
                 // builtin type (`[].sort`, `"a".upper`) is a
                 // `builtin_function_or_method`, the same type as `len`.
@@ -5269,6 +5426,7 @@ impl PyHost {
                 Some(PyObj::FilterObj { .. }) => "filter".into(),
                 Some(PyObj::EnumerateObj { .. }) => "enumerate".into(),
                 Some(PyObj::CallIter { .. }) => "callable_iterator".into(),
+                Some(PyObj::SeqIter { .. }) => "iterator".into(),
                 Some(PyObj::Module { .. }) => "module".into(),
                 // A `__dict__` view IS a dict as far as Python can tell.
                 Some(PyObj::ModuleDict { .. }) => "dict".into(),
@@ -5474,9 +5632,8 @@ impl PyHost {
                         // instance stays bare, as `object()` is
                         // `<object object at 0x…>` and never `<__main__.object …>`.
                         format!(
-                            "<{}{} object at 0x{:012x}>",
-                            self.repr_module_prefix(&inst.class),
-                            inst.class,
+                            "<{} object at 0x{:012x}>",
+                            self.class_repr_path(&inst.class),
                             self.addr_of(v)
                         )
                     }
@@ -5484,7 +5641,7 @@ impl PyHost {
                 // User classes are defined in the top-level module, which under
                 // `-c`/a script CPython names `__main__` (builtins stay bare).
                 Some(PyObj::Class(n)) => {
-                    format!("<class '{}{n}'>", self.repr_module_prefix(n))
+                    format!("<class '{}'>", self.class_repr_path(n))
                 }
                 // `__qualname__`, not `__name__`: CPython reprs a nested or
                 // method function by its dotted path (`<function C.f at 0x…>`,
@@ -5836,6 +5993,9 @@ impl PyHost {
                 Some(PyObj::CallIter { .. }) => {
                     format!("<callable_iterator object at 0x{:012x}>", self.addr_of(v))
                 }
+                Some(PyObj::SeqIter { .. }) => {
+                    format!("<iterator object at 0x{:012x}>", self.addr_of(v))
+                }
                 Some(PyObj::ReScanner { .. }) => {
                     format!("<_sre.SRE_Scanner object at 0x{:012x}>", self.addr_of(v))
                 }
@@ -5892,9 +6052,11 @@ impl PyHost {
                 }
                 Some(PyObj::Super { owner, instance }) => {
                     let icls = match self.get(instance) {
-                        Some(PyObj::Instance(i)) => i.class.clone(),
-                        _ => owner.clone(),
+                        Some(PyObj::Instance(i)) => self.class_display_name(&i.class),
+                        Some(PyObj::Class(n)) => self.class_display_name(n),
+                        _ => self.class_display_name(owner),
                     };
+                    let owner = self.class_display_name(owner);
                     format!("<super: <class '{owner}'>, <{icls} object>>")
                 }
                 Some(PyObj::StaticMethod(f)) => {
@@ -6211,7 +6373,8 @@ impl PyHost {
                 // as `PatternError('x')`.
                 Some(PyObj::Exception { class, args }) => {
                     let inner: Vec<String> = args.iter().map(|a| self.repr_of(a)).collect();
-                    let name = class.rsplit('.').next().unwrap_or(class);
+                    let disp = self.class_display_name(class);
+                    let name = disp.rsplit('.').next().unwrap_or(&disp);
                     format!("{name}({})", inner.join(", "))
                 }
                 // A user exception instance reprs as `Class(repr(arg), …)` from
@@ -6219,7 +6382,11 @@ impl PyHost {
                 Some(PyObj::Instance(inst)) if self.class_is_exception(&inst.class) => {
                     let a = self.exc_instance_args(&inst.dict);
                     let inner: Vec<String> = a.iter().map(|x| self.repr_of(x)).collect();
-                    format!("{}({})", inst.class, inner.join(", "))
+                    format!(
+                        "{}({})",
+                        self.class_display_name(&inst.class),
+                        inner.join(", ")
+                    )
                 }
                 // Builtin-type subclass without a `__repr__` override: the base
                 // type's repr (`repr(Stack([1,2]))` → `[1, 2]`).
@@ -6357,16 +6524,25 @@ impl PyHost {
                     } else if self.implicit_hash_none(&class) {
                         // Shadows any inherited `__hash__`; see
                         // `implicit_hash_none`.
-                        return Err(type_error(&format!("unhashable type: '{class}'")));
+                        return Err(type_error(&format!(
+                            "unhashable type: '{}'",
+                            self.class_display_name(&class)
+                        )));
                     } else {
                         match self.class_lookup(&class, "__hash__") {
                             // `__hash__ = None` (or `__eq__` without `__hash__`)
                             // makes instances unhashable (CPython rule).
                             Some(Value::Undef) => {
-                                return Err(type_error(&format!("unhashable type: '{class}'")))
+                                return Err(type_error(&format!(
+                                    "unhashable type: '{}'",
+                                    self.class_display_name(&class)
+                                )))
                             }
                             None if self.class_lookup(&class, "__eq__").is_some() => {
-                                return Err(type_error(&format!("unhashable type: '{class}'")))
+                                return Err(type_error(&format!(
+                                    "unhashable type: '{}'",
+                                    self.class_display_name(&class)
+                                )))
                             }
                             // A builtin-subclass instance that overrides neither
                             // `__hash__` nor `__eq__` inherits the base type's
@@ -6387,7 +6563,10 @@ impl PyHost {
                                             | PyObj::Bytearray(_)
                                     )
                                 ) {
-                                    return Err(type_error(&format!("unhashable type: '{class}'")));
+                                    return Err(type_error(&format!(
+                                        "unhashable type: '{}'",
+                                        self.class_display_name(&class)
+                                    )));
                                 }
                                 return self.to_key(&inst.payload);
                             }
@@ -6400,7 +6579,10 @@ impl PyHost {
                             // before the borrowed key lookup; reaching here means a
                             // keying path was not routed. Fail visibly, never guess.
                             Some(_) => {
-                                return Err(type_error(&format!("unhashable type: '{class}'")))
+                                return Err(type_error(&format!(
+                                    "unhashable type: '{}'",
+                                    self.class_display_name(&class)
+                                )))
                             }
                         }
                     }
@@ -7056,9 +7238,9 @@ pub fn set_put(s: &mut IndexMap<PKey, Value>, key: PKey, item: Value) {
 // start size. Deleted entries leave no dummies here, so a set that has had
 // elements removed replays as if they had never been inserted.
 //
-// String hashes are per-process randomized in CPython (SipHash keyed by
-// `_Py_HashSecret`), so a set of strings can only agree with a CPython pinned to
-// `PYTHONHASHSEED=0` — the documented boundary.
+// String and bytes hashes are SipHash keyed by `_Py_HashSecret`, which
+// `pyhash::hash_secret` derives from `PYTHONHASHSEED` exactly as CPython does,
+// so a set of strings iterates in CPython's order for the same seed.
 
 pub const SET_MINSIZE: usize = 8;
 const SET_LINEAR_PROBES: usize = 9;
@@ -7178,9 +7360,18 @@ fn reproducible_hash(k: &PKey) -> Option<i64> {
         PKey::Big(b) => Some(crate::pyhash::int_big(b)),
         PKey::FloatBits(bits) => crate::pyhash::double(f64::from_bits(*bits)),
         PKey::Complex(re, im) => crate::pyhash::complex(f64::from_bits(*re), f64::from_bits(*im)),
+        PKey::None => Some(crate::pyhash::NONE),
+        // str/bytes hashes come from the process secret (`PYTHONHASHSEED`),
+        // which `pyhash::hash_secret` reproduces, so the table order does too.
+        PKey::Str(s) => Some(crate::pyhash::string(s)),
+        PKey::Bytes(b) => Some(crate::pyhash::buffer(b)),
         PKey::Tuple(items) => {
             let hashes: Option<Vec<i64>> = items.iter().map(reproducible_hash).collect();
             Some(crate::pyhash::tuple(&hashes?))
+        }
+        PKey::Frozenset(items) => {
+            let hashes: Option<Vec<i64>> = items.iter().map(reproducible_hash).collect();
+            Some(crate::pyhash::frozenset(&hashes?))
         }
         _ => None,
     }
@@ -7428,15 +7619,26 @@ fn prepare_key_walk(
     };
     // Shadows any inherited `__hash__`; see `implicit_hash_none`.
     if with_host(|h| h.implicit_hash_none(&class)) {
-        return Err(type_error(&format!("unhashable type: '{class}'")));
+        return Err(type_error(&format!(
+            "unhashable type: '{}'",
+            with_host(|h| h.class_display_name(&class))
+        )));
     }
     let hashf = with_host(|h| h.class_lookup(&class, "__hash__"));
     match &hashf {
         // `__hash__ = None`, or `__eq__` without `__hash__` → unhashable.
-        Some(Value::Undef) => return Err(type_error(&format!("unhashable type: '{class}'"))),
+        Some(Value::Undef) => {
+            return Err(type_error(&format!(
+                "unhashable type: '{}'",
+                with_host(|h| h.class_display_name(&class))
+            )))
+        }
         None => {
             if with_host(|h| h.class_lookup(&class, "__eq__").is_some()) {
-                return Err(type_error(&format!("unhashable type: '{class}'")));
+                return Err(type_error(&format!(
+                    "unhashable type: '{}'",
+                    with_host(|h| h.class_display_name(&class))
+                )));
             }
             // Default identity hash: `to_key` resolves it inline, no prep needed.
             return Ok(());
@@ -7487,13 +7689,22 @@ pub fn instance_hash_value(v: &Value) -> Result<i64, String> {
     // inherited `__hash__`, so a subclass defining only `__eq__` is unhashable
     // even though `class_lookup` would find its base's real one.
     if with_host(|h| h.implicit_hash_none(&class)) {
-        return Err(type_error(&format!("unhashable type: '{class}'")));
+        return Err(type_error(&format!(
+            "unhashable type: '{}'",
+            with_host(|h| h.class_display_name(&class))
+        )));
     }
     match with_host(|h| h.class_lookup(&class, "__hash__")) {
-        Some(Value::Undef) => Err(type_error(&format!("unhashable type: '{class}'"))),
+        Some(Value::Undef) => Err(type_error(&format!(
+            "unhashable type: '{}'",
+            with_host(|h| h.class_display_name(&class))
+        ))),
         None => {
             if with_host(|h| h.class_lookup(&class, "__eq__").is_some()) {
-                return Err(type_error(&format!("unhashable type: '{class}'")));
+                return Err(type_error(&format!(
+                    "unhashable type: '{}'",
+                    with_host(|h| h.class_display_name(&class))
+                )));
             }
             // A builtin-type subclass hashes by its base value
             // (str/int/float/tuple/frozenset); a list/dict/set subclass is
@@ -7508,7 +7719,10 @@ pub fn instance_hash_value(v: &Value) -> Result<i64, String> {
                     let k = with_host(|h| h.to_key(&payload))?;
                     return Ok(crate::builtins::hash_key(&k));
                 }
-                return Err(type_error(&format!("unhashable type: '{class}'")));
+                return Err(type_error(&format!(
+                    "unhashable type: '{}'",
+                    with_host(|h| h.class_display_name(&class))
+                )));
             }
             Ok(id as i64)
         }
@@ -8649,7 +8863,7 @@ impl PyHost {
                     return Ok(self.norm_big(x + y));
                 }
                 // Mixed/float numeric
-                if let (Some(x), Some(y)) = (self.num_val_arith(a)?, self.num_val_arith(b)?) {
+                if let (Some(x), Some(y)) = self.num_pair_arith(a, b)? {
                     return Ok(Value::Float(x + y));
                 }
                 // complex + complex / int + complex / …
@@ -8760,7 +8974,7 @@ impl PyHost {
                 if let (Some(x), Some(y)) = (self.big_val(a), self.big_val(b)) {
                     return Ok(self.norm_big(x - y));
                 }
-                if let (Some(x), Some(y)) = (self.num_val_arith(a)?, self.num_val_arith(b)?) {
+                if let (Some(x), Some(y)) = self.num_pair_arith(a, b)? {
                     return Ok(Value::Float(x - y));
                 }
                 if let Some(v) = self.complex_binop('-', a, b)? {
@@ -8788,7 +9002,7 @@ impl PyHost {
                 if let Some(r) = self.repeat_seq(a, b)? {
                     return Ok(r);
                 }
-                if let (Some(x), Some(y)) = (self.num_val_arith(a)?, self.num_val_arith(b)?) {
+                if let (Some(x), Some(y)) = self.num_pair_arith(a, b)? {
                     return Ok(Value::Float(x * y));
                 }
                 if let Some(v) = self.complex_binop('*', a, b)? {
@@ -8885,6 +9099,18 @@ impl PyHost {
         match v {
             Value::Float(f) => Some(*f),
             _ => None,
+        }
+    }
+
+    /// `num_val_arith` of both operands of a binary operator. An operand that
+    /// is not a number at all makes the operation a `TypeError` whatever the
+    /// other one is, so a bignum too large for a float must not report its
+    /// `OverflowError` ahead of it.
+    fn num_pair_arith(&self, a: &Value, b: &Value) -> Result<(Option<f64>, Option<f64>), String> {
+        match (self.num_val_arith(a), self.num_val_arith(b)) {
+            (Ok(x), Ok(y)) => Ok((x, y)),
+            (Err(_), Ok(None)) | (Ok(None), Err(_)) => Ok((None, None)),
+            (Err(e), _) | (_, Err(e)) => Err(e),
         }
     }
 
@@ -9030,6 +9256,14 @@ impl PyHost {
             NumOp::Ge => ">=",
             _ => "<",
         };
+        // A NaN is unordered against every number, a bignum included.
+        if [a, b]
+            .iter()
+            .any(|v| matches!(v, Value::Float(f) if f.is_nan()))
+            && [a, b].iter().all(|v| self.num_val(v).is_some())
+        {
+            return Ok(Value::Bool(false));
+        }
         let ord = self.order(a, b, sym)?;
         let res = match op {
             NumOp::Lt => ord == Ordering::Less,
@@ -9076,6 +9310,11 @@ impl PyHost {
             (Some(PyObj::List(x)), Some(PyObj::List(y)))
             | (Some(PyObj::Tuple(x)), Some(PyObj::Tuple(y))) => {
                 for (p, q) in x.iter().zip(y.iter()) {
+                    // The first pair that is not `==` decides; pairs that are
+                    // equal are never ordered (`(None, 1) < (None, 2)`).
+                    if self.equal(p, q) {
+                        continue;
+                    }
                     let o = self.order(p, q, sym)?;
                     if o != Ordering::Equal {
                         return Ok(o);
@@ -9087,6 +9326,11 @@ impl PyHost {
             // first differing element, then by length.
             (Some(PyObj::Deque { items: x, .. }), Some(PyObj::Deque { items: y, .. })) => {
                 for (p, q) in x.iter().zip(y.iter()) {
+                    // The first pair that is not `==` decides; pairs that are
+                    // equal are never ordered (`(None, 1) < (None, 2)`).
+                    if self.equal(p, q) {
+                        continue;
+                    }
                     let o = self.order(p, q, sym)?;
                     if o != Ordering::Equal {
                         return Ok(o);
@@ -9182,7 +9426,7 @@ impl PyHost {
                 if let (Some(x), Some(y)) = (self.big_val(a), self.big_val(b)) {
                     return bigint_true_divide(&x, &y).map(Value::Float);
                 }
-                match (self.num_val_arith(a)?, self.num_val_arith(b)?) {
+                match self.num_pair_arith(a, b)? {
                     (Some(_), Some(0.0)) => Err("ZeroDivisionError: division by zero".into()),
                     (Some(x), Some(y)) => Ok(Value::Float(x / y)),
                     _ => match self.complex_binop('/', a, b)? {
@@ -9213,7 +9457,7 @@ impl PyHost {
                     }
                     return Ok(self.norm_big(bigint_floordiv(&x, &y)));
                 }
-                match (self.num_val_arith(a)?, self.num_val_arith(b)?) {
+                match self.num_pair_arith(a, b)? {
                     (Some(_), Some(0.0)) => Err("ZeroDivisionError: division by zero".into()),
                     (Some(x), Some(y)) => Ok(Value::Float(float_divmod(x, y).0)),
                     _ => Err(self.optype_err("//", a, b)),
@@ -9233,7 +9477,8 @@ impl PyHost {
                     if y == 0 {
                         return Err("ZeroDivisionError: division by zero".into());
                     }
-                    let r = x % y;
+                    // `i64::MIN % -1` is the one pair whose remainder overflows.
+                    let r = x.checked_rem(y).unwrap_or(0);
                     let r = if r != 0 && (r < 0) != (y < 0) {
                         r + y
                     } else {
@@ -9247,20 +9492,36 @@ impl PyHost {
                     }
                     return Ok(self.norm_big(bigint_mod(&x, &y)));
                 }
-                match (self.num_val_arith(a)?, self.num_val_arith(b)?) {
+                match self.num_pair_arith(a, b)? {
                     (Some(_), Some(0.0)) => Err("ZeroDivisionError: division by zero".into()),
                     (Some(x), Some(y)) => Ok(Value::Float(float_divmod(x, y).1)),
                     _ => Err(self.optype_err("%", a, b)),
                 }
             }
             binop::POW => match (ai, bi) {
-                (Some(x), Some(y)) if y >= 0 => {
-                    let mut acc = num_bigint::BigInt::from(1);
-                    let base = num_bigint::BigInt::from(x);
-                    for _ in 0..y {
-                        acc *= &base;
+                // int ** non-negative int is exact whatever the width of either
+                // operand: a bignum base (`(10**20) ** 2`) or a result past i64
+                // stays an int, never a float.
+                _ if matches!(
+                    (self.big_val(a), self.big_val(b)),
+                    (Some(_), Some(ref e)) if e.sign() != num_bigint::Sign::Minus
+                ) =>
+                {
+                    use num_traits::{One, ToPrimitive, Zero};
+                    let (x, e) = (
+                        self.big_val(a).unwrap_or_default(),
+                        self.big_val(b).unwrap_or_default(),
+                    );
+                    match e.to_u32() {
+                        Some(n) => Ok(self.norm_big(x.pow(n))),
+                        // An exponent past u32 only terminates for |base| <= 1.
+                        None if x.is_zero() || x.is_one() => Ok(self.norm_big(x)),
+                        None if x == num_bigint::BigInt::from(-1) => {
+                            let odd = (&e % 2u32) == num_bigint::BigInt::one();
+                            Ok(Value::Int(if odd { -1 } else { 1 }))
+                        }
+                        None => Err("MemoryError".into()),
                     }
-                    Ok(self.norm_big(acc))
                 }
                 _ if self.is_complex(a) || self.is_complex(b) => {
                     match (self.complex_val(a), self.complex_val(b)) {
@@ -9271,7 +9532,7 @@ impl PyHost {
                         _ => Err(self.optype_err("** or pow()", a, b)),
                     }
                 }
-                _ => match (self.num_val_arith(a)?, self.num_val_arith(b)?) {
+                _ => match self.num_pair_arith(a, b)? {
                     // `0 ** <negative>` is a division by zero in CPython, not `inf`.
                     // As of 3.14 both int and float bases word it the same way.
                     (Some(x), Some(y)) if x == 0.0 && y < 0.0 => {
@@ -9286,7 +9547,9 @@ impl PyHost {
                     // every negative base with an infinite exponent used to fall
                     // into the complex branch — `(-1.0) ** float('inf')` answered
                     // `(nan+nanj)` where CPython answers `1.0`.
-                    (Some(x), Some(y)) if x < 0.0 && y.is_finite() && y.fract() != 0.0 => {
+                    (Some(x), Some(y))
+                        if x < 0.0 && x.is_finite() && y.is_finite() && y.fract() != 0.0 =>
+                    {
                         let (r, i) = c_pow((x, 0.0), (y, 0.0))?;
                         Ok(self.alloc(PyObj::Complex(r, i)))
                     }
@@ -9558,8 +9821,10 @@ impl PyHost {
         premap: &HashMap<u32, (String, String, String)>,
     ) -> Result<Value, String> {
         let is_mapping = matches!(self.get(args), Some(PyObj::Dict(_)));
+        // A mapping is also the one positional argument of a template that
+        // has no `%(key)` conversions (`'%s' % {'a': 1}`).
         let arglist: Vec<Value> = if is_mapping {
-            vec![]
+            vec![args.clone()]
         } else {
             match self.get(args) {
                 Some(PyObj::Tuple(t)) => t.clone(),
@@ -9732,8 +9997,10 @@ impl PyHost {
         premap: &std::collections::HashMap<u32, Vec<u8>>,
     ) -> Result<Value, String> {
         let is_mapping = matches!(self.get(args), Some(PyObj::Dict(_)));
+        // A mapping is also the one positional argument of a template that
+        // has no `%(key)` conversions (`'%s' % {'a': 1}`).
         let arglist: Vec<Value> = if is_mapping {
-            vec![]
+            vec![args.clone()]
         } else {
             match self.get(args) {
                 Some(PyObj::Tuple(t)) => t.clone(),
@@ -9959,7 +10226,10 @@ impl PyHost {
     /// `%`'s `*` width is a `Py_ssize_t` and its `*` precision is a C `int`, and
     /// the two overflows name different C types.
     fn next_arg_int(&self, arglist: &[Value], ai: &mut usize, c_int: bool) -> Result<i64, String> {
-        let v = arglist.get(*ai).cloned().unwrap_or(Value::Int(0));
+        let v = arglist
+            .get(*ai)
+            .cloned()
+            .ok_or_else(|| "TypeError: not enough arguments for format string".to_string())?;
         *ai += 1;
         let too_big = || {
             if c_int {
@@ -9974,7 +10244,7 @@ impl PyHost {
             }
             IndexFit::Fits(n) => Ok(n),
             IndexFit::TooLarge(_) => Err(too_big()),
-            IndexFit::NotInt => Ok(0),
+            IndexFit::NotInt => Err("TypeError: * wants int".to_string()),
         }
     }
 
@@ -10508,6 +10778,14 @@ impl PyHost {
                 return self.alloc(PyObj::Foreign(tid));
             }
         }
+        // An instance's type is its class by registry KEY, which `type_name`
+        // (the display name) is not when the name was reused.
+        if let Some(PyObj::Instance(i)) = self.get(v) {
+            if self.classes.contains_key(&i.class) {
+                let key = i.class.clone();
+                return self.alloc(PyObj::Class(key));
+            }
+        }
         let tn = self.type_name(v);
         if self.classes.contains_key(&tn) {
             return self.alloc(PyObj::Class(tn));
@@ -10867,9 +11145,9 @@ impl PyHost {
             let len = range_len(rstart, *rstop, rstep);
             let (i, j) = slice_bounds(lo, hi, step, len, self);
             return Ok(self.alloc(PyObj::Range {
-                start: rstart + i * rstep,
-                stop: rstart + j * rstep,
-                step: rstep * step,
+                start: rstart.saturating_add(i.saturating_mul(rstep)),
+                stop: rstart.saturating_add(j.saturating_mul(rstep)),
+                step: rstep.saturating_mul(step),
             }));
         }
         // Slicing a memoryview yields another memoryview. A contiguous
@@ -10908,14 +11186,14 @@ impl PyHost {
                     if i >= 0 && i < n {
                         out.push(src[i as usize]);
                     }
-                    i += step;
+                    i = i.saturating_add(step);
                 }
             } else {
                 while i > stop {
                     if i >= 0 && i < n {
                         out.push(src[i as usize]);
                     }
-                    i += step;
+                    i = i.saturating_add(step);
                 }
             }
             let len = out.len();
@@ -10941,14 +11219,14 @@ impl PyHost {
                     if i >= 0 && i < n {
                         out.push(src[i as usize]);
                     }
-                    i += step;
+                    i = i.saturating_add(step);
                 }
             } else {
                 while i > stop {
                     if i >= 0 && i < n {
                         out.push(src[i as usize]);
                     }
-                    i += step;
+                    i = i.saturating_add(step);
                 }
             }
             return Ok(if is_ba {
@@ -10971,14 +11249,14 @@ impl PyHost {
                 if i >= 0 && i < n {
                     out.push(items[i as usize].clone());
                 }
-                i += step;
+                i = i.saturating_add(step);
             }
         } else {
             while i > stop {
                 if i >= 0 && i < n {
                     out.push(items[i as usize].clone());
                 }
-                i += step;
+                i = i.saturating_add(step);
             }
         }
         if is_str {
@@ -10991,14 +11269,14 @@ impl PyHost {
                         if i2 >= 0 && i2 < n {
                             r.push(chars[i2 as usize]);
                         }
-                        i2 += step;
+                        i2 = i2.saturating_add(step);
                     }
                 } else {
                     while i2 > stop2 {
                         if i2 >= 0 && i2 < n {
                             r.push(chars[i2 as usize]);
                         }
-                        i2 += step;
+                        i2 = i2.saturating_add(step);
                     }
                 }
                 return Ok(self.new_str(r));
@@ -11287,14 +11565,14 @@ impl PyHost {
                 if i >= 0 && i < n {
                     out.push(i);
                 }
-                i += step;
+                i = i.saturating_add(step);
             }
         } else {
             while i > stop {
                 if i >= 0 && i < n {
                     out.push(i);
                 }
-                i += step;
+                i = i.saturating_add(step);
             }
         }
         out
@@ -11570,12 +11848,12 @@ impl PyHost {
                 if step > 0 {
                     while c < stop {
                         out.push(Value::Int(c));
-                        c += step;
+                        c = c.saturating_add(step);
                     }
                 } else if step < 0 {
                     while c > stop {
                         out.push(Value::Int(c));
-                        c += step;
+                        c = c.saturating_add(step);
                     }
                 }
                 Ok(out)
@@ -11719,7 +11997,8 @@ impl PyHost {
             | Some(PyObj::FilterObj { .. })
             | Some(PyObj::EnumerateObj { .. })
             | Some(PyObj::ItertoolsIter { .. })
-            | Some(PyObj::CallIter { .. }) => return Ok(v.clone()),
+            | Some(PyObj::CallIter { .. })
+            | Some(PyObj::SeqIter { .. }) => return Ok(v.clone()),
             _ => {
                 // Everything else walks its elements through one snapshot cursor;
                 // the tag is what keeps `type(it).__name__` CPython's.
@@ -12162,7 +12441,7 @@ impl PyHost {
     /// in `self.classes`) becomes a `Class`; any other name is a builtin type
     /// (`int`, `str`, `Exception`, …) and must become its `Builtin` type object,
     /// so `base.__dict__`, identity, and `isinstance` match the real builtin.
-    fn class_or_builtin_type(&mut self, name: String) -> Value {
+    pub fn class_or_builtin_type(&mut self, name: String) -> Value {
         if self.classes.contains_key(&name) {
             self.alloc(PyObj::Class(name))
         } else {
@@ -12613,6 +12892,7 @@ impl PyHost {
                     | Some(PyObj::EnumerateObj { .. })
                     | Some(PyObj::Iter(_))
                     | Some(PyObj::CallIter { .. })
+                    | Some(PyObj::SeqIter { .. })
             )
         {
             let b = self.alloc(PyObj::Builtin(name.to_string()));
@@ -12700,8 +12980,10 @@ impl PyHost {
                 // A `__slots__` member is a data descriptor: it answers before
                 // the instance dict, from the instance's slot storage.
                 if let Some(slot) = self.slot_read(recv, name) {
+                    // An unset slot reads through `%T`: the qualified name.
                     return slot.ok_or_else(|| {
-                        format!("AttributeError: '{class}' object has no attribute '{name}'")
+                        let tn = self.fq_type_name(recv);
+                        format!("AttributeError: '{tn}' object has no attribute '{name}'")
                     });
                 }
                 if let Some(v) = self.inst_attr(&inst_dict, name) {
@@ -12733,7 +13015,11 @@ impl PyHost {
                     return Ok(match name {
                         "__cause__" => self.exc_link(recv).0,
                         "__context__" => self.exc_link(recv).1,
-                        _ => Value::Bool(!matches!(self.exc_link(recv).0, Value::Undef)),
+                        // Set by any explicit `from`, `from None` included.
+                        _ => Value::Bool(
+                            !matches!(self.exc_link(recv).0, Value::Undef)
+                                || matches!(recv, Value::Obj(id) if self.suppress_context.contains(id)),
+                        ),
                     });
                 }
                 // Instance introspection: `__class__` and `__dict__`.
@@ -12745,7 +13031,8 @@ impl PyHost {
                     // bare `object()`.
                     if class == "object" || self.slots_of(&class).is_some() {
                         return Err(format!(
-                            "AttributeError: '{class}' object has no attribute '__dict__'"
+                            "AttributeError: '{class}' object has no attribute '__dict__'",
+                            class = self.class_display_name(&class)
                         ));
                     }
                     // Hand back the instance's live dict by handle: identity is
@@ -13022,7 +13309,8 @@ impl PyHost {
                     }));
                 }
                 Err(format!(
-                    "AttributeError: type object '{cname}' has no attribute '{name}'"
+                    "AttributeError: type object '{cname}' has no attribute '{name}'",
+                    cname = self.class_display_name(&cname)
                 ))
             }
             // Modules are fully resolved up-front (see the block before this
@@ -13098,14 +13386,14 @@ impl PyHost {
                 if name == "__traceback__" {
                     // The captured `(scope, line)` frames as a traceback chain, or
                     // None if the exception was never propagated through a frame.
-                    let frames = match recv {
+                    let entries: Vec<TbFrame> = match recv {
                         Value::Obj(id) => self
                             .exc_tb
                             .get(id)
                             .map(|fs| {
                                 fs.iter()
                                     .filter_map(|e| match e {
-                                        TbEntry::Frame(f) => Some((f.name.to_string(), f.line)),
+                                        TbEntry::Frame(f) => Some(f.clone()),
                                         TbEntry::CPython(_) => None,
                                     })
                                     .collect::<Vec<_>>()
@@ -13113,16 +13401,24 @@ impl PyHost {
                             .unwrap_or_default(),
                         _ => Vec::new(),
                     };
-                    if frames.is_empty() {
+                    if entries.is_empty() {
                         return Ok(Value::Undef);
                     }
-                    return Ok(self.alloc(PyObj::Traceback { frames, idx: 0 }));
+                    let frames = entries
+                        .iter()
+                        .map(|f| (f.name.to_string(), f.line))
+                        .collect();
+                    return Ok(self.alloc(PyObj::Traceback {
+                        frames,
+                        idx: 0,
+                        entries: Rc::new(entries),
+                    }));
                 }
                 if name == "__suppress_context__" {
                     // True iff raised with any explicit `from` clause (`raise X
                     // from Y` or `raise X from None`).
-                    let suppressed =
-                        matches!(recv, Value::Obj(id) if self.suppress_context.contains(id));
+                    let suppressed = matches!(recv, Value::Obj(id) if self.suppress_context.contains(id))
+                        || !matches!(self.exc_link(recv).0, Value::Undef);
                     return Ok(Value::Bool(suppressed));
                 }
                 // `AttributeError.name`/`.obj` and `NameError.name` are member
@@ -13145,7 +13441,8 @@ impl PyHost {
                     }));
                 }
                 Err(format!(
-                    "AttributeError: '{class}' object has no attribute '{name}'"
+                    "AttributeError: '{class}' object has no attribute '{name}'",
+                    class = self.class_display_name(&class)
                 ))
             }
             Some(PyObj::Super { owner, instance }) => {
@@ -13153,10 +13450,24 @@ impl PyHost {
                 let instance = instance.clone();
                 let inst_class = match self.get(&instance) {
                     Some(PyObj::Instance(i)) => i.class.clone(),
+                    Some(PyObj::Class(n)) => n.clone(),
                     _ => owner.clone(),
                 };
                 match super_lookup(self, &owner, &inst_class, name) {
                     Some((v, _)) => {
+                        if let Some(PyObj::ClassMethod(inner)) = self.get(&v).cloned() {
+                            let cls = match self.get(&instance) {
+                                Some(PyObj::Class(_)) => instance,
+                                _ => self.alloc(PyObj::Class(inst_class)),
+                            };
+                            return Ok(self.alloc(PyObj::BoundMethod {
+                                recv: cls,
+                                func: inner,
+                            }));
+                        }
+                        if let Some(PyObj::StaticMethod(inner)) = self.get(&v) {
+                            return Ok(inner.clone());
+                        }
                         // Bind a found method to the original instance.
                         if matches!(self.get(&v), Some(PyObj::Func(_))) {
                             Ok(self.alloc(PyObj::BoundMethod {
@@ -13238,12 +13549,30 @@ impl PyHost {
                 }
                 Ok(self.new_dict(d))
             }
-            // A generator's introspection attributes. `gi_code`, `gi_frame`
-            // and `gi_yieldfrom` are NOT here: the first two need a code and
-            // frame object pythonrs does not build for a generator body, and
-            // the third needs the delegated iterator tracked across
-            // `yield from` — reporting `None` for any of them would be a
-            // wrong answer rather than a missing one.
+            // `gi_frame` is `None` once the generator has finished, else a
+            // minimal frame (scope name and line); `gi_code` carries the
+            // function's name. `gi_yieldfrom` is NOT here: it needs the
+            // delegated iterator tracked across `yield from`, and reporting
+            // `None` for it would be a wrong answer rather than a missing one.
+            Some(PyObj::Generator { .. }) if matches!(name, "gi_frame" | "gi_code") => {
+                let Some((fname, done, line)) = self.gen_frame_info(recv) else {
+                    return Err(format!(
+                        "AttributeError: 'generator' object has no attribute '{name}'"
+                    ));
+                };
+                Ok(match name {
+                    "gi_frame" if done => Value::Undef,
+                    "gi_frame" => self.alloc(PyObj::PyFrame {
+                        name: fname,
+                        lineno: line,
+                    }),
+                    _ => self.alloc(PyObj::FrameCode {
+                        name: fname,
+                        lineno: line,
+                    }),
+                })
+            }
+            // A generator's introspection attributes.
             Some(PyObj::Generator { .. })
                 if matches!(
                     name,
@@ -13686,8 +14015,12 @@ impl PyHost {
                 )),
             },
             // Traceback chain navigation.
-            Some(PyObj::Traceback { frames, idx }) => {
-                let (frames, idx) = (frames.clone(), *idx);
+            Some(PyObj::Traceback {
+                frames,
+                idx,
+                entries,
+            }) => {
+                let (frames, idx, entries) = (frames.clone(), *idx, entries.clone());
                 match name {
                     "tb_frame" => {
                         let (n, l) = frames[idx].clone();
@@ -13700,6 +14033,7 @@ impl PyHost {
                             Ok(self.alloc(PyObj::Traceback {
                                 frames,
                                 idx: idx + 1,
+                                entries,
                             }))
                         } else {
                             Ok(Value::Undef)
@@ -15079,7 +15413,8 @@ impl PyHost {
             if !self.slots_allow(&class, name) {
                 return Err(format!(
                     "AttributeError: '{class}' object has no attribute '{name}' and no \
-                     __dict__ for setting new attributes"
+                     __dict__ for setting new attributes",
+                    class = self.class_display_name(&class)
                 ));
             }
         }
@@ -15442,7 +15777,8 @@ impl PyHost {
                 }
             }
             return Err(format!(
-                "AttributeError: type object '{cname}' has no attribute '{name}'"
+                "AttributeError: type object '{cname}' has no attribute '{name}'",
+                cname = self.class_display_name(&cname)
             ));
         }
         // A SimpleNamespace attribute deletion.
@@ -15513,20 +15849,26 @@ impl PyHost {
         // then built its namedtuple field accessors out of enum's class, and
         // `NT.field` raised through ITS `__get__` — so every namedtuple in the
         // program broke the moment anything imported `enum`.
+        // The same holds for any class whose name is already taken: two
+        // classes called `Node` made in different functions (or one redefined
+        // later in the file) are distinct types, and sharing a key made the
+        // second silently replace the first under every instance of it.
         let ancestors: Vec<String> = bases.iter().flat_map(|b| self.mro_of(b)).collect();
-        let key =
-            if ancestors.iter().any(|b| b == name) || crate::builtins::shadows_builtin_type(name) {
-                let mut n = 1usize;
-                loop {
-                    let cand = format!("{name}#{n}");
-                    if !self.classes.contains_key(&cand) {
-                        break cand;
-                    }
-                    n += 1;
+        let key = if ancestors.iter().any(|b| b == name)
+            || crate::builtins::shadows_builtin_type(name)
+            || self.classes.contains_key(name)
+        {
+            let n = self.class_key_counter.entry(name.to_string()).or_insert(0);
+            loop {
+                *n += 1;
+                let cand = format!("{name}#{n}");
+                if !self.classes.contains_key(&cand) {
+                    break cand;
                 }
-            } else {
-                name.to_string()
-            };
+            }
+        } else {
+            name.to_string()
+        };
         let name_for_key = key.clone();
         // A new class can change what an existing name resolves to (the
         // shadowing disambiguation above rekeys classes), so every memoized
@@ -15549,7 +15891,13 @@ impl PyHost {
         // reference (`f = obj.m; f()`), not just `obj.m()` — the latter passes the
         // owner explicitly, the former relies on `FuncVal::owner`.
         for v in ns.values() {
-            if let Some(PyObj::Func(fv)) = self.get_mut(v) {
+            // A `classmethod`/`staticmethod` wraps the function that needs the
+            // tag, so zero-arg `super()` works inside it too.
+            let target = match self.get(v) {
+                Some(PyObj::ClassMethod(inner) | PyObj::StaticMethod(inner)) => inner.clone(),
+                _ => v.clone(),
+            };
+            if let Some(PyObj::Func(fv)) = self.get_mut(&target) {
                 if fv.owner.is_none() {
                     Rc::make_mut(fv).owner = Some(name_for_key.clone());
                 }
@@ -16906,6 +17254,14 @@ fn call_method_inner(
         let f = with_host(|h| h.get_attr(recv, name))?;
         return invoke(&f, args, kwargs);
     }
+    // `prop.fget(obj)` / `.fset` / `.fdel`: attributes holding the accessor,
+    // read and then called.
+    if matches!(name, "fget" | "fset" | "fdel")
+        && with_host(|h| matches!(h.get(recv), Some(PyObj::Property { .. })))
+    {
+        let f = with_host(|h| h.get_attr(recv, name))?;
+        return invoke(&f, args, kwargs);
+    }
     if !needs_owned {
         return crate::builtins::call_type_method(recv, name, args, kwargs);
     }
@@ -17040,7 +17396,10 @@ fn call_method_inner(
             if let Some(slot) = with_host(|h| h.slot_read(recv, name)) {
                 let class = &inst.class;
                 let v = slot.ok_or_else(|| {
-                    format!("AttributeError: '{class}' object has no attribute '{name}'")
+                    format!(
+                        "AttributeError: '{class}' object has no attribute '{name}'",
+                        class = with_host(|h| h.class_display_name(class))
+                    )
                 })?;
                 return invoke(&v, args, kwargs);
             }
@@ -17144,7 +17503,8 @@ fn call_method_inner(
                 return invoke(&attr, args, kwargs);
             }
             Err(format!(
-                "AttributeError: '{class}' object has no attribute '{name}'"
+                "AttributeError: '{class}' object has no attribute '{name}'",
+                class = with_host(|h| h.class_display_name(&class))
             ))
         }
         Some(PyObj::Class(cname)) => {
@@ -17216,8 +17576,12 @@ fn call_method_inner(
                 let cls = with_host(|h| h.alloc(PyObj::Class(cname.clone())));
                 return crate::builtins::call_type_method(&cls, name, args, kwargs);
             }
+            if let Some(r) = metaclass_getattr(recv, name) {
+                return invoke(&r?, args, kwargs);
+            }
             Err(format!(
-                "AttributeError: type object '{cname}' has no attribute '{name}'"
+                "AttributeError: type object '{cname}' has no attribute '{name}'",
+                cname = with_host(|h| h.class_display_name(&cname))
             ))
         }
         Some(PyObj::Module { slot, name: mname }) => {
@@ -17237,11 +17601,29 @@ fn call_method_inner(
         Some(PyObj::Super { owner, instance }) => {
             let inst_class = match with_host(|h| h.get(&instance).cloned()) {
                 Some(PyObj::Instance(i)) => i.class,
+                // `super(C, cls)` / `super()` in a classmethod: the class
+                // itself fixes where the MRO walk starts.
+                Some(PyObj::Class(n)) => n,
                 _ => owner.clone(),
             };
             match with_host(|h| super_lookup(h, &owner, &inst_class, name)) {
                 Some((f, found)) => {
                     let fobj = with_host(|h| h.get(&f).cloned());
+                    // A classmethod found along the MRO binds the class, not
+                    // the instance; a staticmethod binds nothing.
+                    if let Some(PyObj::ClassMethod(inner)) = &fobj {
+                        let cls = with_host(|h| match h.get(&instance) {
+                            Some(PyObj::Class(_)) => instance.clone(),
+                            _ => h.alloc(PyObj::Class(inst_class.clone())),
+                        });
+                        let mut a = Vec::with_capacity(args.len() + 1);
+                        a.push(cls);
+                        a.extend(args);
+                        return invoke(inner, a, kwargs);
+                    }
+                    if let Some(PyObj::StaticMethod(inner)) = &fobj {
+                        return invoke(inner, args, kwargs);
+                    }
                     if let Some(PyObj::Func(fv)) = fobj {
                         // `__new__` is an implicit staticmethod — the class is passed
                         // explicitly in `args`, so `super().__new__(cls, …)` must NOT
@@ -17345,7 +17727,18 @@ fn call_method_inner(
                 // `super().__init_subclass__()` bottoms out at `object`'s no-op
                 // default (PEP 487): a cooperative chain reaching the top returns
                 // `None`. (`object` has no `__set_name__`, so that still errors.)
-                None if name == "__init_subclass__" => Ok(Value::Undef),
+                None if name == "__init_subclass__" => {
+                    if !kwargs.is_empty() {
+                        let cls = with_host(|h| match h.get(&instance) {
+                            Some(PyObj::Class(k)) => h.class_display_name(k),
+                            _ => h.class_display_name(&inst_class),
+                        });
+                        return Err(type_error(&format!(
+                            "{cls}.__init_subclass__() takes no keyword arguments"
+                        )));
+                    }
+                    Ok(Value::Undef)
+                }
                 // `super().__setattr__/__delattr__/__getattribute__(...)` bottom out
                 // at `object`'s implementations — the plain instance-dict ops
                 // (typing's `_GenericAlias.__setattr__` calls `super().__setattr__`).
@@ -17354,17 +17747,17 @@ fn call_method_inner(
                     let attr = it.next().unwrap_or(Value::Undef);
                     let val = it.next().unwrap_or(Value::Undef);
                     let attr_s = with_host(|h| h.as_str(&attr)).unwrap_or_default();
-                    with_host(|h| h.set_attr(&instance, &attr_s, val)).map(|_| Value::Undef)
+                    crate::builtins::raw_setattr(&instance, &attr_s, val).map(|_| Value::Undef)
                 }
                 None if name == "__delattr__" => {
                     let attr = args.into_iter().next().unwrap_or(Value::Undef);
                     let attr_s = with_host(|h| h.as_str(&attr)).unwrap_or_default();
-                    with_host(|h| h.del_attr(&instance, &attr_s)).map(|_| Value::Undef)
+                    crate::builtins::raw_delattr(&instance, &attr_s).map(|_| Value::Undef)
                 }
                 None if name == "__getattribute__" => {
                     let attr = args.into_iter().next().unwrap_or(Value::Undef);
                     let attr_s = with_host(|h| h.as_str(&attr)).unwrap_or_default();
-                    with_host(|h| h.get_attr(&instance, &attr_s))
+                    crate::builtins::raw_getattr(&instance, &attr_s)
                 }
                 None => Err(format!(
                     "AttributeError: 'super' object has no attribute '{name}'"
@@ -17424,6 +17817,28 @@ fn call_method_inner(
         },
         _ => crate::builtins::call_type_method(recv, name, args, kwargs),
     }
+}
+
+/// A class attribute that nothing in the class's MRO defines, supplied by its
+/// metaclass's `__getattr__` (`M.__getattr__(cls, name)`). `None` when `cls` is
+/// not a class or its metaclass defines no such hook.
+pub fn metaclass_getattr(cls: &Value, name: &str) -> Option<Result<Value, String>> {
+    let hook = with_host(|h| {
+        let Some(PyObj::Class(cname)) = h.get(cls) else {
+            return None;
+        };
+        let meta = h.classes.get(cname)?.metaclass.clone();
+        if meta == "type" {
+            return None;
+        }
+        h.class_lookup(&meta, "__getattr__")
+    });
+    let hook = hook?;
+    Some(invoke(
+        &hook,
+        vec![cls.clone(), with_host(|h| h.new_str(name.to_string()))],
+        vec![],
+    ))
 }
 
 /// If `cls` is a user class whose metaclass overrides `name` (used for
@@ -18784,11 +19199,17 @@ pub fn build_class(
             with_host(|h| h.register_class(name, bases, ns.clone()))
         }
     };
+    // The registry key the class was filed under: `name`, or `name#n` when
+    // that name was already taken (see `register_class_meta`).
+    let key = match with_host(|h| h.get(&cls).cloned()) {
+        Some(PyObj::Class(k)) => k,
+        _ => name.to_string(),
+    };
     // Record the class's `__qualname__` (carried on the class-body `FuncDef`,
     // whose qualname was set to the class's dotted path at compile time).
     if !def.qualname.is_empty() {
         with_host(|h| {
-            if let Some(cd) = h.classes.get_mut(name) {
+            if let Some(cd) = h.classes.get_mut(&key) {
                 cd.qualname = def.qualname.clone();
             }
         });
@@ -18800,8 +19221,8 @@ pub fn build_class(
     // after the metaclass `__new__` consumed its own (e.g. enum's `boundary=`).
     // Firing here again would misname descriptors and pass consumed keywords.
     if effective_meta.is_none() {
-        fire_set_name(name, &ns)?;
-        fire_init_subclass(name, class_kwargs)?;
+        fire_set_name(&key, &ns)?;
+        fire_init_subclass(&key, class_kwargs)?;
     }
     Ok(cls)
 }
@@ -18834,8 +19255,9 @@ pub fn fire_init_subclass(
             }
         }
         None if !class_kwargs.is_empty() => {
+            let shown = with_host(|h| h.class_display_name(class_name));
             return Err(type_error(&format!(
-                "{class_name}.__init_subclass__() takes no keyword arguments"
+                "{shown}.__init_subclass__() takes no keyword arguments"
             )));
         }
         None => {}
@@ -19062,7 +19484,7 @@ fn user_str_lines(err: &str) -> Option<String> {
             .ok()
             .and_then(|v| with_host(|h| h.as_str(&v).map(|s| s.to_string())))
             .unwrap_or_else(|| "<exception str() failed>".to_string());
-        let line = join_exc(class, &text);
+        let line = join_exc(&with_host(|h| h.class_exc_label(class)), &text);
         with_host(|h| {
             (h.exc, h.error, h.traceback, h.tb_skip_frame) = saved;
             if i == 0 && h.exc_line_of(exc).as_deref() == Some(err) {
@@ -19377,6 +19799,147 @@ impl PyHost {
         );
     }
 
+    /// `traceback.format_exception(exc, chain=…)` as one string: the exception's
+    /// own `Traceback …` block, preceded (when `chain`) by the
+    /// `__cause__`/`__context__` blocks that led to it, oldest first.
+    pub fn traceback_text(&self, exc: &Value, chain: bool) -> String {
+        let mut out = String::new();
+        let mut ctx = GroupCtx::default();
+        if chain {
+            self.render_exc_chain(exc, &mut ctx, &mut out);
+        } else {
+            let frames = self.frames_of(exc);
+            let cpython = self.cpython_raised_handle(exc);
+            self.render_exc_block(
+                Some(exc),
+                &frames,
+                cpython,
+                &self.exc_final_line(exc),
+                &mut ctx,
+                &mut out,
+            );
+        }
+        out
+    }
+
+    /// `traceback.format_tb(tb)`: one string per frame entry from `tb` inward,
+    /// each with its source line and carets.
+    pub fn traceback_frame_texts(&self, tb: &Value) -> Option<Vec<String>> {
+        let Some(PyObj::Traceback { idx, entries, .. }) = self.get(tb) else {
+            return None;
+        };
+        Some(
+            entries[*idx..]
+                .iter()
+                .map(|f| self.render_frames(&[TbEntry::Frame(f.clone())]))
+                .collect(),
+        )
+    }
+
+    /// `(filename, lineno, name, caret columns)` for each frame of `tb` from
+    /// its own entry inward, the columns as `FrameSummary`'s zero-based UTF-8
+    /// byte offsets — what `traceback.extract_tb` is built from.
+    pub fn traceback_summary_parts(&self, tb: &Value) -> Option<Vec<SummaryPart>> {
+        let Some(PyObj::Traceback { idx, entries, .. }) = self.get(tb) else {
+            return None;
+        };
+        Some(
+            entries[*idx..]
+                .iter()
+                .map(|f| {
+                    let file = match &f.file {
+                        Some(file) => file.to_string(),
+                        None => self.module_filename(f.module),
+                    };
+                    let cols = if f.span.is_some() && f.span.is_one_line() {
+                        let text = self.source_line(f.module, f.span.line).unwrap_or_default();
+                        let byte_of = |col: u32| -> u32 {
+                            text.chars()
+                                .take(col as usize)
+                                .map(|c| c.len_utf8() as u32)
+                                .sum()
+                        };
+                        Some((byte_of(f.span.start), byte_of(f.span.end)))
+                    } else {
+                        None
+                    };
+                    (file, f.line, f.name.to_string(), cols)
+                })
+                .collect(),
+        )
+    }
+
+    /// `(filename, scope, line, caret start, caret end)` for each pythonrs
+    /// frame `exc` was caught through, outermost first, the columns as UTF-8
+    /// byte offsets: what a CPython traceback for the exception is built from.
+    /// A frame with no caret span covers its whole source line, which
+    /// `traceback` draws no carets for.
+    /// The frames a CAUGHT exception passed through, when they are all pythonrs
+    /// frames (none ran inside CPython) — the whole of its traceback, from
+    /// the frame that caught it inward. `None` otherwise.
+    pub fn exc_caught_frames(&self, exc: &Value) -> Option<Vec<TbFrameSpec>> {
+        let entries = self.frames_of(exc);
+        if entries.is_empty() || entries.iter().any(|e| matches!(e, TbEntry::CPython(_))) {
+            return None;
+        }
+        Some(self.tb_frame_tuples(&entries))
+    }
+
+    /// Whether `exc` is the exception now propagating and the frames it has
+    /// unwound through are still uncaptured (see [`Self::exc_traceback_frames`]).
+    pub fn exc_propagating_frames(&self, exc: &Value) -> bool {
+        self.frames_of(exc).is_empty()
+            && !self.traceback.is_empty()
+            && matches!((&self.exc, exc), (Some(Value::Obj(a)), Value::Obj(b)) if a == b)
+    }
+
+    pub fn exc_traceback_frames(&self, exc: &Value) -> Vec<TbFrameSpec> {
+        // An exception still propagating (it is crossing into CPython out of a
+        // callback) has not had its frames captured yet: they are the ones
+        // unwound so far, innermost first.
+        let mut entries = self.frames_of(exc);
+        if entries.is_empty()
+            && matches!((&self.exc, exc), (Some(Value::Obj(a)), Value::Obj(b)) if a == b)
+        {
+            entries = self.traceback.iter().rev().cloned().collect();
+        }
+        self.tb_frame_tuples(&entries)
+    }
+
+    /// [`Self::exc_traceback_frames`] for the frames unwound so far by the
+    /// exception now propagating, whichever object (if any) carries it.
+    pub fn unwound_frames(&self) -> Vec<TbFrameSpec> {
+        let entries: Vec<TbEntry> = self.traceback.iter().rev().cloned().collect();
+        self.tb_frame_tuples(&entries)
+    }
+
+    fn tb_frame_tuples(&self, entries: &[TbEntry]) -> Vec<TbFrameSpec> {
+        entries
+            .iter()
+            .filter_map(|e| match e {
+                TbEntry::Frame(f) => Some(f),
+                TbEntry::CPython(_) => None,
+            })
+            .map(|f| {
+                let file = match &f.file {
+                    Some(file) => file.to_string(),
+                    None => self.module_filename(f.module),
+                };
+                let text = self.source_line(f.module, f.line).unwrap_or_default();
+                let byte_of = |col: usize| -> u32 {
+                    text.chars().take(col).map(|c| c.len_utf8() as u32).sum()
+                };
+                let (start, end) = if f.span.is_some() && f.span.is_one_line() {
+                    (byte_of(f.span.start as usize), byte_of(f.span.end as usize))
+                } else {
+                    let lead = text.len() - text.trim_start().len();
+                    (lead as u32, text.trim_end().len() as u32)
+                };
+                (file, f.name.to_string(), f.line, start, end.max(start))
+            })
+            .collect()
+    }
+
     /// The traceback frames captured for an already-caught exception.
     fn frames_of(&self, exc: &Value) -> Vec<TbEntry> {
         match exc {
@@ -19685,7 +20248,7 @@ impl PyHost {
     /// The CPython exception the error line `err` came from, when CPython
     /// raised it: the exception being handled renders to `err`, or `err` is
     /// the line of the exception the bridge last recorded, uncaught since.
-    fn cpython_raised_for_err(&self, err: &str) -> Option<u32> {
+    pub fn cpython_raised_for_err(&self, err: &str) -> Option<u32> {
         match &self.exc {
             Some(e) if self.exc_line_of(e).as_deref() == Some(err) => self.cpython_raised_handle(e),
             _ => match &self.foreign_exc {
@@ -19714,6 +20277,11 @@ impl PyHost {
                 return format!("{name}{}", &err[class.len()..]);
             }
         }
+        // A class the program defined is named by module and qualified name.
+        let class = err.split_once(": ").map_or(err, |(c, _)| c);
+        if self.classes.contains_key(class) && self.class_is_exception(class) {
+            return format!("{}{}", self.class_exc_label(class), &err[class.len()..]);
+        }
         err.to_string()
     }
 
@@ -19731,7 +20299,10 @@ impl PyHost {
                 {
                     return join_exc(&name, &self.exc_obj_message(exc, class, args));
                 }
-                join_exc(class, &self.exc_obj_message(exc, class, args))
+                join_exc(
+                    &self.class_exc_label(class),
+                    &self.exc_obj_message(exc, class, args),
+                )
             }
             Some(PyObj::Instance(i)) if self.class_is_exception(&i.class) => {
                 if let Some(line) = match exc {
@@ -19740,7 +20311,10 @@ impl PyHost {
                 } {
                     return line.clone();
                 }
-                join_exc(&i.class, &self.exc_inst_message(&i.class, &i.dict))
+                join_exc(
+                    &self.class_exc_label(&i.class),
+                    &self.exc_inst_message(&i.class, &i.dict),
+                )
             }
             _ => String::new(),
         }
@@ -19963,9 +20537,9 @@ impl PyHost {
     /// (`cls.__subclasses__()`).
     pub fn subclasses_of(&self, cname: &str) -> Vec<String> {
         self.classes
-            .values()
-            .filter(|cd| cd.bases.iter().any(|b| b == cname))
-            .map(|cd| cd.name.clone())
+            .iter()
+            .filter(|(_, cd)| cd.bases.iter().any(|b| b == cname))
+            .map(|(key, _)| key.clone())
             .collect()
     }
 
@@ -20465,7 +21039,13 @@ fn pep479_replace(e: String, stop_tb: Option<Vec<TbEntry>>) -> String {
         if let (Value::Obj(cid), Some(tb)) = (&cause, stop_tb) {
             h.exc_tb.insert(*cid, tb);
         }
-        h.set_exc_link(&rt, cause, Value::Undef);
+        // `raise RuntimeError(...) from stop`, with `stop` being handled: it is
+        // both the cause and the context, and an explicit cause suppresses the
+        // context in the rendering.
+        h.set_exc_link(&rt, cause.clone(), cause);
+        if let Value::Obj(rid) = &rt {
+            h.suppress_context.insert(*rid);
+        }
         h.exc = Some(rt);
     });
     "RuntimeError: generator raised StopIteration".to_string()
@@ -20477,6 +21057,9 @@ pub fn gen_resume(gen: &Value, send: Value) -> Result<Option<Value>, String> {
         _ => return Err(type_error("not a generator")),
     };
     if with_host(|h| h.generators[id as usize].done) {
+        // The return value is delivered once, by the resume that finished the
+        // generator; resuming a finished one raises a bare `StopIteration`.
+        with_host(|h| h.generators[id as usize].ret_value = Value::Undef);
         return Ok(None);
     }
     let mut coro = match with_host(|h| h.generators[id as usize].coro.take()) {
@@ -20576,6 +21159,7 @@ pub fn iter_vec(v: &Value) -> Result<Vec<Value>, String> {
                 | Some(PyObj::EnumerateObj { .. })
                 | Some(PyObj::ItertoolsIter { .. })
                 | Some(PyObj::CallIter { .. })
+                | Some(PyObj::SeqIter { .. })
         )
     }) {
         let mut out = Vec::new();
@@ -20643,6 +21227,7 @@ pub fn is_iterator(v: &Value) -> bool {
         | Some(PyObj::EnumerateObj { .. })
         | Some(PyObj::ItertoolsIter { .. })
         | Some(PyObj::CallIter { .. })
+        | Some(PyObj::SeqIter { .. })
         | Some(PyObj::CsvReader { .. }) => true,
         #[cfg(feature = "stdlib-ffi")]
         Some(PyObj::Foreign(id)) => crate::ffi::is_iterator(*id),
@@ -20701,12 +21286,9 @@ pub fn make_iterator(v: &Value) -> Result<Value, String> {
             }
             with_host(|h| h.make_iter(&it))
         }
-        // The old-style `__getitem__(0..)` sequence protocol has no iterator
-        // object to hand back, so it is materialized once here.
-        Some((false, true)) => {
-            let items = iter_instance_items(v)?;
-            Ok(with_host(|h| h.new_iter_seq(items)))
-        }
+        // The old-style `__getitem__(0..)` sequence protocol: a lazy
+        // `iterator` over the object, stepped one index at a time.
+        Some((false, true)) => Ok(with_host(|h| h.new_seq_iter(v.clone()))),
         _ => with_host(|h| h.make_iter(v)),
     }
 }
@@ -20724,6 +21306,8 @@ fn ends_iteration(e: &str, base: &str, saved: &Option<Value>) -> bool {
         with_host(|h| {
             h.error = None;
             h.exc = saved.clone();
+            // Its frames went with it.
+            h.reset_traceback();
         });
     }
     matches
@@ -20887,6 +21471,34 @@ fn itertools_step(it: &Value) -> Result<Option<Value>, String> {
             let cur = buf[0].clone();
             buf[0] = with_host(|h| h.arith(NumOp::Add, &cur, &buf[1]))?;
             Some(cur)
+        }
+        ItKind::Tee => {
+            let idx = nums[0] as usize;
+            let known = with_host(|h| match h.get(&sources[1]) {
+                Some(PyObj::List(l)) => l.get(idx).cloned(),
+                _ => None,
+            });
+            match known {
+                Some(v) => {
+                    nums[0] += 1;
+                    Some(v)
+                }
+                None => match iter_step(&sources[0])? {
+                    Some(v) => {
+                        with_host(|h| {
+                            if let Some(PyObj::List(l)) = h.get_mut(&sources[1]) {
+                                l.push(v.clone());
+                            }
+                        });
+                        nums[0] += 1;
+                        Some(v)
+                    }
+                    None => {
+                        finished = true;
+                        None
+                    }
+                },
+            }
         }
         ItKind::Repeat => {
             // nums[0] = remaining (-1 = infinite).
@@ -21239,6 +21851,7 @@ pub fn iter_step(it: &Value) -> Result<Option<Value>, String> {
         Filter,
         Enumerate,
         CallIter,
+        SeqIter,
         Itertools,
         /// A user object driving its own `__next__` (the class defines it).
         UserNext,
@@ -21256,6 +21869,7 @@ pub fn iter_step(it: &Value) -> Result<Option<Value>, String> {
         Some(PyObj::FilterObj { .. }) => Step::Filter,
         Some(PyObj::EnumerateObj { .. }) => Step::Enumerate,
         Some(PyObj::CallIter { .. }) => Step::CallIter,
+        Some(PyObj::SeqIter { .. }) => Step::SeqIter,
         Some(PyObj::CsvReader { .. }) => Step::Plain,
         Some(PyObj::ItertoolsIter { .. }) => Step::Itertools,
         #[cfg(feature = "stdlib-ffi")]
@@ -21269,6 +21883,7 @@ pub fn iter_step(it: &Value) -> Result<Option<Value>, String> {
         Step::Filter => filter_step(it),
         Step::Enumerate => enumerate_step(it),
         Step::CallIter => calliter_step(it),
+        Step::SeqIter => seqiter_step(it),
         Step::Itertools => itertools_step(it),
         // A user iterator steps by calling its own `__next__`, which must run
         // outside the host borrow; `StopIteration` is exhaustion, every other
@@ -21287,6 +21902,44 @@ pub fn iter_step(it: &Value) -> Result<Option<Value>, String> {
         #[cfg(feature = "stdlib-ffi")]
         Step::Foreign(id) => crate::ffi::iter_next_cb(id),
         Step::Plain => with_host(|h| h.iter_next(it)),
+    }
+}
+
+/// One step of the `__getitem__` sequence-protocol iterator: `obj[idx]`, then
+/// `idx += 1`. `IndexError` or `StopIteration` exhausts it permanently.
+fn seqiter_step(it: &Value) -> Result<Option<Value>, String> {
+    let (obj, idx, done) = match with_host(|h| h.get(it).cloned()) {
+        Some(PyObj::SeqIter { obj, idx, done }) => (obj, idx, done),
+        _ => return Err(type_error("not an iterator")),
+    };
+    if done {
+        return Ok(None);
+    }
+    let saved = with_host(|h| h.exc.clone());
+    let finish = |it: &Value, idx: i64, done: bool| {
+        with_host(|h| {
+            if let Some(PyObj::SeqIter {
+                idx: i, done: d, ..
+            }) = h.get_mut(it)
+            {
+                *i = idx;
+                *d = done;
+            }
+        })
+    };
+    match call_method(&obj, "__getitem__", vec![Value::Int(idx)], vec![]) {
+        Ok(v) => {
+            finish(it, idx + 1, false);
+            Ok(Some(v))
+        }
+        Err(e)
+            if ends_iteration(&e, "IndexError", &saved)
+                || ends_iteration(&e, "StopIteration", &saved) =>
+        {
+            finish(it, idx, true);
+            Ok(None)
+        }
+        Err(e) => Err(e),
     }
 }
 

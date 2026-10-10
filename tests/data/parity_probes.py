@@ -2302,3 +2302,390 @@ for stmt in ["del c[[1]]", "c.__delitem__([1])", "del collections.defaultdict(in
         print(stmt, '!', type(e).__name__)
 del c['a']
 print(c, c.__getitem__('a'))
+
+#==#
+# ── int ** int stays an int whatever the operand width ────────────────────────
+# A bignum BASE took the float route: `(10**20) ** 2` was `1e+40`, and
+# `(2**100 + 1) ** 32` raised OverflowError. `(-inf) ** 0.5` is `inf` (C99
+# `pow`), not the complex result a finite negative base gets.
+print((10**20) ** 2, -(10**20) ** 2, (-3**50) ** 3 < 0)
+print(len(str((2**100 + 1) ** 32)), (2**64) ** 0, (-2) ** 63, True ** 5)
+print(pow(2**70, 3, 10**9 + 7), (-1) ** (2**70), 1 ** (2**70), 0 ** (2**70))
+print((-float('inf')) ** 0.5, (-float('inf')) ** 1.5, (-float('inf')) ** 2.0)
+print(type((-8.0) ** 0.5).__name__)
+#==#
+# ── str/bytes sets iterate in hash-table order ────────────────────────────────
+# The hash secret is pinned (PYTHONHASHSEED=0 in this harness), so a set of
+# strings has ONE legal order; it was insertion order.
+print(list({'a', 'bb', 'ccc', 'dddd'}), {'x', 'y', 'z'})
+print(list({b'a', b'bb', b'ccc'}), list({None, 'q', 1.5, (1, 'a')}))
+s = set()
+for w in ('alpha', 'beta', 'gamma', 'delta', 'epsilon', 'zeta', 'eta', 'theta', 'iota'):
+    s.add(w)
+print(list(s))
+print(list(frozenset(['one', 'two', 'three'])), sorted(set('mississippi')))
+print(list(set('hello world')), list({frozenset('ab'), frozenset('c')}))
+#==#
+# ── `return` in `finally` discards the exception passing through ──────────────
+# The exception was kept pending, so the function raised, and then the next
+# unrelated exception chained onto it as `__context__`.
+def swallow():
+    for i in range(2):
+        try:
+            continue
+        finally:
+            pass
+    try:
+        raise KeyError('k')
+    finally:
+        return 'swallowed'
+print(swallow())
+try:
+    [][1]
+except IndexError as e:
+    print(e.__context__, e.__suppress_context__)
+def loop_swallow():
+    for i in range(3):
+        try:
+            raise ValueError(i)
+        finally:
+            if i == 1:
+                break
+    return i
+print(loop_swallow())
+#==#
+# ── `global` names the module's variable, never an enclosing local ────────────
+def outer():
+    gl = 1
+    def bump():
+        global gl
+        gl += 1
+    try:
+        bump()
+    except NameError as e:
+        print('NameError', e)
+    return gl
+print(outer())
+gv = 10
+def outer2():
+    gv = 1
+    def bump():
+        global gv
+        gv += 1
+        return gv
+    return bump(), gv
+print(outer2(), gv)
+#==#
+# ── an unbound closure cell is not "name is not defined" ──────────────────────
+def f():
+    def g():
+        return late
+    try:
+        g()
+    except NameError as e:
+        print(type(e).__name__, str(e).startswith('cannot access free variable'), e.name)
+    late = 1
+    return g()
+print(f())
+def deleted():
+    d = 1
+    def g():
+        return d
+    del d
+    return g
+try:
+    deleted()()
+except NameError as e:
+    print(type(e).__name__, "free variable 'd'" in str(e))
+#==#
+# ── %-formatting honours __int__/__index__/__float__ and a lone mapping ───────
+class V:
+    def __int__(self): return 7
+    def __index__(self): return 9
+    def __float__(self): return 2.5
+class I:
+    def __index__(self): return 9
+class F:
+    def __float__(self): return 2.5
+print('%d %i %x %o %c' % (V(), V(), V(), V(), V()))
+print('%d|%x|%5.1f|%e' % (I(), I(), F(), F()))
+print('%s' % {'a': 1}, '%r' % {'a': 1}, 'plain' % {'a': 1}, '%(a)s' % {'a': 1})
+print('%*d|%-*d|' % (I(), 3, I(), 4)[:12])
+for fmt, arg in (('%d', F()), ('%x', F()), ('%s %s', {'a': 1})):
+    try:
+        fmt % arg
+    except TypeError as e:
+        print('TypeError')
+#==#
+# ── itertools.islice validates its bounds ─────────────────────────────────────
+import itertools
+for args in ((-1,), (1, -1), (0, 5, 0), (0, 5, -1), (None, None, 0), (-2,), (1.5,), (2**70,)):
+    try:
+        print(list(itertools.islice(range(8), *args)))
+    except Exception as e:
+        print(args, type(e).__name__, str(e).split(':')[0])
+print(list(itertools.islice(range(10), 2, None, 3)), list(itertools.islice('abcd', None)))
+#==#
+# ── generator frame introspection and the one-shot return value ───────────────
+def g():
+    yield 1
+    return 'r'
+x = g()
+print(x.gi_frame is None, x.gi_running, x.gi_suspended, x.gi_code.co_name)
+next(x)
+print(x.gi_frame is None, x.gi_suspended)
+try:
+    next(x)
+except StopIteration as e:
+    print('first', repr(e.value))
+try:
+    next(x)
+except StopIteration as e:
+    print('second', repr(e.value), e.args)
+print(x.gi_frame is None, x.gi_suspended)
+import inspect
+print(inspect.getgeneratorstate(g()))
+def stopper():
+    raise StopIteration('x')
+    yield
+try:
+    list(stopper())
+except RuntimeError as e:
+    print(type(e.__cause__).__name__, type(e.__context__).__name__, e.__suppress_context__)
+#==#
+# ── a `for` loop (and `in`, `any`, `tee`) pulls lazily ────────────────────────
+import itertools
+log = []
+class It:
+    def __init__(self): self.i = 0
+    def __iter__(self): return self
+    def __next__(self):
+        self.i += 1
+        log.append(self.i)
+        if self.i > 50: raise RuntimeError('drained')
+        return self.i
+it = It()
+for v in it:
+    if v >= 3: break
+print(it.i, log)
+log.clear()
+print(4 in It(), log)
+log.clear()
+print(any(v > 2 for v in It()), log)
+log.clear()
+print(all(v < 2 for v in It()), log)
+log.clear()
+a, b = itertools.tee(It())
+print(next(a), next(b), next(a), log)
+class Seq:
+    def __getitem__(self, i):
+        log.append(i)
+        if i > 50: raise RuntimeError('drained')
+        return i * i
+log.clear()
+for v in Seq():
+    if v > 10: break
+print(log)
+s = iter(Seq())
+print(type(s).__name__, next(s), next(s), log[-2:])
+print(list(itertools.islice(Seq(), 3)), list(zip(Seq(), 'ab')))
+class Short:
+    def __getitem__(self, i):
+        if i >= 3: raise IndexError
+        return i
+print(list(Short()), 2 in Short(), 9 in Short(), tuple(Short()), sum(Short()))
+#==#
+# ── object.__setattr__/__delattr__/__getattribute__ run data descriptors ──────
+class D:
+    def __get__(self, o, t=None): print('get'); return 1
+    def __set__(self, o, v): print('set', v)
+    def __delete__(self, o): print('del')
+class P:
+    a = D()
+p = P()
+p.__setattr__('a', 3)
+object.__setattr__(p, 'a', 4)
+p.__delattr__('a')
+object.__delattr__(p, 'a')
+print(p.__getattribute__('a'), object.__getattribute__(p, 'a'), p.__dict__)
+class Q(P):
+    def __setattr__(self, n, v):
+        super().__setattr__(n, v)
+Q().a = 5
+#==#
+# ── a metaclass __getattr__ answers a missing class attribute ─────────────────
+class M(type):
+    def __getattr__(cls, name):
+        return 'meta:' + name
+class K(metaclass=M):
+    present = 1
+print(K.present, K.zzz, getattr(K, 'yyy'), hasattr(K, 'q'))
+class MM(type):
+    def __getattr__(cls, name):
+        raise AttributeError(name)
+class K2(metaclass=MM): pass
+print(getattr(K2, 'nope', 'dflt'))
+#==#
+# ── slice.indices with bignum bounds, and bignum steps ───────────────────────
+print(slice(None, 2**70).indices(5), slice(-2**70, 2**70, -2**70).indices(5))
+print(slice(1, 2, 2**70).indices(5), slice(10**30, 10, 10**30).indices(10))
+print('abc'[:2**70:2**70], list(range(10))[2**70::-1], list(range(10))[::-2**70])
+print(slice(None, None, -1).indices(0), slice(5, None).indices(3))
+try:
+    slice(1, 2, 0).indices(5)
+except ValueError as e:
+    print('ValueError', e)
+#==#
+# ── math: remainder, hypot, floor of a non-finite ────────────────────────────
+import math
+print([math.remainder(x, y) for x, y in ((5, 3), (7, 2), (-5, 3), (5.5, 2), (1e16, 0.7), (123456789.125, 0.7), (3, math.inf), (-0.0, 3))])
+print(math.hypot(3, 4, 0.30000000000000004), math.hypot(1e200, 1e200), math.hypot(0.1, 0.2, 0.3, 0.4, 0.7))
+print(math.hypot(5e-324, 5e-324), math.hypot(1e308, 1e308), math.hypot(), math.hypot(math.inf, math.nan))
+for fn in (math.floor, math.ceil, math.trunc):
+    for v in (math.inf, -math.inf, math.nan):
+        try:
+            fn(v)
+        except Exception as e:
+            print(fn.__name__, type(e).__name__, e)
+try:
+    math.remainder(1, 0)
+except ValueError as e:
+    print('ValueError')
+#==#
+# ── re.fullmatch backtracks to reach the end; re.escape's set ────────────────
+import re
+print(re.fullmatch(r'a*?', 'aaa'), re.fullmatch(r'a+?b??', 'aab'), re.fullmatch(r'(a|ab)*?c', 'ababc'))
+print(re.fullmatch(r'.*?', 'xyz').span(), re.fullmatch(r'a{1,3}?', 'aa').span(), re.fullmatch('a|ab', 'ab').group())
+print(re.fullmatch(r'a|b', 'ab'), re.compile(r'x*?').fullmatch('xx', 1).span())
+print(re.escape('a b\t\n-_.~é#&'), re.escape(b'a b-.'), re.escape('A_9'))
+#==#
+# ── ordering sequences whose elements order through user code ─────────────────
+class V:
+    def __init__(self, v): self.v = v
+    def __eq__(self, o): return isinstance(o, V) and self.v == o.v
+    def __hash__(self): return hash(self.v)
+    def __lt__(self, o): return self.v < o.v
+    def __repr__(self): return 'V(%d)' % self.v
+print((V(1),) < (V(2),), [V(2)] > [V(1)], (V(1), 2) < (V(1), 3), [[V(1)]] < [[V(2)]])
+print(sorted([(V(3), 'a'), (V(1), 'b'), (V(2), 'c')]), max([(V(3), 'a'), (V(9), 'b')]))
+import heapq
+h = []
+for n in (5, 1, 4, 2):
+    heapq.heappush(h, (V(n), n))
+print([heapq.heappop(h)[1] for _ in range(4)])
+print((None, 1) < (None, 2), [None, 3] > [None, 2], (1, None) == (1, None))
+class W:
+    def __init__(self, v): self.v = v
+    def __lt__(self, o): print('lt'); return self.v < o.v
+    def __eq__(self, o): print('eq'); return self.v == o.v
+print((W(1),) < (W(2),))
+#==#
+# ── list.sort empties the list and reports mutation ──────────────────────────
+L = [3, 1, 2]
+seen = []
+def key(v):
+    seen.append(len(L))
+    return v
+L.sort(key=key)
+print(L, seen)
+M = [3, 1, 2]
+try:
+    M.sort(key=lambda v: M.append(9) or v)
+except ValueError as e:
+    print('ValueError', e)
+print(M)
+N = [2, 1]
+try:
+    N.sort(key=lambda v: 1 / 0)
+except ZeroDivisionError:
+    print(N)
+#==#
+# ── classes that reuse a name are distinct types ─────────────────────────────
+def make(n):
+    class Err(Exception):
+        code = n
+        def __str__(self): return 'err%d' % n
+    class Pt:
+        def __init__(self, v): self.v = v
+        def __eq__(self, o): return type(o) is type(self) and o.v == self.v
+        def __hash__(self): return hash(self.v)
+        def who(self): return n
+    return Err, Pt
+E1, P1 = make(1)
+E2, P2 = make(2)
+print(E1 is E2, E1.code, E2.code, P1(1) == P1(1), P1(1) == P2(1), len({P1(1), P2(1)}))
+print(P1(0).who(), P2(0).who(), isinstance(P2(0), P1), isinstance(P2(0), P2), issubclass(E2, E1))
+print(type(P1(0)) is P1, type(P1(0)) is P2, P1.__name__, P1.__qualname__, P2.__mro__[0] is P2)
+print(repr(P2), repr(E2('x')), P1.__subclasses__ is not None)
+try:
+    try:
+        raise E1('a')
+    except E2:
+        print('wrong class')
+except E1 as e:
+    print('right', e, type(e).__name__)
+class A:
+    x = 1
+a = A()
+class A:
+    x = 2
+print(a.x, A().x, type(a) is A, isinstance(a, A), a.__class__.x, type(a).__name__)
+import collections
+nt1 = collections.namedtuple('NT', 'a b')
+nt2 = collections.namedtuple('NT', 'a b c')
+print(nt1(1, 2), nt2(1, 2, 3), type(nt1(1, 2)) is nt1)
+#==#
+# ── locals() inside a comprehension and a generator expression ───────────────
+def h():
+    b = 2
+    return [sorted(locals()) for _ in range(1)][0], list(sorted(locals()) for _ in range(1))[0]
+print(h())
+def outer():
+    a = 1
+    def inner():
+        c = 3
+        return sorted([sorted(locals()) for _ in range(1)][0])
+    return inner()
+print(outer())
+class C:
+    z = 1
+    print(sorted(k for k in locals() if not k.startswith('__')))
+#==#
+# ── type() with a base that is not a type; with_traceback; format 'c' ────────
+class A: pass
+for bases in ((None,), (A, 1), ('x',)):
+    try:
+        type('F', bases, {})
+    except TypeError as e:
+        print('TypeError', str(e).startswith('metaclass conflict'))
+print(type('F', (A,), {}).__mro__[1].__name__, type('G', (), {}).__bases__)
+try:
+    BaseException().with_traceback(5)
+except TypeError as e:
+    print('TypeError', e)
+print(repr(BaseException().with_traceback(None)))
+for v in (2**100 + 1, 2**40, -1):
+    try:
+        print(repr(format(v, 'c')))
+    except OverflowError as e:
+        print('OverflowError', e)
+#==#
+# ── property accessors are callable attributes; json keeps its chain ─────────
+class P:
+    @property
+    def p(self): return 'prop'
+    @p.setter
+    def p(self, v): print('set', v)
+print(P.p.fget(P()), P.p.fset(P(), 3), P.p.fdel)
+import json
+try:
+    json.loads('')
+except json.JSONDecodeError as e:
+    print(type(e.__context__).__name__, e.__suppress_context__, e.__cause__)
+#==#
+# ── int()/range/sorted corners surfaced by the batched fuzz ──────────────────
+print(sorted([True, 2**70, 1.5, -0.0, 0]), sorted(['b', 'B', 'a', 'A', 'ä']))
+print(divmod(-7, 2), divmod(7, -2), divmod(-7.5, 2), (-7) // 2.0, -7 % 3.0, 7 % -3.0)
+print(round(2.5), round(3.5), round(-2.5), round(2.675, 2), round(1234, -2), round(1250, -2))
+print(format(1234567.891, ',.2f'), format(255, '#010b'), format(-255, 'x'), format(0.000123, 'g'))
+print(f'{3.14159:10.3e}|{255:#x}|{"ab":>5}|{1e22}|{1e-5}|{123456789012345678.0}')

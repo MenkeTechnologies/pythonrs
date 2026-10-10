@@ -752,6 +752,73 @@ fn pyerr_to_error(py: Python, err: &PyErr) -> String {
     line
 }
 
+/// `(__cause__, __context__, __suppress_context__)` of a CPython exception, the
+/// two links as pythonrs exception values (`None` links are `Undef`). An
+/// exception the bridge already paired is that same pythonrs object; any other
+/// is rebuilt from its type name and `args` and paired in turn, so
+/// `e.__context__` on something the stdlib raised answers as it does in CPython.
+fn exc_chain_links(host: &mut PyHost, py: Python, exc: &Bound<PyAny>) -> (Value, Value, bool) {
+    let link = |host: &mut PyHost, name: &str| -> Value {
+        match exc.getattr(name) {
+            Ok(o) if !o.is_none() => foreign_exc_value(host, py, &o, 0),
+            _ => Value::Undef,
+        }
+    };
+    let cause = link(host, "__cause__");
+    let context = link(host, "__context__");
+    let suppress = exc
+        .getattr("__suppress_context__")
+        .and_then(|b| b.extract::<bool>())
+        .unwrap_or(false);
+    (cause, context, suppress)
+}
+
+/// A CPython exception object as a pythonrs exception value (see
+/// [`exc_chain_links`]); `depth` bounds the walk of a long `__context__` chain.
+fn foreign_exc_value(host: &mut PyHost, py: Python, o: &Bound<PyAny>, depth: u32) -> Value {
+    if let Some(v) = paired_exception(host, o) {
+        return v;
+    }
+    let Ok(name) = o.get_type().name().map(|n| n.to_string()) else {
+        return Value::Undef;
+    };
+    let args: Vec<Value> = match o.getattr("args").and_then(|a| a.try_iter()) {
+        Ok(it) => it
+            .flatten()
+            .filter_map(|a| py_to_value(host, py, &a).ok())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    let err = PyErr::from_value(o.clone());
+    if let Some((class, bases)) = pyerr_class_bases(py, &err) {
+        host.foreign_exc_bases.insert(class, bases);
+    }
+    let e = host.alloc(crate::host::PyObj::Exception { class: name, args });
+    host.exc_bridge
+        .borrow_mut()
+        .pair(&e, store(o.clone().unbind()), o.as_ptr() as usize, true);
+    if depth < 8 {
+        let link = |host: &mut PyHost, attr: &str| -> Value {
+            match o.getattr(attr) {
+                Ok(x) if !x.is_none() => foreign_exc_value(host, py, &x, depth + 1),
+                _ => Value::Undef,
+            }
+        };
+        let (cause, context) = (link(host, "__cause__"), link(host, "__context__"));
+        host.set_exc_link(&e, cause, context);
+    }
+    if o.getattr("__suppress_context__")
+        .and_then(|b| b.extract::<bool>())
+        .unwrap_or(false)
+    {
+        host.suppress_context.insert(match &e {
+            Value::Obj(i) => *i,
+            _ => 0,
+        });
+    }
+    e
+}
+
 /// Record what the raised exception carries beyond its rendered line — its real
 /// `args` and its instance `__dict__` — so `synth_exc` can rebuild it without
 /// re-parsing its own rendering (see [`ForeignExc`]).
@@ -787,10 +854,14 @@ fn record_foreign_exc(host: &mut PyHost, py: Python, err: &PyErr, line: &str) {
         }
         attrs.sort_by(|a, b| a.0.cmp(&b.0));
     }
+    let (cause, context, suppress_context) = exc_chain_links(host, py, value.as_any());
     host.foreign_exc = Some(crate::host::ForeignExc {
         line: line.to_string(),
         args,
         attrs,
+        cause,
+        context,
+        suppress_context,
         origin: Some(match paired_exception(host, value.as_any()) {
             Some(v) => crate::host::ExcOrigin::Paired(v),
             None => crate::host::ExcOrigin::Raised {
@@ -1225,7 +1296,33 @@ fn exc_to_py<'py>(
         return Ok(None);
     };
     if let Some(&handle) = host.exc_bridge.borrow().to_py.get(id) {
-        return fetch(py, handle).map(Some);
+        let exc = fetch(py, handle)?;
+        // An exception CPython raised, coming back out of the pythonrs frames
+        // that were running underneath it: those frames go IN FRONT of the
+        // ones CPython recorded, so the traceback reads outermost-first.
+        if host.exc_propagating_frames(v) {
+            let frames = host.exc_traceback_frames(v);
+            if !frames.is_empty() {
+                let tail = exc.getattr("__traceback__").map_err(|e| e.to_string())?;
+                let _ = exception_helpers(py)
+                    .and_then(|m| m.getattr("with_tb").map_err(|e| e.to_string()))
+                    .and_then(|f| {
+                        f.call1((exc.clone(), frames, tail))
+                            .map_err(|e| e.to_string())
+                    });
+            }
+        } else if !host.exc_bridge.borrow().foreign.contains(id) {
+            // A pythonrs exception that was caught and is going out again
+            // (`traceback.TracebackException.from_exception(e)`): its CPython
+            // traceback is rebuilt from the frames it was caught through, which
+            // include the catching frame.
+            if let Some(frames) = host.exc_caught_frames(v) {
+                let _ = exception_helpers(py)
+                    .and_then(|m| m.getattr("with_tb").map_err(|e| e.to_string()))
+                    .and_then(|f| f.call1((exc.clone(), frames)).map_err(|e| e.to_string()));
+            }
+        }
+        return Ok(Some(exc));
     }
     let (class, args, builtin) = match host.get(v) {
         Some(PyObj::Exception { class, args }) => (class.clone(), args.clone(), true),
@@ -1275,6 +1372,15 @@ fn exc_to_py<'py>(
     }
     let handle = store(exc.clone().unbind());
     pair_exception(host, v, &exc, handle, false);
+    // The frames it was caught through become a real CPython traceback, so
+    // `traceback.TracebackException`, `logging.exception` and `unittest`'s
+    // failure report see where it was raised.
+    let frames = host.exc_traceback_frames(v);
+    if !frames.is_empty() {
+        let _ = exception_helpers(py)
+            .and_then(|m| m.getattr("with_tb").map_err(|e| e.to_string()))
+            .and_then(|f| f.call1((exc.clone(), frames)).map_err(|e| e.to_string()));
+    }
     Ok(Some(exc))
 }
 
@@ -1396,6 +1502,59 @@ def mirror(name, qualname, module, base, delegate):
 
 def new(cls, args):
     return cls.__new__(cls, *args)
+
+import ast
+import functools
+
+def _frame_function(filename, name, line, col, end_col):
+    # A function whose single statement is `return _n()` placed at exactly
+    # (line, col..end_col) of `filename`, so a traceback through it names that
+    # file, line and caret span — all `traceback.py` reads off a frame.
+    def at(node, a=0, b=1):
+        node.lineno = node.end_lineno = line
+        node.col_offset, node.end_col_offset = a, b
+        return node
+    call = at(ast.Call(func=at(ast.Name(id='_n', ctx=ast.Load())), args=[], keywords=[]), col, end_col)
+    ret = at(ast.Return(value=call), col, end_col)
+    arg = at(ast.arg(arg='_n'))
+    args = ast.arguments(posonlyargs=[], args=[arg], kwonlyargs=[], kw_defaults=[], defaults=[])
+    fn = at(ast.FunctionDef(name='_f', args=args, body=[ret], decorator_list=[]), 0, end_col)
+    if hasattr(fn, 'type_params'):
+        fn.type_params = []
+    mod = ast.Module(body=[fn], type_ignores=[])
+    ns = {}
+    exec(compile(mod, filename, 'exec'), ns)
+    f = ns['_f']
+    try:
+        f.__code__ = f.__code__.replace(co_name=name, co_qualname=name)
+    except TypeError:
+        f.__code__ = f.__code__.replace(co_name=name)
+    return f
+
+def with_tb(exc, frames, tail=None):
+    # Give `exc` a traceback through `frames` (outermost first), as genuine
+    # traceback objects: the frames are really run, nested, with the
+    # exception raised at the bottom, and the driver's own entries cut off.
+    # `tail` is a traceback to continue into (the frames CPython already
+    # recorded when it raised the exception).
+    keep = (exc.__context__, exc.__cause__, exc.__suppress_context__)
+    def raiser():
+        raise exc
+    call = raiser
+    for filename, name, line, col, end_col in reversed(frames):
+        call = functools.partial(_frame_function(filename, name, line, col, end_col), call)
+    try:
+        call()
+    except BaseException as e:
+        tb = e.__traceback__
+    exc.__context__, exc.__cause__, exc.__suppress_context__ = keep
+    # Drop the driver frame in front and the raiser frame behind.
+    tb = tb.tb_next
+    last = tb
+    for _ in range(len(frames) - 1):
+        last = last.tb_next
+    last.tb_next = tail
+    exc.__traceback__ = tb
 "#;
     let module = PyModule::from_code(py, code, c"_pyrs_exceptions.py", c"_pyrs_exceptions")
         .map_err(|e| e.to_string())?;
@@ -1998,7 +2157,8 @@ fn value_to_py_node<'py>(
                 | PyObj::MapObj { .. }
                 | PyObj::FilterObj { .. }
                 | PyObj::EnumerateObj { .. }
-                | PyObj::CallIter { .. },
+                | PyObj::CallIter { .. }
+                | PyObj::SeqIter { .. },
             ) => {
                 let it = PyrsIterator { target: v.clone() };
                 Py::new(py, it)
@@ -2385,6 +2545,12 @@ fn reference_to_value(host: &mut PyHost, py: Python, obj: &Bound<PyAny>) -> Resu
 pub fn get_attr(host: &mut PyHost, id: u32, name: &str) -> Result<Value, String> {
     Python::attach(|py| {
         let obj = fetch(py, id)?;
+        // The `traceback` entry points that report the exception being handled
+        // are answered natively: CPython's own would see no exception (its
+        // `sys.exc_info()` is empty) and no frames for a pythonrs exception.
+        if native_traceback_entry(&obj, name) {
+            return Ok(host.alloc(PyObj::Builtin(format!("traceback.{name}"))));
+        }
         let attr = obj
             .getattr(name)
             .map_err(|e| pyerr_to_error_h(host, py, &e))?;
@@ -2443,8 +2609,130 @@ pub fn call(id: u32, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Result<V
     })
 }
 
+/// `traceback.extract_tb(tb)` for a pythonrs traceback: CPython's own
+/// `StackSummary` of `FrameSummary` objects built from the frames' recorded
+/// `(file, line, scope, caret columns)`, so `.format()`/`print()` of it draw the
+/// same carets CPython would.
+pub fn stack_summary(
+    host: &mut PyHost,
+    parts: &[crate::host::SummaryPart],
+) -> Result<Value, String> {
+    Python::attach(|py| {
+        let tb = py
+            .import("traceback")
+            .map_err(|e| pyerr_to_error_h(host, py, &e))?;
+        let frame_summary = tb
+            .getattr("FrameSummary")
+            .map_err(|e| pyerr_to_error_h(host, py, &e))?;
+        let items = PyList::empty(py);
+        for (file, line, name, cols) in parts {
+            let kw = PyDict::new(py);
+            kw.set_item("end_lineno", *line)
+                .map_err(|e| e.to_string())?;
+            if let Some((c, e)) = cols {
+                kw.set_item("colno", *c).map_err(|e| e.to_string())?;
+                kw.set_item("end_colno", *e).map_err(|e| e.to_string())?;
+            }
+            let fs = frame_summary
+                .call((file.as_str(), *line, name.as_str()), Some(&kw))
+                .map_err(|e| pyerr_to_error_h(host, py, &e))?;
+            items.append(fs).map_err(|e| e.to_string())?;
+        }
+        let summary = tb
+            .getattr("StackSummary")
+            .and_then(|c| c.call_method1("from_list", (items,)))
+            .map_err(|e| pyerr_to_error_h(host, py, &e))?;
+        reference_to_value(host, py, &summary)
+    })
+}
+
+/// CPython's "exception being handled" slot, held for the length of one call
+/// into CPython (`PyErr_SetHandledException`, 3.11+). Looked up by name so the
+/// bridge still links against the 3.9 floor; on an older CPython `enter`
+/// reports `None` and nothing is set.
+struct HandledException {
+    previous: *mut pyo3::ffi::PyObject,
+    set: unsafe extern "C" fn(*mut pyo3::ffi::PyObject),
+}
+
+impl HandledException {
+    fn enter(exc: &Bound<PyAny>) -> Option<HandledException> {
+        type Get = unsafe extern "C" fn() -> *mut pyo3::ffi::PyObject;
+        type Set = unsafe extern "C" fn(*mut pyo3::ffi::PyObject);
+        static FNS: OnceLock<Option<(usize, usize)>> = OnceLock::new();
+        let fns = FNS.get_or_init(|| {
+            // SAFETY: read-only symbol lookups on the global handle with
+            // NUL-terminated names.
+            let (get, set) = unsafe {
+                (
+                    libc::dlsym(libc::RTLD_DEFAULT, c"PyErr_GetHandledException".as_ptr()),
+                    libc::dlsym(libc::RTLD_DEFAULT, c"PyErr_SetHandledException".as_ptr()),
+                )
+            };
+            (!get.is_null() && !set.is_null()).then_some((get as usize, set as usize))
+        });
+        let (get, set) = (*fns)?;
+        // SAFETY: both symbols are CPython's stable-ABI functions of these
+        // exact signatures (3.11+); the interpreter is attached (we hold a
+        // `Python` token's thread state) and `exc` is a live object.
+        unsafe {
+            let get: Get = std::mem::transmute(get);
+            let set: Set = std::mem::transmute(set);
+            let previous = get();
+            set(exc.as_ptr());
+            Some(HandledException { previous, set })
+        }
+    }
+}
+
+impl Drop for HandledException {
+    fn drop(&mut self) {
+        // SAFETY: restores the exception `enter` saved, then releases the
+        // reference `PyErr_GetHandledException` returned.
+        unsafe {
+            (self.set)(self.previous);
+            if !self.previous.is_null() {
+                pyo3::ffi::Py_DECREF(self.previous);
+            }
+        }
+    }
+}
+
+/// Whether `obj.name` is one of the `traceback` entry points pythonrs answers
+/// itself (see [`get_attr`]).
+fn native_traceback_entry(obj: &Bound<PyAny>, name: &str) -> bool {
+    matches!(
+        name,
+        "format_exc"
+            | "print_exc"
+            | "format_exception"
+            | "print_exception"
+            | "format_tb"
+            | "print_tb"
+            | "extract_tb"
+    ) && obj
+        .getattr("__name__")
+        .and_then(|n| n.extract::<String>())
+        .is_ok_and(|n| n == "traceback")
+}
+
 /// `foreign.name(*args, **kwargs)` — call a method on the foreign object.
 pub fn call_method(
+    id: u32,
+    name: &str,
+    args: Vec<Value>,
+    kwargs: Vec<(String, Value)>,
+) -> Result<Value, String> {
+    let native = Python::attach(|py| fetch(py, id).is_ok_and(|o| native_traceback_entry(&o, name)));
+    if native {
+        return crate::builtins::call_builtin_function(&format!("traceback.{name}"), args, kwargs);
+    }
+    call_method_cpython(id, name, args, kwargs)
+}
+
+/// [`call_method`] without the native `traceback` entry points: CPython's own
+/// implementation of the method.
+pub fn call_method_cpython(
     id: u32,
     name: &str,
     args: Vec<Value>,
@@ -2638,10 +2926,25 @@ fn invoke_bound(
         return r;
     }
     let (arg_tuple, kw) = with_host(|h| build_call_args(h, py, args, kwargs))?;
+    // The exception pythonrs is handling is the one CPython's `sys.exc_info()`
+    // reports for the duration of the call.
+    let handled = with_host(|h| {
+        h.exc
+            .clone()
+            .and_then(|e| exc_to_py(h, py, &e).ok().flatten())
+    });
+    let _handling = handled.as_ref().and_then(HandledException::enter);
     let result = callable
         .call(&arg_tuple, kw.as_ref())
         .map_err(|e| pyerr_to_error(py, &e))?;
     with_host(|h| {
+        // The call returned normally, so any exception that passed through a
+        // pythonrs callback underneath it was handled on CPython's side: the
+        // frames it unwound through belong to nobody now, and must not be
+        // counted into the next exception's traceback.
+        if h.error.is_none() {
+            h.reset_traceback();
+        }
         // Reflect any in-place mutation the stdlib call made to a by-value
         // mutable-container argument (`heapq.heapify(lst)`, `random.shuffle(lst)`,
         // `struct.pack_into(fmt, buf, …)`) back into the pythonrs object.
@@ -2828,6 +3131,18 @@ fn pure_value(host: &mut PyHost, py: Python, obj: &Bound<PyAny>) -> Option<Value
     if obj.is_exact_instance_of::<PyTuple>() {
         let items = pure_seq(host, py, obj)?;
         return Some(host.new_tuple(items));
+    }
+    // A pythonrs object that crossed as a proxy is the object it stands for, so
+    // `heapq.heappush(heap, instance)` and `random.shuffle(objs)` leave the
+    // pythonrs list holding the same instances, in their new order.
+    if let Ok(p) = obj.cast::<PyrsInstance>() {
+        return Some(p.borrow().target.clone());
+    }
+    if let Ok(p) = obj.cast::<PyrsCallable>() {
+        return Some(p.borrow().target.clone());
+    }
+    if let Ok(p) = obj.cast::<PyrsIterator>() {
+        return Some(p.borrow().target.clone());
     }
     None
 }
@@ -3094,6 +3409,47 @@ impl PyrsIterator {
                 .map(|b| Some(b.unbind()))
                 .map_err(rs_err),
         }
+    }
+
+    // The generator's introspection attributes, which `inspect.getgeneratorstate`
+    // (and so `asyncio`, `contextlib` debugging helpers) reads off whatever it
+    // is handed.
+    #[getter]
+    fn gi_running(&self) -> PyResult<bool> {
+        self.require_generator("gi_running")?;
+        Ok(with_host(|h| h.gen_state(&self.target)).is_some_and(|(_, running, _)| running))
+    }
+
+    #[getter]
+    fn gi_suspended(&self) -> PyResult<bool> {
+        self.require_generator("gi_suspended")?;
+        Ok(with_host(|h| h.gen_state(&self.target)).is_some_and(|(_, _, suspended)| suspended))
+    }
+
+    /// `None` once the generator has finished; else a frame stand-in with the
+    /// two fields `inspect` reads (`f_lasti` is `-1` until the first resume).
+    #[getter]
+    fn gi_frame(&self, py: Python) -> PyResult<Py<PyAny>> {
+        self.require_generator("gi_frame")?;
+        let Some((_, done, line)) = with_host(|h| h.gen_frame_info(&self.target)) else {
+            return Ok(py.None());
+        };
+        if done {
+            return Ok(py.None());
+        }
+        let started = crate::host::gen_started(&self.target);
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("f_lasti", if started { 0 } else { -1 })?;
+        kwargs.set_item("f_lineno", line)?;
+        py.import("types")?
+            .getattr("SimpleNamespace")?
+            .call((), Some(&kwargs))
+            .map(|o| o.unbind())
+    }
+
+    #[getter]
+    fn gi_yieldfrom(&self, py: Python) -> Py<PyAny> {
+        py.None()
     }
 
     // `gen.send(value)` — resume the wrapped pythonrs generator with `value`.
@@ -3406,11 +3762,60 @@ fn call_err(e: String, outer: Option<Value>) -> pyo3::PyErr {
     });
     let from_value = match class {
         Some(c) if e == c || e.starts_with(&format!("{c}: ")) => {
-            pending.as_ref().and_then(exc_value_to_pyerr)
+            let err = pending.as_ref().and_then(exc_value_to_pyerr);
+            // The frames it unwound through are now in the CPython exception's
+            // traceback; keep them with the pythonrs object too, so it carries
+            // them if CPython hands it straight back.
+            if err.is_some() {
+                if let Some(Value::Obj(id)) = &pending {
+                    with_host(|h| {
+                        let tb: Vec<crate::host::TbEntry> =
+                            h.traceback.iter().rev().cloned().collect();
+                        h.exc_tb.insert(*id, tb);
+                    });
+                }
+            }
+            err
         }
         _ => None,
     };
-    let err = from_value.unwrap_or_else(|| rs_err_typed(e));
+    // An exception CPython itself raised, whose pythonrs rendering is `e`: it
+    // crosses back as that same object, with the pythonrs frames it has
+    // unwound through placed ahead of the ones CPython recorded.
+    let from_value = from_value.or_else(|| {
+        let handle = with_host(|h| h.cpython_raised_for_err(&e))?;
+        Python::attach(|py| {
+            let exc = fetch(py, handle).ok()?;
+            let frames = with_host(|h| h.unwound_frames());
+            if !frames.is_empty() {
+                let tail = exc.getattr("__traceback__").ok()?;
+                let _ = exception_helpers(py)
+                    .and_then(|m| m.getattr("with_tb").map_err(|e| e.to_string()))
+                    .and_then(|f| {
+                        f.call1((exc.clone(), frames, tail))
+                            .map_err(|e| e.to_string())
+                    });
+            }
+            Some(pyo3::PyErr::from_value(exc))
+        })
+    });
+    let err = from_value.unwrap_or_else(|| {
+        // Built from the error string alone: its frames go on as a CPython
+        // traceback of their own.
+        let err = rs_err_typed(e);
+        let frames = with_host(|h| h.unwound_frames());
+        if !frames.is_empty() {
+            Python::attach(|py| {
+                let exc = err.value(py).clone().into_any();
+                let _ = exception_helpers(py)
+                    .and_then(|m| m.getattr("with_tb").map_err(|e| e.to_string()))
+                    .and_then(|f| f.call1((exc, frames)).map_err(|e| e.to_string()));
+            });
+        }
+        err
+    });
+    // Whatever frames it unwound through travelled with it.
+    with_host(|h| h.reset_traceback());
     hand_off_error(outer);
     err
 }

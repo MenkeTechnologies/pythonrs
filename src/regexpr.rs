@@ -18,6 +18,13 @@ pub struct PyRegex {
     /// `closes[g]` is the char index of group `g`'s `)` in the compiled
     /// pattern; index 0 (the whole match) is unused.
     closes: Vec<usize>,
+    /// The pattern text this was compiled from, kept to build the
+    /// full-match variant on demand.
+    source: String,
+    /// `(?:source)\z`, built the first time `fullmatch` needs it; `None` when
+    /// that spelling does not compile (then `fullmatch` falls back to the
+    /// plain engine and an end check).
+    full: std::sync::OnceLock<Option<Engine>>,
 }
 
 /// Whichever engine could take the pattern.
@@ -85,6 +92,8 @@ impl PyRegex {
         Ok(PyRegex {
             engine,
             closes: group_closes(pattern),
+            source: pattern.to_string(),
+            full: std::sync::OnceLock::new(),
         })
     }
 
@@ -121,6 +130,34 @@ impl PyRegex {
                 .flatten()
                 .map(|c| collect_fancy_spans(&c, n)),
         }
+    }
+
+    /// Spans of a match that starts at or after `start` AND ends at the end of
+    /// `text` — `fullmatch`. The pattern is run as `(?:pattern)\z` so the
+    /// engine backtracks into whichever alternative or repeat count reaches
+    /// the end, instead of reporting only its preferred match.
+    pub fn captures_full(&self, text: &str, start: usize) -> Option<Spans> {
+        let full = self.full.get_or_init(|| {
+            let anchored = format!("(?:{})\\z", self.source);
+            match &self.engine {
+                Engine::Fast(_) => regex::Regex::new(&anchored).ok().map(Engine::Fast),
+                Engine::Fancy(_) => fancy_regex::Regex::new(&fancy_spelling(&anchored))
+                    .ok()
+                    .map(Engine::Fancy),
+            }
+        });
+        let n = self.captures_len();
+        match full.as_ref().unwrap_or(&self.engine) {
+            Engine::Fast(re) => re.captures_at(text, start).map(|c| collect_spans(&c, n)),
+            Engine::Fancy(re) => re
+                .captures_from_pos(text, start)
+                .ok()
+                .flatten()
+                .map(|c| collect_fancy_spans(&c, n)),
+        }
+        .filter(|sp| {
+            full.is_some() || sp.first().copied().flatten().map(|(_, e)| e) == Some(text.len())
+        })
     }
 
     /// One step of a left-to-right scan: the leftmost match at or after byte

@@ -10560,3 +10560,53 @@ x = [r(lambda: print(1, flush=1, x=2, sep=3)), r(lambda: open('/dev/null', y=1))
         r#"["print() got an unexpected keyword argument 'x'", "open() got an unexpected keyword argument 'y'", "property() got an unexpected keyword argument 'x'", "eval() got an unexpected keyword argument 'x'", '1', '2', "argument for eval() given by name ('globals') and position (2)", 'None']"#
     );
 }
+
+// Bignum base: `int ** int` stays exact (it took the float route), and a
+// non-finite float base does not become a complex result.
+#[test]
+fn int_pow_is_exact_for_bignum_operands() {
+    assert_eq!(
+        g("x = (10**20) ** 2", "x"),
+        "10000000000000000000000000000000000000000"
+    );
+    assert_eq!(g("x = len(str((2**100 + 1) ** 32))", "x"), "964");
+    assert_eq!(g("x = (-float('inf')) ** 0.5", "x"), "inf");
+}
+
+// `return` in `finally` discards the exception passing through it, and a
+// `global` declaration never resolves to an enclosing function's local.
+#[test]
+fn finally_return_swallows_and_global_skips_enclosing_locals() {
+    assert_eq!(
+        g(
+            "def f():\n    try:\n        raise KeyError('k')\n    finally:\n        return 'ok'\nx = f()",
+            "x"
+        ),
+        "'ok'"
+    );
+    assert_eq!(
+        g(
+            "def outer():\n    gl = 1\n    def bump():\n        global gl\n        gl += 1\n    try:\n        bump()\n    except NameError:\n        return 'NameError'\nx = outer()",
+            "x"
+        ),
+        "'NameError'"
+    );
+}
+
+// Two classes that share a name are two types.
+#[test]
+fn classes_reusing_a_name_stay_distinct() {
+    let src = "def mk(n):\n    class P:\n        def who(self): return n\n    return P\n\
+               A, B = mk(1), mk(2)\n\
+               x = (A is B, A().who(), B().who(), isinstance(B(), A), type(B()) is B, B.__name__)";
+    assert_eq!(g(src, "x"), "(False, 1, 2, False, True, 'P')");
+}
+
+// Iteration over a user iterator is lazy: a `break` leaves the rest unread.
+#[test]
+fn for_loop_over_user_iterator_is_lazy() {
+    let src = "class It:\n    def __init__(self): self.i = 0\n    def __iter__(self): return self\n    def __next__(self):\n        self.i += 1\n        return self.i\n\
+               it = It()\nfor v in it:\n    if v >= 3: break\n\
+               x = (it.i, any(v > 2 for v in It()), 4 in It())";
+    assert_eq!(g(src, "x"), "(3, True, True)");
+}

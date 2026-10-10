@@ -2372,15 +2372,13 @@ written.
   closes its groups early but ends them late, so `re.match(r'(?=(ab))(a)',
   'ab').lastindex` is 1 here and 2 in CPython.
 
-- **A bridged exception carries no CPython traceback.** An exception that crosses
-  from pythonrs into CPython is rebuilt as a fresh exception object, so its
-  `__traceback__` is empty. Two visible consequences, both in code that is not
-  otherwise wrong: `logging.exception('…')` inside a pythonrs `except` block logs
-  `NoneType: None` where CPython prints the four-line traceback (CPython's
-  `sys.exc_info()` on the bridge side has no exception to report), and a
-  `unittest` failure report carries the `AssertionError: 1 != 2` line without the
-  `Traceback (most recent call last):` block above it. Repro:
-  `import logging; logging.basicConfig(); \ntry: 1/0\nexcept ZeroDivisionError: logging.exception('boom')`.
+- **A bridged exception's CPython traceback is synthesized.** An exception
+  crossing into CPython gets real traceback objects built from the frames it
+  was caught (or unwound) through, and `sys.exc_info()` on the CPython side
+  reports the exception pythonrs is handling for the length of a call, so
+  `logging.exception` and `unittest` reports carry the traceback. Frames that
+  ran inside CPython between two pythonrs frames are only shown on the final
+  render, not in the synthesized chain.
 - **A pythonrs callable or object cannot be used from a worker thread.** On the
   bridged build `import threading` is CPython's, and CPython's `threading.py`
   imports the REAL C `_thread` — not the native `_thread` this crate ships — so
@@ -2584,9 +2582,12 @@ written.
   failing node with its carets (`int(\n    'x')` shows `int(` with `~~~^` and
   `'x')` with `^^^^`); a caret span here records one line, so the first line is
   printed with its carets and the continuation lines are dropped.
-- **`traceback.format_tb(e.__traceback__)` fails across the bridge.** The
-  native `traceback` object cannot be passed to CPython's `traceback` module
-  (`TypeError: cannot pass 'traceback' to a CPython stdlib call`).
+- **A pythonrs `traceback` object cannot be passed to other CPython stdlib
+  calls.** `traceback.format_tb/print_tb/extract_tb/format_exception/format_exc/
+  print_exc` are answered natively; handing `e.__traceback__` to anything else
+  (`traceback.walk_tb`) raises `TypeError: cannot pass 'traceback' to a CPython
+  stdlib call`. `traceback.TracebackException.from_exception(e).stack` for an
+  exception that came back out of a CPython callback omits the catching frame.
 - **The object-level methods of a builtin type are typed as slot wrappers.**
   `int.__format__`, `__dir__`, `__reduce__`, `__reduce_ex__` and `__sizeof__`
   report `wrapper_descriptor` where CPython says `method_descriptor`;
@@ -2984,3 +2985,22 @@ entry. These remain open:
   error is at offset 3 (the `yield` within `(yield)`) where CPython, whose
   tokenizer reads the field in place, says 5; the same holds for every
   compile-time error raised over a node inside a field.
+
+### Round 2 batched differential fuzz (`tests/batch_fuzz.rs`)
+
+`tests/batch_fuzz.rs` generates seeded programs of many cases, runs each once
+under the reference `python3` and once under `python`, and compares output per
+case (`BATCH_FUZZ_SEED`, `BATCH_FUZZ_PROGRAMS`, `BATCH_FUZZ_CASES`,
+`BATCH_FUZZ_KEEP`). Fixed, with live-oracle probes in `tests/data/parity_probes.py`:
+bignum `**`, str/bytes set order under a pinned hash seed, `return` in
+`finally` discarding the exception, `global` shadowing an enclosing local,
+the unbound-closure `NameError` wording, `%` numeric protocols and a lone
+mapping argument, `islice` bounds, generator `gi_frame`/`gi_code` and the
+one-shot `StopIteration` value, lazy `for`/`in`/`any`/`all`/`tee`/`__getitem__`
+iteration, descriptor-aware `object.__setattr__`, metaclass `__getattr__`,
+`slice.indices` with bignums, `math.remainder`/`hypot`/`ldexp`/`floor` of a
+non-finite, `re.fullmatch` backtracking and `re.escape`, ordering of sequences
+of user objects, `list.sort` mutation detection, classes that reuse a name
+(registry key `name#n`), `locals()` in comprehensions, `heapq` over instances,
+and the native `traceback` entry points. Still open: `range` slicing with a
+step beyond `i64`, and set order after removal (above).

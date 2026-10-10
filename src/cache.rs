@@ -163,7 +163,11 @@ use std::path::PathBuf;
 /// v55: `BUILD_CLASS` carries the class statement's line.
 /// v56: `CProg.warnings` leads with the invalid-escape `SyntaxWarning`s the
 /// tokenizer and the f-string parser raise.
-const SCHEMA: u64 = 56;
+/// v57: a read of a free variable (`cur_freevars`) lowers to `GETFREE`, whose
+/// unbound error is CPython's `cannot access free variable` wording.
+/// v58: a chunk's constant pool ends with a hash of its position table, so
+/// chunks with identical ops at different source positions hash differently.
+const SCHEMA: u64 = 58;
 
 /// The shard's INDEX: everything a lookup needs, and nothing it does not.
 ///
