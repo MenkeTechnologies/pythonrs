@@ -562,10 +562,7 @@ unsafe extern "C" fn sys_dict_watcher(
     // references to a live key and value.
     let py = unsafe { Python::assume_attached() };
     let key = unsafe { Bound::from_borrowed_ptr(py, key) };
-    let name = key
-        .cast::<PyString>()
-        .ok()
-        .and_then(|s| s.to_cow().ok());
+    let name = key.cast::<PyString>().ok().and_then(|s| s.to_cow().ok());
     let stderr = match name.as_deref() {
         Some("stdout") => false,
         Some("stderr") => true,
@@ -1834,7 +1831,8 @@ impl NanBridge {
 
     fn insert(&mut self, _py: Python<'_>, obj: Py<PyAny>, nan: f64) {
         if self.by_addr.len() >= self.sweep_at {
-            self.by_addr.retain(|_, (o, _)| unsafe { pyo3::ffi::Py_REFCNT(o.as_ptr()) } > 1);
+            self.by_addr
+                .retain(|_, (o, _)| unsafe { pyo3::ffi::Py_REFCNT(o.as_ptr()) } > 1);
             let live: rustc_hash::FxHashSet<usize> = self.by_addr.keys().copied().collect();
             self.by_bits.retain(|_, addr| live.contains(addr));
             self.sweep_at = (self.by_addr.len() * 2).max(64);
@@ -3246,9 +3244,7 @@ fn normalize_throw_args<'py>(
         let second = args.get_item(1).ok().filter(|v| !v.is_none());
         return match second {
             Some(v) if v.is_instance(&first)? => Ok(v),
-            Some(v) if v.is_instance_of::<PyTuple>() => {
-                first.call1(v.cast::<PyTuple>()?.clone())
-            }
+            Some(v) if v.is_instance_of::<PyTuple>() => first.call1(v.cast::<PyTuple>()?.clone()),
             Some(v) => first.call1((v,)),
             None => first.call0(),
         };
