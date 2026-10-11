@@ -9,6 +9,15 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **`from __future__ import annotations` (PEP 563).** Every annotation is
+  compiled as the string `ast_unparse.c` writes for it (`src/unparse.rs`:
+  precedence parentheses, constant `repr`s with `1e309` for an infinity, f-/
+  t-strings rebuilt from their parts) and never evaluated. A function's
+  annotate function returns the strings; a module and a class body store them
+  in an eager `__annotations__` dict after the assignment, as
+  `codegen_annassign` does. The import used to change nothing: annotations
+  were evaluated, so a forward reference raised `NameError` on
+  `__annotations__` and a dataclass silently lost the field.
 - **A t-string interpolation's `expression` is its text as written.**
   `t"{ a }"` and `t"{ a = }"` give `' a '`, `t"{a :>3}"` gives `'a '`: the
   whitespace around the expression is kept, as CPython's tokenizer keeps it.
@@ -2993,6 +3002,14 @@ entry. These remain open:
   assign to __debug__`). `x = (yield) = 1` reads `assignment to yield
   expression not possible` at the parentheses where CPython reads `cannot
   assign to yield expression` at the `yield`.
+- **Annotation gaps left by PEP 563 work.** `x[*a]` and `*args: *Ts` (PEP
+  646) do not parse; a `:=`, `await`, `yield` or async comprehension inside an
+  annotation compiles where CPython raises `… cannot be used within an
+  annotation`; without the future import a module has no `__annotations__` /
+  `__annotate__` and a class no `__annotate__`; `c.d: int` in a class or module
+  does not evaluate `c`; a format spec's `{{` is read as an escaped brace
+  where CPython reads a nested field (`f"{x:a{{b}}}"`). A compiler error from
+  `compile()` over a file carries `text=None` where CPython reads the line.
 - **A node inside an f-string replacement field is positioned within the
   field.** The field is parsed as a module of its own, so `f"{(yield)}"`'s
   error is at offset 3 (the `yield` within `(yield)`) where CPython, whose

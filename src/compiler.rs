@@ -179,6 +179,9 @@ pub struct Compiler {
     /// comprehension inherits it from its enclosing function; a `def`/`lambda`
     /// and a class body replace it.
     await_scope: AwaitScope,
+    /// `from __future__ import annotations` (PEP 563): every annotation is
+    /// compiled as the string [`crate::unparse::expr_as_unicode`] makes of it.
+    future_annotations: bool,
     /// The current scope is an asynchronous generator (`async def` whose own
     /// body yields): a `return` with a value there is a compile-time error.
     async_generator: bool,
@@ -318,8 +321,9 @@ fn compile_checked(stmts: &[Stmt], debug: bool, interactive: bool) -> Result<Pro
     };
     // CPython builds the whole symbol table before it generates code, so its
     // declaration errors win over every error codegen raises.
-    crate::symtable::check(stmts)?;
+    let future = crate::symtable::check(stmts)?;
     let mut c = Compiler {
+        future_annotations: future.annotations,
         debug,
         interactive,
         optimize: crate::host::optimize_level(),
@@ -327,6 +331,15 @@ fn compile_checked(stmts: &[Stmt], debug: bool, interactive: bool) -> Result<Pro
     };
     let mut b = ChunkBuilder::new();
     c.begin_chunk();
+    // PEP 563: an annotated module keeps its annotation strings in an eager
+    // `__annotations__` dict (`SETUP_ANNOTATIONS`), set up before anything runs.
+    if c.future_annotations && stmts.iter().any(is_ann_assign) {
+        let setup = Stmt::from(StmtKind::Assign {
+            targets: vec![Expr::Name("__annotations__".to_string())],
+            value: Expr::Dict(Vec::new()),
+        });
+        c.compile_stmts(&mut b, std::slice::from_ref(&setup))?;
+    }
     // CPython stores a module's docstring as `__doc__` before running the body,
     // and emits that store ONLY when the body actually opens with a string
     // literal (`exec("x=1", g)` leaves `g` without a `__doc__`).
@@ -534,6 +547,25 @@ impl Compiler {
                 // In a class body, a *simple* (bare-name) annotation records
                 // `__annotations__[name] = <annotation>` so dataclass /
                 // typing.NamedTuple and `Cls.__annotations__` see the field.
+                // PEP 563: the value is assigned first, then the annotation's
+                // string is stored, in a class body or at module level alike
+                // (`codegen_annassign`). Nothing is evaluated.
+                if self.future_annotations && self.def_depth == 0 {
+                    if let Some(v) = value {
+                        self.compile_expr(b, v)?;
+                        self.compile_assign(b, target)?;
+                    }
+                    if let Expr::Name(n) = target.unspanned() {
+                        let text = crate::unparse::expr_as_unicode(annotation);
+                        self.compile_expr(b, &Expr::Str(text))?;
+                        let slot = Expr::Subscript(
+                            Box::new(Expr::Name("__annotations__".into())),
+                            Box::new(Expr::Str(n.clone())),
+                        );
+                        self.compile_assign(b, &slot)?;
+                    }
+                    return Ok(());
+                }
                 if self.in_class_body {
                     if let Expr::Name(n) = target.unspanned() {
                         // The annotation is compiled as a thunk so a forward
@@ -2257,6 +2289,16 @@ impl Compiler {
     /// so an annotation that mentions `format` still reaches the enclosing scope
     /// (`def f(x: format)` annotates with the builtin) rather than the argument.
     /// The code object still reports it as `format` (`FuncDef::is_annotate`).
+    /// What an annotation compiles to: the expression itself, or under PEP 563
+    /// the string it unparses to.
+    fn annotation_value(&self, ann: &Expr) -> Expr {
+        if self.future_annotations {
+            Expr::Str(crate::unparse::expr_as_unicode(ann))
+        } else {
+            ann.clone()
+        }
+    }
+
     fn build_annotate(
         &mut self,
         def_id: usize,
@@ -2269,7 +2311,7 @@ impl Compiler {
         let dict_expr = Expr::Dict(
             annotations
                 .iter()
-                .map(|(name, ann)| (Some(Expr::Str(name.clone())), ann.clone()))
+                .map(|(name, ann)| (Some(Expr::Str(name.clone())), self.annotation_value(ann)))
                 .collect(),
         );
         let too_new = Expr::Compare(
@@ -3288,7 +3330,11 @@ impl Compiler {
                 // A comprehension inherits `Async`, but cannot yield at all
                 // (the symbol table has refused that already).
                 if self.await_scope == AwaitScope::Async && !self.in_comprehension {
-                    return Err(Self::misplaced("'yield from' inside async function", false, sp));
+                    return Err(Self::misplaced(
+                        "'yield from' inside async function",
+                        false,
+                        sp,
+                    ));
                 }
                 // `yield from E` — iterate E, yielding each item. The delegating
                 // expression value (the sub-generator's return) is None here.
@@ -5208,7 +5254,10 @@ fn validate_keywords(keywords: &[Keyword]) -> Result<(), String> {
         let Some(name) = &key.name else {
             continue;
         };
-        if let Some(other) = keywords[i + 1..].iter().find(|o| o.name.as_ref() == Some(name)) {
+        if let Some(other) = keywords[i + 1..]
+            .iter()
+            .find(|o| o.name.as_ref() == Some(name))
+        {
             return Err(compiler_error(
                 &format!("keyword argument repeated: {name}"),
                 other.span,

@@ -10616,3 +10616,284 @@ fn for_loop_over_user_iterator_is_lazy() {
                x = (it.i, any(v > 2 for v in It()), 4 in It())";
     assert_eq!(g(src, "x"), "(3, True, True)");
 }
+
+/// `python -c src`: its stdout.
+fn run_stdout(src: &str) -> String {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_python"))
+        .args(["-c", src])
+        .output()
+        .expect("spawn python");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// PEP 563 (`from __future__ import annotations`): annotations are stored as
+/// the text CPython's `ast_unparse.c` writes for them and never evaluated, so
+/// a forward reference neither fails nor drops a field. A function keeps the
+/// strings in its annotate function; a module and a class body store them in
+/// an eager `__annotations__` dict (names mangled, nested blocks included), and
+/// `dataclasses` reads the strings as field types. Expected output is CPython
+/// 3.14.8's.
+#[test]
+fn future_annotations_are_stored_as_strings() {
+    assert_eq!(
+        run_stdout(
+            r##"from __future__ import annotations
+import sys, dataclasses
+x: int = 1
+y: "Later"
+if x:
+    z: Undefined[1]
+class C:
+    a: Node | None
+    b: list[Later] = 2
+    __p: int
+def f(a: int, *args: tuple[()], b: dict[str, Later] = 1, **kw: dict) -> Node: pass
+@dataclasses.dataclass
+class Node:
+    left: Node | None = None
+    val: int = 0
+print(f.__annotations__)
+print(C.__annotations__, C.b)
+print(__annotations__)
+print(sys.modules[__name__].__annotations__ is __annotations__)
+print(Node(val=3), [fl.type for fl in dataclasses.fields(Node)])
+print((lambda: 0).__annotations__)
+"##
+        ),
+        r##"{'a': 'int', 'args': 'tuple[()]', 'b': 'dict[str, Later]', 'kw': 'dict', 'return': 'Node'}
+{'a': 'Node | None', 'b': 'list[Later]', '_C__p': 'int'} 2
+{'x': 'int', 'y': "'Later'", 'z': 'Undefined[1]'}
+True
+Node(left=None, val=3) ['Node | None', 'int']
+{}
+"##
+    );
+}
+
+/// The annotation text `ast_unparse.c` writes: parentheses from precedence
+/// (`2 ** (-1)`, `(-1) ** 2`, `(a | b) & c`), constants as their `repr` with an
+/// infinity spelled `1e309`, `1 .real`, `lambda*a`, a lone generator argument
+/// sharing the call's parentheses, a tuple subscript without parentheses, and
+/// f-/t-strings rebuilt from their parts (`{x=}` as `x={x!r}`, a field opening
+/// with a brace set off by a space, a t-string's top-level field as written).
+#[test]
+fn future_annotations_unparse_like_cpython() {
+    assert_eq!(
+        run_stdout(
+            r##"exprs = r"""
+int
+list[int]
+dict[str, list[int | None]]
+"Later"
+'it\'s'
+"a\"b'c"
+b'x\x00y'
+1
+-1
+(-1) ** 2
+-1 ** 2
+2 ** -1
+2 ** 3 ** 4
+(2 ** 3) ** 4
+1.5
+1e400
+-1e400
+1j
+1e400j
+2.0j
+1_000_000
+0xff
+123456789012345678901234567890
+...
+None
+True
+a and b or c
+a and (b or c)
+not a
+not (a and b)
+(not a) + 1
+-(a + b)
+~a
++a
+a if b else c
+(a if b else c) if d else e
+a if (b if c else d) else e
+lambda: 0
+lambda x: x
+lambda x, y=1, *a, z, w=2, **k: 0
+lambda *a: 0
+lambda *, k: 0
+lambda a, /, b: 0
+lambda a=1, /: 0
+(lambda: 0)()
+(lambda: 0).x
+x.y.z
+(1).real
+1.5 .real
+"s".upper
+a[1:2]
+a[1:2:3]
+a[::]
+a[:, 1]
+a[1,]
+a[()]
+a[(1, 2)]
+f(a, *b, c=1, **d)
+f(x for x in y)
+f((x for x in y), 1)
+[x for x in y if z if w]
+{x for x in y}
+{k: v for k, v in y}
+(x for x in y for z in w)
+[x for x, in y]
+[(a := 1) for x in y]
+a < b <= c
+a is not b
+a not in b
+a in (b, c)
+(a < b) < c
+a < (b < c)
+{}
+{1: 2, **a}
+{1, 2}
+[1, *a]
+(1,)
+(1, 2)
+()
+f"plain"
+f"{x}"
+f"{x!r}"
+f"{x:>10}"
+f"{x:{w}.{p}}"
+f"{x=}"
+f"{x = }"
+f"a{{b}}c{d}"
+f"{'q'}"
+f"{ {1: 2} }"
+f"{x!r:^{w}}"
+f"\n{x}"
+f"{x}" "y"
+t"a{b}c"
+t"{x!r:>4}"
+t"{x=}"
+a | b ^ c & d << e + f * g ** h
+(a | b) & c
+a - (b - c)
+a - b - c
+a / (b * c)
+a @ b
+a // b % c
+a.b[c](d)
+""".strip().splitlines()
+for s in exprs:
+    ns = {}
+    exec("from __future__ import annotations\ndef f() -> " + s + ": pass\n", ns)
+    print(ns['f'].__annotations__['return'])
+"##
+        ),
+        r##"int
+list[int]
+dict[str, list[int | None]]
+'Later'
+"it's"
+'a"b\'c'
+b'x\x00y'
+1
+-1
+(-1) ** 2
+-1 ** 2
+2 ** (-1)
+2 ** 3 ** 4
+(2 ** 3) ** 4
+1.5
+1e309
+-1e309
+1j
+1e309j
+2j
+1000000
+255
+123456789012345678901234567890
+...
+None
+True
+a and b or c
+a and (b or c)
+not a
+not (a and b)
+(not a) + 1
+-(a + b)
+~a
++a
+a if b else c
+(a if b else c) if d else e
+a if (b if c else d) else e
+lambda: 0
+lambda x: x
+lambda x, y=1, *a, z, w=2, **k: 0
+lambda*a: 0
+lambda*, k: 0
+lambda a, /, b: 0
+lambda a=1, /: 0
+(lambda: 0)()
+(lambda: 0).x
+x.y.z
+1 .real
+1.5.real
+'s'.upper
+a[1:2]
+a[1:2:3]
+a[:]
+a[:, 1]
+a[1,]
+a[()]
+a[1, 2]
+f(a, *b, c=1, **d)
+f(x for x in y)
+f((x for x in y), 1)
+[x for x in y if z if w]
+{x for x in y}
+{k: v for k, v in y}
+(x for x in y for z in w)
+[x for x, in y]
+[(a := 1) for x in y]
+a < b <= c
+a is not b
+a not in b
+a in (b, c)
+(a < b) < c
+a < (b < c)
+{}
+{1: 2, **a}
+{1, 2}
+[1, *a]
+(1,)
+(1, 2)
+()
+f'plain'
+f'{x}'
+f'{x!r}'
+f'{x:>10}'
+f'{x:{w}.{p}}'
+f'x={x!r}'
+f'x = {x!r}'
+f'a{{b}}c{d}'
+f"{'q'}"
+f'{ {1: 2}}'
+f'{x!r:^{w}}'
+f'\n{x}'
+f'{x}y'
+t'a{b}c'
+t'{x!r:>4}'
+t'x={x!r}'
+a | b ^ c & d << e + f * g ** h
+(a | b) & c
+a - (b - c)
+a - b - c
+a / (b * c)
+a @ b
+a // b % c
+a.b[c](d)
+"##
+    );
+}

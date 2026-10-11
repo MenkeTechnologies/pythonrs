@@ -8404,7 +8404,7 @@ enum CxOperand {
     Real(f64),
 }
 
-fn fmt_complex(r: f64, i: f64) -> String {
+pub(crate) fn fmt_complex(r: f64, i: f64) -> String {
     // A complex part reprs like a float but drops a trailing `.0` for integral
     // values (`complex(1,2)` → `(1+2j)`, not `(1.0+2.0j)`).
     if r == 0.0 && r.is_sign_positive() {
@@ -8615,7 +8615,7 @@ pub(crate) fn quote_str(s: &str) -> String {
 /// contains a `'` but no `"`. `bytes` escapes just the chosen quote char; a
 /// `bytearray` always escapes `'` (even under a `"` quote) — a CPython quirk
 /// (`bytearray(b"a'b")` → `bytearray(b"a\'b")`).
-fn quote_bytes(b: &[u8], is_bytearray: bool) -> String {
+pub(crate) fn quote_bytes(b: &[u8], is_bytearray: bool) -> String {
     let has_single = b.contains(&b'\'');
     let has_double = b.contains(&b'"');
     let quote = if has_single && !has_double {

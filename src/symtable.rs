@@ -55,11 +55,13 @@ impl Block {
 /// Run the checks over a module. The first declaration error in source order
 /// wins; failing that, the first `global`/`nonlocal` conflict in the order the
 /// analysis pass visits blocks (a block before the blocks nested in it).
-pub fn check(stmts: &[Stmt]) -> Result<(), String> {
+/// Answers the `__future__` features the module turns on.
+pub fn check(stmts: &[Stmt]) -> Result<FutureFeatures, String> {
     // `_PyFuture_FromAST` runs before the symbol table is built, so its
     // errors win over every declaration error.
+    let features = future_parse(stmts)?;
     let mut table = Table {
-        future: future_parse(stmts)?,
+        future: features.location,
         ..Table::default()
     };
     let order = table.open();
@@ -69,8 +71,17 @@ pub fn check(stmts: &[Stmt]) -> Result<(), String> {
     table.analysis.sort_by_key(|(order, _)| *order);
     match table.analysis.into_iter().next() {
         Some((_, e)) => Err(e),
-        None => Ok(()),
+        None => Ok(features),
     }
+}
+
+/// What the `from __future__` imports heading a module turn on.
+#[derive(Default, Clone, Copy)]
+pub struct FutureFeatures {
+    /// `ff_location`: the extent of the last of them.
+    location: Option<(u32, u32, u32, u32)>,
+    /// PEP 563 `annotations`: annotations are kept as strings.
+    pub annotations: bool,
 }
 
 #[derive(Default)]
@@ -104,9 +115,9 @@ const FUTURE_FEATURES: &[&str] = &[
 /// return the extent of the last one. A name `__future__` does not define
 /// is `future feature X is not defined` (`braces` is `not a chance`), at
 /// that name.
-fn future_parse(stmts: &[Stmt]) -> Result<Option<(u32, u32, u32, u32)>, String> {
+fn future_parse(stmts: &[Stmt]) -> Result<FutureFeatures, String> {
     let skip = usize::from(crate::compiler::docstring(stmts).is_some());
-    let mut location = None;
+    let mut features = FutureFeatures::default();
     for s in &stmts[skip..] {
         let StmtKind::ImportFrom {
             module: Some(module),
@@ -120,6 +131,9 @@ fn future_parse(stmts: &[Stmt]) -> Result<Option<(u32, u32, u32, u32)>, String> 
             break;
         }
         for alias in names {
+            if alias.name == "annotations" {
+                features.annotations = true;
+            }
             if FUTURE_FEATURES.contains(&alias.name.as_str()) {
                 continue;
             }
@@ -137,9 +151,9 @@ fn future_parse(stmts: &[Stmt]) -> Result<Option<(u32, u32, u32, u32)>, String> 
                 None => msg,
             });
         }
-        location = s.span;
+        features.location = s.span;
     }
-    Ok(location)
+    Ok(features)
 }
 
 impl Table {

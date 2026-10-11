@@ -42,6 +42,7 @@ pub mod stdlib;
 pub mod suggest;
 pub mod symtable;
 pub mod tiers;
+pub mod unparse;
 
 pub use fusevm::Value;
 
