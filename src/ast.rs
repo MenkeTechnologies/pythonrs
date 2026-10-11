@@ -91,6 +91,10 @@ pub struct Comprehension {
 pub struct Keyword {
     pub name: Option<String>,
     pub value: Expr,
+    /// `name=value` (or `**value`) as a `SyntaxError` reports it — `(lineno,
+    /// offset, end_lineno, end_offset)`, 1-based, exclusive end, in characters.
+    /// `None` for a synthetic keyword.
+    pub span: Option<(u32, u32, u32, u32)>,
 }
 
 /// A source span for traceback carets: character columns within a 1-based

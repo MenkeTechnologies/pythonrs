@@ -1393,3 +1393,59 @@ SyntaxError: 'break', 'continue' and 'return' cannot appear in an except* block
         )
     );
 }
+
+/// Compiler errors over a call and a function body, each at its node with
+/// `args` carrying the position tuple: a keyword named twice in a call or a
+/// class header (at the later of the first such pair, `**` and `*`
+/// arguments in between), a `return` with a value — even `None` — in an
+/// asynchronous generator, and `yield from` in an `async def`. A nested
+/// `def` or `lambda` is a scope of its own and may do either.
+#[test]
+fn codegen_call_and_async_generator_errors_are_positioned() {
+    let out = Command::new(env!("CARGO_BIN_EXE_python"))
+        .args([
+            "-c",
+            r##"cases = [
+ 'async def f():\n    yield 1\n    return 2',
+ 'async def f():\n    return None\n    yield',
+ 'async def f():\n    yield\n    return',
+ 'async def f():\n    def g():\n        return 1\n    yield',
+ 'async def f():\n    yield lambda: 1',
+ 'async def f():\n    yield from g()',
+ 'async def f():\n    x = [(yield from g())]',
+ 'async def f():\n    def g():\n        yield from h()',
+ 'async def f():\n    lambda: (yield from h())',
+ 'f(a=1, a=2)',
+ 'class C(x=1, y=2, x=3): pass',
+ 'f(b=1, **k, a=2, b=3, a=4)',
+ 'f(\xe9=1, \xe9=2)',
+ 'f(a=1, *b, a=2)',
+]
+for s in cases:
+    try:
+        compile(s, '<s>', 'exec')
+        print('ok', repr(s))
+    except SyntaxError as e:
+        print(repr(s), e.args, e.lineno, e.offset, e.end_lineno, e.end_offset)"##,
+        ])
+        .output()
+        .expect("spawn python");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        r##"'async def f():\n    yield 1\n    return 2' ("'return' with value in async generator", ('<s>', 3, 5, None, 3, 13)) 3 5 3 13
+'async def f():\n    return None\n    yield' ("'return' with value in async generator", ('<s>', 2, 5, None, 2, 16)) 2 5 2 16
+ok 'async def f():\n    yield\n    return'
+ok 'async def f():\n    def g():\n        return 1\n    yield'
+ok 'async def f():\n    yield lambda: 1'
+'async def f():\n    yield from g()' ("'yield from' inside async function", ('<s>', 2, 5, None, 2, 19)) 2 5 2 19
+'async def f():\n    x = [(yield from g())]' ("'yield from' inside async function", ('<s>', 2, 11, None, 2, 25)) 2 11 2 25
+ok 'async def f():\n    def g():\n        yield from h()'
+ok 'async def f():\n    lambda: (yield from h())'
+'f(a=1, a=2)' ('keyword argument repeated: a', ('<s>', 1, 8, None, 1, 11)) 1 8 1 11
+'class C(x=1, y=2, x=3): pass' ('keyword argument repeated: x', ('<s>', 1, 19, None, 1, 22)) 1 19 1 22
+'f(b=1, **k, a=2, b=3, a=4)' ('keyword argument repeated: b', ('<s>', 1, 18, None, 1, 21)) 1 18 1 21
+'f(é=1, é=2)' ('keyword argument repeated: é', ('<s>', 1, 9, None, 1, 13)) 1 9 1 13
+'f(a=1, *b, a=2)' ('keyword argument repeated: a', ('<s>', 1, 12, None, 1, 15)) 1 12 1 15
+"##
+    );
+}

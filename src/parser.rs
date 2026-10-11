@@ -2506,19 +2506,25 @@ impl Parser {
                     )));
                 } else if self.eat_op("**") {
                     order.kw_unpack = true;
+                    let start = self.pos - 1;
+                    let value = self.under(level, Self::parse_expr)?;
                     keywords.push(Keyword {
                         name: None,
-                        value: self.under(level, Self::parse_expr)?,
+                        value,
+                        span: Some(self.token_span(start, self.pos - 1)),
                     });
                 } else if self.at_identifier()
                     && matches!(&self.toks[self.pos + 1].tok, Tok::Op(o) if o == "=")
                 {
                     order.keyword = true;
+                    let start = self.pos;
                     let kn = self.expect_name()?;
                     self.expect_op("=")?;
+                    let value = self.under(level, Self::parse_expr)?;
                     keywords.push(Keyword {
                         name: Some(kn),
-                        value: self.under(level, Self::parse_expr)?,
+                        value,
+                        span: Some(self.token_span(start, self.pos - 1)),
                     });
                 } else {
                     order.positional()?;
@@ -3749,15 +3755,19 @@ impl Parser {
             } else if self.eat_op("**") {
                 order.kw_unpack = true;
                 let level = kwarg_level(&mut kwargs, !first);
+                let kw_start = self.pos - 1;
+                let value = self.under(level, Self::parse_expr)?;
                 keywords.push(Keyword {
                     name: None,
-                    value: self.under(level, Self::parse_expr)?,
+                    value,
+                    span: Some(self.token_span(kw_start, self.pos - 1)),
                 });
             } else if self.at_identifier()
                 && matches!(&self.toks[self.pos + 1].tok, Tok::Op(o) if o == "=")
             {
                 order.keyword = true;
                 let level = kwarg_level(&mut kwargs, !first);
+                let kw_start = self.pos;
                 let kn = self.expect_name()?;
                 self.expect_op("=")?;
                 let start = self.pos;
@@ -3766,6 +3776,7 @@ impl Parser {
                 keywords.push(Keyword {
                     name: Some(kn),
                     value,
+                    span: Some(self.token_span(kw_start, self.pos - 1)),
                 });
             } else {
                 order.positional()?;

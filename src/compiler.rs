@@ -179,6 +179,9 @@ pub struct Compiler {
     /// comprehension inherits it from its enclosing function; a `def`/`lambda`
     /// and a class body replace it.
     await_scope: AwaitScope,
+    /// The current scope is an asynchronous generator (`async def` whose own
+    /// body yields): a `return` with a value there is a compile-time error.
+    async_generator: bool,
     /// True while lowering a comprehension's hidden body. An illegal `await`
     /// there is reported as an asynchronous *comprehension* outside an async
     /// function, which is the message CPython uses.
@@ -605,6 +608,14 @@ impl Compiler {
                 // so `return 1` as a whole program simply succeeded.
                 if self.def_depth == 0 {
                     return Err("SyntaxError: 'return' outside function".to_string());
+                }
+                // `codegen_return`: an asynchronous generator cannot return a
+                // value, not even an explicit `None`.
+                if e.is_some() && self.async_generator {
+                    return Err(compiler_error(
+                        "'return' with value in async generator",
+                        s.span,
+                    ));
                 }
                 match e {
                     Some(e) => {
@@ -2493,6 +2504,10 @@ impl Compiler {
         // even inside an `async def`, a `def`/`lambda` opens a synchronous scope,
         // and a comprehension is transparent (it inherits).
         let saved_aw = self.await_scope;
+        let saved_ag = std::mem::replace(
+            &mut self.async_generator,
+            kind == ScopeKind::Function && is_async && body_has_yield(body),
+        );
         let saved_inc = self.in_comprehension;
         let saved_free = std::mem::replace(
             &mut self.cur_freevars,
@@ -2524,6 +2539,7 @@ impl Compiler {
         self.in_class_body = saved_icb;
         self.def_depth = saved_fs;
         self.await_scope = saved_aw;
+        self.async_generator = saved_ag;
         self.in_comprehension = saved_inc;
         self.cur_freevars = saved_free;
         if pushed {
@@ -2579,6 +2595,7 @@ impl Compiler {
         );
         self.fn_depth -= 1;
         let def_id = def_id?;
+        validate_keywords(keywords)?;
         // The explicit metaclass (`class A(metaclass=M)`), or `None` — BUILD_CLASS
         // pops it below the other args and, if a real type, drives construction.
         match keywords
@@ -3268,6 +3285,11 @@ impl Compiler {
                 if self.def_depth == 0 {
                     return Err(Self::misplaced("'yield from' outside function", false, sp));
                 }
+                // A comprehension inherits `Async`, but cannot yield at all
+                // (the symbol table has refused that already).
+                if self.await_scope == AwaitScope::Async && !self.in_comprehension {
+                    return Err(Self::misplaced("'yield from' inside async function", false, sp));
+                }
                 // `yield from E` — iterate E, yielding each item. The delegating
                 // expression value (the sub-generator's return) is None here.
                 self.compile_yield_from(b, inner)?;
@@ -3753,6 +3775,7 @@ impl Compiler {
         args: &[Expr],
         keywords: &[Keyword],
     ) -> Result<(), String> {
+        validate_keywords(keywords)?;
         // CPython `SyntaxWarning` for CALLING a literal. Every type a literal or
         // display can have is non-callable, so knowing the callee's type at
         // compile time is itself the whole test — `None()` and `[1, 2](3)` are
@@ -5176,6 +5199,23 @@ fn compiler_error(msg: &str, pos: Option<(u32, u32, u32, u32)>) -> String {
         crate::parser::SYNTAX_FIELD,
         crate::parser::CHAR_COLUMNS
     )
+}
+
+/// `codegen_validate_keywords`: a keyword named twice in one call or class
+/// header is a compiler `SyntaxError` at the later of the first such pair.
+fn validate_keywords(keywords: &[Keyword]) -> Result<(), String> {
+    for (i, key) in keywords.iter().enumerate() {
+        let Some(name) = &key.name else {
+            continue;
+        };
+        if let Some(other) = keywords[i + 1..].iter().find(|o| o.name.as_ref() == Some(name)) {
+            return Err(compiler_error(
+                &format!("keyword argument repeated: {name}"),
+                other.span,
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The first `break`/`continue`/`return` in `body` that would leave it. A
