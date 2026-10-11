@@ -4213,6 +4213,9 @@ impl Parser {
         if debug_prefix.is_some() && conv.is_none() && spec.is_empty() {
             conv = Some('r');
         }
+        // A t-string's `Interpolation.expression` is the field's text as
+        // written, surrounding whitespace included (`t"{ a = }"` gives `' a '`).
+        let written = expr_src;
         let expr_src = expr_src.trim();
         // pegen reads the field as `fstring_replacement_field` → `annotated_rhs`
         // → `star_expressions` → `star_expression` → `expression`, eleven levels
@@ -4240,7 +4243,7 @@ impl Parser {
         }
         out.push(FStrPart::Expr {
             expr: Box::new(expr),
-            src: expr_src.to_string(),
+            src: written.to_string(),
             conv,
             spec,
         });

@@ -5646,6 +5646,12 @@ fn t_strings_build_templates_not_strings() {
         g("n = 3\ni = t'{n + 1!r:>5}'.interpolations[0]\nx = (i.value, i.expression, i.conversion, i.format_spec)", "x"),
         "(4, 'n + 1', 'r', '>5')"
     );
+    // The expression is the field's text exactly as written, whitespace around
+    // it included; a `=` field's literal keeps the `=` and what surrounds it.
+    assert_eq!(
+        g("a = b = 1\nx = [(i.expression, t.strings) for t in (t'{ a }', t'{a  +b }', t'{ a = }', t'{ a !r}', t'{a :>3}') for i in t.interpolations]", "x"),
+        "[(' a ', ('', '')), ('a  +b ', ('', '')), (' a ', (' a = ', '')), (' a ', ('', '')), ('a ', ('', ''))]"
+    );
     // Iteration interleaves literals and interpolations, skipping empty pieces.
     assert_eq!(
         g("x = [type(p).__name__ for p in t'{1}{2}']", "x"),

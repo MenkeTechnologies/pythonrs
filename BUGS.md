@@ -9,6 +9,10 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **A t-string interpolation's `expression` is its text as written.**
+  `t"{ a }"` and `t"{ a = }"` give `' a '`, `t"{a :>3}"` gives `'a '`: the
+  whitespace around the expression is kept, as CPython's tokenizer keeps it.
+  It used to be trimmed.
 - **`__future__` imports are checked at compile time.** The imports heading a
   module (after an optional docstring) are `future_parse`'s: a feature
   `__future__` does not define is `future feature X is not defined` at its
