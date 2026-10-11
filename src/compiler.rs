@@ -6112,7 +6112,7 @@ fn body_has_yield(body: &[Stmt]) -> bool {
 
 /// The docstring of a function/class/module body: its first statement when that
 /// is a bare string-literal expression, else `None` (CPython's `__doc__` rule).
-fn docstring(body: &[Stmt]) -> Option<String> {
+pub(crate) fn docstring(body: &[Stmt]) -> Option<String> {
     match body.first().map(|s| &s.kind) {
         Some(StmtKind::Expr(e)) => match e.unspanned() {
             Expr::Str(s) => Some(s.clone()),

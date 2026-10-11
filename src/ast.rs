@@ -487,6 +487,9 @@ pub enum PatternKind {
 pub struct Alias {
     pub name: String,
     pub asname: Option<String>,
+    /// `name [as asname]` as a `SyntaxError` reports it, in the form of
+    /// [`Keyword::span`].
+    pub span: Option<(u32, u32, u32, u32)>,
 }
 
 /// A statement plus its 1-based source line (for tracebacks and DAP markers).

@@ -9,6 +9,20 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **`__future__` imports are checked at compile time.** The imports heading a
+  module (after an optional docstring) are `future_parse`'s: a feature
+  `__future__` does not define is `future feature X is not defined` at its
+  name, `braces` is `not a chance`, ahead of every symbol-table error; a
+  `from __future__` import anywhere after them — any block, after a `;`, after
+  a second docstring — is the symbol table's `from __future__ imports must
+  occur at the beginning of the file` at the statement. Both used to compile
+  and fail, or succeed, as an ordinary import at run time.
+- **Codegen refuses repeated keywords and value returns from async
+  generators.** `f(a=1, a=2)` and `class C(x=1, x=2)` are `keyword argument
+  repeated: a` at the later keyword, `return v` (even `return None`) in an
+  `async def` that yields is `'return' with value in async generator`, and
+  `yield from` in an `async def` is `'yield from' inside async function`, each
+  at its node. They compiled before.
 - **Code `eval`/`exec` compile from a string is a traceback frame of its
   own**: `File "<string>", line N, in <module>` (or the `compile()`
   filename) between the caller and what it called, and a function or
@@ -2968,14 +2982,9 @@ entry. These remain open:
   `typing.TypeAliasType` (`isinstance` does agree).
 
 - **Compile-time errors CPython raises that pythonrs accepts, or words
-  differently.** Measured against 3.14.8, each compiles here: `f(a=1, a=2)`
-  (`keyword argument repeated: a`), `from __future__ import nope` (`future
-  feature nope is not defined`) and a `from __future__` import after other
-  code (`must occur at the beginning of the file`), `type X = (yield)` (`yield
-  expression cannot be used within a type alias`), `def f[T, T](): pass`
-  (`duplicate type parameter 'T'`), `return 2` in an async generator
-  (`'return' with value in async generator`), `yield from` in an `async def`
-  (`'yield from' inside async function`), and binding `__debug__` by
+  differently.** Measured against 3.14.8, each compiles here: `type X = (yield)`
+  (`yield expression cannot be used within a type alias`), `def f[T, T](): pass`
+  (`duplicate type parameter 'T'`), and binding `__debug__` by
   assignment, parameter, `del`, keyword argument or `import … as` (`cannot
   assign to __debug__`). `x = (yield) = 1` reads `assignment to yield
   expression not possible` at the parentheses where CPython reads `cannot

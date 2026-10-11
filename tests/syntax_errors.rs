@@ -1449,3 +1449,63 @@ ok 'async def f():\n    lambda: (yield from h())'
 "##
     );
 }
+
+/// `__future__` imports: a feature `__future__` does not define is refused at
+/// its name (`braces` is `not a chance`) by the future pass, ahead of the
+/// symbol table; a `from __future__` import after any statement but a
+/// docstring or another future import — in any block, on the same line after
+/// a `;`, or after a second docstring — is the symbol table's error at the
+/// statement. A relative `from .__future__` is an ordinary import.
+#[test]
+fn future_imports_are_checked() {
+    let out = Command::new(env!("CARGO_BIN_EXE_python"))
+        .args([
+            "-c",
+            r##"cases = [
+ 'from __future__ import nope',
+ 'from __future__ import annotations, braces',
+ 'from __future__ import (division,\n    nope as n)',
+ 'from __future__ import *',
+ '"doc"\nfrom __future__ import annotations\nfrom __future__ import generator_stop\nx = 1',
+ 'x = 1\nfrom __future__ import annotations',
+ 'from __future__ import annotations; from __future__ import division',
+ 'from __future__ import annotations\nx = 1; from __future__ import division',
+ 'def f():\n    from __future__ import annotations',
+ 'from __future__ import annotations\nclass C:\n    from __future__ import division',
+ '"doc"\n"doc2"\nfrom __future__ import annotations',
+ 'import os\nfrom __future__ import nope',
+ 'from .__future__ import x',
+ 'from __future__ import annotations\nfrom __future__ import nope',
+ 'from __future__ import ' + 'é' * 60,
+ 'from __future__ import barry_as_FLUFL',
+]
+for s in cases:
+    try:
+        compile(s, '<s>', 'exec')
+        print('ok', repr(s))
+    except SyntaxError as e:
+        print(repr(s), e.args, e.lineno, e.offset, e.end_lineno, e.end_offset)"##,
+        ])
+        .output()
+        .expect("spawn python");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        r##"'from __future__ import nope' ('future feature nope is not defined',) 1 24 1 28
+'from __future__ import annotations, braces' ('not a chance',) 1 37 1 43
+'from __future__ import (division,\n    nope as n)' ('future feature nope is not defined',) 2 5 2 14
+'from __future__ import *' ('future feature * is not defined',) 1 24 1 25
+ok '"doc"\nfrom __future__ import annotations\nfrom __future__ import generator_stop\nx = 1'
+'x = 1\nfrom __future__ import annotations' ('from __future__ imports must occur at the beginning of the file',) 2 1 2 35
+ok 'from __future__ import annotations; from __future__ import division'
+'from __future__ import annotations\nx = 1; from __future__ import division' ('from __future__ imports must occur at the beginning of the file',) 2 8 2 39
+'def f():\n    from __future__ import annotations' ('from __future__ imports must occur at the beginning of the file',) 2 5 2 39
+'from __future__ import annotations\nclass C:\n    from __future__ import division' ('from __future__ imports must occur at the beginning of the file',) 3 5 3 36
+'"doc"\n"doc2"\nfrom __future__ import annotations' ('from __future__ imports must occur at the beginning of the file',) 3 1 3 35
+'import os\nfrom __future__ import nope' ('from __future__ imports must occur at the beginning of the file',) 2 1 2 28
+ok 'from .__future__ import x'
+'from __future__ import annotations\nfrom __future__ import nope' ('future feature nope is not defined',) 2 24 2 28
+'from __future__ import éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé' ('future feature éééééééééééééééééééééééééééééééééééééééééééééééééé is not defined',) 1 24 1 144
+ok 'from __future__ import barry_as_FLUFL'
+"##
+    );
+}

@@ -56,7 +56,12 @@ impl Block {
 /// wins; failing that, the first `global`/`nonlocal` conflict in the order the
 /// analysis pass visits blocks (a block before the blocks nested in it).
 pub fn check(stmts: &[Stmt]) -> Result<(), String> {
-    let mut table = Table::default();
+    // `_PyFuture_FromAST` runs before the symbol table is built, so its
+    // errors win over every declaration error.
+    let mut table = Table {
+        future: future_parse(stmts)?,
+        ..Table::default()
+    };
     let order = table.open();
     let mut module = Block::default();
     table.body(stmts, &mut module)?;
@@ -75,6 +80,66 @@ struct Table {
     opened: usize,
     /// Analysis-pass errors, tagged with the number of the block they are in.
     analysis: Vec<(usize, String)>,
+    /// `ff_location`: the extent of the last `from __future__` import at the
+    /// head of the module, `None` when there is none.
+    future: Option<(u32, u32, u32, u32)>,
+}
+
+/// The features `future_check_features` (`Python/future.c`) accepts.
+const FUTURE_FEATURES: &[&str] = &[
+    "nested_scopes",
+    "generators",
+    "division",
+    "absolute_import",
+    "with_statement",
+    "print_function",
+    "unicode_literals",
+    "barry_as_FLUFL",
+    "generator_stop",
+    "annotations",
+];
+
+/// `future_parse`: check the `from __future__` imports at the head of the
+/// module — after an optional docstring, before any other statement — and
+/// return the extent of the last one. A name `__future__` does not define
+/// is `future feature X is not defined` (`braces` is `not a chance`), at
+/// that name.
+fn future_parse(stmts: &[Stmt]) -> Result<Option<(u32, u32, u32, u32)>, String> {
+    let skip = usize::from(crate::compiler::docstring(stmts).is_some());
+    let mut location = None;
+    for s in &stmts[skip..] {
+        let StmtKind::ImportFrom {
+            module: Some(module),
+            names,
+            level: 0,
+        } = &s.kind
+        else {
+            break;
+        };
+        if module != "__future__" {
+            break;
+        }
+        for alias in names {
+            if FUTURE_FEATURES.contains(&alias.name.as_str()) {
+                continue;
+            }
+            let msg = if alias.name == "braces" {
+                "SyntaxError: not a chance".to_string()
+            } else {
+                // `UNDEFINED_FUTURE_FEATURE` formats the name with `%.100s`:
+                // at most 100 UTF-8 bytes, a split character replaced.
+                let bytes = alias.name.as_bytes();
+                let name = String::from_utf8_lossy(&bytes[..bytes.len().min(100)]);
+                format!("SyntaxError: future feature {name} is not defined")
+            };
+            return Err(match alias.span {
+                Some(span) => symtable_error(&msg, span),
+                None => msg,
+            });
+        }
+        location = s.span;
+    }
+    Ok(location)
 }
 
 impl Table {
@@ -259,12 +324,41 @@ impl Table {
                     self.body(&c.body, b)?;
                 }
             }
+            StmtKind::ImportFrom { module, level, .. } => {
+                self.check_import_from(module.as_deref(), *level, s.span)?
+            }
             StmtKind::Return(None)
             | StmtKind::Pass
             | StmtKind::Break
             | StmtKind::Continue
-            | StmtKind::Import(_)
-            | StmtKind::ImportFrom { .. } => {}
+            | StmtKind::Import(_) => {}
+        }
+        Ok(())
+    }
+
+    /// `check_import_from`: a `from __future__` import anywhere after the ones
+    /// heading the module — in any block — is refused at the statement.
+    fn check_import_from(
+        &self,
+        module: Option<&str>,
+        level: usize,
+        span: Option<(u32, u32, u32, u32)>,
+    ) -> Result<(), String> {
+        let (Some("__future__"), 0, Some(span)) = (module, level, span) else {
+            return Ok(());
+        };
+        // An absent `ff_location` is all -1s, which every statement follows.
+        let late = match self.future {
+            None => true,
+            Some((line, _, end_line, end_col)) => {
+                span.0 > line || (span.0 == end_line && span.1 > end_col)
+            }
+        };
+        if late {
+            return Err(symtable_error(
+                "SyntaxError: from __future__ imports must occur at the beginning of the file",
+                span,
+            ));
         }
         Ok(())
     }

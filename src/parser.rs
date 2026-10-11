@@ -3062,6 +3062,7 @@ impl Parser {
         self.names_after_import()?;
         let mut names = Vec::new();
         loop {
+            let start = self.pos;
             let mut name = self.expect_name()?;
             while self.eat_op(".") {
                 name.push('.');
@@ -3072,7 +3073,11 @@ impl Parser {
             } else {
                 None
             };
-            names.push(Alias { name, asname });
+            names.push(Alias {
+                name,
+                asname,
+                span: Some(self.token_span(start, self.pos - 1)),
+            });
             if !self.eat_op(",") {
                 break;
             }
@@ -3099,6 +3104,7 @@ impl Parser {
     }
 
     fn parse_from_import(&mut self, out: &mut Vec<Stmt>, line: u32) -> Result<(), String> {
+        let start = self.pos;
         self.advance(); // from
         let mut level = 0;
         while self.at_op(".") || self.at_op("...") {
@@ -3124,17 +3130,23 @@ impl Parser {
             names.push(Alias {
                 name: "*".into(),
                 asname: None,
+                span: Some(self.token_span(self.pos - 1, self.pos - 1)),
             });
         } else {
             let paren = self.eat_op("(");
             loop {
+                let start = self.pos;
                 let name = self.expect_name()?;
                 let asname = if self.eat_kw("as") {
                     Some(self.expect_name()?)
                 } else {
                     None
                 };
-                names.push(Alias { name, asname });
+                names.push(Alias {
+                    name,
+                    asname,
+                    span: Some(self.token_span(start, self.pos - 1)),
+                });
                 if !self.eat_op(",") {
                     break;
                 }
@@ -3146,13 +3158,15 @@ impl Parser {
                 self.expect_op(")")?;
             }
         }
-        out.push(Stmt::new(
+        // Spanned for the symbol table's misplaced-`__future__` error.
+        out.push(self.spanned_stmt(
             StmtKind::ImportFrom {
                 module,
                 names,
                 level,
             },
             line,
+            start,
         ));
         Ok(())
     }
