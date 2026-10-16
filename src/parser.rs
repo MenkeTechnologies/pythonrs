@@ -2491,6 +2491,7 @@ impl Parser {
         let mut keywords = Vec::new();
         if self.eat_op("(") {
             let mut order = ArgOrder::default();
+            let mut late_order: Option<String> = None;
             while !self.at_op(")") {
                 // `class C(*bases)`: the base list is built at run time, as
                 // a call's `*iterable` argument is.
@@ -2527,13 +2528,14 @@ impl Parser {
                         span: Some(self.token_span(start, self.pos - 1)),
                     });
                 } else {
-                    order.positional()?;
+                    late_order = late_order.or(order.positional().err());
                     bases.push(self.under(level, Self::parse_expr)?);
                 }
                 if !self.eat_op(",") {
                     break;
                 }
             }
+            self.check_late_order(late_order)?;
             self.expect_op(")")?;
         }
         let body = self.parse_scope_body("class definition", line, false)?;
@@ -3732,6 +3734,18 @@ impl Parser {
     /// under the gather's loop for the rest), and `kwargs` reads a keyword at
     /// R+6 — R+7 when positionals precede it, which puts `kwargs` under one more
     /// group — with each later keyword under its own gather's loop.
+    /// A positional argument after a keyword is refused by pegen's
+    /// `invalid_arguments` once the argument list has been read, so it is
+    /// positioned at the token that ended the list.
+    fn check_late_order(&self, late: Option<String>) -> Result<(), String> {
+        match late {
+            Some(msg) => {
+                Err(self.err_span(msg.trim_start_matches("SyntaxError: "), self.pos, self.pos))
+            }
+            None => Ok(()),
+        }
+    }
+
     fn parse_call(&mut self, func: Expr) -> Result<Expr, String> {
         let raw = self.level;
         self.expect_op("(")?;
@@ -3739,6 +3753,7 @@ impl Parser {
         let mut keywords = Vec::new();
         let mut order = ArgOrder::default();
         // Where `kwargs`'s first element sits, once a keyword has been met.
+        let mut late_order: Option<String> = None;
         let mut kwargs: Option<u32> = None;
         // A keyword-section element: the first at `kwargs`'s gather, every later
         // one under its loop.
@@ -3793,7 +3808,7 @@ impl Parser {
                     span: Some(self.token_span(kw_start, self.pos - 1)),
                 });
             } else {
-                order.positional()?;
+                late_order = late_order.or(order.positional().err());
                 let start = self.pos;
                 let level = if first { raw + 2 } else { raw + 6 };
                 let e = self.under(level, Self::parse_namedexpr)?;
@@ -3824,6 +3839,7 @@ impl Parser {
                 self.reach_absent_expression(raw + 7)?;
             }
         }
+        self.check_late_order(late_order)?;
         self.expect_op(")")?;
         Ok(Expr::Call {
             func: Box::new(func),
@@ -4007,6 +4023,35 @@ impl Parser {
         }
     }
 
+    /// Where the body of the f-string token under the cursor sits in the source,
+    /// provided it reads `raw` there. Error positions and carets inside the
+    /// string are measured from it.
+    fn fstring_origin(&self, raw: &str) -> Option<Origin> {
+        let tok = &self.toks[self.pos];
+        let body: Vec<char> = raw.chars().collect();
+        let breaks = body.iter().filter(|c| **c == '\n').count() as u32;
+        // The token's `line` is the one it ends on.
+        let first_line = tok.line.checked_sub(breaks)?;
+        let text: Vec<char> = self.lines.get(first_line as usize - 1)?.chars().collect();
+        let start = if breaks == 0 {
+            // `tok.col` is where the token (its prefix included) starts.
+            let mut i = tok.col as usize;
+            while text.get(i).is_some_and(char::is_ascii_alphabetic) {
+                i += 1;
+            }
+            let quote = *text.get(i)?;
+            let triple = text.get(i + 1) == Some(&quote) && text.get(i + 2) == Some(&quote);
+            i + if triple { 3 } else { 1 }
+        } else {
+            // The body's first line runs to the end of its source line.
+            let first: Vec<char> = body.iter().take_while(|c| **c != '\n').copied().collect();
+            text.len().checked_sub(first.len())?
+        };
+        let first_end = body.iter().position(|c| *c == '\n').unwrap_or(body.len());
+        (text.get(start..start + first_end)? == &body[..first_end])
+            .then(|| Origin::new(first_line, start as u32, &body))
+    }
+
     /// Adjacent string literals concatenate (`"a" "b"` -> `"ab"`).
     fn parse_string_group(&mut self) -> Result<Expr, String> {
         let mut parts: Vec<FStrPart> = Vec::new();
@@ -4028,17 +4073,21 @@ impl Parser {
                 Tok::FString(raw, is_raw) => {
                     // The line the token ends on: its closing quotes.
                     let line = self.line();
+                    let origin = self.fstring_origin(&raw);
                     self.advance();
                     any_f = true;
-                    let mut sub = self.parse_fstring(&raw, is_raw, Some(line))?;
+                    let mut sub =
+                        self.parse_fstring(&raw, is_raw, Some(line), origin.as_ref(), 1)?;
                     parts.append(&mut sub);
                 }
                 Tok::TString(raw, is_raw) => {
                     // The line the token ends on: its closing quotes.
                     let line = self.line();
+                    let origin = self.fstring_origin(&raw);
                     self.advance();
                     any_t = true;
-                    let mut sub = self.parse_fstring(&raw, is_raw, Some(line))?;
+                    let mut sub =
+                        self.parse_fstring(&raw, is_raw, Some(line), origin.as_ref(), 1)?;
                     parts.append(&mut sub);
                 }
                 _ => break,
@@ -4091,6 +4140,8 @@ impl Parser {
         raw: &str,
         is_raw: bool,
         line: Option<u32>,
+        origin: Option<&Origin>,
+        depth: u32,
     ) -> Result<Vec<FStrPart>, String> {
         let chars: Vec<char> = raw.chars().collect();
         let decode = |seg: &str| match line {
@@ -4115,6 +4166,9 @@ impl Parser {
                 i += 2;
                 continue;
             }
+            if c == '}' {
+                return Err(fstring_error("single '}' is not allowed", origin, i, i));
+            }
             if c == '{' {
                 // `\N{NAME}` named-Unicode escape: the braces belong to the escape,
                 // not a replacement field. Absorb `{...}` into the literal so
@@ -4138,27 +4192,24 @@ impl Parser {
                     seg.clear();
                     has_lit = false;
                 }
-                // Collect balanced field text up to the matching `}`.
-                let mut depth = 1;
-                i += 1;
-                let mut field = String::new();
-                while i < chars.len() && depth > 0 {
-                    match chars[i] {
-                        '{' => {
-                            depth += 1;
-                            field.push('{');
-                        }
-                        '}' => {
-                            depth -= 1;
-                            if depth > 0 {
-                                field.push('}');
-                            }
-                        }
-                        other => field.push(other),
-                    }
-                    i += 1;
-                }
-                parts.extend(self.build_fstring_field(&field, is_raw)?);
+                let Some(close) = fstring_field_end(&chars, i + 1) else {
+                    return Err(fstring_error(
+                        "expecting '}'",
+                        origin,
+                        chars.len(),
+                        chars.len(),
+                    ));
+                };
+                let field_chars = &chars[i + 1..close];
+                let field: String = field_chars.iter().collect();
+                let field_origin = origin.map(|o| o.sub(i + 1, field_chars));
+                parts.extend(self.build_fstring_field(
+                    &field,
+                    is_raw,
+                    field_origin.as_ref(),
+                    depth,
+                )?);
+                i = close + 1;
             } else {
                 seg.push(c);
                 i += 1;
@@ -4171,43 +4222,110 @@ impl Parser {
         Ok(parts)
     }
 
-    fn build_fstring_field(&self, field: &str, is_raw: bool) -> Result<Vec<FStrPart>, String> {
-        // `{expr=}` debug form (PEP 501): the source text up to and including the
-        // top-level `=` (plus following whitespace) is emitted literally, then
-        // the value. A trailing `!conv`/`:spec` still applies; with neither, the
-        // value uses `repr`. Reconstruct "expr[!conv][:spec]" without the `=`
-        // (and leading whitespace) so the shared conv/spec split below applies.
-        let mut debug_prefix: Option<String> = None;
-        let work: String = if let Some(eq) = find_debug_eq(field) {
-            let after = &field[eq + 1..];
-            let ws = after.len() - after.trim_start().len();
-            debug_prefix = Some(field[..eq + 1 + ws].to_string());
-            format!("{}{}", &field[..eq], after.trim_start())
-        } else {
-            field.to_string()
-        };
-        let field: &str = &work;
+    /// One replacement field's text (between its braces): `expr[=][!conv][:spec]`.
+    /// `origin` is the (line, column) of its first character, for error
+    /// positions; `depth` is how many fields enclose it, counting itself.
+    fn build_fstring_field(
+        &self,
+        field: &str,
+        is_raw: bool,
+        origin: Option<&Origin>,
+        depth: u32,
+    ) -> Result<Vec<FStrPart>, String> {
+        let chars: Vec<char> = field.chars().collect();
+        let (bang, colon) = fstring_field_marks(&chars);
+        let text = |a: usize, b: usize| chars[a..b].iter().collect::<String>();
+        let expr_end = bang.or(colon).unwrap_or(chars.len());
+        let expr0 = text(0, expr_end);
 
-        // Split off !conv and :spec (top level only).
-        let mut expr_src = field;
-        let mut spec: Vec<FStrPart> = Vec::new();
-        let mut conv: Option<char> = None;
-        // format spec — itself a mini joined-string, so a nested replacement field
-        // (`{w}` in `{x:{w}.2f}`) is evaluated at runtime and spliced into the spec.
-        if let Some(idx) = find_top_level(field, ':') {
-            spec = self.parse_fstring(&field[idx + 1..], is_raw, None)?;
-            expr_src = &field[..idx];
-        }
-        // conversion !s/!r/!a
-        if expr_src.len() >= 2 {
-            let bytes = expr_src.as_bytes();
-            if bytes[expr_src.len() - 2] == b'!' {
-                let c = bytes[expr_src.len() - 1] as char;
-                if matches!(c, 's' | 'r' | 'a') {
-                    conv = Some(c);
-                    expr_src = &expr_src[..expr_src.len() - 2];
-                }
+        // `{expr=}` debug form (PEP 501): the source text up to and including the
+        // `=` (plus following whitespace) is emitted literally, then the value.
+        // With neither a conversion nor a format spec the value uses `repr`.
+        let mut debug_prefix: Option<String> = None;
+        let mut expr_src: &str = &expr0;
+        let mut debug_at = None;
+        if let Some(eq) = find_debug_eq(&expr0) {
+            if expr0[eq + 1..].trim().is_empty() {
+                debug_prefix = Some(expr0.clone());
+                expr_src = &expr0[..eq];
+                debug_at = Some(expr0[..eq].chars().count());
             }
+        }
+
+        // The character that ended the (empty) expression, for the message.
+        if expr_src.trim().is_empty() {
+            let (at, ch) = match (debug_at, bang, colon) {
+                (Some(i), _, _) => (i, '='),
+                (_, Some(i), _) => (i, '!'),
+                (_, _, Some(i)) => (i, ':'),
+                _ => (chars.len(), '}'),
+            };
+            return Err(fstring_error(
+                &format!("valid expression required before '{ch}'"),
+                origin,
+                at,
+                at + 1,
+            ));
+        }
+
+        let mut conv: Option<char> = None;
+        if let Some(b) = bang {
+            let after = text(b + 1, colon.unwrap_or(chars.len()));
+            let named = after.trim_end();
+            let n = named.chars().count();
+            if after.is_empty() {
+                return Err(fstring_error(
+                    "missing conversion character",
+                    origin,
+                    b + 1,
+                    b + 2,
+                ));
+            }
+            if after.starts_with(char::is_whitespace) {
+                return Err(fstring_error(
+                    "conversion type must come right after the exclamation mark",
+                    origin,
+                    b,
+                    b + 1 + n,
+                ));
+            }
+            conv = match named {
+                "s" | "r" | "a" => named.chars().next(),
+                _ => {
+                    return Err(fstring_error(
+                        &format!(
+                            "invalid conversion character '{named}': expected 's', 'r', or 'a'"
+                        ),
+                        origin,
+                        b + 1,
+                        b + 1 + n,
+                    ))
+                }
+            };
+        }
+
+        // The format spec is itself a mini joined-string, so a nested
+        // replacement field (`{w}` in `{x:{w}.2f}`) is evaluated at run time and
+        // spliced into the spec.
+        let mut spec: Vec<FStrPart> = Vec::new();
+        if let Some(cs) = colon {
+            if depth >= 3 {
+                return Err(fstring_error(
+                    "expressions nested too deeply",
+                    origin,
+                    cs,
+                    cs,
+                ));
+            }
+            let spec_chars = &chars[cs + 1..];
+            let spec_origin = origin.map(|o| o.sub(cs + 1, spec_chars));
+            spec = self.parse_fstring(
+                &text(cs + 1, chars.len()),
+                is_raw,
+                None,
+                spec_origin.as_ref(),
+                depth + 1,
+            )?;
         }
         // A debug field with neither conversion nor format spec defaults to repr.
         if debug_prefix.is_some() && conv.is_none() && spec.is_empty() {
@@ -4217,19 +4335,38 @@ impl Parser {
         // written, surrounding whitespace included (`t"{ a = }"` gives `' a '`).
         let written = expr_src;
         let expr_src = expr_src.trim();
+        // `lambda` ends at the first top-level `:`, which here starts the spec.
+        if colon.is_some() && is_lambda_head(expr_src) {
+            let start = expr0.chars().count() - expr0.trim_start().chars().count();
+            return Err(fstring_error(
+                "lambda expressions are not allowed without parentheses",
+                origin,
+                start,
+                colon.map_or(start, |c| c + 1),
+            ));
+        }
         // pegen reads the field as `fstring_replacement_field` → `annotated_rhs`
         // → `star_expressions` → `star_expression` → `expression`, eleven levels
         // under the f-string's `atom` (the current level); read here as the
         // parenthesized statement `(field)`, the expression lands eighteen
         // levels under the module, so the module starts seven above the atom.
-        let sub =
-            parse_source(&format!("({expr_src})"), self.level.saturating_sub(7)).map_err(|e| {
-                if e == TOO_COMPLEX {
-                    e
-                } else {
-                    format!("f-string: {e}")
-                }
-            })?;
+        // The parenthesized text is padded so every token lands on the line and
+        // column it has in the source: spans and positions in it are then true
+        // ones, and a runtime error in the expression carets the right place.
+        let lead = expr0.chars().count() - expr0.trim_start().chars().count();
+        let padded = match origin {
+            Some(o) => {
+                let (line, col) = o.locate(lead);
+                format!(
+                    "{}({}{expr_src})",
+                    "\n".repeat(line as usize - 1),
+                    " ".repeat(col as usize - 1)
+                )
+            }
+            None => format!("({expr_src})"),
+        };
+        let sub = parse_source(&padded, self.level.saturating_sub(7))
+            .map_err(|e| fstring_sub_error(e, origin, lead, expr_src.chars().count()))?;
         let expr = match sub.into_iter().next() {
             Some(Stmt {
                 kind: StmtKind::Expr(e),
@@ -4237,6 +4374,22 @@ impl Parser {
             }) => e,
             _ => return Err(format!("f-string: invalid expression {{{expr_src}}}")),
         };
+        // `{` sits one column before the field's text, `}` one past its end.
+        let span = origin.map_or(Span::NONE, |o| {
+            let ((line, open), (end_line, close)) = (o.locate(0), o.locate(chars.len()));
+            if line != end_line {
+                return Span::NONE;
+            }
+            Span {
+                line,
+                end_line: line,
+                start: open - 1,
+                end: close + 1,
+                anchor_start: 0,
+                anchor_end: 0,
+                suppress: false,
+            }
+        });
         let mut out = Vec::with_capacity(2);
         if let Some(pre) = debug_prefix {
             out.push(FStrPart::Lit(pre));
@@ -4246,6 +4399,7 @@ impl Parser {
             src: written.to_string(),
             conv,
             spec,
+            span,
         });
         Ok(out)
     }
@@ -4489,18 +4643,187 @@ impl Parser {
     }
 }
 
-/// Find a top-level (not nested in brackets) occurrence of `ch`.
-fn find_top_level(s: &str, ch: char) -> Option<usize> {
+/// Where an f-string body (or a piece of it) sits in the source: the line and
+/// 0-based column of its first character, and where its own line breaks fall,
+/// so any character index inside it can be located. Error positions and caret
+/// spans inside an f-string are measured from it.
+#[derive(Clone)]
+struct Origin {
+    line: u32,
+    col: u32,
+    breaks: Vec<usize>,
+}
+
+impl Origin {
+    fn new(line: u32, col: u32, text: &[char]) -> Origin {
+        let breaks = text
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| **c == '\n')
+            .map(|(i, _)| i)
+            .collect();
+        Origin { line, col, breaks }
+    }
+
+    /// The (line, 0-based column) of character `idx`.
+    fn locate(&self, idx: usize) -> (u32, u32) {
+        let n = self.breaks.iter().take_while(|&&b| b < idx).count();
+        if n == 0 {
+            (self.line, self.col + idx as u32)
+        } else {
+            (self.line + n as u32, (idx - self.breaks[n - 1] - 1) as u32)
+        }
+    }
+
+    /// The origin of `text`, which starts at character `idx` of this one.
+    fn sub(&self, idx: usize, text: &[char]) -> Origin {
+        let (line, col) = self.locate(idx);
+        Origin::new(line, col, text)
+    }
+}
+
+/// A positioned f-string syntax error. `from`/`to` are character indices into
+/// the string body, whose first character sits at `origin`; `to` is the offset
+/// one past the span's last character, as CPython's `end_offset` is.
+fn fstring_error(msg: &str, origin: Option<&Origin>, from: usize, to: usize) -> String {
+    let text = format!("SyntaxError: f-string: {msg}");
+    match origin {
+        Some(o) => {
+            let (l1, c1) = o.locate(from);
+            let (l2, c2) = o.locate(to);
+            at_pos(&text, l1, c1 as i64 + 1, l2, c2 as i64 + 1)
+        }
+        None => text,
+    }
+}
+
+/// Re-word and re-position a syntax error found parsing a field's expression
+/// (read at its true source position, inside parentheses). `origin` is the
+/// field's, `lead..lead + len` the expression's characters within it. CPython
+/// words only some of these with the `f-string:` prefix, and says the field is
+/// missing its `=`/`!`/`:`/`}` where the expression just stops making sense.
+fn fstring_sub_error(err: String, origin: Option<&Origin>, lead: usize, len: usize) -> String {
+    if err == TOO_COMPLEX {
+        return err;
+    }
+    let (msg, pos) = split_syntax_error(&err);
+    let inner = msg.strip_prefix("SyntaxError: ").unwrap_or(msg);
+    let inner = if inner == "invalid syntax" {
+        "f-string: expecting '=', or '!', or ':', or '}'".to_string()
+    } else if inner.starts_with("unmatched '") {
+        format!("f-string: {inner}")
+    } else {
+        inner.to_string()
+    };
+    let text = format!("SyntaxError: {inner}");
+    let (Some(origin), Some(p)) = (origin, pos) else {
+        return text;
+    };
+    // The wrapping `)` stands for the end of the expression, where CPython
+    // points at the expression's last character.
+    let (end_line, end_col) = origin.locate(lead + len);
+    if p.lineno == Some(end_line as i64) && p.offset == Some(end_col as i64 + 1) && len > 0 {
+        let (l, c) = origin.locate(lead + len - 1);
+        let width = if inner.starts_with("f-string: unmatched") {
+            0
+        } else {
+            1
+        };
+        return at_pos(&text, l, c as i64 + 1, l, c as i64 + 1 + width);
+    }
+    // A stray closer is a point, not a span.
+    match (p.lineno, p.offset, p.end_lineno, p.end_offset) {
+        (Some(l), Some(o), Some(el), Some(eo)) if inner.starts_with("f-string: unmatched") => {
+            let _ = (el, eo);
+            at_pos(&text, l as u32, o, l as u32, o)
+        }
+        (Some(l), Some(o), Some(el), Some(eo)) => at_pos(&text, l as u32, o, el as u32, eo),
+        _ => text,
+    }
+}
+
+/// Whether `expr` begins with the `lambda` keyword.
+fn is_lambda_head(expr: &str) -> bool {
+    expr.strip_prefix("lambda")
+        .is_some_and(|rest| !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_'))
+}
+
+/// Skip the string literal opening at `chars[i]`, returning the index just
+/// past its closing quote, or `None` if it never closes.
+fn skip_string_literal(chars: &[char], mut i: usize) -> Option<usize> {
+    let q = chars[i];
+    let triple = chars.get(i + 1) == Some(&q) && chars.get(i + 2) == Some(&q);
+    let n = if triple { 3 } else { 1 };
+    i += n;
+    loop {
+        match chars.get(i)? {
+            '\\' => i += 2,
+            &d if d == q
+                && (!triple || (chars.get(i + 1) == Some(&q) && chars.get(i + 2) == Some(&q))) =>
+            {
+                return Some(i + n)
+            }
+            _ => i += 1,
+        }
+    }
+}
+
+/// The index of the `}` closing the replacement field whose text starts at
+/// `start` (just past its `{`). Strings in the expression are skipped whole and
+/// brackets nest; after the top-level `:` the rest is a format spec, where
+/// quotes are plain characters and a `{` opens a nested field.
+fn fstring_field_end(chars: &[char], start: usize) -> Option<usize> {
     let mut depth = 0i32;
-    for (i, c) in s.char_indices() {
+    let mut in_spec = false;
+    let mut i = start;
+    while i < chars.len() {
+        let c = chars[i];
+        if !in_spec && (c == '\'' || c == '"') {
+            i = skip_string_literal(chars, i)?;
+            continue;
+        }
+        match c {
+            '(' | '[' if !in_spec => depth += 1,
+            ')' | ']' if !in_spec => depth -= 1,
+            '{' if in_spec => i = fstring_field_end(chars, i + 1)?,
+            '{' => depth += 1,
+            '}' if !in_spec && depth > 0 => depth -= 1,
+            '}' => return Some(i),
+            ':' if !in_spec && depth == 0 => in_spec = true,
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The character indices of a field's top-level `!` (a conversion, not `!=`)
+/// and of the `:` that starts its format spec.
+fn fstring_field_marks(chars: &[char]) -> (Option<usize>, Option<usize>) {
+    let mut depth = 0i32;
+    let mut bang = None;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\'' || c == '"' {
+            match skip_string_literal(chars, i) {
+                Some(next) => {
+                    i = next;
+                    continue;
+                }
+                None => break,
+            }
+        }
         match c {
             '(' | '[' | '{' => depth += 1,
             ')' | ']' | '}' => depth -= 1,
-            _ if c == ch && depth == 0 => return Some(i),
+            '!' if depth == 0 && bang.is_none() && chars.get(i + 1) != Some(&'=') => bang = Some(i),
+            ':' if depth == 0 => return (bang, Some(i)),
             _ => {}
         }
+        i += 1;
     }
-    None
+    (bang, None)
 }
 
 /// Locate the `=` debug marker in an f-string field: the first top-level

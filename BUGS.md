@@ -9,6 +9,18 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **An f-string field is split on the `:`, `!` and `=` outside any string
+  literal or bracket.** `f"{':'.join(x)}"`, `f"{'!r'}"` and `f"{'{'}"` are
+  fields, not specs or nested fields; they raised `SyntaxError` or formatted
+  the wrong text. A quote in a format spec (`f"{x:'>5}"`) is a plain fill
+  character.
+- **An f-string field is read at its true source position.** A runtime error
+  in a field (`f"{x[5]}"`, `f"{1/0}"`), in its `__format__`, or in a bad format
+  spec reports the field's own line and carets it (`line 0`, or the sub-source's
+  line 1 and columns, before), and a compile-time error over a node inside a
+  field (`f"{(yield)}"`) is placed where CPython places it.
+- **`positional argument follows keyword argument` is positioned** at the
+  token that ends the argument list, as pegen's `invalid_arguments` is.
 - **A metaclass `__prepare__` runs before the class body, and its mapping
   seeds the body's scope.** `class C(metaclass=M)` where `M.__prepare__`
   returns `{'z': 1}` can read `z` in the body (a plain function or a
@@ -2614,14 +2626,14 @@ written.
   never runs. Closing it at the loop is not a fix: whether the loop held the
   LAST reference is not visible there (`it = gen(); for v in it: break;
   next(it)` must keep it open).
-- **f-string syntax errors.** The body of an f-string is split on braces at
-  the string level, so an unmatched `}` (`f'}'`) and an empty field (`f'{}'`)
-  are accepted, and an unterminated field (`f'{'`, `f'{x!'`) or a bad
-  conversion (`f'{x!z}'`) reports `unterminated string` / `invalid syntax`
-  without a position, where CPython's PEP 701 tokenizer reports `f-string:
-  single '}' is not allowed`, `f-string: valid expression required before
-  '}'`, `f-string: expecting '}'` and `f-string: invalid conversion character
-  'z': expected 's', 'r', or 'a'` at the column concerned.
+- **f-string syntax errors are partly worded and positioned as CPython's.** A
+  field with an unmatched `}`, an empty expression, a bad or missing
+  conversion, no closing brace or too deep a nesting is refused with CPython's
+  message and columns. Still open: the tokenizer-level cases that need CPython's
+  mode stack (`f"{"a"` is `'{' was never closed`, `f"{x!r"` points one column
+  earlier, `f"{f"{1"}"}"`), and an expression that stops making sense inside a
+  field is placed at the failing token where CPython places it at the first
+  token after the longest valid prefix (`f"{1 +}"` is one column late).
 - **`open(fd)` and a file's `name`.** An integer file descriptor is not
   accepted, and `f.name` is the decoded `str` for a bytes path where CPython
   keeps the `bytes`.
@@ -3033,11 +3045,6 @@ entry. These remain open:
   does not evaluate `c`; a format spec's `{{` is read as an escaped brace
   where CPython reads a nested field (`f"{x:a{{b}}}"`). A compiler error from
   `compile()` over a file carries `text=None` where CPython reads the line.
-- **A node inside an f-string replacement field is positioned within the
-  field.** The field is parsed as a module of its own, so `f"{(yield)}"`'s
-  error is at offset 3 (the `yield` within `(yield)`) where CPython, whose
-  tokenizer reads the field in place, says 5; the same holds for every
-  compile-time error raised over a node inside a field.
 
 ### Round 2 batched differential fuzz (`tests/batch_fuzz.rs`)
 

@@ -72,6 +72,9 @@ pub enum FStrPart {
         src: String,
         conv: Option<char>,
         spec: Vec<FStrPart>,
+        /// The field from its `{` to its `}`, for the traceback caret of a
+        /// formatting error; `Span::NONE` when the string spans lines.
+        span: Span,
     },
 }
 

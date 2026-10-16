@@ -3493,7 +3493,11 @@ impl Compiler {
                     b.emit(Op::LoadConst(k), 0);
                 }
                 FStrPart::Expr {
-                    expr, conv, spec, ..
+                    expr,
+                    conv,
+                    spec,
+                    span,
+                    ..
                 } => {
                     c.compile_expr(b, expr)?;
                     let conv_i = match conv {
@@ -3504,7 +3508,17 @@ impl Compiler {
                     };
                     b.emit(Op::LoadInt(conv_i), 0);
                     c.compile_fstring_spec(b, spec)?;
-                    b.emit(Op::CallBuiltin(ops::FORMAT, 3), 0);
+                    // The op raises on a bad spec or a failing `__format__`, so it
+                    // carries the field's line and span (else `line 0`, no carets).
+                    let line = if span.is_some() {
+                        span.line
+                    } else {
+                        c.cur_line
+                    };
+                    let op = b.emit(Op::CallBuiltin(ops::FORMAT, 3), line);
+                    let prev = std::mem::replace(&mut c.node_span, *span);
+                    c.record_span(op);
+                    c.node_span = prev;
                 }
             }
             Ok(())
@@ -3534,6 +3548,7 @@ impl Compiler {
                         src,
                         conv,
                         spec,
+                        ..
                     } => {
                         c.compile_expr(b, expr)?;
                         let k = b.add_constant(Value::str(src));

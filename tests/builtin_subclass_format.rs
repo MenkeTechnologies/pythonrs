@@ -28,7 +28,9 @@ class P:
 
 #[test]
 fn percent_with_a_single_subclass_argument_uses_its_dunders() {
-    let src = format!("{CLASSES}r = ('%s' % L('x'), '%r' % L('x'), '%s' % I(5), '%r' % I(5), '%d' % I(5))");
+    let src = format!(
+        "{CLASSES}r = ('%s' % L('x'), '%r' % L('x'), '%s' % I(5), '%r' % I(5), '%d' % I(5))"
+    );
     assert_eq!(g(&src, "r"), "('L!', 'R!', 'I!', 'IR', '5')");
 }
 
@@ -58,7 +60,10 @@ fn format_spec_applies_to_the_base_value_not_dunder_str() {
     let src = format!(
         "{CLASSES}r = (format(L('x'), '>4'), f'{{I(5):>4}}', '{{:04d}}'.format(I(7)), format(FL(1.5), '>6.2f'), format(I(255), 'x'), format(L('x'), ''), format(I(5), ''))"
     );
-    assert_eq!(g(&src, "r"), "('   x', '   5', '0007', '  1.50', 'ff', 'L!', 'I!')");
+    assert_eq!(
+        g(&src, "r"),
+        "('   x', '   5', '0007', '  1.50', 'ff', 'L!', 'I!')"
+    );
 }
 
 #[test]

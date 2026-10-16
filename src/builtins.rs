@@ -3238,7 +3238,15 @@ fn b_binop(vm: &mut VM, _: u8) -> Value {
     // The right operand of `fmt % arg` is a format ARGUMENT, not an operand: a
     // `str`/`int` subclass instance there keeps its own `__str__`/`__repr__`.
     // Only a tuple (the argument list) or a mapping is looked through.
-    let b = if tag == host::binop::MOD && with_host(|h| matches!(h.get(&a), Some(PyObj::Str(_)) | Some(PyObj::Bytes(_)) | Some(PyObj::Bytearray(_)))) && !with_host(|h| matches!(h.get(&b), Some(PyObj::Tuple(_)) | Some(PyObj::Dict(_)))) {
+    let b = if tag == host::binop::MOD
+        && with_host(|h| {
+            matches!(
+                h.get(&a),
+                Some(PyObj::Str(_)) | Some(PyObj::Bytes(_)) | Some(PyObj::Bytearray(_))
+            )
+        })
+        && !with_host(|h| matches!(h.get(&b), Some(PyObj::Tuple(_)) | Some(PyObj::Dict(_))))
+    {
         b_orig
     } else {
         b
@@ -6105,7 +6113,9 @@ pub fn py_repr(v: &Value) -> Result<String, String> {
         // Element order follows CPython's set hash-table layout (int subset).
         Some(PyObj::Set(s)) => Some(Cont::Set(h.set_ordered_values(v, s))),
         Some(PyObj::Frozenset(s)) => Some(Cont::Frozenset(h.set_ordered_values(v, s))),
-        Some(PyObj::Deque { items, maxlen }) => Some(Cont::Deque(items.iter().cloned().collect(), *maxlen)),
+        Some(PyObj::Deque { items, maxlen }) => {
+            Some(Cont::Deque(items.iter().cloned().collect(), *maxlen))
+        }
         Some(PyObj::Dict(d)) => {
             let meta = match v {
                 Value::Obj(i) => h.dict_meta.get(i).map(|m| (m.kind, m.factory.clone())),

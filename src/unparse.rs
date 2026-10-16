@@ -420,6 +420,7 @@ fn ftstring_body(parts: &[FStrPart], template: bool) -> String {
                 src,
                 conv,
                 spec,
+                ..
             } => {
                 let text = if template {
                     src.clone()

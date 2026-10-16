@@ -539,17 +539,51 @@ impl Lexer {
                 start_col as i64 + 1,
             )
         };
+        // A nested string literal inside a replacement field that runs out of line or
+        // input. `(line, col)` is where it opened. A triple-quoted one in a
+        // single-quoted f-string is the tokenizer's own unterminated-literal error;
+        // any other is the field missing its `}`.
+        let nested_unterminated = |lx: &Self, line: u32, col: usize, nested_triple: bool| {
+            if nested_triple && !triple {
+                let detected = if lx.pos >= lx.src.len() && lx.src.last() == Some(&'\n') {
+                    lx.line - 1
+                } else {
+                    lx.line
+                };
+                return lx.tok_err(
+                    &format!(
+                        "SyntaxError: unterminated triple-quoted string literal (detected at line {detected})"
+                    ),
+                    line,
+                    col,
+                    col as i64 + 1,
+                );
+            }
+            lx.tok_err(
+                "SyntaxError: f-string: expecting '}'",
+                line,
+                col,
+                col as i64 + 1,
+            )
+        };
         let mut raw = String::new();
         // For an f-string, a quote inside a `{…}` replacement field does not end
         // the literal (PEP 701 nested strings), so track replacement-field depth.
-        let mut brace_depth: i32 = 0;
+        // One entry per open replacement field: whether it has reached its format
+        // spec (where quotes are plain characters), and the brackets its expression
+        // has open.
+        let mut fields: Vec<(bool, Vec<char>)> = Vec::new();
         loop {
             // Inside an f-string replacement field, a quote opens a NESTED string
             // literal (same or different quotes); scan it whole so its content —
             // including the outer quote char — never terminates the outer f-string.
-            if is_f && brace_depth > 0 {
+            if is_f && fields.last().is_some_and(|f| !f.0) {
                 if let Some(q) = self.peek() {
                     if q == '\'' || q == '"' {
+                        // Where the nested literal opens, for the error an
+                        // unterminated one raises.
+                        let nested_col = self.pos - self.line_start;
+                        let nested_line = self.line;
                         raw.push(q);
                         self.bump();
                         let nested_triple = self.peek() == Some(q) && self.peek2() == Some(q);
@@ -562,9 +596,19 @@ impl Lexer {
                         loop {
                             match self.peek() {
                                 None => {
-                                    return Err(format!(
-                                        "SyntaxError: unterminated string (line {})",
-                                        self.line
+                                    return Err(nested_unterminated(
+                                        self,
+                                        nested_line,
+                                        nested_col,
+                                        nested_triple,
+                                    ))
+                                }
+                                Some('\n') if !nested_triple => {
+                                    return Err(nested_unterminated(
+                                        self,
+                                        nested_line,
+                                        nested_col,
+                                        nested_triple,
                                     ))
                                 }
                                 Some('\\') => {
@@ -610,6 +654,15 @@ impl Lexer {
             match self.peek() {
                 None => return Err(unterminated(self)),
                 Some(c) if c == quote => {
+                    if !triple && !fields.is_empty() {
+                        let col = self.pos - self.line_start;
+                        return Err(self.tok_err(
+                            "SyntaxError: f-string: expecting '}', or format specs",
+                            self.line,
+                            col,
+                            col as i64 + 2,
+                        ));
+                    }
                     if triple {
                         if self.peek2() == Some(quote)
                             && self.src.get(self.pos + 2).copied() == Some(quote)
@@ -642,24 +695,69 @@ impl Lexer {
                 // nested width field and then the outer one, and reading that
                 // `}}` as an escape left the outer field open — the scan ran past
                 // the closing quote and reported an unterminated string.
+                // In an expression a `{`/`[`/`(` opens a bracket (a dict or set display,
+                // say) rather than a field; in a format spec a `{` opens a nested field.
                 Some('{') if is_f => {
                     raw.push('{');
                     self.bump();
-                    if brace_depth == 0 && self.peek() == Some('{') {
-                        raw.push('{');
-                        self.bump();
-                    } else {
-                        brace_depth += 1;
+                    match fields.last_mut() {
+                        None if self.peek() == Some('{') => {
+                            raw.push('{');
+                            self.bump();
+                        }
+                        Some((false, open)) => open.push('{'),
+                        _ => fields.push((false, Vec::new())),
                     }
                 }
-                Some('}') if is_f => {
-                    raw.push('}');
+                Some(c @ ('(' | '[')) if is_f && fields.last().is_some_and(|f| !f.0) => {
+                    raw.push(c);
                     self.bump();
-                    if brace_depth == 0 && self.peek() == Some('}') {
-                        raw.push('}');
-                        self.bump();
-                    } else if brace_depth > 0 {
-                        brace_depth -= 1;
+                    if let Some(f) = fields.last_mut() {
+                        f.1.push(c);
+                    }
+                }
+                Some(c @ (')' | ']' | '}')) if is_f => {
+                    let col = self.pos - self.line_start;
+                    raw.push(c);
+                    self.bump();
+                    match fields.last_mut() {
+                        None if c == '}' && self.peek() == Some('}') => {
+                            raw.push('}');
+                            self.bump();
+                        }
+                        // A closer must match the bracket it closes; one with
+                        // nothing to close is the parser's to report.
+                        Some((false, open)) if !open.is_empty() => {
+                            let opener = open.pop().unwrap();
+                            let wanted = match opener {
+                                '(' => ')',
+                                '[' => ']',
+                                _ => '}',
+                            };
+                            if c != wanted {
+                                return Err(self.tok_err(
+                                    &format!(
+                                        "SyntaxError: closing parenthesis '{c}' does not match opening parenthesis '{opener}'"
+                                    ),
+                                    self.line,
+                                    col,
+                                    col as i64 + 1,
+                                ));
+                            }
+                        }
+                        Some(_) if c != '}' => {}
+                        Some(_) => {
+                            fields.pop();
+                        }
+                        None => {}
+                    }
+                }
+                // A top-level `:` ends the expression: the rest is the format spec.
+                Some(':') if is_f && fields.last().is_some_and(|f| !f.0 && f.1.is_empty()) => {
+                    raw.push(':');
+                    self.bump();
+                    if let Some(f) = fields.last_mut() {
+                        f.0 = true;
                     }
                 }
                 Some('\n') if !triple => return Err(unterminated(self)),
