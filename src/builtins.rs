@@ -2084,6 +2084,13 @@ fn format_field(v: &Value, conv: i64, spec: &str) -> Result<String, String> {
             ))),
         });
     }
+    // A `str`/`int`/`float` subclass without its own `__format__` formats its
+    // base value: a non-empty spec applies to the value, not to `__str__`.
+    if !spec.is_empty() {
+        if let Some(base) = with_host(|h| h.base_payload_any(v)) {
+            return format_field(&base, 0, spec);
+        }
+    }
     // The digit limit guards a DECIMAL rendering only: `format(n, "x")` and the
     // float presentations of an int are unbounded in CPython, so a huge int
     // skips the check unless the spec asks for base ten.
@@ -3216,6 +3223,7 @@ fn b_binop(vm: &mut VM, _: u8) -> Value {
         Value::Int(n) => n,
         _ => return abort(vm, "internal: BINOP tag".into()),
     };
+    let b_orig = b.clone();
     if tag == host::binop::BITOR {
         if let Some(r) = mapping_subclass_or(&a, &b) {
             return finish(vm, r);
@@ -3226,6 +3234,14 @@ fn b_binop(vm: &mut VM, _: u8) -> Value {
     let (a, b) = match binop_tag_dunders(tag) {
         Some((l, r)) => (host::subclass_operand(&a, l), host::subclass_operand(&b, r)),
         None => (a, b),
+    };
+    // The right operand of `fmt % arg` is a format ARGUMENT, not an operand: a
+    // `str`/`int` subclass instance there keeps its own `__str__`/`__repr__`.
+    // Only a tuple (the argument list) or a mapping is looked through.
+    let b = if tag == host::binop::MOD && with_host(|h| matches!(h.get(&a), Some(PyObj::Str(_)) | Some(PyObj::Bytes(_)) | Some(PyObj::Bytearray(_)))) && !with_host(|h| matches!(h.get(&b), Some(PyObj::Tuple(_)) | Some(PyObj::Dict(_)))) {
+        b_orig
+    } else {
+        b
     };
     // Counter `&` (intersection) / `|` (union) — multiset ops keeping positive
     // counts; only when both operands are Counters.
@@ -3815,9 +3831,11 @@ fn percent_coerce_numeric(fmt: &[char], args: &Value) -> Result<Value, String> {
 fn str_percent_format(fmt_val: &Value, args: &Value) -> Result<Value, String> {
     // The top-level format arguments: tuple elements, mapping values, or the
     // bare single arg.
+    let keyed = with_host(|h| matches!(h.get(fmt_val), Some(PyObj::Str(f)) if f.contains("%(")));
     let items: Vec<Value> = with_host(|h| match h.get(args) {
         Some(PyObj::Tuple(t)) => t.clone(),
-        Some(PyObj::Dict(d)) => d.values().map(|(_, v)| v.clone()).collect(),
+        // Without `%(key)` conversions the mapping is itself the one argument.
+        Some(PyObj::Dict(d)) if keyed => d.values().map(|(_, v)| v.clone()).collect(),
         _ => vec![args.clone()],
     });
     let mut premap: std::collections::HashMap<u32, (String, String, String)> =
@@ -3839,6 +3857,7 @@ fn str_percent_format(fmt_val: &Value, args: &Value) -> Result<Value, String> {
                     | Some(PyObj::Dict(_))
                     | Some(PyObj::Set(_))
                     | Some(PyObj::Frozenset(_))
+                    | Some(PyObj::Deque { .. })
             ) || h.metaclass_method(it, "__repr__").is_some()
                 || h.metaclass_method(it, "__str__").is_some()
         });
@@ -6001,6 +6020,7 @@ pub fn py_str(v: &Value) -> Result<String, String> {
                 | Some(PyObj::Dict(_))
                 | Some(PyObj::Set(_))
                 | Some(PyObj::Frozenset(_))
+                | Some(PyObj::Deque { .. })
         )
     }) {
         return py_repr(v);
@@ -6064,6 +6084,8 @@ pub fn py_repr(v: &Value) -> Result<String, String> {
         Tuple(Vec<Value>, Option<(String, Vec<String>)>),
         Set(Vec<Value>),
         Frozenset(Vec<Value>),
+        // A deque, plus its bound (`maxlen`).
+        Deque(Vec<Value>, Option<usize>),
         // A dict, plus its subtype tag (Counter / defaultdict / OrderedDict) and
         // the defaultdict factory, so the repr keeps the CPython wrapper.
         Dict(Vec<(Value, Value)>, Option<(host::DictKind, Option<Value>)>),
@@ -6083,6 +6105,7 @@ pub fn py_repr(v: &Value) -> Result<String, String> {
         // Element order follows CPython's set hash-table layout (int subset).
         Some(PyObj::Set(s)) => Some(Cont::Set(h.set_ordered_values(v, s))),
         Some(PyObj::Frozenset(s)) => Some(Cont::Frozenset(h.set_ordered_values(v, s))),
+        Some(PyObj::Deque { items, maxlen }) => Some(Cont::Deque(items.iter().cloned().collect(), *maxlen)),
         Some(PyObj::Dict(d)) => {
             let meta = match v {
                 Value::Obj(i) => h.dict_meta.get(i).map(|m| (m.kind, m.factory.clone())),
@@ -6110,6 +6133,7 @@ pub fn py_repr(v: &Value) -> Result<String, String> {
             Cont::Tuple(..) => "(...)",
             Cont::Set(_) | Cont::Dict(..) => "{...}",
             Cont::Frozenset(_) => "frozenset(...)",
+            Cont::Deque(..) => "[...]",
         };
         if host::repr_guard_enter(id) {
             return Ok(marker.to_string());
@@ -6138,6 +6162,10 @@ pub fn py_repr(v: &Value) -> Result<String, String> {
                 Cont::Set(e) => format!("{{{}}}", reprs(&e)?.join(", ")),
                 Cont::Frozenset(e) if e.is_empty() => "frozenset()".into(),
                 Cont::Frozenset(e) => format!("frozenset({{{}}})", reprs(&e)?.join(", ")),
+                Cont::Deque(e, maxlen) => match maxlen {
+                    Some(m) => format!("deque([{}], maxlen={m})", reprs(&e)?.join(", ")),
+                    None => format!("deque([{}])", reprs(&e)?.join(", ")),
+                },
                 Cont::Dict(pairs, meta) => {
                     let mut p = Vec::with_capacity(pairs.len());
                     for (k, val) in &pairs {

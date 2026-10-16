@@ -9,6 +9,29 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **A metaclass `__prepare__` runs before the class body, and its mapping
+  seeds the body's scope.** `class C(metaclass=M)` where `M.__prepare__`
+  returns `{'z': 1}` can read `z` in the body (a plain function or a
+  classmethod on the metaclass alike). It used to be called after the body,
+  so the name was a `NameError`. Still open: the body does not run against
+  the prepared mapping itself, so its `__setitem__` fires once per name after
+  the body rather than during it, and `__missing__`/`__getitem__` on the
+  mapping are not consulted for an unbound name.
+- **`exec(src, {})` finds `__name__` in `builtins`.** A namespace with no
+  `__name__` resolves it to `'builtins'`, and a class defined there has
+  `__module__ == 'builtins'` (its repr is `<class 'E'>`), as in CPython.
+- **A `str`/`int`/`float` subclass keeps its own `__str__`/`__repr__` as the
+  one argument of `%`**: `'%s' % L('x')` calls `L.__str__`. The right operand
+  was being unwrapped to the base value as if it were an arithmetic operand.
+  A mapping that is the one argument (`'%s' % {k: v}`) now reprs its keys and
+  values through their own `__repr__`.
+- **`format(x, spec)` on a `str`/`int`/`float` subclass applies the spec to
+  the base value** (`f'{I(5):>4}'` is `'   5'`). It raised `unsupported
+  format string passed to I.__format__`, and a `str` subclass with a
+  `__str__` formatted that text instead of its value.
+- **A `deque` of user objects reprs through their `__repr__`** (top level,
+  nested, and as a `%s`/f-string argument); it printed `<__main__.P object
+  at 0x...>`.
 - **`from __future__ import annotations` (PEP 563).** Every annotation is
   compiled as the string `ast_unparse.c` writes for it (`src/unparse.rs`:
   precedence parentheses, constant `repr`s with `1e309` for an infinity, f-/

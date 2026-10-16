@@ -3314,6 +3314,9 @@ impl PyHost {
             "Ellipsis" => Some(self.alloc(PyObj::Ellipsis)),
             // `__debug__` is False exactly when the interpreter is optimized.
             "__debug__" => Some(Value::Bool(optimize_level() == 0)),
+            // A namespace with no `__name__` of its own (`exec(src, {})`) finds the
+            // `builtins` module's.
+            "__name__" => Some(self.new_str("builtins".to_string())),
             _ if crate::builtins::is_known_builtin(name) => Some(self.builtin_object(name)),
             _ => None,
         }
@@ -7188,7 +7191,7 @@ impl PyHost {
 
     /// The native payload of any builtin-subclass instance (value-level
     /// unwrapping for `as_str`/`equal`), or `None` for a plain object subclass.
-    fn base_payload_any(&self, v: &Value) -> Option<Value> {
+    pub fn base_payload_any(&self, v: &Value) -> Option<Value> {
         match self.get(v) {
             Some(PyObj::Instance(i))
                 if !matches!(i.payload, Value::Undef)
@@ -18925,13 +18928,21 @@ impl PyHost {
 /// Run a class-body function on a fresh class frame and return the namespace it
 /// binds (member/method names in definition order). Shared by the native
 /// `build_class` and the foreign-base (CPython metaclass) path.
-fn run_class_body(name: &str, body_func: &Value) -> Result<NameMap, String> {
+fn run_class_body(
+    name: &str,
+    body_func: &Value,
+    seed: &[(String, Value)],
+) -> Result<NameMap, String> {
     let fv = match with_host(|h| h.get(body_func).cloned()) {
         Some(PyObj::Func(fv)) => fv,
         _ => return Err(type_error("internal: class body is not a function")),
     };
     let def = with_host(|h| h.funcs[fv.def_id].clone());
     let env = new_env(fv.env.clone());
+    // Names a metaclass `__prepare__` put in the namespace are visible to the body.
+    for (k, v) in seed {
+        env.borrow_mut().vars.insert(k.clone(), v.clone());
+    }
     let saved_mod = with_host(|h| {
         let saved = h.swap_module(fv.module);
         h.frames.push(Frame {
@@ -18993,7 +19004,7 @@ fn run_class_body(name: &str, body_func: &Value) -> Result<NameMap, String> {
             h.module_globals[fv.module]
                 .get("__name__")
                 .cloned()
-                .unwrap_or_else(|| h.new_str("__main__".to_string()))
+                .unwrap_or_else(|| h.new_str("builtins".to_string()))
         })
     });
     Ok(vars)
@@ -19010,7 +19021,7 @@ pub fn build_class_foreign(
     bases: Vec<Value>,
     body_func: &Value,
 ) -> Result<Value, String> {
-    let ns = run_class_body(name, body_func)?;
+    let ns = run_class_body(name, body_func, &[])?;
     let mut members: Vec<(String, Value)> = ns.into_iter().collect();
     // CPython class creation always provides `__module__`/`__qualname__` in the
     // namespace; some metaclasses (typing.NamedTuple) index them directly and
@@ -19179,8 +19190,6 @@ pub fn build_class(
         Some(PyObj::Func(fv)) => with_host(|h| h.funcs[fv.def_id].clone()),
         _ => return Err(type_error("internal: class body is not a function")),
     };
-    let ns: NameMap = run_class_body(name, body_func)?;
-    check_slots(name, &ns)?;
     // The effective metaclass: the explicit `metaclass=` if given, else the most
     // derived metaclass inherited from the bases (CPython rule). A user metaclass
     // constructs the class via `M(name, bases, namespace)` (firing `M.__new__`/
@@ -19192,8 +19201,17 @@ pub fn build_class(
             (dm != "type").then_some(dm)
         }
     };
+    // PEP 3115: `__prepare__` runs BEFORE the body, and the names it put in the
+    // mapping are visible to the body as it executes.
+    let prepared = match &effective_meta {
+        Some(m) => prepare_namespace(m, name, &bases, &class_kwargs)?,
+        None => None,
+    };
+    let seed = prepared.as_ref().map_or_else(Vec::new, |p| p.1.clone());
+    let ns: NameMap = run_class_body(name, body_func, &seed)?;
+    check_slots(name, &ns)?;
     let cls = match &effective_meta {
-        Some(m) => metaclass_create(m, name, &bases, &ns, &class_kwargs)?,
+        Some(m) => metaclass_create(m, name, &bases, &ns, &class_kwargs, prepared)?,
         None => {
             with_host(|h| h.check_mro(&bases))?;
             with_host(|h| h.register_class(name, bases, ns.clone()))
@@ -19265,16 +19283,8 @@ pub fn fire_init_subclass(
     Ok(())
 }
 
-/// Construct a class through its metaclass: `M(name, (bases...), {ns...})`. This
-/// runs `M`'s `__call__` (or the default `type.__call__` → `__new__`/`__init__`),
-/// exactly like any `M(...)` call, and returns the new class object.
-fn metaclass_create(
-    meta: &str,
-    name: &str,
-    bases: &[String],
-    ns: &NameMap,
-    class_kwargs: &[(String, Value)],
-) -> Result<Value, String> {
+/// The `(name, bases)` arguments a metaclass receives.
+fn class_header_values(name: &str, bases: &[String]) -> (Value, Value) {
     let name_v = with_host(|h| h.new_str(name.to_string()));
     let base_vals: Vec<Value> = with_host(|h| {
         // A builtin base (`Generic`, `int`, `Exception`) must reach the metaclass
@@ -19286,19 +19296,64 @@ fn metaclass_create(
             .collect()
     });
     let bases_v = with_host(|h| h.new_tuple(base_vals));
+    (name_v, bases_v)
+}
+
+/// PEP 3115: call a user metaclass's own `__prepare__` and return the mapping
+/// with its initial string-keyed entries (which seed the class body's scope).
+/// `None` when the metaclass inherits `type.__prepare__`.
+fn prepare_namespace(
+    meta: &str,
+    name: &str,
+    bases: &[String],
+    class_kwargs: &[(String, Value)],
+) -> Result<Option<(Value, Vec<(String, Value)>)>, String> {
+    if with_host(|h| h.class_lookup(meta, "__prepare__").is_none()) {
+        return Ok(None);
+    }
+    let (name_v, bases_v) = class_header_values(name, bases);
     let meta_v = with_host(|h| h.alloc(PyObj::Class(meta.to_string())));
-    // PEP 3115 `__prepare__`: if the metaclass provides a custom namespace (e.g.
-    // enum's `_EnumDict`), build the class dict THROUGH it — replaying each body
-    // assignment via its `__setitem__` so its bookkeeping (member tracking) runs.
-    let has_prepare = with_host(|h| h.class_lookup(meta, "__prepare__").is_some());
-    let ns_v = if has_prepare {
-        let prepared = call_method(
-            &meta_v,
-            "__prepare__",
-            vec![name_v.clone(), bases_v.clone()],
-            class_kwargs.to_vec(),
-        )?;
+    let prepared = call_method(
+        &meta_v,
+        "__prepare__",
+        vec![name_v, bases_v],
+        class_kwargs.to_vec(),
+    )?;
+    let items = call_method(&prepared, "items", vec![], vec![])?;
+    let mut seed = Vec::new();
+    for pair in iter_vec(&items)? {
+        let kv = iter_vec(&pair)?;
+        if let [k, v] = kv.as_slice() {
+            if let Some(k) = with_host(|h| h.as_str(k)) {
+                seed.push((k, v.clone()));
+            }
+        }
+    }
+    Ok(Some((prepared, seed)))
+}
+
+/// Construct a class through its metaclass: `M(name, (bases...), {ns...})`. This
+/// runs `M`'s `__call__` (or the default `type.__call__` → `__new__`/`__init__`),
+/// exactly like any `M(...)` call, and returns the new class object.
+fn metaclass_create(
+    meta: &str,
+    name: &str,
+    bases: &[String],
+    ns: &NameMap,
+    class_kwargs: &[(String, Value)],
+    prepared: Option<(Value, Vec<(String, Value)>)>,
+) -> Result<Value, String> {
+    let (name_v, bases_v) = class_header_values(name, bases);
+    let meta_v = with_host(|h| h.alloc(PyObj::Class(meta.to_string())));
+    // A metaclass with a custom namespace (e.g. enum's `_EnumDict`) builds the
+    // class dict THROUGH it — replaying each body assignment via its
+    // `__setitem__` so its bookkeeping (member tracking) runs. A name the body
+    // left exactly as `__prepare__` seeded it is already in the mapping.
+    let ns_v = if let Some((prepared, seed)) = prepared {
         for (k, v) in ns {
+            if seed.iter().any(|(sk, sv)| sk == k && sv == v) {
+                continue;
+            }
             let kv = with_host(|h| h.new_str(k.clone()));
             call_method(&prepared, "__setitem__", vec![kv, v.clone()], vec![])?;
         }
