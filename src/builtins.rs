@@ -742,13 +742,19 @@ pub fn getitem_value(recv: Value, idx: Value) -> Result<Value, String> {
     }
     // dict-subclass `__missing__`: Counter → 0, defaultdict → default_factory().
     if let Some(meta) = host::dict_meta_of(&recv) {
-        let missing = with_host(|h| match h.to_key(&idx) {
-            Ok(k) => match h.get(&recv) {
-                Some(PyObj::Dict(d)) => !d.contains_key(&k),
-                _ => false,
-            },
-            Err(_) => false,
-        });
+        // The key goes through the same preparation as any dict access, so an
+        // instance with its own `__hash__`/`__eq__` finds the entry it equals.
+        let cands = host::instance_key_candidates_for(&recv, Some(&idx));
+        let missing = host::with_instance_key(&idx, host::KeyRole::Of(&recv), &cands, || {
+            Ok(with_host(|h| match h.to_key(&idx) {
+                Ok(k) => match h.get(&recv) {
+                    Some(PyObj::Dict(d)) => !d.contains_key(&k),
+                    _ => false,
+                },
+                Err(_) => false,
+            }))
+        })
+        .unwrap_or(false);
         if missing {
             match meta.kind {
                 host::DictKind::Counter => return Ok(Value::Int(0)),
@@ -756,7 +762,12 @@ pub fn getitem_value(recv: Value, idx: Value) -> Result<Value, String> {
                     if let Some(factory) = meta.factory {
                         let r = (|| {
                             let default = host::invoke(&factory, vec![], vec![])?;
-                            with_host(|h| h.set_item(&recv, &idx, default.clone()))?;
+                            host::with_instance_key(
+                                &idx,
+                                host::KeyRole::Of(&recv),
+                                &cands,
+                                || with_host(|h| h.set_item(&recv, &idx, default.clone())),
+                            )?;
                             Ok(default)
                         })();
                         return r;
@@ -1008,7 +1019,7 @@ fn subscript_delete(recv: &Value, idx: Value) -> Result<(), String> {
     // `Counter.__delitem__` is `if elem in self: super().__delitem__(elem)` —
     // deleting a missing element is a no-op, not a KeyError.
     if host::dict_meta_of(&recv).is_some_and(|m| m.kind == host::DictKind::Counter)
-        && !with_host(|h| h.contains(&idx, &recv))?
+        && !contains_value(recv.clone(), idx.clone())?
     {
         return Ok(());
     }
@@ -6029,6 +6040,7 @@ pub fn py_str(v: &Value) -> Result<String, String> {
                 | Some(PyObj::Set(_))
                 | Some(PyObj::Frozenset(_))
                 | Some(PyObj::Deque { .. })
+                | Some(PyObj::BoundMethod { .. })
         )
     }) {
         return py_repr(v);
@@ -6060,6 +6072,27 @@ pub fn py_repr(v: &Value) -> Result<String, String> {
             let r = host::call_method(v, "__repr__", vec![], vec![])?;
             return Ok(with_host(|h| h.str_of(&r)));
         }
+    }
+    // A bound method shows its receiver's `repr`, so an instance's own `__repr__`
+    // has to be consulted here, outside the host borrow.
+    let bound = with_host(|h| match h.get(v) {
+        Some(PyObj::BoundMethod { recv, func }) => match h.get(func) {
+            Some(PyObj::Func(f)) => {
+                let qual = h.funcs.get(f.def_id).map(|d| {
+                    if d.qualname.is_empty() {
+                        d.name.clone()
+                    } else {
+                        d.qualname.clone()
+                    }
+                });
+                Some((recv.clone(), qual.unwrap_or_default()))
+            }
+            _ => None,
+        },
+        _ => None,
+    });
+    if let Some((recv, qual)) = bound {
+        return Ok(format!("<bound method {qual} of {}>", py_repr(&recv)?));
     }
     // A slice reprs its three bounds through this layer so an instance bound
     // dispatches its own `__repr__` (the host's `repr_of` is `&self` and cannot
@@ -11749,8 +11782,13 @@ pub fn call_copy(name: &str, args: &[Value]) -> Result<Value, String> {
     match name {
         "copy" => copy_shallow(&v),
         "deepcopy" => {
-            let mut memo = std::collections::HashMap::new();
-            copy_deep(&v, &mut memo)
+            // `deepcopy(x, memo=None)`: the memo is a real dict keyed by `id()`,
+            // which a user `__deepcopy__(self, memo)` hands back to `deepcopy`.
+            let memo = match args.get(1) {
+                Some(m) if !matches!(m, Value::Undef) => m.clone(),
+                _ => with_host(|h| h.new_dict(IndexMap::new())),
+            };
+            copy_deep(&v, &memo)
         }
         _ => Err(host::type_error(&format!(
             "module 'copy' has no attribute '{name}'"
@@ -11758,9 +11796,186 @@ pub fn call_copy(name: &str, args: &[Value]) -> Result<Value, String> {
     }
 }
 
+/// The memo entry for the object with heap id `id`.
+fn memo_get(memo: &Value, id: u32) -> Option<Value> {
+    with_host(|h| {
+        let key = h.to_key(&Value::Int(id as i64)).ok()?;
+        match h.get(memo) {
+            Some(PyObj::Dict(d)) => d.get(&key).map(|(_, v)| v.clone()),
+            _ => None,
+        }
+    })
+}
+
+/// `memo[id] = copy`.
+fn memo_put(memo: &Value, id: u32, copy: Value) {
+    with_host(|h| {
+        if let Ok(key) = h.to_key(&Value::Int(id as i64)) {
+            if let Some(PyObj::Dict(d)) = h.get_mut(memo) {
+                d.insert(key, (Value::Int(id as i64), copy));
+            }
+        }
+    });
+}
+
+/// Whether the user class of `v` defines `name` (a hook the `copy` module honours).
+fn copy_hook(v: &Value, name: &str) -> bool {
+    with_host(|h| match h.get(v) {
+        Some(PyObj::Instance(i)) => h.class_lookup(&i.class, name).is_some(),
+        _ => false,
+    })
+}
+
+/// The copy protocol of a user instance that customizes it, as `copy.copy` /
+/// `copy.deepcopy` apply it: `__copy__` / `__deepcopy__(memo)`, then
+/// `__reduce_ex__(4)` / `__reduce__`, then the `__getstate__` / `__setstate__`
+/// pair `object.__reduce_ex__` builds on. `None` when the class customizes
+/// none, which is a plain structural copy. `memo` is `Some` for a deep copy.
+fn copy_protocol(v: &Value, memo: Option<&Value>) -> Result<Option<Value>, String> {
+    let hook = if memo.is_some() {
+        "__deepcopy__"
+    } else {
+        "__copy__"
+    };
+    if copy_hook(v, hook) {
+        let args = memo.map_or_else(Vec::new, |m| vec![m.clone()]);
+        let out = host::call_method(v, hook, args, vec![])?;
+        if let (Some(m), Value::Obj(id)) = (memo, v) {
+            if out != *v {
+                memo_put(m, *id, out.clone());
+            }
+        }
+        return Ok(Some(out));
+    }
+    let reduced = if copy_hook(v, "__reduce_ex__") {
+        Some(host::call_method(
+            v,
+            "__reduce_ex__",
+            vec![Value::Int(4)],
+            vec![],
+        )?)
+    } else if copy_hook(v, "__reduce__") {
+        Some(host::call_method(v, "__reduce__", vec![], vec![])?)
+    } else {
+        None
+    };
+    if let Some(rv) = reduced {
+        return copy_reconstruct(v, rv, memo).map(Some);
+    }
+    if copy_hook(v, "__getstate__") || copy_hook(v, "__setstate__") {
+        let (class, payload) = with_host(|h| match h.get(v) {
+            Some(PyObj::Instance(i)) => (i.class.clone(), i.payload.clone()),
+            _ => (String::new(), Value::Undef),
+        });
+        let y = with_host(|h| h.new_instance_payload(class, payload));
+        if let (Some(m), Value::Obj(id)) = (memo, v) {
+            memo_put(m, *id, y.clone());
+        }
+        let state = if copy_hook(v, "__getstate__") {
+            host::call_method(v, "__getstate__", vec![], vec![])?
+        } else {
+            with_host(|h| h.get_attr(v, "__dict__"))?
+        };
+        copy_apply_state(&y, state, memo)?;
+        return Ok(Some(y));
+    }
+    Ok(None)
+}
+
+/// `copy._reconstruct(x, memo, func, args, state, listiter, dictiter)`.
+fn copy_reconstruct(x: &Value, rv: Value, memo: Option<&Value>) -> Result<Value, String> {
+    // A string names a global: the object is its own copy.
+    if with_host(|h| h.as_str(&rv)).is_some() {
+        return Ok(x.clone());
+    }
+    let parts = match with_host(|h| h.get(&rv).cloned()) {
+        Some(PyObj::Tuple(t)) if (2..=5).contains(&t.len()) => t,
+        _ => {
+            return Err(host::type_error(
+                "__reduce__ must return a string or tuple of 2 to 5 elements",
+            ))
+        }
+    };
+    let part = |i: usize| parts.get(i).filter(|p| !matches!(p, Value::Undef)).cloned();
+    let deep = |v: Value| match memo {
+        Some(m) => copy_deep(&v, m),
+        None => Ok(v),
+    };
+    let mut args = host::iter_vec(&parts[1])?;
+    if memo.is_some() {
+        args = args.into_iter().map(deep).collect::<Result<_, _>>()?;
+    }
+    let y = host::invoke(&parts[0], args, vec![])?;
+    if let (Some(m), Value::Obj(id)) = (memo, x) {
+        memo_put(m, *id, y.clone());
+    }
+    if let Some(state) = part(2) {
+        copy_apply_state(&y, state, memo)?;
+    }
+    if let Some(items) = part(3) {
+        for item in host::iter_vec(&items)? {
+            let item = deep(item)?;
+            host::call_method(&y, "append", vec![item], vec![])?;
+        }
+    }
+    if let Some(items) = part(4) {
+        for pair in host::iter_vec(&items)? {
+            if let [k, val] = host::iter_vec(&pair)?.as_slice() {
+                let (k, val) = (deep(k.clone())?, deep(val.clone())?);
+                with_host(|h| h.set_item(&y, &k, val))?;
+            }
+        }
+    }
+    Ok(y)
+}
+
+/// Install `state` on the new object `y`: through its `__setstate__`, else
+/// into its `__dict__` (a `(dict, slots)` pair also sets the slots).
+fn copy_apply_state(y: &Value, state: Value, memo: Option<&Value>) -> Result<(), String> {
+    if matches!(state, Value::Undef) {
+        return Ok(());
+    }
+    let state = match memo {
+        Some(m) => copy_deep(&state, m)?,
+        None => state,
+    };
+    if copy_hook(y, "__setstate__") {
+        host::call_method(y, "__setstate__", vec![state], vec![])?;
+        return Ok(());
+    }
+    let (dict_state, slot_state) = match with_host(|h| h.get(&state).cloned()) {
+        Some(PyObj::Tuple(t)) if t.len() == 2 => (t[0].clone(), Some(t[1].clone())),
+        _ => (state, None),
+    };
+    let pairs = with_host(|h| match h.get(&dict_state) {
+        Some(PyObj::Dict(d)) => d.values().cloned().collect::<Vec<_>>(),
+        _ => Vec::new(),
+    });
+    for (k, val) in pairs {
+        if let Some(name) = with_host(|h| h.as_str(&k)) {
+            with_host(|h| h.instance_dict_set(y, &name, val));
+        }
+    }
+    if let Some(slots) = slot_state {
+        let pairs = with_host(|h| match h.get(&slots) {
+            Some(PyObj::Dict(d)) => d.values().cloned().collect::<Vec<_>>(),
+            _ => Vec::new(),
+        });
+        for (k, val) in pairs {
+            if let Some(name) = with_host(|h| h.as_str(&k)) {
+                with_host(|h| h.set_attr(y, &name, val))?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A shallow copy: a fresh mutable container/instance sharing the element or
 /// attribute references; an immutable value is returned unchanged.
 fn copy_shallow(v: &Value) -> Result<Value, String> {
+    if let Some(out) = copy_protocol(v, None)? {
+        return Ok(out);
+    }
     enum K {
         List(Vec<Value>),
         Dict(IndexMap<PKey, (Value, Value)>, Option<host::DictMeta>),
@@ -11769,7 +11984,7 @@ fn copy_shallow(v: &Value) -> Result<Value, String> {
         Instance(Instance),
         Same,
     }
-    let k = with_host(|h| match h.get(v) {
+    let mut k = with_host(|h| match h.get(v) {
         Some(PyObj::List(l)) => K::List(l.clone()),
         Some(PyObj::Dict(d)) => {
             let meta = match v {
@@ -11783,6 +11998,13 @@ fn copy_shallow(v: &Value) -> Result<Value, String> {
         Some(PyObj::Instance(inst)) => K::Instance(inst.clone()),
         _ => K::Same,
     });
+    // A `list`/`dict`/… subclass carries its elements as a payload that is its own
+    // storage, so the copy needs one of its own.
+    if let K::Instance(inst) = &mut k {
+        if !matches!(inst.payload, Value::Undef) {
+            inst.payload = copy_shallow(&inst.payload)?;
+        }
+    }
     Ok(with_host(|h| match k {
         K::List(l) => h.new_list(l),
         K::Dict(d, meta) => {
@@ -11813,14 +12035,17 @@ fn copy_shallow(v: &Value) -> Result<Value, String> {
     }))
 }
 
-/// A deep, recursive copy. New containers are registered in `memo` (keyed by heap
-/// id) before their children are copied, so shared and cyclic references are
+/// A deep, recursive copy. New containers are registered in `memo` (a dict keyed
+/// by `id()`) before their children are copied, so shared and cyclic references are
 /// preserved exactly as CPython's `deepcopy` does.
-fn copy_deep(v: &Value, memo: &mut std::collections::HashMap<u32, Value>) -> Result<Value, String> {
+fn copy_deep(v: &Value, memo: &Value) -> Result<Value, String> {
     if let Value::Obj(i) = v {
-        if let Some(c) = memo.get(i) {
-            return Ok(c.clone());
+        if let Some(c) = memo_get(memo, *i) {
+            return Ok(c);
         }
+    }
+    if let Some(out) = copy_protocol(v, Some(memo))? {
+        return Ok(out);
     }
     enum K {
         List(Vec<Value>),
@@ -11861,7 +12086,7 @@ fn copy_deep(v: &Value, memo: &mut std::collections::HashMap<u32, Value>) -> Res
         K::List(items) => {
             let out = with_host(|h| h.new_list(Vec::new()));
             if let Some(i) = id {
-                memo.insert(i, out.clone());
+                memo_put(memo, i, out.clone());
             }
             let mut copied = Vec::with_capacity(items.len());
             for it in &items {
@@ -11881,14 +12106,14 @@ fn copy_deep(v: &Value, memo: &mut std::collections::HashMap<u32, Value>) -> Res
             }
             let out = with_host(|h| h.new_tuple(copied));
             if let Some(i) = id {
-                memo.insert(i, out.clone());
+                memo_put(memo, i, out.clone());
             }
             Ok(out)
         }
         K::Dict(pairs, meta) => {
             let out = with_host(|h| h.new_dict(IndexMap::new()));
             if let Some(i) = id {
-                memo.insert(i, out.clone());
+                memo_put(memo, i, out.clone());
             }
             let mut nd: IndexMap<PKey, (Value, Value)> = IndexMap::new();
             for (k, val) in &pairs {
@@ -11916,18 +12141,23 @@ fn copy_deep(v: &Value, memo: &mut std::collections::HashMap<u32, Value>) -> Res
             }
             let out = with_host(|h| h.new_set(copied));
             if let Some(i) = id {
-                memo.insert(i, out.clone());
+                memo_put(memo, i, out.clone());
             }
             Ok(out)
         }
         K::Bytearray(b) => {
             let out = with_host(|h| h.alloc(PyObj::Bytearray(b)));
             if let Some(i) = id {
-                memo.insert(i, out.clone());
+                memo_put(memo, i, out.clone());
             }
             Ok(out)
         }
         K::Instance(class, pairs, payload) => {
+            let payload = if matches!(payload, Value::Undef) {
+                payload
+            } else {
+                copy_deep(&payload, memo)?
+            };
             let dict = with_host(|h| h.alloc(PyObj::Dict(IndexMap::new())));
             let out = with_host(|h| {
                 h.alloc(PyObj::Instance(Instance {
@@ -11937,7 +12167,7 @@ fn copy_deep(v: &Value, memo: &mut std::collections::HashMap<u32, Value>) -> Res
                 }))
             });
             if let Some(i) = id {
-                memo.insert(i, out.clone());
+                memo_put(memo, i, out.clone());
             }
             let mut nd: IndexMap<PKey, (Value, Value)> = IndexMap::new();
             for (k, val) in &pairs {
@@ -24115,6 +24345,16 @@ fn counter_binop(a: &Value, b: &Value, op: char) -> Option<Result<Value, String>
     if !(is_counter(a) && is_counter(b)) {
         return None;
     }
+    // `b`'s elements keyed in `a`'s key space, so equal user-defined keys meet.
+    let aligned;
+    let b = match host::align_operand(a, b) {
+        Ok(Some(v)) => {
+            aligned = v;
+            &aligned
+        }
+        Ok(None) => b,
+        Err(e) => return Some(Err(e)),
+    };
     // Counts are VALUES, not i64: `Counter(a=1.5) + Counter(a=1)` is
     // `Counter({'a': 2.5})` in CPython, and a bignum count has to survive too.
     let dump = |v: &Value| -> Vec<(PKey, Value, Value)> {
@@ -24183,7 +24423,9 @@ fn counter_add(
     // Keyword counts are applied after the positional argument, exactly as
     // `Counter.update(self, iterable=None, /, **kwds)` does — dropping them made
     // `c.update(a=2)` a silent no-op.
-    let mut deltas: Vec<(PKey, Value, Value)> = match args.first() {
+    // `(element, count)` pairs; the element is keyed below, where a user
+    // `__hash__`/`__eq__` can run.
+    let mut deltas: Vec<(Value, Value)> = match args.first() {
         None | Some(Value::Undef) => Vec::new(),
         Some(other) => {
             let other = other.clone();
@@ -24195,32 +24437,22 @@ fn counter_add(
             let is_dict = with_host(|h| matches!(h.get(&other), Some(PyObj::Dict(_))));
             if is_dict {
                 with_host(|h| match h.get(&other) {
-                    Some(PyObj::Dict(d)) => d
-                        .values()
-                        .map(|(k, v)| {
-                            let key = h.to_key(k).unwrap_or(PKey::None);
-                            (key, k.clone(), v.clone())
-                        })
-                        .collect(),
+                    Some(PyObj::Dict(d)) => {
+                        d.values().map(|(k, v)| (k.clone(), v.clone())).collect()
+                    }
                     _ => vec![],
                 })
             } else {
-                let items = host::iter_vec(&other)?;
-                with_host(|h| {
-                    items
-                        .into_iter()
-                        .map(|it| {
-                            let key = h.to_key(&it).unwrap_or(PKey::None);
-                            (key, it, Value::Int(1))
-                        })
-                        .collect()
-                })
+                host::iter_vec(&other)?
+                    .into_iter()
+                    .map(|it| (it, Value::Int(1)))
+                    .collect()
             }
         }
     };
     for (k, v) in kwargs {
         let kv = new_str(k.clone());
-        deltas.push((PKey::Str(k.clone()), kv, v.clone()));
+        deltas.push((kv, v.clone()));
     }
     // Counts go through the numeric `+`/`-`, NOT through an i64 accumulator.
     // CPython's `Counter.update` is `self[elem] = count + self_get(elem, 0)`, so
@@ -24228,18 +24460,23 @@ fn counter_add(
     // and a bignum count stays exact. Truncating to i64 silently rewrote both
     // to something the caller never put in.
     let op = if sign < 0 { NumOp::Sub } else { NumOp::Add };
-    for (key, kv, delta) in deltas {
-        let cur = with_host(|h| match h.get(recv) {
-            Some(PyObj::Dict(d)) => d.get(&key).map(|(_, v)| v.clone()),
-            _ => None,
-        })
-        .unwrap_or(Value::Int(0));
-        let next = with_host(|h| h.arith(op, &cur, &delta))?;
-        with_host(|h| {
-            if let Some(PyObj::Dict(d)) = h.get_mut(recv) {
-                d.insert(key, (kv, next));
-            }
-        });
+    for (kv, delta) in deltas {
+        let cands = host::instance_key_candidates_for(recv, Some(&kv));
+        host::with_instance_key(&kv, host::KeyRole::Of(recv), &cands, || {
+            with_host(|h| {
+                let key = h.to_key(&kv)?;
+                let cur = match h.get(recv) {
+                    Some(PyObj::Dict(d)) => d.get(&key).map(|(_, v)| v.clone()),
+                    _ => None,
+                }
+                .unwrap_or(Value::Int(0));
+                let next = h.arith(op, &cur, &delta)?;
+                if let Some(PyObj::Dict(d)) = h.get_mut(recv) {
+                    d.insert(key, (kv.clone(), next));
+                }
+                Ok(())
+            })
+        })?;
     }
     Ok(Value::Undef)
 }
@@ -24251,7 +24488,10 @@ fn ordered_move_to_end(
     kwargs: &[(String, Value)],
 ) -> Result<Value, String> {
     let kv = arg0(args)?;
-    let key = with_host(|h| h.to_key(&kv))?;
+    let cands = host::instance_key_candidates_for(recv, Some(&kv));
+    let key = host::with_instance_key(&kv, host::KeyRole::Of(recv), &cands, || {
+        with_host(|h| h.to_key(&kv))
+    })?;
     let last = args
         .get(1)
         .or_else(|| kwargs.iter().find(|(k, _)| k == "last").map(|(_, v)| v))
