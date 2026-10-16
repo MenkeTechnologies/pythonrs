@@ -9,6 +9,32 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **Counter, defaultdict and OrderedDict find value-equal user keys.**
+  `Counter([P(1), P(1)])`, `c[P(1)] += 1`, `c.update(...)`, `a - b` and
+  `del c[k]` on a `Counter`, a missing key of a `defaultdict`, and
+  `OrderedDict.move_to_end` keyed objects through the same preparation as a
+  `dict`, so a class with `__hash__`/`__eq__` is one key. They counted every
+  instance under one key, or raised `KeyError`/`unhashable`.
+- **`copy.copy`/`copy.deepcopy` run the copy protocol.** `__copy__`,
+  `__deepcopy__(memo)` (with `deepcopy(x, memo)` taking the memo back),
+  `__reduce_ex__`/`__reduce__` (callable, args, state, list and dict items)
+  and the `__getstate__`/`__setstate__` pair are honoured, and the copy of a
+  `list`/`dict` subclass owns its storage instead of sharing the original's.
+- **A bound method's repr shows its receiver's `__repr__`**, and so does
+  `str()` of it.
+- **Compile-time checks CPython makes.** More than one `*` in an assignment
+  target, a `*` target outside a list or tuple, `a = *b`, `del *a`,
+  `[*a for ...]`, `{**a for ...}`, `print(*)`, `from x import *` in a function
+  or class, a bare `except:` that is not last, `break`/`continue`/`return`
+  directly in an `except*`, a sequence pattern with two `*`, an f-string
+  pattern, `case -x` and `case 1+2`, and a `TabError` for indentation that
+  depends on the tab width are refused with CPython's message and span. They
+  ran, or reported `invalid syntax`.
+- **Valid syntax that was refused.** Complex literal patterns (`case 1-2j`),
+  a number followed by `if`/`else`/`for`/`in`/`is`/`not`/`and`/`or` (`1if x
+  else 2`, `[1for x in y]`; `1.a` and `1e` are `invalid decimal literal`),
+  `a[*b]` and `*args: *Ts` (PEP 646), and an f-string field that runs over
+  several lines or holds a comment.
 - **An f-string field is split on the `:`, `!` and `=` outside any string
   literal or bracket.** `f"{':'.join(x)}"`, `f"{'!r'}"` and `f"{'{'}"` are
   fields, not specs or nested fields; they raised `SyntaxError` or formatted
@@ -2463,7 +2489,9 @@ written.
   defined in an imported program module (not `__main__`) is looked up by CPython's
   importer under that module's name, which imports a separate CPython copy of the
   file, so `pickle` reports it is not the same object. `copy.copy`/`deepcopy` are
-  native and do not consult `__copy__`/`__deepcopy__`/`__reduce_ex__`. A
+  native, and honour a class's `__copy__`/`__deepcopy__`/`__reduce_ex__`/
+  `__reduce__`/`__getstate__`/`__setstate__`, but not `copyreg`'s dispatch
+  table, and there is no `copy.replace`. A
   `bytearray` subclass is not a native builtin subclass at all.
 
 - **A left-recursive chain CPython compiles can exceed pythonrs's compile

@@ -85,6 +85,10 @@ struct Lexer {
     line: u32,
     depth: i32,
     indents: Vec<usize>,
+    /// The same stack measured with a tab counting as one column, which the
+    /// tokenizer compares against `indents` to catch a mix of tabs and spaces
+    /// whose meaning depends on the tab width.
+    alt_indents: Vec<usize>,
     out: Vec<Token>,
     /// See [`Lexed::deferred`]. Set by `handle_indent`; stops `run`.
     deferred: Option<String>,
@@ -117,6 +121,7 @@ pub fn lex(src: &str) -> Result<Lexed, String> {
         line: 1,
         depth: 0,
         indents: vec![0],
+        alt_indents: vec![0],
         out: Vec::new(),
         deferred: None,
         line_start: 0,
@@ -334,6 +339,7 @@ impl Lexer {
         }
         while self.indents.len() > 1 {
             self.indents.pop();
+            self.alt_indents.pop();
             self.push(Tok::Dedent);
         }
         self.push(Tok::Eof);
@@ -344,15 +350,18 @@ impl Lexer {
     /// Returns true if the line was blank or comment-only (skip it entirely).
     fn handle_indent(&mut self) -> Result<bool, String> {
         let mut col = 0usize;
+        let mut altcol = 0usize;
         let start = self.pos;
         loop {
             match self.peek() {
                 Some(' ') => {
                     col += 1;
+                    altcol += 1;
                     self.pos += 1;
                 }
                 Some('\t') => {
                     col += 8 - (col % 8);
+                    altcol += 1;
                     self.pos += 1;
                 }
                 Some('\r') => {
@@ -379,12 +388,33 @@ impl Lexer {
             _ => {}
         }
         let top = *self.indents.last().unwrap();
+        let alt_top = *self.alt_indents.last().unwrap();
+        // `indenterror`: the line is deeper, level or shallower under one tab
+        // width and not under the other.
+        let tab_error = |lx: &mut Self| {
+            lx.deferred = Some(crate::parser::at_pos(
+                "TabError: inconsistent use of tabs and spaces in indentation",
+                lx.line,
+                1,
+                lx.line,
+                0,
+            ));
+            Ok(false)
+        };
+        if col == top && altcol != alt_top {
+            return tab_error(self);
+        }
         if col > top {
+            if altcol <= alt_top {
+                return tab_error(self);
+            }
             self.indents.push(col);
+            self.alt_indents.push(altcol);
             self.push(Tok::Indent);
         } else if col < top {
             while col < *self.indents.last().unwrap() {
                 self.indents.pop();
+                self.alt_indents.pop();
                 self.push(Tok::Dedent);
             }
             if col != *self.indents.last().unwrap() {
@@ -402,6 +432,9 @@ impl Lexer {
                     -1,
                 ));
                 return Ok(false);
+            }
+            if altcol != *self.alt_indents.last().unwrap() {
+                return tab_error(self);
             }
         }
         Ok(false)
@@ -760,7 +793,28 @@ impl Lexer {
                         f.0 = true;
                     }
                 }
-                Some('\n') if !triple => return Err(unterminated(self)),
+                // A `#` in a field's expression starts a comment to the end of the
+                // line, quotes and braces in it included.
+                Some('#') if is_f && fields.last().is_some_and(|f| !f.0) => {
+                    while let Some(c) = self.peek().filter(|&c| c != '\n') {
+                        raw.push(c);
+                        self.bump();
+                    }
+                }
+                // A field's expression may run over several lines of a
+                // single-quoted f-string; literal text and format specs may not.
+                Some('\n') if !triple && !fields.last().is_some_and(|f| !f.0) => {
+                    if fields.is_empty() {
+                        return Err(unterminated(self));
+                    }
+                    let col = self.pos - self.line_start;
+                    return Err(self.tok_err(
+                        "SyntaxError: f-string: newlines are not allowed in format specifiers for single quoted f-strings",
+                        self.line,
+                        col,
+                        col as i64 + 1,
+                    ));
+                }
                 Some(c) => {
                     raw.push(c);
                     self.bump();
@@ -784,6 +838,31 @@ impl Lexer {
             self.push(Tok::Str(decoded));
         }
         Ok(())
+    }
+
+    /// The tokenizer's `verify_end_of_number`: a number may not run straight into
+    /// a name (`1.a`, `1e`), except into the keywords `and`, `else`, `for`, `if`,
+    /// `in`, `is`, `not` and `or` (`1if x else 2` is legal). Reported at the
+    /// number's last character.
+    fn verify_end_of_number(&self) -> Result<(), String> {
+        let Some(&c) = self.src.get(self.pos) else {
+            return Ok(());
+        };
+        if !(c.is_alphabetic() || c == '_') {
+            return Ok(());
+        }
+        const KEYWORDS: [&str; 8] = ["and", "else", "for", "if", "in", "is", "not", "or"];
+        let ahead: String = self.src[self.pos..].iter().take(4).collect();
+        if KEYWORDS.iter().any(|k| ahead.starts_with(k)) {
+            return Ok(());
+        }
+        let col = self.pos - 1 - self.line_start;
+        Err(self.tok_err(
+            "SyntaxError: invalid decimal literal",
+            self.line,
+            col,
+            col as i64 + 1,
+        ))
     }
 
     fn scan_number(&mut self) -> Result<(), String> {
@@ -898,10 +977,17 @@ impl Lexer {
                     self.pos += 1;
                 }
                 'e' | 'E' => {
+                    // An exponent needs a digit (after an optional sign); without
+                    // one the `e` is not part of the number (`1else`, `1e`).
+                    let signed = matches!(self.src.get(self.pos + 1), Some('+' | '-'));
+                    let digit_at = self.pos + 1 + usize::from(signed);
+                    if !matches!(self.src.get(digit_at), Some(d) if d.is_ascii_digit()) {
+                        break;
+                    }
                     is_float = true;
                     s.push('e');
                     self.pos += 1;
-                    if matches!(self.peek(), Some('+') | Some('-')) {
+                    if signed {
                         s.push(self.peek().unwrap());
                         self.pos += 1;
                     }
@@ -914,6 +1000,7 @@ impl Lexer {
                 _ => break,
             }
         }
+        self.verify_end_of_number()?;
         if is_complex {
             let v: f64 = s
                 .parse()

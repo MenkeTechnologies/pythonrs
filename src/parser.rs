@@ -560,6 +560,9 @@ const MAXSTACK: u32 = 6000;
 /// `await_primary`, `primary` and its `_raw`, `atom`, the lookahead.
 const EXPRESSION_TO_LOOKAHEAD: u32 = 23;
 
+/// The compiler's refusal of a jump out of an `except*` block.
+const EXCEPT_STAR_JUMP: &str = "'break', 'continue' and 'return' cannot appear in an except* block";
+
 /// What pegen raises when its rules nest past [`MAXSTACK`] or the native stack
 /// runs low — `_Pypegen_stack_overflow`'s `MemoryError`, verified against
 /// `python3 -c "exec('-'*100000+'1')"`.
@@ -638,6 +641,10 @@ struct Parser {
     /// `continue` need. A `class` body starts both afresh.
     in_function: bool,
     loop_depth: u32,
+    /// Inside an `except*` block: the loop depth it was entered at, so a `break` or
+    /// `continue` is refused unless a loop opened since. `None` outside one, and
+    /// in a `def` or `class` nested in one.
+    except_star: Option<u32>,
     /// How many `def`/`class` bodies enclose the statements being read.
     nesting: u32,
     /// The first `'return' outside function` / `'break' outside loop` /
@@ -689,6 +696,7 @@ impl Parser {
             yield_at: None,
             in_function: false,
             loop_depth: 0,
+            except_star: None,
             nesting: 0,
             misplaced: None,
             groups: std::collections::HashMap::new(),
@@ -1114,6 +1122,77 @@ impl Parser {
         Err(self.err_span(&msg, a_start, b_end))
     }
 
+    /// `[*a for a in b]`: a starred item cannot be a comprehension's element.
+    fn starred_comprehension_item(
+        &self,
+        item: &Expr,
+        from: usize,
+        to: usize,
+    ) -> Result<(), String> {
+        match unspan(item) {
+            Expr::Starred(_) => Err(self.err_span(
+                "iterable unpacking cannot be used in comprehension",
+                from,
+                to,
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// Record a compile-time error over tokens `from..=to` (the first one wins),
+    /// reported once the whole file has parsed, as CPython's compiler does.
+    fn note_compile_error(&mut self, msg: &str, from: usize, to: usize) {
+        if self.misplaced.is_none() {
+            let e = self.compiler_err_span(msg, from, to);
+            self.misplaced = Some(format!("{e}{SYNTAX_FIELD}nosrc=1"));
+        }
+    }
+
+    /// The last token of the statement just read that is not layout.
+    fn last_real_token(&self) -> usize {
+        (0..self.pos)
+            .rev()
+            .find(|&i| !matches!(self.toks[i].tok, Tok::Newline | Tok::Indent | Tok::Dedent))
+            .unwrap_or(0)
+    }
+
+    /// The starred-target rules CPython's compiler enforces on an assignment
+    /// target spanning tokens `a..=b`: at most one `*` per tuple or list, and a
+    /// `*` only inside one. `top` is whether `e` is the whole target.
+    fn note_star_targets(&mut self, e: &Expr, a: usize, b: usize, top: bool) {
+        if matches!(self.groups.get(&a), Some(&(close, _, _)) if close == b) {
+            return self.note_star_targets(e, a + 1, b - 1, top);
+        }
+        match unspan(e) {
+            Expr::Starred(inner) => {
+                if top {
+                    self.note_compile_error(
+                        "starred assignment target must be in a list or tuple",
+                        a,
+                        b,
+                    );
+                } else {
+                    self.note_star_targets(inner, a + 1, b, true);
+                }
+            }
+            Expr::Tuple(items) | Expr::List(items) => {
+                let (ia, ib) = self.strip_brackets(a, b);
+                let parts = self.split_commas(ia, ib);
+                let stars = items
+                    .iter()
+                    .filter(|i| matches!(unspan(i), Expr::Starred(_)))
+                    .count();
+                if stars > 1 {
+                    self.note_compile_error("multiple starred expressions in assignment", a, b);
+                }
+                for (item, (x, y)) in items.iter().zip(parts) {
+                    self.note_star_targets(item, x, y, false);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// CPython's `invalid_assignment` / `invalid_named_expression`: the first
     /// target, left to right, that is not a name, attribute, subscript or a
     /// list/tuple/star of those. A lone `target = value` whose target is an
@@ -1298,6 +1377,7 @@ impl Parser {
     ) -> Result<(), String> {
         let invalid = self.invalid_target(target, start, self.pos - 1);
         if self.at_kw("in") && invalid.is_none() {
+            self.note_star_targets(target, start, self.pos - 1, true);
             return Ok(());
         }
         if comprehension {
@@ -1368,13 +1448,16 @@ impl Parser {
     /// A `with` item's `as` target that cannot be assigned to — CPython's
     /// `invalid_with_item`, which applies when the target is followed by `,`,
     /// `)` or `:` — positioned on the part that cannot be.
-    fn check_with_target(&self, target: &Expr, start: usize) -> Result<(), String> {
+    fn check_with_target(&mut self, target: &Expr, start: usize) -> Result<(), String> {
         if !(self.at_op(",") || self.at_op(")") || self.at_op(":")) {
             return Ok(());
         }
         match self.invalid_target(target, start, self.pos - 1) {
             Some((what, (a, b))) => Err(self.err_span(&format!("cannot assign to {what}"), a, b)),
-            None => Ok(()),
+            None => {
+                self.note_star_targets(target, start, self.pos - 1, true);
+                Ok(())
+            }
         }
     }
 
@@ -1476,13 +1559,13 @@ impl Parser {
         line: u32,
         function: bool,
     ) -> Result<Vec<Stmt>, String> {
-        let saved = (self.in_function, self.loop_depth);
+        let saved = (self.in_function, self.loop_depth, self.except_star.take());
         self.in_function = function;
         self.loop_depth = 0;
         self.nesting += 1;
         let body = self.parse_suite(desc, line);
         self.nesting -= 1;
-        (self.in_function, self.loop_depth) = saved;
+        (self.in_function, self.loop_depth, self.except_star) = saved;
         body
     }
 
@@ -1658,7 +1741,9 @@ impl Parser {
                 "break" => {
                     let start = self.pos;
                     self.advance();
-                    if self.loop_depth == 0 {
+                    if self.except_star == Some(self.loop_depth) {
+                        self.note_compile_error(EXCEPT_STAR_JUMP, start, start);
+                    } else if self.loop_depth == 0 {
                         self.note_misplaced("'break' outside loop", start);
                     }
                     out.push(self.spanned_stmt(StmtKind::Break, line, start));
@@ -1667,7 +1752,9 @@ impl Parser {
                 "continue" => {
                     let start = self.pos;
                     self.advance();
-                    if self.loop_depth == 0 {
+                    if self.except_star == Some(self.loop_depth) {
+                        self.note_compile_error(EXCEPT_STAR_JUMP, start, start);
+                    } else if self.loop_depth == 0 {
                         self.note_misplaced("'continue' not properly in loop", start);
                     }
                     out.push(self.spanned_stmt(StmtKind::Continue, line, start));
@@ -1684,7 +1771,9 @@ impl Parser {
                         } else {
                             Some(self.under(stmt, Self::parse_exprlist)?)
                         };
-                    if !self.in_function {
+                    if self.except_star.is_some() {
+                        self.note_compile_error(EXCEPT_STAR_JUMP, start, self.pos - 1);
+                    } else if !self.in_function {
                         self.note_misplaced("'return' outside function", start);
                     }
                     out.push(self.spanned_stmt(StmtKind::Return(v), line, start));
@@ -1698,7 +1787,28 @@ impl Parser {
                     // and its `_raw`: each target is a primary read as a
                     // target, the first at `del_stmt` + 5 and the rest under
                     // the gather's loop.
-                    let targets = self.parse_target_list(stmt + 5)?;
+                    let targets = match self.parse_target_list(stmt + 5) {
+                        Ok(t) => t,
+                        // `invalid_del_stmt`: read as expressions, a `*` item is
+                        // what cannot be deleted.
+                        Err(e) => {
+                            let items = self.reparse(start, |p| p.parse_exprlist());
+                            if let Some((Expr::Tuple(es), end)) = &items {
+                                let parts = self.split_commas(start, *end);
+                                if let Some((_, (a, b))) = es
+                                    .iter()
+                                    .zip(parts)
+                                    .find(|(x, _)| matches!(unspan(x), Expr::Starred(_)))
+                                {
+                                    return Err(self.err_span("cannot delete starred", a, b));
+                                }
+                            }
+                            if let Some((Expr::Starred(_), end)) = items {
+                                return Err(self.err_span("cannot delete starred", start, end));
+                            }
+                            return Err(e);
+                        }
+                    };
                     let items = self.split_commas(start, self.pos - 1);
                     for (t, (a, b)) in targets.iter().zip(items) {
                         if let Some((what, (a, b))) = self.invalid_target(t, a, b) {
@@ -1919,6 +2029,15 @@ impl Parser {
                 value = Some(e);
             }
             self.check_assign_targets(&targets, &spans)?;
+            for (t, &(a, b)) in targets.iter().zip(&spans) {
+                self.note_star_targets(t, a, b, true);
+            }
+            // A bare `*x` on the right is not a tuple: nothing collects it.
+            if let (Some(v), Some(&(a, b))) = (value.as_ref(), spans.last()) {
+                if matches!(unspan(v), Expr::Starred(_)) {
+                    self.note_compile_error("can't use starred expression here", a, b);
+                }
+            }
             // A tuple/list target raises on a wrong item count, and CPython
             // carets the whole target (`a, b = [1]` → `^^^^`). Parenthesized
             // ones already carry a span; a bare `a, b` gets its token extent.
@@ -1939,6 +2058,9 @@ impl Parser {
                 line,
             ));
             return Ok(());
+        }
+        if matches!(unspan(&first), Expr::Starred(_)) {
+            self.note_compile_error("can't use starred expression here", first_start, first_end);
         }
         out.push(Stmt::new(StmtKind::Expr(first), line));
         Ok(())
@@ -2408,7 +2530,16 @@ impl Parser {
                     check_dup(self, &star_name, name_at);
                     if close == ")" && self.at_op(":") {
                         self.advance();
-                        let ann = self.under(annotation_level, Self::parse_expr)?;
+                        // PEP 646: `*args: *Ts` annotates with `(*Ts,)[0]`.
+                        let ann = if self.eat_op("*") {
+                            let inner = self.under(annotation_level, Self::parse_expr)?;
+                            Expr::Subscript(
+                                Box::new(Expr::Tuple(vec![Expr::Starred(Box::new(inner))])),
+                                Box::new(Expr::Int(0)),
+                            )
+                        } else {
+                            self.under(annotation_level, Self::parse_expr)?
+                        };
                         p.annotations.push((star_name.clone(), ann));
                     }
                     p.star = Some(star_name);
@@ -2566,9 +2697,15 @@ impl Parser {
         self.advance();
         let body = self.parse_suite("'try' statement", line)?;
         let mut handlers = Vec::new();
+        // The latest handler as `(is bare, first token, last token)`.
+        let mut bare_handler: Option<(bool, usize, usize)> = None;
         while self.at_kw("except") {
             let except_line = self.line();
             let except_tok = self.pos;
+            // A bare `except:` catches everything, so no handler may follow it.
+            if let Some((true, from, to)) = bare_handler {
+                self.note_compile_error("default 'except:' must be last", from, to);
+            }
             self.advance();
             let star_tok = self.pos;
             let star = self.eat_op("*");
@@ -2627,9 +2764,16 @@ impl Parser {
                     to,
                 ));
             }
+            let outer = self.except_star;
+            if star {
+                self.except_star = Some(self.loop_depth);
+            }
             let hbody = self.under(handler, |p| {
                 p.parse_suite("'except' statement", except_line)
-            })?;
+            });
+            self.except_star = outer;
+            let hbody = hbody?;
+            bare_handler = Some((typ.is_none(), except_tok, self.last_real_token()));
             handlers.push(ExceptHandler {
                 typ,
                 name,
@@ -2896,22 +3040,48 @@ impl Parser {
 
     fn try_literal_pattern(&mut self) -> Result<Option<Pattern>, String> {
         let start = self.pos;
-        // Signed numbers, strings, True/False/None.
-        if self.at_op("-") {
-            self.advance();
-            let e = self.parse_atom()?;
-            let neg = Expr::UnaryOp(UnOp::Neg, Box::new(e));
-            return Ok(Some(self.pattern(PatternKind::Value(neg), start)));
+        // `signed_number`, or `signed_real_number ('+' | '-') imaginary_number`.
+        let is_number = |t: &Tok| {
+            matches!(
+                t,
+                Tok::Int(_) | Tok::BigInt(_) | Tok::Float(_) | Tok::Complex(_)
+            )
+        };
+        if self.at_op("-") || is_number(self.cur()) {
+            let negative = self.eat_op("-");
+            if !is_number(self.cur()) {
+                return Err(self.err_here("invalid syntax"));
+            }
+            let mut e = self.parse_atom()?;
+            if negative {
+                e = Expr::UnaryOp(UnOp::Neg, Box::new(e));
+            }
+            if self.at_op("+") || self.at_op("-") {
+                let op = if self.at_op("+") {
+                    BinOp::Add
+                } else {
+                    BinOp::Sub
+                };
+                self.advance();
+                if !matches!(self.cur(), Tok::Complex(_)) {
+                    return Err(self.err_here("imaginary number required in complex literal"));
+                }
+                let imag = self.parse_atom()?;
+                e = Expr::BinOp(op, Box::new(e), Box::new(imag));
+            }
+            return Ok(Some(self.pattern(PatternKind::Value(e), start)));
+        }
+        if matches!(self.cur(), Tok::FString(..) | Tok::TString(..)) {
+            let at = self.pos;
+            self.parse_atom()?;
+            return Err(self.err_span(
+                "patterns may only match literals and attribute lookups",
+                at,
+                self.pos - 1,
+            ));
         }
         let lit = match self.cur().clone() {
-            Tok::Int(_)
-            | Tok::BigInt(_)
-            | Tok::Float(_)
-            | Tok::Complex(_)
-            | Tok::Str(_)
-            | Tok::FString(_, _)
-            | Tok::TString(_, _)
-            | Tok::Bytes(_) => Some(self.parse_atom()?),
+            Tok::Str(_) | Tok::Bytes(_) => Some(self.parse_atom()?),
             Tok::Name(n) if n == "None" || n == "True" || n == "False" => Some(self.parse_atom()?),
             _ => None,
         };
@@ -2932,10 +3102,19 @@ impl Parser {
     }
 
     /// A sequence pattern over tokens `start` to the last one read.
-    fn sequence_pattern(&self, elems: Vec<Pattern>, start: usize) -> Pattern {
-        let star = elems
+    fn sequence_pattern(&mut self, elems: Vec<Pattern>, start: usize) -> Pattern {
+        let mut stars = elems
             .iter()
-            .position(|p| matches!(p.kind, PatternKind::Star(_)));
+            .enumerate()
+            .filter(|(_, p)| matches!(p.kind, PatternKind::Star(_)));
+        let star = stars.next().map(|(i, _)| i);
+        if stars.next().is_some() {
+            self.note_compile_error(
+                "multiple starred names in sequence pattern",
+                start,
+                self.pos - 1,
+            );
+        }
         self.pattern(PatternKind::Sequence { elems, star }, start)
     }
 
@@ -3129,6 +3308,13 @@ impl Parser {
         self.names_after_import()?;
         let mut names = Vec::new();
         if self.eat_op("*") {
+            if self.nesting > 0 {
+                self.note_compile_error(
+                    "import * only allowed at module level",
+                    self.pos - 1,
+                    self.pos - 1,
+                );
+            }
             names.push(Alias {
                 name: "*".into(),
                 asname: None,
@@ -3773,6 +3959,9 @@ impl Parser {
             let first = args.is_empty() && keywords.is_empty();
             if self.eat_op("*") {
                 order.star().map_err(|e| self.star_error_span(e))?;
+                if self.at_op(")") {
+                    return Err(self.err_here("Invalid star expression"));
+                }
                 let level = match kwargs {
                     Some(_) => kwarg_level(&mut kwargs, true),
                     None if first => raw + 5,
@@ -3856,6 +4045,10 @@ impl Parser {
     fn parse_subscript(&mut self) -> Result<Expr, String> {
         let raw = self.level;
         let parse_one = |p: &mut Self, slice: u32| -> Result<Expr, String> {
+            // PEP 646: `a[*b]` and `a[1, *b]` unpack into the index tuple.
+            if p.eat_op("*") {
+                return Ok(Expr::Starred(Box::new(p.under(slice, Self::parse_expr)?)));
+            }
             let lo_start = p.pos;
             // A missing bound is still an `expression` pegen tried.
             let lo = if p.at_op(":") {
@@ -3900,6 +4093,9 @@ impl Parser {
                 items.push(parse_one(self, raw + 5)?);
             }
             Ok(Expr::Tuple(items))
+        } else if matches!(first, Expr::Starred(_)) {
+            // `a[*b]` indexes with the one-item tuple `(*b,)`.
+            Ok(Expr::Tuple(vec![first]))
         } else {
             Ok(first)
         }
@@ -4354,16 +4550,19 @@ impl Parser {
         // column it has in the source: spans and positions in it are then true
         // ones, and a runtime error in the expression carets the right place.
         let lead = expr0.chars().count() - expr0.trim_start().chars().count();
+        // A comment in the expression runs to its line's end, so the closing
+        // parenthesis goes on a line of its own.
+        let close = if expr_src.contains('#') { "\n)" } else { ")" };
         let padded = match origin {
             Some(o) => {
                 let (line, col) = o.locate(lead);
                 format!(
-                    "{}({}{expr_src})",
+                    "{}({}{expr_src}{close}",
                     "\n".repeat(line as usize - 1),
                     " ".repeat(col as usize - 1)
                 )
             }
-            None => format!("({expr_src})"),
+            None => format!("({expr_src}{close}"),
         };
         let sub = parse_source(&padded, self.level.saturating_sub(7))
             .map_err(|e| fstring_sub_error(e, origin, lead, expr_src.chars().count()))?;
@@ -4427,9 +4626,11 @@ impl Parser {
             self.yield_at = Some((self.pos, atom + 4));
         }
         let first = self.under(atom + 4, Self::parse_star_named)?;
+        let first_end = self.pos - 1;
         if self.at_comp_for() {
             // The `genexp` rule, under the group.
             let comps = self.under(atom + 2, Self::parse_comprehension_clauses)?;
+            self.starred_comprehension_item(&first, start, first_end)?;
             self.expect_op(")")?;
             return Ok(Expr::GenExp(Box::new(first), comps));
         }
@@ -4471,9 +4672,11 @@ impl Parser {
         }
         let start = self.pos;
         let first = self.under(atom + 5, Self::parse_star_named)?;
+        let first_end = self.pos - 1;
         if self.at_comp_for() {
             // The `listcomp` rule, under the group.
             let comps = self.under(atom + 2, Self::parse_comprehension_clauses)?;
+            self.starred_comprehension_item(&first, start, first_end)?;
             self.expect_op("]")?;
             // Its extent locates the symbol table's errors.
             return Ok(self.span_lines_from(Expr::ListComp(Box::new(first), comps), open));
@@ -4525,7 +4728,18 @@ impl Parser {
         }
         // `**mapping` spread implies dict.
         if self.eat_op("**") {
+            let star = self.pos - 1;
             let v = self.under(atom + 5, Self::parse_expr)?;
+            if self.at_comp_for() {
+                self.under(atom + 2, Self::parse_comprehension_clauses)?;
+                if self.at_op("}") {
+                    return Err(self.err_span(
+                        "dict unpacking cannot be used in dict comprehension",
+                        star,
+                        star,
+                    ));
+                }
+            }
             let mut pairs = vec![(None, v)];
             while self.eat_op(",") {
                 if self.at_op("}") {
@@ -4544,6 +4758,7 @@ impl Parser {
         }
         let first_start = self.pos;
         let first = self.under(atom + 5, Self::parse_star_named)?;
+        let first_end = self.pos - 1;
         if self.at_op(":") {
             // dict
             self.advance();
@@ -4586,6 +4801,7 @@ impl Parser {
         } else if self.at_comp_for() {
             // The `setcomp` rule, under the group.
             let comps = self.under(atom + 2, Self::parse_comprehension_clauses)?;
+            self.starred_comprehension_item(&first, first_start, first_end)?;
             self.expect_op("}")?;
             Ok(Expr::SetComp(Box::new(first), comps))
         } else {
@@ -4782,6 +4998,12 @@ fn fstring_field_end(chars: &[char], start: usize) -> Option<usize> {
             i = skip_string_literal(chars, i)?;
             continue;
         }
+        if !in_spec && c == '#' {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
         match c {
             '(' | '[' if !in_spec => depth += 1,
             ')' | ']' if !in_spec => depth -= 1,
@@ -4813,6 +5035,12 @@ fn fstring_field_marks(chars: &[char]) -> (Option<usize>, Option<usize>) {
                 }
                 None => break,
             }
+        }
+        if c == '#' {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
         }
         match c {
             '(' | '[' | '{' => depth += 1,
