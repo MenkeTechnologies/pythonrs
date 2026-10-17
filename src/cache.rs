@@ -224,25 +224,6 @@ struct CProg {
     positions: Vec<(u64, Vec<Span>)>,
 }
 
-/// Recompute a chunk's `op_hash` exactly as `fusevm::ChunkBuilder::build` does
-/// (a `DefaultHasher` over ops then constants, then `true` when the chunk sets
-/// `nan_result_hook`). `op_hash` is `#[serde(skip)]`, so
-/// a deserialized chunk carries `0`; restoring it (from the pre-rebase cached
-/// ops, which match the compile-time hash) lets caret lookups by `op_hash` hit.
-fn restore_op_hash(chunk: &mut Chunk) {
-    use std::collections::hash_map::DefaultHasher;
-    let mut h = DefaultHasher::new();
-    chunk.ops.hash(&mut h);
-    chunk.constants.hash(&mut h);
-    if chunk.nan_result_hook {
-        true.hash(&mut h);
-    }
-    chunk.op_hash = h.finish();
-    for sub in &mut chunk.sub_chunks {
-        restore_op_hash(sub);
-    }
-}
-
 /// The release this binary was built as. It is hashed into every cache key
 /// alongside [`SCHEMA`], so a shard written by one release can never be read by
 /// another.
@@ -472,32 +453,9 @@ pub fn load(src: &str) -> Option<Program> {
         .iter()
         .find(|e| e.key == key && e.verify == verify)?;
     let (off, len) = (entry.off.value() as usize, entry.len.value() as usize);
-    let mut cp: CProg = bincode::deserialize(blobs.get(off..off.checked_add(len)?)?).ok()?;
-    // Restore each chunk's serde-skipped `op_hash` so runtime caret lookups match
-    // the cached position tables' keys.
-    restore_op_hash(&mut cp.main);
-    for (_, f) in &mut cp.functions {
-        restore_op_hash(&mut f.chunk);
-    }
-    // `try` bodies/handlers/else/finally run as their own chunks (in `tries`, not
-    // `main.sub_chunks`), so their `op_hash` must be restored too or a caret for
-    // an error inside a `try` block would be lost on a cache hit.
-    for t in &mut cp.tries {
-        restore_op_hash(&mut t.body);
-        for h in &mut t.handlers {
-            let (typ, handler) = (&mut h.typ, &mut h.body);
-            if let Some(typ) = typ {
-                restore_op_hash(typ);
-            }
-            restore_op_hash(handler);
-        }
-        if let Some(e) = &mut t.orelse {
-            restore_op_hash(e);
-        }
-        if let Some(f) = &mut t.finalbody {
-            restore_op_hash(f);
-        }
-    }
+    // Deserializing a `Chunk` recomputes its `op_hash` (fusevm's `ChunkWire`),
+    // so every chunk comes back keyed as the cached position tables are.
+    let cp: CProg = bincode::deserialize(blobs.get(off..off.checked_add(len)?)?).ok()?;
     Some(Program {
         main: cp.main,
         functions: cp.functions,
@@ -827,21 +785,20 @@ mod tests {
     }
 
     /// A cached chunk's caret table is keyed by the `op_hash` the compiler
-    /// registered, which `ChunkBuilder::build` computes; `restore_op_hash` must
+    /// registered, which `ChunkBuilder::build` computes; deserializing must
     /// reproduce it for every chunk the compiler emits, flagged or not, or every
-    /// traceback after a cache hit loses its carets.
+    /// traceback after a cache hit loses its carets. fusevm recomputes it on the
+    /// way in, so a cache read has nothing to restore.
     #[test]
-    fn restored_op_hash_matches_the_built_one() {
+    fn a_cached_chunk_keeps_its_built_op_hash() {
         for nan_hook in [false, true] {
             let mut b = fusevm::ChunkBuilder::new();
             b.set_nan_result_hook(nan_hook);
             b.emit(fusevm::Op::LoadInt(7), 1);
             b.emit(fusevm::Op::Return, 1);
             let built = b.build();
-            let mut cached: Chunk =
+            let cached: Chunk =
                 bincode::deserialize(&bincode::serialize(&built).unwrap()).unwrap();
-            assert_eq!(cached.op_hash, 0, "serde skips op_hash");
-            restore_op_hash(&mut cached);
             assert_eq!(
                 cached.op_hash, built.op_hash,
                 "nan_result_hook = {nan_hook}"

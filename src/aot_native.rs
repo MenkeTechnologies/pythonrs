@@ -21,22 +21,6 @@ use fusevm::{Chunk, VM};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// Recompute a chunk's `op_hash` the way `fusevm::ChunkBuilder::build` does (a
-/// `DefaultHasher` over ops then constants). `op_hash` is `#[serde(skip)]`, so a
-/// bincode-deserialized AOT chunk carries `0`; restoring it (the pre-rebase ops
-/// match the compile-time hash) lets caret lookups by `op_hash` hit.
-fn restore_op_hash(chunk: &mut Chunk) {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    chunk.ops.hash(&mut h);
-    chunk.constants.hash(&mut h);
-    chunk.op_hash = h.finish();
-    for sub in &mut chunk.sub_chunks {
-        restore_op_hash(sub);
-    }
-}
-
 /// Marker prefix for the embedded program image in `chunk.names`.
 const PROG_IMAGE_TAG: &str = "\u{1}pythonrs-prog-image:";
 
@@ -170,7 +154,7 @@ pub unsafe extern "C" fn fusevm_aot_register_builtins(vm: *mut VM) {
         .filter_map(|n| n.strip_prefix(PROG_IMAGE_TAG))
         .filter_map(|j| serde_json::from_str(j).ok())
         .collect();
-    for mut img in images {
+    for img in images {
         // Restore the source/filename so a traceback shows its `File`/source
         // lines, register the caret position tables, then install the
         // function/try tables the main chunk calls into.
@@ -188,27 +172,6 @@ pub unsafe extern "C" fn fusevm_aot_register_builtins(vm: *mut VM) {
         );
         for (op_hash, table) in img.positions {
             host::register_positions(op_hash, table);
-        }
-        // Function/try bodies deserialize with `op_hash == 0` (serde-skipped); the
-        // caret registry is keyed by the real hash, so restore it on each.
-        for f in &mut img.functions {
-            restore_op_hash(&mut f.chunk);
-        }
-        for t in &mut img.tries {
-            restore_op_hash(&mut t.body);
-            for h in &mut t.handlers {
-                let (typ, handler) = (&mut h.typ, &mut h.body);
-                if let Some(typ) = typ {
-                    restore_op_hash(typ);
-                }
-                restore_op_hash(handler);
-            }
-            if let Some(e) = &mut t.orelse {
-                restore_op_hash(e);
-            }
-            if let Some(fb) = &mut t.finalbody {
-                restore_op_hash(fb);
-            }
         }
         host::with_host(|h| h.load_program(img.functions, img.tries));
     }
@@ -231,7 +194,7 @@ pub extern "C" fn pythonrs_aot_run_embedded() -> i64 {
         static fusevm_aot_chunk_len: u64;
         fn fusevm_aot_entry(vm: *mut VM) -> i64;
     }
-    let mut chunk: Chunk = unsafe {
+    let chunk: Chunk = unsafe {
         let len = fusevm_aot_chunk_len as usize;
         let bytes = std::slice::from_raw_parts(&fusevm_aot_chunk_blob as *const u8, len);
         // The blob is fusevm's chunk-format tag followed by the bincode chunk
@@ -253,9 +216,6 @@ pub extern "C" fn pythonrs_aot_run_embedded() -> i64 {
             }
         }
     };
-    // The deserialized main chunk lost its `op_hash` (serde-skipped); restore it so
-    // an error's caret span is found in the registered position table.
-    restore_op_hash(&mut chunk);
     let mut vm = VM::new(chunk);
     // SAFETY: pointer is valid for the call; the hook borrows it exclusively.
     unsafe { fusevm_aot_register_builtins(&mut vm as *mut VM) };
