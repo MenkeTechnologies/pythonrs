@@ -320,6 +320,11 @@ pub struct FuncDef {
     /// chunk. A VM whose chunk has this hash holds the copy at that entry.
     #[serde(skip)]
     pub unit: u64,
+    /// A method that reads `__class__`, itself or in a function nested in it:
+    /// its call binds `__class__` to the class that defines it, which is
+    /// CPython's implicit `__class__` cell.
+    #[serde(default)]
+    pub binds_class_cell: bool,
 }
 
 impl FuncDef {
@@ -362,6 +367,7 @@ impl FuncDef {
             params_in_slots: self.params_in_slots,
             linked: self.linked,
             unit: self.unit,
+            binds_class_cell: self.binds_class_cell,
         }
     }
 }
@@ -18356,6 +18362,7 @@ pub fn run_user_func(
     let env = new_env(fv.env.clone());
     let slots = bind_call(fv, &def, &env, pos, kwargs)?;
     let owner = owner_opt.or_else(|| fv.owner.clone());
+    bind_class_cell(&def, fv, &owner, &env);
     // `async def`: calling it returns a coroutine object (or, if the body
     // contains `yield`, an async generator); the body runs only when the event
     // loop drives it (CPython does not execute it eagerly). The generator/
@@ -18555,6 +18562,7 @@ pub fn enter_linked(
     let (_, frame_self, pos) = call_receiver(&fv, &def, self_opt, args);
     let slots = bind_call(&fv, &def, &env, pos, kwargs)?;
     let owner = owner_opt.or_else(|| fv.owner.clone());
+    bind_class_cell(&def, &fv, &owner, &env);
     let entered = with_host(|h| {
         if h.frames.len() >= RECURSION_LIMIT {
             return false;
@@ -18624,6 +18632,20 @@ fn join_names(names: &[String]) -> String {
             let head: Vec<String> = names[..n - 1].iter().map(|s| format!("'{s}'")).collect();
             format!("{}, and '{}'", head.join(", "), names[n - 1])
         }
+    }
+}
+
+/// Bind `__class__` in the call environment `env` of a method that reads it
+/// (`FuncDef::binds_class_cell`): the class that defines the method — the one
+/// its function was tagged with when that class was built — else the class the
+/// call found it on.
+fn bind_class_cell(def: &FuncDef, fv: &FuncVal, owner: &Option<String>, env: &Env) {
+    if !def.binds_class_cell {
+        return;
+    }
+    if let Some(class) = fv.owner.clone().or_else(|| owner.clone()) {
+        let class = with_host(|h| h.class_or_builtin_type(class));
+        env.borrow_mut().vars.bind("__class__", class);
     }
 }
 

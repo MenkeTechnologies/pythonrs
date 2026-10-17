@@ -178,7 +178,9 @@ use std::path::PathBuf;
 /// (`FuncDef::linked`, a new field), reached by a jump over them.
 /// v61: a slot-safe function reads a name it neither slots nor closes over
 /// with `GETGLOBAL`.
-const SCHEMA: u64 = 61;
+/// v62: a method that reads `__class__` is marked (`FuncDef::binds_class_cell`,
+/// a new field) and the read walks the environment.
+const SCHEMA: u64 = 62;
 
 /// The shard's INDEX: everything a lookup needs, and nothing it does not.
 ///

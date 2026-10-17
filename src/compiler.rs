@@ -301,6 +301,14 @@ pub struct Compiler {
     /// that scope sits directly in a class body and so reads the class
     /// namespace (`FuncDef::sees_class_scope`) before the globals.
     next_sees_class_scope: bool,
+    /// Inside a function nested (at any depth) in a class body, with no class
+    /// body in between: where a read of `__class__` names the class being
+    /// defined (CPython's implicit `__class__` cell).
+    in_method_scope: bool,
+    /// Whether the method being compiled — the function directly in a class
+    /// body — or a function nested in it reads `__class__`, so its calls bind
+    /// it (`FuncDef::binds_class_cell`).
+    method_reads_class: bool,
 }
 
 /// The kind of scope a hidden function represents, controlling whether it is a
@@ -2673,6 +2681,17 @@ impl Compiler {
         // nested def/class resets the flag so its own annotations don't leak into
         // the enclosing class's dict.
         let saved_icb = self.in_class_body;
+        let is_method = kind == ScopeKind::Function && saved_icb;
+        let in_method_scope = match kind {
+            ScopeKind::ClassBody => false,
+            _ => is_method || self.in_method_scope,
+        };
+        let saved_ims = std::mem::replace(&mut self.in_method_scope, in_method_scope);
+        let saved_mrc = if is_method {
+            std::mem::replace(&mut self.method_reads_class, false)
+        } else {
+            self.method_reads_class
+        };
         let saved_fs = self.def_depth;
         self.def_depth = match kind {
             ScopeKind::ClassBody => 0,
@@ -2716,6 +2735,11 @@ impl Compiler {
         self.names_global = saved_names_global;
         self.fn_slots_bound = saved_bound;
         self.in_class_body = saved_icb;
+        self.in_method_scope = saved_ims;
+        let binds_class_cell = is_method && self.method_reads_class;
+        if is_method {
+            self.method_reads_class = saved_mrc;
+        }
         self.def_depth = saved_fs;
         self.await_scope = saved_aw;
         self.async_generator = saved_ag;
@@ -2748,6 +2772,7 @@ impl Compiler {
             params_in_slots,
             linked: None,
             unit: 0,
+            binds_class_cell,
         };
         self.functions.push((name.to_string(), def));
         if slot_safe {
@@ -3224,11 +3249,16 @@ impl Compiler {
                     }
                 } else {
                     self.name_const(b, n);
+                    let class_cell = n == "__class__" && self.in_method_scope;
+                    if class_cell {
+                        self.method_reads_class = true;
+                    }
                     let op = if self.cur_freevars.contains(n) {
                         ops::GETFREE
-                    } else if self.names_global && !n.starts_with('.') {
+                    } else if self.names_global && !class_cell && !n.starts_with('.') {
                         // A `.`-named compiler temporary lives in the call
-                        // environment, never in the module.
+                        // environment, never in the module, and so does the
+                        // `__class__` a method's call binds.
                         ops::GETGLOBAL
                     } else {
                         ops::GETLOCAL

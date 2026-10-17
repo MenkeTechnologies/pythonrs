@@ -143,3 +143,52 @@ x = (C.tag, C.__mro__[1].__name__)
 ";
     assert_eq!(g(src, "x"), "('real', 'Base')");
 }
+
+/// `__class__` inside a class names the class whose body defines the method
+/// reading it (CPython's implicit cell): in the method itself, in a closure
+/// nested in it, in a class- or staticmethod and a generator method, and in a
+/// subclass's override alongside zero-argument `super()`. A function attached
+/// to a class afterwards, and the class body itself, have no such cell.
+#[test]
+fn dunder_class_names_the_defining_class() {
+    let src = "\
+class A:
+    def m(self):
+        return __class__
+    def nested(self):
+        def inner():
+            return __class__
+        return inner()
+    @classmethod
+    def c(cls):
+        return __class__
+    @staticmethod
+    def s():
+        return __class__
+    def gen(self):
+        yield __class__
+class B(A):
+    def m(self):
+        return (__class__, super().m())
+def free(self):
+    return __class__
+A.f = free
+errs = []
+try:
+    A().f()
+except NameError as e:
+    errs.append(str(e))
+try:
+    class C:
+        x = __class__
+except NameError as e:
+    errs.append(str(e))
+x = (A().m() is A, A().nested() is A, A.c() is A, A.s() is A, next(A().gen()) is A,
+     B().m()[0] is B, B().m()[1] is A, B().nested() is A, errs)
+";
+    assert_eq!(
+        g(src, "x"),
+        "(True, True, True, True, True, True, True, True, \
+         [\"name '__class__' is not defined\", \"name '__class__' is not defined\"])"
+    );
+}
