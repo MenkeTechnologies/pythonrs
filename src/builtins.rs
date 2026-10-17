@@ -3820,6 +3820,20 @@ fn b_inplace(vm: &mut VM, _: u8) -> Value {
         Value::Int(n) => n,
         _ => return abort(vm, "internal: INPLACE tag".into()),
     };
+    // 0. `+=`/`-=`/`*=` on two native ints is the plain arithmetic: an `int`
+    // has no in-place dunder and is never a container. A result outside `i64`
+    // falls through to the bignum the binary fallback promotes it to.
+    if let (Value::Int(x), Value::Int(y)) = (&a, &b) {
+        let r = match tag {
+            host::iop::ADD => x.checked_add(*y),
+            host::iop::SUB => x.checked_sub(*y),
+            host::iop::MUL => x.checked_mul(*y),
+            _ => None,
+        };
+        if let Some(r) = r {
+            return Value::Int(r);
+        }
+    }
     // 1. A user instance's in-place dunder wins; `NotImplemented` falls back.
     if let Some(iname) = iop_dunder(tag) {
         if with_host(|h| is_instance_with(h, &a, iname)) {

@@ -4375,13 +4375,17 @@ impl PyHost {
                 return self.globals().get(name).cloned();
             }
         }
-        let mut env = {
-            let e = self.frame().env.borrow();
-            if let Some(v) = e.vars.get(name) {
-                return Some(v.clone());
-            }
-            e.parent.clone()
-        };
+        if let Some(v) = self.frame().env.borrow().vars.get(name) {
+            return Some(v.clone());
+        }
+        self.read_name_outer(name)
+    }
+
+    /// [`Self::read_name`] past the innermost environment: the enclosing
+    /// scopes, then the module. For a caller that has already probed the
+    /// innermost one.
+    fn read_name_outer(&self, name: &str) -> Option<Value> {
+        let mut env = self.frame().env.borrow().parent.clone();
         while let Some(e) = env {
             let b = e.borrow();
             if let Some(v) = b.vars.get(name) {
@@ -4641,6 +4645,11 @@ impl PyHost {
             if f.locals_set.contains(name) {
                 return NameRead::Unbound;
             }
+            // The innermost environment missed just above.
+            return match self.read_name_outer(name) {
+                Some(v) => NameRead::Value(v),
+                None => NameRead::Missing,
+            };
         }
         match self.read_name(name) {
             Some(v) => NameRead::Value(v),
