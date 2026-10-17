@@ -12681,6 +12681,21 @@ impl PyHost {
         })
     }
 
+    /// Whether `name` on an instance of `class` is a plain `__dict__` read
+    /// (or, with `write`, store): the class allows it ([`Self::dict_reads`],
+    /// [`Self::dict_writes`]) and its MRO does not define `name`. Answered
+    /// from one probe of the class's memo once both halves are known.
+    fn dict_attr(&self, class: &str, name: &str, write: bool) -> bool {
+        if let Some(m) = self.class_memo.borrow().get(class) {
+            let allowed = if write { m.dict_writes } else { m.dict_reads };
+            if let (Some(allowed), Some(found)) = (allowed, m.lookups.get(name)) {
+                return allowed && found.is_none();
+            }
+        }
+        let allowed = if write { self.dict_writes(class) } else { self.dict_reads(class) };
+        allowed && !self.class_has(class, name)
+    }
+
     /// One memoized per-class answer: `field` picks it out of the class's
     /// [`ClassMemo`], and `compute` produces it on a miss.
     fn class_fact(
@@ -14981,7 +14996,7 @@ impl PyHost {
         let Some(PyObj::Instance(inst)) = self.get(recv) else {
             return None;
         };
-        if !self.dict_reads(&inst.class) || self.class_has(&inst.class, name) {
+        if !self.dict_attr(&inst.class, name, false) {
             return None;
         }
         self.inst_attr(&inst.dict, name)
@@ -15000,8 +15015,7 @@ impl PyHost {
         let plain = !name.starts_with("__")
             && name != "args"
             && name != "default_factory"
-            && self.dict_writes(&inst.class)
-            && !self.class_has(&inst.class, name)
+            && self.dict_attr(&inst.class, name, true)
             && matches!(self.get(&inst.dict), Some(PyObj::Dict(_)));
         if !plain {
             return Err(val);
