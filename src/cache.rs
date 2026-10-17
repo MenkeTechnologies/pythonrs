@@ -176,7 +176,9 @@ use std::path::PathBuf;
 /// the call binds them into slots (`FuncDef::params_in_slots`, a new field).
 /// v60: the main chunk ends with a copy of each linkable function body
 /// (`FuncDef::linked`, a new field), reached by a jump over them.
-const SCHEMA: u64 = 60;
+/// v61: a slot-safe function reads a name it neither slots nor closes over
+/// with `GETGLOBAL`.
+const SCHEMA: u64 = 61;
 
 /// The shard's INDEX: everything a lookup needs, and nothing it does not.
 ///

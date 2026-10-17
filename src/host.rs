@@ -1901,6 +1901,12 @@ pub struct LruData {
 /// `PYTHONHASHSEED`.
 pub type NameMap = IndexMap<String, Value, rustc_hash::FxBuildHasher>;
 
+/// A set of names, hashed as [`NameMap`] hashes them. A frame holds two (its
+/// `global` and `nonlocal` declarations), almost always empty, and building an
+/// empty std `HashSet` seeds a `RandomState` from thread-local storage on every
+/// Python call; this one costs nothing to build.
+pub type NameSet = std::collections::HashSet<String, rustc_hash::FxBuildHasher>;
+
 /// `sys.int_info.default_max_str_digits` (`_PY_LONG_DEFAULT_MAX_STR_DIGITS`).
 pub const INT_MAX_STR_DIGITS_DEFAULT: usize = 4300;
 /// The smallest nonzero limit `set_int_max_str_digits` accepts
@@ -2151,10 +2157,10 @@ fn new_env(parent: Option<Env>) -> Env {
 /// One function activation.
 pub struct Frame {
     pub env: Env,
-    pub globals_decl: HashSet<String>,
+    pub globals_decl: NameSet,
     /// Names declared `nonlocal` in this frame — writes target the nearest
     /// enclosing function scope that binds the name, not the local env.
-    pub nonlocals_decl: HashSet<String>,
+    pub nonlocals_decl: NameSet,
     /// Names local to this function scope (see `FuncDef::locals`). A read of a
     /// name in this set resolves ONLY in `env`; if absent it is an
     /// `UnboundLocalError`, not an LEGB fall-through. Empty for the module frame
@@ -2488,6 +2494,10 @@ pub struct PyHost {
     /// (`RAISE_VARARGS 0` jumps to `exception_unwind`, past `PyTraceBack_Here`).
     /// Cleared with the traceback when the exception is caught.
     pub tb_skip_frame: Option<usize>,
+    /// Call environments a linked call returned with nothing else holding
+    /// them, emptied and kept for the next one (`take_call_env`), so a call
+    /// does not allocate and free one each time.
+    spare_envs: Vec<Env>,
     /// `str()` lines of uncaught user exceptions with their own `__str__`,
     /// computed before the traceback is rendered (see `user_str_lines`).
     pub user_str_lines: HashMap<u32, String>,
@@ -3099,8 +3109,8 @@ impl PyHost {
             cur_module: 0,
             frames: vec![Frame {
                 env: module_env,
-                globals_decl: HashSet::new(),
-                nonlocals_decl: HashSet::new(),
+                globals_decl: NameSet::default(),
+                nonlocals_decl: NameSet::default(),
                 locals_set: Rc::new(HashSet::new()),
                 is_class_body: false,
                 self_obj: None,
@@ -3149,6 +3159,7 @@ impl PyHost {
             tb_show_source: true,
             traceback: Vec::new(),
             tb_skip_frame: None,
+            spare_envs: Vec::new(),
             user_str_lines: HashMap::new(),
             stdout_target: None,
             stderr_target: None,
@@ -4426,6 +4437,34 @@ impl PyHost {
     /// Callers save the return value and restore it once the run completes, so
     /// nested calls across modules stay isolated.
     #[inline]
+    /// A fresh, empty call environment whose enclosing scope is `parent`: a
+    /// spare one when a returned call left one, else a new one.
+    fn take_call_env(&mut self, parent: Option<Env>) -> Env {
+        match self.spare_envs.pop() {
+            Some(env) => {
+                env.borrow_mut().parent = parent;
+                env
+            }
+            None => new_env(parent),
+        }
+    }
+
+    /// Keep a returned call's environment for [`Self::take_call_env`] when
+    /// nothing else holds it — a closure or a frame object that captured it
+    /// keeps it as it is.
+    fn give_back_call_env(&mut self, env: Env) {
+        const SPARE_ENVS: usize = 64;
+        if Rc::strong_count(&env) != 1 || self.spare_envs.len() >= SPARE_ENVS {
+            return;
+        }
+        {
+            let mut e = env.borrow_mut();
+            e.vars = EnvVars::default();
+            e.parent = None;
+        }
+        self.spare_envs.push(env);
+    }
+
     pub fn swap_module(&mut self, m: usize) -> usize {
         std::mem::replace(&mut self.cur_module, m)
     }
@@ -18314,7 +18353,8 @@ pub fn run_user_func(
     });
     let def_id = fv.def_id;
     let (self_val, frame_self, pos) = call_receiver(fv, &def, self_opt, args);
-    let (env, slots) = bind_call(fv, &def, pos, kwargs)?;
+    let env = new_env(fv.env.clone());
+    let slots = bind_call(fv, &def, &env, pos, kwargs)?;
     let owner = owner_opt.or_else(|| fv.owner.clone());
     // `async def`: calling it returns a coroutine object (or, if the body
     // contains `yield`, an async generator); the body runs only when the event
@@ -18436,8 +18476,8 @@ fn call_frame(
 ) -> Frame {
     Frame {
         env,
-        globals_decl: HashSet::new(),
-        nonlocals_decl: HashSet::new(),
+        globals_decl: NameSet::default(),
+        nonlocals_decl: NameSet::default(),
         locals_set,
         is_class_body: false,
         self_obj,
@@ -18450,24 +18490,46 @@ fn call_frame(
     }
 }
 
-/// `callable`'s function and the entry of its body in the chunk `vm` runs,
-/// when the call can run on `vm` itself: `callable` is a plain function whose
-/// body the compiler linked into this very chunk (see [`FuncDef::linked`]),
-/// and it reads the globals the running code reads.
-pub fn linked_callee(vm: &VM, callable: &Value) -> Option<(Rc<FuncVal>, usize)> {
+/// A function a call can enter on the caller's own VM, with everything the
+/// call reads off the host gathered in the one borrow that found it.
+pub struct LinkedCallee {
+    fv: Rc<FuncVal>,
+    /// Where its linked body starts in the chunk the VM runs.
+    entry: usize,
+    def: Rc<FuncDef>,
+    locals: Rc<HashSet<String>>,
+    name: Rc<str>,
+    /// Its fresh call environment.
+    env: Env,
+}
+
+/// `callable` as a [`LinkedCallee`], when the call can run on `vm` itself:
+/// `callable` is a plain function whose body the compiler linked into this
+/// very chunk (see [`FuncDef::linked`]), and it reads the globals the running
+/// code reads.
+pub fn linked_callee(vm: &VM, callable: &Value) -> Option<LinkedCallee> {
     with_host(|h| {
         let Some(PyObj::Func(fv)) = h.get(callable) else {
             return None;
         };
         let def = &h.funcs[fv.def_id];
-        let entry = def.linked?;
-        (def.unit == vm.chunk.op_hash && fv.module == h.cur_module)
-            .then(|| (fv.clone(), entry as usize))
+        let entry = def.linked? as usize;
+        if def.unit != vm.chunk.op_hash || fv.module != h.cur_module {
+            return None;
+        }
+        Some(LinkedCallee {
+            fv: fv.clone(),
+            entry,
+            def: def.clone(),
+            locals: h.func_locals[fv.def_id].clone(),
+            name: h.func_names[fv.def_id].clone(),
+            env: h.take_call_env(fv.env.clone()),
+        })
     })
 }
 
-/// Call `fv` on `vm` itself: bind its arguments, push its host frame, and push
-/// a fusevm frame that enters its linked body at `entry`.
+/// Call `callee` on `vm` itself: bind its arguments, push its host frame, and
+/// push a fusevm frame that enters its linked body.
 ///
 /// The caller's next op runs once the body returns through
 /// [`return_linked`]. The call op still pushes its result onto the new frame;
@@ -18476,30 +18538,34 @@ pub fn linked_callee(vm: &VM, callable: &Value) -> Option<(Rc<FuncVal>, usize)> 
 /// per Python call.
 pub fn enter_linked(
     vm: &mut VM,
-    entry: usize,
-    fv: &FuncVal,
+    callee: LinkedCallee,
     self_opt: Option<Value>,
     owner_opt: Option<String>,
     args: Vec<Value>,
     kwargs: Vec<(String, Value)>,
 ) -> Result<(), String> {
-    let (def, locals_rc, frame_name) = with_host(|h| {
-        (
-            h.funcs[fv.def_id].clone(),
-            h.func_locals[fv.def_id].clone(),
-            h.func_names[fv.def_id].clone(),
-        )
+    let LinkedCallee {
+        fv,
+        entry,
+        def,
+        locals,
+        name,
+        env,
+    } = callee;
+    let (_, frame_self, pos) = call_receiver(&fv, &def, self_opt, args);
+    let slots = bind_call(&fv, &def, &env, pos, kwargs)?;
+    let owner = owner_opt.or_else(|| fv.owner.clone());
+    let entered = with_host(|h| {
+        if h.frames.len() >= RECURSION_LIMIT {
+            return false;
+        }
+        let frame = call_frame(h, &fv, env, locals, name, frame_self, owner);
+        h.frames.push(frame);
+        true
     });
-    let (_, frame_self, pos) = call_receiver(fv, &def, self_opt, args);
-    let (env, slots) = bind_call(fv, &def, pos, kwargs)?;
-    if with_host(|h| h.frames.len() >= RECURSION_LIMIT) {
+    if !entered {
         return Err("RecursionError: maximum recursion depth exceeded".to_string());
     }
-    let owner = owner_opt.or_else(|| fv.owner.clone());
-    with_host(|h| {
-        let frame = call_frame(h, fv, env, locals_rc, frame_name, frame_self, owner);
-        h.frames.push(frame);
-    });
     vm.frames.push(fusevm::Frame {
         return_ip: vm.ip,
         stack_base: vm.stack.len(),
@@ -18510,6 +18576,7 @@ pub fn enter_linked(
     Ok(())
 }
 
+
 /// Return `v` from the linked body running in `vm`'s innermost frame: drop
 /// that frame and its host frame, and resume the caller after its call op,
 /// which pushes `v`.
@@ -18517,7 +18584,13 @@ pub fn return_linked(vm: &mut VM, v: Value) -> Value {
     let frame = vm.frames.pop().expect("a linked body runs above the base frame");
     vm.stack.truncate(frame.stack_base);
     vm.ip = frame.return_ip;
-    with_host(|h| h.frames.pop());
+    with_host(|h| {
+        // Dropped in place: popping moves the whole frame out first.
+        let top = h.frames.len() - 1;
+        let env = h.frames[top].env.clone();
+        h.frames.truncate(top);
+        h.give_back_call_env(env);
+    });
     v
 }
 
@@ -18554,25 +18627,24 @@ fn join_names(names: &[String]) -> String {
     }
 }
 
-/// A call's fresh environment and its slot arguments. A
-/// [`FuncDef::params_in_slots`] function takes its arguments in slots and keeps
-/// the environment empty; any other binds them into the environment by name.
+/// Bind a call's arguments: a [`FuncDef::params_in_slots`] function takes them
+/// in slots, returned here, and keeps its fresh environment `env` empty; any
+/// other binds them into `env` by name.
 ///
 /// Its own function so the binding's temporaries stay out of `run_user_func`'s
 /// frame, which every level of Python recursion keeps on the native stack.
 fn bind_call(
     fv: &FuncVal,
     def: &FuncDef,
+    env: &Env,
     pos: Vec<Value>,
     kwargs: Vec<(String, Value)>,
-) -> Result<(Env, Vec<Value>), String> {
-    let env = new_env(fv.env.clone());
+) -> Result<Vec<Value>, String> {
     if def.params_in_slots {
-        let slots = bind_param_slots(def, &fv.defaults, &fv.kwonly_defaults, pos, kwargs)?;
-        return Ok((env, slots));
+        return bind_param_slots(def, &fv.defaults, &fv.kwonly_defaults, pos, kwargs);
     }
-    bind_params(&env, def, &fv.defaults, &fv.kwonly_defaults, pos, kwargs)?;
-    Ok((env, Vec::new()))
+    bind_params(env, def, &fv.defaults, &fv.kwonly_defaults, pos, kwargs)?;
+    Ok(Vec::new())
 }
 
 /// Bind positional + keyword arguments into a fresh call environment.
@@ -19297,8 +19369,8 @@ fn run_class_body(
         let saved = h.swap_module(fv.module);
         h.frames.push(Frame {
             env: env.clone(),
-            globals_decl: HashSet::new(),
-            nonlocals_decl: HashSet::new(),
+            globals_decl: NameSet::default(),
+            nonlocals_decl: NameSet::default(),
             // A class body resolves names dynamically (LOAD_NAME), so an unbound
             // read is a `NameError`, not `UnboundLocalError` — leave this empty.
             locals_set: Rc::new(HashSet::new()),
@@ -21050,8 +21122,8 @@ fn make_gen_kind(
 ) -> Value {
     let frame = Frame {
         env,
-        globals_decl: HashSet::new(),
-        nonlocals_decl: HashSet::new(),
+        globals_decl: NameSet::default(),
+        nonlocals_decl: NameSet::default(),
         locals_set: Rc::new(locals.into_iter().collect()),
         is_class_body: false,
         self_obj: self_val,

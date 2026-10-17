@@ -291,6 +291,16 @@ pub struct Compiler {
     /// [`fn_slots_allowed`] functions). `link_functions` copies each one into
     /// the main chunk.
     linkable: Vec<usize>,
+    /// Whether a name the current scope neither slots nor closes over is a
+    /// global or a builtin, which it is in the body of a slot-safe function: its
+    /// every local is a slot and every free variable reads through `GETFREE`.
+    /// Such a read is `GETGLOBAL` (CPython's `LOAD_GLOBAL`) rather than a walk
+    /// of the environment chain that can only end at the module.
+    names_global: bool,
+    /// Set by `build_annotation_scope` for the scope it is about to build when
+    /// that scope sits directly in a class body and so reads the class
+    /// namespace (`FuncDef::sees_class_scope`) before the globals.
+    next_sees_class_scope: bool,
 }
 
 /// The kind of scope a hidden function represents, controlling whether it is a
@@ -2475,6 +2485,7 @@ impl Compiler {
         body: &[Stmt],
     ) -> Result<usize, String> {
         let in_class_body = self.in_class_body;
+        self.next_sees_class_scope = in_class_body;
         let id = self.build_function(name, params, body)?;
         self.functions[id].1.sees_class_scope = in_class_body;
         Ok(id)
@@ -2593,11 +2604,14 @@ impl Compiler {
         // normal. Saved and restored so a nested function gets its own table.
         let saved_slots = std::mem::take(&mut self.fn_slots);
         let saved_bound = std::mem::take(&mut self.fn_slots_bound);
+        let sees_class_scope = std::mem::take(&mut self.next_sees_class_scope);
         let is_gen_or_async = is_async || body_has_yield(body);
         // A `--dap` compile keeps every local in the environment, where the
         // debugger's `variables`/`evaluate` read the paused frame by name.
         let slot_safe =
             kind.is_function() && !is_gen_or_async && !self.debug && fn_slots_allowed(body);
+        let saved_names_global =
+            std::mem::replace(&mut self.names_global, slot_safe && !sees_class_scope);
         if slot_safe {
             let mut next: u16 = 0;
             let mut table: HashMap<String, u16> = HashMap::new();
@@ -2699,6 +2713,7 @@ impl Compiler {
         }
         let compiled = self.compile_stmts(&mut fb, body);
         self.fn_slots = saved_slots;
+        self.names_global = saved_names_global;
         self.fn_slots_bound = saved_bound;
         self.in_class_body = saved_icb;
         self.def_depth = saved_fs;
@@ -3211,6 +3226,10 @@ impl Compiler {
                     self.name_const(b, n);
                     let op = if self.cur_freevars.contains(n) {
                         ops::GETFREE
+                    } else if self.names_global && !n.starts_with('.') {
+                        // A `.`-named compiler temporary lives in the call
+                        // environment, never in the module.
+                        ops::GETGLOBAL
                     } else {
                         ops::GETLOCAL
                     };

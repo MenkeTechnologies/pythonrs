@@ -103,6 +103,16 @@ pub fn install(vm: &mut VM) {
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
+/// Pop a call op's `argc` operands: the `N` that lead them (the callable, or a
+/// loaded method's `[self_or_none, name, callee_or_none]`) and the arguments
+/// after them, split off the stack in one move.
+fn pop_call<const N: usize>(vm: &mut VM, argc: u8) -> (Vec<Value>, [Value; N]) {
+    let args = vm.stack.split_off(vm.stack.len() + N - argc as usize);
+    let mut head: [Value; N] = std::array::from_fn(|_| vm.pop());
+    head.reverse();
+    (args, head)
+}
+
 fn pop_n(vm: &mut VM, n: usize) -> Vec<Value> {
     let mut v = Vec::with_capacity(n);
     for _ in 0..n {
@@ -1440,13 +1450,13 @@ fn run_loaded(
     args: Vec<Value>,
     kwargs: Vec<(String, Value)>,
 ) -> Value {
-    if let Some((fv, entry)) = host::linked_callee(vm, callee) {
+    if let Some(linked) = host::linked_callee(vm, callee) {
         let (recv, owner) = if is_no_value(self_slot) {
             (None, None)
         } else {
             (Some(self_slot.clone()), host::bound_method_owner(self_slot, name))
         };
-        return match host::enter_linked(vm, entry, &fv, recv, owner, args, kwargs) {
+        return match host::enter_linked(vm, linked, recv, owner, args, kwargs) {
             Ok(()) => Value::Undef,
             Err(e) => abort(vm, e),
         };
@@ -1460,8 +1470,8 @@ fn run_loaded(
 /// the value pushed here is a placeholder its return discards; any other
 /// callable is invoked and its result pushed.
 fn call_value(vm: &mut VM, callable: &Value, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Value {
-    if let Some((fv, entry)) = host::linked_callee(vm, callable) {
-        return match host::enter_linked(vm, entry, &fv, None, None, args, kwargs) {
+    if let Some(linked) = host::linked_callee(vm, callable) {
+        return match host::enter_linked(vm, linked, None, None, args, kwargs) {
             Ok(()) => Value::Undef,
             Err(e) => abort(vm, e),
         };
@@ -1481,8 +1491,7 @@ fn loaded_head(args: &mut Vec<Value>) -> (Value, Value, Value) {
 
 fn b_call_loaded(vm: &mut VM, argc: u8) -> Value {
     note_call_line(vm);
-    let mut args = pop_n(vm, argc as usize);
-    let (self_slot, name, callee) = loaded_head(&mut args);
+    let (args, [self_slot, name, callee]) = pop_call(vm, argc);
     run_loaded(vm, &self_slot, &sref(&name), &callee, args, vec![])
 }
 
@@ -1496,8 +1505,7 @@ fn b_call_loaded_kw(vm: &mut VM, argc: u8) -> Value {
 
 fn b_call_value(vm: &mut VM, argc: u8) -> Value {
     note_call_line(vm);
-    let mut args = pop_n(vm, argc as usize);
-    let callable = args.remove(0);
+    let (args, [callable]) = pop_call(vm, argc);
     call_value(vm, &callable, args, vec![])
 }
 
