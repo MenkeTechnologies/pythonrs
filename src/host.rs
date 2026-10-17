@@ -6507,6 +6507,7 @@ impl PyHost {
                     | PyObj::Module { .. }
                     | PyObj::Code { .. }
                     | PyObj::Lock { .. }
+                    | PyObj::File { .. }
                     | PyObj::TypeVarLike { .. }
                     | PyObj::TypeAlias { .. },
                 ) => {
@@ -22683,6 +22684,10 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
         "_opcode" => Some(with_host(crate::stdlib::pyopcode::entries)),
         // `_imp` — the import primitives `importlib` is handed at startup.
         "_imp" => Some(with_host(crate::stdlib::pyimp::entries)),
+        // `_posixsubprocess` / `select` — the fork+exec primitive and the
+        // readiness wait `subprocess` is built on.
+        "_posixsubprocess" => Some(with_host(crate::stdlib::pysubprocess::subprocess_entries)),
+        "select" => Some(with_host(crate::stdlib::pysubprocess::select_entries)),
         // `_signal` — the POSIX signal numbers `signal.py` re-exports as enums.
         "_signal" => Some(with_host(crate::stdlib::pysignal::entries)),
         // `_csv` — the CSV parser and formatter `csv.py` builds its readers,
@@ -23848,6 +23853,7 @@ fn pip_dir() -> Option<std::path::PathBuf> {
 /// `stdlib_module_names_all_import` test fails if an entry stops resolving.
 const NATIVE_ONLY_MODULES: &[&str] = &[
     "_blake2",
+    "_posixsubprocess",
     "_collections",
     "_csv",
     "_md5",
@@ -23858,6 +23864,7 @@ const NATIVE_ONLY_MODULES: &[&str] = &[
     "_signal",
     "_string",
     "math",
+    "select",
 ];
 
 /// Names that live in the stdlib tree but that CPython deliberately keeps OUT of
@@ -24220,6 +24227,22 @@ impl PyHost {
             newline_translate,
         });
         self.alloc(PyObj::File { id })
+    }
+
+    /// Move the descriptor out of the file handle `id`, leaving it closed:
+    /// `(file, path, readable, writable)`. `None` for a standard stream (which
+    /// owns no file) or a handle that is already closed.
+    pub fn io_take_file(&mut self, id: u32) -> Option<(std::fs::File, String, bool, bool)> {
+        match self.io_handles.get_mut(id as usize) {
+            Some(IoCell::File {
+                file,
+                path,
+                readable,
+                writable,
+                ..
+            }) => file.take().map(|f| (f, path.clone(), *readable, *writable)),
+            _ => None,
+        }
     }
 
     /// Whether the file behind `id` is closed (standard streams never close).
@@ -24815,13 +24838,21 @@ impl PyHost {
 /// vs text is handled at the read/write layer, not here.
 /// `shown` is the file argument as an `OSError` names it: its `repr` (`'a.txt'`,
 /// `b'a.txt'`).
-pub fn open_file(
-    path: &str,
-    shown: &str,
+/// What a `mode` string and the text arguments of `open()` decide before any file
+/// is touched.
+struct OpenSpec {
+    opts: std::fs::OpenOptions,
+    readable: bool,
+    writable: bool,
+    encoding: TextEncoding,
+    newline_translate: bool,
+}
+
+fn parse_open_spec(
     mode: &str,
     encoding: Option<&str>,
     newline: Option<&str>,
-) -> Result<Value, String> {
+) -> Result<OpenSpec, String> {
     use std::fs::OpenOptions;
     let binary = mode.contains('b');
     // CPython rejects both arguments on a binary handle before it opens anything.
@@ -24881,7 +24912,24 @@ pub fn open_file(
         }
         _ => return Err(format!("ValueError: invalid mode: '{mode}'")),
     };
-    let f = opts.open(path).map_err(|e| match e.kind() {
+    Ok(OpenSpec {
+        opts,
+        readable,
+        writable,
+        encoding,
+        newline_translate,
+    })
+}
+
+pub fn open_file(
+    path: &str,
+    shown: &str,
+    mode: &str,
+    encoding: Option<&str>,
+    newline: Option<&str>,
+) -> Result<Value, String> {
+    let spec = parse_open_spec(mode, encoding, newline)?;
+    let f = spec.opts.open(path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => {
             format!("FileNotFoundError: [Errno 2] No such file or directory: {shown}")
         }
@@ -24919,10 +24967,62 @@ pub fn open_file(
             f,
             path.to_string(),
             mode.to_string(),
-            readable,
-            writable,
-            encoding,
-            newline_translate,
+            spec.readable,
+            spec.writable,
+            spec.encoding,
+            spec.newline_translate,
+        )
+    }))
+}
+
+/// `open(fd, mode, closefd=…)`: wrap an already-open descriptor. With
+/// `closefd=False` the handle owns a duplicate, so closing it leaves `fd` open
+/// while reads and writes still share its file offset.
+pub fn open_fd(
+    fd: i32,
+    mode: &str,
+    encoding: Option<&str>,
+    newline: Option<&str>,
+    closefd: bool,
+) -> Result<Value, String> {
+    use std::os::fd::FromRawFd;
+    let spec = parse_open_spec(mode, encoding, newline)?;
+    if mode.contains('x') {
+        // `FileIO(fd, 'x')` creates; there is nothing to create for a descriptor.
+        return Err(format!("ValueError: invalid mode: '{mode}'"));
+    }
+    let owned = if closefd {
+        fd
+    } else {
+        let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+        if dup < 0 {
+            return Err(crate::stdlib::pyposix::os_error(
+                crate::stdlib::pyposix::errno(),
+                None,
+                None,
+            ));
+        }
+        dup
+    };
+    if closefd && unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+        return Err(crate::stdlib::pyposix::os_error(
+            crate::stdlib::pyposix::errno(),
+            None,
+            None,
+        ));
+    }
+    // SAFETY: `owned` is a descriptor the caller handed over (`closefd`) or one
+    // this function just duplicated.
+    let f = unsafe { std::fs::File::from_raw_fd(owned) };
+    Ok(with_host(|h| {
+        h.io_alloc_file(
+            f,
+            fd.to_string(),
+            mode.to_string(),
+            spec.readable,
+            spec.writable,
+            spec.encoding,
+            spec.newline_translate,
         )
     }))
 }

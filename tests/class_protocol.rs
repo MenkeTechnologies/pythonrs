@@ -80,6 +80,9 @@ x = (msgs, Full().a() + Full().b())
     );
 }
 
+// The native `ContextVar`; with the bridge on, CPython's own tracks the context
+// per OS thread, which libtest's thread-per-test layout makes nondeterministic.
+#[cfg(not(feature = "stdlib-ffi"))]
 #[test]
 fn context_var_reset_restores_the_previous_value() {
     let src = "\

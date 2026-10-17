@@ -39,6 +39,68 @@ fn closed_err() -> String {
 
 // ── constructors ─────────────────────────────────────────────────────────────
 
+/// `TextIOWrapper(buffer, encoding=None, errors=None, newline=None, …)` over a
+/// native file handle. The wrapper takes over the buffer's descriptor — the
+/// buffer is left closed, as it is once the wrapper is closed in CPython — so
+/// closing the wrapper releases the descriptor (a pipe end `subprocess` wrapped
+/// must be closed for the child to see EOF). Only file-backed buffers can be
+/// wrapped.
+fn new_textiowrapper(
+    h: &mut PyHost,
+    args: &[Value],
+    kwargs: &[(String, Value)],
+) -> Result<Value, String> {
+    let named = |name: &str, pos: usize| {
+        kwargs
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+            .or_else(|| args.get(pos).cloned())
+            .filter(|v| !matches!(v, Value::Undef))
+    };
+    let buffer = named("buffer", 0).ok_or_else(|| {
+        host::type_error("TextIOWrapper() missing required argument 'buffer' (pos 1)")
+    })?;
+    let encoding = match named("encoding", 1) {
+        None => host::TextEncoding::Utf8,
+        Some(v) => {
+            let name = h.as_str(&v).ok_or_else(|| {
+                host::type_error("TextIOWrapper() argument 'encoding' must be str or None")
+            })?;
+            host::TextEncoding::from_name(&name)
+                .ok_or_else(|| format!("LookupError: unknown encoding: {name}"))?
+        }
+    };
+    let newline = named("newline", 3).and_then(|v| h.as_str(&v));
+    if let Some(n) = newline.as_deref() {
+        if !matches!(n, "" | "\n" | "\r" | "\r\n") {
+            return Err(format!("ValueError: illegal newline value: {n}"));
+        }
+    }
+    let Some(id) = h.file_id(&buffer) else {
+        return Err(host::type_error(
+            "TextIOWrapper: only a file-backed buffer is supported",
+        ));
+    };
+    let Some((taken, path, readable, writable)) = h.io_take_file(id) else {
+        return Err("ValueError: I/O operation on closed file.".to_string());
+    };
+    let mode = match (readable, writable) {
+        (true, true) => "r+",
+        (false, true) => "w",
+        _ => "r",
+    };
+    Ok(h.io_alloc_file(
+        taken,
+        path,
+        mode.to_string(),
+        readable,
+        writable,
+        encoding,
+        newline.is_none(),
+    ))
+}
+
 /// `BytesIO([initial_bytes])`.
 fn new_bytesio(h: &mut PyHost, args: &[Value]) -> Result<Value, String> {
     let buf = match args.first() {
@@ -453,6 +515,7 @@ pub fn call(
     kwargs: &[(String, Value)],
 ) -> Option<Result<Value, String>> {
     Some(match name {
+        "TextIOWrapper" => new_textiowrapper(h, args, kwargs),
         "BytesIO" => new_bytesio(h, args),
         "StringIO" => new_stringio(h, args, kwargs),
         // `text_encoding(encoding, stacklevel=2)` — resolve a None encoding to the

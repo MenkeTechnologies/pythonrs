@@ -6771,6 +6771,16 @@ pub fn call_builtin_function(
             return r;
         }
     }
+    if let Some(f) = name.strip_prefix("_posixsubprocess.") {
+        if let Some(r) = crate::stdlib::pysubprocess::call_subprocess(f, &args) {
+            return r;
+        }
+    }
+    if let Some(f) = name.strip_prefix("select.") {
+        if let Some(r) = crate::stdlib::pysubprocess::call_select(f, &args) {
+            return r;
+        }
+    }
     if let Some(f) = name.strip_prefix("_signal.") {
         if let Some(r) = with_host(|h| crate::stdlib::pysignal::call(h, f, &args)) {
             return r;
@@ -8355,6 +8365,32 @@ pub fn call_builtin_function(
                 .ok_or_else(|| {
                     host::type_error("open() missing required argument 'file' (pos 1)")
                 })?;
+            // An integer `file` is an open descriptor (`open(fd, 'rb')`, what
+            // `subprocess` wraps its pipes in).
+            if !matches!(file, Value::Bool(_)) {
+                if let host::IndexFit::Fits(fd) = with_host(|h| h.index_fit(&file)) {
+                    let text = |name: &str, pos: usize| {
+                        kw_get(&kwargs, name)
+                            .or_else(|| args.get(pos).cloned())
+                            .filter(|v| !matches!(v, Value::Undef))
+                            .and_then(|v| with_host(|h| h.as_str(&v)))
+                    };
+                    let mode = text("mode", 1).unwrap_or_else(|| "r".into());
+                    let closefd = kw_get(&kwargs, "closefd")
+                        .or_else(|| args.get(6).cloned())
+                        .map_or(true, |v| with_host(|h| h.truthy(&v)));
+                    let fd = i32::try_from(fd).map_err(|_| {
+                        "OverflowError: Python int too large to convert to C int".to_string()
+                    })?;
+                    return host::open_fd(
+                        fd,
+                        &mode,
+                        text("encoding", 3).as_deref(),
+                        text("newline", 5).as_deref(),
+                        closefd,
+                    );
+                }
+            }
             // `_io.open` takes any path-like `file` (`os.fspath`), and an
             // `OSError` names it by its `repr` — `b'…'` for a bytes path.
             let file = fspath(&file)?;

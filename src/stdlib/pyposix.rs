@@ -19,7 +19,7 @@ use std::ffi::{CStr, CString};
 type R = Result<Value, String>;
 
 /// The current thread's `errno`.
-fn errno() -> i32 {
+pub(crate) fn errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
 
@@ -64,10 +64,10 @@ fn syscall(mut f: impl FnMut() -> isize) -> Result<isize, i32> {
 
 /// A converted path argument: the C string, the text to show in errors, and
 /// whether the caller passed `bytes` (so results keep the caller's type).
-struct PathArg {
-    c: CString,
-    shown: String,
-    bytes: bool,
+pub(crate) struct PathArg {
+    pub(crate) c: CString,
+    pub(crate) shown: String,
+    pub(crate) bytes: bool,
 }
 
 fn str_of(h: &PyHost, v: &Value) -> Option<String> {
@@ -78,7 +78,7 @@ fn str_of(h: &PyHost, v: &Value) -> Option<String> {
 }
 
 /// CPython's `path_converter`: `str`, `bytes`, or an `os.PathLike` returning one.
-fn path_of(fname: &str, argname: &str, v: &Value) -> Result<PathArg, String> {
+pub(crate) fn path_of(fname: &str, argname: &str, v: &Value) -> Result<PathArg, String> {
     let direct = with_host(|h| match str_of(h, v) {
         Some(s) => Some((s.into_bytes(), false)),
         None => match h.get(v) {
@@ -122,7 +122,7 @@ fn path_of(fname: &str, argname: &str, v: &Value) -> Result<PathArg, String> {
     Ok(PathArg { c, shown, bytes })
 }
 
-fn int_of(fname: &str, argname: &str, v: &Value) -> Result<i64, String> {
+pub(crate) fn int_of(fname: &str, argname: &str, v: &Value) -> Result<i64, String> {
     with_host(|h| match h.index_fit(v) {
         IndexFit::Fits(n) => Ok(n),
         IndexFit::TooLarge(_) => {
@@ -136,7 +136,7 @@ fn int_of(fname: &str, argname: &str, v: &Value) -> Result<i64, String> {
 }
 
 /// A C `int` argument (file descriptors, flags, signals).
-fn cint_of(fname: &str, argname: &str, v: &Value) -> Result<i32, String> {
+pub(crate) fn cint_of(fname: &str, argname: &str, v: &Value) -> Result<i32, String> {
     i32::try_from(int_of(fname, argname, v)?)
         .map_err(|_| "OverflowError: Python int too large to convert to C int".to_string())
 }
@@ -161,6 +161,7 @@ fn path_val(raw: Vec<u8>, bytes: bool) -> Value {
 fn buffer_of(v: &Value) -> Result<Vec<u8>, String> {
     with_host(|h| match h.get(v) {
         Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) => Ok(b.clone()),
+        Some(PyObj::Memoryview { .. }) => h.mv_bytes(v),
         _ => Err(host::type_error(&format!(
             "a bytes-like object is required, not '{}'",
             h.type_name(v)

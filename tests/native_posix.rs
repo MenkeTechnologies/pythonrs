@@ -225,3 +225,56 @@ x = (pkg_local.VALUE, solo_local.NAME, solo_local.FRAME, sys._getframemodulename
 ";
     assert_eq!(g(src, "x"), "(42, 'solo_local', 'solo_local', '__main__')");
 }
+
+#[test]
+fn subprocess_pipes_exec_failures_and_exit_status() {
+    let src = "\
+import os, signal, subprocess
+big = subprocess.run(['sh', '-c', \"head -c 200000 /dev/zero | tr '\\\\0' x; echo e >&2\"], capture_output=True)
+p = subprocess.Popen(['cat'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+echoed, _ = p.communicate('h\\u00e9llo\\n')
+try:
+    subprocess.run(['/no/such/prog'])
+except FileNotFoundError as e:
+    missing = (e.errno, e.filename)
+try:
+    subprocess.run(['true'], cwd='/no/such/dir')
+except FileNotFoundError as e:
+    badcwd = (e.errno, e.filename)
+killed = subprocess.run(['sh', '-c', 'kill -9 $$']).returncode
+env = subprocess.run(['sh', '-c', 'echo $PYRS_PROBE'], env={'PYRS_PROBE': 'v', 'PATH': os.environ['PATH']},
+                     capture_output=True, text=True).stdout.strip()
+try:
+    subprocess.run(['sleep', '5'], timeout=0.2)
+except subprocess.TimeoutExpired as e:
+    timeout = e.timeout
+x = (len(big.stdout), big.stderr, echoed, p.returncode, missing, badcwd,
+     killed == -signal.SIGKILL, env, timeout)
+";
+    assert_eq!(
+        g(src, "x"),
+        "(200000, b'e\\n', 'h\u{e9}llo\\n', 0, (2, '/no/such/prog'), (2, '/no/such/dir'), True, 'v', 0.2)"
+    );
+}
+
+#[test]
+fn select_reports_readiness_per_list() {
+    let src = "\
+import os, select
+r, w = os.pipe()
+idle = select.select([r], [w], [], 0)
+os.write(w, b'x')
+ready = select.select([r], [], [], 1)
+os.close(w)
+hup = select.select([r], [], [], 0)
+try:
+    select.select([r], [], [], -1)
+except ValueError as e:
+    neg = str(e)
+x = (idle == ([], [w], []), ready == ([r], [], []), hup[0] == [r], neg)
+";
+    assert_eq!(
+        g(src, "x"),
+        "(True, True, True, 'timeout must be non-negative')"
+    );
+}

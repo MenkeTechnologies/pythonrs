@@ -19,6 +19,12 @@ written.
   `st_blksize`/`st_blocks`/`st_rdev` (and the macOS fields), and an `OSError`
   from a syscall is the errno's subclass with `filename` and `filename2`
   (`rename` names both).
+- **`subprocess` in the native build.** `_posixsubprocess.fork_exec` (a port of
+  `child_exec`: descriptor shuffling, `cwd`, `umask`, signals, session/process
+  group, uid/gid/groups, `preexec_fn`, `close_fds`, the `PATH` search list and the
+  errpipe report) and `select.select` over `poll(2)`; `open(fd, …)` wraps a
+  descriptor and `io.TextIOWrapper` wraps a file handle. `subprocess` (and
+  `os.popen`, `os.system`) previously failed at import.
 - **The native build imports modules from `sys.path`.** It searched only the
   bundled stdlib, so `import helper` beside the script failed.
 - **`class C(Generic[T])`, `class C(list[int])` and `__mro_entries__`.** A generic
@@ -2820,11 +2826,13 @@ plus the entire CPython stdlib are importable out of the box. A
 module then raises `ModuleNotFoundError`.
 
 - **Missing C accelerators in the native build** (each raises
-  `ModuleNotFoundError`, and everything built on it fails to import): `select`
-  and `selectors`, `_posixsubprocess` (so `subprocess`, `webbrowser`), `zlib`
+  `ModuleNotFoundError`, and everything built on it fails to import): `zlib`
   (`gzip`, `zipfile`), `unicodedata`, `_hashlib` (`hmac`), `array`, `_operator`
   (`secrets`, `hmac`), `_socket`, `fcntl`, `pwd`, `grp`, `termios`, `resource`,
-  `gc`, `_json`, `_heapq`, `_bisect`, `cmath`. `asyncio` is the native event loop
+  `gc`, `_json`, `_heapq`, `_bisect`, `cmath`. `select` offers only `select()`
+  (no `poll`/`epoll`/`kqueue`), so `selectors` uses its `select`-based class.
+  `io.TextIOWrapper` wraps only a file-backed buffer, and takes the buffer's
+  descriptor (the buffer is left closed). `asyncio` is the native event loop
   in both builds and has no `timeout`, `TaskGroup`, `Semaphore`, `Condition`,
   `shield` or `to_thread`.
 - **Native in every build**: `math` (constants + a common function fast path;

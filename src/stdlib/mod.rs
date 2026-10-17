@@ -24,5 +24,6 @@ pub mod pyre;
 pub mod pyreflag;
 pub mod pysignal;
 pub mod pystruct;
+pub mod pysubprocess;
 pub mod pythread;
 pub mod pytokenize;
