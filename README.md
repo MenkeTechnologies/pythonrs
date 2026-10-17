@@ -63,8 +63,10 @@ Two properties of the runtime:
   source, consults `~/.pythonrs/scripts.rkyv`, and on a hit runs the compiled
   chunks directly with lex/parse/lower skipped entirely. No flags, no separate
   build step, no `__pycache__` ritual. The shard is an archived INDEX followed by
-  a raw blob region, and a lookup validates only the index: what the cache costs
-  a run is set by how many programs it holds, never by how large they are.
+  a raw blob region. A lookup memory-maps the shard and validates only the
+  index, so what the cache costs a run is set by how many programs it holds,
+  never by how large they are. A store keeps the most recently stored programs
+  within a 32 MiB budget.
 - **AOT to a native executable.** `python --build foo.py` emits a standalone
   native binary (via `fusevm::aot`, linked against the pythonrs runtime
   staticlib) that runs the script with no interpreter present. This path needs

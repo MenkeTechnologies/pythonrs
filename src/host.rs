@@ -5060,10 +5060,10 @@ pub fn run_chunk_cached(key: u64, make: impl FnOnce() -> Chunk) -> Result<Value,
     let pooled = VM_POOL.with(|p| p.borrow_mut().get_mut(&key).and_then(|v| v.pop()));
     let vm = match pooled {
         Some(mut vm) => {
-            // Hand the VM its own chunk straight back — `reset` moves it, so this
-            // is a pointer swap rather than a copy of the bytecode.
-            let own = std::mem::take(&mut vm.chunk);
-            vm.reset(own);
+            // The pooled VM already holds this function's chunk, so `rewind`
+            // restarts it in place. `reset` would also drop the block-JIT
+            // eligibility memo and re-probe the JIT for it on every call.
+            vm.rewind();
             vm
         }
         None => Box::new(new_configured_vm(make())),

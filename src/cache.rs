@@ -7,7 +7,8 @@
 //!
 //! Layout: a single shard at `~/.pythonrs/scripts.rkyv`, as
 //! `[u64 index length][index][blobs]`. The *index* is a zero-copy rkyv archive
-//! (`Index`) of `(key, verify, source, offset, length)` rows, validated on load;
+//! (`Index`) of `(key, verify, source, offset, length)` rows, validated in
+//! place on a memory-mapped shard;
 //! each *blob* is a bincode-encoded `CProg` (the compiled `fusevm::Chunk`s +
 //! func/try tables) read by offset, because `fusevm::Chunk` is serde-owned, not
 //! `rkyv::Archive`. The blobs sit OUTSIDE the archive so that validating it
@@ -16,6 +17,10 @@
 //! build's `CARGO_PKG_VERSION`, and a fingerprint of the running executable, so
 //! a source, format, release, or REBUILD change misses cleanly instead of
 //! loading stale bytecode.
+//!
+//! A store keeps the most recently stored entries within `MAX_BLOB_BYTES` and
+//! drops the rest, oldest first. Entries an earlier build wrote can never hit
+//! again; the budget is what retires them.
 
 use crate::ast::Span;
 use crate::compiler::Program;
@@ -373,15 +378,49 @@ fn split_shard(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
     (n <= rest.len()).then(|| rest.split_at(n))
 }
 
+/// Map the shard read-only. A lookup touches only the index and one blob, so
+/// reading the whole file made every script start pay for the size of every
+/// program ever cached.
+fn map_shard() -> Option<memmap2::Mmap> {
+    let file = std::fs::File::open(shard_path()?).ok()?;
+    // SAFETY: the shard is never modified in place. `write_shard` renames a
+    // complete temp file over it, which leaves an existing mapping on the old
+    // inode, and `clear` only unlinks it.
+    unsafe { memmap2::Mmap::map(&file) }.ok()
+}
+
 /// The whole shard file alongside its decoded index — the form the rare paths
 /// (`store`, `--cacheview`, `--doctor`) want, since they walk every entry. A
 /// LOOKUP must not come through here: it would pay for decoding the index rows
 /// it will not read. [`load`] reads the index in place instead.
-fn read_shard() -> Option<(Vec<u8>, Index)> {
-    let bytes = std::fs::read(shard_path()?).ok()?;
+fn read_shard() -> Option<(memmap2::Mmap, Index)> {
+    let bytes = map_shard()?;
     let (index, _) = split_shard(&bytes)?;
     let index: Index = rkyv::from_bytes(index).ok()?;
     Some((bytes, index))
+}
+
+/// Remove temp files left by writers that died between `write` and `rename`.
+/// Only called while holding [`ShardLock`], which `store` holds across that
+/// window, so a temp file seen here is orphaned rather than in progress. (A
+/// writer that could not take the lock writes unlocked; deleting its temp file
+/// fails its rename, which costs it the entry and nothing else.)
+fn remove_orphan_temps() {
+    let Some(path) = shard_path() else {
+        return;
+    };
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return;
+    };
+    let prefix = format!("{}.tmp.", name.to_string_lossy());
+    let Ok(listing) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in listing.flatten() {
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Write an index and its blob region as one shard file.
@@ -419,7 +458,7 @@ fn write_shard(index: &Index, blobs: &[u8]) -> Result<(), String> {
 pub fn load(src: &str) -> Option<Program> {
     let key = key_for(src);
     let verify = verify_for(src);
-    let bytes = std::fs::read(shard_path()?).ok()?;
+    let bytes = map_shard()?;
     let (index, blobs) = split_shard(&bytes)?;
     let index = rkyv::check_archived_root::<Index>(index).ok()?;
     let entry = index
@@ -602,7 +641,10 @@ pub fn store_labeled(src: &str, prog: &Program, source: &str) -> Result<(), Stri
     // the shard, so concurrent writers merge instead of clobbering. The lock is
     // held until this function returns (the guard drops). If the lock cannot be
     // taken, fall through unlocked — a dropped entry only costs a recompile.
-    let _guard = ShardLock::acquire();
+    let guard = ShardLock::acquire();
+    if guard.is_some() {
+        remove_orphan_temps();
+    }
     // Rebuild the shard: the surviving blobs are COPIED, never decoded, so a
     // store costs one pass over the file rather than a round trip through every
     // program in it.
@@ -612,9 +654,10 @@ pub fn store_labeled(src: &str, prog: &Program, source: &str) -> Result<(), Stri
         .and_then(|(bytes, _)| split_shard(bytes).map(|(_, b)| b))
         .unwrap_or(&[]);
     let mut index = Index::default();
-    let mut blobs: Vec<u8> = Vec::with_capacity(old_blobs.len() + blob.len());
+    let mut blobs: Vec<u8> = Vec::new();
     if let Some((_, old)) = existing.as_ref() {
-        for e in old.entries.iter().filter(|e| e.key != key) {
+        let budget = MAX_BLOB_BYTES.saturating_sub(blob.len() as u64);
+        for e in retained(old, key, budget) {
             let (off, len) = (e.off as usize, e.len as usize);
             let Some(b) = old_blobs.get(off..off.saturating_add(len)) else {
                 continue;
@@ -635,6 +678,32 @@ pub fn store_labeled(src: &str, prog: &Program, source: &str) -> Result<(), Stri
     });
     blobs.extend_from_slice(&blob);
     write_shard(&index, &blobs)
+}
+
+/// Upper bound on the shard's blob region. Every cache miss rewrites the whole
+/// shard, so its size is paid on each new script and each newly imported module.
+/// At the ~43 KB a typical entry takes, this holds several hundred programs.
+const MAX_BLOB_BYTES: u64 = 32 << 20;
+
+/// The entries of `old` that a store of `new_key` carries forward, in shard
+/// order: all but the one being replaced, newest first, while they fit in
+/// `budget` blob bytes. A store appends at the end, so dropping from the front
+/// drops the entries least recently stored.
+fn retained(old: &Index, new_key: u64, budget: u64) -> Vec<&IndexEntry> {
+    let mut kept = Vec::new();
+    let mut used = 0u64;
+    for e in old.entries.iter().rev() {
+        if e.key == new_key {
+            continue;
+        }
+        used += e.len;
+        if used > budget {
+            break;
+        }
+        kept.push(e);
+    }
+    kept.reverse();
+    kept
 }
 
 #[cfg(test)]
@@ -674,6 +743,47 @@ mod tests {
         // …and the version that is hashed is this build's, so a release bump
         // rotates the whole shard.
         assert_eq!(BUILD_VERSION, env!("CARGO_PKG_VERSION"));
+    }
+
+    fn entry(key: u64, len: u64) -> IndexEntry {
+        IndexEntry {
+            key,
+            verify: key,
+            source: String::new(),
+            off: 0,
+            len,
+        }
+    }
+
+    fn kept_keys(old: &Index, new_key: u64, budget: u64) -> Vec<u64> {
+        retained(old, new_key, budget)
+            .iter()
+            .map(|e| e.key)
+            .collect()
+    }
+
+    /// A re-store replaces its own entry instead of keeping both copies.
+    #[test]
+    fn a_store_drops_the_entry_it_replaces() {
+        let old = Index {
+            entries: vec![entry(1, 10), entry(2, 10), entry(3, 10)],
+        };
+        assert_eq!(kept_keys(&old, 2, u64::MAX), [1, 3]);
+    }
+
+    /// Over budget, the oldest entries go first and the survivors keep their
+    /// shard order. The entry that crosses the budget is dropped with everything
+    /// older, even when an older one would still fit. Without the budget every
+    /// rebuild's entries were carried forward forever, and the shard grew past
+    /// a gigabyte that each cache miss rewrote.
+    #[test]
+    fn a_store_over_budget_keeps_the_newest_entries_in_order() {
+        let old = Index {
+            entries: vec![entry(1, 1), entry(2, 50), entry(3, 30), entry(4, 30)],
+        };
+        assert_eq!(kept_keys(&old, 0, 60), [3, 4]);
+        assert_eq!(kept_keys(&old, 0, 111), [1, 2, 3, 4]);
+        assert!(kept_keys(&old, 0, 0).is_empty());
     }
 
     /// The framing must reject every malformed shard rather than panic on one.
