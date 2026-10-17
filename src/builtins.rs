@@ -1456,10 +1456,8 @@ fn run_loaded(
         } else {
             (Some(self_slot.clone()), host::bound_method_owner(self_slot, name))
         };
-        return match host::enter_linked(vm, linked, recv, owner, args, kwargs) {
-            Ok(()) => Value::Undef,
-            Err(e) => abort(vm, e),
-        };
+        let r = host::enter_linked(vm, linked, recv, owner, args, kwargs, None);
+        return entered(vm, r);
     }
     let r = call_loaded(self_slot, name, callee, args, kwargs);
     finish(vm, r)
@@ -1467,17 +1465,58 @@ fn run_loaded(
 
 /// Call `callable` from `vm`. A function whose body is linked into the chunk
 /// `vm` runs is entered as a frame on `vm` itself (`host::enter_linked`), and
-/// the value pushed here is a placeholder its return discards; any other
+/// the value pushed here is a placeholder its return discards; so is a class
+/// whose `__init__` is such a function, once its instance exists. Any other
 /// callable is invoked and its result pushed.
 fn call_value(vm: &mut VM, callable: &Value, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Value {
     if let Some(linked) = host::linked_callee(vm, callable) {
-        return match host::enter_linked(vm, linked, None, None, args, kwargs) {
-            Ok(()) => Value::Undef,
-            Err(e) => abort(vm, e),
+        let r = host::enter_linked(vm, linked, None, None, args, kwargs, None);
+        return entered(vm, r);
+    }
+    if let Some(class) = host::class_callee(callable) {
+        return match host::construct(&class, args, kwargs) {
+            Ok(host::Construct::Init {
+                inst,
+                init,
+                owner,
+                args,
+                kwargs,
+            }) => match (&inst, host::linked_callee(vm, &init)) {
+                (Value::Obj(id), Some(linked)) => {
+                    let id = Some(*id);
+                    let r = host::enter_linked(vm, linked, Some(inst), owner, args, kwargs, id);
+                    entered(vm, r)
+                }
+                _ => {
+                    let init = host::Construct::Init {
+                        inst,
+                        init,
+                        owner,
+                        args,
+                        kwargs,
+                    };
+                    let r = host::run_construct(init);
+                    finish(vm, r)
+                }
+            },
+            r => {
+                let r = r.and_then(host::run_construct);
+                finish(vm, r)
+            }
         };
     }
     let r = host::invoke(callable, args, kwargs);
     finish(vm, r)
+}
+
+/// The value a call op pushes once it has entered a linked body — a
+/// placeholder the body's return discards — or the abort of a call that could
+/// not enter it.
+fn entered(vm: &mut VM, r: Result<(), String>) -> Value {
+    match r {
+        Ok(()) => Value::Undef,
+        Err(e) => abort(vm, e),
+    }
 }
 
 /// Split the `[self_or_none, name, callee_or_none, rest...]` head off a loaded call.
@@ -2643,7 +2682,10 @@ fn b_sig_return(vm: &mut VM, _: u8) -> Value {
     // pythonrs pushes no fusevm frame but a linked body's, so above the base
     // frame this is a linked body returning to its caller on the same VM.
     if vm.frames.len() > 1 {
-        return host::return_linked(vm, v);
+        return match host::return_linked(vm, v) {
+            Ok(v) => v,
+            Err(e) => abort(vm, e),
+        };
     }
     with_host(|h| h.signal = Some(host::Signal::Return(v.clone())));
     vm.ip = vm.chunk.ops.len();

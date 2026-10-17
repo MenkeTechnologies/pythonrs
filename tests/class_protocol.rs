@@ -192,3 +192,44 @@ x = (A().m() is A, A().nested() is A, A.c() is A, A.s() is A, next(A().gen()) is
          [\"name '__class__' is not defined\", \"name '__class__' is not defined\"])"
     );
 }
+
+/// A class call returns the instance `__init__` initialized, and raises
+/// CPython's `TypeError` when `__init__` returns anything but `None` — both
+/// when the call runs `__init__` on the caller's VM (module code outside any
+/// `try`) and when it runs it on a VM of its own (from inside a `try` body).
+#[test]
+fn a_class_call_returns_its_instance_and_checks_what_init_returned() {
+    let src = "\
+class P:
+    def __init__(self, x, y):
+        self.x = x; self.y = y
+class Q(P):
+    def __init__(self, x):
+        super().__init__(x, 2 * x)
+class Bad:
+    def __init__(self):
+        return 1
+def guarded():
+    try:
+        Bad()
+    except TypeError as e:
+        return str(e)
+direct = None
+try:
+    Bad()
+except TypeError as e:
+    direct = str(e)
+q = Q(3)
+x = (P(1, 2).y, q.x, q.y, type(q).__name__, guarded(), direct)
+";
+    assert_eq!(
+        g(src, "x"),
+        "(2, 3, 6, 'Q', \"__init__() should return None, not 'int'\", \
+         \"__init__() should return None, not 'int'\")"
+    );
+    let uncaught = eval_str("class Bad:\n    def __init__(self):\n        return 1\nBad()\n");
+    assert_eq!(
+        uncaught.err().as_deref(),
+        Some("TypeError: __init__() should return None, not 'int'")
+    );
+}

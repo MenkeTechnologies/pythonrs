@@ -2199,6 +2199,11 @@ pub struct Frame {
     /// The file of code `eval`/`exec`/`compile` built from a string (its
     /// `co_filename`, `<string>` by default); `None` is the module's file.
     pub file: Option<Rc<str>>,
+    /// The heap id of the instance this frame's `__init__` was entered to
+    /// initialize by a class call on the caller's VM ([`enter_linked`]): its
+    /// return hands the instance back in place of `__init__`'s own result. An
+    /// id, not a `Value`, so the field costs the frame 8 bytes and no drop.
+    pub init_of: Option<u32>,
 }
 
 /// `(filename, scope, line, caret start, caret end)` of a frame a CPython
@@ -3126,6 +3131,7 @@ impl PyHost {
                 span: Span::NONE,
                 module: 0,
                 file: None,
+                init_of: None,
             }],
             error: None,
             exc: None,
@@ -18103,9 +18109,68 @@ pub fn instantiate(
     args: Vec<Value>,
     kwargs: Vec<(String, Value)>,
 ) -> Result<Value, String> {
+    run_construct(construct(class, args, kwargs)?)
+}
+
+/// What calling a class leaves to do once its instance exists.
+pub enum Construct {
+    /// The call's result, complete.
+    Done(Value),
+    /// Run `init`, the class's `__init__` function, on `inst`; the call's
+    /// result is `inst`.
+    Init {
+        inst: Value,
+        init: Value,
+        owner: Option<String>,
+        args: Vec<Value>,
+        kwargs: Vec<(String, Value)>,
+    },
+}
+
+/// Finish a class call by running its `__init__`, if it has one left to run.
+pub fn run_construct(c: Construct) -> Result<Value, String> {
+    match c {
+        Construct::Done(v) => Ok(v),
+        Construct::Init {
+            inst,
+            init,
+            owner,
+            args,
+            kwargs,
+        } => {
+            let Some(PyObj::Func(fv)) = with_host(|h| h.get(&init).cloned()) else {
+                unreachable!("Construct::Init carries a function");
+            };
+            let r = run_user_func(&fv, Some(inst.clone()), owner, args, kwargs)?;
+            init_returned(&r)?;
+            Ok(inst)
+        }
+    }
+}
+
+/// CPython's `type.__call__` check on what `__init__` returned.
+pub fn init_returned(r: &Value) -> Result<(), String> {
+    if matches!(r, Value::Undef) {
+        return Ok(());
+    }
+    Err(type_error(&format!(
+        "__init__() should return None, not '{}'",
+        with_host(|h| h.tp_name(r))
+    )))
+}
+
+/// Calling `class`, up to its `__init__`: the instance, built by a metaclass
+/// `__call__`, `__new__`, or the default allocation, and the `__init__` that
+/// still has to run on it.
+pub fn construct(
+    class: &str,
+    args: Vec<Value>,
+    kwargs: Vec<(String, Value)>,
+) -> Result<Construct, String> {
     // Builtin exception classes construct exception objects.
     if crate::builtins::is_exception_class(class) && !with_host(|h| h.classes.contains_key(class)) {
-        return crate::builtins::construct_builtin_exception(class, args, &kwargs);
+        return crate::builtins::construct_builtin_exception(class, args, &kwargs)
+            .map(Construct::Done);
     }
     // If `class`'s metaclass defines `__call__`, it controls instantiation:
     // `A(...)` dispatches to `type(A).__call__(A, ...)`.
@@ -18116,12 +18181,13 @@ pub fn instantiate(
                 if let Some(PyObj::Func(fv)) = with_host(|h| h.get(&f).cloned()) {
                     let clsobj = with_host(|h| h.alloc(PyObj::Class(class.to_string())));
                     let owner = with_host(|h| method_owner(h, m, "__call__"));
-                    return run_user_func(&fv, Some(clsobj), owner, args, kwargs);
+                    return run_user_func(&fv, Some(clsobj), owner, args, kwargs)
+                        .map(Construct::Done);
                 }
             }
         }
     }
-    instantiate_plain(class, args, kwargs)
+    construct_plain(class, args, kwargs)
 }
 
 /// The default `type.__call__`: build a class instance via `__new__`/`__init__`
@@ -18210,10 +18276,19 @@ pub fn instantiate_plain(
     args: Vec<Value>,
     kwargs: Vec<(String, Value)>,
 ) -> Result<Value, String> {
+    run_construct(construct_plain(class, args, kwargs)?)
+}
+
+/// [`instantiate_plain`] up to the `__init__` it leaves to run.
+fn construct_plain(
+    class: &str,
+    args: Vec<Value>,
+    kwargs: Vec<(String, Value)>,
+) -> Result<Construct, String> {
     // Instantiating a metaclass builds a *class* object (not an instance):
     // `M(name, bases, ns)` runs `M.__new__` / `M.__init__`.
     if with_host(|h| class_inherits_type(h, class)) {
-        return metaclass_instantiate(class, args, kwargs);
+        return metaclass_instantiate(class, args, kwargs).map(Construct::Done);
     }
     refuse_abstract(class)?;
     // `__new__` (if the class overrides it) creates the instance; it is an
@@ -18275,15 +18350,20 @@ pub fn instantiate_plain(
         _ => false,
     });
     if init_ok {
-        if let Some(f) = with_host(|h| h.class_lookup(class, "__init__")) {
-            let fobj = with_host(|h| h.get(&f).cloned());
-            if let Some(PyObj::Func(fv)) = fobj {
+        if let Some(init) = with_host(|h| h.class_lookup(class, "__init__")) {
+            if with_host(|h| matches!(h.get(&init), Some(PyObj::Func(_)))) {
                 let owner = with_host(|h| method_owner(h, class, "__init__"));
-                run_user_func(&fv, Some(inst.clone()), owner, args, kwargs)?;
+                return Ok(Construct::Init {
+                    inst,
+                    init,
+                    owner,
+                    args,
+                    kwargs,
+                });
             }
         }
     }
-    Ok(inst)
+    Ok(Construct::Done(inst))
 }
 
 /// Instantiate a metaclass `meta` — i.e. build a new class object from
@@ -18494,6 +18574,7 @@ fn call_frame(
         span: Span::NONE,
         module: fv.module,
         file: h.code_files.get(&fv.def_id).cloned(),
+        init_of: None,
     }
 }
 
@@ -18535,8 +18616,18 @@ pub fn linked_callee(vm: &VM, callable: &Value) -> Option<LinkedCallee> {
     })
 }
 
+/// The name of the class `callable` is, when it is one [`construct`] builds
+/// instances of.
+pub fn class_callee(callable: &Value) -> Option<String> {
+    with_host(|h| match h.get(callable) {
+        Some(PyObj::Class(name)) => Some(name.clone()),
+        _ => None,
+    })
+}
+
 /// Call `callee` on `vm` itself: bind its arguments, push its host frame, and
-/// push a fusevm frame that enters its linked body.
+/// push a fusevm frame that enters its linked body. `init_of` is the instance
+/// a class call entered this `__init__` for (see [`Frame::init_of`]).
 ///
 /// The caller's next op runs once the body returns through
 /// [`return_linked`]. The call op still pushes its result onto the new frame;
@@ -18550,6 +18641,7 @@ pub fn enter_linked(
     owner_opt: Option<String>,
     args: Vec<Value>,
     kwargs: Vec<(String, Value)>,
+    init_of: Option<u32>,
 ) -> Result<(), String> {
     let LinkedCallee {
         fv,
@@ -18567,7 +18659,8 @@ pub fn enter_linked(
         if h.frames.len() >= RECURSION_LIMIT {
             return false;
         }
-        let frame = call_frame(h, &fv, env, locals, name, frame_self, owner);
+        let mut frame = call_frame(h, &fv, env, locals, name, frame_self, owner);
+        frame.init_of = init_of;
         h.frames.push(frame);
         true
     });
@@ -18587,19 +18680,25 @@ pub fn enter_linked(
 
 /// Return `v` from the linked body running in `vm`'s innermost frame: drop
 /// that frame and its host frame, and resume the caller after its call op,
-/// which pushes `v`.
-pub fn return_linked(vm: &mut VM, v: Value) -> Value {
+/// which pushes the result. An `__init__` entered by a class call
+/// ([`Frame::init_of`]) results in its instance, once `v` is `None`.
+pub fn return_linked(vm: &mut VM, v: Value) -> Result<Value, String> {
     let frame = vm.frames.pop().expect("a linked body runs above the base frame");
     vm.stack.truncate(frame.stack_base);
     vm.ip = frame.return_ip;
-    with_host(|h| {
+    let init_of = with_host(|h| {
         // Dropped in place: popping moves the whole frame out first.
         let top = h.frames.len() - 1;
+        let init_of = h.frames[top].init_of.take();
         let env = h.frames[top].env.clone();
         h.frames.truncate(top);
         h.give_back_call_env(env);
+        init_of
     });
-    v
+    match init_of {
+        None => Ok(v),
+        Some(id) => init_returned(&v).map(|()| Value::Obj(id)),
+    }
 }
 
 /// Unwind the linked frames a run stopped inside. Each leaves the host frame
@@ -19404,6 +19503,7 @@ fn run_class_body(
             span: Span::NONE,
             module: fv.module,
             file: h.code_files.get(&fv.def_id).cloned(),
+            init_of: None,
         });
         saved
     });
@@ -21162,6 +21262,7 @@ fn make_gen_kind(
         // which is the current one while it is built.
         module: with_host(|h| h.cur_module()),
         file: None,
+        init_of: None,
     };
     let id = with_host(|h| {
         let id = h.generators.len() as u32;
