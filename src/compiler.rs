@@ -2480,8 +2480,8 @@ impl Compiler {
         if kind.is_function() && !is_gen_or_async && !self.debug && fn_slots_allowed(body) {
             let mut next: u16 = 0;
             let mut table: HashMap<String, u16> = HashMap::new();
-            // Parameters first: `bind_params` has already bound them, and the
-            // prologue below copies each into its slot.
+            // Parameters first, in `param_names` order: the call binds each
+            // argument straight into its slot (`bind_param_slots`).
             for p in param_names(params) {
                 table.entry(p).or_insert_with(|| {
                     let s = next;
@@ -2510,18 +2510,19 @@ impl Compiler {
         }
         let mut fb = ChunkBuilder::new();
         self.begin_chunk();
-        // Prologue: seed each slot. Parameters come from the environment (bound
-        // by `bind_params` before this chunk runs); every other local starts as
-        // the never-assigned marker so a premature read still raises.
-        if !self.fn_slots.is_empty() {
+        // A slotted function takes its arguments in slots `0..n`
+        // (`FuncDef::params_in_slots`): the call binds them there directly.
+        let params_in_slots = !self.fn_slots.is_empty();
+        // Prologue: seed each non-parameter slot with the never-assigned marker
+        // so a premature read still raises.
+        if params_in_slots {
             let params_set: HashSet<String> = param_names(params).into_iter().collect();
             let mut entries: Vec<(&String, &u16)> = self.fn_slots.iter().collect();
             entries.sort_by_key(|(_, s)| **s);
             let proven = self.fn_slots_bound.clone();
             for (name, slot) in entries {
                 if params_set.contains(name) {
-                    self.name_const(&mut fb, name);
-                    fb.emit(Op::CallBuiltin(ops::GETLOCAL, 1), 0);
+                    continue;
                 } else if proven.contains(name) {
                     // Assigned before any read, so the marker would never be
                     // observed — and leaving the prologue empty keeps the chunk
@@ -2608,6 +2609,7 @@ impl Compiler {
             freevars,
             sees_class_scope: false,
             is_annotate: false,
+            params_in_slots,
         };
         self.functions.push((name.to_string(), def));
         Ok(self.functions.len() - 1)

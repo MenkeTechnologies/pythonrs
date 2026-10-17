@@ -303,9 +303,26 @@ pub struct FuncDef {
     /// so `co_varnames` is `('format',)` and the signature `(format, /)`.
     #[serde(default)]
     pub is_annotate: bool,
+    /// The body keeps every parameter in a frame slot, in [`FuncDef::param_names`]
+    /// order, and never reads one by name. A call then binds the arguments
+    /// straight into slots `0..n` and the call environment stays empty: no name
+    /// is hashed, cloned or looked up to pass an argument.
+    #[serde(default)]
+    pub params_in_slots: bool,
 }
 
 impl FuncDef {
+    /// Every name a call binds, in slot order: the positional parameters, a
+    /// named `*args`, the keyword-only parameters, then `**kwargs`. The compiler
+    /// numbers parameter slots in this order (`compiler::param_names`).
+    pub fn param_names(&self) -> impl Iterator<Item = &String> {
+        self.params
+            .iter()
+            .chain(self.star.iter().filter(|s| !s.is_empty()))
+            .chain(self.kwonly.iter())
+            .chain(self.kwargs.iter())
+    }
+
     /// Clone everything EXCEPT the bytecode, leaving `chunk` empty.
     ///
     /// A call needs the signature, the name and the local/free-variable sets; it
@@ -331,6 +348,7 @@ impl FuncDef {
             freevars: self.freevars.clone(),
             sees_class_scope: self.sees_class_scope,
             is_annotate: self.is_annotate,
+            params_in_slots: self.params_in_slots,
         }
     }
 }
@@ -5064,9 +5082,16 @@ fn finish_run(mut vm: Box<VM>, pool_key: Option<u64>) -> Result<Value, String> {
 /// so on a hit there is nothing to build: the caller's `make` is never called and
 /// no bytecode is copied. That is what turns a Python call from "clone the
 /// function body, run it, drop the copy" into "reset a VM and run".
-pub fn run_chunk_cached(key: u64, make: impl FnOnce() -> Chunk) -> Result<Value, String> {
+///
+/// `slots` seeds the entry frame's slots — the arguments of a
+/// [`FuncDef::params_in_slots`] function, empty for any other.
+pub fn run_chunk_cached(
+    key: u64,
+    make: impl FnOnce() -> Chunk,
+    slots: Vec<Value>,
+) -> Result<Value, String> {
     let pooled = VM_POOL.with(|p| p.borrow_mut().get_mut(&key).and_then(|v| v.pop()));
-    let vm = match pooled {
+    let mut vm = match pooled {
         Some(mut vm) => {
             // The pooled VM already holds this function's chunk, so `rewind`
             // restarts it in place. `reset` would also drop the block-JIT
@@ -5076,6 +5101,9 @@ pub fn run_chunk_cached(key: u64, make: impl FnOnce() -> Chunk) -> Result<Value,
         }
         None => Box::new(new_configured_vm(make())),
     };
+    if !slots.is_empty() {
+        vm.frames[0].slots.extend(slots);
+    }
     finish_run(vm, Some(key))
 }
 
@@ -16079,15 +16107,32 @@ pub fn function_annotations(func: &Value) -> Result<Value, String> {
 }
 
 /// Invoke any callable value with positional + keyword arguments.
+///
+/// A plain function is dispatched here, ahead of [`invoke_object`]'s match
+/// over every other callable kind: every level of Python-to-Python recursion
+/// keeps this frame on the native stack, and that match's arms make its frame
+/// several KB in a debug build.
 pub fn invoke(
     callable: &Value,
     args: Vec<Value>,
     kwargs: Vec<(String, Value)>,
 ) -> Result<Value, String> {
-    let obj = with_host(|h| h.get(callable).cloned());
+    match with_host(|h| h.get(callable).cloned()) {
+        Some(PyObj::Func(fv)) => run_user_func(&fv, None, None, args, kwargs),
+        obj => invoke_object(callable, obj, args, kwargs),
+    }
+}
+
+/// [`invoke`] for every callable that is not a plain function. `obj` is
+/// `callable`'s heap object.
+fn invoke_object(
+    callable: &Value,
+    obj: Option<PyObj>,
+    args: Vec<Value>,
+    kwargs: Vec<(String, Value)>,
+) -> Result<Value, String> {
     match obj {
         Some(PyObj::Builtin(name)) => crate::builtins::call_builtin_function(&name, args, kwargs),
-        Some(PyObj::Func(fv)) => run_user_func(&fv, None, None, args, kwargs),
         // A staticmethod is just its wrapped function; a classmethod reached here
         // (without a bound class) still runs its wrapped function.
         Some(PyObj::StaticMethod(inner)) | Some(PyObj::ClassMethod(inner)) => {
@@ -18262,8 +18307,7 @@ pub fn run_user_func(
             None
         }
     });
-    let env = new_env(fv.env.clone());
-    bind_params(&env, &def, &fv.defaults, &fv.kwonly_defaults, pos, kwargs)?;
+    let (env, slots) = bind_call(fv, &def, pos, kwargs)?;
     let owner = owner_opt.or_else(|| fv.owner.clone());
     // `async def`: calling it returns a coroutine object (or, if the body
     // contains `yield`, an async generator); the body runs only when the event
@@ -18337,7 +18381,7 @@ pub fn run_user_func(
         });
         saved
     });
-    let r = run_chunk_cached(def_id as u64, || def.chunk.clone());
+    let r = run_chunk_cached(def_id as u64, || def.chunk.clone(), slots);
     let sig = with_host(|h| {
         if r.is_err() {
             h.push_tb_frame();
@@ -18369,13 +18413,28 @@ fn join_names(names: &[String]) -> String {
     }
 }
 
-/// Bind positional + keyword arguments into a fresh call environment.
+/// A call's fresh environment and its slot arguments. A
+/// [`FuncDef::params_in_slots`] function takes its arguments in slots and keeps
+/// the environment empty; any other binds them into the environment by name.
 ///
-/// The check order mirrors CPython's argument binder (Python/ceval.c
-/// `initialize_locals`) so error messages surface in the same precedence:
-/// keyword collisions (multiple-values) and invalid keywords fire before a
-/// too-many-positional error, which in turn fires before missing-argument
-/// errors. Deviating from this order changes which `TypeError` a caller sees.
+/// Its own function so the binding's temporaries stay out of `run_user_func`'s
+/// frame, which every level of Python recursion keeps on the native stack.
+fn bind_call(
+    fv: &FuncVal,
+    def: &FuncDef,
+    pos: Vec<Value>,
+    kwargs: Vec<(String, Value)>,
+) -> Result<(Env, Vec<Value>), String> {
+    let env = new_env(fv.env.clone());
+    if def.params_in_slots {
+        let slots = bind_param_slots(def, &fv.defaults, &fv.kwonly_defaults, pos, kwargs)?;
+        return Ok((env, slots));
+    }
+    bind_params(&env, def, &fv.defaults, &fv.kwonly_defaults, pos, kwargs)?;
+    Ok((env, Vec::new()))
+}
+
+/// Bind positional + keyword arguments into a fresh call environment.
 fn bind_params(
     env: &Env,
     def: &FuncDef,
@@ -18384,6 +18443,59 @@ fn bind_params(
     pos: Vec<Value>,
     kwargs: Vec<(String, Value)>,
 ) -> Result<(), String> {
+    env.borrow_mut().vars = bound_vars(def, defaults, kwonly_defaults, pos, kwargs)?;
+    Ok(())
+}
+
+/// Bind the arguments of a [`FuncDef::params_in_slots`] function to its
+/// parameter slots, in [`FuncDef::param_names`] order.
+///
+/// An exact-positional call is already in that order, so it is the slot vector
+/// as it stands. Every other call binds through [`bound_vars`] first, so
+/// defaults, keywords, `*args`, `**kwargs` and every argument error behave
+/// exactly as they do for a call bound into an environment.
+fn bind_param_slots(
+    def: &FuncDef,
+    defaults: &[Value],
+    kwonly_defaults: &[Value],
+    pos: Vec<Value>,
+    kwargs: Vec<(String, Value)>,
+) -> Result<Vec<Value>, String> {
+    if is_exact_positional(def, pos.len(), &kwargs) {
+        return Ok(pos);
+    }
+    let mut vars = bound_vars(def, defaults, kwonly_defaults, pos, kwargs)?;
+    Ok(def
+        .param_names()
+        .map(|name| vars.shift_remove(name).unwrap_or(Value::Undef))
+        .collect())
+}
+
+/// The shape nearly every call has: one positional argument per parameter and
+/// nothing else in the signature, so no keyword, default, `*args` or
+/// `**kwargs` handling applies and no argument error is possible.
+fn is_exact_positional(def: &FuncDef, npos: usize, kwargs: &[(String, Value)]) -> bool {
+    npos == def.params.len()
+        && kwargs.is_empty()
+        && def.star.is_none()
+        && def.kwargs.is_none()
+        && def.kwonly.is_empty()
+}
+
+/// Bind positional + keyword arguments to the names of `def`'s parameters.
+///
+/// The check order mirrors CPython's argument binder (Python/ceval.c
+/// `initialize_locals`) so error messages surface in the same precedence:
+/// keyword collisions (multiple-values) and invalid keywords fire before a
+/// too-many-positional error, which in turn fires before missing-argument
+/// errors. Deviating from this order changes which `TypeError` a caller sees.
+fn bound_vars(
+    def: &FuncDef,
+    defaults: &[Value],
+    kwonly_defaults: &[Value],
+    pos: Vec<Value>,
+    kwargs: Vec<(String, Value)>,
+) -> Result<EnvVars, String> {
     let np = def.params.len();
     // The runtime defaults, not the compile-time count: `f.__defaults__ = …`
     // replaces them.
@@ -18432,18 +18544,11 @@ fn bind_params(
     // i.e. nothing, so the absolute deltas are nowhere near equal. Measured on a
     // `cargo build` (debug) binary, where an unoptimized hash lookup is dear;
     // the release ratio will differ.
-    if npos == np
-        && kwargs.is_empty()
-        && !has_vararg
-        && def.star.is_none()
-        && def.kwargs.is_none()
-        && def.kwonly.is_empty()
-    {
+    if is_exact_positional(def, npos, &kwargs) {
         for (i, val) in pos.into_iter().enumerate() {
             vars.insert(def.params[i].clone(), val);
         }
-        env.borrow_mut().vars = vars;
-        return Ok(());
+        return Ok(vars);
     }
 
     // 1. Place positional args into their slots; keep the overflow aside.
@@ -18585,8 +18690,7 @@ fn bind_params(
         vars.insert(kw.clone(), dict);
     }
 
-    env.borrow_mut().vars = vars;
-    Ok(())
+    Ok(vars)
 }
 
 /// CPython's `too_many_positional` message tail (everything after `name()`):

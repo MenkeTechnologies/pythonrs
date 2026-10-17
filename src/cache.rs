@@ -172,7 +172,9 @@ use std::path::PathBuf;
 /// unbound error is CPython's `cannot access free variable` wording.
 /// v58: a chunk's constant pool ends with a hash of its position table, so
 /// chunks with identical ops at different source positions hash differently.
-const SCHEMA: u64 = 58;
+/// v59: a slotted function's prologue no longer loads its parameters by name;
+/// the call binds them into slots (`FuncDef::params_in_slots`, a new field).
+const SCHEMA: u64 = 59;
 
 /// The shard's INDEX: everything a lookup needs, and nothing it does not.
 ///
