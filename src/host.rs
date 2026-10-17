@@ -2654,6 +2654,8 @@ struct GenCell {
     agen_op: Option<AGenOp>,
     /// The defining function's name (used by the un-awaited-coroutine warning).
     func_name: String,
+    /// The body's VM runs and pins, parked here while it is suspended.
+    gc: gc::GcContext,
 }
 
 /// The mutable "execution registers" swapped at every generator resume/suspend
@@ -5133,7 +5135,15 @@ thread_local! {
 /// measurably slowed container-heavy top-level code. Repeated calls to the same
 /// function go through `run_chunk_cached` instead.
 pub fn run_chunk_on(chunk: Chunk) -> Result<Value, String> {
-    finish_run(Box::new(new_configured_vm(chunk)), None)
+    finish_run(Box::new(new_configured_vm(chunk)), None, true)
+}
+
+/// [`run_chunk_on`] for a run whose Rust callers hold no `Value` the collector
+/// cannot reach — the program's top level, or a `try`/loop-body chunk run by a
+/// builtin that pins what it holds (`gc::pin`) — so the collector may run
+/// inside it.
+pub fn run_chunk_transparent(chunk: Chunk) -> Result<Value, String> {
+    finish_run(Box::new(new_configured_vm(chunk)), None, false)
 }
 
 /// Build a VM with pythonrs's builtins, numeric hook, and JIT/debug wiring.
@@ -5155,9 +5165,9 @@ fn new_configured_vm(chunk: Chunk) -> VM {
 
 /// Run `vm` to completion and translate the outcome, recycling it into the pool
 /// under `pool_key` when one is given.
-fn finish_run(mut vm: Box<VM>, pool_key: Option<u64>) -> Result<Value, String> {
+fn finish_run(mut vm: Box<VM>, pool_key: Option<u64>, opaque: bool) -> Result<Value, String> {
     let outcome = {
-        let _run = gc::RunGuard::enter();
+        let _run = gc::RunGuard::enter(&vm, opaque);
         vm.run()
     };
     let halted_top = matches!(outcome, VMResult::Halted)
@@ -5232,12 +5242,12 @@ pub fn run_chunk_cached(
     if !slots.is_empty() {
         vm.frames[0].slots.extend(slots);
     }
-    finish_run(vm, Some(key))
+    finish_run(vm, Some(key), true)
 }
 
 /// Run the top-level program chunk.
 pub fn run_main(chunk: Chunk) -> Result<Value, String> {
-    let r = gc::as_root_run(|| run_chunk_on(chunk));
+    let r = run_chunk_transparent(chunk);
     with_host(|h| h.signal = None);
     r
 }
@@ -21392,6 +21402,7 @@ fn make_gen_kind(
             awaiting: false,
             agen_op: None,
             func_name,
+            gc: gc::GcContext::default(),
         });
         id
     });
@@ -21576,6 +21587,9 @@ fn sub_close(it: &Value, is_gen: bool) {
 /// the sub-iterator. Returns the sub-iterator's return value (its
 /// `StopIteration.value`) so `r = yield from sub()` binds correctly.
 pub fn run_yield_from(it: Value) -> Result<Value, String> {
+    // The delegating generator suspends with `it` held here; the collector
+    // must reach it.
+    let _pin = gc::pin([it.clone()]);
     let is_gen = with_host(|h| matches!(h.get(&it), Some(PyObj::Generator { .. })));
     // `_y = next(_i)` — the first advance is always a plain `next()`.
     let mut y = match sub_send(&it, is_gen, Value::Undef)? {

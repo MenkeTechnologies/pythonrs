@@ -2735,7 +2735,7 @@ fn b_loop_body(vm: &mut VM, _: u8) -> Value {
         Some(t) => t.body,
         None => return abort(vm, "internal: unknown loop-body id".into()),
     };
-    if let Err(e) = host::run_chunk_on(body) {
+    if let Err(e) = host::run_chunk_transparent(body) {
         return abort(vm, e);
     }
     let code = with_host(|h| match &h.signal {
@@ -4377,14 +4377,17 @@ fn b_try(vm: &mut VM, _: u8) -> Value {
     // names the enclosing handler's exception — this snapshot does, and it is
     // what gets restored when the handler finishes.
     let entry_exc = with_host(|h| h.exc.clone());
+    // What this frame holds while the try's chunks run: their runs are
+    // transparent to the collector (`host::gc`), so it must reach these.
+    let pins = host::gc::pin(entry_exc.clone());
 
-    let body_res = host::run_chunk_on(td.body.clone());
+    let body_res = host::run_chunk_transparent(td.body.clone());
     let signal_after_body = with_host(|h| h.signal.is_some());
     match body_res {
         Ok(_) => {
             if !signal_after_body {
                 if let Some(els) = &td.orelse {
-                    if let Err(e) = host::run_chunk_on(els.clone()) {
+                    if let Err(e) = host::run_chunk_transparent(els.clone()) {
                         pending = Some(e);
                     }
                 }
@@ -4400,6 +4403,7 @@ fn b_try(vm: &mut VM, _: u8) -> Value {
             // that stale class would pick the wrong handler. Synthesize a fresh
             // exception from the string and wire the stale one as `__context__`.
             let exc = with_host(|h| materialize_error(h, &e));
+            pins.add(exc.clone());
             if td.handlers.iter().any(|h| h.star) {
                 pending = run_star_handlers(&td, &exc, &entry_exc);
                 handled_star = true;
@@ -4410,7 +4414,7 @@ fn b_try(vm: &mut VM, _: u8) -> Value {
                 let matches = match type_chunk {
                     None => true,
                     Some(tc) => {
-                        let tv = host::run_chunk_on(tc.clone()).unwrap_or(Value::Undef);
+                        let tv = host::run_chunk_transparent(tc.clone()).unwrap_or(Value::Undef);
                         with_host(|h| exc_matches(h, &exc, &tv))
                     }
                 };
@@ -4438,7 +4442,7 @@ fn b_try(vm: &mut VM, _: u8) -> Value {
                         h.capture_exc_tb(&exc);
                         h.reset_traceback();
                     });
-                    let hres = host::run_chunk_on(hbody.clone());
+                    let hres = host::run_chunk_transparent(hbody.clone());
                     match hres {
                         // Unconditionally, signal or not: leaving the handler by
                         // `return` also leaves the exception state, exactly as
@@ -4483,7 +4487,7 @@ fn b_try(vm: &mut VM, _: u8) -> Value {
         let raised_at = pending
             .as_ref()
             .and_then(|_| with_host(|h| h.cur_line_span()));
-        match host::run_chunk_on(fin.clone()) {
+        match host::run_chunk_transparent(fin.clone()) {
             Ok(_) => {
                 if with_host(|h| h.signal.is_none()) {
                     with_host(|h| h.signal = sig_before);
@@ -4535,6 +4539,9 @@ fn run_star_handlers(td: &host::TryDef, exc: &Value, entry_exc: &Option<Value>) 
         h.capture_exc_tb(exc);
         h.reset_traceback();
     });
+    // Every group, subgroup and escaped exception this holds across the
+    // handlers' runs is pinned for the collector (`host::gc`).
+    let pins = host::gc::pin([exc.clone()]);
     // What is still unmatched. `None` once every clause has claimed its part.
     let mut rest = Some(exc.clone());
     // Each handler's own escaping exception, then the unmatched remainder.
@@ -4544,12 +4551,16 @@ fn run_star_handlers(td: &host::TryDef, exc: &Value, entry_exc: &Option<Value>) 
         let Some(cur) = rest.clone() else { break };
         // `except*` always names a type — `except*:` is rejected at compile time.
         let Some(tc) = &hd.typ else { continue };
-        let tv = host::run_chunk_on(tc.clone()).unwrap_or(Value::Undef);
+        let tv = host::run_chunk_transparent(tc.clone()).unwrap_or(Value::Undef);
         let (matched, remainder) = match excgroup::eg_match(&cur, &tv) {
             Ok(pair) => pair,
             Err(e) => return Some(e),
         };
         let Some(matched) = matched else { continue };
+        pins.add(matched.clone());
+        if let Some(r) = &remainder {
+            pins.add(r.clone());
+        }
         rest = remainder;
         if let Some(name) = &hd.name {
             with_host(|h| h.set_name(name, matched.clone()));
@@ -4559,7 +4570,7 @@ fn run_star_handlers(td: &host::TryDef, exc: &Value, entry_exc: &Option<Value>) 
             h.exc = Some(matched.clone());
             h.reset_traceback();
         });
-        match host::run_chunk_on(hd.body.clone()) {
+        match host::run_chunk_transparent(hd.body.clone()) {
             // Nothing escaped: this part of the group is handled.
             Ok(_) => with_host(|h| {
                 if h.signal.is_none() {
@@ -4571,6 +4582,7 @@ fn run_star_handlers(td: &host::TryDef, exc: &Value, entry_exc: &Option<Value>) 
             Err(_) => {
                 if let Some(e) = with_host(|h| h.exc.clone()) {
                     with_host(|h| h.capture_exc_tb(&e));
+                    pins.add(e.clone());
                     raised.push(e);
                 }
             }

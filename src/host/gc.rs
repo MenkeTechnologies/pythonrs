@@ -6,15 +6,24 @@
 //! An object's id — so `is`, `id()` and a dict key — is stable for its life.
 //!
 //! Rust code holds `Value`s the collector cannot see: a builtin's popped
-//! operands, the arguments of a call back into Python, the frames on a
-//! suspended generator's coroutine stack. So a collection runs only where
-//! none can exist — at a safepoint (the entry of a call or loop builtin, before
-//! it pops anything) on the program's top-level VM with no other VM run on the
-//! Rust stack, no generator suspended mid-body, and nothing in the asyncio
-//! loop.
-//! Everything else that holds a `Value` is a root (`trace_roots`). The
-//! `stdlib-ffi` build never collects: CPython objects hold pythonrs ids where
-//! nothing here can read them.
+//! operands, the arguments of a call back into Python, the locals of a
+//! builtin that runs a nested chunk. So a collection runs only where every
+//! such `Value` is accounted for, at a safepoint: the entry of a call or loop
+//! builtin, before it pops anything.
+//!
+//! Every VM run registers itself, as transparent or opaque, in the context it
+//! runs in — the main thread's, or a generator's, whose runs park on its
+//! coroutine stack when it suspends ([`GcContext`]). A transparent run is one
+//! whose Rust callers hold nothing unaccounted for: the program's top level
+//! (`run_main`) and the `try`/loop-body chunks run by builtins that pin
+//! ([`pin`]) what they hold. Any other run — a callback from a builtin, a call
+//! on a VM of its own — is opaque. A collection needs the main context to
+//! hold no opaque run, no generator body to be running, and each suspended
+//! generator to be parked at a `yield` (not an `await`) with only its own body
+//! run below it. The roots are every registered VM, every pin, and the host
+//! tables that hold a `Value` (`trace_roots`). Nothing in the asyncio loop is
+//! traced, so it must be idle. The `stdlib-ffi` build never collects: CPython
+//! objects hold pythonrs ids where nothing here can read them.
 
 use super::*;
 use std::cell::Cell;
@@ -28,11 +37,35 @@ thread_local! {
     /// Set once enough has been allocated since the last collection; the
     /// safepoint's whole cost while it is clear.
     static DUE: Cell<bool> = const { Cell::new(false) };
-    /// VM runs active on this thread's Rust stack (`finish_run`).
-    static DEPTH: Cell<u32> = const { Cell::new(0) };
-    /// The depth of the program's top-level run (`run_main`); 0 when none is
-    /// running. Only code on that VM, with nothing nested in it, can collect.
-    static ROOT_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// The VM runs and pinned values of one execution context: the main thread,
+/// or one generator's coroutine.
+#[derive(Default)]
+pub(super) struct GcContext {
+    /// The VMs running in this context, innermost last. Each lives in its
+    /// `finish_run` (or, for a suspended generator, on the parked coroutine
+    /// stack) for as long as it is registered.
+    vms: Vec<*const VM>,
+    /// `Value`s a builtin holds in Rust locals across a nested run ([`pin`]).
+    pins: Vec<Value>,
+    /// Registered runs whose Rust callers may hold `Value`s nothing pins.
+    opaque: u32,
+}
+
+/// The context code runs in now: the generator whose body is running, else
+/// the main thread.
+fn current_context() -> Option<u32> {
+    CUR_GEN.with(Cell::get)
+}
+
+impl PyHost {
+    fn gc_context(&mut self, generator: Option<u32>) -> &mut GcContext {
+        match generator {
+            Some(id) => &mut self.generators[id as usize].gc,
+            None => &mut self.gc.main,
+        }
+    }
 }
 
 /// `PYTHONRS_GC_STRESS=1`: collect at every safepoint that allows it, so a
@@ -56,6 +89,8 @@ pub(super) struct GcState {
     /// collection allocates nothing once the heap stops growing.
     marks: Marks,
     pending: Vec<u32>,
+    /// The main thread's runs and pins.
+    main: GcContext,
 }
 
 /// One mark bit per heap slot.
@@ -97,29 +132,78 @@ impl GcState {
     }
 }
 
-/// Counts a VM run for as long as it lives (`finish_run`).
-pub(super) struct RunGuard;
+/// Run `f` on the host unless it is borrowed or already destroyed, for a
+/// guard's drop: one dropped while unwinding through a host borrow, or by the
+/// host's own destruction dropping a suspended generator's coroutine stack at
+/// exit, goes away with everything it tracked.
+fn with_live_host(f: impl FnOnce(&mut PyHost)) {
+    let _ = HOST.try_with(|h| {
+        if let Ok(mut h) = h.try_borrow_mut() {
+            f(&mut h);
+        }
+    });
+}
+
+/// A registered VM run (`finish_run`), deregistered when dropped.
+pub(super) struct RunGuard {
+    context: Option<u32>,
+    opaque: bool,
+}
 
 impl RunGuard {
-    pub(super) fn enter() -> RunGuard {
-        DEPTH.with(|d| d.set(d.get() + 1));
-        RunGuard
+    /// Register `vm`'s run in the current context. `opaque` unless its Rust
+    /// callers pin everything they hold (see the module docs).
+    pub(super) fn enter(vm: &VM, opaque: bool) -> RunGuard {
+        let context = current_context();
+        with_host(|h| {
+            let cx = h.gc_context(context);
+            cx.vms.push(vm as *const VM);
+            cx.opaque += u32::from(opaque);
+        });
+        RunGuard { context, opaque }
     }
 }
 
 impl Drop for RunGuard {
     fn drop(&mut self) {
-        DEPTH.with(|d| d.set(d.get() - 1));
+        with_live_host(|h| {
+            let cx = h.gc_context(self.context);
+            cx.vms.pop();
+            cx.opaque -= u32::from(self.opaque);
+        });
     }
 }
 
-/// Run `f`, whose VM run is the program's top level (`run_main`): the one run
-/// a collection may happen inside.
-pub(super) fn as_root_run<R>(f: impl FnOnce() -> R) -> R {
-    let saved = ROOT_DEPTH.with(|r| r.replace(DEPTH.with(Cell::get) + 1));
-    let out = f();
-    ROOT_DEPTH.with(|r| r.set(saved));
-    out
+/// `Value`s a builtin holds in Rust locals while it runs a nested chunk —
+/// roots until the guard drops.
+pub(crate) struct PinGuard {
+    context: Option<u32>,
+    len: usize,
+}
+
+/// Pin `values` in the current context; [`PinGuard::add`] pins more under the
+/// same guard.
+pub(crate) fn pin(values: impl IntoIterator<Item = Value>) -> PinGuard {
+    let context = current_context();
+    let len = with_host(|h| {
+        let cx = h.gc_context(context);
+        let len = cx.pins.len();
+        cx.pins.extend(values);
+        len
+    });
+    PinGuard { context, len }
+}
+
+impl PinGuard {
+    pub(crate) fn add(&self, v: Value) {
+        with_host(|h| h.gc_context(self.context).pins.push(v));
+    }
+}
+
+impl Drop for PinGuard {
+    fn drop(&mut self) {
+        with_live_host(|h| h.gc_context(self.context).pins.truncate(self.len));
+    }
 }
 
 /// Collect if a collection is due and every live `Value` is a root here.
@@ -136,16 +220,21 @@ pub(crate) fn safepoint(vm: &VM) {
 #[cold]
 fn collect_if_safe(vm: &VM) {
     DUE.with(|d| d.set(false));
-    let root = ROOT_DEPTH.with(Cell::get);
-    let top_level = root != 0 && DEPTH.with(Cell::get) == root;
     let safe = cfg!(not(feature = "stdlib-ffi"))
-        && top_level
+        && current_context().is_none()
         && !DEBUG_MODE.with(Cell::get)
         && async_rt::loop_is_idle();
     with_host(|h| {
-        // A generator suspended mid-body holds `Value`s on its coroutine stack; one
-        // not yet started holds only its body chunk, and its frame is a root.
-        if safe && !h.generators.iter().any(|g| g.started && !g.done) {
+        let main = &h.gc.main;
+        // A suspended generator is parked at a `yield` with its own body run
+        // below it (opaque only for the closure that started it, which holds
+        // just its chunk); anything more is on its stack unaccounted for.
+        let parked_cleanly = h
+            .generators
+            .iter()
+            .filter(|g| g.started && !g.done)
+            .all(|g| !g.awaiting && g.gc.opaque <= 1);
+        if safe && !main.vms.is_empty() && main.opaque == 0 && parked_cleanly {
             h.collect(vm);
         } else {
             // Not here: wait for another threshold's worth before asking again.
@@ -153,6 +242,7 @@ fn collect_if_safe(vm: &VM) {
         }
     });
 }
+
 
 /// The reachable set, built as the roots and the objects they reach are traced.
 struct Marker {
@@ -248,6 +338,15 @@ impl Marker {
         self.value(&fv.annotate);
     }
 
+    /// A running VM's operand stack, frame slots and globals.
+    fn vm(&mut self, vm: &VM) {
+        self.values(&vm.stack);
+        for f in &vm.frames {
+            self.values(&f.slots);
+        }
+        self.values(&vm.globals);
+    }
+
     fn signal(&mut self, s: &Option<Signal>) {
         if let Some(Signal::Return(v)) = s {
             self.value(v);
@@ -256,8 +355,9 @@ impl Marker {
 }
 
 impl PyHost {
-    /// Mark from the roots — `vm`, the program's top-level VM at a safepoint,
-    /// and everything `trace_roots` names — and free what was not reached.
+    /// Mark from the roots — every registered VM (`vm` is the one at the
+    /// safepoint), every pin, and everything `trace_roots` names — and free
+    /// what was not reached.
     fn collect(&mut self, vm: &VM) {
         let mut marks = std::mem::take(&mut self.gc.marks);
         marks.reset(self.heap.len());
@@ -266,11 +366,21 @@ impl PyHost {
             pending: std::mem::take(&mut self.gc.pending),
             envs: HashSet::new(),
         };
-        m.values(&vm.stack);
-        for f in &vm.frames {
-            m.values(&f.slots);
+        let contexts = std::iter::once(&self.gc.main).chain(self.generators.iter().map(|g| &g.gc));
+        for cx in contexts {
+            for &ptr in &cx.vms {
+                if std::ptr::eq(ptr, vm) {
+                    m.vm(vm);
+                } else {
+                    // SAFETY: a registered VM is alive: it is deregistered
+                    // before its `finish_run` gives it up, and a suspended
+                    // generator's stay on its parked coroutine stack. Nothing
+                    // runs on it during the collection, which only reads it.
+                    m.vm(unsafe { &*ptr });
+                }
+            }
+            m.values(&cx.pins);
         }
-        m.values(&vm.globals);
         self.trace_roots(&mut m);
         while let Some(id) = m.pending.pop() {
             self.trace_object(id, &mut m);

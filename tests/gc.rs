@@ -122,3 +122,62 @@ print(first, next(g), list(unstarted))
         "held-across-yield held-across-yield! ['held-across-yield', 'held-across-yield!']\n"
     );
 }
+
+/// Collection reaches into `try` bodies and around suspended generators: the
+/// locals of a function's `try` and `except` blocks, a generator suspended
+/// inside a `try`, and one delegating with `yield from` keep their objects
+/// while garbage is collected around them — inside a module-level `try`, after
+/// importing modules that leave generators suspended (`typing`, `enum`),
+/// where the 3,000 short-lived objects then reuse ids.
+#[test]
+fn try_bodies_and_suspended_generators_collect_safely() {
+    let src = r#"
+import typing, enum
+class Node:
+    def __init__(self, v):
+        self.v = v
+def churn(n):
+    for i in range(n):
+        junk = [Node(i), {i: str(i)}]
+def in_try():
+    try:
+        keep = Node('try-local')
+        churn(2000)
+        raise ValueError(keep.v)
+    except ValueError as e:
+        held = Node('handler-local')
+        churn(2000)
+        return str(e) + '/' + held.v
+def gen_in_try():
+    try:
+        x = Node('gen-try')
+        yield x.v
+        yield x.v + '!'
+    finally:
+        pass
+def inner():
+    a = Node('inner')
+    yield a.v
+    yield a.v + '?'
+    return Node('ret').v
+def outer():
+    r = yield from inner()
+    yield r
+g1 = gen_in_try(); g2 = outer()
+first = (next(g1), next(g2))
+churn(3000)
+second = (next(g1), next(g2), next(g2))
+try:
+    ids = set()
+    for i in range(3000):
+        ids.add(id(Node(i)))
+    reused = len(ids) < 3000
+except Exception:
+    reused = None
+print(in_try(), first, second, reused)
+"#;
+    assert_eq!(
+        run(src, true),
+        "try-local/handler-local ('gen-try', 'inner') ('gen-try!', 'inner?', 'ret') True\n"
+    );
+}
