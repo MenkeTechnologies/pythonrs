@@ -180,7 +180,9 @@ use std::path::PathBuf;
 /// with `GETGLOBAL`.
 /// v62: a method that reads `__class__` is marked (`FuncDef::binds_class_cell`,
 /// a new field) and the read walks the environment.
-const SCHEMA: u64 = 62;
+/// v63: every function whose body has no `try`/`with` is linked, not only the
+/// slot-safe ones.
+const SCHEMA: u64 = 63;
 
 /// The shard's INDEX: everything a lookup needs, and nothing it does not.
 ///

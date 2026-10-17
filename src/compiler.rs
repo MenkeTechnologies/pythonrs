@@ -287,9 +287,8 @@ pub struct Compiler {
     /// accumulated as each chunk is built and handed to `Program.positions`.
     collected_positions: Vec<(u64, Vec<Span>)>,
     /// Def ids whose body can run as a fusevm frame on the main chunk's VM:
-    /// it never leaves its chunk through a signal or a sub-chunk (the
-    /// [`fn_slots_allowed`] functions). `link_functions` copies each one into
-    /// the main chunk.
+    /// a plain function whose body never leaves its chunk ([`stays_in_chunk`]).
+    /// `link_functions` copies each one into the main chunk.
     linkable: Vec<usize>,
     /// Whether a name the current scope neither slots nor closes over is a
     /// global or a builtin, which it is in the body of a slot-safe function: its
@@ -2775,7 +2774,7 @@ impl Compiler {
             binds_class_cell,
         };
         self.functions.push((name.to_string(), def));
-        if slot_safe {
+        if kind.is_function() && !is_gen_or_async && !self.debug && stays_in_chunk(body) {
             self.linkable.push(self.functions.len() - 1);
         }
         Ok(self.functions.len() - 1)
@@ -6976,6 +6975,39 @@ fn native_writebacks_valid(
 /// signal path instead. The walk descends through `if`/`try`/`with`/`match`
 /// (which share this loop) but NOT into nested `for`/`while`/`def`/`class`
 /// (which own their own `break`/`continue`).
+/// Whether a function body runs entirely in its own chunk, so it can run as a
+/// fusevm frame on its caller's VM: no `try` or `with`, which lower to
+/// sub-chunks that leave through control signals (as does a loop whose
+/// `break`/`continue` crosses one). A nested `def` or `class` body is a chunk
+/// of its own and does not count.
+fn stays_in_chunk(body: &[Stmt]) -> bool {
+    body.iter().all(|s| match &s.kind {
+        StmtKind::Try { .. } | StmtKind::With { .. } => false,
+        StmtKind::If { body, orelse, .. }
+        | StmtKind::While { body, orelse, .. }
+        | StmtKind::For { body, orelse, .. } => stays_in_chunk(body) && stays_in_chunk(orelse),
+        StmtKind::Match { cases, .. } => cases.iter().all(|c| stays_in_chunk(&c.body)),
+        StmtKind::Expr(_)
+        | StmtKind::Assign { .. }
+        | StmtKind::AugAssign { .. }
+        | StmtKind::AnnAssign { .. }
+        | StmtKind::FuncDef { .. }
+        | StmtKind::ClassDef { .. }
+        | StmtKind::Return(_)
+        | StmtKind::Delete(_)
+        | StmtKind::Pass
+        | StmtKind::Break
+        | StmtKind::Continue
+        | StmtKind::Import(_)
+        | StmtKind::ImportFrom { .. }
+        | StmtKind::Global(_)
+        | StmtKind::Nonlocal(_)
+        | StmtKind::Raise { .. }
+        | StmtKind::Assert { .. }
+        | StmtKind::TypeAlias { .. } => true,
+    })
+}
+
 fn loop_needs_signal(body: &[Stmt]) -> bool {
     fn scan(stmts: &[Stmt], in_boundary: bool) -> bool {
         stmts.iter().any(|s| match &s.kind {
