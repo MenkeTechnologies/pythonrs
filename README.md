@@ -256,10 +256,12 @@ lexer  →  parser  →  AST  →  compiler  →  fusevm::Chunk  →  fusevm VM 
 - `host/gc.rs` — the heap's mark-and-sweep collector (libpython-free build). It
   never moves an object, so ids stay stable, and freed slots are reused. It
   collects only where every live object is reachable from a root it knows,
-  between operations: in module code, a function it calls on the same VM, or a
-  `try`/`with` block in either, with suspended generators parked at a `yield`
-  and an idle asyncio loop. A callback a builtin makes (`sorted(key=...)`), a
-  running generator body and asyncio code do not collect yet.
+  between operations: in module code, in a function called from Python code
+  (on the same VM or one of its own), or in a `try`/`with` block in any of
+  them, with suspended generators parked at a `yield` and an idle asyncio
+  loop. A callback a builtin makes (`sorted(key=...)`), a method reached
+  through a bound-method object or a constructor, a running generator body and
+  asyncio code do not collect yet.
 - `builtins.rs` — the `CallBuiltin` handler table, the numeric hook, the Kernel
   builtin functions (`print` / `len` / `range` / …), and per-type methods.
 - `cache.rs` — the rkyv-shard bytecode cache.

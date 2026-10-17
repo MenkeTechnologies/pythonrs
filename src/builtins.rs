@@ -1461,23 +1461,37 @@ fn run_loaded(
     kwargs: Vec<(String, Value)>,
 ) -> Value {
     if let Some(linked) = host::linked_callee(vm, callee) {
-        let (recv, owner) = if is_no_value(self_slot) {
-            (None, None)
-        } else {
-            (Some(self_slot.clone()), host::bound_method_owner(self_slot, name))
-        };
+        let (recv, owner) = loaded_receiver(self_slot, name);
         let r = host::enter_linked(vm, linked, recv, owner, args, kwargs, None);
         return entered(vm, r);
     }
+    // A plain function on a VM of its own: what `call_loaded` does for one,
+    // as a run the collector may work inside (nothing here is read after it).
+    if let Some(fv) = host::plain_function(callee) {
+        let (recv, owner) = loaded_receiver(self_slot, name);
+        let r = host::run_user_func_transparent(&fv, recv, owner, args, kwargs);
+        return finish(vm, r);
+    }
     let r = call_loaded(self_slot, name, callee, args, kwargs);
     finish(vm, r)
+}
+
+/// The receiver and defining class a loaded method call runs its function
+/// with: none for a callee found without one (`self_slot` empty).
+fn loaded_receiver(self_slot: &Value, name: &str) -> (Option<Value>, Option<String>) {
+    if is_no_value(self_slot) {
+        (None, None)
+    } else {
+        (Some(self_slot.clone()), host::bound_method_owner(self_slot, name))
+    }
 }
 
 /// Call `callable` from `vm`. A function whose body is linked into the chunk
 /// `vm` runs is entered as a frame on `vm` itself (`host::enter_linked`), and
 /// the value pushed here is a placeholder its return discards; so is a class
 /// whose `__init__` is such a function, once its instance exists. Any other
-/// callable is invoked and its result pushed.
+/// callable is invoked and its result pushed; a plain function runs as a run
+/// the collector may work inside, since nothing here is read after it.
 fn call_value(vm: &mut VM, callable: &Value, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Value {
     if let Some(linked) = host::linked_callee(vm, callable) {
         let r = host::enter_linked(vm, linked, None, None, args, kwargs, None);
@@ -1514,6 +1528,10 @@ fn call_value(vm: &mut VM, callable: &Value, args: Vec<Value>, kwargs: Vec<(Stri
                 finish(vm, r)
             }
         };
+    }
+    if let Some(fv) = host::plain_function(callable) {
+        let r = host::run_user_func_transparent(&fv, None, None, args, kwargs);
+        return finish(vm, r);
     }
     let r = host::invoke(callable, args, kwargs);
     finish(vm, r)
@@ -4481,6 +4499,10 @@ fn b_try(vm: &mut VM, _: u8) -> Value {
     // finally always runs; a finally error/return supersedes.
     if let Some(fin) = &td.finalbody {
         let sig_before = with_host(|h| h.signal.take());
+        // A `return` from the body waits here while the `finally` runs.
+        if let Some(host::Signal::Return(v)) = &sig_before {
+            pins.add(v.clone());
+        }
         // An exception passing through the `finally` is re-raised from where
         // it was raised (`RERAISE` restores the frame's position), not from
         // the last line the `finally` body ran.

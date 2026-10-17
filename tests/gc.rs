@@ -181,3 +181,32 @@ print(in_try(), first, second, reused)
         "try-local/handler-local ('gen-try', 'inner') ('gen-try!', 'inner?', 'ret') True\n"
     );
 }
+
+/// A value `return`ed from a `try` waits while its `finally` runs code that
+/// makes garbage, and a function called from a `try` body collects on a VM of
+/// its own; the returned objects survive both.
+#[test]
+fn a_return_survives_its_finally_and_calls_from_try_bodies() {
+    let src = r#"
+class Node:
+    def __init__(self, v):
+        self.v = v
+def churn(n):
+    for i in range(n):
+        junk = [Node(i), {i: str(i)}]
+def f():
+    try:
+        return (Node('returned'), [Node('inside')])
+    finally:
+        churn(2000)
+def call_from_try():
+    try:
+        r = f()
+        churn(2000)
+        return r[0].v + '/' + r[1][0].v
+    except Exception:
+        return None
+print(call_from_try())
+"#;
+    assert_eq!(run(src, true), "returned/inside\n");
+}

@@ -5222,11 +5222,14 @@ fn finish_run(mut vm: Box<VM>, pool_key: Option<u64>, opaque: bool) -> Result<Va
 /// function body, run it, drop the copy" into "reset a VM and run".
 ///
 /// `slots` seeds the entry frame's slots — the arguments of a
-/// [`FuncDef::params_in_slots`] function, empty for any other.
+/// [`FuncDef::params_in_slots`] function, empty for any other. `opaque` is as
+/// for [`gc::RunGuard`]: false only when the callers hold nothing the collector
+/// cannot reach.
 pub fn run_chunk_cached(
     key: u64,
     make: impl FnOnce() -> Chunk,
     slots: Vec<Value>,
+    opaque: bool,
 ) -> Result<Value, String> {
     let pooled = VM_POOL.with(|p| p.borrow_mut().get_mut(&key).and_then(|v| v.pop()));
     let mut vm = match pooled {
@@ -5242,7 +5245,7 @@ pub fn run_chunk_cached(
     if !slots.is_empty() {
         vm.frames[0].slots.extend(slots);
     }
-    finish_run(vm, Some(key), true)
+    finish_run(vm, Some(key), opaque)
 }
 
 /// Run the top-level program chunk.
@@ -18542,6 +18545,30 @@ pub fn run_user_func(
     args: Vec<Value>,
     kwargs: Vec<(String, Value)>,
 ) -> Result<Value, String> {
+    call_user_func(fv, self_opt, owner_opt, args, kwargs, true)
+}
+
+/// [`run_user_func`] for a caller that reads nothing it holds once the call
+/// returns — a call op on a plain function — so the collector may run inside
+/// the call (its VM run is transparent, see `gc`).
+pub fn run_user_func_transparent(
+    fv: &FuncVal,
+    self_opt: Option<Value>,
+    owner_opt: Option<String>,
+    args: Vec<Value>,
+    kwargs: Vec<(String, Value)>,
+) -> Result<Value, String> {
+    call_user_func(fv, self_opt, owner_opt, args, kwargs, false)
+}
+
+fn call_user_func(
+    fv: &FuncVal,
+    self_opt: Option<Value>,
+    owner_opt: Option<String>,
+    args: Vec<Value>,
+    kwargs: Vec<(String, Value)>,
+    opaque: bool,
+) -> Result<Value, String> {
     // Clone the function's METADATA, never its bytecode. `FuncDef::clone` copies
     // the whole `Chunk` (ops, constants, names), and this runs on every single
     // Python call — `fib(27)` cloned 400k copies of a 30-op chunk it then only
@@ -18621,7 +18648,7 @@ pub fn run_user_func(
         h.frames.push(frame);
         saved
     });
-    let r = run_chunk_cached(def_id as u64, || def.chunk.clone(), slots);
+    let r = run_chunk_cached(def_id as u64, || def.chunk.clone(), slots, opaque);
     let sig = with_host(|h| {
         if r.is_err() {
             h.push_tb_frame();
@@ -18731,6 +18758,14 @@ pub fn linked_callee(vm: &VM, callable: &Value) -> Option<LinkedCallee> {
             name: h.func_names[fv.def_id].clone(),
             env: h.take_call_env(fv.env.clone()),
         })
+    })
+}
+
+/// `callable`'s function when it is a plain one (`PyObj::Func`).
+pub fn plain_function(callable: &Value) -> Option<Rc<FuncVal>> {
+    with_host(|h| match h.get(callable) {
+        Some(PyObj::Func(fv)) => Some(fv.clone()),
+        _ => None,
     })
 }
 
