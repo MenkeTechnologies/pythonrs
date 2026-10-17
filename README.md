@@ -253,6 +253,10 @@ lexer  →  parser  →  AST  →  compiler  →  fusevm::Chunk  →  fusevm VM 
   copies.
 - `host.rs` — the `PyHost` object heap (str/list/dict/tuple/set/instances/…), the
   operator/attribute/item/iteration semantics, and the fusevm run plumbing.
+  Each class memoizes its MRO lookups and whether its instances' attribute
+  reads and writes can go straight to their `__dict__`, until a class is
+  defined or a class namespace changes. Python dicts and sets hash with
+  foldhash, seeded per map; the host's internal tables use the Fx hash.
 - `host/gc.rs` — the heap's mark-and-sweep collector (libpython-free build). It
   never moves an object, so ids stay stable, and freed slots are reused. It
   collects only where every live object is reachable from a root it knows,

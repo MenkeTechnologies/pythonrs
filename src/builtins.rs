@@ -5,9 +5,8 @@
 //! stack, call into the `host` object model, and push the result back.
 
 use crate::excgroup;
-use crate::host::{self, ops, with_host, Instance, IterKind, PKey, PyObj};
+use crate::host::{self, ops, with_host, DictMap, Instance, IterKind, PKey, PyObj, SetMap};
 use fusevm::{NumOp, Value, VM};
-use indexmap::IndexMap;
 
 /// Register every pythonrs builtin id on a VM.
 pub fn install(vm: &mut VM) {
@@ -1100,7 +1099,7 @@ fn b_mktuple(vm: &mut VM, argc: u8) -> Value {
 
 fn b_mkset(vm: &mut VM, argc: u8) -> Value {
     let items = pop_n(vm, argc as usize);
-    let mut set: IndexMap<PKey, Value> = IndexMap::new();
+    let mut set: SetMap = SetMap::default();
     for it in items {
         // Instance elements resolve their key (running `__hash__`, collapsing a
         // value-equal earlier element) before the borrowed `to_key`.
@@ -1123,7 +1122,7 @@ fn b_mkset_const(vm: &mut VM, argc: u8) -> Value {
     let display = b_mkset(vm, argc);
     with_host(|h| {
         if let Some((folded, start)) = h.set_layout_of(&display) {
-            let empty = IndexMap::new();
+            let empty = SetMap::default();
             let n = folded.len();
             h.set_relayout_after_merge(
                 &display,
@@ -1138,7 +1137,7 @@ fn b_mkset_const(vm: &mut VM, argc: u8) -> Value {
 
 fn b_mkdict(vm: &mut VM, argc: u8) -> Value {
     let flat = pop_n(vm, argc as usize);
-    let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+    let mut d: DictMap = DictMap::default();
     let mut i = 0;
     while i + 1 < flat.len() {
         let k = flat[i].clone();
@@ -1187,9 +1186,9 @@ fn b_extend_tuple(vm: &mut VM, argc: u8) -> Value {
 fn b_extend_set(vm: &mut VM, argc: u8) -> Value {
     let mut items = pop_n(vm, argc as usize);
     let acc = items.remove(0);
-    let mut set: IndexMap<PKey, Value> = with_host(|h| match h.get(&acc) {
+    let mut set: SetMap = with_host(|h| match h.get(&acc) {
         Some(PyObj::Set(s)) => s.clone(),
-        _ => IndexMap::new(),
+        _ => Default::default(),
     });
     for it in items {
         let cands = with_host(|h| host::set_local_candidates(h, &set));
@@ -1212,9 +1211,9 @@ fn b_extend_set(vm: &mut VM, argc: u8) -> Value {
 fn b_extend_dict(vm: &mut VM, argc: u8) -> Value {
     let flat = pop_n(vm, argc as usize);
     let acc = flat[0].clone();
-    let mut d: IndexMap<PKey, (Value, Value)> = with_host(|h| match h.get(&acc) {
+    let mut d: DictMap = with_host(|h| match h.get(&acc) {
         Some(PyObj::Dict(m)) => m.clone(),
-        _ => IndexMap::new(),
+        _ => Default::default(),
     });
     let mut i = 1;
     while i + 1 < flat.len() {
@@ -1719,7 +1718,7 @@ fn b_build_args(vm: &mut VM, argc: u8) -> Value {
 /// only a plain `dict` used to, every other operand silently adding nothing.
 fn b_build_kwargs(vm: &mut VM, argc: u8) -> Value {
     let flat = pop_flat(vm, argc);
-    let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+    let mut d: DictMap = DictMap::default();
     let mut err: Option<host::KwSpreadError> = None;
     let mut i = 0;
     while i + 1 < flat.len() && err.is_none() {
@@ -1844,7 +1843,7 @@ fn mapping_pairs(v: &Value) -> Result<Option<Vec<(Value, Value)>>, String> {
 /// tag 1 = `**` spread of `a` (b unused), tag 0 = plain `(key a, val b)`.
 fn b_mkdict_ex(vm: &mut VM, argc: u8) -> Value {
     let flat = pop_flat(vm, argc);
-    let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+    let mut d: DictMap = DictMap::default();
     let mut i = 0;
     while i + 2 < flat.len() {
         let spread = matches!(flat[i], Value::Int(1));
@@ -3765,7 +3764,7 @@ fn inplace_builtin(tag: i64, a: &Value, b: &Value) -> Option<Result<Value, Strin
             return Some(Ok(a.clone()));
         }
         // `s ^= t` walks `t` in ITERATION order, discarding or adding each element.
-        let y: IndexMap<PKey, Value> = match with_host(|h| h.set_entries_in_order(b)) {
+        let y: SetMap = match with_host(|h| h.set_entries_in_order(b)) {
             Some(entries) if tag == iop::BITXOR => entries.into_iter().collect(),
             _ => y,
         };
@@ -3976,7 +3975,7 @@ fn percent_coerce_numeric(fmt: &[char], args: &Value) -> Result<Value, String> {
                 _ => Vec::new(),
             });
             let mut changed = false;
-            let mut out = IndexMap::new();
+            let mut out = DictMap::default();
             for (k, (kv, vv)) in pairs {
                 let key = with_host(|h| h.as_str(&kv));
                 let conv = convs
@@ -4034,8 +4033,8 @@ fn str_percent_format(fmt_val: &Value, args: &Value) -> Result<Value, String> {
         Some(PyObj::Dict(d)) if keyed => d.values().map(|(_, v)| v.clone()).collect(),
         _ => vec![args.clone()],
     });
-    let mut premap: std::collections::HashMap<u32, (String, String, String)> =
-        std::collections::HashMap::new();
+    let mut premap: host::HashMap<u32, (String, String, String)> =
+        host::HashMap::default();
     for it in &items {
         let Value::Obj(id) = it else { continue };
         if premap.contains_key(id) {
@@ -4735,7 +4734,7 @@ fn b_match_map_rest(vm: &mut VM, _: u8) -> Value {
     };
     let mut d = with_host(|h| match h.get(&subject) {
         Some(PyObj::Dict(d)) => d.clone(),
-        _ => IndexMap::new(),
+        _ => Default::default(),
     });
     for kv in &keys {
         if let Ok(k) = with_host(|h| h.to_key(kv)) {
@@ -5632,7 +5631,7 @@ fn numeric_hook_inner(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> 
 // ── builtin predicates ───────────────────────────────────────────────────────
 
 pub fn is_builtin_function(name: &str) -> bool {
-    BUILTIN_FUNCS.contains(&name)
+    BUILTIN_FUNC_NAMES.contains(name)
         || name.starts_with("math.")
         || name.starts_with("traceback.")
         || name.starts_with("collections.")
@@ -6125,8 +6124,21 @@ pub fn builtin_names() -> Vec<&'static str> {
     names
 }
 
+/// The builtin exception class names, hashed: the test runs on every builtin
+/// call and every user-class exception check, where a scan of `EXC_PARENTS`
+/// cost more than the call it gated.
+static EXC_NAMES: std::sync::LazyLock<rustc_hash::FxHashSet<&'static str>> =
+    std::sync::LazyLock::new(|| {
+        EXC_PARENTS.iter().map(|(c, _)| *c).chain(["BaseException"]).collect()
+    });
+
+/// `BUILTIN_FUNCS`, hashed: a bare name that no scope binds is tested
+/// against it on every read.
+static BUILTIN_FUNC_NAMES: std::sync::LazyLock<rustc_hash::FxHashSet<&'static str>> =
+    std::sync::LazyLock::new(|| BUILTIN_FUNCS.iter().copied().collect());
+
 pub fn is_exception_class(name: &str) -> bool {
-    EXC_PARENTS.iter().any(|(c, _)| *c == name) || name == "BaseException"
+    EXC_NAMES.contains(name)
 }
 
 pub fn is_known_builtin(name: &str) -> bool {
@@ -6466,6 +6478,11 @@ pub fn call_builtin_function(
         return Err(host::type_error(&format!(
             "cannot create '{name}' instances"
         )));
+    }
+    // Every arm up to `call_named_builtin` handles a dotted `module.func` or
+    // `type.method` name, or `mappingproxy`; a plain builtin skips them all.
+    if !name.contains('.') && name != "mappingproxy" {
+        return call_named_builtin(name, args, kwargs);
     }
     // math.* module functions.
     if let Some(m) = name.strip_prefix("math.") {
@@ -7007,6 +7024,17 @@ pub fn call_builtin_function(
             _ => Err(host::name_error(&format!("_contextvars.{f}"))),
         };
     }
+    call_named_builtin(name, args, kwargs)
+}
+
+/// The tail of [`call_builtin_function`]: the builtins named without a module
+/// or type prefix (`str`, `len`, the exception classes), plus the dotted names
+/// none of its prefix arms claimed.
+fn call_named_builtin(
+    name: &str,
+    args: Vec<Value>,
+    kwargs: Vec<(String, Value)>,
+) -> Result<Value, String> {
     // Exception constructors. The two group classes validate their arguments and
     // pick their concrete class (`BaseExceptionGroup` holding only `Exception`s
     // narrows to `ExceptionGroup`), so they route through PEP 654's constructor.
@@ -8301,7 +8329,7 @@ pub fn call_builtin_function(
                 Some(v) => host::iter_vec(v)?,
                 None => vec![],
             };
-            let mut s: IndexMap<PKey, Value> = IndexMap::new();
+            let mut s: SetMap = SetMap::default();
             for it in items {
                 let cands = with_host(|h| host::set_local_candidates(h, &s));
                 let k = host::with_instance_key(&it, host::KeyRole::Set, &cands, || {
@@ -8313,7 +8341,7 @@ pub fn call_builtin_function(
             Ok(with_host(|h| {
                 let out = h.new_setlike(s, name == "frozenset");
                 if let Some((incoming, src)) = merged_from {
-                    let empty = IndexMap::new();
+                    let empty = SetMap::default();
                     h.set_relayout_after_merge(
                         &out,
                         (&empty, host::SET_MINSIZE),
@@ -9421,7 +9449,7 @@ fn exec_global_names(src: &str) -> Vec<String> {
 /// `globals()`/`locals()`, insertion order preserved.
 fn str_keyed_dict(pairs: Vec<(String, Value)>) -> Value {
     with_host(|h| {
-        let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::with_capacity(pairs.len());
+        let mut d: DictMap = DictMap::with_capacity_and_hasher(pairs.len(), Default::default());
         for (k, v) in pairs {
             let key = h.new_str(k.clone());
             d.insert(PKey::Str(k), (key, v));
@@ -10647,7 +10675,7 @@ fn construct_float(args: &[Value]) -> Result<Value, String> {
 }
 
 fn construct_dict(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, String> {
-    let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+    let mut d: DictMap = DictMap::default();
     if let Some(v) = args.first() {
         // dict(mapping): a real dict OR a dict-subclass instance (`class D(dict)`),
         // whose native dict lives in its payload — unwrap it so `dict(d)` copies
@@ -11567,7 +11595,7 @@ fn call_posix(name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Res
         "abort" => std::process::exit(134),
         "sync" | "sched_yield" => Ok(Value::Undef),
         "_create_environ" => Ok(with_host(|h| {
-            let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+            let mut d: DictMap = DictMap::default();
             for (k, val) in std::env::vars() {
                 let kb = k.into_bytes();
                 let kv = h.alloc(PyObj::Bytes(kb.clone()));
@@ -11919,7 +11947,7 @@ pub fn call_copy(name: &str, args: &[Value]) -> Result<Value, String> {
             // which a user `__deepcopy__(self, memo)` hands back to `deepcopy`.
             let memo = match args.get(1) {
                 Some(m) if !matches!(m, Value::Undef) => m.clone(),
-                _ => with_host(|h| h.new_dict(IndexMap::new())),
+                _ => with_host(|h| h.new_dict(Default::default())),
             };
             copy_deep(&v, &memo)
         }
@@ -12111,8 +12139,8 @@ fn copy_shallow(v: &Value) -> Result<Value, String> {
     }
     enum K {
         List(Vec<Value>),
-        Dict(IndexMap<PKey, (Value, Value)>, Option<host::DictMeta>),
-        Set(IndexMap<PKey, Value>),
+        Dict(DictMap, Option<host::DictMeta>),
+        Set(SetMap),
         Bytearray(Vec<u8>),
         Instance(Instance),
         Same,
@@ -12152,7 +12180,7 @@ fn copy_shallow(v: &Value) -> Result<Value, String> {
         K::Instance(inst) => {
             let pairs = match h.get(&inst.dict) {
                 Some(PyObj::Dict(d)) => d.clone(),
-                _ => IndexMap::new(),
+                _ => Default::default(),
             };
             let dict = h.alloc(PyObj::Dict(pairs));
             let out = h.alloc(PyObj::Instance(Instance {
@@ -12244,11 +12272,11 @@ fn copy_deep(v: &Value, memo: &Value) -> Result<Value, String> {
             Ok(out)
         }
         K::Dict(pairs, meta) => {
-            let out = with_host(|h| h.new_dict(IndexMap::new()));
+            let out = with_host(|h| h.new_dict(Default::default()));
             if let Some(i) = id {
                 memo_put(memo, i, out.clone());
             }
-            let mut nd: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+            let mut nd: DictMap = DictMap::default();
             for (k, val) in &pairs {
                 let ck = copy_deep(k, memo)?;
                 let cv = copy_deep(val, memo)?;
@@ -12266,7 +12294,7 @@ fn copy_deep(v: &Value, memo: &Value) -> Result<Value, String> {
             Ok(out)
         }
         K::Set(items) => {
-            let mut copied: IndexMap<PKey, Value> = IndexMap::new();
+            let mut copied: SetMap = SetMap::default();
             for it in &items {
                 let ci = copy_deep(it, memo)?;
                 let key = with_host(|h| h.to_key(&ci))?;
@@ -12291,7 +12319,7 @@ fn copy_deep(v: &Value, memo: &Value) -> Result<Value, String> {
             } else {
                 copy_deep(&payload, memo)?
             };
-            let dict = with_host(|h| h.alloc(PyObj::Dict(IndexMap::new())));
+            let dict = with_host(|h| h.alloc(PyObj::Dict(Default::default())));
             let out = with_host(|h| {
                 h.alloc(PyObj::Instance(Instance {
                     class,
@@ -12302,7 +12330,7 @@ fn copy_deep(v: &Value, memo: &Value) -> Result<Value, String> {
             if let Some(i) = id {
                 memo_put(memo, i, out.clone());
             }
-            let mut nd: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+            let mut nd: DictMap = DictMap::default();
             for (k, val) in &pairs {
                 let cv = copy_deep(val, memo)?;
                 let key = with_host(|h| h.to_key(k))?;
@@ -13828,7 +13856,7 @@ pub fn re_match_method(m: &Value, method: &str, args: &[Value]) -> Result<Value,
         }
         "groupdict" => {
             let named = named.clone();
-            let mut d: indexmap::IndexMap<host::PKey, (Value, Value)> = indexmap::IndexMap::new();
+            let mut d = DictMap::default();
             for (name, idx) in named {
                 let k = with_host(|h| h.new_str(name.clone()));
                 d.insert(host::PKey::Str(name), (k, group_str(idx)));
@@ -16549,7 +16577,7 @@ fn nt_instance_method(
     })?;
     match name {
         "_asdict" => Some(Ok(with_host(|h| {
-            let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+            let mut d: DictMap = DictMap::default();
             for (f, v) in fields.iter().zip(items.iter()) {
                 let kv = h.new_str(f.clone());
                 d.insert(PKey::Str(f.clone()), (kv, v.clone()));
@@ -17336,7 +17364,7 @@ fn instance_state(recv: &Value) -> Result<Value, String> {
         return Ok(state);
     }
     Ok(with_host(|h| {
-        let mut pairs = IndexMap::new();
+        let mut pairs = DictMap::default();
         for (k, v) in slots {
             let key = h.new_str(k.clone());
             pairs.insert(PKey::Str(k), (key, v));
@@ -19595,7 +19623,7 @@ pub fn type_new_meta(
 }
 
 fn str_maketrans(args: &[Value]) -> Result<Value, String> {
-    let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+    let mut d: DictMap = DictMap::default();
     if args.len() == 1 {
         // A mapping: string-of-length-1 keys become ordinals; int keys stay.
         let pairs = with_host(|h| match h.get(&args[0]) {
@@ -20617,7 +20645,7 @@ fn dict_fromkeys(kind: Option<host::DictKind>, args: &[Value]) -> Result<Value, 
     )?;
     let keys = host::iter_vec(&arg0(args)?)?;
     let value = args.get(1).cloned().unwrap_or(Value::Undef);
-    let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+    let mut d: DictMap = DictMap::default();
     for k in keys {
         let cands = with_host(|h| host::dict_local_candidates(h, &d));
         let key = host::with_instance_key(&k, host::KeyRole::Dict, &cands, || {
@@ -20749,7 +20777,7 @@ fn dict_method(
         "copy" => {
             let d = with_host(|h| match h.get(recv) {
                 Some(PyObj::Dict(d)) => d.clone(),
-                _ => IndexMap::new(),
+                _ => Default::default(),
             });
             Ok(match host::dict_meta_of(recv) {
                 Some(meta) => host::alloc_dict_subtype(d, meta.kind, meta.factory),
@@ -20995,13 +21023,13 @@ fn set_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
             let (s, frozen) = with_host(|h| match h.get(recv) {
                 Some(PyObj::Set(s)) => (s.clone(), false),
                 Some(PyObj::Frozenset(s)) => (s.clone(), true),
-                _ => (IndexMap::new(), false),
+                _ => (Default::default(), false),
             });
             let src = set_merge_source(recv);
             Ok(with_host(|h| {
                 let out = h.new_setlike(s, frozen);
                 if let Some((incoming, src)) = src {
-                    let empty = IndexMap::new();
+                    let empty = SetMap::default();
                     h.set_relayout_after_merge(
                         &out,
                         (&empty, host::SET_MINSIZE),
@@ -21340,7 +21368,7 @@ fn dictitems_xor(a: &Value, b: &Value) -> Result<Value, String> {
 /// and every argument in turn, coercing non-set arguments to sets. With no
 /// arguments it returns a copy of the receiver (preserving set/frozenset type).
 /// A set layout as [`host::PyHost::set_layout_of`] hands it out.
-type SetLayout = (IndexMap<PKey, Value>, usize);
+type SetLayout = (SetMap, usize);
 
 /// What `set_update_internal` folds in with ONE presizing resize rather than
 /// element by element: a set or frozenset, or an exact `dict`. Gives the
@@ -21353,7 +21381,7 @@ fn set_merge_source(v: &Value) -> Option<(usize, Option<SetLayout>)> {
     })
 }
 
-fn src_ref(src: &Option<SetLayout>) -> Option<(&IndexMap<PKey, Value>, usize)> {
+fn src_ref(src: &Option<SetLayout>) -> Option<(&SetMap, usize)> {
     src.as_ref().map(|(m, start)| (m, *start))
 }
 
@@ -24518,7 +24546,7 @@ fn counter_binop(a: &Value, b: &Value, op: char) -> Option<Result<Value, String>
             keys.push((k.clone(), kv.clone()));
         }
     }
-    let mut out: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+    let mut out: DictMap = DictMap::default();
     for (k, kv) in keys {
         let (x, y) = (get(&da, &k), get(&db, &k));
         let val = match op {
@@ -24715,7 +24743,7 @@ fn construct_collection(
             // through it means a keyword count is added, not coerced: `1.5` stays
             // `1.5` and a bignum stays exact, where the old `as_int` store
             // rewrote both to `0`.
-            let c = host::alloc_dict_subtype(IndexMap::new(), host::DictKind::Counter, None);
+            let c = host::alloc_dict_subtype(Default::default(), host::DictKind::Counter, None);
             counter_add(&c, &args, &kwargs, 1)?;
             Ok(c)
         }
@@ -24736,7 +24764,7 @@ fn construct_collection(
                 )));
             }
             let dd =
-                host::alloc_dict_subtype(IndexMap::new(), host::DictKind::DefaultDict, factory);
+                host::alloc_dict_subtype(Default::default(), host::DictKind::DefaultDict, factory);
             dict_method(&dd, "update", rest, &kwargs)?;
             Ok(dd)
         }
@@ -24749,7 +24777,7 @@ fn construct_collection(
                     args.len()
                 )));
             }
-            let od = host::alloc_dict_subtype(IndexMap::new(), host::DictKind::OrderedDict, None);
+            let od = host::alloc_dict_subtype(Default::default(), host::DictKind::OrderedDict, None);
             dict_method(&od, "update", &args, &kwargs)?;
             Ok(od)
         }

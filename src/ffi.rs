@@ -2411,9 +2411,9 @@ fn py_to_value_node(host: &mut PyHost, py: Python, obj: &Bound<PyAny>) -> Result
     }
     if obj.is_exact_instance_of::<PyDict>() {
         let dict = obj.cast::<PyDict>().map_err(|e| e.to_string())?;
-        let out = host.new_dict(indexmap::IndexMap::new());
+        let out = host.new_dict(Default::default());
         remember_from_py(obj, &out);
-        let mut map = indexmap::IndexMap::new();
+        let mut map = crate::host::DictMap::default();
         for (k, v) in dict.iter() {
             let kv = py_to_value(host, py, &k)?;
             let vv = py_to_value(host, py, &v)?;
@@ -2426,7 +2426,7 @@ fn py_to_value_node(host: &mut PyHost, py: Python, obj: &Bound<PyAny>) -> Result
         return Ok(out);
     }
     if obj.is_exact_instance_of::<PySet>() || obj.is_exact_instance_of::<PyFrozenSet>() {
-        let mut map = indexmap::IndexMap::new();
+        let mut map = crate::host::SetMap::default();
         for it in obj.try_iter().map_err(|e| e.to_string())? {
             let iv = py_to_value(host, py, &it.map_err(|e| e.to_string())?)?;
             let key = host.to_key(&iv)?;

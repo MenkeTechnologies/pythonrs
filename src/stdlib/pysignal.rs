@@ -63,14 +63,14 @@ pub fn call(h: &mut PyHost, name: &str, args: &[Value]) -> Option<Result<Value, 
             Ok(h.new_str(format!("Signal {num}")))
         }
         "valid_signals" => {
-            let mut items: indexmap::IndexMap<crate::host::PKey, Value> = indexmap::IndexMap::new();
+            let mut items = crate::host::SetMap::default();
             for (_, n) in SIGNALS {
                 items.insert(crate::host::PKey::Int(*n as i64), Value::Int(*n as i64));
             }
             Ok(h.new_set(items))
         }
         // Nothing is masked, and there is no wakeup fd to write to.
-        "pthread_sigmask" => Ok(h.new_set(indexmap::IndexMap::new())),
+        "pthread_sigmask" => Ok(h.new_set(Default::default())),
         "set_wakeup_fd" => Ok(Value::Int(-1)),
         "siginterrupt" => Ok(Value::Undef),
         _ => return None,

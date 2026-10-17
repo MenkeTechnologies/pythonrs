@@ -1178,7 +1178,7 @@ fn sysconf(args: &[Value]) -> R {
 
 /// `posix.sysconf_names` as a ready dict.
 pub fn sysconf_names(h: &mut PyHost) -> Value {
-    let mut d = indexmap::IndexMap::new();
+    let mut d = crate::host::DictMap::default();
     for (n, c) in SYSCONF_NAMES {
         let k = h.new_str(*n);
         d.insert(

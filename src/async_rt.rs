@@ -860,8 +860,8 @@ pub fn wait(
     let outer = new_future();
     let oid = future_id(&outer).unwrap();
     if tasks.is_empty() {
-        let done = with_host(|h| h.alloc(PyObj::Set(indexmap::IndexMap::new())));
-        let pending = with_host(|h| h.alloc(PyObj::Set(indexmap::IndexMap::new())));
+        let done = with_host(|h| h.alloc(PyObj::Set(Default::default())));
+        let pending = with_host(|h| h.alloc(PyObj::Set(Default::default())));
         let tup = with_host(|h| h.new_tuple(vec![done, pending]));
         settle(oid, tup, None, false);
         return Ok(outer);
@@ -953,8 +953,8 @@ pub fn as_completed(aws: Vec<Value>) -> Result<Value, String> {
     Ok(with_host(|h| h.new_list(outs)))
 }
 
-fn build_set(items: &[Value]) -> indexmap::IndexMap<crate::host::PKey, Value> {
-    let mut m = indexmap::IndexMap::new();
+fn build_set(items: &[Value]) -> crate::host::SetMap {
+    let mut m = crate::host::SetMap::default();
     for (i, v) in items.iter().enumerate() {
         // Futures aren't hashable by value; key by heap identity via a synthetic
         // int key so the set holds each distinct task once.

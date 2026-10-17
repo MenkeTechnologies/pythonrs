@@ -364,7 +364,7 @@ impl PyHost {
         let mut m = Marker {
             marks,
             pending: std::mem::take(&mut self.gc.pending),
-            envs: HashSet::new(),
+            envs: HashSet::default(),
         };
         let contexts = std::iter::once(&self.gc.main).chain(self.generators.iter().map(|g| &g.gc));
         for cx in contexts {

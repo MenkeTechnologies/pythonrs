@@ -1335,6 +1335,7 @@ dependencies = [
  "digest",
  "dirs",
  "fancy-regex",
+ "foldhash",
  "fusevm",
  "glob",
  "indexmap",

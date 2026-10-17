@@ -87,6 +87,7 @@ fusevm = { version = "0.26.10", features = ["jit", "jit-disk-cache", "aot", "ffi
 clap = { version = "4.5", features = ["derive", "cargo"] }
 thiserror = "2.0"
 rustc-hash = "2.1"
+foldhash = "0.2"
 # Python dict preserves insertion order (guaranteed since 3.7, observable in
 # iteration/repr).
 indexmap = "2"

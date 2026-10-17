@@ -19,7 +19,7 @@ use crate::async_rt;
 use fusevm::{Chunk, NumOp, VMResult, Value, VM};
 use indexmap::IndexMap;
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 use std::rc::Rc;
 
 pub(crate) mod gc;
@@ -1057,11 +1057,11 @@ pub enum PyObj {
     Bytes(Vec<u8>),
     List(Vec<Value>),
     Tuple(Vec<Value>),
-    Dict(IndexMap<PKey, (Value, Value)>),
-    Set(IndexMap<PKey, Value>),
+    Dict(DictMap),
+    Set(SetMap),
     /// An immutable, hashable `frozenset`. Same storage as `Set`, but usable as
     /// a dict key / set member (see `PKey::Frozenset`) and immutable.
-    Frozenset(IndexMap<PKey, Value>),
+    Frozenset(SetMap),
     /// A live `dict_keys`/`dict_values`/`dict_items` view. Holds a handle to the
     /// backing dict (not a snapshot), so it reflects later mutations. `kind`:
     /// 0 = keys, 1 = values, 2 = items.
@@ -1906,7 +1906,7 @@ pub struct NtMeta {
 /// `PyObj::LruCache.cache_id`. `order` records insertion order for eviction when
 /// `maxsize` is set (`None` == unbounded). Keys are the hashable arg tuple.
 pub struct LruData {
-    pub map: IndexMap<PKey, Value>,
+    pub map: SetMap,
     pub order: VecDeque<PKey>,
     pub maxsize: Option<usize>,
     pub hits: u64,
@@ -1940,7 +1940,36 @@ pub type NameMap = IndexMap<String, Value, rustc_hash::FxBuildHasher>;
 /// `global` and `nonlocal` declarations), almost always empty, and building an
 /// empty std `HashSet` seeds a `RandomState` from thread-local storage on every
 /// Python call; this one costs nothing to build.
-pub type NameSet = std::collections::HashSet<String, rustc_hash::FxBuildHasher>;
+pub type NameSet = HashSet<String>;
+/// The host's own hash tables (side tables keyed by heap id, interned names,
+/// op hashes) use the Fx hash: their keys come from the interpreter, not from
+/// program data, so SipHash's flooding resistance buys nothing there and costs
+/// a large share of every probe. Python dicts and sets use [`PyHasher`].
+pub type HashMap<K, V> = std::collections::HashMap<K, V, rustc_hash::FxBuildHasher>;
+pub type HashSet<T> = std::collections::HashSet<T, rustc_hash::FxBuildHasher>;
+
+/// The hasher behind Python dicts and sets: foldhash, seeded per map like
+/// std's `RandomState` (so key hashes stay unpredictable across runs, as
+/// CPython's are) but several times cheaper per key than SipHash.
+pub type PyHasher = foldhash::fast::RandomState;
+/// A dict's entries: key → (original key object, value), in insertion order.
+pub type DictMap = IndexMap<PKey, (Value, Value), PyHasher>;
+/// A set's or frozenset's elements: key → original element, in insertion order.
+pub type SetMap = IndexMap<PKey, Value, PyHasher>;
+
+/// What one class answers on the attribute fast paths: each name
+/// [`PyHost::class_lookup`] resolved through its MRO (`None` for a miss),
+/// whether it is an exception class, and whether its instances' attribute
+/// reads and writes may go straight to their `__dict__`
+/// ([`PyHost::dict_reads`], [`PyHost::dict_writes`]). Valid until a class is
+/// registered or a class namespace changes.
+#[derive(Default)]
+struct ClassMemo {
+    lookups: HashMap<String, Option<Value>>,
+    is_exception: Option<bool>,
+    dict_reads: Option<bool>,
+    dict_writes: Option<bool>,
+}
 
 /// `sys.int_info.default_max_str_digits` (`_PY_LONG_DEFAULT_MAX_STR_DIGITS`).
 pub const INT_MAX_STR_DIGITS_DEFAULT: usize = 4300;
@@ -2348,7 +2377,7 @@ pub struct PyHost {
     /// `String` copied out of the `FuncDef` on every call.
     pub func_names: Vec<Rc<str>>,
     /// Class templates by name.
-    pub classes: IndexMap<String, ClassDef>,
+    pub classes: IndexMap<String, ClassDef, rustc_hash::FxBuildHasher>,
     /// The `__class__` cell of each method defined in the body of a class that
     /// CPython built (a class with a foreign base, see [`build_class_foreign`]),
     /// keyed by the owner tag its `FuncVal::owner` carries. Such a class has no
@@ -2364,6 +2393,11 @@ pub struct PyHost {
     /// cache is dropped whenever a class is registered, since a new class can
     /// change what an existing name resolves to.
     mro_cache: std::cell::RefCell<HashMap<String, std::rc::Rc<Vec<String>>>>,
+    /// Per-class answers to the questions every instance attribute read, write
+    /// and construction asks ([`ClassMemo`]). Dropped with `mro_cache`, and by
+    /// [`Self::class_ns_changed`] whenever a class namespace gains or loses a
+    /// name.
+    class_memo: std::cell::RefCell<HashMap<String, ClassMemo>>,
     /// What `__slots__` give each class's instances ([`SlotLayout`]), memoized
     /// because every instance attribute read and write consults it. Dropped
     /// with `mro_cache`, and whenever a class namespace gains or loses a name
@@ -2808,7 +2842,7 @@ thread_local! {
     /// chunk it builds; `record_err_line` looks the failing op's span up here to
     /// draw a CPython-style traceback caret. Grows for the process lifetime, like
     /// the object heap.
-    static POSITIONS: RefCell<HashMap<u64, Vec<Span>>> = RefCell::new(HashMap::new());
+    static POSITIONS: RefCell<HashMap<u64, Vec<Span>>> = RefCell::new(HashMap::default());
 }
 
 /// Register a chunk's op-index → span table under its `op_hash`. Called by the
@@ -2837,7 +2871,7 @@ thread_local! {
     /// `__eq__`), then read by the borrowed [`PyHost::to_key`] which cannot itself
     /// run user code. A single container op prepares its instance key(s) here just
     /// before the borrowed access and clears them right after.
-    static PENDING_KEY: RefCell<HashMap<u32, PKey>> = RefCell::new(HashMap::new());
+    static PENDING_KEY: RefCell<HashMap<u32, PKey>> = RefCell::new(HashMap::default());
 }
 
 /// Insert a resolved instance key for `id` into the pending-key table.
@@ -2869,7 +2903,7 @@ thread_local! {
     /// *outside* any borrow (via [`prefetch_foreign_display`]) and reading it from
     /// the borrowed [`PyHost::str_of`]/[`PyHost::repr_of`] avoids the double borrow.
     static PENDING_DISPLAY: RefCell<HashMap<u32, (String, String)>> =
-        RefCell::new(HashMap::new());
+        RefCell::new(HashMap::default());
 }
 
 /// Read the prefetched `(str, repr)` for a foreign id, if prepared.
@@ -2926,7 +2960,7 @@ fn prefetch_foreign_display(v: &Value) {
             Kind::None => {}
         }
     }
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     walk(v, &mut seen);
 }
 
@@ -3142,20 +3176,21 @@ impl PyHost {
             funcs: Vec::new(),
             func_locals: Vec::new(),
             func_names: Vec::new(),
-            classes: IndexMap::new(),
-            foreign_class_cells: HashMap::new(),
-            mro_cache: std::cell::RefCell::new(HashMap::new()),
-            slot_cache: std::cell::RefCell::new(HashMap::new()),
+            classes: IndexMap::default(),
+            foreign_class_cells: HashMap::default(),
+            mro_cache: std::cell::RefCell::new(HashMap::default()),
+            class_memo: std::cell::RefCell::new(HashMap::default()),
+            slot_cache: std::cell::RefCell::new(HashMap::default()),
             str_index: RefCell::new(None),
             tries: Vec::new(),
             module_globals: vec![NameMap::default()],
-            module_dicts: HashMap::new(),
+            module_dicts: HashMap::default(),
             cur_module: 0,
             frames: vec![Frame {
                 env: module_env,
                 globals_decl: NameSet::default(),
                 nonlocals_decl: NameSet::default(),
-                locals_set: Rc::new(HashSet::new()),
+                locals_set: Rc::new(HashSet::default()),
                 is_class_body: false,
                 self_obj: None,
                 owner: None,
@@ -3172,28 +3207,28 @@ impl PyHost {
             pending_kw_dup: None,
             generators: Vec::new(),
             io_handles: vec![IoCell::Stdout, IoCell::Stderr, IoCell::Stdin],
-            dict_meta: HashMap::new(),
-            nt_meta: HashMap::new(),
-            set_start: HashMap::new(),
+            dict_meta: HashMap::default(),
+            nt_meta: HashMap::default(),
+            set_start: HashMap::default(),
             lru_caches: Vec::new(),
-            total_ordering: HashSet::new(),
-            exc_links: HashMap::new(),
-            class_key_counter: HashMap::new(),
-            code_files: HashMap::new(),
-            exc_tb: HashMap::new(),
-            eg_split_root: HashMap::new(),
-            builtin_objects: HashMap::new(),
+            total_ordering: HashSet::default(),
+            exc_links: HashMap::default(),
+            class_key_counter: HashMap::default(),
+            code_files: HashMap::default(),
+            exc_tb: HashMap::default(),
+            eg_split_root: HashMap::default(),
+            builtin_objects: HashMap::default(),
             builtins_slot: None,
-            tb_starts_empty: HashSet::new(),
+            tb_starts_empty: HashSet::default(),
             suggest: None,
-            func_attrs: HashMap::new(),
-            slot_members: HashMap::new(),
-            slot_values: HashMap::new(),
+            func_attrs: HashMap::default(),
+            slot_members: HashMap::default(),
+            slot_values: HashMap::default(),
             codec_search: Vec::new(),
-            codec_cache: HashMap::new(),
-            codec_errors: HashMap::new(),
-            suppress_context: HashSet::new(),
-            foreign_exc_bases: HashMap::new(),
+            codec_cache: HashMap::default(),
+            codec_errors: HashMap::default(),
+            suppress_context: HashSet::default(),
+            foreign_exc_bases: HashMap::default(),
             foreign_exc: None,
             exc_bridge: RefCell::default(),
             argv: vec![String::new()],
@@ -3206,7 +3241,7 @@ impl PyHost {
             tb_skip_frame: None,
             spare_envs: Vec::new(),
             gc: gc::GcState::default(),
-            user_str_lines: HashMap::new(),
+            user_str_lines: HashMap::default(),
             stdout_target: None,
             stderr_target: None,
             generation: {
@@ -3217,10 +3252,10 @@ impl PyHost {
             capture: None,
             modules: NameMap::default(),
             sys_modules: None,
-            mt_states: HashMap::new(),
+            mt_states: HashMap::default(),
             atexit_callbacks: Vec::new(),
             regexes: Vec::new(),
-            re_cache: HashMap::new(),
+            re_cache: HashMap::default(),
         }
     }
 
@@ -3602,7 +3637,7 @@ fn freed_object(id: u32) -> ! {
             kind,
         }))
     }
-    pub fn new_dict(&mut self, pairs: IndexMap<PKey, (Value, Value)>) -> Value {
+    pub fn new_dict(&mut self, pairs: DictMap) -> Value {
         self.alloc(PyObj::Dict(pairs))
     }
 
@@ -3611,7 +3646,7 @@ fn freed_object(id: u32) -> ! {
     /// built through here so its `dict` field points at heap storage that
     /// `obj.__dict__` can hand back by handle (see [`Instance`]).
     pub fn new_instance(&mut self, class: String, attrs: NameMap) -> Value {
-        let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::with_capacity(attrs.len());
+        let mut d: DictMap = DictMap::with_capacity_and_hasher(attrs.len(), Default::default());
         for (k, v) in attrs {
             let kv = self.new_str(k.clone());
             d.insert(PKey::Str(k), (kv, v));
@@ -3641,7 +3676,7 @@ fn freed_object(id: u32) -> ! {
     /// Allocate a builtin-subclass instance carrying `payload` (the inherited
     /// native list/dict/str/int/… storage). Attributes start empty.
     pub fn new_instance_payload(&mut self, class: String, payload: Value) -> Value {
-        let dict = self.alloc(PyObj::Dict(IndexMap::new()));
+        let dict = self.alloc(PyObj::Dict(Default::default()));
         self.alloc(PyObj::Instance(Instance {
             class,
             dict,
@@ -3654,7 +3689,7 @@ fn freed_object(id: u32) -> ! {
     /// `object` subclass. Walks the MRO so an indirect subclass
     /// (`class B(A)` where `A(list)`) is also detected.
     pub fn builtin_base_of(&self, class: &str) -> Option<&'static str> {
-        for c in self.mro_of(class) {
+        for c in self.mro_rc(class).iter() {
             match c.as_str() {
                 "list" => return Some("list"),
                 "dict" => return Some("dict"),
@@ -3724,7 +3759,7 @@ fn freed_object(id: u32) -> ! {
             _ => Vec::new(),
         }
     }
-    pub fn new_set(&mut self, items: IndexMap<PKey, Value>) -> Value {
+    pub fn new_set(&mut self, items: SetMap) -> Value {
         self.alloc(PyObj::Set(items))
     }
     /// A set/frozenset's elements in CPython iteration/`repr` order. For a set
@@ -3734,7 +3769,7 @@ fn freed_object(id: u32) -> ! {
     /// [`PyHost::set_start`]; any other set falls back to insertion order
     /// (CPython randomizes string hashes, so no fixed order can match
     /// byte-for-byte).
-    pub fn set_ordered_values(&self, v: &Value, s: &IndexMap<PKey, Value>) -> Vec<Value> {
+    pub fn set_ordered_values(&self, v: &Value, s: &SetMap) -> Vec<Value> {
         let Some(slots) = set_slot_order(s, self.set_start_of(v)) else {
             return s.values().cloned().collect();
         };
@@ -3762,9 +3797,9 @@ fn freed_object(id: u32) -> ! {
     pub fn set_relayout_after_merge(
         &mut self,
         dst: &Value,
-        before: (&IndexMap<PKey, Value>, usize),
+        before: (&SetMap, usize),
         incoming: usize,
-        src: Option<(&IndexMap<PKey, Value>, usize)>,
+        src: Option<(&SetMap, usize)>,
     ) {
         let Value::Obj(id) = dst else { return };
         let Some(PyObj::Set(merged) | PyObj::Frozenset(merged)) = self.get(dst) else {
@@ -3773,7 +3808,7 @@ fn freed_object(id: u32) -> ! {
         let Some((order, start)) = set_merge_layout(before, merged, incoming, src) else {
             return;
         };
-        let relaid: IndexMap<PKey, Value> = order
+        let relaid: SetMap = order
             .into_iter()
             .filter_map(|k| merged.get(&k).map(|v| (k, v.clone())))
             .collect();
@@ -3830,7 +3865,7 @@ fn freed_object(id: u32) -> ! {
         let frozen = self.is_frozenset(a);
         let n = map.len();
         let out = self.new_setlike(map.clone(), frozen);
-        let empty = IndexMap::new();
+        let empty = SetMap::default();
         self.set_relayout_after_merge(&out, (&empty, SET_MINSIZE), n, Some((&map, start)));
         Some(out)
     }
@@ -3851,7 +3886,7 @@ fn freed_object(id: u32) -> ! {
             }
             return Some(out);
         }
-        let kept: IndexMap<PKey, Value> = self
+        let kept: SetMap = self
             .set_entries_in_order(a)?
             .into_iter()
             .filter(|(k, _)| !other.contains_key(k))
@@ -3868,7 +3903,7 @@ fn freed_object(id: u32) -> ! {
         let (len_a, len_b) = (self.setlike(a)?.len(), self.setlike(b)?.len());
         let (walk, probe) = if len_b > len_a { (a, b) } else { (b, a) };
         let probe = self.setlike(probe)?.clone();
-        let kept: IndexMap<PKey, Value> = self
+        let kept: SetMap = self
             .set_entries_in_order(walk)?
             .into_iter()
             .filter(|(k, _)| probe.contains_key(k))
@@ -3886,7 +3921,7 @@ fn freed_object(id: u32) -> ! {
         let frozen = self.is_frozenset(a);
         let n = map.len();
         let out = self.new_setlike(map.clone(), frozen);
-        let empty = IndexMap::new();
+        let empty = SetMap::default();
         self.set_relayout_after_merge(&out, (&empty, SET_MINSIZE), n, Some((&map, start)));
         if let Some(PyObj::Set(s) | PyObj::Frozenset(s)) = self.get_mut(&out) {
             for (k, v) in walk {
@@ -3917,19 +3952,19 @@ fn freed_object(id: u32) -> ! {
     }
 
     /// A set's contents and replay start, for passing as a merge source.
-    pub fn set_layout_of(&self, v: &Value) -> Option<(IndexMap<PKey, Value>, usize)> {
+    pub fn set_layout_of(&self, v: &Value) -> Option<(SetMap, usize)> {
         match self.get(v) {
             Some(PyObj::Set(s) | PyObj::Frozenset(s)) => Some((s.clone(), self.set_start_of(v))),
             _ => None,
         }
     }
 
-    pub fn new_frozenset(&mut self, items: IndexMap<PKey, Value>) -> Value {
+    pub fn new_frozenset(&mut self, items: SetMap) -> Value {
         self.alloc(PyObj::Frozenset(items))
     }
     /// A `set` or `frozenset` result, choosing the variant by `frozen` — used by
     /// the set-algebra operators, whose result type follows the left operand.
-    pub fn new_setlike(&mut self, items: IndexMap<PKey, Value>, frozen: bool) -> Value {
+    pub fn new_setlike(&mut self, items: SetMap, frozen: bool) -> Value {
         if frozen {
             self.alloc(PyObj::Frozenset(items))
         } else {
@@ -3939,7 +3974,7 @@ fn freed_object(id: u32) -> ! {
     /// The backing dict's key map of a `dict_keys` view — the set a key view
     /// participates as, with the dict's own (already canonical) keys. `None` for
     /// any other object, including the `dict_values`/`dict_items` views.
-    pub fn keys_view_map(&self, v: &Value) -> Option<IndexMap<PKey, Value>> {
+    pub fn keys_view_map(&self, v: &Value) -> Option<SetMap> {
         let dict = match self.get(v) {
             Some(PyObj::DictView { dict, kind: 0 }) => dict.clone(),
             _ => return None,
@@ -3993,7 +4028,7 @@ fn freed_object(id: u32) -> ! {
     }
 
     /// The backing map of a `set` or `frozenset`, else `None`.
-    pub fn setlike(&self, v: &Value) -> Option<&IndexMap<PKey, Value>> {
+    pub fn setlike(&self, v: &Value) -> Option<&SetMap> {
         match self.get(v) {
             Some(PyObj::Set(s)) | Some(PyObj::Frozenset(s)) => Some(s),
             _ => None,
@@ -4108,7 +4143,7 @@ fn freed_object(id: u32) -> ! {
     /// view's own number slots, run outside the borrow by
     /// `builtins::dictview_setop`, and a `set` declines a list (`{1} | [1]` is a
     /// TypeError), so nothing but sets and views is ever a set-map.
-    pub fn setmap_of(&mut self, v: &Value) -> Option<IndexMap<PKey, Value>> {
+    pub fn setmap_of(&mut self, v: &Value) -> Option<SetMap> {
         if let Some(PyObj::Set(s)) | Some(PyObj::Frozenset(s)) = self.get(v) {
             return Some(s.clone());
         }
@@ -4126,7 +4161,7 @@ fn freed_object(id: u32) -> ! {
             }
         }
         let items = self.view_items(v)?;
-        let mut out: IndexMap<PKey, Value> = IndexMap::new();
+        let mut out: SetMap = SetMap::default();
         for it in items {
             if let Ok(k) = self.to_key(&it) {
                 out.insert(k, it);
@@ -4610,7 +4645,7 @@ fn freed_object(id: u32) -> ! {
             _ => return None,
         };
         let pairs = self.module_globals_pairs(slot);
-        let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::with_capacity(pairs.len());
+        let mut d: DictMap = DictMap::with_capacity_and_hasher(pairs.len(), Default::default());
         for (k, val) in pairs {
             let kv = self.new_str(k.clone());
             d.insert(PKey::Str(k), (kv, val));
@@ -5124,7 +5159,7 @@ thread_local! {
     /// and this pool is on the hot call path. Kept deliberately, per the
     /// measurement above.
     #[allow(clippy::vec_box)]
-    static VM_POOL: RefCell<HashMap<u64, Vec<Box<VM>>>> = RefCell::new(HashMap::new());
+    static VM_POOL: RefCell<HashMap<u64, Vec<Box<VM>>>> = RefCell::new(HashMap::default());
 }
 
 /// Register every pythonrs builtin + the numeric hook on a VM, then run it.
@@ -7388,7 +7423,7 @@ impl PyHost {
 
 /// Insert into a dict with CPython semantics: on a duplicate key, keep the
 /// FIRST-inserted key object but update the value (`{1: 'a', 1.0: 'b'}` → `{1: 'b'}`).
-pub fn dict_put(d: &mut IndexMap<PKey, (Value, Value)>, key: PKey, kv: Value, val: Value) {
+pub fn dict_put(d: &mut DictMap, key: PKey, kv: Value, val: Value) {
     use indexmap::map::Entry;
     match d.entry(key) {
         Entry::Occupied(mut e) => e.get_mut().1 = val,
@@ -7400,7 +7435,7 @@ pub fn dict_put(d: &mut IndexMap<PKey, (Value, Value)>, key: PKey, kv: Value, va
 
 /// Insert into a set with CPython semantics: a duplicate keeps the FIRST element
 /// object (`{1, 1.0, True}` → `{1}`).
-pub fn set_put(s: &mut IndexMap<PKey, Value>, key: PKey, item: Value) {
+pub fn set_put(s: &mut SetMap, key: PKey, item: Value) {
     s.entry(key).or_insert(item);
 }
 
@@ -7564,7 +7599,7 @@ fn reproducible_hash(k: &PKey) -> Option<i64> {
 
 /// Replay `s` into a table that starts with `start` slots. `None` when a key
 /// has no reproducible hash ([`reproducible_hash`]).
-fn set_replay(s: &IndexMap<PKey, Value>, start: usize) -> Option<SetTable> {
+fn set_replay(s: &SetMap, start: usize) -> Option<SetTable> {
     let mut t = SetTable::with_size(start);
     for (idx, k) in s.keys().enumerate() {
         t.add(reproducible_hash(k)?, idx);
@@ -7574,7 +7609,7 @@ fn set_replay(s: &IndexMap<PKey, Value>, start: usize) -> Option<SetTable> {
 
 /// The insertion indices of `s`, reordered into CPython set iteration order
 /// for a replay starting at `start` slots.
-fn set_slot_order(s: &IndexMap<PKey, Value>, start: usize) -> Option<Vec<usize>> {
+fn set_slot_order(s: &SetMap, start: usize) -> Option<Vec<usize>> {
     set_replay(s, start).map(|t| t.slot_order())
 }
 
@@ -7598,10 +7633,10 @@ fn set_slot_order(s: &IndexMap<PKey, Value>, start: usize) -> Option<Vec<usize>>
 ///
 /// `None` when a key has no reproducible hash ([`reproducible_hash`]).
 fn set_merge_layout(
-    before: (&IndexMap<PKey, Value>, usize),
-    merged: &IndexMap<PKey, Value>,
+    before: (&SetMap, usize),
+    merged: &SetMap,
     incoming: usize,
-    src: Option<(&IndexMap<PKey, Value>, usize)>,
+    src: Option<(&SetMap, usize)>,
 ) -> Option<(Vec<PKey>, usize)> {
     let (before_keys, mut start) = before;
     if merged.keys().any(|k| reproducible_hash(k).is_none()) {
@@ -7963,7 +7998,7 @@ fn collect_key_candidates(h: &PyHost, k: &PKey, obj: &Value, out: &mut Vec<(PKey
 
 /// Instance-key collapse candidates from an in-flight set map (a literal/ctor
 /// being built element by element).
-pub fn set_local_candidates(h: &PyHost, s: &IndexMap<PKey, Value>) -> Vec<(PKey, Value)> {
+pub fn set_local_candidates(h: &PyHost, s: &SetMap) -> Vec<(PKey, Value)> {
     let mut out = Vec::new();
     for (k, v) in s.iter() {
         collect_key_candidates(h, k, v, &mut out);
@@ -7972,7 +8007,7 @@ pub fn set_local_candidates(h: &PyHost, s: &IndexMap<PKey, Value>) -> Vec<(PKey,
 }
 
 /// Instance-key collapse candidates from an in-flight dict map.
-pub fn dict_local_candidates(h: &PyHost, d: &IndexMap<PKey, (Value, Value)>) -> Vec<(PKey, Value)> {
+pub fn dict_local_candidates(h: &PyHost, d: &DictMap) -> Vec<(PKey, Value)> {
     let mut out = Vec::new();
     for (k, (kv, _)) in d.iter() {
         collect_key_candidates(h, k, kv, &mut out);
@@ -8081,7 +8116,7 @@ fn any_value_keyed<'a>(mut keys: impl Iterator<Item = &'a PKey>) -> bool {
 
 /// The key map an operand contributes to the set algebra: a `set`/`frozenset`'s
 /// own map, or a `dict_keys` view's backing dict. `None` for everything else.
-fn setlike_map(h: &PyHost, v: &Value) -> Option<IndexMap<PKey, Value>> {
+fn setlike_map(h: &PyHost, v: &Value) -> Option<SetMap> {
     match h.get(v) {
         Some(PyObj::Set(s) | PyObj::Frozenset(s)) => Some(s.clone()),
         _ => h.keys_view_map(v),
@@ -8138,7 +8173,7 @@ pub fn align_operand(a: &Value, b: &Value) -> Result<Option<Value>, String> {
     };
     match side {
         Side::Set(items, frozen) => {
-            let mut out: IndexMap<PKey, Value> = IndexMap::with_capacity(items.len());
+            let mut out: SetMap = SetMap::with_capacity_and_hasher(items.len(), Default::default());
             for it in items {
                 let k =
                     with_instance_key(&it, KeyRole::Set, &cands, || with_host(|h| h.to_key(&it)))?;
@@ -8147,7 +8182,7 @@ pub fn align_operand(a: &Value, b: &Value) -> Result<Option<Value>, String> {
             Ok(Some(with_host(|h| h.new_setlike(out, frozen))))
         }
         Side::Dict(pairs) => {
-            let mut out: IndexMap<PKey, (Value, Value)> = IndexMap::with_capacity(pairs.len());
+            let mut out: DictMap = DictMap::with_capacity_and_hasher(pairs.len(), Default::default());
             for (kv, vv) in pairs {
                 let k =
                     with_instance_key(&kv, KeyRole::Dict, &cands, || with_host(|h| h.to_key(&kv)))?;
@@ -9655,7 +9690,7 @@ impl PyHost {
                 // premap here keeps the non-dispatching fallback behavior.
                 if let Some(PyObj::Str(fmt)) = self.get(a) {
                     let fmt = fmt.clone();
-                    return self.str_format_percent(&fmt, b, &HashMap::new());
+                    return self.str_format_percent(&fmt, b, &HashMap::default());
                 }
                 // Python `%` takes the sign of the divisor (floored remainder).
                 if let (Some(x), Some(y)) = (ai, bi) {
@@ -9802,7 +9837,7 @@ impl PyHost {
                     return Ok(out);
                 }
                 if let (Some(x), Some(y)) = (self.setmap_of(a), self.setmap_of(b)) {
-                    let mut out = IndexMap::new();
+                    let mut out = SetMap::default();
                     match tag {
                         binop::BITAND => {
                             for (k, v) in &x {
@@ -9922,7 +9957,7 @@ impl PyHost {
                 .collect(),
             _ => Vec::new(),
         };
-        let mut out: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+        let mut out: DictMap = DictMap::default();
         for (k, kv, cnt) in entries {
             // Counts need not be ints (`Counter(a=1.5)`), so negate through the
             // numeric `-` and test positivity numerically.
@@ -10380,7 +10415,7 @@ impl PyHost {
                             hash: f_hash,
                         },
                         prec,
-                        &HashMap::new(),
+                        &HashMap::default(),
                     )?;
                     (s.into_bytes(), true)
                 }
@@ -12617,9 +12652,51 @@ impl PyHost {
     /// Whether `class` (a user class name) derives from a builtin exception type
     /// — i.e. its MRO reaches a name that `is_exception_class` recognizes.
     pub fn class_is_exception(&self, class: &str) -> bool {
-        self.mro_of(class)
-            .iter()
-            .any(|c| crate::builtins::is_exception_class(c))
+        self.class_fact(class, |m| &mut m.is_exception, || {
+            self.mro_rc(class)
+                .iter()
+                .any(|c| crate::builtins::is_exception_class(c))
+        })
+    }
+
+    /// Whether reading an attribute of an instance of `class` that the class
+    /// does not define reaches the instance `__dict__` with nothing in
+    /// between: the MRO defines neither `__getattribute__` nor `__slots__`
+    /// (whose members live outside the namespace).
+    fn dict_reads(&self, class: &str) -> bool {
+        self.class_fact(class, |m| &mut m.dict_reads, || {
+            !self.class_has(class, "__getattribute__") && !self.class_has(class, "__slots__")
+        })
+    }
+
+    /// Whether storing an attribute the class does not define on an instance
+    /// of `class` is a plain `__dict__` store: a user class, not an
+    /// exception, whose MRO defines neither `__setattr__` nor `__slots__`.
+    fn dict_writes(&self, class: &str) -> bool {
+        self.class_fact(class, |m| &mut m.dict_writes, || {
+            class != "object"
+                && !self.class_has(class, "__setattr__")
+                && !self.class_has(class, "__slots__")
+                && !self.class_is_exception(class)
+        })
+    }
+
+    /// One memoized per-class answer: `field` picks it out of the class's
+    /// [`ClassMemo`], and `compute` produces it on a miss.
+    fn class_fact(
+        &self,
+        class: &str,
+        field: impl Fn(&mut ClassMemo) -> &mut Option<bool>,
+        compute: impl FnOnce() -> bool,
+    ) -> bool {
+        if let Some(memo) = self.class_memo.borrow_mut().get_mut(class) {
+            if let Some(hit) = *field(memo) {
+                return hit;
+            }
+        }
+        let answer = compute();
+        *field(self.class_memo.borrow_mut().entry(class.to_string()).or_default()) = Some(answer);
+        answer
     }
 
     /// Reconstruct a base/MRO entry from its name: a user-defined class (present
@@ -12664,7 +12741,7 @@ impl PyHost {
                 .unwrap_or(Value::Undef)
         });
         let constraints_tuple = self.new_tuple(constraints);
-        let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+        let mut d: DictMap = DictMap::default();
         for (k, v) in [
             ("__name__", name_v),
             ("__bound__", bound),
@@ -12818,18 +12895,31 @@ impl PyHost {
         }
     }
 
-    /// Look up a name in a class's MRO namespace.
+    /// Look up a name in a class's MRO namespace. This runs several times on
+    /// every instance attribute read and write, so answers are memoized in
+    /// `class_memo`.
     pub fn class_lookup(&self, class: &str, name: &str) -> Option<Value> {
-        // `mro_rc` rather than `mro_of`: this runs on every attribute read, and
-        // copying the name vector per lookup was most of its cost.
-        for c in self.mro_rc(class).iter() {
-            if let Some(cd) = self.classes.get(c) {
-                if let Some(v) = cd.ns.get(name) {
-                    return Some(v.clone());
-                }
-            }
+        if let Some(hit) = self.class_memo.borrow().get(class).and_then(|m| m.lookups.get(name)) {
+            return hit.clone();
         }
-        None
+        let found = self.mro_rc(class).iter().find_map(|c| {
+            self.classes.get(c).and_then(|cd| cd.ns.get(name)).cloned()
+        });
+        self.class_memo
+            .borrow_mut()
+            .entry(class.to_string())
+            .or_default()
+            .lookups
+            .insert(name.to_string(), found.clone());
+        found
+    }
+
+    /// Forget everything memoized about class namespaces; run whenever one
+    /// gains or loses a name, since that can shadow or expose a member for
+    /// every class below it.
+    fn class_ns_changed(&self) {
+        self.class_memo.borrow_mut().clear();
+        self.slot_cache.borrow_mut().clear();
     }
 
     /// `recv.name`, remembering the receiver when the lookup misses so an
@@ -13357,7 +13447,7 @@ impl PyHost {
                 // (not an AttributeError), as in CPython — else typing's
                 // `_get_protocol_attrs` falls back to `annotationlib` (t-strings).
                 if name == "__annotations__" && self.class_lookup(&cname, name).is_none() {
-                    return Ok(self.new_dict(IndexMap::new()));
+                    return Ok(self.new_dict(Default::default()));
                 }
                 // `cls.__class__` is the metaclass (`type(cls)`): a user metaclass
                 // becomes a `Class`, otherwise the builtin `type`.
@@ -13424,7 +13514,7 @@ impl PyHost {
                         .get(&cname)
                         .map(|cd| cd.ns.clone())
                         .unwrap_or_default();
-                    let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+                    let mut d: DictMap = DictMap::default();
                     for (k, val) in ns {
                         let kv = self.new_str(k.clone());
                         d.insert(PKey::Str(k), (kv, val));
@@ -13735,7 +13825,7 @@ impl PyHost {
             Some(PyObj::Func(_)) if name == "__dict__" => {
                 let id = if let Value::Obj(i) = recv { *i } else { 0 };
                 let attrs = self.func_attrs.get(&id).cloned().unwrap_or_default();
-                let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+                let mut d: DictMap = DictMap::default();
                 for (k, v) in attrs {
                     let kv = self.new_str(k.clone());
                     d.insert(PKey::Str(k), (kv, v));
@@ -14081,8 +14171,8 @@ impl PyHost {
                             Some(PyObj::Pattern { id, .. }) => *id,
                             _ => unreachable!("matched a Pattern above"),
                         };
-                        let mut d: indexmap::IndexMap<PKey, (Value, Value)> =
-                            indexmap::IndexMap::new();
+                        let mut d: DictMap =
+                            DictMap::default();
                         for (n, i) in self.regexes[id].named_groups() {
                             let k = self.new_str(n.clone());
                             d.insert(PKey::Str(n), (k, Value::Int(i as i64)));
@@ -14272,7 +14362,7 @@ impl PyHost {
                     })),
                     "f_trace" | "f_trace_lines" | "f_trace_opcodes" => Ok(Value::Undef),
                     "f_lasti" => Ok(Value::Int(-1)),
-                    "f_locals" => Ok(self.new_dict(IndexMap::new())),
+                    "f_locals" => Ok(self.new_dict(Default::default())),
                     "f_globals" | "f_builtins" => {
                         let pairs = match index {
                             Some(i) => self.module_globals[self.frames[i].module]
@@ -14281,7 +14371,7 @@ impl PyHost {
                                 .collect(),
                             None => self.globals_pairs(),
                         };
-                        let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+                        let mut d: DictMap = DictMap::default();
                         for (k, v) in pairs {
                             let kv = self.new_str(k.clone());
                             d.insert(PKey::Str(k), (kv, v));
@@ -14328,7 +14418,7 @@ impl PyHost {
                 let func = func.clone();
                 match self.get(&func) {
                     Some(PyObj::Func(_)) => self.get_attr(&func, name),
-                    _ => Ok(self.new_dict(IndexMap::new())),
+                    _ => Ok(self.new_dict(Default::default())),
                 }
             }
             Some(PyObj::Func(fv))
@@ -14480,7 +14570,7 @@ impl PyHost {
                 if name == "__dict__" && (crate::builtins::is_type_object_name(n)) =>
             {
                 let n = n.clone();
-                let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+                let mut d: DictMap = DictMap::default();
                 // Every builtin type carries `__new__` in its own `__dict__` in
                 // CPython; enum's `_find_data_type_` keys off this membership to
                 // recognise a mixin data type (`'__new__' in base.__dict__`).
@@ -14891,10 +14981,7 @@ impl PyHost {
         let Some(PyObj::Instance(inst)) = self.get(recv) else {
             return None;
         };
-        if self.class_has(&inst.class, name)
-            || self.class_has(&inst.class, "__getattribute__")
-            || self.class_has(&inst.class, "__slots__")
-        {
+        if !self.dict_reads(&inst.class) || self.class_has(&inst.class, name) {
             return None;
         }
         self.inst_attr(&inst.dict, name)
@@ -14910,14 +14997,11 @@ impl PyHost {
         let Some(PyObj::Instance(inst)) = self.get(recv) else {
             return Err(val);
         };
-        let plain = inst.class != "object"
-            && !name.starts_with("__")
+        let plain = !name.starts_with("__")
             && name != "args"
             && name != "default_factory"
+            && self.dict_writes(&inst.class)
             && !self.class_has(&inst.class, name)
-            && !self.class_has(&inst.class, "__setattr__")
-            && !self.class_has(&inst.class, "__slots__")
-            && !self.class_is_exception(&inst.class)
             && matches!(self.get(&inst.dict), Some(PyObj::Dict(_)));
         if !plain {
             return Err(val);
@@ -15119,7 +15203,7 @@ impl PyHost {
     }
 
     fn compute_slots_of(&self, class: &str) -> Option<HashSet<String>> {
-        let mut slots = HashSet::new();
+        let mut slots = HashSet::default();
         let mut any = false;
         for c in self.mro_of(class) {
             if !self.classes.contains_key(&c) {
@@ -15249,7 +15333,7 @@ impl PyHost {
         if let Some(hit) = self.slot_cache.borrow().get(class) {
             return hit.clone();
         }
-        let mut members = HashSet::new();
+        let mut members = HashSet::default();
         for c in self.mro_rc(class).iter() {
             for n in self.own_slots(c).unwrap_or_default() {
                 if self.slot_owner(class, &n).is_some() {
@@ -15376,6 +15460,7 @@ impl PyHost {
             if let Some(cd) = self.classes.get_mut(class) {
                 cd.ns.insert("__slotnames__".to_string(), list);
             }
+            self.class_ns_changed();
         }
         names
     }
@@ -15789,7 +15874,7 @@ impl PyHost {
                     }
                     cd.ns.insert(name.to_string(), val);
                 }
-                self.slot_cache.borrow_mut().clear();
+                self.class_ns_changed();
                 Ok(())
             }
             _ => Err(self.builtin_setattr_error(recv, name)),
@@ -16058,7 +16143,7 @@ impl PyHost {
             let cname = cname.clone();
             if let Some(cd) = self.classes.get_mut(&cname) {
                 if cd.ns.shift_remove(name).is_some() {
-                    self.slot_cache.borrow_mut().clear();
+                    self.class_ns_changed();
                     return Ok(());
                 }
             }
@@ -16160,7 +16245,7 @@ impl PyHost {
         // shadowing disambiguation above rekeys classes), so every memoized
         // linearization is dropped here.
         self.mro_cache.borrow_mut().clear();
-        self.slot_cache.borrow_mut().clear();
+        self.class_ns_changed();
         let mro = {
             let mut out = vec![name_for_key.clone()];
             for b in &bases {
@@ -18467,7 +18552,7 @@ fn construct_plain(
     // `__init__` runs only when `__new__` returned an instance of `class` (or a
     // subclass) — matching CPython's `type.__call__`.
     let init_ok = with_host(|h| match h.get(&inst) {
-        Some(PyObj::Instance(i)) => h.mro_of(&i.class).iter().any(|c| c == class),
+        Some(PyObj::Instance(i)) => h.mro_rc(&i.class).iter().any(|c| c == class),
         _ => false,
     });
     if init_ok {
@@ -19168,7 +19253,7 @@ fn bound_vars(
 
     // 8. Route leftover keywords into `**kwargs` (order preserved).
     if let Some(kw) = &def.kwargs {
-        let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+        let mut d: DictMap = DictMap::default();
         for (k, v) in leftover {
             let kv = with_host(|h| h.new_str(k.clone()));
             d.insert(PKey::Str(k), (kv, v));
@@ -19402,7 +19487,7 @@ impl PyHost {
                 let d = &self.funcs[def_id];
                 let names: Vec<String> = d.kwonly.clone();
                 let required: Vec<bool> = d.kwonly_required.clone();
-                let mut map: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+                let mut map: DictMap = DictMap::default();
                 let mut next = 0usize;
                 for (i, n) in names.iter().enumerate() {
                     if required.get(i).copied().unwrap_or(true) {
@@ -19647,7 +19732,7 @@ fn run_class_body(
             nonlocals_decl: NameSet::default(),
             // A class body resolves names dynamically (LOAD_NAME), so an unbound
             // read is a `NameError`, not `UnboundLocalError` — leave this empty.
-            locals_set: Rc::new(HashSet::new()),
+            locals_set: Rc::new(HashSet::default()),
             is_class_body: true,
             self_obj: None,
             owner: Some(name.to_string()),
@@ -20059,7 +20144,7 @@ fn metaclass_create(
         }
         prepared
     } else {
-        let ns_map: IndexMap<PKey, (Value, Value)> = with_host(|h| {
+        let ns_map: DictMap = with_host(|h| {
             ns.iter()
                 .map(|(k, v)| {
                     let kv = h.new_str(k.clone());
@@ -20431,7 +20516,7 @@ impl PyHost {
         let mut ancestors: Vec<(Value, &'static str)> = Vec::new();
         if let Some(final_exc) = &self.exc {
             let mut cur = final_exc.clone();
-            let mut seen: HashSet<u32> = HashSet::new();
+            let mut seen: HashSet<u32> = HashSet::default();
             loop {
                 if let Value::Obj(id) = cur {
                     if !seen.insert(id) {
@@ -20510,7 +20595,7 @@ impl PyHost {
             "\nDuring handling of the above exception, another exception occurred:\n\n";
         let mut ancestors: Vec<(Value, &'static str)> = Vec::new();
         let mut cur = exc.clone();
-        let mut seen: HashSet<u32> = HashSet::new();
+        let mut seen: HashSet<u32> = HashSet::default();
         loop {
             if let Value::Obj(id) = cur {
                 if !seen.insert(id) {
@@ -23476,7 +23561,7 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                 // `environ` as a {bytes: bytes} dict — CPython's posix.environ is
                 // bytes-keyed on Unix, and os wraps it in a str-decoding mapping.
                 let environ = {
-                    let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+                    let mut d: DictMap = DictMap::default();
                     for (k, val) in std::env::vars() {
                         let kb = k.clone().into_bytes();
                         let kv = h.alloc(PyObj::Bytes(kb.clone()));
@@ -23837,7 +23922,7 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                 ("ENOTSUP", libc::ENOTSUP),
             ];
             let mut v: Vec<(&str, Value)> = Vec::with_capacity(names.len() + 1);
-            let mut ec: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+            let mut ec: DictMap = DictMap::default();
             for (n, val) in names {
                 v.push((n, Value::Int(*val as i64)));
                 let key = PKey::Int(*val as i64);
@@ -24012,7 +24097,7 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                 h.sys_flags.push(flags.clone());
                 flags
             };
-            let modules = h.new_dict(IndexMap::new());
+            let modules = h.new_dict(Default::default());
             // Publish the live sys.modules handle + seed it with already-imported
             // modules, so Python-level assignment/reads stay consistent with the
             // internal import cache.
@@ -24123,7 +24208,7 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
             // module name. `traceback`'s "did you forget to import" hint and any
             // code doing "is this a stdlib module?" both read it.
             let stdlib_module_names = {
-                let mut items = IndexMap::new();
+                let mut items = SetMap::default();
                 for n in stdlib_module_names() {
                     items.insert(PKey::Str(n.clone()), h.new_str(n.clone()));
                 }
@@ -25365,7 +25450,7 @@ impl PyHost {
     fn lru_new(&mut self, maxsize: Option<usize>) -> u32 {
         let id = self.lru_caches.len() as u32;
         self.lru_caches.push(LruData {
-            map: IndexMap::new(),
+            map: Default::default(),
             order: VecDeque::new(),
             maxsize,
             hits: 0,
@@ -25716,7 +25801,7 @@ pub fn alloc_deque(items: VecDeque<Value>, maxlen: Option<usize>) -> Value {
 
 /// Allocate a tagged `dict` subclass (Counter / defaultdict / OrderedDict).
 pub fn alloc_dict_subtype(
-    pairs: IndexMap<PKey, (Value, Value)>,
+    pairs: DictMap,
     kind: DictKind,
     factory: Option<Value>,
 ) -> Value {
