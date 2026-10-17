@@ -1278,6 +1278,7 @@ fn b_call_kw(vm: &mut VM, argc: u8) -> Value {
 }
 
 fn b_call_method(vm: &mut VM, argc: u8) -> Value {
+    host::gc::safepoint(vm);
     let mut args = pop_n(vm, argc as usize);
     let recv = args.remove(0);
     let name = args.remove(0);
@@ -1538,6 +1539,7 @@ fn loaded_head(args: &mut Vec<Value>) -> (Value, Value, Value) {
 }
 
 fn b_call_loaded(vm: &mut VM, argc: u8) -> Value {
+    host::gc::safepoint(vm);
     note_call_line(vm);
     let (args, [self_slot, name, callee]) = pop_call(vm, argc);
     run_loaded(vm, &self_slot, &sref(&name), &callee, args, vec![])
@@ -1552,6 +1554,7 @@ fn b_call_loaded_kw(vm: &mut VM, argc: u8) -> Value {
 }
 
 fn b_call_value(vm: &mut VM, argc: u8) -> Value {
+    host::gc::safepoint(vm);
     note_call_line(vm);
     let (args, [callable]) = pop_call(vm, argc);
     call_value(vm, &callable, args, vec![])
@@ -2465,6 +2468,7 @@ fn b_genret(vm: &mut VM, _: u8) -> Value {
 }
 
 fn b_foriter(vm: &mut VM, _: u8) -> Value {
+    host::gc::safepoint(vm);
     let it = match vm.stack.last() {
         Some(v) => v.clone(),
         None => return abort(vm, "internal: FORITER with empty stack".into()),

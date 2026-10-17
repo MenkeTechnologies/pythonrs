@@ -1429,3 +1429,13 @@ fn as_f(v: Value) -> Option<f64> {
         _ => None,
     }
 }
+
+/// Whether the event loop holds nothing: no future, task or coroutine object,
+/// queued callback or timer. The collector runs only then, since what the
+/// loop holds is not among its roots (`host::gc`).
+pub(crate) fn loop_is_idle() -> bool {
+    LOOP.with(|l| {
+        let l = l.borrow();
+        l.futures.is_empty() && l.async_objs.is_empty() && l.ready.is_empty() && l.timers.is_empty()
+    })
+}

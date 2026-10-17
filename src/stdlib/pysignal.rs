@@ -156,3 +156,8 @@ pub fn entries(h: &mut PyHost) -> Vec<(String, Value)> {
     out.push(("ItimerError".to_string(), err));
     out
 }
+
+/// Visit every installed handler: they are collector roots (`host::gc`).
+pub(crate) fn for_each_handler(mut f: impl FnMut(&Value)) {
+    HANDLERS.with(|h| h.borrow().values().for_each(&mut f));
+}

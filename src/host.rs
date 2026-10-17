@@ -22,6 +22,8 @@ use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
+pub(crate) mod gc;
+
 /// Builtin ids emitted by the compiler and registered on every VM. The compiler
 /// (`compiler.rs`) and the handler table (`builtins.rs::install`) must agree on
 /// these exactly.
@@ -1565,6 +1567,10 @@ pub enum PyObj {
     /// The `Ellipsis` (`...`) singleton — a distinct truthy object of type
     /// `ellipsis`, not `None` (used in slices and as a type-annotation placeholder).
     Ellipsis,
+    /// A slot the collector freed ([`gc`]), waiting on the free list for `alloc`
+    /// to reuse. Nothing reachable refers to it; `get` panics on one rather
+    /// than hand back whatever is allocated there next.
+    Freed,
     /// A live CPython object owned by the `stdlib-ffi` bridge — a handle (index)
     /// into `crate::ffi`'s side-table. Any object the real CPython stdlib returns
     /// that pythonrs can't represent by value (compiled regex, `datetime`,
@@ -2532,6 +2538,8 @@ pub struct PyHost {
     /// them, emptied and kept for the next one (`take_call_env`), so a call
     /// does not allocate and free one each time.
     spare_envs: Vec<Env>,
+    /// The collector's bookkeeping: the free list and when to collect next.
+    gc: gc::GcState,
     /// `str()` lines of uncaught user exceptions with their own `__str__`,
     /// computed before the traceback is rendered (see `user_str_lines`).
     pub user_str_lines: HashMap<u32, String>,
@@ -3195,6 +3203,7 @@ impl PyHost {
             traceback: Vec::new(),
             tb_skip_frame: None,
             spare_envs: Vec::new(),
+            gc: gc::GcState::default(),
             user_str_lines: HashMap::new(),
             stdout_target: None,
             stderr_target: None,
@@ -3358,6 +3367,11 @@ impl PyHost {
 
     // ── heap allocation / accessors ──────────────────────────────────────
     pub fn alloc(&mut self, obj: PyObj) -> Value {
+        self.gc.allocated();
+        if let Some(id) = self.gc.free.pop() {
+            self.heap[id as usize] = obj;
+            return Value::Obj(id);
+        }
         self.heap.push(obj);
         Value::Obj((self.heap.len() - 1) as u32)
     }
@@ -3508,20 +3522,34 @@ impl PyHost {
 
     pub fn get(&self, v: &Value) -> Option<&PyObj> {
         if let Value::Obj(i) = v {
-            self.heap.get(*i as usize)
+            match self.heap.get(*i as usize) {
+                Some(PyObj::Freed) => Self::freed_object(*i),
+                o => o,
+            }
         } else {
             None
         }
     }
     pub fn get_mut(&mut self, v: &Value) -> Option<&mut PyObj> {
         if let Value::Obj(i) = v {
-            self.heap.get_mut(*i as usize)
+            match self.heap.get_mut(*i as usize) {
+                Some(PyObj::Freed) => Self::freed_object(*i),
+                o => o,
+            }
         } else {
             None
         }
     }
 
-    /// The `stdlib-ffi` handle id if `v` is a CPython `Foreign` object, else
+    /// A read of a slot the collector freed: a root the collector did not see.
+/// Loud, because the quiet alternative is reading whatever is allocated there
+/// next.
+#[cold]
+fn freed_object(id: u32) -> ! {
+    panic!("pythonrs: heap object {id} used after the collector freed it")
+}
+
+/// The `stdlib-ffi` handle id if `v` is a CPython `Foreign` object, else
     /// `None`. Copying the id out ends the heap borrow before dispatching to the
     /// bridge (which needs `&mut self` to marshal the result back).
     #[cfg(feature = "stdlib-ffi")]
@@ -5128,7 +5156,10 @@ fn new_configured_vm(chunk: Chunk) -> VM {
 /// Run `vm` to completion and translate the outcome, recycling it into the pool
 /// under `pool_key` when one is given.
 fn finish_run(mut vm: Box<VM>, pool_key: Option<u64>) -> Result<Value, String> {
-    let outcome = vm.run();
+    let outcome = {
+        let _run = gc::RunGuard::enter();
+        vm.run()
+    };
     let halted_top = matches!(outcome, VMResult::Halted)
         .then(|| vm.stack.last().cloned().unwrap_or(Value::Undef));
     if let VMResult::Error(_) = &outcome {
@@ -5206,7 +5237,7 @@ pub fn run_chunk_cached(
 
 /// Run the top-level program chunk.
 pub fn run_main(chunk: Chunk) -> Result<Value, String> {
-    let r = run_chunk_on(chunk);
+    let r = gc::as_root_run(|| run_chunk_on(chunk));
     with_host(|h| h.signal = None);
     r
 }
@@ -5471,6 +5502,8 @@ impl PyHost {
             Value::Float(_) => "float".into(),
             Value::Str(_) => "str".into(),
             Value::Obj(_) => match self.get(v) {
+                // `get` panics on a freed slot rather than return it.
+                Some(PyObj::Freed) => unreachable!("a freed slot read through get"),
                 Some(PyObj::StructFmt(_)) => "Struct".into(),
                 Some(PyObj::ContextVar { .. }) => "ContextVar".into(),
                 Some(PyObj::ContextToken { .. }) => "Token".into(),
@@ -5722,6 +5755,8 @@ impl PyHost {
             Value::Float(f) => fmt_float(*f),
             Value::Str(s) => (**s).clone(),
             Value::Obj(_) => match self.get(v) {
+                // `get` panics on a freed slot rather than return it.
+                Some(PyObj::Freed) => unreachable!("a freed slot read through get"),
                 // `str()` of a mappingproxy is `str()` of the mapping behind it;
                 // only `repr()` says `mappingproxy(...)`.
                 Some(PyObj::MappingProxy { dict }) => self.str_of(dict),
