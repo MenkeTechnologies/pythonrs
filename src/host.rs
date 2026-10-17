@@ -19299,6 +19299,9 @@ fn class_header_values(name: &str, bases: &[String]) -> (Value, Value) {
     (name_v, bases_v)
 }
 
+/// A metaclass namespace and its string-keyed seed entries.
+type PreparedNamespace = (Value, Vec<(String, Value)>);
+
 /// PEP 3115: call a user metaclass's own `__prepare__` and return the mapping
 /// with its initial string-keyed entries (which seed the class body's scope).
 /// `None` when the metaclass inherits `type.__prepare__`.
@@ -19307,7 +19310,7 @@ fn prepare_namespace(
     name: &str,
     bases: &[String],
     class_kwargs: &[(String, Value)],
-) -> Result<Option<(Value, Vec<(String, Value)>)>, String> {
+) -> Result<Option<PreparedNamespace>, String> {
     if with_host(|h| h.class_lookup(meta, "__prepare__").is_none()) {
         return Ok(None);
     }
