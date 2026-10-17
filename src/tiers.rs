@@ -27,6 +27,10 @@ pub struct Loop {
     pub traced: bool,
     /// Whether the tracing JIT gave up on this header.
     pub blacklisted: bool,
+    /// The function whose copy in `main` holds this loop, for a loop in a body
+    /// the compiler linked there (`FuncDef::linked`). `None` is the chunk's
+    /// own code.
+    pub linked_from: Option<String>,
 }
 
 /// What the tiers did with one chunk.
@@ -91,11 +95,15 @@ impl std::fmt::Display for ChunkTiers {
             writeln!(f, "loops                   none")?;
         }
         for l in &self.loops {
-            writeln!(
+            write!(
                 f,
                 "loop @{:<4}             trace-eligible={} traced={} blacklisted={}",
                 l.anchor, l.trace_eligible, l.traced, l.blacklisted
             )?;
+            match &l.linked_from {
+                Some(func) => writeln!(f, " (in the linked copy of fn {func})")?,
+                None => writeln!(f)?,
+            }
         }
         if self.ineligible.is_empty() {
             writeln!(f, "block-ineligible ops    none")?;
@@ -137,9 +145,31 @@ impl std::fmt::Display for Report {
 /// no-op there) and emit byte-identical ops. That is what lets fusevm's
 /// op-hash-keyed caches answer for the run that just happened.
 pub fn report(src: &str) -> Result<Report, String> {
-    let named = program_chunks(&crate::compile(src)?);
+    let prog = crate::compile(src)?;
+    let named = program_chunks(&prog);
     crate::eval_str(src)?;
-    Ok(inspect_all(&named))
+    let mut report = inspect_all(&named);
+    label_linked_loops(&mut report.chunks[0], &prog);
+    Ok(report)
+}
+
+/// Name, for each loop in `main`, the function whose linked copy holds it.
+/// The copies sit back to back after the module code, so a loop belongs to the
+/// last copy starting at or before its header.
+fn label_linked_loops(main: &mut ChunkTiers, prog: &crate::compiler::Program) {
+    let mut copies: Vec<(usize, &str)> = prog
+        .functions
+        .iter()
+        .filter_map(|(_, f)| Some((f.linked? as usize, f.qualname.as_str())))
+        .collect();
+    copies.sort_unstable();
+    for l in &mut main.loops {
+        l.linked_from = copies
+            .iter()
+            .rev()
+            .find(|(entry, _)| *entry <= l.anchor)
+            .map(|(_, name)| name.to_string());
+    }
 }
 
 /// Every chunk a compiled program holds, named for the report.
@@ -147,7 +177,9 @@ pub fn report(src: &str) -> Result<Report, String> {
 /// A Python program is not one chunk: the module body, every `def`, every
 /// comprehension/lambda body, and every arm of a `try` lower to their own
 /// chunk. A hot loop usually lives in one of the latter, so reporting only
-/// `main` would answer the wrong question.
+/// `main` would answer the wrong question. `main` also holds a copy of each
+/// function the compiler linked into it, which is where a loop in a function
+/// called from module code runs; its loops are labelled with that function.
 fn program_chunks(prog: &crate::compiler::Program) -> Vec<(String, Chunk)> {
     let mut out = vec![("main".to_string(), prog.main.clone())];
     for (_, f) in &prog.functions {
@@ -200,6 +232,7 @@ pub fn inspect_chunk(name: &str, chunk: &Chunk) -> ChunkTiers {
                 .is_some_and(|body| jit.is_trace_eligible(body, anchor)),
             traced: jit.trace_is_compiled(chunk, anchor),
             blacklisted: jit.trace_is_blacklisted(chunk, anchor),
+            linked_from: None,
         })
         .collect();
 
@@ -322,14 +355,19 @@ mod tests {
 
     /// The top level is not where the loop is — the report has to walk every
     /// chunk to find it. This pins the multi-chunk walk itself: reporting only
-    /// `main` would say "no loops" for a program that plainly has one.
+    /// `main` would find no loop of the module's own for a program that plainly
+    /// has one. The loop `main` does hold is its linked copy of `f`, and is
+    /// labelled as such.
     #[test]
     fn the_loop_lives_in_a_chunk_other_than_main() {
         let report = report(PROGRAM).expect("runs");
         assert!(report.chunks.len() > 1, "{report}");
         assert!(
-            report.chunks[0].loops.is_empty(),
-            "main has no loop: {report}"
+            report.chunks[0]
+                .loops
+                .iter()
+                .all(|l| l.linked_from.as_deref() == Some("f")),
+            "main has no loop of its own: {report}"
         );
         assert!(
             report.chunks[1..].iter().any(|c| !c.loops.is_empty()),

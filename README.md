@@ -243,7 +243,12 @@ lexer  →  parser  →  AST  →  compiler  →  fusevm::Chunk  →  fusevm VM 
 
 - `lexer.rs` — indentation-significant tokenizer (INDENT/DEDENT/NEWLINE, f-strings).
 - `parser.rs` — recursive-descent Python grammar → `ast.rs`.
-- `compiler.rs` — lowers the AST to fusevm ops + `CallBuiltin` dispatches.
+- `compiler.rs` — lowers the AST to fusevm ops + `CallBuiltin` dispatches. Each
+  function also gets its own chunk. A function whose body never leaves its
+  chunk (no `try`/`with`, generator, nested scope or name introspection) is
+  also copied into its module's main chunk, so a call made from code running
+  on that chunk pushes a fusevm frame on the same VM instead of starting
+  another one. `--tiers` labels the loops in those copies.
 - `host.rs` — the `PyHost` object heap (str/list/dict/tuple/set/instances/…), the
   operator/attribute/item/iteration semantics, and the fusevm run plumbing.
 - `builtins.rs` — the `CallBuiltin` handler table, the numeric hook, the Kernel

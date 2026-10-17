@@ -88,6 +88,75 @@ fn rebase_chunk(chunk: &mut Chunk, func_off: usize, try_off: usize) {
     }
 }
 
+/// `body`'s ops as they read once copied into `dst` at op index `base`: jump
+/// targets moved by `base`, constant indices moved into `dst`'s pool.
+///
+/// `None` leaves the function unlinked. That happens when an op is not one this
+/// relocation knows to be position-independent, so a new op that does carry an
+/// index costs a link, never a wrong jump, or when `dst`'s constant pool is full
+/// (the constants a refused body already added stay in the pool, unread).
+fn relocate_body(body: &Chunk, dst: &mut ChunkBuilder, base: usize) -> Option<Vec<Op>> {
+    if !body.sub_entries.is_empty() || !body.block_ranges.is_empty() || !body.sub_chunks.is_empty() {
+        return None;
+    }
+    let mut consts: Vec<Option<u16>> = vec![None; body.constants.len()];
+    body.ops
+        .iter()
+        .map(|op| {
+            Some(match op {
+                Op::LoadConst(i) => {
+                    let i = *i as usize;
+                    let moved = match consts.get(i)? {
+                        Some(j) => *j,
+                        None => dst.try_add_constant(body.constants[i].clone())?,
+                    };
+                    consts[i] = Some(moved);
+                    Op::LoadConst(moved)
+                }
+                Op::Jump(t) => Op::Jump(t + base),
+                Op::JumpIfTrue(t) => Op::JumpIfTrue(t + base),
+                Op::JumpIfFalse(t) => Op::JumpIfFalse(t + base),
+                Op::JumpIfTrueKeep(t) => Op::JumpIfTrueKeep(t + base),
+                Op::JumpIfFalseKeep(t) => Op::JumpIfFalseKeep(t + base),
+                Op::CallBuiltin(..)
+                | Op::LoadInt(_)
+                | Op::LoadFloat(_)
+                | Op::LoadTrue
+                | Op::LoadFalse
+                | Op::LoadUndef
+                | Op::Pop
+                | Op::Dup
+                | Op::Swap
+                | Op::Rot
+                | Op::GetSlot(_)
+                | Op::SetSlot(_)
+                | Op::Add
+                | Op::Sub
+                | Op::Mul
+                | Op::Div
+                | Op::Mod
+                | Op::Pow
+                | Op::Negate
+                | Op::LogNot
+                | Op::BitAnd
+                | Op::BitOr
+                | Op::BitXor
+                | Op::Shl
+                | Op::Shr
+                | Op::NumEq
+                | Op::NumNe
+                | Op::NumLt
+                | Op::NumLe
+                | Op::NumGt
+                | Op::NumGe
+                | Op::MulModFloor
+                | Op::MulAddModFloor => op.clone(),
+                _ => return None,
+            })
+        })
+        .collect()
+}
+
 /// Break/continue jump fixups for a native loop. When `signal` is set the loop
 /// body runs as a `LOOP_BODY` sub-chunk, so `break`/`continue` emit control
 /// signals instead of in-chunk jumps (they must cross a `try`/`with` boundary);
@@ -217,6 +286,11 @@ pub struct Compiler {
     /// Finished per-chunk position tables paired with their chunk `op_hash`,
     /// accumulated as each chunk is built and handed to `Program.positions`.
     collected_positions: Vec<(u64, Vec<Span>)>,
+    /// Def ids whose body can run as a fusevm frame on the main chunk's VM:
+    /// it never leaves its chunk through a signal or a sub-chunk (the
+    /// [`fn_slots_allowed`] functions). `link_functions` copies each one into
+    /// the main chunk.
+    linkable: Vec<usize>,
 }
 
 /// The kind of scope a hidden function represents, controlling whether it is a
@@ -351,6 +425,7 @@ fn compile_checked(stmts: &[Stmt], debug: bool, interactive: bool) -> Result<Pro
         c.compile_stmts(&mut b, std::slice::from_ref(&store))?;
     }
     c.compile_stmts(&mut b, stmts)?;
+    c.link_functions(&mut b);
     let main = c.finish_chunk(b);
     Ok(Program {
         main,
@@ -432,7 +507,9 @@ impl Compiler {
                     .hash(&mut h);
                 sp.suppress.hash(&mut h);
             }
-            b.add_constant(Value::Int((h.finish() >> 1) as i64));
+            // A main chunk whose pool the linker filled goes without the salt
+            // rather than failing the compile.
+            let _ = b.try_add_constant(Value::Int((h.finish() >> 1) as i64));
         }
         let c = b.build();
         frame.resize(c.ops.len(), Span::NONE);
@@ -442,6 +519,48 @@ impl Compiler {
         self.collected_positions.push((c.op_hash, frame));
         c
     }
+    /// Copy each [`Compiler::linkable`] function body to the end of the main
+    /// chunk `b` and record where it starts in [`FuncDef::linked`].
+    ///
+    /// A call made by code on the main chunk's VM then enters the copy as a
+    /// fusevm frame on that same VM (`host::enter_linked`), where any other
+    /// caller still runs the function's own chunk on a VM of its own. The main
+    /// code jumps over the copies, and each copy ends in a `return None` for
+    /// the body that falls off its end.
+    fn link_functions(&mut self, b: &mut ChunkBuilder) {
+        if self.linkable.is_empty() {
+            return;
+        }
+        let exit = b.emit(Op::Jump(0), 0);
+        for id in std::mem::take(&mut self.linkable) {
+            let body = &self.functions[id].1.chunk;
+            let Some(ops) = relocate_body(body, b, b.current_pos()) else {
+                continue;
+            };
+            let lines = body.lines.clone();
+            let spans = self
+                .collected_positions
+                .iter()
+                .find(|(hash, _)| *hash == body.op_hash)
+                .map(|(_, table)| table.clone())
+                .unwrap_or_default();
+            let entry = b.current_pos();
+            for (i, op) in ops.into_iter().enumerate() {
+                let idx = b.emit(op, lines.get(i).copied().unwrap_or(0));
+                if let Some(&sp) = spans.get(i).filter(|sp| sp.is_some()) {
+                    let frame = self.positions.last_mut().expect("main position frame");
+                    frame.resize(frame.len().max(idx + 1), Span::NONE);
+                    frame[idx] = sp;
+                }
+            }
+            b.emit(Op::LoadUndef, 0);
+            b.emit(Op::CallBuiltin(ops::SIG_RETURN, 1), 0);
+            self.functions[id].1.linked = Some(entry as u32);
+        }
+        let end = b.current_pos();
+        b.patch_jump(exit, end);
+    }
+
     /// Record `self.node_span` (the caret-bearing expr being lowered) against the
     /// raising op at `idx` in the current chunk's position frame.
     fn record_span(&mut self, idx: usize) {
@@ -2477,7 +2596,9 @@ impl Compiler {
         let is_gen_or_async = is_async || body_has_yield(body);
         // A `--dap` compile keeps every local in the environment, where the
         // debugger's `variables`/`evaluate` read the paused frame by name.
-        if kind.is_function() && !is_gen_or_async && !self.debug && fn_slots_allowed(body) {
+        let slot_safe =
+            kind.is_function() && !is_gen_or_async && !self.debug && fn_slots_allowed(body);
+        if slot_safe {
             let mut next: u16 = 0;
             let mut table: HashMap<String, u16> = HashMap::new();
             // Parameters first, in `param_names` order: the call binds each
@@ -2610,8 +2731,13 @@ impl Compiler {
             sees_class_scope: false,
             is_annotate: false,
             params_in_slots,
+            linked: None,
+            unit: 0,
         };
         self.functions.push((name.to_string(), def));
+        if slot_safe {
+            self.linkable.push(self.functions.len() - 1);
+        }
         Ok(self.functions.len() - 1)
     }
 

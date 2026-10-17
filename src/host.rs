@@ -309,6 +309,17 @@ pub struct FuncDef {
     /// is hashed, cloned or looked up to pass an argument.
     #[serde(default)]
     pub params_in_slots: bool,
+    /// Where a copy of the body starts in its program's main chunk, when the
+    /// compiler linked one there (`compiler::link_functions`). A call made by
+    /// code running on that chunk enters the copy on its own VM, as a fusevm
+    /// frame, instead of running [`FuncDef::chunk`] on a VM of its own.
+    #[serde(default)]
+    pub linked: Option<u32>,
+    /// The `op_hash` of the main chunk holding the [`FuncDef::linked`] copy,
+    /// stamped when the program is loaded; `0` until then, which matches no
+    /// chunk. A VM whose chunk has this hash holds the copy at that entry.
+    #[serde(skip)]
+    pub unit: u64,
 }
 
 impl FuncDef {
@@ -349,6 +360,8 @@ impl FuncDef {
             sees_class_scope: self.sees_class_scope,
             is_annotate: self.is_annotate,
             params_in_slots: self.params_in_slots,
+            linked: self.linked,
+            unit: self.unit,
         }
     }
 }
@@ -5046,6 +5059,12 @@ fn finish_run(mut vm: Box<VM>, pool_key: Option<u64>) -> Result<Value, String> {
         // op's line/caret span was never recorded. Capture it here from the
         // still-valid `ip` before unwinding.
         crate::builtins::record_err_line(&vm);
+    }
+    // Only a linked body runs above the base frame, and only an exception stops
+    // a run inside one.
+    if vm.frames.len() > 1 {
+        let raising = matches!(outcome, VMResult::Error(_)) || with_host(|h| h.error.is_some());
+        unwind_linked(&mut vm, raising);
     }
     if let Some(key) = pool_key {
         // A suspended generator parks its VM on the coroutine stack instead — it
@@ -17264,21 +17283,26 @@ pub fn call_bound_function(
     args: Vec<Value>,
     kwargs: Vec<(String, Value)>,
 ) -> Result<Value, String> {
-    let (fv, owner) = with_host(|h| {
-        let owner = match h.get(recv) {
-            Some(PyObj::Instance(i)) => method_owner(h, &i.class, name),
-            _ => None,
-        };
-        let fv = match h.get(func) {
-            Some(PyObj::Func(fv)) => Some(fv.clone()),
-            _ => None,
-        };
-        (fv, owner)
+    let fv = with_host(|h| match h.get(func) {
+        Some(PyObj::Func(fv)) => Some(fv.clone()),
+        _ => None,
     });
     match fv {
-        Some(fv) => run_user_func(&fv, Some(recv.clone()), owner, args, kwargs),
+        Some(fv) => {
+            let owner = bound_method_owner(recv, name);
+            run_user_func(&fv, Some(recv.clone()), owner, args, kwargs)
+        }
         None => invoke(func, args, kwargs),
     }
+}
+
+/// The class that defines method `name` of an instance `recv` — the owner a
+/// call of it runs with, which zero-argument `super()` starts from.
+pub fn bound_method_owner(recv: &Value, name: &str) -> Option<String> {
+    with_host(|h| match h.get(recv) {
+        Some(PyObj::Instance(i)) => method_owner(h, &i.class, name),
+        _ => None,
+    })
 }
 
 fn call_method_inner(
@@ -18289,24 +18313,7 @@ pub fn run_user_func(
         )
     });
     let def_id = fv.def_id;
-    let self_val = self_opt.or_else(|| fv.bound.clone());
-    let mut pos = args;
-    if let Some(s) = &self_val {
-        pos.insert(0, s.clone());
-    }
-    // `__new__` is an implicit staticmethod (no bound receiver), but zero-arg
-    // `super()` inside it resolves against the class passed as the first argument.
-    // Expose that as the frame's `self` without prepending it to the parameters.
-    // The same holds for any method called with its receiver as a plain argument
-    // (`C.m(obj)`, or CPython calling a method stored in a class it built): CPython's
-    // zero-arg `super()` reads the frame's first argument, not a bound receiver.
-    let frame_self = self_val.clone().or_else(|| {
-        if def.name == "__new__" || (fv.owner.is_some() && !def.params.is_empty()) {
-            pos.first().cloned()
-        } else {
-            None
-        }
-    });
+    let (self_val, frame_self, pos) = call_receiver(fv, &def, self_opt, args);
     let (env, slots) = bind_call(fv, &def, pos, kwargs)?;
     let owner = owner_opt.or_else(|| fv.owner.clone());
     // `async def`: calling it returns a coroutine object (or, if the body
@@ -18365,20 +18372,8 @@ pub fn run_user_func(
     }
     let saved_mod = with_host(|h| {
         let saved = h.swap_module(fv.module);
-        h.frames.push(Frame {
-            env,
-            globals_decl: HashSet::new(),
-            nonlocals_decl: HashSet::new(),
-            locals_set: locals_rc,
-            is_class_body: false,
-            self_obj: frame_self,
-            owner,
-            name: frame_name,
-            line: 0,
-            span: Span::NONE,
-            module: fv.module,
-            file: h.code_files.get(&fv.def_id).cloned(),
-        });
+        let frame = call_frame(h, fv, env, locals_rc, frame_name, frame_self, owner);
+        h.frames.push(frame);
         saved
     });
     let r = run_chunk_cached(def_id as u64, || def.chunk.clone(), slots);
@@ -18396,6 +18391,152 @@ pub fn run_user_func(
             Some(Signal::Return(v)) => v,
             _ => Value::Undef,
         }),
+    }
+}
+
+/// The receiver a call to `fv` runs with, the `self` its frame shows to
+/// zero-argument `super()`, and the positional arguments with that receiver
+/// prepended.
+fn call_receiver(
+    fv: &FuncVal,
+    def: &FuncDef,
+    self_opt: Option<Value>,
+    args: Vec<Value>,
+) -> (Option<Value>, Option<Value>, Vec<Value>) {
+    let self_val = self_opt.or_else(|| fv.bound.clone());
+    let mut pos = args;
+    if let Some(s) = &self_val {
+        pos.insert(0, s.clone());
+    }
+    // `__new__` is an implicit staticmethod (no bound receiver), but zero-arg
+    // `super()` inside it resolves against the class passed as the first argument.
+    // Expose that as the frame's `self` without prepending it to the parameters.
+    // The same holds for any method called with its receiver as a plain argument
+    // (`C.m(obj)`, or CPython calling a method stored in a class it built): CPython's
+    // zero-arg `super()` reads the frame's first argument, not a bound receiver.
+    let frame_self = self_val.clone().or_else(|| {
+        if def.name == "__new__" || (fv.owner.is_some() && !def.params.is_empty()) {
+            pos.first().cloned()
+        } else {
+            None
+        }
+    });
+    (self_val, frame_self, pos)
+}
+
+/// The host frame a call to `fv` runs in.
+fn call_frame(
+    h: &PyHost,
+    fv: &FuncVal,
+    env: Env,
+    locals_set: Rc<HashSet<String>>,
+    name: Rc<str>,
+    self_obj: Option<Value>,
+    owner: Option<String>,
+) -> Frame {
+    Frame {
+        env,
+        globals_decl: HashSet::new(),
+        nonlocals_decl: HashSet::new(),
+        locals_set,
+        is_class_body: false,
+        self_obj,
+        owner,
+        name,
+        line: 0,
+        span: Span::NONE,
+        module: fv.module,
+        file: h.code_files.get(&fv.def_id).cloned(),
+    }
+}
+
+/// `callable`'s function and the entry of its body in the chunk `vm` runs,
+/// when the call can run on `vm` itself: `callable` is a plain function whose
+/// body the compiler linked into this very chunk (see [`FuncDef::linked`]),
+/// and it reads the globals the running code reads.
+pub fn linked_callee(vm: &VM, callable: &Value) -> Option<(Rc<FuncVal>, usize)> {
+    with_host(|h| {
+        let Some(PyObj::Func(fv)) = h.get(callable) else {
+            return None;
+        };
+        let def = &h.funcs[fv.def_id];
+        let entry = def.linked?;
+        (def.unit == vm.chunk.op_hash && fv.module == h.cur_module)
+            .then(|| (fv.clone(), entry as usize))
+    })
+}
+
+/// Call `fv` on `vm` itself: bind its arguments, push its host frame, and push
+/// a fusevm frame that enters its linked body at `entry`.
+///
+/// The caller's next op runs once the body returns through
+/// [`return_linked`]. The call op still pushes its result onto the new frame;
+/// that placeholder sits at the frame's stack base, which the return discards.
+/// This is [`run_user_func`] without a VM run, a VM, or a native stack frame
+/// per Python call.
+pub fn enter_linked(
+    vm: &mut VM,
+    entry: usize,
+    fv: &FuncVal,
+    self_opt: Option<Value>,
+    owner_opt: Option<String>,
+    args: Vec<Value>,
+    kwargs: Vec<(String, Value)>,
+) -> Result<(), String> {
+    let (def, locals_rc, frame_name) = with_host(|h| {
+        (
+            h.funcs[fv.def_id].clone(),
+            h.func_locals[fv.def_id].clone(),
+            h.func_names[fv.def_id].clone(),
+        )
+    });
+    let (_, frame_self, pos) = call_receiver(fv, &def, self_opt, args);
+    let (env, slots) = bind_call(fv, &def, pos, kwargs)?;
+    if with_host(|h| h.frames.len() >= RECURSION_LIMIT) {
+        return Err("RecursionError: maximum recursion depth exceeded".to_string());
+    }
+    let owner = owner_opt.or_else(|| fv.owner.clone());
+    with_host(|h| {
+        let frame = call_frame(h, fv, env, locals_rc, frame_name, frame_self, owner);
+        h.frames.push(frame);
+    });
+    vm.frames.push(fusevm::Frame {
+        return_ip: vm.ip,
+        stack_base: vm.stack.len(),
+        slots,
+        entry_ip: Some(entry),
+    });
+    vm.ip = entry;
+    Ok(())
+}
+
+/// Return `v` from the linked body running in `vm`'s innermost frame: drop
+/// that frame and its host frame, and resume the caller after its call op,
+/// which pushes `v`.
+pub fn return_linked(vm: &mut VM, v: Value) -> Value {
+    let frame = vm.frames.pop().expect("a linked body runs above the base frame");
+    vm.stack.truncate(frame.stack_base);
+    vm.ip = frame.return_ip;
+    with_host(|h| h.frames.pop());
+    v
+}
+
+/// Unwind the linked frames a run stopped inside. Each leaves the host frame
+/// stack as its own VM run would have: when `raising`, the frame joins the
+/// traceback and its caller's frame points at the call that entered it.
+fn unwind_linked(vm: &mut VM, raising: bool) {
+    while vm.frames.len() > 1 {
+        let frame = vm.frames.pop().expect("checked above");
+        with_host(|h| {
+            if raising {
+                h.push_tb_frame();
+            }
+            h.frames.pop();
+        });
+        if raising {
+            vm.ip = frame.return_ip;
+            crate::builtins::record_err_line(vm);
+        }
     }
 }
 

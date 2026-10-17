@@ -174,7 +174,9 @@ use std::path::PathBuf;
 /// chunks with identical ops at different source positions hash differently.
 /// v59: a slotted function's prologue no longer loads its parameters by name;
 /// the call binds them into slots (`FuncDef::params_in_slots`, a new field).
-const SCHEMA: u64 = 59;
+/// v60: the main chunk ends with a copy of each linkable function body
+/// (`FuncDef::linked`, a new field), reached by a jump over them.
+const SCHEMA: u64 = 60;
 
 /// The shard's INDEX: everything a lookup needs, and nothing it does not.
 ///

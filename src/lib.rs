@@ -109,7 +109,17 @@ pub fn load_merged(mut prog: compiler::Program) -> fusevm::Chunk {
         warnings: _,
         positions: _,
     } = prog;
-    let funcs: Vec<host::FuncDef> = functions.into_iter().map(|(_, f)| f).collect();
+    // A linked body runs only on a VM holding this main chunk, which is how
+    // `host::linked_entry` recognises one.
+    let funcs: Vec<host::FuncDef> = functions
+        .into_iter()
+        .map(|(_, mut f)| {
+            if f.linked.is_some() {
+                f.unit = main.op_hash;
+            }
+            f
+        })
+        .collect();
     host::with_host(|h| h.load_program(funcs, tries));
     main
 }

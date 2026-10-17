@@ -1302,11 +1302,10 @@ fn call_method_fused(
         )
     });
     if user_lookup {
-        let r = match resolve_method(recv, name) {
-            Ok((self_slot, callee)) => call_loaded(&self_slot, name, &callee, args, kwargs),
-            Err(e) => return abort_at_callee(vm, e),
+        return match resolve_method(recv, name) {
+            Ok((self_slot, callee)) => run_loaded(vm, &self_slot, name, &callee, args, kwargs),
+            Err(e) => abort_at_callee(vm, e),
         };
-        return finish(vm, r);
     }
     match host::call_method(recv, name, args, kwargs) {
         Err(e) if native_lookup_fails(recv, name) => abort_at_callee(vm, e),
@@ -1430,6 +1429,47 @@ fn call_loaded(
     }
 }
 
+/// Run a loaded method call on `vm`: on `vm` itself when the callee is a
+/// function linked into the chunk `vm` runs (see [`call_value`]), else through
+/// [`call_loaded`].
+fn run_loaded(
+    vm: &mut VM,
+    self_slot: &Value,
+    name: &str,
+    callee: &Value,
+    args: Vec<Value>,
+    kwargs: Vec<(String, Value)>,
+) -> Value {
+    if let Some((fv, entry)) = host::linked_callee(vm, callee) {
+        let (recv, owner) = if is_no_value(self_slot) {
+            (None, None)
+        } else {
+            (Some(self_slot.clone()), host::bound_method_owner(self_slot, name))
+        };
+        return match host::enter_linked(vm, entry, &fv, recv, owner, args, kwargs) {
+            Ok(()) => Value::Undef,
+            Err(e) => abort(vm, e),
+        };
+    }
+    let r = call_loaded(self_slot, name, callee, args, kwargs);
+    finish(vm, r)
+}
+
+/// Call `callable` from `vm`. A function whose body is linked into the chunk
+/// `vm` runs is entered as a frame on `vm` itself (`host::enter_linked`), and
+/// the value pushed here is a placeholder its return discards; any other
+/// callable is invoked and its result pushed.
+fn call_value(vm: &mut VM, callable: &Value, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Value {
+    if let Some((fv, entry)) = host::linked_callee(vm, callable) {
+        return match host::enter_linked(vm, entry, &fv, None, None, args, kwargs) {
+            Ok(()) => Value::Undef,
+            Err(e) => abort(vm, e),
+        };
+    }
+    let r = host::invoke(callable, args, kwargs);
+    finish(vm, r)
+}
+
 /// Split the `[self_or_none, name, callee_or_none, rest...]` head off a loaded call.
 fn loaded_head(args: &mut Vec<Value>) -> (Value, Value, Value) {
     let mut head = args.drain(..3);
@@ -1443,8 +1483,7 @@ fn b_call_loaded(vm: &mut VM, argc: u8) -> Value {
     note_call_line(vm);
     let mut args = pop_n(vm, argc as usize);
     let (self_slot, name, callee) = loaded_head(&mut args);
-    let r = call_loaded(&self_slot, &sref(&name), &callee, args, vec![]);
-    finish(vm, r)
+    run_loaded(vm, &self_slot, &sref(&name), &callee, args, vec![])
 }
 
 fn b_call_loaded_kw(vm: &mut VM, argc: u8) -> Value {
@@ -1452,16 +1491,14 @@ fn b_call_loaded_kw(vm: &mut VM, argc: u8) -> Value {
     let mut args = pop_n(vm, argc as usize);
     let kwd = args.pop().unwrap();
     let (self_slot, name, callee) = loaded_head(&mut args);
-    let r = call_loaded(&self_slot, &sref(&name), &callee, args, kw_pairs(&kwd));
-    finish(vm, r)
+    run_loaded(vm, &self_slot, &sref(&name), &callee, args, kw_pairs(&kwd))
 }
 
 fn b_call_value(vm: &mut VM, argc: u8) -> Value {
     note_call_line(vm);
     let mut args = pop_n(vm, argc as usize);
     let callable = args.remove(0);
-    let r = host::invoke(&callable, args, vec![]);
-    finish(vm, r)
+    call_value(vm, &callable, args, vec![])
 }
 
 fn b_call_value_kw(vm: &mut VM, argc: u8) -> Value {
@@ -1470,8 +1507,7 @@ fn b_call_value_kw(vm: &mut VM, argc: u8) -> Value {
     let kwd = args.pop().unwrap();
     let callable = args.remove(0);
     let kwargs = kw_pairs(&kwd);
-    let r = host::invoke(&callable, args, kwargs);
-    finish(vm, r)
+    call_value(vm, &callable, args, kwargs)
 }
 
 // ── generators ────────────────────────────────────────────────────────────────
@@ -2596,6 +2632,11 @@ pub fn same_object(a: &Value, b: &Value) -> bool {
 
 fn b_sig_return(vm: &mut VM, _: u8) -> Value {
     let v = vm.pop();
+    // pythonrs pushes no fusevm frame but a linked body's, so above the base
+    // frame this is a linked body returning to its caller on the same VM.
+    if vm.frames.len() > 1 {
+        return host::return_linked(vm, v);
+    }
     with_host(|h| h.signal = Some(host::Signal::Return(v.clone())));
     vm.ip = vm.chunk.ops.len();
     v
