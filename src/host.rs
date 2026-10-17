@@ -1167,11 +1167,16 @@ pub enum PyObj {
         /// to `traceback.format_tb` renders as the uncaught one does.
         entries: Rc<Vec<TbFrame>>,
     },
-    /// A stack frame object (`tb.tb_frame`). Minimal: the scope name and current
-    /// line, with `f_globals` the running module's globals.
+    /// A stack frame object (`tb.tb_frame`, `sys._getframe`). Minimal: the scope
+    /// name and current line, with `f_globals` the globals of the module the
+    /// frame runs and `f_back` the frame below it on the live stack. `index` is
+    /// that frame's position on the stack when it was taken, or `None` for a
+    /// frame that is no longer (or was never) on it, whose module is then the
+    /// running one.
     PyFrame {
         name: String,
         lineno: u32,
+        index: Option<usize>,
     },
     /// A frame's `f_code`. pythonrs has no CPython code objects, but the fields
     /// callers actually read off one — the defining file and the function name —
@@ -1826,6 +1831,9 @@ pub struct DictMeta {
 pub struct NtMeta {
     pub type_name: String,
     pub fields: Vec<String>,
+    /// Attributes beyond the sequence fields (a struct sequence's hidden fields,
+    /// e.g. `os.stat_result.st_mtime_ns`). They win over a same-named field.
+    pub extra: Vec<(String, Value)>,
 }
 
 /// The memo table behind one `functools.lru_cache`-wrapped callable, indexed by
@@ -5778,7 +5786,7 @@ impl PyHost {
                     format!("<traceback object at 0x{:012x}>", self.addr_of(v))
                 }
                 Some(PyObj::FrameCode { name, .. }) => format!("<code object {name}>"),
-                Some(PyObj::PyFrame { name, lineno }) => {
+                Some(PyObj::PyFrame { name, lineno, .. }) => {
                     format!(
                         "<frame at 0x{:012x}, file '<string>', line {lineno}, code {name}>",
                         self.addr_of(v)
@@ -12833,6 +12841,14 @@ impl PyHost {
         // namedtuple field access: a tagged tuple resolves `.field` to its index,
         // and `._fields` to the field-name tuple.
         if let Value::Obj(i) = recv {
+            if let Some(v) = self
+                .nt_meta
+                .get(i)
+                .and_then(|m| m.extra.iter().find(|(k, _)| k == name))
+                .map(|(_, v)| v.clone())
+            {
+                return Ok(v);
+            }
             if let Some(fields) = self.nt_meta.get(i).map(|m| m.fields.clone()) {
                 if name == "_fields" {
                     let items: Vec<Value> =
@@ -13568,6 +13584,7 @@ impl PyHost {
                     "gi_frame" => self.alloc(PyObj::PyFrame {
                         name: fname,
                         lineno: line,
+                        index: None,
                     }),
                     _ => self.alloc(PyObj::FrameCode {
                         name: fname,
@@ -14017,6 +14034,15 @@ impl PyHost {
                     "AttributeError: 'types.SimpleNamespace' object has no attribute '{name}'"
                 )),
             },
+            // `Token.var` / `Token.old_value`: the variable `set` was called on and
+            // the value it replaced (`None` when it had none).
+            Some(PyObj::ContextToken { var, old }) if matches!(name, "var" | "old_value") => {
+                Ok(if name == "var" {
+                    (**var).clone()
+                } else {
+                    old.as_deref().cloned().unwrap_or(Value::Undef)
+                })
+            }
             // Traceback chain navigation.
             Some(PyObj::Traceback {
                 frames,
@@ -14027,7 +14053,11 @@ impl PyHost {
                 match name {
                     "tb_frame" => {
                         let (n, l) = frames[idx].clone();
-                        Ok(self.alloc(PyObj::PyFrame { name: n, lineno: l }))
+                        Ok(self.alloc(PyObj::PyFrame {
+                            name: n,
+                            lineno: l,
+                            index: None,
+                        }))
                     }
                     "tb_lineno" => Ok(Value::Int(frames[idx].1 as i64)),
                     "tb_lasti" => Ok(Value::Int(-1)),
@@ -14051,9 +14081,11 @@ impl PyHost {
             Some(PyObj::PyFrame {
                 lineno,
                 name: fname,
+                index,
             }) => {
                 let lineno = *lineno;
                 let fname = fname.clone();
+                let index = (*index).filter(|i| *i < self.frames.len());
                 match name {
                     "f_lineno" => Ok(Value::Int(lineno as i64)),
                     // `f_code` — the frame's code object. `logging.findCaller`
@@ -14068,7 +14100,13 @@ impl PyHost {
                     "f_lasti" => Ok(Value::Int(-1)),
                     "f_locals" => Ok(self.new_dict(IndexMap::new())),
                     "f_globals" | "f_builtins" => {
-                        let pairs = self.globals_pairs();
+                        let pairs = match index {
+                            Some(i) => self.module_globals[self.frames[i].module]
+                                .iter()
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect(),
+                            None => self.globals_pairs(),
+                        };
                         let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
                         for (k, v) in pairs {
                             let kv = self.new_str(k.clone());
@@ -14076,7 +14114,10 @@ impl PyHost {
                         }
                         Ok(self.new_dict(d))
                     }
-                    "f_back" => Ok(Value::Undef),
+                    "f_back" => match index {
+                        Some(i) if i > 0 => Ok(self.frame_object_at(i - 1)),
+                        _ => Ok(Value::Undef),
+                    },
                     _ => Err(format!(
                         "AttributeError: 'frame' object has no attribute '{name}'"
                     )),
@@ -15489,6 +15530,22 @@ impl PyHost {
         if matches!(self.get(recv), Some(PyObj::Func(_))) {
             if let Value::Obj(id) = recv {
                 let id = *id;
+                // `func.__defaults__ = (…)` replaces the positional defaults the
+                // call binds from (`collections.namedtuple` and `typing.NamedTuple`
+                // install field defaults this way); `None` clears them.
+                if name == "__defaults__" {
+                    let items = match self.get(&val) {
+                        Some(PyObj::Tuple(t)) => t.clone(),
+                        _ => Vec::new(),
+                    };
+                    if let Some(PyObj::Func(fv)) = self.get_mut(recv) {
+                        std::rc::Rc::make_mut(fv).defaults = items;
+                    }
+                    if let Some(attrs) = self.func_attrs.get_mut(&id) {
+                        attrs.shift_remove(name);
+                    }
+                    return Ok(());
+                }
                 self.func_attrs
                     .entry(id)
                     .or_default()
@@ -15500,10 +15557,16 @@ impl PyHost {
             self.module_globals[slot].insert(name.to_string(), val);
             return Ok(());
         }
+        // `cls.__module__ = "m"` renames the module the class reprs under, not
+        // just the namespace entry (`collections.namedtuple` sets it this way).
+        let new_module = (name == "__module__").then(|| self.as_str(&val)).flatten();
         match self.get_mut(recv) {
             Some(PyObj::Class(cname)) => {
                 let cname = cname.clone();
                 if let Some(cd) = self.classes.get_mut(&cname) {
+                    if let Some(m) = new_module {
+                        cd.module = m;
+                    }
                     cd.ns.insert(name.to_string(), val);
                 }
                 self.slot_cache.borrow_mut().clear();
@@ -16206,7 +16269,12 @@ pub fn is_generic_subscriptable(recv: &Value) -> bool {
     // `Box[int]` a `TypeError: type 'Box' is not subscriptable`, and treating it
     // as parameterization silently accepted programs CPython rejects.
     if let Some(cname) = cname {
-        return with_host(|h| h.class_lookup(&cname, "__class_getitem__").is_some());
+        // `Generic` is a builtin base with no class body to find the hook in, so
+        // a subclass of it (`class IO(Generic[AnyStr])`) is recognized by name.
+        return with_host(|h| {
+            h.class_lookup(&cname, "__class_getitem__").is_some()
+                || h.mro_rc(&cname).iter().any(|c| c == "Generic")
+        });
     }
     with_host(|h| match h.get(recv) {
         // The builtin container/type objects that carry `__class_getitem__` in
@@ -17989,6 +18057,39 @@ fn seed_exception_attrs(h: &mut PyHost, class: &str, args: Vec<Value>, attrs: &m
     attrs.insert("args".to_string(), t);
 }
 
+/// `object_new`'s abstract-class check: a class whose `__abstractmethods__`
+/// (set by `ABCMeta`) is non-empty cannot be instantiated. A class built on a
+/// native base (`dict`, `list`, …) takes that base's `__new__`, which has no such
+/// check, so it is exempt as in CPython.
+fn refuse_abstract(class: &str) -> Result<(), String> {
+    let abstracts = with_host(|h| {
+        if h.builtin_base_of(class).is_some() {
+            return None;
+        }
+        h.classes
+            .get(class)
+            .and_then(|c| c.ns.get("__abstractmethods__").cloned())
+    });
+    let Some(abstracts) = abstracts else {
+        return Ok(());
+    };
+    let mut names: Vec<String> = iter_vec(&abstracts)?
+        .iter()
+        .map(|v| with_host(|h| h.str_of(v)))
+        .collect();
+    if names.is_empty() {
+        return Ok(());
+    }
+    names.sort();
+    let quoted: Vec<String> = names.iter().map(|n| format!("'{n}'")).collect();
+    let label = with_host(|h| h.class_exc_label(class));
+    Err(type_error(&format!(
+        "Can't instantiate abstract class {label} without an implementation for abstract method{} {}",
+        if names.len() == 1 { "" } else { "s" },
+        quoted.join(", ")
+    )))
+}
+
 pub fn instantiate_plain(
     class: &str,
     args: Vec<Value>,
@@ -17999,6 +18100,7 @@ pub fn instantiate_plain(
     if with_host(|h| class_inherits_type(h, class)) {
         return metaclass_instantiate(class, args, kwargs);
     }
+    refuse_abstract(class)?;
     // `__new__` (if the class overrides it) creates the instance; it is an
     // implicit staticmethod, so `cls` is passed as the first argument. `cls` is
     // also installed as the frame `self` so a zero-arg `super().__new__(cls)`
@@ -18282,7 +18384,9 @@ fn bind_params(
     kwargs: Vec<(String, Value)>,
 ) -> Result<(), String> {
     let np = def.params.len();
-    let ndef = def.ndefaults;
+    // The runtime defaults, not the compile-time count: `f.__defaults__ = …`
+    // replaces them.
+    let ndef = defaults.len().min(np);
     let posonly = def.posonly.min(np);
     // Argument-count errors name the callable by its `__qualname__` (CPython:
     // `outer.<locals>.f() takes …`), falling back to the bare name.
@@ -20603,14 +20707,19 @@ impl PyHost {
 
     /// A frame object for `sys._getframe(depth)` — `depth` levels up from the
     /// caller. Minimal (scope name + current line); `f_globals` is live.
-    pub fn current_frame_object(&mut self, depth: usize) -> Value {
-        let idx = self.frames.len().saturating_sub(1 + depth);
-        let (name, lineno) = self
-            .frames
-            .get(idx)
-            .map(|f| (f.name.to_string(), f.line))
-            .unwrap_or_else(|| ("<module>".to_string(), 0));
-        self.alloc(PyObj::PyFrame { name, lineno })
+    pub fn current_frame_object(&mut self, depth: usize) -> Option<Value> {
+        let idx = self.frames.len().checked_sub(1 + depth)?;
+        Some(self.frame_object_at(idx))
+    }
+
+    /// The frame object for stack position `idx`.
+    fn frame_object_at(&mut self, idx: usize) -> Value {
+        let (name, lineno) = (self.frames[idx].name.to_string(), self.frames[idx].line);
+        self.alloc(PyObj::PyFrame {
+            name,
+            lineno,
+            index: Some(idx),
+        })
     }
 
     /// If `gen` is an un-started generator/coroutine, mark it closed without
@@ -22365,6 +22474,7 @@ fn struct_seq(h: &mut PyHost, type_name: &str, fields: Vec<(&str, Value)>) -> Va
             NtMeta {
                 type_name: type_name.to_string(),
                 fields: names,
+                extra: Vec::new(),
             },
         );
     }
@@ -22377,7 +22487,6 @@ fn struct_seq(h: &mut PyHost, type_name: &str, fields: Vec<(&str, Value)>) -> Va
 /// directory) for `-c`/`-m`/stdin, exactly as CPython seeds `sys.path[0]`.
 /// Non-string entries (a `PathLike`, a custom finder) are skipped rather than
 /// stringified, since the bridge can only pass a path across.
-#[cfg(feature = "stdlib-ffi")]
 fn current_search_paths() -> Vec<String> {
     with_host(|h| {
         if let Some(sys) = h.cached_module("sys") {
@@ -22698,120 +22807,119 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
         }),
         // `posix` — the Unix syscall surface `os` sits on. Backed by std::fs/
         // std::env/libc.
-        "posix" => with_host(|h| {
-            const FNS: &[&str] = &[
-                "getcwd",
-                "getcwdb",
-                "chdir",
-                "listdir",
-                "scandir",
-                "stat",
-                "lstat",
-                "fstat",
-                "mkdir",
-                "makedirs",
-                "rmdir",
-                "remove",
-                "unlink",
-                "rename",
-                "replace",
-                "getpid",
-                "getppid",
-                "getuid",
-                "geteuid",
-                "getgid",
-                "getegid",
-                "urandom",
-                "umask",
-                "system",
-                "strerror",
-                "getenv",
-                "putenv",
-                "unsetenv",
-                "access",
-                "fspath",
-                "_exit",
-                "abort",
-                "getpgrp",
-                "cpu_count",
-                "device_encoding",
-                "get_terminal_size",
-                "isatty",
-                "pipe",
-                "dup",
-                "close",
-                "read",
-                "write",
-                "open",
-                "lseek",
-                "fsync",
-                "kill",
-                "waitpid",
-                "_create_environ",
-                "readlink",
-                "symlink",
-                "link",
-                "chmod",
-                "utime",
-                "truncate",
-                "sync",
-                "get_inheritable",
-                "set_inheritable",
-                "ftruncate",
-                "sched_yield",
-            ];
-            let mut v: Vec<(&str, Value)> = FNS
-                .iter()
-                .map(|f| (*f, h.alloc(PyObj::Builtin(format!("posix.{f}")))))
-                .collect();
-            // Constants (from libc where platform-specific).
-            let consts: &[(&str, i64)] = &[
-                ("F_OK", libc::F_OK as i64),
-                ("R_OK", libc::R_OK as i64),
-                ("W_OK", libc::W_OK as i64),
-                ("X_OK", libc::X_OK as i64),
-                ("SEEK_SET", libc::SEEK_SET as i64),
-                ("SEEK_CUR", libc::SEEK_CUR as i64),
-                ("SEEK_END", libc::SEEK_END as i64),
-                ("O_RDONLY", libc::O_RDONLY as i64),
-                ("O_WRONLY", libc::O_WRONLY as i64),
-                ("O_RDWR", libc::O_RDWR as i64),
-                ("O_APPEND", libc::O_APPEND as i64),
-                ("O_CREAT", libc::O_CREAT as i64),
-                ("O_EXCL", libc::O_EXCL as i64),
-                ("O_TRUNC", libc::O_TRUNC as i64),
-                ("O_NONBLOCK", libc::O_NONBLOCK as i64),
-                ("O_CLOEXEC", libc::O_CLOEXEC as i64),
-                ("WNOHANG", libc::WNOHANG as i64),
-                ("EX_OK", 0),
-            ];
-            for (k, val) in consts {
-                v.push((k, Value::Int(*val)));
-            }
-            // `environ` as a {bytes: bytes} dict — CPython's posix.environ is
-            // bytes-keyed on Unix, and os wraps it in a str-decoding mapping.
-            let environ = {
-                let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
-                for (k, val) in std::env::vars() {
-                    let kb = k.clone().into_bytes();
-                    let kv = h.alloc(PyObj::Bytes(kb.clone()));
-                    let vv = h.alloc(PyObj::Bytes(val.into_bytes()));
-                    d.insert(PKey::Bytes(kb), (kv, vv));
+        "posix" => {
+            let mut v = with_host(|h| {
+                const FNS: &[&str] = &[
+                    "getcwd",
+                    "getcwdb",
+                    "scandir",
+                    "makedirs",
+                    "getpid",
+                    "getppid",
+                    "getuid",
+                    "geteuid",
+                    "getgid",
+                    "getegid",
+                    "urandom",
+                    "umask",
+                    "getenv",
+                    "putenv",
+                    "unsetenv",
+                    "fspath",
+                    "_exit",
+                    "abort",
+                    "getpgrp",
+                    "cpu_count",
+                    "device_encoding",
+                    "get_terminal_size",
+                    "_create_environ",
+                    "sync",
+                    "sched_yield",
+                ];
+                let mut v: Vec<(&str, Value)> = FNS
+                    .iter()
+                    .map(|f| (*f, h.alloc(PyObj::Builtin(format!("posix.{f}")))))
+                    .collect();
+                // Constants (from libc where platform-specific).
+                let consts: &[(&str, i64)] = &[
+                    ("F_OK", libc::F_OK as i64),
+                    ("R_OK", libc::R_OK as i64),
+                    ("W_OK", libc::W_OK as i64),
+                    ("X_OK", libc::X_OK as i64),
+                    ("SEEK_SET", libc::SEEK_SET as i64),
+                    ("SEEK_CUR", libc::SEEK_CUR as i64),
+                    ("SEEK_END", libc::SEEK_END as i64),
+                    ("O_RDONLY", libc::O_RDONLY as i64),
+                    ("O_WRONLY", libc::O_WRONLY as i64),
+                    ("O_RDWR", libc::O_RDWR as i64),
+                    ("O_APPEND", libc::O_APPEND as i64),
+                    ("O_CREAT", libc::O_CREAT as i64),
+                    ("O_EXCL", libc::O_EXCL as i64),
+                    ("O_TRUNC", libc::O_TRUNC as i64),
+                    ("O_NONBLOCK", libc::O_NONBLOCK as i64),
+                    ("O_CLOEXEC", libc::O_CLOEXEC as i64),
+                    ("WNOHANG", libc::WNOHANG as i64),
+                    ("EX_OK", 0),
+                ];
+                for (k, val) in consts {
+                    v.push((k, Value::Int(*val)));
                 }
-                h.alloc(PyObj::Dict(d))
-            };
-            // `stat_result` as a type object. `os.stat()` already returns values
-            // tagged with this type name; `pathlib` reaches the TYPE itself to
-            // feature-test for platform-specific fields
-            // (`hasattr(os.stat_result, 'st_flags')`).
-            let stat_result = h.alloc(PyObj::Builtin("os.stat_result".into()));
-            v.push(("stat_result", stat_result));
-            v.push(("environ", environ));
-            // Capability list `os` reads (empty = no optional dir-fd/etc. features).
-            let have = h.new_list(vec![]);
-            v.push(("_have_functions", have));
+                for (k, val) in crate::stdlib::pyposix::constants() {
+                    v.push((k, Value::Int(val)));
+                }
+                for f in crate::stdlib::pyposix::NAMES {
+                    v.push((*f, h.alloc(PyObj::Builtin(format!("posix.{f}")))));
+                }
+                v.push(("sysconf_names", crate::stdlib::pyposix::sysconf_names(h)));
+                // `environ` as a {bytes: bytes} dict — CPython's posix.environ is
+                // bytes-keyed on Unix, and os wraps it in a str-decoding mapping.
+                let environ = {
+                    let mut d: IndexMap<PKey, (Value, Value)> = IndexMap::new();
+                    for (k, val) in std::env::vars() {
+                        let kb = k.clone().into_bytes();
+                        let kv = h.alloc(PyObj::Bytes(kb.clone()));
+                        let vv = h.alloc(PyObj::Bytes(val.into_bytes()));
+                        d.insert(PKey::Bytes(kb), (kv, vv));
+                    }
+                    h.alloc(PyObj::Dict(d))
+                };
+                // `stat_result` as a type object. `os.stat()` already returns values
+                // tagged with this type name; `pathlib` reaches the TYPE itself to
+                // feature-test for platform-specific fields
+                // (`hasattr(os.stat_result, 'st_flags')`).
+                let stat_result = h.alloc(PyObj::Builtin("os.stat_result".into()));
+                v.push(("stat_result", stat_result));
+                v.push(("environ", environ));
+                // Capability list `os` reads (empty = no optional dir-fd/etc. features).
+                let have = h.new_list(vec![]);
+                v.push(("_have_functions", have));
+                v
+            });
+            // Struct sequences, `DirEntry` and `scandir` are classes, so they are
+            // Python (`stdlib::pyposix::module_source`) bound into this namespace;
+            // `get_terminal_size`/`uname`/`times` wrap the native `_`-prefixed
+            // readers in those result types.
+            let extras = run_vendored_module(
+                "posix._extras",
+                crate::stdlib::pyposix::module_source(),
+                std::path::Path::new("<posix._extras>"),
+            )?;
+            for name in [
+                "terminal_size",
+                "uname_result",
+                "times_result",
+                "get_terminal_size",
+                "uname",
+                "times",
+                "register_at_fork",
+                "fork",
+                "DirEntry",
+                "scandir",
+            ] {
+                v.push((name, with_host(|h| h.get_attr(&extras, name))?));
+            }
             v
-        }),
+        }
         // `_thread` — low-level threading primitives. pythonrs runs user code on
         // one thread, so the locks are functional but uncontended.
         "_thread_core" => with_host(|h| {
@@ -23242,6 +23350,7 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                             .iter()
                             .map(|s| s.to_string())
                             .collect(),
+                        extra: Vec::new(),
                     },
                 );
             }
@@ -23455,6 +23564,10 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                     h.alloc(PyObj::Builtin("sys.set_int_max_str_digits".into())),
                 ),
                 ("_getframe", h.alloc(PyObj::Builtin("sys._getframe".into()))),
+                (
+                    "_getframemodulename",
+                    h.alloc(PyObj::Builtin("sys._getframemodulename".into())),
+                ),
                 (
                     "getfilesystemencoding",
                     h.alloc(PyObj::Builtin("sys.getfilesystemencoding".into())),
@@ -23830,11 +23943,21 @@ pub fn stdlib_module_names() -> &'static std::collections::BTreeSet<String> {
 /// Resolve a dotted module name to a source file on the search path, if present:
 /// `json` → `<root>/json.py` or `<root>/json/__init__.py`; `os.path` →
 /// `<root>/os/path.py` or `<root>/os/path/__init__.py`. Roots are searched in
-/// order: the vendored stdlib (`pylib/`) first, then `~/.pythonrs/pip`.
+/// order: `sys.path`, then the vendored stdlib (`pylib/`), then `~/.pythonrs/pip`.
 #[cfg(not(feature = "stdlib-ffi"))]
 fn resolve_vendored_path(name: &str) -> Option<std::path::PathBuf> {
     let rel = name.replace('.', "/");
-    for root in [pylib_dir(), pip_dir()].into_iter().flatten() {
+    // `sys.path` first, in order (`""` is the current directory), so the
+    // script's own directory and anything the program inserted shadow the
+    // stdlib exactly as in CPython; then the bundled stdlib and pip roots.
+    let on_path = current_search_paths().into_iter().map(|p| {
+        if p.is_empty() {
+            std::path::PathBuf::from(".")
+        } else {
+            std::path::PathBuf::from(p)
+        }
+    });
+    for root in on_path.chain([pylib_dir(), pip_dir()].into_iter().flatten()) {
         let module_file = root.join(format!("{rel}.py"));
         if module_file.is_file() {
             return Some(module_file);
@@ -24985,6 +25108,7 @@ pub fn namedtuple_construct(
                 NtMeta {
                     type_name: type_name.to_string(),
                     fields: fields.to_vec(),
+                    extra: Vec::new(),
                 },
             );
         }

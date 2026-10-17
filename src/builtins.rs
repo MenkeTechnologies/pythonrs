@@ -2236,6 +2236,47 @@ fn b_type_alias(vm: &mut VM, _: u8) -> Value {
     })
 }
 
+/// PEP 560: the class names a `class` statement's base list stands for. A
+/// generic alias (`Generic[T]`, `list[int]`, `Base[int]`) is replaced by its
+/// origin; an object that is not a class but defines `__mro_entries__` (typing's
+/// `NamedTuple` function, an instance) is
+/// replaced by what that returns. Anything else that names no class is dropped
+/// as before.
+fn resolve_mro_entries(bases_val: &Value) -> Result<Vec<String>, String> {
+    let items: Vec<Value> = with_host(|h| match h.get(bases_val) {
+        Some(PyObj::List(l)) => l.clone(),
+        _ => Vec::new(),
+    });
+    let mut names = Vec::new();
+    for b in items.iter().cloned() {
+        let mut cur = b;
+        // `Base[int][str]` nests: unwrap to the innermost origin.
+        while let Some(origin) = with_host(|h| match h.get(&cur) {
+            Some(PyObj::GenericAlias { origin, .. }) => Some(origin.clone()),
+            _ => None,
+        }) {
+            cur = origin;
+        }
+        if let Some(n) = with_host(|h| callable_name(h, &cur)) {
+            names.push(n);
+            continue;
+        }
+        let hook = with_host(|h| h.get_attr(&cur, "__mro_entries__").ok());
+        if let Some(hook) = hook {
+            let tup = with_host(|h| h.new_tuple(items.clone()));
+            let res = host::invoke(&hook, vec![tup], vec![])?;
+            let expanded = host::iter_vec(&res)?;
+            names.extend(with_host(|h| {
+                expanded
+                    .iter()
+                    .filter_map(|e| callable_name(h, e))
+                    .collect::<Vec<_>>()
+            }));
+        }
+    }
+    Ok(names)
+}
+
 fn b_build_class(vm: &mut VM, _: u8) -> Value {
     let kwargs_val = vm.pop();
     let body_func = vm.pop();
@@ -2257,10 +2298,10 @@ fn b_build_class(vm: &mut VM, _: u8) -> Value {
         let r = host::build_class_foreign(&name, bases, &body_func);
         return finish(vm, r);
     }
-    let bases: Vec<String> = with_host(|h| match h.get(&bases_val) {
-        Some(PyObj::List(l)) => l.iter().filter_map(|b| callable_name(h, b)).collect(),
-        _ => Vec::new(),
-    });
+    let bases: Vec<String> = match resolve_mro_entries(&bases_val) {
+        Ok(v) => v,
+        Err(e) => return finish(vm, Err(e)),
+    };
     // An explicit `metaclass=` that names a user class drives construction.
     let meta_name = match &metaclass {
         Value::Undef => None,
@@ -4908,7 +4949,7 @@ fn synth_exc(h: &mut host::PyHost, err: &str) -> Value {
     // `if e.errno == errno.ENOENT:` is how OSError is normally discriminated —
     // pythonrs put the whole rendered line in `args[0]` and had no `.errno` at
     // all, so that idiom raised `AttributeError` inside the handler.
-    if let Some((eno, strerror, filename)) = parse_oserror(&msg) {
+    if let Some((eno, strerror, filename, filename2)) = parse_oserror(&msg) {
         if is_oserror_class(&class) {
             let se = h.new_str(strerror.clone());
             let e = h.alloc(PyObj::Exception {
@@ -4922,7 +4963,11 @@ fn synth_exc(h: &mut host::PyHost, err: &str) -> Value {
                 None => Value::Undef,
             };
             let _ = h.set_attr(&e, "filename", fv);
-            let _ = h.set_attr(&e, "filename2", Value::Undef);
+            let f2v = match filename2 {
+                Some(f) => h.new_str(f),
+                None => Value::Undef,
+            };
+            let _ = h.set_attr(&e, "filename2", f2v);
             return e;
         }
     }
@@ -5093,22 +5138,26 @@ pub fn is_oserror_class(class: &str) -> bool {
 }
 
 /// Split an OSError message rendered as CPython renders it —
-/// `[Errno 2] No such file or directory: '/no/such'` — back into
-/// `(errno, strerror, filename)`. `None` when the message has no `[Errno N]`
-/// prefix, which is how a non-`errno` OSError is left alone.
-fn parse_oserror(msg: &str) -> Option<(i64, String, Option<String>)> {
+/// `[Errno 2] No such file or directory: '/no/such'`, or with a second name
+/// `: 'a' -> 'b'` — back into `(errno, strerror, filename, filename2)`. `None`
+/// when the message has no `[Errno N]` prefix, which is how a non-`errno`
+/// OSError is left alone.
+fn parse_oserror(msg: &str) -> Option<(i64, String, Option<String>, Option<String>)> {
     let rest = msg.strip_prefix("[Errno ")?;
     let (num, rest) = rest.split_once("] ")?;
     let eno: i64 = num.parse().ok()?;
     // The filename tail is `: '<path>'`; a strerror never contains one, because
     // every producer appends it as the last segment.
-    match rest.rsplit_once(": '") {
-        Some((strerror, tail)) if tail.ends_with('\'') => Some((
-            eno,
-            strerror.to_string(),
-            Some(tail[..tail.len() - 1].to_string()),
-        )),
-        _ => Some((eno, rest.to_string(), None)),
+    match rest.split_once(": '") {
+        Some((strerror, tail)) if tail.ends_with('\'') => {
+            let names = &tail[..tail.len() - 1];
+            let (first, second) = match names.split_once("' -> '") {
+                Some((a, b)) => (a, Some(b.to_string())),
+                None => (names, None),
+            };
+            Some((eno, strerror.to_string(), Some(first.to_string()), second))
+        }
+        _ => Some((eno, rest.to_string(), None, None)),
     }
 }
 
@@ -6435,7 +6484,14 @@ pub fn call_builtin_function(
                 let tup = call_builtin_function(base, rest, kwargs)?;
                 with_host(|h| {
                     if let Value::Obj(idx) = tup {
-                        h.nt_meta.insert(idx, host::NtMeta { type_name, fields });
+                        h.nt_meta.insert(
+                            idx,
+                            host::NtMeta {
+                                type_name,
+                                fields,
+                                extra: Vec::new(),
+                            },
+                        );
                     }
                 });
                 Ok(tup)
@@ -6721,6 +6777,18 @@ pub fn call_builtin_function(
         }
     }
     if let Some(f) = name.strip_prefix("_io.") {
+        // `io.open` IS the builtin `open`; `open_code(path)` is `open(path, "rb")`.
+        match f {
+            "open" => return call_builtin_function("open", args, kwargs),
+            "open_code" => {
+                let mut a = args;
+                a.truncate(1);
+                let mode = with_host(|h| h.new_str("rb".to_string()));
+                a.push(mode);
+                return call_builtin_function("open", a, vec![]);
+            }
+            _ => {}
+        }
         if let Some(r) = with_host(|h| crate::stdlib::pyio::call(h, f, &args, &kwargs)) {
             return r;
         }
@@ -8532,7 +8600,7 @@ fn reject_kwargs(name: &str, kwargs: &[(String, Value)]) -> Result<(), String> {
 
 /// How a builtin words its refusal of a keyword it does not have.
 #[derive(Clone, Copy, PartialEq)]
-enum KwStyle {
+pub(crate) enum KwStyle {
     /// `f() got an unexpected keyword argument 'k'` — Argument Clinic's wording,
     /// used by nearly everything.
     Unexpected,
@@ -8564,7 +8632,7 @@ enum KwStyle {
 /// remembered and only raised once every required slot is filled.
 ///
 /// Every message here was read off /opt/homebrew/bin/python3 (Python 3.14.7).
-fn bind_named<const N: usize>(
+pub(crate) fn bind_named<const N: usize>(
     fname: &str,
     names: [&str; N],
     posonly: usize,
@@ -11226,96 +11294,45 @@ pub fn random_method(id: u32, name: &str, args: &[Value]) -> Result<Value, Strin
     }
 }
 
-/// The `posix` syscall surface, backed by std::fs/std::env/libc.
+/// The `posix` entries that are not syscalls with a path or descriptor: the
+/// process environment, identity, and a few constants-as-functions. Everything
+/// else is `stdlib::pyposix`, ported from `posixmodule.c`.
 fn call_posix(name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Result<Value, String> {
+    if let Some(r) = crate::stdlib::pyposix::call(name, &args, &kwargs) {
+        return r;
+    }
     let path_arg =
         |i: usize| -> Option<String> { args.get(i).and_then(|v| with_host(|h| h.as_str(v))) };
     let str_v = |s: String| with_host(|h| h.new_str(s));
-    let io_err = |e: std::io::Error| -> String {
-        let code = e.raw_os_error().unwrap_or(0);
-        format!("OSError: [Errno {code}] {e}")
+    let int_arg = |i: usize| args.get(i).and_then(|v| with_host(|h| h.as_int(v)));
+    let cwd_err = |e: std::io::Error| {
+        crate::stdlib::pyposix::os_error(e.raw_os_error().unwrap_or(libc::EIO), None, None)
     };
     match name {
         "getcwd" => std::env::current_dir()
             .map(|p| str_v(p.to_string_lossy().into_owned()))
-            .map_err(io_err),
+            .map_err(cwd_err),
         "getcwdb" => std::env::current_dir()
             .map(|p| with_host(|h| h.alloc(PyObj::Bytes(p.to_string_lossy().as_bytes().to_vec()))))
-            .map_err(io_err),
-        "chdir" => {
-            let p = path_arg(0).ok_or_else(|| host::type_error("chdir: path required"))?;
-            std::env::set_current_dir(&p).map_err(io_err)?;
-            Ok(Value::Undef)
-        }
-        "listdir" => {
-            let p = path_arg(0).unwrap_or_else(|| ".".to_string());
-            let mut names = Vec::new();
-            for entry in std::fs::read_dir(&p).map_err(io_err)? {
-                let e = entry.map_err(io_err)?;
-                names.push(str_v(e.file_name().to_string_lossy().into_owned()));
-            }
-            Ok(with_host(|h| h.new_list(names)))
-        }
-        "stat" | "lstat" => {
-            let p = path_arg(0).ok_or_else(|| host::type_error("stat: path required"))?;
-            let md = if name == "lstat" {
-                std::fs::symlink_metadata(&p)
-            } else {
-                std::fs::metadata(&p)
-            }
-            .map_err(io_err)?;
-            Ok(build_stat_result(&md))
-        }
-        "mkdir" => {
-            let p = path_arg(0).ok_or_else(|| host::type_error("mkdir: path required"))?;
-            std::fs::create_dir(&p).map_err(io_err)?;
-            Ok(Value::Undef)
-        }
-        "makedirs" => {
-            let p = path_arg(0).ok_or_else(|| host::type_error("makedirs: path required"))?;
-            std::fs::create_dir_all(&p).map_err(io_err)?;
-            Ok(Value::Undef)
-        }
-        "rmdir" => {
-            let p = path_arg(0).ok_or_else(|| host::type_error("rmdir: path required"))?;
-            std::fs::remove_dir(&p).map_err(io_err)?;
-            Ok(Value::Undef)
-        }
-        "remove" | "unlink" => {
-            let p = path_arg(0).ok_or_else(|| host::type_error("remove: path required"))?;
-            std::fs::remove_file(&p).map_err(io_err)?;
-            Ok(Value::Undef)
-        }
-        "rename" | "replace" => {
-            let src = path_arg(0).ok_or_else(|| host::type_error("rename: src required"))?;
-            let dst = path_arg(1).ok_or_else(|| host::type_error("rename: dst required"))?;
-            std::fs::rename(&src, &dst).map_err(io_err)?;
-            Ok(Value::Undef)
-        }
+            .map_err(cwd_err),
         "getpid" => Ok(Value::Int(std::process::id() as i64)),
         "getppid" => Ok(Value::Int(unsafe { libc::getppid() } as i64)),
-        "getuid" | "geteuid" => Ok(Value::Int(unsafe { libc::getuid() } as i64)),
-        "getgid" | "getegid" => Ok(Value::Int(unsafe { libc::getgid() } as i64)),
+        "getuid" => Ok(Value::Int(unsafe { libc::getuid() } as i64)),
+        "geteuid" => Ok(Value::Int(unsafe { libc::geteuid() } as i64)),
+        "getgid" => Ok(Value::Int(unsafe { libc::getgid() } as i64)),
+        "getegid" => Ok(Value::Int(unsafe { libc::getegid() } as i64)),
         "getpgrp" => Ok(Value::Int(unsafe { libc::getpgrp() } as i64)),
         "umask" => {
-            let m = args
-                .first()
-                .and_then(|v| with_host(|h| h.as_int(v)))
-                .unwrap_or(0);
-            let prev = unsafe { libc::umask(m as libc::mode_t) };
+            let prev = unsafe { libc::umask(int_arg(0).unwrap_or(0) as libc::mode_t) };
             Ok(Value::Int(prev as i64))
         }
         "urandom" => {
-            let n = args
-                .first()
-                .and_then(|v| with_host(|h| h.as_int(v)))
-                .unwrap_or(0)
-                .max(0) as usize;
+            let n = int_arg(0).unwrap_or(0).max(0) as usize;
             let mut buf = vec![0u8; n];
             use std::io::Read;
             std::fs::File::open("/dev/urandom")
                 .and_then(|mut f| f.read_exact(&mut buf))
-                .map_err(io_err)?;
+                .map_err(cwd_err)?;
             Ok(with_host(|h| h.alloc(PyObj::Bytes(buf))))
         }
         "getenv" => {
@@ -11336,18 +11353,6 @@ fn call_posix(name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Res
             std::env::remove_var(&key);
             Ok(Value::Undef)
         }
-        "access" => {
-            let p = path_arg(0).ok_or_else(|| host::type_error("access: path required"))?;
-            let mode = args
-                .get(1)
-                .and_then(|v| with_host(|h| h.as_int(v)))
-                .unwrap_or(0);
-            let cp =
-                std::ffi::CString::new(p).map_err(|_| "ValueError: embedded null".to_string())?;
-            Ok(Value::Bool(
-                unsafe { libc::access(cp.as_ptr(), mode as i32) } == 0,
-            ))
-        }
         "fspath" => {
             // Return str/bytes unchanged; call __fspath__ on a path-like object.
             let a = arg0(&args)?;
@@ -11359,40 +11364,18 @@ fn call_posix(name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Res
                 host::call_method(&a, "__fspath__", vec![], vec![])
             }
         }
-        "strerror" => {
-            let code = args
-                .first()
-                .and_then(|v| with_host(|h| h.as_int(v)))
-                .unwrap_or(0);
-            let msg = std::io::Error::from_raw_os_error(code as i32).to_string();
-            Ok(str_v(msg))
-        }
-        "system" => {
-            let cmd = path_arg(0).ok_or_else(|| host::type_error("system: command required"))?;
-            let status = std::process::Command::new("/bin/sh")
-                .arg("-c")
-                .arg(&cmd)
-                .status()
-                .map_err(io_err)?;
-            Ok(Value::Int((status.code().unwrap_or(0) as i64) << 8))
-        }
         "cpu_count" => Ok(std::thread::available_parallelism()
             .map(|n| Value::Int(n.get() as i64))
             .unwrap_or(Value::Undef)),
-        "isatty" => {
-            let fd = args
-                .first()
-                .and_then(|v| with_host(|h| h.as_int(v)))
-                .unwrap_or(-1);
-            Ok(Value::Bool(unsafe { libc::isatty(fd as i32) } == 1))
+        "device_encoding" => {
+            let fd = int_arg(0).unwrap_or(-1) as i32;
+            Ok(if unsafe { libc::isatty(fd) } == 1 {
+                str_v("UTF-8".to_string())
+            } else {
+                Value::Undef
+            })
         }
-        "_exit" => {
-            let code = args
-                .first()
-                .and_then(|v| with_host(|h| h.as_int(v)))
-                .unwrap_or(0);
-            std::process::exit(code as i32);
-        }
+        "_exit" => std::process::exit(int_arg(0).unwrap_or(0) as i32),
         "abort" => std::process::exit(134),
         "sync" | "sched_yield" => Ok(Value::Undef),
         "_create_environ" => Ok(with_host(|h| {
@@ -11405,65 +11388,10 @@ fn call_posix(name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Res
             }
             h.alloc(PyObj::Dict(d))
         })),
-        // File-descriptor level ops.
-        "close" => {
-            let fd = args
-                .first()
-                .and_then(|v| with_host(|h| h.as_int(v)))
-                .unwrap_or(-1);
-            unsafe { libc::close(fd as i32) };
-            Ok(Value::Undef)
-        }
-        "get_inheritable" => Ok(Value::Bool(false)),
-        "set_inheritable" | "fsync" | "utime" | "chmod" | "truncate" | "ftruncate" => {
-            Ok(Value::Undef)
-        }
-        "readlink" => {
-            let p = path_arg(0).ok_or_else(|| host::type_error("readlink: path required"))?;
-            std::fs::read_link(&p)
-                .map(|t| str_v(t.to_string_lossy().into_owned()))
-                .map_err(io_err)
-        }
         _ => Err(format!(
             "AttributeError: module 'posix' has no attribute '{name}'"
         )),
     }
-    .inspect_err(|_e| {
-        let _ = &kwargs;
-    })
-}
-
-/// A `posix.stat` result — the 10-field `stat_result` sequence (st_mode, st_ino,
-/// st_dev, st_nlink, st_uid, st_gid, st_size, st_atime, st_mtime, st_ctime),
-/// tagged so `.st_mode` etc. resolve.
-fn build_stat_result(md: &std::fs::Metadata) -> Value {
-    use std::os::unix::fs::MetadataExt;
-    let fields = [
-        ("st_mode", md.mode() as i64),
-        ("st_ino", md.ino() as i64),
-        ("st_dev", md.dev() as i64),
-        ("st_nlink", md.nlink() as i64),
-        ("st_uid", md.uid() as i64),
-        ("st_gid", md.gid() as i64),
-        ("st_size", md.size() as i64),
-        ("st_atime", md.atime()),
-        ("st_mtime", md.mtime()),
-        ("st_ctime", md.ctime()),
-    ];
-    with_host(|h| {
-        let vals: Vec<Value> = fields.iter().map(|(_, v)| Value::Int(*v)).collect();
-        let tup = h.new_tuple(vals);
-        if let Value::Obj(i) = tup {
-            h.nt_meta.insert(
-                i,
-                host::NtMeta {
-                    type_name: "os.stat_result".to_string(),
-                    fields: fields.iter().map(|(k, _)| (*k).to_string()).collect(),
-                },
-            );
-        }
-        tup
-    })
 }
 
 fn call_sys(name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Result<Value, String> {
@@ -11587,7 +11515,24 @@ fn call_sys(name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Resul
                 .and_then(|v| with_host(|h| h.as_int(v)))
                 .unwrap_or(0)
                 .max(0) as usize;
-            Ok(with_host(|h| h.current_frame_object(depth)))
+            with_host(|h| h.current_frame_object(depth))
+                .ok_or_else(|| "ValueError: call stack is not deep enough".to_string())
+        }
+        // `sys._getframemodulename([depth])` — the `__name__` of the globals of the
+        // frame `depth` levels up, or `None` when the stack is shallower. What
+        // `collections.namedtuple` reads to set a class's `__module__`.
+        "_getframemodulename" => {
+            let depth = args
+                .first()
+                .and_then(|v| with_host(|h| h.as_int(v)))
+                .unwrap_or(0)
+                .max(0) as usize;
+            let Some(frame) = with_host(|h| h.current_frame_object(depth)) else {
+                return Ok(Value::Undef);
+            };
+            let globals = with_host(|h| h.get_attr(&frame, "f_globals"))?;
+            let key = with_host(|h| h.new_str("__name__".to_string()));
+            host::call_method(&globals, "get", vec![key], vec![])
         }
         _ => Err(format!(
             "AttributeError: module 'sys' has no attribute '{name}'"
@@ -15384,6 +15329,7 @@ pub fn type_method_names(typename: &str) -> Option<&'static [&'static str]> {
         "tuple" => TUPLE_METHODS,
         "range" => &["index", "count"],
         "slice" => &["indices"],
+        "ContextVar" => &["get", "set", "reset"],
         "deque" => DEQUE_METHODS,
         "complex" => COMPLEX_METHODS,
         "property" => PROPERTY_METHODS,

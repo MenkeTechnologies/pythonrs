@@ -19,6 +19,7 @@ pub mod pyhash;
 pub mod pyimp;
 pub mod pyio;
 pub mod pyopcode;
+pub mod pyposix;
 pub mod pyre;
 pub mod pyreflag;
 pub mod pysignal;

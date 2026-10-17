@@ -9,6 +9,28 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **The native build's `posix` layer.** `os.open/read/write/lseek/dup/dup2/pipe/
+  fstat/ftruncate/truncate/fsync`, `chmod/fchmod/utime`, `symlink/link/readlink`,
+  `kill/killpg/waitpid/wait/fork/execv/execve/setsid`, `getpgid/getsid/nice/
+  sysconf/uname/times/get_terminal_size`, `scandir`/`DirEntry` and
+  `register_at_fork` existed only as names that raised `AttributeError`, so
+  `tempfile`, `os.walk` and `pathlib` writes failed. `chmod`/`utime`/`truncate`
+  were no-ops. `os.stat_result` now has float `st_*time`, `st_*time_ns`,
+  `st_blksize`/`st_blocks`/`st_rdev` (and the macOS fields), and an `OSError`
+  from a syscall is the errno's subclass with `filename` and `filename2`
+  (`rename` names both).
+- **The native build imports modules from `sys.path`.** It searched only the
+  bundled stdlib, so `import helper` beside the script failed.
+- **`class C(Generic[T])`, `class C(list[int])` and `__mro_entries__`.** A generic
+  alias in a base list was dropped, leaving `object`: `Generic` subclasses were
+  not subscriptable (`typing` itself failed to import in the native build) and
+  `class N(NamedTuple)` was not a tuple.
+- **`f.__defaults__ = …` changes what a call binds**, as `collections.namedtuple`
+  and `typing.NamedTuple` rely on; `cls.__module__ = …` renames the class's repr;
+  `Token.var`/`Token.old_value` and `ContextVar.reset` work in the native build;
+  `sys._getframe` reports `ValueError` past the stack, `f_back` walks it and
+  `f_globals` is the frame's own module; `sys._getframemodulename` exists;
+  abstract classes (`__abstractmethods__`) refuse instantiation.
 - **Counter, defaultdict and OrderedDict find value-equal user keys.**
   `Counter([P(1), P(1)])`, `c[P(1)] += 1`, `c.update(...)`, `a - b` and
   `del c[k]` on a `Counter`, a missing key of a `defaultdict`, and
@@ -2797,6 +2819,14 @@ plus the entire CPython stdlib are importable out of the box. A
 `--no-default-features` build serves only the native subset below; every other
 module then raises `ModuleNotFoundError`.
 
+- **Missing C accelerators in the native build** (each raises
+  `ModuleNotFoundError`, and everything built on it fails to import): `select`
+  and `selectors`, `_posixsubprocess` (so `subprocess`, `webbrowser`), `zlib`
+  (`gzip`, `zipfile`), `unicodedata`, `_hashlib` (`hmac`), `array`, `_operator`
+  (`secrets`, `hmac`), `_socket`, `fcntl`, `pwd`, `grp`, `termios`, `resource`,
+  `gc`, `_json`, `_heapq`, `_bisect`, `cmath`. `asyncio` is the native event loop
+  in both builds and has no `timeout`, `TaskGroup`, `Semaphore`, `Condition`,
+  `shield` or `to_thread`.
 - **Native in every build**: `math` (constants + a common function fast path;
   in a default build any symbol the native arm lacks — `isqrt`, `trunc`, `comb`,
   `hypot`, … — defers to the real CPython `math` over the FFI bridge), `sys`
