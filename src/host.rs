@@ -243,6 +243,29 @@ pub enum PKey {
     },
 }
 
+/// A borrowed `PKey::Str`, for probing a dict by name without building the
+/// owned key: every attribute and namespace read used to allocate and free a
+/// `String` just to look one up. It hashes exactly as `PKey`'s derived `Hash`
+/// hashes a `Str` — the variant's discriminant as an `isize`, then the string —
+/// and is equivalent to that key alone.
+pub struct StrKey<'a>(pub &'a str);
+
+/// `PKey::Str`'s position in the enum, which its derived `Hash` writes first.
+const PKEY_STR_DISCRIMINANT: isize = 5;
+
+impl std::hash::Hash for StrKey<'_> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        PKEY_STR_DISCRIMINANT.hash(state);
+        self.0.hash(state);
+    }
+}
+
+impl indexmap::Equivalent<PKey> for StrKey<'_> {
+    fn equivalent(&self, key: &PKey) -> bool {
+        matches!(key, PKey::Str(s) if s == self.0)
+    }
+}
+
 /// A compiled function template: parameter shape + body chunk. Shared by every
 /// closure created from the same `def`/`lambda`.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -3199,7 +3222,7 @@ impl PyHost {
         // `sys.modules['os.path'] = path`).
         if let Some(sm) = &self.sys_modules {
             if let Some(PyObj::Dict(d)) = self.get(sm) {
-                if let Some((_, v)) = d.get(&PKey::Str(name.to_string())) {
+                if let Some((_, v)) = d.get(&StrKey(name)) {
                     return Some(v.clone());
                 }
             }
@@ -3224,7 +3247,7 @@ impl PyHost {
     pub fn sys_module_entry(&self, name: &str) -> Option<Value> {
         let sm = self.sys_modules.as_ref()?;
         match self.get(sm) {
-            Some(PyObj::Dict(d)) => d.get(&PKey::Str(name.to_string())).map(|(_, v)| v.clone()),
+            Some(PyObj::Dict(d)) => d.get(&StrKey(name)).map(|(_, v)| v.clone()),
             _ => None,
         }
     }
@@ -3237,7 +3260,7 @@ impl PyHost {
         self.modules.shift_remove(name);
         if let Some(sm) = self.sys_modules.clone() {
             if let Some(PyObj::Dict(d)) = self.get_mut(&sm) {
-                d.shift_remove(&PKey::Str(name.to_string()));
+                d.shift_remove(&StrKey(name));
             }
         }
     }
@@ -3624,41 +3647,36 @@ impl PyHost {
     /// Read instance attribute `name` from a live instance `__dict__` handle.
     pub fn inst_attr(&self, dict: &Value, name: &str) -> Option<Value> {
         match self.get(dict) {
-            Some(PyObj::Dict(m)) => m.get(&PKey::Str(name.to_string())).map(|(_, v)| v.clone()),
+            Some(PyObj::Dict(m)) => m.get(&StrKey(name)).map(|(_, v)| v.clone()),
             _ => None,
         }
     }
 
     /// Whether a live instance `__dict__` holds `name`.
     pub fn inst_has(&self, dict: &Value, name: &str) -> bool {
-        matches!(self.get(dict), Some(PyObj::Dict(m)) if m.contains_key(&PKey::Str(name.to_string())))
+        matches!(self.get(dict), Some(PyObj::Dict(m)) if m.contains_key(&StrKey(name)))
     }
 
     /// Set `name = val` on a live instance `__dict__`, preserving the existing
     /// key object on update (no fresh string alloc) so repr/iteration order is
     /// stable across reassignment, matching CPython dict semantics.
     pub fn inst_attr_set(&mut self, dict: &Value, name: &str, val: Value) {
-        let key = PKey::Str(name.to_string());
-        if let Some(PyObj::Dict(m)) = self.get(dict) {
-            if m.contains_key(&key) {
-                if let Some(PyObj::Dict(m)) = self.get_mut(dict) {
-                    if let Some(slot) = m.get_mut(&key) {
-                        slot.1 = val;
-                    }
-                }
+        if let Some(PyObj::Dict(m)) = self.get_mut(dict) {
+            if let Some(slot) = m.get_mut(&StrKey(name)) {
+                slot.1 = val;
                 return;
             }
         }
         let kv = self.new_str(name.to_string());
         if let Some(PyObj::Dict(m)) = self.get_mut(dict) {
-            m.insert(key, (kv, val));
+            m.insert(PKey::Str(name.to_string()), (kv, val));
         }
     }
 
     /// Delete `name` from a live instance `__dict__`; returns whether it existed.
     pub fn inst_attr_del(&mut self, dict: &Value, name: &str) -> bool {
         match self.get_mut(dict) {
-            Some(PyObj::Dict(m)) => m.shift_remove(&PKey::Str(name.to_string())).is_some(),
+            Some(PyObj::Dict(m)) => m.shift_remove(&StrKey(name)).is_some(),
             _ => false,
         }
     }
@@ -13923,7 +13941,7 @@ impl PyHost {
             Some(PyObj::TypeVarLike { attrs, .. }) => {
                 let attrs = attrs.clone();
                 if let Some(PyObj::Dict(d)) = self.get(&attrs) {
-                    if let Some((_, v)) = d.get(&PKey::Str(name.to_string())) {
+                    if let Some((_, v)) = d.get(&StrKey(name)) {
                         return Ok(v.clone());
                     }
                 }
@@ -14804,6 +14822,52 @@ impl PyHost {
     /// Does `class` (via its MRO) define method `name`?
     pub fn class_has(&self, class: &str, name: &str) -> bool {
         self.class_lookup(class, name).is_some()
+    }
+
+    /// `recv.name` when it is a plain instance attribute: `recv` is an instance
+    /// whose class MRO defines none of `__getattribute__`, `__slots__` (whose
+    /// members live outside the namespace) or `name`, and whose `__dict__`
+    /// holds `name`. The attribute protocol answers
+    /// with that dict entry in exactly this case, so the read skips it; `None`
+    /// is any other read, left to the full protocol.
+    pub fn plain_inst_attr(&self, recv: &Value, name: &str) -> Option<Value> {
+        let Some(PyObj::Instance(inst)) = self.get(recv) else {
+            return None;
+        };
+        if self.class_has(&inst.class, name)
+            || self.class_has(&inst.class, "__getattribute__")
+            || self.class_has(&inst.class, "__slots__")
+        {
+            return None;
+        }
+        self.inst_attr(&inst.dict, name)
+    }
+
+    /// `recv.name = val` when it is a plain instance-dict store: `recv` is an
+    /// instance of a user class that is not an exception, defines neither
+    /// `__setattr__`, `__slots__` nor `name` in its MRO, and `name` is not a
+    /// dunder or one of the attributes `set_attr` special-cases. None of
+    /// `set_attr`'s checks can refuse such a store, so it goes straight to the
+    /// dict. `Err` hands `val` back for the full protocol.
+    pub fn set_plain_inst_attr(&mut self, recv: &Value, name: &str, val: Value) -> Result<(), Value> {
+        let Some(PyObj::Instance(inst)) = self.get(recv) else {
+            return Err(val);
+        };
+        let plain = inst.class != "object"
+            && !name.starts_with("__")
+            && name != "args"
+            && name != "default_factory"
+            && !self.class_has(&inst.class, name)
+            && !self.class_has(&inst.class, "__setattr__")
+            && !self.class_has(&inst.class, "__slots__")
+            && !self.class_is_exception(&inst.class)
+            && matches!(self.get(&inst.dict), Some(PyObj::Dict(_)));
+        if !plain {
+            return Err(val);
+        }
+        let dict = inst.dict.clone();
+        self.inst_attr_set(&dict, name, val);
+        Ok(())
     }
 
     /// The sorted, de-duplicated attribute names `dir(v)` reports: for an
@@ -25743,5 +25807,31 @@ pub fn unbound_call_without_receiver(tp: &str, meth: &str) -> String {
         ))
     } else {
         type_error(&format!("unbound method {tp}.{meth}() needs an argument"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PKey, StrKey};
+    use indexmap::IndexMap;
+
+    /// A dict keyed by `PKey` finds every `Str` entry through a borrowed
+    /// `StrKey`, and only those: if `StrKey` hashed even slightly differently
+    /// from the derived `Hash` of `PKey::Str` (a variant reordered, the
+    /// discriminant hashed another way), these lookups would miss.
+    #[test]
+    fn a_str_key_finds_what_a_pkey_str_stored() {
+        let mut d: IndexMap<PKey, usize> = IndexMap::new();
+        let names: Vec<String> = (0..100).map(|i| format!("attr_{i}")).collect();
+        for (i, n) in names.iter().enumerate() {
+            d.insert(PKey::Str(n.clone()), i);
+        }
+        d.insert(PKey::Bytes(b"attr_0".to_vec()), 1000);
+        for (i, n) in names.iter().enumerate() {
+            assert_eq!(d.get(&StrKey(n)), Some(&i), "{n}");
+        }
+        assert_eq!(d.get(&StrKey("missing")), None);
+        assert_eq!(d.shift_remove(&StrKey("attr_7")), Some(7));
+        assert_eq!(d.get(&PKey::Str("attr_7".into())), None);
     }
 }

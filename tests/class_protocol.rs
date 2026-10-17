@@ -233,3 +233,54 @@ x = (P(1, 2).y, q.x, q.y, type(q).__name__, guarded(), direct)
         Some("TypeError: __init__() should return None, not 'int'")
     );
 }
+
+/// Attribute reads and writes on instances keep CPython's precedence however
+/// they are answered: a data descriptor and a property beat the instance dict,
+/// an instance value shadows a class attribute, a property added to the class
+/// after the instance exists takes over (and removing it hands back), a slot
+/// beats a same-named dict entry, and user `__getattribute__`, `__setattr__`
+/// and `__getattr__` see every access they should.
+#[test]
+fn instance_attributes_keep_the_lookup_precedence() {
+    let src = "\
+class D:
+    def __get__(self, obj, typ): return 'desc'
+    def __set__(self, obj, val): obj.__dict__['seen'] = val
+class A:
+    k = 'class'
+    d = D()
+    def __init__(self):
+        self.x = 1
+a = A()
+a.__dict__['d'] = 'shadowed?'
+a.k = 'inst'
+a.d = 5
+r = [a.x, a.k, A.k, a.d, a.seen]
+A.x = property(lambda s: 'prop')
+r.append(a.x)
+del A.x
+r.append(a.x)
+class G:
+    def __getattribute__(self, n): return 'ga:' + n
+g = G(); object.__setattr__(g, 'y', 1)
+r.append(g.y)
+class S:
+    def __setattr__(self, n, v): object.__setattr__(self, n, v * 2)
+s = S(); s.v = 4
+r.append(s.v)
+class F:
+    def __getattr__(self, n): return 'fallback:' + n
+f = F(); f.z = 3
+r.append((f.z, f.w))
+class Sl:
+    __slots__ = ('a',)
+class Sub(Sl):
+    pass
+t = Sub(); t.a = 1; t.__dict__['a'] = 5
+r.append((t.a, t.__dict__['a']))
+";
+    assert_eq!(
+        g(src, "r"),
+        "[1, 'inst', 'class', 'desc', 5, 'prop', 1, 'ga:y', 8, (3, 'fallback:w'), (1, 5)]"
+    );
+}

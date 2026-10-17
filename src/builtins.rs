@@ -333,8 +333,12 @@ fn b_getself(vm: &mut VM, _: u8) -> Value {
 }
 
 fn b_getattr(vm: &mut VM, _: u8) -> Value {
-    let name = sval(&vm.pop());
+    let name = vm.pop();
     let recv = vm.pop();
+    let name = sref(&name);
+    if let Some(v) = with_host(|h| h.plain_inst_attr(&recv, &name)) {
+        return v;
+    }
     let r = get_attr_desc(&recv, &name);
     finish(vm, r)
 }
@@ -556,8 +560,13 @@ fn module_function_self(owner: &str, _leaf: &str) -> Option<Result<Value, String
 
 fn b_setattr(vm: &mut VM, _: u8) -> Value {
     let val = vm.pop();
-    let name = sval(&vm.pop());
+    let name = vm.pop();
     let recv = vm.pop();
+    let name = sref(&name);
+    let val = match with_host(|h| h.set_plain_inst_attr(&recv, &name, val)) {
+        Ok(()) => return Value::Undef,
+        Err(val) => val,
+    };
     let r = set_attr_desc(&recv, &name, val);
     match r {
         Ok(()) => Value::Undef,
