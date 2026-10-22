@@ -2745,6 +2745,29 @@ pub fn call_method_cpython(
     })
 }
 
+/// `format(foreign, spec)` — `PyObject_Format`, which looks `__format__` up on
+/// `type(foreign)`. Reading `foreign.__format__` and calling it would bind the
+/// INSTANCE method when `foreign` is itself a class: `format(Color)` for an
+/// `Enum` class fetched the unbound `Enum.__format__` and called it with the
+/// spec as `self`, raising `missing 1 required positional argument`, where
+/// CPython runs `EnumType.__format__` and answers `<enum 'Color'>`.
+pub fn format(id: u32, spec: &str) -> Result<String, String> {
+    Python::attach(|py| {
+        let obj = fetch(py, id)?;
+        let spec = PyString::new(py, spec);
+        // SAFETY: both pointers are live, GIL-bound objects; `PyObject_Format`
+        // returns a new reference or NULL with an exception set.
+        let out = unsafe {
+            Bound::from_owned_ptr_or_err(
+                py,
+                pyo3::ffi::PyObject_Format(obj.as_ptr(), spec.as_ptr()),
+            )
+        }
+        .map_err(|e| pyerr_to_error(py, &e))?;
+        out.extract::<String>().map_err(|e| pyerr_to_error(py, &e))
+    })
+}
+
 /// `T.__new__(*args, **kwargs)` for the builtin type `builtins.T`, looked up
 /// and called on the CPython side, so neither the type nor its `__new__` is
 /// marshalled back into the native type it would map to.
@@ -4506,9 +4529,15 @@ pub fn to_float(id: u32) -> Result<f64, String> {
 /// (`collections.abc.Sequence`, a `typing`/`enum` type). `v` is marshaled to its
 /// CPython form (a native list crosses as a `list`, etc.) and CPython's
 /// `isinstance` decides, so an ABC's structural `__instancecheck__` runs.
-pub fn isinstance_foreign(host: &mut PyHost, v: &Value, cls_id: u32) -> Result<bool, String> {
+///
+/// The host borrow is released before CPython is asked: an ABC's
+/// `_abc_instancecheck` reads `obj.__class__` and `__mro__` back off the proxy
+/// of a pythonrs instance or class, and those getters borrow the host, so a
+/// borrow held across the call was a `RefCell already borrowed` panic for
+/// `isinstance(C(), Base)` after `Base.register(C)`.
+pub fn isinstance_foreign(v: &Value, cls_id: u32) -> Result<bool, String> {
     Python::attach(|py| {
-        let obj = value_to_py(host, py, v)?;
+        let obj = with_host(|h| value_to_py(h, py, v))?;
         let cls = fetch(py, cls_id)?;
         obj.is_instance(&cls).map_err(|e| e.to_string())
     })
@@ -4517,10 +4546,12 @@ pub fn isinstance_foreign(host: &mut PyHost, v: &Value, cls_id: u32) -> Result<b
 /// `issubclass(sub, cls)` where either side is a CPython object behind a handle
 /// (a `collections.namedtuple` class, a `typing`/`abc` type): both cross the
 /// bridge and CPython's own `issubclass` decides, its `TypeError`s included.
-pub fn issubclass_values(host: &mut PyHost, sub: &Value, cls: &Value) -> Result<bool, String> {
+/// No host borrow is held across the call, for the reason [`isinstance_foreign`]
+/// gives.
+pub fn issubclass_values(sub: &Value, cls: &Value) -> Result<bool, String> {
     Python::attach(|py| {
-        let a = value_to_py(host, py, sub)?;
-        let b = value_to_py(host, py, cls)?;
+        let (a, b) =
+            with_host(|h| Ok::<_, String>((value_to_py(h, py, sub)?, value_to_py(h, py, cls)?)))?;
         py.import("builtins")
             .and_then(|m| m.getattr("issubclass"))
             .and_then(|f| f.call1((a, b)))

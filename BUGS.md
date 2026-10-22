@@ -9,6 +9,21 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **`format(x)` of a bridged object looks `__format__` up on `type(x)`.**
+  `format(EnumClass)`, `f'{EnumClass}'` and `'{}'.format(EnumClass)` read the
+  class's own `__format__` attribute — the unbound `Enum.__format__` — and
+  called it with the spec as `self`, raising `Enum.__format__() missing 1
+  required positional argument: 'format_spec'`. A `Foreign` value now goes
+  through `PyObject_Format`, so a class formats through its metaclass
+  (`<enum 'Color'>`, `<class 'datetime.date'>`) and a refused spec is CPython's
+  `unsupported format string passed to EnumType.__format__`.
+- **`ABC.register(C)` makes `isinstance(C(), Base)` and `issubclass(C, Base)`
+  true.** The check ran CPython's `isinstance` while the host was still
+  borrowed for marshalling, and `ABCMeta.__instancecheck__` reads `__class__`
+  back off the pythonrs proxy, whose getter borrows the host again: the program
+  died with `pyo3_runtime.PanicException: RefCell already borrowed`. The borrow
+  is released before CPython decides (`isinstance`/`issubclass` against any
+  foreign class).
 - **The native build's `posix` layer.** `os.open/read/write/lseek/dup/dup2/pipe/
   fstat/ftruncate/truncate/fsync`, `chmod/fchmod/utime`, `symlink/link/readlink`,
   `kill/killpg/waitpid/wait/fork/execv/execve/setsid`, `getpgid/getsid/nice/
@@ -2467,12 +2482,16 @@ written.
 ## Partial / simplified semantics
 
 - **Open from a parity probe against CPython 3.14.8.** Measured, not fixed:
-  `format(EnumClass)` / `f'{EnumClass}'` raises `Enum.__format__() missing 1
-  required positional argument` (the member `__format__` is called on the
-  class); `ABC.register(C)` does not make `isinstance(C(), ABC)` true;
   `inspect.isgeneratorfunction(f)` raises `cannot pass 'code' to a CPython
   stdlib call`; a nested unpacking target
   (`a, (b, c) = 1, (2,)`) carets the outer target, CPython the inner one.
+- **A registered virtual subclass is not inherited by its subclasses.**
+  `Base.register(C)` makes `isinstance(C(), Base)` true (see Implemented), but
+  for `class D(C)` the check is `False` (CPython `True`): `ABCMeta` asks CPython's
+  `issubclass(D, C)` of the two classes' mirrors, and a mirror is built over
+  `(object,)` with no bases, so no mirror is a subclass of another. Carrying the
+  native bases into the mirror is the fix, and a change to what `@dataclass`,
+  `pickle` and every other CPython consumer of a mirror sees.
 - **A builtin container iterator walks a snapshot.** `iter(list)`, `iter(dict)`
   and the other `IterState::Seq`/`DictKeys` cursors copy the items when the
   iterator is made, so `L = [1, 2]; it = iter(L); L.append(3); list(it)` is

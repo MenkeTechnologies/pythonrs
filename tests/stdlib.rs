@@ -3921,3 +3921,89 @@ fn builtins_only_in_cpython_matches_the_bridge() {
         .collect();
     assert_eq!(listed, expected);
 }
+
+#[cfg(feature = "stdlib-ffi")]
+#[test]
+fn format_of_a_foreign_class_looks_up_format_on_its_type() {
+    // Regression: `format(x, spec)` on a Foreign object read `x.__format__` and
+    // called it. For a CLASS that attribute is the unbound instance method —
+    // `Color.__format__` is `Enum.__format__` — so the spec bound as `self`
+    // and `format(Color)` / `f'{Color}'` raised `Enum.__format__() missing 1
+    // required positional argument: 'format_spec'`. CPython's `PyObject_Format`
+    // looks `__format__` up on `type(x)`, so a class formats through its
+    // metaclass (`EnumType.__format__` → `<enum 'Color'>`); the members and a
+    // spec-driven instance (`date`, `Decimal`) are unchanged by the reroute.
+    let src = "\
+import enum, datetime, decimal
+class Color(enum.Enum):
+    RED = 1
+class N(enum.IntEnum):
+    A = 1
+r = [
+    format(Color),
+    f'{Color}',
+    '{}'.format(Color),
+    format(N),
+    format(Color.RED),
+    f'{N.A}',
+    format(N.A, '3d'),
+    format(datetime.date),
+    f'{decimal.Decimal}',
+    f'{datetime.date(2020, 1, 2):%Y/%m/%d}',
+    format(decimal.Decimal('1.5'), '.3f'),
+]";
+    assert_eq!(
+        g(src, "r"),
+        "[\"<enum 'Color'>\", \"<enum 'Color'>\", \"<enum 'Color'>\", \"<enum 'N'>\", \
+         'Color.RED', '1', '  1', \"<class 'datetime.date'>\", \
+         \"<class 'decimal.Decimal'>\", '2020/01/02', '1.500']"
+    );
+    // A spec a metaclass refuses is CPython's own `TypeError`, naming the
+    // metaclass whose `__format__` ran.
+    assert_eq!(
+        err("import enum\nclass Color(enum.Enum):\n    RED = 1\nf'{Color:>20}'"),
+        "TypeError: unsupported format string passed to EnumType.__format__"
+    );
+}
+
+#[cfg(feature = "stdlib-ffi")]
+#[test]
+fn abc_register_makes_a_native_class_a_virtual_subclass() {
+    // Regression: `isinstance(v, foreign_abc)` ran CPython's `isinstance` while
+    // the host was borrowed for marshalling `v`. `ABCMeta.__instancecheck__`
+    // reads `v.__class__` back off the pythonrs proxy, whose getter borrows the
+    // host again, so `Base.register(C); isinstance(C(), Base)` died with
+    // `pyo3_runtime.PanicException: RefCell already borrowed`. The borrow is
+    // released before CPython decides; the registration is then honoured, and
+    // a class that is not registered is still refused.
+    let src = "\
+from abc import ABC, abstractmethod
+import collections.abc
+class Base(ABC): pass
+class C: pass
+class Other: pass
+Base.register(C)
+class Hook(ABC):
+    @classmethod
+    def __subclasshook__(cls, sub):
+        return hasattr(sub, 'quack') or NotImplemented
+class Duck:
+    def quack(self): pass
+class Sized2:
+    def __len__(self): return 0
+r = [
+    isinstance(C(), Base),
+    issubclass(C, Base),
+    isinstance(Other(), Base),
+    issubclass(Other, Base),
+    isinstance(1, Base),
+    isinstance(Duck(), Hook),
+    issubclass(Duck, Hook),
+    isinstance(Sized2(), collections.abc.Sized),
+    isinstance(Sized2(), collections.abc.Iterable),
+]";
+    assert_eq!(
+        g(src, "r"),
+        "[True, True, False, False, False, True, True, True, False]"
+    );
+}

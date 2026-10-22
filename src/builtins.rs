@@ -2183,16 +2183,25 @@ fn format_field(v: &Value, conv: i64, spec: &str) -> Result<String, String> {
     }
     // No conversion: an instance's `__format__(spec)` wins outright.
     //
-    // A bridged CPython object counts. `format(x, s)` is
+    // A bridged CPython object is formatted by CPython. `format(x, s)` is
     // `type(x).__format__(x, s)`, and for a `datetime`/`Decimal` that method is
     // the whole point of the spec — `f"{date:%Y/%m/%d}"` used to reach
     // pythonrs's own mini-language, which has no `%Y` and rejected it with
     // `TypeError: unsupported format string passed to date.__format__`, while
-    // the explicit `date.__format__("%Y/%m/%d")` spelling worked.
+    // the explicit `date.__format__("%Y/%m/%d")` spelling worked. The lookup
+    // has to be on the TYPE: a foreign class such as an `Enum` subclass holds
+    // its members' `__format__` as a plain attribute, and calling that bound
+    // the spec as `self` (`Enum.__format__() missing 1 required positional
+    // argument`) where CPython answers `<enum 'Color'>`.
+    #[cfg(feature = "stdlib-ffi")]
+    if let Some(id) = with_host(|h| match h.get(v) {
+        Some(PyObj::Foreign(id)) => Some(*id),
+        _ => None,
+    }) {
+        return crate::ffi::format(id, spec);
+    }
     let has_format = with_host(|h| match h.get(v) {
         Some(PyObj::Instance(i)) => h.class_lookup(&i.class, "__format__").is_some(),
-        #[cfg(feature = "stdlib-ffi")]
-        Some(PyObj::Foreign(_)) => true,
         _ => false,
     });
     if has_format {
@@ -15369,7 +15378,7 @@ fn isinstance_dispatch(v: &Value, cls: &Value) -> Result<bool, String> {
                 }
             }
         }
-        return with_host(|h| crate::ffi::isinstance_foreign(h, v, cls_id));
+        return crate::ffi::isinstance_foreign(v, cls_id);
     }
     // The mirror case: a CPython object behind a handle tested against a NATIVE
     // builtin type. `isinstance(collections.namedtuple('P', 'a b')(1, 2), tuple)`
@@ -15443,7 +15452,7 @@ fn issubclass_dispatch(sub: &Value, cls: &Value) -> Result<bool, String> {
     }
     #[cfg(feature = "stdlib-ffi")]
     if with_host(|h| h.foreign_id(sub).is_some() || h.foreign_id(cls).is_some()) {
-        return with_host(|h| crate::ffi::issubclass_values(h, sub, cls));
+        return crate::ffi::issubclass_values(sub, cls);
     }
     if plainly_not_a_class(sub) {
         return Err(host::type_error("issubclass() arg 1 must be a class"));
