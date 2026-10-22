@@ -2444,6 +2444,38 @@ written.
   On a 3.9–3.11 interpreter, which has no dict watchers, a CPython-side
   assignment is still not seen.
 
+- **A builtin base brings its own ancestry into a subclass's MRO.**
+  `class K(KeyError)` linearized to `(K, KeyError, object)` and `class
+  M(E, ValueError)` (with `E(Exception)`) to `(M, E, Exception, ValueError,
+  object)`: a builtin base contributed only itself to the C3 merge. It now
+  contributes its whole chain (`builtin_mro`), so `__mro__`, `type.mro()` and
+  every walk over the MRO see `LookupError`, `Exception` and `BaseException`.
+- **`super()` reaches the slots of `object` and of a builtin base.** Past the
+  last user class, `super().__repr__()`, `super().__str__()` in an
+  `Exception` subclass, `super().__eq__(o)`, `super().__hash__()` and the
+  attribute form `super().__repr__` (a method-wrapper) were all
+  `AttributeError: 'super' object has no attribute …`. They now run the
+  builtin ancestor's slot; the proxy also answers `__class__`,
+  `__thisclass__`, `__self__` and `__self_class__`.
+- **A builtin base's methods through the subclass type object.**
+  `DD.fromkeys(...)` (with `DD(dict)`), `I.from_bytes`, `F.fromhex` and
+  `DD.get` were `type object 'DD' has no attribute …`. The alternate
+  constructors bind the subclass and build one (`fromkeys` storing through the
+  subclass's `__setitem__`); other names are the base's own descriptors.
+- **Unbound builtin methods and numeric slots on builtin-subclass values.**
+  `str.upper(S('ab'))`, `list.append(L(), 1)` and `str.join(S('-'), …)` were
+  `AttributeError`s; `(5).__add__(I(7))`, `(2.0).__add__(F(1.0))`,
+  `'a'.__eq__(S('a'))` and `'a'.__lt__(S('b'))` were `NotImplemented`;
+  `round(F(2.5))` and `math.trunc(F(2.5))` said the type defines no
+  `__round__`/`__trunc__`; `OSError.__str__(FileNotFoundError(...))` failed
+  its receiver check. Each now treats the subclass (or builtin exception
+  subclass) as the base it is.
+- **`BaseException.__reduce__`.** `ValueError('x').__reduce__()` raised
+  `cannot pickle 'ValueError' object`; it is now `(type, args)`, with the
+  instance's attributes appended as a dict when there are any, and an
+  `OSError` re-adding the filename(s) it split out of `args`, at every
+  `__reduce_ex__` protocol.
+
 ## Implemented — async/await/asyncio (native fusevm event loop)
 - **`async def` / `await` / `asyncio`.** `async def f()` returns a real coroutine
   object (`type(f()).__name__ == 'coroutine'`; the body does **not** run on call),
@@ -3130,6 +3162,20 @@ entry. These remain open:
   does not evaluate `c`; a format spec's `{{` is read as an escaped brace
   where CPython reads a nested field (`f"{x:a{{b}}}"`). A compiler error from
   `compile()` over a file carries `text=None` where CPython reads the line.
+- **`bytes`, `bytearray` and `complex` subclasses have no native payload.**
+  `class By(bytes)` instances fail `len()` (`'By' object has no attribute
+  '__len__'`), `By.fromhex` is missing, and the same holds for `bytearray`
+  and `complex` bases: `PyHost::builtin_base_of` knows only the str/int/float/
+  tuple/list/dict/set/frozenset and `collections` bases.
+- **An exception's `__dict__`.** A user exception's `e.__dict__` includes the
+  internal `args` entry (`{'args': ('a', 1)}` where CPython reads `{}`), and a
+  builtin exception has no `__dict__` at all (`ValueError('x').__dict__` is an
+  `AttributeError`; CPython reads `{}`, then `{'q': 1}` after `v.q = 1`).
+- **Pickling a user exception over the bridge.** `pickle.dumps(E('a'))` with
+  `class E(Exception)` raises `PicklingError: Can't pickle <class
+  '__main__.E'>: it's not the same object as __main__.E` — the exception
+  crosses as its CPython mirror class, which is not the object `__main__.E`
+  resolves to. A plain user instance pickles.
 
 ### Round 2 batched differential fuzz (`tests/batch_fuzz.rs`)
 

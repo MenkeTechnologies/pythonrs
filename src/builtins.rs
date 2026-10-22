@@ -1481,7 +1481,10 @@ fn loaded_receiver(self_slot: &Value, name: &str) -> (Option<Value>, Option<Stri
     if is_no_value(self_slot) {
         (None, None)
     } else {
-        (Some(self_slot.clone()), host::bound_method_owner(self_slot, name))
+        (
+            Some(self_slot.clone()),
+            host::bound_method_owner(self_slot, name),
+        )
     }
 }
 
@@ -1491,7 +1494,12 @@ fn loaded_receiver(self_slot: &Value, name: &str) -> (Option<Value>, Option<Stri
 /// whose `__init__` is such a function, once its instance exists. Any other
 /// callable is invoked and its result pushed; a plain function runs as a run
 /// the collector may work inside, since nothing here is read after it.
-fn call_value(vm: &mut VM, callable: &Value, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Value {
+fn call_value(
+    vm: &mut VM,
+    callable: &Value,
+    args: Vec<Value>,
+    kwargs: Vec<(String, Value)>,
+) -> Value {
     if let Some(linked) = host::linked_callee(vm, callable) {
         let r = host::enter_linked(vm, linked, None, None, args, kwargs, None);
         return entered(vm, r);
@@ -4042,8 +4050,7 @@ fn str_percent_format(fmt_val: &Value, args: &Value) -> Result<Value, String> {
         Some(PyObj::Dict(d)) if keyed => d.values().map(|(_, v)| v.clone()).collect(),
         _ => vec![args.clone()],
     });
-    let mut premap: host::HashMap<u32, (String, String, String)> =
-        host::HashMap::default();
+    let mut premap: host::HashMap<u32, (String, String, String)> = host::HashMap::default();
     for it in &items {
         let Value::Obj(id) = it else { continue };
         if premap.contains_key(id) {
@@ -6138,7 +6145,11 @@ pub fn builtin_names() -> Vec<&'static str> {
 /// cost more than the call it gated.
 static EXC_NAMES: std::sync::LazyLock<rustc_hash::FxHashSet<&'static str>> =
     std::sync::LazyLock::new(|| {
-        EXC_PARENTS.iter().map(|(c, _)| *c).chain(["BaseException"]).collect()
+        EXC_PARENTS
+            .iter()
+            .map(|(c, _)| *c)
+            .chain(["BaseException"])
+            .collect()
     });
 
 /// `BUILTIN_FUNCS`, hashed: a bare name that no scope binds is tested
@@ -6862,6 +6873,13 @@ pub fn call_builtin_function(
             if let Some(e) = unbound_receiver_error(tp, meth, &recv) {
                 return Err(e);
             }
+            // A builtin-subclass instance runs the base method on its native
+            // payload, never a lookup on the instance: `str.upper(s)` must get
+            // past an `upper` the subclass overrides, and the instance itself
+            // carries no `str` surface for `call_type_method` to find.
+            if let Some(payload) = with_host(|h| h.base_payload_any(&recv)) {
+                return host::base_dispatch(&recv, &payload, tp, meth, args[1..].to_vec(), kwargs);
+            }
             return call_type_method(&recv, meth, args[1..].to_vec(), kwargs);
         }
     }
@@ -7536,6 +7554,18 @@ fn call_named_builtin(
                     Ok(round_int(&n, has_nd, nd))
                 }
                 Value::Float(f) => round_float(*f, has_nd, nd),
+                // A `float`/`int` subclass with no `__round__` of its own rounds
+                // through the base type's slot, on its native value.
+                _ if with_host(|h| match h.get(&v) {
+                    Some(PyObj::Instance(i)) => h.class_lookup(&i.class, "__round__").is_none(),
+                    _ => false,
+                }) && numeric_payload(&v).is_some() =>
+                {
+                    let payload = numeric_payload(&v).unwrap();
+                    let mut a = vec![payload];
+                    a.extend(ndv.filter(|_| has_nd));
+                    call_builtin_function("round", a, vec![])
+                }
                 _ => {
                     // An instance / foreign object (`Decimal`, `Fraction`, a user
                     // class) delegates to `x.__round__([n])`.
@@ -14620,6 +14650,19 @@ fn math_real(v: &Value) -> Result<f64, String> {
     )))
 }
 
+/// The native value of an `int` or `float` subclass instance, which a numeric
+/// slot the subclass does not override runs on. `None` for anything else.
+fn numeric_payload(v: &Value) -> Option<Value> {
+    with_host(|h| match h.get(v) {
+        Some(PyObj::Instance(i))
+            if matches!(h.builtin_base_of(&i.class), Some("int" | "float")) =>
+        {
+            h.base_payload_any(v)
+        }
+        _ => None,
+    })
+}
+
 /// `math.floor` / `math.ceil` / `math.trunc`, which are protocol dispatchers
 /// rather than float functions.
 ///
@@ -14638,6 +14681,11 @@ fn math_round_to_int(name: &str, v: &Value) -> Result<Value, String> {
         with_host(|h| matches!(h.get(v), Some(PyObj::Instance(i)) if instance_has(h, i, dunder)));
     if has {
         return host::call_method(v, dunder, vec![], vec![]);
+    }
+    // A `float`/`int` subclass that does not override the slot runs the
+    // base type's on its native value: `math.trunc(F(2.5))` is `2`.
+    if let Some(payload) = numeric_payload(v) {
+        return math_round_to_int(name, &payload);
     }
     // An integer is already the answer, and only this path keeps it exact.
     let is_int = with_host(|h| {
@@ -16723,6 +16771,16 @@ fn richcmp_accepts(tn: &str, other: &str, ordering: bool) -> bool {
     }
 }
 
+/// The builtin type a rich comparison sees `v` as: a builtin-subclass
+/// instance is its base (`PyUnicode_Check` and friends accept subclasses), so
+/// `'a'.__eq__(S('a'))` compares rather than declining.
+fn operand_type_name(v: &Value) -> String {
+    with_host(|h| {
+        let payload = h.base_payload_any(v);
+        h.type_name(payload.as_ref().unwrap_or(v))
+    })
+}
+
 /// The builtin types that inherit `object_richcompare` — `x == y` is `x is y`,
 /// and every ordering is `NotImplemented`.
 fn richcmp_by_identity(tn: &str) -> bool {
@@ -16925,7 +16983,77 @@ fn bytearray_reduce_args(bytes: Vec<u8>, protocol: i64) -> Vec<Value> {
     })
 }
 
+/// `BaseException.__reduce__` (`BaseException_reduce`, and `OSError_reduce`
+/// for that family, in `Objects/exceptions.c`): `(type(self), self.args)`,
+/// with the instance `__dict__` appended when it holds anything. `object`'s
+/// `__reduce_ex__` defers to it at every protocol, since `BaseException`
+/// overrides `__reduce__`.
+///
+/// An `OSError` built with a filename keeps only `(errno, strerror)` in
+/// `args`, so its recipe re-adds the filename -- and, when there is a second
+/// one, the `winerror` slot (`None`) and `filename2` -- for the constructor
+/// to split again.
+pub fn exception_reduce(recv: &Value) -> Result<Value, String> {
+    // The builtin member slots, which live outside `__dict__` in CPython but
+    // in the attribute map here.
+    const MEMBERS: &[&str] = &["args", "errno", "strerror", "filename", "filename2"];
+    let (cls, attrs) = with_host(|h| match h.get(recv) {
+        Some(PyObj::Instance(i)) => {
+            let (class, dict) = (i.class.clone(), i.dict.clone());
+            let attrs = match h.get(&dict) {
+                Some(PyObj::Dict(d)) => d.values().cloned().collect::<Vec<_>>(),
+                _ => Vec::new(),
+            };
+            (h.alloc(PyObj::Class(class)), attrs)
+        }
+        _ => {
+            let named: Vec<(String, Value)> = match recv {
+                Value::Obj(id) => h.func_attrs.get(id).map_or_else(Vec::new, |m| {
+                    m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                }),
+                _ => Vec::new(),
+            };
+            let attrs = named.into_iter().map(|(k, v)| (h.new_str(k), v)).collect();
+            (h.builtin_type_of(recv), attrs)
+        }
+    });
+    let attrs: Vec<(Value, Value)> = attrs
+        .into_iter()
+        .filter(|(k, _)| !with_host(|h| h.as_str(k)).is_some_and(|k| MEMBERS.contains(&k.as_str())))
+        .collect();
+    let mut args = host::iter_vec(&with_host(|h| h.get_attr(recv, "args"))?)?;
+    let oserror = with_host(|h| exception_isa(&h.type_name(recv), "OSError", h));
+    if oserror && args.len() == 2 {
+        let field = |n: &str| with_host(|h| h.get_attr(recv, n)).unwrap_or(Value::Undef);
+        let (filename, filename2) = (field("filename"), field("filename2"));
+        if !matches!(filename, Value::Undef) {
+            args.push(filename);
+            if !matches!(filename2, Value::Undef) {
+                args.push(Value::Undef);
+                args.push(filename2);
+            }
+        }
+    }
+    Ok(with_host(|h| {
+        let a = h.new_tuple(args);
+        if attrs.is_empty() {
+            return h.new_tuple(vec![cls, a]);
+        }
+        let mut d = DictMap::default();
+        for (k, v) in attrs {
+            if let Ok(key) = h.to_key(&k) {
+                d.insert(key, (k, v));
+            }
+        }
+        let d = h.new_dict(d);
+        h.new_tuple(vec![cls, a, d])
+    }))
+}
+
 fn object_reduce(recv: &Value, tn: &str, protocol: Option<i64>) -> Result<Value, String> {
+    if with_host(|h| is_exception_value(h, recv, &h.type_name(recv))) {
+        return exception_reduce(recv);
+    }
     let own = |args: Vec<Value>| {
         with_host(|h| {
             let cls = h.alloc(PyObj::Builtin(tn.to_string()));
@@ -17038,7 +17166,7 @@ fn object_dunder(
         }
         "__eq__" | "__ne__" => {
             let other = arg0();
-            let ot = with_host(|h| h.type_name(&other));
+            let ot = operand_type_name(&other);
             let eq = if richcmp_by_identity(tn) {
                 // `object_richcompare`: identical or `NotImplemented`. There is
                 // exactly one `None`/`Ellipsis`/`NotImplemented`, so identity and
@@ -17058,10 +17186,11 @@ fn object_dunder(
         }
         "__lt__" | "__le__" | "__gt__" | "__ge__" => {
             let other = arg0();
-            let ot = with_host(|h| h.type_name(&other));
+            let ot = operand_type_name(&other);
             if !richcmp_accepts(tn, &ot, true) {
                 return Some(not_implemented());
             }
+            let other = with_host(|h| h.base_payload_any(&other)).unwrap_or(other);
             let op = match name {
                 "__lt__" => NumOp::Lt,
                 "__le__" => NumOp::Le,
@@ -17128,6 +17257,11 @@ fn receiver_is_instance_of(recv: &Value, rt: &str, tp: &str) -> bool {
     };
     if builtin_bases.contains(&tp) {
         return true;
+    }
+    // A builtin exception passes for each of its ancestors:
+    // `OSError.__str__(FileNotFoundError(...))`.
+    if is_exception_class(rt) && is_exception_class(tp) {
+        return with_host(|h| exception_isa(rt, tp, h));
     }
     with_host(|h| match h.get(recv) {
         Some(PyObj::Instance(i)) => {
@@ -17335,8 +17469,14 @@ pub fn instance_object_dunder(
         // `object.__getstate__()` takes no argument, so the state is not
         // `required`: an instance with no attributes gives `None`.
         "__getstate__" => object_getstate_default(recv, class, false),
-        "__reduce__" => builtin_base_reduce(recv, class)
-            .unwrap_or_else(|| instance_common_reduce(recv, class, 0)),
+        "__reduce__" => {
+            if with_host(|h| is_exception_value(h, recv, &h.type_name(recv))) {
+                exception_reduce(recv)
+            } else {
+                builtin_base_reduce(recv, class)
+                    .unwrap_or_else(|| instance_common_reduce(recv, class, 0))
+            }
+        }
         "__reduce_ex__" => {
             let p = with_host(|h| h.as_int(&arg0())).unwrap_or(0);
             instance_reduce_ex(recv, class, p)
@@ -17394,6 +17534,9 @@ fn instance_state(recv: &Value) -> Result<Value, String> {
 fn instance_reduce_ex(recv: &Value, class: &str, protocol: i64) -> Result<Value, String> {
     if with_host(|h| h.class_lookup(class, "__reduce__")).is_some() {
         return host::call_method(recv, "__reduce__", vec![], vec![]);
+    }
+    if with_host(|h| is_exception_value(h, recv, &h.type_name(recv))) {
+        return exception_reduce(recv);
     }
     if let Some(r) = builtin_base_reduce(recv, class) {
         return r;
@@ -21679,6 +21822,9 @@ fn num_dunder(recv: &Value, name: &str, args: &[Value]) -> Result<Value, String>
     let recv_float = matches!(recv, Value::Float(_));
     let ni = || Ok(with_host(|h| h.alloc(PyObj::NotImplemented)));
     let b = args.first().cloned().unwrap_or(Value::Undef);
+    // An `int`/`float` subclass operand IS an int or float to the slot
+    // (`PyLong_Check` accepts subclasses): `(5).__add__(I(7))` is `12`.
+    let b = numeric_payload(&b).unwrap_or(b);
     // Operand acceptable for a binary dunder on this receiver type?
     let accepts = |v: &Value| {
         if recv_float {
@@ -24786,7 +24932,8 @@ fn construct_collection(
                     args.len()
                 )));
             }
-            let od = host::alloc_dict_subtype(Default::default(), host::DictKind::OrderedDict, None);
+            let od =
+                host::alloc_dict_subtype(Default::default(), host::DictKind::OrderedDict, None);
             dict_method(&od, "update", &args, &kwargs)?;
             Ok(od)
         }

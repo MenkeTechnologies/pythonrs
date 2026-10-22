@@ -284,3 +284,115 @@ r.append((t.a, t.__dict__['a']))
         "[1, 'inst', 'class', 'desc', 5, 'prop', 1, 'ga:y', 8, (3, 'fallback:w'), (1, 5)]"
     );
 }
+
+#[test]
+fn a_builtin_base_brings_its_own_ancestry_into_the_mro() {
+    // `class K(KeyError)` linearized to `(K, KeyError, object)`: the builtin's
+    // own chain (`LookupError`, `Exception`, `BaseException`) was dropped, and
+    // the C3 merge put `ValueError` ahead of `Exception` in a diamond.
+    let src = "\
+class K(KeyError): pass
+class E(Exception): pass
+class M(E, ValueError): pass
+x = ([c.__name__ for c in K.__mro__], [c.__name__ for c in type.mro(M)])
+";
+    assert_eq!(
+        g(src, "x"),
+        "(['K', 'KeyError', 'LookupError', 'Exception', 'BaseException', 'object'], \
+         ['M', 'E', 'ValueError', 'Exception', 'BaseException', 'object'])"
+    );
+}
+
+#[test]
+fn super_reaches_the_slots_of_object_and_builtin_bases() {
+    // Past every user class, `super()` resolves `object`'s slots (and an
+    // exception base's), both as a call and as an attribute; the proxy also
+    // answers its own members.
+    let src = "\
+class Q:
+    def __repr__(self): return 'Q!'
+    def r(self): return super().__repr__()[:11]
+    def w(self): return type(super().__repr__).__name__, super().__eq__(self), super().__ne__(1)
+    def s(self): s = super(); return type(s).__name__, s.__class__.__name__, s.__thisclass__.__name__, s.__self__ is self
+class E(Exception):
+    def __str__(self): return 'x' + super().__str__()
+    def __repr__(self): return 'r' + super().__repr__()
+class A:
+    def __repr__(self): return 'A'
+class B(A):
+    def __repr__(self): return 'B' + super().__repr__()
+class C(B):
+    def __repr__(self): return 'C' + super().__repr__() + super(B, self).__repr__()
+q = Q()
+x = (q.r(), q.w(), q.s(), str(E('a')), repr(E('b')), repr(C()))
+";
+    assert_eq!(
+        g(src, "x"),
+        "('<__main__.Q', ('method-wrapper', True, NotImplemented), ('super', 'super', 'Q', True), \
+         'xa', \"rE('b')\", 'CBAA')"
+    );
+}
+
+#[test]
+fn a_builtin_base_answers_attributes_through_the_subclass() {
+    // `DD.fromkeys` is a classmethod bound to the SUBCLASS (it builds one,
+    // storing through the subclass's `__setitem__`); `DD.get` is the base's
+    // own descriptor; `str.upper(s)` runs the base method on the payload.
+    let src = "\
+class DD(dict):
+    def __setitem__(self, k, v): super().__setitem__(k, v * 2)
+class I(int): pass
+class F(float): pass
+class S(str):
+    def upper(self): return 'overridden'
+d = DD.fromkeys('ab', 1)
+x = (type(d).__name__, d, type(I.from_bytes(b'\\x01', 'big')).__name__, type(F.fromhex('0x1p1')).__name__,
+     repr(DD.get), DD.get(d, 'a'), str.upper(S('ab')), list.append.__name__)
+";
+    assert_eq!(
+        g(src, "x"),
+        "('DD', {'a': 2, 'b': 2}, 'I', 'F', \"<method 'get' of 'dict' objects>\", 2, 'AB', 'append')"
+    );
+}
+
+#[test]
+fn numeric_slots_accept_and_run_on_builtin_subclasses() {
+    // `PyLong_Check`/`PyFloat_Check`/`PyUnicode_Check` accept subclasses, so
+    // the base slots compute rather than decline, and `round`/`math.trunc` of
+    // a subclass with no override run the base type's slot.
+    let src = "\
+import math
+class I(int): pass
+class F(float): pass
+class S(str): pass
+x = ((5).__add__(I(7)), (5).__lt__(I(7)), (2.0).__add__(F(1.0)), 'a'.__eq__(S('a')), 'a'.__lt__(S('b')),
+     round(F(2.5)), round(F(2.25), 1), math.trunc(F(-2.5)), round(I(15), -1),
+     OSError.__str__(OSError(2, 'no')))
+";
+    assert_eq!(
+        g(src, "x"),
+        "(12, True, 3.0, True, True, 2, 2.2, -2, 20, '[Errno 2] no')"
+    );
+}
+
+#[test]
+fn exceptions_reduce_to_their_type_args_and_dict() {
+    // `BaseException.__reduce__`: `(type, args)`, plus the instance dict when
+    // it holds anything; an `OSError` re-adds the filename it split off.
+    let src = "\
+class E(Exception): pass
+e = E('a', 1)
+r1 = e.__reduce__()
+e.z = 5
+v = ValueError('x')
+x = (r1, e.__reduce_ex__(2), v.__reduce__(), Exception.__reduce__(e),
+     OSError(2, 'x', 'f').__reduce__(), OSError(2, 'x', 'f', None, 'g').__reduce__())
+";
+    assert_eq!(
+        g(src, "x"),
+        "((<class '__main__.E'>, ('a', 1)), (<class '__main__.E'>, ('a', 1), {'z': 5}), \
+         (<class 'ValueError'>, ('x',)), (<class '__main__.E'>, ('a', 1), {'z': 5}), \
+         (<class 'FileNotFoundError'>, (2, 'x', 'f')), \
+         (<class 'FileNotFoundError'>, (2, 'x', 'f', None, 'g')))"
+    );
+}

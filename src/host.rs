@@ -3579,14 +3579,14 @@ impl PyHost {
     }
 
     /// A read of a slot the collector freed: a root the collector did not see.
-/// Loud, because the quiet alternative is reading whatever is allocated there
-/// next.
-#[cold]
-fn freed_object(id: u32) -> ! {
-    panic!("pythonrs: heap object {id} used after the collector freed it")
-}
+    /// Loud, because the quiet alternative is reading whatever is allocated there
+    /// next.
+    #[cold]
+    fn freed_object(id: u32) -> ! {
+        panic!("pythonrs: heap object {id} used after the collector freed it")
+    }
 
-/// The `stdlib-ffi` handle id if `v` is a CPython `Foreign` object, else
+    /// The `stdlib-ffi` handle id if `v` is a CPython `Foreign` object, else
     /// `None`. Copying the id out ends the heap borrow before dispatching to the
     /// bridge (which needs `&mut self` to marshal the result back).
     #[cfg(feature = "stdlib-ffi")]
@@ -5968,6 +5968,13 @@ impl PyHost {
                         // class and address, not the slot's owner.
                         DescKind::MethodWrapper => {
                             let addr = recv.as_ref().map(|r| self.addr_of(r)).unwrap_or(0);
+                            // A wrapper bound through `super()` names the slot's
+                            // builtin owner in `qual` (`object.__repr__`); the
+                            // repr still names the instance's own type.
+                            let owner = match &recv {
+                                Some(r) if !self.classes.contains_key(owner) => self.type_name(r),
+                                _ => owner.to_string(),
+                            };
                             format!("<method-wrapper '{name}' of {owner} object at 0x{addr:012x}>")
                         }
                         DescKind::GetSetDescriptor => {
@@ -8182,7 +8189,8 @@ pub fn align_operand(a: &Value, b: &Value) -> Result<Option<Value>, String> {
             Ok(Some(with_host(|h| h.new_setlike(out, frozen))))
         }
         Side::Dict(pairs) => {
-            let mut out: DictMap = DictMap::with_capacity_and_hasher(pairs.len(), Default::default());
+            let mut out: DictMap =
+                DictMap::with_capacity_and_hasher(pairs.len(), Default::default());
             for (kv, vv) in pairs {
                 let k =
                     with_instance_key(&kv, KeyRole::Dict, &cands, || with_host(|h| h.to_key(&kv)))?;
@@ -12652,11 +12660,15 @@ impl PyHost {
     /// Whether `class` (a user class name) derives from a builtin exception type
     /// — i.e. its MRO reaches a name that `is_exception_class` recognizes.
     pub fn class_is_exception(&self, class: &str) -> bool {
-        self.class_fact(class, |m| &mut m.is_exception, || {
-            self.mro_rc(class)
-                .iter()
-                .any(|c| crate::builtins::is_exception_class(c))
-        })
+        self.class_fact(
+            class,
+            |m| &mut m.is_exception,
+            || {
+                self.mro_rc(class)
+                    .iter()
+                    .any(|c| crate::builtins::is_exception_class(c))
+            },
+        )
     }
 
     /// Whether reading an attribute of an instance of `class` that the class
@@ -12664,21 +12676,27 @@ impl PyHost {
     /// between: the MRO defines neither `__getattribute__` nor `__slots__`
     /// (whose members live outside the namespace).
     fn dict_reads(&self, class: &str) -> bool {
-        self.class_fact(class, |m| &mut m.dict_reads, || {
-            !self.class_has(class, "__getattribute__") && !self.class_has(class, "__slots__")
-        })
+        self.class_fact(
+            class,
+            |m| &mut m.dict_reads,
+            || !self.class_has(class, "__getattribute__") && !self.class_has(class, "__slots__"),
+        )
     }
 
     /// Whether storing an attribute the class does not define on an instance
     /// of `class` is a plain `__dict__` store: a user class, not an
     /// exception, whose MRO defines neither `__setattr__` nor `__slots__`.
     fn dict_writes(&self, class: &str) -> bool {
-        self.class_fact(class, |m| &mut m.dict_writes, || {
-            class != "object"
-                && !self.class_has(class, "__setattr__")
-                && !self.class_has(class, "__slots__")
-                && !self.class_is_exception(class)
-        })
+        self.class_fact(
+            class,
+            |m| &mut m.dict_writes,
+            || {
+                class != "object"
+                    && !self.class_has(class, "__setattr__")
+                    && !self.class_has(class, "__slots__")
+                    && !self.class_is_exception(class)
+            },
+        )
     }
 
     /// Whether `name` on an instance of `class` is a plain `__dict__` read
@@ -12692,7 +12710,11 @@ impl PyHost {
                 return allowed && found.is_none();
             }
         }
-        let allowed = if write { self.dict_writes(class) } else { self.dict_reads(class) };
+        let allowed = if write {
+            self.dict_writes(class)
+        } else {
+            self.dict_reads(class)
+        };
         allowed && !self.class_has(class, name)
     }
 
@@ -12710,7 +12732,12 @@ impl PyHost {
             }
         }
         let answer = compute();
-        *field(self.class_memo.borrow_mut().entry(class.to_string()).or_default()) = Some(answer);
+        *field(
+            self.class_memo
+                .borrow_mut()
+                .entry(class.to_string())
+                .or_default(),
+        ) = Some(answer);
         answer
     }
 
@@ -12813,13 +12840,19 @@ impl PyHost {
             .map(|cd| cd.bases.clone())
             .unwrap_or_default();
         if bases.is_empty() {
-            // A native `collections` mapping is a `dict` subclass, so a class
-            // deriving from it linearizes `dict` in after it.
-            if class
-                .strip_prefix("collections.")
-                .is_some_and(|b| matches!(b, "Counter" | "OrderedDict" | "defaultdict"))
-            {
-                return vec![class.to_string(), "dict".to_string()];
+            // A builtin type carries its own ancestry into every class derived
+            // from it: a native `collections` mapping is a `dict` subclass, and
+            // `KeyError` is `LookupError`, `Exception`, `BaseException`. Without
+            // it `class K(KeyError)` linearized to `(K, KeyError, object)`, so
+            // `K.__mro__`, `type.mro(K)` and a `super()` walk past `KeyError`
+            // all skipped the exception hierarchy. `object` stays implicit, as
+            // it is for every MRO stored here.
+            if !self.classes.contains_key(class) {
+                let mut mro = crate::builtins::builtin_mro(class);
+                if mro.last().is_some_and(|c| c == "object") && class != "object" {
+                    mro.pop();
+                }
+                return mro;
             }
             return vec![class.to_string()];
         }
@@ -12914,12 +12947,18 @@ impl PyHost {
     /// every instance attribute read and write, so answers are memoized in
     /// `class_memo`.
     pub fn class_lookup(&self, class: &str, name: &str) -> Option<Value> {
-        if let Some(hit) = self.class_memo.borrow().get(class).and_then(|m| m.lookups.get(name)) {
+        if let Some(hit) = self
+            .class_memo
+            .borrow()
+            .get(class)
+            .and_then(|m| m.lookups.get(name))
+        {
             return hit.clone();
         }
-        let found = self.mro_rc(class).iter().find_map(|c| {
-            self.classes.get(c).and_then(|cd| cd.ns.get(name)).cloned()
-        });
+        let found = self
+            .mro_rc(class)
+            .iter()
+            .find_map(|c| self.classes.get(c).and_then(|cd| cd.ns.get(name)).cloned());
         self.class_memo
             .borrow_mut()
             .entry(class.to_string())
@@ -13595,6 +13634,26 @@ impl PyHost {
                     let mro = self.mro_of(&cname);
                     return self.type_object_data_attr(&mro, name);
                 }
+                // What the builtin base defines, reached through the subclass:
+                // an alternate constructor (`DD.fromkeys`, `I.from_bytes`) is a
+                // classmethod bound to the SUBCLASS, so it builds one; any other
+                // method (`DD.get`) is the base's own unbound descriptor.
+                if !name.starts_with("__") {
+                    if let Some(base) = self.builtin_base_of(&cname) {
+                        let key = crate::builtins::native_type_key(base);
+                        if crate::builtins::type_classmethods(key).contains(&name) {
+                            let cls = self.alloc(PyObj::Class(cname.clone()));
+                            let func = self.alloc(PyObj::Builtin(format!(
+                                "{SUBCLASS_CLASSMETHOD}{key}.{name}"
+                            )));
+                            return Ok(self.alloc(PyObj::BoundMethod { recv: cls, func }));
+                        }
+                        let base_ty = self.alloc(PyObj::Builtin(base.to_string()));
+                        if let Ok(v) = self.get_attr(&base_ty, name) {
+                            return Ok(v);
+                        }
+                    }
+                }
                 // An inherited object-slot dunder reached on the class object with
                 // no override (`C.__ne__`, `C.__repr__`) is the unbound slot
                 // wrapper from `object`, as in CPython. (collections' OrderedDict
@@ -13751,6 +13810,21 @@ impl PyHost {
                     Some(PyObj::Class(n)) => n.clone(),
                     _ => owner.clone(),
                 };
+                // The proxy's own members (`super_members` in
+                // `Objects/typeobject.c`), answered before any MRO walk: they
+                // describe the proxy, not the instance it forwards to.
+                match name {
+                    "__class__" => return Ok(self.alloc(PyObj::Builtin("super".into()))),
+                    "__thisclass__" => return Ok(self.class_or_builtin_type(owner)),
+                    "__self__" => return Ok(instance),
+                    "__self_class__" => {
+                        return Ok(match self.get(&instance) {
+                            Some(PyObj::Class(_)) => instance,
+                            _ => self.class_or_builtin_type(inst_class),
+                        });
+                    }
+                    _ => {}
+                }
                 match super_lookup(self, &owner, &inst_class, name) {
                     Some((v, _)) => {
                         if let Some(PyObj::ClassMethod(inner)) = self.get(&v).cloned() {
@@ -13774,6 +13848,26 @@ impl PyHost {
                             }))
                         } else {
                             Ok(v)
+                        }
+                    }
+                    // Past every user class: a builtin ancestor's slot, bound
+                    // to the instance as a method-wrapper.
+                    None if matches!(self.get(&instance), Some(PyObj::Instance(_))) => {
+                        match super_builtin_slot(self, &owner, &inst_class, name) {
+                            Some(slot) => {
+                                let qual = match self.get(&slot) {
+                                    Some(PyObj::Descriptor { qual, .. }) => qual.clone(),
+                                    _ => unreachable!("super_builtin_slot builds a descriptor"),
+                                };
+                                Ok(self.alloc(PyObj::Descriptor {
+                                    kind: DescKind::MethodWrapper,
+                                    qual,
+                                    recv: Some(instance),
+                                }))
+                            }
+                            None => Err(format!(
+                                "AttributeError: 'super' object has no attribute '{name}'"
+                            )),
                         }
                     }
                     None => Err(format!(
@@ -14186,8 +14280,7 @@ impl PyHost {
                             Some(PyObj::Pattern { id, .. }) => *id,
                             _ => unreachable!("matched a Pattern above"),
                         };
-                        let mut d: DictMap =
-                            DictMap::default();
+                        let mut d: DictMap = DictMap::default();
                         for (n, i) in self.regexes[id].named_groups() {
                             let k = self.new_str(n.clone());
                             d.insert(PKey::Str(n), (k, Value::Int(i as i64)));
@@ -15008,7 +15101,12 @@ impl PyHost {
     /// dunder or one of the attributes `set_attr` special-cases. None of
     /// `set_attr`'s checks can refuse such a store, so it goes straight to the
     /// dict. `Err` hands `val` back for the full protocol.
-    pub fn set_plain_inst_attr(&mut self, recv: &Value, name: &str, val: Value) -> Result<(), Value> {
+    pub fn set_plain_inst_attr(
+        &mut self,
+        recv: &Value,
+        name: &str,
+        val: Value,
+    ) -> Result<(), Value> {
         let Some(PyObj::Instance(inst)) = self.get(recv) else {
             return Err(val);
         };
@@ -16438,6 +16536,9 @@ fn invoke_object(
                     if let Some(m) = name.strip_prefix("__base_method__.") {
                         return call_method(&recv, m, args, kwargs);
                     }
+                    if let Some(qual) = name.strip_prefix(SUBCLASS_CLASSMETHOD) {
+                        return subclass_classmethod(&recv, qual, args, kwargs);
+                    }
                     // A native `_random.Random` method bound to an instance.
                     if let Some(m) = name.strip_prefix("_random.Random.") {
                         if let Value::Obj(id) = &recv {
@@ -16473,7 +16574,24 @@ fn invoke_object(
             qual,
             recv: Some(recv),
         }) => {
-            let method = qual.rsplit_once('.').map_or(qual.as_str(), |(_, m)| m);
+            let (owner, method) = qual.rsplit_once('.').unwrap_or(("", qual.as_str()));
+            // Bound through `super()`, the wrapper is a BUILTIN ancestor's slot
+            // (`object.__repr__`, `Exception.__str__`): run that slot, never a
+            // lookup on the instance, which would find the override `super()`
+            // was written to get past.
+            if with_host(|h| !owner.is_empty() && !h.classes.contains_key(owner)) {
+                let slot = with_host(|h| {
+                    h.alloc(PyObj::Descriptor {
+                        kind: DescKind::WrapperDescriptor,
+                        qual: qual.clone(),
+                        recv: None,
+                    })
+                });
+                let mut all = Vec::with_capacity(args.len() + 1);
+                all.push(recv);
+                all.extend(args);
+                return invoke(&slot, all, kwargs);
+            }
             call_method(&recv, method, args, kwargs)
         }
         // An unbound slot wrapper (`int.__str__`, `object.__repr__`) is callable:
@@ -17010,7 +17128,7 @@ pub fn collections_subclass_copy(v: &Value) -> Option<Result<Value, String>> {
 /// native payload. Container/value dunders route to the native heap ops; named
 /// methods (`append`, `upper`, `keys`, …) route to [`call_type_method`]. `recv`
 /// is the full instance (needed for a `dict` subclass `__missing__` hook).
-fn base_dispatch(
+pub(crate) fn base_dispatch(
     recv: &Value,
     payload: &Value,
     base: &str,
@@ -17991,6 +18109,13 @@ fn call_method_inner(
             if let Some(r) = metaclass_getattr(recv, name) {
                 return invoke(&r?, args, kwargs);
             }
+            // A builtin base's method or alternate constructor, which the
+            // attribute read resolves (`DD.fromkeys(...)`, `DD.get(d, k)`).
+            if with_host(|h| h.builtin_base_of(&cname).is_some()) {
+                if let Ok(f) = with_host(|h| h.get_attr(recv, name)) {
+                    return invoke(&f, args, kwargs);
+                }
+            }
             Err(format!(
                 "AttributeError: type object '{cname}' has no attribute '{name}'",
                 cname = with_host(|h| h.class_display_name(&cname))
@@ -18171,6 +18296,22 @@ fn call_method_inner(
                     let attr_s = with_host(|h| h.as_str(&attr)).unwrap_or_default();
                     crate::builtins::raw_getattr(&instance, &attr_s)
                 }
+                // Any other slot past every user class runs the builtin
+                // ancestor's (`super().__repr__()`, `super().__str__()` in an
+                // `Exception` subclass, `super().__eq__(o)`).
+                None if with_host(|h| matches!(h.get(&instance), Some(PyObj::Instance(_)))) => {
+                    match with_host(|h| super_builtin_slot(h, &owner, &inst_class, name)) {
+                        Some(slot) => {
+                            let mut all = Vec::with_capacity(args.len() + 1);
+                            all.push(instance);
+                            all.extend(args);
+                            invoke(&slot, all, kwargs)
+                        }
+                        None => Err(format!(
+                            "AttributeError: 'super' object has no attribute '{name}'"
+                        )),
+                    }
+                }
                 None => Err(format!(
                     "AttributeError: 'super' object has no attribute '{name}'"
                 )),
@@ -18310,6 +18451,58 @@ fn super_lookup(h: &PyHost, owner: &str, inst_class: &str, name: &str) -> Option
         }
     }
     None
+}
+
+/// The `PyObj::Builtin` name prefix of a builtin type's alternate constructor
+/// bound to a user subclass (`DD.fromkeys`): what follows is `type.method`.
+const SUBCLASS_CLASSMETHOD: &str = "__subclass_classmethod__.";
+
+/// Run builtin alternate constructor `qual` (`dict.fromkeys`, `int.from_bytes`)
+/// as a classmethod of user subclass `cls`, as CPython's do: the result is a
+/// `cls`. `dict.fromkeys` builds `cls()` and stores each key through
+/// `__setitem__` (`_PyDict_FromKeys` takes its exact-dict fast path only for
+/// `dict` itself); the others hand the base value to `cls(...)`
+/// (`int_from_bytes_impl`, `float_fromhex`, `bytes_fromhex_impl`).
+fn subclass_classmethod(
+    cls: &Value,
+    qual: &str,
+    args: Vec<Value>,
+    kwargs: Vec<(String, Value)>,
+) -> Result<Value, String> {
+    let base = crate::builtins::call_builtin_function(qual, args, kwargs)?;
+    if qual.ends_with(".fromkeys") {
+        let inst = invoke(cls, vec![], vec![])?;
+        let items = call_method(&base, "items", vec![], vec![])?;
+        for pair in iter_vec(&items)? {
+            call_method(&inst, "__setitem__", iter_vec(&pair)?, vec![])?;
+        }
+        return Ok(inst);
+    }
+    invoke(cls, vec![base], vec![])
+}
+
+/// The builtin slot a `super` proxy reaches when no user class after `owner`
+/// in `inst_class`'s MRO defines `name`: the unbound wrapper descriptor of the
+/// first BUILTIN ancestor there (`Exception`, `KeyError`), or of `object` at
+/// the top of a plain hierarchy — what `super().__repr__` and
+/// `super().__str__()` resolve to in CPython. `None` for a name that is not
+/// one of `object`'s slots.
+fn super_builtin_slot(h: &mut PyHost, owner: &str, inst_class: &str, name: &str) -> Option<Value> {
+    if !OBJECT_SLOT_WRAPPERS.contains(&name) {
+        return None;
+    }
+    let mro = h.mro_rc(inst_class);
+    let start = mro.iter().position(|c| c == owner)? + 1;
+    let base = mro[start..]
+        .iter()
+        .find(|c| !h.classes.contains_key(c.as_str()))
+        .cloned()
+        .unwrap_or_else(|| "object".to_string());
+    Some(h.alloc(PyObj::Descriptor {
+        kind: DescKind::WrapperDescriptor,
+        qual: format!("{base}.{name}"),
+        recv: None,
+    }))
 }
 
 fn method_owner(h: &PyHost, class: &str, name: &str) -> Option<String> {
@@ -18929,13 +19122,15 @@ pub fn enter_linked(
     Ok(())
 }
 
-
 /// Return `v` from the linked body running in `vm`'s innermost frame: drop
 /// that frame and its host frame, and resume the caller after its call op,
 /// which pushes the result. An `__init__` entered by a class call
 /// ([`Frame::init_of`]) results in its instance, once `v` is `None`.
 pub fn return_linked(vm: &mut VM, v: Value) -> Result<Value, String> {
-    let frame = vm.frames.pop().expect("a linked body runs above the base frame");
+    let frame = vm
+        .frames
+        .pop()
+        .expect("a linked body runs above the base frame");
     vm.stack.truncate(frame.stack_base);
     vm.ip = frame.return_ip;
     let init_of = with_host(|h| {
@@ -25814,11 +26009,7 @@ pub fn alloc_deque(items: VecDeque<Value>, maxlen: Option<usize>) -> Value {
 }
 
 /// Allocate a tagged `dict` subclass (Counter / defaultdict / OrderedDict).
-pub fn alloc_dict_subtype(
-    pairs: DictMap,
-    kind: DictKind,
-    factory: Option<Value>,
-) -> Value {
+pub fn alloc_dict_subtype(pairs: DictMap, kind: DictKind, factory: Option<Value>) -> Value {
     with_host(|h| {
         let d = h.alloc(PyObj::Dict(pairs));
         if let Value::Obj(i) = d {
