@@ -10910,3 +10910,66 @@ fn dict_of_a_module_namespace_is_a_mapping() {
         "(1, 2, 3)"
     );
 }
+
+/// `asyncio.sleep` is a coroutine function (`async def sleep` in CPython):
+/// its call is a coroutine `create_task` accepts, whose delay starts when it
+/// runs; `asyncio.iscoroutine` answers for native coroutines and the
+/// `Coroutine` protocol.
+#[test]
+fn asyncio_sleep_is_a_coroutine_function() {
+    let src = r#"
+import asyncio
+async def co(): return 1
+class C:
+    def __await__(self): yield
+    def send(self, v): pass
+    def throw(self, *a): pass
+    def close(self): pass
+c = co()
+def g(): yield
+out = [asyncio.iscoroutine(c), asyncio.iscoroutine(C()), asyncio.iscoroutine(g()), asyncio.iscoroutine(1)]
+c.close()
+async def main():
+    s = asyncio.sleep(0.01, 'early')
+    kind = type(s).__name__
+    t = asyncio.create_task(asyncio.sleep(0.02, 'late'))
+    u = asyncio.create_task(s)
+    return [kind, await t, await u, asyncio.sleep.__name__]
+out += asyncio.run(main())
+"#;
+    assert_eq!(
+        g(src, "out"),
+        r#"[True, True, False, False, 'coroutine', 'late', 'early', 'sleep']"#
+    );
+}
+
+/// `exec`/`eval` inside a generator or coroutine body: the body runs on a
+/// frame stack of its own, which is set aside for a module-scope frame while
+/// the code runs, and the caller's locals overlay a namespace-less call. A
+/// globals dict gets `__builtins__`, as CPython inserts it.
+#[test]
+fn exec_and_eval_inside_generators_and_coroutines() {
+    let src = r#"
+import asyncio
+def g(a):
+    x = 1
+    yield eval("a + x")
+    d = {"k": 5, "x": x}
+    exec("y = k + x", d)
+    yield d["y"]
+    yield eval("q", {"q": 3})
+async def c(a):
+    b = 3
+    d = {}
+    exec("def f(): return 7", d)
+    return [eval("a * b"), d["f"](), sorted(locals())]
+out = [list(g(2)), asyncio.run(c(2))]
+d = {}; exec("", d); d2 = {}; eval("1", d2); gl = {}; lo = {}; exec("x = 1", gl, lo)
+import builtins
+out += [list(d), list(d2), list(gl), list(lo), d["__builtins__"] is builtins.__dict__]
+"#;
+    assert_eq!(
+        g(src, "out"),
+        r#"[[3, 6, 3], [6, 7, ['a', 'b', 'd']], ['__builtins__'], ['__builtins__'], ['__builtins__'], ['x'], True]"#
+    );
+}

@@ -9,6 +9,16 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **`exec`/`eval` inside a generator or coroutine.** The body runs on a frame
+  stack of its own whose bottom frame is the generator's, so the nested code
+  ran on that frame: `eval("1+1")` returned `None`, `exec(src, d)` left `d`
+  empty, and the caller's locals were not visible. That stack is now set
+  aside for a module frame while the code runs. A globals dict also gets
+  `__builtins__` (the builtins module's dict), as CPython inserts it.
+- **`asyncio.sleep` is a coroutine function.** It returned a Future, so
+  `asyncio.create_task(asyncio.sleep(1))` raised `a coroutine was expected`
+  and the delay started at the call; it is now `async def sleep` awaiting the
+  native timer. `asyncio.iscoroutine` exists.
 - **`inspect` recognizes pythonrs functions across the bridge.**
   `inspect.isfunction(f)`/`ismethod(a.m)` were False, so
   `getmembers(C, isfunction)` was empty and `getsource`/`getfile` raised; the
@@ -3309,6 +3319,13 @@ entry. These remain open:
   namespace (and refreshed with it, as class mirrors are).
 - **A strided memoryview slice is a read-only copy.** `memoryview(ba)[::2]`
   over a `bytearray` is `readonly` and writes through it do not reach `ba`.
+- **asyncio surface still missing**: `asyncio.timeout`, `TaskGroup`,
+  `current_task`, `to_thread` and `iscoroutinefunction` (with its 3.14
+  `DeprecationWarning`) are not in the native module, and an unawaited
+  coroutine's `RuntimeWarning` prints at exit without CPython's location and
+  tracemalloc lines.
+- **A custom `__builtins__` in an `exec`/`eval` globals dict is ignored**
+  (`eval("len([1])", {"__builtins__": {"len": f}})` uses the real `len`).
 - **`f'{x!=}'`** reports `expecting '=', or '!', or ':', or '}'` one column
   right of CPython (offset 6, CPython 5).
 

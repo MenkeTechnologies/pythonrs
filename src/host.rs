@@ -2244,6 +2244,13 @@ fn new_env(parent: Option<Env>) -> Env {
     }))
 }
 
+/// The frames [`PyHost::enter_module_scope`] set aside: the function frames
+/// above the module frame, or (`whole`) a generator's entire frame stack.
+pub struct ParkedScope {
+    frames: Vec<Frame>,
+    whole: bool,
+}
+
 /// One function activation.
 pub struct Frame {
     pub env: Env,
@@ -2288,6 +2295,33 @@ pub struct Frame {
     /// return hands the instance back in place of `__init__`'s own result. An
     /// id, not a `Value`, so the field costs the frame 8 bytes and no drop.
     pub init_of: Option<u32>,
+}
+
+impl Frame {
+    /// A module-level frame running module `module`'s code: an empty env (the
+    /// module's names live in its globals slot), as the host's first frame is.
+    fn module(module: usize) -> Frame {
+        Frame {
+            env: new_env(None),
+            globals_decl: NameSet::default(),
+            nonlocals_decl: NameSet::default(),
+            locals_set: Rc::new(HashSet::default()),
+            is_class_body: false,
+            self_obj: None,
+            owner: None,
+            name: Rc::from("<module>"),
+            line: 0,
+            span: Span::NONE,
+            module,
+            file: None,
+            init_of: None,
+        }
+    }
+
+    /// Whether this is a module-level frame (not a function's or class body's).
+    fn is_module_frame(&self) -> bool {
+        !self.is_class_body && &*self.name == "<module>"
+    }
 }
 
 /// `(filename, scope, line, caret start, caret end)` of a frame a CPython
@@ -4259,15 +4293,40 @@ impl PyHost {
     /// function sets a module global, matching CPython's default-namespace rule).
     /// Returns the parked frames to hand back to [`Self::restore_scope`]. A run already
     /// at module scope parks nothing.
-    pub fn enter_module_scope(&mut self) -> Vec<Frame> {
-        self.frames.split_off(1)
+    ///
+    /// A generator or coroutine body runs on a frame stack of its own whose
+    /// bottom frame is the generator's, not a module frame; that whole stack is
+    /// parked and a module frame for the current module stands in for the run.
+    pub fn enter_module_scope(&mut self) -> ParkedScope {
+        if self.frames.first().is_some_and(|f| f.is_module_frame()) {
+            return ParkedScope {
+                frames: self.frames.split_off(1),
+                whole: false,
+            };
+        }
+        let module = self.cur_module;
+        let frames = std::mem::replace(&mut self.frames, vec![Frame::module(module)]);
+        ParkedScope {
+            frames,
+            whole: true,
+        }
     }
 
     /// Restore the frames parked by [`Self::enter_module_scope`] once the nested run
     /// finishes, so the interrupted caller resumes with its frame intact.
-    pub fn restore_scope(&mut self, parked: Vec<Frame>) {
+    pub fn restore_scope(&mut self, parked: ParkedScope) {
+        if parked.whole {
+            self.frames = parked.frames;
+            return;
+        }
         self.frames.truncate(1);
-        self.frames.extend(parked);
+        self.frames.extend(parked.frames);
+    }
+
+    /// Whether code running now is inside a function scope (a generator's or
+    /// coroutine's body included), rather than at module level.
+    pub fn in_function_scope(&self) -> bool {
+        self.frames.len() > 1 || self.frames.first().is_some_and(|f| !f.is_module_frame())
     }
 
     /// The visible local bindings of the innermost (calling) frame — its env chain
@@ -4276,7 +4335,7 @@ impl PyHost {
     /// module scope (its bindings are the globals, included separately).
     pub fn caller_locals(&self) -> NameMap {
         let mut out: NameMap = NameMap::default();
-        if self.frames.len() <= 1 {
+        if !self.in_function_scope() {
             return out;
         }
         // Collect the env chain, then apply outermost→innermost so the nearest
@@ -25155,6 +25214,10 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
             vec![
                 ("run", h.alloc(PyObj::Builtin("asyncio.run".into()))),
                 ("sleep", h.alloc(PyObj::Builtin("asyncio.sleep".into()))),
+                (
+                    "iscoroutine",
+                    h.alloc(PyObj::Builtin("asyncio.iscoroutine".into())),
+                ),
                 ("gather", h.alloc(PyObj::Builtin("asyncio.gather".into()))),
                 (
                     "create_task",

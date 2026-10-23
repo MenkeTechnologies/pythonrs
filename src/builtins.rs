@@ -9329,13 +9329,28 @@ fn run_pysource(want_value: bool, args: &[Value]) -> Result<Value, String> {
     };
     let globals_arg = ns_arg(1);
     let locals_arg = ns_arg(2);
+    // `exec`/`eval` insert `__builtins__` (the builtins module's dict) into a
+    // globals dict that has none, before the code runs (`PyEval_EvalCode`
+    // via `_PyEval_BuiltinsFromGlobals`'s caller in `builtin_exec_impl`).
+    if let Some(g) = &globals_arg {
+        let missing = with_host(|h| match h.get(g) {
+            Some(PyObj::Dict(d)) => !d.contains_key(&host::PKey::Str("__builtins__".into())),
+            _ => false,
+        });
+        if missing {
+            let builtins = host::import_module("builtins")?;
+            let bdict = with_host(|h| h.get_attr(&builtins, "__dict__"))?;
+            let key = with_host(|h| h.new_str("__builtins__"));
+            with_host(|h| h.set_item(g, &key, bdict))?;
+        }
+    }
     let explicit_ns = globals_arg.is_some() || locals_arg.is_some();
     // With no explicit namespace, a call from inside a function runs against the
     // module globals with the caller's locals overlaid, and its writes are
     // DISCARDED afterward — CPython's rule that exec/eval in a function reads
     // locals but cannot persist to them or to globals. At module scope, writes go
     // straight to the real module globals and persist.
-    let in_function = with_host(|h| h.frame_depth() > 1);
+    let in_function = with_host(|h| h.in_function_scope());
 
     // `eval` requires exactly one expression. Validate the RAW (leading-whitespace
     // stripped, as CPython does) source first, so a statement, a semicolon/newline
@@ -12005,6 +12020,45 @@ fn call_sys(name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Resul
     }
 }
 
+/// The `async def sleep(delay, result=None)` coroutine function behind
+/// `asyncio.sleep`, compiled once per host and kept in the `asyncio` module's
+/// namespace (where the module's `sleep` then names it too).
+fn asyncio_sleep_function() -> Result<Value, String> {
+    let module = host::import_module("asyncio")?;
+    let slot = with_host(|h| h.module_slot(&module))
+        .ok_or_else(|| host::type_error("asyncio is not a module"))?;
+    if let Some(f) = with_host(|h| h.module_global(slot, "_sleep_coroutine")) {
+        return Ok(f);
+    }
+    let globals = with_host(|h| {
+        let mut d = DictMap::default();
+        for (k, v) in [
+            ("__name__", h.new_str("asyncio.tasks")),
+            (
+                "_sleep_future",
+                h.alloc(PyObj::Builtin("asyncio._sleep_future".into())),
+            ),
+        ] {
+            let key = h.new_str(k);
+            d.insert(PKey::Str(k.to_string()), (key, v));
+        }
+        h.new_dict(d)
+    });
+    let src = with_host(|h| {
+        h.new_str(
+            "async def sleep(delay, result=None):\n    \"\"\"Coroutine that completes after a given time (in seconds).\"\"\"\n    return await _sleep_future(delay, result)\n",
+        )
+    });
+    call_builtin_function("exec", vec![src, globals.clone()], vec![])?;
+    let key = with_host(|h| h.new_str("sleep"));
+    let f = with_host(|h| h.get_item(&globals, &key))?;
+    with_host(|h| -> Result<(), String> {
+        h.set_attr(&module, "_sleep_coroutine", f.clone())?;
+        h.set_attr(&module, "sleep", f.clone())
+    })?;
+    Ok(f)
+}
+
 /// `asyncio.*` module functions — dispatched to the native async runtime.
 fn call_asyncio(
     name: &str,
@@ -12014,7 +12068,27 @@ fn call_asyncio(
     use crate::async_rt;
     match name {
         "run" => async_rt::run(args.into_iter().next().unwrap_or(Value::Undef)),
+        // `asyncio.sleep` is a coroutine function, as in CPython (`async def
+        // sleep` in `asyncio/tasks.py`): calling it builds a coroutine, so
+        // `create_task(asyncio.sleep(1))` takes it and its delay starts when it
+        // first runs. The body awaits the native timer future.
         "sleep" => {
+            let sleep = asyncio_sleep_function()?;
+            host::invoke(&sleep, args, kwargs)
+        }
+        // `asyncio.iscoroutine(obj)`: a native coroutine, or an object of a
+        // class providing the `collections.abc.Coroutine` protocol.
+        "iscoroutine" => {
+            let v = args.into_iter().next().unwrap_or(Value::Undef);
+            let protocol = with_host(|h| match h.get(&v) {
+                Some(PyObj::Instance(i)) => ["__await__", "send", "throw", "close"]
+                    .iter()
+                    .all(|m| h.class_lookup(&i.class, m).is_some()),
+                _ => false,
+            });
+            Ok(Value::Bool(host::is_coroutine(&v) || protocol))
+        }
+        "_sleep_future" => {
             let mut it = args.into_iter();
             let delay = it.next().and_then(num_f).unwrap_or(0.0);
             let result = it.next().unwrap_or(Value::Undef);
