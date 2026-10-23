@@ -3028,15 +3028,15 @@ impl Compiler {
     ///     body
     /// except BaseException as .exc:
     ///     .hit = True
-    ///     if not .ctx.__exit__(type(.exc), .exc, None):   # real 3-tuple
+    ///     if not .ctx.__exit__(type(.exc), .exc, .exc.__traceback__):
     ///         raise                                        # truthy → suppressed
     /// finally:
     ///     if not .hit:
     ///         .ctx.__exit__(None, None, None)              # normal exit, once
     /// ```
-    /// `async with` drives `__aenter__`/`__aexit__` through `await`. The traceback
-    /// slot is `None` (pythonrs has no traceback objects); the type and value are
-    /// the real exception's.
+    /// `async with` drives `__aenter__`/`__aexit__` through `await`. The third
+    /// argument is the exception's `__traceback__`, as CPython's `WITH_EXCEPT_START`
+    /// passes it.
     fn desugar_with_single(&mut self, it: &WithItem, body: Vec<Stmt>, is_async: bool) -> Vec<Stmt> {
         // The ENTRY call goes through a dot-prefixed sentinel so
         // `host::call_method` runs CPython's protocol check first: `__exit__` is
@@ -3102,7 +3102,7 @@ impl Compiler {
             }
             .into(),
         );
-        // except handler body: .hit = True; if not .ctx.__exit__(type(.exc),.exc,None): raise
+        // except handler body: .hit = True; if not .ctx.__exit__(type(.exc), .exc, .exc.__traceback__): raise
         let exit_exc = awaited(call(
             &ctx,
             exit_m,
@@ -3113,7 +3113,7 @@ impl Compiler {
                     keywords: vec![],
                 },
                 Expr::Name(exc.clone()),
-                Expr::None,
+                Expr::Attribute(Box::new(Expr::Name(exc.clone())), "__traceback__".into()),
             ],
         ));
         let handler_body: Vec<Stmt> = vec![

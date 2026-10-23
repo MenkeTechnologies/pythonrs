@@ -319,7 +319,7 @@ inheritance attribute lookup, linear override resolution, `__eq__`/`__lt__`, and
       binary operator (it used to be computed as `(a // b, a % b)`, so a class
       defining only `__divmod__` raised `unsupported operand type(s) for //`).
 - [ ] **Context managers** — multiple `with` now exit **LIFO**, `__exit__` returning
-      `True` **suppresses**, `__exit__` receives the live `(type, value, None)` on the
+      `True` **suppresses**, `__exit__` receives the live `(type, value, traceback)` on the
       error path, and the parenthesized with-items form (`with (a as x, b as y):`,
       CPython 3.10+ / PEP 617) parses — including its precedence over the tuple
       reading, so `with (a, b):` is two context managers. The protocol is checked

@@ -299,3 +299,71 @@ result = log";
     // then exits normally (t is None -> True).
     assert_eq!(g(src, "result"), "[(2, False), (1, True)]");
 }
+
+#[test]
+fn with_exit_receives_the_exception_traceback() {
+    // `WITH_EXCEPT_START` passes `(type, value, value.__traceback__)`: the third
+    // argument is a traceback whose innermost node is the raising frame, not
+    // `None`.
+    let src = "\
+import traceback
+seen = None
+class CM:
+    def __enter__(s): return s
+    def __exit__(s, t, v, tb):
+        global seen
+        names = [f.name for f in traceback.extract_tb(tb)]
+        seen = (type(tb).__name__, tb.tb_frame.f_code.co_name, tb.tb_lineno,
+                names == [f.name for f in traceback.extract_tb(v.__traceback__)], names)
+        return True
+def boom():
+    raise ValueError('v')
+def f():
+    with CM():
+        boom()
+f()
+result = seen";
+    assert_eq!(g(src, "result"), "('traceback', 'f', 15, True, ['f', 'boom'])");
+}
+
+#[test]
+fn sys_exc_info_carries_the_traceback() {
+    // `sys.exc_info()[2]` is the handled exception's `__traceback__`, and the
+    // triple is all `None` again once the handler is left.
+    let src = "\
+import sys
+def boom():
+    raise KeyError('k')
+try:
+    boom()
+except KeyError:
+    t, v, tb = sys.exc_info()
+    inside = (t.__name__, tb is not None, tb.tb_lineno, tb.tb_next.tb_frame.f_code.co_name)
+after = sys.exc_info()";
+    assert_eq!(g(src, "inside"), "('KeyError', True, 5, 'boom')");
+    assert_eq!(g(src, "after"), "(None, None, None)");
+}
+
+#[cfg(feature = "stdlib-ffi")]
+#[test]
+fn exit_traceback_crosses_into_cpython_traceback_module() {
+    // A CPython-raised exception's value routes `traceback.format_exception`
+    // to CPython, so the native traceback object handed to `__exit__` has to
+    // cross the bridge; it used to raise `cannot pass 'traceback'`.
+    let src = "\
+import json, traceback
+last = None
+class Log:
+    def __enter__(s): return s
+    def __exit__(s, t, v, tb):
+        global last
+        last = ''.join(traceback.format_exception(t, v, tb)).splitlines()[-1]
+        return True
+with Log():
+    json.loads('{')
+result = last";
+    assert_eq!(
+        g(src, "result"),
+        "'json.decoder.JSONDecodeError: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)'"
+    );
+}

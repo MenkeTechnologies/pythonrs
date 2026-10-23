@@ -1254,6 +1254,10 @@ pub enum PyObj {
         /// The same frames in full (file, caret span), so a traceback handed
         /// to `traceback.format_tb` renders as the uncaught one does.
         entries: Rc<Vec<TbFrame>>,
+        /// The exception this traceback belongs to. A traceback handed to
+        /// CPython (`traceback.format_exception(t, v, tb)`) crosses as that
+        /// exception's CPython `__traceback__`, advanced `idx` nodes.
+        exc: Value,
     },
     /// A stack frame object (`tb.tb_frame`, `sys._getframe`). Minimal: the scope
     /// name and current line, with `f_globals` the globals of the module the
@@ -13315,6 +13319,7 @@ impl PyHost {
             frames,
             idx: 0,
             entries: Rc::new(entries),
+            exc: recv.clone(),
         })
     }
 
@@ -14678,8 +14683,10 @@ impl PyHost {
                 frames,
                 idx,
                 entries,
+                exc,
             }) => {
-                let (frames, idx, entries) = (frames.clone(), *idx, entries.clone());
+                let (frames, idx, entries, exc) =
+                    (frames.clone(), *idx, entries.clone(), exc.clone());
                 match name {
                     "tb_frame" => {
                         let (n, l) = frames[idx].clone();
@@ -14697,6 +14704,7 @@ impl PyHost {
                                 frames,
                                 idx: idx + 1,
                                 entries,
+                                exc,
                             }))
                         } else {
                             Ok(Value::Undef)

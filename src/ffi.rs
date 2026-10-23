@@ -2668,6 +2668,25 @@ fn value_to_py_node<'py>(
                     .and_then(|p| p.call1((pfunc,)))
                     .map_err(|e| e.to_string())
             }
+            // A traceback (`e.__traceback__`, the third `__exit__` argument)
+            // crosses as its exception's CPython `__traceback__` — rebuilt by
+            // `exc_to_py` from the frames the exception was caught through —
+            // advanced to this node, so `traceback.format_exception(t, v, tb)`
+            // and `extract_tb(tb)` read the same frames on either side.
+            Some(PyObj::Traceback { idx, exc, .. }) => {
+                let (idx, exc) = (*idx, exc.clone());
+                let Some(pexc) = exc_to_py(host, py, &exc)? else {
+                    return Ok(py.None().into_bound(py));
+                };
+                let mut tb = pexc.getattr("__traceback__").map_err(|e| e.to_string())?;
+                for _ in 0..idx {
+                    if tb.is_none() {
+                        break;
+                    }
+                    tb = tb.getattr("tb_next").map_err(|e| e.to_string())?;
+                }
+                Ok(tb)
+            }
             _ => Err(crate::host::type_error(&format!(
                 "cannot pass '{}' to a CPython stdlib call",
                 host.type_name(v)

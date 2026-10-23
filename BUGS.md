@@ -9,6 +9,19 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **`__exit__` and `sys.exc_info()` get the traceback.** The `with` desugar
+  passed `None` as `__exit__`'s third argument and `sys.exc_info()` returned
+  `(type, value, None)`, so `tb.tb_lineno`, `traceback.extract_tb(tb)` or
+  `traceback.print_exception(t, v, tb)` in an exit handler failed. Both now
+  carry the exception's `__traceback__`. A native traceback object handed to
+  CPython (`traceback.format_exception(t, v, tb)` for a CPython-raised
+  exception such as `JSONDecodeError`) crosses as its exception's rebuilt
+  CPython `__traceback__` instead of raising `cannot pass 'traceback'`.
+  Still open: each `e.__traceback__` read builds a fresh object, so
+  `tb is e.__traceback__` is `False`; `type(tb) is types.TracebackType` is
+  `False` (though `isinstance` is `True`); and the native traceback of a CPython-raised
+  exception lists only the pythonrs frames (`extract_tb` gives `['<module>']`
+  where CPython also lists `loads`, `decode`, `raw_decode`).
 - **An exception escaping a generator keeps its identity.** The body's
   in-flight exception sat on the generator's swapped-out context, so the
   resumer re-formed it from its message: `raise ValueError(1, 2)` was caught as
@@ -2212,8 +2225,8 @@ written.
   and short-circuit (`1 < f() < 10` calls `f` once; a failed earlier link skips
   the later operands entirely).
 - **`with` / `async with`** call a real `__exit__(exc_type, exc_value, tb)` with
-  the active exception's type and value on the error path (`tb` is `None` —
-  pythonrs has no traceback objects); a truthy return **suppresses** the
+  the active exception's type, value and `__traceback__` on the error path
+  (`sys.exc_info()[2]` is that traceback too); a truthy return **suppresses** the
   exception, a falsy/`None` return re-raises. On the normal path `__exit__` is
   called once with `(None, None, None)`. `with A, B:` nests independently, so an
   inner manager's suppression hides the exception from the outer one. `__enter__`'s

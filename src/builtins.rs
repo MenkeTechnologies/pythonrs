@@ -11980,9 +11980,8 @@ fn call_sys(name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Resul
                 Some(exc) if !want_triple => exc,
                 Some(exc) => {
                     let cls = h.get_attr(&exc, "__class__").unwrap_or(Value::Undef);
-                    // No traceback object: pythonrs records traceback frames in a
-                    // side table rather than as a reachable `__traceback__` chain.
-                    h.new_tuple(vec![cls, exc, Value::Undef])
+                    let tb = h.get_attr(&exc, "__traceback__").unwrap_or(Value::Undef);
+                    h.new_tuple(vec![cls, exc, tb])
                 }
                 None if !want_triple => Value::Undef,
                 None => h.new_tuple(vec![Value::Undef, Value::Undef, Value::Undef]),

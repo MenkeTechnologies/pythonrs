@@ -537,6 +537,7 @@ impl PyHost {
             }
             PyObj::Instance(inst) => m.values([&inst.dict, &inst.payload]),
             PyObj::BoundMethod { recv, func } => m.values([recv, func]),
+            PyObj::Traceback { exc, .. } => m.value(exc),
             PyObj::Iter(IterState::Seq { items, .. }) => m.values(items),
             PyObj::Iter(IterState::DictKeys { keys, .. }) => m.values(keys),
             PyObj::Iter(IterState::RangeIter { .. } | IterState::BigRangeIter { .. }) => {}
@@ -567,7 +568,6 @@ impl PyHost {
             | PyObj::BigRange { .. }
             | PyObj::Code { .. }
             | PyObj::Pattern { .. }
-            | PyObj::Traceback { .. }
             | PyObj::PyFrame { .. }
             | PyObj::FrameCode { .. }
             | PyObj::Lock { .. }
