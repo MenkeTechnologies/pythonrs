@@ -1623,11 +1623,11 @@ class PyrsMirror(type):
         _detach(cls)
         super().__delattr__(name)
 
-def make_mirror(name, members):
+def make_mirror(name, bases, members):
     def body(ns):
         for k in members:
             ns[k] = members[k]
-    return types.new_class(name, (object,), {'metaclass': PyrsMirror}, body)
+    return types.new_class(name, bases or (object,), {'metaclass': PyrsMirror}, body)
 "#;
     let module = PyModule::from_code(py, code, c"_pyrs_mirror.py", c"_pyrs_mirror")
         .map_err(|e| e.to_string())?;
@@ -1681,7 +1681,8 @@ fn pristine_class(obj: &Bound<PyAny>, generation: u64) -> Option<String> {
     })
 }
 
-/// A native class as CPython sees it: a class over `object` carrying the
+/// A native class as CPython sees it: a class over its native bases' mirrors
+/// (over `object` when it has none) carrying the
 /// native namespace — methods as `PyrsCallable` descriptors (they bind `self`),
 /// `__annotations__` and class variables by value — so a decorator
 /// (`@dataclass`) can read the fields and add methods, and introspection
@@ -1703,6 +1704,15 @@ fn class_mirror<'py>(
         .unwrap_or_default();
     let ns_dict = PyDict::new(py);
     for (k, val) in &members {
+        // `type.__new__` runs the nearest base's `__init_subclass__` on every
+        // class it builds. The program's hook already ran, on the program's
+        // class, when the class statement executed; building a subclass's
+        // mirror must not run it again (on the mirror, with the host borrowed),
+        // so the hook stays off the mirror and `object.__init_subclass__` —
+        // a no-op — is what the mirror's subclasses inherit.
+        if k == "__init_subclass__" {
+            continue;
+        }
         let pv = value_to_py(host, py, val)?;
         ns_dict
             .set_item(k.as_str(), pv)
@@ -1739,9 +1749,23 @@ fn class_mirror<'py>(
         }
         return Ok(mirror);
     }
+    // The native bases cross as THEIR mirrors, so the mirrors' `__mro__`
+    // follows the program's: `issubclass(D_mirror, C_mirror)` holds, which is
+    // what `ABCMeta` asks when `Base.register(C)` must cover `class D(C)`, and
+    // an ABC's structural check (`Sized`, `Iterable`, …) finds a dunder a
+    // subclass inherits. A base that is not a native class — a builtin type,
+    // or a class CPython built — is left out: CPython's `list` or `ABC` would
+    // demand its own layout or metaclass of the mirror.
+    let mut bases: Vec<Bound<'py, PyAny>> = Vec::new();
+    for base in class_def.map(|c| c.bases.as_slice()).unwrap_or_default() {
+        if host.classes.contains_key(base) {
+            bases.push(class_mirror(host, py, base)?);
+        }
+    }
+    let bases = PyTuple::new(py, bases).map_err(|e| e.to_string())?;
     let mirror = mirror_helper(py)?
         .getattr("make_mirror")
-        .and_then(|f| f.call1((name, ns_dict)))
+        .and_then(|f| f.call1((name, bases, ns_dict)))
         .map_err(|e| e.to_string())?;
     IDENTITY.with(|m| {
         let mut m = m.borrow_mut();
@@ -1849,9 +1873,9 @@ fn instance_from_mirror(
     });
     remember_from_py(obj, &inst);
     // `BUILD` puts the state into `__dict__` and the slot values (named as
-    // `copyreg._slotnames` names them, mangled) through `setattr`. The mirror
-    // of a subclass does not inherit its base's slots, so a value is routed by
-    // the NATIVE class's slots, wherever the mirror instance kept it.
+    // `copyreg._slotnames` names them, mangled) through `setattr`. A value is
+    // routed by the NATIVE class's slots, wherever the mirror instance kept it
+    // (a slot descriptor of its own or an inherited one, or its `__dict__`).
     let mut dict_attrs: Vec<(Bound<PyAny>, Bound<PyAny>)> = Vec::new();
     if let Ok(dict) = obj.getattr("__dict__") {
         if let Ok(dict) = dict.cast::<PyDict>() {
@@ -4635,12 +4659,37 @@ pub fn to_float(id: u32) -> Result<f64, String> {
 /// of a pythonrs instance or class, and those getters borrow the host, so a
 /// borrow held across the call was a `RefCell already borrowed` panic for
 /// `isinstance(C(), Base)` after `Base.register(C)`.
+///
+/// A native instance against an ABC is answered by `issubclass(obj.__class__,
+/// abc)` — the class's mirror against the ABC. `ABCMeta.__instancecheck__`
+/// asks that first and then, when it is false, asks the same of
+/// `type(instance)`: here the proxy type, whose own `__hash__` made every
+/// native object `Hashable`, a class with `__eq__` and no `__hash__` included.
+/// The second question is about the proxy, not the program's object, so it is
+/// not asked. A class with another metaclass (`typing.Protocol`, `enum`) keeps
+/// CPython's full `isinstance`, whose hooks may look at the instance itself.
 pub fn isinstance_foreign(v: &Value, cls_id: u32) -> Result<bool, String> {
     Python::attach(|py| {
         let obj = with_host(|h| value_to_py(h, py, v))?;
         let cls = fetch(py, cls_id)?;
+        if obj.is_instance_of::<PyrsInstance>() && is_plain_abc(py, &cls) {
+            let class = obj.getattr("__class__").map_err(|e| e.to_string())?;
+            return class
+                .cast::<pyo3::types::PyType>()
+                .map_err(|e| e.to_string())?
+                .is_subclass(&cls)
+                .map_err(|e| e.to_string());
+        }
         obj.is_instance(&cls).map_err(|e| e.to_string())
     })
+}
+
+/// Whether `cls`'s metaclass is `abc.ABCMeta` itself (not a subclass of it).
+fn is_plain_abc(py: Python, cls: &Bound<PyAny>) -> bool {
+    py.import("abc")
+        .and_then(|m| m.getattr("ABCMeta"))
+        .map(|meta| cls.get_type().is(&meta))
+        .unwrap_or(false)
 }
 
 /// `issubclass(sub, cls)` where either side is a CPython object behind a handle

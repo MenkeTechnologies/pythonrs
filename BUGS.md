@@ -2507,6 +2507,20 @@ written.
   still being marshalled), and reading, storing or deleting an attribute of a
   CPython object releases the host borrow while CPython runs, so the pythonrs
   accessors can re-enter (`RefCell already borrowed` otherwise).
+- **A class mirror carries its native bases, and an ABC judges a native
+  instance by its class.** A mirror was built over `(object,)`, so no mirror was
+  a subclass of another: `Base.register(C)` covered `C` but not `class D(C)`
+  (`ABCMeta` asks `issubclass` of the two mirrors), an ABC's structural check
+  and a runtime-checkable `Protocol` missed a dunder a subclass inherits
+  (`isinstance(Child(), Sized)` was `False`), and `inspect.getmro(D)` stopped at
+  `object`. The native bases now cross as their own mirrors (a builtin or
+  CPython-built base is left out, as it would demand its own layout or
+  metaclass), with the base's `__init_subclass__` kept off the mirror so
+  CPython's class creation does not run the program's hook again. And
+  `ABCMeta.__instancecheck__` falls back to `type(instance)` — the proxy type,
+  whose own `__hash__` made every native object `Hashable` — so a native
+  instance against a plain ABC is now answered by `issubclass(obj.__class__,
+  abc)` alone: a class with `__eq__` and no `__hash__` is not `Hashable`.
 
 ## Implemented — async/await/asyncio (native fusevm event loop)
 - **`async def` / `await` / `asyncio`.** `async def f()` returns a real coroutine
@@ -2549,13 +2563,6 @@ written.
   `inspect.isgeneratorfunction(f)` raises `cannot pass 'code' to a CPython
   stdlib call`; a nested unpacking target
   (`a, (b, c) = 1, (2,)`) carets the outer target, CPython the inner one.
-- **A registered virtual subclass is not inherited by its subclasses.**
-  `Base.register(C)` makes `isinstance(C(), Base)` true (see Implemented), but
-  for `class D(C)` the check is `False` (CPython `True`): `ABCMeta` asks CPython's
-  `issubclass(D, C)` of the two classes' mirrors, and a mirror is built over
-  `(object,)` with no bases, so no mirror is a subclass of another. Carrying the
-  native bases into the mirror is the fix, and a change to what `@dataclass`,
-  `pickle` and every other CPython consumer of a mirror sees.
 - **A builtin container iterator walks a snapshot.** `iter(list)`, `iter(dict)`
   and the other `IterState::Seq`/`DictKeys` cursors copy the items when the
   iterator is made, so `L = [1, 2]; it = iter(L); L.append(3); list(it)` is

@@ -4041,3 +4041,121 @@ r += [d.a, d.c, d.c, inspect.isclass(A)]
 ";
     assert_eq!(g(src, "r"), "[6, 'D(a=3)', 'pdoc', 5, 105, 105, True]");
 }
+
+#[cfg(feature = "stdlib-ffi")]
+#[test]
+fn a_class_mirror_carries_its_native_bases() {
+    // Regression: a class crossed into CPython as a mirror over `(object,)`,
+    // so no mirror was a subclass of another. `Base.register(C)` then covered
+    // `C` but not `class D(C)`; an ABC's structural check (`Sized`, a
+    // runtime-checkable `Protocol`) missed a dunder a subclass inherits; and
+    // `inspect.getmro(E)` stopped at `object`. The native bases now cross as
+    // their own mirrors.
+    let src = "\
+from abc import ABC
+import collections.abc, inspect, numbers
+from typing import Protocol, runtime_checkable
+class Base(ABC): pass
+class C: pass
+class D(C): pass
+class E(D): pass
+Base.register(C)
+class Num: pass
+numbers.Number.register(Num)
+class SubNum(Num): pass
+class HasLen:
+    def __len__(self): return 2
+    def __iter__(self): return iter(())
+class Child(HasLen): pass
+@runtime_checkable
+class Quacks(Protocol):
+    def quack(self) -> str: ...
+class Duck:
+    def quack(self): return 'q'
+class Duckling(Duck): pass
+r = [
+    isinstance(D(), Base),
+    isinstance(E(), Base),
+    issubclass(E, Base),
+    isinstance(C(), Base),
+    isinstance(SubNum(), numbers.Number),
+    isinstance(Child(), collections.abc.Sized),
+    isinstance(Child(), collections.abc.Iterable),
+    isinstance(Child(), collections.abc.Sequence),
+    isinstance(Duckling(), Quacks),
+    isinstance(HasLen(), Quacks),
+    inspect.getmro(E) == (E, D, C, object),
+]";
+    assert_eq!(
+        g(src, "r"),
+        "[True, True, True, True, True, True, True, False, True, False, True]"
+    );
+}
+
+#[cfg(feature = "stdlib-ffi")]
+#[test]
+fn abc_hashable_is_decided_by_the_class_not_the_proxy() {
+    // Regression: `ABCMeta.__instancecheck__` asks `type(instance)` once
+    // `instance.__class__` says no, and `type(instance)` is the proxy type,
+    // whose own `__hash__` made every native object `Hashable` — a class with
+    // `__eq__` and no `__hash__`, or `__hash__ = None`, included. A native
+    // instance against an ABC is now answered by its class alone.
+    let src = "\
+from collections.abc import Hashable
+class Plain: pass
+class EqOnly:
+    def __eq__(self, o): return True
+class Explicit:
+    __hash__ = None
+class Inherits(EqOnly): pass
+class Restored(EqOnly):
+    def __hash__(self): return 1
+r = [isinstance(c(), Hashable) for c in (Plain, EqOnly, Explicit, Inherits, Restored)]
+r.append(issubclass(Inherits, Hashable))
+";
+    assert_eq!(g(src, "r"), "[True, False, False, False, True, False]");
+}
+
+#[cfg(feature = "stdlib-ffi")]
+#[test]
+fn a_subclass_mirror_inherits_without_rerunning_init_subclass() {
+    // Building a subclass's mirror over its base's mirror runs CPython's
+    // class creation, which calls the base's `__init_subclass__`: the program's
+    // hook must not run a second time, on the mirror (it was `RefCell already
+    // borrowed`, and would have re-registered the class). Inherited `__slots__`
+    // and dataclass fields still round-trip through `pickle` and `fields()`.
+    let src = "\
+import pickle, dataclasses
+REG = []
+class Plugin:
+    def __init_subclass__(cls, **kw):
+        super().__init_subclass__(**kw)
+        REG.append(cls.__name__)
+class A(Plugin):
+    def __init__(self, x): self.x = x
+class B(A): pass
+b2 = pickle.loads(pickle.dumps(B(3)))
+class S1:
+    __slots__ = ('a',)
+    def __init__(self): self.a = 1
+class S2(S1):
+    __slots__ = ('b',)
+    def __init__(self):
+        super().__init__()
+        self.b = 2
+s = pickle.loads(pickle.dumps(S2()))
+@dataclasses.dataclass
+class P:
+    x: int
+    y: int = 0
+@dataclasses.dataclass
+class Q(P):
+    z: int = 5
+r = [type(b2).__name__, b2.x, REG, type(s).__name__, s.a, s.b,
+     [f.name for f in dataclasses.fields(Q)], repr(Q(1, 2)), Q(1) == Q(1, 0, 5)]
+";
+    assert_eq!(
+        g(src, "r"),
+        "['B', 3, ['A', 'B'], 'S2', 1, 2, ['x', 'y', 'z'], 'Q(x=1, y=2, z=5)', True]"
+    );
+}
