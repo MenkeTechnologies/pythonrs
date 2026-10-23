@@ -388,6 +388,16 @@ fn get_attr_desc(recv: &Value, name: &str) -> Result<Value, String> {
 /// descriptor > instance dict > non-data descriptor / class attr). Does NOT
 /// consult a user `__getattribute__` override or the `__getattr__` fallback.
 pub(crate) fn raw_getattr(recv: &Value, name: &str) -> Result<Value, String> {
+    // A CPython object's attribute is CPython's lookup, which may call back
+    // into pythonrs (a property getter), so it runs outside the host borrow.
+    #[cfg(feature = "stdlib-ffi")]
+    if let Some(id) = with_host(|h| h.foreign_id(recv)) {
+        let r = crate::ffi::get_attr_released(id, name);
+        if let Err(e) = &r {
+            with_host(|h| h.note_attr_miss(e, recv, name, true));
+        }
+        return r;
+    }
     match with_host(|h| h.plan_attr_get(recv, name)) {
         host::AttrGet::Property { fget, inst, owner } => {
             if matches!(fget, Value::Undef) {
@@ -587,6 +597,12 @@ fn set_attr_desc(recv: &Value, name: &str, val: Value) -> Result<(), String> {
 /// (`property.fset`, user `__set__`) then a plain instance-dict store
 /// (honoring `__slots__`). Does not consult a user `__setattr__`.
 pub(crate) fn raw_setattr(recv: &Value, name: &str, val: Value) -> Result<(), String> {
+    // A CPython object stores through CPython, outside the host borrow (a
+    // property setter may be a pythonrs callback); see `raw_getattr`.
+    #[cfg(feature = "stdlib-ffi")]
+    if let Some(id) = with_host(|h| h.foreign_id(recv)) {
+        return crate::ffi::set_attr_released(id, name, &val);
+    }
     match with_host(|h| h.plan_attr_set(recv, name, &val)) {
         host::AttrSet::Property {
             fset,
@@ -649,6 +665,10 @@ fn del_attr_desc(recv: &Value, name: &str) -> Result<(), String> {
 /// (`property.fdel`, user `__delete__`) then a plain instance-dict deletion.
 /// Does not consult a user `__delattr__`.
 pub(crate) fn raw_delattr(recv: &Value, name: &str) -> Result<(), String> {
+    #[cfg(feature = "stdlib-ffi")]
+    if let Some(id) = with_host(|h| h.foreign_id(recv)) {
+        return crate::ffi::del_attr_released(id, name);
+    }
     match with_host(|h| h.plan_attr_del(recv, name)) {
         host::AttrDel::Property { fdel, inst, owner } => {
             if matches!(fdel, Value::Undef) {

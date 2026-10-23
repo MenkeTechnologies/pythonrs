@@ -4007,3 +4007,37 @@ r = [
         "[True, True, False, False, False, True, True, True, False]"
     );
 }
+
+#[cfg(feature = "stdlib-ffi")]
+#[test]
+fn a_class_with_a_property_crosses_into_a_cpython_call() {
+    // Regression: a class mirror marshalled every namespace member, and a
+    // `property` or `cached_property` had no CPython form, so `@dataclass` on
+    // a class with one -- or `inspect.isclass(C)` -- raised `cannot pass
+    // 'property' to a CPython stdlib call`. They cross as CPython's own over
+    // callbacks; reading, storing and caching through them on the resulting
+    // CPython instance run the pythonrs accessors with the host borrow
+    // released (a held borrow was `RefCell already borrowed`).
+    let src = "\
+import dataclasses, functools, inspect
+@dataclasses.dataclass
+class D:
+    a: int
+    @property
+    def p(self):
+        'pdoc'
+        return self.a * 2
+    @p.setter
+    def p(self, v): self.a = v // 2
+    @functools.cached_property
+    def c(self): return self.a + 100
+class A:
+    @property
+    def p(self): return 1
+d = D(3)
+r = [d.p, repr(d), D.p.__doc__]
+d.p = 10
+r += [d.a, d.c, d.c, inspect.isclass(A)]
+";
+    assert_eq!(g(src, "r"), "[6, 'D(a=3)', 'pdoc', 5, 105, 105, True]");
+}

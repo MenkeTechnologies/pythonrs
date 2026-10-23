@@ -2498,6 +2498,16 @@ written.
   `int.__init_subclass__() takes no arguments (1 given)`), where reading them
   gave an unbound slot wrapper.
 
+- **A class with a `property` crosses into a CPython call.** A class mirror
+  marshals every namespace member, and a `property` or `cached_property` had
+  no CPython form, so `@dataclass` on a class with one, and
+  `inspect.isclass(C)`, raised `cannot pass 'property' to a CPython stdlib
+  call`. Both cross as CPython's own over callbacks (their getter's
+  `__doc__`/`__module__` filled in, since CPython reads them while the mirror is
+  still being marshalled), and reading, storing or deleting an attribute of a
+  CPython object releases the host borrow while CPython runs, so the pythonrs
+  accessors can re-enter (`RefCell already borrowed` otherwise).
+
 ## Implemented — async/await/asyncio (native fusevm event loop)
 - **`async def` / `await` / `asyncio`.** `async def f()` returns a real coroutine
   object (`type(f()).__name__ == 'coroutine'`; the body does **not** run on call),
@@ -3204,6 +3214,11 @@ entry. These remain open:
   `__suppress_context__`, `__traceback__` and `args`, and each subclass its own
   members (`OSError`'s `errno`, `strerror`, `filename`, `filename2`,
   `characters_written`; `SyntaxError`'s position fields; …).
+- **`inspect` on pythonrs functions and instances over the bridge.**
+  `inspect.signature(A.f)` raises `cannot pass 'code' to a CPython stdlib
+  call` (it reads `__code__` off the callback proxy), and
+  `inspect.getattr_static(A(), 'p')` raises `AttributeError: p`, because a
+  pythonrs instance crosses as a proxy whose type carries no class namespace.
 
 ### Round 2 batched differential fuzz (`tests/batch_fuzz.rs`)
 

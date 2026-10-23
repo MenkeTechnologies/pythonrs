@@ -1778,6 +1778,41 @@ fn callable_proxy<'py>(
     Ok(proxy.into_bound(py))
 }
 
+/// A property or `cached_property` accessor crossing into CPython: a callback
+/// into the pythonrs function whose `__doc__` is already filled in. CPython's
+/// `property()` and `cached_property()` read the getter's `__doc__` (and
+/// `cached_property` its `__module__`) while the
+/// mirror is still being marshalled, with the host borrowed, so the proxy
+/// cannot ask the host for it then.
+fn accessor_proxy<'py>(
+    host: &PyHost,
+    py: Python<'py>,
+    f: &Value,
+) -> Result<Bound<'py, PyAny>, String> {
+    let Some(PyObj::Func(fv)) = host.get(f) else {
+        return value_to_py(host, py, f);
+    };
+    let doc = match host.funcs.get(fv.def_id).and_then(|d| d.doc.clone()) {
+        Some(s) => PyString::new(py, &s).into_any().unbind(),
+        None => py.None(),
+    };
+    let module = match host
+        .module_global(fv.module, "__name__")
+        .and_then(|m| host.as_str(&m))
+    {
+        Some(s) => PyString::new(py, &s).into_any().unbind(),
+        None => py.None(),
+    };
+    let proxy = PyrsCallable {
+        target: f.clone(),
+        doc: Some(doc),
+        module: Some(module),
+    };
+    Py::new(py, proxy)
+        .map(|p| p.into_any().into_bound(py))
+        .map_err(|e| e.to_string())
+}
+
 /// A CPython instance of a pristine mirror — made by `object.__new__(mirror)`,
 /// which is how `pickle` (`copyreg.__newobj__`, `copyreg._reconstructor`)
 /// rebuilds an object before restoring its state — crosses back as an instance
@@ -2302,6 +2337,31 @@ fn value_to_py_node<'py>(
                     .and_then(|u| u.get_item(tup))
                     .map_err(|e| e.to_string())
             }
+            // A `property` (a class-namespace member crossing in a mirror, so
+            // `@dataclass` and `inspect` see a class that has one) crosses as
+            // CPython's own `property` over its accessors, each a callback
+            // into the pythonrs function.
+            Some(PyObj::Property {
+                fget, fset, fdel, ..
+            }) => {
+                let (fget, fset, fdel) = (fget.clone(), fset.clone(), fdel.clone());
+                let pget = accessor_proxy(host, py, &fget)?;
+                let pset = accessor_proxy(host, py, &fset)?;
+                let pdel = accessor_proxy(host, py, &fdel)?;
+                py.import("builtins")
+                    .and_then(|m| m.getattr("property"))
+                    .and_then(|p| p.call1((pget, pset, pdel)))
+                    .map_err(|e| e.to_string())
+            }
+            // Likewise a `functools.cached_property`; the class it lands in
+            // names it through `__set_name__`.
+            Some(PyObj::CachedProperty { func, .. }) => {
+                let pfunc = accessor_proxy(host, py, &func.clone())?;
+                py.import("functools")
+                    .and_then(|m| m.getattr("cached_property"))
+                    .and_then(|p| p.call1((pfunc,)))
+                    .map_err(|e| e.to_string())
+            }
             _ => Err(crate::host::type_error(&format!(
                 "cannot pass '{}' to a CPython stdlib call",
                 host.type_name(v)
@@ -2558,6 +2618,26 @@ pub fn get_attr(host: &mut PyHost, id: u32, name: &str) -> Result<Value, String>
     })
 }
 
+/// [`get_attr`] with the host borrow released while CPython looks the name
+/// up: the lookup can run pythonrs code -- a `property` or `cached_property`
+/// a class mirror carried over (a `@dataclass` with a property), or any other
+/// descriptor whose accessor is a pythonrs callback -- and that code borrows
+/// the host. Only the result is converted under the borrow.
+pub fn get_attr_released(id: u32, name: &str) -> Result<Value, String> {
+    Python::attach(|py| {
+        let obj = fetch(py, id)?;
+        if native_traceback_entry(&obj, name) {
+            return Ok(with_host(|h| {
+                h.alloc(PyObj::Builtin(format!("traceback.{name}")))
+            }));
+        }
+        match obj.getattr(name) {
+            Ok(attr) => with_host(|h| reference_to_value(h, py, &attr)),
+            Err(e) => Err(with_host(|h| pyerr_to_error_h(h, py, &e))),
+        }
+    })
+}
+
 /// `dir(foreign)` — CPython's own `dir()` for a bridged object, so a module's
 /// or an instance's real attribute list is what a caller sees. Returns an empty
 /// list rather than an error if CPython declines: `dir()` never raises.
@@ -2586,6 +2666,26 @@ pub fn set_attr(host: &mut PyHost, id: u32, name: &str, value: &Value) -> Result
         let v = value_to_py(host, py, value)?;
         obj.setattr(name, v)
             .map_err(|e| pyerr_to_error_h(host, py, &e))
+    })
+}
+
+/// [`set_attr`] and [`del_attr`] with the host borrow released while CPython
+/// stores or deletes, as [`get_attr_released`] reads: a property setter or
+/// deleter carried over in a class mirror is a pythonrs callback.
+pub fn set_attr_released(id: u32, name: &str, value: &Value) -> Result<(), String> {
+    Python::attach(|py| {
+        let obj = fetch(py, id)?;
+        let v = with_host(|h| value_to_py(h, py, value))?;
+        obj.setattr(name, v)
+            .map_err(|e| with_host(|h| pyerr_to_error_h(h, py, &e)))
+    })
+}
+
+pub fn del_attr_released(id: u32, name: &str) -> Result<(), String> {
+    Python::attach(|py| {
+        let obj = fetch(py, id)?;
+        obj.delattr(name)
+            .map_err(|e| with_host(|h| pyerr_to_error_h(h, py, &e)))
     })
 }
 
