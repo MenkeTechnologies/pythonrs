@@ -9,6 +9,24 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **An exception escaping a generator keeps its identity.** The body's
+  in-flight exception sat on the generator's swapped-out context, so the
+  resumer re-formed it from its message: `raise ValueError(1, 2)` was caught as
+  `ValueError('(1, 2)')`, `e is x` was False, and an `ExceptionGroup` lost its
+  members (so `except*` never matched one raised in a coroutine).
+- **asyncio's Python-level half**: `asyncio.timeout`/`Timeout`, `TaskGroup`,
+  `current_task`, `to_thread` and `iscoroutinefunction` (warning at the
+  caller's line) exist, compiled over the native loop. A Task is one object
+  (`current_task() is current_task()`) and hashable.
+- **An unawaited coroutine's `RuntimeWarning`** prints CPython's
+  `file:line: RuntimeWarning: …`, the source line and the tracemalloc hint
+  (the line is where the coroutine was made).
+- **An explicit CPython `metaclass=`** (a class derived from `abc.ABCMeta` or
+  `enum.EnumType`) builds the class through CPython, with or without a CPython
+  base; it was ignored.
+- **A custom `__builtins__` dict** in `exec`/`eval` globals supplies the
+  builtins.
+- **`f'{x!=}'`** points at the `!=` (the expression's last token).
 - **Class keywords reach a CPython metaclass.** `class TD(TypedDict,
   total=False)` built a total TypedDict and `class F(enum.Flag,
   boundary=enum.STRICT)` lost its boundary: a class with a CPython base was
@@ -3324,23 +3342,11 @@ entry. These remain open:
   namespace (and refreshed with it, as class mirrors are).
 - **A strided memoryview slice is a read-only copy.** `memoryview(ba)[::2]`
   over a `bytearray` is `readonly` and writes through it do not reach `ba`.
-- **asyncio surface still missing**: `asyncio.timeout`, `TaskGroup`,
-  `current_task`, `to_thread` and `iscoroutinefunction` (with its 3.14
-  `DeprecationWarning`) are not in the native module, and an unawaited
-  coroutine's `RuntimeWarning` prints at exit without CPython's location and
-  tracemalloc lines.
-- **A custom `__builtins__` in an `exec`/`eval` globals dict is ignored**
-  (`eval("len([1])", {"__builtins__": {"len": f}})` uses the real `len`).
 - **`weakref` on pythonrs objects.** `weakref.ref(obj)` of a native instance
   raises `cannot create weak reference to 'builtins.PyrsInstance' object`:
   `weakref` is CPython's, and a native object crosses as a proxy. A native
   `_weakref` (refs the tracing collector clears, with callbacks run after a
   sweep) is the fix; `WeakValueDictionary`/`WeakSet`/`finalize` follow from it.
-- **An explicit `metaclass=` beside a CPython base is ignored.** `class
-  E2(enum.Enum, metaclass=M)` with `class M(enum.EnumType)` builds an
-  `EnumType` class, not an `M` one.
-- **`f'{x!=}'`** reports `expecting '=', or '!', or ':', or '}'` one column
-  right of CPython (offset 6, CPython 5).
 
 ### Round 2 batched differential fuzz (`tests/batch_fuzz.rs`)
 
