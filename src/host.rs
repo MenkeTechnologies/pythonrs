@@ -13437,6 +13437,17 @@ impl PyHost {
                         }
                     }
                 }
+                // The `__weakref__` getset a class in the MRO installed reads
+                // the instance's weak-reference list head: `None` while no
+                // `weakref.ref` points at it.
+                if name == "__weakref__"
+                    && self
+                        .mro_rc(&class)
+                        .iter()
+                        .any(|c| self.classes.contains_key(c) && self.class_adds_dict_weakref(c).1)
+                {
+                    return Ok(Value::Undef);
+                }
                 // An inherited `object` slot reached on an instance (`obj.__str__`)
                 // with no user override is a bound method-wrapper, as in CPython.
                 if OBJECT_SLOT_WRAPPERS.contains(&name) {
@@ -13568,22 +13579,43 @@ impl PyHost {
                         .get(&cname)
                         .map(|cd| cd.ns.clone())
                         .unwrap_or_default();
-                    let mut d: DictMap = DictMap::default();
-                    for (k, val) in ns {
-                        let kv = self.new_str(k.clone());
-                        d.insert(PKey::Str(k), (kv, val));
-                    }
+                    let mut entries: Vec<(String, Value)> = ns.into_iter().collect();
+                    // A `__doc__` the body never stored is `type_new`'s default,
+                    // added after the descriptors below.
+                    let default_doc = match entries.last() {
+                        Some((k, _)) if k == "__doc__" => entries.pop(),
+                        _ => None,
+                    };
                     // The member descriptor of each slot the class itself
                     // declares, in sorted order as `type_new` installs them.
                     let mut slots = self.own_slots(&cname).unwrap_or_default();
                     slots.sort();
                     for s in slots {
                         if let Some(member) = self.slot_member(&cname, &s) {
-                            let kv = self.new_str(s.clone());
-                            d.insert(PKey::Str(s), (kv, member));
+                            entries.push((s, member));
                         }
                     }
-                    return Ok(self.new_dict(d));
+                    // Then the `__dict__`/`__weakref__` getsets the class adds.
+                    let (add_dict, add_weak) = self.class_adds_dict_weakref(&cname);
+                    let disp = self.class_display_name(&cname);
+                    for (attr, add) in [("__dict__", add_dict), ("__weakref__", add_weak)] {
+                        if add {
+                            let desc = self.alloc(PyObj::Descriptor {
+                                kind: DescKind::GetSetDescriptor,
+                                qual: format!("{disp}.{attr}"),
+                                recv: None,
+                            });
+                            entries.push((attr.to_string(), desc));
+                        }
+                    }
+                    entries.extend(default_doc);
+                    let mut d: DictMap = DictMap::default();
+                    for (k, val) in entries {
+                        let kv = self.new_str(k.clone());
+                        d.insert(PKey::Str(k), (kv, val));
+                    }
+                    let dict = self.alloc(PyObj::Dict(d));
+                    return Ok(self.alloc(PyObj::MappingProxy { dict }));
                 }
                 if let Some(member) = self.slot_member(&cname, name) {
                     return Ok(member);
@@ -13653,6 +13685,14 @@ impl PyHost {
                             return Ok(v);
                         }
                     }
+                }
+                // `object`'s two classmethods, bound to the class.
+                if matches!(name, "__subclasshook__" | "__init_subclass__") {
+                    let func = self.alloc(PyObj::Builtin(format!("{OBJECT_CLASSMETHOD}{name}")));
+                    return Ok(self.alloc(PyObj::BoundMethod {
+                        recv: recv.clone(),
+                        func,
+                    }));
                 }
                 // An inherited object-slot dunder reached on the class object with
                 // no override (`C.__ne__`, `C.__repr__`) is the unbound slot
@@ -14661,8 +14701,13 @@ impl PyHost {
             {
                 let mut mro = crate::builtins::builtin_mro(n);
                 if name == "__bases__" {
-                    // Immediate bases: everything after self (usually just object).
+                    // The immediate bases only -- a builtin type has one, the next
+                    // class of its MRO (`bool.__bases__` is `(int,)`, not
+                    // `(int, object)`), except `ExceptionGroup`'s two and
+                    // `object`'s none.
                     mro.remove(0);
+                    let n_bases = if n == crate::excgroup::GROUP { 2 } else { 1 };
+                    mro.truncate(n_bases);
                 }
                 let vals: Vec<Value> = mro
                     .into_iter()
@@ -14758,6 +14803,17 @@ impl PyHost {
                     kind: DescKind::MemberDescriptor,
                     qual: "function.__globals__".into(),
                     recv: None,
+                }))
+            }
+            // `object`'s two classmethods, bound to the builtin type.
+            Some(PyObj::Builtin(n))
+                if crate::builtins::is_type_like_builtin(n)
+                    && matches!(name, "__subclasshook__" | "__init_subclass__") =>
+            {
+                let func = self.alloc(PyObj::Builtin(format!("{OBJECT_CLASSMETHOD}{name}")));
+                Ok(self.alloc(PyObj::BoundMethod {
+                    recv: recv.clone(),
+                    func,
                 }))
             }
             // A dunder slot reached on a builtin type object (`object.__init__`)
@@ -15214,13 +15270,23 @@ impl PyHost {
     }
 
     fn collect_class_dir(&self, class: &str, set: &mut BTreeSet<String>) {
-        let mut any_user = false;
         for c in self.mro_of(class) {
             if let Some(cd) = self.classes.get(&c) {
-                any_user = true;
                 for k in cd.ns.keys() {
                     set.insert(k.clone());
                 }
+                // The instance-dict machinery `object` itself does not have:
+                // the `__dict__`/`__weakref__` getsets this class installed.
+                let (dict, weak) = self.class_adds_dict_weakref(&c);
+                if dict {
+                    set.insert("__dict__".into());
+                }
+                if weak {
+                    set.insert("__weakref__".into());
+                }
+            } else if crate::builtins::is_exception_class(&c) {
+                // `BaseException` carries its own `__dict__` getset.
+                set.insert("__dict__".into());
             }
             // Each slot is a member descriptor in its declaring class's
             // `__dict__` — listed even when a `"__dict__"` entry leaves the
@@ -15233,11 +15299,6 @@ impl PyHost {
         // user namespace at all, came back EMPTY.
         for n in crate::builtins::OBJECT_DUNDERS {
             set.insert(n.to_string());
-        }
-        // A user class also carries the instance-dict machinery `object` itself
-        // does not have; `object()` must stay at exactly `object`'s 24 names.
-        if any_user {
-            set.insert("__dict__".into());
         }
     }
 
@@ -15366,6 +15427,46 @@ impl PyHost {
                 .map(|s| crate::mangle::mangle(c, &s).unwrap_or(s))
                 .collect(),
         )
+    }
+
+    /// Whether user class `c` installs the `__dict__` and `__weakref__`
+    /// getsets in its own namespace (`type_new_descriptors` in
+    /// `Objects/typeobject.c`). Each is added when the class asks for it --
+    /// no `__slots__`, or a `__slots__` naming it -- and no base already
+    /// provides it. A base provides a dict when it is a user class that kept
+    /// one, an exception, `type` or `OrderedDict`; weak references when it is
+    /// a user class that kept them, `type`, `OrderedDict`, a set or a deque.
+    /// A variable-size base (`int`, `tuple`, `bytes`) admits no
+    /// `__weakref__` at all.
+    fn class_adds_dict_weakref(&self, c: &str) -> (bool, bool) {
+        let (mut want_dict, mut want_weak) = match self.own_slots(c) {
+            Some(slots) => (
+                slots.iter().any(|s| s == "__dict__"),
+                slots.iter().any(|s| s == "__weakref__"),
+            ),
+            None => (true, true),
+        };
+        for base in self.mro_rc(c).iter().skip(1) {
+            let (has_dict, has_weak) = if self.classes.contains_key(base) {
+                match self.own_slots(base) {
+                    Some(slots) => (
+                        slots.iter().any(|s| s == "__dict__"),
+                        slots.iter().any(|s| s == "__weakref__"),
+                    ),
+                    None => (true, true),
+                }
+            } else {
+                match crate::builtins::native_type_key(base) {
+                    "type" | "OrderedDict" => (true, true),
+                    "set" | "frozenset" | "deque" => (false, true),
+                    "int" | "bool" | "tuple" | "bytes" => (false, true),
+                    b => (crate::builtins::is_exception_class(b), false),
+                }
+            };
+            want_dict &= !has_dict;
+            want_weak &= !has_weak;
+        }
+        (want_dict, want_weak)
     }
 
     /// `descr_check` for a `__slots__` member reached by hand
@@ -16538,6 +16639,9 @@ fn invoke_object(
                     }
                     if let Some(qual) = name.strip_prefix(SUBCLASS_CLASSMETHOD) {
                         return subclass_classmethod(&recv, qual, args, kwargs);
+                    }
+                    if let Some(m) = name.strip_prefix(OBJECT_CLASSMETHOD) {
+                        return object_classmethod(&recv, m, args, kwargs);
                     }
                     // A native `_random.Random` method bound to an instance.
                     if let Some(m) = name.strip_prefix("_random.Random.") {
@@ -18090,11 +18194,8 @@ fn call_method_inner(
             // tells `ABCMeta.__subclasscheck__` to fall through to the ordinary
             // MRO/registry check — `numbers.Complex.register(complex)` is the first
             // thing `decimal` does, and it goes straight through this hook.
-            if name == "__subclasshook__" {
-                return Ok(with_host(|h| h.alloc(PyObj::NotImplemented)));
-            }
-            if name == "__init_subclass__" {
-                return Ok(Value::Undef);
+            if matches!(name, "__subclasshook__" | "__init_subclass__") {
+                return object_classmethod(recv, name, args, kwargs);
             }
             // The `type` surface a class inherits — `A.mro()`,
             // `A.__instancecheck__(x)`, `A.__call__()`. LAST, after both the
@@ -18451,6 +18552,49 @@ fn super_lookup(h: &PyHost, owner: &str, inst_class: &str, name: &str) -> Option
         }
     }
     None
+}
+
+/// The `PyObj::Builtin` name prefix of `object.__subclasshook__` /
+/// `object.__init_subclass__` bound to a class.
+const OBJECT_CLASSMETHOD: &str = "__object_classmethod__.";
+
+/// `object.__subclasshook__(cls, subclass)` and `object.__init_subclass__(cls)`
+/// (`object_subclasshook` / `object_init_subclass` in `Objects/typeobject.c`):
+/// the hook never decides (`NotImplemented`) and the PEP 487 default does
+/// nothing. Each checks its arguments as a `METH_O` / `METH_NOARGS` function,
+/// naming the class it is bound to.
+fn object_classmethod(
+    cls: &Value,
+    name: &str,
+    args: Vec<Value>,
+    kwargs: Vec<(String, Value)>,
+) -> Result<Value, String> {
+    let cname = with_host(|h| match h.get(cls) {
+        Some(PyObj::Class(c)) => h.class_display_name(c),
+        Some(PyObj::Builtin(b)) => b.clone(),
+        _ => "object".to_string(),
+    });
+    if !kwargs.is_empty() {
+        return Err(type_error(&format!(
+            "{cname}.{name}() takes no keyword arguments"
+        )));
+    }
+    if name == "__subclasshook__" {
+        if args.len() != 1 {
+            return Err(type_error(&format!(
+                "{cname}.__subclasshook__() takes exactly one argument ({} given)",
+                args.len()
+            )));
+        }
+        return Ok(with_host(|h| h.alloc(PyObj::NotImplemented)));
+    }
+    if !args.is_empty() {
+        return Err(type_error(&format!(
+            "{cname}.__init_subclass__() takes no arguments ({} given)",
+            args.len()
+        )));
+    }
+    Ok(Value::Undef)
 }
 
 /// The `PyObj::Builtin` name prefix of a builtin type's alternate constructor
@@ -19933,6 +20077,18 @@ fn run_class_body(
     for (k, v) in seed {
         env.borrow_mut().vars.insert(k.clone(), v.clone());
     }
+    // The body's first store is `__module__ = __name__` (CPython's
+    // `codegen_class_body`), so it leads the namespace and the body can read it.
+    // It names the module the body was DEFINED in (see below).
+    let module_name = with_host(|h| {
+        h.module_globals[fv.module]
+            .get("__name__")
+            .cloned()
+            .unwrap_or_else(|| h.new_str("builtins".to_string()))
+    });
+    env.borrow_mut()
+        .vars
+        .insert("__module__".to_string(), module_name);
     let saved_mod = with_host(|h| {
         let saved = h.swap_module(fv.module);
         h.frames.push(Frame {

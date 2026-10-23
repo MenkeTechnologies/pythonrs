@@ -396,3 +396,88 @@ x = (r1, e.__reduce_ex__(2), v.__reduce__(), Exception.__reduce__(e),
          (<class 'FileNotFoundError'>, (2, 'x', 'f', None, 'g')))"
     );
 }
+
+#[test]
+fn a_class_namespace_carries_the_dunders_class_creation_stores() {
+    // `__module__` and `__firstlineno__` (the first decorator's line) open the
+    // namespace, a docstring follows as `__doc__`, `__static_attributes__`
+    // closes the body, and `type_new` adds the `__dict__`/`__weakref__`
+    // getsets the bases do not already provide, then a default `__doc__`.
+    let src = "\
+def deco(c): return c
+
+@deco
+class A:
+    x = 1
+    def m(self):
+        self.b, self.a = 1, 2
+        self.c += 1
+        def inner(): self.d = 1
+    def n(me): me.e = 1
+class B:
+    'doc'
+    __slots__ = ('s', '__weakref__')
+class E(Exception): pass
+class I(int): pass
+x = (list(A.__dict__), A.__firstlineno__, A.__static_attributes__, list(B.__dict__),
+     [k for k in E.__dict__ if k in ('__dict__', '__weakref__')],
+     [k for k in I.__dict__ if k in ('__dict__', '__weakref__')],
+     type(A.__dict__).__name__, repr(A.__dict__['__weakref__']), A().__weakref__,
+     list(type('X', (), {}).__dict__))
+";
+    assert_eq!(
+        g(src, "x"),
+        "(['__module__', '__firstlineno__', 'x', 'm', 'n', '__static_attributes__', '__dict__', \
+         '__weakref__', '__doc__'], 3, ('a', 'b', 'd'), ['__module__', '__firstlineno__', \
+         '__doc__', '__slots__', '__static_attributes__', 's', '__weakref__'], ['__weakref__'], \
+         ['__dict__'], 'mappingproxy', \"<attribute '__weakref__' of 'A' objects>\", None, \
+         ['__module__', '__dict__', '__weakref__', '__doc__'])"
+    );
+}
+
+#[test]
+fn builtin_type_bases_and_object_classmethods() {
+    // A builtin type lists only its immediate bases; `ExceptionGroup` has two
+    // and linearizes `BaseExceptionGroup` first. `object.__subclasshook__` and
+    // `__init_subclass__` are classmethods that check their arguments.
+    let src = "\
+class A: pass
+errs = []
+for f, a, k in ((object.__subclasshook__, (), {}), (A.__subclasshook__, (1, 2), {}),
+                (int.__init_subclass__, (1,), {}), (A.__init_subclass__, (), {'x': 1})):
+    try:
+        f(*a, **k)
+    except TypeError as e:
+        errs.append(str(e))
+x = (bool.__bases__, KeyError.__bases__, ExceptionGroup.__bases__,
+     [c.__name__ for c in ExceptionGroup.__mro__], A.__subclasshook__(int), errs)
+";
+    assert_eq!(
+        g(src, "x"),
+        "((<class 'int'>,), (<class 'LookupError'>,), (<class 'BaseExceptionGroup'>, \
+         <class 'Exception'>), ['ExceptionGroup', 'BaseExceptionGroup', 'Exception', \
+         'BaseException', 'object'], NotImplemented, \
+         ['object.__subclasshook__() takes exactly one argument (0 given)', \
+         'A.__subclasshook__() takes exactly one argument (2 given)', \
+         'int.__init_subclass__() takes no arguments (1 given)', \
+         'A.__init_subclass__() takes no keyword arguments'])"
+    );
+}
+
+#[test]
+fn dir_lists_the_dict_and_weakref_getsets_a_class_installed() {
+    // A fully slotted class has neither; its unslotted subclass both; an
+    // exception subclass inherits `BaseException`'s `__dict__` and adds only
+    // `__weakref__`.
+    let src = "\
+class Sl: __slots__ = ()
+class Sub(Sl): pass
+class E(Exception): pass
+class I(int): pass
+x = [[n for n in dir(c) if n in ('__dict__', '__weakref__')] for c in (Sl, Sub, E, I)]
+";
+    assert_eq!(
+        g(src, "x"),
+        "[[], ['__dict__', '__weakref__'], ['__dict__', '__weakref__'], ['__dict__']]"
+    );
+}

@@ -2476,6 +2476,28 @@ written.
   `OSError` re-adding the filename(s) it split out of `args`, at every
   `__reduce_ex__` protocol.
 
+- **A class namespace holds what class creation stores in it.** `A.__dict__`
+  was a plain `dict` copy of the body's names with `__module__` last; it is now
+  a `mappingproxy` laid out as CPython's: `__module__` and `__firstlineno__`
+  (the first decorator's line, else the `class` line) first, a docstring as
+  `__doc__`, the body, `__static_attributes__` (the sorted `self.<name>` stores
+  in the functions the class defines, keyed on the literal name `self`), the
+  slot members, the `__dict__`/`__weakref__` getsets a class adds when no
+  base provides them (none past a user base that has them, only `__weakref__`
+  past an exception, only `__dict__` past `int`/`tuple`), and a default
+  `__doc__`. `type('X', (), {})` gets `__module__` and `__doc__` too, and an
+  instance's `__weakref__` reads `None`. `dir()` of a class lists them, and
+  lists `__dict__`/`__weakref__` only where a class in its MRO installed one.
+- **A builtin type's `__bases__` is its immediate bases.** `bool.__bases__`
+  was `(int, object)` and `KeyError.__bases__` its whole ancestry;
+  `ExceptionGroup` now has both `(BaseExceptionGroup, Exception)` and
+  linearizes `BaseExceptionGroup` first.
+- **`object.__subclasshook__` and `object.__init_subclass__` are bound
+  classmethods** that check their arguments
+  (`A.__subclasshook__() takes exactly one argument (0 given)`,
+  `int.__init_subclass__() takes no arguments (1 given)`), where reading them
+  gave an unbound slot wrapper.
+
 ## Implemented — async/await/asyncio (native fusevm event loop)
 - **`async def` / `await` / `asyncio`.** `async def f()` returns a real coroutine
   object (`type(f()).__name__ == 'coroutine'`; the body does **not** run on call),
@@ -3176,6 +3198,12 @@ entry. These remain open:
   '__main__.E'>: it's not the same object as __main__.E` — the exception
   crosses as its CPython mirror class, which is not the object `__main__.E`
   resolves to. A plain user instance pickles.
+- **`dir()` of a builtin exception lists only `object`'s surface and
+  `add_note`/`with_traceback`.** CPython's `dir(Exception)` also has
+  `__cause__`, `__context__`, `__dict__`, `__setstate__`,
+  `__suppress_context__`, `__traceback__` and `args`, and each subclass its own
+  members (`OSError`'s `errno`, `strerror`, `filename`, `filename2`,
+  `characters_written`; `SyntaxError`'s position fields; …).
 
 ### Round 2 batched differential fuzz (`tests/batch_fuzz.rs`)
 

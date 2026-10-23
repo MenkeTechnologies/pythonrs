@@ -6076,6 +6076,12 @@ pub fn builtin_mro(name: &str) -> Vec<String> {
         chain.push("dict".to_string());
     } else if is_exception_class(name) {
         let mut cur = name;
+        // `ExceptionGroup` is the one builtin exception with two bases:
+        // `(BaseExceptionGroup, Exception)` linearize with
+        // `BaseExceptionGroup` first.
+        if name == crate::excgroup::GROUP {
+            chain.push(crate::excgroup::BASE_GROUP.to_string());
+        }
         while let Some((_, parent)) = EXC_PARENTS.iter().find(|(c, _)| *c == cur) {
             chain.push((*parent).to_string());
             cur = parent;
@@ -19749,7 +19755,7 @@ pub fn type_new_meta(
         }
         _ => None,
     });
-    let namespace: host::NameMap =
+    let mut namespace: host::NameMap =
         with_host(|h| match dict_handle.as_ref().and_then(|d| h.get(d)) {
             Some(PyObj::Dict(d)) => d
                 .values()
@@ -19757,6 +19763,34 @@ pub fn type_new_meta(
                 .collect(),
             _ => host::NameMap::default(),
         });
+    // `type_new_set_module` and `type_new_set_doc`: a namespace with no
+    // `__module__` takes the calling frame's `__name__`, and one with no
+    // `__doc__` gets `None` -- what `type('X', (), {})` shows in its
+    // `__dict__`. A class statement's body has stored `__module__` already.
+    if !namespace.contains_key("__module__") {
+        let m = with_host(|h| h.module_global(h.cur_module(), "__name__"));
+        if let Some(m) = m {
+            namespace.insert("__module__".to_string(), m);
+        }
+    }
+    // A `__doc__` slot's member descriptor already fills the entry.
+    let doc_slot = match namespace.get("__slots__") {
+        Some(s) => with_host(|h| h.as_str(s)).map_or_else(
+            || {
+                host::iter_vec(s).is_ok_and(|xs| {
+                    xs.iter()
+                        .any(|x| with_host(|h| h.as_str(x)).as_deref() == Some("__doc__"))
+                })
+            },
+            |s| s == "__doc__",
+        ),
+        None => false,
+    };
+    if !doc_slot {
+        namespace
+            .entry("__doc__".to_string())
+            .or_insert(Value::Undef);
+    }
     with_host(|h| h.check_mro(&base_names))?;
     let cls =
         with_host(|h| h.register_class_meta(&cname, base_names, namespace.clone(), metaclass));

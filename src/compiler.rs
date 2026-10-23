@@ -96,7 +96,8 @@ fn rebase_chunk(chunk: &mut Chunk, func_off: usize, try_off: usize) {
 /// index costs a link, never a wrong jump, or when `dst`'s constant pool is full
 /// (the constants a refused body already added stay in the pool, unread).
 fn relocate_body(body: &Chunk, dst: &mut ChunkBuilder, base: usize) -> Option<Vec<Op>> {
-    if !body.sub_entries.is_empty() || !body.block_ranges.is_empty() || !body.sub_chunks.is_empty() {
+    if !body.sub_entries.is_empty() || !body.block_ranges.is_empty() || !body.sub_chunks.is_empty()
+    {
         return None;
     }
     let mut consts: Vec<Option<u16>> = vec![None; body.constants.len()];
@@ -2793,12 +2794,13 @@ impl Compiler {
         // into its local env; BUILD_CLASS captures that env as the namespace.
         let class_line = self.cur_line;
         let empty = Params::default();
+        let body = self.class_body_with_dunders(body, decorators, class_line);
         self.fn_depth += 1;
         let def_id = self.build_function_qn(
             &format!("<class {name}>"),
             name,
             &empty,
-            body,
+            &body,
             false,
             ScopeKind::ClassBody,
         );
@@ -2842,6 +2844,44 @@ impl Compiler {
         }
         self.store_name(b, name);
         Ok(())
+    }
+
+    /// A class body as CPython's `codegen_class_body` emits it: the stores of
+    /// `__firstlineno__` (the first decorator's line, else the `class` line)
+    /// and the docstring as `__doc__` open it, and `__static_attributes__` --
+    /// the sorted names stored as `self.<name>` in the functions the body
+    /// defines -- closes it. `__module__` comes first of all, seeded by
+    /// `run_class_body`.
+    fn class_body_with_dunders(
+        &self,
+        body: &[Stmt],
+        decorators: &[Expr],
+        class_line: u32,
+    ) -> Vec<Stmt> {
+        let assign = |name: &str, value: Expr| {
+            Stmt::from(StmtKind::Assign {
+                targets: vec![Expr::Name(name.to_string())],
+                value,
+            })
+        };
+        let first_line = decorators
+            .first()
+            .map(|d| d.span().line)
+            .filter(|&l| l > 0)
+            .unwrap_or(class_line);
+        let mut out = Vec::with_capacity(body.len() + 3);
+        out.push(assign("__firstlineno__", Expr::Int(i64::from(first_line))));
+        if let Some(doc) = self.docstring(body) {
+            out.push(assign("__doc__", Expr::Str(doc)));
+        }
+        out.extend(body.iter().cloned());
+        let mut attrs = Vec::new();
+        static_attrs_stmts(body, false, &mut attrs);
+        attrs.sort();
+        attrs.dedup();
+        let attrs = attrs.into_iter().map(Expr::Str).collect();
+        out.push(assign("__static_attributes__", Expr::Tuple(attrs)));
+        out
     }
 
     /// `type NAME[params] = value` (PEP 695). The value compiles into a
@@ -6348,6 +6388,242 @@ enum CompKind {
 /// descend into nested defs/lambdas).
 fn body_has_yield(body: &[Stmt]) -> bool {
     body.iter().any(stmt_has_yield)
+}
+
+/// Collect a class's `__static_attributes__` from `stmts`: every `self.<name>`
+/// stored inside a function the class defines (CPython's
+/// `codegen_add_static_attribute_to_class`, which keys on the literal name
+/// `self` and files the attribute under the nearest enclosing class). `in_func`
+/// is false while still in the class scope itself -- its own statements, the
+/// list/set/dict comprehensions inlined there, and what a `def` or `lambda`
+/// evaluates there (decorators, defaults) -- and true inside any function,
+/// lambda or generator expression. A nested `class` body files its own.
+fn static_attrs_stmts(stmts: &[Stmt], in_func: bool, out: &mut Vec<String>) {
+    let exprs = |es: &[Expr], out: &mut Vec<String>| {
+        es.iter().for_each(|e| static_attrs_expr(e, in_func, out))
+    };
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Expr(e) | StmtKind::Return(Some(e)) => static_attrs_expr(e, in_func, out),
+            StmtKind::Assign { targets, value } => {
+                targets
+                    .iter()
+                    .for_each(|t| static_attrs_target(t, in_func, out));
+                static_attrs_expr(value, in_func, out);
+            }
+            StmtKind::AugAssign { value, .. } => static_attrs_expr(value, in_func, out),
+            StmtKind::AnnAssign {
+                target,
+                value: Some(value),
+                ..
+            } => {
+                static_attrs_target(target, in_func, out);
+                static_attrs_expr(value, in_func, out);
+            }
+            StmtKind::If { test, body, orelse } | StmtKind::While { test, body, orelse } => {
+                static_attrs_expr(test, in_func, out);
+                static_attrs_stmts(body, in_func, out);
+                static_attrs_stmts(orelse, in_func, out);
+            }
+            StmtKind::For {
+                target,
+                iter,
+                body,
+                orelse,
+                ..
+            } => {
+                static_attrs_target(target, in_func, out);
+                static_attrs_expr(iter, in_func, out);
+                static_attrs_stmts(body, in_func, out);
+                static_attrs_stmts(orelse, in_func, out);
+            }
+            StmtKind::With { items, body, .. } => {
+                for it in items {
+                    static_attrs_expr(&it.context, in_func, out);
+                    if let Some(v) = &it.vars {
+                        static_attrs_target(v, in_func, out);
+                    }
+                }
+                static_attrs_stmts(body, in_func, out);
+            }
+            StmtKind::FuncDef {
+                params,
+                body,
+                decorators,
+                ..
+            } => {
+                exprs(decorators, out);
+                exprs(&params.defaults, out);
+                params
+                    .kwonly_defaults
+                    .iter()
+                    .flatten()
+                    .for_each(|e| static_attrs_expr(e, in_func, out));
+                static_attrs_stmts(body, true, out);
+            }
+            StmtKind::ClassDef {
+                bases,
+                keywords,
+                decorators,
+                ..
+            } => {
+                exprs(decorators, out);
+                exprs(bases, out);
+                keywords
+                    .iter()
+                    .for_each(|k| static_attrs_expr(&k.value, in_func, out));
+            }
+            StmtKind::Raise { exc, cause } => {
+                exc.iter()
+                    .chain(cause.iter())
+                    .for_each(|e| static_attrs_expr(e, in_func, out));
+            }
+            StmtKind::Assert { test, msg } => {
+                static_attrs_expr(test, in_func, out);
+                msg.iter().for_each(|e| static_attrs_expr(e, in_func, out));
+            }
+            StmtKind::Try {
+                body,
+                handlers,
+                orelse,
+                finalbody,
+            } => {
+                static_attrs_stmts(body, in_func, out);
+                for h in handlers {
+                    h.typ
+                        .iter()
+                        .for_each(|e| static_attrs_expr(e, in_func, out));
+                    static_attrs_stmts(&h.body, in_func, out);
+                }
+                static_attrs_stmts(orelse, in_func, out);
+                static_attrs_stmts(finalbody, in_func, out);
+            }
+            StmtKind::Match { subject, cases } => {
+                static_attrs_expr(subject, in_func, out);
+                for c in cases {
+                    c.guard
+                        .iter()
+                        .for_each(|e| static_attrs_expr(e, in_func, out));
+                    static_attrs_stmts(&c.body, in_func, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A store target: `self.<name>` counts inside a function; a tuple, list or
+/// starred target is each of its parts; the operands of a subscript or of
+/// any other attribute store are evaluated, not stored.
+fn static_attrs_target(t: &Expr, in_func: bool, out: &mut Vec<String>) {
+    match t.unspanned() {
+        Expr::Attribute(v, name) => {
+            if in_func && matches!(v.unspanned(), Expr::Name(n) if n == "self") {
+                out.push(name.clone());
+            }
+            static_attrs_expr(v, in_func, out);
+        }
+        Expr::Tuple(xs) | Expr::List(xs) => {
+            xs.iter().for_each(|x| static_attrs_target(x, in_func, out))
+        }
+        Expr::Starred(x) => static_attrs_target(x, in_func, out),
+        Expr::Subscript(v, s) => {
+            static_attrs_expr(v, in_func, out);
+            static_attrs_expr(s, in_func, out);
+        }
+        _ => {}
+    }
+}
+
+/// An expression: only comprehension targets store, and a lambda body or a
+/// generator expression past its first iterable is a function scope.
+fn static_attrs_expr(e: &Expr, in_func: bool, out: &mut Vec<String>) {
+    let mut walk = |x: &Expr| static_attrs_expr(x, in_func, out);
+    match e.unspanned() {
+        Expr::List(xs) | Expr::Tuple(xs) | Expr::Set(xs) | Expr::BoolOp(_, xs) => {
+            xs.iter().for_each(walk)
+        }
+        Expr::Dict(kvs) => {
+            for (k, v) in kvs {
+                if let Some(k) = k {
+                    walk(k);
+                }
+                walk(v);
+            }
+        }
+        Expr::FString(parts) | Expr::TString(parts) => static_attrs_fstr(parts, in_func, out),
+        Expr::Starred(x)
+        | Expr::UnaryOp(_, x)
+        | Expr::Await(x)
+        | Expr::YieldFrom(x)
+        | Expr::Yield(Some(x)) => walk(x),
+        Expr::BinOp(_, a, b) | Expr::Subscript(a, b) | Expr::NamedExpr(a, b) => {
+            walk(a);
+            walk(b);
+        }
+        Expr::Compare(a, links) => {
+            walk(a);
+            links.iter().for_each(|(_, x)| walk(x));
+        }
+        Expr::IfExp { test, body, orelse } => {
+            walk(test);
+            walk(body);
+            walk(orelse);
+        }
+        Expr::Call {
+            func,
+            args,
+            keywords,
+        } => {
+            walk(func);
+            args.iter().for_each(&mut walk);
+            keywords.iter().for_each(|k| walk(&k.value));
+        }
+        Expr::Attribute(v, _) => walk(v),
+        Expr::Slice { lo, hi, step } => lo
+            .iter()
+            .chain(hi.iter())
+            .chain(step.iter())
+            .for_each(|x| walk(x)),
+        Expr::Lambda { params, body } => {
+            params.defaults.iter().for_each(&mut walk);
+            params.kwonly_defaults.iter().flatten().for_each(&mut walk);
+            static_attrs_expr(body, true, out);
+        }
+        Expr::ListComp(elt, gens) | Expr::SetComp(elt, gens) => {
+            static_attrs_comp(&[elt], gens, in_func, in_func, out)
+        }
+        Expr::DictComp(k, v, gens) => static_attrs_comp(&[k, v], gens, in_func, in_func, out),
+        Expr::GenExp(elt, gens) => static_attrs_comp(&[elt], gens, in_func, true, out),
+        _ => {}
+    }
+}
+
+/// A comprehension whose first iterable is evaluated in the enclosing scope
+/// (`outer`) and the rest in `inner` -- the same scope for an inlined
+/// list/set/dict comprehension, a function scope for a generator expression.
+fn static_attrs_comp(
+    elts: &[&Expr],
+    gens: &[Comprehension],
+    outer: bool,
+    inner: bool,
+    out: &mut Vec<String>,
+) {
+    for (i, g) in gens.iter().enumerate() {
+        static_attrs_expr(&g.iter, if i == 0 { outer } else { inner }, out);
+        static_attrs_target(&g.target, inner, out);
+        g.ifs.iter().for_each(|x| static_attrs_expr(x, inner, out));
+    }
+    elts.iter().for_each(|x| static_attrs_expr(x, inner, out));
+}
+
+fn static_attrs_fstr(parts: &[FStrPart], in_func: bool, out: &mut Vec<String>) {
+    for p in parts {
+        if let FStrPart::Expr { expr, spec, .. } = p {
+            static_attrs_expr(expr, in_func, out);
+            static_attrs_fstr(spec, in_func, out);
+        }
+    }
 }
 
 /// The docstring of a function/class/module body: its first statement when that
