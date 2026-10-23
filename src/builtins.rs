@@ -2444,7 +2444,13 @@ fn b_build_class(vm: &mut VM, _: u8) -> Value {
             Some(PyObj::List(l)) => l.clone(),
             _ => Vec::new(),
         });
-        let r = host::build_class_foreign(&name, bases, &body_func);
+        // The class-header keywords (`total=False` for a `TypedDict`) go to
+        // `types.new_class` as its `kwds`.
+        let kwds: Vec<(String, Value)> = with_host(|h| match h.get(&kwargs_val) {
+            Some(PyObj::Dict(d)) => d.values().map(|(k, v)| (h.str_of(k), v.clone())).collect(),
+            _ => Vec::new(),
+        });
+        let r = host::build_class_foreign(&name, bases, &body_func, kwds);
         return finish(vm, r);
     }
     let bases: Vec<String> = match resolve_mro_entries(&bases_val) {

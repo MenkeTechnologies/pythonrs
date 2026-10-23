@@ -20692,6 +20692,7 @@ pub fn build_class_foreign(
     name: &str,
     bases: Vec<Value>,
     body_func: &Value,
+    kwds: Vec<(String, Value)>,
 ) -> Result<Value, String> {
     let ns = run_class_body(name, body_func, &[])?;
     let mut members: Vec<(String, Value)> = ns.into_iter().collect();
@@ -20706,7 +20707,7 @@ pub fn build_class_foreign(
         let q = with_host(|h| h.new_str(name.to_string()));
         members.push(("__qualname__".to_string(), q));
     }
-    let cls = crate::ffi::build_foreign_class(name, &bases, &members)?;
+    let cls = crate::ffi::build_foreign_class(name, &bases, &members, &kwds)?;
     with_host(|h| h.fill_foreign_class_cell(&cls, &members));
     Ok(cls)
 }

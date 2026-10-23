@@ -2042,3 +2042,38 @@ True True False
         "stderr={stderr}"
     );
 }
+
+/// A class with a CPython base gets its header keywords: `total=False` reaches
+/// `_TypedDictMeta`, `boundary=` reaches `EnumType`; a `frozenset` CPython hands back stays one.
+/// Expected output is python3.14's.
+#[test]
+fn class_keywords_reach_a_cpython_metaclass() {
+    let src = r#"from typing import TypedDict
+import enum
+class TD(TypedDict, total=False):
+    a: int
+class TD2(TD):
+    b: str
+print(TD.__total__, sorted(TD.__optional_keys__), sorted(TD2.__required_keys__), type(TD2.__optional_keys__).__name__)
+class F(enum.Flag, boundary=enum.STRICT):
+    A = 1
+    B = 2
+print(F._boundary_, F.A | F.B)
+class E(enum.Enum, metaclass=enum.EnumType):
+    X = 1
+print(E.X)
+"#;
+    let (stdout, stderr, ok) = run_py(src);
+    if bridge_unavailable(ok, &stderr) {
+        eprintln!("skipping class keyword test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(
+        stdout,
+        r#"False ['a'] ['b'] frozenset
+strict F.A|B
+E.X
+"#,
+        "stderr={stderr}"
+    );
+}

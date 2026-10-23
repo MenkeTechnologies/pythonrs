@@ -1217,6 +1217,7 @@ pub fn build_foreign_class(
     name: &str,
     bases: &[Value],
     members: &[(String, Value)],
+    kwds: &[(String, Value)],
 ) -> Result<Value, String> {
     if !init() {
         return Err(bridge_unavailable(name));
@@ -1224,6 +1225,16 @@ pub fn build_foreign_class(
     Python::attach(|py| {
         // Marshal bases + members under a short host borrow; the metaclass call
         // runs with none held (a method body may re-enter fusevm).
+        let kwds_dict = PyDict::new(py);
+        with_host(|h| -> Result<(), String> {
+            for (k, v) in kwds {
+                let pv = value_to_py(h, py, v)?;
+                kwds_dict
+                    .set_item(k.as_str(), pv)
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        })?;
         let (bases_tuple, members_dict): (Bound<PyAny>, Bound<PyAny>) =
             with_host(|h| -> Result<_, String> {
                 let base_objs: Vec<Bound<PyAny>> = bases
@@ -1242,7 +1253,7 @@ pub fn build_foreign_class(
             })?;
         let helper = make_class_helper(py)?;
         let cls = helper
-            .call1((name, bases_tuple, members_dict))
+            .call1((name, bases_tuple, members_dict, kwds_dict))
             .map_err(|e| e.to_string())?;
         let id = store(cls.unbind());
         Ok(with_host(|h| h.alloc(PyObj::Foreign(id))))
@@ -1259,11 +1270,11 @@ fn make_class_helper(py: Python) -> Result<Bound<PyAny>, String> {
     }
     let code = cr#"
 import types
-def _make(name, bases, members):
+def _make(name, bases, members, kwds):
     def body(ns):
         for k in members:
             ns[k] = members[k]
-    return types.new_class(name, tuple(bases), {}, body)
+    return types.new_class(name, tuple(bases), kwds, body)
 "#;
     let module = PyModule::from_code(py, code, c"_pyrs_class.py", c"_pyrs_class")
         .map_err(|e| e.to_string())?;
@@ -2786,6 +2797,10 @@ fn py_to_value_node(host: &mut PyHost, py: Python, obj: &Bound<PyAny>) -> Result
             let iv = py_to_value(host, py, &it.map_err(|e| e.to_string())?)?;
             let key = host.to_key(&iv)?;
             map.insert(key, iv);
+        }
+        // A `frozenset` stays one (`TypedDict.__optional_keys__`).
+        if obj.is_exact_instance_of::<PyFrozenSet>() {
+            return Ok(host.new_frozenset(map));
         }
         return Ok(host.new_set(map));
     }

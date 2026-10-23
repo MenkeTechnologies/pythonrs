@@ -9,6 +9,11 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **Class keywords reach a CPython metaclass.** `class TD(TypedDict,
+  total=False)` built a total TypedDict and `class F(enum.Flag,
+  boundary=enum.STRICT)` lost its boundary: a class with a CPython base was
+  handed to `types.new_class` without its header keywords. A `frozenset`
+  CPython returns (`TD.__optional_keys__`) also crossed back as a `set`.
 - **`exec`/`eval` inside a generator or coroutine.** The body runs on a frame
   stack of its own whose bottom frame is the generator's, so the nested code
   ran on that frame: `eval("1+1")` returned `None`, `exec(src, d)` left `d`
@@ -3326,6 +3331,14 @@ entry. These remain open:
   tracemalloc lines.
 - **A custom `__builtins__` in an `exec`/`eval` globals dict is ignored**
   (`eval("len([1])", {"__builtins__": {"len": f}})` uses the real `len`).
+- **`weakref` on pythonrs objects.** `weakref.ref(obj)` of a native instance
+  raises `cannot create weak reference to 'builtins.PyrsInstance' object`:
+  `weakref` is CPython's, and a native object crosses as a proxy. A native
+  `_weakref` (refs the tracing collector clears, with callbacks run after a
+  sweep) is the fix; `WeakValueDictionary`/`WeakSet`/`finalize` follow from it.
+- **An explicit `metaclass=` beside a CPython base is ignored.** `class
+  E2(enum.Enum, metaclass=M)` with `class M(enum.EnumType)` builds an
+  `EnumType` class, not an `M` one.
 - **`f'{x!=}'`** reports `expecting '=', or '!', or ':', or '}'` one column
   right of CPython (offset 6, CPython 5).
 
