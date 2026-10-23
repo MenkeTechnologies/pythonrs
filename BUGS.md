@@ -9,6 +9,22 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **`inspect` recognizes pythonrs functions across the bridge.**
+  `inspect.isfunction(f)`/`ismethod(a.m)` were False, so
+  `getmembers(C, isfunction)` was empty and `getsource`/`getfile` raised; the
+  proxy reports `types.FunctionType`/`types.MethodType` as its `__class__`,
+  `__code__` crosses as a CPython code object with the function's `co_*`
+  surface (so `isgeneratorfunction`/`iscoroutinefunction` work), and
+  `co_firstlineno` is the `def` line (it was always 1). A classmethod or
+  staticmethod read off a class mirror binds the wrapped function.
+- **`ExceptionGroup`'s heap-type slots**: `dir()` lists `__module__` and
+  `__weakref__`, `ExceptionGroup.__weakref__` is its getset, and a subclass
+  inherits it rather than adding its own.
+- **`memoryview(b)[::2].obj` is `b`** (it was the strided copy).
+- **f-string tokenizer errors**: `f'{x!r'` points at the `r` (it opens a raw
+  string), `f'{x!rr'` and `f'{x!rr=}'` are refused as conversion `'rr'`, and
+  `(f'{x:')` is CPython's `closing parenthesis ')' does not match opening
+  parenthesis '{'`.
 - **Concurrent programs no longer see a half-imported `typing`.** Two hosts on
   two threads share one embedded CPython; a `@dataclass` in one while the other
   ran `typing`'s module body for the first time raised `AttributeError:
@@ -3285,20 +3301,16 @@ entry. These remain open:
   does not evaluate `c`; a format spec's `{{` is read as an escaped brace
   where CPython reads a nested field (`f"{x:a{{b}}}"`). A compiler error from
   `compile()` over a file carries `text=None` where CPython reads the line.
-- **`dir(ExceptionGroup)`** lacks `__module__` and `__weakref__`, and
-  `ExceptionGroup.__weakref__` is an `AttributeError`.
-- **Two f-string tokenizer errors differ.** `print(f'{x!r:')` reads
-  `f-string: expecting '}', or format specs` where CPython reads `closing
-  parenthesis ')' does not match opening parenthesis '{'`, and the caret of
-  `f'{x!r'` (`expecting '}'`) sits one column right of CPython's.
-- **A strided memoryview slice of plain `bytes` reports a copy as `obj`.**
-  `memoryview(b'abc')[::2].obj` is a fresh `bytes`, not the original object.
-- **`inspect` on pythonrs functions and instances over the bridge.**
-  `inspect.isfunction(f)` and `inspect.ismethod(A().m)` are False (the
-  function crosses as a callback proxy, not a `types.FunctionType`), so
-  `inspect.getmembers(A, inspect.isfunction)` is empty; and
-  `inspect.getattr_static(A(), 'p')` raises `AttributeError: p`, because a
-  pythonrs instance crosses as a proxy whose type carries no class namespace.
+- **`inspect.getattr_static(obj, name)` on a pythonrs instance** raises
+  `AttributeError` for a class attribute (`p`, a property; `m`, a method):
+  the instance crosses as a proxy whose CPython type is one shared
+  `PyrsInstance` type, and `getattr_static` walks `type(obj).__mro__`, never
+  `__class__`. Fixing it needs a proxy type per native class carrying the class
+  namespace (and refreshed with it, as class mirrors are).
+- **A strided memoryview slice is a read-only copy.** `memoryview(ba)[::2]`
+  over a `bytearray` is `readonly` and writes through it do not reach `ba`.
+- **`f'{x!=}'`** reports `expecting '=', or '!', or ':', or '}'` one column
+  right of CPython (offset 6, CPython 5).
 
 ### Round 2 batched differential fuzz (`tests/batch_fuzz.rs`)
 
