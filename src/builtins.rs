@@ -14116,11 +14116,17 @@ pub fn re_match_method(m: &Value, method: &str, args: &[Value]) -> Result<Value,
             Ok(with_host(|h| h.new_tuple(vals)))
         }
         "groupdict" => {
+            // A group that did not participate reads as `default`.
+            let default = args.first().cloned().unwrap_or(Value::Undef);
             let named = named.clone();
             let mut d = DictMap::default();
             for (name, idx) in named {
                 let k = with_host(|h| h.new_str(name.clone()));
-                d.insert(host::PKey::Str(name), (k, group_str(idx)));
+                let v = match group_str(idx) {
+                    Value::Undef => default.clone(),
+                    v => v,
+                };
+                d.insert(host::PKey::Str(name), (k, v));
             }
             Ok(with_host(|h| h.new_dict(d)))
         }

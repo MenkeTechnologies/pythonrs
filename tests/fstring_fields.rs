@@ -155,3 +155,13 @@ fn a_bad_format_spec_carries_the_field_line_and_caret() {
         "Traceback (most recent call last):\n  File \"F\", line 3, in <module>\n    f\"{w:.{2}}\")\n      ^^^^^^^^\nValueError: Precision not allowed in integer format specifier\n"
     );
 }
+
+/// The conversion is one NAME token: anything after it but blanks is where
+/// the grammar expected `:` or `}`.
+#[test]
+fn text_after_the_conversion_name_expects_a_colon_or_brace() {
+    assert_eq!(
+        errors(&[r#"f"{1!r=}""#, r#"f"{1!r!s}""#, r#"f"{1!a b}""#, r#"f"{1!s  }""#]),
+        "[(\"f-string: expecting ':' or '}'\", 1, 7, 8), (\"f-string: expecting ':' or '}'\", 1, 7, 8), (\"f-string: expecting ':' or '}'\", 1, 8, 9), None]"
+    );
+}

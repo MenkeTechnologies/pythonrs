@@ -1955,3 +1955,36 @@ z 1
         "stderr={stderr}"
     );
 }
+
+/// A CPython descriptor stored in a native class (`functools.partialmethod`,
+/// `functools.singledispatchmethod`) binds through its `__get__` on attribute
+/// reads and on the fused method call alike. Expected output is python3.14's.
+#[test]
+fn cpython_descriptors_in_a_native_class_bind() {
+    let src = r#"import functools
+class A:
+    def f(self, a, b):
+        return (a, b)
+    g = functools.partialmethod(f, 1)
+    @functools.singledispatchmethod
+    def d(self, x):
+        return 'obj'
+    @d.register
+    def _(self, x: int):
+        return 'int'
+a = A()
+bound = a.g
+print(bound(2), a.g(3), a.d(1), a.d('s'))
+"#;
+    let (stdout, stderr, ok) = run_py(src);
+    if bridge_unavailable(ok, &stderr) {
+        eprintln!("skipping descriptor test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(
+        stdout,
+        r#"(1, 2) (1, 3) int obj
+"#,
+        "stderr={stderr}"
+    );
+}

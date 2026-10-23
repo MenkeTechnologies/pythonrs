@@ -4485,6 +4485,23 @@ impl Parser {
                     b + 1 + n,
                 ));
             }
+            // The conversion is one NAME token; whatever follows it but blanks
+            // must be the `:` or `}` the grammar expects next (`{x!r=}`).
+            let name_len = after
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .count();
+            if name_len > 0 {
+                let blanks = after
+                    .chars()
+                    .skip(name_len)
+                    .take_while(|c| c.is_whitespace())
+                    .count();
+                if name_len + blanks < after.chars().count() {
+                    let at = b + 1 + name_len + blanks;
+                    return Err(fstring_error("expecting ':' or '}'", origin, at, at + 1));
+                }
+            }
             conv = match named {
                 "s" | "r" | "a" => named.chars().next(),
                 _ => {

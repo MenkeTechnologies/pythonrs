@@ -2850,6 +2850,21 @@ fn reference_to_value(host: &mut PyHost, py: Python, obj: &Bound<PyAny>) -> Resu
 }
 
 /// `foreign.name` — attribute access (submodules, functions, constants, …).
+/// Whether the CPython object at handle `id`, found in a native class's
+/// namespace, is a descriptor: `(has __get__, has __set__ or __delete__)` on
+/// its TYPE, as `_PyObject_GenericGetAttrWithDict` asks (`functools.partialmethod`,
+/// `functools.singledispatchmethod`).
+pub fn foreign_descriptor_kind(id: u32) -> (bool, bool) {
+    Python::attach(|py| {
+        let Ok(obj) = fetch(py, id) else {
+            return (false, false);
+        };
+        let ty = obj.get_type();
+        let has = |n: &str| ty.hasattr(n).unwrap_or(false);
+        (has("__get__"), has("__set__") || has("__delete__"))
+    })
+}
+
 pub fn get_attr(host: &mut PyHost, id: u32, name: &str) -> Result<Value, String> {
     Python::attach(|py| {
         let obj = fetch(py, id)?;

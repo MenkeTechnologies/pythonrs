@@ -15998,6 +15998,9 @@ impl PyHost {
                     self.class_has(&c, "__set__") || self.class_has(&c, "__delete__"),
                 )
             }
+            // A CPython descriptor stored in the class (`functools.partialmethod`).
+            #[cfg(feature = "stdlib-ffi")]
+            Some(PyObj::Foreign(id)) => crate::ffi::foreign_descriptor_kind(*id),
             _ => (false, false),
         };
         // Data descriptors override the instance dict; non-data descriptors only
@@ -17977,6 +17980,9 @@ impl PyHost {
                 self.class_has(&d.class, "__get__"),
                 self.class_has(&d.class, "__set__") || self.class_has(&d.class, "__delete__"),
             ),
+            // A CPython descriptor stored in the class (`functools.partialmethod`).
+            #[cfg(feature = "stdlib-ffi")]
+            Some(PyObj::Foreign(id)) => crate::ffi::foreign_descriptor_kind(*id),
             _ => (false, false),
         };
         match in_dict {
@@ -18130,7 +18136,29 @@ fn call_method_inner(
         Some(PyObj::Pattern { .. }) => {
             crate::builtins::re_pattern_method(recv, name, &args, &kwargs)
         }
-        Some(PyObj::Match { .. }) => crate::builtins::re_match_method(recv, name, &args),
+        Some(PyObj::Match { .. }) => {
+            // `groups(default=None)` / `groupdict(default=None)` take their one
+            // argument by name too (Argument Clinic: `default` is positional-or-
+            // keyword).
+            let mut args = args;
+            if matches!(name, "groups" | "groupdict") {
+                for (k, v) in kwargs {
+                    if k != "default" {
+                        return Err(type_error(&format!(
+                            "{name}() got an unexpected keyword argument '{k}'"
+                        )));
+                    }
+                    args.push(v);
+                }
+                if args.len() > 1 {
+                    return Err(type_error(&format!(
+                        "{name}() takes at most 1 argument ({} given)",
+                        args.len()
+                    )));
+                }
+            }
+            crate::builtins::re_match_method(recv, name, &args)
+        }
         Some(PyObj::ReScanner { .. }) => crate::builtins::re_scanner_method(recv, name),
         // `f.__annotate__(fmt)` as a fused method call. `__annotate__` is a plain
         // callable attribute rather than a function method, so the attribute has

@@ -4159,3 +4159,24 @@ r = [type(b2).__name__, b2.x, REG, type(s).__name__, s.a, s.b,
         "['B', 3, ['A', 'B'], 'S2', 1, 2, ['x', 'y', 'z'], 'Q(x=1, y=2, z=5)', True]"
     );
 }
+
+/// `Match.groups(default=None)` and `Match.groupdict(default=None)`: a group
+/// that did not participate reads as `default`, given by position or by name,
+/// with Argument Clinic's refusals. Expected values are CPython 3.14's.
+#[test]
+fn match_groups_and_groupdict_take_a_default() {
+    let src = r#"
+import re
+m = re.match(r"(?P<a>x)(?P<b>y)?", "x")
+out = [m.groups(default="-"), m.groupdict(default=0), m.groups("?"), m.groupdict("-")]
+for c in ["m.groups(1, default=2)", "m.groups(x=1)", "m.groupdict(1, default=2)"]:
+    try:
+        eval(c)
+    except TypeError as e:
+        out.append(str(e))
+"#;
+    assert_eq!(
+        g(src, "out"),
+        r#"[('x', '-'), {'a': 'x', 'b': 0}, ('x', '?'), {'a': 'x', 'b': '-'}, 'groups() takes at most 1 argument (2 given)', "groups() got an unexpected keyword argument 'x'", 'groupdict() takes at most 1 argument (2 given)']"#
+    );
+}

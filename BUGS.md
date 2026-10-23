@@ -9,6 +9,16 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **A CPython descriptor in a native class binds.** `g =
+  functools.partialmethod(f, 1)` and `functools.singledispatchmethod` in a
+  class body: `a.g(2)` raised `'partialmethod' object is not callable`; the
+  attribute read and the fused method call now go through the descriptor's
+  `__get__`.
+- **`Match.groups(default=…)` / `Match.groupdict(default=…)`.** `groupdict`
+  ignored its default, and the keyword form of either was dropped.
+- **`f'{x!r=}'`** reported `invalid conversion character 'r='`; the
+  conversion is one NAME token, so CPython reports `f-string: expecting ':' or
+  '}'` at the `=` (likewise `{x!r!s}`, `{x!a b}`).
 - **A function's `__dict__` is its live attribute store.** `f.__dict__['b'] =
   2` sets `f.b`, `del f.a` and `del f.__dict__['z']` remove attributes,
   `f.__dict__ = d` replaces the store, and the function slots `functools.wraps`
@@ -3270,6 +3280,10 @@ entry. These remain open:
   `compile()` over a file carries `text=None` where CPython reads the line.
 - **`dir(ExceptionGroup)`** lacks `__module__` and `__weakref__`, and
   `ExceptionGroup.__weakref__` is an `AttributeError`.
+- **Two f-string tokenizer errors differ.** `print(f'{x!r:')` reads
+  `f-string: expecting '}', or format specs` where CPython reads `closing
+  parenthesis ')' does not match opening parenthesis '{'`, and the caret of
+  `f'{x!r'` (`expecting '}'`) sits one column right of CPython's.
 - **A strided memoryview slice of plain `bytes` reports a copy as `obj`.**
   `memoryview(b'abc')[::2].obj` is a fresh `bytes`, not the original object.
 - **`inspect` on pythonrs functions and instances over the bridge.**
