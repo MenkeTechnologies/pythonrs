@@ -10973,3 +10973,23 @@ out += [list(d), list(d2), list(gl), list(lo), d["__builtins__"] is builtins.__d
         r#"[[3, 6, 3], [6, 7, ['a', 'b', 'd']], ['__builtins__'], ['__builtins__'], ['__builtins__'], ['x'], True]"#
     );
 }
+
+/// A globals dict whose `__builtins__` is a dict of its own supplies the
+/// builtins for the code run there; the builtins module or its dict is the
+/// ordinary namespace.
+#[test]
+fn a_custom_builtins_dict_supplies_the_builtins() {
+    let src = r#"
+import builtins
+out = [eval("len([1])", {"__builtins__": {"len": lambda x: 42}})]
+try:
+    eval("print", {"__builtins__": {}})
+except NameError as e:
+    out.append(str(e))
+out += [eval("abs(-2)", {"__builtins__": builtins}), eval("abs(-3)", {"__builtins__": builtins.__dict__})]
+"#;
+    assert_eq!(
+        g(src, "out"),
+        r#"[42, "name 'print' is not defined", 2, 3]"#
+    );
+}

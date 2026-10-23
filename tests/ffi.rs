@@ -2077,3 +2077,122 @@ E.X
         "stderr={stderr}"
     );
 }
+
+/// The Python-level half of `asyncio` over the native loop: `timeout` cancels
+/// an overdue block into `TimeoutError`, `current_task` is the running Task
+/// (one object, hashable), `TaskGroup` runs and joins its tasks and raises an
+/// `ExceptionGroup` of their failures, `to_thread` runs the callable. The
+/// deprecated `iscoroutinefunction` warns at the caller's line, and an
+/// unawaited coroutine's `RuntimeWarning` names where it was made. Expected
+/// output is python3.14's (the warnings' file path aside).
+#[test]
+fn asyncio_timeout_taskgroup_current_task_and_warnings() {
+    let src = r#"import asyncio
+async def worker(n, d):
+    await asyncio.sleep(d)
+    return n * 10
+async def boom():
+    raise ValueError('b')
+async def main():
+    try:
+        async with asyncio.timeout(0.01) as cm:
+            await asyncio.sleep(1)
+    except TimeoutError as e:
+        print('timeout', type(e).__name__, cm.expired())
+    async with asyncio.timeout(1) as cm2:
+        await asyncio.sleep(0)
+    print('in time', cm2.expired())
+    t = asyncio.current_task()
+    print(t is asyncio.current_task(), t in {t}, t.get_name().startswith('Task'))
+    async with asyncio.TaskGroup() as tg:
+        a = tg.create_task(worker(6, 0))
+        b = tg.create_task(worker(7, 0.01))
+    print(a.result(), b.result())
+    try:
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(boom())
+            tg.create_task(worker(8, 1))
+    except* ValueError as eg:
+        print('eg', eg.exceptions)
+    print(await asyncio.to_thread(lambda x: x * 2, 21))
+asyncio.run(main())
+try:
+    asyncio.current_task()
+except RuntimeError as e:
+    print(e)
+async def f():
+    pass
+print(asyncio.iscoroutinefunction(f))
+f()
+"#;
+    let (stdout, stderr, ok) = run_py(src);
+    if bridge_unavailable(ok, &stderr) {
+        eprintln!("skipping asyncio test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(
+        stdout,
+        r#"timeout TimeoutError True
+in time False
+True True True
+60 70
+eg (ValueError('b'),)
+42
+no running event loop
+True
+"#,
+        "stderr={stderr}"
+    );
+    let stderr: String = stderr
+        .lines()
+        .map(|l| match l.find(".py:") {
+            Some(i) if !l.starts_with(' ') => format!("{}\n", &l[i..]),
+            _ => format!("{l}\n"),
+        })
+        .collect();
+    assert_eq!(
+        stderr,
+        r#".py:36: DeprecationWarning: 'asyncio.iscoroutinefunction' is deprecated and slated for removal in Python 3.16; use inspect.iscoroutinefunction() instead
+  print(asyncio.iscoroutinefunction(f))
+.py:37: RuntimeWarning: coroutine 'f' was never awaited
+  f()
+RuntimeWarning: Enable tracemalloc to get the object allocation traceback
+"#
+    );
+}
+
+/// An explicit CPython `metaclass=` builds the class through CPython, with or
+/// without a CPython base: `class E2(enum.Enum, metaclass=M)` is an `M`, and
+/// `class Z(metaclass=AM)` (`AM` derived from `abc.ABCMeta`) is an `AM` that
+/// refuses to instantiate while abstract. Expected output is python3.14's.
+#[test]
+fn an_explicit_cpython_metaclass_builds_the_class() {
+    let src = r#"import enum, abc
+class M(enum.EnumType):
+    pass
+class E2(enum.Enum, metaclass=M):
+    X = 1
+class AM(abc.ABCMeta):
+    pass
+class Z(metaclass=AM):
+    @abc.abstractmethod
+    def f(self): ...
+print(type(E2).__name__, E2.X, type(Z).__name__)
+try:
+    Z()
+except TypeError as e:
+    print('abstract', 'f' in str(e))
+"#;
+    let (stdout, stderr, ok) = run_py(src);
+    if bridge_unavailable(ok, &stderr) {
+        eprintln!("skipping metaclass test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(
+        stdout,
+        r#"M E2.X AM
+abstract True
+"#,
+        "stderr={stderr}"
+    );
+}

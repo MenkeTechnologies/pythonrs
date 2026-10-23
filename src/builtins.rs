@@ -2435,10 +2435,15 @@ fn b_build_class(vm: &mut VM, _: u8) -> Value {
     // A foreign (CPython) base — `class C(enum.Enum)`, `class T(NamedTuple)` —
     // means the class must be built by that base's metaclass; route creation
     // through CPython so members/fields are produced the real way.
+    // So does an explicit CPython metaclass (`metaclass=M` for a class M
+    // derived from `abc.ABCMeta` or `enum.EnumType`).
     #[cfg(feature = "stdlib-ffi")]
-    if with_host(|h| match h.get(&bases_val) {
-        Some(PyObj::List(l)) => l.iter().any(|b| h.foreign_id(b).is_some()),
-        _ => false,
+    if with_host(|h| {
+        h.foreign_id(&metaclass).is_some()
+            || match h.get(&bases_val) {
+                Some(PyObj::List(l)) => l.iter().any(|b| h.foreign_id(b).is_some()),
+                _ => false,
+            }
     }) {
         let bases: Vec<Value> = with_host(|h| match h.get(&bases_val) {
             Some(PyObj::List(l)) => l.clone(),
@@ -2446,10 +2451,13 @@ fn b_build_class(vm: &mut VM, _: u8) -> Value {
         });
         // The class-header keywords (`total=False` for a `TypedDict`) go to
         // `types.new_class` as its `kwds`.
-        let kwds: Vec<(String, Value)> = with_host(|h| match h.get(&kwargs_val) {
+        let mut kwds: Vec<(String, Value)> = with_host(|h| match h.get(&kwargs_val) {
             Some(PyObj::Dict(d)) => d.values().map(|(k, v)| (h.str_of(k), v.clone())).collect(),
             _ => Vec::new(),
         });
+        if !matches!(metaclass, Value::Undef) {
+            kwds.insert(0, ("metaclass".to_string(), metaclass.clone()));
+        }
         let r = host::build_class_foreign(&name, bases, &body_func, kwds);
         return finish(vm, r);
     }
@@ -12026,43 +12034,59 @@ fn call_sys(name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>) -> Resul
     }
 }
 
-/// The `async def sleep(delay, result=None)` coroutine function behind
-/// `asyncio.sleep`, compiled once per host and kept in the `asyncio` module's
-/// namespace (where the module's `sleep` then names it too).
-fn asyncio_sleep_function() -> Result<Value, String> {
+/// The Python-level half of `asyncio` (`sleep`, `timeout`, `TaskGroup`, …;
+/// see [`crate::stdlib::pyasyncio`]), compiled once per host. Each name is
+/// then bound in the `asyncio` module, replacing the native stand-in that led
+/// here, and the one asked for is returned.
+fn asyncio_python_part(name: &str) -> Result<Value, String> {
     let module = host::import_module("asyncio")?;
     let slot = with_host(|h| h.module_slot(&module))
         .ok_or_else(|| host::type_error("asyncio is not a module"))?;
-    if let Some(f) = with_host(|h| h.module_global(slot, "_sleep_coroutine")) {
-        return Ok(f);
-    }
-    let globals = with_host(|h| {
-        let mut d = DictMap::default();
-        for (k, v) in [
-            ("__name__", h.new_str("asyncio.tasks")),
-            (
-                "_sleep_future",
-                h.alloc(PyObj::Builtin("asyncio._sleep_future".into())),
-            ),
-        ] {
-            let key = h.new_str(k);
-            d.insert(PKey::Str(k.to_string()), (key, v));
+    let marker = "_python_part_loaded";
+    if with_host(|h| h.module_global(slot, marker)).is_none() {
+        let globals = with_host(|h| {
+            let mut d = DictMap::default();
+            let entries = [
+                ("__name__", h.new_str("asyncio")),
+                (
+                    "_sleep_future",
+                    h.alloc(PyObj::Builtin("asyncio._sleep_future".into())),
+                ),
+                (
+                    "_current_task",
+                    h.alloc(PyObj::Builtin("asyncio.current_task".into())),
+                ),
+                (
+                    "_create_task",
+                    h.alloc(PyObj::Builtin("asyncio.create_task".into())),
+                ),
+                ("_wait", h.alloc(PyObj::Builtin("asyncio.wait".into()))),
+                (
+                    "_get_running_loop",
+                    h.alloc(PyObj::Builtin("asyncio.get_running_loop".into())),
+                ),
+                (
+                    "CancelledError",
+                    h.alloc(PyObj::Builtin("CancelledError".into())),
+                ),
+            ];
+            for (k, v) in entries {
+                let key = h.new_str(k);
+                d.insert(PKey::Str(k.to_string()), (key, v));
+            }
+            h.new_dict(d)
+        });
+        let src = with_host(|h| h.new_str(crate::stdlib::pyasyncio::module_source()));
+        call_builtin_function("exec", vec![src, globals.clone()], vec![])?;
+        for n in crate::stdlib::pyasyncio::NAMES {
+            let key = with_host(|h| h.new_str(*n));
+            let v = with_host(|h| h.get_item(&globals, &key))?;
+            with_host(|h| h.set_attr(&module, n, v))?;
         }
-        h.new_dict(d)
-    });
-    let src = with_host(|h| {
-        h.new_str(
-            "async def sleep(delay, result=None):\n    \"\"\"Coroutine that completes after a given time (in seconds).\"\"\"\n    return await _sleep_future(delay, result)\n",
-        )
-    });
-    call_builtin_function("exec", vec![src, globals.clone()], vec![])?;
-    let key = with_host(|h| h.new_str("sleep"));
-    let f = with_host(|h| h.get_item(&globals, &key))?;
-    with_host(|h| -> Result<(), String> {
-        h.set_attr(&module, "_sleep_coroutine", f.clone())?;
-        h.set_attr(&module, "sleep", f.clone())
-    })?;
-    Ok(f)
+        with_host(|h| h.set_attr(&module, marker, Value::Bool(true)))?;
+    }
+    with_host(|h| h.module_global(slot, name))
+        .ok_or_else(|| format!("AttributeError: module 'asyncio' has no attribute '{name}'"))
 }
 
 /// `asyncio.*` module functions — dispatched to the native async runtime.
@@ -12078,10 +12102,11 @@ fn call_asyncio(
         // sleep` in `asyncio/tasks.py`): calling it builds a coroutine, so
         // `create_task(asyncio.sleep(1))` takes it and its delay starts when it
         // first runs. The body awaits the native timer future.
-        "sleep" => {
-            let sleep = asyncio_sleep_function()?;
-            host::invoke(&sleep, args, kwargs)
+        name if crate::stdlib::pyasyncio::NAMES.contains(&name) => {
+            let f = asyncio_python_part(name)?;
+            host::invoke(&f, args, kwargs)
         }
+        "current_task" => async_rt::current_task(),
         // `asyncio.iscoroutine(obj)`: a native coroutine, or an object of a
         // class providing the `collections.abc.Coroutine` protocol.
         "iscoroutine" => {

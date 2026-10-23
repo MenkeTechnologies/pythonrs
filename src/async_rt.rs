@@ -52,6 +52,9 @@ struct FutureCell {
     /// `CancelledError` into the coroutine at its current `await` point.
     must_cancel: bool,
     name: String,
+    /// The one object standing for this cell, so `current_task() is task`
+    /// and a Task is one key in a set (`TaskGroup._tasks`).
+    obj: Value,
 }
 
 // ── event loop ───────────────────────────────────────────────────────────────
@@ -105,6 +108,8 @@ struct EventLoop {
     time: f64,
     seq: u64,
     running: bool,
+    /// The Task whose coroutine is being stepped (`asyncio.current_task()`).
+    current: Option<u32>,
 }
 
 thread_local! {
@@ -137,15 +142,23 @@ fn new_cell(is_task: bool, coro: Option<Value>, name: String) -> Value {
             step_scheduled: false,
             must_cancel: false,
             name,
+            obj: Value::Undef,
         });
         id
     });
-    with_host(|h| h.alloc(PyObj::Future { id }))
+    let obj = with_host(|h| h.alloc(PyObj::Future { id }));
+    with_loop(|l| l.futures[id as usize].obj = obj.clone());
+    obj
 }
 
 /// A fresh pending `asyncio.Future`.
 pub fn new_future() -> Value {
     new_cell(false, None, "Future".to_string())
+}
+
+/// The object standing for future cell `id`.
+fn future_obj(id: u32) -> Value {
+    with_loop(|l| l.futures[id as usize].obj.clone())
 }
 
 fn future_id(v: &Value) -> Option<u32> {
@@ -200,7 +213,7 @@ fn settle(id: u32, result: Value, exc: Option<Value>, cancelled: bool) -> bool {
     for n in natives {
         call_soon_native(n);
     }
-    let fut = with_host(|h| h.alloc(PyObj::Future { id }));
+    let fut = future_obj(id);
     for cb in pys {
         call_soon_py(cb, vec![fut.clone()]);
     }
@@ -420,7 +433,7 @@ fn cancel_future(id: u32) -> bool {
         with_loop(|l| l.futures[id as usize].must_cancel = true);
         // Schedule a step now; whatever inner Future the coroutine is suspended on
         // is simply abandoned (its later settlement no-ops on the done Task).
-        let task = with_host(|h| h.alloc(PyObj::Future { id }));
+        let task = future_obj(id);
         schedule_step(task);
     } else {
         settle(id, Value::Undef, Some(make_cancelled_error()), true);
@@ -463,11 +476,13 @@ fn task_step(task: Value) {
         None => return,
     };
     let must_cancel = with_loop(|l| std::mem::take(&mut l.futures[id as usize].must_cancel));
+    let prev = with_loop(|l| l.current.replace(id));
     let stepped = if must_cancel {
         host::gen_throw(&coro, make_cancelled_error())
     } else {
         host::gen_resume(&coro, Value::Undef)
     };
+    with_loop(|l| l.current = prev);
     match stepped {
         Ok(Some(awaited)) => {
             // The coroutine yielded a Future it is waiting on. Re-step this Task
@@ -1289,6 +1304,17 @@ fn queue_get_now(id: u32) -> Result<Value, String> {
 /// The singleton `asyncio` event loop object (`get_event_loop`/`get_running_loop`).
 pub fn event_loop() -> Value {
     with_host(|h| h.alloc(PyObj::EventLoop))
+}
+
+/// `asyncio.current_task()`: the Task whose coroutine is running, or `None`.
+pub fn current_task() -> Result<Value, String> {
+    if !with_loop(|l| l.running) {
+        return Err("RuntimeError: no running event loop".to_string());
+    }
+    Ok(match with_loop(|l| l.current) {
+        Some(id) => future_obj(id),
+        None => Value::Undef,
+    })
 }
 
 /// Dispatch a method call on the event-loop object.

@@ -324,3 +324,52 @@ cp = [c.args, c.z is p.z, dc.z is p.z, dc.z, dc.args, log, copy.copy(O(2, 'x', '
         "[(1,), True, False, [1], (1,), [1, 1, 1], 'f']"
     );
 }
+
+/// An exception escaping a generator body is the object the body raised, its
+/// identity and `args` intact (`raise ValueError(1, 2)` was caught as
+/// `ValueError('(1, 2)')`, re-formed from its message), and one raised while
+/// handling a thrown exception keeps that one as its context.
+#[test]
+fn an_exception_escaping_a_generator_keeps_its_identity() {
+    let src = r#"
+class E(Exception):
+    pass
+x = E(1, 2)
+def g():
+    raise x
+    yield
+def g2():
+    raise ValueError(1, 2)
+    yield
+def g3():
+    try:
+        yield
+    except ValueError:
+        raise KeyError('replaced')
+out = []
+try:
+    next(g())
+except E as e:
+    out.append(e is x)
+try:
+    list(g2())
+except ValueError as e:
+    out.append(e.args)
+it = g3(); next(it)
+try:
+    it.throw(ValueError('v'))
+except KeyError as e:
+    out.append((e.args, type(e.__context__).__name__))
+def g4():
+    raise ExceptionGroup('m', [ValueError(1)])
+    yield
+try:
+    next(g4())
+except* ValueError as eg:
+    out.append(eg.exceptions)
+"#;
+    assert_eq!(
+        g(src, "out"),
+        r#"[True, (1, 2), (('replaced',), 'ValueError'), (ValueError(1),)]"#
+    );
+}

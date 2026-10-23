@@ -4593,7 +4593,7 @@ impl Parser {
             None => format!("({expr_src}{close}"),
         };
         let sub = parse_source(&padded, self.level.saturating_sub(7))
-            .map_err(|e| fstring_sub_error(e, origin, lead, expr_src.chars().count()))?;
+            .map_err(|e| fstring_sub_error(e, origin, lead, expr_src))?;
         let expr = match sub.into_iter().next() {
             Some(Stmt {
                 kind: StmtKind::Expr(e),
@@ -4946,7 +4946,8 @@ fn fstring_error(msg: &str, origin: Option<&Origin>, from: usize, to: usize) -> 
 /// field's, `lead..lead + len` the expression's characters within it. CPython
 /// words only some of these with the `f-string:` prefix, and says the field is
 /// missing its `=`/`!`/`:`/`}` where the expression just stops making sense.
-fn fstring_sub_error(err: String, origin: Option<&Origin>, lead: usize, len: usize) -> String {
+fn fstring_sub_error(err: String, origin: Option<&Origin>, lead: usize, expr: &str) -> String {
+    let len = expr.chars().count();
     if err == TOO_COMPLEX {
         return err;
     }
@@ -4964,16 +4965,25 @@ fn fstring_sub_error(err: String, origin: Option<&Origin>, lead: usize, len: usi
         return text;
     };
     // The wrapping `)` stands for the end of the expression, where CPython
-    // points at the expression's last character.
+    // points at the expression's last TOKEN: a one-character one, or an
+    // operator such as the `!=` of `{x!=}`.
     let (end_line, end_col) = origin.locate(lead + len);
     if p.lineno == Some(end_line as i64) && p.offset == Some(end_col as i64 + 1) && len > 0 {
-        let (l, c) = origin.locate(lead + len - 1);
+        const MULTI: &[&str] = &[
+            "**=", "//=", ">>=", "<<=", "!=", "==", "<=", ">=", "**", "//", "<<", ">>", "->", ":=",
+            "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "@=",
+        ];
+        let tok = MULTI
+            .iter()
+            .find(|op| expr.ends_with(*op))
+            .map_or(1, |op| op.len());
+        let (l, c) = origin.locate(lead + len - tok);
         let width = if inner.starts_with("f-string: unmatched") {
             0
         } else {
-            1
+            tok
         };
-        return at_pos(&text, l, c as i64 + 1, l, c as i64 + 1 + width);
+        return at_pos(&text, l, c as i64 + 1, l, c as i64 + 1 + width as i64);
     }
     // A stray closer is a point, not a span.
     match (p.lineno, p.offset, p.end_lineno, p.end_offset) {

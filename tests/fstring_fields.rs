@@ -178,3 +178,13 @@ fn tokenizer_level_field_errors_match_cpython() {
         "[(\"f-string: expecting '}'\", 1, 6, 6), (\"f-string: invalid conversion character 'rr': expected 's', 'r', or 'a'\", 1, 6, 8), (\"closing parenthesis ')' does not match opening parenthesis '{'\", 1, 8, 8), (\"f-string: expecting '}'\", 1, 8, 8), (\"f-string: invalid conversion character 'rr': expected 's', 'r', or 'a'\", 1, 6, 8), (\"f-string: invalid conversion character 'q': expected 's', 'r', or 'a'\", 1, 6, 7)]"
     );
 }
+
+/// A field whose expression ends in a two-character operator (`{x!=}`,
+/// `{x==}`) is refused at that operator, its whole width.
+#[test]
+fn a_field_ending_in_an_operator_points_at_the_operator() {
+    assert_eq!(
+        errors(&["f\"{x!=}\"", "f\"{x !=}\"", "f\"{x==}\"", "f\"{x+}\""]),
+        "[(\"f-string: expecting '=', or '!', or ':', or '}'\", 1, 5, 7), (\"f-string: expecting '=', or '!', or ':', or '}'\", 1, 6, 8), (\"f-string: expecting '=', or '!', or ':', or '}'\", 1, 5, 7), (\"f-string: expecting '=', or '!', or ':', or '}'\", 1, 5, 6)]"
+    );
+}

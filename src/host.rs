@@ -2757,6 +2757,9 @@ struct GenCell {
     agen_op: Option<AGenOp>,
     /// The defining function's name (used by the un-awaited-coroutine warning).
     func_name: String,
+    /// Where the generator object was made: `(module, line)` of the calling
+    /// frame, which the un-awaited-coroutine warning names.
+    created_at: (usize, u32),
     /// The body's VM runs and pins, parked here while it is suspended.
     gc: gc::GcContext,
 }
@@ -3502,6 +3505,13 @@ impl PyHost {
     /// (`builtins_slot`), else the native builtin of that name. `None` is a
     /// `NameError`.
     pub fn lookup_builtin(&mut self, name: &str) -> Option<Value> {
+        // A globals dict whose `__builtins__` is a plain dict of its own (`exec(src,
+        // {"__builtins__": {...}})`) supplies the builtins for code run there.
+        if let Some(b) = self.module_globals[self.cur_module].get("__builtins__") {
+            if let Some(PyObj::Dict(d)) = self.get(b) {
+                return d.get(&StrKey(name)).map(|(_, v)| v.clone());
+            }
+        }
         if let Some(slot) = self.builtins_slot {
             return self.module_globals[slot].get(name).cloned();
         }
@@ -6836,7 +6846,8 @@ impl PyHost {
                     | PyObj::Lock { .. }
                     | PyObj::File { .. }
                     | PyObj::TypeVarLike { .. }
-                    | PyObj::TypeAlias { .. },
+                    | PyObj::TypeAlias { .. }
+                    | PyObj::Future { .. },
                 ) => {
                     let id = match v {
                         Value::Obj(i) => *i,
@@ -22301,15 +22312,36 @@ impl PyHost {
 }
 
 pub fn warn_unawaited_coroutines() {
-    let names: Vec<String> = with_host(|h| {
+    // `_PyErr_WarnUnawaitedCoroutine` warns through `warnings`, so the line is
+    // `file:line: RuntimeWarning: …` with the source line under it, and
+    // without tracemalloc a second warning saying how to get the allocation
+    // traceback. The location is where the object was made (CPython's is where
+    // it was dropped, the same line for a temporary).
+    let warnings: Vec<(String, String, u32, Option<String>)> = with_host(|h| {
         h.generators
             .iter()
             .filter(|g| g.kind == GenKind::Coroutine && !g.started && !g.done)
-            .map(|g| g.func_name.clone())
+            .map(|g| {
+                let (module, line) = g.created_at;
+                (
+                    g.func_name.clone(),
+                    h.module_filename(module),
+                    line,
+                    h.source_line(module, line),
+                )
+            })
             .collect()
     });
-    for name in names {
-        eprintln!("RuntimeWarning: coroutine '{name}' was never awaited");
+    for (name, file, line, src) in warnings {
+        if line == 0 {
+            eprintln!("RuntimeWarning: coroutine '{name}' was never awaited");
+            continue;
+        }
+        eprintln!("{file}:{line}: RuntimeWarning: coroutine '{name}' was never awaited");
+        if let Some(src) = src.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+            eprintln!("  {src}");
+        }
+        eprintln!("RuntimeWarning: Enable tracemalloc to get the object allocation traceback");
     }
 }
 
@@ -22407,6 +22439,7 @@ fn make_gen_kind(
             awaiting: false,
             agen_op: None,
             func_name,
+            created_at: h.frames.last().map_or((0, 0), |f| (f.module, f.line)),
             gc: gc::GcContext::default(),
         });
         id
@@ -22833,6 +22866,22 @@ pub fn gen_resume(gen: &Value, send: Value) -> Result<Option<Value>, String> {
     }
     CUR_GEN.with(|c| c.set(prev));
     let gen_ctx = with_host(|h| h.install_gen_ctx(caller_ctx));
+    // The exception escaping the body is the object the body raised: it was
+    // in flight on the generator's context, which the swap just set aside.
+    // Hand it to the resumer, or it re-forms from the message and loses its
+    // identity and `args` (`raise ValueError(1, 2)` caught as `('(1, 2)',)`).
+    // Only when it IS the escaping one: the context may instead hold an
+    // exception the body was handling when it raised another.
+    if let corosensei::CoroutineResult::Return(Err(err)) = &out {
+        if stop_tb.is_none() {
+            if let Some(e) = gen_ctx.exc.clone() {
+                let same = with_host(|h| h.exc_line_of(&e)).is_some_and(|line| *err == line);
+                if same {
+                    with_host(|h| h.exc = Some(e));
+                }
+            }
+        }
+    }
     with_host(|h| {
         h.generators[id as usize].ctx = gen_ctx;
         h.generators[id as usize].coro = Some(coro);
@@ -25218,6 +25267,24 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                 (
                     "iscoroutine",
                     h.alloc(PyObj::Builtin("asyncio.iscoroutine".into())),
+                ),
+                ("timeout", h.alloc(PyObj::Builtin("asyncio.timeout".into()))),
+                ("Timeout", h.alloc(PyObj::Builtin("asyncio.Timeout".into()))),
+                (
+                    "TaskGroup",
+                    h.alloc(PyObj::Builtin("asyncio.TaskGroup".into())),
+                ),
+                (
+                    "to_thread",
+                    h.alloc(PyObj::Builtin("asyncio.to_thread".into())),
+                ),
+                (
+                    "iscoroutinefunction",
+                    h.alloc(PyObj::Builtin("asyncio.iscoroutinefunction".into())),
+                ),
+                (
+                    "current_task",
+                    h.alloc(PyObj::Builtin("asyncio.current_task".into())),
                 ),
                 ("gather", h.alloc(PyObj::Builtin("asyncio.gather".into()))),
                 (
