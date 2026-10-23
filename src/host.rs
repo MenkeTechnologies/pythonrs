@@ -3696,6 +3696,9 @@ impl PyHost {
                 "str" => return Some("str"),
                 "int" => return Some("int"),
                 "float" => return Some("float"),
+                "complex" => return Some("complex"),
+                "bytes" => return Some("bytes"),
+                "bytearray" => return Some("bytearray"),
                 "tuple" => return Some("tuple"),
                 "set" => return Some("set"),
                 "frozenset" => return Some("frozenset"),
@@ -5338,6 +5341,9 @@ enum NativeCallable<'a> {
 /// bound to its type, never to an instance.
 fn is_type_bound_method(owner: &str, meth: &str) -> bool {
     crate::builtins::type_classmethods(owner).contains(&meth)
+        // `tp_new` is exposed as a builtin method bound to its type
+        // (`tp_new_wrapper`): `<built-in method __new__ of type object at …>`.
+        || (meth == "__new__" && crate::builtins::is_type_object_name(owner))
         || matches!(
             (owner, meth),
             ("str" | "bytes" | "bytearray", "maketrans") | ("itertools.chain", "from_iterable")
@@ -5829,7 +5835,7 @@ impl PyHost {
                     // A user exception instance stringifies to its message
                     // (`BaseException.__str__`): ''/str(arg)/repr(tuple).
                     if self.class_is_exception(&inst.class) {
-                        self.exc_inst_message(&inst.class, &inst.dict)
+                        self.exc_inst_message(&inst.class, v)
                     } else if !matches!(inst.payload, Value::Undef)
                         && self.builtin_base_of(&inst.class).is_some()
                         && self.class_lookup(&inst.class, "__str__").is_none()
@@ -6036,6 +6042,8 @@ impl PyHost {
                         format!("<slot wrapper '{meth}' of '{owner}' objects>")
                     }
                     NativeCallable::MethodDescriptor { owner, meth } => {
+                        let owner =
+                            crate::builtins::exception_method_owner(owner, meth).unwrap_or(owner);
                         let owner = type_object_class_name(owner).unwrap_or_else(|| owner.into());
                         format!("<method '{meth}' of '{owner}' objects>")
                     }
@@ -6606,7 +6614,7 @@ impl PyHost {
                 // A user exception instance reprs as `Class(repr(arg), …)` from
                 // its stored `args`, mirroring `BaseException.__repr__`.
                 Some(PyObj::Instance(inst)) if self.class_is_exception(&inst.class) => {
-                    let a = self.exc_instance_args(&inst.dict);
+                    let a = self.exc_instance_args(v);
                     let inner: Vec<String> = a.iter().map(|x| self.repr_of(x)).collect();
                     format!(
                         "{}({})",
@@ -10969,12 +10977,15 @@ impl PyHost {
     /// there (`deque_repr`, `odict_repr` and `defdict_repr` use
     /// `_PyType_Name(Py_TYPE(self))`, `Counter.__repr__` uses
     /// `self.__class__.__name__`), so `class Q(deque)` reprs as `Q([1])`;
+    /// `bytearray_repr` likewise prints `Py_TYPE(self)->tp_name`, so
+    /// `class BA(bytearray)` reprs as `BA(b'xy')`.
     /// `list`/`dict`/... reprs carry no type name at all.
     fn builtin_subclass_repr(&self, inst: &Instance) -> String {
         let r = self.repr_of(&inst.payload);
         let base = self.builtin_base_of(&inst.class).unwrap_or("");
         match base
             .strip_prefix("collections.")
+            .or((base == "bytearray").then_some(base))
             .and_then(|bare| r.strip_prefix(bare))
         {
             Some(rest) => format!("{}{rest}", inst.class),
@@ -13137,6 +13148,38 @@ impl PyHost {
         }
     }
 
+    /// `e.__traceback__`: the captured `(scope, line)` frames as a traceback
+    /// chain, or None if the exception was never propagated through a frame.
+    fn exc_traceback(&mut self, recv: &Value) -> Value {
+        let entries: Vec<TbFrame> = match recv {
+            Value::Obj(id) => self
+                .exc_tb
+                .get(id)
+                .map(|fs| {
+                    fs.iter()
+                        .filter_map(|e| match e {
+                            TbEntry::Frame(f) => Some(f.clone()),
+                            TbEntry::CPython(_) => None,
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        if entries.is_empty() {
+            return Value::Undef;
+        }
+        let frames = entries
+            .iter()
+            .map(|f| (f.name.to_string(), f.line))
+            .collect();
+        self.alloc(PyObj::Traceback {
+            frames,
+            idx: 0,
+            entries: Rc::new(entries),
+        })
+    }
+
     fn get_attr_inner(&mut self, recv: &Value, name: &str) -> Result<Value, String> {
         // A CPython object (stdlib-ffi) resolves attributes on the CPython side.
         #[cfg(feature = "stdlib-ffi")]
@@ -13323,6 +13366,18 @@ impl PyHost {
                         format!("AttributeError: '{tn}' object has no attribute '{name}'")
                     });
                 }
+                // An exception member (`args`, `errno`, …) is the builtin base's data
+                // descriptor: it reads from the member storage, not the instance
+                // dict. A member never set is NULL, which reads as `None`; the
+                // getset ones fall to their own defaults below.
+                if let Some(getset) = self.exc_member_slot(&class, name) {
+                    if let Some(v) = self.exc_member(recv, name) {
+                        return Ok(v);
+                    }
+                    if !getset && name != "__suppress_context__" {
+                        return Ok(Value::Undef);
+                    }
+                }
                 if let Some(v) = self.inst_attr(&inst_dict, name) {
                     return Ok(v);
                 }
@@ -13336,7 +13391,7 @@ impl PyHost {
                 }
                 // `BaseException`'s methods, inherited by every exception class
                 // that does not override them.
-                if matches!(name, "add_note" | "with_traceback")
+                if matches!(name, "add_note" | "with_traceback" | "__setstate__")
                     && self.class_is_exception(&class)
                     && self.class_lookup(&class, name).is_none()
                 {
@@ -13345,6 +13400,9 @@ impl PyHost {
                         recv: recv.clone(),
                         func,
                     }));
+                }
+                if name == "__traceback__" && self.class_is_exception(&class) {
+                    return Ok(self.exc_traceback(recv));
                 }
                 if (name == "__cause__" || name == "__context__" || name == "__suppress_context__")
                     && self.class_is_exception(&class)
@@ -13571,6 +13629,12 @@ impl PyHost {
                     if let Some(f) = self.class_lookup(&cname, "__new__") {
                         return Ok(f);
                     }
+                    // A builtin base's own `tp_new` (`str.__new__` for `class S(str)`),
+                    // which builds a payload-carrying instance of the subclass.
+                    if let Some(base) = self.builtin_base_of(&cname) {
+                        let base_ty = self.alloc(PyObj::Builtin(base.to_string()));
+                        return self.get_attr(&base_ty, "__new__");
+                    }
                     return Ok(self.alloc(PyObj::Builtin("object.__new__".into())));
                 }
                 if name == "__dict__" {
@@ -13686,6 +13750,25 @@ impl PyHost {
                         }
                     }
                 }
+                // A dunder or method the nearest builtin base itself lists in `dir()`
+                // (`L.__add__`, `S.__getitem__`, `E.add_note`) is that type's own
+                // descriptor, so `dir(cls)` and `getattr(cls, n)` agree. `object`'s
+                // two classmethods bind the subclass instead (below).
+                if !matches!(name, "__subclasshook__" | "__init_subclass__") {
+                    let base = self
+                        .mro_rc(&cname)
+                        .iter()
+                        .find(|c| !self.classes.contains_key(*c))
+                        .cloned();
+                    if let Some(base) = base.filter(|b| {
+                        b != "object" && crate::builtins::type_dir_names(b).contains(&name)
+                    }) {
+                        let base_ty = self.alloc(PyObj::Builtin(base));
+                        if let Ok(v) = self.get_attr(&base_ty, name) {
+                            return Ok(v);
+                        }
+                    }
+                }
                 // `object`'s two classmethods, bound to the class.
                 if matches!(name, "__subclasshook__" | "__init_subclass__") {
                     let func = self.alloc(PyObj::Builtin(format!("{OBJECT_CLASSMETHOD}{name}")));
@@ -13742,6 +13825,28 @@ impl PyHost {
                     // `e.__class__.__name__`).
                     return Ok(self.builtin_type_of(recv));
                 }
+                // `BaseException.__dict__`: the attributes assigned onto the
+                // exception. Its members (`args`, `errno`, `__cause__`, …) share
+                // the attribute map here but live outside `__dict__` in CPython.
+                if name == "__dict__" {
+                    let class = class.clone();
+                    let attrs: Vec<(String, Value)> = match recv {
+                        Value::Obj(id) => self
+                            .func_attrs
+                            .get(id)
+                            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                            .unwrap_or_default(),
+                        _ => Vec::new(),
+                    };
+                    let mut d = DictMap::default();
+                    for (k, v) in attrs {
+                        if crate::builtins::exception_member_owner(self, &class, &k).is_none() {
+                            let key = self.new_str(k.clone());
+                            d.insert(PKey::Str(k), (key, v));
+                        }
+                    }
+                    return Ok(self.alloc(PyObj::Dict(d)));
+                }
                 if name == "args" {
                     let a = args.clone();
                     return Ok(self.new_tuple(a));
@@ -13781,35 +13886,7 @@ impl PyHost {
                     return Ok(self.exc_link(recv).1);
                 }
                 if name == "__traceback__" {
-                    // The captured `(scope, line)` frames as a traceback chain, or
-                    // None if the exception was never propagated through a frame.
-                    let entries: Vec<TbFrame> = match recv {
-                        Value::Obj(id) => self
-                            .exc_tb
-                            .get(id)
-                            .map(|fs| {
-                                fs.iter()
-                                    .filter_map(|e| match e {
-                                        TbEntry::Frame(f) => Some(f.clone()),
-                                        TbEntry::CPython(_) => None,
-                                    })
-                                    .collect::<Vec<_>>()
-                            })
-                            .unwrap_or_default(),
-                        _ => Vec::new(),
-                    };
-                    if entries.is_empty() {
-                        return Ok(Value::Undef);
-                    }
-                    let frames = entries
-                        .iter()
-                        .map(|f| (f.name.to_string(), f.line))
-                        .collect();
-                    return Ok(self.alloc(PyObj::Traceback {
-                        frames,
-                        idx: 0,
-                        entries: Rc::new(entries),
-                    }));
+                    return Ok(self.exc_traceback(recv));
                 }
                 if name == "__suppress_context__" {
                     // True iff raised with any explicit `from` clause (`raise X
@@ -13830,7 +13907,9 @@ impl PyHost {
                 // `dir()` lists and `call_type_method` dispatches. Reaching them
                 // only through a call expression made `e.add_note` — the form
                 // `traceback` and `unittest` pass around — an AttributeError.
-                if crate::builtins::type_has_method(&class, name) {
+                if crate::builtins::type_has_method(&class, name)
+                    && crate::builtins::exception_member_owner(self, &class, name).is_none()
+                {
                     let b = self.alloc(PyObj::Builtin(name.to_string()));
                     return Ok(self.alloc(PyObj::BoundMethod {
                         recv: recv.clone(),
@@ -14670,6 +14749,15 @@ impl PyHost {
                 };
                 Ok(self.new_str(m))
             }
+            // A builtin exception type's members are data descriptors on the
+            // type (`ValueError.args`, `OSError.errno`).
+            Some(PyObj::Builtin(n))
+                if crate::builtins::is_exception_class(n)
+                    && crate::builtins::exception_member_owner(self, n, name).is_some() =>
+            {
+                let n = n.clone();
+                Ok(self.exc_member_descriptor(&n, name).unwrap_or(Value::Undef))
+            }
             // The `type` surface on a builtin type object — `int.mro()`,
             // `int.__instancecheck__(5)`, `int | str` as a method. `dir(int)`
             // does NOT list these (CPython lists a type's INSTANCE attributes,
@@ -14732,6 +14820,13 @@ impl PyHost {
                     let ctor = self.alloc(PyObj::Builtin("object.__new__".into()));
                     d.insert(PKey::Str("__new__".to_string()), (key, ctor));
                 }
+                // The members a builtin exception type defines itself.
+                for (member, _) in crate::builtins::exception_own_members(&n) {
+                    if let Some(desc) = self.exc_member_descriptor(&n, member) {
+                        let key = self.new_str((*member).to_string());
+                        d.insert(PKey::Str((*member).to_string()), (key, desc));
+                    }
+                }
                 // The type-level getset descriptors. Code binds these directly to
                 // read an attribute off a class WITHOUT going through
                 // `__getattr__` or a metaclass: `annotationlib` does
@@ -14781,8 +14876,8 @@ impl PyHost {
                 if name == "__new__" && crate::builtins::is_type_object_name(n) =>
             {
                 let ctor = match n.as_str() {
-                    "int" | "str" | "float" | "tuple" | "frozenset" | "list" | "dict" | "set"
-                    | "type" => {
+                    "int" | "str" | "float" | "complex" | "bytes" | "bytearray" | "tuple"
+                    | "frozenset" | "list" | "dict" | "set" | "type" => {
                         format!("{n}.__new__")
                     }
                     _ => "object.__new__".to_string(),
@@ -15284,9 +15379,12 @@ impl PyHost {
                 if weak {
                     set.insert("__weakref__".into());
                 }
-            } else if crate::builtins::is_exception_class(&c) {
-                // `BaseException` carries its own `__dict__` getset.
-                set.insert("__dict__".into());
+            } else {
+                // A builtin base (`list`, `str`, `KeyError`) contributes what
+                // `dir()` lists for the type itself: its methods, protocol
+                // dunders and data descriptors (`BaseException`'s `args` and
+                // `__dict__` getsets among them).
+                self.collect_builtin_dir(&c, set);
             }
             // Each slot is a member descriptor in its declaring class's
             // `__dict__` — listed even when a `"__dict__"` entry leaves the
@@ -15980,6 +16078,18 @@ impl PyHost {
                 ));
             }
         }
+        // An exception member (`args`, `errno`, `__cause__`, …) is a data
+        // descriptor of the builtin base, stored outside the instance `__dict__`.
+        if let (Some(PyObj::Instance(inst)), Value::Obj(id)) = (self.get(recv), recv) {
+            if self.exc_member_slot(&inst.class, name).is_some() {
+                let id = *id;
+                self.func_attrs
+                    .entry(id)
+                    .or_default()
+                    .insert(name.to_string(), val);
+                return Ok(());
+            }
+        }
         if let Some(PyObj::Instance(inst)) = self.get(recv) {
             let dict = inst.dict.clone();
             self.inst_attr_set(&dict, name, val);
@@ -16344,6 +16454,16 @@ impl PyHost {
             Some(true) => return Ok(()),
             Some(false) => return Err(format!("AttributeError: {name}")),
             None => {}
+        }
+        // An exception member deletes to NULL, which reads back as `None`.
+        if let (Some(PyObj::Instance(inst)), Value::Obj(id)) = (self.get(recv), recv) {
+            if self.exc_member_slot(&inst.class, name).is_some() {
+                let id = *id;
+                if let Some(m) = self.func_attrs.get_mut(&id) {
+                    m.shift_remove(name);
+                }
+                return Ok(());
+            }
         }
         if let Some(PyObj::Instance(inst)) = self.get(recv) {
             let dict = inst.dict.clone();
@@ -17065,6 +17185,9 @@ pub fn base_provides(base: &str, dunder: &str) -> bool {
             dunder,
             "__repr__" | "__str__" | "__hash__" | "__bool__" | "__int__" | "__float__"
         ),
+        "complex" => matches!(dunder, "__repr__" | "__str__" | "__hash__" | "__bool__"),
+        "bytes" => base_provides("tuple", dunder) || dunder == "__bytes__",
+        "bytearray" => base_provides("list", dunder),
         // The native `collections` containers carry the item protocol of the
         // sequence or mapping they are.
         "collections.deque" => base_provides("list", dunder),
@@ -17358,6 +17481,7 @@ fn base_super_init(
         // A `collections` base is rebuilt the same way, and the payload also
         // takes the rebuilt object's tag (a defaultdict's factory, ...).
         "list"
+        | "bytearray"
         | "dict"
         | "set"
         | "collections.deque"
@@ -18108,7 +18232,7 @@ fn call_method_inner(
                 }
             }
             // `BaseException`'s methods on an exception subclass instance.
-            if matches!(name, "add_note" | "with_traceback")
+            if matches!(name, "add_note" | "with_traceback" | "__setstate__")
                 && with_host(|h| h.class_is_exception(&class))
             {
                 return crate::builtins::call_type_method(recv, name, args, kwargs);
@@ -18167,10 +18291,13 @@ fn call_method_inner(
                 }
             }
             // `Cls.__new__(subcls, *args)` with no class-defined `__new__` falls
-            // back to `object.__new__` — a bare instance of the class argument.
+            // back to the inherited `tp_new`: a builtin base's (`str.__new__` for
+            // `class S(str)`, which copyreg's `__newobj__` calls to unpickle), else
+            // `object.__new__` — a bare instance of the class argument.
             // `_pydatetime`'s `tzinfo.__new__(cls)` relies on this.
             if name == "__new__" {
-                return crate::builtins::call_builtin_function("object.__new__", args, kwargs);
+                let ctor = with_host(|h| h.get_attr(recv, "__new__"))?;
+                return invoke(&ctor, args, kwargs);
             }
             // A method defined on the metaclass is callable on the class, bound to
             // the class as its receiver (`cls`): `A.meta_method()`.
@@ -18778,7 +18905,8 @@ fn exception_init(h: &mut PyHost, inst: &Value, args: Vec<Value>) {
 /// `self.args` (overridable by `__init__`/super). An `OSError` subclass also
 /// gets `oserror_init`'s split — the four fields (None when not given) and an
 /// `args` cut to `(errno, strerror)`.
-fn seed_exception_attrs(h: &mut PyHost, class: &str, args: Vec<Value>, attrs: &mut NameMap) {
+fn seed_exception_attrs(h: &mut PyHost, inst: &Value, class: &str, args: Vec<Value>) {
+    let mut attrs = NameMap::default();
     let args = if h.mro_of(class).iter().any(|c| c == "OSError") {
         let parts = oserror_parts(h, class, args);
         for name in ["errno", "strerror", "filename", "filename2"] {
@@ -18793,6 +18921,9 @@ fn seed_exception_attrs(h: &mut PyHost, class: &str, args: Vec<Value>, attrs: &m
     };
     let t = h.alloc(PyObj::Tuple(args));
     attrs.insert("args".to_string(), t);
+    if let Value::Obj(id) = inst {
+        h.func_attrs.entry(*id).or_default().extend(attrs);
+    }
 }
 
 /// `object_new`'s abstract-class check: a class whose `__abstractmethods__`
@@ -18875,7 +19006,10 @@ fn construct_plain(
         // is filled from the args unless the subclass defines `__init__` (which
         // controls filling, typically via `super().__init__(...)`), in which
         // case it starts empty.
-        let immutable = matches!(base, "int" | "float" | "str" | "tuple" | "frozenset");
+        let immutable = matches!(
+            base,
+            "int" | "float" | "complex" | "str" | "bytes" | "tuple" | "frozenset"
+        );
         let has_user_init = with_host(|h| {
             matches!(
                 h.class_lookup(class, "__init__")
@@ -18891,13 +19025,13 @@ fn construct_plain(
         with_host(|h| h.new_instance_payload(class.to_string(), payload))
     } else {
         with_host(|h| {
-            let mut attrs = NameMap::default();
+            let inst = h.new_instance(class.to_string(), NameMap::default());
             // `BaseException.__new__(cls, *args)` seeds `self.args` with the
             // constructor's positional args (overridable by `__init__`/super).
             if h.class_is_exception(class) {
-                seed_exception_attrs(h, class, args.clone(), &mut attrs);
+                seed_exception_attrs(h, &inst, class, args.clone());
             }
-            h.new_instance(class.to_string(), attrs)
+            inst
         })
     };
     // `__init__` runs only when `__new__` returned an instance of `class` (or a
@@ -19894,11 +20028,51 @@ impl PyHost {
         f.env.clone()
     }
 
+    /// The value of exception member `name` (`args`, `errno`, … — the data
+    /// descriptors of [`crate::builtins::exception_member_owner`]) stored on a
+    /// user exception instance. Like CPython's, these live outside the
+    /// instance `__dict__`.
+    /// The descriptor object of exception member `name` as the defining builtin
+    /// type exposes it on the class: `ValueError.args` is `<attribute 'args' of
+    /// 'BaseException' objects>`, `OSError.errno` `<member 'errno' of 'OSError'
+    /// objects>`. `None` when `class` has no such member.
+    fn exc_member_descriptor(&mut self, class: &str, name: &str) -> Option<Value> {
+        let (owner, getset) = crate::builtins::exception_member_owner(self, class, name)?;
+        let kind = if getset {
+            DescKind::GetSetDescriptor
+        } else {
+            DescKind::MemberDescriptor
+        };
+        Some(self.alloc(PyObj::Descriptor {
+            kind,
+            qual: format!("{owner}.{name}"),
+            recv: None,
+        }))
+    }
+
+    /// Whether `name` on an instance of user class `class` is an exception
+    /// member — `Some(getset)` — rather than an ordinary attribute: the class
+    /// is an exception and nothing in its own namespaces shadows the builtin
+    /// base's descriptor.
+    pub fn exc_member_slot(&self, class: &str, name: &str) -> Option<bool> {
+        if !self.class_is_exception(class) || self.class_lookup(class, name).is_some() {
+            return None;
+        }
+        crate::builtins::exception_member_owner(self, class, name).map(|(_, getset)| getset)
+    }
+
+    pub fn exc_member(&self, exc: &Value, name: &str) -> Option<Value> {
+        match exc {
+            Value::Obj(id) => self.func_attrs.get(id)?.get(name).cloned(),
+            _ => None,
+        }
+    }
+
     /// Build the `"Class: message"` display string for an exception's args.
     /// The `args` tuple stored on a user exception instance's dict — set by the
     /// builtin `BaseException.__new__`/`__init__`. Missing (or non-tuple) → empty.
-    pub fn exc_instance_args(&self, dict: &Value) -> Vec<Value> {
-        match self.inst_attr(dict, "args") {
+    pub fn exc_instance_args(&self, exc: &Value) -> Vec<Value> {
+        match self.exc_member(exc, "args") {
             Some(v) => match self.get(&v) {
                 Some(PyObj::Tuple(t)) => t.clone(),
                 _ => vec![v.clone()],
@@ -19959,23 +20133,23 @@ impl PyHost {
     }
 
     /// `str()` of a user exception instance: as [`Self::exc_obj_message`], with
-    /// the `OSError` fields read from the instance dict.
-    pub fn exc_inst_message(&self, class: &str, dict: &Value) -> String {
+    /// the `OSError` fields read from the instance's members.
+    pub fn exc_inst_message(&self, class: &str, exc: &Value) -> String {
         if self.mro_of(class).iter().any(|c| c == "OSError") {
             let errno_set = self
-                .inst_attr(dict, "errno")
+                .exc_member(exc, "errno")
                 .is_some_and(|v| !matches!(v, Value::Undef));
             let get = |n: &str| {
-                // The instance dict holds all four fields (None when unset), so
+                // The instance holds all four fields (None when unset), so
                 // `errno`/`strerror` count as present only when non-None.
-                let v = self.inst_attr(dict, n)?;
+                let v = self.exc_member(exc, n)?;
                 (errno_set || !matches!(n, "errno" | "strerror")).then_some(v)
             };
             if let Some(s) = self.oserror_str(get) {
                 return s;
             }
         }
-        self.exc_message(class, &self.exc_instance_args(dict))
+        self.exc_message(class, &self.exc_instance_args(exc))
     }
 
     pub fn exc_message(&self, class: &str, args: &[Value]) -> String {
@@ -20025,10 +20199,9 @@ impl PyHost {
             Some(PyObj::Exception { class, args }) => {
                 Some(join_exc(class, &self.exc_obj_message(exc, class, args)))
             }
-            Some(PyObj::Instance(i)) if self.class_is_exception(&i.class) => Some(join_exc(
-                &i.class,
-                &self.exc_inst_message(&i.class, &i.dict),
-            )),
+            Some(PyObj::Instance(i)) if self.class_is_exception(&i.class) => {
+                Some(join_exc(&i.class, &self.exc_inst_message(&i.class, exc)))
+            }
             _ => None,
         }
     }
@@ -20604,12 +20777,10 @@ pub fn raise_value(exc: &Value) -> Result<String, String> {
             Some(PyObj::Class(name)) => {
                 // Instantiate a user exception class with no args. An exception
                 // class seeds `self.args = ()` (`BaseException.__new__`).
-                let mut attrs = NameMap::default();
+                let inst = h.new_instance(name.clone(), NameMap::default());
                 if h.class_is_exception(&name) {
-                    let t = h.alloc(PyObj::Tuple(vec![]));
-                    attrs.insert("args".to_string(), t);
+                    seed_exception_attrs(h, &inst, &name, Vec::new());
                 }
-                let inst = h.new_instance(name.clone(), attrs);
                 h.exc = Some(inst);
                 Ok(name)
             }
@@ -20617,7 +20788,7 @@ pub fn raise_value(exc: &Value) -> Result<String, String> {
                 let class = i.class.clone();
                 // A user exception instance's uncaught line shows its message.
                 let line = if h.class_is_exception(&class) {
-                    join_exc(&class, &h.exc_inst_message(&class, &i.dict))
+                    join_exc(&class, &h.exc_inst_message(&class, exc))
                 } else {
                     class
                 };
@@ -21518,7 +21689,7 @@ impl PyHost {
                 }
                 join_exc(
                     &self.class_exc_label(&i.class),
-                    &self.exc_inst_message(&i.class, &i.dict),
+                    &self.exc_inst_message(&i.class, exc),
                 )
             }
             _ => String::new(),

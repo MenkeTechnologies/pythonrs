@@ -1327,13 +1327,7 @@ fn exc_to_py<'py>(
     let (class, args, builtin) = match host.get(v) {
         Some(PyObj::Exception { class, args }) => (class.clone(), args.clone(), true),
         Some(PyObj::Instance(i)) if host.class_is_exception(&i.class) => {
-            let args = match host
-                .inst_attr(&i.dict, "args")
-                .map(|t| host.get(&t).cloned())
-            {
-                Some(Some(PyObj::Tuple(items))) => items,
-                _ => Vec::new(),
-            };
+            let args = host.exc_instance_args(v);
             (i.class.clone(), args, false)
         }
         _ => return Ok(None),
@@ -1475,6 +1469,71 @@ fn exception_mirror_delegate(py: Python, exc: Bound<PyAny>, what: String) -> PyR
     }
 }
 
+/// The pythonrs exception class whose mirror is CPython class `obj`, if any.
+fn exception_mirror_class(host: &PyHost, py: Python, obj: &Bound<PyAny>) -> Option<String> {
+    if !obj.is_instance_of::<pyo3::types::PyType>() {
+        return None;
+    }
+    let bridge = host.exc_bridge.borrow();
+    bridge.mirrors.iter().find_map(|(class, &handle)| {
+        let mirror = fetch(py, handle).ok()?;
+        (mirror.is(obj) && host.classes.contains_key(class)).then(|| class.clone())
+    })
+}
+
+/// The native class a pythonrs exception mirror stands for, as a callable that
+/// constructs it; `None` for any other class (a CPython subclass of a mirror).
+#[pyfunction]
+fn _native_exc(py: Python, cls: &Bound<PyAny>) -> PyResult<Option<Py<PyAny>>> {
+    let Some(class) = crate::host::try_with_host(|h| exception_mirror_class(h, py, cls)).flatten()
+    else {
+        return Ok(None);
+    };
+    let target = with_host(|h| h.alloc(PyObj::Class(class)));
+    let proxy = PyrsCallable {
+        target,
+        doc: None,
+        module: None,
+    };
+    Ok(Some(Py::new(py, proxy)?.into_any()))
+}
+
+/// `__reduce_ex__(protocol)` of the pythonrs exception CPython object `exc`
+/// is paired with — its recipe carries the native `__dict__`, which the CPython
+/// copy does not hold. `None` when `exc` is no such object.
+#[pyfunction]
+fn _exc_reduce(py: Python, exc: &Bound<PyAny>, protocol: i64) -> PyResult<Option<Py<PyAny>>> {
+    let Some(native) = crate::host::try_with_host(|h| paired_exception(h, exc)).flatten() else {
+        return Ok(None);
+    };
+    let recipe =
+        crate::host::call_method(&native, "__reduce_ex__", vec![Value::Int(protocol)], vec![])
+            .map_err(rs_err)?;
+    with_host(|h| value_to_py(h, py, &recipe))
+        .map(|b| Some(b.unbind()))
+        .map_err(rs_err)
+}
+
+/// An attribute CPython sets on the mirror instance of a pythonrs exception
+/// (`BaseException.__setstate__` restoring a pickled `__dict__`) is set on the
+/// pythonrs exception too: the two are one object.
+#[pyfunction]
+fn _exc_setattr(
+    py: Python,
+    exc: &Bound<PyAny>,
+    attr: String,
+    value: &Bound<PyAny>,
+) -> PyResult<()> {
+    let Some(native) = crate::host::try_with_host(|h| paired_exception(h, exc)).flatten() else {
+        return Ok(());
+    };
+    let value = with_host(|h| py_to_value(h, py, value)).map_err(rs_err)?;
+    let name = with_host(|h| h.new_str(attr));
+    crate::builtins::call_builtin_function("setattr", vec![native, name, value], vec![])
+        .map(|_| ())
+        .map_err(rs_err)
+}
+
 /// The two Python-level helpers the mirrors need: `mirror(...)` builds a mirror
 /// class, `new(cls, args)` an instance of one without running an `__init__`
 /// (the pythonrs exception already ran its own).
@@ -1484,7 +1543,27 @@ fn exception_helpers(py: Python) -> Result<Bound<PyModule>, String> {
         return Ok(m.bind(py).clone());
     }
     let code = cr#"
+class _NativeExcMeta(type):
+    # Calling the mirror of a pythonrs exception class constructs the NATIVE
+    # exception (`pickle` rebuilding `E(*args)` from `BaseException.__reduce__`),
+    # which crosses back as an instance of this same mirror.
+    def __call__(cls, /, *args, **kwargs):
+        native = _native_exc(cls)
+        if native is None:
+            return super().__call__(*args, **kwargs)
+        return native(*args, **kwargs)
+
 def mirror(name, qualname, module, base, delegate):
+    def __setattr__(self, attr, value):
+        base.__setattr__(self, attr, value)
+        if not attr.startswith("__"):
+            _exc_setattr(self, attr, value)
+    def __reduce_ex__(self, protocol):
+        # The pythonrs exception's own recipe: its `__dict__` lives there.
+        recipe = _exc_reduce(self, protocol)
+        if recipe is None:
+            return base.__reduce_ex__(self, protocol)
+        return recipe
     def __str__(self):
         return delegate(self, '__str__')
     def __repr__(self):
@@ -1497,8 +1576,11 @@ def mirror(name, qualname, module, base, delegate):
         '__str__': __str__,
         '__repr__': __repr__,
         '__getattr__': __getattr__,
+        '__setattr__': __setattr__,
+        '__reduce_ex__': __reduce_ex__,
     }
-    return type(base)(name, (base,), namespace)
+    meta = _NativeExcMeta if type(base) is type else type(base)
+    return meta(name, (base,), namespace)
 
 def new(cls, args):
     return cls.__new__(cls, *args)
@@ -1558,6 +1640,15 @@ def with_tb(exc, frames, tail=None):
 "#;
     let module = PyModule::from_code(py, code, c"_pyrs_exceptions.py", c"_pyrs_exceptions")
         .map_err(|e| e.to_string())?;
+    for f in [
+        wrap_pyfunction!(_native_exc, &module),
+        wrap_pyfunction!(_exc_setattr, &module),
+        wrap_pyfunction!(_exc_reduce, &module),
+    ] {
+        module
+            .add_function(f.map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    }
     let _ = HELPERS.set(module.clone().unbind());
     Ok(module)
 }
@@ -1623,10 +1714,18 @@ class PyrsMirror(type):
         _detach(cls)
         super().__delattr__(name)
 
-def make_mirror(name, bases, members):
+def _mirror_new(cls, /, *args, **kwargs):
+    new = _native_new(cls)
+    if new is None:
+        return object.__new__(cls)
+    return new(cls, *args, **kwargs)
+
+def make_mirror(name, bases, members, native_new):
     def body(ns):
         for k in members:
             ns[k] = members[k]
+        if native_new:
+            ns["__new__"] = _mirror_new
     return types.new_class(name, bases or (object,), {'metaclass': PyrsMirror}, body)
 "#;
     let module = PyModule::from_code(py, code, c"_pyrs_mirror.py", c"_pyrs_mirror")
@@ -1637,6 +1736,7 @@ def make_mirror(name, bases, members):
             .map_err(|e| e.to_string())
     };
     install(wrap_pyfunction!(_native_class, &module))?;
+    install(wrap_pyfunction!(_native_new, &module))?;
     install(wrap_pyfunction!(_detach, &module))?;
     let _ = HELPER.set(module.clone().into_any().unbind());
     Ok(module.into_any())
@@ -1656,6 +1756,32 @@ fn _native_class(py: Python, cls: &Bound<PyAny>) -> PyResult<Option<Py<PyAny>>> 
     let class = with_host(|h| h.alloc(PyObj::Class(cname)));
     let proxy = PyrsCallable {
         target: class,
+        doc: None,
+        module: None,
+    };
+    Ok(Some(Py::new(py, proxy)?.into_any()))
+}
+
+/// The inherited `tp_new` of the native class a pristine mirror stands for
+/// (`str.__new__` for `class S(str)`), as a callable. A mirror of a builtin
+/// subclass carries it as its `__new__`, so `copyreg.__newobj__(S, 'q')` — how
+/// `pickle` rebuilds a protocol-2 object — builds the native instance with its
+/// payload instead of a payload-less `object.__new__` instance of the mirror.
+#[pyfunction]
+fn _native_new(py: Python, cls: &Bound<PyAny>) -> PyResult<Option<Py<PyAny>>> {
+    let Some(generation) = crate::host::try_with_host(|h| h.generation) else {
+        return Ok(None);
+    };
+    let Some(cname) = pristine_class(cls, generation) else {
+        return Ok(None);
+    };
+    let new = with_host(|h| {
+        let class = h.alloc(PyObj::Class(cname));
+        h.get_attr(&class, "__new__")
+    })
+    .map_err(rs_err)?;
+    let proxy = PyrsCallable {
+        target: new,
         doc: None,
         module: None,
     };
@@ -1763,9 +1889,13 @@ fn class_mirror<'py>(
         }
     }
     let bases = PyTuple::new(py, bases).map_err(|e| e.to_string())?;
+    // A builtin subclass with no `__new__` of its own inherits the base's
+    // `tp_new`; the mirror carries a `__new__` that reaches it (`_native_new`).
+    let native_new =
+        host.builtin_base_of(cname).is_some() && host.class_lookup(cname, "__new__").is_none();
     let mirror = mirror_helper(py)?
         .getattr("make_mirror")
-        .and_then(|f| f.call1((name, bases, ns_dict)))
+        .and_then(|f| f.call1((name, bases, ns_dict, native_new)))
         .map_err(|e| e.to_string())?;
     IDENTITY.with(|m| {
         let mut m = m.borrow_mut();
@@ -2258,6 +2388,12 @@ fn value_to_py_node<'py>(
             // with the class namespace — methods cross as `PyrsCallable`
             // descriptors (they bind `self`), `__annotations__`/class-vars by
             // value — so the decorator can read the fields and add methods.
+            // An exception class crosses as the mirror its instances cross as,
+            // so `except E` and `isinstance(e, E)` hold on the CPython side and
+            // `pickle` finds the class it reduced an instance to.
+            Some(PyObj::Class(cname)) if host.class_is_exception(cname) => {
+                exception_mirror(host, py, cname)
+            }
             Some(PyObj::Class(cname)) => class_mirror(host, py, cname),
             // An exception passed into a CPython call — the value handed to a
             // foreign context manager's `__exit__`, a `gen.throw` argument, an
@@ -2535,6 +2671,9 @@ fn py_to_value_node(host: &mut PyHost, py: Python, obj: &Bound<PyAny>) -> Result
     // A native class's mirror is the native class; an instance CPython made of
     // one (`pickle` rebuilding it) is an instance of the native class.
     if let Some(cname) = pristine_class(obj, host.generation) {
+        return Ok(host.alloc(PyObj::Class(cname)));
+    }
+    if let Some(cname) = exception_mirror_class(host, py, obj) {
         return Ok(host.alloc(PyObj::Class(cname)));
     }
     if let Some(cname) = pristine_class(obj.get_type().as_any(), host.generation) {

@@ -209,3 +209,118 @@ out.append(re.compile('(?i)(?x) a').flags)
         r#"[('PatternError', 'missing ), unterminated subpattern', '(', 0, 1, 1, ('missing ), unterminated subpattern at position 0',)), ('PatternError', 'missing ), unterminated subpattern', 'a\nb(', 3, 2, 2, ('missing ), unterminated subpattern at position 3 (line 2, column 2)',)), ('PatternError', 'multiple repeat', 'a**', 2, 1, 3, ('multiple repeat at position 2',)), ('PatternError', "redefinition of group name 'a' as group 2; was group 1", '(?P<a>x)(?P<a>y)', 12, 1, 13, ("redefinition of group name 'a' as group 2; was group 1 at position 12",)), ('PatternError', "bad character in group name '\\xe9'", b'(?P<\xe9>a)', 4, 1, 5, ("bad character in group name '\\xe9' at position 4",)), ('PatternError', 'look-behind requires fixed-width pattern', None, None, None, None, ('look-behind requires fixed-width pattern',)), ('PatternError', 'bad character range z-a', '[z-a]', 1, 1, 2, ('bad character range z-a at position 1',)), ('PatternError', "undefined character name 'NOPE'", '\\N{NOPE}', 0, 1, 1, ("undefined character name 'NOPE' at position 0",)), ('ValueError', None, 'cannot use LOCALE flag with a str pattern'), ('OverflowError', None, 'the repetition number is too large'), ('PatternError', 5, 'invalid group reference 2 at position 5 (line 2, column 4)'), 98]"#
     );
 }
+
+/// `args`, `errno`, `__cause__` and the other exception members are data
+/// descriptors of the builtin base, stored outside the instance `__dict__`:
+/// `vars(e)` holds only what was assigned, for a user exception and a builtin
+/// one alike, and a deleted member reads back as `None`.
+#[test]
+fn exception_members_live_outside_the_instance_dict() {
+    let src = r#"
+class E(Exception):
+    def __init__(self, a, b=3):
+        super().__init__(a)
+        self.b = b
+class O(OSError): pass
+e = E(1); e.extra = 9
+f = E(2); f.__cause__ = None; f.args = (5,); f.__suppress_context__ = True
+user = [e.__dict__, vars(O(2, 's', 'f')), f.__dict__, f.args, O(2, 's', 'f').errno, str(O(2, 's', 'f'))]
+v = ValueError('x'); v.q = 5
+builtin = [Exception().__dict__, v.__dict__, ImportError('m', name='n').__dict__, OSError(2, 's').__dict__,
+           SystemExit(1).__dict__, StopIteration(4).__dict__, AttributeError('a', name='n', obj=1).__dict__]
+o = O(1, 's'); del o.errno
+deleted = [o.errno, O(3, 'x').errno, hasattr(OSError(), 'characters_written')]
+"#;
+    assert_eq!(
+        g(src, "user"),
+        "[{'b': 3, 'extra': 9}, {}, {'b': 3}, (5,), 2, \"[Errno 2] s: 'f'\"]"
+    );
+    assert_eq!(g(src, "builtin"), "[{}, {'q': 5}, {}, {}, {}, {}, {}]");
+    assert_eq!(g(src, "deleted"), "[None, 3, False]");
+}
+
+/// On the class, an exception member is its descriptor, named by the builtin
+/// type that defines it — as are `BaseException`'s methods reached through a
+/// subclass — and `dir()` lists them.
+#[test]
+fn exception_members_are_descriptors_on_the_class() {
+    let src = r#"
+class E(Exception): pass
+class O(OSError): pass
+r = [repr(ValueError.args), repr(ValueError.__traceback__), repr(OSError.errno), repr(O.errno),
+     repr(E.__cause__), repr(StopIteration.value), repr(BaseException.__dict__['args']),
+     repr(OSError.__dict__['strerror']), repr(ValueError.add_note), repr(O.with_traceback),
+     repr(ExceptionGroup.split), repr(ValueError.__setstate__)]
+k = [sorted(set(dir(ValueError)) - set(dir(object))),
+     sorted(set(dir(OSError)) - set(dir(object)) - set(dir(ValueError))),
+     sorted(set(dir(E())) - set(dir(object)))]
+"#;
+    assert_eq!(
+        g(src, "r"),
+        "[\"<attribute 'args' of 'BaseException' objects>\", \
+         \"<attribute '__traceback__' of 'BaseException' objects>\", \
+         \"<member 'errno' of 'OSError' objects>\", \"<member 'errno' of 'OSError' objects>\", \
+         \"<attribute '__cause__' of 'BaseException' objects>\", \
+         \"<member 'value' of 'StopIteration' objects>\", \
+         \"<attribute 'args' of 'BaseException' objects>\", \
+         \"<member 'strerror' of 'OSError' objects>\", \
+         \"<method 'add_note' of 'BaseException' objects>\", \
+         \"<method 'with_traceback' of 'BaseException' objects>\", \
+         \"<method 'split' of 'BaseExceptionGroup' objects>\", \
+         \"<method '__setstate__' of 'BaseException' objects>\"]"
+    );
+    assert_eq!(
+        g(src, "k"),
+        "[['__cause__', '__context__', '__dict__', '__setstate__', '__suppress_context__', \
+         '__traceback__', 'add_note', 'args', 'with_traceback'], \
+         ['characters_written', 'errno', 'filename', 'filename2', 'strerror'], \
+         ['__cause__', '__context__', '__dict__', '__firstlineno__', '__module__', '__setstate__', \
+         '__static_attributes__', '__suppress_context__', '__traceback__', '__weakref__', \
+         'add_note', 'args', 'with_traceback']]"
+    );
+}
+
+/// `BaseException.__setstate__` sets each key of a dict state, ignores `None`
+/// and refuses anything else; a user exception has a `__traceback__` once
+/// raised (and `None` before).
+#[test]
+fn exception_setstate_and_user_traceback() {
+    let src = r#"
+s = Exception(1); s.__setstate__({'a': 1, 'b': [2]}); s.__setstate__(None)
+st = [s.a, s.b, s.args]
+try:
+    s.__setstate__(5)
+except TypeError as te:
+    st.append(str(te))
+class E(Exception): pass
+try:
+    raise E(7)
+except E as x:
+    tb = [type(x.__traceback__).__name__, x.__traceback__.tb_lineno > 0, E(0).__traceback__]
+"#;
+    assert_eq!(g(src, "st"), "[1, [2], (1,), 'state is not a dictionary']");
+    assert_eq!(g(src, "tb"), "['traceback', True, None]");
+}
+
+/// `copy.copy`/`copy.deepcopy` of an exception go through
+/// `BaseException.__reduce__`: the class is called again with `args` (its
+/// `__init__` runs) and the `__dict__` is restored on top.
+#[test]
+fn copying_an_exception_follows_its_reduce_recipe() {
+    let src = r#"
+import copy
+class O(OSError): pass
+class P(Exception):
+    def __init__(self, a):
+        log.append(a)
+        super().__init__(a)
+log = []
+p = P(1); p.z = [1]
+c = copy.copy(p); dc = copy.deepcopy(p)
+cp = [c.args, c.z is p.z, dc.z is p.z, dc.z, dc.args, log, copy.copy(O(2, 'x', 'f')).filename]
+"#;
+    assert_eq!(
+        g(src, "cp"),
+        "[(1,), True, False, [1], (1,), [1, 1, 1], 'f']"
+    );
+}

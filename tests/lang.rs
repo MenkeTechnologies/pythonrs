@@ -10897,3 +10897,16 @@ a.b[c](d)
 "##
     );
 }
+
+/// `dict(globals(), **kw)` copies the module namespace: `globals()` is a
+/// mapping, not a sequence of pairs.
+#[test]
+fn dict_of_a_module_namespace_is_a_mapping() {
+    assert_eq!(
+        g(
+            "z = 1\nd = dict(globals(), a=2)\nx = (d['z'], d['a'], dict(vars(), q=3)['q'])",
+            "x"
+        ),
+        "(1, 2, 3)"
+    );
+}

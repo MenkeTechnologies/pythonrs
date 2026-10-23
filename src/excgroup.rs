@@ -52,7 +52,7 @@ pub fn group_parts(h: &PyHost, v: &Value) -> Option<(Value, Vec<Value>)> {
     }
     let args = match h.get(v) {
         Some(PyObj::Exception { args, .. }) => args.clone(),
-        Some(PyObj::Instance(i)) => h.exc_instance_args(&i.dict),
+        Some(PyObj::Instance(_)) => h.exc_instance_args(v),
         _ => return None,
     };
     let (msg, excs) = (args.first()?.clone(), args.get(1)?);

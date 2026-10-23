@@ -4923,6 +4923,128 @@ fn syntax_error_init(e: &Value, args: &[Value]) -> Result<(), String> {
     Ok(())
 }
 
+/// The data descriptors each builtin exception type defines itself (its
+/// `tp_getset` and `tp_members`), in definition order; `true` marks a getset
+/// descriptor (`<attribute 'args' of 'BaseException' objects>`), `false` a
+/// member (`<member 'errno' of 'OSError' objects>`). `__dict__` aside. Measured
+/// against the oracle, not reasoned about; regenerate with:
+///
+/// ```text
+/// python3 -c 'import builtins
+/// for n, c in vars(builtins).items():
+///     if isinstance(c, type) and issubclass(c, BaseException):
+///         print(n, [(k, type(v).__name__) for k, v in vars(c).items()
+///                   if type(v).__name__ in ("getset_descriptor", "member_descriptor")
+///                   and k not in ("__dict__", "__weakref__")])'
+/// ```
+///
+/// These live outside the instance `__dict__` in CPython, which is why
+/// `ValueError('x').__dict__` is `{}` and `vars(OSError(2, 's'))` holds no
+/// `errno`.
+const EXCEPTION_MEMBERS: &[(&str, &[(&str, bool)])] = &[
+    (
+        "BaseException",
+        &[
+            ("__suppress_context__", false),
+            ("args", true),
+            ("__traceback__", true),
+            ("__context__", true),
+            ("__cause__", true),
+        ],
+    ),
+    (
+        "BaseExceptionGroup",
+        &[("message", false), ("exceptions", false)],
+    ),
+    ("SystemExit", &[("code", false)]),
+    ("AttributeError", &[("name", false), ("obj", false)]),
+    (
+        "ImportError",
+        &[
+            ("msg", false),
+            ("name", false),
+            ("path", false),
+            ("name_from", false),
+        ],
+    ),
+    ("NameError", &[("name", false)]),
+    (
+        "OSError",
+        &[
+            ("errno", false),
+            ("strerror", false),
+            ("filename", false),
+            ("filename2", false),
+            ("characters_written", true),
+        ],
+    ),
+    ("StopIteration", &[("value", false)]),
+    (
+        "SyntaxError",
+        &[
+            ("msg", false),
+            ("filename", false),
+            ("lineno", false),
+            ("offset", false),
+            ("text", false),
+            ("end_lineno", false),
+            ("end_offset", false),
+            ("print_file_and_line", false),
+            ("_metadata", false),
+        ],
+    ),
+    ("UnicodeDecodeError", UNICODE_ERROR_MEMBERS),
+    ("UnicodeEncodeError", UNICODE_ERROR_MEMBERS),
+    ("UnicodeTranslateError", UNICODE_ERROR_MEMBERS),
+];
+
+const UNICODE_ERROR_MEMBERS: &[(&str, bool)] = &[
+    ("encoding", false),
+    ("object", false),
+    ("start", false),
+    ("end", false),
+    ("reason", false),
+];
+
+/// The builtin exception type that defines method `meth` an exception type
+/// `class` inherits: `BaseException` for `add_note`, `with_traceback` and
+/// `__setstate__`, `BaseExceptionGroup` for the PEP 654 trio. A method
+/// descriptor reprs under its definer (`<method 'add_note' of 'BaseException'
+/// objects>`, reached as `ValueError.add_note`).
+pub(crate) fn exception_method_owner(class: &str, meth: &str) -> Option<&'static str> {
+    if !is_exception_class(class) {
+        return None;
+    }
+    match meth {
+        "add_note" | "with_traceback" | "__setstate__" => Some("BaseException"),
+        "split" | "subgroup" | "derive" => Some(excgroup::BASE_GROUP),
+        _ => None,
+    }
+}
+
+/// The data descriptors builtin exception type `class` itself defines.
+pub(crate) fn exception_own_members(class: &str) -> &'static [(&'static str, bool)] {
+    EXCEPTION_MEMBERS
+        .iter()
+        .find(|(owner, _)| *owner == class)
+        .map_or(&[], |(_, members)| members)
+}
+
+/// The builtin exception type in `class`'s MRO that defines the data
+/// descriptor `name`, and whether it is a getset (rather than a member)
+/// descriptor. `None` when `name` is no exception member of `class`.
+pub(crate) fn exception_member_owner(
+    h: &host::PyHost,
+    class: &str,
+    name: &str,
+) -> Option<(&'static str, bool)> {
+    h.mro_rc(class).iter().find_map(|c| {
+        let (owner, members) = EXCEPTION_MEMBERS.iter().find(|(o, _)| o == c)?;
+        let (_, getset) = members.iter().find(|(m, _)| *m == name)?;
+        Some((*owner, *getset))
+    })
+}
+
 /// The keyword-only attributes `AttributeError_init` (`name`, `obj`) and
 /// `NameError_init` (`name`) accept, in kwlist order; `UnboundLocalError`
 /// inherits `NameError`'s. `None` for a class whose `__init__` takes no
@@ -6678,7 +6800,17 @@ pub fn call_builtin_function(
     if let Some(base) = name.strip_suffix(".__new__").filter(|b| {
         matches!(
             *b,
-            "int" | "str" | "float" | "tuple" | "frozenset" | "list" | "dict" | "set"
+            "int"
+                | "str"
+                | "float"
+                | "complex"
+                | "bytes"
+                | "bytearray"
+                | "tuple"
+                | "frozenset"
+                | "list"
+                | "dict"
+                | "set"
         )
     }) {
         #[cfg(feature = "stdlib-ffi")]
@@ -8549,7 +8681,19 @@ fn call_named_builtin(
                 &args,
                 &kwargs,
             )?;
+            // A `bytes`/`bytearray` subclass exports its native payload's buffer.
             let v = obj.unwrap();
+            let v = with_host(|h| match h.get(&v) {
+                Some(PyObj::Instance(i))
+                    if matches!(
+                        h.get(&i.payload),
+                        Some(PyObj::Bytes(_) | PyObj::Bytearray(_))
+                    ) =>
+                {
+                    i.payload.clone()
+                }
+                _ => v,
+            });
             with_host(|h| {
                 let (len, readonly) = match h.get(&v) {
                     Some(PyObj::Bytes(b)) => (b.len(), true),
@@ -10619,6 +10763,17 @@ fn complex_parts(v: &Value, two_args: bool) -> Result<(f64, Option<f64>), String
             ))),
         });
     }
+    // A `complex` subclass that does not override `__complex__` inherits
+    // `complex.__complex__`, which returns its value.
+    if let Some(rc) = with_host(|h| match h.get(v) {
+        Some(PyObj::Instance(i)) => match h.get(&i.payload) {
+            Some(PyObj::Complex(r, im)) => Some((*r, Some(*im))),
+            _ => None,
+        },
+        _ => None,
+    }) {
+        return Ok(rc);
+    }
     match math_real(v) {
         Ok(f) => Ok((f, None)),
         // With a second argument the first is a REAL, not a "string or a
@@ -10742,6 +10897,16 @@ fn construct_float(args: &[Value]) -> Result<Value, String> {
 fn construct_dict(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, String> {
     let mut d: DictMap = DictMap::default();
     if let Some(v) = args.first() {
+        // `dict(globals())`: a module namespace is a dict in CPython.
+        let module_map = with_host(|h| {
+            let slot = h.module_dict_slot(v)?;
+            let mut m = DictMap::default();
+            for (k, val) in h.module_globals_pairs(slot) {
+                let kv = h.new_str(k.clone());
+                m.insert(PKey::Str(k), (kv, val));
+            }
+            Some(m)
+        });
         // dict(mapping): a real dict OR a dict-subclass instance (`class D(dict)`),
         // whose native dict lives in its payload — unwrap it so `dict(d)` copies
         // the pairs instead of iterating the instance as bare keys.
@@ -10761,7 +10926,8 @@ fn construct_dict(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, S
                 Some(PyObj::Dict(m)) => Some(m.clone()),
                 _ => None,
             })
-        });
+        })
+        .or(module_map);
         // A mapping that exposes `keys()` — a native user `Mapping` (ChainMap,
         // UserDict) or a foreign (CPython) object — is copied via keys()+subscript,
         // matching CPython, instead of being iterated as bare keys / pairs.
@@ -12082,6 +12248,18 @@ fn copy_protocol(v: &Value, memo: Option<&Value>) -> Result<Option<Value>, Strin
         )?)
     } else if copy_hook(v, "__reduce__") {
         Some(host::call_method(v, "__reduce__", vec![], vec![])?)
+    } else if with_host(
+        |h| matches!(h.get(v), Some(PyObj::Instance(i)) if h.class_is_exception(&i.class)),
+    ) {
+        // `BaseException` defines `__reduce__`, so an exception copies by
+        // its recipe: `type(e)(*e.args)` (its `__init__` runs again) with
+        // the `__dict__` restored on top — its members are not in the dict.
+        Some(host::call_method(
+            v,
+            "__reduce_ex__",
+            vec![Value::Int(4)],
+            vec![],
+        )?)
     } else {
         None
     };
@@ -15822,7 +16000,12 @@ fn own_dir_names(typename: &str) -> Vec<&'static str> {
         ]),
         t if is_iter_protocol_type(t) => out.extend_from_slice(&["__next__", "__iter__"]),
         t if is_exception_class(t) => {
-            out.extend_from_slice(&["with_traceback", "add_note"]);
+            out.extend_from_slice(&["with_traceback", "add_note", "__setstate__", "__dict__"]);
+            // The data descriptors every type in the MRO defines (`args`,
+            // `__traceback__`, `errno`, …).
+            for c in builtin_mro(t) {
+                out.extend(exception_own_members(&c).iter().map(|(m, _)| *m));
+            }
             // PEP 654 adds the group protocol on top of `BaseException`'s.
             if t == excgroup::GROUP || t == excgroup::BASE_GROUP {
                 out.extend_from_slice(&["split", "subgroup", "derive"]);
@@ -15960,6 +16143,16 @@ pub fn type_has_method(typename: &str, name: &str) -> bool {
     if type_data_attrs(typename).contains(&name) || type_classmethods(typename).contains(&name) {
         return true;
     }
+    // An exception type's data descriptors (`args`, `__cause__`, `errno`, …)
+    // and its `__dict__` getset, which `get_attr` resolves as attributes.
+    if is_exception_class(typename)
+        && (name == "__dict__"
+            || builtin_mro(typename)
+                .iter()
+                .any(|c| exception_own_members(c).iter().any(|(m, _)| *m == name)))
+    {
+        return true;
+    }
     // `__contains__` is a real bound method on every builtin container in CPython
     // (`frozenset(kwlist).__contains__` is exactly how the stdlib `keyword.py`
     // builds `iskeyword`). Recognize it explicitly — it is kept OUT of the
@@ -16020,7 +16213,9 @@ pub fn type_has_method(typename: &str, name: &str) -> bool {
         // A plain `_thread.lock` has no ownership notion — `_is_owned` is
         // REENTRANT-only, and advertising it on a plain lock makes
         // `threading.Condition` bind a method that cannot answer.
-        _ if is_exception_class(typename) && matches!(name, "with_traceback" | "add_note") => {
+        _ if is_exception_class(typename)
+            && matches!(name, "with_traceback" | "add_note" | "__setstate__") =>
+        {
             return true
         }
         excgroup::GROUP | excgroup::BASE_GROUP
@@ -17499,7 +17694,7 @@ pub fn instance_object_dunder(
             if with_host(|h| is_exception_value(h, recv, &h.type_name(recv))) {
                 exception_reduce(recv)
             } else {
-                builtin_base_reduce(recv, class)
+                builtin_base_reduce(recv, class, 2)
                     .unwrap_or_else(|| instance_common_reduce(recv, class, 0))
             }
         }
@@ -17564,7 +17759,7 @@ fn instance_reduce_ex(recv: &Value, class: &str, protocol: i64) -> Result<Value,
     if with_host(|h| is_exception_value(h, recv, &h.type_name(recv))) {
         return exception_reduce(recv);
     }
-    if let Some(r) = builtin_base_reduce(recv, class) {
+    if let Some(r) = builtin_base_reduce(recv, class, protocol) {
         return r;
     }
     instance_common_reduce(recv, class, protocol)
@@ -17573,15 +17768,19 @@ fn instance_reduce_ex(recv: &Value, class: &str, protocol: i64) -> Result<Value,
 /// The recipe of a builtin base that defines its own `__reduce__`, applied to a
 /// subclass instance: `set`/`frozenset` (`set_reduce`) rebuild as
 /// `(type(self), (list(self),), state)`, the state being `object_getstate`'s.
+/// `bytearray` (`_common_reduce` in `Objects/bytearrayobject.c`) rebuilds as
+/// `(type(self), bytearray_reduce_args, state)` at the protocol asked (its
+/// `__reduce__` is protocol 2).
 /// `None` for every other base, which uses `object`'s protocol.
-fn builtin_base_reduce(recv: &Value, class: &str) -> Option<Result<Value, String>> {
+fn builtin_base_reduce(recv: &Value, class: &str, protocol: i64) -> Option<Result<Value, String>> {
     let base = with_host(|h| h.builtin_base_of(class))?;
-    if !matches!(base, "set" | "frozenset") {
-        return None;
-    }
-    let args = match call_builtin_function("list", vec![recv.clone()], vec![]) {
-        Ok(items) => vec![items],
-        Err(e) => return Some(Err(e)),
+    let args = match base {
+        "set" | "frozenset" => match call_builtin_function("list", vec![recv.clone()], vec![]) {
+            Ok(items) => vec![items],
+            Err(e) => return Some(Err(e)),
+        },
+        "bytearray" => bytearray_reduce_args(as_bytes_object(recv).ok()??, protocol),
+        _ => return None,
     };
     Some(object_getstate(recv, class, false).map(|state| {
         with_host(|h| {
@@ -18383,7 +18582,7 @@ pub fn call_type_method(
         // (there is no traceback object to attach), and `add_note` appends to
         // `__notes__`, which `traceback` renders. `unittest.assertRaises` stores
         // its captured exception with `exc.with_traceback(None)`.
-        _ if matches!(name, "with_traceback" | "add_note")
+        _ if matches!(name, "with_traceback" | "add_note" | "__setstate__")
             && with_host(|h| is_exception_value(h, recv, &tn)) =>
         {
             if name == "with_traceback" {
@@ -18397,6 +18596,9 @@ pub fn call_type_method(
                     ));
                 }
                 return Ok(recv.clone());
+            }
+            if name == "__setstate__" {
+                return exception_setstate(recv, arg0(&args)?);
             }
             exception_add_note(recv, arg0(&args)?)?;
             Ok(Value::Undef)
@@ -18661,6 +18863,25 @@ fn is_exception_value(h: &host::PyHost, v: &Value, tn: &str) -> bool {
 
 /// `BaseException.add_note(note)` (`BaseException_add_note_impl`): append to the
 /// exception's `__notes__` list IN PLACE, creating the list on first use.
+/// `BaseException.__setstate__(state)` (`BaseException___setstate___impl`): a
+/// dict state is applied with `setattr` key by key, `None` is ignored, and
+/// anything else is refused. `pickle` calls it to restore an exception's
+/// `__dict__`.
+fn exception_setstate(exc: &Value, state: Value) -> Result<Value, String> {
+    if matches!(state, Value::Undef) {
+        return Ok(Value::Undef);
+    }
+    let items = with_host(|h| match h.get(&state) {
+        Some(PyObj::Dict(d)) => Some(d.values().cloned().collect::<Vec<_>>()),
+        _ => None,
+    })
+    .ok_or_else(|| host::type_error("state is not a dictionary"))?;
+    for (k, v) in items {
+        call_builtin_function("setattr", vec![exc.clone(), k, v], vec![])?;
+    }
+    Ok(Value::Undef)
+}
+
 fn exception_add_note(exc: &Value, note: Value) -> Result<(), String> {
     with_host(|h| {
         if h.as_str(&note).is_none() {
@@ -22595,6 +22816,11 @@ pub(crate) fn as_bytes_object(v: &Value) -> Result<Option<Vec<u8>>, String> {
     with_host(|h| match h.get(v) {
         Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) => Ok(Some(b.clone())),
         Some(PyObj::Memoryview { .. }) => h.mv_bytes(v).map(Some),
+        // A `bytes`/`bytearray` subclass instance IS one: its native payload.
+        Some(PyObj::Instance(i)) => match h.get(&i.payload) {
+            Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) => Ok(Some(b.clone())),
+            _ => Ok(None),
+        },
         _ => Ok(None),
     })
 }

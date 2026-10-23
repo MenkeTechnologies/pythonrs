@@ -9,6 +9,46 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **`bytes`, `bytearray` and `complex` subclasses carry a native payload.**
+  `class B(bytes)` instances reprd as bare objects and failed `len()`, `[]`,
+  iteration, `hash` and every `bytes` method. A `bytearray` subclass reprs
+  under its own name (`BA(b'xy')`, as `bytearray_repr` prints `tp_name`) and
+  fills through `super().__init__`; `complex(c)` of a subclass instance, a
+  `memoryview` over one and `bytes.join` of them take the payload; a
+  `bytearray` subclass reduces with `bytearray`'s own `__reduce_ex__` recipe.
+- **`cls.__new__` of a builtin subclass is its base's `tp_new`.**
+  `S.__new__(S, 'z')` for `class S(str)` raised `object.__new__(S) is not
+  safe`, so `copyreg.__newobj__` could not rebuild one and `pickle` of every
+  builtin subclass (`str`, `int`, `list`, `bytes`, `complex`, `bytearray`)
+  failed; the class mirror now carries a `__new__` that reaches the native
+  `tp_new`. `T.__new__` reprs as `<built-in method __new__ of type object at …>`.
+- **`dir()` of a class built on a builtin type lists the base's surface**
+  (`append` for `class L(list)`, `add_note`/`args` for `class E(KeyError)`),
+  and `getattr(L, '__add__')` is the base's slot wrapper.
+- **Exception members live outside the instance `__dict__`.** `args`,
+  `__cause__`, `__context__`, `__suppress_context__`, `__traceback__` and each
+  builtin type's own members (`OSError`'s `errno`/`strerror`/`filename`/
+  `filename2`/`characters_written`, `SyntaxError`'s position fields,
+  `ImportError`'s `name`/`path`, …) are data descriptors of the defining type:
+  `vars(E(1))` holds only assigned attributes (it held `args`),
+  `ValueError('x').__dict__` is `{}` (it was an `AttributeError`),
+  `ValueError.args` is `<attribute 'args' of 'BaseException' objects>`,
+  `OSError.errno` is `<member 'errno' of 'OSError' objects>`, and `dir()` of
+  every exception type lists them with `__dict__` and `__setstate__`.
+  `BaseException.__setstate__` exists, a user exception has a `__traceback__`
+  (it was an `AttributeError` even after a raise), `ValueError.add_note` reprs
+  under `BaseException`, and `copy.copy`/`copy.deepcopy` of an exception follow
+  its `__reduce__` recipe (the class is called again with `args`).
+- **Pickling a user exception over the bridge.** `pickle.dumps(E('a'))` raised
+  `Can't pickle <class '__main__.E'>: it's not the same object as
+  __main__.E`. An exception class now crosses as the mirror its instances
+  cross as, calling that mirror builds the native exception, the pickled
+  recipe is the native one (it carries the `__dict__`), and an attribute
+  CPython sets on the mirror instance (`__setstate__`) is set on the native
+  exception. `functools.singledispatch` on a user exception class dispatches
+  its instances.
+- **`dict(globals(), a=1)`** read the module namespace as a sequence of pairs
+  (`dictionary update sequence element #0 has length 8; 2 is required`).
 - **`format(x)` of a bridged object looks `__format__` up on `type(x)`.**
   `format(EnumClass)`, `f'{EnumClass}'` and `'{}'.format(EnumClass)` read the
   class's own `__format__` attribute — the unbound `Enum.__format__` — and
@@ -2724,9 +2764,7 @@ written.
   builtin types (and their values) is CPython's full listing, but the other
   native kinds still come back empty — a function, a bound or unbound method, a
   builtin function, `super`, `staticmethod`/`classmethod`, a code object — or
-  partial (a container iterator lacks `__length_hint__`/`__setstate__`; an
-  exception lacks `args`/`__traceback__`/
-  `__cause__`/`__context__`/`__suppress_context__`/`__dict__`/`__setstate__`;
+  partial (a container iterator lacks `__length_hint__`/`__setstate__`;
   `dict_keys`/`dict_items` lack the set operators and `mapping`; `memoryview`
   lacks `cast`/`count`/`index`/`toreadonly`/`suboffsets`/`__enter__`/`__exit__`).
   Listing them is gated on attribute access agreeing name for name, and several
@@ -3201,26 +3239,24 @@ entry. These remain open:
   does not evaluate `c`; a format spec's `{{` is read as an escaped brace
   where CPython reads a nested field (`f"{x:a{{b}}}"`). A compiler error from
   `compile()` over a file carries `text=None` where CPython reads the line.
-- **`bytes`, `bytearray` and `complex` subclasses have no native payload.**
-  `class By(bytes)` instances fail `len()` (`'By' object has no attribute
-  '__len__'`), `By.fromhex` is missing, and the same holds for `bytearray`
-  and `complex` bases: `PyHost::builtin_base_of` knows only the str/int/float/
-  tuple/list/dict/set/frozenset and `collections` bases.
-- **An exception's `__dict__`.** A user exception's `e.__dict__` includes the
-  internal `args` entry (`{'args': ('a', 1)}` where CPython reads `{}`), and a
-  builtin exception has no `__dict__` at all (`ValueError('x').__dict__` is an
-  `AttributeError`; CPython reads `{}`, then `{'q': 1}` after `v.q = 1`).
-- **Pickling a user exception over the bridge.** `pickle.dumps(E('a'))` with
-  `class E(Exception)` raises `PicklingError: Can't pickle <class
-  '__main__.E'>: it's not the same object as __main__.E` — the exception
-  crosses as its CPython mirror class, which is not the object `__main__.E`
-  resolves to. A plain user instance pickles.
-- **`dir()` of a builtin exception lists only `object`'s surface and
-  `add_note`/`with_traceback`.** CPython's `dir(Exception)` also has
-  `__cause__`, `__context__`, `__dict__`, `__setstate__`,
-  `__suppress_context__`, `__traceback__` and `args`, and each subclass its own
-  members (`OSError`'s `errno`, `strerror`, `filename`, `filename2`,
-  `characters_written`; `SyntaxError`'s position fields; …).
+- **A function's `__dict__` is a snapshot.** `f.__dict__['b'] = 2` does not
+  set `f.b` (CPython: the dict IS the attribute store). A builtin exception's
+  `__dict__` is the same kind of snapshot, so a write into
+  `ValueError('x').__dict__` is lost too; a user exception's is live.
+- **Pickle protocols 0 and 1 of a builtin subclass.** `pickle.dumps(S('q'), 0)`
+  with `class S(str)` loads to `TypeError: str.__new__(S): S is not a subtype
+  of str`: `copyreg._reconstructor` calls `str.__new__(S_mirror, …)` and the
+  class mirror is no CPython `str` subclass. Protocol 2 and above round-trip.
+- **`list.__new__(L, [1])` fills the payload** (`[1]`; CPython's `list_new`
+  ignores its arguments, giving `[]` until `__init__` runs). The same holds for
+  `dict`/`set`/`bytearray` bases; a subclass `__new__` that calls
+  `super().__new__(cls, it)` with no `__init__` relies on that fill today.
+- **`memoryview(B(b'x')).obj` is the `bytes` payload**, not the `B` instance.
+- **`Cls.__weakref__`** on a user class is an `AttributeError` (CPython: the
+  `<attribute '__weakref__' of 'Cls' objects>` getset), and `E().__new__` on a
+  user exception instance is an `AttributeError` (CPython: `E.__new__`).
+- **`dir(ExceptionGroup)`** lacks `__class_getitem__`, `__module__` and
+  `__weakref__`.
 - **`inspect` on pythonrs functions and instances over the bridge.**
   `inspect.signature(A.f)` raises `cannot pass 'code' to a CPython stdlib
   call` (it reads `__code__` off the callback proxy), and

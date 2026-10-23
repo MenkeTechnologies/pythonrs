@@ -1547,6 +1547,87 @@ b'\x80\x02}q\x00X\x01\x00\x00\x00kq\x01c__main__\nP\nq\x02)\x81q\x03}q\x04X\x01\
     );
 }
 
+/// A builtin subclass (`class S(str)`, `class BA(bytearray)`, …) unpickles as
+/// itself: its mirror carries the base's `tp_new`, which `copyreg.__newobj__`
+/// calls. A user exception unpickles as itself with its `__dict__`: the class
+/// crosses as the mirror its instances cross as, calling that mirror builds the
+/// native exception, and the recipe is the native one. Expected output is
+/// python3.14's.
+#[test]
+fn pickle_round_trips_builtin_subclasses_and_user_exceptions() {
+    let src = "\
+import pickle, contextlib
+class S(str): pass
+class I(int): pass
+class L(list): pass
+class B(bytes): pass
+class C(complex): pass
+class BA(bytearray): pass
+for v in (S('q'), I(2), L([1, 2]), B(b'b'), C(1, 2), BA(b'ba')):
+    for proto in (2, 3, 4):
+        r = pickle.loads(pickle.dumps(v, proto))
+        print(proto, type(r).__name__, repr(r), r == v)
+class E(Exception):
+    def __init__(self, a, b=3):
+        super().__init__(a)
+        self.b = b
+class O(OSError): pass
+e = E(1); e.extra = 'x'
+r = pickle.loads(pickle.dumps(e))
+print(type(r) is E, r.args, r.b, r.extra, vars(r))
+print(pickle.loads(pickle.dumps(E)) is E)
+o = pickle.loads(pickle.dumps(O(2, 'nf', 'f')))
+print(type(o) is O, o.errno, o.strerror, o.filename, str(o))
+p = pickle.loads(pickle.dumps([e, e]))
+print(p[0] is p[1], p[0].extra)
+with contextlib.suppress(E):
+    raise E(9)
+print('suppressed')
+import functools
+@functools.singledispatch
+def kind(x): return 'default'
+@kind.register
+def _(x: E): return 'E'
+print(kind(E(1)), kind(ValueError()))
+";
+    let (stdout, stderr, ok) = run_py(src);
+    if bridge_unavailable(ok, &stderr) {
+        eprintln!("skipping pickle test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(
+        stdout,
+        r#"
+2 S 'q' True
+3 S 'q' True
+4 S 'q' True
+2 I 2 True
+3 I 2 True
+4 I 2 True
+2 L [1, 2] True
+3 L [1, 2] True
+4 L [1, 2] True
+2 B b'b' True
+3 B b'b' True
+4 B b'b' True
+2 C (1+2j) True
+3 C (1+2j) True
+4 C (1+2j) True
+2 BA BA(b'ba') True
+3 BA BA(b'ba') True
+4 BA BA(b'ba') True
+True (1,) 3 x {'b': 3, 'extra': 'x'}
+True
+True 2 nf f [Errno 2] nf: 'f'
+True x
+suppressed
+E default
+"#
+        .trim_start(),
+        "stderr={stderr}"
+    );
+}
+
 /// `object.__reduce_ex__` on a user instance is CPython's (`reduce_newobj`,
 /// `object_getstate`, `copyreg._reduce_ex`): a class's own `__getstate__`,
 /// `__reduce__`, `__getnewargs__` and `__getnewargs_ex__` are honoured, slot
