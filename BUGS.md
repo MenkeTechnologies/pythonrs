@@ -9,6 +9,13 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **Concurrent programs no longer see a half-imported `typing`.** Two hosts on
+  two threads share one embedded CPython; a `@dataclass` in one while the other
+  ran `typing`'s module body for the first time raised `AttributeError:
+  partially initialized module 'typing' has no attribute 'ClassVar'`
+  (`dataclasses` reads `sys.modules.get('typing')` without the import lock — the
+  same race exists between plain CPython threads). The bridge imports `typing`
+  while it starts the interpreter.
 - **A CPython descriptor in a native class binds.** `g =
   functools.partialmethod(f, 1)` and `functools.singledispatchmethod` in a
   class body: `a.g(2)` raised `'partialmethod' object is not callable`; the

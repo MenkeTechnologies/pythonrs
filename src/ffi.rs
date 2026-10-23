@@ -279,8 +279,25 @@ pub fn init() -> bool {
         INTERPRETER_STARTED.store(true, std::sync::atomic::Ordering::Relaxed);
         route_std_streams();
         install_main_module_hook();
+        preload_unlocked_probes();
     });
     BRIDGE_USABLE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Import, while the interpreter starts and before any program runs, the
+/// stdlib modules CPython code reads out of `sys.modules` WITHOUT the import
+/// lock. `dataclasses._process_class` does `sys.modules.get('typing')` and then
+/// `typing.ClassVar`: while another thread is still executing `typing`'s module
+/// body, that finds the partially initialized module and the decorator raises
+/// `AttributeError: partially initialized module 'typing' has no attribute
+/// 'ClassVar'`. Plain CPython has the same race between its own threads; here
+/// every pythonrs host on every thread shares one interpreter, so programs that
+/// share nothing hit it (two test threads, one importing `typing`, one
+/// decorating a dataclass). With `typing` imported up front there is no window.
+fn preload_unlocked_probes() {
+    Python::attach(|py| {
+        let _ = py.import("typing");
+    });
 }
 
 /// CPython's `__main__` is the embedded interpreter's own, empty module, while
