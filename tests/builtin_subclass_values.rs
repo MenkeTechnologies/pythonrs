@@ -215,3 +215,13 @@ out = [repr(ExceptionGroup[int]), BaseExceptionGroup[ValueError].__args__, repr(
         r#"['ExceptionGroup[int]', (<class 'ValueError'>,), '__main__.E[int]', '__main__.L[int]', '<built-in method __class_getitem__ of type object', '<built-in method __class_getitem__ of type object', True]"#
     );
 }
+
+/// A strided memoryview slice still reports the original exporter as `obj`.
+#[test]
+fn a_strided_memoryview_slice_keeps_its_exporter() {
+    let src = "
+b = b'abcd'; ba = bytearray(b'wxyz')
+out = [memoryview(b)[::2].obj is b, memoryview(ba)[::-1].obj is ba, memoryview(b)[::2][::1].obj is b]
+";
+    assert_eq!(g(src, "out"), "[True, True, True]");
+}

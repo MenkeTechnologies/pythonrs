@@ -1752,6 +1752,16 @@ def make_mirror(name, bases, members, native_new, builtin_base):
             pass
     return types.new_class(name, bases or (object,), {'metaclass': PyrsMirror}, body)
 
+def make_code(name, qualname, filename, firstlineno, argcount, posonly, kwonly,
+              flags, varnames):
+    # A code object carrying a pythonrs function's `co_*` attributes.
+    def stub(): pass
+    return stub.__code__.replace(
+        co_name=name, co_qualname=qualname, co_filename=filename,
+        co_firstlineno=firstlineno, co_argcount=argcount,
+        co_posonlyargcount=posonly, co_kwonlyargcount=kwonly, co_flags=flags,
+        co_varnames=varnames, co_nlocals=len(varnames))
+
 def base_value(obj, base):
     # The builtin value a mirror instance (a CPython `str`/`list`/... subclass
     # instance `copyreg._reconstructor` built) holds, read through the base
@@ -2613,6 +2623,29 @@ fn value_to_py_node<'py>(
                 py.import("builtins")
                     .and_then(|m| m.getattr("property"))
                     .and_then(|p| p.call1((pget, pset, pdel)))
+                    .map_err(|e| e.to_string())
+            }
+            // A native function's code object crosses as a real CPython code
+            // object with the same `co_*` surface (no bytecode of its own), so
+            // `inspect.getsourcelines`, `inspect.isgeneratorfunction` and friends
+            // read what they read off a CPython function.
+            Some(PyObj::Code { def_id }) => {
+                let p = host.code_parts(*def_id);
+                mirror_helper(py)?
+                    .getattr("make_code")
+                    .and_then(|f| {
+                        f.call1((
+                            p.name,
+                            p.qualname,
+                            p.filename,
+                            p.firstlineno,
+                            p.argcount,
+                            p.posonly,
+                            p.kwonly,
+                            p.flags,
+                            PyTuple::new(py, &p.varnames)?,
+                        ))
+                    })
                     .map_err(|e| e.to_string())
             }
             // Likewise a `functools.cached_property`; the class it lands in
@@ -3666,6 +3699,28 @@ impl PyrsCallable {
     fn set_module(&mut self, value: Py<PyAny>) {
         self.module = Some(value);
     }
+
+    /// A pythonrs function reports `types.FunctionType` as its `__class__`, a
+    /// method bound to one `types.MethodType`. `isinstance` falls back to
+    /// `__class__` when the real type does not match (`object_isinstance`), so
+    /// `inspect.isfunction`/`ismethod` — and everything built on them,
+    /// `getsourcelines`, `getmembers(C, isfunction)` — recognize the proxy.
+    #[getter(__class__)]
+    fn get_class<'py>(slf: Bound<'py, Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let kind = with_host(|h| match h.get(&slf.borrow().target) {
+            Some(PyObj::Func(_)) => Some("FunctionType"),
+            Some(PyObj::BoundMethod { func, .. })
+                if matches!(h.get(func), Some(PyObj::Func(_))) =>
+            {
+                Some("MethodType")
+            }
+            _ => None,
+        });
+        match kind {
+            Some(name) => py.import("types")?.getattr(name),
+            None => Ok(slf.get_type().into_any()),
+        }
+    }
     /// Delegate a missing attribute (function dunder like `__name__` /
     /// `__qualname__` / `__module__`) to the wrapped fusevm callable, so
     /// `functools.update_wrapper` can copy them off it. `__getattr__` runs only
@@ -3724,21 +3779,29 @@ impl PyrsCallable {
     ) -> PyResult<Bound<'py, PyAny>> {
         // `classmethod.__get__` binds the owner (or `type(obj)`), and
         // `staticmethod.__get__` binds nothing, on instance and class access alike.
+        // Either binds the wrapped FUNCTION, as CPython's do: `C.s` is the plain
+        // function and `C.c.__func__` the function itself.
         let kind = with_host(|h| match h.get(&slf.borrow().target) {
-            Some(PyObj::ClassMethod(_)) => Some(true),
-            Some(PyObj::StaticMethod(_)) => Some(false),
+            Some(PyObj::ClassMethod(inner)) => Some((true, inner.clone())),
+            Some(PyObj::StaticMethod(inner)) => Some((false, inner.clone())),
             _ => None,
         });
         match kind {
-            Some(true) => {
+            Some((true, inner)) => {
                 let cls = match (_owner, obj) {
                     (Some(owner), _) if !owner.is_none() => owner,
                     (_, Some(instance)) if !instance.is_none() => instance.get_type().into_any(),
                     _ => return Ok(slf.into_any()),
                 };
-                return py.import("types")?.getattr("MethodType")?.call1((slf, cls));
+                let func = with_host(|h| value_to_py(h, py, &inner)).map_err(rs_err)?;
+                return py
+                    .import("types")?
+                    .getattr("MethodType")?
+                    .call1((func, cls));
             }
-            Some(false) => return Ok(slf.into_any()),
+            Some((false, inner)) => {
+                return with_host(|h| value_to_py(h, py, &inner)).map_err(rs_err);
+            }
             None => {}
         }
         match obj {

@@ -102,3 +102,17 @@ out = [g('x'), m.get('zz', P.__name__), sorted(m.keys())[0], m.copy()['x'], repr
         r#"[1, 'P', '__dict__', 1, '<built-in method items']"#
     );
 }
+
+/// `ExceptionGroup` is a heap type: it lists `__module__` and `__weakref__`,
+/// its `__weakref__` getset is its own, and a subclass inherits it.
+#[test]
+fn exception_group_carries_its_heap_type_slots() {
+    let src = r#"
+class E(ExceptionGroup): pass
+out = [sorted(set(dir(ExceptionGroup)) - set(dir(BaseExceptionGroup))), repr(ExceptionGroup.__weakref__), repr(E.__weakref__), [n for n in dir(ExceptionGroup) if not hasattr(ExceptionGroup, n)]]
+"#;
+    assert_eq!(
+        g(src, "out"),
+        r#"[['__module__', '__weakref__'], "<attribute '__weakref__' of 'ExceptionGroup' objects>", "<attribute '__weakref__' of 'ExceptionGroup' objects>", []]"#
+    );
+}

@@ -2572,6 +2572,8 @@ impl Compiler {
         // `__qualname__`: the dotted path to this entity. Its own name is joined
         // to the enclosing prefix; its body then defines nested entities under an
         // extended prefix (`.<locals>.` for a function, `.` for a class body).
+        // The statement line of the `def` (or `lambda`) being built.
+        let firstlineno = self.cur_line;
         let qualname = format!("{}{}", self.qual_prefix, qual_name);
         let saved_prefix = self.qual_prefix.clone();
         self.qual_prefix = match kind {
@@ -2773,6 +2775,7 @@ impl Compiler {
             linked: None,
             unit: 0,
             binds_class_cell,
+            firstlineno,
         };
         self.functions.push((name.to_string(), def));
         if kind.is_function() && !is_gen_or_async && !self.debug && stays_in_chunk(body) {

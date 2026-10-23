@@ -350,6 +350,11 @@ pub struct FuncDef {
     /// CPython's implicit `__class__` cell.
     #[serde(default)]
     pub binds_class_cell: bool,
+    /// The line of the `def` (its first decorator's, when decorated):
+    /// `co_firstlineno`, which `inspect.getsourcelines` starts from. `0`
+    /// for a function no source line is recorded for.
+    #[serde(default)]
+    pub firstlineno: u32,
 }
 
 impl FuncDef {
@@ -393,6 +398,7 @@ impl FuncDef {
             linked: self.linked,
             unit: self.unit,
             binds_class_cell: self.binds_class_cell,
+            firstlineno: self.firstlineno,
         }
     }
 }
@@ -11501,8 +11507,10 @@ impl PyHost {
                 released: false,
                 hashed: Default::default(),
             });
-            if let (Some(e), Value::Obj(id)) = (exporter, &view) {
-                self.mv_exporter.insert(*id, e);
+            // The copy stands in for a strided view of the same exporter: `obj`
+            // is still the object the parent view was taken of.
+            if let Value::Obj(id) = &view {
+                self.mv_exporter.insert(*id, exporter.unwrap_or(obj));
             }
             return Ok(view);
         }
@@ -14810,6 +14818,14 @@ impl PyHost {
                 };
                 Ok(self.new_str(m))
             }
+            // `ExceptionGroup.__weakref__`: the getset its heap type installs.
+            Some(PyObj::Builtin(n)) if n == crate::excgroup::GROUP && name == "__weakref__" => {
+                Ok(self.alloc(PyObj::Descriptor {
+                    kind: DescKind::GetSetDescriptor,
+                    qual: format!("{n}.__weakref__"),
+                    recv: None,
+                }))
+            }
             // A builtin exception type's members are data descriptors on the
             // type (`ValueError.args`, `OSError.errno`).
             Some(PyObj::Builtin(n))
@@ -15622,6 +15638,8 @@ impl PyHost {
                     "type" | "OrderedDict" => (true, true),
                     "set" | "frozenset" | "deque" => (false, true),
                     "int" | "bool" | "tuple" | "bytes" => (false, true),
+                    // `ExceptionGroup` is a heap type with its own `__weakref__`.
+                    b if b == crate::excgroup::GROUP => (true, true),
                     b => (crate::builtins::is_exception_class(b), false),
                 }
             };
@@ -19924,6 +19942,20 @@ fn too_many_positional(np: usize, ndef: usize, posgiven: usize, kwonly_given: us
 
 // ── more host operations referenced from builtins ────────────────────────────
 
+/// What a native function's code object reports (`co_name`, `co_varnames`,
+/// …), read off its `FuncDef`; the bridge builds a CPython code object from it.
+pub struct CodeParts {
+    pub name: String,
+    pub qualname: String,
+    pub argcount: usize,
+    pub posonly: usize,
+    pub kwonly: usize,
+    pub flags: i64,
+    pub varnames: Vec<String>,
+    pub filename: String,
+    pub firstlineno: u32,
+}
+
 impl PyHost {
     /// Resolve a function introspection dunder to its value: `__name__` /
     /// `__qualname__` from the `FuncDef`, `__module__` is always `__main__` (the
@@ -19933,7 +19965,7 @@ impl PyHost {
     /// `FuncDef`. Covers the surface the faithful stdlib reads: `types` (only
     /// needs the type + `co_flags`), `inspect.signature`
     /// (argcounts/varnames/flags), `functools`, `dataclasses`.
-    fn code_attr(&mut self, def_id: usize, name: &str) -> Result<Value, String> {
+    pub fn code_parts(&self, def_id: usize) -> CodeParts {
         // CPython 3.14 co_flags bits (`Include/cpython/code.h`), named exactly as
         // `dis.COMPILER_FLAG_NAMES` lists them.
         //
@@ -19953,8 +19985,6 @@ impl PyHost {
         const CO_HAS_DOCSTRING: i64 = 0x0400_0000;
         /// Defined directly in a class body (3.14 only).
         const CO_METHOD: i64 = 0x0800_0000;
-        // Pull every field under one short immutable borrow so the alloc/new_str
-        // below (which need `&mut self`) don't conflict with it.
         let (
             co_name,
             co_qualname,
@@ -20022,9 +20052,10 @@ impl PyHost {
                 d.is_annotate,
             )
         };
+        let firstlineno = self.funcs[def_id].firstlineno.max(1);
         // co_varnames: parameters (positional then keyword-only), then
         // `*args`/`**kwargs`, then any remaining body locals.
-        let varnames = || -> Vec<String> {
+        let varnames = {
             let mut names = params.clone();
             names.extend(kwonly.iter().cloned());
             if let Some(s) = star.as_ref().filter(|s| !s.is_empty()) {
@@ -20045,27 +20076,40 @@ impl PyHost {
             }
             names
         };
+        let filename = match self.tb_filename.as_str() {
+            "" => "<string>".to_string(),
+            f => f.to_string(),
+        };
+        CodeParts {
+            name: co_name,
+            qualname: co_qualname,
+            argcount: params.len(),
+            posonly,
+            kwonly: kwonly.len(),
+            flags,
+            varnames,
+            filename,
+            firstlineno,
+        }
+    }
+
+    /// A `co_*` attribute of a function's code object (see [`Self::code_parts`]).
+    fn code_attr(&mut self, def_id: usize, name: &str) -> Result<Value, String> {
+        let p = self.code_parts(def_id);
         match name {
-            "co_name" => Ok(self.new_str(co_name)),
-            "co_qualname" => Ok(self.new_str(co_qualname)),
-            "co_argcount" => Ok(Value::Int(params.len() as i64)),
-            "co_posonlyargcount" => Ok(Value::Int(posonly as i64)),
-            "co_kwonlyargcount" => Ok(Value::Int(kwonly.len() as i64)),
-            "co_flags" => Ok(Value::Int(flags)),
+            "co_name" => Ok(self.new_str(p.name)),
+            "co_qualname" => Ok(self.new_str(p.qualname)),
+            "co_argcount" => Ok(Value::Int(p.argcount as i64)),
+            "co_posonlyargcount" => Ok(Value::Int(p.posonly as i64)),
+            "co_kwonlyargcount" => Ok(Value::Int(p.kwonly as i64)),
+            "co_flags" => Ok(Value::Int(p.flags)),
             "co_varnames" => {
-                let vals: Vec<Value> = varnames().into_iter().map(|n| self.new_str(n)).collect();
+                let vals: Vec<Value> = p.varnames.into_iter().map(|n| self.new_str(n)).collect();
                 Ok(self.new_tuple(vals))
             }
-            "co_nlocals" => Ok(Value::Int(varnames().len() as i64)),
-            "co_filename" => {
-                let f = self.tb_filename.clone();
-                Ok(self.new_str(if f.is_empty() {
-                    "<string>".to_string()
-                } else {
-                    f
-                }))
-            }
-            "co_firstlineno" => Ok(Value::Int(1)),
+            "co_nlocals" => Ok(Value::Int(p.varnames.len() as i64)),
+            "co_filename" => Ok(self.new_str(p.filename)),
+            "co_firstlineno" => Ok(Value::Int(p.firstlineno as i64)),
             "co_freevars" => {
                 let fv = self.funcs[def_id].freevars.clone();
                 let vals: Vec<Value> = fv.into_iter().map(|n| self.new_str(n)).collect();

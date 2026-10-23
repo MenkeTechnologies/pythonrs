@@ -165,3 +165,16 @@ fn text_after_the_conversion_name_expects_a_colon_or_brace() {
         "[(\"f-string: expecting ':' or '}'\", 1, 7, 8), (\"f-string: expecting ':' or '}'\", 1, 7, 8), (\"f-string: expecting ':' or '}'\", 1, 8, 9), None]"
     );
 }
+
+/// Where the tokenizer, not the field parser, decides: `{x!r'` opens a raw
+/// string at the `r` (the caret is there), a conversion NAME that is no string
+/// prefix (`{x!rr'`) is refused as a conversion first, and a closing bracket
+/// right after an f-string that ended inside a format spec is a bracket
+/// mismatch (`(f'{x:')`). A bad conversion NAME is refused whatever follows.
+#[test]
+fn tokenizer_level_field_errors_match_cpython() {
+    assert_eq!(
+        errors(&["f'{x!r'", "f'{x!rr'", "(f'{x:')", "[f'{x!s']", "f'{x!rr=}'", "f'{x!q:>2}'"]),
+        "[(\"f-string: expecting '}'\", 1, 6, 6), (\"f-string: invalid conversion character 'rr': expected 's', 'r', or 'a'\", 1, 6, 8), (\"closing parenthesis ')' does not match opening parenthesis '{'\", 1, 8, 8), (\"f-string: expecting '}'\", 1, 8, 8), (\"f-string: invalid conversion character 'rr': expected 's', 'r', or 'a'\", 1, 6, 8), (\"f-string: invalid conversion character 'q': expected 's', 'r', or 'a'\", 1, 6, 7)]"
+    );
+}

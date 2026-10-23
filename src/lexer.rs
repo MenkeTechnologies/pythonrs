@@ -614,8 +614,53 @@ impl Lexer {
                 if let Some(q) = self.peek() {
                     if q == '\'' || q == '"' {
                         // Where the nested literal opens, for the error an
-                        // unterminated one raises.
-                        let nested_col = self.pos - self.line_start;
+                        // unterminated one raises: at its string prefix when the
+                        // name before the quote is one (`{x!r'` tokenizes `r'…` as
+                        // a raw string, so CPython points at the `r`).
+                        let name: String = {
+                            let run: Vec<char> = raw
+                                .chars()
+                                .rev()
+                                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                                .collect();
+                            run.into_iter().rev().collect()
+                        };
+                        let is_prefix = matches!(
+                            name.to_ascii_lowercase().as_str(),
+                            "r" | "u" | "b" | "br" | "rb" | "f" | "fr" | "rf" | "t" | "tr" | "rt"
+                        );
+                        let name_len = name.chars().count();
+                        let after_bang = raw.chars().rev().nth(name_len) == Some('!');
+                        let mut nested_col = self.pos - self.line_start;
+                        if is_prefix {
+                            nested_col -= name_len;
+                        }
+                        // A conversion NAME that is no string prefix stays a NAME,
+                        // and the parser rejects it before it reaches the
+                        // unterminated literal behind it (`{x!rr'`).
+                        if after_bang
+                            && !is_prefix
+                            && name_len > 0
+                            && !matches!(name.as_str(), "s" | "r" | "a")
+                        {
+                            let at = self.pos - self.line_start - name_len;
+                            let probe = self.pos;
+                            let ends_here = self.src[probe + 1..]
+                                .iter()
+                                .take_while(|c| **c != '\n')
+                                .all(|c| *c != q);
+                            if ends_here {
+                                return Err(self.tok_err(
+                                    &format!(
+                                        "SyntaxError: f-string: invalid conversion character \
+                                         '{name}': expected 's', 'r', or 'a'"
+                                    ),
+                                    self.line,
+                                    at,
+                                    (at + name_len) as i64 + 1,
+                                ));
+                            }
+                        }
                         let nested_line = self.line;
                         raw.push(q);
                         self.bump();
@@ -689,6 +734,26 @@ impl Lexer {
                 Some(c) if c == quote => {
                     if !triple && !fields.is_empty() {
                         let col = self.pos - self.line_start;
+                        // The quote ends the f-string with its `{` still open; a
+                        // closing bracket right after it is the tokenizer's
+                        // mismatch error before the parser sees the field
+                        // (`(f'{x:')`).
+                        let next = self.src[self.pos + 1..]
+                            .iter()
+                            .position(|c| !matches!(c, ' ' | '\t'))
+                            .map(|i| (i, self.src[self.pos + 1 + i]));
+                        if let Some((i, close @ (')' | ']'))) = next {
+                            let at = col + 1 + i;
+                            return Err(self.tok_err(
+                                &format!(
+                                    "SyntaxError: closing parenthesis '{close}' does not match \
+                                     opening parenthesis '{{'"
+                                ),
+                                self.line,
+                                at,
+                                at as i64 + 1,
+                            ));
+                        }
                         return Err(self.tok_err(
                             "SyntaxError: f-string: expecting '}', or format specs",
                             self.line,

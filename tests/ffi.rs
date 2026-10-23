@@ -1988,3 +1988,57 @@ print(bound(2), a.g(3), a.d(1), a.d('s'))
         "stderr={stderr}"
     );
 }
+
+/// `inspect` recognizes a pythonrs function across the bridge: the proxy
+/// reports `types.FunctionType`/`types.MethodType` as its `__class__` (which
+/// `isinstance` falls back to), its `__code__` crosses as a CPython code object
+/// with the function's `co_*` surface (`co_firstlineno` is the `def` line, the
+/// first decorator's when decorated), and a classmethod/staticmethod binds the
+/// wrapped function. Expected output is python3.14's.
+#[test]
+fn inspect_recognizes_native_functions_and_reads_their_source() {
+    let src = r#"import inspect, functools
+def f(x: int, y=2) -> str:
+    "doc"
+    return 'r'
+
+@functools.lru_cache
+def cached(n):
+    return n
+
+def gen():
+    yield 1
+async def co():
+    pass
+class A:
+    def m(self, x):
+        pass
+    @classmethod
+    def c(cls):
+        pass
+    @staticmethod
+    def s():
+        pass
+a = A()
+print(inspect.isfunction(f), inspect.ismethod(a.m), inspect.ismethod(A.c), A.c.__func__ is A.__dict__['c'].__func__)
+print(inspect.getsourcelines(f)[1], inspect.getsource(f).splitlines()[0], inspect.getsourcelines(A.m)[1], inspect.getsourcelines(cached.__wrapped__)[1])
+print(inspect.isgeneratorfunction(gen), inspect.iscoroutinefunction(co), inspect.isgeneratorfunction(f))
+print([n for n, _ in inspect.getmembers(A, inspect.isfunction)], [(n, inspect.isfunction(v.__func__)) for n, v in inspect.getmembers(A, inspect.ismethod)])
+print(f.__code__.co_firstlineno, A.m.__code__.co_firstlineno, cached.__wrapped__.__code__.co_firstlineno, inspect.getfile(f) == __file__)
+"#;
+    let (stdout, stderr, ok) = run_py(src);
+    if bridge_unavailable(ok, &stderr) {
+        eprintln!("skipping inspect test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(
+        stdout,
+        r#"True True True True
+2 def f(x: int, y=2) -> str: 15 6
+True True False
+['m', 's'] [('c', True)]
+2 15 6 True
+"#,
+        "stderr={stderr}"
+    );
+}

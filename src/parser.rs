@@ -4485,12 +4485,23 @@ impl Parser {
                     b + 1 + n,
                 ));
             }
-            // The conversion is one NAME token; whatever follows it but blanks
-            // must be the `:` or `}` the grammar expects next (`{x!r=}`).
+            // The conversion is one NAME token. A NAME other than `s`/`r`/`a` is
+            // refused as such whatever follows it; after a valid one, anything
+            // but blanks must be the `:` or `}` the grammar expects next
+            // (`{x!r=}`).
             let name_len = after
                 .chars()
                 .take_while(|c| c.is_alphanumeric() || *c == '_')
                 .count();
+            let name: String = after.chars().take(name_len).collect();
+            if name_len > 0 && !matches!(name.as_str(), "s" | "r" | "a") {
+                return Err(fstring_error(
+                    &format!("invalid conversion character '{name}': expected 's', 'r', or 'a'"),
+                    origin,
+                    b + 1,
+                    b + 1 + name_len,
+                ));
+            }
             if name_len > 0 {
                 let blanks = after
                     .chars()

@@ -16035,6 +16035,12 @@ fn own_dir_names(typename: &str) -> Vec<&'static str> {
             if t == excgroup::GROUP || t == excgroup::BASE_GROUP {
                 out.extend_from_slice(&["split", "subgroup", "derive"]);
             }
+            // `ExceptionGroup` is a heap type (built in `_PyExc_InitTypes` as a
+            // subclass of both bases), so it carries a `__module__` entry and a
+            // `__weakref__` getset of its own.
+            if t == excgroup::GROUP {
+                out.extend_from_slice(&["__module__", "__weakref__"]);
+            }
         }
         _ => {}
     }
@@ -16251,6 +16257,7 @@ pub fn type_has_method(typename: &str, name: &str) -> bool {
         {
             return true
         }
+        excgroup::GROUP if matches!(name, "__module__" | "__weakref__") => return true,
         "lock" => {
             return matches!(
                 name,
