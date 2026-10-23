@@ -1720,13 +1720,72 @@ def _mirror_new(cls, /, *args, **kwargs):
         return object.__new__(cls)
     return new(cls, *args, **kwargs)
 
-def make_mirror(name, bases, members, native_new):
+def make_mirror(name, bases, members, native_new, builtin_base):
     def body(ns):
         for k in members:
             ns[k] = members[k]
         if native_new:
             ns["__new__"] = _mirror_new
+    if builtin_base is not None:
+        import builtins
+        base = getattr(builtins, builtin_base)
+        try:
+            return types.new_class(name, bases + (base,), {'metaclass': PyrsMirror}, body)
+        except TypeError:
+            pass
     return types.new_class(name, bases or (object,), {'metaclass': PyrsMirror}, body)
+
+def base_value(obj, base):
+    # The builtin value a mirror instance (a CPython `str`/`list`/... subclass
+    # instance `copyreg._reconstructor` built) holds, read through the base
+    # type's own slots so no override of the native class runs on it.
+    import builtins
+    t = getattr(builtins, base)
+    if base in ("bytes", "bytearray"):
+        return t(memoryview(obj))
+    if base == "dict":
+        return dict(dict.items(obj))
+    if base in ("list", "tuple", "set", "frozenset"):
+        return t(t.__iter__(obj))
+    return {"str": str.__str__, "int": int.__index__, "float": float.__float__,
+            "complex": complex.__complex__}[base](obj)
+
+def make_signature(varnames, argcount, posonly, kwonly, flags, defaults, kwdefaults,
+                   annotations, bound):
+    # `inspect._signature_from_function` over a pythonrs function's code
+    # attributes, then `_signature_bound_method` for a bound method.
+    import inspect
+    P = inspect.Parameter
+    empty = P.empty
+    annotations = annotations or {}
+    defaults = defaults or ()
+    kwdefaults = kwdefaults or {}
+    first_default = argcount - len(defaults)
+    params = []
+    for i, n in enumerate(varnames[:argcount]):
+        kind = P.POSITIONAL_ONLY if i < posonly else P.POSITIONAL_OR_KEYWORD
+        default = defaults[i - first_default] if i >= first_default else empty
+        params.append(P(n, kind, default=default, annotation=annotations.get(n, empty)))
+    idx = argcount + kwonly
+    if flags & 0x04:
+        n = varnames[idx]
+        idx += 1
+        params.append(P(n, P.VAR_POSITIONAL, annotation=annotations.get(n, empty)))
+    for n in varnames[argcount:argcount + kwonly]:
+        params.append(P(n, P.KEYWORD_ONLY, default=kwdefaults.get(n, empty),
+                        annotation=annotations.get(n, empty)))
+    if flags & 0x08:
+        n = varnames[idx]
+        params.append(P(n, P.VAR_KEYWORD, annotation=annotations.get(n, empty)))
+    sig = inspect.Signature(params, return_annotation=annotations.get('return', empty))
+    if bound:
+        params = tuple(sig.parameters.values())
+        if not params or params[0].kind in (P.VAR_KEYWORD, P.KEYWORD_ONLY):
+            raise ValueError('invalid method signature')
+        if params[0].kind in (P.POSITIONAL_OR_KEYWORD, P.POSITIONAL_ONLY):
+            params = params[1:]
+        sig = sig.replace(parameters=params)
+    return sig
 "#;
     let module = PyModule::from_code(py, code, c"_pyrs_mirror.py", c"_pyrs_mirror")
         .map_err(|e| e.to_string())?;
@@ -1893,9 +1952,20 @@ fn class_mirror<'py>(
     // `tp_new`; the mirror carries a `__new__` that reaches it (`_native_new`).
     let native_new =
         host.builtin_base_of(cname).is_some() && host.class_lookup(cname, "__new__").is_none();
+    // The builtin base itself (`str` for `class S(str)`) is a base of the mirror
+    // when no native base carries it already, so `copyreg._reconstructor`'s
+    // `str.__new__(S, state)` (pickle protocols 0 and 1) accepts the mirror.
+    let inherited = class_def.is_some_and(|c| {
+        c.bases
+            .iter()
+            .any(|b| host.classes.contains_key(b) && host.builtin_base_of(b).is_some())
+    });
+    let builtin_base = host
+        .builtin_base_of(cname)
+        .filter(|b| !inherited && !b.starts_with("collections."));
     let mirror = mirror_helper(py)?
         .getattr("make_mirror")
-        .and_then(|f| f.call1((name, bases, ns_dict, native_new)))
+        .and_then(|f| f.call1((name, bases, ns_dict, native_new, builtin_base)))
         .map_err(|e| e.to_string())?;
     IDENTITY.with(|m| {
         let mut m = m.borrow_mut();
@@ -1995,7 +2065,22 @@ fn instance_from_mirror(
     if let Some(inst) = known {
         return Ok(inst);
     }
-    let inst = host.new_instance(cname.clone(), crate::host::NameMap::default());
+    // A mirror over a builtin base (`class S(str)`) carries the value its
+    // native payload is made of.
+    let inst = match host
+        .builtin_base_of(&cname)
+        .filter(|b| !b.starts_with("collections."))
+    {
+        Some(base) => {
+            let value = mirror_helper(py)?
+                .getattr("base_value")
+                .and_then(|f| f.call1((obj, base)))
+                .map_err(|e| e.to_string())?;
+            let payload = py_to_value(host, py, &value)?;
+            host.new_instance_payload(cname.clone(), payload)
+        }
+        None => host.new_instance(cname.clone(), crate::host::NameMap::default()),
+    };
     IDENTITY.with(|m| {
         m.borrow_mut()
             .converted
@@ -3481,6 +3566,48 @@ struct PyrsCallable {
     module: Option<Py<PyAny>>,
 }
 
+/// `inspect.signature` of a pythonrs function or bound method crossing as a
+/// callable proxy: an `inspect.Signature` built from the function's
+/// `__code__`, `__defaults__`, `__kwdefaults__` and `__annotations__` the way
+/// `inspect._signature_from_function` reads them (the code object itself
+/// cannot cross). `None` for any other callable, which keeps CPython's own
+/// path.
+fn native_signature(py: Python, target: &Value) -> PyResult<Option<Py<PyAny>>> {
+    let (func, bound) = match with_host(|h| h.get(target).cloned()) {
+        Some(PyObj::Func(_)) => (target.clone(), false),
+        Some(PyObj::BoundMethod { func, .. })
+            if with_host(|h| matches!(h.get(&func), Some(PyObj::Func(_)))) =>
+        {
+            (func, true)
+        }
+        _ => return Ok(None),
+    };
+    let read = |v: &Value, n: &str| crate::builtins::raw_getattr(v, n).map_err(rs_err);
+    let code = read(&func, "__code__")?;
+    let mut parts: Vec<Value> = Vec::new();
+    for n in [
+        "co_varnames",
+        "co_argcount",
+        "co_posonlyargcount",
+        "co_kwonlyargcount",
+        "co_flags",
+    ] {
+        parts.push(read(&code, n)?);
+    }
+    for n in ["__defaults__", "__kwdefaults__", "__annotations__"] {
+        parts.push(read(&func, n)?);
+    }
+    let mut args: Vec<Bound<PyAny>> = Vec::new();
+    for v in &parts {
+        args.push(with_host(|h| value_to_py(h, py, v)).map_err(rs_err)?);
+    }
+    args.push(pyo3::types::PyBool::new(py, bound).to_owned().into_any());
+    let make = mirror_helper(py)
+        .map_err(rs_err)?
+        .getattr("make_signature")?;
+    Ok(Some(make.call1(PyTuple::new(py, args)?)?.unbind()))
+}
+
 #[pymethods]
 impl PyrsCallable {
     /// The wrapped callable's `__doc__`, or whatever was last assigned here.
@@ -3518,6 +3645,11 @@ impl PyrsCallable {
         // `__annotations__` runs user code, and its `NameError` must reach
         // CPython as itself rather than as a missing attribute.
         let outer = with_host(|h| h.exc.clone());
+        if name == "__signature__" {
+            if let Some(sig) = native_signature(py, &self.target)? {
+                return Ok(sig);
+            }
+        }
         match crate::builtins::raw_getattr(&self.target, &name) {
             Ok(v) => with_host(|h| value_to_py(h, py, &v))
                 .map(|b| b.unbind())
@@ -4218,6 +4350,27 @@ impl PyrsInstance {
         with_host(|h| value_to_py(h, py, &r))
             .map(|b| b.unbind())
             .map_err(to_pyerr)
+    }
+
+    /// `obj[k] = v` from CPython (`pickle`'s `SETITEMS` filling a dict
+    /// subclass) runs the native `__setitem__`.
+    fn __setitem__(&self, py: Python, key: Bound<PyAny>, value: Bound<PyAny>) -> PyResult<()> {
+        let to_pyerr = |e: String| pyo3::exceptions::PyRuntimeError::new_err(e);
+        let key_v = with_host(|h| py_to_value(h, py, &key)).map_err(to_pyerr)?;
+        let val_v = with_host(|h| py_to_value(h, py, &value)).map_err(to_pyerr)?;
+        run_for_cpython(|| {
+            crate::host::call_method(&self.target, "__setitem__", vec![key_v, val_v], vec![])
+        })
+        .map(|_| ())
+    }
+
+    fn __delitem__(&self, py: Python, key: Bound<PyAny>) -> PyResult<()> {
+        let to_pyerr = |e: String| pyo3::exceptions::PyRuntimeError::new_err(e);
+        let key_v = with_host(|h| py_to_value(h, py, &key)).map_err(to_pyerr)?;
+        run_for_cpython(|| {
+            crate::host::call_method(&self.target, "__delitem__", vec![key_v], vec![])
+        })
+        .map(|_| ())
     }
 
     fn __richcmp__(

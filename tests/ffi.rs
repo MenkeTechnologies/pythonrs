@@ -1834,3 +1834,124 @@ for o in (T(), u):
         "stderr={stderr}"
     );
 }
+
+/// `inspect.signature` of a pythonrs function, lambda or bound method: the
+/// proxy answers `__signature__` from the function's code attributes, as
+/// `inspect._signature_from_function` reads them. Expected output is
+/// python3.14's.
+#[test]
+fn inspect_signature_reads_a_native_function() {
+    let src = r#"import inspect
+def f(a, b=2, *c, d, e=5, **g) -> int: pass
+def h(x: int, /, y: str = 'q', *, z): pass
+class A:
+    def m(self, x): pass
+    @classmethod
+    def cm(cls, y): pass
+    @staticmethod
+    def sm(z=1): pass
+for o in (f, h, A.m, A().m, A.cm, A.sm, lambda x, /, y: 0, lambda *a: 0):
+    try: print(inspect.signature(o))
+    except Exception as ex: print('EXC', type(ex).__name__, ex)
+s = inspect.signature(f)
+print([(p.name, p.kind.name, p.default) for p in s.parameters.values()], s.return_annotation)
+print(inspect.signature(h).parameters['x'].annotation, str(inspect.signature(h).bind(1, z=2)))
+"#;
+    let (stdout, stderr, ok) = run_py(src);
+    if bridge_unavailable(ok, &stderr) {
+        eprintln!("skipping signature test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(
+        stdout,
+        r#"(a, b=2, *c, d, e=5, **g) -> int
+(x: int, /, y: str = 'q', *, z)
+(self, x)
+(x)
+(y)
+(z=1)
+(x, /, y)
+(*a)
+[('a', 'POSITIONAL_OR_KEYWORD', <class 'inspect._empty'>), ('b', 'POSITIONAL_OR_KEYWORD', 2), ('c', 'VAR_POSITIONAL', <class 'inspect._empty'>), ('d', 'KEYWORD_ONLY', <class 'inspect._empty'>), ('e', 'KEYWORD_ONLY', 5), ('g', 'VAR_KEYWORD', <class 'inspect._empty'>)] <class 'int'>
+<class 'int'> <BoundArguments (x=1, z=2)>
+"#,
+        "stderr={stderr}"
+    );
+}
+
+/// Pickle protocols 0 and 1 rebuild a builtin subclass with
+/// `copyreg._reconstructor`, which calls `str.__new__(S, state)`: the class
+/// mirror is a subclass of the builtin, and its instance crosses back carrying
+/// the value. A dict subclass fills through the proxy's `__setitem__`.
+/// Expected output is python3.14's.
+#[test]
+fn pickle_protocols_0_and_1_round_trip_builtin_subclasses() {
+    let src = r#"import pickle, copy
+class S(str): pass
+class I(int): pass
+class F(float): pass
+class L(list): pass
+class D(dict): pass
+class T(tuple): pass
+class B(bytes): pass
+class BA(bytearray): pass
+class C(complex): pass
+class ST(set): pass
+class FS(frozenset): pass
+for v in (S('q'), I(2), F(1.5), L([1, 2]), D(a=1), T((1, 2)), B(b'b'), BA(b'ba'), C(1, 2), ST({1}), FS({2})):
+    for proto in (0, 1, 2):
+        try:
+            r = pickle.loads(pickle.dumps(v, proto))
+            print(proto, type(r).__name__, repr(r), r == v)
+        except Exception as ex: print(proto, type(v).__name__, 'EXC', type(ex).__name__, ex)
+s = S('z'); s.tag = 1
+r = pickle.loads(pickle.dumps(s, 0)); print(r, r.tag)
+class S2(S): pass
+print(repr(pickle.loads(pickle.dumps(S2('w'), 1))), issubclass(S2, str))
+"#;
+    let (stdout, stderr, ok) = run_py(src);
+    if bridge_unavailable(ok, &stderr) {
+        eprintln!("skipping pickle test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(
+        stdout,
+        r#"0 S 'q' True
+1 S 'q' True
+2 S 'q' True
+0 I 2 True
+1 I 2 True
+2 I 2 True
+0 F 1.5 True
+1 F 1.5 True
+2 F 1.5 True
+0 L [1, 2] True
+1 L [1, 2] True
+2 L [1, 2] True
+0 D {'a': 1} True
+1 D {'a': 1} True
+2 D {'a': 1} True
+0 T (1, 2) True
+1 T (1, 2) True
+2 T (1, 2) True
+0 B b'b' True
+1 B b'b' True
+2 B b'b' True
+0 BA BA(b'ba') True
+1 BA BA(b'ba') True
+2 BA BA(b'ba') True
+0 C (1+2j) True
+1 C (1+2j) True
+2 C (1+2j) True
+0 ST ST({1}) True
+1 ST ST({1}) True
+2 ST ST({1}) True
+0 FS FS({2}) True
+1 FS FS({2}) True
+2 FS FS({2}) True
+z 1
+'w' True
+"#,
+        "stderr={stderr}"
+    );
+}

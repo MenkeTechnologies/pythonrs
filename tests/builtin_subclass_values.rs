@@ -146,3 +146,72 @@ listed = ['append' in dir(L), '__add__' in dir(S), 'add_note' in dir(E), 'args' 
         "[True, True, True, True, \"<slot wrapper '__add__' of 'list' objects>\"]"
     );
 }
+
+/// `list.__new__` (`PyType_GenericNew`) ignores its arguments; the inherited
+/// `__init__` fills the payload after a user `__new__`.
+#[test]
+fn a_mutable_base_new_ignores_its_arguments() {
+    let src = r#"
+class L(list): pass
+class M(list):
+    def __new__(cls, it): return super().__new__(cls, it)
+class D(dict):
+    def __new__(cls, *a, **k): return super().__new__(cls)
+class N(list):
+    def __new__(cls, *a): return super().__new__(cls)
+    def __init__(self, *a): super().__init__([9])
+out = [list.__new__(L, [1]), L.__new__(L, [1, 2]), M([1, 2]), D(a=1), D([(1, 2)]), N(1, 2)]
+"#;
+    assert_eq!(g(src, "out"), r#"[[], [], [1, 2], {'a': 1}, {1: 2}, [9]]"#);
+}
+
+/// `set_repr` and `bytearray`'s repr (its `str` too) name a subclass.
+#[test]
+fn set_and_bytearray_subclasses_name_themselves() {
+    let src = r#"
+class S(set): pass
+class F(frozenset): pass
+class BA(bytearray):
+    def __new__(cls, x): return super().__new__(cls, x)
+out = [str(S([1])), repr(S()), str(F([2])), repr(F()), str(BA(b'q')), repr(S({1, 2}))]
+"#;
+    assert_eq!(
+        g(src, "out"),
+        r#"['S({1})', 'S()', 'F({2})', 'F()', "BA(b'q')", 'S({1, 2})']"#
+    );
+}
+
+/// A memoryview over a `bytes`/`bytearray` subclass instance reports that
+/// instance as `obj`, through sub-views too.
+#[test]
+fn a_memoryview_reports_the_subclass_instance_as_obj() {
+    let src = r#"
+class B(bytes): pass
+class BA(bytearray): pass
+b = B(b'xy'); m = memoryview(b)
+ba = BA(b'ab'); mv = memoryview(ba); mv[0] = 90
+x = b'q'
+out = [m.obj is b, type(m.obj).__name__, memoryview(m).obj is b, m[1:].obj is b, ba, mv.obj is ba, memoryview(x).obj is x]
+"#;
+    assert_eq!(
+        g(src, "out"),
+        r#"[True, 'B', True, True, BA(b'Zb'), True, True]"#
+    );
+}
+
+/// `ExceptionGroup[int]`, a subclass of a builtin with `__class_getitem__`, and
+/// the classmethod's repr.
+#[test]
+fn exception_groups_and_builtin_subclasses_parameterize() {
+    let src = r#"
+class E(ExceptionGroup): pass
+class L(list): pass
+out = [repr(ExceptionGroup[int]), BaseExceptionGroup[ValueError].__args__, repr(E[int]), repr(L[int]),
+       repr(list.__class_getitem__).split(' at ')[0], repr([].__class_getitem__).split(' at ')[0],
+       '__class_getitem__' in dir(BaseExceptionGroup)]
+"#;
+    assert_eq!(
+        g(src, "out"),
+        r#"['ExceptionGroup[int]', (<class 'ValueError'>,), '__main__.E[int]', '__main__.L[int]', '<built-in method __class_getitem__ of type object', '<built-in method __class_getitem__ of type object', True]"#
+    );
+}

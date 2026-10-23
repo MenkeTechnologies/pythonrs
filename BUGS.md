@@ -9,6 +9,35 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **A function's `__dict__` is its live attribute store.** `f.__dict__['b'] =
+  2` sets `f.b`, `del f.a` and `del f.__dict__['z']` remove attributes,
+  `f.__dict__ = d` replaces the store, and the function slots `functools.wraps`
+  assigns (`__name__`, `__doc__`, …) stay out of it. A builtin exception's
+  `__dict__` is live as well (its members stay out).
+- **Pickle protocols 0 and 1 of a builtin subclass.** `pickle.dumps(S('q'), 0)`
+  loaded to `TypeError: str.__new__(S): S is not a subtype of str`; the class
+  mirror of a builtin subclass is now a subclass of that builtin, and an
+  instance `copyreg._reconstructor` builds crosses back carrying the value. A
+  dict subclass at protocol 2 filled through the proxy failed with `object does
+  not support item assignment`.
+- **A mutable base's `tp_new` ignores its arguments.** `list.__new__(L, [1])`
+  was `[1]` (CPython `[]`); after a user `__new__`, the inherited
+  `list`/`dict`/`set`/`bytearray` `__init__` fills the payload.
+- **`set`/`frozenset`/`bytearray` subclasses name themselves** in `repr` and
+  `str` (`S({1})`, `S()`, `F({2})`, `BA(b'q')`).
+- **`memoryview(B(b'x')).obj` is the `B` instance**, through sub-views too.
+- **`Cls.__weakref__`** is the `<attribute '__weakref__' of 'Cls' objects>`
+  getset (one object, as in `Cls.__dict__`), and `obj.__new__` of a user or
+  builtin exception instance is its type's `__new__`.
+- **A class `__dict__` has its read methods as attributes.**
+  `P.__dict__.get` was an `AttributeError`, so `P.__dict__.get(k, x)` failed
+  whenever the call was not folded.
+- **`ExceptionGroup[int]`** and a subclass of a builtin with
+  `__class_getitem__` (`class L(list)`: `L[int]`) parameterize;
+  `list.__class_getitem__` reprs as a builtin method bound to the type.
+- **`inspect.signature` of a pythonrs function, lambda or bound method** over
+  the bridge raised `cannot pass 'code' to a CPython stdlib call`; the proxy
+  answers `__signature__` from the function's code attributes.
 - **`bytes`, `bytearray` and `complex` subclasses carry a native payload.**
   `class B(bytes)` instances reprd as bare objects and failed `len()`, `[]`,
   iteration, `hash` and every `bytes` method. A `bytearray` subclass reprs
@@ -3239,27 +3268,14 @@ entry. These remain open:
   does not evaluate `c`; a format spec's `{{` is read as an escaped brace
   where CPython reads a nested field (`f"{x:a{{b}}}"`). A compiler error from
   `compile()` over a file carries `text=None` where CPython reads the line.
-- **A function's `__dict__` is a snapshot.** `f.__dict__['b'] = 2` does not
-  set `f.b` (CPython: the dict IS the attribute store). A builtin exception's
-  `__dict__` is the same kind of snapshot, so a write into
-  `ValueError('x').__dict__` is lost too; a user exception's is live.
-- **Pickle protocols 0 and 1 of a builtin subclass.** `pickle.dumps(S('q'), 0)`
-  with `class S(str)` loads to `TypeError: str.__new__(S): S is not a subtype
-  of str`: `copyreg._reconstructor` calls `str.__new__(S_mirror, …)` and the
-  class mirror is no CPython `str` subclass. Protocol 2 and above round-trip.
-- **`list.__new__(L, [1])` fills the payload** (`[1]`; CPython's `list_new`
-  ignores its arguments, giving `[]` until `__init__` runs). The same holds for
-  `dict`/`set`/`bytearray` bases; a subclass `__new__` that calls
-  `super().__new__(cls, it)` with no `__init__` relies on that fill today.
-- **`memoryview(B(b'x')).obj` is the `bytes` payload**, not the `B` instance.
-- **`Cls.__weakref__`** on a user class is an `AttributeError` (CPython: the
-  `<attribute '__weakref__' of 'Cls' objects>` getset), and `E().__new__` on a
-  user exception instance is an `AttributeError` (CPython: `E.__new__`).
-- **`dir(ExceptionGroup)`** lacks `__class_getitem__`, `__module__` and
-  `__weakref__`.
+- **`dir(ExceptionGroup)`** lacks `__module__` and `__weakref__`, and
+  `ExceptionGroup.__weakref__` is an `AttributeError`.
+- **A strided memoryview slice of plain `bytes` reports a copy as `obj`.**
+  `memoryview(b'abc')[::2].obj` is a fresh `bytes`, not the original object.
 - **`inspect` on pythonrs functions and instances over the bridge.**
-  `inspect.signature(A.f)` raises `cannot pass 'code' to a CPython stdlib
-  call` (it reads `__code__` off the callback proxy), and
+  `inspect.isfunction(f)` and `inspect.ismethod(A().m)` are False (the
+  function crosses as a callback proxy, not a `types.FunctionType`), so
+  `inspect.getmembers(A, inspect.isfunction)` is empty; and
   `inspect.getattr_static(A(), 'p')` raises `AttributeError: p`, because a
   pythonrs instance crosses as a proxy whose type carries no class namespace.
 

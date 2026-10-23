@@ -615,6 +615,12 @@ impl PyHost {
         if let Some(attrs) = self.func_attrs.get(&id) {
             m.values(attrs.values());
         }
+        if let Some(d) = self.attr_dicts.get(&id) {
+            m.value(d);
+        }
+        if let Some(e) = self.mv_exporter.get(&id) {
+            m.value(e);
+        }
         if let Some(slots) = self.slot_values.get(&id) {
             m.values(slots.values());
         }
@@ -638,6 +644,8 @@ impl PyHost {
         self.eg_split_root.retain(|id, _| live(id));
         self.tb_starts_empty.retain(live);
         self.func_attrs.retain(|id, _| live(id));
+        self.attr_dicts.retain(|id, _| live(id));
+        self.mv_exporter.retain(|id, _| live(id));
         self.slot_values.retain(|id, _| live(id));
         self.suppress_context.retain(live);
         self.user_str_lines.retain(|id, _| live(id));

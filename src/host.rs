@@ -494,6 +494,26 @@ pub struct Instance {
     pub payload: Value,
 }
 
+/// The getset and member descriptors of `function` (measured: `vars(type(f))`
+/// entries of those two types), which `functools.wraps` and friends assign
+/// through: the values are the function's own, not `__dict__` entries.
+const FUNCTION_DATA_DESCRIPTORS: &[&str] = &[
+    "__annotate__",
+    "__annotations__",
+    "__builtins__",
+    "__closure__",
+    "__code__",
+    "__defaults__",
+    "__dict__",
+    "__doc__",
+    "__globals__",
+    "__kwdefaults__",
+    "__module__",
+    "__name__",
+    "__qualname__",
+    "__type_params__",
+];
+
 /// The `object`-level dunder slots that a type object exposes as
 /// `wrapper_descriptor`s (`type(object.__init__)`). The comparison/hash/attr/
 /// format slots CPython wraps; enough for introspection to classify them.
@@ -2505,6 +2525,15 @@ pub struct PyHost {
     /// by the function's heap id. CPython functions carry a writable dict; the
     /// stdlib uses it for `__isabstractmethod__`, `functools.wraps`, decorators.
     pub func_attrs: HashMap<u32, NameMap>,
+    /// The live `__dict__` of an object that has no instance dict -- a
+    /// function, a builtin exception, a property -- once it has been read (or
+    /// assigned). From then on it, not `func_attrs`, holds the object's
+    /// ordinary attributes; an exception's members stay in `func_attrs`.
+    pub attr_dicts: HashMap<u32, Value>,
+    /// The object a memoryview over a `bytes`/`bytearray` subclass instance
+    /// was taken of (its `obj`), by the view's heap id: the view itself
+    /// windows the instance's native payload.
+    pub mv_exporter: HashMap<u32, Value>,
     /// The `member_descriptor` of each `__slots__` entry, by its `qual`
     /// (`<class key>.<name>`): one object per slot, as the one CPython keeps in
     /// the declaring class's `__dict__`, so `C.x is C.x`.
@@ -3222,6 +3251,8 @@ impl PyHost {
             tb_starts_empty: HashSet::default(),
             suggest: None,
             func_attrs: HashMap::default(),
+            attr_dicts: HashMap::default(),
+            mv_exporter: HashMap::default(),
             slot_members: HashMap::default(),
             slot_values: HashMap::default(),
             codec_search: Vec::new(),
@@ -5344,6 +5375,8 @@ fn is_type_bound_method(owner: &str, meth: &str) -> bool {
         // `tp_new` is exposed as a builtin method bound to its type
         // (`tp_new_wrapper`): `<built-in method __new__ of type object at …>`.
         || (meth == "__new__" && crate::builtins::is_type_object_name(owner))
+        // `__class_getitem__` is a classmethod bound to the type it is read off.
+        || (meth == "__class_getitem__" && crate::builtins::type_has_method(owner, meth))
         || matches!(
             (owner, meth),
             ("str" | "bytes" | "bytearray", "maketrans") | ("itertools.chain", "from_iterable")
@@ -5844,8 +5877,14 @@ impl PyHost {
                         // Builtin-type subclass without a `__str__`/`__repr__`
                         // override: the base type's string form (`str(Stack(...))`
                         // → the list form, `str(U("hi"))` → `"hi"`).
+                        // `set`, `frozenset` and `bytearray` have no `__str__` of their
+                        // own (bytearray's is its repr), so `str()` is the repr,
+                        // which names the subclass.
                         match self.builtin_base_of(&inst.class) {
-                            Some(base) if base.starts_with("collections.") => {
+                            Some(base)
+                                if base.starts_with("collections.")
+                                    || matches!(base, "set" | "frozenset" | "bytearray") =>
+                            {
                                 self.builtin_subclass_repr(inst)
                             }
                             _ => self.str_of(&inst.payload),
@@ -10979,13 +11018,21 @@ impl PyHost {
     /// `self.__class__.__name__`), so `class Q(deque)` reprs as `Q([1])`;
     /// `bytearray_repr` likewise prints `Py_TYPE(self)->tp_name`, so
     /// `class BA(bytearray)` reprs as `BA(b'xy')`.
+    /// `set_repr` names a subclass too: `S({1})`, `S()` when empty, and
+    /// `F({2})` for a `frozenset` subclass.
     /// `list`/`dict`/... reprs carry no type name at all.
     fn builtin_subclass_repr(&self, inst: &Instance) -> String {
         let r = self.repr_of(&inst.payload);
         let base = self.builtin_base_of(&inst.class).unwrap_or("");
+        if base == "set" {
+            return match r.as_str() {
+                "set()" => format!("{}()", inst.class),
+                _ => format!("{}({r})", inst.class),
+            };
+        }
         match base
             .strip_prefix("collections.")
-            .or((base == "bytearray").then_some(base))
+            .or(matches!(base, "bytearray" | "frozenset").then_some(base))
             .and_then(|bare| r.strip_prefix(bare))
         {
             Some(rest) => format!("{}{rest}", inst.class),
@@ -11405,18 +11452,27 @@ impl PyHost {
             }
             let (obj, start, readonly) = (obj.clone(), *start, *readonly);
             let n = *len as i64;
+            // A sub-view keeps the exporter its parent reports as `obj`.
+            let exporter = match recv {
+                Value::Obj(id) => self.mv_exporter.get(id).cloned(),
+                _ => None,
+            };
             let (mut i, stop) = slice_bounds(lo, hi, step, n, self);
             if step == 1 {
                 let lo_i = i.clamp(0, n);
                 let hi_i = stop.clamp(lo_i, n);
-                return Ok(self.alloc(PyObj::Memoryview {
+                let view = self.alloc(PyObj::Memoryview {
                     obj,
                     start: start + lo_i as usize,
                     len: (hi_i - lo_i) as usize,
                     readonly,
                     released: false,
                     hashed: Default::default(),
-                }));
+                });
+                if let (Some(e), Value::Obj(id)) = (exporter, &view) {
+                    self.mv_exporter.insert(*id, e);
+                }
+                return Ok(view);
             }
             let src = self.mv_bytes(recv)?;
             let mut out = Vec::new();
@@ -11437,14 +11493,18 @@ impl PyHost {
             }
             let len = out.len();
             let buf = self.alloc(PyObj::Bytes(out));
-            return Ok(self.alloc(PyObj::Memoryview {
+            let view = self.alloc(PyObj::Memoryview {
                 obj: buf,
                 start: 0,
                 len,
                 readonly: true,
                 released: false,
                 hashed: Default::default(),
-            }));
+            });
+            if let (Some(e), Value::Obj(id)) = (exporter, &view) {
+                self.mv_exporter.insert(*id, e);
+            }
+            return Ok(view);
         }
         // Slicing bytes/bytearray yields a new buffer of the same type.
         if let Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) = self.get(recv) {
@@ -13421,6 +13481,12 @@ impl PyHost {
                 if name == "__class__" {
                     return Ok(self.alloc(PyObj::Class(class)));
                 }
+                // `obj.__new__` is the type's `__new__` (an implicit staticmethod),
+                // inherited ones included.
+                if name == "__new__" && self.class_lookup(&class, "__new__").is_none() {
+                    let cls = self.alloc(PyObj::Class(class));
+                    return self.get_attr(&cls, "__new__");
+                }
                 if name == "__dict__" {
                     // A fully-slotted instance has no `__dict__`, and neither has a
                     // bare `object()`.
@@ -13661,14 +13727,9 @@ impl PyHost {
                     }
                     // Then the `__dict__`/`__weakref__` getsets the class adds.
                     let (add_dict, add_weak) = self.class_adds_dict_weakref(&cname);
-                    let disp = self.class_display_name(&cname);
                     for (attr, add) in [("__dict__", add_dict), ("__weakref__", add_weak)] {
                         if add {
-                            let desc = self.alloc(PyObj::Descriptor {
-                                kind: DescKind::GetSetDescriptor,
-                                qual: format!("{disp}.{attr}"),
-                                recv: None,
-                            });
+                            let desc = self.class_getset(&cname, attr);
                             entries.push((attr.to_string(), desc));
                         }
                     }
@@ -13725,6 +13786,16 @@ impl PyHost {
                     let cls = self.alloc(PyObj::Class(cname.clone()));
                     let func = self.alloc(PyObj::Builtin(name.to_string()));
                     return Ok(self.alloc(PyObj::BoundMethod { recv: cls, func }));
+                }
+                // `Cls.__weakref__`: the getset of the nearest class in the MRO
+                // that installed the weakref slot.
+                if name == "__weakref__" {
+                    let owner = self.mro_of(&cname).into_iter().find(|c| {
+                        self.classes.contains_key(c) && self.class_adds_dict_weakref(c).1
+                    });
+                    if let Some(owner) = owner {
+                        return Ok(self.class_getset(&owner, "__weakref__"));
+                    }
                 }
                 if matches!(name, "__base__" | "__type_params__" | "__text_signature__") {
                     let mro = self.mro_of(&cname);
@@ -13809,8 +13880,8 @@ impl PyHost {
                 // arbitrary attributes in CPython, and `unittest` stamps its own
                 // bookkeeping onto the exceptions it catches.
                 if let Value::Obj(id) = recv {
-                    if let Some(v) = self.func_attrs.get(id).and_then(|m| m.get(name)) {
-                        return Ok(v.clone());
+                    if let Some(v) = self.side_attr(*id, name) {
+                        return Ok(v);
                     }
                 }
                 // An `OSError` field that was never set reads as `None` (the
@@ -13825,27 +13896,32 @@ impl PyHost {
                     // `e.__class__.__name__`).
                     return Ok(self.builtin_type_of(recv));
                 }
+                if name == "__new__" {
+                    let ty = self.builtin_type_of(recv);
+                    return self.get_attr(&ty, "__new__");
+                }
                 // `BaseException.__dict__`: the attributes assigned onto the
-                // exception. Its members (`args`, `errno`, `__cause__`, …) share
-                // the attribute map here but live outside `__dict__` in CPython.
+                // exception, live. Its members (`args`, `errno`, `__cause__`, …)
+                // stay in the attribute map: they live outside `__dict__`.
                 if name == "__dict__" {
-                    let class = class.clone();
-                    let attrs: Vec<(String, Value)> = match recv {
-                        Value::Obj(id) => self
-                            .func_attrs
-                            .get(id)
-                            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-                            .unwrap_or_default(),
-                        _ => Vec::new(),
+                    let Value::Obj(id) = recv else {
+                        return Ok(self.new_dict(DictMap::default()));
                     };
-                    let mut d = DictMap::default();
-                    for (k, v) in attrs {
-                        if crate::builtins::exception_member_owner(self, &class, &k).is_none() {
-                            let key = self.new_str(k.clone());
-                            d.insert(PKey::Str(k), (key, v));
-                        }
-                    }
-                    return Ok(self.alloc(PyObj::Dict(d)));
+                    let class = class.clone();
+                    let members: Vec<String> = self
+                        .func_attrs
+                        .get(id)
+                        .map(|m| {
+                            m.keys()
+                                .filter(|k| {
+                                    crate::builtins::exception_member_owner(self, &class, k)
+                                        .is_some()
+                                })
+                                .cloned()
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    return Ok(self.side_dict(*id, |k| members.iter().any(|m| m == k)));
                 }
                 if name == "args" {
                     let a = args.clone();
@@ -14042,23 +14118,13 @@ impl PyHost {
                 if name == "__isabstractmethod__" =>
             {
                 let id = if let Value::Obj(i) = recv { *i } else { 0 };
-                Ok(self
-                    .func_attrs
-                    .get(&id)
-                    .and_then(|m| m.get(name))
-                    .cloned()
-                    .unwrap_or(Value::Bool(false)))
+                Ok(self.side_attr(id, name).unwrap_or(Value::Bool(false)))
             }
-            // A function's writable attribute dict.
+            // A function's writable attribute dict, live: `f.__dict__[k] = v`
+            // is `f.k = v`.
             Some(PyObj::Func(_)) if name == "__dict__" => {
                 let id = if let Value::Obj(i) = recv { *i } else { 0 };
-                let attrs = self.func_attrs.get(&id).cloned().unwrap_or_default();
-                let mut d: DictMap = DictMap::default();
-                for (k, v) in attrs {
-                    let kv = self.new_str(k.clone());
-                    d.insert(PKey::Str(k), (kv, v));
-                }
-                Ok(self.new_dict(d))
+                Ok(self.side_dict(id, |k| FUNCTION_DATA_DESCRIPTORS.contains(&k)))
             }
             // `gi_frame` is `None` once the generator has finished, else a
             // minimal frame (scope name and line); `gi_code` carries the
@@ -14161,15 +14227,10 @@ impl PyHost {
             Some(PyObj::Property { .. }) | Some(PyObj::Descriptor { .. })
                 if name == "__doc__"
                     || matches!(recv, Value::Obj(id)
-                        if self.func_attrs.get(id).is_some_and(|m| m.contains_key(name))) =>
+                        if self.side_attr(*id, name).is_some()) =>
             {
                 let id = if let Value::Obj(i) = recv { *i } else { 0 };
-                Ok(self
-                    .func_attrs
-                    .get(&id)
-                    .and_then(|m| m.get(name))
-                    .cloned()
-                    .unwrap_or(Value::Undef))
+                Ok(self.side_attr(id, name).unwrap_or(Value::Undef))
             }
             // A user-assigned function attribute reads from the side dict. Note
             // that `__isabstractmethod__` gets NO default here: unlike the
@@ -14179,10 +14240,10 @@ impl PyHost {
             // relies on.
             Some(PyObj::Func(_))
                 if matches!(recv, Value::Obj(id)
-                        if self.func_attrs.get(id).is_some_and(|m| m.contains_key(name))) =>
+                        if self.side_attr(*id, name).is_some()) =>
             {
                 let id = if let Value::Obj(i) = recv { *i } else { 0 };
-                let v = self.func_attrs.get(&id).and_then(|m| m.get(name)).cloned();
+                let v = self.side_attr(id, name);
                 Ok(v.unwrap_or(Value::Bool(false)))
             }
             // Code-object introspection (`func.__code__.co_*`), derived from the
@@ -14634,7 +14695,7 @@ impl PyHost {
             // reading the first parameter's type.
             Some(PyObj::Func(fv)) if name == "__annotate__" => {
                 let assigned = matches!(recv, Value::Obj(id)
-                    if self.func_attrs.get(id).is_some_and(|m| m.contains_key("__annotations__")));
+                    if self.side_attr(*id, "__annotations__").is_some());
                 Ok(if assigned {
                     Value::Undef
                 } else {
@@ -15000,7 +15061,10 @@ impl PyHost {
                 }
                 let (obj, len, readonly) = (obj.clone(), *len, *readonly);
                 Ok(match name {
-                    "obj" => obj,
+                    "obj" => match recv {
+                        Value::Obj(id) => self.mv_exporter.get(id).cloned().unwrap_or(obj),
+                        _ => obj,
+                    },
                     "nbytes" => Value::Int(len as i64),
                     "format" => self.new_str("B"),
                     "itemsize" => Value::Int(1),
@@ -15803,7 +15867,7 @@ impl PyHost {
     /// evaluated: annotated, never read, and not assigned over.
     fn annotations_pending(&self, func: &Value) -> bool {
         let assigned = matches!(func, Value::Obj(id)
-            if self.func_attrs.get(id).is_some_and(|m| m.contains_key("__annotations__")));
+            if self.side_attr(*id, "__annotations__").is_some());
         !assigned
             && matches!(self.get(func), Some(PyObj::Func(fv))
                 if matches!(fv.annotations, Value::Undef) && !matches!(fv.annotate, Value::Undef))
@@ -16127,10 +16191,19 @@ impl PyHost {
             }
             if let Value::Obj(id) = recv {
                 let id = *id;
-                self.func_attrs
-                    .entry(id)
-                    .or_default()
-                    .insert(name.to_string(), val);
+                // A member (`errno`, `__cause__`, …) stays outside `__dict__`.
+                let class = match self.get(recv) {
+                    Some(PyObj::Exception { class, .. }) => class.clone(),
+                    _ => String::new(),
+                };
+                if crate::builtins::exception_member_owner(self, &class, name).is_some() {
+                    self.func_attrs
+                        .entry(id)
+                        .or_default()
+                        .insert(name.to_string(), val);
+                } else {
+                    self.side_attr_set(id, name, val);
+                }
                 return Ok(());
             }
         }
@@ -16145,11 +16218,7 @@ impl PyHost {
             Some(PyObj::Property { .. }) | Some(PyObj::Descriptor { .. })
         ) {
             if let Value::Obj(id) = recv {
-                let id = *id;
-                self.func_attrs
-                    .entry(id)
-                    .or_default()
-                    .insert(name.to_string(), val);
+                self.side_attr_set(*id, name, val);
                 return Ok(());
             }
         }
@@ -16169,15 +16238,25 @@ impl PyHost {
                     if let Some(PyObj::Func(fv)) = self.get_mut(recv) {
                         std::rc::Rc::make_mut(fv).defaults = items;
                     }
-                    if let Some(attrs) = self.func_attrs.get_mut(&id) {
-                        attrs.shift_remove(name);
-                    }
+                    self.side_attr_del(id, name);
                     return Ok(());
                 }
-                self.func_attrs
-                    .entry(id)
-                    .or_default()
-                    .insert(name.to_string(), val);
+                // A `function` data descriptor (`__name__`, `__doc__`, …) is a slot
+                // of the function, never an entry of its `__dict__`.
+                if FUNCTION_DATA_DESCRIPTORS.contains(&name) && name != "__dict__" {
+                    self.func_attrs
+                        .entry(id)
+                        .or_default()
+                        .insert(name.to_string(), val);
+                    return Ok(());
+                }
+                // `f.__dict__ = d` makes `d` the attribute store itself.
+                if name == "__dict__" {
+                    self.func_attrs.remove(&id);
+                    self.attr_dicts.insert(id, val);
+                    return Ok(());
+                }
+                self.side_attr_set(id, name, val);
                 return Ok(());
             }
         }
@@ -16468,6 +16547,22 @@ impl PyHost {
         if let Some(PyObj::Instance(inst)) = self.get(recv) {
             let dict = inst.dict.clone();
             if self.inst_attr_del(&dict, name) {
+                return Ok(());
+            }
+        }
+        // An attribute assigned onto a function, a builtin exception or a
+        // property.
+        if let Value::Obj(id) = recv {
+            let side = matches!(
+                self.get(recv),
+                Some(
+                    PyObj::Func(_)
+                        | PyObj::Exception { .. }
+                        | PyObj::Property { .. }
+                        | PyObj::Descriptor { .. }
+                )
+            );
+            if side && self.side_attr_del(*id, name) {
                 return Ok(());
             }
         }
@@ -16952,6 +17047,11 @@ pub fn is_generic_subscriptable(recv: &Value) -> bool {
         return with_host(|h| {
             h.class_lookup(&cname, "__class_getitem__").is_some()
                 || h.mro_rc(&cname).iter().any(|c| c == "Generic")
+                // A subclass of a builtin that has one (`class E(ExceptionGroup)`).
+                || h.mro_rc(&cname).iter().any(|c| {
+                    !h.classes.contains_key(c)
+                        && crate::builtins::type_has_method(c, "__class_getitem__")
+                })
         });
     }
     with_host(|h| match h.get(recv) {
@@ -16961,6 +17061,7 @@ pub fn is_generic_subscriptable(recv: &Value) -> bool {
         Some(PyObj::Builtin(n)) => matches!(
             n.as_str(),
             "list" | "dict" | "tuple" | "set" | "frozenset" | "type"
+                | "ExceptionGroup" | "BaseExceptionGroup"
             // typing's `Generic[T]` builds a generic alias; used as a base
             // (`class C(Generic[T])`), its `__mro_entries__` substitutes `Generic`.
                 | "Generic"
@@ -17997,7 +18098,7 @@ fn call_method_inner(
     if let Value::Obj(id) = recv {
         let stored = with_host(|h| {
             matches!(h.get(recv), Some(PyObj::Func(_)))
-                .then(|| h.func_attrs.get(id).and_then(|m| m.get(name)).cloned())
+                .then(|| h.side_attr(*id, name))
                 .flatten()
         });
         if let Some(f) = stored {
@@ -18983,6 +19084,7 @@ fn construct_plain(
     // implicit staticmethod, so `cls` is passed as the first argument. `cls` is
     // also installed as the frame `self` so a zero-arg `super().__new__(cls)`
     // resolves. Otherwise a bare instance is allocated (default `object.__new__`).
+    let user_new = with_host(|h| h.class_lookup(class, "__new__")).is_some();
     let inst = if let Some(newf) = with_host(|h| h.class_lookup(class, "__new__")) {
         let newf = match with_host(|h| h.get(&newf).cloned()) {
             Some(PyObj::StaticMethod(inner)) => inner,
@@ -19051,6 +19153,20 @@ fn construct_plain(
                     args,
                     kwargs,
                 });
+            }
+        }
+        // A user `__new__` and no user `__init__`: the inherited builtin
+        // `__init__` (`list.__init__`, `dict.__init__`, …) fills a mutable
+        // payload from the constructor arguments, as `type.__call__` runs it.
+        if user_new {
+            let base_payload = with_host(|h| match h.get(&inst) {
+                Some(PyObj::Instance(i)) if !matches!(i.payload, Value::Undef) => {
+                    h.builtin_base_of(&i.class).map(|b| (b, i.payload.clone()))
+                }
+                _ => None,
+            });
+            if let Some((base, payload)) = base_payload {
+                base_super_init(base, &payload, args, kwargs)?;
             }
         }
     }
@@ -20028,10 +20144,111 @@ impl PyHost {
         f.env.clone()
     }
 
-    /// The value of exception member `name` (`args`, `errno`, … — the data
-    /// descriptors of [`crate::builtins::exception_member_owner`]) stored on a
-    /// user exception instance. Like CPython's, these live outside the
-    /// instance `__dict__`.
+    /// Attribute `name` assigned onto side-table object `id` (a function, a
+    /// builtin exception, a property): from its live `__dict__` once that
+    /// exists, else from the attribute map.
+    pub fn side_attr(&self, id: u32, name: &str) -> Option<Value> {
+        if let Some(d) = self.attr_dicts.get(&id) {
+            if let Some(PyObj::Dict(m)) = self.get(d) {
+                if let Some((_, v)) = m.get(&StrKey(name)) {
+                    return Some(v.clone());
+                }
+            }
+        }
+        self.func_attrs.get(&id)?.get(name).cloned()
+    }
+
+    /// Store attribute `name` on side-table object `id`, into its live
+    /// `__dict__` when it has one.
+    pub fn side_attr_set(&mut self, id: u32, name: &str, val: Value) {
+        if let Some(d) = self.attr_dicts.get(&id).cloned() {
+            let key = self.new_str(name.to_string());
+            if let Some(PyObj::Dict(m)) = self.get_mut(&d) {
+                m.insert(PKey::Str(name.to_string()), (key, val));
+                return;
+            }
+        }
+        self.func_attrs
+            .entry(id)
+            .or_default()
+            .insert(name.to_string(), val);
+    }
+
+    /// Remove attribute `name` from side-table object `id`; whether it was set.
+    pub fn side_attr_del(&mut self, id: u32, name: &str) -> bool {
+        if let Some(d) = self.attr_dicts.get(&id).cloned() {
+            if let Some(PyObj::Dict(m)) = self.get_mut(&d) {
+                if m.shift_remove(&StrKey(name)).is_some() {
+                    return true;
+                }
+            }
+        }
+        self.func_attrs
+            .get_mut(&id)
+            .is_some_and(|m| m.shift_remove(name).is_some())
+    }
+
+    /// The live `__dict__` of side-table object `id`, built on first use from
+    /// its attribute map. `is_member` names what stays behind in the map (an
+    /// exception's `args`, `errno`, …, which live outside `__dict__`).
+    pub fn side_dict(&mut self, id: u32, is_member: impl Fn(&str) -> bool) -> Value {
+        if let Some(d) = self.attr_dicts.get(&id) {
+            return d.clone();
+        }
+        let attrs = self.func_attrs.remove(&id).unwrap_or_default();
+        let mut keep = NameMap::default();
+        let mut d = DictMap::default();
+        for (k, v) in attrs {
+            if is_member(&k) {
+                keep.insert(k, v);
+            } else {
+                let kv = self.new_str(k.clone());
+                d.insert(PKey::Str(k), (kv, v));
+            }
+        }
+        if !keep.is_empty() {
+            self.func_attrs.insert(id, keep);
+        }
+        let dict = self.alloc(PyObj::Dict(d));
+        self.attr_dicts.insert(id, dict.clone());
+        dict
+    }
+
+    /// The attributes assigned onto side-table object `id`, in order: its
+    /// live `__dict__`'s string keys, then the attribute map's entries.
+    pub fn side_attr_pairs(&self, id: u32) -> Vec<(String, Value)> {
+        let mut out = Vec::new();
+        if let Some(PyObj::Dict(m)) = self.attr_dicts.get(&id).and_then(|d| self.get(d)) {
+            for (k, v) in m.values() {
+                if let Some(s) = self.as_str(k) {
+                    out.push((s, v.clone()));
+                }
+            }
+        }
+        if let Some(m) = self.func_attrs.get(&id) {
+            out.extend(m.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+        out
+    }
+
+    /// The `__dict__`/`__weakref__` getset descriptor user class `class` installs:
+    /// one object per class and attribute, so `C.__weakref__ is
+    /// C.__dict__['__weakref__']`.
+    fn class_getset(&mut self, class: &str, attr: &str) -> Value {
+        let key = format!("getset:{class}.{attr}");
+        if let Some(d) = self.slot_members.get(&key) {
+            return d.clone();
+        }
+        let disp = self.class_display_name(class);
+        let desc = self.alloc(PyObj::Descriptor {
+            kind: DescKind::GetSetDescriptor,
+            qual: format!("{disp}.{attr}"),
+            recv: None,
+        });
+        self.slot_members.insert(key, desc.clone());
+        desc
+    }
+
     /// The descriptor object of exception member `name` as the defining builtin
     /// type exposes it on the class: `ValueError.args` is `<attribute 'args' of
     /// 'BaseException' objects>`, `OSError.errno` `<member 'errno' of 'OSError'
@@ -20061,6 +20278,10 @@ impl PyHost {
         crate::builtins::exception_member_owner(self, class, name).map(|(_, getset)| getset)
     }
 
+    /// The value of exception member `name` (`args`, `errno`, … — the data
+    /// descriptors of [`crate::builtins::exception_member_owner`]) stored on a
+    /// user exception instance. Like CPython's, these live outside the
+    /// instance `__dict__`.
     pub fn exc_member(&self, exc: &Value, name: &str) -> Option<Value> {
         match exc {
             Value::Obj(id) => self.func_attrs.get(id)?.get(name).cloned(),
@@ -21335,11 +21556,7 @@ impl PyHost {
         let notes = match self.get(exc) {
             Some(PyObj::Instance(i)) => self.inst_attr(&i.dict, "__notes__"),
             Some(PyObj::Exception { .. }) => match exc {
-                Value::Obj(id) => self
-                    .func_attrs
-                    .get(id)
-                    .and_then(|m| m.get("__notes__"))
-                    .cloned(),
+                Value::Obj(id) => self.side_attr(*id, "__notes__"),
                 _ => None,
             },
             _ => None,

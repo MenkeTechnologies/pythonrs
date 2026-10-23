@@ -6821,7 +6821,13 @@ pub fn call_builtin_function(
         let rest: Vec<Value> = args.iter().skip(1).cloned().collect();
         return match target {
             NewTarget::Class(c) => {
-                let payload = call_builtin_function(base, rest, kwargs)?;
+                // A mutable base's `tp_new` ignores its arguments (`list_new`
+                // is `PyType_GenericNew`): its `__init__` fills the payload.
+                let payload = if matches!(base, "list" | "dict" | "set" | "bytearray") {
+                    call_builtin_function(base, vec![], vec![])?
+                } else {
+                    call_builtin_function(base, rest, kwargs)?
+                };
                 Ok(with_host(|h| h.new_instance_payload(c, payload)))
             }
             // `str.__new__(str, 'x')` on the base type itself → the plain value.
@@ -8682,19 +8688,27 @@ fn call_named_builtin(
                 &kwargs,
             )?;
             // A `bytes`/`bytearray` subclass exports its native payload's buffer.
-            let v = obj.unwrap();
-            let v = with_host(|h| match h.get(&v) {
+            // It stays the view's `obj` (`mv_exporter`), as does the exporter of a
+            // memoryview a memoryview is taken of.
+            let orig = obj.unwrap();
+            let (v, exporter) = with_host(|h| match h.get(&orig) {
                 Some(PyObj::Instance(i))
                     if matches!(
                         h.get(&i.payload),
                         Some(PyObj::Bytes(_) | PyObj::Bytearray(_))
                     ) =>
                 {
-                    i.payload.clone()
+                    (i.payload.clone(), Some(orig.clone()))
                 }
-                _ => v,
+                _ => {
+                    let inherited = match &orig {
+                        Value::Obj(id) => h.mv_exporter.get(id).cloned(),
+                        _ => None,
+                    };
+                    (orig.clone(), inherited)
+                }
             });
-            with_host(|h| {
+            let view = with_host(|h| {
                 let (len, readonly) = match h.get(&v) {
                     Some(PyObj::Bytes(b)) => (b.len(), true),
                     Some(PyObj::Bytearray(b)) => (b.len(), false),
@@ -8735,7 +8749,11 @@ fn call_named_builtin(
                     released: false,
                     hashed: Default::default(),
                 }))
-            })
+            })?;
+            if let (Some(e), Value::Obj(id)) = (exporter, &view) {
+                with_host(|h| h.mv_exporter.insert(*id, e));
+            }
+            Ok(view)
         }
         "open" => {
             let names = [
@@ -15956,6 +15974,7 @@ fn own_dir_names(typename: &str) -> Vec<&'static str> {
         }
         "dict_keys" | "dict_items" => out.push("isdisjoint"),
         "Context" => out.extend_from_slice(&["run", "copy", "get", "keys", "values", "items"]),
+        "mappingproxy" => out.extend_from_slice(&["copy", "get", "keys", "values", "items"]),
         "getset_descriptor"
         | "member_descriptor"
         | "wrapper_descriptor"
@@ -16054,7 +16073,9 @@ fn type_extra_names(tn: &str) -> &'static [&'static str] {
         "list" | "dict" | "deque" | "OrderedDict" | "defaultdict" | "Counter" => {
             &["__reversed__", "__class_getitem__"]
         }
-        "set" | "frozenset" | "enumerate" => &["__class_getitem__"],
+        "set" | "frozenset" | "enumerate" | "ExceptionGroup" | "BaseExceptionGroup" => {
+            &["__class_getitem__"]
+        }
         "range" | "dict_keys" | "dict_values" | "dict_items" => &["__reversed__"],
         "memoryview" => &["__class_getitem__", "__buffer__", "__release_buffer__"],
         _ => &[],
@@ -16179,6 +16200,7 @@ pub fn type_has_method(typename: &str, name: &str) -> bool {
         // A C-level attribute descriptor is callable through the descriptor
         // protocol: `type.__dict__['__annotations__'].__get__(cls)`.
         "Context" => return matches!(name, "run" | "copy" | "get" | "keys" | "values" | "items"),
+        "mappingproxy" => return matches!(name, "copy" | "get" | "keys" | "values" | "items"),
         "getset_descriptor"
         | "member_descriptor"
         | "wrapper_descriptor"
@@ -17229,9 +17251,7 @@ pub fn exception_reduce(recv: &Value) -> Result<Value, String> {
         }
         _ => {
             let named: Vec<(String, Value)> = match recv {
-                Value::Obj(id) => h.func_attrs.get(id).map_or_else(Vec::new, |m| {
-                    m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
-                }),
+                Value::Obj(id) => h.side_attr_pairs(*id),
                 _ => Vec::new(),
             };
             let attrs = named.into_iter().map(|(k, v)| (h.new_str(k), v)).collect();
@@ -18605,7 +18625,7 @@ pub fn call_type_method(
         }
         // A `_thread` lock: the operations live on the host object, so route
         // there rather than reimplementing them.
-        "lock" | "RLock" => host::call_method(recv, name, args, kwargs),
+        "lock" | "RLock" | "mappingproxy" => host::call_method(recv, name, args, kwargs),
         // `Context.run(fn, *args, **kw)` — call `fn` in this context. The
         // variables carry their own state, so "this context" is the current one
         // and running is a plain call. `threading` dispatches every thread body
@@ -19089,7 +19109,7 @@ fn property_method(recv: &Value, name: &str, args: &[Value]) -> Result<Value, St
             getter_doc,
         }) => {
             let doc = match recv {
-                Value::Obj(id) => h.func_attrs.get(id).and_then(|m| m.get("__doc__")).cloned(),
+                Value::Obj(id) => h.side_attr(*id, "__doc__"),
                 _ => None,
             };
             (
@@ -19177,10 +19197,7 @@ fn new_property(
         // `__doc__` is a writable member; it lives in the side table an
         // assignment to it writes (see `PyHost::set_attr`).
         if let (Value::Obj(id), false) = (&prop, matches!(doc, Value::Undef)) {
-            h.func_attrs
-                .entry(*id)
-                .or_default()
-                .insert("__doc__".to_string(), doc);
+            h.side_attr_set(*id, "__doc__", doc);
         }
         prop
     }))
