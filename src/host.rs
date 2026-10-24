@@ -21750,8 +21750,13 @@ impl PyHost {
             .is_some_and(|e| self.syntax_error_block(e).is_some());
         if let (Some(pos), false) = (syntax_pos, exc_is_syntax) {
             let final_line = crate::parser::render_syntax_head(&pos, err, "<string>");
-            let final_line = final_line.trim_end_matches('\n');
-            self.render_exc_block(None, &final_frames, None, final_line, &mut ctx, &mut out);
+            // The head is already rendered (and coloured) with its source block.
+            if !final_frames.is_empty() {
+                ctx.emit(&mut out, "Traceback (most recent call last):\n", '|');
+                ctx.emit(&mut out, &self.render_frames(&final_frames), '|');
+            }
+            let final_line = format!("{}\n", final_line.trim_end_matches('\n'));
+            ctx.emit(&mut out, &final_line, '|');
             return out;
         }
         let cpython = self.cpython_raised_for_err(err);
@@ -22051,11 +22056,19 @@ impl PyHost {
             // that reached it, and its final line is `msg` alone.
             if let Some((block, last)) = exc.and_then(|e| self.syntax_error_block(e)) {
                 ctx.emit(out, &block, '|');
-                ctx.emit(out, &format!("{last}\n"), '|');
+                ctx.emit(
+                    out,
+                    &format!("{}\n", crate::tbcolor::final_line(&last)),
+                    '|',
+                );
                 ctx.emit(out, &self.exc_notes_text(exc), '|');
                 return;
             }
-            ctx.emit(out, &format!("{final_line}\n"), '|');
+            ctx.emit(
+                out,
+                &format!("{}\n", crate::tbcolor::final_line(final_line)),
+                '|',
+            );
             ctx.emit(out, &self.exc_notes_text(exc), '|');
             return;
         };
@@ -22079,7 +22092,11 @@ impl PyHost {
             );
             ctx.emit(out, &self.render_frames(frames), '|');
         }
-        ctx.emit(out, &format!("{final_line}\n"), '|');
+        ctx.emit(
+            out,
+            &format!("{}\n", crate::tbcolor::final_line(final_line)),
+            '|',
+        );
         ctx.emit(out, &self.exc_notes_text(exc), '|');
         // Only the first `MAX_GROUP_WIDTH` members are shown; the slot after them
         // reports how many were elided.
@@ -22168,10 +22185,7 @@ impl PyHost {
             if count > RECURSIVE_CUTOFF {
                 continue;
             }
-            out.push_str(&format!(
-                "  File \"{}\", line {}, in {}\n",
-                filename, f.line, f.name
-            ));
+            out.push_str(&crate::tbcolor::file_line(&filename, f.line, Some(&f.name)));
             // Code compiled from a string has no file to read its line from.
             let text = match f.file {
                 Some(_) => None,
@@ -22180,12 +22194,18 @@ impl PyHost {
             if let Some(text) = text.as_deref() {
                 let stripped = text.trim();
                 if !stripped.is_empty() {
-                    out.push_str(&format!("    {stripped}\n"));
-                    if f.span.line == f.line {
-                        if let Some(carets) = caret_line(text, f.span) {
-                            out.push_str(&carets);
-                            out.push('\n');
+                    let line = format!("    {stripped}");
+                    let carets = if f.span.line == f.line {
+                        caret_line(text, f.span)
+                    } else {
+                        None
+                    };
+                    match carets {
+                        Some(carets) => {
+                            let (line, carets) = crate::tbcolor::source_and_carets(&line, &carets);
+                            out.push_str(&format!("{line}\n{carets}\n"));
                         }
+                        None => out.push_str(&format!("{line}\n")),
                     }
                 }
             }

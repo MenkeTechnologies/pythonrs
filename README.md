@@ -203,7 +203,10 @@ that does not compile is reported the way CPython reports it — the
 `File "…", line N` header, the source line and a caret run, then CPython's
 message, with the `Did you mean 'while'?` hint traceback gives a misspelled
 keyword — and a `SyntaxError` carries its `lineno`/`offset`/`end_offset`/`text`
-/`filename`/`_metadata`; `compile()`, `exec` and `eval` share that path. The symbol
+/`filename`/`_metadata`; `compile()`, `exec` and `eval` share that path. On a
+terminal, or under `PYTHON_COLORS=1` / `FORCE_COLOR`, an uncaught exception's
+traceback and a compile error are coloured as CPython 3.13+ colours them
+(`PYTHON_COLORS=0`, `NO_COLOR` and `TERM=dumb` turn it off). The symbol
 table's checks run before any code is generated, so a `global`/`nonlocal`
 after the name was used or bound, or a `yield` in a comprehension, is refused
 as CPython refuses it. Names follow PEP 3131 — `π`, `año`, `变量` are

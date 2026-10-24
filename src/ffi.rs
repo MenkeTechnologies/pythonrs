@@ -4407,14 +4407,39 @@ pub fn traceback_text(handle: u32) -> Option<String> {
             .getattr("__traceback__")
             .ok()
             .filter(|tb| !tb.is_none())?;
-        let lines = py
-            .import("traceback")
-            .and_then(|m| m.getattr("format_tb"))
-            .and_then(|f| f.call1((tb,)))
-            .ok()?;
-        let lines: Vec<String> = lines.extract().ok()?;
-        Some(lines.concat())
+        format_tb_text(py, &tb)
     })
+}
+
+/// `traceback.format_tb(tb)` joined, or, while the uncaught-exception report
+/// is being coloured ([`crate::tbcolor`]), the same frames formatted with
+/// `colorize=True` as `sys.excepthook` formats them (3.13+; an interpreter
+/// whose `StackSummary.format` takes no `colorize` gives the plain text).
+fn format_tb_text(py: Python, tb: &Bound<PyAny>) -> Option<String> {
+    let traceback = py.import("traceback").ok()?;
+    if crate::tbcolor::enabled() {
+        let kwargs = PyDict::new(py);
+        let coloured = kwargs
+            .set_item("colorize", true)
+            .and_then(|_| traceback.getattr("walk_tb")?.call1((tb,)))
+            .and_then(|frames| {
+                traceback
+                    .getattr("StackSummary")?
+                    .call_method1("extract", (frames,))
+            })
+            .and_then(|summary| summary.call_method("format", (), Some(&kwargs)))
+            .and_then(|lines| lines.extract::<Vec<String>>());
+        if let Ok(lines) = coloured {
+            return Some(lines.concat());
+        }
+    }
+    let lines: Vec<String> = traceback
+        .getattr("format_tb")
+        .and_then(|f| f.call1((tb,)))
+        .ok()?
+        .extract()
+        .ok()?;
+    Some(lines.concat())
 }
 
 /// CPython's rendering (`traceback.format_tb`) of the traceback chain at ffi
@@ -4423,13 +4448,7 @@ pub fn traceback_text(handle: u32) -> Option<String> {
 pub fn traceback_segment_text(handle: u32) -> Option<String> {
     Python::attach(|py| {
         let tb = fetch(py, handle).ok()?;
-        let lines = py
-            .import("traceback")
-            .and_then(|m| m.getattr("format_tb"))
-            .and_then(|f| f.call1((tb,)))
-            .ok()?;
-        let lines: Vec<String> = lines.extract().ok()?;
-        Some(lines.concat())
+        format_tb_text(py, &tb)
     })
 }
 

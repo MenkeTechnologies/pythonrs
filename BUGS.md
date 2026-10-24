@@ -9,6 +9,16 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **An uncaught exception's traceback is coloured.** CPython 3.13+ prints it
+  through `sys.excepthook` with `colorize=_colorize.can_colorize(file=
+  sys.stderr)`; pythonrs never coloured. The report (and a compile error) now
+  takes the `_colorize.Traceback` theme when `PYTHON_COLORS=1`, `FORCE_COLOR`
+  is set or stderr is a terminal, and not under `PYTHON_COLORS=0`, `NO_COLOR`
+  or `TERM=dumb`: the `File` line's parts in magenta, the caret range red with
+  its anchor bold red, the type bold magenta and the message magenta. CPython
+  frames in the trace are formatted by CPython with `colorize=True` where its
+  `StackSummary.format` takes it. The `traceback` module's functions stay
+  uncoloured, as CPython's do; the REPL's tracebacks are not coloured yet.
 - **Each asyncio Task runs in a copy of its creator's context.** A
   `ContextVar.set` inside one task leaked into its siblings, its creator and
   the top level after `asyncio.run` (`gather` of two setters returned `[2, 2]`

@@ -384,7 +384,7 @@ pub fn source_line(src: &str, lineno: i64, keep_newline: bool) -> Option<String>
 pub fn render_syntax_error(pos: &SyntaxPos, msg: &str, default_file: &str) -> (String, String) {
     let file = pos.filename.as_deref().unwrap_or(default_file);
     let mut out = match pos.lineno {
-        Some(l) => format!("  File \"{file}\", line {l}\n"),
+        Some(l) => crate::tbcolor::file_line(file, l, None),
         None => format!("  File \"{file}\"\n"),
     };
     if pos.text.is_none() {
@@ -404,9 +404,16 @@ pub fn render_syntax_head(pos: &SyntaxPos, head: &str, default_file: &str) -> St
     match head.split_once(": ") {
         Some((class, msg)) => {
             let (block, msg) = render_syntax_error(pos, msg, default_file);
-            format!("{block}{class}: {msg}")
+            format!(
+                "{block}{}",
+                crate::tbcolor::final_line(&format!("{class}: {msg}"))
+            )
         }
-        None => format!("{}{head}", render_syntax_error(pos, "", default_file).0),
+        None => format!(
+            "{}{}",
+            render_syntax_error(pos, "", default_file).0,
+            crate::tbcolor::final_line(head)
+        ),
     }
 }
 
@@ -419,8 +426,8 @@ fn render_source_and_carets(pos: &SyntaxPos) -> String {
     let rtext = text.trim_end_matches('\n');
     let ltext = rtext.trim_start_matches([' ', '\n', '\x0c']);
     let spaces = (rtext.chars().count() - ltext.chars().count()) as i64;
-    out.push_str(&format!("    {ltext}\n"));
     let Some(mut offset) = pos.offset else {
+        out.push_str(&format!("    {ltext}\n"));
         return out;
     };
     let len = rtext.chars().count() as i64;
@@ -450,10 +457,16 @@ fn render_source_and_carets(pos: &SyntaxPos) -> String {
             .take(col as usize)
             .map(|c| if c.is_whitespace() { c } else { ' ' })
             .collect();
-        out.push_str(&format!(
-            "    {lead}{}\n",
-            "^".repeat((end_col - col).max(0) as usize)
+        let carets = "^".repeat((end_col - col).max(0) as usize);
+        out.push_str(&crate::tbcolor::syntax_source(
+            ltext,
+            col as usize,
+            end_col.max(0) as usize,
+            &lead,
+            &carets,
         ));
+    } else {
+        out.push_str(&format!("    {ltext}\n"));
     }
     out
 }

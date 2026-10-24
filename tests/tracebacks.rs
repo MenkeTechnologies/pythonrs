@@ -73,3 +73,77 @@ fn notes_print_under_the_final_line_of_a_reraised_exception() {
          \x20                                               ^^^^^^^\nKeyError: 'k'\nfirst\nsecond\nmore\n"
     );
 }
+
+/// Run `main` from a fresh directory holding `files` with `env` set, and
+/// return its stderr with the directory written as `DIR`.
+fn stderr_with_env(files: &[(&str, &str)], main: &str, env: &[(&str, &str)]) -> String {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().canonicalize().expect("canonical temp dir");
+    for (name, src) in files {
+        std::fs::write(dir.join(name), src).expect("write source");
+    }
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_python"));
+    cmd.arg(dir.join(main)).env("PYTHONRS_CACHE", "0");
+    for var in ["PYTHON_COLORS", "NO_COLOR", "FORCE_COLOR", "TERM"] {
+        cmd.env_remove(var);
+    }
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("spawn python");
+    String::from_utf8_lossy(&out.stderr).replace(&*dir.to_string_lossy(), "DIR")
+}
+
+/// The traceback of an uncaught exception is coloured as `sys.excepthook`
+/// colours it when `_colorize.can_colorize(file=sys.stderr)` holds: the
+/// `File` line's parts in magenta, the caret range in red with its anchor in
+/// bold red, the type in bold magenta and the message in magenta; a note and
+/// the chain connector stay plain. A syntax error colours its range the same
+/// way. `PYTHON_COLORS=0` wins over `FORCE_COLOR`, and a pipe is not a
+/// terminal. Expected output is python3.14's.
+#[test]
+fn an_uncaught_traceback_is_coloured_when_stderr_may_be() {
+    let main = "def f(d):\n    return d[\"a\"] + 1\ntry:\n    f({\"a\": \"x\"})\nexcept TypeError as e:\n    \
+                e.add_note(\"a note\")\n    raise ValueError(\"outer\") from e\n";
+    let err = stderr_with_env(&[("main.py", main)], "main.py", &[("PYTHON_COLORS", "1")]);
+    assert_eq!(
+        err,
+        "Traceback (most recent call last):\n  \
+         File \x1b[35m\"DIR/main.py\"\x1b[0m, line \x1b[35m4\x1b[0m, in \x1b[35m<module>\x1b[0m\n    \
+         \x1b[31mf\x1b[0m\x1b[1;31m({\"a\": \"x\"})\x1b[0m\n    \
+         \x1b[31m~\x1b[0m\x1b[1;31m^^^^^^^^^^^^\x1b[0m\n  \
+         File \x1b[35m\"DIR/main.py\"\x1b[0m, line \x1b[35m2\x1b[0m, in \x1b[35mf\x1b[0m\n    \
+         return \x1b[31md[\"a\"] \x1b[0m\x1b[1;31m+\x1b[0m\x1b[31m 1\x1b[0m\n           \
+         \x1b[31m~~~~~~~\x1b[0m\x1b[1;31m^\x1b[0m\x1b[31m~~\x1b[0m\n\
+         \x1b[1;35mTypeError\x1b[0m: \x1b[35mcan only concatenate str (not \"int\") to str\x1b[0m\n\
+         a note\n\n\
+         The above exception was the direct cause of the following exception:\n\n\
+         Traceback (most recent call last):\n  \
+         File \x1b[35m\"DIR/main.py\"\x1b[0m, line \x1b[35m7\x1b[0m, in \x1b[35m<module>\x1b[0m\n    \
+         raise ValueError(\"outer\") from e\n\
+         \x1b[1;35mValueError\x1b[0m: \x1b[35mouter\x1b[0m\n"
+    );
+    let err = stderr_with_env(
+        &[("syn.py", "x = (1,\n2 3)\n")],
+        "syn.py",
+        &[("FORCE_COLOR", "1")],
+    );
+    assert_eq!(
+        err,
+        "  File \x1b[35m\"DIR/syn.py\"\x1b[0m, line \x1b[35m2\x1b[0m\n    \
+         \x1b[1;31m2 3\x1b[0m)\n    \x1b[1;31m^^^\x1b[0m\n\
+         \x1b[1;35mSyntaxError\x1b[0m: \x1b[35minvalid syntax. Perhaps you forgot a comma?\x1b[0m\n"
+    );
+    let plain = "  File \"DIR/syn.py\", line 2\n    2 3)\n    ^^^\n\
+                 SyntaxError: invalid syntax. Perhaps you forgot a comma?\n";
+    for env in [
+        &[("PYTHON_COLORS", "0"), ("FORCE_COLOR", "1")][..],
+        &[("NO_COLOR", "1"), ("FORCE_COLOR", "1")][..],
+        &[][..],
+    ] {
+        assert_eq!(
+            stderr_with_env(&[("syn.py", "x = (1,\n2 3)\n")], "syn.py", env),
+            plain
+        );
+    }
+}

@@ -243,7 +243,9 @@ pub extern "C" fn pythonrs_aot_run_embedded() -> i64 {
     crate::stdio::flush_io();
     let code = match host::with_host(|h| h.take_error()).or(native_error) {
         None => 0,
-        Some(e) => match host::classify_top_error(&e) {
+        Some(e) => match crate::tbcolor::with(crate::tbcolor::can_colorize_stderr(), || {
+            host::classify_top_error(&e)
+        }) {
             host::TopExit::SystemExit { code, message } => {
                 if let Some(msg) = message {
                     eprint!("{msg}");

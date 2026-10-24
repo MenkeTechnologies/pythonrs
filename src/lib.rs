@@ -41,6 +41,7 @@ pub mod stdio;
 pub mod stdlib;
 pub mod suggest;
 pub mod symtable;
+pub mod tbcolor;
 pub mod tiers;
 pub mod unparse;
 
@@ -407,7 +408,10 @@ fn execute_program(
         Err(e) => {
             return RunReport {
                 exit_code: 1,
-                stderr: Some(render_compile_error(&e, src, tb_filename)),
+                stderr: Some(crate::tbcolor::with(
+                    crate::tbcolor::can_colorize_stderr(),
+                    || render_compile_error(&e, src, tb_filename),
+                )),
             }
         }
     };
@@ -429,7 +433,9 @@ fn execute_program(
             exit_code: 0,
             stderr: None,
         },
-        Err(e) => match host::classify_top_error(&e) {
+        Err(e) => match crate::tbcolor::with(crate::tbcolor::can_colorize_stderr(), || {
+            host::classify_top_error(&e)
+        }) {
             host::TopExit::SystemExit { code, message } => RunReport {
                 exit_code: code,
                 stderr: message,
