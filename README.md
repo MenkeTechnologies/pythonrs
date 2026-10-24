@@ -225,6 +225,7 @@ what is not yet implemented.
 | `-u` | Unbuffered `stdout`/`stderr` (`PYTHONUNBUFFERED`). Without it the streams buffer as CPython's do: `stdout` line-buffered on a TTY and block-buffered on a pipe or file, `stderr` line-buffered, flushed at the same points (exit, `input()`, before a script's traceback). |
 | `-O` / `-OO` | Optimize (`PYTHONOPTIMIZE`): `-O` compiles `assert` away and sets `__debug__` to `False`; `-OO` also drops docstrings. `sys.flags.optimize` reports the level. |
 | `-E -I -S -B -W` | CPython interpreter flags, accepted for drop-in compatibility (`-W` takes real effect via the embedded interpreter; the rest are tolerated no-ops). |
+| `-X OPT` | Implementation-specific option, listed in `sys._xoptions`. `-X int_max_str_digits=N` sets the integer string conversion limit (after `PYTHONINTMAXSTRDIGITS`), for pythonrs and the embedded interpreter alike. |
 | `--build` | AOT-compile the script to a standalone native executable. Needs a libpython-free runtime — build with `--no-default-features`; a `stdlib-ffi` build refuses up front (its CPython symbols can't be statically linked). |
 | `--dump-bytecode` | Print the lowered `fusevm` bytecode and exit. |
 | `--dump-tokens` | Print the lexer token stream and exit. |

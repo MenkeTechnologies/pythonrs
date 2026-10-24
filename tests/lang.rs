@@ -11080,3 +11080,35 @@ for b, s in ((int, ('a',)), (bytes, 'a'), (tuple, (1,)), (P, ('__dict__',)), (in
          \"nonempty __slots__ not supported for subtype of 'P'\", 'ok', 'ok']"
     );
 }
+
+/// An unbound `__str__`/`__repr__` slot wrapper belongs to the type whose
+/// `__dict__` holds it: `int.__str__` is `object.__str__` (so it renders the
+/// receiver's `repr`), the exceptions share `BaseException`'s. `int.__repr__`
+/// renders an `int` — `True` as `1` — and is bounded by the digit limit like
+/// `str()`.
+#[test]
+fn unbound_str_and_repr_slots_name_their_owner() {
+    let src = r#"
+import sys
+out = [int.__str__(True), int.__repr__(True), repr(int.__str__), repr(int.__repr__),
+       repr(ValueError.__str__), repr(KeyError.__repr__), repr(ModuleNotFoundError.__str__),
+       repr(str.__str__), ValueError.__str__(ValueError('v')), KeyError.__str__(KeyError('a'))]
+sys.set_int_max_str_digits(1000)
+for f in (int.__repr__, int.__str__):
+    try:
+        f(10 ** 1200)
+    except ValueError as e:
+        out.append(str(e)[:30])
+sys.set_int_max_str_digits(4300)
+"#;
+    assert_eq!(
+        g(src, "out"),
+        "['True', '1', \"<slot wrapper '__str__' of 'object' objects>\", \
+         \"<slot wrapper '__repr__' of 'int' objects>\", \
+         \"<slot wrapper '__str__' of 'BaseException' objects>\", \
+         \"<slot wrapper '__repr__' of 'BaseException' objects>\", \
+         \"<slot wrapper '__str__' of 'ImportError' objects>\", \
+         \"<slot wrapper '__str__' of 'str' objects>\", 'v', \"'a'\", \
+         'Exceeds the limit (1000 digits', 'Exceeds the limit (1000 digits']"
+    );
+}

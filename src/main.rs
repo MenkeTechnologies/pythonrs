@@ -72,6 +72,14 @@ fn run_main() -> ExitCode {
     if !cli.warnings.is_empty() {
         std::env::set_var("PYTHONWARNINGS", cli.warnings.join(","));
     }
+    // `-X` is read in pre-initialization too, after the environment.
+    if let Err(msg) = pythonrs::host::set_xoptions(cli.xoptions.clone()) {
+        eprintln!(
+            "Fatal Python error: config_init_int_max_str_digits: {msg}\n\
+             Python runtime state: preinitialized\n"
+        );
+        return ExitCode::FAILURE;
+    }
     // `-O`/`-OO` are the CLI spelling of `PYTHONOPTIMIZE`; folding them into the
     // env var gives `__debug__` and the embedded interpreter one source of truth.
     // A bare `PYTHONOPTIMIZE` already in the environment is only overridden when
@@ -321,8 +329,8 @@ fn program_boundary(raw: &[String]) -> usize {
         {
             return i;
         }
-        if a == "-W" {
-            i += 2; // `-W <action>` consumes its value.
+        if a == "-W" || a == "-X" {
+            i += 2; // `-W <action>` and `-X <opt>` consume their value.
             continue;
         }
         if a.starts_with('-') && a.len() > 1 {

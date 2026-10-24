@@ -1647,3 +1647,93 @@ fn optimize_levels_strip_asserts_and_docstrings() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `-X int_max_str_digits=N` (read after `PYTHONINTMAXSTRDIGITS`, the first
+/// such option winning, its value a whole `wcstol`) sets the limit, is listed
+/// in `sys._xoptions` with the other `-X` options (a later duplicate replacing
+/// the value there, a bare option `True`), and a refused value stops the
+/// interpreter in pre-initialization. Expected output is python3.14's.
+#[test]
+fn dash_x_options_and_the_int_max_str_digits_limit() {
+    let run = |args: &[&str], env: &[(&str, &str)]| {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_python"));
+        cmd.args(args).env_remove("PYTHONINTMAXSTRDIGITS");
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().expect("spawn python");
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.status.code(),
+        )
+    };
+    let show = "import sys; print(sys.get_int_max_str_digits(), sys._xoptions, sys.flags.int_max_str_digits)";
+    let x = [
+        "-X",
+        "foo=bar",
+        "-X",
+        "dev",
+        "-X",
+        "int_max_str_digits=800",
+        "-X",
+        "int_max_str_digits=900",
+        "-c",
+        show,
+    ];
+    assert_eq!(
+        run(&x, &[]),
+        (
+            "800 {'foo': 'bar', 'dev': True, 'int_max_str_digits': '900'} 800\n".to_string(),
+            String::new(),
+            Some(0)
+        )
+    );
+    assert_eq!(
+        run(
+            &["-X", "int_max_str_digits=", "-c", show],
+            &[("PYTHONINTMAXSTRDIGITS", "900")]
+        )
+        .0,
+        "0 {'int_max_str_digits': ''} 0\n"
+    );
+    let refused = "Fatal Python error: config_init_int_max_str_digits: -X int_max_str_digits: invalid \
+                   limit; must be >= 640 or 0 for unlimited.\nPython runtime state: preinitialized\n\n";
+    for opt in [
+        "int_max_str_digits=100",
+        "int_max_str_digits",
+        "int_max_str_digits=7x",
+    ] {
+        assert_eq!(
+            run(&["-X", opt, "-c", "print(1)"], &[]),
+            (String::new(), refused.to_string(), Some(1))
+        );
+    }
+}
+
+/// The limit pythonrs converts with is the one the embedded interpreter
+/// converts with, so `json` (CPython's) refuses what `int()` refuses, after a
+/// `sys.set_int_max_str_digits` and from `PYTHONINTMAXSTRDIGITS`. Expected
+/// output is python3.14's.
+#[test]
+fn the_bridge_converts_with_the_same_int_max_str_digits() {
+    let src = "import sys, json\nsys.set_int_max_str_digits(1000)\n\
+               try:\n    json.loads('1' * 1001)\nexcept ValueError as e:\n    print(str(e)[:52])\n\
+               try:\n    json.dumps(10 ** 1200)\nexcept ValueError as e:\n    print(str(e)[:52])\n";
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_python"))
+        .args(["-c", src])
+        .env_remove("PYTHONINTMAXSTRDIGITS")
+        .output()
+        .expect("spawn python");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if stderr.contains("ModuleNotFoundError") {
+        eprintln!("skipping: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "Exceeds the limit (1000 digits) for integer string c\n\
+         Exceeds the limit (1000 digits) for integer string c\n",
+        "stderr={stderr}"
+    );
+}

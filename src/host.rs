@@ -2051,17 +2051,91 @@ pub fn parse_int_max_str_digits(raw: Option<&str>) -> Option<usize> {
     }
 }
 
+/// The interpreter's `-X` options, in command-line order (`sys._xoptions`).
+static XOPTIONS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// Record the `-X` options. `Err` is the pre-initialization failure CPython
+/// dies with for an `-X int_max_str_digits` it refuses.
+pub fn set_xoptions(opts: Vec<String>) -> Result<(), String> {
+    if let Some(opt) = first_xoption("int_max_str_digits", &opts) {
+        if parse_xoption_int_max_str_digits(opt).is_none() {
+            return Err(
+                "-X int_max_str_digits: invalid limit; must be >= 640 or 0 for unlimited."
+                    .to_string(),
+            );
+        }
+    }
+    let _ = XOPTIONS.set(opts);
+    Ok(())
+}
+
+/// `config_get_xoption`: the FIRST option named `name` (bare or `name=value`).
+fn first_xoption<'a>(name: &str, opts: &'a [String]) -> Option<&'a str> {
+    opts.iter()
+        .map(String::as_str)
+        .find(|o| o.split_once('=').map_or(*o, |(k, _)| k) == name)
+}
+
+/// `-X int_max_str_digits=N` as `config_init_int_max_str_digits` reads it: a
+/// `wcstol` of everything after the `=` that consumes it all (so an empty
+/// value is `0`), `0` or at least the threshold; no `=` is refused.
+fn parse_xoption_int_max_str_digits(opt: &str) -> Option<usize> {
+    let (_, value) = opt.split_once('=')?;
+    let s = value.trim_start_matches(|c: char| c.is_whitespace());
+    let digits = s.strip_prefix(['+', '-']).unwrap_or(s);
+    if value.is_empty() {
+        return Some(0);
+    }
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n: i64 = digits.parse().ok().filter(|n| *n <= i64::from(i32::MAX))?;
+    let n = if s.starts_with('-') { -n } else { n };
+    match usize::try_from(n) {
+        Ok(0) => Some(0),
+        Ok(n) if n >= INT_MAX_STR_DIGITS_THRESHOLD => Some(n),
+        _ => None,
+    }
+}
+
+/// `sys._xoptions`: each `-X` option's value, `True` for a bare one; a later
+/// option of the same name replaces an earlier one.
+pub fn xoptions() -> Vec<(String, Option<String>)> {
+    let mut out: Vec<(String, Option<String>)> = Vec::new();
+    for opt in XOPTIONS.get().map(Vec::as_slice).unwrap_or(&[]) {
+        let (k, v) = match opt.split_once('=') {
+            Some((k, v)) => (k.to_string(), Some(v.to_string())),
+            None => (opt.clone(), None),
+        };
+        match out.iter_mut().find(|(name, _)| *name == k) {
+            Some(slot) => slot.1 = v,
+            None => out.push((k, v)),
+        }
+    }
+    out
+}
+
+/// The limit an interpreter starts with: `PYTHONINTMAXSTRDIGITS`, then an
+/// `-X int_max_str_digits` over it, else the default.
+fn initial_int_max_str_digits() -> usize {
+    let env = parse_int_max_str_digits(std::env::var("PYTHONINTMAXSTRDIGITS").ok().as_deref())
+        .unwrap_or(INT_MAX_STR_DIGITS_DEFAULT);
+    XOPTIONS
+        .get()
+        .and_then(|opts| first_xoption("int_max_str_digits", opts))
+        .and_then(parse_xoption_int_max_str_digits)
+        .unwrap_or(env)
+}
+
 thread_local! {
     /// `sys.get_int_max_str_digits()`: the most decimal digits an `int` may be
     /// converted from or to (`0` = unlimited). Seeded from
-    /// `PYTHONINTMAXSTRDIGITS`, changed by `sys.set_int_max_str_digits`. Kept
-    /// outside `PyHost` because the LEXER enforces it too — an over-long
-    /// decimal literal is a `SyntaxError` — and the lexer runs without the
-    /// host borrowed.
-    static INT_MAX_STR_DIGITS: std::cell::Cell<usize> = std::cell::Cell::new(
-        parse_int_max_str_digits(std::env::var("PYTHONINTMAXSTRDIGITS").ok().as_deref())
-            .unwrap_or(INT_MAX_STR_DIGITS_DEFAULT),
-    );
+    /// `PYTHONINTMAXSTRDIGITS` and `-X int_max_str_digits`, changed by
+    /// `sys.set_int_max_str_digits`. Kept outside `PyHost` because the LEXER
+    /// enforces it too — an over-long decimal literal is a `SyntaxError` — and
+    /// the lexer runs without the host borrowed.
+    static INT_MAX_STR_DIGITS: std::cell::Cell<usize> =
+        std::cell::Cell::new(initial_int_max_str_digits());
 }
 
 /// The current `sys.get_int_max_str_digits()`.
@@ -3117,14 +3191,11 @@ pub fn reset_host() {
     // the OLD body. Drop them with the table they belong to.
     VM_POOL.with(|p| p.borrow_mut().clear());
     async_rt::reset();
-    // A fresh interpreter starts from the environment's digit limit, not from
+    // A fresh interpreter starts from the configured digit limit, not from
     // whatever `sys.set_int_max_str_digits` the previous program left behind.
-    INT_MAX_STR_DIGITS.with(|c| {
-        c.set(
-            parse_int_max_str_digits(std::env::var("PYTHONINTMAXSTRDIGITS").ok().as_deref())
-                .unwrap_or(INT_MAX_STR_DIGITS_DEFAULT),
-        )
-    });
+    INT_MAX_STR_DIGITS.with(|c| c.set(initial_int_max_str_digits()));
+    #[cfg(feature = "stdlib-ffi")]
+    crate::ffi::set_int_max_str_digits(int_max_str_digits());
 }
 
 /// Install the per-run CLI/runtime context on a freshly reset host: `sys.argv`,
@@ -3514,6 +3585,23 @@ impl PyHost {
         }
         self.heap.push(obj);
         Value::Obj((self.heap.len() - 1) as u32)
+    }
+
+    /// The unbound slot wrapper `qual` (`object.__str__`): one object per
+    /// slot, as the owning type's `__dict__` holds one, so `int.__str__ is
+    /// object.__str__` (which `enum` tests to pick a `ReprEnum`'s `__str__`).
+    pub fn slot_wrapper(&mut self, qual: String) -> Value {
+        let key = format!("slot wrapper {qual}");
+        if let Some(v) = self.builtin_objects.get(&key) {
+            return v.clone();
+        }
+        let v = self.alloc(PyObj::Descriptor {
+            kind: DescKind::WrapperDescriptor,
+            qual,
+            recv: None,
+        });
+        self.builtin_objects.insert(key, v.clone());
+        v
     }
 
     /// The interned type object for a builtin name (`len`, `int`, `ValueError`).
@@ -5970,6 +6058,9 @@ impl PyHost {
     /// into every `sys.flags` object.
     pub fn set_int_max_str_digits(&mut self, n: usize) {
         INT_MAX_STR_DIGITS.with(|c| c.set(n));
+        // The embedded interpreter converts with the same limit (`json`, `decimal`).
+        #[cfg(feature = "stdlib-ffi")]
+        crate::ffi::set_int_max_str_digits(n);
         for flags in self.sys_flags.clone() {
             if let Some(PyObj::Namespace { attrs }) = self.get_mut(&flags) {
                 attrs.insert("int_max_str_digits".to_string(), Value::Int(n as i64));
@@ -14140,11 +14231,7 @@ impl PyHost {
                 // wrapper from `object`, as in CPython. (collections' OrderedDict
                 // does `__ne__ = _collections_abc.MutableMapping.__ne__`.)
                 if OBJECT_SLOT_WRAPPERS.contains(&name) {
-                    return Ok(self.alloc(PyObj::Descriptor {
-                        kind: DescKind::WrapperDescriptor,
-                        qual: format!("object.{name}"),
-                        recv: None,
-                    }));
+                    return Ok(self.slot_wrapper(format!("object.{name}")));
                 }
                 Err(format!(
                     "AttributeError: type object '{cname}' has no attribute '{name}'",
@@ -15295,11 +15382,10 @@ impl PyHost {
                     && name.ends_with("__")
                     && OBJECT_SLOT_WRAPPERS.contains(&name) =>
             {
-                Ok(self.alloc(PyObj::Descriptor {
-                    kind: DescKind::WrapperDescriptor,
-                    qual: format!("{n}.{name}"),
-                    recv: None,
-                }))
+                // The wrapper belongs to the type whose `__dict__` holds it:
+                // `int.__str__` is `object.__str__`.
+                let owner = crate::builtins::slot_owner(n, name);
+                Ok(self.slot_wrapper(format!("{owner}.{name}")))
             }
             // `itertools.chain.from_iterable` — the alternate constructor, read
             // off the `chain` callable itself. `call_itertools` already builds it
@@ -17339,6 +17425,15 @@ fn invoke_object(
                 let s = crate::builtins::py_repr(&recv)?;
                 return Ok(with_host(|h| h.new_str(s)));
             }
+            // A CPython receiver (an `IntEnum` member) runs CPython's own slot.
+            #[cfg(feature = "stdlib-ffi")]
+            if crate::builtins::is_type_like_builtin(&base)
+                && with_host(|h| h.foreign_id(&recv)).is_some()
+            {
+                let mut all = vec![recv];
+                all.extend(rest);
+                return crate::ffi::call_builtin_type_method(&base, &method, all, kwargs);
+            }
             if crate::builtins::is_type_like_builtin(&base) {
                 let payload =
                     with_host(|h| h.base_payload_any(&recv)).unwrap_or_else(|| recv.clone());
@@ -17917,14 +18012,20 @@ pub(crate) fn base_dispatch(
             Ok(Value::Bool(with_host(|h| h.contains(&item, payload))?))
         }
         "__iter__" => with_host(|h| h.make_iter(payload)),
-        "__repr__" => Ok(with_host(|h| {
-            let s = h.repr_of(payload);
-            h.new_str(s)
-        })),
-        "__str__" => Ok(with_host(|h| {
-            let s = h.str_of(payload);
-            h.new_str(s)
-        })),
+        "__repr__" | "__str__" => {
+            if let Some(e) = with_host(|h| h.int_str_limit_exceeded(payload)) {
+                return Err(e);
+            }
+            Ok(with_host(|h| {
+                let s = match payload {
+                    // `int.__repr__(True)` is `long_to_decimal_string`: `1`.
+                    Value::Bool(b) if base == "int" => i64::from(*b).to_string(),
+                    _ if name == "__repr__" => h.repr_of(payload),
+                    _ => h.str_of(payload),
+                };
+                h.new_str(s)
+            }))
+        }
         "__hash__" => {
             // Hash by the payload's value (the base type's `__hash__`).
             let k = with_host(|h| h.to_key(payload))?;
@@ -25637,6 +25738,17 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                 // runtime actually behaves: no -O, no -B, no isolation.
                 ("flags", flags),
                 ("warnoptions", h.new_list(Vec::new())),
+                ("_xoptions", {
+                    let mut map = DictMap::default();
+                    for (k, v) in xoptions() {
+                        let kv = h.new_str(k);
+                        let vv = v.map_or(Value::Bool(true), |v| h.new_str(v));
+                        if let Ok(key) = h.to_key(&kv) {
+                            map.insert(key, (kv, vv));
+                        }
+                    }
+                    h.new_dict(map)
+                }),
                 ("hexversion", Value::Int(0x030E_00F0)),
                 ("hash_info", hash_info),
                 ("float_info", float_info),

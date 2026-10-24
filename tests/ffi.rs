@@ -2392,3 +2392,32 @@ print(asyncio.run(main()), v.get())
     }
     assert_eq!(stdout, "([1, 2], 100, 200) 0\n", "stderr={stderr}");
 }
+
+/// An unbound `int`/`str` slot run on a CPython instance of a subclass (an
+/// `IntEnum`/`StrEnum` member) checks the receiver through CPython and works
+/// on its base value: `int.__repr__(E.A)` is `1`, while `int.__str__` is
+/// `object.__str__` and renders the member's own `repr`. Expected output is
+/// python3.14's.
+#[test]
+fn unbound_value_slots_run_on_cpython_subclass_instances() {
+    let src = r#"
+import enum
+class E(enum.IntEnum):
+    A = 1
+print(int.__repr__(E.A), int.__str__(E.A), int.bit_length(E.A), float.__repr__(2.5))
+try:
+    int.__repr__('x')
+except TypeError as e:
+    print(e)
+"#;
+    let (stdout, stderr, ok) = run_py(src);
+    if bridge_unavailable(ok, &stderr) {
+        eprintln!("skipping unbound-slot test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(
+        stdout,
+        "1 <E.A: 1> 1 2.5\ndescriptor '__repr__' requires a 'int' object but received a 'str'\n",
+        "stderr={stderr}"
+    );
+}

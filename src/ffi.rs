@@ -277,6 +277,7 @@ pub fn init() -> bool {
         }
         pyo3::Python::initialize();
         INTERPRETER_STARTED.store(true, std::sync::atomic::Ordering::Relaxed);
+        set_int_max_str_digits(crate::host::int_max_str_digits());
         route_std_streams();
         install_main_module_hook();
         install_warn_hook();
@@ -5749,4 +5750,38 @@ impl TaskContext {
         }
         result
     }
+}
+
+/// Give the embedded interpreter pythonrs's `sys.get_int_max_str_digits()`, so
+/// a conversion CPython performs (`json.loads`, `json.dumps`, `decimal`) is
+/// bounded as one pythonrs performs is. Nothing to do before it starts; it
+/// takes the limit then ([`init`]).
+pub fn set_int_max_str_digits(n: usize) {
+    if !INTERPRETER_STARTED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    Python::attach(|py| {
+        let _ = py
+            .import("sys")
+            .and_then(|sys| sys.call_method1("set_int_max_str_digits", (n,)));
+    });
+}
+
+/// `builtins.<tp>.<meth>(*args)` run by CPython: an unbound builtin method
+/// applied to a CPython receiver (`int.bit_length(E.A)` for an `IntEnum`
+/// member) is CPython's own method on that object.
+pub fn call_builtin_type_method(
+    tp: &str,
+    meth: &str,
+    args: Vec<Value>,
+    kwargs: Vec<(String, Value)>,
+) -> Result<Value, String> {
+    Python::attach(|py| {
+        let method = py
+            .import("builtins")
+            .and_then(|b| b.getattr(tp))
+            .and_then(|t| t.getattr(meth))
+            .map_err(|e| pyerr_to_error(py, &e))?;
+        invoke_bound(py, &method, &args, &kwargs)
+    })
 }

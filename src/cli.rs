@@ -52,6 +52,12 @@ pub struct Cli {
     #[arg(short = 'W', value_name = "ARG")]
     pub warnings: Vec<String>,
 
+    /// Implementation-specific option (CPython `-X <opt>`), listed in
+    /// `sys._xoptions`; `-X int_max_str_digits=N` sets the integer string
+    /// conversion limit.
+    #[arg(short = 'X', value_name = "OPT")]
+    pub xoptions: Vec<String>,
+
     /// Start the interactive REPL.
     #[arg(long = "repl")]
     pub repl: bool,

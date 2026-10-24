@@ -7297,6 +7297,11 @@ pub fn call_builtin_function(
             if let Some(payload) = with_host(|h| h.base_payload_any(&recv)) {
                 return host::base_dispatch(&recv, &payload, tp, meth, args[1..].to_vec(), kwargs);
             }
+            // A CPython receiver (an `IntEnum` member) runs CPython's own method.
+            #[cfg(feature = "stdlib-ffi")]
+            if is_builtin_type(tp) && with_host(|h| h.foreign_id(&recv)).is_some() {
+                return crate::ffi::call_builtin_type_method(tp, meth, args, kwargs);
+            }
             return call_type_method(&recv, meth, args[1..].to_vec(), kwargs);
         }
     }
@@ -16078,6 +16083,49 @@ const EXC_PARENTS: &[(&str, &str)] = &[
     ("ExceptionGroup", "Exception"),
 ];
 
+/// The builtin type whose own `__dict__` holds slot `name` for builtin type
+/// `ty`: the first of its ancestors that defines the slot. Only `__str__` and
+/// `__repr__` are tabled; most builtins inherit `object.__str__` (which
+/// renders `repr`), and the exceptions inherit `BaseException.__repr__`.
+pub fn slot_owner(ty: &str, name: &str) -> String {
+    let defines = |t: &str| match name {
+        "__str__" => matches!(
+            t,
+            "object"
+                | "str"
+                | "bytes"
+                | "bytearray"
+                | "BaseException"
+                | "BaseExceptionGroup"
+                | "ImportError"
+                | "KeyError"
+                | "OSError"
+                | "SyntaxError"
+                | "UnicodeDecodeError"
+                | "UnicodeEncodeError"
+                | "UnicodeTranslateError"
+        ),
+        "__repr__" => {
+            !matches!(
+                t,
+                "enumerate" | "filter" | "map" | "property" | "reversed" | "zip"
+            ) && (!is_exception_class(t) || t == "BaseException")
+        }
+        _ => true,
+    };
+    let mut t = ty;
+    loop {
+        if defines(t) {
+            return t.to_string();
+        }
+        t = match exc_parent(t) {
+            Some(parent) => parent,
+            None if t == "object" => return t.to_string(),
+            None => "object",
+        };
+    }
+}
+
 fn exc_parent(name: &str) -> Option<&'static str> {
     EXC_PARENTS
         .iter()
@@ -18093,6 +18141,11 @@ fn receiver_is_instance_of(recv: &Value, rt: &str, tp: &str) -> bool {
     // `OSError.__str__(FileNotFoundError(...))`.
     if is_exception_class(rt) && is_exception_class(tp) {
         return with_host(|h| exception_isa(rt, tp, h));
+    }
+    // A CPython object (an `IntEnum` member) is judged by CPython.
+    #[cfg(feature = "stdlib-ffi")]
+    if let Some(fid) = with_host(|h| h.foreign_id(recv)) {
+        return crate::ffi::foreign_isinstance_of_builtin(fid, tp);
     }
     with_host(|h| match h.get(recv) {
         Some(PyObj::Instance(i)) => {

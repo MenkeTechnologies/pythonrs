@@ -11,6 +11,7 @@ _python() {
     '-S[no site import (drop-in compat)]' \
     '-B[do not write bytecode caches (drop-in compat)]' \
     '-W[warning filter]:action' \
+    '*-X[implementation-specific option]:option' \
     '--build[AOT-compile to a native executable]' \
     '--dump-bytecode[print lowered fusevm bytecode]' \
     '--dump-tokens[print the lexer token stream]' \

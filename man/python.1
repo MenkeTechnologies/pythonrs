@@ -57,6 +57,14 @@ CPython interpreter flags, accepted for drop\-in compatibility.
 .B \-W
 takes real effect via the embedded interpreter; the rest are tolerated no\-ops.
 .TP
+.B \-X \fIOPT\fR
+Implementation\-specific option, listed in
+.BR sys._xoptions ;
+.B \-X int_max_str_digits=\fIN\fR
+sets the integer string conversion limit (after
+.BR PYTHONINTMAXSTRDIGITS ),
+for pythonrs and the embedded interpreter alike.
+.TP
 .B \-\-build
 Compile the script to a standalone native executable named after the source stem,
 next to the source, and warm the bytecode cache. Fails with an error in the

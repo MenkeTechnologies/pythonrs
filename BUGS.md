@@ -41,6 +41,29 @@ written.
   the keywords (`class E(ImportError): pass; E('x', name='n').name` is
   `None`); a binary operation spanning lines carets only its first line
   (`z = (x +` / `y)` — CPython carets both lines and shows the second).
+- **Unbound `__str__`/`__repr__` slots.** `int.__str__` was a wrapper of
+  `int`; it is `object.__str__` (rendering the receiver's `repr`, so
+  `int.__str__(True)` is `'True'`), and an exception's `__str__`/`__repr__`
+  belong to `BaseException` (or `ImportError`, `KeyError`, `OSError`, …) as in
+  CPython. `int.__repr__(True)` is `'1'`, and `int.__repr__`/`int.__str__` of
+  a too-long int raise the digit-limit `ValueError` (they bypassed it, so the
+  native `json.dumps(10 ** 1200)` ignored the limit). An unbound builtin
+  method or slot applied to a CPython instance of a subclass
+  (`int.__repr__(E.A)`, `int.bit_length(E.A)` for an `IntEnum`) checks and runs
+  through CPython; it was a `TypeError`.
+- **The embedded interpreter converts with pythonrs's int digit limit.**
+  `sys.set_int_max_str_digits(1000)` bounded pythonrs's own conversions while
+  CPython's `json.loads('1' * 1001)` and `json.dumps(10 ** 1200)` still ran
+  under CPython's 4300. The limit is handed to the embedded interpreter when it
+  starts, on every `set_int_max_str_digits`, and when a program starts afresh.
+- **`-X OPT`.** The option was a usage error. It is accepted (consuming its
+  value, before the program), listed in `sys._xoptions` (a later duplicate
+  replacing the value, a bare option `True`), and `-X int_max_str_digits=N`
+  sets the limit after `PYTHONINTMAXSTRDIGITS` as
+  `config_init_int_max_str_digits` reads it — the first such option, a whole
+  `wcstol` of the value (empty is `0`) — with its pre-initialization fatal
+  error for a refused value. Other options (`-X dev`, `-X utf8`, …) only
+  appear in `sys._xoptions`; `sys.flags.dev_mode` stays `False`.
 - **An uncaught exception's traceback is coloured.** CPython 3.13+ prints it
   through `sys.excepthook` with `colorize=_colorize.can_colorize(file=
   sys.stderr)`; pythonrs never coloured. The report (and a compile error) now
@@ -3463,10 +3486,50 @@ entry. These remain open:
   `PyrsInstance` type, and `getattr_static` walks `type(obj).__mro__`, never
   `__class__`. Fixing it needs a proxy type per native class carrying the class
   namespace (and refreshed with it, as class mirrors are).
+  Instance attributes are missing too (`getattr_static(c, 'z')`): its
+  `_check_instance` reads `object.__getattribute__(obj, '__dict__')`, which a
+  proxy without a live dict cannot answer. A faithful fix needs (1) a CPython
+  subclass of `PyrsInstance` per native class whose MRO mirrors the native
+  bases and whose `__dict__` carries the namespace, refreshed on class
+  mutation; (2) `PyrsInstance` routing every attribute read through a native
+  `__getattribute__`, so those namespace entries never shadow an instance
+  attribute; (3) a `__dict__` getset on `PyrsInstance` (passing
+  `_shadowed_dict`'s check) returning the instance's attributes. Costs: a type
+  object per crossed class per generation, every CPython-side attribute read
+  becoming a native call, and a change to `type(proxy)` that `pickle`,
+  `copyreg` and `isinstance` on the CPython side all observe.
 - **A referent's death is seen only at a collection.** pythonrs has no
   reference counts: `del o` leaves `weakref.ref(o)()` alive until the next
   collection, and the default (`stdlib-ffi`) build never collects, so there a
-  weak reference never dies and `finalize` callbacks run at exit.
+  weak reference never dies and `finalize` callbacks run at exit. Prompt death
+  needs the moment the last reference goes, and none is visible here: a
+  `Value::Obj` is a plain index the fusevm VM copies onto its stack, stores
+  with `SetSlot` and drops with a frame without calling the host, and the
+  vendored fusevm cannot be changed, so reference counting cannot be added
+  from this side. Collecting at `del`/rebinding/frame exit while a weak
+  reference is live would cost a full mark per event (quadratic in a loop)
+  and still miss the local-slot drops; a deref-time collection would make
+  every `WeakValueDictionary` read a mark. Collecting at all in the bridge
+  build first needs the CPython-held proxies registered as roots (a count
+  kept by each proxy pyclass's creation and `Drop`).
+- **No `sys.settrace`/`sys.setprofile`** (nor `gettrace`/`getprofile`).
+  Line events need a hook per new source line, and lines are op metadata in
+  the fusevm chunk, not ops; a faithful tracer needs a traced variant of each
+  chunk carrying a line-event op, swapped in while a trace function is set.
+- **A traceback shows one line of a multi-line instruction.** `c = (a\n /
+  b)` and a call whose arguments span lines show the first line with its
+  carets; CPython 3.13+ shows every line of the span (`...<N lines>...` for
+  the long ones) with carets on each. Caret spans record only their first
+  line.
+- **`lambda: x := 1`** is `invalid syntax` at the `:=`; CPython's
+  `invalid_named_expression` reports `cannot use assignment expressions with
+  lambda` over `lambda: x`.
+- **A C-level warning raised straight from pythonrs code** (`datetime.
+  datetime.utcnow()`) reads `sys:1`: `PyErr_WarnEx` walks CPython frames only.
+- **`contextvars` in the native build** keeps one value per variable: there
+  is no `Context` to copy, so tasks share values and `Context.run` isolates
+  nothing. 3.14's `Token` context manager is absent in both builds (the bridge
+  build's `_contextvars` is the linked 3.12's).
 
 ### Round 2 batched differential fuzz (`tests/batch_fuzz.rs`)
 
