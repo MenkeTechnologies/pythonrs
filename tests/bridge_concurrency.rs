@@ -15,6 +15,7 @@
 //! The race needs a process where `typing` has not been imported yet, so the
 //! test re-runs this test binary as a child process, many times.
 
+#[cfg(feature = "stdlib-ffi")]
 use std::process::Command;
 use std::sync::{Arc, Barrier};
 

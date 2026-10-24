@@ -9,6 +9,16 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **Operator errors name a builtin-subclass operand as written.** `[1] +
+  D()` for a `dict` subclass read `can only concatenate list (not "dict")`,
+  and `L([1]) + (1,)` for a `list` subclass used the generic message; they are
+  CPython's `(not "D")` and `can only concatenate list (not "tuple") to list`.
+- **`struct` format `e` is `PyFloat_Pack2`** (native build): it truncated
+  (no round-half-even), flushed every subnormal to zero, packed a NaN as
+  infinity (`0x7c00`) and an overflow as infinity; it now rounds to even,
+  underflows gradually, keeps a NaN's sign and payload both ways, and raises
+  `OverflowError: float too large to pack with e format`. Format `f` raises
+  `… with f format` for a finite value past the float range.
 - **Builtin-subclass operands reach user operator methods as themselves.**
   A `dict`/`list`/`set` subclass operand whose class did not define the
   reflected dunder was replaced by its payload before the other side's user

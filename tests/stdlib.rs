@@ -17,8 +17,8 @@ use pythonrs::{eval_str, host};
 /// its own `__repr__`).
 fn g(src: &str, name: &str) -> String {
     eval_str(src).expect("program should run without error");
-    let v = host::with_host(|h| h.read_global(name))
-        .unwrap_or_else(|| panic!("global {name} unbound"));
+    let v =
+        host::with_host(|h| h.read_global(name)).unwrap_or_else(|| panic!("global {name} unbound"));
     pythonrs::builtins::py_repr(&v).expect("repr should succeed")
 }
 
@@ -4217,4 +4217,39 @@ fn a_text_file_takes_an_assigned_mode() {
          h = open({path:?})\nh.mode = 'rb+'\nout.append(h.mode)\nh.close()\n"
     );
     assert_eq!(g(&src, "out"), "['r', 'x = 1\\n', 'rb+']");
+}
+
+/// `struct` format `e` is `PyFloat_Pack2`/`Unpack2`: round half to even,
+/// gradual underflow, a NaN keeping its sign and payload, `OverflowError`
+/// past the largest half; format `f` overflows past the float range.
+/// Expected values are python3.14's.
+#[test]
+fn struct_half_and_float_packing_follows_pyfloat_pack() {
+    let src = r#"import struct
+def p(fmt, v):
+    try:
+        return struct.pack(fmt, v).hex()
+    except OverflowError as e:
+        return str(e)
+x = [p('<e', v) for v in (65504.0, 65520.0, 6e-8, 3e-5, -0.0, float('nan'), float('-nan'),
+                           1.00048828125, 1.00146484375, 2.0 ** -25, 0.1)]
+x += [p('<f', 1e39), p('<f', float('inf'))]
+"#;
+    assert_eq!(
+        g(src, "x"),
+        "['ff7b', 'float too large to pack with e format', '0100', 'f701', '0080', '007e', '00fe', \
+         '003c', '023c', '0000', '662e', \
+         'float too large to pack with f format', '0000807f']"
+    );
+}
+
+/// 3.14's `PyFloat_Unpack2` keeps a half NaN's payload and sign (the bridge
+/// build's `struct` is the linked interpreter's, which may predate it).
+#[cfg(not(feature = "stdlib-ffi"))]
+#[test]
+fn struct_half_unpack_keeps_a_nan_payload() {
+    let src =
+        "import struct\nx = [struct.pack('<d', struct.unpack('<e', bytes.fromhex(h))[0]).hex() \
+               for h in ('017c', '01fe')]";
+    assert_eq!(g(src, "x"), "['000000000004f07f', '000000000004f8ff']");
 }

@@ -3367,6 +3367,8 @@ fn sequence_op_error(op: NumOp, a: &Value, b: &Value) -> Option<String> {
             return Some("str");
         }
         Some(match h.get(v)? {
+            // A subclass instance is its base sequence (`list.__add__` refuses).
+            PyObj::Instance(_) => return seq_name(h, &h.base_payload_any(v)?),
             PyObj::List(_) => "list",
             PyObj::Tuple(_) => "tuple",
             PyObj::Str(_) => "str",
@@ -5784,6 +5786,8 @@ fn numeric_hook_inner(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> 
         _ => numop_dunders(op).unwrap_or(("", "")),
     };
     let (a_owned, b_owned) = host::subclass_operands(a, fwd, b, refl);
+    // An error names the operands as written (`not "Counter"`), not their payloads.
+    let (shown_a, shown_b) = (a, b);
     let a = &a_owned;
     let b = &b_owned;
     // Counter `+` / `-` — multiset ops keeping positive counts, only when both
@@ -5848,7 +5852,20 @@ fn numeric_hook_inner(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> 
                 return with_host(|h| h.arith(op, a, &b2));
             }
         }
-        return with_host(|h| h.arith(op, a, b)).map(new_object_result);
+        let r = with_host(|h| h.arith(op, a, b)).map(new_object_result);
+        // A payload stood in for a subclass operand: the refusal names the
+        // operands as written (`can only concatenate list (not "D") to list`).
+        if let Err(e) = &r {
+            let unwrapped = !host::value_identity(a, shown_a) || !host::value_identity(b, shown_b);
+            if unwrapped
+                && e.starts_with("TypeError")
+                && matches!(op, Add | Sub | Mul | Div | Mod | Pow)
+            {
+                return Err(sequence_op_error(op, shown_a, shown_b)
+                    .unwrap_or_else(|| unsupported_operand(binop_symbol(fwd), shown_a, shown_b)));
+            }
+        }
+        return r;
     }
     match op {
         Eq => match dispatch_binop(a, b, "__eq__", "__eq__") {
@@ -5949,8 +5966,8 @@ fn numeric_hook_inner(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> 
                 Dunder::Err(e) => Err(e),
                 Dunder::NotImplemented => match base_payload_retry(op, a, b) {
                     Some(Ok(v)) => Ok(v),
-                    _ => Err(sequence_op_error(op, a, b)
-                        .unwrap_or_else(|| unsupported_operand(binop_symbol(l), a, b))),
+                    _ => Err(sequence_op_error(op, shown_a, shown_b)
+                        .unwrap_or_else(|| unsupported_operand(binop_symbol(l), shown_a, shown_b))),
                 },
             }
         }

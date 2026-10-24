@@ -11170,3 +11170,30 @@ except RuntimeError as e:
 "#;
     assert_eq!(g(src, "out"), "[None, 'cannot clear an executing frame']");
 }
+
+/// An operator refusal names a builtin-subclass operand as written, and a
+/// subclass of a sequence refuses as its base does (`list.__add__`). Expected
+/// text is CPython 3.14's.
+#[test]
+fn subclass_operands_are_named_in_operator_errors() {
+    let src = r#"
+class D(dict): pass
+class L(list): pass
+out = []
+for f in (lambda: [1] + D(), lambda: D() + [1], lambda: 'a' * D(), lambda: L([1]) + (1,),
+          lambda: L([1]) * 'x', lambda: (1,) + L()):
+    try:
+        f()
+    except TypeError as e:
+        out.append(str(e))
+"#;
+    assert_eq!(
+        g(src, "out"),
+        "['can only concatenate list (not \"D\") to list', \
+         \"unsupported operand type(s) for +: 'D' and 'list'\", \
+         \"can't multiply sequence by non-int of type 'D'\", \
+         'can only concatenate list (not \"tuple\") to list', \
+         \"can't multiply sequence by non-int of type 'str'\", \
+         'can only concatenate tuple (not \"L\") to tuple']"
+    );
+}

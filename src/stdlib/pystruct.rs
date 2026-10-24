@@ -354,10 +354,19 @@ impl FormatSpec {
                     .map(crate::host::export_float)
                     .ok_or_else(|| err("required argument is not a float"))?;
                 let bytes: Vec<u8> = match code.code {
-                    FormatType::Float => (f as f32).to_le_bytes().to_vec(),
+                    // `PyFloat_Pack4`: a finite value past the float range overflows.
+                    FormatType::Float => {
+                        let y = f as f32;
+                        if y.is_infinite() && f.is_finite() {
+                            return Err(
+                                "OverflowError: float too large to pack with f format".into()
+                            );
+                        }
+                        y.to_le_bytes().to_vec()
+                    }
                     FormatType::Double => f.to_le_bytes().to_vec(),
                     // IEEE 754 binary16, built by hand — no half-float in std.
-                    _ => f16_to_le_bytes(f).to_vec(),
+                    _ => f16_to_le_bytes(f)?.to_vec(),
                 };
                 if self.endian == Endianness::Big {
                     out.extend(bytes.iter().rev());
@@ -508,47 +517,91 @@ fn bigint_to_i128(b: &num_bigint::BigInt) -> Option<i128> {
     b.to_i128()
 }
 
-/// IEEE 754 binary16 encode/decode. RustPython uses the `half` crate; doing it
-/// inline keeps the dependency list unchanged.
-fn f16_to_le_bytes(f: f64) -> [u8; 2] {
-    let bits = (f as f32).to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
-    let mant = (bits & 0x007f_ffff) >> 13;
-    let half = if exp <= 0 {
-        sign
-    } else if exp >= 0x1f {
-        sign | 0x7c00
+/// IEEE 754 binary16 encode: CPython 3.14's `PyFloat_Pack2` — round half to
+/// even, gradual underflow, a NaN keeping its sign and the top of its payload,
+/// and `OverflowError` past the largest half.
+fn f16_to_le_bytes(x: f64) -> Result<[u8; 2], String> {
+    const OVERFLOW: &str = "OverflowError: float too large to pack with e format";
+    let (sign, e, bits): (u16, i32, u16) = if x == 0.0 {
+        (u16::from(x.is_sign_negative()), 0, 0)
+    } else if x.is_infinite() {
+        (u16::from(x < 0.0), 0x1f, 0)
+    } else if x.is_nan() {
+        // The NaN's type bit and payload, as `v & 0xffc0000000000 >> 42`.
+        let v = x.to_bits() & 0x000f_fc00_0000_0000;
+        (u16::from(x.is_sign_negative()), 0x1f, (v >> 42) as u16)
     } else {
-        sign | ((exp as u16) << 10) | mant as u16
+        let sign = u16::from(x < 0.0);
+        let x = x.abs();
+        // `frexp`: x = f * 2**e with f in [0.5, 1), then normalized to [1, 2).
+        let mut e = x.log2().floor() as i32 + 1;
+        let mut f = x / 2f64.powi(e);
+        if f >= 1.0 {
+            f /= 2.0;
+            e += 1;
+        } else if f < 0.5 {
+            f *= 2.0;
+            e -= 1;
+        }
+        f *= 2.0;
+        e -= 1;
+        if e >= 16 {
+            return Err(OVERFLOW.into());
+        } else if e < -25 {
+            f = 0.0;
+            e = 0;
+        } else if e < -14 {
+            f *= 2f64.powi(14 + e);
+            e = 0;
+        } else {
+            e += 15;
+            f -= 1.0;
+        }
+        f *= 1024.0;
+        let mut bits = f as u16;
+        if f - f64::from(bits) > 0.5 || (f - f64::from(bits) == 0.5 && bits % 2 == 1) {
+            bits += 1;
+            if bits == 1024 {
+                bits = 0;
+                e += 1;
+                if e == 31 {
+                    return Err(OVERFLOW.into());
+                }
+            }
+        }
+        (sign, e, bits)
     };
-    half.to_le_bytes()
+    Ok((bits | ((e as u16) << 10) | (sign << 15)).to_le_bytes())
 }
 
+/// IEEE 754 binary16 decode (`PyFloat_Unpack2`): a NaN keeps its sign and
+/// payload.
 fn f16_from_le_bytes(b: [u8; 2]) -> f64 {
     let h = u16::from_le_bytes(b);
-    let sign = ((h & 0x8000) as u32) << 16;
-    let exp = ((h >> 10) & 0x1f) as i32;
-    let mant = (h & 0x03ff) as u32;
-    let bits = if exp == 0 {
-        if mant == 0 {
-            sign
+    let negative = h & 0x8000 != 0;
+    let e = i32::from((h >> 10) & 0x1f);
+    let f = u64::from(h & 0x03ff);
+    let x = if e == 0x1f {
+        if f == 0 {
+            f64::INFINITY
         } else {
-            // Subnormal: renormalize into a float32.
-            let mut e = -1i32;
-            let mut m = mant;
-            while m & 0x0400 == 0 {
-                m <<= 1;
-                e -= 1;
-            }
-            sign | (((e + 127 - 15 + 1) as u32) << 23) | ((m & 0x03ff) << 13)
+            let base: u64 = if negative {
+                0xfff0_0000_0000_0000
+            } else {
+                0x7ff0_0000_0000_0000
+            };
+            return f64::from_bits(base + (f << 42));
         }
-    } else if exp == 0x1f {
-        sign | 0x7f80_0000 | (mant << 13)
+    } else if e == 0 {
+        f as f64 / 1024.0 * 2f64.powi(-14)
     } else {
-        sign | (((exp - 15 + 127) as u32) << 23) | (mant << 13)
+        (f as f64 / 1024.0 + 1.0) * 2f64.powi(e - 15)
     };
-    f32::from_bits(bits) as f64
+    if negative {
+        -x
+    } else {
+        x
+    }
 }
 
 /// The module's exported names.
