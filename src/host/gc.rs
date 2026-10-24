@@ -217,6 +217,22 @@ pub(crate) fn safepoint(vm: &VM) {
     }
 }
 
+/// Run the weakref callbacks the last collection queued. An exception from
+/// one is reported as unraisable (`Exception ignored while calling weakref
+/// callback`), as CPython reports it, and the rest still run.
+pub(crate) fn run_weak_callbacks() {
+    loop {
+        let next =
+            with_host(|h| (!h.weak_callbacks.is_empty()).then(|| h.weak_callbacks.remove(0)));
+        let Some((cb, r)) = next else { break };
+        if let Err(e) = invoke(&cb, vec![r.clone()], vec![]) {
+            with_host(|h| h.exc = None);
+            let cbr = repr_of(&cb);
+            eprintln!("Exception ignored while calling weakref callback {cbr}:\n{e}");
+        }
+    }
+}
+
 #[cold]
 fn collect_if_safe(vm: &VM) {
     DUE.with(|d| d.set(false));
@@ -241,6 +257,7 @@ fn collect_if_safe(vm: &VM) {
             h.gc.since = 0;
         }
     });
+    run_weak_callbacks();
 }
 
 
@@ -394,6 +411,9 @@ impl PyHost {
 
     /// Everything outside the heap that holds a `Value` at a safepoint.
     fn trace_roots(&self, m: &mut Marker) {
+        for (cb, r) in &self.weak_callbacks {
+            m.values([cb, r]);
+        }
         for cd in self.classes.values() {
             m.values(cd.ns.values());
         }
@@ -463,6 +483,10 @@ impl PyHost {
     /// side tables keyed by heap id.
     fn trace_object(&self, id: u32, m: &mut Marker) {
         match &self.heap[id as usize] {
+            // A weak reference keeps its callback and owner alive, never its target.
+            PyObj::WeakRef {
+                callback, owner, ..
+            } => m.values([callback, owner]),
             PyObj::List(items)
             | PyObj::Tuple(items)
             | PyObj::Union { args: items }
@@ -626,9 +650,51 @@ impl PyHost {
         }
     }
 
+    /// Clear every weak reference whose referent this collection frees, and
+    /// queue its callback (`callback(ref)`, the subclass instance for a
+    /// `KeyedRef`) to run once the collection returns; forget the weak
+    /// references that are themselves unreachable.
+    fn clear_weakrefs(&mut self, marks: &Marks) {
+        let dead: Vec<u32> = self
+            .weakrefs
+            .keys()
+            .copied()
+            .filter(|t| !marks.get(*t))
+            .collect();
+        for target in dead {
+            for r in self.weakrefs.remove(&target).unwrap_or_default() {
+                let Value::Obj(rid) = r else { continue };
+                if !marks.get(rid) {
+                    continue;
+                }
+                if let PyObj::WeakRef {
+                    target,
+                    callback,
+                    owner,
+                    ..
+                } = &mut self.heap[rid as usize]
+                {
+                    *target = Value::Undef;
+                    if !matches!(callback, Value::Undef) {
+                        let arg = if matches!(owner, Value::Undef) {
+                            r.clone()
+                        } else {
+                            owner.clone()
+                        };
+                        self.weak_callbacks.push((callback.clone(), arg));
+                    }
+                }
+            }
+        }
+        for refs in self.weakrefs.values_mut() {
+            refs.retain(|r| matches!(r, Value::Obj(id) if marks.get(*id)));
+        }
+    }
+
     /// Free every slot `marks` leaves unmarked, and forget the per-object
     /// metadata of each, which an object reusing its id must not inherit.
     fn sweep(&mut self, marks: &Marks) {
+        self.clear_weakrefs(marks);
         for id in 0..self.heap.len() as u32 {
             if !marks.get(id) && !matches!(self.heap[id as usize], PyObj::Freed) {
                 self.heap[id as usize] = PyObj::Freed;

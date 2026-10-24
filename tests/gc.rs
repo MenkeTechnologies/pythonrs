@@ -210,3 +210,25 @@ print(call_from_try())
 "#;
     assert_eq!(run(src, true), "returned/inside\n");
 }
+
+/// A collection that frees a weak reference's referent clears the reference
+/// and runs its callback (with the reference, or the `KeyedRef` subclass
+/// instance a `WeakValueDictionary` keeps), so the dictionary drops the entry
+/// and `weakref.finalize` fires.
+#[test]
+fn a_collection_clears_weak_references_and_runs_their_callbacks() {
+    let src = "\
+import weakref
+class C: pass
+log = []
+o = C()
+r = weakref.ref(o, lambda w: log.append(w is r))
+d = weakref.WeakValueDictionary()
+o2 = C(); d['k'] = o2
+f = weakref.finalize(C(), log.append, 'fin')
+del o, o2
+for i in range(3): [object() for _ in range(10)]
+print(r(), sorted(log, key=str), len(d))
+";
+    assert_eq!(run(src, true), "None [True, 'fin'] 0\n");
+}

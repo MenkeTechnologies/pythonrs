@@ -1006,6 +1006,11 @@ fn subscript_store(recv: &Value, idx: Value, val: Value) -> Result<(), String> {
     } else {
         val
     };
+    // A CPython object stores with the host released (it may call back).
+    #[cfg(feature = "stdlib-ffi")]
+    if let Some(id) = with_host(|h| h.foreign_id(&recv)) {
+        return crate::ffi::set_item_released(id, &idx, &val);
+    }
     let cands = host::instance_key_candidates_for(&recv, Some(&idx));
     host::with_instance_key(&idx, host::KeyRole::Of(&recv), &cands, || {
         with_host(|h| h.set_item(&recv, &idx, val.clone()))
@@ -1054,6 +1059,10 @@ fn b_delitem(vm: &mut VM, _: u8) -> Value {
 /// the other does not is a divergence by construction.
 fn subscript_delete(recv: &Value, idx: Value) -> Result<(), String> {
     let recv = recv.clone();
+    #[cfg(feature = "stdlib-ffi")]
+    if let Some(id) = with_host(|h| h.foreign_id(&recv)) {
+        return crate::ffi::del_item_released(id, &idx);
+    }
     // `Counter.__delitem__` is `if elem in self: super().__delitem__(elem)` —
     // deleting a missing element is a no-op, not a KeyError.
     if host::dict_meta_of(&recv).is_some_and(|m| m.kind == host::DictKind::Counter)
@@ -2438,13 +2447,12 @@ fn b_build_class(vm: &mut VM, _: u8) -> Value {
     // So does an explicit CPython metaclass (`metaclass=M` for a class M
     // derived from `abc.ABCMeta` or `enum.EnumType`).
     #[cfg(feature = "stdlib-ffi")]
-    if with_host(|h| {
-        h.foreign_id(&metaclass).is_some()
-            || match h.get(&bases_val) {
-                Some(PyObj::List(l)) => l.iter().any(|b| h.foreign_id(b).is_some()),
-                _ => false,
-            }
-    }) {
+    if with_host(|h| h.foreign_id(&metaclass).is_some())
+        || with_host(|h| match h.get(&bases_val) {
+            Some(PyObj::List(l)) => l.iter().any(|b| h.foreign_id(b).is_some()),
+            _ => false,
+        })
+    {
         let bases: Vec<Value> = with_host(|h| match h.get(&bases_val) {
             Some(PyObj::List(l)) => l.clone(),
             _ => Vec::new(),
@@ -6190,6 +6198,9 @@ pub fn is_type_object_name(n: &str) -> bool {
                 // `os.stat()` results are tagged with this type; `pathlib`
                 // feature-tests the type object itself.
                 | "os.stat_result"
+                | "weakref.ReferenceType"
+                | "weakref.ProxyType"
+                | "weakref.CallableProxyType"
         )
         // Every `_io` stream type: `io.py` hands each one to `ABCMeta.register`,
         // which rejects anything that is not a class.
@@ -6655,6 +6666,29 @@ pub fn call_builtin_function(
     args: Vec<Value>,
     kwargs: Vec<(String, Value)>,
 ) -> Result<Value, String> {
+    // `type(obj.method)(func, obj)` — `types.MethodType` — binds `func` to `obj`.
+    if name == "method" {
+        return match args.as_slice() {
+            [func, obj] if kwargs.is_empty() => {
+                if !with_host(|h| is_callable_obj(h, func)) {
+                    return Err(host::type_error("first argument must be callable"));
+                }
+                if matches!(obj, Value::Undef) {
+                    return Err(host::type_error("instance must not be None"));
+                }
+                Ok(with_host(|h| {
+                    h.alloc(PyObj::BoundMethod {
+                        recv: obj.clone(),
+                        func: func.clone(),
+                    })
+                }))
+            }
+            _ => Err(host::type_error(&format!(
+                "method expected 2 arguments, got {}",
+                args.len()
+            ))),
+        };
+    }
     // `type(C.x)()`, `type(iter([]))()`: a type object with no constructor.
     if UNINSTANTIABLE_TYPES.contains(&name) {
         return Err(host::type_error(&format!(
@@ -6825,6 +6859,7 @@ pub fn call_builtin_function(
                 | "list"
                 | "dict"
                 | "set"
+                | "weakref.ReferenceType"
         )
     }) {
         #[cfg(feature = "stdlib-ffi")]
@@ -6835,6 +6870,27 @@ pub fn call_builtin_function(
         let rest: Vec<Value> = args.iter().skip(1).cloned().collect();
         return match target {
             NewTarget::Class(c) => {
+                // A `weakref.ref` subclass (`KeyedRef`): a reference of its own
+                // (never the shared one) whose callback is handed the instance.
+                if base == "weakref.ReferenceType" {
+                    let (ob, cb) = match rest.as_slice() {
+                        [o] => (o.clone(), Value::Undef),
+                        [o, cb, ..] => (o.clone(), cb.clone()),
+                        _ => {
+                            return Err(host::type_error(
+                                "__new__ expected at least 1 argument, got 0",
+                            ))
+                        }
+                    };
+                    let payload = weakref_new(ob, cb, false, true)?;
+                    let inst = with_host(|h| h.new_instance_payload(c, payload.clone()));
+                    with_host(|h| {
+                        if let Some(PyObj::WeakRef { owner, .. }) = h.get_mut(&payload) {
+                            *owner = inst.clone();
+                        }
+                    });
+                    return Ok(inst);
+                }
                 // A mutable base's `tp_new` ignores its arguments (`list_new`
                 // is `PyType_GenericNew`): its `__init__` fills the payload.
                 let payload = if matches!(base, "list" | "dict" | "set" | "bytearray") {
@@ -6867,6 +6923,9 @@ pub fn call_builtin_function(
     }
     // `mappingproxy(mapping)` — `types.MappingProxyType(d)` (which is
     // `type(type.__dict__)`) wraps a dict in a read-only view.
+    if let Some(r) = weakref_builtin(name, &args, &kwargs) {
+        return r;
+    }
     if name == "mappingproxy" {
         let src = arg0(&args)?;
         let dict = with_host(|h| match h.get(&src) {
@@ -8096,6 +8155,23 @@ fn call_named_builtin(
         }
         "hash" => {
             let v = arg0(&args)?;
+            // A weak reference hashes as its referent (`weakref_hash`).
+            let weak = with_host(|h| match h.get(&v) {
+                Some(PyObj::WeakRef {
+                    proxy: false,
+                    target,
+                    key,
+                    ..
+                }) => Some((target.clone(), key.clone())),
+                _ => None,
+            });
+            if let Some((target, key)) = weak {
+                return match (target, key) {
+                    (Value::Undef, Some(k)) => Ok(Value::Int(hash_key(&k))),
+                    (Value::Undef, None) => Err(host::type_error("weak object has gone away")),
+                    (t, _) => call_builtin_function("hash", vec![t], vec![]),
+                };
+            }
             // A user instance's `hash()` is its `__hash__()` result verbatim
             // (CPython does not re-hash it). Delegate other types to the key hash.
             if with_host(|h| matches!(h.get(&v), Some(PyObj::Instance(_)))) {
@@ -12285,6 +12361,211 @@ fn total_ordering_derive(op: NumOp, selfv: &Value, other: &Value) -> Option<Resu
         _ => return None,
     };
     Some(Ok(Value::Bool(result)))
+}
+
+// ── weak references (`_weakref`) ─────────────────────────────────────────────
+
+/// Whether `v` can be weakly referenced: what CPython gives a weak-reference
+/// list (`tp_weaklistoffset`) — instances of classes with a `__weakref__`
+/// slot, functions, methods, classes and types, builtin functions, sets,
+/// generators, code and module objects — and not `int`/`str`/`tuple`/`list`/
+/// `dict`/`bytes`/`float`/`None`/a bare `object()`.
+fn weakrefable(h: &host::PyHost, v: &Value) -> bool {
+    match h.get(v) {
+        Some(PyObj::Instance(i)) => h.instance_has_weakref_slot(&i.class),
+        Some(
+            PyObj::Func(_)
+            | PyObj::BoundMethod { .. }
+            | PyObj::Class(_)
+            | PyObj::Builtin(_)
+            | PyObj::Set(_)
+            | PyObj::Frozenset(_)
+            | PyObj::Generator { .. }
+            | PyObj::Code { .. }
+            | PyObj::Module { .. }
+            | PyObj::Partial { .. }
+            | PyObj::LruCache { .. }
+            | PyObj::Property { .. }
+            | PyObj::Pattern { .. }
+            | PyObj::Future { .. }
+            | PyObj::WeakRef { proxy: false, .. },
+        ) => true,
+        // A CPython object (an instance of a class CPython built, such as an
+        // ABC) stays alive in the bridge's handle table; a native reference to
+        // it never dies.
+        #[cfg(feature = "stdlib-ffi")]
+        Some(PyObj::Foreign(_)) => true,
+        _ => false,
+    }
+}
+
+/// `weakref.ref(obj, callback=None)` / `weakref.proxy(obj, callback=None)`.
+/// A plain reference or proxy with no callback is shared: asking again
+/// returns the one that exists (`weakref.ref(o) is weakref.ref(o)`), unless
+/// it is for a subclass instance (`subclass`), which is always new.
+pub(crate) fn weakref_new(
+    obj: Value,
+    callback: Value,
+    proxy: bool,
+    subclass: bool,
+) -> Result<Value, String> {
+    with_host(|h| {
+        if !weakrefable(h, &obj) {
+            return Err(host::type_error(&format!(
+                "cannot create weak reference to '{}' object",
+                h.tp_name(&obj)
+            )));
+        }
+        let Value::Obj(tid) = obj else { unreachable!() };
+        if matches!(callback, Value::Undef) && !subclass {
+            let existing = h.weakrefs.get(&tid).and_then(|refs| {
+                refs.iter()
+                    .find(|r| {
+                        matches!(h.get(r), Some(PyObj::WeakRef { proxy: p, callback: Value::Undef, owner: Value::Undef, .. }) if *p == proxy)
+                    })
+                    .cloned()
+            });
+            if let Some(r) = existing {
+                return Ok(r);
+            }
+        }
+        let callable = proxy && is_callable_obj(h, &obj);
+        // A CPython referent is keyed by its handle: hashing it would call
+        // into CPython with the host borrowed.
+        let key = if proxy {
+            None
+        } else if h.foreign_id(&obj).is_some() {
+            Some(PKey::Tuple(vec![
+                PKey::Str("\u{1}foreign".into()),
+                PKey::Int(tid as i64),
+            ]))
+        } else {
+            h.to_key(&obj).ok()
+        };
+        let r = h.alloc(PyObj::WeakRef {
+            target: obj.clone(),
+            callback,
+            proxy,
+            callable,
+            key,
+            owner: Value::Undef,
+        });
+        h.weakrefs.entry(tid).or_default().push(r.clone());
+        Ok(r)
+    })
+}
+
+fn is_callable_obj(h: &host::PyHost, v: &Value) -> bool {
+    match h.get(v) {
+        Some(PyObj::Func(_))
+        | Some(PyObj::Builtin(_))
+        | Some(PyObj::Class(_))
+        | Some(PyObj::Partial { .. })
+        | Some(PyObj::LruCache { .. })
+        | Some(PyObj::BoundMethod { .. }) => true,
+        Some(PyObj::Instance(i)) => h.class_lookup(&i.class, "__call__").is_some(),
+        _ => false,
+    }
+}
+
+/// The referent of a weak reference or proxy, or `None` when it is gone. A
+/// subclass instance (`KeyedRef`) answers through its payload.
+pub(crate) fn weakref_target(h: &host::PyHost, r: &Value) -> Option<Value> {
+    match h.get(r) {
+        Some(PyObj::WeakRef { target, .. }) => match target {
+            Value::Undef => None,
+            t => Some(t.clone()),
+        },
+        Some(PyObj::Instance(i)) => weakref_target(h, &i.payload),
+        _ => None,
+    }
+}
+
+/// `ReferenceError` for a proxy whose referent is gone.
+pub(crate) fn weakref_dead_error() -> String {
+    "ReferenceError: weakly-referenced object no longer exists".to_string()
+}
+
+/// The `_weakref` module functions and the reference types' constructors.
+fn weakref_builtin(
+    name: &str,
+    args: &[Value],
+    kwargs: &[(String, Value)],
+) -> Option<Result<Value, String>> {
+    let two = |what: &str| -> Result<(Value, Value), String> {
+        if !kwargs.is_empty() {
+            return Err(host::type_error(&format!(
+                "{what}() takes no keyword arguments"
+            )));
+        }
+        match args {
+            [o] => Ok((o.clone(), Value::Undef)),
+            [o, cb] => Ok((o.clone(), cb.clone())),
+            _ => Err(host::type_error(&format!(
+                "{what} expected at most 2 arguments, got {}",
+                args.len()
+            ))),
+        }
+    };
+    Some(match name {
+        "weakref.ReferenceType" => two("ref").and_then(|(o, cb)| weakref_new(o, cb, false, false)),
+        "_weakref.proxy" => two("proxy").and_then(|(o, cb)| weakref_new(o, cb, true, false)),
+        "weakref.ProxyType" | "weakref.CallableProxyType" => Err(host::type_error(&format!(
+            "cannot create '{name}' instances"
+        ))),
+        "_weakref.getweakrefcount" => {
+            let o = args.first().cloned().unwrap_or(Value::Undef);
+            Ok(Value::Int(with_host(|h| match o {
+                Value::Obj(id) => h.weakrefs.get(&id).map_or(0, |r| r.len()) as i64,
+                _ => 0,
+            })))
+        }
+        "_weakref.getweakrefs" => {
+            let o = args.first().cloned().unwrap_or(Value::Undef);
+            Ok(with_host(|h| {
+                let refs: Vec<Value> = match o {
+                    Value::Obj(id) => h
+                        .weakrefs
+                        .get(&id)
+                        .map(|refs| {
+                            refs.iter()
+                                .map(|r| match h.get(r) {
+                                    Some(PyObj::WeakRef { owner, .. })
+                                        if !matches!(owner, Value::Undef) =>
+                                    {
+                                        owner.clone()
+                                    }
+                                    _ => r.clone(),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    _ => Vec::new(),
+                };
+                h.new_list(refs)
+            }))
+        }
+        // `_remove_dead_weakref(dict, key)`: delete `dict[key]` if it is a
+        // weak reference whose referent is gone.
+        "_weakref._remove_dead_weakref" => (|| {
+            let (d, key) = match args {
+                [d, k] => (d.clone(), k.clone()),
+                _ => {
+                    return Err(host::type_error(
+                        "_remove_dead_weakref expected 2 arguments",
+                    ))
+                }
+            };
+            let item = with_host(|h| h.get_item(&d, &key));
+            if let Ok(v) = item {
+                if with_host(|h| weakref_target(h, &v).is_none()) {
+                    with_host(|h| h.del_item(&d, &key))?;
+                }
+            }
+            Ok(Value::Undef)
+        })(),
+        _ => return None,
+    })
 }
 
 /// `copy.copy` / `copy.deepcopy` — implemented natively because routing them

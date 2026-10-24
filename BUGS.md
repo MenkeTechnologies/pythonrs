@@ -22,6 +22,20 @@ written.
   `False` (though `isinstance` is `True`); and the native traceback of a CPython-raised
   exception lists only the pythonrs frames (`extract_tb` gives `['<module>']`
   where CPython also lists `loads`, `decode`, `raw_decode`).
+- **Native weak references.** `weakref.ref(obj)` of a native object raised
+  `cannot create weak reference to 'builtins.PyrsInstance' object`. A native
+  `_weakref` (`ref`/`ReferenceType`, `proxy`, `getweakrefcount`,
+  `getweakrefs`, `_remove_dead_weakref`) now backs `pylib/weakref.py` and
+  `_weakrefset.py` in every build: references are shared when made without a
+  callback, hash and compare as their referent, cross the bridge, and can be
+  subclassed (`KeyedRef`); proxies forward attributes, methods and calls;
+  `WeakValueDictionary`, `WeakKeyDictionary`, `WeakSet`, `WeakMethod` and
+  `finalize` work. The collector never takes a referent's weak references as
+  roots: a sweep that frees it clears them and runs their callbacks.
+- **`type(obj.m)(func, obj)`** (the method type) binds `func`.
+- **Item stores and deletes on a CPython object run with the host borrow
+  released**, so a CPython mapping that calls a native method back no longer
+  panics with `RefCell already borrowed`.
 - **An exception escaping a generator keeps its identity.** The body's
   in-flight exception sat on the generator's swapped-out context, so the
   resumer re-formed it from its message: `raise ValueError(1, 2)` was caught as
@@ -3355,11 +3369,10 @@ entry. These remain open:
   namespace (and refreshed with it, as class mirrors are).
 - **A strided memoryview slice is a read-only copy.** `memoryview(ba)[::2]`
   over a `bytearray` is `readonly` and writes through it do not reach `ba`.
-- **`weakref` on pythonrs objects.** `weakref.ref(obj)` of a native instance
-  raises `cannot create weak reference to 'builtins.PyrsInstance' object`:
-  `weakref` is CPython's, and a native object crosses as a proxy. A native
-  `_weakref` (refs the tracing collector clears, with callbacks run after a
-  sweep) is the fix; `WeakValueDictionary`/`WeakSet`/`finalize` follow from it.
+- **A referent's death is seen only at a collection.** pythonrs has no
+  reference counts: `del o` leaves `weakref.ref(o)()` alive until the next
+  collection, and the default (`stdlib-ffi`) build never collects, so there a
+  weak reference never dies and `finalize` callbacks run at exit.
 
 ### Round 2 batched differential fuzz (`tests/batch_fuzz.rs`)
 

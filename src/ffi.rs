@@ -2549,6 +2549,23 @@ fn value_to_py_node<'py>(
             // The proxy is the same object every time the instance crosses,
             // as the instance is one object: `pickle` reaches an object again
             // through its own state (`a.me = a`) and recognises it by identity.
+            // A weak reference crosses as an instance proxy: CPython code keys a
+            // dict by it (`WeakKeyDictionary.data`, a dict on a CPython-built
+            // instance), and the proxy hashes and compares as the reference does.
+            Some(PyObj::WeakRef { .. }) => {
+                let Value::Obj(id) = v else { unreachable!() };
+                let key = (host.generation, *id);
+                if let Some(p) =
+                    IDENTITY.with(|m| m.borrow().instances.get(&key).map(|o| o.clone_ref(py)))
+                {
+                    return Ok(p.into_bound(py));
+                }
+                let proxy = Py::new(py, PyrsInstance { target: v.clone() })
+                    .map(|p| p.into_any())
+                    .map_err(|e| e.to_string())?;
+                IDENTITY.with(|m| m.borrow_mut().instances.insert(key, proxy.clone_ref(py)));
+                Ok(proxy.into_bound(py))
+            }
             Some(PyObj::Instance(i)) => {
                 if let Some(exc) = exc_to_py(host, py, v)? {
                     return Ok(exc);
@@ -4936,6 +4953,30 @@ pub fn set_item(host: &mut PyHost, id: u32, idx: &Value, val: &Value) -> Result<
         let v = value_to_py(host, py, val)?;
         obj.set_item(key, v)
             .map_err(|e| pyerr_to_error_h(host, py, &e))
+    })
+}
+
+/// [`set_item`] and [`del_item`] with the host borrow released while CPython
+/// runs the store: a CPython mapping built over a native one (a
+/// `collections.abc.MutableMapping` subclass, `weakref.WeakValueDictionary`)
+/// calls pythonrs methods back.
+pub fn set_item_released(id: u32, idx: &Value, val: &Value) -> Result<(), String> {
+    Python::attach(|py| {
+        let obj = fetch(py, id)?;
+        let (key, v) = with_host(|h| -> Result<_, String> {
+            Ok((value_to_py(h, py, idx)?, value_to_py(h, py, val)?))
+        })?;
+        obj.set_item(key, v)
+            .map_err(|e| with_host(|h| pyerr_to_error_h(h, py, &e)))
+    })
+}
+
+pub fn del_item_released(id: u32, idx: &Value) -> Result<(), String> {
+    Python::attach(|py| {
+        let obj = fetch(py, id)?;
+        let key = with_host(|h| value_to_py(h, py, idx))?;
+        obj.del_item(key)
+            .map_err(|e| with_host(|h| pyerr_to_error_h(h, py, &e)))
     })
 }
 

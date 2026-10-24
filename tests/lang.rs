@@ -10993,3 +10993,23 @@ out += [eval("abs(-2)", {"__builtins__": builtins}), eval("abs(-3)", {"__builtin
         r#"[42, "name 'print' is not defined", 2, 3]"#
     );
 }
+
+/// `type(obj.m)(func, obj)` — the method type — binds `func` to `obj`.
+#[test]
+fn the_method_type_binds_a_function() {
+    let src = r#"
+class C:
+    def m(self):
+        return 1
+c = C()
+out = [type(c.m)(C.m, c)(), type(c.m)(lambda s: s is c, c)()]
+try:
+    type(c.m)(1, c)
+except TypeError as e:
+    out.append(str(e))
+"#;
+    assert_eq!(
+        g(src, "out"),
+        r#"[1, True, 'first argument must be callable']"#
+    );
+}

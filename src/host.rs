@@ -1529,6 +1529,20 @@ pub enum PyObj {
         type_name: String,
         fields: Vec<String>,
     },
+    /// A weak reference (`weakref.ref`, or a subclass's payload) or proxy
+    /// (`weakref.proxy`) to heap object `target`, which the collector does not
+    /// keep alive: a sweep that frees it sets `target` to `Undef` and runs
+    /// `callback(ref)`. `key` is the target's hash key, taken when the ref is
+    /// made so a dead ref still finds its dict entry; `owner` is the subclass
+    /// instance (`weakref.KeyedRef`) the callback is handed, else `Undef`.
+    WeakRef {
+        target: Value,
+        callback: Value,
+        proxy: bool,
+        callable: bool,
+        key: Option<PKey>,
+        owner: Value,
+    },
     /// A `functools.partial`: a callable that pre-binds positional/keyword args
     /// over an arbitrary callable. Handled directly by [`invoke`].
     Partial {
@@ -2578,6 +2592,12 @@ pub struct PyHost {
     /// was taken of (its `obj`), by the view's heap id: the view itself
     /// windows the instance's native payload.
     pub mv_exporter: HashMap<u32, Value>,
+    /// The weak references and proxies to each heap object, by its id, in
+    /// creation order (`weakref.getweakrefs`); cleared by the collector.
+    pub weakrefs: HashMap<u32, Vec<Value>>,
+    /// Weakref callbacks a collection queued, `(callback, ref)`, run once the
+    /// collection returns.
+    pub weak_callbacks: Vec<(Value, Value)>,
     /// The `member_descriptor` of each `__slots__` entry, by its `qual`
     /// (`<class key>.<name>`): one object per slot, as the one CPython keeps in
     /// the declaring class's `__dict__`, so `C.x is C.x`.
@@ -3300,6 +3320,8 @@ impl PyHost {
             func_attrs: HashMap::default(),
             attr_dicts: HashMap::default(),
             mv_exporter: HashMap::default(),
+            weakrefs: HashMap::default(),
+            weak_callbacks: Vec::new(),
             slot_members: HashMap::default(),
             slot_values: HashMap::default(),
             codec_search: Vec::new(),
@@ -3635,6 +3657,29 @@ impl PyHost {
         self.builtin_objects.get(tp).map_or(0, |v| self.addr_of(v))
     }
 
+    /// `weakref_repr` / `proxy_repr`: `<weakref at 0x…; to 'C' at 0x…>`, with the
+    /// referent's `__name__` when it has one, or `; dead>` once it is gone.
+    fn weakref_repr(&self, v: &Value, target: &Value, proxy: bool) -> String {
+        let kind = if proxy { "weakproxy" } else { "weakref" };
+        let me = self.addr_of(v);
+        if matches!(target, Value::Undef) {
+            return format!("<{kind} at 0x{me:012x}; dead>");
+        }
+        let tn = self.tp_name(target);
+        let tn = tn.rsplit('.').next().unwrap_or(&tn).to_string();
+        let name = match self.get(target) {
+            Some(PyObj::Func(fv)) => self.funcs.get(fv.def_id).map(|d| d.name.clone()),
+            Some(PyObj::Class(c)) => Some(self.class_display_name(c)),
+            Some(PyObj::Builtin(n)) => Some(n.rsplit('.').next().unwrap_or(n).to_string()),
+            _ => None,
+        };
+        let at = self.addr_of(target);
+        match name {
+            Some(n) => format!("<{kind} at 0x{me:012x}; to '{tn}' at 0x{at:012x} ({n})>"),
+            None => format!("<{kind} at 0x{me:012x}; to '{tn}' at 0x{at:012x}>"),
+        }
+    }
+
     pub fn addr_of(&self, v: &Value) -> u64 {
         match v {
             Value::Obj(i) => *i as u64,
@@ -3784,6 +3829,7 @@ impl PyHost {
                 "complex" => return Some("complex"),
                 "bytes" => return Some("bytes"),
                 "bytearray" => return Some("bytearray"),
+                "weakref.ReferenceType" => return Some("weakref.ReferenceType"),
                 "tuple" => return Some("tuple"),
                 "set" => return Some("set"),
                 "frozenset" => return Some("frozenset"),
@@ -5507,6 +5553,7 @@ fn type_object_class_name(n: &str) -> Option<String> {
         "functools._lru_cache_wrapper" => Some("functools._lru_cache_wrapper"),
         "re.Pattern" => Some("re.Pattern"),
         "os.stat_result" => Some("os.stat_result"),
+        "weakref.ReferenceType" | "weakref.ProxyType" | "weakref.CallableProxyType" => Some(n),
         _ if n
             .strip_prefix("_io.")
             .is_some_and(|t| crate::stdlib::pyio::STREAM_TYPES.contains(&t)) =>
@@ -5670,6 +5717,13 @@ impl PyHost {
             Value::Obj(_) => match self.get(v) {
                 // `get` panics on a freed slot rather than return it.
                 Some(PyObj::Freed) => unreachable!("a freed slot read through get"),
+                Some(PyObj::WeakRef {
+                    proxy, callable, ..
+                }) => match (proxy, callable) {
+                    (false, _) => "weakref.ReferenceType".into(),
+                    (true, false) => "weakref.ProxyType".into(),
+                    (true, true) => "weakref.CallableProxyType".into(),
+                },
                 Some(PyObj::StructFmt(_)) => "Struct".into(),
                 Some(PyObj::ContextVar { .. }) => "ContextVar".into(),
                 Some(PyObj::ContextToken { .. }) => "Token".into(),
@@ -5837,6 +5891,14 @@ impl PyHost {
             Value::Obj(_) => match self.get(v) {
                 Some(PyObj::Str(s)) => !s.is_empty(),
                 Some(PyObj::Bytes(b)) => !b.is_empty(),
+                Some(PyObj::WeakRef {
+                    proxy: true,
+                    target,
+                    ..
+                }) if !matches!(target, Value::Undef) => {
+                    let t = target.clone();
+                    self.truthy(&t)
+                }
                 Some(PyObj::Bytearray(b)) => !b.is_empty(),
                 Some(PyObj::Memoryview { len, .. }) => *len != 0,
                 Some(PyObj::Deque { items, .. }) => !items.is_empty(),
@@ -5926,6 +5988,13 @@ impl PyHost {
                 // `str()` of a mappingproxy is `str()` of the mapping behind it;
                 // only `repr()` says `mappingproxy(...)`.
                 Some(PyObj::MappingProxy { dict }) => self.str_of(dict),
+                // A live proxy's `str()` is its referent's.
+                Some(PyObj::WeakRef {
+                    proxy: true,
+                    target,
+                    ..
+                }) if !matches!(target, Value::Undef) => self.str_of(target),
+                Some(PyObj::WeakRef { .. }) => self.repr_of(v),
                 Some(PyObj::StructFmt(f)) => format!("<_struct.Struct object, format '{f}'>"),
                 Some(PyObj::BytesIO { .. }) => "<_io.BytesIO object>".to_string(),
                 Some(PyObj::StringIO { .. }) => "<_io.StringIO object>".to_string(),
@@ -6583,6 +6652,7 @@ impl PyHost {
         match v {
             Value::Str(s) => quote_str(s),
             Value::Obj(_) => match self.get(v) {
+                Some(PyObj::WeakRef { target, proxy, .. }) => self.weakref_repr(v, target, *proxy),
                 Some(PyObj::Str(s)) => quote_str(s),
                 Some(PyObj::MappingProxy { dict }) => {
                     format!("mappingproxy({})", self.repr_of(dict))
@@ -6774,6 +6844,41 @@ impl PyHost {
             Value::Int(n) => PKey::Int(*n),
             Value::Float(f) => float_pkey(*f),
             Value::Str(s) => PKey::Str((**s).clone()),
+            Value::Obj(_) if matches!(self.get(v), Some(PyObj::WeakRef { .. })) => {
+                // A weak reference hashes as its referent, from the key taken
+                // when it was made, so a dead one still finds its entry; a
+                // proxy is unhashable.
+                match self.get(v) {
+                    Some(PyObj::WeakRef {
+                        proxy: false,
+                        key: Some(k),
+                        ..
+                    }) => PKey::Tuple(vec![PKey::Str("\u{1}weakref".into()), k.clone()]),
+                    Some(PyObj::WeakRef {
+                        proxy: false,
+                        target: Value::Undef,
+                        ..
+                    }) => {
+                        return Err(type_error("weak object has gone away"));
+                    }
+                    Some(PyObj::WeakRef {
+                        proxy: false,
+                        target,
+                        ..
+                    }) => {
+                        return Err(type_error(&format!(
+                            "unhashable type: '{}'",
+                            self.type_name(target)
+                        )));
+                    }
+                    _ => {
+                        return Err(type_error(&format!(
+                            "unhashable type: '{}'",
+                            self.type_name(v)
+                        )))
+                    }
+                }
+            }
             Value::Obj(_) => match self.get(v) {
                 Some(PyObj::Str(s)) => PKey::Str(s.clone()),
                 // `bytes` is hashable by its byte content; `bytearray` is not.
@@ -7052,6 +7157,27 @@ impl PyHost {
     }
 
     fn equal_inner(&self, a: &Value, b: &Value) -> bool {
+        // Two weak references compare by their referents while both are alive,
+        // else by identity (`weakref_richcompare`).
+        if let (
+            Some(PyObj::WeakRef {
+                proxy: false,
+                target: ta,
+                ..
+            }),
+            Some(PyObj::WeakRef {
+                proxy: false,
+                target: tb,
+                ..
+            }),
+        ) = (self.get(a), self.get(b))
+        {
+            if matches!(ta, Value::Undef) || matches!(tb, Value::Undef) {
+                return a == b;
+            }
+            let (ta, tb) = (ta.clone(), tb.clone());
+            return self.equal(&ta, &tb);
+        }
         // A builtin-subclass instance with no `__eq__` override compares by its
         // native payload value (`'cat' == U('cat')`, `Stack([1]) == [1]`).
         let ua;
@@ -13329,6 +13455,25 @@ impl PyHost {
         if let Some(id) = self.foreign_id(recv) {
             return crate::ffi::get_attr(self, id, name);
         }
+        // A proxy forwards every attribute to its referent; a reference has
+        // its `__callback__`.
+        if let Some(PyObj::WeakRef {
+            proxy,
+            target,
+            callback,
+            ..
+        }) = self.get(recv)
+        {
+            match (proxy, target) {
+                (true, Value::Undef) => return Err(crate::builtins::weakref_dead_error()),
+                (true, t) => {
+                    let t = t.clone();
+                    return self.get_attr(&t, name);
+                }
+                (false, _) if name == "__callback__" => return Ok(callback.clone()),
+                _ => {}
+            }
+        }
         // Type dunders on a scalar value (None/bool/int/float): `__new__` (the
         // inherited object.__new__) and `__class__`. The stdlib inspects these
         // (enum's `_find_new_` reads `None.__new__`).
@@ -15031,8 +15176,19 @@ impl PyHost {
                 if name == "__new__" && crate::builtins::is_type_object_name(n) =>
             {
                 let ctor = match n.as_str() {
-                    "int" | "str" | "float" | "complex" | "bytes" | "bytearray" | "tuple"
-                    | "frozenset" | "list" | "dict" | "set" | "type" => {
+                    "int"
+                    | "str"
+                    | "float"
+                    | "complex"
+                    | "bytes"
+                    | "bytearray"
+                    | "tuple"
+                    | "frozenset"
+                    | "list"
+                    | "dict"
+                    | "set"
+                    | "type"
+                    | "weakref.ReferenceType" => {
                         format!("{n}.__new__")
                     }
                     _ => "object.__new__".to_string(),
@@ -15694,6 +15850,21 @@ impl PyHost {
     /// a user class that kept them, `type`, `OrderedDict`, a set or a deque.
     /// A variable-size base (`int`, `tuple`, `bytes`) admits no
     /// `__weakref__` at all.
+    /// Whether instances of `class` carry a weak-reference list: some class in
+    /// its MRO installed `__weakref__`, or a builtin base has one.
+    pub fn instance_has_weakref_slot(&self, class: &str) -> bool {
+        self.mro_rc(class).iter().any(|c| {
+            if self.classes.contains_key(c) {
+                self.class_adds_dict_weakref(c).1
+            } else {
+                matches!(
+                    crate::builtins::native_type_key(c),
+                    "type" | "OrderedDict" | "set" | "frozenset" | "deque" | "ExceptionGroup"
+                )
+            }
+        })
+    }
+
     fn class_adds_dict_weakref(&self, c: &str) -> (bool, bool) {
         let (mut want_dict, mut want_weak) = match self.own_slots(c) {
             Some(slots) => (
@@ -16184,6 +16355,17 @@ impl PyHost {
 
     /// `recv.name = val`.
     pub fn set_attr(&mut self, recv: &Value, name: &str, val: Value) -> Result<(), String> {
+        if let Some(PyObj::WeakRef {
+            proxy: true,
+            target,
+            ..
+        }) = self.get(recv)
+        {
+            return match target.clone() {
+                Value::Undef => Err(crate::builtins::weakref_dead_error()),
+                t => self.set_attr(&t, name, val),
+            };
+        }
         // A live CPython object (`decimal.getcontext().prec = 6`) sets through the
         // bridge.
         #[cfg(feature = "stdlib-ffi")]
@@ -16612,6 +16794,17 @@ impl PyHost {
     }
 
     pub fn del_attr(&mut self, recv: &Value, name: &str) -> Result<(), String> {
+        if let Some(PyObj::WeakRef {
+            proxy: true,
+            target,
+            ..
+        }) = self.get(recv)
+        {
+            return match target.clone() {
+                Value::Undef => Err(crate::builtins::weakref_dead_error()),
+                t => self.del_attr(&t, name),
+            };
+        }
         #[cfg(feature = "stdlib-ffi")]
         if let Some(id) = self.foreign_id(recv) {
             return crate::ffi::del_attr(self, id, name);
@@ -17070,6 +17263,17 @@ fn invoke_object(
             }
             call_method(&recv, &method, rest, kwargs)
         }
+        // Calling a weak reference reads its referent (`None` once it is gone);
+        // calling a callable proxy calls the referent.
+        Some(PyObj::WeakRef {
+            proxy: false,
+            target,
+            ..
+        }) => Ok(target),
+        Some(PyObj::WeakRef { target, .. }) => match target {
+            Value::Undef => Err(crate::builtins::weakref_dead_error()),
+            t => invoke(&t, args, kwargs),
+        },
         // Calling a generic alias constructs its origin (`list[int]()` -> list()).
         Some(PyObj::GenericAlias { origin, .. }) => invoke(&origin, args, kwargs),
         Some(PyObj::NamedTupleType { type_name, fields }) => {
@@ -17099,6 +17303,13 @@ fn invoke_object(
             if with_host(|h| h.class_lookup(&inst.class, "__call__").is_some()) =>
         {
             call_method(callable, "__call__", args, kwargs)
+        }
+        // A subclass of a callable builtin (`weakref.KeyedRef`) calls its payload.
+        Some(PyObj::Instance(inst))
+            if with_host(|h| h.builtin_base_of(&inst.class))
+                .is_some_and(|b| base_provides(b, "__call__")) =>
+        {
+            invoke(&inst.payload, args, kwargs)
         }
         // A CPython callable (stdlib-ffi): call it on the CPython side. The bridge
         // drops the host borrow across the call so pythonrs callbacks can run.
@@ -17388,6 +17599,7 @@ pub fn base_provides(base: &str, dunder: &str) -> bool {
         "complex" => matches!(dunder, "__repr__" | "__str__" | "__hash__" | "__bool__"),
         "bytes" => base_provides("tuple", dunder) || dunder == "__bytes__",
         "bytearray" => base_provides("list", dunder),
+        "weakref.ReferenceType" => matches!(dunder, "__call__" | "__hash__" | "__repr__"),
         // The native `collections` containers carry the item protocol of the
         // sequence or mapping they are.
         "collections.deque" => base_provides("list", dunder),
@@ -17564,6 +17776,8 @@ pub(crate) fn base_dispatch(
     kwargs: Vec<(String, Value)>,
 ) -> Result<Value, String> {
     match name {
+        // A callable base (`weakref.ref`): `super().__call__()` calls the payload.
+        "__call__" if base_provides(base, "__call__") => invoke(payload, args, kwargs),
         "copy" if base.starts_with("collections.") => {
             collections_subclass_copy(recv).unwrap_or_else(|| Ok(recv.clone()))
         }
@@ -17921,6 +18135,21 @@ pub fn call_method(
     // trick the desugar's `.ctx` temporaries use — so an explicit user
     // `obj.__enter__()` keeps raising the ordinary `AttributeError` that
     // CPython raises for it.
+    // A proxy forwards method calls to its referent.
+    let proxied = with_host(|h| match h.get(recv) {
+        Some(PyObj::WeakRef {
+            proxy: true,
+            target,
+            ..
+        }) => Some(target.clone()),
+        _ => None,
+    });
+    if let Some(target) = proxied {
+        return match target {
+            Value::Undef => Err(crate::builtins::weakref_dead_error()),
+            t => call_method(&t, name, args, kwargs),
+        };
+    }
     if let Some(entry) = name.strip_prefix('.') {
         if let Some(e) = context_manager_error(recv, entry.starts_with("__a")) {
             return Err(e);
@@ -24270,6 +24499,16 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
     // run on a foreign thread whose heap is empty. Serving the native module
     // keeps `get_ident`/`start_joinable_thread` describing the single thread
     // user code actually runs on.
+    // `weakref` and `_weakrefset` run from `pylib/` over the native `_weakref`
+    // in every build: a native object cannot be weakly referenced by CPython's.
+    #[cfg(feature = "stdlib-ffi")]
+    if matches!(name, "weakref" | "_weakrefset") {
+        if let Some(path) = pylib_dir().map(|d| d.join(format!("{name}.py"))) {
+            if let Ok(src) = std::fs::read_to_string(&path) {
+                return run_vendored_module(name, &src, &path);
+            }
+        }
+    }
     if name == "_thread" {
         let src = crate::stdlib::pythread::module_source();
         return run_vendored_module("_thread", src, std::path::Path::new("<_thread>"));
@@ -25374,6 +25613,22 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                 (
                     "copy_context",
                     h.alloc(PyObj::Builtin("_contextvars.copy_context".into())),
+                ),
+            ]
+        }),
+        "_weakref" => with_host(|h| {
+            let b = |h: &mut PyHost, n: &str| h.alloc(PyObj::Builtin(n.into()));
+            vec![
+                ("ref", b(h, "weakref.ReferenceType")),
+                ("ReferenceType", b(h, "weakref.ReferenceType")),
+                ("ProxyType", b(h, "weakref.ProxyType")),
+                ("CallableProxyType", b(h, "weakref.CallableProxyType")),
+                ("proxy", b(h, "_weakref.proxy")),
+                ("getweakrefcount", b(h, "_weakref.getweakrefcount")),
+                ("getweakrefs", b(h, "_weakref.getweakrefs")),
+                (
+                    "_remove_dead_weakref",
+                    b(h, "_weakref._remove_dead_weakref"),
                 ),
             ]
         }),

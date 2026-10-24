@@ -2196,3 +2196,87 @@ abstract True
         "stderr={stderr}"
     );
 }
+
+/// Native weak references (`_weakref` under `pylib/weakref.py`): `ref` is
+/// shared when made without a callback, calls back its referent, hashes and
+/// compares as it; `proxy` forwards attributes, methods and calls; only
+/// weak-referenceable objects are accepted (not `int`/`list`/`object()`, nor a
+/// `__slots__` class without `__weakref__`); `WeakValueDictionary` (over the
+/// `KeyedRef` subclass), `WeakKeyDictionary`, `WeakSet`, `finalize` (run at
+/// exit) and `WeakMethod` work. Expected output is python3.14's.
+#[test]
+fn weak_references_to_native_objects() {
+    let src = r#"import weakref
+class C:
+    def m(self): return 'm'
+c = C()
+r = weakref.ref(c); p = weakref.proxy(c)
+def f(): return 'f'
+print(r() is c, weakref.ref(c) is r, r == weakref.ref(c), hash(r) == hash(c), type(r), type(p), type(weakref.proxy(f)))
+print(type(r).__name__, weakref.ref.__name__, weakref.getweakrefcount(c), len(weakref.getweakrefs(c)), r.__callback__)
+p.x = 5; print(c.x, p.x, p.m(), str(p) == str(c), bool(p), weakref.proxy(f)())
+cb = weakref.ref(c, lambda w: None); print(cb is r, cb.__callback__ is not None, weakref.getweakrefcount(c))
+for x in [[], {}, (), 'a', b'', 1.5, None, object(), len, int, range(1), iter([]), frozenset(), {1}, f, C, c.m]:
+    try: weakref.ref(x); print(type(x).__name__, 'ok')
+    except TypeError as e: print(type(x).__name__, 'no', e)
+class S:
+    __slots__ = ('a',)
+class SW:
+    __slots__ = ('a', '__weakref__')
+for k in (S, SW):
+    try: weakref.ref(k()); print(k.__name__, 'ok')
+    except TypeError as e: print(k.__name__, e)
+d = weakref.WeakValueDictionary(); d['k'] = c; print(d['k'] is c, len(d), list(d.keys()))
+wk = weakref.WeakKeyDictionary(); wk[c] = 1; print(wk[c], c in wk, len(wk))
+ws = weakref.WeakSet([c]); print(c in ws, len(ws))
+fin = weakref.finalize(c, print, 'finalized'); print(fin.alive)
+print(isinstance(r, weakref.ref), isinstance(p, weakref.ProxyType), weakref.ReferenceType is weakref.ref)
+print(weakref.WeakMethod(c.m)() == c.m)
+import abc
+class AB(metaclass=abc.ABCMeta):
+    pass
+ab = AB()
+print(weakref.ref(ab)() is ab)
+"#;
+    let (stdout, stderr, ok) = run_py(src);
+    if bridge_unavailable(ok, &stderr) {
+        eprintln!("skipping weakref test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(
+        stdout,
+        r#"True True True True <class 'weakref.ReferenceType'> <class 'weakref.ProxyType'> <class 'weakref.CallableProxyType'>
+ReferenceType ReferenceType 2 2 None
+5 5 m True True f
+False True 3
+list no cannot create weak reference to 'list' object
+dict no cannot create weak reference to 'dict' object
+tuple no cannot create weak reference to 'tuple' object
+str no cannot create weak reference to 'str' object
+bytes no cannot create weak reference to 'bytes' object
+float no cannot create weak reference to 'float' object
+NoneType no cannot create weak reference to 'NoneType' object
+object no cannot create weak reference to 'object' object
+builtin_function_or_method ok
+type ok
+range no cannot create weak reference to 'range' object
+list_iterator no cannot create weak reference to 'list_iterator' object
+frozenset ok
+set ok
+function ok
+type ok
+method ok
+S cannot create weak reference to 'S' object
+SW ok
+True 1 ['k']
+1 True 1
+True 1
+True
+True True True
+True
+True
+finalized
+"#,
+        "stderr={stderr}"
+    );
+}
