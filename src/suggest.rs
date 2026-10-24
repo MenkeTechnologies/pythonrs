@@ -161,13 +161,16 @@ pub fn with_hint(line: &str, hint: Option<Hint>) -> String {
     }
 }
 
+/// One `_CROSS_LANGUAGE_HINTS` entry for an attribute name: `(type, hint, raw)`.
+type CrossLanguageHint = (&'static str, &'static str, bool);
+
 /// `traceback._CROSS_LANGUAGE_HINTS` (3.15): attribute names that come from
 /// another language, or mutate an immutable type, mapped to the type they are
 /// recognised on and the hint — the Python name to use (`raw == false`,
 /// shown as `Did you mean '.x'?`) or a whole sentence (`raw == true`). A name
 /// may be listed for several types; the first one the object is an instance
 /// of wins.
-const CROSS_LANGUAGE_HINTS: &[(&str, &[(&str, &str, bool)])] = &[
+const CROSS_LANGUAGE_HINTS: &[(&str, &[CrossLanguageHint])] = &[
     // list -- JavaScript/Ruby equivalents
     ("push", &[("list", "append", false)]),
     ("concat", &[("list", "extend", false)]),
