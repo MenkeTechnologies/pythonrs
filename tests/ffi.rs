@@ -2361,3 +2361,34 @@ except DeprecationWarning as e:
         "stderr={stderr}"
     );
 }
+
+/// Each asyncio Task runs in a copy of the context it was created in
+/// (`Task.__init__`'s `copy_context()`, `__step` under `Context.run`): a
+/// `ContextVar.set` inside a task is invisible to its siblings, to the creator
+/// and, after `asyncio.run`, to the top level. Expected output is python3.14's.
+#[test]
+fn asyncio_tasks_run_in_a_copy_of_their_context() {
+    let src = r#"
+import asyncio, contextvars
+v = contextvars.ContextVar('v', default=0)
+async def task(n):
+    v.set(n)
+    await asyncio.sleep(0)
+    return v.get()
+async def child():
+    return v.get()
+async def main():
+    v.set(100)
+    r = await asyncio.gather(task(1), task(2))
+    t = asyncio.create_task(child())
+    v.set(200)
+    return r, await t, v.get()
+print(asyncio.run(main()), v.get())
+"#;
+    let (stdout, stderr, ok) = run_py(src);
+    if bridge_unavailable(ok, &stderr) {
+        eprintln!("skipping task-context test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(stdout, "([1, 2], 100, 200) 0\n", "stderr={stderr}");
+}

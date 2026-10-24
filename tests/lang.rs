@@ -11054,3 +11054,29 @@ except TypeError as e:
          'EllipsisType takes no arguments', \"cannot create 'generator' instances\"]"
     );
 }
+
+/// `type_new_slots_impl`: a class derived from a variable-sized builtin
+/// (`int`, `bytes`, `tuple`, `type`) takes no slots, judged before any slot
+/// name is; empty `__slots__` and the fixed-size builtins are fine.
+#[test]
+fn nonempty_slots_on_a_variable_sized_base() {
+    let src = r#"
+out = []
+class P(int):
+    pass
+for b, s in ((int, ('a',)), (bytes, 'a'), (tuple, (1,)), (P, ('__dict__',)), (int, ()), (str, ('a',))):
+    try:
+        class X(b):
+            __slots__ = s
+        out.append('ok')
+    except TypeError as e:
+        out.append(str(e))
+"#;
+    assert_eq!(
+        g(src, "out"),
+        "[\"nonempty __slots__ not supported for subtype of 'int'\", \
+         \"nonempty __slots__ not supported for subtype of 'bytes'\", \
+         \"nonempty __slots__ not supported for subtype of 'tuple'\", \
+         \"nonempty __slots__ not supported for subtype of 'P'\", 'ok', 'ok']"
+    );
+}

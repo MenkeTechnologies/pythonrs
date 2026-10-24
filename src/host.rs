@@ -21060,7 +21060,7 @@ fn slots_mention(slots: Option<&Value>, want: &str) -> bool {
     })
 }
 
-fn check_slots(class: &str, ns: &NameMap) -> Result<(), String> {
+fn check_slots(class: &str, bases: &[String], ns: &NameMap) -> Result<(), String> {
     let slots = match ns.get("__slots__") {
         Some(v) => v.clone(),
         None => return Ok(()),
@@ -21074,6 +21074,25 @@ fn check_slots(class: &str, ns: &NameMap) -> Result<(), String> {
         Some(s) => vec![with_host(|h| h.new_str(s))],
         None => iter_vec(&slots)?,
     };
+    // `type_new_slots_impl`: a base with variable-sized instances (`int`,
+    // `bytes`, `tuple`, `type`, or a class derived from one) takes no slots,
+    // and this is judged before any slot name is.
+    if !items.is_empty() {
+        let var_sized = bases.iter().find(|b| {
+            with_host(|h| {
+                h.mro_of(b)
+                    .iter()
+                    .chain([*b])
+                    .any(|c| matches!(c.as_str(), "int" | "bytes" | "tuple" | "type"))
+            })
+        });
+        if let Some(b) = var_sized {
+            let shown = with_host(|h| h.class_display_name(b));
+            return Err(type_error(&format!(
+                "nonempty __slots__ not supported for subtype of '{shown}'"
+            )));
+        }
+    }
     let mut names: Vec<String> = Vec::with_capacity(items.len());
     let (mut add_dict, mut add_weak) = (false, false);
     for it in &items {
@@ -21158,7 +21177,7 @@ pub fn build_class(
             "type '{b}' is not an acceptable base type"
         )));
     }
-    check_slots(name, &ns)?;
+    check_slots(name, &bases, &ns)?;
     let cls = match &effective_meta {
         Some(m) => metaclass_create(m, name, &bases, &ns, &class_kwargs, prepared)?,
         None => {

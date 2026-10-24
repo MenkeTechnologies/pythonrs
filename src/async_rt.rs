@@ -55,6 +55,10 @@ struct FutureCell {
     /// The one object standing for this cell, so `current_task() is task`
     /// and a Task is one key in a set (`TaskGroup._tasks`).
     obj: Value,
+    /// The CPython context a Task's steps run in, copied when it was
+    /// created (dropped once it settles).
+    #[cfg(feature = "stdlib-ffi")]
+    context: Option<crate::ffi::TaskContext>,
 }
 
 // ── event loop ───────────────────────────────────────────────────────────────
@@ -143,6 +147,12 @@ fn new_cell(is_task: bool, coro: Option<Value>, name: String) -> Value {
             must_cancel: false,
             name,
             obj: Value::Undef,
+            #[cfg(feature = "stdlib-ffi")]
+            context: if is_task {
+                crate::ffi::TaskContext::copy_current()
+            } else {
+                None
+            },
         });
         id
     });
@@ -203,6 +213,10 @@ fn settle(id: u32, result: Value, exc: Option<Value>, cancelled: bool) -> bool {
         f.result = result;
         f.exc = exc;
         f.cancelled = cancelled;
+        #[cfg(feature = "stdlib-ffi")]
+        {
+            f.context = None;
+        }
         (
             std::mem::take(&mut f.py_callbacks),
             std::mem::take(&mut f.native_callbacks),
@@ -477,11 +491,31 @@ fn task_step(task: Value) {
     };
     let must_cancel = with_loop(|l| std::mem::take(&mut l.futures[id as usize].must_cancel));
     let prev = with_loop(|l| l.current.replace(id));
-    let stepped = if must_cancel {
-        host::gen_throw(&coro, make_cancelled_error())
-    } else {
-        host::gen_resume(&coro, Value::Undef)
+    let step = || {
+        if must_cancel {
+            host::gen_throw(&coro, make_cancelled_error())
+        } else {
+            host::gen_resume(&coro, Value::Undef)
+        }
     };
+    // `self._context.run(self.__step)`. The context is taken out of the cell
+    // for the step, which may settle the Task, and put back unless it did.
+    #[cfg(feature = "stdlib-ffi")]
+    let stepped = match with_loop(|l| l.futures[id as usize].context.take()) {
+        Some(ctx) => {
+            let stepped = ctx.run(step);
+            with_loop(|l| {
+                let f = &mut l.futures[id as usize];
+                if !f.done {
+                    f.context = Some(ctx);
+                }
+            });
+            stepped
+        }
+        None => step(),
+    };
+    #[cfg(not(feature = "stdlib-ffi"))]
+    let stepped = step();
     with_loop(|l| l.current = prev);
     match stepped {
         Ok(Some(awaited)) => {

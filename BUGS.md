@@ -9,6 +9,25 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **Each asyncio Task runs in a copy of its creator's context.** A
+  `ContextVar.set` inside one task leaked into its siblings, its creator and
+  the top level after `asyncio.run` (`gather` of two setters returned `[2, 2]`
+  where CPython returns `[1, 2]`). In the bridge build a Task now copies the
+  CPython context when it is created (`Task.__init__`'s `copy_context()`) and
+  runs every step inside it (`PyContext_Enter`/`PyContext_Exit`, as
+  `Context.run`). The native build's `contextvars` keeps one value per variable
+  and has no contexts to copy.
+- **`__slots__` on a variable-sized base.** `class X(int): __slots__ = ('a',)`
+  (or a `bytes`/`tuple`/`type` subclass, or a class derived from one) built a
+  class; it is `TypeError: nonempty __slots__ not supported for subtype of
+  'int'`, judged before any slot name is.
+- **An unparenthesized `:=` only where a `named_expression` is allowed.**
+  `with x := 1:`, `assert x := 1`, `x = y := 1`, `return x := 1`, `raise x
+  := 1`, `for x in y := [1]:`, a default, a keyword argument, a `*` argument,
+  an annotation, a dict key or value and a slice bound all compiled; each is
+  `invalid syntax` at the `:=` (a dict key or slice bound at the `:` after
+  it), while a condition, a call or class argument, a lone subscript and a
+  display item still take one.
 - **`types`' C types are pythonrs's type objects.** `type(c.m) is
   types.MethodType` was False in the bridge build, as were `FunctionType`,
   `BuiltinFunctionType`, `NoneType`, `GeneratorType`, `EllipsisType`,

@@ -2660,7 +2660,8 @@ impl Parser {
                     });
                 } else {
                     late_order = late_order.or(order.positional().err());
-                    bases.push(self.under(level, Self::parse_expr)?);
+                    // An argument is an `assignment_expression` or an `expression`.
+                    bases.push(self.under(level, Self::parse_namedexpr)?);
                 }
                 if !self.eat_op(",") {
                     break;
@@ -3406,7 +3407,7 @@ impl Parser {
         if self.eat_op("*") {
             return Ok(Expr::Starred(Box::new(self.parse_bitor()?)));
         }
-        self.parse_namedexpr()
+        self.parse_ternary()
     }
 
     /// `star_named_expression`, at its own level: `'*' bitwise_or`, or a
@@ -3417,6 +3418,13 @@ impl Parser {
         }
         let level = self.level + 1;
         self.under(level, Self::parse_namedexpr)
+    }
+
+    /// Whether `e`, read from token `start`, is an unparenthesized `x := v`
+    /// (one in parentheses is an `atom`, valid wherever an expression is).
+    fn bare_named_expr(&self, e: &Expr, start: usize) -> bool {
+        matches!(e.unspanned(), Expr::NamedExpr(..))
+            && !matches!(&self.toks[start].tok, Tok::Op(o) if o == "(")
     }
 
     /// `named_expression`, called at its own level: `expression` one level up,
@@ -3434,9 +3442,12 @@ impl Parser {
         Ok(e)
     }
 
-    /// alias used where a single (non-tuple) expression is wanted.
+    /// `expression`: what most rules take where one (non-tuple) expression is
+    /// wanted. An unparenthesized `:=` is not one (`with x := 1:`, `assert x
+    /// := 1`, `return x := 1` are `invalid syntax` at the `:=`); the rules that
+    /// take a `named_expression` call [`Self::parse_namedexpr`].
     fn parse_expr(&mut self) -> Result<Expr, String> {
-        self.parse_namedexpr()
+        self.parse_ternary()
     }
 
     /// `expression`: a conditional expression, a `disjunction` or a `lambdef`,
@@ -4055,7 +4066,13 @@ impl Parser {
                 p.reach_absent_expression(slice + 1)?;
                 None
             } else {
-                Some(Box::new(p.under(slice, Self::parse_expr)?))
+                // `slice: [expression] ':' … | named_expression`: a lone
+                // index may be `y := 1`, a slice bound may not.
+                let e = p.under(slice, Self::parse_namedexpr)?;
+                if p.bare_named_expr(&e, lo_start) && p.at_op(":") {
+                    return Err(p.err_here("invalid syntax"));
+                }
+                Some(Box::new(e))
             };
             if lo.is_some() {
                 p.comma_hint(lo_start)?;
@@ -4788,7 +4805,10 @@ impl Parser {
         let first = self.under(atom + 5, Self::parse_star_named)?;
         let first_end = self.pos - 1;
         if self.at_op(":") {
-            // dict
+            // dict — whose key is an `expression`, never a bare `k := v`.
+            if self.bare_named_expr(&first, first_start) {
+                return Err(self.err_here("invalid syntax"));
+            }
             self.advance();
             let v = self.under(atom + 6, Self::parse_expr)?;
             if self.at_comp_for() {

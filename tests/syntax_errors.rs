@@ -1509,3 +1509,62 @@ ok 'from __future__ import barry_as_FLUFL'
 "##
     );
 }
+
+/// An unparenthesized `:=` is a `named_expression`, which only some rules
+/// take (a condition, a call or class argument, a lone subscript, a display
+/// item): where the grammar wants an `expression` it is `invalid syntax` at the
+/// `:=`. Expected output is python3.14's.
+#[test]
+fn a_bare_walrus_only_where_a_named_expression_is_allowed() {
+    let out = Command::new(env!("CARGO_BIN_EXE_python"))
+        .args([
+            "-c",
+            r#"cases = [
+    "with x := 1: pass", "with f() as y, z := 2: pass", "assert x := 1", "del x := 1",
+    "x = y := 1", "for x in y := [1]: pass", "def f():\n    return x := 1", "raise x := 1",
+    "def f(a=b:=1): pass", "f(a=b:=1)", "f(*a:=1)", "x: int := 1", "{a: b := 1}",
+    "{a := 1: b}", "a[b:=1:2]", "a[1:b:=1]", "x = 1 if y := 2 else 3",
+]
+for s in cases:
+    try:
+        exec(s, {})
+    except SyntaxError as e:
+        print(repr(s), e.msg, e.lineno, e.offset, e.end_lineno, e.end_offset)
+ok = ["print(x := 1)", "f = print; f(a := 2, a)", "a = [1, 2]; print(a[b := 1], a[(c := 0):2], {(k := 3): k})",
+      "class A(b := object): pass\nprint(A.__bases__, b)", "if (n := 3) > 2: print(n)", "print([y := 5, y ** 2])"]
+for s in ok:
+    exec(s, {})
+"#,
+        ])
+        .output()
+        .expect("spawn python");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        r#"'with x := 1: pass' invalid syntax 1 8 1 10
+'with f() as y, z := 2: pass' invalid syntax 1 18 1 20
+'assert x := 1' invalid syntax 1 10 1 12
+'del x := 1' invalid syntax 1 7 1 9
+'x = y := 1' invalid syntax 1 7 1 9
+'for x in y := [1]: pass' invalid syntax 1 12 1 14
+'def f():\n    return x := 1' invalid syntax 2 14 2 16
+'raise x := 1' invalid syntax 1 9 1 11
+'def f(a=b:=1): pass' invalid syntax 1 10 1 12
+'f(a=b:=1)' invalid syntax 1 6 1 8
+'f(*a:=1)' invalid syntax 1 5 1 7
+'x: int := 1' invalid syntax 1 8 1 10
+'{a: b := 1}' invalid syntax 1 7 1 9
+'{a := 1: b}' invalid syntax 1 8 1 9
+'a[b:=1:2]' invalid syntax 1 7 1 8
+'a[1:b:=1]' invalid syntax 1 6 1 8
+'x = 1 if y := 2 else 3' expected 'else' after 'if' expression 1 5 1 11
+1
+2 2
+2 [1, 2] {3: 3}
+(<class 'object'>,) <class 'object'>
+3
+[5, 25]
+"#,
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

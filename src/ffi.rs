@@ -5645,3 +5645,63 @@ pub fn type_qualified_name(id: u32) -> String {
         }
     })
 }
+
+/// A CPython `contextvars.Context` an asyncio Task runs its steps in: CPython's
+/// `Task.__init__` takes `contextvars.copy_context()` and every `__step` runs
+/// as `self._context.run(self.__step)`, so a `ContextVar.set` in one task is
+/// invisible to its siblings and to the code that created it.
+pub struct TaskContext(Py<PyAny>);
+
+// The `contextvars` C API (`Include/cpython/context.h`, public since 3.7).
+// pyo3 leaves it out of the `abi3` bindings; libpython exports it in every
+// build this crate links.
+extern "C" {
+    fn PyContext_CopyCurrent() -> *mut pyo3::ffi::PyObject;
+    fn PyContext_Enter(ctx: *mut pyo3::ffi::PyObject) -> std::os::raw::c_int;
+    fn PyContext_Exit(ctx: *mut pyo3::ffi::PyObject) -> std::os::raw::c_int;
+}
+
+impl TaskContext {
+    /// A copy of the running CPython context, or `None` while the interpreter
+    /// has not started (no `ContextVar` can exist yet).
+    pub fn copy_current() -> Option<TaskContext> {
+        if !INTERPRETER_STARTED.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        Python::attach(|py| {
+            // SAFETY: the GIL is held; a NULL result is an error we drop.
+            let ctx = unsafe { PyContext_CopyCurrent() };
+            if ctx.is_null() {
+                pyo3::PyErr::take(py);
+                return None;
+            }
+            // SAFETY: `PyContext_CopyCurrent` returns a new reference.
+            Some(TaskContext(
+                unsafe { Bound::from_owned_ptr(py, ctx) }.unbind(),
+            ))
+        })
+    }
+
+    /// Run `f` with this context entered (`PyContext_Enter`/`PyContext_Exit`),
+    /// as `Context.run` does. A context that cannot be entered (already
+    /// entered) leaves `f` running in the current one.
+    pub fn run<T>(&self, f: impl FnOnce() -> T) -> T {
+        // SAFETY: the GIL is held for each call; the context is a live object.
+        let entered = Python::attach(|py| {
+            let ok = unsafe { PyContext_Enter(self.0.as_ptr()) } == 0;
+            if !ok {
+                pyo3::PyErr::take(py);
+            }
+            ok
+        });
+        let result = f();
+        if entered {
+            Python::attach(|py| {
+                if unsafe { PyContext_Exit(self.0.as_ptr()) } != 0 {
+                    pyo3::PyErr::take(py);
+                }
+            });
+        }
+        result
+    }
+}
