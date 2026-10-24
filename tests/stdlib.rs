@@ -12,15 +12,14 @@
 
 use pythonrs::{eval_str, host};
 
-/// Run `src`, then return the `repr` of global `name`.
+/// Run `src`, then return the `repr` of global `name`, as `repr()` computes it
+/// (a vendored pure-Python class such as `collections.Counter` reprs through
+/// its own `__repr__`).
 fn g(src: &str, name: &str) -> String {
     eval_str(src).expect("program should run without error");
-    host::with_host(|h| {
-        let v = h
-            .read_global(name)
-            .unwrap_or_else(|| panic!("global {name} unbound"));
-        h.repr_of(&v)
-    })
+    let v = host::with_host(|h| h.read_global(name))
+        .unwrap_or_else(|| panic!("global {name} unbound"));
+    pythonrs::builtins::py_repr(&v).expect("repr should succeed")
 }
 
 /// The `TypeError` message for running `src` (which must fail).
