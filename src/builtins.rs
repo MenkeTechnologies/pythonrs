@@ -1011,9 +1011,17 @@ fn subscript_store(recv: &Value, idx: Value, val: Value) -> Result<(), String> {
     if let Some(id) = with_host(|h| h.foreign_id(&recv)) {
         return crate::ffi::set_item_released(id, &idx, &val);
     }
-    let cands = host::instance_key_candidates_for(&recv, Some(&idx));
+    // A `dict` subclass instance stores into its payload dict, whose existing
+    // user-hashed keys are the candidates the new key may equal.
+    let target = with_host(|h| match h.get(&recv) {
+        Some(PyObj::Instance(i)) if matches!(h.get(&i.payload), Some(PyObj::Dict(_))) => {
+            i.payload.clone()
+        }
+        _ => recv.clone(),
+    });
+    let cands = host::instance_key_candidates_for(&target, Some(&idx));
     host::with_instance_key(&idx, host::KeyRole::Of(&recv), &cands, || {
-        with_host(|h| h.set_item(&recv, &idx, val.clone()))
+        with_host(|h| h.set_item(&target, &idx, val.clone()))
     })
 }
 
@@ -2639,7 +2647,7 @@ pub fn contains_value(container: Value, item: Value) -> Result<bool, String> {
         // A builtin-type subclass without `__contains__` tests membership on its
         // native payload (`x in Stack([...])`).
         if let Some(payload) = host::subclass_payload(&container, "__contains__") {
-            return with_host(|h| h.contains(&item, &payload));
+            return contains_value(payload, item);
         }
         let has_contains = with_host(|h| match h.get(&container) {
             Some(PyObj::Instance(i)) => h.class_lookup(&i.class, "__contains__").is_some(),
@@ -3288,8 +3296,7 @@ fn try_binop_dunder(
     }
     // A builtin-type subclass operand with no override delegates to its native
     // payload (`S1 | S2` of set subclasses runs native set union, etc.).
-    let a_owned = host::subclass_operand(a, lname);
-    let b_owned = host::subclass_operand(b, rname);
+    let (a_owned, b_owned) = host::subclass_operands(a, lname, b, rname);
     let a = &a_owned;
     let b = &b_owned;
     let involved = with_host(|h| {
@@ -3464,7 +3471,7 @@ fn b_binop(vm: &mut VM, _: u8) -> Value {
     // A builtin-type subclass operand with no override delegates to its native
     // payload, so the native op runs on the base value (`S1 | S2`, `C(5) // 2`).
     let (a, b) = match binop_tag_dunders(tag) {
-        Some((l, r)) => (host::subclass_operand(&a, l), host::subclass_operand(&b, r)),
+        Some((l, r)) => host::subclass_operands(&a, l, &b, r),
         None => (a, b),
     };
     // The right operand of `fmt % arg` is a format ARGUMENT, not an operand: a
@@ -5749,6 +5756,21 @@ fn new_object_result(v: Value) -> Value {
     }
 }
 
+/// After every user dunder declined (`NotImplemented`), the operator a
+/// builtin-subclass operand inherits from its base type: `op` run natively on
+/// the operands' payloads (`Counter(a=1) == {'a': 1}` is `dict.__eq__`'s
+/// answer). `None` when no operand is such an instance.
+fn base_payload_retry(op: NumOp, a: &Value, b: &Value) -> Option<Result<Value, String>> {
+    let payload = |v: &Value| with_host(|h| h.base_payload_any(v));
+    let (p, q) = (payload(a), payload(b));
+    if p.is_none() && q.is_none() {
+        return None;
+    }
+    let p = p.unwrap_or_else(|| a.clone());
+    let q = q.unwrap_or_else(|| b.clone());
+    Some(numeric_hook_inner(op, &p, &q))
+}
+
 fn numeric_hook_inner(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
     use NumOp::*;
     if let Some(r) = deque_subclass_op(op, a, b) {
@@ -5761,16 +5783,7 @@ fn numeric_hook_inner(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> 
         Neg => ("__neg__", ""),
         _ => numop_dunders(op).unwrap_or(("", "")),
     };
-    let a_owned = if fwd.is_empty() {
-        a.clone()
-    } else {
-        host::subclass_operand(a, fwd)
-    };
-    let b_owned = if refl.is_empty() {
-        b.clone()
-    } else {
-        host::subclass_operand(b, refl)
-    };
+    let (a_owned, b_owned) = host::subclass_operands(a, fwd, b, refl);
     let a = &a_owned;
     let b = &b_owned;
     // Counter `+` / `-` — multiset ops keeping positive counts, only when both
@@ -5841,7 +5854,9 @@ fn numeric_hook_inner(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> 
         Eq => match dispatch_binop(a, b, "__eq__", "__eq__") {
             Dunder::Value(v) => Ok(v),
             Dunder::Err(e) => Err(e),
-            Dunder::NotImplemented => Ok(Value::Bool(identity_eq(a, b))),
+            Dunder::NotImplemented => {
+                base_payload_retry(op, a, b).unwrap_or_else(|| Ok(Value::Bool(identity_eq(a, b))))
+            }
         },
         Ne => match dispatch_binop(a, b, "__ne__", "__ne__") {
             Dunder::Value(v) => Ok(v),
@@ -5850,7 +5865,8 @@ fn numeric_hook_inner(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> 
             Dunder::NotImplemented => match dispatch_binop(a, b, "__eq__", "__eq__") {
                 Dunder::Value(v) => Ok(Value::Bool(!with_host(|h| h.truthy(&v)))),
                 Dunder::Err(e) => Err(e),
-                Dunder::NotImplemented => Ok(Value::Bool(!identity_eq(a, b))),
+                Dunder::NotImplemented => base_payload_retry(op, a, b)
+                    .unwrap_or_else(|| Ok(Value::Bool(!identity_eq(a, b)))),
             },
         },
         Lt | Le | Gt | Ge => {
@@ -5877,6 +5893,9 @@ fn numeric_hook_inner(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> 
                         if !matches!(&res, Ok(v) if is_not_implemented(v)) {
                             return res;
                         }
+                    }
+                    if let Some(Ok(v)) = base_payload_retry(op, a, b) {
+                        return Ok(v);
                     }
                     let sym = match op {
                         Lt => "<",
@@ -5928,8 +5947,11 @@ fn numeric_hook_inner(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> 
             match dispatch_arith(a, b, l, r) {
                 Dunder::Value(v) => Ok(v),
                 Dunder::Err(e) => Err(e),
-                Dunder::NotImplemented => Err(sequence_op_error(op, a, b)
-                    .unwrap_or_else(|| unsupported_operand(binop_symbol(l), a, b))),
+                Dunder::NotImplemented => match base_payload_retry(op, a, b) {
+                    Some(Ok(v)) => Ok(v),
+                    _ => Err(sequence_op_error(op, a, b)
+                        .unwrap_or_else(|| unsupported_operand(binop_symbol(l), a, b))),
+                },
             }
         }
     }
@@ -6080,6 +6102,9 @@ pub fn is_type_like_builtin(name: &str) -> bool {
 /// would defeat the point of the shared table.
 pub fn shadows_builtin_type(name: &str) -> bool {
     is_type_like_builtin(name)
+        // `collections/__init__.py` defines a pure-Python `OrderedDict` (and the
+        // others) before replacing it with `_collections`' native type.
+        || matches!(name, "deque" | "defaultdict" | "OrderedDict")
         || matches!(
             name,
             "property"
@@ -18964,6 +18989,20 @@ pub fn call_type_method(
     }
     if let Some(r) = context_var_method(recv, name, &args) {
         return r;
+    }
+    // `frame.clear()` (`frame_clear`): an executing frame refuses; a finished
+    // one has nothing captured to drop.
+    if name == "clear" {
+        if let Some(index) = with_host(|h| match h.get(recv) {
+            Some(PyObj::PyFrame { index, .. }) => Some(*index),
+            _ => None,
+        }) {
+            let executing = with_host(|h| index.is_some_and(|i| i < h.frame_depth()));
+            if executing {
+                return Err("RuntimeError: cannot clear an executing frame".to_string());
+            }
+            return Ok(Value::Undef);
+        }
     }
     if let Some(r) = with_host(|h| crate::stdlib::pystruct::struct_method(h, recv, name, &args)) {
         return r;

@@ -9,6 +9,29 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **Builtin-subclass operands reach user operator methods as themselves.**
+  A `dict`/`list`/`set` subclass operand whose class did not define the
+  reflected dunder was replaced by its payload before the other side's user
+  method ran, so the vendored `Counter.__add__` saw a plain `dict` and
+  `Counter(a=1) + Counter(a=1)` was `unsupported operand type(s)`. When every
+  user method declines, the base type's operator now answers on the payloads
+  (`Counter(a=1) == {'a': 1}` is `True`, as `dict.__eq__` makes it).
+- **User-hashed keys on a `dict` subclass.** `d[P()] = 1`, `d[P()]`,
+  `P() in d` and `del d[P()]` on a `dict` subclass raised `cannot use 'P' as a
+  dict key (unhashable type: 'P')`: the key's `__hash__`/`__eq__` were never
+  resolved against the payload, which broke the vendored `Counter` over
+  user objects.
+- **The native build's `collections` types are the ones it exports.**
+  `collections/__init__.py` defines a pure-Python `OrderedDict` before
+  replacing it with `_collections.OrderedDict`; the class claimed the name, so
+  `type(OrderedDict()) is OrderedDict` was `False` and `OrderedDict(o)` copied
+  into the pure class.
+- **`_csv.writer.writerow` read as an attribute** (`w.writerow`, as the
+  vendored `csv.DictWriter` does) is the bound method; it was an
+  `AttributeError` in the native build.
+- **`frame.clear()`** exists: an executing frame raises `RuntimeError: cannot
+  clear an executing frame`, a finished one returns `None`. Its absence made
+  every `assertRaises` an error in the native build's `unittest`.
 - **`ImportError` has its members, and `from M import x` raises it for every
   module.** `from os import nope` (and `typing`, `datetime`, `subprocess`,
   `pathlib` — every module the bridge serves from CPython) raised the

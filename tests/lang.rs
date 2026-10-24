@@ -11112,3 +11112,61 @@ sys.set_int_max_str_digits(4300)
          'Exceeds the limit (1000 digits', 'Exceeds the limit (1000 digits']"
     );
 }
+
+/// A builtin-subclass operand reaches a user operator method as itself, not
+/// as its payload (`Counter.__add__` tests `isinstance(other, Counter)`); when
+/// every user method declines, the base type's operator answers
+/// (`Counter(a=1) == {'a': 1}` is `dict.__eq__`'s). A user-hashed key stores,
+/// reads, tests and deletes on a `dict` subclass as on a `dict`. Expected
+/// values are CPython 3.14's.
+#[test]
+fn builtin_subclass_operands_and_user_keys() {
+    let src = r#"
+class C(dict):
+    def __add__(self, o):
+        if not isinstance(o, C):
+            return NotImplemented
+        return 'C+C'
+    def __eq__(self, o):
+        if not isinstance(o, C):
+            return NotImplemented
+        return 'C==C'
+class P:
+    def __eq__(s, o): return isinstance(o, P)
+    def __hash__(s): return 7
+class D(dict): pass
+d = D()
+d[P()] = 1
+d[P()] = 2
+out = [C(a=1) + C(), C(a=1) == C(), C(a=1) == {'a': 1}, C(a=1) != {'a': 1}, C(a=1) == {'a': 2},
+       len(d), d[P()], P() in d, d.get(P())]
+del d[P()]
+out.append(len(d))
+try:
+    C() + {}
+except TypeError as e:
+    out.append(str(e))
+"#;
+    assert_eq!(
+        g(src, "out"),
+        "['C+C', 'C==C', True, False, False, 1, 2, True, 2, 0, \
+         \"unsupported operand type(s) for +: 'C' and 'dict'\"]"
+    );
+}
+
+/// `frame.clear()`: an executing frame refuses, a finished one returns `None`
+/// (`unittest`'s `assertRaises` clears the frames of the traceback it caught).
+#[test]
+fn frame_clear_refuses_an_executing_frame() {
+    let src = r#"
+import sys
+def finished():
+    return sys._getframe()
+out = [finished().clear()]
+try:
+    sys._getframe().clear()
+except RuntimeError as e:
+    out.append(str(e))
+"#;
+    assert_eq!(g(src, "out"), "[None, 'cannot clear an executing frame']");
+}

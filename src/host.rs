@@ -15053,6 +15053,15 @@ impl PyHost {
                         Some(i) if i > 0 => Ok(self.frame_object_at(i - 1)),
                         _ => Ok(Value::Undef),
                     },
+                    // `frame.clear()`: a finished frame's locals are dropped (none
+                    // are captured here); an executing one refuses.
+                    "clear" => {
+                        let func = self.alloc(PyObj::Builtin("clear".to_string()));
+                        Ok(self.alloc(PyObj::BoundMethod {
+                            recv: recv.clone(),
+                            func,
+                        }))
+                    }
                     _ => Err(format!(
                         "AttributeError: 'frame' object has no attribute '{name}'"
                     )),
@@ -17901,6 +17910,35 @@ pub fn subclass_operand(v: &Value, dunder: &str) -> Value {
     })
 }
 
+/// Both operands of a binary operator through [`subclass_operand`], unless
+/// either one's class overrides its side of the operator: then that user
+/// method runs and receives the other operand as itself (`Counter.__add__`
+/// tests `isinstance(other, Counter)`), not its native payload.
+pub fn subclass_operands(a: &Value, fwd: &str, b: &Value, refl: &str) -> (Value, Value) {
+    let overrides = |v: &Value, dunder: &str| {
+        !dunder.is_empty()
+            && is_heap(v)
+            && with_host(|h| match h.get(v) {
+                Some(PyObj::Instance(i)) => h.class_lookup(&i.class, dunder).is_some(),
+                _ => false,
+            })
+    };
+    if overrides(a, fwd) || overrides(b, refl) {
+        return (a.clone(), b.clone());
+    }
+    let a = if fwd.is_empty() {
+        a.clone()
+    } else {
+        subclass_operand(a, fwd)
+    };
+    let b = if refl.is_empty() {
+        b.clone()
+    } else {
+        subclass_operand(b, refl)
+    };
+    (a, b)
+}
+
 /// The `collections` base and native payload of a user subclass instance
 /// (`class Q(deque)`), or `None` for anything else.
 pub fn collections_subclass_of(v: &Value) -> Option<(&'static str, Value, String)> {
@@ -17945,6 +17983,19 @@ pub fn collections_subclass_copy(v: &Value) -> Option<Result<Value, String>> {
 /// native payload. Container/value dunders route to the native heap ops; named
 /// methods (`append`, `upper`, `keys`, …) route to [`call_type_method`]. `recv`
 /// is the full instance (needed for a `dict` subclass `__missing__` hook).
+/// `op` on a builtin-subclass payload keyed by `key`, with the key's user
+/// `__hash__`/`__eq__` resolved first against the payload's own keys, as a
+/// store or lookup on the base container itself is (`with_instance_key`).
+fn payload_key_op<R>(
+    recv: &Value,
+    payload: &Value,
+    key: &Value,
+    op: impl FnOnce() -> Result<R, String>,
+) -> Result<R, String> {
+    let cands = instance_key_candidates_for(payload, Some(key));
+    with_instance_key(key, KeyRole::Of(recv), &cands, op)
+}
+
 pub(crate) fn base_dispatch(
     recv: &Value,
     payload: &Value,
@@ -17976,10 +18027,14 @@ pub(crate) fn base_dispatch(
                     "collections.Counter" | "collections.OrderedDict" | "collections.defaultdict"
                 );
             if mapping {
-                let missing = with_host(|h| match h.to_key(&idx) {
-                    Ok(k) => matches!(h.get(payload), Some(PyObj::Dict(d)) if !d.contains_key(&k)),
-                    Err(_) => false,
-                });
+                let missing = payload_key_op(recv, payload, &idx, || {
+                    Ok(with_host(|h| match h.to_key(&idx) {
+                        Ok(k) => {
+                            matches!(h.get(payload), Some(PyObj::Dict(d)) if !d.contains_key(&k))
+                        }
+                        Err(_) => false,
+                    }))
+                })?;
                 if missing {
                     let cls = with_host(|h| match h.get(recv) {
                         Some(PyObj::Instance(i)) => i.class.clone(),
@@ -17995,21 +18050,32 @@ pub(crate) fn base_dispatch(
             if base.starts_with("collections.") {
                 return crate::builtins::getitem_value(payload.clone(), idx);
             }
-            with_host(|h| h.get_item(payload, &idx))
+            payload_key_op(recv, payload, &idx, || {
+                with_host(|h| h.get_item(payload, &idx))
+            })
         }
         "__setitem__" => {
             let mut it = args.into_iter();
             let idx = it.next().unwrap_or(Value::Undef);
             let val = it.next().unwrap_or(Value::Undef);
-            with_host(|h| h.set_item(payload, &idx, val)).map(|_| Value::Undef)
+            payload_key_op(recv, payload, &idx, || {
+                with_host(|h| h.set_item(payload, &idx, val.clone()))
+            })
+            .map(|_| Value::Undef)
         }
         "__delitem__" => {
             let idx = args.into_iter().next().unwrap_or(Value::Undef);
-            with_host(|h| h.del_item(payload, &idx)).map(|_| Value::Undef)
+            payload_key_op(recv, payload, &idx, || {
+                with_host(|h| h.del_item(payload, &idx))
+            })
+            .map(|_| Value::Undef)
         }
         "__contains__" => {
             let item = args.into_iter().next().unwrap_or(Value::Undef);
-            Ok(Value::Bool(with_host(|h| h.contains(&item, payload))?))
+            payload_key_op(recv, payload, &item, || {
+                with_host(|h| h.contains(&item, payload))
+            })
+            .map(Value::Bool)
         }
         "__iter__" => with_host(|h| h.make_iter(payload)),
         "__repr__" | "__str__" => {

@@ -520,6 +520,15 @@ pub fn attr(h: &mut PyHost, recv: &Value, name: &str) -> Option<Result<Value, St
                 let d = (**dialect).clone();
                 return Some(Ok(h.alloc(PyObj::CsvDialect(Box::new(d)))));
             }
+            // `w.writerow` read as an attribute: the bound method, which
+            // `call_type_method` runs through [`write_rows`].
+            if matches!(name, "writerow" | "writerows") {
+                let func = h.alloc(PyObj::Builtin(name.to_string()));
+                return Some(Ok(h.alloc(PyObj::BoundMethod {
+                    recv: recv.clone(),
+                    func,
+                })));
+            }
             (**dialect).clone()
         }
         _ => return None,
