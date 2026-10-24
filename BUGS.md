@@ -9,6 +9,11 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **Development mode and `sys.warnoptions`.** `-X dev` (or a non-empty
+  `PYTHONDEVMODE`) sets `sys.flags.dev_mode` (a `bool`, as `safe_path` is;
+  both were `0`), puts `default` first in `sys.warnoptions` and reaches the
+  embedded interpreter. `sys.warnoptions` was always empty, and `-W` replaced
+  `PYTHONWARNINGS` instead of following its items.
 - **Operator errors name a builtin-subclass operand as written.** `[1] +
   D()` for a `dict` subclass read `can only concatenate list (not "dict")`,
   and `L([1]) + (1,)` for a `list` subclass used the generic message; they are
@@ -95,8 +100,8 @@ written.
   sets the limit after `PYTHONINTMAXSTRDIGITS` as
   `config_init_int_max_str_digits` reads it — the first such option, a whole
   `wcstol` of the value (empty is `0`) — with its pre-initialization fatal
-  error for a refused value. Other options (`-X dev`, `-X utf8`, …) only
-  appear in `sys._xoptions`; `sys.flags.dev_mode` stays `False`.
+  error for a refused value. Other options (`-X utf8`, …) only appear in
+  `sys._xoptions`.
 - **An uncaught exception's traceback is coloured.** CPython 3.13+ prints it
   through `sys.excepthook` with `colorize=_colorize.can_colorize(file=
   sys.stderr)`; pythonrs never coloured. The report (and a compile error) now

@@ -69,8 +69,14 @@ fn run_main() -> ExitCode {
     if cli.unbuffered {
         std::env::set_var("PYTHONUNBUFFERED", "1");
     }
+    // `-W` options follow the `PYTHONWARNINGS` items (`config_init_warnoptions`).
     if !cli.warnings.is_empty() {
-        std::env::set_var("PYTHONWARNINGS", cli.warnings.join(","));
+        let w = cli.warnings.join(",");
+        let all = match std::env::var("PYTHONWARNINGS") {
+            Ok(env) if !env.is_empty() => format!("{env},{w}"),
+            _ => w,
+        };
+        std::env::set_var("PYTHONWARNINGS", all);
     }
     // `-X` is read in pre-initialization too, after the environment.
     if let Err(msg) = pythonrs::host::set_xoptions(cli.xoptions.clone()) {
@@ -79,6 +85,10 @@ fn run_main() -> ExitCode {
              Python runtime state: preinitialized\n"
         );
         return ExitCode::FAILURE;
+    }
+    // Development mode reaches the embedded interpreter as `PYTHONDEVMODE`.
+    if pythonrs::host::dev_mode() {
+        std::env::set_var("PYTHONDEVMODE", "1");
     }
     // `-O`/`-OO` are the CLI spelling of `PYTHONOPTIMIZE`; folding them into the
     // env var gives `__debug__` and the embedded interpreter one source of truth.

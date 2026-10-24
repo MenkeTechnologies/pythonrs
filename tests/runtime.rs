@@ -1737,3 +1737,26 @@ fn the_bridge_converts_with_the_same_int_max_str_digits() {
         "stderr={stderr}"
     );
 }
+
+/// `-X dev` (or `PYTHONDEVMODE`) is development mode: `sys.flags.dev_mode` is
+/// `True` and `sys.warnoptions` starts with `default`; the `-W` options follow
+/// the `PYTHONWARNINGS` items, and the filters are built from them in that
+/// order. Expected output is python3.14's.
+#[test]
+fn dev_mode_and_warnoptions_follow_the_command_line() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_python"))
+        .args(["-X", "dev", "-W", "error", "-c"])
+        .arg("import sys, warnings; print(sys.flags.dev_mode, sys.flags.safe_path, sys.warnoptions, \
+              [f[0] for f in warnings.filters[:4]])")
+        .env("PYTHONWARNINGS", "ignore::UserWarning,always")
+        .env_remove("PYTHONDEVMODE")
+        .output()
+        .expect("spawn python");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "True False ['default', 'ignore::UserWarning', 'always', 'error'] \
+         ['error', 'always', 'ignore', 'default']\n",
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

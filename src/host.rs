@@ -2115,6 +2115,27 @@ pub fn xoptions() -> Vec<(String, Option<String>)> {
     out
 }
 
+/// Development mode (`-X dev`, or a non-empty `PYTHONDEVMODE`).
+pub fn dev_mode() -> bool {
+    XOPTIONS
+        .get()
+        .is_some_and(|opts| first_xoption("dev", opts).is_some())
+        || std::env::var_os("PYTHONDEVMODE").is_some_and(|v| !v.is_empty())
+}
+
+/// `sys.warnoptions`: `default` in development mode, then the
+/// `PYTHONWARNINGS` items (the `-W` options are appended to it at start-up).
+pub fn warnoptions() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if dev_mode() {
+        out.push("default".to_string());
+    }
+    if let Ok(env) = std::env::var("PYTHONWARNINGS") {
+        out.extend(env.split(',').filter(|s| !s.is_empty()).map(str::to_string));
+    }
+    out
+}
+
 /// The limit an interpreter starts with: `PYTHONINTMAXSTRDIGITS`, then an
 /// `-X int_max_str_digits` over it, else the default.
 fn initial_int_max_str_digits() -> usize {
@@ -25568,9 +25589,7 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                     ("quiet", 0),
                     ("hash_randomization", 0),
                     ("isolated", 0),
-                    ("dev_mode", 0),
                     ("utf8_mode", 0),
-                    ("safe_path", 0),
                     ("int_max_str_digits", int_max_str_digits() as i64),
                     ("warn_default_encoding", 0),
                     ("gil", 1),
@@ -25579,6 +25598,8 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                 ] {
                     a.insert(k.to_string(), Value::Int(v));
                 }
+                a.insert("dev_mode".to_string(), Value::Bool(dev_mode()));
+                a.insert("safe_path".to_string(), Value::Bool(false));
                 let flags = h.alloc(PyObj::Namespace { attrs: a });
                 h.sys_flags.push(flags.clone());
                 flags
@@ -25803,7 +25824,10 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
                 // not just the flag it happens to read. Values reflect how this
                 // runtime actually behaves: no -O, no -B, no isolation.
                 ("flags", flags),
-                ("warnoptions", h.new_list(Vec::new())),
+                ("warnoptions", {
+                    let opts = warnoptions().into_iter().map(|o| h.new_str(o)).collect();
+                    h.new_list(opts)
+                }),
                 ("_xoptions", {
                     let mut map = DictMap::default();
                     for (k, v) in xoptions() {
