@@ -596,7 +596,8 @@ fn dunder_debug_is_bound_in_every_scope() {
 
 /// CPython's `Did you mean: 'x'?` hint on an uncaught `NameError`/
 /// `AttributeError`. Every expectation is CPython 3.14.6's, byte-checked
-/// against `python3` on the same program.
+/// against `python3` on the same program, except the `AttributeError` hint's
+/// wording, which is 3.15.0's.
 #[test]
 fn did_you_mean_suggestions() {
     // A module global, a frame-slotted function local, and a builtin.
@@ -624,16 +625,16 @@ fn did_you_mean_suggestions() {
     // raises before the arguments run), and a builtin type.
     assert!(
         traceback_of("class C:\n    def __init__(s):\n        s.value = 1\nC().valu\n").ends_with(
-            "AttributeError: 'C' object has no attribute 'valu'. Did you mean: 'value'?\n"
+            "AttributeError: 'C' object has no attribute 'valu'. Did you mean '.value' instead of '.valu'?\n"
         )
     );
     assert!(
         traceback_of("class C:\n    def total(s):\n        return 1\nC().totl()\n").ends_with(
-            "AttributeError: 'C' object has no attribute 'totl'. Did you mean: 'total'?\n"
+            "AttributeError: 'C' object has no attribute 'totl'. Did you mean '.total' instead of '.totl'?\n"
         )
     );
     assert!(traceback_of("x = [1]\nx.appendd(2)\n").ends_with(
-        "AttributeError: 'list' object has no attribute 'appendd'. Did you mean: 'append'?\n"
+        "AttributeError: 'list' object has no attribute 'appendd'. Did you mean '.append' instead of '.appendd'?\n"
     ));
     // Nothing close enough gets no hint at all.
     assert!(traceback_of("value = 1\nqqqqqqqqqq\n")
@@ -664,6 +665,82 @@ fn did_you_mean_suggestions() {
         ),
         "\"'list' object has no attribute 'appendd'\""
     );
+}
+
+/// The hints 3.15's `TracebackException` appends that 3.14's did not, or
+/// worded differently: an `AttributeError` near miss names both attributes;
+/// a name from another language, or a mutating method on an immutable type,
+/// gets `_CROSS_LANGUAGE_HINTS`' advice (checked with `isinstance`, so a
+/// `list` subclass gets it too) instead of a near miss; a non-ASCII
+/// suggestion is followed by its `ascii()` spelling; and a `from M import x`
+/// miss is an `ImportError` whose candidates are `M`'s public names (private
+/// ones too when `x` is private). Every expectation is CPython 3.15.0's,
+/// byte-checked against `python3` on the same program.
+#[test]
+fn traceback_hints_follow_3_15() {
+    let last_line = |src: &str| {
+        let tb = traceback_of(src);
+        tb.lines().last().expect("a final line").to_string()
+    };
+    let cases = [
+        (
+            "from sys import exitt\n",
+            "ImportError: cannot import name 'exitt' from 'sys' (unknown location). Did you mean: 'exit'?",
+        ),
+        (
+            "from sys import _getframee\n",
+            "ImportError: cannot import name '_getframee' from 'sys' (unknown location). Did you mean: '_getframe'?",
+        ),
+        (
+            "from sys import qqqqqqqq\n",
+            "ImportError: cannot import name 'qqqqqqqq' from 'sys' (unknown location)",
+        ),
+        (
+            "[1].push(2)\n",
+            "AttributeError: 'list' object has no attribute 'push'. Did you mean '.append'?",
+        ),
+        (
+            "[1].contains(2)\n",
+            "AttributeError: 'list' object has no attribute 'contains'. Use 'x in list'.",
+        ),
+        (
+            "frozenset().add(1)\n",
+            "AttributeError: 'frozenset' object has no attribute 'add'. Did you mean to use a 'set' object?",
+        ),
+        (
+            "(1, 2).append(3)\n",
+            "AttributeError: 'tuple' object has no attribute 'append'. Did you mean to use a 'list' object?",
+        ),
+        (
+            "{}.put(1, 2)\n",
+            "AttributeError: 'dict' object has no attribute 'put'. Use d[k] = v.",
+        ),
+        (
+            "(1.5).__or__\n",
+            "AttributeError: 'float' object has no attribute '__or__'. Did you mean to use an 'int' object? \
+             Bitwise operators are not supported by 'float'.",
+        ),
+        (
+            "class L(list): pass\nL().push(1)\n",
+            "AttributeError: 'L' object has no attribute 'push'. Did you mean '.append'?",
+        ),
+        (
+            "import collections\ncollections.OrderedDictt\n",
+            "AttributeError: module 'collections' has no attribute 'OrderedDictt'. \
+             Did you mean '.OrderedDict' instead of '.OrderedDictt'?",
+        ),
+        (
+            "café = 1\nprint(cafe)\n",
+            r"NameError: name 'cafe' is not defined. Did you mean: 'café' ('caf\xe9')?",
+        ),
+        (
+            "class C:\n    naïve = 1\nC().naive\n",
+            r"AttributeError: 'C' object has no attribute 'naive'. Did you mean '.naïve' ('na\xefve') instead of '.naive' ('naive')?",
+        ),
+    ];
+    for (src, want) in cases {
+        assert_eq!(last_line(src), want, "for {src:?}");
+    }
 }
 
 #[test]

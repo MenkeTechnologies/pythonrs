@@ -9,6 +9,38 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **`ImportError` has its members, and `from M import x` raises it for every
+  module.** `from os import nope` (and `typing`, `datetime`, `subprocess`,
+  `pathlib` — every module the bridge serves from CPython) raised the
+  attribute read's `AttributeError`, so `try: from typing import X` /
+  `except ImportError:` let it escape; and `e.name`, `e.path`, `e.name_from`
+  and `e.msg` raised `AttributeError` on every `ImportError`, constructed or
+  raised by an import. `ImportError_init` / `_str` / `_repr` / `_getstate`
+  are ported: the keywords set the members (an unset one reads `None` and is
+  left out of `repr` and `__reduce__`; an explicit `None` counts as set),
+  `msg` is the sole argument and is what `str` shows, and a bad keyword is
+  refused under the `ImportError()` name. A failed `from M import x` reads
+  `cannot import name 'x' from 'M' (<M.__file__>)` — `(unknown location)`
+  and `path=None` for a module with no file — with `name`/`name_from`/`path`
+  set; a missing module's `ModuleNotFoundError` has `name`. The members cross
+  the bridge in both directions (`pickle` round-trips them).
+- **3.15's traceback hints.** An `AttributeError` near miss now reads
+  `Did you mean '.value' instead of '.valu'?`; `_CROSS_LANGUAGE_HINTS` is
+  ported (`[].push` → `Did you mean '.append'?`, `(1, 2).append` →
+  `Did you mean to use a 'list' object?`, `{}.put` → `Use d[k] = v.`, float
+  bitwise dunders), tried first and matched with `isinstance`; a non-ASCII
+  suggestion is followed by its `ascii()` spelling (`'café' ('caf\xe9')`);
+  and a `from M import x` miss suggests from `M`'s names
+  (`ImportError: … Did you mean: 'exit'?`).
+  Still open against 3.15: a `ModuleNotFoundError` gets no
+  `Did you mean: 'json'?` (3.15 asks each `sys.meta_path` finder's
+  `discover()`); the nested-attribute hint (`Did you mean '.inner.foo'
+  instead of '.foo'?`, `_check_for_nested_attribute`) is not ported; the
+  `frozendict` builtin does not exist, so its hints never fire; a user
+  subclass of `ImportError` (likewise `AttributeError`/`NameError`) ignores
+  the keywords (`class E(ImportError): pass; E('x', name='n').name` is
+  `None`); a binary operation spanning lines carets only its first line
+  (`z = (x +` / `y)` — CPython carets both lines and shows the second).
 - **An uncaught exception's traceback is coloured.** CPython 3.13+ prints it
   through `sys.excepthook` with `colorize=_colorize.can_colorize(file=
   sys.stderr)`; pythonrs never coloured. The report (and a compile error) now
@@ -2334,7 +2366,8 @@ written.
   handling of the above exception …"); `raise X from None` sets
   `__suppress_context__`, hiding the implicit context. Each chained exception's
   frames are captured (`__traceback__`) at the point it is caught.
-- **`Did you mean: 'x'?` on an uncaught `NameError`/`AttributeError`.** A port of
+- **`Did you mean: 'x'?` on an uncaught `NameError`/`AttributeError`** (3.15 words
+  the `AttributeError` form `Did you mean '.x' instead of '.y'?`, see above). A port of
   `Python/suggestions.c`'s `_Py_CalculateSuggestions` — which is what CPython
   3.13+ actually runs, and which disagrees with `traceback.py`'s pure-Python
   fallback (the fallback seeds its running best with `len(wrong_name)`, so `st`

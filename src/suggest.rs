@@ -122,12 +122,134 @@ pub fn closest(candidates: &[String], wrong: &str) -> Option<String> {
     suggestion.cloned()
 }
 
+/// The hint `TracebackException.__init__` (3.15) appends to an exception's
+/// final line.
+pub enum Hint {
+    /// A `NameError` or `ImportError` near miss: `. Did you mean: 'x'?`.
+    Name(String),
+    /// An `AttributeError` near miss, which names both attributes:
+    /// `. Did you mean '.x' instead of '.y'?`.
+    Attr { suggestion: String, wrong: String },
+    /// A cross-language or wrong-type hint, already worded
+    /// ([`cross_language_hint`]); appended as `. <hint>`.
+    Raw(String),
+}
+
+/// `f"'{s}' ({s!a})"`: a name that may not be typeable, beside its
+/// escaped spelling.
+fn escaped(s: &str, prefix: &str) -> String {
+    let ascii = crate::host::ascii_of(&crate::host::quote_str(s));
+    format!("'{prefix}{s}' ({ascii})")
+}
+
 /// Append CPython's hint to a terse `Type: message` line, or return it as is.
-pub fn with_hint(line: &str, suggestion: Option<String>) -> String {
-    match suggestion {
-        Some(s) => format!("{line}. Did you mean: '{s}'?"),
+pub fn with_hint(line: &str, hint: Option<Hint>) -> String {
+    match hint {
+        Some(Hint::Name(s)) if s.is_ascii() => format!("{line}. Did you mean: '{s}'?"),
+        Some(Hint::Name(s)) => format!("{line}. Did you mean: {}?", escaped(&s, "")),
+        // Only the suggestion's ASCII-ness picks the form, as in `traceback`.
+        Some(Hint::Attr { suggestion, wrong }) if suggestion.is_ascii() => {
+            format!("{line}. Did you mean '.{suggestion}' instead of '.{wrong}'?")
+        }
+        Some(Hint::Attr { suggestion, wrong }) => format!(
+            "{line}. Did you mean {} instead of {}?",
+            escaped(&suggestion, "."),
+            escaped(&wrong, ".")
+        ),
+        Some(Hint::Raw(hint)) => format!("{line}. {hint}"),
         None => line.to_string(),
     }
+}
+
+/// `traceback._CROSS_LANGUAGE_HINTS` (3.15): attribute names that come from
+/// another language, or mutate an immutable type, mapped to the type they are
+/// recognised on and the hint — the Python name to use (`raw == false`,
+/// shown as `Did you mean '.x'?`) or a whole sentence (`raw == true`). A name
+/// may be listed for several types; the first one the object is an instance
+/// of wins.
+const CROSS_LANGUAGE_HINTS: &[(&str, &[(&str, &str, bool)])] = &[
+    // list -- JavaScript/Ruby equivalents
+    ("push", &[("list", "append", false)]),
+    ("concat", &[("list", "extend", false)]),
+    // list -- Java/C# equivalents
+    ("addAll", &[("list", "extend", false)]),
+    ("contains", &[("list", "Use 'x in list'.", true)]),
+    // list -- wrong-type suggestion (user expected a set)
+    (
+        "add",
+        &[
+            ("list", "Did you mean to use a 'set' object?", true),
+            ("frozenset", "Did you mean to use a 'set' object?", true),
+        ],
+    ),
+    // str -- JavaScript equivalents
+    ("toUpperCase", &[("str", "upper", false)]),
+    ("toLowerCase", &[("str", "lower", false)]),
+    ("trimStart", &[("str", "lstrip", false)]),
+    ("trimEnd", &[("str", "rstrip", false)]),
+    // dict -- Java/JavaScript equivalents
+    ("keySet", &[("dict", "keys", false)]),
+    ("entrySet", &[("dict", "items", false)]),
+    ("entries", &[("dict", "items", false)]),
+    ("putAll", &[("dict", "update", false)]),
+    ("put", &[("dict", "Use d[k] = v.", true)]),
+    // tuple -- mutable method on immutable type (user expected a list)
+    (
+        "append",
+        &[("tuple", "Did you mean to use a 'list' object?", true)],
+    ),
+    (
+        "extend",
+        &[("tuple", "Did you mean to use a 'list' object?", true)],
+    ),
+    (
+        "insert",
+        &[("tuple", "Did you mean to use a 'list' object?", true)],
+    ),
+    (
+        "remove",
+        &[
+            ("tuple", "Did you mean to use a 'list' object?", true),
+            ("frozenset", "Did you mean to use a 'set' object?", true),
+        ],
+    ),
+    // frozenset -- mutable method on immutable type (user expected a set)
+    (
+        "discard",
+        &[("frozenset", "Did you mean to use a 'set' object?", true)],
+    ),
+    // frozendict -- mutable method on immutable type (user expected a dict)
+    (
+        "update",
+        &[
+            ("frozenset", "Did you mean to use a 'set' object?", true),
+            ("frozendict", "Did you mean to use a 'dict' object?", true),
+        ],
+    ),
+    // float -- bitwise operators belong to int
+    ("__or__", &[("float", FLOAT_BITWISE, true)]),
+    ("__and__", &[("float", FLOAT_BITWISE, true)]),
+    ("__xor__", &[("float", FLOAT_BITWISE, true)]),
+    ("__lshift__", &[("float", FLOAT_BITWISE, true)]),
+    ("__rshift__", &[("float", FLOAT_BITWISE, true)]),
+];
+
+const FLOAT_BITWISE: &str =
+    "Did you mean to use an 'int' object? Bitwise operators are not supported by 'float'.";
+
+/// `traceback._get_cross_language_hint`: the worded hint for reading
+/// `wrong` on an object, given `isinstance(obj, T)` for a type name `T`.
+/// It is checked before the near-miss search and replaces it when it applies.
+pub fn cross_language_hint(wrong: &str, is_instance: impl Fn(&str) -> bool) -> Option<String> {
+    let (_, entries) = CROSS_LANGUAGE_HINTS
+        .iter()
+        .find(|(name, _)| *name == wrong)?;
+    let (_, hint, raw) = entries.iter().find(|(ty, _, _)| is_instance(ty))?;
+    Some(if *raw {
+        hint.to_string()
+    } else {
+        format!("Did you mean '.{hint}'?")
+    })
 }
 
 /// The unbound name in a `NameError: name 'x' is not defined` line, if that is

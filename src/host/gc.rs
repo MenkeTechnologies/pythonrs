@@ -460,6 +460,7 @@ impl PyHost {
                 m.value(recv);
                 m.values(self_obj);
             }
+            Some(SuggestCtx::ImportFrom { module, .. }) => m.value(module),
             None => {}
         }
         for env in &self.spare_envs {

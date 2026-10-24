@@ -373,3 +373,78 @@ except* ValueError as eg:
         r#"[True, (1, 2), (('replaced',), 'ValueError'), (ValueError(1),)]"#
     );
 }
+
+/// `ImportError`'s members, as `ImportError_init` / `_str` / `_repr` /
+/// `_getstate` (Objects/exceptions.c) give them: `name`, `path` and
+/// `name_from` are keyword-only and stay unset (reading `None`, but left out
+/// of `repr` and the pickle state) unless passed — explicitly passing `None`
+/// counts as set; `msg` is the sole positional argument and is what `str`
+/// shows; the keywords are refused with `getargs.c`'s wording under the
+/// `ImportError` name even for `ModuleNotFoundError`. An import that fails
+/// carries them too: `from sys import x` names the module and the missing
+/// name with `path=None` (a builtin module has no file), and a missing module
+/// names itself. These were all absent — `e.name` raised `AttributeError`
+/// inside the very handler that caught the failed import. Expected values are
+/// CPython 3.15's.
+#[test]
+fn import_error_carries_name_path_and_name_from() {
+    let src = r#"
+out = []
+e = ImportError('m', name='a', path='p', name_from='f')
+out.append((repr(e), e.msg, e.name, e.path, e.name_from, str(e), e.__reduce__()))
+out.append((repr(ImportError(name='a')), repr(ImportError()), ImportError().msg, ImportError('a', 'b').msg, str(ImportError('a', 'b')), str(ImportError(1))))
+e = ImportError('x')
+e.msg = 'changed'
+out.append((str(e), e.args, e.name, e.path, e.name_from, e.__reduce__(), sorted(vars(e))))
+out.append((repr(ImportError(name=None)), ImportError(name=None).__reduce__(), repr(ModuleNotFoundError('m', name='a', name_from='z'))))
+for kw in ({'name': 1, 'nm': 2}, {'nme': 1}, {'name': 1, 'path': 2, 'name_from': 3, 'x': 4}):
+    try: ModuleNotFoundError(**kw)
+    except TypeError as t: out.append(str(t))
+try:
+    from sys import zzznope
+except ImportError as e:
+    out.append((type(e).__name__, str(e), e.name, e.path, e.name_from, e.__reduce__()[2]))
+try:
+    import zzz_no_such_module
+except ImportError as e:
+    out.append((repr(e), e.name, e.path, e.name_from, e.msg))
+"#;
+    let expected = [
+        r#"[("ImportError('m', name='a', path='p')", 'm', 'a', 'p', 'f', 'm', (<class 'ImportError'>, ('m',), {'name': 'a', 'path': 'p', 'name_from': 'f'})), "#,
+        r#"("ImportError(name='a')", 'ImportError()', None, None, "('a', 'b')", '1'), "#,
+        r#"('changed', ('x',), None, None, None, (<class 'ImportError'>, ('x',)), []), "#,
+        r#"('ImportError(name=None)', (<class 'ImportError'>, (), {'name': None}), "ModuleNotFoundError('m', name='a')"), "#,
+        r#""ImportError() got an unexpected keyword argument 'nm'", "#,
+        r#""ImportError() got an unexpected keyword argument 'nme'. Did you mean 'name'?", "#,
+        r#"'ImportError() takes at most 3 keyword arguments (4 given)', "#,
+        r#"('ImportError', "cannot import name 'zzznope' from 'sys' (unknown location)", 'sys', None, 'zzznope', {'name': 'sys', 'path': None, 'name_from': 'zzznope'}), "#,
+        r#"('ModuleNotFoundError("No module named \'zzz_no_such_module\'", name=\'zzz_no_such_module\')', 'zzz_no_such_module', None, None, "No module named 'zzz_no_such_module'")]"#,
+    ];
+    assert_eq!(g(src, "out"), expected.concat());
+}
+
+/// `from M import missing` raises `ImportError` whatever kind of module `M`
+/// is. For a module the stdlib bridge serves from CPython (`os`, `typing`)
+/// the miss surfaced as the `AttributeError` of the attribute read, so the
+/// version-compat idiom `try: from typing import X / except ImportError:`
+/// let it escape. The message ends with the module's `__file__`, which is
+/// also `path`.
+#[cfg(feature = "stdlib-ffi")]
+#[test]
+fn from_import_of_a_bridged_module_raises_import_error() {
+    let src = r#"
+import os, typing
+out = []
+for m, mod in (('os', os), ('typing', typing)):
+    try:
+        exec(f'from {m} import zzznope')
+    except ImportError as e:
+        out.append((type(e).__name__, e.name, e.name_from, e.path == mod.__file__,
+                    str(e) == f"cannot import name 'zzznope' from '{m}' ({mod.__file__})"))
+"#;
+    assert_eq!(
+        g(src, "out"),
+        "[('ImportError', 'os', 'zzznope', True, True), \
+         ('ImportError', 'typing', 'zzznope', True, True)]"
+    );
+}

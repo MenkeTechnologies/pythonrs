@@ -6537,6 +6537,18 @@ impl PyHost {
         if let Some(s) = crate::excunicode::str_from_attrs(self, v, class) {
             return s;
         }
+        // `ImportError_str`: `msg` when it is exactly a `str`, else
+        // `BaseException_str` of the arguments.
+        if crate::builtins::is_import_error_class(self, class) {
+            if let Value::Obj(id) = v {
+                if let Some(msg) = self.side_attr(*id, "msg") {
+                    if matches!(self.get(&msg), Some(PyObj::Str(_))) || matches!(msg, Value::Str(_))
+                    {
+                        return self.str_of(&msg);
+                    }
+                }
+            }
+        }
         self.exc_message(class, args)
     }
 
@@ -6797,7 +6809,18 @@ impl PyHost {
                 // of `tp_name` after its last dot: `re.PatternError('x')` reprs
                 // as `PatternError('x')`.
                 Some(PyObj::Exception { class, args }) => {
-                    let inner: Vec<String> = args.iter().map(|a| self.repr_of(a)).collect();
+                    let mut inner: Vec<String> = args.iter().map(|a| self.repr_of(a)).collect();
+                    // `ImportError_repr` adds the `name` and `path` members that
+                    // were set, as the keywords that would set them.
+                    if crate::builtins::is_import_error_class(self, class) {
+                        if let Value::Obj(id) = v {
+                            for member in ["name", "path"] {
+                                if let Some(val) = self.side_attr(*id, member) {
+                                    inner.push(format!("{member}={}", self.repr_of(&val)));
+                                }
+                            }
+                        }
+                    }
                     let disp = self.class_display_name(class);
                     let name = disp.rsplit('.').next().unwrap_or(&disp);
                     format!("{name}({})", inner.join(", "))
@@ -13332,6 +13355,16 @@ impl PyHost {
         }
     }
 
+    /// Remember the module a `from module import name` missed in, for the
+    /// traceback's `Did you mean: 'x'?` on the `ImportError` it raised.
+    pub fn note_import_from_miss(&mut self, line: &str, module: &Value, name: &str) {
+        self.suggest = Some(SuggestCtx::ImportFrom {
+            wrong: name.to_string(),
+            module: module.clone(),
+            line: line.to_string(),
+        });
+    }
+
     /// Remember the scope a bare-name read missed in, for the same hint.
     pub fn note_name_miss(&mut self, name: &str) {
         let Some(frame) = self.frames.last() else {
@@ -13352,11 +13385,29 @@ impl PyHost {
         });
     }
 
-    /// CPython's `_compute_suggestion_error` for a terse `Type: message` line:
-    /// the closest name to the one that missed, or `None` when nothing is close
-    /// enough (or the recorded context belongs to a different error).
-    fn suggestion_for(&self, line: &str) -> Option<String> {
+    /// The hint `TracebackException.__init__` appends to a terse `Type:
+    /// message` line, or `None` when nothing applies (or the recorded context
+    /// belongs to a different error): a near miss from
+    /// `_compute_suggestion_error`, or for an `AttributeError` the
+    /// cross-language hint, which is tried first.
+    fn suggestion_for(&self, line: &str) -> Option<crate::suggest::Hint> {
+        use crate::suggest::Hint;
         match self.suggest.as_ref()? {
+            SuggestCtx::ImportFrom {
+                wrong,
+                module,
+                line: l,
+            } => {
+                if l != line {
+                    return None;
+                }
+                let mut candidates = self.dir_names(module);
+                if !wrong.starts_with('_') {
+                    candidates.retain(|n| !n.starts_with('_'));
+                }
+                candidates.sort();
+                crate::suggest::closest(&candidates, wrong).map(Hint::Name)
+            }
             SuggestCtx::Name {
                 wrong,
                 env,
@@ -13371,7 +13422,7 @@ impl PyHost {
                 // instance is reported as `self.<name>` rather than a near miss.
                 if let Some(obj) = self_obj {
                     if self.dir_names(obj).iter().any(|n| n == wrong) {
-                        return Some(format!("self.{wrong}"));
+                        return Some(Hint::Name(format!("self.{wrong}")));
                     }
                 }
                 // CPython's candidates: the frame's locals, then its globals,
@@ -13393,7 +13444,7 @@ impl PyHost {
                     .collect();
                 builtins.sort();
                 candidates.extend(builtins);
-                crate::suggest::closest(&candidates, wrong)
+                crate::suggest::closest(&candidates, wrong).map(Hint::Name)
             }
             SuggestCtx::Attr {
                 wrong,
@@ -13404,6 +13455,10 @@ impl PyHost {
                 if !line.starts_with("AttributeError:") || !line.contains(&format!("'{wrong}'")) {
                     return None;
                 }
+                let is_instance = |ty: &str| crate::builtins::isinstance_of_name(self, recv, ty);
+                if let Some(hint) = crate::suggest::cross_language_hint(wrong, is_instance) {
+                    return Some(Hint::Raw(hint));
+                }
                 let mut candidates = self.dir_names(recv);
                 // Private names are hidden unless the code asked for one, or the
                 // receiver is the running method's own instance.
@@ -13412,7 +13467,10 @@ impl PyHost {
                     candidates.retain(|n| !n.starts_with('_'));
                 }
                 candidates.sort();
-                crate::suggest::closest(&candidates, wrong)
+                crate::suggest::closest(&candidates, wrong).map(|suggestion| Hint::Attr {
+                    suggestion,
+                    wrong: wrong.clone(),
+                })
             }
         }
     }
@@ -14204,6 +14262,12 @@ impl PyHost {
                 // slots that start NULL and read as `None`, whichever path built
                 // the exception. A value set on the instance was answered above.
                 if crate::builtins::name_error_attrs(class).is_some_and(|a| a.contains(&name)) {
+                    return Ok(Value::Undef);
+                }
+                // So are `ImportError`'s `msg`, `name`, `path` and `name_from`.
+                if matches!(name, "msg" | "name" | "path" | "name_from")
+                    && crate::builtins::is_import_error_class(self, class)
+                {
                     return Ok(Value::Undef);
                 }
                 let class = class.clone();
@@ -21622,6 +21686,13 @@ pub enum SuggestCtx {
         self_obj: Option<Value>,
         /// The `"AttributeError: …"` line the miss rendered to, which is how a
         /// synthesized exception finds its `obj` (see [`PyHost::note_attr_miss`]).
+        line: String,
+    },
+    /// A `from module import name` miss: the module whose `dir()` supplies the
+    /// candidates, and the `"ImportError: cannot import name …"` line.
+    ImportFrom {
+        wrong: String,
+        module: Value,
         line: String,
     },
 }

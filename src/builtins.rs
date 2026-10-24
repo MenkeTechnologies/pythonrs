@@ -4248,14 +4248,23 @@ fn b_import(vm: &mut VM, _: u8) -> Value {
 fn b_import_from(vm: &mut VM, _: u8) -> Value {
     let name = sval(&vm.pop());
     let module = vm.pop();
-    let mname = with_host(|h| match h.get(&module) {
-        Some(PyObj::Module { name, .. }) => Some(name.clone()),
-        _ => None,
-    });
     let orig = match with_host(|h| h.get_attr(&module, &name)) {
         Ok(v) => return finish(vm, Ok(v)),
         Err(e) => e,
     };
+    // Only a missing attribute becomes an `ImportError`; anything else a
+    // module `__getattr__` raised propagates (`PyObject_GetOptionalAttr`).
+    if !orig.starts_with("AttributeError") {
+        return finish(vm, Err(orig));
+    }
+    // The module's `__name__` — a native module's or a CPython one's alike.
+    let mname = with_host(|h| match h.get(&module) {
+        Some(PyObj::Module { name, .. }) => Some(name.clone()),
+        _ => h
+            .get_attr(&module, "__name__")
+            .ok()
+            .and_then(|n| h.as_str(&n).map(|s| s.to_string())),
+    });
     if let Some(pkg) = &mname {
         // `from pkg import name` where `name` is a SUBMODULE not yet bound as an
         // attribute: import `pkg.name` and use it (CPython's `_handle_fromlist`).
@@ -4275,15 +4284,30 @@ fn b_import_from(vm: &mut VM, _: u8) -> Value {
                 }
             }
         }
-        return finish(
-            vm,
-            Err(format!(
-                "ImportError: cannot import name '{name}' from '{pkg}'"
-            )),
-        );
     }
-    // A non-module `from` target: surface the original attribute error.
-    finish(vm, Err(orig))
+    finish(
+        vm,
+        Err(cannot_import_name(&module, &name, mname.as_deref())),
+    )
+}
+
+/// `import_from`'s refusal (Python/ceval.c): `cannot import name 'x' from 'm'`
+/// followed by the module's `__file__` in parentheses, or `(unknown location)`
+/// when it has none (a builtin module such as `sys`). The module is
+/// `<unknown module name>` when it has no `__name__`. The miss is recorded for
+/// the traceback's `Did you mean: 'y'?`, whose candidates are the module's.
+fn cannot_import_name(module: &Value, name: &str, mname: Option<&str>) -> String {
+    with_host(|h| {
+        let path = h
+            .get_attr(module, "__file__")
+            .ok()
+            .and_then(|f| h.as_str(&f).map(|s| s.to_string()));
+        let pkg = mname.unwrap_or("<unknown module name>");
+        let location = path.as_deref().unwrap_or("unknown location");
+        let line = format!("ImportError: cannot import name '{name}' from '{pkg}' ({location})");
+        h.note_import_from_miss(&line, module, name);
+        line
+    })
 }
 
 /// `from <dots><modpart> import <name>` — a relative import. Stack (top-first):
@@ -5094,6 +5118,23 @@ fn name_error_init(e: &Value, class: &str, kwargs: &[(String, Value)]) -> Result
     } else {
         "NameError"
     };
+    check_exception_kwargs(fname, attrs, kwargs)?;
+    with_host(|h| {
+        for attr in attrs {
+            let _ = h.set_attr(e, attr, kw_get(kwargs, attr).unwrap_or(Value::Undef));
+        }
+    });
+    Ok(())
+}
+
+/// The refusals `getargs.c` gives a `"|$O…:Name"` keyword-only format — what
+/// the builtin exception initializers parse their keywords with: too many
+/// keywords, or one not in `attrs` (with the near-miss hint 3.14+ appends).
+fn check_exception_kwargs(
+    fname: &str,
+    attrs: &[&str],
+    kwargs: &[(String, Value)],
+) -> Result<(), String> {
     if kwargs.len() > attrs.len() {
         let plural = if attrs.len() == 1 { "" } else { "s" };
         return Err(host::type_error(&format!(
@@ -5111,12 +5152,83 @@ fn name_error_init(e: &Value, class: &str, kwargs: &[(String, Value)]) -> Result
             "{fname}() got an unexpected keyword argument '{k}'{hint}"
         )));
     }
+    Ok(())
+}
+
+/// The keywords `ImportError_init` (Objects/exceptions.c) parses, with the
+/// `"|$OOO:ImportError"` format — so `ModuleNotFoundError` refuses a keyword
+/// as `ImportError()` too.
+const IMPORT_ERROR_KWARGS: &[&str] = &["name", "path", "name_from"];
+
+/// Whether `class` is `ImportError` or one of its subclasses.
+pub(crate) fn is_import_error_class(h: &host::PyHost, class: &str) -> bool {
+    exception_isa(class, "ImportError", h)
+}
+
+/// `ImportError_init`: `args` as for any exception; each keyword passed sets
+/// its member (one NOT passed stays unset, which reads as `None` but is left
+/// out of `repr` and `__reduce__`'s state); and `msg` is the sole positional
+/// argument, unset for any other count.
+fn import_error_init(e: &Value, args: &[Value], kwargs: &[(String, Value)]) -> Result<(), String> {
+    check_exception_kwargs("ImportError", IMPORT_ERROR_KWARGS, kwargs)?;
     with_host(|h| {
-        for attr in attrs {
-            let _ = h.set_attr(e, attr, kw_get(kwargs, attr).unwrap_or(Value::Undef));
+        for (k, v) in kwargs {
+            let _ = h.set_attr(e, k, v.clone());
+        }
+        if let [msg] = args {
+            let _ = h.set_attr(e, "msg", msg.clone());
         }
     });
     Ok(())
+}
+
+/// The members an engine-raised `ImportError` carries, recovered from its
+/// message — which the import system built from exactly these values, in this
+/// order: `No module named 'm'` sets `name` (`_bootstrap`'s
+/// `ModuleNotFoundError(msg, name=m)`); `cannot import name 'x' from 'm'
+/// (loc)` sets `name` `m`, `path` the module's `__file__` — `None` for
+/// `unknown location` (`PyErr_SetImportError(msg, m, NULL)`) — and
+/// `name_from` `x`. A `None` value is a member set to `None`, not left unset.
+fn import_error_attrs_from_message(msg: &str) -> Vec<(&'static str, Option<String>)> {
+    let quoted = |s: &str| -> Option<(String, usize)> {
+        let inner = s.strip_prefix('\'')?;
+        let end = inner.find('\'')?;
+        Some((inner[..end].to_string(), end + 2))
+    };
+    if let Some(rest) = msg.strip_prefix("No module named ") {
+        return quoted(rest)
+            .map(|(m, _)| vec![("name", Some(m))])
+            .unwrap_or_default();
+    }
+    let Some(rest) = msg.strip_prefix("cannot import name ") else {
+        return Vec::new();
+    };
+    let Some((from, used)) = quoted(rest) else {
+        return Vec::new();
+    };
+    let rest = &rest[used..];
+    let Some(rest) = rest
+        .strip_prefix(" from partially initialized module ")
+        .or_else(|| rest.strip_prefix(" from "))
+    else {
+        return Vec::new();
+    };
+    let Some((module, used)) = quoted(rest) else {
+        return Vec::new();
+    };
+    // The location is the LAST parenthesized group: a circular import puts
+    // `(most likely due to a circular import)` before it.
+    let tail = &rest[used..];
+    let path = tail.rfind(" (").and_then(|open| {
+        let loc = &tail[open + 2..];
+        let loc = loc.strip_suffix(')').unwrap_or(loc);
+        (loc != "unknown location").then(|| loc.to_string())
+    });
+    vec![
+        ("name", Some(module)),
+        ("path", path),
+        ("name_from", Some(from)),
+    ]
 }
 
 /// A builtin exception class called with `args`/`kwargs`: the exception object
@@ -5155,6 +5267,9 @@ pub(crate) fn construct_builtin_exception(
         crate::excunicode::init(&e, class, &args)?;
     }
     name_error_init(&e, class, kwargs)?;
+    if with_host(|h| is_import_error_class(h, class)) {
+        import_error_init(&e, &args, kwargs)?;
+    }
     if class == "re.PatternError" {
         pattern_error_init(&e, &args, kwargs)?;
     }
@@ -5364,6 +5479,18 @@ fn synth_exc(h: &mut host::PyHost, err: &str) -> Value {
     // or in CPython (whose C-level fields are not in the recorded `__dict__`).
     if crate::excunicode::is_unicode_error_class(&class) {
         crate::excunicode::bind_args(h, &e, &class, &args);
+    }
+    // `ImportError.msg` is the sole argument, and the import system set `name`
+    // / `path` / `name_from` from the values its message was built with. A
+    // CPython-raised one's recorded members (below) take precedence.
+    if is_import_error_class(h, &class) {
+        if let [msg_arg] = args.as_slice() {
+            let _ = h.set_attr(&e, "msg", msg_arg.clone());
+        }
+        for (name, val) in import_error_attrs_from_message(&msg) {
+            let v = val.map_or(Value::Undef, |s| h.new_str(s));
+            let _ = h.set_attr(&e, name, v);
+        }
     }
     for (name, val) in attrs {
         let _ = h.set_attr(&e, &name, val);
@@ -16190,13 +16317,19 @@ fn isinstance(h: &host::PyHost, v: &Value, cls: &Value) -> bool {
     if let Some(PyObj::Tuple(ts)) = h.get(cls) {
         return ts.iter().any(|t| isinstance(h, v, t));
     }
-    let want = match callable_name(h, cls) {
-        Some(n) => n,
-        None => return false,
-    };
+    match callable_name(h, cls) {
+        Some(want) => isinstance_of_name(h, v, &want),
+        None => false,
+    }
+}
+
+/// `isinstance(v, T)` for the type `T` callable name `want` names (`"list"`,
+/// `"collections.OrderedDict"`, a user class key) — the type-object-free core
+/// of [`isinstance`], for host code that has a type name rather than a value.
+pub(crate) fn isinstance_of_name(h: &host::PyHost, v: &Value, want: &str) -> bool {
     // The `collections` container types are reached as `collections.X`
     // builtins, while their instances report the bare type name.
-    let want = native_type_key(&want).to_string();
+    let want = native_type_key(want).to_string();
     // A class object (a user `Class` or a builtin type) is an instance of `type`.
     if want == "type" {
         match h.get(v) {
@@ -17711,9 +17844,13 @@ pub fn exception_reduce(recv: &Value) -> Result<Value, String> {
             (h.builtin_type_of(recv), attrs)
         }
     });
+    // `ImportError_getstate` puts the `name` / `path` / `name_from` members
+    // that were set into the state, but never `msg`, which `args` rebuilds.
+    let import_error = with_host(|h| is_import_error_class(h, &h.type_name(recv)));
+    let dropped = |k: &str| MEMBERS.contains(&k) || import_error && k == "msg";
     let attrs: Vec<(Value, Value)> = attrs
         .into_iter()
-        .filter(|(k, _)| !with_host(|h| h.as_str(k)).is_some_and(|k| MEMBERS.contains(&k.as_str())))
+        .filter(|(k, _)| !with_host(|h| h.as_str(k)).is_some_and(|k| dropped(&k)))
         .collect();
     let mut args = host::iter_vec(&with_host(|h| h.get_attr(recv, "args"))?)?;
     let oserror = with_host(|h| exception_isa(&h.type_name(recv), "OSError", h));

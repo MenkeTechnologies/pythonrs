@@ -872,6 +872,22 @@ fn record_foreign_exc(host: &mut PyHost, py: Python, err: &PyErr, line: &str) {
         }
         attrs.sort_by(|a, b| a.0.cmp(&b.0));
     }
+    // An `ImportError`'s members are slots, not `__dict__` entries. Read
+    // through the getters, an unset one and one set to `None` look alike;
+    // only the non-`None` ones are carried.
+    if value.is_instance_of::<pyo3::exceptions::PyImportError>() {
+        for member in ["name", "path", "name_from"] {
+            let Ok(v) = value.getattr(member) else {
+                continue;
+            };
+            if v.is_none() {
+                continue;
+            }
+            if let Ok(val) = py_to_value(host, py, &v) {
+                attrs.push((member.to_string(), val));
+            }
+        }
+    }
     let (cause, context, suppress_context) = exc_chain_links(host, py, value.as_any());
     host.foreign_exc = Some(crate::host::ForeignExc {
         line: line.to_string(),
@@ -1392,6 +1408,16 @@ fn exc_to_py<'py>(
     if let Some(meta) = meta {
         let pmeta = value_to_py(host, py, meta)?;
         exc.setattr("_metadata", pmeta).map_err(|e| e.to_string())?;
+    }
+    // So are an `ImportError`'s `name` / `path` / `name_from` members (the
+    // ones that were set): `pickle` and `traceback` read them.
+    if builtin && crate::builtins::is_import_error_class(host, &class) {
+        for member in ["name", "path", "name_from"] {
+            if let Some(val) = host.func_attrs.get(id).and_then(|attrs| attrs.get(member)) {
+                let pval = value_to_py(host, py, val)?;
+                exc.setattr(member, pval).map_err(|e| e.to_string())?;
+            }
+        }
     }
     let handle = store(exc.clone().unbind());
     pair_exception(host, v, &exc, handle, false);
