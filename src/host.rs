@@ -1491,12 +1491,15 @@ pub enum PyObj {
     Bytearray(Vec<u8>),
     /// A `memoryview` over a `bytes`/`bytearray` buffer. Holds a handle to the
     /// backing object (not a snapshot), so a view over a `bytearray` reflects
-    /// later mutations. `start`/`len` bound the (possibly sliced) window;
-    /// `readonly` is true for a `bytes` backing. A faithful 1-D unsigned-byte
-    /// (`format 'B'`, `itemsize 1`) subset.
+    /// later mutations. Element `k` of the (possibly sliced) window is byte
+    /// `start + k * stride` of the backing, for `k < len` — a strided slice
+    /// (`mv[::2]`, `mv[::-1]`) is a view of the same buffer, as CPython's
+    /// `strides[0]` makes it. `readonly` is true for a `bytes` backing. A
+    /// faithful 1-D unsigned-byte (`format 'B'`, `itemsize 1`) subset.
     Memoryview {
         obj: Value,
         start: usize,
+        stride: isize,
         len: usize,
         readonly: bool,
         /// Set by `release()` (and by leaving a `with` block). Every operation
@@ -7095,6 +7098,7 @@ impl PyHost {
                 Some(PyObj::Memoryview {
                     obj,
                     start,
+                    stride,
                     len,
                     readonly,
                     released,
@@ -7109,7 +7113,7 @@ impl PyHost {
                     match self.get(obj) {
                         Some(PyObj::Bytes(b)) => {
                             hashed.set(true);
-                            PKey::Bytes(b[*start..*start + *len].to_vec())
+                            PKey::Bytes(mv_gather(b, *start, *stride, *len))
                         }
                         _ => {
                             return Err("ValueError: cannot hash writable memoryview object".into())
@@ -11178,6 +11182,7 @@ impl PyHost {
         if let Some(PyObj::Memoryview {
             obj,
             start,
+            stride,
             len,
             released,
             ..
@@ -11186,12 +11191,8 @@ impl PyHost {
             if *released {
                 return Err(MV_RELEASED.to_string());
             }
-            let (start, len) = (*start, *len);
             if let Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) = self.get(obj) {
-                return Ok(b
-                    .get(start..start + len)
-                    .map(|s| s.to_vec())
-                    .unwrap_or_default());
+                return Ok(mv_gather(b, *start, *stride, *len));
             }
         }
         Ok(Vec::new())
@@ -11642,12 +11643,14 @@ impl PyHost {
                 step: rstep.saturating_mul(step),
             }));
         }
-        // Slicing a memoryview yields another memoryview. A contiguous
-        // (`step == 1`) slice is a sub-view sharing the backing buffer; a
-        // strided slice materializes a fresh read-only byte buffer to view.
+        // Slicing a memoryview yields another view of the same buffer
+        // (`memory_subscript` → `init_slice`): it starts at element `i` of the
+        // parent and steps `step` of the parent's elements, so a strided slice
+        // of a `bytearray` view stays writable and writes reach the backing.
         if let Some(PyObj::Memoryview {
             obj,
             start,
+            stride,
             len,
             readonly,
             ..
@@ -11656,61 +11659,36 @@ impl PyHost {
             if self.mv_released(recv) {
                 return Err(MV_RELEASED.to_string());
             }
-            let (obj, start, readonly) = (obj.clone(), *start, *readonly);
+            let (obj, start, stride, readonly) = (obj.clone(), *start, *stride, *readonly);
             let n = *len as i64;
             // A sub-view keeps the exporter its parent reports as `obj`.
             let exporter = match recv {
                 Value::Obj(id) => self.mv_exporter.get(id).cloned(),
                 _ => None,
             };
-            let (mut i, stop) = slice_bounds(lo, hi, step, n, self);
-            if step == 1 {
-                let lo_i = i.clamp(0, n);
-                let hi_i = stop.clamp(lo_i, n);
-                let view = self.alloc(PyObj::Memoryview {
-                    obj,
-                    start: start + lo_i as usize,
-                    len: (hi_i - lo_i) as usize,
-                    readonly,
-                    released: false,
-                    hashed: Default::default(),
-                });
-                if let (Some(e), Value::Obj(id)) = (exporter, &view) {
-                    self.mv_exporter.insert(*id, e);
-                }
-                return Ok(view);
-            }
-            let src = self.mv_bytes(recv)?;
-            let mut out = Vec::new();
-            if step > 0 {
-                while i < stop {
-                    if i >= 0 && i < n {
-                        out.push(src[i as usize]);
-                    }
-                    i = i.saturating_add(step);
-                }
+            let (i, stop) = slice_bounds(lo, hi, step, n, self);
+            // `PySlice_AdjustIndices`' slice length.
+            let count = match step {
+                s if s > 0 && i < stop => (stop - i - 1) / s + 1,
+                s if s < 0 && stop < i => (i - stop - 1) / -s + 1,
+                _ => 0,
+            };
+            let first = if count > 0 {
+                (start as isize + i as isize * stride) as usize
             } else {
-                while i > stop {
-                    if i >= 0 && i < n {
-                        out.push(src[i as usize]);
-                    }
-                    i = i.saturating_add(step);
-                }
-            }
-            let len = out.len();
-            let buf = self.alloc(PyObj::Bytes(out));
+                start
+            };
             let view = self.alloc(PyObj::Memoryview {
-                obj: buf,
-                start: 0,
-                len,
-                readonly: true,
+                obj,
+                start: first,
+                stride: stride.saturating_mul(step as isize),
+                len: count as usize,
+                readonly,
                 released: false,
                 hashed: Default::default(),
             });
-            // The copy stands in for a strided view of the same exporter: `obj`
-            // is still the object the parent view was taken of.
-            if let Value::Obj(id) = &view {
-                self.mv_exporter.insert(*id, exporter.unwrap_or(obj));
+            if let (Some(e), Value::Obj(id)) = (exporter, &view) {
+                self.mv_exporter.insert(*id, e);
             }
             return Ok(view);
         }
@@ -11871,11 +11849,13 @@ impl PyHost {
             Some(PyObj::Memoryview {
                 obj,
                 start,
+                stride,
                 len,
                 readonly,
                 ..
             }) => {
-                let (obj, start, len, readonly) = (obj.clone(), *start, *len, *readonly);
+                let (obj, start, stride, len, readonly) =
+                    (obj.clone(), *start, *stride, *len, *readonly);
                 if self.mv_released(recv) {
                     return Err(MV_RELEASED.to_string());
                 }
@@ -11889,7 +11869,7 @@ impl PyHost {
                 }
                 let b = self.mv_byte_value(&val)?;
                 if let Some(PyObj::Bytearray(buf)) = self.get_mut(&obj) {
-                    if let Some(slot) = buf.get_mut(start + k as usize) {
+                    if let Some(slot) = buf.get_mut(mv_offset(start, stride, k)) {
                         *slot = b;
                     }
                 }
@@ -11935,6 +11915,7 @@ impl PyHost {
         let Some(PyObj::Memoryview {
             obj,
             start,
+            stride,
             len,
             readonly,
             ..
@@ -11942,7 +11923,7 @@ impl PyHost {
         else {
             return Err(type_error("expected a memoryview"));
         };
-        let (obj, start, len, readonly) = (obj.clone(), *start, *len, *readonly);
+        let (obj, start, stride, len, readonly) = (obj.clone(), *start, *stride, *len, *readonly);
         if self.mv_released(recv) {
             return Err(MV_RELEASED.to_string());
         }
@@ -11966,7 +11947,7 @@ impl PyHost {
         }
         if let Some(PyObj::Bytearray(buf)) = self.get_mut(&obj) {
             for (k, b) in picks.iter().zip(repl) {
-                if let Some(slot) = buf.get_mut(start + *k as usize) {
+                if let Some(slot) = buf.get_mut(mv_offset(start, stride, *k)) {
                     *slot = b;
                 }
             }
@@ -12896,6 +12877,26 @@ fn read_up_to(r: &mut impl std::io::Read, buf: &mut Vec<u8>) -> std::io::Result<
     }
     buf.truncate(filled);
     Ok(())
+}
+
+/// The backing offset of element `k` of a memoryview window.
+fn mv_offset(start: usize, stride: isize, k: i64) -> usize {
+    (start as isize + k as isize * stride) as usize
+}
+
+/// The `len` bytes a memoryview window shows, element `k` at
+/// [`mv_offset`]; empty when the backing shrank under the window.
+fn mv_gather(buf: &[u8], start: usize, stride: isize, len: usize) -> Vec<u8> {
+    if stride == 1 {
+        return buf
+            .get(start..start + len)
+            .map(<[u8]>::to_vec)
+            .unwrap_or_default();
+    }
+    (0..len as i64)
+        .map(|k| buf.get(mv_offset(start, stride, k)).copied())
+        .collect::<Option<Vec<u8>>>()
+        .unwrap_or_default()
 }
 
 fn slice_bounds(lo: &Value, hi: &Value, step: i64, n: i64, h: &PyHost) -> (i64, i64) {
@@ -15287,10 +15288,14 @@ impl PyHost {
             }
             // `memoryview` read-only descriptor attributes. A faithful 1-D
             // unsigned-byte view: `format 'B'`, `itemsize 1`, `ndim 1`,
-            // contiguous. `obj` is the backing object; `nbytes`/`shape` derive
-            // from the window length.
+            // `strides` the element step. `obj` is the backing object;
+            // `nbytes`/`shape` derive from the window length.
             Some(PyObj::Memoryview {
-                obj, len, readonly, ..
+                obj,
+                stride,
+                len,
+                readonly,
+                ..
             }) if matches!(
                 name,
                 "obj"
@@ -15309,7 +15314,7 @@ impl PyHost {
                 if self.mv_released(recv) {
                     return Err(MV_RELEASED.to_string());
                 }
-                let (obj, len, readonly) = (obj.clone(), *len, *readonly);
+                let (obj, stride, len, readonly) = (obj.clone(), *stride, *len, *readonly);
                 Ok(match name {
                     "obj" => match recv {
                         Value::Obj(id) => self.mv_exporter.get(id).cloned().unwrap_or(obj),
@@ -15325,11 +15330,11 @@ impl PyHost {
                         self.new_tuple(vec![n])
                     }
                     "strides" => {
-                        let one = Value::Int(1);
-                        self.new_tuple(vec![one])
+                        let s = Value::Int(stride as i64);
+                        self.new_tuple(vec![s])
                     }
-                    // Single-segment 1-D views are contiguous in every layout.
-                    _ => Value::Bool(true),
+                    // `MV_CONTIGUOUS_NDIM1`: one element, or a unit stride.
+                    _ => Value::Bool(len == 1 || stride == 1),
                 })
             }
             // `slice` read-only attributes: the RAW stored bound objects
@@ -16371,6 +16376,20 @@ impl PyHost {
         #[cfg(feature = "stdlib-ffi")]
         if let Some(id) = self.foreign_id(recv) {
             return crate::ffi::set_attr(self, id, name, &val);
+        }
+        // `text.mode = 'r'` (`io.open`, `tokenize.open`): a `TextIOWrapper`
+        // keeps the `mode` it is given in its instance dict.
+        if name == "mode" {
+            let file = match self.get(recv) {
+                Some(PyObj::File { id }) => Some(*id as usize),
+                _ => None,
+            };
+            if let (Some(id), Some(m)) = (file, self.as_str(&val)) {
+                if let Some(IoCell::File { mode, .. }) = self.io_handles.get_mut(id) {
+                    *mode = m;
+                    return Ok(());
+                }
+            }
         }
         self.immutable_type_check(recv, name)?;
         self.readonly_member_check(recv, name)?;
@@ -21130,6 +21149,15 @@ pub fn build_class(
     };
     let seed = prepared.as_ref().map_or_else(Vec::new, |p| p.1.clone());
     let ns: NameMap = run_class_body(name, body_func, &seed)?;
+    // `type_new` → `best_base`: a final builtin base is refused.
+    if let Some(b) = bases.iter().find(|b| {
+        crate::builtins::is_final_builtin_type(b)
+            && !with_host(|h| h.classes.contains_key(b.as_str()))
+    }) {
+        return Err(type_error(&format!(
+            "type '{b}' is not an acceptable base type"
+        )));
+    }
     check_slots(name, &ns)?;
     let cls = match &effective_meta {
         Some(m) => metaclass_create(m, name, &bases, &ns, &class_kwargs, prepared)?,

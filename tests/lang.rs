@@ -11013,3 +11013,44 @@ except TypeError as e:
         r#"[1, True, 'first argument must be callable']"#
     );
 }
+
+/// A final builtin type is refused as a base (`best_base`), and the singleton
+/// types construct their singleton (`type(None)() is None`).
+#[test]
+fn final_builtin_bases_and_singleton_types() {
+    let src = r#"
+out = []
+for b in (bool, range, slice, memoryview, type(None), type(len), type(lambda: 0), type(iter([]))):
+    try:
+        class X(b):
+            pass
+        out.append('ok')
+    except TypeError as e:
+        out.append(str(e))
+out += [type(None)() is None, type(...)() is ..., type(NotImplemented)() is NotImplemented]
+for t in (type(None), type(...)):
+    try:
+        t(1)
+    except TypeError as e:
+        out.append(str(e))
+def gen():
+    yield 1
+try:
+    type(gen())()
+except TypeError as e:
+    out.append(str(e))
+"#;
+    assert_eq!(
+        g(src, "out"),
+        "[\"type 'bool' is not an acceptable base type\", \
+         \"type 'range' is not an acceptable base type\", \
+         \"type 'slice' is not an acceptable base type\", \
+         \"type 'memoryview' is not an acceptable base type\", \
+         \"type 'NoneType' is not an acceptable base type\", \
+         \"type 'builtin_function_or_method' is not an acceptable base type\", \
+         \"type 'function' is not an acceptable base type\", \
+         \"type 'list_iterator' is not an acceptable base type\", \
+         True, True, True, 'NoneType takes no arguments', \
+         'EllipsisType takes no arguments', \"cannot create 'generator' instances\"]"
+    );
+}

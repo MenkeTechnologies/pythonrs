@@ -279,6 +279,7 @@ pub fn init() -> bool {
         INTERPRETER_STARTED.store(true, std::sync::atomic::Ordering::Relaxed);
         route_std_streams();
         install_main_module_hook();
+        install_warn_hook();
         preload_unlocked_probes();
     });
     BRIDGE_USABLE.load(std::sync::atomic::Ordering::Relaxed)
@@ -2457,6 +2458,11 @@ fn value_to_py_node<'py>(
             }
             Some(PyObj::Ellipsis) => Ok(py.Ellipsis().into_bound(py)),
             Some(PyObj::Foreign(id)) => fetch(py, *id),
+            // `type(f)`, `type(obj.m)`, `type(None)`: the CPython type of the same
+            // name, the object `types.FunctionType` / `MethodType` / `NoneType` are.
+            Some(PyObj::Builtin(name)) if types_module_type(name).is_some() => {
+                cpython_types_type(py, name)
+            }
             // A pythonrs lazy iterator (generator / zip / map / filter /
             // enumerate / composite iterator) passed into a CPython call
             // (`itertools.takewhile(pred, gen())`, `"".join(gen())`, …) is wrapped
@@ -2872,6 +2878,11 @@ fn py_to_value_node(host: &mut PyHost, py: Python, obj: &Bound<PyAny>) -> Result
     if let Some(name) = native_builtin_type(py, obj) {
         return Ok(host.builtin_object(name));
     }
+    // Likewise a `types` type pythonrs's `type()` hands out natively
+    // (`types.MethodType` is `type(obj.m)`), so `type(c.m) is types.MethodType`.
+    if let Some(name) = native_types_module_type(py, obj) {
+        return Ok(host.builtin_object(name));
+    }
     // Anything else stays on the CPython side behind a Foreign handle.
     Ok(host.alloc(PyObj::Foreign(store(obj.clone().unbind()))))
 }
@@ -2889,6 +2900,83 @@ fn native_builtin_type(py: Python, obj: &Bound<PyAny>) -> Option<&'static str> {
         .find(|n| *n == name)?;
     let builtin = py.import("builtins").ok()?.getattr(native).ok()?;
     builtin.is(obj).then_some(native)
+}
+
+/// The C types `types` names whose objects pythonrs makes natively, keyed by the
+/// name `type()` reports for them (`PyHost::type_name`), with their `types`
+/// attribute. Every one is final in CPython (`Py_TPFLAGS_BASETYPE` unset), so
+/// standing in for the CPython type never loses a subclass; `module`,
+/// `SimpleNamespace` and the other subclassable ones stay CPython's.
+const TYPES_MODULE_TYPES: &[(&str, &str)] = &[
+    ("function", "FunctionType"),
+    ("method", "MethodType"),
+    ("builtin_function_or_method", "BuiltinFunctionType"),
+    ("NoneType", "NoneType"),
+    ("NotImplementedType", "NotImplementedType"),
+    ("ellipsis", "EllipsisType"),
+    ("generator", "GeneratorType"),
+    ("coroutine", "CoroutineType"),
+    ("async_generator", "AsyncGeneratorType"),
+    ("mappingproxy", "MappingProxyType"),
+    ("method-wrapper", "MethodWrapperType"),
+    ("wrapper_descriptor", "WrapperDescriptorType"),
+    ("method_descriptor", "MethodDescriptorType"),
+    ("classmethod_descriptor", "ClassMethodDescriptorType"),
+    ("getset_descriptor", "GetSetDescriptorType"),
+    ("member_descriptor", "MemberDescriptorType"),
+];
+
+/// The `types` attribute naming the CPython type of native name `name`.
+fn types_module_type(name: &str) -> Option<&'static str> {
+    TYPES_MODULE_TYPES
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, attr)| *attr)
+}
+
+/// The CPython type a [`TYPES_MODULE_TYPES`] name stands for.
+fn cpython_types_type<'py>(py: Python<'py>, name: &str) -> Result<Bound<'py, PyAny>, String> {
+    let attr = types_module_type(name).ok_or_else(|| format!("no types type for '{name}'"))?;
+    py.import("types")
+        .and_then(|m| m.getattr(attr))
+        .map_err(|e| e.to_string())
+}
+
+/// `types.FunctionType(code, globals, …)` and the other [`TYPES_MODULE_TYPES`]
+/// pythonrs has no constructor for: the CPython type builds the object.
+pub fn call_types_type(
+    name: &str,
+    args: Vec<Value>,
+    kwargs: Vec<(String, Value)>,
+) -> Result<Value, String> {
+    if !init() {
+        return Err(bridge_unavailable("types"));
+    }
+    Python::attach(|py| {
+        let ty = cpython_types_type(py, name)?;
+        invoke_bound(py, &ty, &args, &kwargs)
+    })
+}
+
+/// The native type name standing for the CPython type object behind handle
+/// `tid`, when pythonrs implements that type: a builtin (`list`) or one of
+/// [`TYPES_MODULE_TYPES`] (`function`).
+pub fn native_type_name(tid: u32) -> Option<&'static str> {
+    Python::attach(|py| {
+        let ty = fetch(py, tid).ok()?;
+        native_builtin_type(py, &ty).or_else(|| native_types_module_type(py, &ty))
+    })
+}
+
+/// The native name of `obj` when it IS one of [`TYPES_MODULE_TYPES`].
+fn native_types_module_type(py: Python, obj: &Bound<PyAny>) -> Option<&'static str> {
+    if !obj.is_instance_of::<pyo3::types::PyType>() {
+        return None;
+    }
+    let name: String = obj.getattr("__name__").ok()?.extract().ok()?;
+    let (native, attr) = TYPES_MODULE_TYPES.iter().find(|(n, _)| *n == name)?;
+    let ty = py.import("types").ok()?.getattr(*attr).ok()?;
+    ty.is(obj).then_some(*native)
 }
 
 /// The pythonrs value behind a proxy pyclass, if `obj` is one. Every proxy this
@@ -3298,45 +3386,169 @@ fn warn_from_pythonrs(
         Some(v) => with_host(|h| h.as_int(v))?,
     };
     Some((|| {
-        let context = with_host(|h| h.warning_context(stacklevel));
-        let (filename, lineno, module) =
-            context.unwrap_or_else(|| ("<sys>".into(), 0, "sys".into()));
+        let location = warning_location(stacklevel);
         let to_py = |v: &Value| with_host(|h| value_to_py(h, py, v));
         let message = to_py(&message)?;
-        let warning = py.get_type::<pyo3::exceptions::PyWarning>();
-        // `get_category`.
-        let category = if message.is_instance(&warning).unwrap_or(false) {
-            message.get_type().into_any()
-        } else {
-            match &category {
-                None | Some(Value::Undef) => {
-                    py.get_type::<pyo3::exceptions::PyUserWarning>().into_any()
-                }
-                Some(c) => {
-                    let c = to_py(c)?;
-                    let ok = c
-                        .cast::<pyo3::types::PyType>()
-                        .is_ok_and(|t| t.is_subclass(&warning).unwrap_or(false));
-                    if !ok {
-                        return Err(format!(
-                            "TypeError: category must be a Warning subclass, not '{}'",
-                            c.get_type()
-                                .name()
-                                .map(|n| n.to_string())
-                                .unwrap_or_default()
-                        ));
-                    }
-                    c
-                }
-            }
+        let category = match &category {
+            None | Some(Value::Undef) => None,
+            Some(c) => Some(to_py(c)?),
         };
+        let category = warning_category(py, &message, category)?;
         let source = match &source {
             Some(v) => to_py(v)?,
             None => py.None().into_bound(py),
         };
-        warn_explicit_at(py, message, category, (filename, lineno, module), source)?;
+        warn_explicit_at(py, message, category, location, source)?;
         Ok(Value::Undef)
     })())
+}
+
+/// Where a warning `stacklevel` pythonrs frames out is shown, or CPython's
+/// `<sys>:0` when the stack is not that deep.
+fn warning_location(stacklevel: i64) -> (String, u32, String) {
+    crate::host::try_with_host(|h| h.warning_context(stacklevel))
+        .flatten()
+        .unwrap_or_else(|| ("<sys>".into(), 0, "sys".into()))
+}
+
+/// `get_category`: a `Warning` instance's class, else `category` (a `Warning`
+/// subclass), else `UserWarning`.
+fn warning_category<'py>(
+    py: Python<'py>,
+    message: &Bound<'py, PyAny>,
+    category: Option<Bound<'py, PyAny>>,
+) -> Result<Bound<'py, PyAny>, String> {
+    let warning = py.get_type::<pyo3::exceptions::PyWarning>();
+    if message.is_instance(&warning).unwrap_or(false) {
+        return Ok(message.get_type().into_any());
+    }
+    let Some(c) = category.filter(|c| !c.is_none()) else {
+        return Ok(py.get_type::<pyo3::exceptions::PyUserWarning>().into_any());
+    };
+    let ok = c
+        .cast::<pyo3::types::PyType>()
+        .is_ok_and(|t| t.is_subclass(&warning).unwrap_or(false));
+    if !ok {
+        return Err(format!(
+            "TypeError: category must be a Warning subclass, not '{}'",
+            c.get_type()
+                .name()
+                .map(|n| n.to_string())
+                .unwrap_or_default()
+        ));
+    }
+    Ok(c)
+}
+
+thread_local! {
+    /// The address (`id()`) of the CPython frame the innermost running
+    /// CPython-to-pythonrs callback was entered from, 0 for none: where a
+    /// CPython frame walk that started below the callback crosses into
+    /// pythonrs frames. [`run_for_cpython`] saves and restores it.
+    static CALLBACK_FRAME: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// [`CALLBACK_FRAME`], for the `warnings.warn` of [`install_warn_hook`].
+#[pyfunction]
+fn _callback_frame() -> usize {
+    CALLBACK_FRAME.get()
+}
+
+/// The pythonrs half of the `warnings.warn` installed by [`install_warn_hook`]:
+/// a warning whose `stacklevel` reaches past the CPython frames, located
+/// `stacklevel` pythonrs frames out.
+#[pyfunction]
+#[pyo3(signature = (message, category, stacklevel, source))]
+fn _warn_native<'py>(
+    py: Python<'py>,
+    message: Bound<'py, PyAny>,
+    category: Bound<'py, PyAny>,
+    stacklevel: i64,
+    source: Bound<'py, PyAny>,
+) -> PyResult<()> {
+    let category = warning_category(py, &message, Some(category)).map_err(|e| {
+        pyo3::exceptions::PyTypeError::new_err(e.trim_start_matches("TypeError: ").to_string())
+    })?;
+    let (filename, lineno, module) = warning_location(stacklevel);
+    let registry = warn_registry(py, &module).map_err(rs_err)?;
+    py.import("warnings")?.getattr("warn_explicit")?.call1((
+        message,
+        category,
+        filename,
+        lineno,
+        module,
+        registry,
+        py.None(),
+        source,
+    ))?;
+    Ok(())
+}
+
+/// Replace CPython's `warnings.warn` with one that, when `stacklevel` walks
+/// off the CPython frames (`warnings._deprecated`'s `stacklevel=3` called from
+/// a pythonrs function, or any stdlib `warn(…, stacklevel=2)` whose caller is
+/// pythonrs code), keeps counting through the pythonrs frame stack instead of
+/// reporting `sys:1`, as `setup_context` would over one continuous stack. A
+/// walk that stays inside CPython frames is CPython's own `warn`.
+fn install_warn_hook() {
+    // Best effort, as the other start-up hooks are: without it a deep
+    // `stacklevel` from CPython code reads `sys:1`, as it did before.
+    let _ = Python::attach(|py| -> PyResult<()> {
+        let code = cr#"
+import sys, warnings
+
+def install(native_warn, callback_frame):
+    orig = warnings.warn
+
+    def warn(message, category=None, stacklevel=1, source=None, *, skip_file_prefixes=()):
+        if skip_file_prefixes:
+            # `warn` raises the level to 2 here; one more skips this frame.
+            if type(stacklevel) is int:
+                stacklevel = max(stacklevel, 2) + 1
+            return orig(message, category, stacklevel, source,
+                        skip_file_prefixes=skip_file_prefixes)
+        if type(stacklevel) is not int:
+            return orig(message, category, stacklevel, source)
+        level = max(stacklevel, 1)
+        stop = callback_frame()
+        f = sys._getframe(0).f_back
+        seen = 0
+        while seen < level and f is not None and id(f) != stop:
+            seen += 1
+            f = f.f_back
+        if seen < level:
+            return native_warn(message, category, level - seen, source)
+        return orig(message, category, level + 1, source)
+
+    warn.__doc__ = orig.__doc__
+    warnings.warn = warn
+"#;
+        let helper = PyModule::from_code(py, code, c"<pythonrs-warnings>", c"_pythonrs_warnings")?;
+        helper.getattr("install")?.call1((
+            wrap_pyfunction!(_warn_native, py)?,
+            wrap_pyfunction!(_callback_frame, py)?,
+        ))?;
+        Ok(())
+    });
+}
+
+/// The `__warningregistry__` of pythonrs module `module` ([`WARN_REGISTRIES`]).
+fn warn_registry<'py>(py: Python<'py>, module: &str) -> Result<Bound<'py, PyAny>, String> {
+    let registry_id = {
+        let mut map = WARN_REGISTRIES
+            .get_or_init(|| Mutex::new(Default::default()))
+            .lock()
+            .map_err(|e| e.to_string())?;
+        match map.get(module) {
+            Some(&id) => id,
+            None => {
+                let id = store(pyo3::types::PyDict::new(py).into_any().unbind());
+                map.insert(module.to_string(), id);
+                id
+            }
+        }
+    };
+    fetch(py, registry_id)
 }
 
 /// `warnings.warn_explicit` for a warning located at `(filename, lineno,
@@ -3348,21 +3560,7 @@ fn warn_explicit_at<'py>(
     (filename, lineno, module): (String, u32, String),
     source: Bound<'py, PyAny>,
 ) -> Result<(), String> {
-    let registry_id = {
-        let mut map = WARN_REGISTRIES
-            .get_or_init(|| Mutex::new(Default::default()))
-            .lock()
-            .map_err(|e| e.to_string())?;
-        match map.get(&module) {
-            Some(&id) => id,
-            None => {
-                let id = store(pyo3::types::PyDict::new(py).into_any().unbind());
-                map.insert(module.clone(), id);
-                id
-            }
-        }
-    };
-    let registry = fetch(py, registry_id)?;
+    let registry = warn_registry(py, &module)?;
     py.import("warnings")
         .and_then(|w| w.getattr("warn_explicit"))
         .and_then(|f| {
@@ -4386,9 +4584,17 @@ fn call_err(e: String, outer: Option<Value>) -> pyo3::PyErr {
 
 /// Run pythonrs code on behalf of a CPython caller: an error it raises leaves
 /// as the CPython exception of its class ([`call_err`]).
+/// The CPython frame that made the call is recorded for the duration
+/// ([`CALLBACK_FRAME`]).
 fn run_for_cpython<T>(f: impl FnOnce() -> Result<T, String>) -> PyResult<T> {
     let outer = with_host(|h| h.exc.clone());
-    f().map_err(|e| call_err(e, outer))
+    // SAFETY: every caller is a pymethod, so the GIL is held; the borrowed
+    // frame pointer is kept only as an address to compare against.
+    let frame = unsafe { pyo3::ffi::PyEval_GetFrame() } as usize;
+    let outer_frame = CALLBACK_FRAME.replace(frame);
+    let result = f();
+    CALLBACK_FRAME.set(outer_frame);
+    result.map_err(|e| call_err(e, outer))
 }
 
 /// Drop the pythonrs-side error state once its exception has been handed to

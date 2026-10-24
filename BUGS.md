@@ -9,6 +9,40 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **`types`' C types are pythonrs's type objects.** `type(c.m) is
+  types.MethodType` was False in the bridge build, as were `FunctionType`,
+  `BuiltinFunctionType`, `NoneType`, `GeneratorType`, `EllipsisType`,
+  `MappingProxyType` and the descriptor types: `types` is CPython's, and its
+  type objects crossed as foreign handles. Each of those final types (never
+  `ModuleType` or another subclassable one) now crosses in as the native type
+  `type()` reports and back out as CPython's, so `typing.Optional[int].__args__
+  [1] is type(None)` and `singledispatch` registration on `types.FunctionType`
+  hold. `types.FunctionType(code, globals)` is still built by CPython.
+- **A final builtin type is refused as a base.** `class X(bool)`, `class
+  X(type(len))`, `class X(range)` and the other types without
+  `Py_TPFLAGS_BASETYPE` built a class; they are `TypeError: type 'bool' is not
+  an acceptable base type`. `type(None)()`, `type(...)()` and
+  `type(NotImplemented)()` return their singleton (`NoneType takes no
+  arguments` with an argument) and `type(gen())()` is `cannot create
+  'generator' instances`; they raised `NameError`.
+- **A strided memoryview slice is a view.** `memoryview(ba)[::2]` was a
+  read-only copy; it is a view stepping through the same buffer, so it is
+  writable over a `bytearray` (item and slice stores reach `ba`), `strides`
+  reports the step (`(2,)`, `(-1,)`), `contiguous` follows
+  `MV_CONTIGUOUS_NDIM1`, and slices of it compose.
+- **A deep `stacklevel` from CPython code reaches pythonrs frames.**
+  `warnings._deprecated` (`stacklevel=3`) called from a pythonrs function
+  showed `sys:1`: CPython's walk ran out of frames at the bridge. CPython's
+  `warnings.warn` is wrapped so a walk that leaves the CPython frames — at the
+  bottom of the stack, or at the frame that called a pythonrs callback — keeps
+  counting through the pythonrs frame stack. `warnings.warn` is then a Python
+  function where CPython's is builtin. A C-level warning (`PyErr_WarnEx`, e.g.
+  `datetime.utcnow()`) called straight from pythonrs still reads `sys:1`, and a
+  `skip_file_prefixes` walk does not see pythonrs frames.
+- **A text file takes an assigned `mode`.** `tokenize.open` sets `text.mode =
+  'r'`, which raised `attribute 'mode' of 'TextIOWrapper' objects is not
+  writable` in the native build, so every warning shown with its source line
+  (`linecache`) failed there.
 - **`__exit__` and `sys.exc_info()` get the traceback.** The `with` desugar
   passed `None` as `__exit__`'s third argument and `sys.exc_info()` returned
   `(type, value, None)`, so `tb.tb_lineno`, `traceback.extract_tb(tb)` or
@@ -3367,8 +3401,6 @@ entry. These remain open:
   `PyrsInstance` type, and `getattr_static` walks `type(obj).__mro__`, never
   `__class__`. Fixing it needs a proxy type per native class carrying the class
   namespace (and refreshed with it, as class mirrors are).
-- **A strided memoryview slice is a read-only copy.** `memoryview(ba)[::2]`
-  over a `bytearray` is `readonly` and writes through it do not reach `ba`.
 - **A referent's death is seen only at a collection.** pythonrs has no
   reference counts: `del o` leaves `weakref.ref(o)()` alive until the next
   collection, and the default (`stdlib-ffi`) build never collects, so there a

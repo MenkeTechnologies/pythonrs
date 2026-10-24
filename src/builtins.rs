@@ -5875,6 +5875,10 @@ fn cs_to_double(hi: f64, lo: f64) -> f64 {
 /// (`Objects/typeobject.c` `tp_new_wrapper` / `type_call`). The names are
 /// exactly what `PyHost::type_name` reports for those values.
 pub const UNINSTANTIABLE_TYPES: &[&str] = &[
+    "builtin_function_or_method",
+    "generator",
+    "coroutine",
+    "async_generator",
     "member_descriptor",
     "wrapper_descriptor",
     "method_descriptor",
@@ -5901,6 +5905,33 @@ pub const UNINSTANTIABLE_TYPES: &[&str] = &[
     "dict_reversevalueiterator",
     "dict_reverseitemiterator",
 ];
+
+/// The builtin types CPython will not let a class derive from (no
+/// `Py_TPFLAGS_BASETYPE`): `class X(bool)` is `TypeError: type 'bool' is not
+/// an acceptable base type`. Every constructor-less type is one of them.
+pub fn is_final_builtin_type(name: &str) -> bool {
+    UNINSTANTIABLE_TYPES.contains(&name)
+        || matches!(
+            name,
+            "bool"
+                | "range"
+                | "slice"
+                | "memoryview"
+                | "NoneType"
+                | "NotImplementedType"
+                | "ellipsis"
+                | "function"
+                | "method"
+                | "mappingproxy"
+                | "code"
+                | "frame"
+                | "cell"
+                | "traceback"
+                | "dict_keys"
+                | "dict_values"
+                | "dict_items"
+        )
+}
 
 /// `True` if `name` names a builtin *type* (constructor) or exception class —
 /// i.e. `type(<that>)` is `type`. Used by `PyHost::type_name` to distinguish a
@@ -6688,6 +6719,28 @@ pub fn call_builtin_function(
                 args.len()
             ))),
         };
+    }
+    // `type(None)()`, `type(...)()`, `type(NotImplemented)()`: the singleton.
+    if let Some(singleton) = match name {
+        "NoneType" => Some(Value::Undef),
+        "ellipsis" => Some(with_host(|h| h.alloc(PyObj::Ellipsis))),
+        "NotImplementedType" => Some(with_host(|h| h.alloc(PyObj::NotImplemented))),
+        _ => None,
+    } {
+        if !args.is_empty() || !kwargs.is_empty() {
+            let shown = if name == "ellipsis" {
+                "EllipsisType"
+            } else {
+                name
+            };
+            return Err(host::type_error(&format!("{shown} takes no arguments")));
+        }
+        return Ok(singleton);
+    }
+    // `types.FunctionType(code, globals)`: CPython builds the function.
+    #[cfg(feature = "stdlib-ffi")]
+    if name == "function" {
+        return crate::ffi::call_types_type(name, args, kwargs);
     }
     // `type(C.x)()`, `type(iter([]))()`: a type object with no constructor.
     if UNINSTANTIABLE_TYPES.contains(&name) {
@@ -7926,13 +7979,11 @@ fn call_named_builtin(
             #[cfg(feature = "stdlib-ffi")]
             if let Some(fid) = with_host(|h| h.foreign_id(&v)) {
                 if let Some(tid) = crate::ffi::type_of(fid) {
-                    // A CPython builtin type pythonrs also has (`list`, `dict`, …) is
-                    // answered with the native type object, so `type(x) is list`
-                    // holds for a list kept behind a handle.
-                    if let Some(name) = crate::ffi::foreign_builtin_type_name(tid)
-                        .filter(|n| BUILTIN_TYPES.contains(&n.as_str()))
-                    {
-                        return Ok(with_host(|h| h.builtin_object(&name)));
+                    // A CPython type pythonrs also has (`list`, `dict`, `function`,
+                    // …) is answered with the native type object, so `type(x) is
+                    // list` holds for a list kept behind a handle.
+                    if let Some(name) = crate::ffi::native_type_name(tid) {
+                        return Ok(with_host(|h| h.builtin_object(name)));
                     }
                     return Ok(with_host(|h| h.alloc(PyObj::Foreign(tid))));
                 }
@@ -8806,6 +8857,7 @@ fn call_named_builtin(
                     Some(PyObj::Memoryview {
                         obj,
                         start,
+                        stride,
                         len,
                         readonly,
                         released,
@@ -8814,10 +8866,12 @@ fn call_named_builtin(
                         if *released {
                             return Err(host::MV_RELEASED.to_string());
                         }
-                        let (obj, start, len, readonly) = (obj.clone(), *start, *len, *readonly);
+                        let (obj, start, stride, len, readonly) =
+                            (obj.clone(), *start, *stride, *len, *readonly);
                         return Ok(h.alloc(PyObj::Memoryview {
                             obj,
                             start,
+                            stride,
                             len,
                             readonly,
                             released: false,
@@ -8834,6 +8888,7 @@ fn call_named_builtin(
                 Ok(h.alloc(PyObj::Memoryview {
                     obj: v.clone(),
                     start: 0,
+                    stride: 1,
                     len,
                     readonly,
                     released: false,

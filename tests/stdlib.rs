@@ -1062,7 +1062,7 @@ fn memoryview_over_bytes() {
 fn memoryview_slicing_and_membership() {
     // A contiguous slice is a sub-view sharing the buffer.
     assert_eq!(g("x = memoryview(b'abcde')[1:3].tobytes()", "x"), "b'bc'");
-    // A strided slice materializes a fresh view.
+    // A strided slice is a view stepping through the same buffer.
     assert_eq!(g("x = memoryview(b'abcde')[::2].tobytes()", "x"), "b'ace'");
     assert_eq!(
         g("x = memoryview(b'abcde')[::-1].tobytes()", "x"),
@@ -1076,6 +1076,27 @@ fn memoryview_slicing_and_membership() {
     // bool() of an empty vs non-empty view.
     assert_eq!(g("x = bool(memoryview(b''))", "x"), "False");
     assert_eq!(g("x = bool(memoryview(b'a'))", "x"), "True");
+}
+
+/// A strided slice of a `bytearray` view is a writable view of the same buffer
+/// (`init_slice`): writes through it reach the bytearray, and `strides` /
+/// contiguity report the step.
+#[test]
+fn strided_memoryview_slices_write_through() {
+    let src = r"
+ba = bytearray(b'abcdefgh')
+m = memoryview(ba)[::2]
+out = [m.readonly, m.strides, m.c_contiguous, m[:1].contiguous, m[0:0].contiguous]
+m[0] = ord('X')
+m[1:3] = b'YZ'
+memoryview(ba)[::-1][::3] = b'123'
+m[::-1][0] = ord('Q')
+out += [bytes(ba), m.tobytes(), m[::-1].strides, memoryview(ba)[1:7:2][::-1].tolist()]
+";
+    assert_eq!(
+        g(src, "out"),
+        "[False, (2,), False, True, False, b'X3Yd2fQ1', b'XY2Q', (-2,), [102, 100, 51]]"
+    );
 }
 
 /// `memoryview` is a context manager whose exit releases the view
@@ -4179,4 +4200,22 @@ for c in ["m.groups(1, default=2)", "m.groups(x=1)", "m.groupdict(1, default=2)"
         g(src, "out"),
         r#"[('x', '-'), {'a': 'x', 'b': 0}, ('x', '?'), {'a': 'x', 'b': '-'}, 'groups() takes at most 1 argument (2 given)', "groups() got an unexpected keyword argument 'x'", 'groupdict() takes at most 1 argument (2 given)']"#
     );
+}
+
+/// `text.mode = 'r'`, as `tokenize.open` (and so `linecache`, and so every
+/// warning shown with its source line) does: a text file keeps the assigned
+/// `mode`.
+#[test]
+fn a_text_file_takes_an_assigned_mode() {
+    let mut f = tempfile::Builder::new()
+        .suffix(".py")
+        .tempfile()
+        .expect("temp file");
+    std::io::Write::write_all(&mut f, b"x = 1\n").expect("write source");
+    let path = f.path().display().to_string();
+    let src = format!(
+        "import tokenize\nwith tokenize.open({path:?}) as t:\n    out = [t.mode, t.read()]\n\
+         h = open({path:?})\nh.mode = 'rb+'\nout.append(h.mode)\nh.close()\n"
+    );
+    assert_eq!(g(&src, "out"), "['r', 'x = 1\\n', 'rb+']");
 }

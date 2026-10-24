@@ -2280,3 +2280,84 @@ finalized
         "stderr={stderr}"
     );
 }
+
+/// The `types` module's C types are the objects pythonrs's `type()` hands out:
+/// `type(c.m) is types.MethodType`, `type(None) is types.NoneType`, and they
+/// cross back out as CPython's (`typing.Optional[int]` holds `NoneType`).
+#[test]
+fn types_module_types_are_the_native_type_objects() {
+    let src = r#"
+import types, typing, functools
+def f(a): return a + 1
+class C:
+    def m(self): return 7
+c = C()
+def gen(): yield 1
+print(type(c.m) is types.MethodType, type(f) is types.FunctionType, type(len) is types.BuiltinFunctionType,
+      type(None) is types.NoneType, type(gen()) is types.GeneratorType, type(...) is types.EllipsisType,
+      type(C.__dict__) is types.MappingProxyType, type(str.join) is types.MethodDescriptorType)
+print(types.MethodType(f, 5)(), types.NoneType(), types.MappingProxyType({1: 2})[1])
+g = types.FunctionType(f.__code__, {})
+print(type(g) is types.FunctionType)
+print(typing.Optional[int].__args__[1] is type(None), typing.Optional[int] == typing.Union[int, types.NoneType])
+sd = functools.singledispatch(lambda x: 'base')
+sd.register(types.FunctionType, lambda x: 'fn')
+sd.register(types.NoneType, lambda x: 'none')
+print(sd(f), sd(None), sd(1))
+try:
+    class X(types.FunctionType): pass
+except TypeError as e: print(e)
+"#;
+    let (stdout, stderr, ok) = run_py(src);
+    if bridge_unavailable(ok, &stderr) {
+        eprintln!("skipping types-module test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(
+        stdout,
+        "True True True True True True True True\n6 None 2\nTrue\nTrue True\nfn none base\n\
+         type 'function' is not an acceptable base type\n",
+        "stderr={stderr}"
+    );
+}
+
+/// A `stacklevel` that walks off CPython's frames keeps counting through the
+/// pythonrs frames: `warnings._deprecated` (`stacklevel=3`) called from a
+/// pythonrs function names that function's caller, also when the pythonrs code
+/// runs as a CPython callback (`sorted(key=…)`), and a recorded or `error`
+/// warning carries that location. Expected output is python3.14's.
+#[test]
+fn a_deep_stacklevel_from_cpython_names_the_pythonrs_caller() {
+    let src = "\
+import warnings, contextlib
+def f():
+    warnings._deprecated('thing', remove=(3, 20))
+def via_callback(x=0):
+    f()
+    return x
+with warnings.catch_warnings(record=True) as w:
+    warnings.simplefilter('always')
+    f()
+    sorted([2, 1], key=via_callback)
+    with contextlib.ExitStack() as stack:
+        stack.callback(via_callback)
+print([(x.lineno, x.filename == __file__, x.category.__name__) for x in w])
+warnings.simplefilter('error')
+try:
+    f()
+except DeprecationWarning as e:
+    print(e)
+";
+    let (stdout, stderr, ok) = run_py(src);
+    if bridge_unavailable(ok, &stderr) {
+        eprintln!("skipping stacklevel test: stdlib bridge unavailable ({stderr})");
+        return;
+    }
+    assert_eq!(
+        stdout,
+        "[(9, True, 'DeprecationWarning'), (5, True, 'DeprecationWarning'), \
+         (5, True, 'DeprecationWarning'), (5, True, 'DeprecationWarning')]\n\
+         'thing' is deprecated and slated for removal in Python 3.20\n",
+        "stderr={stderr}"
+    );
+}
