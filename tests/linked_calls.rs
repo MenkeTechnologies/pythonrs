@@ -56,7 +56,10 @@ def total(n):
 print(caller(), g(), f(), Sub().m(1), total(1000))
 ");
     assert_eq!(err, "");
-    assert_eq!(out, "('caller', 6) first second ('sub', ('base', 2)) 499500\n");
+    assert_eq!(
+        out,
+        "('caller', 6) first second ('sub', ('base', 2)) 499500\n"
+    );
 }
 
 /// An exception raised two linked frames deep lists every frame, each at the

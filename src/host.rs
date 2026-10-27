@@ -1614,7 +1614,7 @@ pub enum PyObj {
     /// The `Ellipsis` (`...`) singleton — a distinct truthy object of type
     /// `ellipsis`, not `None` (used in slices and as a type-annotation placeholder).
     Ellipsis,
-    /// A slot the collector freed ([`gc`]), waiting on the free list for `alloc`
+    /// A slot the collector freed (`gc`), waiting on the free list for `alloc`
     /// to reuse. Nothing reachable refers to it; `get` panics on one rather
     /// than hand back whatever is allocated there next.
     Freed,
@@ -5529,7 +5529,7 @@ fn finish_run(mut vm: Box<VM>, pool_key: Option<u64>, opaque: bool) -> Result<Va
 ///
 /// `slots` seeds the entry frame's slots — the arguments of a
 /// [`FuncDef::params_in_slots`] function, empty for any other. `opaque` is as
-/// for [`gc::RunGuard`]: false only when the callers hold nothing the collector
+/// for `gc::RunGuard`: false only when the callers hold nothing the collector
 /// cannot reach.
 pub fn run_chunk_cached(
     key: u64,
@@ -17303,7 +17303,7 @@ pub fn function_annotations(func: &Value) -> Result<Value, String> {
 
 /// Invoke any callable value with positional + keyword arguments.
 ///
-/// A plain function is dispatched here, ahead of [`invoke_object`]'s match
+/// A plain function is dispatched here, ahead of `invoke_object`'s match
 /// over every other callable kind: every level of Python-to-Python recursion
 /// keeps this frame on the native stack, and that match's arms make its frame
 /// several KB in a debug build.
@@ -20929,7 +20929,7 @@ impl PyHost {
     }
 
     /// The value of exception member `name` (`args`, `errno`, … — the data
-    /// descriptors of [`crate::builtins::exception_member_owner`]) stored on a
+    /// descriptors of `crate::builtins::exception_member_owner`) stored on a
     /// user exception instance. Like CPython's, these live outside the
     /// instance `__dict__`.
     pub fn exc_member(&self, exc: &Value, name: &str) -> Option<Value> {

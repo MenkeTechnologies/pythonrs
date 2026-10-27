@@ -323,7 +323,10 @@ def f():
         boom()
 f()
 result = seen";
-    assert_eq!(g(src, "result"), "('traceback', 'f', 15, True, ['f', 'boom'])");
+    assert_eq!(
+        g(src, "result"),
+        "('traceback', 'f', 15, True, ['f', 'boom'])"
+    );
 }
 
 #[test]

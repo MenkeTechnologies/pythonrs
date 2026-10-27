@@ -801,8 +801,7 @@ mod tests {
             b.emit(fusevm::Op::LoadInt(7), 1);
             b.emit(fusevm::Op::Return, 1);
             let built = b.build();
-            let cached: Chunk =
-                bincode::deserialize(&bincode::serialize(&built).unwrap()).unwrap();
+            let cached: Chunk = bincode::deserialize(&bincode::serialize(&built).unwrap()).unwrap();
             assert_eq!(
                 cached.op_hash, built.op_hash,
                 "nan_result_hook = {nan_hook}"

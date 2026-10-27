@@ -260,7 +260,6 @@ fn collect_if_safe(vm: &VM) {
     run_weak_callbacks();
 }
 
-
 /// The reachable set, built as the roots and the objects they reach are traced.
 struct Marker {
     marks: Marks,
@@ -578,7 +577,9 @@ impl PyHost {
                 m.values(args);
                 kwargs.iter().for_each(|(_, v)| m.value(v));
             }
-            PyObj::Property { fget, fset, fdel, .. } => m.values([fget, fset, fdel]),
+            PyObj::Property {
+                fget, fset, fdel, ..
+            } => m.values([fget, fset, fdel]),
             PyObj::Redirect { target, saved, .. } => {
                 m.value(target);
                 m.values(saved);

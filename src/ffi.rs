@@ -2969,7 +2969,7 @@ fn cpython_types_type<'py>(py: Python<'py>, name: &str) -> Result<Bound<'py, PyA
         .map_err(|e| e.to_string())
 }
 
-/// `types.FunctionType(code, globals, …)` and the other [`TYPES_MODULE_TYPES`]
+/// `types.FunctionType(code, globals, …)` and the other `TYPES_MODULE_TYPES`
 /// pythonrs has no constructor for: the CPython type builds the object.
 pub fn call_types_type(
     name: &str,
@@ -2987,7 +2987,7 @@ pub fn call_types_type(
 
 /// The native type name standing for the CPython type object behind handle
 /// `tid`, when pythonrs implements that type: a builtin (`list`) or one of
-/// [`TYPES_MODULE_TYPES`] (`function`).
+/// `TYPES_MODULE_TYPES` (`function`).
 pub fn native_type_name(tid: u32) -> Option<&'static str> {
     Python::attach(|py| {
         let ty = fetch(py, tid).ok()?;
