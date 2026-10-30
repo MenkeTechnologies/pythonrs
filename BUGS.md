@@ -9,6 +9,49 @@ fixed. Every line below was re-checked against the **default-build** binary
 written.
 
 ## Implemented (previously listed here as gaps)
+- **3.15 diagnostics for conversion slots, spreads and `%` formatting.**
+  Measured against `/opt/homebrew/bin/python3` (3.15.2) with
+  `tests/parity.rs` and `parity-fuzz --stderr`. A user dunder returning the
+  wrong type reads `O.__index__() must return an int, not float` for
+  `__index__`/`__int__`/`__float__`/`__complex__`/`__bool__`/`__str__`/
+  `__repr__`/`__iter__`/`__bytes__`/`__format__`; a `__str__`/`__repr__`
+  returning a non-`str` used to be accepted and printed. A non-iterable `*`
+  operand is `Value after * must be an iterable, not int` (in calls and
+  displays; it was `'int' object is not iterable`), an unpacking source is
+  `cannot unpack non-iterable int object`, and a call's `**` operand is
+  `Value after ** must be a mapping, not list`. `%` formatting is ported
+  from `unicode_format.c`/`bytesobject.c`: per-argument errors carry
+  `format argument 2: ` / `format argument 'a': ` / `format argument: `,
+  template errors name the `%`'s position (`unsupported format %z at
+  position 0`, `stray % at position 3`), leftover/missing counts are
+  reported, a `list` or `__getitem__` object is the mapping (`'abc' % []`
+  is `'abc'`), and a keyed conversion forbids a later positional one.
+  Sequence slicing drops "or None" from its index error (`range` keeps it),
+  `combinations` says `r cannot be negative`, the integer `math` functions
+  are named `math.integer.isqrt()`, `type()`'s namespace refusal says
+  `dict or frozendict`, a bad `warnings` category reads `not class 'int'`,
+  `bytes.hex`'s `bytes_per_sep` is a `Py_ssize_t`, and a `bytearray` repr
+  no longer escapes `'` under a `"` quote. Generators, coroutines and async
+  generators answer `gi_state`/`cr_state`/`ag_state`, and coroutines and
+  async generators answer `cr_*`/`ag_*` (all were `AttributeError`, so
+  `inspect.getcoroutinestate` failed).
+- **Keyword arguments the binders dropped.** `itertools.combinations(xs,
+  r=2)` raised `combinations() missing r`; `permutations`/`combinations`/
+  `combinations_with_replacement` now bind `iterable`/`r` by keyword and read
+  `r` as a `Py_ssize_t`. `bytes.replace(..., count=n)` (new in 3.15) works,
+  and a non-integer `count` is refused instead of meaning "all". Every
+  `math` function except `isclose`/`prod` refuses keywords; `math.gcd(x=1)`
+  used to ignore the keyword and return. Argument Clinic's total-count check runs first, so
+  `round(1, 2, ndigits=3)` is `takes at most 2 arguments (3 given)`.
+  Still open against 3.15: the `frozendict`, `sentinel` and
+  `ImportCycleError` builtins do not exist (`tests/stdlib.rs`
+  `builtins_only_in_cpython_matches_the_bridge` fails on them); `'%(k)s' %
+  m` for a user mapping or a `defaultdict` miss cannot call `__getitem__`/
+  `__missing__` from inside the formatter; `math.nextafter(steps=)` is
+  refused; `__index__` returning `True` is accepted without 3.15's
+  `DeprecationWarning`, `__float__` returning a `float` subclass is refused
+  where 3.15 accepts it with that warning, and `str(x)` returning a `str` subclass comes back
+  as a plain `str`.
 - **Development mode and `sys.warnoptions`.** `-X dev` (or a non-empty
   `PYTHONDEVMODE`) sets `sys.flags.dev_mode` (a `bool`, as `safe_path` is;
   both were `0`), puts `default` first in `sys.warnoptions` and reaches the
@@ -1568,8 +1611,8 @@ written.
   `f(**None)`) was silently empty. They now merge through the same mapping test
   as `dict.update` (a `dict` subclass from its storage unless it overrides
   `__iter__`), and the errors are CPython's — `'list' object is not a mapping`,
-  `__main__.f() argument after ** must be a mapping, not list`, `keywords must
-  be strings`. `dict(seq)` skipped a pair of the wrong length instead of raising
+  `__main__.f() argument after ** must be a mapping, not list` (3.15: `Value
+  after ** must be a mapping, not list`), `keywords must be strings`. `dict(seq)` skipped a pair of the wrong length instead of raising
   `dictionary update sequence element #N has length L; 2 is required`. The
   callee in every `**`-merge error is now named as `_PyObject_FunctionStr`
   names it (`__main__.C.m`, `__main__.outer.<locals>.inner`, `list.append`),
@@ -1736,8 +1779,8 @@ written.
 - **A negative `r` is a `ValueError` from the combinatoric itertools.**
   `permutations(xs, -1)` cast `-1` to `usize`, wrapped it past the pool length
   and yielded nothing; `combinations(xs, -1)` clamped it to `0` and yielded the
-  single empty tuple. Both now raise CPython's `ValueError: r must be
-  non-negative`.
+  single empty tuple. Both now raise CPython's `ValueError` (3.15: `r must be
+  non-negative` for `permutations`, `r cannot be negative` for the other two).
 - **A module-level builtin reports its bare `__name__` and its own
   `__module__`.** `itertools.permutations.__name__` was the dotted
   `'itertools.permutations'` and `__module__` was `'builtins'`; the name split
@@ -1901,7 +1944,8 @@ written.
   `format(65, '-c')` / `format(65, ' c')` are
   `ValueError: Sign not allowed with integer format specifier 'c'` and
   `format(65, '#c')` is the matching `Alternate form (#) …`; all four used to
-  succeed. `'%c' % (10**20)` is `OverflowError: %c arg not in range(0x110000)`
+  succeed. `'%c' % (10**20)` is `OverflowError: format argument: %c argument not in
+  range(0x110000)`
   rather than a `TypeError` — an int too large is a RANGE error, not a type one.
 - **`PYTHONHASHSEED` is honoured for every seed, not just `0`.** See the
   `hash()` section below.
@@ -1920,7 +1964,7 @@ written.
   `__iter__` returns `self` keeps its identity and an unbounded iterator is
   never drained), falls back to the `__getitem__` sequence protocol when there
   is no `__iter__`, and rejects a non-iterator result with CPython's
-  `iter() returned non-iterator of type 'int'`. `next()` steps a user `__next__`
+  `B.__iter__() must return an iterator, not int` (3.15). `next()` steps a user `__next__`
   outside the host borrow, treating `StopIteration` as exhaustion, and names a
   non-iterator as `'N' object is not an iterator`.
 - **Every builtin iterator reports its own CPython type name.** All of them
