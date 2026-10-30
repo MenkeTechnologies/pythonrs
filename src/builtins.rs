@@ -15059,20 +15059,10 @@ fn platform_erf(x: f64) -> f64 {
 }
 
 /// `erfc` from the platform, for the same reason as [`platform_erf`].
-///
-/// Except at -1.0. `math_1a` first tests `x == -1.0` (`PyFloat_AsDouble`'s
-/// error value), and GCC at -O3 threads that branch and folds `erfc(-1.0)` at
-/// compile time, correctly rounded, into a constant: the CPython 3.15.1 build
-/// actions/setup-python serves answers 1.8427007929497148 from its
-/// `math_erfc`'s rodata where glibc's `erfc(-1.0)` is 1.842700792949715 (read
-/// off its disassembly). macOS libm already gives the rounded value.
 #[cfg(unix)]
 fn platform_erfc(x: f64) -> f64 {
     unsafe extern "C" {
         fn erfc(x: f64) -> f64;
-    }
-    if x == -1.0 {
-        return 1.842_700_792_949_714_8;
     }
     unsafe { erfc(x) }
 }
