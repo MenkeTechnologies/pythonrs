@@ -3456,13 +3456,23 @@ fn warning_category<'py>(
         .cast::<pyo3::types::PyType>()
         .is_ok_and(|t| t.is_subclass(&warning).unwrap_or(false));
     if !ok {
-        return Err(format!(
-            "TypeError: category must be a Warning subclass, not '{}'",
-            c.get_type()
-                .name()
+        // 3.15 names a non-Warning CLASS as itself (`not class 'int'`) and any
+        // other object by its type (`not 'int'`), both fully qualified.
+        let fq = |t: &Bound<'_, pyo3::types::PyType>| {
+            t.fully_qualified_name()
                 .map(|n| n.to_string())
                 .unwrap_or_default()
-        ));
+        };
+        return Err(match c.cast::<pyo3::types::PyType>() {
+            Ok(t) => format!(
+                "TypeError: category must be a Warning subclass, not class '{}'",
+                fq(t)
+            ),
+            Err(_) => format!(
+                "TypeError: category must be a Warning subclass, not '{}'",
+                fq(&c.get_type())
+            ),
+        });
     }
     Ok(c)
 }
@@ -4215,6 +4225,24 @@ impl PyrsIterator {
         Ok(with_host(|h| h.gen_state(&self.target)).is_some_and(|(_, _, suspended)| suspended))
     }
 
+    /// `GEN_CREATED`/`GEN_RUNNING`/`GEN_SUSPENDED`/`GEN_CLOSED` — the 3.15
+    /// attribute `inspect.getgeneratorstate` returns directly.
+    #[getter]
+    fn gi_state(&self) -> PyResult<String> {
+        self.state_attr("gi_state")
+    }
+
+    /// `inspect.getcoroutinestate` reads this off a coroutine.
+    #[getter]
+    fn cr_state(&self) -> PyResult<String> {
+        self.state_attr("cr_state")
+    }
+
+    #[getter]
+    fn ag_state(&self) -> PyResult<String> {
+        self.state_attr("ag_state")
+    }
+
     /// `None` once the generator has finished; else a frame stand-in with the
     /// two fields `inspect` reads (`f_lasti` is `-1` until the first resume).
     #[getter]
@@ -4337,6 +4365,21 @@ impl PyrsIterator {
             "'{}' object has no attribute '{name}'",
             with_host(|h| h.type_name(&self.target))
         )))
+    }
+
+    /// A `gi_state`/`cr_state`/`ag_state` read, answered by the host, which
+    /// refuses the prefix that does not match the wrapped object's kind.
+    fn state_attr(&self, name: &str) -> PyResult<String> {
+        self.require_generator(name)?;
+        match with_host(|h| h.get_attr(&self.target, name).map(|v| h.as_str(&v))) {
+            Ok(Some(s)) => Ok(s),
+            Ok(None) => Err(pyo3::exceptions::PyAttributeError::new_err(
+                name.to_string(),
+            )),
+            Err(e) => Err(pyo3::exceptions::PyAttributeError::new_err(
+                e.strip_prefix("AttributeError: ").unwrap_or(&e).to_string(),
+            )),
+        }
     }
 
     /// Shared tail of `send`/`throw`: a yielded value crosses back, an exhausted

@@ -820,7 +820,7 @@ pub fn getitem_value(recv: Value, idx: Value) -> Result<Value, String> {
     // A `slice` bound with `__index__` is resolved the same way (`a[Idx():Idx()]`).
     let idx = if with_host(|h| !matches!(h.get(&recv), Some(PyObj::Dict(_)))) {
         if with_host(|h| matches!(h.get(&idx), Some(PyObj::Slice { .. }))) {
-            normalize_slice_bounds(&idx)?
+            normalize_slice_bounds(&recv, &idx)?
         } else {
             match index_dunder(&idx) {
                 Ok(Some(v)) => v,
@@ -970,7 +970,7 @@ fn subscript_store(recv: &Value, idx: Value, val: Value) -> Result<(), String> {
         matches!(h.get(&idx), Some(PyObj::Slice { .. }))
             && !matches!(h.get(&recv), Some(PyObj::Dict(_) | PyObj::Deque { .. }))
     }) {
-        let idx = normalize_slice_bounds(&idx)?;
+        let idx = normalize_slice_bounds(&recv, &idx)?;
         // A `memoryview` slice store takes a BUFFER, not an iterable: CPython
         // rejects `mv[0:2] = [1, 2]` and `mv[0:2] = 'ab'` as "a bytes-like object
         // is required" without ever iterating them. So the bytes-like check has
@@ -1086,7 +1086,7 @@ fn subscript_delete(recv: &Value, idx: Value) -> Result<(), String> {
         matches!(h.get(&idx), Some(PyObj::Slice { .. }))
             && !matches!(h.get(&recv), Some(PyObj::Dict(_)))
     }) {
-        normalize_slice_bounds(&idx)?
+        normalize_slice_bounds(&recv, &idx)?
     } else {
         store_index(&recv, idx)?
     };
@@ -1742,7 +1742,12 @@ fn b_build_args(vm: &mut VM, argc: u8) -> Value {
         if spread {
             match host::iter_vec(&val) {
                 Ok(items) => out.extend(items),
-                Err(e) => return abort(vm, e),
+                Err(e) => {
+                    let e = host::reword_not_iterable(&val, e, |t| {
+                        format!("Value after * must be an iterable, not {t}")
+                    });
+                    return abort(vm, e);
+                }
             }
         } else {
             out.push(val);
@@ -1820,7 +1825,7 @@ fn check_kw_dup(vm: &mut VM, disp: &str) -> Option<Value> {
                 format!("{disp}() got multiple values for keyword argument '{k}'")
             }
             host::KwSpreadError::NotMapping(t) => {
-                format!("{disp}() argument after ** must be a mapping, not {t}")
+                format!("Value after ** must be a mapping, not {t}")
             }
             host::KwSpreadError::NonStrKey => "keywords must be strings".to_string(),
         };
@@ -1976,12 +1981,7 @@ pub(crate) fn py_bool(v: &Value) -> Result<bool, String> {
         // `slot_nb_bool` accepts only a `bool`: an `int` (even `1`) is refused.
         return match host::call_method(v, "__bool__", vec![], vec![])? {
             Value::Bool(b) => Ok(b),
-            x => Err(with_host(|h| {
-                host::type_error(&format!(
-                    "__bool__ should return bool, returned {}",
-                    h.tp_name(&x)
-                ))
-            })),
+            x => Err(host::bad_dunder_return(v, "__bool__", "a bool", &x)),
         };
     }
     if has_len {
@@ -2137,10 +2137,7 @@ pub(crate) fn index_dunder(v: &Value) -> Result<Option<Value>, String> {
     }
     let r = host::call_method(v, "__index__", vec![], vec![])?;
     if !is_int_value(&r) {
-        let t = with_host(|h| h.type_name(&r));
-        return Err(host::type_error(&format!(
-            "__index__ returned non-int (type {t})"
-        )));
+        return Err(host::bad_dunder_return(v, "__index__", "an int", &r));
     }
     Ok(Some(r))
 }
@@ -2196,11 +2193,10 @@ fn stringify(vm: &mut VM, v: &Value, repr: bool) -> Value {
                 Some(PyObj::Instance(i)) => instance_has(h, i, "__repr__"),
                 _ => false,
             });
-        if has {
-            let r = host::call_method(v, method, vec![], vec![]);
-            return finish(vm, r);
-        } else if has_fallback {
-            let r = host::call_method(v, "__repr__", vec![], vec![]);
+        if has || has_fallback {
+            let method = if has { method } else { "__repr__" };
+            let r = host::call_method(v, method, vec![], vec![])
+                .and_then(|r| str_result(v, method, &r).map(|_| r));
             return finish(vm, r);
         }
     }
@@ -2253,13 +2249,7 @@ fn format_field(v: &Value, conv: i64, spec: &str) -> Result<String, String> {
         let specv = with_host(|h| h.new_str(spec.to_string()));
         let r = host::call_method(v, "__format__", vec![specv], vec![])?;
         // `PyObject_Format` refuses anything but a `str` back.
-        return with_host(|h| match h.as_str(&r) {
-            Some(s) => Ok(s),
-            None => Err(host::type_error(&format!(
-                "__format__ must return a str, not {}",
-                h.tp_name(&r)
-            ))),
-        });
+        return str_result(v, "__format__", &r);
     }
     // A `str`/`int`/`float` subclass without its own `__format__` formats its
     // base value: a non-empty spec applies to the value, not to `__str__`.
@@ -4172,12 +4162,7 @@ fn bytes_percent_format(fmt_val: &Value, args: &Value, is_ba: bool) -> Result<Va
             Some(b) => {
                 premap.insert(*id, b);
             }
-            None => {
-                return Err(host::type_error(&format!(
-                    "__bytes__ returned non-bytes (type {})",
-                    with_host(|h| h.type_name(&res))
-                )))
-            }
+            None => return Err(host::bad_dunder_return(it, "__bytes__", "a bytes", &res)),
         }
     }
     let fmt = with_host(|h| match h.get(fmt_val) {
@@ -4404,7 +4389,12 @@ fn b_unpack(vm: &mut VM, _: u8) -> Value {
     let iterable = vm.pop();
     let items = match host::iter_vec(&iterable) {
         Ok(v) => v,
-        Err(e) => return abort(vm, e),
+        Err(e) => {
+            let e = host::reword_not_iterable(&iterable, e, |t| {
+                format!("cannot unpack non-iterable {t} object")
+            });
+            return abort(vm, e);
+        }
     };
     // Build the `count` target values in target order, then push them so that
     // target[0] ends on top: manually push target[1..] reversed and RETURN
@@ -6623,7 +6613,7 @@ pub fn py_str(v: &Value) -> Result<String, String> {
         });
         if has_str {
             let r = host::call_method(v, "__str__", vec![], vec![])?;
-            return Ok(with_host(|h| h.str_of(&r)));
+            return str_result(v, "__str__", &r);
         }
         // `BaseException.__str__` (the message) wins over a user `__repr__` for
         // exception instances — CPython never falls str→repr for these.
@@ -6632,7 +6622,7 @@ pub fn py_str(v: &Value) -> Result<String, String> {
         }
         if has_repr {
             let r = host::call_method(v, "__repr__", vec![], vec![])?;
-            return Ok(with_host(|h| h.str_of(&r)));
+            return str_result(v, "__repr__", &r);
         }
     }
     // `str(container)` == `repr(container)`; route through py_repr so instance
@@ -6676,7 +6666,7 @@ pub fn py_repr(v: &Value) -> Result<String, String> {
         });
         if has_repr {
             let r = host::call_method(v, "__repr__", vec![], vec![])?;
-            return Ok(with_host(|h| h.str_of(&r)));
+            return str_result(v, "__repr__", &r);
         }
     }
     // A bound method shows its receiver's `repr`, so an instance's own `__repr__`
@@ -8973,12 +8963,7 @@ fn call_named_builtin(
                         if with_host(|h| matches!(h.get(&r), Some(PyObj::Bytes(_)))) {
                             return Ok(r);
                         }
-                        return Err(with_host(|h| {
-                            host::type_error(&format!(
-                                "__bytes__ returned non-bytes (type {})",
-                                h.tp_name(&r)
-                            ))
-                        }));
+                        return Err(host::bad_dunder_return(src, "__bytes__", "a bytes", &r));
                     }
                 }
             }
@@ -9403,10 +9388,17 @@ pub(crate) fn bind_named<const N: usize>(
     args: &[Value],
     kwargs: &[(String, Value)],
 ) -> Result<[Option<Value>; N], String> {
-    if args.len() > N {
+    // Argument Clinic counts positionals AND keywords against the maximum
+    // before binding anything, so `round(1, 2, ndigits=3)` is "takes at most
+    // 2 arguments (3 given)", not a by-name/by-position clash.
+    let given = match style {
+        KwStyle::Unexpected => args.len() + kwargs.len(),
+        KwStyle::Invalid => args.len(),
+    };
+    if given > N {
+        let s = if N == 1 { "" } else { "s" };
         return Err(host::type_error(&format!(
-            "{fname}() takes at most {N} arguments ({} given)",
-            args.len()
+            "{fname}() takes at most {N} argument{s} ({given} given)"
         )));
     }
     let mut slots: [Option<Value>; N] = std::array::from_fn(|_| None);
@@ -10730,10 +10722,7 @@ fn construct_int(args: &[Value]) -> Result<Value, String> {
         if has_int {
             let r = host::call_method(&v, "__int__", vec![], vec![])?;
             if !is_int_value(&r) {
-                let t = with_host(|h| h.type_name(&r));
-                return Err(host::type_error(&format!(
-                    "__int__ returned non-int (type {t})"
-                )));
+                return Err(host::bad_dunder_return(&v, "__int__", "an int", &r));
             }
             return Ok(r);
         }
@@ -11107,13 +11096,11 @@ fn complex_parts(v: &Value, two_args: bool) -> Result<(f64, Option<f64>), String
     );
     if has_complex {
         let r = host::call_method(v, "__complex__", vec![], vec![])?;
-        return with_host(|h| match h.get(&r) {
-            Some(PyObj::Complex(re, im)) => Ok((*re, Some(*im))),
-            _ => Err(host::type_error(&format!(
-                "__complex__ returned non-complex (type {})",
-                h.type_name(&r)
-            ))),
+        let parts = with_host(|h| match h.get(&r) {
+            Some(PyObj::Complex(re, im)) => Some((*re, Some(*im))),
+            _ => None,
         });
+        return parts.ok_or_else(|| host::bad_dunder_return(v, "__complex__", "a complex", &r));
     }
     // A `complex` subclass that does not override `__complex__` inherits
     // `complex.__complex__`, which returns its value.
@@ -11172,12 +11159,7 @@ fn construct_float(args: &[Value]) -> Result<Value, String> {
         let r = host::call_method(&v, "__float__", vec![], vec![])?;
         let ok = matches!(r, Value::Float(_));
         if !ok {
-            let t = with_host(|h| h.type_name(&r));
-            // CPython names the defining type: "Fl.__float__ returned …".
-            let owner = with_host(|h| h.type_name(&v));
-            return Err(host::type_error(&format!(
-                "{owner}.__float__ returned non-float (type {t})"
-            )));
+            return Err(host::bad_dunder_return(&v, "__float__", "a float", &r));
         }
         return Ok(r);
     }
@@ -11777,9 +11759,26 @@ fn call_itertools(
             ))
         }
         "product" => itertools_product(&args, &kwargs),
-        "permutations" => itertools_permutations(&args),
-        "combinations" => itertools_combinations(&args, false),
-        "combinations_with_replacement" => itertools_combinations(&args, true),
+        "permutations" | "combinations" | "combinations_with_replacement" => {
+            // `permutations(iterable, r=None)`, `combinations(iterable, r)`:
+            // both parameters may be passed by keyword.
+            let required = if name == "permutations" { 1 } else { 2 };
+            let [pool, r] = bind_named(
+                name,
+                ["iterable", "r"],
+                0,
+                required,
+                KwStyle::Unexpected,
+                &args,
+                &kwargs,
+            )?;
+            let pool = host::iter_vec(&pool.unwrap_or(Value::Undef))?;
+            let r = r.filter(|v| !matches!(v, Value::Undef));
+            match name {
+                "permutations" => itertools_permutations(pool, r),
+                _ => itertools_combinations(pool, r, name != "combinations"),
+            }
+        }
         "tee" => itertools_tee(&args),
         "groupby" => itertools_groupby(&args, &kwargs),
         _ => Err(format!(
@@ -11834,25 +11833,24 @@ fn itertools_product(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value
     Ok(list_iter(tuples))
 }
 
-/// CPython's message for a negative `r` in `permutations`, `combinations` and
-/// `combinations_with_replacement` (Modules/itertoolsmodule.c: all three raise
-/// the same `ValueError` from their argument parsers).
-fn negative_r_error() -> String {
-    "ValueError: r must be non-negative".to_string()
+/// CPython 3.15's message for a negative `r`: `combinations` and
+/// `combinations_with_replacement` say "r cannot be negative", while
+/// `permutations` still says "r must be non-negative".
+fn negative_r_error(combinations: bool) -> String {
+    if combinations {
+        "ValueError: r cannot be negative".to_string()
+    } else {
+        "ValueError: r must be non-negative".to_string()
+    }
 }
 
-fn itertools_permutations(args: &[Value]) -> Result<Value, String> {
-    let pool = host::iter_vec(&arg0(args)?)?;
+fn itertools_permutations(pool: Vec<Value>, r: Option<Value>) -> Result<Value, String> {
     let n = pool.len();
     // A negative `r` is a ValueError, not an empty result. Casting it straight to
     // `usize` wrapped it to a huge value that failed the `r <= n` guard, so
     // `permutations(xs, -1)` quietly yielded nothing where CPython raises.
-    let r = match args
-        .get(1)
-        .filter(|v| !matches!(v, Value::Undef))
-        .and_then(|v| with_host(|h| h.as_int(v)))
-    {
-        Some(x) if x < 0 => return Err(negative_r_error()),
+    let r = match r.as_ref().map(ssize_arg).transpose()? {
+        Some(x) if x < 0 => return Err(negative_r_error(false)),
         Some(x) => x as usize,
         None => n,
     };
@@ -11893,17 +11891,18 @@ fn itertools_permutations(args: &[Value]) -> Result<Value, String> {
     Ok(list_iter(out))
 }
 
-fn itertools_combinations(args: &[Value], with_repl: bool) -> Result<Value, String> {
-    let pool = host::iter_vec(&arg0(args)?)?;
+fn itertools_combinations(
+    pool: Vec<Value>,
+    r: Option<Value>,
+    with_repl: bool,
+) -> Result<Value, String> {
     let n = pool.len();
-    let r = args
-        .get(1)
-        .and_then(|v| with_host(|h| h.as_int(v)))
-        .ok_or_else(|| host::type_error("combinations() missing r"))?;
+    // `bind_named` already required `r`.
+    let r = ssize_arg(&r.unwrap_or(Value::Undef))?;
     // `.max(0)` clamped a negative `r` to zero, which made `combinations(xs, -1)`
     // yield the single empty tuple instead of raising.
     if r < 0 {
-        return Err(negative_r_error());
+        return Err(negative_r_error(true));
     }
     let r = r as usize;
     let mut out: Vec<Value> = Vec::new();
@@ -15603,8 +15602,25 @@ fn call_math_value(
     args: &[Value],
     kwargs: &[(String, Value)],
 ) -> Result<Value, String> {
+    // 3.15 moved the integer functions into `math.integer` (re-exported by
+    // `math`), and their argument errors name that module.
+    let qual = if matches!(
+        name,
+        "comb" | "factorial" | "gcd" | "isqrt" | "lcm" | "perm"
+    ) {
+        format!("math.integer.{name}")
+    } else {
+        format!("math.{name}")
+    };
+    // Only `isclose` and `prod` take keywords; every other `math` function is
+    // positional-only and refuses any keyword at all.
+    if !kwargs.is_empty() && !matches!(name, "isclose" | "prod") {
+        return Err(host::type_error(&format!(
+            "{qual}() takes no keyword arguments"
+        )));
+    }
     if let Some(spec) = math_arity(name) {
-        check_arity(name, &format!("math.{name}"), spec, args.len())?;
+        check_arity(name, &qual, spec, args.len())?;
     }
     if matches!(name, "floor" | "ceil" | "trunc") {
         return math_round_to_int(name, args.first().unwrap_or(&Value::Undef));
@@ -16785,6 +16801,7 @@ pub fn type_data_attrs(tn: &str) -> &'static [&'static str] {
             "gi_suspended",
             "gi_frame",
             "gi_code",
+            "gi_state",
         ],
         "deque" => &["maxlen"],
         "defaultdict" => &["default_factory"],
@@ -19157,7 +19174,7 @@ pub fn call_type_method(
             let k = if with_host(|h| matches!(h.get(recv), Some(PyObj::Slice { .. }))) {
                 k
             } else if with_host(|h| matches!(h.get(&k), Some(PyObj::Slice { .. }))) {
-                normalize_slice_bounds(&k)?
+                normalize_slice_bounds(recv, &k)?
             } else {
                 store_index(recv, k)?
             };
@@ -20077,7 +20094,7 @@ fn method_kwarg_pos(bytes: bool, method: &str, kw: &str) -> Option<usize> {
         ("expandtabs", "tabsize") | ("splitlines", "keepends") => 0,
         ("encode", "encoding") if !bytes => 0,
         ("encode", "errors") if !bytes => 1,
-        ("replace", "count") if !bytes => 2,
+        ("replace", "count") => 2,
         ("decode", "encoding") if bytes => 0,
         ("decode", "errors") if bytes => 1,
         ("hex", "sep") if bytes => 0,
@@ -20094,7 +20111,9 @@ fn method_kwarg_pos(bytes: bool, method: &str, kw: &str) -> Option<usize> {
 fn method_accepts_kwargs(bytes: bool, method: &str) -> bool {
     match method {
         "split" | "rsplit" | "expandtabs" | "splitlines" => true,
-        "encode" | "replace" | "format" => !bytes,
+        // 3.15 gave `bytes.replace` the keyword `count` that `str.replace` has.
+        "replace" => true,
+        "encode" | "format" => !bytes,
         "decode" | "hex" | "translate" => bytes,
         _ => false,
     }
@@ -20688,7 +20707,8 @@ pub fn type_new_meta(
         return Err(refuse(2, "tuple", bases));
     }
     if !kind_ok(ns, |o| matches!(o, PyObj::Dict(_))) {
-        return Err(refuse(3, "dict", ns));
+        // 3.15 also accepts a `frozendict` namespace and names it in the refusal.
+        return Err(refuse(3, "dict or frozendict", ns));
     }
     // Base class names from the bases tuple (a bare `object` base is implicit).
     let base_names: Vec<String> = with_host(|h| match h.get(bases) {
@@ -21552,8 +21572,7 @@ fn builtin_method_arity(tn: &str, name: &str) -> Option<Arity> {
         "encode" if !bytes => Arity::ClinicRange(0, 2, 2),
         "decode" | "hex" if bytes => Arity::ClinicRange(0, 2, 2),
         "expandtabs" | "splitlines" => Arity::ClinicRange(0, 1, 1),
-        "replace" if !bytes => Arity::ClinicRange(2, 3, 3),
-        "replace" => Arity::VarRange(2, 3),
+        "replace" => Arity::ClinicRange(2, 3, 3),
         "translate" => Arity::ClinicRange(1, 2, 2),
         _ => return None,
     })
@@ -22563,7 +22582,7 @@ fn resolve_slice_bound(v: &Value) -> Result<Value, String> {
 /// instance bound are returned unchanged (identity preserved). This is applied
 /// ONLY on the builtin-sequence path — a user `__getitem__` receives the slice
 /// with its original bound objects, exactly as CPython delivers it.
-fn normalize_slice_bounds(idx: &Value) -> Result<Value, String> {
+fn normalize_slice_bounds(recv: &Value, idx: &Value) -> Result<Value, String> {
     let parts = with_host(|h| match h.get(idx) {
         Some(PyObj::Slice { lo, hi, step }) => Some((lo.clone(), hi.clone(), step.clone())),
         _ => None,
@@ -22595,9 +22614,20 @@ fn normalize_slice_bounds(idx: &Value) -> Result<Value, String> {
                 || matches!(h.get(b), Some(PyObj::BigInt(_)))
         });
         if !ok {
-            return Err(host::type_error(
-                "slice indices must be integers or None or have an __index__ method",
-            ));
+            // A sequence slot resolves bounds through `_PyEval_SliceIndex`,
+            // whose 3.15 wording dropped "or None"; `range` goes through
+            // `_PySlice_GetLongIndices`, which kept it.
+            let is_range = with_host(|h| {
+                matches!(
+                    h.get(recv),
+                    Some(PyObj::Range { .. } | PyObj::BigRange { .. })
+                )
+            });
+            return Err(host::type_error(if is_range {
+                "slice indices must be integers or None or have an __index__ method"
+            } else {
+                "slice indices must be integers or have an __index__ method"
+            }));
         }
     }
     Ok(with_host(|h| h.alloc(PyObj::Slice { lo, hi, step })))
@@ -24494,10 +24524,12 @@ fn bytes_common_method(
         "replace" => {
             let old = need_sub(0)?;
             let new = need_sub(1)?;
-            let count = args
-                .get(2)
-                .and_then(|v| with_host(|h| h.as_int(v)))
-                .unwrap_or(-1);
+            // `count` is a `Py_ssize_t`, as for `str.replace`: a non-integer
+            // (or `None`) is refused rather than read as "replace all".
+            let count = match args.get(2) {
+                Some(v) => ssize_arg(v)?,
+                None => -1,
+            };
             Ok(mk_bytes(is_ba, replace_bytes(&bytes, &old, &new, count)))
         }
         "strip" | "lstrip" | "rstrip" => {
@@ -24732,7 +24764,7 @@ fn pad_bytes(bytes: &[u8], args: &[Value], mode: char) -> Result<Vec<u8>, String
 /// `_Py_strhex_impl` (`Python/pystrhex.c`). `sep` is a 1-character `str` or a
 /// 1-byte `bytes`, inserted every `|bytes_per_sep|` bytes — grouping from the
 /// RIGHT for a positive count, from the LEFT for a negative one; a count of 0
-/// inserts nothing. `bytes_per_sep` is a C `int`. An unset `sep` ignores the
+/// inserts nothing. `bytes_per_sep` is a `Py_ssize_t` (a C `int` before 3.15). An unset `sep` ignores the
 /// count entirely. (`Value::Undef` is read as unset, so an explicit `None`
 /// does not raise the `has no len()` CPython gives it.)
 fn bytes_hex(bytes: &[u8], args: &[Value]) -> Result<String, String> {
@@ -24758,15 +24790,7 @@ fn bytes_hex(bytes: &[u8], args: &[Value]) -> Result<String, String> {
     };
     let group = match args.get(1) {
         None => 1,
-        Some(v) => match with_host(|h| h.index_fit(v)) {
-            host::IndexFit::Fits(n) => i32::try_from(n).map_err(|_| {
-                "OverflowError: Python int too large to convert to C int".to_string()
-            })?,
-            host::IndexFit::TooLarge(_) => {
-                return Err("OverflowError: Python int too large to convert to C int".into())
-            }
-            host::IndexFit::NotInt => ssize_arg(v)? as i32,
-        },
+        Some(v) => ssize_arg(v)?,
     };
     if group == 0 {
         return Ok(digits(bytes));
@@ -27098,6 +27122,16 @@ fn as_i(v: &Value) -> Option<i64> {
 
 fn is_str(v: &Value) -> bool {
     matches!(v, Value::Str(_)) || with_host(|h| h.as_str(v).is_some())
+}
+
+/// The text of what `owner.method()` returned, where `PyObject_Str`,
+/// `PyObject_Repr` and `PyObject_Format` accept nothing but a `str` (or a `str`
+/// subclass). A user `__str__` returning `1` used to print as `'1'`.
+fn str_result(owner: &Value, method: &str, r: &Value) -> Result<String, String> {
+    if let Value::Str(s) = r {
+        return Ok((**s).clone());
+    }
+    with_host(|h| h.as_str(r)).ok_or_else(|| host::bad_dunder_return(owner, method, "a str", r))
 }
 
 /// `callable(v)`, through the builtin so every callable kind it knows counts.

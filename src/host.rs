@@ -173,6 +173,52 @@ struct ConvFlags {
     hash: bool,
 }
 
+/// One parsed `%` conversion: its mapping key (when `%(key)`), flags, width,
+/// precision, and the conversion character with its position.
+struct PctSpec {
+    key: Option<Value>,
+    minus: bool,
+    plus: bool,
+    space: bool,
+    zero: bool,
+    hash: bool,
+    width: Option<usize>,
+    prec: Option<usize>,
+    conv: u32,
+    conv_at: usize,
+}
+
+impl PctSpec {
+    fn flags(&self) -> ConvFlags {
+        ConvFlags {
+            plus: self.plus,
+            space: self.space,
+            hash: self.hash,
+        }
+    }
+}
+
+/// `unicode_formatter_t`'s argument cursor: the current argument source, its
+/// length (`-1` for a single non-tuple argument, `-3` after a `%(key)` lookup)
+/// and the next index, plus the mapping when the arguments are one.
+struct PctState {
+    args: Value,
+    arglen: isize,
+    argidx: isize,
+    dict: Option<Value>,
+}
+
+/// Marks a conversion error that still needs `FORMAT_ERROR`'s argument label;
+/// [`pct_error`] builds it and `PyHost::percent_format_units` resolves it.
+const PCT_LABEL: &str = "\u{1}pct\u{1}";
+/// A conversion character the renderer does not know.
+const PCT_UNKNOWN_CONV: &str = "\u{1}pct-unknown\u{1}";
+
+/// A per-argument `%`-conversion error, labelled with the argument later.
+fn pct_error(exc: &str, msg: &str) -> String {
+    format!("{PCT_LABEL}{exc}\0{msg}")
+}
+
 // ── heap objects ───────────────────────────────────────────────────────────
 
 /// A key usable in a dict/set: Python hashes by value for the immutable types.
@@ -6126,7 +6172,7 @@ impl PyHost {
                 Some(PyObj::Str(s)) => s.clone(),
                 Some(PyObj::BigInt(b)) => b.to_string(),
                 Some(PyObj::Complex(r, i)) => fmt_complex(*r, *i),
-                Some(PyObj::Bytes(b)) => format!("b{}", quote_bytes(b, false)),
+                Some(PyObj::Bytes(b)) => format!("b{}", quote_bytes(b)),
                 Some(PyObj::Instance(inst)) => {
                     // A user exception instance stringifies to its message
                     // (`BaseException.__str__`): ''/str(arg)/repr(tuple).
@@ -6562,7 +6608,7 @@ impl PyHost {
                     "<_UnixSelectorEventLoop running=False closed=False debug=False>".into()
                 }
                 Some(PyObj::AsyncObj { id }) => async_rt::async_obj_repr(*id),
-                Some(PyObj::Bytearray(b)) => format!("bytearray(b{})", quote_bytes(b, true)),
+                Some(PyObj::Bytearray(b)) => format!("bytearray(b{})", quote_bytes(b)),
                 Some(PyObj::Memoryview { released, .. }) => {
                     let kind = if *released {
                         "released memory"
@@ -9183,7 +9229,7 @@ pub fn is_printable_char(c: char) -> bool {
 fn re_quote(text: &str, is_bytes: bool) -> String {
     if is_bytes {
         let raw: Vec<u8> = text.chars().map(|c| c as u8).collect();
-        format!("b{}", quote_bytes(&raw, false))
+        format!("b{}", quote_bytes(&raw))
     } else {
         quote_str(text)
     }
@@ -9232,10 +9278,10 @@ pub(crate) fn quote_str(s: &str) -> String {
 
 /// Render the `'…'`/`"…"` quoted body of a `bytes`/`bytearray` repr. CPython
 /// defaults to a single quote, switching to a double quote only when the buffer
-/// contains a `'` but no `"`. `bytes` escapes just the chosen quote char; a
-/// `bytearray` always escapes `'` (even under a `"` quote) — a CPython quirk
-/// (`bytearray(b"a'b")` → `bytearray(b"a\'b")`).
-pub(crate) fn quote_bytes(b: &[u8], is_bytearray: bool) -> String {
+/// contains a `'` but no `"`, and escapes just the chosen quote char. Before
+/// 3.15 a `bytearray` also escaped `'` under a `"` quote
+/// (`bytearray(b"a\'b")`); 3.15 renders it exactly as `bytes` does.
+pub(crate) fn quote_bytes(b: &[u8]) -> String {
     let has_single = b.contains(&b'\'');
     let has_double = b.contains(&b'"');
     let quote = if has_single && !has_double {
@@ -9255,7 +9301,6 @@ pub(crate) fn quote_bytes(b: &[u8], is_bytearray: bool) -> String {
                 out.push('\\');
                 out.push(quote as char);
             }
-            b'\'' if is_bytearray => out.push_str("\\'"),
             0x20..=0x7e => out.push(c as char),
             _ => out.push_str(&format!("\\x{c:02x}")),
         }
@@ -10425,11 +10470,309 @@ impl PyHost {
         }
     }
 
-    /// Minimal printf-style `%` formatting for `str % args`.
-    /// `str % args` — CPython printf-style formatting. Supports the mapping form
-    /// `'%(k)s' % {…}`, single-arg vs tuple positional args, conversions
-    /// `d i u s r a f F e E g G x X o c %`, the flags `- + space 0 #`, field
-    /// width and `.precision` (both as literals or `*` dynamic from the args).
+    /// Whether `%` formatting treats `args` as its mapping (`ctx->dict`):
+    /// CPython's `PyMapping_Check` (the type has `mp_subscript`) minus `tuple`
+    /// and `str` — and minus `bytes`/`bytearray` too for a bytes template. A
+    /// `list`, `range` or user class with `__getitem__` therefore counts, which
+    /// is why `'abc' % []` is `'abc'` rather than a leftover-argument error.
+    fn pct_is_mapping(&self, args: &Value, bytes: bool) -> bool {
+        match self.get(args) {
+            Some(PyObj::Dict(_))
+            | Some(PyObj::List(_))
+            | Some(PyObj::Range { .. })
+            | Some(PyObj::BigRange { .. })
+            | Some(PyObj::Memoryview { .. }) => true,
+            Some(PyObj::Bytes(_)) | Some(PyObj::Bytearray(_)) => !bytes,
+            // A builtin subclass is judged by its payload (a `str` or `tuple`
+            // subclass is excluded however it is subscripted).
+            Some(PyObj::Instance(i)) => match self.base_payload_any(args) {
+                Some(p) => self.pct_is_mapping(&p, bytes),
+                None => self.class_lookup(&i.class, "__getitem__").is_some(),
+            },
+            _ => false,
+        }
+    }
+
+    /// `str % args` / `bytes % args`, ported from CPython 3.15's
+    /// `PyUnicode_Format` (`Objects/unicode_format.c`) and `_PyBytes_FormatEx`
+    /// (`Objects/bytesobject.c`). The template is walked as code units (`char`s
+    /// of a `str`, bytes of a `bytes`), so one parser serves both; the
+    /// conversions themselves differ and are rendered by the caller's `render`.
+    ///
+    /// Argument bookkeeping follows `unicode_formatter_t` exactly: a tuple has
+    /// `arglen = len, argidx = 0`, anything else `arglen = -1, argidx = -2`; a
+    /// `%(key)` conversion swaps in the looked-up value with `arglen = -3,
+    /// argidx = -4`. Every per-argument error names its argument the way
+    /// `FORMAT_ERROR` does: `format argument 'key': `, `format argument 2: `
+    /// (1-based, a tuple element) or `format argument: ` (the single argument).
+    fn percent_format_units(
+        &mut self,
+        fmt: &[u32],
+        args: &Value,
+        bytes: bool,
+        mut render: impl FnMut(&mut Self, &PctSpec, &Value) -> Result<Vec<u32>, String>,
+    ) -> Result<Vec<u32>, String> {
+        let (arglen, argidx) = match self.get(args) {
+            Some(PyObj::Tuple(t)) => (t.len() as isize, 0isize),
+            _ => (-1, -2),
+        };
+        let mut st = PctState {
+            args: args.clone(),
+            arglen,
+            argidx,
+            dict: self.pct_is_mapping(args, bytes).then(|| args.clone()),
+        };
+        let n = fmt.len();
+        let mut out: Vec<u32> = Vec::with_capacity(n);
+        let mut i = 0usize;
+        while i < n {
+            if fmt[i] != '%' as u32 {
+                out.push(fmt[i]);
+                i += 1;
+                continue;
+            }
+            let start = i;
+            i += 1;
+            if i < n && fmt[i] == '%' as u32 {
+                out.push('%' as u32);
+                i += 1;
+                continue;
+            }
+            let spec = self.pct_parse(fmt, &mut i, start, &mut st, bytes)?;
+            let val = self.pct_next_arg(&mut st, true)?;
+            let core = render(self, &spec, &val).map_err(|e| {
+                // `render` reports a conversion it does not know with the bare
+                // character; CPython words it by what the character is.
+                if e == PCT_UNKNOWN_CONV {
+                    unknown_conv_error(spec.conv, start, spec.conv_at, bytes)
+                } else if let Some(rest) = e.strip_prefix(PCT_LABEL) {
+                    // `TypeError\0%d requires …` → the labelled message.
+                    let (exc, msg) = rest.split_once('\0').unwrap_or(("TypeError", rest));
+                    format!("{exc}: {}{msg}", self.pct_label(&spec, &st))
+                } else {
+                    e
+                }
+            })?;
+            out.extend(core);
+        }
+        if st.dict.is_none() && st.argidx < st.arglen {
+            let what = if bytes { "bytes" } else { "string" };
+            return Err(type_error(&format!(
+                "not all arguments converted during {what} formatting (required {}, got {})",
+                if st.arglen < 0 { 0 } else { st.argidx },
+                if st.arglen < 0 { 1 } else { st.arglen }
+            )));
+        }
+        Ok(out)
+    }
+
+    /// `FORMAT_ERROR`'s prefix for the argument a conversion consumed.
+    fn pct_label(&self, spec: &PctSpec, st: &PctState) -> String {
+        match &spec.key {
+            Some(k) => format!("format argument {}: ", self.repr_of(k)),
+            None if st.argidx >= 0 => format!("format argument {}: ", st.argidx),
+            None => "format argument: ".to_string(),
+        }
+    }
+
+    /// `unicode_format_getnextarg`: the next positional argument, or the single
+    /// non-tuple argument when `allowone` (a `*` width/precision never takes it).
+    fn pct_next_arg(&self, st: &mut PctState, allowone: bool) -> Result<Value, String> {
+        let idx = st.argidx;
+        if idx < st.arglen && (allowone || st.arglen >= 0) {
+            st.argidx += 1;
+            if st.arglen >= 0 {
+                if let Some(PyObj::Tuple(t)) = self.get(&st.args) {
+                    return Ok(t[idx as usize].clone());
+                }
+            }
+            return Ok(st.args.clone());
+        }
+        Err(type_error(&format!(
+            "not enough arguments for format string (got {})",
+            if st.arglen < 0 { 1 } else { st.arglen }
+        )))
+    }
+
+    /// A `*` width or precision: `PyLong_Check`, then `PyLong_AsSsize_t` (width)
+    /// or `PyLong_AsInt` (precision). An `__index__` object is refused here.
+    fn pct_star(&self, st: &mut PctState, spec: &PctSpec, width: bool) -> Result<i64, String> {
+        let v = self.pct_next_arg(st, false)?;
+        let fit = self.index_fit(&v);
+        let label = || self.pct_label(spec, st);
+        let too_big = || {
+            let what = if width { "width" } else { "precision" };
+            format!("OverflowError: {}too big for {what}", label())
+        };
+        match fit {
+            IndexFit::NotInt => Err(type_error(&format!(
+                "{}* requires int, not {}",
+                label(),
+                self.fq_type_name(&v)
+            ))),
+            IndexFit::TooLarge(_) => Err(too_big()),
+            IndexFit::Fits(n) if !width && (n > i32::MAX as i64 || n < i32::MIN as i64) => {
+                Err(too_big())
+            }
+            IndexFit::Fits(n) if width && n == i64::MIN => Err(too_big()),
+            IndexFit::Fits(n) => Ok(n),
+        }
+    }
+
+    /// `unicode_format_arg_parse`: the mapping key, flags, width, precision and
+    /// length modifier of the conversion whose `%` is at `start`; `*i` is just
+    /// past the `%` and is left past the conversion character.
+    fn pct_parse(
+        &mut self,
+        fmt: &[u32],
+        i: &mut usize,
+        start: usize,
+        st: &mut PctState,
+        bytes: bool,
+    ) -> Result<PctSpec, String> {
+        let n = fmt.len();
+        let mut spec = PctSpec {
+            key: None,
+            minus: false,
+            plus: false,
+            space: false,
+            zero: false,
+            hash: false,
+            width: None,
+            prec: None,
+            conv: 0,
+            conv_at: 0,
+        };
+        let at = |c: char, i: usize| i < n && fmt[i] == c as u32;
+        if at('(', *i) {
+            let Some(dict) = st.dict.clone() else {
+                return Err(type_error(&format!(
+                    "format requires a mapping, not {}",
+                    self.fq_type_name(&st.args)
+                )));
+            };
+            *i += 1;
+            let key_start = *i;
+            let mut depth = 1;
+            while depth > 0 && *i < n {
+                if fmt[*i] == ')' as u32 {
+                    depth -= 1;
+                } else if fmt[*i] == '(' as u32 {
+                    depth += 1;
+                }
+                *i += 1;
+            }
+            if depth > 0 {
+                return Err(format!(
+                    "ValueError: stray % or incomplete format key at position {start}"
+                ));
+            }
+            let raw = &fmt[key_start..*i - 1];
+            let key = if bytes {
+                self.alloc(PyObj::Bytes(raw.iter().map(|&u| u as u8).collect()))
+            } else {
+                self.new_str(
+                    raw.iter()
+                        .filter_map(|&u| char::from_u32(u))
+                        .collect::<String>(),
+                )
+            };
+            // A `dict` subclass reads its native payload.
+            let target = self.base_payload_any(&dict).unwrap_or_else(|| dict.clone());
+            let val = match self.get(&target) {
+                Some(PyObj::Dict(d)) => {
+                    let k = self.to_key(&key)?;
+                    match d.get(&k).map(|(_, v)| v.clone()) {
+                        Some(v) => v,
+                        None => return Err(self.key_error(&key)),
+                    }
+                }
+                _ => self.get_item(&target, &key)?,
+            };
+            st.args = val;
+            st.arglen = -3;
+            st.argidx = -4;
+            spec.key = Some(key);
+        } else if st.arglen < -1 {
+            return Err(format!(
+                "ValueError: format requires a parenthesised mapping key at position {start}"
+            ));
+        }
+        while *i < n {
+            match char::from_u32(fmt[*i]) {
+                Some('-') => spec.minus = true,
+                Some('+') => spec.plus = true,
+                Some(' ') => spec.space = true,
+                Some('#') => spec.hash = true,
+                Some('0') => spec.zero = true,
+                _ => break,
+            }
+            *i += 1;
+        }
+        let star_with_key = || {
+            format!(
+                "ValueError: * cannot be used with a parenthesised mapping key at position {start}"
+            )
+        };
+        if at('*', *i) {
+            if st.arglen < -1 {
+                return Err(star_with_key());
+            }
+            *i += 1;
+            let w = self.pct_star(st, &spec, true)?;
+            if w < 0 {
+                spec.minus = true;
+            }
+            spec.width = Some(w.unsigned_abs() as usize);
+        } else {
+            let mut w: usize = 0;
+            let mut any = false;
+            while *i < n && (('0' as u32)..=('9' as u32)).contains(&fmt[*i]) {
+                let d = (fmt[*i] - '0' as u32) as usize;
+                if w > (isize::MAX as usize - d) / 10 {
+                    return Err(format!("ValueError: width too big at position {start}"));
+                }
+                w = w * 10 + d;
+                any = true;
+                *i += 1;
+            }
+            if any {
+                spec.width = Some(w);
+            }
+        }
+        if at('.', *i) {
+            *i += 1;
+            if at('*', *i) {
+                if st.arglen < -1 {
+                    return Err(star_with_key());
+                }
+                *i += 1;
+                spec.prec = Some(self.pct_star(st, &spec, false)?.max(0) as usize);
+            } else {
+                let mut p: usize = 0;
+                while *i < n && (('0' as u32)..=('9' as u32)).contains(&fmt[*i]) {
+                    let d = (fmt[*i] - '0' as u32) as usize;
+                    if p > (i32::MAX as usize - d) / 10 {
+                        return Err(format!("ValueError: precision too big at position {start}"));
+                    }
+                    p = p * 10 + d;
+                    *i += 1;
+                }
+                spec.prec = Some(p);
+            }
+        }
+        if *i < n && matches!(char::from_u32(fmt[*i]), Some('h' | 'l' | 'L')) {
+            *i += 1;
+        }
+        if *i >= n {
+            return Err(format!("ValueError: stray % at position {start}"));
+        }
+        spec.conv = fmt[*i];
+        spec.conv_at = *i;
+        *i += 1;
+        Ok(spec)
+    }
+
     /// `str % args`. `premap` carries the dispatched `str()`/`repr()`/`ascii()`
     /// of any user instance or instance-bearing container among the format args,
     /// pre-resolved *outside* the host borrow (this method runs inside it and so
@@ -10440,171 +10783,27 @@ impl PyHost {
         args: &Value,
         premap: &HashMap<u32, (String, String, String)>,
     ) -> Result<Value, String> {
-        let is_mapping = matches!(self.get(args), Some(PyObj::Dict(_)));
-        // A mapping is also the one positional argument of a template that
-        // has no `%(key)` conversions (`'%s' % {'a': 1}`).
-        let arglist: Vec<Value> = if is_mapping {
-            vec![args.clone()]
-        } else {
-            match self.get(args) {
-                Some(PyObj::Tuple(t)) => t.clone(),
-                _ => vec![args.clone()],
-            }
-        };
-        let chars: Vec<char> = fmt.chars().collect();
-        let n = chars.len();
-        let mut out = String::new();
-        let mut ai = 0usize;
-        let mut i = 0usize;
-        while i < n {
-            if chars[i] != '%' {
-                out.push(chars[i]);
-                i += 1;
-                continue;
-            }
-            i += 1;
-            if i >= n {
-                return Err("ValueError: incomplete format".into());
-            }
-            if chars[i] == '%' {
-                out.push('%');
-                i += 1;
-                continue;
-            }
-            // Mapping key `%(name)s`.
-            let mut mapping_key: Option<String> = None;
-            if chars[i] == '(' {
-                i += 1;
-                let mut key = String::new();
-                let mut depth = 1;
-                while i < n && depth > 0 {
-                    match chars[i] {
-                        '(' => {
-                            depth += 1;
-                            key.push('(');
-                        }
-                        ')' => {
-                            depth -= 1;
-                            if depth > 0 {
-                                key.push(')');
-                            }
-                        }
-                        c => key.push(c),
-                    }
-                    i += 1;
-                }
-                mapping_key = Some(key);
-            }
-            // Flags.
-            let (mut f_minus, mut f_plus, mut f_space, mut f_zero, mut f_hash) =
-                (false, false, false, false, false);
-            while i < n {
-                match chars[i] {
-                    '-' => f_minus = true,
-                    '+' => f_plus = true,
-                    ' ' => f_space = true,
-                    '0' => f_zero = true,
-                    '#' => f_hash = true,
-                    _ => break,
-                }
-                i += 1;
-            }
-            // Width (literal or `*`).
-            let mut width: Option<usize> = None;
-            if i < n && chars[i] == '*' {
-                i += 1;
-                let w = self.next_arg_int(&arglist, &mut ai, false)?;
-                if w < 0 {
-                    f_minus = true;
-                    width = Some((-w) as usize);
-                } else {
-                    width = Some(w as usize);
-                }
-            } else {
-                let mut wd = String::new();
-                while i < n && chars[i].is_ascii_digit() {
-                    wd.push(chars[i]);
-                    i += 1;
-                }
-                if !wd.is_empty() {
-                    width = wd.parse().ok();
-                }
-            }
-            // Precision (literal or `*`).
-            let mut prec: Option<usize> = None;
-            if i < n && chars[i] == '.' {
-                i += 1;
-                if i < n && chars[i] == '*' {
-                    i += 1;
-                    prec = Some(self.next_arg_int(&arglist, &mut ai, true)?.max(0) as usize);
-                } else {
-                    let mut pd = String::new();
-                    while i < n && chars[i].is_ascii_digit() {
-                        pd.push(chars[i]);
-                        i += 1;
-                    }
-                    prec = Some(pd.parse().unwrap_or(0));
-                }
-            }
-            // Length modifiers are accepted and ignored.
-            while i < n && matches!(chars[i], 'h' | 'l' | 'L') {
-                i += 1;
-            }
-            if i >= n {
-                return Err("ValueError: incomplete format".into());
-            }
-            let conv = chars[i];
-            // CPython's message names WHERE the bad conversion character sits.
-            let conv_at = i;
-            i += 1;
-            // Resolve the value for this conversion.
-            let val = if let Some(key) = &mapping_key {
-                let kv = self.new_str(key.clone());
-                let k = self.to_key(&kv)?;
-                let found = match self.get(args) {
-                    Some(PyObj::Dict(d)) => d.get(&k).map(|(_, v)| v.clone()),
-                    _ => return Err("TypeError: format requires a mapping".into()),
-                };
-                match found {
-                    Some(v) => v,
-                    None => return Err(self.key_error(&kv)),
-                }
-            } else {
-                let v = arglist.get(ai).cloned().ok_or_else(|| {
-                    "TypeError: not enough arguments for format string".to_string()
-                })?;
-                ai += 1;
-                v
-            };
-            let core = self
-                .format_conv(
-                    conv,
-                    &val,
-                    ConvFlags {
-                        plus: f_plus,
-                        space: f_space,
-                        hash: f_hash,
-                    },
-                    prec,
-                    premap,
-                )
-                .map_err(|e| locate_unsupported_conv(e, conv, conv_at))?;
-            out.push_str(&pad_conv(
+        let units: Vec<u32> = fmt.chars().map(|c| c as u32).collect();
+        let out = self.percent_format_units(&units, args, false, |h, spec, val| {
+            let conv = char::from_u32(spec.conv).unwrap_or('\0');
+            let core = h.format_conv(conv, val, spec.flags(), spec.prec, premap)?;
+            let padded = pad_conv(
                 &core,
-                width,
-                f_minus,
-                f_zero,
+                spec.width,
+                spec.minus,
+                spec.zero,
                 is_numeric_conv(conv),
-            ));
-        }
-        if !is_mapping && ai < arglist.len() {
-            return Err("TypeError: not all arguments converted during string formatting".into());
-        }
-        Ok(self.new_str(out))
+            );
+            Ok(padded.chars().map(|c| c as u32).collect())
+        })?;
+        Ok(self.new_str(
+            out.into_iter()
+                .filter_map(char::from_u32)
+                .collect::<String>(),
+        ))
     }
 
-    /// `bytes % args` / `bytearray % args` — PEP 461 percent formatting. Mirrors
-    /// `str_format_percent` but the template and result are raw bytes and the
+    /// `bytes % args` / `bytearray % args` — PEP 461 percent formatting. The
     /// conversions follow bytes semantics: `%b`/`%s` take a bytes-like object,
     /// `%c` an int in `0..=256` or a length-1 bytes-like, `%a`/`%r` produce the
     /// ASCII repr, and the numeric conversions reuse `format_conv`. `is_ba`
@@ -10616,256 +10815,93 @@ impl PyHost {
         is_ba: bool,
         premap: &std::collections::HashMap<u32, Vec<u8>>,
     ) -> Result<Value, String> {
-        let is_mapping = matches!(self.get(args), Some(PyObj::Dict(_)));
-        // A mapping is also the one positional argument of a template that
-        // has no `%(key)` conversions (`'%s' % {'a': 1}`).
-        let arglist: Vec<Value> = if is_mapping {
-            vec![args.clone()]
-        } else {
-            match self.get(args) {
-                Some(PyObj::Tuple(t)) => t.clone(),
-                _ => vec![args.clone()],
-            }
-        };
-        let n = fmt.len();
-        let mut out: Vec<u8> = Vec::with_capacity(n);
-        let mut ai = 0usize;
-        let mut i = 0usize;
-        while i < n {
-            if fmt[i] != b'%' {
-                out.push(fmt[i]);
-                i += 1;
-                continue;
-            }
-            i += 1;
-            if i >= n {
-                return Err("ValueError: incomplete format".into());
-            }
-            if fmt[i] == b'%' {
-                out.push(b'%');
-                i += 1;
-                continue;
-            }
-            // Mapping key `%(name)s` (the key is a bytes object).
-            let mut mapping_key: Option<Vec<u8>> = None;
-            if fmt[i] == b'(' {
-                i += 1;
-                let mut key = Vec::new();
-                let mut depth = 1;
-                while i < n && depth > 0 {
-                    match fmt[i] {
-                        b'(' => {
-                            depth += 1;
-                            key.push(b'(');
-                        }
-                        b')' => {
-                            depth -= 1;
-                            if depth > 0 {
-                                key.push(b')');
-                            }
-                        }
-                        c => key.push(c),
-                    }
-                    i += 1;
-                }
-                mapping_key = Some(key);
-            }
-            // Flags.
-            let (mut f_minus, mut f_plus, mut f_space, mut f_zero, mut f_hash) =
-                (false, false, false, false, false);
-            while i < n {
-                match fmt[i] {
-                    b'-' => f_minus = true,
-                    b'+' => f_plus = true,
-                    b' ' => f_space = true,
-                    b'0' => f_zero = true,
-                    b'#' => f_hash = true,
-                    _ => break,
-                }
-                i += 1;
-            }
-            // Width (literal or `*`).
-            let mut width: Option<usize> = None;
-            if i < n && fmt[i] == b'*' {
-                i += 1;
-                let w = self.next_arg_int(&arglist, &mut ai, false)?;
-                if w < 0 {
-                    f_minus = true;
-                    width = Some((-w) as usize);
-                } else {
-                    width = Some(w as usize);
-                }
-            } else {
-                let mut wd = String::new();
-                while i < n && fmt[i].is_ascii_digit() {
-                    wd.push(fmt[i] as char);
-                    i += 1;
-                }
-                if !wd.is_empty() {
-                    width = wd.parse().ok();
-                }
-            }
-            // Precision (literal or `*`).
-            let mut prec: Option<usize> = None;
-            if i < n && fmt[i] == b'.' {
-                i += 1;
-                if i < n && fmt[i] == b'*' {
-                    i += 1;
-                    prec = Some(self.next_arg_int(&arglist, &mut ai, true)?.max(0) as usize);
-                } else {
-                    let mut pd = String::new();
-                    while i < n && fmt[i].is_ascii_digit() {
-                        pd.push(fmt[i] as char);
-                        i += 1;
-                    }
-                    prec = Some(pd.parse().unwrap_or(0));
-                }
-            }
-            // Length modifiers are accepted and ignored.
-            while i < n && matches!(fmt[i], b'h' | b'l' | b'L') {
-                i += 1;
-            }
-            if i >= n {
-                return Err("ValueError: incomplete format".into());
-            }
-            let conv = fmt[i] as char;
-            let conv_at = i;
-            i += 1;
-            // Resolve the value for this conversion.
-            let val = if let Some(key) = &mapping_key {
-                let kv = self.alloc(PyObj::Bytes(key.clone()));
-                let k = self.to_key(&kv)?;
-                let found = match self.get(args) {
-                    Some(PyObj::Dict(d)) => d.get(&k).map(|(_, v)| v.clone()),
-                    _ => return Err("TypeError: format requires a mapping".into()),
-                };
-                match found {
-                    Some(v) => v,
-                    None => return Err(self.key_error(&kv)),
-                }
-            } else {
-                let v = arglist.get(ai).cloned().ok_or_else(|| {
-                    "TypeError: not enough arguments for format string".to_string()
-                })?;
-                ai += 1;
-                v
-            };
+        let units: Vec<u32> = fmt.iter().map(|&b| b as u32).collect();
+        let out = self.percent_format_units(&units, args, true, |h, spec, val| {
+            let conv = char::from_u32(spec.conv).unwrap_or('\0');
             let (core, numeric): (Vec<u8>, bool) = match conv {
                 'b' | 's' => {
-                    let mut raw = match self.get(&val) {
+                    let mut raw = match h.get(val) {
                         Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) => b.clone(),
                         // A user instance's `__bytes__` was pre-resolved outside
                         // the borrow into `premap`, keyed by heap id.
-                        _ => match &val {
+                        _ => match val {
                             Value::Obj(id) if premap.contains_key(id) => premap[id].clone(),
                             _ => {
-                                return Err(type_error(&format!(
-                            "%b requires a bytes-like object, or an object that implements __bytes__, not '{}'",
-                            self.type_name(&val)
-                        )))
+                                return Err(pct_error(
+                                    "TypeError",
+                                    &format!(
+                                        "%b requires a bytes-like object, or an object that implements __bytes__, not {}",
+                                        h.fq_type_name(val)
+                                    ),
+                                ))
                             }
                         },
                     };
-                    if let Some(p) = prec {
+                    if let Some(p) = spec.prec {
                         raw.truncate(p);
                     }
                     (raw, false)
                 }
                 'a' | 'r' => {
                     // Both force an ASCII rendering of the repr.
-                    let mut s = ascii_of(&self.repr_of(&val));
-                    if let Some(p) = prec {
+                    let mut s = ascii_of(&h.repr_of(val));
+                    if let Some(p) = spec.prec {
                         s = s.chars().take(p).collect();
                     }
                     (s.into_bytes(), false)
                 }
                 'c' => {
-                    if let Some(cp) = self.as_int(&val) {
-                        // An out-of-range INT is an OverflowError with its own
-                        // wording; the TypeError below is for a wrong TYPE.
-                        if !(0..=255).contains(&cp) {
-                            return Err("OverflowError: %c arg not in range(256)".into());
+                    let one = match h.get(val) {
+                        Some(PyObj::Bytes(b)) => Some(("bytes", b.clone())),
+                        Some(PyObj::Bytearray(b)) => Some(("bytearray", b.clone())),
+                        _ => None,
+                    };
+                    match one {
+                        Some((_, b)) if b.len() == 1 => (b, false),
+                        Some((kind, b)) => {
+                            return Err(pct_error(
+                                "TypeError",
+                                &format!(
+                                    "%c requires an integer in range(256) or a single byte, not a {kind} object of length {}",
+                                    b.len()
+                                ),
+                            ))
                         }
-                        (vec![cp as u8], false)
-                    } else {
-                        let raw = match self.get(&val) {
-                            Some(PyObj::Bytes(b)) | Some(PyObj::Bytearray(b)) => Some(b.clone()),
-                            _ => None,
-                        };
-                        match raw {
-                            Some(b) if b.len() == 1 => (vec![b[0]], false),
-                            Some(b) => return Err(format!(
-                                "TypeError: %c requires an integer in range(256) or a single byte, not a bytes object of length {}",
-                                b.len()
-                            )),
-                            None => return Err(type_error(&format!(
-                                "%c requires an integer in range(256) or a single byte, not {}",
-                                self.type_name(&val)
-                            ))),
-                        }
+                        None => match h.index_fit(val) {
+                            IndexFit::Fits(cp) if (0..=255).contains(&cp) => (vec![cp as u8], false),
+                            IndexFit::Fits(_) | IndexFit::TooLarge(_) => {
+                                return Err(pct_error(
+                                    "OverflowError",
+                                    "%c argument not in range(256)",
+                                ))
+                            }
+                            IndexFit::NotInt => {
+                                return Err(pct_error(
+                                    "TypeError",
+                                    &format!(
+                                        "%c requires an integer in range(256) or a single byte, not {}",
+                                        h.fq_type_name(val)
+                                    ),
+                                ))
+                            }
+                        },
                     }
                 }
                 'd' | 'i' | 'u' | 'x' | 'X' | 'o' | 'f' | 'F' | 'e' | 'E' | 'g' | 'G' => {
-                    let s = self.format_conv(
-                        conv,
-                        &val,
-                        ConvFlags {
-                            plus: f_plus,
-                            space: f_space,
-                            hash: f_hash,
-                        },
-                        prec,
-                        &HashMap::default(),
-                    )?;
+                    let s = h.format_conv(conv, val, spec.flags(), spec.prec, &HashMap::default())?;
                     (s.into_bytes(), true)
                 }
-                other => {
-                    return Err(locate_unsupported_conv(
-                        format!("ValueError: unsupported format character '{other}'"),
-                        other,
-                        conv_at,
-                    ))
-                }
+                _ => return Err(PCT_UNKNOWN_CONV.to_string()),
             };
-            out.extend_from_slice(&pad_conv_bytes(&core, width, f_minus, f_zero, numeric));
-        }
-        if !is_mapping && ai < arglist.len() {
-            return Err("TypeError: not all arguments converted during bytes formatting".into());
-        }
+            let padded = pad_conv_bytes(&core, spec.width, spec.minus, spec.zero, numeric);
+            Ok(padded.into_iter().map(u32::from).collect())
+        })?;
+        let out: Vec<u8> = out.into_iter().map(|u| u as u8).collect();
         Ok(if is_ba {
             self.alloc(PyObj::Bytearray(out))
         } else {
             self.alloc(PyObj::Bytes(out))
         })
-    }
-
-    /// Pop the next positional arg as an i64 (for `*` width/precision).
-    /// The next `%`-format argument read as a `Py_ssize_t` width or precision
-    /// (the `*` forms). A bignum used to read as `0` — `'%*d' % (10**20, 1)`
-    /// printed `1` — where CPython's `PyLong_AsSsize_t` raises.
-    /// `%`'s `*` width is a `Py_ssize_t` and its `*` precision is a C `int`, and
-    /// the two overflows name different C types.
-    fn next_arg_int(&self, arglist: &[Value], ai: &mut usize, c_int: bool) -> Result<i64, String> {
-        let v = arglist
-            .get(*ai)
-            .cloned()
-            .ok_or_else(|| "TypeError: not enough arguments for format string".to_string())?;
-        *ai += 1;
-        let too_big = || {
-            if c_int {
-                "OverflowError: Python int too large to convert to C int".to_string()
-            } else {
-                "OverflowError: Python int too large to convert to C ssize_t".to_string()
-            }
-        };
-        match self.index_fit(&v) {
-            IndexFit::Fits(n) if c_int && (n > i32::MAX as i64 || n < i32::MIN as i64) => {
-                Err(too_big())
-            }
-            IndexFit::Fits(n) => Ok(n),
-            IndexFit::TooLarge(_) => Err(too_big()),
-            IndexFit::NotInt => Err("TypeError: * wants int".to_string()),
-        }
     }
 
     /// Render one `%`-conversion's core text (sign included, width padding not).
@@ -10924,26 +10960,33 @@ impl PyHost {
             'c' => {
                 if let Some(cp) = self.as_int(val) {
                     let ch = char::from_u32(cp as u32).ok_or_else(|| {
-                        "OverflowError: %c arg not in range(0x110000)".to_string()
+                        pct_error("OverflowError", "%c argument not in range(0x110000)")
                     })?;
                     Ok(ch.to_string())
                 } else if self.big_val(val).is_some() {
                     // An int too large for `as_int` is still an INT, so this is
                     // a range error and not a type error — `'%c' % 10**20` is
                     // `OverflowError`, the same as `'%c' % -1`.
-                    Err("OverflowError: %c arg not in range(0x110000)".into())
+                    Err(pct_error(
+                        "OverflowError",
+                        "%c argument not in range(0x110000)",
+                    ))
                 } else if let Some(s) = self.as_str(val) {
                     match s.chars().count() {
                         1 => Ok(s),
-                        n => Err(type_error(&format!(
-                            "%c requires an int or a unicode character, not a string of length {n}"
-                        ))),
+                        n => Err(pct_error(
+                            "TypeError",
+                            &format!("%c requires an integer or a unicode character, not a string of length {n}"),
+                        )),
                     }
                 } else {
-                    Err(type_error(&format!(
-                        "%c requires an int or a unicode character, not {}",
-                        self.type_name(val)
-                    )))
+                    Err(pct_error(
+                        "TypeError",
+                        &format!(
+                            "%c requires an integer or a unicode character, not {}",
+                            self.fq_type_name(val)
+                        ),
+                    ))
                 }
             }
             'd' | 'i' | 'u' | 'x' | 'X' | 'o' => {
@@ -10971,17 +11014,23 @@ impl PyHost {
                             num_bigint::BigInt::from_f64(f.trunc()).unwrap_or_default()
                         }
                         None => {
-                            return Err(type_error(&format!(
-                                "%{conv} format: a real number is required, not {}",
-                                self.type_name(val)
-                            )))
+                            return Err(pct_error(
+                                "TypeError",
+                                &format!(
+                                    "%{conv} requires a real number, not {}",
+                                    self.fq_type_name(val)
+                                ),
+                            ))
                         }
                     },
                     None => {
-                        return Err(type_error(&format!(
-                            "%{conv} format: an integer is required, not {}",
-                            self.type_name(val)
-                        )))
+                        return Err(pct_error(
+                            "TypeError",
+                            &format!(
+                                "%{conv} requires an integer, not {}",
+                                self.fq_type_name(val)
+                            ),
+                        ))
                     }
                 };
                 let neg = b.is_negative();
@@ -11006,10 +11055,13 @@ impl PyHost {
             }
             'f' | 'F' | 'e' | 'E' | 'g' | 'G' => {
                 let x = self.num_val(val).ok_or_else(|| {
-                    type_error(&format!(
-                        "%{conv} format: a real number is required, not {}",
-                        self.type_name(val)
-                    ))
+                    pct_error(
+                        "TypeError",
+                        &format!(
+                            "%{conv} requires a real number, not {}",
+                            self.fq_type_name(val)
+                        ),
+                    )
                 })?;
                 let neg = x.is_sign_negative();
                 if x.is_nan() {
@@ -11037,28 +11089,31 @@ impl PyHost {
                 let core = if hash { alt_decimal_point(&core) } else { core };
                 Ok(format!("{}{}", sign_str(neg), core))
             }
-            other => Err(format!(
-                "ValueError: unsupported format character '{other}'"
-            )),
+            _ => Err(PCT_UNKNOWN_CONV.to_string()),
         }
     }
 }
 
-/// Add the code point and format-string index CPython appends to an unsupported
-/// `%`-conversion. CPython's full message is
-/// `unsupported format character 'z' (0x7a) at index 1`; pythonrs reported only
-/// the character, so nothing said WHERE in the template the bad conversion was —
-/// the one piece of the message that is useful in a long format string.
-/// A non-`ValueError` (a type error from the conversion itself) passes through.
-fn locate_unsupported_conv(err: String, conv: char, at: usize) -> String {
-    let bare = format!("ValueError: unsupported format character '{conv}'");
-    if err == bare {
-        return format!(
-            "ValueError: unsupported format character '{conv}' (0x{:x}) at index {at}",
-            conv as u32
-        );
+/// The `ValueError` for a conversion character `%` formatting does not know,
+/// worded as CPython 3.15 words it by what the character is: an ASCII letter is
+/// an unsupported conversion, anything else most likely a stray `%` (`start` is
+/// the `%`, `at` the character).
+fn unknown_conv_error(conv: u32, start: usize, at: usize, bytes: bool) -> String {
+    let stray = format!("ValueError: stray % at position {start} or unexpected format character");
+    let c = char::from_u32(conv).unwrap_or('\u{fffd}');
+    if c.is_ascii_alphabetic() {
+        format!("ValueError: unsupported format %{c} at position {start}")
+    } else if c == '\'' {
+        format!("{stray} \"'\" at position {at}")
+    } else if (32..127).contains(&conv) {
+        format!("{stray} '{c}' at position {at}")
+    } else if bytes {
+        format!("{stray} with code 0x{conv:02x} at position {at}")
+    } else if is_printable_char(c) {
+        format!("{stray} '{c}' (U+{conv:04X}) at position {at}")
+    } else {
+        format!("{stray} U+{conv:04X} at position {at}")
     }
-    err
 }
 
 /// Whether a `%`-conversion produces a number (eligible for `0`-fill / sign).
@@ -14532,6 +14587,42 @@ impl PyHost {
             // function's name. `gi_yieldfrom` is NOT here: it needs the
             // delegated iterator tracked across `yield from`, and reporting
             // `None` for it would be a wrong answer rather than a missing one.
+            // A coroutine's `cr_*` and an async generator's `ag_*` attributes are
+            // the generator's `gi_*` under their own prefix; `<prefix>_state`
+            // (3.15) is the state name `inspect.getgeneratorstate` and
+            // `getcoroutinestate` return.
+            Some(PyObj::Generator { id })
+                if name.starts_with("cr_") || name.starts_with("ag_") || name == "gi_state" =>
+            {
+                let (prefix, tag) = match self.generators[*id as usize].kind {
+                    GenKind::Generator => ("gi_", "GEN"),
+                    GenKind::Coroutine => ("cr_", "CORO"),
+                    GenKind::AsyncGen => ("ag_", "AGEN"),
+                };
+                match name.strip_prefix(prefix) {
+                    Some("state") => {
+                        let g = &self.generators[*id as usize];
+                        let running = g.coro.is_none() && !g.done;
+                        let state = if g.done {
+                            "CLOSED"
+                        } else if running {
+                            "RUNNING"
+                        } else if g.started {
+                            "SUSPENDED"
+                        } else {
+                            "CREATED"
+                        };
+                        Ok(self.new_str(format!("{tag}_{state}")))
+                    }
+                    Some(rest @ ("running" | "suspended" | "frame" | "code")) => {
+                        self.get_attr_inner(recv, &format!("gi_{rest}"))
+                    }
+                    _ => Err(format!(
+                        "AttributeError: '{}' object has no attribute '{name}'",
+                        self.type_name(recv)
+                    )),
+                }
+            }
             Some(PyObj::Generator { .. }) if matches!(name, "gi_frame" | "gi_code") => {
                 let Some((fname, done, line)) = self.gen_frame_info(recv) else {
                     return Err(format!(
@@ -23582,6 +23673,21 @@ pub fn is_iterator(v: &Value) -> bool {
     })
 }
 
+/// The `TypeError` a conversion slot raises when a user dunder hands back the
+/// wrong type, worded as CPython 3.15 words every one of them
+/// (`Objects/abstract.c`, `typeobject.c`): `'%T.__index__() must return an int,
+/// not %T'`. `owner` is the receiver, `want` the article and type the slot
+/// requires (`"an int"`, `"a str"`, `"an iterator"`).
+pub fn bad_dunder_return(owner: &Value, method: &str, want: &str, got: &Value) -> String {
+    with_host(|h| {
+        type_error(&format!(
+            "{}.{method}() must return {want}, not {}",
+            h.fq_type_name(owner),
+            h.fq_type_name(got)
+        ))
+    })
+}
+
 /// Run a user class's `__iter__` and require that it handed back an ITERATOR.
 ///
 /// CPython enforces this where `iter()` is applied, so `for x in obj` and
@@ -23594,10 +23700,21 @@ pub fn call_iter_dunder(v: &Value) -> Result<Value, String> {
     if is_iterator(&it) {
         return Ok(it);
     }
-    Err(type_error(&format!(
-        "iter() returned non-iterator of type '{}'",
-        with_host(|h| h.type_name(&it))
-    )))
+    Err(bad_dunder_return(v, "__iter__", "an iterator", &it))
+}
+
+/// Re-word `e` when it is the plain refusal to iterate `v` at all
+/// (`'int' object is not iterable`): a `*` spread and an unpacking assignment
+/// raise their own text for a non-iterable operand (`ceval.c`'s
+/// `_PyEval_FormatExcCheckArg` siblings), while an error raised from INSIDE a
+/// user `__iter__` passes through unchanged. `msg` is built from `v`'s type name.
+pub fn reword_not_iterable(v: &Value, e: String, msg: impl FnOnce(&str) -> String) -> String {
+    let tn = with_host(|h| h.type_name(v));
+    if e == type_error(&format!("'{tn}' object is not iterable")) {
+        type_error(&msg(&tn))
+    } else {
+        e
+    }
 }
 
 /// Turn `v` into something [`iter_step`] can drive, running any user-level

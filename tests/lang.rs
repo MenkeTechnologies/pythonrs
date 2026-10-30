@@ -1672,7 +1672,7 @@ fn user_iterator_protocol_is_lazy_and_identity_preserving() {
     // distinct messages.
     assert_eq!(
         eval_str("class B:\n    def __iter__(self): return 5\nx = iter(B())").unwrap_err(),
-        "TypeError: iter() returned non-iterator of type 'int'"
+        "TypeError: B.__iter__() must return an iterator, not int"
     );
     assert_eq!(
         eval_str("class N: pass\nx = next(N())").unwrap_err(),
@@ -5428,7 +5428,7 @@ fn bignum_through_a_float_presentation_type() {
     );
     assert_eq!(
         pythonrs::eval_str("x = '%c' % (10**20)").unwrap_err(),
-        "OverflowError: %c arg not in range(0x110000)"
+        "OverflowError: format argument: %c argument not in range(0x110000)"
     );
 }
 
@@ -7712,18 +7712,18 @@ fn diagnostics_match_the_reference_wording() {
             "1 * None",
             "TypeError: unsupported operand type(s) for *: 'int' and 'NoneType'",
         ),
-        // fabricated: dropped the code point and the index in the template.
+        // 3.15 names an unsupported conversion by the position of its `%`.
         (
             "'%z' % 1",
-            "ValueError: unsupported format character 'z' (0x7a) at index 1",
+            "ValueError: unsupported format %z at position 0",
         ),
         (
             "'ab%q' % 1",
-            "ValueError: unsupported format character 'q' (0x71) at index 3",
+            "ValueError: unsupported format %q at position 2",
         ),
         (
             "b'%z' % 1",
-            "ValueError: unsupported format character 'z' (0x7a) at index 1",
+            "ValueError: unsupported format %z at position 0",
         ),
         // fabricated: named neither the item index nor the offending type.
         (
@@ -8210,10 +8210,10 @@ fn protocol_failures_report_the_protocol() {
         ("super()", "RuntimeError: super(): no arguments"),
         // An out-of-range %c argument is an OverflowError with its own wording;
         // the TypeError is for a wrong TYPE.
-        ("b'%c' % 300", "OverflowError: %c arg not in range(256)"),
+        ("b'%c' % 300", "OverflowError: format argument: %c argument not in range(256)"),
         (
             "b'%c' % 'a'",
-            "TypeError: %c requires an integer in range(256) or a single byte, not str",
+            "TypeError: format argument: %c requires an integer in range(256) or a single byte, not str",
         ),
         // str.format brace handling: a stray `{` was consumed to end-of-string
         // and reported as a missing argument; a stray `}` was emitted as a
@@ -8482,7 +8482,6 @@ fn a_bignum_index_is_an_overflow_not_a_type_error() {
         "\"abc\".rsplit(\"b\", 10**20)",
         "\"abc\".replace(\"b\", \"x\", 10**20)",
         "(1).to_bytes(10**20, \"big\")",
-        "\"%*d\" % (10**20, 1)",
     ] {
         assert_eq!(
             eval_str(src).expect_err("must raise"),
@@ -8490,10 +8489,19 @@ fn a_bignum_index_is_an_overflow_not_a_type_error() {
             "for {src:?}"
         );
     }
+    // A `%` `*` width (`Py_ssize_t`) or precision (C `int`) that does not fit
+    // is labelled with its argument and named by what it was for (3.15).
+    assert_eq!(
+        eval_str("\"%*d\" % (10**20, 1)").expect_err("must raise"),
+        "OverflowError: format argument 1: too big for width"
+    );
+    assert_eq!(
+        eval_str("\"%.*f\" % (10**20, 1.5)").expect_err("must raise"),
+        "OverflowError: format argument 1: too big for precision"
+    );
     // Two sites take a C `int`, and CPython names that width instead.
     for src in [
         "\"a\\tb\".expandtabs(10**20)",
-        "\"%.*f\" % (10**20, 1.5)",
         "import sys\nsys.setrecursionlimit(10**30)",
     ] {
         assert_eq!(
@@ -9602,8 +9610,8 @@ t(lambda: "x".zfill(None))
     assert!(result.is_ok(), "{result:?}");
     assert_eq!(
         out,
-        r##"TypeError: %c requires an int or a unicode character, not float
-TypeError: %c requires an int or a unicode character, not a string of length 2
+        r##"TypeError: format argument: %c requires an integer or a unicode character, not float
+TypeError: format argument: %c requires an integer or a unicode character, not a string of length 2
 TypeError: 'in <string>' requires string as left operand, not float
 TypeError: 'int' object is not reversible
 TypeError: 'set' object is not reversible
@@ -9914,27 +9922,27 @@ fn bool_format_and_bytes_dunders_are_called_and_checked() {
     for (src, want) in [
         (
             "bool(B1())",
-            "TypeError: __bool__ should return bool, returned int",
+            "TypeError: B1.__bool__() must return a bool, not int",
         ),
         (
             "not B1()",
-            "TypeError: __bool__ should return bool, returned int",
+            "TypeError: B1.__bool__() must return a bool, not int",
         ),
         (
             "1 if B1() else 2",
-            "TypeError: __bool__ should return bool, returned int",
+            "TypeError: B1.__bool__() must return a bool, not int",
         ),
         (
             "format(F())",
-            "TypeError: __format__ must return a str, not int",
+            "TypeError: F.__format__() must return a str, not int",
         ),
         (
             "f'{F()}'",
-            "TypeError: __format__ must return a str, not int",
+            "TypeError: F.__format__() must return a str, not int",
         ),
         (
             "bytes(BadBy())",
-            "TypeError: __bytes__ returned non-bytes (type str)",
+            "TypeError: BadBy.__bytes__() must return a bytes, not str",
         ),
         (
             "bytes(By(), 'utf-8')",
@@ -11195,5 +11203,345 @@ for f in (lambda: [1] + D(), lambda: D() + [1], lambda: 'a' * D(), lambda: L([1]
          'can only concatenate list (not \"tuple\") to list', \
          \"can't multiply sequence by non-int of type 'str'\", \
          'can only concatenate tuple (not \"L\") to tuple']"
+    );
+}
+
+// ── CPython 3.15 parity: expected outputs below were captured from
+// /opt/homebrew/bin/python3 (Python 3.15.2) running the same program. ──
+
+/// A user dunder that hands back the wrong type is refused by the slot that
+/// called it, worded as 3.15 words every one: `O.__index__() must return an
+/// int, not float` (the receiver's qualified type, then what came back). A
+/// `__str__`/`__repr__` returning a non-`str` used to print as its `str()`;
+/// a `str` subclass is accepted.
+#[test]
+fn conversion_slots_refuse_a_wrong_result_type() {
+    let src = r#"def t(label, f):
+    try: print(label, repr(f()))
+    except Exception as e: print(label, type(e).__name__ + ":", e)
+def make():
+    class O:
+        def __index__(s): return 1.5
+        def __int__(s): return 1.5
+        def __float__(s): return 1
+        def __complex__(s): return 1
+        def __bool__(s): return 1
+        def __str__(s): return 1
+        def __repr__(s): return 2
+        def __iter__(s): return 3
+        def __bytes__(s): return 4
+        def __format__(s, spec): return 5
+    return O
+O = make()
+class S(str): pass
+class Good:
+    def __str__(s): return S('sub')
+    def __repr__(s): return S('rsub')
+t('index', lambda: [1][O()])
+t('int', lambda: int(O()))
+t('float', lambda: float(O()))
+t('complex', lambda: complex(O()))
+t('bool', lambda: bool(O()))
+t('str', lambda: str(O()))
+t('repr', lambda: repr(O()))
+t('fstr-r', lambda: f'{O()!r}')
+t('pct-s', lambda: '%s' % O())
+t('in-list', lambda: str([O()]))
+t('iter', lambda: iter(O()))
+t('for', lambda: [x for x in O()])
+t('bytes', lambda: bytes(O()))
+t('format', lambda: format(O(), ''))
+t('good', lambda: (str(Good()), repr(Good())))
+"#;
+    let (result, out) = pythonrs::eval_str_captured(src, &[]);
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        out,
+        r#"index TypeError: make.<locals>.O.__index__() must return an int, not float
+int TypeError: make.<locals>.O.__int__() must return an int, not float
+float TypeError: make.<locals>.O.__float__() must return a float, not int
+complex TypeError: make.<locals>.O.__complex__() must return a complex, not int
+bool TypeError: make.<locals>.O.__bool__() must return a bool, not int
+str TypeError: make.<locals>.O.__str__() must return a str, not int
+repr TypeError: make.<locals>.O.__repr__() must return a str, not int
+fstr-r TypeError: make.<locals>.O.__repr__() must return a str, not int
+pct-s TypeError: make.<locals>.O.__str__() must return a str, not int
+in-list TypeError: make.<locals>.O.__repr__() must return a str, not int
+iter TypeError: make.<locals>.O.__iter__() must return an iterator, not int
+for TypeError: make.<locals>.O.__iter__() must return an iterator, not int
+bytes TypeError: make.<locals>.O.__bytes__() must return a bytes, not int
+format TypeError: make.<locals>.O.__format__() must return a str, not int
+good ('sub', 'rsub')
+"#
+    );
+}
+
+/// A non-iterable `*` operand and a non-iterable unpacking source get their
+/// own wording instead of the bare `'int' object is not iterable`, while an
+/// error raised INSIDE a user `__iter__` passes through untouched.
+#[test]
+fn star_spread_and_unpacking_name_a_non_iterable_operand() {
+    let src = r#"def t(label, f):
+    try: print(label, repr(f()))
+    except Exception as e: print(label, type(e).__name__ + ":", e)
+def f(*a, **k): return a, k
+class G:
+    def __iter__(s): raise TypeError("'int' object is not iterable, from inside")
+t('list', lambda: [*1])
+t('tuple', lambda: (*None,))
+t('call', lambda: f(1, *2.5))
+t('inner', lambda: f(*G()))
+t('dstar', lambda: f(**[]))
+t('dstar-dict', lambda: dict(**{}, **[1]))
+t('display', lambda: {**1})
+def unpack(v):
+    a, b = v
+    return a, b
+def unpack_star(v):
+    a, *b = v
+    return a, b
+t('unpack', lambda: unpack(5))
+t('unpack-none', lambda: unpack(None))
+t('unpack-star', lambda: unpack_star(1.5))
+def loop():
+    for x, y in [1]: pass
+t('for-target', loop)
+t('ok', lambda: (unpack((1, 2)), f(*[1], *'ab')))
+"#;
+    let (result, out) = pythonrs::eval_str_captured(src, &[]);
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        out,
+        r#"list TypeError: Value after * must be an iterable, not int
+tuple TypeError: Value after * must be an iterable, not NoneType
+call TypeError: Value after * must be an iterable, not float
+inner TypeError: 'int' object is not iterable, from inside
+dstar TypeError: Value after ** must be a mapping, not list
+dstar-dict TypeError: Value after ** must be a mapping, not list
+display TypeError: 'int' object is not a mapping
+unpack TypeError: cannot unpack non-iterable int object
+unpack-none TypeError: cannot unpack non-iterable NoneType object
+unpack-star TypeError: cannot unpack non-iterable float object
+for-target TypeError: cannot unpack non-iterable int object
+ok ((1, 2), ((1, 'a', 'b'), {}))
+"#
+    );
+}
+
+/// Keyword `r` for the combinatoric itertools, Argument Clinic's total-count
+/// check, `math` refusing keywords, `bytes.replace(count=)`, the 3.15
+/// wording of slice/`r`/`type()`/`bytearray` repr, and `gi_state`/
+/// `cr_state`/`ag_state` with the `cr_*`/`ag_*` attributes.
+#[test]
+fn argument_binding_and_3_15_wording_of_builtins() {
+    let src = r#"import itertools, math
+def t(label, f):
+    try: print(label, repr(f()))
+    except Exception as e: print(label, type(e).__name__ + ":", e)
+L = [1, 2, 3]
+t('slice-list', lambda: L[:2.5])
+t('slice-str', lambda: 'abc'['x':])
+t('slice-range', lambda: range(5)[:1.5])
+t('slice-indices', lambda: slice(None, 'a').indices(5))
+t('comb-kw', lambda: list(itertools.combinations(r=1, iterable=[1, 2])))
+t('cwr-kw', lambda: list(itertools.combinations_with_replacement([1, 2], r=2)))
+t('perm-kw', lambda: list(itertools.permutations('ab', r=1)))
+t('comb-neg', lambda: itertools.combinations([1], -1))
+t('cwr-neg', lambda: itertools.combinations_with_replacement([1], r=-1))
+t('perm-neg', lambda: itertools.permutations([1], -1))
+t('comb-missing', lambda: itertools.combinations([1]))
+t('comb-float', lambda: itertools.combinations([1], 1.5))
+t('comb-many', lambda: itertools.combinations([1], 1, r=1))
+t('perm-unknown', lambda: itertools.permutations([1], x=1))
+t('round-many', lambda: round(1, 2, ndigits=3))
+t('pow-many', lambda: pow(1, 2, 3, mod=4))
+t('isqrt', lambda: math.isqrt(1, 2))
+t('factorial', lambda: math.factorial())
+t('gcd-kw', lambda: math.gcd(x=1))
+t('sqrt-kw', lambda: math.sqrt(x=4))
+t('isclose-kw', lambda: math.isclose(1, 1.0, rel_tol=0.1))
+t('prod-kw', lambda: math.prod([2, 3], start=2))
+t('brepl-kw', lambda: b'aaa'.replace(b'a', b'b', count=2))
+t('barepl-kw', lambda: bytearray(b'aaa').replace(b'a', b'b', count=1))
+t('brepl-none', lambda: b'aaa'.replace(b'a', b'b', count=None))
+t('brepl-str', lambda: b'aaa'.replace(b'a', b'b', 'x'))
+t('brepl-few', lambda: b'a'.replace(b'a'))
+t('hex-big', lambda: b'abcd'.hex(':', 2**40))
+t('hex-huge', lambda: b'ab'.hex(':', 2**70))
+t('type-ns', lambda: type('A', (), 1))
+t('ba-repr', lambda: (bytearray(b"a'b"), bytearray(b'a"b'), bytearray(b'a"\'b')))
+def gen(): yield 1
+x = gen(); s = [x.gi_state]; next(x); s.append(x.gi_state); x.close(); s.append(x.gi_state)
+print(s)
+async def coro(): pass
+co = coro(); print(co.cr_state, co.cr_running, co.cr_suspended); co.close(); print(co.cr_state, co.cr_frame)
+async def agen(): yield 1
+a = agen(); print(a.ag_state)
+t('wrong-prefix', lambda: a.cr_state)
+"#;
+    let (result, out) = pythonrs::eval_str_captured(src, &[]);
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        out,
+        r#"slice-list TypeError: slice indices must be integers or have an __index__ method
+slice-str TypeError: slice indices must be integers or have an __index__ method
+slice-range TypeError: slice indices must be integers or None or have an __index__ method
+slice-indices TypeError: slice indices must be integers or None or have an __index__ method
+comb-kw [(1,), (2,)]
+cwr-kw [(1, 1), (1, 2), (2, 2)]
+perm-kw [('a',), ('b',)]
+comb-neg ValueError: r cannot be negative
+cwr-neg ValueError: r cannot be negative
+perm-neg ValueError: r must be non-negative
+comb-missing TypeError: combinations() missing required argument 'r' (pos 2)
+comb-float TypeError: 'float' object cannot be interpreted as an integer
+comb-many TypeError: combinations() takes at most 2 arguments (3 given)
+perm-unknown TypeError: permutations() got an unexpected keyword argument 'x'
+round-many TypeError: round() takes at most 2 arguments (3 given)
+pow-many TypeError: pow() takes at most 3 arguments (4 given)
+isqrt TypeError: math.integer.isqrt() takes exactly one argument (2 given)
+factorial TypeError: math.integer.factorial() takes exactly one argument (0 given)
+gcd-kw TypeError: math.integer.gcd() takes no keyword arguments
+sqrt-kw TypeError: math.sqrt() takes no keyword arguments
+isclose-kw True
+prod-kw 12
+brepl-kw b'bba'
+barepl-kw bytearray(b'baa')
+brepl-none TypeError: 'NoneType' object cannot be interpreted as an integer
+brepl-str TypeError: 'str' object cannot be interpreted as an integer
+brepl-few TypeError: replace() takes at least 2 positional arguments (1 given)
+hex-big '61626364'
+hex-huge OverflowError: Python int too large to convert to C ssize_t
+type-ns TypeError: type.__new__() argument 3 must be dict or frozendict, not int
+ba-repr (bytearray(b"a'b"), bytearray(b'a"b'), bytearray(b'a"\'b'))
+['GEN_CREATED', 'GEN_SUSPENDED', 'GEN_CLOSED']
+CORO_CREATED False False
+CORO_CLOSED None
+AGEN_CREATED
+wrong-prefix AttributeError: 'async_generator' object has no attribute 'cr_state'
+"#
+    );
+}
+
+/// The bridged `warnings.warn` names a non-Warning category as 3.15 does
+/// (`not class 'int'` for a class, `not 'int'` for an instance), and
+/// `inspect.getgeneratorstate`/`getcoroutinestate` read the 3.15 `*_state`
+/// attributes off a pythonrs generator and coroutine.
+#[cfg(feature = "stdlib-ffi")]
+#[test]
+fn warning_category_and_inspect_states_over_the_bridge() {
+    let src = r#"import inspect, warnings
+def t(label, f):
+    try: print(label, repr(f()))
+    except Exception as e: print(label, type(e).__name__ + ":", e)
+for c in (int, 1, 'x', ValueError):
+    t('warn', lambda: warnings.warn('m', c))
+def gen(): yield 1
+x = gen(); s = [inspect.getgeneratorstate(x)]; next(x); s.append(inspect.getgeneratorstate(x)); x.close(); s.append(inspect.getgeneratorstate(x))
+print(s)
+async def coro(): pass
+co = coro(); print(inspect.getcoroutinestate(co)); co.close(); print(inspect.getcoroutinestate(co))
+"#;
+    let (result, out) = pythonrs::eval_str_captured(src, &[]);
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        out,
+        r#"warn TypeError: category must be a Warning subclass, not class 'int'
+warn TypeError: category must be a Warning subclass, not 'int'
+warn TypeError: category must be a Warning subclass, not 'str'
+warn TypeError: category must be a Warning subclass, not class 'ValueError'
+['GEN_CREATED', 'GEN_SUSPENDED', 'GEN_CLOSED']
+CORO_CREATED
+CORO_CLOSED
+"#
+    );
+}
+
+/// `%` formatting ported from 3.15's `unicode_format.c`/`bytesobject.c`:
+/// every per-argument error is labelled (`format argument 2: `, `format
+/// argument 'a': `, or `format argument: ` for the single argument), template
+/// errors name the position of the `%`, a list/user `__getitem__` object is
+/// the mapping (`'abc' % []` is `'abc'`), and a keyed conversion forbids a
+/// later positional one.
+#[test]
+fn percent_format_errors_follow_unicode_format_c() {
+    let src = r#"def t(src):
+    try: print(src, '->', repr(eval(src)))
+    except Exception as e: print(src, '!', type(e).__name__ + ":", e)
+for src in [
+ "'%d' % 'x'", "'%s %d' % (1, 'x')", "'%(a)d' % {'a': 'x'}", "'%x' % 1.5", "'%o' % None",
+ "'%c' % 'ab'", "'%c' % 1.5", "'%c' % -1", "'%s %c' % (1, 10**20)",
+ "'%*d' % ('a', 1)", "'%d %.*f' % (1, 'a', 1.0)", "'%*d' % (2**70, 1)", "'%.*d' % (2**40, 1)",
+ "'%f' % 'x'", "'%(a)e' % {'a': [1]}",
+ "'%s' % ()", "'%s %s' % (1,)", "'%s %s' % 1", "'%*d' % 1", "'%s' % (1, 2)", "'abc' % 1",
+ "'abc' % []", "'abc' % {'a': 1}", "'%s' % {'a': 1}", "'%(a)s %s' % {'a': 1}", "'%(a)*d' % {'a': 1}",
+ "'%' % 1", "'abc%' % ()", "'%(a' % {'a': 1}", "'%(a)' % {'a': 1}", "'%5' % 1",
+ "'%z' % 1", "'ab%y' % 1", "'%!' % 1", "'%\\'' % 1", "'%\\xe9' % 1", "'%\\x07' % 1",
+ "'%(a)d' % 1", "'%(a)d' % (1,)", "'%(a)d' % [1]", "'%(b)d' % {'a': 1}",
+ "b'%d' % b'x'", "b'%c' % 'x'", "b'%c' % b'ab'", "b'%c' % bytearray(b'ab')", "b'%c' % 256", "b'%f' % 'x'",
+ "b'%s' % 1", "b'%(a)s' % {b'a': 1}", "b'%s' % (b'1', b'2')", "b'%(a)s' % 1", "b'%\\x07' % 1",
+ "'%s|%5.2f|%-4d|%(x)s' % (1, 2.5, 3, 4)" if False else "'%s|%5.2f|%-4d|' % (1, 2.5, 3)", "'%(x)s-%(y)05d' % {'x': 1, 'y': 2}",
+]:
+    t(src)
+"#;
+    let (result, out) = pythonrs::eval_str_captured(src, &[]);
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        out,
+        r#"'%d' % 'x' ! TypeError: format argument: %d requires a real number, not str
+'%s %d' % (1, 'x') ! TypeError: format argument 2: %d requires a real number, not str
+'%(a)d' % {'a': 'x'} ! TypeError: format argument 'a': %d requires a real number, not str
+'%x' % 1.5 ! TypeError: format argument: %x requires an integer, not float
+'%o' % None ! TypeError: format argument: %o requires an integer, not NoneType
+'%c' % 'ab' ! TypeError: format argument: %c requires an integer or a unicode character, not a string of length 2
+'%c' % 1.5 ! TypeError: format argument: %c requires an integer or a unicode character, not float
+'%c' % -1 ! OverflowError: format argument: %c argument not in range(0x110000)
+'%s %c' % (1, 10**20) ! OverflowError: format argument 2: %c argument not in range(0x110000)
+'%*d' % ('a', 1) ! TypeError: format argument 1: * requires int, not str
+'%d %.*f' % (1, 'a', 1.0) ! TypeError: format argument 2: * requires int, not str
+'%*d' % (2**70, 1) ! OverflowError: format argument 1: too big for width
+'%.*d' % (2**40, 1) ! OverflowError: format argument 1: too big for precision
+'%f' % 'x' ! TypeError: format argument: %f requires a real number, not str
+'%(a)e' % {'a': [1]} ! TypeError: format argument 'a': %e requires a real number, not list
+'%s' % () ! TypeError: not enough arguments for format string (got 0)
+'%s %s' % (1,) ! TypeError: not enough arguments for format string (got 1)
+'%s %s' % 1 ! TypeError: not enough arguments for format string (got 1)
+'%*d' % 1 ! TypeError: not enough arguments for format string (got 1)
+'%s' % (1, 2) ! TypeError: not all arguments converted during string formatting (required 1, got 2)
+'abc' % 1 ! TypeError: not all arguments converted during string formatting (required 0, got 1)
+'abc' % [] -> 'abc'
+'abc' % {'a': 1} -> 'abc'
+'%s' % {'a': 1} -> "{'a': 1}"
+'%(a)s %s' % {'a': 1} ! ValueError: format requires a parenthesised mapping key at position 6
+'%(a)*d' % {'a': 1} ! ValueError: * cannot be used with a parenthesised mapping key at position 0
+'%' % 1 ! ValueError: stray % at position 0
+'abc%' % () ! ValueError: stray % at position 3
+'%(a' % {'a': 1} ! ValueError: stray % or incomplete format key at position 0
+'%(a)' % {'a': 1} ! ValueError: stray % at position 0
+'%5' % 1 ! ValueError: stray % at position 0
+'%z' % 1 ! ValueError: unsupported format %z at position 0
+'ab%y' % 1 ! ValueError: unsupported format %y at position 2
+'%!' % 1 ! ValueError: stray % at position 0 or unexpected format character '!' at position 1
+'%\'' % 1 ! ValueError: stray % at position 0 or unexpected format character "'" at position 1
+'%\xe9' % 1 ! ValueError: stray % at position 0 or unexpected format character 'é' (U+00E9) at position 1
+'%\x07' % 1 ! ValueError: stray % at position 0 or unexpected format character U+0007 at position 1
+'%(a)d' % 1 ! TypeError: format requires a mapping, not int
+'%(a)d' % (1,) ! TypeError: format requires a mapping, not tuple
+'%(a)d' % [1] ! TypeError: list indices must be integers or slices, not str
+'%(b)d' % {'a': 1} ! KeyError: 'b'
+b'%d' % b'x' ! TypeError: format argument: %d requires a real number, not bytes
+b'%c' % 'x' ! TypeError: format argument: %c requires an integer in range(256) or a single byte, not str
+b'%c' % b'ab' ! TypeError: format argument: %c requires an integer in range(256) or a single byte, not a bytes object of length 2
+b'%c' % bytearray(b'ab') ! TypeError: format argument: %c requires an integer in range(256) or a single byte, not a bytearray object of length 2
+b'%c' % 256 ! OverflowError: format argument: %c argument not in range(256)
+b'%f' % 'x' ! TypeError: format argument: %f requires a real number, not str
+b'%s' % 1 ! TypeError: format argument: %b requires a bytes-like object, or an object that implements __bytes__, not int
+b'%(a)s' % {b'a': 1} ! TypeError: format argument b'a': %b requires a bytes-like object, or an object that implements __bytes__, not int
+b'%s' % (b'1', b'2') ! TypeError: not all arguments converted during bytes formatting (required 1, got 2)
+b'%(a)s' % 1 ! TypeError: format requires a mapping, not int
+b'%\x07' % 1 ! ValueError: stray % at position 0 or unexpected format character with code 0x07 at position 1
+'%s|%5.2f|%-4d|' % (1, 2.5, 3) -> '1| 2.50|3   |'
+'%(x)s-%(y)05d' % {'x': 1, 'y': 2} -> '1-00002'
+"#
     );
 }

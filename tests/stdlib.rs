@@ -3541,7 +3541,10 @@ fn ffi_operator_index_honours_a_user_index_dunder() {
                x = (operator.index(I()), operator.index(J()), operator.getitem(list(range(9)), I()), sorted(It()))\n\
                try:\n    operator.index(Bad())\nexcept TypeError as e:\n    bad = str(e)";
     assert_eq!(g(src, "x"), "(7, 7, 7, [1, 2])");
-    assert_eq!(g(src, "bad"), "'__index__ returned non-int (type str)'");
+    assert_eq!(
+        g(src, "bad"),
+        "'Bad.__index__() must return an int, not str'"
+    );
 }
 
 /// `sys.getsizeof` is `type(o).__sizeof__(o)` plus CPython's pre-header: 16

@@ -132,8 +132,9 @@ fn bytes_repr_quoting() {
     assert_eq!(g("x = b\"a'b\"", "x"), "b\"a'b\"");
     assert_eq!(g("x = b'a\"b'", "x"), "b'a\"b'");
     assert_eq!(g("x = b'a\\'b\"c'", "x"), "b'a\\'b\"c'");
-    // bytearray always escapes a single quote, even under a double quote.
-    assert_eq!(g("x = bytearray(b\"a'b\")", "x"), "bytearray(b\"a\\'b\")");
+    // Since 3.15 a bytearray quotes exactly as bytes does (it used to escape
+    // a single quote even under a double quote).
+    assert_eq!(g("x = bytearray(b\"a'b\")", "x"), "bytearray(b\"a'b\")");
     assert_eq!(
         g("x = b'\\x00\\x7f\\x80\\xff'", "x"),
         "b'\\x00\\x7f\\x80\\xff'"

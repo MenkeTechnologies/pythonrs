@@ -258,7 +258,7 @@ fn expr(out: &mut String, e: &Expr, level: u8) {
         Expr::Str(s) => out.push_str(&crate::host::quote_str(s)),
         Expr::Bytes(b) => {
             out.push('b');
-            out.push_str(&crate::host::quote_bytes(b, false));
+            out.push_str(&crate::host::quote_bytes(b));
         }
         Expr::FString(parts) => {
             out.push('f');
