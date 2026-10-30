@@ -17736,15 +17736,17 @@ pub fn call_named(
     Err(name_error(name))
 }
 
-/// The builtins of CPython 3.14 that pythonrs has no native object for: they
+/// The builtins of CPython 3.15 that pythonrs has no native object for: they
 /// exist only in the embedded interpreter's `builtins` module (`aiter`,
-/// `anext`, `breakpoint`, `__build_class__`, `_IncompleteInputError`, and the
+/// `anext`, `breakpoint`, `__build_class__`, `_IncompleteInputError`, 3.15's
+/// `frozendict`, `sentinel` and `ImportCycleError`, and the
 /// `help`/`copyright`/`credits`/`license` objects `site` installs there).
 /// Listing them lets a bare name resolve to one without building the
 /// `builtins` namespace — and so without starting CPython — on every other
 /// `NameError`. A test in tests/ffi.rs checks the list against the bridge.
 #[cfg(feature = "stdlib-ffi")]
 pub const CPYTHON_ONLY_BUILTINS: &[&str] = &[
+    "ImportCycleError",
     "_IncompleteInputError",
     "__build_class__",
     "aiter",
@@ -17752,8 +17754,10 @@ pub const CPYTHON_ONLY_BUILTINS: &[&str] = &[
     "breakpoint",
     "copyright",
     "credits",
+    "frozendict",
     "help",
     "license",
+    "sentinel",
 ];
 
 /// Resolve a bare name through the builtins (see [`PyHost::lookup_builtin`]).
