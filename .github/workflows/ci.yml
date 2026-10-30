@@ -39,6 +39,9 @@ jobs:
           ln -sf "$(command -v python3.15)" "$HOME/py315/bin/python3"
           ln -sf "$(command -v python3.15)" "$HOME/py315/bin/python"
           echo "$HOME/py315/bin" >> "$GITHUB_PATH"
+          # Debian's libpython does not find its own stdlib when embedded
+          # without a home (`import json` fails); README.md documents PYTHONHOME.
+          echo "PYTHONHOME=/usr" >> "$GITHUB_ENV"
       - name: Format
         run: cargo fmt --check
       - name: Clippy
@@ -74,6 +77,9 @@ jobs:
           ln -sf "$(command -v python3.15)" "$HOME/py315/bin/python3"
           ln -sf "$(command -v python3.15)" "$HOME/py315/bin/python"
           echo "$HOME/py315/bin" >> "$GITHUB_PATH"
+          # Debian's libpython does not find its own stdlib when embedded
+          # without a home (`import json` fails); README.md documents PYTHONHOME.
+          echo "PYTHONHOME=/usr" >> "$GITHUB_ENV"
       - name: Clippy (stdlib-ffi)
         run: cargo clippy --all-targets --features stdlib-ffi -- -D warnings
       - name: Build (stdlib-ffi)
