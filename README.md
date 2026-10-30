@@ -96,7 +96,7 @@ newer CPython at run time. pyo3 finds the interpreter by looking up `python3` on
 `PATH`; point it elsewhere with
 
 ```sh
-PYO3_PYTHON=$(command -v python3.14) cargo build
+PYO3_PYTHON=$(command -v python3.15) cargo build
 ```
 
 which is also the escape hatch when `python3` on `PATH` is pythonrs itself —
@@ -105,18 +105,18 @@ pyo3 rejects it with "no Python 3.x interpreter found".
 The built binary links that interpreter's libpython and imports THAT
 interpreter's standard library: built while `python3` on `PATH` is a 3.12,
 `import dataclasses`, `re`, `typing`, … run 3.12's code, and every difference
-from 3.14 in them shows up as a parity divergence. Build with
-`PYO3_PYTHON` naming a 3.14 before measuring parity against one
+from 3.15 in them shows up as a parity divergence. Build with
+`PYO3_PYTHON` naming a 3.15 before measuring parity against one
 (`otool -L target/debug/python` / `ldd` shows which libpython was linked).
 
 When the linked libpython's compiled-in prefix holds its stdlib — the macOS
-framework installs (Homebrew `python@3.14`, python.org) — nothing more is
+framework installs (Homebrew `python@3.15`, python.org) — nothing more is
 needed. Otherwise finding it at RUN time needs `PYTHONHOME` set to the matching
 prefix (see [FFI_STDLIB.md](FFI_STDLIB.md)); without it `import os` raises
 `ModuleNotFoundError` and `sys.path` comes back nearly empty:
 
 ```sh
-PYTHONHOME=$(python3.14 -c 'import sys; print(sys.prefix)') ./target/debug/python script.py
+PYTHONHOME=$(python3.15 -c 'import sys; print(sys.prefix)') ./target/debug/python script.py
 ```
 
 `cargo build --no-default-features` drops pyo3/libpython entirely and serves

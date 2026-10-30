@@ -16,8 +16,8 @@ jobs:
     # build pulls pyo3 and links libpython — it needs a CPython >= 3.9 on PATH
     # (`abi3-py39`) and no other env.
     #
-    # The pin is 3.14 because that is the CPython pythonrs is ported from
-    # (src/pyhash.rs is 3.14.6, src/mangle.rs verified against 3.14) and
+    # The pin is 3.15 because that is the CPython pythonrs tracks (its error
+    # wordings are measured against 3.15 since 59a186f2a8) and
     # tests/parity.rs asks the interpreter on PATH for its oracle. Under 3.13
     # the unhashable-key wording alone diverges: 3.14 says
     # `cannot use 'U' as a set element (unhashable type: 'U')` where 3.13 says
@@ -30,7 +30,7 @@ jobs:
       - name: Install CPython
         uses: actions/setup-python@v5
         with:
-          python-version: "3.14"
+          python-version: "3.15"
       - name: Format
         run: cargo fmt --check
       - name: Clippy
@@ -57,7 +57,7 @@ jobs:
       - name: Install CPython
         uses: actions/setup-python@v5
         with:
-          python-version: "3.14"
+          python-version: "3.15"
       - name: Clippy (stdlib-ffi)
         run: cargo clippy --all-targets --features stdlib-ffi -- -D warnings
       - name: Build (stdlib-ffi)
@@ -71,7 +71,7 @@ jobs:
   # version 3.12" — Fedora 40). Building the default feature set against the
   # oldest CPython the floor claims to support is what catches a raised floor
   # before it reaches crates.io. Build only: the runtime oracle in tests/parity.rs
-  # and the 3.14 error wordings are the build-test job's business, not this one's.
+  # and the 3.15 error wordings are the build-test job's business, not this one's.
   ffi-abi3-floor:
     runs-on: ubuntu-latest
     steps:
