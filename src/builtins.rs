@@ -8558,7 +8558,7 @@ fn call_named_builtin(
             }
             host::flush_stdout()?;
             let mut line = String::new();
-            let _ = std::io::stdin().read_line(&mut line);
+            let _ = with_host(|h| h.stdin.read_line(&mut line));
             let line = line
                 .trim_end_matches('\n')
                 .trim_end_matches('\r')

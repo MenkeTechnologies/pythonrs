@@ -161,7 +161,7 @@ pub fn with_bounds<R>(base: usize, top: usize, f: impl FnOnce() -> R) -> R {
 /// than [`FRONTEND_ROOM`] left: the size of the interpreter thread `src/main.rs`
 /// spawns, so a compile reaches the same depth wherever it runs. Reserved, not
 /// committed: pages are touched only as deep as a parse actually goes.
-const FRONTEND_STACK: usize = 512 * 1024 * 1024;
+pub(crate) const FRONTEND_STACK: usize = 512 * 1024 * 1024;
 
 /// How much room the parser and the compiler need before they run on the
 /// caller's stack as they find it.

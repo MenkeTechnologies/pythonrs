@@ -18,6 +18,7 @@ pub mod casefold;
 pub mod cli;
 pub mod compiler;
 pub mod dap;
+pub mod embed;
 pub mod excgroup;
 pub mod excunicode;
 pub mod extensions;
@@ -45,6 +46,7 @@ pub mod tbcolor;
 pub mod tiers;
 pub mod unparse;
 
+pub use embed::run_program;
 pub use fusevm::Value;
 
 /// Compile a source string to a runnable program.
@@ -243,9 +245,19 @@ pub fn plain_error(e: String) -> String {
 /// assert_eq!(out, "HI\n");
 /// ```
 pub fn eval_str_captured(src: &str, globals: &[(&str, &str)]) -> (Result<Value, String>, String) {
+    eval_captured(src, globals, host::StdinSource::Process)
+}
+
+/// [`eval_str_captured`] with the program's standard input read from `stdin`.
+pub(crate) fn eval_captured(
+    src: &str,
+    globals: &[(&str, &str)],
+    stdin: host::StdinSource,
+) -> (Result<Value, String>, String) {
     host::reset_host();
     host::init_runtime(vec![String::new()], None, src, "<string>", true);
     host::with_host(|h| {
+        h.stdin = stdin;
         for (name, text) in globals {
             let value = h.new_str(*text);
             h.set_global(name, value);
@@ -353,7 +365,7 @@ pub enum ReportOrder {
 /// flushes) before returning. The text is returned rather than printed, so an
 /// embedder or a test reads it; [`run_main_program`] is the binary's entry,
 /// which prints it at the point CPython does.
-pub fn run_program(
+pub fn run_program_report(
     src: &str,
     argv: Vec<String>,
     main_file: Option<String>,
@@ -365,7 +377,7 @@ pub fn run_program(
     report
 }
 
-/// The `python` binary's run: [`run_program`] with the report written to
+/// The `python` binary's run: [`run_program_report`] with the report written to
 /// stderr where CPython writes it — after the program's own buffered stdout for
 /// a script, before it for `-c` (see [`ReportOrder`]) — and before `atexit`
 /// callbacks run, since CPython prints the exception in `PyErr_Print` and runs

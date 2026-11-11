@@ -1864,6 +1864,34 @@ pub enum IterState {
 
 // ── I/O side table ───────────────────────────────────────────────────────────
 
+/// Where the program's standard input comes from: the process stdin, or text an
+/// embedder supplied ([`crate::embed::run_program`]). Every native read of
+/// `sys.stdin`, and `input()`, goes through the host's one `StdinSource`.
+pub enum StdinSource {
+    Process,
+    Fed(std::io::Cursor<Vec<u8>>),
+}
+
+impl std::io::Read for StdinSource {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            StdinSource::Process => std::io::stdin().read(buf),
+            StdinSource::Fed(c) => c.read(buf),
+        }
+    }
+}
+
+impl StdinSource {
+    /// One line including its `\n` (empty at EOF), as `input()` reads it.
+    pub fn read_line(&mut self, line: &mut String) -> std::io::Result<usize> {
+        use std::io::BufRead;
+        match self {
+            StdinSource::Process => std::io::stdin().read_line(line),
+            StdinSource::Fed(c) => c.read_line(line),
+        }
+    }
+}
+
 /// One live file / standard stream, indexed by `PyObj::File.id`. Slots 0/1/2 are
 /// always `Stdout`/`Stderr`/`Stdin`. A `File` holds the owned `std::fs::File`
 /// (`None` once closed), the path (for `repr`/`f.name`), the mode string exactly
@@ -2841,6 +2869,8 @@ pub struct PyHost {
     /// host-level and catches every native write, including one through a
     /// reassigned `sys.stdout` that still ends at the real stream.
     capture: Option<String>,
+    /// The program's standard input; see [`StdinSource`].
+    pub stdin: StdinSource,
     /// Imported modules keyed by dotted name — pythonrs's `sys.modules`. A second
     /// `import x` returns the cached module object (CPython identity + run-once
     /// side effects) instead of re-executing the vendored `.py`. Populated by
@@ -3491,6 +3521,7 @@ impl PyHost {
             },
             sys_flags: Vec::new(),
             capture: None,
+            stdin: StdinSource::Process,
             modules: NameMap::default(),
             sys_modules: None,
             mt_states: HashMap::default(),
@@ -25342,7 +25373,7 @@ fn import_module_inner(name: &str) -> Result<Value, String> {
             ]
         }),
         // `atexit` — cleanup callbacks run (LIFO) at interpreter shutdown. Native
-        // because CPython's is a C module; the callbacks fire from `run_program`
+        // because CPython's is a C module; the callbacks fire from `run_program_report`
         // after the top-level program finishes (see `run_atexit_callbacks`).
         "atexit" => with_host(|h| {
             vec![
@@ -26696,10 +26727,10 @@ impl PyHost {
             Some(IoCell::File { file: Some(_), .. }) => return Err(unsupported_read()),
             Some(IoCell::File { file: None, .. }) => return Err(closed_err()),
             Some(IoCell::Stdin) => match want {
-                None => std::io::stdin().read_to_end(&mut buf).map(|_| ()),
+                None => self.stdin.read_to_end(&mut buf).map(|_| ()),
                 Some(k) => {
                     buf.resize(k, 0);
-                    read_up_to(&mut std::io::stdin(), &mut buf)
+                    read_up_to(&mut self.stdin, &mut buf)
                 }
             },
             _ => return Err(unsupported_read()),
@@ -26830,7 +26861,7 @@ impl PyHost {
             }) => f.read(&mut one),
             Some(IoCell::File { file: Some(_), .. }) => return Err(unsupported_read()),
             Some(IoCell::File { file: None, .. }) => return Err(closed_err()),
-            Some(IoCell::Stdin) => std::io::stdin().read(&mut one),
+            Some(IoCell::Stdin) => self.stdin.read(&mut one),
             _ => return Err(unsupported_read()),
         };
         match read {
@@ -27077,7 +27108,7 @@ impl PyHost {
             Some(IoCell::File { file: Some(_), .. }) => return Err(unsupported_read()),
             Some(IoCell::File { file: None, .. }) => return Err(closed_err()),
             Some(IoCell::Stdin) => {
-                std::io::stdin().read_to_end(&mut bytes).map_err(io_err)?;
+                self.stdin.read_to_end(&mut bytes).map_err(io_err)?;
             }
             _ => return Err(unsupported_read()),
         }

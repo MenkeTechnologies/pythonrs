@@ -54,3 +54,58 @@ fn capture_resets_between_runs() {
     assert_eq!(first, "one\n");
     assert_eq!(second, "two\n");
 }
+
+// `run_program`: the uniform `(src, input) -> Result<String, String>` entry point.
+
+#[test]
+fn print_is_captured() {
+    assert_eq!(
+        pythonrs::run_program("print('hello')", "").unwrap(),
+        "hello\n"
+    );
+}
+
+#[test]
+fn input_and_sys_stdin_read_the_given_input() {
+    let src = "import sys\nfirst = input()\nrest = sys.stdin.read()\nprint(first.upper(), len(rest.splitlines()))";
+    assert_eq!(
+        pythonrs::run_program(src, "abc\nx\ny\n").unwrap(),
+        "ABC 2\n"
+    );
+}
+
+#[test]
+fn errors_and_exit_codes() {
+    assert!(pythonrs::run_program("def (", "").is_err());
+    let err = pythonrs::run_program("raise ValueError('boom')", "").unwrap_err();
+    assert!(err.ends_with("ValueError: boom"), "{err}");
+    assert_eq!(
+        pythonrs::run_program("import sys\nsys.exit(3)", "").unwrap_err(),
+        "SystemExit: 3"
+    );
+    assert_eq!(
+        pythonrs::run_program("import sys\nprint('a')\nsys.exit(0)\nprint('b')", "").unwrap(),
+        "a\n"
+    );
+}
+
+#[test]
+fn concurrent_calls_keep_their_own_output() {
+    let handles: Vec<_> = (0..8)
+        .map(|t| {
+            std::thread::spawn(move || {
+                let input: String = (0..500).map(|i| format!("{t} {i}\n")).collect();
+                let src = "import sys\nfor line in sys.stdin:\n    print(line.split()[0])";
+                (t, pythonrs::run_program(src, &input).unwrap())
+            })
+        })
+        .collect();
+    for h in handles {
+        let (t, out) = h.join().unwrap();
+        assert!(
+            out.lines().all(|l| l == t.to_string()),
+            "thread {t} saw foreign output"
+        );
+        assert_eq!(out.lines().count(), 500);
+    }
+}

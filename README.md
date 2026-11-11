@@ -43,6 +43,7 @@ pythonrs both **transparently caches bytecode via rkyv on every run** and
 - [\[0x06\] Parity Harness](#0x06-parity-harness)
 - [\[0x07\] Status & Roadmap](#0x07-status--roadmap)
 - [\[0x08\] Documentation](#0x08-documentation)
+- [\[0x09\] Embedding](#0x09-embedding)
 - [\[0xFF\] License](#0xff-license)
 
 ---
@@ -434,6 +435,19 @@ the generated `reference.html`.
 - **Engineering report** — <https://menketechnologies.github.io/pythonrs/report.html>
 - **Builtin reference** — <https://menketechnologies.github.io/pythonrs/reference.html>
 - **The shared VM** — [`fusevm`](https://github.com/MenkeTechnologies/fusevm), shared with other language frontends.
+
+## [0x09] EMBEDDING
+
+```rust
+pub fn run_program(src: &str, input: &str) -> Result<String, String>
+```
+
+Runs `src` as a complete program with `input` as its standard input (`input()`, `sys.stdin.read()`/`readline()`, `for line in sys.stdin`) and returns everything it printed. Each call runs on its own thread with a fresh interpreter, so calls from different threads never share state or output, and nothing is written to the process stdout. Writes to `sys.stderr` are captured into the same string. A syntax error, an uncaught exception (the traceback is the message), a nonzero `sys.exit`, or an interpreter panic returns `Err`; `sys.exit(0)` returns `Ok` with the output so far. `atexit` callbacks are not run. `eval_str_captured(src, globals)` is the lower-level variant that seeds globals and returns the outcome and output separately.
+
+```rust
+let out = pythonrs::run_program("print(input().upper())", "hi\n")?;
+assert_eq!(out, "HI\n");
+```
 
 ## [0xFF] LICENSE
 

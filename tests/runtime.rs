@@ -3,13 +3,13 @@
 //! and uncaught-exception tracebacks. Expected values are what CPython 3.14
 //! produces for the same program/invocation.
 
-use pythonrs::{eval_str, host, run_program};
+use pythonrs::{eval_str, host, run_program_report};
 
 /// Run `src` as a top-level program with the given argv, then return the `repr`
 /// of global `name`.
 fn g_with_argv(src: &str, argv: &[&str], name: &str) -> String {
     let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
-    let r = run_program(src, argv, None, "<string>", true);
+    let r = run_program_report(src, argv, None, "<string>", true);
     assert_eq!(
         r.exit_code, 0,
         "program should exit 0, got stderr {:?}",
@@ -71,7 +71,7 @@ fn name_main_guard_runs() {
 
 #[test]
 fn file_global_set_for_file_run() {
-    let r = run_program(
+    let r = run_program_report(
         "x = __file__",
         vec!["s.py".into()],
         Some("/tmp/s.py".into()),
@@ -85,7 +85,7 @@ fn file_global_set_for_file_run() {
 
 #[test]
 fn sys_exit_int_sets_exit_code() {
-    let r = run_program(
+    let r = run_program_report(
         "import sys\nsys.exit(3)",
         vec![String::new()],
         None,
@@ -98,7 +98,7 @@ fn sys_exit_int_sets_exit_code() {
 
 #[test]
 fn sys_exit_string_writes_message_exit_1() {
-    let r = run_program(
+    let r = run_program_report(
         "import sys\nsys.exit('bad')",
         vec![String::new()],
         None,
@@ -111,7 +111,7 @@ fn sys_exit_string_writes_message_exit_1() {
 
 #[test]
 fn sys_exit_none_is_zero() {
-    let r = run_program(
+    let r = run_program_report(
         "import sys\nsys.exit()",
         vec![String::new()],
         None,
@@ -125,28 +125,28 @@ fn sys_exit_none_is_zero() {
 #[test]
 fn builtin_exit_int_sets_exit_code() {
     // `exit(2)` (site.Quitter) is equivalent to `sys.exit(2)`.
-    let r = run_program("exit(2)", vec![String::new()], None, "<string>", true);
+    let r = run_program_report("exit(2)", vec![String::new()], None, "<string>", true);
     assert_eq!(r.exit_code, 2);
     assert_eq!(r.stderr, None);
 }
 
 #[test]
 fn builtin_quit_none_is_zero() {
-    let r = run_program("quit()", vec![String::new()], None, "<string>", true);
+    let r = run_program_report("quit()", vec![String::new()], None, "<string>", true);
     assert_eq!(r.exit_code, 0);
     assert_eq!(r.stderr, None);
 }
 
 #[test]
 fn builtin_exit_string_writes_message_exit_1() {
-    let r = run_program("exit('bad')", vec![String::new()], None, "<string>", true);
+    let r = run_program_report("exit('bad')", vec![String::new()], None, "<string>", true);
     assert_eq!(r.exit_code, 1);
     assert_eq!(r.stderr.as_deref(), Some("bad\n"));
 }
 
 #[test]
 fn raise_system_exit_with_code() {
-    let r = run_program(
+    let r = run_program_report(
         "raise SystemExit(5)",
         vec![String::new()],
         None,
@@ -193,7 +193,7 @@ fn sys_scalars_present() {
 
 /// One helper: run `src` as `/t.py`, expect exit 1, return the traceback.
 fn traceback_of(src: &str) -> String {
-    let r = run_program(
+    let r = run_program_report(
         src,
         vec!["t.py".into()],
         Some("/t.py".into()),
@@ -343,7 +343,7 @@ fn uncaught_traceback_shape() {
     // (outermost first), then `ErrorType: message`. The `a()`/`b()` call sites get
     // the `~^^` call anchor; the bare `raise` line has no caret.
     let src = "def a():\n    b()\n\ndef b():\n    raise ValueError(\"boom\")\n\na()\n";
-    let r = run_program(
+    let r = run_program_report(
         src,
         vec!["t.py".into()],
         Some("/t.py".into()),
@@ -373,7 +373,7 @@ fn uncaught_traceback_explicit_cause_chain() {
     // CPython connector line, then the raising exception. The `int("bad")` call
     // carries the `~~~^^^^^^^` caret; the `raise … from e` line has none.
     let src = "try:\n    int(\"bad\")\nexcept ValueError as e:\n    raise RuntimeError(\"wrapped\") from e\n";
-    let r = run_program(
+    let r = run_program_report(
         src,
         vec!["t.py".into()],
         Some("/t.py".into()),
@@ -407,7 +407,7 @@ fn uncaught_traceback_implicit_context_chain() {
     // call gets the `~~~~~^^^^^^^` caret; `return int(s)` is caret-suppressed (a
     // `return call()` value), matching CPython.
     let src = "def parse(s):\n    return int(s)\n\ntry:\n    parse(\"xyz\")\nexcept ValueError:\n    raise RuntimeError(\"handler failed\")\n";
-    let r = run_program(
+    let r = run_program_report(
         src,
         vec!["t.py".into()],
         Some("/t.py".into()),
@@ -441,7 +441,7 @@ fn uncaught_traceback_from_none_suppresses_context() {
     // hidden — only the raising exception's block prints.
     let src =
         "try:\n    int(\"bad\")\nexcept ValueError:\n    raise RuntimeError(\"clean\") from None\n";
-    let r = run_program(
+    let r = run_program_report(
         src,
         vec!["t.py".into()],
         Some("/t.py".into()),
@@ -462,7 +462,7 @@ fn uncaught_traceback_from_none_suppresses_context() {
 #[test]
 fn stdin_traceback_omits_source_lines() {
     // Source text is unavailable for stdin, so only the frame headers show.
-    let r = run_program(
+    let r = run_program_report(
         "raise KeyError(7)\n",
         vec![String::new()],
         None,
@@ -479,7 +479,7 @@ fn stdin_traceback_omits_source_lines() {
 #[test]
 fn print_to_stderr_does_not_error() {
     // `print(..., file=sys.stderr)` routes off stdout without raising.
-    let r = run_program(
+    let r = run_program_report(
         "import sys\nprint('x', file=sys.stderr)\nok = True",
         vec![String::new()],
         None,
@@ -527,7 +527,7 @@ fn main_module_dunders_are_bound() {
         "False",
         "`python -c` has no script file, so no __cached__"
     );
-    let r = run_program(
+    let r = run_program_report(
         "x = ('__cached__' in globals(), __cached__)",
         vec!["prog.py".to_string()],
         Some("prog.py".to_string()),
