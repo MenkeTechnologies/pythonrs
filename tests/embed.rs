@@ -109,3 +109,13 @@ fn concurrent_calls_keep_their_own_output() {
         assert_eq!(out.lines().count(), 500);
     }
 }
+
+#[test]
+fn stderr_is_not_in_run_program_output_but_stays_in_eval_str_captured() {
+    let src =
+        "import sys\nprint('out')\nsys.stderr.write('err\\n')\nprint('more', file=sys.stderr)";
+    assert_eq!(pythonrs::run_program(src, "").unwrap(), "out\n");
+    let (result, merged) = pythonrs::eval_str_captured(src, &[]);
+    assert!(result.is_ok());
+    assert_eq!(merged, "out\nerr\nmore\n");
+}

@@ -2861,14 +2861,17 @@ pub struct PyHost {
     /// shows up in `sys.flags.int_max_str_digits` as it does in CPython.
     sys_flags: Vec<Value>,
     /// In-process output sink. When `Some`, everything the program writes to the
-    /// native stdout/stderr streams is appended here instead of reaching the
-    /// process — what an embedder that owns the terminal (a TUI) needs so a
+    /// native stdout stream (and stderr, per `capture_stderr`) is appended here
+    /// instead of reaching the process — what an embedder that owns the terminal (a TUI) needs so a
     /// `print` cannot corrupt its display. `None` (the default) is the ordinary
     /// standalone `python` behaviour. Distinct from `stdout_target`, which is
     /// Python-level (`sys.stdout = …`) and redirects to a Python object; this is
     /// host-level and catches every native write, including one through a
     /// reassigned `sys.stdout` that still ends at the real stream.
     capture: Option<String>,
+    /// Whether `capture` also takes native stderr writes. When `false`, stderr
+    /// reaches the process stderr while stdout is captured.
+    capture_stderr: bool,
     /// The program's standard input; see [`StdinSource`].
     pub stdin: StdinSource,
     /// Imported modules keyed by dotted name — pythonrs's `sys.modules`. A second
@@ -3521,6 +3524,7 @@ impl PyHost {
             },
             sys_flags: Vec::new(),
             capture: None,
+            capture_stderr: true,
             stdin: StdinSource::Process,
             modules: NameMap::default(),
             sys_modules: None,
@@ -26996,9 +27000,11 @@ impl PyHost {
     // process, not to the program.
 
     /// Start capturing program output in-process. Any text already captured is
-    /// discarded, so each run starts clean.
-    pub fn begin_capture(&mut self) {
+    /// discarded, so each run starts clean. With `stderr`, native stderr writes
+    /// land in the same buffer; without it they reach the process stderr.
+    pub fn begin_capture(&mut self, stderr: bool) {
         self.capture = Some(String::new());
+        self.capture_stderr = stderr;
     }
 
     /// Stop capturing and take everything written since [`begin_capture`],
@@ -27024,9 +27030,11 @@ impl PyHost {
 
     /// [`write_out`](PyHost::write_out) for text that is already UTF-8 bytes.
     fn write_out_bytes(&mut self, bytes: &[u8], stderr: bool) {
-        if let Some(buf) = &mut self.capture {
-            buf.push_str(&String::from_utf8_lossy(bytes));
-            return;
+        if let Some(buf) = self.capture.as_mut() {
+            if !stderr || self.capture_stderr {
+                buf.push_str(&String::from_utf8_lossy(bytes));
+                return;
+            }
         }
         crate::stdio::write_bytes(std_stream(stderr), bytes);
     }

@@ -9,8 +9,9 @@ use crate::host::{self, StdinSource, TopExit};
 /// `sys.stdin` see. Each call runs on its own thread (with the interpreter's
 /// 512 MiB stack reservation) and a fresh host; stdout goes to that host's
 /// capture buffer ([`crate::eval_str_captured`]), so concurrent calls never share
-/// output and nothing reaches the process stdout. Writes to `sys.stderr` land in
-/// the same buffer, as with [`crate::eval_str_captured`].
+/// output and nothing reaches the process stdout. Writes to `sys.stderr` go to the
+/// process stderr, not the returned string (unlike [`crate::eval_str_captured`],
+/// which returns both streams merged).
 ///
 /// A syntax error, an uncaught exception (its traceback is the message), a
 /// nonzero `sys.exit`, and a panic in the interpreter return `Err`.
@@ -29,7 +30,7 @@ pub fn run_program(src: &str, input: &str) -> Result<String, String> {
 }
 
 fn run_captured(src: &str, stdin: StdinSource) -> Result<String, String> {
-    let (result, output) = crate::eval_captured(src, &[], stdin);
+    let (result, output) = crate::eval_captured(src, &[], stdin, false);
     let Err(e) = result else {
         return Ok(output);
     };

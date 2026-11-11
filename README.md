@@ -442,7 +442,7 @@ the generated `reference.html`.
 pub fn run_program(src: &str, input: &str) -> Result<String, String>
 ```
 
-Runs `src` as a complete program with `input` as its standard input (`input()`, `sys.stdin.read()`/`readline()`, `for line in sys.stdin`) and returns everything it printed. Each call runs on its own thread with a fresh interpreter, so calls from different threads never share state or output, and nothing is written to the process stdout. Writes to `sys.stderr` are captured into the same string. A syntax error, an uncaught exception (the traceback is the message), a nonzero `sys.exit`, or an interpreter panic returns `Err`; `sys.exit(0)` returns `Ok` with the output so far. `atexit` callbacks are not run. `eval_str_captured(src, globals)` is the lower-level variant that seeds globals and returns the outcome and output separately.
+Runs `src` as a complete program with `input` as its standard input (`input()`, `sys.stdin.read()`/`readline()`, `for line in sys.stdin`) and returns everything it printed to stdout. Each call runs on its own thread with a fresh interpreter, so calls from different threads never share state or output, and nothing is written to the process stdout. Writes to `sys.stderr` go to the process stderr. A syntax error, an uncaught exception (the traceback is the message), a nonzero `sys.exit`, or an interpreter panic returns `Err`; `sys.exit(0)` returns `Ok` with the output so far. `atexit` callbacks are not run. `eval_str_captured(src, globals)` is the lower-level variant that seeds globals and returns the outcome and output (stdout and stderr merged) separately.
 
 ```rust
 let out = pythonrs::run_program("print(input().upper())", "hi\n")?;

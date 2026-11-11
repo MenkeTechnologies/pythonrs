@@ -245,14 +245,17 @@ pub fn plain_error(e: String) -> String {
 /// assert_eq!(out, "HI\n");
 /// ```
 pub fn eval_str_captured(src: &str, globals: &[(&str, &str)]) -> (Result<Value, String>, String) {
-    eval_captured(src, globals, host::StdinSource::Process)
+    eval_captured(src, globals, host::StdinSource::Process, true)
 }
 
 /// [`eval_str_captured`] with the program's standard input read from `stdin`.
+/// `stderr` selects whether native stderr writes join the captured output
+/// (`true`) or go to the process stderr (`false`).
 pub(crate) fn eval_captured(
     src: &str,
     globals: &[(&str, &str)],
     stdin: host::StdinSource,
+    stderr: bool,
 ) -> (Result<Value, String>, String) {
     host::reset_host();
     host::init_runtime(vec![String::new()], None, src, "<string>", true);
@@ -262,12 +265,16 @@ pub(crate) fn eval_captured(
             let value = h.new_str(*text);
             h.set_global(name, value);
         }
-        h.begin_capture();
+        h.begin_capture(stderr);
     });
     let result = compile_or_load_cacheable(src, false)
         .and_then(run_compiled)
         .map_err(plain_error);
     let output = host::with_host(|h| h.end_capture());
+    if !stderr {
+        // Line-buffered: a final write without a newline is still pending.
+        stdio::flush(stdio::Stream::Stderr);
+    }
     (result, output)
 }
 
