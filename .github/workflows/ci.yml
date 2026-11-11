@@ -95,7 +95,9 @@ jobs:
   # before it reaches crates.io. Build only: the runtime oracle in tests/parity.rs
   # and the 3.15 error wordings are the build-test job's business, not this one's.
   ffi-abi3-floor:
-    runs-on: ubuntu-latest
+    # actions/setup-python publishes no CPython 3.9 build for ubuntu-26.04,
+    # which ubuntu-latest now resolves to; 24.04 still has it.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
