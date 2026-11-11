@@ -1326,7 +1326,7 @@ dependencies = [
 
 [[package]]
 name = "pythonrs"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "bincode",
  "blake2",
